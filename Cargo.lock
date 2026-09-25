@@ -240,6 +240,7 @@ dependencies = [
  "rudb-parse",
  "rudb-pipeline",
  "rudb-plan",
+ "rudb-qc",
  "rudb-seam",
  "rudb-storage",
  "rudb-txn",
@@ -521,6 +522,26 @@ name = "rudb-projection"
 version = "0.4.33"
 dependencies = [
  "rudb-native",
+]
+
+[[package]]
+name = "rudb-qc"
+version = "0.4.33"
+dependencies = [
+ "rudb-catalog",
+ "rudb-common",
+ "rudb-exec",
+ "rudb-kernels",
+ "rudb-pipeline",
+ "rudb-plan",
+ "rudb-qc-gen",
+ "rudb-qc-interp",
+ "rudb-qc-ir",
+ "rudb-qc-pipe",
+ "rudb-qc-plan",
+ "rudb-qc-rt",
+ "rudb-seam",
+ "rudb-vector",
 ]
 
 [[package]]

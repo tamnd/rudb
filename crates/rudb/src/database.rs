@@ -24,7 +24,7 @@ use crate::config::Config;
 use crate::connection::{Connection, single};
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
-use crate::settings::Settings;
+use crate::settings::{COMPILED_ENGINE, Settings};
 use crate::{foreign, upsert};
 
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
@@ -626,7 +626,13 @@ struct Inner {
     /// A successful setting statement invalidates the one cached native aggregate plan.
     settings_revision: AtomicU64,
     native_aggregate_plan: Mutex<Option<CachedNativeAggregate>>,
+    /// What the compiled engine handed back under `SET engine = 'compiled'`, one line per query
+    /// and the latest [`REFUSALS_KEPT`] of them, for [`Database::refusals`].
+    refusals: Mutex<Vec<String>>,
 }
+
+/// How many refusals the log keeps.
+const REFUSALS_KEPT: usize = 1000;
 
 #[derive(Debug)]
 struct CachedNativeAggregate {
@@ -1232,6 +1238,7 @@ impl Database {
             declined: Mutex::default(),
             settings_revision: AtomicU64::new(0),
             native_aggregate_plan: Mutex::default(),
+            refusals: Mutex::default(),
         };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
@@ -1250,6 +1257,13 @@ impl Database {
     #[must_use]
     pub fn opened_with(&self) -> Config {
         self.shared.inner.settings.defaults()
+    }
+
+    /// The queries the compiled engine handed back to the first engine, latest last, each as the
+    /// refusal and then the statement.
+    #[must_use]
+    pub fn refusals(&self) -> Vec<String> {
+        self.shared.inner.refusals.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// One setting, by the name `SET` uses for it, in the spelling DuckDB prints.
@@ -1376,6 +1390,7 @@ impl Database {
             declined: Mutex::default(),
             settings_revision: AtomicU64::new(0),
             native_aggregate_plan: Mutex::default(),
+            refusals: Mutex::default(),
         };
         Ok(Self { shared: Shared { inner: Arc::new(inner) } })
     }
@@ -2851,6 +2866,16 @@ impl Shared {
         run(sql, &plan, &catalog, cancel, under).map(Some)
     }
 
+    /// Notes a query the compiled engine handed back, before the first engine runs it.
+    fn refused(&self, sql: &str, refusal: &rudb_qc::Refusal) {
+        let mut log = self.inner.refusals.lock().unwrap_or_else(PoisonError::into_inner);
+        if log.len() == REFUSALS_KEPT {
+            log.remove(0);
+        }
+        let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        log.push(format!("{refusal} | {sql}"));
+    }
+
     fn remember_native_aggregate(&self, sql: &str, ast: &Ast, plan: &Plan, catalog: &Catalog) {
         if !is_native_summary_aggregate(ast, plan, catalog) {
             return;
@@ -2904,6 +2929,14 @@ impl Shared {
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
+                if self.inner.settings.engine() == COMPILED_ENGINE {
+                    match rudb_qc::compile(&plan, cancel) {
+                        Ok(compiled) => {
+                            return run_compiled(sql, &plan, &catalog, cancel, compiled, under);
+                        }
+                        Err(refusal) => self.refused(sql, &refusal),
+                    }
+                }
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze, statistics } => {
@@ -4313,6 +4346,44 @@ fn run(
     report.fill(&mut metrics);
     rudb_opt::explain::record_estimates(plan, facts, &mut metrics);
     Ok(QueryResult::new(names, types, chunks, held).in_session(session.clone()).measured(metrics))
+}
+
+/// Runs a plan the compiled engine took, with the same budget and the same timing fields `run`
+/// fills, so a benchmark reads either engine the same way.
+fn run_compiled(
+    sql: &str,
+    plan: &Plan,
+    catalog: &Catalog,
+    cancel: &Cancel,
+    compiled: rudb_qc::Compiled,
+    under: Under<'_>,
+) -> Result<QueryResult> {
+    let Under { budget: Budget { memory, pool }, seams, session, planning, .. } = under;
+    memory.forget_peak();
+    let driving = Span::start();
+    let qc = rudb_qc::Under { catalog, cancel, memory, seams, session, pool };
+    let answer = compiled.run(plan, qc)?;
+    let (ran_wall, ran_cpu) = driving.stop();
+    let mut held = memory.reservation();
+    let mut chunks = Vec::with_capacity(answer.chunks.len());
+    for chunk in answer.chunks {
+        let chunk = chunk.into_flat()?;
+        held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
+        chunks.push(chunk);
+    }
+    let mut metrics = Document::new(sql);
+    metrics.settings.memory_limit = memory.limit();
+    metrics.settings.threads = u32::try_from(pool.threads()).unwrap_or(u32::MAX);
+    metrics.timing.parse_ns = planning.parse_ns;
+    metrics.timing.bind_ns = planning.bind_ns;
+    metrics.timing.optimize_ns = planning.optimize_ns;
+    metrics.timing.execute_ns = ran_wall;
+    metrics.timing.total_ns = planning.total_ns().saturating_add(ran_wall);
+    metrics.resource.cpu_ns = ran_cpu;
+    metrics.resource.peak_bytes = memory.peak();
+    Ok(QueryResult::new(answer.names, answer.types, chunks, held)
+        .in_session(session.clone())
+        .measured(metrics))
 }
 
 /// The plan `EXPLAIN` prints, run first if `ANALYZE` was asked for.

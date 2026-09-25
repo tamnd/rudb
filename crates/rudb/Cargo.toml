@@ -21,6 +21,7 @@ rudb-bind.workspace = true
 rudb-plan.workspace = true
 rudb-opt.workspace = true
 rudb-exec.workspace = true
+rudb-qc.workspace = true
 rudb-pipeline.workspace = true
 rudb-catalog.workspace = true
 rudb-functions.workspace = true

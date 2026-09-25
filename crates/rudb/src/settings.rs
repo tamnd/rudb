@@ -157,6 +157,11 @@ pub(crate) struct Settings {
     /// is the projected width at which the build stops paying for itself, which is a crossover a
     /// measurement moves. Both start where `rudb_opt` has them.
     sizes: RwLock<rudb_opt::link::Sizes>,
+    /// Which engine runs a query, as `SET engine` has left it: `first` for the vectorized engine
+    /// and `compiled` for the query compiler of `spec/compiler`, which hands back what it refuses.
+    ///
+    /// Not a DuckDB setting, so not in the settings catalog, for the reason the seams are not.
+    engine: RwLock<String>,
 }
 
 impl Settings {
@@ -193,6 +198,7 @@ impl Settings {
             rules: RwLock::new(Rules::new()),
             links: RwLock::new(String::new()),
             sizes: RwLock::new(rudb_opt::link::Sizes::default()),
+            engine: RwLock::new(FIRST_ENGINE.to_string()),
         }
     }
 
@@ -226,6 +232,11 @@ impl Settings {
     /// The two link join numbers as the statements have left them.
     pub(crate) fn sizes(&self) -> rudb_opt::link::Sizes {
         *self.sizes.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// The engine `SET engine` picked, `first` or `compiled`.
+    pub(crate) fn engine(&self) -> String {
+        self.engine.read().unwrap_or_else(|held| held.into_inner()).clone()
     }
 
     /// The configuration as the statements have left it.
@@ -284,6 +295,17 @@ impl Settings {
                 .write()
                 .unwrap_or_else(|held| held.into_inner())
                 .set(name, text.trim());
+        }
+        if is_engine(name) {
+            let written = value.map_or_else(|| FIRST_ENGINE.to_string(), text_of);
+            let engine = written.trim().to_ascii_lowercase();
+            if engine != FIRST_ENGINE && engine != COMPILED_ENGINE {
+                return Err(Error::invalid_input(format!(
+                    "engine is {FIRST_ENGINE} or {COMPILED_ENGINE}, not {written}"
+                )));
+            }
+            *self.engine.write().unwrap_or_else(|held| held.into_inner()) = engine;
+            return Ok(());
         }
         if is_links(name) {
             // Validated here and nowhere else. A declaration that does not parse is a mistake in a
@@ -648,6 +670,9 @@ impl Settings {
         if is_links(name) {
             return Ok(self.links());
         }
+        if is_engine(name) {
+            return Ok(self.engine());
+        }
         if let Some(which) = graph_size(name) {
             let sizes = self.sizes();
             return Ok(match which {
@@ -925,6 +950,19 @@ fn is_seam(name: &str) -> bool {
         return false;
     }
     name.starts_with(SEAM_PREFIX) || rudb_seam::seam_named(name).is_some()
+}
+
+/// The engine a query runs on when nothing says otherwise.
+pub(crate) const FIRST_ENGINE: &str = "first";
+
+/// The query compiler, which runs what it can and hands the rest to the first engine.
+pub(crate) const COMPILED_ENGINE: &str = "compiled";
+
+/// Whether this name is the engine setting.
+///
+/// The same shape as [`is_seam`], and a DuckDB setting of this name, should one ever exist, wins.
+fn is_engine(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("engine")
 }
 
 /// Whether this name is the relationship declaration setting.

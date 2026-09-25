@@ -71,6 +71,7 @@ rudb-qc-rt = { version = "=0.4.33", path = "crates/rudb-qc-rt" }
 rudb-qc-plan = { version = "=0.4.33", path = "crates/rudb-qc-plan" }
 rudb-qc-pipe = { version = "=0.4.33", path = "crates/rudb-qc-pipe" }
 rudb-qc-gen = { version = "=0.4.33", path = "crates/rudb-qc-gen" }
+rudb-qc = { version = "=0.4.33", path = "crates/rudb-qc" }
 rudb-regex = { version = "=0.4.33", path = "crates/rudb-regex" }
 rudb-seam = { version = "=0.4.33", path = "crates/rudb-seam" }
 rudb-stats = { version = "=0.4.33", path = "crates/rudb-stats" }
