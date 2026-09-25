@@ -510,10 +510,12 @@ impl<'a> Transform<'a> {
     /// prints, and a `SET` has no plan. An `INSERT` has a plan for its source and showing that
     /// would answer a question nobody asked, since the source is not what the statement does.
     ///
-    /// Three of the option names are answered and the rest are refused. `ANALYZE` in the list is
+    /// Four of the option names are answered and the rest are refused. `ANALYZE` in the list is
     /// the keyword written the other way and DuckDB takes both, `LOGICAL` names the plan this
     /// already prints, and `STATISTICS` asks for the section that says what the planner knew, which
-    /// is what `spec/stats/05-every-query.md` section 5.1.1 asks `EXPLAIN` to print. Anything else,
+    /// is what `spec/stats/05-every-query.md` section 5.1.1 asks `EXPLAIN` to print. `CODEGEN` is
+    /// ours and asks for what the compiled engine generated, per `spec/compiler/16-observability.md`.
+    /// Anything else,
     /// `FORMAT JSON` above all, asks for the plan in a shape nothing here writes, and answering it
     /// with the text form would be answering a different question quietly.
     ///
@@ -526,6 +528,7 @@ impl<'a> Transform<'a> {
     fn explain_statement(&mut self, node: u32) -> Result<Statement> {
         let mut analyze = self.find(node, "AnalyzeKeyword") != NONE;
         let mut statistics = false;
+        let mut codegen = false;
         let list = self.find(node, "ExplainOptionList");
         if list != NONE {
             for option in self.kids(list).filter(|&kid| self.name(kid) == "ExplainOption") {
@@ -534,6 +537,7 @@ impl<'a> Transform<'a> {
                     "analyze" => analyze = true,
                     "logical" => {}
                     "statistics" => statistics = true,
+                    "codegen" => codegen = true,
                     lowered => {
                         return Err(Error::not_implemented(format!(
                             "Unimplemented explain type: {lowered}"
@@ -557,7 +561,14 @@ impl<'a> Transform<'a> {
             "CallStatement" => self.call_query(inner)?,
             _ => return self.unsupported(inner),
         };
-        Ok(Statement::Explain { query, analyze, statistics })
+        // The generated code is printed instead of the plan, so there is nothing for `ANALYZE` or
+        // `STATISTICS` to add to, and taking them would print something other than what they ask.
+        if codegen && (analyze || statistics) {
+            return Err(Error::not_implemented(
+                "EXPLAIN (CODEGEN) cannot be combined with ANALYZE or STATISTICS",
+            ));
+        }
+        Ok(Statement::Explain { query, analyze, statistics, codegen })
     }
 
     /// `CallStatement <- 'CALL' QualifiedTableFunction TableFunctionArguments`, which is the table
@@ -5639,10 +5650,11 @@ mod tests {
             }
             Statement::Transaction(Transaction::Commit) => "COMMIT".to_string(),
             Statement::Transaction(Transaction::Rollback) => "ROLLBACK".to_string(),
-            Statement::Explain { query, analyze, statistics } => {
+            Statement::Explain { query, analyze, statistics, codegen } => {
                 let analyze = if analyze { "ANALYZE " } else { "" };
                 let statistics = if statistics { "(STATISTICS) " } else { "" };
-                format!("EXPLAIN {analyze}{statistics}{}", show_query(&ast, query))
+                let codegen = if codegen { "(CODEGEN) " } else { "" };
+                format!("EXPLAIN {analyze}{statistics}{codegen}{}", show_query(&ast, query))
             }
         }
     }
@@ -5700,6 +5712,7 @@ mod tests {
             round_statement("EXPLAIN ANALYZE (STATISTICS) SELECT 1"),
             "EXPLAIN ANALYZE (STATISTICS) SELECT 1"
         );
+        assert_eq!(round_statement("explain (codegen) select 1"), "EXPLAIN (CODEGEN) SELECT 1");
     }
 
     #[test]
@@ -5710,6 +5723,7 @@ mod tests {
         for (query, named) in [
             ("EXPLAIN (FORMAT JSON) SELECT 1", "Unimplemented explain type: format"),
             ("EXPLAIN (NONSENSE) SELECT 1", "Unimplemented explain type: nonsense"),
+            ("EXPLAIN (CODEGEN, ANALYZE) SELECT 1", "cannot be combined"),
             ("EXPLAIN (ANALYZE false) SELECT 1", "ExplainOption"),
             ("EXPLAIN INSERT INTO t VALUES (1)", "InsertStatement"),
             ("EXPLAIN CREATE TABLE u (a INTEGER)", "CreateStatement"),

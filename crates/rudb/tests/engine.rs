@@ -64,3 +64,33 @@ fn the_engine_setting_takes_two_names_and_resets_to_the_first() {
     database.execute("RESET engine").expect("reset");
     assert_eq!(database.setting("engine").expect("a setting"), "first");
 }
+
+fn explained(database: &Database, sql: &str) -> String {
+    match rows(database, sql).as_slice() {
+        [row] => match &row[1] {
+            Value::Varchar(text) => text.clone(),
+            other => panic!("{sql} explained as {other:?}"),
+        },
+        other => panic!("{sql} explained as {other:?}"),
+    }
+}
+
+#[test]
+fn explain_codegen_prints_the_stages_and_the_module_or_the_refusal() {
+    let database = database();
+    let text = explained(
+        &database,
+        "EXPLAIN (CODEGEN) SELECT s, count(*) FROM t GROUP BY s ORDER BY 2 DESC",
+    );
+    assert!(text.contains("scan "), "{text}");
+    assert!(text.contains("aggregate by 1 keys"), "{text}");
+    assert!(text.contains("module "), "{text}");
+    let text =
+        explained(&database, "EXPLAIN (CODEGEN) SELECT count(*) FROM t a JOIN t b ON a.x = b.x");
+    assert!(text.starts_with("refused: "), "{text}");
+    assert_eq!(
+        database.refusals(),
+        Vec::<String>::new(),
+        "an explain runs nothing, so it logs nothing"
+    );
+}

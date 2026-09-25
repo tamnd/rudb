@@ -75,7 +75,10 @@ pub enum Bound {
     ///
     /// With `statistics` set it prints what the planner knew as well, which is the use and the class
     /// behind every number in the plan. That one changes nothing about the plan or the run either.
-    Explain { plan: Plan, analyze: bool, statistics: bool },
+    ///
+    /// With `codegen` set the layer above hands the plan to the compiled engine and prints what it
+    /// generated instead.
+    Explain { plan: Plan, analyze: bool, statistics: bool, codegen: bool },
 }
 
 /// A bound `SET` or `RESET`.
@@ -524,10 +527,10 @@ fn bind_one(
             Ok(Bound::Detach { name: ast.string(name).to_string(), if_exists })
         }
         ast::Statement::Transaction(kind) => Ok(Bound::Transaction(kind)),
-        ast::Statement::Explain { query, analyze, statistics } => {
+        ast::Statement::Explain { query, analyze, statistics, codegen } => {
             let mut binder = Binder::with(catalog, parameters, session);
             let (root, _) = binder.bind_query(ast, query)?;
-            Ok(Bound::Explain { plan: finish(binder, root)?, analyze, statistics })
+            Ok(Bound::Explain { plan: finish(binder, root)?, analyze, statistics, codegen })
         }
     }
 }
