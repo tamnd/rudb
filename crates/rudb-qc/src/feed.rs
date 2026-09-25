@@ -1,4 +1,10 @@
-//! Handing chunks to a compiled body, one chunk to a morsel.
+//! Running one pipeline as the steps of section 5.4 of `spec/compiler/05-pipelines-and-state.md`,
+//! handing the body one chunk to a morsel.
+//!
+//! Only the body is generated in C1. The other steps a pipeline has are small and run here: init
+//! writes the state header and points the state at what the runtime made for it, and finalize
+//! reads an aggregate's groups out of its table. Every call of the body returns a [`Status`] and
+//! [`Feed::push`] does what it asks.
 //!
 //! The body reads its columns through the morsel's column table, which wants a values address and
 //! a validity bitmap per column. A fixed width column of a flat vector is already the first of
@@ -19,13 +25,16 @@ use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::Plan;
 use rudb_qc_gen::{Body, Out};
 use rudb_qc_interp::Program;
-use rudb_qc_ir::{ErrorKind, Module, status};
-use rudb_qc_rt::abi::{Col, Morsel};
+use rudb_qc_ir::status::{Kind, Status};
+use rudb_qc_ir::{ErrorKind, Module};
+use rudb_qc_pipe::{Pipeline, Step};
+use rudb_qc_plan::Column;
+use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
 use rudb_qc_rt::{RUNTIME_ERROR, Rt, text};
 use rudb_vector::{Chunk, Data, Validity, Vector};
 
 use crate::Under;
-use crate::finish::{Cell, cell, vector};
+use crate::finish::{self, Cell, cell, vector};
 
 /// One pipeline being run.
 pub(crate) struct Feed<'a> {
@@ -33,6 +42,8 @@ pub(crate) struct Feed<'a> {
     program: &'a Program,
     func: usize,
     body: &'a Body,
+    steps: Vec<Step>,
+    columns: &'a [Column],
     cancel: Cancel,
     inner: Mutex<Inner<'a>>,
 }
@@ -40,11 +51,18 @@ pub(crate) struct Feed<'a> {
 /// What a call changes.
 struct Inner<'a> {
     rt: &'a mut Rt,
-    /// The body's state, in words so that every field in it is aligned.
-    state: Vec<u64>,
+    /// The body's state, in cache lines so that the header is aligned as the spec lays it out.
+    state: Vec<Line>,
     /// The chunks a result body produced.
     out: Vec<Chunk>,
+    /// Whether the body said the pipeline may stop.
+    done: bool,
 }
+
+/// One cache line of state.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Line([u8; 64]);
 
 impl fmt::Debug for Feed<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -53,10 +71,11 @@ impl fmt::Debug for Feed<'_> {
 }
 
 impl<'a> Feed<'a> {
-    /// A feed for `body`, with its state set up.
+    /// A feed for pipeline `p`, whose generated body is `body`, with its init step run.
     pub(crate) fn new(
         module: &'a Module,
         program: &'a Program,
+        p: &'a Pipeline,
         body: &'a Body,
         rt: &'a mut Rt,
         cancel: &Cancel,
@@ -64,7 +83,17 @@ impl<'a> Feed<'a> {
         let func = program
             .func(&body.func)
             .ok_or_else(|| Error::internal(format!("no function {} in the module", body.func)))?;
-        let mut state = vec![0u64; (body.state as usize).div_ceil(8)];
+        let steps = p.steps();
+        let columns = match &p.sink {
+            rudb_qc_pipe::Sink::Result { columns, .. }
+            | rudb_qc_pipe::Sink::Aggregate { columns, .. } => columns.as_slice(),
+        };
+        let mut state = vec![Line([0; 64]); (body.state as usize).div_ceil(64).max(1)];
+        // Init. With one worker the local state is the shared state, so the header points at its
+        // own block, which never moves because the vector is never grown.
+        let header = StateHeader::new(state.as_ptr().cast());
+        // SAFETY: the first line of the state is 64 bytes aligned to 64, which is the header.
+        unsafe { state.as_mut_ptr().cast::<StateHeader>().write(header) };
         if let Out::Aggregate(g) = &body.sink {
             if let Some(at) = g.row {
                 // The one group of an aggregate with no groups was made with the table, and rows
@@ -82,8 +111,10 @@ impl<'a> Feed<'a> {
             program,
             func,
             body,
+            steps,
+            columns,
             cancel,
-            inner: Mutex::new(Inner { rt, state, out: Vec::new() }),
+            inner: Mutex::new(Inner { rt, state, out: Vec::new(), done: false }),
         })
     }
 
@@ -103,12 +134,12 @@ impl<'a> Feed<'a> {
         query.run(under.cancel, under.pool)
     }
 
-    /// Runs the body over one chunk.
-    pub(crate) fn push(&self, chunk: &Chunk) -> Result<()> {
+    /// Runs the body over one chunk, and says whether the pipeline wants more.
+    pub(crate) fn push(&self, chunk: &Chunk) -> Result<Progress> {
         let chunk = chunk.clone().settled()?.into_flat()?;
         let rows = chunk.len();
         if rows == 0 {
-            return Ok(());
+            return Ok(Progress::More);
         }
         let mut held = Vec::with_capacity(self.body.reads.len());
         for &c in &self.body.reads {
@@ -127,6 +158,9 @@ impl<'a> Feed<'a> {
             cols: cols.as_ptr(),
         };
         let mut inner = self.lock();
+        if inner.done {
+            return Ok(Progress::Done);
+        }
         let mut buffers = Vec::new();
         if let Out::Result { count, columns } = &self.body.sink {
             let st = bytes(&mut inner.state);
@@ -145,11 +179,22 @@ impl<'a> Feed<'a> {
                 buffers.push(b);
             }
         }
-        let Inner { rt, state, out } = &mut *inner;
+        let Inner { rt, state, out, done } = &mut *inner;
         let st = state.as_mut_ptr().cast::<u8>();
-        let status = self.program.call(self.func, st, (&raw const morsel).cast(), &mut **rt);
+        loop {
+            let status = self.program.call(self.func, st, (&raw const morsel).cast(), &mut **rt);
+            match Status(status).kind() {
+                Kind::Ok => break,
+                // The body saved where it got to in the header's cursor and picks up there.
+                Kind::Yield => {}
+                Kind::Done => {
+                    *done = true;
+                    break;
+                }
+                _ => return Err(self.check(Status(status), rt)),
+            }
+        }
         drop(held);
-        self.check(status, rt)?;
         if let Out::Result { count, columns } = &self.body.sink {
             let st = bytes(state);
             let n = u64::from_le_bytes(
@@ -171,46 +216,65 @@ impl<'a> Feed<'a> {
             }
             out.push(Chunk::with_rows(vectors, n)?);
         }
-        Ok(())
+        Ok(if *done { Progress::Done } else { Progress::More })
     }
 
-    /// The chunks a result body produced, once every chunk has been pushed.
+    /// Runs the steps after the body once every chunk has been pushed, and returns the rows the
+    /// pipeline produced.
     pub(crate) fn finish(self) -> Result<Vec<Chunk>> {
         let inner = self.inner.into_inner().map_err(|_| Error::internal("a feed was poisoned"))?;
-        Ok(inner.out)
+        let mut out = inner.out;
+        for step in &self.steps {
+            match step {
+                Step::Init | Step::Body => {}
+                // The accumulators of an aggregate with no groups are the one row of its table,
+                // so there is nothing kept aside to flush.
+                Step::LocalFin => {}
+                Step::Merge => return Err(Error::internal("a merge step with one worker")),
+                Step::Finalize => {
+                    if let Out::Aggregate(g) = &self.body.sink {
+                        out = finish::groups(inner.rt, g, self.columns)?;
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner<'a>> {
         self.inner.lock().unwrap_or_else(|held| held.into_inner())
     }
 
-    /// Turns a status other than `OK` into the error it stands for.
-    fn check(&self, s: u64, rt: &mut Rt) -> Result<()> {
-        match status::kind(s) {
-            status::OK => Ok(()),
-            status::CANCELLED => {
-                self.cancel.check()?;
-                Err(Error::interrupt("Interrupted!"))
-            }
-            status::ERROR if status::payload(s) == RUNTIME_ERROR => Err(rt
+    /// The error a status that stops the pipeline stands for.
+    fn check(&self, s: Status, rt: &mut Rt) -> Error {
+        match s.kind() {
+            Kind::Cancelled => match self.cancel.check() {
+                Err(e) => e,
+                Ok(()) => Error::interrupt("Interrupted!"),
+            },
+            Kind::Error if s.payload() == RUNTIME_ERROR => rt
                 .take_error()
-                .unwrap_or_else(|| Error::internal("the runtime failed and did not say why"))),
-            status::ERROR => {
-                let site = usize::try_from(status::payload(s))
-                    .ok()
-                    .and_then(|at| self.module.errors.get(at))
-                    .ok_or_else(|| Error::internal(format!("status {s:#x} names no error site")))?;
+                .unwrap_or_else(|| Error::internal("the runtime failed and did not say why")),
+            Kind::Error => {
+                let Some(site) =
+                    usize::try_from(s.payload()).ok().and_then(|at| self.module.errors.get(at))
+                else {
+                    return Error::internal(format!("status {s:?} names no error site"));
+                };
                 let code = match site.kind {
                     ErrorKind::Overflow | ErrorKind::DivideByZero | ErrorKind::OutOfRange => {
                         ErrorCode::OutOfRange
                     }
                     ErrorKind::Conversion => ErrorCode::Conversion,
                     ErrorKind::Cancel => ErrorCode::Interrupt,
-                    ErrorKind::Internal => return Err(Error::internal(site.text.clone())),
+                    ErrorKind::Internal => return Error::internal(site.text.clone()),
                 };
-                Err(Error::new(code, site.text.clone()))
+                Error::new(code, site.text.clone())
             }
-            other => Err(Error::internal(format!("a pipeline returned status {other}"))),
+            // No body in C1 has a guard, and none of its slots grows, so these are bugs.
+            Kind::Deopt => Error::internal(format!("a pipeline deoptimized at {s:?}")),
+            Kind::NeedMemory => Error::internal(format!("a pipeline asked for memory, {s:?}")),
+            _ => Error::internal(format!("a pipeline returned status {s:?}")),
         }
     }
 }
@@ -222,9 +286,9 @@ struct Buffers {
 }
 
 /// The state as bytes.
-fn bytes(state: &mut [u64]) -> &mut [u8] {
-    // SAFETY: a `u64` is eight bytes with no padding and any byte pattern is one.
-    unsafe { std::slice::from_raw_parts_mut(state.as_mut_ptr().cast::<u8>(), state.len() * 8) }
+fn bytes(state: &mut [Line]) -> &mut [u8] {
+    // SAFETY: a `Line` is 64 bytes with no padding and any byte pattern is one.
+    unsafe { std::slice::from_raw_parts_mut(state.as_mut_ptr().cast::<u8>(), state.len() * 64) }
 }
 
 /// A source column as the body reads it, and whatever had to be made for that.
@@ -308,8 +372,7 @@ impl Sink for Scan<'_, '_> {
     }
 
     fn sink(&self, chunk: &Chunk, _local: &mut Self::Local) -> Result<Progress> {
-        self.0.push(chunk)?;
-        Ok(Progress::More)
+        self.0.push(chunk)
     }
 
     fn combine(&self, _local: Self::Local) -> Result<()> {

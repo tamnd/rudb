@@ -10,12 +10,22 @@
 //! The breakers are the aggregate, which is a sink, and the sort, top N, limit and fetch, which in
 //! C1 are stages of their own over the rows the pipeline before them produced. They are few rows
 //! or cheap work in ClickBench, and a compiled top N is part of C3.
+//!
+//! The stages form the graph of section 5.2: [`Graph::edges`] lists which stage waits for which,
+//! and every edge in C1 is a [`EdgeKind::Finalize`] edge, because a stage only ever reads what an
+//! earlier one finished. Each pipeline runs as the steps of section 5.4, which [`Pipeline::steps`]
+//! derives from the kinds of its state slots, and every step starts from a state whose first line
+//! is a [`StateHeader`]. C1 runs every pipeline on one worker, so no pipeline has a merge step and
+//! its local state is its shared state.
 
 use std::fmt;
 
 use rudb_common::Value;
 use rudb_plan::NodeRef;
 use rudb_qc_plan::{Aggregate, Column, Expr, Key, Kind, Rel};
+
+pub use rudb_qc_ir::status::Status;
+pub use rudb_qc_rt::abi::StateHeader;
 
 /// Where a pipeline's rows come from.
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +99,91 @@ pub struct Pipeline {
     pub sink: Sink,
 }
 
+/// The kind of a state slot, from the table in section 5.5.1. Only the kinds C1 fills are here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotKind {
+    /// The output rows of a result sink.
+    ResultSink,
+    /// A hash aggregate's table.
+    AggTable,
+    /// The accumulators of an aggregate with no groups.
+    ScalarAcc,
+}
+
+/// One of the steps a pipeline runs as, per section 5.4. Every step has the same signature, a
+/// state and a morsel in and a [`Status`] out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Step {
+    /// Once per worker before its first morsel: set up the local state.
+    Init,
+    /// Once per morsel: the fused loop.
+    Body,
+    /// Once per worker after its last morsel: flush what the worker kept to itself.
+    LocalFin,
+    /// Once per worker: fold its local state into the shared state.
+    Merge,
+    /// Once per pipeline: build and publish what later stages read.
+    Finalize,
+}
+
+/// How many workers run a pipeline. C1 has one runtime per query and runs every pipeline on one.
+pub const DOP: usize = 1;
+
+impl Pipeline {
+    /// The state slots the pipeline writes, in the order they are laid out.
+    #[must_use]
+    pub fn slots(&self) -> Vec<SlotKind> {
+        match &self.sink {
+            Sink::Result { .. } => vec![SlotKind::ResultSink],
+            Sink::Aggregate { groups, .. } if groups.is_empty() => vec![SlotKind::ScalarAcc],
+            Sink::Aggregate { .. } => vec![SlotKind::AggTable],
+        }
+    }
+
+    /// The steps the pipeline runs, in order, from its slots and [`DOP`].
+    ///
+    /// Every pipeline has an init step, which writes the state header, and a body. A slot that
+    /// keeps partials needs a local finish and one that others read needs a finalize. A merge
+    /// is only there with more than one worker.
+    #[must_use]
+    pub fn steps(&self) -> Vec<Step> {
+        let slots = self.slots();
+        let mut steps = vec![Step::Init, Step::Body];
+        if slots.contains(&SlotKind::ScalarAcc) {
+            steps.push(Step::LocalFin);
+        }
+        if DOP > 1 {
+            steps.push(Step::Merge);
+        }
+        if slots.iter().any(|s| matches!(s, SlotKind::AggTable | SlotKind::ScalarAcc)) {
+            steps.push(Step::Finalize);
+        }
+        steps
+    }
+}
+
+/// Why one stage waits for another, per section 5.2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// The consumer reads what the producer built: a table, a buffer of rows, a sorted run.
+    Finalize,
+    /// The consumer's scan applies a filter the producer publishes.
+    FilterPublish,
+    /// The consumer has to see its rows after the producer's.
+    Order,
+}
+
+/// A dependency between two stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Edge {
+    /// The stage that has to finish first.
+    pub from: usize,
+    /// The stage that waits for it.
+    pub to: usize,
+    /// Why.
+    pub kind: EdgeKind,
+}
+
 /// One step of a query.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stage {
@@ -154,6 +249,21 @@ impl Stage {
             | Stage::Fetch { columns, .. } => columns,
         }
     }
+
+    /// The stages this one reads.
+    #[must_use]
+    pub fn inputs(&self) -> Vec<usize> {
+        match self {
+            Stage::Pipeline(p) => match &p.source {
+                Source::Stage { stage, .. } => vec![*stage],
+                Source::Scan { .. } | Source::Values { .. } => Vec::new(),
+            },
+            Stage::Sort { input, .. }
+            | Stage::TopN { input, .. }
+            | Stage::Limit { input, .. }
+            | Stage::Fetch { input, .. } => vec![*input],
+        }
+    }
 }
 
 /// A query as stages. Each stage reads only stages before it, and the last one is the answer.
@@ -176,6 +286,18 @@ impl Graph {
             Stage::Pipeline(p) => Some((i, p)),
             _ => None,
         })
+    }
+
+    /// The edges between stages, by the stage that waits.
+    #[must_use]
+    pub fn edges(&self) -> Vec<Edge> {
+        let mut edges = Vec::new();
+        for (to, stage) in self.stages.iter().enumerate() {
+            for from in stage.inputs() {
+                edges.push(Edge { from, to, kind: EdgeKind::Finalize });
+            }
+        }
+        edges
     }
 }
 
@@ -361,6 +483,12 @@ impl fmt::Display for Graph {
                 }
             }
         }
+        let edges = self.edges();
+        if !edges.is_empty() {
+            let edges: Vec<String> =
+                edges.iter().map(|e| format!("{} -{:?}-> {}", e.from, e.kind, e.to)).collect();
+            writeln!(f, "edges: {}", edges.join(", "))?;
+        }
         Ok(())
     }
 }
@@ -387,6 +515,9 @@ mod tests {
         assert_eq!(g.stages.len(), 2, "{g}");
         let Stage::Pipeline(agg) = &g.stages[0] else { panic!("{g}") };
         assert_eq!(agg.filters.len(), 1);
+        assert_eq!(agg.slots(), [SlotKind::AggTable]);
+        assert_eq!(agg.steps(), [Step::Init, Step::Body, Step::Finalize]);
+        assert_eq!(g.edges(), [Edge { from: 0, to: 1, kind: EdgeKind::Finalize }]);
         assert!(matches!(agg.sink, Sink::Aggregate { .. }));
         // The projection over the aggregate only renames, so the top N reads the aggregate.
         assert!(matches!(g.stages[1], Stage::TopN { input: 0, .. }));
@@ -401,6 +532,8 @@ mod tests {
             "    Get memory.main.a AS a #0 [x::INTEGER]\n",
         ));
         let Stage::Pipeline(p) = &g.stages[0] else { panic!("{g}") };
+        assert_eq!(p.steps(), [Step::Init, Step::Body]);
+        assert!(g.edges().is_empty());
         let Kind::Compare { left, .. } = &p.filters[0].kind else { panic!("{g}") };
         assert!(matches!(&left.kind, Kind::Function { name, .. } if name == "+"));
         assert_eq!(left.columns(), [0]);
