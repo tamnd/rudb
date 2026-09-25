@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.36
+
+A patch release of seven commits, mostly on the graph layer's link joins, with the fused hash join in the compiled engine and two families of list functions. The native directory format number stays at 30 and the storage format version at 9.
+
+On the graph layer, #1929 always pushes a join through a monotone link, because the push now walks only the parents the set holds rather than every parent. A join whose build key is not a parent key reduces through the link on the driving column, and a scan that reads several joins places rows only from its own and tests the rest against their key bitmaps. #1931 gathers a parent whose rows a chunk scatters over most of its parts out of the column held end to end, instead of splitting every chunk by part. With all ten TPC-H relationships declared on SF1, single thread instructions for the suite go from 9.17 to 8.30 billion on the clustered file and from 11.32 to 10.74 on the base one. q04 goes from 0.281 to 0.106 and q09 from 1.263 to 1.064 on the clustered file, and every answer is the same. On aggregation, #1927 walks a run once for all the calls that share the pass rather than once per call, which is what q01's five sums over one layout do.
+
+For the query compiler, #1928 compiles inner equi-joins as the fused hash join of spec 10.5, the last operator the C1 physical plan asks for, and #1926 gives the compiled pipelines the graph, state header, status word and steps of spec 05.
+
+#1925 adds string_split, string_split_regex and their aliases, rewrites split_part over them, and names subscripts the way they were written. #1930 adds unnest in the select list and as a table function, including recursive and max_depth.
+
 ## 0.4.35
 
 A patch release of fifteen commits. The compiled engine now answers all 43 ClickBench queries the same as the first engine at ten million rows, the join build runs on every thread, and a setting turns off answers read from load time summaries. The native directory format number stays at 30 and the storage format version at 9.
