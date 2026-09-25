@@ -11039,10 +11039,7 @@ fn an_array_is_a_list_written_with_the_keyword_or_a_query_gathered_into_one() {
         text("SELECT ARRAY(SELECT i FROM range(300000) t(i) ORDER BY i % 7, i DESC)[1:2]"),
         "[299999, 299992]"
     );
-    assert_eq!(
-        text("SELECT ARRAY(SELECT i FROM range(9) t(i) ORDER BY i DESC LIMIT 2)"),
-        "[8, 7]"
-    );
+    assert_eq!(text("SELECT ARRAY(SELECT i FROM range(9) t(i) ORDER BY i DESC LIMIT 2)"), "[8, 7]");
     assert!(
         failure(&db, "SELECT ARRAY(SELECT i, i FROM range(2) t(i))")
             .contains("Subquery returns 2 columns - expected 1")
