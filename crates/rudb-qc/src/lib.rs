@@ -23,13 +23,13 @@
 
 mod feed;
 mod finish;
+mod tier;
 
 use rudb_catalog::Catalog;
 use rudb_common::{Cancel, LogicalType, Memory, Result, Session};
 use rudb_pipeline::{Pool, Progress};
 use rudb_plan::Plan;
 use rudb_qc_gen::Query;
-use rudb_qc_interp::Program;
 use rudb_qc_pipe::{Graph, Source, Stage};
 use rudb_qc_plan::Kind;
 pub use rudb_qc_plan::Refusal;
@@ -37,13 +37,15 @@ use rudb_qc_rt::Rt;
 use rudb_vector::Chunk;
 
 use crate::feed::Feed;
+use crate::tier::Tiers;
+pub use crate::tier::{Options, Report, Tier};
 
 /// A query the compiled engine has agreed to run.
 #[derive(Debug)]
 pub struct Compiled {
     graph: Graph,
     query: Query,
-    program: Program,
+    tiers: Tiers,
     rt: Rt,
 }
 
@@ -65,13 +67,27 @@ pub struct Answer {
 /// A refusal from the physical plan, the generator or the driver itself. None of them is an error
 /// in the query: the caller runs the first engine instead and logs the refusal.
 pub fn compile(plan: &Plan, cancel: &Cancel) -> std::result::Result<Compiled, Refusal> {
+    compile_with(plan, cancel, Options::default())
+}
+
+/// [`compile`], on the tier `options` asks for.
+///
+/// # Errors
+///
+/// As for [`compile`]. A function the tier does not lower is not a refusal: it runs on `interp`,
+/// and [`Compiled::report`] says so.
+pub fn compile_with(
+    plan: &Plan,
+    cancel: &Cancel,
+    options: Options,
+) -> std::result::Result<Compiled, Refusal> {
     let rel = rudb_qc_plan::lower(plan)?;
     let graph = rudb_qc_pipe::split(&rel);
     check(&graph)?;
     let mut rt = Rt::new(cancel.clone());
     let query = rudb_qc_gen::generate(&graph, &mut rt)?;
-    let program = Program::new(&query.module);
-    Ok(Compiled { graph, query, program, rt })
+    let tiers = Tiers::new(&query.module, options.tier);
+    Ok(Compiled { graph, query, tiers, rt })
 }
 
 /// Refuses what the driver cannot run yet.
@@ -119,6 +135,12 @@ impl Compiled {
         format!("{}\n{}", self.graph, rudb_qc_ir::print::print(&self.query.module))
     }
 
+    /// What the second tier did with the module.
+    #[must_use]
+    pub fn report(&self) -> &Report {
+        self.tiers.report()
+    }
+
     /// Runs the query.
     ///
     /// # Errors
@@ -135,7 +157,7 @@ impl Compiled {
                         .ok_or_else(|| rudb_common::Error::internal("a pipeline with no body"))?;
                     let feed = Feed::new(
                         &self.query.module,
-                        &self.program,
+                        &self.tiers,
                         p,
                         body,
                         &mut self.rt,

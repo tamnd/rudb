@@ -9,6 +9,10 @@
 //! counts as is a refusal, and the refusals are printed grouped by reason at the end, which is the
 //! list of what to build next.
 //!
+//! `--tier` picks the tier the compiled engine runs on, which is how C2's exit criterion, the same
+//! answers on `clif`, is checked, and `--suite` points the same comparison at TPC-H or JOB: the
+//! tables and the queries are read the way `cargo xtask refusals` reads them.
+//!
 //! Rows are compared as sorted lists, because a query with no `ORDER BY` has no order to hold
 //! either engine to, and a double is compared to a relative 1e-9 because two engines adding the
 //! same numbers in a different order do not have to agree on the last bit. A query that orders and
@@ -22,6 +26,8 @@ use std::time::Instant;
 use rudb::Database;
 use rudb_common::Value;
 
+use crate::refusals;
+
 /// The projection `tamnd/rudb-bench` loads the file through, which turns the integer times and the
 /// day number into the types the DDL declares.
 const FIXUP: &str = "* REPLACE (make_date(EventDate) AS EventDate, epoch_ms(EventTime * 1000) AS \
@@ -29,27 +35,57 @@ const FIXUP: &str = "* REPLACE (make_date(EventDate) AS EventDate, epoch_ms(Even
                      epoch_ms(LocalEventTime * 1000) AS LocalEventTime)";
 
 pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
-    let Some(first) = args.first() else {
-        return Err("usage: cargo xtask compiled <file.parquet> [q1 q2 ...]".into());
+    let usage = || {
+        "usage: cargo xtask compiled [--tier auto|interp|clif] <file.parquet> [q1 q2 ...]\n       \
+         cargo xtask compiled [--tier auto|interp|clif] --suite <parquet dir> <queries> [q1 ...]"
+            .to_string()
     };
-    let file = PathBuf::from(first);
-    let file =
-        file.canonicalize().map_err(|e| format!("could not resolve {}: {e}", file.display()))?;
-    let only: Vec<&str> = args[1..].iter().map(String::as_str).collect();
-
-    let (ddl, queries) = statements(root)?;
+    let mut args = args;
+    let mut tier = "auto".to_string();
+    if let [flag, name, rest @ ..] = args
+        && flag == "--tier"
+    {
+        tier = name.clone();
+        args = rest;
+    }
     let database = Database::new();
-    database.execute(&ddl).map_err(|e| format!("the hits DDL: {e}"))?;
-    let load = format!(
-        "INSERT INTO hits SELECT {FIXUP} FROM read_parquet('{}', binary_as_string=True)",
-        file.display()
-    );
-    let began = Instant::now();
-    database.execute(&load).map_err(|e| format!("loading {}: {e}", file.display()))?;
-    let rows = database.table_len("hits").map_err(|e| e.to_string())?;
-    println!();
-    println!("file    {}", file.display());
-    println!("rows    {rows}, loaded in {:.1}s", began.elapsed().as_secs_f64());
+    // The tier is set before anything runs, so a build without it fails here and not after a
+    // load of ten million rows.
+    database.execute(&format!("SET qc_tier = '{tier}'")).map_err(|e| e.to_string())?;
+    let (queries, only) = match args {
+        [flag, tables, queries, only @ ..] if flag == "--suite" => {
+            let began = Instant::now();
+            let created = refusals::create(&database, Path::new(tables))?;
+            println!();
+            println!(
+                "tables  {created} from {tables}, loaded in {:.1}s",
+                began.elapsed().as_secs_f64()
+            );
+            (refusals::read(Path::new(queries))?, only)
+        }
+        [first, only @ ..] if !first.starts_with("--") => {
+            let file = PathBuf::from(first);
+            let file = file
+                .canonicalize()
+                .map_err(|e| format!("could not resolve {}: {e}", file.display()))?;
+            let (ddl, queries) = statements(root)?;
+            database.execute(&ddl).map_err(|e| format!("the hits DDL: {e}"))?;
+            let load = format!(
+                "INSERT INTO hits SELECT {FIXUP} FROM read_parquet('{}', binary_as_string=True)",
+                file.display()
+            );
+            let began = Instant::now();
+            database.execute(&load).map_err(|e| format!("loading {}: {e}", file.display()))?;
+            let rows = database.table_len("hits").map_err(|e| e.to_string())?;
+            println!();
+            println!("file    {}", file.display());
+            println!("rows    {rows}, loaded in {:.1}s", began.elapsed().as_secs_f64());
+            (queries, only)
+        }
+        _ => return Err(usage()),
+    };
+    let only: Vec<&str> = only.iter().map(String::as_str).collect();
+    println!("tier    {tier}");
     println!();
     println!("{:<5} {:>9} {:>9}  verdict", "query", "first", "compiled");
 

@@ -27,6 +27,14 @@ rudb-qc-rt.workspace = true
 rudb-qc-plan.workspace = true
 rudb-qc-pipe.workspace = true
 rudb-qc-gen.workspace = true
+rudb-qc-clif = { workspace = true, optional = true }
+
+[features]
+default = []
+# The second tier, `clif`: pipeline functions compiled to machine code through Cranelift. Off by
+# default so that the default build keeps the zero dependency rule. CI builds with every feature
+# and `cargo xtask` turns it on for the tasks that measure.
+qc-clif = ["dep:rudb-qc-clif"]
 
 [lints]
 workspace = true

@@ -37,6 +37,8 @@ default = []
 # Off by default since the system allocator measured ahead on the queries, see `main.rs`. On gives
 # the mimalloc build back for a workload that is mostly cross thread frees.
 mimalloc = ["dep:libmimalloc-sys"]
+# The query compiler's second tier, see `rudb-qc`.
+qc-clif = ["rudb/qc-clif"]
 
 [lints]
 workspace = true

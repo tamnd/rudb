@@ -148,3 +148,26 @@ fn a_top_n_over_wide_rows_reads_them_back_on_the_compiled_engine() {
     assert_eq!(rows(&database, sql), compiled);
     assert_eq!(database.refusals(), Vec::<String>::new());
 }
+
+#[test]
+fn every_tier_the_build_has_answers_what_the_first_engine_answers() {
+    let database = database();
+    let sql = "SELECT s, count(*), sum(x), min(x) FROM t WHERE x % 3 <> 1 GROUP BY s ORDER BY s NULLS FIRST";
+    database.execute("SET engine = 'first'").expect("the first engine");
+    let first = rows(&database, sql);
+    database.execute("SET engine = 'compiled'").expect("the compiled engine");
+    for tier in ["auto", "interp", "clif"] {
+        let set = database.execute(&format!("SET qc_tier = '{tier}'"));
+        if tier == "clif" && !cfg!(feature = "qc-clif") {
+            let error = set.expect_err("clif needs the feature").to_string();
+            assert!(error.contains("qc-clif"), "{error}");
+            continue;
+        }
+        set.unwrap_or_else(|error| panic!("SET qc_tier = '{tier}' failed: {error}"));
+        assert_eq!(database.setting("qc_tier").expect("qc_tier reads back"), tier);
+        assert_eq!(rows(&database, sql), first, "{tier}");
+    }
+    let error = database.execute("SET qc_tier = 'llvm'").expect_err("no such tier").to_string();
+    assert!(error.contains("auto, interp, clif"), "{error}");
+    assert_eq!(database.refusals(), Vec::<String>::new());
+}

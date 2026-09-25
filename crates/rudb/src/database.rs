@@ -3006,7 +3006,8 @@ impl Shared {
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 if self.inner.settings.engine() == COMPILED_ENGINE {
-                    match rudb_qc::compile(&plan, cancel) {
+                    let options = rudb_qc::Options { tier: self.inner.settings.tier() };
+                    match rudb_qc::compile_with(&plan, cancel, options) {
                         Ok(compiled) => {
                             return run_compiled(sql, &plan, &catalog, cancel, compiled, under);
                         }

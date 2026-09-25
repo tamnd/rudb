@@ -30,7 +30,6 @@ use rudb_common::{Cancel, Error, ErrorCode, Result};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::Plan;
 use rudb_qc_gen::{Body, Out};
-use rudb_qc_interp::Program;
 use rudb_qc_ir::status::{Kind, Status};
 use rudb_qc_ir::{ErrorKind, Module};
 use rudb_qc_pipe::{Pipeline, Step};
@@ -41,11 +40,12 @@ use rudb_vector::{Chunk, Data, Validity, Vector};
 
 use crate::Under;
 use crate::finish::{self, Cell, cell, vector};
+use crate::tier::Tiers;
 
 /// One pipeline being run.
 pub(crate) struct Feed<'a> {
     module: &'a Module,
-    program: &'a Program,
+    tiers: &'a Tiers,
     func: usize,
     body: &'a Body,
     steps: Vec<Step>,
@@ -80,13 +80,13 @@ impl<'a> Feed<'a> {
     /// A feed for pipeline `p`, whose generated body is `body`, with its init step run.
     pub(crate) fn new(
         module: &'a Module,
-        program: &'a Program,
+        tiers: &'a Tiers,
         p: &'a Pipeline,
         body: &'a Body,
         rt: &'a mut Rt,
         cancel: &Cancel,
     ) -> Result<Feed<'a>> {
-        let func = program
+        let func = tiers
             .func(&body.func)
             .ok_or_else(|| Error::internal(format!("no function {} in the module", body.func)))?;
         let steps = p.steps();
@@ -132,7 +132,7 @@ impl<'a> Feed<'a> {
         let cancel = cancel.clone();
         Ok(Feed {
             module,
-            program,
+            tiers,
             func,
             body,
             steps,
@@ -213,8 +213,7 @@ impl<'a> Feed<'a> {
             }
             let st = state.as_mut_ptr().cast::<u8>();
             loop {
-                let status =
-                    self.program.call(self.func, st, (&raw const morsel).cast(), &mut **rt);
+                let status = self.tiers.call(self.func, st, (&raw const morsel).cast(), rt);
                 match Status(status).kind() {
                     Kind::Ok => break 'attempt,
                     // The body saved where it got to in the header's cursor and picks up there.

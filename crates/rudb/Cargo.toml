@@ -35,6 +35,11 @@ rudb-arrow.workspace = true
 rudb-io.workspace = true
 iana-time-zone.workspace = true
 
+[features]
+default = []
+# The query compiler's second tier, see `rudb-qc`.
+qc-clif = ["rudb-qc/qc-clif"]
+
 [dev-dependencies]
 rudb-csv.workspace = true
 
