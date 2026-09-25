@@ -46,7 +46,12 @@ impl fmt::Debug for Call {
 impl Call {
     /// The call of `name` over `args`, answering `returns`, with the columns it reads named by
     /// `columns` for the message that quotes it.
-    pub(crate) fn new(name: &str, args: &[Expr], returns: &LogicalType, columns: &[Column]) -> Call {
+    pub(crate) fn new(
+        name: &str,
+        args: &[Expr],
+        returns: &LogicalType,
+        columns: &[Column],
+    ) -> Call {
         let literals: Vec<Option<Value>> = args
             .iter()
             .map(|a| match &a.kind {

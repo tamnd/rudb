@@ -295,6 +295,7 @@ pub(crate) fn fetch(
             continue;
         }
         let mut held = Vec::with_capacity(count);
+        // row at a time: these are the ordinals a top N kept, at most 1,024 of them.
         for i in 0..count {
             match chunk.column(ordinal)?.value_at(i) {
                 Value::BigInt(n) => held

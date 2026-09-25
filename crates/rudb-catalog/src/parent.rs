@@ -494,6 +494,7 @@ impl Parent {
         // the chance they were are strings like the rest.
         for piece in &mut pieces {
             if piece.form() != Form::Flat {
+                // flatten: the pieces do not share one dictionary, so the column is built as strings.
                 *piece = piece.flatten()?;
             }
         }

@@ -180,7 +180,7 @@ impl Compiled {
             outputs.push(Some(chunks));
         }
         let columns = self.graph.columns();
-        let chunks = outputs.pop().flatten().unwrap_or_default();
+        let chunks = outputs.pop().unwrap_or_default().unwrap_or_default();
         Ok(Answer {
             names: columns.iter().map(|c| c.name.clone()).collect(),
             types: columns.iter().map(|c| c.ty.clone()).collect(),
