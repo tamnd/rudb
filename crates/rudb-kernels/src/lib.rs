@@ -80,6 +80,7 @@ pub mod scalar;
 pub mod select;
 mod sequence;
 mod shape;
+mod split;
 mod structs;
 mod subscript;
 mod text;

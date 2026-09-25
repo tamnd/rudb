@@ -3010,6 +3010,60 @@ fn error_fails_with_the_message_it_was_given() {
     );
 }
 
+/// The splits cut at every separator and keep the empty pieces, a null separator leaves the string
+/// whole, and `split_part` is the pin's macro over them.
+#[test]
+fn a_string_splits_the_way_the_pin_splits_it() {
+    let db = database();
+    let strings = |values: &[&str]| Value::List {
+        element: LogicalType::Varchar,
+        values: values.iter().map(|value| text(value)).collect(),
+    };
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT string_split('a,b,,c', ','), str_split('héllo', ''), string_to_array('a,b', NULL), \
+             string_split_regex('a1b22c', '[0-9]+'), regexp_split_to_array('aXbxc', 'x', 'i')"
+        ),
+        vec![vec![
+            strings(&["a", "b", "", "c"]),
+            strings(&["h", "é", "l", "l", "o"]),
+            strings(&["a,b"]),
+            strings(&["a", "b", "c"]),
+            strings(&["a", "b", "c"]),
+        ]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT split_part('a,b,c', ',', 2), split_part('a,b,c', ',', -1), split_part('a,b,c', ',', 5)"
+        ),
+        vec![vec![text("b"), text("c"), text("")]]
+    );
+    assert_eq!(
+        failure(&db, "SELECT string_split_regex('a', 'x', 'g')"),
+        "Option 'g' (global replace) is only valid for regexp_replace"
+    );
+}
+
+/// A subscript is named in the brackets it was written in, with the bounds that were left out
+/// left out of the name too, and a written `array_extract` keeps its own name.
+#[test]
+fn a_subscript_is_named_as_it_was_written() {
+    let db = database();
+    let result =
+        db.query("SELECT [1, 2][1], [1, 2, 3][2:], [1, 2, 3][:2], array_extract([1], 1)").unwrap();
+    assert_eq!(
+        result.names(),
+        [
+            "list_value(1, 2)[1]",
+            "list_value(1, 2, 3)[2:]",
+            "list_value(1, 2, 3)[:2]",
+            "array_extract(list_value(1), 1)"
+        ]
+    );
+}
+
 /// A number is named after the value it stands for, and a minus written onto a decimal is part of
 /// it unless brackets or a second minus keep them apart.
 #[test]

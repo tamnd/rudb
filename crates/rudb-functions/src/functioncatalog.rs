@@ -307,11 +307,9 @@ fn positional(count: usize) -> Vec<String> {
 /// The names one function's arguments go by, which is [`positional`] unless the function is in
 /// [`PARAMETER_NAMES`].
 fn named(name: &str, count: usize) -> Vec<String> {
-    match PARAMETER_NAMES.iter().find(|(entry, _)| *entry == name) {
-        Some((_, names)) if names.len() == count => {
-            names.iter().map(|name| (*name).to_string()).collect()
-        }
-        _ => positional(count),
+    match PARAMETER_NAMES.iter().find(|(entry, names)| *entry == name && names.len() == count) {
+        Some((_, names)) => names.iter().map(|name| (*name).to_string()).collect(),
+        None => positional(count),
     }
 }
 
@@ -325,10 +323,26 @@ fn named(name: &str, count: usize) -> Vec<String> {
 /// binder about the same argument. `error` is here because the pin names its one argument
 /// `message`, though its candidate list still says `col0`.
 ///
+/// The splits are here because the pin names their arguments in this table while its candidate
+/// lists still say `col0`, which is the other way round from most functions.
+///
 /// A row only applies at the argument count it has names for, so a function with two arities keeps
-/// `col0` at the arity this list does not cover rather than being given the wrong names.
-const PARAMETER_NAMES: &[(&str, &[&str])] =
-    &[("current_setting", &["setting_name"]), ("error", &["message"])];
+/// `col0` at an arity this list does not cover rather than being given the wrong names, and one
+/// with two named arities has a row for each.
+const PARAMETER_NAMES: &[(&str, &[&str])] = &[
+    ("current_setting", &["setting_name"]),
+    ("error", &["message"]),
+    ("regexp_split_to_array", &["string", "regex"]),
+    ("regexp_split_to_array", &["string", "regex", "options"]),
+    ("split", &["string", "separator"]),
+    ("str_split", &["string", "separator"]),
+    ("str_split_regex", &["string", "regex"]),
+    ("str_split_regex", &["string", "regex", "options"]),
+    ("string_split", &["string", "separator"]),
+    ("string_split_regex", &["string", "regex"]),
+    ("string_split_regex", &["string", "regex", "options"]),
+    ("string_to_array", &["string", "separator"]),
+];
 
 #[cfg(test)]
 mod tests {
