@@ -396,13 +396,15 @@ impl Rids {
         Ok(Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false })
     }
 
-    /// The push over a monotone link, a parent at a time.
+    /// The push over a monotone link, a held parent at a time.
     ///
     /// The children of one parent are one run of ones in the link, so a parent the set holds keeps
-    /// the whole run and one it does not keep none of it. The walk is then one step a parent and a
-    /// range of bits set, where reading the link a child at a time is one step a child and a test
-    /// of the set in each. On `lineitem` against `orders` that is a million and a half steps rather
-    /// than six million, see spec/perf/52-a-push-a-parent-at-a-time.md.
+    /// the whole run and one it does not keep none of it. The walk goes from one held parent to the
+    /// next by counting the zeros between them a word at a time, and sets the range of bits for
+    /// each run it lands on, so a parent the set does not hold costs its share of a word and not a
+    /// step of its own. Stepping every parent and testing the set for each cost about fifty seven
+    /// instructions a parent, which on TPC-H q21 was 85 million a push to keep a tenth of `orders`,
+    /// see spec/perf/52-a-push-a-parent-at-a-time.md for where the step a parent came from.
     ///
     /// A part is counted as skipped when none of its rows is kept, which for a link in parent order
     /// is the part the zone map would have ruled out. The early stop is asked at the first run
@@ -414,12 +416,20 @@ impl Rids {
         let len = runs.len();
         let mark = children.div_ceil(STOP_AFTER);
         let mut asked = !stopping;
-        let (mut parent, mut child, mut kept, mut at) = (0_u64, 0_u64, 0_u64, 0_usize);
-        // A sparse set is asked in ascending order, so a cursor into it does what a binary search
-        // a parent would.
-        let mut cursor = 0;
-        while at < len {
+        // `at` is where the run of parent `parent` starts, which is past `parent` zeros, so the
+        // children before it are `at - parent`.
+        let (mut parent, mut at, mut kept) = (0_u64, 0_usize, 0_u64);
+        for held in self.iter() {
+            if held > parent {
+                let Some(next) = past_zeros(bits, at, held - parent) else { break };
+                at = next;
+                parent = held;
+            }
+            if at > len {
+                break;
+            }
             let run = count(ones_from(bits, at, len));
+            let child = count(at) - parent;
             if run > 0 {
                 if !asked && child >= mark {
                     asked = true;
@@ -432,21 +442,8 @@ impl Rids {
                         };
                     }
                 }
-                let held = match &self.body {
-                    Body::Full => true,
-                    Body::Dense { words, .. } => bit(words, parent),
-                    Body::Sparse(members) => {
-                        while members.get(cursor).is_some_and(|&member| member < parent) {
-                            cursor += 1;
-                        }
-                        members.get(cursor) == Some(&parent)
-                    }
-                };
-                if held {
-                    set_range(&mut words, child, child + run);
-                    kept += run;
-                }
-                child += run;
+                set_range(&mut words, child, child + run);
+                kept += run;
             }
             // The zero after the run, which moves on to the next parent.
             at += index(run) + 1;
@@ -636,6 +633,27 @@ fn shape(rows: u64, members: u64) -> Form {
 /// Whether bit `at` of a bitmap is set.
 fn bit(words: &[u64], at: u64) -> bool {
     words.get(index(at / 64)).is_some_and(|word| word >> (at % 64) & 1 == 1)
+}
+
+/// The bit just past the `n`th zero from bit `at` on, for `n` of one or more, or `None` when the
+/// words run out first.
+///
+/// A word at a time: the zeros left in the word are counted, and either they are too few and the
+/// walk moves on, or the one wanted is among them and is found with one select in the word.
+fn past_zeros(bits: &[u64], mut at: usize, n: u64) -> Option<usize> {
+    let mut left = n - 1;
+    loop {
+        let shift = at % 64;
+        let zeros = !*bits.get(at / 64)? >> shift;
+        let found = u64::from(zeros.count_ones());
+        if found > left {
+            #[expect(clippy::cast_possible_truncation, reason = "under the zeros in one word")]
+            let within = crate::bits::nth_set(zeros, left as u32) as usize;
+            return Some(at + within + 1);
+        }
+        left -= found;
+        at += 64 - shift;
+    }
 }
 
 /// How many one bits in a row start at bit `at`, stopping at `len`.
@@ -898,6 +916,10 @@ mod tests {
                 .expect("sorted"),
             Rids::from_sorted(parents, (0..parents).filter(|p| p % 5 == 2).collect())
                 .expect("sorted"),
+            // Held parents far apart, so the walk crosses words of zeros and runs between them.
+            Rids::from_sorted(parents, (0..parents).filter(|p| p % 97 == 42).collect())
+                .expect("sorted"),
+            Rids::from_sorted(parents, (1990..parents).collect()).expect("sorted"),
         ] {
             let pushed = set.forward(&link).expect("the same table");
             let expected: Vec<Rid> =

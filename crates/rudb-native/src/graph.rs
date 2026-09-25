@@ -961,6 +961,31 @@ pub fn stored_link_counts(child: &Reader, parent: &Reader, edge: &Edge) -> Optio
     link::Link::counts(&bytes[binding..]).ok()
 }
 
+/// The parent table and column the current forward link for this child column was built against.
+///
+/// Read off the binding at the front of the section, so the link itself is not read. A caller
+/// that follows the link asks [`stored_link`] with the edge made from this, which checks the
+/// binding again against the parent's generation, so a link built against an older parent is
+/// found here and then refused there.
+#[must_use]
+pub fn link_parent(child: &Reader, child_column: usize) -> Option<(String, usize)> {
+    let table = child.table();
+    let id = u64::try_from(child_column).ok()?;
+    let held = table
+        .sections()
+        .iter()
+        .find(|section| section.kind == *section::FORWARD_LINK && section.id == id)?;
+    if !held.usable(table.generation()) || held.refused().is_some() {
+        return None;
+    }
+    let head = child.payload_head(held, 16).ok()?;
+    let column = u32::from_le_bytes(head.get(8..12)?.try_into().ok()?);
+    let length = u32::from_le_bytes(head.get(12..16)?.try_into().ok()?) as usize;
+    let bytes = child.payload_head(held, 16 + length).ok()?;
+    let name = std::str::from_utf8(bytes.get(16..16 + length)?).ok()?;
+    Some((name.to_owned(), column as usize))
+}
+
 /// The child's current forward link section for this edge's child column.
 fn link_section<'a>(child: &'a Reader, edge: &Edge) -> Option<&'a section::Section> {
     let table = child.table();

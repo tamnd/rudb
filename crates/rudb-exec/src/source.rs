@@ -1195,7 +1195,10 @@ impl<'a> Scan<'a> {
         let mut unread = self.unread.clone();
         let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
         for sideways in joins {
-            let domain = sideways.domain(self.index).map(|(key, _)| key);
+            let domain = sideways
+                .domain(self.index)
+                .or_else(|| sideways.spare(self.index))
+                .map(|(key, _)| key);
             let sifting = sideways.sifting(self.index).map(|(key, _)| key);
             unread.retain(|&at| domain != Some(at) && sifting != Some(at));
         }
@@ -1331,7 +1334,10 @@ impl<'a> Scan<'a> {
         }
         let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
         for sideways in joins {
-            let domain = sideways.domain(self.index).map(|(key, _)| key);
+            let domain = sideways
+                .domain(self.index)
+                .or_else(|| sideways.spare(self.index))
+                .map(|(key, _)| key);
             let sifting = sideways.sifting(self.index).map(|(key, _)| key);
             if domain == Some(stored.input) || sifting == Some(stored.input) {
                 return Ok(false);
@@ -1467,7 +1473,12 @@ impl<'a> Scan<'a> {
         let mut tight = false;
         for (sideways, paying) in joins {
             let before = keys.len();
-            keys.extend(sideways.domain(self.index).map(|(key, _)| key));
+            keys.extend(
+                sideways
+                    .domain(self.index)
+                    .or_else(|| sideways.spare(self.index))
+                    .map(|(key, _)| key),
+            );
             keys.extend(sideways.sifting(self.index).map(|(key, _)| key));
             tight |= keys.len() > before && paying.tight();
         }
@@ -1573,7 +1584,13 @@ impl<'a> Scan<'a> {
         // keeps nearly every row stops being asked. It takes the place of the filter rather than
         // going in front of it, see `Found::domain`.
         for (sideways, paying) in handoffs() {
-            let Some((at, domain)) = sideways.domain(self.index) else { continue };
+            // A join above that is not this scan's own placed its answer as exact rows this scan
+            // does not read, so it is tested by the bitmap kept beside them.
+            let own = self.sideways.as_ref().is_some_and(|own| Arc::ptr_eq(own, sideways));
+            let domain = sideways
+                .domain(self.index)
+                .or_else(|| if own { None } else { sideways.spare(self.index) });
+            let Some((at, domain)) = domain else { continue };
             if !paying.worth() {
                 continue;
             }

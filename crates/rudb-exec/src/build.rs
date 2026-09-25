@@ -770,15 +770,18 @@ fn exact(
     binding: ColumnBinding,
 ) -> Option<Exact> {
     let Expr::Column(key) = *plan.expr(key) else { return None };
-    let key = traced(plan, parent, key)?;
-    let (parent_table, parent_columns) = scanned(plan, catalog, parent, key.table).ok()??;
     let (child_table, child_columns) = scanned(plan, catalog, driving, binding.table).ok()??;
-    let parent_rows = parent_table.rows().stored()?;
-    let parent_column = stored_column(plan, parent_table, key.table, parent_columns, key)?;
     let child_column = stored_column(plan, child_table, binding.table, child_columns, binding)?;
-    if !rudb_native::graph::holds_key_map(parent_rows, parent_column) {
-        return None;
-    }
+    let keyed = traced(plan, parent, key).and_then(|key| {
+        let (parent_table, parent_columns) = scanned(plan, catalog, parent, key.table).ok()??;
+        let parent_rows = parent_table.rows().stored()?;
+        let parent_column = stored_column(plan, parent_table, key.table, parent_columns, key)?;
+        rudb_native::graph::holds_key_map(parent_rows, parent_column)
+            .then_some((parent_table, parent_column))
+    });
+    let (parent_table, parent_column) =
+        keyed.or_else(|| linked_parent(catalog, child_table, child_column))?;
+    let parent_rows = parent_table.rows().stored()?;
     // No link is a join that still has the key map, and the key map alone is enough for an exact
     // test of the driving column's values, see `sideways::Domain`. A link over the budget is not in
     // the file, and neither is one for a child that is not one committed file. Both are read when
@@ -793,6 +796,31 @@ fn exact(
         (child_rows.clone(), edge)
     });
     Some(Exact::stored(Stored { parent: parent_rows.clone(), column: parent_column, child }))
+}
+
+/// The parent the driving column's stored link points into, when that parent has a key map over
+/// the column the link was built against.
+///
+/// This is how a build side whose key is not a parent's key column gets an exact set all the same.
+/// On TPC-H q21 the build side is lines of `lineitem` and the driving side is `lineitem` again,
+/// joined on `l_orderkey`. Neither side is `orders`, but every value either side holds is an order
+/// key, and the driving column's link says which order each driving row names. So the build side's
+/// keys go through the key map of `orders` to a set of orders and that set goes through the link to
+/// the driving rows, the same as when the build side is `orders` itself. A build key that is not a
+/// key of the parent is not in the key map, and the lookup that finds that out sends the join back
+/// to the filter, see `sideways::held_parents`, so nothing here has to prove that the build side's
+/// values are parent keys.
+fn linked_parent<'a>(
+    catalog: &'a Catalog,
+    child: &Table,
+    child_column: usize,
+) -> Option<(&'a Table, usize)> {
+    let (name, column) = rudb_native::graph::link_parent(child.rows().stored()?, child_column)?;
+    let owner = child.name();
+    let parent = catalog
+        .table(&QualifiedName::new(owner.catalog.clone(), owner.schema.clone(), name))
+        .ok()?;
+    rudb_native::graph::holds_key_map(parent.rows().stored()?, column).then_some((parent, column))
 }
 
 /// The stored column under `node` that `binding` reads, through anything that passes it along.
@@ -2162,6 +2190,9 @@ impl<'a> Building<'a, '_> {
                     plan.string(schema),
                     plan.string(table),
                 );
+                for aside in &self.above {
+                    aside.set_aside();
+                }
                 let filters = Filters {
                     pruning: std::mem::take(&mut self.pruning),
                     pushed: self.pushing.take(),
