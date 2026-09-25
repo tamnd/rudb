@@ -14,7 +14,7 @@ For the query compiler, #1911 reads wide rows back after a top N, which was the 
 
 On joins and the graph layer, #1912 builds a join table on every thread and narrows its side before the layout, #1913 answers a chunk's children off a monotone link by walking the bitmap, and #1917 gives key maps a budget share of their own, so the map over `o_orderkey` is kept on the clustered SF1 file. On aggregation, #1908 counts a run of one key in the encoded count scatter as one weighted record, which helps ClickBench 17.
 
-#1907 adds `SET stored_answers = false`, which stops the engine answering from numbers the native writer stored at load time, for benchmark runs that must not pre-aggregate. #1910 adds random, setseed, TRY and the if macro, and #1920 expands the pin's built-in macros and adds error(). #1905 raises the MSRV to 1.88.0. #1918 corrects the note on which instructions counter is immune to load, and #1906 is changelog only.
+#1907 adds `SET stored_answers = false`, which stops the engine answering from numbers the native writer stored at load time, for benchmark runs that must not pre-aggregate. #1910 adds random, setseed, TRY and the if macro, and #1920 expands the pin's built-in macros and adds error(). #1905 raises the MSRV to 1.88.0. #1918 corrects the note on which instructions counter is immune to load, and #1906 is changelog only. #1924 fixes the release gate, which stopped the 0.4.33 and 0.4.34 release runs before they published anything, so this is the first release with binaries since 0.4.32.
 
 ## 0.4.34
 
