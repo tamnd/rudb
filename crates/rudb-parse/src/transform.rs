@@ -1203,6 +1203,7 @@ impl<'a> Transform<'a> {
                     BinaryOp::IntegerDivide => "//",
                     BinaryOp::Modulo => "%",
                     BinaryOp::Power => "**",
+                    BinaryOp::Caret => "^",
                     BinaryOp::Concat => "||",
                     _ => return Err(Error::parser("Expected constant expression.")),
                 };
@@ -3450,7 +3451,8 @@ impl<'a> Transform<'a> {
             "/" => BinaryOp::Divide,
             "//" => BinaryOp::IntegerDivide,
             "%" => BinaryOp::Modulo,
-            "^" | "**" => BinaryOp::Power,
+            "**" => BinaryOp::Power,
+            "^" => BinaryOp::Caret,
             "&" => BinaryOp::BitAnd,
             "|" => BinaryOp::BitOr,
             "<<" => BinaryOp::ShiftLeft,

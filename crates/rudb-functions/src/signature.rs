@@ -92,6 +92,12 @@ enum Shape {
     Rounded,
     /// `gcd` and `lcm`, which are declared over `BIGINT` and `HUGEINT` and nothing else.
     Whole,
+    /// `bit_count`, declared over the five signed integer types and always answering a `TINYINT`.
+    ///
+    /// An unsigned argument goes to the narrowest signed type that holds it, since that is the
+    /// overload the pin's implicit casts reach, so `bit_count(255::UTINYINT)` counts a `SMALLINT`
+    /// and is 8. A `UHUGEINT` reaches none of them and is refused.
+    BitCounted,
     /// Every argument has to be that type already and the result is fixed. `lower`, `length`,
     /// `LIKE`, `chr`.
     ///
@@ -501,7 +507,19 @@ const TABLE: &[Entry] = &[
     number("isfinite", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Boolean)),
     number("gcd", Arity::exactly(2), Shape::Whole),
     number("lcm", Arity::exactly(2), Shape::Whole),
-    number("factorial", Arity::exactly(1), Shape::FixedTo(Fixed::Integer, Fixed::HugeInt)),
+    // `binom` and `factorial` are declared over INTEGER alone and the pin refuses a BIGINT or a
+    // decimal rather than narrowing it, so these widen and do not cast.
+    number("factorial", Arity::exactly(1), Shape::Widened(Fixed::Integer, Fixed::HugeInt)),
+    number("binom", Arity::exactly(2), Shape::Widened(Fixed::Integer, Fixed::HugeInt)),
+    number("bit_count", Arity::exactly(1), Shape::BitCounted),
+    // The bitwise operators and `xor`, over the integer types only and answering the type the
+    // arguments meet at, which is the same rule the `bit_and` aggregate follows.
+    number("&", Arity::exactly(2), Shape::Bitwise),
+    number("|", Arity::exactly(2), Shape::Bitwise),
+    number("<<", Arity::exactly(2), Shape::Bitwise),
+    number(">>", Arity::exactly(2), Shape::Bitwise),
+    number("~", Arity::exactly(1), Shape::Bitwise),
+    number("xor", Arity::exactly(2), Shape::Bitwise),
     // Strings.
     // `||` takes anything and turns it into a string, which is why everything under it is a `Text`
     // and this is not. `1 || 'a'` is `1a` upstream, and two lists are the second reading of the same
@@ -1220,6 +1238,24 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             };
             (vec![returns.clone(); arguments.len()], returns)
         }
+        Shape::BitCounted => {
+            let mut wanted = Vec::with_capacity(arguments.len());
+            for ty in arguments {
+                wanted.push(match ty {
+                    LogicalType::Null | LogicalType::UBigInt => LogicalType::HugeInt,
+                    LogicalType::UTinyInt => LogicalType::SmallInt,
+                    LogicalType::USmallInt => LogicalType::Integer,
+                    LogicalType::UInteger => LogicalType::BigInt,
+                    LogicalType::TinyInt
+                    | LogicalType::SmallInt
+                    | LogicalType::Integer
+                    | LogicalType::BigInt
+                    | LogicalType::HugeInt => ty.clone(),
+                    _ => return Err(no_match(entry.name, arguments)),
+                });
+            }
+            (wanted, LogicalType::TinyInt)
+        }
         Shape::Exact(argument, result) => {
             let wanted = argument.ty();
             for ty in arguments {
@@ -1899,6 +1935,115 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         &["lcm(col0 BIGINT, col1 BIGINT) -> BIGINT", "lcm(col0 HUGEINT, col1 HUGEINT) -> HUGEINT"],
     ),
     ("factorial", &["factorial(col0 INTEGER) -> HUGEINT"]),
+    // The bitwise family, word for word the pin's lists.
+    (
+        "&",
+        &[
+            "\"&\"(col0 TINYINT, col1 TINYINT) -> TINYINT",
+            "\"&\"(col0 SMALLINT, col1 SMALLINT) -> SMALLINT",
+            "\"&\"(col0 INTEGER, col1 INTEGER) -> INTEGER",
+            "\"&\"(col0 BIGINT, col1 BIGINT) -> BIGINT",
+            "\"&\"(col0 HUGEINT, col1 HUGEINT) -> HUGEINT",
+            "\"&\"(col0 UTINYINT, col1 UTINYINT) -> UTINYINT",
+            "\"&\"(col0 USMALLINT, col1 USMALLINT) -> USMALLINT",
+            "\"&\"(col0 UINTEGER, col1 UINTEGER) -> UINTEGER",
+            "\"&\"(col0 UBIGINT, col1 UBIGINT) -> UBIGINT",
+            "\"&\"(col0 UHUGEINT, col1 UHUGEINT) -> UHUGEINT",
+            "\"&\"(col0 BIT, col1 BIT) -> BIT",
+        ],
+    ),
+    (
+        "|",
+        &[
+            "\"|\"(col0 TINYINT, col1 TINYINT) -> TINYINT",
+            "\"|\"(col0 SMALLINT, col1 SMALLINT) -> SMALLINT",
+            "\"|\"(col0 INTEGER, col1 INTEGER) -> INTEGER",
+            "\"|\"(col0 BIGINT, col1 BIGINT) -> BIGINT",
+            "\"|\"(col0 HUGEINT, col1 HUGEINT) -> HUGEINT",
+            "\"|\"(col0 UTINYINT, col1 UTINYINT) -> UTINYINT",
+            "\"|\"(col0 USMALLINT, col1 USMALLINT) -> USMALLINT",
+            "\"|\"(col0 UINTEGER, col1 UINTEGER) -> UINTEGER",
+            "\"|\"(col0 UBIGINT, col1 UBIGINT) -> UBIGINT",
+            "\"|\"(col0 UHUGEINT, col1 UHUGEINT) -> UHUGEINT",
+            "\"|\"(col0 BIT, col1 BIT) -> BIT",
+        ],
+    ),
+    (
+        "~",
+        &[
+            "\"~\"(col0 TINYINT) -> TINYINT",
+            "\"~\"(col0 SMALLINT) -> SMALLINT",
+            "\"~\"(col0 INTEGER) -> INTEGER",
+            "\"~\"(col0 BIGINT) -> BIGINT",
+            "\"~\"(col0 HUGEINT) -> HUGEINT",
+            "\"~\"(col0 UTINYINT) -> UTINYINT",
+            "\"~\"(col0 USMALLINT) -> USMALLINT",
+            "\"~\"(col0 UINTEGER) -> UINTEGER",
+            "\"~\"(col0 UBIGINT) -> UBIGINT",
+            "\"~\"(col0 UHUGEINT) -> UHUGEINT",
+            "\"~\"(col0 BIT) -> BIT",
+        ],
+    ),
+    (
+        "xor",
+        &[
+            "xor(col0 TINYINT, col1 TINYINT) -> TINYINT",
+            "xor(col0 SMALLINT, col1 SMALLINT) -> SMALLINT",
+            "xor(col0 INTEGER, col1 INTEGER) -> INTEGER",
+            "xor(col0 BIGINT, col1 BIGINT) -> BIGINT",
+            "xor(col0 HUGEINT, col1 HUGEINT) -> HUGEINT",
+            "xor(col0 UTINYINT, col1 UTINYINT) -> UTINYINT",
+            "xor(col0 USMALLINT, col1 USMALLINT) -> USMALLINT",
+            "xor(col0 UINTEGER, col1 UINTEGER) -> UINTEGER",
+            "xor(col0 UBIGINT, col1 UBIGINT) -> UBIGINT",
+            "xor(col0 UHUGEINT, col1 UHUGEINT) -> UHUGEINT",
+            "xor(col0 BIT, col1 BIT) -> BIT",
+        ],
+    ),
+    (
+        "<<",
+        &[
+            "\"<<\"(col0 TINYINT, col1 TINYINT) -> TINYINT",
+            "\"<<\"(col0 SMALLINT, col1 SMALLINT) -> SMALLINT",
+            "\"<<\"(col0 INTEGER, col1 INTEGER) -> INTEGER",
+            "\"<<\"(col0 BIGINT, col1 BIGINT) -> BIGINT",
+            "\"<<\"(col0 HUGEINT, col1 HUGEINT) -> HUGEINT",
+            "\"<<\"(col0 UTINYINT, col1 UTINYINT) -> UTINYINT",
+            "\"<<\"(col0 USMALLINT, col1 USMALLINT) -> USMALLINT",
+            "\"<<\"(col0 UINTEGER, col1 UINTEGER) -> UINTEGER",
+            "\"<<\"(col0 UBIGINT, col1 UBIGINT) -> UBIGINT",
+            "\"<<\"(col0 UHUGEINT, col1 UHUGEINT) -> UHUGEINT",
+            "\"<<\"(col0 BIT, col1 INTEGER) -> BIT",
+        ],
+    ),
+    (
+        ">>",
+        &[
+            "\">>\"(col0 TINYINT, col1 TINYINT) -> TINYINT",
+            "\">>\"(col0 SMALLINT, col1 SMALLINT) -> SMALLINT",
+            "\">>\"(col0 INTEGER, col1 INTEGER) -> INTEGER",
+            "\">>\"(col0 BIGINT, col1 BIGINT) -> BIGINT",
+            "\">>\"(col0 HUGEINT, col1 HUGEINT) -> HUGEINT",
+            "\">>\"(col0 UTINYINT, col1 UTINYINT) -> UTINYINT",
+            "\">>\"(col0 USMALLINT, col1 USMALLINT) -> USMALLINT",
+            "\">>\"(col0 UINTEGER, col1 UINTEGER) -> UINTEGER",
+            "\">>\"(col0 UBIGINT, col1 UBIGINT) -> UBIGINT",
+            "\">>\"(col0 UHUGEINT, col1 UHUGEINT) -> UHUGEINT",
+            "\">>\"(col0 BIT, col1 INTEGER) -> BIT",
+        ],
+    ),
+    (
+        "bit_count",
+        &[
+            "bit_count(col0 TINYINT) -> TINYINT",
+            "bit_count(col0 SMALLINT) -> TINYINT",
+            "bit_count(col0 INTEGER) -> TINYINT",
+            "bit_count(col0 BIGINT) -> TINYINT",
+            "bit_count(col0 HUGEINT) -> TINYINT",
+            "bit_count(col0 BIT) -> BIGINT",
+        ],
+    ),
+    ("binom", &["binom(col0 INTEGER, col1 INTEGER) -> HUGEINT"]),
     // The session context functions, which all print the same way because they all take nothing.
     // The four spelled as macros upstream are not here on purpose: the pin answers those with
     // "Macro current_user() does not support the supplied arguments" and a `Candidate macros:` block
@@ -2508,6 +2653,7 @@ impl Shape {
             Self::Floored => (all("DECIMAL"), "DECIMAL"),
             Self::Rounded => (leading(1, SAME, "INTEGER"), SAME),
             Self::Whole => (all("BIGINT"), "BIGINT"),
+            Self::BitCounted => (all("TINYINT"), "TINYINT"),
             // The floor is what a shape that widens is declared as, which is the overload upstream
             // lists first and the one a call with nothing to say about its arguments lands on.
             Self::FixedTo(from, to)
@@ -2619,6 +2765,8 @@ fn canonical(name: &str) -> &str {
 const ALIASES: &[(&str, &str)] = &[
     ("ceiling", "ceil"),
     ("power", "pow"),
+    ("**", "pow"),
+    ("^", "pow"),
     ("roundbankers", "round_even"),
     ("greatest_common_divisor", "gcd"),
     ("least_common_multiple", "lcm"),

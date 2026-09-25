@@ -36,14 +36,10 @@
 //!
 //! # What does not agree yet
 //!
-//! Three things, and none of them is a printing question. Each one is a place where rudb's transform
-//! threw away something the pin kept, so the answer is in `transform` and not here, and each has an
-//! issue of its own. Two hundred and sixty two view bodies were measured against the pin and these
-//! four lines are what is left over.
-//!
-//! `^` and `**` are one [`BinaryOp::Power`] here and two operators there, and the pin keeps whichever
-//! was written all the way down to the function it resolves: `[1] ^ [2]` and `[1] ** [2]` fail with
-//! different names in the message. A view written with one comes back with the other.
+//! Two things, and neither is a printing question. Each one is a place where rudb's transform
+//! throws away something the pin keeps, so the answer is in `transform` and not here, and each has
+//! an issue of its own. Two hundred and sixty two view bodies were measured against the pin and
+//! these are what was left over, after `^` and `**` became two operators here as they are there.
 //!
 //! `LIMIT ALL` is dropped by the transform, since it means no limit, and the pin writes it back as
 //! `LIMIT NULL`.
@@ -615,6 +611,7 @@ fn binary(ast: &Ast, op: BinaryOp, left: ExprRef, right: ExprRef) -> String {
         // Whichever of `^` and `**` was written is what the pin prints, and both arrive here as one
         // operator, so one spelling has to stand for both. See the module doc.
         BinaryOp::Power => "**",
+        BinaryOp::Caret => "^",
         BinaryOp::BitAnd => "&",
         BinaryOp::BitOr => "|",
         BinaryOp::ShiftLeft => "<<",

@@ -146,6 +146,7 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
         ("gcd", [left, right]) => whole(left, right, returns, false),
         ("lcm", [left, right]) => whole(left, right, returns, true),
         ("factorial", [only]) => factorial(only),
+        ("binom", [n, k]) => binom(n, k),
         _ => return None,
     };
     Some(answer)
@@ -436,6 +437,38 @@ fn factorial(value: &Value) -> Result<Value> {
     Ok(Value::HugeInt(product))
 }
 
+/// `binom`, the number of ways to pick `k` things out of `n`, exact and as wide as a `HUGEINT`.
+///
+/// This is the pin's loop step for step, cancelling each factor against the running product before
+/// multiplying it in, because where that loop overflows is where the pin says the value is out of
+/// range: `binom(130, 65)` fits and `binom(131, 65)` does not.
+fn binom(n: &Value, k: &Value) -> Result<Value> {
+    let (Some(n), Some(k)) = (integral(n), integral(k)) else {
+        return Err(Error::internal(format!("binom of {n} and {k}")));
+    };
+    if n < 0 || k < 0 {
+        return Err(Error::out_of_range("binom with negative input is undefined"));
+    }
+    if n < k {
+        return Ok(Value::HugeInt(0));
+    }
+    let k = k.min(n - k);
+    let mut answer: i128 = 1;
+    for step in 1..=k {
+        let mut numerator = n - k + step;
+        let mut denominator = step;
+        let common = gcd_of(numerator, denominator);
+        numerator /= common;
+        denominator /= common;
+        let common = gcd_of(answer, denominator);
+        answer /= common;
+        answer = answer
+            .checked_mul(numerator)
+            .ok_or_else(|| Error::out_of_range("Value out of range"))?;
+    }
+    Ok(Value::HugeInt(answer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +479,21 @@ mod tests {
 
     fn dec(unscaled: i128, width: u8, scale: u8) -> Value {
         Value::Decimal { unscaled, width, scale }
+    }
+
+    #[test]
+    fn binom_is_exact_until_the_pins_loop_overflows() {
+        let binom =
+            |n, k| value("binom", &[Value::Integer(n), Value::Integer(k)], &LogicalType::HugeInt);
+        assert_eq!(binom(5, 2).unwrap().unwrap(), Value::HugeInt(10));
+        assert_eq!(binom(6, 8).unwrap().unwrap(), Value::HugeInt(0));
+        assert_eq!(binom(0, 0).unwrap().unwrap(), Value::HugeInt(1));
+        assert_eq!(
+            binom(130, 65).unwrap().unwrap(),
+            Value::HugeInt(95_067_625_827_960_698_145_584_333_020_095_113_100)
+        );
+        assert!(binom(131, 65).unwrap().is_err());
+        assert!(binom(-6, 3).unwrap().is_err());
     }
 
     #[test]
