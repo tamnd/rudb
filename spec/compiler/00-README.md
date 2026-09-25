@@ -4,6 +4,8 @@ Written 24 September 2026, against rudb 0.4.12 at `97a146a2`. This folder specif
 
 The research behind it is in `research-notes/`: five source files, 3,658 lines, every number linked to where it came from. Numbers in this folder that come from a search summary rather than the source text are marked `[snippet]`, as they are there.
 
+`research-notes/F-fact-classes.md` is a note of a different kind. It lists every fact class document 04 uses and whether rudb records it today, which answers Q8 of document 20.
+
 ## Why a second engine, and why now
 
 `../08-codegen.md` and `../planner-v2/10-specialization.md` treat compilation as a tier inside the vectorized engine. The argument cited the Bespoke OLAP ablation: basic generated code over a flat layout bought 1.26x on TPC-H and 0.57x on CEB, while the fully specialized engines bought 12.35x and 51.40x. On that reading compilation came third, behind encoded execution and fusion.
