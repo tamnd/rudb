@@ -276,6 +276,16 @@ impl BitVector {
         self.words.len() * size_of::<u64>() + self.rank.bytes()
     }
 
+    /// Bytes [`BitVector::write`] produces for a vector of `len` bits, whatever its bits are.
+    ///
+    /// For a payload that puts something after a vector and has to find where it starts.
+    #[must_use]
+    pub fn bytes_for(len: usize) -> usize {
+        let words = len.div_ceil(64);
+        let (blocks, superblocks) = Rank::shape(words);
+        words * size_of::<u64>() + superblocks * size_of::<u32>() + blocks * size_of::<u16>()
+    }
+
     /// Appends the bitmap and its rank index.
     pub fn write(&self, out: &mut Vec<u8>) {
         for word in &self.words {

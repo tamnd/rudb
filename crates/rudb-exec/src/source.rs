@@ -707,6 +707,10 @@ thread_local! {
 /// # Errors
 ///
 /// Whatever narrowing the chunk to the rows that survived raises.
+/// A part whose exact rows keep one row in this many or fewer is read at those rows alone. See
+/// [`Source::read_reduced`].
+const SPARSE_READ: usize = 8;
+
 fn reduce(reduced: Option<(&Rids, u64)>, chunk: &mut Chunk) -> Result<()> {
     let Some((rows, first)) = reduced else { return Ok(()) };
     let len = chunk.len();
@@ -1112,6 +1116,18 @@ impl<'a> Scan<'a> {
     /// Whatever evaluating the predicate or narrowing the chunk reports.
     fn apply(&self, at: usize, chunk: &mut Chunk, mark: bool) -> Result<()> {
         let reduced = self.reduced(at).filter(|(rows, _)| !rows.is_full());
+        self.apply_reduced(at, reduced, chunk, mark)
+    }
+
+    /// [`Self::apply`] with the exact rows given rather than looked up, and `None` for a chunk
+    /// they were already applied to when it was read. See [`Self::read_reduced`].
+    fn apply_reduced(
+        &self,
+        at: usize,
+        reduced: Option<(&Rids, u64)>,
+        chunk: &mut Chunk,
+        mark: bool,
+    ) -> Result<()> {
         let Some(pushed) = self.pushed.as_ref() else { return reduce(reduced, chunk) };
         let whole =
             pushed.probes.as_deref().is_some_and(|probes| self.table.rows().certain(at, probes));
@@ -1215,6 +1231,49 @@ impl<'a> Scan<'a> {
         }
         *chunk = Chunk::with_rows(out, len)?;
         Ok(())
+    }
+
+    /// Reads only the rows of part `at` the exact rows from a join above hold, when they are few.
+    ///
+    /// The exact rows name the part's survivors before a byte of it is read, so a part in which few
+    /// survive is decoded at those rows and no others. Reading the part whole and cutting it
+    /// afterwards decodes every row of every column to keep a handful. A reduction through a
+    /// relationship whose parent side is small is the case: on TPC-H q17 the 204 parts a filter
+    /// keeps have 6,088 lines among the six million of `lineitem`, which is two or three a part.
+    ///
+    /// Past one survivor in [`SPARSE_READ`] rows the part is read whole, because decoding at a
+    /// position costs more than decoding in a run and a part that keeps many rows is closer to the
+    /// run.
+    fn read_reduced(&self, at: usize, out: &mut Chunk) -> Result<bool> {
+        let Some((rows, first)) = self.reduced(at).filter(|(rows, _)| !rows.is_full()) else {
+            return Ok(false);
+        };
+        let len = self.table.rows().chunk_len(at)?;
+        let positions = rows.offsets_in(first, len);
+        if positions.len().saturating_mul(SPARSE_READ) > len {
+            return Ok(false);
+        }
+        let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
+        let read = self.table.rows().read_rows(at, &projected, &positions)?;
+        let kept = positions.len();
+        let mut held = Vec::with_capacity(self.columns.len());
+        let mut real = 0;
+        for column in &self.columns {
+            if column.is_some() {
+                held.push(read.column(real)?.clone());
+                real += 1;
+            } else {
+                let numbers = positions
+                    .iter()
+                    .map(|&row| Value::BigInt(self.offsets[at] + i64::from(row)))
+                    .collect::<Vec<_>>();
+                held.push(Vector::from_values(LogicalType::BigInt, &numbers)?);
+            }
+        }
+        *out = Chunk::with_rows(held, kept)?;
+        self.apply_reduced(at, None, out, false)?;
+        self.sift(out)?;
+        Ok(true)
     }
 
     /// Runs the filter this scan took off the operator above it and the joins' runtime filters over
@@ -2072,6 +2131,9 @@ impl Source for Scan<'_> {
             counters.part_read();
         }
         if self.read_stored(at, out)? || self.read_late(at, out)? || self.read_deferring(at, out)? {
+            return Ok(more(morsel));
+        }
+        if self.read_reduced(at, out)? {
             return Ok(more(morsel));
         }
         let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();

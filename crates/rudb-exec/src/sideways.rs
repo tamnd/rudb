@@ -71,7 +71,7 @@ use std::sync::{Arc, OnceLock};
 
 use rudb_common::bounds::{Bound, Op};
 use rudb_common::{LogicalType, Result, SessionTimeZone};
-use rudb_graph::{KeyMap, Link, Pushed, Rids};
+use rudb_graph::{Adjacency, KeyMap, Link, PART_ROWS, Pushed, Rids};
 use rudb_metrics::Reduced;
 use rudb_plan::{BuildSide, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 use rudb_storage::{Blocked, Range};
@@ -294,7 +294,10 @@ pub(crate) struct Exact {
     /// Which parent row every driving row points at, when the link is in the file. Without it the
     /// build side's keys become a [`Domain`] instead.
     link: OnceLock<Option<Link>>,
-    /// Where the two are read from, or nothing when they were handed over already read.
+    /// The children of every parent row, when the file holds the backward adjacency. With it a
+    /// build side that holds few parents becomes the driving rows by reading their lists.
+    adjacency: OnceLock<Option<Adjacency>>,
+    /// Where the three are read from, or nothing when they were handed over already read.
     stored: Option<Stored>,
 }
 
@@ -317,6 +320,7 @@ impl Exact {
             children: link.as_ref().map(Link::children),
             keys: OnceLock::from(Some(keys)),
             link: OnceLock::from(link),
+            adjacency: OnceLock::from(None),
             stored: None,
         }
     }
@@ -328,6 +332,7 @@ impl Exact {
             children: stored.child.as_ref().map(|(child, _)| child.table().rows() as u64),
             keys: OnceLock::new(),
             link: OnceLock::new(),
+            adjacency: OnceLock::new(),
             stored: Some(stored),
         }
     }
@@ -347,7 +352,7 @@ impl Exact {
         if self.parents == 0 {
             return false;
         }
-        let per_part = self.parents as f64 * rudb_graph::PART_ROWS as f64 / children as f64;
+        let per_part = self.parents as f64 * PART_ROWS as f64 / children as f64;
         let missed = (1.0 - held as f64 / self.parents as f64).powf(per_part.max(1.0));
         missed >= 0.5
     }
@@ -357,6 +362,29 @@ impl Exact {
             .get_or_init(|| {
                 let stored = self.stored.as_ref()?;
                 rudb_native::graph::key_map(&stored.parent, stored.column)
+            })
+            .as_ref()
+    }
+
+    /// The same, with the adjacency handed over already built.
+    #[cfg(test)]
+    pub(crate) fn adjacent(keys: KeyMap, adjacency: Adjacency) -> Self {
+        Self {
+            parents: keys.len(),
+            children: Some(adjacency.children()),
+            keys: OnceLock::from(Some(keys)),
+            link: OnceLock::from(None),
+            adjacency: OnceLock::from(Some(adjacency)),
+            stored: None,
+        }
+    }
+
+    fn adjacency(&self) -> Option<&Adjacency> {
+        self.adjacency
+            .get_or_init(|| {
+                let stored = self.stored.as_ref()?;
+                let (child, edge) = stored.child.as_ref()?;
+                rudb_native::graph::stored_adjacency(child, &stored.parent, edge)
             })
             .as_ref()
     }
@@ -644,9 +672,17 @@ pub(crate) fn found_for(
     // enough of the driving table to pay for the lookups and the link, see [`Exact::might_skip`],
     // and only then are those read.
     let by_key = exact.map(|exact| domain_of(keyed, exact, chunks)).transpose()?.flatten();
-    let trying =
-        exact.filter(|exact| by_key.as_ref().is_none_or(|(_, held)| exact.might_skip(*held)));
-    let pushing = trying.map(|exact| reduce(keyed, exact, chunks)).transpose()?.flatten();
+    let listed = match exact {
+        Some(exact) => listed(keyed, exact, chunks)?,
+        None => None,
+    };
+    let trying = exact.filter(|exact| {
+        listed.is_none() && by_key.as_ref().is_none_or(|(_, held)| exact.might_skip(*held))
+    });
+    let pushing = match listed {
+        Some(listed) => Some(Pushing::Done(listed)),
+        None => trying.map(|exact| reduce(keyed, exact, chunks)).transpose()?.flatten(),
+    };
     let pushed = match pushing {
         Some(Pushing::Done(pushed)) => Some(pushed),
         _ => None,
@@ -833,8 +869,74 @@ fn integer(ty: &LogicalType) -> bool {
 fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<Pushing>> {
     let Some(map) = exact.keys() else { return Ok(None) };
     let Some(link) = exact.link() else { return Ok(None) };
+    let Some(held) = held_parents(keyed, map, link.parents(), chunks)? else { return Ok(None) };
+    if map.span().is_some() {
+        let (reached, parts) = held.reach(link)?;
+        if reached.saturating_mul(2) >= parts {
+            return Ok(Some(Pushing::Declined));
+        }
+    }
+    Ok(Some(Pushing::Done(held.forward_or_stop(link)?)))
+}
+
+/// The driving rows whose key the build side holds, read off the backward adjacency, when the
+/// parents it holds have few children between them.
+///
+/// spec/graph/03-the-file-format.md section 3.5, for the case section 5.3 of the execution document
+/// gives it: the children of a small selected set of parents. Without it the scan tests every
+/// driving row against the build side's keys, and on TPC-H q17 that is six million tests on each of
+/// two scans of `lineitem` to keep 6,088. With it the lists of the 204 parts are read and the scan
+/// decodes those rows and no others, see `Scan::read_reduced`.
+///
+/// `None` when there is no adjacency, when a key is not in the key map, or when the parents'
+/// children are more than one driving row in [`LISTED`]. Past that the scan reads most parts whole
+/// anyway and the bitmap over the key values tests their rows for less than the lists cost.
+fn listed(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<Pushed>> {
+    let rows: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+    let Some(children) = exact.children.filter(|&children| children > 0) else { return Ok(None) };
+    // A build row is at most one parent, and a parent has children / parents of them on average,
+    // so a side holding more than a LISTED'th of the parents is expected to reach more than a
+    // LISTED'th of the children and is not worth reading the adjacency for.
+    if rows.saturating_mul(LISTED) >= exact.parents.min(children) {
+        return Ok(None);
+    }
+    let Some(adjacency) = exact.adjacency() else { return Ok(None) };
+    let Some(map) = exact.keys() else { return Ok(None) };
+    let Some(held) = held_parents(keyed, map, adjacency.parents(), chunks)? else {
+        return Ok(None);
+    };
+    if adjacency.reached(&held).saturating_mul(LISTED) >= children {
+        return Ok(None);
+    }
+    let rids = adjacency.push(&held)?;
+    let parts = children.div_ceil(PART_ROWS as u64);
+    let mut touched = 0_u64;
+    let mut last = None;
+    for rid in rids.iter() {
+        let part = rid / PART_ROWS as u64;
+        if last != Some(part) {
+            touched += 1;
+            last = Some(part);
+        }
+    }
+    Ok(Some(Pushed { rids, parts, skipped: parts - touched, stopped: false }))
+}
+
+/// A build side is read through the adjacency when its parents' children are fewer than one
+/// driving row in this many. See [`listed`].
+const LISTED: u64 = 8;
+
+/// The parent rows whose keys the build side holds, as a set over the parent table.
+///
+/// `None` when a key does not read as an integer or is not in the key map, which should not happen
+/// because the build side is a subset of the parent's rows.
+fn held_parents(
+    keyed: &Keyed<'_>,
+    map: &KeyMap,
+    parents: u64,
+    chunks: &[Chunk],
+) -> Result<Option<Rids>> {
     let (plan, exprs, schema, time_zone) = keyed.parts();
-    let parents = link.parents();
     let mut words = vec![0_u64; usize::try_from(parents.div_ceil(64)).unwrap_or(usize::MAX)];
     for chunk in chunks {
         let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
@@ -853,14 +955,7 @@ fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<P
             *word |= 1 << (rid % 64);
         }
     }
-    let held = Rids::from_words(parents, words)?;
-    if map.span().is_some() {
-        let (reached, parts) = held.reach(link)?;
-        if reached.saturating_mul(2) >= parts {
-            return Ok(Some(Pushing::Declined));
-        }
-    }
-    Ok(Some(Pushing::Done(held.forward_or_stop(link)?)))
+    Ok(Some(Rids::from_words(parents, words)?))
 }
 
 /// What [`reduce`] made of a join armed with a link.
@@ -984,7 +1079,7 @@ mod tests {
     use rudb_storage::Blocked;
     use rudb_vector::{Chunk, Vector};
 
-    use rudb_graph::{KeyMap, Link};
+    use rudb_graph::{Adjacency, KeyMap, Link};
 
     use super::{
         Across, Exact, Extremes, Found, Keyed, SMALL, Schema, Sideways, beneath, found_for, hash,
@@ -1267,6 +1362,30 @@ mod tests {
         let expected: Vec<u64> = (3_000..4_000).chain(40_000..41_000).collect();
         assert_eq!(kept, expected);
         assert_eq!(found.range, Some((Bound::Int(103), Bound::Int(140))));
+    }
+
+    /// The same answer read from the other end. Children scattered over the parents, so the key
+    /// test would have to visit every child row, and the adjacency lists the ones two parents own.
+    #[test]
+    fn an_adjacency_lists_the_children_of_the_parents_a_side_holds() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let parent_keys: Vec<Option<i128>> = (0..50).map(|rid| Some(100 + rid)).collect();
+        let parents_of: Vec<u64> = (0..50_000).map(|child| child % 50).collect();
+        let exact = Exact::adjacent(
+            KeyMap::build(&parent_keys).expect("unique keys"),
+            Adjacency::build(&parents_of, 50).expect("every parent exists"),
+        );
+
+        let found = found(&keyed, Some(&exact), &[chunk(&[Some(103), None]), chunk(&[Some(140)])])
+            .expect("integers");
+
+        let rows = found.rows.expect("an exact side");
+        let kept: Vec<u64> = rows.iter().collect();
+        let expected: Vec<u64> =
+            (0..50_000).filter(|child| child % 50 == 3 || child % 50 == 40).collect();
+        assert_eq!(kept, expected);
     }
 
     /// The exact rows answer the scan, which leaves no bitmap behind for a join above that narrows
