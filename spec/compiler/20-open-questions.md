@@ -73,6 +73,8 @@ This folder settles the shape of the compiled engine, and these are the question
 
 **What would settle it.** A list in the C1 report of every fact class document 04 uses, marked as exists, requested, or not planned. It gets reviewed with the storage owners.
 
+**Where it stands.** The list is `research-notes/F-fact-classes.md`: 24 fact classes, 20 exist, 1 is requested and 3 are not planned.
+
 ## Q9. Is the interpreter fast enough to be the tier for short queries?
 
 **Why it matters.** Document 09's Rule I1 runs a pipeline on `interp` only when storage metadata proves its input is at most one morsel, and document 09 runs a failed guard's first fallback on `interp` while `direct` compiles. A single morsel on `interp` at about 3.2x `direct`'s time is bounded, but a single-morsel pipeline with an expensive body (a regex, a wide string join) is not cheap, and the extrapolation cannot rescue a pipeline with no next morsel.
