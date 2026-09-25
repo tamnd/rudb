@@ -61,7 +61,6 @@ use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
 use crate::lists;
 use crate::maps;
-use crate::math;
 use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
 use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
@@ -69,6 +68,7 @@ use crate::shape::{first, identity, nulls_of, single};
 use crate::structs;
 use crate::subscript;
 use crate::text;
+use crate::{bits, math};
 
 /// How the call being evaluated is written, for the one error that quotes it.
 ///
@@ -368,6 +368,7 @@ fn one_of<A: Fn(usize) -> usize>(
         "make_date" => made_date(data, at, base, rows, returns),
         "epoch_ms" => made_timestamp(data, at, base, rows, returns),
         name if datetime::is_interval(name) => made_interval(name, data, at, base, rows, returns),
+        "~" | "bit_count" => bits_of(name == "~", data, at, &base, rows, returns),
         _ => math::vectorized(name, data, at, base, rows, returns),
     }
 }
@@ -1036,6 +1037,9 @@ fn binary(
     if let Some((op, floating_zero_errors)) = arithmetic_op(name) {
         return arithmetic_of(op, floating_zero_errors, left, right, returns, written);
     }
+    if matches!(name, "&" | "|" | "xor" | "<<" | ">>") {
+        return bitwise_of(name, left, right, returns);
+    }
     match name {
         "/" => slash_of(left, right, returns),
         "||" => concat_of(left, right, returns),
@@ -1478,6 +1482,116 @@ fn arithmetic_of(
         return Ok(None);
     }
     by_form!(left, right, arithmetic_runs, op, floating_zero_errors, left, right, returns, written)
+}
+
+/// The bitwise operators and `xor` over two runs of one integer type.
+///
+/// The binder cast both sides to the answer's type, so the runs line up and the loop is the native
+/// operation. A left shift the pin refuses sets the flag and hands the vector back to the row at a
+/// time path, which raises with the pin's words and the two operands in them, or does not raise
+/// because the row was null.
+fn bitwise_of(
+    name: &str,
+    left: &Vector,
+    right: &Vector,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    if !returns.is_integer() || left.logical_type() != returns || right.logical_type() != returns {
+        return Ok(None);
+    }
+    by_form!(left, right, bitwise_runs, name, left, right, returns)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the same two sides with an index each that every run in this file takes, and the name \
+              and the answer's type"
+)]
+fn bitwise_runs<L, R>(
+    one: &Data,
+    at_left: L,
+    other: &Data,
+    at_right: R,
+    name: &str,
+    left: &Vector,
+    right: &Vector,
+    returns: &LogicalType,
+) -> Result<Option<Vector>>
+where
+    L: Fn(usize) -> usize,
+    R: Fn(usize) -> usize,
+{
+    let rows = left.len();
+    let base = nulls_of(left).and(&nulls_of(right), rows);
+    macro_rules! integers {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            $(
+                if let (Data::$variant(a), Data::$variant(b)) = (one, other) {
+                    let mut out = vec![0 as $native; rows];
+                    let signed = <$native>::MIN != (0 as $native);
+                    let trouble = match name {
+                        "&" => sweep(&mut out, a, &at_left, b, &at_right, |x, y| (x & y, false)),
+                        "|" => sweep(&mut out, a, &at_left, b, &at_right, |x, y| (x | y, false)),
+                        "xor" => sweep(&mut out, a, &at_left, b, &at_right, |x, y| (x ^ y, false)),
+                        // A count outside the width, a negative one included, empties the value.
+                        ">>" => sweep(&mut out, a, &at_left, b, &at_right, |x, y: $native| {
+                            let shifted = u32::try_from(y).ok().and_then(|by| x.checked_shr(by));
+                            (shifted.unwrap_or(0 as $native), false)
+                        }),
+                        // A signed value has to keep its top bit clear and an unsigned one only
+                        // has to keep its bits, which is what the leading zeros say directly.
+                        // Everything else, a negative value or count or a zero shifted past the
+                        // width, is the row path's to answer.
+                        _ => sweep(&mut out, a, &at_left, b, &at_right, |x: $native, y: $native| {
+                            let Some(by) = u32::try_from(y).ok() else { return (0 as $native, true) };
+                            let room = x.leading_zeros();
+                            let fits = if signed { room > by } else { room >= by };
+                            (x.checked_shl(by).unwrap_or(0 as $native), !fits)
+                        }),
+                    };
+                    if trouble {
+                        return Ok(None);
+                    }
+                    blank(&mut out, &base);
+                    return finish(returns, Data::$variant(out.into()), base);
+                }
+            )+
+        };
+    }
+    rudb_vector::for_each_layout!(integer, integers);
+    Ok(None)
+}
+
+/// `~` and `bit_count` over a run of one integer type.
+fn bits_of<A: Fn(usize) -> usize>(
+    invert: bool,
+    data: &Data,
+    at: A,
+    base: &Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    macro_rules! integers {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            $(
+                if let Data::$variant(held) = data {
+                    if invert {
+                        let mut out: Vec<$native> = (0..rows).map(|index| !held[at(index)]).collect();
+                        blank(&mut out, base);
+                        return finish(returns, Data::$variant(out.into()), base.clone());
+                    }
+                    // The pin counts into a TINYINT, so the 128 bits of a HUGEINT minus one wrap.
+                    #[expect(clippy::cast_possible_truncation)]
+                    let mut out: Vec<i8> =
+                        (0..rows).map(|index| held[at(index)].count_ones() as i8).collect();
+                    blank(&mut out, base);
+                    return finish(returns, Data::Int8(out.into()), base.clone());
+                }
+            )+
+        };
+    }
+    rudb_vector::for_each_layout!(integer, integers);
+    Ok(None)
 }
 
 /// One optimistic pass over the two runs, with the operator hoisted out of the loop.
@@ -3124,6 +3238,9 @@ pub fn call_values(
         return answer;
     }
     if let Some(answer) = math::value(name, args, returns) {
+        return answer;
+    }
+    if let Some(answer) = bits::value(name, args) {
         return answer;
     }
     // `list_aggr` over one list. The binder resolved the aggregate and put its name second, and

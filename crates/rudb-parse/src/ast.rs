@@ -1251,8 +1251,11 @@ pub enum BinaryOp {
     IntegerDivide,
     /// `%`.
     Modulo,
-    /// `^` or `**`.
+    /// `**`.
     Power,
+    /// `^`, which is `**` under another name and is kept apart only because a column is named after
+    /// whichever of the two was written.
+    Caret,
     /// `&`.
     BitAnd,
     /// `|`.

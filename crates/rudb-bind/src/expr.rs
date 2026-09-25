@@ -471,8 +471,8 @@ impl Binder<'_> {
                 let condition = self.as_boolean(bound, "IS UNKNOWN")?;
                 self.against_null(CompareOp::DistinctFrom, condition)
             }
-            UnaryOp::BitNot => Err(Error::not_implemented("the ~ operator".to_string())),
-            UnaryOp::Factorial => Err(Error::not_implemented("the ! operator".to_string())),
+            UnaryOp::BitNot => self.call("~", vec![bound]),
+            UnaryOp::Factorial => self.call("factorial", vec![bound]),
         }
     }
 
@@ -1891,6 +1891,12 @@ fn function_of(op: BinaryOp) -> Option<&'static str> {
         BinaryOp::Divide => "/",
         BinaryOp::IntegerDivide => "//",
         BinaryOp::Modulo => "%",
+        BinaryOp::Power => "**",
+        BinaryOp::Caret => "^",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::ShiftLeft => "<<",
+        BinaryOp::ShiftRight => ">>",
         BinaryOp::Concat => "||",
         BinaryOp::Like => "~~",
         BinaryOp::NotLike => "!~~",
@@ -1980,6 +1986,7 @@ fn spelling(ast: &Ast, op: BinaryOp) -> String {
         BinaryOp::IntegerDivide => "//",
         BinaryOp::Modulo => "%",
         BinaryOp::Power => "**",
+        BinaryOp::Caret => "^",
         BinaryOp::BitAnd => "&",
         BinaryOp::BitOr => "|",
         BinaryOp::ShiftLeft => "<<",

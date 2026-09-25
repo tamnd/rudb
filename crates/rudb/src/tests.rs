@@ -2327,6 +2327,75 @@ fn the_math_functions_answer_with_the_pins_types() {
     assert!(error.message().contains("must be a constant expression"), "{error}");
 }
 
+/// The bitwise operators, `xor`, `bit_count`, `binom` and the operator spellings of `pow` and
+/// `factorial`, with the pin's names and answers.
+#[test]
+fn the_bitwise_family_and_the_operator_spellings_answer_like_the_pin() {
+    let db = database();
+    let result = db
+        .query("SELECT 5 & 3, 5 | 3, 1 << 4, -8 >> 1, ~5, xor(5, 3), 2 ^ 10, 2 ** 3, 4!")
+        .expect("the operators bind");
+    assert_eq!(
+        result.names(),
+        [
+            "(5 & 3)",
+            "(5 | 3)",
+            "(1 << 4)",
+            "(-8 >> 1)",
+            "~(5)",
+            "xor(5, 3)",
+            "(2 ^ 10)",
+            "(2 ** 3)",
+            "factorial(4)"
+        ]
+    );
+    assert_eq!(
+        rows(&db, "SELECT 5 & 3, 5 | 3, 1 << 4, -8 >> 1, ~5, xor(5, 3), 2 ^ 10, 2 ** 3, 4!"),
+        vec![vec![
+            Value::Integer(1),
+            Value::Integer(7),
+            Value::Integer(16),
+            Value::Integer(-4),
+            Value::Integer(-6),
+            Value::Integer(6),
+            Value::Double(1024.0),
+            Value::Double(8.0),
+            Value::HugeInt(24)
+        ]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT bit_count(-1::BIGINT), bit_count(-1::HUGEINT), binom(5, 2), binom(6, 8)"),
+        vec![vec![Value::TinyInt(64), Value::TinyInt(-128), Value::HugeInt(10), Value::HugeInt(0)]]
+    );
+    // Over a column, which is the loop rather than the fold.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT sum(x & 3), sum(x << 1), sum(x >> 1), sum(bit_count(x)), sum(~x), \
+             sum(xor(x, 1)) FROM range(10) t(x)"
+        ),
+        vec![vec![
+            Value::HugeInt(13),
+            Value::HugeInt(90),
+            Value::HugeInt(20),
+            Value::HugeInt(15),
+            Value::HugeInt(-55),
+            Value::HugeInt(45)
+        ]]
+    );
+    for (query, expected) in [
+        ("SELECT x << 62 FROM range(3) t(x)", "Overflow in left shift (2 << 62)"),
+        ("SELECT 1 << 31", "Overflow in left shift (1 << 31)"),
+        ("SELECT -1 << 1", "Cannot left-shift negative number -1"),
+        ("SELECT binom(131, 65)", "Value out of range"),
+        ("SELECT xor(true, false)", "xor(col0 UHUGEINT, col1 UHUGEINT) -> UHUGEINT"),
+        ("SELECT binom(2.5, 1)", "binom(col0 INTEGER, col1 INTEGER) -> HUGEINT"),
+    ] {
+        let error = db.execute(query).expect_err(query);
+        assert!(error.message().contains(expected), "{query}: {error}");
+    }
+}
+
 /// `duckdb_functions()` through the binder and the executor, per #465.
 #[test]
 fn the_functions_table_answers_the_question_a_client_asks_it() {

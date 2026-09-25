@@ -456,7 +456,7 @@ fn identifiers_match_without_regard_to_case_and_keep_the_case_they_were_created_
 
 #[test]
 fn what_is_not_bound_yet_says_what_was_written_rather_than_producing_a_wrong_plan() {
-    let query = "SELECT counter ** 2 FROM hits";
+    let query = "SELECT counter <=> 2 FROM hits";
     let message = failure(query);
     assert!(!message.is_empty(), "{query} should say what it cannot do");
 }
