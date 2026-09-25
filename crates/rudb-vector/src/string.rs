@@ -103,6 +103,7 @@ impl StringView {
 
     /// The length in bytes.
     #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
         self.length as usize
     }
@@ -115,6 +116,7 @@ impl StringView {
 
     /// Whether the whole string is in the view.
     #[must_use]
+    #[inline]
     pub fn is_inline(&self) -> bool {
         self.len() <= INLINE_LIMIT
     }
@@ -145,6 +147,7 @@ impl StringView {
     /// because [`Self::as_inline_str`] pays for a UTF-8 validation that a comparison has no use
     /// for. On a filter against a varchar column that validation is the whole cost of the row.
     #[must_use]
+    #[inline]
     pub fn inline_bytes(&self) -> Option<&[u8]> {
         if self.is_inline() { Some(&self.payload[..self.len()]) } else { None }
     }
@@ -171,6 +174,7 @@ impl StringView {
     /// column is the views and nothing else. Both of them resolve a row the same way, and this is
     /// where that one way is written.
     #[must_use]
+    #[inline]
     pub fn bytes_in<'a>(&'a self, arena: &'a [u8]) -> Option<&'a [u8]> {
         if let Some(inline) = self.inline_bytes() {
             return Some(inline);
@@ -178,6 +182,7 @@ impl StringView {
         arena.get(self.offset()..self.offset() + self.len())
     }
 
+    #[inline]
     fn offset(&self) -> usize {
         u64::from_le_bytes([
             self.payload[4],
@@ -655,6 +660,7 @@ impl StringColumn {
     /// bytes are valid either way and the validation is a scan of the payload that changes no
     /// answer. On a varchar filter it was measured at most of the per row cost.
     #[must_use]
+    #[inline]
     pub fn bytes(&self, index: usize) -> Option<&[u8]> {
         self.views.get(index)?.bytes_in(&self.arena)
     }
