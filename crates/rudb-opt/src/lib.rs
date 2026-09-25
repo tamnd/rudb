@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Thirty passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
+//! Thirty one passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
 //! is the start of it. Column pruning came first, because it is the pass whose absence is measured
 //! in gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -46,6 +46,7 @@ pub mod tables;
 pub mod topn;
 pub mod total;
 mod transitive;
+pub mod unique;
 pub mod unnest;
 mod walk;
 
@@ -137,6 +138,11 @@ pub const RANK: u8 = 11;
 /// because the expressions it leaves in a projection are the ones a `HAVING` should get to run
 /// before, and pushdown is what moves the `HAVING` under them.
 ///
+/// Turning an aggregate whose groups are its rows into a projection is right after that, and it is
+/// before filter pushdown for the same reason: a `HAVING` over it should land on the projection it
+/// leaves. What it reads is a scan with only filters over it, which is the shape the binder writes,
+/// so nothing it needs has to have moved yet.
+///
 /// Group key pushdown is after the two passes that turn a mark into a semi join, and that is the
 /// difference between the pass firing on TPC-H q20 and not. It copies the relation that restricts
 /// the outer query so the aggregate underneath builds only the groups that will be read, and the
@@ -199,11 +205,12 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 30] = [
+pub static PASSES: [&(dyn Pass + Sync); 31] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
     &fromkey::AnswersFromTheKey,
+    &unique::RowsAreGroups,
     &shared::CommonAggregate,
     &total::TotalFromGroups,
     &filter::FilterPushdown,
