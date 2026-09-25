@@ -744,8 +744,10 @@ pub(crate) fn found_for(
     // enough of the driving table to pay for the lookups and the link, see [`Exact::might_skip`],
     // and only then are those read.
     let by_key = exact.map(|exact| domain_of(keyed, exact, chunks)).transpose()?.flatten();
+    let mut held =
+        Held { keyed, chunks, by_key: by_key.as_ref().map(|(domain, _)| domain), made: None };
     let listed = match exact.filter(|_| placed) {
-        Some(exact) => listed(keyed, exact, chunks)?,
+        Some(exact) => listed(exact, chunks, &mut held)?,
         None => None,
     };
     // A monotone link is pushed whatever it could skip, because the push walks from one held
@@ -760,7 +762,7 @@ pub(crate) fn found_for(
     });
     let pushing = match listed {
         Some(listed) => Some(Pushing::Done(listed)),
-        None => trying.map(|exact| reduce(keyed, exact, chunks)).transpose()?.flatten(),
+        None => trying.map(|exact| reduce(exact, &mut held)).transpose()?.flatten(),
     };
     let pushed = match pushing {
         Some(Pushing::Done(pushed)) => Some(pushed),
@@ -944,10 +946,8 @@ fn integer(ty: &LogicalType) -> bool {
 
 /// The driving rows whose link points at a parent row the build side holds.
 ///
-/// One lookup per build row to make a set of parent rows, then one push of that set through the
-/// link, which skips every part of the driving table whose parents all fall outside it. The key
-/// expression is evaluated here a second time rather than once for both, because it is a column
-/// read and a side that is armed with this is the side the join was going to hash anyway.
+/// The set of parent rows the build side holds, see [`Held`], then one push of that set through the
+/// link, which skips every part of the driving table whose parents all fall outside it.
 ///
 /// `None` when a key does not read as an integer or is not in the key map. Neither should happen,
 /// because the build side is a subset of the parent's rows and the map is over all of them. If one
@@ -963,10 +963,10 @@ fn integer(ty: &LogicalType) -> bool {
 /// instructions against 0.52 G with the bitmap. A monotone link is never declined, because its
 /// push walks from one held parent to the next and costs about what the set holds, see
 /// `Rids::forward`, and the exact rows it makes are cheaper for the scan than the bitmap.
-fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<Pushing>> {
+fn reduce(exact: &Exact, held: &mut Held<'_, '_>) -> Result<Option<Pushing>> {
     let Some(map) = exact.keys() else { return Ok(None) };
     let Some(link) = exact.link() else { return Ok(None) };
-    let Some(held) = held_parents(keyed, map, link.parents(), chunks)? else { return Ok(None) };
+    let Some(held) = held.parents(map, link.parents())? else { return Ok(None) };
     if map.span().is_some() && link.form() != Form::Monotone {
         let (reached, parts) = held.reach(link)?;
         if reached.saturating_mul(2) >= parts {
@@ -988,7 +988,7 @@ fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<P
 /// `None` when there is no adjacency, when a key is not in the key map, or when the parents'
 /// children are more than one driving row in [`LISTED`]. Past that the scan reads most parts whole
 /// anyway and the bitmap over the key values tests their rows for less than the lists cost.
-fn listed(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<Pushed>> {
+fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Option<Pushed>> {
     let rows: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
     let Some(children) = exact.children.filter(|&children| children > 0) else { return Ok(None) };
     // A build row is at most one parent, and a parent has children / parents of them on average,
@@ -999,13 +999,13 @@ fn listed(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<P
     }
     let Some(adjacency) = exact.adjacency() else { return Ok(None) };
     let Some(map) = exact.keys() else { return Ok(None) };
-    let Some(held) = held_parents(keyed, map, adjacency.parents(), chunks)? else {
+    let Some(held) = held.parents(map, adjacency.parents())? else {
         return Ok(None);
     };
-    if adjacency.reached(&held).saturating_mul(LISTED) >= children {
+    if adjacency.reached(held).saturating_mul(LISTED) >= children {
         return Ok(None);
     }
-    let rids = adjacency.push(&held)?;
+    let rids = adjacency.push(held)?;
     let parts = children.div_ceil(PART_ROWS as u64);
     let mut touched = 0_u64;
     let mut last = None;
@@ -1023,6 +1023,40 @@ fn listed(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<P
 /// driving row in this many. See [`listed`].
 const LISTED: u64 = 8;
 
+/// The parent rows the build side holds, made the first time a push asks and kept for the next.
+///
+/// Both pushes ask for the same set, the adjacency's in [`listed`] and the link's in [`reduce`],
+/// and each made it for itself, which on TPC-H q21 was a key map lookup for every build row of its
+/// two semi joins twice over. Made once, and made from the bitmap over the key values when
+/// [`domain_of`] made one, since that already names every key the side holds, see
+/// [`KeyMap::rows_of_span`].
+struct Held<'a, 'k> {
+    keyed: &'k Keyed<'a>,
+    chunks: &'k [Chunk],
+    by_key: Option<&'k Domain>,
+    /// What was made, and over how many parents.
+    made: Option<(u64, Option<Rids>)>,
+}
+
+impl Held<'_, '_> {
+    fn parents(&mut self, map: &KeyMap, parents: u64) -> Result<Option<&Rids>> {
+        if self.made.as_ref().is_none_or(|(over, _)| *over != parents) {
+            let from_span = match self.by_key {
+                Some(domain) if map.span() == Some((domain.base, domain.range)) => {
+                    map.rows_of_span(&domain.words, parents)?
+                }
+                _ => None,
+            };
+            let rids = match from_span {
+                Some(words) => Some(Rids::from_words(parents, words)?),
+                None => held_parents(self.keyed, map, parents, self.chunks)?,
+            };
+            self.made = Some((parents, rids));
+        }
+        Ok(self.made.as_ref().and_then(|(_, rids)| rids.as_ref()))
+    }
+}
+
 /// The parent rows whose keys the build side holds, as a set over the parent table.
 ///
 /// `None` when a key does not read as an integer or is not in the key map, which should not happen
@@ -1035,16 +1069,19 @@ fn held_parents(
 ) -> Result<Option<Rids>> {
     let (plan, exprs, schema, time_zone) = keyed.parts();
     let mut words = vec![0_u64; usize::try_from(parents.div_ceil(64)).unwrap_or(usize::MAX)];
+    let mut block = Vec::new();
     for chunk in chunks {
         let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
         let Some(keys) = keys.first() else { continue };
         let nullable = has_nulls(keys, chunk.len());
+        let read = keys.signed_block(&mut block) && block.len() >= chunk.len();
         for row in 0..chunk.len() {
             // A null key matches nothing under the rule this is armed for, the same as in the filter.
             if nullable && keys.is_null_at(row) {
                 continue;
             }
-            let Some(key) = keys.signed_at(row) else { return Ok(None) };
+            let key = if read { Some(i128::from(block[row])) } else { keys.signed_at(row) };
+            let Some(key) = key else { return Ok(None) };
             let Some(rid) = map.lookup(key)? else { return Ok(None) };
             let Some(word) = usize::try_from(rid / 64).ok().and_then(|at| words.get_mut(at)) else {
                 return Ok(None);
@@ -1075,15 +1112,20 @@ fn domain_of(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Optio
     let Some(len) = words_for(range) else { return Ok(None) };
     let (plan, exprs, schema, time_zone) = keyed.parts();
     let mut words = vec![0_u64; len];
+    let mut block = Vec::new();
     for chunk in chunks {
         let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
         let Some(keys) = keys.first() else { continue };
         let nullable = has_nulls(keys, chunk.len());
+        // A block of keys at once where the column has one, since a key at a time through
+        // `signed_at` was about seventy instructions a row on TPC-H q21's lineitem keys.
+        let read = keys.signed_block(&mut block) && block.len() >= chunk.len();
         for row in 0..chunk.len() {
             if nullable && keys.is_null_at(row) {
                 continue;
             }
-            let Some(key) = keys.signed_at(row) else { return Ok(None) };
+            let key = if read { Some(i128::from(block[row])) } else { keys.signed_at(row) };
+            let Some(key) = key else { return Ok(None) };
             let Some(offset) = key.checked_sub(base).and_then(|at| u64::try_from(at).ok()) else {
                 return Ok(None);
             };
