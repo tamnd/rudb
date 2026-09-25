@@ -230,6 +230,13 @@ fn the_reduction_changes_no_answer() {
          AND c_custkey % 7 = 0",
         "SELECT count(*) FROM orders JOIN customer ON o_custkey = c_custkey WHERE c_custkey > 50000",
         "SELECT count(*) FROM orders JOIN customer ON o_custkey = c_custkey",
+        // Nothing above the join reads `customer`, so the join hands the reduced rows on.
+        "SELECT count(*), sum(o_orderkey) FROM orders JOIN customer ON o_custkey = c_custkey \
+         WHERE c_custkey % 30000 < 3",
+        "SELECT o_custkey, count(*) FROM orders JOIN customer ON o_custkey = c_custkey WHERE \
+         c_name LIKE 'c2999%' GROUP BY o_custkey ORDER BY o_custkey",
+        "SELECT * FROM orders JOIN customer ON o_custkey = c_custkey WHERE c_custkey % 10000 = 7 \
+         ORDER BY o_orderkey",
     ];
     for sql in queries {
         let on = rows(&database, sql);

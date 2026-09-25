@@ -121,6 +121,9 @@ pub(crate) struct Sideways<'a> {
     /// that is its own. Such a scan cannot place exact rows from this one, see [`Found::spare`], so
     /// the build side does not make them. Written when the scan is built.
     aside: OnceLock<()>,
+    /// Whether a scan took this as its own, which is the scan that places the exact rows. Written
+    /// when the scan is built. See [`Sideways::settles`].
+    owned: OnceLock<()>,
 }
 
 /// What one side of a join holds, as much of it as was worth keeping.
@@ -516,6 +519,25 @@ impl<'a> Sideways<'a> {
     /// Whether exact rows from this handoff would be placed by the scan. See [`Sideways::aside`].
     pub(crate) fn placed(&self) -> bool {
         self.aside.get().is_none()
+    }
+
+    /// Says a scan took this as its own, so the exact rows it makes are the rows that scan reads.
+    pub(crate) fn own(&self) {
+        let _ = self.owned.set(());
+    }
+
+    /// Whether every row the scan hands up is one of the exact rows, once the build side has
+    /// finished.
+    ///
+    /// True only when a scan took this as its own and the build side made exact rows for it. Every
+    /// row that scan reads is then a row whose key one of the build side's rows holds, and the
+    /// filters and projections between it and the join can drop such a row but cannot make one.
+    /// That is what lets the join above answer without looking anything up. See
+    /// [`crate::join::Probe::settled_by`].
+    pub(crate) fn settles(&self) -> bool {
+        self.owned.get().is_some()
+            && self.placed()
+            && self.binding().is_some_and(|binding| self.rows(binding.table).is_some())
     }
 
     /// Whether a join above asked for [`Sideways::kept`].
