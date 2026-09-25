@@ -79,6 +79,11 @@ pub const SORTED_PROJECTION: &[u8; 8] = b"RUDBSP1\0";
 /// Row-preserving run encoding of a projection ordered by one signed integer column.
 pub const RUN_PROJECTION: &[u8; 8] = b"RUDBRP1\0";
 
+/// A word per row of a long text column with a bit for each run of three bytes its value holds,
+/// per `spec/graph/12-the-order-the-suite-asks-for.md` section 12.6. Paid for out of its own share,
+/// so it is on neither budget list below.
+pub const TEXT_GRAMS: &[u8; 8] = b"RUDBTG1\0";
+
 /// The kinds the graph document owns, which share its ten percent of the column bytes.
 pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
 
@@ -218,6 +223,7 @@ impl Section {
                 | DEGREES
                 | SORTED_PROJECTION
                 | RUN_PROJECTION
+                | TEXT_GRAMS
         )
     }
 

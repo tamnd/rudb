@@ -304,6 +304,22 @@ pub fn decode_flat(bytes: &[u8]) -> Result<Flat> {
 ///
 /// As [`decode`].
 pub fn holds_in(bytes: &[u8], sequence: &Sequence) -> Result<Option<Vec<bool>>> {
+    holds_in_where(bytes, sequence, |_| true)
+}
+
+/// [`holds_in`], walking only the values `maybe` does not rule out and answering no for the rest.
+///
+/// For a caller that holds a sketch of each value, see [`crate::sequence::grams`]. A value ruled out
+/// is stepped over by its length and never walked.
+///
+/// # Errors
+///
+/// As [`decode`].
+pub fn holds_in_where(
+    bytes: &[u8],
+    sequence: &Sequence,
+    mut maybe: impl FnMut(usize) -> bool,
+) -> Result<Option<Vec<bool>>> {
     if bytes.first() != Some(&Kind::Fsst.tag()) {
         return Ok(None);
     }
@@ -319,7 +335,8 @@ pub fn holds_in(bytes: &[u8], sequence: &Sequence) -> Result<Option<Vec<bool>>> 
             return Err(Error::internal("a compressed run is past the end of its chunk"));
         };
         payload = rest;
-        held.push(coded.holds(codes)?);
+        let row = held.len();
+        held.push(maybe(row) && coded.holds(codes)?);
     }
     if reader.remaining() != 0 {
         return Err(Error::internal(format!(
