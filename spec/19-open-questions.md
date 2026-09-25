@@ -70,7 +70,11 @@ Runtime dispatch per document 7.3 costs an indirect call per kernel invocation a
 
 The default is runtime dispatch, which is what ClickHouse does and it works. The question is whether the measured cost is large enough to justify a `-march=native` build path for people who care, which is a small amount of work and a real amount of user confusion.
 
-**Answered by measurement at M3. Either answer is fine.**
+**Answered: one binary, and the baseline it is compiled for is raised to `x86-64-v3`.** The measurement that settled it is in `spec/perf/66-the-registers-we-already-have.md`. Nothing in the engine had ever been compiled for anything past SSE2, and neither had any of the measurements in `spec/perf`, because every one of them is a ratio between two builds made the same way and a constant factor under both of them cancels out. Turning the baseline up is 12.8 percent of the instructions TPC-H at SF1 retires and 25.2 percent of q01's, on all twenty two queries, which is more than the whole of `spec/perf` up to that point put together.
+
+That number is what makes the question easy rather than close. Dispatch was the default answer because it costs an indirect call, and an indirect call per kernel is a small price against a large win. But a raised baseline collects the same win with no call and no lost inlining, and it collects it in the arithmetic the kernels are built out of rather than only in the kernels somebody got round to writing twice. The cost is a floor: Haswell on Intel and Zen on AMD, hardware from 2013 and 2017, and an older host gets an illegal instruction rather than a slow query. For an engine somebody links into their own program that floor is part of what the engine is, so it belongs in the install documentation, and it is in `README.md`.
+
+Dispatch is not off the table, it is just no longer the thing that buys the first factor. What is left for it is AVX-512 and `VBMI2`, which cannot be a compiled baseline because the hardware is not general enough, and which matter for bit unpacking specifically. That is a narrow enough surface to be worth an indirect call, and it is one kernel family rather than the whole engine. Document 7.3 says so.
 
 ## Q8: How much does the DuckDB C API constrain the Rust API?
 

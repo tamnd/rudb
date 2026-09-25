@@ -33,7 +33,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  RUSTFLAGS: -D warnings
+  # `.cargo/config.toml` compiles the x86-64 targets for x86-64-v3, and a `RUSTFLAGS` here replaces
+  # the rustflags in that file rather than adding to them, so every job that wants both writes both.
+  # Every runner in this workflow is x86-64 except the macos one, which the test job handles.
+  RUSTFLAGS: -D warnings -C target-cpu=x86-64-v3
   RUSTDOCFLAGS: -D warnings
 
 jobs:
@@ -71,15 +74,26 @@ jobs:
           - name: linux x86-64, debug
             os: ubuntu-24.04
             profile: dev
+            cpu: -C target-cpu=x86-64-v3
           - name: linux x86-64, release
             os: ubuntu-24.04
             profile: release
+            cpu: -C target-cpu=x86-64-v3
           - name: macos arm64
             os: macos-26
             profile: dev
+            # Left out rather than translated to an arm equivalent, because the arm targets in the
+            # release matrix are built for baseline arm64 and this job is here to test what ships.
+            cpu: ""
           - name: windows x86-64
             os: windows-2025
             profile: dev
+            cpu: -C target-cpu=x86-64-v3
+    # This is the job that runs the tests, so it is the one that has to compile the engine the
+    # release builds compile. Per row rather than from the workflow's env, since one of the four
+    # rows is arm64 and `-C target-cpu=x86-64-v3` is not a flag rustc accepts there.
+    env:
+      RUSTFLAGS: -D warnings ${{ matrix.cpu }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: Swatinem/rust-cache@v2.9.2
@@ -189,8 +203,10 @@ jobs:
     # The harness is somebody else's crate as far as this gate is concerned, and a new rustc that
     # warns about something in it is not a reason to fail a change to the engine. The corpus either
     # passes or it does not, and that is the answer this job is here for.
+    # There is no way to unset a variable the workflow set, so the deny is dropped by writing the
+    # rest of what belongs here, which is the target CPU the corpus should be exercised on.
     env:
-      RUSTFLAGS: ""
+      RUSTFLAGS: -C target-cpu=x86-64-v3
       RUSTDOCFLAGS: ""
     steps:
       # Both checkouts go under the workspace and next to each other, because that is where the

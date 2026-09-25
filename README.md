@@ -92,6 +92,8 @@ cd rudb
 cargo build --release
 ```
 
+**On x86 this needs a CPU from 2013 or later.** The engine is compiled for `x86-64-v3`, which means AVX2, BMI2 and FMA, so the floor is Haswell on Intel and Zen on AMD. Older hardware than that will build and then die with an illegal instruction rather than run slowly, so if you are on a pre-2013 Xeon this is the line to know about. It buys 12.8 percent of the instructions TPC-H retires and 25.2 percent of Q1's, on every query rather than a few, which is the whole reason the floor is there: `spec/perf/66-the-registers-we-already-have.md` has the per query table and `spec/19-open-questions.md` Q7 has the argument. There is no floor on arm, where the baseline is plain arm64 and NEON is part of it. If you need x86 without the floor, `RUSTFLAGS="-C target-cpu=x86-64" cargo build --release` gives you a portable build and gives back the 12.8 percent.
+
 That is the whole of it, on Linux, macOS and Windows. No CMake, no Python in the build, no code generation step that is not a `build.rs` or an `xtask`. Everything else is a task:
 
 ```

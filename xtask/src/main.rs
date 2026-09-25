@@ -501,13 +501,15 @@ fn msrv_scoped(scope: &[String]) -> Result<(), String> {
 
     // Through `rustup run` rather than `cargo +1.85.0`, because `cargo xtask` sets `CARGO` to a
     // real binary and the `+toolchain` syntax is a rustup shim thing that a real binary rejects.
-    let mut args = vec!["run".to_string(), version.clone(), "cargo".into(), "check".into()];
+    // `--config` for the deny rather than `RUSTFLAGS`, for the reason `cargo` below gives: the
+    // variable would drop the workspace's `-C target-cpu` and check a different engine.
+    let mut args = vec!["run".to_string(), version.clone(), "cargo".into()];
+    args.extend(["--config".to_string(), DENY_WARNINGS.into(), "check".into()]);
     args.extend(scope.iter().cloned());
     args.push("--all-features".into());
     println!("rustup {}", args.join(" "));
     let status = Command::new("rustup")
         .args(&args)
-        .env("RUSTFLAGS", std::env::var("RUSTFLAGS").unwrap_or_else(|_| "-D warnings".into()))
         // Its own target directory, or every run of this task invalidates the artifacts the
         // other tasks just built and the gate takes twice as long for no reason.
         .env("CARGO_TARGET_DIR", root.join("target").join("msrv"))
@@ -523,6 +525,14 @@ fn msrv_scoped(scope: &[String]) -> Result<(), String> {
     }
 }
 
+/// Denies warnings as a Cargo config argument, which joins with the rustflags in
+/// `.cargo/config.toml` instead of replacing them the way the environment variable does.
+///
+/// `cfg(all())` is the cfg that matches every target, and Cargo joins the rustflags of every
+/// `target.<cfg>` table that matches, so this arrives alongside the `-C target-cpu` the file sets
+/// for x86-64 rather than instead of it.
+const DENY_WARNINGS: &str = r#"target."cfg(all())".rustflags=["-D","warnings"]"#;
+
 /// Runs cargo the way CI runs it, which means with warnings denied.
 ///
 /// Without this the local gate is weaker than the remote one: `cargo clippy` exits zero on a
@@ -534,12 +544,16 @@ fn msrv_scoped(scope: &[String]) -> Result<(), String> {
 /// variable share not a single artifact: the second one walks the whole crate graph again, printing
 /// the same crate names the first one just printed. The corpus step used to build the shell through
 /// `compare::build`, which leaves `RUSTFLAGS` alone on purpose, and paid exactly that.
+///
+/// The deny goes in through `--config` rather than through `RUSTFLAGS` because a `RUSTFLAGS` in the
+/// environment replaces the rustflags from `.cargo/config.toml` rather than adding to them, and that
+/// file is where the workspace's `-C target-cpu` lives. Setting the variable here would have built
+/// the whole gate for baseline x86-64 while a release build got AVX2, which is the one shape of
+/// mistake that produces a green gate over an engine nobody ships.
 pub(crate) fn cargo(args: &[&str]) -> Result<(), String> {
     println!("cargo {}", args.join(" "));
     let mut command = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    if std::env::var_os("RUSTFLAGS").is_none() {
-        command.env("RUSTFLAGS", "-D warnings");
-    }
+    command.arg("--config").arg(DENY_WARNINGS);
     if std::env::var_os("RUSTDOCFLAGS").is_none() {
         command.env("RUSTDOCFLAGS", "-D warnings");
     }
