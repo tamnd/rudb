@@ -15,6 +15,7 @@ mod ablate;
 mod bench;
 mod codegen;
 mod compare;
+mod compiled;
 mod compress;
 mod conform;
 mod differential;
@@ -74,6 +75,9 @@ fn main() -> ExitCode {
         // which is the only way to check the answers at a size the committed fixture cannot reach.
         // Not under `bench` above, because that word means a measurement and this is a comparison
         // of answers that happens to print times as well.
+        // The same forty three through the first engine and the compiled engine in one process,
+        // which is the check that C1 of the compiler milestones is done against.
+        Some("compiled") => compiled::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         Some("differential") => {
             differential::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>())
         }
@@ -282,6 +286,9 @@ fn usage() {
     println!("                         builds rudb and the harness, then runs the suite. needs a");
     println!("                         tamnd/rudb-bench checkout beside this one, or");
     println!("                         RUDB_BENCH_REPO, and the suite's data on the machine");
+    println!("  compiled <file> [q..]  the forty three ClickBench queries under SET engine first");
+    println!("                         and compiled over that Parquet file, rows compared, and");
+    println!("                         the compiled engine's refusals grouped by reason");
     println!("  differential <file>    the forty three ClickBench queries through rudb and");
     println!("                         through duckdb over that Parquet file, answers compared");
     println!("                         byte for byte, times printed beside them. the committed");
