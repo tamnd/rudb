@@ -1,9 +1,12 @@
 //! The generator, per `spec/compiler/07-code-generation.md`: one QIR function per pipeline.
 //!
 //! A body runs over the rows `begin..end` of one morsel. It reads the source columns through the
-//! morsel's column table, tests the filters in order and jumps to the next row at the first one
-//! that is not true, and then hands the row to the sink. Everything the body keeps between calls
-//! is in its state, whose layout [`Body`] describes so that the driver can set it up and read it:
+//! morsel's column table, runs the operators in order and jumps to the next row at the first filter
+//! that is not true, and then hands the row to the sink. A join probe is a loop of its own inside
+//! the row loop, over the entries of the one directory slot the row's hash picks, and everything
+//! after it runs once per match, per section 10.5 of `spec/compiler/10-joins.md`. Everything the
+//! body keeps between calls is in its state, whose layout [`Body`] describes so that the driver can
+//! set it up and read it:
 //!
 //! ```text
 //! [header: 64 bytes][sink fields]
@@ -11,9 +14,14 @@
 //!
 //! A result sink has a row count and, per output column, the address of a values buffer and of a
 //! validity buffer with one byte per row. The driver points them at buffers as long as the morsel
-//! and turns what the body wrote into a chunk after each call. An aggregate sink has the key
-//! buffer the body builds each row's key in before `ht_insert`, or for an aggregate with no groups
-//! the address of the one group row, which the driver writes there before the first call.
+//! and turns what the body wrote into a chunk after each call. Past a probe a row can make any
+//! number of rows, so there the sink also has the buffers' capacity, and a body that fills them
+//! returns `NeedMemory` for the driver to grow them and run the morsel again. An aggregate sink has
+//! the key buffer the body builds each row's key in before `ht_insert`, or for an aggregate with no
+//! groups the address of the one group row, which the driver writes there before the first call. A
+//! join build has the record buffer the body builds each row's record in before `jt_append`. After
+//! the sink come three words per probe, which the driver fills from the built table at init: the
+//! directory's address, the shift that takes a hash to its slot and the tag table's address.
 //!
 //! Handles are made here, in the query's [`Rt`], because the code carries them as constants: the
 //! `LIKE` patterns and regular expressions, the grouping tables, the distinct sets. String
@@ -35,10 +43,12 @@ use rudb_common::{LogicalType, PhysicalType, Value};
 use rudb_plan::CompareOp;
 use rudb_qc_ir::catalogue::proxy;
 use rudb_qc_ir::func::INV;
-use rudb_qc_ir::{Builder, ErrorKind, Field, Module, Op, Ty, Val, dce, verify};
-use rudb_qc_pipe::{Graph, Pipeline, Sink, Stage};
+use rudb_qc_ir::status::NEED_MEMORY;
+use rudb_qc_ir::{Block, Builder, ErrorKind, Field, Module, Op, Ty, Val, dce, verify};
+use rudb_qc_pipe::{Graph, Op as PipeOp, Pipeline, Probe, Sink, Stage};
 use rudb_qc_plan::{Aggregate, Column, Expr, Kind, Refusal, Result};
 use rudb_qc_rt::abi::{COL_SIZE, COL_VALID, HEADER, MORSEL_BEGIN, MORSEL_COLS, MORSEL_END};
+use rudb_qc_rt::join::{ADDRESS, FOLD, JoinLayout, JoinTable};
 use rudb_qc_rt::table::{GroupTable, KeyField, Layout};
 use rudb_qc_rt::{Rt, text};
 
@@ -65,6 +75,21 @@ pub struct Body {
     pub state: u32,
     /// Where the rows go.
     pub sink: Out,
+    /// The join tables the body probes, in the order of its probes.
+    pub probes: Vec<Probing>,
+}
+
+/// Where the body reads a join table it probes, which the driver fills in before the first call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Probing {
+    /// The handle of the table in the query's runtime.
+    pub table: u64,
+    /// The state offset of the directory's address.
+    pub directory: u32,
+    /// The state offset of the shift, an `i64`.
+    pub shift: u32,
+    /// The state offset of the tag table's address.
+    pub tags: u32,
 }
 
 /// The state layout of a sink.
@@ -76,9 +101,24 @@ pub enum Out {
         count: u32,
         /// The output columns.
         columns: Vec<Slot>,
+        /// Past a probe, the state offset of how many rows the buffers hold, an `i64`.
+        capacity: Option<u32>,
     },
     /// A hash aggregate.
     Aggregate(Grouping),
+    /// A join build.
+    Build(Building),
+}
+
+/// A join build's table and the record the body builds for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Building {
+    /// The handle of the table in the query's runtime.
+    pub table: u64,
+    /// The record's shape.
+    pub layout: JoinLayout,
+    /// The state offset of the record buffer.
+    pub record: u32,
 }
 
 /// One output column of a result sink.
@@ -161,10 +201,24 @@ pub enum AccOp {
 /// made does not verify, which is a bug and is refused rather than run.
 pub fn generate(graph: &Graph, rt: &mut Rt) -> Result<Query> {
     let mut module = Module::new("query");
-    let mut bodies = Vec::with_capacity(graph.stages.len());
+    let mut bodies: Vec<Option<Body>> = Vec::with_capacity(graph.stages.len());
     for (stage, s) in graph.stages.iter().enumerate() {
         bodies.push(match s {
-            Stage::Pipeline(p) => Some(pipeline(stage, p, &mut module, rt)?),
+            Stage::Pipeline(p) => {
+                let mut joins = Vec::new();
+                for probe in p.probes() {
+                    match bodies.get(probe.build).and_then(Option::as_ref).map(|b| &b.sink) {
+                        Some(Out::Build(b)) => joins.push(b.clone()),
+                        _ => {
+                            return Err(Refusal::new(
+                                "HashJoin",
+                                "a probe of a stage that is not an earlier build",
+                            ));
+                        }
+                    }
+                }
+                Some(pipeline(stage, p, &joins, &mut module, rt)?)
+            }
             _ => None,
         });
     }
@@ -207,19 +261,36 @@ fn unsigned(ty: &LogicalType) -> bool {
     )
 }
 
-fn pipeline(stage: usize, p: &Pipeline, module: &mut Module, rt: &mut Rt) -> Result<Body> {
+fn pipeline(
+    stage: usize,
+    p: &Pipeline,
+    joins: &[Building],
+    module: &mut Module,
+    rt: &mut Rt,
+) -> Result<Body> {
     let name = format!("p{stage}");
+    let source = p.source.columns();
     let mut reads = Vec::new();
+    // Only the source's columns are read from the morsel. The rest are what the probes bring.
     let mut note = |e: &Expr| {
         for c in e.columns() {
-            if !reads.contains(&c) {
+            if c < source.len() && !reads.contains(&c) {
                 reads.push(c);
             }
         }
     };
-    p.filters.iter().for_each(&mut note);
+    for op in &p.ops {
+        match op {
+            PipeOp::Filter(f) => note(f),
+            PipeOp::Probe(probe) => probe.keys.iter().for_each(&mut note),
+        }
+    }
     match &p.sink {
         Sink::Result { exprs, .. } => exprs.iter().for_each(&mut note),
+        Sink::Build { keys, payload, .. } => {
+            keys.iter().for_each(&mut note);
+            payload.iter().for_each(&mut note);
+        }
         Sink::Aggregate { groups, aggregates, .. } => {
             groups.iter().for_each(&mut note);
             for a in aggregates {
@@ -231,7 +302,6 @@ fn pipeline(stage: usize, p: &Pipeline, module: &mut Module, rt: &mut Rt) -> Res
         }
     }
     reads.sort_unstable();
-    let source = p.source.columns();
     let mut g = Gen {
         b: Builder::new(&name, "generic", stage as u32),
         module,
@@ -240,8 +310,10 @@ fn pipeline(stage: usize, p: &Pipeline, module: &mut Module, rt: &mut Rt) -> Res
         loaded: HashMap::new(),
         row: Val::NONE,
         ptrs: Vec::new(),
-        columns: source.to_vec(),
+        columns: p.columns(),
         next: 0,
+        joins: joins.to_vec(),
+        tables: Vec::new(),
     };
     g.b.func_mut().state.push(Field { offset: 0, size: HEADER, name: "header".into() });
 
@@ -259,9 +331,23 @@ fn pipeline(stage: usize, p: &Pipeline, module: &mut Module, rt: &mut Rt) -> Res
         let ty = qir_type(&source[c].ty)?;
         g.cols.insert(c, (values, valid, ty));
     }
-    let (out, state) = g.prepare_sink(&p.sink)?;
+    let fans_out = p.probes().next().is_some();
+    let (out, state) = g.prepare_sink(&p.sink, fans_out)?;
     g.next = state;
     let st = g.b.st();
+    let mut probes = Vec::with_capacity(joins.len());
+    for (k, j) in joins.iter().enumerate() {
+        let at = g.next.next_multiple_of(8);
+        g.field(at, 8, &format!("probe{k}.directory"));
+        g.field(at + 8, 8, &format!("probe{k}.shift"));
+        g.field(at + 16, 8, &format!("probe{k}.tags"));
+        g.next = at + 24;
+        let directory = g.b.load(Ty::Ptr, st, Val::NONE, 1, at as i32, INV);
+        let shift = g.b.load(Ty::I64, st, Val::NONE, 1, at as i32 + 8, INV);
+        let tags = g.b.load(Ty::Ptr, st, Val::NONE, 1, at as i32 + 16, INV);
+        g.tables.push((directory, shift, tags));
+        probes.push(Probing { table: j.table, directory: at, shift: at + 8, tags: at + 16 });
+    }
     match &out {
         Out::Result { columns, .. } => {
             for slot in columns {
@@ -276,6 +362,7 @@ fn pipeline(stage: usize, p: &Pipeline, module: &mut Module, rt: &mut Rt) -> Res
                 g.ptrs.push(row);
             }
         }
+        Out::Build(_) => {}
     }
 
     let head = g.b.block(&[(Ty::I64, "i")]);
@@ -293,15 +380,7 @@ fn pipeline(stage: usize, p: &Pipeline, module: &mut Module, rt: &mut Rt) -> Res
     g.b.brif(more, body, &[], exit, &[]);
 
     g.b.switch_to(body);
-    for f in &p.filters {
-        let (v, ok) = g.expr(f)?;
-        let pass = g.b.bin(Op::And, v, ok);
-        let then = g.b.block(&[]);
-        g.b.brif(pass, then, &[], next, &[]);
-        g.b.switch_to(then);
-    }
-    g.sink(&p.sink, &out)?;
-    g.b.br(next, &[]);
+    g.ops(&p.ops, 0, next, 1, &p.sink, &out)?;
 
     g.b.switch_to(next);
     let one = g.b.int(Ty::I64, 1);
@@ -316,7 +395,7 @@ fn pipeline(stage: usize, p: &Pipeline, module: &mut Module, rt: &mut Rt) -> Res
     let mut func = g.b.finish();
     dce(&mut func);
     module.funcs.push(func);
-    Ok(Body { func: name, reads, state, sink: out })
+    Ok(Body { func: name, reads, state, sink: out, probes })
 }
 
 struct Gen<'a> {
@@ -337,6 +416,11 @@ struct Gen<'a> {
     columns: Vec<Column>,
     /// Where the next field goes in the state, past the sink's and every `vcall` slot so far.
     next: u32,
+    /// The builds of the tables the probes read, in the order of the probes.
+    joins: Vec<Building>,
+    /// Per probe, the directory's address, the shift and the tag table's address, read once in
+    /// the entry block.
+    tables: Vec<(Val, Val, Val)>,
 }
 
 /// A value and whether it is valid.
@@ -348,7 +432,7 @@ impl Gen<'_> {
     }
 
     /// Lays out the sink's state and makes its table, and returns the layout and the state size.
-    fn prepare_sink(&mut self, sink: &Sink) -> Result<(Out, u32)> {
+    fn prepare_sink(&mut self, sink: &Sink, fans_out: bool) -> Result<(Out, u32)> {
         match sink {
             Sink::Result { exprs, columns } => {
                 self.field(SINK, 8, "count");
@@ -364,8 +448,36 @@ impl Gen<'_> {
                         logical: c.ty.clone(),
                     });
                 }
-                let state = SINK + 8 + 16 * exprs.len() as u32;
-                Ok((Out::Result { count: SINK, columns: slots }, state))
+                let mut state = SINK + 8 + 16 * exprs.len() as u32;
+                let capacity = fans_out.then(|| {
+                    self.field(state, 8, "capacity");
+                    state += 8;
+                    state - 8
+                });
+                Ok((Out::Result { count: SINK, columns: slots, capacity }, state))
+            }
+            Sink::Build { keys, payload, .. } => {
+                let mut size = 0u32;
+                let mut field = |e: &Expr, what: &str| -> Result<KeyField> {
+                    let ty = qir_type(&e.ty)?;
+                    if ty.is_float() && what == "key" {
+                        return Err(Refusal::new(
+                            "HashJoin",
+                            "a floating point key, which the table would compare by its bits",
+                        ));
+                    }
+                    let f = KeyField { offset: size, width: ty.bytes(), text: ty == Ty::Str16 };
+                    size += f.width + 1;
+                    Ok(f)
+                };
+                let keys = keys.iter().map(|e| field(e, "key")).collect::<Result<Vec<_>>>()?;
+                let payload =
+                    payload.iter().map(|e| field(e, "payload")).collect::<Result<Vec<_>>>()?;
+                let layout = JoinLayout { keys, payload, size };
+                let table = self.rt.add_join(JoinTable::new(layout.clone()));
+                let buffer = size.next_multiple_of(8);
+                self.field(SINK, buffer, "record");
+                Ok((Out::Build(Building { table, layout, record: SINK }), SINK + buffer))
             }
             Sink::Aggregate { groups, aggregates, .. } => {
                 let mut keys = Vec::with_capacity(groups.len());
@@ -965,11 +1077,144 @@ impl Gen<'_> {
         self.b.conv(Op::Bitcast, x, Ty::Ptr)
     }
 
-    fn sink(&mut self, sink: &Sink, out: &Out) -> Result<()> {
+    /// Runs `ops` on the current row and then the sink, and goes to `skip` when done with it. The
+    /// first probe in `ops` is probe number `probe` of the pipeline, and `depth` is the loop depth
+    /// of the code so far.
+    fn ops(
+        &mut self,
+        ops: &[PipeOp],
+        probe: usize,
+        skip: Block,
+        depth: u8,
+        sink: &Sink,
+        out: &Out,
+    ) -> Result<()> {
+        let Some((op, rest)) = ops.split_first() else {
+            self.sink(sink, out, skip)?;
+            self.b.br(skip, &[]);
+            return Ok(());
+        };
+        match op {
+            PipeOp::Filter(f) => {
+                let (v, ok) = self.expr(f)?;
+                let pass = self.b.bin(Op::And, v, ok);
+                let then = self.b.block(&[]);
+                self.b.brif(pass, then, &[], skip, &[]);
+                self.b.switch_to(then);
+                self.ops(rest, probe, skip, depth, sink, out)
+            }
+            PipeOp::Probe(p) => {
+                let (head, e, stride, advance) = self.probe(p, probe, skip, depth + 1)?;
+                self.ops(rest, probe + 1, advance, depth + 1, sink, out)?;
+                self.b.switch_to(advance);
+                let stride = self.b.int(Ty::I64, i128::from(stride));
+                let e = self.b.bin(Op::Add, e, stride);
+                self.b.br(head, &[e]);
+                Ok(())
+            }
+        }
+    }
+
+    /// The fused probe of section 10.5: hashes the row's keys, tests the tag of the slot the hash
+    /// picks, and starts a loop over the slot's entries that leaves the builder in the block of a
+    /// match, with the payload read. A row with a null key, or whose tag says the slot cannot hold
+    /// it, goes to `skip`. Returns the loop's header, the entry address it carries, the stride
+    /// and the block that goes on to the next entry, which the caller ends once the code for a
+    /// match is written.
+    fn probe(
+        &mut self,
+        p: &Probe,
+        n: usize,
+        skip: Block,
+        depth: u8,
+    ) -> Result<(Block, Val, u32, Block)> {
+        let layout = self.joins[n].layout.clone();
+        let (directory, shift, tags) = self.tables[n];
+        // A null key matches nothing, and the build never stored one.
+        let mut hash = self.b.int(Ty::I64, 0);
+        let mut keys = Vec::with_capacity(p.keys.len());
+        for e in &p.keys {
+            let (v, ok) = self.expr(e)?;
+            let then = self.b.block(&[]);
+            self.b.brif(ok, then, &[], skip, &[]);
+            self.b.switch_to(then);
+            hash = self.hash(hash, v, &e.ty)?;
+            keys.push(v);
+        }
+        let fold = self.b.konst(Ty::I64, u128::from(FOLD));
+        let h = self.b.bin(Op::Mul, hash, fold);
+        let slot = self.b.bin(Op::Lshr, h, shift);
+        let word = self.b.load(Ty::I64, directory, slot, 8, 0, 0);
+        let low = self.b.int(Ty::I64, 2047);
+        let at = self.b.bin(Op::And, h, low);
+        let tag = self.b.load(Ty::I16, tags, at, 2, 0, 0);
+        let tag = self.b.conv(Op::Zext, tag, Ty::I64);
+        let k48 = self.b.int(Ty::I64, 48);
+        let bloom = self.b.bin(Op::Lshr, word, k48);
+        let seen = self.b.bin(Op::And, bloom, tag);
+        let maybe = self.b.bin(Op::IcmpEq, seen, tag);
+        let address = self.b.konst(Ty::I64, u128::from(ADDRESS));
+        let lo = self.b.bin(Op::And, word, address);
+        let hi = self.b.load(Ty::I64, directory, slot, 8, 8, 0);
+        let hi = self.b.bin(Op::And, hi, address);
+
+        let head = self.b.block(&[(Ty::I64, "entry")]);
+        self.b.brif(maybe, head, &[lo], skip, &[]);
+        self.b.switch_to(head);
+        self.b.set_loop(head, depth);
+        let e = self.b.param(head, 0);
+        self.b.poll(1024);
+        let more = self.b.bin(Op::IcmpUlt, e, hi);
+        let candidate = self.b.block(&[]);
+        self.b.brif(more, candidate, &[], skip, &[]);
+
+        self.b.switch_to(candidate);
+        let advance = self.b.block(&[]);
+        let entry = self.b.conv(Op::Bitcast, e, Ty::Ptr);
+        let stored = self.b.load(Ty::I64, entry, Val::NONE, 1, 0, 0);
+        let same = self.b.bin(Op::IcmpEq, stored, hash);
+        let check = self.b.block(&[]);
+        self.b.brif(same, check, &[], advance, &[]);
+        self.b.switch_to(check);
+        for ((v, e), f) in keys.into_iter().zip(&p.keys).zip(&layout.keys) {
+            let ty = qir_type(&e.ty)?;
+            let x = self.b.load(ty, entry, Val::NONE, 1, 8 + f.offset as i32, 0);
+            let eq = if ty == Ty::Str16 {
+                self.rt(proxy_id("str_eq"), &[x, v])
+            } else {
+                self.b.bin(Op::IcmpEq, x, v)
+            };
+            let then = self.b.block(&[]);
+            self.b.brif(eq, then, &[], advance, &[]);
+            self.b.switch_to(then);
+        }
+        for (j, (f, c)) in layout.payload.iter().zip(&p.columns).enumerate() {
+            let ty = qir_type(&c.ty)?;
+            let v = self.b.load(ty, entry, Val::NONE, 1, 8 + f.offset as i32, 0);
+            let ok = self.b.load(Ty::I1, entry, Val::NONE, 1, 8 + f.null() as i32, 0);
+            self.loaded.insert(p.first + j, (v, ok));
+        }
+        Ok((head, e, layout.stride(), advance))
+    }
+
+    fn sink(&mut self, sink: &Sink, out: &Out, skip: Block) -> Result<()> {
         let st = self.b.st();
         match (sink, out) {
-            (Sink::Result { exprs, .. }, Out::Result { count, columns }) => {
+            (Sink::Result { exprs, .. }, Out::Result { count, columns, capacity }) => {
                 let n = self.b.load(Ty::I64, st, Val::NONE, 1, *count as i32, 0);
+                if let Some(at) = capacity {
+                    // A probe can make more rows than the morsel has. When the buffers are full,
+                    // the driver grows them and runs the morsel again from the start.
+                    let cap = self.b.load(Ty::I64, st, Val::NONE, 1, *at as i32, 0);
+                    let room = self.b.bin(Op::IcmpUlt, n, cap);
+                    let (fits, full) = (self.b.block(&[]), self.b.block(&[]));
+                    self.b.set_cold(full);
+                    self.b.brif(room, fits, &[], full, &[]);
+                    self.b.switch_to(full);
+                    let status = self.b.int(Ty::I64, i128::from(NEED_MEMORY));
+                    self.b.ret(status);
+                    self.b.switch_to(fits);
+                }
                 for (k, (e, slot)) in exprs.iter().zip(columns).enumerate() {
                     let (v, ok) = self.expr(e)?;
                     let (values, valid) = (self.ptrs[2 * k], self.ptrs[2 * k + 1]);
@@ -1004,6 +1249,32 @@ impl Gen<'_> {
                 for (a, acc) in aggregates.iter().zip(&g.accs) {
                     self.update(a, acc, row, g.acc_offset + acc.offset)?;
                 }
+                Ok(())
+            }
+            (Sink::Build { keys, payload, .. }, Out::Build(b)) => {
+                // A row with a null key can never match, so it stays out of the table.
+                let mut hash = self.b.int(Ty::I64, 0);
+                let mut values = Vec::with_capacity(keys.len() + payload.len());
+                for e in keys {
+                    let (v, ok) = self.expr(e)?;
+                    let then = self.b.block(&[]);
+                    self.b.brif(ok, then, &[], skip, &[]);
+                    self.b.switch_to(then);
+                    hash = self.hash(hash, v, &e.ty)?;
+                    values.push((v, ok));
+                }
+                for e in payload {
+                    values.push(self.expr(e)?);
+                }
+                let fields = b.layout.keys.iter().chain(&b.layout.payload);
+                for ((v, ok), f) in values.into_iter().zip(fields) {
+                    let at = (b.record + f.offset) as i32;
+                    self.b.store(st, Val::NONE, 1, at, v, 0);
+                    self.b.store(st, Val::NONE, 1, at + f.width as i32, ok, 0);
+                }
+                let record = self.offset(st, b.record);
+                let table = self.handle(b.table);
+                self.rt(proxy_id("jt_append"), &[table, record, hash]);
                 Ok(())
             }
             _ => Err(Refusal::new("the sink", "its layout is of the other kind")),

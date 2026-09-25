@@ -2,9 +2,10 @@
 //! handing the body one chunk to a morsel.
 //!
 //! Only the body is generated in C1. The other steps a pipeline has are small and run here: init
-//! writes the state header and points the state at what the runtime made for it, and finalize
-//! reads an aggregate's groups out of its table. Every call of the body returns a [`Status`] and
-//! [`Feed::push`] does what it asks.
+//! writes the state header and points the state at what the runtime made for it, the join tables
+//! its probes read included, and finalize reads an aggregate's groups out of its table or lays out
+//! a join build's table for the pipelines that probe it. Every call of the body returns a
+//! [`Status`] and [`Feed::push`] does what it asks.
 //!
 //! The body reads its columns through the morsel's column table, which wants a values address and
 //! a validity bitmap per column. A fixed width column of a flat vector is already the first of
@@ -16,6 +17,11 @@
 //! A result body writes its rows into buffers the driver points it at, and they are turned into a
 //! chunk straight after the call. The strings in them are copied out then too, because they point
 //! into the chunk that was just read or into the runtime's heap, and neither is kept.
+//!
+//! Past a join probe one row can make many, so there the buffers start as long as the morsel and
+//! the body says `NeedMemory` when they are full. The driver then doubles them and runs the morsel
+//! again from the start, which is safe because the only thing such a body changes is the buffers
+//! and their count, and both start over.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -86,6 +92,7 @@ impl<'a> Feed<'a> {
         let steps = p.steps();
         let columns = match &p.sink {
             rudb_qc_pipe::Sink::Result { columns, .. }
+            | rudb_qc_pipe::Sink::Build { columns, .. }
             | rudb_qc_pipe::Sink::Aggregate { columns, .. } => columns.as_slice(),
         };
         let mut state = vec![Line([0; 64]); (body.state as usize).div_ceil(64).max(1)];
@@ -103,6 +110,23 @@ impl<'a> Feed<'a> {
                 })?;
                 let row = table.address(0) as u64;
                 bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
+            }
+        }
+        for probe in &body.probes {
+            // The build ran and was finalized before this pipeline started, and its table does
+            // not move after that.
+            let table = rt
+                .join(probe.table)
+                .filter(|t| t.is_finished())
+                .ok_or_else(|| Error::internal("a probe of a join table that is not built"))?;
+            let published = table.published();
+            let st = bytes(&mut state);
+            for (at, word) in [
+                (probe.directory, published.directory as u64),
+                (probe.shift, published.shift),
+                (probe.tags, published.tags as u64),
+            ] {
+                st[at as usize..at as usize + 8].copy_from_slice(&word.to_le_bytes());
             }
         }
         let cancel = cancel.clone();
@@ -161,46 +185,64 @@ impl<'a> Feed<'a> {
         if inner.done {
             return Ok(Progress::Done);
         }
+        let mut room = rows;
         let mut buffers = Vec::new();
-        if let Out::Result { count, columns } = &self.body.sink {
-            let st = bytes(&mut inner.state);
-            st[*count as usize..*count as usize + 8].fill(0);
-            for slot in columns {
-                let mut b = Buffers {
-                    values: vec![0u128; (rows * slot.ty.bytes() as usize).div_ceil(16)],
-                    valid: vec![0u8; rows],
-                };
-                let values = b.values.as_mut_ptr() as u64;
-                let valid = b.valid.as_mut_ptr() as u64;
-                st[slot.values as usize..slot.values as usize + 8]
-                    .copy_from_slice(&values.to_le_bytes());
-                st[slot.valid as usize..slot.valid as usize + 8]
-                    .copy_from_slice(&valid.to_le_bytes());
-                buffers.push(b);
-            }
-        }
         let Inner { rt, state, out, done } = &mut *inner;
-        let st = state.as_mut_ptr().cast::<u8>();
-        loop {
-            let status = self.program.call(self.func, st, (&raw const morsel).cast(), &mut **rt);
-            match Status(status).kind() {
-                Kind::Ok => break,
-                // The body saved where it got to in the header's cursor and picks up there.
-                Kind::Yield => {}
-                Kind::Done => {
-                    *done = true;
-                    break;
+        'attempt: loop {
+            buffers.clear();
+            if let Out::Result { count, columns, capacity } = &self.body.sink {
+                let st = bytes(state);
+                st[*count as usize..*count as usize + 8].fill(0);
+                if let Some(at) = capacity {
+                    st[*at as usize..*at as usize + 8]
+                        .copy_from_slice(&(room as u64).to_le_bytes());
                 }
-                _ => return Err(self.check(Status(status), rt)),
+                for slot in columns {
+                    let mut b = Buffers {
+                        values: vec![0u128; (room * slot.ty.bytes() as usize).div_ceil(16)],
+                        valid: vec![0u8; room],
+                    };
+                    let values = b.values.as_mut_ptr() as u64;
+                    let valid = b.valid.as_mut_ptr() as u64;
+                    st[slot.values as usize..slot.values as usize + 8]
+                        .copy_from_slice(&values.to_le_bytes());
+                    st[slot.valid as usize..slot.valid as usize + 8]
+                        .copy_from_slice(&valid.to_le_bytes());
+                    buffers.push(b);
+                }
+            }
+            let st = state.as_mut_ptr().cast::<u8>();
+            loop {
+                let status =
+                    self.program.call(self.func, st, (&raw const morsel).cast(), &mut **rt);
+                match Status(status).kind() {
+                    Kind::Ok => break 'attempt,
+                    // The body saved where it got to in the header's cursor and picks up there.
+                    Kind::Yield => {}
+                    Kind::Done => {
+                        *done = true;
+                        break 'attempt;
+                    }
+                    // Only a result sink past a probe asks, and only when its buffers are full.
+                    Kind::NeedMemory
+                        if matches!(self.body.sink, Out::Result { capacity: Some(_), .. }) =>
+                    {
+                        room = room.checked_mul(2).ok_or_else(|| {
+                            Error::internal("a join made more rows than memory holds")
+                        })?;
+                        continue 'attempt;
+                    }
+                    _ => return Err(self.check(Status(status), rt)),
+                }
             }
         }
         drop(held);
-        if let Out::Result { count, columns } = &self.body.sink {
+        if let Out::Result { count, columns, .. } = &self.body.sink {
             let st = bytes(state);
             let n = u64::from_le_bytes(
                 st[*count as usize..*count as usize + 8].try_into().unwrap_or_default(),
             );
-            let n = usize::try_from(n).unwrap_or(usize::MAX).min(rows);
+            let n = usize::try_from(n).unwrap_or(usize::MAX).min(room);
             let mut vectors = Vec::with_capacity(columns.len());
             for (slot, b) in columns.iter().zip(&buffers) {
                 let w = slot.ty.bytes() as usize;
@@ -231,11 +273,15 @@ impl<'a> Feed<'a> {
                 // so there is nothing kept aside to flush.
                 Step::LocalFin => {}
                 Step::Merge => return Err(Error::internal("a merge step with one worker")),
-                Step::Finalize => {
-                    if let Out::Aggregate(g) = &self.body.sink {
-                        out = finish::groups(inner.rt, g, self.columns)?;
+                Step::Finalize => match &self.body.sink {
+                    Out::Aggregate(g) => out = finish::groups(inner.rt, g, self.columns)?,
+                    // The build publishes its table to the probes and produces no rows.
+                    Out::Build(b) => {
+                        inner.rt.finish_join(b.table)?;
+                        out = Vec::new();
                     }
-                }
+                    Out::Result { .. } => {}
+                },
             }
         }
         Ok(out)
@@ -271,7 +317,8 @@ impl<'a> Feed<'a> {
                 };
                 Error::new(code, site.text.clone())
             }
-            // No body in C1 has a guard, and none of its slots grows, so these are bugs.
+            // No body in C1 has a guard, and only a result sink past a probe grows, so these are
+            // bugs.
             Kind::Deopt => Error::internal(format!("a pipeline deoptimized at {s:?}")),
             Kind::NeedMemory => Error::internal(format!("a pipeline asked for memory, {s:?}")),
             _ => Error::internal(format!("a pipeline returned status {s:?}")),

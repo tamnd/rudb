@@ -12,6 +12,7 @@ use rudb_qc_interp::Runtime;
 use rudb_qc_ir::{CATALOGUE, status};
 use rudb_regex::{Regex, Rewrite};
 
+use crate::join::{JoinTable, Published};
 use crate::like::Like;
 use crate::mem;
 use crate::table::{Distinct, GroupTable, read_u128};
@@ -29,6 +30,7 @@ enum Object {
     Regex { regex: Regex, rewrite: Rewrite, global: bool },
     Table(GroupTable),
     Distinct(Distinct),
+    Join(JoinTable),
 }
 
 /// The runtime of one query.
@@ -93,6 +95,34 @@ impl Rt {
     /// A handle on a grouping table.
     pub fn add_table(&mut self, table: GroupTable) -> u64 {
         self.add(Object::Table(table))
+    }
+
+    /// A handle on a join hash table.
+    pub fn add_join(&mut self, table: JoinTable) -> u64 {
+        self.add(Object::Join(table))
+    }
+
+    /// The join table behind a handle.
+    #[must_use]
+    pub fn join(&self, handle: u64) -> Option<&JoinTable> {
+        match self.objects.get(handle as usize) {
+            Some(Object::Join(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Runs the finalize step of a join build: lays out the table behind `handle` so that probes
+    /// can read it, and returns what they read.
+    ///
+    /// # Errors
+    ///
+    /// When the handle is not a join table, or the table cannot be laid out.
+    pub fn finish_join(&mut self, handle: u64) -> Result<Published, Error> {
+        let Some(Object::Join(table)) = self.objects.get_mut(handle as usize) else {
+            return Err(bad_handle("finish_join"));
+        };
+        table.finish().map_err(|e| Error::new(ErrorCode::Internal, e))?;
+        Ok(table.published())
     }
 
     /// A handle on a set of distinct values per group.
@@ -210,6 +240,15 @@ impl Rt {
                 // table's layout says.
                 let row = unsafe { table.insert(a[1] as usize, a[2] as u64, &mut self.heap) };
                 row as u128
+            }
+            "jt_append" => {
+                let Some(Object::Join(table)) = self.objects.get_mut(a[0] as usize) else {
+                    return Err(self.fail(bad_handle(name)));
+                };
+                // SAFETY: the generator passes the record buffer in its state, laid out as the
+                // table's layout says.
+                unsafe { table.append(a[1] as usize, a[2] as u64, &mut self.heap) };
+                0
             }
             "agg_distinct" | "agg_distinct_int" => {
                 // SAFETY: the second argument is a row `ht_insert` returned, and it starts with
@@ -367,6 +406,7 @@ mod tests {
             ..Default::default()
         }));
         let set = rt.add_distinct();
+        let join = rt.add_join(JoinTable::new(crate::join::JoinLayout::default()));
         let row = rt.table(table).unwrap().address(0) as u128;
         let s = text::make(b"abc");
         for (i, p) in CATALOGUE.iter().enumerate() {
@@ -374,6 +414,7 @@ mod tests {
                 "str_like" => vec![u128::from(like), s],
                 "str_regex" | "str_regex_replace" => vec![u128::from(re), s],
                 "ht_insert" => vec![u128::from(table), 0, 5],
+                "jt_append" => vec![u128::from(join), 0, 5],
                 "agg_distinct" | "agg_distinct_int" => vec![u128::from(set), row, s],
                 "agg_min_str" | "agg_max_str" => vec![row + 8],
                 "i128_div" => vec![10, 3],
