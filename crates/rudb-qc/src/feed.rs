@@ -69,9 +69,9 @@ impl<'a> Feed<'a> {
             if let Some(at) = g.row {
                 // The one group of an aggregate with no groups was made with the table, and rows
                 // never move, so its address is written once.
-                let table = rt
-                    .table(g.table)
-                    .ok_or_else(|| Error::internal("the aggregate's table is not in the runtime"))?;
+                let table = rt.table(g.table).ok_or_else(|| {
+                    Error::internal("the aggregate's table is not in the runtime")
+                })?;
                 let row = table.address(0) as u64;
                 bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
             }
@@ -119,7 +119,8 @@ impl<'a> Feed<'a> {
             source: 0,
             chunk: 0,
             begin: 0,
-            end: u32::try_from(rows).map_err(|_| Error::internal("a chunk too long for a morsel"))?,
+            end: u32::try_from(rows)
+                .map_err(|_| Error::internal("a chunk too long for a morsel"))?,
             seq: 0,
             enc: 0,
             flags: 0,
@@ -151,7 +152,9 @@ impl<'a> Feed<'a> {
         self.check(status, rt)?;
         if let Out::Result { count, columns } = &self.body.sink {
             let st = bytes(state);
-            let n = u64::from_le_bytes(st[*count as usize..*count as usize + 8].try_into().unwrap_or_default());
+            let n = u64::from_le_bytes(
+                st[*count as usize..*count as usize + 8].try_into().unwrap_or_default(),
+            );
             let n = usize::try_from(n).unwrap_or(usize::MAX).min(rows);
             let mut vectors = Vec::with_capacity(columns.len());
             for (slot, b) in columns.iter().zip(&buffers) {

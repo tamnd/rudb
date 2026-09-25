@@ -94,3 +94,22 @@ fn explain_codegen_prints_the_stages_and_the_module_or_the_refusal() {
         "an explain runs nothing, so it logs nothing"
     );
 }
+
+#[test]
+fn a_top_n_over_wide_rows_reads_them_back_on_the_compiled_engine() {
+    let database = Database::new();
+    for sql in [
+        "CREATE TABLE w (a INTEGER, b VARCHAR, c BIGINT, d DOUBLE, e VARCHAR, f INTEGER, g INTEGER, h VARCHAR, i BIGINT, j INTEGER)",
+        "INSERT INTO w SELECT (i * 7919) % 2000, 'b' || i, i * 3, i / 4.0, CASE WHEN i % 3 = 0 THEN NULL ELSE 'e' END, i, -i, 'a longer string than twelve ' || i, i * i, i % 5 FROM range(2000) r(i)",
+    ] {
+        database.execute(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    let sql = "SELECT * FROM w ORDER BY a DESC LIMIT 7";
+    database.execute("SET engine = 'compiled'").expect("the compiled engine");
+    let text = explained(&database, &format!("EXPLAIN (CODEGEN) {sql}"));
+    assert!(text.contains("fetch the rows"), "{text}");
+    let compiled = rows(&database, sql);
+    database.execute("SET engine = 'first'").expect("the first engine");
+    assert_eq!(rows(&database, sql), compiled);
+    assert_eq!(database.refusals(), Vec::<String>::new());
+}

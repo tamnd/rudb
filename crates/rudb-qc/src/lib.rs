@@ -13,7 +13,8 @@
 //! where C1 stops: the sink says it is not parallel, because one [`Rt`] serves the whole query and
 //! per worker state is C3.
 //!
-//! The breakers between pipelines are run here over the rows the pipeline before them produced.
+//! The breakers between pipelines are run here over the rows the pipeline before them produced,
+//! and so is the fetch that reads whole rows back once a top N has picked them.
 //! A sort, a top N and a limit are cheap on ClickBench, where they sit over a few thousand groups
 //! at most, and doing them a value at a time keeps the rules for comparing values in one place,
 //! `rudb_kernels::compare`.
@@ -83,8 +84,10 @@ fn check(graph: &Graph) -> std::result::Result<(), Refusal> {
                     return Err(Refusal::new("Sort", "a sort key that is not a column"));
                 }
             }
-            Stage::Fetch { .. } => {
-                return Err(Refusal::new("TableFetch", "the driver cannot read rows back yet"));
+            Stage::Fetch { row, .. } => {
+                if !matches!(row.kind, Kind::Column(_)) {
+                    return Err(Refusal::new("TableFetch", "a row ordinal that is not a column"));
+                }
             }
         }
     }
@@ -167,8 +170,11 @@ impl Compiled {
                 Stage::Limit { input, count, offset, .. } => {
                     finish::limit(take(&mut outputs, *input)?, *count, *offset)?
                 }
-                Stage::Fetch { .. } => {
-                    return Err(rudb_common::Error::internal("a fetch the check let through"));
+                Stage::Fetch { input, node, row, .. } => {
+                    let Kind::Column(ordinal) = row.kind else {
+                        return Err(rudb_common::Error::internal("a fetch the check let through"));
+                    };
+                    finish::fetch(take(&mut outputs, *input)?, plan, *node, ordinal, under.catalog)?
                 }
             };
             outputs.push(Some(chunks));
