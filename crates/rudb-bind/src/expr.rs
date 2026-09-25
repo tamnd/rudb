@@ -159,6 +159,12 @@ impl Binder<'_> {
             ast::Expr::List { items } => self.bind_list(ast, items, scope),
             ast::Expr::Struct { names, values } => {
                 let names: Vec<String> = ast.name(names).map(str::to_string).collect();
+                // A field has to have a name, and the one way to write one without is `{'': 1}`.
+                if names.iter().any(String::is_empty) {
+                    return Err(Error::binder(
+                        "Need named argument for struct pack, e.g. STRUCT_PACK(a := b)",
+                    ));
+                }
                 let written = ast.expr_list(values).to_vec();
                 let mut bound = Vec::with_capacity(written.len());
                 for value in written {
