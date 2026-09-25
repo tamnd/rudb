@@ -1528,14 +1528,18 @@ impl GlobalDictionary {
         self.ends.len()
     }
 
-    /// About how many bytes closing this dictionary holds at once: every value decoded, and a
-    /// sort entry and a code for each.
+    /// About how many bytes closing this dictionary holds at once: every value decoded, a sort
+    /// entry for each, and beside it a code or a frequency candidate.
     fn closing_bytes(&self) -> usize {
         let values = self.values();
         let decoded = (0..values.div_ceil(TEXT_PAYLOAD_VALUES))
             .map(|block| self.ends[((block + 1) * TEXT_PAYLOAD_VALUES).min(values) - 1] as usize)
             .sum::<usize>();
-        decoded.saturating_add(values.saturating_mul(size_of::<(u64, u32)>() + size_of::<u32>()))
+        // The values in byte order, which is a head and a code each, and then either the codes
+        // they were sorted as or the count and code each frequency candidate is, whichever is
+        // larger, since the two are not held at once.
+        let beside = size_of::<u32>().max(size_of::<(u64, Option<u32>)>());
+        decoded.saturating_add(values.saturating_mul(size_of::<(u64, u32)>() + beside))
     }
 
     /// About what the dictionary holds in memory, by capacity rather than by length.
@@ -8110,6 +8114,9 @@ fn keep_most_frequent(entries: &mut Vec<FrequencyEntry>) -> u64 {
         let (_, next, _) = entries.select_nth_unstable_by(FREQUENCY_ENTRIES, order);
         let omitted_max = next.count;
         entries.truncate(FREQUENCY_ENTRIES);
+        // The summary lives until the table is written, and what it was cut down from can be
+        // millions of entries long.
+        entries.shrink_to_fit();
         omitted_max
     } else {
         0
@@ -8123,17 +8130,43 @@ fn code_frequency(
     flat: &[u8],
     bases: &[u64],
 ) -> Result<(FrequencySummary, Vec<Option<Vec<u8>>>)> {
-    let mut entries = dictionary
-        .counts
-        .iter()
-        .enumerate()
-        .filter(|(_, count)| **count != 0)
-        .map(|(code, &count)| FrequencyEntry { value: FrequencyValue::Code(code as u32), count })
-        .collect::<Vec<_>>();
+    // Every distinct value is a candidate and only [`FREQUENCY_ENTRIES`] of them are kept, so the
+    // candidates are a count and a code rather than a whole entry each, which is a third of the
+    // size. On the 10 million row `hits` load the entries of `URL` and `Referer` were about 200 MB
+    // each at the moment they were cut down, and the close ran both at once.
+    let seen = dictionary.counts.iter().filter(|count| **count != 0).count();
+    let mut candidates = Vec::with_capacity(seen + usize::from(dictionary.nulls != 0));
+    candidates.extend(
+        dictionary
+            .counts
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(code, &count)| (count, Some(code as u32))),
+    );
     if dictionary.nulls != 0 {
-        entries.push(FrequencyEntry { value: FrequencyValue::Null, count: dictionary.nulls });
+        candidates.push((dictionary.nulls, None));
     }
-    let omitted_max = keep_most_frequent(&mut entries);
+    // The order of `keep_most_frequent`, where a null sorts before any code as `None` does.
+    let order = |left: &(u64, Option<u32>), right: &(u64, Option<u32>)| {
+        right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
+    };
+    let omitted_max = if candidates.len() > FREQUENCY_ENTRIES {
+        let (_, next, _) = candidates.select_nth_unstable_by(FREQUENCY_ENTRIES, order);
+        let omitted_max = next.0;
+        candidates.truncate(FREQUENCY_ENTRIES);
+        omitted_max
+    } else {
+        0
+    };
+    candidates.sort_unstable_by(order);
+    let entries = candidates
+        .into_iter()
+        .map(|(count, code)| FrequencyEntry {
+            value: code.map_or(FrequencyValue::Null, FrequencyValue::Code),
+            count,
+        })
+        .collect::<Vec<_>>();
     let mut spans = Vec::with_capacity(entries.len());
     let mut text_bytes = 0_usize;
     for entry in &entries {
