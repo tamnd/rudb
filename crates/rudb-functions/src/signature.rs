@@ -273,6 +273,9 @@ enum Shape {
     /// `mad(x)`, the median distance from the median, which is an INTERVAL for anything that is a
     /// time and the continuous type for anything that is a number.
     Deviation,
+    /// `arg_min(arg, by)`, which answers one of its `arg` values in the type it was given, and
+    /// `arg_min(arg, by, n)`, which answers a list of them with `n` taken as a BIGINT.
+    Picked,
     /// No arguments at all and a fixed result. `now()` and `current_schema()`.
     ///
     /// The session context functions, which are the ones whose answer comes from the connection
@@ -1011,6 +1014,12 @@ const TABLE: &[Entry] = &[
     aggregate("median", Arity::exactly(1), Shape::Median, false),
     aggregate("mad", Arity::exactly(1), Shape::Deviation, false),
     aggregate("mode", Arity::exactly(1), Shape::AsGiven, false),
+    aggregate("arg_min", Arity::between(2, 3), Shape::Picked, false),
+    aggregate("arg_max", Arity::between(2, 3), Shape::Picked, false),
+    aggregate("arg_min_null", Arity::exactly(2), Shape::Picked, false),
+    aggregate("arg_max_null", Arity::exactly(2), Shape::Picked, false),
+    aggregate("arg_min_nulls_last", Arity::between(2, 3), Shape::Picked, false),
+    aggregate("arg_max_nulls_last", Arity::between(2, 3), Shape::Picked, false),
     // The ranking windows, which answer from where the row sits in its partition rather than from
     // anything in it. Six names and seven rows, since `rank_dense` is an alias upstream reports
     // with `dense_rank` in its `alias_of`. The three that count rows are BIGINT and the two that
@@ -1381,6 +1390,13 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let held = interpolated(value).ok_or_else(|| no_match(entry.name, arguments))?;
             (vec![held.clone(), fraction.clone()], fractioned(fraction, held))
         }
+        Shape::Picked => match arguments {
+            [arg, by] => (vec![arg.clone(), by.clone()], arg.clone()),
+            [arg, by, _] => {
+                (vec![arg.clone(), by.clone(), LogicalType::BigInt], LogicalType::list(arg.clone()))
+            }
+            _ => return Err(no_match(entry.name, arguments)),
+        },
         Shape::Median => {
             let value = &arguments[0];
             let held = match value {
@@ -2862,6 +2878,7 @@ impl Shape {
             // one row here stands for all of them.
             Self::Discrete | Self::Continuous => (leading(1, ANY, "DOUBLE"), ANY),
             Self::Median | Self::Deviation => (all(ANY), ANY),
+            Self::Picked => (leading(2, ANY, "BIGINT"), ANY),
         }
     }
 }
@@ -2923,6 +2940,10 @@ const ALIASES: &[(&str, &str)] = &[
     ("variance", "var_samp"),
     ("group_concat", "string_agg"),
     ("quantile", "quantile_disc"),
+    ("argmin", "arg_min"),
+    ("min_by", "arg_min"),
+    ("argmax", "arg_max"),
+    ("max_by", "arg_max"),
     ("listagg", "string_agg"),
     ("list_extract", "array_extract"),
     ("list_element", "array_extract"),

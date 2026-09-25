@@ -92,7 +92,7 @@ pub(crate) enum Whole {
 impl Whole {
     /// The number a value is, and which type it came from, or `None` for a value that is not held
     /// as a number.
-    fn of(value: &Value) -> Option<(Self, i64)> {
+    pub(crate) fn of(value: &Value) -> Option<(Self, i64)> {
         Some(match *value {
             Value::TinyInt(n) => (Self::TinyInt, i64::from(n)),
             Value::SmallInt(n) => (Self::SmallInt, i64::from(n)),
@@ -244,6 +244,21 @@ pub(crate) enum Numbers<'a> {
     U32(&'a [u32]),
 }
 
+impl Numbers<'_> {
+    /// The number at `row`, widened.
+    pub(crate) fn at(self, row: usize) -> i64 {
+        match self {
+            Self::I8(n) => i64::from(n[row]),
+            Self::I16(n) => i64::from(n[row]),
+            Self::I32(n) => i64::from(n[row]),
+            Self::I64(n) => n[row],
+            Self::U8(n) => i64::from(n[row]),
+            Self::U16(n) => i64::from(n[row]),
+            Self::U32(n) => i64::from(n[row]),
+        }
+    }
+}
+
 impl<'a> Column<'a> {
     /// The column a flat vector of `rows` rows is, or `None` for a form or a type this does not
     /// read, which then goes in a value at a time.
@@ -289,16 +304,7 @@ impl<'a> Column<'a> {
         match self {
             Self::Reals(reals) => held.push_real(reals[row]),
             Self::Wholes(whole, numbers) => {
-                let n = match numbers {
-                    Numbers::I8(n) => i64::from(n[row]),
-                    Numbers::I16(n) => i64::from(n[row]),
-                    Numbers::I32(n) => i64::from(n[row]),
-                    Numbers::I64(n) => n[row],
-                    Numbers::U8(n) => i64::from(n[row]),
-                    Numbers::U16(n) => i64::from(n[row]),
-                    Numbers::U32(n) => i64::from(n[row]),
-                };
-                held.push_whole(whole, n);
+                held.push_whole(whole, numbers.at(row));
             }
         }
     }

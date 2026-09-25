@@ -59,6 +59,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aggregate;
+mod arg_extreme;
 mod bits;
 pub mod cast;
 pub mod compare;

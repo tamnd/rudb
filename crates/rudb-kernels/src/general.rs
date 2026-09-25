@@ -18,6 +18,7 @@ use std::cmp::Ordering;
 use rudb_common::{Error, LogicalType, Result, Value};
 
 use crate::aggregate::Accumulator;
+use crate::arg_extreme::{ArgExtreme, Key};
 use crate::compare::order_with_nulls;
 use crate::number::{approximate, fit, integral};
 use crate::quantile::{self, Column, Held, Holistic};
@@ -54,6 +55,9 @@ pub(crate) enum General {
     /// The quantiles, `median`, `mad` and `mode`, which hold every value that is not null and the
     /// fraction the call asked for, and answer in [`crate::quantile`].
     Holistic { values: Held, fraction: Option<Value>, measure: Holistic, returns: LogicalType },
+    /// The `arg_min` and `arg_max` spellings, which keep the row with the least or greatest key,
+    /// or the best `n` of them when the call passes a count, and answer in [`crate::arg_extreme`].
+    Arg { state: ArgExtreme, returns: LogicalType },
 }
 
 /// Which row [`General::Pick`] keeps.
@@ -90,6 +94,9 @@ impl General {
         let pick = |pick| Self::Pick { held: None, pick };
         let bits = |op| Self::Bits { held: None, op, returns: returns.clone() };
         let moments = |measure| Self::Moments { count: 0, mean: 0.0, squared: 0.0, measure };
+        if let Some(state) = ArgExtreme::named(name) {
+            return Some(Self::Arg { state, returns: returns.clone() });
+        }
         if let Some(measure) = Holistic::named(name) {
             let returns = returns.clone();
             return Some(Self::Holistic { values: Held::Empty, fraction: None, measure, returns });
@@ -128,6 +135,7 @@ impl General {
             return Err(Error::internal("an aggregate over 0 arguments".to_string()));
         };
         match self {
+            Self::Arg { state, .. } => state.update(args)?,
             Self::List { values, .. } => values.push(value.clone()),
             Self::Pick { held, pick } => match pick {
                 Pick::First => {
@@ -207,6 +215,18 @@ impl General {
         Ok(())
     }
 
+    /// Whether this state can say from a typed `by` alone that a row changes nothing, through
+    /// [`Self::cannot_take`].
+    pub(crate) fn keyed(&self) -> bool {
+        matches!(self, Self::Arg { .. })
+    }
+
+    /// Whether a row whose second argument is `key` is sure to change nothing, for a call of
+    /// `arity` arguments.
+    pub(crate) fn cannot_take(&self, key: Key, arity: usize) -> bool {
+        matches!(self, Self::Arg { state, .. } if state.cannot_take(key, arity))
+    }
+
     /// Whether this state skips nulls and takes the rest of a column through [`Self::push_column`].
     pub(crate) fn takes_columns(&self) -> bool {
         matches!(self, Self::Holistic { .. })
@@ -238,6 +258,7 @@ impl General {
             (Self::List { values, .. }, Self::List { values: more, .. }) => {
                 values.extend(more.iter().cloned());
             }
+            (Self::Arg { state, .. }, Self::Arg { state: theirs, .. }) => state.combine(theirs)?,
             (Self::Ordered { rows, .. }, Self::Ordered { rows: more, .. }) => {
                 rows.extend(more.iter().cloned());
             }
@@ -327,6 +348,9 @@ impl General {
         if let Self::Ordered { keys, rows, inner } = self {
             return ordered(keys, rows, inner);
         }
+        if let Self::Arg { state, returns } = self {
+            return state.finish(returns);
+        }
         if let Self::Holistic { values, fraction, measure, returns } = self {
             return quantile::finish(*measure, values, fraction.as_ref(), returns);
         }
@@ -368,8 +392,8 @@ impl General {
             }
             Self::Joined { seen: false, .. } => Value::Null,
             Self::Joined { text, .. } => Value::Varchar(text.clone()),
-            Self::Ordered { .. } | Self::Holistic { .. } => {
-                return Err(Error::internal("an ordered or holistic aggregate"));
+            Self::Ordered { .. } | Self::Holistic { .. } | Self::Arg { .. } => {
+                return Err(Error::internal("an ordered, holistic or arg_min aggregate"));
             }
         })
     }

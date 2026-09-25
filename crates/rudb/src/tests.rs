@@ -11175,3 +11175,58 @@ fn unnest_of_a_struct_is_a_column_per_field_the_way_the_pin_does() {
         "Need named argument for struct pack, e.g. STRUCT_PACK(a := b)"
     );
 }
+
+#[test]
+fn arg_min_and_arg_max_answer_the_way_the_pin_does() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let nulls = "FROM (VALUES (NULL, 1), (2, NULL), (3, 5), (4, 5), (5, 0)) t(a, b)";
+    assert_eq!(
+        text(&format!(
+            "SELECT arg_min(a, b), arg_max(a, b), arg_min_null(a, b), arg_max_null(a, b), arg_min_nulls_last(a, b), arg_max_nulls_last(a, b) {nulls}"
+        )),
+        "5,3,5,3,5,3"
+    );
+    assert_eq!(
+        text(&format!(
+            "SELECT arg_min(a, b, 2), arg_max(a, b, 2), arg_min_nulls_last(a, b, 2) {nulls}"
+        )),
+        "[5, 4],[4, 3],[5, NULL]"
+    );
+    assert_eq!(
+        text("SELECT arg_min(a, b), arg_min_null(a, b) FROM (VALUES (NULL, 1), (2, 3)) t(a, b)"),
+        "2,NULL"
+    );
+    assert_eq!(
+        text(
+            "SELECT arg_max_nulls_last(a, b), arg_max_null(a, b) FROM (VALUES (NULL, NULL), (4, NULL)) t(a, b)"
+        ),
+        "4,NULL"
+    );
+    assert_eq!(
+        text(
+            "SELECT arg_min(a, b, 5), min_by(a, b), max_by(a, b), argmax(a, b) FROM (VALUES (1, 3), (2, 1), (3, 2), (4, 1), (5, 3), (6, 1), (7, 2)) t(a, b)"
+        ),
+        "[4, 2, 6, 7, 3],2,1,1"
+    );
+    assert_eq!(
+        text(
+            "SELECT g, arg_min(a, b, 2), typeof(arg_min(a::SMALLINT, b)) FROM (VALUES (1, 1, 5), (1, 2, 5), (2, 3, 1)) t(g, a, b) GROUP BY g ORDER BY g"
+        ),
+        "1,[2, 1],SMALLINT;2,[3],SMALLINT"
+    );
+    assert_eq!(text("SELECT arg_min(i, i, 2) FROM range(0) t(i)"), "NULL");
+    for (sql, message) in [
+        ("SELECT arg_min(i, i, 0) FROM range(3) t(i)", "n value must be > 0"),
+        ("SELECT arg_min(i, i, NULL) FROM range(3) t(i)", "n value cannot be NULL"),
+        ("SELECT arg_max(i, i, 1000000000000) FROM range(3) t(i)", "n value must be < 1000000"),
+    ] {
+        assert!(failure(&db, sql).contains(message), "{sql}");
+    }
+}

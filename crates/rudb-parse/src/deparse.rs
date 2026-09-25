@@ -843,9 +843,10 @@ pub fn typename(text: &str) -> String {
         return typename(&text[..open]) + &text[open..];
     }
     let (base, arguments) = arguments(text);
-    // `ENUM('a','b')` is written back with a space after each comma, whatever it was written with.
-    if let ("ENUM", Some(inside)) = (base.to_ascii_uppercase().as_str(), arguments) {
-        return format!("ENUM({})", pieces(inside).join(", "));
+    // `enum('a','b')` is written back with a space after each comma, whatever it was written with,
+    // and with the word in the case it was written in.
+    if let (true, Some(inside)) = (base.eq_ignore_ascii_case("enum"), arguments) {
+        return format!("{base}({})", pieces(inside).join(", "));
     }
     let Some(name) = standard(base) else {
         let base = unquote(base);
@@ -993,7 +994,6 @@ fn standard(base: &str) -> Option<&'static str> {
         ("NATIONAL CHARACTER VARYING", "VARCHAR"),
         ("VARCHAR", "VARCHAR"),
         ("BIT", "BIT"),
-        ("DATE", "DATE"),
         ("TIME", "TIME"),
         ("TIME WITH TIME ZONE", "TIME WITH TIME ZONE"),
         ("TIME WITHOUT TIME ZONE", "TIME"),
@@ -1217,6 +1217,16 @@ mod tests {
         assert_eq!(cast("int[2][3]"), "SELECT CAST(x AS INTEGER[2][3])");
         assert_eq!(cast("map(int, varchar)"), "SELECT CAST(x AS MAP(INTEGER, VARCHAR))");
         assert_eq!(cast("union(a int)"), "SELECT CAST(x AS UNION(a INTEGER))");
+    }
+
+    /// `date` and `enum` have no rule in the grammar, so they keep the case they were written in.
+    #[test]
+    fn a_date_and_an_enum_keep_the_case_they_were_written_in() {
+        let cast = |written: &str| body(&format!("SELECT CAST(x AS {written})"));
+        assert_eq!(cast("date"), "SELECT CAST(x AS date)");
+        assert_eq!(cast("Date[]"), "SELECT CAST(x AS Date[])");
+        assert_eq!(cast("enum('a','b')"), "SELECT CAST(x AS enum('a', 'b'))");
+        assert_eq!(cast("ENUM('x')"), "SELECT CAST(x AS ENUM('x'))");
     }
 
     /// A struct keeps the case of the field name and resolves the field type.
