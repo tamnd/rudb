@@ -11039,14 +11039,84 @@ fn an_array_is_a_list_written_with_the_keyword_or_a_query_gathered_into_one() {
         text("SELECT ARRAY(SELECT i FROM range(300000) t(i) ORDER BY i % 7, i DESC)[1:2]"),
         "[299999, 299992]"
     );
-    assert_eq!(
-        text("SELECT ARRAY(SELECT i FROM range(9) t(i) ORDER BY i DESC LIMIT 2)"),
-        "[8, 7]"
-    );
+    assert_eq!(text("SELECT ARRAY(SELECT i FROM range(9) t(i) ORDER BY i DESC LIMIT 2)"), "[8, 7]");
     assert!(
         failure(&db, "SELECT ARRAY(SELECT i, i FROM range(2) t(i))")
             .contains("Subquery returns 2 columns - expected 1")
     );
+}
+
+#[test]
+fn the_quantiles_median_mad_and_mode_answer_the_way_the_pin_does() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    assert_eq!(
+        text(
+            "SELECT quantile_disc(i, [0.1, 0.5, 0.9]), quantile_cont(i, [0.1, 0.5]), quantile(i, 0.5), median(i), mad(i) FROM range(10) t(i)"
+        ),
+        "[0, 4, 8],[0.9, 4.5],4,4.5,2.5"
+    );
+    assert_eq!(
+        text(
+            "SELECT quantile_disc(i, 0.1::DOUBLE), quantile_disc(i, 0.1::FLOAT), quantile_cont(i, 0.99), quantile_disc(i, -0.25) FROM range(10) t(i)"
+        ),
+        "0,1,8.91,7"
+    );
+    assert_eq!(
+        text("SELECT quantile_cont(x, 0.3), typeof(median(x)) FROM (VALUES (1::BIGINT), (2)) t(x)"),
+        "1.2999999999999998,DOUBLE"
+    );
+    assert_eq!(
+        text(
+            "SELECT median(x), quantile_cont(x, 0.3), mad(x) FROM (VALUES (1.25::DECIMAL(5,2)), (-2.5), (3.33)) t(x)"
+        ),
+        "1.25,-0.25,2.08"
+    );
+    assert_eq!(
+        text(
+            "SELECT median(d), quantile_cont(d, 0.3), mad(d) FROM (SELECT DATE '2020-01-01' + i::INT AS d FROM range(4) t(i))"
+        ),
+        "2020-01-02 12:00:00,2020-01-01 21:36:00,1 day"
+    );
+    assert_eq!(
+        text("SELECT median(s), mode(s) FROM (VALUES ('a'), ('b'), ('c'), ('d')) t(s)"),
+        "b,a"
+    );
+    assert_eq!(text("SELECT mode(x) FROM (VALUES (2), (1), (1), (2), (3)) t(x)"), "2");
+    assert_eq!(text("SELECT median(i), mode(i) FROM range(0) t(i)"), "NULL,NULL");
+    assert_eq!(
+        text(
+            "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY i), percentile_disc(0.25) WITHIN GROUP (ORDER BY i DESC), mode() WITHIN GROUP (ORDER BY i % 3), quantile_cont(i, 0.5 ORDER BY i DESC) FROM range(10) t(i)"
+        ),
+        "2.25,7,0,4.5"
+    );
+    for (sql, message) in [
+        ("SELECT quantile_cont(i, i) FROM range(3) t(i)", "must be a constant expression"),
+        ("SELECT quantile_cont(i, NULL) FROM range(3) t(i)", "must not be NULL"),
+        ("SELECT quantile_cont(i, 1.5) FROM range(3) t(i)", "in the range [-1, 1]"),
+        ("SELECT quantile_cont(i, [0.5, NULL]) FROM range(3) t(i)", "cannot be NULL"),
+        (
+            "SELECT sum(i) WITHIN GROUP (ORDER BY i) FROM range(3) t(i)",
+            "Unknown ordered aggregate \"sum\"",
+        ),
+        ("SELECT quantile_cont(i, [-0.25, 0.5]) FROM range(3) t(i)", "consistent signs"),
+        (
+            "SELECT percentile_disc(-0.5) WITHIN GROUP (ORDER BY i) FROM range(3) t(i)",
+            "range [0, 1]",
+        ),
+        (
+            "SELECT percentile_cont(i, 0.5) WITHIN GROUP (ORDER BY i) FROM range(3) t(i)",
+            "Wrong number of arguments for PERCENTILE_CONT",
+        ),
+    ] {
+        assert!(failure(&db, sql).contains(message), "{sql}");
+    }
 }
 
 #[test]

@@ -20,6 +20,7 @@ use rudb_common::{Error, LogicalType, Result, Value};
 use crate::aggregate::Accumulator;
 use crate::compare::order_with_nulls;
 use crate::number::{approximate, fit, integral};
+use crate::quantile::{self, Holistic};
 
 /// A running aggregate that is not one of the five the aggregate module keeps inline.
 #[derive(Debug, Clone)]
@@ -50,6 +51,14 @@ pub(crate) enum General {
     /// does not reach the answer. The sort is stable, so rows that tie on every key keep the order
     /// they arrived in, which is the most the pin promises too.
     Ordered { keys: Vec<(bool, bool)>, rows: Vec<Vec<Value>>, inner: Box<Accumulator> },
+    /// The quantiles, `median`, `mad` and `mode`, which hold every value that is not null and the
+    /// fraction the call asked for, and answer in [`crate::quantile`].
+    Holistic {
+        values: Vec<Value>,
+        fraction: Option<Value>,
+        measure: Holistic,
+        returns: LogicalType,
+    },
 }
 
 /// Which row [`General::Pick`] keeps.
@@ -86,6 +95,10 @@ impl General {
         let pick = |pick| Self::Pick { held: None, pick };
         let bits = |op| Self::Bits { held: None, op, returns: returns.clone() };
         let moments = |measure| Self::Moments { count: 0, mean: 0.0, squared: 0.0, measure };
+        if let Some(measure) = Holistic::named(name) {
+            let returns = returns.clone();
+            return Some(Self::Holistic { values: Vec::new(), fraction: None, measure, returns });
+        }
         Some(match name {
             "list" => {
                 let element = match returns {
@@ -138,6 +151,12 @@ impl General {
             // decides what to skip once they are in order.
             Self::Ordered { rows, .. } => rows.push(args.to_vec()),
             _ if value.is_null() => {}
+            Self::Holistic { values, fraction, .. } => {
+                if fraction.is_none() {
+                    *fraction = args.get(1).cloned();
+                }
+                values.push(value.clone());
+            }
             Self::Logic { held, all } => {
                 let Value::Boolean(flag) = *value else {
                     return Err(unexpected("bool_and", value));
@@ -201,6 +220,15 @@ impl General {
             }
             (Self::Ordered { rows, .. }, Self::Ordered { rows: more, .. }) => {
                 rows.extend(more.iter().cloned());
+            }
+            (
+                Self::Holistic { values, fraction, .. },
+                Self::Holistic { values: more, fraction: theirs, .. },
+            ) => {
+                values.extend(more.iter().cloned());
+                if fraction.is_none() {
+                    fraction.clone_from(theirs);
+                }
             }
             (Self::Pick { held, pick }, Self::Pick { held: theirs, .. }) => {
                 let take = match pick {
@@ -279,6 +307,9 @@ impl General {
         if let Self::Ordered { keys, rows, inner } = self {
             return ordered(keys, rows, inner);
         }
+        if let Self::Holistic { values, fraction, measure, returns } = self {
+            return quantile::finish(*measure, values, fraction.as_ref(), returns);
+        }
         Ok(match self {
             Self::List { values, .. } if values.is_empty() => Value::Null,
             Self::List { element, values } => {
@@ -317,7 +348,9 @@ impl General {
             }
             Self::Joined { seen: false, .. } => Value::Null,
             Self::Joined { text, .. } => Value::Varchar(text.clone()),
-            Self::Ordered { .. } => return Err(Error::internal("an ordered aggregate")),
+            Self::Ordered { .. } | Self::Holistic { .. } => {
+                return Err(Error::internal("an ordered or holistic aggregate"));
+            }
         })
     }
 }

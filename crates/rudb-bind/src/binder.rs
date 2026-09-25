@@ -3303,6 +3303,20 @@ impl<'a> Binder<'a> {
         self.in_aggregate = false;
         let filter = filter?;
 
+        // The ordered-set aggregates take the value they read from their `ORDER BY` when the call
+        // does not write it, which is what `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` is
+        // parsed into, and a descending order counts their fractions from the top.
+        let (ordered_set, taken) = ordered_set(name, args.len(), sorted);
+        let injected = sorted.iter().map(|item| item.expr).take(usize::from(taken));
+        let args: Vec<ast::ExprRef> = injected.chain(args.iter().copied()).collect();
+        let from_top = ordered_set
+            && sorted.len() == 1
+            && match sorted[0].order {
+                Order::Unstated => self.semantics.default_descending(),
+                Order::Ascending => false,
+                Order::Descending => true,
+            };
+
         self.in_aggregate = true;
         let mut bound = Vec::with_capacity(args.len());
         let mut failure = None;
@@ -3342,6 +3356,10 @@ impl<'a> Binder<'a> {
                 "The \"separator\" argument in function \"string_agg\" must be a constant expression",
             ));
         }
+        if matches!(resolved.name, "quantile_cont" | "quantile_disc") {
+            let ordered = ordered_set && sorted.len() == 1;
+            bound[1] = self.quantile_fraction(resolved.name, bound[1], ordered, from_top)?;
+        }
         let mut cast = Vec::with_capacity(bound.len());
         for (arg, wanted) in bound.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
@@ -3367,6 +3385,67 @@ impl<'a> Binder<'a> {
         let aggregation = self.aggregation.as_ref().expect("checked above");
         let (index, groups) = (aggregation.index, aggregation.groups.len());
         Ok(self.column(index, groups + at, ty))
+    }
+
+    /// The fraction of a quantile call, checked the way the pin checks it and counted from the top
+    /// when the call's `ORDER BY` is descending.
+    ///
+    /// A negative fraction already means counting from the top, so a call that also writes an
+    /// order may not have one, and a list may not mix the two directions.
+    fn quantile_fraction(
+        &mut self,
+        name: &str,
+        fraction: ExprRef,
+        ordered: bool,
+        from_top: bool,
+    ) -> Result<ExprRef> {
+        let Ok(Some(value)) = fold::value_of(&self.plan, fraction) else {
+            return Err(Error::binder(format!(
+                "The \"quantile\" argument in function \"{name}\" must be a constant expression"
+            )));
+        };
+        if value.is_null() {
+            return Err(Error::binder(format!(
+                "The \"quantile\" argument in function '\"{name}\"' must not be NULL"
+            )));
+        }
+        let each = match &value {
+            Value::List { values, .. } => values.as_slice(),
+            one => std::slice::from_ref(one),
+        };
+        let mut signs = (false, false);
+        for one in each {
+            if one.is_null() {
+                return Err(Error::binder("QUANTILE parameter cannot be NULL"));
+            }
+            let share = share(one).unwrap_or(f64::NAN);
+            if !(-1.0..=1.0).contains(&share) {
+                return Err(Error::binder(
+                    "QUANTILE can only take parameters in the range [-1, 1]",
+                ));
+            }
+            if share < 0.0 {
+                signs.0 = true;
+            } else {
+                signs.1 = true;
+            }
+        }
+        if ordered && signs.0 {
+            return Err(Error::binder("PERCENTILEs can only take parameters in the range [0, 1]"));
+        }
+        if signs.0 && signs.1 {
+            return Err(Error::binder("QUANTILE parameters must have consistent signs"));
+        }
+        if !from_top {
+            return Ok(fraction);
+        }
+        let negated = match value {
+            Value::List { element, values } => {
+                Value::List { element, values: values.iter().map(negated).collect() }
+            }
+            one => negated(&one),
+        };
+        Ok(self.add_constant(negated))
     }
 
     /// The name of an aggregate with the `ORDER BY` of its call folded in, with the keys that matter
@@ -4231,4 +4310,55 @@ fn same_expr(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether a call is to one of the ordered-set aggregates, and whether it takes the value it reads
+/// from its one `ORDER BY` key because it does not write one.
+fn ordered_set(name: &str, written: usize, sorted: &[ast::OrderItem]) -> (bool, bool) {
+    let name = name.to_ascii_lowercase();
+    let wants = match name.as_str() {
+        "quantile_cont" | "quantile_disc" | "quantile" => 1,
+        "mode" => 0,
+        _ => return (false, false),
+    };
+    (true, sorted.len() == 1 && written == wants)
+}
+
+/// A quantile fraction counted from the other end.
+fn negated(value: &Value) -> Value {
+    match *value {
+        Value::Decimal { unscaled, width, scale } => {
+            Value::Decimal { unscaled: -unscaled, width, scale }
+        }
+        Value::Double(share) => Value::Double(-share),
+        Value::Float(share) => Value::Float(-share),
+        ref whole => match share(whole) {
+            Some(share) => Value::Double(-share),
+            None => whole.clone(),
+        },
+    }
+}
+
+/// A numeric fraction as a double, or `None` for a value that is not a number.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a fraction is compared with -1 and 1, which a double holds exactly"
+)]
+fn share(value: &Value) -> Option<f64> {
+    Some(match *value {
+        Value::TinyInt(v) => f64::from(v),
+        Value::SmallInt(v) => f64::from(v),
+        Value::Integer(v) => f64::from(v),
+        Value::BigInt(v) => v as f64,
+        Value::HugeInt(v) => v as f64,
+        Value::UTinyInt(v) => f64::from(v),
+        Value::USmallInt(v) => f64::from(v),
+        Value::UInteger(v) => f64::from(v),
+        Value::UBigInt(v) => v as f64,
+        Value::UHugeInt(v) => v as f64,
+        Value::Float(v) => f64::from(v),
+        Value::Double(v) => v,
+        Value::Decimal { unscaled, scale, .. } => unscaled as f64 / 10f64.powi(i32::from(scale)),
+        _ => return None,
+    })
 }
