@@ -63,6 +63,8 @@ pub struct Statement {
     pub optimize_ns: u64,
     /// The physical plan and the operator tree.
     pub physical_ns: u64,
+    /// The part of `physical_ns` the compiled engine spent generating and compiling code.
+    pub codegen_ns: u64,
     /// Running it, with turning what it produced into a result.
     pub execute_ns: u64,
     /// The whole statement.
@@ -92,6 +94,7 @@ impl Statement {
         self.rewrite_ns = timing.rewrite_ns;
         self.optimize_ns = timing.optimize_ns.saturating_sub(timing.rewrite_ns);
         self.physical_ns = timing.physical_ns;
+        self.codegen_ns = timing.codegen_ns;
         self.execute_ns = timing.execute_ns;
         self.total_ns = timing.total_ns;
         self.cpu_ns = metrics.resource.cpu_ns;

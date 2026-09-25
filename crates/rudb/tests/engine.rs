@@ -118,6 +118,9 @@ fn explain_codegen_prints_the_stages_and_the_module_or_the_refusal() {
     assert!(text.contains("scan "), "{text}");
     assert!(text.contains("aggregate by 1 keys"), "{text}");
     assert!(text.contains("module "), "{text}");
+    assert!(text.contains(" functions native, "), "{text}");
+    assert!(text.contains(" generated in "), "{text}");
+    assert!(text.contains(" compiled in "), "{text}");
     let text = explained(
         &database,
         "EXPLAIN (CODEGEN) SELECT count(*) FROM t a LEFT JOIN t b ON a.x = b.x AND b.s = 'w1'",

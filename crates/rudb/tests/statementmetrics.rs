@@ -59,6 +59,29 @@ fn a_query_leaves_its_four_frontend_phases() {
     assert_eq!(column(&row, "frontend_ns"), frontend);
     let rest = column(&row, "physical_ns") + column(&row, "execute_ns");
     assert_eq!(column(&row, "total_ns"), frontend + rest, "{row:?}");
+    assert_eq!(column(&row, "codegen_ns"), 0, "the first engine generates no code: {row:?}");
+}
+
+#[test]
+fn a_query_on_the_compiled_engine_leaves_its_compile_time() {
+    let database = Database::new();
+    let connection = database.connect();
+    connection
+        .execute("CREATE TABLE compiled_phases AS SELECT i % 7 AS k, i AS v FROM range(1000) r(i)")
+        .expect("builds the table");
+    database.execute("SET engine = 'compiled'").expect("the compiled engine");
+    let sql = "SELECT k, sum(v) FROM compiled_phases WHERE v > 10 GROUP BY k";
+    let result = connection.query(sql).expect("runs the query");
+    assert_eq!(database.refusals(), Vec::<String>::new(), "the compiled engine took it");
+    let timing = &result.metrics().expect("a query that ran has metrics").timing;
+    assert!(timing.codegen_ns > 0, "{timing:?}");
+    assert!(result.metrics().expect("measured").render().contains("\"codegen_ns\""));
+    let row = kept(&connection, sql);
+    let codegen = column(&row, "codegen_ns");
+    assert!(codegen > 0, "the compile was charged nothing: {row:?}");
+    assert_eq!(column(&row, "physical_ns"), codegen, "{row:?}");
+    let rest = column(&row, "physical_ns") + column(&row, "execute_ns");
+    assert_eq!(column(&row, "total_ns"), column(&row, "frontend_ns") + rest, "{row:?}");
 }
 
 #[test]

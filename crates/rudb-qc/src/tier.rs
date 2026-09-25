@@ -188,6 +188,8 @@ pub struct Options {
 pub struct Report {
     /// The tier the query asked for, with `auto` decided.
     pub tier: &'static str,
+    /// The time spent turning the plan into the QIR module, on every tier.
+    pub generate: Duration,
     /// The time spent lowering and loading machine code, zero on `interp`.
     pub compile: Duration,
     /// How many functions the module has.
@@ -204,11 +206,12 @@ impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "tier {}: {} of {} functions native, {} bytes, compiled in {:.3} ms",
+            "tier {}: {} of {} functions native, {} bytes, generated in {:.3} ms, compiled in {:.3} ms",
             self.tier,
             self.native,
             self.functions,
             self.bytes,
+            self.generate.as_secs_f64() * 1e3,
             self.compile.as_secs_f64() * 1e3,
         )?;
         for reason in &self.fallbacks {
@@ -278,6 +281,11 @@ impl Tiers {
     /// What the second tier did.
     pub(crate) fn report(&self) -> &Report {
         &self.report
+    }
+
+    /// Notes how long the module took to generate, which happened before the tiers saw it.
+    pub(crate) fn generated_in(&mut self, took: Duration) {
+        self.report.generate = took;
     }
 
     /// The index of the function with this name.

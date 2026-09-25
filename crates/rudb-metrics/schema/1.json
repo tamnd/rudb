@@ -31,6 +31,7 @@
     "optimize_ns": 310000,
     "rewrite_ns": 120000,
     "physical_ns": 44000,
+    "codegen_ns": 0,
     "execute_ns": 1323000000,
     "result_ns": 2000000,
     "total_ns": 1323483000
