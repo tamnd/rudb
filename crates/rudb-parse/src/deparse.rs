@@ -350,7 +350,8 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         Expr::Unary { op, operand } => unary(ast, op, operand),
         Expr::Binary { op, left, right } => binary(ast, op, left, right),
         Expr::Function { name, args, distinct, filter } => {
-            call(ast, name, args, distinct, filter, ast.named_args(index))
+            let sorted = ast.aggregate_order(index);
+            call(ast, name, args, distinct, filter, ast.named_args(index), sorted)
         }
         held @ Expr::Window { .. } => window(ast, held),
         Expr::Cast { operand, ty, try_cast } => {
@@ -655,6 +656,7 @@ fn call(
     distinct: bool,
     filter: ExprRef,
     named: &[Target],
+    sorted: &[OrderItem],
 ) -> String {
     let written = parts(ast, name);
     let list = ast.expr_list(args);
@@ -681,6 +683,10 @@ fn call(
             quoted(ast.string(target.alias)),
             expr(ast, target.expr)
         ));
+    }
+    if !sorted.is_empty() {
+        let items: Vec<String> = sorted.iter().map(|item| order(ast, item)).collect();
+        listed.push_str(&format!(" ORDER BY {}", items.join(", ")));
     }
     format!("{}({word}{listed}){}", operator(ast, name, &written), filtered(ast, filter))
 }

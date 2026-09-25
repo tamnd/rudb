@@ -13,8 +13,12 @@
 //! answer with one, which is the pin's behavior and is why the null check lives in each arm rather
 //! than in front of all of them.
 
+use std::cmp::Ordering;
+
 use rudb_common::{Error, LogicalType, Result, Value};
 
+use crate::aggregate::Accumulator;
+use crate::compare::order_with_nulls;
 use crate::number::{approximate, fit, integral};
 
 /// A running aggregate that is not one of the five the aggregate module keeps inline.
@@ -38,6 +42,14 @@ pub(crate) enum General {
     /// `string_agg`, the text so far, whether anything has gone into it, and the separator it was
     /// joined with, which a combine has to put between the two halves.
     Joined { text: String, seen: bool, separator: String },
+    /// An aggregate whose call said which order to read its rows in, `list(x ORDER BY y)`.
+    ///
+    /// Every row is held as it came, the aggregate's arguments followed by the sort keys, and the
+    /// rows are sorted and handed to a fresh copy of `inner` only when the answer is asked for. A
+    /// combine is then two runs of rows put together, which is why the order the threads finish in
+    /// does not reach the answer. The sort is stable, so rows that tie on every key keep the order
+    /// they arrived in, which is the most the pin promises too.
+    Ordered { keys: Vec<(bool, bool)>, rows: Vec<Vec<Value>>, inner: Box<Accumulator> },
 }
 
 /// Which row [`General::Pick`] keeps.
@@ -122,6 +134,9 @@ impl General {
                     }
                 }
             },
+            // The rows of an ordered call are kept whole, nulls and all, and the aggregate it wraps
+            // decides what to skip once they are in order.
+            Self::Ordered { rows, .. } => rows.push(args.to_vec()),
             _ if value.is_null() => {}
             Self::Logic { held, all } => {
                 let Value::Boolean(flag) = *value else {
@@ -183,6 +198,9 @@ impl General {
         match (self, other) {
             (Self::List { values, .. }, Self::List { values: more, .. }) => {
                 values.extend(more.iter().cloned());
+            }
+            (Self::Ordered { rows, .. }, Self::Ordered { rows: more, .. }) => {
+                rows.extend(more.iter().cloned());
             }
             (Self::Pick { held, pick }, Self::Pick { held: theirs, .. }) => {
                 let take = match pick {
@@ -258,6 +276,9 @@ impl General {
 
     /// The answer.
     pub(crate) fn finish(&self) -> Result<Value> {
+        if let Self::Ordered { keys, rows, inner } = self {
+            return ordered(keys, rows, inner);
+        }
         Ok(match self {
             Self::List { values, .. } if values.is_empty() => Value::Null,
             Self::List { element, values } => {
@@ -296,8 +317,43 @@ impl General {
             }
             Self::Joined { seen: false, .. } => Value::Null,
             Self::Joined { text, .. } => Value::Varchar(text.clone()),
+            Self::Ordered { .. } => return Err(Error::internal("an ordered aggregate")),
         })
     }
+}
+
+/// The answer of an ordered aggregate: its rows sorted on the keys at their end and folded into a
+/// fresh copy of the aggregate in that order.
+fn ordered(keys: &[(bool, bool)], rows: &[Vec<Value>], inner: &Accumulator) -> Result<Value> {
+    let mut failure = None;
+    let mut sorted: Vec<&Vec<Value>> = rows.iter().collect();
+    sorted.sort_by(|left, right| {
+        let (left, right) = (&left[left.len() - keys.len()..], &right[right.len() - keys.len()..]);
+        for ((a, b), &(descending, nulls_first)) in left.iter().zip(right).zip(keys) {
+            // Nulls are placed before the direction is applied, so `DESC NULLS LAST` still puts
+            // them last.
+            let placed = match order_with_nulls(a, b, nulls_first) {
+                Ok(ordering) if descending && !a.is_null() && !b.is_null() => ordering.reverse(),
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    Ordering::Equal
+                }
+            };
+            if placed != Ordering::Equal {
+                return placed;
+            }
+        }
+        Ordering::Equal
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let mut fresh = inner.clone();
+    for row in sorted {
+        fresh.update(&row[..row.len() - keys.len()])?;
+    }
+    fresh.finish()
 }
 
 /// A value of a type the binder should not have let through to this aggregate.

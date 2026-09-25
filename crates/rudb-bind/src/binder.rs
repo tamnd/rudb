@@ -128,6 +128,21 @@ pub(crate) struct WindowRun {
     calls: Vec<ExprRef>,
 }
 
+/// One aggregate call as it was written, before any of it has been bound.
+#[derive(Clone, Copy)]
+pub(crate) struct AggregateCall<'a> {
+    /// The function name, as written and not yet resolved.
+    name: &'a str,
+    /// The arguments.
+    args: &'a [ast::ExprRef],
+    /// Whether `DISTINCT` was written inside the parens.
+    distinct: bool,
+    /// The `FILTER (WHERE ...)` predicate, or `NONE`.
+    filter: ast::ExprRef,
+    /// The `ORDER BY` written inside the parens.
+    sorted: &'a [ast::OrderItem],
+}
+
 /// One window call as it was written, before any of it has been bound.
 ///
 /// These six travel together from the parser all the way to the run they end up filed under, and
@@ -3244,13 +3259,15 @@ impl<'a> Binder<'a> {
         args: &[ast::ExprRef],
         distinct: bool,
         filter: ast::ExprRef,
+        sorted: &[ast::OrderItem],
         scope: &Scope,
     ) -> Result<ExprRef> {
         if self.trying {
             return Err(Error::binder("aggregates are not allowed inside the TRY expression"));
         }
         let frames = std::mem::take(&mut self.lambda_frames);
-        let bound = self.bind_aggregate_over_rows(ast, name, args, distinct, filter, scope);
+        let call = AggregateCall { name, args, distinct, filter, sorted };
+        let bound = self.bind_aggregate_over_rows(ast, &call, scope);
         self.lambda_frames = frames;
         bound
     }
@@ -3258,12 +3275,10 @@ impl<'a> Binder<'a> {
     fn bind_aggregate_over_rows(
         &mut self,
         ast: &Ast,
-        name: &str,
-        args: &[ast::ExprRef],
-        distinct: bool,
-        filter: ast::ExprRef,
+        written: &AggregateCall<'_>,
         scope: &Scope,
     ) -> Result<ExprRef> {
+        let AggregateCall { name, args, distinct, filter, sorted } = *written;
         if self.in_filter {
             return Err(Error::binder("aggregate functions are not allowed in FILTER"));
         }
@@ -3291,7 +3306,8 @@ impl<'a> Binder<'a> {
         self.in_aggregate = true;
         let mut bound = Vec::with_capacity(args.len());
         let mut failure = None;
-        for &arg in args {
+        let written_keys = sorted.iter().map(|item| item.expr);
+        for arg in args.iter().copied().chain(written_keys) {
             match self.bind_expr(ast, arg, scope) {
                 Ok(expr) => bound.push(expr),
                 Err(error) => {
@@ -3303,6 +3319,14 @@ impl<'a> Binder<'a> {
         self.in_aggregate = false;
         if let Some(error) = failure {
             return Err(error);
+        }
+        let keys = bound.split_off(args.len());
+        // A distinct aggregate sees each value once, and a key that is not one of the values would
+        // have more than one of them to sort that value by.
+        if distinct && !keys.iter().all(|&key| bound.iter().any(|&arg| self.same_expr(arg, key))) {
+            return Err(Error::binder(
+                "In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list",
+            ));
         }
 
         let types: Vec<LogicalType> =
@@ -3322,8 +3346,9 @@ impl<'a> Binder<'a> {
         for (arg, wanted) in bound.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
         }
+        let name = self.ordered_aggregate(resolved.name, sorted, &keys, &mut cast);
         let args = self.plan.add_expr_list(&cast);
-        let name = self.plan.intern(resolved.name);
+        let name = self.plan.intern(&name);
         let ty = resolved.returns;
         let call = self.plan.add_expr(Expr::Aggregate { name, args, distinct, filter }, ty.clone());
 
@@ -3342,6 +3367,49 @@ impl<'a> Binder<'a> {
         let aggregation = self.aggregation.as_ref().expect("checked above");
         let (index, groups) = (aggregation.index, aggregation.groups.len());
         Ok(self.column(index, groups + at, ty))
+    }
+
+    /// The name of an aggregate with the `ORDER BY` of its call folded in, with the keys that matter
+    /// added to the end of its arguments.
+    ///
+    /// Only the aggregates whose answer depends on the order the rows come in keep their keys, which
+    /// is what the pin does too: `sum(x ORDER BY y)` is `sum(x)` there, named as written and computed
+    /// without a sort. A key that is a constant orders nothing and is dropped, so `list(x ORDER BY
+    /// 1)` is a plain `list` and not the first column, which is what a number means in the query's
+    /// own `ORDER BY` and not what it means here.
+    fn ordered_aggregate(
+        &mut self,
+        name: &str,
+        sorted: &[ast::OrderItem],
+        keys: &[ExprRef],
+        args: &mut Vec<ExprRef>,
+    ) -> String {
+        const DEPENDS_ON_ORDER: &[&str] = &["list", "first", "last", "any_value", "string_agg"];
+        if !DEPENDS_ON_ORDER.contains(&name) {
+            return name.to_string();
+        }
+        let mut flags = Vec::new();
+        for (&key, item) in keys.iter().zip(sorted) {
+            if matches!(fold::value_of(&self.plan, key), Ok(Some(_))) {
+                continue;
+            }
+            let descending = match item.order {
+                Order::Unstated => self.semantics.default_descending(),
+                Order::Ascending => false,
+                Order::Descending => true,
+            };
+            let nulls_first = match item.nulls {
+                Nulls::First => true,
+                Nulls::Last => false,
+                Nulls::Unstated => self.semantics.nulls_first(descending),
+            };
+            flags.push((descending, nulls_first));
+            args.push(key);
+        }
+        if flags.is_empty() {
+            return name.to_string();
+        }
+        rudb_kernels::ordered_name(name, &flags)
     }
 
     // ----------------------------------------------------------------- windows

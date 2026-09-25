@@ -1403,6 +1403,10 @@ pub struct Ast {
     /// The lists written `ARRAY[...]` rather than `[...]`. They are the same list, and only the
     /// name of a column holding one tells them apart.
     pub array_lists: Vec<ExprRef>,
+    /// The `ORDER BY` written inside an aggregate call, `list(x ORDER BY y)`, as a run of
+    /// [`OrderItem`] beside the call it belongs to. Kept to one side for the reason the named
+    /// arguments are: few calls have one and every call would carry the field.
+    pub aggregate_orders: Vec<(ExprRef, Slice)>,
 }
 
 impl Ast {
@@ -1505,6 +1509,14 @@ impl Ast {
             .iter()
             .find(|(held, _)| *held == call)
             .map_or(&[], |&(_, slice)| self.target_list(slice))
+    }
+
+    /// The `ORDER BY` written inside a call, empty when it has none.
+    pub fn aggregate_order(&self, call: ExprRef) -> &[OrderItem] {
+        self.aggregate_orders
+            .iter()
+            .find(|(held, _)| *held == call)
+            .map_or(&[], |&(_, slice)| self.order_list(slice))
     }
 
     /// Whether a list was written `ARRAY[...]`.
