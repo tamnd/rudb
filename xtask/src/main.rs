@@ -32,6 +32,7 @@ mod linkjoin;
 mod native;
 mod parquet;
 mod profile;
+mod refusals;
 mod rids;
 mod rowloop;
 mod ruletable;
@@ -71,13 +72,16 @@ fn main() -> ExitCode {
             Some(suite) => compare::run(&root(), &suite),
             None => bench::run(&root()),
         },
+        // The same forty three through the first engine and the compiled engine in one process,
+        // which is the check that C1 of the compiler milestones is done against.
+        Some("compiled") => compiled::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        // How much of a suite the compiled engine takes, which is the JOB and TPC-H number C1 asks
+        // to be reported.
+        Some("refusals") => refusals::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         // The forty three ClickBench queries through both engines over a file somebody downloaded,
         // which is the only way to check the answers at a size the committed fixture cannot reach.
         // Not under `bench` above, because that word means a measurement and this is a comparison
         // of answers that happens to print times as well.
-        // The same forty three through the first engine and the compiled engine in one process,
-        // which is the check that C1 of the compiler milestones is done against.
-        Some("compiled") => compiled::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         Some("differential") => {
             differential::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>())
         }
@@ -289,6 +293,10 @@ fn usage() {
     println!("  compiled <file> [q..]  the forty three ClickBench queries under SET engine first");
     println!("                         and compiled over that Parquet file, rows compared, and");
     println!("                         the compiled engine's refusals grouped by reason");
+    println!("  refusals <dir> <q>     every query in q, a .sql file with -- qNN headers or a");
+    println!("                         directory of .sql files, through EXPLAIN (CODEGEN) over");
+    println!("                         tables made from the parquet files in dir, with the");
+    println!("                         refusals counted by what was refused first");
     println!("  differential <file>    the forty three ClickBench queries through rudb and");
     println!("                         through duckdb over that Parquet file, answers compared");
     println!("                         byte for byte, times printed beside them. the committed");
