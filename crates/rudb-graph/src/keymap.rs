@@ -600,6 +600,98 @@ impl KeyMap {
         }
     }
 
+    /// The rows holding a set of keys, where the set is a bitmap over [`Self::span`] and so is the
+    /// answer, over the `rows` rows of the parent.
+    ///
+    /// The same set a [`Self::lookup`] of every key in `held` would make, for a walk over the words
+    /// of the two bitmaps. A key's row in the dense form is how many keys come before it, and the
+    /// word it sits in says that for all sixty four of its keys at once, so the rank is kept running
+    /// from one word to the next rather than asked for again at each key. On TPC-H q21 a lookup
+    /// at a time was about 185 instructions a key, over the three hundred thousand `lineitem` keys
+    /// two of its joins hold, and the join had already set the same keys in a bitmap over the span.
+    ///
+    /// `held` may run one word past the span, which is what a join's bitmap does so that a key past
+    /// the end has somewhere to land, as long as nothing past the span is set.
+    ///
+    /// `None` when the map has no span, which is the sorted form, or when `held` holds a key the
+    /// map does not, which a caller answers the way it would a key [`Self::lookup`] did not find.
+    ///
+    /// # Errors
+    ///
+    /// If a bit packed payload is torn, the same as [`Self::lookup`].
+    pub fn rows_of_span(&self, held: &[u64], rows: u64) -> Result<Option<Vec<u64>>> {
+        let words = usize::try_from(rows.div_ceil(64)).unwrap_or(usize::MAX);
+        let Some((_, range)) = self.span() else { return Ok(None) };
+        let span_words = usize::try_from(range.div_ceil(64)).unwrap_or(usize::MAX);
+        if held.len() < span_words || held[span_words..].iter().any(|&word| word != 0) {
+            return Ok(None);
+        }
+        // The last word of the span is only partly inside it.
+        if range % 64 != 0 && held[span_words - 1] >> (range % 64) != 0 {
+            return Ok(None);
+        }
+        let held = &held[..span_words];
+        let mut out = vec![0_u64; words];
+        match &self.body {
+            Body::Identity { count, .. } => {
+                if *count > rows {
+                    return Ok(None);
+                }
+                out[..span_words].copy_from_slice(held);
+            }
+            Body::Dense { bits, .. } => {
+                if bits.len() < held.len() {
+                    return Ok(None);
+                }
+                let mut before = 0_u64;
+                for (&keys, &present) in held.iter().zip(bits) {
+                    if keys & !present != 0 {
+                        return Ok(None);
+                    }
+                    let mut left = keys;
+                    while left != 0 {
+                        let below = (1_u64 << left.trailing_zeros()) - 1;
+                        let rid = before + u64::from((present & below).count_ones());
+                        let Some(word) = out.get_mut((rid / 64) as usize) else { return Ok(None) };
+                        *word |= 1 << (rid % 64);
+                        left &= left - 1;
+                    }
+                    before += u64::from(present.count_ones());
+                }
+            }
+            Body::Permuted { bits, rid_width, perm, .. } => {
+                if bits.len() < held.len() {
+                    return Ok(None);
+                }
+                let mut before = 0_u64;
+                for (&keys, &present) in held.iter().zip(bits) {
+                    if keys & !present != 0 {
+                        return Ok(None);
+                    }
+                    let mut left = keys;
+                    while left != 0 {
+                        let below = (1_u64 << left.trailing_zeros()) - 1;
+                        let place = before + u64::from((present & below).count_ones());
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "a rank is below the key count, which the build checked fits a usize"
+                        )]
+                        let rid = bitpack::tail_at(perm, *rid_width, place as usize)?;
+                        let Some(word) = out.get_mut((rid / 64) as usize) else { return Ok(None) };
+                        *word |= 1 << (rid % 64);
+                        left &= left - 1;
+                    }
+                    before += u64::from(present.count_ones());
+                }
+            }
+            Body::Sorted { .. } => return Ok(None),
+        }
+        if rows % 64 != 0 && out.last().is_some_and(|&word| word >> (rows % 64) != 0) {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
+
     /// The `rid` of the row holding this key, or `None` when no row holds it.
     ///
     /// `None` is the ordinary answer and not an exceptional one: a child key with no matching
@@ -1100,6 +1192,47 @@ mod tests {
         assert_eq!(map.lookup(0).expect("lookup"), None, "below the base");
         assert_eq!(map.lookup(1001).expect("lookup"), None, "past the end");
         assert_eq!(map.span(), Some((1, 1000)));
+    }
+
+    #[test]
+    fn the_rows_of_a_span_are_the_rows_a_lookup_of_each_key_finds() {
+        let identity = keys(&(5..1005).collect::<Vec<i128>>());
+        let dense = keys(&(0..3000).filter(|value| value % 3 != 1).collect::<Vec<i128>>());
+        let mut shuffled = (0..3000).filter(|value| value % 3 != 1).collect::<Vec<i128>>();
+        shuffled.sort_by_key(|value| (value * 7919) % 3001);
+        let permuted = keys(&shuffled);
+        for (column, form) in
+            [(identity, Form::Identity), (dense, Form::Dense), (permuted, Form::Permuted)]
+        {
+            let map = KeyMap::build(&column).expect("build");
+            assert_eq!(map.form(), form);
+            let rows = column.len() as u64;
+            let (base, range) = map.span().expect("a span");
+            let mut held = vec![0_u64; (range / 64 + 1) as usize];
+            let mut wanted = vec![0_u64; rows.div_ceil(64) as usize];
+            for key in column.iter().flatten().filter(|key| *key % 5 == 0 || *key % 7 == 3) {
+                let offset = (key - base) as u64;
+                held[(offset / 64) as usize] |= 1 << (offset % 64);
+                let rid = map.lookup(*key).expect("lookup").expect("a key in the column");
+                wanted[(rid / 64) as usize] |= 1 << (rid % 64);
+            }
+            assert_eq!(map.rows_of_span(&held, rows).expect("rows"), Some(wanted), "{form:?}");
+            if form != Form::Identity {
+                // A key inside the span that no row holds.
+                let missing = (0..range).find(|offset| {
+                    map.lookup(base + i128::from(*offset)).expect("lookup").is_none()
+                });
+                let offset = missing.expect("a hole in the span");
+                held[(offset / 64) as usize] |= 1 << (offset % 64);
+                assert_eq!(map.rows_of_span(&held, rows).expect("rows"), None, "{form:?}");
+            }
+            let last = held.len() - 1;
+            held[last] |= 1 << 63;
+            assert_eq!(map.rows_of_span(&held, rows).expect("rows"), None, "past the span");
+        }
+        let sorted = keys(&(0..1000).map(|value| value * 1000).collect::<Vec<i128>>());
+        let map = KeyMap::build(&sorted).expect("build");
+        assert_eq!(map.rows_of_span(&[0; 4], 1000).expect("rows"), None, "no span");
     }
 
     #[test]
