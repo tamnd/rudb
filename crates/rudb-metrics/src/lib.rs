@@ -96,6 +96,7 @@ mod json;
 mod load;
 mod qerror;
 mod report;
+mod split;
 mod statements;
 mod warn;
 
@@ -110,6 +111,7 @@ pub use histogram::{HIGHEST, Histogram};
 pub use load::{Holding, KEPT_LOADS, LoadProfile, Stage, StageSpan, StageTotals, recent_loads};
 pub use qerror::{QErrors, Spread, q_error, tenths, word};
 pub use report::Report;
+pub use split::Split;
 pub use statements::{
     KEPT_STATEMENTS, KEPT_TEXT, Statement, recent_statements, remember, remember_unplanned,
     remembered_here,

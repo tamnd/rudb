@@ -998,6 +998,12 @@ pub fn strategy_fields() -> Vec<Field> {
 /// the operator tree and `execute_ns` is running it, and `total_ns` is the whole statement. A
 /// statement that did not run a plan, `CREATE TABLE` or `SET`, has its parse, bind and total and
 /// zero for the rest. `cpu_ns` is the CPU time of every thread the plan ran on.
+///
+/// The last eight are the execution split by kind of work, which is the operators' own time summed
+/// over threads: `scan_ns` is reading and decoding, `filter_ns` deciding which rows a predicate
+/// keeps, `build_ns` keeping a join's side and building its table, `probe_ns` looking rows up in
+/// it, `aggregate_ns` grouping, `strings_ns` expression steps on strings, `materialize_ns` copying
+/// rows into new chunks, and `other_ns` the rest.
 #[must_use]
 pub fn statement_metric_fields() -> Vec<Field> {
     vec![
@@ -1012,6 +1018,14 @@ pub fn statement_metric_fields() -> Vec<Field> {
         Field::new("execute_ns", LogicalType::BigInt),
         Field::new("total_ns", LogicalType::BigInt),
         Field::new("cpu_ns", LogicalType::BigInt),
+        Field::new("scan_ns", LogicalType::BigInt),
+        Field::new("filter_ns", LogicalType::BigInt),
+        Field::new("build_ns", LogicalType::BigInt),
+        Field::new("probe_ns", LogicalType::BigInt),
+        Field::new("aggregate_ns", LogicalType::BigInt),
+        Field::new("strings_ns", LogicalType::BigInt),
+        Field::new("materialize_ns", LogicalType::BigInt),
+        Field::new("other_ns", LogicalType::BigInt),
     ]
 }
 

@@ -20,8 +20,9 @@
 //! never turns into an answer change nobody meant to make.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rudb_common::{Error, Result};
 use rudb_vector::Chunk;
@@ -46,6 +47,12 @@ struct Shared {
     /// the sink is built. It is written once, before the query runs, and read once per chunk, so
     /// relaxed ordering is all it needs: there is no second thing whose visibility depends on it.
     flatten: AtomicBool,
+    /// Nanoseconds spent flattening, summed over every thread that queued a chunk.
+    ///
+    /// Here rather than in a stage, because the root is not an operator and no operator's reading
+    /// would see it. It is the last copy a query makes, and on a query with a large answer it is a
+    /// real part of the time.
+    flattened: AtomicU64,
 }
 
 /// Everything the root holds under one lock.
@@ -179,6 +186,7 @@ fn build(
         buffer,
         ordered: order.is_some(),
         flatten: AtomicBool::new(false),
+        flattened: AtomicU64::new(0),
         queue: Mutex::new(Queue { ready: VecDeque::new(), order }),
     });
     (RootSink { shared: Arc::clone(&shared) }, RootReader { shared })
@@ -194,7 +202,11 @@ impl RootSink {
     /// on the single thread that drains the queue afterwards.
     fn taken(&self, chunk: &Chunk) -> Result<Chunk> {
         if self.shared.flatten.load(Ordering::Relaxed) {
-            return chunk.clone().into_flat();
+            let started = Instant::now();
+            let flat = chunk.clone().into_flat();
+            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.shared.flattened.fetch_add(nanos, Ordering::Relaxed);
+            return flat;
         }
         Ok(chunk.clone())
     }
@@ -313,6 +325,14 @@ impl RootReader {
     /// were produced in and the rest are flat, which is not a thing any caller wants.
     pub fn flattening(&self) {
         self.shared.flatten.store(true, Ordering::Relaxed);
+    }
+
+    /// How long the flattening [`RootReader::flattening`] asked for took, summed over threads.
+    ///
+    /// Zero for a root nobody asked to flatten.
+    #[must_use]
+    pub fn flattened_ns(&self) -> u64 {
+        self.shared.flattened.load(Ordering::Relaxed)
     }
 
     /// The next chunk, or `None` when there is nothing queued right now.

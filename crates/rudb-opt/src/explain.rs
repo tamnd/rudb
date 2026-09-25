@@ -713,6 +713,17 @@ fn write_totals(measured: &Document, out: &mut String) {
         duration(timing.rewrite_ns),
         duration(timing.optimize_ns.saturating_sub(timing.rewrite_ns))
     );
+    // The execution by kind of work, the parts that did any. See [`rudb_metrics::Split`].
+    let split = measured.split();
+    let parts: Vec<String> = split
+        .parts()
+        .iter()
+        .filter(|(_, nanos)| *nanos > 0)
+        .map(|(name, nanos)| format!("{} {name}", duration(*nanos)))
+        .collect();
+    if !parts.is_empty() {
+        let _ = writeln!(out, "  by kind of work: {}", parts.join(", "));
+    }
     let _ = writeln!(
         out,
         "  {} of cpu, {} held at the peak",

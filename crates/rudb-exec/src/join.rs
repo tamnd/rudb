@@ -85,6 +85,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use rudb_common::stage::{self, Stage};
 use rudb_common::{
     Cancel, Error, LogicalType, Memory, Reservation, Result, Session, SessionTimeZone, Value,
 };
@@ -1574,52 +1575,76 @@ impl<'a> Probe<'a> {
     fn built_with(&self, threads: &Lease<'_>) -> Result<Arc<Built>> {
         self.built
             .get_or_init(|| {
-                let (chunks, kept) = self.gathered.take()?;
-                let keying =
-                    self.equalities.gathered(self.plan, &self.right_schema, self.time_zone);
-                let mut charged = self.held.lock().map_err(poisoned)?;
-                // Before the table rather than after it, because it is one pass over the same
-                // chunks and reading them while they are warm costs less than reading them twice.
-                // Only a mark join asks, and only one written with `=`. See [`Built::undecided`].
-                let undecided = self.kind == JoinKind::Mark
-                    && !self.equalities.null_is_a_value.first().copied().unwrap_or(false)
-                    && any_null_key(keying, &chunks, &self.cancel)?;
-                // The chunks laid end to end, which is a copy of the side and is charged as one.
-                // The chunks themselves are not charged again here: `kept` is what the keep that
-                // made them charged, and it goes when they do.
-                // Before the side is laid out rather than inside the table, because a row that
-                // cannot match costs its copy into every column and its hash and its deal as well,
-                // and on q09 that is nineteen rows of `partsupp` in every twenty.
-                let chunks = self.narrowed(keying, chunks, threads)?;
-                let chunks = self.in_key_order(keying, chunks, threads)?;
-                let rows = Build::new(&self.right_types, &chunks, threads)?;
-                charged.grow(rows.footprint())?;
-                // Laid before the table rather than after it, because a key that is a column of
-                // this side is already laid out in `rows` and the table reads it from there.
-                let index = match laid_keys(keying, &rows) {
-                    Some(keys) => {
-                        // Everything the table reads is in `rows` now, so the chunks go before
-                        // the table is built rather than after the join is done.
-                        drop(chunks);
-                        drop(kept);
-                        let index =
-                            Lookup::build(&keys, rows.rows(), keying.nulls, threads, &self.cancel)?;
-                        charged.grow(index.footprint())?;
-                        index
-                    }
-                    None => lookup(keying, &chunks, &self.cancel, threads, &mut charged)?,
-                };
-                if let Some(counters) = &self.counters {
-                    counters.joining(Joined {
-                        algorithm: Algorithm::Hash,
-                        build_rows: u64::try_from(rows.rows()).unwrap_or(u64::MAX),
-                        build_bytes: charged.bytes(),
-                        declined: vec![Declined::new(Algorithm::Loop, KEYED)],
-                    });
-                }
-                Ok(Arc::new(Built { rows, index, undecided }))
+                let building = stage::Timing::start(Stage::Build);
+                let built = self.build_table(threads);
+                building.stop(0);
+                built
             })
             .clone()
+    }
+
+    /// The body of [`Self::built_with`], which runs once and is timed as a whole.
+    fn build_table(&self, threads: &Lease<'_>) -> Result<Arc<Built>> {
+        let (chunks, kept) = self.gathered.take()?;
+        let keying = self.equalities.gathered(self.plan, &self.right_schema, self.time_zone);
+        let mut charged = self.held.lock().map_err(poisoned)?;
+        // Before the table rather than after it, because it is one pass over the same
+        // chunks and reading them while they are warm costs less than reading them twice.
+        // Only a mark join asks, and only one written with `=`. See [`Built::undecided`].
+        let undecided = self.kind == JoinKind::Mark
+            && !self.equalities.null_is_a_value.first().copied().unwrap_or(false)
+            && any_null_key(keying, &chunks, &self.cancel)?;
+        // The chunks laid end to end, which is a copy of the side and is charged as one.
+        // The chunks themselves are not charged again here: `kept` is what the keep that
+        // made them charged, and it goes when they do.
+        // Before the side is laid out rather than inside the table, because a row that
+        // cannot match costs its copy into every column and its hash and its deal as well,
+        // and on q09 that is nineteen rows of `partsupp` in every twenty.
+        let chunks = self.narrowed(keying, chunks, threads)?;
+        let chunks = self.in_key_order(keying, chunks, threads)?;
+        let rows = Build::new(&self.right_types, &chunks, threads)?;
+        charged.grow(rows.footprint())?;
+        // Laid before the table rather than after it, because a key that is a column of
+        // this side is already laid out in `rows` and the table reads it from there.
+        let index = match laid_keys(keying, &rows) {
+            Some(keys) => {
+                // Everything the table reads is in `rows` now, so the chunks go before
+                // the table is built rather than after the join is done.
+                drop(chunks);
+                drop(kept);
+                let index = Lookup::build(&keys, rows.rows(), keying.nulls, threads, &self.cancel)?;
+                charged.grow(index.footprint())?;
+                index
+            }
+            None => lookup(keying, &chunks, &self.cancel, threads, &mut charged)?,
+        };
+        if let Some(counters) = &self.counters {
+            counters.joining(Joined {
+                algorithm: Algorithm::Hash,
+                build_rows: u64::try_from(rows.rows()).unwrap_or(u64::MAX),
+                build_bytes: charged.bytes(),
+                declined: vec![Declined::new(Algorithm::Loop, KEYED)],
+            });
+        }
+        Ok(Arc::new(Built { rows, index, undecided }))
+    }
+}
+
+impl Probe<'_> {
+    /// The driving side's columns at the matched rows and, for a join that answers with both
+    /// sides, the gathered side's beside them.
+    fn matched(&self, left: &Chunk, built: &Built, local: &Probing) -> Result<Vec<Vector>> {
+        let mut columns: Vec<Vector> = left
+            .columns()
+            .iter()
+            .map(|column| column.gather(&local.left_at))
+            .collect::<Result<Vec<_>>>()?;
+        // A semi or an anti join answers with the driving row alone, so there is no gathered half
+        // to put beside it and no positions were written for one.
+        if !matches!(self.kind, JoinKind::Semi | JoinKind::Anti) {
+            columns.extend(built.rows.gather(&local.right_at)?);
+        }
+        Ok(columns)
     }
 }
 
@@ -1788,16 +1813,12 @@ impl Stream for Probe<'_> {
                 *row += 1;
             }
         }
-        let mut columns: Vec<Vector> = left
-            .columns()
-            .iter()
-            .map(|column| column.gather(&local.left_at))
-            .collect::<Result<Vec<_>>>()?;
-        // A semi or an anti join answers with the driving row alone, so there is no gathered half
-        // to put beside it and no positions were written for one.
-        if !matches!(self.kind, JoinKind::Semi | JoinKind::Anti) {
-            columns.extend(built.rows.gather(&local.right_at)?);
-        }
+        // The columns put beside each match are copies by position, which is materializing rather
+        // than probing, and a join whose matches are wide is a join whose time goes here.
+        let materializing = stage::Timing::start(Stage::Materialize);
+        let columns = self.matched(&left, &built, local);
+        materializing.stop(0);
+        let mut columns = columns?;
         if self.swapped {
             // Back into the plan's order, for the reason [`Sink::finalize`] gives below. One
             // rotation of the column list rather than a rotation per row, which is what holding the

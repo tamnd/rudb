@@ -34,7 +34,7 @@
 use std::cell::Cell;
 use std::sync::{Mutex, PoisonError};
 
-use crate::Document;
+use crate::{Document, Split};
 
 /// How many statements a process keeps for `rudb_statement_metrics()`.
 pub const KEPT_STATEMENTS: usize = 64;
@@ -69,6 +69,9 @@ pub struct Statement {
     pub total_ns: u64,
     /// CPU time across every thread, zero for a statement that did not run a plan.
     pub cpu_ns: u64,
+    /// The execution by kind of work, all zero for a statement that did not run a plan. See
+    /// [`Split`].
+    pub split: Split,
 }
 
 impl Statement {
@@ -92,6 +95,7 @@ impl Statement {
         self.execute_ns = timing.execute_ns;
         self.total_ns = timing.total_ns;
         self.cpu_ns = metrics.resource.cpu_ns;
+        self.split = metrics.split();
     }
 }
 

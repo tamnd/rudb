@@ -70,10 +70,30 @@ pub enum Stage {
     Count,
     /// Turning a finished table into the chunks it answers for.
     Emit,
+    /// Deciding which rows a predicate keeps, inside an operator that is not a filter.
+    ///
+    /// A scan that took the query's filter into itself runs it on every chunk it reads, and without
+    /// this the time that filter took reads as time spent reading. The two have different fixes, so
+    /// they are two numbers.
+    Filter,
+    /// Building a join's table over the side it gathered, which is the layout and the hashing.
+    ///
+    /// The build happens the first time the probe asks for the table, so it is charged to the
+    /// probing operator. This is what takes it back out.
+    Build,
+    /// Running an expression step that reads or writes strings, such as a `LIKE`, a comparison of
+    /// two `VARCHAR` columns or a cast to text.
+    ///
+    /// Charged wherever the expression runs, so a string predicate in a scan comes out of the
+    /// scan's filter time and a string key in a projection comes out of the projection.
+    Strings,
+    /// Copying rows into a new chunk by position, such as the columns a join puts beside each
+    /// match, or turning a chunk into flat columns for whoever reads the answer.
+    Materialize,
 }
 
 /// How many stages there are, which is how wide a [`Spent`] is.
-const STAGES: usize = 11;
+const STAGES: usize = 15;
 
 impl Stage {
     /// Every stage, in the order the work goes through them.
@@ -89,6 +109,10 @@ impl Stage {
         Self::Merge,
         Self::Count,
         Self::Emit,
+        Self::Filter,
+        Self::Build,
+        Self::Strings,
+        Self::Materialize,
     ];
 
     /// The name in the document and in the report.
@@ -106,6 +130,10 @@ impl Stage {
             Self::Merge => "merge",
             Self::Count => "count",
             Self::Emit => "emit",
+            Self::Filter => "filter",
+            Self::Build => "build",
+            Self::Strings => "strings",
+            Self::Materialize => "materialize",
         }
     }
 
@@ -124,6 +152,10 @@ impl Stage {
             Self::Merge => 8,
             Self::Count => 9,
             Self::Emit => 10,
+            Self::Filter => 11,
+            Self::Build => 12,
+            Self::Strings => 13,
+            Self::Materialize => 14,
         }
     }
 }
@@ -227,15 +259,21 @@ impl Spent {
 thread_local! {
     /// What this thread has spent in each stage so far.
     static SPENT: Cell<Spent> = const { Cell::new(Spent::none()) };
+    /// Every nanosecond this thread has charged to any stage, which is what a [`Timing`] that
+    /// started earlier subtracts so that a stage inside another is not counted twice.
+    static CLAIMED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Records time and bytes against a stage on this thread.
+///
+/// The time is also claimed, so a [`Timing`] running around this call does not charge it again.
 pub fn took(stage: Stage, nanos: u64, bytes: u64) {
     SPENT.with(|spent| {
         let mut now = spent.get();
         now.add(Spent::of(stage, nanos, bytes));
         spent.set(now);
     });
+    CLAIMED.with(|claimed| claimed.set(claimed.get().saturating_add(nanos)));
 }
 
 /// Adds what another thread spent to this thread's total.
@@ -248,7 +286,8 @@ pub fn took(stage: Stage, nanos: u64, bytes: u64) {
 /// the operator that did them and nothing is lost.
 ///
 /// The time is a sum over threads and not an elapsed time, the same as every other stage number,
-/// because that is the one that compares against the CPU an operator charged.
+/// because that is the one that compares against the CPU an operator charged. It is not claimed
+/// against this thread's clock, because it was not spent on it.
 pub fn gained(spent: Spent) {
     SPENT.with(|slot| {
         let mut now = slot.get();
@@ -269,38 +308,48 @@ pub fn here() -> Spent {
 /// a difference instead.
 pub fn reset() {
     SPENT.with(|spent| spent.set(Spent::none()));
+    CLAIMED.with(|claimed| claimed.set(0));
 }
 
 /// A clock started at one stage, charging what it measured when it stops.
 ///
 /// The pair of calls is a type rather than two lines because the second line is the one that gets
 /// forgotten, and a stage that starts a clock and never stops it is a stage that reads as free.
+///
+/// A clock charges only the time no stage inside it charged. A scan's filter runs a `LIKE`, and
+/// the `LIKE` is string work inside the filter, so the filter is charged the rest and the two add up
+/// to what the call took rather than to more than it. Without that the stages of one operator
+/// could add up to more than the operator's own time and no split built on them would be a split.
 #[derive(Debug)]
 pub struct Timing {
     stage: Stage,
     at: Instant,
+    claimed: u64,
 }
 
 impl Timing {
     /// Starts the clock for a stage.
     #[must_use]
     pub fn start(stage: Stage) -> Self {
-        Self { stage, at: Instant::now() }
+        let claimed = CLAIMED.with(Cell::get);
+        Self { stage, at: Instant::now(), claimed }
     }
 
-    /// Stops it and charges the time, along with the bytes that went through.
+    /// Stops it and charges the time no stage inside it charged, along with the bytes that went
+    /// through.
     ///
     /// A caller with no meaningful byte count passes zero, which keeps the stage out of the rate
     /// column rather than putting a nought in it.
     pub fn stop(self, bytes: u64) {
         let nanos = u64::try_from(self.at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        took(self.stage, nanos, bytes);
+        let inside = CLAIMED.with(Cell::get).saturating_sub(self.claimed);
+        took(self.stage, nanos.saturating_sub(inside), bytes);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Spent, Stage, here, reset, took};
+    use super::{Spent, Stage, Timing, gained, here, reset, took};
 
     #[test]
     fn time_lands_against_its_own_stage_and_leaves_the_rest_alone() {
@@ -380,5 +429,35 @@ mod tests {
             assert_eq!(Spent::of(stage, 7, 3).total(), 7);
             assert_eq!(Spent::of(stage, 7, 3).bytes(stage), 3);
         }
+    }
+
+    #[test]
+    fn a_stage_inside_another_is_charged_once() {
+        reset();
+        let outer = Timing::start(Stage::Filter);
+        let inner = Timing::start(Stage::Strings);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        inner.stop(0);
+        took(Stage::Decode, 1_000_000, 0);
+        outer.stop(0);
+        let spent = here();
+        let strings = spent.nanos(Stage::Strings);
+        assert!(strings >= 2_000_000, "the inner clock keeps what it measured");
+        assert!(
+            spent.nanos(Stage::Filter) < 1_000_000,
+            "the outer clock gives up both the inner clock and the charge made inside it, {spent:?}"
+        );
+        reset();
+    }
+
+    #[test]
+    fn what_another_thread_spent_is_not_taken_off_this_one() {
+        reset();
+        let outer = Timing::start(Stage::Emit);
+        gained(Spent::of(Stage::Merge, 60_000_000_000, 0));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        outer.stop(0);
+        assert!(here().nanos(Stage::Emit) >= 1_000_000);
+        reset();
     }
 }

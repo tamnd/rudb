@@ -180,6 +180,14 @@ impl<'a> Query<'a> {
         }
     }
 
+    /// How long turning the answer into flat columns for a caller took, summed over threads.
+    ///
+    /// Zero unless [`Query::for_a_caller`] asked for it.
+    #[must_use]
+    pub fn flattened_ns(&self) -> u64 {
+        self.reader.as_ref().map_or(0, RootReader::flattened_ns)
+    }
+
     /// The next chunk of the answer, or `None` when there are no more.
     ///
     /// Only meaningful after [`Query::run`] has returned. The serial driver runs a pipeline to

@@ -128,7 +128,16 @@ impl Document {
             out.count("rewrite_ns", self.timing.rewrite_ns);
             out.count("physical_ns", self.timing.physical_ns);
             out.count("execute_ns", self.timing.execute_ns);
+            out.count("result_ns", self.timing.result_ns);
             out.count("total_ns", self.timing.total_ns);
+        });
+        // Worked out from the operators below rather than stored, and written here so a reader who
+        // wants the one line does not have to know which stage goes where. See [`crate::Split`].
+        out.key("split");
+        out.object(|out| {
+            for (name, nanos) in self.split().parts() {
+                out.count(&format!("{name}_ns"), nanos);
+            }
         });
         out.key("resource");
         out.object(|out| {
@@ -463,6 +472,11 @@ pub struct Timing {
     pub physical_ns: u64,
     /// Running it.
     pub execute_ns: u64,
+    /// The part of `execute_ns` that went on turning the answer into flat columns for the caller.
+    ///
+    /// Summed over the threads that did it, like an operator's time. The root that does it is not
+    /// an operator, so without this the last copy a query makes would be in no row at all.
+    pub result_ns: u64,
     /// The whole call, which is the five phases above added up.
     ///
     /// It used to be `physical_ns` plus `execute_ns`, because nothing above the executor was on a
@@ -948,6 +962,7 @@ mod tests {
         metrics.timing.rewrite_ns = 120_000;
         metrics.timing.physical_ns = 44_000;
         metrics.timing.execute_ns = 1_323_000_000;
+        metrics.timing.result_ns = 2_000_000;
         metrics.timing.total_ns = 1_323_483_000;
         metrics.resource.cpu_ns = 9_880_000_000;
         metrics.resource.build_cpu_ns = 44_000;
