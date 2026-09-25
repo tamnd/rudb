@@ -92,17 +92,18 @@ use rudb_kernels::{Connective, combine, is_true};
 use rudb_metrics::{Algorithm, Counters, Declined, Joined};
 use rudb_pipeline::{Lease, Progress, Sink, Stream};
 use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Plan, Slice};
-use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
+use rudb_vector::{Chunk, Data, Selection, VECTOR_SIZE, Validity, Vector};
 
 use crate::buffer::Buffered;
 use crate::expr::evaluate_all_in_time_zone;
 use crate::extents::{Extents, Spread};
 use crate::gather::{self, Gathering};
 use crate::lookup::{Lookup, MISS, NONE, Scratch};
+use crate::pairs::in_parallel;
 use crate::rows;
 use crate::schema::Schema;
 use crate::side::{Build, PAD, laid_out};
-use crate::sideways::Sideways;
+use crate::sideways::{Domain, Sideways};
 
 /// Why a join that found a key did not walk every pair, for the metrics document.
 const KEYED: &str = "a conjunct of the condition is an equality with one side's columns on each \
@@ -1300,32 +1301,61 @@ impl<'a> Probe<'a> {
         self
     }
 
-    /// Which gathered rows can go in the table, by [`Probe::narrowed_by`], or `None` for all.
-    fn allowed(&self, keys: &[Vector], rows: usize) -> Option<Vec<bool>> {
-        let mut allowed: Option<Vec<bool>> = None;
-        let mut block = Vec::new();
-        for (at, sideways) in &self.narrowing {
-            let (Some(domain), Some(key)) = (sideways.kept(), keys.get(*at)) else { continue };
-            let integer = matches!(
-                key.logical_type(),
-                LogicalType::TinyInt
-                    | LogicalType::SmallInt
-                    | LogicalType::Integer
-                    | LogicalType::BigInt
-            );
-            if !integer {
-                continue;
-            }
-            let mask = allowed.get_or_insert_with(|| vec![true; rows]);
-            let mut here = vec![false; rows];
-            for row in domain.keep(key, rows, &mut block) {
-                here[row as usize] = true;
-            }
-            for (flag, here) in mask.iter_mut().zip(here) {
-                *flag = *flag && here;
-            }
+    /// The gathered chunks less every row whose key one of [`Probe::narrowed_by`] says no driving
+    /// row can hold, a chunk at a time on every thread in the lease.
+    ///
+    /// Only a key that is a column of this side is narrowed, since that is the column the bitmap is
+    /// asked about, and only an integer one, since the exact bitmap answers for the integer value.
+    /// A chunk that loses every row is dropped and one that keeps more than half is kept whole. The
+    /// rows that stay keep their order, which is the order a chain hands them back in.
+    fn narrowed(
+        &self,
+        keying: Keying<'_>,
+        chunks: Vec<Chunk>,
+        threads: &Lease<'_>,
+    ) -> Result<Vec<Chunk>> {
+        let filters: Vec<(usize, &Domain)> = self
+            .narrowing
+            .iter()
+            .filter_map(|(at, sideways)| {
+                let domain = sideways.kept()?;
+                let Expr::Column(binding) = *keying.plan.expr(*keying.exprs.get(*at)?) else {
+                    return None;
+                };
+                let column = keying.schema.position_of(binding)?;
+                let integer = matches!(
+                    self.right_types.get(column)?,
+                    LogicalType::TinyInt
+                        | LogicalType::SmallInt
+                        | LogicalType::Integer
+                        | LogicalType::BigInt
+                );
+                integer.then_some((column, domain))
+            })
+            .collect();
+        if filters.is_empty() {
+            return Ok(chunks);
         }
-        allowed
+        let held: Vec<Mutex<Option<Chunk>>> =
+            chunks.into_iter().map(|chunk| Mutex::new(Some(chunk))).collect();
+        let one = |index: usize| -> Result<Option<Chunk>> {
+            let Some(mut chunk) = held[index].lock().map_err(poisoned)?.take() else {
+                return Ok(None);
+            };
+            let mut block = Vec::new();
+            for &(column, domain) in &filters {
+                let rows = chunk.len();
+                let kept = domain.keep(chunk.column(column)?, rows, &mut block);
+                // A row that cannot match does no harm in the table, so a chunk that keeps most of
+                // its rows is kept whole rather than copied to drop a few.
+                if kept.len() <= rows / 2 {
+                    chunk = chunk.select(&Selection::from_indices(kept))?;
+                }
+            }
+            Ok((!chunk.is_empty()).then_some(chunk))
+        };
+        let narrowed = in_parallel(threads, held.len(), threads.degree(), "narrowed chunk", one)?;
+        Ok(narrowed.into_iter().flatten().collect())
     }
 
     /// Applies the session semantics to the key expressions.
@@ -1496,6 +1526,10 @@ impl<'a> Probe<'a> {
                 // The chunks laid end to end, which is a copy of the side and is charged as one.
                 // The chunks themselves are not charged again here: `kept` is what the keep that
                 // made them charged, and it goes when they do.
+                // Before the side is laid out rather than inside the table, because a row that
+                // cannot match costs its copy into every column and its hash and its deal as well,
+                // and on q09 that is nineteen rows of `partsupp` in every twenty.
+                let chunks = self.narrowed(keying, chunks, threads)?;
                 let rows = Build::new(&self.right_types, &chunks, threads)?;
                 charged.grow(rows.footprint())?;
                 // Laid before the table rather than after it, because a key that is a column of
@@ -1506,15 +1540,8 @@ impl<'a> Probe<'a> {
                         // the table is built rather than after the join is done.
                         drop(chunks);
                         drop(kept);
-                        let allowed = self.allowed(&keys, rows.rows());
-                        let index = Lookup::build_among(
-                            &keys,
-                            rows.rows(),
-                            keying.nulls,
-                            allowed.as_deref(),
-                            threads,
-                            &self.cancel,
-                        )?;
+                        let index =
+                            Lookup::build(&keys, rows.rows(), keying.nulls, threads, &self.cancel)?;
                         charged.grow(index.footprint())?;
                         index
                     }
