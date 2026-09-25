@@ -89,7 +89,7 @@ pub const CONSISTENT: &str = "CONSISTENT";
 pub const VOLATILE: &str = "VOLATILE";
 
 /// The functions the pin reports as volatile with side effects, of the ones rudb has.
-const MOVING: &[&str] = &["currval", "nextval", "random", "setseed", "setval"];
+const MOVING: &[&str] = &["currval", "error", "nextval", "random", "setseed", "setval"];
 
 /// The columns `duckdb_functions()` produces, which is DuckDB's twenty one.
 #[must_use]
@@ -322,11 +322,13 @@ fn named(name: &str, count: usize) -> Vec<String> {
 /// `regexp_replace(string, regex, replacement)` is three VARCHARs and the order is not guessable
 /// from that. `current_setting` is here because its error message names the parameter, so a row
 /// saying `col0` next to a message saying `setting_name` would be this table disagreeing with the
-/// binder about the same argument.
+/// binder about the same argument. `error` is here because the pin names its one argument
+/// `message`, though its candidate list still says `col0`.
 ///
 /// A row only applies at the argument count it has names for, so a function with two arities keeps
 /// `col0` at the arity this list does not cover rather than being given the wrong names.
-const PARAMETER_NAMES: &[(&str, &[&str])] = &[("current_setting", &["setting_name"])];
+const PARAMETER_NAMES: &[(&str, &[&str])] =
+    &[("current_setting", &["setting_name"]), ("error", &["message"])];
 
 #[cfg(test)]
 mod tests {
@@ -468,8 +470,8 @@ mod tests {
         // A function that lands here volatile has to be added to the list on purpose, so this fails
         // for one that arrives without anybody deciding what the column says for it.
         for entry in function_entries().iter().filter(|entry| entry.function_type != "table") {
-            let moving =
-                ["currval", "nextval", "random", "setseed", "setval"].contains(&entry.name);
+            let moving = ["currval", "error", "nextval", "random", "setseed", "setval"]
+                .contains(&entry.name);
             let stability = if moving { super::VOLATILE } else { CONSISTENT };
             assert_eq!(entry.stability, Some(stability), "{}", entry.name);
             assert_eq!(entry.has_side_effects, Some(moving), "{}", entry.name);

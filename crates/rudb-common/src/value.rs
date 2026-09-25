@@ -287,7 +287,7 @@ impl fmt::Display for Value {
             Self::UHugeInt(v) => write!(f, "{v}"),
             Self::Float(v) => write_float(f, *v),
             Self::Double(v) => write_float(f, *v),
-            Self::Decimal { unscaled, scale, .. } => write_decimal(f, *unscaled, *scale),
+            Self::Decimal { unscaled, width, scale } => write_decimal(f, *unscaled, *width, *scale),
             Self::Varchar(v) => f.write_str(v),
             Self::Blob(v) => write_blob(f, v),
             Self::Date(v) => write_date(f, *v),
@@ -497,19 +497,24 @@ pub fn format_double(value: f64) -> String {
     format!("{sign}{mantissa}e{exponent_sign}{:02}", exponent.abs())
 }
 
-fn write_decimal(f: &mut fmt::Formatter<'_>, unscaled: i128, scale: u8) -> fmt::Result {
+/// A decimal with the point where its scale puts it.
+///
+/// A type with no digits before the point, `DECIMAL(2,2)` say, prints nothing there either, so the
+/// pin prints `.5::DECIMAL(1,1)` as `.5` and the same half as `DECIMAL(3,2)` as `0.50`.
+fn write_decimal(f: &mut fmt::Formatter<'_>, unscaled: i128, width: u8, scale: u8) -> fmt::Result {
     if scale == 0 {
         return write!(f, "{unscaled}");
     }
     let negative = unscaled < 0;
     // Widened before the negation so that i128::MIN does not overflow on the way to its digits.
     let digits = unscaled.unsigned_abs().to_string();
+    let whole = if width > scale { "0" } else { "" };
     let scale = usize::from(scale);
     let (whole, fraction) = if digits.len() > scale {
         let split = digits.len() - scale;
         (digits[..split].to_string(), digits[split..].to_string())
     } else {
-        ("0".to_string(), format!("{:0>scale$}", digits))
+        (whole.to_string(), format!("{:0>scale$}", digits))
     };
     if negative {
         f.write_str("-")?;
@@ -791,6 +796,10 @@ mod tests {
         assert_eq!(d(-5, 3), "-0.005");
         assert_eq!(d(1234, 0), "1234");
         assert_eq!(d(1_000_000, 6), "1.000000");
+        let narrow = |unscaled, width, scale| Value::Decimal { unscaled, width, scale }.to_string();
+        assert_eq!(narrow(50, 2, 2), ".50");
+        assert_eq!(narrow(-5, 1, 1), "-.5");
+        assert_eq!(narrow(50, 3, 2), "0.50");
     }
 
     #[test]

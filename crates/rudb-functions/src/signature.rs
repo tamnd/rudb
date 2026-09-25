@@ -546,6 +546,8 @@ const TABLE: &[Entry] = &[
         numeric_only: false,
     },
     text("lower", Arity::exactly(1), Fixed::Varchar),
+    // `error` fails with its argument as the message, and a NULL message is a NULL answer.
+    text("error", Arity::exactly(1), Fixed::Null),
     text("upper", Arity::exactly(1), Fixed::Varchar),
     Entry {
         name: "length",
@@ -2076,6 +2078,7 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("current_schema", &["current_schema() -> VARCHAR"]),
     ("current_database", &["current_database() -> VARCHAR"]),
     ("lower", &["lower(col0 VARCHAR) -> VARCHAR"]),
+    ("error", &["\"error\"(col0 VARCHAR) -> \"NULL\""]),
     ("upper", &["upper(col0 VARCHAR) -> VARCHAR"]),
     (
         "length",
