@@ -440,7 +440,8 @@ fn fold(
     selection: &Selection,
 ) -> Result<()> {
     for &(output, column) in read {
-        let selected = Vector::dictionary(selection.indices().to_vec(), chunk.column(column)?.clone())?;
+        let selected =
+            Vector::dictionary(selection.indices().to_vec(), chunk.column(column)?.clone())?;
         extremes[output].update_run(std::slice::from_ref(&selected), selection.len())?;
     }
     Ok(())

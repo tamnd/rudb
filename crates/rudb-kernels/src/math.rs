@@ -128,6 +128,7 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
     }
     let answer = match (name, args) {
         ("pi", []) => Ok(Value::Double(std::f64::consts::PI)),
+        ("setseed", [seed]) => crate::random::setseed(seed),
         ("log", [base, x]) => two(base, x, |base, x| x.log10() / base.log10()),
         ("pow", [x, y]) => two(x, y, f64::powf),
         ("atan2", [y, x]) => two(y, x, f64::atan2),

@@ -28,7 +28,7 @@
 //! `TIMESTAMPTZ` printed as text is `None` for a third: the text depends on the session zone, and
 //! the optimizer has no session by design.
 
-use rudb_common::{LogicalType, Result, Value};
+use rudb_common::{ErrorCode, LogicalType, Result, Value};
 use rudb_kernels::{Comparison, Connective, call_values, cast_value, combine, compare_values};
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan, Slice};
 use rudb_vector::Vector;
@@ -36,9 +36,10 @@ use rudb_vector::Vector;
 /// The functions whose value is not decided by their arguments.
 ///
 /// `SELECT DISTINCT function_name FROM duckdb_functions() WHERE has_side_effects` on the pinned
-/// binary, which is the list at the commit the grammar is vendored from. rudb implements none of
-/// them today and the list is here anyway, so that the first one to land is refused by code that
-/// already knew about it rather than folded by code that had never heard of it.
+/// binary, which is the list at the commit the grammar is vendored from. rudb has the sequence
+/// functions, `random` and `setseed` so far, and the rest are listed anyway so that the next one to
+/// land is refused by code that already knew about it rather than folded by code that had never
+/// heard of it. `TRY` refuses an operand that calls any of them.
 pub const VOLATILE: [&str; 17] = [
     "current_connection_id",
     "current_query",
@@ -101,6 +102,12 @@ pub fn value_of(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
             if VOLATILE.contains(&name) {
                 return Ok(None);
             }
+            if let ("try", [only]) = (name, plan.expr_list(args)) {
+                return match value_of(plan, *only) {
+                    Err(error) if caught(&error) => Ok(Some(Value::Null)),
+                    answer => answer,
+                };
+            }
             let Some(values) = values_of(plan, args)? else { return Ok(None) };
             // The one call the values alone cannot answer, since a value of an enum is its string
             // and the position is in the type.
@@ -115,6 +122,13 @@ pub fn value_of(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
         Expr::Case { arms, otherwise } => return case(plan, arms, otherwise),
     };
     Ok(Some(value))
+}
+
+/// Whether `TRY` answers null for this error rather than passing it on, which is the pin's three
+/// kinds of error a value can cause.
+#[must_use]
+pub fn caught(error: &rudb_common::Error) -> bool {
+    matches!(error.code(), ErrorCode::Conversion | ErrorCode::OutOfRange | ErrorCode::InvalidInput)
 }
 
 /// What a run of expressions comes to, or `None` if any one of them does not come to one thing.

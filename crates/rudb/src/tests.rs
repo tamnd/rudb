@@ -1028,7 +1028,6 @@ fn a_function_that_is_not_implemented_does_not_answer_its_own_argument() {
     let message = failure(&db, "SELECT unnest([1], recursive := true)");
     assert!(message.contains("not supported yet"), "{message}");
     assert!(message.starts_with("recursive := true is not supported yet"), "{message}");
-    assert!(failure(&db, "SELECT length(try('a'))").contains("not supported yet"));
 }
 
 /// The four string functions with a grammar rule of their own, end to end. Per #314.
@@ -2359,6 +2358,80 @@ fn the_math_functions_answer_with_the_pins_types() {
     assert!(error.message().contains("must be a constant expression"), "{error}");
 }
 
+#[test]
+fn a_seeded_random_repeats_the_pins_numbers_and_every_row_draws_its_own() {
+    let db = database();
+    // The only test that seeds, since the generator belongs to the process. The numbers are the
+    // pin's after `SELECT setseed(0.5)`.
+    let seeded = |sql: &str| {
+        assert_eq!(rows(&db, "SELECT setseed(0.5)"), vec![vec![Value::Null]]);
+        rows(&db, sql)
+    };
+    assert_eq!(
+        seeded("SELECT random() FROM range(3)"),
+        [0.851_113_188_628_732_5, 0.564_860_018_730_782_4, 0.064_130_513_197_432_43]
+            .map(|value| vec![Value::Double(value)])
+    );
+    assert_eq!(
+        seeded("SELECT random(), random()"),
+        [[Value::Double(0.851_113_188_628_732_5), Value::Double(0.002_978_387_269_385_594)]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(DISTINCT random()), min(random()) >= 0, max(random()) < 1 FROM range(5000)"
+        ),
+        [[Value::BigInt(5000), Value::Boolean(true), Value::Boolean(true)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT typeof(random()), typeof(setseed(0.1)), setseed(NULL)"),
+        [[Value::Varchar("DOUBLE".into()), Value::Varchar("\"NULL\"".into()), Value::Null]]
+    );
+    let error = db.query("SELECT setseed(1.5)").unwrap_err().to_string();
+    assert!(
+        error.contains("SETSEED accepts seed values between -1.0 and 1.0, inclusive"),
+        "{error}"
+    );
+}
+
+/// `TRY` answers NULL for the rows that fail a cast or go out of range and keeps the rest, refuses
+/// what the pin refuses, and `if` is the CASE the pin's macro expands to.
+#[test]
+fn try_nulls_the_rows_that_fail_and_if_is_a_case() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT TRY(CAST(x AS INTEGER)) FROM (VALUES ('1'), ('two'), ('3')) t(x)"),
+        [Value::Integer(1), Value::Null, Value::Integer(3)].map(|value| vec![value])
+    );
+    assert_eq!(
+        rows(&db, "SELECT TRY(CAST(300 AS TINYINT)), TRY(CAST('x' AS INTEGER)), TRY(1 + 1)"),
+        [[Value::Null, Value::Null, Value::Integer(2)]]
+    );
+    for (sql, message) in [
+        ("SELECT TRY((SELECT 1))", "TRY can not be used in combination with a scalar subquery"),
+        ("SELECT TRY(random())", "TRY can not be used in combination with a volatile function"),
+        ("SELECT TRY(sum(1))", "aggregates are not allowed inside the TRY expression"),
+        ("SELECT TRY(row_number() OVER ())", "window functions are not allowed in try"),
+        ("SELECT TRY(1, 2)", "Wrong number of arguments provided to TRY expression"),
+    ] {
+        let error = db.query(sql).unwrap_err().to_string();
+        assert!(error.contains(message), "{sql}: {error}");
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT if(1 < 2, 'yes', 'no'), if(NULL, 1, 2.5)::VARCHAR, typeof(if(true, 1, 2.5))"
+        ),
+        [[
+            Value::Varchar("yes".into()),
+            Value::Varchar("2.5".into()),
+            Value::Varchar("DECIMAL(11,1)".into())
+        ]]
+    );
+    let error = db.query("SELECT if(true, 1)").unwrap_err().to_string();
+    assert!(error.contains("Macro \"if\"() does not support the supplied arguments"), "{error}");
+}
+
 /// The bitwise operators, `xor`, `bit_count`, `binom` and the operator spellings of `pow` and
 /// `factorial`, with the pin's names and answers.
 #[test]
@@ -2848,6 +2921,36 @@ fn ieee_floating_point_ops_are_resolved_while_the_expression_is_bound() {
     assert_eq!(db.setting("ieee_floating_point_ops").expect("the setting"), "true");
     let error = db.execute("SET ieee_floating_point_ops = 'off'").expect_err("not a boolean");
     assert_eq!(error.message(), "Failed to cast value: Could not convert string 'off' to BOOL");
+}
+
+/// `divide` and `mod` are the `//` and `%` operators, and a division by zero says so in the name it
+/// was called by, the way the pin's message does.
+#[test]
+fn divide_and_mod_name_themselves_when_they_divide_by_zero() {
+    let db = database();
+    let advice = "Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.";
+    for (sql, expression) in [
+        ("SELECT divide(7, 0)", "divide(7, 0)"),
+        ("SELECT mod(7, 0)", "mod(7, 0)"),
+        ("SELECT divide(7.0, 0)", "divide(7.0, 0.0)"),
+        ("SELECT mod(7.5, 0)", "mod(7.5, 0.0)"),
+        ("SELECT 7 // 0", "(7 // 0)"),
+    ] {
+        assert_eq!(
+            failure(&db, sql),
+            format!("Division by zero in expression {expression}. {advice}"),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        rows(&db, "SELECT divide(7, 2), mod(7, 2), TRY(divide(7, 0))"),
+        vec![vec![Value::Integer(3), Value::Integer(1), Value::Null]]
+    );
+    db.execute("SET null_on_division_by_zero = true").expect("nulling division errors");
+    assert_eq!(
+        rows(&db, "SELECT divide(7, 0), mod(7, 0), mod(7.5, 0), divide(7.0, 0)"),
+        vec![vec![Value::Null, Value::Null, Value::Null, Value::Null]]
+    );
 }
 
 #[test]

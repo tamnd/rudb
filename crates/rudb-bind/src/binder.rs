@@ -298,6 +298,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) correlations: Vec<Vec<ColumnBinding>>,
     /// The lambdas whose bodies are being bound, innermost last. See `crate::lambda`.
     pub(crate) lambda_frames: Vec<crate::lambda::Frame>,
+    /// Whether the expression being bound is inside a `TRY`, which refuses what it cannot rerun.
+    pub(crate) trying: bool,
     /// Where we are, for an error message that says which clause the writer should look at.
     pub(crate) clause: &'static str,
     /// Whether a Parquet file that could be read through a native mirror is bound from its outline
@@ -354,6 +356,7 @@ impl<'a> Binder<'a> {
             lateral_scopes: Vec::new(),
             correlations: Vec::new(),
             lambda_frames: Vec::new(),
+            trying: false,
             clause: "SELECT clause",
             outlined: false,
             expanding: Vec::new(),
@@ -3120,6 +3123,9 @@ impl<'a> Binder<'a> {
         filter: ast::ExprRef,
         scope: &Scope,
     ) -> Result<ExprRef> {
+        if self.trying {
+            return Err(Error::binder("aggregates are not allowed inside the TRY expression"));
+        }
         let frames = std::mem::take(&mut self.lambda_frames);
         let bound = self.bind_aggregate_over_rows(ast, name, args, distinct, filter, scope);
         self.lambda_frames = frames;
@@ -3232,6 +3238,9 @@ impl<'a> Binder<'a> {
         written: &WindowCall<'_>,
         scope: &Scope,
     ) -> Result<ExprRef> {
+        if self.trying {
+            return Err(Error::binder("window functions are not allowed in try"));
+        }
         let frames = std::mem::take(&mut self.lambda_frames);
         let bound = self.bind_window_over_rows(ast, written, scope);
         self.lambda_frames = frames;

@@ -3521,6 +3521,7 @@ impl<'a> Transform<'a> {
                 "FunctionExpression" => return self.function(node),
                 "CoalesceExpression" => return self.coalesce(node),
                 "NullIfExpression" => return self.null_if(node),
+                "TryExpression" => return self.try_expression(node),
                 "LambdaExpression" => return self.lambda(node),
                 "SubstringExpression" => return self.substring(node),
                 "PositionExpression" => return self.position(node),
@@ -4407,6 +4408,19 @@ impl<'a> Transform<'a> {
     ///
     /// It stays a function called `nullif` rather than becoming the `CASE` upstream's macro expands
     /// to, since the column it produces is named after the call and not after the expansion.
+    /// `TryExpression <- 'TRY' Parens(Expression)`, kept as a call to `try` that the binder and the
+    /// executor know is not a function. The pin prints it as `TRY(...)` and so does this.
+    fn try_expression(&mut self, node: u32) -> Result<ExprRef> {
+        let kids: Vec<u32> = self.kids(node).collect();
+        let [only] = kids[..] else {
+            return self.unsupported(node);
+        };
+        let inner = self.expr(only)?;
+        let args = self.expr_slice(vec![inner]);
+        let name = self.function_name("try");
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
+    }
+
     fn null_if(&mut self, node: u32) -> Result<ExprRef> {
         let arguments = self.find(node, "NullIfArguments");
         if arguments == NONE {
@@ -6842,7 +6856,6 @@ mod tests {
     #[test]
     fn a_keyword_is_not_stepped_through_on_the_way_to_its_one_argument() {
         for (sql, rule) in [
-            ("SELECT try(1)", "TryExpression"),
             ("SELECT unpack([1])", "UnpackExpression"),
             ("SELECT columns('a')", "ColumnsExpression"),
         ] {

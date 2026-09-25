@@ -43,10 +43,9 @@
 //!
 //! No window functions, because rudb has none. No macros, no pragma functions and no table macros,
 //! for the same reason. `has_side_effects` is false and `stability` is `CONSISTENT` on every scalar
-//! and aggregate row, because every function rudb has is a pure function of its arguments: there is
-//! no `random`, no `nextval` and no `now` in the table yet. A volatile one arrives with a row that
-//! says so rather than with this column quietly staying wrong, which is why it is derived from
-//! nothing and asserted in a test.
+//! and aggregate row except the sequence functions, `random` and `setseed`, which are `VOLATILE` with
+//! side effects as they are on the pin. There is no `now` yet, which would be the first
+//! `CONSISTENT_WITHIN_QUERY` row.
 
 use rudb_common::{Field, LogicalType};
 
@@ -83,8 +82,14 @@ pub const FUNCTION_CATALOG: &str = "system";
 /// The schema builtins are reported as belonging to.
 pub const FUNCTION_SCHEMA: &str = "main";
 
-/// The stability every function in this engine has, since none of them is volatile yet.
+/// The stability of a function whose answer depends on nothing but its arguments.
 pub const CONSISTENT: &str = "CONSISTENT";
+
+/// The stability of a function that can answer differently for the same arguments.
+pub const VOLATILE: &str = "VOLATILE";
+
+/// The functions the pin reports as volatile with side effects, of the ones rudb has.
+const MOVING: &[&str] = &["currval", "nextval", "random", "setseed", "setval"];
 
 /// The columns `duckdb_functions()` produces, which is DuckDB's twenty one.
 #[must_use]
@@ -148,8 +153,8 @@ fn scalar(row: FunctionRow) -> FunctionEntry {
         parameters: named(row.alias_of.unwrap_or(row.name), row.types.len()),
         parameter_types: row.types.iter().map(|name| (*name).to_string()).collect(),
         varargs: row.varargs,
-        has_side_effects: Some(false),
-        stability: Some(CONSISTENT),
+        has_side_effects: Some(MOVING.contains(&row.name)),
+        stability: Some(if MOVING.contains(&row.name) { VOLATILE } else { CONSISTENT }),
     }
 }
 
@@ -459,14 +464,15 @@ mod tests {
     }
 
     #[test]
-    fn nothing_in_this_engine_is_volatile_yet_and_the_table_says_so() {
-        // There is no `random`, no `nextval` and no `now` in the function table, so every scalar and
-        // aggregate row is consistent and has no side effects. The day one of those lands this test
-        // fails, which is the point: the column has to be given a real answer rather than inheriting
-        // one nobody looked at.
+    fn only_the_functions_the_pin_calls_volatile_are_volatile_here() {
+        // A function that lands here volatile has to be added to the list on purpose, so this fails
+        // for one that arrives without anybody deciding what the column says for it.
         for entry in function_entries().iter().filter(|entry| entry.function_type != "table") {
-            assert_eq!(entry.stability, Some(CONSISTENT), "{}", entry.name);
-            assert_eq!(entry.has_side_effects, Some(false), "{}", entry.name);
+            let moving =
+                ["currval", "nextval", "random", "setseed", "setval"].contains(&entry.name);
+            let stability = if moving { super::VOLATILE } else { CONSISTENT };
+            assert_eq!(entry.stability, Some(stability), "{}", entry.name);
+            assert_eq!(entry.has_side_effects, Some(moving), "{}", entry.name);
         }
     }
 }
