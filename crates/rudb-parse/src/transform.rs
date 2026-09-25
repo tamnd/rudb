@@ -483,6 +483,7 @@ impl<'a> Transform<'a> {
                 let name = self.identifier(self.find(inner, "CatalogName"));
                 Ok(Statement::Detach { name, if_exists })
             }
+            "CopyStatement" => self.copy_statement(inner),
             "TransactionStatement" => {
                 let kind = self.first(inner);
                 Ok(Statement::Transaction(match self.name(kind) {
@@ -2008,8 +2009,173 @@ impl<'a> Transform<'a> {
         let returning = self.returning(node, name, alias)?;
         let conflict = self.conflict(node, name, alias)?;
         let index = self.ast.inserts.len() as u32;
-        self.ast.inserts.push(Insert { name, columns, source, returning, conflict });
+        self.ast.inserts.push(Insert { name, columns, source, returning, conflict, copy: false });
         Ok(Statement::Insert(index))
+    }
+
+    /// `CopyStatement <- 'COPY' CopyVariations`, of which `COPY t FROM 'file'` is done.
+    ///
+    /// It becomes `INSERT INTO t SELECT * FROM read_csv('file', ...)` with the options turned into
+    /// the named parameters `read_csv` takes, which is close to what DuckDB does with it and means
+    /// the load goes down the same road as every other load from a CSV file, split across threads
+    /// and all. The one thing the rewrite leaves out is that the file is read as the table's types,
+    /// and [`Insert::copy`] is how the binder hears about that. The answer is the one an `INSERT`
+    /// gives, a `Count` of the rows written, which is what the pin answers a `COPY` with too.
+    ///
+    /// A `.parquet` file, or `FORMAT parquet`, becomes a `read_parquet` instead, since that reader
+    /// is here and the rewrite is the same. Everything that writes a file, `COPY t TO` and `COPY
+    /// (query) TO`, is still refused, and so is `COPY FROM DATABASE`.
+    fn copy_statement(&mut self, node: u32) -> Result<Statement> {
+        let table = self.descendant(node, "CopyTable");
+        if table == NONE {
+            return self.unsupported(self.first(node));
+        }
+        let direction = self.first(self.find(table, "FromOrTo"));
+        if self.name(direction) != "CopyFrom" {
+            return self.unsupported(node);
+        }
+        let name = self.name_parts(self.find(table, "BaseTableName"));
+        let list = self.find(table, "InsertColumnList");
+        let columns = if list == NONE {
+            Slice::default()
+        } else {
+            let mut parts = Vec::new();
+            for kid in self.kids(self.find(list, "ColumnList")) {
+                parts.push(self.identifier(kid));
+            }
+            self.part_slice(parts)
+        };
+        let file = self.first(self.find(table, "CopyFileName"));
+        let path = match self.name(file) {
+            "CopyFileNameStringLiteral" => self.string_value(self.find(file, "StringLiteral"))?,
+            "CopyFileNameIdentifier" => self.text(file).to_string(),
+            _ => return self.unsupported(file),
+        };
+        let (format, options) = self.copy_options(self.find(table, "CopyOptions"))?;
+        let format = format.unwrap_or_else(|| {
+            let lowered = path.to_ascii_lowercase();
+            if lowered.ends_with(".parquet") { "parquet".to_string() } else { "csv".to_string() }
+        });
+        let reader = match format.as_str() {
+            "csv" => "read_csv",
+            "parquet" if options.is_empty() => "read_parquet",
+            "parquet" => {
+                return Err(Error::not_implemented(
+                    "COPY FROM a Parquet file with options other than FORMAT is not supported yet",
+                ));
+            }
+            other => {
+                return Err(Error::not_implemented(format!(
+                    "COPY FROM with FORMAT {other} is not supported yet"
+                )));
+            }
+        };
+        let text = self.intern(&path);
+        let path = self.push(Expr::Literal { kind: LiteralKind::String, text });
+        let mut args = vec![Target { expr: path, alias: NONE }];
+        for (parameter, expr) in options {
+            let alias = self.intern(parameter);
+            args.push(Target { expr, alias });
+        }
+        let args = self.target_slice(args);
+        let function = self.intern(reader);
+        let function = self.part_slice(vec![function]);
+        let source = self.push_source(Source::Function {
+            name: function,
+            args,
+            alias: NONE,
+            columns: Slice::default(),
+            pragma: false,
+        });
+        let source = self.star_over(source);
+        let index = self.ast.inserts.len() as u32;
+        self.ast.inserts.push(Insert {
+            name,
+            columns,
+            source,
+            returning: None,
+            conflict: None,
+            copy: true,
+        });
+        Ok(Statement::Insert(index))
+    }
+
+    /// `CopyOptions <- 'WITH'? CopyOptionList`, as the format it named, if it named one, and the
+    /// rest as `read_csv` parameters with their values.
+    ///
+    /// Both spellings are read. The generic list, `(FORMAT csv, HEADER false, NULL '')`, is the one
+    /// DuckDB documents and the one the Join Order Benchmark loads with. The specialized one,
+    /// `WITH DELIMITER '|' NULL '' CSV HEADER`, is PostgreSQL's older form and the grammar keeps it,
+    /// so the options that mean the same thing in both are read from both. An option written with
+    /// no value is a true one, which is what `HEADER` on its own means in either.
+    ///
+    /// An option DuckDB takes and this does not is refused by name rather than dropped, because
+    /// every one of them changes which rows come out. A name DuckDB does not take either gets the
+    /// first line of DuckDB's own refusal.
+    fn copy_options(&mut self, node: u32) -> Result<(Option<String>, CopyOptions)> {
+        let mut format = None;
+        let mut options = Vec::new();
+        if node == NONE {
+            return Ok((format, options));
+        }
+        let mut generic = Vec::new();
+        self.named_nodes(node, "CopyGenericOption", &mut generic);
+        for option in generic {
+            let inner = self.first(option);
+            if self.name(inner) != "GenericCopyOption" {
+                return self.unsupported(inner);
+            }
+            let name = self.text(self.find(inner, "CopyOptionName")).to_ascii_lowercase();
+            let value = self.find(inner, "GenericCopyOptionValue");
+            if value != NONE && self.name(self.first(value)) != "GenericCopyOptionExpression" {
+                return self.unsupported(value);
+            }
+            if name == "format" {
+                // `FORMAT csv` writes the format as a bare word, which would read as a column,
+                // so it is taken as the text it was written with.
+                if value == NONE {
+                    return self.unsupported(option);
+                }
+                let written = self.text(value).trim();
+                let written = written.trim_matches('\'').to_ascii_lowercase();
+                format = Some(written);
+                continue;
+            }
+            let parameter = copy_parameter(&name)?;
+            let expr = if value == NONE {
+                self.push(Expr::Literal { kind: LiteralKind::True, text: NONE })
+            } else {
+                self.expr(self.descendant(value, "Expression"))?
+            };
+            options.push((parameter, expr));
+        }
+        let mut specialized = Vec::new();
+        self.named_nodes(node, "SpecializedOption", &mut specialized);
+        for option in specialized {
+            let mut inner = self.first(option);
+            if self.name(inner) == "SingleOption" {
+                inner = self.first(inner);
+            }
+            let parameter = match self.name(inner) {
+                "CsvOption" => {
+                    format = Some("csv".to_string());
+                    continue;
+                }
+                "HeaderOption" => {
+                    let yes = self.push(Expr::Literal { kind: LiteralKind::True, text: NONE });
+                    options.push(("header", yes));
+                    continue;
+                }
+                "NullAsOption" => "nullstr",
+                "DelimiterAsOption" => "delim",
+                "QuoteAsOption" => "quote",
+                "EscapeAsOption" => "escape",
+                _ => return self.unsupported(inner),
+            };
+            let expr = self.string_literal(self.find(inner, "StringLiteral"))?;
+            options.push((parameter, expr));
+        }
+        Ok((format, options))
     }
 
     /// `OrAction <- InsertOrReplace / InsertOrIgnore` and `OnConflictClause <- 'ON' 'CONFLICT'
@@ -2361,7 +2527,14 @@ impl<'a> Transform<'a> {
         delete: bool,
     ) -> Statement {
         let index = self.ast.inserts.len() as u32;
-        self.ast.inserts.push(Insert { name, columns, source, returning, conflict: None });
+        self.ast.inserts.push(Insert {
+            name,
+            columns,
+            source,
+            returning,
+            conflict: None,
+            copy: false,
+        });
         if delete { Statement::Delete(index) } else { Statement::Update(index) }
     }
 
@@ -4754,6 +4927,35 @@ impl<'a> Transform<'a> {
     }
 }
 
+/// The options of a `COPY` as the `read_csv` parameters they become, each with its value.
+type CopyOptions = Vec<(&'static str, ExprRef)>;
+
+/// The `read_csv` parameter a `COPY` option is, by the name it was written with in lower case.
+///
+/// `DELIMITER` and `NULL` are the `COPY` names for what `read_csv` calls `delim` and `nullstr`, and
+/// DuckDB takes the `read_csv` names in a `COPY` too, so both are here.
+fn copy_parameter(name: &str) -> Result<&'static str> {
+    Ok(match name {
+        "header" => "header",
+        "delimiter" | "delim" | "sep" => "delim",
+        "quote" => "quote",
+        "escape" => "escape",
+        "null" | "nullstr" => "nullstr",
+        "all_varchar" | "allow_quoted_nulls" | "auto_detect" | "columns" | "comment"
+        | "compression" | "dateformat" | "date_format" | "decimal_separator" | "encoding"
+        | "force_not_null" | "force_quote" | "ignore_errors" | "max_line_size" | "names"
+        | "new_line" | "null_padding" | "sample_size" | "skip" | "strict_mode"
+        | "timestampformat" | "timestamp_format" | "types" | "dtypes" => {
+            return Err(Error::not_implemented(format!(
+                "COPY FROM with the option {name} is not supported yet"
+            )));
+        }
+        _ => {
+            return Err(Error::not_implemented(format!("Unrecognized option \"{name}\" for csv")));
+        }
+    })
+}
+
 /// Each unit an interval literal can be written in, as the grammar rule that spells it, the
 /// function it becomes, and the width the count is truncated to on the way there.
 ///
@@ -5960,6 +6162,58 @@ mod tests {
             "INSERT INTO t BY NAME SELECT 1 AS a",
             "INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT c DO NOTHING",
         ] {
+            let error = parse_ast(query).unwrap_err().to_string();
+            assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");
+        }
+    }
+
+    #[test]
+    fn a_copy_from_a_file_is_an_insert_from_read_csv() {
+        let ast = parse_ast(
+            "COPY name FROM '/data/name.csv' (FORMAT csv, HEADER false, ESCAPE '\\', QUOTE '\"', NULL '')",
+        )
+        .unwrap();
+        let Statement::Insert(index) = ast.statements[0] else { panic!("not an insert") };
+        assert!(ast.insert(index).copy);
+        assert_eq!(
+            round_statement(
+                "COPY name FROM '/data/name.csv' (FORMAT csv, HEADER false, ESCAPE '\\', QUOTE '\"', NULL '')"
+            ),
+            "INSERT INTO name SELECT * FROM read_csv('/data/name.csv', header := FALSE, \
+             escape := '\\', quote := '\"', nullstr := '')"
+        );
+        assert_eq!(
+            round_statement("COPY t (a, b) FROM 'in.csv' (HEADER, DELIMITER '|')"),
+            "INSERT INTO t (a, b) SELECT * FROM read_csv('in.csv', header := TRUE, delim := '|')"
+        );
+        assert_eq!(
+            round_statement("COPY t FROM 'in.csv' WITH DELIMITER AS ';' NULL 'NA' CSV HEADER"),
+            "INSERT INTO t SELECT * FROM read_csv('in.csv', delim := ';', nullstr := 'NA', \
+             header := TRUE)"
+        );
+        assert_eq!(
+            round_statement("COPY t FROM 'x.parquet'"),
+            "INSERT INTO t SELECT * FROM read_parquet('x.parquet')"
+        );
+        assert!(!{
+            let ast = parse_ast("INSERT INTO t VALUES (1)").unwrap();
+            let Statement::Insert(index) = ast.statements[0] else { panic!("not an insert") };
+            ast.insert(index).copy
+        });
+    }
+
+    #[test]
+    fn a_copy_this_does_not_read_is_refused_by_name() {
+        for (query, message) in [
+            ("COPY t FROM 'in.csv' (FOO 1)", "Unrecognized option \"foo\" for csv"),
+            ("COPY t FROM 'in.csv' (SKIP 1)", "the option skip is not supported yet"),
+            ("COPY t FROM 'in.json' (FORMAT json)", "FORMAT json is not supported yet"),
+        ] {
+            let error = parse_ast(query).unwrap_err().to_string();
+            assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");
+            assert!(error.contains(message), "{query} gave {error}");
+        }
+        for query in ["COPY t TO 'out.csv'", "COPY (SELECT 1) TO 'out.csv'"] {
             let error = parse_ast(query).unwrap_err().to_string();
             assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");
         }

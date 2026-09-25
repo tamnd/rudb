@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(csv.parameter_types[0], "VARCHAR");
         assert_eq!(
             csv.parameters[1..],
-            ["all_varchar", "delim", "escape", "header", "quote", "sep"]
+            ["all_varchar", "delim", "escape", "header", "names", "nullstr", "quote", "sep"]
         );
     }
 

@@ -312,6 +312,8 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    delim VARCHAR\n",
         "    escape VARCHAR\n",
         "    header BOOLEAN\n",
+        "    names VARCHAR[]\n",
+        "    nullstr VARCHAR\n",
         "    quote VARCHAR\n",
         "    sep VARCHAR\n",
     );

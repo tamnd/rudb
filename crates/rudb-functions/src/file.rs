@@ -77,10 +77,36 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
             }
             ("quote", Value::Varchar(text)) => given.quote = Some(one_byte(name, text)?),
             ("escape", Value::Varchar(text)) => given.escape = Some(one_byte(name, text)?),
+            ("nullstr", Value::Varchar(text)) => given.nulls = Some(vec![text.clone()]),
+            ("nullstr", Value::List { values, .. }) => given.nulls = Some(strings(name, values)?),
+            ("names", Value::List { values, .. }) => given.names = Some(strings(name, values)?),
+            (TYPES_SET, Value::Boolean(on)) => given.typed = *on,
             _ => {}
         }
     }
     Ok(given)
+}
+
+/// The name of the setting the binder writes into a `COPY t FROM` plan to say the column types are
+/// the table's rather than the sniffer's.
+///
+/// It is not in `read_csv`'s parameter list, so a call cannot write it, and it rides with the named
+/// parameters rather than beside them because that list is what the executor rebuilds the reader
+/// from. See [`Given::typed`] for what it changes.
+pub const TYPES_SET: &str = "types_set";
+
+/// The strings a list parameter was given, refusing a null in the list, which DuckDB does too.
+fn strings(parameter: &str, values: &[Value]) -> Result<Vec<String>> {
+    values
+        .iter()
+        .map(|value| match value {
+            Value::Varchar(text) => Ok(text.clone()),
+            _ => Err(Error::binder(format!(
+                "CSV Reader function option \"{parameter}\" requires a non-null string or a list \
+                 of non-null strings as input"
+            ))),
+        })
+        .collect()
 }
 
 /// The one byte a punctuation parameter was given.
@@ -406,7 +432,7 @@ fn largest_distincts(reader: &Reader, largest: &mut [Counted]) {
 pub fn csv_fields(paths: &[String], given: Given) -> Result<Vec<Field>> {
     let mut sniffed = Vec::with_capacity(paths.len());
     for path in paths {
-        sniffed.push((path.clone(), open_csv(path, given)?.fields()));
+        sniffed.push((path.clone(), open_csv(path, given.clone())?.fields()));
     }
     rudb_csv::across(&sniffed)
 }

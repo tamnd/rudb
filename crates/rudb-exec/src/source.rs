@@ -3014,7 +3014,7 @@ impl<'a> FileScan<'a> {
         cutting.pieces = 1;
         cutting.skipping = Vec::new();
         let Some(path) = self.paths.get(cutting.at) else { return Ok(()) };
-        let mut reader = FileReader::open(self.function, path, self.given)?;
+        let mut reader = FileReader::open(self.function, path, self.given.clone())?;
         let first = if cutting.at == 0 { None } else { self.paths.first().map(String::as_str) };
         let held = positions(self.function, &self.wanted, &reader.fields(), path, first)?;
         reader.project(&held)?;

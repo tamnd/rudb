@@ -52,6 +52,8 @@ pub struct Reader {
     path: String,
     given: Given,
     dialect: Dialect,
+    /// The strings that read as a null, from [`Given::null_strings`].
+    nulls: Option<Vec<Vec<u8>>>,
     fields: Vec<Field>,
     projection: Vec<usize>,
     buffer: Vec<u8>,
@@ -105,11 +107,13 @@ impl Reader {
         given: Given,
         block: usize,
     ) -> Result<Self> {
+        let nulls = given.null_strings();
         let mut reader = Self {
             file: Arc::from(file),
             path: path.to_string(),
             given,
             dialect: Dialect::comma_separated(),
+            nulls,
             fields: Vec::new(),
             projection: Vec::new(),
             buffer: Vec::new(),
@@ -126,15 +130,31 @@ impl Reader {
         };
         reader.fill(0)?;
         let sample = reader.buffer.clone();
+        let given = &reader.given;
         let quote = given.quote.or_else(|| dialect::quote(&sample));
         let delimiter = match given.delimiter {
             Some(byte) => byte,
             None => dialect::delimiter(&sample, quote)?,
         };
         let escape = given.escape.or(quote);
+        let told = given.header;
         reader.dialect = Dialect { delimiter, quote, escape, header: false };
         let rows = reader.sample_rows(&sample)?;
-        let (header, fields) = describe(&rows, given.header);
+        let (header, mut fields) = describe(&rows, told);
+        if let Some(names) = &reader.given.names {
+            if names.len() > fields.len() {
+                return Err(Error::invalid_input(format!(
+                    "Error when sniffing file \"{path}\".\nIt was not possible to detect the CSV \
+                     Header, due to the header having less columns than expected\nNumber of \
+                     expected columns: {}. Actual number of columns {}",
+                    names.len(),
+                    fields.len()
+                )));
+            }
+            for (field, name) in fields.iter_mut().zip(names) {
+                field.name.clone_from(name);
+            }
+        }
         reader.dialect.header = header;
         reader.fields = fields;
         reader.projection = (0..reader.fields.len()).collect();
@@ -223,7 +243,12 @@ impl Reader {
         }
         let first = self.line;
         self.line += rows as u64;
-        let cells = Cells { bytes: &self.buffer, records: &self.records, dialect: self.dialect };
+        let cells = Cells {
+            bytes: &self.buffer,
+            records: &self.records,
+            dialect: self.dialect,
+            nulls: self.nulls.as_deref(),
+        };
         let projected: Vec<_> =
             self.projection.iter().map(|&at| (at, &self.fields[at].ty)).collect();
         let mut builders = convert::builders(&cells, &projected);
@@ -338,8 +363,9 @@ impl Reader {
         Self {
             file: Arc::clone(&self.file),
             path: self.path.clone(),
-            given: self.given,
+            given: self.given.clone(),
             dialect: self.dialect,
+            nulls: self.nulls.clone(),
             fields: self.fields.clone(),
             projection: self.projection.clone(),
             buffer: Vec::new(),
@@ -412,21 +438,33 @@ impl Reader {
     /// `delim=';'` past the sample. Telling somebody that what they wrote down was auto-detected is
     /// the one thing the block could say that would send them looking in the wrong place.
     fn conversion_error(&self, text: &str, field: &Field, line: u64) -> String {
+        // A type the caller set, which is every column of a `COPY t FROM`, gets the binary's other
+        // paragraph, since telling somebody to set the type they set is no help. Measured on
+        // `v2.0.0-dev84237` with a `COPY` of a file whose second row does not fit the table.
+        let advice = if self.given.typed {
+            "This type was either manually set or derived from an existing table. Select a \
+             different type to correctly parse this column."
+                .to_string()
+        } else {
+            format!(
+                "This type was auto-detected from the CSV file.\nPossible solutions:\n* Override \
+                 the type for this column manually by setting the type explicitly, e.g., \
+                 types={{'{}': 'VARCHAR'}}\n* Set the sample size to a larger value to enable the \
+                 auto-detection to scan more values, e.g., sample_size=-1\n* Use a COPY statement \
+                 to automatically derive types from an existing table.",
+                field.name
+            )
+        };
         format!(
             "CSV Error on Line: {line}\nOriginal Line: {text}\nError when converting column \
              \"{}\". Could not convert string \"{text}\" to '{}'\n\nColumn {} is being converted \
-             as type {}\nThis type was auto-detected from the CSV file.\nPossible solutions:\n* \
-             Override the type for this column manually by setting the type explicitly, e.g., \
-             types={{'{}': 'VARCHAR'}}\n* Set the sample size to a larger value to enable the \
-             auto-detection to scan more values, e.g., sample_size=-1\n* Use a COPY statement to \
-             automatically derive types from an existing table.\n* Check whether the null string \
-             value is set correctly (e.g., nullstr = 'N/A')\n\n  file = {}\n  delimiter = {}\n  \
-             quote = {}\n  escape = {}\n  header = {} {}\n  sample_size = {}\n",
+             as type {}\n{advice}\n* Check whether the null string value is set correctly (e.g., \
+             nullstr = 'N/A')\n\n  file = {}\n  delimiter = {}\n  quote = {}\n  escape = {}\n  \
+             header = {} {}\n  sample_size = {}\n",
             field.name,
             field.ty,
             field.name,
             field.ty,
-            field.name,
             self.path,
             Given::shown(self.given.delimiter, Some(self.dialect.delimiter)),
             Given::shown(self.given.quote, self.dialect.quote),
@@ -492,7 +530,7 @@ impl Reader {
         Ok(Some(
             self.scratch
                 .iter()
-                .map(|text| if text.is_empty() { None } else { Some(text.clone()) })
+                .map(|text| if self.is_null(text) { None } else { Some(text.clone()) })
                 .collect(),
         ))
     }
@@ -552,6 +590,15 @@ impl Reader {
         Ok(())
     }
 
+    /// Whether a field read one record at a time is a null, which is the same test
+    /// [`convert::is_null`] makes on a range.
+    fn is_null(&self, text: &str) -> bool {
+        match &self.nulls {
+            None => text.is_empty(),
+            Some(nulls) => nulls.iter().any(|null| null.as_slice() == text.as_bytes()),
+        }
+    }
+
     /// The records the sniffer gets to look at, which is the sample or the file, whichever is
     /// shorter.
     fn sample_rows(&self, sample: &[u8]) -> Result<Vec<Vec<Option<String>>>> {
@@ -569,7 +616,7 @@ impl Reader {
             rows.push(
                 fields
                     .iter()
-                    .map(|text| if text.is_empty() { None } else { Some(text.clone()) })
+                    .map(|text| if self.is_null(text) { None } else { Some(text.clone()) })
                     .collect(),
             );
         }
@@ -917,6 +964,79 @@ mod tests {
         reader.retype(&[LogicalType::Double]).expect("one type for one column");
         assert_eq!(reader.fields()[0].ty, LogicalType::Double);
         assert_eq!(all(&mut reader), [[Value::Double(1.0)], [Value::Double(2.0)]]);
+    }
+
+    /// Measured on DuckDB `v2.0.0-dev84237`. With a null string that is not the empty one, an
+    /// empty field is an empty string, the null string is a null quoted or not, and `""` is an
+    /// empty string too, because the quoted form of a null is the null string quoted.
+    #[test]
+    fn a_null_string_other_than_the_empty_one_leaves_an_empty_field_as_text() {
+        let given =
+            Given { header: Some(false), nulls: Some(vec!["NA".to_string()]), ..Given::default() };
+        let mut reader = read_with("x,NA\n,\"NA\"\n\"\",y\n", given);
+        let text = |value: &str| Value::Varchar(value.into());
+        assert_eq!(
+            all(&mut reader),
+            [vec![text("x"), Value::Null], vec![text(""), Value::Null], vec![text(""), text("y")],]
+        );
+    }
+
+    #[test]
+    fn a_list_of_null_strings_makes_each_of_them_a_null() {
+        let given = Given {
+            header: Some(false),
+            nulls: Some(vec!["NA".to_string(), "-".to_string()]),
+            ..Given::default()
+        };
+        let mut reader = read_with("1,NA\n-,2\n", given);
+        assert_eq!(
+            all(&mut reader),
+            [vec![Value::BigInt(1), Value::Null], vec![Value::Null, Value::BigInt(2)]]
+        );
+    }
+
+    #[test]
+    fn given_names_rename_the_first_columns_and_too_many_of_them_are_refused() {
+        let names = |list: &[&str]| Some(list.iter().map(ToString::to_string).collect());
+        let reader = read_with("1,2,3\n", Given { names: names(&["p"]), ..Given::default() });
+        let found: Vec<String> = reader.fields().iter().map(|f| f.name.clone()).collect();
+        assert_eq!(found, ["p", "column1", "column2"]);
+
+        let filesystem = SimFilesystem::new();
+        let path = Path::new("/t.csv");
+        let file = filesystem.open(path, OpenMode::Create).expect("creates");
+        file.write_at(0, b"1,2\n").expect("writes");
+        drop(file);
+        let file = filesystem.open(path, OpenMode::Read).expect("opens");
+        let given = Given { names: names(&["a", "b", "c"]), ..Given::default() };
+        let Err(error) = Reader::open_with(file, "/t.csv", given) else {
+            panic!("three names for two columns are refused")
+        };
+        assert!(
+            error.message().ends_with("Number of expected columns: 3. Actual number of columns 2"),
+            "{error}"
+        );
+    }
+
+    /// The table's types are the caller's, so the advice is DuckDB's for a type that was set rather
+    /// than the sample size one it gives a type it guessed.
+    #[test]
+    fn a_bad_value_in_a_column_whose_type_was_set_gets_the_advice_for_a_set_type() {
+        let given = Given { header: Some(false), typed: true, ..Given::default() };
+        let mut reader = read_with("1,x\nfoo,y\n", given);
+        reader.retype(&[LogicalType::Integer, LogicalType::Varchar]).expect("two for two");
+        let error = all_or_error(&mut reader).unwrap_err();
+        let message = error.message();
+        assert!(message.starts_with("CSV Error on Line: 2"), "{error}");
+        assert!(message.contains("Could not convert string \"foo\" to 'INTEGER'"), "{error}");
+        assert!(
+            message.contains(
+                "Column column0 is being converted as type INTEGER\nThis type was either manually \
+                 set or derived from an existing table."
+            ),
+            "{error}"
+        );
+        assert!(!message.contains("Possible solutions"), "{error}");
     }
 
     #[test]

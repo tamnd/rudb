@@ -69,6 +69,16 @@ pub fn record(
             at += 1;
             loop {
                 let Some(&byte) = bytes.get(at) else { return Ok(None) };
+                if byte == escape && escape != quote {
+                    // An escape of its own, such as the backslash the Join Order Benchmark's
+                    // files are written with, keeps whatever byte follows it, so `\"` is a quote
+                    // in the value, `\\` is one backslash and `\n` is the letter n. That last one
+                    // looks like a line break and is not one, which is DuckDB's reading.
+                    let Some(&next) = bytes.get(at + 1) else { return Ok(None) };
+                    field.push(next);
+                    at += 2;
+                    continue;
+                }
                 if byte == escape && bytes.get(at + 1) == Some(&quote) {
                     field.push(quote);
                     at += 2;
@@ -205,10 +215,11 @@ impl Span {
         self.end & ESCAPED != 0
     }
 
-    /// Whether the field is empty, which the reader turns into a null.
+    /// Whether the field is empty, which the reader turns into a null unless it was told a
+    /// different null string.
     ///
     /// A field with an escape in it is never empty once the escape is taken out, since every escape
-    /// leaves a quote behind, so the range answers for the value.
+    /// leaves a byte behind, so the range answers for the value.
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.start() == self.end()
@@ -248,12 +259,23 @@ impl Span {
 /// escape byte followed by a quote being one quote and anything else being itself. The range ends
 /// before the closing quote, so there is no closing quote in it to be mistaken for the second half
 /// of a pair, and reading it again from the same end gives the same pairs.
+///
+/// An escape that is not the quote pairs with whatever follows it, the same as in [`record`], and
+/// the loop that found the field never ends one on a lone escape, so every escape here has a byte
+/// after it.
 fn unescape(raw: &[u8], dialect: Dialect) -> Vec<u8> {
     let quote = dialect.quote_byte();
     let escape = dialect.escape_byte();
     let mut out = Vec::with_capacity(raw.len());
     let mut at = 0;
     while let Some(&byte) = raw.get(at) {
+        if byte == escape && escape != quote {
+            if let Some(&next) = raw.get(at + 1) {
+                out.push(next);
+                at += 2;
+                continue;
+            }
+        }
         if byte == escape && raw.get(at + 1) == Some(&quote) {
             out.push(quote);
             at += 2;
@@ -556,6 +578,15 @@ fn spans(
                     out.truncate(mark);
                     return Ok(None);
                 };
+                if byte == escape && escape != quote {
+                    if at + 1 >= bytes.len() {
+                        out.truncate(mark);
+                        return Ok(None);
+                    }
+                    escaped = true;
+                    at += 2;
+                    continue;
+                }
                 if byte == escape && bytes.get(at + 1) == Some(&quote) {
                     escaped = true;
                     at += 2;
@@ -701,6 +732,21 @@ mod tests {
     fn utf8_survives_being_read_one_byte_at_a_time() {
         assert_eq!(split("a,héllo\n".as_bytes(), comma()), [["a", "héllo"]]);
     }
+
+    #[test]
+    fn a_backslash_escape_inside_quotes_keeps_whatever_byte_follows_it() {
+        // The Join Order Benchmark's files, which say `ESCAPE '\'`. DuckDB `v2.0.0-dev84237` reads
+        // `\"` as a quote, `\\` as one backslash and `\n` as the letter n, and a backslash
+        // outside quotes as a backslash.
+        let backslash = Dialect { escape: Some(b'\\'), ..comma() };
+        assert_eq!(
+            split(b"1,\"O\\\"Brien, Pat\"\n2,\"a\\\\b\",\"x\\ny\"\n3,c\\d\n", backslash),
+            vec![vec!["1", "O\"Brien, Pat"], vec!["2", "a\\b", "xny"], vec!["3", "c\\d"]]
+        );
+        // A doubled quote is not an escaped quote any more once the escape is something else.
+        let mut fields = Vec::new();
+        assert!(record(b"\"a\"\"b\"\n", 0, backslash, true, &mut fields).is_err());
+    }
 }
 
 /// The two readers held to the same answers.
@@ -842,6 +888,7 @@ mod agree {
             b"\"\"\"\"\n".to_vec(),
             b"\"a\"\"\",b\n".to_vec(),
             b"\"a\\\"b\",c\n\"a\\\\\"\n".to_vec(),
+            b"\"a\\\\b\",\"x\\ny\",\"\\\n\"\n\"a\\".to_vec(),
             b"'a,b'\t'c''d'\n".to_vec(),
             b"x\xffy,\"\xfe\"\"\"\n".to_vec(),
             "h\u{e9}llo,w\u{f6}rld\n".as_bytes().to_vec(),

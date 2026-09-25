@@ -31,13 +31,32 @@ pub(crate) struct Cells<'a> {
     pub(crate) bytes: &'a [u8],
     pub(crate) records: &'a Records,
     pub(crate) dialect: Dialect,
+    /// The strings that read as a null, or `None` for the empty one, which is the default and is
+    /// answered off the range without looking at a byte.
+    pub(crate) nulls: Option<&'a [Vec<u8>]>,
 }
 
 impl Cells<'_> {
-    /// Field `column` of row `row`, or `None` for a null, which is an empty field or one the row
-    /// is too short to have.
+    /// Field `column` of row `row`, or `None` for a null, which is a field that is one of the null
+    /// strings, an empty one unless it was told otherwise, or one the row is too short to have.
     fn at(&self, row: usize, column: usize) -> Option<Span> {
-        self.records.field(row, column).filter(|span| !span.is_empty())
+        let span = self.records.field(row, column)?;
+        match self.nulls {
+            None => (!span.is_empty()).then_some(span),
+            Some(nulls) => (!is_null(span, self.bytes, self.dialect, nulls)).then_some(span),
+        }
+    }
+}
+
+/// Whether a field is one of `nulls`, compared as the value it holds rather than as the bytes it
+/// was written with, so a quoted null is a null too.
+pub(crate) fn is_null(span: Span, bytes: &[u8], dialect: Dialect, nulls: &[Vec<u8>]) -> bool {
+    if span.escaped() {
+        let text = span.text(bytes, dialect);
+        nulls.iter().any(|null| null.as_slice() == text.as_bytes())
+    } else {
+        let raw = span.raw(bytes);
+        nulls.iter().any(|null| null.as_slice() == raw)
     }
 }
 

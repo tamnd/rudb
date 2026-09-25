@@ -28,7 +28,7 @@ pub use entrycatalog::{
     show_table_fields, table_fields, view_fields,
 };
 pub use file::{
-    Footers, csv_fields, csv_given, files, is_file, is_pattern, open_csv, open_parquet,
+    Footers, TYPES_SET, csv_fields, csv_given, files, is_file, is_pattern, open_csv, open_parquet,
     parquet_footers, parquet_outline,
 };
 pub use functioncatalog::{
