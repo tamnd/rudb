@@ -831,8 +831,13 @@ fn flat(vector: &Vector, data: &Data, sink: &mut Sink<'_>) -> bool {
         Data::Float32(held) => pass!(|row: usize| held.get(row).map(|&v| hash_real(f64::from(v)))),
         Data::Float64(held) => pass!(|row: usize| held.get(row).map(|&v| hash_real(v))),
         // A string arrives here as views into the arena. The column is read directly rather than
-        // through `Vector::bytes_at`, which asks the form and the validity again for every row.
-        Data::Varlen(held) => pass!(|row: usize| held.bytes(row).map(hash64)),
+        // through `Vector::bytes_at`, which asks the form and the validity again for every row, and
+        // the views and the arena are taken once, since reaching them through the column was a call
+        // a row that the compiler kept out of line, about a fifth of this pass on `lineitem`.
+        Data::Varlen(held) => {
+            let (views, arena) = (held.views(), held.arena());
+            pass!(|row: usize| views.get(row).and_then(|view| view.bytes_in(arena)).map(hash64))
+        }
         // An interval and an empty column. Neither has a canonical pattern written down above, and
         // inventing one here rather than in `hash_value` is how the two stop agreeing.
         _ => false,
