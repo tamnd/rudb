@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rudb_common::{LogicalType, Result, Value};
-use rudb_graph::{Degrees, Form, KeyMap, Keys, NO_PARENT, link, wire};
+use rudb_graph::{Adjacency, Degrees, Form, KeyMap, Keys, NO_PARENT, link, wire};
 use rudb_vector::Chunk;
 
 use crate::section::{self, Attachment};
@@ -264,6 +264,17 @@ pub fn build_key_map(reader: &Reader, column: usize) -> Result<KeyMap> {
 /// is what will move it, which is why the builder below takes it rather than reading this.
 pub const BUDGET_SHARE: u64 = 10;
 
+/// The share of a table's stored column bytes its adjacencies are allowed to cost together.
+///
+/// Section 3.7. Apart from `BUDGET_SHARE`, because an adjacency is a different kind of thing from
+/// a link or a key map. Those are about the size of the key column they answer for, and a tenth of
+/// the table holds several of them. An adjacency lists every child row once under its parent, so
+/// it costs a row id per child whatever the parent is: on SF1 `lineitem` that is 6 million ids of
+/// 23 bits, about 18 MB, which is more than the whole of the 10 percent share on its own. Out of the
+/// same share it can never be kept. A quarter holds two of them on `lineitem`, which is what the
+/// queries that filter `part` and `supplier` hard read, and the ranking below decides which two.
+pub const ADJACENCY_SHARE: u64 = 25;
+
 /// The size below which a table's graph sections always fit, whatever the share works out to.
 ///
 /// A percentage of the stored bytes is the right rule for a structure whose size is worth arguing
@@ -393,7 +404,7 @@ pub fn build_key_maps_within(
 /// of a payload. A section whose extent table does not checksum is counted as nothing, because it
 /// is a section that is already not there.
 fn held_bytes(reader: &Reader, replacing: &[usize]) -> Result<u64> {
-    held_bytes_except(reader, *section::KEY_MAP, replacing)
+    held_bytes_except(reader, &[*section::KEY_MAP], replacing)
 }
 
 /// The key map this table carries for a column, when it carries one this build can use.
@@ -470,6 +481,11 @@ pub struct BuiltLink {
     pub degrees: Option<Degrees>,
     /// Whether it is in the file.
     pub built: bool,
+    /// What the backward adjacency takes in the file or would have, and zero when the link is
+    /// monotone and answers that direction itself, or when there is no link.
+    pub adjacency_bytes: usize,
+    /// Whether the backward adjacency is in the file.
+    pub adjacency: bool,
     /// Why not, when not. `None` when it is.
     pub note: Option<String>,
     /// How long the build took, the reading of the child column included.
@@ -532,19 +548,23 @@ fn links_of_one_table(
     let column_bytes = child.layout().columns_total();
     let allowance = (column_bytes.saturating_mul(share) / 100).max(BUDGET_FLOOR);
     let replacing = edges.iter().map(|edge| edge.child_column).collect::<Vec<usize>>();
-    let mut spent = held_bytes_except(&child, *section::FORWARD_LINK, &replacing)?;
+    let index_allowance = (column_bytes.saturating_mul(ADJACENCY_SHARE) / 100).max(BUDGET_FLOOR);
+    let mut spent = held_bytes_except(&child, &[*section::FORWARD_LINK], &replacing)?;
+    let mut indexed = held_adjacency_bytes(&child, &replacing)?;
     let mut report = Vec::with_capacity(edges.len());
     let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(edges.len());
+    let mut adjacencies: Vec<Option<Vec<u8>>> = Vec::with_capacity(edges.len());
     for edge in edges {
         let start = Instant::now();
         match one_link(&catalog, &child, edge) {
-            Ok((built, bytes)) => {
+            Ok((built, bytes, adjacency)) => {
                 report.push(BuiltLink {
                     build: start.elapsed(),
                     table_bytes: column_bytes,
                     ..built
                 });
                 payloads.push(Some(bytes));
+                adjacencies.push(adjacency);
             }
             Err(note) => {
                 report.push(BuiltLink {
@@ -557,14 +577,23 @@ fn links_of_one_table(
                     table_bytes: column_bytes,
                     degrees: None,
                     built: false,
+                    adjacency_bytes: 0,
+                    adjacency: false,
                     note: Some(note),
                     build: start.elapsed(),
                 });
                 payloads.push(None);
+                adjacencies.push(None);
             }
         }
     }
-    let mut order = (0..report.len()).filter(|at| payloads[*at].is_some()).collect::<Vec<_>>();
+    // A link is candidate `at` and its adjacency is candidate `at` plus the number of edges, so one
+    // ranking covers both and each keeps its own place in the report.
+    let edge_count = report.len();
+    let mut order = (0..edge_count)
+        .filter(|at| payloads[*at].is_some())
+        .chain((0..edge_count).filter(|at| adjacencies[*at].is_some()).map(|at| at + edge_count))
+        .collect::<Vec<_>>();
     // Most rows saved per byte first. What a link saves is the hash table the join would build
     // without it, and a hash join builds its smaller side, so the rows saved are the smaller of the
     // child and the parent. Counting the children alone ranks every link of one table by its size
@@ -572,20 +601,46 @@ fn links_of_one_table(
     // `part`, which saves a table of 200,000 rows, over the one to `partsupp`, which saves 800,000
     // and costs a tenth more. A link over no rows is worth nothing per byte and sorts last rather
     // than dividing by zero.
+    //
+    // What an adjacency saves is different. It turns a reduction from a small set of parents into
+    // reading their children, where without it the scan tests every child row, so the rows it
+    // saves are the child rows. Adjacencies are paid for out of `ADJACENCY_SHARE` and links out of
+    // the table's allowance, so the two never compete for the same bytes, and among adjacencies of
+    // one table, which all save the same child rows, the smaller comes first.
+    let value = |at: usize| -> f64 {
+        if at < edge_count {
+            let bytes = report[at].bytes.max(1);
+            report[at].children.min(report[at].parents) as f64 / bytes as f64
+        } else {
+            let at = at - edge_count;
+            report[at].linked as f64 / report[at].adjacency_bytes.max(1) as f64
+        }
+    };
     order.sort_by(|left, right| {
-        let value = |at: &usize| -> f64 {
-            let bytes = report[*at].bytes.max(1);
-            report[*at].children.min(report[*at].parents) as f64 / bytes as f64
-        };
-        value(right).partial_cmp(&value(left)).unwrap_or(std::cmp::Ordering::Equal)
+        value(*right).partial_cmp(&value(*left)).unwrap_or(std::cmp::Ordering::Equal)
     });
     for at in order {
-        let cost = report[at].bytes as u64;
-        if spent.saturating_add(cost) <= allowance {
-            spent += cost;
-            report[at].built = true;
+        let (cost, link) = if at < edge_count {
+            (report[at].bytes as u64, true)
         } else {
-            report[at].note = Some(format!("over the budget of {allowance} bytes"));
+            (report[at - edge_count].adjacency_bytes as u64, false)
+        };
+        let fits = if link {
+            spent.saturating_add(cost) <= allowance
+        } else {
+            indexed.saturating_add(cost) <= index_allowance
+        };
+        if fits && link {
+            spent += cost;
+        } else if fits {
+            indexed += cost;
+        }
+        match (link, fits) {
+            (true, true) => report[at].built = true,
+            (true, false) => {
+                report[at].note = Some(format!("over the budget of {allowance} bytes"));
+            }
+            (false, fits) => report[at - edge_count].adjacency = fits,
         }
     }
     drop(child);
@@ -630,6 +685,26 @@ fn links_of_one_table(
     // a relationship it can resolve finds them the same way. The degrees are attached only for a
     // link that was kept: on their own they would describe a relationship the file cannot follow,
     // which is a planning hint for a plan that is not available.
+    // An adjacency stands without its link: a reduction through it starts from the parent's key
+    // map and ends at child rows, and never asks which parent a child has. One that was measured
+    // and refused gets a budget record, the same as a link.
+    for ((built, payload), adjacency) in report.iter().zip(&payloads).zip(&adjacencies) {
+        let (Some(_), Some(bytes)) = (payload, adjacency) else { continue };
+        let kept = built.adjacency;
+        attachments.push(Attachment {
+            kind: *section::ADJACENCY,
+            id: u64::try_from(built.edge.child_column)
+                .map_err(|_| invalid("column index overflow"))?,
+            flags: 0,
+            header_bytes: if kept {
+                u32::try_from(binding_bytes(&built.edge.parent))
+                    .map_err(|_| invalid("a parent name longer than a section header"))?
+            } else {
+                cost(bytes.len())
+            },
+            bytes: if kept { bytes } else { &[] },
+        });
+    }
     for (column, bytes) in &measured {
         attachments.push(Attachment {
             kind: *section::DEGREES,
@@ -643,6 +718,9 @@ fn links_of_one_table(
     Ok(report)
 }
 
+/// A built link, its payload, and the payload of its adjacency when it has one.
+type OneLink = (BuiltLink, Vec<u8>, Option<Vec<u8>>);
+
 /// Builds one link, or says in one sentence why there is not one.
 ///
 /// The error type is a `String` and not an [`rudb_common::Error`] on purpose. Every reason a link
@@ -653,7 +731,7 @@ fn one_link(
     catalog: &Catalog,
     child: &Reader,
     edge: &Edge,
-) -> std::result::Result<(BuiltLink, Vec<u8>), String> {
+) -> std::result::Result<OneLink, String> {
     let parent =
         catalog.table(&edge.parent).map_err(|_| format!("no table named {}", edge.parent))?;
     let map = parent_map(&parent, edge)?;
@@ -692,6 +770,17 @@ fn one_link(
     // half and put a histogram inside a function whose job is to choose a form.
     let degrees = Degrees::of(&parents_of, map.len(), true);
     let bytes = encode_link(&link, &parent, edge).map_err(|error| error.to_string())?;
+    // A monotone link answers the backward direction itself, so the adjacency is only for the
+    // packed form. It is built from the same slice the link was, a counting sort over it.
+    let adjacency = match link.form() {
+        link::Form::Monotone => None,
+        link::Form::Packed => {
+            let adjacency = Adjacency::build(&parents_of, map.len())
+                .and_then(|adjacency| encode_adjacency(&adjacency, &parent, edge))
+                .map_err(|error| error.to_string())?;
+            Some(adjacency)
+        }
+    };
     Ok((
         BuiltLink {
             edge: edge.clone(),
@@ -703,10 +792,13 @@ fn one_link(
             table_bytes: 0,
             degrees: Some(degrees),
             built: false,
+            adjacency_bytes: adjacency.as_ref().map_or(0, Vec::len),
+            adjacency: false,
             note: None,
             build: Duration::ZERO,
         },
         bytes,
+        adjacency,
     ))
 }
 
@@ -778,6 +870,48 @@ fn encode_link(link: &link::Link, parent: &Reader, edge: &Edge) -> Result<Vec<u8
     bytes.resize(binding_bytes(&edge.parent), 0);
     link.write(&mut bytes)?;
     Ok(bytes)
+}
+
+/// The payload of an adjacency: the same binding a link has, then the adjacency.
+///
+/// The binding is the link's for the link's reason, since an adjacency read against a parent that
+/// has been rewritten names children of rows that are not the rows the key map now gives.
+fn encode_adjacency(adjacency: &Adjacency, parent: &Reader, edge: &Edge) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(binding_bytes(&edge.parent) + adjacency.bytes() + 32);
+    let name = edge.parent.as_bytes();
+    bytes.extend_from_slice(&parent.table().generation().to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(edge.parent_column)
+            .map_err(|_| invalid("column index overflow"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u32::try_from(name.len())
+            .map_err(|_| invalid("a parent name longer than a u32"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(name);
+    bytes.resize(binding_bytes(&edge.parent), 0);
+    adjacency.write(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// The backward adjacency this child table carries for a column, under the same rules as
+/// [`stored_link`]: current, bound to the parent being asked about, and readable, or nothing.
+#[must_use]
+pub fn stored_adjacency(child: &Reader, parent: &Reader, edge: &Edge) -> Option<Adjacency> {
+    let table = child.table();
+    let id = u64::try_from(edge.child_column).ok()?;
+    let held = table
+        .sections()
+        .iter()
+        .find(|section| section.kind == *section::ADJACENCY && section.id == id)?;
+    if !held.usable(table.generation()) || held.refused().is_some() {
+        return None;
+    }
+    let bytes = child.payload(held).ok()?;
+    let binding = bound(&bytes, parent, edge)?;
+    Adjacency::read(&bytes[binding..]).ok()
 }
 
 /// The forward link this child table carries for a column, when it carries one this build can use
@@ -916,15 +1050,34 @@ fn refused(reader: &Reader, kind: [u8; 8], id: usize) -> Option<(u8, u64)> {
 }
 
 /// What the table's sections of one kind cost, leaving out the ids this build is replacing.
-fn held_bytes_except(reader: &Reader, kind: [u8; 8], replacing: &[usize]) -> Result<u64> {
+fn held_bytes_except(reader: &Reader, kinds: &[[u8; 8]], replacing: &[usize]) -> Result<u64> {
     let mut total = 0;
     for held in reader.table().sections() {
-        if !held.among(section::GRAPH_KINDS) {
+        if !held.among(section::GRAPH_KINDS) || held.kind == *section::ADJACENCY {
             continue;
         }
-        let replaced =
-            held.kind == kind && replacing.iter().any(|&id| u64::try_from(id) == Ok(held.id));
+        let replaced = kinds.contains(&held.kind)
+            && replacing.iter().any(|&id| u64::try_from(id) == Ok(held.id));
         if replaced || !held.usable(reader.table().generation()) {
+            continue;
+        }
+        let Ok(extents) = reader.extents(held) else { continue };
+        total += extents.iter().map(|extent| u64::from(extent.length)).sum::<u64>();
+    }
+    Ok(total)
+}
+
+/// The bytes the adjacencies of a table already hold, leaving out the columns about to be rebuilt.
+///
+/// Adjacencies are paid for out of their own share, so they are counted apart from the other
+/// graph sections and `held_bytes_except` leaves them out.
+fn held_adjacency_bytes(reader: &Reader, replacing: &[usize]) -> Result<u64> {
+    let mut total = 0;
+    for held in reader.table().sections() {
+        if held.kind != *section::ADJACENCY || !held.usable(reader.table().generation()) {
+            continue;
+        }
+        if replacing.iter().any(|&id| u64::try_from(id) == Ok(held.id)) {
             continue;
         }
         let Ok(extents) = reader.extents(held) else { continue };
@@ -1569,6 +1722,36 @@ mod tests {
         let link = stored_link(&child, &parent, &edge()).expect("the link is kept");
         assert_eq!(link.linked(), 100);
         assert_eq!(link.forward(99), Some(99));
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_packed_link_leaves_the_children_of_every_parent_beside_it() {
+        // Six children a parent, scattered, so the link is packed and the lists are not ranges.
+        let foreign = (0..6000_i64).map(|child| Some((child * 7) % 1000 + 1)).collect::<Vec<_>>();
+        let path = related("adjacency", 1000, &foreign);
+        let report = build_links(&path, &[edge()]).expect("build");
+        assert_eq!(report[0].form, Some(link::Form::Packed));
+        assert!(report[0].adjacency, "a packed link's adjacency fits the floor");
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let child = catalog.table("child").expect("the child");
+        let parent = catalog.table("parent").expect("the parent");
+        let adjacency = stored_adjacency(&child, &parent, &edge()).expect("it is in the file");
+        assert_eq!(
+            (adjacency.children(), adjacency.parents(), adjacency.edges()),
+            (6000, 1000, 6000)
+        );
+        let mut listed = Vec::new();
+        for held in [0_u64, 1, 500, 999] {
+            listed.clear();
+            adjacency.children_of(held, &mut listed).expect("a parent in range");
+            let slow = (0..6000_u64).filter(|&at| (at * 7) % 1000 == held).collect::<Vec<_>>();
+            assert_eq!(listed, slow, "parent {held}");
+        }
+        let wrong = Edge { parent: "child".into(), ..edge() };
+        assert!(stored_adjacency(&child, &parent, &wrong).is_none(), "a different parent name");
 
         fs::remove_file(&path).expect("clean up");
     }

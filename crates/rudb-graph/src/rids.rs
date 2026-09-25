@@ -503,7 +503,19 @@ impl Rids {
                     .collect()
             }
             Body::Dense { words, .. } => {
-                (first..end).filter(|&rid| bit(words, rid)).map(offset).collect()
+                let mut out = Vec::new();
+                let mut at = first;
+                while at < end {
+                    let word = words.get(index(at / 64)).copied().unwrap_or(0) >> (at % 64);
+                    let span = (64 - at % 64).min(end - at);
+                    let mut bits = if span == 64 { word } else { word & ((1 << span) - 1) };
+                    while bits != 0 {
+                        out.push(offset(at + u64::from(bits.trailing_zeros())));
+                        bits &= bits - 1;
+                    }
+                    at += span;
+                }
+                out
             }
         }
     }
@@ -690,6 +702,24 @@ mod tests {
     /// The members of a set, the slow way, for comparing against.
     fn members(rids: &Rids) -> Vec<Rid> {
         (0..rids.rows()).filter(|&rid| rids.contains(rid)).collect()
+    }
+
+    #[test]
+    fn the_offsets_of_a_bitmap_are_its_members_in_the_range() {
+        let rows = 5000;
+        let members: Vec<Rid> = (0..rows).filter(|rid| rid % 3 == 0 || rid % 64 == 63).collect();
+        let set = Rids::from_sorted(rows, members.clone()).expect("sorted");
+        assert_eq!(set.form(), Form::Dense);
+        for (first, len) in [(0, 64), (1, 63), (63, 2), (100, 1000), (4990, 64), (0, 5000), (7, 0)]
+        {
+            let slow = members
+                .iter()
+                .filter(|&&rid| rid >= first && rid < first + len)
+                .map(|&rid| u32::try_from(rid - first).expect("small"))
+                .collect::<Vec<_>>();
+            let len = usize::try_from(len).expect("small");
+            assert_eq!(set.offsets_in(first, len), slow, "from {first} for {len}");
+        }
     }
 
     #[test]

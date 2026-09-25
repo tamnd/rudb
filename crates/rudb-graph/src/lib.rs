@@ -30,6 +30,7 @@
 //! forward link is a restatement of a foreign key column. Neither adds a fact, which is exactly why
 //! neither can be missed when it is gone.
 
+pub mod adjacency;
 pub mod bits;
 pub mod degree;
 pub mod keymap;
@@ -39,6 +40,7 @@ pub mod rid;
 pub mod rids;
 pub mod wire;
 
+pub use adjacency::Adjacency;
 pub use bits::BitVector;
 pub use degree::{BUCKETS, Degrees};
 pub use keymap::{DENSE_THRESHOLD, Form, KeyMap, Keys, Observed};
