@@ -8,14 +8,18 @@
 //! meet a node or a type they would have to refuse halfway through writing code for it.
 //!
 //! What C1 accepts is what ClickBench needs: scans, filters, projections, grouped and ungrouped
-//! aggregates, sorts, top N and limits, literal rows, and the late materialisation fetch. Every
-//! other node is a refusal that names it, which is how the refusal log says what C2 has to add.
+//! aggregates, sorts, top N and limits, literal rows, and the late materialisation fetch, plus the
+//! inner equi-join of section 10.5 that the join benchmarks need first. Every other node is a
+//! refusal that names it, which is how the refusal log says what C2 has to add.
 
 use std::fmt;
 
+pub use rudb_plan::BuildSide;
+
 use rudb_common::{LogicalType, PhysicalType, Value};
 use rudb_plan::{
-    Bound, ColumnBinding, CompareOp, ConjunctionOp, Expr as PlanExpr, ExprRef, Node, NodeRef, Plan,
+    Bound, ColumnBinding, CompareOp, ConjunctionOp, Expr as PlanExpr, ExprRef, JoinKind, Node,
+    NodeRef, Plan,
 };
 
 /// Why the compiled engine will not run a query.
@@ -288,6 +292,24 @@ pub enum Rel {
         /// The output columns.
         columns: Vec<Column>,
     },
+    /// An inner equi-join by a hash table, fused into the pipelines per section 10.5 of
+    /// `spec/compiler/10-joins.md`: the build side fills the table and the other side probes it
+    /// inline. The output is the left columns and then the right ones, whichever side builds.
+    Join {
+        /// The left input.
+        left: Box<Rel>,
+        /// The right input.
+        right: Box<Rel>,
+        /// Which input fills the table.
+        build: BuildSide,
+        /// The equalities, each a key over the left input's columns and one over the right
+        /// input's, both of the same type. There is at least one.
+        keys: Vec<(Expr, Expr)>,
+        /// The rest of the condition, over the output columns, all of which must be true.
+        residual: Vec<Expr>,
+        /// The output columns.
+        columns: Vec<Column>,
+    },
 }
 
 impl Rel {
@@ -299,7 +321,8 @@ impl Rel {
             | Rel::Values { columns, .. }
             | Rel::Project { columns, .. }
             | Rel::Aggregate { columns, .. }
-            | Rel::Fetch { columns, .. } => columns,
+            | Rel::Fetch { columns, .. }
+            | Rel::Join { columns, .. } => columns,
             Rel::Filter { input, .. }
             | Rel::Sort { input, .. }
             | Rel::TopN { input, .. }
@@ -320,6 +343,7 @@ impl Rel {
             Rel::TopN { .. } => "TopN",
             Rel::Limit { .. } => "Limit",
             Rel::Fetch { .. } => "Fetch",
+            Rel::Join { .. } => "HashJoin",
         }
     }
 }
@@ -510,6 +534,32 @@ impl Lower<'_> {
                 let bindings = numbered(index, columns.len());
                 Ok((Rel::Fetch { input: Box::new(input), node: at, row, columns }, bindings))
             }
+            Node::Join { left, right, kind, conditions, build } => {
+                if kind != JoinKind::Inner {
+                    return Err(Refusal::new(
+                        format!("Join {}", kind.keyword()),
+                        "only inner joins are compiled so far",
+                    ));
+                }
+                let (left, lb) = self.node(left)?;
+                let (right, rb) = self.node(right)?;
+                let bindings: Bindings = lb.iter().chain(&rb).copied().collect();
+                let mut conjuncts = Vec::new();
+                for c in plan.expr_list(conditions) {
+                    flatten(self.expr(*c, &bindings)?, &mut conjuncts);
+                }
+                let (keys, residual) = split(conjuncts, lb.len(), right.columns())?;
+                let columns = left.columns().iter().chain(right.columns()).cloned().collect();
+                let rel = Rel::Join {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    build,
+                    keys,
+                    residual,
+                    columns,
+                };
+                Ok((rel, bindings))
+            }
             other => Err(Refusal::new(
                 node_name(&other),
                 "the compiled engine has no translator for this operator yet",
@@ -638,6 +688,75 @@ fn check_type(ty: &LogicalType) -> Result<()> {
     }
 }
 
+/// A join key over the left input and the matching one over the right.
+type KeyPair = (Expr, Expr);
+
+/// Adds the conjuncts of `e` to `out`, looking through nested `AND`s.
+fn flatten(e: Expr, out: &mut Vec<Expr>) {
+    match e.kind {
+        Kind::And(children) => children.into_iter().for_each(|c| flatten(c, out)),
+        kind => out.push(Expr { kind, ty: e.ty }),
+    }
+}
+
+/// Splits a join condition over the left columns and then the right ones into the key pairs a
+/// hash join looks up by and the rest. An equality is a key when one side reads only left columns
+/// and the other only right columns, and both read at least one. The right key is rebased onto the
+/// right input's own columns.
+fn split(conjuncts: Vec<Expr>, left: usize, right: &[Column]) -> Result<(Vec<KeyPair>, Vec<Expr>)> {
+    let side = |e: &Expr| {
+        let cs = e.columns();
+        if cs.is_empty() {
+            None
+        } else if cs.iter().all(|&c| c < left) {
+            Some(false)
+        } else if cs.iter().all(|&c| c >= left) {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    let rebase: Vec<Expr> = (0..left)
+        .map(|_| Expr { kind: Kind::Constant(Value::Null), ty: LogicalType::Null })
+        .chain(right.iter().enumerate().map(|(i, c)| Expr::column(i, c.ty.clone())))
+        .collect();
+    let mut keys = Vec::new();
+    let mut residual = Vec::new();
+    for c in conjuncts {
+        if let Kind::Compare { op: CompareOp::Equal, left: a, right: b } = &c.kind {
+            let pair = match (side(a), side(b)) {
+                (Some(false), Some(true)) => Some((a, b)),
+                (Some(true), Some(false)) => Some((b, a)),
+                _ => None,
+            };
+            if let Some((l, r)) = pair {
+                if l.ty != r.ty {
+                    return Err(Refusal::new(
+                        "Join",
+                        format!("a key compares {} with {}", l.ty, r.ty),
+                    ));
+                }
+                if matches!(l.ty.physical(), PhysicalType::Float32 | PhysicalType::Float64) {
+                    return Err(Refusal::new(
+                        "Join",
+                        format!(
+                            "a key of type {}, which the table would compare by its bits",
+                            l.ty
+                        ),
+                    ));
+                }
+                keys.push(((**l).clone(), r.substitute(&rebase)));
+                continue;
+            }
+        }
+        residual.push(c);
+    }
+    if keys.is_empty() {
+        return Err(Refusal::new("Join", "the condition has no equality between the two sides"));
+    }
+    Ok((keys, residual))
+}
+
 fn node_name(node: &Node) -> String {
     let text = format!("{node:?}");
     text.split([' ', '{', '(']).next().unwrap_or("node").to_owned()
@@ -683,6 +802,41 @@ mod tests {
             Err(r) => assert_eq!(r.what, "Distinct"),
             Ok(rel) => panic!("{rel:?} was accepted"),
         }
+    }
+
+    #[test]
+    fn an_inner_equi_join_splits_its_condition_into_keys_and_the_rest() {
+        let rel = lowered(concat!(
+            "Join INNER on=[(#0.0::INTEGER = #1.1::INTEGER)::BOOLEAN, ",
+            "(#1.0::VARCHAR = #0.1::VARCHAR)::BOOLEAN, (#0.0::INTEGER < #1.1::INTEGER)::BOOLEAN] ",
+            "build=left\n",
+            "  Get memory.main.l AS l #0 [a::INTEGER, s::VARCHAR]\n",
+            "  Get memory.main.r AS r #1 [s::VARCHAR, b::INTEGER]\n",
+        ))
+        .unwrap();
+        let Rel::Join { keys, residual, build, columns, .. } = &rel else { panic!("{rel:?}") };
+        assert_eq!(*build, BuildSide::Left);
+        assert_eq!(columns.len(), 4);
+        let pairs: Vec<_> = keys.iter().map(|(l, r)| (l.columns(), r.columns())).collect();
+        assert_eq!(pairs, [(vec![0], vec![1]), (vec![1], vec![0])]);
+        assert_eq!(residual.len(), 1);
+        assert_eq!(residual[0].columns(), [0, 3]);
+        assert_eq!(rel.name(), "HashJoin");
+    }
+
+    #[test]
+    fn joins_the_generator_cannot_run_are_refused_with_a_reason() {
+        let what = |text: &str| lowered(text).map(|r| format!("{r:?}")).unwrap_err().what;
+        let scans = concat!(
+            "  Get memory.main.l AS l #0 [a::INTEGER, f::DOUBLE]\n",
+            "  Get memory.main.r AS r #1 [a::INTEGER, f::DOUBLE]\n",
+        );
+        let left = format!("Join LEFT on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n{scans}");
+        assert_eq!(what(&left), "Join LEFT");
+        let theta = format!("Join INNER on=[(#0.0::INTEGER < #1.0::INTEGER)::BOOLEAN]\n{scans}");
+        assert_eq!(what(&theta), "Join");
+        let float = format!("Join INNER on=[(#0.1::DOUBLE = #1.1::DOUBLE)::BOOLEAN]\n{scans}");
+        assert_eq!(what(&float), "Join");
     }
 
     #[test]

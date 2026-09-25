@@ -1,11 +1,18 @@
 //! Pipelines, per `spec/compiler/05-pipelines-and-state.md`.
 //!
 //! [`split`] cuts a [`Rel`] tree at its breakers and returns the stages in the order they run. A
-//! [`Pipeline`] is a source, the filters that apply to it and a sink. The filters and projections
-//! between a source and the next breaker are folded into it by substitution, so a filter above a
-//! projection becomes a filter over the source's columns and the sink's expressions read the source
-//! directly. Nothing between two breakers is left as an operator of its own, which is the point of
-//! compiling a pipeline: one loop over the rows of a morsel, with no chunk in between.
+//! [`Pipeline`] is a source, the operators that apply to it in order and a sink. The filters and
+//! projections between a source and the next breaker are folded into it by substitution, so a
+//! filter above a projection becomes a filter over the source's columns and the sink's expressions
+//! read the source directly. Nothing between two breakers is left as an operator of its own, which
+//! is the point of compiling a pipeline: one loop over the rows of a morsel, with no chunk in
+//! between.
+//!
+//! A hash join is the fused join of section 10.5 of `spec/compiler/10-joins.md`. Its build side is
+//! a pipeline of its own that ends in a [`Sink::Build`], and the side that probes carries on as the
+//! same pipeline with an [`Op::Probe`] in it, which looks each row up and runs the rest of the
+//! pipeline once per match. The columns a match brings are numbered after the source's, so an
+//! expression past a probe reads them like any other column.
 //!
 //! The breakers are the aggregate, which is a sink, and the sort, top N, limit and fetch, which in
 //! C1 are stages of their own over the rows the pipeline before them produced. They are few rows
@@ -13,16 +20,16 @@
 //!
 //! The stages form the graph of section 5.2: [`Graph::edges`] lists which stage waits for which,
 //! and every edge in C1 is a [`EdgeKind::Finalize`] edge, because a stage only ever reads what an
-//! earlier one finished. Each pipeline runs as the steps of section 5.4, which [`Pipeline::steps`]
-//! derives from the kinds of its state slots, and every step starts from a state whose first line
-//! is a [`StateHeader`]. C1 runs every pipeline on one worker, so no pipeline has a merge step and
-//! its local state is its shared state.
+//! earlier one finished, a join table included. Each pipeline runs as the steps of section 5.4,
+//! which [`Pipeline::steps`] derives from the kinds of its state slots, and every step starts from
+//! a state whose first line is a [`StateHeader`]. C1 runs every pipeline on one worker, so no
+//! pipeline has a merge step and its local state is its shared state.
 
 use std::fmt;
 
 use rudb_common::Value;
 use rudb_plan::NodeRef;
-use rudb_qc_plan::{Aggregate, Column, Expr, Key, Kind, Rel};
+use rudb_qc_plan::{Aggregate, BuildSide, Column, Expr, Key, Kind, Rel};
 
 pub use rudb_qc_ir::status::Status;
 pub use rudb_qc_rt::abi::StateHeader;
@@ -77,6 +84,15 @@ pub enum Sink {
         /// Their names and types.
         columns: Vec<Column>,
     },
+    /// The build side of a hash join: every row whose keys are all valid goes into the table.
+    Build {
+        /// The key expressions, over the source's columns.
+        keys: Vec<Expr>,
+        /// The columns a match hands the probe, over the source's columns.
+        payload: Vec<Expr>,
+        /// Their names and types.
+        columns: Vec<Column>,
+    },
     /// A hash aggregate. The output is the groups and then the aggregates.
     Aggregate {
         /// The group expressions, over the source's columns.
@@ -88,13 +104,37 @@ pub enum Sink {
     },
 }
 
+/// A lookup of each row in a join table a build pipeline filled.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Probe {
+    /// The stage whose [`Sink::Build`] filled the table.
+    pub build: usize,
+    /// The key expressions, over the pipeline's columns so far, in the order of the build's.
+    pub keys: Vec<Expr>,
+    /// The number the first payload column gets. The payload columns come after the source's
+    /// and after those of every probe before this one.
+    pub first: usize,
+    /// The payload columns.
+    pub columns: Vec<Column>,
+}
+
+/// One operator between a pipeline's source and its sink.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Op {
+    /// A predicate the row has to pass.
+    Filter(Expr),
+    /// A join probe. What follows runs once per match, and a row with none goes no further.
+    Probe(Probe),
+}
+
 /// One compiled loop.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pipeline {
     /// Where the rows come from.
     pub source: Source,
-    /// The predicates a row has to pass, in order, over the source's columns.
-    pub filters: Vec<Expr>,
+    /// The operators a row goes through, in order. An expression in one reads the source's
+    /// columns and the payload of the probes before it.
+    pub ops: Vec<Op>,
     /// Where the rows go.
     pub sink: Sink,
 }
@@ -108,6 +148,10 @@ pub enum SlotKind {
     AggTable,
     /// The accumulators of an aggregate with no groups.
     ScalarAcc,
+    /// The join table a build fills.
+    HtBuild,
+    /// What a probe reads of a join table another pipeline built.
+    HtProbe,
 }
 
 /// One of the steps a pipeline runs as, per section 5.4. Every step has the same signature, a
@@ -133,11 +177,33 @@ impl Pipeline {
     /// The state slots the pipeline writes, in the order they are laid out.
     #[must_use]
     pub fn slots(&self) -> Vec<SlotKind> {
-        match &self.sink {
-            Sink::Result { .. } => vec![SlotKind::ResultSink],
-            Sink::Aggregate { groups, .. } if groups.is_empty() => vec![SlotKind::ScalarAcc],
-            Sink::Aggregate { .. } => vec![SlotKind::AggTable],
+        let mut slots = vec![match &self.sink {
+            Sink::Result { .. } => SlotKind::ResultSink,
+            Sink::Build { .. } => SlotKind::HtBuild,
+            Sink::Aggregate { groups, .. } if groups.is_empty() => SlotKind::ScalarAcc,
+            Sink::Aggregate { .. } => SlotKind::AggTable,
+        }];
+        slots.extend(self.probes().map(|_| SlotKind::HtProbe));
+        slots
+    }
+
+    /// The probes, in order.
+    pub fn probes(&self) -> impl Iterator<Item = &Probe> {
+        self.ops.iter().filter_map(|op| match op {
+            Op::Probe(p) => Some(p),
+            Op::Filter(_) => None,
+        })
+    }
+
+    /// The source's columns and then the payload of every probe: what an expression in the
+    /// sink reads.
+    #[must_use]
+    pub fn columns(&self) -> Vec<Column> {
+        let mut out = self.source.columns().to_vec();
+        for p in self.probes() {
+            out.extend(p.columns.iter().cloned());
         }
+        out
     }
 
     /// The steps the pipeline runs, in order, from its slots and [`DOP`].
@@ -155,7 +221,10 @@ impl Pipeline {
         if DOP > 1 {
             steps.push(Step::Merge);
         }
-        if slots.iter().any(|s| matches!(s, SlotKind::AggTable | SlotKind::ScalarAcc)) {
+        if slots
+            .iter()
+            .any(|s| matches!(s, SlotKind::AggTable | SlotKind::ScalarAcc | SlotKind::HtBuild))
+        {
             steps.push(Step::Finalize);
         }
         steps
@@ -241,7 +310,9 @@ impl Stage {
     pub fn columns(&self) -> &[Column] {
         match self {
             Stage::Pipeline(p) => match &p.sink {
-                Sink::Result { columns, .. } | Sink::Aggregate { columns, .. } => columns,
+                Sink::Result { columns, .. }
+                | Sink::Build { columns, .. }
+                | Sink::Aggregate { columns, .. } => columns,
             },
             Stage::Sort { columns, .. }
             | Stage::TopN { columns, .. }
@@ -250,14 +321,18 @@ impl Stage {
         }
     }
 
-    /// The stages this one reads.
+    /// The stages this one reads: the one its rows come from and the builds its probes read.
     #[must_use]
     pub fn inputs(&self) -> Vec<usize> {
         match self {
-            Stage::Pipeline(p) => match &p.source {
-                Source::Stage { stage, .. } => vec![*stage],
-                Source::Scan { .. } | Source::Values { .. } => Vec::new(),
-            },
+            Stage::Pipeline(p) => {
+                let mut out = match &p.source {
+                    Source::Stage { stage, .. } => vec![*stage],
+                    Source::Scan { .. } | Source::Values { .. } => Vec::new(),
+                };
+                out.extend(p.probes().map(|probe| probe.build));
+                out
+            }
             Stage::Sort { input, .. }
             | Stage::TopN { input, .. }
             | Stage::Limit { input, .. }
@@ -313,10 +388,12 @@ pub fn split(rel: &Rel) -> Graph {
 /// A pipeline still being built: a source and what has been folded into it so far.
 struct Open {
     source: Source,
-    filters: Vec<Expr>,
-    /// The current columns, as expressions over the source's.
+    ops: Vec<Op>,
+    /// The current columns, as expressions over the source's and the probes' payload.
     exprs: Vec<Expr>,
     columns: Vec<Column>,
+    /// How many columns the source and the probes so far give.
+    width: usize,
 }
 
 impl Open {
@@ -324,7 +401,8 @@ impl Open {
         let columns = source.columns().to_vec();
         let exprs =
             columns.iter().enumerate().map(|(i, c)| Expr::column(i, c.ty.clone())).collect();
-        Open { source, filters: Vec::new(), exprs, columns }
+        let width = columns.len();
+        Open { source, ops: Vec::new(), exprs, columns, width }
     }
 
     fn is_identity(&self) -> bool {
@@ -343,16 +421,12 @@ impl Graph {
     /// Ends a pipeline with a result sink, and returns its stage.
     fn close(&mut self, open: Open) -> usize {
         if let Source::Stage { stage, .. } = open.source {
-            if open.filters.is_empty() && open.is_identity() {
+            if open.ops.is_empty() && open.is_identity() {
                 return stage;
             }
         }
         let sink = Sink::Result { exprs: open.exprs, columns: open.columns };
-        self.stages.push(Stage::Pipeline(Pipeline {
-            source: open.source,
-            filters: open.filters,
-            sink,
-        }));
+        self.stages.push(Stage::Pipeline(Pipeline { source: open.source, ops: open.ops, sink }));
         self.stages.len() - 1
     }
 
@@ -369,7 +443,7 @@ impl Graph {
             Rel::Filter { input, predicate } => {
                 let mut open = self.open(input);
                 let predicate = predicate.substitute(&open.exprs);
-                conjuncts(predicate, &mut open.filters);
+                filters(predicate, &mut open.ops);
                 open
             }
             Rel::Project { input, exprs, columns } => {
@@ -392,7 +466,7 @@ impl Graph {
                     })
                     .collect();
                 let sink = Sink::Aggregate { groups, aggregates, columns: columns.clone() };
-                let p = Pipeline { source: open.source, filters: open.filters, sink };
+                let p = Pipeline { source: open.source, ops: open.ops, sink };
                 self.push(Stage::Pipeline(p))
             }
             Rel::Sort { input, keys } => {
@@ -419,6 +493,51 @@ impl Graph {
                 let input = self.close(open);
                 self.push(Stage::Limit { input, count: *count, offset: *offset, columns })
             }
+            Rel::Join { left, right, build, keys, residual, columns } => {
+                let (built, probing) = match build {
+                    BuildSide::Right => (right, left),
+                    BuildSide::Left => (left, right),
+                };
+                let side = |k: &(Expr, Expr)| match build {
+                    BuildSide::Right => (k.1.clone(), k.0.clone()),
+                    BuildSide::Left => (k.0.clone(), k.1.clone()),
+                };
+                let (build_keys, probe_keys): (Vec<Expr>, Vec<Expr>) =
+                    keys.iter().map(side).unzip();
+                let b = self.open(built);
+                let sink = Sink::Build {
+                    keys: build_keys.iter().map(|k| k.substitute(&b.exprs)).collect(),
+                    payload: b.exprs,
+                    columns: b.columns.clone(),
+                };
+                self.stages.push(Stage::Pipeline(Pipeline { source: b.source, ops: b.ops, sink }));
+                let stage = self.stages.len() - 1;
+                let mut open = self.open(probing);
+                let first = open.width;
+                open.width += b.columns.len();
+                let payload: Vec<Expr> = b
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(j, c)| Expr::column(first + j, c.ty.clone()))
+                    .collect();
+                open.ops.push(Op::Probe(Probe {
+                    build: stage,
+                    keys: probe_keys.iter().map(|k| k.substitute(&open.exprs)).collect(),
+                    first,
+                    columns: b.columns,
+                }));
+                open.exprs = match build {
+                    BuildSide::Right => open.exprs.into_iter().chain(payload).collect(),
+                    BuildSide::Left => payload.into_iter().chain(open.exprs).collect(),
+                };
+                open.columns = columns.clone();
+                for r in residual {
+                    let r = r.substitute(&open.exprs);
+                    filters(r, &mut open.ops);
+                }
+                open
+            }
             Rel::Fetch { input, node, row, columns } => {
                 let open = self.open(input);
                 let input = self.close(open);
@@ -433,10 +552,11 @@ impl Graph {
     }
 }
 
-fn conjuncts(e: Expr, out: &mut Vec<Expr>) {
+/// Adds a filter per conjunct of `e`.
+fn filters(e: Expr, out: &mut Vec<Op>) {
     match e.kind {
-        Kind::And(children) => children.into_iter().for_each(|c| conjuncts(c, out)),
-        kind => out.push(Expr { kind, ty: e.ty }),
+        Kind::And(children) => children.into_iter().for_each(|c| filters(c, out)),
+        kind => out.push(Op::Filter(Expr { kind, ty: e.ty })),
     }
 }
 
@@ -452,6 +572,11 @@ impl fmt::Display for Graph {
                     };
                     let to = match &p.sink {
                         Sink::Result { exprs, .. } => format!("{} columns out", exprs.len()),
+                        Sink::Build { keys, payload, .. } => format!(
+                            "join table by {} keys holding {} columns",
+                            keys.len(),
+                            payload.len()
+                        ),
                         Sink::Aggregate { groups, aggregates, .. } => {
                             format!(
                                 "aggregate by {} keys into {} accumulators",
@@ -460,11 +585,12 @@ impl fmt::Display for Graph {
                             )
                         }
                     };
-                    writeln!(
-                        f,
-                        "stage {i}: pipeline from {from}, {} filters, {to}",
-                        p.filters.len()
-                    )?;
+                    let filters = p.ops.iter().filter(|op| matches!(op, Op::Filter(_))).count();
+                    let mut ops = vec![format!("{filters} filters")];
+                    for probe in p.probes() {
+                        ops.push(format!("probe stage {}", probe.build));
+                    }
+                    writeln!(f, "stage {i}: pipeline from {from}, {}, {to}", ops.join(", "))?;
                 }
                 Stage::Sort { input, keys, .. } => {
                     writeln!(f, "stage {i}: sort stage {input} by {} keys", keys.len())?
@@ -514,7 +640,7 @@ mod tests {
         ));
         assert_eq!(g.stages.len(), 2, "{g}");
         let Stage::Pipeline(agg) = &g.stages[0] else { panic!("{g}") };
-        assert_eq!(agg.filters.len(), 1);
+        assert!(matches!(agg.ops[..], [Op::Filter(_)]));
         assert_eq!(agg.slots(), [SlotKind::AggTable]);
         assert_eq!(agg.steps(), [Step::Init, Step::Body, Step::Finalize]);
         assert_eq!(g.edges(), [Edge { from: 0, to: 1, kind: EdgeKind::Finalize }]);
@@ -534,8 +660,53 @@ mod tests {
         let Stage::Pipeline(p) = &g.stages[0] else { panic!("{g}") };
         assert_eq!(p.steps(), [Step::Init, Step::Body]);
         assert!(g.edges().is_empty());
-        let Kind::Compare { left, .. } = &p.filters[0].kind else { panic!("{g}") };
+        let Op::Filter(filter) = &p.ops[0] else { panic!("{g}") };
+        let Kind::Compare { left, .. } = &filter.kind else { panic!("{g}") };
         assert!(matches!(&left.kind, Kind::Function { name, .. } if name == "+"));
         assert_eq!(left.columns(), [0]);
+    }
+
+    #[test]
+    fn a_join_builds_one_side_and_probes_it_inline_on_the_other() {
+        let g = graph(concat!(
+            "Aggregate #3 groups=[] aggregates=[count_star()::BIGINT]\n",
+            "  Filter (#0.1::INTEGER < #1.1::INTEGER)::BOOLEAN\n",
+            "    Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+            "      Get memory.main.l AS l #0 [a::INTEGER, x::INTEGER]\n",
+            "      Get memory.main.r AS r #1 [a::INTEGER, y::INTEGER]\n",
+        ));
+        assert_eq!(g.stages.len(), 2, "{g}");
+        let Stage::Pipeline(build) = &g.stages[0] else { panic!("{g}") };
+        assert!(matches!(&build.source, Source::Scan { table, .. } if table.ends_with(".r")));
+        assert!(matches!(&build.sink, Sink::Build { keys, payload, .. }
+            if keys.len() == 1 && payload.len() == 2));
+        assert_eq!(build.slots(), [SlotKind::HtBuild]);
+        assert_eq!(build.steps(), [Step::Init, Step::Body, Step::Finalize]);
+        let Stage::Pipeline(probe) = &g.stages[1] else { panic!("{g}") };
+        assert_eq!(probe.slots(), [SlotKind::ScalarAcc, SlotKind::HtProbe]);
+        let [Op::Probe(p), Op::Filter(f)] = &probe.ops[..] else { panic!("{g}") };
+        assert_eq!((p.build, p.first), (0, 2));
+        assert_eq!(p.keys[0].columns(), [0]);
+        // The filter reads the probe side's second column and the build side's second, which is
+        // the second payload column.
+        assert_eq!(f.columns(), [1, 3]);
+        assert_eq!(probe.columns().len(), 4);
+        assert_eq!(g.edges(), [Edge { from: 0, to: 1, kind: EdgeKind::Finalize }]);
+        assert!(g.to_string().contains("probe stage 0"), "{g}");
+    }
+
+    #[test]
+    fn a_join_that_builds_on_its_left_keeps_the_columns_in_order() {
+        let g = graph(concat!(
+            "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN] build=left\n",
+            "  Get memory.main.l AS l #0 [a::INTEGER, x::VARCHAR]\n",
+            "  Get memory.main.r AS r #1 [a::INTEGER]\n",
+        ));
+        let Stage::Pipeline(probe) = &g.stages[1] else { panic!("{g}") };
+        assert!(matches!(&probe.source, Source::Scan { table, .. } if table.ends_with(".r")));
+        let Sink::Result { exprs, columns } = &probe.sink else { panic!("{g}") };
+        let read: Vec<_> = exprs.iter().map(Expr::columns).collect();
+        assert_eq!(read, [vec![1], vec![2], vec![0]]);
+        assert_eq!(columns[1].name, "x");
     }
 }

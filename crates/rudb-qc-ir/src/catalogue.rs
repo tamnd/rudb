@@ -63,6 +63,8 @@ proxies! {
     // Hash tables and aggregation state. The first argument is the handle of the table or the
     // distinct set, the second the group row `ht_insert` returned.
     "ht_insert" (Ptr, Ptr, I64) -> Ptr, mayfail, effect;
+    // A join build appends the record in its state and the record's hash to the table.
+    "jt_append" (Ptr, Ptr, I64) -> Void, mayfail, effect;
     "agg_distinct" (Ptr, Ptr, Str16) -> Void, mayfail, effect;
     "agg_distinct_int" (Ptr, Ptr, I128) -> Void, mayfail, effect;
     "agg_min_str" (Ptr, Str16) -> Void, mayfail, effect;
