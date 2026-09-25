@@ -171,3 +171,23 @@ fn every_tier_the_build_has_answers_what_the_first_engine_answers() {
     assert!(error.contains("auto, interp, clif"), "{error}");
     assert_eq!(database.refusals(), Vec::<String>::new());
 }
+
+#[test]
+fn switching_tiers_at_every_morsel_answers_what_one_tier_answers() {
+    let database = database();
+    let sql = "SELECT s, count(*), sum(x), max(x) FROM t GROUP BY s ORDER BY s NULLS FIRST";
+    database.execute("SET engine = 'compiled'").expect("the compiled engine");
+    database.execute("SET qc_tier = 'interp'").expect("interp");
+    let alone = rows(&database, sql);
+    for switch in ["every:1", "random:3", "off"] {
+        database.execute(&format!("SET qc_switch = '{switch}'")).expect("a switch");
+        assert_eq!(database.setting("qc_switch").expect("qc_switch reads back"), switch);
+        if cfg!(feature = "qc-clif") {
+            database.execute("SET qc_tier = 'clif'").expect("clif");
+        }
+        assert_eq!(rows(&database, sql), alone, "{switch}");
+    }
+    let error = database.execute("SET qc_switch = 'every:0'").expect_err("no such switch");
+    assert!(error.to_string().contains("every:<n>"), "{error}");
+    assert_eq!(database.refusals(), Vec::<String>::new());
+}

@@ -296,6 +296,9 @@ fn usage() {
     println!("                         --tier auto|interp|clif first picks the compiled engine's");
     println!("                         tier, and --suite <dir> <q> in place of the file runs the");
     println!("                         queries in q over the tables refusals would make from dir");
+    println!("                         --tiers <seed> in place of --tier runs every query on");
+    println!("                         interp, on clif and on clif switching tiers at random");
+    println!("                         morsels, at threads 1, and wants the rows bit for bit");
     println!("  refusals <dir> <q>     every query in q, a .sql file with -- qNN headers or a");
     println!("                         directory of .sql files, through EXPLAIN (CODEGEN) over");
     println!("                         tables made from the parquet files in dir, with the");

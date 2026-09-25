@@ -38,7 +38,7 @@ use rudb_vector::Chunk;
 
 use crate::feed::Feed;
 use crate::tier::Tiers;
-pub use crate::tier::{Options, Report, Tier};
+pub use crate::tier::{Options, Report, Switch, Switches, Tier};
 
 /// A query the compiled engine has agreed to run.
 #[derive(Debug)]
@@ -58,6 +58,8 @@ pub struct Answer {
     pub types: Vec<LogicalType>,
     /// The rows.
     pub chunks: Vec<Chunk>,
+    /// How many times the query moved between the tiers, which only `SET qc_switch` makes it do.
+    pub switches: Switches,
 }
 
 /// Compiles an optimized plan, or says why the compiled engine will not run it.
@@ -86,7 +88,7 @@ pub fn compile_with(
     check(&graph)?;
     let mut rt = Rt::new(cancel.clone());
     let query = rudb_qc_gen::generate(&graph, &mut rt)?;
-    let tiers = Tiers::new(&query.module, options.tier);
+    let tiers = Tiers::new(&query.module, options);
     Ok(Compiled { graph, query, tiers, rt })
 }
 
@@ -206,6 +208,7 @@ impl Compiled {
             names: columns.iter().map(|c| c.name.clone()).collect(),
             types: columns.iter().map(|c| c.ty.clone()).collect(),
             chunks,
+            switches: self.tiers.switches(),
         })
     }
 }

@@ -61,34 +61,40 @@ fn rows(chunks: &[Chunk]) -> Vec<Vec<Value>> {
 }
 
 /// The compiled engine's rows, which every tier this build has must agree on to the bit, with
-/// every function of the module compiled by the tiers that compile.
+/// every function of the module compiled by the tiers that compile, and again with the query moved
+/// between the tiers at every morsel and at random ones.
 fn compiled(text: &str) -> Result<Vec<Vec<Value>>> {
-    let mut answers: Vec<(Tier, Result<Vec<Vec<Value>>>)> = Vec::new();
-    for tier in [Tier::Interp, Tier::Clif].into_iter().filter(|t| t.built()) {
-        let answer = on(text, tier);
+    let mut runs = vec![Options { tier: Tier::Interp, switch: Switch::Off }];
+    if Tier::Clif.built() {
+        for switch in [Switch::Off, Switch::Every(1), Switch::Random(7)] {
+            runs.push(Options { tier: Tier::Clif, switch });
+        }
+    }
+    let mut answers: Vec<(Options, Result<Vec<Vec<Value>>>)> = Vec::new();
+    for options in runs {
+        let answer = on(text, options);
         if let Some((first, earlier)) = answers.first() {
             let same = match (earlier, &answer) {
                 (Ok(a), Ok(b)) => format!("{a:?}") == format!("{b:?}"),
                 (Err(a), Err(b)) => a.to_string() == b.to_string() && a.code() == b.code(),
                 _ => false,
             };
-            assert!(same, "{tier} gave {answer:?} and {first} gave {earlier:?}");
+            assert!(same, "{options:?} gave {answer:?} and {first:?} gave {earlier:?}");
         }
-        answers.push((tier, answer));
+        answers.push((options, answer));
     }
     answers.swap_remove(0).1
 }
 
 /// The compiled engine's rows on one tier.
-fn on(text: &str, tier: Tier) -> Result<Vec<Vec<Value>>> {
+fn on(text: &str, options: Options) -> Result<Vec<Vec<Value>>> {
     let catalog = catalog();
     let plan = Plan::parse(text).expect("a well formed plan");
     let cancel = Cancel::new();
     let pool = Pool::default();
-    let compiled =
-        compile_with(&plan, &cancel, Options { tier }).expect("the compiled engine takes it");
+    let compiled = compile_with(&plan, &cancel, options).expect("the compiled engine takes it");
     let report = compiled.report();
-    if tier == Tier::Clif {
+    if options.tier == Tier::Clif {
         assert_eq!(report.native, report.functions, "{report}");
     }
     let memory = Memory::unlimited();

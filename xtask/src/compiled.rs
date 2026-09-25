@@ -11,7 +11,8 @@
 //!
 //! `--tier` picks the tier the compiled engine runs on, which is how C2's exit criterion, the same
 //! answers on `clif`, is checked, and `--suite` points the same comparison at TPC-H or JOB: the
-//! tables and the queries are read the way `cargo xtask refusals` reads them.
+//! tables and the queries are read the way `cargo xtask refusals` reads them. `--tiers <seed>` is
+//! the tier against tier differential of section 15.3: see [`tiers`].
 //!
 //! Rows are compared as sorted lists, because a query with no `ORDER BY` has no order to hold
 //! either engine to, and a double is compared to a relative 1e-9 because two engines adding the
@@ -36,17 +37,27 @@ const FIXUP: &str = "* REPLACE (make_date(EventDate) AS EventDate, epoch_ms(Even
 
 pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let usage = || {
-        "usage: cargo xtask compiled [--tier auto|interp|clif] <file.parquet> [q1 q2 ...]\n       \
-         cargo xtask compiled [--tier auto|interp|clif] --suite <parquet dir> <queries> [q1 ...]"
+        "usage: cargo xtask compiled [--tier auto|interp|clif | --tiers <seed>] <file.parquet> \
+         [q1 q2 ...]\n       \
+         cargo xtask compiled [--tier auto|interp|clif | --tiers <seed>] --suite <parquet dir> \
+         <queries> [q1 ...]"
             .to_string()
     };
     let mut args = args;
     let mut tier = "auto".to_string();
-    if let [flag, name, rest @ ..] = args
-        && flag == "--tier"
-    {
-        tier = name.clone();
-        args = rest;
+    let mut seed = None;
+    if let [flag, value, rest @ ..] = args {
+        match flag.as_str() {
+            "--tier" => tier = value.clone(),
+            "--tiers" => {
+                seed = Some(value.parse::<u64>().map_err(|e| format!("--tiers {value}: {e}"))?);
+                tier = "clif".to_string();
+            }
+            _ => {}
+        }
+        if seed.is_some() || flag == "--tier" {
+            args = rest;
+        }
     }
     let database = Database::new();
     // The tier is set before anything runs, so a build without it fails here and not after a
@@ -85,6 +96,9 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         _ => return Err(usage()),
     };
     let only: Vec<&str> = only.iter().map(String::as_str).collect();
+    if let Some(seed) = seed {
+        return tiers(&database, &queries, &only, seed);
+    }
     println!("tier    {tier}");
     println!();
     println!("{:<5} {:>9} {:>9}  verdict", "query", "first", "compiled");
@@ -154,6 +168,101 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         println!("{name} compiled: {compiled}");
     }
     if wrong.is_empty() { Ok(()) } else { Err(format!("{} queries differ", wrong.len())) }
+}
+
+/// The tier differential of `spec/compiler/15-correctness.md` section 15.3: every query on
+/// `interp`, on `clif`, and on `clif` with switches back and forth at random morsels, one thread,
+/// and the three answers the same to the bit and in the same order.
+///
+/// The switches are drawn from `seed` plus the query's place in the list, so a failure names the
+/// setting that brings it back. Rows are compared through their `Debug` text, which writes a double
+/// with every bit that tells it apart, `-0.0` included. How many switches landed in an aggregate or
+/// a join build, where state lives from one morsel to the next, is printed per query, and a run
+/// where none landed anywhere fails, because then it tested nothing.
+fn tiers(
+    database: &Database,
+    queries: &[(String, String)],
+    only: &[&str],
+    seed: u64,
+) -> Result<(), String> {
+    let set = |sql: &str| database.execute(sql).map(|_| ()).map_err(|e| format!("{sql}: {e}"));
+    set("SET threads = 1")?;
+    set("SET engine = 'compiled'")?;
+    println!("tiers   interp, clif, clif with qc_switch random:{seed}+n, threads 1");
+    println!();
+    println!(
+        "{:<5} {:>9} {:>9} {:>9} {:>9} {:>9}  verdict",
+        "query", "interp", "clif", "switched", "in aggr", "in build"
+    );
+    let (mut same, mut refused, mut wrong) = (0, 0, Vec::new());
+    let start = database.tier_switches();
+    for (n, (name, sql)) in queries.iter().enumerate() {
+        if !only.is_empty() && !only.contains(&name.as_str()) {
+            continue;
+        }
+        let logged = database.refusals().len();
+        let mut runs = Vec::new();
+        let before = database.tier_switches();
+        for (tier, switch) in [
+            ("interp", "off".to_string()),
+            ("clif", "off".to_string()),
+            ("clif", format!("random:{}", seed.wrapping_add(n as u64))),
+        ] {
+            set(&format!("SET qc_tier = '{tier}'"))?;
+            set(&format!("SET qc_switch = '{switch}'"))?;
+            let began = Instant::now();
+            let rows: Result<Vec<Vec<Value>>, String> =
+                database.query(sql).map(|r| r.rows().collect()).map_err(|e| e.to_string());
+            runs.push((format!("{rows:?}"), began.elapsed().as_secs_f64(), switch));
+        }
+        set("SET qc_switch = 'off'")?;
+        let after = database.tier_switches();
+        let (aggregate, build) = (after.aggregate - before.aggregate, after.build - before.build);
+        let switched = after.total() - before.total();
+        let verdict = if database.refusals().len() > logged {
+            refused += 1;
+            "refused".to_string()
+        } else if runs.iter().all(|r| r.0 == runs[0].0) {
+            same += 1;
+            "same".to_string()
+        } else {
+            let odd: Vec<String> = runs[1..]
+                .iter()
+                .filter(|r| r.0 != runs[0].0)
+                .map(|r| format!("clif, qc_switch {}", r.2))
+                .collect();
+            wrong.push((name.clone(), runs[0].0.clone(), odd.join(" and ")));
+            format!("differ on {}", odd.join(" and "))
+        };
+        println!(
+            "{name:<5} {:>8.3}s {:>8.3}s {:>8.3}s {switched:>9} {aggregate:>9} {build:>9}  {verdict}",
+            runs[0].1, runs[1].1, runs[2].1
+        );
+    }
+    println!();
+    println!("same {same}, refused {refused}, differ {}", wrong.len());
+    let end = database.tier_switches();
+    let (result, aggregate, build) =
+        (end.result - start.result, end.aggregate - start.aggregate, end.build - start.build);
+    println!(
+        "switches {} in all: {} producing rows, {} in an aggregate, {} in a join build",
+        result + aggregate + build,
+        result,
+        aggregate,
+        build
+    );
+    for (name, interp, which) in &wrong {
+        println!();
+        println!("{name} interp: {}", interp.chars().take(400).collect::<String>());
+        println!("{name} differs on {which}");
+    }
+    if !wrong.is_empty() {
+        return Err(format!("{} queries differ between the tiers", wrong.len()));
+    }
+    if same > 0 && result + aggregate + build == 0 {
+        return Err("no switch landed in any query, so the differential tested nothing".into());
+    }
+    Ok(())
 }
 
 /// What one engine said about one query.
