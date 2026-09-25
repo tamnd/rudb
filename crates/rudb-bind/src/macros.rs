@@ -11,8 +11,8 @@
 //! The `list_` aggregates are `crate::listaggr`, `list_append` and its five relatives are in
 //! `crate::expr`, and `if` and `nullif` bind as the CASE they stand for. The json macros wait for a
 //! JSON type, `md5_number_lower` and `md5_number_upper` wait for BIT, `days_in_month` waits for
-//! `last_day`, `split_part` waits for `string_split`, and `generate_subscripts` and
-//! `regexp_split_to_table` wait for `unnest` in an expression.
+//! `last_day`, and `generate_subscripts` and `regexp_split_to_table` wait for `unnest` in an
+//! expression.
 
 use rudb_common::{Error, Result};
 use rudb_parse::{Ast, Kind, ast, deparse, parse_ast_with_case, tokenize};
@@ -70,6 +70,12 @@ const MACROS: &[Macro] = &[
     define("fmod", &["x", "y"], "(x - (y * floor((x / y))))"),
     define("geomean", &["x"], "exp(avg(ln(x)))"),
     define("geometric_mean", &["x"], "geomean(x)"),
+    define(
+        "split_part",
+        &["string", "delimiter", "position"],
+        "\"if\"(((string IS NOT NULL) AND (\"delimiter\" IS NOT NULL) AND (\"position\" IS NOT \
+         NULL)), COALESCE(string_split(string, \"delimiter\")[\"position\"], ''), NULL)",
+    ),
     define("wavg", &["value", "weight"], "weighted_avg(\"value\", weight)"),
     define(
         "weighted_avg",

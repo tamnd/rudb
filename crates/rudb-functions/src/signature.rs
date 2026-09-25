@@ -355,6 +355,8 @@ enum Fixed {
     Interval,
     /// The type of a bare `NULL`, which is what `setseed` answers.
     Null,
+    /// `VARCHAR[]`, which is what the splits answer.
+    VarcharList,
 }
 
 impl Fixed {
@@ -375,6 +377,7 @@ impl Fixed {
             Self::TimestampTz => LogicalType::TimestampTz,
             Self::Interval => LogicalType::Interval,
             Self::Null => LogicalType::Null,
+            Self::VarcharList => LogicalType::list(LogicalType::Varchar),
         }
     }
 }
@@ -780,6 +783,15 @@ const TABLE: &[Entry] = &[
     text("regexp_replace", Arity::between(3, 4), Fixed::Varchar),
     text("regexp_matches", Arity::between(2, 3), Fixed::Boolean),
     text("regexp_full_match", Arity::between(2, 3), Fixed::Boolean),
+    // The splits, under every name the pin answers to. A null separator is not a null answer, which
+    // is in `rudb_kernels::split`.
+    text("string_split", Arity::exactly(2), Fixed::VarcharList),
+    text("str_split", Arity::exactly(2), Fixed::VarcharList),
+    text("string_to_array", Arity::exactly(2), Fixed::VarcharList),
+    text("split", Arity::exactly(2), Fixed::VarcharList),
+    text("string_split_regex", Arity::between(2, 3), Fixed::VarcharList),
+    text("str_split_regex", Arity::between(2, 3), Fixed::VarcharList),
+    text("regexp_split_to_array", Arity::between(2, 3), Fixed::VarcharList),
     Entry {
         name: "regexp_extract",
         kind: FunctionKind::Scalar,
@@ -2230,6 +2242,32 @@ const CANDIDATES: &[(&str, &[&str])] = &[
             "regexp_full_match(string VARCHAR, regex VARCHAR, \"options\" VARCHAR) -> BOOLEAN",
         ],
     ),
+    // The splits list their arguments as `col0` here, though `duckdb_functions()` names them.
+    ("string_split", &["string_split(col0 VARCHAR, col1 VARCHAR) -> VARCHAR[]"]),
+    ("str_split", &["str_split(col0 VARCHAR, col1 VARCHAR) -> VARCHAR[]"]),
+    ("string_to_array", &["string_to_array(col0 VARCHAR, col1 VARCHAR) -> VARCHAR[]"]),
+    ("split", &["split(col0 VARCHAR, col1 VARCHAR) -> VARCHAR[]"]),
+    (
+        "string_split_regex",
+        &[
+            "string_split_regex(col0 VARCHAR, col1 VARCHAR) -> VARCHAR[]",
+            "string_split_regex(col0 VARCHAR, col1 VARCHAR, col2 VARCHAR) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "str_split_regex",
+        &[
+            "str_split_regex(col0 VARCHAR, col1 VARCHAR) -> VARCHAR[]",
+            "str_split_regex(col0 VARCHAR, col1 VARCHAR, col2 VARCHAR) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "regexp_split_to_array",
+        &[
+            "regexp_split_to_array(col0 VARCHAR, col1 VARCHAR) -> VARCHAR[]",
+            "regexp_split_to_array(col0 VARCHAR, col1 VARCHAR, col2 VARCHAR) -> VARCHAR[]",
+        ],
+    ),
     // Both overloads of each interval constructor, including the BIGINT one this engine does not
     // have a row for, because the list is what DuckDB accepts and somebody reading it is being told
     // what to write rather than what is built here.
@@ -2626,6 +2664,7 @@ impl Fixed {
             Self::TimestampTz => "TIMESTAMP WITH TIME ZONE",
             Self::Interval => "INTERVAL",
             Self::Null => "\"NULL\"",
+            Self::VarcharList => "VARCHAR[]",
         }
     }
 }

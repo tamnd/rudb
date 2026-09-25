@@ -65,6 +65,7 @@ use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
 use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
 use crate::shape::{first, identity, nulls_of, single};
+use crate::split;
 use crate::structs;
 use crate::subscript;
 use crate::text;
@@ -3226,6 +3227,10 @@ pub fn call_values(
         return answer;
     }
     if let Some(answer) = maps::before_nulls(name, args, returns) {
+        return answer;
+    }
+    // The splits answer a null separator with the whole string, and refuse a null option string.
+    if let Some(answer) = split::before_nulls(name, args) {
         return answer;
     }
     if args.iter().any(Value::is_null) {

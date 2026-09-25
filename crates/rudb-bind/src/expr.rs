@@ -1720,6 +1720,9 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             if (starred || empty) && rudb_catalog::same_name(written, "count") {
                 return format!("count_star(){}", named_filter(ast, filter, semantics));
             }
+            if let Some(name) = subscript_name(ast, expr, written, args, semantics) {
+                return name;
+            }
             // The name goes to lower case, which is the one place a spelling from the query is not
             // kept. DuckDB's parser folds a function name as it reads it and the name it prints
             // here is the folded one, so `SELECT SUM(x)` comes back as a column called `sum(x)`.
@@ -1996,6 +1999,41 @@ fn whole_number(ast: &Ast, expr: ast::ExprRef) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The name of `x[i]` or `x[a:b]`, which the pin keeps in the brackets it was written in, where
+/// a written `array_extract(x, i)` keeps its own name.
+///
+/// The parser turns both into the call, so the brackets are read off the spans. A subscript begins
+/// where its target does and a call begins at its name, and a bound the parser filled in, the `1`
+/// of `x[:2]` or the `-1` of `x[2:]`, spans the whole subscript rather than any text of its own,
+/// so it is left out of the name the way it was left out of the query.
+fn subscript_name(
+    ast: &Ast,
+    call: ast::ExprRef,
+    written: &str,
+    args: ast::Slice,
+    semantics: Semantics,
+) -> Option<String> {
+    let (&target, bounds) = ast.expr_list(args).split_first()?;
+    let span = ast.expr_span(call);
+    if !matches!(written, "array_extract" | "array_slice")
+        || span.start != ast.expr_span(target).start
+    {
+        return None;
+    }
+    let bounds: Vec<String> = bounds
+        .iter()
+        .map(|&bound| {
+            if ast.expr_span(bound) == span {
+                String::new()
+            } else {
+                describe(ast, bound, semantics)
+            }
+        })
+        .collect();
+    let separator = if written == "array_slice" { ":" } else { "" };
+    Some(format!("{}[{}]", describe(ast, target, semantics), bounds.join(separator)))
 }
 
 /// The name of a number, which is the value it stands for printed the way the pin prints it.
