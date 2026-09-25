@@ -45,10 +45,10 @@ impl Binder<'_> {
     /// `SET schema = s1` and `SET disabled_optimizers = expression_rewriter`.
     pub(crate) fn bind_setting_value(&mut self, ast: &Ast, expr: ast::ExprRef) -> Result<ExprRef> {
         self.clause = "SET statement";
-        if let ast::Expr::Column { name } = ast.expr(expr) {
-            if let Some(last) = ast.name(name).last() {
-                return Ok(self.add_constant(Value::Varchar(last.to_string())));
-            }
+        if let ast::Expr::Column { name } = ast.expr(expr)
+            && let Some(last) = ast.name(name).last()
+        {
+            return Ok(self.add_constant(Value::Varchar(last.to_string())));
         }
         self.bind_expr(ast, expr, &Scope::empty())
     }
@@ -359,10 +359,10 @@ impl Binder<'_> {
         for binding in read {
             if outer_scope.columns.iter().any(|column| column.binding == binding) {
                 correlations.push(binding);
-            } else if let Some(enclosing) = self.correlations.last_mut() {
-                if !enclosing.contains(&binding) {
-                    enclosing.push(binding);
-                }
+            } else if let Some(enclosing) = self.correlations.last_mut()
+                && !enclosing.contains(&binding)
+            {
+                enclosing.push(binding);
             }
         }
         let nested_subqueries = std::mem::take(&mut self.scalar_subqueries);
@@ -409,22 +409,22 @@ impl Binder<'_> {
     fn bind_column_parts(&mut self, parts: &[&str], scope: &Scope) -> Result<ExprRef> {
         // A lambda parameter beats a column of the same name, so `lambda l: l + 1` over a table with
         // a column `l` reads the element. The innermost lambda that has the name is the one meant.
-        if let [word] = parts {
-            if let Some(parameter) = self.lambda_parameter(word) {
-                return Ok(parameter);
-            }
+        if let [word] = parts
+            && let Some(parameter) = self.lambda_parameter(word)
+        {
+            return Ok(parameter);
         }
         // A bare `current_date` is one of the ten session context keywords, and a column of that
         // name beats it. The scope is asked whether anything answers to the word before the fold
         // rather than the fold happening when resolution fails, so that two tables carrying the name
         // is still the ambiguity error. Both halves were measured against the pin. See
         // `crate::context`.
-        if let [word] = parts {
-            if !scope.names(word) && !self.outer_scopes.iter().any(|outer| outer.names(word)) {
-                if let Some(folded) = self.context_keyword(word) {
-                    return Ok(folded);
-                }
-            }
+        if let [word] = parts
+            && !scope.names(word)
+            && !self.outer_scopes.iter().any(|outer| outer.names(word))
+            && let Some(folded) = self.context_keyword(word)
+        {
+            return Ok(folded);
         }
         if let Some(found) = scope.resolve_optional(parts)? {
             return Ok(self.add_expr(Expr::Column(found.binding), found.ty.clone()));
@@ -450,10 +450,10 @@ impl Binder<'_> {
         if self.in_aggregate && self.lateral_scopes.contains(&at) {
             return Err(Error::binder("LATERAL join cannot contain aggregates!"));
         }
-        if let Some(correlations) = self.correlations.last_mut() {
-            if !correlations.contains(&binding) {
-                correlations.push(binding);
-            }
+        if let Some(correlations) = self.correlations.last_mut()
+            && !correlations.contains(&binding)
+        {
+            correlations.push(binding);
         }
         Ok(self.add_expr(Expr::Column(binding), ty))
     }
@@ -541,11 +541,11 @@ impl Binder<'_> {
     ) -> Result<ExprRef> {
         // A negated number literal is one constant rather than a call, so that -2147483648 is an
         // INTEGER the way it is written and not a negation of a BIGINT.
-        if op == UnaryOp::Negate {
-            if let ast::Expr::Literal { kind: LiteralKind::Number, text } = ast.expr(operand) {
-                let value = number(ast.string(text), true)?;
-                return Ok(self.add_constant(value));
-            }
+        if op == UnaryOp::Negate
+            && let ast::Expr::Literal { kind: LiteralKind::Number, text } = ast.expr(operand)
+        {
+            let value = number(ast.string(text), true)?;
+            return Ok(self.add_constant(value));
         }
         let bound = self.bind_expr(ast, operand, scope)?;
         match op {
@@ -674,6 +674,7 @@ impl Binder<'_> {
         if negated { self.call("not", vec![matched]) } else { Ok(matched) }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_call(
         &mut self,
         ast: &Ast,
@@ -797,25 +798,27 @@ impl Binder<'_> {
         // ANY, so there is no type for a plan to carry until the name is read. Upstream folds it
         // too, which an `EXPLAIN` of a query that calls it shows. A call this cannot fold falls
         // through to the table, which refuses it in upstream's words.
-        if rudb_catalog::same_name(&written, "current_setting") && bound.len() == 1 {
-            if let Some(folded) = self.setting(bound[0])? {
-                return Ok(folded);
-            }
+        if rudb_catalog::same_name(&written, "current_setting")
+            && bound.len() == 1
+            && let Some(folded) = self.setting(bound[0])?
+        {
+            return Ok(folded);
         }
-        if rudb_catalog::same_name(&written, "current_schemas") && bound.len() == 1 {
-            if let Some(folded) = self.current_schemas(bound[0])? {
-                return Ok(folded);
-            }
+        if rudb_catalog::same_name(&written, "current_schemas")
+            && bound.len() == 1
+            && let Some(folded) = self.current_schemas(bound[0])?
+        {
+            return Ok(folded);
         }
         // The session context functions are the third group the binder answers, and they fold for
         // the reason the pin marks them `CONSISTENT_WITHIN_QUERY`: the answer is settled when the
         // statement starts and no row changes it. A call with arguments is not one of these and
         // falls through to the table, which has a row per name so that `now(1)` is the arity error
         // rather than a missing function. See `crate::context`.
-        if bound.is_empty() {
-            if let Some(folded) = self.context_call(&written) {
-                return Ok(folded);
-            }
+        if bound.is_empty()
+            && let Some(folded) = self.context_call(&written)
+        {
+            return Ok(folded);
         }
         // The one argument form measures from the session-local date at the start of the
         // statement. Insert that date here so the ordinary two-moment kernel remains free of a

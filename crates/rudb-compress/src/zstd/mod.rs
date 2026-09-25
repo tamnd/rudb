@@ -150,13 +150,13 @@ fn frame<'a>(input: &'a [u8], out: &mut Vec<u8>) -> Result<&'a [u8]> {
         }
     }
 
-    if let Some(size) = head.content {
-        if (out.len() - from) as u64 != size {
-            return Err(Error::io(format!(
-                "a zstd frame that says it holds {size} bytes and produced {}",
-                out.len() - from
-            )));
-        }
+    if let Some(size) = head.content
+        && (out.len() - from) as u64 != size
+    {
+        return Err(Error::io(format!(
+            "a zstd frame that says it holds {size} bytes and produced {}",
+            out.len() - from
+        )));
     }
     if head.checked {
         let written = word(rest, 0, 4)? as u32;

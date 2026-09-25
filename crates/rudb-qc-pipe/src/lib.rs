@@ -420,10 +420,11 @@ impl Graph {
 
     /// Ends a pipeline with a result sink, and returns its stage.
     fn close(&mut self, open: Open) -> usize {
-        if let Source::Stage { stage, .. } = open.source {
-            if open.ops.is_empty() && open.is_identity() {
-                return stage;
-            }
+        if let Source::Stage { stage, .. } = open.source
+            && open.ops.is_empty()
+            && open.is_identity()
+        {
+            return stage;
         }
         let sink = Sink::Result { exprs: open.exprs, columns: open.columns };
         self.stages.push(Stage::Pipeline(Pipeline { source: open.source, ops: open.ops, sink }));

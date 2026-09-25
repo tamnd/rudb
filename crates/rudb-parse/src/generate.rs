@@ -550,7 +550,7 @@ impl Random {
     }
 
     fn chance(&mut self, one_in: u64) -> bool {
-        self.next() % one_in == 0
+        self.next().is_multiple_of(one_in)
     }
 
     fn pick<T: Copy>(&mut self, from: &[T]) -> T {

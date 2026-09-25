@@ -456,31 +456,28 @@ impl Catalog {
                 }
                 continue;
             }
-            if entry.catalog.is_empty() {
-                if let Ok(database) = self.database(&entry.schema) {
-                    if let Some(main) = database.schemas.first() {
-                        entry.catalog = database.name.clone();
-                        entry.schema = main.name.clone();
-                        continue;
-                    }
-                }
+            if entry.catalog.is_empty()
+                && let Ok(database) = self.database(&entry.schema)
+                && let Some(main) = database.schemas.first()
+            {
+                entry.catalog = database.name.clone();
+                entry.schema = main.name.clone();
+                continue;
             }
             return Err(Error::catalog(format!(
                 "{set}: No catalog + schema named \"{}\" found.",
                 entry.text()
             )));
         }
-        if one {
-            if let Some(entry) = entries.first() {
-                if same_name(&entry.catalog, TEMP_CATALOG)
-                    || same_name(&entry.catalog, SYSTEM_CATALOG)
-                {
-                    return Err(Error::catalog(format!(
-                        "{set} cannot be set to internal schema \"{}\"",
-                        entry.catalog
-                    )));
-                }
-            }
+        if one
+            && let Some(entry) = entries.first()
+            && (same_name(&entry.catalog, TEMP_CATALOG)
+                || same_name(&entry.catalog, SYSTEM_CATALOG))
+        {
+            return Err(Error::catalog(format!(
+                "{set} cannot be set to internal schema \"{}\"",
+                entry.catalog
+            )));
         }
         self.search = entries;
         Ok(())
@@ -717,15 +714,15 @@ impl Catalog {
         // is in, which is the one `USE` last named, and the pin does nothing to a later entry of
         // the path that pointed at the dropped schema.
         let current = self.search.first().map(|entry| self.searched(entry));
-        if let Some((held, schema)) = current {
-            if same_name(&held, catalog) && same_name(&schema, name) {
-                // The pin writes the path back as a bare `main` rather than clearing it, so the
-                // setting reads `main` where a session that never set it reads empty.
-                let catalog =
-                    if same_name(&held, &self.default_catalog) { String::new() } else { held };
-                self.search =
-                    vec![crate::SearchEntry { catalog, schema: DEFAULT_SCHEMA.to_string() }];
-            }
+        if let Some((held, schema)) = current
+            && same_name(&held, catalog)
+            && same_name(&schema, name)
+        {
+            // The pin writes the path back as a bare `main` rather than clearing it, so the
+            // setting reads `main` where a session that never set it reads empty.
+            let catalog =
+                if same_name(&held, &self.default_catalog) { String::new() } else { held };
+            self.search = vec![crate::SearchEntry { catalog, schema: DEFAULT_SCHEMA.to_string() }];
         }
         Ok(())
     }
@@ -971,14 +968,13 @@ impl Catalog {
             )));
         }
         for candidate in self.candidates(parts)? {
-            if let Ok(schema) = self.schema(&candidate.catalog, &candidate.schema) {
-                if let Some(held) = schema
+            if let Ok(schema) = self.schema(&candidate.catalog, &candidate.schema)
+                && let Some(held) = schema
                     .sequences
                     .iter()
                     .find(|held| same_name(&held.name.table, &candidate.table))
-                {
-                    return Ok(held.name.clone());
-                }
+            {
+                return Ok(held.name.clone());
             }
         }
         Err(Error::catalog(format!(
@@ -1192,12 +1188,12 @@ impl Catalog {
             )));
         }
         self.changed();
-        if let Ok(table) = self.table_mut(&owner) {
-            if !table.sequences().contains(name) {
-                let mut sequences = table.sequences().to_vec();
-                sequences.push(name.clone());
-                table.set_sequences(sequences);
-            }
+        if let Ok(table) = self.table_mut(&owner)
+            && !table.sequences().contains(name)
+        {
+            let mut sequences = table.sequences().to_vec();
+            sequences.push(name.clone());
+            table.set_sequences(sequences);
         }
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
         if let Some(sequence) =

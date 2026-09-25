@@ -73,12 +73,13 @@ pub fn prune(plan: &mut Plan) {
 /// the arena only asks that a node's children sit behind it, which a node with no children does
 /// however early its slot is.
 fn walk(plan: &mut Plan, at: NodeRef) {
-    if !already_empty(plan, at) && empty(plan, at) {
-        if let Some((index, columns)) = columns_of(plan, at) {
-            let rows = plan.add_rows(&[]);
-            *plan.node_mut(at) = Node::Values { index, columns, rows };
-            return;
-        }
+    if !already_empty(plan, at)
+        && empty(plan, at)
+        && let Some((index, columns)) = columns_of(plan, at)
+    {
+        let rows = plan.add_rows(&[]);
+        *plan.node_mut(at) = Node::Values { index, columns, rows };
+        return;
     }
     for child in plan.node(at).children().into_iter().flatten() {
         walk(plan, child);

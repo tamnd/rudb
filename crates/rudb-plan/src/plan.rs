@@ -1457,37 +1457,31 @@ impl Plan {
         // would emit and the reader would misread as a scalar function, which is a wrong answer
         // rather than an error.
         for (expr, aggregate_allowed, window_allowed) in self.top_level_exprs(node) {
-            if window_allowed {
-                if let Expr::Window { args, filter, order, .. } = *self.expr(expr) {
-                    let keys: Vec<ExprRef> =
-                        self.sort_key_list(order).iter().map(|key| key.expr).collect();
-                    let nested =
-                        self.expr_list(args).iter().chain(filter.iter()).chain(keys.iter()).any(
-                            |&child| {
-                                self.reaches_a_window(child) || self.reaches_an_aggregate(child)
-                            },
-                        );
-                    if nested {
-                        return fail("has a window or aggregate inside a window function");
-                    }
-                    continue;
+            if window_allowed && let Expr::Window { args, filter, order, .. } = *self.expr(expr) {
+                let keys: Vec<ExprRef> =
+                    self.sort_key_list(order).iter().map(|key| key.expr).collect();
+                let nested =
+                    self.expr_list(args).iter().chain(filter.iter()).chain(keys.iter()).any(
+                        |&child| self.reaches_a_window(child) || self.reaches_an_aggregate(child),
+                    );
+                if nested {
+                    return fail("has a window or aggregate inside a window function");
                 }
+                continue;
             }
             if self.reaches_a_window(expr) {
                 return fail("has a window function outside a window list");
             }
-            if aggregate_allowed {
-                if let Expr::Aggregate { args, filter, .. } = *self.expr(expr) {
-                    let nested = self
-                        .expr_list(args)
-                        .iter()
-                        .chain(filter.iter())
-                        .any(|&child| self.reaches_an_aggregate(child));
-                    if nested {
-                        return fail("has an aggregate inside an aggregate");
-                    }
-                    continue;
+            if aggregate_allowed && let Expr::Aggregate { args, filter, .. } = *self.expr(expr) {
+                let nested = self
+                    .expr_list(args)
+                    .iter()
+                    .chain(filter.iter())
+                    .any(|&child| self.reaches_an_aggregate(child));
+                if nested {
+                    return fail("has an aggregate inside an aggregate");
                 }
+                continue;
             }
             if self.reaches_an_aggregate(expr) {
                 return fail("has an aggregate outside an aggregate list");

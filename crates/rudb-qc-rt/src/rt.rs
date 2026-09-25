@@ -18,7 +18,7 @@ use crate::mem;
 use crate::table::{Distinct, GroupTable, read_u128};
 use crate::text::{self, Heap};
 
-/// The error site payload that means the runtime failed and [`Rt::error`] says why.
+/// The error site payload that means the runtime failed and `Rt::error` says why.
 pub const RUNTIME_ERROR: u64 = 0xff_ffff;
 
 /// A first engine kernel over `n` rows of the buffers a `vcall` passes.

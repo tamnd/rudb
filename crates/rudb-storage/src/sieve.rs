@@ -756,7 +756,7 @@ fn words(out: &mut Vec<u8>, held: &[u64]) {
 
 /// Reads a whole slice of bytes back as words, or `None` when it is not a whole number of them.
 fn read_words(bytes: &[u8]) -> Option<Vec<u64>> {
-    if bytes.len() % 8 != 0 {
+    if !bytes.len().is_multiple_of(8) {
         return None;
     }
     let mut held = Vec::with_capacity(bytes.len() / 8);

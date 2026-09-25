@@ -85,11 +85,11 @@ impl Cfg {
                         Some(q) => intersect(&idom, &order, p, q),
                     });
                 }
-                if let Some(d) = new {
-                    if idom[b.index()] != d {
-                        idom[b.index()] = d;
-                        changed = true;
-                    }
+                if let Some(d) = new
+                    && idom[b.index()] != d
+                {
+                    idom[b.index()] = d;
+                    changed = true;
                 }
             }
         }

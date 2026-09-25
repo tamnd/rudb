@@ -289,12 +289,11 @@ impl Builder {
             k.extend_from_slice(ops);
             k.into()
         });
-        if let Some(k) = &key {
-            if let Some(&(b, v)) = self.cse.get(k) {
-                if b == self.cur || b == Block(0) {
-                    return Some(v);
-                }
-            }
+        if let Some(k) = &key
+            && let Some(&(b, v)) = self.cse.get(k)
+            && (b == self.cur || b == Block(0))
+        {
+            return Some(v);
         }
         let result = (rty != Ty::Void).then(|| self.f.new_val(rty, None));
         let site = self.site();
@@ -315,12 +314,11 @@ impl Builder {
     pub fn un(&mut self, op: Op, a: Val) -> Val {
         let ty = self.ty(a);
         debug_assert_eq!(op.form(), Form::Un, "{} is not unary", op.name());
-        if self.fold {
-            if let Some(x) = self.bits(a) {
-                if let Ok(r) = eval::unary(op, ty, op.result(ty), x) {
-                    return self.konst(op.result(ty), r);
-                }
-            }
+        if self.fold
+            && let Some(x) = self.bits(a)
+            && let Ok(r) = eval::unary(op, ty, op.result(ty), x)
+        {
+            return self.konst(op.result(ty), r);
         }
         self.value(op, ty, 0, &[a.0])
     }
@@ -419,10 +417,10 @@ impl Builder {
             if from == to && matches!(op, Op::Sext | Op::Zext | Op::Trunc | Op::Bitcast) {
                 return a;
             }
-            if let Some(x) = self.bits(a) {
-                if let Ok(r) = eval::unary(op, from, to, x) {
-                    return self.konst(to, r);
-                }
+            if let Some(x) = self.bits(a)
+                && let Ok(r) = eval::unary(op, from, to, x)
+            {
+                return self.konst(to, r);
             }
         }
         self.value(op, to, 0, &[a.0])
@@ -432,12 +430,11 @@ impl Builder {
     #[track_caller]
     pub fn ftosi(&mut self, a: Val, to: Ty, err: u32) -> Val {
         let from = self.ty(a);
-        if self.fold {
-            if let Some(x) = self.bits(a) {
-                if let Ok(r) = eval::unary(Op::FtosiT, from, to, x) {
-                    return self.konst(to, r);
-                }
-            }
+        if self.fold
+            && let Some(x) = self.bits(a)
+            && let Ok(r) = eval::unary(Op::FtosiT, from, to, x)
+        {
+            return self.konst(to, r);
         }
         self.value(Op::FtosiT, to, 0, &[a.0, err])
     }
@@ -470,12 +467,11 @@ impl Builder {
     #[track_caller]
     pub fn checked_neg(&mut self, a: Val, err: u32) -> Val {
         let ty = self.ty(a);
-        if self.fold {
-            if let Some(x) = self.bits(a) {
-                if let Ok(r) = eval::unary(Op::SnegT, ty, ty, x) {
-                    return self.konst(ty, r);
-                }
-            }
+        if self.fold
+            && let Some(x) = self.bits(a)
+            && let Ok(r) = eval::unary(Op::SnegT, ty, ty, x)
+        {
+            return self.konst(ty, r);
         }
         self.value(Op::SnegT, ty, 0, &[a.0, err])
     }
@@ -496,10 +492,10 @@ impl Builder {
             if k == 0 {
                 return a;
             }
-            if let Some(x) = self.bits(a) {
-                if let Ok(r) = eval::scale(Op::Ddown, ty, x, k) {
-                    return self.konst(ty, r);
-                }
+            if let Some(x) = self.bits(a)
+                && let Ok(r) = eval::scale(Op::Ddown, ty, x, k)
+            {
+                return self.konst(ty, r);
             }
         }
         self.value(Op::Ddown, ty, 0, &[a.0, k])
@@ -513,10 +509,10 @@ impl Builder {
             if k == 0 {
                 return a;
             }
-            if let Some(x) = self.bits(a) {
-                if let Ok(r) = eval::scale(Op::DupT, ty, x, k) {
-                    return self.konst(ty, r);
-                }
+            if let Some(x) = self.bits(a)
+                && let Ok(r) = eval::scale(Op::DupT, ty, x, k)
+            {
+                return self.konst(ty, r);
             }
         }
         self.value(Op::DupT, ty, 0, &[a.0, k, err])
@@ -611,10 +607,10 @@ impl Builder {
     /// `brif c, t(targs), f(fargs)`. A constant condition becomes a `br`.
     #[track_caller]
     pub fn brif(&mut self, c: Val, t: Block, targs: &[Val], f: Block, fargs: &[Val]) {
-        if self.fold {
-            if let Some(x) = self.bits(c) {
-                return if x != 0 { self.br(t, targs) } else { self.br(f, fargs) };
-            }
+        if self.fold
+            && let Some(x) = self.bits(c)
+        {
+            return if x != 0 { self.br(t, targs) } else { self.br(f, fargs) };
         }
         let mut ops = vec![c.0, t.0, targs.len() as u32];
         ops.extend(targs.iter().map(|v| v.0));
@@ -658,10 +654,10 @@ impl Builder {
             let key: Box<[u32]> = std::iter::once(header(Op::Rtcall, p.ret, 0, ops.len()))
                 .chain(ops.iter().copied())
                 .collect();
-            if let Some(&(b, v)) = self.cse.get(&key) {
-                if b == self.cur || b == Block(0) {
-                    return Some(v);
-                }
+            if let Some(&(b, v)) = self.cse.get(&key)
+                && (b == self.cur || b == Block(0))
+            {
+                return Some(v);
             }
             let r = self.emit(Op::Rtcall, p.ret, 0, &ops);
             if let Some(v) = r {

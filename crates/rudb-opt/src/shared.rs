@@ -117,11 +117,11 @@ fn split(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
         calls.iter().map(|&call| shifted(plan, call)).collect();
     let mut wants = Vec::with_capacity(calls.len());
     for (at, &call) in calls.iter().enumerate() {
-        if let Some(arg) = mean(plan, call) {
-            if calls.iter().any(|&other| summed(plan, other, arg)) {
-                wants.push(Want::Mean(arg));
-                continue;
-            }
+        if let Some(arg) = mean(plan, call)
+            && calls.iter().any(|&other| summed(plan, other, arg))
+        {
+            wants.push(Want::Mean(arg));
+            continue;
         }
         if let Some((base, by)) = shifts[at] {
             // Worth it when the one sum and one count this leaves stand for at least two calls, or

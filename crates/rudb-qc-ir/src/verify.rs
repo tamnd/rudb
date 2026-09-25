@@ -82,10 +82,10 @@ impl<'a> Checker<'a> {
                 }
             }
             for (k, i) in f.insts(block).enumerate() {
-                if let Some(r) = i.result {
-                    if let Some(d) = defs.get_mut(r.index()) {
-                        *d = Some(Def { block, pos: k as u32 + 1, dead: i.dead() });
-                    }
+                if let Some(r) = i.result
+                    && let Some(d) = defs.get_mut(r.index())
+                {
+                    *d = Some(Def { block, pos: k as u32 + 1, dead: i.dead() });
                 }
             }
         }
@@ -397,7 +397,7 @@ impl<'a> Checker<'a> {
                 self.want(v(0), ty, "the switch value");
                 let n = o[2] as usize;
                 self.args(Block(o[1]), &o[3..3 + n]);
-                for pair in o[3 + n..].chunks_exact(2) {
+                for pair in o[3 + n..].as_chunks::<2>().0 {
                     self.args(Block(pair[1]), &[]);
                 }
             }
@@ -702,17 +702,16 @@ impl<'a> Checker<'a> {
                 return false;
             }
             let d = self.cfg.idom[x.index()];
-            if let Some(t) = self.f.terminator(d) {
-                if t.op == Op::Brif && Val(t.ops[0]) == valid {
-                    let n = t.ops[2] as usize;
-                    let (yes, no) = (Block(t.ops[1]), Block(t.ops[3 + n]));
-                    // The true side must be entered only from this branch, and must dominate `b`.
-                    if yes != no
-                        && self.cfg.preds[yes.index()].len() == 1
-                        && self.cfg.dominates(yes, b)
-                    {
-                        return true;
-                    }
+            if let Some(t) = self.f.terminator(d)
+                && t.op == Op::Brif
+                && Val(t.ops[0]) == valid
+            {
+                let n = t.ops[2] as usize;
+                let (yes, no) = (Block(t.ops[1]), Block(t.ops[3 + n]));
+                // The true side must be entered only from this branch, and must dominate `b`.
+                if yes != no && self.cfg.preds[yes.index()].len() == 1 && self.cfg.dominates(yes, b)
+                {
+                    return true;
                 }
             }
             x = d;

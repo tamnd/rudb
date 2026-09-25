@@ -335,7 +335,7 @@ impl Link {
     /// instructions between them, and on q09 those were a tenth of the query for 319,404 children.
     /// The children a scan hands up are ascending, so the next one is usually a few words further
     /// along the bitmap than the last, and walking those words is a count of ones per word. A
-    /// child further away than [`Link::WALK`] children, or one before the last, is searched for
+    /// child further away than `Link::WALK` children, or one before the last, is searched for
     /// again, so the answer is the same in any order and only the cost depends on it.
     pub fn forward_each(&self, children: &[Rid], out: &mut Vec<Rid>) {
         out.clear();

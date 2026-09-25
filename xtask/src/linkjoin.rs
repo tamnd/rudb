@@ -282,10 +282,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
                 // moved and an interval that misses zero is a row this run called wrong. How often
                 // that happens is how often any row of the table is called wrong, which is the only
                 // honest thing to read a single link join row against.
-                if let Some((low, high)) = outcome.interval() {
-                    if low > 0.0 || high < 0.0 {
-                        cleared.push((name.clone(), delta));
-                    }
+                if let Some((low, high)) = outcome.interval()
+                    && (low > 0.0 || high < 0.0)
+                {
+                    cleared.push((name.clone(), delta));
                 }
             }
         }

@@ -1762,10 +1762,10 @@ impl<'a> Aggregate<'a> {
         if let Some(error) = table.failure.take() {
             return Err(error);
         }
-        if let Some(limit) = self.max_groups {
-            if !self.alone {
-                self.agree(rows, limit, table, installed)?;
-            }
+        if let Some(limit) = self.max_groups
+            && !self.alone
+        {
+            self.agree(rows, limit, table, installed)?;
         }
         let timing = stage::Timing::start(Stage::Fold);
         let done = self.fold(rows, table, None, None);
@@ -3369,11 +3369,13 @@ impl<'a> Aggregate<'a> {
                 // exactly the way that one does, so it comes through here and the only difference is
                 // the state it is pointed at.
                 let held = self.calls[at].state_of(at);
-                if !self.count_only && !self.compact_numeric && self.calls[at].finishes_plainly() {
-                    if let Some(vector) = finish_run(&states, picked, calls, held, ty)? {
-                        columns.push(vector);
-                        continue;
-                    }
+                if !self.count_only
+                    && !self.compact_numeric
+                    && self.calls[at].finishes_plainly()
+                    && let Some(vector) = finish_run(&states, picked, calls, held, ty)?
+                {
+                    columns.push(vector);
+                    continue;
                 }
                 // What a result owns away from itself is not knowable until it has been asked for,
                 // so that part is charged as it arrives and given back once it is in the vector.
@@ -4442,10 +4444,10 @@ impl<'a> Aggregate<'a> {
             if slot == NOWHERE {
                 continue;
             }
-            if let Some(flags) = &rows.filters[at] {
-                if !is_true(&flags.value_at(row)) {
-                    continue;
-                }
+            if let Some(flags) = &rows.filters[at]
+                && !is_true(&flags.value_at(row))
+            {
+                continue;
             }
             if let (DistinctSet::BigInt(set), [column]) =
                 (&mut seen[slot * calls + at], rows.arguments[at].as_slice())
@@ -5294,14 +5296,13 @@ impl CompactNumeric {
         // row and the map is empty in every query that does not overflow a SMALLINT sum past sixty
         // four bits, which needs on the order of ten to the fourteen rows in one group. It was eight
         // percent of ClickBench 32.
-        if overflow.is_empty() {
-            if let (Some(total_sum), Some(total_mean)) =
+        if overflow.is_empty()
+            && let (Some(total_sum), Some(total_mean)) =
                 (self.sum.checked_add(added_sum), self.mean.checked_add(added_mean))
-            {
-                self.sum = total_sum;
-                self.mean = total_mean;
-                return Ok(());
-            }
+        {
+            self.sum = total_sum;
+            self.mean = total_mean;
+            return Ok(());
         }
         if let std::collections::hash_map::Entry::Vacant(entry) = overflow.entry(slot) {
             if let (Some(total_sum), Some(total_mean)) =
@@ -5919,86 +5920,81 @@ impl Sink for Aggregate<'_> {
             *fixed = true;
             return Ok(Progress::More);
         }
-        if self.count_only && self.keys.len() == 1 {
-            if let [key] = rows.keys.as_slice() {
-                if let Some((codes, dictionary)) = key.stable_dictionary_parts() {
-                    let state = self.dense.get_or_init(|| DenseCount {
-                        dictionary: Arc::clone(dictionary),
-                        partitions: (0..DENSE_PARTITIONS)
-                            .map(|_| Mutex::new(DensePartition::default()))
-                            .collect(),
-                        held: Mutex::new(Vec::new()),
-                    });
-                    if !Arc::ptr_eq(&state.dictionary, dictionary) {
-                        return Err(Error::internal(
-                            "one stable dictionary aggregate received two code spaces",
-                        ));
+        if self.count_only
+            && self.keys.len() == 1
+            && let [key] = rows.keys.as_slice()
+            && let Some((codes, dictionary)) = key.stable_dictionary_parts()
+        {
+            let state = self.dense.get_or_init(|| DenseCount {
+                dictionary: Arc::clone(dictionary),
+                partitions: (0..DENSE_PARTITIONS)
+                    .map(|_| Mutex::new(DensePartition::default()))
+                    .collect(),
+                held: Mutex::new(Vec::new()),
+            });
+            if !Arc::ptr_eq(&state.dictionary, dictionary) {
+                return Err(Error::internal(
+                    "one stable dictionary aggregate received two code spaces",
+                ));
+            }
+            let validity = key.validity();
+            let before = dense_codes.iter().map(Blocks::footprint).sum::<usize>();
+            if !validity.has_nulls(rows.rows) && !dictionary.validity().has_nulls(dictionary.len())
+            {
+                for &code in &codes[..rows.rows] {
+                    if code as usize >= dictionary.len() {
+                        return Err(Error::internal("a stable dictionary code is out of range"));
                     }
-                    let validity = key.validity();
-                    let before = dense_codes.iter().map(Blocks::footprint).sum::<usize>();
-                    if !validity.has_nulls(rows.rows)
-                        && !dictionary.validity().has_nulls(dictionary.len())
-                    {
-                        for &code in &codes[..rows.rows] {
-                            if code as usize >= dictionary.len() {
-                                return Err(Error::internal(
-                                    "a stable dictionary code is out of range",
-                                ));
-                            }
-                            dense_codes[code as usize % DENSE_PARTITIONS].push(code);
-                        }
+                    dense_codes[code as usize % DENSE_PARTITIONS].push(code);
+                }
+            } else {
+                for (row, &code) in codes.iter().enumerate().take(rows.rows) {
+                    if key.is_null_at(row) {
+                        *dense_nulls += 1;
                     } else {
-                        for (row, &code) in codes.iter().enumerate().take(rows.rows) {
-                            if key.is_null_at(row) {
-                                *dense_nulls += 1;
-                            } else {
-                                let code = code as usize;
-                                if code >= dictionary.len() {
-                                    return Err(Error::internal(
-                                        "a stable dictionary code is out of range",
-                                    ));
-                                }
-                                dense_codes[code % DENSE_PARTITIONS].push(code as u32);
-                            }
+                        let code = code as usize;
+                        if code >= dictionary.len() {
+                            return Err(Error::internal(
+                                "a stable dictionary code is out of range",
+                            ));
                         }
+                        dense_codes[code % DENSE_PARTITIONS].push(code as u32);
                     }
-                    let after = dense_codes.iter().map(Blocks::footprint).sum::<usize>();
-                    dense_memory.grow(width_of(after.saturating_sub(before)))?;
-                    *dense = true;
-                    return Ok(Progress::More);
                 }
             }
+            let after = dense_codes.iter().map(Blocks::footprint).sum::<usize>();
+            dense_memory.grow(width_of(after.saturating_sub(before)))?;
+            *dense = true;
+            return Ok(Progress::More);
         }
         // The groups strictly inside the chunk are closed and skip the table, and only the first
         // and the last run go the ordinary way, since either of them can carry on into a chunk some
         // other instance holds. The two ends are cut before anything is folded, so a vector that
         // cannot be cut leaves the whole chunk to the ordinary path.
-        if self.closes() {
-            if let Some((from, to)) = interior(&rows.keys[0], rows.rows, self.grouped) {
-                if let (Ok(head), Ok(tail)) = (rows.slice(0, from), rows.slice(to, rows.rows - to))
-                {
-                    if self.closes_by_run() {
-                        let timing = stage::Timing::start(Stage::Fold);
-                        let answered = self.close_runs(&rows, from, to);
-                        timing.stop(0);
-                        if let Some(answered) = answered? {
-                            ran_memory.grow(width_of(answered.footprint()))?;
-                            ran.push(answered);
-                            self.open(&head, single, installed, spreading, own, folded)?;
-                            self.open(&tail, single, installed, spreading, own, folded)?;
-                            return Ok(Progress::More);
-                        }
-                    }
-                    let building = closed.get_or_insert_with(|| self.shut());
-                    let timing = stage::Timing::start(Stage::Fold);
-                    let done = self.fold(&rows, building, None, Some((from, to)));
-                    timing.stop(0);
-                    done?;
+        if self.closes()
+            && let Some((from, to)) = interior(&rows.keys[0], rows.rows, self.grouped)
+            && let (Ok(head), Ok(tail)) = (rows.slice(0, from), rows.slice(to, rows.rows - to))
+        {
+            if self.closes_by_run() {
+                let timing = stage::Timing::start(Stage::Fold);
+                let answered = self.close_runs(&rows, from, to);
+                timing.stop(0);
+                if let Some(answered) = answered? {
+                    ran_memory.grow(width_of(answered.footprint()))?;
+                    ran.push(answered);
                     self.open(&head, single, installed, spreading, own, folded)?;
                     self.open(&tail, single, installed, spreading, own, folded)?;
                     return Ok(Progress::More);
                 }
             }
+            let building = closed.get_or_insert_with(|| self.shut());
+            let timing = stage::Timing::start(Stage::Fold);
+            let done = self.fold(&rows, building, None, Some((from, to)));
+            timing.stop(0);
+            done?;
+            self.open(&head, single, installed, spreading, own, folded)?;
+            self.open(&tail, single, installed, spreading, own, folded)?;
+            return Ok(Progress::More);
         }
         self.open(&rows, single, installed, spreading, own, folded)?;
         Ok(Progress::More)
@@ -7297,10 +7293,10 @@ impl Aggregate<'_> {
         // hands back no file, and then the set aside groups are whole on their own and finish as a
         // table of their own. Either way each of them is finished once, because a group is only ever
         // set aside by a partition that did not hold its key.
-        if left.is_none() {
-            if let Some(whole) = carried.take() {
-                left = self.finish(whole, chunks, held)?;
-            }
+        if left.is_none()
+            && let Some(whole) = carried.take()
+        {
+            left = self.finish(whole, chunks, held)?;
         }
         while let Some(mut file) = left {
             left = self.again(&mut file, carried.take(), chunks, held)?;
@@ -7583,10 +7579,10 @@ fn width_of(size: usize) -> u64 {
 /// positional name, since the projection above an aggregate is what names the query's output and
 /// these names never reach a result set.
 fn group_name(plan: &Plan, group: ExprRef, input: &Schema, at: usize) -> String {
-    if let Expr::Column(binding) = *plan.expr(group) {
-        if let Some(position) = input.position_of(binding) {
-            return input.fields()[position].name.clone();
-        }
+    if let Expr::Column(binding) = *plan.expr(group)
+        && let Some(position) = input.position_of(binding)
+    {
+        return input.fields()[position].name.clone();
     }
     format!("group{at}")
 }

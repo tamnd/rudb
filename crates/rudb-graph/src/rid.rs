@@ -123,14 +123,14 @@ impl Places {
             // writer bug, and finding it here rather than in a join is the difference between a
             // failed open and a wrong answer.
             let uniform = parts.iter().all(|&rows| rows as usize == PART_ROWS);
-            if let Some((_, earlier)) = parts.split_last() {
-                if let Some(which) = earlier.iter().position(|&rows| rows as usize != PART_ROWS) {
-                    return Err(malformed(format!(
-                        "part {which} of stripe {at} holds {} rows and only the last part of a \
+            if let Some((_, earlier)) = parts.split_last()
+                && let Some(which) = earlier.iter().position(|&rows| rows as usize != PART_ROWS)
+            {
+                return Err(malformed(format!(
+                    "part {which} of stripe {at} holds {} rows and only the last part of a \
                          stripe may be short",
-                        earlier[which]
-                    )));
-                }
+                    earlier[which]
+                )));
             }
             let rows = u64::from(total);
             stripes.push(StripeSum { base, rows, parts: cumulative, uniform });
@@ -252,7 +252,7 @@ mod tests {
         if stripes > 0 {
             let whole = (tail / full) as usize;
             let mut last = vec![full; whole];
-            if tail % full != 0 {
+            if !tail.is_multiple_of(full) {
                 last.push(tail % full);
             }
             out.push(last);

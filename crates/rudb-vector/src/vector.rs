@@ -2474,10 +2474,10 @@ impl Vector {
         if first >= limit {
             return Ok(first);
         }
-        if let Body::ExternalText { source } = &self.body {
-            if matches!(self.validity, Validity::AllValid) {
-                return source.sweep(first, limit, body);
-            }
+        if let Body::ExternalText { source } = &self.body
+            && matches!(self.validity, Validity::AllValid)
+        {
+            return source.sweep(first, limit, body);
         }
         body(first, self.try_bytes_at(first)?.unwrap_or_default())?;
         Ok(first + 1)
@@ -2505,18 +2505,18 @@ impl Vector {
     ///
     /// Whatever reading a value raises.
     pub fn try_values_visited(&self, indices: &[usize]) -> Result<Vec<Value>> {
-        if let Body::ExternalText { source } = &self.body {
-            if matches!(self.validity, Validity::AllValid) {
-                let mut out = vec![Value::Null; indices.len()];
-                let mut own = |at: usize, bytes: &[u8]| {
-                    if indices[at] < self.len {
-                        out[at] = bytes_as(&self.ty, bytes);
-                    }
-                    Ok(())
-                };
-                source.visit(indices, &mut own)?;
-                return Ok(out);
-            }
+        if let Body::ExternalText { source } = &self.body
+            && matches!(self.validity, Validity::AllValid)
+        {
+            let mut out = vec![Value::Null; indices.len()];
+            let mut own = |at: usize, bytes: &[u8]| {
+                if indices[at] < self.len {
+                    out[at] = bytes_as(&self.ty, bytes);
+                }
+                Ok(())
+            };
+            source.visit(indices, &mut own)?;
+            return Ok(out);
         }
         indices.iter().map(|&index| self.try_value_at(index)).collect()
     }
@@ -3530,11 +3530,9 @@ impl Vector {
     /// for that one both of them have to be written out.
     fn copied(&self, at: Vec<usize>, forms_stay: bool) -> Result<Self> {
         let rows = at.len();
-        if forms_stay {
-            if let Body::Dictionary { codes, values, stable: true } = &self.body {
-                let inside = at.iter().max().is_none_or(|&top| top < codes.len());
-                return self.stable_gathered(codes, values, &at, inside, |index| index);
-            }
+        if forms_stay && let Body::Dictionary { codes, values, stable: true } = &self.body {
+            let inside = at.iter().max().is_none_or(|&top| top < codes.len());
+            return self.stable_gathered(codes, values, &at, inside, |index| index);
         }
         let (at, leaf) = self.resolve(at);
         let live: Vec<bool> = at.iter().map(|&index| index != NOWHERE).collect();

@@ -289,10 +289,10 @@ impl LoadProfile {
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
-        if first.is_ok() {
-            if let Some(peak) = resident_peak() {
-                self.peak_rss.store(peak, Ordering::Relaxed);
-            }
+        if first.is_ok()
+            && let Some(peak) = resident_peak()
+        {
+            self.peak_rss.store(peak, Ordering::Relaxed);
         }
     }
 

@@ -391,10 +391,10 @@ mod tests {
         let values: Vec<Value> = (0..rows)
             .map(|_| {
                 let draw = rng.next();
-                if nulls > 0 && draw % nulls == 0 {
+                if nulls > 0 && draw.is_multiple_of(nulls) {
                     Value::Null
                 } else {
-                    Value::Boolean(draw % 2 == 0)
+                    Value::Boolean(draw.is_multiple_of(2))
                 }
             })
             .collect();

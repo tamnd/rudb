@@ -193,7 +193,7 @@ impl GroupTable {
 
     fn add(&mut self, key: &[u8], hash: u64, heap: &mut Heap) -> usize {
         let gid = self.rows.len();
-        if gid % ROWS_PER_PAGE == 0 {
+        if gid.is_multiple_of(ROWS_PER_PAGE) {
             self.pages.push(vec![0u8; ROWS_PER_PAGE * self.row_size].into_boxed_slice());
         }
         let size = self.row_size;

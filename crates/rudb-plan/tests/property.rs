@@ -235,7 +235,7 @@ impl Random {
     }
 
     fn chance(&mut self, one_in: u64) -> bool {
-        self.next() % one_in == 0
+        self.next().is_multiple_of(one_in)
     }
 
     fn pick<T: Copy>(&mut self, from: &[T]) -> T {
@@ -386,7 +386,7 @@ impl Generator {
     fn value_of(&mut self, ty: &LogicalType) -> Value {
         let number = self.random.next();
         match ty {
-            LogicalType::Boolean => Value::Boolean(number % 2 == 0),
+            LogicalType::Boolean => Value::Boolean(number.is_multiple_of(2)),
             LogicalType::TinyInt => Value::TinyInt(number as i8),
             LogicalType::SmallInt => Value::SmallInt(number as i16),
             LogicalType::Integer => Value::Integer(number as i32),

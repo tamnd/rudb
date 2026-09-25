@@ -124,10 +124,10 @@ pub(crate) fn builders(
     if !text.is_empty() {
         for row in 0..cells.records.len() {
             for (sum, &column) in long.iter_mut().zip(&text) {
-                if let Some(span) = cells.at(row, column) {
-                    if span.len() > INLINE_LIMIT {
-                        *sum += span.len();
-                    }
+                if let Some(span) = cells.at(row, column)
+                    && span.len() > INLINE_LIMIT
+                {
+                    *sum += span.len();
                 }
             }
         }

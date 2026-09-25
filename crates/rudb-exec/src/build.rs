@@ -684,7 +684,7 @@ fn edge(plan: &Plan, bound: rudb_plan::Bound, input: &Schema) -> Result<Edge> {
     Ok(match bound {
         rudb_plan::Bound::All => Edge::All,
         rudb_plan::Bound::Rows(rows) => Edge::Rows(rows),
-        rudb_plan::Bound::Read(expr) => Edge::Read(Prepared::one(plan, expr, input)?),
+        rudb_plan::Bound::Read(expr) => Edge::Read(Box::new(Prepared::one(plan, expr, input)?)),
     })
 }
 
@@ -692,7 +692,7 @@ fn edge(plan: &Plan, bound: rudb_plan::Bound, input: &Schema) -> Result<Edge> {
 fn portion(plan: &Plan, share: rudb_plan::Share, input: &Schema) -> Result<Portion> {
     Ok(match share {
         rudb_plan::Share::Percent(percent) => Portion::Percent(percent),
-        rudb_plan::Share::Read(expr) => Portion::Read(Prepared::one(plan, expr, input)?),
+        rudb_plan::Share::Read(expr) => Portion::Read(Box::new(Prepared::one(plan, expr, input)?)),
     })
 }
 
@@ -732,10 +732,10 @@ fn scanned<'a>(
     node: NodeRef,
     index: u32,
 ) -> Result<Option<(&'a Table, Slice)>> {
-    if let Some((table, found, columns)) = whole_table(plan, catalog, node)? {
-        if found == index {
-            return Ok(Some((table, columns)));
-        }
+    if let Some((table, found, columns)) = whole_table(plan, catalog, node)?
+        && found == index
+    {
+        return Ok(Some((table, columns)));
     }
     for child in plan.node(node).children().into_iter().flatten() {
         if let Some(found) = scanned(plan, catalog, child, index)? {
@@ -1092,16 +1092,16 @@ fn stored_summary(
         // Counting the one column a grouping produced is counting its distinct values, which is the
         // other half of how `COUNT(DISTINCT column)` is planned. The count drops the null group and
         // the distinct count never had it, so the two agree.
-        if call == "count" {
-            if let Some((table, produced, column)) = grouped_column(plan, catalog, input)? {
-                if binding.table == produced && binding.column == 0 {
-                    let Some(distinct) = table.rows().distinct_values(column)? else {
-                        return Ok(None);
-                    };
-                    values.push(count(distinct)?);
-                    continue;
-                }
-            }
+        if call == "count"
+            && let Some((table, produced, column)) = grouped_column(plan, catalog, input)?
+            && binding.table == produced
+            && binding.column == 0
+        {
+            let Some(distinct) = table.rows().distinct_values(column)? else {
+                return Ok(None);
+            };
+            values.push(count(distinct)?);
+            continue;
         }
         let Some((table, index, columns)) = below else { return Ok(None) };
         let Some(column) = stored_column(plan, table, index, columns, binding) else {
@@ -1789,10 +1789,8 @@ impl<'a> Building<'a, '_> {
             }) else {
                 return;
             };
-            if reducing {
-                if let Some(exact) = exact(plan, catalog, parent, key, driving, binding) {
-                    sideways.exactly(exact);
-                }
+            if reducing && let Some(exact) = exact(plan, catalog, parent, key, driving, binding) {
+                sideways.exactly(exact);
             }
             sideways.keying(Keyed::new(plan, key, held_schema.clone(), zone));
             sideways.about(binding);
@@ -1893,47 +1891,42 @@ impl<'a> Building<'a, '_> {
         aggregates: Slice,
         bound: AggregateBound,
     ) -> Result<Segment<'a>> {
-        if bound.max_groups.is_none() && bound.having_count.is_none() {
-            if let Some((reader, order, covered, group_type)) =
+        if bound.max_groups.is_none()
+            && bound.having_count.is_none()
+            && let Some((reader, order, covered, group_type)) =
                 covering_grouped_distinct(self.plan, self.catalog, input, groups, aggregates)?
-            {
-                let schema = Schema::numbered(
-                    vec![
-                        Field::new("group".to_string(), group_type),
-                        Field::new("count".to_string(), LogicalType::BigInt),
-                    ],
-                    index,
-                );
-                let source = ProjectionDistinct::new(reader, order, covered, schema.clone());
-                let id = self.shape.operator(reference);
-                let pipeline = self.shape.pipeline(reference);
-                let counters = self.watch(
-                    reference,
-                    id,
-                    pipeline,
-                    "Aggregate",
-                    Some("covering grouped distinct"),
-                );
-                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
-            }
+        {
+            let schema = Schema::numbered(
+                vec![
+                    Field::new("group".to_string(), group_type),
+                    Field::new("count".to_string(), LogicalType::BigInt),
+                ],
+                index,
+            );
+            let source = ProjectionDistinct::new(reader, order, covered, schema.clone());
+            let id = self.shape.operator(reference);
+            let pipeline = self.shape.pipeline(reference);
+            let counters =
+                self.watch(reference, id, pipeline, "Aggregate", Some("covering grouped distinct"));
+            return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
         }
         // Before the input is built, because building it is what puts it in a pipeline and a
         // pipeline that exists is a pipeline that runs. A summary that let the rows be counted
         // underneath it would answer in no time and take exactly as long as it always did.
         // `SET stored_answers = off` skips this and reads the rows, which is how a ClickBench run keeps what the loader added up out of its numbers.
         let stored = self.session.rules().enabled(Rule::StoredAnswers);
-        if stored && bound.max_groups.is_none() && bound.having_count.is_none() {
-            if let Some(values) =
+        if stored
+            && bound.max_groups.is_none()
+            && bound.having_count.is_none()
+            && let Some(values) =
                 stored_summary(self.plan, self.catalog, input, groups, aggregates)?
-            {
-                let schema = summary_schema(self.plan, index, aggregates)?;
-                let source = Summary::new(&schema, &values)?;
-                let id = self.shape.operator(reference);
-                let pipeline = self.shape.pipeline(reference);
-                let counters =
-                    self.watch(reference, id, pipeline, "Aggregate", Some("stored summary"));
-                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
-            }
+        {
+            let schema = summary_schema(self.plan, index, aggregates)?;
+            let source = Summary::new(&schema, &values)?;
+            let id = self.shape.operator(reference);
+            let pipeline = self.shape.pipeline(reference);
+            let counters = self.watch(reference, id, pipeline, "Aggregate", Some("stored summary"));
+            return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
         }
         self.marking = marks_through(self.plan, input, groups, aggregates).then_some(input);
         let below = self.node(input);
@@ -1995,42 +1988,42 @@ impl<'a> Building<'a, '_> {
         let schema = aggregate.schema().clone();
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
-        if bound.max_groups.is_none() {
-            if let Some(records) = native_host_groups(
+        if bound.max_groups.is_none()
+            && let Some(records) = native_host_groups(
                 self.plan,
                 self.catalog,
                 input,
                 groups,
                 aggregates,
                 bound.having_count,
-            )? {
-                let source = Frequencies::records(schema.clone(), records)?;
-                let counters =
-                    self.watch(reference, id, pipeline, "Aggregate", Some("native host groups"));
-                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
-            }
+            )?
+        {
+            let source = Frequencies::records(schema.clone(), records)?;
+            let counters =
+                self.watch(reference, id, pipeline, "Aggregate", Some("native host groups"));
+            return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
         }
         if bound.max_groups.is_none() && bound.having_count.is_none() {
             let top = bound.top_counts.map(|(bound, _)| bound);
-            if let Some(top) = top {
-                if let Some(frequencies) = native_pair_frequencies(
+            if let Some(top) = top
+                && let Some(frequencies) = native_pair_frequencies(
                     self.plan,
                     self.catalog,
                     input,
                     groups,
                     aggregates,
                     top,
-                )? {
-                    let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
-                    let counters = self.watch(
-                        reference,
-                        id,
-                        pipeline,
-                        "Aggregate",
-                        Some("native pair frequencies"),
-                    );
-                    return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
-                }
+                )?
+            {
+                let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
+                let counters = self.watch(
+                    reference,
+                    id,
+                    pipeline,
+                    "Aggregate",
+                    Some("native pair frequencies"),
+                );
+                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
             }
         }
         let counters = self.watch(reference, id, pipeline, "Aggregate", None);
@@ -2462,10 +2455,10 @@ impl<'a> Building<'a, '_> {
                 // Armed afterwards, like the join's own filter and for the same reason: the binding
                 // the top N knows is the one the projection above the scan hands it, so it has to be
                 // walked down to the scan's own before the scan can be asked about it.
-                if let Some((binding, op)) = cutoff::ordering(plan, keys) {
-                    if let Some(binding) = sideways::beneath(plan, input, binding) {
-                        cutoff.about(binding, op);
-                    }
+                if let Some((binding, op)) = cutoff::ordering(plan, keys)
+                    && let Some(binding) = sideways::beneath(plan, input, binding)
+                {
+                    cutoff.about(binding, op);
                 }
                 let schema = below.schema.clone();
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;

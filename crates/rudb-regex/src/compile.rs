@@ -129,10 +129,10 @@ fn invert(ranges: &[(char, char)]) -> Vec<(char, char)> {
     let mut next = 0u32;
     for &(low, high) in ranges {
         let low = low as u32;
-        if low > next {
-            if let (Some(from), Some(to)) = (char::from_u32(next), char::from_u32(low - 1)) {
-                out.push((from, to));
-            }
+        if low > next
+            && let (Some(from), Some(to)) = (char::from_u32(next), char::from_u32(low - 1))
+        {
+            out.push((from, to));
         }
         next = next.max(high as u32 + 1);
         // The surrogate block is not made of characters, so a range that ends just under it has to

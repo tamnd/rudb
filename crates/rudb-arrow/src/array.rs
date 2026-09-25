@@ -188,10 +188,10 @@ fn varlen(data: &Data, len: usize) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut offsets = Vec::with_capacity((len + 1) * 4);
     offsets.extend_from_slice(&0i32.to_le_bytes());
     for index in 0..len {
-        if let Data::Varlen(column) = data {
-            if let Some(bytes) = column.bytes(index) {
-                values.extend_from_slice(bytes);
-            }
+        if let Data::Varlen(column) = data
+            && let Some(bytes) = column.bytes(index)
+        {
+            values.extend_from_slice(bytes);
         }
         // A null still gets an offset, and it is the same one as the value before it, which is what
         // makes a null and an empty string the same two numbers and the validity bitmap the only

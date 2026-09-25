@@ -171,10 +171,10 @@ impl Expr {
     }
 
     fn collect(&self, out: &mut Vec<usize>) {
-        if let Kind::Column(i) = self.kind {
-            if !out.contains(&i) {
-                out.push(i);
-            }
+        if let Kind::Column(i) = self.kind
+            && !out.contains(&i)
+        {
+            out.push(i);
         }
         self.children(|c| c.collect(out));
     }

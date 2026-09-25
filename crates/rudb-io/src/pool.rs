@@ -420,17 +420,17 @@ fn plan(
     let mut jobs: Vec<Job> = Vec::with_capacity(parts.len());
     for part in parts {
         let end = part.offset + part.buf.len() as u64;
-        if config.coalesce {
-            if let Some(last) = jobs.last_mut() {
-                let last_end = last.offset + last.span as u64;
-                let gap = part.offset.saturating_sub(last_end);
-                let span = end.saturating_sub(last.offset);
-                // `part.offset < last_end` means the ranges overlap, which merges for free.
-                if gap <= config.coalesce_gap && span <= config.coalesce_span {
-                    last.span = span as usize;
-                    last.parts.push(part);
-                    continue;
-                }
+        if config.coalesce
+            && let Some(last) = jobs.last_mut()
+        {
+            let last_end = last.offset + last.span as u64;
+            let gap = part.offset.saturating_sub(last_end);
+            let span = end.saturating_sub(last.offset);
+            // `part.offset < last_end` means the ranges overlap, which merges for free.
+            if gap <= config.coalesce_gap && span <= config.coalesce_span {
+                last.span = span as usize;
+                last.parts.push(part);
+                continue;
             }
         }
         jobs.push(Job {

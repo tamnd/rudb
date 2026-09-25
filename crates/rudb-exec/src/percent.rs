@@ -52,7 +52,7 @@ pub(crate) enum Portion {
     /// A share the binder worked out, already checked to be between nought and a hundred.
     Percent(f64),
     /// An expression over the input, holding the share in every row.
-    Read(Prepared),
+    Read(Box<Prepared>),
 }
 
 /// A share of the input, held until there is an input to take a share of.
@@ -125,7 +125,7 @@ impl LimitPercent {
         let out = Buffered::new();
         let limit = Self {
             percent: match percent {
-                Portion::Read(prepared) => Portion::Read(prepared.in_session(session)),
+                Portion::Read(prepared) => Portion::Read(Box::new(prepared.in_session(session))),
                 settled => settled,
             },
             offset: offset.in_session(session),

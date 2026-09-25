@@ -305,14 +305,14 @@ impl Extremum {
     /// and, on a win, two stores. Anything else settles into a value and compares the long way,
     /// which is what a mix of dictionaries or a mix of forms in one aggregate costs.
     fn offer(&mut self, dictionary: &Arc<Vector>, code: u32, rank: u32, least: bool) -> Result<()> {
-        if let Self::Ranked { dictionary: mine, code: held_code, rank: held_rank } = self {
-            if Arc::ptr_eq(mine, dictionary) {
-                if if least { rank < *held_rank } else { rank > *held_rank } {
-                    *held_code = code;
-                    *held_rank = rank;
-                }
-                return Ok(());
+        if let Self::Ranked { dictionary: mine, code: held_code, rank: held_rank } = self
+            && Arc::ptr_eq(mine, dictionary)
+        {
+            if if least { rank < *held_rank } else { rank > *held_rank } {
+                *held_code = code;
+                *held_rank = rank;
             }
+            return Ok(());
         }
         let candidate = dictionary.try_value_at(code as usize)?;
         let ordering = order(&candidate, self.settle()?)?;
@@ -1267,10 +1267,10 @@ pub fn update_tallied(
     if matches!(nulls, Validity::AllInvalid) {
         return Ok(());
     }
-    if let Some(least) = extreme {
-        if ranked_extremes(states, into, input, rows, &nulls, least)? {
-            return Ok(());
-        }
+    if let Some(least) = extreme
+        && ranked_extremes(states, into, input, rows, &nulls, least)?
+    {
+        return Ok(());
     }
     if extreme.is_some()
         && input.logical_type() == &LogicalType::Varchar
@@ -1329,10 +1329,10 @@ pub fn update_tallied(
         )));
     };
     let feed = feed_of(first, input.logical_type());
-    if let Some(feed) = feed {
-        if spread(states, into, input, rows, nulls.live(), feed)? {
-            return Ok(());
-        }
+    if let Some(feed) = feed
+        && spread(states, into, input, rows, nulls.live(), feed)?
+    {
+        return Ok(());
     }
     // An aggregate reads one vector, so its form goes in both halves of the report.
     fallback::record(Kernel::Aggregate, input.form(), input.form());
@@ -2075,10 +2075,10 @@ fn count_runs(
 ) {
     let mut start = 0;
     for &(slot, end) in runs {
-        if let Some(index) = group(slot) {
-            if let State::Counted { count, .. } = &mut states[index].state {
-                *count += (end - start) as i64;
-            }
+        if let Some(index) = group(slot)
+            && let State::Counted { count, .. } = &mut states[index].state
+        {
+            *count += (end - start) as i64;
         }
         start = end;
     }
@@ -3274,10 +3274,10 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
                     _ => None,
                 };
             };
-            if let (Want::Whole, Validity::AllValid) = (want, nulls) {
-                if let Some(total) = tally(data, codes) {
-                    return Some(Contribution::Whole(total));
-                }
+            if let (Want::Whole, Validity::AllValid) = (want, nulls)
+                && let Some(total) = tally(data, codes)
+            {
+                return Some(Contribution::Whole(total));
             }
             collect::<false, _>(data, |index| codes[index] as usize, rows, nulls, want)
         }
@@ -3386,10 +3386,10 @@ fn extreme_bytes(
         if !nulls.is_valid(row) {
             continue;
         }
-        if let Some((_, held)) = winner {
-            if held == code {
-                continue;
-            }
+        if let Some((_, held)) = winner
+            && held == code
+        {
+            continue;
         }
         let candidate = values.try_bytes_at(code as usize).ok()??;
         let ahead = match winner {

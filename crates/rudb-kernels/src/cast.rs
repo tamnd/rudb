@@ -112,13 +112,13 @@ pub fn cast_in_time_zone(
         // row at a time: an enum to enum cast is a catalogue change, not a hot path, and this loop
         // only looks for the first label the target does not have, to name both enums in the error.
         for index in 0..input.len() {
-            if let Value::Varchar(label) = input.try_value_at(index)? {
-                if !labels.contains(&label) {
-                    return Err(Error::conversion(format!(
-                        "Type {} with value {label} can't be cast to the destination type {target}",
-                        input.logical_type()
-                    )));
-                }
+            if let Value::Varchar(label) = input.try_value_at(index)?
+                && !labels.contains(&label)
+            {
+                return Err(Error::conversion(format!(
+                    "Type {} with value {label} can't be cast to the destination type {target}",
+                    input.logical_type()
+                )));
             }
         }
     }
@@ -145,12 +145,10 @@ fn cast_value_in_time_zone(
     try_cast: bool,
     time_zone: Option<SessionTimeZone>,
 ) -> Result<Value> {
-    if matches!(target, LogicalType::Varchar) {
-        if let (Value::TimestampTz(micros), Some(time_zone)) = (value, time_zone) {
-            return Ok(Value::Varchar(
-                value.to_string_at_offset(time_zone.offset_seconds_at(*micros)),
-            ));
-        }
+    if matches!(target, LogicalType::Varchar)
+        && let (Value::TimestampTz(micros), Some(time_zone)) = (value, time_zone)
+    {
+        return Ok(Value::Varchar(value.to_string_at_offset(time_zone.offset_seconds_at(*micros))));
     }
     cast_value(value, target, try_cast)
 }
@@ -350,12 +348,11 @@ fn from_packed<M: Fn(usize) -> usize>(
     // Unpacked in bulk once rather than a code at a time in each loop below. See
     // [`rudb_vector::Packed::unpack`].
     let codes = packed.codes_at(at, rows);
-    if let Numeric::Exact { scale: now, width } = into {
-        if now == was {
-            if let Some(data) = packed_straight(packed, &codes, width, physical) {
-                return Some(data);
-            }
-        }
+    if let Numeric::Exact { scale: now, width } = into
+        && now == was
+        && let Some(data) = packed_straight(packed, &codes, width, physical)
+    {
+        return Some(data);
     }
     // A run whose two ends fit in an `i64` loosens from there, which is one instruction a value
     // where the same conversion from an `i128` is a call into the runtime. It is the benchmark
@@ -751,10 +748,10 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
             _ => {}
         }
     }
-    if let Value::Varchar(text) = value {
-        if let Some(answer) = from_text(text, target, try_cast) {
-            return answer;
-        }
+    if let Value::Varchar(text) = value
+        && let Some(answer) = from_text(text, target, try_cast)
+    {
+        return answer;
     }
     match convert(value, target) {
         Ok(converted) => Ok(converted),

@@ -181,10 +181,10 @@ fn from_paths(root: &Path, base: String, paths: Vec<String>) -> Focus {
         {
             grammar = true;
         }
-        if let Some(rest) = path.strip_prefix("crates/") {
-            if let Some((name, _)) = rest.split_once('/') {
-                direct.insert(name.to_string());
-            }
+        if let Some(rest) = path.strip_prefix("crates/")
+            && let Some((name, _)) = rest.split_once('/')
+        {
+            direct.insert(name.to_string());
         }
         // The workspace manifest, the lockfile, the toolchain file, the lint configuration and the
         // gate's own code all reach every crate, so none of them can be narrowed around.
@@ -285,10 +285,10 @@ fn base(root: &Path) -> Option<String> {
     let dirty = git(root, &["status", "--porcelain", "--untracked-files=all"])
         .is_some_and(|out| !out.trim().is_empty());
     for trunk in ["origin/main", "main"] {
-        if let Some(merge_base) = git(root, &["merge-base", trunk, "HEAD"]) {
-            if let Some(chosen) = against(Some(merge_base.trim()), &head, dirty) {
-                return Some(chosen);
-            }
+        if let Some(merge_base) = git(root, &["merge-base", trunk, "HEAD"])
+            && let Some(chosen) = against(Some(merge_base.trim()), &head, dirty)
+        {
+            return Some(chosen);
         }
     }
     git(root, &["rev-parse", "HEAD~1"]).map(|out| out.trim().to_string())

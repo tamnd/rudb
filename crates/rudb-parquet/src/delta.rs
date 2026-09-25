@@ -52,13 +52,13 @@ pub(crate) fn binary_packed(bytes: &[u8], count: usize) -> Result<(Vec<i64>, usi
     let miniblocks = varint(bytes, &mut at)? as usize;
     let stated = varint(bytes, &mut at)? as usize;
     let first = zigzag(varint(bytes, &mut at)?);
-    if block == 0 || miniblocks == 0 || block % miniblocks != 0 {
+    if block == 0 || miniblocks == 0 || !block.is_multiple_of(miniblocks) {
         return Err(Error::io(format!(
             "a delta header of {block} values in {miniblocks} miniblocks, which do not divide"
         )));
     }
     let per_miniblock = block / miniblocks;
-    if per_miniblock % 8 != 0 {
+    if !per_miniblock.is_multiple_of(8) {
         // The packing works in groups of eight, so a miniblock that is not a multiple of eight
         // values has no defined length in bytes. Every writer emits 32, and the specification
         // requires the multiple.

@@ -531,10 +531,10 @@ fn unary(ast: &Ast, op: UnaryOp, operand: ExprRef) -> String {
     // `-1` is a number and not a negation of one, so a minus in front of a numeric constant folds
     // into it and `- -3` folds twice and comes back as `3`. A plus does not fold, which is why
     // `+3` comes back as `+(3)`.
-    if matches!(op, UnaryOp::Negate) {
-        if let Some(number) = negated(ast, operand) {
-            return number;
-        }
+    if matches!(op, UnaryOp::Negate)
+        && let Some(number) = negated(ast, operand)
+    {
+        return number;
     }
     let written = expr(ast, operand);
     match op {

@@ -315,7 +315,7 @@ pub(crate) enum Edge {
     /// A number the binder worked out.
     Rows(u64),
     /// An expression over the input, holding the number in every row.
-    Read(Prepared),
+    Read(Box<Prepared>),
 }
 
 /// How much of the limit one instance has used up, and what the limit turned out to be.
@@ -353,7 +353,7 @@ impl Edge {
     #[must_use]
     pub(crate) fn in_session(self, session: &Session) -> Self {
         match self {
-            Self::Read(prepared) => Self::Read(prepared.in_session(session)),
+            Self::Read(prepared) => Self::Read(Box::new(prepared.in_session(session))),
             settled => settled,
         }
     }

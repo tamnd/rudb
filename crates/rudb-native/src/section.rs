@@ -388,7 +388,7 @@ pub fn encode_extents(extents: &[Extent], out: &mut Vec<u8>) -> Result<()> {
 /// If the byte count is not a multiple of an entry, if an entry is malformed, or if the entries are
 /// not in element order.
 pub fn decode_extents(bytes: &[u8]) -> Result<Vec<Extent>> {
-    if bytes.len() % EXTENT_BYTES != 0 {
+    if !bytes.len().is_multiple_of(EXTENT_BYTES) {
         return Err(malformed("an extent table is not a whole number of entries"));
     }
     let mut extents: Vec<Extent> = Vec::with_capacity(bytes.len() / EXTENT_BYTES);

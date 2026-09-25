@@ -911,10 +911,10 @@ impl Window {
             if self.excluded(peers, at, row) {
                 continue;
             }
-            if let Some(filter) = call.filter_at {
-                if rows[row].0[filter].as_bool() != Some(true) {
-                    continue;
-                }
+            if let Some(filter) = call.filter_at
+                && rows[row].0[filter].as_bool() != Some(true)
+            {
+                continue;
             }
             let args: Vec<Value> = rows[row].0[call.args_at..call.args_at + call.args].to_vec();
             if call.ignore_nulls && args.iter().any(Value::is_null) {

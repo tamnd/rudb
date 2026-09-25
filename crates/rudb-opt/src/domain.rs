@@ -1233,10 +1233,10 @@ fn filtering(
     // right side moved is not reachable above and reporting it would point whatever read it at a
     // column that is not there. A mark join produces both sides, so both halves are reported.
     let mut moved = first.moved;
-    if kind == JoinKind::Mark {
-        if let Some(other) = second {
-            moved.extend(other.moved);
-        }
+    if kind == JoinKind::Mark
+        && let Some(other) = second
+    {
+        moved.extend(other.moved);
     }
     Some(Pushed { node, keys: first.keys, moved })
 }
