@@ -619,7 +619,8 @@ pub fn select_range(
                                       unsigned on purpose"
                         )]
                         let (low, span) = (low as $signed, (high - low) as $unsigned);
-                        #[expect(clippy::cast_sign_loss, reason = "the distance is read unsigned")]
+                        // Allowed rather than expected, since an unsigned type has no sign to lose.
+                        #[allow(clippy::cast_sign_loss, reason = "the distance is read unsigned")]
                         let within = |value: $signed| value.wrapping_sub(low) as $unsigned <= span;
                         Some(match live {
                             Some(rows) => kept_where(Some(rows), len, |row| within(values[row])),
