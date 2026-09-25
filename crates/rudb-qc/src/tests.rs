@@ -70,8 +70,14 @@ fn compiled(text: &str) -> Result<Vec<Vec<Value>>> {
     let memory = Memory::unlimited();
     let seams = rudb_seam::Settings::new();
     let session = Session::new();
-    let under =
-        Under { catalog: &catalog, cancel: &cancel, memory: &memory, seams: &seams, session: &session, pool: &pool };
+    let under = Under {
+        catalog: &catalog,
+        cancel: &cancel,
+        memory: &memory,
+        seams: &seams,
+        session: &session,
+        pool: &pool,
+    };
     compiled.run(&plan, under).map(|a| rows(&a.chunks))
 }
 

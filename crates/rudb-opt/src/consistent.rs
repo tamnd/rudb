@@ -83,18 +83,18 @@ impl Pass for ConsistentExtremes {
         let mut changed = false;
         let root = plan.root();
         let mut next = walk::fresh_index(plan);
-        let rewritten = walk::restack(plan, root, &mut changed, &mut |plan, at| {
-            match rewrite(plan, at, &mut next) {
-                Ok(done) => Some(done),
-                Err(Declined::Silently) => None,
-                Err(Declined::Because(reason)) => {
-                    let index = match *plan.node(at) {
-                        Node::Aggregate { index, .. } => index,
-                        _ => 0,
-                    };
-                    plan.note_declined(format!("aggregate #{index} {reason}"));
-                    None
-                }
+        let rewritten = walk::restack(plan, root, &mut changed, &mut |plan, at| match rewrite(
+            plan, at, &mut next,
+        ) {
+            Ok(done) => Some(done),
+            Err(Declined::Silently) => None,
+            Err(Declined::Because(reason)) => {
+                let index = match *plan.node(at) {
+                    Node::Aggregate { index, .. } => index,
+                    _ => 0,
+                };
+                plan.note_declined(format!("aggregate #{index} {reason}"));
+                None
             }
         });
         if changed {
@@ -132,11 +132,7 @@ struct Relation {
 type Place = (usize, u32);
 
 /// The node that stands in for the aggregate at `at`, or why there is none.
-fn rewrite(
-    plan: &mut Plan,
-    at: NodeRef,
-    next: &mut u32,
-) -> std::result::Result<NodeRef, Declined> {
+fn rewrite(plan: &mut Plan, at: NodeRef, next: &mut u32) -> std::result::Result<NodeRef, Declined> {
     let Node::Aggregate { input, index, groups, aggregates } = *plan.node(at) else {
         return Err(Declined::Silently);
     };
@@ -610,16 +606,16 @@ fn gyo(edges: &[BTreeSet<u32>]) -> std::result::Result<Vec<Option<usize>>, Strin
             let shared: BTreeSet<u32> = edges[ear]
                 .iter()
                 .copied()
-                .filter(|class| left.iter().any(|&other| other != ear && edges[other].contains(class)))
+                .filter(|class| {
+                    left.iter().any(|&other| other != ear && edges[other].contains(class))
+                })
                 .collect();
             if shared.is_empty() {
                 removed = Some((slot, None));
                 break;
             }
-            let holder = left
-                .iter()
-                .copied()
-                .find(|&other| other != ear && shared.is_subset(&edges[other]));
+            let holder =
+                left.iter().copied().find(|&other| other != ear && shared.is_subset(&edges[other]));
             if let Some(holder) = holder {
                 if shared.len() > 1 {
                     return Err("joins two relations on more than one column".to_owned());
@@ -747,14 +743,11 @@ fn rebound(
     find: &Resolver<'_>,
 ) -> ExprRef {
     if let Expr::Column(binding) = *plan.expr(expr) {
-        let (_, column) = find.place(plan, binding).expect("the predicate was checked to read this");
+        let (_, column) =
+            find.place(plan, binding).expect("the predicate was checked to read this");
         let ty = plan.expr_type(expr).clone();
         let span = plan.expr_span(expr);
-        return plan.add_expr_at(
-            Expr::Column(ColumnBinding::new(fresh, moved[&column])),
-            ty,
-            span,
-        );
+        return plan.add_expr_at(Expr::Column(ColumnBinding::new(fresh, moved[&column])), ty, span);
     }
     walk::rebuild(plan, expr, &mut |plan, child| rebound(plan, child, fresh, moved, find))
 }
@@ -855,7 +848,8 @@ mod tests {
              Get memory.main.a AS a #0 [x::INTEGER, y::INTEGER]\n        \
              Get memory.main.b AS b #1 [x::INTEGER, y::INTEGER]\n      \
              Get memory.main.c AS c #2 [x::INTEGER, y::INTEGER]\n";
-        let plan = Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        let plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         let (text, declined) = rewritten(plan);
         assert!(!text.contains("Consistent"), "{text}");
         assert!(declined.iter().any(|written| written.contains("cycle")), "{declined:?}");

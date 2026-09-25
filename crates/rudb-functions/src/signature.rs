@@ -353,6 +353,8 @@ enum Fixed {
     Timestamp,
     TimestampTz,
     Interval,
+    /// The type of a bare `NULL`, which is what `setseed` answers.
+    Null,
 }
 
 impl Fixed {
@@ -372,6 +374,7 @@ impl Fixed {
             Self::Timestamp => LogicalType::Timestamp,
             Self::TimestampTz => LogicalType::TimestampTz,
             Self::Interval => LogicalType::Interval,
+            Self::Null => LogicalType::Null,
         }
     }
 }
@@ -496,6 +499,17 @@ const TABLE: &[Entry] = &[
     number("pow", Arity::exactly(2), Shape::FixedTo(Fixed::Double, Fixed::Double)),
     number("nextafter", Arity::exactly(2), Shape::FixedTo(Fixed::Double, Fixed::Double)),
     number("pi", Arity::exactly(0), Shape::Constant(Fixed::Double)),
+    // Volatile, so neither is folded, and the executor hands `random` the row count it cannot
+    // take from an argument. `setseed('a')` is the cast refusing a string, which is why it is not
+    // limited to numbers.
+    number("random", Arity::exactly(0), Shape::Constant(Fixed::Double)),
+    Entry {
+        name: "setseed",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::FixedTo(Fixed::Double, Fixed::Null),
+        numeric_only: false,
+    },
     number("floor", Arity::exactly(1), Shape::Floored),
     number("ceil", Arity::exactly(1), Shape::Floored),
     number("round", Arity::between(1, 2), Shape::Rounded),
@@ -1806,6 +1820,8 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("pi", &["pi() -> DOUBLE"]),
+    ("random", &["random() -> DOUBLE"]),
+    ("setseed", &["setseed(col0 DOUBLE) -> \"NULL\""]),
     (
         "floor",
         &[
@@ -2606,6 +2622,7 @@ impl Fixed {
             Self::Timestamp => "TIMESTAMP",
             Self::TimestampTz => "TIMESTAMP WITH TIME ZONE",
             Self::Interval => "INTERVAL",
+            Self::Null => "\"NULL\"",
         }
     }
 }

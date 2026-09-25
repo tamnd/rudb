@@ -151,7 +151,9 @@ impl Reducer {
                 if self.key(position(at), edge.class).is_none()
                     || self.key(edge.leaf, edge.class).is_none()
                 {
-                    return fail("shares a class with its parent that one of the two has no column in");
+                    return fail(
+                        "shares a class with its parent that one of the two has no column in",
+                    );
                 }
             }
         }

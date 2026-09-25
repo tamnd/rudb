@@ -109,6 +109,10 @@ pub(crate) fn evaluate_in_time_zone(
                     })
                     .map_err(|error| error.with_fallback_span(plan.expr_span(expr)));
             }
+            // `random()` has no argument to take a row count from, so it is given the chunk's.
+            if plan.string(name) == "random" && plan.expr_list(args).is_empty() {
+                return rudb_kernels::random(chunk.len());
+            }
             let args =
                 evaluate_all_in_time_zone(plan, plan.expr_list(args), schema, chunk, time_zone)?;
             // The renderer runs only if a kernel asks for it, which is only on the row that divides

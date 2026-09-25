@@ -27,15 +27,19 @@ pub(crate) fn vector(ty: &LogicalType, cells: &[Cell]) -> Result<Vector> {
             const W: usize = std::mem::size_of::<$t>();
             let v: Vec<$t> = cells
                 .iter()
-                .map(|c| c.map_or(<$t>::default(), |b| <$t>::from_le_bytes(b[..W].try_into().unwrap_or_default())))
+                .map(|c| {
+                    c.map_or(<$t>::default(), |b| {
+                        <$t>::from_le_bytes(b[..W].try_into().unwrap_or_default())
+                    })
+                })
                 .collect();
             Data::$variant(Buffer::from(v))
         }};
     }
     let data = match ty.physical() {
-        PhysicalType::Bool => {
-            Data::Bool(Buffer::from(cells.iter().map(|c| c.is_some_and(|b| b[0] != 0)).collect::<Vec<_>>()))
-        }
+        PhysicalType::Bool => Data::Bool(Buffer::from(
+            cells.iter().map(|c| c.is_some_and(|b| b[0] != 0)).collect::<Vec<_>>(),
+        )),
         PhysicalType::Int8 => fixed!(Int8, i8),
         PhysicalType::Int16 => fixed!(Int16, i16),
         PhysicalType::Int32 => fixed!(Int32, i32),
@@ -85,7 +89,8 @@ pub(crate) fn values(rows: &[Vec<Value>], columns: &[Column]) -> Result<Chunk> {
 
 /// The groups of a hash aggregate: the keys and then the finished accumulators.
 pub(crate) fn groups(rt: &Rt, g: &Grouping, columns: &[Column]) -> Result<Vec<Chunk>> {
-    let table = rt.table(g.table).ok_or_else(|| Error::internal("the aggregate's table is gone"))?;
+    let table =
+        rt.table(g.table).ok_or_else(|| Error::internal("the aggregate's table is gone"))?;
     let mut chunks = Vec::new();
     let mut from = 0;
     while from < table.len() {
@@ -182,8 +187,20 @@ pub(crate) fn sort(
         for &(c, descending, nulls_first) in &keys {
             let o = match (l[c].is_null(), r[c].is_null()) {
                 (true, true) => Ordering::Equal,
-                (true, false) => if nulls_first { Ordering::Less } else { Ordering::Greater },
-                (false, true) => if nulls_first { Ordering::Greater } else { Ordering::Less },
+                (true, false) => {
+                    if nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (false, true) => {
+                    if nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
                 (false, false) => match order(&l[c], &r[c]) {
                     Ok(o) if descending => o.reverse(),
                     Ok(o) => o,
