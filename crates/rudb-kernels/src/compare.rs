@@ -2266,7 +2266,7 @@ fn numeric_order(left: &Value, right: &Value) -> Result<Ordering> {
 }
 
 /// DuckDB's float order: NaN is equal to itself and above everything else, and zero has one place.
-fn float_order(left: f64, right: f64) -> Ordering {
+pub(crate) fn float_order(left: f64, right: f64) -> Ordering {
     if left == right {
         return Ordering::Equal;
     }
