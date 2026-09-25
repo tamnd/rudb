@@ -2953,6 +2953,90 @@ fn divide_and_mod_name_themselves_when_they_divide_by_zero() {
     );
 }
 
+/// The pin's built-in macros expand into their bodies, so `fmod` is a double because its body
+/// divides, `geomean` aggregates with the rest of its block, and a call with the wrong number of
+/// arguments lists every overload the way the pin does.
+#[test]
+fn a_builtin_macro_binds_as_the_body_the_pin_gives_it() {
+    let db = database();
+    let result = db.query("SELECT fmod(7, 3), fdiv(7, 2), fmod(-7, 3), current_role").unwrap();
+    assert_eq!(result.names(), ["fmod(7, 3)", "fdiv(7, 2)", "fmod(-7, 3)", "current_role"]);
+    assert_eq!(
+        result.rows().collect::<Vec<_>>(),
+        vec![vec![Value::Double(1.0), Value::Double(3.0), Value::Double(2.0), text("duckdb")]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT s, geomean(x), weighted_avg(x, x) FROM t GROUP BY s ORDER BY s NULLS LAST"
+        ),
+        vec![
+            vec![text("a"), Value::Double(1.732_050_807_568_877_4), Value::Double(2.5)],
+            vec![text("c"), Value::Double(2.0), Value::Double(2.0)],
+            vec![Value::Null, Value::Double(1.0), Value::Double(1.0)],
+        ]
+    );
+    assert_eq!(
+        rows(&db, "SELECT array_pop_back([1, 2, 3]), array_pop_front([1, 2, 3])"),
+        vec![vec![list(&[1, 2]), list(&[2, 3])]]
+    );
+    assert_eq!(rows(&db, "SELECT assert_true(x > 0) FROM t LIMIT 1"), vec![vec![Value::Null]]);
+    assert_eq!(failure(&db, "SELECT assert_true(x > 1) FROM t"), "Assertion failed");
+    assert_eq!(
+        failure(&db, "SELECT assert_true(x > 1, 'too small') FROM t"),
+        "Assertion: too small"
+    );
+    assert_eq!(
+        failure(&db, "SELECT assert_true()"),
+        "Macro assert_true() does not support the supplied arguments. You might need to add \
+         explicit type casts.\nCandidate macros:\n\tassert_true(condition)\n\t\
+         assert_true(condition, message)"
+    );
+}
+
+/// `error` fails with its argument as the message, answers NULL for a NULL one, and is only
+/// reached for the rows that reach it.
+#[test]
+fn error_fails_with_the_message_it_was_given() {
+    let db = database();
+    assert_eq!(failure(&db, "SELECT error('boom')"), "boom");
+    assert_eq!(rows(&db, "SELECT error(NULL)"), vec![vec![Value::Null]]);
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT CASE WHEN x > 0 THEN x ELSE error('never') END FROM t ORDER BY 1 LIMIT 1"
+        ),
+        vec![vec![integer(1)]]
+    );
+}
+
+/// A number is named after the value it stands for, and a minus written onto a decimal is part of
+/// it unless brackets or a second minus keep them apart.
+#[test]
+fn a_number_is_named_the_way_the_pin_prints_it() {
+    let db = database();
+    let sql = "SELECT -1.5, - 1.5, -(1.5), - -1.5, -(-1.5), .5, 00.50, 1., 1_000.5, 1.5e3, -0.0";
+    let result = db.query(sql).unwrap();
+    assert_eq!(
+        result.names(),
+        [
+            "-1.5",
+            "-1.5",
+            "-(1.5)",
+            "-(-(1.5))",
+            "-(-1.5)",
+            ".5",
+            "0.50",
+            "1",
+            "1000.5",
+            "1500.0",
+            "0.0"
+        ]
+    );
+    assert_eq!(result.value_at(0, 5).to_string(), ".5");
+    assert_eq!(result.value_at(0, 6).to_string(), "0.50");
+}
+
 #[test]
 fn timestamp_to_timestamptz_casts_can_be_disabled_while_binding() {
     let db = database();

@@ -60,7 +60,7 @@ impl Binder<'_> {
         expr: ast::ExprRef,
         scope: &Scope,
     ) -> Result<ExprRef> {
-        let span = ast.expr_span(expr);
+        let span = self.pinned_span.unwrap_or_else(|| ast.expr_span(expr));
         let outer = std::mem::replace(&mut self.current_span, span);
         let result =
             self.bind_expr_inner(ast, expr, scope).map_err(|error| error.with_fallback_span(span));
@@ -618,6 +618,9 @@ impl Binder<'_> {
                 return Err(Error::parser("Wrong number of arguments provided to TRY expression"));
             };
             return self.bind_try(ast, only, scope);
+        }
+        if let Some(expanded) = self.builtin_macro(ast, &written, &arguments, scope)? {
+            return Ok(expanded);
         }
         if kind_of(&written) == Some(FunctionKind::Aggregate) {
             return self.bind_aggregate(ast, &written, &arguments, distinct, filter, scope);
@@ -1506,6 +1509,7 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
         ast::Expr::Function { name, args, .. } => {
             let written = ast.name(name).last().unwrap_or_default();
             kind_of(written) == Some(FunctionKind::Aggregate)
+                || crate::macros::aggregates(written)
                 || ast.expr_list(args).iter().any(|&arg| has_aggregate(ast, arg))
         }
         ast::Expr::Cast { operand, .. } => has_aggregate(ast, operand),
@@ -1646,7 +1650,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             LiteralKind::False => "false".to_string(),
             LiteralKind::String => format!("'{}'", ast.string(text)),
             LiteralKind::Blob => format!("'{}'::BLOB", ast.string(text)),
-            LiteralKind::Number => ast.string(text).to_string(),
+            LiteralKind::Number => number_name(ast.string(text)),
         },
         // A prefix operator is a function call with the argument in brackets, so `-i` is named
         // `-(i)` rather than `-i`. A minus in front of a whole number is the exception, because
@@ -1662,9 +1666,10 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             let inner = describe(ast, operand, semantics);
             match op {
                 UnaryOp::Not => format!("(NOT {inner})"),
-                UnaryOp::Negate => match whole_number(ast, operand) {
-                    Some(number) => flip(&number),
-                    None => format!("-({inner})"),
+                UnaryOp::Negate => match (whole_number(ast, operand), signed(ast, expr, operand)) {
+                    (Some(number), _) => flip(&number),
+                    (None, Some(number)) => number,
+                    (None, None) => format!("-({inner})"),
                 },
                 UnaryOp::Plus => format!("+({inner})"),
                 UnaryOp::BitNot => format!("~({inner})"),
@@ -1991,6 +1996,59 @@ fn whole_number(ast: &Ast, expr: ast::ExprRef) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The name of a number, which is the value it stands for printed the way the pin prints it.
+///
+/// So the underscores go, `1_000.5` is `1000.5`, one with an exponent is the double it is, `1.5e3`
+/// is `1500.0`, and a decimal loses the zeros in front and a point with nothing after it: `00.50`
+/// is `0.50` and `1.` is `1`. One with no digits before the point has none in its name either,
+/// which is how `.5` prints as a `DECIMAL(1,1)`.
+fn number_name(text: &str) -> String {
+    let plain: String = text.chars().filter(|&c| c != '_').collect();
+    let hex = plain.starts_with("0x") || plain.starts_with("0X");
+    if hex {
+        return plain;
+    }
+    if plain.contains(['e', 'E']) {
+        if let Ok(value) = plain.parse::<f64>() {
+            return Value::Double(value).to_string();
+        }
+        return plain;
+    }
+    let Some((whole, fraction)) = plain.split_once('.') else {
+        return plain;
+    };
+    let trimmed = whole.trim_start_matches('0');
+    let whole = if trimmed.is_empty() && !whole.is_empty() { "0" } else { trimmed };
+    if fraction.is_empty() { whole.to_string() } else { format!("{whole}.{fraction}") }
+}
+
+/// The name of a minus written straight onto a number with a point in it, which the pin reads as
+/// part of the number: `-1.5` is `-1.5`, `-(1.5)` keeps its brackets, and a negative zero loses
+/// its sign. A minus whose operand is another unbracketed minus is not one of these, since the pin
+/// names `- -1.5` as `-(-(1.5))`.
+///
+/// The tree has no brackets in it, so a bracket is read off the spans, which take in the brackets
+/// around what they cover: the operand of `-(1.5)` is wider than its own text, and the minus of
+/// `-(-1.5)` ends after its operand does, which is why that one is named `-(-1.5)`.
+fn signed(ast: &Ast, negation: ast::ExprRef, operand: ast::ExprRef) -> Option<String> {
+    let ast::Expr::Literal { kind: LiteralKind::Number, text } = ast.expr(operand) else {
+        return None;
+    };
+    let (inner, outer) = (ast.expr_span(operand), ast.expr_span(negation));
+    let written = ast.string(text).len() as u32;
+    let bracketed = inner.end - inner.start > written;
+    let doubled = outer.end == inner.end
+        && ast.exprs.iter().any(|held| {
+            matches!(held, ast::Expr::Unary { op: UnaryOp::Negate, operand } if *operand == negation)
+        });
+    if bracketed || doubled {
+        return None;
+    }
+    let name = number_name(ast.string(text));
+    let zero = name.bytes().all(|byte| matches!(byte, b'0' | b'.'));
+    Some(if zero { name } else { format!("-{name}") })
 }
 
 /// The same number with the other sign.

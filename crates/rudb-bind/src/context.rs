@@ -74,12 +74,13 @@ pub(crate) enum Context {
 
 /// The spellings that stand on their own with no parentheses, and what each one answers.
 ///
-/// Ten of them, and `current_database` is deliberately not one. The pin refuses a bare
+/// Eleven of them, and `current_database` is deliberately not one. The pin refuses a bare
 /// `current_database` with `Referenced column "current_database" was not found`, so it is a function
 /// there and not a keyword, and accepting it here would bind a query the pin does not.
 const KEYWORDS: &[(&str, Context)] = &[
     ("current_catalog", Context::Database),
     ("current_date", Context::Date),
+    ("current_role", Context::User),
     ("current_schema", Context::Schema),
     ("current_time", Context::ZonedTime),
     ("current_timestamp", Context::Instant),
@@ -204,12 +205,14 @@ mod tests {
             sorted.dedup();
             assert_eq!(names, sorted);
         }
-        assert_eq!(KEYWORDS.len(), 10);
+        assert_eq!(KEYWORDS.len(), 11);
         assert_eq!(CALLS.len(), 14);
     }
 
-    /// The four that are keywords only and the one that is a call only, which is the whole of the
+    /// The names that are keywords only and the ones that are calls only, which is the whole of the
     /// difference between the two lists and each side of it was measured against the pin.
+    /// `current_role()` is a call on the pin too, but as a macro, so it is expanded in
+    /// `crate::macros` and is not in the list of calls.
     #[test]
     fn the_names_that_take_only_one_of_the_two_spellings_are_the_five_measured() {
         let only_keyword: Vec<&str> = KEYWORDS
@@ -219,7 +222,13 @@ mod tests {
             .collect();
         assert_eq!(
             only_keyword,
-            vec!["current_time", "current_timestamp", "localtime", "localtimestamp"]
+            vec![
+                "current_role",
+                "current_time",
+                "current_timestamp",
+                "localtime",
+                "localtimestamp"
+            ]
         );
         let only_call: Vec<&str> = CALLS
             .iter()

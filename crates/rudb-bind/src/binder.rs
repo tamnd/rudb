@@ -251,6 +251,9 @@ pub(crate) struct Binder<'a> {
     next_index: u32,
     /// Source range inherited by plan objects built for the current AST expression or query.
     pub(crate) current_span: Span,
+    /// The span every expression is placed at while a built-in macro's body is bound, which is the
+    /// span of the call. See `crate::macros`.
+    pub(crate) pinned_span: Option<Span>,
     /// Set while a select block aggregates, which changes what a bare column means.
     pub(crate) aggregation: Option<Aggregation>,
     /// A grouped block may need stored column order to close groups while it scans. Other queries
@@ -339,6 +342,7 @@ impl<'a> Binder<'a> {
             plan: Plan::new(),
             next_index: 0,
             current_span: Span::new(0, 0),
+            pinned_span: None,
             aggregation: None,
             want_ascending: false,
             upsert: false,
