@@ -8,8 +8,10 @@
 
 use std::cmp::Ordering;
 
+use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
 use rudb_kernels::compare::order;
+use rudb_plan::{Node, NodeRef, Plan};
 use rudb_qc_gen::{AccOp, Grouping, qir_type};
 use rudb_qc_plan::{Column, Key, Kind};
 use rudb_qc_rt::{Rt, text};
@@ -230,6 +232,66 @@ pub(crate) fn sort(
             vectors.push(Vector::from_values(ty.clone(), &column)?);
         }
         out.push(Chunk::with_rows(vectors, part.len())?);
+    }
+    Ok(out)
+}
+
+/// The table rows named by column `ordinal` of `chunks`, read back in the order they are named.
+///
+/// This is `rudb_exec`'s `TableFetch` over rows the compiled engine produced: the ordinals are read
+/// in file order, each once, and then put back into the order the stage before gave them.
+pub(crate) fn fetch(
+    chunks: Vec<Chunk>,
+    plan: &Plan,
+    node: NodeRef,
+    ordinal: usize,
+    catalog: &Catalog,
+) -> Result<Vec<Chunk>> {
+    let Node::TableFetch { catalog: c, schema, table, columns, .. } = *plan.node(node) else {
+        return Err(Error::internal("a fetch stage that names no TableFetch"));
+    };
+    let name = QualifiedName::new(plan.string(c), plan.string(schema), plan.string(table));
+    let table = catalog.table(&name)?;
+    let fields = plan.field_list(columns);
+    let positions = fields
+        .iter()
+        .map(|f| {
+            table
+                .column_index(&f.name)
+                .ok_or_else(|| Error::internal(format!("{name} has no column {}", f.name)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let types: Vec<LogicalType> = fields.iter().map(|f| f.ty.clone()).collect();
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let count = chunk.len();
+        if count == 0 {
+            continue;
+        }
+        let mut held = Vec::with_capacity(count);
+        for i in 0..count {
+            match chunk.column(ordinal)?.value_at(i) {
+                Value::BigInt(n) => held
+                    .push(u64::try_from(n).map_err(|_| Error::internal("a negative row ordinal"))?),
+                other => return Err(Error::internal(format!("a row ordinal of {other:?}"))),
+            }
+        }
+        let mut order: Vec<usize> = (0..count).collect();
+        order.sort_by_key(|&at| held[at]);
+        let mut rows = Vec::with_capacity(count);
+        let mut taken = vec![0_u32; count];
+        for at in order {
+            if rows.last() != Some(&held[at]) {
+                rows.push(held[at]);
+            }
+            taken[at] = u32::try_from(rows.len() - 1).unwrap_or(u32::MAX);
+        }
+        let fetched = table.rows().rows_at(&types, &positions, &rows)?;
+        let mut vectors = Vec::with_capacity(fetched.width());
+        for at in 0..fetched.width() {
+            vectors.push(fetched.column(at)?.gather(&taken)?);
+        }
+        out.push(Chunk::with_rows(vectors, count)?);
     }
     Ok(out)
 }
