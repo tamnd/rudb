@@ -33,6 +33,14 @@ readme = "README.md"
 # section 18.3. Internal crates are pinned exactly so that a partial publish cannot produce a
 # mixed-version build.
 [workspace.dependencies]
+# The code generator of the query compiler's second tier, and only behind the `qc-clif` feature,
+# so the default build keeps the zero dependency rule. Pinned exactly because the IR it takes and the
+# instructions it knows change between releases, and 0.125 is the last one that builds on our MSRV.
+# The codegen crate without its defaults, which would build every target: `host-arch` is the one
+# target the code runs on. cranelift-frontend asks for the default features back, so unwind and
+# gimli come in regardless.
+cranelift-codegen = { version = "=0.125.0", default-features = false, features = ["std", "host-arch"] }
+cranelift-frontend = { version = "=0.125.0", default-features = false, features = ["std"] }
 chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 chrono-tz = "0.10.4"
 iana-time-zone = "0.1.65"
@@ -77,6 +85,7 @@ rudb-pipeline = { version = "=0.5.0", path = "crates/rudb-pipeline" }
 rudb-plan = { version = "=0.5.0", path = "crates/rudb-plan" }
 rudb-qc-ir = { version = "=0.5.0", path = "crates/rudb-qc-ir" }
 rudb-qc-interp = { version = "=0.5.0", path = "crates/rudb-qc-interp" }
+rudb-qc-clif = { version = "=0.5.0", path = "crates/rudb-qc-clif" }
 rudb-qc-rt = { version = "=0.5.0", path = "crates/rudb-qc-rt" }
 rudb-qc-plan = { version = "=0.5.0", path = "crates/rudb-qc-plan" }
 rudb-qc-pipe = { version = "=0.5.0", path = "crates/rudb-qc-pipe" }

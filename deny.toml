@@ -15,6 +15,9 @@ version = 2
 # We ship under Apache-2.0 and only take dependencies whose terms that license can carry.
 allow = [
   "Apache-2.0",
+  # Cranelift, regalloc2 and target-lexicon, which the qc-clif feature builds. The exception only
+  # widens what a user of the object code may do, so Apache-2.0 carries it.
+  "Apache-2.0 WITH LLVM-exception",
   "MIT",
   "Unicode-3.0",
 ]
@@ -28,7 +31,10 @@ deny = [
   # one and probed by the other is a wrong answer that only appears under a feature combination
   # nobody ran. Warn broadly above, deny for the crates where it would actually hurt.
   { name = "ahash" },
-  { name = "hashbrown" },
+  # Cranelift keeps its own tables in hashbrown, through regalloc2 and through gimli's indexmap.
+  # They hold the compiler's values while a function is lowered and never a row, so the copies
+  # cannot build a table the database probes.
+  { name = "hashbrown", wrappers = ["cranelift-codegen", "regalloc2", "indexmap"] },
   # spec/13-ecosystem.md: we read Parquet ourselves rather than shelling out to a reader whose
   # data structures we would then have to convert out of on the scan path.
   { name = "parquet2" },

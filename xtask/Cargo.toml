@@ -26,5 +26,11 @@ rudb-parse.workspace = true
 rudb-plan.workspace = true
 rudb-vector.workspace = true
 
+[features]
+default = []
+# The query compiler's second tier. The tasks that measure turn it on when they rebuild themselves
+# under the bench profile, so the number is the one a release with the tier would give.
+qc-clif = ["rudb/qc-clif"]
+
 [lints]
 workspace = true

@@ -163,6 +163,11 @@ pub(crate) struct Settings {
     ///
     /// Not a DuckDB setting, so not in the settings catalog, for the reason the seams are not.
     engine: RwLock<String>,
+    /// Which tier the compiled engine runs its pipelines on, as `SET qc_tier` has left it: `auto`,
+    /// `interp` or `clif`. Only read when the engine is `compiled`.
+    ///
+    /// Not a DuckDB setting either, for the same reason.
+    tier: RwLock<rudb_qc::Tier>,
 }
 
 impl Settings {
@@ -200,6 +205,7 @@ impl Settings {
             links: RwLock::new(String::new()),
             sizes: RwLock::new(rudb_opt::link::Sizes::default()),
             engine: RwLock::new(FIRST_ENGINE.to_string()),
+            tier: RwLock::new(rudb_qc::Tier::Auto),
         }
     }
 
@@ -238,6 +244,11 @@ impl Settings {
     /// The engine `SET engine` picked, `first` or `compiled`.
     pub(crate) fn engine(&self) -> String {
         self.engine.read().unwrap_or_else(|held| held.into_inner()).clone()
+    }
+
+    /// The tier `SET qc_tier` picked.
+    pub(crate) fn tier(&self) -> rudb_qc::Tier {
+        *self.tier.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The configuration as the statements have left it.
@@ -306,6 +317,23 @@ impl Settings {
                 )));
             }
             *self.engine.write().unwrap_or_else(|held| held.into_inner()) = engine;
+            return Ok(());
+        }
+        if is_tier(name) {
+            let written = value.map_or_else(|| rudb_qc::Tier::Auto.name().to_string(), text_of);
+            let names: Vec<&str> = rudb_qc::Tier::ALL.iter().map(|t| t.name()).collect();
+            let tier = rudb_qc::Tier::from_name(&written).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "qc_tier is one of {}, not {written}",
+                    names.join(", ")
+                ))
+            })?;
+            if !tier.built() {
+                return Err(Error::invalid_input(format!(
+                    "qc_tier {tier} needs a build with the qc-clif feature"
+                )));
+            }
+            *self.tier.write().unwrap_or_else(|held| held.into_inner()) = tier;
             return Ok(());
         }
         if is_links(name) {
@@ -674,6 +702,9 @@ impl Settings {
         if is_engine(name) {
             return Ok(self.engine());
         }
+        if is_tier(name) {
+            return Ok(self.tier().name().to_string());
+        }
         if let Some(which) = graph_size(name) {
             let sizes = self.sizes();
             return Ok(match which {
@@ -964,6 +995,11 @@ pub(crate) const COMPILED_ENGINE: &str = "compiled";
 /// The same shape as [`is_seam`], and a DuckDB setting of this name, should one ever exist, wins.
 fn is_engine(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("engine")
+}
+
+/// Whether this name is the compiled engine's tier setting, the same shape as [`is_engine`].
+fn is_tier(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("qc_tier")
 }
 
 /// Whether this name is the relationship declaration setting.

@@ -83,7 +83,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
 }
 
 /// One table per Parquet file in `dir`, named after the file.
-fn create(database: &Database, dir: &Path) -> Result<usize, String> {
+pub(crate) fn create(database: &Database, dir: &Path) -> Result<usize, String> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| format!("reading {}: {e}", dir.display()))? {
         let path = entry.map_err(|e| e.to_string())?.path();
@@ -121,7 +121,7 @@ fn explain(database: &Database, sql: &str) -> Result<String, String> {
 }
 
 /// The named queries in a file with `-- qNN` headers, or in a directory of one query per file.
-fn read(path: &Path) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn read(path: &Path) -> Result<Vec<(String, String)>, String> {
     let unreadable = |p: &Path, e: std::io::Error| format!("reading {}: {e}", p.display());
     if !path.is_dir() {
         let text = std::fs::read_to_string(path).map_err(|e| unreadable(path, e))?;

@@ -11,6 +11,7 @@ pub mod code;
 pub mod join;
 pub mod like;
 mod mem;
+pub mod native;
 mod rt;
 pub mod table;
 pub mod text;

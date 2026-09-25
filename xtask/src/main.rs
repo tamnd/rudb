@@ -292,7 +292,10 @@ fn usage() {
     println!("                         RUDB_BENCH_REPO, and the suite's data on the machine");
     println!("  compiled <file> [q..]  the forty three ClickBench queries under SET engine first");
     println!("                         and compiled over that Parquet file, rows compared, and");
-    println!("                         the compiled engine's refusals grouped by reason");
+    println!("                         the compiled engine's refusals grouped by reason.");
+    println!("                         --tier auto|interp|clif first picks the compiled engine's");
+    println!("                         tier, and --suite <dir> <q> in place of the file runs the");
+    println!("                         queries in q over the tables refusals would make from dir");
     println!("  refusals <dir> <q>     every query in q, a .sql file with -- qNN headers or a");
     println!("                         directory of .sql files, through EXPLAIN (CODEGEN) over");
     println!("                         tables made from the parquet files in dir, with the");

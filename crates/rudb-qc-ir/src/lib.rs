@@ -16,6 +16,7 @@
 mod build;
 pub mod catalogue;
 pub mod cfg;
+pub mod entry;
 pub mod eval;
 pub mod func;
 mod op;

@@ -152,9 +152,10 @@ pub(crate) fn rebuild(root: &Path, task: &str, rest: &[String]) -> Result<(), St
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     println!("building xtask under the bench profile, because a debug number is not a number");
     let mut args: Vec<String> =
-        ["run", "--quiet", "--profile", "bench", "--package", "xtask", "--", task]
-            .iter()
-            .map(|&arg| arg.to_string())
+        ["run", "--quiet", "--profile", "bench", "--package", "xtask", "--features", "qc-clif"]
+            .into_iter()
+            .chain(["--", task])
+            .map(str::to_string)
             .collect();
     args.extend(rest.iter().cloned());
     let status = Command::new(cargo)

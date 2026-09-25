@@ -57,9 +57,10 @@ pub const COL_VALID: i32 = 8;
 
 /// The first cache line of every pipeline's state, before the local slots.
 ///
-/// The body reads its fields at the offsets below. `rt` and `profile` are opaque here: the
-/// interpreter tier passes the runtime to a step as an argument and keeps no counters yet, so
-/// both stay null until a tier that needs them fills them in.
+/// The body reads its fields at the offsets below. `rt` and `profile` are opaque here. The
+/// interpreter tier passes the runtime to a step as an argument, so `rt` is null under it, and a
+/// native tier finds the runtime through `rt` instead (see [`crate::native`]). Nothing keeps
+/// counters yet, so `profile` stays null.
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
 pub struct StateHeader {
@@ -108,6 +109,8 @@ impl StateHeader {
 
 /// The size of the state header. Local slots start here.
 pub const HEADER: u32 = 64;
+/// The header's `rt` word, which holds a [`crate::native::Ctx`] while native code runs.
+pub const RT: i32 = rudb_qc_ir::entry::CTX_OFFSET;
 /// The header's `cursor` word, where a body that yields records how far it got.
 pub const CURSOR: i32 = 24;
 /// The header's deferred error word.
@@ -129,6 +132,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Col, valid), COL_VALID as usize);
         assert_eq!(size_of::<StateHeader>(), HEADER as usize);
         assert_eq!(align_of::<StateHeader>(), 64);
+        assert_eq!(std::mem::offset_of!(StateHeader, rt), RT as usize);
         assert_eq!(std::mem::offset_of!(StateHeader, cursor), CURSOR as usize);
         assert_eq!(std::mem::offset_of!(StateHeader, error), ERROR as usize);
         assert_eq!(std::mem::offset_of!(StateHeader, poll_left), POLL_LEFT as usize);
