@@ -220,7 +220,13 @@ impl<'a> Keep<'a> {
     fn fill(&self, chunks: &[Chunk]) -> Result<()> {
         let Some(sideways) = self.sideways.as_ref() else { return Ok(()) };
         let Some(keyed) = sideways.keyed() else { return Ok(()) };
-        sideways.found(sideways::found_for(keyed, sideways.exact(), chunks, sideways.is_wanted())?);
+        sideways.found(sideways::found_for(
+            keyed,
+            sideways.exact(),
+            chunks,
+            sideways.is_wanted(),
+            sideways.placed(),
+        )?);
         Ok(())
     }
 }

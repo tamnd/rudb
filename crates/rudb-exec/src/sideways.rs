@@ -71,6 +71,7 @@ use std::sync::{Arc, OnceLock};
 
 use rudb_common::bounds::{Bound, Op};
 use rudb_common::{LogicalType, Result, SessionTimeZone};
+use rudb_graph::link::Form;
 use rudb_graph::{Adjacency, KeyMap, Link, PART_ROWS, Pushed, Rids};
 use rudb_metrics::Reduced;
 use rudb_plan::{BuildSide, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
@@ -116,6 +117,10 @@ pub(crate) struct Sideways<'a> {
     /// Whether a join above wants the build side's keys as a bitmap even where the scan has
     /// something better. Written while the query is being built. See [`Sideways::kept`].
     wanted: OnceLock<()>,
+    /// Whether the scan this is about reads it as one of several, below another join's handoff
+    /// that is its own. Such a scan cannot place exact rows from this one, see [`Found::spare`], so
+    /// the build side does not make them. Written when the scan is built.
+    aside: OnceLock<()>,
 }
 
 /// What one side of a join holds, as much of it as was worth keeping.
@@ -138,6 +143,11 @@ pub(crate) struct Found {
     /// The build side's keys as a bitmap over the parent's key range, when the join had a key map
     /// and no link. Like `rows`, it takes the place of the filter.
     domain: Option<Domain>,
+    /// The same bitmap kept beside `rows`, for a scan that is reduced by another join's rows and
+    /// so reads this join's answer as one of several. Such a scan cannot place a second set of
+    /// rows, because the rows it tests have already been narrowed, and without this it would get
+    /// nothing from the join at all, since `rows` takes the place of the filter.
+    spare: Option<Domain>,
     /// The build side's keys as a bitmap over their own range, made only for a join above that
     /// asked for it and only when `domain` is not there. The scan never reads it.
     held: Option<Domain>,
@@ -297,6 +307,8 @@ pub(crate) struct Exact {
     /// The children of every parent row, when the file holds the backward adjacency. With it a
     /// build side that holds few parents becomes the driving rows by reading their lists.
     adjacency: OnceLock<Option<Adjacency>>,
+    /// The form the link takes, read off its head without reading the link.
+    form: OnceLock<Option<Form>>,
     /// Where the three are read from, or nothing when they were handed over already read.
     stored: Option<Stored>,
 }
@@ -321,6 +333,7 @@ impl Exact {
             keys: OnceLock::from(Some(keys)),
             link: OnceLock::from(link),
             adjacency: OnceLock::from(None),
+            form: OnceLock::new(),
             stored: None,
         }
     }
@@ -333,6 +346,7 @@ impl Exact {
             keys: OnceLock::new(),
             link: OnceLock::new(),
             adjacency: OnceLock::new(),
+            form: OnceLock::new(),
             stored: Some(stored),
         }
     }
@@ -375,6 +389,7 @@ impl Exact {
             keys: OnceLock::from(Some(keys)),
             link: OnceLock::from(None),
             adjacency: OnceLock::from(Some(adjacency)),
+            form: OnceLock::new(),
             stored: None,
         }
     }
@@ -387,6 +402,17 @@ impl Exact {
                 rudb_native::graph::stored_adjacency(child, &stored.parent, edge)
             })
             .as_ref()
+    }
+
+    /// Whether the link is in the monotone form, which [`reduce`] can push for what the set holds.
+    fn monotone(&self) -> bool {
+        let form = self.form.get_or_init(|| {
+            let Some(stored) = self.stored.as_ref() else { return self.link().map(Link::form) };
+            let (child, edge) = stored.child.as_ref()?;
+            rudb_native::graph::stored_link_counts(child, &stored.parent, edge)
+                .map(|counts| counts.form)
+        });
+        *form == Some(Form::Monotone)
     }
 
     fn link(&self) -> Option<&Link> {
@@ -482,6 +508,16 @@ impl<'a> Sideways<'a> {
         let _ = self.wanted.set(());
     }
 
+    /// Says the scan reads this handoff as one of several. See [`Sideways::aside`].
+    pub(crate) fn set_aside(&self) {
+        let _ = self.aside.set(());
+    }
+
+    /// Whether exact rows from this handoff would be placed by the scan. See [`Sideways::aside`].
+    pub(crate) fn placed(&self) -> bool {
+        self.aside.get().is_none()
+    }
+
     /// Whether a join above asked for [`Sideways::kept`].
     pub(crate) fn is_wanted(&self) -> bool {
         self.wanted.get().is_some()
@@ -570,6 +606,16 @@ impl<'a> Sideways<'a> {
         }
         Some((binding.column as usize, self.found.get()?.domain.as_ref()?))
     }
+
+    /// The bitmap kept beside the exact rows, for a scan that cannot place them. See
+    /// [`Found::spare`].
+    pub(crate) fn spare(&self, index: u32) -> Option<(usize, &Domain)> {
+        let binding = self.binding.get()?;
+        if binding.table != index {
+            return None;
+        }
+        Some((binding.column as usize, self.found.get()?.spare.as_ref()?))
+    }
 }
 
 /// The same column as `binding`, named the way the scan at the bottom of `node` names it.
@@ -653,11 +699,15 @@ pub(crate) fn through(node: &Node) -> Option<NodeRef> {
 ///
 /// With `wanted`, the keys as a bitmap as well when nothing else made one, for a join above that
 /// asked. See [`Sideways::wanted`].
+///
+/// With `placed` false, no exact rows, because the scan reads this handoff as one of several and
+/// places only the rows of its own. The bitmap over the key values is made as it would be.
 pub(crate) fn found_for(
     keyed: &Keyed<'_>,
     exact: Option<&Exact>,
     chunks: &[Chunk],
     wanted: bool,
+    placed: bool,
 ) -> Result<Found> {
     let (plan, exprs, schema, time_zone) = keyed.parts();
     let rows: usize = chunks.iter().map(Chunk::len).sum();
@@ -672,12 +722,19 @@ pub(crate) fn found_for(
     // enough of the driving table to pay for the lookups and the link, see [`Exact::might_skip`],
     // and only then are those read.
     let by_key = exact.map(|exact| domain_of(keyed, exact, chunks)).transpose()?.flatten();
-    let listed = match exact {
+    let listed = match exact.filter(|_| placed) {
         Some(exact) => listed(keyed, exact, chunks)?,
         None => None,
     };
+    // A monotone link is pushed whatever it could skip, because the push walks from one held
+    // parent to the next and costs about what the set holds, and the exact rows it makes spare the
+    // scan a bit test on every row of every part. On TPC-H q04 that took the query from 0.281 G to
+    // 0.106 G instructions on the file clustered by date, where the orders of one quarter are spread
+    // over too many parts of `lineitem` for the push to skip one.
     let trying = exact.filter(|exact| {
-        listed.is_none() && by_key.as_ref().is_none_or(|(_, held)| exact.might_skip(*held))
+        placed
+            && listed.is_none()
+            && (exact.monotone() || by_key.as_ref().is_none_or(|(_, held)| exact.might_skip(*held)))
     });
     let pushing = match listed {
         Some(listed) => Some(Pushing::Done(listed)),
@@ -694,12 +751,18 @@ pub(crate) fn found_for(
         by_key: false,
     });
     let mut domain = None;
-    if let (None, Some((bitmap, held))) = (&pushed, by_key) {
+    let mut spare = None;
+    if let Some((bitmap, held)) = by_key {
         let parents = exact.and_then(Exact::keys).map_or(0, KeyMap::len);
-        reduced = Some(Reduced { kept: held, rows: parents, stopped: false, by_key: true });
         // A side that holds every parent key removes only the rows whose key no parent holds, and
         // the join drops those as cheaply, so testing every row would buy nothing.
-        domain = (held < parents).then_some(bitmap);
+        let bitmap = (held < parents).then_some(bitmap);
+        if pushed.is_none() {
+            reduced = Some(Reduced { kept: held, rows: parents, stopped: false, by_key: true });
+            domain = bitmap;
+        } else {
+            spare = bitmap;
+        }
     }
     // The exact rows answer everything the filter would, with no false positives, so a side that
     // has them does not pay for building the filter too. Nor does a side whose reduction stopped
@@ -740,7 +803,17 @@ pub(crate) fn found_for(
             filter.add(word);
         }
     }
-    Ok(Found { range: extremes.into_range(), filter, rows: exact, domain, held, reduced, keys })
+    let spare = spare.filter(|_| exact.is_some());
+    Ok(Found {
+        range: extremes.into_range(),
+        filter,
+        rows: exact,
+        domain,
+        spare,
+        held,
+        reduced,
+        keys,
+    })
 }
 
 /// The build side's keys as a [`Domain`] over their own range, when that range is small enough.
@@ -865,12 +938,14 @@ fn integer(ty: &LogicalType) -> bool {
 /// decodes costs the link and a bit test for every row and the scan then decodes it anyway to test
 /// the key. TPC-H is the case where it does not pay: the orders of one quarter are spread over the
 /// whole of `lineitem`, the push skipped no part of it, and with the push q04 took 0.94 G
-/// instructions against 0.52 G with the bitmap.
+/// instructions against 0.52 G with the bitmap. A monotone link is never declined, because its
+/// push walks from one held parent to the next and costs about what the set holds, see
+/// `Rids::forward`, and the exact rows it makes are cheaper for the scan than the bitmap.
 fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<Pushing>> {
     let Some(map) = exact.keys() else { return Ok(None) };
     let Some(link) = exact.link() else { return Ok(None) };
     let Some(held) = held_parents(keyed, map, link.parents(), chunks)? else { return Ok(None) };
-    if map.span().is_some() {
+    if map.span().is_some() && link.form() != Form::Monotone {
         let (reached, parts) = held.reach(link)?;
         if reached.saturating_mul(2) >= parts {
             return Ok(Some(Pushing::Declined));
@@ -1046,7 +1121,7 @@ impl Found {
     /// A build side that turned out to hold this, for the tests that stand in for one.
     #[cfg(test)]
     pub(crate) fn of(range: Option<(Bound, Bound)>, filter: Option<Blocked>) -> Self {
-        Self { range, filter, rows: None, domain: None, held: None, reduced: None, keys: None }
+        Self { range, filter, ..Self::default() }
     }
 
     /// The same, with the keys as a sorted list beside the range.
@@ -1059,15 +1134,7 @@ impl Found {
     /// The same, with an exact set of driving rows.
     #[cfg(test)]
     pub(crate) fn exactly(range: Option<(Bound, Bound)>, rows: Rids) -> Self {
-        Self {
-            range,
-            filter: None,
-            rows: Some(rows),
-            domain: None,
-            held: None,
-            reduced: None,
-            keys: None,
-        }
+        Self { range, filter: None, rows: Some(rows), ..Self::default() }
     }
 }
 
@@ -1090,7 +1157,7 @@ mod tests {
         exact: Option<&Exact>,
         chunks: &[Chunk],
     ) -> rudb_common::Result<Found> {
-        found_for(keyed, exact, chunks, false)
+        found_for(keyed, exact, chunks, false, true)
     }
 
     fn column(values: &[Option<i32>]) -> Vector {
@@ -1407,7 +1474,7 @@ mod tests {
         let unasked = found(&keyed, Some(&exact), &side).expect("integers");
         assert!(unasked.rows.is_some() && unasked.domain.is_none() && unasked.held.is_none());
 
-        let asked = found_for(&keyed, Some(&exact), &side, true).expect("integers");
+        let asked = found_for(&keyed, Some(&exact), &side, true, true).expect("integers");
         assert!(asked.rows.is_some(), "the scan is still answered by the exact rows");
         let held = asked.held.expect("a bitmap for the join above");
         let kept: Vec<i64> = (90..160).filter(|&key| held.holds(key)).collect();
@@ -1494,13 +1561,34 @@ mod tests {
         assert!(exact.keys.get().is_some(), "handed over already read, so nothing was loaded");
     }
 
-    /// A thousand parents with a hundred children each, so a part of the driving table points at
-    /// about ten of them. A side that holds every fifth parent leaves a part with none of them
-    /// about one time in ten, so a push would skip almost nothing and the bitmap over the keys is
-    /// what the scan gets. The same side holding two parents next to each other is pushed, and the
-    /// push skips every part but the one they are in.
+    /// A thousand parents with a hundred children each, the children dealt round the parents so
+    /// that a part of the driving table points at all of them and the link is packed. A side that
+    /// holds every fifth parent leaves no part with none of them, so a push would skip nothing and
+    /// the bitmap over the keys is what the scan gets.
     #[test]
-    fn a_push_is_made_only_where_it_could_skip_parts() {
+    fn a_packed_link_is_pushed_only_where_it_could_skip_parts() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let parent_keys: Vec<Option<i128>> = (0..1_000).map(|rid| Some(100 + rid)).collect();
+        let parents_of: Vec<u64> = (0..100_000).map(|child| child % 1_000).collect();
+        let link = Link::build(&parents_of, 1_000).expect("every parent exists");
+        assert_eq!(link.form(), super::Form::Packed);
+        let exact = Exact::new(KeyMap::build(&parent_keys).expect("unique keys"), Some(link));
+
+        let spread: Vec<Option<i32>> = (0..1_000).step_by(5).map(|rid| Some(100 + rid)).collect();
+        let wide = found(&keyed, Some(&exact), &[chunk(&spread)]).expect("integers");
+        assert!(wide.rows.is_none(), "no push");
+        assert!(wide.domain.is_some() && wide.filter.is_none(), "the bitmap is the answer");
+        let reduced = wide.reduced.expect("a reduction to report");
+        assert_eq!((reduced.kept, reduced.rows, reduced.by_key), (200, 1_000, true));
+    }
+
+    /// The same parents with their children in parent order, which is the monotone form. The push
+    /// costs what the side holds, so it is made however spread the side is, and the bitmap is kept
+    /// beside the rows for a scan that reads this join as one of several.
+    #[test]
+    fn a_monotone_link_is_pushed_however_spread_the_side_is() {
         let mut plan = Plan::new();
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
@@ -1513,18 +1601,22 @@ mod tests {
 
         let spread: Vec<Option<i32>> = (0..1_000).step_by(5).map(|rid| Some(100 + rid)).collect();
         let wide = found(&keyed, Some(&exact), &[chunk(&spread)]).expect("integers");
-        assert!(wide.rows.is_none(), "no push");
-        assert!(wide.domain.is_some() && wide.filter.is_none(), "the bitmap is the answer");
-        let reduced = wide.reduced.expect("a reduction to report");
-        assert_eq!((reduced.kept, reduced.rows, reduced.by_key), (200, 1_000, true));
+        let rows = wide.rows.expect("a push");
+        let expected: Vec<u64> = (0..100_000).filter(|child| child / 100 % 5 == 0).collect();
+        assert_eq!(rows.iter().collect::<Vec<u64>>(), expected);
+        assert!(wide.domain.is_none() && wide.spare.is_some());
 
         let near =
             found(&keyed, Some(&exact), &[chunk(&[Some(600), Some(601)])]).expect("integers");
         let rows = near.rows.expect("a push");
         assert_eq!(rows.iter().collect::<Vec<u64>>(), (50_000..50_200).collect::<Vec<u64>>());
-        assert!(near.domain.is_none());
         let reduced = near.reduced.expect("a reduction to report");
         assert!(!reduced.by_key);
+
+        let aside =
+            found_for(&keyed, Some(&exact), &[chunk(&spread)], false, false).expect("integers");
+        assert!(aside.rows.is_none(), "a scan that cannot place rows is not given any");
+        assert!(aside.domain.is_some(), "and gets the bitmap in their place");
     }
 
     /// A driving side written as plan text, which is how every other operator test in this crate
