@@ -40,6 +40,13 @@
 //! out is that place, and everything past the slot, the chains, the single key test and the
 //! gathers, is the same code for both. See [`Lookup::build`].
 //!
+//! # Keys in order
+//!
+//! A side whose keys are distinct and already ascending, row after row, which is a table read in
+//! the order of its primary key, needs no chain either. A key's rank among the keys is then its row,
+//! so the slot a probe hands out is the gathered row itself, and the table is only which places hold
+//! a key. See [`Lookup::ordered`].
+//!
 //! # Nulls
 //!
 //! `NULL = NULL` is null and not true, so a row whose key holds a null in a column the join
@@ -49,11 +56,11 @@
 //! puts every null in one group and that is the same question.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use rudb_common::{Cancel, Error, LogicalType, Result};
 use rudb_pipeline::Lease;
-use rudb_vector::{Form, Vector};
+use rudb_vector::{Data, Form, Vector};
 
 use crate::pairs::in_parallel;
 use crate::table::{BATCH, Probe, Table, Walk};
@@ -132,6 +139,9 @@ pub(crate) struct Lookup {
     ///
     /// A key's slot is then how many keys sit below it rather than its place. See [`Ranked`].
     ranked: Option<Ranked>,
+    /// Whether a slot is the gathered row it names, which is true when the side's keys ascend with
+    /// no key twice and no row without one. `head` and `next` are then empty. See [`Lookup::ordered`].
+    ordered: bool,
 }
 
 /// The places that hold a key, one bit each, and how many keys sit before each word of them.
@@ -155,6 +165,47 @@ impl Ranked {
         for place in rows {
             words[place / 64] |= 1 << (place % 64);
         }
+        Self::counted(words)
+    }
+
+    /// The same for keys that ascend, set a slice of them per thread.
+    ///
+    /// The places of one slice are a run of words that the next slice starts after, so two slices
+    /// can only meet in the word one ends and the other starts in. Each slice keeps the word it is
+    /// in and writes it once it moves past it, which is one atomic `or` per word rather than per key.
+    fn ascending(
+        places: usize,
+        keys: &[i64],
+        low: i64,
+        size: usize,
+        threads: &Lease<'_>,
+    ) -> Result<Self> {
+        let words: Vec<AtomicU64> = (0..places.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+        let slices = keys.len().div_ceil(size);
+        let set = |slice: usize| -> Result<()> {
+            let within = &keys[slice * size..((slice + 1) * size).min(keys.len())];
+            let (mut at, mut bits) = (usize::MAX, 0u64);
+            for &key in within {
+                let place = key.wrapping_sub(low) as usize;
+                if place / 64 != at {
+                    if bits != 0 {
+                        words[at].fetch_or(bits, Ordering::Relaxed);
+                    }
+                    (at, bits) = (place / 64, 0);
+                }
+                bits |= 1 << (place % 64);
+            }
+            if bits != 0 {
+                words[at].fetch_or(bits, Ordering::Relaxed);
+            }
+            Ok(())
+        };
+        in_parallel(threads, slices, slices, "join index places", set)?;
+        Ok(Self::counted(words.into_iter().map(AtomicU64::into_inner).collect()))
+    }
+
+    /// The words with the count before each of them.
+    fn counted(words: Vec<u64>) -> Self {
         let mut before = Vec::with_capacity(words.len());
         let mut count = 0u32;
         for word in &words {
@@ -257,7 +308,17 @@ impl Lookup {
             kept += held;
         }
         let distinct = head.len();
-        Ok(Self { parts, bits, head, next, kept, distinct, low: None, ranked: None })
+        Ok(Self {
+            parts,
+            bits,
+            head,
+            next,
+            kept,
+            distinct,
+            low: None,
+            ranked: None,
+            ordered: false,
+        })
     }
 
     /// The direct form, when the key is one integer column compared with `=` and its keyed values
@@ -284,26 +345,49 @@ impl Lookup {
         if !integer(key.logical_type()) {
             return Ok(None);
         }
-        let mut block = Vec::new();
-        if !key.signed_block(&mut block) || block.len() < rows {
-            return Ok(None);
-        }
+        // Read where it lies when the column is already a flat run of `i64`, which a laid out
+        // `BIGINT` key is. Copied, that was 12 MB of fresh memory for the keys of `orders` and a
+        // third of the time the direct form took on q09.
+        let mut owned = Vec::new();
+        let block: &[i64] = match key.data() {
+            Some(Data::Int64(values)) if key.form() == Form::Flat && values.len() >= rows => {
+                &values.as_slice()[..rows]
+            }
+            _ => {
+                if !key.signed_block(&mut owned) || owned.len() < rows {
+                    return Ok(None);
+                }
+                &owned[..rows]
+            }
+        };
         let slices = slices_of(rows, threads.degree());
         let size = rows.div_ceil(slices);
-        let range = |slice: usize| -> Result<(i64, i64)> {
+        // The smallest and largest key of each slice, and whether the slice's keys ascend with every
+        // row keyed, which is asked in the same pass because it is one more compare a row.
+        let range = |slice: usize| -> Result<(i64, i64, bool)> {
             let (mut low, mut high) = (i64::MAX, i64::MIN);
             let within = slice * size..((slice + 1) * size).min(rows);
+            let mut ascending = true;
+            let mut last = None;
             for (&value, &keyed) in block[within.clone()].iter().zip(&keyed[within]) {
                 if keyed {
                     low = low.min(value);
                     high = high.max(value);
+                    ascending &= last.is_none_or(|last| last < value);
+                    last = Some(value);
+                } else {
+                    ascending = false;
                 }
             }
-            Ok((low, high))
+            Ok((low, high, ascending))
         };
         let ranges = in_parallel(threads, slices, slices, "join index range", range)?;
-        let low = ranges.iter().map(|&(low, _)| low).min().unwrap_or(i64::MAX);
-        let high = ranges.iter().map(|&(_, high)| high).max().unwrap_or(i64::MIN);
+        let low = ranges.iter().map(|&(low, _, _)| low).min().unwrap_or(i64::MAX);
+        let high = ranges.iter().map(|&(_, high, _)| high).max().unwrap_or(i64::MIN);
+        // Each slice ascends and ends below where the next one starts, so the whole side ascends.
+        let held: Vec<_> = ranges.iter().filter(|&&(low, high, _)| low <= high).collect();
+        let ordered = ranges.iter().all(|&(_, _, ascending)| ascending)
+            && held.windows(2).all(|pair| pair[0].1 < pair[1].0);
         if low > high {
             return Ok(None);
         }
@@ -315,6 +399,9 @@ impl Lookup {
         }
         cancel.check()?;
         let places = places as usize;
+        if ordered {
+            return Self::ordered(block, low, places, size, threads).map(Some);
+        }
         let place_of = |row: usize| block[row].wrapping_sub(low) as usize;
         let ranked = (places as u64 > (rows as u64).saturating_mul(PLACES))
             .then(|| Ranked::new(places, (0..rows).filter(|&row| keyed[row]).map(place_of)));
@@ -380,7 +467,51 @@ impl Lookup {
             distinct,
             low: Some(low),
             ranked,
+            ordered: false,
         }))
+    }
+
+    /// The form for keys that ascend, distinct and with no row unkeyed, which is a table read in the
+    /// order of its primary key: `orders` on `o_orderkey`, `part` on `p_partkey`, and the rest.
+    ///
+    /// The rank of a key among the keys is then the row it is in. So the slot a probe finds is the
+    /// gathered row, there is no chain for a slot to start, and every key is a chain of one. What is
+    /// left of the table is which places hold a key, a bit each and counts beside them, set a slice
+    /// of rows per thread. Keys with no gap between them do not need even that, because a place is
+    /// then its own rank.
+    ///
+    /// On TPC-H q09 the direct form built a `head` of six million places for the 1.5 million rows of
+    /// `orders`, which is 24 MB written by the build and missed into once for every driving row, and
+    /// dealt the rows to partitions to write it. The bits are 750 KB and a probe of them stays in the
+    /// cache.
+    fn ordered(
+        keys: &[i64],
+        low: i64,
+        places: usize,
+        size: usize,
+        threads: &Lease<'_>,
+    ) -> Result<Self> {
+        let rows = keys.len();
+        let ranked = (places != rows)
+            .then(|| Ranked::ascending(places, keys, low, size, threads))
+            .transpose()?;
+        Ok(Self {
+            parts: Vec::new(),
+            bits: 0,
+            head: Vec::new(),
+            next: Vec::new(),
+            kept: rows,
+            distinct: rows,
+            low: Some(low),
+            ranked,
+            ordered: true,
+        })
+    }
+
+    /// Whether a slot is the row it names. See [`Lookup::ordered`].
+    #[cfg(test)]
+    pub(crate) fn is_ordered(&self) -> bool {
+        self.ordered
     }
 
     /// Whether there is anything at all to look up.
@@ -477,15 +608,15 @@ impl Lookup {
     ) {
         let [key] = keys else { return };
         which_are_keyed(keys, rows, nulls, &mut scratch.keyed);
-        let places = self.head.len() as u64;
+        let places = self.slot_count() as u64;
         let ranked = self.ranked.as_ref();
         let hit = |value: i64| {
             let place = value.wrapping_sub(low) as u64;
             match ranked {
                 Some(ranked) => ranked.slot(place),
-                None => {
-                    (place < places && self.head[place as usize] != 0).then_some(place as usize)
-                }
+                // A side in order with no gap between its keys has a key at every place.
+                None => (place < places && (self.ordered || self.head[place as usize] != 0))
+                    .then_some(place as usize),
             }
         };
         if key.signed_block(&mut scratch.block) && scratch.block.len() >= rows {
@@ -541,7 +672,7 @@ impl Lookup {
 
     /// How many slots a probe can hand out, which is one past the largest.
     pub(crate) fn slot_count(&self) -> usize {
-        self.head.len()
+        if self.ordered { self.distinct } else { self.head.len() }
     }
 
     /// Whether every key in the table holds exactly one gathered row.
@@ -562,6 +693,11 @@ impl Lookup {
     /// flight at once, where the row loop had one and waited it out before the next.
     pub(crate) fn firsts(&self, slots: &[usize], into: &mut Vec<u32>) {
         into.clear();
+        if self.ordered {
+            // A slot is under `u32::MAX` rows here, and a miss is the one slot that is not.
+            into.extend(slots.iter().map(|&slot| u32::try_from(slot).unwrap_or(NONE)));
+            return;
+        }
         into.extend(
             slots
                 .iter()
@@ -574,6 +710,10 @@ impl Lookup {
     /// The same as [`Lookup::matches`] from its second step on. `into` is cleared here.
     pub(crate) fn chain_from(&self, first: u32, into: &mut Vec<u32>) {
         into.clear();
+        if self.ordered {
+            into.extend((first != NONE).then_some(first));
+            return;
+        }
         let mut at = first;
         while at != NONE {
             into.push(at);
@@ -592,6 +732,10 @@ impl Lookup {
     pub(crate) fn matches(&self, slot: usize, into: &mut Vec<u32>) {
         into.clear();
         if slot == MISS {
+            return;
+        }
+        if self.ordered {
+            into.push(slot as u32);
             return;
         }
         let mut at = self.head[slot].wrapping_sub(1);
@@ -1057,5 +1201,69 @@ mod tests {
         assert!(lookup.single());
         let found = found(&lookup, &[Some(1_000), Some(802), Some(801), Some(1_002), Some(999)]);
         assert_eq!(found, [vec![0], vec![99], vec![], vec![], vec![]]);
+    }
+
+    /// Keys that ascend, with gaps, on several threads: a key's slot is its row, a gap and either end
+    /// miss, and a probe's first row is the only one it has.
+    #[test]
+    fn an_ordered_side_answers_each_key_with_its_own_row() {
+        let values: Vec<Option<i32>> =
+            (0..SPLIT as i32 + 1_000).map(|row| Some(7 + row * 3)).collect();
+        let pool = Pool::new(4);
+        let lookup = built_by(&values, &[false], &pool.lease(4));
+        assert!(lookup.ordered && lookup.head.is_empty() && lookup.next.is_empty());
+        assert!(lookup.ranked.is_some(), "keys a third of their span are ranked");
+        assert!(lookup.single());
+        assert_eq!(lookup.slot_count(), values.len());
+        let last = 7 + (values.len() as i32 - 1) * 3;
+        let asked = [Some(7), Some(8), Some(10), Some(4), Some(last), Some(last + 3), Some(3_007)];
+        let found = found(&lookup, &asked);
+        assert_eq!(
+            found,
+            [vec![0], vec![], vec![1], vec![], vec![values.len() as u32 - 1], vec![], vec![1_000]]
+        );
+        let mut firsts = Vec::new();
+        lookup.firsts(&[5, MISS], &mut firsts);
+        assert_eq!(firsts, [5, super::NONE]);
+        let mut chain = Vec::new();
+        lookup.chain_from(5, &mut chain);
+        assert_eq!(chain, [5]);
+    }
+
+    /// Keys that ascend with no gap between them need no bits, since each place is its own rank.
+    #[test]
+    fn an_ordered_side_with_no_gaps_is_its_own_places() {
+        let values: Vec<Option<i32>> = (0..500).map(|row| Some(-20 + row)).collect();
+        let lookup = built(&values);
+        assert!(lookup.ordered && lookup.ranked.is_none());
+        assert_eq!(
+            found(&lookup, &[Some(-20), Some(479), Some(480), Some(-21)]),
+            [vec![0], vec![499], vec![], vec![]]
+        );
+    }
+
+    /// A key seen twice, a key lower than the one before it, or a row with no key at all is not in
+    /// order, on one thread or across the seam between two slices, and the chains answer instead.
+    #[test]
+    fn a_side_out_of_order_anywhere_keeps_its_chains() {
+        let rows = SPLIT as i32 + 1_000;
+        let pool = Pool::new(4);
+        // The last one is the first row of the second of four slices, so the seam is what breaks.
+        for broken in [1, rows / 2, rows - 1, (rows as usize).div_ceil(4) as i32] {
+            let ascending: Vec<Option<i32>> = (0..rows).map(|row| Some(row * 2)).collect();
+            let mut twice = ascending.clone();
+            twice[broken as usize] = twice[broken as usize - 1];
+            let mut lower = ascending.clone();
+            lower[broken as usize] = Some(-1);
+            let mut null = ascending.clone();
+            null[broken as usize] = None;
+            for values in [twice, lower, null] {
+                for threads in [Lease::alone(), pool.lease(4)] {
+                    let lookup = built_by(&values, &[false], &threads);
+                    assert!(!lookup.ordered, "broken at {broken}");
+                    answers_in_order(&lookup, &values, 1);
+                }
+            }
+        }
     }
 }
