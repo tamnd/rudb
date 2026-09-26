@@ -267,6 +267,10 @@ enum Shape {
     /// type the answer is in before it is held, which is a DOUBLE for any integer and a TIMESTAMP
     /// for a DATE, and a list of fractions answers a list.
     Continuous,
+    /// `reservoir_quantile(x, q[, size])`, which answers with one of its values like
+    /// [`Shape::Discrete`] but only takes numbers, an unsigned one widened to the signed type the
+    /// pin widens it to, and a sample size that fits an INTEGER.
+    Sampled,
     /// `median(x)`, which is [`Shape::Continuous`] over anything that interpolates, an INTERVAL
     /// included, and a value as given over anything else.
     Median,
@@ -1081,6 +1085,7 @@ const TABLE: &[Entry] = &[
     ),
     aggregate("quantile_cont", Arity::exactly(2), Shape::Continuous, false),
     aggregate("quantile_disc", Arity::exactly(2), Shape::Discrete, false),
+    aggregate("reservoir_quantile", Arity::between(2, 3), Shape::Sampled, false),
     aggregate("median", Arity::exactly(1), Shape::Median, false),
     aggregate("mad", Arity::exactly(1), Shape::Deviation, false),
     aggregate("mode", Arity::exactly(1), Shape::AsGiven, false),
@@ -1506,6 +1511,7 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let held = interpolated(value).ok_or_else(|| no_match(entry.name, arguments))?;
             (vec![held.clone(), fraction.clone()], fractioned(fraction, held))
         }
+        Shape::Sampled => sampled(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
         Shape::Picked => match arguments {
             [arg, by] => (vec![arg.clone(), by.clone()], arg.clone()),
             [arg, by, _] => {
@@ -1983,6 +1989,51 @@ fn interpolated(value: &LogicalType) -> Option<LogicalType> {
         LogicalType::Time => LogicalType::Time,
         _ => return None,
     })
+}
+
+/// The argument types and answer of `reservoir_quantile`, or `None` when the pin has no overload
+/// for the call.
+fn sampled(arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
+    let held = match &arguments[0] {
+        LogicalType::UTinyInt
+        | LogicalType::USmallInt
+        | LogicalType::UInteger
+        | LogicalType::Null => LogicalType::BigInt,
+        LogicalType::UBigInt => LogicalType::HugeInt,
+        LogicalType::UHugeInt => LogicalType::Double,
+        ty @ (LogicalType::TinyInt
+        | LogicalType::SmallInt
+        | LogicalType::Integer
+        | LogicalType::BigInt
+        | LogicalType::HugeInt
+        | LogicalType::Float
+        | LogicalType::Double
+        | LogicalType::Decimal { .. }) => ty.clone(),
+        _ => return None,
+    };
+    let number = |ty: &LogicalType| ty.is_numeric() || *ty == LogicalType::Null;
+    let fraction = match &arguments[1] {
+        LogicalType::List(element) if number(element) => LogicalType::list(LogicalType::Double),
+        ty if number(ty) => LogicalType::Double,
+        _ => return None,
+    };
+    let mut wanted = vec![held.clone(), fraction.clone()];
+    if let Some(size) = arguments.get(2) {
+        let fits = matches!(
+            size,
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::UTinyInt
+                | LogicalType::USmallInt
+                | LogicalType::Null
+        );
+        if !fits {
+            return None;
+        }
+        wanted.push(LogicalType::Integer);
+    }
+    Some((wanted, fractioned(&fraction, held)))
 }
 
 /// A quantile's answer, which is a list of them when the fractions are a list.
@@ -3010,6 +3061,7 @@ impl Shape {
             // The pin has a row per value type, each with a DOUBLE fraction and a DOUBLE[] twin, and
             // one row here stands for all of them.
             Self::Discrete | Self::Continuous => (leading(1, ANY, "DOUBLE"), ANY),
+            Self::Sampled => ([ANY, "DOUBLE", "INTEGER"][..count.min(3)].to_vec(), ANY),
             Self::Median | Self::Deviation => (all(ANY), ANY),
             Self::Picked => (leading(2, ANY, "BIGINT"), ANY),
             Self::Histogram => (leading(1, ANY, ANY_LIST), "MAP"),
@@ -3566,6 +3618,12 @@ mod tests {
                     Shape::Ranged => arguments = vec![LogicalType::BigInt; count],
                     Shape::Continuous | Shape::Deviation => {
                         arguments = vec![LogicalType::Double; count];
+                    }
+                    Shape::Sampled => {
+                        arguments = vec![LogicalType::Double; count];
+                        if count == 3 {
+                            arguments[2] = LogicalType::Integer;
+                        }
                     }
                     Shape::Sorted | Shape::Graded => {
                         arguments = vec![LogicalType::Varchar; count];

@@ -3363,6 +3363,9 @@ impl<'a> Binder<'a> {
             let ordered = ordered_set && sorted.len() == 1;
             bound[1] = self.quantile_fraction(resolved.name, bound[1], ordered, from_top)?;
         }
+        if resolved.name == "reservoir_quantile" {
+            self.reservoir_arguments(&bound)?;
+        }
         let mut cast = Vec::with_capacity(bound.len());
         for (arg, wanted) in bound.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
@@ -3449,6 +3452,48 @@ impl<'a> Binder<'a> {
             one => negated(&one),
         };
         Ok(self.add_constant(negated))
+    }
+
+    /// Checks the fraction and the sample size of a `reservoir_quantile` call the way the pin does,
+    /// which is in words of its own rather than the ones the other quantiles use.
+    fn reservoir_arguments(&self, bound: &[ExprRef]) -> Result<()> {
+        let constant = |arg: ExprRef, parameter: &str| match fold::value_of(&self.plan, arg) {
+            Ok(Some(value)) => Ok(value),
+            _ => Err(Error::binder(format!(
+                "The \"{parameter}\" argument in function \"reservoir_quantile\" must be a constant \
+                 expression"
+            ))),
+        };
+        let fraction = constant(bound[1], "quantile")?;
+        let each = match &fraction {
+            Value::List { values, .. } => values.as_slice(),
+            one => std::slice::from_ref(one),
+        };
+        for one in each {
+            if one.is_null() {
+                return Err(Error::binder("RESERVOIR_QUANTILE QUANTILE parameter cannot be NULL"));
+            }
+            if !(0.0..=1.0).contains(&share(one).unwrap_or(f64::NAN)) {
+                return Err(Error::binder(
+                    "RESERVOIR_QUANTILE can only take parameters in the range [0, 1]",
+                ));
+            }
+        }
+        let Some(&size) = bound.get(2) else {
+            return Ok(());
+        };
+        let size = constant(size, "sample_size")?;
+        if size.is_null() {
+            return Err(Error::binder(
+                "The \"sample_size\" argument in function '\"reservoir_quantile\"' must not be NULL",
+            ));
+        }
+        if share(&size).is_none_or(|n| n <= 0.0) {
+            return Err(Error::binder(
+                "Size of the RESERVOIR_QUANTILE sample must be bigger than 0",
+            ));
+        }
+        Ok(())
     }
 
     /// The name of an aggregate with the `ORDER BY` of its call folded in, with the keys that matter
