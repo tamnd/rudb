@@ -9528,6 +9528,16 @@ fn a_rollback_puts_back_what_the_transaction_changed_the_way_the_pin_does() {
         error("SELECT 1"),
         "TransactionContext Error: Current transaction is aborted (please ROLLBACK)"
     );
+    // The pin binds first, so a statement that would not bind says so even here.
+    assert_eq!(
+        error("INSERT INTO t VALUES (1, 2)"),
+        "Binder Error: table \"t\" has 1 columns but 2 values were supplied"
+    );
+    assert!(error("SELECT * FROM nothere").starts_with("Catalog Error: Table with name nothere"));
+    assert_eq!(
+        error("INSERT INTO t VALUES (5)"),
+        "TransactionContext Error: Current transaction is aborted (please ROLLBACK)"
+    );
     db.execute("COMMIT").unwrap();
     assert_eq!(count(&db), "2");
     db.execute("BEGIN").unwrap();
