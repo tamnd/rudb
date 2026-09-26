@@ -1271,6 +1271,19 @@ where
     if left.logical_type() != right.logical_type() {
         return None;
     }
+    // A bit string's bytes do not sort the way its bits do, so ordering two of them is the
+    // fallback's, which asks `bit::cmp`. Equality is still the bytes, since a bit string has one
+    // layout.
+    let equality = matches!(
+        op,
+        Comparison::Equal
+            | Comparison::NotEqual
+            | Comparison::DistinctFrom
+            | Comparison::NotDistinctFrom
+    );
+    if *left.logical_type() == LogicalType::Bit && !equality {
+        return None;
+    }
 
     // Where each side keeps its values and how a row of it is reached, which is what turns flat,
     // dictionary and run length into one branch below rather than nine. See [`Through`].
@@ -2176,6 +2189,7 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
         (Value::Varchar(a), Value::Varchar(b)) => Ok(a.as_bytes().cmp(b.as_bytes())),
         (Value::Blob(a), Value::Blob(b)) => Ok(a.cmp(b)),
+        (Value::Bit(a), Value::Bit(b)) => Ok(rudb_common::bit::cmp(a, b)),
         (Value::Date(a), Value::Date(b)) => Ok(a.cmp(b)),
         // A zoned value orders with its own kind and by the same rule, since both of them are the
         // count of microseconds from a fixed point and the zone is about printing.

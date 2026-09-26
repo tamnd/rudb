@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bit;
 pub mod bounds;
 pub mod cancel;
 pub mod clustering;

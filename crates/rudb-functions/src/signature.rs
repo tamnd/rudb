@@ -280,6 +280,8 @@ enum Shape {
     /// whose bins are cast to the type of `x`. A decimal is counted as a double when there are bins,
     /// because the pin has no binned histogram over decimals and casts them.
     Histogram,
+    /// A function over bit strings, whose arguments [`bitstring`] works out by name.
+    Bits,
     /// No arguments at all and a fixed result. `now()` and `current_schema()`.
     ///
     /// The session context functions, which are the ones whose answer comes from the connection
@@ -936,6 +938,14 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::Varchar),
         numeric_only: false,
     },
+    // Bit strings. The operators, `bit_count`, `length` and the bit aggregates take them too,
+    // through the same [`bitstring`] rule.
+    bits("get_bit", Arity::exactly(2)),
+    bits("set_bit", Arity::exactly(3)),
+    bits("bit_position", Arity::exactly(2)),
+    bits("bitstring", Arity::exactly(2)),
+    bits("bit_length", Arity::exactly(1)),
+    bits("octet_length", Arity::exactly(1)),
     // Whether a value is the key `histogram(x, bins)` counts the values no bin took under.
     Entry {
         name: "is_histogram_other_bin",
@@ -1021,6 +1031,8 @@ const TABLE: &[Entry] = &[
     aggregate("entropy", Arity::exactly(1), Shape::AnyTo(Fixed::Double), false),
     aggregate("histogram", Arity::between(1, 2), Shape::Histogram, false),
     aggregate("histogram_exact", Arity::exactly(2), Shape::Histogram, false),
+    // A bit per value from the smallest to the largest, set for the values that came up.
+    aggregate("bitstring_agg", Arity::one_of(&[1, 3]), Shape::Bits, false),
     aggregate("skewness", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double), true),
     aggregate("kurtosis", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double), true),
     aggregate(
@@ -1104,6 +1116,49 @@ const TABLE: &[Entry] = &[
 /// A scalar that takes numbers.
 const fn number(name: &'static str, arity: Arity, shape: Shape) -> Entry {
     Entry { name, kind: FunctionKind::Scalar, arity, shape, numeric_only: true }
+}
+
+/// A scalar over bit strings.
+const fn bits(name: &'static str, arity: Arity) -> Entry {
+    Entry { name, kind: FunctionKind::Scalar, arity, shape: Shape::Bits, numeric_only: false }
+}
+
+/// The arguments and the answer of a call that takes bit strings, or `None` when it is not one.
+///
+/// A string or a null stands in for a bit string, which is how a literal reaches one, and a count
+/// or a position is an `INTEGER` whatever whole number was written. The operators and the bit
+/// aggregates only take this reading when a bit string is among their arguments, and leave the
+/// whole numbers to the rule they already have.
+fn bitstring(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{BigInt, Bit, Blob, Integer, Null, Varchar};
+    let bitish = |ty: &LogicalType| matches!(ty, Bit | Varchar | Null);
+    let whole = |ty: &LogicalType| ty.is_integer() || *ty == Null;
+    let some_bit = arguments.contains(&Bit);
+    Some(match (name, arguments) {
+        ("&" | "|" | "xor", [left, right]) if some_bit && bitish(left) && bitish(right) => {
+            (vec![Bit, Bit], Bit)
+        }
+        ("~" | "bit_and" | "bit_or" | "bit_xor", [Bit]) => (vec![Bit], Bit),
+        ("<<" | ">>", [Bit, shift]) if whole(shift) => (vec![Bit, Integer], Bit),
+        ("bit_count" | "length" | "bit_length" | "octet_length", [Bit]) => (vec![Bit], BigInt),
+        ("bit_length", [Varchar | Null]) => (vec![Varchar], BigInt),
+        ("octet_length", [Blob | Null]) => (vec![Blob], BigInt),
+        ("get_bit", [bits, at]) if bitish(bits) && whole(at) => (vec![Bit, Integer], Integer),
+        ("set_bit", [bits, at, to]) if bitish(bits) && whole(at) && whole(to) => {
+            (vec![Bit, Integer, Integer], Bit)
+        }
+        ("bit_position", [needle, bits]) if bitish(needle) && bitish(bits) => {
+            (vec![Bit, Bit], Integer)
+        }
+        ("bitstring", [Bit, len]) if whole(len) => (vec![Bit, Integer], Bit),
+        ("bitstring", [Varchar | Null, len]) if whole(len) => (vec![Varchar, Integer], Bit),
+        ("bitstring_agg", [value, bounds @ ..])
+            if value.is_integer() && bounds.iter().all(whole) =>
+        {
+            (vec![value.clone(); arguments.len()], Bit)
+        }
+        _ => return None,
+    })
 }
 
 /// A scalar that takes strings and returns `returns`.
@@ -1236,6 +1291,9 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         return resolve("list_contains", arguments);
     }
     if let Some((cast_to, returns)) = temporal(entry.name, arguments) {
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
+    if let Some((cast_to, returns)) = bitstring(entry.name, arguments) {
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
     }
     if entry.numeric_only {
@@ -1458,6 +1516,9 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             }
             _ => return Err(no_match(entry.name, arguments)),
         },
+        Shape::Bits => {
+            bitstring(entry.name, arguments).ok_or_else(|| no_match(entry.name, arguments))?
+        }
         Shape::Median => {
             let value = &arguments[0];
             let held = match value {
@@ -2942,6 +3003,7 @@ impl Shape {
             Self::Median | Self::Deviation => (all(ANY), ANY),
             Self::Picked => (leading(2, ANY, "BIGINT"), ANY),
             Self::Histogram => (leading(1, ANY, ANY_LIST), "MAP"),
+            Self::Bits => (all(ANY), "BIT"),
         }
     }
 }
@@ -3500,6 +3562,17 @@ mod tests {
                         arguments[0] = strings();
                     }
                     Shape::Histogram if count == 2 => arguments[1] = strings(),
+                    Shape::Bits => {
+                        arguments = match entry.name {
+                            "bitstring_agg" => vec![LogicalType::Integer; count],
+                            "bit_position" => vec![LogicalType::Bit; count],
+                            _ => {
+                                let mut bits = vec![LogicalType::Integer; count];
+                                bits[0] = LogicalType::Bit;
+                                bits
+                            }
+                        };
+                    }
                     _ => {}
                 }
                 resolve(entry.name, &arguments).unwrap_or_else(|error| {

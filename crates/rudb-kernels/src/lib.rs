@@ -61,6 +61,7 @@
 pub mod aggregate;
 mod arg_extreme;
 mod bits;
+mod bitstring;
 pub mod cast;
 pub mod compare;
 mod datetime;

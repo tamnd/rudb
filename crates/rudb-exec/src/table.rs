@@ -3413,7 +3413,7 @@ fn fold_value(state: u64, value: &Value) -> u64 {
         Value::Float(x) => mix(state, canonical(f64::from(*x))),
         Value::Double(x) => mix(state, canonical(*x)),
         Value::Varchar(x) => mix(state, bytes_word(x.as_bytes())),
-        Value::Blob(x) => mix(state, bytes_word(x)),
+        Value::Blob(x) | Value::Bit(x) => mix(state, bytes_word(x)),
         // Two words, low first, the way the 128 bit layouts are read. The width and the scale of a
         // decimal are not mixed, because they are the column's and not the value's, and a flat
         // decimal column is a run of integers with no room to keep them.
