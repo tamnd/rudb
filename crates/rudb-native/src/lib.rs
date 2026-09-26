@@ -5267,6 +5267,11 @@ impl NativeText {
                 .copied()
                 .ok_or_else(|| invalid("global dictionary offsets are short"));
         }
+        self.packed_end(index)
+    }
+
+    /// [`Self::end_within`] read out of the packed offsets, whether or not the table is built.
+    fn packed_end(&self, index: usize) -> Result<u32> {
         let run = index / TEXT_OFFSET_RUN;
         let bytes = self
             .packed()
@@ -5351,9 +5356,19 @@ impl NativeText {
             }
             return Ok((start, end));
         }
+        self.packed_span(index)
+    }
+
+    /// [`Self::span_within`] read out of the packed offsets, whether or not the table is built.
+    fn packed_span(&self, index: usize) -> Result<(u32, u32)> {
         let within = index % TEXT_OFFSET_RUN;
         let (start, end) = if within == 0 {
-            (self.start_within(index)?, self.end_within(index)?)
+            let start = if index.is_multiple_of(TEXT_PAYLOAD_VALUES) {
+                0
+            } else {
+                self.packed_end(index - 1)?
+            };
+            (start, self.packed_end(index)?)
         } else {
             let run = index / TEXT_OFFSET_RUN;
             let bytes = self
@@ -5546,31 +5561,31 @@ impl TextSource for NativeText {
             lens.extend_at(indices, into);
             return Ok(());
         }
-        self.ends_asked.fetch_add(indices.len(), Atomic::Relaxed);
-        let Some(ends) = self.value_ends() else {
-            for &index in indices {
-                into.push(
-                    self.bytes_len_at(index as usize)?
-                        .map_or(0, |len| i64::try_from(len).unwrap_or(i64::MAX)),
-                );
-            }
-            return Ok(());
+        // The lengths are built out of ends unpacked for the purpose and dropped, not out of the
+        // table of ends. That table is four bytes a value and the lengths are two, and a column
+        // that is only asked for lengths would keep both. On q29 that was 11 MB of `Referer` ends
+        // held for `STRLEN` alone.
+        let asked = self.ends_asked.fetch_add(indices.len(), Atomic::Relaxed) + indices.len();
+        let lens = match self.value_ends.get() {
+            Some(Some(ends)) => self.value_lens.get_or_init(|| lengths_of(ends)).as_ref(),
+            _ if asked >= self.ends_worth_unpacking() => self
+                .value_lens
+                .get_or_init(|| self.unpack_ends().and_then(|ends| lengths_of(&ends)))
+                .as_ref(),
+            _ => None,
         };
-        if let Some(lens) = self.value_lens.get_or_init(|| lengths_of(ends)) {
+        if let Some(lens) = lens {
             lens.extend_at(indices, into);
             return Ok(());
         }
         for &index in indices {
             let index = index as usize;
             // Past the end is no value and so no length, which is what a row at a time read says.
-            let Some(&end) = ends.get(index) else {
+            if index >= self.values {
                 into.push(0);
                 continue;
-            };
-            let start = if index.is_multiple_of(TEXT_PAYLOAD_VALUES) { 0 } else { ends[index - 1] };
-            if start > end {
-                return Err(invalid("global dictionary value ends before it starts"));
             }
+            let (start, end) = self.packed_span(index)?;
             into.push(i64::from(end - start));
         }
         Ok(())
