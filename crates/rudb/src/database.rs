@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rudb_bind::{Bound, Parameters, Write};
 use rudb_catalog::{Catalog, DEFAULT_CATALOG, Entry, QualifiedName, View};
@@ -3490,7 +3490,7 @@ impl Shared {
     }
 
     /// The query timeout this database was opened with.
-    pub(crate) fn timeout(&self) -> Option<std::time::Duration> {
+    pub(crate) fn timeout(&self) -> Option<Duration> {
         self.inner.settings.config().query_timeout()
     }
 
@@ -4724,6 +4724,8 @@ fn run_compiled(
     memory.forget_peak();
     let driving = Span::start();
     let qc = rudb_qc::Under { catalog, cancel, memory, seams, session, pool };
+    // The run takes the query, so what the compile made is kept before it starts.
+    let report = compiled.report().clone();
     let answer = compiled.run(plan, qc)?;
     let (ran_wall, ran_cpu) = driving.stop();
     {
@@ -4750,6 +4752,16 @@ fn run_compiled(
     // physical phase, so the time goes in both fields and `total_ns` counts it once.
     metrics.timing.physical_ns = codegen_ns;
     metrics.timing.codegen_ns = codegen_ns;
+    metrics.timing.lower_ns = nanos(report.plan);
+    metrics.timing.qir_ns = nanos(report.generate);
+    metrics.timing.backend_ns = nanos(report.compile);
+    metrics.codegen = rudb_metrics::Codegen {
+        tier: Some(report.tier.to_owned()),
+        functions: count(report.functions),
+        native: count(report.native),
+        qir_insts: count(report.insts),
+        code_bytes: count(report.bytes),
+    };
     metrics.timing.execute_ns = ran_wall;
     metrics.timing.total_ns =
         planning.total_ns().saturating_add(codegen_ns).saturating_add(ran_wall);
@@ -4807,6 +4819,16 @@ fn explaining(
     let measured = result.metrics().expect("a query that ran reports what it did");
     let text = rudb_opt::explain::analyzed(plan, context, seams, measured, statistics);
     explained("analyzed_plan", &text)
+}
+
+/// A duration in the nanoseconds the metrics count.
+fn nanos(took: Duration) -> u64 {
+    u64::try_from(took.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// A size as the metrics count it.
+fn count(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// A query the compiled engine took, with how long taking it took and where its tier switches are

@@ -65,6 +65,16 @@ pub struct Statement {
     pub physical_ns: u64,
     /// The part of `physical_ns` the compiled engine spent generating and compiling code.
     pub codegen_ns: u64,
+    /// The part of `codegen_ns` that went on the compiled engine's physical plan.
+    pub lower_ns: u64,
+    /// The part of `codegen_ns` that went on generating QIR.
+    pub qir_ns: u64,
+    /// The part of `codegen_ns` the tier's backend took.
+    pub backend_ns: u64,
+    /// The QIR instructions the compiled engine generated, zero on the first engine.
+    pub qir_insts: u64,
+    /// The bytes of machine code it loaded.
+    pub code_bytes: u64,
     /// Running it, with turning what it produced into a result.
     pub execute_ns: u64,
     /// The whole statement.
@@ -95,6 +105,11 @@ impl Statement {
         self.optimize_ns = timing.optimize_ns.saturating_sub(timing.rewrite_ns);
         self.physical_ns = timing.physical_ns;
         self.codegen_ns = timing.codegen_ns;
+        self.lower_ns = timing.lower_ns;
+        self.qir_ns = timing.qir_ns;
+        self.backend_ns = timing.backend_ns;
+        self.qir_insts = metrics.codegen.qir_insts;
+        self.code_bytes = metrics.codegen.code_bytes;
         self.execute_ns = timing.execute_ns;
         self.total_ns = timing.total_ns;
         self.cpu_ns = metrics.resource.cpu_ns;

@@ -32,6 +32,9 @@
     "rewrite_ns": 120000,
     "physical_ns": 44000,
     "codegen_ns": 0,
+    "lower_ns": 0,
+    "qir_ns": 0,
+    "backend_ns": 0,
     "execute_ns": 1323000000,
     "result_ns": 2000000,
     "total_ns": 1323483000
@@ -45,6 +48,13 @@
     "strings_ns": 0,
     "materialize_ns": 2000000,
     "other_ns": 343000000
+  },
+  "codegen": {
+    "tier": null,
+    "functions": 0,
+    "native": 0,
+    "qir_insts": 0,
+    "code_bytes": 0
   },
   "resource": {
     "cpu_ns": 9880000000,

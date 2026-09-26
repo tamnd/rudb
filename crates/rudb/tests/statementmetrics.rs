@@ -75,11 +75,19 @@ fn a_query_on_the_compiled_engine_leaves_its_compile_time() {
     assert_eq!(database.refusals(), Vec::<String>::new(), "the compiled engine took it");
     let timing = &result.metrics().expect("a query that ran has metrics").timing;
     assert!(timing.codegen_ns > 0, "{timing:?}");
-    assert!(result.metrics().expect("measured").render().contains("\"codegen_ns\""));
+    let rendered = result.metrics().expect("measured").render();
+    assert!(rendered.contains("\"codegen_ns\"") && rendered.contains("\"qir_insts\""));
     let row = kept(&connection, sql);
     let codegen = column(&row, "codegen_ns");
     assert!(codegen > 0, "the compile was charged nothing: {row:?}");
     assert_eq!(column(&row, "physical_ns"), codegen, "{row:?}");
+    // The split is taken inside the compile, so its three parts fit in the wall time around it.
+    let split = column(&row, "lower_ns") + column(&row, "qir_ns") + column(&row, "backend_ns");
+    assert!(column(&row, "qir_ns") > 0 && split <= codegen, "{row:?}");
+    assert!(column(&row, "qir_insts") > 0, "{row:?}");
+    let made = &result.metrics().expect("measured").codegen;
+    assert_eq!(column(&row, "qir_insts"), i64::try_from(made.qir_insts).unwrap(), "{made:?}");
+    assert_eq!(column(&row, "code_bytes") > 0, made.native > 0, "{made:?}");
     let rest = column(&row, "physical_ns") + column(&row, "execute_ns");
     assert_eq!(column(&row, "total_ns"), column(&row, "frontend_ns") + rest, "{row:?}");
 }

@@ -299,8 +299,9 @@ fn usage() {
     println!("                         --tiers <seed> in place of --tier runs every query on");
     println!("                         interp, on clif or direct and on that switching at random");
     println!("                         morsels, at threads 1, and wants the rows bit for bit");
-    println!("                         --threads <n> sets threads first, and a compile column");
-    println!("                         prints each query's codegen_ns with the median at the end");
+    println!("                         --threads <n> sets threads first, and columns print each");
+    println!("                         query's codegen_ns, backend_ns, QIR instructions and code");
+    println!("                         bytes, with the median compile time at the end");
     println!("                         --set name=value runs SET first, and --corpus <dir> in");
     println!("                         place of the file runs both checks over sqllogictest files");
     println!("  refusals <dir> <q>     every query in q, a .sql file with -- qNN headers or a");

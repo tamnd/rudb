@@ -128,7 +128,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     }
     println!("tier    {tier}");
     println!();
-    println!("{:<5} {:>9} {:>9} {:>10}  verdict", "query", "first", "compiled", "compile");
+    println!(
+        "{:<5} {:>9} {:>9} {:>10} {:>10} {:>7} {:>7}  verdict",
+        "query", "first", "compiled", "compile", "backend", "insts", "bytes"
+    );
 
     let mut same = 0;
     let mut ties = 0;
@@ -180,8 +183,13 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             compiles.push(compiled.compile_ms);
         }
         println!(
-            "{name:<5} {:>8.3}s {:>8.3}s {:>8.3}ms  {verdict}",
-            first.seconds, compiled.seconds, compiled.compile_ms
+            "{name:<5} {:>8.3}s {:>8.3}s {:>8.3}ms {:>8.3}ms {:>7} {:>7}  {verdict}",
+            first.seconds,
+            compiled.seconds,
+            compiled.compile_ms,
+            compiled.backend_ms,
+            compiled.insts,
+            compiled.bytes
         );
     }
 
@@ -307,24 +315,50 @@ struct Answer {
     seconds: f64,
     /// The `codegen_ns` of the query, in milliseconds: zero on the first engine.
     compile_ms: f64,
+    /// The part of it the tier's backend took, `backend_ns` in milliseconds.
+    backend_ms: f64,
+    /// The QIR instructions the compiled engine generated.
+    insts: u64,
+    /// The bytes of machine code it loaded.
+    bytes: u64,
+}
+
+impl Default for Answer {
+    fn default() -> Answer {
+        Answer {
+            rows: Ok(Vec::new()),
+            seconds: 0.0,
+            compile_ms: 0.0,
+            backend_ms: 0.0,
+            insts: 0,
+            bytes: 0,
+        }
+    }
 }
 
 fn answer(database: &Database, engine: &str, sql: &str) -> Answer {
     if let Err(e) = database.execute(&format!("SET engine = '{engine}'")) {
-        return Answer { rows: Err(e.to_string()), seconds: 0.0, compile_ms: 0.0 };
+        return Answer { rows: Err(e.to_string()), ..Answer::default() };
     }
     let began = Instant::now();
-    let (rows, compile_ms) = match database.query(sql) {
-        Ok(result) => (Ok(result.rows().collect()), compile_ms(&result)),
-        Err(e) => (Err(e.to_string()), 0.0),
+    let (rows, sizes) = match database.query(sql) {
+        Ok(result) => (Ok(result.rows().collect()), made(&result)),
+        Err(e) => (Err(e.to_string()), Answer::default()),
     };
-    Answer { rows, seconds: began.elapsed().as_secs_f64(), compile_ms }
+    Answer { rows, seconds: began.elapsed().as_secs_f64(), ..sizes }
 }
 
-/// The time a query spent generating and compiling code, from its timing document, in
-/// milliseconds.
-fn compile_ms(result: &rudb::QueryResult) -> f64 {
-    result.metrics().map_or(0.0, |m| m.timing.codegen_ns as f64 / 1e6)
+/// What a query's code took to make and how big it came out, from its metrics document, as an
+/// [`Answer`] without the rows.
+fn made(result: &rudb::QueryResult) -> Answer {
+    let Some(m) = result.metrics() else { return Answer::default() };
+    Answer {
+        compile_ms: m.timing.codegen_ns as f64 / 1e6,
+        backend_ms: m.timing.backend_ns as f64 / 1e6,
+        insts: m.codegen.qir_insts,
+        bytes: m.codegen.code_bytes,
+        ..Answer::default()
+    }
 }
 
 /// Every query in a directory of sqllogictest files, on the first engine and on the compiled one

@@ -89,11 +89,12 @@ pub fn compile_with(
     let rel = rudb_qc_plan::lower(plan)?;
     let graph = rudb_qc_pipe::split(&rel);
     check(&graph)?;
+    let planned = started.elapsed();
     let mut rt = Rt::new(cancel.clone());
     let query = rudb_qc_gen::generate(&graph, &mut rt)?;
-    let generated = started.elapsed();
+    let generated = started.elapsed().saturating_sub(planned);
     let mut tiers = Tiers::new(&query.module, options);
-    tiers.generated_in(generated);
+    tiers.generated_in(planned, generated);
     Ok(Compiled { graph, query, tiers, rt })
 }
 

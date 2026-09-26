@@ -997,6 +997,9 @@ pub fn strategy_fields() -> Vec<Field> {
 /// optimizer. They do not overlap and `frontend_ns` is the four added up. `physical_ns` is building
 /// the operator tree, or on the compiled engine generating and compiling its code, which
 /// `codegen_ns` repeats so that the compile time of a query stands out, zero on the first engine.
+/// `lower_ns`, `qir_ns` and `backend_ns` split `codegen_ns` into the compiled engine's physical
+/// plan, generating QIR and the backend, and `qir_insts` and `code_bytes` are how much QIR and
+/// machine code it made.
 /// `execute_ns` is running it and `total_ns` is the whole statement. A statement that did not
 /// run a plan, `CREATE TABLE` or `SET`, has its parse, bind and total and
 /// zero for the rest. `cpu_ns` is the CPU time of every thread the plan ran on.
@@ -1018,6 +1021,11 @@ pub fn statement_metric_fields() -> Vec<Field> {
         Field::new("frontend_ns", LogicalType::BigInt),
         Field::new("physical_ns", LogicalType::BigInt),
         Field::new("codegen_ns", LogicalType::BigInt),
+        Field::new("lower_ns", LogicalType::BigInt),
+        Field::new("qir_ns", LogicalType::BigInt),
+        Field::new("backend_ns", LogicalType::BigInt),
+        Field::new("qir_insts", LogicalType::BigInt),
+        Field::new("code_bytes", LogicalType::BigInt),
         Field::new("execute_ns", LogicalType::BigInt),
         Field::new("total_ns", LogicalType::BigInt),
         Field::new("cpu_ns", LogicalType::BigInt),
