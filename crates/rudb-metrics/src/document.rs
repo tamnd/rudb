@@ -30,6 +30,8 @@ pub struct Document {
     pub outcome: Outcome,
     /// Where the time went before and during execution.
     pub timing: Timing,
+    /// What the compiled engine made of the query, all zero on the first engine.
+    pub codegen: Codegen,
     /// What it used.
     pub resource: Resource,
     /// How much the planner knew, one decision per operator.
@@ -60,6 +62,7 @@ impl Document {
             settings: Settings::default(),
             outcome: Outcome::Succeeded,
             timing: Timing::default(),
+            codegen: Codegen::default(),
             resource: Resource::default(),
             estimates: Classes::new(),
             strategies: Vec::new(),
@@ -128,6 +131,9 @@ impl Document {
             out.count("rewrite_ns", self.timing.rewrite_ns);
             out.count("physical_ns", self.timing.physical_ns);
             out.count("codegen_ns", self.timing.codegen_ns);
+            out.count("lower_ns", self.timing.lower_ns);
+            out.count("qir_ns", self.timing.qir_ns);
+            out.count("backend_ns", self.timing.backend_ns);
             out.count("execute_ns", self.timing.execute_ns);
             out.count("result_ns", self.timing.result_ns);
             out.count("total_ns", self.timing.total_ns);
@@ -139,6 +145,14 @@ impl Document {
             for (name, nanos) in self.split().parts() {
                 out.count(&format!("{name}_ns"), nanos);
             }
+        });
+        out.key("codegen");
+        out.object(|out| {
+            out.maybe_words("tier", self.codegen.tier.as_deref());
+            out.count("functions", self.codegen.functions);
+            out.count("native", self.codegen.native);
+            out.count("qir_insts", self.codegen.qir_insts);
+            out.count("code_bytes", self.codegen.code_bytes);
         });
         out.key("resource");
         out.object(|out| {
@@ -452,6 +466,22 @@ impl Outcome {
     }
 }
 
+/// What the compiled engine generated for a query, which is how big a compile was, next to how
+/// long it took in [`Timing`].
+#[derive(Debug, Clone, Default)]
+pub struct Codegen {
+    /// The tier the pipelines were compiled for, with `auto` decided, or none on the first engine.
+    pub tier: Option<String>,
+    /// How many pipeline functions the query's module has.
+    pub functions: u64,
+    /// How many of them run as machine code.
+    pub native: u64,
+    /// The QIR instructions in the module, over every function.
+    pub qir_insts: u64,
+    /// The bytes of machine code loaded.
+    pub code_bytes: u64,
+}
+
 /// Where the time went, in nanoseconds.
 #[derive(Debug, Clone, Default)]
 pub struct Timing {
@@ -474,6 +504,14 @@ pub struct Timing {
     /// The part of `physical_ns` the compiled engine spent turning the plan into QIR and the QIR
     /// into code for its tier, which is the whole of its physical phase. Zero on the first engine.
     pub codegen_ns: u64,
+    /// The part of `codegen_ns` that went on the compiled engine's own physical plan: lowering the
+    /// optimized plan and splitting it into pipelines.
+    pub lower_ns: u64,
+    /// The part of `codegen_ns` that went on generating the QIR of the pipelines.
+    pub qir_ns: u64,
+    /// The part of `codegen_ns` the backend of the tier took to turn the QIR into machine code and
+    /// load it, zero on `interp`.
+    pub backend_ns: u64,
     /// Running it.
     pub execute_ns: u64,
     /// The part of `execute_ns` that went on turning the answer into flat columns for the caller.

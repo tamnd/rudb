@@ -207,12 +207,16 @@ pub struct Options {
 pub struct Report {
     /// The tier the query asked for, with `auto` decided.
     pub tier: &'static str,
-    /// The time spent turning the plan into the QIR module, on every tier.
+    /// The time spent lowering the optimized plan and splitting it into pipelines, on every tier.
+    pub plan: Duration,
+    /// The time spent generating the QIR module from the pipelines, on every tier.
     pub generate: Duration,
     /// The time spent lowering and loading machine code, zero on `interp`.
     pub compile: Duration,
     /// How many functions the module has.
     pub functions: usize,
+    /// How many QIR instructions they have between them.
+    pub insts: usize,
     /// How many of them run as machine code.
     pub native: usize,
     /// The bytes of machine code loaded.
@@ -225,11 +229,13 @@ impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "tier {}: {} of {} functions native, {} bytes, generated in {:.3} ms, compiled in {:.3} ms",
+            "tier {}: {} of {} functions native, {} instructions, {} bytes, planned in {:.3} ms, generated in {:.3} ms, compiled in {:.3} ms",
             self.tier,
             self.native,
             self.functions,
+            self.insts,
             self.bytes,
+            self.plan.as_secs_f64() * 1e3,
             self.generate.as_secs_f64() * 1e3,
             self.compile.as_secs_f64() * 1e3,
         )?;
@@ -272,8 +278,9 @@ impl Tiers {
             [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
         );
         let tier = tier.decided();
+        let insts = module.funcs.iter().flat_map(|f| &f.blocks).map(|b| b.prov.len()).sum();
         let mut report =
-            Report { tier: tier.name(), functions: module.funcs.len(), ..Report::default() };
+            Report { tier: tier.name(), functions: module.funcs.len(), insts, ..Report::default() };
         let native = match tier {
             Tier::Clif => native::compile(module, &mut report, clif::compile),
             Tier::Direct => native::compile(module, &mut report, direct::compile),
@@ -288,9 +295,11 @@ impl Tiers {
         &self.report
     }
 
-    /// Notes how long the module took to generate, which happened before the tiers saw it.
-    pub(crate) fn generated_in(&mut self, took: Duration) {
-        self.report.generate = took;
+    /// Notes how long the plan took to lower and the module to generate, which happened before
+    /// the tiers saw it.
+    pub(crate) fn generated_in(&mut self, plan: Duration, generate: Duration) {
+        self.report.plan = plan;
+        self.report.generate = generate;
     }
 
     /// The index of the function with this name.

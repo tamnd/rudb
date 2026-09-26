@@ -749,6 +749,7 @@ dependencies = [
  "rudb-pipeline",
  "rudb-plan",
  "rudb-qc-clif",
+ "rudb-qc-direct",
  "rudb-qc-gen",
  "rudb-qc-interp",
  "rudb-qc-ir",
