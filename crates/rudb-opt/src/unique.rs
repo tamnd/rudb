@@ -35,9 +35,29 @@
 //!
 //! `DISTINCT`, a `FILTER` on a call, `count(e)` and any other aggregate are refused. None of them is
 //! what a measured query does with this shape.
+//!
+//! # Through a join
+//!
+//! TPC-H q10 groups the join of `customer`, `nation` and a total per `o_custkey` on `c_custkey` and
+//! six other columns of `customer`. The total is one row per `o_custkey`, and `nation` is one row per
+//! `n_nationkey`, so each `customer` row meets at most one row of each and comes out of both joins
+//! at most once. `c_custkey` holds every value once in `customer`, so it holds every value once in
+//! what the joins produce too, and the aggregate over them hashed seven keys, five of them strings,
+//! to put 37,967 rows into 37,967 groups. That was 28 of the 141 ms the query took on one thread.
+//!
+//! So the walk goes through a join when the key comes from a side whose rows each come out at most
+//! once. For an inner or a left join that is the other side matching each of them at most once,
+//! which one equality in the condition against a column the other side holds no value twice in
+//! says. A semi, an anti, a mark or a single join hands each left row up once whatever it finds.
+//! The other side's column is asked the same question the key is, so it can be a column of a scan
+//! or the key of an aggregate with one key, which is what the total per `o_custkey` is.
+//!
+//! The total only exists once eager aggregation has pushed it under the join, which is well after
+//! the place in the sequence where this first runs, so [`JoinedRowsAreGroups`] is the same rewrite
+//! run again after it.
 
 use rudb_common::{Class, LogicalType, Result, Stat, Value};
-use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan};
+use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice};
 
 use crate::estimate::{self, Facts, Key};
 use crate::fromkey::cast;
@@ -51,6 +71,21 @@ pub struct RowsAreGroups;
 impl Pass for RowsAreGroups {
     fn name(&self) -> &'static str {
         "rows_are_groups"
+    }
+
+    fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
+        project_all(plan, context.facts());
+        Ok(())
+    }
+}
+
+/// The same, run again once eager aggregation has put its totals under the joins.
+#[derive(Debug, Clone, Copy)]
+pub struct JoinedRowsAreGroups;
+
+impl Pass for JoinedRowsAreGroups {
+    fn name(&self) -> &'static str {
+        "joined_rows_are_groups"
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
@@ -90,11 +125,59 @@ fn project(plan: &mut Plan, at: NodeRef, stats: &Facts) -> Option<NodeRef> {
     Some(plan.add_node(Node::Project { input, index, exprs, names }))
 }
 
-/// Whether `key` is a column of a scan under `input` that holds every value once and no null.
+/// Whether `key` is a column under `input` that no two rows hold the same value of.
 fn distinct(plan: &Plan, input: NodeRef, key: ExprRef, stats: &Facts) -> bool {
     let Expr::Column(outer) = *plan.expr(key) else { return false };
-    let Some((scan, binding)) = filtered_scan(plan, input, outer) else { return false };
-    let Node::Get { catalog, schema, table, columns, .. } = *plan.node(scan) else {
+    unique(plan, input, outer, stats)
+}
+
+/// Whether no two rows of `at` hold the same value of `binding`, a null counting as a value.
+///
+/// A filter keeps a subset of the rows and a projection that only passes a column on keeps every row
+/// and every value in it, so a column no row holds twice is still one after either. That is the
+/// shape a view puts over a file: ClickBench over Parquet reads `hits` through `SELECT * REPLACE
+/// (...)`, which rewrites four time columns and passes `WatchID` on untouched. The key of an
+/// aggregate with one key is one row per value by construction, a null included. Joins are in the
+/// module comment.
+fn unique(plan: &Plan, at: NodeRef, binding: ColumnBinding, stats: &Facts) -> bool {
+    match *plan.node(at) {
+        Node::Get { index, .. } if index == binding.table => counted(plan, at, binding, stats),
+        Node::Filter { input, .. } => unique(plan, input, binding, stats),
+        Node::Project { input, index, exprs, .. } if index == binding.table => {
+            let Some(&expr) = plan.expr_list(exprs).get(binding.column as usize) else {
+                return false;
+            };
+            let Expr::Column(inner) = *plan.expr(expr) else { return false };
+            unique(plan, input, inner, stats)
+        }
+        Node::Aggregate { index, groups, .. } if index == binding.table => {
+            binding.column == 0 && plan.expr_list(groups).len() == 1
+        }
+        Node::Join { left, right, kind, conditions, .. } => {
+            let from_left = produces(plan, left, binding);
+            match kind {
+                JoinKind::Semi | JoinKind::Anti | JoinKind::Mark | JoinKind::Single => {
+                    from_left && unique(plan, left, binding, stats)
+                }
+                JoinKind::Inner | JoinKind::Left => {
+                    let (mine, other) = if from_left { (left, right) } else { (right, left) };
+                    if !from_left && kind == JoinKind::Left {
+                        return false;
+                    }
+                    (from_left || produces(plan, right, binding))
+                        && unique(plan, mine, binding, stats)
+                        && once(plan, conditions, other, stats)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether the scan `at` holds every value of `binding` once and no null, by exact counts.
+fn counted(plan: &Plan, at: NodeRef, binding: ColumnBinding, stats: &Facts) -> bool {
+    let Node::Get { catalog, schema, table, columns, .. } = *plan.node(at) else {
         return false;
     };
     let Some(field) = plan.field_list(columns).get(binding.column as usize) else {
@@ -107,32 +190,42 @@ fn distinct(plan: &Plan, input: NodeRef, key: ExprRef, stats: &Facts) -> bool {
     };
     let rows = exact(stats.get(&Key::Rows { catalog, schema, table }));
     let values = exact(stats.get(&Key::Distinct { catalog, schema, table, column: &field.name }));
-    let never_null = field.not_null || estimate::never_null(plan, input, outer);
+    let never_null = field.not_null || estimate::never_null(plan, at, binding);
     never_null && rows.is_some() && rows == values
 }
 
-/// The scan `binding` reads and the column of it that is, when nothing stands between it and `at`
-/// but filters and projections that hand the column up as it is.
+/// Whether `binding` is one of the columns `at` hands up.
+fn produces(plan: &Plan, at: NodeRef, binding: ColumnBinding) -> bool {
+    walk::outputs(plan, at).is_some_and(|columns| columns.iter().any(|(bound, _)| *bound == binding))
+}
+
+/// Whether a join on `conditions` matches each row of the side facing `other` to at most one row
+/// of `other`.
 ///
-/// A projection that only passes a column on keeps every row and every value in it, so a column no
-/// row holds twice is still one after it. That is the shape a view puts over a file: ClickBench over
-/// Parquet reads `hits` through `SELECT * REPLACE (...)`, which rewrites four time columns and passes
-/// `WatchID` on untouched.
-fn filtered_scan(
-    plan: &Plan,
-    at: NodeRef,
-    binding: ColumnBinding,
-) -> Option<(NodeRef, ColumnBinding)> {
-    match *plan.node(at) {
-        Node::Get { index, .. } if index == binding.table => Some((at, binding)),
-        Node::Filter { input, .. } => filtered_scan(plan, input, binding),
-        Node::Project { input, index, exprs, .. } if index == binding.table => {
-            let &expr = plan.expr_list(exprs).get(binding.column as usize)?;
-            let Expr::Column(inner) = *plan.expr(expr) else { return None };
-            filtered_scan(plan, input, inner)
+/// One equality in the `AND` against a column of `other` that no two of its rows share is enough,
+/// whatever the rest of the condition says, since the rest can only take matches away. An integer
+/// cast over that column is allowed, because one that succeeds maps two values to two values.
+fn once(plan: &Plan, conditions: Slice, other: NodeRef, stats: &Facts) -> bool {
+    let column = |expr: ExprRef| match *plan.expr(expr) {
+        Expr::Column(binding) => Some(binding),
+        Expr::Cast { input, try_cast: false }
+            if plan.expr_type(expr).is_integer() && plan.expr_type(input).is_integer() =>
+        {
+            match *plan.expr(input) {
+                Expr::Column(binding) => Some(binding),
+                _ => None,
+            }
         }
         _ => None,
-    }
+    };
+    plan.expr_list(conditions).iter().any(|&condition| {
+        let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
+            return false;
+        };
+        [left, right].into_iter().filter_map(column).any(|binding| {
+            produces(plan, other, binding) && unique(plan, other, binding, stats)
+        })
+    })
 }
 
 /// What `call` comes to over a group of one row, written against the aggregate's input.
@@ -173,13 +266,13 @@ mod tests {
     use super::project_all;
     use crate::estimate::Facts;
 
-    /// A store of one column called `w` that says this much about how many nulls it holds.
+    /// A store of one column of that name that says this much about how many nulls it holds.
     #[derive(Debug)]
-    struct Stub(Stat<u64>);
+    struct Stub(&'static str, Stat<u64>);
 
     impl Zones for Stub {
         fn column(&self, name: &str) -> Option<usize> {
-            (name == "w").then_some(0)
+            (name == self.0).then_some(0)
         }
 
         fn surviving(&self, _tests: &[Test]) -> Option<u64> {
@@ -195,7 +288,7 @@ mod tests {
         }
 
         fn nulls(&self, _column: usize) -> Stat<u64> {
-            self.0
+            self.1
         }
     }
 
@@ -220,7 +313,7 @@ mod tests {
     fn projected(text: &str, stats: &Facts, nulls: u64) -> String {
         let mut plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
-        let zones = Arc::new(Stub(Stat::exact(nulls, Provenance::NullCount)));
+        let zones = Arc::new(Stub("w", Stat::exact(nulls, Provenance::NullCount)));
         plan.set_zones(0, zones as Arc<dyn Zones>);
         project_all(&mut plan, stats);
         plan.validate().unwrap_or_else(|error| panic!("{text} did not stay valid: {error}"));
@@ -286,5 +379,62 @@ mod tests {
         assert_eq!(projected(&other, &counted(1_000, 1_000), 0), other);
         let counts = WATCHED.replace("count_star()::BIGINT", "count(#0.2::SMALLINT)::BIGINT");
         assert_eq!(projected(&counts, &counted(1_000, 1_000), 0), counts);
+    }
+
+    /// TPC-H q10's shape once eager aggregation has run: a total per customer joined back to the
+    /// customers and then to their nations, grouped on the customer key and columns beside it.
+    const JOINED: &str = concat!(
+        "Aggregate #5 groups=[#0.0::BIGINT, #0.1::VARCHAR, #2.1::VARCHAR] ",
+        "aggregates=[sum(#4.1::DECIMAL(38,2))::DECIMAL(38,2)]\n",
+        "  Join INNER on=[(#0.2::INTEGER = #2.0::INTEGER)::BOOLEAN]\n",
+        "    Get memory.main.n AS n #2 [k::INTEGER, name::VARCHAR]\n",
+        "    Join INNER on=[(#0.0::BIGINT = #4.0::BIGINT)::BOOLEAN]\n",
+        "      Get memory.main.c AS c #0 [k::BIGINT, name::VARCHAR, n::INTEGER]\n",
+        "      Aggregate #4 groups=[#1.0::BIGINT] aggregates=[sum(#1.1::DECIMAL(15,2))::DECIMAL(38,2)]\n",
+        "        Get memory.main.o AS o #1 [c::BIGINT, price::DECIMAL(15,2)]\n",
+    );
+
+    /// `c` and `n` counted with `customers` and `nations` distinct keys of 100 and 25 rows, and no
+    /// null in either key.
+    fn joined(text: &str, customers: u64, nations: u64) -> String {
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "c", 100);
+        facts.record_distinct("memory", "main", "c", "k", customers, Provenance::Dictionary);
+        facts.record("memory", "main", "n", 25);
+        facts.record_distinct("memory", "main", "n", "k", nations, Provenance::Dictionary);
+        let mut plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        for index in [0, 2] {
+            let zones = Arc::new(Stub("k", Stat::exact(0, Provenance::NullCount)));
+            plan.set_zones(index, zones as Arc<dyn Zones>);
+        }
+        project_all(&mut plan, &facts);
+        plan.validate().unwrap_or_else(|error| panic!("{text} did not stay valid: {error}"));
+        plan.to_string()
+    }
+
+    #[test]
+    fn a_key_each_join_hands_up_once_makes_the_aggregate_over_them_a_projection() {
+        let out = joined(JOINED, 100, 25);
+        assert!(out.starts_with("Project #5 [#0.0::BIGINT AS column0, "), "{out}");
+        assert!(!out.contains("Aggregate #5"), "{out}");
+        assert!(out.contains("Aggregate #4"), "{out}");
+    }
+
+    /// A key that repeats on either side of the join, a total over more than one key, and a key
+    /// from the side a left join pads all keep the aggregate.
+    #[test]
+    fn a_join_that_may_hand_a_row_up_twice_keeps_its_aggregate() {
+        assert_eq!(joined(JOINED, 99, 25), JOINED);
+        assert_eq!(joined(JOINED, 100, 24), JOINED);
+        let wide = JOINED.replace("groups=[#1.0::BIGINT]", "groups=[#1.0::BIGINT, #1.1::DECIMAL(15,2)]");
+        assert_eq!(joined(&wide, 100, 25), wide);
+        let padded = concat!(
+            "Aggregate #3 groups=[#2.0::INTEGER] aggregates=[count_star()::BIGINT]\n",
+            "  Join LEFT on=[(#0.2::INTEGER = #2.0::INTEGER)::BOOLEAN]\n",
+            "    Get memory.main.c AS c #0 [k::BIGINT, name::VARCHAR, n::INTEGER]\n",
+            "    Get memory.main.n AS n #2 [k::INTEGER, name::VARCHAR]\n",
+        );
+        assert_eq!(joined(padded, 100, 25), padded);
     }
 }
