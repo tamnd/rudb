@@ -109,6 +109,7 @@
 mod config;
 mod connection;
 mod database;
+mod export;
 mod foreign;
 mod journal;
 mod mirror;

@@ -23,10 +23,10 @@ use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 
 use crate::ast::{
     AlterAction, Ast, Attach, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, Constraint,
-    CreateTable, CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert, JoinKind,
-    LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope, Select,
-    SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement, StrRef, Target, Transaction,
-    UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
+    CopyTo, CreateTable, CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert,
+    JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope,
+    Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement, StrRef, Target,
+    Transaction, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -2024,15 +2024,16 @@ impl<'a> Transform<'a> {
     ///
     /// A `.parquet` file, or `FORMAT parquet`, becomes a `read_parquet` instead, since that reader
     /// is here and the rewrite is the same. Everything that writes a file, `COPY t TO` and `COPY
-    /// (query) TO`, is still refused, and so is `COPY FROM DATABASE`.
+    /// (query) TO`, go to [`Self::copy_to`]. `COPY FROM DATABASE` is refused.
     fn copy_statement(&mut self, node: u32) -> Result<Statement> {
+        let select = self.descendant(node, "CopySelect");
+        if select != NONE {
+            let query = self.query(self.descendant(select, "SelectStatementInternal"))?;
+            return self.copy_to(select, query);
+        }
         let table = self.descendant(node, "CopyTable");
         if table == NONE {
             return self.unsupported(self.first(node));
-        }
-        let direction = self.first(self.find(table, "FromOrTo"));
-        if self.name(direction) != "CopyFrom" {
-            return self.unsupported(node);
         }
         let name = self.name_parts(self.find(table, "BaseTableName"));
         let list = self.find(table, "InsertColumnList");
@@ -2045,12 +2046,30 @@ impl<'a> Transform<'a> {
             }
             self.part_slice(parts)
         };
-        let file = self.first(self.find(table, "CopyFileName"));
-        let path = match self.name(file) {
-            "CopyFileNameStringLiteral" => self.string_value(self.find(file, "StringLiteral"))?,
-            "CopyFileNameIdentifier" => self.text(file).to_string(),
-            _ => return self.unsupported(file),
-        };
+        let direction = self.first(self.find(table, "FromOrTo"));
+        if self.name(direction) != "CopyFrom" {
+            let source =
+                self.push_source(Source::Table { name, alias: NONE, columns: Slice::default() });
+            let query = if columns.len == 0 {
+                self.star_over(source)
+            } else {
+                let mut targets = Vec::new();
+                for index in columns.start..columns.start + columns.len {
+                    let part = self.ast.parts[index as usize];
+                    let name = self.part_slice(vec![part]);
+                    let expr = self.push(Expr::Column { name });
+                    targets.push(Target { expr, alias: NONE });
+                }
+                let targets = self.target_slice(targets);
+                let start = self.ast.source_lists.len() as u32;
+                self.ast.source_lists.push(source);
+                let from = Slice { start, len: 1 };
+                let select = self.push_select(Select { targets, from, ..Select::empty() });
+                self.push_query(Query::bare(QueryBody::Select(select)))
+            };
+            return self.copy_to(table, query);
+        }
+        let path = self.copy_file_name(table)?;
         let (format, options) = self.copy_options(self.find(table, "CopyOptions"))?;
         let format = format.unwrap_or_else(|| {
             let lowered = path.to_ascii_lowercase();
@@ -2098,6 +2117,86 @@ impl<'a> Transform<'a> {
             copy: true,
         });
         Ok(Statement::Insert(index))
+    }
+
+    /// `... TO CopyFileName CopyOptions?`, the file and the options kept as written.
+    ///
+    /// The options are not checked here, because which names exist depends on the format and the
+    /// format can be written anywhere in the list or not at all. A string value is kept as the
+    /// string it spells and anything else as its text, which is enough for every option `COPY TO`
+    /// takes: each is a word, a number, a string, or a list of columns.
+    fn copy_to(&mut self, node: u32, query: QueryRef) -> Result<Statement> {
+        let path = self.copy_file_name(node)?;
+        let mut options = Vec::new();
+        let list = self.find(node, "CopyOptions");
+        if list != NONE {
+            let mut generic = Vec::new();
+            self.named_nodes(list, "CopyGenericOption", &mut generic);
+            for option in generic {
+                let inner = self.first(option);
+                if self.name(inner) != "GenericCopyOption" {
+                    return self.unsupported(inner);
+                }
+                let name = self.text(self.find(inner, "CopyOptionName")).to_ascii_lowercase();
+                let value = self.find(inner, "GenericCopyOptionValue");
+                let value = if value == NONE { None } else { Some(self.copy_option_text(value)?) };
+                options.push((name, value));
+            }
+            let mut specialized = Vec::new();
+            self.named_nodes(list, "SpecializedOption", &mut specialized);
+            for option in specialized {
+                let mut inner = self.first(option);
+                if self.name(inner) == "SingleOption" {
+                    inner = self.first(inner);
+                }
+                let name = match self.name(inner) {
+                    "CsvOption" => {
+                        options.push(("format".to_string(), Some("csv".to_string())));
+                        continue;
+                    }
+                    "HeaderOption" => {
+                        options.push(("header".to_string(), None));
+                        continue;
+                    }
+                    "ForceQuoteOption" => {
+                        let columns = self.text(self.find(inner, "StarSymbolColumnList"));
+                        options.push(("force_quote".to_string(), Some(columns.to_string())));
+                        continue;
+                    }
+                    "NullAsOption" => "null",
+                    "DelimiterAsOption" => "delimiter",
+                    "QuoteAsOption" => "quote",
+                    "EscapeAsOption" => "escape",
+                    _ => return self.unsupported(inner),
+                };
+                let value = self.string_value(self.find(inner, "StringLiteral"))?;
+                options.push((name.to_string(), Some(value)));
+            }
+        }
+        let index = self.ast.copies.len() as u32;
+        self.ast.copies.push(CopyTo { query, path, options });
+        Ok(Statement::CopyTo(index))
+    }
+
+    /// `CopyFileName`, as the name of the file.
+    fn copy_file_name(&self, node: u32) -> Result<String> {
+        let file = self.first(self.find(node, "CopyFileName"));
+        match self.name(file) {
+            "CopyFileNameStringLiteral" => self.string_value(self.find(file, "StringLiteral")),
+            "CopyFileNameIdentifier" => Ok(self.text(file).to_string()),
+            _ => self.unsupported(file),
+        }
+    }
+
+    /// The value of one generic `COPY` option: the string a string literal spells, and the text of
+    /// anything else.
+    fn copy_option_text(&self, value: u32) -> Result<String> {
+        let text = self.text(value).trim();
+        let literal = self.descendant(value, "StringLiteral");
+        if literal != NONE && self.text(literal).trim() == text {
+            return self.string_value(literal);
+        }
+        Ok(text.to_string())
     }
 
     /// `CopyOptions <- 'WITH'? CopyOptionList`, as the format it named, if it named one, and the
@@ -5947,6 +6046,18 @@ mod tests {
                 let codegen = if codegen { "(CODEGEN) " } else { "" };
                 format!("EXPLAIN {analyze}{statistics}{codegen}{}", show_query(&ast, query))
             }
+            Statement::CopyTo(index) => {
+                let copy = &ast.copies[index as usize];
+                let options = copy
+                    .options
+                    .iter()
+                    .map(|(name, value)| match value {
+                        Some(value) => format!(" {name}={value}"),
+                        None => format!(" {name}"),
+                    })
+                    .collect::<String>();
+                format!("COPY ({}) TO {}{options}", show_query(&ast, copy.query), copy.path)
+            }
         }
     }
 
@@ -6300,9 +6411,27 @@ mod tests {
             assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");
             assert!(error.contains(message), "{query} gave {error}");
         }
-        for query in ["COPY t TO 'out.csv'", "COPY (SELECT 1) TO 'out.csv'"] {
-            let error = parse_ast(query).unwrap_err().to_string();
-            assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");
+    }
+
+    #[test]
+    fn copy_to_holds_a_query_and_the_options_as_written() {
+        for (query, shown) in [
+            ("COPY t TO 'out.csv'", "COPY (SELECT * FROM t) TO out.csv"),
+            ("COPY t (a, b) TO 'out.csv'", "COPY (SELECT a, b FROM t) TO out.csv"),
+            (
+                "COPY (SELECT 1 AS x) TO 'o.csv' (HEADER false, DELIMITER '|', NULL 'NA')",
+                "COPY (SELECT 1 AS x) TO o.csv header=false delimiter=| null=NA",
+            ),
+            (
+                "COPY t TO 'o.csv' (FORCE_QUOTE (a, b), QUOTE '''')",
+                "COPY (SELECT * FROM t) TO o.csv force_quote=(a, b) quote='",
+            ),
+            (
+                "COPY t TO 'o.csv' WITH DELIMITER ';' CSV HEADER",
+                "COPY (SELECT * FROM t) TO o.csv delimiter=; format=csv header",
+            ),
+        ] {
+            assert_eq!(round_statement(query), shown, "{query}");
         }
     }
 

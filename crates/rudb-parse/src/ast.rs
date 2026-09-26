@@ -77,6 +77,8 @@ pub type InsertRef = u32;
 pub type SettingRef = u32;
 /// An index into `Ast::attaches`.
 pub type AttachRef = u32;
+/// An index into [`Ast::copies`].
+pub type CopyToRef = u32;
 /// An index into `Ast::windows`.
 pub type WindowRef = u32;
 
@@ -148,6 +150,23 @@ pub enum Statement {
     /// `CODEGEN` asks for what the compiled engine would run instead of the plan: its stages and
     /// the QIR it generated for them, or the reason it refuses the query.
     Explain { query: QueryRef, analyze: bool, statistics: bool, codegen: bool },
+    /// `COPY t TO 'file'` or `COPY (query) TO 'file'`, as an index into [`Ast::copies`].
+    CopyTo(CopyToRef),
+}
+
+/// `COPY ... TO`, which writes what a query answers to a file.
+///
+/// `COPY t TO` and `COPY t (a, b) TO` are held as the query over the table they mean, so the one
+/// shape covers both spellings. The options are kept as written, name and value text, because
+/// which ones exist depends on the format and the binder is where a wrong one is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyTo {
+    /// What is written.
+    pub query: QueryRef,
+    /// The file name.
+    pub path: String,
+    /// Each option, lowercased, with the text of its value or `None` when it was written bare.
+    pub options: Vec<(String, Option<String>)>,
 }
 
 /// `SET name = value` and `RESET name`.
@@ -1384,6 +1403,8 @@ pub struct Ast {
     pub settings: Vec<Setting>,
     /// The `ATTACH` arena.
     pub attaches: Vec<Attach>,
+    /// The `COPY ... TO` arena.
+    pub copies: Vec<CopyTo>,
     /// Backing store for every [`Slice`] of column definitions.
     pub column_defs: Vec<ColumnDef>,
     /// Backing store for every [`Slice`] of names, which is a name list rather than a name.
