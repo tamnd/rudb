@@ -11398,3 +11398,91 @@ fn histogram_counts_each_value_or_each_bin_the_way_the_pin_does() {
     );
     assert!(error("SELECT histogram(x, 5) FROM (VALUES (1)) t(x)").contains("No function matches"));
 }
+
+#[test]
+fn bit_strings_cast_sort_and_combine_the_way_the_pin_does() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    assert_eq!(
+        text(
+            "SELECT '1100'::BIT & '1010'::BIT, '1100'::BIT | '1010'::BIT, xor('1100'::BIT, '1010'::BIT), ~'1100'::BIT"
+        ),
+        "1000,1110,0110,0011"
+    );
+    assert_eq!(
+        text("SELECT '1100'::BIT << 1, '1100'::BIT >> 1, '1100'::BIT >> 9"),
+        "1000,0110,0000"
+    );
+    assert_eq!(
+        text(
+            "SELECT x FROM (VALUES ('1'::BIT), ('01'::BIT), ('111'::BIT), ('00000000'::BIT), ('000000000'::BIT)) t(x) ORDER BY x"
+        ),
+        "00000000;000000000;01;1;111"
+    );
+    assert_eq!(text("SELECT '1'::BIT < '01'::BIT, '0'::BIT = '00'::BIT"), "false,false");
+    assert_eq!(
+        text("SELECT 5::TINYINT::BIT, true::BIT, '0101'::BIT::INTEGER, ''::BIT, 'x1f'::BIT"),
+        "00000101,00000001,5,0,00011111"
+    );
+    assert_eq!(
+        text(
+            "SELECT bit_count('1101'::BIT), bit_length('1101'::BIT), octet_length('111100001'::BIT)"
+        ),
+        "3,4,2"
+    );
+    assert_eq!(
+        text(
+            "SELECT get_bit('0110'::BIT, 1), set_bit('0110'::BIT, 0, 1), bit_position('11'::BIT, '0011'::BIT), bitstring('101', 6)"
+        ),
+        "1,1110,3,000101"
+    );
+    assert_eq!(
+        text(
+            "SELECT bit_and(x), bit_or(x), bit_xor(x) FROM (VALUES ('1100'::BIT), ('1010'::BIT), (NULL)) t(x)"
+        ),
+        "1000,1110,0110"
+    );
+    assert_eq!(
+        text("SELECT bitstring_agg(x, 1, 10) FROM (VALUES (1), (3), (10), (NULL)) t(x)"),
+        "1010000001"
+    );
+    assert_eq!(
+        text(
+            "SELECT g, bitstring_agg(x, 0, 4) FROM range(10) t(x), (VALUES (1), (2)) u(g) WHERE x < 5 AND x % g = 0 GROUP BY g ORDER BY g"
+        ),
+        "1,11111;2,10101"
+    );
+    assert_eq!(text("SELECT bitstring_agg(x, 1, 3) FROM range(0) t(x)"), "NULL");
+    let error = |sql: &str| db.execute(sql).expect_err("refused").to_string();
+    assert!(
+        error("SELECT '1'::BIT & '10'::BIT").contains("Cannot AND bit strings of different sizes")
+    );
+    assert!(
+        error("SELECT '012'::BIT")
+            .contains("Invalid character encountered in string -> bit conversion: '2'")
+    );
+    assert!(
+        error("SELECT get_bit('0110'::BIT, 4)").contains("bit index 4 out of valid range (0..3)")
+    );
+    assert!(
+        error("SELECT '111111111'::BIT::TINYINT").contains("Bitstring doesn't fit inside of INT8")
+    );
+    assert!(
+        error("SELECT bitstring_agg(x, 2, 4) FROM (VALUES (1)) t(x)")
+            .contains("Value 1 is outside of provided min and max range (2 <-> 4)")
+    );
+    assert!(
+        error("SELECT bitstring_agg(x, 3, 1) FROM (VALUES (1)) t(x)")
+            .contains("Invalid explicit bitstring range: Minimum (3) > maximum (1)")
+    );
+    assert!(
+        error("SELECT bitstring_agg(x) FROM (VALUES (1)) t(x)")
+            .contains("Could not retrieve required statistics")
+    );
+}

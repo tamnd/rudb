@@ -2397,7 +2397,7 @@ impl Vector {
         match &self.body {
             Body::Constant(value) => match value.as_ref() {
                 Value::Varchar(text) => Some(text.as_bytes()),
-                Value::Blob(bytes) => Some(bytes),
+                Value::Blob(bytes) | Value::Bit(bytes) => Some(bytes),
                 _ => None,
             },
             Body::Dictionary { codes, values, .. } => {
@@ -2431,7 +2431,7 @@ impl Vector {
         match &self.body {
             Body::Constant(value) => Ok(match value.as_ref() {
                 Value::Varchar(text) => Some(text.as_bytes()),
-                Value::Blob(bytes) => Some(bytes.as_slice()),
+                Value::Blob(bytes) | Value::Bit(bytes) => Some(bytes.as_slice()),
                 _ => None,
             }),
             Body::Dictionary { codes, values, .. } => match codes.get(index) {
@@ -4872,7 +4872,8 @@ fn bytes_as(ty: &LogicalType, bytes: &[u8]) -> Value {
         LogicalType::Varchar => {
             std::str::from_utf8(bytes).map_or(Value::Null, |text| Value::Varchar(text.to_owned()))
         }
-        LogicalType::Blob | LogicalType::Bit => Value::Blob(bytes.to_vec()),
+        LogicalType::Blob => Value::Blob(bytes.to_vec()),
+        LogicalType::Bit => Value::Bit(bytes.to_vec()),
         _ => Value::Null,
     }
 }
@@ -5062,7 +5063,7 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
             // A blob goes in as the bytes it is. The column stores a length and some bytes either
             // way, so text is the reading of one rather than a different column, and a blob that
             // is not UTF-8 is stored exactly like one that happens to be.
-            Value::Blob(bytes) => {
+            Value::Blob(bytes) | Value::Bit(bytes) => {
                 column.push_bytes(bytes);
             }
             other => return Err(Error::internal(format!("{other:?} is not a string"))),

@@ -55,6 +55,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::aggregate::{Accumulator, divide_mean, exactly};
+use crate::bitstring;
 use crate::cast;
 use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
@@ -3238,6 +3239,9 @@ pub fn call_values(
     if let ("is_histogram_other_bin", [value]) = (name, args) {
         let other = histogram::other_bin(&value.logical_type());
         return Ok(Value::Boolean(other.as_ref() == Some(value)));
+    }
+    if let Some(answer) = bitstring::value(name, args) {
+        return answer;
     }
     if let Some(answer) = lists::value(name, args, returns) {
         return answer;

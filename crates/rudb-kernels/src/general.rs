@@ -19,6 +19,7 @@ use rudb_common::{Error, LogicalType, Result, Value};
 
 use crate::aggregate::Accumulator;
 use crate::arg_extreme::{ArgExtreme, Key};
+use crate::bitstring::Gathered;
 use crate::compare::order_with_nulls;
 use crate::histogram::Binned;
 use crate::number::{approximate, fit, integral};
@@ -37,6 +38,10 @@ pub(crate) enum General {
     Logic { held: Option<bool>, all: bool },
     /// `bit_and`, `bit_or` and `bit_xor`, held wide and narrowed to the argument's type at the end.
     Bits { held: Option<i128>, op: BitOp, returns: LogicalType },
+    /// `bit_and`, `bit_or` and `bit_xor` over bit strings, which all have to be one length.
+    BitString { held: Option<Vec<u8>>, op: BitOp },
+    /// `bitstring_agg`, in [`crate::bitstring`].
+    Gathered(Gathered),
     /// `product`, in floating point the way the pin multiplies.
     Product { total: f64, seen: bool },
     /// The variance family, as a running count, mean and sum of squared differences.
@@ -114,7 +119,13 @@ impl General {
     /// A fresh state for `name`, or `None` when the name is not one of these.
     pub(crate) fn new(name: &str, returns: &LogicalType) -> Option<Self> {
         let pick = |pick| Self::Pick { held: None, pick };
-        let bits = |op| Self::Bits { held: None, op, returns: returns.clone() };
+        let bits = |op| {
+            if *returns == LogicalType::Bit {
+                Self::BitString { held: None, op }
+            } else {
+                Self::Bits { held: None, op, returns: returns.clone() }
+            }
+        };
         let moments = |measure| Self::Moments { count: 0, mean: 0.0, squared: 0.0, measure };
         if let Some(state) = ArgExtreme::named(name) {
             return Some(Self::Arg { state, returns: returns.clone() });
@@ -145,6 +156,7 @@ impl General {
             "bit_and" => bits(BitOp::And),
             "bit_or" => bits(BitOp::Or),
             "bit_xor" => bits(BitOp::Xor),
+            "bitstring_agg" => Self::Gathered(Gathered::default()),
             "product" => Self::Product { total: 1.0, seen: false },
             "var_samp" => moments(Measure::VarSamp),
             "var_pop" => moments(Measure::VarPop),
@@ -222,6 +234,14 @@ impl General {
                     (Some(so_far), BitOp::Xor) => so_far ^ bits,
                 });
             }
+            Self::BitString { held, op } => {
+                let Value::Bit(bits) = value else { return Err(unexpected("bit_and", value)) };
+                match held {
+                    None => *held = Some(bits.clone()),
+                    Some(so_far) => fold_bits(so_far, bits, *op)?,
+                }
+            }
+            Self::Gathered(state) => state.update(value, &args[1..])?,
             Self::Product { total, seen } => {
                 *total *= approximate(value).ok_or_else(|| unexpected("product", value))?;
                 *seen = true;
@@ -396,6 +416,14 @@ impl General {
                     (here, there) => here.or(there),
                 };
             }
+            (Self::BitString { held, op }, Self::BitString { held: theirs, .. }) => {
+                match (held.as_mut(), theirs) {
+                    (Some(here), Some(there)) => fold_bits(here, there, *op)?,
+                    (None, there) => held.clone_from(there),
+                    (Some(_), None) => {}
+                }
+            }
+            (Self::Gathered(state), Self::Gathered(theirs)) => state.combine(theirs),
             (Self::Paired(state), Self::Paired(theirs)) => state.combine(theirs),
             (Self::Powers(state), Self::Powers(theirs)) => state.combine(theirs),
             (
@@ -526,6 +554,8 @@ impl General {
                 Value::map(key.clone(), LogicalType::UBigInt, entries.collect())
             }
             Self::Binned(state) => state.finish(),
+            Self::BitString { held, .. } => held.clone().map_or(Value::Null, Value::Bit),
+            Self::Gathered(state) => state.finish(),
             Self::Moments { count, squared, measure, .. } => {
                 #[expect(
                     clippy::cast_precision_loss,
@@ -628,4 +658,26 @@ fn settled(value: f64, err: f64) -> (f64, f64) {
 /// A value of a type the binder should not have let through to this aggregate.
 fn unexpected(name: &str, value: &Value) -> Error {
     Error::internal(format!("{name} was handed a {}", value.logical_type()))
+}
+
+/// Folds a bit string into the one held so far, which has to be as long, with the pin's error when
+/// it is not.
+fn fold_bits(held: &mut [u8], bits: &[u8], op: BitOp) -> Result<()> {
+    if rudb_common::bit::len(held) != rudb_common::bit::len(bits) {
+        let what = match op {
+            BitOp::And => "AND",
+            BitOp::Or => "OR",
+            BitOp::Xor => "XOR",
+        };
+        return Err(Error::invalid_input(format!("Cannot {what} bit strings of different sizes")));
+    }
+    for (byte, theirs) in held[1..].iter_mut().zip(&bits[1..]) {
+        *byte = match op {
+            BitOp::And => *byte & theirs,
+            BitOp::Or => *byte | theirs,
+            BitOp::Xor => *byte ^ theirs,
+        };
+    }
+    rudb_common::bit::finalize(held);
+    Ok(())
 }

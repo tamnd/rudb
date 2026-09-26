@@ -2176,6 +2176,7 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
         (Value::Varchar(a), Value::Varchar(b)) => Ok(a.as_bytes().cmp(b.as_bytes())),
         (Value::Blob(a), Value::Blob(b)) => Ok(a.cmp(b)),
+        (Value::Bit(a), Value::Bit(b)) => Ok(rudb_common::bit::cmp(a, b)),
         (Value::Date(a), Value::Date(b)) => Ok(a.cmp(b)),
         // A zoned value orders with its own kind and by the same rule, since both of them are the
         // count of microseconds from a fixed point and the zone is about printing.

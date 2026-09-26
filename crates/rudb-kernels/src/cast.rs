@@ -38,7 +38,7 @@ use std::cmp::Ordering;
 use std::str::FromStr;
 
 use rudb_common::{
-    Error, ErrorCode, Field, LogicalType, PhysicalType, Result, SessionTimeZone, Value,
+    Error, ErrorCode, Field, LogicalType, PhysicalType, Result, SessionTimeZone, Value, bit,
     civil_from_days, days_from_civil,
 };
 use rudb_vector::{Data, Form, Vector};
@@ -943,6 +943,9 @@ fn from_text(text: &str, target: &LogicalType, try_cast: bool) -> Option<Result<
 }
 
 fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
+    if let Value::Bit(bits) = value {
+        return from_bit(bits, target);
+    }
     match target {
         LogicalType::Boolean => to_boolean(value),
         LogicalType::TinyInt
@@ -960,6 +963,7 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
         LogicalType::Decimal { width, scale } => to_decimal(value, *width, *scale),
         LogicalType::Varchar => Ok(Value::Varchar(value.to_string())),
         LogicalType::Blob => to_blob(value),
+        LogicalType::Bit => to_bit(value),
         LogicalType::Date => to_date(value),
         LogicalType::Time => to_time(value),
         LogicalType::TimeTz => to_time_tz(value),
@@ -1338,6 +1342,71 @@ fn to_decimal(value: &Value, width: u8, scale: u8) -> Result<Value> {
 /// the whole number cast asks with the target's scale in place of zero.
 fn parse_decimal(text: &str, scale: u8) -> Option<i128> {
     shifted(&written_number(text)?, i32::from(scale))
+}
+
+/// A value as a bit string, which for a number is the bytes of it big end first, so a `TINYINT` is
+/// eight bits and a `DOUBLE` the sixty four of its IEEE layout, as the pin does it.
+fn to_bit(value: &Value) -> Result<Value> {
+    let bytes = match value {
+        Value::Varchar(text) => return Ok(Value::Bit(bit::from_text(text)?)),
+        Value::Blob(bytes) if bytes.is_empty() => {
+            return Err(Error::conversion("Cannot cast empty BLOB to BIT"));
+        }
+        Value::Blob(bytes) => bytes.clone(),
+        Value::Boolean(flag) => vec![u8::from(*flag)],
+        Value::TinyInt(n) => n.to_be_bytes().to_vec(),
+        Value::SmallInt(n) => n.to_be_bytes().to_vec(),
+        Value::Integer(n) => n.to_be_bytes().to_vec(),
+        Value::BigInt(n) => n.to_be_bytes().to_vec(),
+        Value::HugeInt(n) => n.to_be_bytes().to_vec(),
+        Value::UTinyInt(n) => n.to_be_bytes().to_vec(),
+        Value::USmallInt(n) => n.to_be_bytes().to_vec(),
+        Value::UInteger(n) => n.to_be_bytes().to_vec(),
+        Value::UBigInt(n) => n.to_be_bytes().to_vec(),
+        Value::UHugeInt(n) => n.to_be_bytes().to_vec(),
+        Value::Float(n) => n.to_be_bytes().to_vec(),
+        Value::Double(n) => n.to_be_bytes().to_vec(),
+        other => return Err(no_cast(other, &LogicalType::Bit)),
+    };
+    Ok(Value::Bit(bit::from_bytes(&bytes)))
+}
+
+/// A bit string as another type. A number takes the bits as the low end of its bytes, big end
+/// first, and a bit string with more bytes than the number has is refused.
+fn from_bit(bits: &[u8], target: &LogicalType) -> Result<Value> {
+    let bytes = bit::to_bytes(bits);
+    let fitted = |width: usize, name: &str| {
+        if bytes.len() > width {
+            return Err(Error::conversion(format!("Bitstring doesn't fit inside of {name}")));
+        }
+        let mut out = vec![0; width - bytes.len()];
+        out.extend_from_slice(&bytes);
+        Ok(out)
+    };
+    macro_rules! number {
+        ($kind:ident, $ty:ty) => {{
+            let raw = fitted(size_of::<$ty>(), &target.physical_name())?;
+            Value::$kind(<$ty>::from_be_bytes(raw.try_into().expect("sized above")))
+        }};
+    }
+    Ok(match target {
+        LogicalType::Varchar => Value::Varchar(bit::to_text(bits)),
+        LogicalType::Blob => Value::Blob(bytes),
+        LogicalType::Boolean => Value::Boolean(fitted(1, "UINT8")?[0] > 0),
+        LogicalType::TinyInt => number!(TinyInt, i8),
+        LogicalType::SmallInt => number!(SmallInt, i16),
+        LogicalType::Integer => number!(Integer, i32),
+        LogicalType::BigInt => number!(BigInt, i64),
+        LogicalType::HugeInt => number!(HugeInt, i128),
+        LogicalType::UTinyInt => number!(UTinyInt, u8),
+        LogicalType::USmallInt => number!(USmallInt, u16),
+        LogicalType::UInteger => number!(UInteger, u32),
+        LogicalType::UBigInt => number!(UBigInt, u64),
+        LogicalType::UHugeInt => number!(UHugeInt, u128),
+        LogicalType::Float => number!(Float, f32),
+        LogicalType::Double => number!(Double, f64),
+        other => return Err(no_cast(&Value::Bit(bits.to_vec()), other)),
+    })
 }
 
 /// Text to bytes, which is not the bytes of the text.
@@ -2223,8 +2292,8 @@ mod tests {
         let fitted = cast_value(&Value::BigInt(40_000), &LogicalType::SmallInt, true)
             .expect("try_cast swallows the range failure");
         assert_eq!(fitted, Value::Null);
-        let error = cast_value(&Value::Integer(1), &LogicalType::Bit, true)
-            .expect_err("try_cast does not invent a bit string");
+        let error = cast_value(&Value::Integer(1), &LogicalType::Uuid, true)
+            .expect_err("try_cast does not invent a uuid");
         assert_eq!(error.code(), ErrorCode::NotImplemented);
     }
 
@@ -2459,8 +2528,8 @@ mod tests {
         let refused = cast_value(&Value::Date(0), &LogicalType::Integer, true)
             .expect("try_cast swallows a pair duckdb has no cast for");
         assert_eq!(refused, Value::Null);
-        let error = cast_value(&Value::Integer(1), &LogicalType::Bit, true)
-            .expect_err("try_cast does not invent a bit string");
+        let error = cast_value(&Value::Integer(1), &LogicalType::Uuid, true)
+            .expect_err("try_cast does not invent a uuid");
         assert_eq!(error.code(), ErrorCode::NotImplemented);
     }
 

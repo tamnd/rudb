@@ -250,6 +250,7 @@ mod tag {
     pub(super) const STRUCT: u8 = 22;
     pub(super) const TIME_TZ: u8 = 23;
     pub(super) const TIMESTAMP_TZ: u8 = 24;
+    pub(super) const BIT: u8 = 25;
 }
 
 /// Writes one value.
@@ -278,6 +279,7 @@ fn put(out: &mut Sink<'_>, value: &Value, ty: &LogicalType) -> Result<()> {
         }
         Value::Varchar(text) => bytes(out, tag::VARCHAR, text.as_bytes()),
         Value::Blob(held) => bytes(out, tag::BLOB, held),
+        Value::Bit(held) => bytes(out, tag::BIT, held),
         Value::Date(held) => fixed(out, tag::DATE, &held.to_le_bytes()),
         Value::Time(held) => fixed(out, tag::TIME, &held.to_le_bytes()),
         Value::TimeTz(held) => fixed(out, tag::TIME_TZ, &held.to_le_bytes()),
@@ -386,6 +388,11 @@ fn get(reader: &mut BufReader<File>, ty: &LogicalType, reuse: Option<Value>) -> 
             held.resize(length(reader)?, 0);
             fill(reader, &mut held)?;
             Value::Blob(held)
+        }
+        tag::BIT => {
+            let mut held = vec![0; length(reader)?];
+            fill(reader, &mut held)?;
+            Value::Bit(held)
         }
         tag::DATE => Value::Date(i32::from_le_bytes(take(reader)?)),
         tag::TIME => Value::Time(i64::from_le_bytes(take(reader)?)),
