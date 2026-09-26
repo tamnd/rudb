@@ -349,7 +349,7 @@ pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
 /// searches, and everything after it is choosing how the plan runs, which is what somebody means by
 /// the optimizer. A test holds the index to the pass, so a pass added in front of join ordering
 /// moves the line with it or fails.
-pub const REWRITES: usize = 9;
+pub const REWRITES: usize = 10;
 
 /// [`optimize_with`], saying how many wall nanoseconds of it were the rewrites.
 ///
