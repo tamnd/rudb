@@ -4294,10 +4294,11 @@ pub struct Reader {
     /// The membership sieves of one stripe of one column, by column and then by stripe, read the
     /// first time a probe asks about them. A query filters on one or two columns and never looks at
     /// the rest, so reading these at open would be the whole index for the sake of a fraction of it.
-    sieves: Arc<Vec<Vec<SieveSlot>>>,
+    /// A column's slots are made the first time it is asked about, for the same reason.
+    sieves: Arc<Vec<OnceLock<Box<[SieveSlot]>>>>,
     /// The per part ranges of one stripe of one column, by column and then by stripe, read the
     /// first time something compares that column and kept after that.
-    part_ranges: Arc<Vec<Vec<RangeSlot>>>,
+    part_ranges: Arc<Vec<OnceLock<Box<[RangeSlot]>>>>,
     /// Which stripe and which part of it every part of the table is, by table wide part number.
     places: Arc<Vec<Place>>,
     cache: Arc<Shelf>,
@@ -4469,6 +4470,10 @@ fn verify_part(bytes: &[u8], span: PartSpan) -> Result<()> {
 /// asks a compressed text part whether it can answer and then reads it, and `passing` holds those
 /// pages, oldest first, down to the column's floor. That is what keeps ClickBench 21 from pooling
 /// every page of `URL` for a second scan that never comes.
+///
+/// The slots by stripe are empty until the column is first read, because a table as wide as the
+/// ClickBench one has a hundred columns a query never reads, and a slot for every stripe of each of
+/// them was most of a megabyte a process paid at open.
 #[derive(Debug, Default)]
 struct Cached {
     pages: Vec<Option<Resident>>,
@@ -6401,28 +6406,14 @@ impl Reader {
         let places = places(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
         let table_fields = table.fields.len();
-        let stripes = table.stripes.len();
-        let columns = (0..table.fields.len())
-            .map(|_| {
-                Mutex::new(Cached {
-                    pages: (0..stripes).map(|_| None).collect(),
-                    index: (0..stripes).map(|_| None).collect(),
-                    touched: vec![Vec::new(); stripes],
-                    ..Cached::default()
-                })
-            })
-            .collect::<Vec<_>>();
+        let columns = (0..table_fields).map(|_| Mutex::new(Cached::default())).collect::<Vec<_>>();
         let cache = Shelf {
             columns,
             held: (0..table_fields).map(|_| AtomicUsize::new(0)).collect(),
             kept: AtomicUsize::new(CACHED_STRIPES_PER_COLUMN),
         };
-        let sieves: Vec<Vec<SieveSlot>> = (0..table.fields.len())
-            .map(|_| table.stripes.iter().map(|_| OnceLock::new()).collect())
-            .collect();
-        let part_ranges: Vec<Vec<RangeSlot>> = (0..table.fields.len())
-            .map(|_| table.stripes.iter().map(|_| OnceLock::new()).collect())
-            .collect();
+        let sieves = (0..table_fields).map(|_| OnceLock::new()).collect();
+        let part_ranges = (0..table_fields).map(|_| OnceLock::new()).collect();
         let verified = (places.len() * table_fields).div_ceil(64);
         let firsts = places
             .iter()
@@ -7605,6 +7596,12 @@ impl Reader {
         let cache =
             self.cache.columns.get(column).ok_or_else(|| invalid("column index out of range"))?;
         let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
+        if cached.index.is_empty() {
+            let stripes = self.table.stripes.len();
+            cached.pages = (0..stripes).map(|_| None).collect();
+            cached.index = vec![None; stripes];
+            cached.touched = vec![Vec::new(); stripes];
+        }
         let known = cached.index.get(at).and_then(Clone::clone);
         let page = cached.pages.get(at).and_then(Option::as_ref).map(|slot| {
             slot.used.store(true, Atomic::Relaxed);
@@ -7870,7 +7867,11 @@ impl Reader {
     /// reasoning as the sieves: this is an index over data that is still there, so a caller that
     /// cannot read one reads the rows and gets the right answer slowly.
     fn stripe_part_ranges(&self, stripe: usize, column: usize) -> Option<&[Range]> {
-        let slot = self.part_ranges.get(column)?.get(stripe)?;
+        let slot = self
+            .part_ranges
+            .get(column)?
+            .get_or_init(|| self.table.stripes.iter().map(|_| OnceLock::new()).collect())
+            .get(stripe)?;
         if let Some(held) = slot.get() {
             return Some(held);
         }
@@ -7967,7 +7968,11 @@ impl Reader {
     /// and a caller that cannot read one reads the rows, so this is the one place in the file where
     /// a bad checksum is a slow query rather than an error.
     fn stripe_sieves(&self, stripe: usize, column: usize) -> Option<&[Option<Sieve>]> {
-        let slot = self.sieves.get(column)?.get(stripe)?;
+        let slot = self
+            .sieves
+            .get(column)?
+            .get_or_init(|| self.table.stripes.iter().map(|_| OnceLock::new()).collect())
+            .get(stripe)?;
         if let Some(held) = slot.get() {
             return Some(held);
         }
