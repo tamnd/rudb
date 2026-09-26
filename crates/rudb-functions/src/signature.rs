@@ -276,6 +276,10 @@ enum Shape {
     /// `arg_min(arg, by)`, which answers one of its `arg` values in the type it was given, and
     /// `arg_min(arg, by, n)`, which answers a list of them with `n` taken as a BIGINT.
     Picked,
+    /// `histogram(x)`, a map from each value to how often it came up, and `histogram(x, bins)`,
+    /// whose bins are cast to the type of `x`. A decimal is counted as a double when there are bins,
+    /// because the pin has no binned histogram over decimals and casts them.
+    Histogram,
     /// No arguments at all and a fixed result. `now()` and `current_schema()`.
     ///
     /// The session context functions, which are the ones whose answer comes from the connection
@@ -932,6 +936,14 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::Varchar),
         numeric_only: false,
     },
+    // Whether a value is the key `histogram(x, bins)` counts the values no bin took under.
+    Entry {
+        name: "is_histogram_other_bin",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::AnyTo(Fixed::Boolean),
+        numeric_only: false,
+    },
     // The value of a setting, as a value rather than as a row of `duckdb_settings()`. This is the
     // second function the binder folds and it folds for the same reason `typeof` does: the answer
     // is settled once the name is known and nothing about it changes per row. Upstream folds it too
@@ -1007,6 +1019,8 @@ const TABLE: &[Entry] = &[
     aggregate("favg", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double), true),
     aggregate("count_if", Arity::exactly(1), Shape::Widened(Fixed::Boolean, Fixed::HugeInt), false),
     aggregate("entropy", Arity::exactly(1), Shape::AnyTo(Fixed::Double), false),
+    aggregate("histogram", Arity::between(1, 2), Shape::Histogram, false),
+    aggregate("histogram_exact", Arity::exactly(2), Shape::Histogram, false),
     aggregate("skewness", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double), true),
     aggregate("kurtosis", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double), true),
     aggregate(
@@ -1429,6 +1443,18 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             [arg, by] => (vec![arg.clone(), by.clone()], arg.clone()),
             [arg, by, _] => {
                 (vec![arg.clone(), by.clone(), LogicalType::BigInt], LogicalType::list(arg.clone()))
+            }
+            _ => return Err(no_match(entry.name, arguments)),
+        },
+        Shape::Histogram => match arguments {
+            [value] => (vec![value.clone()], LogicalType::map(value.clone(), LogicalType::UBigInt)),
+            [value, LogicalType::List(_) | LogicalType::Null] => {
+                let key = match value {
+                    LogicalType::Decimal { .. } => LogicalType::Double,
+                    _ => value.clone(),
+                };
+                let returns = LogicalType::map(key.clone(), LogicalType::UBigInt);
+                (vec![key.clone(), LogicalType::list(key)], returns)
             }
             _ => return Err(no_match(entry.name, arguments)),
         },
@@ -2915,6 +2941,7 @@ impl Shape {
             Self::Discrete | Self::Continuous => (leading(1, ANY, "DOUBLE"), ANY),
             Self::Median | Self::Deviation => (all(ANY), ANY),
             Self::Picked => (leading(2, ANY, "BIGINT"), ANY),
+            Self::Histogram => (leading(1, ANY, ANY_LIST), "MAP"),
         }
     }
 }
@@ -3472,6 +3499,7 @@ mod tests {
                         arguments = vec![LogicalType::Varchar; count];
                         arguments[0] = strings();
                     }
+                    Shape::Histogram if count == 2 => arguments[1] = strings(),
                     _ => {}
                 }
                 resolve(entry.name, &arguments).unwrap_or_else(|error| {

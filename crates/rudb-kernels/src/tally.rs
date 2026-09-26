@@ -150,6 +150,15 @@ impl Tally {
         Ok(Value::Double(total.log2() - weighted / total))
     }
 
+    /// Every distinct value with its count, in the order the values sort in.
+    pub(crate) fn sorted(&self) -> Result<Vec<(Value, u64)>> {
+        let mut all = self.distinct()?;
+        if !matches!(self, Self::Values { .. }) {
+            sort(&mut all)?;
+        }
+        Ok(all)
+    }
+
     /// Every distinct value with its count, in no particular order.
     fn distinct(&self) -> Result<Vec<(Value, u64)>> {
         Ok(match self {
