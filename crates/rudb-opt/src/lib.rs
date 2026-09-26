@@ -14,6 +14,7 @@ pub mod bounds;
 pub mod cluster;
 pub mod columns;
 pub mod consistent;
+pub mod constant;
 pub mod cte;
 pub mod delim;
 pub mod dense;
@@ -179,6 +180,12 @@ pub const RANK: u8 = 11;
 /// subtree it removes is a subtree they would otherwise walk, and because the operators it leaves
 /// next to each other are the pairs limit pushdown and top N are looking for.
 ///
+/// Dropping the sort keys that are one value on every row is before limit pushdown, because a sort
+/// left with no keys is taken out and the limit over it can then go down to the scan. It is also
+/// before the unused column drop, because a key it takes away was the last reader of its column. And
+/// it is after the rewrite that turns a grouping on a key into a projection, which is what writes the
+/// count such a sort is ordered by as a literal.
+///
 /// Filter pushdown and limit pushdown used to make work for each other, which is worth recording
 /// here because the fix is not in this list. Limit pushdown trades a limit with the projection under
 /// it, so `Filter / Limit / Project` became `Filter / Project / Limit`, and the filter that had
@@ -205,7 +212,7 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 31] = [
+pub static PASSES: [&(dyn Pass + Sync); 32] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -226,6 +233,7 @@ pub static PASSES: [&(dyn Pass + Sync); 31] = [
     &empty::EmptyResultPullup,
     &extremes::StatisticsPropagation,
     &cte::UnusedMaterialization,
+    &constant::ConstantOrder,
     &columns::UnusedColumns,
     &reorder::FilterOrder,
     &limit::LimitPushdown,

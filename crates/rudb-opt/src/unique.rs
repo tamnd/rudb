@@ -26,10 +26,10 @@
 //!
 //! # When it is the same answer
 //!
-//! The key has to be a bare column of a scan with only filters between the scan and the aggregate,
-//! because a filter keeps a subset of the rows and a subset of distinct values is still distinct. A
-//! join could repeat a row and a projection could compute a column that is not distinct at all, so
-//! both stop the walk. The counts have to be exact and equal: the table's rows and the column's
+//! The key has to be a bare column of a scan with only filters and projections that pass the column
+//! on between the scan and the aggregate, because a filter keeps a subset of the rows and a subset
+//! of distinct values is still distinct. A join could repeat a row and a projection that computes
+//! the column could make it not distinct at all, so both stop the walk. The counts have to be exact and equal: the table's rows and the column's
 //! distinct values, both out of [`Facts`], where only a counted number is kept. And the column has
 //! to hold no nulls, declared or counted, since every null row lands in the one null group.
 //!
@@ -92,8 +92,8 @@ fn project(plan: &mut Plan, at: NodeRef, stats: &Facts) -> Option<NodeRef> {
 
 /// Whether `key` is a column of a scan under `input` that holds every value once and no null.
 fn distinct(plan: &Plan, input: NodeRef, key: ExprRef, stats: &Facts) -> bool {
-    let Expr::Column(binding) = *plan.expr(key) else { return false };
-    let Some(scan) = filtered_scan(plan, input, binding) else { return false };
+    let Expr::Column(outer) = *plan.expr(key) else { return false };
+    let Some((scan, binding)) = filtered_scan(plan, input, outer) else { return false };
     let Node::Get { catalog, schema, table, columns, .. } = *plan.node(scan) else {
         return false;
     };
@@ -107,15 +107,30 @@ fn distinct(plan: &Plan, input: NodeRef, key: ExprRef, stats: &Facts) -> bool {
     };
     let rows = exact(stats.get(&Key::Rows { catalog, schema, table }));
     let values = exact(stats.get(&Key::Distinct { catalog, schema, table, column: &field.name }));
-    let never_null = field.not_null || estimate::never_null(plan, input, binding);
+    let never_null = field.not_null || estimate::never_null(plan, input, outer);
     never_null && rows.is_some() && rows == values
 }
 
-/// The scan `binding` reads, when nothing but filters stand between it and `at`.
-fn filtered_scan(plan: &Plan, at: NodeRef, binding: ColumnBinding) -> Option<NodeRef> {
+/// The scan `binding` reads and the column of it that is, when nothing stands between it and `at`
+/// but filters and projections that hand the column up as it is.
+///
+/// A projection that only passes a column on keeps every row and every value in it, so a column no
+/// row holds twice is still one after it. That is the shape a view puts over a file: ClickBench over
+/// Parquet reads `hits` through `SELECT * REPLACE (...)`, which rewrites four time columns and passes
+/// `WatchID` on untouched.
+fn filtered_scan(
+    plan: &Plan,
+    at: NodeRef,
+    binding: ColumnBinding,
+) -> Option<(NodeRef, ColumnBinding)> {
     match *plan.node(at) {
-        Node::Get { index, .. } if index == binding.table => Some(at),
+        Node::Get { index, .. } if index == binding.table => Some((at, binding)),
         Node::Filter { input, .. } => filtered_scan(plan, input, binding),
+        Node::Project { input, index, exprs, .. } if index == binding.table => {
+            let &expr = plan.expr_list(exprs).get(binding.column as usize)?;
+            let Expr::Column(inner) = *plan.expr(expr) else { return None };
+            filtered_scan(plan, input, inner)
+        }
         _ => None,
     }
 }
@@ -228,6 +243,30 @@ mod tests {
                 "x::SMALLINT, p::VARCHAR]\n",
             )
         );
+    }
+
+    /// A projection that passes the key on, as a view over a file does, is walked through, and one
+    /// that computes it is not.
+    #[test]
+    fn a_key_a_projection_passes_on_is_still_a_key() {
+        let viewed = concat!(
+            "Aggregate #2 groups=[#1.0::BIGINT, #1.1::INTEGER] aggregates=[count_star()::BIGINT]\n",
+            "  Project #1 [#0.0::BIGINT AS w, \"+\"(#0.1::INTEGER, 1::INTEGER)::INTEGER AS ip]\n",
+            "    Get memory.main.hits AS hits #0 [w::BIGINT, ip::INTEGER, r::SMALLINT, x::SMALLINT, ",
+            "p::VARCHAR]\n",
+        );
+        assert_eq!(
+            projected(viewed, &counted(1_000, 1_000), 0),
+            concat!(
+                "Project #2 [#1.0::BIGINT AS column0, #1.1::INTEGER AS column1, 1::BIGINT AS ",
+                "column2]\n",
+                "  Project #1 [#0.0::BIGINT AS w, \"+\"(#0.1::INTEGER, 1::INTEGER)::INTEGER AS ip]\n",
+                "    Get memory.main.hits AS hits #0 [w::BIGINT, ip::INTEGER, r::SMALLINT, ",
+                "x::SMALLINT, p::VARCHAR]\n",
+            )
+        );
+        let computed = viewed.replace("#0.0::BIGINT AS w", "\"+\"(#0.0::BIGINT, 1::BIGINT)::BIGINT AS w");
+        assert_eq!(projected(&computed, &counted(1_000, 1_000), 0), computed);
     }
 
     /// One repeated value, one null, or a count nobody took, and a group may hold two rows.
