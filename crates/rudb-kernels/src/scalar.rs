@@ -59,6 +59,7 @@ use crate::cast;
 use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
+use crate::histogram;
 use crate::lists;
 use crate::maps;
 use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
@@ -3233,6 +3234,10 @@ pub fn call_values(
     }
     if args.iter().any(Value::is_null) {
         return Ok(Value::Null);
+    }
+    if let ("is_histogram_other_bin", [value]) = (name, args) {
+        let other = histogram::other_bin(&value.logical_type());
+        return Ok(Value::Boolean(other.as_ref() == Some(value)));
     }
     if let Some(answer) = lists::value(name, args, returns) {
         return answer;

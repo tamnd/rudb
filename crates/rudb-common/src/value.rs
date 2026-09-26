@@ -529,9 +529,21 @@ fn write_decimal(f: &mut fmt::Formatter<'_>, unscaled: i128, width: u8, scale: u
 /// the characters that lay out a nested value, and a quote inside is written `\'` and a backslash
 /// `\\`. Anything else prints bare, backslashes and all, which was checked character by character
 /// against the pin.
+///
+/// The rule is about the text and not the type. The pin casts every element that is not nested to
+/// a string and quotes that string by the same rule, which is why a time prints as `['10:00:00']`
+/// and an empty blob as `['']` while a date prints bare.
 fn write_element(f: &mut fmt::Formatter<'_>, value: &Value) -> fmt::Result {
-    let Value::Varchar(text) = value else {
-        return write!(f, "{value}");
+    let printed;
+    let text = match value {
+        Value::Varchar(text) => text,
+        Value::Null | Value::List { .. } | Value::Struct(_) | Value::Map { .. } => {
+            return write!(f, "{value}");
+        }
+        _ => {
+            printed = value.to_string();
+            &printed
+        }
     };
     let edge = |c: Option<char>| c.is_some_and(char::is_whitespace);
     let quoted = text.is_empty()
@@ -635,6 +647,12 @@ pub fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
 /// from one. The one is the other with the sign dropped and the number shifted by one, so the
 /// astronomical year zero prints as `0001-01-01 (BC)` and minus 2020 prints as 2021 BC.
 fn write_date(f: &mut fmt::Formatter<'_>, days: i32) -> fmt::Result {
+    // The pin keeps the two infinities at the ends of the range, which is also how they print.
+    match days {
+        i32::MAX => return f.write_str("infinity"),
+        days if days == -i32::MAX => return f.write_str("-infinity"),
+        _ => {}
+    }
     let (year, month, day) = civil_from_days(days);
     if year <= 0 {
         write!(f, "{:04}-{month:02}-{day:02} (BC)", 1 - year)
@@ -665,6 +683,11 @@ fn write_time(f: &mut fmt::Formatter<'_>, micros: i64) -> fmt::Result {
 
 fn write_timestamp(f: &mut fmt::Formatter<'_>, micros: i64) -> fmt::Result {
     const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
+    match micros {
+        i64::MAX => return f.write_str("infinity"),
+        micros if micros == -i64::MAX => return f.write_str("-infinity"),
+        _ => {}
+    }
     let days = micros.div_euclid(MICROS_PER_DAY);
     let within_day = micros.rem_euclid(MICROS_PER_DAY);
     let Ok(days) = i32::try_from(days) else {

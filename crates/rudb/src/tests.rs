@@ -8814,11 +8814,11 @@ fn range_and_generate_series_as_scalars_answer_with_the_pins_lists() {
         ("SELECT range(5)", "[0, 1, 2, 3, 4]"),
         (
             "SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-03', INTERVAL '1 day 12 hours')",
-            "[2020-01-01 00:00:00, 2020-01-02 12:00:00]",
+            "['2020-01-01 00:00:00', '2020-01-02 12:00:00']",
         ),
         (
             "SELECT range(TIMESTAMP '2020-01-03', TIMESTAMP '2020-01-01', INTERVAL '-1 day -12 hours')",
-            "[2020-01-03 00:00:00, 2020-01-01 12:00:00]",
+            "['2020-01-03 00:00:00', '2020-01-01 12:00:00']",
         ),
         ("SELECT range(2, 5)", "[2, 3, 4]"),
         ("SELECT range(10, 2, -3)", "[10, 7, 4]"),
@@ -8845,12 +8845,12 @@ fn range_and_generate_series_as_scalars_answer_with_the_pins_lists() {
         ("SELECT range(-9223372036854775807, -9223372036854775808, -1)", "[-9223372036854775807]"),
         (
             "SELECT range(DATE '2020-01-01', DATE '2020-01-04', INTERVAL 1 DAY)",
-            "[2020-01-01 00:00:00, 2020-01-02 00:00:00, 2020-01-03 00:00:00]",
+            "['2020-01-01 00:00:00', '2020-01-02 00:00:00', '2020-01-03 00:00:00']",
         ),
         (
             "SELECT generate_series(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL 6 HOUR)",
-            "[2020-01-01 00:00:00, 2020-01-01 06:00:00, 2020-01-01 12:00:00, \
-             2020-01-01 18:00:00, 2020-01-02 00:00:00]",
+            "['2020-01-01 00:00:00', '2020-01-01 06:00:00', '2020-01-01 12:00:00', \
+             '2020-01-01 18:00:00', '2020-01-02 00:00:00']",
         ),
         (
             "SELECT typeof(range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL 6 HOUR))",
@@ -8859,7 +8859,7 @@ fn range_and_generate_series_as_scalars_answer_with_the_pins_lists() {
         ("SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL 0 HOUR)", "[]"),
         (
             "SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-03-01', INTERVAL '1 month 1 day')",
-            "[2020-01-01 00:00:00, 2020-02-02 00:00:00]",
+            "['2020-01-01 00:00:00', '2020-02-02 00:00:00']",
         ),
     ];
     for (sql, answer) in answers {
@@ -8900,7 +8900,7 @@ fn range_and_generate_series_as_scalars_answer_with_the_pins_lists() {
     .collect();
     assert_eq!(
         column,
-        ["[2020-01-01 00:00:00, 2020-01-01 12:00:00, 2020-01-02 00:00:00]", "NULL", "[]"]
+        ["['2020-01-01 00:00:00', '2020-01-01 12:00:00', '2020-01-02 00:00:00']", "NULL", "[]"]
     );
     assert_eq!(row("SELECT count(*) FROM range(4)"), "4");
 }
@@ -11326,4 +11326,75 @@ fn arg_min_and_arg_max_answer_the_way_the_pin_does() {
     ] {
         assert!(failure(&db, sql).contains(message), "{sql}");
     }
+}
+
+#[test]
+fn histogram_counts_each_value_or_each_bin_the_way_the_pin_does() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    assert_eq!(
+        text(
+            "SELECT histogram(x), typeof(histogram(x)) FROM (VALUES (3), (1), (2), (1), (NULL)) t(x)"
+        ),
+        "{1=2, 2=1, 3=1},MAP(INTEGER, UBIGINT)"
+    );
+    assert_eq!(
+        text("SELECT histogram(x) FROM (VALUES ('B'), ('a'), ('A'), ('b')) t(x)"),
+        "{A=1, B=1, a=1, b=1}"
+    );
+    assert_eq!(text("SELECT histogram(x) FROM (VALUES (NULL::INT)) t(x)"), "NULL");
+    assert_eq!(
+        text("SELECT histogram(x, [5, 3, 1, 3]) FROM (VALUES (0), (1), (2), (3), (4), (6)) t(x)"),
+        "{1=2, 3=2, 5=1, 2147483647=1}"
+    );
+    assert_eq!(
+        text(
+            "SELECT histogram_exact(x, [1, 3, 5]) FROM (VALUES (0), (1), (2), (3), (4), (6)) t(x)"
+        ),
+        "{1=1, 3=1, 5=0, 2147483647=4}"
+    );
+    assert_eq!(
+        text(
+            "SELECT histogram(x, [1.5, 2.5]), typeof(histogram(x, [1.5])) FROM (VALUES (1.25::DECIMAL(4,2)), (2.0)) t(x)"
+        ),
+        "{1.5=1, 2.5=1},MAP(DOUBLE, UBIGINT)"
+    );
+    assert_eq!(
+        text("SELECT histogram(x, ['2020-01-01'::DATE]) FROM (VALUES ('2021-01-01'::DATE)) t(x)"),
+        "{2020-01-01=0, infinity=1}"
+    );
+    assert_eq!(
+        text("SELECT histogram(x, ['10:00'::TIME]) FROM (VALUES ('11:00'::TIME)) t(x)"),
+        "{'10:00:00'=0, '24:00:00'=1}"
+    );
+    assert_eq!(
+        text(
+            "SELECT g, histogram(x, [1, 2]) FROM (VALUES (1, 1), (1, 5), (2, 2)) t(g, x) GROUP BY g ORDER BY g"
+        ),
+        "1,{1=1, 2=0, 2147483647=1};2,{1=0, 2=1}"
+    );
+    assert_eq!(
+        text("SELECT histogram(x, [1.0, 2.0]) FROM (VALUES ('nan'::DOUBLE), (0.5), (1.0)) t(x)"),
+        "{1.0=3, 2.0=0}"
+    );
+    assert_eq!(
+        text("SELECT histogram_exact(x % 10, [1, 3, 5]) FROM range(100) t(x)"),
+        "{1=10, 3=10, 5=10, 9223372036854775807=70}"
+    );
+    let error = |sql: &str| db.execute(sql).expect_err("refused").to_string();
+    assert!(
+        error("SELECT histogram(x, NULL) FROM (VALUES (1)) t(x)")
+            .contains("Histogram bin list cannot be NULL")
+    );
+    assert!(
+        error("SELECT histogram(x, [1, NULL]) FROM (VALUES (1)) t(x)")
+            .contains("Histogram bin entry cannot be NULL")
+    );
+    assert!(error("SELECT histogram(x, 5) FROM (VALUES (1)) t(x)").contains("No function matches"));
 }

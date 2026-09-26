@@ -20,6 +20,7 @@ use rudb_common::{Error, LogicalType, Result, Value};
 use crate::aggregate::Accumulator;
 use crate::arg_extreme::{ArgExtreme, Key};
 use crate::compare::order_with_nulls;
+use crate::histogram::Binned;
 use crate::number::{approximate, fit, integral};
 use crate::quantile::{self, Column, Held, Holistic};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
@@ -70,6 +71,13 @@ pub(crate) enum General {
     CountIf { count: i128, seen: bool },
     /// `entropy`, which counts each distinct value rather than holding them all.
     Tally(Tally),
+    /// `histogram(x)`, the count of each distinct value, answered as a map keyed by `key`.
+    ///
+    /// A call that passes bins becomes [`General::Binned`] at its first row, since the name alone
+    /// does not say which of the two it is.
+    Counted { tally: Tally, key: LogicalType },
+    /// `histogram(x, bins)` and `histogram_exact(x, bins)`, in [`crate::histogram`].
+    Binned(Binned),
 }
 
 /// Which row [`General::Pick`] keeps.
@@ -147,6 +155,8 @@ impl General {
             "favg" => Self::Kahan { value: 0.0, err: 0.0, count: 0, average: true },
             "count_if" => Self::CountIf { count: 0, seen: false },
             "entropy" => Self::Tally(Tally::Empty),
+            "histogram" => Self::Counted { tally: Tally::Empty, key: map_key(returns) },
+            "histogram_exact" => Self::Binned(Binned::new(true, map_key(returns))),
             "string_agg" => {
                 Self::Joined { text: String::new(), seen: false, separator: String::new() }
             }
@@ -180,6 +190,13 @@ impl General {
             Self::Ordered { rows, .. } => rows.push(args.to_vec()),
             Self::Paired(state) => state.update(args)?,
             _ if value.is_null() => {}
+            Self::Counted { key, .. } if args.len() > 1 => {
+                let mut binned = Binned::new(false, key.clone());
+                binned.update(value, args.get(1))?;
+                *self = Self::Binned(binned);
+            }
+            Self::Counted { tally, .. } => tally.push(value)?,
+            Self::Binned(state) => state.update(value, args.get(1))?,
             Self::Powers(state) => {
                 state.add(approximate(value).ok_or_else(|| unexpected("skewness", value))?);
             }
@@ -272,7 +289,12 @@ impl General {
     pub(crate) fn takes_columns(&self) -> bool {
         matches!(
             self,
-            Self::Holistic { .. } | Self::Tally(_) | Self::Kahan { .. } | Self::CountIf { .. }
+            Self::Holistic { .. }
+                | Self::Tally(_)
+                | Self::Kahan { .. }
+                | Self::CountIf { .. }
+                | Self::Counted { .. }
+                | Self::Binned(_)
         )
     }
 
@@ -284,8 +306,23 @@ impl General {
         row: usize,
         args: &[rudb_vector::Vector],
     ) -> Result<()> {
+        if let Self::Binned(state) = self
+            && state.push_column(column, row)
+        {
+            return Ok(());
+        }
         match (&mut *self, column) {
             (Self::Tally(tally), column) => return tally.push_column(column, row),
+            (Self::Counted { tally, .. }, column) if args.len() < 2 => {
+                return tally.push_column(column, row);
+            }
+            (Self::Counted { .. } | Self::Binned(_), column) => {
+                let mut row_args = vec![column.value(row)];
+                for arg in args.iter().skip(1) {
+                    row_args.push(arg.try_value_at(row)?);
+                }
+                return self.update(&row_args);
+            }
             (Self::CountIf { count, seen }, Column::Flags(flags)) => {
                 *count += i128::from(flags[row]);
                 *seen = true;
@@ -370,6 +407,15 @@ impl General {
                 *count += more;
             }
             (Self::Tally(tally), Self::Tally(theirs)) => tally.append(theirs)?,
+            (Self::Counted { tally, .. }, Self::Counted { tally: theirs, .. }) => {
+                tally.append(theirs)?;
+            }
+            (Self::Binned(state), Self::Binned(theirs)) => state.combine(theirs)?,
+            // A group that saw no rows has not learned it was binned yet.
+            (Self::Binned(_), Self::Counted { .. }) => {}
+            (here @ Self::Counted { .. }, Self::Binned(theirs)) => {
+                *here = Self::Binned(theirs.clone());
+            }
             (Self::CountIf { count, seen }, Self::CountIf { count: more, seen: any }) => {
                 *count += more;
                 *seen |= any;
@@ -470,6 +516,16 @@ impl General {
             }
             Self::CountIf { count, .. } => Value::HugeInt(*count),
             Self::Tally(tally) => tally.entropy()?,
+            Self::Counted { tally, key } => {
+                let entries = tally.sorted()?;
+                if entries.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let entries =
+                    entries.into_iter().map(|(value, count)| (value, Value::UBigInt(count)));
+                Value::map(key.clone(), LogicalType::UBigInt, entries.collect())
+            }
+            Self::Binned(state) => state.finish(),
             Self::Moments { count, squared, measure, .. } => {
                 #[expect(
                     clippy::cast_precision_loss,
@@ -505,6 +561,14 @@ impl General {
                 return Err(Error::internal("an ordered, holistic or arg_min aggregate"));
             }
         })
+    }
+}
+
+/// The key type of a map an aggregate answers with, or the null type when it does not answer one.
+fn map_key(returns: &LogicalType) -> LogicalType {
+    match returns {
+        LogicalType::Map(key, _) => (**key).clone(),
+        _ => LogicalType::Null,
     }
 }
 
