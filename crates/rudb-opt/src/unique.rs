@@ -26,12 +26,13 @@
 //!
 //! # When it is the same answer
 //!
-//! The key has to be a bare column of a scan with only filters and projections that pass the column
-//! on between the scan and the aggregate, because a filter keeps a subset of the rows and a subset
-//! of distinct values is still distinct. A join could repeat a row and a projection that computes
-//! the column could make it not distinct at all, so both stop the walk. The counts have to be exact and equal: the table's rows and the column's
-//! distinct values, both out of [`Facts`], where only a counted number is kept. And the column has
-//! to hold no nulls, declared or counted, since every null row lands in the one null group.
+//! The key has to be a bare column of a scan with only filters, projections that pass the column on
+//! and the joins in the next section between the scan and the aggregate, because a filter keeps a
+//! subset of the rows and a subset of distinct values is still distinct. A projection that computes
+//! the column could make it not distinct at all, so it stops the walk. The counts have to be exact
+//! and equal: the table's rows and the column's distinct values, both out of [`Facts`], where only a
+//! counted number is kept. And the column has to hold no nulls, declared or counted, since every
+//! null row lands in the one null group.
 //!
 //! `DISTINCT`, a `FILTER` on a call, `count(e)` and any other aggregate are refused. None of them is
 //! what a measured query does with this shape.
@@ -196,7 +197,8 @@ fn counted(plan: &Plan, at: NodeRef, binding: ColumnBinding, stats: &Facts) -> b
 
 /// Whether `binding` is one of the columns `at` hands up.
 fn produces(plan: &Plan, at: NodeRef, binding: ColumnBinding) -> bool {
-    walk::outputs(plan, at).is_some_and(|columns| columns.iter().any(|(bound, _)| *bound == binding))
+    walk::outputs(plan, at)
+        .is_some_and(|columns| columns.iter().any(|(bound, _)| *bound == binding))
 }
 
 /// Whether a join on `conditions` matches each row of the side facing `other` to at most one row
@@ -222,9 +224,10 @@ fn once(plan: &Plan, conditions: Slice, other: NodeRef, stats: &Facts) -> bool {
         let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
             return false;
         };
-        [left, right].into_iter().filter_map(column).any(|binding| {
-            produces(plan, other, binding) && unique(plan, other, binding, stats)
-        })
+        [left, right]
+            .into_iter()
+            .filter_map(column)
+            .any(|binding| produces(plan, other, binding) && unique(plan, other, binding, stats))
     })
 }
 
@@ -358,7 +361,8 @@ mod tests {
                 "x::SMALLINT, p::VARCHAR]\n",
             )
         );
-        let computed = viewed.replace("#0.0::BIGINT AS w", "\"+\"(#0.0::BIGINT, 1::BIGINT)::BIGINT AS w");
+        let computed =
+            viewed.replace("#0.0::BIGINT AS w", "\"+\"(#0.0::BIGINT, 1::BIGINT)::BIGINT AS w");
         assert_eq!(projected(&computed, &counted(1_000, 1_000), 0), computed);
     }
 
@@ -427,7 +431,8 @@ mod tests {
     fn a_join_that_may_hand_a_row_up_twice_keeps_its_aggregate() {
         assert_eq!(joined(JOINED, 99, 25), JOINED);
         assert_eq!(joined(JOINED, 100, 24), JOINED);
-        let wide = JOINED.replace("groups=[#1.0::BIGINT]", "groups=[#1.0::BIGINT, #1.1::DECIMAL(15,2)]");
+        let wide =
+            JOINED.replace("groups=[#1.0::BIGINT]", "groups=[#1.0::BIGINT, #1.1::DECIMAL(15,2)]");
         assert_eq!(joined(&wide, 100, 25), wide);
         let padded = concat!(
             "Aggregate #3 groups=[#2.0::INTEGER] aggregates=[count_star()::BIGINT]\n",
