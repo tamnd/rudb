@@ -2033,8 +2033,9 @@ impl<'a> Aggregate<'a> {
             && signed_key(self.plan.expr_type(self.keys[0]))
     }
 
-    /// Whether every call is a plain count and the one key has a range the planner knows, so the
-    /// counts can be kept in arrays the key indexes. See [`group_ranged`].
+    /// Whether every call is a plain count or a sum of a signed column no wider than 128 bits, and
+    /// the one key has a range the planner knows, so the calls can be kept in arrays the key
+    /// indexes. See [`group_ranged`].
     ///
     /// Nothing that reads the groups afterwards is allowed, a TopN or a `HAVING` on the count or a
     /// limit on the groups, since those live in the table this goes around.
@@ -2052,10 +2053,21 @@ impl<'a> Aggregate<'a> {
                 call.folds()
                     && !call.distinct
                     && call.filter.is_none()
-                    && call.returns == LogicalType::BigInt
                     && match call.name.as_str() {
-                        "count_star" => call.args.is_empty(),
-                        "count" => call.args.len() == 1,
+                        "count_star" => call.args.is_empty() && call.returns == LogicalType::BigInt,
+                        "count" => call.args.len() == 1 && call.returns == LogicalType::BigInt,
+                        "sum" => {
+                            call.args.len() == 1
+                                && call.returns.physical() == PhysicalType::Int128
+                                && matches!(
+                                    self.plan.expr_type(call.args[0]).physical(),
+                                    PhysicalType::Int8
+                                        | PhysicalType::Int16
+                                        | PhysicalType::Int32
+                                        | PhysicalType::Int64
+                                        | PhysicalType::Int128
+                                )
+                        }
                         _ => false,
                     }
             })
@@ -2072,12 +2084,10 @@ impl<'a> Aggregate<'a> {
             let calls = self
                 .calls
                 .iter()
-                .map(|call| {
-                    if call.args.is_empty() {
-                        group_ranged::Counted::Rows
-                    } else {
-                        group_ranged::Counted::Valid
-                    }
+                .map(|call| match call.name.as_str() {
+                    "sum" => group_ranged::Counted::Sum(call.returns.clone()),
+                    _ if call.args.is_empty() => group_ranged::Counted::Rows,
+                    _ => group_ranged::Counted::Valid,
                 })
                 .collect();
             group_ranged::Exchange::new(
