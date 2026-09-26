@@ -29,6 +29,9 @@ rudb-qc-pipe.workspace = true
 rudb-qc-gen.workspace = true
 rudb-qc-clif = { workspace = true, optional = true }
 
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+rudb-qc-direct.workspace = true
+
 [features]
 default = []
 # The second tier, `clif`: pipeline functions compiled to machine code through Cranelift. Off by

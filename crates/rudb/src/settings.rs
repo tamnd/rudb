@@ -164,7 +164,7 @@ pub(crate) struct Settings {
     /// Not a DuckDB setting, so not in the settings catalog, for the reason the seams are not.
     engine: RwLock<String>,
     /// Which tier the compiled engine runs its pipelines on, as `SET qc_tier` has left it: `auto`,
-    /// `interp` or `clif`. Only read when the engine is `compiled`.
+    /// `interp`, `clif` or `direct`. Only read when the engine is `compiled`.
     ///
     /// Not a DuckDB setting either, for the same reason.
     tier: RwLock<rudb_qc::Tier>,
@@ -339,9 +339,7 @@ impl Settings {
                 ))
             })?;
             if !tier.built() {
-                return Err(Error::invalid_input(format!(
-                    "qc_tier {tier} needs a build with the qc-clif feature"
-                )));
+                return Err(Error::invalid_input(format!("qc_tier {tier} needs {}", tier.needs())));
             }
             *self.tier.write().unwrap_or_else(|held| held.into_inner()) = tier;
             return Ok(());

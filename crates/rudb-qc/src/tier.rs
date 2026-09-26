@@ -1,17 +1,18 @@
 //! The tiers a pipeline function runs on, per section 8.1 of `spec/compiler/08-backends.md`:
-//! `interp`, which always exists, and `clif`, the Cranelift backend, when the build has the
-//! `qc-clif` feature and the platform has a code arena.
+//! `interp`, which always exists, `direct`, the single pass x86-64 backend, on x86-64, and
+//! `clif`, the Cranelift backend, when the build has the `qc-clif` feature. Both backends need a
+//! platform with a code arena.
 //!
 //! Every function is lowered for the interpreter, whatever the tier. That is the fallback for a
-//! function the second tier does not lower, and it is what lets a query move between the tiers at
+//! function a backend does not lower, and it is what lets a query move between the tiers at
 //! a morsel boundary: the two agree on the state and the morsel to the byte, so either one can
 //! pick up where the other stopped.
 //!
 //! [`Switch`] moves a query between the tiers at morsel boundaries, which is the tier differential
 //! of section 15 of the spec: the same query with and without the moves has to give the same bits.
 //!
-//! A function `clif` refuses, or panics on, runs on `interp` and the refusal is kept in the
-//! [`Report`]. A query never fails because the second tier could not compile it.
+//! A function a backend refuses, or panics on, runs on `interp` and the refusal is kept in the
+//! [`Report`]. A query never fails because a backend could not compile it.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -31,11 +32,13 @@ pub enum Tier {
     Interp,
     /// Machine code through Cranelift, with `interp` for what it does not lower.
     Clif,
+    /// Machine code from the single pass backend, with `interp` for what it does not lower.
+    Direct,
 }
 
 impl Tier {
     /// Every tier, in the order `SET qc_tier` lists them.
-    pub const ALL: [Tier; 3] = [Tier::Auto, Tier::Interp, Tier::Clif];
+    pub const ALL: [Tier; 4] = [Tier::Auto, Tier::Interp, Tier::Clif, Tier::Direct];
 
     /// The name `SET qc_tier` takes.
     #[must_use]
@@ -44,6 +47,7 @@ impl Tier {
             Tier::Auto => "auto",
             Tier::Interp => "interp",
             Tier::Clif => "clif",
+            Tier::Direct => "direct",
         }
     }
 
@@ -53,18 +57,33 @@ impl Tier {
         Tier::ALL.into_iter().find(|t| t.name().eq_ignore_ascii_case(name.trim()))
     }
 
-    /// Whether this build can run the tier. `clif` needs the `qc-clif` feature.
+    /// Whether this build can run the tier. `clif` needs the `qc-clif` feature and `direct` an
+    /// x86-64 target.
     #[must_use]
     pub fn built(self) -> bool {
-        self != Tier::Clif || cfg!(feature = "qc-clif")
+        match self {
+            Tier::Auto | Tier::Interp => true,
+            Tier::Clif => cfg!(feature = "qc-clif"),
+            Tier::Direct => cfg!(target_arch = "x86_64"),
+        }
     }
 
-    /// Whether this compiles to machine code, once `auto` is decided.
-    fn native(self) -> bool {
+    /// What the build message says a tier that is not [`Tier::built`] needs.
+    #[must_use]
+    pub fn needs(self) -> &'static str {
         match self {
-            Tier::Interp => false,
-            Tier::Clif => true,
-            Tier::Auto => cfg!(feature = "qc-clif"),
+            Tier::Clif => "a build with the qc-clif feature",
+            Tier::Direct => "an x86-64 build",
+            Tier::Auto | Tier::Interp => "nothing",
+        }
+    }
+
+    /// The tier `auto` stands for in this build: `clif` when it is built, `interp` otherwise.
+    fn decided(self) -> Tier {
+        match self {
+            Tier::Auto if Tier::Clif.built() => Tier::Clif,
+            Tier::Auto => Tier::Interp,
+            t => t,
         }
     }
 }
@@ -198,7 +217,7 @@ pub struct Report {
     pub native: usize,
     /// The bytes of machine code loaded.
     pub bytes: usize,
-    /// Each function that runs on `interp` although the tier is `clif`, and why.
+    /// Each function that runs on `interp` although the tier compiles to machine code, and why.
     pub fallbacks: Vec<String>,
 }
 
@@ -224,7 +243,6 @@ impl fmt::Display for Report {
 /// A module on every tier it has.
 pub(crate) struct Tiers {
     program: Program,
-    #[cfg(feature = "qc-clif")]
     native: Vec<Option<rudb_qc_rt::code::Code>>,
     report: Report,
     switch: Switch,
@@ -253,32 +271,19 @@ impl Tiers {
             module.funcs.iter().map(|_| AtomicU8::new(2)).collect(),
             [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
         );
-        let mut report = Report {
-            tier: if tier.native() { Tier::Clif.name() } else { Tier::Interp.name() },
-            functions: module.funcs.len(),
-            ..Report::default()
+        let tier = tier.decided();
+        let mut report =
+            Report { tier: tier.name(), functions: module.funcs.len(), ..Report::default() };
+        let native = match tier {
+            Tier::Clif => native::compile(module, &mut report, clif::compile),
+            Tier::Direct => native::compile(module, &mut report, direct::compile),
+            Tier::Interp | Tier::Auto => module.funcs.iter().map(|_| None).collect(),
         };
-        #[cfg(feature = "qc-clif")]
-        {
-            let native = if tier.native() {
-                clif::compile(module, &mut report)
-            } else {
-                module.funcs.iter().map(|_| None).collect()
-            };
-            let (morsels, last, switches) = counts;
-            Tiers { program, native, report, switch, morsels, last, switches }
-        }
-        #[cfg(not(feature = "qc-clif"))]
-        {
-            if tier.native() {
-                report.fallbacks.push("this build has no clif tier".to_string());
-            }
-            let (morsels, last, switches) = counts;
-            Tiers { program, report, switch, morsels, last, switches }
-        }
+        let (morsels, last, switches) = counts;
+        Tiers { program, native, report, switch, morsels, last, switches }
     }
 
-    /// What the second tier did.
+    /// What the backend did.
     pub(crate) fn report(&self) -> &Report {
         &self.report
     }
@@ -315,15 +320,7 @@ impl Tiers {
 
     /// Whether function `f` has machine code.
     fn has_native(&self, f: usize) -> bool {
-        #[cfg(feature = "qc-clif")]
-        {
-            matches!(self.native.get(f), Some(Some(_)))
-        }
-        #[cfg(not(feature = "qc-clif"))]
-        {
-            let _ = f;
-            false
-        }
+        matches!(self.native.get(f), Some(Some(_)))
     }
 
     /// Runs function `f` on a state and a morsel, as machine code when `native` is set and there
@@ -336,80 +333,80 @@ impl Tiers {
         m: *const u8,
         rt: &mut Rt,
     ) -> u64 {
-        #[cfg(feature = "qc-clif")]
         if native && let Some(Some(code)) = self.native.get(f) {
-            return clif::call(code, st, m, rt);
+            return native::call(code, st, m, rt);
         }
-        #[cfg(not(feature = "qc-clif"))]
-        let _ = native;
         self.program.call(f, st, m, rt)
     }
 }
 
-#[cfg(feature = "qc-clif")]
-mod clif {
+/// Loading and calling machine code, whichever backend made it.
+mod native {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::OnceLock;
     use std::time::Instant;
 
-    use rudb_qc_clif::Backend;
-    use rudb_qc_ir::Module;
+    use rudb_qc_ir::entry::Entry;
+    use rudb_qc_ir::{Func, Module};
     use rudb_qc_rt::code::{Code, CodeArena, Reloc, RelocKind};
     use rudb_qc_rt::native::{Ctx, address};
     use rudb_qc_rt::{Rt, abi};
 
     use super::Report;
 
-    /// The backend and the arena, made once per process, or why they could not be.
-    fn machine() -> Result<&'static (Backend, CodeArena), &'static str> {
-        static MACHINE: OnceLock<Result<(Backend, CodeArena), String>> = OnceLock::new();
-        MACHINE
-            .get_or_init(|| {
-                let backend = Backend::host().map_err(|e| e.to_string())?;
-                let arena = CodeArena::new().map_err(|e| format!("no code arena: {e}"))?;
-                Ok((backend, arena))
-            })
+    /// A backend's output: the bytes, and where each runtime entry's address goes with its
+    /// addend.
+    pub(super) struct Lowered {
+        pub(super) bytes: Vec<u8>,
+        pub(super) relocs: Vec<(u32, Entry, i64)>,
+    }
+
+    /// The arena, made once per process, or why it could not be.
+    fn arena() -> Result<&'static CodeArena, &'static str> {
+        static ARENA: OnceLock<Result<CodeArena, String>> = OnceLock::new();
+        ARENA
+            .get_or_init(|| CodeArena::new().map_err(|e| format!("no code arena: {e}")))
             .as_ref()
             .map_err(String::as_str)
     }
 
-    /// Compiles and loads every function of `module`, and says in `report` what it did.
-    pub(super) fn compile(module: &Module, report: &mut Report) -> Vec<Option<Code>> {
+    /// Compiles every function of `module` with `lower` and loads it, and says in `report` what
+    /// it did.
+    pub(super) fn compile(
+        module: &Module,
+        report: &mut Report,
+        lower: fn(&Func) -> Result<Lowered, String>,
+    ) -> Vec<Option<Code>> {
         let start = Instant::now();
-        let machine = match machine() {
-            Ok(m) => m,
+        let arena = match arena() {
+            Ok(a) => a,
             Err(why) => {
                 report.fallbacks.push(why.to_string());
                 return module.funcs.iter().map(|_| None).collect();
             }
         };
-        let (backend, arena) = machine;
         let mut out = Vec::with_capacity(module.funcs.len());
         for f in &module.funcs {
-            // Cranelift asserts what it believes about its input, and an assertion here is a
-            // function this tier does not handle, not a reason to fail the query.
-            let compiled = catch_unwind(AssertUnwindSafe(|| backend.compile(f)))
+            // A backend asserts what it believes about its input, and an assertion here is a
+            // function it does not handle, not a reason to fail the query.
+            let compiled = catch_unwind(AssertUnwindSafe(|| lower(f)))
                 .unwrap_or_else(|_| {
-                    Err(rudb_qc_clif::Error {
-                        func: f.name.clone(),
-                        reason: "the code generator panicked".to_string(),
-                    })
+                    Err(format!("{}: {}: the code generator panicked", report.tier, f.name))
                 })
-                .map_err(|e| e.to_string())
                 .and_then(|code| {
                     let relocs: Vec<Reloc> = code
                         .relocs
                         .iter()
-                        .map(|r| Reloc {
-                            offset: r.offset,
+                        .map(|&(offset, entry, addend)| Reloc {
+                            offset,
                             kind: RelocKind::Abs8,
-                            target: address(r.entry),
-                            addend: r.addend,
+                            target: address(entry),
+                            addend,
                         })
                         .collect();
                     arena
                         .load(&code.bytes, &relocs)
-                        .map_err(|e| format!("clif: {}: loading: {e}", f.name))
+                        .map_err(|e| format!("{}: {}: loading: {e}", report.tier, f.name))
                 });
             match compiled {
                 Ok(code) => {
@@ -446,5 +443,73 @@ mod clif {
     }
 }
 
-#[cfg(all(test, feature = "qc-clif"))]
+#[cfg(feature = "qc-clif")]
+mod clif {
+    use std::sync::OnceLock;
+
+    use rudb_qc_clif::Backend;
+    use rudb_qc_ir::Func;
+
+    use super::native::Lowered;
+
+    /// Compiles one function through Cranelift for this machine.
+    pub(super) fn compile(f: &Func) -> Result<Lowered, String> {
+        static BACKEND: OnceLock<Result<Backend, String>> = OnceLock::new();
+        let backend = BACKEND
+            .get_or_init(|| Backend::host().map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let code = backend.compile(f).map_err(|e| e.to_string())?;
+        let relocs = code.relocs.iter().map(|r| (r.offset, r.entry, r.addend)).collect();
+        Ok(Lowered { bytes: code.bytes, relocs })
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod direct {
+    use std::sync::OnceLock;
+
+    use rudb_qc_direct::Backend;
+    use rudb_qc_ir::Func;
+
+    use super::native::Lowered;
+
+    /// Compiles one function with the single pass backend, using what this processor has.
+    pub(super) fn compile(f: &Func) -> Result<Lowered, String> {
+        static BACKEND: OnceLock<Result<Backend, String>> = OnceLock::new();
+        let backend = BACKEND
+            .get_or_init(|| Backend::host().map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let code = backend.compile(f).map_err(|e| e.to_string())?;
+        let relocs = code.relocs.iter().map(|r| (r.offset, r.entry, r.addend)).collect();
+        Ok(Lowered { bytes: code.bytes, relocs })
+    }
+}
+
+/// A build without Cranelift refuses every function, and `SET qc_tier` refuses the tier first.
+#[cfg(not(feature = "qc-clif"))]
+mod clif {
+    use rudb_qc_ir::Func;
+
+    use super::native::Lowered;
+
+    pub(super) fn compile(f: &Func) -> Result<Lowered, String> {
+        Err(format!("{}: this build has no clif tier", f.name))
+    }
+}
+
+/// Not on x86-64, `direct` refuses every function, and `SET qc_tier` refuses the tier first.
+#[cfg(not(target_arch = "x86_64"))]
+mod direct {
+    use rudb_qc_ir::Func;
+
+    use super::native::Lowered;
+
+    pub(super) fn compile(f: &Func) -> Result<Lowered, String> {
+        Err(format!("{}: this build has no direct tier", f.name))
+    }
+}
+
+#[cfg(test)]
 mod tests;

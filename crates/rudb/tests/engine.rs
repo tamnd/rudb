@@ -159,11 +159,16 @@ fn every_tier_the_build_has_answers_what_the_first_engine_answers() {
     database.execute("SET engine = 'first'").expect("the first engine");
     let first = rows(&database, sql);
     database.execute("SET engine = 'compiled'").expect("the compiled engine");
-    for tier in ["auto", "interp", "clif"] {
+    for tier in ["auto", "interp", "clif", "direct"] {
         let set = database.execute(&format!("SET qc_tier = '{tier}'"));
         if tier == "clif" && !cfg!(feature = "qc-clif") {
             let error = set.expect_err("clif needs the feature").to_string();
             assert!(error.contains("qc-clif"), "{error}");
+            continue;
+        }
+        if tier == "direct" && !cfg!(target_arch = "x86_64") {
+            let error = set.expect_err("direct needs x86-64").to_string();
+            assert!(error.contains("x86-64"), "{error}");
             continue;
         }
         set.unwrap_or_else(|error| panic!("SET qc_tier = '{tier}' failed: {error}"));
@@ -171,7 +176,7 @@ fn every_tier_the_build_has_answers_what_the_first_engine_answers() {
         assert_eq!(rows(&database, sql), first, "{tier}");
     }
     let error = database.execute("SET qc_tier = 'llvm'").expect_err("no such tier").to_string();
-    assert!(error.contains("auto, interp, clif"), "{error}");
+    assert!(error.contains("auto, interp, clif, direct"), "{error}");
     assert_eq!(database.refusals(), Vec::<String>::new());
 }
 

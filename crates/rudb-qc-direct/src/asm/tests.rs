@@ -343,6 +343,10 @@ fn flags_bits_and_bytes() {
                 }
             }
             check(&format!("crc32 {}, {}", Q[d.0 as usize], Q[s.0 as usize]), |a| a.crc32(d, s));
+            for size in [Size::W, Size::D, Size::Q] {
+                let (dn, sn) = (name(size, d), name(size, s));
+                check(&format!("bt {dn}, {sn}"), |a| a.bt(size, d, s));
+            }
         }
         check(&format!("bswap {}", D[d.0 as usize]), |a| a.bswap(Size::D, d));
         check(&format!("bswap {}", Q[d.0 as usize]), |a| a.bswap(Size::Q, d));
@@ -460,6 +464,10 @@ fn sse() {
             for x in [Xmm(0), Xmm(7), Xmm(8), Xmm(15)] {
                 check(&format!("mov{s} xmm{}, {ptr} ptr {at}", x.0), |a| a.fload(p, x, m));
                 check(&format!("mov{s} {ptr} ptr {at}, xmm{}", x.0), |a| a.fstore(p, m, x));
+                if p == Prec::S {
+                    check(&format!("movups xmm{}, xmmword ptr {at}", x.0), |a| a.vload(x, m));
+                    check(&format!("movups xmmword ptr {at}, xmm{}", x.0), |a| a.vstore(m, x));
+                }
             }
         }
     }

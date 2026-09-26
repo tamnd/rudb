@@ -37,9 +37,9 @@ const FIXUP: &str = "* REPLACE (make_date(EventDate) AS EventDate, epoch_ms(Even
 
 pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let usage = || {
-        "usage: cargo xtask compiled [--threads <n>] [--set <name>=<value>]... [--tier auto|interp|clif | --tiers <seed>] \
+        "usage: cargo xtask compiled [--threads <n>] [--set <name>=<value>]... [--tier auto|interp|clif|direct | --tiers <seed>] \
          <file.parquet> [q1 q2 ...]\n       \
-         cargo xtask compiled [--threads <n>] [--tier auto|interp|clif | --tiers <seed>] \
+         cargo xtask compiled [--threads <n>] [--tier auto|interp|clif|direct | --tiers <seed>] \
          --suite <parquet dir> <queries> [q1 ...]\n       \
          cargo xtask compiled [--threads <n>] [--tiers <seed>] --corpus <slt dir>"
             .to_string()
@@ -54,7 +54,6 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             "--tier" => tier = value.clone(),
             "--tiers" => {
                 seed = Some(value.parse::<u64>().map_err(|e| format!("--tiers {value}: {e}"))?);
-                tier = "clif".to_string();
             }
             "--threads" => {
                 threads =
@@ -69,6 +68,11 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             _ => break,
         }
         args = rest;
+    }
+    // The differential compares `interp` with one native tier, `clif` unless `--tier` names
+    // another.
+    if seed.is_some() && (tier == "auto" || tier == "interp") {
+        tier = if cfg!(feature = "qc-clif") { "clif" } else { "direct" }.to_string();
     }
     if let [flag, dir] = args
         && flag == "--corpus"
@@ -120,7 +124,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     };
     let only: Vec<&str> = only.iter().map(String::as_str).collect();
     if let Some(seed) = seed {
-        return tiers(&database, &queries, &only, seed);
+        return tiers(&database, &queries, &only, &tier, seed);
     }
     println!("tier    {tier}");
     println!();
@@ -202,8 +206,8 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
 }
 
 /// The tier differential of `spec/compiler/15-correctness.md` section 15.3: every query on
-/// `interp`, on `clif`, and on `clif` with switches back and forth at random morsels, one thread,
-/// and the three answers the same to the bit and in the same order.
+/// `interp`, on a native tier, and on that tier with switches back and forth at random morsels,
+/// one thread, and the three answers the same to the bit and in the same order.
 ///
 /// The switches are drawn from `seed` plus the query's place in the list, so a failure names the
 /// setting that brings it back. Rows are compared through their `Debug` text, which writes a double
@@ -214,16 +218,17 @@ fn tiers(
     database: &Database,
     queries: &[(String, String)],
     only: &[&str],
+    native: &str,
     seed: u64,
 ) -> Result<(), String> {
     let set = |sql: &str| database.execute(sql).map(|_| ()).map_err(|e| format!("{sql}: {e}"));
     set("SET threads = 1")?;
     set("SET engine = 'compiled'")?;
-    println!("tiers   interp, clif, clif with qc_switch random:{seed}+n, threads 1");
+    println!("tiers   interp, {native}, {native} with qc_switch random:{seed}+n, threads 1");
     println!();
     println!(
         "{:<5} {:>9} {:>9} {:>9} {:>9} {:>9}  verdict",
-        "query", "interp", "clif", "switched", "in aggr", "in build"
+        "query", "interp", native, "switched", "in aggr", "in build"
     );
     let (mut same, mut refused, mut wrong) = (0, 0, Vec::new());
     let start = database.tier_switches();
@@ -236,8 +241,8 @@ fn tiers(
         let before = database.tier_switches();
         for (tier, switch) in [
             ("interp", "off".to_string()),
-            ("clif", "off".to_string()),
-            ("clif", format!("random:{}", seed.wrapping_add(n as u64))),
+            (native, "off".to_string()),
+            (native, format!("random:{}", seed.wrapping_add(n as u64))),
         ] {
             set(&format!("SET qc_tier = '{tier}'"))?;
             set(&format!("SET qc_switch = '{switch}'"))?;
@@ -260,7 +265,7 @@ fn tiers(
             let odd: Vec<String> = runs[1..]
                 .iter()
                 .filter(|r| r.0 != runs[0].0)
-                .map(|r| format!("clif, qc_switch {}", r.2))
+                .map(|r| format!("{native}, qc_switch {}", r.2))
                 .collect();
             wrong.push((name.clone(), runs[0].0.clone(), odd.join(" and ")));
             format!("differ on {}", odd.join(" and "))
@@ -341,11 +346,13 @@ fn corpus(dir: &Path, tier: &str, seed: u64, threads: Option<u32>) -> Result<(),
         .filter(|path| path.extension().is_some_and(|e| e == "test" || e == "slt"))
         .collect();
     files.sort();
-    let natives = if tier != "interp" && cfg!(feature = "qc-clif") {
-        vec![("clif", "off".to_string()), ("clif", format!("random:{seed}"))]
-    } else {
-        Vec::new()
-    };
+    let mut natives = Vec::new();
+    if tier != "interp" && cfg!(feature = "qc-clif") {
+        natives.extend([("clif", "off".to_string()), ("clif", format!("random:{seed}"))]);
+    }
+    if tier != "interp" && cfg!(target_arch = "x86_64") {
+        natives.extend([("direct", "off".to_string()), ("direct", format!("random:{seed}"))]);
+    }
     let (mut queries, mut refused, mut errors, mut same) = (0, 0, 0, 0);
     let mut wrong = Vec::new();
     let mut compiles = Vec::new();
@@ -429,8 +436,12 @@ fn corpus(dir: &Path, tier: &str, seed: u64, threads: Option<u32>) -> Result<(),
         landed[1] += after.aggregate - before.aggregate;
         landed[2] += after.build - before.build;
     }
-    let tiers = if natives.is_empty() { "interp" } else { "interp, clif, clif switching" };
-    println!("corpus  {} files, {queries} queries, on {tiers}", files.len());
+    let tiers: Vec<String> = std::iter::once("interp".to_string())
+        .chain(natives.iter().map(|(tier, switch)| {
+            if switch == "off" { tier.to_string() } else { format!("{tier} switching") }
+        }))
+        .collect();
+    println!("corpus  {} files, {queries} queries, on {}", files.len(), tiers.join(", "));
     println!("same {same}, same error {errors}, refused {refused}, differ {}", wrong.len());
     println!(
         "switches {} in all: {} producing rows, {} in an aggregate, {} in a join build",

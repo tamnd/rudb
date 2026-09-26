@@ -1,8 +1,8 @@
-//! `clif` against `interp`, one opcode at a time and then over control flow and memory: every
-//! opcode on every type the verifier lets it take, on edge values and random bits, has to give the
-//! same status and the same bytes on both tiers. This is what makes the second tier's workarounds
-//! for what Cranelift lacks safe to rely on, and it runs in a second, which the query level
-//! differential does not.
+//! Each backend the build has against `interp`, one opcode at a time and then over control flow
+//! and memory: every opcode on every type the verifier lets it take, on edge values and random
+//! bits, has to give the same status and the same bytes on every tier. This is what makes the
+//! backends' workarounds for what the machine lacks safe to rely on, and it runs in seconds,
+//! which the query level differential does not.
 
 use rudb_common::Cancel;
 use rudb_qc_ir::{Form, Module, Op, Ty, parse, verify};
@@ -194,15 +194,26 @@ fn run(tiers: &Tiers, a: u128, b: u128) -> (u64, u128) {
     (status, state[6])
 }
 
-/// Both tiers of one module, with the check that `clif` compiled it.
-fn both(m: &Module) -> (Tiers, Tiers) {
-    let clif = Tiers::new(m, Options { tier: Tier::Clif, ..Options::default() });
-    assert_eq!(clif.report().native, m.funcs.len(), "{}", clif.report());
-    (Tiers::new(m, Options { tier: Tier::Interp, ..Options::default() }), clif)
+/// The tiers this build compiles to machine code with.
+fn natives() -> Vec<Tier> {
+    [Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()).collect()
+}
+
+/// One module on `interp` and on `tier`, with the check that `tier` compiled all of it.
+fn both(m: &Module, tier: Tier) -> (Tiers, Tiers) {
+    let native = Tiers::new(m, Options { tier, ..Options::default() });
+    assert_eq!(native.report().native, m.funcs.len(), "{}", native.report());
+    (Tiers::new(m, Options { tier: Tier::Interp, ..Options::default() }), native)
 }
 
 #[test]
 fn every_opcode_on_every_type_is_the_interpreters() {
+    for tier in natives() {
+        every_opcode_on(tier);
+    }
+}
+
+fn every_opcode_on(tier: Tier) {
     let mut bits = Bits(0x9e37_79b9_7f4a_7c15);
     let mut cases = 0usize;
     let mut modules = 0usize;
@@ -220,7 +231,7 @@ fn every_opcode_on_every_type_is_the_interpreters() {
                 for &k in ks {
                     let Some(m) = one(op, ty, to, k) else { continue };
                     modules += 1;
-                    let (interp, clif) = both(&m);
+                    let (interp, native) = both(&m, tier);
                     let xs = values(ty, &mut bits);
                     let ys = values(ty, &mut bits);
                     for (i, &a) in xs.iter().enumerate() {
@@ -229,11 +240,11 @@ fn every_opcode_on_every_type_is_the_interpreters() {
                         for &b in ys.iter().skip(i % 5).step_by(5).chain(xs.get(i)) {
                             cases += 1;
                             let want = run(&interp, a, b);
-                            let got = run(&clif, a, b);
+                            let got = run(&native, a, b);
                             if want != got && wrong.len() < 40 {
                                 wrong.push(format!(
                                     "{} {ty} -> {to} k={k} on {a:#x}, {b:#x}: interp {want:x?}, \
-                                     clif {got:x?}",
+                                     {tier} {got:x?}",
                                     op.name(),
                                 ));
                             }
@@ -243,7 +254,7 @@ fn every_opcode_on_every_type_is_the_interpreters() {
             }
         }
     }
-    assert!(wrong.is_empty(), "{} of {cases} differ:\n{}", wrong.len(), wrong.join("\n"));
+    assert!(wrong.is_empty(), "{tier}: {} of {cases} differ:\n{}", wrong.len(), wrong.join("\n"));
     // The count is a floor so that a parser or verifier change that quietly rejects most of the
     // generated functions fails here instead of passing on nothing.
     assert!(modules > 400, "only {modules} functions were generated");
@@ -251,7 +262,7 @@ fn every_opcode_on_every_type_is_the_interpreters() {
 
 #[test]
 fn integer_opcodes_cover_every_width() {
-    // The narrow widths are where Cranelift and the interpreter's `u128` registers part ways, so
+    // The narrow widths are where the machine and the interpreter's `u128` registers part ways, so
     // they are checked to be among the ones generated above.
     for ty in INTS {
         assert!(one(Op::Add, ty, Ty::Void, 0).is_some(), "add {ty}");
@@ -312,7 +323,13 @@ cold block b6:
 fn memory_and_control_flow_are_the_interpreters() {
     let m = parse(FLOW).expect("the flow module parses");
     verify(&m).expect("the flow module verifies");
-    let (interp, clif) = both(&m);
+    for tier in natives() {
+        flow_on(&m, tier);
+    }
+}
+
+fn flow_on(m: &Module, tier: Tier) {
+    let (interp, native) = both(m, tier);
     let mut bits = Bits(7);
     for round in 0..400u64 {
         let mut state = [[0u128; 24]; 2];
@@ -334,20 +351,21 @@ fn memory_and_control_flow_are_the_interpreters() {
         let mut rt = Rt::new(Cancel::new());
         let [a, b] = &mut state;
         let want = interp.call(false, 0, a.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
-        let got = clif.call(true, 0, b.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
-        assert_eq!(want, got, "round {round}");
+        let got = native.call(true, 0, b.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
+        assert_eq!(want, got, "{tier} round {round}");
         // The header's `rt` word is the one thing only native code writes, and it clears it.
-        assert_eq!(a[..], b[..], "round {round}");
+        assert_eq!(a[..], b[..], "{tier} round {round}");
     }
 }
 
 #[test]
 fn a_cancelled_query_stops_at_a_poll_on_both_tiers() {
     let m = parse(FLOW).expect("the flow module parses");
-    let (interp, clif) = both(&m);
     let cancel = Cancel::new();
     cancel.cancel();
-    for tiers in [&interp, &clif] {
+    let mut all = vec![Tiers::new(&m, Options { tier: Tier::Interp, ..Options::default() })];
+    all.extend(natives().into_iter().map(|t| both(&m, t).1));
+    for tiers in &all {
         let mut state = [0u128; 24];
         state[4] = 100;
         state[5] = 1;
@@ -379,12 +397,13 @@ fn a_switch_names_itself_the_way_set_takes_it() {
 #[test]
 fn switches_move_a_function_between_the_tiers_and_are_counted_where_they_land() {
     let m = parse(FLOW).expect("the flow module parses");
-    let every = Tiers::new(&m, Options { tier: Tier::Clif, switch: Switch::Every(2) });
+    let Some(&tier) = natives().first() else { return };
+    let every = Tiers::new(&m, Options { tier, switch: Switch::Every(2) });
     let picked: Vec<bool> = (0..8).map(|_| every.morsel(0, Sink::Aggregate)).collect();
     assert_eq!(picked, [true, true, false, false, true, true, false, false]);
     assert_eq!(every.switches(), Switches { aggregate: 3, ..Switches::default() });
 
-    let random = Tiers::new(&m, Options { tier: Tier::Clif, switch: Switch::Random(1) });
+    let random = Tiers::new(&m, Options { tier, switch: Switch::Random(1) });
     let picked: Vec<bool> = (0..64).map(|_| random.morsel(0, Sink::Build)).collect();
     let flips = picked.windows(2).filter(|w| w[0] != w[1]).count() as u64;
     assert!(flips > 8, "{picked:?}");
