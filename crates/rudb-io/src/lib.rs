@@ -45,6 +45,7 @@
 pub mod device;
 pub mod glob;
 pub mod machine;
+pub mod map;
 pub mod pool;
 pub mod real;
 pub mod sim;
@@ -61,6 +62,7 @@ use rudb_common::Result;
 
 pub use glob::expand;
 pub use machine::{default_memory_limit, execution_cores, physical_memory};
+pub use map::Mapped;
 pub use pool::{Config, Pool, Pooled, Stats};
 pub use real::RealFilesystem;
 pub use sim::{Completions, Crash, Op, SimFilesystem};
