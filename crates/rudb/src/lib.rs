@@ -106,6 +106,7 @@
 
 #![forbid(unsafe_code)]
 
+mod appender;
 mod config;
 mod connection;
 mod database;
@@ -123,6 +124,7 @@ mod upsert;
 #[cfg(test)]
 mod tests;
 
+pub use appender::Appender;
 pub use config::{Config, parse_size};
 pub use connection::Connection;
 pub use database::{Database, NativeExtremaValues};
