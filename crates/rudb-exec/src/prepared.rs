@@ -39,7 +39,7 @@ use rudb_common::{
 };
 use rudb_kernels::{
     Comparison, Connective, Found, Held, Lookup, Members, Recipe, cast_in_time_zone, combine,
-    compare_prepared, in_set, is_true, refine_flags, refine_prepared, select_prepared, selection,
+    compare_prepared, in_set, refine_flags, refine_prepared, select_prepared, selection,
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Assembly, Chunk, Selection, Vector};
@@ -1312,18 +1312,19 @@ impl Prepared {
             };
             let mut scratch = arm.when.scratch();
             let flags = arm.when.evaluate_one(narrowed, &mut scratch)?;
-            let mut taken = Vec::new();
-            let mut still = Vec::new();
-            // row at a time: splitting the rows an arm claims from the ones it leaves is a test per
-            // row, and what replaces it is the selection threading the rest of #57 asks for rather
-            // than anything that can be done here.
-            for (at, &row) in pending.iter().enumerate() {
-                if is_true(&flags.value_at(at)) {
-                    taken.push(row);
-                } else {
-                    still.push(row);
-                }
+            // The flags are read as the positions they keep, in one sweep of the booleans and their
+            // validity, rather than as a value per row. The value per row was a quarter of what the
+            // conditions cost on ClickBench 40, whose one arm tests two columns of small integers.
+            let kept = selection(flags, pending.len());
+            let mut taken = Vec::with_capacity(kept.len());
+            let mut still = Vec::with_capacity(pending.len() - kept.len());
+            let mut next = 0;
+            for at in kept.iter() {
+                still.extend_from_slice(&pending[next..at]);
+                taken.push(pending[at]);
+                next = at + 1;
             }
+            still.extend_from_slice(&pending[next..]);
             claimed.push(taken);
             pending = still;
         }
