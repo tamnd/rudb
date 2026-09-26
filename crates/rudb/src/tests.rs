@@ -11505,3 +11505,54 @@ fn bit_strings_cast_sort_and_combine_the_way_the_pin_does() {
             .contains("Could not retrieve required statistics")
     );
 }
+
+#[test]
+fn hash_and_approx_count_distinct_answer_what_the_pin_does() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    assert_eq!(
+        text(
+            "SELECT typeof(hash(1)), hash(1), hash(-1::TINYINT), hash(NULL), hash('a'), hash(1, NULL)"
+        ),
+        "UBIGINT,4717996019076358352,4739667815145166545,13787848793156543929,12561829011207016135,17970267147294058266"
+    );
+    assert_eq!(
+        text(
+            "SELECT hash([1, 2, 3]), hash([[1, 2], [3]]), hash(1, [2, 3]), hash({'a': 1, 'b': 2}), hash([]::INT[])"
+        ),
+        "12722334483198565868,12722334483198565868,12722334483198565868,6530802887144669425,13787848793156543929"
+    );
+    assert_eq!(
+        text(
+            "SELECT hash({'a': [1, 2], 'b': 'x'}), hash(1, 'a', 2.5), hash('0101'::BIT), hash(DATE '2020-01-01'), hash(INTERVAL 40 DAY)"
+        ),
+        "5025248203796332496,8583250983988650523,2527836143571797051,3044828828311488314,994387204874416290"
+    );
+    assert_eq!(text("SELECT approx_count_distinct(x) FROM range(1000) t(x)"), "978");
+    assert_eq!(
+        text(
+            "SELECT approx_count_distinct(x), approx_count_distinct(x::VARCHAR), approx_count_distinct(x % 7), approx_count_distinct(x::HUGEINT) FROM range(100000) t(x)"
+        ),
+        "99467,103958,7,99467"
+    );
+    assert_eq!(
+        text(
+            "SELECT approx_count_distinct(x::DOUBLE), approx_count_distinct([x, x + 1]), approx_count_distinct(DATE '2020-01-01' + x::INT), approx_count_distinct('v' || x) FROM range(3000) t(x)"
+        ),
+        "2987,3085,2960,3113"
+    );
+    assert_eq!(
+        text(
+            "SELECT g, approx_count_distinct(x) FROM range(5000) t(x), (VALUES (1), (2)) u(g) WHERE x % g = 0 GROUP BY g ORDER BY g"
+        ),
+        "1,4902;2,2406"
+    );
+    assert_eq!(text("SELECT approx_count_distinct(x) FROM (VALUES (NULL::INT)) t(x)"), "0");
+    assert_eq!(text("SELECT approx_count_distinct(x) FROM range(0) t(x)"), "0");
+}

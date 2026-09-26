@@ -946,6 +946,14 @@ const TABLE: &[Entry] = &[
     bits("bitstring", Arity::exactly(2)),
     bits("bit_length", Arity::exactly(1)),
     bits("octet_length", Arity::exactly(1)),
+    // The pin's hash of its arguments, which a null goes into like any other value.
+    Entry {
+        name: "hash",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(1),
+        shape: Shape::AnyTo(Fixed::UBigInt),
+        numeric_only: false,
+    },
     // Whether a value is the key `histogram(x, bins)` counts the values no bin took under.
     Entry {
         name: "is_histogram_other_bin",
@@ -1029,6 +1037,7 @@ const TABLE: &[Entry] = &[
     aggregate("favg", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double), true),
     aggregate("count_if", Arity::exactly(1), Shape::Widened(Fixed::Boolean, Fixed::HugeInt), false),
     aggregate("entropy", Arity::exactly(1), Shape::AnyTo(Fixed::Double), false),
+    aggregate("approx_count_distinct", Arity::exactly(1), Shape::AnyTo(Fixed::BigInt), false),
     aggregate("histogram", Arity::between(1, 2), Shape::Histogram, false),
     aggregate("histogram_exact", Arity::exactly(2), Shape::Histogram, false),
     // A bit per value from the smallest to the largest, set for the values that came up.
@@ -2529,6 +2538,7 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("typeof", &["typeof(col0 ANY) -> VARCHAR"]),
+    ("hash", &["hash(col0 ANY, [ANY...]) -> UBIGINT"]),
     ("current_setting", &["current_setting(setting_name VARCHAR) -> ANY"]),
     ("nextval", &["nextval(sequence_name VARCHAR) -> BIGINT"]),
     ("currval", &["currval(sequence_name VARCHAR) -> BIGINT"]),

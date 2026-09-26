@@ -21,6 +21,7 @@ use crate::aggregate::Accumulator;
 use crate::arg_extreme::{ArgExtreme, Key};
 use crate::bitstring::Gathered;
 use crate::compare::order_with_nulls;
+use crate::hash::Sketch;
 use crate::histogram::Binned;
 use crate::number::{approximate, fit, integral};
 use crate::quantile::{self, Column, Held, Holistic};
@@ -42,6 +43,8 @@ pub(crate) enum General {
     BitString { held: Option<Vec<u8>>, op: BitOp },
     /// `bitstring_agg`, in [`crate::bitstring`].
     Gathered(Gathered),
+    /// `approx_count_distinct`, in [`crate::hash`].
+    Sketched(Sketch),
     /// `product`, in floating point the way the pin multiplies.
     Product { total: f64, seen: bool },
     /// The variance family, as a running count, mean and sum of squared differences.
@@ -157,6 +160,7 @@ impl General {
             "bit_or" => bits(BitOp::Or),
             "bit_xor" => bits(BitOp::Xor),
             "bitstring_agg" => Self::Gathered(Gathered::default()),
+            "approx_count_distinct" => Self::Sketched(Sketch::default()),
             "product" => Self::Product { total: 1.0, seen: false },
             "var_samp" => moments(Measure::VarSamp),
             "var_pop" => moments(Measure::VarPop),
@@ -242,6 +246,7 @@ impl General {
                 }
             }
             Self::Gathered(state) => state.update(value, &args[1..])?,
+            Self::Sketched(sketch) => sketch.insert(value),
             Self::Product { total, seen } => {
                 *total *= approximate(value).ok_or_else(|| unexpected("product", value))?;
                 *seen = true;
@@ -424,6 +429,7 @@ impl General {
                 }
             }
             (Self::Gathered(state), Self::Gathered(theirs)) => state.combine(theirs),
+            (Self::Sketched(sketch), Self::Sketched(theirs)) => sketch.combine(theirs),
             (Self::Paired(state), Self::Paired(theirs)) => state.combine(theirs),
             (Self::Powers(state), Self::Powers(theirs)) => state.combine(theirs),
             (
@@ -556,6 +562,7 @@ impl General {
             Self::Binned(state) => state.finish(),
             Self::BitString { held, .. } => held.clone().map_or(Value::Null, Value::Bit),
             Self::Gathered(state) => state.finish(),
+            Self::Sketched(sketch) => Value::BigInt(sketch.count()),
             Self::Moments { count, squared, measure, .. } => {
                 #[expect(
                     clippy::cast_precision_loss,
