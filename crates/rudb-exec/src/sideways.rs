@@ -1061,6 +1061,8 @@ impl Held<'_, '_> {
 ///
 /// `None` when a key does not read as an integer or is not in the key map, which should not happen
 /// because the build side is a subset of the parent's rows.
+// The row indexes the null mask and `signed_at` as well as the block, so it stays an index.
+#[allow(clippy::needless_range_loop)]
 fn held_parents(
     keyed: &Keyed<'_>,
     map: &KeyMap,
@@ -1107,6 +1109,8 @@ enum Pushing {
 /// integer or falls outside the range, which is a key no parent holds and should not happen, and
 /// then the join gets the filter. The count is of distinct keys, which is of parents, because a bit
 /// is set rather than added to.
+// The row indexes the null mask and `signed_at` as well as the block, so it stays an index.
+#[allow(clippy::needless_range_loop)]
 fn domain_of(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<(Domain, u64)>> {
     let Some((base, range)) = exact.keys().and_then(KeyMap::span) else { return Ok(None) };
     let Some(len) = words_for(range) else { return Ok(None) };

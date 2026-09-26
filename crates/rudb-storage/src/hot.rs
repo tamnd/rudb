@@ -547,7 +547,7 @@ impl HotStripe {
 
     /// Takes back what `txn` did to the row at `slot`: the values its updates overwrote go back
     /// in place, newest first, a delete is undone, and the row goes free. The undo records stay in
-    /// the chain stamped [`ABORTED`], because a reader may have copied a value the abort took
+    /// the chain stamped `ABORTED`, because a reader may have copied a value the abort took
     /// back, and the record is what puts the old value over it.
     ///
     /// # Panics

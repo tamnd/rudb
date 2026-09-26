@@ -281,10 +281,10 @@ fn unread(plan: &Plan, parent: NodeRef, join: NodeRef) -> bool {
 ///
 /// The executor asks this about a join whose driving scan it may reduce to exactly the rows that
 /// match, where the join then has nothing to add but the gathered side's columns. It is
-/// [`unread`] and [`absorbed`] together, the same two questions elimination asks, for a join no
+/// `unread` and `absorbed` together, the same two questions elimination asks, for a join no
 /// certificate lets the plan delete because its parent side is filtered.
 ///
-/// Unlike [`unread`] it looks only at the nodes the root reaches, because the plan it is asked
+/// Unlike `unread` it looks only at the nodes the root reaches, because the plan it is asked
 /// about is the one that runs, and a node a pass left behind is a node nothing runs.
 pub fn unread_side(plan: &Plan, join: NodeRef, side: NodeRef) -> bool {
     let mut produced = Vec::new();
