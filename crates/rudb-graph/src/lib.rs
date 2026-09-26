@@ -38,6 +38,7 @@ pub mod link;
 pub mod rel;
 pub mod rid;
 pub mod rids;
+mod tail;
 pub mod wire;
 
 pub use adjacency::Adjacency;

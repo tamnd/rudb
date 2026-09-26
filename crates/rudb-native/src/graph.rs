@@ -12,7 +12,9 @@
 //! with an [`Option`] and not a [`Result`]: there is no failure it could report that is not
 //! answered by running the query the way it ran before the section existed.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rudb_common::{LogicalType, Result, Value};
@@ -448,6 +450,65 @@ pub fn key_map(reader: &Reader, column: usize) -> Option<KeyMap> {
         return None;
     }
     Some(map)
+}
+
+/// The graph structures of one open table, each decoded the first time a plan asks for it and
+/// shared from then on.
+///
+/// Every join the graph layer reduces asks for the parent's key map, and a join over a relationship
+/// asks for the child's link or adjacency, each through its own operator. TPC-H q21 has four joins
+/// that reduce, and each read, checked and decoded the same `orders` key map and the same
+/// `lineitem` adjacency, which made the adjacency alone a third of the query's page faults. A
+/// table's sections do not change for as long as a reader is open, since a reader is over one
+/// generation of the table, so decoding one once per reader is decoding it once.
+///
+/// A link and an adjacency are kept by the parent they were checked against as well, the parent's
+/// name, column and generation, because the check of the binding at the front of the section is
+/// against those and a different parent is a different question. A `None` is kept too, since a
+/// section that is not there or does not check is not going to be there on the next ask.
+#[derive(Debug, Default)]
+pub(crate) struct Decoded {
+    key_maps: Mutex<HashMap<usize, Option<Arc<KeyMap>>>>,
+    links: Mutex<HashMap<Binding, Option<Arc<link::Link>>>>,
+    adjacencies: Mutex<HashMap<Binding, Option<Arc<Adjacency>>>>,
+}
+
+/// The child column and the parent's name, column and generation a structure was checked against.
+type Binding = (usize, String, usize, u64);
+
+fn binding_of(parent: &Reader, edge: &Edge) -> Binding {
+    (edge.child_column, edge.parent.clone(), edge.parent_column, parent.table().generation())
+}
+
+/// What `make` gives for `key`, made once while the lock is held, so that the workers of a plan
+/// that all ask at once read the section once between them.
+fn once<K: std::hash::Hash + Eq, T>(
+    held: &Mutex<HashMap<K, Option<Arc<T>>>>,
+    key: K,
+    make: impl FnOnce() -> Option<T>,
+) -> Option<Arc<T>> {
+    let mut held = held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.entry(key).or_insert_with(|| make().map(Arc::new)).clone()
+}
+
+/// [`key_map`], decoded once per open table. See [`Decoded`].
+#[must_use]
+pub fn shared_key_map(reader: &Reader, column: usize) -> Option<Arc<KeyMap>> {
+    once(&reader.graph.key_maps, column, || key_map(reader, column))
+}
+
+/// [`stored_link`], decoded once per open table and parent. See [`Decoded`].
+#[must_use]
+pub fn shared_link(child: &Reader, parent: &Reader, edge: &Edge) -> Option<Arc<link::Link>> {
+    once(&child.graph.links, binding_of(parent, edge), || stored_link(child, parent, edge))
+}
+
+/// [`stored_adjacency`], decoded once per open table and parent. See [`Decoded`].
+#[must_use]
+pub fn shared_adjacency(child: &Reader, parent: &Reader, edge: &Edge) -> Option<Arc<Adjacency>> {
+    once(&child.graph.adjacencies, binding_of(parent, edge), || {
+        stored_adjacency(child, parent, edge)
+    })
 }
 
 /// One relationship, with both sides resolved to a table and a column of it.
@@ -924,7 +985,7 @@ pub fn stored_adjacency(child: &Reader, parent: &Reader, edge: &Edge) -> Option<
     }
     let bytes = child.payload(held).ok()?;
     let binding = bound(&bytes, parent, edge)?;
-    Adjacency::read(&bytes[binding..]).ok()
+    Adjacency::read_from(bytes, binding).ok()
 }
 
 /// The forward link this child table carries for a column, when it carries one this build can use
@@ -939,7 +1000,7 @@ pub fn stored_link(child: &Reader, parent: &Reader, edge: &Edge) -> Option<link:
     let held = link_section(child, edge)?;
     let bytes = child.payload(held).ok()?;
     let binding = bound(&bytes, parent, edge)?;
-    link::Link::read(&bytes[binding..]).ok()
+    link::Link::read_from(bytes, binding).ok()
 }
 
 /// The counts at the front of the stored link [`stored_link`] would return, read without the link.

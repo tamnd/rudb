@@ -26,6 +26,7 @@ use rudb_encoding::bitpack;
 use crate::bits::BitVector;
 use crate::rid::{NO_PARENT, Rid};
 use crate::rids::Rids;
+use crate::tail::Tail;
 
 /// The payload layout version.
 const LAYOUT: u8 = 1;
@@ -46,7 +47,7 @@ pub struct Adjacency {
     /// One run of ones per parent, one per child, each followed by a zero.
     starts: BitVector,
     /// The child rows, grouped by parent, `width` bits each.
-    rows: Vec<u8>,
+    rows: Tail,
     width: usize,
 }
 
@@ -106,7 +107,7 @@ impl Adjacency {
             parents,
             edges: count(edges),
             starts: BitVector::new(words, len)?,
-            rows,
+            rows: rows.into(),
             width,
         })
     }
@@ -228,6 +229,18 @@ impl Adjacency {
     /// If the payload is shorter than its header, names a layout this build does not know, or holds
     /// a body that is not the size its header implies.
     pub fn read(bytes: &[u8]) -> Result<Self> {
+        Self::read_from(bytes.to_vec(), 0)
+    }
+
+    /// [`Adjacency::read`] of the bytes of `payload` from `at` on, keeping `payload` for the child
+    /// rows rather than copying them out of it. See [`Tail`] for why.
+    ///
+    /// # Errors
+    ///
+    /// As [`Adjacency::read`], or if `at` is past the end of `payload`.
+    pub fn read_from(payload: Vec<u8>, at: usize) -> Result<Self> {
+        let bytes =
+            payload.get(at..).ok_or_else(|| malformed("a payload shorter than its header"))?;
         if bytes.len() < HEADER_BYTES {
             return Err(malformed("a payload shorter than its header"));
         }
@@ -254,7 +267,9 @@ impl Adjacency {
         if starts.ones() != edges {
             return Err(malformed("lists that do not hold the edges the header counts"));
         }
-        Ok(Self { children, parents, edges, starts, rows: rest[split..].to_vec(), width })
+        let rows = Tail::of(payload, at + HEADER_BYTES + split)
+            .ok_or_else(|| malformed("a body that is not the size its header implies"))?;
+        Ok(Self { children, parents, edges, starts, rows, width })
     }
 }
 

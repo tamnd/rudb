@@ -2347,7 +2347,7 @@ impl<'a> Building<'a, '_> {
         let link = edges
             .into_iter()
             .flatten()
-            .find_map(|edge| rudb_native::graph::stored_link(child_rows, parent_rows, &edge))
+            .find_map(|edge| rudb_native::graph::shared_link(child_rows, parent_rows, &edge))
             .ok_or_else(|| refuse("a relationship the child's file has no link for"))?;
         // A semi or an anti join reads no column of the parent, which is not a special case here so
         // much as the reason those two are nearly free: the list below is empty, so the operator
@@ -2371,7 +2371,7 @@ impl<'a> Building<'a, '_> {
             usize::try_from(limit.saturating_sub(self.memory.used())).unwrap_or(usize::MAX)
         });
         Ok(Linked {
-            link: Arc::new(link),
+            link,
             parent: Arc::new(Parent::new(parent_table.rows().clone(), budget)),
             projected,
             parent_schema: Schema::numbered(fields, parent_index),
