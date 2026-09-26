@@ -52,7 +52,8 @@
 //! [`crate::Database::setting`] is the Rust side of the same read.
 
 use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Mutex, PoisonError, RwLock};
 
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{
@@ -172,6 +173,15 @@ pub(crate) struct Settings {
     /// `SET qc_switch` has left it: `off`, `every:<n>` or `random:<seed>`. Only the tier
     /// differential sets it.
     switch: RwLock<rudb_qc::Switch>,
+    /// How many times a statement has been let at the settings, counted after it is done.
+    changes: AtomicU64,
+    /// The last session [`Settings::session`] built, and the count of changes it was built at.
+    ///
+    /// Every statement asks for a session and almost none of them change anything, so the one built
+    /// last is handed out again for as long as the count has not moved. The count is read before the
+    /// session is built, so a session built while a change was landing is filed under the count from
+    /// before it, and the change's own bump makes it stale.
+    built: Mutex<Option<(u64, Session)>>,
 }
 
 impl Settings {
@@ -211,6 +221,8 @@ impl Settings {
             engine: RwLock::new(FIRST_ENGINE.to_string()),
             tier: RwLock::new(rudb_qc::Tier::Auto),
             switch: RwLock::new(rudb_qc::Switch::Off),
+            changes: AtomicU64::new(0),
+            built: Mutex::new(None),
         }
     }
 
@@ -278,6 +290,21 @@ impl Settings {
     /// For a name that is not a setting, for a scope this database does not have, and for a value
     /// the setting cannot take.
     pub(crate) fn apply(
+        &self,
+        memory: &Memory,
+        pool: &Pool,
+        catalog: &mut Catalog,
+        name: &str,
+        scope: Scope,
+        value: Option<&Value>,
+    ) -> Result<()> {
+        let applied = self.applied(memory, pool, catalog, name, scope, value);
+        self.changes.fetch_add(1, AtomicOrdering::AcqRel);
+        applied
+    }
+
+    /// What [`Settings::apply`] does, before it counts the change.
+    fn applied(
         &self,
         memory: &Memory,
         pool: &Pool,
@@ -686,7 +713,9 @@ impl Settings {
         };
         let entry = rudb_functions::setting_named(setting)
             .expect("a pragma writes a setting the registry has, which its own test checks");
-        self.carry(entry, Some(&Value::Varchar(value.to_string())))
+        let carried = self.carry(entry, Some(&Value::Varchar(value.to_string())));
+        self.changes.fetch_add(1, AtomicOrdering::AcqRel);
+        carried
     }
 
     /// What a setting rudb does not read is at now, which is its default until a statement sets it.
@@ -831,15 +860,29 @@ impl Settings {
 
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
-    /// Built once per statement rather than held, because there are twenty two names and the alternative
-    /// is a second copy of the settings that has to be kept in step with this one. An alias reports
-    /// the same value as the name it resolves to, which is the same thing reading either spelling
-    /// back gives, and it is what the binary returns for both halves of each pair.
-    ///
-    /// The two locks are taken once each here rather than once per name through [`Settings::value`],
-    /// because every statement pays for this now that `current_setting()` can appear in any of them.
-    /// Twenty settings and twenty two names means the loop below would otherwise take several locks.
+    /// Built again only after a `SET`, `RESET` or pragma has been through, and otherwise the copy
+    /// built last. Every statement asks for this now that `current_setting()` can appear in any of
+    /// them, and building it is a map of every setting the catalog has, which on a `SELECT 1` was
+    /// half of the statement. An alias reports the same value as the name it resolves to, which is
+    /// the same thing reading either spelling back gives, and it is what the binary returns for both
+    /// halves of each pair.
     pub(crate) fn session(&self) -> Session {
+        let changes = self.changes.load(AtomicOrdering::Acquire);
+        let mut built = self.built.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((at, session)) = built.as_ref()
+            && *at == changes
+        {
+            return session.clone();
+        }
+        let session = self.build();
+        *built = Some((changes, session.clone()));
+        session
+    }
+
+    /// The session the settings come to now, built from nothing.
+    ///
+    /// The locks are taken once each here rather than once per name through [`Settings::value`].
+    fn build(&self) -> Session {
         let config = self.config();
         let disabled = self.disabled_optimizers();
         let memory = config.memory_limit().map_or_else(|| "unlimited".to_string(), human);
@@ -1381,6 +1424,35 @@ mod tests {
         assert!(error.message().starts_with("Unknown unit for memory: ''"), "{}", error.message());
         let error = bytes_of("abc").expect_err("not a number at all");
         assert_eq!(error.message(), "Memory must have a number (e.g. 1GB)");
+    }
+
+    /// The session handed out is the one built last until something is set, and then it is not.
+    #[test]
+    fn a_session_built_before_a_set_is_not_handed_out_after_it() {
+        let (settings, memory) = settings();
+        let set = |name: &str, value: &str| {
+            let value = Value::Varchar(value.into());
+            settings
+                .apply(
+                    &memory,
+                    &Pool::default(),
+                    &mut Catalog::new(),
+                    name,
+                    Scope::Unwritten,
+                    Some(&value),
+                )
+                .expect("a value the setting takes");
+        };
+        let before = settings.session();
+        assert_eq!(settings.session(), before);
+        set("threads", "3");
+        assert_eq!(settings.session().get("threads"), Some("3"));
+        assert_eq!(settings.session().get("threads"), Some("3"));
+        set("default_order", "DESC");
+        assert!(settings.session().semantics().default_descending());
+        assert_eq!(settings.session().get("enable_optimizer"), Some("true"));
+        settings.toggle("disable_optimizer").expect("a pragma");
+        assert_eq!(settings.session().get("enable_optimizer"), Some("false"));
     }
 
     #[test]

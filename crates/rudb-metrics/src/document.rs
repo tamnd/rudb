@@ -9,6 +9,8 @@
 //! purpose: this is the shape the numbers are reported in, and the code that produces them is the
 //! instrumentation shim that sits around the push operators.
 
+use std::sync::OnceLock;
+
 use rudb_common::stat::{Class, Classes, Provenance};
 use rudb_common::{Spent, Tally};
 
@@ -413,10 +415,17 @@ impl Machine {
     /// There is no portable way to ask for either, the machine the number will be compared against
     /// is the harness's business rather than the engine's, and a guessed host name in a published
     /// row is worse than an empty one.
+    ///
+    /// The core count is asked for once per process. Every statement builds a document, and on
+    /// Linux the standard library answers by opening and reading the cgroup files, which on
+    /// ClickBench 43 was 6 percent of the statement.
     #[must_use]
     pub fn here() -> Self {
-        let cores = std::thread::available_parallelism()
-            .map_or(0, |cores| u32::try_from(cores.get()).unwrap_or(u32::MAX));
+        static CORES: OnceLock<u32> = OnceLock::new();
+        let cores = *CORES.get_or_init(|| {
+            std::thread::available_parallelism()
+                .map_or(0, |cores| u32::try_from(cores.get()).unwrap_or(u32::MAX))
+        });
         Self { name: None, cores, memory: None, os: std::env::consts::OS.to_string() }
     }
 }
