@@ -975,6 +975,11 @@ fn grouped_column<'a>(
 /// `WHERE AdvEngineID <> 0` is a walk over fourteen entries rather than a million.
 ///
 /// A complete synopsis can give the row count for a filter. Grouped output still reads rows.
+///
+/// An incomplete one still answers when the constant is one of the values it lists. The rows that
+/// equal it are its exact count, and the rows that differ from it are every row that is neither
+/// null nor equal to it. That is the case that matters, because the synopsis keeps only the two
+/// leading values of a column it saw whole, so `AdvEngineID <> 0` never had a complete list to walk.
 struct CertainFilter {
     /// The leading values of the column the predicate names, with their exact row counts.
     entries: Vec<(Value, u64)>,
@@ -984,14 +989,25 @@ struct CertainFilter {
     against: Value,
     /// Whether the predicate keeps the rows that differ rather than the ones that match.
     differs: bool,
+    /// Every row of the table.
+    rows: u64,
+    /// The null rows of the column, when the file counted them.
+    nulls: Option<u64>,
 }
 
 impl CertainFilter {
     /// How many rows the predicate keeps, or `None` if any entry cannot be decided.
     ///
-    /// Needs the complete list. A value the synopsis left out is a value whose rows are missing
-    /// from this sum, and a row count that is quietly short is worse than no row count at all.
+    /// A listed constant needs only its own count. Anything else needs the complete list, since a
+    /// value the synopsis left out is a value whose rows are missing from the sum, and a row count
+    /// that is quietly short is worse than no row count at all.
     fn rows(&self) -> Option<u64> {
+        if let Some((_, count)) = self.entries.iter().find(|(value, _)| value == &self.against) {
+            if !self.differs {
+                return Some(*count);
+            }
+            return self.rows.checked_sub(self.nulls?)?.checked_sub(*count);
+        }
         if self.omitted_max != 0 {
             return None;
         }
@@ -1055,7 +1071,9 @@ fn certain_filter(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Optio
     };
     let Some(prefix) = table.rows().frequency_prefix(column)? else { return Ok(None) };
     let (entries, omitted_max) = (prefix.entries, prefix.omitted_max);
-    Ok(Some(CertainFilter { entries, omitted_max, against, differs }))
+    let rows = table.rows().len() as u64;
+    let nulls = table.rows().null_count(column)?;
+    Ok(Some(CertainFilter { entries, omitted_max, against, differs, rows, nulls }))
 }
 
 /// How many rows a node produces, when that can be known without producing them.
@@ -2772,7 +2790,7 @@ mod tests {
     use rudb_plan::{CompareOp, Expr, Node, Plan};
     use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
-    use super::{count_having_aggregate, count_top_aggregate, native_pair_frequencies};
+    use super::{count_having_aggregate, count_top_aggregate, known_rows, native_pair_frequencies};
 
     fn native_path(label: &str) -> PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("time advances").as_nanos();
@@ -2852,6 +2870,32 @@ mod tests {
         assert!(
             pair_frequencies(&pair_plan(), &catalog, 10).is_none(),
             "a count of one cannot beat an omitted first-key count of one"
+        );
+        fs::remove_file(path).expect("clean up");
+    }
+
+    /// How many rows `predicate` keeps over `items`, as far as the file can say without reading.
+    fn filtered_rows(catalog: &Catalog, predicate: &str) -> Option<u64> {
+        let plan = Plan::parse(&format!(
+            "Filter {predicate}\n  Get memory.main.items AS items #0 [id::BIGINT, phrase::VARCHAR]"
+        ))
+        .expect("a filtered scan");
+        known_rows(&plan, catalog, plan.root()).expect("metadata reads")
+    }
+
+    #[test]
+    fn a_listed_constant_counts_its_filter_from_an_incomplete_synopsis() {
+        let mut rows = Vec::new();
+        for (id, times) in [(0, 100), (1, 50), (2, 30), (3, 20)] {
+            rows.extend(std::iter::repeat_n((id, format!("phrase {id}")), times));
+        }
+        let (path, catalog) = native_catalog("listed-filter", &rows);
+        assert_eq!(filtered_rows(&catalog, "(#0.0::BIGINT <> 0::BIGINT)::BOOLEAN"), Some(100));
+        assert_eq!(filtered_rows(&catalog, "(#0.0::BIGINT = 1::BIGINT)::BOOLEAN"), Some(50));
+        assert_eq!(
+            filtered_rows(&catalog, "(#0.0::BIGINT <> 3::BIGINT)::BOOLEAN"),
+            None,
+            "the synopsis keeps the two leading values, so the fourth has no count to subtract"
         );
         fs::remove_file(path).expect("clean up");
     }
