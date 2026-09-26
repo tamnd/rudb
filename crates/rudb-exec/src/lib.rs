@@ -124,6 +124,7 @@ mod setop;
 mod settingnames;
 mod side;
 mod sideways;
+mod siblings;
 mod signed;
 mod sort;
 mod source;
