@@ -37,29 +37,52 @@ const FIXUP: &str = "* REPLACE (make_date(EventDate) AS EventDate, epoch_ms(Even
 
 pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let usage = || {
-        "usage: cargo xtask compiled [--tier auto|interp|clif | --tiers <seed>] <file.parquet> \
-         [q1 q2 ...]\n       \
-         cargo xtask compiled [--tier auto|interp|clif | --tiers <seed>] --suite <parquet dir> \
-         <queries> [q1 ...]"
+        "usage: cargo xtask compiled [--threads <n>] [--set <name>=<value>]... [--tier auto|interp|clif | --tiers <seed>] \
+         <file.parquet> [q1 q2 ...]\n       \
+         cargo xtask compiled [--threads <n>] [--tier auto|interp|clif | --tiers <seed>] \
+         --suite <parquet dir> <queries> [q1 ...]\n       \
+         cargo xtask compiled [--threads <n>] [--tiers <seed>] --corpus <slt dir>"
             .to_string()
     };
     let mut args = args;
     let mut tier = "auto".to_string();
     let mut seed = None;
-    if let [flag, value, rest @ ..] = args {
+    let mut threads = None;
+    let mut sets = Vec::new();
+    while let [flag, value, rest @ ..] = args {
         match flag.as_str() {
             "--tier" => tier = value.clone(),
             "--tiers" => {
                 seed = Some(value.parse::<u64>().map_err(|e| format!("--tiers {value}: {e}"))?);
                 tier = "clif".to_string();
             }
-            _ => {}
+            "--threads" => {
+                threads =
+                    Some(value.parse::<u32>().map_err(|e| format!("--threads {value}: {e}"))?);
+            }
+            "--set" => {
+                let (name, set) = value
+                    .split_once('=')
+                    .ok_or_else(|| format!("--set {value}: not name=value"))?;
+                sets.push(format!("SET {name} = '{set}'"));
+            }
+            _ => break,
         }
-        if seed.is_some() || flag == "--tier" {
-            args = rest;
-        }
+        args = rest;
+    }
+    if let [flag, dir] = args
+        && flag == "--corpus"
+    {
+        return corpus(Path::new(dir), &tier, seed.unwrap_or(1), threads);
     }
     let database = Database::new();
+    if let Some(threads) = threads {
+        database.execute(&format!("SET threads = {threads}")).map_err(|e| e.to_string())?;
+    }
+    for set in &sets {
+        database.execute(set).map_err(|e| format!("{set}: {e}"))?;
+        println!("{set}");
+    }
     // The tier is set before anything runs, so a build without it fails here and not after a
     // load of ten million rows.
     database.execute(&format!("SET qc_tier = '{tier}'")).map_err(|e| e.to_string())?;
@@ -101,13 +124,14 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     }
     println!("tier    {tier}");
     println!();
-    println!("{:<5} {:>9} {:>9}  verdict", "query", "first", "compiled");
+    println!("{:<5} {:>9} {:>9} {:>10}  verdict", "query", "first", "compiled", "compile");
 
     let mut same = 0;
     let mut ties = 0;
     let mut refused = 0;
     let mut wrong = Vec::new();
     let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut compiles = Vec::new();
     for (name, sql) in &queries {
         if !only.is_empty() && !only.contains(&name.as_str()) {
             continue;
@@ -148,11 +172,18 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
                 "differ".to_string()
             }
         };
-        println!("{name:<5} {:>8.3}s {:>8.3}s  {verdict}", first.seconds, compiled.seconds);
+        if refusal.is_none() {
+            compiles.push(compiled.compile_ms);
+        }
+        println!(
+            "{name:<5} {:>8.3}s {:>8.3}s {:>8.3}ms  {verdict}",
+            first.seconds, compiled.seconds, compiled.compile_ms
+        );
     }
 
     println!();
     println!("same {same}, same up to ties {ties}, refused {refused}, differ {}", wrong.len());
+    compiled_in(&mut compiles);
     if !reasons.is_empty() {
         println!();
         println!("refusals, by reason:");
@@ -269,15 +300,195 @@ fn tiers(
 struct Answer {
     rows: Result<Vec<Vec<Value>>, String>,
     seconds: f64,
+    /// The `codegen_ns` of the query, in milliseconds: zero on the first engine.
+    compile_ms: f64,
 }
 
 fn answer(database: &Database, engine: &str, sql: &str) -> Answer {
     if let Err(e) = database.execute(&format!("SET engine = '{engine}'")) {
-        return Answer { rows: Err(e.to_string()), seconds: 0.0 };
+        return Answer { rows: Err(e.to_string()), seconds: 0.0, compile_ms: 0.0 };
     }
     let began = Instant::now();
-    let rows = database.query(sql).map(|r| r.rows().collect()).map_err(|e| e.to_string());
-    Answer { rows, seconds: began.elapsed().as_secs_f64() }
+    let (rows, compile_ms) = match database.query(sql) {
+        Ok(result) => (Ok(result.rows().collect()), compile_ms(&result)),
+        Err(e) => (Err(e.to_string()), 0.0),
+    };
+    Answer { rows, seconds: began.elapsed().as_secs_f64(), compile_ms }
+}
+
+/// The time a query spent generating and compiling code, from its timing document, in
+/// milliseconds.
+fn compile_ms(result: &rudb::QueryResult) -> f64 {
+    result.metrics().map_or(0.0, |m| m.timing.codegen_ns as f64 / 1e6)
+}
+
+/// Every query in a directory of sqllogictest files, on the first engine and on the compiled one
+/// on `interp`, on `clif` and on `clif` switching tiers at random morsels.
+///
+/// This points both differentials at the committed corpus of `tamnd/rudb-compat`, which has the
+/// subqueries, windows and edge cases the benchmark suites do not. The files are not checked
+/// against their written answers, which is the corpus test's job: every statement runs in order on
+/// one database per file, and each query the compiled engine takes has to give the first engine's
+/// rows, compared the way the rest of this command compares them, and the same rows bit for bit on
+/// every tier. Only the lines a record starts with are read, so a query the harness would skip
+/// for a `skipif` still runs here, which only makes it one more query.
+fn corpus(dir: &Path, tier: &str, seed: u64, threads: Option<u32>) -> Result<(), String> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        // flatten: an entry that cannot be read is a file this run does not see, as `ls` would.
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "test" || e == "slt"))
+        .collect();
+    files.sort();
+    let natives = if tier != "interp" && cfg!(feature = "qc-clif") {
+        vec![("clif", "off".to_string()), ("clif", format!("random:{seed}"))]
+    } else {
+        Vec::new()
+    };
+    let (mut queries, mut refused, mut errors, mut same) = (0, 0, 0, 0);
+    let mut wrong = Vec::new();
+    let mut compiles = Vec::new();
+    // Producing rows, in an aggregate, in a join build.
+    let mut landed = [0u64; 3];
+    for file in &files {
+        let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let name = file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let database = Database::new();
+        if let Some(threads) = threads {
+            database.execute(&format!("SET threads = {threads}")).map_err(|e| e.to_string())?;
+        }
+        let before = database.tier_switches();
+        for (line, query, sql) in records(&text) {
+            if !query {
+                let _ = database.execute("SET engine = 'first'");
+                // The answer is the corpus test's to check. Here the statement only has to have
+                // run, or not, the way it does for the corpus.
+                let _ = database.execute(&sql);
+                continue;
+            }
+            queries += 1;
+            let first = answer(&database, "first", &sql);
+            let logged = database.refusals().len();
+            let mut runs = Vec::new();
+            for (tier, switch) in
+                std::iter::once(("interp", "off".to_string())).chain(natives.clone())
+            {
+                let set = format!("SET qc_tier = '{tier}'");
+                database.execute(&set).map_err(|e| format!("{set}: {e}"))?;
+                let set = format!("SET qc_switch = '{switch}'");
+                database.execute(&set).map_err(|e| format!("{set}: {e}"))?;
+                let ran = answer(&database, "compiled", &sql);
+                runs.push((format!("{tier} {switch}"), ran));
+            }
+            let _ = database.execute("SET qc_switch = 'off'");
+            if database.refusals().len() > logged {
+                refused += 1;
+                continue;
+            }
+            if let Some((_, ran)) = runs.get(1) {
+                compiles.push(ran.compile_ms);
+            }
+            let Ok(expected) = &first.rows else {
+                // An error on the first engine is an answer too, and the compiled engine has to
+                // give the same one.
+                let odd: Vec<&str> =
+                    runs.iter().filter(|r| r.1.rows != first.rows).map(|r| r.0.as_str()).collect();
+                if odd.is_empty() {
+                    errors += 1;
+                } else {
+                    wrong.push(format!(
+                        "{name}:{line} {} error differs on {}",
+                        sql,
+                        odd.join(", ")
+                    ));
+                }
+                continue;
+            };
+            let reference = format!("{:?}", runs[0].1.rows);
+            let mut odd = Vec::new();
+            for (label, ran) in &runs {
+                let agrees = match &ran.rows {
+                    Ok(rows) => agree(expected, rows),
+                    Err(_) => false,
+                };
+                if !agrees {
+                    odd.push(format!("{label} against first"));
+                } else if format!("{:?}", ran.rows) != reference {
+                    odd.push(format!("{label} against interp"));
+                }
+            }
+            if odd.is_empty() {
+                same += 1;
+            } else {
+                wrong.push(format!("{name}:{line} {sql}\n  differs: {}", odd.join(", ")));
+            }
+        }
+        let after = database.tier_switches();
+        landed[0] += after.result - before.result;
+        landed[1] += after.aggregate - before.aggregate;
+        landed[2] += after.build - before.build;
+    }
+    let tiers = if natives.is_empty() { "interp" } else { "interp, clif, clif switching" };
+    println!("corpus  {} files, {queries} queries, on {tiers}", files.len());
+    println!("same {same}, same error {errors}, refused {refused}, differ {}", wrong.len());
+    println!(
+        "switches {} in all: {} producing rows, {} in an aggregate, {} in a join build",
+        landed.iter().sum::<u64>(),
+        landed[0],
+        landed[1],
+        landed[2]
+    );
+    compiled_in(&mut compiles);
+    for line in &wrong {
+        println!();
+        println!("{line}");
+    }
+    if wrong.is_empty() { Ok(()) } else { Err(format!("{} queries differ", wrong.len())) }
+}
+
+/// The statements and queries of a sqllogictest file in order: the line each starts on, whether it
+/// is a query, and its SQL.
+fn records(text: &str) -> Vec<(usize, bool, String)> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut at = 0;
+    // row at a time: a record is found by its first line and ends at a blank line or `----`.
+    while at < lines.len() {
+        let head = lines[at].trim();
+        let query = head.starts_with("query");
+        if !query && !head.starts_with("statement") {
+            at += 1;
+            continue;
+        }
+        let start = at + 1;
+        at += 1;
+        let mut sql = Vec::new();
+        while at < lines.len() && !lines[at].trim().is_empty() && lines[at].trim() != "----" {
+            sql.push(lines[at]);
+            at += 1;
+        }
+        if !sql.is_empty() {
+            out.push((start, query, sql.join("\n")));
+        }
+    }
+    out
+}
+
+/// Prints the median, the slowest and the sum of the compile times of the queries the compiled
+/// engine took, in milliseconds.
+fn compiled_in(compiles: &mut [f64]) {
+    if compiles.is_empty() {
+        return;
+    }
+    compiles.sort_by(f64::total_cmp);
+    let median = compiles[compiles.len() / 2];
+    let slowest = compiles[compiles.len() - 1];
+    let sum: f64 = compiles.iter().sum();
+    println!(
+        "compile time over {} queries: median {median:.3} ms, slowest {slowest:.3} ms, all {sum:.3} ms",
+        compiles.len()
+    );
 }
 
 /// Whether two answers to a query that ends in `LIMIT` differ only in which of a run of tied rows
