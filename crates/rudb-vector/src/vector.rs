@@ -1308,6 +1308,16 @@ impl Vector {
         Ok(vector)
     }
 
+    /// The same vector without the promise that its codes mean the same thing on every page of its
+    /// source, for a source that no longer keeps it. Nothing is copied.
+    #[must_use]
+    pub fn loosened(mut self) -> Self {
+        if let Body::Dictionary { stable, .. } = &mut self.body {
+            *stable = false;
+        }
+        self
+    }
+
     /// A stable dictionary whose caller already found the largest code while decoding it.
     pub fn stable_dictionary_validated(
         codes: Vec<u32>,

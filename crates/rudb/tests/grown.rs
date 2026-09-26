@@ -134,3 +134,51 @@ fn a_run_that_inserts_more_than_once_keeps_every_row() {
     assert_eq!(third.value("SELECT sum(a) FROM t").expect("reads").to_string(), "55");
     std::fs::remove_file(path).expect("removes the temporary database");
 }
+
+#[test]
+fn a_string_group_over_a_grown_table_counts_the_rows_since() {
+    // The file's string codes cover the file and not what arrived since, which has none. The
+    // counts that group by code, one key or several, and the distinct count that counts codes, all
+    // used to take the file's codes for the whole table and lose or double the rows since.
+    let path = scratch("codes");
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let setup = [
+        "CREATE TABLE t (u BIGINT, v BIGINT, s VARCHAR)",
+        "INSERT INTO t SELECT i % 50, i % 7, 's' || (i % 300)::VARCHAR FROM range(200000) r(i)",
+    ];
+    let changes = [
+        "INSERT INTO t SELECT 3, 1, 'new' || (i % 5)::VARCHAR FROM range(30000) r(i)",
+        "INSERT INTO t SELECT 4, 2, 's1' FROM range(30000)",
+    ];
+    let memory = Database::new();
+    for sql in setup.iter().chain(&changes) {
+        memory.execute(sql).expect("the memory table is made");
+    }
+    {
+        let first = Database::open(&name).expect("a file name starts a native database");
+        for sql in setup {
+            first.execute(sql).expect("the file table is made");
+        }
+        first.execute("CHECKPOINT").expect("commits");
+    }
+    let second = Database::open(&name).expect("the written file opens");
+    for sql in changes {
+        second.execute(sql).expect("a committed table takes rows");
+    }
+    for query in [
+        "SELECT s, count(*) AS c FROM t GROUP BY s ORDER BY c DESC, s LIMIT 5",
+        "SELECT u, s, count(*) AS c FROM t GROUP BY u, s ORDER BY c DESC, s LIMIT 3",
+        "SELECT u, v, s, count(*) AS c FROM t GROUP BY u, v, s ORDER BY c DESC, s LIMIT 3",
+        "SELECT count(*) FROM (SELECT s, count(*) FROM t GROUP BY s)",
+        "SELECT count(DISTINCT s) FROM t",
+    ] {
+        let wanted = memory.query(query).expect("reads").rows().collect::<Vec<_>>();
+        for threads in [1, 4] {
+            second.execute(&format!("SET threads = {threads}")).expect("sets the threads");
+            let got = second.query(query).expect("reads").rows().collect::<Vec<_>>();
+            assert_eq!(got, wanted, "{threads} threads: {query}");
+        }
+    }
+    drop(second);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}

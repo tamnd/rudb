@@ -765,9 +765,12 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.read(at, columns),
             Self::Native(reader) => reader.read(at, columns),
+            // A part of the file keeps the file's string codes, and they are not the codes of the
+            // rows that arrived since, which have none. A caller told the codes were stable would
+            // count the file's rows by code and never meet the others.
             Self::Grown(reader, rows) => {
                 if at < reader.parts() {
-                    reader.read(at, columns)
+                    reader.read(at, columns).map(Chunk::loosened)
                 } else {
                     rows.read(at - reader.parts(), columns)
                 }
@@ -804,7 +807,7 @@ impl Rows {
         match self {
             Self::Native(reader) => reader.read_rows(at, columns, positions, whole),
             Self::Grown(reader, _) if at < reader.parts() => {
-                reader.read_rows(at, columns, positions, whole)
+                reader.read_rows(at, columns, positions, whole).map(Chunk::loosened)
             }
             Self::Memory(_) | Self::Grown(_, _) => {
                 let part = self.read(at, columns)?;
