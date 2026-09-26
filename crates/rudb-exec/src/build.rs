@@ -61,6 +61,7 @@ use rudb_plan::{
     ROOT, Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
+use rudb_vector::VECTOR_SIZE;
 
 use crate::buffer::Buffered;
 use crate::consistent::{Answer, Collect, Reduction};
@@ -79,13 +80,13 @@ use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{Broadcast, CrossProduct, Gathered, Join, Marking, Padding, Probe};
-use crate::key::Digest;
+use crate::key::{Digest, Key, RowMap};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
 use crate::linkjoin::LinkJoin;
 use crate::links::links;
 use crate::percent::{LimitPercent, Portion};
-use crate::prepared::Prepared;
+use crate::prepared::{Prepared, Scratch};
 use crate::query::Query;
 use crate::register::registries;
 use crate::schema::Schema;
@@ -733,6 +734,127 @@ fn native_pair_frequencies(
         entries.push((vec![first, second], count));
     }
     Ok(Some(NativePairFrequencies { entries }))
+}
+
+/// Any `wanted` whole groups of a count under a limit with no order, taken from the rows of the
+/// values one key's frequency synopsis kept rows for.
+///
+/// A limit with no order may answer any of the groups, and a group holding one of those values has
+/// every one of its rows among the kept rows, so its count is exact once the rows of its value are
+/// read. The values are read one at a time from the one held by the fewest rows, and the rest of
+/// the table is never read once enough groups are whole.
+fn native_any_groups(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+    wanted: usize,
+) -> Result<Option<NativePairFrequencies>> {
+    if wanted == 0 {
+        return Ok(None);
+    }
+    let Some(anchored) = Anchored::new(plan, catalog, input, groups, aggregates)? else {
+        return Ok(None);
+    };
+    let occurrences = &anchored.occurrences;
+    let mut counts = RowMap::<u64>::default();
+    if occurrences.anchor_indices.len() == occurrences.ordinals.len() {
+        let values = occurrences.anchor_indices.iter().copied().max().map_or(0, usize::from);
+        let mut rows = vec![Vec::new(); values + 1];
+        for (&ordinal, &anchor) in occurrences.ordinals.iter().zip(&occurrences.anchor_indices) {
+            rows[usize::from(anchor)].push(ordinal);
+        }
+        for ordinals in rows.iter().rev() {
+            anchored.count(ordinals, &mut counts)?;
+            if counts.len() >= wanted {
+                break;
+            }
+        }
+    } else {
+        anchored.count(&occurrences.ordinals, &mut counts)?;
+    }
+    if counts.len() < wanted {
+        return Ok(None);
+    }
+    let entries = counts.into_iter().take(wanted).map(|(key, count)| (key.0, count)).collect();
+    Ok(Some(NativePairFrequencies { entries }))
+}
+
+/// A count grouped by keys one of which is a column whose frequency synopsis kept the rows of its
+/// leading values, ready to count the groups over any of those rows.
+struct Anchored<'a> {
+    table: &'a Table,
+    types: Vec<LogicalType>,
+    stored: Vec<usize>,
+    prepared: Prepared,
+    occurrences: rudb_native::FrequencyOccurrences,
+}
+
+impl<'a> Anchored<'a> {
+    fn new(
+        plan: &Plan,
+        catalog: &'a Catalog,
+        input: NodeRef,
+        groups: Slice,
+        aggregates: Slice,
+    ) -> Result<Option<Self>> {
+        let Some((table, index, columns)) = whole_table(plan, catalog, input)? else {
+            return Ok(None);
+        };
+        let [aggregate] = plan.expr_list(aggregates) else { return Ok(None) };
+        let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
+            return Ok(None);
+        };
+        let keys = plan.expr_list(groups);
+        if keys.is_empty()
+            || plan.string(name) != "count_star"
+            || !plan.expr_list(args).is_empty()
+            || distinct
+            || filter.is_some()
+        {
+            return Ok(None);
+        }
+        let fields = plan.field_list(columns);
+        let mut stored = Vec::with_capacity(fields.len());
+        for field in fields {
+            let Some(column) = table.column_index(&field.name) else { return Ok(None) };
+            stored.push(column);
+        }
+        let mut anchored = None;
+        for &key in keys {
+            if let Expr::Column(column) = *plan.expr(key)
+                && column.table == index
+                && let Some(&at) = stored.get(column.column as usize)
+                && let Some(occurrences) = table.rows().frequency_occurrences(at)?
+            {
+                anchored = Some(occurrences);
+                break;
+            }
+        }
+        let Some(occurrences) = anchored else { return Ok(None) };
+        let schema = Schema::numbered(fields.to_vec(), index);
+        let Ok(prepared) = Prepared::new(plan, keys, &schema) else { return Ok(None) };
+        let types = fields.iter().map(|field| field.ty.clone()).collect();
+        Ok(Some(Self { table, types, stored, prepared, occurrences }))
+    }
+
+    /// Adds the rows at `ordinals` to the count of the group each of them falls in.
+    fn count(&self, ordinals: &[u64], counts: &mut RowMap<u64>) -> Result<()> {
+        let mut scratch = Scratch::default();
+        let mut vectors = Vec::with_capacity(self.stored.len());
+        for ordinals in ordinals.chunks(VECTOR_SIZE) {
+            let chunk = self.table.rows().rows_at(&self.types, &self.stored, ordinals)?;
+            vectors.clear();
+            self.prepared.evaluate(&chunk, &mut scratch, &mut vectors)?;
+            for row in 0..ordinals.len() {
+                let key =
+                    vectors.iter().map(|vector| vector.try_value_at(row)).collect::<Result<_>>()?;
+                *counts.entry(Key(key)).or_default() += 1;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One end of a limit, ready to run.
@@ -2072,6 +2194,17 @@ impl<'a> Building<'a, '_> {
             let source = Frequencies::records(schema.clone(), records)?;
             let counters =
                 self.watch(reference, id, pipeline, "Aggregate", Some("native host groups"));
+            return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+        }
+        if let Some(wanted) = bound.max_groups
+            && bound.top_counts.is_none()
+            && bound.having_count.is_none()
+            && let Some(frequencies) =
+                native_any_groups(self.plan, self.catalog, input, groups, aggregates, wanted)?
+        {
+            let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
+            let counters =
+                self.watch(reference, id, pipeline, "Aggregate", Some("native any groups"));
             return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
         }
         if bound.max_groups.is_none() && bound.having_count.is_none() {
