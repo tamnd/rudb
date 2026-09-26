@@ -13,6 +13,7 @@
 //! reader, and the two would eventually disagree about how many decimal places a memory limit has.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::{Offset, TimeZone as _, Utc};
 use chrono_tz::Tz;
@@ -24,9 +25,13 @@ use crate::Rules;
 /// Every setting the engine has, not only the ones somebody changed. A reader of this is answering
 /// "what is it now", so a name that is missing means the engine does not have that setting rather
 /// than that it is at its default.
+///
+/// The names and values are shared between copies. The database builds a session once and hands a
+/// copy to every statement, and with a couple of hundred settings a deep copy of the map was most
+/// of what a `SELECT 1` cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
-    values: BTreeMap<String, String>,
+    values: Arc<BTreeMap<String, String>>,
     time_zone: Tz,
     semantics: Semantics,
     rules: Rules,
@@ -217,7 +222,7 @@ impl SessionTimeZone {
 impl Default for Session {
     fn default() -> Self {
         Self {
-            values: BTreeMap::new(),
+            values: Arc::new(BTreeMap::new()),
             time_zone: chrono_tz::UTC,
             semantics: Semantics::default(),
             rules: Rules::new(),
@@ -236,7 +241,7 @@ impl Session {
 
     /// Records what one setting is now.
     pub fn set(&mut self, name: &str, value: impl Into<String>) {
-        self.values.insert(name.to_string(), value.into());
+        Arc::make_mut(&mut self.values).insert(name.to_string(), value.into());
     }
 
     /// Sets the time zone after it has been validated by the setting layer.
