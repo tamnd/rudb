@@ -3682,6 +3682,15 @@ impl Shared {
                     Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns },
                 )
             }
+            Bound::CopyTo(mut copy) => {
+                let (optimize_ns, rewrite_ns) = optimized(&mut copy.plan, &context)?;
+                let budget = self.budget();
+                let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
+                    .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
+                let result = run(sql, &copy.plan, &catalog, cancel, under)?;
+                let rows = crate::export::write_csv(&copy, &result, session.session_time_zone())?;
+                QueryResult::changed(rows)
+            }
             Bound::Setting(setting)
                 if setting.pragma && setting.name.eq_ignore_ascii_case("device_card_refresh") =>
             {

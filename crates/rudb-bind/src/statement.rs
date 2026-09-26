@@ -79,6 +79,35 @@ pub enum Bound {
     /// With `codegen` set the layer above hands the plan to the compiled engine and prints what it
     /// generated instead.
     Explain { plan: Plan, analyze: bool, statistics: bool, codegen: bool },
+    /// `COPY ... TO`, a query and how to write what it answers.
+    CopyTo(CopyTo),
+}
+
+/// A bound `COPY ... TO` a CSV file, with every option read and defaulted.
+///
+/// The defaults are the pin's: a header line, a comma, a double quote that is its own escape, and
+/// a null written as nothing at all. The escape does not follow the quote, so `QUOTE ''''` alone
+/// still escapes with a double quote, which is what the pin writes.
+#[derive(Debug)]
+pub struct CopyTo {
+    /// The query whose rows are written.
+    pub plan: Plan,
+    /// The file.
+    pub path: String,
+    /// Whether the first line names the columns.
+    pub header: bool,
+    /// What goes between two values.
+    pub delimiter: String,
+    /// What a value is quoted with.
+    pub quote: String,
+    /// What comes before a quote inside a quoted value.
+    pub escape: String,
+    /// What a null is written as.
+    pub null: String,
+    /// The columns every value of which is quoted, by name.
+    pub force_quote: Vec<String>,
+    /// Whether every column is, which is `FORCE_QUOTE *`.
+    pub force_quote_all: bool,
 }
 
 /// A bound `SET` or `RESET`.
@@ -532,7 +561,127 @@ fn bind_one(
             let (root, _) = binder.bind_query(ast, query)?;
             Ok(Bound::Explain { plan: finish(binder, root)?, analyze, statistics, codegen })
         }
+        ast::Statement::CopyTo(index) => {
+            let copy = &ast.copies[index as usize];
+            let mut binder = Binder::with(catalog, parameters, session);
+            let (root, _) = binder.bind_query(ast, copy.query)?;
+            copy_to(copy, finish(binder, root)?).map(Bound::CopyTo)
+        }
     }
+}
+
+/// Reads the options of a `COPY ... TO` against the format they are for.
+///
+/// Only CSV is written. A `.parquet` or `.json` file, or a format named outright, is refused rather
+/// than written as CSV under a name that says otherwise. An option the pin takes and this does not
+/// is refused by name, and one the pin does not take either gets the first line of its refusal.
+fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
+    let lowered = copy.path.to_ascii_lowercase();
+    let mut format = if lowered.ends_with(".parquet") {
+        "parquet"
+    } else if lowered.ends_with(".json") || lowered.ends_with(".ndjson") {
+        "json"
+    } else {
+        "csv"
+    }
+    .to_string();
+    if let Some((_, Some(written))) = copy.options.iter().rev().find(|(name, _)| name == "format") {
+        format = written.trim_matches('\'').to_ascii_lowercase();
+    }
+    if format != "csv" {
+        return Err(Error::not_implemented(format!(
+            "COPY TO with FORMAT {format} is not supported yet"
+        )));
+    }
+    let mut out = CopyTo {
+        plan,
+        path: copy.path.clone(),
+        header: true,
+        delimiter: ",".to_string(),
+        quote: "\"".to_string(),
+        escape: "\"".to_string(),
+        null: String::new(),
+        force_quote: Vec::new(),
+        force_quote_all: false,
+    };
+    for (name, value) in &copy.options {
+        let text = || {
+            value.clone().ok_or_else(|| {
+                Error::binder(format!("\"{name}\" expects a single argument as a string value"))
+            })
+        };
+        match name.as_str() {
+            "format" => {}
+            "header" => {
+                out.header = match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                    None | Some("true" | "1" | "on") => true,
+                    Some("false" | "0" | "off") => false,
+                    Some(other) => {
+                        return Err(Error::binder(format!(
+                            "\"header\" expects a boolean value, not {other}"
+                        )));
+                    }
+                };
+            }
+            // The pin reads `'\t'` as a tab here, and only here.
+            "delimiter" | "delim" | "sep" => {
+                out.delimiter = text()?.replace("\\t", "\t");
+            }
+            "quote" => out.quote = text()?,
+            "escape" => out.escape = text()?,
+            "null" | "nullstr" => out.null = text()?,
+            "force_quote" => {
+                let written = text()?;
+                let written = written.trim();
+                let list = written.strip_prefix('(').and_then(|rest| rest.strip_suffix(')'));
+                let list = list.unwrap_or(written);
+                if list.trim() == "*" {
+                    out.force_quote_all = true;
+                } else {
+                    for column in list.split(',') {
+                        let column = column.trim();
+                        let unquoted =
+                            column.strip_prefix('"').and_then(|rest| rest.strip_suffix('"'));
+                        out.force_quote.push(unquoted.unwrap_or(column).to_string());
+                    }
+                }
+            }
+            "compression"
+            | "dateformat"
+            | "date_format"
+            | "timestampformat"
+            | "timestamp_format"
+            | "new_line"
+            | "prefix"
+            | "suffix"
+            | "per_thread_output"
+            | "file_size_bytes"
+            | "partition_by"
+            | "overwrite"
+            | "overwrite_or_ignore"
+            | "filename_pattern"
+            | "file_extension"
+            | "use_tmp_file"
+            | "return_files"
+            | "write_partition_columns"
+            | "preserve_order"
+            | "force_not_null"
+            | "encoding" => {
+                return Err(Error::not_implemented(format!(
+                    "COPY TO with the option {name} is not supported yet"
+                )));
+            }
+            _ => {
+                return Err(Error::not_implemented(format!(
+                    "Unrecognized option \"{name}\" for csv"
+                )));
+            }
+        }
+    }
+    if out.delimiter.is_empty() {
+        return Err(Error::binder("The delimiter option cannot be empty"));
+    }
+    Ok(out)
 }
 
 /// Parses and binds one statement, which is the whole front end in one call.
