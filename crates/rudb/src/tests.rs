@@ -11426,6 +11426,15 @@ fn bit_strings_cast_sort_and_combine_the_way_the_pin_does() {
         "00000000;000000000;01;1;111"
     );
     assert_eq!(text("SELECT '1'::BIT < '01'::BIT, '0'::BIT = '00'::BIT"), "false,false");
+    db.execute("CREATE TABLE bit_order(v BIT)").unwrap();
+    db.execute("INSERT INTO bit_order VALUES ('0'), ('10101010'), ('00'), ('01'), ('1')").unwrap();
+    assert_eq!(text("SELECT v FROM bit_order WHERE v < '10101010'::BIT ORDER BY v"), "0;00;01;1");
+    assert_eq!(
+        text(
+            "SELECT l.v, r.v FROM bit_order l, bit_order r WHERE l.v < r.v AND r.v = '1'::BIT ORDER BY 1"
+        ),
+        "0,1;00,1;01,1"
+    );
     assert_eq!(
         text("SELECT 5::TINYINT::BIT, true::BIT, '0101'::BIT::INTEGER, ''::BIT, 'x1f'::BIT"),
         "00000101,00000001,5,0,00011111"

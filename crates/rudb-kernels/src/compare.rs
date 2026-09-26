@@ -1271,6 +1271,19 @@ where
     if left.logical_type() != right.logical_type() {
         return None;
     }
+    // A bit string's bytes do not sort the way its bits do, so ordering two of them is the
+    // fallback's, which asks `bit::cmp`. Equality is still the bytes, since a bit string has one
+    // layout.
+    let equality = matches!(
+        op,
+        Comparison::Equal
+            | Comparison::NotEqual
+            | Comparison::DistinctFrom
+            | Comparison::NotDistinctFrom
+    );
+    if *left.logical_type() == LogicalType::Bit && !equality {
+        return None;
+    }
 
     // Where each side keeps its values and how a row of it is reached, which is what turns flat,
     // dictionary and run length into one branch below rather than nine. See [`Through`].
