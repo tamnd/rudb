@@ -64,6 +64,23 @@ impl Pair {
         wanted
     }
 
+    /// Checks that the file answers `query` with `rows` rows, each of them a row the memory table
+    /// gives for `every`, for a query whose limit has no order and so may answer any of its groups.
+    fn among(&self, query: &str, every: &str, rows: usize) {
+        let wanted = Self::rows(&self.memory, every)
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<std::collections::HashSet<_>>();
+        for threads in [1, 4] {
+            self.file.execute(&format!("SET threads = {threads}")).expect("sets the threads");
+            let got = Self::rows(&self.file, query);
+            assert_eq!(got.len(), rows, "{threads} threads: {query}");
+            for row in got {
+                assert!(wanted.contains(&format!("{row:?}")), "{threads} threads: {row:?}");
+            }
+        }
+    }
+
     /// Whether the file answered without its scan reading a row.
     fn unread(&self, query: &str) -> bool {
         let plan = Self::rows(&self.file, &format!("EXPLAIN ANALYZE {query}"))
@@ -146,4 +163,36 @@ fn a_pair_is_counted_over_the_rows_of_the_leading_values_when_all_of_them_do_not
                  u, phrase LIMIT 5 OFFSET 60";
     assert!(!pair.unread(query));
     pair.agree(query);
+}
+
+/// Heavy users as in the pair test, each row also given a time, so a count can group by the user,
+/// something computed from the time, and the phrase.
+const TIMED: [&str; 2] = [
+    "CREATE TABLE hits(u BIGINT, t BIGINT, phrase VARCHAR)",
+    "INSERT INTO hits SELECT CASE WHEN i < 105000 THEN floor((sqrt(8 * (i // 500) + 1) - 1) / \
+     2)::BIGINT WHEN i < 285000 THEN 1000 + i % 600 ELSE 1000000 + i END, i % 11, CASE WHEN i >= \
+     105000 THEN 'm' || (i % 7)::VARCHAR WHEN i % 5 = 0 THEN 'p' || (i % 3)::VARCHAR ELSE '' END \
+     FROM range(600000) r(i)",
+];
+
+#[test]
+fn a_limit_with_no_order_takes_whole_groups_from_the_kept_rows() {
+    let pair = Pair::of("any", &TIMED);
+    let every = "SELECT u, phrase, COUNT(*) FROM hits GROUP BY u, phrase";
+    let query = "SELECT u, phrase, COUNT(*) FROM hits GROUP BY u, phrase LIMIT 10";
+    pair.among(query, every, 10);
+    assert!(pair.unread(query));
+    pair.among(&format!("{every} LIMIT 4 OFFSET 30"), every, 4);
+    let every = "SELECT t % 3 AS m, u, COUNT(*) FROM hits GROUP BY m, u";
+    pair.among(&format!("{every} LIMIT 25"), every, 25);
+    // More groups than the kept rows hold, so the rows are read.
+    let query = "SELECT u, COUNT(*) FROM hits GROUP BY u LIMIT 5000";
+    pair.among(query, "SELECT u, COUNT(*) FROM hits GROUP BY u", 5000);
+    assert!(!pair.unread(query));
+    for sql in ["DELETE FROM hits WHERE u = 19 AND t % 2 = 0", "DELETE FROM hits WHERE u = 1000"] {
+        pair.memory.execute(sql).expect("the memory table changes");
+        pair.file.execute(sql).expect("the file table changes");
+    }
+    let every = "SELECT u, phrase, COUNT(*) FROM hits GROUP BY u, phrase";
+    pair.among(&format!("{every} LIMIT 40"), every, 40);
 }
