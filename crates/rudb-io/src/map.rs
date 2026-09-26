@@ -25,10 +25,11 @@ pub struct Mapped {
     len: usize,
 }
 
-// SAFETY: the mapping is read only and never moves, so a shared reference to it from any thread
-// reads the same bytes, and unmapping it takes `self` by value in `Drop`.
+// SAFETY: the mapping is read only and does not belong to a thread, so it can be unmapped on any.
 #[allow(unsafe_code, reason = "a raw pointer to shared read only memory is Send and Sync")]
 unsafe impl Send for Mapped {}
+// SAFETY: the mapping is read only and never moves, so a shared reference to it from any thread
+// reads the same bytes, and unmapping it takes the last owner in `Drop`.
 #[allow(unsafe_code, reason = "a raw pointer to shared read only memory is Send and Sync")]
 unsafe impl Sync for Mapped {}
 

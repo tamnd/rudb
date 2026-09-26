@@ -7780,15 +7780,16 @@ impl Reader {
                         .offset
                         .checked_add(span.start as u64)
                         .ok_or_else(|| invalid("part range overflow"))?;
-                    let bytes = match self.map.as_deref().and_then(|map| map.get(offset, span.length)) {
-                        Some(bytes) => bytes,
-                        None => {
-                            let mut bytes = vec![0; span.length];
-                            read_at(&self.file, offset, &mut bytes)?;
-                            owned = bytes;
-                            owned.as_slice()
-                        }
-                    };
+                    let bytes =
+                        match self.map.as_deref().and_then(|map| map.get(offset, span.length)) {
+                            Some(bytes) => bytes,
+                            None => {
+                                let mut bytes = vec![0; span.length];
+                                read_at(&self.file, offset, &mut bytes)?;
+                                owned = bytes;
+                                owned.as_slice()
+                            }
+                        };
                     if self.is_verified(bit) {
                         Ok(bytes)
                     } else {

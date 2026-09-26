@@ -491,19 +491,19 @@ fn once<K: std::hash::Hash + Eq, T>(
     held.entry(key).or_insert_with(|| make().map(Arc::new)).clone()
 }
 
-/// [`key_map`], decoded once per open table. See [`Decoded`].
+/// [`key_map`], decoded once per open table. See `Decoded`.
 #[must_use]
 pub fn shared_key_map(reader: &Reader, column: usize) -> Option<Arc<KeyMap>> {
     once(&reader.graph.key_maps, column, || key_map(reader, column))
 }
 
-/// [`stored_link`], decoded once per open table and parent. See [`Decoded`].
+/// [`stored_link`], decoded once per open table and parent. See `Decoded`.
 #[must_use]
 pub fn shared_link(child: &Reader, parent: &Reader, edge: &Edge) -> Option<Arc<link::Link>> {
     once(&child.graph.links, binding_of(parent, edge), || stored_link(child, parent, edge))
 }
 
-/// [`stored_adjacency`], decoded once per open table and parent. See [`Decoded`].
+/// [`stored_adjacency`], decoded once per open table and parent. See `Decoded`.
 #[must_use]
 pub fn shared_adjacency(child: &Reader, parent: &Reader, edge: &Edge) -> Option<Arc<Adjacency>> {
     once(&child.graph.adjacencies, binding_of(parent, edge), || {
