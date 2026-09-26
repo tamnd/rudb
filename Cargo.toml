@@ -86,6 +86,7 @@ rudb-plan = { version = "=0.6.0", path = "crates/rudb-plan" }
 rudb-qc-ir = { version = "=0.6.0", path = "crates/rudb-qc-ir" }
 rudb-qc-interp = { version = "=0.6.0", path = "crates/rudb-qc-interp" }
 rudb-qc-clif = { version = "=0.6.0", path = "crates/rudb-qc-clif" }
+rudb-qc-direct = { version = "=0.6.0", path = "crates/rudb-qc-direct" }
 rudb-qc-rt = { version = "=0.6.0", path = "crates/rudb-qc-rt" }
 rudb-qc-plan = { version = "=0.6.0", path = "crates/rudb-qc-plan" }
 rudb-qc-pipe = { version = "=0.6.0", path = "crates/rudb-qc-pipe" }

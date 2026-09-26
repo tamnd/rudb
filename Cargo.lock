@@ -754,6 +754,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-qc-direct"
+version = "0.6.0"
+dependencies = [
+ "rudb-qc-ir",
+]
+
+[[package]]
 name = "rudb-qc-gen"
 version = "0.6.0"
 dependencies = [
