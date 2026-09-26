@@ -299,6 +299,10 @@ fn usage() {
     println!("                         --tiers <seed> in place of --tier runs every query on");
     println!("                         interp, on clif and on clif switching tiers at random");
     println!("                         morsels, at threads 1, and wants the rows bit for bit");
+    println!("                         --threads <n> sets threads first, and a compile column");
+    println!("                         prints each query's codegen_ns with the median at the end");
+    println!("                         --set name=value runs SET first, and --corpus <dir> in");
+    println!("                         place of the file runs both checks over sqllogictest files");
     println!("  refusals <dir> <q>     every query in q, a .sql file with -- qNN headers or a");
     println!("                         directory of .sql files, through EXPLAIN (CODEGEN) over");
     println!("                         tables made from the parquet files in dir, with the");
