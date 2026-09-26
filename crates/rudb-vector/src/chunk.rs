@@ -108,6 +108,13 @@ impl Chunk {
         })
     }
 
+    /// The same rows with every column [`Vector::loosened`].
+    #[must_use]
+    pub fn loosened(mut self) -> Self {
+        self.columns = self.columns.into_iter().map(Vector::loosened).collect();
+        self
+    }
+
     /// The columns, given up.
     #[must_use]
     pub fn into_columns(self) -> Vec<Vector> {
