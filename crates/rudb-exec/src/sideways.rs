@@ -303,13 +303,13 @@ pub(crate) struct Exact {
     /// Rows the driving table has, when it is one file and so could have a link.
     children: Option<u64>,
     /// Which parent row holds a key, once read. `None` inside is a map that did not read.
-    keys: OnceLock<Option<KeyMap>>,
+    keys: OnceLock<Option<Arc<KeyMap>>>,
     /// Which parent row every driving row points at, when the link is in the file. Without it the
     /// build side's keys become a [`Domain`] instead.
-    link: OnceLock<Option<Link>>,
+    link: OnceLock<Option<Arc<Link>>>,
     /// The children of every parent row, when the file holds the backward adjacency. With it a
     /// build side that holds few parents becomes the driving rows by reading their lists.
-    adjacency: OnceLock<Option<Adjacency>>,
+    adjacency: OnceLock<Option<Arc<Adjacency>>>,
     /// The form the link takes, read off its head without reading the link.
     form: OnceLock<Option<Form>>,
     /// Where the three are read from, or nothing when they were handed over already read.
@@ -333,8 +333,8 @@ impl Exact {
         Self {
             parents: keys.len(),
             children: link.as_ref().map(Link::children),
-            keys: OnceLock::from(Some(keys)),
-            link: OnceLock::from(link),
+            keys: OnceLock::from(Some(Arc::new(keys))),
+            link: OnceLock::from(link.map(Arc::new)),
             adjacency: OnceLock::from(None),
             form: OnceLock::new(),
             stored: None,
@@ -378,9 +378,9 @@ impl Exact {
         self.keys
             .get_or_init(|| {
                 let stored = self.stored.as_ref()?;
-                rudb_native::graph::key_map(&stored.parent, stored.column)
+                rudb_native::graph::shared_key_map(&stored.parent, stored.column)
             })
-            .as_ref()
+            .as_deref()
     }
 
     /// The same, with the adjacency handed over already built.
@@ -389,9 +389,9 @@ impl Exact {
         Self {
             parents: keys.len(),
             children: Some(adjacency.children()),
-            keys: OnceLock::from(Some(keys)),
+            keys: OnceLock::from(Some(Arc::new(keys))),
             link: OnceLock::from(None),
-            adjacency: OnceLock::from(Some(adjacency)),
+            adjacency: OnceLock::from(Some(Arc::new(adjacency))),
             form: OnceLock::new(),
             stored: None,
         }
@@ -402,9 +402,9 @@ impl Exact {
             .get_or_init(|| {
                 let stored = self.stored.as_ref()?;
                 let (child, edge) = stored.child.as_ref()?;
-                rudb_native::graph::stored_adjacency(child, &stored.parent, edge)
+                rudb_native::graph::shared_adjacency(child, &stored.parent, edge)
             })
-            .as_ref()
+            .as_deref()
     }
 
     /// Whether the link is in the monotone form, which [`reduce`] can push for what the set holds.
@@ -423,9 +423,9 @@ impl Exact {
             .get_or_init(|| {
                 let stored = self.stored.as_ref()?;
                 let (child, edge) = stored.child.as_ref()?;
-                rudb_native::graph::stored_link(child, &stored.parent, edge)
+                rudb_native::graph::shared_link(child, &stored.parent, edge)
             })
-            .as_ref()
+            .as_deref()
     }
 }
 

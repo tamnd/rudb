@@ -52,6 +52,7 @@ use rudb_encoding::bitpack;
 
 use crate::bits::BitVector;
 use crate::rid::{NO_PARENT, PART_ROWS, Rid};
+use crate::tail::Tail;
 
 /// The payload layout version. See the same constant in `wire.rs` for why it is belt and braces.
 const LAYOUT: u8 = 1;
@@ -127,7 +128,7 @@ pub type Bounds = Option<(Rid, Rid)>;
 enum Body {
     Packed {
         /// Bit-packed parent `rid`s, `width` bits each.
-        bytes: Vec<u8>,
+        bytes: Tail,
         width: usize,
         /// Minimum and maximum per [`PART_ROWS`] children, for section 5.5.
         heads: Vec<Bounds>,
@@ -501,6 +502,17 @@ impl Link {
     /// know, or holds a body that is not the size its header implies. Every one of those is a
     /// section to drop rather than a query to fail, by section 3.1.
     pub fn read(bytes: &[u8]) -> Result<Self> {
+        Self::read_from(bytes.to_vec(), 0)
+    }
+
+    /// [`Link::read`] of the bytes of `payload` from `at` on, keeping `payload` for the packed
+    /// parents rather than copying them out of it. See [`Tail`] for why.
+    ///
+    /// # Errors
+    ///
+    /// As [`Link::read`], or if `at` is past the end of `payload`.
+    pub fn read_from(payload: Vec<u8>, at: usize) -> Result<Self> {
+        let bytes = payload.get(at..).ok_or_else(|| malformed("a forward link header is torn"))?;
         let Counts { children, parents, linked, form } = Self::counts(bytes)?;
         let width = bytes[25] as usize;
         let rest = &bytes[HEADER_BYTES..];
@@ -528,7 +540,10 @@ impl Link {
                     let high = number(&rest[part * 16 + 8..part * 16 + 16])?;
                     heads.push((low != NO_PARENT).then_some((low, high)));
                 }
-                Body::Packed { bytes: rest[head..].to_vec(), width, heads }
+                let bytes = Tail::of(payload, at + HEADER_BYTES + head).ok_or_else(|| {
+                    malformed("a forward link's body is not the size its header implies")
+                })?;
+                Body::Packed { bytes, width, heads }
             }
             Form::Monotone => {
                 let len = usize::try_from(linked + parents)
@@ -589,7 +604,7 @@ fn packed(parents_of: &[Rid], parents: u64) -> Result<Body> {
         .collect::<Vec<u64>>();
     let mut bytes = Vec::with_capacity(bitpack::tail_len(values.len(), width));
     bitpack::pack_linear(&values, width, &mut bytes)?;
-    Ok(Body::Packed { bytes, width, heads })
+    Ok(Body::Packed { bytes: bytes.into(), width, heads })
 }
 
 /// Bits per entry: enough for every parent `rid` and one more value meaning no parent.

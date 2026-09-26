@@ -4324,6 +4324,9 @@ pub struct Reader {
     text_grams: Arc<Vec<OnceLock<Option<Vec<u64>>>>>,
     /// The row id of every part's first row, by table wide part number.
     firsts: Arc<Vec<usize>>,
+    /// The key maps, links and adjacencies of this table, each decoded the first time a plan asks.
+    /// See [`graph::Decoded`].
+    graph: Arc<graph::Decoded>,
     /// The file's size when it was opened, for [`Reader::layout`].
     size: u64,
     /// The committed directory's size, for [`Reader::layout`].
@@ -6449,6 +6452,7 @@ impl Reader {
             verified: Arc::new((0..verified).map(|_| AtomicU64::new(0)).collect()),
             text_grams: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             firsts: Arc::new(firsts),
+            graph: Arc::default(),
             size,
             directory,
             opening,
@@ -7232,14 +7236,19 @@ impl Reader {
 
     /// Read a verified extent into a caller-owned buffer so repeated extents can reuse its pages.
     fn extent_into(&self, of: &section::Extent, bytes: &mut Vec<u8>) -> Result<()> {
+        bytes.resize(of.length as usize, 0);
+        self.extent_in_place(of, bytes)
+    }
+
+    /// Reads and verifies one extent into `bytes`, which is exactly its length.
+    fn extent_in_place(&self, of: &section::Extent, bytes: &mut [u8]) -> Result<()> {
         let end = of
             .offset
             .checked_add(u64::from(of.length))
             .ok_or_else(|| invalid("an extent overflows the file"))?;
-        if of.offset < HEADER || end > self.size {
+        if of.offset < HEADER || end > self.size || bytes.len() != of.length as usize {
             return Err(invalid("an extent is outside the file"));
         }
-        bytes.resize(of.length as usize, 0);
         read_at(&self.file, of.offset, bytes)?;
         if checksum(bytes) != of.hash {
             return Err(invalid("an extent does not checksum"));
@@ -7279,18 +7288,26 @@ impl Reader {
     /// For a structure that is resident anyway, which a key map is. Anything large enough that the
     /// split matters should be walking [`Reader::extents`] and taking the one it needs.
     ///
+    /// Each extent is read where it goes in the payload. Read into a buffer of its own and copied
+    /// over, every byte of a section went to fresh memory twice, and in TPC-H q21 loading the
+    /// sections was half the page faults of a query whose system time was as large as its user time.
+    ///
     /// # Errors
     ///
     /// If the extent table or any extent fails its check.
     pub fn payload(&self, of: &Section) -> Result<Vec<u8>> {
         let extents = self.extents(of)?;
-        let mut bytes =
-            Vec::with_capacity(sum(extents.iter().map(|one| u64::from(one.length))) as usize);
+        let total = usize::try_from(sum(extents.iter().map(|one| u64::from(one.length))))
+            .map_err(|_| invalid("a section longer than fits in memory"))?;
+        let mut bytes = vec![0; total];
+        let mut at = 0;
         for one in &extents {
-            if one.first != bytes.len() as u64 {
+            if one.first != at as u64 {
                 return Err(invalid("a section's extents do not join up"));
             }
-            bytes.extend_from_slice(&self.extent(one)?);
+            let end = at + one.length as usize;
+            self.extent_in_place(one, &mut bytes[at..end])?;
+            at = end;
         }
         // The same exception `write_section` makes: a budget record has no bytes, so its
         // `header_bytes` is a size rather than a header and there is nothing for it to run past.
