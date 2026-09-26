@@ -671,7 +671,7 @@ fn an_insert_checks_the_width_and_the_column_names_against_the_table() {
     assert!(statement_failure("INSERT INTO visits (nope) VALUES (1)").contains("nope"));
     assert!(
         statement_failure("INSERT INTO visits (duration, duration) VALUES (1, 2)")
-            .contains("twice")
+            .contains("Duplicate column name \"duration\" in INSERT")
     );
     assert!(statement_failure("INSERT INTO nope VALUES (1)").contains("nope"));
 }

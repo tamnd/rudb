@@ -2970,6 +2970,25 @@ impl Shared {
     ) -> Result<QueryResult> {
         let aborted = self.open().as_ref().is_some_and(|open| open.aborted);
         if aborted && crate::syntax::statement_kind(sql) != Some("TransactionStatement") {
+            // The pin binds before it looks at the transaction, so a statement that would not bind
+            // anyway says why rather than that the transaction is aborted.
+            let session = self.session();
+            let case = session.semantics().identifier_case();
+            let ast = rudb_parse::parse_ast_with_case(sql, case)?;
+            let bound = rudb_bind::bind_statement_with(
+                &ast,
+                &self.read(),
+                &Parameters::default(),
+                &session,
+            );
+            if let Err(error) = bound
+                && matches!(
+                    error.code(),
+                    rudb_common::ErrorCode::Binder | rudb_common::ErrorCode::Catalog
+                )
+            {
+                return Err(error);
+            }
             return Err(Error::transaction("Current transaction is aborted (please ROLLBACK)"));
         }
         let result = run();

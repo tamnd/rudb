@@ -1809,15 +1809,13 @@ fn insert(
             let at = fields.iter().position(|field| same_name(&field.name, column)).ok_or_else(
                 || {
                     Error::binder(format!(
-                        "Table \"{}\" does not have a column named \"{column}\"",
+                        "Table \"{}\" does not have a column with name \"{column}\"",
                         name.table
                     ))
                 },
             )?;
             if targets.contains(&at) {
-                return Err(Error::binder(format!(
-                    "Column \"{column}\" is named twice in the same INSERT"
-                )));
+                return Err(Error::binder(format!("Duplicate column name \"{column}\" in INSERT")));
             }
             targets.push(at);
         }
@@ -1849,13 +1847,24 @@ fn insert(
         bound
     };
     let targets = if written.source == NONE { Vec::new() } else { targets };
+    // The pin's two sentences, lowercase `table` and all, for without a column list and with one.
     if scope.len() != targets.len() {
-        return Err(Error::binder(format!(
-            "Table \"{}\" has {} columns but {} values were supplied",
-            name.table,
-            targets.len(),
-            scope.len()
-        )));
+        return Err(Error::binder(if written.columns.is_empty() {
+            format!(
+                "table \"{}\" has {} columns but {} values were supplied",
+                name.table,
+                targets.len(),
+                scope.len()
+            )
+        } else {
+            format!(
+                "Column name/value mismatch for insert on \"{}\": expected {} columns but {} \
+                 values were supplied",
+                name.table,
+                targets.len(),
+                scope.len()
+            )
+        }));
     }
 
     // A table that declared what order its rows go in gets the sort here, under the projection
