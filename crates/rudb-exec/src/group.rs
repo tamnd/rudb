@@ -5585,12 +5585,30 @@ enum DistinctSet {
 /// High-cardinality string grouping commonly creates one group per row. A `COUNT(DISTINCT BIGINT)`
 /// beside it used to allocate a hash table for every one of those singleton groups. The first value
 /// needs no table, and the table is created only when a second distinct value reaches the group.
+///
+/// Between the two is a short run of values kept in the order they came and searched from the
+/// front. TPC-H q16 counts the distinct suppliers of 18,314 groups made of 118,274 rows, so about
+/// six values to a group, and a hash table for each of them was an allocation, two rehashes as it
+/// grew and a hashed insert a row, which at eight threads came to a sixth of the query. Up to
+/// [`FEW_DISTINCT`] values are one allocation and a compare each, and a set larger than that moves
+/// into the table it would have had anyway.
 #[derive(Debug, Default)]
 enum BigIntDistinct {
     #[default]
     Empty,
     One(i64),
+    Few(Box<FewDistinct>),
     Many(BigIntSet),
+}
+
+/// How many values a distinct set keeps in a run before it becomes a hash table.
+const FEW_DISTINCT: usize = 16;
+
+/// The run of a [`BigIntDistinct`] that has more than one value and no more than [`FEW_DISTINCT`].
+#[derive(Debug)]
+struct FewDistinct {
+    len: usize,
+    values: [i64; FEW_DISTINCT],
 }
 
 impl BigIntDistinct {
@@ -5602,9 +5620,25 @@ impl BigIntDistinct {
             }
             Self::One(held) if *held == value => false,
             Self::One(held) => {
-                let first = *held;
+                let mut values = [0; FEW_DISTINCT];
+                values[0] = *held;
+                values[1] = value;
+                *self = Self::Few(Box::new(FewDistinct { len: 2, values }));
+                true
+            }
+            Self::Few(few) => {
+                let held = &few.values[..few.len];
+                if held.contains(&value) {
+                    return false;
+                }
+                if few.len < FEW_DISTINCT {
+                    few.values[few.len] = value;
+                    few.len += 1;
+                    return true;
+                }
                 let mut values = BigIntSet::default();
-                values.insert(first);
+                values.reserve(FEW_DISTINCT * 2);
+                values.extend(held.iter().copied());
                 values.insert(value);
                 *self = Self::Many(values);
                 true
@@ -5617,6 +5651,12 @@ impl BigIntDistinct {
         match self {
             Self::Empty => Ok(()),
             Self::One(value) => accept(value),
+            Self::Few(few) => {
+                for &value in &few.values[..few.len] {
+                    accept(value)?;
+                }
+                Ok(())
+            }
             Self::Many(values) => {
                 for value in values {
                     accept(value)?;
@@ -8711,7 +8751,35 @@ mod tests {
         assert!(values.insert(9));
         assert!(!values.insert(7));
         assert!(!values.insert(9));
+        assert!(matches!(values, BigIntDistinct::Few(_)));
+    }
+
+    /// A run that fills moves into a table holding every value it had, and the values come back
+    /// out once each whichever form the set is in.
+    #[test]
+    fn a_bigint_distinct_run_moves_into_a_table_when_it_fills() {
+        let mut values = BigIntDistinct::default();
+        for value in 0..super::FEW_DISTINCT as i64 {
+            assert!(values.insert(value * 3));
+        }
+        assert!(matches!(values, BigIntDistinct::Few(_)));
+        assert!(!values.insert(0));
+        assert!(values.insert(-1));
         assert!(matches!(values, BigIntDistinct::Many(_)));
+        for value in 0..super::FEW_DISTINCT as i64 {
+            assert!(!values.insert(value * 3));
+        }
+        let mut out = Vec::new();
+        values
+            .into_each(|value| {
+                out.push(value);
+                Ok(())
+            })
+            .expect("each value");
+        out.sort_unstable();
+        let mut expected: Vec<i64> = (0..super::FEW_DISTINCT as i64).map(|v| v * 3).collect();
+        expected.insert(0, -1);
+        assert_eq!(out, expected);
     }
 
     #[test]
