@@ -686,7 +686,7 @@ impl KeyMap {
             }
             Body::Sorted { .. } => return Ok(None),
         }
-        if rows % 64 != 0 && out.last().is_some_and(|&word| word >> (rows % 64) != 0) {
+        if !rows.is_multiple_of(64) && out.last().is_some_and(|&word| word >> (rows % 64) != 0) {
             return Ok(None);
         }
         Ok(Some(out))
