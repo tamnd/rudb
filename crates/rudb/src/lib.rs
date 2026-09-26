@@ -110,6 +110,7 @@ mod config;
 mod connection;
 mod database;
 mod foreign;
+mod journal;
 mod mirror;
 mod prepared;
 mod result;
