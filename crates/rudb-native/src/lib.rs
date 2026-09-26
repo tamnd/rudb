@@ -39,7 +39,7 @@ use std::fs::File;
 use std::mem::{size_of, size_of_val};
 use std::path::Path;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as Atomic};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
@@ -4322,6 +4322,14 @@ pub struct Reader {
     /// reads hashed the whole part again: on TPC-H q21, which reads `lineitem` three times, that was
     /// 4 percent of the query.
     verified: Arc<Vec<AtomicU64>>,
+    /// How many parts of each stripe's page of each column are still to be read out of the mapped
+    /// file before the page is let go, stripe by stripe and each column in turn.
+    ///
+    /// A page and not a part at a time, because letting go of mapped pages is a call that stops
+    /// every thread of the process to flush what it had mapped, and a part at a time that was twice
+    /// the kernel instructions on ClickBench 10. A stripe's page is let go by whichever worker
+    /// reads its last part. See [`Mapped::release`].
+    unreleased: Arc<Vec<AtomicU32>>,
     /// Each text column's [`grams`] sketch in row id order, read the first time a `LIKE` asks
     /// about the column, and `None` when the table carries none for it.
     text_grams: Arc<Vec<OnceLock<Option<Vec<u64>>>>>,
@@ -6460,6 +6468,14 @@ impl Reader {
         let sieves = (0..table_fields).map(|_| OnceLock::new()).collect();
         let part_ranges = (0..table_fields).map(|_| OnceLock::new()).collect();
         let verified = (places.len() * table_fields).div_ceil(64);
+        let unreleased = table
+            .stripes
+            .iter()
+            .flat_map(|stripe| {
+                let parts = u32::try_from(stripe.parts.len()).unwrap_or(u32::MAX);
+                (0..table_fields).map(move |_| AtomicU32::new(parts))
+            })
+            .collect();
         let firsts = places
             .iter()
             .scan(0, |first, place| {
@@ -6487,6 +6503,7 @@ impl Reader {
             pages: Arc::new(AtomicUsize::new(0)),
             indexes: Arc::new(AtomicUsize::new(0)),
             verified: Arc::new((0..verified).map(|_| AtomicU64::new(0)).collect()),
+            unreleased: Arc::new(unreleased),
             text_grams: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             firsts: Arc::new(firsts),
             graph: Arc::default(),
@@ -7784,6 +7801,7 @@ impl Reader {
                 .get(place.part as usize)
                 .ok_or_else(|| invalid("part index out of range"))?;
             let owned;
+            let mut mapped = false;
             let bit = at * self.table.fields.len() + column;
             let bytes = match &held.page {
                 Some(held) if self.is_verified(bit) => part_bytes(held.bytes(), span),
@@ -7797,7 +7815,10 @@ impl Reader {
                         .ok_or_else(|| invalid("part range overflow"))?;
                     let bytes =
                         match self.map.as_deref().and_then(|map| map.get(offset, span.length)) {
-                            Some(bytes) => bytes,
+                            Some(bytes) => {
+                                mapped = true;
+                                bytes
+                            }
                             None => {
                                 let mut bytes = vec![0; span.length];
                                 read_at(&self.file, offset, &mut bytes)?;
@@ -7833,6 +7854,17 @@ impl Reader {
                 None => decode(&field.ty, rows, bytes, dictionary)?,
                 Some(positions) => decode_at(&field.ty, rows, bytes, dictionary, positions)?,
             };
+            // What was decoded is in memory of its own now, so once every part of the page has
+            // been, nothing this scan does reads the page again. A part read twice counts twice
+            // and lets the page go early, which costs the reads after it a fault and no more.
+            if mapped
+                && let Some(map) = self.map.as_deref()
+                && let Some(left) = self.unreleased.get(index * self.table.fields.len() + column)
+                && left.fetch_update(Atomic::Relaxed, Atomic::Relaxed, |left| left.checked_sub(1))
+                    == Ok(1)
+            {
+                map.release(page.offset, page.length as usize);
+            }
             // A demoted column's codes are not the column's codes, only the codes of the stripes
             // written before the demotion, so they are not handed out as if they were. See
             // [`DEMOTED`].
