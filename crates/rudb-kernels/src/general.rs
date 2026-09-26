@@ -24,7 +24,7 @@ use crate::compare::order_with_nulls;
 use crate::hash::Sketch;
 use crate::histogram::Binned;
 use crate::number::{approximate, fit, integral};
-use crate::quantile::{self, Column, Held, Holistic};
+use crate::quantile::{self, Column, Held, Holistic, Sample};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
 use crate::tally::Tally;
 
@@ -66,6 +66,8 @@ pub(crate) enum General {
     /// The quantiles, `median`, `mad` and `mode`, which hold every value that is not null and the
     /// fraction the call asked for, and answer in [`crate::quantile`].
     Holistic { values: Held, fraction: Option<Value>, measure: Holistic, returns: LogicalType },
+    /// `reservoir_quantile`, which keeps a sample of the values rather than all of them.
+    Sampled { sample: Sample, fraction: Option<Value>, returns: LogicalType },
     /// The `arg_min` and `arg_max` spellings, which keep the row with the least or greatest key,
     /// or the best `n` of them when the call passes a count, and answer in [`crate::arg_extreme`].
     Arg { state: ArgExtreme, returns: LogicalType },
@@ -161,6 +163,11 @@ impl General {
             "bit_xor" => bits(BitOp::Xor),
             "bitstring_agg" => Self::Gathered(Gathered::default()),
             "approx_count_distinct" => Self::Sketched(Sketch::default()),
+            "reservoir_quantile" => Self::Sampled {
+                sample: Sample::default(),
+                fraction: None,
+                returns: returns.clone(),
+            },
             "product" => Self::Product { total: 1.0, seen: false },
             "var_samp" => moments(Measure::VarSamp),
             "var_pop" => moments(Measure::VarPop),
@@ -247,6 +254,13 @@ impl General {
             }
             Self::Gathered(state) => state.update(value, &args[1..])?,
             Self::Sketched(sketch) => sketch.insert(value),
+            Self::Sampled { sample, fraction, .. } => {
+                if fraction.is_none() {
+                    *fraction = args.get(1).cloned();
+                }
+                sample.size(args.get(2));
+                sample.push(value);
+            }
             Self::Product { total, seen } => {
                 *total *= approximate(value).ok_or_else(|| unexpected("product", value))?;
                 *seen = true;
@@ -315,6 +329,7 @@ impl General {
         matches!(
             self,
             Self::Holistic { .. }
+                | Self::Sampled { .. }
                 | Self::Tally(_)
                 | Self::Kahan { .. }
                 | Self::CountIf { .. }
@@ -360,6 +375,15 @@ impl General {
             }
             (Self::CountIf { .. } | Self::Kahan { .. }, column) => {
                 return self.update(&[column.value(row)]);
+            }
+            (Self::Sampled { sample, fraction, .. }, column) => {
+                if fraction.is_none() {
+                    *fraction = args.get(1).map(|given| given.try_value_at(row)).transpose()?;
+                    let size = args.get(2).map(|given| given.try_value_at(row)).transpose()?;
+                    sample.size(size.as_ref());
+                }
+                sample.push_column(column, row);
+                return Ok(());
             }
             _ => {}
         }
@@ -430,6 +454,15 @@ impl General {
             }
             (Self::Gathered(state), Self::Gathered(theirs)) => state.combine(theirs),
             (Self::Sketched(sketch), Self::Sketched(theirs)) => sketch.combine(theirs),
+            (
+                Self::Sampled { sample, fraction, .. },
+                Self::Sampled { sample: theirs, fraction: given, .. },
+            ) => {
+                sample.combine(theirs);
+                if fraction.is_none() {
+                    fraction.clone_from(given);
+                }
+            }
             (Self::Paired(state), Self::Paired(theirs)) => state.combine(theirs),
             (Self::Powers(state), Self::Powers(theirs)) => state.combine(theirs),
             (
@@ -520,6 +553,9 @@ impl General {
         if let Self::Holistic { values, fraction, measure, returns } = self {
             return quantile::finish(*measure, values, fraction.as_ref(), returns);
         }
+        if let Self::Sampled { sample, fraction, returns } = self {
+            return sample.finish(fraction.as_ref(), returns);
+        }
         Ok(match self {
             Self::List { values, .. } if values.is_empty() => Value::Null,
             Self::List { element, values } => {
@@ -594,7 +630,10 @@ impl General {
             Self::Powers(state) => state.finish()?,
             Self::Joined { seen: false, .. } => Value::Null,
             Self::Joined { text, .. } => Value::Varchar(text.clone()),
-            Self::Ordered { .. } | Self::Holistic { .. } | Self::Arg { .. } => {
+            Self::Ordered { .. }
+            | Self::Holistic { .. }
+            | Self::Sampled { .. }
+            | Self::Arg { .. } => {
                 return Err(Error::internal("an ordered, holistic or arg_min aggregate"));
             }
         })

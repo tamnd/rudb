@@ -11556,3 +11556,82 @@ fn hash_and_approx_count_distinct_answer_what_the_pin_does() {
     assert_eq!(text("SELECT approx_count_distinct(x) FROM (VALUES (NULL::INT)) t(x)"), "0");
     assert_eq!(text("SELECT approx_count_distinct(x) FROM range(0) t(x)"), "0");
 }
+
+#[test]
+fn reservoir_quantile_picks_what_the_pin_picks_and_refuses_what_it_refuses() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    assert_eq!(
+        text(
+            "SELECT reservoir_quantile(x, 0.5), typeof(reservoir_quantile(x, 0.5)) FROM range(101) t(x)"
+        ),
+        "50,BIGINT"
+    );
+    assert_eq!(
+        text(
+            "SELECT reservoir_quantile(x::INT, 0.25), reservoir_quantile(x::DOUBLE, 0.9), reservoir_quantile(x::DECIMAL(10, 2), 0.5), reservoir_quantile(x, [0.1, 0.5, 0.9]) FROM range(10) t(x)"
+        ),
+        "2,8.0,4.00,[0, 4, 8]"
+    );
+    assert_eq!(
+        text(
+            "SELECT typeof(reservoir_quantile(x::UINTEGER, 0.5)), typeof(reservoir_quantile(x::UBIGINT, 0.5)), typeof(reservoir_quantile(x::TINYINT, 0.5)), typeof(reservoir_quantile(x::FLOAT, 0.5)) FROM range(10) t(x)"
+        ),
+        "BIGINT,HUGEINT,TINYINT,FLOAT"
+    );
+    assert_eq!(text("SELECT reservoir_quantile(x, 0.5, 5) FROM range(5) t(x)"), "2");
+    assert_eq!(text("SELECT reservoir_quantile(x, 0.5) FROM range(0) t(x)"), "NULL");
+    assert_eq!(text("SELECT reservoir_quantile(x, 0.5) FROM (VALUES (1), (NULL), (3)) t(x)"), "1");
+    assert_eq!(
+        text(
+            "SELECT x % 2 AS g, reservoir_quantile(x, 0.5) FROM range(20) t(x) GROUP BY g ORDER BY g"
+        ),
+        "0,8;1,9"
+    );
+    assert_eq!(text("SELECT reservoir_quantile(1, 0.5, 1) FROM range(100)"), "1");
+    let near = text(
+        "SELECT reservoir_quantile(x, 0.5, 1000) BETWEEN 4000 AND 6000 FROM range(10000) t(x)",
+    );
+    assert_eq!(near, "true");
+    for (sql, message) in [
+        (
+            "SELECT reservoir_quantile(x, 1.5) FROM range(5) t(x)",
+            "RESERVOIR_QUANTILE can only take parameters in the range [0, 1]",
+        ),
+        (
+            "SELECT reservoir_quantile(x, NULL) FROM range(5) t(x)",
+            "RESERVOIR_QUANTILE QUANTILE parameter cannot be NULL",
+        ),
+        (
+            "SELECT reservoir_quantile(x, [0.5, NULL]) FROM range(5) t(x)",
+            "RESERVOIR_QUANTILE QUANTILE parameter cannot be NULL",
+        ),
+        (
+            "SELECT reservoir_quantile(x, x) FROM range(5) t(x)",
+            "The \"quantile\" argument in function \"reservoir_quantile\" must be a constant expression",
+        ),
+        (
+            "SELECT reservoir_quantile(x, 0.5, 0) FROM range(5) t(x)",
+            "Size of the RESERVOIR_QUANTILE sample must be bigger than 0",
+        ),
+        (
+            "SELECT reservoir_quantile(x, 0.5, NULL) FROM range(5) t(x)",
+            "The \"sample_size\" argument in function '\"reservoir_quantile\"' must not be NULL",
+        ),
+        (
+            "SELECT reservoir_quantile(x, 0.5, x::INT) FROM range(5) t(x)",
+            "The \"sample_size\" argument in function \"reservoir_quantile\" must be a constant expression",
+        ),
+        ("SELECT reservoir_quantile(x::VARCHAR, 0.5) FROM range(5) t(x)", "No function matches"),
+        ("SELECT reservoir_quantile(x, 0.5, 3::BIGINT) FROM range(5) t(x)", "No function matches"),
+    ] {
+        let error = db.execute(sql).expect_err(sql);
+        assert!(error.message().contains(message), "{sql}: {error}");
+    }
+}

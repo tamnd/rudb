@@ -4142,9 +4142,9 @@ mod tests {
 
     #[test]
     fn an_aggregate_nobody_has_written_says_which_one() {
-        let error = Accumulator::new("reservoir_quantile", &LogicalType::Double)
-            .expect_err("reservoir_quantile is not written yet");
-        assert!(error.message().contains("the reservoir_quantile aggregate"), "{error}");
+        let error = Accumulator::new("approx_top_k", &LogicalType::Double)
+            .expect_err("approx_top_k is not written yet");
+        assert!(error.message().contains("the approx_top_k aggregate"), "{error}");
     }
 
     /// The row at a time path, which is the answer the one pass path has to reach.

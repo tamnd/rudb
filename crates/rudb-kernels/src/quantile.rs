@@ -38,6 +38,8 @@ pub(crate) enum Holistic {
     Median,
     Deviation,
     Mode,
+    /// `reservoir_quantile`, which picks from a [`Sample`] at `(n - 1) * q` rounded down.
+    Reservoir,
 }
 
 impl Holistic {
@@ -144,6 +146,27 @@ impl Whole {
 }
 
 impl Held {
+    /// How many values are held.
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Wholes { values, .. } => values.len(),
+            Self::Reals(values) => values.len(),
+            Self::Values(values) => values.len(),
+        }
+    }
+
+    /// Puts a value that is not null in the place of the one at `at`.
+    fn replace(&mut self, at: usize, value: &Value) {
+        match (&mut *self, Whole::of(value), value) {
+            (Self::Wholes { values, whole }, Some((kind, n)), _) if kind == *whole => {
+                values[at] = n
+            }
+            (Self::Reals(values), _, Value::Double(real)) => values[at] = *real,
+            _ => self.spilled()[at] = value.clone(),
+        }
+    }
+
     /// Adds a value that is not null.
     pub(crate) fn push(&mut self, value: &Value) {
         match self {
@@ -221,6 +244,121 @@ impl Held {
             Self::Values(values) => values,
             _ => unreachable!("a held set of values was just made one"),
         }
+    }
+}
+
+/// The sample a `reservoir_quantile` group keeps, `8192` values unless the call asks for another
+/// size, drawn evenly from every value that is not null.
+///
+/// Until the sample is full it holds every value and the answer is exact. After that each new
+/// value takes the place of a held one with the chance a uniform sample gives it, which is what
+/// the pin's reservoir does too. The pin draws from a random seed, so its answer over more values
+/// than the sample changes from run to run. This draws from a fixed one, so the same rows in the
+/// same order always give the same answer.
+#[derive(Debug, Clone)]
+pub(crate) struct Sample {
+    held: Held,
+    /// The most values held, read off the call's third argument on the first row.
+    capacity: Option<usize>,
+    /// How many values the sample was drawn from.
+    seen: u64,
+    /// The state of the draws, a splitmix64 sequence.
+    draws: u64,
+}
+
+impl Default for Sample {
+    fn default() -> Self {
+        Self { held: Held::Empty, capacity: None, seen: 0, draws: 0x9e37_79b9_7f4a_7c15 }
+    }
+}
+
+impl Sample {
+    /// The pin's sample size when the call does not give one.
+    const SIZE: usize = 8192;
+
+    /// Reads the sample size off the call's arguments the first time.
+    pub(crate) fn size(&mut self, size: Option<&Value>) {
+        if self.capacity.is_none() {
+            let size = size.and_then(crate::number::integral).and_then(|n| usize::try_from(n).ok());
+            self.capacity = Some(size.filter(|&n| n > 0).unwrap_or(Self::SIZE));
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity.unwrap_or(Self::SIZE)
+    }
+
+    /// A draw between 0 and `below`, which is not 0.
+    fn draw(&mut self, below: u64) -> u64 {
+        self.draws = self.draws.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.draws;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) % below
+    }
+
+    /// Where the next value goes: `Ok` to add it, `Err` with the place of the one it takes the
+    /// place of, or `None` to pass it by.
+    fn slot(&mut self) -> Option<std::result::Result<(), usize>> {
+        self.seen += 1;
+        let capacity = self.capacity();
+        if self.held.len() < capacity {
+            return Some(Ok(()));
+        }
+        let at = self.draw(self.seen);
+        usize::try_from(at).ok().filter(|&at| at < capacity).map(Err)
+    }
+
+    /// Adds a value that is not null.
+    pub(crate) fn push(&mut self, value: &Value) {
+        match self.slot() {
+            Some(Ok(())) => self.held.push(value),
+            Some(Err(at)) => self.held.replace(at, value),
+            None => {}
+        }
+    }
+
+    /// Adds the row of a column.
+    pub(crate) fn push_column(&mut self, column: Column<'_>, row: usize) {
+        match self.slot() {
+            Some(Ok(())) => column.push(&mut self.held, row),
+            Some(Err(at)) => self.held.replace(at, &column.value(row)),
+            None => {}
+        }
+    }
+
+    /// Takes in the sample of another group of the same call. When the two together fit, that is
+    /// all of both. Otherwise each place of the new sample is drawn from one side or the other, as
+    /// likely as the share of the values that side was drawn from.
+    pub(crate) fn combine(&mut self, other: &Self) {
+        if self.capacity.is_none() {
+            self.capacity = other.capacity;
+        }
+        let capacity = self.capacity();
+        if self.seen + other.seen <= capacity as u64 {
+            self.held.append(&other.held);
+            self.seen += other.seen;
+            return;
+        }
+        let (mut mine, mut theirs) = (self.held.values(), other.held.values());
+        let (weight, total) = (self.seen, self.seen + other.seen);
+        let mut held = Held::Empty;
+        while held.len() < capacity && !(mine.is_empty() && theirs.is_empty()) {
+            let side = if theirs.is_empty() || (!mine.is_empty() && self.draw(total) < weight) {
+                &mut mine
+            } else {
+                &mut theirs
+            };
+            let at = self.draw(side.len() as u64);
+            held.push(&side.swap_remove(usize::try_from(at).unwrap_or(0)));
+        }
+        self.held = held;
+        self.seen = total;
+    }
+
+    /// The answer over the sample.
+    pub(crate) fn finish(&self, fraction: Option<&Value>, returns: &LogicalType) -> Result<Value> {
+        finish(Holistic::Reservoir, &self.held, fraction, returns)
     }
 }
 
@@ -386,6 +524,24 @@ impl Fraction {
         (self.placed(low, n), self.placed(high, n), row - below)
     }
 
+    /// Where `reservoir_quantile` picks among `n` sorted values, which is `(n - 1) * q` rounded
+    /// down in doubles, as the pin works it out.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "the position is between 0 and n and n is a count of rows held in memory"
+    )]
+    fn sampled(self, n: usize) -> usize {
+        let at = ((n - 1) as f64 * self.share) as usize;
+        self.placed(at.min(n - 1), n)
+    }
+
+    /// Where a quantile that picks one of the values picks it.
+    fn picked(self, n: usize, measure: Holistic) -> usize {
+        if measure == Holistic::Reservoir { self.sampled(n) } else { self.discrete(n) }
+    }
+
     fn placed(self, at: usize, n: usize) -> usize {
         if self.descending { n - 1 - at } else { at }
     }
@@ -514,17 +670,17 @@ fn typed<T: Number, R: Rebuild<T>>(
 ) -> Result<Value> {
     let one = |numbers: &mut [T], fraction: Fraction, discrete: bool| {
         if discrete {
-            let at = fraction.discrete(numbers.len());
+            let at = fraction.picked(numbers.len(), measure);
             Ok(rebuild.value(*numbers.select_nth_unstable_by(at, cmp).1))
         } else {
             continuous(&typed_pair(numbers, fraction, cmp), rebuild)
         }
     };
     match measure {
-        Holistic::Continuous | Holistic::Discrete => {
+        Holistic::Continuous | Holistic::Discrete | Holistic::Reservoir => {
             let fraction =
                 fraction.ok_or_else(|| Error::internal("a quantile with no fraction"))?;
-            let discrete = measure == Holistic::Discrete;
+            let discrete = measure != Holistic::Continuous;
             match (fraction, returns) {
                 (Value::List { values: fractions, .. }, LogicalType::List(element)) => {
                     let answers = fractions
@@ -604,12 +760,12 @@ fn finish_values(
     }
     let sorted = sorted(values)?;
     match measure {
-        Holistic::Continuous | Holistic::Discrete => {
+        Holistic::Continuous | Holistic::Discrete | Holistic::Reservoir => {
             let fraction =
                 fraction.ok_or_else(|| Error::internal("a quantile with no fraction"))?;
             let one = |fraction: Fraction| {
-                if measure == Holistic::Discrete {
-                    Ok(sorted[fraction.discrete(sorted.len())].clone())
+                if measure != Holistic::Continuous {
+                    Ok(sorted[fraction.picked(sorted.len(), measure)].clone())
                 } else {
                     sorted_continuous(&sorted, fraction)
                 }
@@ -897,6 +1053,7 @@ mod tests {
                 };
                 for fraction in &fractions {
                     both(Holistic::Discrete, Some(fraction));
+                    both(Holistic::Reservoir, Some(fraction));
                     if continuous {
                         both(Holistic::Continuous, Some(fraction));
                     }
@@ -908,5 +1065,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_reservoir_picks_below_n_minus_one_times_q_and_keeps_its_size() {
+        let mut sample = Sample::default();
+        sample.size(None);
+        for n in 1..=10 {
+            sample.push(&Value::Decimal { unscaled: n * 110, width: 10, scale: 2 });
+        }
+        let fraction = Value::Double(0.5);
+        let ty = LogicalType::Decimal { width: 10, scale: 2 };
+        let answer = sample.finish(Some(&fraction), &ty).unwrap();
+        assert_eq!(answer, Value::Decimal { unscaled: 550, width: 10, scale: 2 });
+
+        let (mut left, mut right) = (Sample::default(), Sample::default());
+        left.size(Some(&Value::Integer(100)));
+        right.size(Some(&Value::Integer(100)));
+        for n in 0..5000 {
+            left.push(&Value::BigInt(n));
+            right.push(&Value::BigInt(n + 5000));
+        }
+        assert_eq!(left.held.len(), 100);
+        left.combine(&right);
+        assert_eq!((left.held.len(), left.seen), (100, 10_000));
+        let Value::BigInt(middle) = left.finish(Some(&fraction), &LogicalType::BigInt).unwrap()
+        else {
+            panic!("a BIGINT sample answers a BIGINT");
+        };
+        assert!((3000..7000).contains(&middle), "{middle}");
     }
 }
