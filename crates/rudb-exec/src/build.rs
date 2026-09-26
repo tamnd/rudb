@@ -2220,7 +2220,15 @@ impl<'a> Building<'a, '_> {
         aggregates: Slice,
         bound: AggregateBound,
     ) -> Result<Segment<'a>> {
-        if bound.max_groups.is_none()
+        // Every path below that answers out of something the loader worked out rather than out of
+        // the rows is behind `stored_answers`: the whole table summary, the run projection, the
+        // host groups and the value and pair frequencies. ClickBench counts all of them as
+        // aggregation done at load time, so `SET stored_answers = off` makes the aggregate read
+        // the rows. The any groups path stays, because it reads the rows of the values it picks
+        // and only uses the synopsis as an index to find them.
+        let stored = self.session.rules().enabled(Rule::StoredAnswers);
+        if stored
+            && bound.max_groups.is_none()
             && bound.having_count.is_none()
             && let Some((reader, order, covered, group_type)) =
                 covering_grouped_distinct(self.plan, self.catalog, input, groups, aggregates)?
@@ -2243,7 +2251,6 @@ impl<'a> Building<'a, '_> {
         // pipeline that exists is a pipeline that runs. A summary that let the rows be counted
         // underneath it would answer in no time and take exactly as long as it always did.
         // `SET stored_answers = off` skips this and reads the rows, which is how a ClickBench run keeps what the loader added up out of its numbers.
-        let stored = self.session.rules().enabled(Rule::StoredAnswers);
         if stored
             && bound.max_groups.is_none()
             && bound.having_count.is_none()
@@ -2317,7 +2324,8 @@ impl<'a> Building<'a, '_> {
         let schema = aggregate.schema().clone();
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
-        if bound.max_groups.is_none()
+        if stored
+            && bound.max_groups.is_none()
             && let Some(records) = native_host_groups(
                 self.plan,
                 self.catalog,
@@ -2343,7 +2351,7 @@ impl<'a> Building<'a, '_> {
                 self.watch(reference, id, pipeline, "Aggregate", Some("native any groups"));
             return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
         }
-        if bound.max_groups.is_none() && bound.having_count.is_none() {
+        if stored && bound.max_groups.is_none() && bound.having_count.is_none() {
             let top = bound.top_counts.map(|(bound, _)| bound);
             if let Some(top) = top
                 && let Some(frequencies) = native_value_frequencies(
