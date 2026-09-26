@@ -135,6 +135,12 @@ struct Candidate {
     key: Vec<Cell>,
     values: Vec<Cell>,
     arrival: crate::sort::Arrival,
+    /// The one key as the integer it is stored as, where the key is one column of a type whose
+    /// order is the order of that integer and this row's value of it is not null.
+    ///
+    /// Two candidates that both have one compare on it and nothing else, see [`ordered`]. Anything
+    /// else, a null on either side included, goes through the cells as it always has.
+    ordinal: Option<i128>,
 }
 
 /// One column of a candidate row, which is either the value or what it takes to read it later.
@@ -268,10 +274,56 @@ fn settled(
     right: &Candidate,
     failure: &mut Option<Error>,
 ) -> Ordering {
-    match compare(keys, &left.key, &right.key, failure) {
+    let ordering = ordered(keys, left.ordinal, right.ordinal)
+        .unwrap_or_else(|| compare(keys, &left.key, &right.key, failure));
+    match ordering {
         Ordering::Equal => left.arrival.cmp(&right.arrival),
         ordering => ordering,
     }
+}
+
+/// Where two single keys sit by the integers they are stored as, when both of them have one.
+///
+/// The answer [`compare`] gives for the same two rows. A candidate only has an ordinal when the key
+/// list is one column of a type that orders as its stored integer, see [`orders_as_stored`], and the
+/// value is not null, so the null placement has nothing to say and only the direction does. On
+/// ClickBench 43 the candidates are the 1423 minutes of a day and a half ordered by a `TIMESTAMP`,
+/// and comparing them as values was a fifth of the query.
+fn ordered(keys: &[SortKey], left: Option<i128>, right: Option<i128>) -> Option<Ordering> {
+    let ordering = left?.cmp(&right?);
+    Some(if keys.first()?.descending { ordering.reverse() } else { ordering })
+}
+
+/// Whether a key of this type sorts the way the integer [`Vector::signed_at`] reads out of it does.
+///
+/// The signed integers, and the types stored in one where a bigger number is a later or bigger
+/// value. A decimal is here because one column has one scale, so its unscaled values order as the
+/// decimals do. The unsigned integers are not, because `signed_at` does not read them.
+fn orders_as_stored(logical: &LogicalType) -> bool {
+    matches!(
+        logical,
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::HugeInt
+            | LogicalType::Decimal { .. }
+            | LogicalType::Date
+            | LogicalType::Time
+            | LogicalType::Timestamp
+            | LogicalType::TimestampS
+            | LogicalType::TimestampMs
+            | LogicalType::TimestampNs
+            | LogicalType::TimestampTz
+    )
+}
+
+/// The ordinal of one row's key, when the operator keeps them and the row's key is not null.
+fn ordinal_at(ordinal: bool, keys: &[Vector], row: usize) -> Option<i128> {
+    if !ordinal {
+        return None;
+    }
+    keys.first()?.signed_at(row)
 }
 
 /// Where two rows of key cells sit relative to each other, under the key list in priority order.
@@ -337,6 +389,8 @@ pub(crate) struct TopN {
     exprs: Prepared,
     /// The input's types, which are also the output's.
     types: Vec<LogicalType>,
+    /// Whether candidates carry their key as an integer as well, see [`Candidate::ordinal`].
+    ordinal: bool,
     /// How many rows to emit, once the ones to skip have been skipped.
     count: usize,
     /// How many rows to skip first.
@@ -413,8 +467,10 @@ impl TopN {
         let offset = usize::try_from(offset).unwrap_or(usize::MAX);
         let keys = plan.sort_key_list(keys).to_vec();
         let exprs: Vec<_> = keys.iter().map(|key| key.expr).collect();
+        let ordinal = matches!(exprs.as_slice(), [only] if orders_as_stored(plan.expr_type(*only)));
         let out = Buffered::new();
         let top = Self {
+            ordinal,
             exprs: Prepared::new(plan, &exprs, input)?,
             keys,
             types: input.types(),
@@ -496,7 +552,8 @@ impl TopN {
             return Ok(0);
         }
         let arrival = place.of(row);
-        hold(keys, chunk, row, arrival, kept)
+        let ordinal = ordinal_at(self.ordinal, keys, row);
+        hold(keys, chunk, row, (arrival, ordinal), kept)
     }
 }
 
@@ -540,8 +597,9 @@ impl Sink for TopN {
                 .flatten();
             let offer = |row: usize, local: &mut Running| {
                 let arrival = local.place.of(row);
+                let ordinal = ordinal_at(self.ordinal, &keys, row);
                 keep(
-                    Where { keys: &self.keys, columns: &keys, chunk, row, arrival },
+                    Where { keys: &self.keys, columns: &keys, chunk, row, arrival, ordinal },
                     local,
                     self.bound,
                 );
@@ -713,7 +771,7 @@ fn hold(
     keys: &[Vector],
     chunk: &Chunk,
     row: usize,
-    arrival: crate::sort::Arrival,
+    (arrival, ordinal): (crate::sort::Arrival, Option<i128>),
     kept: &mut Vec<Candidate>,
 ) -> Result<u64> {
     let key: Vec<Cell> =
@@ -721,7 +779,7 @@ fn hold(
     let values: Vec<Cell> =
         chunk.columns().iter().map(|column| Cell::of(column, row)).collect::<Result<_>>()?;
     let taken = charge(&key) + charge(&values);
-    kept.push(Candidate { key, values, arrival });
+    kept.push(Candidate { key, values, arrival, ordinal });
     Ok(taken)
 }
 
@@ -731,7 +789,7 @@ fn hold(
 /// separates it from the worst candidate, so a row that loses on the first of three keys costs one
 /// value rather than three and never allocates the `Vec` that holds them. Almost every row loses.
 fn keep(
-    Where { keys, columns, chunk, row, arrival }: Where<'_>,
+    Where { keys, columns, chunk, row, arrival, ordinal }: Where<'_>,
     local: &mut Running,
     bound: usize,
 ) {
@@ -763,20 +821,23 @@ fn keep(
     // reads the morsels it is given in order and each of them from the start, so a row reaching
     // here arrived after everything already held.
     let at = local.kept.partition_point(|candidate| {
-        compare(keys, &candidate.key, &key, failure) != Ordering::Greater
+        ordered(keys, candidate.ordinal, ordinal)
+            .unwrap_or_else(|| compare(keys, &candidate.key, &key, failure))
+            != Ordering::Greater
     });
-    local.kept.insert(at, Candidate { key, values, arrival });
+    local.kept.insert(at, Candidate { key, values, arrival, ordinal });
     local.kept.truncate(bound);
     local.moved = true;
 }
 
-/// One row being offered to the candidates, which is five things that only travel together.
+/// One row being offered to the candidates, which is six things that only travel together.
 struct Where<'a> {
     keys: &'a [SortKey],
     columns: &'a [Vector],
     chunk: &'a Chunk,
     row: usize,
     arrival: crate::sort::Arrival,
+    ordinal: Option<i128>,
 }
 
 /// Where one row of the key columns sits against a key already held.

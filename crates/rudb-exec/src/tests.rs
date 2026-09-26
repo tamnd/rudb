@@ -378,6 +378,31 @@ fn a_top_n_is_a_sort_with_a_limit_over_it() {
     assert_eq!(run(&format!("TopN 2 offset 1 {keys}\n  {SCAN}")), skipped);
 }
 
+/// A key that is one integer column is compared as the integer, and that has to leave every order
+/// the sort gives alone: both directions, both null placements, ties, and both the path that keeps
+/// its candidates in order and the one past an offset that keeps them in a heap.
+#[test]
+fn a_top_n_on_one_integer_key_answers_what_the_sort_does() {
+    let rows: Vec<String> = (0..80)
+        .map(|at| match at % 7 {
+            0 => format!("[NULL::BIGINT, {at}::INTEGER]"),
+            _ => format!("[{}::BIGINT, {at}::INTEGER]", (at * 37) % 23 - 11),
+        })
+        .collect();
+    let values = format!("Values #0 [k::BIGINT, at::INTEGER] rows=[{}]", rows.join(", "));
+    for direction in ["ASC", "DESC"] {
+        for nulls in ["NULLS FIRST", "NULLS LAST"] {
+            let keys = format!("[#0.0::BIGINT {direction} {nulls}]");
+            for (count, offset) in [(5, 0), (3, 70), (10, 60)] {
+                let sorted =
+                    run(&format!("Limit {count} offset {offset}\n  Sort {keys}\n    {values}"));
+                let top = run(&format!("TopN {count} offset {offset} {keys}\n  {values}"));
+                assert_eq!(top, sorted, "{keys} limit {count} offset {offset}");
+            }
+        }
+    }
+}
+
 /// The rows that are skipped have to be found before there is anything to skip them from, so the
 /// offset is part of what the operator holds rather than something left above it.
 #[test]
