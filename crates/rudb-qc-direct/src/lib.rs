@@ -4,7 +4,8 @@
 //! It is the tier that has to make the first morsel fast, so it does in two linear passes what
 //! `clif` does in a pipeline of them. The analysis pass in [`analysis`] finds the loops, lays out
 //! the blocks and computes liveness as intervals over that layout. The code generation pass then
-//! selects instructions, allocates registers and encodes in one walk over the blocks.
+//! selects instructions, allocates registers and encodes in one walk over the blocks, writing
+//! through the encoder in [`asm`].
 //!
 //! Like `clif`, the output is bytes and relocations and nothing else. The code arena and the
 //! runtime entries are in `rudb-qc-rt` above this crate, and compiling is a pure function of the
@@ -13,3 +14,4 @@
 #![forbid(unsafe_code)]
 
 pub mod analysis;
+pub mod asm;
