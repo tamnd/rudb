@@ -1572,9 +1572,9 @@ impl<'a> Aggregate<'a> {
             calls.iter().map(|call| Accumulator::new(&call.name, &call.returns).ok()).collect();
         let out = Buffered::new();
         let partition_from = if keys.iter().all(|&key| fixed_width(plan.expr_type(key))) {
-            FIXED_PARTITION_FROM
+            std::env::var("RUDB_FPF").ok().and_then(|v| v.parse().ok()).unwrap_or(FIXED_PARTITION_FROM)
         } else {
-            PARTITION_FROM
+            std::env::var("RUDB_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(PARTITION_FROM)
         };
         let aggregate = Self {
             plan,
