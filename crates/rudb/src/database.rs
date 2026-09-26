@@ -5105,6 +5105,17 @@ mod tests {
                 operator.detail.as_deref() == Some("covering grouped distinct")
             })
         );
+        // With the stored answers off the projection is a precomputed answer like any other, so
+        // the same query reads the rows and gives the same groups.
+        database.execute("SET stored_answers = false").unwrap();
+        let read = database.query(plain).unwrap();
+        assert_eq!(read.rows().collect::<Vec<_>>(), result.rows().collect::<Vec<_>>());
+        assert!(
+            !read.metrics().unwrap().operators.iter().any(|operator| {
+                operator.detail.as_deref() == Some("covering grouped distinct")
+            })
+        );
+        database.execute("RESET stored_answers").unwrap();
         let filtered = database
             .query("SELECT zone, COUNT(DISTINCT person) FROM events WHERE zone > 0 GROUP BY zone ORDER BY zone")
             .unwrap();

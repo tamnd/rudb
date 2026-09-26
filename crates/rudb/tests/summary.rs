@@ -668,3 +668,47 @@ fn turning_the_stored_answers_off_reads_the_rows_and_answers_the_same() {
     pair.file.execute("RESET stored_answers").expect("the switch resets");
     assert!(pair.summarised("SELECT COUNT(*) FROM t"), "the reset left the switch off");
 }
+
+/// The operators that answer a grouped query out of something the writer kept rather than out of
+/// the rows. ClickBench counts every one of them as a precomputed answer, so the switch has to turn
+/// them all off, not just the summary of a whole table.
+const KEPT: [&str; 4] = [
+    "native value frequencies",
+    "native pair frequencies",
+    "native host groups",
+    "covering grouped distinct",
+];
+
+/// Whether any operator of this query read its groups out of something the writer kept.
+fn kept(db: &Database, query: &str) -> bool {
+    let result = db.query(query).expect("the query ran");
+    let metrics = result.metrics().expect("the query was measured");
+    metrics
+        .operators
+        .iter()
+        .any(|operator| operator.detail.as_deref().is_some_and(|detail| KEPT.contains(&detail)))
+}
+
+/// A top count over one key or two is what ClickBench's q16, q34 and q36 ask, and the file can
+/// answer it out of the value and pair frequencies the writer kept. With the switch off it has to
+/// read the rows instead and still give the same groups.
+#[test]
+fn turning_the_stored_answers_off_reads_the_rows_for_a_top_count() {
+    let pair = Pair::new(
+        "storedofftop",
+        "SELECT CASE WHEN i % 20 * 1000 < i - i % 1000 THEN 'h' || CAST(i % 20 AS VARCHAR) \
+         ELSE 'c' || CAST(i AS VARCHAR) END AS s, i % 3 AS k FROM range(20000) r(i)",
+    );
+    let queries = [
+        "SELECT s, COUNT(*) AS c FROM t GROUP BY s ORDER BY c DESC LIMIT 5",
+        "SELECT s, k, COUNT(*) AS c FROM t GROUP BY s, k ORDER BY c DESC, s, k LIMIT 5",
+    ];
+    let before: Vec<_> = queries.iter().map(|query| pair.listing(query)).collect();
+    pair.file.execute("SET stored_answers = false").expect("the switch is a setting");
+    pair.memory.execute("SET stored_answers = false").expect("the switch is a setting");
+    for (query, wanted) in queries.iter().zip(&before) {
+        assert_eq!(&pair.listing(query), wanted, "{query} changed its answer");
+        assert!(!kept(&pair.file, query), "{query} read kept groups with the switch off");
+        assert!(scanned(&pair.file, query), "{query} did not scan the file with the switch off");
+    }
+}

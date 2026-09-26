@@ -23,6 +23,7 @@
 //! [`Rule::StoredAnswers`] is another switch with nothing under it.
 //! The native writer puts a row count, null counts, column bounds, stripe totals, exact distinct counts and value frequencies in the file, and a whole table `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` or `COUNT(DISTINCT)` can be read straight out of those.
 //! ClickBench does not allow that, because it is aggregation done at load time, so `stored_answers = off` makes the aggregate read the rows.
+//! The same goes for a grouped count answered out of the value frequencies, the pair frequencies or the host groups the writer keeps, and for a grouped distinct answered out of a run projection, so those are behind this switch too.
 //! Zone map pruning and the filters on the scan are indexes rather than answers and stay on either way.
 //!
 //! # Why these are not in `Settings::NAMES`
@@ -87,6 +88,7 @@ pub enum Rule {
     /// section: it is a rewrite that is right or wrong on the plan alone.
     Consistent,
     /// Answering a whole table aggregate out of what the table wrote down when it was loaded, which is its row count, its null counts, its column bounds, its stripe totals and its exact distinct counts and value frequencies.
+    /// Also a grouped count answered out of the stored value frequencies, pair frequencies or host groups, and a grouped distinct answered out of a run projection.
     /// Off means the aggregate reads the rows.
     /// A master of its own rather than a statistics rule, because turning it off is what a ClickBench run does and that run should not lose the statistics along with it.
     StoredAnswers,
