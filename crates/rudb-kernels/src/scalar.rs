@@ -60,6 +60,7 @@ use crate::cast;
 use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
+use crate::hash;
 use crate::histogram;
 use crate::lists;
 use crate::maps;
@@ -3232,6 +3233,10 @@ pub fn call_values(
     // The splits answer a null separator with the whole string, and refuse a null option string.
     if let Some(answer) = split::before_nulls(name, args) {
         return answer;
+    }
+    // `hash` hashes a null like any other value.
+    if name == "hash" {
+        return Ok(Value::UBigInt(hash::hash_all(args)));
     }
     if args.iter().any(Value::is_null) {
         return Ok(Value::Null);
