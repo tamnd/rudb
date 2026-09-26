@@ -293,11 +293,11 @@ fn usage() {
     println!("  compiled <file> [q..]  the forty three ClickBench queries under SET engine first");
     println!("                         and compiled over that Parquet file, rows compared, and");
     println!("                         the compiled engine's refusals grouped by reason.");
-    println!("                         --tier auto|interp|clif first picks the compiled engine's");
+    println!("                         --tier auto|interp|clif|direct picks the compiled engine's");
     println!("                         tier, and --suite <dir> <q> in place of the file runs the");
     println!("                         queries in q over the tables refusals would make from dir");
     println!("                         --tiers <seed> in place of --tier runs every query on");
-    println!("                         interp, on clif and on clif switching tiers at random");
+    println!("                         interp, on clif or direct and on that switching at random");
     println!("                         morsels, at threads 1, and wants the rows bit for bit");
     println!("                         --threads <n> sets threads first, and a compile column");
     println!("                         prints each query's codegen_ns with the median at the end");

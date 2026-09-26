@@ -705,6 +705,11 @@ impl Asm {
         self.inst(0, true, 0, &[0x0f, 0xa3], idx.0, Rm::M(m), 0);
     }
 
+    /// `bt r, idx`, at 16 bits or more: bit `idx` of `r` modulo the width, into the carry flag.
+    pub fn bt(&mut self, size: Size, r: Reg, idx: Reg) {
+        self.sized(size, &[], &[0x0f, 0xa3], idx.0, Rm::R(r.0), 0, 0);
+    }
+
     /// `bt r, n`.
     pub fn bt_imm(&mut self, size: Size, r: Reg, n: u8) {
         self.sized(size, &[], &[0x0f, 0xba], 4, Rm::R(r.0), 0, 1);
@@ -822,6 +827,16 @@ impl Asm {
     /// `movss` or `movsd` to memory.
     pub fn fstore(&mut self, p: Prec, m: Mem, s: Xmm) {
         self.inst(p.prefix(), false, 0, &[0x0f, 0x11], s.0, Rm::M(m), 0);
+    }
+
+    /// `movups d, [m]`: sixteen bytes, unaligned.
+    pub fn vload(&mut self, d: Xmm, m: Mem) {
+        self.inst(0, false, 0, &[0x0f, 0x10], d.0, Rm::M(m), 0);
+    }
+
+    /// `movups [m], s`: sixteen bytes, unaligned.
+    pub fn vstore(&mut self, m: Mem, s: Xmm) {
+        self.inst(0, false, 0, &[0x0f, 0x11], s.0, Rm::M(m), 0);
     }
 
     /// `movaps d, s`, a whole register copy.

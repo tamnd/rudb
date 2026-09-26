@@ -65,9 +65,9 @@ fn rows(chunks: &[Chunk]) -> Vec<Vec<Value>> {
 /// between the tiers at every morsel and at random ones.
 fn compiled(text: &str) -> Result<Vec<Vec<Value>>> {
     let mut runs = vec![Options { tier: Tier::Interp, switch: Switch::Off }];
-    if Tier::Clif.built() {
+    for tier in [Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()) {
         for switch in [Switch::Off, Switch::Every(1), Switch::Random(7)] {
-            runs.push(Options { tier: Tier::Clif, switch });
+            runs.push(Options { tier, switch });
         }
     }
     let mut answers: Vec<(Options, Result<Vec<Vec<Value>>>)> = Vec::new();
@@ -94,7 +94,7 @@ fn on(text: &str, options: Options) -> Result<Vec<Vec<Value>>> {
     let pool = Pool::default();
     let compiled = compile_with(&plan, &cancel, options).expect("the compiled engine takes it");
     let report = compiled.report();
-    if options.tier == Tier::Clif {
+    if options.tier != Tier::Interp {
         assert_eq!(report.native, report.functions, "{report}");
     }
     let memory = Memory::unlimited();
