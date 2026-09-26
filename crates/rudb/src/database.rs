@@ -14,6 +14,7 @@ use rudb_common::{
 };
 use rudb_io::{Filesystem, RealFilesystem};
 use rudb_metrics::{Document, LoadProfile, Report, Span, Stage};
+use rudb_native::LogAnchor;
 use rudb_native::graph::Edge;
 use rudb_parse::ast::{self, Ast};
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
@@ -22,6 +23,7 @@ use rudb_vector::{Chunk, Data, Form, Selection, Vector};
 
 use crate::config::Config;
 use crate::connection::{Connection, single};
+use crate::journal::Journal;
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
 use crate::settings::{COMPILED_ENGINE, Settings};
@@ -585,6 +587,9 @@ struct Inner {
     writer: Mutex<()>,
     /// The transaction a `BEGIN` opened, until a `COMMIT` or a `ROLLBACK` closes it.
     open: Mutex<Option<Open>>,
+    /// The log of the file, for a database that has one it may write. Taken after the catalog lock
+    /// by whatever holds both.
+    journal: Mutex<Option<Journal>>,
     /// Told when a load has let go of the catalog, so a test can run a query in the middle of one.
     #[cfg(test)]
     loading: Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -682,7 +687,8 @@ impl Drop for Inner {
             catalog.restore(open.before);
         }
         if let Some(path) = self.path.as_ref().filter(|_| self.writable) {
-            let _ = persist(path, catalog, &self.pages, DEFAULT_CATALOG);
+            let journal = self.journal.get_mut().unwrap_or_else(PoisonError::into_inner);
+            let _ = persist_main(path, catalog, &self.pages, journal, true);
         }
         // Every attached file gets the same write, which is what the pin does for one that was
         // never detached.
@@ -1228,6 +1234,7 @@ impl Database {
             catalog: RwLock::new(Catalog::new()),
             writer: Mutex::default(),
             open: Mutex::default(),
+            journal: Mutex::default(),
             #[cfg(test)]
             loading: Mutex::default(),
             path: None,
@@ -1362,6 +1369,8 @@ impl Database {
         let path = PathBuf::from(path);
         let mut catalog = Catalog::new();
         let pages = rudb_native::PagePool::new(page_budget(config.memory_limit()));
+        let writable = !config.read_only();
+        let mut anchor = None;
         if path.exists() {
             // The catalog directory names the tables and the loop below decodes each one's own
             // directory. That is one decode per table rather than one decode of everything, but it
@@ -1380,15 +1389,33 @@ impl Database {
             for view in &views {
                 catalog.create_native_view(view)?;
             }
+            anchor = native.log_anchor().cloned();
+        }
+        // What the log committed after the file's last checkpoint goes back into the tables, and
+        // a database that may write checkpoints it straight away, so the log it replayed can go.
+        let (journal, appends) = Journal::recover(&path, anchor.as_ref(), writable)?;
+        let replayed = !appends.is_empty();
+        for append in appends {
+            let name = QualifiedName {
+                catalog: DEFAULT_CATALOG.to_string(),
+                schema: append.schema.clone(),
+                table: append.table.clone(),
+            };
+            let chunk = append.chunk(catalog.table(&name)?.columns())?;
+            catalog.table_mut(&name)?.append_all(vec![chunk], 1)?;
+        }
+        let mut journal = writable.then_some(journal);
+        if replayed && writable {
+            persist_main(&path, &mut catalog, &pages, &mut journal, false)?;
         }
         let memory = Memory::new(config.memory_limit());
         let pool = runtime(&config);
-        let writable = !config.read_only();
         let settings = Settings::new(config);
         let inner = Inner {
             catalog: RwLock::new(catalog),
             writer: Mutex::default(),
             open: Mutex::default(),
+            journal: Mutex::new(journal),
             #[cfg(test)]
             loading: Mutex::default(),
             path: Some(path),
@@ -1437,7 +1464,9 @@ impl Database {
         let path = path.clone();
         let _writing = self.shared.writing();
         let mut catalog = self.shared.write();
-        persist(&path, &mut catalog, &self.shared.inner.pages, DEFAULT_CATALOG)?;
+        let mut journal = self.shared.journal();
+        persist_main(&path, &mut catalog, &self.shared.inner.pages, &mut journal, true)?;
+        drop(journal);
         for (name, path) in attached_files(&catalog) {
             persist(&path, &mut catalog, &self.shared.inner.pages, &name)?;
         }
@@ -1468,9 +1497,15 @@ impl Database {
     ///
     /// Public because a program that builds its own catalog rather than parsing SQL to build one is
     /// a real thing an embedded database gets used for.
+    ///
+    /// What the closure changed checkpoints when it returns, since there is no telling what it was.
+    /// A checkpoint that fails is tried again by the next commit.
     pub fn with_catalog_mut<T>(&self, write: impl FnOnce(&mut Catalog) -> T) -> T {
         let _writing = self.shared.writing();
-        write(&mut self.shared.write())
+        self.shared.unlogged();
+        let written = write(&mut self.shared.write());
+        let _ = self.shared.settle();
+        written
     }
 
     /// Defines a table.
@@ -1486,9 +1521,13 @@ impl Database {
     pub fn create_table(&self, name: &str, columns: Vec<Field>) -> Result<()> {
         let parts: Vec<&str> = name.split('.').collect();
         let _writing = self.shared.writing();
-        let mut catalog = self.shared.write();
-        let resolved = catalog.resolve_for_create(&parts)?;
-        catalog.create_table(resolved, columns)
+        self.shared.unlogged();
+        let created = {
+            let mut catalog = self.shared.write();
+            catalog.resolve_for_create(&parts).and_then(|name| catalog.create_table(name, columns))
+        };
+        let settled = self.shared.settle();
+        created.and(settled)
     }
 
     /// Drops a table.
@@ -1499,9 +1538,13 @@ impl Database {
     pub fn drop_table(&self, name: &str) -> Result<()> {
         let parts: Vec<&str> = name.split('.').collect();
         let _writing = self.shared.writing();
-        let mut catalog = self.shared.write();
-        let resolved = catalog.resolve(&parts)?;
-        catalog.drop_table(&resolved)
+        self.shared.unlogged();
+        let dropped = {
+            let mut catalog = self.shared.write();
+            catalog.resolve(&parts).and_then(|name| catalog.drop_table(&name))
+        };
+        let settled = self.shared.settle();
+        dropped.and(settled)
     }
 
     /// Appends rows to a table, each row left to right in the table's column order.
@@ -1516,8 +1559,15 @@ impl Database {
     /// If the name does not resolve, if a row is not as wide as the table, or if a value cannot be
     /// converted to its column's type.
     pub fn append(&self, name: &str, rows: &[Vec<Value>]) -> Result<()> {
-        let parts: Vec<&str> = name.split('.').collect();
         let _writing = self.shared.writing();
+        let appended = self.append_held(name, rows);
+        let settled = self.shared.settle();
+        appended.and(settled)
+    }
+
+    /// [`Database::append`] with the writer lock held, up to the commit.
+    fn append_held(&self, name: &str, rows: &[Vec<Value>]) -> Result<()> {
+        let parts: Vec<&str> = name.split('.').collect();
         let mut catalog = self.shared.write();
         let resolved = catalog.resolve(&parts)?;
         let table = catalog.table_mut(&resolved)?;
@@ -1530,7 +1580,9 @@ impl Database {
             .iter()
             .all(|row| row.len() == types.len() && row.iter().zip(&types).all(|(v, t)| fits(v, t)))
         {
-            return table.append_rows(rows);
+            table.append_rows(rows)?;
+            self.shared.stage_rows(&resolved, table.columns(), rows);
+            return Ok(());
         }
         let mut converted = Vec::with_capacity(rows.len());
         for (index, row) in rows.iter().enumerate() {
@@ -1548,7 +1600,9 @@ impl Database {
                 .collect::<Result<Vec<Value>>>()?;
             converted.push(row);
         }
-        table.append_rows(&converted)
+        table.append_rows(&converted)?;
+        self.shared.stage_rows(&resolved, table.columns(), &converted);
+        Ok(())
     }
 
     /// How many rows a table holds.
@@ -1685,6 +1739,41 @@ fn persist(
     pages: &rudb_native::PagePool,
     database: &str,
 ) -> Result<()> {
+    persist_anchored(path, catalog, pages, database, None)
+}
+
+/// A checkpoint of the default database, which writes the log's anchor into the file and then
+/// recycles the segments that made redundant, or with `closing` the whole log.
+///
+/// The anchor is written whatever else the checkpoint finds to do, because a checkpoint that
+/// found the tables clean still moves the cut, and a log it recycled without the file saying so
+/// would be replayed from an older cut the next time the file is opened. That costs a new catalog
+/// on a checkpoint that would otherwise have written nothing, and only when the log has moved
+/// since the last one.
+fn persist_main(
+    path: &Path,
+    catalog: &mut Catalog,
+    pages: &rudb_native::PagePool,
+    journal: &mut Option<Journal>,
+    closing: bool,
+) -> Result<()> {
+    let Some(journal) = journal.as_mut() else {
+        return persist(path, catalog, pages, DEFAULT_CATALOG);
+    };
+    let anchor = journal.anchor();
+    persist_anchored(path, catalog, pages, DEFAULT_CATALOG, Some(&anchor))?;
+    if closing { journal.close() } else { journal.checkpointed() }
+}
+
+/// [`persist`], writing `anchor` into the file when there is one, and carrying the file's own
+/// forward when there is not.
+fn persist_anchored(
+    path: &Path,
+    catalog: &mut Catalog,
+    pages: &rudb_native::PagePool,
+    database: &str,
+    anchor: Option<&LogAnchor>,
+) -> Result<()> {
     let names =
         catalog.stored_tables_in(database).map(|table| table.name().clone()).collect::<Vec<_>>();
     let views = views(catalog, database);
@@ -1704,10 +1793,11 @@ fn persist(
     // Comparing that too would make a plain `SELECT` from a view leave the file looking out of date,
     // and the next checkpoint would write the whole database again to store a list that answers the
     // same questions it already answered.
+    let anchored = |held: &Held| anchor.is_none_or(|anchor| held.anchor.as_ref() == Some(anchor));
     if clean
-        && held
-            .as_ref()
-            .is_some_and(|held| held.tables == wanted(&names) && same_views(&held.views, &views))
+        && held.as_ref().is_some_and(|held| {
+            held.tables == wanted(&names) && same_views(&held.views, &views) && anchored(held)
+        })
     {
         return Ok(());
     }
@@ -1717,16 +1807,16 @@ fn persist(
     // rewrite below it, written as an empty file and renamed over whatever was there.
     if names.is_empty() {
         let temporary = scratch(path)?;
-        rudb_native::Writer::empty(&temporary, &views, None)?;
+        rudb_native::Writer::empty(&temporary, &views, anchor)?;
         return rename(&temporary, path);
     }
     // Only the views moved, so nothing has to be written again. Everything the file holds is still
     // the right bytes in the right place and the commit is a new catalog naming the same pages.
     if clean && held.is_some_and(|held| held.tables == wanted(&names)) {
-        rudb_native::Writer::restate(path, &views, None)?;
+        rudb_native::Writer::restate(path, &views, anchor)?;
         return rebind(path, catalog, &names, pages);
     }
-    if appended(path, catalog, &names, &views)? {
+    if appended(path, catalog, &names, &views, anchor)? {
         return rebind(path, catalog, &names, pages);
     }
     let temporary = scratch(path)?;
@@ -1751,7 +1841,10 @@ fn persist(
         }
         writer = Some(open);
     }
-    let writer = writer.ok_or_else(|| Error::internal("a catalog with tables wrote none"))?;
+    let mut writer = writer.ok_or_else(|| Error::internal("a catalog with tables wrote none"))?;
+    if let Some(anchor) = anchor {
+        writer = writer.with_log_anchor(anchor.clone());
+    }
     writer.with_views(views).finish()?;
     rename(&temporary, path)?;
     rebind(path, catalog, &names, pages)
@@ -1811,6 +1904,7 @@ fn committed(path: &Path) -> Result<Option<Held>> {
     Ok(Some(Held {
         tables: held.names().map(str::to_string).collect(),
         views: held.views().cloned().collect(),
+        anchor: held.log_anchor().cloned(),
     }))
 }
 
@@ -1820,6 +1914,8 @@ struct Held {
     tables: BTreeSet<String>,
     /// Its views, whole, since a view is entirely in the catalog level.
     views: Vec<rudb_native::ViewEntry>,
+    /// How much of the log it holds.
+    anchor: Option<LogAnchor>,
 }
 
 /// The tables with the row count the committed catalog records for each of them.
@@ -2287,6 +2383,7 @@ fn appended(
     catalog: &mut Catalog,
     names: &[QualifiedName],
     views: &[rudb_native::ViewEntry],
+    anchor: Option<&LogAnchor>,
 ) -> Result<bool> {
     let Some(held) = held_rows(path)? else { return Ok(false) };
     if held.is_empty() {
@@ -2334,7 +2431,10 @@ fn appended(
         }
         writer = Some(open);
     }
-    let Some(writer) = writer else { return Ok(false) };
+    let Some(mut writer) = writer else { return Ok(false) };
+    if let Some(anchor) = anchor {
+        writer = writer.with_log_anchor(anchor.clone());
+    }
     // Told rather than carried forward, because the caller's list is the catalog's and the writer's
     // is whatever the committed generation had. A view that was dropped since then is only missing
     // from the first of those.
@@ -2892,6 +2992,64 @@ impl Shared {
         self.inner.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn journal(&self) -> MutexGuard<'_, Option<Journal>> {
+        self.inner.journal.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stages rows [`Database::append`] put into `name`, whose columns are `fields`.
+    fn stage_rows(&self, name: &QualifiedName, fields: &[Field], rows: &[Vec<Value>]) {
+        let mut journal = self.journal();
+        let Some(journal) = journal.as_mut() else { return };
+        if !name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) {
+            return;
+        }
+        let columns = fields
+            .iter()
+            .enumerate()
+            .map(|(at, field)| {
+                let values = rows.iter().map(|row| row[at].clone()).collect::<Vec<_>>();
+                Vector::from_values(field.ty.clone(), &values)
+            })
+            .collect::<Result<Vec<_>>>();
+        let payload = columns.and_then(Chunk::new).ok().and_then(|chunk| {
+            journal.encode(&name.schema, &name.table, fields, std::slice::from_ref(&chunk))
+        });
+        journal.stage(payload);
+    }
+
+    /// Marks the commit of what is being written to checkpoint rather than log.
+    fn unlogged(&self) {
+        if let Some(journal) = self.journal().as_mut() {
+            journal.dirty();
+        }
+    }
+
+    /// Makes what the statement that just ran committed durable, which outside a transaction is
+    /// every statement and inside one is the `COMMIT`.
+    ///
+    /// Appends the log can carry go to it as one block. Anything else checkpoints the default
+    /// database, which writes what changed into the file along with the new cut. A statement that
+    /// failed comes here too, because what it did before it failed is not undone.
+    ///
+    /// Called with the writer lock held, so nothing commits between the statement and this.
+    fn settle(&self) -> Result<()> {
+        if self.transacting() {
+            return Ok(());
+        }
+        let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable) else {
+            return Ok(());
+        };
+        let mut catalog = self.write();
+        let mut journal = self.journal();
+        let Some(held) = journal.as_mut() else { return Ok(()) };
+        // A block the lane refused is followed by the checkpoint, which makes the same rows
+        // durable the slow way.
+        if !held.needs_checkpoint() && held.commit().is_ok() {
+            return Ok(());
+        }
+        persist_main(path, &mut catalog, &self.inner.pages, &mut journal, false)
+    }
+
     /// `BEGIN`, `COMMIT` or `ROLLBACK`, with the pin's refusals for the ones that do not fit.
     fn transaction(&self, kind: ast::Transaction, catalog: &mut Catalog) -> Result<QueryResult> {
         let mut open = self.open();
@@ -2910,6 +3068,9 @@ impl Shared {
                 };
                 if closed.aborted {
                     catalog.restore(closed.before);
+                    if let Some(journal) = self.journal().as_mut() {
+                        journal.discard();
+                    }
                 }
             }
             ast::Transaction::Rollback => {
@@ -2917,6 +3078,9 @@ impl Shared {
                     return Err(Error::transaction("cannot rollback - no transaction is active"));
                 };
                 catalog.restore(closed.before);
+                if let Some(journal) = self.journal().as_mut() {
+                    journal.discard();
+                }
             }
         }
         Ok(QueryResult::empty())
@@ -3410,9 +3574,13 @@ impl Shared {
         parse_ns: u64,
     ) -> Result<QueryResult> {
         let _writing = self.writing();
-        kept(sql, parse_ns, |noted| {
+        let result = kept(sql, parse_ns, |noted| {
             self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
-        })
+        });
+        let settled = self.settle();
+        let result = result?;
+        settled?;
+        Ok(result)
     }
 
     /// [`Shared::execute_ast`], asking for mirrors the way [`Shared::query_mirrored`] does.
@@ -3476,6 +3644,13 @@ impl Shared {
                 "Cannot write to database \"\"{}\"\" - transaction is launched in read-only mode",
                 catalog.default_catalog()
             )));
+        }
+        // Only a plain append has a log record, and it stages its rows once they are in. Every
+        // other change checkpoints when it commits.
+        let logged = matches!(&bound, Bound::Insert(insert)
+            if insert.write == Write::Append && insert.conflict.is_none());
+        if writes && !logged {
+            self.unlogged();
         }
         match bound {
             Bound::Query(mut plan) => {
@@ -3549,7 +3724,13 @@ impl Shared {
                     return Ok(QueryResult::empty());
                 }
                 if let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable) {
-                    persist(path, &mut catalog, &self.inner.pages, DEFAULT_CATALOG)?;
+                    persist_main(
+                        path,
+                        &mut catalog,
+                        &self.inner.pages,
+                        &mut self.journal(),
+                        false,
+                    )?;
                     index(path, &mut catalog, &self.inner.settings.links(), &self.inner.pages)?;
                     sketch(path, &mut catalog, &self.inner.pages)?;
                 }
@@ -3834,6 +4015,10 @@ impl Shared {
                         let reader = rudb_native::Catalog::open(path)?.table(&table)?;
                         let added = reader.table().rows();
                         catalog.table_mut(&insert.name)?.commit_native(reader)?;
+                        // The rows are in the file already. What is left is a file the sink may
+                        // have written without an anchor, which the checkpoint puts back, and
+                        // which costs a new catalog and nothing else.
+                        self.unlogged();
                         return QueryResult::changed(added);
                     }
                 }
@@ -3860,7 +4045,21 @@ impl Shared {
                         foreign::missing(&catalog, &insert.name, &chunks)?;
                         let added = chunks.iter().map(Chunk::len).sum();
                         let written = if wanted { chunks.clone() } else { Vec::new() };
-                        catalog.table_mut(&insert.name)?.append_all(chunks, workers)?;
+                        let name = &insert.name;
+                        let fields = catalog.table(name)?.columns();
+                        let staged = self
+                            .journal()
+                            .as_ref()
+                            .filter(|_| name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG))
+                            .map(|journal| {
+                                journal.encode(&name.schema, &name.table, fields, &chunks)
+                            });
+                        catalog.table_mut(name)?.append_all(chunks, workers)?;
+                        if let Some(payload) = staged
+                            && let Some(journal) = self.journal().as_mut()
+                        {
+                            journal.stage(payload);
+                        }
                         (added, written)
                     }
                     Write::Update | Write::Delete => {

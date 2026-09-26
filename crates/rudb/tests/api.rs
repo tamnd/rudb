@@ -368,11 +368,14 @@ fn a_database_on_a_file_is_written_when_the_last_handle_goes_away() {
     let connection = database.connect();
     drop(database);
     connection.execute("INSERT INTO t VALUES (7), (5)").expect("inserts");
-    assert!(!path.exists(), "nothing is on the disk yet, because nobody said CHECKPOINT");
     drop(connection);
-    assert!(!path.exists(), "a handle going away while others are open writes nothing");
     drop(second);
-    assert!(path.exists(), "the last handle going away is what writes the file");
+    // The file is there from the first `CREATE TABLE` on, which commits by writing it, and the rows
+    // are in the log until the last handle going away checkpoints them and removes it.
+    assert!(path.exists(), "the file is written");
+    let mut wal = path.as_os_str().to_owned();
+    wal.push(".wal");
+    assert!(!std::path::Path::new(&wal).exists(), "the last handle checkpointed the log away");
 
     let reopened = Database::open(&name).expect("the native database reopens");
     assert_eq!(
@@ -393,7 +396,6 @@ fn close_writes_the_file_and_says_whether_it_worked() {
     database.execute("CREATE TABLE t (x INTEGER)").expect("creates");
     database.execute("CREATE TABLE u (y INTEGER)").expect("creates the second");
     database.execute("INSERT INTO t VALUES (3)").expect("inserts");
-    assert!(!path.exists(), "nothing is on the disk until the close below");
     database.close().expect("the file is written and nothing went wrong");
     assert!(path.exists(), "the file is there as soon as close returns");
 

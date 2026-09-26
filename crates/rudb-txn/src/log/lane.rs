@@ -377,6 +377,14 @@ impl Lane {
         self.lock().durable
     }
 
+    /// Where the next block goes: the sequence of its segment and its offset there, which is where
+    /// a replay that wants nothing written so far would start.
+    #[must_use]
+    pub fn position(&self) -> (u64, u64) {
+        let state = self.lock();
+        (state.tail_sequence, state.tail_offset)
+    }
+
     /// What the lane has done since it was opened.
     #[must_use]
     pub fn stats(&self) -> Stats {
