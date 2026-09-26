@@ -993,7 +993,11 @@ fn check_text(
 
 /// The `CHECK` constraints of a table as the query a write runs over the rows it wrote, or `None`
 /// for a table with none.
-fn bind_checks(
+///
+/// # Errors
+///
+/// If the name does not resolve to a table or a constraint no longer binds against it.
+pub fn bind_checks(
     catalog: &Catalog,
     parameters: &Parameters,
     session: &Session,

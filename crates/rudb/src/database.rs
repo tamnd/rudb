@@ -1605,6 +1605,32 @@ impl Database {
         Ok(())
     }
 
+    /// An [`Appender`](crate::Appender) on a table, which takes rows a value at a time and
+    /// writes them at [`flush`](crate::Appender::flush) and [`close`](crate::Appender::close).
+    ///
+    /// # Errors
+    ///
+    /// If the name does not resolve to a table.
+    pub fn appender(&self, name: &str) -> Result<crate::Appender> {
+        let parts: Vec<&str> = name.split('.').collect();
+        let catalog = self.shared.read();
+        let resolved = catalog.resolve(&parts)?;
+        let table = catalog.table(&resolved)?;
+        let fields = table.columns().to_vec();
+        let defaults = (0..fields.len()).map(|at| table.default(at).map(str::to_owned)).collect();
+        drop(catalog);
+        Ok(crate::Appender::new(self.clone(), resolved, fields, defaults))
+    }
+
+    /// Writes chunks an [`Appender`](crate::Appender) built, the way an `INSERT` of the same rows
+    /// would: `CHECK`, `NOT NULL`, keys and foreign keys, then the log, then the commit.
+    pub(crate) fn append_chunks(&self, name: &QualifiedName, chunks: Vec<Chunk>) -> Result<()> {
+        let _writing = self.shared.writing();
+        let appended = self.shared.append_chunks(name, chunks);
+        let settled = self.shared.settle();
+        appended.and(settled)
+    }
+
     /// How many rows a table holds.
     ///
     /// # Errors
@@ -4133,6 +4159,44 @@ impl Shared {
 }
 
 impl Shared {
+    /// [`Database::append_chunks`] with the writer lock held, up to the commit.
+    fn append_chunks(&self, name: &QualifiedName, chunks: Vec<Chunk>) -> Result<()> {
+        if chunks.iter().all(Chunk::is_empty) {
+            return Ok(());
+        }
+        let mut catalog = self.write();
+        if let Some(held) = catalog.attached(&name.catalog).filter(|held| held.read_only()) {
+            return Err(Error::invalid_input(format!(
+                "Cannot execute statement of type \"INSERT\" on database \"{}\" which is \
+                 attached in read-only mode!",
+                held.name()
+            )));
+        }
+        let session = self.session();
+        if let Some(mut checks) =
+            rudb_bind::bind_checks(&catalog, &Parameters::default(), &session, name)?
+        {
+            let seams = self.inner.settings.seams();
+            let place = (&Cancel::new(), &seams, &session);
+            self.check("", &mut catalog, place, name, &mut checks, &chunks)?;
+        }
+        foreign::missing(&catalog, name, &chunks)?;
+        let fields = catalog.table(name)?.columns();
+        let staged = self
+            .journal()
+            .as_ref()
+            .filter(|_| name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG))
+            .map(|journal| journal.encode(&name.schema, &name.table, fields, &chunks));
+        let workers = self.inner.pool.threads();
+        catalog.table_mut(name)?.append_all(chunks, workers)?;
+        if let Some(payload) = staged
+            && let Some(journal) = self.journal().as_mut()
+        {
+            journal.stage(payload);
+        }
+        Ok(())
+    }
+
     /// Refuses rows a write is about to keep when one of them fails a `CHECK` of the table, with
     /// the pin's message for the first constraint, in the order written, that a row fails.
     ///
