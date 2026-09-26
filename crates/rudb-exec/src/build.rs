@@ -92,6 +92,7 @@ use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
 use crate::settingnames::settingnames;
+use crate::siblings::{Children, Siblings, Walk};
 use crate::sideways::{self, Exact, Keyed, Sideways, Stored};
 use crate::sort::Sort;
 use crate::source::{
@@ -1006,6 +1007,109 @@ fn linked_parent<'a>(
     rudb_native::graph::holds_key_map(parent.rows().stored()?, column).then_some((parent, column))
 }
 
+/// The most children one parent may have for a join to walk to its siblings.
+///
+/// Every row of the chunk becomes a pair per sibling, so a parent with thousands of children turns
+/// one chunk into millions of pairs, which a hash join would have matched up without making. The
+/// bound is on the parent with the most, as the file measured it, because one of those in a chunk
+/// is enough.
+const MOST_SIBLINGS: u64 = 64;
+
+/// A semi or an anti join that can be answered by walking each row to its siblings, when it is one.
+///
+/// The other side has to be a scan of a stored child table under nothing but filters, and one of
+/// the equalities has to hold that table's linked column equal to a column of the rows the join
+/// keeps or drops. That link has to reach every child, since a child with no parent is one the
+/// walk cannot find, and the parent has to have a key map over the column the link was built
+/// against. The rest of the conditions have to be more than that one equality, because a join
+/// that is only the equality is a link join already and costs less. See `crate::siblings`.
+///
+/// `None` on anything else, including a catalog error, because the join it falls back to is the
+/// same hash join it always was.
+fn walk(
+    plan: &Plan,
+    catalog: &Catalog,
+    kind: JoinKind,
+    right: NodeRef,
+    conditions: Slice,
+) -> Option<Walk> {
+    if !matches!(kind, JoinKind::Semi | JoinKind::Anti) {
+        return None;
+    }
+    let conditions = plan.expr_list(conditions);
+    if conditions.iter().all(|&condition| equated(plan, condition).is_some()) {
+        return None;
+    }
+    let mut tests = Vec::new();
+    let mut node = right;
+    while let Node::Filter { input, predicate } = *plan.node(node) {
+        tests.push(predicate);
+        node = input;
+    }
+    let (table, index, columns) = whole_table(plan, catalog, node).ok()??;
+    let rows = table.rows().stored()?;
+    // The equality the walk follows, which the siblings hold by construction and so is not tested.
+    let (at, key, child_column) = conditions.iter().enumerate().find_map(|(at, &condition)| {
+        let [first, second] = equated(plan, condition)?;
+        let (child, other) = match (first.table == index, second.table == index) {
+            (true, false) => (first, second),
+            (false, true) => (second, first),
+            _ => return None,
+        };
+        Some((at, other, stored_column(plan, table, index, columns, child)?))
+    })?;
+    let (parent, parent_column) = linked_parent(catalog, table, child_column)?;
+    let parent_rows = parent.rows().stored()?;
+    let edge = rudb_native::graph::Edge {
+        child: table.name().table.clone(),
+        child_column,
+        parent: parent.name().table.clone(),
+        parent_column,
+    };
+    let link = rudb_native::graph::shared_link(rows, parent_rows, &edge)?;
+    if link.linked() != link.children() {
+        return None;
+    }
+    let degrees = rudb_native::graph::stored_degrees(rows, child_column)?;
+    if degrees.highest() > MOST_SIBLINGS {
+        return None;
+    }
+    let children = if link.form() == rudb_graph::link::Form::Monotone {
+        Children::Runs(link)
+    } else {
+        Children::Listed(rudb_native::graph::shared_adjacency(rows, parent_rows, &edge)?)
+    };
+    let keys = rudb_native::graph::shared_key_map(parent_rows, parent_column)?;
+    tests.extend(conditions.iter().enumerate().filter(|&(other, _)| other != at).map(|(_, &c)| c));
+    // The columns of the table the tests read, each once, in the order they are first read.
+    let fields = plan.field_list(columns);
+    let mut read: Vec<(u32, usize, Field)> = Vec::new();
+    let mut stored = true;
+    for &test in &tests {
+        plan.read_columns(test, &mut |_, binding| {
+            if binding.table != index || read.iter().any(|&(column, ..)| column == binding.column) {
+                return;
+            }
+            let found = stored_column(plan, table, index, columns, binding)
+                .zip(fields.get(binding.column as usize));
+            match found {
+                Some((at, field)) => read.push((binding.column, at, field.clone())),
+                None => stored = false,
+            }
+        });
+    }
+    stored.then(|| Walk {
+        kind,
+        keys,
+        children,
+        rows: table.rows().clone(),
+        index,
+        read,
+        key,
+        tests,
+    })
+}
+
 /// The stored column under `node` that `binding` reads, through anything that passes it along.
 ///
 /// A projection renames, so the binding becomes the column in its position, and an expression there
@@ -1890,6 +1994,20 @@ impl<'a> Building<'a, '_> {
         let Node::Join { left, right, kind, conditions, build } = *plan.node(reference) else {
             return Err(Error::internal("a join was built from a node that is not one"));
         };
+        // A semi or an anti join over a child table's siblings never reads the other side at all.
+        // The rows it keeps or drops stream through, and each walks to its siblings. See
+        // `crate::siblings`.
+        if self.session.rules().enabled(Rule::GraphReduction)
+            && let Some(found) = walk(plan, self.catalog, kind, right, conditions)
+        {
+            let below = self.node(left)?;
+            let operator =
+                Siblings::new(plan, found, &below.schema, self.seams, self.cancel.clone())?
+                    .in_session(self.session);
+            let schema = below.schema.clone();
+            let counters = self.watch(reference, id, pipeline, "Siblings", None);
+            return Ok(below.then(Arc::new(Watched::new(operator, counters)), schema));
+        }
         // One side runs first, because no row of the other one can be answered until every
         // row it might match has been seen. That is the dependency edge, and it is the same
         // one the hash join builds on. The driving side is a pipeline of its own rather than

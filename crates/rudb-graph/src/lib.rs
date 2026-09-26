@@ -45,7 +45,7 @@ pub use adjacency::Adjacency;
 pub use bits::BitVector;
 pub use degree::{BUCKETS, Degrees};
 pub use keymap::{DENSE_THRESHOLD, Form, KeyMap, Keys, Observed};
-pub use link::{Bounds, Counts, Link};
+pub use link::{Bounds, Counts, Cursor, Link};
 pub use rel::{Cardinality, Relationship, Side, parse_links};
 pub use rid::{NO_PARENT, PART_ROWS, Place, Places, Rid, STRIPE_PARTS};
 pub use rids::{Pushed, Rids, SPARSE_RATIO, STOP_AFTER};

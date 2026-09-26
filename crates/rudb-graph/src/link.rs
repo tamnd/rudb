@@ -147,6 +147,45 @@ pub struct Link {
     body: Body,
 }
 
+/// Where [`Link::backward_from`] last stopped.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Cursor {
+    at: Option<At>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct At {
+    parent: Rid,
+    /// The bit of the zero that ends this parent's run.
+    zero: usize,
+    from: Rid,
+    to: Rid,
+}
+
+impl Cursor {
+    /// How many parents on a cursor reads rather than selects. A run is a few bits for a parent of
+    /// a few children, so this is a few words at most.
+    const NEAR: Rid = 64;
+}
+
+/// The bit of the `k`th zero, counting from zero, at or after bit `start`. `None` past the end of
+/// the words, which a caller inside the vector's zero count never reaches.
+fn kth_zero(words: &[u64], start: usize, k: u64) -> Option<usize> {
+    let mut left = k;
+    let mut word = start / 64;
+    let mut zeros = !*words.get(word)? & (u64::MAX << (start % 64));
+    loop {
+        let here = u64::from(zeros.count_ones());
+        if left < here {
+            // Under sixty four, since it is under the count of one word.
+            return Some(word * 64 + crate::bits::nth_set(zeros, left as u32) as usize);
+        }
+        left -= here;
+        word += 1;
+        zeros = !*words.get(word)?;
+    }
+}
+
 impl Link {
     /// Builds a link from one parent `rid` per child, with [`NO_PARENT`] for the unmatched.
     ///
@@ -394,6 +433,54 @@ impl Link {
         let cum = |nth: Rid| -> Option<u64> { vector.select0(nth).map(|at| count(at) - nth) };
         let from = if parent == 0 { 0 } else { cum(parent - 1)? };
         Some(from..cum(parent)?)
+    }
+
+    /// [`Self::backward`] for a parent at or a little past the one `cursor` was left at, found by
+    /// reading on from there rather than by two selects.
+    ///
+    /// For a caller asking about parents in rising order, which is a child read in its own order
+    /// asking about its siblings. A select is a search each time, and on TPC-H q21 two of them per
+    /// line of `lineitem` were a tenth of the query, where the next parent asked about is a word or
+    /// two of bits further on. A parent behind the cursor or far past it is two selects as before,
+    /// and leaves the cursor there.
+    #[must_use]
+    pub fn backward_from(&self, parent: Rid, cursor: &mut Cursor) -> Option<std::ops::Range<Rid>> {
+        let Body::Monotone { vector } = &self.body else { return None };
+        if parent >= self.parents {
+            return None;
+        }
+        if let Some(at) = cursor.at
+            && at.parent == parent
+        {
+            return Some(at.from..at.to);
+        }
+        let near = cursor.at.filter(|at| at.parent < parent && parent - at.parent <= Cursor::NEAR);
+        let found = match near {
+            Some(at) => {
+                let words = vector.words();
+                // Every run ends in a zero, so the parents in between are that many zeros on, and
+                // the ones passed on the way are their children.
+                let start = at.zero + 1;
+                let between = parent - at.parent - 1;
+                let (first, from) = if between == 0 {
+                    (start, at.to)
+                } else {
+                    let before = kth_zero(words, start, between - 1)?;
+                    (before + 1, at.to + count(before - start) - (between - 1))
+                };
+                let zero = kth_zero(words, first, 0)?;
+                At { parent, zero, from, to: from + count(zero - first) }
+            }
+            None => {
+                let zero = vector.select0(parent)?;
+                let to = count(zero) - parent;
+                let from =
+                    if parent == 0 { 0 } else { count(vector.select0(parent - 1)?) - (parent - 1) };
+                At { parent, zero, from, to }
+            }
+        };
+        cursor.at = Some(found);
+        Some(found.from..found.to)
     }
 
     /// The minimum and maximum parent `rid` over one part of the child table, for section 5.5.
@@ -672,6 +759,27 @@ fn malformed(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cursor_finds_the_same_children_as_a_select() {
+        // Parents of zero to nine children, some childless, over several words of runs.
+        let mut parents_of = Vec::new();
+        for parent in 0..3_000_u64 {
+            for _ in 0..(parent * 7 + parent / 13) % 10 {
+                parents_of.push(parent);
+            }
+        }
+        let link = Link::build(&parents_of, 3_000).expect("build");
+        assert_eq!(link.form(), Form::Monotone);
+        let mut asked: Vec<Rid> = (0..3_000).step_by(3).collect();
+        // Repeats, steps of one, a step back, a jump past what the cursor reads on over, the last.
+        asked.extend([2_000, 2_000, 2_001, 2_002, 5, 6, 2_900, 2_999, 0, 1_000, 1_064, 1_129]);
+        let mut cursor = Cursor::default();
+        for parent in asked {
+            assert_eq!(link.backward_from(parent, &mut cursor), link.backward(parent), "{parent}");
+        }
+        assert_eq!(link.backward_from(3_000, &mut cursor), None);
+    }
 
     /// Checks every child resolves to the parent it was built from, in the link and in a copy of it
     /// that went through the payload.
