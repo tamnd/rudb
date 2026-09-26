@@ -46,7 +46,7 @@ use rudb_common::bounds::{self, Bound, Op, scaled_as};
 use rudb_common::{Clustering, Error, Field, LogicalType, PhysicalType, Result, Value, Width};
 use rudb_encoding::sequence::Sequence;
 use rudb_encoding::{bitpack, chooser, integer, string};
-use rudb_io::{Filesystem, OpenMode, RealFilesystem};
+use rudb_io::{Filesystem, Mapped, OpenMode, RealFilesystem};
 use rudb_metrics::{LoadProfile, Stage};
 use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
@@ -4263,6 +4263,8 @@ type Synopsis = Arc<Vec<(Value, u64)>>;
 #[derive(Debug, Clone)]
 pub struct Reader {
     file: Arc<File>,
+    /// The file mapped, shared with the catalog. See [`Catalog`].
+    map: Option<Arc<Mapped>>,
     table: Arc<Table>,
     dictionaries: Arc<Vec<OnceLock<Arc<Vector>>>>,
     /// Held while a global dictionary is being opened, one per column.
@@ -4406,14 +4408,35 @@ struct CachedColumn {
 /// page is still checked every time, since those bytes come fresh off the file.
 #[derive(Debug)]
 struct HeldPage {
-    bytes: Vec<u8>,
+    bytes: PageBytes,
     checked: Vec<AtomicBool>,
 }
 
+/// Where a held page's bytes are: read into memory of its own, or a range of the mapped file.
+#[derive(Debug)]
+enum PageBytes {
+    Read(Vec<u8>),
+    Mapped { map: Arc<Mapped>, offset: u64, length: usize },
+}
+
+impl PageBytes {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Read(bytes) => bytes,
+            // The range was checked against the mapping when the page was taken.
+            Self::Mapped { map, offset, length } => map.get(*offset, *length).unwrap_or_default(),
+        }
+    }
+}
+
 impl HeldPage {
+    fn bytes(&self) -> &[u8] {
+        self.bytes.bytes()
+    }
+
     /// The bytes of part `part`, checked against `span` the first time anyone asks for them.
     fn part(&self, part: usize, span: PartSpan) -> Result<&[u8]> {
-        let bytes = part_bytes(&self.bytes, span)?;
+        let bytes = part_bytes(self.bytes(), span)?;
         let checked = self.checked.get(part).ok_or_else(|| invalid("part index out of range"))?;
         if !checked.load(Atomic::Relaxed) {
             verify_part(bytes, span)?;
@@ -5950,7 +5973,7 @@ fn remember(cached: &mut Cached, held: &CachedColumn) -> Option<(usize, Arc<Atom
     if slot.is_some() {
         return None;
     }
-    let bytes = page.bytes.len();
+    let bytes = page.bytes().len();
     // Set, so that the page a worker has just paid to read is not the one the pass it pays for
     // lets go of before the worker has read a part out of it.
     let used = Arc::new(AtomicBool::new(true));
@@ -5970,6 +5993,9 @@ fn remember(cached: &mut Cached, held: &CachedColumn) -> Option<(usize, Arc<Atom
 pub struct Catalog {
     file: Arc<File>,
     size: u64,
+    /// The file as it was at open, mapped, so a reader takes a page's bytes where the page cache
+    /// holds them instead of copying them out. `None` where the file cannot be mapped.
+    map: Option<Arc<Mapped>>,
     entries: Arc<Vec<Entry>>,
     /// The views the file holds, whole, since a view has no second level to read later.
     views: Arc<Vec<ViewEntry>>,
@@ -6020,10 +6046,12 @@ impl Catalog {
         let (file, size, _, bytes, opening) = slot_bytes(path)?;
         let (entries, views, card, anchor) = decode_catalog(&bytes, size)?;
         remember_card(path, card.as_ref());
+        let map = Mapped::open(&file, size).map(Arc::new);
         Ok(Self {
             anchor: anchor.map(Arc::new),
             file: Arc::new(file),
             size,
+            map,
             entries: Arc::new(entries),
             views: Arc::new(views),
             opening,
@@ -6097,6 +6125,7 @@ impl Catalog {
         opening.bytes += u64::from(entry.directory.length);
         Reader::build(
             Arc::clone(&self.file),
+            self.map.clone(),
             self.size,
             read_directory(Cursor::over(&self.file, offset, length), self.size, Some(offset))?,
             u64::from(entry.directory.length),
@@ -6397,6 +6426,7 @@ impl Reader {
     /// Builds a reader over one decoded table directory.
     fn build(
         file: Arc<File>,
+        map: Option<Arc<Mapped>>,
         size: u64,
         table: Table,
         directory: u64,
@@ -6425,6 +6455,7 @@ impl Reader {
             .collect();
         Ok(Self {
             file,
+            map,
             table: Arc::new(table),
             dictionaries: Arc::new(dictionaries),
             loading: Arc::new((0..table_fields).map(|_| Mutex::new(())).collect()),
@@ -7693,8 +7724,17 @@ impl Reader {
         let page = if whole {
             self.pages.fetch_add(1, Atomic::Relaxed);
             let span = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
-            let mut bytes = vec![0; span.length as usize];
-            read_at(&self.file, span.offset, &mut bytes)?;
+            let length = span.length as usize;
+            let bytes = match &self.map {
+                Some(map) if map.get(span.offset, length).is_some() => {
+                    PageBytes::Mapped { map: Arc::clone(map), offset: span.offset, length }
+                }
+                _ => {
+                    let mut bytes = vec![0; length];
+                    read_at(&self.file, span.offset, &mut bytes)?;
+                    PageBytes::Read(bytes)
+                }
+            };
             let checked = index.iter().map(|_| AtomicBool::new(false)).collect();
             Some(Arc::new(HeldPage { bytes, checked }))
         } else {
@@ -7731,7 +7771,7 @@ impl Reader {
             let owned;
             let bit = at * self.table.fields.len() + column;
             let bytes = match &held.page {
-                Some(held) if self.is_verified(bit) => part_bytes(&held.bytes, span),
+                Some(held) if self.is_verified(bit) => part_bytes(held.bytes(), span),
                 Some(held) => {
                     held.part(place.part as usize, span).inspect(|_| self.set_verified(bit))
                 }
@@ -7740,15 +7780,21 @@ impl Reader {
                         .offset
                         .checked_add(span.start as u64)
                         .ok_or_else(|| invalid("part range overflow"))?;
-                    let mut bytes = vec![0; span.length];
-                    read_at(&self.file, offset, &mut bytes)?;
-                    owned = bytes;
-                    if self.is_verified(bit) {
-                        Ok(owned.as_slice())
-                    } else {
-                        verify_part(&owned, span).map(|()| {
-                            self.set_verified(bit);
+                    let bytes = match self.map.as_deref().and_then(|map| map.get(offset, span.length)) {
+                        Some(bytes) => bytes,
+                        None => {
+                            let mut bytes = vec![0; span.length];
+                            read_at(&self.file, offset, &mut bytes)?;
+                            owned = bytes;
                             owned.as_slice()
+                        }
+                    };
+                    if self.is_verified(bit) {
+                        Ok(bytes)
+                    } else {
+                        verify_part(bytes, span).map(|()| {
+                            self.set_verified(bit);
+                            bytes
                         })
                     }
                 }
