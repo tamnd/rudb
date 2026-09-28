@@ -103,15 +103,8 @@ unsafe extern "C" fn rtcall(
     catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: native code passes the header's context word and a buffer of `n` arguments,
         // and `out` is a 16 byte slot of its frame.
-        let (c, args) = unsafe { (ctx(c), words(args, n)) };
-        match c.rt.rtcall(proxy, args) {
-            Ok(v) => {
-                // SAFETY: as above.
-                unsafe { out.write(v) };
-                0
-            }
-            Err(s) => s,
-        }
+        let (c, args, out) = unsafe { (ctx(c), words(args, n), &mut *out) };
+        c.rt.rtcall_into(proxy, args, out)
     }))
     .unwrap_or_else(|_| panicked())
 }

@@ -27,6 +27,20 @@ pub trait Runtime {
     /// The status to return when the call fails.
     fn rtcall(&mut self, proxy: u32, args: &[u128]) -> Result<u128, u64>;
 
+    /// [`rtcall`](Runtime::rtcall) with the value written to `out`, and the status returned, 0
+    /// when it worked. Native code calls this, and a runtime can write the value of a call made
+    /// once a row straight into the caller's slot, which spares reading it back from a `Result`
+    /// with a wider load than the stores that just wrote it.
+    fn rtcall_into(&mut self, proxy: u32, args: &[u128], out: &mut u128) -> u64 {
+        match self.rtcall(proxy, args) {
+            Ok(v) => {
+                *out = v;
+                0
+            }
+            Err(s) => s,
+        }
+    }
+
     /// Runs first engine kernel `kernel` over `n` elements of the buffers.
     ///
     /// # Errors
