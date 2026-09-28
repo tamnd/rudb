@@ -712,6 +712,17 @@ thread_local! {
 /// [`Source::read_reduced`].
 const SPARSE_READ: usize = 8;
 
+/// The rows in both `held` and `rows`, or `rows` when nothing was held before.
+///
+/// Sets over tables of different sizes would be a bug above, and the first alone is still every
+/// row that can survive.
+fn narrowed(held: Option<Rids>, rows: Rids) -> Rids {
+    match held {
+        None => rows,
+        Some(before) => before.intersect(&rows).unwrap_or(before),
+    }
+}
+
 /// Drops the rows of a chunk that the exact rows from a join above do not hold, for a scan with no
 /// filter to fold them into.
 ///
@@ -2024,13 +2035,20 @@ impl<'a> Scan<'a> {
         let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
         let sets = joins.filter_map(|sideways| sideways.rows(self.index).cloned());
         let mut held: Option<Rids> = None;
-        for rows in sets.chain(self.valued_rows()) {
-            // Sets over tables of different sizes would be a bug above, and the first alone is
-            // still every row that can survive.
-            held = Some(match held {
-                None => rows,
-                Some(before) => before.intersect(&rows).unwrap_or(before),
-            });
+        for rows in sets {
+            held = Some(narrowed(held, rows));
+        }
+        // Rows a join handed down that are already few enough to be read alone leave the value
+        // rows little to take away, and asking the dictionary and decoding the rows of its values
+        // cost more than that little. In 9a the joins leave 29 thousand rows of `cast_info` and
+        // the voice credits are two million.
+        let sparse = held
+            .as_ref()
+            .is_some_and(|rows| rows.len().saturating_mul(SPARSE_READ as u64) <= rows.rows());
+        if !sparse {
+            for rows in self.valued_rows() {
+                held = Some(narrowed(held, rows));
+            }
         }
         held
     }
