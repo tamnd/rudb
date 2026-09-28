@@ -358,20 +358,19 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// A Thrift compact writer, for tests.
+/// A Thrift compact writer, for the page headers and the footer the Parquet writer puts out.
 ///
-/// Writing one is cheaper than committing a fixture for every shape, and it is the only
-/// Thrift writer in the workspace, because rudb writes Parquet at 2m and not here. It sits
-/// here rather than inside `tests` because the page header tests need it too, and two
-/// encoders that have to agree is one more than the number worth having.
-#[cfg(test)]
+/// It started as a test helper, because writing one was cheaper than committing a fixture for
+/// every shape the reader has to read, and the writer in `write.rs` uses the same one so that the
+/// encoder the reader is tested against is the encoder that writes the files. A nested structure
+/// is a writer of its own, handed to [`Writer::nested`] or [`Writer::list_of_nested`] when it is
+/// done, which is what starts its field ids over.
 #[derive(Debug, Default)]
 pub(crate) struct Writer {
     bytes: Vec<u8>,
     last_id: i16,
 }
 
-#[cfg(test)]
 impl Writer {
     pub(crate) fn varint(&mut self, mut value: u64) {
         loop {
@@ -432,6 +431,44 @@ impl Writer {
         self.field(id, 12);
         self.bytes.extend_from_slice(&inner.bytes);
         self.bytes.push(0);
+    }
+
+    pub(crate) fn i32(&mut self, id: i16, value: i32) {
+        self.field(id, 5);
+        self.zigzag(i64::from(value));
+    }
+
+    pub(crate) fn binary(&mut self, id: i16, value: &[u8]) {
+        self.field(id, 8);
+        self.varint(value.len() as u64);
+        self.bytes.extend_from_slice(value);
+    }
+
+    /// A list header for `len` elements of the wire type `wire`.
+    fn list(&mut self, id: i16, wire: u8, len: usize) {
+        self.field(id, 9);
+        if len < 15 {
+            self.bytes.push(((len as u8) << 4) | wire);
+        } else {
+            self.bytes.push(0xf0 | wire);
+            self.varint(len as u64);
+        }
+    }
+
+    pub(crate) fn list_of_strings(&mut self, id: i16, values: &[&str]) {
+        self.list(id, 8, values.len());
+        for value in values {
+            self.varint(value.len() as u64);
+            self.bytes.extend_from_slice(value.as_bytes());
+        }
+    }
+
+    pub(crate) fn list_of_nested(&mut self, id: i16, values: Vec<Writer>) {
+        self.list(id, 12, values.len());
+        for value in values {
+            self.bytes.extend_from_slice(&value.bytes);
+            self.bytes.push(0);
+        }
     }
 
     pub(crate) fn stop(mut self) -> Vec<u8> {

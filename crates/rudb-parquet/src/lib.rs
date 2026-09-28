@@ -13,9 +13,8 @@
 //! [`Reader`] is the one a scan drives: it picks the columns, walks the row groups, and puts the
 //! columns side by side into chunks.
 //!
-//! Nothing here writes a file. The write path is M2m and it belongs next to a compressor, which
-//! `rudb-compress` does not have yet, because a compressor nothing writes with is a compressor
-//! nothing tests.
+//! [`Writer`] is the write path, which `COPY ... TO 'file.parquet'` drives: a flat schema, plain
+//! values and snappy pages, with the statistics the reader's pruning reads.
 //!
 //! # What a file has to be for this to read it
 //!
@@ -27,9 +26,9 @@
 //! being honest about what it has rather than this crate guessing.
 //!
 //! `PLAIN` or dictionary encoded values. The delta encodings and `BYTE_STREAM_SPLIT` are named in
-//! the error when a file uses one, and so are `INT96`, fixed length byte arrays, and byte arrays
-//! whose bytes are not text. See `spec/engine/05-scan.md` sections 5.3 to 5.6 and the checklist on
-//! the sub-milestone issue.
+//! the error when a file uses one, and so are `INT96`, fixed length byte arrays that are not
+//! decimals, and byte arrays whose bytes are not text. See `spec/engine/05-scan.md` sections 5.3
+//! to 5.6 and the checklist on the sub-milestone issue.
 
 #![forbid(unsafe_code)]
 
@@ -43,6 +42,7 @@ mod prune;
 mod reader;
 mod thrift;
 mod values;
+mod write;
 
 pub use chunk::{Page, Pages};
 pub use metadata::{
@@ -51,3 +51,4 @@ pub use metadata::{
 pub use page::{Body, DataV1, DataV2, Dictionary, Header};
 pub use prune::{Bound, Footer, Op, Test, skips};
 pub use reader::{Reader, read};
+pub use write::{Writer, storage};

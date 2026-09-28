@@ -3759,7 +3759,9 @@ impl Shared {
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 let result = run(sql, &copy.plan, &catalog, cancel, under)?;
                 let zone = session.session_time_zone();
-                let rows = if copy.json {
+                let rows = if copy.parquet {
+                    crate::export::write_parquet(&copy, &result)?
+                } else if copy.json {
                     crate::export::write_json(&copy, &result, zone)?
                 } else {
                     crate::export::write_csv(&copy, &result, zone)?

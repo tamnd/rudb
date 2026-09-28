@@ -112,6 +112,12 @@ pub struct CopyTo {
     pub json: bool,
     /// For JSON, whether the rows go in one array rather than one object a line.
     pub array: bool,
+    /// Whether the file is Parquet, in which case only the two options below apply.
+    pub parquet: bool,
+    /// For Parquet, the codec the pages are compressed with, in lower case.
+    pub compression: String,
+    /// For Parquet, how many rows go in a row group.
+    pub row_group_size: u64,
 }
 
 /// A bound `SET` or `RESET`.
@@ -576,8 +582,8 @@ fn bind_one(
 
 /// Reads the options of a `COPY ... TO` against the format they are for.
 ///
-/// CSV and JSON are written. A `.parquet` file, or Parquet named outright, is refused rather than
-/// written as CSV under a name that says otherwise. An option the pin takes and this does not is
+/// CSV, JSON and Parquet are written, the format picked by the file's extension unless `FORMAT`
+/// names one. An option the pin takes and this does not is
 /// refused by name, and one the pin does not take either gets the first line of its refusal.
 fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     let lowered = copy.path.to_ascii_lowercase();
@@ -595,9 +601,7 @@ fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     match format.as_str() {
         "csv" => {}
         "json" => return json_to(copy, plan),
-        "parquet" => {
-            return Err(Error::not_implemented("COPY TO with FORMAT parquet is not supported yet"));
-        }
+        "parquet" => return parquet_to(copy, plan),
         _ => {
             return Err(Error::catalog(format!(
                 "Copy Function with name {format} does not exist!"
@@ -616,6 +620,9 @@ fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         force_quote_all: false,
         json: false,
         array: false,
+        parquet: false,
+        compression: String::new(),
+        row_group_size: 0,
     };
     for (name, value) in &copy.options {
         let text = || {
@@ -712,6 +719,9 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         force_quote_all: false,
         json: true,
         array: false,
+        parquet: false,
+        compression: String::new(),
+        row_group_size: 0,
     };
     for (name, value) in &copy.options {
         match name.as_str() {
@@ -751,6 +761,90 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             _ => {
                 return Err(Error::binder(format!(
                     "Unknown option for COPY ... TO ... (FORMAT JSON): \"{name}\"."
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Reads the options of a `COPY ... TO` a Parquet file, which are the codec and the row group size.
+fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
+    let mut out = CopyTo {
+        plan,
+        path: copy.path.clone(),
+        header: false,
+        delimiter: String::new(),
+        quote: String::new(),
+        escape: String::new(),
+        null: String::new(),
+        force_quote: Vec::new(),
+        force_quote_all: false,
+        json: false,
+        array: false,
+        parquet: true,
+        compression: "snappy".to_string(),
+        row_group_size: 122_880,
+    };
+    for (name, value) in &copy.options {
+        let written = value.as_deref().unwrap_or_default().trim_matches('\'');
+        match name.as_str() {
+            "format" => {}
+            "compression" | "codec" => {
+                let codec = written.to_ascii_lowercase();
+                match codec.as_str() {
+                    "uncompressed" | "snappy" => out.compression = codec,
+                    "brotli" | "gzip" | "lz4" | "lz4_raw" | "zstd" => {
+                        return Err(Error::not_implemented(format!(
+                            "COPY TO a Parquet file with the {codec} codec is not supported yet"
+                        )));
+                    }
+                    _ => {
+                        return Err(Error::binder(
+                            "Expected \"compression\" argument to be any of [uncompressed, brotli, \
+                             gzip, snappy, lz4, lz4_raw or zstd]",
+                        ));
+                    }
+                }
+            }
+            "row_group_size" => {
+                out.row_group_size = written.parse().map_err(|_| {
+                    Error::invalid_input(format!(
+                        "Copy option \"row_group_size\" expected an argument of type UBIGINT - the \
+                         argument \"{written}\" of type VARCHAR could not be cast as this type"
+                    ))
+                })?;
+                out.row_group_size = out.row_group_size.max(1);
+            }
+            "row_group_size_bytes"
+            | "row_groups_per_file"
+            | "compression_level"
+            | "field_ids"
+            | "kv_metadata"
+            | "dictionary_size_limit"
+            | "string_dictionary_page_size_limit"
+            | "write_bloom_filter"
+            | "bloom_filter_false_positive_ratio"
+            | "parquet_version"
+            | "geoparquet_version"
+            | "per_thread_output"
+            | "file_size_bytes"
+            | "partition_by"
+            | "overwrite"
+            | "overwrite_or_ignore"
+            | "filename_pattern"
+            | "file_extension"
+            | "use_tmp_file"
+            | "return_files"
+            | "write_partition_columns"
+            | "preserve_order" => {
+                return Err(Error::not_implemented(format!(
+                    "COPY TO with the option {name} is not supported yet"
+                )));
+            }
+            _ => {
+                return Err(Error::not_implemented(format!(
+                    "Unrecognized option \"{name}\" for parquet"
                 )));
             }
         }
