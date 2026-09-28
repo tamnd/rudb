@@ -554,7 +554,10 @@ fn write_value<W: Write>(out: &mut W, value: &Value) -> fmt::Result {
         Value::Time(held)
         | Value::TimeTz(held)
         | Value::Timestamp(held)
-        | Value::TimestampTz(held) => write!(out, "{held}"),
+        | Value::TimestampTz(held)
+        | Value::TimestampS(held)
+        | Value::TimestampMs(held)
+        | Value::TimestampNs(held) => write!(out, "{held}"),
         Value::Interval { months, days, micros } => write!(out, "{{{months}, {days}, {micros}}}"),
         Value::List { values, .. } => {
             out.write_char('{')?;

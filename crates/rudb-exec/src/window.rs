@@ -1222,7 +1222,10 @@ fn placement(value: &Value) -> Option<f64> {
         Value::Time(held)
         | Value::TimeTz(held)
         | Value::Timestamp(held)
-        | Value::TimestampTz(held) => held as f64,
+        | Value::TimestampTz(held)
+        | Value::TimestampS(held)
+        | Value::TimestampMs(held)
+        | Value::TimestampNs(held) => held as f64,
         _ => return None,
     };
     number.is_finite().then_some(number)
@@ -1322,10 +1325,10 @@ fn seated(number: f64, returns: &LogicalType) -> Value {
         _ if !fits(i128::from(i64::MIN), i128::from(i64::MAX)) => Value::Null,
         LogicalType::Time => Value::Time(whole as i64),
         LogicalType::TimeTz => Value::TimeTz(whole as i64),
-        LogicalType::Timestamp
-        | LogicalType::TimestampS
-        | LogicalType::TimestampMs
-        | LogicalType::TimestampNs => Value::Timestamp(whole as i64),
+        LogicalType::Timestamp => Value::Timestamp(whole as i64),
+        LogicalType::TimestampS => Value::TimestampS(whole as i64),
+        LogicalType::TimestampMs => Value::TimestampMs(whole as i64),
+        LogicalType::TimestampNs => Value::TimestampNs(whole as i64),
         LogicalType::TimestampTz => Value::TimestampTz(whole as i64),
         // Every type the binder lets through is above, so this is the overflow arm for the ones
         // that named a range and missed it.

@@ -1495,10 +1495,27 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             // table with both overloads in it to refuse from, which this is not yet, so the answer
             // is the widest of the candidates rather than a message about a choice nobody made.
             let last = match arguments.last() {
-                Some(LogicalType::Null) | None => LogicalType::Timestamp,
+                // The second, millisecond and nanosecond timestamps have no overload of their own
+                // and upstream casts them to a plain timestamp, which is also what comes back.
+                Some(
+                    LogicalType::Null
+                    | LogicalType::TimestampS
+                    | LogicalType::TimestampMs
+                    | LogicalType::TimestampNs,
+                )
+                | None => LogicalType::Timestamp,
                 Some(ty) => ty.clone(),
             };
-            (leading(1, first, arguments), last)
+            let mut cast_to = leading(1, first, arguments);
+            if let Some(
+                slot @ (LogicalType::TimestampS
+                | LogicalType::TimestampMs
+                | LogicalType::TimestampNs),
+            ) = cast_to.last_mut()
+            {
+                *slot = LogicalType::Timestamp;
+            }
+            (cast_to, last)
         }
         Shape::Accumulated => {
             let common = promote_all(name, arguments)?;
@@ -1939,8 +1956,18 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
 fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
     use LogicalType::{
         BigInt, Date, Double, HugeInt, Integer, Interval, Null, SmallInt, Time, TimeTz, Timestamp,
-        TimestampTz, TinyInt, UBigInt, UHugeInt, USmallInt, UTinyInt,
+        TimestampMs, TimestampNs, TimestampS, TimestampTz, TinyInt, UBigInt, UHugeInt, USmallInt,
+        UTinyInt,
     };
+    // The second, millisecond and nanosecond timestamps have no arithmetic of their own. Upstream
+    // casts each of them to a plain timestamp and answers as it would for one, so `NS + INTERVAL`
+    // is a `TIMESTAMP` and `NS - NS` is an interval.
+    let precise = |ty: &LogicalType| matches!(ty, TimestampS | TimestampMs | TimestampNs);
+    if arguments.iter().any(precise) {
+        let plain: Vec<LogicalType> =
+            arguments.iter().map(|ty| if precise(ty) { Timestamp } else { ty.clone() }).collect();
+        return temporal(name, &plain);
+    }
     let kept = |returns| Some((arguments.to_vec(), returns));
     // A null literal has no type yet, so it counts as the number and the cast to a double is what
     // turns the whole call into a null.

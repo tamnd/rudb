@@ -421,6 +421,9 @@ mod tag {
     pub(super) const LIST: u8 = 23;
     pub(super) const STRUCT: u8 = 24;
     pub(super) const MAP: u8 = 25;
+    pub(super) const TIMESTAMP_S: u8 = 26;
+    pub(super) const TIMESTAMP_MS: u8 = 27;
+    pub(super) const TIMESTAMP_NS: u8 = 28;
 }
 
 /// Writes one value of a column of `ty`, or says it cannot.
@@ -517,6 +520,18 @@ fn put(out: &mut Vec<u8>, value: &Value, ty: &LogicalType) -> Option<()> {
                 fits(LogicalType::TimestampTz)?;
                 fixed(out, tag::TIMESTAMP_TZ, &held.to_le_bytes())
             };
+        }
+        Value::TimestampS(held) => {
+            fits(LogicalType::TimestampS)?;
+            fixed(out, tag::TIMESTAMP_S, &held.to_le_bytes());
+        }
+        Value::TimestampMs(held) => {
+            fits(LogicalType::TimestampMs)?;
+            fixed(out, tag::TIMESTAMP_MS, &held.to_le_bytes());
+        }
+        Value::TimestampNs(held) => {
+            fits(LogicalType::TimestampNs)?;
+            fixed(out, tag::TIMESTAMP_NS, &held.to_le_bytes());
         }
         Value::Interval { months, days, micros } => {
             fits(LogicalType::Interval)?;
@@ -616,6 +631,9 @@ fn get(bytes: &[u8], at: &mut usize, ty: &LogicalType) -> Result<Value> {
         tag::TIME_TZ => Value::TimeTz(i64::from_le_bytes(array(bytes, at)?)),
         tag::TIMESTAMP => Value::Timestamp(i64::from_le_bytes(array(bytes, at)?)),
         tag::TIMESTAMP_TZ => Value::TimestampTz(i64::from_le_bytes(array(bytes, at)?)),
+        tag::TIMESTAMP_S => Value::TimestampS(i64::from_le_bytes(array(bytes, at)?)),
+        tag::TIMESTAMP_MS => Value::TimestampMs(i64::from_le_bytes(array(bytes, at)?)),
+        tag::TIMESTAMP_NS => Value::TimestampNs(i64::from_le_bytes(array(bytes, at)?)),
         tag::INTERVAL => Value::Interval {
             months: i32::from_le_bytes(array(bytes, at)?),
             days: i32::from_le_bytes(array(bytes, at)?),

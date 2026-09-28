@@ -969,6 +969,9 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
         LogicalType::TimeTz => to_time_tz(value),
         LogicalType::Timestamp => to_timestamp(value),
         LogicalType::TimestampTz => to_timestamp_tz(value),
+        LogicalType::TimestampS | LogicalType::TimestampMs | LogicalType::TimestampNs => {
+            to_precise(value, target)
+        }
         LogicalType::Interval => to_interval(value),
         // An enum value is its string, so a string that is one of the list is already the answer
         // and anything else that is not a string has no cast here, as it has none in the pin.
@@ -1471,6 +1474,9 @@ fn hex(byte: u8) -> Option<u8> {
 }
 
 fn to_date(value: &Value) -> Result<Value> {
+    if let Some(micros) = coarse_micros(value, "DATE")? {
+        return to_date(&Value::Timestamp(micros));
+    }
     match value {
         Value::Timestamp(micros) | Value::TimestampTz(micros) => {
             i32::try_from(micros.div_euclid(MICROS_PER_DAY))
@@ -1494,6 +1500,9 @@ fn to_date(value: &Value) -> Result<Value> {
 /// optional, a date in front is read and thrown away, and whatever is after the numbers is
 /// ignored, so `'12:34:56 UTC'` and `'12:34:56abc'` are both twelve thirty four.
 fn to_time(value: &Value) -> Result<Value> {
+    if let Some(micros) = coarse_micros(value, "higher precision")? {
+        return to_time(&Value::Timestamp(micros));
+    }
     match value {
         Value::Timestamp(micros) | Value::TimestampTz(micros) | Value::TimeTz(micros) => {
             Ok(Value::Time(micros.rem_euclid(MICROS_PER_DAY)))
@@ -1523,6 +1532,9 @@ fn to_time_tz(value: &Value) -> Result<Value> {
 /// See [`to_time_tz`] for why this is the identity today. A date becomes midnight the way it does
 /// for `TIMESTAMP`, which is midnight UTC here and midnight in the session zone upstream.
 fn to_timestamp_tz(value: &Value) -> Result<Value> {
+    if let Some(micros) = coarse_micros(value, "higher precision")? {
+        return Ok(Value::TimestampTz(micros));
+    }
     match value {
         Value::Date(days) => Ok(Value::TimestampTz(i64::from(*days) * MICROS_PER_DAY)),
         Value::Timestamp(micros) => Ok(Value::TimestampTz(*micros)),
@@ -1542,6 +1554,9 @@ fn bad_time(text: &str) -> Error {
 }
 
 fn to_timestamp(value: &Value) -> Result<Value> {
+    if let Some(micros) = coarse_micros(value, "higher precision")? {
+        return Ok(Value::Timestamp(micros));
+    }
     match value {
         Value::Date(days) => Ok(Value::Timestamp(i64::from(*days) * MICROS_PER_DAY)),
         Value::TimestampTz(micros) => Ok(Value::Timestamp(*micros)),
@@ -1551,6 +1566,119 @@ fn to_timestamp(value: &Value) -> Result<Value> {
         },
         _ => Err(no_cast(value, &LogicalType::Timestamp)),
     }
+}
+
+/// The ticks in a second of each timestamp that is not counted in microseconds.
+fn ticks_per_second(ty: &LogicalType) -> Option<i64> {
+    match ty {
+        LogicalType::TimestampS => Some(1),
+        LogicalType::TimestampMs => Some(1_000),
+        LogicalType::TimestampNs => Some(1_000_000_000),
+        _ => None,
+    }
+}
+
+/// A count of ticks restated in another unit, the way the pin's `TryCastTimestampBase` does it.
+///
+/// The two infinities stay infinite. Going to a finer unit multiplies and can run out of room,
+/// which is `None`. Going to a coarser one cannot, and it rounds half away from the epoch, which is
+/// done in the pin's own steps: divide by half the factor, move one further from zero and halve.
+/// That is why a timestamp half a second before the epoch is the second before it and not the
+/// epoch itself.
+fn restamp(ticks: i64, from: i64, to: i64) -> Option<i64> {
+    if from == to || ticks == i64::MAX || ticks == -i64::MAX {
+        return Some(ticks);
+    }
+    if from < to {
+        return ticks.checked_mul(to / from);
+    }
+    let halved = ticks / (from / to / 2);
+    Some((if halved < 0 { halved - 1 } else { halved + 1 }) / 2)
+}
+
+/// The microseconds a precision timestamp stands for, `None` for any other value.
+///
+/// Going from nanoseconds rounds and cannot fail. Going from seconds or milliseconds can run out
+/// of room, and the pin names what it was converting to when it does, which is the `DATE` for a
+/// cast to one and `higher precision` for everything else.
+fn coarse_micros(value: &Value, into: &str) -> Result<Option<i64>> {
+    let (ticks, per_second) = match value {
+        Value::TimestampS(ticks) => (*ticks, 1),
+        Value::TimestampMs(ticks) => (*ticks, 1_000),
+        Value::TimestampNs(ticks) => (*ticks, 1_000_000_000),
+        _ => return Ok(None),
+    };
+    restamp(ticks, per_second, 1_000_000)
+        .map(Some)
+        .ok_or_else(|| Error::conversion(format!("Could not convert Timestamp to {into}.")))
+}
+
+/// A cast to `TIMESTAMP_S`, `TIMESTAMP_MS` or `TIMESTAMP_NS`.
+///
+/// Every source goes through microseconds except text going to nanoseconds, which keeps the three
+/// digits after the sixth and drops any after the ninth, as the pin does. Text going to the two
+/// coarse ones is read as a `TIMESTAMP` and rounded, so `'00:00:07.9'` is eight seconds. The pairs
+/// are the pin's and so are the gaps: nothing goes from nanoseconds to seconds, and a failed read
+/// of the text says `INT64` because the pin names the integer these are stored in.
+fn to_precise(value: &Value, target: &LogicalType) -> Result<Value> {
+    let Some(per_second) = ticks_per_second(target) else {
+        return Err(no_cast(value, target));
+    };
+    let wrap = |ticks: i64| match target {
+        LogicalType::TimestampS => Value::TimestampS(ticks),
+        LogicalType::TimestampMs => Value::TimestampMs(ticks),
+        _ => Value::TimestampNs(ticks),
+    };
+    let finer = || Error::conversion("Could not convert Timestamp to higher precision.");
+    let (ticks, from) = match value {
+        Value::Varchar(text) => {
+            let unread = || not_convertible(text, &LogicalType::BigInt);
+            let micros = parse_timestamp(text).map_err(|_| unread())?;
+            if per_second < 1_000_000 {
+                return Ok(wrap(restamp(micros, 1_000_000, per_second).ok_or_else(unread)?));
+            }
+            // A finite timestamp that lands on the top of the range reads as infinity, and the
+            // pin refuses that rather than answering with it.
+            let nanos = micros
+                .checked_mul(1_000)
+                .and_then(|nanos| nanos.checked_add(sub_micros(text)))
+                .filter(|nanos| *nanos != i64::MAX && *nanos != -i64::MAX)
+                .ok_or_else(unread)?;
+            return Ok(wrap(nanos));
+        }
+        Value::Date(days) => {
+            let micros = match *days {
+                i32::MAX => i64::MAX,
+                days if days == -i32::MAX => -i64::MAX,
+                days => i64::from(days) * MICROS_PER_DAY,
+            };
+            return restamp(micros, 1_000_000, per_second).map(wrap).ok_or_else(|| {
+                Error::conversion(format!(
+                    "Type INT32 with value {value} can't be cast to the destination type INT64"
+                ))
+            });
+        }
+        Value::Timestamp(micros) | Value::TimestampTz(micros) => (*micros, 1_000_000),
+        Value::TimestampS(ticks) => (*ticks, 1),
+        Value::TimestampMs(ticks) => (*ticks, 1_000),
+        Value::TimestampNs(ticks) if per_second != 1 => (*ticks, 1_000_000_000),
+        _ => return Err(no_cast(value, target)),
+    };
+    restamp(ticks, from, per_second).map(wrap).ok_or_else(finer)
+}
+
+/// The nanoseconds past the microsecond in a timestamp that has already been read, which are the
+/// seventh to the ninth digits of the fraction.
+fn sub_micros(text: &str) -> i64 {
+    let Ok((_, _, Some(time))) = split_parts(text.trim()) else {
+        return 0;
+    };
+    let (clock, _) = split_zone(time);
+    let Some((_, digits)) = clock.split_once('.') else {
+        return 0;
+    };
+    let extra: String = digits.chars().skip(6).take(3).collect();
+    format!("{extra:0<3}").parse().unwrap_or(0)
 }
 
 /// What the timestamp message says the format should have been, including the parts of it this

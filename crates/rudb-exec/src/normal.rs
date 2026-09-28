@@ -330,7 +330,10 @@ fn ordered(value: &Value, bytes: usize) -> Result<u128> {
         | Value::Time(held)
         | Value::TimeTz(held)
         | Value::Timestamp(held)
-        | Value::TimestampTz(held) => (i128::from(*held) as u128, true),
+        | Value::TimestampTz(held)
+        | Value::TimestampS(held)
+        | Value::TimestampMs(held)
+        | Value::TimestampNs(held) => (i128::from(*held) as u128, true),
         Value::HugeInt(held) => (*held as u128, true),
         Value::UTinyInt(held) => (u128::from(*held), false),
         Value::USmallInt(held) => (u128::from(*held), false),

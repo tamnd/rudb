@@ -178,7 +178,10 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
         | Value::Time(x)
         | Value::TimeTz(x)
         | Value::Timestamp(x)
-        | Value::TimestampTz(x) => x.hash(state),
+        | Value::TimestampTz(x)
+        | Value::TimestampS(x)
+        | Value::TimestampMs(x)
+        | Value::TimestampNs(x) => x.hash(state),
         Value::HugeInt(x) => x.hash(state),
         Value::UTinyInt(x) => x.hash(state),
         Value::USmallInt(x) => x.hash(state),

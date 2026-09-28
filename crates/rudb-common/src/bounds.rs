@@ -206,6 +206,9 @@ impl Bound {
             | Value::TimestampTz(micros) => {
                 Self::Scaled { unscaled: i128::from(*micros), scale: MICROS }
             }
+            Value::TimestampS(seconds) => Self::Scaled { unscaled: i128::from(*seconds), scale: 0 },
+            Value::TimestampMs(millis) => Self::Scaled { unscaled: i128::from(*millis), scale: 3 },
+            Value::TimestampNs(nanos) => Self::Scaled { unscaled: i128::from(*nanos), scale: 9 },
             Value::Varchar(text) => Self::Bytes(text.as_bytes().to_vec()),
             Value::Blob(bytes) => Self::Bytes(bytes.clone()),
             _ => return None,
@@ -259,6 +262,15 @@ impl Bound {
             }
             (Self::Scaled { unscaled, scale }, LogicalType::TimestampTz) => {
                 return fit!(&restated(*unscaled, *scale, MICROS)?, TimestampTz);
+            }
+            (Self::Scaled { unscaled, scale }, LogicalType::TimestampS) => {
+                return fit!(&restated(*unscaled, *scale, 0)?, TimestampS);
+            }
+            (Self::Scaled { unscaled, scale }, LogicalType::TimestampMs) => {
+                return fit!(&restated(*unscaled, *scale, 3)?, TimestampMs);
+            }
+            (Self::Scaled { unscaled, scale }, LogicalType::TimestampNs) => {
+                return fit!(&restated(*unscaled, *scale, 9)?, TimestampNs);
             }
             (Self::Bytes(bytes), LogicalType::Varchar) => {
                 Value::Varchar(String::from_utf8(bytes.clone()).ok()?)
