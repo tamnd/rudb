@@ -1894,8 +1894,10 @@ impl<'a> Aggregate<'a> {
 
     /// The keys, arguments and filters out of what the expressions evaluated to over `rows` rows.
     ///
-    /// For a marked chunk the keys are cut to the kept rows here, so that a row the filter dropped
-    /// never opens a group, and the arguments and filters stay whole.
+    /// For a marked chunk the keys stay whole too. [`Aggregate::fold`] reads them over every row when
+    /// the direct map answers the chunk and puts a row the filter dropped in no group afterwards, and
+    /// cuts them to the kept rows itself when it goes any other way. Anything else that reads a
+    /// marked chunk settles it first, which cuts the keys with everything else.
     fn rows_of(
         &self,
         evaluated: Vec<Vector>,
@@ -1905,10 +1907,7 @@ impl<'a> Aggregate<'a> {
         let mut values = evaluated.into_iter();
         let mut keys: Vec<Vector> = values.by_ref().take(self.keys.len()).collect();
         let (rows, marked) = match kept {
-            Some(kept) => {
-                keys = Chunk::with_rows(keys, rows)?.select(kept)?.into_columns();
-                (kept.len(), Some((kept.clone(), rows)))
-            }
+            Some(kept) => (kept.len(), Some((kept.clone(), rows))),
             None => (rows, None),
         };
         // An integer key a filter left as a dictionary over its page, or one still packed, is
@@ -2726,6 +2725,17 @@ impl<'a> Aggregate<'a> {
         // writes each slot once as it goes, and filling the slots with `NOWHERE` first was a second
         // write of every one of them, 560 MB over seventy runs of ClickBench 28.
         slots.clear();
+        // A marked chunk's keys come whole, and they are read that way for as long as the direct map
+        // answers the chunk, which is `uncut` holding the kept rows. The rows the filter dropped are
+        // taken back out of the slots at the end. Cutting the two dictionary keys of q01 to the rows
+        // its date filter keeps was a gather of 98 percent of every chunk twice over, and 5.6 percent
+        // of the query.
+        let mut uncut = marked.as_ref().map(|(kept, _)| kept);
+        let every = marked.as_ref().map_or(*length, |(_, all)| *all);
+        let kept_rows = *length;
+        let mut length = if uncut.is_some() { &every } else { length };
+        let cut_keys: Vec<Vector>;
+        let mut keys = keys;
         // The direct map first, because a chunk it answers is a chunk that is never hashed. The
         // whole key of q1 is two dictionary codes with six combinations between them, so the map is
         // six slots long and every row after the first six is a multiply add and a load. See
@@ -2758,6 +2768,14 @@ impl<'a> Aggregate<'a> {
                 || coded_spent.saturating_add(codes.combos() - grown.unwrap_or(0))
                     <= coded_read.saturating_mul(WINDOW_RATE).saturating_add(WINDOW_SLACK)
         });
+        // Every other way of finding a row's group would open one for a row the filter dropped, so the
+        // keys are cut to the kept rows the way they used to be before any of them is looked at.
+        if let Some(kept) = uncut.filter(|_| direct.is_none()) {
+            cut_keys = Chunk::with_rows(keys.clone(), every)?.select(kept)?.into_columns();
+            keys = &cut_keys;
+            length = &kept_rows;
+            uncut = None;
+        }
         let mut runs_found = false;
         if let Some(codes) = &direct {
             if !codes.same_as(coded_on) {
@@ -2831,8 +2849,15 @@ impl<'a> Aggregate<'a> {
                 for run in slot_runs.iter_mut() {
                     let (place, end) = *run;
                     let mut slot = slot_at(coded_map[place]);
-                    if slot == NOWHERE {
-                        slot = resolve(start)?;
+                    // A run the filter dropped every row of opens no group.
+                    let first = match uncut {
+                        Some(kept) if slot == NOWHERE => first_kept(kept.indices(), start, end),
+                        _ => Some(start),
+                    };
+                    if slot == NOWHERE
+                        && let Some(first) = first
+                    {
+                        slot = resolve(first)?;
                         coded_map.set(place, held_at(slot));
                     }
                     *run = (slot, end);
@@ -2858,9 +2883,16 @@ impl<'a> Aggregate<'a> {
                     if row == *length {
                         break;
                     }
-                    let slot = resolve(row)?;
-                    slots[row] = slot;
-                    coded_map.set(coded_places[row], held_at(slot));
+                    // A row the filter dropped opens no group, and whatever group it names is taken
+                    // off it at the end anyway.
+                    if uncut.is_none_or(|kept| kept.indices().binary_search(&(row as u32)).is_ok())
+                    {
+                        let slot = resolve(row)?;
+                        slots[row] = slot;
+                        coded_map.set(coded_places[row], held_at(slot));
+                    } else {
+                        slots[row] = NOWHERE;
+                    }
                     row += 1;
                 }
             }
@@ -3034,6 +3066,22 @@ impl<'a> Aggregate<'a> {
         };
         let whole;
         let length = match marked {
+            // Keys read whole found slots and runs over every row already, with each row the filter
+            // dropped in the group its key names, so those rows are taken out of them instead.
+            Some((picks, _)) if uncut.is_some() => {
+                let most = every.saturating_mul(users) / RUN_ROWS;
+                let mut cut = Vec::with_capacity(slot_runs.len() + 8);
+                if runs_found && cut_runs(slot_runs, picks.indices(), every, most, &mut cut) {
+                    *slot_runs = cut;
+                } else {
+                    if runs_found {
+                        fill_slots(slots, slot_runs);
+                    }
+                    drop_unkept(slots, picks.indices());
+                    runs_found = false;
+                }
+                length
+            }
             Some((picks, all)) => {
                 let mut spread = Vec::with_capacity(slot_runs.len() + 8);
                 let most = all.saturating_mul(users) / RUN_ROWS;
@@ -4744,6 +4792,104 @@ fn spread_slots(slots: &mut Vec<usize>, kept: &[u32], all: usize) {
     }
 }
 
+/// The first of the kept rows that falls in `start..end`, if any does.
+fn first_kept(kept: &[u32], start: usize, end: usize) -> Option<usize> {
+    let at = kept.partition_point(|&row| (row as usize) < start);
+    kept.get(at).map(|&row| row as usize).filter(|&row| row < end)
+}
+
+/// How many kept rows in a row are looked at before a stretch of them is taken as one.
+const STRETCH: usize = 16;
+
+/// The stretches of rows between the kept ones, each as the row it starts at and the row after
+/// it ends, handed to `dropped` in order, with the rows after the last kept one up to `all`.
+///
+/// A filter that keeps nearly everything keeps sixteen rows in a row far more often than not, and
+/// the last of those sixteen being fifteen past the first says so in one compare, so most of the
+/// kept rows are never looked at one at a time.
+fn gaps(kept: &[u32], all: usize, mut dropped: impl FnMut(usize, usize) -> bool) -> bool {
+    let mut row = 0;
+    let mut at = 0;
+    while let Some(&first) = kept.get(at) {
+        let first = first as usize;
+        if first > row && !dropped(row, first) {
+            return false;
+        }
+        if kept.get(at + STRETCH - 1).is_some_and(|&last| last as usize == first + STRETCH - 1) {
+            at += STRETCH;
+            row = first + STRETCH;
+        } else {
+            at += 1;
+            row = first + 1;
+        }
+    }
+    row >= all || dropped(row, all)
+}
+
+/// Every row the filter dropped out of `slots`, which hold a slot for every row of the chunk.
+fn drop_unkept(slots: &mut [usize], kept: &[u32]) {
+    let all = slots.len();
+    gaps(kept, all, |from, to| {
+        slots[from..to].fill(NOWHERE);
+        true
+    });
+}
+
+/// Runs over every row of a marked chunk with the rows the filter dropped cut out of them into runs
+/// of `NOWHERE`, or `false` with `into` empty once that takes more than `most` runs.
+///
+/// The counterpart of [`spread_runs`] for runs found over every row rather than over the kept ones.
+fn cut_runs(
+    runs: &[(usize, usize)],
+    kept: &[u32],
+    all: usize,
+    most: usize,
+    into: &mut Vec<(usize, usize)>,
+) -> bool {
+    into.clear();
+    if runs.last().map_or(0, |&(_, end)| end) != all {
+        return false;
+    }
+    let mut dropped = Vec::new();
+    gaps(kept, all, |from, to| {
+        dropped.push((from, to));
+        true
+    });
+    let mut push = |slot: usize, end: usize| {
+        match into.last_mut() {
+            Some(last) if last.0 == slot => last.1 = end,
+            _ => into.push((slot, end)),
+        }
+        into.len() <= most
+    };
+    let mut gap = 0;
+    let mut row = 0;
+    for &(slot, end) in runs {
+        while row < end {
+            while dropped.get(gap).is_some_and(|&(_, to)| to <= row) {
+                gap += 1;
+            }
+            let pushed = match dropped.get(gap) {
+                Some(&(from, to)) if from < end => {
+                    let upto = to.min(end);
+                    let before = from <= row || push(slot, from);
+                    row = upto;
+                    before && push(NOWHERE, upto)
+                }
+                _ => {
+                    row = end;
+                    push(slot, end)
+                }
+            };
+            if !pushed {
+                into.clear();
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The runs of a marked chunk's kept rows as runs of all `all` of its rows, with every row the
 /// filter dropped in a run of `NOWHERE`, or `false` with `into` empty once that takes more than
 /// `most` runs.
@@ -4806,20 +4952,20 @@ struct Rows {
     arguments: Vec<Vec<Vector>>,
     filters: Vec<Option<Vector>>,
     rows: usize,
-    /// For a marked chunk, the rows of the arguments and filters the keys stand for and how many
-    /// rows the arguments and filters have. The keys are `rows` long either way. See
-    /// [`Aggregate::reads_marked`].
+    /// For a marked chunk, the rows the filter kept and how many rows the columns have. `rows` is
+    /// how many were kept, and the keys, the arguments and the filters are all still every row long.
+    /// See [`Aggregate::reads_marked`] and [`Aggregate::rows_of`].
     marked: Option<(Selection, usize)>,
 }
 
 impl Rows {
-    /// The same rows with the arguments and filters cut to the kept rows, the way they would have
-    /// come had the filter cut the chunk. Rows that were not marked are handed back as they are.
+    /// The same rows with every column cut to the kept rows, the way they would have come had the
+    /// filter cut the chunk. Rows that were not marked are handed back as they are.
     fn settled(&self) -> Result<Cow<'_, Self>> {
-        let Some((kept, _)) = &self.marked else { return Ok(Cow::Borrowed(self)) };
+        let Some((kept, all)) = &self.marked else { return Ok(Cow::Borrowed(self)) };
         let cut = |vector: &Vector| vector.gather(kept.indices());
         Ok(Cow::Owned(Self {
-            keys: self.keys.clone(),
+            keys: Chunk::with_rows(self.keys.clone(), *all)?.select(kept)?.into_columns(),
             arguments: self
                 .arguments
                 .iter()
@@ -8060,8 +8206,8 @@ mod tests {
         Distinct, EncodedCountRecord, EncodedCountRun, EncodedCountRuns, EncodedValid,
         FixedPartition, FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS,
         RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
-        bigint_distinct_partition, encoded_count_partition, fixed_partition, interior, run_starts,
-        run_total, slot_runs_of, spread_runs, spread_slots,
+        bigint_distinct_partition, cut_runs, drop_unkept, encoded_count_partition, first_kept,
+        fixed_partition, interior, run_starts, run_total, slot_runs_of, spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -8121,6 +8267,36 @@ mod tests {
         let whole: Vec<u32> = (0..all as u32).collect();
         assert!(spread_runs(&[(5, 150), (2, 200)], &whole, all, 2, &mut spread));
         assert_eq!(spread, [(5, 150), (2, 200)]);
+    }
+
+    /// Runs found over every row of a marked chunk, cut at the rows the filter dropped, come out as
+    /// the runs of the slots with those rows put in no group, and so do the slots themselves.
+    #[test]
+    fn runs_over_every_row_lose_the_dropped_rows_like_their_slots() {
+        let all = 300;
+        for dropped in [&[0_u32, 1, 40, 41, 42, 77, 299][..], &[5, 150, 151], &[], &[298, 299]] {
+            let kept: Vec<u32> = (0..all as u32).filter(|row| !dropped.contains(row)).collect();
+            let slots: Vec<usize> =
+                (0..all).map(|row| [3, 3, 9, 1, NOWHERE][row / 23 % 5]).collect();
+            let mut runs = Vec::new();
+            assert!(slot_runs_of(&slots, &mut runs, 1));
+            let mut cut = Vec::new();
+            assert!(cut_runs(&runs, &kept, all, usize::MAX, &mut cut));
+            let mut taken = slots.clone();
+            drop_unkept(&mut taken, &kept);
+            for (row, &slot) in taken.iter().enumerate() {
+                let dropped = dropped.contains(&(row as u32));
+                assert_eq!(slot, if dropped { NOWHERE } else { slots[row] }, "row {row}");
+            }
+            let mut expected = Vec::new();
+            assert!(slot_runs_of(&taken, &mut expected, usize::MAX));
+            assert_eq!(cut, expected, "{dropped:?}");
+            assert!(!cut_runs(&runs, &kept, all, 2, &mut cut));
+            assert!(cut.is_empty());
+        }
+        assert_eq!(first_kept(&[3, 9, 20], 4, 9), None);
+        assert_eq!(first_kept(&[3, 9, 20], 4, 10), Some(9));
+        assert_eq!(first_kept(&[3, 9, 20], 21, 30), None);
     }
 
     /// Slots cut into runs come back as the runs they are, across the blocks the cut reads them in,
