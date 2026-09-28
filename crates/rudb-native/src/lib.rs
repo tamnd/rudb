@@ -960,6 +960,15 @@ pub struct FrequencyOccurrences {
     pub anchor_indices: Vec<u16>,
 }
 
+/// A dictionary column's synopsis by code, which is what [`Reader::frequency_codes`] answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrequencyCodes {
+    /// The code of every listed value, `None` for a null, with the number of rows holding it.
+    pub entries: Vec<(Option<u32>, u64)>,
+    /// How many rows the most common value outside the list holds.
+    pub omitted_max: u64,
+}
+
 /// Exact grouped counts for a pair of values, in descending count order.
 pub type PairFrequencyCounts = Vec<(Vec<Value>, u64)>;
 
@@ -7322,6 +7331,33 @@ impl Reader {
             anchors,
             anchor_indices,
         }))
+    }
+
+    /// One dictionary column's synopsis as the codes its parts carry, with the bound on every
+    /// value it left out.
+    ///
+    /// The entries are in the order and hold the counts [`Self::frequency_prefix`] lists, with
+    /// `None` for a listed null, so a caller can find the rows of the listed values in the parts
+    /// without comparing a string. `None` when the column has no synopsis or is not written
+    /// against a dictionary.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema or its synopsis cannot be read.
+    pub fn frequency_codes(&self, column: usize) -> Result<Option<FrequencyCodes>> {
+        let Some((entries, omitted_max)) = self.frequency_head(column)? else {
+            return Ok(None);
+        };
+        let mut codes = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let code = match entry.value {
+                FrequencyValue::Null => None,
+                FrequencyValue::Code(code) => Some(code),
+                FrequencyValue::Integer(_) => return Ok(None),
+            };
+            codes.push((code, entry.count));
+        }
+        Ok(Some(FrequencyCodes { entries: codes, omitted_max }))
     }
 
     /// How many distinct values one column holds, counting a null as no value.

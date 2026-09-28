@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
-use rudb_catalog::{Catalog, Parent, QualifiedName, Table};
+use rudb_catalog::{Catalog, CodedRows, Parent, QualifiedName, Table};
 use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Rule, Session, Value};
 use rudb_functions::TableFunction;
 use rudb_graph::Link;
@@ -57,8 +57,8 @@ use rudb_pipeline::{
     BufferId, DynSink, DynStream, Pipeline, PipelineId, Source, Watched, root, root_in_order,
 };
 use rudb_plan::{
-    BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, PipelineRef, Plan,
-    ROOT, Shape, Slice, seams_of,
+    BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef,
+    PipelineRef, Plan, ROOT, Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
 use rudb_vector::VECTOR_SIZE;
@@ -895,6 +895,234 @@ fn native_any_groups(
     }
     let entries = counts.into_iter().take(wanted).map(|(key, count)| (key.0, count)).collect();
     Ok(Some(NativePairFrequencies { entries }))
+}
+
+/// The most rows [`native_coded_counts`] fetches, a quarter of what the synopsis of a numeric
+/// column keeps the ordinals of, since these are found by reading the codes of every part first.
+const CODED_ROWS: u64 = 32_768;
+
+/// The leading groups of a count grouped by a string column with a frequency synopsis and a signed
+/// integer column, counted over only the rows of the string values that synopsis lists.
+///
+/// A group holds no more rows than the value of the string key it has, and a filter only takes
+/// rows away, so a group whose value the synopsis left out holds no more rows than the synopsis
+/// bound. The rows of the listed values are found by their codes, the integer is read beside them
+/// in the same pass, and the answer stands when the `n`th count is strictly above that bound. On
+/// ClickBench 15 that is about twelve thousand rows of a million, where the aggregate it replaces
+/// scattered the hundred and thirty thousand rows the filter kept into a hundred thousand groups.
+///
+/// The filter has to be equality tests of the string key and nothing else, `SearchPhrase <> ''`
+/// there, since those are settled by leaving the values they reject out and no row is evaluated.
+/// One key is left to the aggregate, which counts codes as fast as the scan here reads them.
+fn native_coded_counts(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+    top: usize,
+) -> Result<Option<NativePairFrequencies>> {
+    let (source, predicate) = match *plan.node(input) {
+        Node::Filter { input, predicate } => (input, Some(predicate)),
+        _ => (input, None),
+    };
+    let Some((table, index, columns)) = whole_table(plan, catalog, source)? else {
+        return Ok(None);
+    };
+    let [aggregate] = plan.expr_list(aggregates) else { return Ok(None) };
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
+        return Ok(None);
+    };
+    let keys = plan.expr_list(groups);
+    if top == 0
+        || keys.is_empty()
+        || plan.string(name) != "count_star"
+        || !plan.expr_list(args).is_empty()
+        || distinct
+        || filter.is_some()
+    {
+        return Ok(None);
+    }
+    let fields = plan.field_list(columns);
+    let mut stored = Vec::with_capacity(fields.len());
+    for field in fields {
+        let Some(column) = table.column_index(&field.name) else { return Ok(None) };
+        stored.push(column);
+    }
+    let mut found = None;
+    for &key in keys {
+        if let Expr::Column(binding) = *plan.expr(key)
+            && binding.table == index
+            && plan.expr_type(key) == &LogicalType::Varchar
+            && let Some(&column) = stored.get(binding.column as usize)
+            && let Some(codes) = table.rows().frequency_codes(column)?
+        {
+            found = Some((binding, column, codes));
+            break;
+        }
+    }
+    let Some((binding, column, codes)) = found else { return Ok(None) };
+    let Some(prefix) = table.rows().frequency_prefix(column)? else { return Ok(None) };
+    if prefix.entries.len() != codes.entries.len() {
+        return Ok(None);
+    }
+    // The values the filter tests the key against, each with whether it keeps rows equal to it.
+    let mut tests = Vec::new();
+    let mut untested = false;
+    if let Some(predicate) = predicate {
+        let conjuncts = match *plan.expr(predicate) {
+            Expr::Conjunction { op: ConjunctionOp::And, children } => plan.expr_list(children),
+            _ => std::slice::from_ref(&predicate),
+        };
+        for &conjunct in conjuncts {
+            let Expr::Compare { op, left, right } = *plan.expr(conjunct) else { continue };
+            let keeps = match op {
+                CompareOp::Equal => true,
+                CompareOp::NotEqual => false,
+                _ => continue,
+            };
+            let value = match (plan.expr(left), plan.expr(right)) {
+                (Expr::Column(held), Expr::Constant(value))
+                | (Expr::Constant(value), Expr::Column(held))
+                    if *held == binding =>
+                {
+                    plan.value(*value)
+                }
+                _ => continue,
+            };
+            // Only a string is compared the way the filter will compare it.
+            if !matches!(value, Value::Varchar(_)) {
+                continue;
+            }
+            tests.push((value, keeps));
+        }
+        untested = tests.len() < conjuncts.len();
+    }
+    let mut bound = codes.omitted_max;
+    let mut wanted = Vec::new();
+    let mut held = Vec::new();
+    for ((value, _), &(code, count)) in prefix.entries.iter().zip(&codes.entries) {
+        // A null is rejected by any comparison, and a value by a test it fails.
+        if (!tests.is_empty() && value.is_null())
+            || tests.iter().any(|&(against, keeps)| (value == against) != keeps)
+        {
+            continue;
+        }
+        match code {
+            Some(code) => {
+                wanted.push(code);
+                held.push(count);
+            }
+            // Its rows are not found by a code, so it is left out and bounds what it could hold.
+            None => bound = bound.max(count),
+        }
+    }
+    // No group holds more rows than its value, so too few values above the bound is too few
+    // groups that could be.
+    let rows = held.iter().sum::<u64>();
+    let leaders = held.iter().filter(|&&count| count > bound).count();
+    if leaders < top || rows > CODED_ROWS {
+        return Ok(None);
+    }
+    // A small integer beside the string, with a filter the tests above already settle, is read in
+    // the same pass as the codes, and the groups are counted without making a string of either.
+    let signed = match keys {
+        &[left, right] if !untested => {
+            let (other, first) =
+                if is_binding(plan, left, binding) { (right, false) } else { (left, true) };
+            match *plan.expr(other) {
+                Expr::Column(beside)
+                    if beside.table == index
+                        && beside != binding
+                        && matches!(
+                            plan.expr_type(other),
+                            LogicalType::TinyInt
+                                | LogicalType::SmallInt
+                                | LogicalType::Integer
+                                | LogicalType::BigInt
+                        ) =>
+                {
+                    stored.get(beside.column as usize).map(|&at| (at, plan.expr_type(other), first))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let Some((other, ty, first)) = signed else { return Ok(None) };
+    let Some(found) = table.rows().coded_rows(column, other, &wanted)? else {
+        return Ok(None);
+    };
+    // The synopsis counts are exact, so any other number of rows means the codes are not the ones
+    // the parts carry, and the answer is left to the rows.
+    if found.codes.len() as u64 != rows {
+        return Ok(None);
+    }
+    signed_coded_counts(&found, ty, first, bound, top)
+}
+
+/// Whether `expr` is the column `binding` names.
+fn is_binding(plan: &Plan, expr: ExprRef, binding: ColumnBinding) -> bool {
+    matches!(*plan.expr(expr), Expr::Column(held) if held == binding)
+}
+
+/// The groups of [`native_coded_counts`] when the other key is a signed integer read beside the
+/// codes, counted by the pair of the two and named as values only for the groups that lead.
+fn signed_coded_counts(
+    found: &CodedRows,
+    ty: &LogicalType,
+    first: bool,
+    bound: u64,
+    top: usize,
+) -> Result<Option<NativePairFrequencies>> {
+    let Some(dictionary) = &found.dictionary else { return Ok(None) };
+    if found.others.len() != found.codes.len() {
+        return Ok(None);
+    }
+    let mut counts = HashMap::<(Option<i128>, u32), u64, BuildHasherDefault<Digest>>::default();
+    for (&other, &code) in found.others.iter().zip(&found.codes) {
+        *counts.entry((other, code)).or_default() += 1;
+    }
+    let mut boundaries = counts.values().copied().collect::<Vec<_>>();
+    if boundaries.len() < top {
+        return Ok(None);
+    }
+    boundaries.select_nth_unstable_by(top - 1, |left, right| right.cmp(left));
+    let boundary = boundaries[top - 1];
+    if boundary <= bound {
+        return Ok(None);
+    }
+    let mut entries = Vec::new();
+    for ((other, code), count) in counts {
+        if count < boundary {
+            continue;
+        }
+        let other = match other {
+            Some(value) => signed_value(ty, value)?,
+            None => Value::Null,
+        };
+        let text = Value::Varchar(
+            dictionary
+                .try_text_at(code as usize)?
+                .ok_or_else(|| Error::internal("a string frequency code is null"))?
+                .to_owned(),
+        );
+        let key = if first { vec![other, text] } else { vec![text, other] };
+        entries.push((key, count));
+    }
+    Ok(Some(NativePairFrequencies { entries }))
+}
+
+/// A signed integer read out of a column, as the value of the column's type.
+fn signed_value(ty: &LogicalType, value: i128) -> Result<Value> {
+    let range = || Error::internal("a signed column value is out of its type's range");
+    Ok(match ty {
+        LogicalType::TinyInt => Value::TinyInt(i8::try_from(value).map_err(|_| range())?),
+        LogicalType::SmallInt => Value::SmallInt(i16::try_from(value).map_err(|_| range())?),
+        LogicalType::Integer => Value::Integer(i32::try_from(value).map_err(|_| range())?),
+        LogicalType::BigInt => Value::BigInt(i64::try_from(value).map_err(|_| range())?),
+        _ => return Err(Error::internal("a signed key has a type that is not a signed integer")),
+    })
 }
 
 /// A count grouped by keys one of which is a column whose frequency synopsis kept the rows of its
@@ -2516,6 +2744,15 @@ impl<'a> Building<'a, '_> {
                     "Aggregate",
                     Some("native pair frequencies"),
                 );
+                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+            }
+            if let Some(top) = top
+                && let Some(frequencies) =
+                    native_coded_counts(self.plan, self.catalog, input, groups, aggregates, top)?
+            {
+                let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
+                let counters =
+                    self.watch(reference, id, pipeline, "Aggregate", Some("native coded counts"));
                 return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
             }
         }

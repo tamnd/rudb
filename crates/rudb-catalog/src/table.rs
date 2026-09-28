@@ -7,8 +7,8 @@ use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{Clustering, ColumnFacts, Error, Field, LogicalType, Result, Value};
 use rudb_encoding::sequence::Sequence;
 use rudb_native::{
-    Common, FrequencyOccurrences, FrequencyPrefix, PairFrequencyCounts, Reader as NativeReader,
-    StoredPart, Stripes,
+    Common, FrequencyCodes, FrequencyOccurrences, FrequencyPrefix, PairFrequencyCounts,
+    Reader as NativeReader, StoredPart, Stripes,
 };
 use rudb_storage::{MemoryTable, Probe, Range};
 use rudb_vector::{Chunk, Form, VECTOR_SIZE, Vector, concat};
@@ -79,6 +79,18 @@ pub struct StablePairCodes {
 }
 
 type StableCodes = (Vec<Option<u32>>, Arc<Vector>);
+
+/// The rows of a dictionary column that hold one of a set of codes, found by
+/// [`Rows::coded_rows`].
+#[derive(Debug, Default)]
+pub struct CodedRows {
+    /// The code each of those rows holds.
+    pub codes: Vec<u32>,
+    /// The signed value of the other column at each row.
+    pub others: Vec<Option<i128>>,
+    /// The one table-wide dictionary the codes name.
+    pub dictionary: Option<Arc<Vector>>,
+}
 
 impl Rows {
     /// The rows to append to, turning a committed file into one that has rows in memory beside it.
@@ -304,6 +316,110 @@ impl Rows {
             // are no longer numbered the way the file numbers them once there are more of them.
             Self::Grown(_, _) => Ok(None),
         }
+    }
+
+    /// One dictionary column's synopsis as the codes its parts carry.
+    ///
+    /// A file only, for the reason [`Self::frequency_occurrences`] gives: the codes are the file's,
+    /// and rows appended since are neither counted in the synopsis nor coded against it.
+    pub fn frequency_codes(&self, column: usize) -> Result<Option<FrequencyCodes>> {
+        match self {
+            Self::Native(reader) => reader.frequency_codes(column),
+            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
+        }
+    }
+
+    /// The codes of the rows whose dictionary column holds one of `codes`, each with the signed
+    /// value of `other` at the same row, and the dictionary the codes index.
+    ///
+    /// Every part is read, but for its codes and the one other column, which is what a filter on
+    /// the column costs without its strings. The parts are split across threads, since a table of
+    /// a million rows is a thousand of them. `None` when the table is not a file, a part of the
+    /// column is not written against the one dictionary the rest are, or `other` is not signed.
+    pub fn coded_rows(
+        &self,
+        column: usize,
+        other: usize,
+        codes: &[u32],
+    ) -> Result<Option<CodedRows>> {
+        let Self::Native(reader) = self else { return Ok(None) };
+        let Some(&most) = codes.iter().max() else { return Ok(None) };
+        let mut wanted = vec![false; most as usize + 1];
+        for &code in codes {
+            wanted[code as usize] = true;
+        }
+        let parts = reader.parts();
+        let workers =
+            std::thread::available_parallelism().map_or(1, usize::from).min(8).min(parts).max(1);
+        let each = parts.div_ceil(workers);
+        let columns = [column, other];
+        let (wanted, columns) = (&wanted, &columns);
+        let found = std::thread::scope(|scope| {
+            let handles = (0..workers)
+                .map(|worker| {
+                    let parts = worker * each..((worker + 1) * each).min(parts);
+                    scope.spawn(move || Self::coded_parts(reader, columns, wanted, parts))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| Error::internal("a coded row worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let mut rows = CodedRows::default();
+        let mut dictionary: Option<Arc<Vector>> = None;
+        for found in found {
+            let Some((held, found)) = found else { return Ok(None) };
+            match (&dictionary, held) {
+                (Some(dictionary), Some(held)) if !Arc::ptr_eq(dictionary, &held) => {
+                    return Ok(None);
+                }
+                (None, Some(held)) => dictionary = Some(held),
+                _ => {}
+            }
+            rows.codes.extend(found.codes);
+            rows.others.extend(found.others);
+        }
+        Ok(dictionary.map(|dictionary| CodedRows { dictionary: Some(dictionary), ..rows }))
+    }
+
+    /// One worker's share of [`Rows::coded_rows`], the parts in `parts` read in order.
+    fn coded_parts(
+        reader: &NativeReader,
+        columns: &[usize],
+        wanted: &[bool],
+        parts: std::ops::Range<usize>,
+    ) -> Result<Option<(Option<Arc<Vector>>, CodedRows)>> {
+        let mut rows = CodedRows::default();
+        let mut dictionary: Option<Arc<Vector>> = None;
+        for part in parts {
+            let held = reader.read(part, columns)?;
+            let vector = held.column(0)?;
+            let Some((part_codes, values)) = vector.stable_dictionary_parts() else {
+                return Ok(None);
+            };
+            match &dictionary {
+                Some(held) if !Arc::ptr_eq(held, values) => return Ok(None),
+                Some(_) => {}
+                None => dictionary = Some(Arc::clone(values)),
+            }
+            let other = held.column(1)?;
+            for (row, &code) in part_codes.iter().enumerate() {
+                if !wanted.get(code as usize).copied().unwrap_or(false) || vector.is_null_at(row) {
+                    continue;
+                }
+                rows.codes.push(code);
+                if other.is_null_at(row) {
+                    rows.others.push(None);
+                } else {
+                    let Some(value) = other.signed_at(row) else { return Ok(None) };
+                    rows.others.push(Some(value));
+                }
+            }
+        }
+        Ok(Some((dictionary, rows)))
     }
 
     /// Query-specific pair leaders are not used, including in older native files.
