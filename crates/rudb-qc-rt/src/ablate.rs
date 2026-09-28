@@ -21,14 +21,17 @@ impl Ablate {
     pub const LANES: Ablate = Ablate(1 << 3);
     /// An aggregate with no groups answered from the table's statistics.
     pub const STATS: Ablate = Ablate(1 << 4);
+    /// A `LIKE` over a column coded into a dictionary answered once for each of its values.
+    pub const CODES: Ablate = Ablate(1 << 5);
 
     /// Every switch with its name, in the order a table of them is printed.
-    pub const ALL: [(&'static str, Ablate); 5] = [
+    pub const ALL: [(&'static str, Ablate); 6] = [
         ("probe", Ablate::PROBE),
         ("like", Ablate::LIKE),
         ("top", Ablate::TOP),
         ("lanes", Ablate::LANES),
         ("stats", Ablate::STATS),
+        ("codes", Ablate::CODES),
     ];
 
     /// Reads a comma separated list of names, where an empty list or `none` is nothing and `all`
