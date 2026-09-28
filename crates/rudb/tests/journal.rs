@@ -255,3 +255,79 @@ fn changes_across_many_chunks_replay_in_the_order_they_committed() {
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn commit_sync_is_a_setting_that_reads_back_and_refuses_what_it_is_not() {
+    let db = Database::new();
+    let read = |db: &Database| db.setting("commit_sync").expect("reads back");
+    assert_eq!(read(&db), "full");
+    for (written, read_back) in [("os", "os"), ("NONE", "none"), ("off", "none"), ("normal", "os")]
+    {
+        db.execute(&format!("SET commit_sync = '{written}'")).expect("sets");
+        assert_eq!(read(&db), read_back);
+    }
+    let error = db.execute("SET commit_sync = 'sometimes'").expect_err("refused");
+    assert!(error.to_string().contains("commit_sync is full, os or none"), "{error}");
+    db.execute("RESET commit_sync").expect("resets");
+    assert_eq!(read(&db), "full");
+}
+
+/// Under `os` a commit is written without a sync, and a crash of the process, which is what this
+/// can test, loses none of it.
+#[test]
+fn a_commit_that_skips_the_sync_still_survives_a_crash_of_the_process() {
+    let path = path("sync-os");
+    let db = open(&path);
+    db.execute("SET commit_sync = 'os'").expect("sets");
+    db.execute("CREATE TABLE t (id INTEGER, name VARCHAR)").expect("creates");
+    db.execute("INSERT INTO t VALUES (0, 'zero')").expect("inserts");
+    let insert = db.prepare("INSERT INTO t VALUES (?, ?)").expect("prepares");
+    for id in 1..500 {
+        insert.execute(&[Value::Integer(id), Value::Varchar(format!("n{id}"))]).expect("inserts");
+    }
+    drop(insert);
+    crash(db);
+
+    let db = open(&path);
+    let got = rows(&db, "SELECT count(*), sum(id), max(id) FROM t");
+    assert_eq!(
+        got[0],
+        vec![Value::BigInt(500), Value::HugeInt((0..500).sum()), Value::Integer(499)]
+    );
+    db.close().expect("closes");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Under `none` nothing waits. A close still keeps every row, and a crash keeps a prefix of the
+/// commits, the ones written out before it, and never a commit without the ones before it.
+#[test]
+fn a_commit_that_waits_for_nothing_loses_at_most_the_tail_of_the_log() {
+    let path = path("sync-none");
+    let db = open(&path);
+    db.execute("SET commit_sync = 'none'").expect("sets");
+    db.execute("CREATE TABLE t (id INTEGER, name VARCHAR)").expect("creates");
+    db.execute("INSERT INTO t VALUES (0, 'zero')").expect("inserts");
+    let insert = db.prepare("INSERT INTO t VALUES (?, ?)").expect("prepares");
+    let padding = "x".repeat(200);
+    for id in 1..20_000 {
+        insert.execute(&[Value::Integer(id), Value::Varchar(padding.clone())]).expect("inserts");
+    }
+    drop(insert);
+    crash(db);
+
+    let db = open(&path);
+    let got = rows(&db, "SELECT count(*), min(id), max(id) FROM t");
+    let Value::BigInt(count) = got[0][0] else { panic!("a count: {got:?}") };
+    assert!(count > 1, "more than a megabyte was committed and none of it was written out");
+    assert!(count <= 20_000);
+    assert_eq!(got[0][1], Value::Integer(0));
+    assert_eq!(got[0][2], Value::Integer(i32::try_from(count).expect("small") - 1), "a prefix");
+    db.execute("INSERT INTO t VALUES (-1, 'last')").expect("inserts");
+    db.close().expect("closes");
+
+    let db = open(&path);
+    let after = rows(&db, "SELECT count(*) FROM t");
+    assert_eq!(after[0][0], Value::BigInt(count + 1), "a close keeps every row");
+    db.close().expect("closes");
+    let _ = std::fs::remove_file(&path);
+}

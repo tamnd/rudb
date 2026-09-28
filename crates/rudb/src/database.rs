@@ -3250,7 +3250,7 @@ impl Shared {
         let Some(held) = journal.as_mut() else { return Ok(()) };
         // A block the lane refused is followed by the checkpoint, which makes the same rows
         // durable the slow way.
-        if !held.needs_checkpoint() && held.commit().is_ok() {
+        if !held.needs_checkpoint() && held.commit(self.inner.settings.commit_sync()).is_ok() {
             return Ok(());
         }
         persist_main(path, &mut catalog, &self.inner.pages, &mut journal, false)

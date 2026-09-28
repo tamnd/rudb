@@ -360,6 +360,30 @@ impl Lane {
         }
     }
 
+    /// Changes what the next commit waits for.
+    pub fn set_commit_sync(&mut self, sync: CommitSync) {
+        self.options.commit_sync = sync;
+    }
+
+    /// How many bytes of committed blocks have not been handed to the operating system yet, which
+    /// under [`CommitSync::None`] is what a crash of the process would lose.
+    #[must_use]
+    pub fn unwritten(&self) -> u64 {
+        let state = self.lock();
+        state.reserved - state.written.min(state.reserved)
+    }
+
+    /// Writes every block committed so far to the operating system, without a sync.
+    ///
+    /// # Errors
+    ///
+    /// If the lane failed, now or earlier.
+    pub fn write_out(&self) -> Result<()> {
+        let state = self.lock();
+        let end = state.reserved;
+        self.wait(state, end, false).map(|_| ())
+    }
+
     /// Writes and syncs every block committed so far.
     ///
     /// # Errors

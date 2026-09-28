@@ -30,7 +30,9 @@ use std::sync::Arc;
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_io::{Filesystem, RealFilesystem};
 use rudb_native::{LaneStart, LogAnchor};
-use rudb_txn::log::{Block, Kind, Lane, Options, SEGMENT_BYTES, SEGMENT_HEADER, replay, segments};
+use rudb_txn::log::{
+    Block, CommitSync, Kind, Lane, Options, SEGMENT_BYTES, SEGMENT_HEADER, replay, segments,
+};
 use rudb_vector::{Chunk, Selection, Vector};
 
 /// The lane every record goes to, until there are more.
@@ -48,6 +50,9 @@ const SEGMENT: u64 = SEGMENT_BYTES / 4;
 /// quarter of a segment, so a block always fits one, and large enough that ordinary inserts never
 /// meet it; what does is a load, which the checkpoint writes as pages anyway.
 const MOST_STAGED: usize = (SEGMENT / 4) as usize;
+
+/// How many bytes of blocks `commit_sync = none` lets queue before it writes them out.
+const QUEUED: u64 = 1 << 20;
 
 /// A record staged for the commit: its kind and its payload.
 #[derive(Debug)]
@@ -354,13 +359,17 @@ impl Journal {
         self.dirty || (!self.anchored && !self.staged.is_empty())
     }
 
-    /// Writes what was staged to the lane as one committed block and waits until it is durable.
+    /// Writes what was staged to the lane as one committed block and waits for what `sync` says.
+    ///
+    /// Under [`CommitSync::None`] the blocks queue in the lane and nothing waits, and once a
+    /// megabyte of them is queued they are handed to the operating system in one write, so a crash
+    /// of the process loses at most that much and the queue does not grow without end.
     ///
     /// # Errors
     ///
     /// If the lane cannot be opened or written. The staged records are dropped either way; a
     /// failed commit is followed by a checkpoint, which the caller asks for.
-    pub(crate) fn commit(&mut self) -> Result<()> {
+    pub(crate) fn commit(&mut self, sync: CommitSync) -> Result<()> {
         if self.staged.is_empty() {
             return Ok(());
         }
@@ -379,8 +388,12 @@ impl Journal {
             }
         };
         let lane = self.lane.insert(lane);
+        lane.set_commit_sync(sync);
         lane.commit(&block)?;
         self.last = ts;
+        if sync == CommitSync::None && lane.unwritten() >= QUEUED {
+            lane.write_out()?;
+        }
         Ok(())
     }
 
@@ -405,6 +418,11 @@ impl Journal {
     ///
     /// If a segment cannot be removed.
     pub(crate) fn checkpointed(&mut self) -> Result<()> {
+        // Blocks still queued under `commit_sync = none` go out first, so none of them is left to
+        // be written into a segment this is about to remove.
+        if let Some(lane) = &self.lane {
+            lane.write_out()?;
+        }
         self.discard();
         self.anchored = true;
         let below = self.lane.as_ref().map_or(u64::MAX, |lane| lane.position().0);
