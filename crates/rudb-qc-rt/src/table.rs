@@ -18,6 +18,7 @@
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::text::{self, Heap};
 
@@ -97,6 +98,39 @@ pub struct GroupTable {
     cap: usize,
     /// The first group the slots know about.
     since: usize,
+    /// The groups this table may make, when a limit with no order above the aggregate reads only
+    /// that many of them.
+    limited: Option<Limited>,
+}
+
+/// The groups the tables of a limited aggregate's workers agree on: the first keys any of them
+/// saw, up to the limit. A worker makes a group only for a key in the set, and the rows of every
+/// other key go to a row that is never read, so each group the workers make sees every row of its
+/// key and the merge adds up whole groups. A set with fewer keys than the limit takes the key of
+/// any worker that asks.
+#[derive(Debug)]
+pub struct Agreed {
+    held: Mutex<(GroupTable, Heap)>,
+    limit: usize,
+}
+
+impl Agreed {
+    /// A set of at most `limit` keys for tables of this shape.
+    #[must_use]
+    pub fn new(layout: Layout, limit: usize) -> Agreed {
+        Agreed { held: Mutex::new((GroupTable::new(layout), Heap::new())), limit }
+    }
+}
+
+/// A table's side of an [`Agreed`] set.
+#[derive(Debug)]
+struct Limited {
+    agreed: Arc<Agreed>,
+    /// Whether the table has made a group for every key of the full set, after which a key it does
+    /// not have is one it never will.
+    installed: bool,
+    /// The row the rows of the keys left out update, as long as a row and never read.
+    dump: Vec<u128>,
 }
 
 impl GroupTable {
@@ -115,6 +149,7 @@ impl GroupTable {
             slots: vec![0; 64],
             cap: 0,
             since: 0,
+            limited: None,
         };
         if table.layout.keys.is_empty() {
             table.add(&[], 0, None);
@@ -136,6 +171,23 @@ impl GroupTable {
     /// groups are merged by parts after the scan.
     pub fn cap(&mut self, cap: usize) {
         self.cap = cap;
+    }
+
+    /// Makes a group only for the keys of `agreed`, which the other tables of the same aggregate
+    /// share. A table with no key columns has one group whatever the limit, and is left as it is.
+    pub fn limit(&mut self, agreed: Arc<Agreed>) {
+        if self.layout.keys.is_empty() {
+            return;
+        }
+        let dump = self.layout.init.len() + Layout::acc_offset(self.layout.key_size) as usize;
+        let mut dump = vec![0u128; dump.div_ceil(16)];
+        let acc = Layout::acc_offset(self.layout.key_size) as usize;
+        // SAFETY: the vector is as long as a row, and any byte pattern is a `u128`.
+        let row = unsafe {
+            std::slice::from_raw_parts_mut(dump.as_mut_ptr().cast::<u8>(), dump.len() * 16)
+        };
+        row[acc..acc + self.layout.init.len()].copy_from_slice(&self.layout.init);
+        self.limited = Some(Limited { agreed, installed: false, dump });
     }
 
     /// Frees the slots of a table that is done taking keys, on the thread that made it. An insert
@@ -200,8 +252,45 @@ impl GroupTable {
     pub unsafe fn insert(&mut self, key: usize, hash: u64, heap: &mut Heap) -> usize {
         // SAFETY: the caller's contract.
         let key = unsafe { crate::mem::slice(key, self.layout.key_size as usize) };
+        if self.limited.is_some() {
+            return self.insert_limited(key, hash, heap);
+        }
         let gid = self.find_or_add(key, hash, Some(heap));
         self.rows[gid]
+    }
+
+    /// [`insert`](GroupTable::insert) for a table with an [`Agreed`] set. A key the table has is
+    /// found without the lock, and so is every key once the table has the whole set.
+    fn insert_limited(&mut self, key: &[u8], hash: u64, heap: &mut Heap) -> usize {
+        if let Some(gid) = self.find(key, hash) {
+            return self.rows[gid];
+        }
+        let Some(limited) = &self.limited else { return 0 };
+        if !limited.installed {
+            let agreed = Arc::clone(&limited.agreed);
+            let mut held = agreed.held.lock().unwrap_or_else(PoisonError::into_inner);
+            let (set, kept) = &mut *held;
+            let known = set.find(key, hash).is_some();
+            if known || set.len() < agreed.limit {
+                if !known {
+                    set.find_or_add(key, hash, Some(kept));
+                }
+                drop(held);
+                let gid = self.find_or_add(key, hash, Some(heap));
+                return self.rows[gid];
+            }
+            // The set is full and this key is not in it. The table makes the groups of the set it
+            // does not have yet, so it never has to ask again.
+            let size = self.layout.key_size as usize;
+            for gid in 0..set.len() {
+                self.find_or_add(&set.row(gid)[8..8 + size], set.hashes[gid], Some(heap));
+            }
+            drop(held);
+            if let Some(limited) = &mut self.limited {
+                limited.installed = true;
+            }
+        }
+        self.limited.as_ref().map_or(0, |l| l.dump.as_ptr().expose_provenance())
     }
 
     /// Folds every group of `other` into this table. A group this table does not have yet is made,
@@ -331,6 +420,7 @@ impl GroupTable {
             slots: Vec::new(),
             cap: 0,
             since: 0,
+            limited: None,
         };
         (table, ran)
     }
@@ -339,6 +429,27 @@ impl GroupTable {
         let at = std::ptr::with_exposed_provenance_mut::<u8>(self.rows[gid]);
         // SAFETY: as in `row`, and `&mut self` means nothing else is reading it.
         unsafe { std::slice::from_raw_parts_mut(at, self.row_size) }
+    }
+
+    /// The group id of `key`, if the table has it.
+    fn find(&self, key: &[u8], hash: u64) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut at = (hash as usize) & mask;
+        let tag = hash << 32;
+        loop {
+            let slot = self.slots[at];
+            if slot == 0 {
+                return None;
+            }
+            let gid = (slot as u32 - 1) as usize;
+            if slot & !0xffff_ffff == tag && self.same(gid, key) {
+                return Some(gid);
+            }
+            at = (at + 1) & mask;
+        }
     }
 
     /// The group id of `key`, made if it is new. A long string in a new key is copied into `heap`
@@ -775,6 +886,39 @@ mod tests {
         let merged = GroupTable::join(layout, parts);
         assert_eq!(merged.len(), 250);
         assert!(!merged.forgot());
+    }
+
+    #[test]
+    fn limited_tables_make_groups_for_the_keys_they_agree_on_and_no_others() {
+        let layout = Layout {
+            keys: vec![KeyField { offset: 0, width: 8, text: false }],
+            key_size: 9,
+            init: vec![0; 8],
+        };
+        let agreed = Arc::new(Agreed::new(layout.clone(), 3));
+        let (mut a, mut b) = (GroupTable::new(layout.clone()), GroupTable::new(layout));
+        a.limit(Arc::clone(&agreed));
+        b.limit(Arc::clone(&agreed));
+        let mut heap = Heap::new();
+        let mut put = |t: &mut GroupTable, v: u64| {
+            let k = v.to_le_bytes().into_iter().chain([0]).collect::<Vec<_>>();
+            // SAFETY: the key is alive and has no strings.
+            unsafe { t.insert(k.as_ptr().expose_provenance(), v * 7, &mut heap) }
+        };
+        put(&mut a, 1);
+        put(&mut b, 2);
+        put(&mut a, 3);
+        let dump = put(&mut b, 4);
+        assert_eq!(put(&mut a, 5), put(&mut a, 6));
+        assert_eq!(put(&mut b, 9), dump);
+        put(&mut b, 1);
+        let keys = |t: &GroupTable| {
+            let mut keys: Vec<u8> = (0..t.len()).map(|g| t.row(g)[8]).collect();
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(keys(&a), [1, 2, 3]);
+        assert_eq!(keys(&b), [1, 2, 3]);
     }
 
     #[test]

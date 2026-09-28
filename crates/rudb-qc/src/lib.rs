@@ -14,7 +14,9 @@
 //! runs the filter itself, and none of the zone maps live in this crate. An aggregate
 //! over a scan runs on as many workers as the scan has threads, each with its own state and its
 //! own [`Rt`] made by [`Rt::worker`], and the workers' groups are merged into the query's when
-//! they finish. A pipeline that produces rows runs the same way when only a sort reads them, and
+//! they finish. When only a limit with no order reads the groups, the workers agree on the first
+//! keys any of them sees, as many as the limit reads, and make groups for those keys and no
+//! others. A pipeline that produces rows runs the same way when only a sort reads them, and
 //! its workers' rows are put together in the order the workers finish. Any other pipeline that
 //! produces rows, or builds a join table, runs on one worker, because the order its rows come out
 //! in is part of the answer.
@@ -177,7 +179,19 @@ impl Compiled {
         let mut unordered = vec![false; self.graph.stages.len()];
         // The stages whose rows only a top N reads, with its keys and how many rows it keeps.
         let mut topped: Vec<Option<(Vec<Key>, u64)>> = vec![None; self.graph.stages.len()];
+        // The stages whose rows only a limit with no order reads, with how many rows it reads.
+        let mut limited: Vec<Option<usize>> = vec![None; self.graph.stages.len()];
         for stage in &self.graph.stages {
+            if let Stage::Limit { input, count: Some(count), offset, .. } = stage
+                && let Ok(count) = usize::try_from(count.saturating_add(*offset))
+            {
+                limited[*input] = Some(count);
+                if let Stage::Pipeline(p) = &self.graph.stages[*input]
+                    && let Some(below) = passed(p)
+                {
+                    limited[below] = Some(count);
+                }
+            }
             if let Stage::Sort { input, .. } | Stage::TopN { input, .. } = stage {
                 unordered[*input] = true;
             }
@@ -226,6 +240,10 @@ impl Compiled {
                     let feed = feed.sized(rows);
                     let feed = match &topped[at] {
                         Some((keys, count)) => feed.topped(keys, *count),
+                        None => feed,
+                    };
+                    let feed = match limited[at] {
+                        Some(count) => feed.limited(count),
                         None => feed,
                     };
                     match &p.source {
@@ -286,11 +304,8 @@ impl Compiled {
 /// that are in the top N of their own chunk of the groups, so the aggregate cuts its chunks before
 /// the projection sees them.
 fn through(p: &rudb_qc_pipe::Pipeline, keys: &[Key]) -> Option<(usize, Vec<Key>)> {
-    let Source::Stage { stage, .. } = p.source else { return None };
+    let stage = passed(p)?;
     let rudb_qc_pipe::Sink::Result { exprs, .. } = &p.sink else { return None };
-    if !p.ops.is_empty() {
-        return None;
-    }
     let keys = keys
         .iter()
         .map(|k| {
@@ -300,6 +315,12 @@ fn through(p: &rudb_qc_pipe::Pipeline, keys: &[Key]) -> Option<(usize, Vec<Key>)
         })
         .collect::<Option<Vec<Key>>>()?;
     Some((stage, keys))
+}
+
+/// The stage `p` reads, when `p` makes one row out of each of its rows and nothing else.
+fn passed(p: &rudb_qc_pipe::Pipeline) -> Option<usize> {
+    let Source::Stage { stage, .. } = p.source else { return None };
+    (p.ops.is_empty() && matches!(p.sink, rudb_qc_pipe::Sink::Result { .. })).then_some(stage)
 }
 
 /// How many rows the table a scan reads has, when the scan reads a table and not a function.
