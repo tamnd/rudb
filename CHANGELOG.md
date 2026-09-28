@@ -8,6 +8,12 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.2
+
+More C5 work on the compiled engine's grouped aggregates. #2061 lets a top N over a compiled scan tell the scan which parts it can skip. #2062 answers an aggregate with no groups from the table statistics, like the first engine already does, and #2063 adds a `rows` option so the tests can still run such an aggregate over its rows. #2065 lets a merge part keep a worker's row where it is instead of copying it into a fresh page. #2067 reuses the last row's group for a key that is the same as the last one, which pays off on a file sorted on its keys. #2068 makes each merge part's groups into chunks where it folds them and skips the join. Elsewhere, #2064 floors a sub-day date_trunc on timestamps with a fixed unit per part, and #2066 says why the runtime bitmap's bounds check stays.
+
+On gamingpc over ClickBench at ten million rows and 16 threads, #2065, #2067 and #2068 together took q33 from 0.160s to 0.098s, q16 from 0.068s to 0.049s, q19 from 0.169s to 0.115s, q28 from 0.029s to 0.017s and q36 from 0.060s to 0.051s, and #2062 took q2 from 0.004s to 0.002s. None of the 43 queries differ from the first engine. The native directory format number stays at 30 and the storage format version at 9.
+
 ## 0.8.1
 
 The first C5 work, on ClickBench on the compiled engine. #2049 lets the scan under a compiled pipeline skip the parts its zone maps rule out. #2051 cuts groups to the top N through a projection and adds `--explain` to `xtask compiled`. #2054 makes groups only for the keys a limit with no order reads, which made q18 about four times faster. #2055 picks the groups a top N by count keeps straight from the group rows before making them into values. #2057 sizes the parts of a group merge by the number of groups so each part's slots stay in the cache, and #2058 lets a merge part take a worker's row as it is for a key it has not seen. Elsewhere, #2050 reads a key only at the rows a tight pushed filter keeps, and #2053 adds approx_top_k over the pin's filtered space saving.
