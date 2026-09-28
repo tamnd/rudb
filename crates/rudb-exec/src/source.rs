@@ -748,6 +748,8 @@ struct Pushed {
     predicate: Prepared,
     /// A necessary single-column LIKE that can run before the other projected column is read.
     late: Option<Late>,
+    /// The conjuncts that read one text column and nothing else, by column. See [`Valued`].
+    valued: Vec<Valued>,
     /// The whole predicate when it is a `LIKE` a compressed text page can answer without its
     /// strings being read. See [`Scan::read_stored`].
     stored: Option<Stored>,
@@ -800,6 +802,90 @@ struct Working {
     scratch: Scratch,
     late_scratch: Option<Scratch>,
     gauge: Gauge,
+}
+
+/// The conjuncts of a pushed filter that read one text column and nothing else.
+///
+/// Asked of the column's table wide dictionary once, they say which codes can pass, and the rows of
+/// those codes, which the file records per value, are every row the filter can keep. Those go in
+/// with the exact rows a join hands down, so a filter that keeps a few percent of a table reads a
+/// few percent of it. On JOB `cast_info.note IN (...)` keeps 2.4 of 36 million rows and the scan
+/// used to decode every code to find them. The filter still runs over what is read, so the rows only
+/// ever say where to look. See `rudb_native::postings`.
+#[derive(Debug)]
+struct Valued {
+    input: usize,
+    tests: Vec<Prepared>,
+}
+
+impl Valued {
+    /// The codes of `dictionary` every test passes, or `None` when a null passes them all, since
+    /// the recorded rows leave the nulls out, or when a test cannot be asked.
+    fn passing(&self, types: &[LogicalType], dictionary: &Vector) -> Option<Vec<u32>> {
+        let over = |len: usize, column: Option<&Vector>| {
+            let mut columns =
+                types.iter().map(|ty| Vector::constant(*ty, Value::Null, len)).collect::<Vec<_>>();
+            if let Some(column) = column {
+                columns[self.input] = column.clone();
+            }
+            Chunk::with_rows(columns, len).ok()
+        };
+        let nulls = over(1, None)?;
+        let mut null_passes = true;
+        for test in &self.tests {
+            let kept = test.evaluate_filter(&nulls, &mut test.scratch()).ok()?;
+            null_passes &= kept.len() == 1;
+        }
+        if null_passes {
+            return None;
+        }
+        let values = over(dictionary.len(), Some(dictionary))?;
+        let mut held: Option<Vec<u32>> = None;
+        for test in &self.tests {
+            let kept = test.evaluate_filter(&values, &mut test.scratch()).ok()?;
+            held = Some(match held {
+                None => kept.indices().to_vec(),
+                Some(before) => {
+                    let mut pass = vec![false; dictionary.len()];
+                    for &code in kept.indices() {
+                        pass[code as usize] = true;
+                    }
+                    before.into_iter().filter(|&code| pass[code as usize]).collect()
+                }
+            });
+        }
+        held
+    }
+}
+
+/// The conjuncts of `predicate` that read exactly one text column of the scan, grouped by column.
+fn valued(plan: &Plan, schema: &Schema, predicate: ExprRef, session: &Session) -> Vec<Valued> {
+    let conjuncts = match *plan.expr(predicate) {
+        Expr::Conjunction { op: ConjunctionOp::And, children } => plan.expr_list(children).to_vec(),
+        _ => vec![predicate],
+    };
+    let types = schema.types();
+    let mut out: Vec<Valued> = Vec::new();
+    for conjunct in conjuncts {
+        let mut inputs = Vec::new();
+        let mut unknown = false;
+        crate::join::columns(plan, conjunct, &mut |binding| match schema.position_of(binding) {
+            Some(at) if !inputs.contains(&at) => inputs.push(at),
+            Some(_) => {}
+            None => unknown = true,
+        });
+        let [input] = inputs[..] else { continue };
+        if unknown || types[input] != LogicalType::Varchar {
+            continue;
+        }
+        let Ok(test) = Prepared::one(plan, conjunct, schema) else { continue };
+        let test = test.in_session(session);
+        match out.iter_mut().find(|one| one.input == input) {
+            Some(one) => one.tests.push(test),
+            None => out.push(Valued { input, tests: vec![test] }),
+        }
+    }
+    out
 }
 
 /// The first predicate and column of a two-column selective scan.
@@ -1017,9 +1103,11 @@ impl Pushed {
             None
         };
         let stored = stored_like(plan, schema, pushdown.predicate);
+        let valued = valued(plan, schema, pushdown.predicate, session);
         Ok(Self {
             predicate,
             late,
+            valued,
             stored,
             compaction,
             passes: later_passes(plan, pushdown.node),
@@ -1876,14 +1964,48 @@ impl<'a> Scan<'a> {
     }
 
     /// The rows in every set of exact rows the joins above handed down, `None` when none did.
+    ///
+    /// The rows the file records for the values the pushed filter can keep go in with them, see
+    /// [`Valued`].
     fn handed(&self) -> Option<Rids> {
         let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
-        let mut sets = joins.filter_map(|sideways| sideways.rows(self.index));
-        let first = sets.next()?;
-        // Sets over tables of different sizes would be a bug above, and the first alone is still
-        // every row that can survive.
-        let all = sets.try_fold(first.clone(), |held, rows| held.intersect(rows));
-        Some(all.unwrap_or_else(|_| first.clone()))
+        let sets = joins.filter_map(|sideways| sideways.rows(self.index).cloned());
+        let mut held: Option<Rids> = None;
+        for rows in sets.chain(self.valued_rows()) {
+            // Sets over tables of different sizes would be a bug above, and the first alone is
+            // still every row that can survive.
+            held = Some(match held {
+                None => rows,
+                Some(before) => before.intersect(&rows).unwrap_or(before),
+            });
+        }
+        held
+    }
+
+    /// The rows the file records for the values each [`Valued`] group can keep, for the groups
+    /// that keep at most one row in [`SPARSE_READ`], which is where reading at the rows pays.
+    fn valued_rows(&self) -> Vec<Rids> {
+        let Some(pushed) = &self.pushed else { return Vec::new() };
+        let Some(reader) = self.table.rows().stored() else { return Vec::new() };
+        let types = self.schema.types();
+        let mut out = Vec::new();
+        for one in &pushed.valued {
+            let Some(column) = self.columns[one.input] else { continue };
+            let Some(index) = reader.value_rows(column) else { continue };
+            let Ok(Some(dictionary)) = reader.global_dictionary(column) else { continue };
+            if dictionary.len() != index.values() {
+                continue;
+            }
+            let Some(codes) = one.passing(&types, &dictionary) else { continue };
+            let Some(held) = index.held(&codes) else { continue };
+            if held.saturating_mul(SPARSE_READ as u64) > index.rows() {
+                continue;
+            }
+            if let Ok(rows) = index.rows_of(&codes) {
+                out.push(rows);
+            }
+        }
+        out
     }
 
     /// Whether the exact rows hold nothing inside part `at`, so the part is never read.

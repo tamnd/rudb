@@ -2335,7 +2335,8 @@ fn index(
     rebind(path, catalog, &names, pages)
 }
 
-/// Sketches the long text columns of every table in the file that has no current sketch.
+/// Sketches the long text columns of every table in the file that has no current sketch, and
+/// records the rows of each value of its coded text columns. See `rudb_native::postings`.
 ///
 /// Apart from [`index`] because nothing has to be declared for it: a text sketch answers a `LIKE`
 /// on the column it was built from and on nothing else, so the file is all it needs. A table whose
@@ -2345,14 +2346,22 @@ fn sketch(path: &Path, catalog: &mut Catalog, pages: &rudb_native::PagePool) -> 
     let native = rudb_native::Catalog::open_in(path, pages)?;
     let mut stale = Vec::new();
     for name in native.names() {
-        if !rudb_native::grams::current(&native.table(name)?) {
-            stale.push(name.to_string());
+        let reader = native.table(name)?;
+        let grams = !rudb_native::grams::current(&reader);
+        let postings = !rudb_native::postings::current(&reader);
+        if grams || postings {
+            stale.push((name.to_string(), grams, postings));
         }
     }
     drop(native);
     let mut names = Vec::new();
-    for table in &stale {
-        rudb_native::grams::build_text_grams(path, table)?;
+    for (table, grams, postings) in &stale {
+        if *grams {
+            rudb_native::grams::build_text_grams(path, table)?;
+        }
+        if *postings {
+            rudb_native::postings::build_value_rows(path, table)?;
+        }
         if let Some(name) = catalog
             .tables()
             .find(|held| held.name().table == *table)
