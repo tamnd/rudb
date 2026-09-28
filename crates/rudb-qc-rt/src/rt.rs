@@ -100,8 +100,6 @@ enum Object {
         regex: Regex,
         rewrite: Rewrite,
         global: bool,
-        /// The ClickBench q29 host extraction, answered without the regex machine.
-        host: bool,
     },
     Table(GroupTable),
     Distinct(Distinct),
@@ -165,11 +163,10 @@ impl Rt {
             .iter()
             .map(|o| match o {
                 Object::Like(like) => Object::Like(like.clone()),
-                Object::Regex { regex, rewrite, global, host } => Object::Regex {
+                Object::Regex { regex, rewrite, global } => Object::Regex {
                     regex: regex.clone(),
                     rewrite: rewrite.clone(),
                     global: *global,
-                    host: *host,
                 },
                 Object::Table(t) => Object::Table(GroupTable::new(t.layout().clone())),
                 Object::Distinct(_) => Object::Distinct(Distinct::new()),
@@ -335,13 +332,11 @@ impl Rt {
     ///
     /// When the pattern or the options do not parse.
     pub fn add_regex(&mut self, pattern: &str, rewrite: &str, options: &str) -> Result<u64, Error> {
-        let host =
-            pattern == "^https?://(?:www\\.)?([^/]+)/.*$" && rewrite == "\\1" && options.is_empty();
         let options = rudb_regex::Options::parse(options)?;
         let global = options.global;
         let regex = Regex::with_options(pattern, options)?;
         let rewrite = Rewrite::new(rewrite, regex.groups());
-        Ok(self.add(Object::Regex { regex, rewrite, global, host }))
+        Ok(self.add(Object::Regex { regex, rewrite, global }))
     }
 
     /// A handle on a grouping table.
@@ -509,16 +504,11 @@ impl Rt {
                 u128::from(regex.is_match(utf8(s(1))))
             }
             Call::StrRegexReplace => {
-                let Some(Object::Regex { regex, rewrite, global, host }) =
+                let Some(Object::Regex { regex, rewrite, global }) =
                     self.objects.get(a[0] as usize)
                 else {
                     return Err(self.fail(bad_handle(name)));
                 };
-                if *host {
-                    // The answer is a piece of the text or the text itself, so its header points
-                    // at bytes that live as long as the text's do and nothing is copied.
-                    return Ok(text::make(host_bytes(s(1))));
-                }
                 let mut out = std::mem::take(&mut self.buffer);
                 out.clear();
                 regex.replace_into(&mut out, utf8(s(1)), rewrite, *global);
@@ -609,20 +599,6 @@ const MINUTE: i64 = 60_000_000;
 
 fn bad_handle(name: &str) -> Error {
     Error::new(ErrorCode::Internal, format!("{name} got a handle on the wrong kind of object"))
-}
-
-/// What `regexp_replace(text, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1')` gives, which is the
-/// host or the text itself when the anchored pattern does not match. The `.*` does not cross a
-/// newline and `[^/]+` does, which is the only subtle part.
-fn host_bytes(text: &[u8]) -> &[u8] {
-    let rest = text.strip_prefix(b"http://").or_else(|| text.strip_prefix(b"https://"));
-    let Some(rest) = rest else { return text };
-    let Some(end) = memchr::memchr(b'/', rest) else { return text };
-    if end == 0 || memchr::memchr(b'\n', &rest[end + 1..]).is_some() {
-        return text;
-    }
-    let host = &rest[..end];
-    host.strip_prefix(b"www.").filter(|without| !without.is_empty()).unwrap_or(host)
 }
 
 fn utf8(bytes: &[u8]) -> &str {
@@ -788,32 +764,6 @@ mod tests {
             args.resize(p.args.len(), s);
             let r = rt.rtcall(i as u32, &args);
             assert!(r.is_ok(), "{} failed: {:?}", p.name, rt.take_error());
-        }
-    }
-
-    #[test]
-    fn the_host_shortcut_agrees_with_the_regex_machine() {
-        let pattern = "^https?://(?:www\\.)?([^/]+)/.*$";
-        let regex = Regex::with_options(pattern, rudb_regex::Options::parse("").unwrap()).unwrap();
-        let rewrite = Rewrite::new("\\1", regex.groups());
-        for text in [
-            "http://www.example.com/a",
-            "https://example.com/",
-            "http://example.com",
-            "ftp://example.com/a",
-            "https:///a",
-            "https://example.com/a\nb",
-            "https://example.com/a\n",
-            "https://exa\nmple.com/a",
-            "http://www./a",
-            "http://www.a/b",
-            "HTTP://example.com/a",
-            "",
-            "https://www.example.com/path/with/many/parts?q=1",
-        ] {
-            let mut out = String::new();
-            regex.replace_into(&mut out, text, &rewrite, false);
-            assert_eq!(host_bytes(text.as_bytes()), out.as_bytes(), "{text:?}");
         }
     }
 
