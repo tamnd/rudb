@@ -80,6 +80,20 @@ pub struct StablePairCodes {
 
 type StableCodes = (Vec<Option<u32>>, Arc<Vector>);
 
+/// The rows of a dictionary column that hold one of a set of codes, found by
+/// [`Rows::coded_rows`].
+#[derive(Debug, Default)]
+pub struct CodedRows {
+    /// Table-wide row ordinals, ascending.
+    pub ordinals: Vec<u64>,
+    /// The code each of those rows holds.
+    pub codes: Vec<u32>,
+    /// The signed value of the other column at each row, when one was asked for.
+    pub others: Vec<Option<i128>>,
+    /// The one table-wide dictionary the codes name.
+    pub dictionary: Option<Arc<Vector>>,
+}
+
 impl Rows {
     /// The rows to append to, turning a committed file into one that has rows in memory beside it.
     ///
@@ -317,28 +331,85 @@ impl Rows {
         }
     }
 
-    /// The ordinals of the rows whose dictionary column holds one of `codes`, in ascending order,
-    /// with the dictionary the codes index.
+    /// The rows whose dictionary column holds one of `codes`, in ascending order, with the
+    /// dictionary the codes index.
     ///
     /// Every part is read, but for its codes alone, which is what a filter on the column costs
-    /// without its strings. `None` when the table is not a file or a part of the column is not
-    /// written against the one dictionary the rest are.
-    pub fn coded_ordinals(
+    /// without its strings. With `other` the signed values of that column come back beside the
+    /// codes, read in the same pass. The parts are split across threads, since a table of a
+    /// million rows is a thousand of them. `None` when the table is not a file, a part of the
+    /// column is not written against the one dictionary the rest are, or `other` is not signed.
+    pub fn coded_rows(
         &self,
         column: usize,
+        other: Option<usize>,
         codes: &[u32],
-    ) -> Result<Option<(Vec<u64>, Arc<Vector>)>> {
+    ) -> Result<Option<CodedRows>> {
         let Self::Native(reader) = self else { return Ok(None) };
         let Some(&most) = codes.iter().max() else { return Ok(None) };
         let mut wanted = vec![false; most as usize + 1];
         for &code in codes {
             wanted[code as usize] = true;
         }
-        let mut ordinals = Vec::new();
-        let mut dictionary: Option<Arc<Vector>> = None;
+        let parts = reader.parts();
+        let mut starts = Vec::with_capacity(parts);
         let mut start = 0_u64;
-        for part in 0..reader.parts() {
-            let held = reader.read(part, &[column])?;
+        for part in 0..parts {
+            starts.push(start);
+            start += reader.part_rows(part) as u64;
+        }
+        let workers =
+            std::thread::available_parallelism().map_or(1, usize::from).min(8).min(parts).max(1);
+        let each = parts.div_ceil(workers);
+        let columns = match other {
+            Some(other) => vec![column, other],
+            None => vec![column],
+        };
+        let (wanted, starts, columns) = (&wanted, &starts, &columns);
+        let found = std::thread::scope(|scope| {
+            let handles = (0..workers)
+                .map(|worker| {
+                    let parts = worker * each..((worker + 1) * each).min(parts);
+                    scope.spawn(move || Self::coded_parts(reader, columns, wanted, starts, parts))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| Error::internal("a coded row worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let mut rows = CodedRows::default();
+        let mut dictionary: Option<Arc<Vector>> = None;
+        for found in found {
+            let Some((held, found)) = found else { return Ok(None) };
+            match (&dictionary, held) {
+                (Some(dictionary), Some(held)) if !Arc::ptr_eq(dictionary, &held) => {
+                    return Ok(None);
+                }
+                (None, Some(held)) => dictionary = Some(held),
+                _ => {}
+            }
+            rows.ordinals.extend(found.ordinals);
+            rows.codes.extend(found.codes);
+            rows.others.extend(found.others);
+        }
+        Ok(dictionary.map(|dictionary| CodedRows { dictionary: Some(dictionary), ..rows }))
+    }
+
+    /// One worker's share of [`Rows::coded_rows`], the parts in `parts` read in order.
+    fn coded_parts(
+        reader: &NativeReader,
+        columns: &[usize],
+        wanted: &[bool],
+        starts: &[u64],
+        parts: std::ops::Range<usize>,
+    ) -> Result<Option<(Option<Arc<Vector>>, CodedRows)>> {
+        let mut rows = CodedRows::default();
+        let mut dictionary: Option<Arc<Vector>> = None;
+        for part in parts {
+            let held = reader.read(part, columns)?;
             let vector = held.column(0)?;
             let Some((part_codes, values)) = vector.stable_dictionary_parts() else {
                 return Ok(None);
@@ -348,14 +419,24 @@ impl Rows {
                 Some(_) => {}
                 None => dictionary = Some(Arc::clone(values)),
             }
+            let other = if columns.len() > 1 { Some(held.column(1)?) } else { None };
             for (row, &code) in part_codes.iter().enumerate() {
-                if wanted.get(code as usize).copied().unwrap_or(false) && !vector.is_null_at(row) {
-                    ordinals.push(start + row as u64);
+                if !wanted.get(code as usize).copied().unwrap_or(false) || vector.is_null_at(row) {
+                    continue;
+                }
+                rows.ordinals.push(starts[part] + row as u64);
+                rows.codes.push(code);
+                if let Some(other) = other {
+                    if other.is_null_at(row) {
+                        rows.others.push(None);
+                    } else {
+                        let Some(value) = other.signed_at(row) else { return Ok(None) };
+                        rows.others.push(Some(value));
+                    }
                 }
             }
-            start += reader.part_rows(part) as u64;
         }
-        Ok(dictionary.map(|dictionary| (ordinals, dictionary)))
+        Ok(Some((dictionary, rows)))
     }
 
     /// Query-specific pair leaders are not used, including in older native files.

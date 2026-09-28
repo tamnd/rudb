@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
-use rudb_catalog::{Catalog, Parent, QualifiedName, Table};
+use rudb_catalog::{Catalog, CodedRows, Parent, QualifiedName, Table};
 use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Rule, Session, Value};
 use rudb_functions::TableFunction;
 use rudb_graph::Link;
@@ -61,7 +61,7 @@ use rudb_plan::{
     PipelineRef, Plan, ROOT, Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
-use rudb_vector::VECTOR_SIZE;
+use rudb_vector::{VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
 use crate::consistent::{Answer, Collect, Reduction};
@@ -968,6 +968,7 @@ fn native_coded_counts(
     }
     // The values the filter tests the key against, each with whether it keeps rows equal to it.
     let mut tests = Vec::new();
+    let mut untested = false;
     if let Some(predicate) = predicate {
         let conjuncts = match *plan.expr(predicate) {
             Expr::Conjunction { op: ConjunctionOp::And, children } => plan.expr_list(children),
@@ -995,6 +996,7 @@ fn native_coded_counts(
             }
             tests.push((value, keeps));
         }
+        untested = tests.len() < conjuncts.len();
     }
     let mut bound = codes.omitted_max;
     let mut wanted = Vec::new();
@@ -1022,14 +1024,45 @@ fn native_coded_counts(
     if leaders < top || rows > CODED_ROWS {
         return Ok(None);
     }
-    let Some((ordinals, _)) = table.rows().coded_ordinals(column, &wanted)? else {
+    // A small integer beside the string, with a filter the tests above already settle, is read in
+    // the same pass as the codes, and the groups are counted without making a string of either.
+    let signed = match keys {
+        &[left, right] if !untested => {
+            let (other, first) =
+                if is_binding(plan, left, binding) { (right, false) } else { (left, true) };
+            match *plan.expr(other) {
+                Expr::Column(beside)
+                    if beside.table == index
+                        && beside != binding
+                        && matches!(
+                            plan.expr_type(other),
+                            LogicalType::TinyInt
+                                | LogicalType::SmallInt
+                                | LogicalType::Integer
+                                | LogicalType::BigInt
+                        ) =>
+                {
+                    stored.get(beside.column as usize).map(|&at| (at, plan.expr_type(other), first))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(found) =
+        table.rows().coded_rows(column, signed.map(|(other, _, _)| other), &wanted)?
+    else {
         return Ok(None);
     };
     // The synopsis counts are exact, so any other number of rows means the codes are not the ones
     // the parts carry, and the answer is left to the rows.
-    if ordinals.len() as u64 != rows {
+    if found.ordinals.len() as u64 != rows {
         return Ok(None);
     }
+    if let (Some((_, ty, first)), Some(dictionary)) = (signed, &found.dictionary) {
+        return signed_coded_counts(&found, dictionary, ty, first, bound, top);
+    }
+    let ordinals = found.ordinals;
     let schema = Schema::numbered(fields.to_vec(), index);
     let Ok(prepared) = Prepared::new(plan, keys, &schema) else { return Ok(None) };
     let filter = match predicate {
@@ -1078,6 +1111,70 @@ fn native_coded_counts(
         .map(|(key, count)| (key.0, count))
         .collect();
     Ok(Some(NativePairFrequencies { entries }))
+}
+
+/// Whether `expr` is the column `binding` names.
+fn is_binding(plan: &Plan, expr: ExprRef, binding: ColumnBinding) -> bool {
+    matches!(*plan.expr(expr), Expr::Column(held) if held == binding)
+}
+
+/// The groups of [`native_coded_counts`] when the other key is a signed integer read beside the
+/// codes, counted by the pair of the two and named as values only for the groups that lead.
+fn signed_coded_counts(
+    found: &CodedRows,
+    dictionary: &Vector,
+    ty: &LogicalType,
+    first: bool,
+    bound: u64,
+    top: usize,
+) -> Result<Option<NativePairFrequencies>> {
+    if found.others.len() != found.codes.len() {
+        return Ok(None);
+    }
+    let mut counts = HashMap::<(Option<i128>, u32), u64, BuildHasherDefault<Digest>>::default();
+    for (&other, &code) in found.others.iter().zip(&found.codes) {
+        *counts.entry((other, code)).or_default() += 1;
+    }
+    let mut boundaries = counts.values().copied().collect::<Vec<_>>();
+    if boundaries.len() < top {
+        return Ok(None);
+    }
+    boundaries.select_nth_unstable_by(top - 1, |left, right| right.cmp(left));
+    let boundary = boundaries[top - 1];
+    if boundary <= bound {
+        return Ok(None);
+    }
+    let mut entries = Vec::new();
+    for ((other, code), count) in counts {
+        if count < boundary {
+            continue;
+        }
+        let other = match other {
+            Some(value) => signed_value(ty, value)?,
+            None => Value::Null,
+        };
+        let text = Value::Varchar(
+            dictionary
+                .try_text_at(code as usize)?
+                .ok_or_else(|| Error::internal("a string frequency code is null"))?
+                .to_owned(),
+        );
+        let key = if first { vec![other, text] } else { vec![text, other] };
+        entries.push((key, count));
+    }
+    Ok(Some(NativePairFrequencies { entries }))
+}
+
+/// A signed integer read out of a column, as the value of the column's type.
+fn signed_value(ty: &LogicalType, value: i128) -> Result<Value> {
+    let range = || Error::internal("a signed column value is out of its type's range");
+    Ok(match ty {
+        LogicalType::TinyInt => Value::TinyInt(i8::try_from(value).map_err(|_| range())?),
+        LogicalType::SmallInt => Value::SmallInt(i16::try_from(value).map_err(|_| range())?),
+        LogicalType::Integer => Value::Integer(i32::try_from(value).map_err(|_| range())?),
+        LogicalType::BigInt => Value::BigInt(i64::try_from(value).map_err(|_| range())?),
+        _ => return Err(Error::internal("a signed key has a type that is not a signed integer")),
+    })
 }
 
 /// A count grouped by keys one of which is a column whose frequency synopsis kept the rows of its
