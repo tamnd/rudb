@@ -185,7 +185,7 @@ pub fn build_measured<'a>(
     build_measured_with_sink(
         plan,
         catalog,
-        BuildUnder { cancel, memory, seams, session, report },
+        BuildUnder { cancel, memory, seams, session, report, cutoff: None },
         None,
         None,
     )
@@ -213,7 +213,7 @@ pub fn build_measured_into<'a>(
     build_measured_with_sink(
         plan,
         catalog,
-        BuildUnder { cancel, memory, seams, session, report: &report },
+        BuildUnder { cancel, memory, seams, session, report: &report, cutoff: None },
         Some(sink),
         None,
     )
@@ -247,10 +247,70 @@ pub fn build_pruned_into<'a>(
     build_measured_with_sink(
         plan,
         catalog,
-        BuildUnder { cancel, memory, seams, session, report: &report },
+        BuildUnder { cancel, memory, seams, session, report: &report, cutoff: None },
         Some(sink),
         Some(plan.root()),
     )
+}
+
+/// [`build_measured_into`], or [`build_pruned_into`] when `pruned`, with the scan skipping the
+/// parts that `cut` rules out as the top N the caller runs over its rows fills up.
+///
+/// # Errors
+///
+/// The same as [`build_pruned_into`] when `pruned`, and as [`build_measured_into`] otherwise.
+#[allow(clippy::too_many_arguments)]
+pub fn build_cut_into<'a>(
+    plan: &'a Plan,
+    catalog: &'a Catalog,
+    cancel: &Cancel,
+    memory: &Memory,
+    seams: &Settings,
+    session: &Session,
+    sink: Arc<dyn DynSink + 'a>,
+    pruned: bool,
+    cut: &TopCut,
+) -> Result<Query<'a>> {
+    if pruned && !matches!(plan.node(plan.root()), Node::Filter { .. }) {
+        return Err(Error::internal("a pruned scan whose root is not a filter"));
+    }
+    let report = Report::new();
+    let cutoff = Some(Arc::clone(&cut.0));
+    build_measured_with_sink(
+        plan,
+        catalog,
+        BuildUnder { cancel, memory, seams, session, report: &report, cutoff },
+        Some(sink),
+        pruned.then(|| plan.root()),
+    )
+}
+
+/// The cutoff of a top N that runs outside the first engine, over the rows of a scan the first
+/// engine builds with [`build_cut_into`]. See [`crate::cutoff`] for why a scan may skip the parts
+/// it rules out.
+#[derive(Debug)]
+pub struct TopCut(Arc<Cutoff>);
+
+impl TopCut {
+    /// The cutoff for the top N `top` of `plan`, when its first key reads a column of a scan
+    /// below it and puts nulls last, and `None` otherwise.
+    #[must_use]
+    pub fn of(plan: &Plan, top: NodeRef) -> Option<TopCut> {
+        let Node::TopN { input, keys, .. } = *plan.node(top) else { return None };
+        let (binding, op) = cutoff::ordering(plan, keys)?;
+        let binding = sideways::beneath(plan, input, binding)?;
+        let cutoff = Cutoff::new();
+        cutoff.about(binding, op);
+        Some(TopCut(cutoff))
+    }
+
+    /// Says that the caller holds a full set of candidates whose worst first key is `value`. A
+    /// value no bound compares with says nothing.
+    pub fn reached(&self, value: &Value) {
+        if let Some(bound) = Bound::of_value(value) {
+            self.0.reached(bound);
+        }
+    }
 }
 
 struct BuildUnder<'a> {
@@ -259,6 +319,8 @@ struct BuildUnder<'a> {
     seams: &'a Settings,
     session: &'a Session,
     report: &'a Report,
+    /// A cutoff from a top N the caller runs, for the scan at the bottom of the plan.
+    cutoff: Option<Arc<Cutoff>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -276,7 +338,7 @@ fn build_measured_with_sink<'a>(
     sink: Option<Arc<dyn DynSink + 'a>>,
     pruning_only: Option<NodeRef>,
 ) -> Result<Query<'a>> {
-    let BuildUnder { cancel, memory, seams, session, report } = under;
+    let BuildUnder { cancel, memory, seams, session, report, cutoff } = under;
     let shape = Shape::of(plan);
     for pipeline in shape.all() {
         report.pipeline(pipeline);
@@ -301,7 +363,7 @@ fn build_measured_with_sink<'a>(
         sideways: None,
         above: Vec::new(),
         armed: Vec::new(),
-        cutoff: None,
+        cutoff,
         top_counts: Vec::new(),
         marking: None,
         pruning_only,

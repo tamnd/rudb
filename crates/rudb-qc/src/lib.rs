@@ -246,6 +246,14 @@ impl Compiled {
                         Some(count) => feed.limited(count),
                         None => feed,
                     };
+                    let feed = match (&p.source, &topped[at]) {
+                        (Source::Scan { node, .. }, Some(_)) => {
+                            let cut = topping(plan, filtered(plan, *node).unwrap_or(*node))
+                                .and_then(|top| rudb_exec::TopCut::of(plan, top));
+                            feed.telling(cut)
+                        }
+                        _ => feed,
+                    };
                     match &p.source {
                         Source::Scan { node, .. } => {
                             let mut scan = plan.clone();
@@ -337,6 +345,20 @@ fn scanned(plan: &Plan, node: NodeRef, catalog: &Catalog) -> Option<usize> {
 /// nothing else: every row of the parts left comes to the body, which runs the filter itself.
 fn filtered(plan: &Plan, node: NodeRef) -> Option<NodeRef> {
     parent(plan, plan.root(), node).filter(|&p| matches!(plan.node(p), Node::Filter { .. }))
+}
+
+/// The top N right above the scan or filter at `node`, with nothing but filters and projections
+/// between them.
+fn topping(plan: &Plan, node: NodeRef) -> Option<NodeRef> {
+    let mut at = node;
+    loop {
+        let up = parent(plan, plan.root(), at)?;
+        match plan.node(up) {
+            Node::Filter { .. } | Node::Project { .. } => at = up,
+            Node::TopN { .. } => return Some(up),
+            _ => return None,
+        }
+    }
 }
 
 /// The node under `from` whose input is `child`.

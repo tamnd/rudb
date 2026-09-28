@@ -87,6 +87,29 @@ fn a_top_n_by_a_count_picks_its_groups_by_the_count_on_the_compiled_engine() {
 }
 
 #[test]
+fn a_top_n_over_a_scan_tells_the_scan_its_cutoff_on_the_compiled_engine() {
+    let database = Database::new();
+    for sql in [
+        "CREATE TABLE t (k BIGINT, s VARCHAR)",
+        // Enough rows for many parts, with the keys spread so that most parts hold none of the top.
+        "INSERT INTO t SELECT (i * 7919) % 300000, CASE WHEN i % 5 = 0 THEN '' ELSE 's' || (i % 97) END FROM range(300000) r(i)",
+    ] {
+        database.execute(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    for sql in [
+        "SELECT s FROM t WHERE s <> '' ORDER BY k LIMIT 10",
+        "SELECT s, k FROM t WHERE s <> '' ORDER BY k DESC LIMIT 5 OFFSET 3",
+        "SELECT k, s FROM t ORDER BY k, s LIMIT 7",
+    ] {
+        database.execute("SET engine = 'first'").expect("the first engine");
+        let first = rows(&database, sql);
+        database.execute("SET engine = 'compiled'").expect("the compiled engine");
+        assert_eq!(rows(&database, sql), first, "{sql}");
+    }
+    assert_eq!(database.refusals(), Vec::<String>::new());
+}
+
+#[test]
 fn a_refused_query_runs_on_the_first_engine_and_is_logged() {
     let database = database();
     database.execute("SET engine = 'compiled'").expect("the compiled engine");

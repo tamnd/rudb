@@ -143,7 +143,10 @@ mod written;
 #[cfg(test)]
 mod tests;
 
-pub use build::{build, build_measured, build_measured_into, build_pruned_into, build_with};
+pub use build::{
+    TopCut, build, build_cut_into, build_measured, build_measured_into, build_pruned_into,
+    build_with,
+};
 pub use expr::{evaluate, evaluate_all};
 pub use links::declared;
 pub use prepared::{Prepared, Scratch};
