@@ -139,6 +139,41 @@ fn catalog() -> Catalog {
         .rows_mut()
         .append_rows(&rows)
         .expect("rows of the table's own types");
+    // `names` holds strings on either side of the longest one a header holds whole, and long
+    // ones that share their length and first four bytes, in runs and alone.
+    let names = QualifiedName::new("memory", "main", "names");
+    catalog
+        .create_table(
+            names.clone(),
+            vec![Field::new("s", LogicalType::Varchar), Field::new("k", LogicalType::Integer)],
+        )
+        .expect("a fresh table");
+    let words = [
+        "twelve bytes",
+        "twelve bytes!",
+        "twelve bytes?",
+        "",
+        "a string that is longer than twelve bytes",
+        "a string that is longer than twelve bites",
+        "x",
+    ];
+    let rows: Vec<Vec<Value>> = (0..9000usize)
+        .map(|i| {
+            let w = if i < 3000 { i / 40 } else { i * 7 };
+            let s = if w % 9 == 7 {
+                Value::Null
+            } else {
+                Value::Varchar(words[w % words.len()].to_string())
+            };
+            vec![s, Value::Integer((i % 3) as i32)]
+        })
+        .collect();
+    catalog
+        .table_mut(&names)
+        .expect("the table just created")
+        .rows_mut()
+        .append_rows(&rows)
+        .expect("rows of the table's own types");
     let empty = QualifiedName::new("memory", "main", "empty");
     catalog
         .create_table(empty, vec![Field::new("x", LogicalType::Integer)])
@@ -332,6 +367,22 @@ fn a_grouped_aggregate_over_strings_matches_the_first_engine() {
         ),
         false,
     );
+}
+
+#[test]
+fn strings_around_the_inline_length_group_and_compare_as_the_first_engine_does() {
+    let scan = "Get memory.main.names AS names #0 [s::VARCHAR, k::INTEGER]";
+    let aggs = "aggregates=[count_star()::BIGINT, sum(#0.1::INTEGER)::HUGEINT]";
+    same(&format!("Aggregate #1 groups=[#0.0::VARCHAR] {aggs}\n  {scan}"), false);
+    same(&format!("Aggregate #1 groups=[#0.0::VARCHAR, #0.1::INTEGER] {aggs}\n  {scan}"), false);
+    for w in ["twelve bytes", "twelve bytes?", "a string that is longer than twelve bites", ""] {
+        same(
+            &format!(
+                "Project #1 [#0.1::INTEGER AS k]\n  Filter (#0.0::VARCHAR = '{w}'::VARCHAR)::BOOLEAN\n    {scan}"
+            ),
+            true,
+        );
+    }
 }
 
 #[test]
