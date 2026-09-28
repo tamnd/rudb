@@ -578,6 +578,25 @@ impl Runtime for Rt {
         self.call(p.name, args)
     }
 
+    fn rtcall_into(&mut self, proxy: u32, args: &[u128], out: &mut u128) -> u64 {
+        if proxy == HOT[0] {
+            let Some(Object::Table(table)) = self.objects.get_mut(args[0] as usize) else {
+                return self.fail(bad_handle("ht_insert"));
+            };
+            // SAFETY: as for `ht_insert`.
+            let row = unsafe { table.insert(args[1] as usize, args[2] as u64, &mut self.heap) };
+            *out = row as u128;
+            return 0;
+        }
+        match self.rtcall(proxy, args) {
+            Ok(v) => {
+                *out = v;
+                0
+            }
+            Err(s) => s,
+        }
+    }
+
     fn vcall(&mut self, kernel: u32, n: u64, buffers: &[u128]) -> Result<(), u64> {
         let Some(k) = self.kernels.get_mut(kernel as usize) else {
             return Err(self.fail(Error::new(ErrorCode::Internal, format!("no kernel {kernel}"))));

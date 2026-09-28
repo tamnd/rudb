@@ -138,6 +138,10 @@ struct Lane {
     pages: Vec<Box<[u8]>>,
     /// How many rows of the last page are taken.
     fill: usize,
+    /// How many rows the last page holds, zero before the first.
+    room: usize,
+    /// The address of the next row of the last page.
+    next: usize,
 }
 
 /// The groups the tables of a limited aggregate's workers agree on: the first keys any of them
@@ -538,6 +542,7 @@ impl GroupTable {
         for lane in &mut self.lanes {
             pages.append(&mut lane.pages);
             lane.fill = 0;
+            lane.room = 0;
         }
         pages
     }
@@ -685,6 +690,11 @@ impl GroupTable {
 
     fn same(&self, gid: usize, key: &[u8]) -> bool {
         let row = &self.row(gid)[8..8 + key.len()];
+        // Keys with the same bytes are the same key, which is nearly every key whose hash matched,
+        // so a word-wise look at the whole key settles most probes without going field by field.
+        if same_bytes(row, key) {
+            return true;
+        }
         for f in &self.layout.keys {
             let n = f.null() as usize;
             if row[n] != key[n] {
@@ -715,18 +725,18 @@ impl GroupTable {
         if !self.lanes.is_empty() {
             let at = (hash.wrapping_mul(SPREAD) >> (64 - LANE_BITS)) as usize;
             let lane = &mut self.lanes[at];
-            let room = lane.pages.last().map_or(0, |p| p.len() / self.row_size);
-            if lane.fill == room {
-                let rows = (room * 2).clamp(FIRST_LANE_ROWS, LANE_ROWS);
-                lane.pages.push(vec![0u8; rows * self.row_size].into_boxed_slice());
+            if lane.fill == lane.room {
+                let rows = (lane.room * 2).clamp(FIRST_LANE_ROWS, LANE_ROWS);
+                let mut page = vec![0u8; rows * self.row_size].into_boxed_slice();
+                lane.next = page.as_mut_ptr().expose_provenance();
+                lane.pages.push(page);
+                lane.room = rows;
                 lane.fill = 0;
             }
-            let at = lane.fill * self.row_size;
+            let address = lane.next;
+            lane.next += self.row_size;
             lane.fill += 1;
-            return lane
-                .pages
-                .last_mut()
-                .map_or(0, |page| page[at..].as_mut_ptr().expose_provenance());
+            return address;
         }
         if self.fill == ROWS_PER_PAGE || self.pages.is_empty() {
             self.pages.push(vec![0u8; ROWS_PER_PAGE * self.row_size].into_boxed_slice());
@@ -814,6 +824,18 @@ fn prefetch(address: usize) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = address;
+}
+
+/// Whether two keys of the same length have the same bytes, compared eight at a time.
+#[inline]
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    let (mut x, mut y) = (a.chunks_exact(8), b.chunks_exact(8));
+    for (p, q) in x.by_ref().zip(y.by_ref()) {
+        if p != q {
+            return false;
+        }
+    }
+    x.remainder() == y.remainder()
 }
 
 /// Reads a `u128` from sixteen bytes.
