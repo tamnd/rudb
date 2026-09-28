@@ -14,6 +14,7 @@ use rudb_kernels::compare::order;
 use rudb_plan::{Node, NodeRef, Plan};
 use rudb_qc_gen::{AccOp, Grouping, qir_type};
 use rudb_qc_plan::{Column, Key, Kind};
+use rudb_qc_rt::table::{Distinct, GroupTable};
 use rudb_qc_rt::{Rt, text};
 use rudb_vector::{Buffer, Chunk, Data, Selection, StringColumn, VECTOR_SIZE, Validity, Vector};
 
@@ -93,38 +94,65 @@ pub(crate) fn values(rows: &[Vec<Value>], columns: &[Column]) -> Result<Chunk> {
 pub(crate) fn groups(rt: &Rt, g: &Grouping, columns: &[Column]) -> Result<Vec<Chunk>> {
     let table =
         rt.table(g.table).ok_or_else(|| Error::internal("the aggregate's table is gone"))?;
-    let mut chunks = Vec::new();
-    let mut from = 0;
-    while from < table.len() {
-        let to = (from + VECTOR_SIZE).min(table.len());
-        let mut vectors = Vec::with_capacity(columns.len());
-        for (k, ty) in &g.keys {
-            let cells: Vec<Cell> = (from..to)
-                .map(|gid| {
-                    let row = table.row(gid);
-                    let at = 8 + k.offset as usize;
-                    (row[8 + k.null() as usize] == 0).then(|| cell(&row[at..at + k.width as usize]))
-                })
-                .collect();
-            vectors.push(vector(ty, &cells)?);
-        }
-        for acc in &g.accs {
-            let mut cells = Vec::with_capacity(to - from);
-            for gid in from..to {
-                let at = (g.acc_offset + acc.offset) as usize;
-                let a = &table.row(gid)[at..];
-                cells.push(finish(rt, acc.op, &acc.arg, a, gid)?);
-            }
-            vectors.push(vector(&acc.ty, &cells)?);
-        }
-        chunks.push(Chunk::with_rows(vectors, to - from)?);
-        from = to;
+    let sets = g
+        .accs
+        .iter()
+        .filter_map(|acc| match acc.op {
+            AccOp::Distinct(h) => Some(
+                rt.distinct(h)
+                    .map(|d| (h, d))
+                    .ok_or_else(|| Error::internal("a distinct set is gone")),
+            ),
+            _ => None,
+        })
+        .collect::<Result<Vec<_>>>()?;
+    (0..table.len().div_ceil(VECTOR_SIZE))
+        .map(|at| group_chunk(table, &sets, g, columns, at))
+        .collect()
+}
+
+/// The groups of chunk `at` of a hash aggregate's table, the ones from `at * VECTOR_SIZE` on.
+/// `sets` are its distinct sets by handle.
+pub(crate) fn group_chunk(
+    table: &GroupTable,
+    sets: &[(u64, &Distinct)],
+    g: &Grouping,
+    columns: &[Column],
+    at: usize,
+) -> Result<Chunk> {
+    let from = at * VECTOR_SIZE;
+    let to = (from + VECTOR_SIZE).min(table.len());
+    let mut vectors = Vec::with_capacity(columns.len());
+    for (k, ty) in &g.keys {
+        let cells: Vec<Cell> = (from..to)
+            .map(|gid| {
+                let row = table.row(gid);
+                let at = 8 + k.offset as usize;
+                (row[8 + k.null() as usize] == 0).then(|| cell(&row[at..at + k.width as usize]))
+            })
+            .collect();
+        vectors.push(vector(ty, &cells)?);
     }
-    Ok(chunks)
+    for acc in &g.accs {
+        let mut cells = Vec::with_capacity(to - from);
+        for gid in from..to {
+            let at = (g.acc_offset + acc.offset) as usize;
+            let a = &table.row(gid)[at..];
+            cells.push(finish(sets, acc.op, &acc.arg, a, gid)?);
+        }
+        vectors.push(vector(&acc.ty, &cells)?);
+    }
+    Chunk::with_rows(vectors, to - from)
 }
 
 /// The value of one accumulator, `a` being its bytes in the group row.
-fn finish(rt: &Rt, op: AccOp, arg: &LogicalType, a: &[u8], gid: usize) -> Result<Cell> {
+fn finish(
+    sets: &[(u64, &Distinct)],
+    op: AccOp,
+    arg: &LogicalType,
+    a: &[u8],
+    gid: usize,
+) -> Result<Cell> {
     let i64_at = |at: usize| i64::from_le_bytes(a[at..at + 8].try_into().unwrap_or_default());
     let f64_at = |at: usize| f64::from_le_bytes(a[at..at + 8].try_into().unwrap_or_default());
     let i128_at = |at: usize| i128::from_le_bytes(a[at..at + 16].try_into().unwrap_or_default());
@@ -147,7 +175,10 @@ fn finish(rt: &Rt, op: AccOp, arg: &LogicalType, a: &[u8], gid: usize) -> Result
         }
         AccOp::MinStr | AccOp::MaxStr => (a[16] != 0).then(|| cell(&a[..16])),
         AccOp::Distinct(h) => {
-            let d = rt.distinct(h).ok_or_else(|| Error::internal("a distinct set is gone"))?;
+            let d = sets
+                .iter()
+                .find_map(|&(at, d)| (at == h).then_some(d))
+                .ok_or_else(|| Error::internal("a distinct set is gone"))?;
             let n = i64::try_from(d.count(gid)).unwrap_or(i64::MAX);
             Some(cell(&n.to_le_bytes()))
         }
@@ -232,12 +263,38 @@ pub(crate) fn sort(
     let skip = usize::try_from(offset).unwrap_or(usize::MAX);
     let take = count.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
     let wanted = skip.saturating_add(take);
-    let mut kept: Vec<u32> = (0..place.len() as u32).collect();
+    let mut kept: Vec<u32>;
     if wanted == 0 {
-        kept.clear();
-    } else if wanted < kept.len() {
-        kept.select_nth_unstable_by(wanted - 1, &mut compare);
-        kept.truncate(wanted);
+        kept = Vec::new();
+    } else if wanted.saturating_mul(8) < place.len() {
+        // A few rows out of many: the best ones so far are kept, and a row that is not better than
+        // the worst of those is passed over after one comparison, which is most of them.
+        let room = wanted.saturating_mul(4).max(1024);
+        kept = Vec::with_capacity(room);
+        let mut worst = None;
+        for n in 0..place.len() as u32 {
+            if let Some(w) = worst
+                && compare(&n, &w) != Ordering::Less
+            {
+                continue;
+            }
+            kept.push(n);
+            if kept.len() == room {
+                kept.select_nth_unstable_by(wanted - 1, &mut compare);
+                kept.truncate(wanted);
+                worst = Some(kept[wanted - 1]);
+            }
+        }
+        if kept.len() > wanted {
+            kept.select_nth_unstable_by(wanted - 1, &mut compare);
+            kept.truncate(wanted);
+        }
+    } else {
+        kept = (0..place.len() as u32).collect();
+        if wanted < kept.len() {
+            kept.select_nth_unstable_by(wanted - 1, &mut compare);
+            kept.truncate(wanted);
+        }
     }
     kept.sort_unstable_by(&mut compare);
     if let Some(e) = failed {

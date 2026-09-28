@@ -38,7 +38,7 @@ use rudb_qc_plan::Column;
 use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
 use rudb_qc_rt::table::GroupTable;
 use rudb_qc_rt::{RUNTIME_ERROR, Rt, text};
-use rudb_vector::{Chunk, Data, Validity, Vector};
+use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
 use crate::Under;
 use crate::finish::{self, Cell, cell, vector};
@@ -85,6 +85,8 @@ struct Inner<'a> {
     done: bool,
     /// The runtimes of the workers that finished, when they are merged all at once.
     workers: Vec<Rt>,
+    /// Whether an aggregate's groups were already made into chunks, which a merge does.
+    grouped: bool,
     /// Whether a worker has been folded into the runtime yet.
     merged: bool,
 }
@@ -180,6 +182,7 @@ impl<'a> Feed<'a> {
                 done: false,
                 merged: false,
                 workers: Vec::new(),
+                grouped: false,
             }),
         })
     }
@@ -256,7 +259,8 @@ impl<'a> Feed<'a> {
             let splits = pieces(threads, tables.len(), |at| tables[at].split(bits))?;
             let layout = mine.layout().clone();
             let merged = pieces(threads, parts, |part| {
-                let mut table = GroupTable::new(layout.clone());
+                let most = splits.iter().map(|s| s[part].len()).sum();
+                let mut table = GroupTable::with_capacity(layout.clone(), most);
                 for (other, split) in tables.iter().zip(&splits) {
                     table.absorb_some(other, &split[part], fold);
                 }
@@ -267,6 +271,14 @@ impl<'a> Feed<'a> {
         // The table adopted from the first worker is replaced, and its strings with it, but its
         // heap is kept with the worker, which the merged table's strings may point into.
         inner.rt.settle(workers, g.table, merged)?;
+        // The groups are made into chunks here too, while there are threads to do it with.
+        let table = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
+        let columns = self.columns;
+        let chunks = pieces(threads, table.len().div_ceil(VECTOR_SIZE), |at| {
+            finish::group_chunk(table, &[], g, columns, at)
+        })?;
+        inner.out = chunks.into_iter().collect::<Result<_>>()?;
+        inner.grouped = true;
         Ok(())
     }
 
@@ -420,7 +432,10 @@ impl<'a> Feed<'a> {
                 Step::LocalFin => {}
                 Step::Merge => return Err(Error::internal("a merge step with one worker")),
                 Step::Finalize => match &self.body.sink {
-                    Out::Aggregate(g) => out = finish::groups(inner.rt, g, self.columns)?,
+                    Out::Aggregate(g) if !inner.grouped => {
+                        out = finish::groups(inner.rt, g, self.columns)?;
+                    }
+                    Out::Aggregate(_) => {}
                     // The build publishes its table to the probes and produces no rows.
                     Out::Build(b) => {
                         inner.rt.finish_join(b.table)?;

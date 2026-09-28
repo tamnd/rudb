@@ -107,6 +107,16 @@ impl GroupTable {
         table
     }
 
+    /// A table like [`new`](GroupTable::new) makes, with room for `groups` groups before it grows.
+    #[must_use]
+    pub fn with_capacity(layout: Layout, groups: usize) -> GroupTable {
+        let mut table = GroupTable::new(layout);
+        table.slots = vec![0; (groups * 2).next_power_of_two().max(64)];
+        table.rows.reserve(groups);
+        table.hashes.reserve(groups);
+        table
+    }
+
     /// The shape of the rows.
     #[must_use]
     pub fn layout(&self) -> &Layout {
