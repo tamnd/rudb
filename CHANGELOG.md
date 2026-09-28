@@ -8,6 +8,12 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.1
+
+The first C5 work, on ClickBench on the compiled engine. #2049 lets the scan under a compiled pipeline skip the parts its zone maps rule out. #2051 cuts groups to the top N through a projection and adds `--explain` to `xtask compiled`. #2054 makes groups only for the keys a limit with no order reads, which made q18 about four times faster. #2055 picks the groups a top N by count keeps straight from the group rows before making them into values. #2057 sizes the parts of a group merge by the number of groups so each part's slots stay in the cache, and #2058 lets a merge part take a worker's row as it is for a key it has not seen. Elsewhere, #2050 reads a key only at the rows a tight pushed filter keeps, and #2053 adds approx_top_k over the pin's filtered space saving.
+
+On gamingpc over ClickBench at ten million rows and 16 threads, compared with the build these changes started from, q33 went from 0.245s to 0.155s, q16 from 0.083s to 0.066s, q19 from 0.234s to 0.158s, q34 from 0.176s to 0.117s and q36 from 0.070s to 0.059s. None of the 43 queries differ from the first engine. The native directory format number stays at 30 and the storage format version at 9.
+
 ## 0.8.0
 
 The release where C4 closed. The compiled engine now runs every pipeline on all threads, compiles each one lazily on the tier that pays off, moves it up from `direct` to `clif` while it runs, keeps compiled code in a per process cache, and sends a morsel back to its fallback when a guard fails. Since 0.7.2, #2047 adds `SET qc_morsel`, which cuts each chunk into pieces of at most that many rows, and a test that puts a guard that always fails into the no NULL version of a pipeline and checks that the rows still match and the version is given up after three failures.
