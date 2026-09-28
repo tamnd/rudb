@@ -23,7 +23,7 @@ use rudb_vector::{Chunk, Data, Form, Selection, Vector};
 
 use crate::config::Config;
 use crate::connection::{Connection, single};
-use crate::journal::Journal;
+use crate::journal::{Change, Journal, Replayed};
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
 use crate::settings::{COMPILED_ENGINE, Settings};
@@ -1401,17 +1401,9 @@ impl Database {
         }
         // What the log committed after the file's last checkpoint goes back into the tables, and
         // a database that may write checkpoints it straight away, so the log it replayed can go.
-        let (journal, appends) = Journal::recover(&path, anchor.as_ref(), writable)?;
-        let replayed = !appends.is_empty();
-        for append in appends {
-            let name = QualifiedName {
-                catalog: DEFAULT_CATALOG.to_string(),
-                schema: append.schema.clone(),
-                table: append.table.clone(),
-            };
-            let chunk = append.chunk(catalog.table(&name)?.columns())?;
-            catalog.table_mut(&name)?.append_all(vec![chunk], 1)?;
-        }
+        let (journal, changes) = Journal::recover(&path, anchor.as_ref(), writable)?;
+        let replayed = !changes.is_empty();
+        replay_changes(&mut catalog, changes)?;
         let mut journal = writable.then_some(journal);
         if replayed && writable {
             persist_main(&path, &mut catalog, &pages, &mut journal, false)?;
@@ -1774,6 +1766,46 @@ fn persist(
     database: &str,
 ) -> Result<()> {
     persist_anchored(path, catalog, pages, database, None)
+}
+
+/// Puts what the log committed after the file's last checkpoint back into the tables, in order.
+///
+/// Appends go straight in. A table an update or a delete touches is read into memory once, takes
+/// that change and every one after it there, and is replaced at the end.
+fn replay_changes(catalog: &mut Catalog, changes: Vec<Replayed>) -> Result<()> {
+    let mut held: Vec<(QualifiedName, Vec<Chunk>)> = Vec::new();
+    for replayed in changes {
+        let name = QualifiedName {
+            catalog: DEFAULT_CATALOG.to_string(),
+            schema: replayed.schema.clone(),
+            table: replayed.table.clone(),
+        };
+        let fields = catalog.table(&name)?.columns().to_vec();
+        let change = replayed.change(&fields)?;
+        let at = match held.iter().position(|(held, _)| *held == name) {
+            Some(at) => at,
+            None if replayed.appends() => {
+                if let Change::Insert(chunk) = change {
+                    catalog.table_mut(&name)?.append_all(vec![chunk], 1)?;
+                }
+                continue;
+            }
+            None => {
+                let rows = catalog.table(&name)?.rows();
+                let all = (0..fields.len()).collect::<Vec<_>>();
+                let chunks = (0..rows.chunk_count())
+                    .map(|at| rows.read(at, &all).and_then(Chunk::settled))
+                    .collect::<Result<Vec<_>>>()?;
+                held.push((name, chunks));
+                held.len() - 1
+            }
+        };
+        change.apply(&fields, &mut held[at].1)?;
+    }
+    for (name, chunks) in held {
+        catalog.table_mut(&name)?.replace_all(chunks, 1)?;
+    }
+    Ok(())
 }
 
 /// A checkpoint of the default database, which writes the log's anchor into the file and then
@@ -2482,20 +2514,23 @@ fn appended(
 /// unflagged ones for a `DELETE`. The second is the flagged rows, the ones the statement changed or
 /// took out, and it is only built when a `RETURNING` list wants them. The count is how many were
 /// flagged either way. The flag column is taken off both.
-fn split(
-    chunks: Vec<Chunk>,
-    delete: bool,
-    wanted: bool,
-) -> Result<(Vec<Chunk>, Vec<Chunk>, usize)> {
+///
+/// Last come the row numbers of the flagged rows among all the rows, and how many rows there were,
+/// which is what a log record names them by.
+fn split(chunks: Vec<Chunk>, delete: bool, wanted: bool) -> Result<Split> {
     let mut kept = Vec::with_capacity(chunks.len());
     let mut changed = Vec::new();
     let mut count = 0;
+    let mut flagged = Vec::new();
+    let mut scanned = 0;
     for chunk in chunks {
         let width = chunk.width().saturating_sub(1);
         let hit = Selection::from_predicate(chunk.len(), |row| {
             chunk.value_at(row, width) == Value::Boolean(true)
         });
         count += hit.len();
+        flagged.extend(hit.iter().map(|row| (scanned + row) as u64));
+        scanned += chunk.len();
         let columns: Vec<usize> = (0..width).collect();
         let chunk = chunk.project(&columns)?;
         if wanted && !hit.is_empty() {
@@ -2510,8 +2545,11 @@ fn split(
             kept.push(chunk);
         }
     }
-    Ok((kept, changed, count))
+    Ok((kept, changed, count, flagged, scanned))
 }
+
+/// What [`split`] hands back.
+type Split = (Vec<Chunk>, Vec<Chunk>, usize, Vec<u64>, usize);
 
 /// Whether a table can be written straight into the file as its own generation.
 ///
@@ -3731,10 +3769,12 @@ impl Shared {
                 catalog.default_catalog()
             )));
         }
-        // Only a plain append has a log record, and it stages its rows once they are in. Every
-        // other change checkpoints when it commits.
+        // A plain append, an update and a delete have log records, staged once the rows are in.
+        // Every other change checkpoints when it commits.
         let logged = matches!(&bound, Bound::Insert(insert)
-            if insert.write == Write::Append && insert.conflict.is_none());
+            if insert.conflict.is_none()
+                && (insert.write == Write::Append
+                    || insert.name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)));
         if writes && !logged {
             self.unlogged();
         }
@@ -4172,8 +4212,10 @@ impl Shared {
                     Write::Update | Write::Delete => {
                         let delete = insert.write == Write::Delete;
                         let plain = catalog.table(&insert.name)?.foreign().is_empty();
-                        let (kept, changed, count) =
-                            split(chunks, delete, wanted || checks.is_some() || !plain)?;
+                        let logs = self.journal().as_ref().is_some_and(Journal::logs);
+                        let needed = wanted || checks.is_some() || !plain || (logs && !delete);
+                        let (kept, changed, count, flagged, scanned) =
+                            split(chunks, delete, needed)?;
                         if let Some(checks) = checks.as_mut() {
                             self.check(sql, &mut catalog, place, &insert.name, checks, &changed)?;
                         }
@@ -4181,7 +4223,36 @@ impl Shared {
                             foreign::missing(&catalog, &insert.name, &changed)?;
                         }
                         foreign::lost(&catalog, &insert.name, &kept)?;
-                        catalog.table_mut(&insert.name)?.replace_all(kept, workers)?;
+                        let name = &insert.name;
+                        let table = catalog.table(name)?;
+                        // The row numbers are the scan's, so they name the table's rows only when
+                        // the scan read every row, in order, which it does as long as it read as
+                        // many as the table holds.
+                        let staged = logs.then(|| {
+                            let journal = self.journal();
+                            let journal = journal.as_ref()?;
+                            if scanned != table.rows().len() {
+                                return None;
+                            }
+                            if delete {
+                                journal.encode_delete(&name.schema, &name.table, &flagged)
+                            } else {
+                                let fields = table.columns();
+                                journal.encode_update(
+                                    &name.schema,
+                                    &name.table,
+                                    fields,
+                                    &flagged,
+                                    &changed,
+                                )
+                            }
+                        });
+                        catalog.table_mut(name)?.replace_all(kept, workers)?;
+                        if let Some(record) = staged
+                            && let Some(journal) = self.journal().as_mut()
+                        {
+                            journal.stage(record);
+                        }
                         (count, changed)
                     }
                 };

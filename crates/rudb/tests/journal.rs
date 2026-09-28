@@ -108,12 +108,14 @@ fn a_rolled_back_insert_is_not_replayed_and_a_committed_one_is() {
 }
 
 #[test]
-fn an_update_or_a_delete_checkpoints_and_the_log_after_it_still_replays() {
+fn an_update_or_a_delete_is_logged_and_replayed() {
     let path = path("update");
     let db = open(&path);
     db.execute("CREATE TABLE t (id INTEGER, v VARCHAR)").expect("creates");
     db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").expect("inserts");
+    assert_eq!(segments(&path), 0, "the first insert streamed into the file");
     db.execute("UPDATE t SET v = 'z' WHERE id = 2").expect("updates");
+    assert!(segments(&path) > 0, "the update went to the log rather than a checkpoint");
     db.execute("DELETE FROM t WHERE id = 3").expect("deletes");
     db.execute("INSERT INTO t VALUES (4, 'd')").expect("inserts");
     crash(db);
@@ -210,4 +212,46 @@ fn a_log_beside_a_file_that_is_not_its_own_is_ignored() {
     let _ = std::fs::remove_file(&from);
     let _ = std::fs::remove_dir_all(wal(&from));
     let _ = std::fs::remove_file(&to);
+}
+
+#[test]
+fn changes_across_many_chunks_replay_in_the_order_they_committed() {
+    let path = path("chunks");
+    let db = open(&path);
+    db.execute("CREATE TABLE t (id BIGINT, v VARCHAR, n DOUBLE)").expect("creates");
+    db.execute("INSERT INTO t SELECT i, 'r' || i, i / 2 FROM range(10000) r(i)").expect("loads");
+    db.execute("DELETE FROM t WHERE id % 3 = 0").expect("deletes");
+    db.execute("UPDATE t SET v = 'u' || id, n = NULL WHERE id % 7 = 1").expect("updates");
+    db.execute("BEGIN").expect("begins");
+    db.execute("INSERT INTO t VALUES (20000, 'new', 1.5)").expect("inserts");
+    db.execute("DELETE FROM t WHERE id BETWEEN 4000 AND 4999").expect("deletes");
+    db.execute("UPDATE t SET n = -1 WHERE id = 20000 OR id = 9998").expect("updates");
+    db.execute("COMMIT").expect("commits");
+    db.execute("BEGIN").expect("begins");
+    db.execute("DELETE FROM t").expect("deletes");
+    db.execute("ROLLBACK").expect("rolls back");
+    let query = "SELECT count(*), sum(id), count(n), sum(n), min(v), max(v), \
+                 count(*) FILTER (WHERE v LIKE 'u%') FROM t";
+    let before = rows(&db, query);
+    let order = rows(&db, "SELECT list(id) FROM t");
+    crash(db);
+
+    let db = open(&path);
+    assert_eq!(rows(&db, query), before);
+    assert_eq!(rows(&db, "SELECT list(id) FROM t"), order, "the rows keep their order");
+    assert_eq!(
+        rows(&db, "SELECT v, n FROM t WHERE id IN (1, 2, 9998, 20000) ORDER BY id"),
+        vec![
+            vec![Value::Varchar("u1".into()), Value::Null],
+            vec![Value::Varchar("r2".into()), Value::Double(1.0)],
+            vec![Value::Varchar("r9998".into()), Value::Double(-1.0)],
+            vec![Value::Varchar("new".into()), Value::Double(-1.0)],
+        ]
+    );
+    crash(db);
+
+    let db = open(&path);
+    assert_eq!(rows(&db, query), before, "a second open replays nothing twice");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
 }
