@@ -61,7 +61,7 @@ use rudb_plan::{
     PipelineRef, Plan, ROOT, Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
-use rudb_vector::{VECTOR_SIZE, Vector};
+use rudb_vector::VECTOR_SIZE;
 
 use crate::buffer::Buffered;
 use crate::consistent::{Answer, Collect, Reduction};
@@ -901,19 +901,19 @@ fn native_any_groups(
 /// column keeps the ordinals of, since these are found by reading the codes of every part first.
 const CODED_ROWS: u64 = 32_768;
 
-/// The leading groups of a count grouped by keys one of which is a string column with a frequency
-/// synopsis, counted over only the rows of the values that synopsis lists.
+/// The leading groups of a count grouped by a string column with a frequency synopsis and a signed
+/// integer column, counted over only the rows of the string values that synopsis lists.
 ///
 /// A group holds no more rows than the value of the string key it has, and a filter only takes
 /// rows away, so a group whose value the synopsis left out holds no more rows than the synopsis
-/// bound. The rows of the listed values are found by their codes, the filter and the keys are
-/// evaluated over those rows alone, and the answer stands when the `n`th count is strictly above
-/// that bound. On ClickBench 15 that is about seven thousand rows of a million, where the
-/// aggregate it replaces scattered the hundred and thirty thousand rows the filter kept into a
-/// hundred thousand groups.
+/// bound. The rows of the listed values are found by their codes, the integer is read beside them
+/// in the same pass, and the answer stands when the `n`th count is strictly above that bound. On
+/// ClickBench 15 that is about twelve thousand rows of a million, where the aggregate it replaces
+/// scattered the hundred and thirty thousand rows the filter kept into a hundred thousand groups.
 ///
-/// A value the filter's own equality tests of the key reject, `SearchPhrase <> ''` there, is not
-/// read at all, since the filter would reject every row of it anyway.
+/// The filter has to be equality tests of the string key and nothing else, `SearchPhrase <> ''`
+/// there, since those are settled by leaving the values they reject out and no row is evaluated.
+/// One key is left to the aggregate, which counts codes as fast as the scan here reads them.
 fn native_coded_counts(
     plan: &Plan,
     catalog: &Catalog,
@@ -1049,68 +1049,16 @@ fn native_coded_counts(
         }
         _ => None,
     };
-    let Some(found) =
-        table.rows().coded_rows(column, signed.map(|(other, _, _)| other), &wanted)?
-    else {
+    let Some((other, ty, first)) = signed else { return Ok(None) };
+    let Some(found) = table.rows().coded_rows(column, other, &wanted)? else {
         return Ok(None);
     };
     // The synopsis counts are exact, so any other number of rows means the codes are not the ones
     // the parts carry, and the answer is left to the rows.
-    if found.ordinals.len() as u64 != rows {
+    if found.codes.len() as u64 != rows {
         return Ok(None);
     }
-    if let (Some((_, ty, first)), Some(dictionary)) = (signed, &found.dictionary) {
-        return signed_coded_counts(&found, dictionary, ty, first, bound, top);
-    }
-    let ordinals = found.ordinals;
-    let schema = Schema::numbered(fields.to_vec(), index);
-    let Ok(prepared) = Prepared::new(plan, keys, &schema) else { return Ok(None) };
-    let filter = match predicate {
-        Some(predicate) => match Prepared::one(plan, predicate, &schema) {
-            Ok(filter) => Some(filter),
-            Err(_) => return Ok(None),
-        },
-        None => None,
-    };
-    let types = fields.iter().map(|field| field.ty.clone()).collect::<Vec<_>>();
-    let mut counts = RowMap::<u64>::default();
-    let mut scratch = Scratch::default();
-    let mut filtering = Scratch::default();
-    let mut vectors = Vec::with_capacity(keys.len());
-    for ordinals in ordinals.chunks(VECTOR_SIZE) {
-        let chunk = table.rows().rows_at(&types, &stored, ordinals)?;
-        let selection = match &filter {
-            Some(filter) => Some(filter.evaluate_filter(&chunk, &mut filtering)?),
-            None => None,
-        };
-        vectors.clear();
-        prepared.evaluate(&chunk, &mut scratch, &mut vectors)?;
-        let mut add = |row: usize| -> Result<()> {
-            let key =
-                vectors.iter().map(|vector| vector.try_value_at(row)).collect::<Result<_>>()?;
-            *counts.entry(Key(key)).or_default() += 1;
-            Ok(())
-        };
-        match &selection {
-            Some(selection) => selection.iter().try_for_each(&mut add)?,
-            None => (0..ordinals.len()).try_for_each(&mut add)?,
-        }
-    }
-    let mut boundaries = counts.values().copied().collect::<Vec<_>>();
-    if boundaries.len() < top {
-        return Ok(None);
-    }
-    boundaries.select_nth_unstable_by(top - 1, |left, right| right.cmp(left));
-    let boundary = boundaries[top - 1];
-    if boundary <= bound {
-        return Ok(None);
-    }
-    let entries = counts
-        .into_iter()
-        .filter(|(_, count)| *count >= boundary)
-        .map(|(key, count)| (key.0, count))
-        .collect();
-    Ok(Some(NativePairFrequencies { entries }))
+    signed_coded_counts(&found, ty, first, bound, top)
 }
 
 /// Whether `expr` is the column `binding` names.
@@ -1122,12 +1070,12 @@ fn is_binding(plan: &Plan, expr: ExprRef, binding: ColumnBinding) -> bool {
 /// codes, counted by the pair of the two and named as values only for the groups that lead.
 fn signed_coded_counts(
     found: &CodedRows,
-    dictionary: &Vector,
     ty: &LogicalType,
     first: bool,
     bound: u64,
     top: usize,
 ) -> Result<Option<NativePairFrequencies>> {
+    let Some(dictionary) = &found.dictionary else { return Ok(None) };
     if found.others.len() != found.codes.len() {
         return Ok(None);
     }

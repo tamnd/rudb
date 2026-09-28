@@ -84,11 +84,9 @@ type StableCodes = (Vec<Option<u32>>, Arc<Vector>);
 /// [`Rows::coded_rows`].
 #[derive(Debug, Default)]
 pub struct CodedRows {
-    /// Table-wide row ordinals, ascending.
-    pub ordinals: Vec<u64>,
     /// The code each of those rows holds.
     pub codes: Vec<u32>,
-    /// The signed value of the other column at each row, when one was asked for.
+    /// The signed value of the other column at each row.
     pub others: Vec<Option<i128>>,
     /// The one table-wide dictionary the codes name.
     pub dictionary: Option<Arc<Vector>>,
@@ -331,18 +329,17 @@ impl Rows {
         }
     }
 
-    /// The rows whose dictionary column holds one of `codes`, in ascending order, with the
-    /// dictionary the codes index.
+    /// The codes of the rows whose dictionary column holds one of `codes`, each with the signed
+    /// value of `other` at the same row, and the dictionary the codes index.
     ///
-    /// Every part is read, but for its codes alone, which is what a filter on the column costs
-    /// without its strings. With `other` the signed values of that column come back beside the
-    /// codes, read in the same pass. The parts are split across threads, since a table of a
-    /// million rows is a thousand of them. `None` when the table is not a file, a part of the
+    /// Every part is read, but for its codes and the one other column, which is what a filter on
+    /// the column costs without its strings. The parts are split across threads, since a table of
+    /// a million rows is a thousand of them. `None` when the table is not a file, a part of the
     /// column is not written against the one dictionary the rest are, or `other` is not signed.
     pub fn coded_rows(
         &self,
         column: usize,
-        other: Option<usize>,
+        other: usize,
         codes: &[u32],
     ) -> Result<Option<CodedRows>> {
         let Self::Native(reader) = self else { return Ok(None) };
@@ -352,25 +349,16 @@ impl Rows {
             wanted[code as usize] = true;
         }
         let parts = reader.parts();
-        let mut starts = Vec::with_capacity(parts);
-        let mut start = 0_u64;
-        for part in 0..parts {
-            starts.push(start);
-            start += reader.part_rows(part) as u64;
-        }
         let workers =
             std::thread::available_parallelism().map_or(1, usize::from).min(8).min(parts).max(1);
         let each = parts.div_ceil(workers);
-        let columns = match other {
-            Some(other) => vec![column, other],
-            None => vec![column],
-        };
-        let (wanted, starts, columns) = (&wanted, &starts, &columns);
+        let columns = [column, other];
+        let (wanted, columns) = (&wanted, &columns);
         let found = std::thread::scope(|scope| {
             let handles = (0..workers)
                 .map(|worker| {
                     let parts = worker * each..((worker + 1) * each).min(parts);
-                    scope.spawn(move || Self::coded_parts(reader, columns, wanted, starts, parts))
+                    scope.spawn(move || Self::coded_parts(reader, columns, wanted, parts))
                 })
                 .collect::<Vec<_>>();
             handles
@@ -391,7 +379,6 @@ impl Rows {
                 (None, Some(held)) => dictionary = Some(held),
                 _ => {}
             }
-            rows.ordinals.extend(found.ordinals);
             rows.codes.extend(found.codes);
             rows.others.extend(found.others);
         }
@@ -403,7 +390,6 @@ impl Rows {
         reader: &NativeReader,
         columns: &[usize],
         wanted: &[bool],
-        starts: &[u64],
         parts: std::ops::Range<usize>,
     ) -> Result<Option<(Option<Arc<Vector>>, CodedRows)>> {
         let mut rows = CodedRows::default();
@@ -419,20 +405,17 @@ impl Rows {
                 Some(_) => {}
                 None => dictionary = Some(Arc::clone(values)),
             }
-            let other = if columns.len() > 1 { Some(held.column(1)?) } else { None };
+            let other = held.column(1)?;
             for (row, &code) in part_codes.iter().enumerate() {
                 if !wanted.get(code as usize).copied().unwrap_or(false) || vector.is_null_at(row) {
                     continue;
                 }
-                rows.ordinals.push(starts[part] + row as u64);
                 rows.codes.push(code);
-                if let Some(other) = other {
-                    if other.is_null_at(row) {
-                        rows.others.push(None);
-                    } else {
-                        let Some(value) = other.signed_at(row) else { return Ok(None) };
-                        rows.others.push(Some(value));
-                    }
+                if other.is_null_at(row) {
+                    rows.others.push(None);
+                } else {
+                    let Some(value) = other.signed_at(row) else { return Ok(None) };
+                    rows.others.push(Some(value));
                 }
             }
         }
