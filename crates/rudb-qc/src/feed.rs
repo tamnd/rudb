@@ -45,6 +45,9 @@ use crate::finish::{self, Cell, cell, vector};
 use crate::merge;
 use crate::tier::{self, Tiers};
 
+/// For each worker table, the pairs of a worker group and the group it became in one part.
+type Made = Vec<Vec<(u32, u32)>>;
+
 /// One pipeline being run.
 pub(crate) struct Feed<'a> {
     module: &'a Module,
@@ -291,14 +294,13 @@ impl<'a> Feed<'a> {
                 let merged = pieces(threads, parts, |part| {
                     let most = splits.iter().map(|s| s[part].len()).sum();
                     let mut table = GroupTable::with_capacity(layout.clone(), most);
-                    let mut made = vec![Vec::new(); tables.len()];
-                    for ((other, split), made) in tables.iter().zip(&splits).zip(&mut made) {
-                        table.absorb_some(other, &split[part], made, fold);
+                    let mut made = vec![Vec::new(); if sets.is_empty() { 0 } else { tables.len() }];
+                    for (t, (other, split)) in tables.iter().zip(&splits).enumerate() {
+                        table.absorb_some(other, &split[part], made.get_mut(t), fold);
                     }
                     (table, made)
                 })?;
-                let (merged, made): (Vec<GroupTable>, Vec<Vec<Vec<u32>>>) =
-                    merged.into_iter().unzip();
+                let (merged, made): (Vec<GroupTable>, Vec<Made>) = merged.into_iter().unzip();
                 // A group of a part is found at the part's first group and its place in it.
                 let mut from = Vec::with_capacity(parts);
                 let mut at = 0;
@@ -311,8 +313,8 @@ impl<'a> Feed<'a> {
                 } else {
                     pieces(threads, tables.len(), |t| {
                         let mut map = vec![0; tables[t].len()];
-                        for (part, split) in splits[t].iter().enumerate() {
-                            for (&gid, &local) in split.iter().zip(&made[part][t]) {
+                        for (part, made) in made.iter().enumerate() {
+                            for &(gid, local) in &made[t] {
                                 map[gid as usize] = from[part] + local as usize;
                             }
                         }

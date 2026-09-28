@@ -51,6 +51,9 @@ pub struct Query<'a> {
     worker_cpu_ns: AtomicU64,
     /// The most instances any one pipeline ran as.
     widest: AtomicUsize,
+    /// Whether a pipeline reads a stored table or a file, rather than only statistics kept about
+    /// one, constants and the rows of other pipelines.
+    reads: bool,
 }
 
 impl<'a> Query<'a> {
@@ -86,7 +89,21 @@ impl<'a> Query<'a> {
             schema,
             worker_cpu_ns: AtomicU64::new(0),
             widest: AtomicUsize::new(0),
+            reads: true,
         })
+    }
+
+    /// The same query, saying whether it reads a stored table or a file.
+    pub(crate) fn reading(mut self, reads: bool) -> Self {
+        self.reads = reads;
+        self
+    }
+
+    /// Whether running the query reads a stored table or a file. A query that does not is answered
+    /// out of the statistics kept about its tables, or out of constants, and runs in no time.
+    #[must_use]
+    pub fn reads_tables(&self) -> bool {
+        self.reads
     }
 
     /// The columns this query produces.
