@@ -3217,7 +3217,33 @@ impl Vector {
         if let Some(flat) = self.unpacked_whole() {
             return Ok(flat);
         }
+        if let Some(flat) = self.unpacked_through() {
+            return Ok(flat);
+        }
         self.copied((0..self.len).collect(), false)
+    }
+
+    /// A selection over a packed column, unpacked at the rows it selects.
+    ///
+    /// A scan that filters hands up its stored columns with the kept rows as a dictionary or a
+    /// gather over them, and the general copy reads each of those rows a value at a time through
+    /// both levels. [`Self::unpacked_at`] does the same rows in bulk. Laying the sparse chunks of
+    /// TPC-H q6 end to end went through here, and the copy a value at a time was a third of the
+    /// query.
+    fn unpacked_through(&self) -> Option<Self> {
+        if !matches!(self.validity, Validity::AllValid) {
+            return None;
+        }
+        match &self.body {
+            Body::Dictionary { codes, values, .. } => {
+                values.unpacked_at(codes.as_slice().get(..self.len)?)
+            }
+            Body::Gathered { .. } => {
+                let (source, rids) = self.gathered_parts()?;
+                source.unpacked_at(rids)
+            }
+            _ => None,
+        }
     }
 
     /// A packed column with no nulls written out whole, a block of 64 codes at a time.
@@ -7288,6 +7314,27 @@ mod tests {
         let flat = nulls.flatten().expect("flattens");
         assert_eq!(flat.iter().collect::<Vec<_>>(), nulls.iter().collect::<Vec<_>>());
         assert!(flat.is_null_at(0) && !flat.is_null_at(1));
+    }
+
+    /// A selection over a packed column, as a dictionary or as a gather, flattens to the rows it
+    /// selects, in the order it selects them.
+    #[test]
+    fn a_selection_over_a_packed_column_flattens_to_the_rows_it_selects() {
+        let words: Vec<u64> =
+            (0..400_u64).map(|word| word.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let whole = Arc::new(
+            Vector::packed(LogicalType::Integer, words, 13, -1_000, 300).expect("300 codes"),
+        );
+        let rows: Vec<u32> = vec![299, 0, 64, 63, 7, 7, 150];
+        let want: Vec<Value> = rows.iter().map(|&row| whole.value_at(row as usize)).collect();
+        for selected in [
+            Vector::dictionary_over(rows.clone(), Arc::clone(&whole)).expect("in range"),
+            Vector::gathered(Arc::clone(&whole), Arc::new(rows.clone())).expect("in range"),
+        ] {
+            let flat = selected.flatten().expect("flattens");
+            assert_eq!(flat.form(), Form::Flat);
+            assert_eq!(flat.iter().collect::<Vec<_>>(), want);
+        }
     }
 
     #[test]

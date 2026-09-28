@@ -203,6 +203,10 @@ impl Stream for StopAfter {
         0
     }
 
+    fn stops_early(&self) -> bool {
+        true
+    }
+
     fn push(&self, chunk: &mut Chunk, seen: &mut usize) -> rudb_common::Result<Progress> {
         *seen += chunk.len();
         Ok(if *seen >= self.limit { Progress::Done } else { Progress::More })
@@ -460,11 +464,69 @@ fn the_root_hands_chunks_to_a_caller_outside_the_engine() {
     run_serial(&built, &Cancel::new()).unwrap();
     assert!(reader.is_finished());
 
+    // Three chunks of three rows each, which the driver holds and hands on as one.
     let chunks = reader.drain().unwrap();
-    assert_eq!(chunks.len(), 3);
+    assert_eq!(chunks.len(), 1);
     let rows: usize = chunks.iter().map(Chunk::len).sum();
     assert_eq!(rows, 9);
     assert!(reader.next_chunk().unwrap().is_none());
+}
+
+#[test]
+fn sparse_chunks_reach_the_sink_together_and_in_order() {
+    let (sink, reader) = root(BufferId(0), None);
+    let source = Arc::new(Counting::new((1..=100).collect(), 50, 10));
+    let built = pipeline(source, Arc::new(sink)).then(Arc::new(Evens) as Arc<dyn DynStream>);
+
+    run_serial(&built, &Cancel::new()).unwrap();
+
+    let chunks = reader.drain().unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(rows(&chunks), (1..=50).map(|value| value * 2).collect::<Vec<i64>>());
+}
+
+/// A root putting chunks back in the order the morsels were cut gets every row under its own
+/// morsel, so what is held goes on before the next morsel starts rather than at the end.
+#[test]
+fn held_rows_go_on_before_the_next_morsel_when_the_sink_keeps_them_apart() {
+    let (sink, reader) = root_in_order(BufferId(0), None);
+    let source = Arc::new(Counting::new((1..=40).collect(), 10, 5));
+    let built = pipeline(source, Arc::new(sink));
+
+    run_serial(&built, &Cancel::new()).unwrap();
+
+    let chunks = reader.drain().unwrap();
+    assert_eq!(chunks.iter().map(Chunk::len).collect::<Vec<usize>>(), vec![10, 10, 10, 10]);
+    assert_eq!(rows(&chunks), (1..=40).collect::<Vec<i64>>());
+}
+
+/// Rows held below an operator that has had enough already went through it, so they still arrive.
+#[test]
+fn rows_held_below_an_operator_that_stopped_still_arrive() {
+    let source = Arc::new(Counting::new((1..=100).collect(), 100, 10));
+    let sink = Arc::new(Total::default());
+    let built = pipeline(source, Arc::clone(&sink))
+        .then(Arc::new(StopAfter { limit: 30 }) as Arc<dyn DynStream>)
+        .then(Arc::new(Evens) as Arc<dyn DynStream>);
+
+    run_serial(&built, &Cancel::new()).unwrap();
+
+    assert_eq!(*sink.global.lock().unwrap(), (1..=30).filter(|value| value % 2 == 0).sum::<i64>());
+}
+
+/// Held rows on several threads, where each instance lets go of its own.
+#[test]
+fn every_instance_lets_go_of_what_it_held() {
+    let source = Arc::new(Counting::new((1..=10_000).collect(), 1000, 10));
+    let sink = Arc::new(Total::default());
+    let built = pipeline(source, Arc::clone(&sink)).then(Arc::new(Evens) as Arc<dyn DynStream>);
+
+    run_parallel(&built, &Cancel::new(), &Pool::new(4).lease(4), 4).unwrap();
+
+    assert_eq!(
+        *sink.global.lock().unwrap(),
+        (1..=10_000).filter(|value| value % 2 == 0).sum::<i64>()
+    );
 }
 
 /// Who flattens a chunk on its way out of the engine, which is the sink and not the caller.
@@ -506,7 +568,8 @@ fn a_root_a_caller_is_reading_flattens_as_it_queues() {
 #[test]
 fn a_full_root_queue_reports_backpressure_through_the_same_four_reasons() {
     let (sink, reader) = root(BufferId(4), Some(1));
-    let source = Arc::new(Counting::new((1..=9).collect(), 3, 3));
+    // Chunks full enough that the driver hands each one on as it comes rather than holding it.
+    let source = Arc::new(Counting::new((1..=6000).collect(), 2000, 2000));
     let built =
         Pipeline::new(PipelineId(0), source as Arc<dyn Source>, Arc::new(sink) as Arc<dyn DynSink>);
 

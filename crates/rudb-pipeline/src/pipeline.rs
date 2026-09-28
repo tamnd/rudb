@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::dynamic::{DynSink, DynStream, LocalState};
+use crate::hold::Held;
 use crate::progress::PipelineId;
 use crate::traits::Source;
 
@@ -185,6 +186,12 @@ impl<'a> Pipeline<'a> {
         Locals {
             streams: self.streams.iter().map(|stream| stream.local_state()).collect(),
             sink: self.sink.local_state(),
+            held: (0..=self.streams.len()).map(|_| Held::default()).collect(),
+            holds_from: if self.sink.may_stop() {
+                self.streams.len() + 1
+            } else {
+                self.streams.iter().rposition(|stream| stream.may_stop()).map_or(0, |at| at + 1)
+            },
         }
     }
 }
@@ -196,4 +203,9 @@ pub struct Locals {
     pub streams: Vec<LocalState>,
     /// The sink's.
     pub sink: LocalState,
+    /// The sparse chunks held back in front of each operator, and last in front of the sink.
+    pub(crate) held: Vec<Held>,
+    /// The first boundary anything is held at, which is below the last operator that can stop
+    /// early.
+    pub(crate) holds_from: usize,
 }

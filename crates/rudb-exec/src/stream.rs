@@ -413,6 +413,10 @@ impl Stream for Limit {
         false
     }
 
+    fn stops_early(&self) -> bool {
+        true
+    }
+
     fn push(&self, chunk: &mut Chunk, taken: &mut Taken) -> Result<Progress> {
         let rows = chunk.len() as u64;
         // Nothing to take from and, more to the point, no row to read a bound out of. An empty

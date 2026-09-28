@@ -23,10 +23,10 @@
 //! # What is here and what is not
 //!
 //! The decision is per chunk and it decides between [`Chunk::select`] and [`Chunk::compact`]. The
-//! other half of the paper is a buffer that merges several sparse chunks into a full one, which no
-//! operator here can do yet, because [`Stream::push`](crate::Stream::push) transforms one chunk in
-//! place and has nowhere to keep a remainder. That is a change to the operator interface rather
-//! than to this seam, and it is the follow up.
+//! other half of the paper is a buffer that merges several sparse chunks into a full one. No
+//! operator here can do that, because [`Stream::push`](crate::Stream::push) transforms one chunk in
+//! place and has nowhere to keep a remainder, so the driver does it between operators instead, in
+//! `hold`.
 //!
 //! Nothing here reads a row. [`Compaction::worth_it`] is asked once per chunk and the copy itself
 //! is [`Chunk::compact`], which is a gather per column.

@@ -166,6 +166,15 @@ pub trait Stream: Send + Sync + fmt::Debug {
         Ok(())
     }
 
+    /// Whether this operator can want no more rows before its input runs out, which is a `LIMIT`.
+    ///
+    /// The driver holds sparse chunks back and pushes them on together, and in front of an
+    /// operator like that it would read rows the operator never wanted while it waited for enough
+    /// of them. So nothing is held in front of one.
+    fn stops_early(&self) -> bool {
+        false
+    }
+
     /// Whether this operator owes chunks once every instance has finished reading.
     ///
     /// Almost nothing does, and the cost of asking is one virtual call per operator per pipeline,
@@ -329,6 +338,22 @@ pub trait Sink: Send + Sync + fmt::Debug {
     /// Whatever taking note of the morsel reports.
     fn at(&self, _morsel: &Morsel, _local: &mut Self::Local) -> Result<()> {
         Ok(())
+    }
+
+    /// Whether this sink can want no more rows before its input runs out. See
+    /// [`Stream::stops_early`], which is the same question.
+    fn stops_early(&self) -> bool {
+        false
+    }
+
+    /// Whether every row has to arrive under the morsel it was read from.
+    ///
+    /// The driver holds sparse chunks back and pushes them on together, and without this it lets
+    /// rows from one morsel wait for the rows of the next. A sink that puts rows back in the order
+    /// the morsels were cut says yes, and the driver pushes on what it holds before every new
+    /// morsel for it rather than once at the end.
+    fn keeps_morsels(&self) -> bool {
+        false
     }
 
     /// Take one chunk into the local state.

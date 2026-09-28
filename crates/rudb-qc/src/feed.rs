@@ -1013,6 +1013,10 @@ impl Sink for Scan<'_, '_> {
         self.0.parallel
     }
 
+    fn stops_early(&self) -> bool {
+        true
+    }
+
     fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress> {
         match local {
             Some(w) => self.0.run(chunk, &mut w.rt, &mut w.state, &mut w.out, &mut false),

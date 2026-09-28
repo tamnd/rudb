@@ -140,6 +140,10 @@ impl<S: Stream> Stream for Watched<S> {
         self.inner.drains()
     }
 
+    fn stops_early(&self) -> bool {
+        self.inner.stops_early()
+    }
+
     /// Measured, and the rows counted, because a drain is chunks this operator produced and the
     /// document would otherwise show an operator that made fewer rows than it handed on.
     ///
@@ -231,6 +235,14 @@ impl<K: Sink> Sink for Watched<K> {
         let noted = self.inner.at(morsel, local);
         measure.stop(&self.counters);
         noted
+    }
+
+    fn keeps_morsels(&self) -> bool {
+        self.inner.keeps_morsels()
+    }
+
+    fn stops_early(&self) -> bool {
+        self.inner.stops_early()
     }
 
     fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress> {

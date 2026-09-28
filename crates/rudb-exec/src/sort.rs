@@ -690,6 +690,10 @@ impl Sink for Sort {
         Ok(())
     }
 
+    fn keeps_morsels(&self) -> bool {
+        true
+    }
+
     fn sink(&self, chunk: &Chunk, local: &mut Gathered) -> Result<Progress> {
         if chunk.is_empty() {
             return Ok(Progress::More);

@@ -2842,6 +2842,10 @@ impl Sink for NativeSink {
         Ok(())
     }
 
+    fn keeps_morsels(&self) -> bool {
+        true
+    }
+
     fn sink(&self, chunk: &Chunk, place: &mut Self::Local) -> Result<Progress> {
         self.keep(chunk.clone(), place)
     }
