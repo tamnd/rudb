@@ -37,7 +37,7 @@ use rudb_qc_ir::{ErrorKind, Module};
 use rudb_qc_pipe::{Pipeline, Source, Step};
 use rudb_qc_plan::{Column, Key};
 use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
-use rudb_qc_rt::table::{Agreed, Distinct, GroupTable, Job, LANE_BITS};
+use rudb_qc_rt::table::{Agreed, Distinct, GroupTable, Job, LANE_BITS, SetPart};
 use rudb_qc_rt::{RUNTIME_ERROR, Rt, text};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
@@ -236,6 +236,13 @@ impl<'a> Feed<'a> {
             table.cap(WORKER_GROUPS);
             if self.sets.is_empty() {
                 table.lanes();
+            }
+        }
+        if self.split {
+            for &h in &self.sets {
+                if let Some(set) = rt.distinct_mut(h) {
+                    set.spill();
+                }
             }
         }
         if let (Some(agreed), Out::Aggregate(g)) = (&self.agreed, &self.body.sink)
@@ -437,14 +444,20 @@ impl<'a> Feed<'a> {
         }
         let total = inner.rt.table(g.table).map_or(0, GroupTable::len);
         for (&h, list) in self.sets.iter().zip(&sets) {
+            // Parts of their own, few enough pairs each that the repeats are found in the cache.
+            let held: usize = list.iter().map(Distinct::held).sum();
+            let parts = (held / PART_PAIRS).next_power_of_two().clamp(16, 4096);
+            let bits = parts.trailing_zeros();
             let splits = pieces(threads, list.len(), |w| list[w].split(&maps[w], bits))?;
             let counts: Vec<AtomicU64> = (0..total).map(|_| AtomicU64::new(0)).collect();
             pieces(threads, parts, |part| {
-                let sources: Vec<(&Distinct, &[usize], &[u32])> = list
+                let sources: Vec<SetPart<'_>> = list
                     .iter()
                     .zip(&maps)
                     .zip(&splits)
-                    .map(|((d, m), s)| (d, m.as_slice(), s[part].as_slice()))
+                    .map(|((d, m), s)| {
+                        (d, m.as_slice(), s.pairs[part].as_slice(), s.picks[part].as_slice())
+                    })
                     .collect();
                 Distinct::gather(&sources, &counts);
             })?;
@@ -1041,6 +1054,9 @@ const SPLIT_FROM: usize = 1 << 16;
 
 /// About how many groups one part of a merge holds, so that its slots stay in the cache.
 const PART_GROUPS: usize = 1 << 14;
+
+/// About how many pairs of a distinct set a part of the merge gathers.
+const PART_PAIRS: usize = 1 << 14;
 
 /// How many groups [`piece`] takes at once when it can pick the ones a top N keeps by their count.
 const COUNTED_SPAN: usize = 1 << 16;
