@@ -440,6 +440,9 @@ pub(crate) struct Scan<'a> {
     testing: OnceLock<Vec<Probe>>,
     /// The rows every join above that handed rows down holds between them. See [`Source::reduced`].
     exact: OnceLock<Option<Rids>>,
+    /// The workers the scan was offered, kept for [`Valued::passing`], which runs before any of them
+    /// has a row to read.
+    threads: AtomicUsize,
     schema: Schema,
     chunks: Handout,
     /// The parts of each stripe, empty when the rows are not native.
@@ -705,6 +708,21 @@ thread_local! {
     static READER: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
+/// A part whose exact rows keep one row in this many or fewer is read at those rows alone. See
+/// [`Source::read_reduced`].
+const SPARSE_READ: usize = 8;
+
+/// The rows in both `held` and `rows`, or `rows` when nothing was held before.
+///
+/// Sets over tables of different sizes would be a bug above, and the first alone is still every
+/// row that can survive.
+fn narrowed(held: Option<Rids>, rows: Rids) -> Rids {
+    match held {
+        None => rows,
+        Some(before) => before.intersect(&rows).unwrap_or(before),
+    }
+}
+
 /// Drops the rows of a chunk that the exact rows from a join above do not hold, for a scan with no
 /// filter to fold them into.
 ///
@@ -714,10 +732,6 @@ thread_local! {
 /// # Errors
 ///
 /// Whatever narrowing the chunk to the rows that survived raises.
-/// A part whose exact rows keep one row in this many or fewer is read at those rows alone. See
-/// [`Source::read_reduced`].
-const SPARSE_READ: usize = 8;
-
 fn reduce(reduced: Option<(&Rids, u64)>, chunk: &mut Chunk) -> Result<()> {
     let Some((rows, first)) = reduced else { return Ok(()) };
     let len = chunk.len();
@@ -748,6 +762,8 @@ struct Pushed {
     predicate: Prepared,
     /// A necessary single-column LIKE that can run before the other projected column is read.
     late: Option<Late>,
+    /// The conjuncts that read one text column and nothing else, by column. See [`Valued`].
+    valued: Vec<Valued>,
     /// The whole predicate when it is a `LIKE` a compressed text page can answer without its
     /// strings being read. See [`Scan::read_stored`].
     stored: Option<Stored>,
@@ -800,6 +816,135 @@ struct Working {
     scratch: Scratch,
     late_scratch: Option<Scratch>,
     gauge: Gauge,
+}
+
+/// The conjuncts of a pushed filter that read one text column and nothing else.
+///
+/// Asked of the column's table wide dictionary once, they say which codes can pass, and the rows of
+/// those codes, which the file records per value, are every row the filter can keep. Those go in
+/// with the exact rows a join hands down, so a filter that keeps a few percent of a table reads a
+/// few percent of it. On JOB `cast_info.note IN (...)` keeps 2.4 of 36 million rows and the scan
+/// used to decode every code to find them. The filter still runs over what is read, so the rows only
+/// ever say where to look. See `rudb_native::postings`.
+#[derive(Debug)]
+struct Valued {
+    input: usize,
+    tests: Vec<Prepared>,
+}
+
+impl Valued {
+    /// The codes of `dictionary` every test passes, or `None` when a null passes them all, since
+    /// the recorded rows leave the nulls out, or when a test cannot be asked.
+    ///
+    /// The dictionary is asked a vector's length at a time, since a chunk is no longer than that.
+    fn passing(
+        &self,
+        types: &[LogicalType],
+        dictionary: &Vector,
+        threads: usize,
+    ) -> Option<Vec<u32>> {
+        let nulls = self.over(types, 1, None)?;
+        let mut null_passes = true;
+        for test in &self.tests {
+            null_passes &= test.evaluate_filter(&nulls, &mut test.scratch()).ok()?.len() == 1;
+        }
+        if null_passes {
+            return None;
+        }
+        // The scan's workers are all waiting for this answer, so it is shared out among as many
+        // threads as they are. `cast_info.note` has 715 thousand values, which is 50 milliseconds
+        // on one thread and more than the scan it saves takes on six.
+        let windows = dictionary.len().div_ceil(VECTOR_SIZE);
+        let threads = threads.clamp(1, windows.max(1));
+        if threads == 1 {
+            return self.codes_in(types, dictionary, 0..dictionary.len());
+        }
+        let per = windows.div_ceil(threads) * VECTOR_SIZE;
+        let shares = std::thread::scope(|scope| {
+            let handles = (0..dictionary.len())
+                .step_by(per)
+                .map(|at| {
+                    let end = (at + per).min(dictionary.len());
+                    scope.spawn(move || self.codes_in(types, dictionary, at..end))
+                })
+                .collect::<Vec<_>>();
+            handles.into_iter().map(|handle| handle.join().ok().flatten()).collect::<Vec<_>>()
+        });
+        let mut codes = Vec::new();
+        for share in shares {
+            codes.extend(share?);
+        }
+        Some(codes)
+    }
+
+    /// The codes in `range` of `dictionary` every test passes, a window at a time.
+    fn codes_in(
+        &self,
+        types: &[LogicalType],
+        dictionary: &Vector,
+        range: Range<usize>,
+    ) -> Option<Vec<u32>> {
+        let mut scratches = self.tests.iter().map(Prepared::scratch).collect::<Vec<_>>();
+        let mut codes = Vec::new();
+        let mut pass = Vec::new();
+        for at in range.clone().step_by(VECTOR_SIZE) {
+            let len = VECTOR_SIZE.min(range.end - at);
+            let values = self.over(types, len, Some(dictionary.slice(at, len).ok()?))?;
+            pass.clear();
+            pass.resize(len, 0_usize);
+            for (test, scratch) in self.tests.iter().zip(&mut scratches) {
+                for &row in test.evaluate_filter(&values, scratch).ok()?.indices() {
+                    pass[row as usize] += 1;
+                }
+            }
+            let base = u32::try_from(at).ok()?;
+            let all = self.tests.len();
+            codes.extend((0..len).filter(|&row| pass[row] == all).map(|row| base + row as u32));
+        }
+        Some(codes)
+    }
+
+    /// A chunk of `len` rows of nulls, with `column` in the tested column when there is one.
+    fn over(&self, types: &[LogicalType], len: usize, column: Option<Vector>) -> Option<Chunk> {
+        let mut columns = types
+            .iter()
+            .map(|ty| Vector::constant(ty.clone(), Value::Null, len))
+            .collect::<Vec<_>>();
+        if let Some(column) = column {
+            columns[self.input] = column;
+        }
+        Chunk::with_rows(columns, len).ok()
+    }
+}
+
+/// The conjuncts of `predicate` that read exactly one text column of the scan, grouped by column.
+fn valued(plan: &Plan, schema: &Schema, predicate: ExprRef, session: &Session) -> Vec<Valued> {
+    let conjuncts = match *plan.expr(predicate) {
+        Expr::Conjunction { op: ConjunctionOp::And, children } => plan.expr_list(children).to_vec(),
+        _ => vec![predicate],
+    };
+    let types = schema.types();
+    let mut out: Vec<Valued> = Vec::new();
+    for conjunct in conjuncts {
+        let mut inputs = Vec::new();
+        let mut unknown = false;
+        crate::join::columns(plan, conjunct, &mut |binding| match schema.position_of(binding) {
+            Some(at) if !inputs.contains(&at) => inputs.push(at),
+            Some(_) => {}
+            None => unknown = true,
+        });
+        let [input] = inputs[..] else { continue };
+        if unknown || types[input] != LogicalType::Varchar {
+            continue;
+        }
+        let Ok(test) = Prepared::one(plan, conjunct, schema) else { continue };
+        let test = test.in_session(session);
+        match out.iter_mut().find(|one| one.input == input) {
+            Some(one) => one.tests.push(test),
+            None => out.push(Valued { input, tests: vec![test] }),
+        }
+    }
+    out
 }
 
 /// The first predicate and column of a two-column selective scan.
@@ -1017,9 +1162,11 @@ impl Pushed {
             None
         };
         let stored = stored_like(plan, schema, pushdown.predicate);
+        let valued = valued(plan, schema, pushdown.predicate, session);
         Ok(Self {
             predicate,
             late,
+            valued,
             stored,
             compaction,
             passes: later_passes(plan, pushdown.node),
@@ -1149,6 +1296,7 @@ impl<'a> Scan<'a> {
             index,
             testing: OnceLock::new(),
             exact: OnceLock::new(),
+            threads: AtomicUsize::new(1),
             schema,
             chunks,
             stripes,
@@ -1479,7 +1627,11 @@ impl<'a> Scan<'a> {
     fn read_late(&self, at: usize, out: &mut Chunk) -> Result<bool> {
         let Some(pushed) = &self.pushed else { return Ok(false) };
         let Some(late) = &pushed.late else { return Ok(false) };
-        if self.sideways.is_some() || !self.also.is_empty() || !late.worth() {
+        if self.sideways.is_some()
+            || !self.also.is_empty()
+            || !late.worth()
+            || self.reduced(at).is_some()
+        {
             return Ok(false);
         }
         let Some(primary) = self.columns[late.input] else { return Ok(false) };
@@ -1876,14 +2028,63 @@ impl<'a> Scan<'a> {
     }
 
     /// The rows in every set of exact rows the joins above handed down, `None` when none did.
+    ///
+    /// The rows the file records for the values the pushed filter can keep go in with them, see
+    /// [`Valued`].
     fn handed(&self) -> Option<Rids> {
         let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
-        let mut sets = joins.filter_map(|sideways| sideways.rows(self.index));
-        let first = sets.next()?;
-        // Sets over tables of different sizes would be a bug above, and the first alone is still
-        // every row that can survive.
-        let all = sets.try_fold(first.clone(), |held, rows| held.intersect(rows));
-        Some(all.unwrap_or_else(|_| first.clone()))
+        let sets = joins.filter_map(|sideways| sideways.rows(self.index).cloned());
+        let mut held: Option<Rids> = None;
+        for rows in sets {
+            held = Some(narrowed(held, rows));
+        }
+        // Rows a join handed down that are already few enough to be read alone leave the value
+        // rows little to take away, and asking the dictionary and decoding the rows of its values
+        // cost more than that little. In 9a the joins leave 29 thousand rows of `cast_info` and
+        // the voice credits are two million.
+        let sparse = held
+            .as_ref()
+            .is_some_and(|rows| rows.len().saturating_mul(SPARSE_READ as u64) <= rows.rows());
+        if !sparse {
+            for rows in self.valued_rows() {
+                held = Some(narrowed(held, rows));
+            }
+        }
+        held
+    }
+
+    /// The rows the file records for the values each [`Valued`] group can keep, for the groups
+    /// that keep at most one row in [`SPARSE_READ`], which is where reading at the rows pays.
+    fn valued_rows(&self) -> Vec<Rids> {
+        let Some(pushed) = &self.pushed else { return Vec::new() };
+        let Some(reader) = self.table.rows().stored() else { return Vec::new() };
+        let types = self.schema.types();
+        let mut out = Vec::new();
+        let rows = reader.table().rows();
+        for one in &pushed.valued {
+            let Some(column) = self.columns[one.input] else { continue };
+            let Ok(Some(dictionary)) = reader.global_dictionary(column) else { continue };
+            // A file written before the builder left these columns out still holds their rows.
+            if dictionary.len().saturating_mul(rudb_native::postings::FEWEST_ROWS_PER_VALUE) > rows {
+                continue;
+            }
+            let Some(index) = reader.value_rows(column) else { continue };
+            if dictionary.len() != index.values()
+                || index.held(&[]).is_none_or(|whole| whole.saturating_mul(SPARSE_READ as u64) > index.rows())
+            {
+                continue;
+            }
+            let threads = self.threads.load(Ordering::Relaxed);
+            let Some(codes) = one.passing(&types, &dictionary, threads) else { continue };
+            let Some(held) = index.held(&codes) else { continue };
+            if held.saturating_mul(SPARSE_READ as u64) > index.rows() {
+                continue;
+            }
+            if let Ok(rows) = index.rows_of(&codes) {
+                out.push(rows);
+            }
+        }
+        out
     }
 
     /// Whether the exact rows hold nothing inside part `at`, so the part is never read.
@@ -2224,6 +2425,7 @@ impl Source for Scan<'_> {
     }
 
     fn morsels(&self, threads: usize, weight: usize) -> Option<usize> {
+        self.threads.store(threads, Ordering::Relaxed);
         let chunks = self.chunks.total();
         // A table that says nothing about how its chunks are grouped has nothing to divide by, so
         // its chunks go out one at a time to whoever asks, which is what every table did before
@@ -4347,6 +4549,7 @@ mod tests {
             index: 0,
             testing: OnceLock::new(),
             exact: OnceLock::new(),
+            threads: AtomicUsize::new(1),
             schema: Schema::numbered(fields, 0),
             chunks: Handout::new(table.rows().chunk_count()),
             stripes: Vec::new(),

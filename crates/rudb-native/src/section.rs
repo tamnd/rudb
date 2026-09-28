@@ -84,6 +84,10 @@ pub const RUN_PROJECTION: &[u8; 8] = b"RUDBRP1\0";
 /// so it is on neither budget list below.
 pub const TEXT_GRAMS: &[u8; 8] = b"RUDBTG1\0";
 
+/// The rows of each value of a text column held in a table wide dictionary, see
+/// [`crate::postings`]. Paid for out of its own share, so it is on neither budget list below.
+pub const VALUE_ROWS: &[u8; 8] = b"RUDBVR1\0";
+
 /// The kinds the graph document owns, which share its ten percent of the column bytes.
 pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
 
@@ -224,6 +228,7 @@ impl Section {
                 | SORTED_PROJECTION
                 | RUN_PROJECTION
                 | TEXT_GRAMS
+                | VALUE_ROWS
         )
     }
 

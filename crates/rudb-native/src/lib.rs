@@ -59,6 +59,7 @@ mod distinct;
 pub mod grams;
 pub mod graph;
 pub mod host;
+pub mod postings;
 mod prepare;
 mod projection;
 mod run_projection;
@@ -4367,6 +4368,9 @@ pub struct Reader {
     /// Each text column's [`grams`] sketch in row id order, read the first time a `LIKE` asks
     /// about the column, and `None` when the table carries none for it.
     text_grams: Arc<Vec<OnceLock<Option<Vec<u64>>>>>,
+    /// Each coded text column's [`postings`] section, read the first time a filter asks about the
+    /// column, and `None` when the table carries none for it.
+    value_rows: Arc<Vec<OnceLock<Option<Arc<postings::ValueRows>>>>>,
     /// The row id of every part's first row, by table wide part number.
     firsts: Arc<Vec<usize>>,
     /// The key maps, links and adjacencies of this table, each decoded the first time a plan asks.
@@ -6557,6 +6561,7 @@ impl Reader {
             verified: Arc::new((0..verified).map(|_| AtomicU64::new(0)).collect()),
             unreleased: Arc::new(unreleased),
             text_grams: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
+            value_rows: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             firsts: Arc::new(firsts),
             graph: Arc::default(),
             size,
@@ -7508,6 +7513,45 @@ impl Reader {
     #[must_use]
     pub fn demoted(&self, column: usize) -> bool {
         self.table.demoted.get(column).copied().unwrap_or(false)
+    }
+
+    /// The table wide dictionary of a column, or `None` for a column without one.
+    ///
+    /// # Errors
+    ///
+    /// If the dictionary page cannot be read or does not decode.
+    pub fn global_dictionary(&self, column: usize) -> Result<Option<Arc<Vector>>> {
+        if column >= self.table.fields.len() {
+            return Ok(None);
+        }
+        self.dictionary(column)
+    }
+
+    /// The column's [`postings`] section, read once, or `None` when the table carries none.
+    #[must_use]
+    pub fn value_rows(&self, column: usize) -> Option<Arc<postings::ValueRows>> {
+        self.value_rows
+            .get(column)?
+            .get_or_init(|| postings::value_rows(self, column).map(Arc::new))
+            .clone()
+    }
+
+    /// Every row's table wide code in part `part` of `column`, `None` for a null, or `None` for
+    /// the whole part when its page is not coded against the table wide dictionary.
+    ///
+    /// # Errors
+    ///
+    /// If the part cannot be read or its page does not decode.
+    pub fn stable_codes(&self, part: usize, column: usize) -> Result<Option<Vec<Option<u32>>>> {
+        if self.table.dictionaries.get(column).is_none_or(Option::is_none) {
+            return Ok(None);
+        }
+        let rows = self.part_rows(part);
+        let positions = (0..rows).collect::<Vec<_>>();
+        self.with_part(part, column, |bytes| {
+            let mut out = Vec::with_capacity(rows);
+            Ok(decode_selected_stable_codes(rows, bytes, &positions, &mut out)?.then_some(out))
+        })
     }
 
     /// The global dictionary of a column, opened once however many workers ask for it at once.
