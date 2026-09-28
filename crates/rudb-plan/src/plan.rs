@@ -421,9 +421,10 @@ impl Plan {
     #[must_use]
     pub fn ascending(&self, index: u32, column: &str) -> bool {
         self.ascending.get(&index).is_some_and(|columns| columns.contains(column))
-            || self.facts.get(&index).is_some_and(|(facts, ascending)| {
-                *ascending && facts.ascending.contains(column)
-            })
+            || self
+                .facts
+                .get(&index)
+                .is_some_and(|(facts, ascending)| *ascending && facts.ascending.contains(column))
     }
 
     /// Records that a value of the string column called `column` of the table bound at `index` takes
