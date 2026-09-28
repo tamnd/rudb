@@ -42,7 +42,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         return crate::timing::rebuild(root, "compiled", args);
     }
     let usage = || {
-        "usage: cargo xtask compiled [--threads <n>] [--repeat <n>] [--set <name>=<value>]... [--tier auto|interp|clif|direct | --tiers <seed>] \
+        "usage: cargo xtask compiled [--threads <n>] [--repeat <n>] [--set <name>=<value>]... [--explain] [--tier auto|interp|clif|direct | --tiers <seed>] \
          <file.parquet> [q1 q2 ...]\n       \
          cargo xtask compiled [--threads <n>] [--tier auto|interp|clif|direct | --tiers <seed>] \
          --suite <parquet dir> <queries> [q1 ...]\n       \
@@ -55,7 +55,16 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let mut threads = None;
     let mut repeat = 1_usize;
     let mut sets = Vec::new();
-    while let [flag, value, rest @ ..] = args {
+    let mut explain = false;
+    loop {
+        if let [flag, rest @ ..] = args
+            && flag == "--explain"
+        {
+            explain = true;
+            args = rest;
+            continue;
+        }
+        let [flag, value, rest @ ..] = args else { break };
         match flag.as_str() {
             "--tier" => tier = value.clone(),
             "--tiers" => {
@@ -153,6 +162,9 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     for (name, sql) in &queries {
         if !only.is_empty() && !only.contains(&name.as_str()) {
             continue;
+        }
+        if explain {
+            explained(&database, name, sql);
         }
         let first = answer(&database, "first", sql);
         let up = database.tier_ups();
@@ -362,6 +374,24 @@ impl Default for Answer {
             backend_ms: 0.0,
             insts: 0,
             bytes: 0,
+        }
+    }
+}
+
+/// Prints the first engine's plan and the compiled engine's stages and module for one query, which
+/// is what `--explain` asks for when a query is slower than it should be.
+fn explained(database: &Database, name: &str, sql: &str) {
+    for how in ["EXPLAIN", "EXPLAIN (CODEGEN)"] {
+        println!("-- {name}: {how}");
+        match database.query(&format!("{how} {sql}")) {
+            Ok(result) => {
+                for row in result.rows() {
+                    for value in row {
+                        println!("{value}");
+                    }
+                }
+            }
+            Err(e) => println!("error: {e}"),
         }
     }
 }

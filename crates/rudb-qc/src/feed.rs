@@ -413,14 +413,7 @@ impl<'a> Feed<'a> {
         let columns = self.columns;
         let top = self.top;
         let chunks = pieces(threads, table.len().div_ceil(VECTOR_SIZE), |at| {
-            let chunk = finish::group_chunk(table, &sets, g, columns, at)?;
-            match top {
-                // Every row of the answer is in the top N of the chunk it is in.
-                Some((keys, count)) if (count as usize) < chunk.len() => {
-                    finish::sort(vec![chunk], keys, Some(count), 0)
-                }
-                _ => Ok(vec![chunk]),
-            }
+            cut(finish::group_chunk(table, &sets, g, columns, at)?, top)
         })?;
         let mut out = Vec::with_capacity(chunks.len());
         for chunk in chunks {
@@ -626,7 +619,11 @@ impl<'a> Feed<'a> {
                 Step::Merge => return Err(Error::internal("a merge step with one worker")),
                 Step::Finalize => match &self.body.sink {
                     Out::Aggregate(g) if !inner.grouped => {
-                        out = finish::groups(inner.rt, g, self.columns)?;
+                        let mut cuts = Vec::new();
+                        for chunk in finish::groups(inner.rt, g, self.columns)? {
+                            cuts.append(&mut cut(chunk, self.top)?);
+                        }
+                        out = cuts;
                     }
                     Out::Aggregate(_) => {}
                     // The build publishes its table to the probes and produces no rows.
@@ -677,6 +674,17 @@ impl<'a> Feed<'a> {
             Kind::NeedMemory => Error::internal(format!("a pipeline asked for memory, {s:?}")),
             _ => Error::internal(format!("a pipeline returned status {s:?}")),
         }
+    }
+}
+
+/// A chunk of groups cut to its top N, when only a top N reads them. Every row of the answer is in
+/// the top N of the chunk it is in.
+fn cut(chunk: Chunk, top: Option<(&[Key], u64)>) -> Result<Vec<Chunk>> {
+    match top {
+        Some((keys, count)) if (count as usize) < chunk.len() => {
+            finish::sort(vec![chunk], keys, Some(count), 0)
+        }
+        _ => Ok(vec![chunk]),
     }
 }
 
