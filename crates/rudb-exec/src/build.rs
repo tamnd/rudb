@@ -285,6 +285,20 @@ pub fn build_cut_into<'a>(
     )
 }
 
+/// The values of the aggregate `node` of `plan`, when every one of them can be read from the
+/// statistics of the table under it the way the first engine answers such an aggregate without
+/// reading a row, and `None` when one of them needs the rows.
+///
+/// # Errors
+///
+/// When the table fails to say what it knows.
+pub fn summarized(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Option<Vec<Value>>> {
+    let Node::Aggregate { input, groups, aggregates, .. } = *plan.node(node) else {
+        return Ok(None);
+    };
+    stored_summary(plan, catalog, input, groups, aggregates)
+}
+
 /// The cutoff of a top N that runs outside the first engine, over the rows of a scan the first
 /// engine builds with [`build_cut_into`]. See [`crate::cutoff`] for why a scan may skip the parts
 /// it rules out.
