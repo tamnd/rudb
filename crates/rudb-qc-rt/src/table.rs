@@ -87,6 +87,13 @@ pub struct GroupTable {
     /// [`join`](GroupTable::join). The hash in the slot is what lets a probe pass a slot of another
     /// key without reading that group's row.
     slots: Vec<u64>,
+    /// How many groups the slots may hold before they are emptied, zero for no limit. The rows
+    /// stay where they are, so a key seen again after that gets a second group, which a merge by
+    /// parts folds together. A table made small this way keeps its slots and its newest rows in
+    /// the cache while a worker probes it.
+    cap: usize,
+    /// The first group the slots know about.
+    since: usize,
 }
 
 impl GroupTable {
@@ -103,6 +110,8 @@ impl GroupTable {
             rows: Vec::new(),
             hashes: Vec::new(),
             slots: vec![0; 64],
+            cap: 0,
+            since: 0,
         };
         if table.layout.keys.is_empty() {
             table.add(&[], 0, None);
@@ -118,6 +127,18 @@ impl GroupTable {
         table.rows.reserve(groups);
         table.hashes.reserve(groups);
         table
+    }
+
+    /// Lets the table forget the groups it has once it holds `cap` of them, for a worker whose
+    /// groups are merged by parts after the scan.
+    pub fn cap(&mut self, cap: usize) {
+        self.cap = cap;
+    }
+
+    /// Whether a key may have more than one group, because the slots were emptied.
+    #[must_use]
+    pub fn forgot(&self) -> bool {
+        self.since != 0
     }
 
     /// The shape of the rows.
@@ -268,6 +289,8 @@ impl GroupTable {
             rows: Vec::with_capacity(n),
             hashes: Vec::with_capacity(n),
             slots: Vec::new(),
+            cap: 0,
+            since: 0,
         };
         for part in parts {
             table.pages.extend(part.pages);
@@ -306,7 +329,10 @@ impl GroupTable {
         }
         let gid = self.add(key, hash, heap);
         self.slots[at] = tag | (gid as u64 + 1);
-        if self.rows.len() * 2 > self.slots.len() {
+        if self.cap != 0 && self.rows.len() - self.since >= self.cap {
+            self.slots.fill(0);
+            self.since = self.rows.len();
+        } else if (self.rows.len() - self.since) * 2 > self.slots.len() {
             self.grow();
         }
         gid
@@ -375,12 +401,12 @@ impl GroupTable {
 
     fn grow(&mut self) {
         let mut size = self.slots.len() * 2;
-        while self.rows.len() * 2 > size {
+        while (self.rows.len() - self.since) * 2 > size {
             size *= 2;
         }
         let mut slots = vec![0u64; size];
         let mask = slots.len() - 1;
-        for (gid, &hash) in self.hashes.iter().enumerate() {
+        for (gid, &hash) in self.hashes.iter().enumerate().skip(self.since) {
             let mut at = (hash as usize) & mask;
             while slots[at] != 0 {
                 at = (at + 1) & mask;
@@ -684,6 +710,36 @@ mod tests {
         k[9..25].copy_from_slice(&text::make(s).to_le_bytes());
         k[25] = u8::from(null);
         k
+    }
+
+    #[test]
+    fn a_capped_table_forgets_and_a_merge_by_parts_folds_it_back() {
+        let layout = Layout {
+            keys: vec![KeyField { offset: 0, width: 8, text: false }],
+            key_size: 9,
+            init: vec![0; 8],
+        };
+        let mut t = GroupTable::new(layout.clone());
+        t.cap(100);
+        let mut heap = Heap::new();
+        for round in 0..3u64 {
+            for i in 0..150u64 {
+                let k = (i + round * 50).to_le_bytes().into_iter().chain([0]).collect::<Vec<_>>();
+                // SAFETY: the key is alive and has no strings.
+                unsafe { t.insert(k.as_ptr().expose_provenance(), i + round * 50, &mut heap) };
+            }
+        }
+        assert!(t.forgot());
+        assert!(t.len() > 250);
+        let mut parts = Vec::new();
+        for pick in t.split(2) {
+            let mut part = GroupTable::with_capacity(layout.clone(), pick.len());
+            part.absorb_some(&t, &pick, None, |_, _| {});
+            parts.push(part);
+        }
+        let merged = GroupTable::join(layout, parts);
+        assert_eq!(merged.len(), 250);
+        assert!(!merged.forgot());
     }
 
     #[test]

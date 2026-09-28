@@ -203,7 +203,13 @@ impl<'a> Feed<'a> {
 
     /// A worker with a runtime of its own and its state as init leaves it.
     fn worker(&self) -> Worker {
-        let rt = self.lock().rt.worker();
+        let mut rt = self.lock().rt.worker();
+        if self.split
+            && let Out::Aggregate(g) = &self.body.sink
+            && let Some(table) = rt.table_mut(g.table)
+        {
+            table.cap(WORKER_GROUPS);
+        }
         let mut state = self.template.clone();
         head(&mut state);
         if let Out::Aggregate(g) = &self.body.sink
@@ -270,19 +276,25 @@ impl<'a> Feed<'a> {
                 workers.iter_mut().map(|w| w.take_distinct(h).ok_or_else(|| gone(h))).collect()
             })
             .collect::<Result<Vec<Vec<Distinct>>>>()?;
+        // A worker that forgot its groups may have a key twice, which only the parts fold.
+        let forgot = workers.iter().filter_map(|w| w.table(g.table)).any(GroupTable::forgot);
         let first = workers.remove(0);
         let folds = &self.folds;
         let fold = |d: &mut [u8], s: &[u8]| merge::fold(folds, d, s);
         let groups: usize =
             workers.iter().filter_map(|w| w.table(g.table)).map(GroupTable::len).sum();
         inner.rt.adopt(first, g.table, &[]);
+        // The workers are folded into the adopted table, which must not forget them.
+        if let Some(table) = inner.rt.table_mut(g.table) {
+            table.cap(0);
+        }
         let parts = (threads.degree() * 4).next_power_of_two().clamp(16, 1024);
         let bits = parts.trailing_zeros();
         // Which merged group each worker's group became, for the distinct sets.
         let mut maps: Vec<Vec<usize>> = Vec::with_capacity(workers.len() + 1);
         maps.push((0..inner.rt.table(g.table).map_or(0, GroupTable::len)).collect());
         // Few groups fold faster on one thread than they split.
-        let split = !g.keys.is_empty() && groups >= SPLIT_FROM;
+        let split = !g.keys.is_empty() && (groups >= SPLIT_FROM || forgot);
         if split {
             let (merged, made) = {
                 let mine = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
@@ -695,6 +707,10 @@ impl Sink for Scan<'_, '_> {
 
 /// How many groups the workers of an aggregate have between them before they are merged in parts.
 const SPLIT_FROM: usize = 1 << 16;
+
+/// How many groups a worker's table holds before it forgets them and starts again, so that its
+/// slots and the rows it is filling stay in the cache.
+const WORKER_GROUPS: usize = 1 << 15;
 
 fn gone(table: u64) -> Error {
     Error::internal(format!("the group table or distinct set {table} is gone"))

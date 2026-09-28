@@ -328,6 +328,14 @@ impl Rt {
         }
     }
 
+    /// The group table behind a handle, to change.
+    pub fn table_mut(&mut self, handle: u64) -> Option<&mut GroupTable> {
+        match self.objects.get_mut(handle as usize) {
+            Some(Object::Table(t)) => Some(t),
+            _ => None,
+        }
+    }
+
     /// The distinct sets behind a handle.
     #[must_use]
     pub fn distinct(&self, handle: u64) -> Option<&Distinct> {
