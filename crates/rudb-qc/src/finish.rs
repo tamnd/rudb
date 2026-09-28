@@ -219,6 +219,8 @@ pub(crate) fn sort(
     for (at, chunk) in chunks.iter().enumerate() {
         for (column, &(c, _, _)) in flat.iter_mut().zip(&keys) {
             let vector = chunk.column(c)?;
+            // flatten: a key is read as a slice, and only a stage that is not ours hands over a
+            // vector that is not flat already.
             column.push(if vector.data().is_some() { vector.clone() } else { vector.flatten()? });
         }
         place.extend((0..chunk.len()).map(|i| (at as u32, i as u32)));
