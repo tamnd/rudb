@@ -4484,6 +4484,22 @@ impl PageBytes {
     }
 }
 
+/// A mapped page lets its pages go when the last holder does.
+///
+/// A page read part by part is let go once its last part is read, but
+/// a page held whole was never let go at all, so every page a scan held stayed mapped into the
+/// process until the file closed. A `LIKE` holds each `URL` page whole, because it asks a part
+/// whether it can answer and then reads it, and on ClickBench 21 that was 23 MB of a 49 MB peak.
+/// Nothing reads a dropped page through this holder again, and a reader that maps the same range
+/// later faults it back in from the page cache.
+impl Drop for PageBytes {
+    fn drop(&mut self) {
+        if let Self::Mapped { map, offset, length } = self {
+            map.release(*offset, *length);
+        }
+    }
+}
+
 impl HeldPage {
     fn bytes(&self) -> &[u8] {
         self.bytes.bytes()
