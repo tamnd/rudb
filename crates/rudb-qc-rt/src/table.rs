@@ -101,8 +101,6 @@ pub struct GroupTable {
     /// The groups this table may make, when a limit with no order above the aggregate reads only
     /// that many of them.
     limited: Option<Limited>,
-    /// Whether a new group in [`absorb_some`](GroupTable::absorb_some) keeps the row it came from.
-    adopting: bool,
 }
 
 /// The groups the tables of a limited aggregate's workers agree on: the first keys any of them
@@ -152,7 +150,6 @@ impl GroupTable {
             cap: 0,
             since: 0,
             limited: None,
-            adopting: false,
         };
         if table.layout.keys.is_empty() {
             table.add(&[], 0, None);
@@ -350,8 +347,9 @@ impl GroupTable {
     /// Folds the groups `picks` of `other`, as [`split`](GroupTable::split) gave them, into this
     /// table, as [`absorb`](GroupTable::absorb) does with all of them. With `made`, each group's id
     /// in `other` and the group it became here are pushed to it. With `whole`, a key this table
-    /// does not have yet takes the row of `other` as it is, which is right when combining a row
-    /// into a new group's row gives that row back.
+    /// does not have yet keeps the row of `other` where it is, which is right when combining a row
+    /// into a new group's row gives that row back, and which needs whoever
+    /// [took](GroupTable::take_pages) `other`'s pages to keep them as long as this table.
     pub fn absorb_some(
         &mut self,
         other: &GroupTable,
@@ -377,12 +375,10 @@ impl GroupTable {
                     gid
                 }
                 Err(slot) => {
-                    let gid = if whole && self.adopting {
+                    let gid = if whole {
                         self.rows.push(row);
                         self.hashes.push(hash);
                         self.rows.len() - 1
-                    } else if whole {
-                        self.copy(src, hash)
                     } else {
                         let gid = self.add(key, hash, None);
                         combine(self.row_mut(gid), src);
@@ -412,13 +408,6 @@ impl GroupTable {
     pub fn keep(&mut self, mut pages: Vec<Box<[u8]>>) {
         self.pages.append(&mut pages);
         self.fill = ROWS_PER_PAGE;
-    }
-
-    /// Makes [`absorb_some`](GroupTable::absorb_some) with `whole` take a row it does not have yet
-    /// where it is, with no copy, which is right when the pages of the tables it absorbs from were
-    /// taken and will be kept by the table this one ends up in.
-    pub fn adopt_rows(&mut self) {
-        self.adopting = true;
     }
 
     /// One table of the groups of `parts`, which have the layout `layout` and no key in common,
@@ -469,7 +458,6 @@ impl GroupTable {
             cap: 0,
             since: 0,
             limited: None,
-            adopting: false,
         };
         (table, ran)
     }
@@ -585,30 +573,12 @@ impl GroupTable {
         self.pages.last_mut().map_or(0, |page| page[at..].as_mut_ptr().expose_provenance())
     }
 
-    /// A new group whose row is `src` but for the group id at its front.
-    fn copy(&mut self, src: &[u8], hash: u64) -> usize {
-        let gid = self.rows.len();
-        let address = self.room();
-        // SAFETY: `room` gave a row of `row_size` bytes in a page this table owns, and no group
-        // points at it yet.
-        let row = unsafe {
-            std::slice::from_raw_parts_mut(
-                std::ptr::with_exposed_provenance_mut::<u8>(address),
-                self.row_size,
-            )
-        };
-        row.copy_from_slice(&src[..self.row_size]);
-        row[..8].copy_from_slice(&(gid as u64).to_le_bytes());
-        self.rows.push(address);
-        self.hashes.push(hash);
-        gid
-    }
-
     fn add(&mut self, key: &[u8], hash: u64, mut heap: Option<&mut Heap>) -> usize {
         let gid = self.rows.len();
         let address = self.room();
         let acc = Layout::acc_offset(self.layout.key_size) as usize;
-        // SAFETY: as in `copy`.
+        // SAFETY: `room` gave a row of `row_size` bytes in a page this table owns, and no group
+        // points at it yet.
         let row = unsafe {
             std::slice::from_raw_parts_mut(
                 std::ptr::with_exposed_provenance_mut::<u8>(address),
@@ -979,6 +949,50 @@ mod tests {
         let merged = GroupTable::join(layout, parts);
         assert_eq!(merged.len(), 250);
         assert!(!merged.forgot());
+    }
+
+    #[test]
+    fn a_merge_that_keeps_the_rows_where_they_are_folds_every_count() {
+        let layout = Layout {
+            keys: vec![KeyField { offset: 0, width: 8, text: false }],
+            key_size: 9,
+            init: vec![0; 8],
+        };
+        let acc = Layout::acc_offset(9) as usize;
+        let mut t = GroupTable::new(layout.clone());
+        t.cap(100);
+        let mut heap = Heap::new();
+        for round in 0..3u64 {
+            for i in 0..150u64 {
+                let k = (i + round * 50).to_le_bytes().into_iter().chain([0]).collect::<Vec<_>>();
+                // SAFETY: the key is alive and has no strings, and the row is the table's.
+                unsafe {
+                    let row = t.insert(k.as_ptr().expose_provenance(), i + round * 50, &mut heap);
+                    let count = std::ptr::with_exposed_provenance_mut::<u64>(row + acc);
+                    count.write_unaligned(count.read_unaligned() + 1);
+                }
+            }
+        }
+        let pages = t.take_pages();
+        let add = |d: &mut [u8], s: &[u8]| {
+            let n = |b: &[u8]| u64::from_le_bytes(b[acc..acc + 8].try_into().unwrap_or_default());
+            let total = n(d) + n(s);
+            d[acc..acc + 8].copy_from_slice(&total.to_le_bytes());
+        };
+        let mut parts = Vec::new();
+        for pick in t.split(2) {
+            let mut part = GroupTable::with_capacity(layout.clone(), pick.len());
+            part.absorb_some(&t, &pick, None, true, add);
+            parts.push(part);
+        }
+        drop(t);
+        let mut merged = GroupTable::join(layout, parts);
+        merged.keep(pages);
+        let counts: Vec<u64> = (0..merged.len())
+            .map(|gid| u64::from_le_bytes(merged.row(gid)[acc..acc + 8].try_into().unwrap()))
+            .collect();
+        assert_eq!(counts.len(), 250);
+        assert_eq!(counts.iter().sum::<u64>(), 450);
     }
 
     #[test]

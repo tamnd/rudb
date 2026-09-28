@@ -373,10 +373,9 @@ impl<'a> Feed<'a> {
         if split {
             // Folding a worker's row into a new group gives the row back, but for a distinct set,
             // which the fold leaves alone, so without one a new group keeps its worker's row where
-            // it is. The pages the rows are in go to the merged table.
-            let whole = sets.is_empty();
-            let mut pages = Vec::new();
-            if whole {
+            // it is.
+            if sets.is_empty() {
+                let mut pages = Vec::new();
                 if let Some(table) = inner.rt.table_mut(g.table) {
                     pages.append(&mut table.take_pages());
                 }
@@ -385,6 +384,7 @@ impl<'a> Feed<'a> {
                         pages.append(&mut table.take_pages());
                     }
                 }
+                return self.merge_whole(inner, workers, pages, bits, threads);
             }
             let (merged, made) = {
                 let mine = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
@@ -396,12 +396,9 @@ impl<'a> Feed<'a> {
                 let merged = pieces(threads, parts, |part| {
                     let most = splits.iter().map(|s| s[part].len()).sum();
                     let mut table = GroupTable::with_capacity(layout.clone(), most);
-                    if whole {
-                        table.adopt_rows();
-                    }
-                    let mut made = vec![Vec::new(); if sets.is_empty() { 0 } else { tables.len() }];
+                    let mut made = vec![Vec::new(); tables.len()];
                     for (t, (other, split)) in tables.iter().zip(&splits).enumerate() {
-                        table.absorb_some(other, &split[part], made.get_mut(t), whole, fold);
+                        table.absorb_some(other, &split[part], made.get_mut(t), false, fold);
                     }
                     table.seal();
                     (table, made)
@@ -414,20 +411,16 @@ impl<'a> Feed<'a> {
                     from.push(at);
                     at += t.len();
                 }
-                let made = if sets.is_empty() {
-                    Vec::new()
-                } else {
-                    pieces(threads, tables.len(), |t| {
-                        let mut map = vec![0; tables[t].len()];
-                        for (part, made) in made.iter().enumerate() {
-                            for &(gid, local) in &made[t] {
-                                map[gid as usize] = from[part] + local as usize;
-                            }
+                let made = pieces(threads, tables.len(), |t| {
+                    let mut map = vec![0; tables[t].len()];
+                    for (part, made) in made.iter().enumerate() {
+                        for &(gid, local) in &made[t] {
+                            map[gid as usize] = from[part] + local as usize;
                         }
-                        map
-                    })?
-                };
-                let (mut joined, ran) = GroupTable::join_with(layout, merged, |jobs| {
+                    }
+                    map
+                })?;
+                let (joined, ran) = GroupTable::join_with(layout, merged, |jobs| {
                     let jobs: Vec<Mutex<Option<Job<'_>>>> =
                         jobs.into_iter().map(|job| Mutex::new(Some(job))).collect();
                     pieces(threads, jobs.len(), |at| {
@@ -437,7 +430,6 @@ impl<'a> Feed<'a> {
                     })
                 });
                 ran?;
-                joined.keep(pages);
                 (joined, made)
             };
             maps = made;
@@ -480,6 +472,66 @@ impl<'a> Feed<'a> {
         let chunks = pieces(threads, table.len().div_ceil(span), |at| {
             piece(table, &sets, g, columns, top, at * span, ((at + 1) * span).min(table.len()))
         })?;
+        let mut out = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            out.append(&mut chunk?);
+        }
+        inner.out = out;
+        inner.grouped = true;
+        Ok(())
+    }
+
+    /// The rest of [`merge`](Feed::merge) for an aggregate with no distinct set, whose rows the
+    /// merge takes where they are in `pages`. Each part folds its groups and makes them into chunks
+    /// while they are in the cache of the thread that folded them, cut to the groups a top N by a
+    /// count can keep when one reads them, so the parts are never joined into one table.
+    fn merge_whole(
+        &self,
+        mut inner: MutexGuard<'_, Inner<'a>>,
+        workers: Vec<Rt>,
+        pages: Vec<Box<[u8]>>,
+        bits: u32,
+        threads: &Lease<'_>,
+    ) -> Result<()> {
+        let Out::Aggregate(g) = &self.body.sink else {
+            return Ok(());
+        };
+        let folds = &self.folds;
+        let fold = |d: &mut [u8], s: &[u8]| merge::fold(folds, d, s);
+        let (columns, top) = (self.columns, self.top);
+        let counted =
+            top.and_then(|(keys, count)| Some((finish::counted(g, keys)?, keys.len() > 1, count)));
+        let (chunks, layout) = {
+            let mine = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
+            let tables = std::iter::once(Ok(mine))
+                .chain(workers.iter().map(|w| w.table(g.table).ok_or_else(|| gone(g.table))))
+                .collect::<Result<Vec<&GroupTable>>>()?;
+            let splits = pieces(threads, tables.len(), |at| tables[at].split(bits))?;
+            let layout = mine.layout().clone();
+            let chunks = pieces(threads, 1 << bits, |part| {
+                let most = splits.iter().map(|s| s[part].len()).sum();
+                let mut table = GroupTable::with_capacity(layout.clone(), most);
+                for (other, split) in tables.iter().zip(&splits) {
+                    table.absorb_some(other, &split[part], None, true, fold);
+                }
+                table.seal();
+                let gids = counted
+                    .and_then(|(at, more, count)| {
+                        finish::counted_top(&table, at, more, count, 0, table.len())
+                    })
+                    .unwrap_or_else(|| (0..table.len()).collect());
+                let mut out = Vec::new();
+                for gids in gids.chunks(VECTOR_SIZE) {
+                    out.append(&mut cut(finish::group_rows(&table, &[], g, columns, gids)?, top)?);
+                }
+                Ok::<_, Error>(out)
+            })?;
+            (chunks, layout)
+        };
+        // The rows stay where they are until the query is done, as a merged table's would.
+        let mut kept = GroupTable::new(layout);
+        kept.keep(pages);
+        inner.rt.settle(workers, g.table, kept)?;
         let mut out = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             out.append(&mut chunk?);
