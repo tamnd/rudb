@@ -83,9 +83,9 @@ pub enum Bound {
     CopyTo(CopyTo),
 }
 
-/// A bound `COPY ... TO` a CSV file, with every option read and defaulted.
+/// A bound `COPY ... TO` a CSV or a JSON file, with every option read and defaulted.
 ///
-/// The defaults are the pin's: a header line, a comma, a double quote that is its own escape, and
+/// The CSV defaults are the pin's: a header line, a comma, a double quote that is its own escape, and
 /// a null written as nothing at all. The escape does not follow the quote, so `QUOTE ''''` alone
 /// still escapes with a double quote, which is what the pin writes.
 #[derive(Debug)]
@@ -108,6 +108,10 @@ pub struct CopyTo {
     pub force_quote: Vec<String>,
     /// Whether every column is, which is `FORCE_QUOTE *`.
     pub force_quote_all: bool,
+    /// Whether the file is JSON rather than CSV, and the CSV options above are left alone.
+    pub json: bool,
+    /// For JSON, whether the rows go in one array rather than one object a line.
+    pub array: bool,
 }
 
 /// A bound `SET` or `RESET`.
@@ -572,14 +576,14 @@ fn bind_one(
 
 /// Reads the options of a `COPY ... TO` against the format they are for.
 ///
-/// Only CSV is written. A `.parquet` or `.json` file, or a format named outright, is refused rather
-/// than written as CSV under a name that says otherwise. An option the pin takes and this does not
-/// is refused by name, and one the pin does not take either gets the first line of its refusal.
+/// CSV and JSON are written. A `.parquet` file, or Parquet named outright, is refused rather than
+/// written as CSV under a name that says otherwise. An option the pin takes and this does not is
+/// refused by name, and one the pin does not take either gets the first line of its refusal.
 fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     let lowered = copy.path.to_ascii_lowercase();
     let mut format = if lowered.ends_with(".parquet") {
         "parquet"
-    } else if lowered.ends_with(".json") || lowered.ends_with(".ndjson") {
+    } else if [".json", ".ndjson", ".jsonl"].iter().any(|end| lowered.ends_with(end)) {
         "json"
     } else {
         "csv"
@@ -588,10 +592,17 @@ fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     if let Some((_, Some(written))) = copy.options.iter().rev().find(|(name, _)| name == "format") {
         format = written.trim_matches('\'').to_ascii_lowercase();
     }
-    if format != "csv" {
-        return Err(Error::not_implemented(format!(
-            "COPY TO with FORMAT {format} is not supported yet"
-        )));
+    match format.as_str() {
+        "csv" => {}
+        "json" => return json_to(copy, plan),
+        "parquet" => {
+            return Err(Error::not_implemented("COPY TO with FORMAT parquet is not supported yet"));
+        }
+        _ => {
+            return Err(Error::catalog(format!(
+                "Copy Function with name {format} does not exist!"
+            )));
+        }
     }
     let mut out = CopyTo {
         plan,
@@ -603,6 +614,8 @@ fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         null: String::new(),
         force_quote: Vec::new(),
         force_quote_all: false,
+        json: false,
+        array: false,
     };
     for (name, value) in &copy.options {
         let text = || {
@@ -680,6 +693,67 @@ fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     }
     if out.delimiter.is_empty() {
         return Err(Error::binder("The delimiter option cannot be empty"));
+    }
+    Ok(out)
+}
+
+/// Reads the options of a `COPY ... TO` a JSON file, which is one object a line unless `ARRAY`
+/// asks for one array of them.
+fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
+    let mut out = CopyTo {
+        plan,
+        path: copy.path.clone(),
+        header: false,
+        delimiter: String::new(),
+        quote: String::new(),
+        escape: String::new(),
+        null: String::new(),
+        force_quote: Vec::new(),
+        force_quote_all: false,
+        json: true,
+        array: false,
+    };
+    for (name, value) in &copy.options {
+        match name.as_str() {
+            "format" => {}
+            "array" => {
+                out.array = match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                    None | Some("true" | "t" | "1" | "on" | "y" | "yes") => true,
+                    Some("false" | "f" | "0" | "off" | "n" | "no") => false,
+                    Some(_) => {
+                        let written = value.as_deref().unwrap_or_default();
+                        return Err(Error::invalid_input(format!(
+                            "Failed to cast value: Could not convert string '{written}' to BOOL"
+                        )));
+                    }
+                };
+            }
+            "compression"
+            | "dateformat"
+            | "date_format"
+            | "timestampformat"
+            | "timestamp_format"
+            | "per_thread_output"
+            | "file_size_bytes"
+            | "partition_by"
+            | "overwrite"
+            | "overwrite_or_ignore"
+            | "filename_pattern"
+            | "file_extension"
+            | "use_tmp_file"
+            | "return_files"
+            | "write_partition_columns"
+            | "preserve_order" => {
+                return Err(Error::not_implemented(format!(
+                    "COPY TO with the option {name} is not supported yet"
+                )));
+            }
+            _ => {
+                return Err(Error::binder(format!(
+                    "Unknown option for COPY ... TO ... (FORMAT JSON): \"{name}\"."
+                )));
+            }
+        }
     }
     Ok(out)
 }
