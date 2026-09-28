@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
-use rudb_common::{Clustering, Error, Field, LogicalType, Result, Value};
+use rudb_common::{Clustering, ColumnFacts, Error, Field, LogicalType, Result, Value};
 use rudb_encoding::sequence::Sequence;
 use rudb_native::{
     Common, FrequencyOccurrences, FrequencyPrefix, PairFrequencyCounts, Reader as NativeReader,
@@ -1012,6 +1012,18 @@ impl Rows {
         }
     }
 
+    /// What the file knows about its columns, gathered once for as long as it is open.
+    ///
+    /// `None` for a table in memory or one with rows grown past its file, which answer through
+    /// [`Rows::distincts`] and the others instead because what they hold changes.
+    #[must_use]
+    pub fn facts(&self) -> Option<Arc<ColumnFacts>> {
+        match self {
+            Self::Memory(_) | Self::Grown(_, _) => None,
+            Self::Native(reader) => Some(rudb_native::facts(reader)),
+        }
+    }
+
     /// The columns whose values never go down in row order and hold no null, by name.
     ///
     /// Only a file can say, because only a file keeps a summary of each column's order. A table in
@@ -1327,6 +1339,12 @@ impl Table {
     #[must_use]
     pub fn widths(&self) -> Vec<(String, u64)> {
         self.rows.widths()
+    }
+
+    /// What the file behind this table knows about its columns, which [`Rows::facts`] answers.
+    #[must_use]
+    pub fn facts(&self) -> Option<Arc<ColumnFacts>> {
+        self.rows.facts()
     }
 
     #[must_use]

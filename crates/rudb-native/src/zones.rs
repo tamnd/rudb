@@ -45,11 +45,12 @@
 //! and is already answered by [`Reader::skips`].
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use rudb_common::Result;
 use rudb_common::bounds::{Bound, End, Frequencies, Remainder, Spread, Test, Zones, kept};
 use rudb_common::stat::{Direction, Provenance};
-use rudb_common::{Stat, Value};
+use rudb_common::{ColumnFacts, Stat, Value};
 use rudb_storage::Probe;
 
 use crate::Reader;
@@ -189,6 +190,22 @@ pub fn distincts(reader: &Reader) -> Result<Vec<(String, Stat<u64>)>> {
         ));
     }
     Ok(counted)
+}
+
+/// Everything [`distincts`], [`ascending`] and [`widths`] say, gathered once per open table.
+///
+/// The file does not change under a reader, so the answers do not either, and every plan that reads
+/// the table asks. A directory that cannot answer its distinct counts leaves them out, the way the
+/// catalog always has: the scan fails a moment later with the same error, where it can be raised.
+#[must_use]
+pub fn facts(reader: &Reader) -> Arc<ColumnFacts> {
+    Arc::clone(reader.facts.get_or_init(|| {
+        Arc::new(ColumnFacts {
+            distincts: distincts(reader).unwrap_or_default().into_iter().collect(),
+            ascending: ascending(reader).into_iter().collect(),
+            widths: widths(reader).into_iter().collect(),
+        })
+    }))
 }
 
 /// The columns whose values never go down in row order and hold no null, by name.

@@ -72,7 +72,7 @@ pub use prepare::{Building, DICTIONARY_CAP_BYTES, Merged, Merger, Paged, Prepare
 pub use projection::build_sorted_projection;
 pub use run_projection::{RunProjectionPart, RunProjectionScan, build_run_projection};
 pub use section::Section;
-pub use zones::{Common, Stripes, ascending, distincts, widths};
+pub use zones::{Common, Stripes, ascending, distincts, facts, widths};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
@@ -4289,6 +4289,9 @@ pub struct Reader {
     frequency_heads: Arc<Vec<OnceLock<Arc<FrequencyHead>>>>,
     /// Each column's summary, the first time anything asks for it. See `stats::held_summary`.
     summaries: Arc<Vec<OnceLock<Option<Arc<rudb_stats::Summary>>>>>,
+    /// The distinct counts, orders and widths the planner reads off the table, gathered the first
+    /// time a plan asks. See [`facts`].
+    facts: Arc<OnceLock<Arc<rudb_common::ColumnFacts>>>,
     /// How many global dictionaries have been opened. A scan of a dictionary column should open its
     /// dictionary once however many workers it has, and the test that says so is the only thing
     /// keeping it that way.
@@ -6494,6 +6497,7 @@ impl Reader {
             frequency_summaries: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             frequency_heads: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             summaries: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
+            facts: Arc::new(OnceLock::new()),
             opened: Arc::new(AtomicUsize::new(0)),
             sieves: Arc::new(sieves),
             part_ranges: Arc::new(part_ranges),
