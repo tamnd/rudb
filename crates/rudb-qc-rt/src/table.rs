@@ -71,6 +71,14 @@ const ROWS_PER_PAGE: usize = 1024;
 /// How many bits of a key's hash pick the lane a table that is merged by parts puts its row in.
 pub const LANE_BITS: u32 = 8;
 
+/// A table with lanes whose slots had a group for fewer than one key in this many of those it was
+/// asked for before they were emptied makes a row for each of the next [`BLIND_TABLES`] times
+/// [`cap`](GroupTable::cap) keys without looking for it. The merge folds the rows of a key that
+/// has more than one, as it does for the keys the slots forgot, and the table looks again after,
+/// in case the keys changed.
+const MISSES: usize = 5;
+const BLIND_TABLES: usize = 8;
+
 /// The most rows a page of a lane holds. The first page of a lane holds [`FIRST_LANE_ROWS`] and
 /// each one after it twice as many as the one before, so a table with few groups does not zero a
 /// full page for every lane.
@@ -117,6 +125,11 @@ pub struct GroupTable {
     /// How many groups a table with lanes made before its slots were last emptied, which it no
     /// longer has an address for.
     gone: usize,
+    /// How many keys a table with lanes was asked for since its slots were last emptied.
+    asked: usize,
+    /// How many more keys a table with lanes makes a row for without looking for them, because
+    /// most of the keys it was asked for before were new.
+    blind: usize,
 }
 
 /// The rows of one lane.
@@ -176,6 +189,8 @@ impl GroupTable {
             limited: None,
             lanes: Vec::new(),
             gone: 0,
+            asked: 0,
+            blind: 0,
         };
         if table.layout.keys.is_empty() {
             table.add(&[], 0, None);
@@ -306,6 +321,14 @@ impl GroupTable {
         if self.limited.is_some() {
             return self.insert_limited(key, hash, heap);
         }
+        if self.blind != 0 {
+            self.blind -= 1;
+            self.gone += 1;
+            let address = self.room(hash);
+            self.write_row(address, key, hash, Some(heap));
+            return address;
+        }
+        self.asked += 1;
         let gid = self.find_or_add(key, hash, Some(heap));
         self.rows[gid]
     }
@@ -551,6 +574,8 @@ impl GroupTable {
             limited: None,
             lanes: Vec::new(),
             gone: 0,
+            asked: 0,
+            blind: 0,
         };
         (table, ran)
     }
@@ -624,6 +649,10 @@ impl GroupTable {
         if self.cap != 0 && self.rows.len() - self.since >= self.cap {
             self.slots.fill(0);
             self.since = self.rows.len();
+            if !self.lanes.is_empty() && self.asked.saturating_sub(self.cap) * MISSES < self.asked {
+                self.blind = self.cap * BLIND_TABLES;
+            }
+            self.asked = 0;
         } else if (self.rows.len() - self.since) * 2 > self.slots.len() {
             self.grow();
         }
@@ -683,7 +712,7 @@ impl GroupTable {
         self.pages.last_mut().map_or(0, |page| page[at..].as_mut_ptr().expose_provenance())
     }
 
-    fn add(&mut self, key: &[u8], hash: u64, mut heap: Option<&mut Heap>) -> usize {
+    fn add(&mut self, key: &[u8], hash: u64, heap: Option<&mut Heap>) -> usize {
         if !self.lanes.is_empty() && self.since != 0 {
             // The rows the slots forgot are only read again by the merge, from their lanes.
             self.gone += self.rows.len();
@@ -693,6 +722,16 @@ impl GroupTable {
         }
         let gid = self.rows.len();
         let address = self.room(hash);
+        let front = if self.lanes.is_empty() { gid as u64 } else { hash };
+        self.write_row(address, key, front, heap);
+        self.rows.push(address);
+        self.hashes.push(hash);
+        gid
+    }
+
+    /// Writes a new group's row at `address`, which [`room`](GroupTable::room) gave, starting with
+    /// `front`.
+    fn write_row(&self, address: usize, key: &[u8], front: u64, mut heap: Option<&mut Heap>) {
         let acc = Layout::acc_offset(self.layout.key_size) as usize;
         // SAFETY: `room` gave a row of `row_size` bytes in a page this table owns, and no group
         // points at it yet.
@@ -703,7 +742,6 @@ impl GroupTable {
             )
         };
         let layout = &self.layout;
-        let front = if self.lanes.is_empty() { gid as u64 } else { hash };
         row[..8].copy_from_slice(&front.to_le_bytes());
         row[8..8 + key.len()].copy_from_slice(key);
         for f in &layout.keys {
@@ -721,9 +759,6 @@ impl GroupTable {
             }
         }
         row[acc..acc + layout.init.len()].copy_from_slice(&layout.init);
-        self.rows.push(address);
-        self.hashes.push(hash);
-        gid
     }
 
     fn grow(&mut self) {
@@ -1162,6 +1197,51 @@ mod tests {
         }
         assert_eq!(counts.len(), 350);
         assert_eq!(counts.iter().sum::<u64>(), 900);
+    }
+
+    #[test]
+    fn a_table_with_lanes_that_finds_no_key_stops_looking_and_the_merge_folds_every_count() {
+        let layout = Layout {
+            keys: vec![KeyField { offset: 0, width: 8, text: false }],
+            key_size: 9,
+            init: vec![0; 8],
+        };
+        let acc = Layout::acc_offset(9) as usize;
+        let mut heap = Heap::new();
+        let mut t = GroupTable::new(layout.clone());
+        t.cap(100);
+        t.lanes();
+        // Every key is new at first, then the first hundred come back three times.
+        let keys = (0..500u64).chain((0..300).map(|i| i % 100));
+        for v in keys {
+            let k = v.to_le_bytes().into_iter().chain([0]).collect::<Vec<_>>();
+            // SAFETY: the key is alive and has no strings, and the row is the table's.
+            unsafe {
+                let row = t.insert(k.as_ptr().expose_provenance(), v * 7, &mut heap);
+                let count = std::ptr::with_exposed_provenance_mut::<u64>(row + acc);
+                count.write_unaligned(count.read_unaligned() + 1);
+            }
+        }
+        // Past the first hundred keys no row was looked for, so each key that came back got more.
+        assert_eq!(t.len(), 800);
+        let add = |d: &mut [u8], s: &[u8]| {
+            let n = |b: &[u8]| u64::from_le_bytes(b[acc..acc + 8].try_into().unwrap_or_default());
+            let total = n(d) + n(s);
+            d[acc..acc + 8].copy_from_slice(&total.to_le_bytes());
+        };
+        let mut counts = Vec::new();
+        for lane in 0..1 << LANE_BITS {
+            let mut part = GroupTable::new(layout.clone());
+            part.absorb_lane(&t, lane, add);
+            for gid in 0..part.len() {
+                let row = part.row(gid);
+                let key = u64::from_le_bytes(row[8..16].try_into().unwrap());
+                counts.push((key, u64::from_le_bytes(row[acc..acc + 8].try_into().unwrap())));
+            }
+        }
+        counts.sort_unstable();
+        let want: Vec<(u64, u64)> = (0..500).map(|v| (v, if v < 100 { 4 } else { 1 })).collect();
+        assert_eq!(counts, want);
     }
 
     #[test]
