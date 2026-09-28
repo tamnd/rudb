@@ -986,14 +986,34 @@ impl<'c> Held<'c> {
             Data::Float64(b) => b.as_slice().as_ptr().cast(),
             Data::Varlen(s) => {
                 let arena = s.arena();
+                // A view is laid out as a `str16` is, but for the address of a long string, which
+                // is its offset in the arena. So a view is taken as it is and a long one has the
+                // arena's address added, and the views are only read one by one when one of them
+                // points past the arena.
+                let base = arena.as_ptr().expose_provenance() as u64;
+                let mut end = 0u64;
                 text = s
                     .views()
                     .iter()
-                    .map(|view| match view.bytes_in(arena) {
-                        Some(b) => text::make(b),
-                        None => text::make(&[]),
+                    .map(|view| {
+                        let w = view.to_bits();
+                        let n = u64::from(w as u32);
+                        if n as usize > text::INLINE {
+                            let at = (w >> 64) as u64;
+                            end = end.max(at.saturating_add(n));
+                            (w & u128::from(u64::MAX)) | (u128::from(base.wrapping_add(at)) << 64)
+                        } else {
+                            w
+                        }
                     })
                     .collect();
+                if end > arena.len() as u64 {
+                    text = s
+                        .views()
+                        .iter()
+                        .map(|view| text::make(view.bytes_in(arena).unwrap_or_default()))
+                        .collect();
+                }
                 text.as_ptr().cast::<u8>()
             }
             _ => return Err(Error::internal("a column of a type the generator refuses")),

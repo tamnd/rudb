@@ -163,6 +163,17 @@ impl StringView {
         std::str::from_utf8(&self.payload[..self.len()]).ok()
     }
 
+    /// The sixteen bytes of the view as one little endian number: the length in the low 32 bits,
+    /// then the payload. For a long string the high 64 bits are its offset in the arena.
+    #[must_use]
+    #[inline]
+    pub fn to_bits(&self) -> u128 {
+        let mut b = [0u8; 16];
+        b[..4].copy_from_slice(&self.length.to_le_bytes());
+        b[4..].copy_from_slice(&self.payload);
+        u128::from_le_bytes(b)
+    }
+
     /// The bytes, given the arena the long strings of this column live in.
     ///
     /// A short string is in the view and the arena is not read at all, which is why this takes the
