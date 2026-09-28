@@ -67,8 +67,8 @@ pub(crate) fn folds(g: &Grouping) -> Result<Vec<Fold>> {
             AccOp::SumFloat => How::SumFloat,
             AccOp::AvgFloat => How::AvgFloat,
             AccOp::Min | AccOp::Max | AccOp::AnyValue => {
-                let ty = qir_type(&acc.arg)
-                    .map_err(|r| rudb_common::Error::internal(r.to_string()))?;
+                let ty =
+                    qir_type(&acc.arg).map_err(|r| rudb_common::Error::internal(r.to_string()))?;
                 let order = match ty {
                     Ty::F32 => Order::F32,
                     Ty::F64 => Order::F64,
@@ -235,7 +235,10 @@ mod tests {
         let folds = [
             Fold { at: 0, how: How::Count },
             Fold { at: 8, how: How::SumInt },
-            Fold { at: 32, how: How::Extreme { width: 8, keep: Keep::Least, order: Order::Signed } },
+            Fold {
+                at: 32,
+                how: How::Extreme { width: 8, keep: Keep::Least, order: Order::Signed },
+            },
             Fold { at: 48, how: How::Extreme { width: 8, keep: Keep::Any, order: Order::Signed } },
         ];
         let row = |count: i64, sum: Option<i128>, min: Option<i64>, any: Option<i64>| {

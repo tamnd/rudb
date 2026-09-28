@@ -32,7 +32,11 @@ pub type Maker = Arc<dyn Fn() -> Kernel + Send + Sync>;
 /// Something a handle names.
 enum Object {
     Like(Like),
-    Regex { regex: Regex, rewrite: Rewrite, global: bool },
+    Regex {
+        regex: Regex,
+        rewrite: Rewrite,
+        global: bool,
+    },
     Table(GroupTable),
     Distinct(Distinct),
     Join(JoinTable),

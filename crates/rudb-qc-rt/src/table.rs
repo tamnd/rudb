@@ -321,7 +321,11 @@ impl Distinct {
 
     /// Folds the sets of `other` into these, the sets of its group `g` into those of `map[g]`.
     pub fn absorb(&mut self, other: Distinct, map: &[usize]) {
-        fn fold<T: Eq + std::hash::Hash>(to: &mut Vec<HashSet<T>>, from: Vec<HashSet<T>>, map: &[usize]) {
+        fn fold<T: Eq + std::hash::Hash>(
+            to: &mut Vec<HashSet<T>>,
+            from: Vec<HashSet<T>>,
+            map: &[usize],
+        ) {
             for (gid, set) in from.into_iter().enumerate() {
                 let Some(&at) = map.get(gid) else { continue };
                 if to.len() <= at {
