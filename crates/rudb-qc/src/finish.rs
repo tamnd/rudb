@@ -90,12 +90,9 @@ pub(crate) fn values(rows: &[Vec<Value>], columns: &[Column]) -> Result<Chunk> {
     Chunk::with_rows(vectors, rows.len())
 }
 
-/// The groups of a hash aggregate: the keys and then the finished accumulators.
-pub(crate) fn groups(rt: &Rt, g: &Grouping, columns: &[Column]) -> Result<Vec<Chunk>> {
-    let table =
-        rt.table(g.table).ok_or_else(|| Error::internal("the aggregate's table is gone"))?;
-    let sets = g
-        .accs
+/// The distinct sets of a hash aggregate, by handle.
+pub(crate) fn sets<'r>(rt: &'r Rt, g: &Grouping) -> Result<Vec<(u64, &'r Distinct)>> {
+    g.accs
         .iter()
         .filter_map(|acc| match acc.op {
             AccOp::Distinct(h) => Some(
@@ -105,27 +102,23 @@ pub(crate) fn groups(rt: &Rt, g: &Grouping, columns: &[Column]) -> Result<Vec<Ch
             ),
             _ => None,
         })
-        .collect::<Result<Vec<_>>>()?;
-    (0..table.len().div_ceil(VECTOR_SIZE))
-        .map(|at| group_chunk(table, &sets, g, columns, at))
         .collect()
 }
 
-/// The groups of chunk `at` of a hash aggregate's table, the ones from `at * VECTOR_SIZE` on.
-/// `sets` are its distinct sets by handle.
-pub(crate) fn group_chunk(
+/// The groups `gids` of a hash aggregate's table as one chunk, the keys and then the finished
+/// accumulators. `sets` are its distinct sets by handle.
+pub(crate) fn group_rows(
     table: &GroupTable,
     sets: &[(u64, &Distinct)],
     g: &Grouping,
     columns: &[Column],
-    at: usize,
+    gids: &[usize],
 ) -> Result<Chunk> {
-    let from = at * VECTOR_SIZE;
-    let to = (from + VECTOR_SIZE).min(table.len());
     let mut vectors = Vec::with_capacity(columns.len());
     for (k, ty) in &g.keys {
-        let cells: Vec<Cell> = (from..to)
-            .map(|gid| {
+        let cells: Vec<Cell> = gids
+            .iter()
+            .map(|&gid| {
                 let row = table.row(gid);
                 let at = 8 + k.offset as usize;
                 (row[8 + k.null() as usize] == 0).then(|| cell(&row[at..at + k.width as usize]))
@@ -134,15 +127,58 @@ pub(crate) fn group_chunk(
         vectors.push(vector(ty, &cells)?);
     }
     for acc in &g.accs {
-        let mut cells = Vec::with_capacity(to - from);
-        for gid in from..to {
+        let mut cells = Vec::with_capacity(gids.len());
+        for &gid in gids {
             let at = (g.acc_offset + acc.offset) as usize;
             let a = &table.row(gid)[at..];
             cells.push(finish(sets, acc.op, &acc.arg, a, gid)?);
         }
         vectors.push(vector(&acc.ty, &cells)?);
     }
-    Chunk::with_rows(vectors, to - from)
+    Chunk::with_rows(vectors, gids.len())
+}
+
+/// Where the first of a top N's keys is in a group row, and whether it is descending, when that
+/// key is a count, which is read straight out of the row.
+pub(crate) fn counted(g: &Grouping, keys: &[Key]) -> Option<(usize, bool)> {
+    let first = keys.first()?;
+    let Kind::Column(c) = first.expr.kind else { return None };
+    let acc = g.accs.get(c.checked_sub(g.keys.len())?)?;
+    matches!(acc.op, AccOp::CountStar | AccOp::Count)
+        .then_some(((g.acc_offset + acc.offset) as usize, first.descending))
+}
+
+/// The groups from `from` to `to` that can be in the first `count`, when the first key is the
+/// count [`counted`] found at `at`, or `None` when there is nothing to cut. The groups left out are
+/// never made into values at all.
+///
+/// With one key, exactly `count` groups are kept and a tie at the edge goes either way, which any
+/// order the sort could have picked does too. With `more` keys they break the ties, so every group
+/// with a count as good as the last one kept stays in for the sort to decide.
+pub(crate) fn counted_top(
+    table: &GroupTable,
+    (at, descending): (usize, bool),
+    more: bool,
+    count: u64,
+    from: usize,
+    to: usize,
+) -> Option<Vec<usize>> {
+    let n = usize::try_from(count).ok().filter(|&n| n > 0 && n < to - from)?;
+    // Smaller is better, so a descending count is ranked by its complement.
+    let rank = |gid: usize| {
+        let v = i64::from_le_bytes(table.row(gid)[at..at + 8].try_into().unwrap_or_default());
+        if descending { !v } else { v }
+    };
+    let mut ranked: Vec<(i64, u32)> = (from..to).map(|gid| (rank(gid), gid as u32)).collect();
+    ranked.select_nth_unstable(n - 1);
+    let mut gids: Vec<usize> = if more {
+        let edge = ranked[n - 1].0;
+        (from..to).filter(|&gid| rank(gid) <= edge).collect()
+    } else {
+        ranked[..n].iter().map(|&(_, gid)| gid as usize).collect()
+    };
+    gids.sort_unstable();
+    Some(gids)
 }
 
 /// The value of one accumulator, `a` being its bytes in the group row.
