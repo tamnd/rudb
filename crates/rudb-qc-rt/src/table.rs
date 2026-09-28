@@ -66,16 +66,23 @@ impl Layout {
 
 const ROWS_PER_PAGE: usize = 1024;
 
+/// An odd number with its bits spread out, the golden ratio in fixed point.
+const SPREAD: u64 = 0x9e37_79b9_7f4a_7c15;
+
 /// A grouping hash table.
 #[derive(Debug)]
 pub struct GroupTable {
     layout: Layout,
     row_size: usize,
     pages: Vec<Box<[u8]>>,
-    /// The address of every row, by group id.
+    /// How many rows of the last page are taken.
+    fill: usize,
+    /// The address of every row, by group id. A row is read through this and not worked out from
+    /// its page, because a table [`join`](GroupTable::join) makes holds pages that are not full.
     rows: Vec<usize>,
     hashes: Vec<u64>,
-    /// Open addressing over group ids plus one, zero for empty.
+    /// Open addressing over group ids plus one, zero for empty, and empty until the first insert
+    /// in a table made by [`join`](GroupTable::join).
     slots: Vec<u32>,
 }
 
@@ -89,13 +96,24 @@ impl GroupTable {
             layout,
             row_size,
             pages: Vec::new(),
+            fill: ROWS_PER_PAGE,
             rows: Vec::new(),
             hashes: Vec::new(),
             slots: vec![0; 64],
         };
         if table.layout.keys.is_empty() {
-            table.add(&[], 0, &mut Heap::new());
+            table.add(&[], 0, None);
         }
+        table
+    }
+
+    /// A table like [`new`](GroupTable::new) makes, with room for `groups` groups before it grows.
+    #[must_use]
+    pub fn with_capacity(layout: Layout, groups: usize) -> GroupTable {
+        let mut table = GroupTable::new(layout);
+        table.slots = vec![0; (groups * 2).next_power_of_two().max(64)];
+        table.rows.reserve(groups);
+        table.hashes.reserve(groups);
         table
     }
 
@@ -124,9 +142,14 @@ impl GroupTable {
     /// If there is no such group.
     #[must_use]
     pub fn row(&self, gid: usize) -> &[u8] {
-        let page = gid / ROWS_PER_PAGE;
-        let at = (gid % ROWS_PER_PAGE) * self.row_size;
-        &self.pages[page][at..at + self.row_size]
+        // SAFETY: every address in `rows` is a row of `row_size` bytes in a page this table owns.
+        unsafe { crate::mem::slice(self.rows[gid], self.row_size) }
+    }
+
+    /// The hash of the key of group `gid`.
+    #[must_use]
+    pub fn hash(&self, gid: usize) -> u64 {
+        self.hashes[gid]
     }
 
     /// The address of the row of group `gid`, for compiled code.
@@ -144,7 +167,7 @@ impl GroupTable {
     pub unsafe fn insert(&mut self, key: usize, hash: u64, heap: &mut Heap) -> usize {
         // SAFETY: the caller's contract.
         let key = unsafe { crate::mem::slice(key, self.layout.key_size as usize) };
-        let gid = self.find_or_add(key, hash, heap);
+        let gid = self.find_or_add(key, hash, Some(heap));
         self.rows[gid]
     }
 
@@ -153,11 +176,12 @@ impl GroupTable {
     /// its starting accumulators the same way an old one is. `map` gets the group id each group of
     /// `other` landed on, in order, for the state that is kept by group id outside the rows.
     ///
-    /// The two tables must have the same layout, which a worker's copy of a table does.
+    /// The two tables must have the same layout, which a worker's copy of a table does. A long
+    /// string in a key is not copied, so the caller keeps whatever holds `other`'s alive as long as
+    /// this table, which a runtime does with the workers it folds.
     pub fn absorb(
         &mut self,
         other: &GroupTable,
-        heap: &mut Heap,
         map: &mut Vec<usize>,
         mut combine: impl FnMut(&mut [u8], &[u8]),
     ) {
@@ -173,20 +197,81 @@ impl GroupTable {
         let size = self.layout.key_size as usize;
         for gid in 0..other.len() {
             let src = other.row(gid);
-            let at = self.find_or_add(&src[8..8 + size], other.hashes[gid], heap);
+            let at = self.find_or_add(&src[8..8 + size], other.hashes[gid], None);
             map.push(at);
             combine(self.row_mut(at), src);
         }
     }
 
-    fn row_mut(&mut self, gid: usize) -> &mut [u8] {
-        let page = gid / ROWS_PER_PAGE;
-        let at = (gid % ROWS_PER_PAGE) * self.row_size;
-        &mut self.pages[page][at..at + self.row_size]
+    /// The groups of this table split into `1 << bits` parts by their hashes, so that two tables
+    /// split the same way put a key in the same part.
+    ///
+    /// A key's hash is a CRC-32C, which leaves the top half of the word zero, so the part is the
+    /// top bits of the hash times an odd number, which every bit of the hash moves.
+    #[must_use]
+    pub fn split(&self, bits: u32) -> Vec<Vec<u32>> {
+        let mut parts = vec![Vec::new(); 1 << bits];
+        let shift = 64 - bits;
+        for (gid, &hash) in self.hashes.iter().enumerate() {
+            let part = if bits == 0 { 0 } else { (hash.wrapping_mul(SPREAD) >> shift) as usize };
+            parts[part].push(gid as u32);
+        }
+        parts
     }
 
-    /// The group id of `key`, made if it is new.
-    fn find_or_add(&mut self, key: &[u8], hash: u64, heap: &mut Heap) -> usize {
+    /// Folds the groups `gids` of `other` into this table, as [`absorb`](GroupTable::absorb) does
+    /// with all of them, and with nothing kept by group id outside the rows.
+    pub fn absorb_some(
+        &mut self,
+        other: &GroupTable,
+        gids: &[u32],
+        mut combine: impl FnMut(&mut [u8], &[u8]),
+    ) {
+        let size = self.layout.key_size as usize;
+        for &gid in gids {
+            let src = other.row(gid as usize);
+            let at = self.find_or_add(&src[8..8 + size], other.hashes[gid as usize], None);
+            combine(self.row_mut(at), src);
+        }
+    }
+
+    /// One table of the groups of `parts`, which have the layout `layout` and no key in common,
+    /// in the order they come. The rows do not move, so the group id at the front of one is the
+    /// one it had in its part, which only a distinct set reads, and a table with distinct sets is
+    /// folded with [`absorb`](GroupTable::absorb) instead.
+    #[must_use]
+    pub fn join(layout: Layout, parts: Vec<GroupTable>) -> GroupTable {
+        let n = parts.iter().map(GroupTable::len).sum();
+        let mut table = GroupTable {
+            row_size: layout.row_size(),
+            layout,
+            pages: Vec::new(),
+            fill: ROWS_PER_PAGE,
+            rows: Vec::with_capacity(n),
+            hashes: Vec::with_capacity(n),
+            slots: Vec::new(),
+        };
+        for part in parts {
+            table.pages.extend(part.pages);
+            table.rows.extend(part.rows);
+            table.hashes.extend(part.hashes);
+        }
+        table
+    }
+
+    fn row_mut(&mut self, gid: usize) -> &mut [u8] {
+        let at = std::ptr::with_exposed_provenance_mut::<u8>(self.rows[gid]);
+        // SAFETY: as in `row`, and `&mut self` means nothing else is reading it.
+        unsafe { std::slice::from_raw_parts_mut(at, self.row_size) }
+    }
+
+    /// The group id of `key`, made if it is new. A long string in a new key is copied into `heap`
+    /// when there is one.
+    fn find_or_add(&mut self, key: &[u8], hash: u64, heap: Option<&mut Heap>) -> usize {
+        if self.slots.is_empty() {
+            self.slots = vec![0; 64];
+            self.grow();
+        }
         let mask = self.slots.len() - 1;
         let mut at = (hash as usize) & mask;
         loop {
@@ -234,23 +319,28 @@ impl GroupTable {
         true
     }
 
-    fn add(&mut self, key: &[u8], hash: u64, heap: &mut Heap) -> usize {
+    fn add(&mut self, key: &[u8], hash: u64, mut heap: Option<&mut Heap>) -> usize {
         let gid = self.rows.len();
-        if gid.is_multiple_of(ROWS_PER_PAGE) {
+        if self.fill == ROWS_PER_PAGE {
             self.pages.push(vec![0u8; ROWS_PER_PAGE * self.row_size].into_boxed_slice());
+            self.fill = 0;
         }
         let size = self.row_size;
         let acc = Layout::acc_offset(self.layout.key_size) as usize;
         let keys = self.layout.keys.clone();
         let init = self.layout.init.clone();
         let Some(page) = self.pages.last_mut() else { return 0 };
-        let at = (gid % ROWS_PER_PAGE) * size;
+        let at = self.fill * size;
+        self.fill += 1;
         let row = &mut page[at..at + size];
         row[..8].copy_from_slice(&(gid as u64).to_le_bytes());
         row[8..8 + key.len()].copy_from_slice(key);
         for f in &keys {
             let o = 8 + f.offset as usize;
-            if f.text && row[8 + f.null() as usize] == 0 {
+            if let Some(heap) = heap.as_deref_mut()
+                && f.text
+                && row[8 + f.null() as usize] == 0
+            {
                 let s = read_u128(&row[o..o + 16]);
                 if text::len(s) > text::INLINE {
                     // SAFETY: as in `same`.
@@ -266,7 +356,11 @@ impl GroupTable {
     }
 
     fn grow(&mut self) {
-        let mut slots = vec![0u32; self.slots.len() * 2];
+        let mut size = self.slots.len() * 2;
+        while self.rows.len() * 2 > size {
+            size *= 2;
+        }
+        let mut slots = vec![0u32; size];
         let mask = slots.len() - 1;
         for (gid, hash) in self.hashes.iter().enumerate() {
             let mut at = (*hash as usize) & mask;

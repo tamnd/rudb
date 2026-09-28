@@ -157,7 +157,7 @@ impl Rt {
             else {
                 return Err(bad_handle("absorb"));
             };
-            mine.absorb(theirs, &mut self.heap, &mut map, combine);
+            mine.absorb(theirs, &mut map, combine);
         }
         for &h in sets {
             let theirs = match worker.objects.get_mut(h as usize) {
@@ -172,6 +172,29 @@ impl Rt {
             mine.absorb(theirs, &map);
         }
         self.keep_worker(worker);
+        Ok(())
+    }
+
+    /// Puts `merged` in place of group table `table`, and keeps `workers` the way a fold does. The
+    /// table is what the workers' tables of the same handle became when they were merged, and its
+    /// strings point into their heaps, which is why they are kept.
+    ///
+    /// # Errors
+    ///
+    /// When `table` does not name a group table.
+    pub fn settle(
+        &mut self,
+        workers: Vec<Rt>,
+        table: u64,
+        merged: GroupTable,
+    ) -> Result<(), Error> {
+        let Some(Object::Table(mine)) = self.objects.get_mut(table as usize) else {
+            return Err(bad_handle("settle"));
+        };
+        *mine = merged;
+        for worker in workers {
+            self.keep_worker(worker);
+        }
         Ok(())
     }
 

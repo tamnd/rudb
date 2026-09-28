@@ -14,6 +14,7 @@ use rudb_kernels::compare::order;
 use rudb_plan::{Node, NodeRef, Plan};
 use rudb_qc_gen::{AccOp, Grouping, qir_type};
 use rudb_qc_plan::{Column, Key, Kind};
+use rudb_qc_rt::table::{Distinct, GroupTable};
 use rudb_qc_rt::{Rt, text};
 use rudb_vector::{Buffer, Chunk, Data, Selection, StringColumn, VECTOR_SIZE, Validity, Vector};
 
@@ -93,38 +94,65 @@ pub(crate) fn values(rows: &[Vec<Value>], columns: &[Column]) -> Result<Chunk> {
 pub(crate) fn groups(rt: &Rt, g: &Grouping, columns: &[Column]) -> Result<Vec<Chunk>> {
     let table =
         rt.table(g.table).ok_or_else(|| Error::internal("the aggregate's table is gone"))?;
-    let mut chunks = Vec::new();
-    let mut from = 0;
-    while from < table.len() {
-        let to = (from + VECTOR_SIZE).min(table.len());
-        let mut vectors = Vec::with_capacity(columns.len());
-        for (k, ty) in &g.keys {
-            let cells: Vec<Cell> = (from..to)
-                .map(|gid| {
-                    let row = table.row(gid);
-                    let at = 8 + k.offset as usize;
-                    (row[8 + k.null() as usize] == 0).then(|| cell(&row[at..at + k.width as usize]))
-                })
-                .collect();
-            vectors.push(vector(ty, &cells)?);
-        }
-        for acc in &g.accs {
-            let mut cells = Vec::with_capacity(to - from);
-            for gid in from..to {
-                let at = (g.acc_offset + acc.offset) as usize;
-                let a = &table.row(gid)[at..];
-                cells.push(finish(rt, acc.op, &acc.arg, a, gid)?);
-            }
-            vectors.push(vector(&acc.ty, &cells)?);
-        }
-        chunks.push(Chunk::with_rows(vectors, to - from)?);
-        from = to;
+    let sets = g
+        .accs
+        .iter()
+        .filter_map(|acc| match acc.op {
+            AccOp::Distinct(h) => Some(
+                rt.distinct(h)
+                    .map(|d| (h, d))
+                    .ok_or_else(|| Error::internal("a distinct set is gone")),
+            ),
+            _ => None,
+        })
+        .collect::<Result<Vec<_>>>()?;
+    (0..table.len().div_ceil(VECTOR_SIZE))
+        .map(|at| group_chunk(table, &sets, g, columns, at))
+        .collect()
+}
+
+/// The groups of chunk `at` of a hash aggregate's table, the ones from `at * VECTOR_SIZE` on.
+/// `sets` are its distinct sets by handle.
+pub(crate) fn group_chunk(
+    table: &GroupTable,
+    sets: &[(u64, &Distinct)],
+    g: &Grouping,
+    columns: &[Column],
+    at: usize,
+) -> Result<Chunk> {
+    let from = at * VECTOR_SIZE;
+    let to = (from + VECTOR_SIZE).min(table.len());
+    let mut vectors = Vec::with_capacity(columns.len());
+    for (k, ty) in &g.keys {
+        let cells: Vec<Cell> = (from..to)
+            .map(|gid| {
+                let row = table.row(gid);
+                let at = 8 + k.offset as usize;
+                (row[8 + k.null() as usize] == 0).then(|| cell(&row[at..at + k.width as usize]))
+            })
+            .collect();
+        vectors.push(vector(ty, &cells)?);
     }
-    Ok(chunks)
+    for acc in &g.accs {
+        let mut cells = Vec::with_capacity(to - from);
+        for gid in from..to {
+            let at = (g.acc_offset + acc.offset) as usize;
+            let a = &table.row(gid)[at..];
+            cells.push(finish(sets, acc.op, &acc.arg, a, gid)?);
+        }
+        vectors.push(vector(&acc.ty, &cells)?);
+    }
+    Chunk::with_rows(vectors, to - from)
 }
 
 /// The value of one accumulator, `a` being its bytes in the group row.
-fn finish(rt: &Rt, op: AccOp, arg: &LogicalType, a: &[u8], gid: usize) -> Result<Cell> {
+fn finish(
+    sets: &[(u64, &Distinct)],
+    op: AccOp,
+    arg: &LogicalType,
+    a: &[u8],
+    gid: usize,
+) -> Result<Cell> {
     let i64_at = |at: usize| i64::from_le_bytes(a[at..at + 8].try_into().unwrap_or_default());
     let f64_at = |at: usize| f64::from_le_bytes(a[at..at + 8].try_into().unwrap_or_default());
     let i128_at = |at: usize| i128::from_le_bytes(a[at..at + 16].try_into().unwrap_or_default());
@@ -147,7 +175,10 @@ fn finish(rt: &Rt, op: AccOp, arg: &LogicalType, a: &[u8], gid: usize) -> Result
         }
         AccOp::MinStr | AccOp::MaxStr => (a[16] != 0).then(|| cell(&a[..16])),
         AccOp::Distinct(h) => {
-            let d = rt.distinct(h).ok_or_else(|| Error::internal("a distinct set is gone"))?;
+            let d = sets
+                .iter()
+                .find_map(|&(at, d)| (at == h).then_some(d))
+                .ok_or_else(|| Error::internal("a distinct set is gone"))?;
             let n = i64::try_from(d.count(gid)).unwrap_or(i64::MAX);
             Some(cell(&n.to_le_bytes()))
         }
@@ -184,36 +215,39 @@ pub(crate) fn sort(
         })
         .collect::<Result<_>>()?;
     let mut place: Vec<(u32, u32)> = Vec::new();
-    let mut columns: Vec<Vec<Value>> = vec![Vec::new(); keys.len()];
+    let mut flat: Vec<Vec<Vector>> = vec![Vec::new(); keys.len()];
     for (at, chunk) in chunks.iter().enumerate() {
-        for (column, &(c, _, _)) in columns.iter_mut().zip(&keys) {
+        for (column, &(c, _, _)) in flat.iter_mut().zip(&keys) {
             let vector = chunk.column(c)?;
-            column.extend((0..chunk.len()).map(|i| vector.value_at(i)));
+            // flatten: a key is read as a slice, and only a stage that is not ours hands over a
+            // vector that is not flat already.
+            column.push(if vector.data().is_some() { vector.clone() } else { vector.flatten()? });
         }
         place.extend((0..chunk.len()).map(|i| (at as u32, i as u32)));
     }
+    let columns: Vec<Sorted<'_>> =
+        flat.iter().zip(&keys).map(|(v, &(c, _, _))| Sorted::of(&types[c], v)).collect();
     let mut failed = None;
     let mut compare = |l: &u32, r: &u32| {
         let (l, r) = (*l as usize, *r as usize);
         for (column, &(_, descending, nulls_first)) in columns.iter().zip(&keys) {
-            let (a, b) = (&column[l], &column[r]);
-            let o = match (a.is_null(), b.is_null()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => {
-                    if nulls_first {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                }
+            let o = match (column.valid[l], column.valid[r]) {
+                (false, false) => Ordering::Equal,
                 (false, true) => {
                     if nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (true, false) => {
+                    if nulls_first {
                         Ordering::Greater
                     } else {
                         Ordering::Less
                     }
                 }
-                (false, false) => match order(a, b) {
+                (true, true) => match column.order(l, r) {
                     Ok(o) if descending => o.reverse(),
                     Ok(o) => o,
                     Err(e) => {
@@ -231,12 +265,38 @@ pub(crate) fn sort(
     let skip = usize::try_from(offset).unwrap_or(usize::MAX);
     let take = count.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
     let wanted = skip.saturating_add(take);
-    let mut kept: Vec<u32> = (0..place.len() as u32).collect();
+    let mut kept: Vec<u32>;
     if wanted == 0 {
-        kept.clear();
-    } else if wanted < kept.len() {
-        kept.select_nth_unstable_by(wanted - 1, &mut compare);
-        kept.truncate(wanted);
+        kept = Vec::new();
+    } else if wanted.saturating_mul(8) < place.len() {
+        // A few rows out of many: the best ones so far are kept, and a row that is not better than
+        // the worst of those is passed over after one comparison, which is most of them.
+        let room = wanted.saturating_mul(4).max(1024);
+        kept = Vec::with_capacity(room);
+        let mut worst = None;
+        for n in 0..place.len() as u32 {
+            if let Some(w) = worst
+                && compare(&n, &w) != Ordering::Less
+            {
+                continue;
+            }
+            kept.push(n);
+            if kept.len() == room {
+                kept.select_nth_unstable_by(wanted - 1, &mut compare);
+                kept.truncate(wanted);
+                worst = Some(kept[wanted - 1]);
+            }
+        }
+        if kept.len() > wanted {
+            kept.select_nth_unstable_by(wanted - 1, &mut compare);
+            kept.truncate(wanted);
+        }
+    } else {
+        kept = (0..place.len() as u32).collect();
+        if wanted < kept.len() {
+            kept.select_nth_unstable_by(wanted - 1, &mut compare);
+            kept.truncate(wanted);
+        }
     }
     kept.sort_unstable_by(&mut compare);
     if let Some(e) = failed {
@@ -260,6 +320,137 @@ pub(crate) fn sort(
         out.push(Chunk::with_rows(vectors, part.len())?);
     }
     Ok(out)
+}
+
+/// One sort key over every row being sorted, read out of its vectors once.
+///
+/// A key whose physical value orders the way its logical one does is kept as numbers or bytes and
+/// compared as those, and anything else is kept as values and compared by [`order`]. A top ten over
+/// ten million groups (ClickBench q16) spent most of its time making and dropping a value for each.
+struct Sorted<'a> {
+    valid: Vec<bool>,
+    keys: Keys<'a>,
+}
+
+enum Keys<'a> {
+    Signed(Vec<i128>),
+    Unsigned(Vec<u128>),
+    Float(Vec<f64>),
+    Bytes(Vec<&'a [u8]>),
+    Values(Vec<Value>),
+}
+
+impl<'a> Sorted<'a> {
+    fn of(ty: &LogicalType, vectors: &'a [Vector]) -> Self {
+        let valid =
+            vectors.iter().flat_map(|v| (0..v.len()).map(|i| v.validity().is_valid(i))).collect();
+        let native = matches!(
+            ty,
+            LogicalType::Boolean
+                | LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+                | LogicalType::HugeInt
+                | LogicalType::UTinyInt
+                | LogicalType::USmallInt
+                | LogicalType::UInteger
+                | LogicalType::UBigInt
+                | LogicalType::UHugeInt
+                | LogicalType::Float
+                | LogicalType::Double
+                | LogicalType::Date
+                | LogicalType::Time
+                | LogicalType::Timestamp
+                | LogicalType::TimestampS
+                | LogicalType::TimestampMs
+                | LogicalType::TimestampNs
+                | LogicalType::TimestampTz
+                | LogicalType::Decimal { .. }
+                | LogicalType::Varchar
+                | LogicalType::Blob
+        );
+        let keys = if native { Self::native(vectors) } else { None };
+        let keys = keys.unwrap_or_else(|| {
+            // row at a time: a key of a type with no native order, compared as values.
+            Keys::Values(vectors.iter().flat_map(|v| (0..v.len()).map(|i| v.value_at(i))).collect())
+        });
+        Self { valid, keys }
+    }
+
+    /// The keys as numbers or bytes, or `None` if a vector is not flat or not a type read here.
+    fn native(vectors: &'a [Vector]) -> Option<Keys<'a>> {
+        macro_rules! all {
+            ($keys:ident, $t:ty, $($variant:ident),+) => {{
+                let mut out: Vec<$t> = Vec::new();
+                for v in vectors {
+                    match v.data()? {
+                        $(Data::$variant(b) if b.len() == v.len() => out.extend(b.iter().map(|&x| x as $t)),)+
+                        _ => return None,
+                    }
+                }
+                Keys::$keys(out)
+            }};
+        }
+        Some(match vectors.first()?.data()? {
+            Data::Bool(_) => {
+                let mut out = Vec::new();
+                for v in vectors {
+                    let Data::Bool(b) = v.data()? else { return None };
+                    if b.len() != v.len() {
+                        return None;
+                    }
+                    out.extend(b.iter().map(|&x| u128::from(x)));
+                }
+                Keys::Unsigned(out)
+            }
+            Data::Int8(_) | Data::Int16(_) | Data::Int32(_) | Data::Int64(_) | Data::Int128(_) => {
+                all!(Signed, i128, Int8, Int16, Int32, Int64, Int128)
+            }
+            Data::UInt8(_)
+            | Data::UInt16(_)
+            | Data::UInt32(_)
+            | Data::UInt64(_)
+            | Data::UInt128(_) => all!(Unsigned, u128, UInt8, UInt16, UInt32, UInt64, UInt128),
+            Data::Float32(_) | Data::Float64(_) => all!(Float, f64, Float32, Float64),
+            Data::Varlen(_) => {
+                let mut out = Vec::new();
+                for v in vectors {
+                    let Data::Varlen(s) = v.data()? else { return None };
+                    if s.len() != v.len() {
+                        return None;
+                    }
+                    out.extend((0..v.len()).map(|i| s.bytes(i).unwrap_or_default()));
+                }
+                Keys::Bytes(out)
+            }
+            _ => return None,
+        })
+    }
+
+    /// The order of rows `l` and `r`, both of them not null.
+    fn order(&self, l: usize, r: usize) -> Result<Ordering> {
+        Ok(match &self.keys {
+            Keys::Signed(k) => k[l].cmp(&k[r]),
+            Keys::Unsigned(k) => k[l].cmp(&k[r]),
+            Keys::Float(k) => float_order(k[l], k[r]),
+            Keys::Bytes(k) => k[l].cmp(k[r]),
+            Keys::Values(k) => order(&k[l], &k[r])?,
+        })
+    }
+}
+
+/// DuckDB's float order, the one [`order`] uses: NaN is above everything and zero has one place.
+fn float_order(l: f64, r: f64) -> Ordering {
+    if l == r {
+        return Ordering::Equal;
+    }
+    match (l.is_nan(), r.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => l.partial_cmp(&r).unwrap_or(Ordering::Equal),
+    }
 }
 
 /// The table rows named by column `ordinal` of `chunks`, read back in the order they are named.
