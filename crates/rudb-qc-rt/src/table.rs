@@ -101,6 +101,8 @@ pub struct GroupTable {
     /// The groups this table may make, when a limit with no order above the aggregate reads only
     /// that many of them.
     limited: Option<Limited>,
+    /// Whether a new group in [`absorb_some`](GroupTable::absorb_some) keeps the row it came from.
+    adopting: bool,
 }
 
 /// The groups the tables of a limited aggregate's workers agree on: the first keys any of them
@@ -150,6 +152,7 @@ impl GroupTable {
             cap: 0,
             since: 0,
             limited: None,
+            adopting: false,
         };
         if table.layout.keys.is_empty() {
             table.add(&[], 0, None);
@@ -365,7 +368,7 @@ impl GroupTable {
                 prefetch(next);
             }
             // SAFETY: `split` took the address from `other`'s rows, and `other` is borrowed, so
-            // its pages are still there.
+            // its pages are still there, or kept by whoever took them.
             let src = unsafe { crate::mem::slice(row, other.row_size) };
             let key = &src[8..8 + size];
             let at = match self.probe(key, hash) {
@@ -374,7 +377,11 @@ impl GroupTable {
                     gid
                 }
                 Err(slot) => {
-                    let gid = if whole {
+                    let gid = if whole && self.adopting {
+                        self.rows.push(row);
+                        self.hashes.push(hash);
+                        self.rows.len() - 1
+                    } else if whole {
                         self.copy(src, hash)
                     } else {
                         let gid = self.add(key, hash, None);
@@ -390,6 +397,28 @@ impl GroupTable {
                 made.push((gid as u32, at as u32));
             }
         }
+    }
+
+    /// Takes the pages this table's rows are in, for a merge whose parts keep the rows where they
+    /// are. The rows can still be read and written through their addresses as long as the caller
+    /// keeps the pages, and a row the table makes after this goes in a page of its own.
+    pub fn take_pages(&mut self) -> Vec<Box<[u8]>> {
+        self.fill = ROWS_PER_PAGE;
+        std::mem::take(&mut self.pages)
+    }
+
+    /// Keeps `pages`, which [`take_pages`](GroupTable::take_pages) took from the tables whose rows
+    /// this one holds, for as long as this table.
+    pub fn keep(&mut self, mut pages: Vec<Box<[u8]>>) {
+        self.pages.append(&mut pages);
+        self.fill = ROWS_PER_PAGE;
+    }
+
+    /// Makes [`absorb_some`](GroupTable::absorb_some) with `whole` take a row it does not have yet
+    /// where it is, with no copy, which is right when the pages of the tables it absorbs from were
+    /// taken and will be kept by the table this one ends up in.
+    pub fn adopt_rows(&mut self) {
+        self.adopting = true;
     }
 
     /// One table of the groups of `parts`, which have the layout `layout` and no key in common,
@@ -440,6 +469,7 @@ impl GroupTable {
             cap: 0,
             since: 0,
             limited: None,
+            adopting: false,
         };
         (table, ran)
     }
