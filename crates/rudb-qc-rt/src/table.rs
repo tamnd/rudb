@@ -70,6 +70,9 @@ const ROWS_PER_PAGE: usize = 1024;
 /// An odd number with its bits spread out, the golden ratio in fixed point.
 const SPREAD: u64 = 0x9e37_79b9_7f4a_7c15;
 
+/// One piece of the work of [`GroupTable::join_with`].
+pub type Job<'a> = Box<dyn FnOnce() + Send + 'a>;
+
 /// A grouping hash table.
 #[derive(Debug)]
 pub struct GroupTable {
@@ -133,6 +136,12 @@ impl GroupTable {
     /// groups are merged by parts after the scan.
     pub fn cap(&mut self, cap: usize) {
         self.cap = cap;
+    }
+
+    /// Frees the slots of a table that is done taking keys, on the thread that made it. An insert
+    /// after this builds them again.
+    pub fn seal(&mut self) {
+        self.slots = Vec::new();
     }
 
     /// Whether a key may have more than one group, because the slots were emptied.
@@ -280,24 +289,50 @@ impl GroupTable {
     /// one it had in its part, which nothing reads once the workers are done.
     #[must_use]
     pub fn join(layout: Layout, parts: Vec<GroupTable>) -> GroupTable {
+        GroupTable::join_with(layout, parts, |jobs| jobs.into_iter().for_each(|job| job())).0
+    }
+
+    /// [`join`](GroupTable::join), with the copying of each part's group ids and the freeing of
+    /// what is left of it handed to `run` as one job a part, for it to run on as many threads as
+    /// it has. A merge of millions of groups spent a fifth of its time doing that on one.
+    pub fn join_with<R>(
+        layout: Layout,
+        parts: Vec<GroupTable>,
+        run: impl FnOnce(Vec<Job<'_>>) -> R,
+    ) -> (GroupTable, R) {
         let n = parts.iter().map(GroupTable::len).sum();
-        let mut table = GroupTable {
+        let mut rows = vec![0; n];
+        let mut hashes = vec![0; n];
+        let mut pages = Vec::new();
+        let ran = {
+            let (mut r, mut h) = (rows.as_mut_slice(), hashes.as_mut_slice());
+            let mut jobs: Vec<Job<'_>> = Vec::with_capacity(parts.len());
+            for mut part in parts {
+                pages.append(&mut part.pages);
+                let (rows, rest) = std::mem::take(&mut r).split_at_mut(part.len());
+                r = rest;
+                let (hashes, rest) = std::mem::take(&mut h).split_at_mut(part.len());
+                h = rest;
+                jobs.push(Box::new(move || {
+                    rows.copy_from_slice(&part.rows);
+                    hashes.copy_from_slice(&part.hashes);
+                    drop(part);
+                }));
+            }
+            run(jobs)
+        };
+        let table = GroupTable {
             row_size: layout.row_size(),
             layout,
-            pages: Vec::new(),
+            pages,
             fill: ROWS_PER_PAGE,
-            rows: Vec::with_capacity(n),
-            hashes: Vec::with_capacity(n),
+            rows,
+            hashes,
             slots: Vec::new(),
             cap: 0,
             since: 0,
         };
-        for part in parts {
-            table.pages.extend(part.pages);
-            table.rows.extend(part.rows);
-            table.hashes.extend(part.hashes);
-        }
-        table
+        (table, ran)
     }
 
     fn row_mut(&mut self, gid: usize) -> &mut [u8] {
