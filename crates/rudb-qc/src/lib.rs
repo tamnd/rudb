@@ -8,8 +8,10 @@
 //!
 //! A pipeline over a base table reads it through the first engine. The plan is cloned with the
 //! `Get` node as its root, built by `rudb_exec` into a query whose root is a sink of ours, and
-//! every chunk the scan produces is handed to the compiled body as one morsel. That is what keeps
-//! the storage layer, the zone maps and the pushed down filters out of this crate. An aggregate
+//! every chunk the scan produces is handed to the compiled body as one morsel. When a filter sits
+//! right above the `Get`, the scan is built from it with `rudb_exec::build_pruned_into`, which
+//! uses the filter only to skip the parts the zone maps rule out, so the body sees fewer chunks,
+//! runs the filter itself, and none of the zone maps live in this crate. An aggregate
 //! over a scan runs on as many workers as the scan has threads, each with its own state and its
 //! own [`Rt`] made by [`Rt::worker`], and the workers' groups are merged into the query's when
 //! they finish. A pipeline that produces rows runs the same way when only a sort reads them, and
@@ -223,8 +225,9 @@ impl Compiled {
                     match &p.source {
                         Source::Scan { node, .. } => {
                             let mut scan = plan.clone();
-                            scan.set_root(*node);
-                            feed.scan(&scan, under)?;
+                            let filter = filtered(plan, *node);
+                            scan.set_root(filter.unwrap_or(*node));
+                            feed.scan(&scan, filter.is_some(), under)?;
                         }
                         Source::Values { rows, columns } => {
                             feed.push(&finish::values(rows, columns)?)?;
@@ -276,6 +279,27 @@ fn scanned(plan: &Plan, node: NodeRef, catalog: &Catalog) -> Option<usize> {
     };
     let name = QualifiedName::new(plan.string(c), plan.string(schema), plan.string(table));
     catalog.table(&name).ok().map(|t| t.rows().len())
+}
+
+/// The filter right above the `Get` at `node`, if there is one, which the scan is built from so
+/// that the first engine skips the parts its zone maps rule out. The filter prunes and does
+/// nothing else: every row of the parts left comes to the body, which runs the filter itself.
+fn filtered(plan: &Plan, node: NodeRef) -> Option<NodeRef> {
+    parent(plan, plan.root(), node).filter(|&p| matches!(plan.node(p), Node::Filter { .. }))
+}
+
+/// The node under `from` whose input is `child`.
+fn parent(plan: &Plan, from: NodeRef, child: NodeRef) -> Option<NodeRef> {
+    let mut stack = vec![from];
+    while let Some(n) = stack.pop() {
+        for c in plan.node(n).children().into_iter().flatten() {
+            if c == child {
+                return Some(n);
+            }
+            stack.push(c);
+        }
+    }
+    None
 }
 
 /// The rows of an earlier stage, which only the stage after it reads.

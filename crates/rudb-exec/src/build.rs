@@ -187,6 +187,7 @@ pub fn build_measured<'a>(
         catalog,
         BuildUnder { cancel, memory, seams, session, report },
         None,
+        None,
     )
 }
 
@@ -214,6 +215,41 @@ pub fn build_measured_into<'a>(
         catalog,
         BuildUnder { cancel, memory, seams, session, report: &report },
         Some(sink),
+        None,
+    )
+}
+
+/// [`build_measured_into`] over a plan whose root is a filter straight on a stored table, where the
+/// filter only tells the scan which parts its zone maps rule out and is not applied to a row.
+///
+/// Every row of every part the zone maps leave alive goes to `sink`, filtered or not, so the sink
+/// has to run the predicate itself. The compiled engine is the caller: its body runs the filter as
+/// part of the pipeline, and what it wants from the first engine is only to not be handed the parts
+/// that cannot hold a row it keeps. A filter that ran here as well would be compared twice, which on
+/// ClickBench cost the queries whose filter keeps most rows 10 to 25%.
+///
+/// # Errors
+///
+/// The same as [`build_measured`], and a root that is not a filter.
+pub fn build_pruned_into<'a>(
+    plan: &'a Plan,
+    catalog: &'a Catalog,
+    cancel: &Cancel,
+    memory: &Memory,
+    seams: &Settings,
+    session: &Session,
+    sink: Arc<dyn DynSink + 'a>,
+) -> Result<Query<'a>> {
+    if !matches!(plan.node(plan.root()), Node::Filter { .. }) {
+        return Err(Error::internal("a pruned scan whose root is not a filter"));
+    }
+    let report = Report::new();
+    build_measured_with_sink(
+        plan,
+        catalog,
+        BuildUnder { cancel, memory, seams, session, report: &report },
+        Some(sink),
+        Some(plan.root()),
     )
 }
 
@@ -238,6 +274,7 @@ fn build_measured_with_sink<'a>(
     catalog: &'a Catalog,
     under: BuildUnder<'_>,
     sink: Option<Arc<dyn DynSink + 'a>>,
+    pruning_only: Option<NodeRef>,
 ) -> Result<Query<'a>> {
     let BuildUnder { cancel, memory, seams, session, report } = under;
     let shape = Shape::of(plan);
@@ -267,6 +304,7 @@ fn build_measured_with_sink<'a>(
         cutoff: None,
         top_counts: Vec::new(),
         marking: None,
+        pruning_only,
         held: Vec::new(),
     };
     let segment = building.node(plan.root())?;
@@ -1640,6 +1678,8 @@ struct Building<'a, 'b> {
     /// the scan or the filter operator to mark the rows it keeps rather than cut them. See
     /// [`marks_through`].
     marking: Option<NodeRef>,
+    /// The filter that only prunes the scan under it, for [`build_pruned_into`].
+    pruning_only: Option<NodeRef>,
     /// The materialisations whose bodies are being walked, innermost last.
     held: Vec<Held>,
 }
@@ -2676,6 +2716,12 @@ impl<'a> Building<'a, '_> {
                 .in_session(self.session);
                 let schema = fetch.schema().clone();
                 below.then(Arc::new(Watched::new(fetch, counters)), schema)
+            }
+            Node::Filter { input, predicate } if self.pruning_only == Some(reference) => {
+                self.pruning = rudb_opt::bounds::of(plan, input, predicate);
+                let below = self.node(input)?;
+                self.pruning = Vec::new();
+                below
             }
             Node::Filter { input, predicate } => {
                 let marks = self.marking == Some(reference);
