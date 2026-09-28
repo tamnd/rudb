@@ -129,8 +129,8 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     println!("tier    {tier}");
     println!();
     println!(
-        "{:<5} {:>9} {:>9} {:>10} {:>10} {:>7} {:>7}  verdict",
-        "query", "first", "compiled", "compile", "backend", "insts", "bytes"
+        "{:<5} {:>9} {:>9} {:>10} {:>10} {:>10} {:>10} {:>7} {:>7}  verdict",
+        "query", "first", "compiled", "compile", "lower", "qir", "backend", "insts", "bytes"
     );
 
     let mut same = 0;
@@ -183,10 +183,12 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             compiles.push(compiled.compile_ms);
         }
         println!(
-            "{name:<5} {:>8.3}s {:>8.3}s {:>8.3}ms {:>8.3}ms {:>7} {:>7}  {verdict}",
+            "{name:<5} {:>8.3}s {:>8.3}s {:>8.3}ms {:>8.3}ms {:>8.3}ms {:>8.3}ms {:>7} {:>7}  {verdict}",
             first.seconds,
             compiled.seconds,
             compiled.compile_ms,
+            compiled.lower_ms,
+            compiled.qir_ms,
             compiled.backend_ms,
             compiled.insts,
             compiled.bytes
@@ -315,6 +317,11 @@ struct Answer {
     seconds: f64,
     /// The `codegen_ns` of the query, in milliseconds: zero on the first engine.
     compile_ms: f64,
+    /// The part of it lowering the plan and splitting it into pipelines took, `lower_ns` in
+    /// milliseconds.
+    lower_ms: f64,
+    /// The part of it generating the QIR took, `qir_ns` in milliseconds.
+    qir_ms: f64,
     /// The part of it the tier's backend took, `backend_ns` in milliseconds.
     backend_ms: f64,
     /// The QIR instructions the compiled engine generated.
@@ -329,6 +336,8 @@ impl Default for Answer {
             rows: Ok(Vec::new()),
             seconds: 0.0,
             compile_ms: 0.0,
+            lower_ms: 0.0,
+            qir_ms: 0.0,
             backend_ms: 0.0,
             insts: 0,
             bytes: 0,
@@ -354,6 +363,8 @@ fn made(result: &rudb::QueryResult) -> Answer {
     let Some(m) = result.metrics() else { return Answer::default() };
     Answer {
         compile_ms: m.timing.codegen_ns as f64 / 1e6,
+        lower_ms: m.timing.lower_ns as f64 / 1e6,
+        qir_ms: m.timing.qir_ns as f64 / 1e6,
         backend_ms: m.timing.backend_ns as f64 / 1e6,
         insts: m.codegen.qir_insts,
         bytes: m.codegen.code_bytes,
