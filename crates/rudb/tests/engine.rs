@@ -46,6 +46,24 @@ fn the_compiled_engine_answers_what_the_first_engine_answers() {
 }
 
 #[test]
+fn a_limit_with_no_order_over_groups_reads_whole_groups_on_the_compiled_engine() {
+    let database = database();
+    let whole = rows(&database, "SELECT x, s, count(*), sum(x), min(s) FROM t GROUP BY x, s");
+    database.execute("SET engine = 'compiled'").expect("the compiled engine");
+    for sql in [
+        "SELECT x, s, count(*), sum(x), min(s) FROM t GROUP BY x, s LIMIT 7",
+        "SELECT x, s, count(*), sum(x), min(s) FROM t GROUP BY x, s LIMIT 4 OFFSET 3",
+    ] {
+        let some = rows(&database, sql);
+        assert_eq!(some.len(), if sql.contains("OFFSET") { 4 } else { 7 }, "{sql}");
+        for row in &some {
+            assert!(whole.contains(row), "{sql} made {row:?}");
+        }
+    }
+    assert_eq!(database.refusals(), Vec::<String>::new());
+}
+
+#[test]
 fn a_refused_query_runs_on_the_first_engine_and_is_logged() {
     let database = database();
     database.execute("SET engine = 'compiled'").expect("the compiled engine");

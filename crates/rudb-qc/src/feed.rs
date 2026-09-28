@@ -36,7 +36,7 @@ use rudb_qc_ir::{ErrorKind, Module};
 use rudb_qc_pipe::{Pipeline, Source, Step};
 use rudb_qc_plan::{Column, Key};
 use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
-use rudb_qc_rt::table::{Distinct, GroupTable, Job};
+use rudb_qc_rt::table::{Agreed, Distinct, GroupTable, Job};
 use rudb_qc_rt::{RUNTIME_ERROR, Rt, text};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
@@ -77,6 +77,9 @@ pub(crate) struct Feed<'a> {
     /// merge that makes its groups into chunks keeps only the rows of each chunk that could make
     /// it.
     top: Option<(&'a [Key], u64)>,
+    /// The keys an aggregate's tables agree to make groups for, when a limit with no order is all
+    /// that reads its groups.
+    agreed: Option<Arc<Agreed>>,
     inner: Mutex<Inner<'a>>,
 }
 
@@ -201,6 +204,7 @@ impl<'a> Feed<'a> {
             folds,
             sets,
             top: None,
+            agreed: None,
             inner: Mutex::new(Inner {
                 rt,
                 state,
@@ -226,6 +230,11 @@ impl<'a> Feed<'a> {
         {
             table.cap(WORKER_GROUPS);
         }
+        if let (Some(agreed), Out::Aggregate(g)) = (&self.agreed, &self.body.sink)
+            && let Some(table) = rt.table_mut(g.table)
+        {
+            table.limit(Arc::clone(agreed));
+        }
         let mut state = self.template.clone();
         head(&mut state);
         if let Out::Aggregate(g) = &self.body.sink
@@ -249,6 +258,24 @@ impl<'a> Feed<'a> {
     /// pipeline produces.
     pub(crate) fn topped(mut self, keys: &'a [Key], count: u64) -> Self {
         self.top = Some((keys, count));
+        self
+    }
+
+    /// Says that only a limit of `count` rows with no order, skipped ones included, reads the
+    /// groups of this pipeline, so its tables make groups for the first `count` keys they see
+    /// between them and no others. An aggregate with distinct sets is left as it is, because the
+    /// rows of the keys left out would add to them.
+    pub(crate) fn limited(mut self, count: usize) -> Self {
+        let Out::Aggregate(g) = &self.body.sink else { return self };
+        if g.keys.is_empty() || !merge::sets(g).is_empty() || count >= WORKER_GROUPS {
+            return self;
+        }
+        let agreed = self.lock().rt.table_mut(g.table).map(|table| {
+            let agreed = Arc::new(Agreed::new(table.layout().clone(), count));
+            table.limit(Arc::clone(&agreed));
+            agreed
+        });
+        self.agreed = agreed;
         self
     }
 
