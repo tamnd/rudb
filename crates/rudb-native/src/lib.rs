@@ -84,6 +84,19 @@ const INTEGER_EXTREMES: &[u8; 8] = b"RUDBEX10";
 const COMPLETE_FREQUENCIES: &[u8; 8] = b"RUDBFQ10";
 const DEVICE_CARD: &[u8; 8] = b"RUDBDV10";
 const MAX_CATALOG_FREQUENCIES: usize = 64;
+/// How many parts [`Reader::matched`] runs a pattern over, spread evenly across the table.
+///
+/// Four parts of the native format are thirty two thousand rows, which puts a pattern that keeps
+/// one row in ten thousand at about three rows of the sample, and costs a few milliseconds once
+/// per pattern per open table.
+const SAMPLED_PARTS: usize = 4;
+/// How many parts a table can have for [`Reader::picked`] to run a condition over the whole of it.
+///
+/// Thirty two parts are a quarter of a million rows, which holds every dimension table of JOB with
+/// room to spare and none of its fact tables.
+const PICKED_PARTS: usize = 32;
+/// The most rows [`Reader::picked`] keeps the values of before it stops.
+const MOST_PICKED: usize = 1024;
 const FORMAT: u32 = 30;
 
 /// Formats this build can open.
@@ -177,8 +190,9 @@ const CLUSTERING: &[u8; 8] = b"RUDBCL1\0";
 /// so the dictionary is still written and still decodes them, but it no longer holds every value of
 /// the column, and nothing that reads it as if it did can be trusted: not the distinct count, not
 /// the frequencies, not the sorted order's first and last value, and not the codes as a group key
-/// or a membership index. A reader that finds a column named here decodes its coded pages to plain
-/// strings and answers everything else the way it answers a column with no dictionary.
+/// or a membership index. A reader that finds a column named here hands its coded pages out as
+/// dictionaries that promise nothing across pages, and answers everything else the way it answers a
+/// column with no dictionary.
 ///
 /// Same convention as [`CLUSTERING`], written only when a column was demoted, so a file with none
 /// is the bytes it always was. A build that predates it refuses a file that has one with
@@ -4292,6 +4306,12 @@ pub struct Reader {
     /// The distinct counts, orders and widths the planner reads off the table, gathered the first
     /// time a plan asks. See [`facts`].
     facts: Arc<OnceLock<Arc<rudb_common::ColumnFacts>>>,
+    /// What share of the sampled rows each pattern a plan asked about kept, by column, function and
+    /// pattern. See [`Reader::matched`].
+    matched: Arc<Mutex<HashMap<(usize, String, String), f64>>>,
+    /// The key values of the rows each condition a plan asked about kept, by column, function,
+    /// pattern and key column. See [`Reader::picked`].
+    picked: Arc<Mutex<HashMap<(usize, String, String, usize), Option<Vec<Value>>>>>,
     /// How many global dictionaries have been opened. A scan of a dictionary column should open its
     /// dictionary once however many workers it has, and the test that says so is the only thing
     /// keeping it that way.
@@ -4508,12 +4528,18 @@ fn verify_part(bytes: &[u8], span: PartSpan) -> Result<()> {
 /// The slots by stripe are empty until the column is first read, because a table as wide as the
 /// ClickBench one has a hundred columns a query never reads, and a slot for every stripe of each of
 /// them was most of a megabyte a process paid at open.
+/// `paged` is which stripes have had their page read whole, a bit a stripe, and a page read whole
+/// the second time goes into the pool too. A scan narrowed by a join reads most parts of a stripe
+/// and seldom all of them, so its stripes were never read through, and every run of it read each
+/// page whole again and let it go. On JOB 3a that was 44 percent of the time, spent copying and
+/// faulting in pages of `movie_info` that the run before had just thrown away.
 #[derive(Debug, Default)]
 struct Cached {
     pages: Vec<Option<Resident>>,
     loading: Vec<usize>,
     index: Vec<Option<Arc<Vec<PartSpan>>>>,
     touched: Vec<Vec<u64>>,
+    paged: Vec<u64>,
     passing: VecDeque<usize>,
 }
 
@@ -5969,6 +5995,15 @@ fn part_bytes(page: &[u8], span: PartSpan) -> Result<&[u8]> {
     page.get(span.start..end).ok_or_else(|| invalid("part exceeds its column page"))
 }
 
+/// Marks stripe `stripe` as having had its page read whole, and says whether it had been before.
+fn paged(bits: &mut [u64], stripe: usize) -> bool {
+    let (word, bit) = (stripe / 64, 1_u64 << (stripe % 64));
+    let Some(held) = bits.get_mut(word) else { return false };
+    let before = *held & bit != 0;
+    *held |= bit;
+    before
+}
+
 /// Marks part `part` of a stripe of `parts` parts read, and says whether it had been read before and
 /// whether every part of the stripe had been before this one was asked for again.
 fn touch(bits: &mut Vec<u64>, part: usize, parts: usize) -> (bool, bool) {
@@ -6498,6 +6533,8 @@ impl Reader {
             frequency_heads: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             summaries: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             facts: Arc::new(OnceLock::new()),
+            matched: Arc::default(),
+            picked: Arc::default(),
             opened: Arc::new(AtomicUsize::new(0)),
             sieves: Arc::new(sieves),
             part_ranges: Arc::new(part_ranges),
@@ -6628,6 +6665,203 @@ impl Reader {
     #[must_use]
     pub fn parts(&self) -> usize {
         self.places.len()
+    }
+
+    /// The share of a sample of a string column's rows that `function` keeps, one of the `LIKE`
+    /// family or `=`, called with the column and `pattern`.
+    ///
+    /// A pattern says nothing a bound or a frequency count can read, so a plan used to charge it a
+    /// fifth of the rows. That is wrong both ways and JOB shows both: `'%Downey%Robert%'` keeps a
+    /// handful of the four million names and `'%(co-production)%'` keeps a tenth of the companies,
+    /// and in 6d the fifth made `name` look dearer than `cast_info` and put it after. So the pattern
+    /// is run over [`SAMPLED_PARTS`] parts spread across the table, read the way a sparse scan reads
+    /// them so no page is kept for it, and a pattern nothing in the sample matched is charged half a
+    /// row of the sample rather than none. The answer is kept for as long as the reader is, so a
+    /// statement run again asks the file nothing.
+    #[must_use]
+    pub fn matched(&self, column: usize, function: &str, pattern: &str) -> Option<f64> {
+        let key = (column, function.to_owned(), pattern.to_owned());
+        if let Some(&share) = self.matched.lock().ok()?.get(&key) {
+            return Some(share);
+        }
+        let field = self.table.fields.get(column)?;
+        if field.ty != LogicalType::Varchar {
+            return None;
+        }
+        let parts = self.parts();
+        let taken = parts.min(SAMPLED_PARTS);
+        let (mut rows, mut kept) = (0_usize, 0_usize);
+        for at in 0..taken {
+            let part = (at * parts + parts / 2) / taken;
+            let chunk = self.read_sparse(part, &[column]).ok()?;
+            let values = chunk.column(0).ok()?;
+            if function == "=" {
+                let wanted = Value::Varchar(pattern.into());
+                rows += values.len();
+                kept += (0..values.len()).filter(|&row| values.value_at(row) == wanted).count();
+                continue;
+            }
+            let pattern = Vector::constant(
+                LogicalType::Varchar,
+                Value::Varchar(pattern.into()),
+                values.len(),
+            );
+            let passed =
+                rudb_kernels::call(function, &[values, &pattern], &LogicalType::Boolean, None)
+                    .ok()?;
+            rows += passed.len();
+            kept += (0..passed.len())
+                .filter(|&row| passed.value_at(row) == Value::Boolean(true))
+                .count();
+        }
+        if rows == 0 {
+            return None;
+        }
+        #[expect(clippy::cast_precision_loss, reason = "a share of a sample of a few parts")]
+        let share = (kept as f64).max(0.5) / rows as f64;
+        self.matched.lock().ok()?.insert(key, share);
+        Some(share)
+    }
+
+    /// The values of `key` in every row of the table `function` keeps, run as [`Self::matched`]
+    /// runs it, when the table has no more than [`PICKED_PARTS`] parts and the rows kept are no more
+    /// than `most`.
+    ///
+    /// The whole table rather than a sample, because the answer is which rows and not how many. A
+    /// dimension table a query names a value of is small: `keyword` is 134,170 rows in seventeen
+    /// parts and `info_type` one part, so this is at most a quarter of a million strings read once
+    /// per condition per open table. `None` for a larger table, for a condition that keeps more,
+    /// and for a column that is not a string.
+    #[must_use]
+    pub fn picked(
+        &self,
+        column: usize,
+        function: &str,
+        pattern: &str,
+        key: usize,
+        most: usize,
+    ) -> Option<Vec<Value>> {
+        let cached = (column, function.to_owned(), pattern.to_owned(), key);
+        if let Some(values) = self.picked.lock().ok()?.get(&cached) {
+            return values.as_ref().filter(|values| values.len() <= most).cloned();
+        }
+        let field = self.table.fields.get(column)?;
+        if field.ty != LogicalType::Varchar
+            || key >= self.table.fields.len()
+            || self.parts() > PICKED_PARTS
+        {
+            return None;
+        }
+        let mut kept = Vec::new();
+        let mut whole = true;
+        for part in 0..self.parts() {
+            let chunk = self.read_sparse(part, &[column, key]).ok()?;
+            let values = chunk.column(0).ok()?;
+            let keys = chunk.column(1).ok()?;
+            let passed: Vec<bool> = if function == "=" {
+                let wanted = Value::Varchar(pattern.into());
+                (0..values.len()).map(|row| values.value_at(row) == wanted).collect()
+            } else {
+                let pattern = Vector::constant(
+                    LogicalType::Varchar,
+                    Value::Varchar(pattern.into()),
+                    values.len(),
+                );
+                let passed =
+                    rudb_kernels::call(function, &[values, &pattern], &LogicalType::Boolean, None)
+                        .ok()?;
+                (0..passed.len()).map(|row| passed.value_at(row) == Value::Boolean(true)).collect()
+            };
+            kept.extend(
+                passed
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &passed)| passed)
+                    .map(|(row, _)| keys.value_at(row)),
+            );
+            // Past the most any caller asks for, the values are no use to anyone and the count is
+            // what [`Self::matched`] is for.
+            if kept.len() > MOST_PICKED {
+                whole = false;
+                break;
+            }
+        }
+        let kept = whole.then_some(kept);
+        self.picked.lock().ok()?.insert(cached, kept.clone());
+        kept.filter(|values| values.len() <= most)
+    }
+
+    /// The share of a sample of the column's rows that hold one of `values`, run over the parts
+    /// [`Self::matched`] runs a pattern over, and half a row of the sample where none of them did.
+    /// Kept for as long as the reader is, as that is.
+    #[must_use]
+    pub fn holding(&self, column: usize, values: &[Bound]) -> Option<f64> {
+        let key = (column, "in".to_owned(), format!("{values:?}"));
+        if let Some(&share) = self.matched.lock().ok()?.get(&key) {
+            return Some(share);
+        }
+        self.table.fields.get(column)?;
+        let parts = self.parts();
+        let taken = parts.min(SAMPLED_PARTS);
+        let (mut rows, mut kept) = (0_usize, 0_usize);
+        for at in 0..taken {
+            let part = (at * parts + parts / 2) / taken;
+            let chunk = self.read_sparse(part, &[column]).ok()?;
+            let held = chunk.column(0).ok()?;
+            rows += held.len();
+            kept += (0..held.len())
+                .filter(|&row| {
+                    Bound::of_value(&held.value_at(row))
+                        .is_some_and(|bound| values.contains(&bound))
+                })
+                .count();
+        }
+        if rows == 0 {
+            return None;
+        }
+        #[expect(clippy::cast_precision_loss, reason = "a share of a sample of a few parts")]
+        let share = (kept as f64).max(0.5) / rows as f64;
+        self.matched.lock().ok()?.insert(key, share);
+        Some(share)
+    }
+
+    /// How many pairs of a value of the column and a part holding it the table has, from the values
+    /// a sample of its parts hold, the ones [`Self::holding`] reads. Kept for as long as the reader
+    /// is.
+    #[must_use]
+    pub fn placed(&self, column: usize) -> Option<f64> {
+        let key = (column, "placed".to_owned(), String::new());
+        if let Some(&pairs) = self.matched.lock().ok()?.get(&key) {
+            return Some(pairs);
+        }
+        self.table.fields.get(column)?;
+        let parts = self.parts();
+        let taken = parts.min(SAMPLED_PARTS);
+        let mut held = 0_usize;
+        for at in 0..taken {
+            let part = (at * parts + parts / 2) / taken;
+            let chunk = self.read_sparse(part, &[column]).ok()?;
+            let column = chunk.column(0).ok()?;
+            let mut values = (0..column.len())
+                .filter_map(|row| match Bound::of_value(&column.value_at(row))? {
+                    Bound::Int(value) => Some(Some(value)),
+                    _ => Some(None),
+                })
+                .collect::<Option<Vec<i128>>>()?;
+            values.sort_unstable();
+            values.dedup();
+            held += values.len();
+        }
+        if taken == 0 {
+            return None;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a count of parts and values is a weight here"
+        )]
+        let pairs = held as f64 * parts as f64 / taken as f64;
+        self.matched.lock().ok()?.insert(key, pairs);
+        Some(pairs)
     }
 
     /// The parts of each stripe, in table wide part numbers.
@@ -7449,8 +7683,9 @@ impl Reader {
         Ok(Some(counts))
     }
 
-    /// The rows of one text part that hold `sequence`'s pieces in order, or with `negated` the rows
-    /// that do not, answered on the compressed page without decompressing it. Nulls are in neither.
+    /// The rows of one text part that hold the pieces of one of `sequences` in order, or with
+    /// `negated` the rows that hold none of them, answered on the compressed page without
+    /// decompressing it. Nulls are in neither.
     /// `None` for a part that is not compressed text, which the caller reads the usual way.
     ///
     /// For a scan whose filter is the only thing that reads the column, which then never has the
@@ -7464,7 +7699,7 @@ impl Reader {
         &self,
         part: usize,
         column: usize,
-        sequence: &Sequence,
+        sequences: &[Sequence],
         negated: bool,
     ) -> Result<Option<Vec<u32>>> {
         let place = *self.places.get(part).ok_or_else(|| invalid("part index out of range"))?;
@@ -7491,20 +7726,24 @@ impl Reader {
                 _ => return Err(invalid("page validity tag differs")),
             };
             // A row whose sketch lacks a bit the pieces need cannot hold them, so only the rest
-            // are walked. See `grams`.
-            let needs = sequence.needs();
+            // are walked, for each pattern. See `grams`.
             let first = self.firsts.get(part).copied().unwrap_or_default();
             let sketch = self
                 .text_grams
                 .get(column)
                 .and_then(|slot| slot.get_or_init(|| grams::text_grams(self, column)).as_deref())
                 .and_then(|words| words.get(first..first + rows));
-            let maybe = |row: usize| sketch.is_none_or(|words| words[row] & needs == needs);
-            let Some(held) = string::holds_in_where(&bytes[cur.at..], sequence, maybe)? else {
-                return Ok(None);
-            };
-            if held.len() != rows {
-                return Err(invalid("compressed text page holds the wrong number of rows"));
+            let mut held = vec![false; rows];
+            for sequence in sequences {
+                let needs = sequence.needs();
+                let maybe = |row: usize| sketch.is_none_or(|words| words[row] & needs == needs);
+                let Some(one) = string::holds_in_where(&bytes[cur.at..], sequence, maybe)? else {
+                    return Ok(None);
+                };
+                if one.len() != rows {
+                    return Err(invalid("compressed text page holds the wrong number of rows"));
+                }
+                held.iter_mut().zip(one).for_each(|(held, one)| *held |= one);
             }
             let valid = |row: usize| mask.is_none_or(|mask| mask[row / 8] >> (row % 8) & 1 == 1);
             Ok(Some(
@@ -7668,6 +7907,7 @@ impl Reader {
             cached.pages = (0..stripes).map(|_| None).collect();
             cached.index = vec![None; stripes];
             cached.touched = vec![Vec::new(); stripes];
+            cached.paged = vec![0; stripes.div_ceil(64)];
         }
         let known = cached.index.get(at).and_then(Clone::clone);
         let page = cached.pages.get(at).and_then(Option::as_ref).map(|slot| {
@@ -7680,6 +7920,8 @@ impl Reader {
             _ => (false, false),
         };
         let whole = whole && again;
+        // A page read whole for a second time goes to the pool as well, see [`Cached`].
+        let through = through || (whole && page.is_none() && paged(&mut cached.paged, at));
         if let Some(index) = known.clone()
             && (!whole || page.is_some())
         {
@@ -7870,10 +8112,13 @@ impl Reader {
                 map.release(page.offset, page.length as usize);
             }
             // A demoted column's codes are not the column's codes, only the codes of the stripes
-            // written before the demotion, so they are not handed out as if they were. See
-            // [`DEMOTED`].
-            if self.demoted(column) && vector.stable_dictionary_parts().is_some() {
-                vector = vector.flatten()?;
+            // written before the demotion, so they are not handed out as if they were. They still
+            // name the right values inside the part, so the part goes out as a dictionary that
+            // promises nothing across parts rather than as plain strings. Flattening it copied
+            // every string of the part out of the global dictionary, and on JOB that was nearly all
+            // of the time of every query that filters `movie_info.info`. See [`DEMOTED`].
+            if self.demoted(column) {
+                vector = vector.loosened();
             }
             picked.push(vector.into_pages());
         }
@@ -12987,10 +13232,7 @@ fn decode(
     let validity = match flag {
         0 => Validity::AllValid,
         1 => Validity::AllInvalid,
-        2 => {
-            let mask = cur.take(rows.div_ceil(8))?;
-            Validity::from_iter(rows, |row| mask[row / 8] >> (row % 8) & 1 == 1)
-        }
+        2 => Validity::from_bytes(rows, cur.take(rows.div_ceil(8))?),
         _ => return Err(invalid("page validity tag differs")),
     };
     if codec == 1 {
@@ -13757,6 +13999,37 @@ mod tests {
         // A column the file does not have. Zero here would be a fact about a column that is not
         // there, which the planner would then divide by.
         assert_eq!(stripes.nulls(column + 1), Stat::Unknown);
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn the_planner_gets_the_share_a_pattern_or_an_equality_keeps_off_a_sample() {
+        // Every value different, so there is no synopsis and no count of values to divide by, which
+        // is `keyword` in JOB. One row in four starts with `a`, and one row holds `k7`.
+        let path = path("matched_for_the_planner");
+        let mut writer =
+            Writer::create(&path, "words", vec![Field::new("w", LogicalType::Varchar)])
+                .expect("new file");
+        let values: Vec<Value> = (0..400)
+            .map(|row| Value::Varchar(format!("{}{row}", ["a", "b", "c", "k"][row % 4]).into()))
+            .collect();
+        let rows =
+            Chunk::new(vec![Vector::from_values(LogicalType::Varchar, &values).expect("text")])
+                .expect("one column");
+        writer.append(&rows).expect("the only part");
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let stripes = Stripes::new(reader);
+        let column = stripes.column("w").expect("the file has that column");
+        let share = stripes.matching(column, "~~", "a%").expect("a pattern is sampled");
+        assert!((share - 0.25).abs() < 1e-9, "{share}");
+        let share = stripes.matching(column, "!~~", "a%").expect("so is its negation");
+        assert!((share - 0.75).abs() < 1e-9, "{share}");
+        let share = stripes.matching(column, "=", "k7").expect("an equality is sampled");
+        assert!((share - 1.0 / 400.0).abs() < 1e-9, "{share}");
+        // Nothing matched is half a row of the sample, never nothing.
+        let share = stripes.matching(column, "=", "zz").expect("a miss is still a share");
+        assert!((share - 0.5 / 400.0).abs() < 1e-9, "{share}");
         fs::remove_file(&path).expect("clean up");
     }
 

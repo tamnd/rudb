@@ -76,7 +76,7 @@ use rudb_graph::{Adjacency, KeyMap, Link, PART_ROWS, Pushed, Rids};
 use rudb_metrics::Reduced;
 use rudb_plan::{BuildSide, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 use rudb_storage::{Blocked, Range};
-use rudb_vector::{Chunk, Data, Vector};
+use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
 use crate::expr::evaluate_all_in_time_zone;
 use crate::lookup::has_nulls;
@@ -225,7 +225,59 @@ pub(crate) struct Domain {
     words: Vec<u64>,
 }
 
+/// The widest stretch of key values [`Domain::misses`] looks through for one part, which is a
+/// thousand words.
+///
+/// A part of a column stored in key order covers a few thousand values and is looked through in a
+/// few dozen words. A part of a column whose values are spread over the table covers most of the
+/// domain, holds some key almost surely, and would cost the whole bitmap to find that out, so a
+/// stretch wider than this keeps the part without looking.
+const SPAN: i128 = 1 << 16;
+
 impl Domain {
+    /// A bitmap whose bit `n` stands for key `n`, out of words set that way by somebody else.
+    ///
+    /// The one extra word on the end is the always clear bit [`words_for`] leaves room for.
+    pub(crate) fn from_words(mut words: Vec<u64>) -> Self {
+        let range = words.len() as u64 * 64;
+        words.push(0);
+        Self { base: 0, range, words }
+    }
+
+    /// Whether no key the bitmap holds falls inside a part whose column spans `range`.
+    ///
+    /// The bitmap counterpart of [`Keys::misses`], for a set too large to list. On a column stored
+    /// in key order, which is every key of a table loaded in the order its identifiers were handed
+    /// out, a filtered parent leaves whole parts of the child with no key it holds, and those are
+    /// never read. `false` for an open or non integer range and for one wider than [`SPAN`].
+    pub(crate) fn misses(&self, range: &Range) -> bool {
+        let (Some(Bound::Int(low)), Some(Bound::Int(high))) = (&range.low, &range.high) else {
+            return false;
+        };
+        let top = i128::from(self.range) - 1;
+        let (low, high) = ((*low - self.base).max(0), (*high - self.base).min(top));
+        if low > high {
+            return true;
+        }
+        if high - low > SPAN {
+            return false;
+        }
+        let (Ok(low), Ok(high)) = (usize::try_from(low), usize::try_from(high)) else {
+            return false;
+        };
+        let (first, last) = (low / 64, high / 64);
+        (first..=last).all(|at| {
+            let mut bits = self.words[at];
+            if at == first {
+                bits &= u64::MAX << (low % 64);
+            }
+            if at == last {
+                bits &= u64::MAX >> (63 - high % 64);
+            }
+            bits == 0
+        })
+    }
+
     /// Whether the build side holds `key`.
     fn holds(&self, key: i64) -> bool {
         let Ok(offset) = u64::try_from(i128::from(key) - self.base) else { return false };
@@ -414,6 +466,9 @@ pub(crate) struct Exact {
     form: OnceLock<Option<Form>>,
     /// Where the three are read from, or nothing when they were handed over already read.
     stored: Option<Stored>,
+    /// Whether the key map is over the driving table's own column, so that the rows holding a set
+    /// of keys are the rows the map gives for them and there is no link or adjacency to follow.
+    own: bool,
 }
 
 /// The files a join's [`Exact`] reads its key map and its link out of.
@@ -438,6 +493,7 @@ impl Exact {
             adjacency: OnceLock::from(None),
             form: OnceLock::new(),
             stored: None,
+            own: false,
         }
     }
 
@@ -451,6 +507,7 @@ impl Exact {
             adjacency: OnceLock::new(),
             form: OnceLock::new(),
             stored: Some(stored),
+            own: false,
         }
     }
 
@@ -474,6 +531,12 @@ impl Exact {
         missed >= 0.5
     }
 
+    /// The key map of a driving table's own unique column, read out of the file when the keys a
+    /// reduction kept first ask, which turns those keys straight into the rows that hold them.
+    pub(crate) fn own(table: rudb_native::Reader, column: usize) -> Self {
+        Self { own: true, ..Self::stored(Stored { parent: table, column, child: None }) }
+    }
+
     fn keys(&self) -> Option<&KeyMap> {
         self.keys
             .get_or_init(|| {
@@ -494,6 +557,7 @@ impl Exact {
             adjacency: OnceLock::from(Some(Arc::new(adjacency))),
             form: OnceLock::new(),
             stored: None,
+            own: false,
         }
     }
 
@@ -1119,6 +1183,98 @@ fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Op
     Ok(Some(Pushed { rids, parts, skipped: parts - touched, stopped: false }))
 }
 
+/// The rows of the driving table that hold one of `count` key values, read off the backward
+/// adjacency, when they are fewer than one row in [`GATHERED`].
+///
+/// The same lists [`listed`] reads for a join, for the keys a relation of a consistent reduction
+/// kept, which are values and not the rows of a build side. Every value has to be in the parent's
+/// key map. A value that is not is one no parent holds, and the driving rows that hold it are in
+/// no list, so the set would miss them and the scan is left to test its rows instead.
+fn listed_keys(exact: &Exact, count: u64, keys: impl Iterator<Item = i64>) -> Option<Pushed> {
+    if exact.own {
+        return owned_keys(exact, count, keys);
+    }
+    let children = exact.children.filter(|&children| children > 0)?;
+    if count.saturating_mul(GATHERED) >= exact.parents.min(children) {
+        return None;
+    }
+    let adjacency = exact.adjacency()?;
+    let map = exact.keys()?;
+    let parents = adjacency.parents();
+    let mut words = vec![0_u64; usize::try_from(parents.div_ceil(64)).ok()?];
+    for key in keys {
+        let rid = map.lookup(i128::from(key)).ok()??;
+        *words.get_mut(usize::try_from(rid / 64).ok()?)? |= 1 << (rid % 64);
+    }
+    let held = Rids::from_words(parents, words).ok()?;
+    if adjacency.reached(&held).saturating_mul(GATHERED) >= children {
+        return None;
+    }
+    let rids = adjacency.push(&held).ok()?;
+    if !thin(&rids) {
+        return None;
+    }
+    let parts = children.div_ceil(PART_ROWS as u64);
+    Some(Pushed { rids, parts, skipped: 0, stopped: false })
+}
+
+/// The rows of a table whose own unique column holds one of `count` key values, read off its key
+/// map, when they are fewer than one row in [`GATHERED`].
+///
+/// A value the map does not hold is in no row of the table and is passed over, which is the
+/// difference from [`listed_keys`], where such a value could still be in a driving row.
+fn owned_keys(exact: &Exact, count: u64, keys: impl Iterator<Item = i64>) -> Option<Pushed> {
+    if exact.parents == 0 || count.saturating_mul(GATHERED) >= exact.parents {
+        return None;
+    }
+    let map = exact.keys()?;
+    let rows = map.len();
+    let mut words = vec![0_u64; usize::try_from(rows.div_ceil(64)).ok()?];
+    for key in keys {
+        let Some(rid) = map.lookup(i128::from(key)).ok()? else { continue };
+        *words.get_mut(usize::try_from(rid / 64).ok()?)? |= 1 << (rid % 64);
+    }
+    let rids = Rids::from_words(rows, words).ok()?;
+    if !thin(&rids) {
+        return None;
+    }
+    let parts = rows.div_ceil(PART_ROWS as u64);
+    Some(Pushed { rids, parts, skipped: 0, stopped: false })
+}
+
+/// Whether rows sit thinly enough in the parts they fall in for the scan to read them one at a
+/// time, fewer than one in [`LISTED`] of each part's rows on average, which is the share
+/// `Source::read_reduced` reads a part at its rows for.
+///
+/// The share of the whole table is not the test. A table stored in the order of the key reached
+/// through keeps a parent's children together, so a few parents fill the parts they touch. In JOB
+/// 23b the 24,592 movies complete_cast kept reach 1.27 million rows of movie_info, one row in twelve
+/// of the table, but they fill the parts they are in. Those parts get read whole whatever happens,
+/// and naming the rows by where they sit takes the `LIKE` on the info column off its dictionary
+/// codes, which made the scan four times slower than filtering it on the keys.
+fn thin(rids: &Rids) -> bool {
+    // A stored part is a vector of rows, which is the length the scan compares against.
+    let part_rows = VECTOR_SIZE as u64;
+    let (mut touched, mut last) = (0_u64, u64::MAX);
+    for rid in rids.iter() {
+        if rid / part_rows != last {
+            last = rid / part_rows;
+            touched += 1;
+        }
+    }
+    rids.len().saturating_mul(LISTED) < touched.saturating_mul(part_rows)
+}
+
+/// A relation of a consistent reduction is read at the rows its kept keys reach when they are
+/// fewer than one row of its table in this many. See [`listed_keys`].
+///
+/// Higher than [`LISTED`] because of where the work happens. The rows are gathered once the
+/// relation before has finished, on one thread, at about 30 ns a row reached on the IMDb load, while
+/// testing a row's key against the kept keys costs a few nanoseconds and is spread over every
+/// worker of the scan. In JOB 9a the 119,532 movies kept reach 3.37 million rows of cast_info, one
+/// in eleven, and gathering them took longer than the scan they were meant to shorten.
+const GATHERED: u64 = 64;
+
 /// A build side is read through the adjacency when its parents' children are fewer than one
 /// driving row in this many. See [`listed`].
 const LISTED: u64 = 8;
@@ -1286,6 +1442,71 @@ impl Extremes {
 }
 
 impl Found {
+    /// The keys one relation of a consistent reduction kept, as a bitmap whose bit `n` is key `n`,
+    /// for the scan of the relation above it. See [`crate::consistent`].
+    ///
+    /// The range goes with it, so that the zone maps rule out the parts outside it, and so do the
+    /// keys as a list when there are few enough of them to list. The bitmap is what the scan tests
+    /// its rows against, before it reads any column the key is not in.
+    ///
+    /// With an [`Exact`] whose table carries the backward adjacency, keys few enough that their rows
+    /// are fewer than one in [`LISTED`] are turned into those rows instead, and the scan reads them
+    /// and nothing else. See [`listed_keys`].
+    pub(crate) fn kept(words: Vec<u64>, exact: Option<&Exact>) -> Self {
+        let set = || {
+            words.iter().enumerate().flat_map(|(at, &word)| {
+                let mut bits = word;
+                std::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let bit = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    Some(at as i64 * 64 + i64::from(bit))
+                })
+            })
+        };
+        let count: u64 = words.iter().map(|word| u64::from(word.count_ones())).sum();
+        let low = set().next();
+        let high = words
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, word)| **word != 0)
+            .map(|(at, word)| at as i64 * 64 + 63 - i64::from(word.leading_zeros()));
+        let range =
+            low.zip(high).map(|(low, high)| (Bound::Int(low.into()), Bound::Int(high.into())));
+        if let Some(pushed) = exact.and_then(|exact| listed_keys(exact, count, set())) {
+            let reduced = Reduced {
+                kept: pushed.rids.len(),
+                rows: pushed.rids.rows(),
+                stopped: false,
+                by_key: false,
+            };
+            return Self {
+                range,
+                filter: None,
+                rows: Some(pushed.rids),
+                domain: None,
+                spare: None,
+                held: None,
+                reduced: Some(reduced),
+                keys: None,
+            };
+        }
+        let keys = (count <= KEYS as u64).then(|| Keys { keys: set().collect() });
+        Self {
+            range,
+            filter: None,
+            rows: None,
+            domain: Some(Domain::from_words(words)),
+            spare: None,
+            held: None,
+            reduced: None,
+            keys,
+        }
+    }
+
     /// A build side that turned out to hold this, for the tests that stand in for one.
     #[cfg(test)]
     pub(crate) fn of(range: Option<(Bound, Bound)>, filter: Option<Blocked>) -> Self {
@@ -1674,6 +1895,46 @@ mod tests {
         assert_eq!(kept, expected);
     }
 
+    /// The keys a relation of a reduction kept are values and not rows, and the parent's key map
+    /// turns them into the parents whose children the adjacency lists. A value no parent holds could
+    /// be in a driving row the lists leave out, so a set with one is handed over as a bitmap instead.
+    #[test]
+    fn kept_keys_become_the_rows_that_hold_them_when_every_key_has_a_parent() {
+        let parent_keys: Vec<Option<i128>> = (0..1_000).map(|rid| Some(100 + rid)).collect();
+        let parents_of: Vec<u64> = (0..100_000).map(|child| child % 1_000).collect();
+        let exact = Exact::adjacent(
+            KeyMap::build(&parent_keys).expect("unique keys"),
+            Adjacency::build(&parents_of, 1_000).expect("every parent exists"),
+        );
+        let words = |keys: &[usize]| {
+            let mut words = vec![0_u64; 40];
+            for &key in keys {
+                words[key / 64] |= 1 << (key % 64);
+            }
+            words
+        };
+
+        let found = Found::kept(words(&[103]), Some(&exact));
+        let rows = found.rows.expect("listed");
+        assert!(found.domain.is_none());
+        let expected: Vec<u64> = (0..100_000).filter(|child| child % 1_000 == 3).collect();
+        assert_eq!(rows.iter().collect::<Vec<u64>>(), expected);
+
+        let found = Found::kept(words(&[103, 2_000]), Some(&exact));
+        assert!(found.rows.is_none() && found.domain.is_some());
+
+        // Few enough rows of the table, but each parent's children are stored together, so the one
+        // kept parent fills the part it is in and reading it whole is no worse than reading its
+        // rows one at a time.
+        let parents_of: Vec<u64> = (0..400_000).map(|child| child / 3_000).collect();
+        let clustered = Exact::adjacent(
+            KeyMap::build(&parent_keys).expect("unique keys"),
+            Adjacency::build(&parents_of, 1_000).expect("every parent exists"),
+        );
+        let found = Found::kept(words(&[103]), Some(&clustered));
+        assert!(found.rows.is_none() && found.domain.is_some());
+    }
+
     /// The exact rows answer the scan, which leaves no bitmap behind for a join above that narrows
     /// its own table by these keys. Asked for, the side makes one anyway, and it holds exactly the
     /// keys the side holds.
@@ -1847,6 +2108,32 @@ mod tests {
     /// The case that is in every plan over a view: the join names the projection's column and the
     /// scan under it names its own, and without the walk between them the filter is built, handed
     /// over and read by nobody.
+    #[test]
+    fn the_kept_keys_of_a_reduction_rule_out_the_parts_that_hold_none_of_them() {
+        let mut words = vec![0_u64; 4];
+        for key in [3_usize, 70, 200] {
+            words[key / 64] |= 1 << (key % 64);
+        }
+        let found = Found::kept(words, None);
+        assert_eq!(found.range, Some((Bound::Int(3), Bound::Int(200))));
+        assert_eq!(found.keys.as_ref().map(|keys| keys.keys.clone()), Some(vec![3, 70, 200]));
+        let domain = found.domain.expect("a bitmap");
+        let part = |low: i64, high: i64| rudb_storage::Range {
+            low: Some(Bound::Int(low.into())),
+            high: Some(Bound::Int(high.into())),
+            ..rudb_storage::Range::default()
+        };
+        assert!(domain.misses(&part(4, 69)));
+        assert!(domain.misses(&part(201, 5_000)));
+        assert!(domain.misses(&part(-9, 2)));
+        for (low, high) in [(0, 3), (3, 3), (70, 70), (71, 200), (-5, 1_000_000_000)] {
+            assert!(!domain.misses(&part(low, high)), "{low}..{high}");
+        }
+        let mut block = Vec::new();
+        let keys = column(&[Some(3), Some(4), Some(200), Some(256), Some(-1), None]);
+        assert_eq!(domain.kept(&keys, 6, &mut block).indices(), [0, 2]);
+    }
+
     #[test]
     fn a_projection_between_the_join_and_the_scan_renames_the_column_the_filter_is_about() {
         let plan = driving(

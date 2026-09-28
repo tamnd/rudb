@@ -27,7 +27,7 @@ use rudb_metrics::Counters;
 use rudb_native::{Reader as NativeReader, RunProjectionPart, RunProjectionScan};
 use rudb_parquet::{Bound, Op, Reader, Test, skips};
 use rudb_pipeline::{Compaction, Gauge, Morsel, Progress, Source, narrow};
-use rudb_plan::{ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
+use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 use rudb_seam::{Context, SeamId, Settings};
 use rudb_storage::Probe;
 use rudb_vector::{Chunk, Data, Form, Selection, VECTOR_SIZE, Vector};
@@ -438,6 +438,8 @@ pub(crate) struct Scan<'a> {
     /// both are known is after the pipeline this one depends on has finished and before this one has
     /// started. That is [`Source::morsels`], and every read is after it.
     testing: OnceLock<Vec<Probe>>,
+    /// The rows every join above that handed rows down holds between them. See [`Source::reduced`].
+    exact: OnceLock<Option<Rids>>,
     schema: Schema,
     chunks: Handout,
     /// The parts of each stripe, empty when the rows are not native.
@@ -824,23 +826,85 @@ impl Late {
     }
 }
 
-/// A filter that is one `LIKE '%a%b%'` on a string column, answered by the pages rather than by the
-/// strings.
+/// A filter that is one `LIKE '%a%b%'` on a string column, or an `OR` of them, answered by the
+/// pages rather than by the strings.
 #[derive(Debug)]
 struct Stored {
     /// The column, in the scan's numbering.
     input: usize,
-    sequence: Sequence,
+    /// The patterns, any one of which keeps a row.
+    sequences: Vec<Sequence>,
     negated: bool,
 }
 
 /// The column, the pieces and whether it is a `NOT LIKE`, when `predicate` is a `LIKE` whose pattern
-/// is some pieces between `%` and nothing else.
+/// is some pieces between `%` and nothing else, or an `OR` of such `LIKE`s over one column.
 ///
 /// Those are the patterns a string holds exactly when it holds the pieces in order, which is what a
 /// page can answer on its codes. A `_` is one character and not one byte, and a pattern anchored at
 /// either end asks where the pieces are and not only whether, so neither comes here.
+///
+/// An `IS NOT NULL` of the same column beside it is kept too, since a null holds no pattern and the
+/// pages leave it out already. JOB 20c asks `chn.name IS NOT NULL AND (chn.name LIKE '%man%' OR
+/// chn.name LIKE '%Man%')` of three million names, and decompressing them to search them was half
+/// the query.
 fn stored_like(plan: &Plan, schema: &Schema, predicate: ExprRef) -> Option<Stored> {
+    let conjuncts = match *plan.expr(predicate) {
+        Expr::Conjunction { op: ConjunctionOp::And, children } => plan.expr_list(children).to_vec(),
+        _ => vec![predicate],
+    };
+    let mut found: Option<Stored> = None;
+    let mut present = Vec::new();
+    for conjunct in conjuncts {
+        if let Some(input) = present_column(plan, schema, conjunct) {
+            present.push(input);
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(match *plan.expr(conjunct) {
+            Expr::Conjunction { op: ConjunctionOp::Or, children } => {
+                let mut input = None;
+                let mut sequences = Vec::new();
+                for &child in plan.expr_list(children) {
+                    let (column, sequence, negated) = one_like(plan, schema, child)?;
+                    if negated || input.is_some_and(|input| input != column) {
+                        return None;
+                    }
+                    input = Some(column);
+                    sequences.push(sequence);
+                }
+                Stored { input: input?, sequences, negated: false }
+            }
+            _ => {
+                let (input, sequence, negated) = one_like(plan, schema, conjunct)?;
+                Stored { input, sequences: vec![sequence], negated }
+            }
+        });
+    }
+    found.filter(|stored| present.iter().all(|&input| input == stored.input))
+}
+
+/// The column of an `IS NOT NULL`, which is written as `IS DISTINCT FROM NULL`.
+fn present_column(plan: &Plan, schema: &Schema, predicate: ExprRef) -> Option<usize> {
+    let Expr::Compare { op: CompareOp::DistinctFrom, left, right } = *plan.expr(predicate) else {
+        return None;
+    };
+    let Expr::Column(binding) = *plan.expr(left) else { return None };
+    let right = match *plan.expr(right) {
+        Expr::Cast { input, .. } => input,
+        _ => right,
+    };
+    let Expr::Constant(value) = *plan.expr(right) else { return None };
+    if !plan.value(value).is_null() {
+        return None;
+    }
+    schema.position_of(binding)
+}
+
+/// One `LIKE` of [`stored_like`], as its column, its pieces and whether it is negated.
+fn one_like(plan: &Plan, schema: &Schema, predicate: ExprRef) -> Option<(usize, Sequence, bool)> {
     let Expr::Function { name, args } = *plan.expr(predicate) else { return None };
     let negated = match plan.string(name) {
         "~~" => false,
@@ -860,7 +924,7 @@ fn stored_like(plan: &Plan, schema: &Schema, predicate: ExprRef) -> Option<Store
         return None;
     }
     let pieces: Vec<&[u8]> = inner.split('%').map(str::as_bytes).collect();
-    Some(Stored { input, sequence: Sequence::new(&pieces)?, negated })
+    Some((input, Sequence::new(&pieces)?, negated))
 }
 
 /// A LIKE conjunct followed by a simple comparison on another column.
@@ -1084,6 +1148,7 @@ impl<'a> Scan<'a> {
             cutoff,
             index,
             testing: OnceLock::new(),
+            exact: OnceLock::new(),
             schema,
             chunks,
             stripes,
@@ -1358,7 +1423,7 @@ impl<'a> Scan<'a> {
         let rows = self.table.rows();
         // A LIKE answered on the pages is string work, and it is the whole of the filter here.
         let searching = stage::Timing::start(Stage::Strings);
-        let holding = rows.rows_holding(at, column, &stored.sequence, stored.negated);
+        let holding = rows.rows_holding(at, column, &stored.sequences, stored.negated);
         searching.stop(0);
         let Some(kept) = holding? else {
             return Ok(false);
@@ -1481,6 +1546,11 @@ impl<'a> Scan<'a> {
     /// one brand and container keeps about one `lineitem` row in a thousand, and decoding the
     /// quantity and the price of the other nine hundred and ninety nine was a third of the query.
     /// See `spec/perf/47-columns-at-the-kept-rows.md`.
+    ///
+    /// When such a join's filter keeps that few, it goes before the scan's own filter as well, which
+    /// then reads its columns at the rows the join kept. In JOB 3c the kept movies are about one
+    /// `movie_info` row in two thousand, and decompressing every `info` to test it against a list of
+    /// countries first was most of the query.
     fn read_deferring(&self, at: usize, out: &mut Chunk) -> Result<bool> {
         if !self.deferring.worth() || self.reduced(at).is_some() {
             return Ok(false);
@@ -1506,7 +1576,23 @@ impl<'a> Scan<'a> {
         let expanding = (!tight && self.pushed.is_some() && self.passed.tight())
             .then(|| self.expanding.get())
             .flatten();
-        let wide = if tight { &self.deferrable } else { &self.deferred };
+        // A tight join goes first of all, the scan's own filter included, when that filter reads
+        // something the join does not. The filter's columns are then read at the rows the join kept
+        // and nowhere else. See the last paragraph above.
+        let early = tight
+            && self.pushed.is_some()
+            && (0..self.columns.len()).any(|at| {
+                self.columns[at].is_some() && !keys.contains(&at) && !self.deferrable.contains(&at)
+            });
+        let every: Vec<usize>;
+        let wide = if early {
+            every = (0..self.columns.len()).filter(|&at| self.columns[at].is_some()).collect();
+            &every
+        } else if tight {
+            &self.deferrable
+        } else {
+            &self.deferred
+        };
         if (wide.is_empty() && expanding.is_none_or(Vec::is_empty))
             || (self.pushed.is_none() && keys.is_empty())
         {
@@ -1542,7 +1628,11 @@ impl<'a> Scan<'a> {
         }
         held.push(Vector::sequence(0, 1, len));
         *out = Chunk::with_rows(held, len)?;
-        self.narrow_read(at, out, false)?;
+        if early {
+            self.sift(out)?;
+        } else {
+            self.narrow_read(at, out, false)?;
+        }
         let kept = out.len();
         self.deferring.saw(len, kept);
         let mut columns = std::mem::replace(out, Chunk::empty(&[])).into_columns();
@@ -1574,6 +1664,9 @@ impl<'a> Scan<'a> {
             }
         }
         *out = Chunk::with_rows(columns, kept)?;
+        if early && kept > 0 {
+            self.apply(at, out, false)?;
+        }
         Ok(true)
     }
 
@@ -1683,6 +1776,7 @@ impl<'a> Scan<'a> {
     /// divided by one set of rows and done over a different one.
     fn testing(&self) -> &[Probe] {
         self.testing.get_or_init(|| {
+            let _ = self.exact.set(self.handed());
             let mut probes = self.probes.clone();
             if let Some(sideways) = self.sideways.as_ref() {
                 // Here because this is the one moment every instance of the scan passes through
@@ -1695,6 +1789,11 @@ impl<'a> Scan<'a> {
                 probes.extend(onto(&self.columns, sideways.tests(self.index)));
             }
             for (sideways, _) in &self.also {
+                if let (Some(counters), Some(reduced)) =
+                    (&self.counters, sideways.reduction(self.index))
+                {
+                    counters.reducing(reduced);
+                }
                 probes.extend(onto(&self.columns, sideways.tests(self.index)));
             }
             probes
@@ -1741,10 +1840,21 @@ impl<'a> Scan<'a> {
         })
     }
 
-    /// Whether a join above holds no key inside part `at`, so the part is never read. See [`Keys`].
+    /// Whether a join above holds no key inside part `at`, so the part is never read. See [`Keys`]
+    /// and [`Domain::misses`](crate::sideways::Domain::misses).
     fn keyed_away(&self, at: usize) -> bool {
-        self.keyed().any(|(column, keys)| {
-            self.table.rows().ruled_by(at, column, &|range| keys.misses(range))
+        let rows = self.table.rows();
+        if self.keyed().any(|(column, keys)| rows.ruled_by(at, column, &|range| keys.misses(range)))
+        {
+            return true;
+        }
+        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
+        joins.filter_map(|sideways| sideways.domain(self.index)).any(|(at_key, domain)| {
+            self.columns
+                .get(at_key)
+                .copied()
+                .flatten()
+                .is_some_and(|column| rows.ruled_by(at, column, &|range| domain.misses(range)))
         })
     }
 
@@ -1752,10 +1862,28 @@ impl<'a> Scan<'a> {
     ///
     /// The position is the row's place in the table, which is what a link calls a child `rid`, so
     /// the set can be asked about a part without reading anything.
+    ///
+    /// The rows all of them hold when more than one join handed rows down. A join that hands rows
+    /// down tests nothing else, so each set has to be kept, and the rows in all of them are the
+    /// fewest to read. In JOB 29a `cast_info` was handed the 134,153 roles of the people `name`
+    /// kept and the few of the one movie left, and read the first set only.
     fn reduced(&self, at: usize) -> Option<(&Rids, u64)> {
-        let rows = self.sideways.as_ref()?.rows(self.index)?;
+        // Settled with the tests, at the one moment the joins above have all finished.
+        self.testing();
+        let rows = self.exact.get()?.as_ref()?;
         let first = u64::try_from(*self.offsets.get(at)?).ok()?;
         Some((rows, first))
+    }
+
+    /// The rows in every set of exact rows the joins above handed down, `None` when none did.
+    fn handed(&self) -> Option<Rids> {
+        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
+        let mut sets = joins.filter_map(|sideways| sideways.rows(self.index));
+        let first = sets.next()?;
+        // Sets over tables of different sizes would be a bug above, and the first alone is still
+        // every row that can survive.
+        let all = sets.try_fold(first.clone(), |held, rows| held.intersect(rows));
+        Some(all.unwrap_or_else(|_| first.clone()))
     }
 
     /// Whether the exact rows hold nothing inside part `at`, so the part is never read.
@@ -4218,6 +4346,7 @@ mod tests {
             cutoff: None,
             index: 0,
             testing: OnceLock::new(),
+            exact: OnceLock::new(),
             schema: Schema::numbered(fields, 0),
             chunks: Handout::new(table.rows().chunk_count()),
             stripes: Vec::new(),
@@ -4287,6 +4416,66 @@ mod tests {
         )
         .expect("the column is there");
         (plan, scan)
+    }
+
+    /// The pages answer an `OR` of `LIKE`s over one column with an `IS NOT NULL` of it beside them,
+    /// the shape of JOB 20c's `char_name` filter, and nothing that reads a second column.
+    #[test]
+    fn an_or_of_likes_over_one_column_is_answered_by_the_pages() {
+        let table = Table::new(
+            QualifiedName::new("memory", "main", "t"),
+            vec![
+                Field::new("name", LogicalType::Varchar),
+                Field::new("kind", LogicalType::Varchar),
+            ],
+        )
+        .expect("two columns");
+        let stored = |predicate: &str| {
+            let plan = Plan::parse(&format!(
+                "Filter {predicate}\n  Get memory.main.t AS t #0 [name::VARCHAR, kind::VARCHAR]"
+            ))
+            .expect("the plan text round trips");
+            let Node::Filter { input, predicate } = *plan.node(plan.root()) else {
+                panic!("the plan is a filter");
+            };
+            let Node::Get { index, columns, .. } = *plan.node(input) else { panic!("under a get") };
+            let moved = rudb_opt::bounds::into_scan(&plan, plan.root())
+                .expect("a filter over a stored table");
+            let pushdown = Pushdown {
+                node: plan.root(),
+                predicate,
+                tests: moved.tests,
+                whole: moved.whole,
+                conjuncts: moved.conjuncts,
+                marks: false,
+            };
+            let filters = Filters { pushed: Some(pushdown), ..Filters::default() };
+            let scan = Scan::new(
+                &plan,
+                &table,
+                index,
+                columns,
+                filters,
+                &Settings::default(),
+                &Session::default(),
+            )
+            .expect("two projected columns");
+            scan.pushed
+                .as_ref()
+                .and_then(|pushed| pushed.stored.as_ref())
+                .map(|stored| (stored.input, stored.sequences.len(), stored.negated))
+        };
+        let man = "(\"~~\"(#0.0::VARCHAR, '%man%'::VARCHAR)::BOOLEAN OR \
+                   \"~~\"(#0.0::VARCHAR, '%Man%'::VARCHAR)::BOOLEAN)::BOOLEAN";
+        let present = "(#0.0::VARCHAR IS DISTINCT FROM NULL::VARCHAR)::BOOLEAN";
+        assert_eq!(stored(man), Some((0, 2, false)));
+        assert_eq!(stored(&format!("({present} AND {man})::BOOLEAN")), Some((0, 2, false)));
+        let other = "\"~~\"(#0.1::VARCHAR, '%Man%'::VARCHAR)::BOOLEAN";
+        let mixed =
+            format!("(\"~~\"(#0.0::VARCHAR, '%man%'::VARCHAR)::BOOLEAN OR {other})::BOOLEAN");
+        assert_eq!(stored(&mixed), None, "two columns");
+        let kind = "(#0.1::VARCHAR IS DISTINCT FROM NULL::VARCHAR)::BOOLEAN";
+        assert_eq!(stored(&format!("({kind} AND {man})::BOOLEAN")), None, "a second column");
     }
 
     /// A necessary LIKE can read one column first without changing the full AND answer.

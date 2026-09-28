@@ -115,6 +115,13 @@ fn a_demoted_column_answers_every_query_as_the_rows_in_memory_do() {
             .to_owned(),
         "SELECT count(*) FROM t WHERE url LIKE 'https://example.com/page/5999%'".to_owned(),
         "SELECT count(*) FROM t WHERE url LIKE '%/1_'".to_owned(),
+        // A prefix, answered from the ranks of the coded pages and from the text of the others.
+        "SELECT count(*) FROM t WHERE url LIKE 'https://example.com/1%'".to_owned(),
+        "SELECT count(*) FROM t WHERE url NOT LIKE 'https://example.com/1%'".to_owned(),
+        "SELECT count(*) FROM t WHERE url LIKE 'https://example.com/%'".to_owned(),
+        "SELECT count(*) FROM t WHERE url LIKE 'https://example.com/page/%'".to_owned(),
+        "SELECT count(*), min(city) FROM t WHERE city LIKE 'city 1%'".to_owned(),
+        "SELECT count(*) FROM t WHERE city NOT LIKE 'city 1%'".to_owned(),
         "SELECT count(*) FROM t WHERE url > 'https://example.com/page/5'".to_owned(),
         // A sort on the column, which a rank from the dictionary would get wrong.
         "SELECT id, url FROM t ORDER BY url, id LIMIT 30".to_owned(),

@@ -196,6 +196,10 @@ pub fn compare_prepared(
     {
         return boolean(vec![false; len], Validity::AllInvalid, len);
     }
+    if let Some((other, distinct)) = against_null(op, &left_valid, &right_valid) {
+        let answers = (0..len).map(|row| other.is_valid(row) == distinct).collect();
+        return boolean(answers, Validity::AllValid, len);
+    }
 
     if let Some(answers) = external_text_literal(op, left, right, len, identity, held)? {
         let validity = left_valid.and(&right_valid, len);
@@ -258,6 +262,15 @@ pub fn select_prepared(
     {
         return Ok(Selection::empty());
     }
+    if let Some((other, distinct)) = against_null(op, &left_valid, &right_valid) {
+        if *other == Validity::AllValid && distinct {
+            return Ok(Selection::identity(len));
+        }
+        let rows = (0..len).filter(|&row| other.is_valid(row) == distinct);
+        return Ok(Selection::from_indices(
+            rows.filter_map(|row| u32::try_from(row).ok()).collect(),
+        ));
+    }
     // A selection holds `u32` rows, and a chunk is nowhere near that, but the long way checks it
     // and so this does too rather than casting past it.
     if u32::try_from(len).is_ok() {
@@ -284,6 +297,30 @@ pub fn select_prepared(
         }
     }
     Ok(crate::select::selection(&compare_prepared(op, left, right, held)?, len))
+}
+
+/// The validity of the side that is not the null literal, and whether a row holds when that side is
+/// valid, for `IS DISTINCT FROM` and `IS NOT DISTINCT FROM` with a side that is all null.
+///
+/// `x IS NOT NULL` is bound as `x IS DISTINCT FROM NULL`, and no loop below takes a total comparison,
+/// so every one of those went a row at a time and built a value per row to learn what the mask
+/// already says. JOB 19a spent a third of its `movie_info` scan there over `mi.info IS NOT NULL`.
+/// Both sides all null is the other side all null too, which holds for `IS NOT DISTINCT FROM` alone,
+/// and the same test says so.
+fn against_null<'a>(
+    op: Comparison,
+    left_valid: &'a Validity,
+    right_valid: &'a Validity,
+) -> Option<(&'a Validity, bool)> {
+    if !op.is_total() {
+        return None;
+    }
+    let other = match (left_valid, right_valid) {
+        (_, Validity::AllInvalid) => left_valid,
+        (Validity::AllInvalid, _) => right_valid,
+        _ => return None,
+    };
+    Some((other, op == Comparison::DistinctFrom))
 }
 
 /// The rows of a flat integer column with no nulls that hold against a literal or against another
@@ -846,6 +883,15 @@ pub fn refine_prepared(
     if !op.is_total() && (left_valid == Validity::AllInvalid || right_valid == Validity::AllInvalid)
     {
         return Ok(Selection::empty());
+    }
+    if let Some((other, distinct)) = against_null(op, &left_valid, &right_valid) {
+        if *other == Validity::AllValid && distinct {
+            return Ok(kept.clone());
+        }
+        let rows = kept.indices().iter().copied();
+        return Ok(Selection::from_indices(
+            rows.filter(|&row| other.is_valid(row as usize) == distinct).collect(),
+        ));
     }
 
     let rows = kept.indices();
@@ -2916,6 +2962,51 @@ mod tests {
         let kept = refine(Comparison::GreaterOrEqual, &column, &cut, &Selection::identity(4))
             .expect("refines");
         assert_eq!(kept.indices(), [2]);
+        assert_eq!(fallback::count(Kernel::Compare, Form::Dictionary, Form::Constant), before);
+    }
+
+    /// `x IS NOT NULL`, bound as `x IS DISTINCT FROM NULL`, and its negation are answered off the
+    /// mask by all three entry points, with the null on either side, and agree with the row at a
+    /// time path without taking it.
+    #[test]
+    fn a_distinctness_test_against_null_reads_the_mask_and_not_the_rows() {
+        let before = fallback::count(Kernel::Compare, Form::Dictionary, Form::Constant);
+        let text = |values: &[Value]| {
+            Vector::from_values(LogicalType::Varchar, values).expect("a flat text column")
+        };
+        let words = [Value::Varchar("a".into()), Value::Null, Value::Varchar("b".into())];
+        let column = Vector::dictionary(vec![0, 1, 2, 1, 0], text(&words)).expect("in range");
+        let solid = Vector::dictionary(vec![0, 2, 2, 0, 0], text(&words)).expect("in range");
+        let null = Vector::constant(LogicalType::Varchar, Value::Null, 5);
+        let every = Selection::identity(5);
+        let some = Selection::from_indices(vec![1, 2, 4]);
+        for op in [Comparison::DistinctFrom, Comparison::NotDistinctFrom] {
+            for side in [&column, &solid, &null] {
+                for (left, right) in [(side, &null), (&null, side)] {
+                    let rows: Vec<u32> = (0..5_u32)
+                        .filter(|&row| {
+                            let one = left.value_at(row as usize);
+                            let other = right.value_at(row as usize);
+                            compare_values(op, &one, &other).expect("compares")
+                                == Value::Boolean(true)
+                        })
+                        .collect();
+                    let flags = compare(op, left, right).expect("compares");
+                    let flagged: Vec<u32> = (0..5_u32)
+                        .filter(|&row| flags.value_at(row as usize) == Value::Boolean(true))
+                        .collect();
+                    assert_eq!(flagged, rows, "{op:?}");
+                    let selected = select_prepared(op, left, right, None).expect("selects");
+                    assert_eq!(selected.indices(), rows.as_slice(), "{op:?}");
+                    let refined = refine(op, left, right, &every).expect("refines");
+                    assert_eq!(refined.indices(), rows.as_slice(), "{op:?}");
+                    let within: Vec<u32> =
+                        rows.iter().copied().filter(|row| some.indices().contains(row)).collect();
+                    let refined = refine(op, left, right, &some).expect("refines");
+                    assert_eq!(refined.indices(), within.as_slice(), "{op:?}");
+                }
+            }
+        }
         assert_eq!(fallback::count(Kernel::Compare, Form::Dictionary, Form::Constant), before);
     }
 

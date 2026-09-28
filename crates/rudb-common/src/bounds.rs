@@ -458,6 +458,147 @@ pub trait Zones: std::fmt::Debug + Send + Sync {
     /// [`Class::Exact`]: crate::stat::Class::Exact
     /// [`Stat`]: crate::Stat
     fn nulls(&self, column: usize) -> Stat<u64>;
+
+    /// How the values of one column sit across the store's parts, where they are integers.
+    ///
+    /// What a scan handed a set of keys can skip depends on this and on nothing else about the
+    /// column. `cast_info` in the IMDb load is written roughly in movie order, so the few movies a
+    /// selective filter leaves fall inside a few parts' ends and the rest are never opened, while
+    /// the same number of people are spread over every part. A planner that prices the two scans
+    /// alike puts them in the wrong order. `None` where the store kept no integer ends to say.
+    fn reach(&self, column: usize) -> Option<Reach> {
+        let _ = column;
+        None
+    }
+
+    /// Whether the store can find the rows holding a given set of values of this column without
+    /// testing every row, off a key map over the column or an adjacency from it to a parent's.
+    ///
+    /// A scan that can is read at those rows alone once the relations before it have narrowed the
+    /// column's values far enough, which changes what it costs to read it late. In JOB 9a the
+    /// people `cast_info` keeps are a few thousand of the four million in `name`, and `name` read
+    /// at them skips the `LIKE` over every name the whole scan runs. False where the store cannot.
+    fn gathers(&self, column: usize) -> bool {
+        let _ = column;
+        false
+    }
+
+    /// How many pairs of a value of this column and a part holding it the store has, measured on a
+    /// sample of its parts. Over the number of values it is how many parts one value's rows are in.
+    ///
+    /// One for a column the table is laid out by, and the rows a value has for one that is in no
+    /// order. `movie_info` is laid out by its type of information and then by movie, so a movie's
+    /// rows are in four parts, one a type, and the rows of a few movies of one type are in a part
+    /// each. `None` where the store cannot say.
+    fn placed(&self, column: usize) -> Option<f64> {
+        let _ = column;
+        None
+    }
+
+    /// The share of the column's rows `function` keeps, one of the `LIKE` family by its resolved
+    /// name or `=`, called with the column and the constant `pattern`, measured on a sample of the
+    /// rows.
+    ///
+    /// A pattern is the condition nothing else here can read, and the fifth a plan charges instead
+    /// is wrong by orders of magnitude on JOB in both directions. `None` where the store cannot
+    /// run it.
+    fn matching(&self, column: usize, function: &str, pattern: &str) -> Option<f64> {
+        let _ = (column, function, pattern);
+        None
+    }
+
+    /// The values of `key` in every row `function` keeps, called as [`Self::matching`] is, where
+    /// the table is small enough to run it over all of it and it keeps no more than `most` rows.
+    ///
+    /// A share of a sample says how many rows a condition keeps and not which. Which is what a join
+    /// wants: `k.keyword = 'character-name-in-title'` keeps one keyword of 134,170, that one keyword
+    /// is the most common in `movie_keyword` with 41,840 rows, and no share of the keywords can say
+    /// so. Handed the value, the frequency synopsis of the other side counts its rows outright. See
+    /// [`Frequencies::rows_with`]. `None` where the store cannot or will not run it.
+    fn picked(
+        &self,
+        column: usize,
+        function: &str,
+        pattern: &str,
+        key: usize,
+        most: usize,
+    ) -> Option<Vec<Bound>> {
+        let _ = (column, function, pattern, key, most);
+        None
+    }
+
+    /// The share of the column's rows that hold one of `values`, measured on a sample of the rows as
+    /// [`Self::matching`] measures a pattern.
+    ///
+    /// For the values [`Self::picked`] found where the frequency synopsis of this column does not
+    /// list them. `movie_info_idx` holds five types of information and its synopsis lists none of
+    /// them, so the ten rows of `bottom 10 rank` in JOB 12b were a fifth of the table by the
+    /// average and are none of a sample. `None` where the store cannot say.
+    fn holding(&self, column: usize, values: &[Bound]) -> Option<f64> {
+        let _ = (column, values);
+        None
+    }
+
+    /// The share of the parts whose ends hold one of `values`, and the share of the rows those
+    /// values are in when each part's rows are taken to be spread evenly over the integers between
+    /// its ends.
+    ///
+    /// For a column the table is laid out by, where the ends of a part say which values it holds.
+    /// `movie_info` is laid out by its type of information and then by movie, and the countries of
+    /// JOB 14b are in 390 of its 1,812 parts, where the average type is in 94. The rows are a
+    /// twelfth of the table, where a sample of four parts found a quarter. `None` where the store
+    /// cannot say.
+    fn spans(&self, column: usize, values: &[Bound]) -> Option<(f64, f64)> {
+        let _ = (column, values);
+        None
+    }
+
+    /// The table, the key column and the generation of the parent every row of this column was
+    /// found in exactly once, when the store linked the column and proved it.
+    ///
+    /// A join to such a parent keeps every child row once, so where nothing reads the parent the
+    /// join can go. In JOB 26b `name` is joined on `cast_info.person_id` and nothing else, and
+    /// holding it in the join tree forced `char_name` to be read whole before `cast_info` rather than
+    /// at the roles of the six movies left. The column is numbered as the parent's store numbers it,
+    /// and the caller checks the generation against that store's own. `None` where the store cannot
+    /// say.
+    fn total_link(&self, column: usize) -> Option<(String, usize, u64)> {
+        let _ = column;
+        None
+    }
+
+    /// Which version of its table the store holds, for checking a [`Self::total_link`] against.
+    fn generation(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// How the values of one column sit across a store's parts. See [`Zones::reach`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Reach {
+    /// How many parts the store has.
+    pub parts: u64,
+    /// How many integers lie between the smallest and the largest value of the column.
+    pub values: u64,
+    /// How many parts one value falls between the two ends of, on average over the values.
+    ///
+    /// One for a column written in order, and every part for a column written in no order at all.
+    pub per_value: f64,
+}
+
+impl Reach {
+    /// The share of the parts that `keys` values, spread over the column, fall inside the ends of.
+    ///
+    /// Each value lands inside a given part's ends with the chance `per_value / parts`, and a part
+    /// is opened when any of them does.
+    #[must_use]
+    pub fn touched(&self, keys: f64) -> f64 {
+        if self.parts == 0 {
+            return 1.0;
+        }
+        let one = (self.per_value / self.parts as f64).clamp(0.0, 1.0);
+        (1.0 - (1.0 - one).powf(keys.max(0.0))).clamp(0.0, 1.0)
+    }
 }
 
 /// A store that counted how many rows hold each value of a column, asked how many hold one value.
@@ -519,6 +660,27 @@ pub trait Frequencies: std::fmt::Debug + Send + Sync {
     ///
     /// [`rows_with`]: Self::rows_with
     fn remainder(&self, column: usize) -> Option<Remainder>;
+
+    /// How many times more rows a value somebody named holds than the average value does.
+    ///
+    /// A filter names the values it keeps, and the values people name are the ones that turn up.
+    /// Picked that way, in proportion to how many rows each holds, a value holds the sum of the
+    /// squares of the counts over the sum of the counts on average, and the ratio of that to the
+    /// plain average is this. It is one for a column where every value holds as many rows as any
+    /// other and grows with the skew. On the IMDb load `movie_keyword.keyword_id` is 133: the
+    /// eight keywords of JOB 6d reach 35,548 rows, the average says 270, and the average times this
+    /// says 35,929.
+    ///
+    /// With the ratio comes the count of the column's values, because the ratio is about a few
+    /// values named and not about many kept by a filter on something else. The German companies of
+    /// JOB 13a are ten thousand, a filter on the country picks them whatever their size, and they
+    /// hold 5.7 percent of `movie_companies` where the ratio of 400 would say all of it.
+    ///
+    /// `None` for a column with no synopsis or no count of its values.
+    fn skew(&self, column: usize) -> Option<(f64, u64)> {
+        let _ = column;
+        None
+    }
 }
 
 /// What a frequency synopsis left out of one column, for the caller that has to guess at it.

@@ -286,14 +286,19 @@ mod tests {
         let sequence = Sequence::new(&[b"special", b"requests"]).expect("an automaton");
         let mut walked = Vec::new();
         for part in 0..before.parts() {
-            walked.push(before.rows_holding(part, 0, &sequence, true).expect("a part"));
+            walked.push(
+                before
+                    .rows_holding(part, 0, std::slice::from_ref(&sequence), true)
+                    .expect("a part"),
+            );
         }
         drop(before);
         build_text_grams(&path, "orders").expect("build");
         let after = Catalog::open(&path).expect("reopen").table("orders").expect("the table");
         let mut kept = 0;
         for (part, walked) in walked.iter().enumerate() {
-            let sketched = after.rows_holding(part, 0, &sequence, true).expect("a part");
+            let sketched =
+                after.rows_holding(part, 0, std::slice::from_ref(&sequence), true).expect("a part");
             assert_eq!(&sketched, walked, "part {part}");
             kept += sketched.map_or(0, |rows| rows.len());
         }

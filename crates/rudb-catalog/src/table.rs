@@ -820,10 +820,10 @@ impl Rows {
         }
     }
 
-    /// The rows of one part whose string column `column` holds `sequence`'s pieces in order, or with
-    /// `negated` the rows whose column does not, nulls in neither, when the part can say without its
-    /// strings being read. `None` when it cannot, which is every part but a compressed text page of
-    /// a native file.
+    /// The rows of one part whose string column `column` holds the pieces of one of `sequences` in
+    /// order, or with `negated` the rows whose column holds none of them, nulls in neither, when
+    /// the part can say without its strings being read. `None` when it cannot, which is every part
+    /// but a compressed text page of a native file.
     ///
     /// # Errors
     ///
@@ -832,13 +832,13 @@ impl Rows {
         &self,
         at: usize,
         column: usize,
-        sequence: &Sequence,
+        sequences: &[Sequence],
         negated: bool,
     ) -> Result<Option<Vec<u32>>> {
         match self {
-            Self::Native(reader) => reader.rows_holding(at, column, sequence, negated),
+            Self::Native(reader) => reader.rows_holding(at, column, sequences, negated),
             Self::Grown(reader, _) if at < reader.parts() => {
-                reader.rows_holding(at, column, sequence, negated)
+                reader.rows_holding(at, column, sequences, negated)
             }
             Self::Memory(_) | Self::Grown(_, _) => Ok(None),
         }

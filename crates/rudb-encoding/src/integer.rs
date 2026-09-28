@@ -76,6 +76,10 @@ const RUN: usize = 8;
 /// [`RUN`] is the cheaper loop.
 const LONG_RUN: usize = 64;
 
+/// How many rows a run of an RLE chunk has to average before [`pointed`] says a few of its rows
+/// are cheaper found by walking the runs than by expanding the chunk.
+const RLE_WALKED: usize = 4;
+
 /// What a chunk is encoded as. The discriminant is the tag byte in the serialized form and is part
 /// of the format, so the numbers are written down rather than left to the compiler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,7 +398,8 @@ pub fn decode_selected(bytes: &[u8], positions: &[usize]) -> Result<Vec<i64>> {
 ///
 /// True for the kinds whose rows can be found without the rows before them: a constant, packed
 /// units, and strides or dictionary codes over packed units. A run length chunk walks every run to
-/// find where a row is, and a delta chunk adds up every delta before it, so for those a caller that
+/// find where a row is, which is cheaper than expanding it only when its runs are long, and a delta
+/// chunk adds up every delta before it, so for a delta chunk or one of short runs a caller that
 /// wants a few rows does better decoding the chunk the usual way and picking them out.
 #[must_use]
 pub fn pointed(bytes: &[u8]) -> bool {
@@ -412,6 +417,22 @@ pub fn pointed(bytes: &[u8]) -> bool {
         Some(Kind::Dict) => {
             let mut reader = Reader::new(bytes.get(1 + 4..).unwrap_or_default());
             skip_chunk(&mut reader).is_ok() && simple(reader.rest())
+        }
+        // Walking the runs costs a run length a run and expanding them a write a row, so a chunk
+        // whose runs are several rows long on average is cheaper walked. A key column stored in its
+        // own order, the way `cast_info.movie_id` is, has runs of about ten, and a scan narrowed by
+        // a join was expanding every part of it to keep a few rows. The tag and the row count come
+        // first, then the run values' tag and their count, which is the number of runs.
+        Some(Kind::Rle) => {
+            let word = |at: usize| {
+                bytes
+                    .get(at..at + 4)
+                    .map(|four| u32::from_le_bytes(four.try_into().expect("four bytes")) as usize)
+            };
+            match (word(1), word(1 + 4 + 1)) {
+                (Some(rows), Some(runs)) => runs.saturating_mul(RLE_WALKED) <= rows,
+                _ => false,
+            }
         }
         _ => false,
     }
@@ -2160,10 +2181,21 @@ mod tests {
             let expected = positions.iter().map(|&position| values[position]).collect::<Vec<_>>();
             assert_eq!(selected, expected, "{}", kind.name());
             let shape = describe(&bytes).unwrap();
-            let simple = !shape.contains("RLE") && !shape.contains("DELTA");
+            // A run length chunk on top whose runs average several rows walks its runs.
+            let simple = kind == Kind::Rle || (!shape.contains("RLE") && !shape.contains("DELTA"));
             assert_eq!(pointed(&bytes), simple, "{shape}");
             assert_eq!(run_length(&bytes), kind == Kind::Rle, "{shape}");
         }
+    }
+
+    #[test]
+    fn a_run_length_chunk_is_walked_only_when_its_runs_are_long() {
+        let long: Vec<i64> = (0..8192).map(|index| index / 10).collect();
+        let short: Vec<i64> = (0..8192).map(|index| index / 2 % 5).collect();
+        let long = encode_only(Kind::Rle, &long).unwrap().expect("runs apply");
+        let short = encode_only(Kind::Rle, &short).unwrap().expect("runs apply");
+        assert!(pointed(&long));
+        assert!(!pointed(&short));
     }
 
     #[test]

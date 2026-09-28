@@ -168,6 +168,30 @@ impl Validity {
         Self::Mask(mask).normalize(len)
     }
 
+    /// Validity out of a bitmap stored a byte at a time with the first row in the lowest bit, which
+    /// is how a page of the native format keeps its nulls, normalized.
+    ///
+    /// Eight bytes make a word in the order they are stored, so this is a copy and not a loop over
+    /// the rows. Going through [`Self::from_iter`] tested and cleared one bit a row with the word
+    /// it wrote a dependency of the next, and on JOB that was four percent of all the time spent
+    /// over the 113 queries, most of it on nullable columns such as `movie_companies.note`. The bits
+    /// past `len` are set, for the reason given on [`Self::from_run`].
+    #[must_use]
+    pub fn from_bytes(len: usize, bytes: &[u8]) -> Self {
+        let mut words = vec![u64::MAX; len.div_ceil(64)];
+        for (word, eight) in words.iter_mut().zip(bytes.chunks(8)) {
+            let mut held = [0xFF_u8; 8];
+            held[..eight.len()].copy_from_slice(eight);
+            *word = u64::from_le_bytes(held);
+        }
+        if len % 64 != 0 {
+            if let Some(last) = words.last_mut() {
+                *last |= u64::MAX << (len % 64);
+            }
+        }
+        Self::Mask(Bitmap { words }).normalize(len)
+    }
+
     /// Validity packed from one byte a row, which is what a kernel that accumulated its answer in a
     /// `Vec<bool>` is holding when it finishes.
     ///
@@ -381,6 +405,25 @@ mod tests {
         assert!(Validity::Mask(mask.clone()).is_valid(3));
         mask.set(3, false);
         assert!(!Validity::Mask(mask).is_valid(3));
+    }
+
+    /// A stored bitmap read eight bytes at a time is the validity a bit at a time read builds, for
+    /// lengths on and off a word and a byte, with bits set past the end of the last byte.
+    #[test]
+    fn a_stored_bitmap_read_a_word_at_a_time_is_the_one_read_a_bit_at_a_time() {
+        for len in [1_usize, 7, 8, 9, 63, 64, 65, 130, 1024, 1031] {
+            let mut bytes: Vec<u8> =
+                (0..len.div_ceil(8)).map(|at| (at * 37 + 11) as u8 ^ 0x5A).collect();
+            if let Some(last) = bytes.last_mut() {
+                *last |= 0x80;
+            }
+            let by_bit = Validity::from_iter(len, |row| bytes[row / 8] >> (row % 8) & 1 == 1);
+            assert_eq!(Validity::from_bytes(len, &bytes), by_bit, "{len} rows");
+            let all = vec![0xFF_u8; len.div_ceil(8)];
+            assert_eq!(Validity::from_bytes(len, &all), Validity::AllValid, "{len} rows");
+            let none = vec![0_u8; len.div_ceil(8)];
+            assert_eq!(Validity::from_bytes(len, &none), Validity::AllInvalid, "{len} rows");
+        }
     }
 
     #[test]
