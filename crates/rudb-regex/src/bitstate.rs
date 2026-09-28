@@ -48,18 +48,20 @@ pub(crate) fn fits(program: &Program, text: &str) -> bool {
     program.insts.len().saturating_mul(text.len() + 1) <= MAX_BITS
 }
 
-/// Runs the program, with the same arguments and the same answer as [`crate::vm::search`].
+/// Runs the program, with the same arguments and the same answer as [`crate::vm::search`], leaving
+/// the slots in `found` so that a caller running it once a row allocates nothing.
 pub(crate) fn search(
     program: &Program,
     text: &str,
     start: usize,
     whole: bool,
-) -> Option<Vec<Option<usize>>> {
+    found: &mut Vec<Option<usize>>,
+) -> bool {
     CACHE.with(|cache| match cache.try_borrow_mut() {
-        Ok(mut cache) => cache.search(program, text, start, whole),
+        Ok(mut cache) => cache.search(program, text, start, whole, found),
         // Nothing on this path calls back into it, so the cache is never already borrowed. Building
         // one rather than panicking costs a few allocations on a call that does not happen.
-        Err(_) => Cache::default().search(program, text, start, whole),
+        Err(_) => Cache::default().search(program, text, start, whole, found),
     })
 }
 
@@ -99,7 +101,8 @@ impl Cache {
         text: &str,
         start: usize,
         whole: bool,
-    ) -> Option<Vec<Option<usize>>> {
+        found: &mut Vec<Option<usize>>,
+    ) -> bool {
         let stride = text.len() + 1;
         let words = program.insts.len() * stride / 32 + 1;
         self.visited.clear();
@@ -115,17 +118,21 @@ impl Cache {
                 // Every byte the prefilter skips is the whole machine not run. It only ever skips
                 // past positions no match could begin at, so the answer is the same one a search
                 // from every position gives, which is what the test against `vm` holds it to.
-                at = program.first.skip(bytes, at)?;
+                match program.first.skip(bytes, at) {
+                    Some(next) => at = next,
+                    None => return false,
+                }
             }
             self.slots.clear();
             self.slots.resize(width, None);
             if self.run(program, text, bytes, at, whole, stride) {
-                return Some(self.slots.clone());
+                found.clone_from(&self.slots);
+                return true;
             }
             if !everywhere {
-                return None;
+                return false;
             }
-            let (_, size) = read(bytes, text, at)?;
+            let Some((_, size)) = read(bytes, text, at) else { return false };
             at += size;
         }
     }
@@ -143,67 +150,70 @@ impl Cache {
         self.jobs.clear();
         self.jobs.push(Job::Step { pc: 0, at: from });
         while let Some(job) = self.jobs.pop() {
-            let (pc, at) = match job {
+            let (mut pc, mut at) = match job {
                 Job::Restore { slot, value } => {
                     self.slots[slot] = value;
                     continue;
                 }
                 Job::Step { pc, at } => (pc, at),
             };
-            let cell = pc * stride + at;
-            if self.visited[cell / 32] >> (cell % 32) & 1 == 1 {
-                continue;
-            }
-            self.visited[cell / 32] |= 1 << (cell % 32);
-            // The arms that read a character fall out of the match with what they read, and the
-            // ones that read a position have already pushed whatever comes next and are done.
-            let step = match program.insts[pc] {
-                Inst::Char(want) => read(bytes, text, at).filter(|&(ch, _)| ch == want),
-                Inst::Set(id) => {
-                    read(bytes, text, at).filter(|&(ch, _)| program.sets[id].contains(ch))
+            // The first way on is walked here rather than pushed and popped straight back off,
+            // which is the same order and most of the work when a pattern has one way on.
+            loop {
+                let cell = pc * stride + at;
+                if self.visited[cell / 32] >> (cell % 32) & 1 == 1 {
+                    break;
                 }
-                Inst::Any(newline) => {
-                    read(bytes, text, at).filter(|&(ch, _)| newline || ch != '\n')
-                }
-                Inst::Assert(assertion) => {
-                    if holds(assertion, text, at) {
-                        self.jobs.push(Job::Step { pc: pc + 1, at });
+                self.visited[cell / 32] |= 1 << (cell % 32);
+                let read = match program.insts[pc] {
+                    Inst::Char(want) => read(bytes, text, at).filter(|&(ch, _)| ch == want),
+                    Inst::Set(id) => {
+                        read(bytes, text, at).filter(|&(ch, _)| program.sets[id].contains(ch))
                     }
-                    continue;
-                }
-                Inst::Save(slot) => {
-                    // The undo goes on first so that it comes off last, after everything the rest
-                    // of the program pushes on top of it has been walked and has failed.
-                    if slot < self.slots.len() {
-                        self.jobs.push(Job::Restore { slot, value: self.slots[slot] });
-                        self.slots[slot] = Some(at);
+                    Inst::Any(newline) => {
+                        read(bytes, text, at).filter(|&(ch, _)| newline || ch != '\n')
                     }
-                    self.jobs.push(Job::Step { pc: pc + 1, at });
-                    continue;
-                }
-                Inst::Split(first, second) => {
-                    self.jobs.push(Job::Step { pc: second, at });
-                    self.jobs.push(Job::Step { pc: first, at });
-                    continue;
-                }
-                Inst::Jump(to) => {
-                    self.jobs.push(Job::Step { pc: to, at });
-                    continue;
-                }
-                Inst::Match => {
-                    // A whole text match that has text left over is not one, and this branch dies
-                    // rather than the search stopping, because another one may still reach the end.
-                    if whole && at != text.len() {
+                    Inst::Assert(assertion) => {
+                        if !holds(assertion, text, at) {
+                            break;
+                        }
+                        pc += 1;
                         continue;
                     }
-                    if let Some(end) = self.slots.get_mut(1) {
-                        *end = Some(at);
+                    Inst::Save(slot) => {
+                        // The undo goes on the stack so that it comes off after everything the
+                        // rest of the program leaves there has been walked and has failed.
+                        if slot < self.slots.len() {
+                            self.jobs.push(Job::Restore { slot, value: self.slots[slot] });
+                            self.slots[slot] = Some(at);
+                        }
+                        pc += 1;
+                        continue;
                     }
-                    return true;
-                }
-            };
-            if let Some((_, size)) = step {
-                self.jobs.push(Job::Step { pc: pc + 1, at: at + size });
+                    Inst::Split(first, second) => {
+                        self.jobs.push(Job::Step { pc: second, at });
+                        pc = first;
+                        continue;
+                    }
+                    Inst::Jump(to) => {
+                        pc = to;
+                        continue;
+                    }
+                    Inst::Match => {
+                        // A whole text match that has text left over is not one, and this branch
+                        // dies rather than the search stopping, because another may reach the end.
+                        if whole && at != text.len() {
+                            break;
+                        }
+                        if let Some(end) = self.slots.get_mut(1) {
+                            *end = Some(at);
+                        }
+                        return true;
+                    }
+                };
+                let Some((_, size)) = read else { break };
+                pc += 1;
+                at += size;
             }
         }
         false
@@ -317,8 +327,11 @@ mod tests {
                         if !text.is_char_boundary(start) {
                             continue;
                         }
+                        let mut found = Vec::new();
+                        let ours =
+                            search(&program, text, start, whole, &mut found).then_some(found);
                         assert_eq!(
-                            search(&program, text, start, whole),
+                            ours,
                             vm::search(&program, text, start, whole),
                             "{pattern:?} over {text:?} from {start} whole {whole}"
                         );
@@ -337,7 +350,7 @@ mod tests {
         let program = compile(&ast, groups).expect("compiles");
         let text = "a".repeat(2000);
         assert!(fits(&program, &text));
-        assert_eq!(search(&program, &text, 0, false), None);
+        assert!(!search(&program, &text, 0, false, &mut Vec::new()));
     }
 
     /// A pattern big enough to be worth an exponential number of steps is also big enough that the
