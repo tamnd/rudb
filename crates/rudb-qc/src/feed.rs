@@ -53,6 +53,11 @@ pub(crate) struct Feed<'a> {
     module: &'a Module,
     tiers: &'a Tiers,
     func: usize,
+    /// The version of the body for a morsel with no NULL in the columns it reads.
+    nonull: Option<usize>,
+    /// The rows the pipeline's input has, when that is known, which the tier of a version is
+    /// picked by.
+    rows: Option<usize>,
     body: &'a Body,
     steps: Vec<Step>,
     columns: &'a [Column],
@@ -183,6 +188,8 @@ impl<'a> Feed<'a> {
             module,
             tiers,
             func,
+            nonull: body.nonull.as_deref().and_then(|name| tiers.func(name)),
+            rows: None,
             body,
             steps,
             columns,
@@ -209,6 +216,9 @@ impl<'a> Feed<'a> {
     /// A worker with a runtime of its own and its state as init leaves it.
     fn worker(&self) -> Worker {
         self.tiers.joined(self.func);
+        if let Some(f) = self.nonull {
+            self.tiers.joined(f);
+        }
         let mut rt = self.lock().rt.worker();
         if self.split
             && let Out::Aggregate(g) = &self.body.sink
@@ -227,6 +237,12 @@ impl<'a> Feed<'a> {
             bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
         }
         Worker { rt, state, out: Vec::new() }
+    }
+
+    /// Says that the pipeline's input has `rows` rows, when that is known.
+    pub(crate) fn sized(mut self, rows: Option<usize>) -> Self {
+        self.rows = rows;
+        self
     }
 
     /// Says that only a top N over `keys` of `count` rows, skipped ones included, reads what this
@@ -478,7 +494,17 @@ impl<'a> Feed<'a> {
             Out::Aggregate(_) => tier::Sink::Aggregate,
             Out::Build(_) => tier::Sink::Build,
         };
-        let start = self.tiers.start(self.func);
+        // A morsel with no NULL in what the body reads runs the version that checks none, which is
+        // a guard checked before the call and so never sent back.
+        let mut f = self.func;
+        if let Some(v) = self.nonull
+            && held.iter().all(|h| h.clean)
+            && self.tiers.speculate(v)
+        {
+            self.tiers.prepare(self.module, v, self.rows, !self.body.probes.is_empty());
+            f = v;
+        }
+        let start = self.tiers.start(f);
         'attempt: loop {
             buffers.clear();
             if let Out::Result { count, columns, capacity } = &self.body.sink {
@@ -504,9 +530,9 @@ impl<'a> Feed<'a> {
             }
             let st = state.as_mut_ptr().cast::<u8>();
             // The tier is picked once per morsel, so a switch only ever happens between two.
-            let native = self.tiers.morsel(self.func, sink);
+            let native = self.tiers.morsel(f, sink);
             loop {
-                let status = self.tiers.call(native, self.func, st, (&raw const morsel).cast(), rt);
+                let status = self.tiers.call(native, f, st, (&raw const morsel).cast(), rt);
                 match Status(status).kind() {
                     Kind::Ok => break 'attempt,
                     // The body saved where it got to in the header's cursor and picks up there.
@@ -524,13 +550,27 @@ impl<'a> Feed<'a> {
                         })?;
                         continue 'attempt;
                     }
+                    // A guard failed inside the body. Only a result sink starts the morsel over
+                    // from nothing, so only there is it run again on the guard's fallback.
+                    Kind::Deopt if matches!(self.body.sink, Out::Result { .. }) => {
+                        let fallback = usize::try_from(Status(status).payload())
+                            .ok()
+                            .and_then(|at| self.module.guards.get(at))
+                            .and_then(|g| self.tiers.func(&g.fallback))
+                            .filter(|&back| back != f)
+                            .ok_or_else(|| self.check(Status(status), rt))?;
+                        self.tiers.deopt(f);
+                        self.tiers.prepare(self.module, fallback, self.rows, false);
+                        f = fallback;
+                        continue 'attempt;
+                    }
                     _ => return Err(self.check(Status(status), rt)),
                 }
             }
         }
         drop(held);
         if let Some(start) = start {
-            self.tiers.ran(self.module, self.func, rows, start);
+            self.tiers.ran(self.module, f, rows, start);
         }
         if let Out::Result { count, columns, .. } = &self.body.sink {
             let st = bytes(state);
@@ -615,8 +655,8 @@ impl<'a> Feed<'a> {
                 };
                 Error::new(code, site.text.clone())
             }
-            // No body in C1 has a guard, and only a result sink past a probe grows, so these are
-            // bugs.
+            // A guard that fails in a body that cannot start its morsel over, or names no
+            // fallback, and a body that grows that is not a result sink past a probe, are bugs.
             Kind::Deopt => Error::internal(format!("a pipeline deoptimized at {s:?}")),
             Kind::NeedMemory => Error::internal(format!("a pipeline asked for memory, {s:?}")),
             _ => Error::internal(format!("a pipeline returned status {s:?}")),
@@ -647,6 +687,8 @@ fn bytes(state: &mut [Line]) -> &mut [u8] {
 struct Held<'c> {
     values: *const u8,
     valid: Vec<u8>,
+    /// Whether the column has no NULL in the morsel.
+    clean: bool,
     /// The `str16` headers of a string column, which `values` points at.
     _text: Vec<u128>,
     _chunk: std::marker::PhantomData<&'c Vector>,
@@ -655,10 +697,13 @@ struct Held<'c> {
 impl<'c> Held<'c> {
     fn of(v: &'c Vector, rows: usize) -> Result<Held<'c>> {
         let mut valid = vec![0xffu8; rows.div_ceil(8)];
+        let mut clean = true;
         if !matches!(v.validity(), Validity::AllValid) {
             valid.fill(0);
             for i in 0..rows {
-                if !v.is_null_at(i) {
+                if v.is_null_at(i) {
+                    clean = false;
+                } else {
                     valid[i / 8] |= 1 << (i % 8);
                 }
             }
@@ -697,7 +742,7 @@ impl<'c> Held<'c> {
             }
             _ => return Err(Error::internal("a column of a type the generator refuses")),
         };
-        Ok(Held { values, valid, _text: text, _chunk: std::marker::PhantomData })
+        Ok(Held { values, valid, clean, _text: text, _chunk: std::marker::PhantomData })
     }
 
     fn col(&self) -> Col {

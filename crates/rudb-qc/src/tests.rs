@@ -110,10 +110,11 @@ fn answer(text: &str, options: Options) -> Result<Answer> {
         pool: &pool,
     };
     let answer = compiled.run(&plan, under)?;
-    // A named tier compiles every pipeline that ran, and `auto` leaves the small ones on `interp`.
+    // A named tier compiles every function that ran, and `auto` leaves the small ones on
+    // `interp`. The version of a body for morsels with no NULL is compiled only when one comes.
     let report = &answer.report;
     if matches!(options.tier, Tier::Clif | Tier::Direct) {
-        assert_eq!(report.native, report.functions, "{report}");
+        assert!(report.native > 0 && report.fallbacks.is_empty(), "{report}");
     }
     Ok(answer)
 }
@@ -161,6 +162,17 @@ fn a_named_tier_compiles_a_pipeline_when_it_starts_and_not_before() {
         let answer = answer(SCAN, options).expect("the scan runs");
         assert_eq!((answer.report.small, answer.report.native), (0, 1), "{tier}");
     }
+}
+
+#[test]
+fn a_morsel_with_no_null_runs_the_version_that_checks_none_and_one_with_a_null_does_not() {
+    let clean = "Aggregate #1 groups=[] aggregates=[count(#0.0::INTEGER)::BIGINT, sum(#0.0::INTEGER)::HUGEINT, min(#0.0::INTEGER)::INTEGER]\n  Get memory.main.big AS big #0 [x::INTEGER]";
+    same(clean, true);
+    let options = Options { tier: Tier::Interp, ..Options::default() };
+    let report = answer(clean, options).expect("the aggregate runs").report;
+    assert_eq!((report.nonull, report.deopts), (1, 0), "{report}");
+    let report = answer(SCAN, options).expect("the scan runs").report;
+    assert_eq!(report.nonull, 0, "{report}");
 }
 
 #[test]
