@@ -271,6 +271,11 @@ enum Shape {
     /// [`Shape::Discrete`] but only takes numbers, an unsigned one widened to the signed type the
     /// pin widens it to, and a sample size that fits an INTEGER.
     Sampled,
+    /// `approx_quantile(x, q)`, which answers from a t-digest. A fraction has to cast to a FLOAT
+    /// without a DOUBLE in the way, and the types held are the pin's: one fraction casts a DECIMAL
+    /// to the integer it is stored as and widens a TINYINT or a FLOAT, while a list of fractions
+    /// keeps both.
+    Digested,
     /// `median(x)`, which is [`Shape::Continuous`] over anything that interpolates, an INTERVAL
     /// included, and a value as given over anything else.
     Median,
@@ -1086,6 +1091,7 @@ const TABLE: &[Entry] = &[
     aggregate("quantile_cont", Arity::exactly(2), Shape::Continuous, false),
     aggregate("quantile_disc", Arity::exactly(2), Shape::Discrete, false),
     aggregate("reservoir_quantile", Arity::between(2, 3), Shape::Sampled, false),
+    aggregate("approx_quantile", Arity::exactly(2), Shape::Digested, false),
     aggregate("median", Arity::exactly(1), Shape::Median, false),
     aggregate("mad", Arity::exactly(1), Shape::Deviation, false),
     aggregate("mode", Arity::exactly(1), Shape::AsGiven, false),
@@ -1512,6 +1518,7 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             (vec![held.clone(), fraction.clone()], fractioned(fraction, held))
         }
         Shape::Sampled => sampled(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
+        Shape::Digested => digested(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
         Shape::Picked => match arguments {
             [arg, by] => (vec![arg.clone(), by.clone()], arg.clone()),
             [arg, by, _] => {
@@ -2034,6 +2041,54 @@ fn sampled(arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)>
         wanted.push(LogicalType::Integer);
     }
     Some((wanted, fractioned(&fraction, held)))
+}
+
+/// The argument types and answer of `approx_quantile`, or `None` when the pin has no overload for
+/// the call.
+fn digested(arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
+    let floats = |ty: &LogicalType| {
+        matches!(ty, LogicalType::Float | LogicalType::Decimal { .. } | LogicalType::Null)
+            || ty.is_integer()
+    };
+    let (fraction, listed) = match &arguments[1] {
+        LogicalType::List(element) if floats(element) => {
+            (LogicalType::list(LogicalType::Float), true)
+        }
+        ty if floats(ty) => (LogicalType::Float, false),
+        _ => return None,
+    };
+    let held = match &arguments[0] {
+        LogicalType::TinyInt if listed => LogicalType::TinyInt,
+        LogicalType::Float if listed => LogicalType::Float,
+        ty @ LogicalType::Decimal { .. } if listed => ty.clone(),
+        LogicalType::Decimal { width, .. } => match width {
+            ..=4 => LogicalType::SmallInt,
+            5..=9 => LogicalType::Integer,
+            10..=18 => LogicalType::BigInt,
+            _ => LogicalType::HugeInt,
+        },
+        LogicalType::TinyInt
+        | LogicalType::UTinyInt
+        | LogicalType::USmallInt
+        | LogicalType::UInteger
+        | LogicalType::Null => LogicalType::BigInt,
+        LogicalType::UBigInt => LogicalType::HugeInt,
+        LogicalType::UHugeInt | LogicalType::Float => LogicalType::Double,
+        LogicalType::TimestampS | LogicalType::TimestampMs | LogicalType::TimestampNs => {
+            LogicalType::Timestamp
+        }
+        ty @ (LogicalType::SmallInt
+        | LogicalType::Integer
+        | LogicalType::BigInt
+        | LogicalType::HugeInt
+        | LogicalType::Double
+        | LogicalType::Date
+        | LogicalType::Time
+        | LogicalType::Timestamp
+        | LogicalType::TimestampTz) => ty.clone(),
+        _ => return None,
+    };
+    Some((vec![held.clone(), fraction.clone()], fractioned(&fraction, held)))
 }
 
 /// A quantile's answer, which is a list of them when the fractions are a list.
@@ -3062,6 +3117,7 @@ impl Shape {
             // one row here stands for all of them.
             Self::Discrete | Self::Continuous => (leading(1, ANY, "DOUBLE"), ANY),
             Self::Sampled => ([ANY, "DOUBLE", "INTEGER"][..count.min(3)].to_vec(), ANY),
+            Self::Digested => (vec![ANY, "FLOAT"], ANY),
             Self::Median | Self::Deviation => (all(ANY), ANY),
             Self::Picked => (leading(2, ANY, "BIGINT"), ANY),
             Self::Histogram => (leading(1, ANY, ANY_LIST), "MAP"),
@@ -3619,6 +3675,7 @@ mod tests {
                     Shape::Continuous | Shape::Deviation => {
                         arguments = vec![LogicalType::Double; count];
                     }
+                    Shape::Digested => arguments = vec![LogicalType::Double, LogicalType::Float],
                     Shape::Sampled => {
                         arguments = vec![LogicalType::Double; count];
                         if count == 3 {

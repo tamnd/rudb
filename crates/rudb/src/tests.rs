@@ -11558,6 +11558,129 @@ fn hash_and_approx_count_distinct_answer_what_the_pin_does() {
 }
 
 #[test]
+fn approx_quantile_answers_what_the_pin_answers_and_refuses_what_it_refuses() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    // Every answer below is the pin's over the same rows.
+    for (sql, answer) in [
+        (
+            "SELECT approx_quantile(x, 0.5), approx_quantile(x::DOUBLE, 0.5) FROM range(1000) t(x)",
+            "500,499.5",
+        ),
+        ("SELECT approx_quantile(x, [0.1, 0.5, 0.9]) FROM range(1000) t(x)", "[100, 500, 899]"),
+        (
+            "SELECT approx_quantile(x::DOUBLE / 3, [0.1, 0.33, 0.9]) FROM range(1000) t(x)",
+            "[33.16666716337204, 109.83333770434064, 299.8333253860475]",
+        ),
+        ("SELECT approx_quantile(x, 0), approx_quantile(x, 1) FROM range(100) t(x)", "0,99"),
+        ("SELECT approx_quantile(x, 0.3) FROM (VALUES (1), (2), (3), (4)) t(x)", "2"),
+        ("SELECT approx_quantile(x, 0.5) FROM range(0) t(x)", "NULL"),
+        ("SELECT approx_quantile(NULL, 0.5)", "NULL"),
+        ("SELECT approx_quantile(x, 0.5) FROM (VALUES (1.5::DOUBLE), (NULL), (2.5)) t(x)", "2.0"),
+        ("SELECT approx_quantile(x, 0.5) FROM (VALUES ('inf'::DOUBLE), (1.0), (2.0)) t(x)", "1.5"),
+        (
+            "SELECT approx_quantile('2020-01-01'::DATE + x::INTEGER, 0.5) FROM range(10) t(x)",
+            "2020-01-05",
+        ),
+        (
+            "SELECT approx_quantile('2020-01-01'::TIMESTAMP + INTERVAL (x) DAY, 0.5) FROM range(10) t(x)",
+            "2020-01-05 12:00:00",
+        ),
+        (
+            "SELECT approx_quantile(x, 0.5) FROM (VALUES ('10:00:00'::TIME), ('11:00:00'::TIME)) t(x)",
+            "10:30:00",
+        ),
+        (
+            "SELECT approx_quantile((x / 10)::DECIMAL(4, 1), 0.5), approx_quantile((x / 10)::DECIMAL(4, 1), [0.5, 0.1]) FROM range(100) t(x)",
+            "5,[5.0, 1.0]",
+        ),
+        (
+            "SELECT approx_quantile((x / 7)::DECIMAL(18, 3), 0.5), approx_quantile((x / 7)::DECIMAL(18, 3), [0.5, 0.25]) FROM range(100) t(x)",
+            "7,[7.072, 3.500]",
+        ),
+        ("SELECT approx_quantile(x::TINYINT, 0.5) FROM (VALUES (127), (127)) t(x)", "127"),
+        (
+            "SELECT approx_quantile(x, 0.5) FROM (VALUES (9223372036854775807), (9223372036854775807)) t(x)",
+            "9223372036854775807",
+        ),
+        (
+            "SELECT approx_quantile(x, 0.5) FILTER (WHERE x > 10), approx_quantile(DISTINCT x % 10, 0.5) FROM range(100) t(x)",
+            "55,4",
+        ),
+        (
+            "SELECT x % 3 AS g, approx_quantile(x, 0.5) FROM range(100) t(x) GROUP BY g ORDER BY g",
+            "0,50;1,49;2,50",
+        ),
+        (
+            "SELECT approx_quantile(x, 0.5) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM range(5) t(x)",
+            "0;0;1;2;3",
+        ),
+        ("SELECT approx_quantile(x, []) FROM range(100) t(x)", "[]"),
+        ("SELECT approx_quantile(x, 0.5::FLOAT) FROM range(100) t(x)", "50"),
+        // The pin answers 2.2250738585072014e-308 here, above both values, which is tamnd/duckdb#16.
+        ("SELECT approx_quantile(x, 1.0) FROM (VALUES (-5.0::DOUBLE), (-3.0)) t(x)", "-3.0"),
+    ] {
+        assert_eq!(text(sql), answer, "{sql}");
+    }
+    let types = |ty: &str| {
+        text(&format!(
+            "SELECT typeof(approx_quantile(NULL::{ty}, 0.5)), typeof(approx_quantile(NULL::{ty}, [0.5]))"
+        ))
+    };
+    for (ty, answer) in [
+        ("TINYINT", "BIGINT,TINYINT[]"),
+        ("SMALLINT", "SMALLINT,SMALLINT[]"),
+        ("INTEGER", "INTEGER,INTEGER[]"),
+        ("HUGEINT", "HUGEINT,HUGEINT[]"),
+        ("UTINYINT", "BIGINT,BIGINT[]"),
+        ("UINTEGER", "BIGINT,BIGINT[]"),
+        ("UBIGINT", "HUGEINT,HUGEINT[]"),
+        ("UHUGEINT", "DOUBLE,DOUBLE[]"),
+        ("FLOAT", "DOUBLE,FLOAT[]"),
+        ("DOUBLE", "DOUBLE,DOUBLE[]"),
+        ("DECIMAL(4, 1)", "SMALLINT,DECIMAL(4,1)[]"),
+        ("DECIMAL(9, 2)", "INTEGER,DECIMAL(9,2)[]"),
+        ("DECIMAL(18, 3)", "BIGINT,DECIMAL(18,3)[]"),
+        ("DECIMAL(38, 2)", "HUGEINT,DECIMAL(38,2)[]"),
+        ("DATE", "DATE,DATE[]"),
+        ("TIMESTAMP_MS", "TIMESTAMP,TIMESTAMP[]"),
+        ("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE,TIMESTAMP WITH TIME ZONE[]"),
+    ] {
+        assert_eq!(types(ty), answer, "{ty}");
+    }
+    for (sql, message) in [
+        (
+            "SELECT approx_quantile(x, 1.5) FROM range(5) t(x)",
+            "APPROXIMATE QUANTILE can only take parameters in range [0, 1]",
+        ),
+        (
+            "SELECT approx_quantile(x, NULL) FROM range(5) t(x)",
+            "The \"quantile\" argument in function '\"approx_quantile\"' must not be NULL",
+        ),
+        (
+            "SELECT approx_quantile(x, [0.5, NULL]) FROM range(5) t(x)",
+            "APPROXIMATE QUANTILE parameter cannot be NULL",
+        ),
+        (
+            "SELECT approx_quantile(x, q) FROM range(5) t(x), (SELECT 0.5 AS q)",
+            "The \"quantile\" argument in function \"approx_quantile\" must be a constant expression",
+        ),
+        ("SELECT approx_quantile(x::VARCHAR, 0.5) FROM range(5) t(x)", "No function matches"),
+        ("SELECT approx_quantile(x::BOOLEAN, 0.5) FROM range(5) t(x)", "No function matches"),
+        ("SELECT approx_quantile(x, 0.5::DOUBLE) FROM range(5) t(x)", "No function matches"),
+    ] {
+        let error = db.execute(sql).expect_err(sql);
+        assert!(error.message().contains(message), "{sql}: {error}");
+    }
+}
+
+#[test]
 fn reservoir_quantile_picks_what_the_pin_picks_and_refuses_what_it_refuses() {
     let db = Database::new();
     let text = |sql: &str| {
