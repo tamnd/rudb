@@ -7422,7 +7422,7 @@ impl Reader {
         ) {
             return Ok(None);
         }
-        let (rows, counts) = match self.with_part(place, column, |bytes| {
+        let (rows, counts) = match self.with_part(part, column, |bytes| {
             if bytes.first() != Some(&5) || bytes.get(1) != Some(&0) {
                 return Ok(None);
             }
@@ -7474,7 +7474,7 @@ impl Reader {
             return Ok(None);
         }
         let rows = place.rows as usize;
-        self.with_part(place, column, |bytes| {
+        self.with_part(part, column, |bytes| {
             if bytes.first() != Some(&6) {
                 return Ok(None);
             }
@@ -7532,13 +7532,18 @@ impl Reader {
     }
 
     /// Runs `read` over the stored bytes of one column of one part, out of the stripe's page when
-    /// it is held and read off the file on their own when it is not.
+    /// it is held and out of the mapping or off the file when it is not.
+    ///
+    /// The checksum is asked once per reader, the way [`Self::read_impl`] asks it, and not once per
+    /// held page or once per read. A LIKE answered on the compressed text comes through here, and
+    /// on TPC-H q13 it hashed every `o_comment` part again on every run of the query.
     fn with_part<T>(
         &self,
-        place: Place,
+        part: usize,
         column: usize,
         read: impl FnOnce(&[u8]) -> Result<T>,
     ) -> Result<T> {
+        let place = *self.places.get(part).ok_or_else(|| invalid("part index out of range"))?;
         let stripe_index = place.stripe as usize;
         let stripe = self
             .table
@@ -7551,19 +7556,35 @@ impl Reader {
             .index
             .get(place.part as usize)
             .ok_or_else(|| invalid("part index out of range"))?;
-        match &held.page {
-            Some(page) => read(page.part(place.part as usize, span)?),
+        let bit = part * self.table.fields.len() + column;
+        let owned;
+        let bytes = match &held.page {
+            Some(held) if self.is_verified(bit) => part_bytes(held.bytes(), span)?,
+            Some(held) => {
+                held.part(place.part as usize, span).inspect(|_| self.set_verified(bit))?
+            }
             None => {
                 let offset = page
                     .offset
                     .checked_add(span.start as u64)
                     .ok_or_else(|| invalid("part range overflow"))?;
-                let mut bytes = vec![0; span.length];
-                read_at(&self.file, offset, &mut bytes)?;
-                verify_part(&bytes, span)?;
-                read(&bytes)
+                let bytes = match self.map.as_deref().and_then(|map| map.get(offset, span.length)) {
+                    Some(bytes) => bytes,
+                    None => {
+                        let mut bytes = vec![0; span.length];
+                        read_at(&self.file, offset, &mut bytes)?;
+                        owned = bytes;
+                        owned.as_slice()
+                    }
+                };
+                if !self.is_verified(bit) {
+                    verify_part(bytes, span)?;
+                    self.set_verified(bit);
+                }
+                bytes
             }
-        }
+        };
+        read(bytes)
     }
 
     /// Reads named columns from one part, only at the rows `positions` names.
@@ -17857,6 +17878,32 @@ mod tests {
         let error = fresh.read_rows(0, &[0], &[0, 1], false).expect_err("a new reader checks");
         assert!(error.message().contains("column page checksum differs"), "{error}");
         assert_eq!(first.len(), 2);
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A tally and a LIKE on the compressed text remember what they checked in the same place a
+    /// read does, so a read after them does not hash the part again.
+    #[test]
+    fn a_part_a_filter_read_is_not_checked_again() {
+        let path = path("checked-by-filter");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("id", LogicalType::Integer),
+                Field::new("text", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        writer.append(&sample()).expect("stripe written");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        reader.integer_tally(0, 0).expect("tallied");
+        assert!(reader.is_verified(0), "the tally checked the integer part");
+        let sequence = Sequence::new(&[b"a".as_slice()]).expect("a sequence");
+        reader.rows_holding(0, 1, &sequence, false).expect("answered");
+        assert!(reader.is_verified(1), "the LIKE checked the text part");
         fs::remove_file(path).expect("remove scratch file");
     }
 
