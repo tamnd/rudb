@@ -9,9 +9,11 @@
 //! A pipeline over a base table reads it through the first engine. The plan is cloned with the
 //! `Get` node as its root, built by `rudb_exec` into a query whose root is a sink of ours, and
 //! every chunk the scan produces is handed to the compiled body as one morsel. That is what keeps
-//! the storage layer, the zone maps and the pushed down filters out of this crate, and it is also
-//! where C1 stops: the sink says it is not parallel, because one [`Rt`] serves the whole query and
-//! per worker state is C3.
+//! the storage layer, the zone maps and the pushed down filters out of this crate. An aggregate
+//! over a scan runs on as many workers as the scan has threads, each with its own state and its
+//! own [`Rt`] made by [`Rt::worker`], and each worker's groups are folded into the query's as it
+//! finishes. A pipeline that produces rows or builds a join table still runs on one, because the
+//! order its rows come out in is part of the answer.
 //!
 //! The breakers between pipelines are run here over the rows the pipeline before them produced,
 //! and so is the fetch that reads whole rows back once a top N has picked them.
@@ -23,6 +25,7 @@
 
 mod feed;
 mod finish;
+mod merge;
 mod tier;
 
 use std::time::Instant;

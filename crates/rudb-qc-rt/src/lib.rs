@@ -16,4 +16,4 @@ mod rt;
 pub mod table;
 pub mod text;
 
-pub use rt::{Kernel, RUNTIME_ERROR, Rt, hash};
+pub use rt::{Kernel, Maker, RUNTIME_ERROR, Rt, hash};

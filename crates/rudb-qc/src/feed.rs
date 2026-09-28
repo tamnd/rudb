@@ -32,7 +32,7 @@ use rudb_plan::Plan;
 use rudb_qc_gen::{Body, Out};
 use rudb_qc_ir::status::{Kind, Status};
 use rudb_qc_ir::{ErrorKind, Module};
-use rudb_qc_pipe::{Pipeline, Step};
+use rudb_qc_pipe::{Pipeline, Source, Step};
 use rudb_qc_plan::Column;
 use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
 use rudb_qc_rt::{RUNTIME_ERROR, Rt, text};
@@ -40,6 +40,7 @@ use rudb_vector::{Chunk, Data, Validity, Vector};
 
 use crate::Under;
 use crate::finish::{self, Cell, cell, vector};
+use crate::merge;
 use crate::tier::{self, Tiers};
 
 /// One pipeline being run.
@@ -51,7 +52,21 @@ pub(crate) struct Feed<'a> {
     steps: Vec<Step>,
     columns: &'a [Column],
     cancel: Cancel,
+    /// Whether the scan may run this pipeline on many workers at once, each with its own state and
+    /// runtime, folded together as each one finishes.
+    parallel: bool,
+    /// The state as init left it, which a worker's starts as.
+    template: Vec<Line>,
+    /// How an aggregate's workers fold their groups together, and its distinct sets.
+    folds: Vec<merge::Fold>,
+    sets: Vec<u64>,
     inner: Mutex<Inner<'a>>,
+}
+
+/// One worker of a parallel pipeline.
+pub(crate) struct Worker {
+    rt: Rt,
+    state: Vec<Line>,
 }
 
 /// What a call changes.
@@ -63,6 +78,8 @@ struct Inner<'a> {
     out: Vec<Chunk>,
     /// Whether the body said the pipeline may stop.
     done: bool,
+    /// Whether a worker has been folded into the runtime yet.
+    merged: bool,
 }
 
 /// One cache line of state.
@@ -98,9 +115,7 @@ impl<'a> Feed<'a> {
         let mut state = vec![Line([0; 64]); (body.state as usize).div_ceil(64).max(1)];
         // Init. With one worker the local state is the shared state, so the header points at its
         // own block, which never moves because the vector is never grown.
-        let header = StateHeader::new(state.as_ptr().cast());
-        // SAFETY: the first line of the state is 64 bytes aligned to 64, which is the header.
-        unsafe { state.as_mut_ptr().cast::<StateHeader>().write(header) };
+        head(&mut state);
         if let Out::Aggregate(g) = &body.sink
             && let Some(at) = g.row
         {
@@ -130,6 +145,12 @@ impl<'a> Feed<'a> {
             }
         }
         let cancel = cancel.clone();
+        let (parallel, folds, sets) = match &body.sink {
+            Out::Aggregate(g) if matches!(p.source, Source::Scan { .. }) => {
+                (true, merge::folds(g)?, merge::sets(g))
+            }
+            _ => (false, Vec::new(), Vec::new()),
+        };
         Ok(Feed {
             module,
             tiers,
@@ -138,8 +159,44 @@ impl<'a> Feed<'a> {
             steps,
             columns,
             cancel,
-            inner: Mutex::new(Inner { rt, state, out: Vec::new(), done: false }),
+            parallel,
+            template: state.clone(),
+            folds,
+            sets,
+            inner: Mutex::new(Inner { rt, state, out: Vec::new(), done: false, merged: false }),
         })
+    }
+
+    /// A worker with a runtime of its own and its state as init leaves it.
+    fn worker(&self) -> Worker {
+        let rt = self.lock().rt.worker();
+        let mut state = self.template.clone();
+        head(&mut state);
+        if let Out::Aggregate(g) = &self.body.sink
+            && let Some(at) = g.row
+            && let Some(table) = rt.table(g.table)
+        {
+            // The worker's own one group, which its table made when it was made.
+            let row = table.address(0) as u64;
+            bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
+        }
+        Worker { rt, state }
+    }
+
+    /// Folds a worker that has seen its last morsel into the query's runtime. The first one is
+    /// taken as it is, so a pipeline that ran on one worker folds nothing.
+    fn fold(&self, worker: Worker) -> Result<()> {
+        let Out::Aggregate(g) = &self.body.sink else {
+            return Err(Error::internal("a parallel pipeline that is not an aggregate"));
+        };
+        let mut inner = self.lock();
+        if inner.merged {
+            inner.rt.absorb(worker.rt, g.table, &self.sets, |d, s| merge::fold(&self.folds, d, s))
+        } else {
+            inner.merged = true;
+            inner.rt.adopt(worker.rt, g.table, &self.sets);
+            Ok(())
+        }
     }
 
     /// Runs the body over every chunk of a scan, by building `scan` in the first engine with this
@@ -160,6 +217,23 @@ impl<'a> Feed<'a> {
 
     /// Runs the body over one chunk, and says whether the pipeline wants more.
     pub(crate) fn push(&self, chunk: &Chunk) -> Result<Progress> {
+        let mut inner = self.lock();
+        if inner.done {
+            return Ok(Progress::Done);
+        }
+        let Inner { rt, state, out, done, .. } = &mut *inner;
+        self.run(chunk, rt, state, out, done)
+    }
+
+    /// Runs the body over one chunk against `rt` and `state`.
+    fn run(
+        &self,
+        chunk: &Chunk,
+        rt: &mut Rt,
+        state: &mut [Line],
+        out: &mut Vec<Chunk>,
+        done: &mut bool,
+    ) -> Result<Progress> {
         let chunk = chunk.clone().settled()?.into_flat()?;
         let rows = chunk.len();
         if rows == 0 {
@@ -181,13 +255,8 @@ impl<'a> Feed<'a> {
             flags: 0,
             cols: cols.as_ptr(),
         };
-        let mut inner = self.lock();
-        if inner.done {
-            return Ok(Progress::Done);
-        }
         let mut room = rows;
         let mut buffers = Vec::new();
-        let Inner { rt, state, out, done } = &mut *inner;
         let sink = match &self.body.sink {
             Out::Result { .. } => tier::Sink::Result,
             Out::Aggregate(_) => tier::Sink::Aggregate,
@@ -338,6 +407,13 @@ struct Buffers {
     valid: Vec<u8>,
 }
 
+/// Writes the state header, which points at the state's own block.
+fn head(state: &mut [Line]) {
+    let header = StateHeader::new(state.as_ptr().cast());
+    // SAFETY: the first line of the state is 64 bytes aligned to 64, which is the header.
+    unsafe { state.as_mut_ptr().cast::<StateHeader>().write(header) };
+}
+
 /// The state as bytes.
 fn bytes(state: &mut [Line]) -> &mut [u8] {
     // SAFETY: a `Line` is 64 bytes with no padding and any byte pattern is one.
@@ -416,20 +492,28 @@ impl fmt::Debug for Scan<'_, '_> {
 }
 
 impl Sink for Scan<'_, '_> {
-    type Local = ();
+    type Local = Option<Worker>;
 
-    fn local(&self) -> Self::Local {}
+    fn local(&self) -> Self::Local {
+        self.0.parallel.then(|| self.0.worker())
+    }
 
     fn parallel(&self) -> bool {
-        false
+        self.0.parallel
     }
 
-    fn sink(&self, chunk: &Chunk, _local: &mut Self::Local) -> Result<Progress> {
-        self.0.push(chunk)
+    fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress> {
+        match local {
+            Some(w) => self.0.run(chunk, &mut w.rt, &mut w.state, &mut Vec::new(), &mut false),
+            None => self.0.push(chunk),
+        }
     }
 
-    fn combine(&self, _local: Self::Local) -> Result<()> {
-        Ok(())
+    fn combine(&self, local: Self::Local) -> Result<()> {
+        match local {
+            Some(w) => self.0.fold(w),
+            None => Ok(()),
+        }
     }
 
     fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {

@@ -144,6 +144,49 @@ impl GroupTable {
     pub unsafe fn insert(&mut self, key: usize, hash: u64, heap: &mut Heap) -> usize {
         // SAFETY: the caller's contract.
         let key = unsafe { crate::mem::slice(key, self.layout.key_size as usize) };
+        let gid = self.find_or_add(key, hash, heap);
+        self.rows[gid]
+    }
+
+    /// Folds every group of `other` into this table. A group this table does not have yet is made,
+    /// and then `combine` gets its row and the row from `other`, so a new group is combined into
+    /// its starting accumulators the same way an old one is. `map` gets the group id each group of
+    /// `other` landed on, in order, for the state that is kept by group id outside the rows.
+    ///
+    /// The two tables must have the same layout, which a worker's copy of a table does.
+    pub fn absorb(
+        &mut self,
+        other: &GroupTable,
+        heap: &mut Heap,
+        map: &mut Vec<usize>,
+        mut combine: impl FnMut(&mut [u8], &[u8]),
+    ) {
+        map.clear();
+        // A table with no keys made its one group without a slot, so it is never found by key.
+        if self.layout.keys.is_empty() {
+            if !other.is_empty() && !self.is_empty() {
+                combine(self.row_mut(0), other.row(0));
+                map.push(0);
+            }
+            return;
+        }
+        let size = self.layout.key_size as usize;
+        for gid in 0..other.len() {
+            let src = other.row(gid);
+            let at = self.find_or_add(&src[8..8 + size], other.hashes[gid], heap);
+            map.push(at);
+            combine(self.row_mut(at), src);
+        }
+    }
+
+    fn row_mut(&mut self, gid: usize) -> &mut [u8] {
+        let page = gid / ROWS_PER_PAGE;
+        let at = (gid % ROWS_PER_PAGE) * self.row_size;
+        &mut self.pages[page][at..at + self.row_size]
+    }
+
+    /// The group id of `key`, made if it is new.
+    fn find_or_add(&mut self, key: &[u8], hash: u64, heap: &mut Heap) -> usize {
         let mask = self.slots.len() - 1;
         let mut at = (hash as usize) & mask;
         loop {
@@ -153,7 +196,7 @@ impl GroupTable {
             }
             let gid = (slot - 1) as usize;
             if self.hashes[gid] == hash && self.same(gid, key) {
-                return self.rows[gid];
+                return gid;
             }
             at = (at + 1) & mask;
         }
@@ -162,7 +205,7 @@ impl GroupTable {
         if self.rows.len() * 2 > self.slots.len() {
             self.grow();
         }
-        self.rows[gid]
+        gid
     }
 
     fn same(&self, gid: usize, key: &[u8]) -> bool {
@@ -274,6 +317,30 @@ impl Distinct {
         if !self.texts[gid].contains(v) {
             self.texts[gid].insert(v.into());
         }
+    }
+
+    /// Folds the sets of `other` into these, the sets of its group `g` into those of `map[g]`.
+    pub fn absorb(&mut self, other: Distinct, map: &[usize]) {
+        fn fold<T: Eq + std::hash::Hash>(
+            to: &mut Vec<HashSet<T>>,
+            from: Vec<HashSet<T>>,
+            map: &[usize],
+        ) {
+            for (gid, set) in from.into_iter().enumerate() {
+                let Some(&at) = map.get(gid) else { continue };
+                if to.len() <= at {
+                    to.resize_with(at + 1, HashSet::new);
+                }
+                if to[at].len() < set.len() {
+                    let smaller = std::mem::replace(&mut to[at], set);
+                    to[at].extend(smaller);
+                } else {
+                    to[at].extend(set);
+                }
+            }
+        }
+        fold(&mut self.ints, other.ints, map);
+        fold(&mut self.texts, other.texts, map);
     }
 
     /// How many distinct values group `gid` saw.

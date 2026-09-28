@@ -249,7 +249,9 @@ pub fn qir_type(ty: &LogicalType) -> Result<Ty> {
     })
 }
 
-fn unsigned(ty: &LogicalType) -> bool {
+/// Whether values of `ty` compare as unsigned numbers.
+#[must_use]
+pub fn unsigned(ty: &LogicalType) -> bool {
     matches!(
         ty.physical(),
         PhysicalType::Bool
@@ -1032,8 +1034,14 @@ impl Gen<'_> {
         for a in args {
             pairs.push(self.translate(a)?);
         }
-        let mut call = vcall::Call::new(name, args, &e.ty, &self.columns);
-        let id = self.rt.add_kernel(Box::new(move |n, buffers| call.run(n, buffers)));
+        // Every worker of a parallel pipeline makes its own, because a call keeps the strings it
+        // answered with.
+        let (name_, args_, ty_, columns_) =
+            (name.to_string(), args.to_vec(), e.ty.clone(), self.columns.clone());
+        let id = self.rt.add_kernel(std::sync::Arc::new(move || {
+            let mut call = vcall::Call::new(&name_, &args_, &ty_, &columns_);
+            Box::new(move |n, buffers| call.run(n, buffers))
+        }));
         if self.module.kernel(name) != id {
             return Err(Refusal::new(
                 format!("the kernel for {name}"),

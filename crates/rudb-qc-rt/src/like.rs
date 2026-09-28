@@ -6,13 +6,13 @@
 use memchr::memmem;
 
 /// A compiled pattern.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Like {
     pattern: Pattern,
     fold: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Pattern {
     Exact(Vec<u8>),
     Prefix(Vec<u8>),
