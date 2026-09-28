@@ -173,6 +173,9 @@ pub(crate) struct Settings {
     /// `SET qc_switch` has left it: `off`, `every:<n>` or `random:<seed>`. Only the tier
     /// differential sets it.
     switch: RwLock<rudb_qc::Switch>,
+    /// The most rows one call of a compiled body covers, as `SET qc_morsel` has left it, zero
+    /// for a whole chunk of the scan. Only the morsel size sweep of question Q7 sets it.
+    morsel: RwLock<usize>,
     /// How many times a statement has been let at the settings, counted after it is done.
     changes: AtomicU64,
     /// The last session [`Settings::session`] built, and the count of changes it was built at.
@@ -221,6 +224,7 @@ impl Settings {
             engine: RwLock::new(FIRST_ENGINE.to_string()),
             tier: RwLock::new(rudb_qc::Tier::Auto),
             switch: RwLock::new(rudb_qc::Switch::Off),
+            morsel: RwLock::new(0),
             changes: AtomicU64::new(0),
             built: Mutex::new(None),
         }
@@ -271,6 +275,11 @@ impl Settings {
     /// The switches `SET qc_switch` asked for.
     pub(crate) fn switch(&self) -> rudb_qc::Switch {
         *self.switch.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// The morsel size `SET qc_morsel` asked for, zero for a whole chunk.
+    pub(crate) fn morsel(&self) -> usize {
+        *self.morsel.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The configuration as the statements have left it.
@@ -379,6 +388,14 @@ impl Settings {
                 ))
             })?;
             *self.switch.write().unwrap_or_else(|held| held.into_inner()) = switch;
+            return Ok(());
+        }
+        if is_morsel(name) {
+            let written = value.map_or_else(|| "0".to_string(), text_of);
+            let rows = written.trim().parse::<usize>().map_err(|_| {
+                Error::invalid_input(format!("qc_morsel is a number of rows, not {written}"))
+            })?;
+            *self.morsel.write().unwrap_or_else(|held| held.into_inner()) = rows;
             return Ok(());
         }
         if is_links(name) {
@@ -755,6 +772,9 @@ impl Settings {
         if is_switch(name) {
             return Ok(self.switch().to_string());
         }
+        if is_morsel(name) {
+            return Ok(self.morsel().to_string());
+        }
         if let Some(which) = graph_size(name) {
             let sizes = self.sizes();
             return Ok(match which {
@@ -1069,6 +1089,12 @@ fn is_tier(name: &str) -> bool {
 /// Whether this name is the compiled engine's switch setting, the same shape as [`is_engine`].
 fn is_switch(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("qc_switch")
+}
+
+/// Whether this name is the compiled engine's morsel size setting, the same shape as
+/// [`is_engine`].
+fn is_morsel(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("qc_morsel")
 }
 
 /// Whether this name is the relationship declaration setting.
