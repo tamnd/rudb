@@ -132,8 +132,11 @@ const SORTED_BOUND: usize = 64;
 /// One row in the running: its keys, the row itself, and where it arrived.
 #[derive(Debug)]
 struct Candidate {
-    key: Vec<Cell>,
-    values: Vec<Cell>,
+    /// The key cells and then the row's, in one `Vec` rather than two. A kept row costs one
+    /// allocation instead of two, and a candidate is smaller to move when the running is trimmed.
+    cells: Vec<Cell>,
+    /// How many of `cells` are the key.
+    keyed: usize,
     arrival: crate::sort::Arrival,
     /// The one key as the integer it is stored as, where the key is one column of a type whose
     /// order is the order of that integer and this row's value of it is not null.
@@ -141,6 +144,13 @@ struct Candidate {
     /// Two candidates that both have one compare on it and nothing else, see [`ordered`]. Anything
     /// else, a null on either side included, goes through the cells as it always has.
     ordinal: Option<i128>,
+}
+
+impl Candidate {
+    /// The key cells, which are the first ones.
+    fn key(&self) -> &[Cell] {
+        &self.cells[..self.keyed]
+    }
 }
 
 /// One column of a candidate row, which is either the value or what it takes to read it later.
@@ -275,7 +285,7 @@ fn settled(
     failure: &mut Option<Error>,
 ) -> Ordering {
     let ordering = ordered(keys, left.ordinal, right.ordinal)
-        .unwrap_or_else(|| compare(keys, &left.key, &right.key, failure));
+        .unwrap_or_else(|| compare(keys, left.key(), right.key(), failure));
     match ordering {
         Ordering::Equal => left.arrival.cmp(&right.arrival),
         ordering => ordering,
@@ -540,7 +550,7 @@ impl TopN {
             trim(&self.keys, kept, self.bound, failure);
             *trimmed = true;
             *cut = (kept.len() == self.bound && self.bound > 0)
-                .then(|| kept[self.bound - 1].key.clone());
+                .then(|| kept[self.bound - 1].key().to_vec());
             if let Some(reached) = cut.as_ref() {
                 self.reached(reached);
             }
@@ -590,7 +600,7 @@ impl Sink for TopN {
             // rank says nothing about, and the search says as much as it ever did.
             let narrowed = full
                 .then(|| {
-                    let worst = &local.kept[self.bound - 1].key;
+                    let worst = local.kept[self.bound - 1].key();
                     let ranked = beats_rank(&self.keys, &keys, worst, rows);
                     ranked.or_else(|| worth_looking_at(&self.keys, &keys, worst, rows))
                 })
@@ -624,7 +634,7 @@ impl Sink for TopN {
             recharge(&local.kept, &mut local.charged)?;
             if local.moved && self.bound > 0 && local.kept.len() == self.bound {
                 local.moved = false;
-                self.reached(&local.kept[self.bound - 1].key);
+                self.reached(local.kept[self.bound - 1].key());
             }
             return Ok(Progress::More);
         }
@@ -697,7 +707,10 @@ impl Sink for TopN {
         // The only place a candidate's row is read, which is why a candidate holds codes rather than
         // values: everything that got this far and lost was never read at all.
         let ordered: Vec<Vec<Value>> = wanted
-            .map(|candidate| candidate.values.into_iter().map(Cell::value).collect())
+            .map(|candidate| {
+                let keyed = candidate.keyed;
+                candidate.cells.into_iter().skip(keyed).map(Cell::value).collect()
+            })
             .collect::<Result<_>>()?;
         let mut held = self.held.lock().map_err(poisoned)?;
         let chunks = rows::chunks(&self.types, &ordered, &mut held)?;
@@ -764,9 +777,8 @@ fn settle(
 /// Reads one row out of the columns and puts it among the candidates, unordered.
 ///
 /// What the batched path does with a row it has decided to keep, and the reason it costs what it
-/// costs: a `Vec` for the key, a `Vec` for the row, and a value per column of each. A column that
-/// arrives as codes is kept as a code, see [`Cell`]. The answer is what the two together are
-/// charged.
+/// costs: a `Vec` for the key and the row, and a value per column of each. A column that arrives as
+/// codes is kept as a code, see [`Cell`]. The answer is what the cells are charged.
 fn hold(
     keys: &[Vector],
     chunk: &Chunk,
@@ -774,13 +786,22 @@ fn hold(
     (arrival, ordinal): (crate::sort::Arrival, Option<i128>),
     kept: &mut Vec<Candidate>,
 ) -> Result<u64> {
-    let key: Vec<Cell> =
-        keys.iter().map(|column| Cell::keyed(column, row)).collect::<Result<_>>()?;
-    let values: Vec<Cell> =
-        chunk.columns().iter().map(|column| Cell::of(column, row)).collect::<Result<_>>()?;
-    let taken = charge(&key) + charge(&values);
-    kept.push(Candidate { key, values, arrival, ordinal });
+    let cells = read_row(keys, chunk, row)?;
+    let taken = charge(&cells);
+    kept.push(Candidate { cells, keyed: keys.len(), arrival, ordinal });
     Ok(taken)
+}
+
+/// One row's key cells followed by its own, read out of the columns into one `Vec`.
+fn read_row(keys: &[Vector], chunk: &Chunk, row: usize) -> Result<Vec<Cell>> {
+    let mut cells = Vec::with_capacity(keys.len() + chunk.columns().len());
+    for column in keys {
+        cells.push(Cell::keyed(column, row)?);
+    }
+    for column in chunk.columns() {
+        cells.push(Cell::of(column, row)?);
+    }
+    Ok(cells)
 }
 
 /// Keeps one row when its key belongs in the ordered prefix.
@@ -798,34 +819,28 @@ fn keep(
     }
     let failure = &mut local.failure;
     if local.kept.len() == bound
-        && against(keys, columns, row, &local.kept[bound - 1].key, failure) != Ordering::Less
+        && against(keys, columns, row, local.kept[bound - 1].key(), failure) != Ordering::Less
     {
         return;
     }
-    let key: Vec<Cell> = match columns.iter().map(|column| Cell::keyed(column, row)).collect() {
-        Ok(key) => key,
+    let cells = match read_row(columns, chunk, row) {
+        Ok(cells) => cells,
         Err(error) => {
             failure.get_or_insert(error);
             return;
         }
     };
-    let values: Vec<Cell> =
-        match chunk.columns().iter().map(|column| Cell::of(column, row)).collect() {
-            Ok(values) => values,
-            Err(error) => {
-                failure.get_or_insert(error);
-                return;
-            }
-        };
+    let key = &cells[..columns.len()];
     // After every candidate whose key it ties, which is where its arrival puts it too: an instance
     // reads the morsels it is given in order and each of them from the start, so a row reaching
     // here arrived after everything already held.
     let at = local.kept.partition_point(|candidate| {
         ordered(keys, candidate.ordinal, ordinal)
-            .unwrap_or_else(|| compare(keys, &candidate.key, &key, failure))
+            .unwrap_or_else(|| compare(keys, candidate.key(), key, failure))
             != Ordering::Greater
     });
-    local.kept.insert(at, Candidate { key, values, arrival, ordinal });
+    let keyed = columns.len();
+    local.kept.insert(at, Candidate { cells, keyed, arrival, ordinal });
     local.kept.truncate(bound);
     local.moved = true;
 }
@@ -971,8 +986,7 @@ fn still_wanted(key: SortKey, single: bool) -> Comparison {
 /// and has no partial release. Nothing else can be holding the difference at this point, since the
 /// operator is between two reads of its input.
 fn recharge(kept: &[Candidate], scratch: &mut Reservation) -> Result<()> {
-    let footprint =
-        kept.iter().map(|candidate| charge(&candidate.key) + charge(&candidate.values)).sum();
+    let footprint = kept.iter().map(|candidate| charge(&candidate.cells)).sum();
     scratch.release();
     scratch.grow(footprint)
 }
