@@ -63,6 +63,7 @@ use crate::arg_extreme::Key;
 use crate::compare::order;
 use crate::fallback::{self, Kernel};
 use crate::general::General;
+use crate::lttb::{Plot, Points};
 use crate::number::{fit, integral, pow10, rescale};
 use crate::quantile::Column;
 use crate::shape::{identity, nulls_of};
@@ -448,6 +449,11 @@ impl Accumulator {
     /// If the name is not an aggregate this crate implements.
     pub fn new(name: &str, returns: &LogicalType) -> Result<Self> {
         if let Some((inner, keys)) = split_ordered(name) {
+            if let ("lttb", [key]) = (inner, keys.as_slice()) {
+                let plot = Plot::sorted(returns, *key);
+                let general = General::Plotted { plot, returns: returns.clone() };
+                return Ok(Self { state: State::General(Box::new(general)) });
+            }
             let inner = Box::new(Self::new(inner, returns)?);
             let general = General::Ordered { keys, rows: Vec::new(), inner };
             return Ok(Self { state: State::General(Box::new(general)) });
@@ -596,6 +602,14 @@ impl Accumulator {
     /// The same errors [`Accumulator::update`] raises, for the same reasons.
     pub fn update_run(&mut self, args: &[Vector], rows: usize) -> Result<()> {
         if let State::General(general) = &mut self.state {
+            if general.takes_points()
+                && let Some(points) = Points::of(args, rows)
+            {
+                for row in 0..rows {
+                    general.push_point(&points, row)?;
+                }
+                return Ok(());
+            }
             if general.takes_columns()
                 && let Some(input) = args.first()
                 && let Some(column) = Column::of(input, rows)
@@ -1436,6 +1450,20 @@ pub fn update_general(
                 return Err(Error::internal(format!("an aggregate state at {index} is not held")));
             };
             general.push_column(column, row, inputs)?;
+        }
+        return Ok(true);
+    }
+    let points = match &states[offset].state {
+        State::General(general) if general.takes_points() => Points::of(inputs, rows),
+        _ => None,
+    };
+    if let Some(points) = points {
+        for row in 0..rows {
+            let Some(index) = into.index(row) else { continue };
+            let Some(Accumulator { state: State::General(general) }) = states.get_mut(index) else {
+                return Err(Error::internal(format!("an aggregate state at {index} is not held")));
+            };
+            general.push_point(&points, row)?;
         }
         return Ok(true);
     }

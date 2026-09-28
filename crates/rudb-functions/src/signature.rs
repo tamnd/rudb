@@ -16,7 +16,7 @@
 //! because it carries an implementation per pair. Ours does not carry one yet, and inventing 169
 //! rows before there is a kernel behind any of them would be inventing the wrong 169 rows.
 
-use rudb_common::{Error, LogicalType, MAX_DECIMAL_WIDTH, Result};
+use rudb_common::{Error, Field, LogicalType, MAX_DECIMAL_WIDTH, Result};
 
 /// Whether a name is a scalar function, an aggregate or a window.
 ///
@@ -279,6 +279,10 @@ enum Shape {
     /// `approx_top_k(x, k)`, a list of values of any type with a count that has to cast to a
     /// BIGINT without a DECIMAL, a DOUBLE or a wider integer in the way.
     Topped,
+    /// `lttb(x, y, n)`, a list of `(x, y)` points. The x axis is a FLOAT, a DOUBLE or a timestamp,
+    /// with any other number read as a DOUBLE and a DATE as a TIMESTAMP_NS, the y axis a FLOAT or a
+    /// DOUBLE, and the count is taken the way [`Shape::Topped`] takes it.
+    Plotted,
     /// `median(x)`, which is [`Shape::Continuous`] over anything that interpolates, an INTERVAL
     /// included, and a value as given over anything else.
     Median,
@@ -1096,6 +1100,7 @@ const TABLE: &[Entry] = &[
     aggregate("reservoir_quantile", Arity::between(2, 3), Shape::Sampled, false),
     aggregate("approx_quantile", Arity::exactly(2), Shape::Digested, false),
     aggregate("approx_top_k", Arity::exactly(2), Shape::Topped, false),
+    aggregate("lttb", Arity::exactly(3), Shape::Plotted, false),
     aggregate("median", Arity::exactly(1), Shape::Median, false),
     aggregate("mad", Arity::exactly(1), Shape::Deviation, false),
     aggregate("mode", Arity::exactly(1), Shape::AsGiven, false),
@@ -1523,21 +1528,12 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         }
         Shape::Sampled => sampled(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
         Shape::Digested => digested(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
-        Shape::Topped => match &arguments[1] {
-            LogicalType::TinyInt
-            | LogicalType::SmallInt
-            | LogicalType::Integer
-            | LogicalType::BigInt
-            | LogicalType::UTinyInt
-            | LogicalType::USmallInt
-            | LogicalType::UInteger
-            | LogicalType::Varchar
-            | LogicalType::Null => (
-                vec![arguments[0].clone(), LogicalType::BigInt],
-                LogicalType::list(arguments[0].clone()),
-            ),
-            _ => return Err(no_match(entry.name, arguments)),
-        },
+        Shape::Topped if counted(&arguments[1]) => (
+            vec![arguments[0].clone(), LogicalType::BigInt],
+            LogicalType::list(arguments[0].clone()),
+        ),
+        Shape::Plotted => plotted(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
+        Shape::Topped => return Err(no_match(entry.name, arguments)),
         Shape::Picked => match arguments {
             [arg, by] => (vec![arg.clone(), by.clone()], arg.clone()),
             [arg, by, _] => {
@@ -2060,6 +2056,50 @@ fn sampled(arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)>
         wanted.push(LogicalType::Integer);
     }
     Some((wanted, fractioned(&fraction, held)))
+}
+
+/// Whether a count of `approx_top_k` or `lttb` casts to the BIGINT the pin wants without a
+/// DECIMAL, a DOUBLE or a wider integer in the way.
+fn counted(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::Varchar
+            | LogicalType::Null
+    )
+}
+
+/// The argument types and answer of `lttb`, or `None` when the pin has no overload for the call.
+fn plotted(arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
+    let real = |ty: &LogicalType| match ty {
+        LogicalType::Float => Some(LogicalType::Float),
+        LogicalType::Double | LogicalType::Decimal { .. } | LogicalType::Null => {
+            Some(LogicalType::Double)
+        }
+        ty if ty.is_integer() => Some(LogicalType::Double),
+        _ => None,
+    };
+    let x = match &arguments[0] {
+        LogicalType::Date => LogicalType::TimestampNs,
+        ty @ (LogicalType::Timestamp
+        | LogicalType::TimestampS
+        | LogicalType::TimestampMs
+        | LogicalType::TimestampNs
+        | LogicalType::TimestampTz) => ty.clone(),
+        ty => real(ty)?,
+    };
+    let y = real(&arguments[1])?;
+    if !counted(&arguments[2]) {
+        return None;
+    }
+    let point = LogicalType::Struct(vec![Field::new("x", x.clone()), Field::new("y", y.clone())]);
+    Some((vec![x, y, LogicalType::BigInt], LogicalType::list(point)))
 }
 
 /// The argument types and answer of `approx_quantile`, or `None` when the pin has no overload for
@@ -3138,6 +3178,7 @@ impl Shape {
             Self::Sampled => ([ANY, "DOUBLE", "INTEGER"][..count.min(3)].to_vec(), ANY),
             Self::Digested => (vec![ANY, "FLOAT"], ANY),
             Self::Topped => (vec![ANY, "BIGINT"], ANY_LIST),
+            Self::Plotted => (vec!["DOUBLE", "DOUBLE", "BIGINT"], ANY_LIST),
             Self::Median | Self::Deviation => (all(ANY), ANY),
             Self::Picked => (leading(2, ANY, "BIGINT"), ANY),
             Self::Histogram => (leading(1, ANY, ANY_LIST), "MAP"),
@@ -3697,6 +3738,10 @@ mod tests {
                     }
                     Shape::Digested => arguments = vec![LogicalType::Double, LogicalType::Float],
                     Shape::Topped => arguments = vec![LogicalType::Double, LogicalType::BigInt],
+                    Shape::Plotted => {
+                        arguments =
+                            vec![LogicalType::Double, LogicalType::Double, LogicalType::BigInt];
+                    }
                     Shape::Sampled => {
                         arguments = vec![LogicalType::Double; count];
                         if count == 3 {

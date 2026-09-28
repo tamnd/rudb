@@ -72,6 +72,7 @@ mod hash;
 mod histogram;
 mod lists;
 pub mod logic;
+mod lttb;
 mod maps;
 mod math;
 pub mod membership;

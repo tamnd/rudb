@@ -3380,6 +3380,9 @@ impl<'a> Binder<'a> {
         for (arg, wanted) in bound.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
         }
+        if resolved.name == "lttb" {
+            self.lttb_points(cast[2])?;
+        }
         let name = self.ordered_aggregate(resolved.name, sorted, &keys, &mut cast);
         let args = self.plan.add_expr_list(&cast);
         let name = self.plan.intern(&name);
@@ -3476,6 +3479,20 @@ impl<'a> Binder<'a> {
         ))
     }
 
+    /// Checks the number of points an `lttb` call thins to, once it is a BIGINT, in the pin's words.
+    fn lttb_points(&self, n: ExprRef) -> Result<()> {
+        match fold::value_of(&self.plan, n)? {
+            None => {
+                Err(Error::binder("lttb: the number of points (third argument) must be a constant"))
+            }
+            Some(Value::Null) => Err(Error::binder("lttb: the number of points must not be NULL")),
+            Some(Value::BigInt(n)) if n < 2 => {
+                Err(Error::binder("lttb: the number of points must be at least 2"))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
     /// Checks the fraction and the sample size of a `reservoir_quantile` call the way the pin does,
     /// which is in words of its own rather than the ones the other quantiles use.
     fn reservoir_arguments(&self, bound: &[ExprRef]) -> Result<()> {
@@ -3564,7 +3581,8 @@ impl<'a> Binder<'a> {
         keys: &[ExprRef],
         args: &mut Vec<ExprRef>,
     ) -> String {
-        const DEPENDS_ON_ORDER: &[&str] = &["list", "first", "last", "any_value", "string_agg"];
+        const DEPENDS_ON_ORDER: &[&str] =
+            &["list", "first", "last", "any_value", "string_agg", "lttb"];
         if !DEPENDS_ON_ORDER.contains(&name) {
             return name.to_string();
         }
@@ -3733,6 +3751,9 @@ impl<'a> Binder<'a> {
         let mut cast = Vec::with_capacity(parts.args.len());
         for (arg, wanted) in parts.args.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
+        }
+        if resolved.name == "lttb" {
+            self.lttb_points(cast[2])?;
         }
         let args = self.plan.add_expr_list(&cast);
         let order = self.plan.add_sort_keys(&parts.inner);
