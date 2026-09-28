@@ -2957,6 +2957,7 @@ impl Shared {
         rudb_qc::Options {
             tier: self.inner.settings.tier(),
             switch: self.inner.settings.switch(),
+            morsel: self.inner.settings.morsel(),
             ..rudb_qc::Options::default()
         }
     }

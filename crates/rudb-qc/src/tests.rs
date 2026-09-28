@@ -47,6 +47,18 @@ fn catalog() -> Catalog {
         .rows_mut()
         .append_rows(&[vec![Value::Integer(i32::MAX)], vec![Value::Integer(1)]])
         .expect("two rows");
+    // `clean` has no NULL and many chunks.
+    let clean = QualifiedName::new("memory", "main", "clean");
+    catalog
+        .create_table(clean.clone(), vec![Field::new("x", LogicalType::Integer)])
+        .expect("a fresh table");
+    let rows: Vec<Vec<Value>> = (0..40_000).map(|i| vec![Value::Integer(i)]).collect();
+    catalog
+        .table_mut(&clean)
+        .expect("the table just created")
+        .rows_mut()
+        .append_rows(&rows)
+        .expect("rows of the table's own types");
     let empty = QualifiedName::new("memory", "main", "empty");
     catalog
         .create_table(empty, vec![Field::new("x", LogicalType::Integer)])
@@ -61,14 +73,20 @@ fn rows(chunks: &[Chunk]) -> Vec<Vec<Value>> {
 }
 
 /// The compiled engine's rows, which every tier this build has must agree on to the bit, with
-/// every function of the module compiled by the tiers that compile, and again with the query moved
-/// between the tiers at every morsel and at random ones.
+/// every function of the module compiled by the tiers that compile, again with the query moved
+/// between the tiers at every morsel and at random ones, and with each chunk cut into morsels of an
+/// odd size.
 fn compiled(text: &str) -> Result<Vec<Vec<Value>>> {
-    let mut runs = vec![Options { tier: Tier::Interp, ..Options::default() }, Options::default()];
+    let mut runs = vec![
+        Options { tier: Tier::Interp, ..Options::default() },
+        Options::default(),
+        Options { tier: Tier::Interp, morsel: 1000, ..Options::default() },
+    ];
     for tier in [Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()) {
         for switch in [Switch::Off, Switch::Every(1), Switch::Random(7)] {
             runs.push(Options { tier, switch, ..Options::default() });
         }
+        runs.push(Options { tier, morsel: 333, ..Options::default() });
     }
     let mut answers: Vec<(Options, Result<Vec<Vec<Value>>>)> = Vec::new();
     for options in runs {
@@ -173,6 +191,45 @@ fn a_morsel_with_no_null_runs_the_version_that_checks_none_and_one_with_a_null_d
     assert_eq!((report.nonull, report.deopts), (1, 0), "{report}");
     let report = answer(SCAN, options).expect("the scan runs").report;
     assert_eq!(report.nonull, 0, "{report}");
+}
+
+#[test]
+fn a_guard_that_fails_in_a_body_sends_the_morsel_back_and_is_given_up_after_three() {
+    let text = "Project #1 [\"+\"(#0.0::INTEGER, 1::INTEGER)::INTEGER AS y]\n  Get memory.main.clean AS clean #0 [x::INTEGER]";
+    let (first, _) = both(text);
+    let catalog = catalog();
+    let plan = Plan::parse(text).expect("a well formed plan");
+    let cancel = Cancel::new();
+    let (pool, memory, seams, session) =
+        (Pool::default(), Memory::unlimited(), rudb_seam::Settings::new(), Session::new());
+    let under = Under {
+        catalog: &catalog,
+        cancel: &cancel,
+        memory: &memory,
+        seams: &seams,
+        session: &session,
+        pool: &pool,
+    };
+    for tier in [Tier::Interp, Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()) {
+        let options = Options { tier, fresh: true, ..Options::default() };
+        let mut compiled = compile_with(&plan, &cancel, options).expect("it is taken");
+        let body = compiled.query.bodies[0].as_ref().expect("a pipeline");
+        let nonull = body.nonull.clone().expect("a version with no NULL");
+        let module = &compiled.query.module;
+        let site = module.guards.iter().position(|g| g.fallback == body.func).expect("its guard");
+        // The version with no NULL fails its guard before it does anything, on every morsel.
+        let printed = rudb_qc_ir::print::print(module);
+        let at = printed.find(&format!("func @{nonull} ")).expect("the version is printed");
+        let entry = at + printed[at..].find("):\n").expect("an entry block") + 3;
+        let changed =
+            format!("{}  guard false, !G{site}\n{}", &printed[..entry], &printed[entry..]);
+        compiled.query.module = rudb_qc_ir::parse(&changed).expect("the changed module parses");
+        compiled.tiers = Tiers::new(&compiled.query.module, options);
+        let answer = compiled.run(&plan, under).expect("the projection runs");
+        assert_eq!(rows(&answer.chunks), first, "{tier}");
+        let report = &answer.report;
+        assert_eq!((report.deopts, report.nonull), (3, 0), "{tier}: {report}");
+    }
 }
 
 #[test]

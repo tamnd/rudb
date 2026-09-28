@@ -476,7 +476,7 @@ impl<'a> Feed<'a> {
             held.push(Held::of(chunk.column(c)?, rows)?);
         }
         let cols: Vec<Col> = held.iter().map(Held::col).collect();
-        let morsel = Morsel {
+        let mut morsel = Morsel {
             source: 0,
             chunk: 0,
             begin: 0,
@@ -529,44 +529,57 @@ impl<'a> Feed<'a> {
                 }
             }
             let st = state.as_mut_ptr().cast::<u8>();
-            // The tier is picked once per morsel, so a switch only ever happens between two.
-            let native = self.tiers.morsel(f, sink);
-            loop {
-                let status = self.tiers.call(native, f, st, (&raw const morsel).cast(), rt);
-                match Status(status).kind() {
-                    Kind::Ok => break 'attempt,
-                    // The body saved where it got to in the header's cursor and picks up there.
-                    Kind::Yield => {}
-                    Kind::Done => {
-                        *done = true;
-                        break 'attempt;
+            // A chunk is cut into morsels of `split` rows when that is set, all of them run on the
+            // same version, and a result's rows go on where the morsel before left them.
+            let step = match self.tiers.split() {
+                0 => rows,
+                n => n.min(rows),
+            };
+            let mut begin = 0;
+            while begin < rows {
+                let end = (begin + step).min(rows);
+                (morsel.begin, morsel.end) = (begin as u32, end as u32);
+                begin = end;
+                // The tier is picked once per morsel, so a switch only ever happens between two.
+                let native = self.tiers.morsel(f, sink);
+                loop {
+                    let status = self.tiers.call(native, f, st, (&raw const morsel).cast(), rt);
+                    match Status(status).kind() {
+                        Kind::Ok => break,
+                        // The body saved where it got to in the header's cursor and picks up there.
+                        Kind::Yield => {}
+                        Kind::Done => {
+                            *done = true;
+                            break 'attempt;
+                        }
+                        // Only a result sink past a probe asks, and only when its buffers are full.
+                        Kind::NeedMemory
+                            if matches!(self.body.sink, Out::Result { capacity: Some(_), .. }) =>
+                        {
+                            room = room.checked_mul(2).ok_or_else(|| {
+                                Error::internal("a join made more rows than memory holds")
+                            })?;
+                            continue 'attempt;
+                        }
+                        // A guard failed inside the body. Only a result sink starts the morsel over
+                        // from nothing, so only there is it run again on the guard's fallback.
+                        Kind::Deopt if matches!(self.body.sink, Out::Result { .. }) => {
+                            let fallback = usize::try_from(Status(status).payload())
+                                .ok()
+                                .and_then(|at| self.module.guards.get(at))
+                                .and_then(|g| self.tiers.func(&g.fallback))
+                                .filter(|&back| back != f)
+                                .ok_or_else(|| self.check(Status(status), rt))?;
+                            self.tiers.deopt(f);
+                            self.tiers.prepare(self.module, fallback, self.rows, false);
+                            f = fallback;
+                            continue 'attempt;
+                        }
+                        _ => return Err(self.check(Status(status), rt)),
                     }
-                    // Only a result sink past a probe asks, and only when its buffers are full.
-                    Kind::NeedMemory
-                        if matches!(self.body.sink, Out::Result { capacity: Some(_), .. }) =>
-                    {
-                        room = room.checked_mul(2).ok_or_else(|| {
-                            Error::internal("a join made more rows than memory holds")
-                        })?;
-                        continue 'attempt;
-                    }
-                    // A guard failed inside the body. Only a result sink starts the morsel over
-                    // from nothing, so only there is it run again on the guard's fallback.
-                    Kind::Deopt if matches!(self.body.sink, Out::Result { .. }) => {
-                        let fallback = usize::try_from(Status(status).payload())
-                            .ok()
-                            .and_then(|at| self.module.guards.get(at))
-                            .and_then(|g| self.tiers.func(&g.fallback))
-                            .filter(|&back| back != f)
-                            .ok_or_else(|| self.check(Status(status), rt))?;
-                        self.tiers.deopt(f);
-                        self.tiers.prepare(self.module, fallback, self.rows, false);
-                        f = fallback;
-                        continue 'attempt;
-                    }
-                    _ => return Err(self.check(Status(status), rt)),
                 }
             }
+            break;
         }
         drop(held);
         if let Some(start) = start {

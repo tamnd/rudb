@@ -195,6 +195,13 @@ fn switching_tiers_at_every_morsel_answers_what_one_tier_answers() {
         }
         assert_eq!(rows(&database, sql), alone, "{switch}");
     }
+    for morsel in ["100", "4096", "0"] {
+        database.execute(&format!("SET qc_morsel = {morsel}")).expect("a morsel size");
+        assert_eq!(database.setting("qc_morsel").expect("qc_morsel reads back"), morsel);
+        assert_eq!(rows(&database, sql), alone, "{morsel}");
+    }
+    let error = database.execute("SET qc_morsel = 'many'").expect_err("not a size");
+    assert!(error.to_string().contains("number of rows"), "{error}");
     let error = database.execute("SET qc_switch = 'every:0'").expect_err("no such switch");
     assert!(error.to_string().contains("every:<n>"), "{error}");
     assert_eq!(database.refusals(), Vec::<String>::new());

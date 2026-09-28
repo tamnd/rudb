@@ -230,6 +230,9 @@ pub struct Options {
     /// Whether every function is compiled anew, and none is taken from the code cache or kept
     /// in it.
     pub fresh: bool,
+    /// The most rows one call of a body covers, which cuts a chunk of the scan into morsels of
+    /// that many rows. Zero calls it once for the whole chunk.
+    pub morsel: usize,
 }
 
 /// What the second tier did with a query's module, for `EXPLAIN (CODEGEN)` and the query log.
@@ -325,6 +328,8 @@ pub(crate) struct Tiers {
     native: Vec<OnceLock<Option<Arc<Code>>>>,
     /// Whether the code cache is left alone.
     fresh: bool,
+    /// The most rows a call covers, zero for a whole chunk.
+    split: usize,
     calibration: Calibration,
     /// The clock the progress is kept on.
     clock: Instant,
@@ -361,7 +366,7 @@ impl fmt::Debug for Tiers {
 impl Tiers {
     /// Lowers `module` for the interpreter and, when `options` asks for it, for the machine.
     pub(crate) fn new(module: &Module, options: Options) -> Tiers {
-        let Options { tier, switch, stay, fresh } = options;
+        let Options { tier, switch, stay, fresh, morsel } = options;
         let program = Program::new(module);
         let counts = (
             AtomicU64::new(0),
@@ -383,6 +388,7 @@ impl Tiers {
             small,
             native,
             fresh,
+            split: morsel,
             calibration: Calibration::HOST,
             clock: Instant::now(),
             upper: (0..each).map(|_| Arc::default()).collect(),
@@ -406,6 +412,11 @@ impl Tiers {
         report.deopts = sum(&self.deopted);
         report.nonull = sum(&self.tried) - report.deopts;
         report
+    }
+
+    /// The most rows one call of a body covers, zero for a whole chunk.
+    pub(crate) fn split(&self) -> usize {
+        self.split
     }
 
     /// Whether function `f`, a version behind a guard, is still worth picking, and counts the
