@@ -678,13 +678,9 @@ impl Gen<'_> {
                 } else {
                     let size = size.next_multiple_of(8);
                     self.field(SINK, size, "key");
-                    if keys.iter().any(|(k, _)| k.text) {
-                        (None, None, SINK + size)
-                    } else {
-                        self.field(SINK + size, 8, "last");
-                        self.field(SINK + size + 8, 32, "probe");
-                        (None, Some(SINK + size), SINK + size + 40)
-                    }
+                    self.field(SINK + size, 8, "last");
+                    self.field(SINK + size + 8, 32, "probe");
+                    (None, Some(SINK + size), SINK + size + 40)
                 };
                 let probe = last.map(|at| at + 8);
                 let grouping = Grouping { table, keys, acc_offset, accs, row, last, probe };
@@ -1121,7 +1117,7 @@ impl Gen<'_> {
                     let zero = g.b.int(Ty::I32, 0);
                     return g.b.bin(Op::IcmpEq, len, zero);
                 }
-                return g.rt(proxy_id("str_eq"), &[a, b]);
+                return g.text_eq(a, b, true);
             }
             let op = if ty.is_float() { Op::FcmpEq } else { Op::IcmpEq };
             g.b.bin(op, a, b)
@@ -1544,7 +1540,7 @@ impl Gen<'_> {
             let ty = qir_type(&e.ty)?;
             let x = self.b.load(ty, entry, Val::NONE, 1, 8 + f.offset as i32, 0);
             let eq = if ty == Ty::Str16 {
-                self.rt(proxy_id("str_eq"), &[x, v])
+                self.text_eq(x, v, true)
             } else {
                 self.b.bin(Op::IcmpEq, x, v)
             };
@@ -1615,7 +1611,11 @@ impl Gen<'_> {
             let off = (8 + k.offset) as i32;
             let ty = self.b.ty(v);
             let x = self.b.load(ty, row, Val::NONE, 1, off, 0);
-            let eq = self.b.bin(Op::IcmpEq, x, v);
+            let eq = if ty == Ty::Str16 {
+                self.text_eq(x, v, true)
+            } else {
+                self.b.bin(Op::IcmpEq, x, v)
+            };
             let null = self.b.load(Ty::I1, row, Val::NONE, 1, off + k.width as i32, 0);
             // The null byte is set where `ok` is not.
             let flip = self.b.bin(Op::Xor, null, ok);
@@ -1694,7 +1694,13 @@ impl Gen<'_> {
                                 let at = (SINK + k.offset) as i32;
                                 let ty = self.b.ty(v);
                                 let old = self.b.load(ty, st, Val::NONE, 1, at, 0);
-                                let eq = self.b.bin(Op::IcmpEq, old, v);
+                                // A long string in the buffer may point at a morsel that is gone,
+                                // so only a key the header holds whole is taken as the same here.
+                                let eq = if ty == Ty::Str16 {
+                                    self.text_eq(old, v, false)
+                                } else {
+                                    self.b.bin(Op::IcmpEq, old, v)
+                                };
                                 let null =
                                     self.b.load(Ty::I1, st, Val::NONE, 1, at + k.width as i32, 0);
                                 // The null byte is set where `ok` is not.
@@ -1784,7 +1790,26 @@ impl Gen<'_> {
     fn hash(&mut self, hash: Val, v: Val, logical: &LogicalType) -> Result<Val> {
         let ty = self.b.ty(v);
         Ok(match ty {
-            Ty::Str16 => self.rt(proxy_id("str_hash"), &[v, hash]),
+            Ty::Str16 => {
+                // A string the header holds whole is hashed as the header's two words, which are
+                // the same for the same string because `text::make` zeroes what the string leaves.
+                // A longer one never has the same length, so it can hash its bytes.
+                let inline = self.b.un(Op::StrInl, v);
+                let (short, long) = (self.b.block(&[]), self.b.block(&[]));
+                let done = self.b.block(&[(Ty::I64, "hash")]);
+                self.b.brif(inline, short, &[], long, &[]);
+                self.b.switch_to(short);
+                let w0 = self.b.un(Op::StrW0, v);
+                let w1 = self.b.un(Op::StrW1, v);
+                let h = self.b.bin(Op::Crc32c, hash, w0);
+                let h = self.b.bin(Op::Crc32c, h, w1);
+                self.b.br(done, &[h]);
+                self.b.switch_to(long);
+                let h = self.rt(proxy_id("str_hash"), &[v, hash]);
+                self.b.br(done, &[h]);
+                self.b.switch_to(done);
+                self.b.param(done, 0)
+            }
             Ty::I128 => {
                 let lo = self.b.conv(Op::Trunc, v, Ty::I64);
                 let k = self.b.int(Ty::I128, 64);
@@ -1801,6 +1826,34 @@ impl Gen<'_> {
             }
             _ => return Err(Refusal::new(format!("grouping by {logical}"), "the key has no hash")),
         })
+    }
+
+    /// Whether two strings are the same. Headers with the same first word and a string the header
+    /// holds whole are the same exactly when their second words are, and so are two long headers
+    /// pointing at the same bytes, so the runtime is asked only about two long strings of one
+    /// length and prefix in different places. Without `call` that case is taken as not the same.
+    fn text_eq(&mut self, a: Val, b: Val, call: bool) -> Val {
+        let w0 = self.b.un(Op::StrW0, a);
+        let x0 = self.b.un(Op::StrW0, b);
+        let w1 = self.b.un(Op::StrW1, a);
+        let x1 = self.b.un(Op::StrW1, b);
+        let head = self.b.bin(Op::IcmpEq, w0, x0);
+        let tail = self.b.bin(Op::IcmpEq, w1, x1);
+        let both = self.b.bin(Op::And, head, tail);
+        let inline = self.b.un(Op::StrInl, b);
+        if !call {
+            return self.b.bin(Op::And, both, inline);
+        }
+        let differ = self.b.un(Op::Not, head);
+        let known = self.b.bin(Op::Or, tail, inline);
+        let known = self.b.bin(Op::Or, known, differ);
+        let (ask, done) = (self.b.block(&[]), self.b.block(&[(Ty::I1, "same")]));
+        self.b.brif(known, done, &[both], ask, &[]);
+        self.b.switch_to(ask);
+        let same = self.rt(proxy_id("str_eq"), &[a, b]);
+        self.b.br(done, &[same]);
+        self.b.switch_to(done);
+        self.b.param(done, 0)
     }
 
     /// Runs `f` only when `c` holds, and carries on after it either way.
