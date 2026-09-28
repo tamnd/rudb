@@ -59,6 +59,28 @@ fn catalog() -> Catalog {
         .rows_mut()
         .append_rows(&rows)
         .expect("rows of the table's own types");
+    // `runs` holds its keys in runs, some of them NULL, the way a file sorted on them does.
+    let runs = QualifiedName::new("memory", "main", "runs");
+    catalog
+        .create_table(
+            runs.clone(),
+            vec![Field::new("k", LogicalType::BigInt), Field::new("j", LogicalType::Integer)],
+        )
+        .expect("a fresh table");
+    let rows: Vec<Vec<Value>> = (0..20_000i64)
+        .map(|i| {
+            let k = if (i / 50) % 5 == 2 { Value::Null } else { Value::BigInt(i / 37 % 90) };
+            let j =
+                if (i / 60) % 7 == 4 { Value::Null } else { Value::Integer((i / 100 % 3) as i32) };
+            vec![k, j]
+        })
+        .collect();
+    catalog
+        .table_mut(&runs)
+        .expect("the table just created")
+        .rows_mut()
+        .append_rows(&rows)
+        .expect("rows of the table's own types");
     let empty = QualifiedName::new("memory", "main", "empty");
     catalog
         .create_table(empty, vec![Field::new("x", LogicalType::Integer)])
@@ -252,6 +274,14 @@ fn a_grouped_aggregate_over_strings_matches_the_first_engine() {
         ),
         false,
     );
+}
+
+#[test]
+fn a_grouped_aggregate_over_runs_of_one_key_matches_the_first_engine() {
+    let aggs = "aggregates=[count_star()::BIGINT, count(#0.1::INTEGER)::BIGINT, sum(#0.1::INTEGER)::HUGEINT, min(#0.1::INTEGER)::INTEGER]";
+    let scan = "Get memory.main.runs AS runs #0 [k::BIGINT, j::INTEGER]";
+    same(&format!("Aggregate #1 groups=[#0.0::BIGINT] {aggs}\n  {scan}"), false);
+    same(&format!("Aggregate #1 groups=[#0.0::BIGINT, #0.1::INTEGER] {aggs}\n  {scan}"), false);
 }
 
 #[test]
