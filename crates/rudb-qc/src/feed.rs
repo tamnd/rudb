@@ -24,7 +24,7 @@
 //! and their count, and both start over.
 
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rudb_common::{Cancel, Error, ErrorCode, Result};
@@ -36,7 +36,7 @@ use rudb_qc_ir::{ErrorKind, Module};
 use rudb_qc_pipe::{Pipeline, Source, Step};
 use rudb_qc_plan::Column;
 use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
-use rudb_qc_rt::table::GroupTable;
+use rudb_qc_rt::table::{Distinct, GroupTable};
 use rudb_qc_rt::{RUNTIME_ERROR, Rt, text};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
@@ -183,8 +183,7 @@ impl<'a> Feed<'a> {
             parallel,
             template: state.clone(),
             split: parallel
-                && matches!(&body.sink, Out::Aggregate(g) if !g.keys.is_empty())
-                && sets.is_empty(),
+                && matches!(&body.sink, Out::Aggregate(g) if !g.keys.is_empty() || !sets.is_empty()),
             folds,
             sets,
             inner: Mutex::new(Inner {
@@ -232,7 +231,10 @@ impl<'a> Feed<'a> {
             inner.workers.push(worker.rt);
             Ok(())
         } else if inner.merged {
-            inner.rt.absorb(worker.rt, g.table, &self.sets, |d, s| merge::fold(&self.folds, d, s))
+            inner
+                .rt
+                .absorb(worker.rt, g.table, &self.sets, |d, s| merge::fold(&self.folds, d, s))
+                .map(drop)
         } else {
             inner.merged = true;
             inner.rt.adopt(worker.rt, g.table, &self.sets);
@@ -253,50 +255,113 @@ impl<'a> Feed<'a> {
         };
         let mut inner = self.lock();
         let mut workers = std::mem::take(&mut inner.workers);
-        let Some(first) = workers.pop() else {
+        if workers.is_empty() {
             return Ok(());
-        };
+        }
+        // The distinct sets are merged on their own once the groups are, so they are taken out
+        // of every worker first.
+        let sets = self
+            .sets
+            .iter()
+            .map(|&h| {
+                workers.iter_mut().map(|w| w.take_distinct(h).ok_or_else(|| gone(h))).collect()
+            })
+            .collect::<Result<Vec<Vec<Distinct>>>>()?;
+        let first = workers.remove(0);
         let folds = &self.folds;
         let fold = |d: &mut [u8], s: &[u8]| merge::fold(folds, d, s);
         let groups: usize =
             workers.iter().filter_map(|w| w.table(g.table)).map(GroupTable::len).sum();
-        inner.rt.adopt(first, g.table, &self.sets);
+        inner.rt.adopt(first, g.table, &[]);
+        let parts = (threads.degree() * 4).next_power_of_two().clamp(16, 1024);
+        let bits = parts.trailing_zeros();
+        // Which merged group each worker's group became, for the distinct sets.
+        let mut maps: Vec<Vec<usize>> = Vec::with_capacity(workers.len() + 1);
+        maps.push((0..inner.rt.table(g.table).map_or(0, GroupTable::len)).collect());
         // Few groups fold faster on one thread than they split.
-        if groups < SPLIT_FROM {
+        let split = !g.keys.is_empty() && groups >= SPLIT_FROM;
+        if split {
+            let (merged, made) = {
+                let mine = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
+                let tables = std::iter::once(Ok(mine))
+                    .chain(workers.iter().map(|w| w.table(g.table).ok_or_else(|| gone(g.table))))
+                    .collect::<Result<Vec<&GroupTable>>>()?;
+                let splits = pieces(threads, tables.len(), |at| tables[at].split(bits))?;
+                let layout = mine.layout().clone();
+                let merged = pieces(threads, parts, |part| {
+                    let most = splits.iter().map(|s| s[part].len()).sum();
+                    let mut table = GroupTable::with_capacity(layout.clone(), most);
+                    let mut made = vec![Vec::new(); tables.len()];
+                    for ((other, split), made) in tables.iter().zip(&splits).zip(&mut made) {
+                        table.absorb_some(other, &split[part], made, fold);
+                    }
+                    (table, made)
+                })?;
+                let (merged, made): (Vec<GroupTable>, Vec<Vec<Vec<u32>>>) =
+                    merged.into_iter().unzip();
+                // A group of a part is found at the part's first group and its place in it.
+                let mut from = Vec::with_capacity(parts);
+                let mut at = 0;
+                for t in &merged {
+                    from.push(at);
+                    at += t.len();
+                }
+                let made = if sets.is_empty() {
+                    Vec::new()
+                } else {
+                    pieces(threads, tables.len(), |t| {
+                        let mut map = vec![0; tables[t].len()];
+                        for (part, split) in splits[t].iter().enumerate() {
+                            for (&gid, &local) in split.iter().zip(&made[part][t]) {
+                                map[gid as usize] = from[part] + local as usize;
+                            }
+                        }
+                        map
+                    })?
+                };
+                (GroupTable::join(layout, merged), made)
+            };
+            maps = made;
+            // The table adopted from the first worker is replaced, and its strings with it, but
+            // its heap is kept with the worker, which the merged table's strings may point into.
+            inner.rt.settle(workers, g.table, merged)?;
+        } else {
             for w in workers {
-                inner.rt.absorb(w, g.table, &self.sets, fold)?;
+                maps.push(inner.rt.absorb(w, g.table, &[], fold)?);
             }
+        }
+        let total = inner.rt.table(g.table).map_or(0, GroupTable::len);
+        for (&h, list) in self.sets.iter().zip(&sets) {
+            let splits = pieces(threads, list.len(), |w| list[w].split(&maps[w], bits))?;
+            let counts: Vec<AtomicU64> = (0..total).map(|_| AtomicU64::new(0)).collect();
+            pieces(threads, parts, |part| {
+                let sources: Vec<(&Distinct, &[usize], &[u32])> = list
+                    .iter()
+                    .zip(&maps)
+                    .zip(&splits)
+                    .map(|((d, m), s)| (d, m.as_slice(), s[part].as_slice()))
+                    .collect();
+                Distinct::gather(&sources, &counts);
+            })?;
+            let counts = counts.into_iter().map(AtomicU64::into_inner).collect();
+            inner.rt.put_distinct(h, Distinct::counted_only(counts))?;
+        }
+        if !split {
             return Ok(());
         }
-        let merged = {
-            let mine = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
-            let tables = std::iter::once(Ok(mine))
-                .chain(workers.iter().map(|w| w.table(g.table).ok_or_else(|| gone(g.table))))
-                .collect::<Result<Vec<&GroupTable>>>()?;
-            let parts = (threads.degree() * 4).next_power_of_two().clamp(16, 1024);
-            let bits = parts.trailing_zeros();
-            let splits = pieces(threads, tables.len(), |at| tables[at].split(bits))?;
-            let layout = mine.layout().clone();
-            let merged = pieces(threads, parts, |part| {
-                let most = splits.iter().map(|s| s[part].len()).sum();
-                let mut table = GroupTable::with_capacity(layout.clone(), most);
-                for (other, split) in tables.iter().zip(&splits) {
-                    table.absorb_some(other, &split[part], fold);
-                }
-                table
-            })?;
-            GroupTable::join(layout, merged)
-        };
-        // The table adopted from the first worker is replaced, and its strings with it, but its
-        // heap is kept with the worker, which the merged table's strings may point into.
-        inner.rt.settle(workers, g.table, merged)?;
         // The groups are made into chunks here too, while there are threads to do it with.
         let table = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
+        let sets = self
+            .sets
+            .iter()
+            .map(|&h| inner.rt.distinct(h).map(|d| (h, d)).ok_or_else(|| gone(h)))
+            .collect::<Result<Vec<_>>>()?;
         let columns = self.columns;
         let chunks = pieces(threads, table.len().div_ceil(VECTOR_SIZE), |at| {
-            finish::group_chunk(table, &[], g, columns, at)
+            finish::group_chunk(table, &sets, g, columns, at)
         })?;
-        inner.out = chunks.into_iter().collect::<Result<_>>()?;
+        let chunks = chunks.into_iter().collect::<Result<_>>()?;
+        inner.out = chunks;
         inner.grouped = true;
         Ok(())
     }
@@ -630,7 +695,7 @@ impl Sink for Scan<'_, '_> {
 const SPLIT_FROM: usize = 1 << 16;
 
 fn gone(table: u64) -> Error {
-    Error::internal(format!("group table {table} is gone"))
+    Error::internal(format!("the group table or distinct set {table} is gone"))
 }
 
 /// Runs `count` pieces of work on the lease's threads, the calling one included, and hands back
