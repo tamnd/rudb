@@ -2026,8 +2026,9 @@ impl<'a> Binder<'a> {
         label: String,
         columns: ast::Slice,
     ) -> Result<(NodeRef, Scope)> {
-        let table = self.catalog.table(resolved)?;
-        let fields: Vec<Field> = table.columns().to_vec();
+        let catalog = self.catalog;
+        let table = catalog.table(resolved)?;
+        let fields: &[Field] = table.columns();
         // The new rows of an `ON CONFLICT DO UPDATE`, which the write puts in a table of their own
         // before it runs the query. Nothing the table knows about its own rows holds for them.
         let excluded = self.upsert && same_name(&label, "excluded");
@@ -2065,7 +2066,7 @@ impl<'a> Binder<'a> {
         let schema = self.plan.intern(&resolved.schema);
         let table_name = self.plan.intern(&resolved.table);
         let alias = self.plan.intern(&label);
-        let columns = self.plan.add_fields(&fields);
+        let columns = self.plan.add_fields(fields);
         // What the store wrote down about itself, against the table index the same way a Parquet
         // footer is. A table with nothing to say records nothing and the estimate falls back to the
         // constants it used before, which is what every table did until the file had a directory
@@ -2076,17 +2077,20 @@ impl<'a> Binder<'a> {
         if let Some(frequencies) = table.frequencies().filter(|_| !excluded) {
             self.plan.set_frequencies(index, frequencies);
         }
-        for (column, distinct) in table.distincts() {
-            if !excluded {
+        // A stored table hands over what it gathered once for the whole plan to share. Only a table
+        // whose rows can change is asked column by column.
+        let facts = table.facts().filter(|_| !excluded);
+        if let Some(facts) = facts {
+            self.plan.set_facts(index, facts, self.want_ascending);
+        } else if !excluded {
+            for (column, distinct) in table.distincts() {
                 self.plan.measure_distinct(index, &column, distinct);
             }
-        }
-        if self.want_ascending && !excluded {
-            for column in table.ascending() {
-                self.plan.mark_ascending(index, &column);
+            if self.want_ascending {
+                for column in table.ascending() {
+                    self.plan.mark_ascending(index, &column);
+                }
             }
-        }
-        if !excluded {
             for (column, bytes) in table.widths() {
                 self.plan.measure_width(index, &column, bytes);
             }

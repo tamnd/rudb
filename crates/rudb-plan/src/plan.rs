@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rudb_common::bounds::{Frequencies, Zones};
-use rudb_common::{Error, Field, LogicalType, Result, Span, Stat, Value};
+use rudb_common::{ColumnFacts, Error, Field, LogicalType, Result, Span, Stat, Value};
 
 use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
 use crate::node::{Bound, JoinKind, Node, WindowBound};
@@ -62,7 +62,11 @@ pub struct Plan {
     /// not by the position the column has in the scan, because column pruning moves the position
     /// and moves nothing else, and a number keyed to a position a pass has since changed is worse
     /// than no number.
-    distincts: BTreeMap<(u32, String), Stat<u64>>,
+    distincts: BTreeMap<u32, BTreeMap<String, Stat<u64>>>,
+    /// What a stored table knows about its columns by name, by table index, as the binder found it
+    /// in the catalog, and whether its ascending columns may be used. Read under `distincts`,
+    /// `ascending` and `widths`, which answer first where a pass wrote a column of its own.
+    facts: BTreeMap<u32, (Arc<ColumnFacts>, bool)>,
     /// The minimum and the maximum per part of the table bound at an index, where anything kept
     /// them.
     ///
@@ -108,10 +112,10 @@ pub struct Plan {
     ends: BTreeMap<u32, (i128, u64)>,
     /// The columns a table is stored in ascending order of, by table index and name, as the binder
     /// read them off the store's own summaries. A fact about the file, like `distincts`.
-    ascending: BTreeSet<(u32, String)>,
+    ascending: BTreeMap<u32, BTreeSet<String>>,
     /// How many bytes a value of a string column takes on average, by table index and name, as the
     /// binder read them off the store's own summaries. A fact about the file, like `distincts`.
-    widths: BTreeMap<(u32, String), u64>,
+    widths: BTreeMap<u32, BTreeMap<String, u64>>,
     /// The aggregates whose one grouping key arrives in ascending order, by output index, so that a
     /// group can be closed as soon as the key moves past it. A decision, like `dense`, written by
     /// one pass, `rudb_opt`'s `cluster`.
@@ -181,12 +185,13 @@ impl Plan {
             root: 0,
             measured: BTreeMap::new(),
             distincts: BTreeMap::new(),
+            facts: BTreeMap::new(),
             zones: BTreeMap::new(),
             frequencies: BTreeMap::new(),
             presized: BTreeMap::new(),
             dense: BTreeMap::new(),
             ends: BTreeMap::new(),
-            ascending: BTreeSet::new(),
+            ascending: BTreeMap::new(),
             widths: BTreeMap::new(),
             clustered: BTreeSet::new(),
             grouped: BTreeSet::new(),
@@ -237,19 +242,33 @@ impl Plan {
     /// A [`Stat`] and not a number, because a Parquet footer counts per row group and the question
     /// is about the column, so the two are the same number only where the file is one row group.
     pub fn measure_distinct(&mut self, index: u32, column: &str, distinct: Stat<u64>) {
-        self.distincts.insert((index, column.to_owned()), distinct);
+        self.distincts.entry(index).or_default().insert(column.to_owned(), distinct);
+    }
+
+    /// Records what the stored table bound at `index` knows about its columns, which answers every
+    /// column [`Self::measure_distinct`], [`Self::mark_ascending`] and [`Self::measure_width`] were
+    /// not called for. `ascending` says whether its ascending columns count, since not every
+    /// binder wants them.
+    pub fn set_facts(&mut self, index: u32, facts: Arc<ColumnFacts>, ascending: bool) {
+        self.facts.insert(index, (facts, ascending));
     }
 
     /// How many distinct values that column holds, where the binder counted.
     #[must_use]
     pub fn distinct_measured(&self, index: u32, column: &str) -> Stat<u64> {
-        self.distincts.get(&(index, column.to_owned())).copied().unwrap_or(Stat::Unknown)
+        self.distincts
+            .get(&index)
+            .and_then(|columns| columns.get(column))
+            .or_else(|| self.facts.get(&index).and_then(|(facts, _)| facts.distincts.get(column)))
+            .copied()
+            .unwrap_or(Stat::Unknown)
     }
 
     /// How many columns anybody counted, which is what a test about this asks.
     #[must_use]
     pub fn distinct_count(&self) -> usize {
-        self.distincts.len()
+        let facts = self.facts.values().map(|(facts, _)| facts.distincts.len());
+        self.distincts.values().map(BTreeMap::len).chain(facts).sum()
     }
 
     /// Records what the table bound at `index` keeps as bounds per part of itself.
@@ -331,6 +350,7 @@ impl Plan {
         self.zones.clear();
         self.frequencies.clear();
         self.distincts.clear();
+        self.facts.clear();
         self.ascending.clear();
         self.widths.clear();
     }
@@ -394,25 +414,32 @@ impl Plan {
     /// Records that the table bound to `index` stores its rows in ascending order of `column`,
     /// with no null in it.
     pub fn mark_ascending(&mut self, index: u32, column: &str) {
-        self.ascending.insert((index, column.to_owned()));
+        self.ascending.entry(index).or_default().insert(column.to_owned());
     }
 
     /// Whether the table bound to `index` stores its rows in ascending order of `column`.
     #[must_use]
     pub fn ascending(&self, index: u32, column: &str) -> bool {
-        self.ascending.contains(&(index, column.to_owned()))
+        self.ascending.get(&index).is_some_and(|columns| columns.contains(column))
+            || self.facts.get(&index).is_some_and(|(facts, ascending)| {
+                *ascending && facts.ascending.contains(column)
+            })
     }
 
     /// Records that a value of the string column called `column` of the table bound at `index` takes
     /// `bytes` bytes on average, counting only the values that are not null.
     pub fn measure_width(&mut self, index: u32, column: &str, bytes: u64) {
-        self.widths.insert((index, column.to_owned()), bytes);
+        self.widths.entry(index).or_default().insert(column.to_owned(), bytes);
     }
 
     /// How many bytes a value of that column takes on average, where the store said.
     #[must_use]
     pub fn width_measured(&self, index: u32, column: &str) -> Option<u64> {
-        self.widths.get(&(index, column.to_owned())).copied()
+        self.widths
+            .get(&index)
+            .and_then(|columns| columns.get(column))
+            .or_else(|| self.facts.get(&index).and_then(|(facts, _)| facts.widths.get(column)))
+            .copied()
     }
 
     /// Records that the aggregate binding its output to `index` sees its one key in ascending order.
