@@ -37,6 +37,7 @@ use rudb_qc_ir::{ErrorKind, Module};
 use rudb_qc_pipe::{Pipeline, Source, Step};
 use rudb_qc_plan::{Column, Key};
 use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
+use rudb_qc_rt::like::Like;
 use rudb_qc_rt::table::{Agreed, Distinct, GroupTable, Job, LANE_BITS, SetPart};
 use rudb_qc_rt::{Ablate, RUNTIME_ERROR, Rt, text};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
@@ -130,7 +131,20 @@ struct Inner<'a> {
 /// arena of its own and then made into a header, which was over a third of the instructions of
 /// TPC-H q1 compiled. Kept coded, the dictionary is made into headers once and a row costs the
 /// load of its header.
-type Headers = Vec<Option<(Arc<Vector>, Arc<Vector>, Vec<u128>)>>;
+///
+/// The same goes for each `LIKE` the body reads over a coded column: it is answered once for each
+/// value of the dictionary, and a row costs the load of its code's answer.
+#[derive(Debug, Default)]
+struct Headers {
+    text: Vec<Option<Flat>>,
+    likes: Vec<Option<Answered>>,
+}
+
+/// A dictionary, its values made flat, and a `str16` header per value.
+type Flat = (Arc<Vector>, Arc<Vector>, Vec<u128>);
+
+/// A dictionary and a `LIKE`'s answer for each of its values.
+type Answered = (Arc<Vector>, Vec<u8>);
 
 /// One cache line of state.
 #[repr(C, align(64))]
@@ -239,7 +253,7 @@ impl<'a> Feed<'a> {
                 merged: false,
                 workers: Vec::new(),
                 grouped: false,
-                headers: Vec::new(),
+                headers: Headers::default(),
             }),
         })
     }
@@ -287,7 +301,14 @@ impl<'a> Feed<'a> {
             let row = table.address(0) as u64;
             bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
         }
-        Worker { rt, state, out: Vec::new(), morsel: 0, from: Vec::new(), headers: Vec::new() }
+        Worker {
+            rt,
+            state,
+            out: Vec::new(),
+            morsel: 0,
+            from: Vec::new(),
+            headers: Headers::default(),
+        }
     }
 
     /// Says that the pipeline's input has `rows` rows, when that is known.
@@ -670,20 +691,45 @@ impl<'a> Feed<'a> {
         if rows == 0 {
             return Ok(Progress::More);
         }
+        // A `LIKE` over a column coded into a small dictionary, or one it has answered already, is
+        // answered for the dictionary's values and read through the codes. Every other `LIKE` is
+        // answered further down, over its column made flat.
+        headers.text.resize(self.body.reads.len(), None);
+        headers.likes.resize(self.body.likes.len(), None);
+        let mut answers: Vec<Option<Vec<u8>>> = Vec::with_capacity(self.body.likes.len());
+        for (m, known) in self.body.likes.iter().zip(headers.likes.iter_mut()) {
+            let v = chunk.column(m.column)?;
+            let codes = !self.tiers.ablate().off(Ablate::CODES);
+            answers.push(if codes && worded(v, rows, known.as_ref()) {
+                Some(like_coded(rt, m.like, v, rows, known)?)
+            } else {
+                None
+            });
+        }
+        let by_codes = |c: usize| {
+            self.body.likes.iter().zip(&answers).any(|(m, a)| m.column == c && a.is_some())
+        };
+        let flat = |c: usize| {
+            self.body.likes.iter().zip(&answers).any(|(m, a)| m.column == c && a.is_none())
+        };
         // A text column the body reads is kept coded when its dictionary is small or its headers
-        // are made already, and every other column is made flat. A column a `LIKE` answers is made
-        // flat too, because the answers read its strings in place.
-        headers.resize(self.body.reads.len(), None);
+        // are made already, and every other column is made flat. A column a `LIKE` answers over
+        // its strings is made flat too, because the answers read its strings in place, and one
+        // the body reads only through answers from its dictionary is not read at all.
         let mut keep = vec![false; chunk.width()];
-        for (&c, known) in self.body.reads.iter().zip(headers.iter()) {
-            keep[c] = !self.body.likes.iter().any(|m| m.column == c)
-                && coded(chunk.column(c)?, rows, known.as_ref());
+        for (&c, known) in self.body.reads.iter().zip(headers.text.iter()) {
+            keep[c] = !flat(c) && coded(chunk.column(c)?, rows, known.as_ref());
+        }
+        for m in &self.body.likes {
+            if by_codes(m.column) && !flat(m.column) && !self.body.reads.contains(&m.column) {
+                keep[m.column] = true;
+            }
         }
         let columns = chunk.into_columns().into_iter().zip(&keep);
         let columns = columns.map(|(v, &keep)| if keep { Ok(v) } else { v.into_flat() });
         let chunk = Chunk::with_rows(columns.collect::<Result<_>>()?, rows)?;
         let mut held = Vec::with_capacity(self.body.reads.len());
-        for (&c, known) in self.body.reads.iter().zip(headers.iter_mut()) {
+        for (&c, known) in self.body.reads.iter().zip(headers.text.iter_mut()) {
             held.push(if keep[c] {
                 Held::coded(chunk.column(c)?, rows, known)?
             } else {
@@ -691,36 +737,28 @@ impl<'a> Feed<'a> {
             });
         }
         let mut cols: Vec<Col> = held.iter().map(Held::col).collect();
-        // Each `LIKE` the body reads as a column is answered here for the whole morsel.
-        let mut answers = Vec::with_capacity(self.body.likes.len());
-        for m in &self.body.likes {
-            let like = rt.like(m.like).ok_or_else(|| Error::internal("a LIKE pattern is gone"))?;
-            let mut out = vec![0u8; rows];
-            if let Some(Data::Varlen(s)) = chunk.column(m.column)?.data() {
-                let (views, arena) = (s.views(), s.arena());
-                // A long string's view holds its length and its offset in the arena.
-                let place = |at: usize| {
-                    let w = views[at].to_bits();
-                    let n = w as u32 as usize;
-                    let start = (w >> 64) as u64 as usize;
-                    (n > text::INLINE).then(|| start..start.saturating_add(n))
-                };
-                let text = |at: usize| views[at].bytes_in(arena).unwrap_or_default();
-                like.answer(rows, arena, place, text, &mut out);
+        // Each other `LIKE` the body reads as a column is answered here for the whole morsel.
+        let mut valids = Vec::new();
+        for (m, answer) in self.body.likes.iter().zip(answers.iter_mut()) {
+            if answer.is_none() {
+                let like =
+                    rt.like(m.like).ok_or_else(|| Error::internal("a LIKE pattern is gone"))?;
+                let mut out = vec![0u8; rows];
+                answer_flat(like, chunk.column(m.column)?, rows, &mut out);
+                *answer = Some(out);
             }
+            let out = answer.as_ref().ok_or_else(|| Error::internal("a LIKE left unanswered"))?;
             let valid = match self.body.reads.iter().position(|&c| c == m.column) {
                 Some(at) => cols[at].valid,
                 None => {
                     // The body reads the column only through its answers, so only its validity
                     // is held and not its strings.
-                    let h = Held::of(chunk.column(m.column)?, rows, false)?;
-                    let valid = h.valid.as_ptr();
-                    held.push(h);
-                    valid
+                    let (valid, _) = validity(chunk.column(m.column)?, rows);
+                    valids.push(valid);
+                    valids.last().map_or(std::ptr::null(), Vec::as_ptr)
                 }
             };
             cols.push(Col { values: out.as_ptr(), valid });
-            answers.push(out);
         }
         let mut morsel = Morsel {
             source: 0,
@@ -1102,11 +1140,7 @@ impl<'c> Held<'c> {
 
     /// A text column held as codes into a dictionary: the header of each row's value, from the
     /// headers `known` has for the dictionary, made first when it has them for another one.
-    fn coded(
-        v: &'c Vector,
-        rows: usize,
-        known: &mut Option<(Arc<Vector>, Arc<Vector>, Vec<u128>)>,
-    ) -> Result<Held<'c>> {
+    fn coded(v: &'c Vector, rows: usize, known: &mut Option<Flat>) -> Result<Held<'c>> {
         let (codes, dictionary) = v
             .shared_dictionary_parts()
             .ok_or_else(|| Error::internal("a coded column that is not a dictionary"))?;
@@ -1141,7 +1175,7 @@ impl<'c> Held<'c> {
 /// Whether `v` is read as codes into its dictionary, which is when it is text coded into a
 /// dictionary with no NULL in it and either its headers are made already or the dictionary is not
 /// much longer than the chunk, so that making them is no more work than copying out the rows.
-fn coded(v: &Vector, rows: usize, known: Option<&(Arc<Vector>, Arc<Vector>, Vec<u128>)>) -> bool {
+fn coded(v: &Vector, rows: usize, known: Option<&Flat>) -> bool {
     if v.logical_type() != &LogicalType::Varchar {
         return false;
     }
@@ -1152,6 +1186,65 @@ fn coded(v: &Vector, rows: usize, known: Option<&(Arc<Vector>, Arc<Vector>, Vec<
         && !dictionary.validity().has_nulls(dictionary.len())
         && (known.is_some_and(|(d, ..)| Arc::ptr_eq(d, dictionary))
             || dictionary.len() <= rows.max(VECTOR_SIZE))
+}
+
+/// Whether a `LIKE` over `v` is answered for its dictionary's values rather than its rows, which is
+/// when it is text coded into a dictionary and either the answers are there already or the
+/// dictionary is not longer than the chunk, so that answering it is no more work than the rows.
+fn worded(v: &Vector, rows: usize, known: Option<&Answered>) -> bool {
+    if v.logical_type() != &LogicalType::Varchar {
+        return false;
+    }
+    let Some((codes, dictionary)) = v.shared_dictionary_parts() else {
+        return false;
+    };
+    codes.len() >= rows
+        && (known.is_some_and(|(d, _)| Arc::ptr_eq(d, dictionary))
+            || dictionary.len() <= rows.max(VECTOR_SIZE))
+}
+
+/// A `LIKE` over a coded column, one answer a row, from the answers `known` has for the
+/// dictionary, made first when it has them for another one.
+fn like_coded(
+    rt: &Rt,
+    like: u64,
+    v: &Vector,
+    rows: usize,
+    known: &mut Option<Answered>,
+) -> Result<Vec<u8>> {
+    let (codes, dictionary) = v
+        .shared_dictionary_parts()
+        .ok_or_else(|| Error::internal("a coded column that is not a dictionary"))?;
+    let codes = codes.get(..rows).ok_or_else(|| Error::internal("fewer codes than rows"))?;
+    if !known.as_ref().is_some_and(|(d, _)| Arc::ptr_eq(d, dictionary)) {
+        let like = rt.like(like).ok_or_else(|| Error::internal("a LIKE pattern is gone"))?;
+        let values = (**dictionary).clone().into_flat()?;
+        let mut out = vec![0u8; values.len()];
+        answer_flat(like, &values, values.len(), &mut out);
+        *known = Some((Arc::clone(dictionary), out));
+    }
+    let Some((_, made)) = known.as_ref() else {
+        return Err(Error::internal("answers made and then not there"));
+    };
+    // A NULL row's code may be anything, and its answer is never read because the row is NULL.
+    Ok(codes.iter().map(|&code| made.get(code as usize).copied().unwrap_or(0)).collect())
+}
+
+/// A `LIKE` over the first `rows` strings of a flat text column, one answer a row, with a row that
+/// is not a string answered false.
+fn answer_flat(like: &Like, v: &Vector, rows: usize, out: &mut [u8]) {
+    if let Some(Data::Varlen(s)) = v.data() {
+        let (views, arena) = (s.views(), s.arena());
+        // A long string's view holds its length and its offset in the arena.
+        let place = |at: usize| {
+            let w = views[at].to_bits();
+            let n = w as u32 as usize;
+            let start = (w >> 64) as u64 as usize;
+            (n > text::INLINE).then(|| start..start.saturating_add(n))
+        };
+        let text = |at: usize| views[at].bytes_in(arena).unwrap_or_default();
+        like.answer(rows, arena, place, text, out);
+    }
 }
 
 /// The validity bitmap of the first `rows` rows of `v`, and whether none of them is NULL.
@@ -1333,5 +1426,33 @@ mod tests {
             codes.iter().map(|&c| Some(words[c as usize].as_bytes().to_vec())).collect();
         assert_eq!(first, want);
         assert_eq!(again, want);
+    }
+    #[test]
+    fn a_like_over_a_coded_column_answers_each_dictionary_value_once() {
+        let words = ["http://google.com/", "", "no", "a long string with Google and google in it"];
+        let values: Vec<Value> = words.iter().map(|w| Value::Varchar((*w).to_string())).collect();
+        let dictionary = Arc::new(Vector::from_values(LogicalType::Varchar, &values).unwrap());
+        let codes = vec![3, 0, 1, 2, 3, 3, 0, 2, 1];
+        let rows = codes.len();
+        let v = Vector::stable_dictionary(codes.clone(), Arc::clone(&dictionary)).unwrap();
+        let mut rt = Rt::new(Cancel::new());
+        for (pattern, fold) in
+            [("%google%", false), ("%GOOGLE%", true), ("http%", false), ("", false)]
+        {
+            let like = rt.add_like(pattern, fold);
+            let mut known = None;
+            assert!(worded(&v, rows, known.as_ref()));
+            let first = like_coded(&rt, like, &v, rows, &mut known).unwrap();
+            let made = known.as_ref().map(|(_, answers)| answers.as_ptr());
+            let again = like_coded(&rt, like, &v, rows, &mut known).unwrap();
+            assert_eq!(made, known.as_ref().map(|(_, answers)| answers.as_ptr()));
+            let matcher = rt.like(like).unwrap();
+            let want: Vec<u8> = codes
+                .iter()
+                .map(|&c| u8::from(matcher.matches(words[c as usize].as_bytes())))
+                .collect();
+            assert_eq!(first, want, "{pattern}");
+            assert_eq!(again, want, "{pattern}");
+        }
     }
 }
