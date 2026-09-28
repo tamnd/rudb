@@ -1,4 +1,4 @@
-//! `COPY ... TO` a CSV or a JSON file.
+//! `COPY ... TO` a CSV, a JSON or a Parquet file.
 //!
 //! In CSV, every value is written as its cast to VARCHAR, under the session's time zone, which is
 //! what the pin writes: a list is `[1, 2]`, a double is `1e+20`, a blob is `\x00\xFF`. A value
@@ -12,14 +12,18 @@
 //! casts to, a list is an array, a struct and a map are objects, and anything else is the string its
 //! cast to VARCHAR reads. The rows go one to a line, or with `ARRAY` into one array with a row a
 //! line after a tab, where no rows at all is an array holding one empty line.
+//!
+//! A Parquet file is written by `rudb-parquet`, a row group at a time, with the columns cast first
+//! to the types that crate stores: an enum as its text, a coarse timestamp in microseconds.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use rudb_bind::CopyTo;
-use rudb_common::{Error, LogicalType, Result, SessionTimeZone, Value};
+use rudb_common::{Error, Field, LogicalType, Result, SessionTimeZone, Value};
+use rudb_compress::Codec;
 use rudb_kernels::cast::{cast_in_time_zone, cast_value};
-use rudb_vector::Vector;
+use rudb_vector::{Chunk, Vector};
 
 use crate::QueryResult;
 
@@ -182,6 +186,50 @@ pub(crate) fn write_json(
     out.flush().map_err(written)?;
     Ok(rows)
 }
+
+/// Writes a result as a Parquet file, a row group every `ROW_GROUP_SIZE` rows or so, since a
+/// group ends at the end of the chunk that fills it.
+pub(crate) fn write_parquet(copy: &CopyTo, result: &QueryResult) -> Result<usize> {
+    let file = File::create(&copy.path)
+        .map_err(|error| Error::io(format!("Cannot open file \"{}\": {error}", copy.path)))?;
+    let types = result.types();
+    let mut stored = Vec::with_capacity(types.len());
+    let mut fields = Vec::with_capacity(types.len());
+    for (name, ty) in result.names().iter().zip(types) {
+        let ty = rudb_parquet::storage(ty)?;
+        fields.push(Field::new(name.clone(), ty.clone()));
+        stored.push(ty);
+    }
+    let codec = if copy.compression == "snappy" { Codec::Snappy } else { Codec::Uncompressed };
+    let mut writer = rudb_parquet::Writer::new(BufWriter::new(file), &fields, codec, CREATED_BY)?;
+    let mut group = Vec::new();
+    let (mut waiting, mut rows) = (0, 0);
+    for chunk in result.chunks() {
+        let mut columns = Vec::with_capacity(chunk.width());
+        for (column, ty) in types.iter().enumerate() {
+            let vector = chunk.column(column)?;
+            columns.push(if *ty == stored[column] {
+                vector.clone()
+            } else {
+                cast_in_time_zone(vector, &stored[column], false, None)?
+            });
+        }
+        group.push(Chunk::new(columns)?);
+        waiting += chunk.len();
+        rows += chunk.len();
+        if waiting as u64 >= copy.row_group_size {
+            writer.write_group(&group)?;
+            group.clear();
+            waiting = 0;
+        }
+    }
+    writer.write_group(&group)?;
+    writer.finish()?;
+    Ok(rows)
+}
+
+/// What a Parquet file written here says wrote it.
+const CREATED_BY: &str = concat!("rudb version ", env!("CARGO_PKG_VERSION"));
 
 /// Whether a value of `ty` is written as a JSON string, the text of its cast to VARCHAR.
 fn quoted(ty: &LogicalType) -> bool {

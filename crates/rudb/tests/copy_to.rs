@@ -1,5 +1,5 @@
 //! `COPY ... TO` a CSV or a JSON file, checked byte for byte against what the pinned DuckDB wrote for the
-//! same statements.
+//! same statements, and a Parquet file, checked by reading it back.
 
 use std::path::PathBuf;
 
@@ -93,7 +93,15 @@ fn what_this_does_not_write_is_refused_by_name() {
     let db = Database::new();
     for (sql, message) in [
         ("COPY (SELECT 1 AS x) TO 'o.csv' (BOGUS 1)", "Unrecognized option \"bogus\" for csv"),
-        ("COPY (SELECT 1 AS x) TO 'o.csv' (FORMAT parquet)", "FORMAT parquet is not supported yet"),
+        (
+            "COPY (SELECT 1 AS x) TO 'o.parquet' (COMPRESSION zstd)",
+            "zstd codec is not supported yet",
+        ),
+        (
+            "COPY (SELECT 1 AS x) TO 'o.parquet' (BOGUS 1)",
+            "Unrecognized option \"bogus\" for parquet",
+        ),
+        ("COPY (SELECT [1] AS x) TO 'o.parquet'", "type INTEGER[] is not supported yet"),
     ] {
         let error = db.execute(sql).expect_err(sql).to_string();
         assert!(error.starts_with("Not implemented Error"), "{sql} gave {error}");
@@ -179,4 +187,81 @@ fn json_options_are_the_pins() {
         let error = db.execute(sql).expect_err(sql).to_string();
         assert!(error.starts_with(message), "{sql} gave {error}");
     }
+}
+
+fn values(db: &Database, sql: &str) -> Vec<Vec<rudb_common::Value>> {
+    let result = db.query(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    (0..result.len())
+        .map(|row| (0..result.width()).map(|column| result.value_at(row, column)).collect())
+        .collect()
+}
+
+#[test]
+fn a_parquet_file_reads_back_as_what_was_written() {
+    let db = Database::new();
+    db.execute(
+        "CREATE TABLE p (a TINYINT, b SMALLINT, c INTEGER, d BIGINT, e UTINYINT, f USMALLINT, \
+         g UINTEGER, h UBIGINT, i FLOAT, j DOUBLE, k VARCHAR, l BLOB, m BOOLEAN, n DATE, o TIME, \
+         q TIMESTAMP, r TIMESTAMPTZ, s DECIMAL(4,2), t DECIMAL(15,3), u DECIMAL(30,1))",
+    )
+    .expect("creates");
+    db.execute(
+        "INSERT INTO p VALUES \
+         (1, 2, 3, 4, 5, 6, 7, 8, 1.5, 2.5, 'text', 'blob\\x41', true, DATE '2026-01-02', \
+          TIME '01:02:03.5', TIMESTAMP '2026-01-02 03:04:05.25', \
+          TIMESTAMPTZ '2026-01-02 03:04:05+00', 12.34, 1234567.891, \
+          -123456789012345678901.5), \
+         (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+          NULL, NULL, NULL, NULL, NULL, NULL), \
+         (-1, -2, -3, -4, 250, 65000, 4000000000, 18000000000000000000, -1.5, -2.5, '', '', false, \
+          DATE '1970-01-01', TIME '00:00:00', TIMESTAMP '1969-12-31 23:59:59', \
+          TIMESTAMPTZ '1969-12-31 23:59:59+00', -0.01, 0, 99999999999999999999999999999.9)",
+    )
+    .expect("inserts");
+    // The blob is text, because a blob that is not reads back only once the reader has a byte
+    // column to put it in.
+    db.execute("SET TimeZone = 'UTC'").expect("sets");
+    for codec in ["snappy", "uncompressed"] {
+        let path = std::env::temp_dir()
+            .join(format!("rudb-copy-to-{codec}-{}.parquet", std::process::id()));
+        let sql = format!("COPY p TO '{}' (COMPRESSION {codec})", path.display());
+        let result = db.execute(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        assert!(result.changes().is_some(), "{sql} answers a count");
+        let back = format!("read_parquet('{}')", path.display());
+        assert_eq!(
+            values(&db, &format!("SELECT * FROM {back} ORDER BY c NULLS LAST")),
+            values(&db, "SELECT * FROM p ORDER BY c NULLS LAST"),
+            "{codec}"
+        );
+        let types = |from: &str| values(&db, &format!("SELECT column_type FROM (DESCRIBE {from})"));
+        assert_eq!(types(&format!("SELECT * FROM {back}")), types("SELECT * FROM p"), "{codec}");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn a_parquet_file_of_many_row_groups_reads_back_whole() {
+    let db = Database::new();
+    let path =
+        std::env::temp_dir().join(format!("rudb-copy-to-groups-{}.parquet", std::process::id()));
+    let sql = format!(
+        "COPY (SELECT range AS id, 'r' || range AS tag, CASE WHEN range % 7 = 0 THEN NULL \
+         ELSE range * 2 END AS twice FROM range(20000)) TO '{}' (ROW_GROUP_SIZE 4096)",
+        path.display()
+    );
+    db.execute(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    let back = format!("read_parquet('{}')", path.display());
+    let got = values(&db, &format!("SELECT count(*), sum(id), count(twice), max(tag) FROM {back}"));
+    let expected = values(
+        &db,
+        "SELECT count(*), sum(range), count(*) FILTER (WHERE range % 7 <> 0), max('r' || range) \
+         FROM range(20000)",
+    );
+    assert_eq!(got, expected);
+    let got = values(&db, &format!("SELECT tag, twice FROM {back} WHERE id = 12345"));
+    assert_eq!(
+        got,
+        vec![vec![rudb_common::Value::Varchar("r12345".into()), rudb_common::Value::BigInt(24690)]]
+    );
+    let _ = std::fs::remove_file(&path);
 }

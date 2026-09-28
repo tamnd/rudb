@@ -1,4 +1,4 @@
-//! Snappy, the raw block format, decompression only.
+//! Snappy, the raw block format.
 //!
 //! This is the format Parquet means by `SNAPPY`: a bare block, not the framed stream format with
 //! the `sNaPpY` magic and the per chunk CRCs. A Parquet page is a block, its length is in the
@@ -41,6 +41,90 @@
 //! written out there.
 
 use rudb_common::{Error, Result};
+
+/// How far back a copy may reach, which is also how much input one table of positions covers.
+const BLOCK: usize = 1 << 16;
+
+/// Compresses `input` into one Snappy block.
+///
+/// The greedy matcher every Snappy writer uses: a table from four bytes to where they were last
+/// seen, a copy wherever the table points at the same four bytes, and a literal for whatever lies
+/// between two copies. The input is taken 64 KiB at a time with a fresh table each, so no copy
+/// reaches back past the start of its piece and every offset fits the two byte copy. The ratio is
+/// the format's usual one, and the speed is that of one hash and one compare a byte.
+#[must_use]
+pub fn compress(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + input.len() + input.len() / 6);
+    let mut length = input.len() as u64;
+    while length >= 0x80 {
+        out.push((length as u8) | 0x80);
+        length >>= 7;
+    }
+    out.push(length as u8);
+    for piece in input.chunks(BLOCK) {
+        compress_piece(piece, &mut out);
+    }
+    out
+}
+
+/// One piece of at most [`BLOCK`] bytes.
+fn compress_piece(piece: &[u8], out: &mut Vec<u8>) {
+    const BITS: u32 = 14;
+    let mut table = vec![0_u16; 1 << BITS];
+    let word =
+        |at: usize| u32::from_le_bytes([piece[at], piece[at + 1], piece[at + 2], piece[at + 3]]);
+    let hash = |word: u32| (word.wrapping_mul(0x1E35_A7BD) >> (32 - BITS)) as usize;
+    let mut literal = 0;
+    let mut at = 0;
+    // The table holds positions plus one, so zero is an empty slot.
+    while at + 4 <= piece.len() {
+        let current = word(at);
+        let slot = hash(current);
+        let candidate = usize::from(table[slot]);
+        table[slot] = (at + 1) as u16;
+        if candidate == 0 || word(candidate - 1) != current {
+            at += 1;
+            continue;
+        }
+        let from = candidate - 1;
+        let mut length = 4;
+        while at + length < piece.len() && piece[from + length] == piece[at + length] {
+            length += 1;
+        }
+        emit_literal(&piece[literal..at], out);
+        emit_copy(at - from, length, out);
+        at += length;
+        literal = at;
+    }
+    emit_literal(&piece[literal..], out);
+}
+
+/// A literal element, with its length in the tag or in the bytes after it.
+fn emit_literal(bytes: &[u8], out: &mut Vec<u8>) {
+    if bytes.is_empty() {
+        return;
+    }
+    let less = bytes.len() - 1;
+    if less < 60 {
+        out.push((less as u8) << 2);
+    } else {
+        let width = (usize::BITS - less.leading_zeros()).div_ceil(8) as usize;
+        out.push(((59 + width) as u8) << 2);
+        out.extend_from_slice(&less.to_le_bytes()[..width]);
+    }
+    out.extend_from_slice(bytes);
+}
+
+/// A copy of `length` bytes from `offset` back, as two byte offset copies of at most 64 each.
+fn emit_copy(offset: usize, mut length: usize, out: &mut Vec<u8>) {
+    let offset = (offset as u16).to_le_bytes();
+    while length > 0 {
+        let take = length.min(64);
+        out.push((((take - 1) as u8) << 2) | 0b10);
+        out.extend_from_slice(&offset);
+        length -= take;
+    }
+}
 
 /// Decompresses a Snappy block that is known to hold `limit` bytes at the outside.
 ///
@@ -538,6 +622,32 @@ fn overruns(what: &str, len: usize, pos: usize, expected: usize) -> Error {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn compress_round_trips_and_shrinks_what_repeats() {
+        let mut inputs: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"a".to_vec(),
+            b"abcdabcdabcdabcdabcd".to_vec(),
+            vec![0; 300_000],
+            (0..200_000_u32).flat_map(|n| (n % 1000).to_le_bytes()).collect(),
+        ];
+        let mut state = 7_u64;
+        inputs.push(
+            (0..70_000)
+                .map(|_| {
+                    state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    (state >> 56) as u8
+                })
+                .collect(),
+        );
+        for input in &inputs {
+            let packed = super::compress(input);
+            let back = super::decompress(&packed, input.len()).expect("decompresses");
+            assert_eq!(&back, input);
+        }
+        assert!(super::compress(&inputs[3]).len() < 20_000);
+    }
     use super::decompressed_len;
     use rudb_common::Result;
 

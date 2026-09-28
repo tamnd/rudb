@@ -191,12 +191,7 @@ impl Page {
                                 .to_string(),
                         ));
                     }
-                    Physical::FixedLenByteArray => {
-                        return Err(Error::io(
-                            "a FIXED_LEN_BYTE_ARRAY column, which this reader does not read yet"
-                                .to_string(),
-                        ));
-                    }
+                    Physical::FixedLenByteArray => decimal_width(column)?,
                     Physical::Boolean | Physical::ByteArray => {
                         unreachable!("booleans take the fallback and byte arrays their own arm")
                     }
@@ -289,6 +284,18 @@ fn plain(
             let dense = booleans(tail(body, at)?, count)?;
             Ok(Data::Bool(Buffer::from_vec(spread(dense, levels, total))))
         }
+        // An unsigned column as wide as its wire type holds the bits, so a `UINTEGER` of four
+        // billion is a negative `INT32` on the wire and has to be read back as the bits it is.
+        Physical::Int32 if target == PhysicalType::UInt32 => {
+            let bytes = fixed::<4>(tail(body, at)?, count)?;
+            let wire = words::<4>(bytes).map(|word| i32::from_le_bytes(word).cast_unsigned());
+            narrow(target, count, wire, levels, total)
+        }
+        Physical::Int64 if target == PhysicalType::UInt64 => {
+            let bytes = fixed::<8>(tail(body, at)?, count)?;
+            let wire = words::<8>(bytes).map(|word| i64::from_le_bytes(word).cast_unsigned());
+            narrow(target, count, wire, levels, total)
+        }
         Physical::Int32 => {
             let bytes = fixed::<4>(tail(body, at)?, count)?;
             narrow(target, count, words::<4>(bytes).map(i32::from_le_bytes), levels, total)
@@ -318,10 +325,42 @@ fn plain(
              not read yet"
                 .to_string(),
         )),
+        Physical::FixedLenByteArray if matches!(column.ty, LogicalType::Decimal { .. }) => {
+            let width = decimal_width(column)?;
+            let wanted = count.checked_mul(width).ok_or_else(|| {
+                Error::io(format!("a page claiming {count} values of {width} bytes each"))
+            })?;
+            let bytes = tail(body, at)?.get(..wanted).ok_or_else(|| {
+                Error::io(format!("a page needing {wanted} bytes of values with fewer left"))
+            })?;
+            narrow(target, count, bytes.chunks_exact(width).map(signed_big_endian), levels, total)
+        }
         Physical::FixedLenByteArray => Err(Error::io(
-            "a FIXED_LEN_BYTE_ARRAY column, which this reader does not read yet".to_string(),
+            "a FIXED_LEN_BYTE_ARRAY column that is not a decimal, which this reader does not \
+             read yet"
+                .to_string(),
         )),
     }
+}
+
+/// The byte width of a decimal stored as a fixed length byte array, which is at most sixteen
+/// because nothing wider fits the thirty-eight digits a decimal here can have.
+fn decimal_width(column: &SchemaColumn) -> Result<usize> {
+    match usize::try_from(column.width) {
+        Ok(width @ 1..=16) => Ok(width),
+        _ => Err(Error::io(format!(
+            "a decimal column {} stored in {} bytes a value",
+            column.name, column.width
+        ))),
+    }
+}
+
+/// A two's complement integer written most significant byte first, in at most sixteen bytes.
+fn signed_big_endian(bytes: &[u8]) -> i128 {
+    let fill = if bytes.first().is_some_and(|first| first & 0x80 != 0) { 0xff } else { 0 };
+    let mut wide = [fill; 16];
+    wide[16 - bytes.len()..].copy_from_slice(bytes);
+    i128::from_be_bytes(wide)
 }
 
 /// Reads one of the delta encodings, or byte stream split, laid out for the column's type.
@@ -344,7 +383,16 @@ fn delta(
                 )));
             }
             let (dense, _) = crate::delta::binary_packed(tail(body, at)?, count)?;
-            narrow(target, count, dense.into_iter(), levels, total)
+            match (column.physical, target) {
+                (Physical::Int32, PhysicalType::UInt32) => {
+                    let wire = dense.into_iter().map(|value| (value as i32).cast_unsigned());
+                    narrow(target, count, wire, levels, total)
+                }
+                (Physical::Int64, PhysicalType::UInt64) => {
+                    narrow(target, count, dense.into_iter().map(i64::cast_unsigned), levels, total)
+                }
+                _ => narrow(target, count, dense.into_iter(), levels, total),
+            }
         }
         Encoding::DeltaLengthByteArray => {
             text(column)?;

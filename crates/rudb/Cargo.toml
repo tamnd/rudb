@@ -33,6 +33,8 @@ rudb-metrics.workspace = true
 rudb-native.workspace = true
 rudb-arrow.workspace = true
 rudb-io.workspace = true
+rudb-parquet.workspace = true
+rudb-compress.workspace = true
 iana-time-zone.workspace = true
 
 [features]
