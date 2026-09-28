@@ -23,15 +23,18 @@ impl Ablate {
     pub const STATS: Ablate = Ablate(1 << 4);
     /// A `LIKE` over a column coded into a dictionary answered once for each of its values.
     pub const CODES: Ablate = Ablate(1 << 5);
+    /// Overflow checks left out where the ranges in the table's statistics rule them out.
+    pub const RANGES: Ablate = Ablate(1 << 6);
 
     /// Every switch with its name, in the order a table of them is printed.
-    pub const ALL: [(&'static str, Ablate); 6] = [
+    pub const ALL: [(&'static str, Ablate); 7] = [
         ("probe", Ablate::PROBE),
         ("like", Ablate::LIKE),
         ("top", Ablate::TOP),
         ("lanes", Ablate::LANES),
         ("stats", Ablate::STATS),
         ("codes", Ablate::CODES),
+        ("ranges", Ablate::RANGES),
     ];
 
     /// Reads a comma separated list of names, where an empty list or `none` is nothing and `all`

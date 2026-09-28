@@ -37,6 +37,7 @@ mod tier;
 use std::time::Instant;
 
 use rudb_catalog::{Catalog, QualifiedName};
+use rudb_common::bounds::Bound;
 use rudb_common::{Cancel, LogicalType, Memory, Result, Session, Value};
 use rudb_pipeline::{Pool, Progress};
 use rudb_plan::{Node, NodeRef, Plan};
@@ -97,18 +98,80 @@ pub fn compile_with(
     cancel: &Cancel,
     options: Options,
 ) -> std::result::Result<Compiled, Refusal> {
+    compile_over(plan, None, cancel, options)
+}
+
+/// [`compile_with`], with the statistics `catalog` keeps about the tables the plan scans, which
+/// let the version of a body for a morsel with no NULL leave out the overflow checks the ranges of
+/// its columns rule out.
+///
+/// # Errors
+///
+/// As for [`compile`].
+pub fn compile_over(
+    plan: &Plan,
+    catalog: Option<&Catalog>,
+    cancel: &Cancel,
+    options: Options,
+) -> std::result::Result<Compiled, Refusal> {
     let started = Instant::now();
     let rel = rudb_qc_plan::lower(plan)?;
     let graph = rudb_qc_pipe::split(&rel);
     check(&graph)?;
+    let bits = catalog
+        .filter(|_| !options.ablate.off(Ablate::RANGES))
+        .map(|catalog| ranges(&graph, plan, catalog))
+        .unwrap_or_default();
     let planned = started.elapsed();
     let mut rt = Rt::new(cancel.clone());
     rt.set_ablate(options.ablate);
-    let query = rudb_qc_gen::generate(&graph, &mut rt)?;
+    let query = rudb_qc_gen::generate_with(&graph, &mut rt, &bits)?;
     let generated = started.elapsed().saturating_sub(planned);
     let tiers = Tiers::new(&query.module, options);
     tiers.generated_in(planned, generated);
     Ok(Compiled { graph, query, tiers, rt })
+}
+
+/// For each stage, what the statistics say about each column it scans, in the form
+/// [`rudb_qc_gen::generate_with`] takes.
+fn ranges(graph: &Graph, plan: &Plan, catalog: &Catalog) -> Vec<Vec<Option<u32>>> {
+    let stored = |stage: &Stage| -> Option<Vec<Option<u32>>> {
+        let Stage::Pipeline(p) = stage else { return None };
+        let Source::Scan { node, columns, .. } = &p.source else { return None };
+        let Node::Get { catalog: c, schema, table, .. } = *plan.node(*node) else { return None };
+        let name = QualifiedName::new(plan.string(c), plan.string(schema), plan.string(table));
+        let table = catalog.table(&name).ok()?;
+        Some(columns.iter().map(|c| bits(table, &c.name, &c.ty)).collect())
+    };
+    graph.stages.iter().map(|stage| stored(stage).unwrap_or_default()).collect()
+}
+
+/// The fewest `k` for which every value of the integer or decimal column `name` of `table` is at
+/// least `-2^k` and under `2^k`, as the unscaled integer of a decimal, when its zone maps know.
+fn bits(table: &rudb_catalog::Table, name: &str, ty: &LogicalType) -> Option<u32> {
+    let signed = matches!(
+        ty,
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::HugeInt
+    );
+    let unscaled = |b: Bound| match (b, ty) {
+        (Bound::Int(v), _) if signed => Some(v),
+        (Bound::Scaled { unscaled, scale }, LogicalType::Decimal { scale: s, .. })
+            if scale == *s =>
+        {
+            Some(unscaled)
+        }
+        _ => None,
+    };
+    if !signed && !matches!(ty, LogicalType::Decimal { .. }) {
+        return None;
+    }
+    let (low, high) = table.rows().exact_extremes(table.column_index(name)?).ok()??;
+    let (low, high) = (unscaled(low)?, unscaled(high)?);
+    (0..127).find(|&k| low >= -(1i128 << k) && high < 1i128 << k)
 }
 
 /// Refuses what the driver cannot run yet.

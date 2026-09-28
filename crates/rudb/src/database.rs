@@ -3346,7 +3346,7 @@ impl Shared {
                 }
             }
             let compiling = Span::start();
-            let compiled = rudb_qc::compile_with(plan, cancel, self.qc_options());
+            let compiled = rudb_qc::compile_over(plan, Some(catalog), cancel, self.qc_options());
             let (codegen_ns, _) = compiling.stop();
             match compiled {
                 Ok(compiled) => {
@@ -3435,7 +3435,7 @@ impl Shared {
             Bound::Explain { mut plan, analyze, statistics, codegen } => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if codegen {
-                    return explained_codegen(&plan, cancel, self.qc_options());
+                    return explained_codegen(&plan, &catalog, cancel, self.qc_options());
                 }
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
@@ -3903,7 +3903,7 @@ impl Shared {
             Bound::Explain { mut plan, analyze, statistics, codegen } => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if codegen {
-                    return explained_codegen(&plan, cancel, self.qc_options());
+                    return explained_codegen(&plan, &catalog, cancel, self.qc_options());
                 }
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
@@ -5230,10 +5230,11 @@ struct Codegen<'a> {
 /// does with the query and refusing it is what it does.
 fn explained_codegen(
     plan: &Plan,
+    catalog: &Catalog,
     cancel: &Cancel,
     options: rudb_qc::Options,
 ) -> Result<QueryResult> {
-    match rudb_qc::compile_with(plan, cancel, options) {
+    match rudb_qc::compile_over(plan, Some(catalog), cancel, options) {
         Ok(compiled) => explained("codegen", &compiled.explain()),
         Err(refusal) => explained("codegen", &format!("refused: {refusal}")),
     }

@@ -89,6 +89,10 @@ pub struct Body {
     /// can call either one on any morsel, and it is a pre-check guard of section 9.6 of
     /// `spec/compiler/09-tiering-and-caching.md` with `func` as its fallback.
     pub nonull: Option<String>,
+    /// The source columns [`Body::nonull`] also takes to be in range, each with the `k` for
+    /// which every value is at least `-2^k` and under `2^k`. The version leaves out the overflow
+    /// checks that range rules out, so the driver runs it only on a morsel that holds to it.
+    pub ranged: Vec<(usize, u32)>,
     /// The `LIKE` answers the body reads after its source columns in the morsel's column table,
     /// in that order.
     pub likes: Vec<Matched>,
@@ -248,6 +252,19 @@ pub enum AccOp {
 /// A refusal when a pipeline needs something the generator does not know yet, or when what it
 /// made does not verify, which is a bug and is refused rather than run.
 pub fn generate(graph: &Graph, rt: &mut Rt) -> Result<Query> {
+    generate_with(graph, rt, &[])
+}
+
+/// [`generate`], with what the statistics say about the columns each pipeline scans.
+///
+/// `bits` has one entry per stage, and each of those one per source column: the `k` for which
+/// every value of the column is at least `-2^k` and under `2^k`, or `None` when that is not known.
+/// A stage past the end of `bits` knows nothing.
+///
+/// # Errors
+///
+/// As for [`generate`].
+pub fn generate_with(graph: &Graph, rt: &mut Rt, bits: &[Vec<Option<u32>>]) -> Result<Query> {
     let mut module = Module::new("query");
     let mut bodies: Vec<Option<Body>> = Vec::with_capacity(graph.stages.len());
     for (stage, s) in graph.stages.iter().enumerate() {
@@ -265,7 +282,8 @@ pub fn generate(graph: &Graph, rt: &mut Rt) -> Result<Query> {
                         }
                     }
                 }
-                Some(pipeline(stage, p, &joins, &mut module, rt)?)
+                let known = bits.get(stage).map_or(&[][..], Vec::as_slice);
+                Some(pipeline(stage, p, &joins, &mut module, rt, known)?)
             }
             _ => None,
         });
@@ -317,6 +335,7 @@ fn pipeline(
     joins: &[Building],
     module: &mut Module,
     rt: &mut Rt,
+    bits: &[Option<u32>],
 ) -> Result<Body> {
     let name = format!("p{stage}");
     let source = p.source.columns();
@@ -358,25 +377,41 @@ fn pipeline(
         }
     }
     reads.sort_unstable();
-    let generic = Pass { name: &name, version: "generic", nonull: false, replay: None };
-    let (func, out, state, probes, made) =
+    let generic = Pass { name: &name, version: "generic", nonull: false, replay: None, bits: &[] };
+    let (func, out, state, probes, made, _) =
         emit(stage, p, joins, module, rt, &reads, &likes, generic)?;
     module.funcs.push(func);
     // The version for a morsel with no NULL in the columns it reads. It shares the generic one's
     // tables and kernels and has to come out with the same state, or it is left out.
     let mut nonull = None;
+    let mut ranged = Vec::new();
     if !reads.is_empty() || !likes.is_empty() {
         let variant = format!("{name}_nonull");
-        let pass = Pass { name: &variant, version: "nonull", nonull: true, replay: Some(&made) };
-        if let Ok((f, o, st, pr, _)) = emit(stage, p, joins, module, rt, &reads, &likes, pass)
+        let pass =
+            Pass { name: &variant, version: "nonull", nonull: true, replay: Some(&made), bits };
+        if let Ok((f, o, st, pr, _, r)) = emit(stage, p, joins, module, rt, &reads, &likes, pass)
             && (&o, st, &pr) == (&out, state, &probes)
         {
             module.funcs.push(f);
             module.guard("no NULL in the columns the morsel reads", &name, true);
             nonull = Some(variant);
+            ranged = r;
         }
     }
-    Ok(Body { func: name, reads, state, sink: out, probes, nonull, likes })
+    Ok(Body { func: name, reads, state, sink: out, probes, nonull, ranged, likes })
+}
+
+/// The digits after the point of a signed integer or a decimal type, which is none for an integer.
+fn scale_of(ty: &LogicalType) -> Option<u8> {
+    match ty {
+        LogicalType::Decimal { scale, .. } => Some(*scale),
+        LogicalType::TinyInt
+        | LogicalType::SmallInt
+        | LogicalType::Integer
+        | LogicalType::BigInt
+        | LogicalType::HugeInt => Some(0),
+        _ => None,
+    }
 }
 
 /// Adds every source column `e` reads outside the `LIKE`s in `likes` to `reads`, each once.
@@ -426,11 +461,13 @@ struct Pass<'a> {
     version: &'a str,
     nonull: bool,
     replay: Option<&'a [u64]>,
+    /// What the statistics say about the source columns, as in [`generate_with`].
+    bits: &'a [Option<u32>],
 }
 
-/// A pipeline's function, its sink, the bytes of state it needs, its probes, and the handles it
-/// made in the runtime.
-type Emitted = (Func, Out, u32, Vec<Probing>, Vec<u64>);
+/// A pipeline's function, its sink, the bytes of state it needs, its probes, the handles it made
+/// in the runtime, and the source columns it took to be in range.
+type Emitted = (Func, Out, u32, Vec<Probing>, Vec<u64>, Vec<(usize, u32)>);
 
 #[allow(clippy::too_many_arguments)]
 fn emit(
@@ -461,6 +498,8 @@ fn emit(
         nonull: pass.nonull,
         made: Vec::new(),
         replay: pass.replay.map(|made| (made, 0)),
+        bits: pass.bits,
+        ranged: Vec::new(),
     };
     g.b.func_mut().state.push(Field { offset: 0, size: HEADER, name: "header".into() });
 
@@ -552,9 +591,10 @@ fn emit(
     }
     let state = g.next.next_multiple_of(8);
     let made = std::mem::take(&mut g.made);
+    let ranged = std::mem::take(&mut g.ranged);
     let mut func = g.b.finish();
     dce(&mut func);
-    Ok((func, out, state, probes, made))
+    Ok((func, out, state, probes, made, ranged))
 }
 
 struct Gen<'a> {
@@ -590,6 +630,10 @@ struct Gen<'a> {
     made: Vec<u64>,
     /// On the second pass, the first one's handles and how many of them are handed out so far.
     replay: Option<(&'a [u64], usize)>,
+    /// What the statistics say about the source columns, as in [`generate_with`].
+    bits: &'a [Option<u32>],
+    /// The source columns this version took to be in range so far, each once.
+    ranged: Vec<(usize, u32)>,
 }
 
 /// A value and whether it is valid.
@@ -1068,6 +1112,26 @@ impl Gen<'_> {
         };
         let text = format!("Overflow in {word} of {}", e.ty.physical_name());
         let err = self.error(ErrorKind::Overflow, text);
+        // A result the ranges of its columns keep under ten to `width` can neither overflow nor
+        // run out of digits, which is most of the arithmetic of a report over stored decimals.
+        let mut used = Vec::new();
+        if self.nonull
+            && let Some(most) = self.reach(e, &mut used)
+            && most < pow10(u32::from(width)).unsigned_abs()
+        {
+            let plain = match name {
+                "+" => Op::Add,
+                "-" => Op::Sub,
+                _ => Op::Mul,
+            };
+            for u in used {
+                if !self.ranged.contains(&u) {
+                    self.ranged.push(u);
+                }
+            }
+            let valid = self.b.bin(Op::And, va, vb);
+            return Ok(Some((self.b.bin(plain, a, b), valid)));
+        }
         let v = self.b.checked(op, a, b, err);
         let reach = if product { lw.saturating_add(rw) } else { lw.max(rw).saturating_add(1) };
         if reach > width {
@@ -1075,6 +1139,44 @@ impl Gen<'_> {
         }
         let valid = self.b.bin(Op::And, va, vb);
         Ok(Some((v, valid)))
+    }
+
+    /// The most the unscaled integer of `e` can be either way when the source columns it reads are
+    /// in the ranges the statistics give, with those columns added to `used`. `None` when some
+    /// part of `e` is not arithmetic this follows.
+    fn reach(&self, e: &Expr, used: &mut Vec<(usize, u32)>) -> Option<u128> {
+        match &e.kind {
+            Kind::Column(c) => {
+                let k = (*self.bits.get(*c)?)?;
+                if !used.iter().any(|&(u, _)| u == *c) {
+                    used.push((*c, k));
+                }
+                1u128.checked_shl(k)
+            }
+            Kind::Constant(v) => match *v {
+                Value::Decimal { unscaled, .. } | Value::HugeInt(unscaled) => {
+                    Some(unscaled.unsigned_abs())
+                }
+                Value::BigInt(x) => Some(u128::from(x.unsigned_abs())),
+                Value::Integer(x) => Some(u128::from(x.unsigned_abs())),
+                Value::SmallInt(x) => Some(u128::from(x.unsigned_abs())),
+                Value::TinyInt(x) => Some(u128::from(x.unsigned_abs())),
+                _ => None,
+            },
+            // A cast between integers and decimals that adds digits after the point multiplies.
+            Kind::Cast { input, .. } => {
+                let (from, to) = (scale_of(&input.ty)?, scale_of(&e.ty)?);
+                let up = u32::from(to.checked_sub(from)?);
+                self.reach(input, used)?.checked_mul(pow10(up).unsigned_abs())
+            }
+            Kind::Function { name, args } => match (name.as_str(), args.as_slice()) {
+                ("+" | "-", [l, r]) => self.reach(l, used)?.checked_add(self.reach(r, used)?),
+                ("*", [l, r]) => self.reach(l, used)?.checked_mul(self.reach(r, used)?),
+                ("-", [x]) => self.reach(x, used),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Traps with `err` unless `v`, a decimal's unscaled integer in `ty`, is under ten to `width`
