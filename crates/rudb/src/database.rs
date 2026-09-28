@@ -3117,6 +3117,101 @@ impl Shared {
         journal.stage(payload);
     }
 
+    /// Runs a prepared one row `INSERT` without binding it, or says it cannot and leaves everything
+    /// as it was, for [`Shared::execute_ast`] to run.
+    ///
+    /// Everything that could make the plan's answer differ from putting the row in is checked
+    /// before anything is touched: a table with constraints, keys or a declared order, a column the
+    /// row leaves out that has a default, a null for a `NOT NULL` column, a value that is not
+    /// already its column's type or a widening of it, a transaction that is read only or aborted,
+    /// and a database that is read only or mirrors Parquet. The rest is what
+    /// [`Database::append`] does with a row, then the commit.
+    pub(crate) fn insert_direct(
+        &self,
+        direct: &crate::prepared::Direct,
+        parameters: &Parameters,
+        sql: &str,
+    ) -> Option<Result<QueryResult>> {
+        use crate::prepared::Item;
+        if !self.inner.writable || self.inner.settings.config().parquet_mirror() {
+            return None;
+        }
+        let _writing = self.writing();
+        if self.open().as_ref().is_some_and(|open| open.aborted || open.read_only) {
+            return None;
+        }
+        let mut catalog = self.write();
+        let parts: Vec<&str> = direct.name.iter().map(String::as_str).collect();
+        let name = catalog.resolve(&parts).ok()?;
+        if !name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)
+            || catalog.entry(&name).ok()? != Entry::Table
+        {
+            return None;
+        }
+        let table = catalog.table(&name).ok()?;
+        if !table.checks().is_empty()
+            || !table.foreign().is_empty()
+            || !table.keys().is_empty()
+            || !table.guards().is_empty()
+            || table.clustering().is_some()
+        {
+            return None;
+        }
+        let fields = table.columns();
+        let targets: Vec<usize> = if direct.columns.is_empty() {
+            (0..fields.len()).collect()
+        } else {
+            let mut targets = Vec::with_capacity(direct.columns.len());
+            for column in &direct.columns {
+                let at = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))?;
+                if targets.contains(&at) {
+                    return None;
+                }
+                targets.push(at);
+            }
+            targets
+        };
+        if targets.len() != direct.items.len()
+            || (0..fields.len()).any(|at| !targets.contains(&at) && table.default(at).is_some())
+        {
+            return None;
+        }
+        let mut row = vec![Value::Null; fields.len()];
+        for (item, &at) in direct.items.iter().zip(&targets) {
+            let value = match item {
+                Item::Null => Value::Null,
+                Item::Parameter(name) => parameters.get(name)?.clone(),
+            };
+            let ty = &fields[at].ty;
+            let value = if value.is_null() {
+                Value::Null
+            } else {
+                let from = value.logical_type();
+                if &from == ty {
+                    value
+                } else if widens(&from, ty) {
+                    rudb_kernels::cast::cast_value(&value, ty, false).ok()?
+                } else {
+                    return None;
+                }
+            };
+            if value.is_null() && fields[at].not_null {
+                return None;
+            }
+            row[at] = value;
+        }
+        let rows = [row];
+        let result = kept(sql, 0, |_| {
+            let table = catalog.table_mut(&name)?;
+            table.append_rows(&rows)?;
+            self.stage_rows(&name, table.columns(), &rows);
+            QueryResult::changed(1)
+        });
+        drop(catalog);
+        let settled = self.settle();
+        Some(result.and_then(|result| settled.map(|()| result)))
+    }
+
     /// Marks the commit of what is being written to checkpoint rather than log.
     fn unlogged(&self) {
         if let Some(journal) = self.journal().as_mut() {
@@ -4654,6 +4749,15 @@ fn asked_for_mirrors(bound: &Bound) -> bool {
 struct Noted {
     parse_ns: u64,
     bind_ns: u64,
+}
+
+/// Whether a value of type `from` goes into a column of type `to` by one of the casts
+/// [`Shared::insert_direct`] makes by itself: an integer into another integer or a `DOUBLE`, and a
+/// `FLOAT` into a `DOUBLE`. An integer that does not fit a narrower one fails the cast, and then
+/// the plan runs and refuses it in its own words.
+fn widens(from: &LogicalType, to: &LogicalType) -> bool {
+    (from.is_integer() && (to.is_integer() || matches!(to, LogicalType::Double)))
+        || (matches!(from, LogicalType::Float) && matches!(to, LogicalType::Double))
 }
 
 /// Run a statement and make sure it left a row for `rudb_statement_metrics()`.

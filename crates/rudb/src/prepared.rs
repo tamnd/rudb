@@ -2,7 +2,7 @@
 
 use rudb_bind::Parameters;
 use rudb_common::{Error, Result, Value};
-use rudb_parse::ast::Ast;
+use rudb_parse::ast::{self, Ast};
 use rudb_parse::parse_ast_with_case;
 
 use crate::connection::single;
@@ -40,6 +40,70 @@ pub struct Prepared {
     sql: String,
     ast: Ast,
     names: Vec<String>,
+    direct: Option<Direct>,
+}
+
+/// An `INSERT INTO t [(columns)] VALUES (row)` whose items are parameters or `NULL`, with nothing
+/// after the row: no `RETURNING`, no `ON CONFLICT`.
+///
+/// This is the trickle insert, one row per statement, and binding it builds a plan of a projection
+/// over a one row `VALUES` only for the executor to walk it back down to the row. So the shape is
+/// read once here, and an execution that finds a plain table under the name puts the row straight
+/// in. Anything the shape does not settle by itself, a constraint, a default or a value that needs
+/// more than a widening to fit its column, goes the long way, so the errors and the answers are
+/// the ones the plan gives.
+#[derive(Debug, Clone)]
+pub(crate) struct Direct {
+    /// The table's name, as it was written.
+    pub(crate) name: Vec<String>,
+    /// The column list, empty when the statement did not write one.
+    pub(crate) columns: Vec<String>,
+    /// The row, one item for each column it names.
+    pub(crate) items: Vec<Item>,
+}
+
+/// One item of a [`Direct`] row.
+#[derive(Debug, Clone)]
+pub(crate) enum Item {
+    /// A parameter, by its identifier.
+    Parameter(String),
+    /// A `NULL` written into the statement.
+    Null,
+}
+
+impl Direct {
+    /// The shape of `ast`, if it is one statement of it.
+    fn of(ast: &Ast) -> Option<Self> {
+        let [ast::Statement::Insert(at)] = ast.statements.as_slice() else { return None };
+        let insert = ast.insert(*at);
+        if insert.returning.is_some()
+            || insert.conflict.is_some()
+            || insert.copy
+            || insert.source == rudb_parse::NONE
+        {
+            return None;
+        }
+        let query = ast.query(insert.source);
+        let ast::QueryBody::Values(rows) = query.body else { return None };
+        if query != ast::Query::bare(query.body) {
+            return None;
+        }
+        let [row] = ast.rows(rows) else { return None };
+        let items = ast
+            .expr_list(*row)
+            .iter()
+            .map(|&expr| match ast.expr(expr) {
+                ast::Expr::Parameter { name } => Some(Item::Parameter(ast.string(name).to_owned())),
+                ast::Expr::Literal { kind: ast::LiteralKind::Null, .. } => Some(Item::Null),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            name: ast.name(insert.name).map(str::to_owned).collect(),
+            columns: ast.name(insert.columns).map(str::to_owned).collect(),
+            items,
+        })
+    }
 }
 
 impl Prepared {
@@ -48,7 +112,8 @@ impl Prepared {
         let session = shared.session();
         let ast = parse_ast_with_case(sql, session.semantics().identifier_case())?;
         let names = ast.parameters().into_iter().map(str::to_string).collect();
-        Ok(Self { shared, sql: sql.to_string(), ast, names })
+        let direct = Direct::of(&ast);
+        Ok(Self { shared, sql: sql.to_string(), ast, names, direct })
     }
 
     /// The statement as it was written.
@@ -106,6 +171,11 @@ impl Prepared {
     /// Checks the values against the statement and runs it.
     fn run(&self, parameters: Parameters) -> Result<QueryResult> {
         let result = self.check(&parameters).and_then(|()| {
+            if let Some(direct) = &self.direct
+                && let Some(done) = self.shared.insert_direct(direct, &parameters, &self.sql)
+            {
+                return done;
+            }
             // Zero for the parse, because this statement was parsed once at `PREPARE` and the
             // whole point of it is that this execution did not parse anything.
             self.shared.execute_ast(&self.ast, &self.sql, &parameters, &self.shared.token(), 0)
