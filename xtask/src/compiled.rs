@@ -149,11 +149,13 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let mut wrong = Vec::new();
     let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut compiles = Vec::new();
+    let ups = database.tier_ups();
     for (name, sql) in &queries {
         if !only.is_empty() && !only.contains(&name.as_str()) {
             continue;
         }
         let first = answer(&database, "first", sql);
+        let up = database.tier_ups();
         let logged = database.refusals().len();
         let mut compiled = answer(&database, "compiled", sql);
         if repeat > 1 && database.refusals().len() == logged {
@@ -195,6 +197,8 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         if refusal.is_none() {
             compiles.push(compiled.compile_ms);
         }
+        let moved = database.tier_ups() - up;
+        let verdict = if moved > 0 { format!("{verdict}, {moved} up to clif") } else { verdict };
         println!(
             "{name:<5} {:>8.3}s {:>8.3}s {:>8.3}ms {:>8.3}ms {:>8.3}ms {:>8.3}ms {:>7} {:>7}  {verdict}",
             first.seconds,
@@ -210,6 +214,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
 
     println!();
     println!("same {same}, same up to ties {ties}, refused {refused}, differ {}", wrong.len());
+    let ups = database.tier_ups() - ups;
+    if ups > 0 {
+        println!("{ups} pipeline functions moved up from direct to clif as they ran");
+    }
     compiled_in(&mut compiles);
     if !reasons.is_empty() {
         println!();

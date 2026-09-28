@@ -19,15 +19,24 @@
 //! pipeline that never starts costs nothing. Under `auto` a pipeline whose input is known to be at
 //! most one morsel from what storage or the stage before it says runs on `interp` without being
 //! compiled, which is rule I1, and every other one is compiled on `direct`, which is rule I2.
+//!
+//! A pipeline `auto` compiled on `direct` may then move up to `clif` while it runs, when the rows
+//! it has left make the compile pay for itself, which the [`up`] module decides.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use rudb_qc_interp::Program;
 use rudb_qc_ir::Module;
 use rudb_qc_rt::Rt;
+use rudb_qc_rt::code::Code;
+
+use crate::tier::up::{Calibration, Class, Progress, Seen, Verdict};
+
+mod up;
 
 /// Which tier runs a query's pipelines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -214,6 +223,9 @@ pub struct Options {
     pub tier: Tier,
     /// Whether it is made to move between the tiers as it runs.
     pub switch: Switch,
+    /// Whether a pipeline stays on the tier it started on, where `auto` would otherwise move it up
+    /// to `clif` when that pays.
+    pub stay: bool,
 }
 
 /// What the second tier did with a query's module, for `EXPLAIN (CODEGEN)` and the query log.
@@ -239,6 +251,12 @@ pub struct Report {
     pub small: usize,
     /// Each function that runs on `interp` although the tier compiles to machine code, and why.
     pub fallbacks: Vec<String>,
+    /// How many functions moved up to `clif` while their pipeline ran.
+    pub up: usize,
+    /// The time spent compiling them, on a thread of its own and not on the workers.
+    pub background: Duration,
+    /// Why each of them moved up, with what the decision read.
+    pub climbs: Vec<String>,
 }
 
 impl fmt::Display for Report {
@@ -258,8 +276,19 @@ impl fmt::Display for Report {
         if self.small > 0 {
             write!(f, ", {} on interp for one morsel of input", self.small)?;
         }
+        if self.up > 0 {
+            write!(
+                f,
+                ", {} moved up to clif in {:.3} ms in the background",
+                self.up,
+                self.background.as_secs_f64() * 1e3
+            )?;
+        }
         for reason in &self.fallbacks {
             write!(f, "\n  interp: {reason}")?;
+        }
+        for climb in &self.climbs {
+            write!(f, "\n  clif: {climb}")?;
         }
         Ok(())
     }
@@ -273,8 +302,20 @@ pub(crate) struct Tiers {
     /// Whether a function whose input is one morsel at most stays on `interp`, which `auto` asks.
     small: bool,
     /// Each function's machine code, made when its pipeline starts.
-    native: Vec<OnceLock<Option<rudb_qc_rt::code::Code>>>,
-    report: Mutex<Report>,
+    native: Vec<OnceLock<Option<Code>>>,
+    calibration: Calibration,
+    /// The clock the progress is kept on.
+    clock: Instant,
+    /// Each function's `clif` code once it has moved up, which a background compile fills. Empty
+    /// unless the query is on `auto` with `direct` and `clif` both built, the only way to move up.
+    upper: Vec<Arc<OnceLock<Option<Code>>>>,
+    /// Each function's rows and time so far, for the decision.
+    progress: Vec<Progress>,
+    /// Each function's class and size, set when it is compiled on `direct`.
+    shape: Vec<OnceLock<(Class, usize)>>,
+    /// The background compiles started.
+    pending: Mutex<Vec<JoinHandle<()>>>,
+    report: Arc<Mutex<Report>>,
     switch: Switch,
     /// How many morsels have been fed, which numbers them for [`Switch`].
     morsels: AtomicU64,
@@ -294,7 +335,7 @@ impl fmt::Debug for Tiers {
 impl Tiers {
     /// Lowers `module` for the interpreter and, when `options` asks for it, for the machine.
     pub(crate) fn new(module: &Module, options: Options) -> Tiers {
-        let Options { tier, switch } = options;
+        let Options { tier, switch, stay } = options;
         let program = Program::new(module);
         let counts = (
             AtomicU64::new(0),
@@ -303,6 +344,8 @@ impl Tiers {
         );
         let small = tier == Tier::Auto;
         let tier = tier.decided();
+        let climb = small && !stay && tier == Tier::Direct && Tier::Clif.built();
+        let each = if climb { module.funcs.len() } else { 0 };
         let insts = module.funcs.iter().flat_map(|f| &f.blocks).map(|b| b.prov.len()).sum();
         let report =
             Report { tier: tier.name(), functions: module.funcs.len(), insts, ..Report::default() };
@@ -313,7 +356,13 @@ impl Tiers {
             tier,
             small,
             native,
-            report: Mutex::new(report),
+            calibration: Calibration::HOST,
+            clock: Instant::now(),
+            upper: (0..each).map(|_| Arc::default()).collect(),
+            progress: (0..each).map(|_| Progress::default()).collect(),
+            shape: (0..each).map(|_| OnceLock::new()).collect(),
+            pending: Mutex::new(Vec::new()),
+            report: Arc::new(Mutex::new(report)),
             switch,
             morsels,
             last,
@@ -328,16 +377,17 @@ impl Tiers {
 
     /// Notes how long the plan took to lower and the module to generate, which happened before
     /// the tiers saw it.
-    pub(crate) fn generated_in(&mut self, plan: Duration, generate: Duration) {
-        let report = self.report.get_mut().unwrap_or_else(PoisonError::into_inner);
+    pub(crate) fn generated_in(&self, plan: Duration, generate: Duration) {
+        let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
         report.plan = plan;
         report.generate = generate;
     }
 
     /// Readies function `f` of `module` for a pipeline that is about to start, whose input is
-    /// `rows` rows when that is known. The function is compiled here, once, unless the tier is
-    /// `interp` or `auto` keeps a function with at most one morsel of input on `interp`.
-    pub(crate) fn prepare(&self, module: &Module, f: usize, rows: Option<usize>) {
+    /// `rows` rows when that is known and which probes a join table when `probes` is set. The
+    /// function is compiled here, once, unless the tier is `interp` or `auto` keeps a function
+    /// with at most one morsel of input on `interp`.
+    pub(crate) fn prepare(&self, module: &Module, f: usize, rows: Option<usize>, probes: bool) {
         let Some(slot) = self.native.get(f) else { return };
         if slot.get().is_some() {
             return;
@@ -356,18 +406,27 @@ impl Tiers {
                 return;
             }
         };
-        slot.get_or_init(|| {
+        let code = slot.get_or_init(|| {
             let func = module.funcs.get(f)?;
             let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
             native::compile(func, &mut report, lower)
         });
+        // Only a function on `direct` whose input has a known size may move up.
+        if code.is_some()
+            && let (Some(func), Some(p), Some(shape), Some(rows)) =
+                (module.funcs.get(f), self.progress.get(f), self.shape.get(f), rows)
+        {
+            let insts = func.blocks.iter().map(|b| b.prov.len()).sum();
+            let _ = shape.set((Class::of(func, probes), insts));
+            p.total.store(rows as u64, Ordering::Relaxed);
+        }
     }
 
     /// Readies every function as a pipeline with an input of unknown size would, for
     /// `EXPLAIN (CODEGEN)`, which shows the code without running the query.
     pub(crate) fn prepare_all(&self, module: &Module) {
         for f in 0..module.funcs.len() {
-            self.prepare(module, f, None);
+            self.prepare(module, f, None, false);
         }
     }
 
@@ -396,6 +455,94 @@ impl Tiers {
         native
     }
 
+    /// When a morsel of function `f` starts, when its time counts toward moving it up.
+    pub(crate) fn start(&self, f: usize) -> Option<Instant> {
+        self.progress.get(f).filter(|p| !p.decided.load(Ordering::Relaxed)).map(|_| Instant::now())
+    }
+
+    /// Counts a worker of function `f`.
+    pub(crate) fn joined(&self, f: usize) {
+        if let Some(p) = self.progress.get(f) {
+            p.workers.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts a morsel of `rows` rows of function `f` of `module` that started at `start`, and
+    /// moves the function up to `clif` when this is the worker to decide and that pays.
+    pub(crate) fn ran(&self, module: &Module, f: usize, rows: usize, start: Instant) {
+        let Some(p) = self.progress.get(f) else { return };
+        let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let now = nanos(self.clock.elapsed());
+        let took = nanos(start.elapsed());
+        let at = nanos(start.saturating_duration_since(self.clock));
+        if !p.ran(rows as u64, took, at, now, self.calibration.period) {
+            return;
+        }
+        let Some(&(class, insts)) = self.shape.get(f).and_then(OnceLock::get) else { return };
+        let seen = p.seen(now, insts, class);
+        let Some(verdict) = up::decide(&seen, &self.calibration) else { return };
+        // A compile past the cap waits for the next decision.
+        let cap = std::thread::available_parallelism().map_or(1, |n| (n.get() / 8).max(1));
+        if COMPILING.fetch_add(1, Ordering::Relaxed) >= cap {
+            COMPILING.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        if p.decided.swap(true, Ordering::Relaxed) {
+            COMPILING.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        self.climb(module, f, &seen, verdict);
+    }
+
+    /// Compiles function `f` of `module` on `clif` on a thread of its own, and publishes the code
+    /// for the workers' next morsels. One slot in [`COMPILING`] is already taken for it.
+    fn climb(&self, module: &Module, f: usize, seen: &Seen, verdict: Verdict) {
+        let (Some(func), Some(slot)) = (module.funcs.get(f), self.upper.get(f)) else {
+            COMPILING.fetch_sub(1, Ordering::Relaxed);
+            return;
+        };
+        let (func, slot, report) = (func.clone(), Arc::clone(slot), Arc::clone(&self.report));
+        let rate = seen.rows as f64 / seen.busy as f64 * 1e3;
+        let why = format!(
+            "{} after {} morsels on {} workers with {} rows left at {rate:.1} rows a µs a worker, {:.3} ms to stay and {:.3} ms to move up with a {:.3} ms compile",
+            func.name,
+            seen.morsels,
+            seen.workers.max(1),
+            seen.left,
+            verdict.stay / 1e6,
+            verdict.up / 1e6,
+            verdict.cost / 1e6,
+        );
+        let job = move || {
+            let mut done = Report { tier: Tier::Clif.name(), ..Report::default() };
+            let code = native::compile(&func, &mut done, clif::compile);
+            let _ = slot.set(code);
+            let mut report = report.lock().unwrap_or_else(PoisonError::into_inner);
+            report.up += done.native;
+            MOVED.fetch_add(done.native as u64, Ordering::Relaxed);
+            report.background += done.compile;
+            report.fallbacks.append(&mut done.fallbacks);
+            report.climbs.push(why);
+            COMPILING.fetch_sub(1, Ordering::Relaxed);
+        };
+        match std::thread::Builder::new().name("rudb-qc-clif".into()).spawn(job) {
+            Ok(handle) => self.pending.lock().unwrap_or_else(PoisonError::into_inner).push(handle),
+            Err(_) => {
+                COMPILING.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Waits for the background compiles started so far.
+    #[cfg(test)]
+    fn settle(&self) {
+        let pending =
+            std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner));
+        for handle in pending {
+            let _ = handle.join();
+        }
+    }
+
     /// Whether function `f` has machine code.
     fn has_native(&self, f: usize) -> bool {
         self.native.get(f).and_then(OnceLock::get).is_some_and(Option::is_some)
@@ -411,11 +558,32 @@ impl Tiers {
         m: *const u8,
         rt: &mut Rt,
     ) -> u64 {
-        if native && let Some(Some(code)) = self.native.get(f).and_then(OnceLock::get) {
-            return native::call(code, st, m, rt);
+        if native {
+            // The `clif` code once a function has moved up, which the slot's acquire makes safe to
+            // call from the morsel after it was published.
+            if let Some(Some(code)) = self.upper.get(f).and_then(|slot| slot.get()) {
+                return native::call(code, st, m, rt);
+            }
+            if let Some(Some(code)) = self.native.get(f).and_then(OnceLock::get) {
+                return native::call(code, st, m, rt);
+            }
         }
         self.program.call(f, st, m, rt)
     }
+}
+
+/// How many background compiles are running in the process, which section 9.5 of the spec caps
+/// at one for every eight threads.
+static COMPILING: AtomicUsize = AtomicUsize::new(0);
+
+/// How many functions have moved up to `clif` in the process.
+static MOVED: AtomicU64 = AtomicU64::new(0);
+
+/// How many functions have moved up to `clif` in the process so far, counted when their compile
+/// is done, which may be after their query is.
+#[must_use]
+pub fn moved_up() -> u64 {
+    MOVED.load(Ordering::Relaxed)
 }
 
 /// Loading and calling machine code, whichever backend made it.

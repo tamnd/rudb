@@ -208,6 +208,7 @@ impl<'a> Feed<'a> {
 
     /// A worker with a runtime of its own and its state as init leaves it.
     fn worker(&self) -> Worker {
+        self.tiers.joined(self.func);
         let mut rt = self.lock().rt.worker();
         if self.split
             && let Out::Aggregate(g) = &self.body.sink
@@ -477,6 +478,7 @@ impl<'a> Feed<'a> {
             Out::Aggregate(_) => tier::Sink::Aggregate,
             Out::Build(_) => tier::Sink::Build,
         };
+        let start = self.tiers.start(self.func);
         'attempt: loop {
             buffers.clear();
             if let Out::Result { count, columns, capacity } = &self.body.sink {
@@ -527,6 +529,9 @@ impl<'a> Feed<'a> {
             }
         }
         drop(held);
+        if let Some(start) = start {
+            self.tiers.ran(self.module, self.func, rows, start);
+        }
         if let Out::Result { count, columns, .. } = &self.body.sink {
             let st = bytes(state);
             let n = u64::from_le_bytes(

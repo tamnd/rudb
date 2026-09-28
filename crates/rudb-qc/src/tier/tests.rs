@@ -405,19 +405,110 @@ fn a_switch_names_itself_the_way_set_takes_it() {
 fn switches_move_a_function_between_the_tiers_and_are_counted_where_they_land() {
     let m = parse(FLOW).expect("the flow module parses");
     let Some(&tier) = natives().first() else { return };
-    let every = tiers(&m, Options { tier, switch: Switch::Every(2) });
+    let every = tiers(&m, Options { tier, switch: Switch::Every(2), ..Options::default() });
     let picked: Vec<bool> = (0..8).map(|_| every.morsel(0, Sink::Aggregate)).collect();
     assert_eq!(picked, [true, true, false, false, true, true, false, false]);
     assert_eq!(every.switches(), Switches { aggregate: 3, ..Switches::default() });
 
-    let random = tiers(&m, Options { tier, switch: Switch::Random(1) });
+    let random = tiers(&m, Options { tier, switch: Switch::Random(1), ..Options::default() });
     let picked: Vec<bool> = (0..64).map(|_| random.morsel(0, Sink::Build)).collect();
     let flips = picked.windows(2).filter(|w| w[0] != w[1]).count() as u64;
     assert!(flips > 8, "{picked:?}");
     assert_eq!(random.switches(), Switches { build: flips, ..Switches::default() });
 
     // On `interp` there is nothing to switch to, and nothing is counted.
-    let interp = tiers(&m, Options { tier: Tier::Interp, switch: Switch::Every(1) });
+    let interp =
+        tiers(&m, Options { tier: Tier::Interp, switch: Switch::Every(1), ..Options::default() });
     assert!((0..8).all(|_| !interp.morsel(0, Sink::Result)));
     assert_eq!(interp.switches().total(), 0);
+}
+
+#[test]
+fn kohn_moves_up_past_the_worked_example_of_the_spec_and_not_before() {
+    use super::up::{Calibration, Class, Seen, decide};
+    // One worker, `clif` 1.045 times faster and a 160 µs compile, which section 9.4 works out
+    // needs about 7.4 ms left on `direct`, at one row a nanosecond.
+    let c = Calibration {
+        fixed: 160_000.0,
+        per_inst: 0.0,
+        speedup: [1.045; 4],
+        first_after: 0,
+        ..Calibration::HOST
+    };
+    let seen = |left: u64| Seen {
+        elapsed: 1_000_000,
+        morsels: 4,
+        workers: 1,
+        rows: 1_000_000,
+        left,
+        busy: 1_000_000,
+        insts: 40,
+        class: Class::Aggregate,
+    };
+    assert_eq!(decide(&seen(7_300_000), &c), None);
+    let verdict = decide(&seen(7_600_000), &c).expect("it pays past 7.4 ms");
+    assert!(verdict.stay - verdict.up >= verdict.cost, "{verdict:?}");
+    // Too early, too few morsels, or a class that gains nothing, and it stays.
+    assert_eq!(decide(&Seen { elapsed: 10, ..seen(u64::MAX / 4) }, &Calibration::HOST), None);
+    assert_eq!(decide(&Seen { workers: 8, ..seen(u64::MAX / 4) }, &c), None);
+    let flat = Calibration { speedup: [1.0; 4], ..c };
+    assert_eq!(decide(&seen(u64::MAX / 4), &flat), None);
+    // Other workers keep going on `direct` while one compiles, so more of them need more rows.
+    let wide = Seen { workers: 16, morsels: 16, ..seen(7_600_000) };
+    assert_eq!(decide(&wide, &c), None);
+}
+
+#[test]
+fn a_function_on_direct_moves_up_to_clif_once_and_gives_the_interpreters_bits() {
+    let m = parse(FLOW).expect("the flow module parses");
+    let named = Tiers::new(&m, Options { tier: Tier::Direct, ..Options::default() });
+    assert!(named.progress.is_empty(), "only auto moves up");
+    let stays = Tiers::new(&m, Options { stay: true, ..Options::default() });
+    assert!(stays.progress.is_empty(), "stay keeps a function where it started");
+    if !(Tier::Direct.built() && Tier::Clif.built()) {
+        return;
+    }
+    let mut auto = Tiers::new(&m, Options::default());
+    auto.calibration = super::up::Calibration {
+        fixed: 1.0,
+        per_inst: 0.0,
+        speedup: [2.0; 4],
+        first_after: 0,
+        period: 0,
+        ..super::up::Calibration::HOST
+    };
+    auto.prepare(&m, 0, Some(1 << 30), false);
+    let interp = tiers(&m, Options { tier: Tier::Interp, ..Options::default() });
+    let state = || {
+        let mut s = [0u128; 24];
+        s[4] = 5 | (0b1011 << 64);
+        s[5] = 1;
+        for (at, w) in s[8..16].iter_mut().enumerate() {
+            *w = at as u128 * 3;
+        }
+        s
+    };
+    let mut rt = Rt::new(Cancel::new());
+    let mut want = state();
+    let status = interp.call(false, 0, want.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
+    for morsel in 0..4 {
+        if morsel == 2 {
+            auto.settle();
+            let report = auto.report();
+            assert_eq!((report.up, report.climbs.len()), (1, 1), "{report}");
+            assert!(matches!(auto.upper[0].get(), Some(Some(_))), "{report}");
+        }
+        let start = auto.start(0);
+        let mut got = state();
+        let native = auto.morsel(0, Sink::Result);
+        assert!(native, "morsel {morsel}");
+        let back = auto.call(native, 0, got.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
+        assert_eq!((status, want), (back, got), "morsel {morsel}");
+        if let Some(start) = start {
+            auto.ran(&m, 0, 1000, start);
+        }
+    }
+    // It decided once and moved up once.
+    assert!(auto.start(0).is_none());
+    assert_eq!(auto.report().up, 1);
 }
