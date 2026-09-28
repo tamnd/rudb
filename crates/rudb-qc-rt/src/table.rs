@@ -346,12 +346,15 @@ impl GroupTable {
 
     /// Folds the groups `picks` of `other`, as [`split`](GroupTable::split) gave them, into this
     /// table, as [`absorb`](GroupTable::absorb) does with all of them. With `made`, each group's id
-    /// in `other` and the group it became here are pushed to it.
+    /// in `other` and the group it became here are pushed to it. With `whole`, a key this table
+    /// does not have yet takes the row of `other` as it is, which is right when combining a row
+    /// into a new group's row gives that row back.
     pub fn absorb_some(
         &mut self,
         other: &GroupTable,
         picks: &[(usize, u64)],
         mut made: Option<&mut Vec<(u32, u32)>>,
+        whole: bool,
         mut combine: impl FnMut(&mut [u8], &[u8]),
     ) {
         /// How many groups ahead a row is asked for before it is read.
@@ -364,12 +367,28 @@ impl GroupTable {
             // SAFETY: `split` took the address from `other`'s rows, and `other` is borrowed, so
             // its pages are still there.
             let src = unsafe { crate::mem::slice(row, other.row_size) };
-            let at = self.find_or_add(&src[8..8 + size], hash, None);
+            let key = &src[8..8 + size];
+            let at = match self.probe(key, hash) {
+                Ok(gid) => {
+                    combine(self.row_mut(gid), src);
+                    gid
+                }
+                Err(slot) => {
+                    let gid = if whole {
+                        self.copy(src, hash)
+                    } else {
+                        let gid = self.add(key, hash, None);
+                        combine(self.row_mut(gid), src);
+                        gid
+                    };
+                    self.place(slot, gid, hash);
+                    gid
+                }
+            };
             if let Some(made) = made.as_deref_mut() {
                 let gid = u64::from_le_bytes(src[..8].try_into().unwrap_or_default());
                 made.push((gid as u32, at as u32));
             }
-            combine(self.row_mut(at), src);
         }
     }
 
@@ -455,6 +474,18 @@ impl GroupTable {
     /// The group id of `key`, made if it is new. A long string in a new key is copied into `heap`
     /// when there is one.
     fn find_or_add(&mut self, key: &[u8], hash: u64, heap: Option<&mut Heap>) -> usize {
+        match self.probe(key, hash) {
+            Ok(gid) => gid,
+            Err(at) => {
+                let gid = self.add(key, hash, heap);
+                self.place(at, gid, hash);
+                gid
+            }
+        }
+    }
+
+    /// The group id of `key`, or the empty slot a new group of it goes in.
+    fn probe(&mut self, key: &[u8], hash: u64) -> Result<usize, usize> {
         if self.slots.is_empty() {
             self.slots = vec![0; 64];
             self.grow();
@@ -465,23 +496,26 @@ impl GroupTable {
         loop {
             let slot = self.slots[at];
             if slot == 0 {
-                break;
+                return Err(at);
             }
             let gid = (slot as u32 - 1) as usize;
             if slot & !0xffff_ffff == tag && self.same(gid, key) {
-                return gid;
+                return Ok(gid);
             }
             at = (at + 1) & mask;
         }
-        let gid = self.add(key, hash, heap);
-        self.slots[at] = tag | (gid as u64 + 1);
+    }
+
+    /// Points the empty slot `at` that [`probe`](GroupTable::probe) gave at the new group `gid`,
+    /// and forgets the groups or grows the slots when there are enough of them.
+    fn place(&mut self, at: usize, gid: usize, hash: u64) {
+        self.slots[at] = (hash << 32) | (gid as u64 + 1);
         if self.cap != 0 && self.rows.len() - self.since >= self.cap {
             self.slots.fill(0);
             self.since = self.rows.len();
         } else if (self.rows.len() - self.since) * 2 > self.slots.len() {
             self.grow();
         }
-        gid
     }
 
     fn same(&self, gid: usize, key: &[u8]) -> bool {
@@ -510,19 +544,48 @@ impl GroupTable {
         true
     }
 
-    fn add(&mut self, key: &[u8], hash: u64, mut heap: Option<&mut Heap>) -> usize {
-        let gid = self.rows.len();
-        if self.fill == ROWS_PER_PAGE {
+    /// The address of a row no group has yet, at the end of the last page.
+    fn room(&mut self) -> usize {
+        if self.fill == ROWS_PER_PAGE || self.pages.is_empty() {
             self.pages.push(vec![0u8; ROWS_PER_PAGE * self.row_size].into_boxed_slice());
             self.fill = 0;
         }
-        let size = self.row_size;
+        let at = self.fill * self.row_size;
+        self.fill += 1;
+        self.pages.last_mut().map_or(0, |page| page[at..].as_mut_ptr().expose_provenance())
+    }
+
+    /// A new group whose row is `src` but for the group id at its front.
+    fn copy(&mut self, src: &[u8], hash: u64) -> usize {
+        let gid = self.rows.len();
+        let address = self.room();
+        // SAFETY: `room` gave a row of `row_size` bytes in a page this table owns, and no group
+        // points at it yet.
+        let row = unsafe {
+            std::slice::from_raw_parts_mut(
+                std::ptr::with_exposed_provenance_mut::<u8>(address),
+                self.row_size,
+            )
+        };
+        row.copy_from_slice(&src[..self.row_size]);
+        row[..8].copy_from_slice(&(gid as u64).to_le_bytes());
+        self.rows.push(address);
+        self.hashes.push(hash);
+        gid
+    }
+
+    fn add(&mut self, key: &[u8], hash: u64, mut heap: Option<&mut Heap>) -> usize {
+        let gid = self.rows.len();
+        let address = self.room();
         let acc = Layout::acc_offset(self.layout.key_size) as usize;
-        let GroupTable { layout, pages, fill, .. } = self;
-        let Some(page) = pages.last_mut() else { return 0 };
-        let at = *fill * size;
-        *fill += 1;
-        let row = &mut page[at..at + size];
+        // SAFETY: as in `copy`.
+        let row = unsafe {
+            std::slice::from_raw_parts_mut(
+                std::ptr::with_exposed_provenance_mut::<u8>(address),
+                self.row_size,
+            )
+        };
+        let layout = &self.layout;
         row[..8].copy_from_slice(&(gid as u64).to_le_bytes());
         row[8..8 + key.len()].copy_from_slice(key);
         for f in &layout.keys {
@@ -540,7 +603,7 @@ impl GroupTable {
             }
         }
         row[acc..acc + layout.init.len()].copy_from_slice(&layout.init);
-        self.rows.push(row.as_mut_ptr().expose_provenance());
+        self.rows.push(address);
         self.hashes.push(hash);
         gid
     }
@@ -880,7 +943,7 @@ mod tests {
         let mut parts = Vec::new();
         for pick in t.split(2) {
             let mut part = GroupTable::with_capacity(layout.clone(), pick.len());
-            part.absorb_some(&t, &pick, None, |_, _| {});
+            part.absorb_some(&t, &pick, None, false, |_, _| {});
             parts.push(part);
         }
         let merged = GroupTable::join(layout, parts);
