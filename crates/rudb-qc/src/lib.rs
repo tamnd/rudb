@@ -44,6 +44,7 @@ use rudb_qc_gen::Query;
 use rudb_qc_pipe::{Graph, Source, Stage};
 pub use rudb_qc_plan::Refusal;
 use rudb_qc_plan::{Key, Kind};
+pub use rudb_qc_rt::Ablate;
 use rudb_qc_rt::Rt;
 use rudb_vector::Chunk;
 
@@ -102,6 +103,7 @@ pub fn compile_with(
     check(&graph)?;
     let planned = started.elapsed();
     let mut rt = Rt::new(cancel.clone());
+    rt.set_ablate(options.ablate);
     let query = rudb_qc_gen::generate(&graph, &mut rt)?;
     let generated = started.elapsed().saturating_sub(planned);
     let tiers = Tiers::new(&query.module, options);

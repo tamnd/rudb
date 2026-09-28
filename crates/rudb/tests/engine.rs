@@ -296,6 +296,38 @@ fn every_tier_the_build_has_answers_what_the_first_engine_answers() {
 }
 
 #[test]
+fn leaving_a_technique_out_answers_the_same() {
+    let database = Database::new();
+    for sql in [
+        "SET threads = 4",
+        "CREATE TABLE u (k BIGINT, url VARCHAR)",
+        "INSERT INTO u SELECT i % 70001, CASE i % 3 WHEN 0 THEN 'https://www.host' || (i % 11) || '.com/p' WHEN 1 THEN 'http://host' || (i % 13) || '.org/' ELSE 'ftp://x/' || i END FROM range(200000) r(i)",
+    ] {
+        database.execute(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    let queries = [
+        "SELECT k, count(*) AS c FROM u GROUP BY k ORDER BY c DESC, k LIMIT 5",
+        "SELECT count(*) FROM u WHERE url LIKE '%host1%'",
+        "SELECT regexp_replace(url, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS h, count(*) AS c FROM u GROUP BY h ORDER BY c DESC, h LIMIT 5",
+        "SELECT count(*), max(k) FROM u",
+    ];
+    let first: Vec<_> = queries.iter().map(|sql| rows(&database, sql)).collect();
+    database.execute("SET engine = 'compiled'").expect("the compiled engine");
+    for ablate in ["none", "probe", "like", "top", "lanes", "stats", "all"] {
+        database.execute(&format!("SET qc_ablate = '{ablate}'")).expect("a switch");
+        let back = database.setting("qc_ablate").expect("qc_ablate reads back");
+        let all = "probe,like,top,lanes,stats";
+        assert_eq!(back, if ablate == "all" { all } else { ablate });
+        for (sql, first) in queries.iter().zip(&first) {
+            assert_eq!(&rows(&database, sql), first, "{sql} with {ablate} off");
+        }
+    }
+    let error = database.execute("SET qc_ablate = 'probe,fast'").expect_err("no such switch");
+    assert!(error.to_string().contains("probe, like"), "{error}");
+    assert_eq!(database.refusals(), Vec::<String>::new());
+}
+
+#[test]
 fn switching_tiers_at_every_morsel_answers_what_one_tier_answers() {
     let database = database();
     let sql = "SELECT s, count(*), sum(x), max(x) FROM t GROUP BY s ORDER BY s NULLS FIRST";

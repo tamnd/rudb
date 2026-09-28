@@ -42,7 +42,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         return crate::timing::rebuild(root, "compiled", args);
     }
     let usage = || {
-        "usage: cargo xtask compiled [--threads <n>] [--repeat <n>] [--set <name>=<value>]... [--explain] [--tier auto|interp|clif|direct | --tiers <seed>] \
+        "usage: cargo xtask compiled [--threads <n>] [--repeat <n>] [--set <name>=<value>]... [--explain] [--ablation] [--tier auto|interp|clif|direct | --tiers <seed>] \
          <file.parquet> [q1 q2 ...]\n       \
          cargo xtask compiled [--threads <n>] [--tier auto|interp|clif|direct | --tiers <seed>] \
          --suite <parquet dir> <queries> [q1 ...]\n       \
@@ -56,11 +56,16 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let mut repeat = 1_usize;
     let mut sets = Vec::new();
     let mut explain = false;
+    let mut ablation = false;
     loop {
         if let [flag, rest @ ..] = args
-            && flag == "--explain"
+            && (flag == "--explain" || flag == "--ablation")
         {
-            explain = true;
+            if flag == "--explain" {
+                explain = true;
+            } else {
+                ablation = true;
+            }
             args = rest;
             continue;
         }
@@ -144,6 +149,9 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let only: Vec<&str> = only.iter().map(String::as_str).collect();
     if let Some(seed) = seed {
         return tiers(&database, &queries, &only, &tier, seed);
+    }
+    if ablation {
+        return ablate(&database, &queries, &only, repeat);
     }
     println!("tier    {tier}");
     println!();
@@ -246,6 +254,76 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         println!("{name} compiled: {compiled}");
     }
     if wrong.is_empty() { Ok(()) } else { Err(format!("{} queries differ", wrong.len())) }
+}
+
+/// The ablation table of `spec/compiler/17-measurement.md` section 17.8: every query on the
+/// compiled engine with everything on, then with each technique `qc_ablate` names left out in
+/// turn, each the median of `repeat` runs. A cell is the time with the technique left out over the
+/// time with everything on, so 2.00 means the technique halves that query and 1.00 means it does
+/// nothing for it, and the last line is the geometric mean of each column. Leaving a technique out
+/// must not change an answer, so rows that differ from the run with everything on fail the task.
+fn ablate(
+    database: &Database,
+    queries: &[(String, String)],
+    only: &[&str],
+    repeat: usize,
+) -> Result<(), String> {
+    let set = |sql: &str| database.execute(sql).map(|_| ()).map_err(|e| format!("{sql}: {e}"));
+    // The switches are the ones this build has, read back from the setting.
+    set("SET qc_ablate = 'all'")?;
+    let all = database.setting("qc_ablate").map_err(|e| e.to_string())?;
+    let switches: Vec<String> = all.split(',').map(str::to_string).collect();
+    set("SET qc_ablate = 'none'")?;
+    println!("ablation, time with the technique left out over time with everything on");
+    println!();
+    print!("{:<5} {:>9}", "query", "all on");
+    for name in &switches {
+        print!(" {name:>7}");
+    }
+    println!();
+    let run = |sql: &str| {
+        let first = answer(database, "compiled", sql);
+        if repeat > 1 { steadied(database, sql, first, repeat) } else { first }
+    };
+    let mut logs = vec![0.0_f64; switches.len()];
+    let (mut counted, mut wrong) = (0, Vec::new());
+    for (name, sql) in queries {
+        if !only.is_empty() && !only.contains(&name.as_str()) {
+            continue;
+        }
+        let on = run(sql);
+        let Ok(rows) = &on.rows else {
+            println!("{name:<5} {:>9}", "error");
+            continue;
+        };
+        print!("{name:<5} {:>8.3}s", on.seconds);
+        let mut ratios = Vec::with_capacity(switches.len());
+        for switch in &switches {
+            set(&format!("SET qc_ablate = '{switch}'"))?;
+            let off = run(sql);
+            set("SET qc_ablate = 'none'")?;
+            match &off.rows {
+                Ok(other) if agree(rows, other) || tied(database, sql, rows, other) => {}
+                _ => wrong.push(format!("{name} with {switch} off")),
+            }
+            let ratio = off.seconds / on.seconds.max(1e-9);
+            print!(" {ratio:>7.2}");
+            ratios.push(ratio);
+        }
+        println!();
+        for (log, ratio) in logs.iter_mut().zip(ratios) {
+            *log += ratio.ln();
+        }
+        counted += 1;
+    }
+    if counted > 0 {
+        print!("{:<5} {:>9}", "geo", "");
+        for log in &logs {
+            print!(" {:>7.2}", (log / f64::from(counted)).exp());
+        }
+        println!();
+    }
+    if wrong.is_empty() { Ok(()) } else { Err(format!("answers changed: {}", wrong.join(", "))) }
 }
 
 /// The tier differential of `spec/compiler/15-correctness.md` section 15.3: every query on

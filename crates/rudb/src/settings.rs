@@ -176,6 +176,9 @@ pub(crate) struct Settings {
     /// The most rows one call of a compiled body covers, as `SET qc_morsel` has left it, zero
     /// for a whole chunk of the scan. Only the morsel size sweep of question Q7 sets it.
     morsel: RwLock<usize>,
+    /// The techniques the compiled engine leaves out, as `SET qc_ablate` has left them. Only the
+    /// ablation runs of section 17.8 of the measurement spec set it.
+    ablate: RwLock<rudb_qc::Ablate>,
     /// How many times a statement has been let at the settings, counted after it is done.
     changes: AtomicU64,
     /// The last session [`Settings::session`] built, and the count of changes it was built at.
@@ -225,6 +228,7 @@ impl Settings {
             tier: RwLock::new(rudb_qc::Tier::Auto),
             switch: RwLock::new(rudb_qc::Switch::Off),
             morsel: RwLock::new(0),
+            ablate: RwLock::new(rudb_qc::Ablate::NONE),
             changes: AtomicU64::new(0),
             built: Mutex::new(None),
         }
@@ -280,6 +284,11 @@ impl Settings {
     /// The morsel size `SET qc_morsel` asked for, zero for a whole chunk.
     pub(crate) fn morsel(&self) -> usize {
         *self.morsel.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// The techniques `SET qc_ablate` left out, none unless it was set.
+    pub(crate) fn ablate(&self) -> rudb_qc::Ablate {
+        *self.ablate.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The configuration as the statements have left it.
@@ -396,6 +405,18 @@ impl Settings {
                 Error::invalid_input(format!("qc_morsel is a number of rows, not {written}"))
             })?;
             *self.morsel.write().unwrap_or_else(|held| held.into_inner()) = rows;
+            return Ok(());
+        }
+        if is_ablate(name) {
+            let written = value.map_or_else(String::new, text_of);
+            let ablate = rudb_qc::Ablate::parse(&written).ok_or_else(|| {
+                let names: Vec<&str> = rudb_qc::Ablate::ALL.iter().map(|&(n, _)| n).collect();
+                Error::invalid_input(format!(
+                    "qc_ablate is a list of {}, all or none, not {written}",
+                    names.join(", ")
+                ))
+            })?;
+            *self.ablate.write().unwrap_or_else(|held| held.into_inner()) = ablate;
             return Ok(());
         }
         if is_links(name) {
@@ -775,6 +796,9 @@ impl Settings {
         if is_morsel(name) {
             return Ok(self.morsel().to_string());
         }
+        if is_ablate(name) {
+            return Ok(self.ablate().to_string());
+        }
         if let Some(which) = graph_size(name) {
             let sizes = self.sizes();
             return Ok(match which {
@@ -1095,6 +1119,11 @@ fn is_switch(name: &str) -> bool {
 /// [`is_engine`].
 fn is_morsel(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("qc_morsel")
+}
+
+/// Whether this name is the compiled engine's ablation setting, the same shape as [`is_engine`].
+fn is_ablate(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("qc_ablate")
 }
 
 /// Whether this name is the relationship declaration setting.
