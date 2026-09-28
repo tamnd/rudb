@@ -65,6 +65,7 @@ pub(crate) fn write_csv(
                 Some(zone),
             )?);
         }
+        // row at a time: a CSV file is written a line per row, and every column is already text.
         for row in 0..chunk.len() {
             line.clear();
             for (column, vector) in columns.iter().enumerate() {
