@@ -32,7 +32,7 @@ use rudb_common::{
 };
 use rudb_kernels::{
     Accumulator, NOWHERE, finish_run, group_tally, is_true, settle_extremes, update_general,
-    update_runs, update_shared_runs, update_tallied, whole_answers,
+    update_runs, update_shared_runs, update_shared_slots, update_tallied, whole_answers,
 };
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
@@ -700,6 +700,23 @@ fn slot_runs_of(slots: &[usize], into: &mut Vec<(usize, usize)>, users: usize) -
     into.push((last, slots.len()));
     true
 }
+
+/// Whether the first rows of a chunk change group often enough that reading it by slot costs less
+/// than finding its runs, which is a mean run under four rows over the first [`RUN_BLOCK`] of them.
+///
+/// The first block stands for the chunk because the chunks this is asked about are in no order that
+/// changes partway through: a key the rows are sorted on has long runs from its first row, and q01's
+/// two keys, which are in no order at all, change group every 2.81 rows from its first row too.
+fn short_runs(slots: &[usize]) -> bool {
+    let block = &slots[..slots.len().min(RUN_BLOCK + 1)];
+    let starts = block.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    block.len() > 1 && starts * 4 > block.len()
+}
+
+/// The most groups a chunk can have and still be read by slot rather than by run, which is where the
+/// four copies of every group's totals [`rudb_kernels::update_shared_slots`] keeps still fit in a few
+/// cache lines each.
+const FEW_SLOTS: usize = 16;
 
 /// How many slots [`slot_runs_of`] reads a mask of starts over, which is one bit a row of a `u64`.
 const RUN_BLOCK: usize = 64;
@@ -3154,7 +3171,18 @@ impl<'a> Aggregate<'a> {
         // it was counted above and is handed to `slot_runs_of` as its budget. The count loop below
         // reads them once, and a call that goes by vector, that does not fold, that is `DISTINCT` or
         // that carries a `FILTER` never reaches the run path at all.
-        let by_runs = runs_found || slot_runs_of(slots, slot_runs, users);
+        //
+        // A chunk of a handful of groups whose rows change group every few rows goes by slot instead,
+        // where the calls that share a pass add each row into its group's totals. See
+        // [`rudb_kernels::update_shared_slots`].
+        let groups_now = states.len().checked_div(calls).unwrap_or(usize::MAX);
+        let by_slots = !runs_found
+            && users > 1
+            && !self.count_only
+            && !self.compact_numeric
+            && groups_now <= FEW_SLOTS
+            && short_runs(&slots[..slots.len().min(*length)]);
+        let by_runs = !by_slots && (runs_found || slot_runs_of(slots, slot_runs, users));
         if self.count_only {
             if by_runs {
                 let mut start = 0;
@@ -3184,7 +3212,7 @@ impl<'a> Aggregate<'a> {
         // per call. Asked again with what it left, because a pass covers one layout and q01 has two.
         // See [`rudb_kernels::update_shared_runs`].
         let mut shared = 0_u64;
-        if by_runs && users > 1 && !self.count_only && !self.compact_numeric {
+        if (by_runs || by_slots) && users > 1 && !self.count_only && !self.compact_numeric {
             let offered = self
                 .calls
                 .iter()
@@ -3196,14 +3224,12 @@ impl<'a> Aggregate<'a> {
             let inputs: Vec<Option<&Vector>> =
                 arguments.iter().map(|argument| argument.first()).collect();
             loop {
-                let took = update_shared_runs(
-                    states,
-                    slot_runs,
-                    calls,
-                    &inputs,
-                    offered & !shared,
-                    *length,
-                )?;
+                let wanted = offered & !shared;
+                let took = if by_slots {
+                    update_shared_slots(states, slots, calls, &inputs, wanted, *length)?
+                } else {
+                    update_shared_runs(states, slot_runs, calls, &inputs, wanted, *length)?
+                };
                 if took == 0 {
                     break;
                 }

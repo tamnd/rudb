@@ -1904,11 +1904,65 @@ pub fn update_shared_runs(
     wanted: u64,
     rows: usize,
 ) -> Result<u64> {
-    if wanted.count_ones() < 2 {
-        return Ok(0);
-    }
     if runs.last().map_or(0, |&(_, end)| end) != rows {
         return Err(Error::internal(format!("runs that do not end at the {rows} rows given")));
+    }
+    update_shared(states, Walk::Runs(runs), stride, inputs, wanted, rows)
+}
+
+/// [`update_shared_runs`] for a chunk whose rows are read one at a time by the slot each is in, with
+/// no runs found first.
+///
+/// This is for a chunk with a handful of groups whose rows change group every few rows, which is q01:
+/// four groups and runs of 2.81 rows. There the runs cost more than they save. Finding them is a pass
+/// over the slots, and visiting one costs about seventy instructions before a value of it is read, so
+/// at under three rows a run the visits are most of the fold. Read by slot, a row costs the load of
+/// its slot and an add per call into that group's totals, and there are no visits at all.
+///
+/// The totals are held four times over and row `r` adds into copy `r % 4`, so that two rows of one
+/// group next to each other add into different memory. With one copy, a row waits for the store the
+/// row before it made to the same total, and on q01 that is most rows. A row in no group, which is
+/// [`NOWHERE`], adds into a group past the last one that nothing reads, so the loop has no branch in
+/// it for the rows a filter dropped.
+///
+/// Answers the same calls [`update_shared_runs`] would, and leaves the rest untouched the same way.
+///
+/// # Errors
+///
+/// As [`update_shared_runs`], and an internal error for fewer slots than rows.
+pub fn update_shared_slots(
+    states: &mut [Accumulator],
+    slots: &[usize],
+    stride: usize,
+    inputs: &[Option<&Vector>],
+    wanted: u64,
+    rows: usize,
+) -> Result<u64> {
+    let Some(slots) = slots.get(..rows) else {
+        return Err(Error::internal(format!("fewer slots than the {rows} rows given")));
+    };
+    update_shared(states, Walk::Slots(slots), stride, inputs, wanted, rows)
+}
+
+/// How a shared pass reaches each row's group: by the runs of rows in one group, or by the group of
+/// each row on its own.
+#[derive(Clone, Copy)]
+enum Walk<'w> {
+    Runs(&'w [(usize, usize)]),
+    Slots(&'w [usize]),
+}
+
+/// The body of [`update_shared_runs`] and [`update_shared_slots`], which differ only in the walk.
+fn update_shared(
+    states: &mut [Accumulator],
+    walk: Walk<'_>,
+    stride: usize,
+    inputs: &[Option<&Vector>],
+    wanted: u64,
+    rows: usize,
+) -> Result<u64> {
+    if wanted.count_ones() < 2 {
+        return Ok(0);
     }
     let groups = states.len().checked_div(stride).unwrap_or(usize::MAX);
     if groups > FEW || groups.saturating_mul(4) > rows {
@@ -1975,7 +2029,7 @@ pub fn update_shared_runs(
             read.iter().map(|(offset, feed, values)| (*offset, *feed, values.as_slice())).collect();
         group.extend_from_slice(&flat);
         if group.len() + counting.len() >= 2 {
-            if !many_runs(states, runs, stride, &group, &counting, groups)? {
+            if !many_runs(states, walk, stride, &group, &counting, groups)? {
                 return Ok(0);
             }
             return Ok(group.iter().fold(took, |took, &(offset, _, _)| took | 1 << offset));
@@ -1988,7 +2042,7 @@ pub fn update_shared_runs(
         // Nothing but counts, so the pass is the walk and the lengths and there is no value loop to
         // pick a layout for. The width the locals are asked for is zero, so which one this is has no
         // bearing on anything past naming a type to write the loop that never runs.
-        return many_runs::<i64>(states, runs, stride, &[], &counting, groups)
+        return many_runs::<i64>(states, walk, stride, &[], &counting, groups)
             .map(|shared| if shared { took } else { 0 });
     };
     macro_rules! shared {
@@ -2001,7 +2055,7 @@ pub fn update_shared_runs(
                             group.push((call.offset, call.feed, &values.as_slice()[..rows]));
                         }
                     }
-                    if !many_runs(states, runs, stride, &group, &counting, groups)? {
+                    if !many_runs(states, walk, stride, &group, &counting, groups)? {
                         return Ok(0);
                     }
                     group.iter().fold(took, |took, &(offset, _, _)| took | 1 << offset)
@@ -2113,7 +2167,7 @@ fn shareable<'r>(
 /// into a state whose feed does not fit, which is a bug here rather than anything a query can cause.
 fn many_runs<T: Copy + TryInto<i64>>(
     states: &mut [Accumulator],
-    runs: &[(usize, usize)],
+    walk: Walk<'_>,
     stride: usize,
     group: &[(usize, Feed, &[T])],
     counting: &[usize],
@@ -2126,15 +2180,49 @@ fn many_runs<T: Copy + TryInto<i64>>(
     // A width the compiler knows is a walk whose columns and totals are named rather than looked up,
     // which is what the run visit costs most of, so the widths a query reaches each get a walk of
     // their own and anything wider reads its calls out of the list as it goes.
+    // The slot walk has no form for a width it is not written for, and a chunk that wide goes by runs.
     macro_rules! widths {
-        ($($width:literal),+ $(,)?) => {
+        ($into:expr, $walk:ident, $by:expr, $any:expr, $($width:literal),+ $(,)?) => {
             match width {
-                $($width => walk_runs::<$width, T>(&mut folded, runs, group),)+
-                _ => walk_any(&mut folded, runs, span, group),
+                $($width => $walk::<$width, T>($into, $by, group),)+
+                _ => $any,
             }
         };
     }
-    if !widths!(1, 2, 3, 4, 5, 6, 7, 8) {
+    let walked = match walk {
+        Walk::Runs(runs) => widths!(
+            &mut folded,
+            walk_runs,
+            runs,
+            walk_any(&mut folded, runs, span, group),
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+        ),
+        Walk::Slots(slots) => {
+            let Some(copies) = cells.checked_add(span).and_then(|one| one.checked_mul(COPIES))
+            else {
+                return Ok(false);
+            };
+            let mut copied = vec![0_i64; copies];
+            let walked =
+                widths!(&mut copied, walk_slots, (slots, groups), false, 0, 1, 2, 3, 4, 5, 6, 7, 8);
+            // The copies added up into the one set of totals the rest reads, leaving out the group
+            // past the last that the rows in none of them went to.
+            walked
+                && copied.chunks_exact(cells + span).all(|copy| {
+                    folded.iter_mut().zip(&copy[..cells]).all(|(total, &part)| {
+                        total.checked_add(part).map(|sum| *total = sum).is_some()
+                    })
+                })
+        }
+    };
+    if !walked {
         return Ok(false);
     }
     for (slot, cells) in folded.chunks_exact(span).enumerate() {
@@ -2224,6 +2312,81 @@ fn walk_runs<const W: usize, T: Copy + TryInto<i64>>(
     }
     true
 }
+
+/// How many copies of the totals [`walk_slots`] adds into, one for each of this many rows in a row.
+const COPIES: usize = 4;
+
+/// [`many_runs`]'s walk of the rows by slot, for a pass whose width the compiler knows.
+///
+/// `folded` is [`COPIES`] runs of `groups + 1` groups of totals, each a group's `W` totals and then its
+/// row count, and row `r` adds into copy `r % COPIES`. The group past the last is where a row in no
+/// group goes, and nothing reads it. See [`update_shared_slots`] for why there are copies.
+///
+/// `false` for the misses [`walk_runs`] documents.
+fn walk_slots<const W: usize, T: Copy + TryInto<i64>>(
+    folded: &mut [i64],
+    (slots, groups): (&[usize], usize),
+    group: &[(usize, Feed, &[T])],
+) -> bool {
+    let span = W + 1;
+    let copy = (groups + 1) * span;
+    if folded.len() != copy * COPIES {
+        return false;
+    }
+    let Ok(group): std::result::Result<&[(usize, Feed, &[T]); W], _> = group.try_into() else {
+        return false;
+    };
+    let rows = slots.len();
+    let mut short = false;
+    let columns: [&[T]; W] = array::from_fn(|call| match group[call].2.get(..rows) {
+        Some(column) => column,
+        None => {
+            short = true;
+            &[]
+        }
+    });
+    if short {
+        return false;
+    }
+    // One row into its group's totals in copy `copy_at`, reading the calls' values out of `values`.
+    let mut add = |copy_at: usize, slot: usize, values: [T; W]| -> bool {
+        let at = copy_at * copy + slot.min(groups) * span;
+        let Some(cells) = folded.get_mut(at..at + span) else { return false };
+        for (cell, value) in cells.iter_mut().zip(values) {
+            let Ok(value) = value.try_into() else { return false };
+            let Some(sum) = cell.checked_add(value) else { return false };
+            *cell = sum;
+        }
+        cells[W] += 1;
+        true
+    };
+    // Read a block of rows at a time, so that the length of each column's block is a constant and a
+    // row's read of it needs no bounds check. Per row, that check was a compare and a branch for every
+    // call, which on q01 was a quarter of the loop.
+    let (blocks, _) = slots.as_chunks::<SLOT_BLOCK>();
+    let whole = blocks.len() * SLOT_BLOCK;
+    let columns_by_block: [&[[T; SLOT_BLOCK]]; W] =
+        array::from_fn(|call| columns[call][..whole].as_chunks::<SLOT_BLOCK>().0);
+    for (at, block) in blocks.iter().enumerate() {
+        // Every column was cut to `whole` rows above, so each has a block `at` as the slots do.
+        let values: [&[T; SLOT_BLOCK]; W] = array::from_fn(|call| &columns_by_block[call][at]);
+        for (row, &slot) in block.iter().enumerate() {
+            if !add(row % COPIES, slot, values.map(|column| column[row])) {
+                return false;
+            }
+        }
+    }
+    for (row, &slot) in slots.iter().enumerate().skip(whole) {
+        if !add(row % COPIES, slot, columns.map(|column| column[row])) {
+            return false;
+        }
+    }
+    true
+}
+
+/// How many rows [`walk_slots`] reads as one block, which is a multiple of [`COPIES`] so that a row's
+/// place in its block says which copy it adds into.
+const SLOT_BLOCK: usize = 8;
 
 /// [`walk_runs`] for a pass wider than any width it is written for, reading its calls out of the list.
 ///
@@ -5235,12 +5398,19 @@ mod tests {
         }
         assert_eq!(shared, 0b111_1111, "the wrong calls shared a walk");
         assert_eq!(passes, 1, "the flat i64 calls did not walk the runs with the read out ones");
+        // The same calls read by slot, rows in no group included, take the same pass to the same
+        // answers.
+        let mut by_slot = fresh();
+        let took = update_shared_slots(&mut by_slot, &slots, stride, &inputs, offered, rows)
+            .expect("folds them in");
+        assert_eq!(took, 0b111_1111, "the wrong calls shared a walk by slot");
         for group in 0..groups {
             for (at, &(name, _, _)) in calls.iter().enumerate() {
                 let index = group * stride + at;
                 let answer = alone[index].finish().expect("finishes");
                 let note = format!("{name} at {at} of group {group}");
                 assert_eq!(together[index].finish().expect("finishes"), answer, "{note}");
+                assert_eq!(by_slot[index].finish().expect("finishes"), answer, "{note}, by slot");
             }
         }
     }
