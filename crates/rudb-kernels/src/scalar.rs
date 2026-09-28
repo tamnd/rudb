@@ -50,7 +50,7 @@
 
 use memchr::memmem;
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
-use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
+use rudb_vector::{Data, Form, NO_ROW, StringColumn, Validity, Vector, picked};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -211,6 +211,9 @@ fn specialized<V: AsRef<Vector>>(
     }
     if matches!(name, "substring" | "substr") {
         return substring_of(args, returns, rows);
+    }
+    if name == "coalesce" {
+        return coalesced(args, returns, rows);
     }
     if let Some(vector) = lists::vectorized(name, args, returns, rows)? {
         return Ok(Some(vector));
@@ -483,6 +486,67 @@ fn text_of<A: Fn(usize) -> usize>(
         "lower" | "upper" => fold_of(name, text, base, rows, returns),
         _ => Ok(None),
     }
+}
+
+/// `coalesce` over columns, as one pick per row of the first argument that is not null there.
+///
+/// TPC-H q13 counts each customer's orders under a left join and reads the count through
+/// `coalesce(count, 0)`, which on the row at a time path built a `Value` for both arguments of all
+/// 150 thousand customers and a vector back out of them. The pick is a copy of one value a row.
+///
+/// An argument that is never null answers every row that gets to it, so nothing after it is read,
+/// and when that is the first one it is the answer as it stands. A null constant answers no row and
+/// is left out. `None` for arguments of another type than the answer, which the signature casts
+/// away, and for a form the pick does not copy, which goes the row at a time way.
+fn coalesced<V: AsRef<Vector>>(
+    args: &[V],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let args: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
+    if args.iter().any(|arg| arg.logical_type() != returns) {
+        return Ok(None);
+    }
+    let upto = args.iter().position(|arg| arg.never_null()).map_or(args.len(), |at| at + 1);
+    let args = &args[..upto];
+    if let [only] = args {
+        return Ok(Some((*only).clone()));
+    }
+    // A constant is one row that every row picks, and anything the pick cannot read is flattened
+    // into a run it can.
+    let mut held = Vec::with_capacity(args.len());
+    let mut once = Vec::with_capacity(args.len());
+    for arg in args {
+        match (arg.form(), arg.constant_value()) {
+            (_, Some(Value::Null)) => continue,
+            (_, Some(value)) => {
+                held.push(Vector::from_values(returns.clone(), std::slice::from_ref(value))?);
+                once.push(true);
+            }
+            (Form::Flat | Form::Dictionary, None) => {
+                held.push((*arg).clone());
+                once.push(false);
+            }
+            _ => {
+                // flatten: a run or a gather has no layout the pick indexes, and the copy out of
+                // it is one of the copies the pick was going to make anyway.
+                held.push(arg.flatten()?);
+                once.push(false);
+            }
+        }
+    }
+    let picks: Vec<(u32, u32)> = (0..rows)
+        .map(|row| {
+            held.iter()
+                .zip(&once)
+                .position(|(source, &once)| !source.is_null_at(if once { 0 } else { row }))
+                // Under the argument count, and a row under the batch's length, both far under a
+                // `u32`.
+                .map_or((NO_ROW, 0), |at| (at as u32, if once[at] { 0 } else { row as u32 }))
+        })
+        .collect();
+    let sources: Vec<&Vector> = held.iter().collect();
+    picked(returns, &sources, &picks)
 }
 
 /// `substring` over a column, with a start and a length that are the same on every row.
@@ -3912,6 +3976,39 @@ mod tests {
             called("coalesce", &[Value::Null, Value::Null], &LogicalType::Integer),
             Value::Null
         );
+    }
+
+    /// Each row takes the first argument that is not null there, whatever form the arguments are
+    /// in, and a row where every one is null stays null.
+    #[test]
+    fn coalesce_over_columns_takes_the_first_value_each_row_has() {
+        let ty = LogicalType::BigInt;
+        let big = |values: &[Option<i64>]| {
+            let values: Vec<Value> =
+                values.iter().map(|value| value.map_or(Value::Null, Value::BigInt)).collect();
+            Vector::from_values(ty.clone(), &values).unwrap()
+        };
+        let first = big(&[Some(1), None, None, Some(4), None]);
+        let codes = Vector::dictionary(vec![1, 0, 1, 1, 1], big(&[Some(20), None])).unwrap();
+        let zero = Vector::constant(ty.clone(), Value::BigInt(0), 5);
+        let null = Vector::constant(ty.clone(), Value::Null, 5);
+        let answer = |args: &[&Vector]| -> Vec<Value> {
+            call("coalesce", args, &ty, None).unwrap().iter().collect()
+        };
+        let expect = |values: &[Option<i64>]| -> Vec<Value> {
+            values.iter().map(|value| value.map_or(Value::Null, Value::BigInt)).collect()
+        };
+        assert_eq!(
+            answer(&[&first, &zero]),
+            expect(&[Some(1), Some(0), Some(0), Some(4), Some(0)])
+        );
+        assert_eq!(
+            answer(&[&null, &first, &codes, &zero]),
+            expect(&[Some(1), Some(20), Some(0), Some(4), Some(0)])
+        );
+        assert_eq!(answer(&[&first, &codes]), expect(&[Some(1), Some(20), None, Some(4), None]));
+        assert_eq!(answer(&[&null, &null]), expect(&[None, None, None, None, None]));
+        assert_eq!(answer(&[&zero, &first]), expect(&[Some(0); 5]));
     }
 
     #[test]
