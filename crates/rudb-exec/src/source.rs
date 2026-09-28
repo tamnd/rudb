@@ -1596,6 +1596,7 @@ impl<'a> Scan<'a> {
         // is cheap but not free, so it answers to the same count as the filter and a bitmap that
         // keeps nearly every row stops being asked. It takes the place of the filter rather than
         // going in front of it, see `Found::domain`.
+        let mut block = Vec::new();
         for (sideways, paying) in handoffs() {
             // A join above that is not this scan's own placed its answer as exact rows this scan
             // does not read, so it is tested by the bitmap kept beside them.
@@ -1609,11 +1610,11 @@ impl<'a> Scan<'a> {
             }
             let Ok(column) = chunk.column(at) else { continue };
             let rows = chunk.len();
-            let kept = domain.keep(column, rows, &mut Vec::new());
-            paying.saw(rows, kept.len());
-            if kept.len() < rows {
+            let kept = domain.kept(column, rows, &mut block);
+            paying.saw(rows, kept.count());
+            if kept.count() < rows {
                 let whole = std::mem::replace(chunk, Chunk::empty(&[]));
-                *chunk = whole.select(&Selection::from_indices(kept))?;
+                *chunk = whole.select(&Selection::from_indices(kept.indices()))?;
             }
         }
         Ok(())
@@ -3054,11 +3055,11 @@ impl<'a> FileScan<'a> {
         if let Some((at, domain)) = sideways.domain(self.index) {
             let Ok(column) = chunk.column(at) else { return Ok(()) };
             let rows = chunk.len();
-            let kept = domain.keep(column, rows, &mut Vec::new());
-            self.paying.saw(rows, kept.len());
-            if kept.len() < rows {
+            let kept = domain.kept(column, rows, &mut Vec::new());
+            self.paying.saw(rows, kept.count());
+            if kept.count() < rows {
                 let whole = std::mem::replace(chunk, Chunk::empty(&[]));
-                *chunk = whole.select(&Selection::from_indices(kept))?;
+                *chunk = whole.select(&Selection::from_indices(kept.indices()))?;
             }
             return Ok(());
         }

@@ -1368,11 +1368,12 @@ impl<'a> Probe<'a> {
             let mut block = Vec::new();
             for &(column, domain) in &filters {
                 let rows = chunk.len();
-                let kept = domain.keep(chunk.column(column)?, rows, &mut block);
+                let kept = domain.kept(chunk.column(column)?, rows, &mut block);
                 // A row that cannot match does no harm in the table, so a chunk that keeps most of
-                // its rows is kept whole rather than copied to drop a few.
-                if kept.len() <= rows / 2 {
-                    chunk = chunk.select(&Selection::from_indices(kept))?;
+                // its rows is kept whole rather than copied to drop a few, and the row numbers are
+                // only read out of the bits of the chunks that are not.
+                if kept.count() <= rows / 2 {
+                    chunk = chunk.select(&Selection::from_indices(kept.indices()))?;
                 }
             }
             Ok((!chunk.is_empty()).then_some(chunk))
