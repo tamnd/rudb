@@ -3363,6 +3363,9 @@ impl<'a> Binder<'a> {
             let ordered = ordered_set && sorted.len() == 1;
             bound[1] = self.quantile_fraction(resolved.name, bound[1], ordered, from_top)?;
         }
+        if resolved.name == "approx_quantile" {
+            self.digest_arguments(&bound)?;
+        }
         if resolved.name == "reservoir_quantile" {
             self.reservoir_arguments(&bound)?;
         }
@@ -3492,6 +3495,37 @@ impl<'a> Binder<'a> {
             return Err(Error::binder(
                 "Size of the RESERVOIR_QUANTILE sample must be bigger than 0",
             ));
+        }
+        Ok(())
+    }
+
+    /// Checks the fractions of an `approx_quantile` call the way the pin does, which is in words of
+    /// its own again.
+    fn digest_arguments(&self, bound: &[ExprRef]) -> Result<()> {
+        let Ok(Some(fraction)) = fold::value_of(&self.plan, bound[1]) else {
+            return Err(Error::binder(
+                "The \"quantile\" argument in function \"approx_quantile\" must be a constant \
+                 expression",
+            ));
+        };
+        if fraction.is_null() {
+            return Err(Error::binder(
+                "The \"quantile\" argument in function '\"approx_quantile\"' must not be NULL",
+            ));
+        }
+        let each = match &fraction {
+            Value::List { values, .. } => values.as_slice(),
+            one => std::slice::from_ref(one),
+        };
+        for one in each {
+            if one.is_null() {
+                return Err(Error::binder("APPROXIMATE QUANTILE parameter cannot be NULL"));
+            }
+            if !(0.0..=1.0).contains(&share(one).unwrap_or(f64::NAN)) {
+                return Err(Error::binder(
+                    "APPROXIMATE QUANTILE can only take parameters in range [0, 1]",
+                ));
+            }
         }
         Ok(())
     }

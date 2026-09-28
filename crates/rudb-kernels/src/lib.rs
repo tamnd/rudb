@@ -65,6 +65,7 @@ mod bitstring;
 pub mod cast;
 pub mod compare;
 mod datetime;
+mod digest;
 pub mod fallback;
 mod general;
 mod hash;
