@@ -36,7 +36,7 @@ mod tier;
 use std::time::Instant;
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Cancel, LogicalType, Memory, Result, Session};
+use rudb_common::{Cancel, LogicalType, Memory, Result, Session, Value};
 use rudb_pipeline::{Pool, Progress};
 use rudb_plan::{Node, NodeRef, Plan};
 use rudb_qc_gen::Query;
@@ -211,6 +211,16 @@ impl Compiled {
                     let body = self.query.bodies[at]
                         .as_ref()
                         .ok_or_else(|| rudb_common::Error::internal("a pipeline with no body"))?;
+                    // An aggregate with no groups the table's statistics answer, as they do for the
+                    // first engine, reads no rows.
+                    if let Source::Scan { node, .. } = &p.source
+                        && let Some(aggregate) = summed(plan, *node)
+                        && let Some(values) = rudb_exec::summarized(plan, under.catalog, aggregate)?
+                        && let Some(chunk) = summary(values, stage.columns())
+                    {
+                        outputs.push(Some(vec![chunk]));
+                        continue;
+                    }
                     // An earlier stage's rows are taken before the pipeline starts, because how
                     // many there are is what decides its tier.
                     let input = match &p.source {
@@ -359,6 +369,28 @@ fn topping(plan: &Plan, node: NodeRef) -> Option<NodeRef> {
             _ => return None,
         }
     }
+}
+
+/// The aggregate right above the scan at `node`, with nothing but filters and projections between
+/// them.
+fn summed(plan: &Plan, node: NodeRef) -> Option<NodeRef> {
+    let mut at = node;
+    loop {
+        let up = parent(plan, plan.root(), at)?;
+        match plan.node(up) {
+            Node::Filter { .. } | Node::Project { .. } => at = up,
+            Node::Aggregate { .. } => return Some(up),
+            _ => return None,
+        }
+    }
+}
+
+/// The one row of `values` as a chunk of `columns`, when there is a value of the column's type
+/// for each of them.
+fn summary(values: Vec<Value>, columns: &[rudb_qc_plan::Column]) -> Option<Chunk> {
+    let fits = values.len() == columns.len()
+        && values.iter().zip(columns).all(|(v, c)| v.is_null() || v.logical_type() == c.ty);
+    fits.then(|| finish::values(&[values], columns).ok()).flatten()
 }
 
 /// The node under `from` whose input is `child`.

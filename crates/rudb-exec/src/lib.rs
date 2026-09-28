@@ -145,7 +145,7 @@ mod tests;
 
 pub use build::{
     TopCut, build, build_cut_into, build_measured, build_measured_into, build_pruned_into,
-    build_with,
+    build_with, summarized,
 };
 pub use expr::{evaluate, evaluate_all};
 pub use links::declared;

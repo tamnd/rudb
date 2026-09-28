@@ -110,6 +110,32 @@ fn a_top_n_over_a_scan_tells_the_scan_its_cutoff_on_the_compiled_engine() {
 }
 
 #[test]
+fn a_whole_table_aggregate_the_statistics_answer_matches_on_the_compiled_engine() {
+    let database = Database::new();
+    for sql in [
+        "CREATE TABLE w (a SMALLINT, b BIGINT, d DATE)",
+        "INSERT INTO w SELECT i % 4, i * 3 - 1000, DATE '2020-01-01' + (i % 400)::INTEGER FROM range(50000) r(i)",
+        "INSERT INTO w VALUES (NULL, NULL, NULL)",
+    ] {
+        database.execute(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    for sql in [
+        "SELECT count(*) FROM w",
+        "SELECT count(*) FROM w WHERE a <> 0",
+        "SELECT count(*) FROM w WHERE a = 2",
+        "SELECT count(b), sum(b), min(b), max(b) FROM w",
+        "SELECT min(d), max(d) FROM w",
+        "SELECT count(DISTINCT a) FROM w",
+        "SELECT sum(a), avg(b) FROM w WHERE b > 0",
+    ] {
+        database.execute("SET engine = 'first'").expect("the first engine");
+        let first = rows(&database, sql);
+        database.execute("SET engine = 'compiled'").expect("the compiled engine");
+        assert_eq!(rows(&database, sql), first, "{sql}");
+    }
+}
+
+#[test]
 fn a_refused_query_runs_on_the_first_engine_and_is_logged() {
     let database = database();
     database.execute("SET engine = 'compiled'").expect("the compiled engine");
