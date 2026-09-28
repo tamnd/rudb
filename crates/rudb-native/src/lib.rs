@@ -1103,6 +1103,14 @@ pub struct Table {
     /// Empty for files written before `RUDBFT1`. A `None` entry is the null frequency entry; every
     /// code entry in a column named by the block has its exact bytes here.
     frequency_texts: Vec<Vec<Option<Vec<u8>>>>,
+    /// Where each column's frequency texts sit in the file, for a directory read out of one.
+    ///
+    /// Left there the way [`Frequencies::Stored`] leaves a synopsis, and read back the first time a
+    /// query turns that column's synopsis into values. Copying out and checking every spelling of
+    /// every string column's synopsis was most of what opening `hits` cost, and it was a third of
+    /// the instructions in `SELECT 1`, since a query asks about the synopsis of few columns or
+    /// none. Empty when the texts are held, or when there are none.
+    text_spans: Vec<Option<Span>>,
     /// Exact candidate host aggregates and an upper bound for every omitted host.
     host_groups: Option<host::HostSummary>,
     /// How many distinct values each column holds, for the columns that know.
@@ -2294,6 +2302,7 @@ impl Writer {
                 ordinal_bounds: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
+                text_spans: Vec::new(),
                 host_groups: None,
                 clustering: None,
                 constraints: Constraints::default(),
@@ -2372,6 +2381,7 @@ impl Writer {
                 ordinal_bounds: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
+                text_spans: Vec::new(),
                 host_groups: None,
                 clustering: None,
                 constraints: Constraints::default(),
@@ -2500,6 +2510,7 @@ impl Writer {
                 ordinal_bounds: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
+                text_spans: Vec::new(),
                 host_groups: None,
                 clustering: None,
                 constraints: Constraints::default(),
@@ -6892,13 +6903,51 @@ impl Reader {
         Ok(values)
     }
 
+    /// One column's frequency texts, read back from the file when the directory left them there.
+    ///
+    /// The spellings are checked here, the way they were checked at open before they were left in
+    /// the file, and only for the one column a query asked about.
+    fn stored_texts(&self, column: usize) -> Result<Option<Vec<Option<Vec<u8>>>>> {
+        let Some(span) = self.table.text_spans.get(column).copied().flatten() else {
+            return Ok(None);
+        };
+        let mut bytes = vec![0; span.length as usize];
+        read_at(&self.file, span.offset, &mut bytes)?;
+        let mut cur = Cursor::new(&bytes);
+        let mut texts = Vec::new();
+        while !cur.done() {
+            texts.push(match cur.u8()? {
+                0 => None,
+                1 => {
+                    let length = cur.u32()? as usize;
+                    let bytes = cur.take(length)?.to_vec();
+                    if self
+                        .table
+                        .fields
+                        .get(column)
+                        .is_some_and(|field| field.ty == LogicalType::Varchar)
+                    {
+                        std::str::from_utf8(&bytes)
+                            .map_err(|_| invalid("frequency text is not UTF-8"))?;
+                    }
+                    Some(bytes)
+                }
+                _ => return Err(invalid("frequency text tag differs")),
+            });
+        }
+        Ok(Some(texts))
+    }
+
     fn decode_frequencies_once(
         &self,
         column: usize,
         ty: &LogicalType,
         entries: &[FrequencyEntry],
     ) -> Result<Vec<(Value, u64)>> {
-        let stored_texts = self.table.frequency_texts.get(column).filter(|texts| !texts.is_empty());
+        let read = self.stored_texts(column)?;
+        let stored_texts = read
+            .as_ref()
+            .or_else(|| self.table.frequency_texts.get(column).filter(|texts| !texts.is_empty()));
         if stored_texts.is_some_and(|texts| texts.len() != entries.len()) {
             return Err(invalid("frequency text count differs from its synopsis"));
         }
@@ -8692,6 +8741,10 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
                 put_u64(&mut out, entry.count);
             }
         }
+    }
+    // Only a reader leaves texts in the file, and nothing writes a reader's table back.
+    if table.text_spans.iter().any(Option::is_some) {
+        return Err(invalid("frequency texts left in the file cannot be written back"));
     }
     let text_columns = table.frequency_texts.iter().filter(|texts| !texts.is_empty()).count();
     if text_columns != 0 {
@@ -10549,6 +10602,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
     let mut ordinal_bounds = Vec::new();
     let mut seen_ordinal_bounds = false;
     let mut frequency_texts = vec![Vec::new(); width];
+    let mut text_spans = Vec::new();
     let mut seen_frequency_texts = false;
     let mut host_groups = None;
     let mut demoted = Vec::new();
@@ -10654,7 +10708,9 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
             }
             for _ in 0..columns {
                 let column = cur.u16()? as usize;
-                if !frequency_texts.get(column).is_some_and(Vec::is_empty) {
+                if !frequency_texts.get(column).is_some_and(Vec::is_empty)
+                    || text_spans.get(column).is_some_and(Option::is_some)
+                {
                     return Err(invalid("frequency text column is repeated or out of range"));
                 }
                 if !matches!(fields.get(column), Some(field) if coded_type(&field.ty))
@@ -10666,6 +10722,33 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                 let count = cur.u16()? as usize;
                 if count == 0 || count != entry_counts[column] {
                     return Err(invalid("frequency text count differs from its synopsis"));
+                }
+                if let Some(offset) = stored_at {
+                    // Only the tags and the lengths are read, and the spellings are checked when
+                    // they are read back, see `Reader::stored_texts`.
+                    let start = cur.at;
+                    for _ in 0..count {
+                        match cur.u8()? {
+                            0 => {}
+                            1 => {
+                                let length = cur.u32()? as usize;
+                                cur.skip(length)?;
+                            }
+                            _ => return Err(invalid("frequency text tag differs")),
+                        }
+                    }
+                    let span = Span {
+                        offset: offset
+                            .checked_add(start as u64)
+                            .ok_or_else(|| invalid("frequency text offset overflow"))?,
+                        length: u32::try_from(cur.at - start)
+                            .map_err(|_| invalid("frequency texts are too long"))?,
+                    };
+                    if text_spans.is_empty() {
+                        text_spans = vec![None; width];
+                    }
+                    text_spans[column] = Some(span);
+                    continue;
                 }
                 let mut texts = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -10886,6 +10969,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         ordinal_bounds,
         pair_frequencies,
         frequency_texts,
+        text_spans,
         host_groups,
         clustering,
         generation,
@@ -13890,6 +13974,7 @@ mod tests {
             ordinal_bounds: Vec::new(),
             pair_frequencies: Vec::new(),
             frequency_texts: Vec::new(),
+            text_spans: Vec::new(),
             host_groups: None,
             clustering: None,
             constraints: Constraints::default(),
@@ -17106,6 +17191,31 @@ mod tests {
                 }
             }
             assert!(stored >= 2, "only {stored} synopses were left in the file");
+            let mut texts = 0;
+            for (column, held) in whole.frequency_texts.iter().enumerate() {
+                let span = windowed.text_spans.get(column).copied().flatten();
+                assert!(windowed.frequency_texts.get(column).is_none_or(Vec::is_empty));
+                let Some(span) = span else {
+                    assert!(held.is_empty(), "column {column} lost its texts");
+                    continue;
+                };
+                let mut left = vec![0; span.length as usize];
+                read_at(&catalog.file, span.offset, &mut left).expect("the texts");
+                let mut expected = Vec::new();
+                for text in held {
+                    match text {
+                        None => expected.push(0),
+                        Some(text) => {
+                            expected.push(1);
+                            put_u32(&mut expected, u32::try_from(text.len()).expect("short"));
+                            expected.extend_from_slice(text);
+                        }
+                    }
+                }
+                assert_eq!(left, expected, "column {column}");
+                texts += 1;
+            }
+            assert!(texts >= 1, "no texts were left in the file");
         }
         let reader = catalog.table("items").expect("the table");
         assert!(reader.frequency_heads[1].get().is_none());
@@ -17114,6 +17224,15 @@ mod tests {
         let clone = reader.clone();
         assert!(clone.top_frequencies(1, 1).expect("cached synopsis").is_some());
         assert!(Arc::ptr_eq(first, clone.frequency_heads[1].get().expect("same synopsis")));
+        let spelled = reader.stored_texts(1).expect("readable texts").expect("texts left");
+        let words = reader.frequency_prefix(1).expect("a readable synopsis").expect("a synopsis");
+        assert_eq!(spelled.len(), words.entries.len());
+        assert!(
+            words
+                .entries
+                .iter()
+                .all(|(word, _)| matches!(word, Value::Varchar(word) if word.starts_with("word ")))
+        );
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -17929,6 +18048,7 @@ mod tests {
             ordinal_bounds: Vec::new(),
             pair_frequencies: Vec::new(),
             frequency_texts: Vec::new(),
+            text_spans: Vec::new(),
             host_groups: None,
             clustering: None,
             constraints: Constraints::default(),
