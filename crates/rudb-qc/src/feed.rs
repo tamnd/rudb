@@ -24,6 +24,7 @@
 //! and their count, and both start over.
 
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rudb_common::{Cancel, Error, ErrorCode, Result};
@@ -35,6 +36,7 @@ use rudb_qc_ir::{ErrorKind, Module};
 use rudb_qc_pipe::{Pipeline, Source, Step};
 use rudb_qc_plan::Column;
 use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
+use rudb_qc_rt::table::GroupTable;
 use rudb_qc_rt::{RUNTIME_ERROR, Rt, text};
 use rudb_vector::{Chunk, Data, Validity, Vector};
 
@@ -60,6 +62,9 @@ pub(crate) struct Feed<'a> {
     /// How an aggregate's workers fold their groups together, and its distinct sets.
     folds: Vec<merge::Fold>,
     sets: Vec<u64>,
+    /// Whether the workers are kept until the last one finishes and then merged a part of the
+    /// groups to a thread, which a table with keys and no distinct sets is.
+    split: bool,
     inner: Mutex<Inner<'a>>,
 }
 
@@ -78,6 +83,8 @@ struct Inner<'a> {
     out: Vec<Chunk>,
     /// Whether the body said the pipeline may stop.
     done: bool,
+    /// The runtimes of the workers that finished, when they are merged all at once.
+    workers: Vec<Rt>,
     /// Whether a worker has been folded into the runtime yet.
     merged: bool,
 }
@@ -161,9 +168,19 @@ impl<'a> Feed<'a> {
             cancel,
             parallel,
             template: state.clone(),
+            split: parallel
+                && matches!(&body.sink, Out::Aggregate(g) if !g.keys.is_empty())
+                && sets.is_empty(),
             folds,
             sets,
-            inner: Mutex::new(Inner { rt, state, out: Vec::new(), done: false, merged: false }),
+            inner: Mutex::new(Inner {
+                rt,
+                state,
+                out: Vec::new(),
+                done: false,
+                merged: false,
+                workers: Vec::new(),
+            }),
         })
     }
 
@@ -190,13 +207,67 @@ impl<'a> Feed<'a> {
             return Err(Error::internal("a parallel pipeline that is not an aggregate"));
         };
         let mut inner = self.lock();
-        if inner.merged {
+        if self.split {
+            inner.workers.push(worker.rt);
+            Ok(())
+        } else if inner.merged {
             inner.rt.absorb(worker.rt, g.table, &self.sets, |d, s| merge::fold(&self.folds, d, s))
         } else {
             inner.merged = true;
             inner.rt.adopt(worker.rt, g.table, &self.sets);
             Ok(())
         }
+    }
+
+    /// Merges the workers [`Feed::fold`] kept into the query's runtime, once the last one has
+    /// finished. Each worker's groups are split by hash first, so that a key lands in the same part
+    /// on every worker, and then each part is merged into a table of its own on a thread of its
+    /// own. The parts have no key in common and are joined into one table by moving their pages.
+    ///
+    /// Folding the workers one after another under the lock took most of the time of a query
+    /// with millions of groups, over a second of ClickBench q16's at sixteen threads.
+    fn merge(&self, threads: &Lease<'_>) -> Result<()> {
+        let Out::Aggregate(g) = &self.body.sink else {
+            return Ok(());
+        };
+        let mut inner = self.lock();
+        let mut workers = std::mem::take(&mut inner.workers);
+        let Some(first) = workers.pop() else {
+            return Ok(());
+        };
+        let folds = &self.folds;
+        let fold = |d: &mut [u8], s: &[u8]| merge::fold(folds, d, s);
+        let groups: usize = workers.iter().filter_map(|w| w.table(g.table)).map(GroupTable::len).sum();
+        inner.rt.adopt(first, g.table, &self.sets);
+        // Few groups fold faster on one thread than they split.
+        if groups < SPLIT_FROM {
+            for w in workers {
+                inner.rt.absorb(w, g.table, &self.sets, fold)?;
+            }
+            return Ok(());
+        }
+        let merged = {
+            let mine = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
+            let tables = std::iter::once(Ok(mine))
+                .chain(workers.iter().map(|w| w.table(g.table).ok_or_else(|| gone(g.table))))
+                .collect::<Result<Vec<&GroupTable>>>()?;
+            let parts = (threads.degree() * 4).next_power_of_two().clamp(16, 1024);
+            let bits = parts.trailing_zeros();
+            let splits = pieces(threads, tables.len(), |at| tables[at].split(bits))?;
+            let layout = mine.layout().clone();
+            let merged = pieces(threads, parts, |part| {
+                let mut table = GroupTable::new(layout.clone());
+                for (other, split) in tables.iter().zip(&splits) {
+                    table.absorb_some(other, &split[part], fold);
+                }
+                table
+            })?;
+            GroupTable::join(layout, merged)
+        };
+        // The table adopted from the first worker is replaced, and its strings with it, but its
+        // heap is kept with the worker, which the merged table's strings may point into.
+        inner.rt.settle(workers, g.table, merged)?;
+        Ok(())
     }
 
     /// Runs the body over every chunk of a scan, by building `scan` in the first engine with this
@@ -516,7 +587,51 @@ impl Sink for Scan<'_, '_> {
         }
     }
 
-    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
-        Ok(())
+    fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
+        if self.0.split { self.0.merge(threads) } else { Ok(()) }
     }
+}
+
+/// How many groups the workers of an aggregate have between them before they are merged in parts.
+const SPLIT_FROM: usize = 1 << 16;
+
+fn gone(table: u64) -> Error {
+    Error::internal(format!("group table {table} is gone"))
+}
+
+/// Runs `count` pieces of work on the lease's threads, the calling one included, and hands back
+/// what they made in order. A thread takes the next piece off a counter when it finishes one,
+/// because the pieces are not the same size.
+fn pieces<T: Send>(
+    threads: &Lease<'_>,
+    count: usize,
+    run: impl Fn(usize) -> T + Sync,
+) -> Result<Vec<T>> {
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<T>>> = (0..count).map(|_| Mutex::new(None)).collect();
+    let step = || {
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            if at >= count {
+                return;
+            }
+            let made = run(at);
+            if let Ok(mut slot) = slots[at].lock() {
+                *slot = Some(made);
+            }
+        }
+    };
+    let ((), panicked) = threads.scatter_at_most(count, &step, step);
+    if panicked {
+        return Err(Error::internal("a thread merging an aggregate panicked"));
+    }
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .ok()
+                .flatten()
+                .ok_or_else(|| Error::internal("a piece of a merge went missing"))
+        })
+        .collect()
 }
