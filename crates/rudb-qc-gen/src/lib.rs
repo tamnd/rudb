@@ -213,6 +213,12 @@ pub enum AccOp {
     SumFloat,
     /// An `i128` total and an `i64` count after it.
     AvgInt,
+    /// An `i128` total, an `i64` part of it after that and a seen byte, for a sum over values of
+    /// at most 64 bits. A row adds to the part, and only an add that would overflow it moves the
+    /// part into the total, so the total is the sum of both.
+    SumSplit,
+    /// The same total and part, and an `i64` count after them, for an average over the same.
+    AvgSplit,
     /// An `i64` total and a seen byte after it, for a sum over values of at most sixteen bits,
     /// which no group can overflow before it holds 2^48 rows.
     SumNarrow,
@@ -707,18 +713,18 @@ impl Gen<'_> {
             }
             ("count", false) => AccOp::Count,
             ("sum", _) if argty.is_int() && qir_type(&a.ty)? == Ty::I128 && !unsigned(&arg) => {
-                if argty.bytes() <= 2 {
-                    AccOp::SumNarrow
-                } else {
-                    AccOp::SumInt
+                match argty.bytes() {
+                    ..=2 => AccOp::SumNarrow,
+                    3..=8 => AccOp::SumSplit,
+                    _ => AccOp::SumInt,
                 }
             }
             ("sum", _) if argty.is_float() && qir_type(&a.ty)? == Ty::F64 => AccOp::SumFloat,
             ("avg", _) if argty.is_int() && !unsigned(&arg) && qir_type(&a.ty)? == Ty::F64 => {
-                if argty.bytes() <= 2 {
-                    AccOp::AvgNarrow
-                } else {
-                    AccOp::AvgInt
+                match argty.bytes() {
+                    ..=2 => AccOp::AvgNarrow,
+                    3..=8 => AccOp::AvgSplit,
+                    _ => AccOp::AvgInt,
                 }
             }
             ("avg", _) if argty.is_float() && qir_type(&a.ty)? == Ty::F64 => AccOp::AvgFloat,
@@ -1899,6 +1905,26 @@ impl Gen<'_> {
                 self.b.store(row, Val::NONE, 1, d, total, 0);
                 self.bump(acc.op == AccOp::AvgInt, take, row, d + 16);
             }
+            AccOp::SumSplit | AccOp::AvgSplit => {
+                let x = self.widen(v, &acc.arg, Ty::I64);
+                let zero = self.zero(Ty::I64);
+                let x = self.b.select(take, x, zero);
+                let part = self.b.load(Ty::I64, row, Val::NONE, 1, d + 16, 0);
+                let (added, spill) = (self.b.block(&[(Ty::I64, "part")]), self.b.block(&[]));
+                self.b.set_cold(spill);
+                self.b.checked_edge(Op::SaddOv, part, x, added, spill);
+                // The part would overflow, so it goes into the total and starts again at `x`.
+                self.b.switch_to(spill);
+                let total = self.b.load(Ty::I128, row, Val::NONE, 1, d, 0);
+                let wide = self.b.conv(Op::Sext, part, Ty::I128);
+                let total = self.b.bin(Op::Add, total, wide);
+                self.b.store(row, Val::NONE, 1, d, total, 0);
+                self.b.br(added, &[x]);
+                self.b.switch_to(added);
+                let part = self.b.param(added, 0);
+                self.b.store(row, Val::NONE, 1, d + 16, part, 0);
+                self.bump(acc.op == AccOp::AvgSplit, take, row, d + 24);
+            }
             AccOp::SumNarrow | AccOp::AvgNarrow => {
                 let x = self.widen(v, &acc.arg, Ty::I64);
                 let zero = self.zero(Ty::I64);
@@ -2019,6 +2045,7 @@ fn acc_size(acc: &Acc) -> Result<u32> {
     Ok(match acc.op {
         AccOp::CountStar | AccOp::Count => 8,
         AccOp::SumInt | AccOp::AvgInt => 24,
+        AccOp::SumSplit | AccOp::AvgSplit => 32,
         AccOp::SumNarrow | AccOp::AvgNarrow | AccOp::SumFloat | AccOp::AvgFloat => 16,
         AccOp::Min | AccOp::Max | AccOp::AnyValue => (w + 1).next_multiple_of(8),
         AccOp::MinStr | AccOp::MaxStr => 24,

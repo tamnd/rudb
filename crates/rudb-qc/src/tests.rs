@@ -174,6 +174,30 @@ fn catalog() -> Catalog {
         .rows_mut()
         .append_rows(&rows)
         .expect("rows of the table's own types");
+    // `huge` holds values near both ends of BIGINT, so that any sum of a few of them leaves it.
+    let huge = QualifiedName::new("memory", "main", "huge");
+    catalog
+        .create_table(
+            huge.clone(),
+            vec![Field::new("k", LogicalType::Integer), Field::new("v", LogicalType::BigInt)],
+        )
+        .expect("a fresh table");
+    let rows: Vec<Vec<Value>> = (0..7000i64)
+        .map(|i| {
+            let v = match i % 10 {
+                3 => Value::Null,
+                0 | 7 => Value::BigInt(i64::MIN + i),
+                _ => Value::BigInt(i64::MAX - i),
+            };
+            vec![Value::Integer((i / 700 % 4) as i32), v]
+        })
+        .collect();
+    catalog
+        .table_mut(&huge)
+        .expect("the table just created")
+        .rows_mut()
+        .append_rows(&rows)
+        .expect("rows of the table's own types");
     let empty = QualifiedName::new("memory", "main", "empty");
     catalog
         .create_table(empty, vec![Field::new("x", LogicalType::Integer)])
@@ -383,6 +407,14 @@ fn strings_around_the_inline_length_group_and_compare_as_the_first_engine_does()
             true,
         );
     }
+}
+
+#[test]
+fn sums_and_averages_past_the_range_of_a_bigint_match_the_first_engine() {
+    let scan = "Get memory.main.huge AS huge #0 [k::INTEGER, v::BIGINT]";
+    let aggs = "aggregates=[sum(#0.1::BIGINT)::HUGEINT, avg(#0.1::BIGINT)::DOUBLE, count(#0.1::BIGINT)::BIGINT]";
+    same(&format!("Aggregate #1 groups=[#0.0::INTEGER] {aggs}\n  {scan}"), false);
+    same(&format!("Aggregate #1 groups=[] {aggs}\n  {scan}"), false);
 }
 
 #[test]

@@ -151,10 +151,12 @@ fn an_ungrouped_aggregate_updates_the_one_row() {
     run(&query, 0, &mut rt, &[x], &mut st);
     let row = rt.table(grouping.table).expect("the table").row(0);
     let acc = &row[grouping.acc_offset as usize..];
-    let sum = i128::from_le_bytes(acc[..16].try_into().unwrap());
-    let count = i64::from_le_bytes(acc[24..32].try_into().unwrap());
-    let max = i32::from_le_bytes(acc[32..36].try_into().unwrap());
-    assert_eq!((sum, acc[16], count, max, acc[36]), (9, 1, 3, 10, 1));
+    // The sum is an i128 total and the i64 part that has not spilled into it yet.
+    let total = i128::from_le_bytes(acc[..16].try_into().unwrap());
+    let part = i64::from_le_bytes(acc[16..24].try_into().unwrap());
+    let count = i64::from_le_bytes(acc[32..40].try_into().unwrap());
+    let max = i32::from_le_bytes(acc[40..44].try_into().unwrap());
+    assert_eq!((total + i128::from(part), acc[24], count, max, acc[44]), (9, 1, 3, 10, 1));
 }
 
 #[test]
