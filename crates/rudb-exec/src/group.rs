@@ -1569,7 +1569,7 @@ impl<'a> Aggregate<'a> {
         // `fresh` raises on, and it still raises there rather than here, so a plan that never opens a
         // group answers the way it always did.
         let template: Option<Vec<Accumulator>> =
-            calls.iter().map(|call| Accumulator::new(&call.name, &call.returns).ok()).collect();
+            calls.iter().map(|call| Accumulator::folding(&call.name, &call.returns).ok()).collect();
         let out = Buffered::new();
         let partition_from = if keys.iter().all(|&key| fixed_width(plan.expr_type(key))) {
             FIXED_PARTITION_FROM
@@ -3449,6 +3449,7 @@ impl<'a> Aggregate<'a> {
                 if !self.count_only
                     && !self.compact_numeric
                     && self.calls[at].finishes_plainly()
+                    && !matches!(ty, LogicalType::AggregateState(_))
                     && let Some(vector) = finish_run(&states, picked, calls, held, ty)?
                 {
                     columns.push(vector);
@@ -3491,6 +3492,11 @@ impl<'a> Aggregate<'a> {
                             ),
                             // `held` is this call's own state, and the earlier call's where this one
                             // repeats it.
+                            // An exported call's state is the aggregate it exports, so it is
+                            // written out here rather than finished.
+                            (None, None) if matches!(ty, LogicalType::AggregateState(_)) => {
+                                states[slot * calls + held].finish_as(ty)
+                            }
                             (None, None) if self.groups.is_empty() => {
                                 states[slot * calls + held].finish_ungrouped()
                             }
@@ -4602,7 +4608,7 @@ impl<'a> Aggregate<'a> {
             return Ok(());
         }
         for call in &self.calls {
-            states.push(Accumulator::new(&call.name, &call.returns)?);
+            states.push(Accumulator::folding(&call.name, &call.returns)?);
         }
         Ok(())
     }

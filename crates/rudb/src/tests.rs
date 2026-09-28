@@ -12066,3 +12066,47 @@ fn export_state_writes_the_states_the_pin_writes_and_finalize_and_combine_read_t
         assert!(error.message().contains(message), "{sql}: {error}");
     }
 }
+
+#[test]
+fn a_grouped_export_finalizes_to_what_the_plain_aggregate_answers() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    db.execute(
+        "CREATE TABLE t AS SELECT x % 1000 AS g, x AS v, (x % 97)::DECIMAL(9,2) AS d, \
+         (x % 13)::VARCHAR AS s FROM range(300000) r(x)",
+    )
+    .expect("create");
+    for (plain, exported) in [
+        ("sum(v)", "sum(v) EXPORT_STATE"),
+        ("avg(v)", "avg(v) EXPORT_STATE"),
+        ("count(*)", "count(*) EXPORT_STATE"),
+        ("count(v)", "count(v) EXPORT_STATE"),
+        ("min(s)", "min(s) EXPORT_STATE"),
+        ("max(v)", "max(v) EXPORT_STATE"),
+        ("sum(d)", "sum(d) EXPORT_STATE"),
+        ("avg(d)", "avg(d) EXPORT_STATE"),
+        ("stddev(v)", "stddev(v) EXPORT_STATE"),
+        ("covar_pop(v, g)", "covar_pop(v, g) EXPORT_STATE"),
+        ("sum(v) FILTER (WHERE v % 2 = 0)", "sum(v) FILTER (WHERE v % 2 = 0) EXPORT_STATE"),
+        ("count(DISTINCT s)", "count(DISTINCT s) EXPORT_STATE"),
+    ] {
+        let sql = format!(
+            "SELECT count(*), count(*) FILTER (WHERE p IS DISTINCT FROM f) FROM (SELECT g, \
+             {plain} AS p, finalize({exported}) AS f FROM t GROUP BY g)"
+        );
+        assert_eq!(text(&sql), "1000,0", "{sql}");
+    }
+    assert_eq!(
+        text(
+            "SELECT g, finalize(combine(a, a)), finalize(a) FROM (SELECT g, avg(v) EXPORT_STATE \
+             AS a FROM t GROUP BY g) WHERE g < 2 ORDER BY g"
+        ),
+        "0,149500.0,149500.0;1,149501.0,149501.0"
+    );
+}
