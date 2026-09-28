@@ -104,6 +104,12 @@ fn laid(pieces: &[Chunk]) -> Result<Option<Chunk>> {
             columns.push(Vector::constant(ty.clone(), value.clone(), rows));
             continue;
         }
+        // A string column is laid in one pass, since flattening each piece first would copy
+        // every string twice.
+        if let Some(column) = Vector::laid_strings(&parts)? {
+            columns.push(column);
+            continue;
+        }
         // flatten: a selection over a stored column is a dictionary over it, which has no layout
         // that pieces share, and copying the kept rows out is the copy this is here to make.
         let flat = parts.iter().map(|part| part.flatten()).collect::<Result<Vec<_>>>()?;
@@ -160,6 +166,41 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), 8);
         assert_eq!(out[0].columns()[0].constant_value(), Some(&Value::Null));
+    }
+
+    /// Selections over different string columns are laid into one arena, nulls and long strings
+    /// kept where they were.
+    #[test]
+    fn string_pieces_are_laid_into_one_arena() {
+        let long = "a string well past what fits inline in a view".to_string();
+        let text = |values: &[Option<&str>]| {
+            let values: Vec<Value> = values
+                .iter()
+                .map(|value| value.map_or(Value::Null, |text| Value::Varchar(text.into())))
+                .collect();
+            Vector::from_values(LogicalType::Varchar, &values).unwrap()
+        };
+        let mut held = Held::default();
+        let first = text(&[Some("x"), Some(&long), None]);
+        let second = text(&[None, Some("short")]);
+        let mut a = Chunk::new(vec![Vector::dictionary(vec![1, 2, 0], first).unwrap()]).unwrap();
+        let mut b = Chunk::new(vec![Vector::dictionary(vec![1, 0], second).unwrap()]).unwrap();
+        assert!(held.take(&mut a).unwrap().is_none());
+        assert!(held.take(&mut b).unwrap().is_none());
+
+        let out = held.out().unwrap();
+        assert_eq!(out.len(), 1);
+        let values: Vec<Value> = out[0].columns()[0].iter().collect();
+        assert_eq!(
+            values,
+            vec![
+                Value::Varchar(long.clone()),
+                Value::Null,
+                Value::Varchar("x".into()),
+                Value::Varchar("short".into()),
+                Value::Null,
+            ]
+        );
     }
 
     #[test]
