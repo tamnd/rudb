@@ -641,9 +641,40 @@ impl<'a> Feed<'a> {
         }
         let mut held = Vec::with_capacity(self.body.reads.len());
         for &c in &self.body.reads {
-            held.push(Held::of(chunk.column(c)?, rows)?);
+            held.push(Held::of(chunk.column(c)?, rows, true)?);
         }
-        let cols: Vec<Col> = held.iter().map(Held::col).collect();
+        let mut cols: Vec<Col> = held.iter().map(Held::col).collect();
+        // Each `LIKE` the body reads as a column is answered here for the whole morsel.
+        let mut answers = Vec::with_capacity(self.body.likes.len());
+        for m in &self.body.likes {
+            let like = rt.like(m.like).ok_or_else(|| Error::internal("a LIKE pattern is gone"))?;
+            let mut out = vec![0u8; rows];
+            if let Some(Data::Varlen(s)) = chunk.column(m.column)?.data() {
+                let (views, arena) = (s.views(), s.arena());
+                // A long string's view holds its length and its offset in the arena.
+                let place = |at: usize| {
+                    let w = views[at].to_bits();
+                    let n = w as u32 as usize;
+                    let start = (w >> 64) as u64 as usize;
+                    (n > text::INLINE).then(|| start..start.saturating_add(n))
+                };
+                let text = |at: usize| views[at].bytes_in(arena).unwrap_or_default();
+                like.answer(rows, arena, place, text, &mut out);
+            }
+            let valid = match self.body.reads.iter().position(|&c| c == m.column) {
+                Some(at) => cols[at].valid,
+                None => {
+                    // The body reads the column only through its answers, so only its validity
+                    // is held and not its strings.
+                    let h = Held::of(chunk.column(m.column)?, rows, false)?;
+                    let valid = h.valid.as_ptr();
+                    held.push(h);
+                    valid
+                }
+            };
+            cols.push(Col { values: out.as_ptr(), valid });
+            answers.push(out);
+        }
         let mut morsel = Morsel {
             source: 0,
             chunk: 0,
@@ -750,6 +781,7 @@ impl<'a> Feed<'a> {
             break;
         }
         drop(held);
+        drop(answers);
         if let Some(start) = start {
             self.tiers.ran(self.module, f, rows, start);
         }
@@ -951,7 +983,9 @@ struct Held<'c> {
 }
 
 impl<'c> Held<'c> {
-    fn of(v: &'c Vector, rows: usize) -> Result<Held<'c>> {
+    /// Holds `v`, and without the strings of a string column when `strings` is false, for a
+    /// column the body reads only the validity of.
+    fn of(v: &'c Vector, rows: usize, strings: bool) -> Result<Held<'c>> {
         let mut valid = vec![0xffu8; rows.div_ceil(8)];
         let mut clean = true;
         if !matches!(v.validity(), Validity::AllValid) {
@@ -984,6 +1018,7 @@ impl<'c> Held<'c> {
             Data::UInt128(b) => b.as_slice().as_ptr().cast(),
             Data::Float32(b) => b.as_slice().as_ptr().cast(),
             Data::Float64(b) => b.as_slice().as_ptr().cast(),
+            Data::Varlen(_) if !strings => std::ptr::null(),
             Data::Varlen(s) => {
                 let arena = s.arena();
                 // A view is laid out as a `str16` is, but for the address of a long string, which

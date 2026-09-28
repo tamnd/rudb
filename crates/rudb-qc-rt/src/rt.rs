@@ -317,6 +317,15 @@ impl Rt {
         self.add(Object::Like(Like::new(pattern, fold)))
     }
 
+    /// The `LIKE` pattern behind a handle.
+    #[must_use]
+    pub fn like(&self, handle: u64) -> Option<&Like> {
+        match self.objects.get(handle as usize) {
+            Some(Object::Like(like)) => Some(like),
+            _ => None,
+        }
+    }
+
     /// A handle on a regular expression and, for `regexp_replace`, its rewrite.
     ///
     /// # Errors

@@ -25,6 +25,10 @@
 //! the sink come three words per probe, which the driver fills from the built table at init: the
 //! directory's address, the shift that takes a hash to its slot and the tag table's address.
 //!
+//! A `LIKE` of a source column against a constant is not asked a row at a time. The body reads it
+//! as one more column of the morsel, a byte a row, which the driver fills before the call by
+//! asking the pattern of the whole morsel at once, and [`Body::likes`] says which ones those are.
+//!
 //! Handles are made here, in the query's [`Rt`], because the code carries them as constants: the
 //! `LIKE` patterns and regular expressions, the grouping tables, the distinct sets. String
 //! literals are kept in the runtime's heap for the same reason. That is the literal table of
@@ -85,6 +89,23 @@ pub struct Body {
     /// can call either one on any morsel, and it is a pre-check guard of section 9.6 of
     /// `spec/compiler/09-tiering-and-caching.md` with `func` as its fallback.
     pub nonull: Option<String>,
+    /// The `LIKE` answers the body reads after its source columns in the morsel's column table,
+    /// in that order.
+    pub likes: Vec<Matched>,
+}
+
+/// A `LIKE` of a source column against a constant, which the driver answers for the whole morsel
+/// and hands the body as a column of one byte a row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Matched {
+    /// The source column.
+    pub column: usize,
+    /// The pattern as written.
+    pub pattern: String,
+    /// Whether it is `ILIKE`.
+    pub fold: bool,
+    /// The pattern's handle in the runtime.
+    pub like: u64,
 }
 
 /// Where the body reads a join table it probes, which the driver fills in before the first call.
@@ -293,15 +314,19 @@ fn pipeline(
 ) -> Result<Body> {
     let name = format!("p{stage}");
     let source = p.source.columns();
+    // Only the first operator sees every row of the morsel. A `LIKE` past a filter is asked only of
+    // the rows that got through, and answering it for the whole morsel would ask all of them.
+    let mut likes: Vec<Matched> = Vec::new();
+    if let Some(PipeOp::Filter(f)) = p.ops.first() {
+        matched(f, source.len(), &mut likes);
+    }
+    for m in &mut likes {
+        m.like = rt.add_like(&m.pattern, m.fold);
+    }
     let mut reads = Vec::new();
-    // Only the source's columns are read from the morsel. The rest are what the probes bring.
-    let mut note = |e: &Expr| {
-        for c in e.columns() {
-            if c < source.len() && !reads.contains(&c) {
-                reads.push(c);
-            }
-        }
-    };
+    // Only the source's columns are read from the morsel. The rest are what the probes bring, and
+    // a column only an answered `LIKE` reads is not read itself.
+    let mut note = |e: &Expr| read_by(e, source.len(), &likes, &mut reads);
     for op in &p.ops {
         match op {
             PipeOp::Filter(f) => note(f),
@@ -326,15 +351,16 @@ fn pipeline(
     }
     reads.sort_unstable();
     let generic = Pass { name: &name, version: "generic", nonull: false, replay: None };
-    let (func, out, state, probes, made) = emit(stage, p, joins, module, rt, &reads, generic)?;
+    let (func, out, state, probes, made) =
+        emit(stage, p, joins, module, rt, &reads, &likes, generic)?;
     module.funcs.push(func);
     // The version for a morsel with no NULL in the columns it reads. It shares the generic one's
     // tables and kernels and has to come out with the same state, or it is left out.
     let mut nonull = None;
-    if !reads.is_empty() {
+    if !reads.is_empty() || !likes.is_empty() {
         let variant = format!("{name}_nonull");
         let pass = Pass { name: &variant, version: "nonull", nonull: true, replay: Some(&made) };
-        if let Ok((f, o, st, pr, _)) = emit(stage, p, joins, module, rt, &reads, pass)
+        if let Ok((f, o, st, pr, _)) = emit(stage, p, joins, module, rt, &reads, &likes, pass)
             && (&o, st, &pr) == (&out, state, &probes)
         {
             module.funcs.push(f);
@@ -342,7 +368,46 @@ fn pipeline(
             nonull = Some(variant);
         }
     }
-    Ok(Body { func: name, reads, state, sink: out, probes, nonull })
+    Ok(Body { func: name, reads, state, sink: out, probes, nonull, likes })
+}
+
+/// Adds every source column `e` reads outside the `LIKE`s in `likes` to `reads`, each once.
+fn read_by(e: &Expr, sources: usize, likes: &[Matched], reads: &mut Vec<usize>) {
+    match &e.kind {
+        Kind::Column(c) if *c < sources && !reads.contains(c) => reads.push(*c),
+        Kind::Function { .. } if answered(e, likes).is_some() => {}
+        _ => e.children(|c| read_by(c, sources, likes, reads)),
+    }
+}
+
+/// The index in `likes` of the `LIKE` that `e` is, if it is one of them.
+fn answered(e: &Expr, likes: &[Matched]) -> Option<usize> {
+    let Kind::Function { name, args } = &e.kind else { return None };
+    let ("~~" | "!~~" | "~~*" | "!~~*", [s, pattern]) = (name.as_str(), args.as_slice()) else {
+        return None;
+    };
+    let (Kind::Column(column), Kind::Constant(Value::Varchar(p))) = (&s.kind, &pattern.kind) else {
+        return None;
+    };
+    let fold = name.contains('*');
+    likes.iter().position(|m| (m.column, m.pattern.as_str(), m.fold) == (*column, p, fold))
+}
+
+/// Adds every `LIKE` in `e` of a source column against a constant to `likes`, each once.
+fn matched(e: &Expr, sources: usize, likes: &mut Vec<Matched>) {
+    if let Kind::Function { name, args } = &e.kind
+        && let ("~~" | "!~~" | "~~*" | "!~~*", [s, pattern]) = (name.as_str(), args.as_slice())
+        && let (Kind::Column(column), Kind::Constant(Value::Varchar(p))) = (&s.kind, &pattern.kind)
+        && *column < sources
+        && s.ty == LogicalType::Varchar
+    {
+        if answered(e, likes).is_none() {
+            let fold = name.contains('*');
+            likes.push(Matched { column: *column, pattern: p.clone(), fold, like: 0 });
+        }
+        return;
+    }
+    e.children(|c| matched(c, sources, likes));
 }
 
 /// One pass over a pipeline: the function's name and version, whether it reads every column as
@@ -359,6 +424,7 @@ struct Pass<'a> {
 /// made in the runtime.
 type Emitted = (Func, Out, u32, Vec<Probing>, Vec<u64>);
 
+#[allow(clippy::too_many_arguments)]
 fn emit(
     stage: usize,
     p: &Pipeline,
@@ -366,6 +432,7 @@ fn emit(
     module: &mut Module,
     rt: &mut Rt,
     reads: &[usize],
+    likes: &[Matched],
     pass: Pass<'_>,
 ) -> Result<Emitted> {
     let source = p.source.columns();
@@ -374,6 +441,8 @@ fn emit(
         module,
         rt,
         cols: HashMap::new(),
+        likes: Vec::new(),
+        matched: Vec::new(),
         loaded: HashMap::new(),
         row: Val::NONE,
         ptrs: Vec::new(),
@@ -401,6 +470,13 @@ fn emit(
         let ty = qir_type(&source[c].ty)?;
         g.cols.insert(c, (values, valid, ty));
     }
+    for k in 0..likes.len() {
+        let at = (reads.len() + k) as i32 * COL_SIZE;
+        let values = g.b.load(Ty::Ptr, table, Val::NONE, 1, at, INV);
+        let valid = g.b.load(Ty::Ptr, table, Val::NONE, 1, at + COL_VALID, INV);
+        g.likes.push((values, valid));
+    }
+    g.matched = likes.to_vec();
     let fans_out = p.probes().next().is_some();
     let (out, state) = g.prepare_sink(&p.sink, fans_out)?;
     g.next = state;
@@ -479,6 +555,10 @@ struct Gen<'a> {
     rt: &'a mut Rt,
     /// Source column to its values address, validity address and type.
     cols: HashMap<usize, (Val, Val, Ty)>,
+    /// The `LIKE`s the driver answers, and the address of each one's answers and of its column's
+    /// validity.
+    matched: Vec<Matched>,
+    likes: Vec<(Val, Val)>,
     /// Source columns already read for the current row, in a block every later use is dominated
     /// by.
     loaded: HashMap<usize, (Val, Val)>,
@@ -662,7 +742,8 @@ impl Gen<'_> {
             if self.loaded.contains_key(&c) {
                 continue;
             }
-            let (values, valid, ty) = self.cols[&c];
+            // A column only an answered `LIKE` reads is not in the morsel's table.
+            let Some(&(values, valid, ty)) = self.cols.get(&c) else { continue };
             let v = self.b.load(ty, values, self.row, ty.bytes(), 0, 0);
             if self.nonull {
                 let ok = self.truth();
@@ -1182,7 +1263,18 @@ impl Gen<'_> {
             }
             ("~~" | "!~~" | "~~*" | "!~~*", [s, pattern]) => {
                 let Kind::Constant(Value::Varchar(p)) = &pattern.kind else { return Ok(None) };
-                let h = self.rt.add_like(p, name.contains('*'));
+                let fold = name.contains('*');
+                if let Some(at) = answered(e, &self.matched) {
+                    let (answers, valid) = self.likes[at];
+                    let ok =
+                        if self.nonull { self.truth() } else { self.b.load_bit(valid, self.row) };
+                    let m = self.b.load(Ty::I1, answers, self.row, 1, 0, 0);
+                    let no = self.b.bool(false);
+                    let m = self.b.select(ok, m, no);
+                    let m = if name.starts_with('!') { self.b.un(Op::Not, m) } else { m };
+                    return Ok(Some((m, ok)));
+                }
+                let h = self.rt.add_like(p, fold);
                 let (s, ok) = self.translate(s)?;
                 let h = self.handle(h);
                 let m = self.rt(proxy_id("str_like"), &[h, s]);

@@ -39,6 +39,98 @@ impl Like {
         }
         self.pattern.holds(text)
     }
+
+    /// Answers `rows` strings, one byte each into `out`, 1 for a match. Row `at` is
+    /// `arena[place(at)]` when `place` has it, and `text(at)` when it does not.
+    ///
+    /// A pattern with a piece to look for inside the string finds it with one search over the
+    /// arena, the way the first engine's kernel searches a chunk's strings laid end to end.
+    /// Setting a search up costs about what running it over a short string does, so one search a
+    /// row pays that setup for every URL, and one search over the arena pays it once. A match
+    /// that runs across the end of one string has no match in that string after it, since that
+    /// would end later still, so the search goes on from the start of the next string either way.
+    /// A pattern of several pieces looks for its longest middle piece and asks the whole pattern
+    /// only of the strings that hold it. The arena is searched as it is when the strings in it
+    /// come in row order, which is how a column is decoded, and copied into that order when they
+    /// do not. Every other pattern is asked row by row.
+    pub fn answer<'t>(
+        &self,
+        rows: usize,
+        arena: &'t [u8],
+        place: impl Fn(usize) -> Option<std::ops::Range<usize>>,
+        text: impl Fn(usize) -> &'t [u8],
+        out: &mut [u8],
+    ) {
+        let out = &mut out[..rows];
+        let bytes = |at: usize| place(at).and_then(|r| arena.get(r)).unwrap_or_else(|| text(at));
+        let finder = match (&self.pattern, self.fold) {
+            (Pattern::Contains(f), false) => Some(&**f),
+            (Pattern::Segments { middles, .. }, false) => {
+                middles.iter().max_by_key(|f| f.needle().len())
+            }
+            _ => None,
+        };
+        let Some(finder) = finder.filter(|f| !f.needle().is_empty()) else {
+            for (at, slot) in out.iter_mut().enumerate() {
+                *slot = u8::from(self.matches(bytes(at)));
+            }
+            return;
+        };
+        let whole = matches!(self.pattern, Pattern::Contains(_));
+        let holds = |text: &[u8]| whole || self.pattern.holds(text);
+        // The strings the arena holds in order, and every other one answered on its own.
+        let mut spans = Vec::with_capacity(rows);
+        let mut ordered = true;
+        for (at, slot) in out.iter_mut().enumerate() {
+            *slot = 0;
+            match place(at).filter(|r| r.end <= arena.len()) {
+                Some(r) => {
+                    ordered &= spans.last().is_none_or(|&(_, end, _)| end <= r.start);
+                    spans.push((r.start, r.end, at));
+                }
+                None => *slot = u8::from(self.pattern.holds(text(at))),
+            }
+        }
+        let joined;
+        let haystack = if ordered {
+            arena
+        } else {
+            let mut all =
+                Vec::with_capacity(spans.iter().map(|&(start, end, _)| end - start).sum());
+            for span in &mut spans {
+                let from = all.len();
+                all.extend_from_slice(&arena[span.0..span.1]);
+                *span = (from, all.len(), span.2);
+            }
+            joined = all;
+            &joined[..]
+        };
+        let needle = finder.needle().len();
+        let (mut next, mut from) = (0, spans.first().map_or(0, |s| s.0));
+        let last = spans.last().map_or(0, |s| s.1);
+        while next < spans.len()
+            && let Some(found) = finder.find(&haystack[from..last])
+        {
+            let at = from + found;
+            while spans[next].1 <= at {
+                next += 1;
+            }
+            let (start, end, row) = spans[next];
+            if at < start {
+                // A match in the gap before a string, or across into it, says nothing of it.
+                from = start;
+                continue;
+            }
+            if at + needle <= end {
+                out[row] = u8::from(holds(&haystack[start..end]));
+            }
+            from = end;
+            next += 1;
+            if let Some(&(start, ..)) = spans.get(next) {
+                from = start;
+            }
+        }
+    }
 }
 
 impl Pattern {
@@ -161,5 +253,32 @@ mod tests {
             assert_eq!(Like::new(p, false).matches(t.as_bytes()), want, "{t} LIKE {p}");
         }
         assert!(Like::new("%GOOGLE%", true).matches(b"www.Google.com"));
+    }
+
+    #[test]
+    fn a_morsel_answers_as_its_rows_do() {
+        let texts = ["", "google", "xgoog", "le.com", "a.google.com/x", "googl", "egoogle", "go"];
+        for p in ["%google%", "%goo%le%", "g%e", "%", "%%", "google", "%le", "go%", "_o%"] {
+            let like = Like::new(p, false);
+            let mut out = vec![9u8; texts.len()];
+            // The long ones in an arena in order, with a gap, and then out of order.
+            let arena = b"..google...xgoog.le.com..a.google.com/x..egoogle";
+            let places =
+                [None, Some(2..8), Some(11..16), None, Some(25..39), None, Some(41..48), None];
+            let shuffled =
+                [None, Some(41..48), Some(2..8), None, Some(25..39), None, Some(11..16), None];
+            for (places, texts) in [(&places, texts), (&shuffled, texts)] {
+                let texts: Vec<&[u8]> = texts
+                    .iter()
+                    .zip(places.iter())
+                    .map(|(t, place)| place.clone().map_or(t.as_bytes(), |r| &arena[r]))
+                    .collect();
+                let rows = texts.len();
+                like.answer(rows, arena, |at| places[at].clone(), |at| texts[at], &mut out);
+                for (t, got) in texts.iter().zip(&out) {
+                    assert_eq!(*got == 1, like.matches(t), "{t:?} LIKE {p}");
+                }
+            }
+        }
     }
 }
