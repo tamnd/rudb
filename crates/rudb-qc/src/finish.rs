@@ -169,14 +169,39 @@ pub(crate) fn counted_top(
         let v = i64::from_le_bytes(table.row(gid)[at..at + 8].try_into().unwrap_or_default());
         if descending { !v } else { v }
     };
-    let mut ranked: Vec<(i64, u32)> = (from..to).map(|gid| (rank(gid), gid as u32)).collect();
-    ranked.select_nth_unstable(n - 1);
-    let mut gids: Vec<usize> = if more {
+    // The groups are gathered until there are twice as many as are kept, then cut to the best
+    // `n` and the ties with the last of them, which is the edge a group has to reach from then
+    // on. Most groups of a big table are passed over after one read of their count.
+    let mut ranked: Vec<(i64, u32)> = Vec::with_capacity((2 * n).min(to - from));
+    let mut edge = None;
+    let mut room = 2 * n;
+    let cut = |ranked: &mut Vec<(i64, u32)>| {
+        ranked.select_nth_unstable(n - 1);
         let edge = ranked[n - 1].0;
-        (from..to).filter(|&gid| rank(gid) <= edge).collect()
-    } else {
-        ranked[..n].iter().map(|&(_, gid)| gid as usize).collect()
+        if more {
+            ranked.retain(|&(r, _)| r <= edge);
+        } else {
+            ranked.truncate(n);
+        }
+        edge
     };
+    for gid in from..to {
+        let r = rank(gid);
+        if let Some(e) = edge
+            && (r > e || (r == e && !more))
+        {
+            continue;
+        }
+        ranked.push((r, gid as u32));
+        if ranked.len() == room {
+            edge = Some(cut(&mut ranked));
+            room = (2 * ranked.len()).max(2 * n);
+        }
+    }
+    if ranked.len() > n {
+        cut(&mut ranked);
+    }
+    let mut gids: Vec<usize> = ranked.iter().map(|&(_, gid)| gid as usize).collect();
     gids.sort_unstable();
     Some(gids)
 }
