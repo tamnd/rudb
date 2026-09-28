@@ -76,7 +76,7 @@ use rudb_graph::{Adjacency, KeyMap, Link, PART_ROWS, Pushed, Rids};
 use rudb_metrics::Reduced;
 use rudb_plan::{BuildSide, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 use rudb_storage::{Blocked, Range};
-use rudb_vector::{Chunk, Vector};
+use rudb_vector::{Chunk, Data, Vector};
 
 use crate::expr::evaluate_all_in_time_zone;
 use crate::lookup::has_nulls;
@@ -232,50 +232,150 @@ impl Domain {
         offset < self.range && self.words[(offset / 64) as usize] >> (offset % 64) & 1 == 1
     }
 
+    /// Whether the bit at `offset` from the base is set, with the range test folded into the read.
+    ///
+    /// A key under the base wraps round to an offset far past the range and a key past the range is
+    /// moved onto the bit at the range itself, which [`words_for`] leaves room for and nothing sets,
+    /// so one unsigned compare covers both ends and it is a conditional move rather than a branch
+    /// that half the keys of a filtered parent take.
+    #[inline]
+    fn bit(&self, offset: u64) -> bool {
+        let offset = offset.min(self.range);
+        self.words[(offset / 64) as usize] >> (offset % 64) & 1 == 1
+    }
+
     /// Which of the first `rows` rows of `keys` hold a key the build side holds.
     ///
     /// A null key is not one, because a null matches nothing under the rule this is armed for.
-    /// `block` is the caller's to keep between chunks so that the widened keys are not allocated a
-    /// chunk at a time.
-    pub(crate) fn keep(&self, keys: &Vector, rows: usize, block: &mut Vec<i64>) -> Vec<u32> {
-        let mut kept = Vec::with_capacity(rows);
-        if keys.signed_block(block) && block.len() >= rows {
-            let none_null = keys.none_null();
-            if let (Ok(base), true, true) =
-                (i64::try_from(self.base), none_null, self.range < 1 << 62)
+    /// `block` is the caller's to keep between chunks, and is only used by the form at the end that
+    /// has to widen every key before it can look at one.
+    pub(crate) fn kept(&self, keys: &Vector, rows: usize, block: &mut Vec<i64>) -> Kept {
+        // Both faster forms need the base to fit an `i64`, so that a key's offset from it is the
+        // wrapping subtraction [`Self::bit`] is written for, and a range short enough that a key
+        // the other side of the wrap cannot land back inside it.
+        let armed = i64::try_from(self.base).ok().filter(|_| self.range < 1 << 62);
+        if let Some(base) = armed.filter(|_| keys.none_null()) {
+            // A packed key is tested on its code, with the frame's base folded into the domain's,
+            // because a code is the value less the frame's base and an offset is the value less the
+            // domain's, so the two differ by a constant worked out once a chunk. That leaves the
+            // widening out: no `i64` per row is written down and read back to test a bit with.
+            if let Some(packed) = keys.packed_parts()
+                && let Ok(frame) = i64::try_from(packed.base())
             {
-                // A key under the base wraps round to an offset far past the range, so one compare
-                // covers both ends, and the row is written whether it is kept or not so that the loop
-                // has no branch to mispredict on a bitmap that keeps about half.
-                // A key past the range is moved onto the bit at the range itself, which
-                // [`words_for`] leaves room for and nothing sets, so the range test is a
-                // conditional move and not a branch that half the keys of a filtered parent take.
-                kept.resize(rows, 0);
-                let mut at = 0;
-                for (row, &key) in block[..rows].iter().enumerate() {
-                    let offset = (key.wrapping_sub(base) as u64).min(self.range);
-                    let hit = self.words[(offset / 64) as usize] >> (offset % 64) & 1 == 1;
-                    kept[at] = row as u32;
-                    at += usize::from(hit);
-                }
-                kept.truncate(at);
+                let shift = frame.wrapping_sub(base) as u64;
+                let mut codes = [0_u64; 64];
+                return marked(rows, |from, to| {
+                    let block = &mut codes[..to - from];
+                    packed.unpack(from, block);
+                    block.iter().enumerate().fold(0, |word, (bit, &code)| {
+                        word | u64::from(self.bit(code.wrapping_add(shift))) << bit
+                    })
+                });
+            }
+            // A key already laid out as integers is read where it lies, which for a `BIGINT` column
+            // is the difference between a pass over the chunk and a copy of it followed by one.
+            if let Some(kept) = self.over_flat(keys, rows, base) {
                 return kept;
             }
-            for (row, &key) in block[..rows].iter().enumerate() {
-                if self.holds(key) && (none_null || !keys.is_null_at(row)) {
-                    kept.push(row as u32);
-                }
-            }
-            return kept;
         }
-        for row in 0..rows {
-            let key = keys.signed_at(row).and_then(|key| i64::try_from(key).ok());
-            if key.is_some_and(|key| self.holds(key)) {
-                kept.push(row as u32);
+        if keys.signed_block(block) && block.len() >= rows {
+            let none_null = keys.none_null();
+            let widened = &block[..rows];
+            return marked(rows, |from, to| {
+                widened[from..to].iter().enumerate().fold(0, |word, (bit, &key)| {
+                    let held = self.holds(key) && (none_null || !keys.is_null_at(from + bit));
+                    word | u64::from(held) << bit
+                })
+            });
+        }
+        marked(rows, |from, to| {
+            (from..to).fold(0, |word, row| {
+                let key = keys.signed_at(row).and_then(|key| i64::try_from(key).ok());
+                word | u64::from(key.is_some_and(|key| self.holds(key))) << (row - from)
+            })
+        })
+    }
+
+    /// [`Self::kept`] over a key column that is already integers of some width, and `None` for one
+    /// that is not.
+    fn over_flat(&self, keys: &Vector, rows: usize, base: i64) -> Option<Kept> {
+        macro_rules! flat {
+            ($values:expr) => {{
+                let values = $values.as_slice().get(..rows)?;
+                Some(marked(rows, |from, to| {
+                    values[from..to].iter().enumerate().fold(0, |word, (bit, &key)| {
+                        let offset = i64::from(key).wrapping_sub(base) as u64;
+                        word | u64::from(self.bit(offset)) << bit
+                    })
+                }))
+            }};
+        }
+        match keys.data()? {
+            Data::Int8(values) => flat!(values),
+            Data::Int16(values) => flat!(values),
+            Data::Int32(values) => flat!(values),
+            Data::Int64(values) => {
+                let values = values.as_slice().get(..rows)?;
+                Some(marked(rows, |from, to| {
+                    values[from..to].iter().enumerate().fold(0, |word, (bit, &key)| {
+                        word | u64::from(self.bit(key.wrapping_sub(base) as u64)) << bit
+                    })
+                }))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Which rows a [`Domain`] kept, as a bit a row and how many of them are set.
+///
+/// A bitmap rather than the row numbers because the caller asks how many survived before it asks
+/// which, and a chunk that keeps most of its rows is kept whole and never asks which at all. Laying
+/// the row numbers out first wrote a `u32` a row whether the row was kept or not, which is a store a
+/// row the bitmap does not do, thirty two times the bytes of a bit a row, and a count the loop had
+/// to carry where a popcount a word gets it after the fact.
+#[derive(Debug)]
+pub(crate) struct Kept {
+    bits: Vec<u64>,
+    count: usize,
+}
+
+impl Kept {
+    /// How many rows were kept.
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The kept rows in order, which is what a selection is built from.
+    pub(crate) fn indices(&self) -> Vec<u32> {
+        let mut kept = Vec::with_capacity(self.count);
+        for (index, &bits) in self.bits.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                kept.push((index * 64 + bits.trailing_zeros() as usize) as u32);
+                bits &= bits - 1;
             }
         }
         kept
     }
+}
+
+/// The bits of `rows` rows, sixty four at a time, from a test that answers for a run of them.
+///
+/// Sixty four rows a word is what makes the row loop a fold into a register: no store a row, no
+/// length to move on, and the count comes out of a popcount a word rather than being carried.
+fn marked(rows: usize, mut word_of: impl FnMut(usize, usize) -> u64) -> Kept {
+    let mut bits = Vec::with_capacity(rows / 64 + 1);
+    let mut count = 0;
+    let mut row = 0;
+    while row < rows {
+        let end = (row + 64).min(rows);
+        let word = word_of(row, end);
+        count += word.count_ones() as usize;
+        bits.push(word);
+        row = end;
+    }
+    Kept { bits, count }
 }
 
 /// What turns a build side's keys into the set of driving rows that can match them, exactly.
@@ -1393,10 +1493,61 @@ mod tests {
         assert_eq!(found.range, Some((Bound::Int(-4), Bound::Int(60))));
         let domain = found.domain.expect("a bitmap over sixty five values");
         let driving = column(&[Some(7), Some(8), None, Some(-4), Some(-5), Some(61), Some(60)]);
-        let kept = domain.keep(&driving, driving.len(), &mut Vec::new());
+        let kept = domain.kept(&driving, driving.len(), &mut Vec::new()).indices();
         assert_eq!(kept, [0, 3, 6]);
         let whole = column(&[Some(60), Some(1), Some(7), Some(i32::MIN), Some(i32::MAX)]);
-        assert_eq!(domain.keep(&whole, whole.len(), &mut Vec::new()), [0, 2]);
+        assert_eq!(domain.kept(&whole, whole.len(), &mut Vec::new()).indices(), [0, 2]);
+    }
+
+    /// The three forms of [`super::Domain::kept`] answer the same rows: a column of integers read
+    /// where it lies, a packed column read on its codes with the frame's base folded in, and the
+    /// widening form a column with nulls in it still takes. Two hundred rows so that the run past
+    /// the last whole word of sixty four is one of the cases, and a frame base each side of the
+    /// domain's so that the folded shift is tested both ways round.
+    #[test]
+    fn a_bitmap_reads_flat_keys_packed_keys_and_widened_keys_alike() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+
+        let found =
+            found(&keyed, None, &[chunk(&[Some(100), Some(163), Some(250)])]).expect("integers");
+
+        let domain = found.domain.expect("a bitmap over a hundred and fifty one values");
+        let rows: Vec<i64> = (0..200).collect();
+        let held = |keys: &Vector| domain.kept(keys, 200, &mut Vec::new()).indices();
+        let integers = column(&rows.iter().map(|&row| Some(row as i32)).collect::<Vec<_>>());
+        assert!(integers.none_null() && integers.data().is_some(), "the flat form");
+        assert_eq!(held(&integers), [100, 163]);
+        let wide: Vec<Value> = rows.iter().map(|&row| Value::BigInt(row)).collect();
+        let wide = Vector::from_values(LogicalType::BigInt, &wide).expect("a column of big ints");
+        assert_eq!(held(&wide), [100, 163]);
+        let under = packed_keys(&rows, 8, 0);
+        assert!(under.packed_parts().is_some(), "the packed form");
+        assert_eq!(held(&under), [100, 163]);
+        let over = packed_keys(&rows.iter().map(|row| row + 150).collect::<Vec<_>>(), 9, 150);
+        assert_eq!(held(&over), [13, 100], "a hundred and sixty three and two hundred and fifty");
+        let mut nulls: Vec<Option<i32>> = rows.iter().map(|&row| Some(row as i32)).collect();
+        nulls[163] = None;
+        assert_eq!(held(&column(&nulls)), [100], "the widening form, where a null is not a key");
+    }
+
+    /// A column of those values packed at that width over that base, which is the form the native
+    /// file stores a key column of a small range in.
+    fn packed_keys(values: &[i64], width: u32, base: i128) -> Vector {
+        let bits = width as usize;
+        let mut words = vec![0_u64; (values.len() * bits).div_ceil(u64::BITS as usize) + 1];
+        for (row, &value) in values.iter().enumerate() {
+            let code = u64::try_from(i128::from(value) - base).expect("a value above the base");
+            let at = row * bits;
+            let (word, offset) = (at / 64, at % 64);
+            words[word] |= code << offset;
+            if offset + bits > 64 {
+                words[word + 1] |= code >> (64 - offset);
+            }
+        }
+        Vector::packed(LogicalType::BigInt, words, width, base, values.len())
+            .expect("a packed column of those values")
     }
 
     /// A range that ends on a word boundary still has the bit past its end to send a miss to, so a
@@ -1423,7 +1574,7 @@ mod tests {
             Some(i32::MAX),
             Some(64),
         ]);
-        assert_eq!(domain.keep(&driving, driving.len(), &mut Vec::new()), [0, 7]);
+        assert_eq!(domain.kept(&driving, driving.len(), &mut Vec::new()).indices(), [0, 7]);
     }
 
     /// Past sixty four bits a key the bitmap is bigger than the filter it would replace, once it is
@@ -1455,7 +1606,7 @@ mod tests {
         assert!(found.filter.is_none(), "the bitmap takes the filter's place");
         let domain = found.domain.expect("two keys over the cache sized range");
         let probe = column(&[Some(0), Some(1), Some(edge), Some(edge + 1)]);
-        assert_eq!(domain.keep(&probe, 4, &mut Vec::new()), [0, 2]);
+        assert_eq!(domain.kept(&probe, 4, &mut Vec::new()).indices(), [0, 2]);
     }
 
     /// A side that gathered nothing leaves a filter that holds nothing, which is a scan that drops
@@ -1607,7 +1758,7 @@ mod tests {
         let domain = found.domain.expect("a bitmap");
         let driving = chunk(&[Some(103), Some(104), None, Some(299), Some(300), Some(99)]);
         let mut block = Vec::new();
-        assert_eq!(domain.keep(&driving.columns()[0], driving.len(), &mut block), [0, 3]);
+        assert_eq!(domain.kept(&driving.columns()[0], driving.len(), &mut block).indices(), [0, 3]);
     }
 
     /// A side with as many rows as the parent has keys holds about every parent, so the key map is
