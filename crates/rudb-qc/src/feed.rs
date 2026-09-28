@@ -240,7 +240,8 @@ impl<'a> Feed<'a> {
         };
         let folds = &self.folds;
         let fold = |d: &mut [u8], s: &[u8]| merge::fold(folds, d, s);
-        let groups: usize = workers.iter().filter_map(|w| w.table(g.table)).map(GroupTable::len).sum();
+        let groups: usize =
+            workers.iter().filter_map(|w| w.table(g.table)).map(GroupTable::len).sum();
         inner.rt.adopt(first, g.table, &self.sets);
         // Few groups fold faster on one thread than they split.
         if groups < SPLIT_FROM {
