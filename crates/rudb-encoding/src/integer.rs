@@ -1050,9 +1050,16 @@ fn expanded<T: Lane>(run_values: &[i64], run_lengths: &[i64], count: usize) -> R
             at += length as usize;
         }
     } else {
+        // Whole blocks of [`RUN`] rather than a fill of the run's own length, since a fill of a
+        // length the compiler cannot see picks its store width at run time, and on ClickBench 23 that
+        // choice was more of the loop than the stores. A run is rounded up to blocks, which the room
+        // past the end of the chunk and the run after it both absorb.
         for (&value, &length) in runs {
             let length = length as usize;
-            values[at..at + length.max(RUN)].fill(T::wrap(value));
+            let room = length.next_multiple_of(RUN).max(RUN);
+            for block in values[at..at + room].chunks_exact_mut(RUN) {
+                block.fill(T::wrap(value));
+            }
             at += length;
         }
     }
