@@ -2875,6 +2875,24 @@ fn clock<const PERIOD: i64, const UNIT: i64>(
     })
 }
 
+/// Every timestamp floored to a whole `UNIT`, as `micros - micros.rem_euclid(UNIT)`.
+///
+/// The same answer [`Part::truncate_micros`] gives for a part shorter than a day, settled before
+/// the loop for the reason [`clock`] is. `date_trunc('minute', EventTime)` in ClickBench 43 was
+/// two fifths of what a row cost the aggregate over it, spent matching on the part.
+fn floored<const UNIT: i64>(
+    micros: &[i64],
+    at: &impl Fn(usize) -> usize,
+    base: Validity,
+    out: &mut [i64],
+) -> Result<Validity> {
+    over_valid(out.len(), base, |index| {
+        let value = micros[at(index)];
+        out[index] = value - value.rem_euclid(UNIT);
+        Ok(())
+    })
+}
+
 /// The four `date_part` and `date_trunc` loops, once the form has been turned into a mapping.
 #[expect(
     clippy::too_many_arguments,
@@ -2961,10 +2979,23 @@ fn date_runs<A: Fn(usize) -> usize>(
         }
         (LogicalType::Timestamp, Data::Int64(micros), true) => {
             let mut out = vec![0i64; rows];
-            let validity = over_valid(rows, base, |index| {
-                out[index] = part.truncate_micros(micros[at(index)])?;
-                Ok(())
-            })?;
+            let validity = match part {
+                Part::Microsecond => floored::<1>(micros, &at, base, &mut out)?,
+                Part::Millisecond => floored::<1_000>(micros, &at, base, &mut out)?,
+                Part::Second | Part::Epoch => {
+                    floored::<{ datetime::MICROS_PER_SECOND }>(micros, &at, base, &mut out)?
+                }
+                Part::Minute => {
+                    floored::<{ datetime::MICROS_PER_MINUTE }>(micros, &at, base, &mut out)?
+                }
+                Part::Hour => {
+                    floored::<{ datetime::MICROS_PER_HOUR }>(micros, &at, base, &mut out)?
+                }
+                _ => over_valid(rows, base, |index| {
+                    out[index] = part.truncate_micros(micros[at(index)])?;
+                    Ok(())
+                })?,
+            };
             finish(returns, Data::Int64(out.into()), validity)
         }
         (LogicalType::Interval, Data::Interval(fields), false) => {
