@@ -11747,6 +11747,82 @@ fn approx_top_k_answers_what_the_pin_answers_and_refuses_what_it_refuses() {
 }
 
 #[test]
+fn lttb_keeps_the_points_the_pin_keeps_and_refuses_what_it_refuses() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let parabola = "FROM (SELECT i AS x, (i * i)::DOUBLE AS y FROM range(10) t(i))";
+    // Every answer below is the pin's over the same rows.
+    for (sql, answer) in [
+        (
+            format!("SELECT lttb(x::DOUBLE, y, 5 ORDER BY x) {parabola}"),
+            "[{'x': 0.0, 'y': 0.0}, {'x': 2.0, 'y': 4.0}, {'x': 5.0, 'y': 25.0}, {'x': 7.0, 'y': 49.0}, {'x': 9.0, 'y': 81.0}]",
+        ),
+        (
+            format!("SELECT lttb(x, y, 4 ORDER BY x) {parabola}"),
+            "[{'x': 0.0, 'y': 0.0}, {'x': 3.0, 'y': 9.0}, {'x': 6.0, 'y': 36.0}, {'x': 9.0, 'y': 81.0}]",
+        ),
+        (
+            format!("SELECT lttb(x::DOUBLE, y, 2 ORDER BY x) {parabola}"),
+            "[{'x': 0.0, 'y': 0.0}, {'x': 9.0, 'y': 81.0}]",
+        ),
+        (
+            "SELECT lttb(x::DOUBLE, CASE WHEN x = 2 THEN 'nan'::DOUBLE ELSE x END, 3 ORDER BY x) FROM range(6) t(x)".to_string(),
+            "[{'x': 0.0, 'y': 0.0}, {'x': 1.0, 'y': 1.0}, {'x': 5.0, 'y': 5.0}]",
+        ),
+        (
+            "SELECT x % 2 g, len(lttb(x::DOUBLE, (x * x % 7)::DOUBLE, 3 ORDER BY x)) FROM range(20) t(x) GROUP BY g ORDER BY g".to_string(),
+            "0,3;1,3",
+        ),
+        (
+            "SELECT lttb(x, ((x * 7919) % 1000)::DOUBLE, 5 ORDER BY x)::VARCHAR FROM range(1000000) t(x)".to_string(),
+            "[{'x': 0.0, 'y': 0.0}, {'x': 321.0, 'y': 999.0}, {'x': 334000.0, 'y': 0.0}, {'x': 667321.0, 'y': 999.0}, {'x': 999999.0, 'y': 81.0}]",
+        ),
+        ("SELECT lttb(x::DOUBLE, NULL::DOUBLE, 5) FROM range(10) t(x)".to_string(), "NULL"),
+        (
+            "SELECT typeof(lttb(1, 1::FLOAT, '3')), typeof(lttb(1::FLOAT, 1, 3::UINTEGER))".to_string(),
+            "STRUCT(x DOUBLE, y FLOAT)[],STRUCT(x FLOAT, y DOUBLE)[]",
+        ),
+        (
+            "SELECT lttb(TIMESTAMP '2020-01-01' + INTERVAL (x) HOUR, ((x * 7919) % 1000)::DOUBLE, 5 ORDER BY x)::VARCHAR FROM range(1000) t(x)".to_string(),
+            "[{'x': '2020-01-01 00:00:00', 'y': 0.0}, {'x': '2020-01-02 01:00:00', 'y': 975.0}, {'x': '2020-01-15 22:00:00', 'y': 2.0}, {'x': '2020-01-28 19:00:00', 'y': 973.0}, {'x': '2020-02-11 15:00:00', 'y': 81.0}]",
+        ),
+    ] {
+        assert_eq!(text(&sql), answer, "{sql}");
+    }
+    for (sql, message) in [
+        (
+            "SELECT lttb(x, x, 1) FROM range(5) t(x)",
+            "lttb: the number of points must be at least 2",
+        ),
+        (
+            "SELECT lttb(x, x, NULL) FROM range(5) t(x)",
+            "lttb: the number of points must not be NULL",
+        ),
+        (
+            "SELECT lttb(x, x, x) FROM range(5) t(x)",
+            "lttb: the number of points (third argument) must be a constant",
+        ),
+        (
+            "SELECT lttb(x, x, x) OVER () FROM range(5) t(x)",
+            "lttb: the number of points (third argument) must be a constant",
+        ),
+        ("SELECT lttb(x, x, 'x') FROM range(5) t(x)", "Could not convert string 'x' to INT64"),
+        ("SELECT lttb(x, x, 3.0) FROM range(5) t(x)", "No function matches"),
+        ("SELECT lttb(x, DATE '2020-01-01', 3) FROM range(5) t(x)", "No function matches"),
+        ("SELECT lttb(TIME '01:00:00', 1.0, 3)", "No function matches"),
+    ] {
+        let error = db.execute(sql).expect_err(sql);
+        assert!(error.message().contains(message), "{sql}: {error}");
+    }
+}
+
+#[test]
 fn reservoir_quantile_picks_what_the_pin_picks_and_refuses_what_it_refuses() {
     let db = Database::new();
     let text = |sql: &str| {

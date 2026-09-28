@@ -24,6 +24,7 @@ use crate::compare::order_with_nulls;
 use crate::digest::Digest;
 use crate::hash::Sketch;
 use crate::histogram::Binned;
+use crate::lttb::{Plot, Points};
 use crate::number::{approximate, fit, integral};
 use crate::quantile::{self, Column, Held, Holistic, Sample};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
@@ -74,6 +75,9 @@ pub(crate) enum General {
     Digested { digest: Digest, fraction: Option<Value>, returns: LogicalType },
     /// `approx_top_k`, which watches the most counted values, in [`crate::topk`].
     Top { top: Box<TopK>, element: LogicalType },
+    /// `lttb`, which holds every point and thins them when the answer is asked for, in
+    /// [`crate::lttb`].
+    Plotted { plot: Plot, returns: LogicalType },
     /// The `arg_min` and `arg_max` spellings, which keep the row with the least or greatest key,
     /// or the best `n` of them when the call passes a count, and answer in [`crate::arg_extreme`].
     Arg { state: ArgExtreme, returns: LogicalType },
@@ -181,6 +185,7 @@ impl General {
                 };
                 Self::Top { top: Box::default(), element }
             }
+            "lttb" => Self::Plotted { plot: Plot::new(returns), returns: returns.clone() },
             "reservoir_quantile" => Self::Sampled {
                 sample: Sample::default(),
                 fraction: None,
@@ -286,6 +291,10 @@ impl General {
                 digest.push(value);
             }
             Self::Top { top, .. } => top.push(value, args.get(1))?,
+            Self::Plotted { plot, .. } => {
+                let y = args.get(1).unwrap_or(&Value::Null);
+                plot.push(value, y, args.get(2), args.get(3))?;
+            }
             Self::Product { total, seen } => {
                 *total *= approximate(value).ok_or_else(|| unexpected("product", value))?;
                 *seen = true;
@@ -370,6 +379,19 @@ impl General {
             args.get(1).map(|given| given.try_value_at(row)).transpose()?
         };
         top.push_text(text, k.as_ref())
+    }
+
+    /// Whether this state takes whole batches of points through [`Self::push_point`].
+    pub(crate) const fn takes_points(&self) -> bool {
+        matches!(self, Self::Plotted { .. })
+    }
+
+    /// Adds the point at `row`, for a state [`Self::takes_points`] says yes to.
+    pub(crate) fn push_point(&mut self, points: &Points<'_>, row: usize) -> Result<()> {
+        let Self::Plotted { plot, .. } = self else {
+            return Err(Error::internal("points handed to an aggregate that does not plot them"));
+        };
+        plot.push_row(points, row)
     }
 
     /// Whether this state skips nulls and takes the rest of a column through [`Self::push_column`].
@@ -538,6 +560,9 @@ impl General {
                 }
             }
             (Self::Top { top, .. }, Self::Top { top: theirs, .. }) => top.combine(theirs)?,
+            (Self::Plotted { plot, .. }, Self::Plotted { plot: theirs, .. }) => {
+                plot.combine(theirs)
+            }
             (Self::Paired(state), Self::Paired(theirs)) => state.combine(theirs),
             (Self::Powers(state), Self::Powers(theirs)) => state.combine(theirs),
             (
@@ -678,6 +703,7 @@ impl General {
             Self::Gathered(state) => state.finish(),
             Self::Sketched(sketch) => Value::BigInt(sketch.count()),
             Self::Top { top, element } => top.finish(element),
+            Self::Plotted { plot, returns } => plot.finish(returns),
             Self::Moments { count, squared, measure, .. } => {
                 #[expect(
                     clippy::cast_precision_loss,
