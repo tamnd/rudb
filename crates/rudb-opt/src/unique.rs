@@ -60,6 +60,7 @@
 use rudb_common::{Class, LogicalType, Result, Stat, Value};
 use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice};
 
+use crate::columns;
 use crate::estimate::{self, Facts, Key};
 use crate::fromkey::cast;
 use crate::pass::{Context, Pass};
@@ -90,7 +91,14 @@ impl Pass for JoinedRowsAreGroups {
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        project_all(plan, context.facts());
+        // This runs after the unused columns pass, and an aggregate turned into a projection can
+        // leave a group key nothing above reads. As a key it had to stay, but as a projected column
+        // it is dead, so the pruning runs again here rather than on the next run of the sequence,
+        // which is what the settle check in a debug build would catch.
+        if project_all(plan, context.facts()) {
+            columns::prune(plan);
+            columns::forward(plan);
+        }
         Ok(())
     }
 }
@@ -98,13 +106,15 @@ impl Pass for JoinedRowsAreGroups {
 /// Rewrites every aggregate in `plan` that groups on a column with no value in it twice.
 ///
 /// What it produces is a projection, which this never looks at, so a second run leaves it alone.
-pub fn project_all(plan: &mut Plan, stats: &Facts) {
+/// Says whether it rewrote anything.
+pub fn project_all(plan: &mut Plan, stats: &Facts) -> bool {
     let mut moved = false;
     let root =
         walk::restack(plan, plan.root(), &mut moved, &mut |plan, at| project(plan, at, stats));
     if moved {
         plan.set_root(root);
     }
+    moved
 }
 
 /// The projection `at` is, when it is an aggregate whose every group is one row.
