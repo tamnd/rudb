@@ -20,13 +20,69 @@ use crate::mem;
 use crate::table::{Distinct, GroupTable, read_u128};
 use crate::text::{self, Heap};
 
-/// The proxies of `ht_insert`, `agg_distinct` and `agg_distinct_int`, which compiled code calls
-/// once a row.
-static HOT: std::sync::LazyLock<[u32; 3]> = std::sync::LazyLock::new(|| {
-    let at =
-        |name: &str| CATALOGUE.iter().position(|p| p.name == name).map_or(u32::MAX, |i| i as u32);
-    [at("ht_insert"), at("agg_distinct"), at("agg_distinct_int")]
-});
+/// A runtime function by what it does, so that a call goes to its code by one jump on the proxy
+/// rather than by comparing names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Call {
+    StrPromote,
+    StrEq,
+    StrCmp,
+    StrHash,
+    StrLength,
+    StrLike,
+    StrRegex,
+    StrRegexReplace,
+    StrLower,
+    StrUpper,
+    StrConcat,
+    HtInsert,
+    JtAppend,
+    AggDistinct,
+    AggDistinctInt,
+    AggMinStr,
+    AggMaxStr,
+    I128Div,
+    DateTruncMinute,
+    DateExtractMinute,
+    DateExtractYear,
+    DateTruncMonth,
+    /// A name in the catalogue with no code here, which fails when it is called.
+    Missing,
+}
+
+impl Call {
+    fn named(name: &str) -> Call {
+        match name {
+            "str_promote" => Call::StrPromote,
+            "str_eq" => Call::StrEq,
+            "str_cmp" => Call::StrCmp,
+            "str_hash" => Call::StrHash,
+            "str_length" => Call::StrLength,
+            "str_like" => Call::StrLike,
+            "str_regex" => Call::StrRegex,
+            "str_regex_replace" => Call::StrRegexReplace,
+            "str_lower" => Call::StrLower,
+            "str_upper" => Call::StrUpper,
+            "str_concat" => Call::StrConcat,
+            "ht_insert" => Call::HtInsert,
+            "jt_append" => Call::JtAppend,
+            "agg_distinct" => Call::AggDistinct,
+            "agg_distinct_int" => Call::AggDistinctInt,
+            "agg_min_str" => Call::AggMinStr,
+            "agg_max_str" => Call::AggMaxStr,
+            "i128_div" => Call::I128Div,
+            "date_trunc_minute" => Call::DateTruncMinute,
+            "date_extract_minute" => Call::DateExtractMinute,
+            "date_extract_year" => Call::DateExtractYear,
+            "date_trunc_month" => Call::DateTruncMonth,
+            _ => Call::Missing,
+        }
+    }
+}
+
+/// The [`Call`] of every proxy, in the catalogue's order.
+static CALLS: std::sync::LazyLock<Vec<Call>> =
+    std::sync::LazyLock::new(|| CATALOGUE.iter().map(|p| Call::named(p.name)).collect());
 
 /// The error site payload that means the runtime failed and `Rt::error` says why.
 pub const RUNTIME_ERROR: u64 = 0xff_ffff;
@@ -412,30 +468,33 @@ impl Rt {
         Ok(0)
     }
 
-    fn call(&mut self, name: &str, a: &[u128]) -> Result<u128, u64> {
+    #[inline(always)]
+    fn call(&mut self, call: Call, name: &str, a: &[u128]) -> Result<u128, u64> {
         // SAFETY: every `str16` compiled code passes is inline or points at bytes the driver or
         // this heap keeps alive for the whole query, which is rule V10.
         let s = |i: usize| unsafe { text::bytes(&a[i]) };
-        Ok(match name {
-            "str_promote" => {
+        Ok(match call {
+            Call::StrPromote => {
                 let bytes = s(1).to_vec();
                 self.string(&bytes)
             }
-            "str_eq" => u128::from(a[0] == a[1] || s(0) == s(1)),
-            "str_cmp" => u128::from(s(0).cmp(s(1)) as i32 as u32),
-            "str_hash" => u128::from(hash(s(0), a[1] as u64)),
-            "str_length" => u128::from(s(0).iter().filter(|b| (**b as i8) >= -0x40).count() as u64),
-            "str_like" => match self.objects.get(a[0] as usize) {
+            Call::StrEq => u128::from(a[0] == a[1] || s(0) == s(1)),
+            Call::StrCmp => u128::from(s(0).cmp(s(1)) as i32 as u32),
+            Call::StrHash => u128::from(hash(s(0), a[1] as u64)),
+            Call::StrLength => {
+                u128::from(s(0).iter().filter(|b| (**b as i8) >= -0x40).count() as u64)
+            }
+            Call::StrLike => match self.objects.get(a[0] as usize) {
                 Some(Object::Like(like)) => u128::from(like.matches(s(1))),
                 _ => return Err(self.fail(bad_handle(name))),
             },
-            "str_regex" => {
+            Call::StrRegex => {
                 let Some(Object::Regex { regex, .. }) = self.objects.get(a[0] as usize) else {
                     return Err(self.fail(bad_handle(name)));
                 };
                 u128::from(regex.is_match(utf8(s(1))))
             }
-            "str_regex_replace" => {
+            Call::StrRegexReplace => {
                 let Some(Object::Regex { regex, rewrite, global }) =
                     self.objects.get(a[0] as usize)
                 else {
@@ -448,19 +507,19 @@ impl Rt {
                 self.buffer = out;
                 v
             }
-            "str_lower" | "str_upper" => {
+            Call::StrLower | Call::StrUpper => {
                 let t = utf8(s(0));
-                let out = if name == "str_lower" { t.to_lowercase() } else { t.to_uppercase() };
+                let out = if call == Call::StrLower { t.to_lowercase() } else { t.to_uppercase() };
                 self.string(out.as_bytes())
             }
-            "str_concat" => {
+            Call::StrConcat => {
                 let mut out = Vec::with_capacity(s(0).len() + s(1).len());
                 out.extend_from_slice(s(0));
                 out.extend_from_slice(s(1));
                 self.string(&out)
             }
-            "ht_insert" => self.ht_insert(a)?,
-            "jt_append" => {
+            Call::HtInsert => self.ht_insert(a)?,
+            Call::JtAppend => {
                 let Some(Object::Join(table)) = self.objects.get_mut(a[0] as usize) else {
                     return Err(self.fail(bad_handle(name)));
                 };
@@ -469,9 +528,9 @@ impl Rt {
                 unsafe { table.append(a[1] as usize, a[2] as u64, &mut self.heap) };
                 0
             }
-            "agg_distinct" => self.agg_distinct(a, true)?,
-            "agg_distinct_int" => self.agg_distinct(a, false)?,
-            "agg_min_str" | "agg_max_str" => {
+            Call::AggDistinct => self.agg_distinct(a, true)?,
+            Call::AggDistinctInt => self.agg_distinct(a, false)?,
+            Call::AggMinStr | Call::AggMaxStr => {
                 let at = a[0] as usize;
                 // SAFETY: the first argument is the accumulator in a group row, a `str16` and a
                 // byte that says whether it holds a value yet.
@@ -481,7 +540,7 @@ impl Rt {
                     // SAFETY: the accumulator holds a string this heap keeps.
                     let old = unsafe { text::bytes(&old) };
                     let ord = s(1).cmp(old);
-                    if name == "agg_min_str" { ord.is_lt() } else { ord.is_gt() }
+                    if call == Call::AggMinStr { ord.is_lt() } else { ord.is_gt() }
                 };
                 if better {
                     let bytes = s(1).to_vec();
@@ -493,7 +552,7 @@ impl Rt {
                 }
                 0
             }
-            "i128_div" => {
+            Call::I128Div => {
                 let (x, y) = (a[0] as i128, a[1] as i128);
                 match x.checked_div(y) {
                     Some(q) => q as u128,
@@ -503,23 +562,23 @@ impl Rt {
                     }
                 }
             }
-            "date_trunc_minute" => {
+            Call::DateTruncMinute => {
                 let t = a[0] as u64 as i64;
                 u128::from(t.div_euclid(MINUTE).wrapping_mul(MINUTE) as u64)
             }
-            "date_extract_minute" => {
+            Call::DateExtractMinute => {
                 let t = a[0] as u64 as i64;
                 u128::from(t.div_euclid(MINUTE).rem_euclid(60) as u64)
             }
-            "date_extract_year" => {
+            Call::DateExtractYear => {
                 let (y, _, _) = civil_from_days(a[0] as u32 as i32);
                 u128::from(i64::from(y) as u64)
             }
-            "date_trunc_month" => {
+            Call::DateTruncMonth => {
                 let (y, m, _) = civil_from_days(a[0] as u32 as i32);
                 u128::from(days_from_civil(y, m, 1) as u32)
             }
-            _ => {
+            Call::Missing => {
                 return Err(self
                     .fail(Error::new(ErrorCode::Internal, format!("no runtime function {name}"))));
             }
@@ -561,36 +620,38 @@ pub fn hash(bytes: &[u8], seed: u64) -> u64 {
 
 impl Runtime for Rt {
     fn rtcall(&mut self, proxy: u32, args: &[u128]) -> Result<u128, u64> {
-        // The calls made once a row go straight to their code, and the rest by name.
-        let hot = &*HOT;
-        if proxy == hot[0] {
-            return self.ht_insert(args);
-        } else if proxy == hot[1] {
-            return self.agg_distinct(args, true);
-        } else if proxy == hot[2] {
-            return self.agg_distinct(args, false);
+        let mut out = 0;
+        match self.rtcall_into(proxy, args, &mut out) {
+            0 => Ok(out),
+            s => Err(s),
         }
-        let Some(p) = CATALOGUE.get(proxy as usize) else {
-            return Err(
-                self.fail(Error::new(ErrorCode::Internal, format!("no runtime function {proxy}")))
-            );
-        };
-        self.call(p.name, args)
     }
 
     fn rtcall_into(&mut self, proxy: u32, args: &[u128], out: &mut u128) -> u64 {
-        if proxy == HOT[0] {
-            let Some(Object::Table(table)) = self.objects.get_mut(args[0] as usize) else {
-                return self.fail(bad_handle("ht_insert"));
-            };
-            let at = args.get(3).map_or(0, |&w| w as usize);
-            // SAFETY: as for `ht_insert`.
-            let row =
-                unsafe { insert(table, args[1] as usize, args[2] as u64, at, &mut self.heap) };
-            *out = row as u128;
-            return 0;
-        }
-        match self.rtcall(proxy, args) {
+        let (Some(&call), Some(p)) = (CALLS.get(proxy as usize), CATALOGUE.get(proxy as usize))
+        else {
+            return self
+                .fail(Error::new(ErrorCode::Internal, format!("no runtime function {proxy}")));
+        };
+        // The value is written to `out` here, where it is still in a register. Returned in a
+        // `Result`, it went through memory and was read back with a wider load than the stores
+        // that wrote it, which stalled every call.
+        let r = match call {
+            Call::HtInsert => {
+                let Some(Object::Table(table)) = self.objects.get_mut(args[0] as usize) else {
+                    return self.fail(bad_handle("ht_insert"));
+                };
+                let at = args.get(3).map_or(0, |&w| w as usize);
+                // SAFETY: as for `ht_insert`.
+                let row =
+                    unsafe { insert(table, args[1] as usize, args[2] as u64, at, &mut self.heap) };
+                Ok(row as u128)
+            }
+            Call::AggDistinct => self.agg_distinct(args, true),
+            Call::AggDistinctInt => self.agg_distinct(args, false),
+            _ => self.call(call, p.name, args),
+        };
+        match r {
             Ok(v) => {
                 *out = v;
                 0
