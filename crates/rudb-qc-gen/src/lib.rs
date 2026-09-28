@@ -153,6 +153,10 @@ pub struct Grouping {
     /// For an aggregate with no groups, the state offset where the driver writes the address of
     /// the one row.
     pub row: Option<u32>,
+    /// For an aggregate grouped by keys that are all fixed width, the state offset of the row the
+    /// last key went to, zero before the first. A row whose key is the last one's goes to the same
+    /// row without hashing or probing, which is most rows of a file sorted on its keys.
+    pub last: Option<u32>,
 }
 
 /// One accumulator in a group row.
@@ -576,15 +580,20 @@ impl Gen<'_> {
                 };
                 let acc_offset = Layout::acc_offset(size);
                 let table = self.once(|g| g.rt.add_table(GroupTable::new(layout)))?;
-                let (row, state) = if groups.is_empty() {
+                let (row, last, state) = if groups.is_empty() {
                     self.field(SINK, 8, "row");
-                    (Some(SINK), SINK + 8)
+                    (Some(SINK), None, SINK + 8)
                 } else {
                     let size = size.next_multiple_of(8);
                     self.field(SINK, size, "key");
-                    (None, SINK + size)
+                    if keys.iter().any(|(k, _)| k.text) {
+                        (None, None, SINK + size)
+                    } else {
+                        self.field(SINK + size, 8, "last");
+                        (None, Some(SINK + size), SINK + size + 8)
+                    }
                 };
-                let grouping = Grouping { table, keys, acc_offset, accs, row };
+                let grouping = Grouping { table, keys, acc_offset, accs, row, last };
                 Ok((Out::Aggregate(grouping), state))
             }
         }
@@ -1325,9 +1334,37 @@ impl Gen<'_> {
                 let row = match g.row {
                     Some(at) => self.b.load(Ty::Ptr, st, Val::NONE, 1, at as i32, 4),
                     None => {
+                        let mut values = Vec::with_capacity(groups.len());
+                        for e in groups {
+                            values.push(self.expr(e)?);
+                        }
+                        // The key buffer still holds the last row's key, which a key the same
+                        // bytes as it finds the same group, so its row is taken again.
+                        let done = self.b.block(&[(Ty::Ptr, "row")]);
+                        if let Some(last) = g.last {
+                            let seen = self.b.load(Ty::I64, st, Val::NONE, 1, last as i32, 0);
+                            let zero = self.b.int(Ty::I64, 0);
+                            let mut same = self.b.bin(Op::IcmpNe, seen, zero);
+                            for (&(v, ok), (k, _)) in values.iter().zip(&g.keys) {
+                                let at = (SINK + k.offset) as i32;
+                                let ty = self.b.ty(v);
+                                let old = self.b.load(ty, st, Val::NONE, 1, at, 0);
+                                let eq = self.b.bin(Op::IcmpEq, old, v);
+                                let null =
+                                    self.b.load(Ty::I1, st, Val::NONE, 1, at + k.width as i32, 0);
+                                // The null byte is set where `ok` is not.
+                                let flip = self.b.bin(Op::Xor, null, ok);
+                                same = self.b.bin(Op::And, same, eq);
+                                same = self.b.bin(Op::And, same, flip);
+                            }
+                            let seen = self.b.conv(Op::Bitcast, seen, Ty::Ptr);
+                            let new = self.b.block(&[]);
+                            self.b.brif(same, done, &[seen], new, &[]);
+                            self.b.switch_to(new);
+                        }
                         let mut hash = self.b.int(Ty::I64, 0);
-                        for (e, (k, _)) in groups.iter().zip(&g.keys) {
-                            let (v, ok) = self.expr(e)?;
+                        for (&(v, ok), (e, (k, _))) in values.iter().zip(groups.iter().zip(&g.keys))
+                        {
                             let at = (SINK + k.offset) as i32;
                             self.b.store(st, Val::NONE, 1, at, v, 0);
                             let null = self.b.un(Op::Not, ok);
@@ -1338,7 +1375,13 @@ impl Gen<'_> {
                         }
                         let key = self.offset(st, SINK);
                         let table = self.handle(g.table);
-                        self.rt(proxy_id("ht_insert"), &[table, key, hash])
+                        let row = self.rt(proxy_id("ht_insert"), &[table, key, hash]);
+                        if let Some(last) = g.last {
+                            self.b.store(st, Val::NONE, 1, last as i32, row, 0);
+                        }
+                        self.b.br(done, &[row]);
+                        self.b.switch_to(done);
+                        self.b.param(done, 0)
                     }
                 };
                 for (a, acc) in aggregates.iter().zip(&g.accs) {
