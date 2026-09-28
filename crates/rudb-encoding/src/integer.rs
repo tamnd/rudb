@@ -417,6 +417,16 @@ pub fn pointed(bytes: &[u8]) -> bool {
     }
 }
 
+/// Whether this is a run length chunk, which [`decode_selected`] reads without expanding its runs.
+///
+/// It still decodes every run length, and the run values when they are deltas, so it is not
+/// [`pointed`]. What it skips is writing out every row and picking a few of them afterwards, which
+/// for a key kept as runs, such as the order key of TPC-H lineitem, was most of the cost.
+#[must_use]
+pub fn run_length(bytes: &[u8]) -> bool {
+    bytes.first().and_then(|&tag| Kind::from_tag(tag).ok()) == Some(Kind::Rle)
+}
+
 /// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
 ///
 /// A string column holds integer chunks inside its own body, and the reader on that side cannot
@@ -2152,6 +2162,7 @@ mod tests {
             let shape = describe(&bytes).unwrap();
             let simple = !shape.contains("RLE") && !shape.contains("DELTA");
             assert_eq!(pointed(&bytes), simple, "{shape}");
+            assert_eq!(run_length(&bytes), kind == Kind::Rle, "{shape}");
         }
     }
 
