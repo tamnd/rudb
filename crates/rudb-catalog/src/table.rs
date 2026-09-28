@@ -11,7 +11,7 @@ use rudb_native::{
     Reader as NativeReader, StoredPart, Stripes,
 };
 use rudb_storage::{MemoryTable, Probe, Range};
-use rudb_vector::{Chunk, Form, VECTOR_SIZE, Vector, concat};
+use rudb_vector::{Chunk, VECTOR_SIZE, Vector, concat};
 
 use crate::catalog::DETACHED;
 use crate::held::Held;
@@ -1837,13 +1837,10 @@ impl Table {
                 continue;
             }
             let vector = chunk.column(at)?;
-            let found = match vector.form() {
-                Form::Flat | Form::Sequence => {
-                    vector.validity().has_nulls(vector.len())
-                        && (0..vector.len()).any(|row| !vector.validity().is_valid(row))
-                }
-                _ => (0..vector.len()).any(|row| vector.value_at(row).is_null()),
-            };
+            // Asked through the validity rather than through a value per row. Building a value for
+            // every row of every `NOT NULL` column was most of what loading a file cost, and for a
+            // string column it copied each row's bytes only to drop them.
+            let found = !vector.never_null() && (0..vector.len()).any(|row| vector.is_null_at(row));
             if found {
                 return Err(self.null_in(&column.name));
             }
@@ -2142,5 +2139,27 @@ mod tests {
         .expect("two columns of four rows");
         let error = table.append(chunk).expect_err("a constant null in UserID");
         assert_eq!(error.message(), "NOT NULL constraint failed: hits.UserID");
+    }
+
+    #[test]
+    fn a_null_behind_a_dictionary_code_is_found() {
+        let mut table = required();
+        let values = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1), Value::Null])
+            .expect("an id and a null");
+        let phrase = Vector::constant(LogicalType::Varchar, Value::Varchar("a".to_string()), 3);
+        let good = Chunk::new(vec![
+            Vector::dictionary(vec![0, 0, 0], values.clone()).expect("three rows"),
+            phrase.clone(),
+        ])
+        .expect("two columns of three rows");
+        table.append(good).expect("no row points at the null");
+        let bad = Chunk::new(vec![
+            Vector::dictionary(vec![0, 1, 0], values).expect("three rows"),
+            phrase,
+        ])
+        .expect("two columns of three rows");
+        let error = table.append(bad).expect_err("a null in UserID through its code");
+        assert_eq!(error.message(), "NOT NULL constraint failed: hits.UserID");
+        assert_eq!(table.rows().len(), 3, "the bad chunk was kept anyway");
     }
 }
