@@ -64,6 +64,7 @@ use rudb_functions::{Behaviour, LOCAL, SETTINGS, SettingEntry};
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
+use rudb_txn::log::CommitSync;
 
 use crate::config::{Config, parse_size};
 
@@ -179,6 +180,11 @@ pub(crate) struct Settings {
     /// The techniques the compiled engine leaves out, as `SET qc_ablate` has left them. Only the
     /// ablation runs of section 17.8 of the measurement spec set it.
     ablate: RwLock<rudb_qc::Ablate>,
+    /// What a commit waits for before it returns, as `SET commit_sync` has left it: `full`, `os`
+    /// or `none`. Read by the log at every commit, so a change takes effect at the next one.
+    ///
+    /// Not a DuckDB setting, for the reason the seams are not.
+    commit_sync: RwLock<CommitSync>,
     /// How many times a statement has been let at the settings, counted after it is done.
     changes: AtomicU64,
     /// The last session [`Settings::session`] built, and the count of changes it was built at.
@@ -229,6 +235,7 @@ impl Settings {
             switch: RwLock::new(rudb_qc::Switch::Off),
             morsel: RwLock::new(0),
             ablate: RwLock::new(rudb_qc::Ablate::NONE),
+            commit_sync: RwLock::new(CommitSync::Full),
             changes: AtomicU64::new(0),
             built: Mutex::new(None),
         }
@@ -264,6 +271,11 @@ impl Settings {
     /// The two link join numbers as the statements have left them.
     pub(crate) fn sizes(&self) -> rudb_opt::link::Sizes {
         *self.sizes.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// What `SET commit_sync` left a commit waiting for.
+    pub(crate) fn commit_sync(&self) -> CommitSync {
+        *self.commit_sync.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The engine `SET engine` picked, `first` or `compiled`.
@@ -405,6 +417,14 @@ impl Settings {
                 Error::invalid_input(format!("qc_morsel is a number of rows, not {written}"))
             })?;
             *self.morsel.write().unwrap_or_else(|held| held.into_inner()) = rows;
+            return Ok(());
+        }
+        if is_commit_sync(name) {
+            let written = value.map_or_else(|| "full".to_string(), text_of);
+            let sync = sync_named(&written).ok_or_else(|| {
+                Error::invalid_input(format!("commit_sync is full, os or none, not {written}"))
+            })?;
+            *self.commit_sync.write().unwrap_or_else(|held| held.into_inner()) = sync;
             return Ok(());
         }
         if is_ablate(name) {
@@ -796,6 +816,9 @@ impl Settings {
         if is_morsel(name) {
             return Ok(self.morsel().to_string());
         }
+        if is_commit_sync(name) {
+            return Ok(sync_name(self.commit_sync()).to_string());
+        }
         if is_ablate(name) {
             return Ok(self.ablate().to_string());
         }
@@ -1119,6 +1142,33 @@ fn is_switch(name: &str) -> bool {
 /// [`is_engine`].
 fn is_morsel(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("qc_morsel")
+}
+
+/// Whether this name is the log's commit setting, the same shape as [`is_engine`].
+fn is_commit_sync(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("commit_sync")
+}
+
+/// The commit setting a word names. `barrier` is taken and is `full` until the log has a second
+/// kind of sync, and `off` is `none`, the word SQLite's `synchronous` uses for it.
+fn sync_named(word: &str) -> Option<CommitSync> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "full" | "on" => Some(CommitSync::Full),
+        "barrier" => Some(CommitSync::Barrier),
+        "os" | "normal" => Some(CommitSync::Os),
+        "none" | "off" => Some(CommitSync::None),
+        _ => None,
+    }
+}
+
+/// The word a commit setting is read back as.
+fn sync_name(sync: CommitSync) -> &'static str {
+    match sync {
+        CommitSync::Full => "full",
+        CommitSync::Barrier => "barrier",
+        CommitSync::Os => "os",
+        CommitSync::None => "none",
+    }
 }
 
 /// Whether this name is the compiled engine's ablation setting, the same shape as [`is_engine`].
