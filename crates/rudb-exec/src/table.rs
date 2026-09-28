@@ -359,6 +359,16 @@ impl Table {
         self.hashes[slot]
     }
 
+    /// The hashes of the groups in `slots`, for the same reason as [`Self::hash_of`] and without
+    /// copying them out, since a merge wants a run of them at a time.
+    ///
+    /// # Panics
+    ///
+    /// If `slots` reaches past the last group in this table, which is a bug in the caller.
+    pub(crate) fn hashes_of(&self, slots: std::ops::Range<usize>) -> &[u64] {
+        &self.hashes[slots]
+    }
+
     /// What the stored keys own away from themselves.
     ///
     /// Charged separately from [`Self::footprint`] because it is charged for longer. The strings a
