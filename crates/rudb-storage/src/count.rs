@@ -233,9 +233,8 @@ impl Column {
         }
         stray.extend(self.tally.spilled().unwrap_or_default());
         stray.extend(later.tally.spilled().unwrap_or_default());
-        match self.sketch.union(&later.sketch) {
-            Ok(union) => self.sketch = union,
-            Err(_) => return self.blind(),
+        if self.sketch.absorb(&later.sketch).is_err() {
+            return self.blind();
         }
         for hash in stray {
             self.sketch.add_hash(hash);
