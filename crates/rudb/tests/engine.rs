@@ -64,6 +64,29 @@ fn a_limit_with_no_order_over_groups_reads_whole_groups_on_the_compiled_engine()
 }
 
 #[test]
+fn a_top_n_by_a_count_picks_its_groups_by_the_count_on_the_compiled_engine() {
+    let database = Database::new();
+    for sql in [
+        "CREATE TABLE u (k INTEGER, v VARCHAR)",
+        // Key k has k rows, so no two groups tie on the count.
+        "INSERT INTO u SELECT a.i, 'v' || (b.j % 3) FROM range(100) a(i), range(100) b(j) WHERE b.j < a.i",
+    ] {
+        database.execute(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    for sql in [
+        "SELECT k, count(*) AS c FROM u GROUP BY k ORDER BY c DESC LIMIT 3",
+        "SELECT k, count(v) AS c FROM u GROUP BY k ORDER BY c LIMIT 4 OFFSET 2",
+        "SELECT v, k, count(*) AS c FROM u GROUP BY v, k ORDER BY c DESC, v, k LIMIT 5",
+    ] {
+        database.execute("SET engine = 'first'").expect("the first engine");
+        let first = rows(&database, sql);
+        database.execute("SET engine = 'compiled'").expect("the compiled engine");
+        assert_eq!(rows(&database, sql), first, "{sql}");
+    }
+    assert_eq!(database.refusals(), Vec::<String>::new());
+}
+
+#[test]
 fn a_refused_query_runs_on_the_first_engine_and_is_logged() {
     let database = database();
     database.execute("SET engine = 'compiled'").expect("the compiled engine");

@@ -381,7 +381,11 @@ impl Default for Answer {
 /// Prints the first engine's plan and the compiled engine's stages and module for one query, which
 /// is what `--explain` asks for when a query is slower than it should be.
 fn explained(database: &Database, name: &str, sql: &str) {
-    for how in ["EXPLAIN", "EXPLAIN (CODEGEN)"] {
+    for how in ["EXPLAIN", "EXPLAIN (CODEGEN)", "EXPLAIN ANALYZE"] {
+        // The analyzed plan is the first engine's, with what each of its operators took.
+        if database.execute("SET engine = 'first'").is_err() {
+            return;
+        }
         println!("-- {name}: {how}");
         match database.query(&format!("{how} {sql}")) {
             Ok(result) => {

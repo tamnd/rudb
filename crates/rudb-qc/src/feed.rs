@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rudb_common::{Cancel, Error, ErrorCode, Result};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::Plan;
-use rudb_qc_gen::{Body, Out};
+use rudb_qc_gen::{Body, Grouping, Out};
 use rudb_qc_ir::status::{Kind, Status};
 use rudb_qc_ir::{ErrorKind, Module};
 use rudb_qc_pipe::{Pipeline, Source, Step};
@@ -437,10 +437,10 @@ impl<'a> Feed<'a> {
             .iter()
             .map(|&h| inner.rt.distinct(h).map(|d| (h, d)).ok_or_else(|| gone(h)))
             .collect::<Result<Vec<_>>>()?;
-        let columns = self.columns;
-        let top = self.top;
-        let chunks = pieces(threads, table.len().div_ceil(VECTOR_SIZE), |at| {
-            cut(finish::group_chunk(table, &sets, g, columns, at)?, top)
+        let (columns, top) = (self.columns, self.top);
+        let span = span(top, g);
+        let chunks = pieces(threads, table.len().div_ceil(span), |at| {
+            piece(table, &sets, g, columns, top, at * span, ((at + 1) * span).min(table.len()))
         })?;
         let mut out = Vec::with_capacity(chunks.len());
         for chunk in chunks {
@@ -646,9 +646,21 @@ impl<'a> Feed<'a> {
                 Step::Merge => return Err(Error::internal("a merge step with one worker")),
                 Step::Finalize => match &self.body.sink {
                     Out::Aggregate(g) if !inner.grouped => {
+                        let table = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
+                        let sets = finish::sets(inner.rt, g)?;
+                        let span = span(self.top, g);
                         let mut cuts = Vec::new();
-                        for chunk in finish::groups(inner.rt, g, self.columns)? {
-                            cuts.append(&mut cut(chunk, self.top)?);
+                        for from in (0..table.len()).step_by(span) {
+                            let to = (from + span).min(table.len());
+                            cuts.append(&mut piece(
+                                table,
+                                &sets,
+                                g,
+                                self.columns,
+                                self.top,
+                                from,
+                                to,
+                            )?);
                         }
                         out = cuts;
                     }
@@ -702,6 +714,38 @@ impl<'a> Feed<'a> {
             _ => Error::internal(format!("a pipeline returned status {s:?}")),
         }
     }
+}
+
+/// How many groups [`piece`] takes at once: many when a top N by a count reads them, because
+/// then only the groups that can make it are made into values, and a chunk's worth otherwise.
+fn span(top: Option<(&[Key], u64)>, g: &Grouping) -> usize {
+    match top {
+        Some((keys, _)) if finish::counted(g, keys).is_some() => COUNTED_SPAN,
+        _ => VECTOR_SIZE,
+    }
+}
+
+/// The groups from `from` to `to` of `table` as chunks, cut to the top N when only a top N reads
+/// them.
+fn piece(
+    table: &GroupTable,
+    sets: &[(u64, &Distinct)],
+    g: &Grouping,
+    columns: &[Column],
+    top: Option<(&[Key], u64)>,
+    from: usize,
+    to: usize,
+) -> Result<Vec<Chunk>> {
+    let kept = top.and_then(|(keys, count)| {
+        let at = finish::counted(g, keys)?;
+        finish::counted_top(table, at, keys.len() > 1, count, from, to)
+    });
+    let gids = kept.unwrap_or_else(|| (from..to).collect());
+    let mut out = Vec::new();
+    for gids in gids.chunks(VECTOR_SIZE) {
+        out.append(&mut cut(finish::group_rows(table, sets, g, columns, gids)?, top)?);
+    }
+    Ok(out)
 }
 
 /// A chunk of groups cut to its top N, when only a top N reads them. Every row of the answer is in
@@ -842,6 +886,9 @@ impl Sink for Scan<'_, '_> {
 
 /// How many groups the workers of an aggregate have between them before they are merged in parts.
 const SPLIT_FROM: usize = 1 << 16;
+
+/// How many groups [`piece`] takes at once when it can pick the ones a top N keeps by their count.
+const COUNTED_SPAN: usize = 1 << 16;
 
 /// How many groups a worker's table holds before it forgets them and starts again, so that its
 /// slots and the rows it is filling stay in the cache.
