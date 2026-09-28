@@ -83,6 +83,9 @@ pub fn cast_in_time_zone(
     try_cast: bool,
     time_zone: Option<SessionTimeZone>,
 ) -> Result<Vector> {
+    // A column of aggregate states is held as the layout its states are written in, so a cast into
+    // one is a cast into that layout, and a cast out of one starts from it.
+    let target = target.storage();
     if input.logical_type() == target {
         return Ok(input.clone());
     }
@@ -723,6 +726,7 @@ fn approximate_out(run: Vec<f64>, single: bool) -> Option<Data> {
 /// If the value cannot be represented in the target type and `try_cast` is false, or if the pair
 /// of types is one this does not handle yet.
 pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result<Value> {
+    let target = target.storage();
     if value.is_null() || matches!(target, LogicalType::Null) {
         return Ok(Value::Null);
     }

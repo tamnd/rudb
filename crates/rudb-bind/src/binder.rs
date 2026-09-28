@@ -338,6 +338,9 @@ pub(crate) struct Binder<'a> {
     pub(crate) lambda_frames: Vec<crate::lambda::Frame>,
     /// Whether the expression being bound is inside a `TRY`, which refuses what it cannot rerun.
     pub(crate) trying: bool,
+    /// Whether the call being bound wrote `EXPORT_STATE` after it, which an aggregate takes to
+    /// mean it answers with its state rather than with its result.
+    pub(crate) exporting: bool,
     /// Where we are, for an error message that says which clause the writer should look at.
     pub(crate) clause: &'static str,
     /// Whether a Parquet file that could be read through a native mirror is bound from its outline
@@ -404,6 +407,7 @@ impl<'a> Binder<'a> {
             correlations: Vec::new(),
             lambda_frames: Vec::new(),
             trying: false,
+            exporting: false,
             clause: "SELECT clause",
             outlined: false,
             expanding: Vec::new(),
@@ -3286,6 +3290,7 @@ impl<'a> Binder<'a> {
         scope: &Scope,
     ) -> Result<ExprRef> {
         let AggregateCall { name, args, distinct, filter, sorted } = *written;
+        let exporting = std::mem::take(&mut self.exporting);
         if self.in_filter {
             return Err(Error::binder("aggregate functions are not allowed in FILTER"));
         }
@@ -3383,10 +3388,26 @@ impl<'a> Binder<'a> {
         if resolved.name == "lttb" {
             self.lttb_points(cast[2])?;
         }
-        let name = self.ordered_aggregate(resolved.name, sorted, &keys, &mut cast);
+        let mut name = self.ordered_aggregate(resolved.name, sorted, &keys, &mut cast);
+        let mut ty = resolved.returns;
+        // An exported state is typed with the call it came from, so that `finalize` and `combine`
+        // know what to read it back into, and the name says so, which keeps the executor's paths
+        // for a plain `sum` or `count` away from a call that answers with something else.
+        if exporting {
+            if !sorted.is_empty() {
+                return Err(Error::not_implemented(format!(
+                    "exporting the state of an ordered {} aggregate",
+                    resolved.name
+                )));
+            }
+            let arguments: Vec<LogicalType> =
+                cast.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
+            let layout = rudb_kernels::state_layout(resolved.name, &arguments, &ty)?;
+            ty = LogicalType::aggregate_state(resolved.name, arguments, ty, layout);
+            name.push_str(rudb_kernels::EXPORTED);
+        }
         let args = self.plan.add_expr_list(&cast);
         let name = self.plan.intern(&name);
-        let ty = resolved.returns;
         let call = self.plan.add_expr(Expr::Aggregate { name, args, distinct, filter }, ty.clone());
 
         // Two identical aggregates are one column of the aggregate's output. `SELECT sum(x),

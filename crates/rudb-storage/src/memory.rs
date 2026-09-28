@@ -332,7 +332,9 @@ impl MemoryTable {
             )));
         }
         for (index, (held, wanted)) in chunk.types().iter().zip(&self.types).enumerate() {
-            if held != wanted {
+            // A column of aggregate states is stored as the layout its states are written in, and
+            // a vector of them is typed that way.
+            if held != wanted.storage() {
                 return Err(Error::internal(format!(
                     "column {index} of the chunk is {held} and the table's is {wanted}"
                 )));

@@ -11969,3 +11969,100 @@ fn the_precise_timestamps_cast_round_and_bind_the_way_the_pin_does() {
         assert!(error.message().contains(message), "{sql}: {error}");
     }
 }
+
+#[test]
+fn export_state_writes_the_states_the_pin_writes_and_finalize_and_combine_read_them() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    for sql in [
+        "CREATE TABLE t1 AS SELECT avg(range::INTEGER) EXPORT_STATE AS state FROM range(10)",
+        "INSERT INTO t1 SELECT avg((range::INTEGER + 10.0)::INTEGER) EXPORT_STATE FROM range(10)",
+        "CREATE TABLE s AS SELECT sum(x::INT) EXPORT_STATE AS s FROM range(3) r(x)",
+        "INSERT INTO s VALUES (5)",
+        "INSERT INTO s SELECT sum(x::BIGINT) EXPORT_STATE FROM range(3) r(x)",
+    ] {
+        db.execute(sql).expect(sql);
+    }
+    for (sql, answer) in [
+        ("SELECT column_type FROM (DESCRIBE t1)", "AGGREGATE_STATE"),
+        ("SELECT finalize(state) FROM t1 ORDER BY 1", "4.5;14.5"),
+        ("SELECT finalize(combine(state, state)) FROM t1 ORDER BY 1", "4.5;14.5"),
+        ("SELECT s, finalize(s) FROM s", "3,3;5,5;3,3"),
+        ("SELECT count(*) FROM (SELECT s FROM s UNION ALL SELECT 5)", "4"),
+        ("SELECT sum(x) EXPORT_STATE::INT FROM range(3) r(x)", "3"),
+        (
+            "SELECT (avg(42) EXPORT_STATE)::STRUCT(count UBIGINT, \"value\" INTEGER)",
+            "{'count': 1, 'value': 42}",
+        ),
+        (
+            "SELECT k, avg(x) EXPORT_STATE, stddev(x) EXPORT_STATE, max(x) EXPORT_STATE, \
+             count(*) EXPORT_STATE FROM range(10) r(x), (SELECT x % 3 AS k) GROUP BY k ORDER BY k",
+            "0,{'count': 4, 'value': 18},{'count': 4, 'mean': 4.5, 'dsquared': 45.0},9,4;\
+             1,{'count': 3, 'value': 12},{'count': 3, 'mean': 4.0, 'dsquared': 18.0},7,3;\
+             2,{'count': 3, 'value': 15},{'count': 3, 'mean': 5.0, 'dsquared': 18.0},8,3",
+        ),
+        (
+            "SELECT k, finalize(sum(x) EXPORT_STATE) FROM range(10) r(x), (SELECT x % 3 AS k) \
+             GROUP BY k ORDER BY k",
+            "0,18;1,12;2,15",
+        ),
+        (
+            "SELECT covar_pop(x, x*2+1) EXPORT_STATE, regr_avgx(x, x*2+1) EXPORT_STATE, \
+             regr_count(x, x*2+1) EXPORT_STATE FROM range(4) r(x)",
+            "{'count': 4, 'meanx': 4.0, 'meany': 1.5, 'co_moment': 10.0},\
+             {'sum': 16.0, 'count': 4},4",
+        ),
+        (
+            "SELECT kurtosis(x) EXPORT_STATE FROM range(4) r(x)",
+            "{'n': 4, 'sum': 6.0, 'sum_sqr': 14.0, 'sum_cub': 36.0, 'sum_four': 98.0}",
+        ),
+        (
+            "SELECT skewness(x) EXPORT_STATE FROM range(0) r(x)",
+            "{'n': 0, 'sum': 0.0, 'sum_sqr': 0.0, 'sum_cub': 0.0}",
+        ),
+        (
+            "SELECT finalize(corr(x, x*2+1) EXPORT_STATE), finalize(regr_slope(x, x*2+1) \
+             EXPORT_STATE) FROM range(4) r(x)",
+            "0.9999999999999998,0.5",
+        ),
+        ("SELECT typeof(finalize(regr_count(1, 2) EXPORT_STATE))", "UINTEGER"),
+        (
+            "SELECT avg(1.5::FLOAT) EXPORT_STATE, avg(1::TINYINT) EXPORT_STATE, \
+             avg(1.5::DECIMAL(20,2)) EXPORT_STATE",
+            "{'count': 1, 'value': 1.5},{'count': 1, 'value': 1},{'count': 1, 'value': 150}",
+        ),
+        (
+            "SELECT sum(1.5::DECIMAL(4,1)) EXPORT_STATE, min('a') EXPORT_STATE, \
+             bool_or(true) EXPORT_STATE, count_if(true) EXPORT_STATE",
+            "15,a,true,1",
+        ),
+    ] {
+        assert_eq!(text(sql), answer, "{sql}");
+    }
+    for (sql, message) in [
+        ("SELECT finalize(1)", "Can only \"finalize\" INTEGER, not AGGREGATE_STATE"),
+        ("SELECT combine(1, 2)", "Can only \"combine\" INTEGER, not AGGREGATE_STATE"),
+        (
+            "SELECT combine(sum(1) EXPORT_STATE, 1)",
+            "Cannot COMBINE aggregate states from different functions, AGGREGATE_STATE <> INTEGER",
+        ),
+        (
+            "SELECT combine(sum(1::INT) EXPORT_STATE, sum(1::BIGINT) EXPORT_STATE)",
+            "Cannot COMBINE aggregate states of \"sum\" that were created with different \
+             parameters: [INTEGER] <> [BIGINT]",
+        ),
+        (
+            "SELECT entropy(1) EXPORT_STATE",
+            "Aggregate function \"\"entropy\"\" does not have a state type callback defined",
+        ),
+    ] {
+        let error = db.execute(sql).expect_err(sql);
+        assert!(error.message().contains(message), "{sql}: {error}");
+    }
+}

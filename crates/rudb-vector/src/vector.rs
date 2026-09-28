@@ -444,6 +444,15 @@ pub struct Vector {
     body: Body,
 }
 
+/// The type a vector of `ty` is built as. An aggregate state is its layout by the time it is in a
+/// vector, so that nothing that reads one has to know it was ever anything else.
+fn held_as(ty: LogicalType) -> LogicalType {
+    match ty {
+        LogicalType::AggregateState(state) => held_as(state.layout.clone()),
+        other => other,
+    }
+}
+
 /// What the vector holds, which is what its form is decided by.
 #[derive(Debug, Clone, PartialEq)]
 enum Body {
@@ -874,6 +883,7 @@ impl Vector {
     /// than left to the caller because a vector whose type and layout disagree is a wrong answer
     /// waiting to be read out, and it costs one comparison at construction to prevent.
     pub fn flat(ty: LogicalType, data: Data) -> Result<Self> {
+        let ty = held_as(ty);
         let len = data.len();
         if !matches!(data, Data::Empty) && layout_of(&data) != ty.physical() {
             return Err(Error::internal(format!(
@@ -897,6 +907,7 @@ impl Vector {
     /// which today means `ARRAY` and `UNION`. A `LIST`, a `STRUCT` and a `MAP` are routed to their own
     /// builders and come back built.
     pub fn from_values(ty: LogicalType, values: &[Value]) -> Result<Self> {
+        let ty = held_as(ty);
         match &ty {
             LogicalType::List(element) => {
                 return Self::list_from_values(element.as_ref().clone(), values);
@@ -1209,6 +1220,7 @@ impl Vector {
     /// and what makes a projection of a constant free.
     #[must_use]
     pub fn constant(ty: LogicalType, value: Value, len: usize) -> Self {
+        let ty = held_as(ty);
         let validity = if value.is_null() { Validity::AllInvalid } else { Validity::AllValid };
         Self { ty, len, validity, body: Body::Constant(Box::new(value)) }
     }
@@ -1646,6 +1658,7 @@ impl Vector {
 
     /// A text vector whose values remain in a storage source until they are read.
     pub fn external_text(ty: LogicalType, source: Arc<dyn TextSource>) -> Result<Self> {
+        let ty = held_as(ty);
         if ty.physical() != rudb_common::PhysicalType::Varlen {
             return Err(Error::internal(format!(
                 "a {ty} vector cannot use an external text source"
@@ -6657,11 +6670,11 @@ mod tests {
             Value::SmallInt(x) => Some(i128::from(*x)),
             Value::Integer(x) | Value::Date(x) => Some(i128::from(*x)),
             Value::BigInt(x)
-                | Value::Time(x)
-                | Value::Timestamp(x)
-                | Value::TimestampS(x)
-                | Value::TimestampMs(x)
-                | Value::TimestampNs(x) => Some(i128::from(*x)),
+            | Value::Time(x)
+            | Value::Timestamp(x)
+            | Value::TimestampS(x)
+            | Value::TimestampMs(x)
+            | Value::TimestampNs(x) => Some(i128::from(*x)),
             Value::HugeInt(x) | Value::Decimal { unscaled: x, .. } => Some(*x),
             _ => None,
         }

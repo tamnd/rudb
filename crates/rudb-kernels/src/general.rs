@@ -14,8 +14,9 @@
 //! than in front of all of them.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, Result, StateType, Value};
 
 use crate::aggregate::Accumulator;
 use crate::arg_extreme::{ArgExtreme, Key};
@@ -66,6 +67,10 @@ pub(crate) enum General {
     /// does not reach the answer. The sort is stable, so rows that tie on every key keep the order
     /// they arrived in, which is the most the pin promises too.
     Ordered { keys: Vec<(bool, bool)>, rows: Vec<Vec<Value>>, inner: Box<Accumulator> },
+    /// A call that exports its state, `sum(x) EXPORT_STATE`, which folds rows into `inner` the way
+    /// the aggregate always does and answers with the state written out in the layout of `state`,
+    /// which every group shares rather than each holding a copy of its own.
+    Exported { inner: Box<Accumulator>, state: Arc<StateType> },
     /// The quantiles, `median`, `mad` and `mode`, which hold every value that is not null and the
     /// fraction the call asked for, and answer in [`crate::quantile`].
     Holistic { values: Held, fraction: Option<Value>, measure: Holistic, returns: LogicalType },
@@ -210,8 +215,19 @@ impl General {
         })
     }
 
+    /// The aggregate an exported state wraps, which is what a run of rows goes to.
+    pub(crate) fn exported_mut(&mut self) -> Option<&mut Accumulator> {
+        match self {
+            Self::Exported { inner, .. } => Some(inner),
+            _ => None,
+        }
+    }
+
     /// Folds one row in. `args` is the row's arguments in call order.
     pub(crate) fn update(&mut self, args: &[Value]) -> Result<()> {
+        if let Self::Exported { inner, .. } = self {
+            return inner.update(args);
+        }
         let Some(value) = args.first() else {
             return Err(Error::internal("an aggregate over 0 arguments".to_string()));
         };
@@ -304,6 +320,7 @@ impl General {
                 *count += 1;
             }
             Self::Tally(tally) => tally.push(value)?,
+            Self::Exported { inner, .. } => inner.update(args)?,
             Self::CountIf { count, seen } => {
                 let Value::Boolean(flag) = *value else {
                     return Err(unexpected("count_if", value));
@@ -496,6 +513,9 @@ impl General {
             (Self::Ordered { rows, .. }, Self::Ordered { rows: more, .. }) => {
                 rows.extend(more.iter().cloned());
             }
+            (Self::Exported { inner, .. }, Self::Exported { inner: theirs, .. }) => {
+                inner.combine(theirs)?;
+            }
             (
                 Self::Holistic { values, fraction, .. },
                 Self::Holistic { values: more, fraction: theirs, .. },
@@ -647,6 +667,9 @@ impl General {
         if let Self::Ordered { keys, rows, inner } = self {
             return ordered(keys, rows, inner);
         }
+        if let Self::Exported { inner, state } = self {
+            return inner.export(&state.layout);
+        }
         if let Self::Arg { state, returns } = self {
             return state.finish(returns);
         }
@@ -736,6 +759,7 @@ impl General {
             Self::Joined { seen: false, .. } => Value::Null,
             Self::Joined { text, .. } => Value::Varchar(text.clone()),
             Self::Ordered { .. }
+            | Self::Exported { .. }
             | Self::Holistic { .. }
             | Self::Sampled { .. }
             | Self::Digested { .. }

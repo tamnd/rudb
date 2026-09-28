@@ -136,6 +136,24 @@ pub enum LogicalType {
     /// holds every position, which is why it sorts in the order the list was written and not in the
     /// order of the strings. The list is shared, since every vector of the type carries it.
     Enum(Arc<[String]>),
+    /// What an aggregate called with `EXPORT_STATE` answers with: the state it had reached, as a
+    /// value of [`StateType::layout`], labelled with the call it came from so that `finalize` and
+    /// `combine` can pick the aggregate back up. Every value of the type is a value of the layout,
+    /// and a vector of it is a vector of the layout, which is what [`LogicalType::storage`] says.
+    AggregateState(Arc<StateType>),
+}
+
+/// The call an [`LogicalType::AggregateState`] came from and the shape its state is written in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StateType {
+    /// The aggregate's name, as it resolved.
+    pub function: String,
+    /// The types the aggregate was bound with, which two states have to share to be combined.
+    pub arguments: Vec<LogicalType>,
+    /// What the aggregate answers with, which is what `finalize` gives back.
+    pub returns: LogicalType,
+    /// The type the state is written as.
+    pub layout: LogicalType,
 }
 
 /// How a value is actually laid out in a vector.
@@ -248,10 +266,33 @@ impl LogicalType {
         Self::Map(Box::new(key), Box::new(value))
     }
 
+    /// The type a value of this one is held as, which is itself for everything but an aggregate
+    /// state, and that state's layout for one.
+    #[must_use]
+    pub fn storage(&self) -> &Self {
+        match self {
+            Self::AggregateState(state) => state.layout.storage(),
+            other => other,
+        }
+    }
+
+    /// An aggregate state type for a call to `function` over `arguments`.
+    #[must_use]
+    pub fn aggregate_state(
+        function: impl Into<String>,
+        arguments: Vec<Self>,
+        returns: Self,
+        layout: Self,
+    ) -> Self {
+        let function = function.into();
+        Self::AggregateState(Arc::new(StateType { function, arguments, returns, layout }))
+    }
+
     /// How this type is laid out.
     #[must_use]
     pub fn physical(&self) -> PhysicalType {
         match self {
+            Self::AggregateState(state) => state.layout.physical(),
             Self::Null => PhysicalType::Empty,
             Self::Boolean => PhysicalType::Bool,
             Self::TinyInt => PhysicalType::Int8,
@@ -416,7 +457,7 @@ impl LogicalType {
         matches!(
             self,
             Self::List(_) | Self::Array(_, _) | Self::Struct(_) | Self::Map(_, _) | Self::Union(_)
-        )
+        ) || matches!(self, Self::AggregateState(state) if state.layout.is_nested())
     }
 
     /// Whether two values of this type are equal exactly when they are the same key.
@@ -465,6 +506,12 @@ impl LogicalType {
         }
         match (self, other) {
             (Self::Null, ty) | (ty, Self::Null) => Some(ty.clone()),
+            // A state meets a value of its layout as the state, which is how the pin lets a
+            // `UNION ALL` put a plain number next to a state of `sum`.
+            (Self::AggregateState(state), other) | (other, Self::AggregateState(state)) => {
+                state.layout.promote(other.storage())?;
+                Some(Self::AggregateState(state.clone()))
+            }
             (Self::List(left), Self::List(right)) => Some(Self::list(left.promote(right)?)),
             // An unnamed struct meets any struct of its size field by field, and takes the names
             // of the other side when it has some.
@@ -635,6 +682,7 @@ impl fmt::Display for LogicalType {
             }
             Self::Struct(fields) => write_fields(f, "STRUCT", fields),
             Self::Union(fields) => write_fields(f, "UNION", fields),
+            Self::AggregateState(_) => f.write_str("AGGREGATE_STATE"),
             Self::Enum(labels) => {
                 f.write_str("ENUM(")?;
                 for (index, label) in labels.iter().enumerate() {

@@ -1428,6 +1428,9 @@ pub struct Ast {
     /// [`OrderItem`] beside the call it belongs to. Kept to one side for the reason the named
     /// arguments are: few calls have one and every call would carry the field.
     pub aggregate_orders: Vec<(ExprRef, Slice)>,
+    /// The aggregate calls written with `EXPORT_STATE` after them, which answer with the state
+    /// they reached rather than with their result.
+    pub exported: Vec<ExprRef>,
 }
 
 impl Ast {
@@ -1530,6 +1533,11 @@ impl Ast {
             .iter()
             .find(|(held, _)| *held == call)
             .map_or(&[], |&(_, slice)| self.target_list(slice))
+    }
+
+    /// Whether a call was written with `EXPORT_STATE` after it.
+    pub fn exports_state(&self, call: ExprRef) -> bool {
+        self.exported.contains(&call)
     }
 
     /// The `ORDER BY` written inside a call, empty when it has none.

@@ -4118,10 +4118,7 @@ impl<'a> Transform<'a> {
     /// `FunctionExpression <- FunctionIdentifier FunctionExpressionArguments WithinGroupClause?
     /// FilterClause? ExportClause? OverClause?`.
     fn function(&mut self, node: u32) -> Result<ExprRef> {
-        let clause = self.find(node, "ExportClause");
-        if clause != NONE {
-            return self.unsupported(clause);
-        }
+        let exports = self.find(node, "ExportClause") != NONE;
         // `FilterClauseContents <- 'WHERE'? Expression`, so the word is optional and the predicate
         // is the last thing under it either way. Whether the call is allowed to carry one at all is
         // the binder's question, because it is a question about what the name resolves to.
@@ -4135,6 +4132,11 @@ impl<'a> Transform<'a> {
             self.expr(predicate)?
         };
         let over = self.find(node, "OverClause");
+        // A window call has no state of its own to hand out, and the pin's grammar has no room for
+        // the word in front of an `OVER`.
+        if exports && over != NONE {
+            return Err(Error::parser("syntax error at or near \"EXPORT_STATE\""));
+        }
         let mut name = self.name_parts(self.first(node));
         // `FunctionExpressionArguments <- Parens(FunctionExpressionArgumentList)` and
         // `FunctionExpressionArgumentList <- DistinctOrAll? FunctionArgumentList? OrderByClause?
@@ -4273,6 +4275,9 @@ impl<'a> Transform<'a> {
         let call = self.push(Expr::Function { name, args, distinct, filter });
         if inner.len > 0 {
             self.ast.aggregate_orders.push((call, inner));
+        }
+        if exports {
+            self.ast.exported.push(call);
         }
         Ok(call)
     }
