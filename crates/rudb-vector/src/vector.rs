@@ -46,7 +46,7 @@ use rudb_common::{Cause, Error, Field, LogicalType, Result, Value, slow};
 
 use crate::buffer::Buffer;
 use crate::fsst::SymbolTable;
-use crate::string::{StringColumn, StringView};
+use crate::string::{INLINE_LIMIT, StringColumn, StringView};
 use crate::validity::Validity;
 
 /// How many values are in a full vector.
@@ -3578,6 +3578,71 @@ impl Vector {
             validity: Validity::AllValid,
             body: Body::Flat(data),
         })
+    }
+
+    /// Several string vectors laid end to end, the bytes of each row copied once into one arena.
+    ///
+    /// What a pipeline holding sparse chunks wants for a string column that reached it as a
+    /// selection over text in storage. Flattening each piece and laying the flat pieces end to end
+    /// copies every string twice, and grows an arena per piece a string at a time on the way. On
+    /// JOB 7c that was a fifth of the query, most of it `person_info.info`. Here every piece is
+    /// walked down to the text under it first, the bytes are counted, and one arena of the right
+    /// size takes them.
+    ///
+    /// `None` when there are no pieces, when the pieces are not all of one type, or when a piece
+    /// bottoms out in a form this does not read, compressed text or a constant, which the caller
+    /// answers by flattening.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the text out of storage raises.
+    pub fn laid_strings(pieces: &[&Self]) -> Result<Option<Self>> {
+        let Some(first) = pieces.first() else { return Ok(None) };
+        let ty = &first.ty;
+        if ty.physical() != rudb_common::PhysicalType::Varlen {
+            return Ok(None);
+        }
+        let mut walks = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            if &piece.ty != ty {
+                return Ok(None);
+            }
+            let (at, leaf) = piece.resolve((0..piece.len).collect());
+            if !matches!(
+                leaf.body,
+                Body::Views { .. } | Body::ExternalText { .. } | Body::Flat(Data::Varlen(_))
+            ) {
+                return Ok(None);
+            }
+            walks.push((at, leaf));
+        }
+        let rows = walks.iter().map(|(at, _)| at.len()).sum();
+        let mut bytes = 0;
+        for (at, leaf) in &walks {
+            for &index in at {
+                if index != NOWHERE
+                    && let Some(len) = leaf.try_bytes_len_at(index)?
+                    && len > INLINE_LIMIT
+                {
+                    bytes += len;
+                }
+            }
+        }
+        let mut out = StringColumn::with_capacity(rows);
+        out.reserve_bytes(bytes);
+        let mut live = Vec::with_capacity(rows);
+        for (at, leaf) in &walks {
+            for &index in at {
+                let found = if index == NOWHERE { None } else { leaf.try_bytes_at(index)? };
+                live.push(found.is_some());
+                out.push_bytes(found.unwrap_or_default());
+            }
+        }
+        let (views, arena) = out.into_parts();
+        Ok(Some(
+            Self::string_views(ty.clone(), views, Arc::new(arena))?
+                .with_validity(Validity::from_run(&live)),
+        ))
     }
 
     /// The copy both [`Self::gather`] and [`Self::flatten`] are.
