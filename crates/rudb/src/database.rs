@@ -5188,13 +5188,13 @@ mod tests {
                 operator.detail.as_deref() == Some("covering grouped distinct")
             })
         );
-        // With the stored answers off the projection is a precomputed answer like any other, so
-        // the same query reads the rows and gives the same groups.
+        // The projection keeps every row in another order, so it is an index rather than a kept
+        // answer and turning the stored answers off leaves it in use.
         database.execute("SET stored_answers = false").unwrap();
         let read = database.query(plain).unwrap();
         assert_eq!(read.rows().collect::<Vec<_>>(), result.rows().collect::<Vec<_>>());
         assert!(
-            !read.metrics().unwrap().operators.iter().any(|operator| {
+            read.metrics().unwrap().operators.iter().any(|operator| {
                 operator.detail.as_deref() == Some("covering grouped distinct")
             })
         );

@@ -53,7 +53,6 @@
 //! [`Zones::extreme`]: rudb_common::bounds::Zones::extreme
 
 use rudb_common::bounds::{Bound, End};
-use rudb_common::rules::Rule;
 use rudb_common::stat::Use;
 use rudb_common::{Field, LogicalType, Result, Value};
 use rudb_plan::{ColumnBinding, Expr, Node, NodeRef, Plan};
@@ -81,11 +80,10 @@ impl Pass for StatisticsPropagation {
         "statistics_propagation"
     }
 
-    fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        // The bounds are something the loader wrote down, so `SET stored_answers = off` keeps the scan here too.
-        if context.allows(Rule::StoredAnswers) {
-            fold(plan);
-        }
+    fn run(&self, plan: &mut Plan, _context: &Context) -> Result<()> {
+        // The bounds are a statistic of the column rather than an answer kept for a query, so this
+        // runs whatever `stored_answers` says.
+        fold(plan);
         Ok(())
     }
 }

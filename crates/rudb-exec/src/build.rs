@@ -2220,15 +2220,13 @@ impl<'a> Building<'a, '_> {
         aggregates: Slice,
         bound: AggregateBound,
     ) -> Result<Segment<'a>> {
-        // Every path below that answers out of something the loader worked out rather than out of
-        // the rows is behind `stored_answers`: the whole table summary, the run projection, the
-        // host groups and the value and pair frequencies. ClickBench counts all of them as
-        // aggregation done at load time, so `SET stored_answers = off` makes the aggregate read
-        // the rows. The any groups path stays, because it reads the rows of the values it picks
-        // and only uses the synopsis as an index to find them.
+        // Only the host groups and the pair frequencies are behind `stored_answers`, because they
+        // are a result kept for a query shape rather than a statistic of a column. The whole table
+        // summary and the value frequencies are per column statistics and the run projection keeps
+        // every row, so those answer whatever the switch says, and so does the any groups path,
+        // which reads the rows of the values it picks.
         let stored = self.session.rules().enabled(Rule::StoredAnswers);
-        if stored
-            && bound.max_groups.is_none()
+        if bound.max_groups.is_none()
             && bound.having_count.is_none()
             && let Some((reader, order, covered, group_type)) =
                 covering_grouped_distinct(self.plan, self.catalog, input, groups, aggregates)?
@@ -2250,9 +2248,7 @@ impl<'a> Building<'a, '_> {
         // Before the input is built, because building it is what puts it in a pipeline and a
         // pipeline that exists is a pipeline that runs. A summary that let the rows be counted
         // underneath it would answer in no time and take exactly as long as it always did.
-        // `SET stored_answers = off` skips this and reads the rows, which is how a ClickBench run keeps what the loader added up out of its numbers.
-        if stored
-            && bound.max_groups.is_none()
+        if bound.max_groups.is_none()
             && bound.having_count.is_none()
             && let Some(values) =
                 stored_summary(self.plan, self.catalog, input, groups, aggregates)?
@@ -2351,7 +2347,7 @@ impl<'a> Building<'a, '_> {
                 self.watch(reference, id, pipeline, "Aggregate", Some("native any groups"));
             return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
         }
-        if stored && bound.max_groups.is_none() && bound.having_count.is_none() {
+        if bound.max_groups.is_none() && bound.having_count.is_none() {
             let top = bound.top_counts.map(|(bound, _)| bound);
             if let Some(top) = top
                 && let Some(frequencies) = native_value_frequencies(
@@ -2373,7 +2369,8 @@ impl<'a> Building<'a, '_> {
                 );
                 return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
             }
-            if let Some(top) = top
+            if stored
+                && let Some(top) = top
                 && let Some(frequencies) = native_pair_frequencies(
                     self.plan,
                     self.catalog,

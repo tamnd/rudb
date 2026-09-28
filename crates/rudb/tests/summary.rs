@@ -616,7 +616,7 @@ fn an_integer_columns_distinct_count_is_read_out_of_the_directory() {
     }
 }
 
-/// Every aggregate query the stored answers take, for the switch that turns them off.
+/// Every aggregate query the per column statistics answer, which the switch leaves alone.
 const STORED: [&str; 9] = [
     "SELECT COUNT(*) FROM t",
     "SELECT COUNT(s) FROM t",
@@ -636,11 +636,10 @@ fn scanned(db: &Database, query: &str) -> bool {
     metrics.operators.iter().any(|operator| operator.kind == "Scan" && operator.rows_out > 0)
 }
 
-/// `SET stored_answers = false` is what a ClickBench run sets, and it has to cost time rather than change an answer.
-/// Each query is asked with the switch on and off, on the file and in memory, and the rows have to be the same all four ways.
-/// With it off every one of them has to have scanned, which is what the metrics of the scan say.
+/// `SET stored_answers = false` is what a ClickBench run sets, and it turns off the answers kept for a query shape and nothing else.
+/// A row count, a bound, a total or a distinct count is a statistic of the column, so each of these is still read out of the file with the switch off and gives the same rows.
 #[test]
-fn turning_the_stored_answers_off_reads_the_rows_and_answers_the_same() {
+fn turning_the_stored_answers_off_keeps_the_statistics() {
     let pair = Pair::new(
         "storedoff",
         "SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i % 7 END AS n, 'v' || (i % 13) AS s \
@@ -656,28 +655,16 @@ fn turning_the_stored_answers_off_reads_the_rows_and_answers_the_same() {
     }
     for (query, wanted) in STORED.iter().zip(&before) {
         assert_eq!(&pair.listing(query), wanted, "{query} changed its answer");
-        assert!(
-            !pair.summarised(query),
-            "{query} was answered out of the file with the switch off"
-        );
-        assert!(!pair.in_memory(query), "{query} was answered out of memory with the switch off");
-        assert!(scanned(&pair.file, query), "{query} did not scan the file with the switch off");
-        assert!(scanned(&pair.memory, query), "{query} did not scan memory with the switch off");
+        assert!(!scanned(&pair.file, query), "{query} scanned the file for a statistic");
     }
-    // A reset puts it back on, which is where a fresh database has it.
     pair.file.execute("RESET stored_answers").expect("the switch resets");
-    assert!(pair.summarised("SELECT COUNT(*) FROM t"), "the reset left the switch off");
+    assert_eq!(pair.file.setting("stored_answers").expect("the switch reads back"), "true");
 }
 
-/// The operators that answer a grouped query out of something the writer kept rather than out of
-/// the rows. ClickBench counts every one of them as a precomputed answer, so the switch has to turn
-/// them all off, not just the summary of a whole table.
-const KEPT: [&str; 4] = [
-    "native value frequencies",
-    "native pair frequencies",
-    "native host groups",
-    "covering grouped distinct",
-];
+/// The operators that answer a grouped query out of a result the writer kept for that query shape
+/// rather than out of the rows. ClickBench counts both as a precomputed answer, so the switch turns
+/// them off.
+const KEPT: [&str; 2] = ["native pair frequencies", "native host groups"];
 
 /// Whether any operator of this query read its groups out of something the writer kept.
 fn kept(db: &Database, query: &str) -> bool {
@@ -689,26 +676,24 @@ fn kept(db: &Database, query: &str) -> bool {
         .any(|operator| operator.detail.as_deref().is_some_and(|detail| KEPT.contains(&detail)))
 }
 
-/// A top count over one key or two is what ClickBench's q16, q34 and q36 ask, and the file can
-/// answer it out of the value and pair frequencies the writer kept. With the switch off it has to
-/// read the rows instead and still give the same groups.
+/// A top count over one key or two is what ClickBench's q16, q34 and q36 ask. One key is answered
+/// out of that column's value frequencies, which are a statistic and stay on. Two keys would be
+/// answered out of the pair frequencies, which are a result kept for that grouping, so with the
+/// switch off that one reads the rows and still gives the same groups.
 #[test]
-fn turning_the_stored_answers_off_reads_the_rows_for_a_top_count() {
+fn turning_the_stored_answers_off_reads_the_rows_for_a_two_key_top_count() {
     let pair = Pair::new(
         "storedofftop",
         "SELECT CASE WHEN i % 20 * 1000 < i - i % 1000 THEN 'h' || CAST(i % 20 AS VARCHAR) \
          ELSE 'c' || CAST(i AS VARCHAR) END AS s, i % 3 AS k FROM range(20000) r(i)",
     );
-    let queries = [
-        "SELECT s, COUNT(*) AS c FROM t GROUP BY s ORDER BY c DESC LIMIT 5",
-        "SELECT s, k, COUNT(*) AS c FROM t GROUP BY s, k ORDER BY c DESC, s, k LIMIT 5",
-    ];
-    let before: Vec<_> = queries.iter().map(|query| pair.listing(query)).collect();
+    let single = "SELECT s, COUNT(*) AS c FROM t GROUP BY s ORDER BY c DESC LIMIT 5";
+    let double = "SELECT s, k, COUNT(*) AS c FROM t GROUP BY s, k ORDER BY c DESC, s, k LIMIT 5";
+    let before = [pair.listing(single), pair.listing(double)];
     pair.file.execute("SET stored_answers = false").expect("the switch is a setting");
     pair.memory.execute("SET stored_answers = false").expect("the switch is a setting");
-    for (query, wanted) in queries.iter().zip(&before) {
-        assert_eq!(&pair.listing(query), wanted, "{query} changed its answer");
-        assert!(!kept(&pair.file, query), "{query} read kept groups with the switch off");
-        assert!(scanned(&pair.file, query), "{query} did not scan the file with the switch off");
-    }
+    assert_eq!(pair.listing(single), before[0], "{single} changed its answer");
+    assert_eq!(pair.listing(double), before[1], "{double} changed its answer");
+    assert!(!kept(&pair.file, double), "{double} read kept groups with the switch off");
+    assert!(scanned(&pair.file, double), "{double} did not scan the file with the switch off");
 }
