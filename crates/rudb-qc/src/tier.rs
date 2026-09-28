@@ -13,9 +13,16 @@
 //!
 //! A function a backend refuses, or panics on, runs on `interp` and the refusal is kept in the
 //! [`Report`]. A query never fails because a backend could not compile it.
+//!
+//! Nothing is compiled when the query is. Each pipeline's function is compiled when the pipeline
+//! starts, which is rule I3 of section 9.3 of `spec/compiler/09-tiering-and-caching.md`, and a
+//! pipeline that never starts costs nothing. Under `auto` a pipeline whose input is known to be at
+//! most one morsel from what storage or the stage before it says runs on `interp` without being
+//! compiled, which is rule I1, and every other one is compiled on `direct`, which is rule I2.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use rudb_qc_interp::Program;
@@ -25,7 +32,8 @@ use rudb_qc_rt::Rt;
 /// Which tier runs a query's pipelines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tier {
-    /// `clif` when the build has it, `interp` otherwise.
+    /// `direct` when the build has it, then `clif`, then `interp`, with a pipeline whose input is
+    /// at most one morsel on `interp`.
     #[default]
     Auto,
     /// The interpreter only.
@@ -78,9 +86,11 @@ impl Tier {
         }
     }
 
-    /// The tier `auto` stands for in this build: `clif` when it is built, `interp` otherwise.
+    /// The tier `auto` compiles on in this build: `direct` when it is built, then `clif`, and
+    /// `interp` when neither is.
     fn decided(self) -> Tier {
         match self {
+            Tier::Auto if Tier::Direct.built() => Tier::Direct,
             Tier::Auto if Tier::Clif.built() => Tier::Clif,
             Tier::Auto => Tier::Interp,
             t => t,
@@ -193,6 +203,10 @@ fn mix(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// The most rows a pipeline's input can have for `auto` to leave it on `interp`: one morsel, per
+/// the table of section 9.9 of the spec, where rule I1 and this number come from.
+const ONE_MORSEL: usize = 16_384;
+
 /// How a query is compiled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -221,6 +235,8 @@ pub struct Report {
     pub native: usize,
     /// The bytes of machine code loaded.
     pub bytes: usize,
+    /// How many functions ran on `interp` under `auto` because their input was one morsel at most.
+    pub small: usize,
     /// Each function that runs on `interp` although the tier compiles to machine code, and why.
     pub fallbacks: Vec<String>,
 }
@@ -239,6 +255,9 @@ impl fmt::Display for Report {
             self.generate.as_secs_f64() * 1e3,
             self.compile.as_secs_f64() * 1e3,
         )?;
+        if self.small > 0 {
+            write!(f, ", {} on interp for one morsel of input", self.small)?;
+        }
         for reason in &self.fallbacks {
             write!(f, "\n  interp: {reason}")?;
         }
@@ -249,8 +268,13 @@ impl fmt::Display for Report {
 /// A module on every tier it has.
 pub(crate) struct Tiers {
     program: Program,
-    native: Vec<Option<rudb_qc_rt::code::Code>>,
-    report: Report,
+    /// The tier a function is compiled on, `interp` for none.
+    tier: Tier,
+    /// Whether a function whose input is one morsel at most stays on `interp`, which `auto` asks.
+    small: bool,
+    /// Each function's machine code, made when its pipeline starts.
+    native: Vec<OnceLock<Option<rudb_qc_rt::code::Code>>>,
+    report: Mutex<Report>,
     switch: Switch,
     /// How many morsels have been fed, which numbers them for [`Switch`].
     morsels: AtomicU64,
@@ -277,29 +301,74 @@ impl Tiers {
             module.funcs.iter().map(|_| AtomicU8::new(2)).collect(),
             [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
         );
+        let small = tier == Tier::Auto;
         let tier = tier.decided();
         let insts = module.funcs.iter().flat_map(|f| &f.blocks).map(|b| b.prov.len()).sum();
-        let mut report =
+        let report =
             Report { tier: tier.name(), functions: module.funcs.len(), insts, ..Report::default() };
-        let native = match tier {
-            Tier::Clif => native::compile(module, &mut report, clif::compile),
-            Tier::Direct => native::compile(module, &mut report, direct::compile),
-            Tier::Interp | Tier::Auto => module.funcs.iter().map(|_| None).collect(),
-        };
+        let native = module.funcs.iter().map(|_| OnceLock::new()).collect();
         let (morsels, last, switches) = counts;
-        Tiers { program, native, report, switch, morsels, last, switches }
+        Tiers {
+            program,
+            tier,
+            small,
+            native,
+            report: Mutex::new(report),
+            switch,
+            morsels,
+            last,
+            switches,
+        }
     }
 
-    /// What the backend did.
-    pub(crate) fn report(&self) -> &Report {
-        &self.report
+    /// What the backend did so far.
+    pub(crate) fn report(&self) -> Report {
+        self.report.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// Notes how long the plan took to lower and the module to generate, which happened before
     /// the tiers saw it.
     pub(crate) fn generated_in(&mut self, plan: Duration, generate: Duration) {
-        self.report.plan = plan;
-        self.report.generate = generate;
+        let report = self.report.get_mut().unwrap_or_else(PoisonError::into_inner);
+        report.plan = plan;
+        report.generate = generate;
+    }
+
+    /// Readies function `f` of `module` for a pipeline that is about to start, whose input is
+    /// `rows` rows when that is known. The function is compiled here, once, unless the tier is
+    /// `interp` or `auto` keeps a function with at most one morsel of input on `interp`.
+    pub(crate) fn prepare(&self, module: &Module, f: usize, rows: Option<usize>) {
+        let Some(slot) = self.native.get(f) else { return };
+        if slot.get().is_some() {
+            return;
+        }
+        if self.small && rows.is_some_and(|n| n <= ONE_MORSEL) {
+            if slot.set(None).is_ok() {
+                self.report.lock().unwrap_or_else(PoisonError::into_inner).small += 1;
+            }
+            return;
+        }
+        let lower = match self.tier {
+            Tier::Clif => clif::compile,
+            Tier::Direct => direct::compile,
+            Tier::Interp | Tier::Auto => {
+                let _ = slot.set(None);
+                return;
+            }
+        };
+        slot.get_or_init(|| {
+            let func = module.funcs.get(f)?;
+            let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
+            native::compile(func, &mut report, lower)
+        });
+    }
+
+    /// Readies every function as a pipeline with an input of unknown size would, for
+    /// `EXPLAIN (CODEGEN)`, which shows the code without running the query.
+    pub(crate) fn prepare_all(&self, module: &Module) {
+        for f in 0..module.funcs.len() {
+            self.prepare(module, f, None);
+        }
     }
 
     /// The index of the function with this name.
@@ -329,7 +398,7 @@ impl Tiers {
 
     /// Whether function `f` has machine code.
     fn has_native(&self, f: usize) -> bool {
-        matches!(self.native.get(f), Some(Some(_)))
+        self.native.get(f).and_then(OnceLock::get).is_some_and(Option::is_some)
     }
 
     /// Runs function `f` on a state and a morsel, as machine code when `native` is set and there
@@ -342,7 +411,7 @@ impl Tiers {
         m: *const u8,
         rt: &mut Rt,
     ) -> u64 {
-        if native && let Some(Some(code)) = self.native.get(f) {
+        if native && let Some(Some(code)) = self.native.get(f).and_then(OnceLock::get) {
             return native::call(code, st, m, rt);
         }
         self.program.call(f, st, m, rt)
@@ -355,8 +424,8 @@ mod native {
     use std::sync::OnceLock;
     use std::time::Instant;
 
+    use rudb_qc_ir::Func;
     use rudb_qc_ir::entry::Entry;
-    use rudb_qc_ir::{Func, Module};
     use rudb_qc_rt::code::{Code, CodeArena, Reloc, RelocKind};
     use rudb_qc_rt::native::{Ctx, address};
     use rudb_qc_rt::{Rt, abi};
@@ -379,58 +448,53 @@ mod native {
             .map_err(String::as_str)
     }
 
-    /// Compiles every function of `module` with `lower` and loads it, and says in `report` what
-    /// it did.
+    /// Compiles `f` with `lower` and loads it, and says in `report` what it did.
     pub(super) fn compile(
-        module: &Module,
+        f: &Func,
         report: &mut Report,
         lower: fn(&Func) -> Result<Lowered, String>,
-    ) -> Vec<Option<Code>> {
+    ) -> Option<Code> {
         let start = Instant::now();
         let arena = match arena() {
             Ok(a) => a,
             Err(why) => {
                 report.fallbacks.push(why.to_string());
-                return module.funcs.iter().map(|_| None).collect();
+                return None;
             }
         };
-        let mut out = Vec::with_capacity(module.funcs.len());
-        for f in &module.funcs {
-            // A backend asserts what it believes about its input, and an assertion here is a
-            // function it does not handle, not a reason to fail the query.
-            let compiled = catch_unwind(AssertUnwindSafe(|| lower(f)))
-                .unwrap_or_else(|_| {
-                    Err(format!("{}: {}: the code generator panicked", report.tier, f.name))
-                })
-                .and_then(|code| {
-                    let relocs: Vec<Reloc> = code
-                        .relocs
-                        .iter()
-                        .map(|&(offset, entry, addend)| Reloc {
-                            offset,
-                            kind: RelocKind::Abs8,
-                            target: address(entry),
-                            addend,
-                        })
-                        .collect();
-                    arena
-                        .load(&code.bytes, &relocs)
-                        .map_err(|e| format!("{}: {}: loading: {e}", report.tier, f.name))
-                });
-            match compiled {
-                Ok(code) => {
-                    report.native += 1;
-                    report.bytes += code.len();
-                    out.push(Some(code));
-                }
-                Err(why) => {
-                    report.fallbacks.push(why);
-                    out.push(None);
-                }
+        // A backend asserts what it believes about its input, and an assertion here is a function
+        // it does not handle, not a reason to fail the query.
+        let compiled = catch_unwind(AssertUnwindSafe(|| lower(f)))
+            .unwrap_or_else(|_| {
+                Err(format!("{}: {}: the code generator panicked", report.tier, f.name))
+            })
+            .and_then(|code| {
+                let relocs: Vec<Reloc> = code
+                    .relocs
+                    .iter()
+                    .map(|&(offset, entry, addend)| Reloc {
+                        offset,
+                        kind: RelocKind::Abs8,
+                        target: address(entry),
+                        addend,
+                    })
+                    .collect();
+                arena
+                    .load(&code.bytes, &relocs)
+                    .map_err(|e| format!("{}: {}: loading: {e}", report.tier, f.name))
+            });
+        report.compile += start.elapsed();
+        match compiled {
+            Ok(code) => {
+                report.native += 1;
+                report.bytes += code.len();
+                Some(code)
+            }
+            Err(why) => {
+                report.fallbacks.push(why);
+                None
             }
         }
-        report.compile = start.elapsed();
-        out
     }
 
     /// Calls machine code with the runtime reachable through the state header.
