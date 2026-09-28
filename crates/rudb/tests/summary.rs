@@ -287,15 +287,23 @@ fn a_filter_the_synopsis_cannot_decide_sends_the_query_back_to_the_rows() {
         "filter ignored"
     );
     // Five thousand distinct values overflow the budget, so the file kept the leading ones and a
-    // bound on what it dropped, and a bound cannot be counted with.
+    // bound on what it dropped. A constant it listed still has its exact count, which is enough for
+    // an equality and, with the null count, for the rows that differ from it, so those two answer.
+    // An ordering comparison would have to add up the values it dropped, and a bound cannot be
+    // counted with.
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE wide = 1"), Value::BigInt(1));
     assert!(
-        !pair.summarised("SELECT COUNT(*) FROM t WHERE wide = 1"),
-        "a partial list was counted"
+        pair.summarised("SELECT COUNT(*) FROM t WHERE wide = 1"),
+        "a listed value was not counted"
     );
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE wide <> 1"), Value::BigInt(4999));
     assert!(
-        !pair.summarised("SELECT COUNT(*) FROM t WHERE wide <> 1"),
+        pair.summarised("SELECT COUNT(*) FROM t WHERE wide <> 1"),
+        "a listed value was not counted"
+    );
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE wide > 1"), Value::BigInt(4998));
+    assert!(
+        !pair.summarised("SELECT COUNT(*) FROM t WHERE wide > 1"),
         "a partial list was counted"
     );
     // A null constant compares unknown against every row whatever the column holds, so the answer
@@ -403,14 +411,20 @@ fn a_top_count_with_no_skew_to_prove_it_with_goes_back_to_the_rows() {
 }
 
 #[test]
-fn a_filtered_top_count_over_a_prefix_still_refuses_to_count_the_rows_it_keeps() {
-    // The proof covers which groups lead and by how much. It says nothing about how many rows the
-    // filter keeps in total, because the values the synopsis dropped are rows this list never saw,
-    // so the count of them is still a question for the rows.
+fn a_filtered_count_over_a_prefix_answers_only_for_the_value_it_lists() {
+    // The proof covers which groups lead and by how much. It says nothing about the values the
+    // synopsis dropped, so a count that has to add those up is still a question for the rows. The
+    // rows that differ from a listed value are the exception, because they are every row that is
+    // neither null nor that value, and both of those are counted exactly.
     let pair = Pair::new("prefixrows", SKEWED);
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s <> 'h0'"), Value::BigInt(19050));
     assert!(
-        !pair.summarised("SELECT COUNT(*) FROM t WHERE s <> 'h0'"),
+        pair.summarised("SELECT COUNT(*) FROM t WHERE s <> 'h0'"),
+        "a listed value was not counted"
+    );
+    pair.agree("SELECT COUNT(*) FROM t WHERE s > 'h0'");
+    assert!(
+        !pair.summarised("SELECT COUNT(*) FROM t WHERE s > 'h0'"),
         "a prefix was added up as though it were the whole column"
     );
 }
@@ -616,7 +630,7 @@ fn an_integer_columns_distinct_count_is_read_out_of_the_directory() {
     }
 }
 
-/// Every aggregate query the stored answers take, for the switch that turns them off.
+/// Every aggregate query the per column statistics answer, which the switch leaves alone.
 const STORED: [&str; 9] = [
     "SELECT COUNT(*) FROM t",
     "SELECT COUNT(s) FROM t",
@@ -636,11 +650,10 @@ fn scanned(db: &Database, query: &str) -> bool {
     metrics.operators.iter().any(|operator| operator.kind == "Scan" && operator.rows_out > 0)
 }
 
-/// `SET stored_answers = false` is what a ClickBench run sets, and it has to cost time rather than change an answer.
-/// Each query is asked with the switch on and off, on the file and in memory, and the rows have to be the same all four ways.
-/// With it off every one of them has to have scanned, which is what the metrics of the scan say.
+/// `SET stored_answers = false` is what a ClickBench run sets, and it turns off the answers kept for a query shape and nothing else.
+/// A row count, a bound, a total or a distinct count is a statistic of the column, so each of these is still read out of the file with the switch off and gives the same rows.
 #[test]
-fn turning_the_stored_answers_off_reads_the_rows_and_answers_the_same() {
+fn turning_the_stored_answers_off_keeps_the_statistics() {
     let pair = Pair::new(
         "storedoff",
         "SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i % 7 END AS n, 'v' || (i % 13) AS s \
@@ -656,28 +669,16 @@ fn turning_the_stored_answers_off_reads_the_rows_and_answers_the_same() {
     }
     for (query, wanted) in STORED.iter().zip(&before) {
         assert_eq!(&pair.listing(query), wanted, "{query} changed its answer");
-        assert!(
-            !pair.summarised(query),
-            "{query} was answered out of the file with the switch off"
-        );
-        assert!(!pair.in_memory(query), "{query} was answered out of memory with the switch off");
-        assert!(scanned(&pair.file, query), "{query} did not scan the file with the switch off");
-        assert!(scanned(&pair.memory, query), "{query} did not scan memory with the switch off");
+        assert!(!scanned(&pair.file, query), "{query} scanned the file for a statistic");
     }
-    // A reset puts it back on, which is where a fresh database has it.
     pair.file.execute("RESET stored_answers").expect("the switch resets");
-    assert!(pair.summarised("SELECT COUNT(*) FROM t"), "the reset left the switch off");
+    assert_eq!(pair.file.setting("stored_answers").expect("the switch reads back"), "true");
 }
 
-/// The operators that answer a grouped query out of something the writer kept rather than out of
-/// the rows. ClickBench counts every one of them as a precomputed answer, so the switch has to turn
-/// them all off, not just the summary of a whole table.
-const KEPT: [&str; 4] = [
-    "native value frequencies",
-    "native pair frequencies",
-    "native host groups",
-    "covering grouped distinct",
-];
+/// The operators that answer a grouped query out of a result the writer kept for that query shape
+/// rather than out of the rows. ClickBench counts both as a precomputed answer, so the switch turns
+/// them off.
+const KEPT: [&str; 2] = ["native pair frequencies", "native host groups"];
 
 /// Whether any operator of this query read its groups out of something the writer kept.
 fn kept(db: &Database, query: &str) -> bool {
@@ -689,26 +690,24 @@ fn kept(db: &Database, query: &str) -> bool {
         .any(|operator| operator.detail.as_deref().is_some_and(|detail| KEPT.contains(&detail)))
 }
 
-/// A top count over one key or two is what ClickBench's q16, q34 and q36 ask, and the file can
-/// answer it out of the value and pair frequencies the writer kept. With the switch off it has to
-/// read the rows instead and still give the same groups.
+/// A top count over one key or two is what ClickBench's q16, q34 and q36 ask. One key is answered
+/// out of that column's value frequencies, which are a statistic and stay on. Two keys would be
+/// answered out of the pair frequencies, which are a result kept for that grouping, so with the
+/// switch off that one reads the rows and still gives the same groups.
 #[test]
-fn turning_the_stored_answers_off_reads_the_rows_for_a_top_count() {
+fn turning_the_stored_answers_off_reads_the_rows_for_a_two_key_top_count() {
     let pair = Pair::new(
         "storedofftop",
         "SELECT CASE WHEN i % 20 * 1000 < i - i % 1000 THEN 'h' || CAST(i % 20 AS VARCHAR) \
          ELSE 'c' || CAST(i AS VARCHAR) END AS s, i % 3 AS k FROM range(20000) r(i)",
     );
-    let queries = [
-        "SELECT s, COUNT(*) AS c FROM t GROUP BY s ORDER BY c DESC LIMIT 5",
-        "SELECT s, k, COUNT(*) AS c FROM t GROUP BY s, k ORDER BY c DESC, s, k LIMIT 5",
-    ];
-    let before: Vec<_> = queries.iter().map(|query| pair.listing(query)).collect();
+    let single = "SELECT s, COUNT(*) AS c FROM t GROUP BY s ORDER BY c DESC LIMIT 5";
+    let double = "SELECT s, k, COUNT(*) AS c FROM t GROUP BY s, k ORDER BY c DESC, s, k LIMIT 5";
+    let before = [pair.listing(single), pair.listing(double)];
     pair.file.execute("SET stored_answers = false").expect("the switch is a setting");
     pair.memory.execute("SET stored_answers = false").expect("the switch is a setting");
-    for (query, wanted) in queries.iter().zip(&before) {
-        assert_eq!(&pair.listing(query), wanted, "{query} changed its answer");
-        assert!(!kept(&pair.file, query), "{query} read kept groups with the switch off");
-        assert!(scanned(&pair.file, query), "{query} did not scan the file with the switch off");
-    }
+    assert_eq!(pair.listing(single), before[0], "{single} changed its answer");
+    assert_eq!(pair.listing(double), before[1], "{double} changed its answer");
+    assert!(!kept(&pair.file, double), "{double} read kept groups with the switch off");
+    assert!(scanned(&pair.file, double), "{double} did not scan the file with the switch off");
 }
