@@ -233,7 +233,7 @@ impl Adjacency {
     }
 
     /// [`Adjacency::read`] of the bytes of `payload` from `at` on, keeping `payload` for the child
-    /// rows rather than copying them out of it. See [`Tail`] for why.
+    /// rows rather than copying them out of it. See `Tail` for why.
     ///
     /// # Errors
     ///
