@@ -41,7 +41,7 @@ const fn huge(value: i128) -> u64 {
 }
 
 /// The pin's hash of some bytes.
-fn bytes(data: &[u8]) -> u64 {
+pub(crate) fn bytes(data: &[u8]) -> u64 {
     let mut h = 0xe17a_1465_u64 ^ (data.len() as u64).wrapping_mul(0xc6a4_a793_5bd1_e995);
     let mut blocks = data.chunks_exact(8);
     for block in &mut blocks {

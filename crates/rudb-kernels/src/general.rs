@@ -28,6 +28,7 @@ use crate::number::{approximate, fit, integral};
 use crate::quantile::{self, Column, Held, Holistic, Sample};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
 use crate::tally::Tally;
+use crate::topk::TopK;
 
 /// A running aggregate that is not one of the five the aggregate module keeps inline.
 #[derive(Debug, Clone)]
@@ -71,6 +72,8 @@ pub(crate) enum General {
     Sampled { sample: Sample, fraction: Option<Value>, returns: LogicalType },
     /// `approx_quantile`, which keeps a t-digest of the values.
     Digested { digest: Digest, fraction: Option<Value>, returns: LogicalType },
+    /// `approx_top_k`, which watches the most counted values, in [`crate::topk`].
+    Top { top: Box<TopK>, element: LogicalType },
     /// The `arg_min` and `arg_max` spellings, which keep the row with the least or greatest key,
     /// or the best `n` of them when the call passes a count, and answer in [`crate::arg_extreme`].
     Arg { state: ArgExtreme, returns: LogicalType },
@@ -171,6 +174,13 @@ impl General {
                 fraction: None,
                 returns: returns.clone(),
             },
+            "approx_top_k" => {
+                let element = match returns {
+                    LogicalType::List(element) => (**element).clone(),
+                    _ => LogicalType::Null,
+                };
+                Self::Top { top: Box::default(), element }
+            }
             "reservoir_quantile" => Self::Sampled {
                 sample: Sample::default(),
                 fraction: None,
@@ -275,6 +285,7 @@ impl General {
                 }
                 digest.push(value);
             }
+            Self::Top { top, .. } => top.push(value, args.get(1))?,
             Self::Product { total, seen } => {
                 *total *= approximate(value).ok_or_else(|| unexpected("product", value))?;
                 *seen = true;
@@ -338,6 +349,29 @@ impl General {
         matches!(self, Self::Arg { state, .. } if state.cannot_take(key, arity))
     }
 
+    /// Whether this state counts a `VARCHAR` by its bytes through [`Self::push_text`].
+    pub(crate) const fn takes_text(&self) -> bool {
+        matches!(self, Self::Top { .. })
+    }
+
+    /// Counts the text at `row`, which is not null, for a state [`Self::takes_text`] says yes to.
+    pub(crate) fn push_text(
+        &mut self,
+        text: &[u8],
+        row: usize,
+        args: &[rudb_vector::Vector],
+    ) -> Result<()> {
+        let Self::Top { top, .. } = self else {
+            return Err(Error::internal("text handed to an aggregate that does not count text"));
+        };
+        let k = if top.started() {
+            None
+        } else {
+            args.get(1).map(|given| given.try_value_at(row)).transpose()?
+        };
+        top.push_text(text, k.as_ref())
+    }
+
     /// Whether this state skips nulls and takes the rest of a column through [`Self::push_column`].
     pub(crate) fn takes_columns(&self) -> bool {
         matches!(
@@ -345,6 +379,7 @@ impl General {
             Self::Holistic { .. }
                 | Self::Sampled { .. }
                 | Self::Digested { .. }
+                | Self::Top { .. }
                 | Self::Tally(_)
                 | Self::Kahan { .. }
                 | Self::CountIf { .. }
@@ -406,6 +441,14 @@ impl General {
                 }
                 digest.push_column(column, row);
                 return Ok(());
+            }
+            (Self::Top { top, .. }, column) => {
+                let k = if top.started() {
+                    None
+                } else {
+                    args.get(1).map(|given| given.try_value_at(row)).transpose()?
+                };
+                return top.push_column(column, row, k.as_ref());
             }
             _ => {}
         }
@@ -494,6 +537,7 @@ impl General {
                     fraction.clone_from(given);
                 }
             }
+            (Self::Top { top, .. }, Self::Top { top: theirs, .. }) => top.combine(theirs)?,
             (Self::Paired(state), Self::Paired(theirs)) => state.combine(theirs),
             (Self::Powers(state), Self::Powers(theirs)) => state.combine(theirs),
             (
@@ -633,6 +677,7 @@ impl General {
             Self::BitString { held, .. } => held.clone().map_or(Value::Null, Value::Bit),
             Self::Gathered(state) => state.finish(),
             Self::Sketched(sketch) => Value::BigInt(sketch.count()),
+            Self::Top { top, element } => top.finish(element),
             Self::Moments { count, squared, measure, .. } => {
                 #[expect(
                     clippy::cast_precision_loss,

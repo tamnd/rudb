@@ -11681,6 +11681,72 @@ fn approx_quantile_answers_what_the_pin_answers_and_refuses_what_it_refuses() {
 }
 
 #[test]
+fn approx_top_k_answers_what_the_pin_answers_and_refuses_what_it_refuses() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    // Every answer below is the pin's over the same rows. The FILTER one shows the pin's rule:
+    // once the places are full a new value takes the last one, at that one's count plus one.
+    for (sql, answer) in [
+        ("SELECT approx_top_k(x % 5, 3) FROM range(100) t(x)", "[0, 1, 2]"),
+        ("SELECT approx_top_k(x, 5) FROM (VALUES (3), (1), (2), (1), (3)) t(x)", "[1, 3, 2]"),
+        (
+            "SELECT approx_top_k(x, 2) FILTER (WHERE x > 0), approx_top_k(DISTINCT x % 2, 5) FROM range(10) t(x)",
+            "[7, 8],[0, 1]",
+        ),
+        (
+            "SELECT x % 2 g, approx_top_k(x % 4, 1) FROM range(20) t(x) GROUP BY g ORDER BY g",
+            "0,[0];1,[1]",
+        ),
+        ("SELECT approx_top_k(x, 2) FROM (VALUES (NULL), (1), (NULL)) t(x)", "[1]"),
+        ("SELECT approx_top_k(x, 3) FROM range(0) t(x)", "NULL"),
+        ("SELECT approx_top_k(x, NULL) FROM range(0) t(x)", "NULL"),
+        ("SELECT approx_top_k(NULL, 2)", "NULL"),
+        ("SELECT approx_top_k(x, '2') FROM range(3) t(x)", "[0, 1]"),
+        ("SELECT approx_top_k(x, 999999) FROM range(3) t(x)", "[0, 1, 2]"),
+        ("SELECT approx_top_k(x > 0, 2) FROM range(3) t(x)", "[true, false]"),
+        ("SELECT approx_top_k(x::FLOAT, 2) FROM range(3) t(x)", "[0.0, 1.0]"),
+        ("SELECT approx_top_k(-0.0::DOUBLE, 1)", "[0.0]"),
+        ("SELECT approx_top_k(x::DECIMAL(5, 2), 2) FROM range(3) t(x)", "[0.00, 1.00]"),
+        ("SELECT approx_top_k(x::VARCHAR, 2) FROM range(3) t(x)", "[0, 1]"),
+        ("SELECT approx_top_k(s, 1) FROM (VALUES ('a'), ('bb'), ('bb')) t(s)", "[bb]"),
+        ("SELECT approx_top_k((x % 100)::VARCHAR, 3) FROM range(1000) t(x)", "[70, 77, 87]"),
+        ("SELECT approx_top_k([x % 2], 1) FROM range(5) t(x)", "[[0]]"),
+        ("SELECT approx_top_k({'i': x % 2}, 1) FROM range(5) t(x)", "[{'i': 0}]"),
+        (
+            "SELECT typeof(approx_top_k(x::DECIMAL(5, 2), 2)), typeof(approx_top_k(x::TINYINT, 2)) FROM range(3) t(x)",
+            "DECIMAL(5,2)[],TINYINT[]",
+        ),
+    ] {
+        assert_eq!(text(sql), answer, "{sql}");
+    }
+    for (sql, message) in [
+        ("SELECT approx_top_k(x, 0) FROM range(5) t(x)", "k value must be > 0"),
+        ("SELECT approx_top_k(x, -1) FROM range(5) t(x)", "k value must be > 0"),
+        ("SELECT approx_top_k(x, 999999999999999) FROM range(5) t(x)", "k value must be < 1000000"),
+        ("SELECT approx_top_k(x, NULL) FROM range(5) t(x)", "k value cannot be NULL"),
+        (
+            "SELECT approx_top_k(x, k) FROM (VALUES (1, 1), (2, 2)) t(x, k)",
+            "The \"col1\" argument in function \"approx_top_k\" must be a constant expression",
+        ),
+        (
+            "SELECT approx_top_k(x, k) OVER () FROM (VALUES (1, 1), (2, 2)) t(x, k)",
+            "The \"col1\" argument in function \"approx_top_k\" must be a constant expression",
+        ),
+        ("SELECT approx_top_k(x, 2.0) FROM range(3) t(x)", "No function matches"),
+        ("SELECT approx_top_k(x, 2::UBIGINT) FROM range(3) t(x)", "No function matches"),
+    ] {
+        let error = db.execute(sql).expect_err(sql);
+        assert!(error.message().contains(message), "{sql}: {error}");
+    }
+}
+
+#[test]
 fn reservoir_quantile_picks_what_the_pin_picks_and_refuses_what_it_refuses() {
     let db = Database::new();
     let text = |sql: &str| {

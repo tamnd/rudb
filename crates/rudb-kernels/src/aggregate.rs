@@ -606,6 +606,24 @@ impl Accumulator {
                 }
                 return Ok(());
             }
+            if general.takes_text()
+                && let Some(input) = args.first()
+                && *input.logical_type() == LogicalType::Varchar
+            {
+                let mut row_args = Vec::with_capacity(args.len());
+                for row in (0..rows).filter(|&row| input.validity().is_valid(row)) {
+                    if let Some(bytes) = input.bytes_at(row) {
+                        general.push_text(bytes, row, args)?;
+                        continue;
+                    }
+                    row_args.clear();
+                    for arg in args {
+                        row_args.push(arg.try_value_at(row)?);
+                    }
+                    general.update(&row_args)?;
+                }
+                return Ok(());
+            }
             let keys = if general.keyed() { by_column(args, rows) } else { None };
             let mut row_args = Vec::with_capacity(args.len());
             for row in 0..rows {
@@ -1418,6 +1436,36 @@ pub fn update_general(
                 return Err(Error::internal(format!("an aggregate state at {index} is not held")));
             };
             general.push_column(column, row, inputs)?;
+        }
+        return Ok(true);
+    }
+    let text = match (&states[offset].state, inputs.first()) {
+        (State::General(general), Some(input))
+            if general.takes_text() && *input.logical_type() == LogicalType::Varchar =>
+        {
+            Some(input)
+        }
+        _ => None,
+    };
+    if let Some(input) = text {
+        let mut args = Vec::with_capacity(inputs.len());
+        for row in (0..rows).filter(|&row| input.validity().is_valid(row)) {
+            let Some(index) = into.index(row) else { continue };
+            let Some(accumulator) = states.get_mut(index) else {
+                return Err(Error::internal(format!("an aggregate state at {index} is not held")));
+            };
+            // A form the bytes are not read out of goes the way every other row goes.
+            if let (State::General(general), Some(bytes)) =
+                (&mut accumulator.state, input.bytes_at(row))
+            {
+                general.push_text(bytes, row, inputs)?;
+                continue;
+            }
+            args.clear();
+            for input in inputs {
+                args.push(input.try_value_at(row)?);
+            }
+            accumulator.update(&args)?;
         }
         return Ok(true);
     }
@@ -4142,9 +4190,9 @@ mod tests {
 
     #[test]
     fn an_aggregate_nobody_has_written_says_which_one() {
-        let error = Accumulator::new("approx_top_k", &LogicalType::Double)
-            .expect_err("approx_top_k is not written yet");
-        assert!(error.message().contains("the approx_top_k aggregate"), "{error}");
+        let error = Accumulator::new("no_such_aggregate", &LogicalType::Double)
+            .expect_err("no_such_aggregate is not written");
+        assert!(error.message().contains("the no_such_aggregate aggregate"), "{error}");
     }
 
     /// The row at a time path, which is the answer the one pass path has to reach.
