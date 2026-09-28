@@ -39,8 +39,8 @@ use rudb_pipeline::{Pool, Progress};
 use rudb_plan::{Node, NodeRef, Plan};
 use rudb_qc_gen::Query;
 use rudb_qc_pipe::{Graph, Source, Stage};
-use rudb_qc_plan::Kind;
 pub use rudb_qc_plan::Refusal;
+use rudb_qc_plan::{Key, Kind};
 use rudb_qc_rt::Rt;
 use rudb_vector::Chunk;
 
@@ -176,13 +176,19 @@ impl Compiled {
         // The stages whose rows only a sort reads, which may come in any order.
         let mut unordered = vec![false; self.graph.stages.len()];
         // The stages whose rows only a top N reads, with its keys and how many rows it keeps.
-        let mut topped = vec![None; self.graph.stages.len()];
+        let mut topped: Vec<Option<(Vec<Key>, u64)>> = vec![None; self.graph.stages.len()];
         for stage in &self.graph.stages {
             if let Stage::Sort { input, .. } | Stage::TopN { input, .. } = stage {
                 unordered[*input] = true;
             }
             if let Stage::TopN { input, keys, count, offset, .. } = stage {
-                topped[*input] = Some((keys.as_slice(), count.saturating_add(*offset)));
+                let count = count.saturating_add(*offset);
+                topped[*input] = Some((keys.clone(), count));
+                if let Stage::Pipeline(p) = &self.graph.stages[*input]
+                    && let Some((below, keys)) = through(p, keys)
+                {
+                    topped[below] = Some((keys, count));
+                }
             }
         }
         for (at, stage) in self.graph.stages.iter().enumerate() {
@@ -218,8 +224,8 @@ impl Compiled {
                         unordered[at],
                     )?;
                     let feed = feed.sized(rows);
-                    let feed = match topped[at] {
-                        Some((keys, count)) => feed.topped(keys, count),
+                    let feed = match &topped[at] {
+                        Some((keys, count)) => feed.topped(keys, *count),
                         None => feed,
                     };
                     match &p.source {
@@ -270,6 +276,30 @@ impl Compiled {
             report: self.tiers.report(),
         })
     }
+}
+
+/// The stage a top N over the rows of `p` can also cut, with the keys it cuts that stage's rows
+/// by, when `p` only passes columns of that stage's rows through, one row out for each row in.
+///
+/// ClickBench q36 is the case: a projection computes `ClientIP - 1` and the rest over three and a
+/// half million groups and a top 10 by count reads it. The rows the top N keeps come from rows
+/// that are in the top N of their own chunk of the groups, so the aggregate cuts its chunks before
+/// the projection sees them.
+fn through(p: &rudb_qc_pipe::Pipeline, keys: &[Key]) -> Option<(usize, Vec<Key>)> {
+    let Source::Stage { stage, .. } = p.source else { return None };
+    let rudb_qc_pipe::Sink::Result { exprs, .. } = &p.sink else { return None };
+    if !p.ops.is_empty() {
+        return None;
+    }
+    let keys = keys
+        .iter()
+        .map(|k| {
+            let Kind::Column(at) = k.expr.kind else { return None };
+            let expr = exprs.get(at)?;
+            matches!(expr.kind, Kind::Column(_)).then(|| Key { expr: expr.clone(), ..k.clone() })
+        })
+        .collect::<Option<Vec<Key>>>()?;
+    Some((stage, keys))
 }
 
 /// How many rows the table a scan reads has, when the scan reads a table and not a function.
