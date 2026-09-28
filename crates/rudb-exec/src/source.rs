@@ -440,6 +440,9 @@ pub(crate) struct Scan<'a> {
     testing: OnceLock<Vec<Probe>>,
     /// The rows every join above that handed rows down holds between them. See [`Source::reduced`].
     exact: OnceLock<Option<Rids>>,
+    /// The workers the scan was offered, kept for [`Valued::passing`], which runs before any of them
+    /// has a row to read.
+    threads: AtomicUsize,
     schema: Schema,
     chunks: Handout,
     /// The parts of each stripe, empty when the rows are not native.
@@ -823,31 +826,59 @@ impl Valued {
     /// the recorded rows leave the nulls out, or when a test cannot be asked.
     ///
     /// The dictionary is asked a vector's length at a time, since a chunk is no longer than that.
-    fn passing(&self, types: &[LogicalType], dictionary: &Vector) -> Option<Vec<u32>> {
-        let over = |len: usize, column: Option<Vector>| {
-            let mut columns = types
-                .iter()
-                .map(|ty| Vector::constant(ty.clone(), Value::Null, len))
-                .collect::<Vec<_>>();
-            if let Some(column) = column {
-                columns[self.input] = column;
-            }
-            Chunk::with_rows(columns, len).ok()
-        };
-        let mut scratches = self.tests.iter().map(Prepared::scratch).collect::<Vec<_>>();
-        let nulls = over(1, None)?;
+    fn passing(
+        &self,
+        types: &[LogicalType],
+        dictionary: &Vector,
+        threads: usize,
+    ) -> Option<Vec<u32>> {
+        let nulls = self.over(types, 1, None)?;
         let mut null_passes = true;
-        for (test, scratch) in self.tests.iter().zip(&mut scratches) {
-            null_passes &= test.evaluate_filter(&nulls, scratch).ok()?.len() == 1;
+        for test in &self.tests {
+            null_passes &= test.evaluate_filter(&nulls, &mut test.scratch()).ok()?.len() == 1;
         }
         if null_passes {
             return None;
         }
+        // The scan's workers are all waiting for this answer, so it is shared out among as many
+        // threads as they are. `cast_info.note` has 715 thousand values, which is 50 milliseconds
+        // on one thread and more than the scan it saves takes on six.
+        let windows = dictionary.len().div_ceil(VECTOR_SIZE);
+        let threads = threads.clamp(1, windows.max(1));
+        if threads == 1 {
+            return self.codes_in(types, dictionary, 0..dictionary.len());
+        }
+        let per = windows.div_ceil(threads) * VECTOR_SIZE;
+        let shares = std::thread::scope(|scope| {
+            let handles = (0..dictionary.len())
+                .step_by(per)
+                .map(|at| {
+                    let end = (at + per).min(dictionary.len());
+                    scope.spawn(move || self.codes_in(types, dictionary, at..end))
+                })
+                .collect::<Vec<_>>();
+            handles.into_iter().map(|handle| handle.join().ok().flatten()).collect::<Vec<_>>()
+        });
+        let mut codes = Vec::new();
+        for share in shares {
+            codes.extend(share?);
+        }
+        Some(codes)
+    }
+
+    /// The codes in `range` of `dictionary` every test passes, a window at a time.
+    fn codes_in(
+        &self,
+        types: &[LogicalType],
+        dictionary: &Vector,
+        range: Range<usize>,
+    ) -> Option<Vec<u32>> {
+        let mut scratches = self.tests.iter().map(Prepared::scratch).collect::<Vec<_>>();
         let mut codes = Vec::new();
         let mut pass = Vec::new();
-        for at in (0..dictionary.len()).step_by(VECTOR_SIZE) {
-            let len = VECTOR_SIZE.min(dictionary.len() - at);
-            let values = over(len, Some(dictionary.slice(at, len).ok()?))?;
+        for at in range.clone().step_by(VECTOR_SIZE) {
+            let len = VECTOR_SIZE.min(range.end - at);
+            let values = self.over(types, len, Some(dictionary.slice(at, len).ok()?))?;
             pass.clear();
             pass.resize(len, 0_usize);
             for (test, scratch) in self.tests.iter().zip(&mut scratches) {
@@ -860,6 +891,18 @@ impl Valued {
             codes.extend((0..len).filter(|&row| pass[row] == all).map(|row| base + row as u32));
         }
         Some(codes)
+    }
+
+    /// A chunk of `len` rows of nulls, with `column` in the tested column when there is one.
+    fn over(&self, types: &[LogicalType], len: usize, column: Option<Vector>) -> Option<Chunk> {
+        let mut columns = types
+            .iter()
+            .map(|ty| Vector::constant(ty.clone(), Value::Null, len))
+            .collect::<Vec<_>>();
+        if let Some(column) = column {
+            columns[self.input] = column;
+        }
+        Chunk::with_rows(columns, len).ok()
     }
 }
 
@@ -1242,6 +1285,7 @@ impl<'a> Scan<'a> {
             index,
             testing: OnceLock::new(),
             exact: OnceLock::new(),
+            threads: AtomicUsize::new(1),
             schema,
             chunks,
             stripes,
@@ -2012,7 +2056,8 @@ impl<'a> Scan<'a> {
             {
                 continue;
             }
-            let Some(codes) = one.passing(&types, &dictionary) else { continue };
+            let threads = self.threads.load(Ordering::Relaxed);
+            let Some(codes) = one.passing(&types, &dictionary, threads) else { continue };
             let Some(held) = index.held(&codes) else { continue };
             if held.saturating_mul(SPARSE_READ as u64) > index.rows() {
                 continue;
@@ -2362,6 +2407,7 @@ impl Source for Scan<'_> {
     }
 
     fn morsels(&self, threads: usize, weight: usize) -> Option<usize> {
+        self.threads.store(threads, Ordering::Relaxed);
         let chunks = self.chunks.total();
         // A table that says nothing about how its chunks are grouped has nothing to divide by, so
         // its chunks go out one at a time to whoever asks, which is what every table did before
@@ -4485,6 +4531,7 @@ mod tests {
             index: 0,
             testing: OnceLock::new(),
             exact: OnceLock::new(),
+            threads: AtomicUsize::new(1),
             schema: Schema::numbered(fields, 0),
             chunks: Handout::new(table.rows().chunk_count()),
             stripes: Vec::new(),
