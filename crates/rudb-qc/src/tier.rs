@@ -36,6 +36,7 @@ use rudb_qc_rt::code::Code;
 
 use crate::tier::up::{Calibration, Class, Progress, Seen, Verdict};
 
+mod cache;
 mod up;
 
 /// Which tier runs a query's pipelines.
@@ -226,6 +227,9 @@ pub struct Options {
     /// Whether a pipeline stays on the tier it started on, where `auto` would otherwise move it up
     /// to `clif` when that pays.
     pub stay: bool,
+    /// Whether every function is compiled anew, and none is taken from the code cache or kept
+    /// in it.
+    pub fresh: bool,
 }
 
 /// What the second tier did with a query's module, for `EXPLAIN (CODEGEN)` and the query log.
@@ -257,6 +261,8 @@ pub struct Report {
     pub background: Duration,
     /// Why each of them moved up, with what the decision read.
     pub climbs: Vec<String>,
+    /// How many of the functions that run as machine code were taken from the code cache.
+    pub cached: usize,
     /// How many morsels ran on the version of their function that reads no NULL, because none of
     /// the columns it reads had one.
     pub nonull: u64,
@@ -280,6 +286,9 @@ impl fmt::Display for Report {
         )?;
         if self.small > 0 {
             write!(f, ", {} on interp for one morsel of input", self.small)?;
+        }
+        if self.cached > 0 {
+            write!(f, ", {} from the code cache", self.cached)?;
         }
         if self.nonull > 0 {
             write!(f, ", {} morsels with no NULL", self.nonull)?;
@@ -313,13 +322,15 @@ pub(crate) struct Tiers {
     /// Whether a function whose input is one morsel at most stays on `interp`, which `auto` asks.
     small: bool,
     /// Each function's machine code, made when its pipeline starts.
-    native: Vec<OnceLock<Option<Code>>>,
+    native: Vec<OnceLock<Option<Arc<Code>>>>,
+    /// Whether the code cache is left alone.
+    fresh: bool,
     calibration: Calibration,
     /// The clock the progress is kept on.
     clock: Instant,
     /// Each function's `clif` code once it has moved up, which a background compile fills. Empty
     /// unless the query is on `auto` with `direct` and `clif` both built, the only way to move up.
-    upper: Vec<Arc<OnceLock<Option<Code>>>>,
+    upper: Vec<Arc<OnceLock<Option<Arc<Code>>>>>,
     /// Each function's rows and time so far, for the decision.
     progress: Vec<Progress>,
     /// Each function's class and size, set when it is compiled on `direct`.
@@ -350,7 +361,7 @@ impl fmt::Debug for Tiers {
 impl Tiers {
     /// Lowers `module` for the interpreter and, when `options` asks for it, for the machine.
     pub(crate) fn new(module: &Module, options: Options) -> Tiers {
-        let Options { tier, switch, stay } = options;
+        let Options { tier, switch, stay, fresh } = options;
         let program = Program::new(module);
         let counts = (
             AtomicU64::new(0),
@@ -371,6 +382,7 @@ impl Tiers {
             tier,
             small,
             native,
+            fresh,
             calibration: Calibration::HOST,
             clock: Instant::now(),
             upper: (0..each).map(|_| Arc::default()).collect(),
@@ -452,7 +464,30 @@ impl Tiers {
         let code = slot.get_or_init(|| {
             let func = module.funcs.get(f)?;
             let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
-            native::compile(func, &mut report, lower)
+            if self.fresh {
+                return native::compile(func, &mut report, lower).map(Arc::new);
+            }
+            // A function that moved up to `clif` in an earlier query starts there when it could
+            // move up in this one, and has nothing left to decide.
+            let mut hit = None;
+            if !self.upper.is_empty() {
+                hit = cache::get(&cache::key(Tier::Clif.name(), func));
+                if hit.is_some()
+                    && let Some(p) = self.progress.get(f)
+                {
+                    p.decided.store(true, Ordering::Relaxed);
+                }
+            }
+            let key = cache::key(self.tier.name(), func);
+            if let Some(code) = hit.or_else(|| cache::get(&key)) {
+                report.native += 1;
+                report.bytes += code.len();
+                report.cached += 1;
+                return Some(code);
+            }
+            let code = native::compile(func, &mut report, lower).map(Arc::new)?;
+            cache::put(key, &code);
+            Some(code)
         });
         // Only a function on `direct` whose input has a known size may move up.
         if code.is_some()
@@ -545,6 +580,7 @@ impl Tiers {
             return;
         };
         let (func, slot, report) = (func.clone(), Arc::clone(slot), Arc::clone(&self.report));
+        let fresh = self.fresh;
         let rate = seen.rows as f64 / seen.busy as f64 * 1e3;
         let why = format!(
             "{} after {} morsels on {} workers with {} rows left at {rate:.1} rows a µs a worker, {:.3} ms to stay and {:.3} ms to move up with a {:.3} ms compile",
@@ -558,7 +594,12 @@ impl Tiers {
         );
         let job = move || {
             let mut done = Report { tier: Tier::Clif.name(), ..Report::default() };
-            let code = native::compile(&func, &mut done, clif::compile);
+            let code = native::compile(&func, &mut done, clif::compile).map(Arc::new);
+            if let Some(code) = &code
+                && !fresh
+            {
+                cache::put(cache::key(Tier::Clif.name(), &func), code);
+            }
             let _ = slot.set(code);
             let mut report = report.lock().unwrap_or_else(PoisonError::into_inner);
             report.up += done.native;

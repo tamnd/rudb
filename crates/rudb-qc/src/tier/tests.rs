@@ -4,11 +4,13 @@
 //! backends' workarounds for what the machine lacks safe to rely on, and it runs in seconds,
 //! which the query level differential does not.
 
+use std::sync::Arc;
+
 use rudb_common::Cancel;
 use rudb_qc_ir::{Form, Module, Op, Ty, parse, verify};
 use rudb_qc_rt::Rt;
 
-use super::{Options, Sink, Switch, Switches, Tier, Tiers};
+use super::{Options, Sink, Switch, Switches, Tier, Tiers, cache};
 
 const INTS: [Ty; 6] = [Ty::I1, Ty::I8, Ty::I16, Ty::I32, Ty::I64, Ty::I128];
 const ALL: [Ty; 10] =
@@ -468,7 +470,9 @@ fn a_function_on_direct_moves_up_to_clif_once_and_gives_the_interpreters_bits() 
     if !(Tier::Direct.built() && Tier::Clif.built()) {
         return;
     }
-    let mut auto = Tiers::new(&m, Options::default());
+    // Another test may have left the function's `clif` code in the cache, which would start it
+    // there.
+    let mut auto = Tiers::new(&m, Options { fresh: true, ..Options::default() });
     auto.calibration = super::up::Calibration {
         fixed: 1.0,
         per_inst: 0.0,
@@ -511,4 +515,29 @@ fn a_function_on_direct_moves_up_to_clif_once_and_gives_the_interpreters_bits() 
     // It decided once and moved up once.
     assert!(auto.start(0).is_none());
     assert_eq!(auto.report().up, 1);
+}
+
+#[test]
+fn a_function_compiled_once_is_taken_from_the_cache_the_next_time_and_runs_the_same() {
+    let m = parse(FLOW).expect("the flow module parses");
+    for tier in natives() {
+        let first = tiers(&m, Options { tier, ..Options::default() });
+        let again = tiers(&m, Options { tier, ..Options::default() });
+        let report = again.report();
+        assert_eq!((report.native, report.cached), (m.funcs.len(), m.funcs.len()), "{report}");
+        assert_eq!(report.compile, std::time::Duration::ZERO, "{report}");
+        let (Some(Some(a)), Some(Some(b))) = (first.native[0].get(), again.native[0].get()) else {
+            panic!("{tier} compiled nothing");
+        };
+        assert!(Arc::ptr_eq(a, b), "{tier} compiled the function twice");
+        let fresh = tiers(&m, Options { tier, fresh: true, ..Options::default() });
+        assert_eq!(fresh.report().cached, 0, "{}", fresh.report());
+    }
+    // Two functions that differ in one constant never share code.
+    let other =
+        parse(&FLOW.replacen("%acc, 77", "%acc, 78", 1)).expect("the changed module parses");
+    for tier in natives() {
+        let a = cache::key(tier.name(), &m.funcs[0]);
+        assert_ne!(a, cache::key(tier.name(), &other.funcs[0]), "{tier}");
+    }
 }
