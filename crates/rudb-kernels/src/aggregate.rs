@@ -62,9 +62,9 @@ use rudb_vector::{Data, Form, Live, Validity, Vector};
 use crate::arg_extreme::Key;
 use crate::compare::order;
 use crate::fallback::{self, Kernel};
-use crate::general::General;
+use crate::general::{General, Measure};
 use crate::lttb::{Plot, Points};
-use crate::number::{fit, integral, pow10, rescale};
+use crate::number::{approximate, fit, integral, pow10, rescale};
 use crate::quantile::Column;
 use crate::shape::{identity, nulls_of};
 
@@ -189,6 +189,8 @@ enum Kind {
     Avg,
     Min,
     Max,
+    /// The variance family, in [`State::Spread`].
+    Spread,
     /// Anything in [`State::General`], which no vector path here reads.
     General,
 }
@@ -232,6 +234,14 @@ enum State {
     // kept in place: it fits in the width the totals already take, and q29's MIN(Referer) over 400
     // thousand groups spent 26 MB and an allocation a group on boxes of one.
     Extreme { held: Option<Extremum>, least: bool },
+    /// The variance family, as a running count, mean and sum of squared differences.
+    ///
+    /// This is Welford's update and the pin's combine, step for step, because the order the
+    /// arithmetic happens in is the last digit of the answer. It is kept in place rather than
+    /// behind the box [`State::General`] holds, because a grouped `stddev` holds one per group
+    /// and the box was the size of the widest general state. Over 100000 groups that was twice
+    /// the pin's memory.
+    Spread { count: u64, mean: f64, squared: f64, measure: Measure },
     /// Any other aggregate, boxed so that the five above stay as narrow as they are.
     General(Box<General>),
 }
@@ -427,6 +437,7 @@ impl Accumulator {
                     Kind::Max
                 }
             }
+            State::Spread { .. } => Kind::Spread,
             State::General(_) => Kind::General,
         }
     }
@@ -434,6 +445,7 @@ impl Accumulator {
     fn returns(&self) -> Return {
         match self.state {
             State::Counted { .. } => Return::BigInt,
+            State::Spread { .. } => Return::Double,
             State::Whole { returns, .. }
             | State::Real { returns, .. }
             | State::Mean { returns, .. }
@@ -466,6 +478,11 @@ impl Accumulator {
             let general = General::Ordered { keys, rows: Vec::new(), inner };
             return Ok(Self { state: State::General(Box::new(general)) });
         }
+        if let Some(measure) = Measure::named(name) {
+            return Ok(Self {
+                state: State::Spread { count: 0, mean: 0.0, squared: 0.0, measure },
+            });
+        }
         if let Some(general) = General::new(name, returns) {
             return Ok(Self { state: State::General(Box::new(general)) });
         }
@@ -486,8 +503,11 @@ impl Accumulator {
         };
         let returns = Return::new(returns);
         let state = match kind {
-            // Every name that builds one of these went to [`General::new`] above.
-            Kind::General => return Err(Error::internal(format!("the {name} aggregate"))),
+            // Every name that builds one of these went to [`General::new`] or [`Measure::named`]
+            // above.
+            Kind::Spread | Kind::General => {
+                return Err(Error::internal(format!("the {name} aggregate")));
+            }
             Kind::CountStar | Kind::Count => {
                 State::Counted { count: 0, star: kind == Kind::CountStar }
             }
@@ -586,6 +606,12 @@ impl Accumulator {
                 if replace {
                     *held = Some(Extremum::Held(Box::new(value.clone())));
                 }
+            }
+            State::Spread { count, mean, squared, .. } => {
+                let input = approximate(value).ok_or_else(|| {
+                    Error::internal(format!("stddev was handed a {}", value.logical_type()))
+                })?;
+                welford(count, mean, squared, input);
             }
             // Taken at the top, before the null is skipped, and kept here for the match.
             State::General(general) => general.update(args)?,
@@ -714,6 +740,17 @@ impl Accumulator {
         // type is, so they come back before there is any question of which loop to run.
         if let State::Counted { count, .. } = &mut self.state {
             *count += i64::try_from(nulls.count_valid(rows)).map_err(|_| overlong())?;
+            return Ok(true);
+        }
+        // A variance reads a flat column of doubles where it lies, in row order, which is the order
+        // the row at a time loop adds in and so the same answer to the last digit.
+        if let State::Spread { count, mean, squared, .. } = &mut self.state {
+            let Some(Column::Reals(reals)) = Column::of(input, rows) else { return Ok(false) };
+            for (row, &input) in reals.iter().enumerate() {
+                if nulls.is_valid(row) {
+                    welford(count, mean, squared, input);
+                }
+            }
             return Ok(true);
         }
         let least = self.kind() == Kind::Min;
@@ -931,6 +968,26 @@ impl Accumulator {
                     }
                 }
             }
+            (
+                State::Spread { count, mean, squared, .. },
+                State::Spread { count: more, mean: theirs, squared: their_squared, .. },
+            ) => {
+                if *count == 0 {
+                    (*count, *mean, *squared) = (*more, *theirs, *their_squared);
+                } else if *more > 0 {
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "the count of rows in one group is well inside the exact range"
+                    )]
+                    let (here, there) = (*count as f64, *more as f64);
+                    let total = here + there;
+                    let delta = theirs - *mean;
+                    *squared = their_squared + *squared + delta * delta * there * here / total;
+                    // The pin moves the mean with a fused multiply and add, which rounds once.
+                    *mean = (there / total).mul_add(delta, *mean);
+                    *count += more;
+                }
+            }
             (State::General(general), State::General(other)) => general.combine(other)?,
             (here, there) => {
                 return Err(Error::internal(format!(
@@ -1040,6 +1097,9 @@ impl Accumulator {
             State::Scaled { total, seen, .. } => {
                 Some(if *seen { Answer::Whole(*total) } else { Answer::Null })
             }
+            State::Spread { count, squared, measure, .. } => {
+                Some(variance(*count, *squared, *measure).map_or(Answer::Null, Answer::Real))
+            }
             State::Extreme { .. } | State::General(_) => None,
         }
     }
@@ -1072,6 +1132,7 @@ impl Accumulator {
                     _ => None,
                 }
             }
+            State::Spread { .. } => (returns == Return::Double).then_some(Route::Double),
             State::Extreme { .. } | State::General(_) => None,
         }
     }
@@ -1408,6 +1469,22 @@ pub fn update_tallied(
             states.len()
         )));
     };
+    // A variance over a flat column of doubles goes straight into each group's state, with no
+    // `Value` built per row, and in row order so that each group adds in the order it always did.
+    if matches!(first.state, State::Spread { .. })
+        && let Some(Column::Reals(reals)) = Column::of(input, rows)
+    {
+        for (row, &input) in reals.iter().enumerate() {
+            if !nulls.is_valid(row) {
+                continue;
+            }
+            let Some(index) = into.index(row) else { continue };
+            if let State::Spread { count, mean, squared, .. } = &mut states[index].state {
+                welford(count, mean, squared, input);
+            }
+        }
+        return Ok(());
+    }
     let feed = feed_of(first, input.logical_type());
     if let Some(feed) = feed
         && spread(states, into, input, rows, nulls.live(), feed)?
@@ -2538,7 +2615,7 @@ enum Feed {
 fn feed_of(first: &Accumulator, ty: &LogicalType) -> Option<Feed> {
     match (&first.state, ty) {
         (State::Counted { .. }, _) => Some(Feed::Counted),
-        (State::General(_), _) => None,
+        (State::Spread { .. } | State::General(_), _) => None,
         // A whole total adds the integers of an integer column. The type is asked about rather
         // than taken for granted because a date and a timestamp are stored as integers too, and
         // summing one of those is not a thing you can do: the row at a time path says `summing a
@@ -3320,6 +3397,43 @@ pub(crate) fn divide_mean(total: f64, seen: i64, scale: u8) -> f64 {
     total / divisor
 }
 
+/// Adds one row to a [`State::Spread`], which is Welford's update in the order the pin does it.
+fn welford(count: &mut u64, mean: &mut f64, squared: &mut f64, input: f64) {
+    *count += 1;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the count of rows in one group is well inside the exact range"
+    )]
+    let differential = (input - *mean) / *count as f64;
+    let next = *mean + differential;
+    *squared += (input - next) * (input - *mean);
+    *mean = next;
+}
+
+/// The answer of a [`State::Spread`] over `count` rows, or `None` where the pin answers null, which
+/// is no rows at all and one row for a sample measure.
+fn variance(count: u64, squared: f64, measure: Measure) -> Option<f64> {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the count of rows in one group is well inside the exact range"
+    )]
+    let rows = count as f64;
+    if measure == Measure::Sem {
+        return (count > 0).then(|| (squared / rows).sqrt() / rows.sqrt());
+    }
+    let sample = matches!(measure, Measure::VarSamp | Measure::StddevSamp);
+    let variance = match (count, sample) {
+        (0, _) | (1, true) => return None,
+        (1, false) => 0.0,
+        (_, true) => squared / (rows - 1.0),
+        (_, false) => squared / rows,
+    };
+    Some(match measure {
+        Measure::VarSamp | Measure::VarPop => variance,
+        Measure::StddevSamp | Measure::StddevPop | Measure::Sem => variance.sqrt(),
+    })
+}
+
 /// An exact total as the double a mean divides, which is the one rounding `avg` over whole numbers
 /// is allowed to do and is where duckdb does it too.
 #[expect(
@@ -3339,7 +3453,7 @@ fn mean_real(bits: i128) -> f64 {
 }
 
 fn approximate_or_error(value: &Value) -> Result<f64> {
-    crate::number::approximate(value).ok_or_else(|| not_narrow(value))
+    approximate(value).ok_or_else(|| not_narrow(value))
 }
 
 /// A value as an unscaled integer at a fixed scale.
@@ -4137,7 +4251,7 @@ mod tests {
         // anything.
         let mut running = 0.0_f64;
         for value in wide_values() {
-            running += crate::number::approximate(&value).expect("a number");
+            running += approximate(&value).expect("a number");
         }
         assert_ne!(running / 4.0, wide_mean(), "the two ways of averaging have to differ here");
         assert_eq!(run("avg", &LogicalType::Double, &wide_values()), Value::Double(wide_mean()));
@@ -4158,7 +4272,7 @@ mod tests {
         let rows = [Value::Double(1e17), Value::Double(1.0), Value::Double(3.0)];
         let mut running = 0.0_f64;
         for value in &rows {
-            running += crate::number::approximate(value).expect("a number");
+            running += approximate(value).expect("a number");
         }
         assert_eq!(run("avg", &LogicalType::Double, &rows), Value::Double(running / 3.0));
     }
@@ -4486,6 +4600,50 @@ mod tests {
             update_scattered(&mut states, slots, STRIDE, OFFSET, input, slots.len())?;
         }
         Ok(states)
+    }
+
+    /// The variance family folded a vector at a time and a group at a time reaches the bits the
+    /// row at a time loop reaches, and its grouped finish is taken a run at a time.
+    ///
+    /// Equal to the last digit rather than close, because the vector loops were written to add the
+    /// rows in the order the row loop does, and a change that reordered them would move the last
+    /// digit and nothing else.
+    #[test]
+    fn the_variance_family_folds_a_column_the_way_it_folds_a_row() {
+        let mut rng = Rng(0x5eed_ca11_ab1e_05d0);
+        let groups = 7;
+        for name in ["var_samp", "var_pop", "stddev_samp", "stddev_pop", "sem"] {
+            let returns = LogicalType::Double;
+            assert_eq!(
+                Accumulator::new(name, &returns).expect("known").kind(),
+                Kind::Spread,
+                "{name} is kept in place"
+            );
+            for nulls in [0_usize, 4, 1] {
+                let first = flat(&LogicalType::Double, 97, nulls, &mut rng);
+                let second = flat(&LogicalType::Double, 64, nulls, &mut rng);
+                let note = format!("{name}, one null in {nulls}");
+                agrees(name, &returns, &[first.clone(), second.clone()], &note);
+                let dealt: Vec<(Vector, Vec<usize>)> = [first, second]
+                    .into_iter()
+                    .map(|batch| {
+                        let slots = deal(batch.len(), groups);
+                        (batch, slots)
+                    })
+                    .collect();
+                let slow = group_at_a_time(name, &returns, &dealt, groups, true).expect("folds");
+                let fast = group_at_once(name, &returns, &dealt, groups, true).expect("folds");
+                assert_eq!(slow, fast, "{note}");
+                let states = scattered_states(name, &returns, &dealt, groups, true).expect("folds");
+                let at: Vec<usize> = (0..groups).collect();
+                let run = finish_run(&states, &at, STRIDE, OFFSET, &returns)
+                    .expect("finishes")
+                    .expect("a variance is finished a run at a time");
+                for (group, slow) in slow.iter().enumerate() {
+                    assert_eq!(&run.value_at(group), slow, "{note}, group {group}");
+                }
+            }
+        }
     }
 
     /// The run at a time finish against the `Value` at a time one, over every aggregate and type.

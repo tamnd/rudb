@@ -252,6 +252,11 @@ impl Accumulator {
                 let count = Value::UBigInt(u64::try_from(*seen).unwrap_or_default());
                 Ok(Value::Struct(vec![("count".to_string(), count), ("value".to_string(), value)]))
             }
+            State::Spread { count, mean, squared, .. } => Ok(Value::Struct(vec![
+                ("count".to_string(), Value::UBigInt(*count)),
+                ("mean".to_string(), Value::Double(*mean)),
+                ("dsquared".to_string(), Value::Double(*squared)),
+            ])),
             State::General(general) => general.export(),
         }
     }
@@ -297,6 +302,11 @@ impl Accumulator {
                 }
             }
             State::Extreme { .. } => accumulator.update(std::slice::from_ref(value))?,
+            State::Spread { count, mean, squared, .. } => {
+                *count = counted(member(value, "count")?)?;
+                *mean = real(member(value, "mean")?)?;
+                *squared = real(member(value, "dsquared")?)?;
+            }
             State::General(general) => general.import(value)?,
         }
         Ok(accumulator)
@@ -320,11 +330,6 @@ impl General {
             | Self::BitString { .. }
             | Self::Product { .. }
             | Self::CountIf { .. } => self.finish()?,
-            Self::Moments { count, mean, squared, .. } => named(vec![
-                ("count", Value::UBigInt(*count)),
-                ("mean", Value::Double(*mean)),
-                ("dsquared", Value::Double(*squared)),
-            ]),
             Self::Kahan { value, err, count, average: true } => named(vec![
                 ("count", Value::UBigInt(*count)),
                 ("value", Value::Double(*value)),
@@ -353,11 +358,6 @@ impl General {
             | Self::BitString { .. }
             | Self::Product { .. } => {
                 self.update(std::slice::from_ref(value))?;
-            }
-            Self::Moments { count, mean, squared, .. } => {
-                *count = counted(member(value, "count")?)?;
-                *mean = real(member(value, "mean")?)?;
-                *squared = real(member(value, "dsquared")?)?;
             }
             Self::Kahan { value: sum, err, count, average } => {
                 *sum = real(member(value, "value")?)?;

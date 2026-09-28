@@ -51,11 +51,6 @@ pub(crate) enum General {
     Sketched(Sketch),
     /// `product`, in floating point the way the pin multiplies.
     Product { total: f64, seen: bool },
-    /// The variance family, as a running count, mean and sum of squared differences.
-    ///
-    /// This is Welford's update and the pin's combine, step for step, because the order the
-    /// arithmetic happens in is the last digit of the answer.
-    Moments { count: u64, mean: f64, squared: f64, measure: Measure },
     /// `string_agg`, the text so far, whether anything has gone into it, and the separator it was
     /// joined with, which a combine has to put between the two halves.
     Joined { text: String, seen: bool, separator: String },
@@ -124,7 +119,7 @@ pub(crate) enum BitOp {
     Xor,
 }
 
-/// Which answer [`General::Moments`] gives.
+/// Which answer a variance state gives, which is kept in place by the accumulator rather than here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Measure {
     VarSamp,
@@ -133,6 +128,20 @@ pub(crate) enum Measure {
     StddevPop,
     /// `sem`, the standard error of the mean.
     Sem,
+}
+
+impl Measure {
+    /// The measure `name` asks for, or `None` when it is not one of the variance family.
+    pub(crate) fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "var_samp" => Self::VarSamp,
+            "var_pop" => Self::VarPop,
+            "stddev_samp" => Self::StddevSamp,
+            "stddev_pop" => Self::StddevPop,
+            "sem" => Self::Sem,
+            _ => return None,
+        })
+    }
 }
 
 impl General {
@@ -146,7 +155,6 @@ impl General {
                 Self::Bits { held: None, op, returns: returns.clone() }
             }
         };
-        let moments = |measure| Self::Moments { count: 0, mean: 0.0, squared: 0.0, measure };
         if let Some(state) = ArgExtreme::named(name) {
             return Some(Self::Arg { state, returns: returns.clone() });
         }
@@ -197,11 +205,6 @@ impl General {
                 returns: returns.clone(),
             },
             "product" => Self::Product { total: 1.0, seen: false },
-            "var_samp" => moments(Measure::VarSamp),
-            "var_pop" => moments(Measure::VarPop),
-            "stddev_samp" => moments(Measure::StddevSamp),
-            "stddev_pop" => moments(Measure::StddevPop),
-            "sem" => moments(Measure::Sem),
             "fsum" => Self::Kahan { value: 0.0, err: 0.0, count: 0, average: false },
             "favg" => Self::Kahan { value: 0.0, err: 0.0, count: 0, average: true },
             "count_if" => Self::CountIf { count: 0, seen: false },
@@ -327,18 +330,6 @@ impl General {
                 };
                 *count += i128::from(flag);
                 *seen = true;
-            }
-            Self::Moments { count, mean, squared, .. } => {
-                let input = approximate(value).ok_or_else(|| unexpected("stddev", value))?;
-                *count += 1;
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "the count of rows in one group is well inside the exact range"
-                )]
-                let differential = (input - *mean) / *count as f64;
-                let next = *mean + differential;
-                *squared += (input - next) * (input - *mean);
-                *mean = next;
             }
             Self::Joined { text, seen, separator: kept } => {
                 // A null separator drops the row, which is how the pin answers
@@ -612,26 +603,6 @@ impl General {
                 *seen |= any;
             }
             (
-                Self::Moments { count, mean, squared, .. },
-                Self::Moments { count: more, mean: theirs, squared: their_squared, .. },
-            ) => {
-                if *count == 0 {
-                    (*count, *mean, *squared) = (*more, *theirs, *their_squared);
-                } else if *more > 0 {
-                    #[expect(
-                        clippy::cast_precision_loss,
-                        reason = "the count of rows in one group is well inside the exact range"
-                    )]
-                    let (here, there) = (*count as f64, *more as f64);
-                    let total = here + there;
-                    let delta = theirs - *mean;
-                    *squared = their_squared + *squared + delta * delta * there * here / total;
-                    // The pin moves the mean with a fused multiply and add, which rounds once.
-                    *mean = (there / total).mul_add(delta, *mean);
-                    *count += more;
-                }
-            }
-            (
                 Self::Joined { text, seen, separator },
                 Self::Joined { text: theirs, seen: any, separator: their_separator },
             ) => {
@@ -727,33 +698,6 @@ impl General {
             Self::Sketched(sketch) => Value::BigInt(sketch.count()),
             Self::Top { top, element } => top.finish(element),
             Self::Plotted { plot, returns } => plot.finish(returns),
-            Self::Moments { count, squared, measure, .. } => {
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "the count of rows in one group is well inside the exact range"
-                )]
-                let rows = *count as f64;
-                if *measure == Measure::Sem {
-                    return Ok(if *count == 0 {
-                        Value::Null
-                    } else {
-                        Value::Double((squared / rows).sqrt() / rows.sqrt())
-                    });
-                }
-                let sample = matches!(measure, Measure::VarSamp | Measure::StddevSamp);
-                let variance = match (*count, sample) {
-                    (0, _) | (1, true) => return Ok(Value::Null),
-                    (1, false) => 0.0,
-                    (_, true) => squared / (rows - 1.0),
-                    (_, false) => squared / rows,
-                };
-                match measure {
-                    Measure::VarSamp | Measure::VarPop => Value::Double(variance),
-                    Measure::StddevSamp | Measure::StddevPop | Measure::Sem => {
-                        Value::Double(variance.sqrt())
-                    }
-                }
-            }
             Self::Paired(state) => state.finish(),
             Self::Powers(state) => state.finish()?,
             Self::Joined { seen: false, .. } => Value::Null,
