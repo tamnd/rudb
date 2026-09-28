@@ -254,19 +254,32 @@ fn verified(
 
 /// Whether nothing outside the join and its parent side reads a column the parent side produces.
 ///
-/// Asked over every node rather than by walking up from the join, because a pass that ran before
-/// this one may have left a node that reads the parent sitting somewhere this walk would not pass
-/// through, and a column that is read from an unreachable node is a column this has no business
-/// deciding about. Counting it as read costs an elimination and counting it as unread would be a
-/// binding pointing at a scan that is no longer in the plan.
+/// Asked over every node the root reaches rather than by walking up from the join, because a pass
+/// that ran before this one may have left a node that reads the parent sitting somewhere a walk up
+/// from the join would not pass through, and a node reachable from the root is a node that runs
+/// whether this walk would have found it or not.
+///
+/// The nodes the root does not reach are skipped, and that is not a nicety. A comma join is bound as
+/// a cross product under a filter, and [`crate::order::JoinOrder`] replaces the pair with a join
+/// built out of new nodes rather than editing them, because the arena never removes a node: one
+/// nothing points at is one nothing runs. So after join ordering every comma join in the query has
+/// left behind a filter that reads both sides of it, and a walk that counted those read every parent
+/// of every comma join as read and eliminated nothing. All twenty two TPC-H queries are written with
+/// comma joins, which is how a rewrite that fires on `JOIN ... ON` fired on none of them.
 fn unread(plan: &Plan, parent: NodeRef, join: NodeRef) -> bool {
     let mut produced = Vec::new();
     indices(plan, parent, &mut produced);
+    let mut running = vec![false; plan.node_count()];
+    mark(plan, plan.root(), &mut running);
     let mut inside = vec![false; plan.node_count()];
     mark(plan, parent, &mut inside);
     let mut clear = true;
     for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
-        if node == join || inside.get(node as usize).copied().unwrap_or(false) {
+        let at = node as usize;
+        if node == join
+            || !running.get(at).copied().unwrap_or(false)
+            || inside.get(at).copied().unwrap_or(false)
+        {
             continue;
         }
         walk::node_columns(plan, node, &mut |_, binding| {
@@ -284,8 +297,9 @@ fn unread(plan: &Plan, parent: NodeRef, join: NodeRef) -> bool {
 /// `unread` and `absorbed` together, the same two questions elimination asks, for a join no
 /// certificate lets the plan delete because its parent side is filtered.
 ///
-/// Unlike `unread` it looks only at the nodes the root reaches, because the plan it is asked
-/// about is the one that runs, and a node a pass left behind is a node nothing runs.
+/// Like `unread` it looks only at the nodes the root reaches, because the plan it is asked about is
+/// the one that runs, and a node a pass left behind is a node nothing runs. It also builds its own
+/// consumers out of those nodes, which `unread` has no use for.
 pub fn unread_side(plan: &Plan, join: NodeRef, side: NodeRef) -> bool {
     let mut produced = Vec::new();
     indices(plan, side, &mut produced);
