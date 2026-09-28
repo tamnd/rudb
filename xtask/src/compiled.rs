@@ -36,8 +36,13 @@ const FIXUP: &str = "* REPLACE (make_date(EventDate) AS EventDate, epoch_ms(Even
                      epoch_ms(LocalEventTime * 1000) AS LocalEventTime)";
 
 pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
+    // The compile times this prints are the C3 numbers, and a debug build of the compiler is about
+    // four times slower than the one a release ships, so the task always measures the bench build.
+    if cfg!(debug_assertions) {
+        return crate::timing::rebuild(root, "compiled", args);
+    }
     let usage = || {
-        "usage: cargo xtask compiled [--threads <n>] [--set <name>=<value>]... [--tier auto|interp|clif|direct | --tiers <seed>] \
+        "usage: cargo xtask compiled [--threads <n>] [--repeat <n>] [--set <name>=<value>]... [--tier auto|interp|clif|direct | --tiers <seed>] \
          <file.parquet> [q1 q2 ...]\n       \
          cargo xtask compiled [--threads <n>] [--tier auto|interp|clif|direct | --tiers <seed>] \
          --suite <parquet dir> <queries> [q1 ...]\n       \
@@ -48,12 +53,17 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let mut tier = "auto".to_string();
     let mut seed = None;
     let mut threads = None;
+    let mut repeat = 1_usize;
     let mut sets = Vec::new();
     while let [flag, value, rest @ ..] = args {
         match flag.as_str() {
             "--tier" => tier = value.clone(),
             "--tiers" => {
                 seed = Some(value.parse::<u64>().map_err(|e| format!("--tiers {value}: {e}"))?);
+            }
+            "--repeat" => {
+                repeat =
+                    value.parse::<usize>().map_err(|e| format!("--repeat {value}: {e}"))?.max(1);
             }
             "--threads" => {
                 threads =
@@ -129,8 +139,8 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     println!("tier    {tier}");
     println!();
     println!(
-        "{:<5} {:>9} {:>9} {:>10} {:>10} {:>7} {:>7}  verdict",
-        "query", "first", "compiled", "compile", "backend", "insts", "bytes"
+        "{:<5} {:>9} {:>9} {:>10} {:>10} {:>10} {:>10} {:>7} {:>7}  verdict",
+        "query", "first", "compiled", "compile", "lower", "qir", "backend", "insts", "bytes"
     );
 
     let mut same = 0;
@@ -145,7 +155,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         }
         let first = answer(&database, "first", sql);
         let logged = database.refusals().len();
-        let compiled = answer(&database, "compiled", sql);
+        let mut compiled = answer(&database, "compiled", sql);
+        if repeat > 1 && database.refusals().len() == logged {
+            compiled = steadied(&database, sql, compiled, repeat);
+        }
         let refusal = database.refusals().get(logged).cloned();
         let verdict = match (&first.rows, &compiled.rows, &refusal) {
             (_, _, Some(line)) => {
@@ -183,10 +196,12 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             compiles.push(compiled.compile_ms);
         }
         println!(
-            "{name:<5} {:>8.3}s {:>8.3}s {:>8.3}ms {:>8.3}ms {:>7} {:>7}  {verdict}",
+            "{name:<5} {:>8.3}s {:>8.3}s {:>8.3}ms {:>8.3}ms {:>8.3}ms {:>8.3}ms {:>7} {:>7}  {verdict}",
             first.seconds,
             compiled.seconds,
             compiled.compile_ms,
+            compiled.lower_ms,
+            compiled.qir_ms,
             compiled.backend_ms,
             compiled.insts,
             compiled.bytes
@@ -315,6 +330,11 @@ struct Answer {
     seconds: f64,
     /// The `codegen_ns` of the query, in milliseconds: zero on the first engine.
     compile_ms: f64,
+    /// The part of it lowering the plan and splitting it into pipelines took, `lower_ns` in
+    /// milliseconds.
+    lower_ms: f64,
+    /// The part of it generating the QIR took, `qir_ns` in milliseconds.
+    qir_ms: f64,
     /// The part of it the tier's backend took, `backend_ns` in milliseconds.
     backend_ms: f64,
     /// The QIR instructions the compiled engine generated.
@@ -329,6 +349,8 @@ impl Default for Answer {
             rows: Ok(Vec::new()),
             seconds: 0.0,
             compile_ms: 0.0,
+            lower_ms: 0.0,
+            qir_ms: 0.0,
             backend_ms: 0.0,
             insts: 0,
             bytes: 0,
@@ -348,12 +370,36 @@ fn answer(database: &Database, engine: &str, sql: &str) -> Answer {
     Answer { rows, seconds: began.elapsed().as_secs_f64(), ..sizes }
 }
 
+/// `first` with its timings replaced by the median of `repeat` runs of the same query on the
+/// compiled engine, so one slow compile does not stand for the query. The rows are the first run's,
+/// which is the one the verdict is about.
+fn steadied(database: &Database, sql: &str, first: Answer, repeat: usize) -> Answer {
+    let mut runs = vec![first];
+    for _ in 1..repeat {
+        runs.push(answer(database, "compiled", sql));
+    }
+    let median = |f: &dyn Fn(&Answer) -> f64| {
+        let mut values: Vec<f64> = runs.iter().map(f).collect();
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    };
+    let seconds = median(&|a| a.seconds);
+    let compile_ms = median(&|a| a.compile_ms);
+    let lower_ms = median(&|a| a.lower_ms);
+    let qir_ms = median(&|a| a.qir_ms);
+    let backend_ms = median(&|a| a.backend_ms);
+    let first = runs.swap_remove(0);
+    Answer { seconds, compile_ms, lower_ms, qir_ms, backend_ms, ..first }
+}
+
 /// What a query's code took to make and how big it came out, from its metrics document, as an
 /// [`Answer`] without the rows.
 fn made(result: &rudb::QueryResult) -> Answer {
     let Some(m) = result.metrics() else { return Answer::default() };
     Answer {
         compile_ms: m.timing.codegen_ns as f64 / 1e6,
+        lower_ms: m.timing.lower_ns as f64 / 1e6,
+        qir_ms: m.timing.qir_ns as f64 / 1e6,
         backend_ms: m.timing.backend_ns as f64 / 1e6,
         insts: m.codegen.qir_insts,
         bytes: m.codegen.code_bytes,
