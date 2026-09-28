@@ -64,7 +64,10 @@ fn rows(chunks: &[Chunk]) -> Vec<Vec<Value>> {
 /// every function of the module compiled by the tiers that compile, and again with the query moved
 /// between the tiers at every morsel and at random ones.
 fn compiled(text: &str) -> Result<Vec<Vec<Value>>> {
-    let mut runs = vec![Options { tier: Tier::Interp, switch: Switch::Off }];
+    let mut runs = vec![
+        Options { tier: Tier::Interp, switch: Switch::Off },
+        Options { tier: Tier::Auto, switch: Switch::Off },
+    ];
     for tier in [Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()) {
         for switch in [Switch::Off, Switch::Every(1), Switch::Random(7)] {
             runs.push(Options { tier, switch });
@@ -88,15 +91,16 @@ fn compiled(text: &str) -> Result<Vec<Vec<Value>>> {
 
 /// The compiled engine's rows on one tier.
 fn on(text: &str, options: Options) -> Result<Vec<Vec<Value>>> {
+    answer(text, options).map(|a| rows(&a.chunks))
+}
+
+/// The compiled engine's answer on one tier.
+fn answer(text: &str, options: Options) -> Result<Answer> {
     let catalog = catalog();
     let plan = Plan::parse(text).expect("a well formed plan");
     let cancel = Cancel::new();
     let pool = Pool::default();
     let compiled = compile_with(&plan, &cancel, options).expect("the compiled engine takes it");
-    let report = compiled.report();
-    if options.tier != Tier::Interp {
-        assert_eq!(report.native, report.functions, "{report}");
-    }
     let memory = Memory::unlimited();
     let seams = rudb_seam::Settings::new();
     let session = Session::new();
@@ -108,7 +112,13 @@ fn on(text: &str, options: Options) -> Result<Vec<Vec<Value>>> {
         session: &session,
         pool: &pool,
     };
-    compiled.run(&plan, under).map(|a| rows(&a.chunks))
+    let answer = compiled.run(&plan, under)?;
+    // A named tier compiles every pipeline that ran, and `auto` leaves the small ones on `interp`.
+    let report = &answer.report;
+    if matches!(options.tier, Tier::Clif | Tier::Direct) {
+        assert_eq!(report.native, report.functions, "{report}");
+    }
+    Ok(answer)
 }
 
 /// The first engine's rows and then the compiled engine's.
@@ -133,6 +143,27 @@ fn same(text: &str, ordered: bool) {
     }
     assert!(!first.is_empty(), "a test that compares nothing");
     assert_eq!(first, compiled);
+}
+
+#[test]
+fn auto_leaves_a_pipeline_over_one_morsel_on_interp_and_compiles_nothing() {
+    let answer = answer(SCAN, Options::default()).expect("the scan runs");
+    assert_eq!(answer.chunks.iter().map(Chunk::len).sum::<usize>(), 5000);
+    let report = &answer.report;
+    assert_eq!((report.small, report.native, report.bytes), (1, 0, 0), "{report}");
+    assert_eq!(report.compile, std::time::Duration::ZERO, "{report}");
+}
+
+#[test]
+fn a_named_tier_compiles_a_pipeline_when_it_starts_and_not_before() {
+    for tier in [Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()) {
+        let plan = Plan::parse(SCAN).expect("a well formed plan");
+        let options = Options { tier, switch: Switch::Off };
+        let compiled = compile_with(&plan, &Cancel::new(), options).expect("it is taken");
+        assert_eq!(compiled.report().native, 0, "{tier}");
+        let answer = answer(SCAN, options).expect("the scan runs");
+        assert_eq!((answer.report.small, answer.report.native), (0, 1), "{tier}");
+    }
 }
 
 #[test]

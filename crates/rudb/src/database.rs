@@ -4874,10 +4874,13 @@ fn run_compiled(
     memory.forget_peak();
     let driving = Span::start();
     let qc = rudb_qc::Under { catalog, cancel, memory, seams, session, pool };
-    // The run takes the query, so what the compile made is kept before it starts.
-    let report = compiled.report().clone();
     let answer = compiled.run(plan, qc)?;
+    // Each pipeline compiled its function as it started, so that time is in the run's.
+    let report = answer.report.clone();
+    let backend = nanos(report.compile);
     let (ran_wall, ran_cpu) = driving.stop();
+    let (codegen_ns, ran_wall) =
+        (codegen_ns.saturating_add(backend), ran_wall.saturating_sub(backend));
     {
         let mut total = switches.lock().unwrap_or_else(PoisonError::into_inner);
         total.result += answer.switches.result;
@@ -4986,7 +4989,8 @@ fn count(n: usize) -> u64 {
 struct Codegen<'a> {
     /// The query.
     compiled: rudb_qc::Compiled,
-    /// The wall time `rudb_qc::compile_with` took, generation and the tier's compile together.
+    /// The wall time `rudb_qc::compile_with` took, which is planning and generation. The tier's
+    /// compile happens as each pipeline starts and is added once the run says how long it took.
     codegen_ns: u64,
     /// The database's count of tier switches, which the run adds to.
     switches: &'a Mutex<rudb_qc::Switches>,

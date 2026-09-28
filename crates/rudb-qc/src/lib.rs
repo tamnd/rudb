@@ -31,10 +31,10 @@ mod tier;
 
 use std::time::Instant;
 
-use rudb_catalog::Catalog;
+use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{Cancel, LogicalType, Memory, Result, Session};
 use rudb_pipeline::{Pool, Progress};
-use rudb_plan::Plan;
+use rudb_plan::{Node, NodeRef, Plan};
 use rudb_qc_gen::Query;
 use rudb_qc_pipe::{Graph, Source, Stage};
 use rudb_qc_plan::Kind;
@@ -66,6 +66,8 @@ pub struct Answer {
     pub chunks: Vec<Chunk>,
     /// How many times the query moved between the tiers, which only `SET qc_switch` makes it do.
     pub switches: Switches,
+    /// What the tiers did, with the compiles the run made.
+    pub report: Report,
 }
 
 /// Compiles an optimized plan, or says why the compiled engine will not run it.
@@ -144,6 +146,7 @@ impl Compiled {
     /// The stages, one line each, the generated module and the [`Report`], for `EXPLAIN (CODEGEN)`.
     #[must_use]
     pub fn explain(&self) -> String {
+        self.tiers.prepare_all(&self.query.module);
         format!(
             "{}\n{}\n{}",
             self.graph,
@@ -152,9 +155,11 @@ impl Compiled {
         )
     }
 
-    /// What the second tier did with the module.
+    /// What the second tier did with the module so far. A pipeline's function is compiled when
+    /// the pipeline starts, so before [`Compiled::run`] this has the planning and nothing else,
+    /// and [`Answer::report`] has the rest.
     #[must_use]
-    pub fn report(&self) -> &Report {
+    pub fn report(&self) -> Report {
         self.tiers.report()
     }
 
@@ -184,6 +189,22 @@ impl Compiled {
                     let body = self.query.bodies[at]
                         .as_ref()
                         .ok_or_else(|| rudb_common::Error::internal("a pipeline with no body"))?;
+                    // An earlier stage's rows are taken before the pipeline starts, because how
+                    // many there are is what decides its tier.
+                    let input = match &p.source {
+                        Source::Stage { stage, .. } => Some(take(&mut outputs, *stage)?),
+                        Source::Scan { .. } | Source::Values { .. } => None,
+                    };
+                    let rows = match &p.source {
+                        Source::Scan { node, .. } => scanned(plan, *node, under.catalog),
+                        Source::Values { rows, .. } => Some(rows.len()),
+                        Source::Stage { .. } => {
+                            input.as_ref().map(|chunks| chunks.iter().map(Chunk::len).sum())
+                        }
+                    };
+                    if let Some(f) = self.tiers.func(&body.func) {
+                        self.tiers.prepare(&self.query.module, f, rows);
+                    }
                     let feed = Feed::new(
                         &self.query.module,
                         &self.tiers,
@@ -206,8 +227,8 @@ impl Compiled {
                         Source::Values { rows, columns } => {
                             feed.push(&finish::values(rows, columns)?)?;
                         }
-                        Source::Stage { stage, .. } => {
-                            for chunk in take(&mut outputs, *stage)? {
+                        Source::Stage { .. } => {
+                            for chunk in input.unwrap_or_default() {
                                 if feed.push(&chunk)? == Progress::Done {
                                     break;
                                 }
@@ -241,8 +262,18 @@ impl Compiled {
             types: columns.iter().map(|c| c.ty.clone()).collect(),
             chunks,
             switches: self.tiers.switches(),
+            report: self.tiers.report(),
         })
     }
+}
+
+/// How many rows the table a scan reads has, when the scan reads a table and not a function.
+fn scanned(plan: &Plan, node: NodeRef, catalog: &Catalog) -> Option<usize> {
+    let Node::Get { catalog: c, schema, table, .. } = *plan.node(node) else {
+        return None;
+    };
+    let name = QualifiedName::new(plan.string(c), plan.string(schema), plan.string(table));
+    catalog.table(&name).ok().map(|t| t.rows().len())
 }
 
 /// The rows of an earlier stage, which only the stage after it reads.

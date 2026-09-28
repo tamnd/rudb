@@ -194,6 +194,13 @@ fn run(tiers: &Tiers, a: u128, b: u128) -> (u64, u128) {
     (status, state[6])
 }
 
+/// A module on the tiers `options` asks for, with every function compiled up front.
+fn tiers(m: &Module, options: Options) -> Tiers {
+    let tiers = Tiers::new(m, options);
+    tiers.prepare_all(m);
+    tiers
+}
+
 /// The tiers this build compiles to machine code with.
 fn natives() -> Vec<Tier> {
     [Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()).collect()
@@ -201,9 +208,9 @@ fn natives() -> Vec<Tier> {
 
 /// One module on `interp` and on `tier`, with the check that `tier` compiled all of it.
 fn both(m: &Module, tier: Tier) -> (Tiers, Tiers) {
-    let native = Tiers::new(m, Options { tier, ..Options::default() });
+    let native = tiers(m, Options { tier, ..Options::default() });
     assert_eq!(native.report().native, m.funcs.len(), "{}", native.report());
-    (Tiers::new(m, Options { tier: Tier::Interp, ..Options::default() }), native)
+    (tiers(m, Options { tier: Tier::Interp, ..Options::default() }), native)
 }
 
 #[test]
@@ -363,7 +370,7 @@ fn a_cancelled_query_stops_at_a_poll_on_both_tiers() {
     let m = parse(FLOW).expect("the flow module parses");
     let cancel = Cancel::new();
     cancel.cancel();
-    let mut all = vec![Tiers::new(&m, Options { tier: Tier::Interp, ..Options::default() })];
+    let mut all = vec![tiers(&m, Options { tier: Tier::Interp, ..Options::default() })];
     all.extend(natives().into_iter().map(|t| both(&m, t).1));
     for tiers in &all {
         let mut state = [0u128; 24];
@@ -398,19 +405,19 @@ fn a_switch_names_itself_the_way_set_takes_it() {
 fn switches_move_a_function_between_the_tiers_and_are_counted_where_they_land() {
     let m = parse(FLOW).expect("the flow module parses");
     let Some(&tier) = natives().first() else { return };
-    let every = Tiers::new(&m, Options { tier, switch: Switch::Every(2) });
+    let every = tiers(&m, Options { tier, switch: Switch::Every(2) });
     let picked: Vec<bool> = (0..8).map(|_| every.morsel(0, Sink::Aggregate)).collect();
     assert_eq!(picked, [true, true, false, false, true, true, false, false]);
     assert_eq!(every.switches(), Switches { aggregate: 3, ..Switches::default() });
 
-    let random = Tiers::new(&m, Options { tier, switch: Switch::Random(1) });
+    let random = tiers(&m, Options { tier, switch: Switch::Random(1) });
     let picked: Vec<bool> = (0..64).map(|_| random.morsel(0, Sink::Build)).collect();
     let flips = picked.windows(2).filter(|w| w[0] != w[1]).count() as u64;
     assert!(flips > 8, "{picked:?}");
     assert_eq!(random.switches(), Switches { build: flips, ..Switches::default() });
 
     // On `interp` there is nothing to switch to, and nothing is counted.
-    let interp = Tiers::new(&m, Options { tier: Tier::Interp, switch: Switch::Every(1) });
+    let interp = tiers(&m, Options { tier: Tier::Interp, switch: Switch::Every(1) });
     assert!((0..8).all(|_| !interp.morsel(0, Sink::Result)));
     assert_eq!(interp.switches().total(), 0);
 }
