@@ -371,6 +371,21 @@ impl<'a> Feed<'a> {
         // Few groups fold faster on one thread than they split.
         let split = !g.keys.is_empty() && (groups >= SPLIT_FROM || forgot);
         if split {
+            // Folding a worker's row into a new group gives the row back, but for a distinct set,
+            // which the fold leaves alone, so without one a new group keeps its worker's row where
+            // it is. The pages the rows are in go to the merged table.
+            let whole = sets.is_empty();
+            let mut pages = Vec::new();
+            if whole {
+                if let Some(table) = inner.rt.table_mut(g.table) {
+                    pages.append(&mut table.take_pages());
+                }
+                for w in &mut workers {
+                    if let Some(table) = w.table_mut(g.table) {
+                        pages.append(&mut table.take_pages());
+                    }
+                }
+            }
             let (merged, made) = {
                 let mine = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
                 let tables = std::iter::once(Ok(mine))
@@ -378,12 +393,12 @@ impl<'a> Feed<'a> {
                     .collect::<Result<Vec<&GroupTable>>>()?;
                 let splits = pieces(threads, tables.len(), |at| tables[at].split(bits))?;
                 let layout = mine.layout().clone();
-                // Folding a worker's row into a new group gives the row back, but for a distinct
-                // set, which the fold leaves alone.
-                let whole = sets.is_empty();
                 let merged = pieces(threads, parts, |part| {
                     let most = splits.iter().map(|s| s[part].len()).sum();
                     let mut table = GroupTable::with_capacity(layout.clone(), most);
+                    if whole {
+                        table.adopt_rows();
+                    }
                     let mut made = vec![Vec::new(); if sets.is_empty() { 0 } else { tables.len() }];
                     for (t, (other, split)) in tables.iter().zip(&splits).enumerate() {
                         table.absorb_some(other, &split[part], made.get_mut(t), whole, fold);
@@ -412,7 +427,7 @@ impl<'a> Feed<'a> {
                         map
                     })?
                 };
-                let (joined, ran) = GroupTable::join_with(layout, merged, |jobs| {
+                let (mut joined, ran) = GroupTable::join_with(layout, merged, |jobs| {
                     let jobs: Vec<Mutex<Option<Job<'_>>>> =
                         jobs.into_iter().map(|job| Mutex::new(Some(job))).collect();
                     pieces(threads, jobs.len(), |at| {
@@ -422,6 +437,7 @@ impl<'a> Feed<'a> {
                     })
                 });
                 ran?;
+                joined.keep(pages);
                 (joined, made)
             };
             maps = made;
