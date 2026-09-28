@@ -18175,7 +18175,7 @@ mod tests {
         reader.integer_tally(0, 0).expect("tallied");
         assert!(reader.is_verified(0), "the tally checked the integer part");
         let sequence = Sequence::new(&[b"a".as_slice()]).expect("a sequence");
-        reader.rows_holding(0, 1, &sequence, false).expect("answered");
+        reader.rows_holding(0, 1, std::slice::from_ref(&sequence), false).expect("answered");
         assert!(reader.is_verified(1), "the LIKE checked the text part");
         fs::remove_file(path).expect("remove scratch file");
     }
