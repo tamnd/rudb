@@ -5,11 +5,14 @@
 //! the rows an append commits go to one lane of the log in `<database>.wal/` before the statement
 //! returns, and the next open replays them.
 //!
-//! Only appends are logged. Everything else that changes a database's file (an update, a delete, a
-//! schema change) checkpoints when it commits instead, which is durable at the price of writing the
-//! tables it changed. The row-level Update and Delete records replace that once the hot stripes
-//! carry DML. An append too large for a block, or of a type the record does not encode, takes the
-//! checkpoint as well.
+//! Appends, updates and deletes are logged. A schema change checkpoints when it commits instead,
+//! which is durable at the price of writing the tables it changed. So does a write too large for a
+//! block, or of a type the records do not encode.
+//!
+//! An Update or Delete record names its rows by where they sit in the table, as runs of row
+//! numbers. Those are stable between the statement and the replay, because a table keeps the order
+//! its rows went in and every change before this one in the log is replayed first. An Update
+//! carries the whole new row, so replay needs nothing of what the row held.
 //!
 //! The file's `RUDBWL1` anchor is what keeps a replay from applying a commit twice. Every
 //! checkpoint writes the newest commit timestamp into it as the durable cut, and only then are the
@@ -28,12 +31,12 @@ use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_io::{Filesystem, RealFilesystem};
 use rudb_native::{LaneStart, LogAnchor};
 use rudb_txn::log::{Block, Kind, Lane, Options, SEGMENT_BYTES, SEGMENT_HEADER, replay, segments};
-use rudb_vector::{Chunk, Vector};
+use rudb_vector::{Chunk, Selection, Vector};
 
 /// The lane every record goes to, until there are more.
 const LANE: u8 = 0;
 
-/// The one payload layout of an Insert record.
+/// The one payload layout of each record kind.
 const VERSION: u8 = 1;
 
 /// How large a segment is. Smaller than the log's default, because a segment is written out whole
@@ -46,27 +49,142 @@ const SEGMENT: u64 = SEGMENT_BYTES / 4;
 /// meet it; what does is a load, which the checkpoint writes as pages anyway.
 const MOST_STAGED: usize = (SEGMENT / 4) as usize;
 
-/// An append read back out of the log, for the table it names.
+/// A record staged for the commit: its kind and its payload.
+#[derive(Debug)]
+pub(crate) struct Record {
+    kind: Kind,
+    payload: Vec<u8>,
+}
+
+/// A change read back out of the log, for the table it names.
 #[derive(Debug)]
 pub(crate) struct Replayed {
+    kind: Kind,
     /// The table's schema.
     pub(crate) schema: String,
     /// The table.
     pub(crate) table: String,
-    /// The payload after the name, which [`decode_rows`] reads against the table's columns.
+    /// The payload after the name, which [`Self::change`] reads against the table's columns.
     payload: Vec<u8>,
-    /// Where the rows start in it.
-    rows_at: usize,
+    /// Where the rest starts in it.
+    rest_at: usize,
 }
 
-impl Replayed {
-    /// The rows as one chunk, the columns typed as `fields` says.
+/// What a replayed record does to its table.
+#[derive(Debug)]
+pub(crate) enum Change {
+    /// Rows appended at the end.
+    Insert(Chunk),
+    /// The rows in these runs of row numbers taken out.
+    Delete(Vec<(u64, u64)>),
+    /// The rows in these runs given the rows of the chunk, in order.
+    Update(Vec<(u64, u64)>, Chunk),
+}
+
+impl Change {
+    /// Applies the change to `chunks`, which hold the table's rows in order, the columns typed as
+    /// `fields` says.
     ///
     /// # Errors
     ///
-    /// If the payload does not read as rows of those columns.
-    pub(crate) fn chunk(&self, fields: &[Field]) -> Result<Chunk> {
-        decode_rows(&self.payload[self.rows_at..], fields)
+    /// If a row number is past the last row, or new values do not fit their columns.
+    pub(crate) fn apply(self, fields: &[Field], chunks: &mut Vec<Chunk>) -> Result<()> {
+        match self {
+            Self::Insert(chunk) => chunks.push(chunk),
+            Self::Delete(runs) => {
+                let mut rows = runs.iter().flat_map(|&(first, len)| first..first + len).peekable();
+                let mut offset = 0;
+                let mut kept = Vec::with_capacity(chunks.len());
+                for chunk in chunks.drain(..) {
+                    let end = offset + chunk.len() as u64;
+                    let mut gone = Vec::new();
+                    while let Some(row) = rows.next_if(|&row| row < end) {
+                        gone.push(u32::try_from(row - offset).map_err(|_| corrupt("a row"))?);
+                    }
+                    offset = end;
+                    if gone.is_empty() {
+                        kept.push(chunk);
+                        continue;
+                    }
+                    let rest = Selection::from_indices(gone).complement(chunk.len());
+                    if !rest.is_empty() {
+                        kept.push(chunk.select(&rest)?);
+                    }
+                }
+                *chunks = kept;
+                if rows.next().is_some() {
+                    return Err(corrupt("a delete record past the table's last row"));
+                }
+            }
+            Self::Update(runs, new) => {
+                let mut rows = runs.iter().flat_map(|&(first, len)| first..first + len).peekable();
+                let mut offset = 0;
+                let mut next = 0;
+                for chunk in chunks.iter_mut() {
+                    let end = offset + chunk.len() as u64;
+                    let mut hits = Vec::new();
+                    while let Some(row) = rows.next_if(|&row| row < end) {
+                        hits.push((row - offset) as usize);
+                    }
+                    offset = end;
+                    if hits.is_empty() {
+                        continue;
+                    }
+                    let mut columns = Vec::with_capacity(fields.len());
+                    for (column, field) in fields.iter().enumerate() {
+                        let mut values = (0..chunk.len())
+                            .map(|row| chunk.value_at(row, column))
+                            .collect::<Vec<_>>();
+                        for (at, &row) in hits.iter().enumerate() {
+                            values[row] = new.value_at(next + at, column);
+                        }
+                        columns.push(Vector::from_values(field.ty.clone(), &values)?);
+                    }
+                    next += hits.len();
+                    *chunk = Chunk::new(columns)?;
+                }
+                if rows.next().is_some() {
+                    return Err(corrupt("an update record past the table's last row"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Replayed {
+    /// Whether this only appends, which replay can do without reading the table.
+    pub(crate) fn appends(&self) -> bool {
+        self.kind == Kind::Insert
+    }
+
+    /// The change, with rows typed as `fields` says.
+    ///
+    /// # Errors
+    ///
+    /// If the payload does not read as a change to a table of those columns.
+    pub(crate) fn change(&self, fields: &[Field]) -> Result<Change> {
+        let bytes = &self.payload[self.rest_at..];
+        match self.kind {
+            Kind::Insert => Ok(Change::Insert(decode_rows(bytes, fields)?)),
+            Kind::Delete => {
+                let mut at = 0;
+                let runs = get_runs(bytes, &mut at)?;
+                if at != bytes.len() {
+                    return Err(corrupt("a delete record with bytes after its rows"));
+                }
+                Ok(Change::Delete(runs))
+            }
+            _ => {
+                let mut at = 0;
+                let runs = get_runs(bytes, &mut at)?;
+                let rows = decode_rows(&bytes[at..], fields)?;
+                if runs.iter().map(|run| run.1).sum::<u64>() != rows.len() as u64 {
+                    return Err(corrupt("an update record whose rows and row numbers differ"));
+                }
+                Ok(Change::Update(runs, rows))
+            }
+        }
     }
 }
 
@@ -81,8 +199,8 @@ pub(crate) struct Journal {
     last: u64,
     /// Opened at the first commit, because opening one makes a segment.
     lane: Option<Lane>,
-    /// Insert payloads waiting for the commit.
-    staged: Vec<Vec<u8>>,
+    /// Records waiting for the commit.
+    staged: Vec<Record>,
     staged_bytes: usize,
     /// Whether the commit has to checkpoint rather than log.
     dirty: bool,
@@ -100,7 +218,7 @@ pub(crate) fn directory(path: &Path) -> PathBuf {
 
 impl Journal {
     /// Reads the log of the database file at `path`, whose anchor is `anchor`, and hands back the
-    /// journal and every append above the cut in commit order.
+    /// journal and every change above the cut in commit order.
     ///
     /// A file without an anchor has never had a commit logged against it, so a log directory
     /// beside it is left over from another file of the same name and is removed, when `writable`.
@@ -133,7 +251,7 @@ impl Journal {
             return Ok((journal, Vec::new()));
         };
         let read = replay(fs.as_ref(), &dir, LANE, anchor.database)?;
-        let mut appends = Vec::new();
+        let mut changes = Vec::new();
         for block in read.blocks {
             let ts = block.commit.commit_ts;
             if !anchor.replays(ts) {
@@ -141,15 +259,16 @@ impl Journal {
             }
             journal.last = journal.last.max(ts);
             for record in block.records {
-                if record.header.kind == Kind::Insert {
-                    appends.push(read_insert(record.payload)?);
+                let kind = record.header.kind;
+                if matches!(kind, Kind::Insert | Kind::Update | Kind::Delete) {
+                    changes.push(read_record(kind, record.payload)?);
                 }
             }
         }
-        Ok((journal, appends))
+        Ok((journal, changes))
     }
 
-    /// The Insert payload for the rows of `chunks` appended to `schema.table`, whose columns are
+    /// The Insert record for the rows of `chunks` appended to `schema.table`, whose columns are
     /// `fields`, or `None` when they cannot be logged. Built before the rows go in, so a failed
     /// append has nothing to take back, and [`Self::stage`]d once they are in.
     pub(crate) fn encode(
@@ -158,25 +277,62 @@ impl Journal {
         table: &str,
         fields: &[Field],
         chunks: &[Chunk],
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Record> {
         if self.dirty {
             return None;
         }
-        encode_insert(schema, table, fields, chunks, MOST_STAGED - self.staged_bytes)
+        let mut out = header(schema, table)?;
+        put_rows(&mut out, fields, chunks, MOST_STAGED - self.staged_bytes)?;
+        Some(Record { kind: Kind::Insert, payload: out })
     }
 
-    /// Stages an append for the commit, or marks the commit to checkpoint when there is no payload.
-    pub(crate) fn stage(&mut self, payload: Option<Vec<u8>>) {
+    /// The Delete record for the rows at `rows` of `schema.table`, the row numbers ascending.
+    pub(crate) fn encode_delete(&self, schema: &str, table: &str, rows: &[u64]) -> Option<Record> {
+        if self.dirty {
+            return None;
+        }
+        let mut out = header(schema, table)?;
+        put_runs(&mut out, rows)?;
+        (out.len() <= MOST_STAGED - self.staged_bytes)
+            .then_some(Record { kind: Kind::Delete, payload: out })
+    }
+
+    /// The Update record that gives the rows at `rows` of `schema.table` the rows of `chunks`, in
+    /// order, the row numbers ascending.
+    pub(crate) fn encode_update(
+        &self,
+        schema: &str,
+        table: &str,
+        fields: &[Field],
+        rows: &[u64],
+        chunks: &[Chunk],
+    ) -> Option<Record> {
+        if self.dirty {
+            return None;
+        }
+        let mut out = header(schema, table)?;
+        put_runs(&mut out, rows)?;
+        put_rows(&mut out, fields, chunks, MOST_STAGED - self.staged_bytes)?;
+        Some(Record { kind: Kind::Update, payload: out })
+    }
+
+    /// Stages a record for the commit, or marks the commit to checkpoint when there is none.
+    pub(crate) fn stage(&mut self, record: Option<Record>) {
         if self.dirty {
             return;
         }
-        match payload {
-            Some(payload) if self.staged_bytes + payload.len() <= MOST_STAGED => {
-                self.staged_bytes += payload.len();
-                self.staged.push(payload);
+        match record {
+            Some(record) if self.staged_bytes + record.payload.len() <= MOST_STAGED => {
+                self.staged_bytes += record.payload.len();
+                self.staged.push(record);
             }
             _ => self.dirty(),
         }
+    }
+
+    /// Whether the commit still logs rather than checkpoints.
+    pub(crate) fn logs(&self) -> bool {
+        !self.dirty
     }
 
     /// Marks the commit to checkpoint.
@@ -212,8 +368,8 @@ impl Journal {
         self.staged_bytes = 0;
         let ts = self.last + 1;
         let mut block = Block::new(ts, ts, self.last);
-        for payload in &staged {
-            block.push(Kind::Insert, 0, payload)?;
+        for record in &staged {
+            block.push(record.kind, 0, &record.payload)?;
         }
         let lane = match self.lane.take() {
             Some(lane) => lane,
@@ -289,23 +445,56 @@ fn fresh_id() -> u64 {
     RandomState::new().hash_one((nanos, std::process::id()))
 }
 
-/// An Insert payload, or `None` when a column's type or a value is one the record does not carry.
-/// Gives up once the payload passes `most` bytes, which is what keeps a large load from being
-/// encoded whole only to be checkpointed instead.
-fn encode_insert(
-    schema: &str,
-    table: &str,
-    fields: &[Field],
-    chunks: &[Chunk],
-    most: usize,
-) -> Option<Vec<u8>> {
+/// The start every payload shares: the layout and the table's name.
+fn header(schema: &str, table: &str) -> Option<Vec<u8>> {
+    let mut out = vec![VERSION];
+    put_text(&mut out, schema)?;
+    put_text(&mut out, table)?;
+    Some(out)
+}
+
+/// Row numbers, ascending, as a count of runs and each run's first row and length.
+fn put_runs(out: &mut Vec<u8>, rows: &[u64]) -> Option<()> {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &row in rows {
+        match runs.last_mut() {
+            Some((first, len)) if *first + *len == row => *len += 1,
+            Some((first, len)) if *first + *len > row => return None,
+            _ => runs.push((row, 1)),
+        }
+    }
+    out.extend_from_slice(&u32::try_from(runs.len()).ok()?.to_le_bytes());
+    for (first, len) in runs {
+        out.extend_from_slice(&first.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+    Some(())
+}
+
+/// The runs [`put_runs`] wrote, checked to ascend without touching.
+fn get_runs(bytes: &[u8], at: &mut usize) -> Result<Vec<(u64, u64)>> {
+    let count = u32::from_le_bytes(array(bytes, at)?) as usize;
+    let mut runs: Vec<(u64, u64)> = Vec::with_capacity(count.min(bytes.len() / 16));
+    for _ in 0..count {
+        let first = u64::from_le_bytes(array(bytes, at)?);
+        let len = u64::from_le_bytes(array(bytes, at)?);
+        let after = runs.last().map_or(0, |(first, len)| first + len);
+        if len == 0 || first < after || first.checked_add(len).is_none() {
+            return Err(corrupt("a record whose row numbers do not ascend"));
+        }
+        runs.push((first, len));
+    }
+    Ok(runs)
+}
+
+/// The rows of `chunks` a column at a time, or `None` when a column's type or a value is one the
+/// records do not carry. Gives up once the payload passes `most` bytes, which is what keeps a large
+/// load from being encoded whole only to be checkpointed instead.
+fn put_rows(out: &mut Vec<u8>, fields: &[Field], chunks: &[Chunk], most: usize) -> Option<()> {
     if !fields.iter().all(|field| carried(&field.ty)) {
         return None;
     }
     let rows: usize = chunks.iter().map(Chunk::len).sum();
-    let mut out = vec![VERSION];
-    put_text(&mut out, schema)?;
-    put_text(&mut out, table)?;
     out.extend_from_slice(&u16::try_from(fields.len()).ok()?.to_le_bytes());
     out.extend_from_slice(&u32::try_from(rows).ok()?.to_le_bytes());
     for (column, field) in fields.iter().enumerate() {
@@ -315,25 +504,25 @@ fn encode_insert(
             }
             // row at a time: only a small insert is logged this way, and `most` caps its bytes.
             for row in 0..chunk.len() {
-                put(&mut out, &chunk.value_at(row, column), &field.ty)?;
+                put(out, &chunk.value_at(row, column), &field.ty)?;
             }
             if out.len() > most {
                 return None;
             }
         }
     }
-    Some(out)
+    Some(())
 }
 
-/// The name an Insert payload is for, and where its rows start.
-fn read_insert(payload: Vec<u8>) -> Result<Replayed> {
+/// The name a payload is for, and where the rest of it starts.
+fn read_record(kind: Kind, payload: Vec<u8>) -> Result<Replayed> {
     let mut at = 0;
     if take(&payload, &mut at, 1)?[0] != VERSION {
-        return Err(corrupt("an insert record of another layout"));
+        return Err(corrupt("a record of another layout"));
     }
     let schema = get_text(&payload, &mut at)?;
     let table = get_text(&payload, &mut at)?;
-    Ok(Replayed { schema, table, payload, rows_at: at })
+    Ok(Replayed { kind, schema, table, payload, rest_at: at })
 }
 
 /// The rows of an Insert payload, from its column count on, as a chunk of `fields`.
@@ -701,9 +890,16 @@ fn mismatch(tag: u8, ty: &LogicalType) -> Error {
 #[cfg(test)]
 mod tests {
     use rudb_common::{Field, LogicalType, Value};
+    use rudb_txn::log::Kind;
     use rudb_vector::{Chunk, Vector};
 
-    use super::{decode_rows, encode_insert, read_insert};
+    use super::{Change, decode_rows, header, put_rows, put_runs, read_record};
+
+    fn insert(fields: &[Field], chunks: &[Chunk]) -> Option<Vec<u8>> {
+        let mut out = header("main", "items")?;
+        put_rows(&mut out, fields, chunks, usize::MAX)?;
+        Some(out)
+    }
 
     fn column(ty: LogicalType, values: Vec<Value>) -> (Field, Vector) {
         let vector = Vector::from_values(ty.clone(), &values).expect("a vector");
@@ -742,12 +938,12 @@ mod tests {
         ];
         let (fields, vectors): (Vec<Field>, Vec<Vector>) = pieces.into_iter().unzip();
         let chunk = Chunk::new(vectors).expect("a chunk");
-        let payload =
-            encode_insert("main", "items", &fields, &[chunk.clone(), chunk.clone()], usize::MAX)
-                .expect("carried");
-        let replayed = read_insert(payload).expect("reads");
+        let payload = insert(&fields, &[chunk.clone(), chunk.clone()]).expect("carried");
+        let replayed = read_record(Kind::Insert, payload).expect("reads");
         assert_eq!((replayed.schema.as_str(), replayed.table.as_str()), ("main", "items"));
-        let back = replayed.chunk(&fields).expect("decodes");
+        let Change::Insert(back) = replayed.change(&fields).expect("decodes") else {
+            panic!("an insert")
+        };
         assert_eq!(back.len(), 4);
         for row in 0..4 {
             for col in 0..fields.len() {
@@ -761,6 +957,37 @@ mod tests {
     fn a_type_the_record_does_not_carry_is_refused() {
         let (field, vector) = column(LogicalType::Uuid, vec![Value::Null]);
         let chunk = Chunk::new(vec![vector]).expect("a chunk");
-        assert!(encode_insert("main", "t", &[field], &[chunk], usize::MAX).is_none());
+        assert!(insert(&[field], &[chunk]).is_none());
+    }
+
+    #[test]
+    fn row_numbers_go_in_as_runs() {
+        let (field, vector) = column(LogicalType::Integer, vec![Value::Integer(9); 5]);
+        let fields = [field];
+        let chunk = Chunk::new(vec![vector]).expect("a chunk");
+        let mut out = header("main", "t").expect("a name");
+        put_runs(&mut out, &[0, 1, 2, 7, 9, 10]).expect("ascending");
+        let replayed = read_record(Kind::Delete, out.clone()).expect("reads");
+        let Change::Delete(runs) = replayed.change(&fields).expect("decodes") else {
+            panic!("a delete")
+        };
+        assert_eq!(runs, vec![(0, 3), (7, 1), (9, 2)]);
+        let mut update = header("main", "t").expect("a name");
+        put_runs(&mut update, &[3, 4, 5, 6, 20]).expect("ascending");
+        put_rows(&mut update, &fields, std::slice::from_ref(&chunk), usize::MAX).expect("rows");
+        let replayed = read_record(Kind::Update, update).expect("reads");
+        let Change::Update(runs, rows) = replayed.change(&fields).expect("decodes") else {
+            panic!("an update")
+        };
+        assert_eq!((runs, rows.len()), (vec![(3, 4), (20, 1)], 5));
+        assert!(put_runs(&mut Vec::new(), &[4, 2]).is_none(), "row numbers that fall");
+        let short = read_record(Kind::Update, {
+            let mut update = header("main", "t").expect("a name");
+            put_runs(&mut update, &[1]).expect("one row");
+            put_rows(&mut update, &fields, &[chunk], usize::MAX).expect("rows");
+            update
+        })
+        .expect("reads");
+        assert!(short.change(&fields).is_err(), "five rows for one row number");
     }
 }
