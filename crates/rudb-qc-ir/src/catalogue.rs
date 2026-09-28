@@ -61,8 +61,9 @@ proxies! {
     "str_length" (Str16) -> I64, pure;
     "str_concat" (Str16, Str16) -> Str16, mayfail;
     // Hash tables and aggregation state. The first argument is the handle of the table or the
-    // distinct set, the second the group row `ht_insert` returned.
-    "ht_insert" (Ptr, Ptr, I64) -> Ptr, mayfail, effect;
+    // distinct set, the second the group row `ht_insert` returned. The last argument of
+    // `ht_insert` is where it publishes the table for compiled code's own probe, or zero.
+    "ht_insert" (Ptr, Ptr, I64, Ptr) -> Ptr, mayfail, effect;
     // A join build appends the record in its state and the record's hash to the table.
     "jt_append" (Ptr, Ptr, I64) -> Void, mayfail, effect;
     "agg_distinct" (Ptr, Ptr, Str16) -> Void, mayfail, effect;

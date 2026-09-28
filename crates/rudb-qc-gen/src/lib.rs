@@ -18,7 +18,9 @@
 //! number of rows, so there the sink also has the buffers' capacity, and a body that fills them
 //! returns `NeedMemory` for the driver to grow them and run the morsel again. An aggregate sink has
 //! the key buffer the body builds each row's key in before `ht_insert`, or for an aggregate with no
-//! groups the address of the one group row, which the driver writes there before the first call. A
+//! groups the address of the one group row, which the driver writes there before the first call.
+//! When every key is fixed width it also has the row of the last key and four words `ht_insert`
+//! publishes the table in, so that the body finds a key's group itself and calls only for a new one. A
 //! join build has the record buffer the body builds each row's record in before `jt_append`. After
 //! the sink come three words per probe, which the driver fills from the built table at init: the
 //! directory's address, the shift that takes a hash to its slot and the tag table's address.
@@ -157,6 +159,10 @@ pub struct Grouping {
     /// last key went to, zero before the first. A row whose key is the last one's goes to the same
     /// row without hashing or probing, which is most rows of a file sorted on its keys.
     pub last: Option<u32>,
+    /// For the same aggregates, the state offset of four words `ht_insert` publishes the table in,
+    /// which the body probes itself before it calls: the address of the slots, their mask, the
+    /// address of the rows by group id, and how many keys it found that way.
+    pub probe: Option<u32>,
 }
 
 /// One accumulator in a group row.
@@ -595,10 +601,12 @@ impl Gen<'_> {
                         (None, None, SINK + size)
                     } else {
                         self.field(SINK + size, 8, "last");
-                        (None, Some(SINK + size), SINK + size + 8)
+                        self.field(SINK + size + 8, 32, "probe");
+                        (None, Some(SINK + size), SINK + size + 40)
                     }
                 };
-                let grouping = Grouping { table, keys, acc_offset, accs, row, last };
+                let probe = last.map(|at| at + 8);
+                let grouping = Grouping { table, keys, acc_offset, accs, row, last, probe };
                 Ok((Out::Aggregate(grouping), state))
             }
         }
@@ -1207,7 +1215,7 @@ impl Gen<'_> {
         out: &Out,
     ) -> Result<()> {
         let Some((op, rest)) = ops.split_first() else {
-            self.sink(sink, out, skip)?;
+            self.sink(sink, out, skip, depth)?;
             self.b.br(skip, &[]);
             return Ok(());
         };
@@ -1314,7 +1322,83 @@ impl Gen<'_> {
         Ok((head, e, layout.stride(), advance))
     }
 
-    fn sink(&mut self, sink: &Sink, out: &Out, skip: Block) -> Result<()> {
+    /// Looks for the group of the key in the key buffer through the words `ht_insert` published
+    /// at `at`, the way [`GroupTable`] probes its slots. Returns the block to call `ht_insert` from
+    /// when the key is not found or nothing is published yet, and a block with the row as its
+    /// parameter that both ways go to. Keys are compared as values and null bytes, which is
+    /// enough because a null key's value is zero.
+    fn find_group(
+        &mut self,
+        g: &Grouping,
+        values: &[Pair],
+        hash: Val,
+        at: u32,
+        depth: u8,
+    ) -> Result<(Block, Option<Block>)> {
+        let st = self.b.st();
+        let at = at as i32;
+        let (slow, found) = (self.b.block(&[]), self.b.block(&[(Ty::Ptr, "row")]));
+        let slots = self.b.load(Ty::Ptr, st, Val::NONE, 1, at, 0);
+        let word = self.b.conv(Op::Bitcast, slots, Ty::I64);
+        let zero = self.b.int(Ty::I64, 0);
+        let published = self.b.bin(Op::IcmpNe, word, zero);
+        let look = self.b.block(&[]);
+        self.b.brif(published, look, &[], slow, &[]);
+        self.b.switch_to(look);
+        let mask = self.b.load(Ty::I64, st, Val::NONE, 1, at + 8, 0);
+        let rows = self.b.load(Ty::Ptr, st, Val::NONE, 1, at + 16, 0);
+        let k32 = self.b.int(Ty::I64, 32);
+        let tag = self.b.bin(Op::Shl, hash, k32);
+        let first = self.b.bin(Op::And, hash, mask);
+        let head = self.b.block(&[(Ty::I64, "at")]);
+        self.b.br(head, &[first]);
+        self.b.switch_to(head);
+        // The slots are never more than half full, so the loop ends at an empty one.
+        self.b.set_loop(head, depth + 1);
+        self.b.set_bounded(head);
+        let i = self.b.param(head, 0);
+        let slot = self.b.load(Ty::I64, slots, i, 8, 0, 0);
+        let empty = self.b.bin(Op::IcmpEq, slot, zero);
+        let (test, next) = (self.b.block(&[]), self.b.block(&[]));
+        self.b.brif(empty, slow, &[], test, &[]);
+        self.b.switch_to(test);
+        let high = self.b.konst(Ty::I64, u128::from(!0xffff_ffffu64));
+        let hi = self.b.bin(Op::And, slot, high);
+        let tagged = self.b.bin(Op::IcmpEq, hi, tag);
+        let check = self.b.block(&[]);
+        self.b.brif(tagged, check, &[], next, &[]);
+        self.b.switch_to(check);
+        let low = self.b.int(Ty::I64, 0xffff_ffff);
+        let gid = self.b.bin(Op::And, slot, low);
+        let row = self.b.load(Ty::Ptr, rows, gid, 8, -8, 0);
+        let mut same = self.b.bool(true);
+        for (&(v, ok), (k, _)) in values.iter().zip(&g.keys) {
+            let off = (8 + k.offset) as i32;
+            let ty = self.b.ty(v);
+            let x = self.b.load(ty, row, Val::NONE, 1, off, 0);
+            let eq = self.b.bin(Op::IcmpEq, x, v);
+            let null = self.b.load(Ty::I1, row, Val::NONE, 1, off + k.width as i32, 0);
+            // The null byte is set where `ok` is not.
+            let flip = self.b.bin(Op::Xor, null, ok);
+            same = self.b.bin(Op::And, same, eq);
+            same = self.b.bin(Op::And, same, flip);
+        }
+        let hit = self.b.block(&[]);
+        self.b.brif(same, hit, &[], next, &[]);
+        self.b.switch_to(hit);
+        let n = self.b.load(Ty::I64, st, Val::NONE, 1, at + 24, 0);
+        let one = self.b.int(Ty::I64, 1);
+        let n = self.b.bin(Op::Add, n, one);
+        self.b.store(st, Val::NONE, 1, at + 24, n, 0);
+        self.b.br(found, &[row]);
+        self.b.switch_to(next);
+        let j = self.b.bin(Op::Add, i, one);
+        let j = self.b.bin(Op::And, j, mask);
+        self.b.br(head, &[j]);
+        Ok((slow, Some(found)))
+    }
+
+    fn sink(&mut self, sink: &Sink, out: &Out, skip: Block, depth: u8) -> Result<()> {
         let st = self.b.st();
         match (sink, out) {
             (Sink::Result { exprs, .. }, Out::Result { count, columns, capacity }) => {
@@ -1349,7 +1433,16 @@ impl Gen<'_> {
                     None => {
                         let mut values = Vec::with_capacity(groups.len());
                         for e in groups {
-                            values.push(self.expr(e)?);
+                            let (v, ok) = self.expr(e)?;
+                            // A null key's value is zeroed, so that keys the same are the same
+                            // bytes for the probe below.
+                            let v = if g.probe.is_some() {
+                                let zero = self.b.konst(self.b.ty(v), 0);
+                                self.b.select(ok, v, zero)
+                            } else {
+                                v
+                            };
+                            values.push((v, ok));
                         }
                         // The key buffer still holds the last row's key, which a key the same
                         // bytes as it finds the same group, so its row is taken again.
@@ -1388,7 +1481,24 @@ impl Gen<'_> {
                         }
                         let key = self.offset(st, SINK);
                         let table = self.handle(g.table);
-                        let row = self.rt(proxy_id("ht_insert"), &[table, key, hash]);
+                        let (slow, found) = match g.probe {
+                            Some(at) => self.find_group(g, &values, hash, at, depth)?,
+                            None => (self.b.current(), None),
+                        };
+                        self.b.switch_to(slow);
+                        let published = match g.probe {
+                            Some(at) => self.offset(st, at),
+                            None => self.b.konst(Ty::Ptr, 0),
+                        };
+                        let row = self.rt(proxy_id("ht_insert"), &[table, key, hash, published]);
+                        let row = match found {
+                            Some(found) => {
+                                self.b.br(found, &[row]);
+                                self.b.switch_to(found);
+                                self.b.param(found, 0)
+                            }
+                            None => row,
+                        };
                         if let Some(last) = g.last {
                             self.b.store(st, Val::NONE, 1, last as i32, row, 0);
                         }
