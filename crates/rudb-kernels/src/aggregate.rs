@@ -237,9 +237,10 @@ enum State {
     /// The variance family, as a running count, mean and sum of squared differences.
     ///
     /// This is Welford's update and the pin's combine, step for step, because the order the
-    /// arithmetic happens in is the last digit of the answer. It is kept in place rather than behind
-    /// the box [`State::General`] holds, because a grouped `stddev` holds one per group and the box
-    /// was the size of the widest general state. Over 100000 groups that was twice the pin's memory.
+    /// arithmetic happens in is the last digit of the answer. It is kept in place rather than
+    /// behind the box [`State::General`] holds, because a grouped `stddev` holds one per group
+    /// and the box was the size of the widest general state. Over 100000 groups that was twice
+    /// the pin's memory.
     Spread { count: u64, mean: f64, squared: f64, measure: Measure },
     /// Any other aggregate, boxed so that the five above stay as narrow as they are.
     General(Box<General>),
