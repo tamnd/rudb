@@ -29,6 +29,10 @@ enum How {
     SumInt,
     /// An `i128` total and an `i64` count.
     AvgInt,
+    /// An `i64` total and a seen byte.
+    SumNarrow,
+    /// An `i64` total and an `i64` count.
+    AvgNarrow,
     /// An `f64` total and a seen byte.
     SumFloat,
     /// An `f64` total and an `i64` count.
@@ -64,6 +68,8 @@ pub(crate) fn folds(g: &Grouping) -> Result<Vec<Fold>> {
             AccOp::CountStar | AccOp::Count => How::Count,
             AccOp::SumInt => How::SumInt,
             AccOp::AvgInt => How::AvgInt,
+            AccOp::SumNarrow => How::SumNarrow,
+            AccOp::AvgNarrow => How::AvgNarrow,
             AccOp::SumFloat => How::SumFloat,
             AccOp::AvgFloat => How::AvgFloat,
             AccOp::Min | AccOp::Max | AccOp::AnyValue => {
@@ -115,6 +121,14 @@ pub(crate) fn fold(folds: &[Fold], dst: &mut [u8], src: &[u8]) {
             How::AvgInt => {
                 put_i128(d, 0, i128_at(d, 0).wrapping_add(i128_at(s, 0)));
                 put_i64(d, 16, i64_at(d, 16).wrapping_add(i64_at(s, 16)));
+            }
+            How::SumNarrow => {
+                put_i64(d, 0, i64_at(d, 0).wrapping_add(i64_at(s, 0)));
+                d[8] |= s[8];
+            }
+            How::AvgNarrow => {
+                put_i64(d, 0, i64_at(d, 0).wrapping_add(i64_at(s, 0)));
+                put_i64(d, 8, i64_at(d, 8).wrapping_add(i64_at(s, 8)));
             }
             // The body only ever adds to a total that starts at zero, so adding a worker's total is
             // the same sum in another order. One with nothing in it is skipped, so that a total of

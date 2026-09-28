@@ -59,12 +59,17 @@ fn catalog() -> Catalog {
         .rows_mut()
         .append_rows(&rows)
         .expect("rows of the table's own types");
-    // `runs` holds its keys in runs, some of them NULL, the way a file sorted on them does.
+    // `runs` holds its keys in runs, some of them NULL, the way a file sorted on them does. Its
+    // `h` spans all of SMALLINT and is NULL in every row whose `k` is 5.
     let runs = QualifiedName::new("memory", "main", "runs");
     catalog
         .create_table(
             runs.clone(),
-            vec![Field::new("k", LogicalType::BigInt), Field::new("j", LogicalType::Integer)],
+            vec![
+                Field::new("k", LogicalType::BigInt),
+                Field::new("j", LogicalType::Integer),
+                Field::new("h", LogicalType::SmallInt),
+            ],
         )
         .expect("a fresh table");
     let rows: Vec<Vec<Value>> = (0..20_000i64)
@@ -72,7 +77,12 @@ fn catalog() -> Catalog {
             let k = if (i / 50) % 5 == 2 { Value::Null } else { Value::BigInt(i / 37 % 90) };
             let j =
                 if (i / 60) % 7 == 4 { Value::Null } else { Value::Integer((i / 100 % 3) as i32) };
-            vec![k, j]
+            let h = if i / 37 % 90 == 5 {
+                Value::Null
+            } else {
+                Value::SmallInt((i * 7919 % 65_536 - 32_768) as i16)
+            };
+            vec![k, j, h]
         })
         .collect();
     catalog
@@ -300,6 +310,14 @@ fn a_grouped_aggregate_over_runs_of_one_key_matches_the_first_engine() {
     let scan = "Get memory.main.runs AS runs #0 [k::BIGINT, j::INTEGER]";
     same(&format!("Aggregate #1 groups=[#0.0::BIGINT] {aggs}\n  {scan}"), false);
     same(&format!("Aggregate #1 groups=[#0.0::BIGINT, #0.1::INTEGER] {aggs}\n  {scan}"), false);
+}
+
+#[test]
+fn a_sum_and_an_average_of_a_smallint_match_the_first_engine() {
+    let aggs = "aggregates=[sum(#0.2::SMALLINT)::HUGEINT, avg(#0.2::SMALLINT)::DOUBLE, count_star()::BIGINT]";
+    let scan = "Get memory.main.runs AS runs #0 [k::BIGINT, j::INTEGER, h::SMALLINT]";
+    same(&format!("Aggregate #1 groups=[#0.0::BIGINT] {aggs}\n  {scan}"), false);
+    same(&format!("Aggregate #1 groups=[] {aggs}\n  {scan}"), true);
 }
 
 #[test]

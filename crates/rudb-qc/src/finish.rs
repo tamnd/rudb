@@ -300,11 +300,16 @@ fn finish(
     Ok(match op {
         AccOp::CountStar | AccOp::Count => Some(cell(&a[..8])),
         AccOp::SumInt => (a[16] != 0).then(|| cell(&a[..16])),
+        AccOp::SumNarrow => (a[8] != 0).then(|| cell(&i128::from(i64_at(0)).to_le_bytes())),
         AccOp::SumFloat => (a[8] != 0).then(|| cell(&a[..8])),
         AccOp::AvgInt => {
             let n = i64_at(16);
             // The first engine's answer: the exact total, then one division in doubles.
             (n != 0).then(|| cell(&(i128_at(0) as f64 / n as f64).to_le_bytes()))
+        }
+        AccOp::AvgNarrow => {
+            let n = i64_at(8);
+            (n != 0).then(|| cell(&(i64_at(0) as f64 / n as f64).to_le_bytes()))
         }
         AccOp::AvgFloat => {
             let n = i64_at(8);
