@@ -276,6 +276,9 @@ enum Shape {
     /// to the integer it is stored as and widens a TINYINT or a FLOAT, while a list of fractions
     /// keeps both.
     Digested,
+    /// `approx_top_k(x, k)`, a list of values of any type with a count that has to cast to a
+    /// BIGINT without a DECIMAL, a DOUBLE or a wider integer in the way.
+    Topped,
     /// `median(x)`, which is [`Shape::Continuous`] over anything that interpolates, an INTERVAL
     /// included, and a value as given over anything else.
     Median,
@@ -1092,6 +1095,7 @@ const TABLE: &[Entry] = &[
     aggregate("quantile_disc", Arity::exactly(2), Shape::Discrete, false),
     aggregate("reservoir_quantile", Arity::between(2, 3), Shape::Sampled, false),
     aggregate("approx_quantile", Arity::exactly(2), Shape::Digested, false),
+    aggregate("approx_top_k", Arity::exactly(2), Shape::Topped, false),
     aggregate("median", Arity::exactly(1), Shape::Median, false),
     aggregate("mad", Arity::exactly(1), Shape::Deviation, false),
     aggregate("mode", Arity::exactly(1), Shape::AsGiven, false),
@@ -1519,6 +1523,21 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         }
         Shape::Sampled => sampled(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
         Shape::Digested => digested(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
+        Shape::Topped => match &arguments[1] {
+            LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::Varchar
+            | LogicalType::Null => (
+                vec![arguments[0].clone(), LogicalType::BigInt],
+                LogicalType::list(arguments[0].clone()),
+            ),
+            _ => return Err(no_match(entry.name, arguments)),
+        },
         Shape::Picked => match arguments {
             [arg, by] => (vec![arg.clone(), by.clone()], arg.clone()),
             [arg, by, _] => {
@@ -3118,6 +3137,7 @@ impl Shape {
             Self::Discrete | Self::Continuous => (leading(1, ANY, "DOUBLE"), ANY),
             Self::Sampled => ([ANY, "DOUBLE", "INTEGER"][..count.min(3)].to_vec(), ANY),
             Self::Digested => (vec![ANY, "FLOAT"], ANY),
+            Self::Topped => (vec![ANY, "BIGINT"], ANY_LIST),
             Self::Median | Self::Deviation => (all(ANY), ANY),
             Self::Picked => (leading(2, ANY, "BIGINT"), ANY),
             Self::Histogram => (leading(1, ANY, ANY_LIST), "MAP"),
@@ -3676,6 +3696,7 @@ mod tests {
                         arguments = vec![LogicalType::Double; count];
                     }
                     Shape::Digested => arguments = vec![LogicalType::Double, LogicalType::Float],
+                    Shape::Topped => arguments = vec![LogicalType::Double, LogicalType::BigInt],
                     Shape::Sampled => {
                         arguments = vec![LogicalType::Double; count];
                         if count == 3 {

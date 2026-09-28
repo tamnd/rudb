@@ -92,6 +92,7 @@ mod structs;
 mod subscript;
 mod tally;
 mod text;
+mod topk;
 
 pub use aggregate::{
     Accumulator, NOWHERE, finish_run, group_tally, ordered_name, settle_extremes, update_general,

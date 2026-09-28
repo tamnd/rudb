@@ -3369,6 +3369,9 @@ impl<'a> Binder<'a> {
         if resolved.name == "reservoir_quantile" {
             self.reservoir_arguments(&bound)?;
         }
+        if resolved.name == "approx_top_k" {
+            self.top_k_argument(&bound)?;
+        }
         let mut cast = Vec::with_capacity(bound.len());
         for (arg, wanted) in bound.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
@@ -3455,6 +3458,18 @@ impl<'a> Binder<'a> {
             one => negated(&one),
         };
         Ok(self.add_constant(negated))
+    }
+
+    /// Refuses an `approx_top_k` whose `k` is not a constant, over a group or over a window.
+    ///
+    /// The pin names the argument `col1` whatever it was written as, and the sentence is its own.
+    fn top_k_argument(&self, bound: &[ExprRef]) -> Result<()> {
+        if matches!(fold::value_of(&self.plan, bound[1]), Ok(Some(_))) {
+            return Ok(());
+        }
+        Err(Error::binder(
+            "The \"col1\" argument in function \"approx_top_k\" must be a constant expression",
+        ))
     }
 
     /// Checks the fraction and the sample size of a `reservoir_quantile` call the way the pin does,
@@ -3707,6 +3722,9 @@ impl<'a> Binder<'a> {
                     resolved.name
                 )));
             }
+        }
+        if resolved.name == "approx_top_k" {
+            self.top_k_argument(&parts.args)?;
         }
         let mut cast = Vec::with_capacity(parts.args.len());
         for (arg, wanted) in parts.args.iter().zip(&resolved.arguments) {
