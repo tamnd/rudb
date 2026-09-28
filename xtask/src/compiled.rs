@@ -36,6 +36,11 @@ const FIXUP: &str = "* REPLACE (make_date(EventDate) AS EventDate, epoch_ms(Even
                      epoch_ms(LocalEventTime * 1000) AS LocalEventTime)";
 
 pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
+    // The compile times this prints are the C3 numbers, and a debug build of the compiler is about
+    // four times slower than the one a release ships, so the task always measures the bench build.
+    if cfg!(debug_assertions) {
+        return crate::timing::rebuild(root, "compiled", args);
+    }
     let usage = || {
         "usage: cargo xtask compiled [--threads <n>] [--repeat <n>] [--set <name>=<value>]... [--tier auto|interp|clif|direct | --tiers <seed>] \
          <file.parquet> [q1 q2 ...]\n       \
