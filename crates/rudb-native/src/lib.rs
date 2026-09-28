@@ -12865,7 +12865,7 @@ fn decode_at(
         // Past the codec, the validity flag and the mask a flag of 2 has.
         && bytes
             .get(2 + if bytes.get(1) == Some(&2) { rows.div_ceil(8) } else { 0 }..)
-            .is_some_and(integer::pointed)
+            .is_some_and(|body| integer::pointed(body) || integer::run_length(body))
     {
         return cascade_at(ty, rows, bytes, positions);
     }

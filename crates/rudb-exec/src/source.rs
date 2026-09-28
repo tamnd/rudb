@@ -30,7 +30,7 @@ use rudb_pipeline::{Compaction, Gauge, Morsel, Progress, Source, narrow};
 use rudb_plan::{ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 use rudb_seam::{Context, SeamId, Settings};
 use rudb_storage::Probe;
-use rudb_vector::{Chunk, Data, Selection, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, Data, Form, Selection, VECTOR_SIZE, Vector};
 
 use crate::cutoff::Cutoff;
 use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
@@ -472,6 +472,10 @@ pub(crate) struct Scan<'a> {
     /// which are read that way instead once a join's bitmap or filter is measured keeping few rows.
     /// See [`Paying::tight`].
     deferrable: Vec<usize>,
+    /// The columns of [`Self::deferrable`] a whole read decoded flat, which is what they cost read
+    /// whole. Learned from the first part read whole, since a column that comes out packed or as
+    /// codes costs next to nothing to read whole and more to read a second time at the kept rows.
+    expanding: OnceLock<Vec<usize>>,
     /// What the filters kept of the parts read that way, which stops the deferring once they are
     /// measured keeping most rows, since then the string columns are read nearly whole anyway and
     /// the second read is a cost with nothing to show for it.
@@ -1090,6 +1094,7 @@ impl<'a> Scan<'a> {
             counters: None,
             deferred,
             deferrable,
+            expanding: OnceLock::new(),
             deferring: Paying::default(),
             unread,
             paying: Paying::default(),
@@ -1495,11 +1500,24 @@ impl<'a> Scan<'a> {
             keys.extend(sideways.sifting(self.index).map(|(key, _)| key));
             tight |= keys.len() > before && paying.tight();
         }
+        // A pushed filter that keeps few rows pays for the other columns a whole read decodes, which
+        // on TPC-H q12 is the order key kept as runs of deltas and decoded whole for the half a
+        // percent of lineitem the dates and the ship mode keep.
+        let expanding = (!tight && self.pushed.is_some() && self.passed.tight())
+            .then(|| self.expanding.get())
+            .flatten();
         let wide = if tight { &self.deferrable } else { &self.deferred };
-        if wide.is_empty() || (self.pushed.is_none() && keys.is_empty()) {
+        if (wide.is_empty() && expanding.is_none_or(Vec::is_empty))
+            || (self.pushed.is_none() && keys.is_empty())
+        {
             return Ok(false);
         }
-        let deferred: Vec<usize> = wide.iter().copied().filter(|at| !keys.contains(at)).collect();
+        let deferred: Vec<usize> = wide
+            .iter()
+            .chain(expanding.into_iter().flatten())
+            .copied()
+            .filter(|at| !keys.contains(at))
+            .collect();
         let first: Vec<usize> = (0..self.columns.len())
             .filter(|at| !deferred.contains(at))
             .filter_map(|at| self.columns[at])
@@ -2169,6 +2187,17 @@ impl Source for Scan<'_> {
         }
         let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
         let read = self.table.rows().read(at, &projected)?;
+        if !self.deferrable.is_empty() && self.expanding.get().is_none() {
+            let real = |place: usize| self.columns[..place].iter().flatten().count();
+            let flat = self
+                .deferrable
+                .iter()
+                .copied()
+                .filter(|&place| !self.deferred.contains(&place))
+                .filter(|&place| read.column(real(place)).is_ok_and(|v| v.form() == Form::Flat))
+                .collect();
+            let _ = self.expanding.set(flat);
+        }
         if self.columns.iter().all(Option::is_some) {
             *out = read;
             self.narrow_read(at, out, true)?;
@@ -4199,6 +4228,7 @@ mod tests {
             counters: None,
             deferred: Vec::new(),
             deferrable: Vec::new(),
+            expanding: OnceLock::new(),
             deferring: Paying::default(),
             unread: Vec::new(),
             paying: Paying::default(),
