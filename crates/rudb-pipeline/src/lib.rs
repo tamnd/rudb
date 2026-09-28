@@ -81,6 +81,7 @@
 
 mod compact;
 mod dynamic;
+mod hold;
 mod morsel;
 mod pages;
 mod parallel;

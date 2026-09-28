@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rudb_common::{Cancel, Error, Result};
 use rudb_vector::Chunk;
 
+use crate::hold::Held;
 use crate::morsel::Morsel;
 use crate::pipeline::{Locals, Pipeline};
 use crate::pool::Lease;
@@ -73,8 +74,14 @@ pub(crate) fn instance(
     locals: &mut Locals,
 ) -> Result<()> {
     let mut chunk = Chunk::empty(&[]);
+    let keeps = pipeline.sink().keeps_order();
 
     'morsels: while let Some(mut morsel) = taken(pipeline, stop) {
+        // The rows held back from the morsel before, while the sink still counts them as its.
+        if keeps && released(pipeline, locals)? == Progress::Done {
+            stop.ask();
+            break;
+        }
         // Before the first read of it rather than after the last, because a sink that puts chunks
         // back in the order the morsels were cut has to know where a chunk came from at the moment
         // it arrives, not once the morsel it came from is finished with.
@@ -97,6 +104,11 @@ pub(crate) fn instance(
         }
     }
 
+    // After a stop as well, since what is held below the operator that had enough is still owed
+    // to the ones there.
+    if released(pipeline, locals)? == Progress::Done {
+        stop.ask();
+    }
     Ok(())
 }
 
@@ -109,12 +121,31 @@ pub(crate) fn instance(
 /// `start` is where to begin, and it is not always zero. A chunk that came out of a drain enters
 /// the pipeline below the operator that drained it rather than at the top, because the operators
 /// above that one have already seen everything they were going to see.
+///
+/// A chunk too sparse to be worth a push of its own is held in front of the operator it reached
+/// and goes on with the ones held after it, which is what `hold` is about. It is taken out of
+/// `chunk`, so the caller is left an empty one either way.
 pub(crate) fn through(
     pipeline: &Pipeline<'_>,
     start: usize,
     chunk: &mut Chunk,
     locals: &mut Locals,
 ) -> Result<Progress> {
+    pushed(pipeline, start, None, chunk, locals)
+}
+
+/// [`through`], with the boundary a held chunk is being let go from.
+///
+/// That one does not hold what it lets go, or a merge that still came out sparse would go round
+/// for ever.
+fn pushed(
+    pipeline: &Pipeline<'_>,
+    start: usize,
+    mut open: Option<usize>,
+    chunk: &mut Chunk,
+    locals: &mut Locals,
+) -> Result<Progress> {
+    let streams = pipeline.streams();
     let mut finished = false;
     // The operators that have more output in the chunk they were already given, which is a cross
     // product and nothing else today. Each one is asked again only after the chunk it produced has
@@ -123,12 +154,32 @@ pub(crate) fn through(
     let mut again: Vec<usize> = Vec::new();
     let mut from = start;
     loop {
-        for (at, (stream, local)) in
-            pipeline.streams().iter().zip(&mut locals.streams).enumerate().skip(from)
-        {
-            match stream.push_state(chunk, local)? {
+        for at in from..=streams.len() {
+            if open != Some(at) {
+                // Only with nothing above owed another look, because an operator asked again reads
+                // the chunk it produced last time and has to find it where it left it.
+                if again.is_empty() && at >= locals.holds_from && Held::wants(chunk) {
+                    let Some(full) = locals.held[at].take(chunk)? else {
+                        return Ok(settled(finished));
+                    };
+                    let progress = let_go(pipeline, at, full, locals)?;
+                    return Ok(settled(finished || progress == Progress::Done));
+                }
+                // Anything held here arrived first, so it goes first.
+                if !locals.held[at].is_empty() {
+                    let before = locals.held[at].out()?;
+                    if let_go(pipeline, at, before, locals)? == Progress::Done {
+                        return Ok(Progress::Done);
+                    }
+                }
+            }
+            let Some(stream) = streams.get(at) else { break };
+            match stream.push_state(chunk, &mut locals.streams[at])? {
                 Progress::Blocked(blocked) => return Err(parked(pipeline, blocked)),
-                Progress::Done => finished = true,
+                Progress::Done => {
+                    finished = true;
+                    forget(locals, at);
+                }
                 Progress::Again => again.push(at),
                 Progress::More => {}
             }
@@ -143,7 +194,10 @@ pub(crate) fn through(
         };
         match sunk {
             Progress::Blocked(blocked) => return Err(parked(pipeline, blocked)),
-            Progress::Done => finished = true,
+            Progress::Done => {
+                finished = true;
+                forget(locals, streams.len());
+            }
             // A sink produces nothing, so there is nothing for it to have more of.
             Progress::More | Progress::Again => {}
         }
@@ -152,11 +206,62 @@ pub(crate) fn through(
         // above it have already seen what it produced. Going the other way round would hand them a
         // second chunk built from an input they were half way through.
         match again.pop() {
-            Some(at) if !finished => from = at,
+            Some(at) if !finished => {
+                // What it is asked again with is not a chunk arriving there, so it is not held and
+                // nothing held there gets in ahead of it.
+                from = at;
+                open = Some(at);
+            }
             _ => break,
         }
     }
-    Ok(if finished { Progress::Done } else { Progress::More })
+    Ok(settled(finished))
+}
+
+/// What a push that may have been told to stop answers.
+fn settled(finished: bool) -> Progress {
+    if finished { Progress::Done } else { Progress::More }
+}
+
+/// Push chunks let go from the boundary `at` on from there, stopping when told to.
+///
+/// Whoever said stop is at `at` or below it, so the chunks not pushed yet were headed for it.
+fn let_go(
+    pipeline: &Pipeline<'_>,
+    at: usize,
+    chunks: Vec<Chunk>,
+    locals: &mut Locals,
+) -> Result<Progress> {
+    for mut chunk in chunks {
+        if pushed(pipeline, at, Some(at), &mut chunk, locals)? == Progress::Done {
+            return Ok(Progress::Done);
+        }
+    }
+    Ok(Progress::More)
+}
+
+/// Push on everything held, from the top down.
+///
+/// Every boundary gets its turn even after somebody says stop, because rows held below the one
+/// that said it already went through it and are owed to what is below. The ones above it were
+/// dropped when it said so.
+fn released(pipeline: &Pipeline<'_>, locals: &mut Locals) -> Result<Progress> {
+    let mut finished = false;
+    for at in 0..locals.held.len() {
+        if locals.held[at].is_empty() {
+            continue;
+        }
+        let chunks = locals.held[at].out()?;
+        finished |= let_go(pipeline, at, chunks, locals)? == Progress::Done;
+    }
+    Ok(settled(finished))
+}
+
+/// Drop what is held for the operator at `at` or above it, which has said it wants no more.
+fn forget(locals: &mut Locals, at: usize) {
+    for held in &mut locals.held[..=at] {
+        *held = Held::default();
+    }
 }
 
 /// Take from every operator that owes chunks, once every instance has finished reading.
@@ -193,6 +298,8 @@ pub(crate) fn drain(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
             cancel.check()?;
             through(pipeline, at + 1, chunk, taking)
         })?;
+        // Before the next operator drains, since what it drains comes after what this one did.
+        released(pipeline, &mut locals)?;
     }
     pipeline.sink().combine_state(locals.sink)
 }

@@ -84,6 +84,9 @@ pub trait DynStream: Send + Sync + fmt::Debug {
     /// Whether this operator owes chunks once every instance has finished reading.
     fn drains_once(&self) -> bool;
 
+    /// Whether the typed operator can stop early. See [`Stream::stops_early`].
+    fn may_stop(&self) -> bool;
+
     /// The chunks this operator owes, once every instance has finished reading.
     ///
     /// # Errors
@@ -114,6 +117,10 @@ impl<S: Stream> DynStream for S {
 
     fn prepare_once(&self, threads: &Lease<'_>) -> Result<()> {
         self.prepare(threads)
+    }
+
+    fn may_stop(&self) -> bool {
+        self.stops_early()
     }
 
     fn drains_once(&self) -> bool {
@@ -154,6 +161,12 @@ pub trait DynSink: Send + Sync + fmt::Debug {
     ///
     /// Whatever the typed operator reports, plus an internal error if the state is the wrong one.
     fn at_state(&self, morsel: &Morsel, local: &mut LocalState) -> Result<()>;
+
+    /// Whether rows have to arrive under their own morsel. See [`Sink::keeps_morsels`].
+    fn keeps_order(&self) -> bool;
+
+    /// Whether the typed operator can stop early. See [`Sink::stops_early`].
+    fn may_stop(&self) -> bool;
 
     /// Take one chunk into the local state.
     ///
@@ -209,6 +222,14 @@ impl<S: Sink> DynSink for S {
 
     fn at_state(&self, morsel: &Morsel, local: &mut LocalState) -> Result<()> {
         self.at(morsel, local.downcast_mut::<S::Local>()?)
+    }
+
+    fn keeps_order(&self) -> bool {
+        self.keeps_morsels()
+    }
+
+    fn may_stop(&self) -> bool {
+        self.stops_early()
     }
 
     fn sink_state(&self, chunk: &Chunk, local: &mut LocalState) -> Result<Progress> {

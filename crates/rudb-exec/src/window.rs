@@ -541,6 +541,10 @@ impl Sink for Window {
         Ok(())
     }
 
+    fn keeps_morsels(&self) -> bool {
+        true
+    }
+
     fn sink(&self, chunk: &Chunk, local: &mut Gathered) -> Result<Progress> {
         let mut gathered = Vec::new();
         self.values.evaluate(chunk, &mut local.scratch, &mut gathered)?;

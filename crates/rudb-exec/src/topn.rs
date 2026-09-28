@@ -587,6 +587,10 @@ impl Sink for TopN {
         Ok(())
     }
 
+    fn keeps_morsels(&self) -> bool {
+        true
+    }
+
     fn sink(&self, chunk: &Chunk, local: &mut Running) -> Result<Progress> {
         let mut keys = Vec::with_capacity(self.keys.len());
         self.exprs.evaluate(chunk, &mut local.scratch, &mut keys)?;

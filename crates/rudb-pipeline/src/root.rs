@@ -247,6 +247,10 @@ impl Sink for RootSink {
         Ok(())
     }
 
+    fn keeps_morsels(&self) -> bool {
+        self.shared.ordered
+    }
+
     fn sink(&self, chunk: &Chunk, place: &mut RootPlace) -> Result<Progress> {
         if chunk.is_empty() {
             return Ok(Progress::More);
