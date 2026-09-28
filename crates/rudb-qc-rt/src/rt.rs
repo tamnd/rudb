@@ -345,6 +345,14 @@ impl Rt {
         }
     }
 
+    /// The distinct sets behind a handle, to change.
+    pub fn distinct_mut(&mut self, handle: u64) -> Option<&mut Distinct> {
+        match self.objects.get_mut(handle as usize) {
+            Some(Object::Distinct(d)) => Some(d),
+            _ => None,
+        }
+    }
+
     /// Keeps `bytes` in the runtime heap for as long as the query runs.
     pub fn keep(&mut self, bytes: &[u8]) -> u128 {
         self.heap.keep(bytes)

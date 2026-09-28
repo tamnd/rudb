@@ -827,10 +827,14 @@ pub fn read_u128(b: &[u8]) -> u128 {
 /// The distinct values of one `COUNT(DISTINCT x)`, per group.
 ///
 /// Every group shares one open addressing table of (group, value) pairs, so a new group costs
-/// nothing and a lookup is one probe sequence over a flat array. A string is copied into an arena
-/// the set owns, and an entry keeps where it is.
+/// nothing and a lookup is one probe sequence over a flat array. A number that fits in 64 bits is
+/// kept in the slot itself, so a lookup touches one line. A wider one, or a string, is kept in an
+/// entry the slot points at. A string is copied into an arena the set owns, and an entry keeps
+/// where it is.
 #[derive(Debug, Default)]
 pub struct Distinct {
+    narrow: Narrow,
+    spill: Option<Spill>,
     ints: Pairs,
     texts: Pairs,
     arena: Vec<u8>,
@@ -843,6 +847,191 @@ pub struct Distinct {
 struct Pairs {
     slots: Vec<u64>,
     entries: Vec<Pair>,
+}
+
+/// Pairs of a group and a number that fits in 64 bits. A slot holds the number and one more than
+/// the group, and is empty when that is zero. The table is at most half full, because a number
+/// has no tag to tell a slot apart by before it is compared.
+#[derive(Debug, Default)]
+struct Narrow {
+    slots: Vec<[u64; 2]>,
+    len: usize,
+}
+
+impl Narrow {
+    /// A table with room for `n` pairs.
+    fn with_room(n: usize) -> Narrow {
+        Narrow { slots: vec![[0; 2]; (n * 2).next_power_of_two().max(64)], len: 0 }
+    }
+
+    /// Adds the pair of group `gid` and number `v`, whose hash is `hash`, and says whether it
+    /// is new.
+    fn add(&mut self, gid: u64, v: u64, hash: u64) -> bool {
+        if (self.len + 1) * 2 > self.slots.len() {
+            self.grow();
+        }
+        let mask = self.slots.len() - 1;
+        let pair = [v, gid + 1];
+        let mut at = hash as usize & mask;
+        loop {
+            let slot = self.slots[at];
+            if slot[1] == 0 {
+                self.slots[at] = pair;
+                self.len += 1;
+                return true;
+            }
+            if slot == pair {
+                return false;
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let size = (self.slots.len() * 2).max(64);
+        let old = std::mem::replace(&mut self.slots, vec![[0; 2]; size]);
+        let mask = size - 1;
+        for pair in old.into_iter().filter(|p| p[1] != 0) {
+            let mut at = narrow_hash(pair[1] - 1, pair[0]) as usize & mask;
+            while self.slots[at][1] != 0 {
+                at = (at + 1) & mask;
+            }
+            self.slots[at] = pair;
+        }
+    }
+
+    /// Every pair, as the group and the number.
+    fn pairs(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.slots.iter().filter(|p| p[1] != 0).map(|p| (p[1] - 1, p[0]))
+    }
+}
+
+/// A set to gather one part of: the set, how its groups are renamed, and its pairs and picks of
+/// the part from [`Distinct::split`].
+pub type SetPart<'a> = (&'a Distinct, &'a [usize], &'a [[u64; 2]], &'a [u32]);
+
+/// One set's pairs split into parts by [`Distinct::split`].
+#[derive(Debug)]
+pub struct Split {
+    /// The numbers that fit in 64 bits of each part, as the number and the renamed group.
+    pub pairs: Vec<Vec<[u64; 2]>>,
+    /// Where the other values of each part are in the set.
+    pub picks: Vec<Vec<u32>>,
+}
+
+/// Pairs of a group and a number that fits in 64 bits, kept as they come instead of looked up,
+/// for a worker's sets that only the merge counts. Looking a pair up in a table as big as all of
+/// a worker's pairs misses the cache on almost every row, where adding it to the end does not,
+/// and the merge splits the pairs into parts small enough to find the repeats in the cache.
+///
+/// A pair the same as the last one in its slot of `recent` is left out, which catches most of
+/// the repeats of a set with few values. When the pairs get to `squeeze` they are split the same
+/// way and the repeats taken out, so a set of many repeats that `recent` misses does not grow
+/// without end.
+#[derive(Debug)]
+struct Spill {
+    pairs: Vec<[u64; 2]>,
+    recent: Vec<[u64; 2]>,
+    squeeze: usize,
+}
+
+/// The slots of [`Spill::recent`].
+const RECENT: usize = 1 << 10;
+
+/// The fewest pairs a spill takes the repeats out of.
+const SQUEEZE: usize = 1 << 20;
+
+impl Spill {
+    fn new() -> Spill {
+        Spill { pairs: Vec::new(), recent: vec![[0; 2]; RECENT], squeeze: SQUEEZE }
+    }
+
+    fn add(&mut self, gid: u64, v: u64, hash: u64) {
+        let pair = [v, gid + 1];
+        let last = &mut self.recent[hash as usize & (RECENT - 1)];
+        if *last == pair {
+            return;
+        }
+        *last = pair;
+        self.pairs.push([v, gid]);
+        if self.pairs.len() >= self.squeeze {
+            self.squeeze();
+        }
+    }
+
+    fn squeeze(&mut self) {
+        const BITS: u32 = 8;
+        let mut parts = vec![Vec::new(); 1 << BITS];
+        for &[v, gid] in &self.pairs {
+            parts[(narrow_hash(gid, v) >> (64 - BITS)) as usize].push([v, gid]);
+        }
+        self.pairs.clear();
+        for part in parts {
+            let mut seen = Narrow::with_room(part.len());
+            self.pairs
+                .extend(part.into_iter().filter(|&[v, gid]| seen.add(gid, v, narrow_hash(gid, v))));
+        }
+        self.squeeze = (self.pairs.len() * 2).max(SQUEEZE);
+    }
+}
+
+/// One part's new pairs per group, on their way to the counts every part adds to.
+///
+/// With few groups every part adds to the same few counts, and the threads would take their lines
+/// from each other on almost every pair, so a part counts its own and adds them at the end. With
+/// many, the pairs of one group tend to come together, so a run of them is added at once.
+enum Tally {
+    Own { counts: Vec<u64>, seen: Vec<u32> },
+    Run(u64, u64),
+}
+
+/// The most groups a part counts on its own.
+const OWN_GROUPS: usize = 1 << 16;
+
+impl Tally {
+    fn new(groups: usize) -> Tally {
+        if groups <= OWN_GROUPS {
+            Tally::Own { counts: vec![0; groups], seen: Vec::new() }
+        } else {
+            Tally::Run(u64::MAX, 0)
+        }
+    }
+
+    fn add(&mut self, gid: u64, to: &[AtomicU64]) {
+        match self {
+            Tally::Own { counts, seen } => {
+                let n = &mut counts[gid as usize];
+                if *n == 0 {
+                    seen.push(gid as u32);
+                }
+                *n += 1;
+            }
+            Tally::Run(run, n) => {
+                if *run != gid {
+                    if *n != 0 {
+                        to[*run as usize].fetch_add(*n, Relaxed);
+                    }
+                    (*run, *n) = (gid, 0);
+                }
+                *n += 1;
+            }
+        }
+    }
+
+    fn add_to(self, to: &[AtomicU64]) {
+        match self {
+            Tally::Own { counts, seen } => {
+                for gid in seen {
+                    to[gid as usize].fetch_add(counts[gid as usize], Relaxed);
+                }
+            }
+            Tally::Run(run, n) => {
+                if n != 0 {
+                    to[run as usize].fetch_add(n, Relaxed);
+                }
+            }
+        }
+    }
 }
 
 /// A group and a value. A string's value is where its bytes are in the arena, the offset in the
@@ -863,6 +1052,17 @@ fn mix(h: u64) -> u64 {
 
 fn int_hash(gid: u64, v: u128) -> u64 {
     mix(gid.wrapping_mul(MIX) ^ (v as u64) ^ ((v >> 64) as u64).rotate_left(23))
+}
+
+fn narrow_hash(gid: u64, v: u64) -> u64 {
+    mix(gid.wrapping_mul(MIX) ^ v)
+}
+
+/// The number `v` as 64 bits, if it is a sign extended `i64`, which is how compiled code passes
+/// every signed number up to that wide.
+fn narrow(v: u128) -> Option<u64> {
+    let x = v as u64;
+    (x as i64 as i128 as u128 == v).then_some(x)
 }
 
 fn text_hash(gid: u64, bytes: &[u8]) -> u64 {
@@ -931,6 +1131,19 @@ impl Distinct {
         Distinct::default()
     }
 
+    /// Keeps the numbers that fit in 64 bits as they come from here on, for a set whose count
+    /// only [`gather`](Distinct::gather) reads. [`count`](Distinct::count) does not see them.
+    pub fn spill(&mut self) {
+        self.spill.get_or_insert_with(Spill::new);
+    }
+
+    /// How many pairs the sets hold, some of them the same when they spill.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        let spilled = self.spill.as_ref().map_or(0, |s| s.pairs.len());
+        self.narrow.len + spilled + self.ints.entries.len() + self.texts.entries.len()
+    }
+
     fn counted(&mut self, gid: u64) {
         let gid = gid as usize;
         if self.counts.len() <= gid {
@@ -942,6 +1155,15 @@ impl Distinct {
     /// Adds a number to the set of group `gid`.
     pub fn add_int(&mut self, gid: usize, v: u128) {
         let gid = gid as u64;
+        if let Some(x) = narrow(v) {
+            let hash = narrow_hash(gid, x);
+            if let Some(spill) = &mut self.spill {
+                spill.add(gid, x, hash);
+            } else if self.narrow.add(gid, x, hash) {
+                self.counted(gid);
+            }
+            return;
+        }
         self.ints.reserve();
         let hash = int_hash(gid, v);
         if let Err(at) = self.ints.find(hash, |p| p.gid == gid && p.value == v) {
@@ -977,6 +1199,12 @@ impl Distinct {
     /// Folds the sets of `other` into these, the sets of its group `g` into those of `map[g]`.
     pub fn absorb(&mut self, other: Distinct, map: &[usize]) {
         let to = |gid: u64| map.get(gid as usize).map(|&g| g as u64);
+        let spilled = other.spill.iter().flat_map(|s| s.pairs.iter().map(|&[v, gid]| (gid, v)));
+        for (gid, v) in other.narrow.pairs().chain(spilled) {
+            if let Some(gid) = to(gid) {
+                self.add_int(gid as usize, v as i64 as i128 as u128);
+            }
+        }
         for p in &other.ints.entries {
             if let Some(gid) = to(p.gid) {
                 self.add_int(gid as usize, p.value);
@@ -994,49 +1222,67 @@ impl Distinct {
 
     /// The pairs of these sets split into `1 << bits` parts by the hash of the value and the group
     /// `map` renames its group to, so that two sets split the same way put an equal pair in the
-    /// same part. A number is named by where it is in the sets and a string by that plus the
-    /// count of numbers, and a pair of a group `map` drops is left out.
+    /// same part, and a pair of a group `map` drops is left out. A number that fits in 64 bits is
+    /// copied into its part with its new group, as the number and the group. Any other value is
+    /// named by where it is in the sets, a number by its place and a string by that plus the
+    /// count of numbers.
     #[must_use]
-    pub fn split(&self, map: &[usize], bits: u32) -> Vec<Vec<u32>> {
-        let mut parts = vec![Vec::new(); 1 << bits];
+    pub fn split(&self, map: &[usize], bits: u32) -> Split {
+        let mut split =
+            Split { pairs: vec![Vec::new(); 1 << bits], picks: vec![Vec::new(); 1 << bits] };
         let shift = 64 - bits;
         let part = |hash: u64| if bits == 0 { 0 } else { (hash >> shift) as usize };
+        let spilled = self.spill.iter().flat_map(|s| s.pairs.iter().map(|&[v, gid]| (gid, v)));
+        for (gid, v) in self.narrow.pairs().chain(spilled) {
+            if let Some(&gid) = map.get(gid as usize) {
+                let gid = gid as u64;
+                split.pairs[part(narrow_hash(gid, v))].push([v, gid]);
+            }
+        }
         for (i, p) in self.ints.entries.iter().enumerate() {
             if let Some(&gid) = map.get(p.gid as usize) {
-                parts[part(int_hash(gid as u64, p.value))].push(i as u32);
+                split.picks[part(int_hash(gid as u64, p.value))].push(i as u32);
             }
         }
         let ints = self.ints.entries.len();
         for (i, p) in self.texts.entries.iter().enumerate() {
             if let Some(&gid) = map.get(p.gid as usize) {
                 let hash = text_hash(gid as u64, Self::bytes(&self.arena, p.value));
-                parts[part(hash)].push((ints + i) as u32);
+                split.picks[part(hash)].push((ints + i) as u32);
             }
         }
-        parts
+        split
     }
 
-    /// Counts the distinct pairs of one part: `picks` of each set, with its groups renamed by
-    /// `map`, as [`split`](Distinct::split) named and renamed them. Each new pair adds one to the
-    /// count of its group in `counts`, which the parts share.
-    pub fn gather(sources: &[(&Distinct, &[usize], &[u32])], counts: &[AtomicU64]) {
-        let most = sources.iter().map(|(_, _, picks)| picks.len()).sum::<usize>();
+    /// Counts the distinct pairs of one part: the pairs and `picks` of each set, with its groups
+    /// renamed by `map`, as [`split`](Distinct::split) named and renamed them. Each new pair adds
+    /// one to the count of its group in `counts`, which the parts share.
+    pub fn gather(sources: &[SetPart<'_>], counts: &[AtomicU64]) {
+        let most = sources.iter().map(|(_, _, _, picks)| picks.len()).sum::<usize>();
         let mut pairs = Pairs {
             slots: vec![0; (most * 8 / 7 + 1).next_power_of_two().max(64)],
             entries: Vec::with_capacity(most),
         };
-        // Pairs of one group tend to come together, so their count is added once for the run.
-        let mut run = (u64::MAX, 0u64);
-        let mut add = |gid: u64| {
-            if run.0 != gid {
-                if run.1 != 0 {
-                    counts[run.0 as usize].fetch_add(run.1, Relaxed);
+        let narrow = sources.iter().map(|(_, _, pairs, _)| pairs.len()).sum::<usize>();
+        let mut seen = Narrow::with_room(narrow);
+        let mut tally = Tally::new(counts.len());
+        let mut add = |gid: u64| tally.add(gid, counts);
+        for &(_, _, given, _) in sources {
+            // The slot of the pair a few ahead is asked for early, since the pairs come in no
+            // order of their slots.
+            const AHEAD: usize = 8;
+            let mask = seen.slots.len() - 1;
+            for (i, &[v, gid]) in given.iter().enumerate() {
+                if let Some(&[w, g]) = given.get(i + AHEAD) {
+                    let at = narrow_hash(g, w) as usize & mask;
+                    prefetch(std::ptr::from_ref(&seen.slots[at]).addr());
                 }
-                run = (gid, 0);
+                if seen.add(gid, v, narrow_hash(gid, v)) {
+                    add(gid);
+                }
             }
-            run.1 += 1;
-        };
-        for (at, &(set, map, picks)) in sources.iter().enumerate() {
+        }
+        for (at, &(set, map, _, picks)) in sources.iter().enumerate() {
             let ints = set.ints.entries.len();
             for &pick in picks {
                 let pick = pick as usize;
@@ -1068,9 +1314,7 @@ impl Distinct {
                 }
             }
         }
-        if run.1 != 0 {
-            counts[run.0 as usize].fetch_add(run.1, Relaxed);
-        }
+        tally.add_to(counts);
     }
 
     /// Sets that know only how many distinct values each group saw, which is all a merged set
@@ -1348,5 +1592,49 @@ mod tests {
     fn a_scalar_table_has_its_group_before_any_row() {
         let t = GroupTable::new(Layout { init: vec![0; 16], ..Layout::default() });
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn spilled_sets_count_what_a_set_of_every_pair_counts() {
+        // Numbers that repeat far apart, so that `recent` misses them, some that do not fit in 64
+        // bits, and more pairs than a spill keeps before it squeezes them.
+        let value = |i: u64| {
+            if i % 1000 == 7 {
+                u128::MAX - u128::from(i % 5)
+            } else {
+                ((i * 7919 % 50_000) as i64 - 25_000) as i128 as u128
+            }
+        };
+        // The second worker has its groups in the other order.
+        let maps = [vec![0, 1, 2], vec![2, 1, 0]];
+        let mut want = std::collections::HashSet::new();
+        let mut sets = [Distinct::new(), Distinct::new()];
+        for (w, set) in sets.iter_mut().enumerate() {
+            set.spill();
+            for i in 0..SQUEEZE as u64 + 5000 {
+                let (gid, v) = ((i % 3) as usize, value(i + w as u64 * 3));
+                set.add_int(gid, v);
+                want.insert((maps[w][gid], v));
+            }
+        }
+        assert!(sets[0].held() < SQUEEZE, "the squeeze took the repeats out");
+        let bits = 4;
+        let splits: Vec<Split> = sets.iter().zip(&maps).map(|(d, m)| d.split(m, bits)).collect();
+        let counts: Vec<AtomicU64> = (0..3).map(|_| AtomicU64::new(0)).collect();
+        for part in 0..1 << bits {
+            let sources: Vec<SetPart<'_>> = sets
+                .iter()
+                .zip(&maps)
+                .zip(&splits)
+                .map(|((d, m), s)| {
+                    (d, m.as_slice(), s.pairs[part].as_slice(), s.picks[part].as_slice())
+                })
+                .collect();
+            Distinct::gather(&sources, &counts);
+        }
+        let got: Vec<u64> = counts.iter().map(|c| c.load(Relaxed)).collect();
+        let want: Vec<u64> =
+            (0..3).map(|g| want.iter().filter(|&&(gid, _)| gid == g).count() as u64).collect();
+        assert_eq!(got, want);
     }
 }

@@ -360,6 +360,26 @@ fn a_count_distinct_matches_the_first_engine() {
 }
 
 #[test]
+fn a_count_distinct_over_many_values_and_many_groups_matches_the_first_engine() {
+    let wide = "Get memory.main.wide AS wide #0 [k::BIGINT, j::INTEGER]";
+    let runs = "Get memory.main.runs AS runs #0 [k::BIGINT, j::INTEGER, h::SMALLINT]";
+    for (groups, arg, scan) in [
+        ("", "#0.0::BIGINT", wide),
+        ("#0.1::INTEGER", "#0.0::BIGINT", wide),
+        ("#0.0::BIGINT", "#0.1::INTEGER", wide),
+        ("", "#0.2::SMALLINT", runs),
+        ("#0.1::INTEGER", "#0.2::SMALLINT", runs),
+    ] {
+        same(
+            &format!(
+                "Aggregate #1 groups=[{groups}] aggregates=[count(DISTINCT {arg})::BIGINT, count_star()::BIGINT]\n  {scan}"
+            ),
+            false,
+        );
+    }
+}
+
+#[test]
 fn a_top_n_over_groups_matches_the_first_engine_in_order() {
     same(
         &format!(
