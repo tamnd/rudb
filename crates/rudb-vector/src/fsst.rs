@@ -121,6 +121,8 @@ fn mask_of(len: usize) -> u64 {
 pub struct SymbolTable {
     /// Code to symbol. At most [`MAX_SYMBOLS`] long.
     symbols: Vec<Symbol>,
+    /// Every code's bytes and length, see [`Decode`].
+    decode: Box<Decode>,
     /// What compressing looks symbols up in, built the first time something is compressed.
     ///
     /// Decompressing only ever reads `symbols`, and a table read back from a file is almost always
@@ -128,6 +130,33 @@ pub struct SymbolTable {
     /// pair slots and sorted the symbols for every block of a text column a scan decoded, which on
     /// `SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'` was six percent of the query.
     lookup: OnceLock<Lookup>,
+}
+
+/// Every code there can be, with the bytes it stands for and how many of them there are.
+///
+/// What decompressing reads instead of `symbols`, because a code is a byte and a table of all 256 of
+/// them is one the compiler knows a byte cannot index past. Read through `symbols`, every code paid a
+/// comparison against how many symbols the table had, and the eight byte value and one byte length
+/// sat sixteen bytes apart.
+///
+/// A code with no symbol has a length of zero, and so has [`ESCAPE`], so the loop asks one question
+/// of a code before it writes it out and only the rare answer has to find out which of the two it
+/// was. Built with the table, which is 2304 bytes written once per table against the thousands of
+/// codes one table decompresses.
+struct Decode {
+    values: [u64; 256],
+    lens: [u8; 256],
+}
+
+impl Decode {
+    fn of(symbols: &[Symbol]) -> Box<Self> {
+        let mut decode = Box::new(Self { values: [0; 256], lens: [0; 256] });
+        for (code, symbol) in symbols.iter().enumerate().take(MAX_SYMBOLS) {
+            decode.values[code] = symbol.value;
+            decode.lens[code] = symbol.len;
+        }
+        decode
+    }
 }
 
 /// The tables the matcher reads, all of them built from the symbols and holding nothing else.
@@ -198,6 +227,7 @@ impl SymbolTable {
     pub fn footprint(&self) -> usize {
         size_of::<Self>()
             + self.symbols.capacity() * size_of::<Symbol>()
+            + size_of::<Decode>()
             + self.lookup.get().map_or(0, |lookup| {
                 lookup.single.capacity()
                     + lookup.short.capacity() * size_of::<u16>()
@@ -388,8 +418,49 @@ impl SymbolTable {
     ///
     /// Inlined because a caller replaying a chunk asks for about nine short runs per value, and as
     /// a call the pushes, pops and return around each one were a third of the time spent in here.
+    ///
+    /// A symbol is checked for room with one comparison against the last place an eight byte store
+    /// still fits, which also tells the compiler the store is in bounds, so that and the length of
+    /// zero [`Decode`] gives the codes that are not symbols are the only two questions a code is asked.
+    /// The loop this replaced asked four, and its twenty instructions a code were half of what
+    /// decompressing the `Referer` dictionary on ClickBench 29 cost.
     #[inline]
     pub fn decompress_at(&self, input: &[u8], out: &mut [u8], mut at: usize) -> Result<usize> {
+        let Some(last) = out.len().checked_sub(MAX_SYMBOL_LEN) else {
+            return self.decompress_near_end(input, out, at);
+        };
+        let Decode { values, lens } = &*self.decode;
+        let mut codes = input.iter();
+        while let Some(&code) = codes.next() {
+            let len = lens[code as usize];
+            if len == 0 {
+                if code != ESCAPE {
+                    return Err(not_in_table(code));
+                }
+                let Some(&literal) = codes.next() else {
+                    return Err(truncated("an escaped byte"));
+                };
+                let Some(slot) = out.get_mut(at) else {
+                    return Err(out_of_room());
+                };
+                *slot = literal;
+                at += 1;
+                continue;
+            }
+            if at > last {
+                return Err(out_of_room());
+            }
+            out[at..at + MAX_SYMBOL_LEN].copy_from_slice(&values[code as usize].to_le_bytes());
+            at += len as usize;
+        }
+        Ok(at)
+    }
+
+    /// [`Self::decompress_at`] into a buffer too short for even one eight byte store, which only an
+    /// output of a few bytes with no room past it can be. Every symbol fails for want of room here and
+    /// only escaped bytes go in.
+    #[cold]
+    fn decompress_near_end(&self, input: &[u8], out: &mut [u8], mut at: usize) -> Result<usize> {
         let symbols = self.symbols.as_slice();
         let mut codes = input.iter();
         while let Some(&code) = codes.next() {
@@ -435,7 +506,7 @@ impl SymbolTable {
     }
 
     fn build(symbols: Vec<Symbol>) -> Self {
-        Self { symbols, lookup: OnceLock::new() }
+        Self { decode: Decode::of(&symbols), symbols, lookup: OnceLock::new() }
     }
 
     fn lookup(&self) -> &Lookup {
