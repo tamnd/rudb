@@ -83,6 +83,18 @@ pub enum Value {
     /// behind it and this is a point in time, so the one thing this arm knows that the other does
     /// not is which moment it is.
     TimestampTz(i64),
+    /// `TIMESTAMP_S`, whole seconds since 1970-01-01 00:00:00.
+    ///
+    /// The three precision timestamps each hold the count in their own unit rather than in
+    /// microseconds, because that is what the column under them holds and because a nanosecond
+    /// is not a microsecond: the first thing a `TIMESTAMP_NS` has that a `TIMESTAMP` does not is
+    /// the three digits a microsecond count would drop. The two infinities are the ends of the
+    /// `i64` in every unit, the same as for [`Value::Timestamp`].
+    TimestampS(i64),
+    /// `TIMESTAMP_MS`, milliseconds since 1970-01-01 00:00:00.
+    TimestampMs(i64),
+    /// `TIMESTAMP_NS`, nanoseconds since 1970-01-01 00:00:00.
+    TimestampNs(i64),
     /// `INTERVAL`, the months, days and microseconds triple.
     ///
     /// Three fields rather than one duration because interval arithmetic with months is not
@@ -220,6 +232,9 @@ impl Value {
             Self::TimeTz(_) => LogicalType::TimeTz,
             Self::Timestamp(_) => LogicalType::Timestamp,
             Self::TimestampTz(_) => LogicalType::TimestampTz,
+            Self::TimestampS(_) => LogicalType::TimestampS,
+            Self::TimestampMs(_) => LogicalType::TimestampMs,
+            Self::TimestampNs(_) => LogicalType::TimestampNs,
             Self::Interval { .. } => LogicalType::Interval,
             Self::List { element, .. } => LogicalType::list(element.clone()),
             Self::Struct(fields) => LogicalType::Struct(
@@ -308,6 +323,9 @@ impl fmt::Display for Value {
                 write_timestamp(f, *v)?;
                 f.write_str(UTC)
             }
+            Self::TimestampS(v) => write_coarse(f, *v, 1_000_000),
+            Self::TimestampMs(v) => write_coarse(f, *v, 1_000),
+            Self::TimestampNs(v) => write_nanos(f, *v),
             Self::Interval { months, days, micros } => write_interval(f, *months, *days, *micros),
             Self::List { values, .. } => {
                 f.write_str("[")?;
@@ -702,6 +720,46 @@ fn write_timestamp(f: &mut fmt::Formatter<'_>, micros: i64) -> fmt::Result {
     write_time(f, within_day)
 }
 
+/// A timestamp counted in seconds or milliseconds, which prints as the microsecond one it is.
+///
+/// The pin prints these by casting them to `TIMESTAMP` first, so the two infinities stay what they
+/// are and anything else is scaled up, which cannot lose a digit and can only run out of room.
+fn write_coarse(f: &mut fmt::Formatter<'_>, ticks: i64, micros_per_tick: i64) -> fmt::Result {
+    if ticks == i64::MAX || ticks == -i64::MAX {
+        return write_timestamp(f, ticks);
+    }
+    match ticks.checked_mul(micros_per_tick) {
+        Some(micros) if micros != i64::MAX && micros != -i64::MAX => write_timestamp(f, micros),
+        _ => f.write_str("timestamp out of range"),
+    }
+}
+
+/// A timestamp counted in nanoseconds, with up to nine digits after the point.
+///
+/// Trailing zeros are trimmed the way they are for a microsecond one, so a value on a microsecond
+/// boundary prints exactly as the `TIMESTAMP` it equals and the digits only grow when there are
+/// nanoseconds to show.
+fn write_nanos(f: &mut fmt::Formatter<'_>, nanos: i64) -> fmt::Result {
+    const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
+    if nanos == i64::MAX || nanos == -i64::MAX {
+        return write_timestamp(f, nanos);
+    }
+    let within_day = nanos.rem_euclid(NANOS_PER_DAY);
+    let Ok(days) = i32::try_from(nanos.div_euclid(NANOS_PER_DAY)) else {
+        return f.write_str("timestamp out of range");
+    };
+    write_date(f, days)?;
+    let seconds = within_day / 1_000_000_000;
+    let fraction = within_day % 1_000_000_000;
+    let (hours, minutes, seconds) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
+    write!(f, " {hours:02}:{minutes:02}:{seconds:02}")?;
+    if fraction != 0 {
+        let text = format!("{fraction:09}");
+        write!(f, ".{}", text.trim_end_matches('0'))?;
+    }
+    Ok(())
+}
+
 fn write_interval(f: &mut fmt::Formatter<'_>, months: i32, days: i32, micros: i64) -> fmt::Result {
     let mut wrote = false;
     let space = |f: &mut fmt::Formatter<'_>, wrote: &mut bool| -> fmt::Result {
@@ -812,6 +870,13 @@ mod tests {
         // count is the previous day at a positive time, not the next day at a negative one.
         assert_eq!(Value::Timestamp(-1).to_string(), "1969-12-31 23:59:59.999999");
         assert_eq!(Value::Timestamp(0).to_string(), "1970-01-01 00:00:00");
+        assert_eq!(Value::TimestampS(7).to_string(), "1970-01-01 00:00:07");
+        assert_eq!(Value::TimestampMs(-500).to_string(), "1969-12-31 23:59:59.5");
+        assert_eq!(Value::TimestampNs(1).to_string(), "1970-01-01 00:00:00.000000001");
+        assert_eq!(Value::TimestampNs(-1).to_string(), "1969-12-31 23:59:59.999999999");
+        assert_eq!(Value::TimestampNs(1_500_000).to_string(), "1970-01-01 00:00:00.0015");
+        assert_eq!(Value::TimestampNs(i64::MAX).to_string(), "infinity");
+        assert_eq!(Value::TimestampS(-i64::MAX).to_string(), "-infinity");
     }
 
     #[test]

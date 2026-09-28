@@ -11900,3 +11900,72 @@ fn reservoir_quantile_picks_what_the_pin_picks_and_refuses_what_it_refuses() {
         assert!(error.message().contains(message), "{sql}: {error}");
     }
 }
+
+#[test]
+fn the_precise_timestamps_cast_round_and_bind_the_way_the_pin_does() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    // Every answer below is the pin's.
+    for (sql, answer) in [
+        ("SELECT TIMESTAMP '2020-01-01 00:00:07.9'::TIMESTAMP_S", "2020-01-01 00:00:08"),
+        ("SELECT '2020-01-01 00:00:07.9'::TIMESTAMP_S", "2020-01-01 00:00:08"),
+        ("SELECT '2020-01-01 00:00:00.123456789'::TIMESTAMP_NS", "2020-01-01 00:00:00.123456789"),
+        ("SELECT '2020-01-01 00:00:00.1234567891'::TIMESTAMP_NS", "2020-01-01 00:00:00.123456789"),
+        (
+            "SELECT '2020-01-01 00:00:00.123456789'::TIMESTAMP_NS::TIMESTAMP_MS",
+            "2020-01-01 00:00:00.123",
+        ),
+        (
+            "SELECT '2020-01-01 00:00:00.1235'::TIMESTAMP_MS::TIMESTAMP_NS",
+            "2020-01-01 00:00:00.124",
+        ),
+        ("SELECT '2020-01-01 00:00:00.5'::TIMESTAMP_NS::TIMESTAMP", "2020-01-01 00:00:00.5"),
+        ("SELECT '2020-01-01 23:59:59.5'::TIMESTAMP_MS::DATE", "2020-01-01"),
+        ("SELECT '2020-01-01 12:34:56.789'::TIMESTAMP_MS::TIME", "12:34:56.789"),
+        ("SELECT '1969-12-31 23:59:59.5'::TIMESTAMP_MS::TIMESTAMP_S", "1969-12-31 23:59:59"),
+        (
+            "SELECT '2020-01-01 00:00:00.123456789'::TIMESTAMP_NS + INTERVAL 1 DAY",
+            "2020-01-02 00:00:00.123457",
+        ),
+        ("SELECT typeof('2020-01-01'::TIMESTAMP_NS + INTERVAL 1 DAY)", "TIMESTAMP"),
+        ("SELECT '2020-01-02'::TIMESTAMP_NS - '2020-01-01 00:00:00.5'::TIMESTAMP_NS", "23:59:59.5"),
+        ("SELECT date_trunc('month', '2020-03-04 05:06:07'::TIMESTAMP_S)", "2020-03-01 00:00:00"),
+        ("SELECT typeof(date_trunc('month', '2020-03-04'::TIMESTAMP_S))", "TIMESTAMP"),
+        (
+            "SELECT '2020-01-01 00:00:00.5'::TIMESTAMP_NS = TIMESTAMP '2020-01-01 00:00:00.5'",
+            "true",
+        ),
+        (
+            "SELECT x::TIMESTAMP_S, count(*) FROM (VALUES (TIMESTAMP '2020-01-01 00:00:01.2'), \
+             (TIMESTAMP '2020-01-01 00:00:00.8'), (NULL)) t(x) GROUP BY 1 ORDER BY 1 NULLS FIRST",
+            "NULL,1;2020-01-01 00:00:01,2",
+        ),
+    ] {
+        assert_eq!(text(sql), answer, "{sql}");
+    }
+    for (sql, message) in [
+        ("SELECT 'x'::TIMESTAMP_NS", "Could not convert string 'x' to INT64"),
+        ("SELECT 'x'::TIMESTAMP_S", "Could not convert string 'x' to INT64"),
+        (
+            "SELECT TIMESTAMP '2500-01-01'::TIMESTAMP_NS",
+            "Could not convert Timestamp to higher precision.",
+        ),
+        (
+            "SELECT DATE '1500-01-02'::TIMESTAMP_NS",
+            "Type INT32 with value 1500-01-02 can't be cast to the destination type INT64",
+        ),
+        (
+            "SELECT '2020-01-01'::TIMESTAMP_NS::TIMESTAMP_S",
+            "Unimplemented type for cast (TIMESTAMP_NS -> TIMESTAMP_S)",
+        ),
+    ] {
+        let error = db.execute(sql).expect_err(sql);
+        assert!(error.message().contains(message), "{sql}: {error}");
+    }
+}

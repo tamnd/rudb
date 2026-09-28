@@ -306,7 +306,10 @@ fn number(value: &Value) -> Option<i128> {
         | Value::Time(held)
         | Value::TimeTz(held)
         | Value::Timestamp(held)
-        | Value::TimestampTz(held) => Some(i128::from(held)),
+        | Value::TimestampTz(held)
+        | Value::TimestampS(held)
+        | Value::TimestampMs(held)
+        | Value::TimestampNs(held) => Some(i128::from(held)),
         Value::HugeInt(held) => Some(held),
         Value::UTinyInt(held) => Some(i128::from(held)),
         Value::USmallInt(held) => Some(i128::from(held)),

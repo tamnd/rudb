@@ -2812,7 +2812,12 @@ impl Vector {
                 Value::TinyInt(x) => Some(i128::from(*x)),
                 Value::SmallInt(x) => Some(i128::from(*x)),
                 Value::Integer(x) | Value::Date(x) => Some(i128::from(*x)),
-                Value::BigInt(x) | Value::Time(x) | Value::Timestamp(x) => Some(i128::from(*x)),
+                Value::BigInt(x)
+                | Value::Time(x)
+                | Value::Timestamp(x)
+                | Value::TimestampS(x)
+                | Value::TimestampMs(x)
+                | Value::TimestampNs(x) => Some(i128::from(*x)),
                 Value::HugeInt(x) | Value::Decimal { unscaled: x, .. } => Some(*x),
                 _ => None,
             },
@@ -2912,7 +2917,12 @@ impl Vector {
                     Value::TinyInt(x) => i64::from(*x),
                     Value::SmallInt(x) => i64::from(*x),
                     Value::Integer(x) | Value::Date(x) => i64::from(*x),
-                    Value::BigInt(x) | Value::Time(x) | Value::Timestamp(x) => *x,
+                    Value::BigInt(x)
+                    | Value::Time(x)
+                    | Value::Timestamp(x)
+                    | Value::TimestampS(x)
+                    | Value::TimestampMs(x)
+                    | Value::TimestampNs(x) => *x,
                     _ => return false,
                 };
                 out.resize(self.len, held);
@@ -4854,11 +4864,19 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
         LogicalType::Date => signed().and_then(|x| i32::try_from(x).ok()).map(Value::Date),
         LogicalType::Time => signed().and_then(|x| i64::try_from(x).ok()).map(Value::Time),
         LogicalType::TimeTz => signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimeTz),
-        LogicalType::Timestamp
-        | LogicalType::TimestampS
-        | LogicalType::TimestampMs
-        | LogicalType::TimestampNs => {
+        LogicalType::Timestamp => {
             signed().and_then(|x| i64::try_from(x).ok()).map(Value::Timestamp)
+        }
+        // Each of these holds its count in its own unit, so the value keeps the unit and the digits
+        // a microsecond count would have rounded away or scaled wrong.
+        LogicalType::TimestampS => {
+            signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimestampS)
+        }
+        LogicalType::TimestampMs => {
+            signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimestampMs)
+        }
+        LogicalType::TimestampNs => {
+            signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimestampNs)
         }
         LogicalType::TimestampTz => {
             signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimestampTz)
@@ -5057,7 +5075,10 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
             | Value::Time(x)
             | Value::TimeTz(x)
             | Value::Timestamp(x)
-            | Value::TimestampTz(x) => v.push(*x),
+            | Value::TimestampTz(x)
+            | Value::TimestampS(x)
+            | Value::TimestampMs(x)
+            | Value::TimestampNs(x) => v.push(*x),
             Value::Decimal { unscaled, .. } => decimal!(v, i64, unscaled),
             other => return Err(Error::internal(format!("{other:?} is not a 64 bit value"))),
         },
@@ -6635,7 +6656,12 @@ mod tests {
             Value::TinyInt(x) => Some(i128::from(*x)),
             Value::SmallInt(x) => Some(i128::from(*x)),
             Value::Integer(x) | Value::Date(x) => Some(i128::from(*x)),
-            Value::BigInt(x) | Value::Time(x) | Value::Timestamp(x) => Some(i128::from(*x)),
+            Value::BigInt(x)
+                | Value::Time(x)
+                | Value::Timestamp(x)
+                | Value::TimestampS(x)
+                | Value::TimestampMs(x)
+                | Value::TimestampNs(x) => Some(i128::from(*x)),
             Value::HugeInt(x) | Value::Decimal { unscaled: x, .. } => Some(*x),
             _ => None,
         }

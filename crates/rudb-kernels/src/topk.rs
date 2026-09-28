@@ -362,9 +362,13 @@ pub(crate) fn sort_key(value: &Value, out: &mut Vec<u8>) {
         Value::TinyInt(v) => signed(i64::from(*v), 1, out),
         Value::SmallInt(v) => signed(i64::from(*v), 2, out),
         Value::Integer(v) | Value::Date(v) => signed(i64::from(*v), 4, out),
-        Value::BigInt(v) | Value::Time(v) | Value::Timestamp(v) | Value::TimestampTz(v) => {
-            signed(*v, 8, out)
-        }
+        Value::BigInt(v)
+        | Value::Time(v)
+        | Value::Timestamp(v)
+        | Value::TimestampTz(v)
+        | Value::TimestampS(v)
+        | Value::TimestampMs(v)
+        | Value::TimestampNs(v) => signed(*v, 8, out),
         #[expect(clippy::cast_sign_loss, reason = "the pin keeps a zoned time in 64 bits")]
         Value::TimeTz(v) => out.extend_from_slice(&(*v as u64).to_be_bytes()),
         Value::UTinyInt(v) => out.push(*v),

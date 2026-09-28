@@ -203,19 +203,19 @@ impl<'a> Points<'a> {
 enum Axis {
     Float(Vec<f32>),
     Double(Vec<f64>),
-    /// Any of the timestamps, in the unit its type counts in, and whether it has a time zone.
-    Ticks(Vec<i64>, bool),
+    /// Any of the timestamps, in the unit its type counts in, and which of them it is.
+    Ticks(Vec<i64>, LogicalType),
 }
 
 impl Axis {
     fn of(ty: &LogicalType) -> Self {
         match ty {
             LogicalType::Float => Self::Float(Vec::new()),
-            LogicalType::TimestampTz => Self::Ticks(Vec::new(), true),
             LogicalType::Timestamp
+            | LogicalType::TimestampTz
             | LogicalType::TimestampS
             | LogicalType::TimestampMs
-            | LogicalType::TimestampNs => Self::Ticks(Vec::new(), false),
+            | LogicalType::TimestampNs => Self::Ticks(Vec::new(), ty.clone()),
             _ => Self::Double(Vec::new()),
         }
     }
@@ -232,7 +232,14 @@ impl Axis {
         match (self, value) {
             (Self::Float(values), Value::Float(v)) => values.push(*v),
             (Self::Double(values), Value::Double(v)) => values.push(*v),
-            (Self::Ticks(values, _), Value::Timestamp(v) | Value::TimestampTz(v)) => {
+            (
+                Self::Ticks(values, _),
+                Value::Timestamp(v)
+                | Value::TimestampTz(v)
+                | Value::TimestampS(v)
+                | Value::TimestampMs(v)
+                | Value::TimestampNs(v),
+            ) => {
                 values.push(*v);
             }
             (_, value) => {
@@ -268,8 +275,16 @@ impl Axis {
         match self {
             Self::Float(values) => Value::Float(values[index]),
             Self::Double(values) => Value::Double(values[index]),
-            Self::Ticks(values, true) => Value::TimestampTz(values[index]),
-            Self::Ticks(values, false) => Value::Timestamp(values[index]),
+            Self::Ticks(values, ty) => {
+                let ticks = values[index];
+                match ty {
+                    LogicalType::TimestampTz => Value::TimestampTz(ticks),
+                    LogicalType::TimestampS => Value::TimestampS(ticks),
+                    LogicalType::TimestampMs => Value::TimestampMs(ticks),
+                    LogicalType::TimestampNs => Value::TimestampNs(ticks),
+                    _ => Value::Timestamp(ticks),
+                }
+            }
         }
     }
 }

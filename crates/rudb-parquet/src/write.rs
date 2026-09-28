@@ -396,7 +396,10 @@ fn plain(value: &Value, column: &Column, out: &mut Vec<u8>, framed: bool) -> Res
             Value::BigInt(value)
             | Value::Time(value)
             | Value::Timestamp(value)
-            | Value::TimestampTz(value),
+            | Value::TimestampTz(value)
+            | Value::TimestampS(value)
+            | Value::TimestampMs(value)
+            | Value::TimestampNs(value),
             _,
         ) => out.extend_from_slice(&value.to_le_bytes()),
         (Value::UBigInt(value), _) => out.extend_from_slice(&value.to_le_bytes()),
@@ -471,7 +474,10 @@ fn integer(value: &Value) -> i128 {
         Value::BigInt(value)
         | Value::Time(value)
         | Value::Timestamp(value)
-        | Value::TimestampTz(value) => i128::from(*value),
+        | Value::TimestampTz(value)
+        | Value::TimestampS(value)
+        | Value::TimestampMs(value)
+        | Value::TimestampNs(value) => i128::from(*value),
         Value::UBigInt(value) => i128::from(*value),
         _ => 0,
     }

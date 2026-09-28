@@ -78,7 +78,10 @@ pub(crate) fn hash(value: &Value) -> u64 {
         | Value::Time(v)
         | Value::TimeTz(v)
         | Value::Timestamp(v)
-        | Value::TimestampTz(v) => wide(*v),
+        | Value::TimestampTz(v)
+        | Value::TimestampS(v)
+        | Value::TimestampMs(v)
+        | Value::TimestampNs(v) => wide(*v),
         Value::UBigInt(v) => murmur(*v),
         Value::HugeInt(v) => huge(*v),
         #[expect(clippy::cast_possible_wrap, reason = "only the bits are hashed")]
