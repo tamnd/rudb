@@ -287,6 +287,13 @@ impl Rising {
     }
 }
 
+/// The sum a split accumulator holds: its `i128` total and the `i64` part not yet in it.
+fn split(a: &[u8]) -> i128 {
+    let total = i128::from_le_bytes(a[..16].try_into().unwrap_or_default());
+    let part = i64::from_le_bytes(a[16..24].try_into().unwrap_or_default());
+    total.wrapping_add(i128::from(part))
+}
+
 /// What the total of an average over `arg` is divided by, `n` values having gone into it.
 ///
 /// The first engine's `divide_mean`: the count times ten to the scale, both as doubles, which for
@@ -313,6 +320,11 @@ fn finish(
     Ok(match op {
         AccOp::CountStar | AccOp::Count => Some(cell(&a[..8])),
         AccOp::SumInt => (a[16] != 0).then(|| cell(&a[..16])),
+        AccOp::SumSplit => (a[24] != 0).then(|| cell(&split(a).to_le_bytes())),
+        AccOp::AvgSplit => {
+            let n = i64_at(24);
+            (n != 0).then(|| cell(&(split(a) as f64 / divisor(arg, n)).to_le_bytes()))
+        }
         AccOp::SumNarrow => (a[8] != 0).then(|| cell(&i128::from(i64_at(0)).to_le_bytes())),
         AccOp::SumFloat => (a[8] != 0).then(|| cell(&a[..8])),
         AccOp::AvgInt => {

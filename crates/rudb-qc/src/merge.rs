@@ -29,6 +29,10 @@ enum How {
     SumInt,
     /// An `i128` total and an `i64` count.
     AvgInt,
+    /// An `i128` total, an `i64` part and a seen byte.
+    SumSplit,
+    /// An `i128` total, an `i64` part and an `i64` count.
+    AvgSplit,
     /// An `i64` total and a seen byte.
     SumNarrow,
     /// An `i64` total and an `i64` count.
@@ -68,6 +72,8 @@ pub(crate) fn folds(g: &Grouping) -> Result<Vec<Fold>> {
             AccOp::CountStar | AccOp::Count => How::Count,
             AccOp::SumInt => How::SumInt,
             AccOp::AvgInt => How::AvgInt,
+            AccOp::SumSplit => How::SumSplit,
+            AccOp::AvgSplit => How::AvgSplit,
             AccOp::SumNarrow => How::SumNarrow,
             AccOp::AvgNarrow => How::AvgNarrow,
             AccOp::SumFloat => How::SumFloat,
@@ -121,6 +127,17 @@ pub(crate) fn fold(folds: &[Fold], dst: &mut [u8], src: &[u8]) {
             How::AvgInt => {
                 put_i128(d, 0, i128_at(d, 0).wrapping_add(i128_at(s, 0)));
                 put_i64(d, 16, i64_at(d, 16).wrapping_add(i64_at(s, 16)));
+            }
+            // The part of `src` goes into the total, so that adding to the part of `dst` later
+            // cannot overflow on account of it.
+            How::SumSplit | How::AvgSplit => {
+                let s_total = i128_at(s, 0).wrapping_add(i128::from(i64_at(s, 16)));
+                put_i128(d, 0, i128_at(d, 0).wrapping_add(s_total));
+                if matches!(f.how, How::SumSplit) {
+                    d[24] |= s[24];
+                } else {
+                    put_i64(d, 24, i64_at(d, 24).wrapping_add(i64_at(s, 24)));
+                }
             }
             How::SumNarrow => {
                 put_i64(d, 0, i64_at(d, 0).wrapping_add(i64_at(s, 0)));
