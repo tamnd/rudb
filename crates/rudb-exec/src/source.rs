@@ -705,6 +705,14 @@ thread_local! {
     static READER: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
+/// How many rows a table has to hold for each value of a column's dictionary before a filter on the
+/// column is asked of the dictionary to find its rows. See [`Scan::valued_rows`].
+const FEWEST_PER_VALUE: usize = 32;
+
+/// A part whose exact rows keep one row in this many or fewer is read at those rows alone. See
+/// [`Source::read_reduced`].
+const SPARSE_READ: usize = 8;
+
 /// Drops the rows of a chunk that the exact rows from a join above do not hold, for a scan with no
 /// filter to fold them into.
 ///
@@ -714,10 +722,6 @@ thread_local! {
 /// # Errors
 ///
 /// Whatever narrowing the chunk to the rows that survived raises.
-/// A part whose exact rows keep one row in this many or fewer is read at those rows alone. See
-/// [`Source::read_reduced`].
-const SPARSE_READ: usize = 8;
-
 fn reduce(reduced: Option<(&Rids, u64)>, chunk: &mut Chunk) -> Result<()> {
     let Some((rows, first)) = reduced else { return Ok(()) };
     let len = chunk.len();
@@ -821,40 +825,45 @@ struct Valued {
 impl Valued {
     /// The codes of `dictionary` every test passes, or `None` when a null passes them all, since
     /// the recorded rows leave the nulls out, or when a test cannot be asked.
+    ///
+    /// The dictionary is asked a vector's length at a time, since a chunk is no longer than that.
     fn passing(&self, types: &[LogicalType], dictionary: &Vector) -> Option<Vec<u32>> {
-        let over = |len: usize, column: Option<&Vector>| {
-            let mut columns =
-                types.iter().map(|ty| Vector::constant(*ty, Value::Null, len)).collect::<Vec<_>>();
+        let over = |len: usize, column: Option<Vector>| {
+            let mut columns = types
+                .iter()
+                .map(|ty| Vector::constant(ty.clone(), Value::Null, len))
+                .collect::<Vec<_>>();
             if let Some(column) = column {
-                columns[self.input] = column.clone();
+                columns[self.input] = column;
             }
             Chunk::with_rows(columns, len).ok()
         };
+        let mut scratches = self.tests.iter().map(Prepared::scratch).collect::<Vec<_>>();
         let nulls = over(1, None)?;
         let mut null_passes = true;
-        for test in &self.tests {
-            let kept = test.evaluate_filter(&nulls, &mut test.scratch()).ok()?;
-            null_passes &= kept.len() == 1;
+        for (test, scratch) in self.tests.iter().zip(&mut scratches) {
+            null_passes &= test.evaluate_filter(&nulls, scratch).ok()?.len() == 1;
         }
         if null_passes {
             return None;
         }
-        let values = over(dictionary.len(), Some(dictionary))?;
-        let mut held: Option<Vec<u32>> = None;
-        for test in &self.tests {
-            let kept = test.evaluate_filter(&values, &mut test.scratch()).ok()?;
-            held = Some(match held {
-                None => kept.indices().to_vec(),
-                Some(before) => {
-                    let mut pass = vec![false; dictionary.len()];
-                    for &code in kept.indices() {
-                        pass[code as usize] = true;
-                    }
-                    before.into_iter().filter(|&code| pass[code as usize]).collect()
+        let mut codes = Vec::new();
+        let mut pass = Vec::new();
+        for at in (0..dictionary.len()).step_by(VECTOR_SIZE) {
+            let len = VECTOR_SIZE.min(dictionary.len() - at);
+            let values = over(len, Some(dictionary.slice(at, len).ok()?))?;
+            pass.clear();
+            pass.resize(len, 0_usize);
+            for (test, scratch) in self.tests.iter().zip(&mut scratches) {
+                for &row in test.evaluate_filter(&values, scratch).ok()?.indices() {
+                    pass[row as usize] += 1;
                 }
-            });
+            }
+            let base = u32::try_from(at).ok()?;
+            let all = self.tests.len();
+            codes.extend((0..len).filter(|&row| pass[row] == all).map(|row| base + row as u32));
         }
-        held
+        Some(codes)
     }
 }
 
@@ -1567,7 +1576,11 @@ impl<'a> Scan<'a> {
     fn read_late(&self, at: usize, out: &mut Chunk) -> Result<bool> {
         let Some(pushed) = &self.pushed else { return Ok(false) };
         let Some(late) = &pushed.late else { return Ok(false) };
-        if self.sideways.is_some() || !self.also.is_empty() || !late.worth() {
+        if self.sideways.is_some()
+            || !self.also.is_empty()
+            || !late.worth()
+            || self.reduced(at).is_some()
+        {
             return Ok(false);
         }
         let Some(primary) = self.columns[late.input] else { return Ok(false) };
@@ -1989,11 +2002,19 @@ impl<'a> Scan<'a> {
         let Some(reader) = self.table.rows().stored() else { return Vec::new() };
         let types = self.schema.types();
         let mut out = Vec::new();
+        let rows = reader.table().rows();
         for one in &pushed.valued {
             let Some(column) = self.columns[one.input] else { continue };
-            let Some(index) = reader.value_rows(column) else { continue };
             let Ok(Some(dictionary)) = reader.global_dictionary(column) else { continue };
-            if dictionary.len() != index.values() {
+            // The filter is asked of every value of the dictionary, and a dictionary with nearly a
+            // value per row, which is `title.title`, costs as much to ask as the scan it would save.
+            if dictionary.len().saturating_mul(FEWEST_PER_VALUE) > rows {
+                continue;
+            }
+            let Some(index) = reader.value_rows(column) else { continue };
+            if dictionary.len() != index.values()
+                || index.held(&[]).is_none_or(|whole| whole.saturating_mul(SPARSE_READ as u64) > index.rows())
+            {
                 continue;
             }
             let Some(codes) = one.passing(&types, &dictionary) else { continue };
