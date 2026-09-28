@@ -257,6 +257,7 @@ fn build_measured_with_sink<'a>(
         report,
         shape,
         done: Vec::new(),
+        reads: false,
         drivers: Vec::new(),
         pruning: Vec::new(),
         pushing: None,
@@ -287,8 +288,8 @@ fn build_measured_with_sink<'a>(
         building.close(segment, ROOT, Arc::new(sink));
         Some(reader)
     };
-    let Building { done, drivers, .. } = building;
-    Query::new(done, drivers, reader, schema)
+    let Building { done, drivers, reads, .. } = building;
+    Ok(Query::new(done, drivers, reader, schema)?.reading(reads))
 }
 
 /// Whether the rows reaching the root are already in an order the plan chose.
@@ -1541,17 +1542,25 @@ struct Segment<'a> {
     schema: Schema,
     /// The pipelines this one cannot start before.
     after: Vec<PipelineRef>,
+    /// Whether the source reads a stored table or a file.
+    reads: bool,
 }
 
 impl<'a> Segment<'a> {
     /// A segment that is just its source.
     fn new(source: Arc<dyn Source + 'a>, schema: Schema) -> Self {
-        Self { source, streams: Vec::new(), schema, after: Vec::new() }
+        Self { source, streams: Vec::new(), schema, after: Vec::new(), reads: false }
     }
 
     /// A segment reading what a pipeline breaker finalised into.
     fn reading(source: Arc<dyn Source + 'a>, schema: Schema, after: PipelineRef) -> Self {
-        Self { source, streams: Vec::new(), schema, after: vec![after] }
+        Self { source, streams: Vec::new(), schema, after: vec![after], reads: false }
+    }
+
+    /// The same segment, marked as reading a stored table or a file.
+    fn reads(mut self) -> Self {
+        self.reads = true;
+        self
     }
 
     /// Puts a streaming operator on the end, which becomes what the segment produces.
@@ -1575,6 +1584,8 @@ struct Building<'a, 'b> {
     shape: Shape,
     /// The pipelines closed so far, in the order they have to run.
     done: Vec<Pipeline<'a>>,
+    /// Whether a pipeline closed so far reads a stored table or a file.
+    reads: bool,
     /// One per entry of `done`, in the same order.
     drivers: Vec<Arc<Driver>>,
     /// The bounds tests the filter arm worked out for the scan it is about to walk into.
@@ -1712,6 +1723,7 @@ impl<'a> Building<'a, '_> {
 
     /// Ends a segment with a sink and puts the finished pipeline on the list.
     fn close(&mut self, segment: Segment<'a>, id: PipelineRef, sink: Arc<dyn DynSink + 'a>) {
+        self.reads |= segment.reads;
         let mut pipeline = Pipeline::new(PipelineId(id), segment.source, sink);
         for stream in segment.streams {
             pipeline = pipeline.then(stream);
@@ -2596,7 +2608,7 @@ impl<'a> Building<'a, '_> {
                 )?
                 .watched(counters.clone());
                 let schema = scan.schema().clone();
-                Segment::new(Arc::new(Watched::new(scan, counters)), schema)
+                Segment::new(Arc::new(Watched::new(scan, counters)), schema).reads()
             }
             Node::Dummy => {
                 let dummy = Dummy::new();
@@ -2610,7 +2622,7 @@ impl<'a> Building<'a, '_> {
                 let counters = self.watch(reference, id, pipeline, "Values", None);
                 Segment::new(Arc::new(Watched::new(values, counters)), schema)
             }
-            Node::TableFunction { .. } => self.table_function(reference)?,
+            Node::TableFunction { .. } => self.table_function(reference)?.reads(),
             Node::LateralFunction { input, index, function, args, columns, .. } => {
                 let below = self.node(input)?;
                 let name = plan.string(function);
@@ -2988,6 +3000,7 @@ impl<'a> Building<'a, '_> {
                     streams: Vec::new(),
                     schema,
                     after: filled,
+                    reads: false,
                 }
             }
             Node::CteScan { index, cte, columns, .. } => {

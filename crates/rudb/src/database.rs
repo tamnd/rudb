@@ -18,7 +18,7 @@ use rudb_native::LogAnchor;
 use rudb_native::graph::Edge;
 use rudb_parse::ast::{self, Ast};
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
-use rudb_plan::{Expr, Node, Plan};
+use rudb_plan::{Expr, Node, NodeRef, Plan};
 use rudb_vector::{Chunk, Data, Form, Selection, Vector};
 
 use crate::config::Config;
@@ -3233,6 +3233,14 @@ impl Shared {
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 if self.inner.settings.engine() == COMPILED_ENGINE {
+                    // A query the first engine answers out of the statistics kept about its
+                    // tables, without reading a row, has nothing for compiled code to make faster.
+                    if aggregates_a_table(&plan, plan.root()) {
+                        let first = built(&plan, &catalog, cancel, under)?;
+                        if !first.query.reads_tables() {
+                            return finish(sql, &plan, cancel, under, first);
+                        }
+                    }
                     let compiling = Span::start();
                     let compiled = rudb_qc::compile_with(&plan, cancel, self.qc_options());
                     let (codegen_ns, _) = compiling.stop();
@@ -4728,7 +4736,27 @@ fn run(
     cancel: &Cancel,
     under: Under<'_>,
 ) -> Result<QueryResult> {
-    let Under { budget: Budget { memory, pool }, facts, seams, session, going, planning } = under;
+    let first = built(plan, catalog, cancel, under)?;
+    finish(sql, plan, cancel, under, first)
+}
+
+/// A query the first engine built and has not run yet, with the report its operators write to and
+/// the wall and CPU time the build took.
+struct Built<'a> {
+    query: rudb_exec::Query<'a>,
+    report: Report,
+    wall: u64,
+    cpu: u64,
+}
+
+/// Builds `plan` on the first engine under `under`'s budget and settings.
+fn built<'a>(
+    plan: &'a Plan,
+    catalog: &'a Catalog,
+    cancel: &Cancel,
+    under: Under<'_>,
+) -> Result<Built<'a>> {
+    let Under { budget: Budget { memory, .. }, seams, session, .. } = under;
     // The budget is shared by the database and its high-water mark survives a query. Reset it to
     // what is live now before measuring this execution, otherwise a metrics document either says
     // zero forever (when nobody copies the mark) or inherits the largest earlier query. A caller
@@ -4738,7 +4766,32 @@ fn run(
     let report = Report::new();
     let building = Span::start();
     let query = rudb_exec::build_measured(plan, catalog, cancel, memory, seams, session, &report)?;
-    let (built_wall, built_cpu) = building.stop();
+    let (wall, cpu) = building.stop();
+    Ok(Built { query, report, wall, cpu })
+}
+
+/// Whether an aggregate in the plan reads a stored table directly, which is the shape the first
+/// engine can answer out of the table's statistics.
+fn aggregates_a_table(plan: &Plan, node: NodeRef) -> bool {
+    if let Node::Aggregate { input, .. } = *plan.node(node)
+        && matches!(plan.node(input), Node::Get { .. })
+    {
+        return true;
+    }
+    plan.node(node).children().into_iter().flatten().any(|child| aggregates_a_table(plan, child))
+}
+
+/// Runs a query the first engine built, and fills in the metrics document `run` returns.
+fn finish(
+    sql: &str,
+    plan: &Plan,
+    cancel: &Cancel,
+    under: Under<'_>,
+    built: Built<'_>,
+) -> Result<QueryResult> {
+    let Under { budget: Budget { memory, pool }, facts, seams: _, session, going, planning } =
+        under;
+    let Built { query, report, wall: built_wall, cpu: built_cpu } = built;
     if going == Rows::ForACaller {
         query.for_a_caller();
     }

@@ -82,9 +82,11 @@ pub struct GroupTable {
     /// its page, because a table [`join`](GroupTable::join) makes holds pages that are not full.
     rows: Vec<usize>,
     hashes: Vec<u64>,
-    /// Open addressing over group ids plus one, zero for empty, and empty until the first insert
-    /// in a table made by [`join`](GroupTable::join).
-    slots: Vec<u32>,
+    /// Open addressing over group ids plus one in the low half, with the low half of the group's
+    /// hash above it, zero for empty, and empty until the first insert in a table made by
+    /// [`join`](GroupTable::join). The hash in the slot is what lets a probe pass a slot of another
+    /// key without reading that group's row.
+    slots: Vec<u64>,
 }
 
 impl GroupTable {
@@ -205,35 +207,49 @@ impl GroupTable {
     }
 
     /// The groups of this table split into `1 << bits` parts by their hashes, so that two tables
-    /// split the same way put a key in the same part.
+    /// split the same way put a key in the same part. A group is its row's address and its hash,
+    /// read here in the order the table holds them, so that the part that folds it reads nothing
+    /// of this table but the row.
     ///
     /// A key's hash is a CRC-32C, which leaves the top half of the word zero, so the part is the
     /// top bits of the hash times an odd number, which every bit of the hash moves.
     #[must_use]
-    pub fn split(&self, bits: u32) -> Vec<Vec<u32>> {
-        let mut parts = vec![Vec::new(); 1 << bits];
+    pub fn split(&self, bits: u32) -> Vec<Vec<(usize, u64)>> {
+        let room = (self.len() >> bits) + (self.len() >> (bits + 3)) + 8;
+        let mut parts = vec![Vec::with_capacity(room); 1 << bits];
         let shift = 64 - bits;
-        for (gid, &hash) in self.hashes.iter().enumerate() {
+        for (&row, &hash) in self.rows.iter().zip(&self.hashes) {
             let part = if bits == 0 { 0 } else { (hash.wrapping_mul(SPREAD) >> shift) as usize };
-            parts[part].push(gid as u32);
+            parts[part].push((row, hash));
         }
         parts
     }
 
-    /// Folds the groups `gids` of `other` into this table, as [`absorb`](GroupTable::absorb) does
-    /// with all of them, and pushes the group each became to `map`.
+    /// Folds the groups `picks` of `other`, as [`split`](GroupTable::split) gave them, into this
+    /// table, as [`absorb`](GroupTable::absorb) does with all of them. With `made`, each group's id
+    /// in `other` and the group it became here are pushed to it.
     pub fn absorb_some(
         &mut self,
         other: &GroupTable,
-        gids: &[u32],
-        map: &mut Vec<u32>,
+        picks: &[(usize, u64)],
+        mut made: Option<&mut Vec<(u32, u32)>>,
         mut combine: impl FnMut(&mut [u8], &[u8]),
     ) {
+        /// How many groups ahead a row is asked for before it is read.
+        const AHEAD: usize = 8;
         let size = self.layout.key_size as usize;
-        for &gid in gids {
-            let src = other.row(gid as usize);
-            let at = self.find_or_add(&src[8..8 + size], other.hashes[gid as usize], None);
-            map.push(at as u32);
+        for (i, &(row, hash)) in picks.iter().enumerate() {
+            if let Some(&(next, _)) = picks.get(i + AHEAD) {
+                prefetch(next);
+            }
+            // SAFETY: `split` took the address from `other`'s rows, and `other` is borrowed, so
+            // its pages are still there.
+            let src = unsafe { crate::mem::slice(row, other.row_size) };
+            let at = self.find_or_add(&src[8..8 + size], hash, None);
+            if let Some(made) = made.as_deref_mut() {
+                let gid = u64::from_le_bytes(src[..8].try_into().unwrap_or_default());
+                made.push((gid as u32, at as u32));
+            }
             combine(self.row_mut(at), src);
         }
     }
@@ -276,19 +292,20 @@ impl GroupTable {
         }
         let mask = self.slots.len() - 1;
         let mut at = (hash as usize) & mask;
+        let tag = hash << 32;
         loop {
             let slot = self.slots[at];
             if slot == 0 {
                 break;
             }
-            let gid = (slot - 1) as usize;
-            if self.hashes[gid] == hash && self.same(gid, key) {
+            let gid = (slot as u32 - 1) as usize;
+            if slot & !0xffff_ffff == tag && self.same(gid, key) {
                 return gid;
             }
             at = (at + 1) & mask;
         }
         let gid = self.add(key, hash, heap);
-        self.slots[at] = gid as u32 + 1;
+        self.slots[at] = tag | (gid as u64 + 1);
         if self.rows.len() * 2 > self.slots.len() {
             self.grow();
         }
@@ -329,15 +346,14 @@ impl GroupTable {
         }
         let size = self.row_size;
         let acc = Layout::acc_offset(self.layout.key_size) as usize;
-        let keys = self.layout.keys.clone();
-        let init = self.layout.init.clone();
-        let Some(page) = self.pages.last_mut() else { return 0 };
-        let at = self.fill * size;
-        self.fill += 1;
+        let GroupTable { layout, pages, fill, .. } = self;
+        let Some(page) = pages.last_mut() else { return 0 };
+        let at = *fill * size;
+        *fill += 1;
         let row = &mut page[at..at + size];
         row[..8].copy_from_slice(&(gid as u64).to_le_bytes());
         row[8..8 + key.len()].copy_from_slice(key);
-        for f in &keys {
+        for f in &layout.keys {
             let o = 8 + f.offset as usize;
             if let Some(heap) = heap.as_deref_mut()
                 && f.text
@@ -351,7 +367,7 @@ impl GroupTable {
                 }
             }
         }
-        row[acc..acc + init.len()].copy_from_slice(&init);
+        row[acc..acc + layout.init.len()].copy_from_slice(&layout.init);
         self.rows.push(row.as_mut_ptr().expose_provenance());
         self.hashes.push(hash);
         gid
@@ -362,17 +378,29 @@ impl GroupTable {
         while self.rows.len() * 2 > size {
             size *= 2;
         }
-        let mut slots = vec![0u32; size];
+        let mut slots = vec![0u64; size];
         let mask = slots.len() - 1;
-        for (gid, hash) in self.hashes.iter().enumerate() {
-            let mut at = (*hash as usize) & mask;
+        for (gid, &hash) in self.hashes.iter().enumerate() {
+            let mut at = (hash as usize) & mask;
             while slots[at] != 0 {
                 at = (at + 1) & mask;
             }
-            slots[at] = gid as u32 + 1;
+            slots[at] = (hash << 32) | (gid as u64 + 1);
         }
         self.slots = slots;
     }
+}
+
+/// Asks for the cache line at `address` ahead of reading it.
+#[inline]
+fn prefetch(address: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is a hint that does not fault, whatever the address.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(address as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = address;
 }
 
 /// Reads a `u128` from sixteen bytes.
