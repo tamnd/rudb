@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use rudb_qc_interp::Program;
 use rudb_qc_ir::Module;
-use rudb_qc_rt::Rt;
 use rudb_qc_rt::code::Code;
+use rudb_qc_rt::{Ablate, Rt};
 
 use crate::tier::up::{Calibration, Class, Progress, Seen, Verdict};
 
@@ -236,6 +236,8 @@ pub struct Options {
     /// Whether an aggregate with no groups that the table's statistics answer is run over the
     /// rows anyway, for testing the compiled code and for measuring what the statistics save.
     pub rows: bool,
+    /// The techniques left out, for measuring what each one is worth.
+    pub ablate: Ablate,
 }
 
 /// What the second tier did with a query's module, for `EXPLAIN (CODEGEN)` and the query log.
@@ -335,6 +337,8 @@ pub(crate) struct Tiers {
     split: usize,
     /// Whether an aggregate the statistics answer reads its rows anyway.
     rows: bool,
+    /// The techniques this query leaves out.
+    ablate: Ablate,
     calibration: Calibration,
     /// The clock the progress is kept on.
     clock: Instant,
@@ -371,7 +375,7 @@ impl fmt::Debug for Tiers {
 impl Tiers {
     /// Lowers `module` for the interpreter and, when `options` asks for it, for the machine.
     pub(crate) fn new(module: &Module, options: Options) -> Tiers {
-        let Options { tier, switch, stay, fresh, morsel, rows } = options;
+        let Options { tier, switch, stay, fresh, morsel, rows, ablate } = options;
         let program = Program::new(module);
         let counts = (
             AtomicU64::new(0),
@@ -394,7 +398,8 @@ impl Tiers {
             native,
             fresh,
             split: morsel,
-            rows,
+            rows: rows || ablate.off(Ablate::STATS),
+            ablate,
             calibration: Calibration::HOST,
             clock: Instant::now(),
             upper: (0..each).map(|_| Arc::default()).collect(),
@@ -428,6 +433,11 @@ impl Tiers {
     /// Whether an aggregate the statistics answer reads its rows anyway.
     pub(crate) fn rows(&self) -> bool {
         self.rows
+    }
+
+    /// The techniques this query leaves out.
+    pub(crate) fn ablate(&self) -> Ablate {
+        self.ablate
     }
 
     /// Whether function `f`, a version behind a guard, is still worth picking, and counts the

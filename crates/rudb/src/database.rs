@@ -3000,6 +3000,7 @@ impl Shared {
             tier: self.inner.settings.tier(),
             switch: self.inner.settings.switch(),
             morsel: self.inner.settings.morsel(),
+            ablate: self.inner.settings.ablate(),
             ..rudb_qc::Options::default()
         }
     }

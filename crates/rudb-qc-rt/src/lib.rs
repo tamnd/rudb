@@ -7,6 +7,7 @@
 #![deny(unsafe_code)]
 
 pub mod abi;
+mod ablate;
 pub mod code;
 pub mod join;
 pub mod like;
@@ -16,4 +17,5 @@ mod rt;
 pub mod table;
 pub mod text;
 
+pub use ablate::Ablate;
 pub use rt::{Kernel, Maker, RUNTIME_ERROR, Rt, hash};

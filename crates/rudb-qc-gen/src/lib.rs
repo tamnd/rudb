@@ -57,7 +57,7 @@ use rudb_qc_plan::{Aggregate, Column, Expr, Kind, Refusal, Result};
 use rudb_qc_rt::abi::{COL_SIZE, COL_VALID, HEADER, MORSEL_BEGIN, MORSEL_COLS, MORSEL_END};
 use rudb_qc_rt::join::{ADDRESS, FOLD, JoinLayout, JoinTable};
 use rudb_qc_rt::table::{GroupTable, KeyField, Layout};
-use rudb_qc_rt::{Rt, text};
+use rudb_qc_rt::{Ablate, Rt, text};
 
 /// Where the sink's fields start.
 const SINK: u32 = HEADER;
@@ -317,7 +317,9 @@ fn pipeline(
     // Only the first operator sees every row of the morsel. A `LIKE` past a filter is asked only of
     // the rows that got through, and answering it for the whole morsel would ask all of them.
     let mut likes: Vec<Matched> = Vec::new();
-    if let Some(PipeOp::Filter(f)) = p.ops.first() {
+    if let Some(PipeOp::Filter(f)) = p.ops.first()
+        && !rt.ablate().off(Ablate::LIKE)
+    {
         matched(f, source.len(), &mut likes);
     }
     for m in &mut likes {
@@ -682,7 +684,7 @@ impl Gen<'_> {
                     self.field(SINK + size + 8, 32, "probe");
                     (None, Some(SINK + size), SINK + size + 40)
                 };
-                let probe = last.map(|at| at + 8);
+                let probe = last.filter(|_| !self.rt.ablate().off(Ablate::PROBE)).map(|at| at + 8);
                 let grouping = Grouping { table, keys, acc_offset, accs, row, last, probe };
                 Ok((Out::Aggregate(grouping), state))
             }

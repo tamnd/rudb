@@ -38,7 +38,7 @@ use rudb_qc_pipe::{Pipeline, Source, Step};
 use rudb_qc_plan::{Column, Key};
 use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
 use rudb_qc_rt::table::{Agreed, Distinct, GroupTable, Job, LANE_BITS, SetPart};
-use rudb_qc_rt::{RUNTIME_ERROR, Rt, text};
+use rudb_qc_rt::{Ablate, RUNTIME_ERROR, Rt, text};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
 use crate::Under;
@@ -244,6 +244,11 @@ impl<'a> Feed<'a> {
         })
     }
 
+    /// Whether a top N by a count is cut from the group rows before they are made into values.
+    fn counting(&self) -> bool {
+        !self.tiers.ablate().off(Ablate::TOP)
+    }
+
     /// A worker with a runtime of its own and its state as init leaves it.
     fn worker(&self) -> Worker {
         self.tiers.joined(self.func);
@@ -256,7 +261,7 @@ impl<'a> Feed<'a> {
             && let Some(table) = rt.table_mut(g.table)
         {
             table.cap(WORKER_GROUPS);
-            if self.sets.is_empty() {
+            if self.sets.is_empty() && !self.tiers.ablate().off(Ablate::LANES) {
                 table.lanes();
             }
         }
@@ -497,10 +502,11 @@ impl<'a> Feed<'a> {
             .iter()
             .map(|&h| inner.rt.distinct(h).map(|d| (h, d)).ok_or_else(|| gone(h)))
             .collect::<Result<Vec<_>>>()?;
-        let (columns, top) = (self.columns, self.top);
-        let span = span(top, g);
+        let (columns, top, counting) = (self.columns, self.top, self.counting());
+        let span = span(top, g, counting);
         let chunks = pieces(threads, table.len().div_ceil(span), |at| {
-            piece(table, &sets, g, columns, top, at * span, ((at + 1) * span).min(table.len()))
+            let to = ((at + 1) * span).min(table.len());
+            piece(table, &sets, g, columns, (top, counting), at * span, to)
         })?;
         let mut out = Vec::with_capacity(chunks.len());
         for chunk in chunks {
@@ -528,8 +534,9 @@ impl<'a> Feed<'a> {
         let folds = &self.folds;
         let fold = |d: &mut [u8], s: &[u8]| merge::fold(folds, d, s);
         let (columns, top) = (self.columns, self.top);
-        let counted =
-            top.and_then(|(keys, count)| Some((finish::counted(g, keys)?, keys.len() > 1, count)));
+        let counted = top
+            .filter(|_| self.counting())
+            .and_then(|(keys, count)| Some((finish::counted(g, keys)?, keys.len() > 1, count)));
         let (chunks, layout) = {
             let mine = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
             let tables = std::iter::once(Ok(mine))
@@ -868,6 +875,7 @@ impl<'a> Feed<'a> {
     /// Runs the steps after the body once every chunk has been pushed, and returns the rows the
     /// pipeline produced.
     pub(crate) fn finish(self) -> Result<Vec<Chunk>> {
+        let counting = self.counting();
         let inner = self.inner.into_inner().map_err(|_| Error::internal("a feed was poisoned"))?;
         let mut out = inner.out;
         if self.ordered && inner.from.len() == out.len() {
@@ -888,7 +896,7 @@ impl<'a> Feed<'a> {
                     Out::Aggregate(g) if !inner.grouped => {
                         let table = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
                         let sets = finish::sets(inner.rt, g)?;
-                        let span = span(self.top, g);
+                        let span = span(self.top, g, counting);
                         let mut cuts = Vec::new();
                         for from in (0..table.len()).step_by(span) {
                             let to = (from + span).min(table.len());
@@ -897,7 +905,7 @@ impl<'a> Feed<'a> {
                                 &sets,
                                 g,
                                 self.columns,
-                                self.top,
+                                (self.top, counting),
                                 from,
                                 to,
                             )?);
@@ -958,25 +966,25 @@ impl<'a> Feed<'a> {
 
 /// How many groups [`piece`] takes at once: many when a top N by a count reads them, because
 /// then only the groups that can make it are made into values, and a chunk's worth otherwise.
-fn span(top: Option<(&[Key], u64)>, g: &Grouping) -> usize {
+fn span(top: Option<(&[Key], u64)>, g: &Grouping, counting: bool) -> usize {
     match top {
-        Some((keys, _)) if finish::counted(g, keys).is_some() => COUNTED_SPAN,
+        Some((keys, _)) if counting && finish::counted(g, keys).is_some() => COUNTED_SPAN,
         _ => VECTOR_SIZE,
     }
 }
 
 /// The groups from `from` to `to` of `table` as chunks, cut to the top N when only a top N reads
-/// them.
+/// them, and cut by the count first when `counting` says the top N can be.
 fn piece(
     table: &GroupTable,
     sets: &[(u64, &Distinct)],
     g: &Grouping,
     columns: &[Column],
-    top: Option<(&[Key], u64)>,
+    (top, counting): (Option<(&[Key], u64)>, bool),
     from: usize,
     to: usize,
 ) -> Result<Vec<Chunk>> {
-    let kept = top.and_then(|(keys, count)| {
+    let kept = top.filter(|_| counting).and_then(|(keys, count)| {
         let at = finish::counted(g, keys)?;
         finish::counted_top(table, at, keys.len() > 1, count, from, to)
     });

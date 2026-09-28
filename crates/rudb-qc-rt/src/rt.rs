@@ -14,6 +14,7 @@ use rudb_qc_interp::Runtime;
 use rudb_qc_ir::{CATALOGUE, status};
 use rudb_regex::{Regex, Rewrite};
 
+use crate::Ablate;
 use crate::join::{JoinTable, Published};
 use crate::like::Like;
 use crate::mem;
@@ -120,6 +121,8 @@ pub struct Rt {
     cancel: Cancel,
     error: Option<Error>,
     buffer: String,
+    /// The techniques this query leaves out.
+    ablate: Ablate,
     /// The runtimes of the workers folded into this one. Their heaps hold strings the rows of
     /// this one's tables point at, so they live as long as it does.
     held: Vec<Rt>,
@@ -148,8 +151,20 @@ impl Rt {
             cancel,
             error: None,
             buffer: String::new(),
+            ablate: Ablate::NONE,
             held: Vec::new(),
         }
+    }
+
+    /// Leaves out the techniques in `ablate`, before any handle is made.
+    pub fn set_ablate(&mut self, ablate: Ablate) {
+        self.ablate = ablate;
+    }
+
+    /// The techniques this query leaves out.
+    #[must_use]
+    pub fn ablate(&self) -> Ablate {
+        self.ablate
     }
 
     /// A runtime for one worker of a parallel pipeline. Every handle names the same kind of
@@ -181,6 +196,7 @@ impl Rt {
             counters: Vec::new(),
             cancel: self.cancel.clone(),
             error: None,
+            ablate: self.ablate,
             buffer: String::new(),
             held: Vec::new(),
         }
