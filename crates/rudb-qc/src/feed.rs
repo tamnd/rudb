@@ -27,7 +27,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rudb_common::{Cancel, Error, ErrorCode, Result};
+use rudb_common::{Cancel, Error, ErrorCode, LogicalType, Result};
 use rudb_exec::TopCut;
 use rudb_pipeline::{Lease, Morsel as Cut, Progress, Sink};
 use rudb_plan::Plan;
@@ -99,6 +99,7 @@ pub(crate) struct Worker {
     /// The morsel the worker is on, and the morsel each chunk in `out` came from.
     morsel: u64,
     from: Vec<u64>,
+    headers: Headers,
 }
 
 /// What a call changes.
@@ -118,7 +119,18 @@ struct Inner<'a> {
     grouped: bool,
     /// Whether a worker has been folded into the runtime yet.
     merged: bool,
+    headers: Headers,
 }
+
+/// For each column the body reads, the last text dictionary it came with, that dictionary's values
+/// made flat, and a `str16` header per value.
+///
+/// A text column storage keeps coded reaches the body as codes into one dictionary for the whole
+/// column, or one a page. Made flat, every row's string was copied out of the dictionary into an
+/// arena of its own and then made into a header, which was over a third of the instructions of
+/// TPC-H q1 compiled. Kept coded, the dictionary is made into headers once and a row costs the
+/// load of its header.
+type Headers = Vec<Option<(Arc<Vector>, Arc<Vector>, Vec<u128>)>>;
 
 /// One cache line of state.
 #[repr(C, align(64))]
@@ -227,6 +239,7 @@ impl<'a> Feed<'a> {
                 merged: false,
                 workers: Vec::new(),
                 grouped: false,
+                headers: Vec::new(),
             }),
         })
     }
@@ -269,7 +282,7 @@ impl<'a> Feed<'a> {
             let row = table.address(0) as u64;
             bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
         }
-        Worker { rt, state, out: Vec::new(), morsel: 0, from: Vec::new() }
+        Worker { rt, state, out: Vec::new(), morsel: 0, from: Vec::new(), headers: Vec::new() }
     }
 
     /// Says that the pipeline's input has `rows` rows, when that is known.
@@ -631,8 +644,8 @@ impl<'a> Feed<'a> {
         if inner.done {
             return Ok(Progress::Done);
         }
-        let Inner { rt, state, out, done, .. } = &mut *inner;
-        self.run(chunk, rt, state, out, done)
+        let Inner { rt, state, out, done, headers, .. } = &mut *inner;
+        self.run(chunk, rt, state, out, done, headers)
     }
 
     /// Runs the body over one chunk against `rt` and `state`.
@@ -643,15 +656,32 @@ impl<'a> Feed<'a> {
         state: &mut [Line],
         out: &mut Vec<Chunk>,
         done: &mut bool,
+        headers: &mut Headers,
     ) -> Result<Progress> {
-        let chunk = chunk.clone().settled()?.into_flat()?;
+        let chunk = chunk.clone().settled()?;
         let rows = chunk.len();
         if rows == 0 {
             return Ok(Progress::More);
         }
+        // A text column the body reads is kept coded when its dictionary is small or its headers
+        // are made already, and every other column is made flat. A column a `LIKE` answers is made
+        // flat too, because the answers read its strings in place.
+        headers.resize(self.body.reads.len(), None);
+        let mut keep = vec![false; chunk.width()];
+        for (&c, known) in self.body.reads.iter().zip(headers.iter()) {
+            keep[c] = !self.body.likes.iter().any(|m| m.column == c)
+                && coded(chunk.column(c)?, rows, known.as_ref());
+        }
+        let columns = chunk.into_columns().into_iter().zip(&keep);
+        let columns = columns.map(|(v, &keep)| if keep { Ok(v) } else { v.into_flat() });
+        let chunk = Chunk::with_rows(columns.collect::<Result<_>>()?, rows)?;
         let mut held = Vec::with_capacity(self.body.reads.len());
-        for &c in &self.body.reads {
-            held.push(Held::of(chunk.column(c)?, rows, true)?);
+        for (&c, known) in self.body.reads.iter().zip(headers.iter_mut()) {
+            held.push(if keep[c] {
+                Held::coded(chunk.column(c)?, rows, known)?
+            } else {
+                Held::of(chunk.column(c)?, rows, true)?
+            });
         }
         let mut cols: Vec<Col> = held.iter().map(Held::col).collect();
         // Each `LIKE` the body reads as a column is answered here for the whole morsel.
@@ -1003,18 +1033,7 @@ impl<'c> Held<'c> {
     /// Holds `v`, and without the strings of a string column when `strings` is false, for a
     /// column the body reads only the validity of.
     fn of(v: &'c Vector, rows: usize, strings: bool) -> Result<Held<'c>> {
-        let mut valid = vec![0xffu8; rows.div_ceil(8)];
-        let mut clean = true;
-        if !matches!(v.validity(), Validity::AllValid) {
-            valid.fill(0);
-            for i in 0..rows {
-                if v.is_null_at(i) {
-                    clean = false;
-                } else {
-                    valid[i / 8] |= 1 << (i % 8);
-                }
-            }
-        }
+        let (valid, clean) = validity(v, rows);
         let data = v.data().ok_or_else(|| Error::internal("a flattened column is not flat"))?;
         let mut text = Vec::new();
         let values = match data {
@@ -1073,9 +1092,75 @@ impl<'c> Held<'c> {
         Ok(Held { values, valid, clean, _text: text, _chunk: std::marker::PhantomData })
     }
 
+    /// A text column held as codes into a dictionary: the header of each row's value, from the
+    /// headers `known` has for the dictionary, made first when it has them for another one.
+    fn coded(
+        v: &'c Vector,
+        rows: usize,
+        known: &mut Option<(Arc<Vector>, Arc<Vector>, Vec<u128>)>,
+    ) -> Result<Held<'c>> {
+        let (codes, dictionary) = v
+            .shared_dictionary_parts()
+            .ok_or_else(|| Error::internal("a coded column that is not a dictionary"))?;
+        let codes = codes.get(..rows).ok_or_else(|| Error::internal("fewer codes than rows"))?;
+        if !known.as_ref().is_some_and(|(d, ..)| Arc::ptr_eq(d, dictionary)) {
+            // The headers of long values point into `values`, which is kept with them.
+            let values = Arc::new((**dictionary).clone().into_flat()?);
+            let Some(Data::Varlen(s)) = values.data() else {
+                return Err(Error::internal("a text dictionary whose values are not strings"));
+            };
+            let arena = s.arena();
+            let made =
+                s.views().iter().map(|view| text::make(view.bytes_in(arena).unwrap_or_default()));
+            let made = made.collect();
+            *known = Some((Arc::clone(dictionary), values, made));
+        }
+        let Some((_, _, made)) = known.as_ref() else {
+            return Err(Error::internal("headers made and then not there"));
+        };
+        let text: Vec<u128> =
+            codes.iter().map(|&code| made.get(code as usize).copied().unwrap_or(0)).collect();
+        let (valid, clean) = validity(v, rows);
+        let values = text.as_ptr().cast::<u8>();
+        Ok(Held { values, valid, clean, _text: text, _chunk: std::marker::PhantomData })
+    }
+
     fn col(&self) -> Col {
         Col { values: self.values, valid: self.valid.as_ptr() }
     }
+}
+
+/// Whether `v` is read as codes into its dictionary, which is when it is text coded into a
+/// dictionary with no NULL in it and either its headers are made already or the dictionary is not
+/// much longer than the chunk, so that making them is no more work than copying out the rows.
+fn coded(v: &Vector, rows: usize, known: Option<&(Arc<Vector>, Arc<Vector>, Vec<u128>)>) -> bool {
+    if v.logical_type() != &LogicalType::Varchar {
+        return false;
+    }
+    let Some((codes, dictionary)) = v.shared_dictionary_parts() else {
+        return false;
+    };
+    codes.len() >= rows
+        && !dictionary.validity().has_nulls(dictionary.len())
+        && (known.is_some_and(|(d, ..)| Arc::ptr_eq(d, dictionary))
+            || dictionary.len() <= rows.max(VECTOR_SIZE))
+}
+
+/// The validity bitmap of the first `rows` rows of `v`, and whether none of them is NULL.
+fn validity(v: &Vector, rows: usize) -> (Vec<u8>, bool) {
+    let mut valid = vec![0xffu8; rows.div_ceil(8)];
+    let mut clean = true;
+    if !matches!(v.validity(), Validity::AllValid) {
+        valid.fill(0);
+        for i in 0..rows {
+            if v.is_null_at(i) {
+                clean = false;
+            } else {
+                valid[i / 8] |= 1 << (i % 8);
+            }
+        }
+    }
+    (valid, clean)
 }
 
 /// The root of a scan the first engine runs for us.
@@ -1116,7 +1201,9 @@ impl Sink for Scan<'_, '_> {
     fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress> {
         match local {
             Some(w) => {
-                let progress = self.0.run(chunk, &mut w.rt, &mut w.state, &mut w.out, &mut false);
+                let (rt, state, out, headers) =
+                    (&mut w.rt, &mut w.state, &mut w.out, &mut w.headers);
+                let progress = self.0.run(chunk, rt, state, out, &mut false, headers);
                 w.from.resize(w.out.len(), w.morsel);
                 progress
             }
@@ -1191,4 +1278,52 @@ fn pieces<T: Send>(
                 .ok_or_else(|| Error::internal("a piece of a merge went missing"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use rudb_common::Value;
+
+    use super::*;
+
+    /// The headers of a column read as codes, dereferenced back to bytes, one per row.
+    fn read(held: &Held<'_>, rows: usize) -> Vec<Option<Vec<u8>>> {
+        let headers = held.values.cast::<u128>();
+        (0..rows)
+            .map(|i| {
+                (held.valid[i / 8] & (1 << (i % 8)) != 0).then(|| {
+                    // SAFETY: `values` is `rows` headers whose long strings the test keeps alive.
+                    let h = unsafe { headers.add(i).read_unaligned() };
+                    let len = h as u32 as usize;
+                    if len <= text::INLINE {
+                        h.to_le_bytes()[4..4 + len].to_vec()
+                    } else {
+                        let at = (h >> 64) as usize as *const u8;
+                        // SAFETY: a long header points at `len` bytes of the dictionary's values.
+                        unsafe { std::slice::from_raw_parts(at, len) }.to_vec()
+                    }
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_text_dictionary_is_read_as_its_values_through_headers_made_once() {
+        let words = ["R", "", "a string that is longer than twelve bytes"];
+        let values: Vec<Value> = words.iter().map(|w| Value::Varchar((*w).to_string())).collect();
+        let dictionary = Arc::new(Vector::from_values(LogicalType::Varchar, &values).unwrap());
+        let codes = vec![2, 0, 1, 2, 2, 0, 1, 0, 2];
+        let rows = codes.len();
+        let v = Vector::stable_dictionary(codes.clone(), Arc::clone(&dictionary)).unwrap();
+        let mut known = None;
+        assert!(coded(&v, rows, known.as_ref()));
+        let first = read(&Held::coded(&v, rows, &mut known).unwrap(), rows);
+        let made = known.as_ref().map(|(_, values, _)| Arc::as_ptr(values));
+        let again = read(&Held::coded(&v, rows, &mut known).unwrap(), rows);
+        assert_eq!(made, known.as_ref().map(|(_, values, _)| Arc::as_ptr(values)));
+        let want: Vec<_> =
+            codes.iter().map(|&c| Some(words[c as usize].as_bytes().to_vec())).collect();
+        assert_eq!(first, want);
+        assert_eq!(again, want);
+    }
 }
