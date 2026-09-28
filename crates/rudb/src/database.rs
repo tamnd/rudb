@@ -3733,7 +3733,12 @@ impl Shared {
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 let result = run(sql, &copy.plan, &catalog, cancel, under)?;
-                let rows = crate::export::write_csv(&copy, &result, session.session_time_zone())?;
+                let zone = session.session_time_zone();
+                let rows = if copy.json {
+                    crate::export::write_json(&copy, &result, zone)?
+                } else {
+                    crate::export::write_csv(&copy, &result, zone)?
+                };
                 QueryResult::changed(rows)
             }
             Bound::Setting(setting)
