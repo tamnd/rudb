@@ -313,6 +313,7 @@ fn encode_insert(
             if chunk.width() != fields.len() {
                 return None;
             }
+            // row at a time: only a small insert is logged this way, and `most` caps its bytes.
             for row in 0..chunk.len() {
                 put(&mut out, &chunk.value_at(row, column), &field.ty)?;
             }
