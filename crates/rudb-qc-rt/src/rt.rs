@@ -388,9 +388,9 @@ impl Rt {
         let Some(Object::Table(table)) = self.objects.get_mut(a[0] as usize) else {
             return Err(self.fail(bad_handle("ht_insert")));
         };
-        // SAFETY: the generator passes the key buffer in its state, laid out as the table's
-        // layout says.
-        let row = unsafe { table.insert(a[1] as usize, a[2] as u64, &mut self.heap) };
+        let at = a.get(3).map_or(0, |&w| w as usize);
+        // SAFETY: the generator passes the key buffer and the published words in its state.
+        let row = unsafe { insert(table, a[1] as usize, a[2] as u64, at, &mut self.heap) };
         Ok(row as u128)
     }
 
@@ -583,8 +583,10 @@ impl Runtime for Rt {
             let Some(Object::Table(table)) = self.objects.get_mut(args[0] as usize) else {
                 return self.fail(bad_handle("ht_insert"));
             };
+            let at = args.get(3).map_or(0, |&w| w as usize);
             // SAFETY: as for `ht_insert`.
-            let row = unsafe { table.insert(args[1] as usize, args[2] as u64, &mut self.heap) };
+            let row =
+                unsafe { insert(table, args[1] as usize, args[2] as u64, at, &mut self.heap) };
             *out = row as u128;
             return 0;
         }
@@ -620,6 +622,41 @@ impl Runtime for Rt {
     }
 }
 
+/// Inserts the key at `key` into `table`. When `at` is not zero it is the address of the four
+/// words of the state where compiled code finds a key's row without calling here: the slots, their
+/// mask, the rows and how many keys it found that way since the last call, which this adds to the
+/// table's count and zeroes before it publishes the first three again, since the insert may have
+/// moved them.
+///
+/// # Safety
+///
+/// `key` must be a key laid out as the table's layout says and `at` zero or the address of four
+/// writable words.
+unsafe fn insert(
+    table: &mut GroupTable,
+    key: usize,
+    hash: u64,
+    at: usize,
+    heap: &mut Heap,
+) -> usize {
+    if at == 0 {
+        // SAFETY: the caller's contract.
+        return unsafe { table.insert(key, hash, heap) };
+    }
+    // SAFETY: the caller's contract.
+    let found = unsafe { mem::slice(at + 24, 8) };
+    table.found(u64::from_le_bytes(found.try_into().unwrap_or_default()) as usize);
+    // SAFETY: the caller's contract.
+    let row = unsafe { table.insert(key, hash, heap) };
+    let mut words = [0u8; 32];
+    for (w, v) in words.chunks_exact_mut(8).zip(table.published()) {
+        w.copy_from_slice(&v.to_le_bytes());
+    }
+    // SAFETY: the caller's contract.
+    unsafe { mem::write(at, &words) };
+    row
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,7 +683,7 @@ mod tests {
             let args: Vec<u128> = match p.name {
                 "str_like" => vec![u128::from(like), s],
                 "str_regex" | "str_regex_replace" => vec![u128::from(re), s],
-                "ht_insert" => vec![u128::from(table), 0, 5],
+                "ht_insert" => vec![u128::from(table), 0, 5, 0],
                 "jt_append" => vec![u128::from(join), 0, 5],
                 "agg_distinct" | "agg_distinct_int" => vec![u128::from(set), row, s],
                 "agg_min_str" | "agg_max_str" => vec![row + 8],

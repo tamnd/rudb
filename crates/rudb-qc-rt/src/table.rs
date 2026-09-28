@@ -337,6 +337,29 @@ impl GroupTable {
         self.rows[gid]
     }
 
+    /// What compiled code needs to find a key's row itself: the address of the slots, their mask
+    /// and the address of the row addresses by group id. All zero while every key must come
+    /// through [`insert`](GroupTable::insert), which is before the first key, for a table with an
+    /// [`Agreed`] set and for one making rows without looking. The words are good until the next
+    /// insert, which may move them.
+    #[must_use]
+    pub fn published(&self) -> [u64; 3] {
+        if self.limited.is_some() || self.blind != 0 || self.slots.is_empty() {
+            return [0; 3];
+        }
+        [
+            self.slots.as_ptr().expose_provenance() as u64,
+            self.slots.len() as u64 - 1,
+            self.rows.as_ptr().expose_provenance() as u64,
+        ]
+    }
+
+    /// Counts `n` keys compiled code found through [`published`](GroupTable::published) words,
+    /// which a table with lanes weighs against the groups it makes.
+    pub fn found(&mut self, n: usize) {
+        self.asked += n;
+    }
+
     /// [`insert`](GroupTable::insert) for a table with an [`Agreed`] set. A key the table has is
     /// found without the lock, and so is every key once the table has the whole set.
     fn insert_limited(&mut self, key: &[u8], hash: u64, heap: &mut Heap) -> usize {
