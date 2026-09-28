@@ -3179,6 +3179,43 @@ impl Shared {
         run(sql, &plan, &catalog, cancel, under).map(Some)
     }
 
+    /// Runs a planned query on the engine `SET engine` picked, which for `compiled` is the compiled
+    /// engine when it takes the plan and the first engine when it hands it back.
+    ///
+    /// Both ways a query comes in ask here, a caller's `query` and a statement the shell runs
+    /// through `execute`, so the setting means the same thing whichever one a query took.
+    fn answer(
+        &self,
+        sql: &str,
+        plan: &Plan,
+        catalog: &Catalog,
+        cancel: &Cancel,
+        under: Under<'_>,
+    ) -> Result<QueryResult> {
+        if self.inner.settings.engine() == COMPILED_ENGINE {
+            // A query the first engine answers out of the statistics kept about its tables,
+            // without reading a row, has nothing for compiled code to make faster.
+            if aggregates_a_table(plan, plan.root()) {
+                let first = built(plan, catalog, cancel, under)?;
+                if !first.query.reads_tables() {
+                    return finish(sql, plan, cancel, under, first);
+                }
+            }
+            let compiling = Span::start();
+            let compiled = rudb_qc::compile_with(plan, cancel, self.qc_options());
+            let (codegen_ns, _) = compiling.stop();
+            match compiled {
+                Ok(compiled) => {
+                    let switches = &self.inner.switches;
+                    let compiled = Codegen { compiled, codegen_ns, switches };
+                    return run_compiled(sql, plan, catalog, cancel, compiled, under);
+                }
+                Err(refusal) => self.refused(sql, &refusal),
+            }
+        }
+        run(sql, plan, catalog, cancel, under)
+    }
+
     /// Notes a query the compiled engine handed back, before the first engine runs it.
     fn refused(&self, sql: &str, refusal: &rudb_qc::Refusal) {
         let mut log = self.inner.refusals.lock().unwrap_or_else(PoisonError::into_inner);
@@ -3249,28 +3286,7 @@ impl Shared {
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
-                if self.inner.settings.engine() == COMPILED_ENGINE {
-                    // A query the first engine answers out of the statistics kept about its
-                    // tables, without reading a row, has nothing for compiled code to make faster.
-                    if aggregates_a_table(&plan, plan.root()) {
-                        let first = built(&plan, &catalog, cancel, under)?;
-                        if !first.query.reads_tables() {
-                            return finish(sql, &plan, cancel, under, first);
-                        }
-                    }
-                    let compiling = Span::start();
-                    let compiled = rudb_qc::compile_with(&plan, cancel, self.qc_options());
-                    let (codegen_ns, _) = compiling.stop();
-                    match compiled {
-                        Ok(compiled) => {
-                            let switches = &self.inner.switches;
-                            let compiled = Codegen { compiled, codegen_ns, switches };
-                            return run_compiled(sql, &plan, &catalog, cancel, compiled, under);
-                        }
-                        Err(refusal) => self.refused(sql, &refusal),
-                    }
-                }
-                run(sql, &plan, &catalog, cancel, under)
+                self.answer(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze, statistics, codegen } => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
@@ -3731,7 +3747,12 @@ impl Shared {
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
-                run(sql, &plan, &catalog, cancel, under)
+                // A plan with parameters in it is left to the first engine, which the compiled one
+                // has never been asked to take.
+                if !parameters.is_empty() {
+                    return run(sql, &plan, &catalog, cancel, under);
+                }
+                self.answer(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze, statistics, codegen } => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;

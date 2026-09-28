@@ -109,6 +109,36 @@ fn catalog() -> Catalog {
         .rows_mut()
         .append_rows(&rows)
         .expect("rows of the table's own types");
+    // `dec` holds prices and rates the way TPC-H's lineitem does, some of them NULL, and one row
+    // whose price is too wide for a narrower decimal.
+    let dec = QualifiedName::new("memory", "main", "dec");
+    let money = LogicalType::Decimal { width: 15, scale: 2 };
+    catalog
+        .create_table(
+            dec.clone(),
+            vec![
+                Field::new("k", LogicalType::Integer),
+                Field::new("p", money.clone()),
+                Field::new("r", money),
+            ],
+        )
+        .expect("a fresh table");
+    let cents = |unscaled: i128| Value::Decimal { unscaled, width: 15, scale: 2 };
+    let rows: Vec<Vec<Value>> = (0..6000i128)
+        .map(|i| {
+            let p =
+                if i % 13 == 7 { Value::Null } else { cents(i * 7919 % 10_000_000 - 3_000_000) };
+            let r = if i % 17 == 3 { Value::Null } else { cents(i % 11) };
+            vec![Value::Integer((i % 4) as i32), p, r]
+        })
+        .chain([vec![Value::Integer(9), cents(99_999_999_999), cents(5)]])
+        .collect();
+    catalog
+        .table_mut(&dec)
+        .expect("the table just created")
+        .rows_mut()
+        .append_rows(&rows)
+        .expect("rows of the table's own types");
     let empty = QualifiedName::new("memory", "main", "empty");
     catalog
         .create_table(empty, vec![Field::new("x", LogicalType::Integer)])
@@ -485,4 +515,46 @@ fn an_error_a_function_raises_is_the_error_the_first_engine_raises() {
     ));
     assert_eq!(error.code(), ErrorCode::InvalidInput, "{error:?}");
     assert!(error.to_string().contains("(x // 0)"), "{error}");
+}
+
+const DEC: &str = "Get memory.main.dec AS dec #0 [k::INTEGER, p::DECIMAL(15,2), r::DECIMAL(15,2)]";
+
+#[test]
+fn decimal_sums_products_and_averages_match_the_first_engine() {
+    let charge = concat!(
+        "\"*\"(\"*\"(CAST(#0.1::DECIMAL(15,2))::DECIMAL(18,2), ",
+        "\"-\"(1.00::DECIMAL(18,2), CAST(#0.2::DECIMAL(15,2))::DECIMAL(18,2))::DECIMAL(18,2))::DECIMAL(18,4), ",
+        "\"+\"(1.00::DECIMAL(18,2), CAST(#0.2::DECIMAL(15,2))::DECIMAL(18,2))::DECIMAL(18,2))::DECIMAL(18,6)",
+    );
+    let aggs = format!(
+        "aggregates=[sum(#0.1::DECIMAL(15,2))::DECIMAL(38,2), sum({charge})::DECIMAL(38,6), avg(#0.1::DECIMAL(15,2))::DOUBLE, avg(#0.2::DECIMAL(15,2))::DOUBLE, count_star()::BIGINT]"
+    );
+    same(&format!("Aggregate #1 groups=[#0.0::INTEGER] {aggs}\n  {DEC}"), false);
+    same(&format!("Aggregate #1 groups=[] {aggs}\n  {DEC}"), true);
+}
+
+#[test]
+fn decimal_casts_and_comparisons_match_the_first_engine() {
+    let text = concat!(
+        "Project #1 [CAST(#0.1::DECIMAL(15,2))::DECIMAL(15,1) AS a, CAST(#0.1::DECIMAL(15,2))::DOUBLE AS b, ",
+        "\"-\"(#0.2::DECIMAL(15,2))::DECIMAL(15,2) AS c]\n",
+        "  Filter (#0.2::DECIMAL(15,2) >= 0.05::DECIMAL(15,2))::BOOLEAN\n",
+        "    Get memory.main.dec AS dec #0 [k::INTEGER, p::DECIMAL(15,2), r::DECIMAL(15,2)]",
+    );
+    same(text, false);
+}
+
+#[test]
+fn a_decimal_cast_out_of_range_is_the_error_the_first_engine_raises() {
+    // The first engine names the value in its message and compiled code only has the types, so
+    // the two agree on the code.
+    let text = format!("Project #1 [CAST(#0.1::DECIMAL(15,2))::DECIMAL(9,2) AS a]\n  {DEC}");
+    let plan = Plan::parse(&text).expect("a well formed plan");
+    let first = rudb_exec::build(&plan, &catalog())
+        .expect("the first engine builds")
+        .collect(&Cancel::new(), &Pool::default())
+        .expect_err("the cast is out of range");
+    let error = compiled(&text).expect_err("the cast is out of range");
+    assert_eq!(error.code(), first.code(), "{error:?}");
+    assert_eq!(error.code(), ErrorCode::Conversion, "{error:?}");
 }

@@ -321,6 +321,25 @@ impl Stage {
         }
     }
 
+    /// Gives the columns the stage produces the names in `columns`, which match them in number
+    /// and type.
+    fn rename(&mut self, columns: Vec<Column>) {
+        let own = match self {
+            Stage::Pipeline(p) => match &mut p.sink {
+                Sink::Result { columns, .. }
+                | Sink::Build { columns, .. }
+                | Sink::Aggregate { columns, .. } => columns,
+            },
+            Stage::Sort { columns, .. }
+            | Stage::TopN { columns, .. }
+            | Stage::Limit { columns, .. }
+            | Stage::Fetch { columns, .. } => columns,
+        };
+        for (own, new) in own.iter_mut().zip(columns) {
+            own.name = new.name;
+        }
+    }
+
     /// The stages this one reads: the one its rows come from and the builds its probes read.
     #[must_use]
     pub fn inputs(&self) -> Vec<usize> {
@@ -424,6 +443,9 @@ impl Graph {
             && open.ops.is_empty()
             && open.is_identity()
         {
+            // A projection that only renames, like the `AS revenue` over an aggregate, passes the
+            // stage through but keeps its names.
+            self.stages[stage].rename(open.columns);
             return stage;
         }
         let sink = Sink::Result { exprs: open.exprs, columns: open.columns };
@@ -649,6 +671,17 @@ mod tests {
         // The projection over the aggregate only renames, so the top N reads the aggregate.
         assert!(matches!(g.stages[1], Stage::TopN { input: 0, .. }));
         assert_eq!(g.columns()[0].name, "SearchPhrase");
+    }
+
+    #[test]
+    fn a_projection_that_only_renames_the_answer_keeps_its_names() {
+        let g = graph(concat!(
+            "Project #2 [#1.0::BIGINT AS revenue]\n",
+            "  Aggregate #1 groups=[] aggregates=[count_star()::BIGINT]\n",
+            "    Get memory.main.a AS a #0 [x::INTEGER]\n",
+        ));
+        assert_eq!(g.stages.len(), 1, "{g}");
+        assert_eq!(g.columns()[0].name, "revenue");
     }
 
     #[test]
