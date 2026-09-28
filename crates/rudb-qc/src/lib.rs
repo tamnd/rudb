@@ -213,7 +213,8 @@ impl Compiled {
                         .ok_or_else(|| rudb_common::Error::internal("a pipeline with no body"))?;
                     // An aggregate with no groups the table's statistics answer, as they do for the
                     // first engine, reads no rows.
-                    if let Source::Scan { node, .. } = &p.source
+                    if !self.tiers.rows()
+                        && let Source::Scan { node, .. } = &p.source
                         && let Some(aggregate) = summed(plan, *node)
                         && let Some(values) = rudb_exec::summarized(plan, under.catalog, aggregate)?
                         && let Some(chunk) = summary(values, stage.columns())

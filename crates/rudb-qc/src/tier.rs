@@ -233,6 +233,9 @@ pub struct Options {
     /// The most rows one call of a body covers, which cuts a chunk of the scan into morsels of
     /// that many rows. Zero calls it once for the whole chunk.
     pub morsel: usize,
+    /// Whether an aggregate with no groups that the table's statistics answer is run over the
+    /// rows anyway, for testing the compiled code and for measuring what the statistics save.
+    pub rows: bool,
 }
 
 /// What the second tier did with a query's module, for `EXPLAIN (CODEGEN)` and the query log.
@@ -330,6 +333,8 @@ pub(crate) struct Tiers {
     fresh: bool,
     /// The most rows a call covers, zero for a whole chunk.
     split: usize,
+    /// Whether an aggregate the statistics answer reads its rows anyway.
+    rows: bool,
     calibration: Calibration,
     /// The clock the progress is kept on.
     clock: Instant,
@@ -366,7 +371,7 @@ impl fmt::Debug for Tiers {
 impl Tiers {
     /// Lowers `module` for the interpreter and, when `options` asks for it, for the machine.
     pub(crate) fn new(module: &Module, options: Options) -> Tiers {
-        let Options { tier, switch, stay, fresh, morsel } = options;
+        let Options { tier, switch, stay, fresh, morsel, rows } = options;
         let program = Program::new(module);
         let counts = (
             AtomicU64::new(0),
@@ -389,6 +394,7 @@ impl Tiers {
             native,
             fresh,
             split: morsel,
+            rows,
             calibration: Calibration::HOST,
             clock: Instant::now(),
             upper: (0..each).map(|_| Arc::default()).collect(),
@@ -417,6 +423,11 @@ impl Tiers {
     /// The most rows one call of a body covers, zero for a whole chunk.
     pub(crate) fn split(&self) -> usize {
         self.split
+    }
+
+    /// Whether an aggregate the statistics answer reads its rows anyway.
+    pub(crate) fn rows(&self) -> bool {
+        self.rows
     }
 
     /// Whether function `f`, a version behind a guard, is still worth picking, and counts the
