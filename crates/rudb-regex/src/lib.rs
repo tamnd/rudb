@@ -69,6 +69,8 @@ mod compile;
 mod parse;
 mod vm;
 
+use std::cell::RefCell;
+
 use rudb_common::{Error, Result};
 
 use crate::compile::Program;
@@ -166,19 +168,20 @@ impl Regex {
     /// `start` is zero, which is what makes a global replacement of an anchored pattern replace once.
     #[must_use]
     pub fn find_at(&self, text: &str, start: usize) -> Option<Captures> {
-        self.search(text, start, false).map(|slots| Captures { slots })
+        let mut found = Captures { slots: Vec::new() };
+        self.search(text, start, false, &mut found.slots).then_some(found)
     }
 
     /// Whether the pattern matches anywhere in the text, which is `regexp_matches`.
     #[must_use]
     pub fn is_match(&self, text: &str) -> bool {
-        self.search(text, 0, false).is_some()
+        self.matches(text, false)
     }
 
     /// Whether the pattern matches the whole text, which is `regexp_full_match`.
     #[must_use]
     pub fn is_full_match(&self, text: &str) -> bool {
-        self.search(text, 0, true).is_some()
+        self.matches(text, true)
     }
 
     /// Finds the first match, through [`run`].
@@ -189,16 +192,32 @@ impl Regex {
     /// answer passes that check it is the whole pattern's answer too: the head's match comes first
     /// in priority among the head's matches, and the whole pattern's first is the first of those
     /// the tail accepts. Where it does not, the whole pattern runs as it would have.
-    fn search(&self, text: &str, start: usize, whole: bool) -> Option<Vec<Option<usize>>> {
+    /// Whether there is a match, with the slots it needs kept in [`FOUND`] rather than allocated.
+    fn matches(&self, text: &str, whole: bool) -> bool {
+        FOUND.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut found) => self.search(text, 0, whole, &mut found.slots),
+            Err(_) => self.search(text, 0, whole, &mut Vec::new()),
+        })
+    }
+
+    fn search(
+        &self,
+        text: &str,
+        start: usize,
+        whole: bool,
+        slots: &mut Vec<Option<usize>>,
+    ) -> bool {
         if let (Some((head, newline)), false) = (&self.head, whole) {
-            let mut slots = run(head, text, start, false)?;
-            let end = slots.get(1).copied().flatten()?;
+            if !run(head, text, start, false, slots) {
+                return false;
+            }
+            let Some(end) = slots.get(1).copied().flatten() else { return false };
             if *newline || !text.as_bytes()[end..].contains(&b'\n') {
                 slots[1] = Some(text.len());
-                return Some(slots);
+                return true;
             }
         }
-        run(&self.program, text, start, whole)
+        run(&self.program, text, start, whole, slots)
     }
 
     /// The text of one group of the first match, which is `regexp_extract`.
@@ -240,16 +259,33 @@ impl Regex {
             out.push_str(text);
             return;
         }
+        FOUND.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut found) => self.replace_with(out, text, rewrite, global, &mut found),
+            Err(_) => {
+                self.replace_with(out, text, rewrite, global, &mut Captures { slots: Vec::new() })
+            }
+        });
+    }
+
+    /// The replacement with somewhere to keep the match, which is the one [`FOUND`] a thread has.
+    fn replace_with(
+        &self,
+        out: &mut String,
+        text: &str,
+        rewrite: &Rewrite,
+        global: bool,
+        found: &mut Captures,
+    ) {
         if global {
-            self.replace_all(out, text, rewrite);
+            self.replace_all(out, text, rewrite, found);
             return;
         }
-        let Some(found) = self.find_at(text, 0) else {
+        if !self.search(text, 0, false, &mut found.slots) {
             out.push_str(text);
             return;
-        };
+        }
         out.push_str(&text[..found.start()]);
-        rewrite.apply(out, text, &found);
+        rewrite.apply(out, text, found);
         out.push_str(&text[found.end()..]);
     }
 
@@ -260,13 +296,13 @@ impl Regex {
     /// '-', 'g')` is `-a-a-a-` in DuckDB: the machine matches the empty string before every
     /// character and once at the end, and the rule that keeps it from matching the empty string
     /// twice in the same place is that an empty match where the last one ended is skipped over.
-    fn replace_all(&self, out: &mut String, text: &str, rewrite: &Rewrite) {
+    fn replace_all(&self, out: &mut String, text: &str, rewrite: &Rewrite, found: &mut Captures) {
         let mut at = 0;
         let mut last_end: Option<usize> = None;
         while at <= text.len() {
-            let Some(found) = self.find_at(text, at) else {
+            if !self.search(text, at, false, &mut found.slots) {
                 break;
-            };
+            }
             if at < found.start() {
                 out.push_str(&text[at..found.start()]);
             }
@@ -278,7 +314,7 @@ impl Regex {
                 at += ch.len_utf8();
                 continue;
             }
-            rewrite.apply(out, text, &found);
+            rewrite.apply(out, text, found);
             at = found.end();
             last_end = Some(at);
         }
@@ -290,11 +326,29 @@ impl Regex {
 ///
 /// This is the only place the choice is made and it is made on size alone, because the two machines
 /// give the same answer and differ only in what they spend to get it.
-fn run(program: &Program, text: &str, start: usize, whole: bool) -> Option<Vec<Option<usize>>> {
+fn run(
+    program: &Program,
+    text: &str,
+    start: usize,
+    whole: bool,
+    slots: &mut Vec<Option<usize>>,
+) -> bool {
     if bitstate::fits(program, text) {
-        return bitstate::search(program, text, start, whole);
+        return bitstate::search(program, text, start, whole, slots);
     }
-    vm::search(program, text, start, whole)
+    match vm::search(program, text, start, whole) {
+        Some(found) => {
+            *slots = found;
+            true
+        }
+        None => false,
+    }
+}
+
+thread_local! {
+    /// Where a replacement keeps the match it is working on, so that a column of them allocates
+    /// one set of slots per thread rather than one per row.
+    static FOUND: RefCell<Captures> = const { RefCell::new(Captures { slots: Vec::new() }) };
 }
 
 /// The pattern before a trailing `.*$`, and whether that dot matches a newline.
@@ -644,11 +698,11 @@ mod tests {
             assert!(regex.head.is_some(), "{pattern:?} has a tail");
             for text in texts {
                 for start in 0..=text.len() {
-                    assert_eq!(
-                        regex.search(text, start, false),
-                        run(&regex.program, text, start, false),
-                        "{pattern:?} over {text:?} from {start}"
-                    );
+                    let (mut split, mut plain) = (Vec::new(), Vec::new());
+                    let split = regex.search(text, start, false, &mut split).then_some(split);
+                    let plain =
+                        run(&regex.program, text, start, false, &mut plain).then_some(plain);
+                    assert_eq!(split, plain, "{pattern:?} over {text:?} from {start}");
                 }
             }
         }
