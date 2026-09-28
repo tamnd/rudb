@@ -131,6 +131,19 @@ fn capacity(k: usize) -> usize {
     (k * 4).next_power_of_two()
 }
 
+/// How many slots a sketch starts with, so that one over a handful of values, which is every
+/// sketch a single-row insert makes, is not a 128 KiB table. It doubles from here up to
+/// [`capacity`] as it fills.
+const FIRST_SLOTS: usize = 16;
+
+/// How many slots a sketch of `k` hashes holding `held` of them gets.
+fn slots_for(k: usize, held: usize) -> usize {
+    (held * 4).next_power_of_two().max(FIRST_SLOTS).min(capacity(k))
+}
+
+/// The most hashes [`Sketch::absorb`] adds one at a time rather than through [`Sketch::union`].
+const FEW: usize = 256;
+
 impl PartialEq for Sketch {
     /// Two sketches are equal when they would answer the same, which is the same k and the same
     /// bottom k hashes. The slots they happen to sit in are not part of that: a table filled in a
@@ -215,7 +228,7 @@ impl Sketch {
     #[inline(never)]
     fn insert(&mut self, hash: u64) {
         if self.slots.is_empty() {
-            self.slots = vec![EMPTY; capacity(self.k)];
+            self.slots = vec![EMPTY; slots_for(self.k, 0)];
         }
         let mask = self.slots.len() - 1;
         let mut at = (hash as usize) & mask;
@@ -238,7 +251,25 @@ impl Sketch {
             self.threshold =
                 self.slots.iter().filter(|slot| **slot != EMPTY).copied().max().unwrap_or(EMPTY);
         } else if self.held >= self.slots.len() / 2 {
-            self.compact();
+            if self.slots.len() < capacity(self.k) {
+                self.grow();
+            } else {
+                self.compact();
+            }
+        }
+    }
+
+    /// Doubles the table, for a sketch that has not reached its full size yet.
+    fn grow(&mut self) {
+        let doubled = vec![EMPTY; self.slots.len() * 2];
+        let old = std::mem::replace(&mut self.slots, doubled);
+        let mask = self.slots.len() - 1;
+        for hash in old.into_iter().filter(|slot| *slot != EMPTY) {
+            let mut at = (hash as usize) & mask;
+            while self.slots[at] != EMPTY {
+                at = (at + 1) & mask;
+            }
+            self.slots[at] = hash;
         }
     }
 
@@ -435,6 +466,27 @@ impl Sketch {
         Ok(Self::holding(self.k, &merged))
     }
 
+    /// Makes this the union of itself and `other`, which is [`Sketch::union`] without building a
+    /// third sketch when `other` holds only a few hashes. Those are added one at a time, which
+    /// leaves the same bottom k: every hash `other` holds is a hash of one of its values, and the
+    /// ones of its bottom k are among them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sketch::union`].
+    pub fn absorb(&mut self, other: &Self) -> Result<()> {
+        if self.k != other.k || other.held > FEW {
+            *self = self.union(other)?;
+            return Ok(());
+        }
+        for &hash in &other.slots {
+            if hash != EMPTY {
+                self.add_hash(hash);
+            }
+        }
+        Ok(())
+    }
+
     /// A sketch holding exactly these hashes, which have to be sorted and deduplicated.
     ///
     /// For [`Sketch::union`], which works out its answer as a list and then needs it back as a
@@ -444,7 +496,7 @@ impl Sketch {
         if hashes.is_empty() {
             return sketch;
         }
-        sketch.slots = vec![EMPTY; capacity(k)];
+        sketch.slots = vec![EMPTY; slots_for(k, hashes.len())];
         let mask = sketch.slots.len() - 1;
         for hash in hashes {
             let mut at = (*hash as usize) & mask;
@@ -1013,5 +1065,24 @@ mod tests {
         // one, and every estimate off it would be wrong by the amount that was dropped.
         assert!(Sketch::from_hashes(4, &[1, 2, 3, 4, 5]).is_err());
         assert!(Sketch::from_hashes(0, &[]).is_err(), "a sketch of no hashes estimates nothing");
+    }
+
+    #[test]
+    fn absorbing_one_row_at_a_time_is_the_union() {
+        let column = values(20_000, "row-");
+        let mut whole = Sketch::of(&borrow(&column));
+        let mut fed = Sketch::new(DEFAULT_K).expect("a sketch");
+        for value in &column {
+            fed.absorb(&Sketch::of(&[value.as_slice()])).expect("same k");
+        }
+        assert_eq!(fed, whole, "row by row");
+        let mut halves = Sketch::of(&borrow(&column[..10_000]));
+        halves.absorb(&Sketch::of(&borrow(&column[10_000..]))).expect("same k");
+        assert_eq!(halves, whole, "two large halves go through the union");
+        whole.absorb(&Sketch::new(DEFAULT_K).expect("a sketch")).expect("same k");
+        assert_eq!(whole.distinct(), halves.distinct(), "an empty one changes nothing");
+        let small = Sketch::of(&borrow(&column[..10]));
+        assert_eq!(small.slots.len(), FIRST_SLOTS * 2, "ten values in a small table");
+        assert!(Sketch::new(8).expect("a sketch").absorb(&small).is_err(), "another k");
     }
 }
