@@ -20,6 +20,14 @@ use crate::mem;
 use crate::table::{Distinct, GroupTable, read_u128};
 use crate::text::{self, Heap};
 
+/// The proxies of `ht_insert`, `agg_distinct` and `agg_distinct_int`, which compiled code calls
+/// once a row.
+static HOT: std::sync::LazyLock<[u32; 3]> = std::sync::LazyLock::new(|| {
+    let at =
+        |name: &str| CATALOGUE.iter().position(|p| p.name == name).map_or(u32::MAX, |i| i as u32);
+    [at("ht_insert"), at("agg_distinct"), at("agg_distinct_int")]
+});
+
 /// The error site payload that means the runtime failed and `Rt::error` says why.
 pub const RUNTIME_ERROR: u64 = 0xff_ffff;
 
@@ -136,9 +144,10 @@ impl Rt {
         self.keep_worker(worker);
     }
 
-    /// Folds a worker's group table `table` and distinct sets `sets` into this runtime's.
-    /// `combine` gets a row of this table and the worker's row of the same group, and folds the
-    /// accumulators of the second into the first.
+    /// Folds a worker's group table `table` and distinct sets `sets` into this runtime's, and says
+    /// which group of this table each of the worker's became. `combine` gets a row of this table
+    /// and the worker's row of the same group, and folds the accumulators of the second into the
+    /// first.
     ///
     /// # Errors
     ///
@@ -149,7 +158,7 @@ impl Rt {
         table: u64,
         sets: &[u64],
         combine: impl FnMut(&mut [u8], &[u8]),
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<usize>, Error> {
         let mut map = Vec::new();
         {
             let (Some(Object::Table(mine)), Some(Object::Table(theirs))) =
@@ -172,7 +181,34 @@ impl Rt {
             mine.absorb(theirs, &map);
         }
         self.keep_worker(worker);
-        Ok(())
+        Ok(map)
+    }
+
+    /// Takes the distinct sets behind a handle out of this runtime, and leaves nothing there.
+    pub fn take_distinct(&mut self, handle: u64) -> Option<Distinct> {
+        match self.objects.get_mut(handle as usize) {
+            Some(o @ Object::Distinct(_)) => match std::mem::replace(o, Object::Absent) {
+                Object::Distinct(d) => Some(d),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Puts `sets` behind a handle that named distinct sets before [`take_distinct`](Rt::take_distinct)
+    /// took them.
+    ///
+    /// # Errors
+    ///
+    /// When the handle names something else.
+    pub fn put_distinct(&mut self, handle: u64, sets: Distinct) -> Result<(), Error> {
+        match self.objects.get_mut(handle as usize) {
+            Some(o @ (Object::Distinct(_) | Object::Absent)) => {
+                *o = Object::Distinct(sets);
+                Ok(())
+            }
+            _ => Err(bad_handle("put_distinct")),
+        }
     }
 
     /// Puts `merged` in place of group table `table`, and keeps `workers` the way a fold does. The
@@ -332,6 +368,34 @@ impl Rt {
         if bytes.len() <= text::INLINE { text::make(bytes) } else { self.heap.keep(bytes) }
     }
 
+    fn ht_insert(&mut self, a: &[u128]) -> Result<u128, u64> {
+        let Some(Object::Table(table)) = self.objects.get_mut(a[0] as usize) else {
+            return Err(self.fail(bad_handle("ht_insert")));
+        };
+        // SAFETY: the generator passes the key buffer in its state, laid out as the table's
+        // layout says.
+        let row = unsafe { table.insert(a[1] as usize, a[2] as u64, &mut self.heap) };
+        Ok(row as u128)
+    }
+
+    fn agg_distinct(&mut self, a: &[u128], text: bool) -> Result<u128, u64> {
+        // SAFETY: the second argument is a row `ht_insert` returned, and it starts with the group
+        // id.
+        let gid = u64::from_le_bytes(
+            unsafe { mem::slice(a[1] as usize, 8) }.try_into().unwrap_or_default(),
+        );
+        let Some(Object::Distinct(set)) = self.objects.get_mut(a[0] as usize) else {
+            return Err(self.fail(bad_handle("agg_distinct")));
+        };
+        if text {
+            // SAFETY: as for every `str16` compiled code passes, see `call`.
+            set.add_text(gid as usize, unsafe { text::bytes(&a[2]) });
+        } else {
+            set.add_int(gid as usize, a[2]);
+        }
+        Ok(0)
+    }
+
     fn call(&mut self, name: &str, a: &[u128]) -> Result<u128, u64> {
         // SAFETY: every `str16` compiled code passes is inline or points at bytes the driver or
         // this heap keeps alive for the whole query, which is rule V10.
@@ -379,15 +443,7 @@ impl Rt {
                 out.extend_from_slice(s(1));
                 self.string(&out)
             }
-            "ht_insert" => {
-                let Some(Object::Table(table)) = self.objects.get_mut(a[0] as usize) else {
-                    return Err(self.fail(bad_handle(name)));
-                };
-                // SAFETY: the generator passes the key buffer in its state, laid out as the
-                // table's layout says.
-                let row = unsafe { table.insert(a[1] as usize, a[2] as u64, &mut self.heap) };
-                row as u128
-            }
+            "ht_insert" => self.ht_insert(a)?,
             "jt_append" => {
                 let Some(Object::Join(table)) = self.objects.get_mut(a[0] as usize) else {
                     return Err(self.fail(bad_handle(name)));
@@ -397,22 +453,8 @@ impl Rt {
                 unsafe { table.append(a[1] as usize, a[2] as u64, &mut self.heap) };
                 0
             }
-            "agg_distinct" | "agg_distinct_int" => {
-                // SAFETY: the second argument is a row `ht_insert` returned, and it starts with
-                // the group id.
-                let gid = u64::from_le_bytes(
-                    unsafe { mem::slice(a[1] as usize, 8) }.try_into().unwrap_or_default(),
-                );
-                let Some(Object::Distinct(set)) = self.objects.get_mut(a[0] as usize) else {
-                    return Err(self.fail(bad_handle(name)));
-                };
-                if name == "agg_distinct" {
-                    set.add_text(gid as usize, s(2));
-                } else {
-                    set.add_int(gid as usize, a[2]);
-                }
-                0
-            }
+            "agg_distinct" => self.agg_distinct(a, true)?,
+            "agg_distinct_int" => self.agg_distinct(a, false)?,
             "agg_min_str" | "agg_max_str" => {
                 let at = a[0] as usize;
                 // SAFETY: the first argument is the accumulator in a group row, a `str16` and a
@@ -503,6 +545,15 @@ pub fn hash(bytes: &[u8], seed: u64) -> u64 {
 
 impl Runtime for Rt {
     fn rtcall(&mut self, proxy: u32, args: &[u128]) -> Result<u128, u64> {
+        // The calls made once a row go straight to their code, and the rest by name.
+        let hot = &*HOT;
+        if proxy == hot[0] {
+            return self.ht_insert(args);
+        } else if proxy == hot[1] {
+            return self.agg_distinct(args, true);
+        } else if proxy == hot[2] {
+            return self.agg_distinct(args, false);
+        }
         let Some(p) = CATALOGUE.get(proxy as usize) else {
             return Err(
                 self.fail(Error::new(ErrorCode::Internal, format!("no runtime function {proxy}")))
