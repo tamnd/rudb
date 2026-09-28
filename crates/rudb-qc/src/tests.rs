@@ -115,6 +115,8 @@ fn answer(text: &str, options: Options) -> Result<Answer> {
     let plan = Plan::parse(text).expect("a well formed plan");
     let cancel = Cancel::new();
     let pool = Pool::default();
+    // The rows are read even where the table's statistics answer, so it is the code that is tested.
+    let options = Options { rows: true, ..options };
     let compiled = compile_with(&plan, &cancel, options).expect("the compiled engine takes it");
     let memory = Memory::unlimited();
     let seams = rudb_seam::Settings::new();
