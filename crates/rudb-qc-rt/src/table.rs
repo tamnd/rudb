@@ -66,6 +66,9 @@ impl Layout {
 
 const ROWS_PER_PAGE: usize = 1024;
 
+/// An odd number with its bits spread out, the golden ratio in fixed point.
+const SPREAD: u64 = 0x9e37_79b9_7f4a_7c15;
+
 /// A grouping hash table.
 #[derive(Debug)]
 pub struct GroupTable {
@@ -190,14 +193,17 @@ impl GroupTable {
         }
     }
 
-    /// The groups of this table split by the top `bits` bits of their hashes, so that two tables
+    /// The groups of this table split into `1 << bits` parts by their hashes, so that two tables
     /// split the same way put a key in the same part.
+    ///
+    /// A key's hash is a CRC-32C, which leaves the top half of the word zero, so the part is the
+    /// top bits of the hash times an odd number, which every bit of the hash moves.
     #[must_use]
     pub fn split(&self, bits: u32) -> Vec<Vec<u32>> {
         let mut parts = vec![Vec::new(); 1 << bits];
         let shift = 64 - bits;
         for (gid, &hash) in self.hashes.iter().enumerate() {
-            let part = if bits == 0 { 0 } else { (hash >> shift) as usize };
+            let part = if bits == 0 { 0 } else { (hash.wrapping_mul(SPREAD) >> shift) as usize };
             parts[part].push(gid as u32);
         }
         parts
