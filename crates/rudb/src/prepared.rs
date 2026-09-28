@@ -214,3 +214,38 @@ impl Prepared {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rudb_bind::Parameters;
+    use rudb_common::Value;
+
+    use super::Direct;
+    use crate::Database;
+
+    /// The tests in `tests/direct_insert.rs` check that the short way lands what the plan lands,
+    /// which they would also do if the short way were never taken. This checks that it is.
+    #[test]
+    fn a_plain_table_takes_the_short_way() {
+        let db = Database::new();
+        db.execute("CREATE TABLE t (id BIGINT, name VARCHAR, price DOUBLE, qty INTEGER)")
+            .expect("creates");
+        let prepared = db.prepare("INSERT INTO t VALUES (?, ?, ?, NULL)").expect("prepares");
+        let direct = prepared.direct.as_ref().expect("the shape is recognised");
+        let values = vec![Value::BigInt(1), Value::Varchar("a".into()), Value::Integer(2)];
+        let taken =
+            prepared.shared.insert_direct(direct, &Parameters::positional(values), prepared.sql());
+        assert_eq!(taken.expect("taken").expect("runs").value_at(0, 0), Value::BigInt(1));
+        assert_eq!(db.table_len("t").expect("counts"), 1);
+
+        for sql in [
+            "INSERT INTO t VALUES (?, ?, ?, ?) RETURNING id",
+            "INSERT INTO t SELECT ?, ?, ?, ?",
+            "INSERT INTO t VALUES (?, ?, ?, 1 + ?)",
+            "INSERT INTO t VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
+        ] {
+            assert!(db.prepare(sql).expect("prepares").direct.is_none(), "{sql}");
+        }
+        assert!(Direct::of(&rudb_parse::parse_ast("SELECT ?").expect("parses")).is_none());
+    }
+}

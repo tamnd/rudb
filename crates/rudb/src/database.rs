@@ -3124,8 +3124,9 @@ impl Shared {
     /// before anything is touched: a table with constraints, keys or a declared order, a column the
     /// row leaves out that has a default, a null for a `NOT NULL` column, a value that is not
     /// already its column's type or a widening of it, a transaction that is read only or aborted,
-    /// and a database that is read only or mirrors Parquet. The rest is what
-    /// [`Database::append`] does with a row, then the commit.
+    /// and a database that is read only. Mirroring is left alone, because a row of parameters
+    /// reads no Parquet file to mirror. The rest is what [`Database::append`] does with a row,
+    /// then the commit.
     pub(crate) fn insert_direct(
         &self,
         direct: &crate::prepared::Direct,
@@ -3133,7 +3134,7 @@ impl Shared {
         sql: &str,
     ) -> Option<Result<QueryResult>> {
         use crate::prepared::Item;
-        if !self.inner.writable || self.inner.settings.config().parquet_mirror() {
+        if !self.inner.writable {
             return None;
         }
         let _writing = self.writing();
