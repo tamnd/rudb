@@ -112,7 +112,12 @@ enum Slot {
     Window { group: usize, at: usize, len: usize },
     /// A chunk of the group still filling, at position `at` of the open run.
     Open { at: usize },
+    /// The small chunks at the end of the table, read as one chunk. Only ever the last slot.
+    Tail,
 }
+
+/// The largest chunk the tail takes. Anything bigger is already a chunk worth its own slot.
+const TAIL_TAKES: usize = 64;
 
 /// A table held in memory as row groups, read a chunk at a time.
 #[derive(Debug, Clone)]
@@ -129,6 +134,18 @@ pub struct MemoryTable {
     /// The zones of the chunks in `open` folded together, so the group's zone is built as it fills
     /// rather than in a second pass at the seal.
     open_zone: Option<Zone>,
+    /// Small chunks that arrived one after another, held as one slot until they add up to a
+    /// vector's worth of rows.
+    ///
+    /// A prepared `INSERT` of one row used to be a chunk and a slot of its own, and a table
+    /// written a row at a time was then two hundred thousand one-row chunks that every scan walked
+    /// one at a time: 858 ms for a `sum` and a `count(DISTINCT ...)` over 200,000 rows. The rows
+    /// still arrive as small chunks and their statistics are still taken as they arrive, so the
+    /// zone and the counts stay exact, but they sit behind one slot and are laid into one chunk
+    /// when there are [`VECTOR_SIZE`] of them, or when a read asks for them.
+    tail: Vec<Chunk>,
+    /// How many rows are in `tail`.
+    tail_rows: usize,
     /// One per chunk, in the same numbering as `slots`.
     zones: Vec<Zone>,
     /// The distinct count of every column, over the whole table rather than per chunk.
@@ -155,6 +172,8 @@ impl MemoryTable {
             open: Vec::new(),
             open_rows: 0,
             open_zone: None,
+            tail: Vec::new(),
+            tail_rows: 0,
             zones: Vec::new(),
             counts,
             rows: 0,
@@ -221,8 +240,96 @@ impl MemoryTable {
         self.counts.add(&chunk);
         self.counts_ns += zoned.elapsed().as_nanos() as u64;
         self.stats_ns += started.elapsed().as_nanos() as u64;
-        self.place(chunk, zone);
+        if chunk.len() <= TAIL_TAKES {
+            return self.trail(chunk, zone);
+        }
+        self.place(chunk, zone)
+    }
+
+    /// Puts a small chunk whose statistics have been taken at the end of the tail.
+    ///
+    /// The tail's zone is the zones of its chunks folded together, which is what the zone of the
+    /// one chunk they are read as would have been, and the counts have already seen the rows.
+    fn trail(&mut self, chunk: Chunk, zone: Zone) -> Result<()> {
+        match &mut self.open_zone {
+            Some(open) => open.widen(&zone),
+            None => self.open_zone = Some(zone.clone()),
+        }
+        if self.tail.is_empty() {
+            self.slots.push(Slot::Tail);
+            self.zones.push(zone);
+        } else if let Some(last) = self.zones.last_mut() {
+            last.widen(&zone);
+        }
+        self.rows += chunk.len();
+        self.open_rows += chunk.len();
+        self.tail_rows += chunk.len();
+        // As pages, so that a read of a tail of one chunk shares it the way an open chunk is shared.
+        self.tail.push(chunk.into_pages());
+        if self.tail_rows >= VECTOR_SIZE {
+            self.close_tail()?;
+        }
+        if self.open_rows >= ROWS_PER_GROUP {
+            self.seal()?;
+        }
         Ok(())
+    }
+
+    /// Lays the tail into one chunk and makes it an open chunk like any other.
+    ///
+    /// The slot stays where it is and so does its zone, so nothing a reader numbered moves.
+    fn close_tail(&mut self) -> Result<()> {
+        if self.tail.is_empty() {
+            return Ok(());
+        }
+        let columns: Vec<usize> = (0..self.types.len()).collect();
+        let chunk = self.tail_read(&columns)?;
+        if let Some(last) = self.slots.last_mut() {
+            *last = Slot::Open { at: self.open.len() };
+        }
+        self.open.push(chunk.into_pages());
+        self.tail.clear();
+        self.tail_rows = 0;
+        Ok(())
+    }
+
+    /// The named columns of the tail, laid end to end.
+    ///
+    /// A column the vector crate will not lay, which the flat columns an `INSERT` builds never
+    /// are, is put back together out of its values instead, so a read never fails over a layout.
+    fn tail_read(&self, columns: &[usize]) -> Result<Chunk> {
+        if let [only] = self.tail.as_slice() {
+            let mut picked = Vec::with_capacity(columns.len());
+            for &column in columns {
+                picked.push(only.column(column)?.clone());
+            }
+            return Chunk::with_rows(picked, only.len());
+        }
+        let mut picked = Vec::with_capacity(columns.len());
+        let mut pieces = Vec::with_capacity(self.tail.len());
+        for &column in columns {
+            let ty = self.types.get(column).ok_or_else(|| {
+                Error::internal(format!("column {column} of a table that has {}", self.types.len()))
+            })?;
+            pieces.clear();
+            for chunk in &self.tail {
+                pieces.push(chunk.column(column)?);
+            }
+            let vector = match rudb_vector::concat(ty, &pieces) {
+                Ok(Some(vector)) => vector,
+                _ => {
+                    let mut values = Vec::with_capacity(self.tail_rows);
+                    for piece in &pieces {
+                        for row in 0..piece.len() {
+                            values.push(piece.try_value_at(row)?);
+                        }
+                    }
+                    Vector::from_values(ty.clone(), &values)?
+                }
+            };
+            picked.push(vector);
+        }
+        Chunk::with_rows(picked, self.tail_rows)
     }
 
     /// Appends every chunk of a finished result, with the statistics taken on up to `workers`
@@ -317,7 +424,7 @@ impl MemoryTable {
         self.counts_ns += counted.into_inner();
         for chunk in chunks {
             let zone = Zone::from_ranges(ranges.iter_mut().filter_map(Iterator::next).collect());
-            self.place(chunk, zone);
+            self.place(chunk, zone)?;
         }
         Ok(())
     }
@@ -344,7 +451,8 @@ impl MemoryTable {
     }
 
     /// Puts a chunk whose statistics have been taken into the group that is filling.
-    fn place(&mut self, chunk: Chunk, zone: Zone) {
+    fn place(&mut self, chunk: Chunk, zone: Zone) -> Result<()> {
+        self.close_tail()?;
         match &mut self.open_zone {
             Some(open) => open.widen(&zone),
             None => self.open_zone = Some(zone.clone()),
@@ -358,8 +466,9 @@ impl MemoryTable {
         // rather than a copy. A page laid end to end afterwards is copied out of once, here.
         self.open.push(chunk.into_pages());
         if self.open_rows >= ROWS_PER_GROUP {
-            self.seal();
+            self.seal()?;
         }
+        Ok(())
     }
 
     /// Lays the open chunks end to end into one group, or keeps them as the chunks they are.
@@ -373,9 +482,10 @@ impl MemoryTable {
     /// Sealing is where the copy is. It is one pass over the rows of the group per column, and it
     /// buys every read afterwards a window into one run instead of a jump to one of a hundred and
     /// twenty allocations.
-    fn seal(&mut self) {
+    fn seal(&mut self) -> Result<()> {
+        self.close_tail()?;
         if self.open.is_empty() {
-            return;
+            return Ok(());
         }
         let first = self.slots.len() - self.open.len();
         let last = self.slots.len();
@@ -407,6 +517,7 @@ impl MemoryTable {
         self.open.clear();
         self.open_rows = 0;
         self.open_zone = None;
+        Ok(())
     }
 
     /// The chunks of each row group, in the numbering [`Self::read`] takes.
@@ -423,8 +534,9 @@ impl MemoryTable {
     pub fn group_parts(&self) -> Vec<std::ops::Range<usize>> {
         let mut parts: Vec<std::ops::Range<usize>> =
             self.groups.iter().map(|group| group.chunks.clone()).collect();
-        if !self.open.is_empty() {
-            parts.push((self.slots.len() - self.open.len())..self.slots.len());
+        let open = self.open.len() + usize::from(!self.tail.is_empty());
+        if open > 0 {
+            parts.push((self.slots.len() - open)..self.slots.len());
         }
         parts
     }
@@ -732,6 +844,7 @@ impl MemoryTable {
         match slot {
             Slot::Window { len, .. } => len,
             Slot::Open { at } => self.open.get(at).map_or(0, Chunk::len),
+            Slot::Tail => self.tail_rows,
         }
     }
 
@@ -834,6 +947,7 @@ impl MemoryTable {
                 }
                 Chunk::with_rows(picked, held.len())
             }
+            Slot::Tail => self.tail_read(columns),
         }
     }
 
@@ -1410,5 +1524,86 @@ mod tests {
             "the fourth column crosses the cap"
         );
         assert!(all.counts_ns() <= all.stats_ns(), "a part is larger than the whole");
+    }
+
+    fn trickled(rows: i32) -> MemoryTable {
+        let mut table = MemoryTable::new(vec![LogicalType::Integer, LogicalType::Varchar]);
+        for id in 0..rows {
+            let name =
+                if id % 7 == 0 { Value::Null } else { Value::Varchar(format!("n{}", id % 5)) };
+            table.append_rows(&[vec![Value::Integer(id), name]]).expect("one row");
+        }
+        table
+    }
+
+    #[test]
+    fn rows_that_arrive_one_at_a_time_are_read_as_one_chunk() {
+        let table = trickled(100);
+        assert_eq!(table.len(), 100);
+        assert_eq!(table.chunk_count(), 1);
+        assert_eq!(table.chunk_len(0), Some(100));
+        assert_eq!(table.group_parts(), vec![0..1]);
+        assert_eq!(table.group_rows(0), 100);
+        let got = every_row(&table);
+        assert_eq!(got, (0..100).map(Value::Integer).collect::<Vec<_>>());
+        let names = table.read(0, &[1]).expect("the tail");
+        assert_eq!(names.column(0).expect("a column").value_at(0), Value::Null);
+        assert_eq!(names.column(0).expect("a column").value_at(3), Value::Varchar("n3".into()));
+    }
+
+    #[test]
+    fn the_tail_keeps_the_statistics_a_chunk_of_the_same_rows_would_have() {
+        let table = trickled(1000);
+        let mut whole = MemoryTable::new(vec![LogicalType::Integer, LogicalType::Varchar]);
+        let rows: Vec<Vec<Value>> = (0..1000)
+            .map(|id| {
+                let name =
+                    if id % 7 == 0 { Value::Null } else { Value::Varchar(format!("n{}", id % 5)) };
+                vec![Value::Integer(id), name]
+            })
+            .collect();
+        whole.append_rows(&rows).expect("rows");
+        assert_eq!(table.chunk_count(), whole.chunk_count());
+        assert_eq!(table.zone(0), whole.zone(0));
+        assert_eq!(table.group_zone(0), whole.group_zone(0));
+        for column in 0..2 {
+            assert_eq!(table.distinct_values(column), whole.distinct_values(column));
+            assert_eq!(table.null_count(column).ok(), whole.null_count(column).ok());
+            assert_eq!(table.exact_extremes(column).ok(), whole.exact_extremes(column).ok());
+            assert_eq!(table.exact_sum(column).ok(), whole.exact_sum(column).ok());
+        }
+    }
+
+    #[test]
+    fn a_full_tail_becomes_a_chunk_and_a_big_chunk_closes_the_tail_first() {
+        let rows = i32::try_from(VECTOR_SIZE).expect("small") + 10;
+        let mut table = trickled(rows);
+        assert_eq!(table.chunk_count(), 2);
+        assert_eq!(table.chunk_len(0), Some(VECTOR_SIZE));
+        assert_eq!(table.chunk_len(1), Some(10));
+        let big: Vec<Vec<Value>> =
+            (0..100).map(|id| vec![Value::Integer(rows + id), Value::Null]).collect();
+        table.append_rows(&big).expect("rows");
+        assert_eq!(table.chunk_count(), 3);
+        assert_eq!(table.chunk_len(1), Some(10));
+        assert_eq!(table.chunk_len(2), Some(100));
+        let got = every_row(&table);
+        assert_eq!(got, (0..rows + 100).map(Value::Integer).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_group_filled_a_row_at_a_time_seals_into_one_run() {
+        let mut table = MemoryTable::new(vec![LogicalType::BigInt]);
+        let rows = ROWS_PER_GROUP + 5;
+        for id in 0..rows {
+            table.append_rows(&[vec![Value::BigInt(id as i64)]]).expect("one row");
+        }
+        assert_eq!(table.group_count(), 1);
+        assert_eq!(table.chunk_count(), ROWS_PER_GROUP / VECTOR_SIZE + 1);
+        assert_eq!(table.group_rows(1), 5);
+        assert_eq!(
+            table.exact_sum(0).ok().flatten().map(|(sum, _)| sum),
+            Some((0..rows as i128).sum())
+        );
     }
 }
