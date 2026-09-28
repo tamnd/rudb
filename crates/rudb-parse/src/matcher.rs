@@ -435,6 +435,14 @@ impl<'a> Matcher<'a> {
                 Ok(Action::Enter(CHILDREN[(node.a + step) as usize]))
             }
             Op::Optional => {
+                // An optional is nullable, so the guard above always lets it in, and most of them
+                // are the tail of an expression level or a clause the statement does not have. The
+                // child's own FIRST set settles those here, where entering it would have cost a
+                // step, a push and a pop to reach the same empty match.
+                if self.cannot_start(node.a) {
+                    self.reached(self.pos);
+                    return Ok(Action::Succeed(NONE, NONE));
+                }
                 self.push(self.frame(FrameOp::Optional, node.a, 0))?;
                 Ok(Action::Enter(node.a))
             }
@@ -462,6 +470,15 @@ impl<'a> Matcher<'a> {
             step += 1;
         }
         step
+    }
+
+    /// Whether the FIRST filter already knows this node fails at the current token.
+    ///
+    /// The guard at the top of [`Self::enter`], asked by a caller that is about to enter the node,
+    /// so the failure is settled where it is known rather than after a step, a push and a pop.
+    #[inline]
+    fn cannot_start(&self, index: u32) -> bool {
+        self.filter && !NODES[index as usize].can_start(self.key(self.pos))
     }
 
     fn frame(&self, op: FrameOp, a: u32, b: u32) -> Frame {
@@ -531,6 +548,13 @@ impl<'a> Matcher<'a> {
                     Action::Succeed(frame.head, frame.tail)
                 } else {
                     let next = CHILDREN[(frame.a + frame.step) as usize];
+                    // The same test `enter` would make first, made before the frame goes back on
+                    // the stack only to come straight off it again in `settle_fail`.
+                    if self.cannot_start(next) {
+                        self.reached(self.pos);
+                        self.pos = frame.start;
+                        return Action::Fail;
+                    }
                     self.stack.push(frame);
                     Action::Enter(next)
                 }
@@ -549,6 +573,12 @@ impl<'a> Matcher<'a> {
                 frame.mark = self.pos;
                 frame.step += 1;
                 let child = frame.a;
+                // Every repeat ends on a token its child cannot start with, and this is that
+                // ending without the round trip through `enter` and `settle_fail`.
+                if self.cannot_start(child) {
+                    self.reached(self.pos);
+                    return Action::Succeed(frame.head, frame.tail);
+                }
                 self.stack.push(frame);
                 Action::Enter(child)
             }
