@@ -364,12 +364,15 @@ impl<'a> Feed<'a> {
                     .collect::<Result<Vec<&GroupTable>>>()?;
                 let splits = pieces(threads, tables.len(), |at| tables[at].split(bits))?;
                 let layout = mine.layout().clone();
+                // Folding a worker's row into a new group gives the row back, but for a distinct
+                // set, which the fold leaves alone.
+                let whole = sets.is_empty();
                 let merged = pieces(threads, parts, |part| {
                     let most = splits.iter().map(|s| s[part].len()).sum();
                     let mut table = GroupTable::with_capacity(layout.clone(), most);
                     let mut made = vec![Vec::new(); if sets.is_empty() { 0 } else { tables.len() }];
                     for (t, (other, split)) in tables.iter().zip(&splits).enumerate() {
-                        table.absorb_some(other, &split[part], made.get_mut(t), fold);
+                        table.absorb_some(other, &split[part], made.get_mut(t), whole, fold);
                     }
                     table.seal();
                     (table, made)
