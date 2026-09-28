@@ -23,6 +23,7 @@
 
 mod feed;
 mod finish;
+mod merge;
 mod tier;
 
 use std::time::Instant;

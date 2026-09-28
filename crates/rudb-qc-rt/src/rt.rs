@@ -7,6 +7,8 @@
 
 #![allow(unsafe_code)]
 
+use std::sync::Arc;
+
 use rudb_common::{Cancel, Error, ErrorCode, civil_from_days, days_from_civil};
 use rudb_qc_interp::Runtime;
 use rudb_qc_ir::{CATALOGUE, status};
@@ -24,6 +26,9 @@ pub const RUNTIME_ERROR: u64 = 0xff_ffff;
 /// A first engine kernel over `n` rows of the buffers a `vcall` passes.
 pub type Kernel = Box<dyn FnMut(u64, &[u128]) -> Result<(), Error> + Send>;
 
+/// Makes a [`Kernel`]. A kernel keeps state between calls, so every worker needs its own.
+pub type Maker = Arc<dyn Fn() -> Kernel + Send + Sync>;
+
 /// Something a handle names.
 enum Object {
     Like(Like),
@@ -31,6 +36,10 @@ enum Object {
     Table(GroupTable),
     Distinct(Distinct),
     Join(JoinTable),
+    /// What a worker has where the query's runtime has a join table. A probe reads the table
+    /// through the addresses its state was given and never through the handle, and a build runs
+    /// on one worker, so a worker never needs one.
+    Absent,
 }
 
 /// The runtime of one query.
@@ -38,10 +47,14 @@ pub struct Rt {
     heap: Heap,
     objects: Vec<Object>,
     kernels: Vec<Kernel>,
+    makers: Vec<Maker>,
     counters: Vec<u64>,
     cancel: Cancel,
     error: Option<Error>,
     buffer: String,
+    /// The runtimes of the workers folded into this one. Their heaps hold strings the rows of
+    /// this one's tables point at, so they live as long as it does.
+    held: Vec<Rt>,
 }
 
 impl std::fmt::Debug for Rt {
@@ -62,11 +75,112 @@ impl Rt {
             heap: Heap::new(),
             objects: Vec::new(),
             kernels: Vec::new(),
+            makers: Vec::new(),
             counters: Vec::new(),
             cancel,
             error: None,
             buffer: String::new(),
+            held: Vec::new(),
         }
+    }
+
+    /// A runtime for one worker of a parallel pipeline. Every handle names the same kind of
+    /// object as here, so the same code runs against it: the patterns are copies, the kernels are
+    /// new, and the group tables and distinct sets are empty ones of the same shape, for the
+    /// worker to fill and [`Rt::absorb`] to fold back in.
+    #[must_use]
+    pub fn worker(&self) -> Rt {
+        let objects = self
+            .objects
+            .iter()
+            .map(|o| match o {
+                Object::Like(like) => Object::Like(like.clone()),
+                Object::Regex { regex, rewrite, global } => Object::Regex {
+                    regex: regex.clone(),
+                    rewrite: rewrite.clone(),
+                    global: *global,
+                },
+                Object::Table(t) => Object::Table(GroupTable::new(t.layout().clone())),
+                Object::Distinct(_) => Object::Distinct(Distinct::new()),
+                Object::Join(_) | Object::Absent => Object::Absent,
+            })
+            .collect();
+        Rt {
+            heap: Heap::new(),
+            objects,
+            kernels: self.makers.iter().map(|make| make()).collect(),
+            makers: self.makers.clone(),
+            counters: Vec::new(),
+            cancel: self.cancel.clone(),
+            error: None,
+            buffer: String::new(),
+            held: Vec::new(),
+        }
+    }
+
+    /// Takes a worker's group table `table` and distinct sets `sets` in place of this runtime's,
+    /// which is what the first worker of a parallel pipeline does. Nothing was written to this
+    /// runtime's while the workers ran, so there is nothing in them to fold.
+    pub fn adopt(&mut self, mut worker: Rt, table: u64, sets: &[u64]) {
+        for &h in std::iter::once(&table).chain(sets) {
+            let h = h as usize;
+            if let (Some(mine), Some(theirs)) = (self.objects.get_mut(h), worker.objects.get_mut(h))
+            {
+                std::mem::swap(mine, theirs);
+            }
+        }
+        self.keep_worker(worker);
+    }
+
+    /// Folds a worker's group table `table` and distinct sets `sets` into this runtime's.
+    /// `combine` gets a row of this table and the worker's row of the same group, and folds the
+    /// accumulators of the second into the first.
+    ///
+    /// # Errors
+    ///
+    /// When a handle does not name a table or a set in both runtimes.
+    pub fn absorb(
+        &mut self,
+        mut worker: Rt,
+        table: u64,
+        sets: &[u64],
+        combine: impl FnMut(&mut [u8], &[u8]),
+    ) -> Result<(), Error> {
+        let mut map = Vec::new();
+        {
+            let (Some(Object::Table(mine)), Some(Object::Table(theirs))) =
+                (self.objects.get_mut(table as usize), worker.objects.get(table as usize))
+            else {
+                return Err(bad_handle("absorb"));
+            };
+            mine.absorb(theirs, &mut self.heap, &mut map, combine);
+        }
+        for &h in sets {
+            let theirs = match worker.objects.get_mut(h as usize) {
+                Some(o @ Object::Distinct(_)) => std::mem::replace(o, Object::Absent),
+                _ => return Err(bad_handle("absorb")),
+            };
+            let (Some(Object::Distinct(mine)), Object::Distinct(theirs)) =
+                (self.objects.get_mut(h as usize), theirs)
+            else {
+                return Err(bad_handle("absorb"));
+            };
+            mine.absorb(theirs, &map);
+        }
+        self.keep_worker(worker);
+        Ok(())
+    }
+
+    /// Adds a worker's counters to these and keeps its heap alive.
+    fn keep_worker(&mut self, mut worker: Rt) {
+        let counters = std::mem::take(&mut worker.counters);
+        if self.counters.len() < counters.len() {
+            self.counters.resize(counters.len(), 0);
+        }
+        for (mine, theirs) in self.counters.iter_mut().zip(counters) {
+            *mine = mine.wrapping_add(theirs);
+        }
+        self.held.push(worker);
     }
 
     fn add(&mut self, object: Object) -> u64 {
@@ -130,9 +244,10 @@ impl Rt {
         self.add(Object::Distinct(Distinct::new()))
     }
 
-    /// The id a `vcall` uses for `kernel`.
-    pub fn add_kernel(&mut self, kernel: Kernel) -> u32 {
-        self.kernels.push(kernel);
+    /// The id a `vcall` uses for the kernel `make` makes.
+    pub fn add_kernel(&mut self, make: Maker) -> u32 {
+        self.kernels.push(make());
+        self.makers.push(make);
         self.kernels.len() as u32 - 1
     }
 
@@ -173,7 +288,7 @@ impl Rt {
     /// The bytes the heap holds.
     #[must_use]
     pub fn footprint(&self) -> usize {
-        self.heap.footprint()
+        self.heap.footprint() + self.held.iter().map(Rt::footprint).sum::<usize>()
     }
 
     fn fail(&mut self, error: Error) -> u64 {
