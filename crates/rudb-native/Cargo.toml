@@ -21,9 +21,9 @@ rudb-metrics.workspace = true
 rudb-stats.workspace = true
 rudb-storage.workspace = true
 rudb-vector.workspace = true
+rudb-kernels.workspace = true
 
 [dev-dependencies]
-rudb-kernels.workspace = true
 
 [lints]
 workspace = true

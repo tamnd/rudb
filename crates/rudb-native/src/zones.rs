@@ -48,7 +48,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use rudb_common::Result;
-use rudb_common::bounds::{Bound, End, Frequencies, Remainder, Spread, Test, Zones, kept};
+use rudb_common::bounds::{Bound, End, Frequencies, Reach, Remainder, Spread, Test, Zones, kept};
 use rudb_common::stat::{Direction, Provenance};
 use rudb_common::{ColumnFacts, Stat, Value};
 use rudb_storage::Probe;
@@ -128,6 +128,93 @@ impl Zones for Stripes {
             }
             _ => Stat::Unknown,
         }
+    }
+
+    fn gathers(&self, column: usize) -> bool {
+        crate::graph::holds_key_map(&self.reader, column)
+            || crate::graph::adjacency_parent(&self.reader, column).is_some()
+    }
+
+    fn matching(&self, column: usize, function: &str, pattern: &str) -> Option<f64> {
+        self.reader.matched(column, function, pattern)
+    }
+
+    fn picked(
+        &self,
+        column: usize,
+        function: &str,
+        pattern: &str,
+        key: usize,
+        most: usize,
+    ) -> Option<Vec<Bound>> {
+        let values = self.reader.picked(column, function, pattern, key, most)?;
+        values.iter().map(Bound::of_value).collect()
+    }
+
+    fn holding(&self, column: usize, values: &[Bound]) -> Option<f64> {
+        self.reader.holding(column, values)
+    }
+
+    fn placed(&self, column: usize) -> Option<f64> {
+        self.reader.placed(column)
+    }
+
+    #[expect(clippy::cast_precision_loss, reason = "counts of parts and rows are shares here")]
+    fn spans(&self, column: usize, values: &[Bound]) -> Option<(f64, f64)> {
+        let values: Vec<i128> = values
+            .iter()
+            .map(|value| match value {
+                Bound::Int(value) => Some(*value),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let parts = self.reader.parts();
+        let (mut held, mut rows, mut total) = (0_usize, 0.0_f64, 0_usize);
+        for part in 0..parts {
+            let range = self.reader.part_range(part, column)?;
+            let count = self.reader.part_rows(part);
+            total += count;
+            let (Some(Bound::Int(low)), Some(Bound::Int(high))) = (range.low, range.high) else {
+                continue;
+            };
+            let inside = values.iter().filter(|&&value| low <= value && value <= high).count();
+            if inside > 0 {
+                held += 1;
+                rows += count as f64 * inside as f64
+                    / high.saturating_sub(low).saturating_add(1) as f64;
+            }
+        }
+        (parts > 0 && total > 0).then(|| (held as f64 / parts as f64, rows / total as f64))
+    }
+
+    fn total_link(&self, column: usize) -> Option<(String, usize, u64)> {
+        crate::graph::total_parent(&self.reader, column)
+    }
+
+    fn generation(&self) -> Option<u64> {
+        Some(self.reader.table().generation())
+    }
+
+    fn reach(&self, column: usize) -> Option<Reach> {
+        // The ends of every part, which is a page per stripe of the column read once and kept by
+        // the reader, and which the scan reads anyway to decide what to skip.
+        let parts = self.reader.parts();
+        let (mut low, mut high, mut spans) = (i128::MAX, i128::MIN, 0.0_f64);
+        for part in 0..parts {
+            let range = self.reader.part_range(part, column)?;
+            match (range.low, range.high) {
+                (Some(Bound::Int(from)), Some(Bound::Int(to))) if from <= to => {
+                    spans += (to - from + 1) as f64;
+                    low = low.min(from);
+                    high = high.max(to);
+                }
+                // A part of nothing but nulls holds no value a key could land on.
+                (None, None) if range.nulls > 0 => {}
+                _ => return None,
+            }
+        }
+        let values = u64::try_from(high.checked_sub(low)?.checked_add(1)?).ok()?;
+        Some(Reach { parts: u64::try_from(parts).ok()?, values, per_value: spans / values as f64 })
     }
 }
 
@@ -341,6 +428,37 @@ impl Frequencies for Common {
         // report a tail larger than the column.
         let rows = Frequencies::rows(self).saturating_sub(held);
         Some(Remainder { rows, listed, most: omitted_max })
+    }
+
+    #[expect(clippy::cast_precision_loss, reason = "counts are weights here and not identities")]
+    fn skew(&self, column: usize) -> Option<(f64, u64)> {
+        let (entries, omitted_max) = self.reader.held_prefix(column).ok()??;
+        let values = self.reader.distinct_values(column).ok()??;
+        let nulls = self.reader.null_count(column).ok()?;
+        let counted = Frequencies::rows(self).saturating_sub(nulls) as f64;
+        let mut held = 0.0;
+        let mut squares = 0.0;
+        let mut listed = 0_u64;
+        for (value, count) in entries.iter() {
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            let count = *count as f64;
+            held += count;
+            squares += count * count;
+            listed += 1;
+        }
+        // The tail is spread evenly over the values the list left out, and no more than the bound
+        // the writer recorded on any one of them.
+        let tail = (counted - held).max(0.0);
+        let rest = values.saturating_sub(listed);
+        if tail > 0.0 && rest > 0 {
+            squares += tail * (tail / rest as f64).min(omitted_max.max(1) as f64);
+        }
+        if counted <= 0.0 || values == 0 {
+            return None;
+        }
+        Some(((squares * values as f64 / (counted * counted)).max(1.0), values))
     }
 }
 

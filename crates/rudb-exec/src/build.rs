@@ -3101,17 +3101,61 @@ impl<'a> Building<'a, '_> {
                 let fields = plan.field_list(columns).to_vec();
                 let types = fields.iter().map(|field| field.ty.clone()).collect();
                 let shared = Arc::new(Reduction::new(tree, types, memory)?);
+                // The keys each relation keeps are also handed to the scans of the relations that
+                // share a class with it, its parent's among them, which test their rows against
+                // them before they read the other columns. Made up front because a relation's sink
+                // fills its edges and the scans that read them may be built later, and those say
+                // which column each edge is about.
+                let feeds: Vec<Vec<(usize, u32, Arc<Sideways<'a>>)>> = (0..tree.leaves.len())
+                    .map(|at| {
+                        shared
+                            .readers(at)
+                            .map(|(reader, column)| (reader, column, Sideways::new()))
+                            .collect()
+                    })
+                    .collect();
+                let reducing = self.session.rules().enabled(Rule::GraphReduction);
                 let mut filled: Vec<PipelineRef> = Vec::with_capacity(tree.leaves.len());
                 for (at, leaf) in tree.leaves.iter().enumerate() {
                     let own = self.shape.pipeline(leaf.input);
-                    let mut below = self.node(leaf.input)?;
                     let position = u32::try_from(at).map_err(|_| {
                         Error::internal("a join tree of more than u32::MAX relations")
                     })?;
+                    for &(_, column, ref feed) in
+                        feeds.iter().flatten().filter(|(reader, ..)| *reader == at)
+                    {
+                        if let Some(binding) = relation_column(plan, leaf.input, column) {
+                            if reducing {
+                                if let Some(exact) =
+                                    listing(plan, self.catalog, leaf.input, binding)
+                                {
+                                    feed.exactly(exact);
+                                }
+                            }
+                            feed.about(binding);
+                            self.above.push(Arc::clone(feed));
+                        }
+                    }
+                    let below = self.node(leaf.input);
+                    self.above.clear();
+                    let mut below = below?;
                     below
                         .after
                         .extend(tree.children(position).map(|(child, _)| filled[child as usize]));
-                    self.close(below, own, Arc::new(Collect::new(Arc::clone(&shared), at)));
+                    // A scan also waits for every relation before it that hands it keys, so that
+                    // it reads the whole set and not what was kept by the time it started. The
+                    // planner puts the cheap relations first and the dear ones last for exactly
+                    // this, and a dear scan that set off early would read every row it has.
+                    for (source, edges) in feeds.iter().enumerate().take(at) {
+                        if edges.iter().any(|(reader, ..)| *reader == at)
+                            && !below.after.contains(&filled[source])
+                        {
+                            below.after.push(filled[source]);
+                        }
+                    }
+                    let edges = feeds[at].iter().map(|(_, _, feed)| Arc::clone(feed)).collect();
+                    let collect = Collect::new(Arc::clone(&shared), at, edges);
+                    self.close(below, own, Arc::new(collect));
                     filled.push(own);
                 }
                 let answer = Answer::new(shared, Schema::numbered(fields, index));
@@ -3146,6 +3190,64 @@ impl<'a> Building<'a, '_> {
         };
         Ok(segment)
     }
+}
+
+/// The column at `column` of what `input` produces, named the way the scan at the bottom of it
+/// names it, for the relations of a consistent reduction.
+///
+/// Such a relation is a scan or a filter over one, and a filter produces its input's columns in the
+/// same places. Anything else is `None`, and the scan is then handed nothing.
+fn relation_column(plan: &Plan, input: NodeRef, column: u32) -> Option<ColumnBinding> {
+    let mut at = input;
+    loop {
+        match *plan.node(at) {
+            Node::Filter { input, .. } => at = input,
+            Node::Get { index, .. } => return Some(ColumnBinding { table: index, column }),
+            _ => return None,
+        }
+    }
+}
+
+/// What turns the keys a consistent reduction hands a relation's scan into the rows that hold
+/// them, when the relation's table carries a backward adjacency over the column the keys are about.
+///
+/// The keys are values of a join class and not rows of a table the query reads, so the parent is
+/// whichever table the adjacency was built against, read off the adjacency itself, and its key map
+/// is what turns a value into the parent row whose children the adjacency lists. The parent does
+/// not have to be in the query. A column that is its own table's unique key and has a key map needs
+/// no adjacency, because the map gives the rows themselves. `None` when the relation is not a
+/// stored table, the column carries neither, or the parent has no key map. See `Found::kept` for
+/// when the rows are read this way.
+fn listing(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    binding: ColumnBinding,
+) -> Option<Exact> {
+    let (child_table, child_columns) = scanned(plan, catalog, input, binding.table).ok()??;
+    let child_rows = child_table.rows().stored()?;
+    let child_column = stored_column(plan, child_table, binding.table, child_columns, binding)?;
+    if rudb_native::graph::holds_key_map(child_rows, child_column) {
+        return Some(Exact::own(child_rows.clone(), child_column));
+    }
+    let (parent, parent_column) = rudb_native::graph::adjacency_parent(child_rows, child_column)?;
+    let mut name = child_table.name().clone();
+    name.table = parent;
+    let parent_rows = catalog.table(&name).ok()?.rows().stored()?;
+    if !rudb_native::graph::holds_key_map(parent_rows, parent_column) {
+        return None;
+    }
+    let edge = rudb_native::graph::Edge {
+        child: child_table.name().table.clone(),
+        child_column,
+        parent: name.table.clone(),
+        parent_column,
+    };
+    Some(Exact::stored(Stored {
+        parent: parent_rows.clone(),
+        column: parent_column,
+        child: Some((child_rows.clone(), edge)),
+    }))
 }
 
 /// Whether the filter under an aggregate can mark the rows it keeps rather than cut them out.

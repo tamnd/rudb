@@ -52,7 +52,7 @@ use memchr::memmem;
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 use rudb_vector::{Data, Form, NO_ROW, StringColumn, Validity, Vector, picked};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::aggregate::{Accumulator, divide_mean, exactly};
 use crate::bitstring;
@@ -2311,14 +2311,34 @@ fn like_of(
         }
     };
     let base = nulls_of(text).and(&nulls_of(pattern), rows);
+    if let Some((codes, dictionary)) = text.shared_dictionary_parts() {
+        if let Some(span) = like.ranked(dictionary)? {
+            return like_ranked(dictionary, codes, span, like.negated, base, rows, returns);
+        }
+    }
     if let Some((codes, dictionary)) = text.stable_dictionary_parts() {
         return like_stable(dictionary, codes, like, base, rows, returns);
+    }
+    // Codes that are not stable still name the right values of the dictionary they come with, and
+    // the memo is kept against that one dictionary, so a demoted column whose parts all point into
+    // the file's dictionary is answered once per value for the query like a stable one. Without
+    // this `movie_info.info` copied every row's string to search it, a third of JOB 19a and 24a.
+    if let Some((codes, dictionary)) = text.shared_dictionary_parts() {
+        if dictionary.form() == Form::StringView && codes.len() >= rows {
+            return like_stable(dictionary, codes, like, base, rows, returns);
+        }
     }
     match text.form() {
         Form::Flat => {
             let Some(Data::Varlen(column)) = text.data() else {
                 return Ok(None);
             };
+            if column.len() >= rows {
+                let text = |index: usize| Ok(column.bytes(index).unwrap_or_default());
+                if let Some(done) = like_joined(text, like, &base, rows, returns)? {
+                    return Ok(Some(done));
+                }
+            }
             like_run(column, identity, like, base, rows, returns)
         }
         Form::Dictionary | Form::Rle => {
@@ -2335,6 +2355,10 @@ fn like_of(
             // way in, so the gather indexes without a bound of its own.
             if column.len() < rows {
                 return like_over(column, &codes, like, base, rows, returns);
+            }
+            let text = |index: usize| Ok(column.bytes(codes[index] as usize).unwrap_or_default());
+            if let Some(done) = like_joined(text, like, &base, rows, returns)? {
+                return Ok(Some(done));
             }
             let at = move |index: usize| codes[index] as usize;
             like_run(column, at, like, base, rows, returns)
@@ -2361,6 +2385,9 @@ pub(crate) struct Like {
     /// Whether the answer is inverted, which is the `!` in the spelling.
     negated: bool,
     stable: OnceLock<StableLike>,
+    /// The ranks a prefix covers in the last sorted dictionary asked about, with that dictionary.
+    /// See [`Like::ranked`].
+    ranked: Mutex<Option<(Arc<Vector>, usize, usize)>>,
 }
 
 /// How many dictionary values one decision of the stable memo covers.
@@ -2531,7 +2558,42 @@ impl Like {
             fold_case,
             negated,
             stable: OnceLock::new(),
+            ranked: Mutex::new(None),
         })
+    }
+
+    /// The ranks of the values a prefix pattern holds in `dictionary`, from the first to one past
+    /// the last, or `None` for any other pattern or a dictionary that does not know its order.
+    ///
+    /// The values that start with `abc` are the values from `abc` up to but not including `abd`,
+    /// because the order is the byte order, so `LIKE 'abc%'` is two searches of the order and then
+    /// a rank against two bounds a row. Asking the dictionary for the text of each row cost JOB 17a
+    /// a lookup in a global dictionary of four million names per row of `name`. The two bounds are
+    /// kept for the dictionary they were found in, which on a stored column is the same one for
+    /// every part of the scan.
+    fn ranked(&self, dictionary: &Arc<Vector>) -> Result<Option<(usize, usize)>> {
+        let Pattern::Prefix(prefix) = &self.compiled else { return Ok(None) };
+        if self.fold_case {
+            return Ok(None);
+        }
+        let Some(ranks) = dictionary.ranks() else { return Ok(None) };
+        if dictionary.code_ranks().is_none() {
+            return Ok(None);
+        }
+        let mut held =
+            self.ranked.lock().map_err(|_| Error::internal("a LIKE memo was poisoned"))?;
+        if let Some((known, first, past)) = &*held {
+            if Arc::ptr_eq(known, dictionary) {
+                return Ok(Some((*first, *past)));
+            }
+        }
+        let (first, _) = crate::peel::below(dictionary, ranks, prefix.as_bytes())?;
+        let past = match successor(prefix.as_bytes()) {
+            Some(next) => crate::peel::below(dictionary, ranks, &next)?.0,
+            None => ranks,
+        };
+        *held = Some((Arc::clone(dictionary), first, past));
+        Ok(Some((first, past)))
     }
 
     /// Whether the string at `position` matches, negation included.
@@ -2609,6 +2671,83 @@ fn like_run<A: Fn(usize) -> usize>(
     finish(returns, Data::Bool(out.into()), validity)
 }
 
+/// A substring `LIKE` over a chunk, found by one search over the chunk's strings laid end to end
+/// rather than by one search a string.
+///
+/// A name in IMDb is fifteen bytes, and a search over fifteen bytes is nearly all the cost of
+/// starting one: `memmem` looks at the length, picks a strategy and sets up its vector registers
+/// before it reads a byte. JOB 6a asks `name LIKE '%Downey%Robert%'` of 4.2 million names and was
+/// paying that setup 4.2 million times, 700 ms of CPU, for two rows. Copying the chunk into one
+/// buffer costs a `memcpy` a string, and then the search runs at the speed it runs over a page of
+/// text, stopping only where the needle is.
+///
+/// A match found this way can run across the end of one string into the next. That string has no
+/// match starting at or after the one found, since any such match would end later still, so the
+/// search goes on from the start of the next string either way, and a string with a match is not
+/// searched again. A pattern of several pieces searches for its longest middle piece and asks the
+/// whole pattern only of the strings that hold it.
+///
+/// `None` is every pattern this does not speed up, which is anything with no middle piece to look
+/// for or that folds case, and those take the loop a string at a time.
+fn like_joined<'a>(
+    text: impl Fn(usize) -> Result<&'a [u8]>,
+    like: &Like,
+    base: &Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    if like.fold_case {
+        return Ok(None);
+    }
+    let (finder, split) = match &like.compiled {
+        Pattern::Contains(finder) => (&**finder, None),
+        Pattern::Segments(split) => {
+            let Some(longest) = split.middles.iter().max_by_key(|finder| finder.needle().len())
+            else {
+                return Ok(None);
+            };
+            (longest, Some(&**split))
+        }
+        _ => return Ok(None),
+    };
+    let needle = finder.needle().len();
+    if needle == 0 || matches!(base, Validity::AllInvalid) {
+        return Ok(None);
+    }
+    let mut joined = Vec::new();
+    let mut ends = Vec::with_capacity(rows);
+    for index in 0..rows {
+        joined.extend_from_slice(text(index)?);
+        ends.push(joined.len());
+    }
+    let mut out = vec![false; rows];
+    let (mut from, mut row) = (0, 0);
+    while let Some(found) = joined.get(from..).and_then(|rest| finder.find(rest)) {
+        let at = from + found;
+        while ends[row] <= at {
+            row += 1;
+        }
+        if at + needle <= ends[row] {
+            out[row] = match split {
+                Some(split) => split.holds(text(row)?),
+                None => true,
+            };
+        }
+        from = ends[row];
+        row += 1;
+        if row == rows {
+            break;
+        }
+    }
+    // A null row answers false underneath its null, which is what the loop a string at a time
+    // leaves there, so the two give the same bytes and not only the same values.
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot =
+            (*slot != like.negated) && !matches!(base, Validity::Mask(mask) if !mask.get(index));
+    }
+    finish(returns, Data::Bool(out.into()), base.clone().normalize(rows))
+}
+
 fn like_vector_run(
     values: &Vector,
     codes: &[u32],
@@ -2617,6 +2756,50 @@ fn like_vector_run(
     rows: usize,
     returns: &LogicalType,
 ) -> Result<Option<Vector>> {
+    // A chunk of a column like `movie_companies.note` points at a few hundred values over thousands
+    // of rows, and copying each row's string to search it was a third of JOB 19a. When the codes
+    // repeat, the search runs once per distinct code and the rows take the answer of theirs.
+    let mut distinct = codes.get(..rows).map(<[u32]>::to_vec).unwrap_or_default();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if !distinct.is_empty() && distinct.len() * 2 <= rows {
+        let answered = like_codes(
+            values,
+            &distinct,
+            like,
+            Validity::AllValid,
+            distinct.len(),
+            &LogicalType::Boolean,
+        )?;
+        let Some(answered) = answered else { return Ok(None) };
+        let held: Vec<bool> =
+            (0..distinct.len()).map(|at| answered.value_at(at) == Value::Boolean(true)).collect();
+        let mut out = vec![false; rows];
+        let validity = over_valid(rows, base, |index| {
+            let at = distinct
+                .binary_search(&codes[index])
+                .map_err(|_| Error::internal("a code is missing from its own distinct list"))?;
+            out[index] = held[at];
+            Ok(())
+        })?;
+        return finish(returns, Data::Bool(out.into()), validity);
+    }
+    like_codes(values, codes, like, base, rows, returns)
+}
+
+/// [`like_vector_run`] a row at a time, with no look at whether the codes repeat.
+fn like_codes(
+    values: &Vector,
+    codes: &[u32],
+    like: &Like,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let text = |index: usize| Ok(values.try_bytes_at(codes[index] as usize)?.unwrap_or_default());
+    if let Some(done) = like_joined(text, like, &base, rows, returns)? {
+        return Ok(Some(done));
+    }
     let mut out = vec![false; rows];
     let mut characters = Vec::new();
     let validity = over_valid(rows, base, |index| {
@@ -2624,6 +2807,44 @@ fn like_vector_run(
         Ok(())
     })?;
     finish(returns, Data::Bool(out.into()), validity)
+}
+
+/// The smallest byte string past every string that starts with `prefix`, or `None` when there is
+/// none, which is a prefix of nothing but `0xFF` bytes.
+fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut next = prefix.to_vec();
+    while let Some(last) = next.pop() {
+        if last < u8::MAX {
+            next.push(last + 1);
+            return Some(next);
+        }
+    }
+    None
+}
+
+/// A prefix `LIKE` over a sorted dictionary, a rank against two bounds a row. See [`Like::ranked`].
+fn like_ranked(
+    dictionary: &Vector,
+    codes: &[u32],
+    (first, past): (usize, usize),
+    negated: bool,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let Some(order) = dictionary.code_ranks() else { return Ok(None) };
+    if codes.len() < rows {
+        return Ok(None);
+    }
+    let mut out = vec![false; rows];
+    // row at a time: two loads and a compare, with the null rows' answers thrown away by `base`.
+    for (slot, &code) in out.iter_mut().zip(&codes[..rows]) {
+        let rank = *order
+            .get(code as usize)
+            .ok_or_else(|| Error::internal("a ranked code is past the end of its dictionary"))?;
+        *slot = (first <= rank as usize && (rank as usize) < past) != negated;
+    }
+    finish(returns, Data::Bool(out.into()), base)
 }
 
 fn like_stable(
@@ -4279,6 +4500,41 @@ mod tests {
         assert_eq!(called("!~~", &[text, pattern], &LogicalType::Boolean), Value::Boolean(true));
     }
 
+    /// A chunk searched as one run of bytes finds what a search a string finds, including where
+    /// the needle only turns up across the end of one string and the start of the next.
+    #[test]
+    fn a_match_across_two_strings_is_not_a_match_in_either() {
+        let texts = ["ab", "cd", "abc", "", "xbc", "Downey, Robert", "Robert Downey", "bcbc"];
+        let mut values: Vec<Value> =
+            texts.iter().map(|text| Value::Varchar((*text).into())).collect();
+        values.push(Value::Null);
+        let rows = values.len();
+        let text = Vector::from_values(LogicalType::Varchar, &values).expect("builds");
+        for (spelling, negated) in [
+            ("%bc%", false),
+            ("%bc%", true),
+            ("%Downey%Robert%", false),
+            ("%b%d%", false),
+            ("%dx%", false),
+        ] {
+            let pattern =
+                Vector::constant(LogicalType::Varchar, Value::Varchar(spelling.into()), rows);
+            let name = if negated { "!~~" } else { "~~" };
+            let answer =
+                binary(name, &Hoisted::Nothing, &text, &pattern, &LogicalType::Boolean, rows, None)
+                    .expect("the call is written")
+                    .expect("a flat text has a loop of its own");
+            for (row, value) in values.iter().enumerate() {
+                let expected = called(
+                    name,
+                    &[value.clone(), Value::Varchar(spelling.into())],
+                    &LogicalType::Boolean,
+                );
+                assert_eq!(answer.value_at(row), expected, "{spelling} {value:?}");
+            }
+        }
+    }
+
     /// A dictionary encoded text reaches the compiled loop instead of falling out of it.
     ///
     /// This is the one thing the property test cannot say, because `agrees` is happy when the row at
@@ -4790,6 +5046,31 @@ mod tests {
                 let want = oracle(name, std::slice::from_ref(&arg), &returns)
                     .expect("the row at a time path answers");
                 assert_eq!(format!("{taken:?}"), format!("{want:?}"), "{name} on {form:?}");
+            }
+        }
+    }
+
+    /// A `LIKE` over codes that repeat into a column that is read answers once per distinct code,
+    /// and the rows get what the row at a time path gives them, negated or not.
+    #[test]
+    fn a_like_over_repeating_codes_into_a_read_column_agrees_with_the_row_at_a_time_path() {
+        let values = ["USA:2005", "Japan:2007", "(USA) (TV)", "", "Japan:1999 (worldwide)"];
+        let kept = Kept(values.iter().map(|text| text.as_bytes().to_vec()).collect());
+        let read = Vector::external_text(LogicalType::Varchar, Arc::new(kept))
+            .expect("the source is text");
+        let codes: Vec<u32> = (0..40_u32).map(|row| (row * 7 + row / 3) % 5).collect();
+        let rows = codes.len();
+        let coded = Vector::dictionary(codes, read).expect("every code names a value");
+        for name in ["~~", "!~~"] {
+            for spelling in ["%(USA)%", "Japan:%200%", "%worldwide%", "USA:%", "%"] {
+                let pattern =
+                    Vector::constant(LogicalType::Varchar, Value::Varchar(spelling.into()), rows);
+                let taken = like_of(name, None, &coded, &pattern, &LogicalType::Boolean, rows)
+                    .expect("the call is written")
+                    .unwrap_or_else(|| panic!("{name} {spelling} took the row at a time path"));
+                let want = oracle(name, &[coded.clone(), pattern], &LogicalType::Boolean)
+                    .expect("the row at a time path answers");
+                assert_eq!(format!("{taken:?}"), format!("{want:?}"), "{name} {spelling}");
             }
         }
     }

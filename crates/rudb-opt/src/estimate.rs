@@ -793,6 +793,119 @@ fn counted_by(
     missing(plan, input, conjunct, reads)
         .or_else(|| common(plan, input, conjunct, stats, reads))
         .or_else(|| values(plan, conjunct, stats, reads).map(|(v, from)| (1.0 / widened(v), from)))
+        .or_else(|| sampled(plan, input, conjunct).map(|share| (share, Provenance::Sample)))
+}
+
+/// What fraction of a scan's rows a `LIKE` or an equality of one of its columns against a constant
+/// keeps, run by the store over a sample of the rows. See [`Zones::matching`].
+///
+/// Asked last, because it is the one answer here that reads the file, and only for the conditions
+/// on a string column none of the others could read. In JOB 6d the fifth charged for
+/// `n.name LIKE '%Downey%Robert%'` said 833,498 of the four million names, and put `cast_info`
+/// ahead of `name` in the reduction when two names pass. An equality is here for the columns with
+/// no synopsis and no distinct count, which is every string column whose values are nearly all
+/// different: `k.keyword = 'marvel-cinematic-universe'` keeps one row of 134,170 and was charged
+/// 26,834, which in 6e made the movies it leads to look like a hundred thousand.
+///
+/// A disjunction over one column is the sum of its branches, capped at every row. Branches that are
+/// equalities cannot overlap, and branches that are patterns can, which makes the sum a ceiling.
+fn sampled(plan: &Plan, input: NodeRef, conjunct: ExprRef) -> Option<f64> {
+    if let Expr::Conjunction { op: ConjunctionOp::Or, children } = *plan.expr(conjunct) {
+        let branches = plan.expr_list(children);
+        // Capped for the reason [`common`] caps.
+        if branches.is_empty() || branches.len() > 32 {
+            return None;
+        }
+        let mut column = None;
+        let mut total = 0.0;
+        for &branch in branches {
+            let (at, share) = sampled_one(plan, input, branch)?;
+            if *column.get_or_insert(at) != at {
+                return None;
+            }
+            total += share;
+        }
+        return Some(f64::min(total, 1.0));
+    }
+    sampled_one(plan, input, conjunct).map(|(_, share)| share)
+}
+
+/// [`sampled`] for one condition, with the store's number for the column it reads.
+fn sampled_one(plan: &Plan, input: NodeRef, conjunct: ExprRef) -> Option<(usize, f64)> {
+    let (zones, function, column, constant) = condition(plan, input, conjunct)?;
+    Some((column, zones.matching(column, function, constant)?))
+}
+
+/// A `LIKE` or an equality of a string column of the scan against a constant, as the store names
+/// the column, with the store.
+fn condition<'a>(
+    plan: &'a Plan,
+    input: NodeRef,
+    conjunct: ExprRef,
+) -> Option<(&'a Arc<dyn Zones>, &'a str, usize, &'a str)> {
+    let (function, column, constant) = match *plan.expr(conjunct) {
+        Expr::Function { name, args } => {
+            let function = plan.string(name);
+            if !matches!(function, "~~" | "!~~" | "~~*" | "!~~*") {
+                return None;
+            }
+            let [column, pattern] = plan.expr_list(args) else { return None };
+            (function, *column, *pattern)
+        }
+        Expr::Compare { op: CompareOp::Equal, left, right } => match plan.expr(left) {
+            Expr::Column(_) => ("=", left, right),
+            _ => ("=", right, left),
+        },
+        _ => return None,
+    };
+    let (Expr::Column(binding), Expr::Constant(constant)) =
+        (plan.expr(column), plan.expr(constant))
+    else {
+        return None;
+    };
+    let Value::Varchar(constant) = plan.value(*constant) else { return None };
+    let index = bounds::scanned(plan, input)?;
+    if binding.table != index {
+        return None;
+    }
+    let names = match *plan.node(input) {
+        Node::Get { columns, .. } => plan.field_list(columns),
+        _ => return None,
+    };
+    let zones = plan.zones(index)?;
+    let column = zones.column(&names.get(binding.column as usize)?.name)?;
+    Some((zones, function, column, constant))
+}
+
+/// The values of the scan's column `key` in the rows `conjunct` keeps, where the store could run
+/// it over the whole table and it keeps no more than `most`. See [`Zones::picked`].
+///
+/// A disjunction over one column is the values of its branches together, as [`sampled`] adds the
+/// shares of them.
+pub(crate) fn picked(
+    plan: &Plan,
+    input: NodeRef,
+    conjunct: ExprRef,
+    key: &str,
+    most: usize,
+) -> Option<Vec<Bound>> {
+    let branches = match *plan.expr(conjunct) {
+        Expr::Conjunction { op: ConjunctionOp::Or, children } => plan.expr_list(children),
+        _ => std::slice::from_ref(&conjunct),
+    };
+    if branches.is_empty() || branches.len() > 32 {
+        return None;
+    }
+    let mut values = Vec::new();
+    for &branch in branches {
+        let (zones, function, column, constant) = condition(plan, input, branch)?;
+        let key = zones.column(key)?;
+        values.extend(zones.picked(column, function, constant, key, most)?);
+        if values.len() > most {
+            return None;
+        }
+    }
+    Some(values)
 }
 
 /// What fraction of a scan's rows one condition keeps, with the constant where nothing could say.

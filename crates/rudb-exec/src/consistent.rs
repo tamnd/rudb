@@ -22,6 +22,31 @@
 //! and nothing else. It goes from the roots down, parents before children, which is the stored order
 //! backwards, keeping each held row whose key its parent kept and folding the extremes in.
 //!
+//! # Dropping rows in the scan
+//!
+//! Testing a row's keys in the sink is late: by then the scan has read and decoded every column the
+//! relation hands over, strings included, for rows that are nearly all about to go. On the Join
+//! Order Benchmark that was most of the time of the worst queries, `movie_info` read and flattened
+//! all fifteen million of its `info` strings to keep a few thousand. So each relation's finished
+//! sets are also handed to scans through the same [`Sideways`] a hash join hands its build side's
+//! keys through, as a bitmap over the key values with the range and, when they are few, the list of
+//! keys beside it. The scan then rules out parts whose keys it holds none of, tests the key column
+//! of each part it reads against the bitmap before the pushed filter runs, and reads the other
+//! columns at the rows that pass. See `crate::source::Scan::read_deferring`. The sink still tests
+//! every key, because the scan is allowed to stop testing a bitmap that keeps most rows and a scan
+//! the builder could not reach tests nothing.
+//!
+//! A set goes to more scans than the parent's. The columns of one class are equal in every row of
+//! the join, so the keys a relation kept in a class hold every value that class takes in the join,
+//! and any other relation with a column in that class can drop a row whose value is not among them
+//! without changing the answer, wherever it is in the tree. The relations are scanned in the order
+//! of the leaves, cheapest first, and a scan waits for every relation that hands it a set, so a set
+//! goes to the next relation in its class to be scanned and to no other. That relation keeps a
+//! subset of it and hands that on in turn, so each class is a chain from its cheapest relation to
+//! its dearest, and the dearest tests one set per class rather than one per relation before it.
+//! That is what lets `title` narrowed to eight movies in JOB 24b cut down the scan of `movie_info`
+//! in a branch of its own.
+//!
 //! # The sets
 //!
 //! A set of keys is a bitmap over the values from zero to a limit, which is where the identifiers of
@@ -57,6 +82,7 @@ use rudb_plan::Reducer;
 use rudb_vector::{Chunk, Selection, Vector};
 
 use crate::schema::Schema;
+use crate::sideways::{Found, Sideways};
 use crate::source::Handout;
 
 /// The keys below this go in the bitmap, and everything else in the hash set.
@@ -136,6 +162,9 @@ struct Role {
     /// Whether the rows are kept for the second sweep, and if so which columns, as positions in
     /// the relation's input.
     held: Option<Vec<usize>>,
+    /// The keys whose kept sets go to other relations' scans, each with the relations and the
+    /// column of each that is in the same class. See the module documentation.
+    published: Vec<(usize, Vec<(usize, u32)>)>,
 }
 
 /// What every relation of one node shares: the sets, the held rows and the running extremes.
@@ -146,6 +175,9 @@ pub(crate) struct Reduction {
     types: Vec<LogicalType>,
     /// Per relation, the keys it kept in the class it shares with its parent, while it is running.
     gathering: Vec<Mutex<Keys>>,
+    /// Per relation, the keys it kept for other scans, in the order of [`Role::published`], while it
+    /// is running. The one in the parent's class is left empty and `gathering` stands in for it.
+    publishing: Vec<Mutex<Vec<Keys>>>,
     /// The same, once the relation has finished, for its parent's sink to read without a lock.
     up: Vec<OnceLock<Keys>>,
     /// Per relation, the keys of its parent's class that a root allowed it, while the root runs.
@@ -207,16 +239,43 @@ impl Reduction {
                 columns.extend(extremes.iter().map(|&(_, column)| column));
                 columns
             });
-            roles.push(Role { keys, children, parent, down, extremes, held });
+            let published = leaf
+                .keys
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, key)| {
+                    // Only the next relation in the class to be scanned. The scans run in the
+                    // order of the leaves and each waits for the ones that hand it keys, so that
+                    // relation is read against these keys and keeps a subset of them, which it
+                    // hands on in turn. The relations further on would test their rows against
+                    // this set and then against a smaller one, and the ones already scanned
+                    // would be handed keys they never read.
+                    let readers: Vec<(usize, u32)> = (at + 1..count)
+                        .filter(|&other| !below(tree, other, at))
+                        .find_map(|other| {
+                            let column = tree.key(u32::try_from(other).ok()?, key.class)?;
+                            Some((other, column))
+                        })
+                        .into_iter()
+                        .collect();
+                    (!readers.is_empty()).then_some((slot, readers))
+                })
+                .collect();
+            roles.push(Role { keys, children, parent, down, extremes, held, published });
         }
         let mut extremes = Vec::with_capacity(types.len());
         for (extreme, ty) in tree.extremes.iter().zip(&types) {
             extremes.push(Accumulator::new(if extreme.max { "max" } else { "min" }, ty)?);
         }
+        let publishing = roles
+            .iter()
+            .map(|role| Mutex::new(role.published.iter().map(|_| Keys::default()).collect()))
+            .collect();
         Ok(Self {
             roles,
             types,
             gathering: (0..count).map(|_| Mutex::new(Keys::default())).collect(),
+            publishing,
             up: (0..count).map(|_| OnceLock::new()).collect(),
             allowing: (0..count).map(|_| Mutex::new(Keys::default())).collect(),
             allowed: (0..count).map(|_| OnceLock::new()).collect(),
@@ -230,6 +289,12 @@ impl Reduction {
         })
     }
 
+    /// The relations whose scans the keys of relation `at` go to, each with the column of that
+    /// relation they are about, in the order [`Collect::new`] wants its edges in.
+    pub(crate) fn readers(&self, at: usize) -> impl Iterator<Item = (usize, u32)> + '_ {
+        self.roles[at].published.iter().flat_map(|(_, readers)| readers.iter().copied())
+    }
+
     /// What the roots have folded in so far, which is where the second sweep starts from.
     fn accumulators(&self) -> Result<Vec<Accumulator>> {
         let held = self.extremes.lock().map_err(poisoned)?;
@@ -239,15 +304,18 @@ impl Reduction {
 
 /// The sink at the end of one relation's scan, which runs the first sweep over it.
 #[derive(Debug)]
-pub(crate) struct Collect {
+pub(crate) struct Collect<'a> {
     shared: Arc<Reduction>,
     at: usize,
+    /// Where the keys this relation kept go for other scans, one edge per reader in the order of
+    /// [`Reduction::readers`].
+    feeds: Vec<Arc<Sideways<'a>>>,
 }
 
-impl Collect {
-    /// The sink for relation `at` of the tree.
-    pub(crate) fn new(shared: Arc<Reduction>, at: usize) -> Self {
-        Self { shared, at }
+impl<'a> Collect<'a> {
+    /// The sink for relation `at` of the tree, handing what it keeps to `feeds` as well.
+    pub(crate) fn new(shared: Arc<Reduction>, at: usize, feeds: Vec<Arc<Sideways<'a>>>) -> Self {
+        Self { shared, at, feeds }
     }
 }
 
@@ -256,6 +324,9 @@ impl Collect {
 pub(crate) struct Collecting {
     /// The keys handed up to the parent.
     up: Keys,
+    /// The keys handed to other scans, in the order of [`Role::published`], with the one in the
+    /// parent's class left empty because `up` is the same set.
+    published: Vec<Keys>,
     /// Per child the second sweep goes on to, the keys a root allows it, in the order of
     /// [`Role::down`].
     down: Vec<Keys>,
@@ -270,7 +341,7 @@ pub(crate) struct Collecting {
     nulls: Vec<bool>,
 }
 
-impl Sink for Collect {
+impl Sink for Collect<'_> {
     type Local = Collecting;
 
     fn local(&self) -> Collecting {
@@ -278,6 +349,7 @@ impl Sink for Collect {
         let root = role.parent.is_none();
         Collecting {
             up: Keys::default(),
+            published: role.published.iter().map(|_| Keys::default()).collect(),
             down: role.down.iter().map(|_| Keys::default()).collect(),
             // Only a root reads extremes as it goes.
             extremes: (root && !role.extremes.is_empty()).then(|| self.shared.fresh.clone()),
@@ -329,6 +401,15 @@ impl Sink for Collect {
                 local.up.insert(values[row as usize]);
             }
         }
+        for (slot, &(key, _)) in role.published.iter().enumerate() {
+            if Some(key) == role.parent {
+                continue;
+            }
+            let values = &local.values[key];
+            for &row in &kept {
+                local.published[slot].insert(values[row as usize]);
+            }
+        }
         if role.parent.is_none() {
             for (slot, &(_, key)) in role.down.iter().enumerate() {
                 let values = &local.values[key];
@@ -357,6 +438,11 @@ impl Sink for Collect {
         if role.parent.is_some() {
             shared.gathering[self.at].lock().map_err(poisoned)?.merge(local.up);
         }
+        let mut publishing = shared.publishing[self.at].lock().map_err(poisoned)?;
+        for (held, keys) in publishing.iter_mut().zip(local.published) {
+            held.merge(keys);
+        }
+        drop(publishing);
         for (&(child, _), keys) in role.down.iter().zip(local.down) {
             shared.allowing[child].lock().map_err(poisoned)?.merge(keys);
         }
@@ -379,6 +465,19 @@ impl Sink for Collect {
             shared.empty.store(true, Ordering::Relaxed);
         }
         let up = std::mem::take(&mut *shared.gathering[self.at].lock().map_err(poisoned)?);
+        let published = std::mem::take(&mut *shared.publishing[self.at].lock().map_err(poisoned)?);
+        let mut feeds = self.feeds.iter();
+        for ((key, readers), keys) in role.published.iter().zip(&published) {
+            let keys = if Some(*key) == role.parent { &up } else { keys };
+            for _ in readers {
+                let Some(feed) = feeds.next() else { break };
+                // A key outside the bitmap would be one the scan's bitmap turns away, so a set with
+                // any is not handed over and the sink alone tests it.
+                if feed.binding().is_some() && keys.spread.is_empty() {
+                    feed.found(Found::kept(keys.words.clone(), feed.exact()));
+                }
+            }
+        }
         let _ = shared.up[self.at].set(up);
         for &(child, _) in &role.down {
             let allowed = std::mem::take(&mut *shared.allowing[child].lock().map_err(poisoned)?);
@@ -386,6 +485,18 @@ impl Sink for Collect {
         }
         Ok(())
     }
+}
+
+/// Whether relation `leaf` is `ancestor` or somewhere under it.
+fn below(tree: &Reducer, leaf: usize, ancestor: usize) -> bool {
+    let mut at = Some(leaf);
+    while let Some(here) = at {
+        if here == ancestor {
+            return true;
+        }
+        at = tree.leaves[here].parent.map(|edge| edge.leaf as usize);
+    }
+    false
 }
 
 /// Reads one column of join keys as `i64`, and says whether any of them is null.

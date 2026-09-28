@@ -988,6 +988,68 @@ pub fn stored_adjacency(child: &Reader, parent: &Reader, edge: &Edge) -> Option<
     Adjacency::read_from(bytes, binding).ok()
 }
 
+/// The parent table and column the backward adjacency of a child column was built against, read off
+/// the binding at the front of its payload, when the table carries a current one.
+///
+/// A caller that holds only the child, which is a reduction handed a set of key values rather than
+/// a join over a parent it can see, asks this to find the parent whose key map turns those values
+/// into the rows the adjacency is indexed by. What it names is checked again by [`stored_adjacency`]
+/// against the parent as it is now, so a stale name costs a lookup and never an answer.
+#[must_use]
+pub fn adjacency_parent(child: &Reader, child_column: usize) -> Option<(String, usize)> {
+    let table = child.table();
+    let id = u64::try_from(child_column).ok()?;
+    let held = table
+        .sections()
+        .iter()
+        .find(|section| section.kind == *section::ADJACENCY && section.id == id)?;
+    if !held.usable(table.generation()) || held.refused().is_some() {
+        return None;
+    }
+    let head = child.payload_head(held, 16).ok()?;
+    let column = u32::from_le_bytes(head.get(8..12)?.try_into().ok()?) as usize;
+    let length = u32::from_le_bytes(head.get(12..16)?.try_into().ok()?) as usize;
+    let bytes = child.payload_head(held, 16 + length).ok()?;
+    let name = std::str::from_utf8(bytes.get(16..16 + length)?).ok()?;
+    Some((name.to_owned(), column))
+}
+
+/// The parent a column's forward link was built against, as its table, its key column and the
+/// generation it had then, when every row of the column found a parent.
+///
+/// For a planner that wants to drop a relation from a join because nothing it holds changes the
+/// answer, which is true of a parent every child row finds exactly once. The key a link is built
+/// over was found distinct, so once is given, and at least once is `linked` equal to `children`.
+/// Only the header is read. The caller checks the generation against the parent as it is now,
+/// since a parent rewritten after the build may have lost a row a child pointed at.
+#[must_use]
+pub fn total_parent(child: &Reader, child_column: usize) -> Option<(String, usize, u64)> {
+    let table = child.table();
+    let id = u64::try_from(child_column).ok()?;
+    // The link when it was kept, and the adjacency when the link was over its budget and the
+    // adjacency was not. Both start with the same binding and both count the children and the ones
+    // that found a parent, in the link's third word and the adjacency's `edges`. A budget record
+    // has no bytes, so it reads as nothing here and the next kind is asked.
+    [*section::FORWARD_LINK, *section::ADJACENCY].into_iter().find_map(|kind| {
+        let held =
+            table.sections().iter().find(|section| section.kind == kind && section.id == id)?;
+        if !held.usable(table.generation()) {
+            return None;
+        }
+        let head = child.payload_head(held, 16).ok()?;
+        let generation = u64::from_le_bytes(head.get(0..8)?.try_into().ok()?);
+        let column = u32::from_le_bytes(head.get(8..12)?.try_into().ok()?) as usize;
+        let length = u32::from_le_bytes(head.get(12..16)?.try_into().ok()?) as usize;
+        let binding = 16 + length.div_ceil(8) * 8;
+        let bytes = child.payload_head(held, binding + link::HEADER_BYTES).ok()?;
+        let name = std::str::from_utf8(bytes.get(16..16 + length)?).ok()?;
+        let counts = bytes.get(binding..binding + 24)?;
+        let children = u64::from_le_bytes(counts.get(0..8)?.try_into().ok()?);
+        let linked = u64::from_le_bytes(counts.get(16..24)?.try_into().ok()?);
+        (linked == children).then(|| (name.to_owned(), column, generation))
+    })
+}
+
 /// The forward link this child table carries for a column, when it carries one this build can use
 /// and the parent it was built against is still the parent being asked about.
 ///
@@ -1774,6 +1836,8 @@ mod tests {
         let link = links(&path, &foreign);
         assert_eq!(link.forward(2), None, "a null is not a link");
         assert_eq!(link.forward(3), None, "a key that matches nothing is not a link");
+        let child = Catalog::open(&path).expect("reopen").table("child").expect("the child");
+        assert_eq!(total_parent(&child, 0), None, "a link some children missed is no certificate");
 
         fs::remove_file(&path).expect("clean up");
     }
@@ -1863,6 +1927,12 @@ mod tests {
             }
         );
         assert_eq!((counts.children, counts.linked), (500, 500));
+        // Every child found a parent, so the planner is told which parent and at what generation.
+        assert_eq!(
+            total_parent(&child, 0),
+            Some(("parent".to_owned(), 0, parent.table().generation()))
+        );
+        assert_eq!(total_parent(&child, 1), None, "a column with no link");
         let wrong = Edge { parent: "child".into(), ..edge() };
         assert!(stored_link(&child, &parent, &wrong).is_none(), "a different parent name");
         assert!(stored_link_counts(&child, &parent, &wrong).is_none(), "a different parent name");
@@ -1920,6 +1990,11 @@ mod tests {
         // What does survive is the size and the form, which is exit criterion 3 of G3: somebody
         // deciding whether to raise `graph_budget` reads this rather than rebuilding to find out.
         assert_eq!(refused_link(&child, 0), Some((link::Form::Packed, report[0].bytes as u64)));
+        // Every child found a parent, and whether a planner is told so rests on the adjacency now,
+        // which carries the same binding and the same counts when it was kept.
+        let total =
+            report[0].adjacency.then(|| ("parent".to_owned(), 0, parent.table().generation()));
+        assert_eq!(total_parent(&child, 0), total);
 
         fs::remove_file(&path).expect("clean up");
     }

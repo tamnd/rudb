@@ -92,11 +92,14 @@ pub enum Rule {
     /// Off means the aggregate reads the rows. The per column statistics, the row count, null counts, bounds, stripe totals, distinct counts and value frequencies, answer either way.
     /// A master of its own rather than a statistics rule, because turning it off is what a ClickBench run does and that run should not lose the statistics along with it.
     StoredAnswers,
+    /// Pricing a set of kept keys at the rows the values people name tend to hold, off the frequency
+    /// synopsis of the column they are looked up in, rather than at the average value's rows.
+    Skew,
 }
 
 impl Rule {
     /// Every rule, in the order a report lists them.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::StatsAll,
         Self::Presize,
         Self::DirectAddressing,
@@ -111,6 +114,7 @@ impl Rule {
         Self::ClosedGroups,
         Self::Consistent,
         Self::StoredAnswers,
+        Self::Skew,
     ];
 
     /// The canonical name, which is what a setting reads back as.
@@ -131,6 +135,7 @@ impl Rule {
             Self::ClosedGroups => "stats.closed_groups",
             Self::Consistent => "plan.consistent",
             Self::StoredAnswers => "stored.answers",
+            Self::Skew => "stats.skew",
         }
     }
 
