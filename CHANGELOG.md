@@ -8,6 +8,12 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.3
+
+More C5 work on the compiled engine's grouped aggregates, mostly for queries where nearly every key is new. #2070 puts a worker's rows into 256 lanes by hash once its table fills, so the merge folds one lane per part and never has to split the rows again. #2071 makes a worker stop looking up keys in that table when almost none are found and just write the new rows. #2072 prefetches the rows and slots ahead while the lanes fold, and gathers a top N by a descending count during the fold instead of reading every row again after it. #2074 keeps a sum or average of a SMALLINT or TINYINT in an i64 instead of an i128, which makes the group row smaller. Elsewhere, #2073 holds sparse chunks between operators in the first engine's pipelines and pushes them on together.
+
+On gamingpc over ClickBench at ten million rows and 16 threads, compared with the numbers in 0.8.2, q33 went from 0.098s to 0.057s, q16 from 0.049s to 0.029s, q19 from 0.115s to 0.088s and q36 from 0.051s to 0.033s. None of the 43 queries differ from the first engine. The native directory format number stays at 30 and the storage format version at 9.
+
 ## 0.8.2
 
 More C5 work on the compiled engine's grouped aggregates. #2061 lets a top N over a compiled scan tell the scan which parts it can skip. #2062 answers an aggregate with no groups from the table statistics, like the first engine already does, and #2063 adds a `rows` option so the tests can still run such an aggregate over its rows. #2065 lets a merge part keep a worker's row where it is instead of copying it into a fresh page. #2067 reuses the last row's group for a key that is the same as the last one, which pays off on a file sorted on its keys. #2068 makes each merge part's groups into chunks where it folds them and skips the join. Elsewhere, #2064 floors a sub-day date_trunc on timestamps with a fixed unit per part, and #2066 says why the runtime bitmap's bounds check stays.
