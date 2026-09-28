@@ -1201,7 +1201,8 @@ impl Sink for Scan<'_, '_> {
     fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress> {
         match local {
             Some(w) => {
-                let (rt, state, out, headers) = (&mut w.rt, &mut w.state, &mut w.out, &mut w.headers);
+                let (rt, state, out, headers) =
+                    (&mut w.rt, &mut w.state, &mut w.out, &mut w.headers);
                 let progress = self.0.run(chunk, rt, state, out, &mut false, headers);
                 w.from.resize(w.out.len(), w.morsel);
                 progress
