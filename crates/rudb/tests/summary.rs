@@ -287,15 +287,23 @@ fn a_filter_the_synopsis_cannot_decide_sends_the_query_back_to_the_rows() {
         "filter ignored"
     );
     // Five thousand distinct values overflow the budget, so the file kept the leading ones and a
-    // bound on what it dropped, and a bound cannot be counted with.
+    // bound on what it dropped. A constant it listed still has its exact count, which is enough for
+    // an equality and, with the null count, for the rows that differ from it, so those two answer.
+    // An ordering comparison would have to add up the values it dropped, and a bound cannot be
+    // counted with.
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE wide = 1"), Value::BigInt(1));
     assert!(
-        !pair.summarised("SELECT COUNT(*) FROM t WHERE wide = 1"),
-        "a partial list was counted"
+        pair.summarised("SELECT COUNT(*) FROM t WHERE wide = 1"),
+        "a listed value was not counted"
     );
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE wide <> 1"), Value::BigInt(4999));
     assert!(
-        !pair.summarised("SELECT COUNT(*) FROM t WHERE wide <> 1"),
+        pair.summarised("SELECT COUNT(*) FROM t WHERE wide <> 1"),
+        "a listed value was not counted"
+    );
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE wide > 1"), Value::BigInt(4998));
+    assert!(
+        !pair.summarised("SELECT COUNT(*) FROM t WHERE wide > 1"),
         "a partial list was counted"
     );
     // A null constant compares unknown against every row whatever the column holds, so the answer
@@ -403,14 +411,20 @@ fn a_top_count_with_no_skew_to_prove_it_with_goes_back_to_the_rows() {
 }
 
 #[test]
-fn a_filtered_top_count_over_a_prefix_still_refuses_to_count_the_rows_it_keeps() {
-    // The proof covers which groups lead and by how much. It says nothing about how many rows the
-    // filter keeps in total, because the values the synopsis dropped are rows this list never saw,
-    // so the count of them is still a question for the rows.
+fn a_filtered_count_over_a_prefix_answers_only_for_the_value_it_lists() {
+    // The proof covers which groups lead and by how much. It says nothing about the values the
+    // synopsis dropped, so a count that has to add those up is still a question for the rows. The
+    // rows that differ from a listed value are the exception, because they are every row that is
+    // neither null nor that value, and both of those are counted exactly.
     let pair = Pair::new("prefixrows", SKEWED);
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s <> 'h0'"), Value::BigInt(19050));
     assert!(
-        !pair.summarised("SELECT COUNT(*) FROM t WHERE s <> 'h0'"),
+        pair.summarised("SELECT COUNT(*) FROM t WHERE s <> 'h0'"),
+        "a listed value was not counted"
+    );
+    pair.agree("SELECT COUNT(*) FROM t WHERE s > 'h0'");
+    assert!(
+        !pair.summarised("SELECT COUNT(*) FROM t WHERE s > 'h0'"),
         "a prefix was added up as though it were the whole column"
     );
 }
