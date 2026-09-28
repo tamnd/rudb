@@ -64,13 +64,10 @@ fn rows(chunks: &[Chunk]) -> Vec<Vec<Value>> {
 /// every function of the module compiled by the tiers that compile, and again with the query moved
 /// between the tiers at every morsel and at random ones.
 fn compiled(text: &str) -> Result<Vec<Vec<Value>>> {
-    let mut runs = vec![
-        Options { tier: Tier::Interp, switch: Switch::Off },
-        Options { tier: Tier::Auto, switch: Switch::Off },
-    ];
+    let mut runs = vec![Options { tier: Tier::Interp, ..Options::default() }, Options::default()];
     for tier in [Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()) {
         for switch in [Switch::Off, Switch::Every(1), Switch::Random(7)] {
-            runs.push(Options { tier, switch });
+            runs.push(Options { tier, switch, ..Options::default() });
         }
     }
     let mut answers: Vec<(Options, Result<Vec<Vec<Value>>>)> = Vec::new();
@@ -158,7 +155,7 @@ fn auto_leaves_a_pipeline_over_one_morsel_on_interp_and_compiles_nothing() {
 fn a_named_tier_compiles_a_pipeline_when_it_starts_and_not_before() {
     for tier in [Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()) {
         let plan = Plan::parse(SCAN).expect("a well formed plan");
-        let options = Options { tier, switch: Switch::Off };
+        let options = Options { tier, ..Options::default() };
         let compiled = compile_with(&plan, &Cancel::new(), options).expect("it is taken");
         assert_eq!(compiled.report().native, 0, "{tier}");
         let answer = answer(SCAN, options).expect("the scan runs");

@@ -1285,6 +1285,14 @@ impl Database {
         *self.shared.inner.switches.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// How many pipeline functions have moved up from `direct` to `clif` while they ran, over the
+    /// life of the process and not only this database's, since the compiles run on threads of
+    /// their own and are counted when they are done.
+    #[must_use]
+    pub fn tier_ups(&self) -> u64 {
+        rudb_qc::moved_up()
+    }
+
     /// One setting, by the name `SET` uses for it, in the spelling DuckDB prints.
     ///
     /// The Rust side of reading a setting back. `SELECT current_setting('threads')` is the SQL side
@@ -2946,7 +2954,11 @@ impl Shared {
 
     /// The tier and the switching the compiled engine is set to.
     fn qc_options(&self) -> rudb_qc::Options {
-        rudb_qc::Options { tier: self.inner.settings.tier(), switch: self.inner.settings.switch() }
+        rudb_qc::Options {
+            tier: self.inner.settings.tier(),
+            switch: self.inner.settings.switch(),
+            ..rudb_qc::Options::default()
+        }
     }
 
     /// The memory and the threads this database will lend a query.

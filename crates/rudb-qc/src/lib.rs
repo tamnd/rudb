@@ -44,7 +44,7 @@ use rudb_vector::Chunk;
 
 use crate::feed::Feed;
 use crate::tier::Tiers;
-pub use crate::tier::{Options, Report, Switch, Switches, Tier};
+pub use crate::tier::{Options, Report, Switch, Switches, Tier, moved_up};
 
 /// A query the compiled engine has agreed to run.
 #[derive(Debug)]
@@ -99,7 +99,7 @@ pub fn compile_with(
     let mut rt = Rt::new(cancel.clone());
     let query = rudb_qc_gen::generate(&graph, &mut rt)?;
     let generated = started.elapsed().saturating_sub(planned);
-    let mut tiers = Tiers::new(&query.module, options);
+    let tiers = Tiers::new(&query.module, options);
     tiers.generated_in(planned, generated);
     Ok(Compiled { graph, query, tiers, rt })
 }
@@ -203,7 +203,8 @@ impl Compiled {
                         }
                     };
                     if let Some(f) = self.tiers.func(&body.func) {
-                        self.tiers.prepare(&self.query.module, f, rows);
+                        let probes = !body.probes.is_empty();
+                        self.tiers.prepare(&self.query.module, f, rows, probes);
                     }
                     let feed = Feed::new(
                         &self.query.module,
