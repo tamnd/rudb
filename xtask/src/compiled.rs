@@ -37,7 +37,7 @@ const FIXUP: &str = "* REPLACE (make_date(EventDate) AS EventDate, epoch_ms(Even
 
 pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let usage = || {
-        "usage: cargo xtask compiled [--threads <n>] [--set <name>=<value>]... [--tier auto|interp|clif|direct | --tiers <seed>] \
+        "usage: cargo xtask compiled [--threads <n>] [--repeat <n>] [--set <name>=<value>]... [--tier auto|interp|clif|direct | --tiers <seed>] \
          <file.parquet> [q1 q2 ...]\n       \
          cargo xtask compiled [--threads <n>] [--tier auto|interp|clif|direct | --tiers <seed>] \
          --suite <parquet dir> <queries> [q1 ...]\n       \
@@ -48,12 +48,17 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let mut tier = "auto".to_string();
     let mut seed = None;
     let mut threads = None;
+    let mut repeat = 1_usize;
     let mut sets = Vec::new();
     while let [flag, value, rest @ ..] = args {
         match flag.as_str() {
             "--tier" => tier = value.clone(),
             "--tiers" => {
                 seed = Some(value.parse::<u64>().map_err(|e| format!("--tiers {value}: {e}"))?);
+            }
+            "--repeat" => {
+                repeat =
+                    value.parse::<usize>().map_err(|e| format!("--repeat {value}: {e}"))?.max(1);
             }
             "--threads" => {
                 threads =
@@ -145,7 +150,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         }
         let first = answer(&database, "first", sql);
         let logged = database.refusals().len();
-        let compiled = answer(&database, "compiled", sql);
+        let mut compiled = answer(&database, "compiled", sql);
+        if repeat > 1 && database.refusals().len() == logged {
+            compiled = steadied(&database, sql, compiled, repeat);
+        }
         let refusal = database.refusals().get(logged).cloned();
         let verdict = match (&first.rows, &compiled.rows, &refusal) {
             (_, _, Some(line)) => {
@@ -355,6 +363,28 @@ fn answer(database: &Database, engine: &str, sql: &str) -> Answer {
         Err(e) => (Err(e.to_string()), Answer::default()),
     };
     Answer { rows, seconds: began.elapsed().as_secs_f64(), ..sizes }
+}
+
+/// `first` with its timings replaced by the median of `repeat` runs of the same query on the
+/// compiled engine, so one slow compile does not stand for the query. The rows are the first run's,
+/// which is the one the verdict is about.
+fn steadied(database: &Database, sql: &str, first: Answer, repeat: usize) -> Answer {
+    let mut runs = vec![first];
+    for _ in 1..repeat {
+        runs.push(answer(database, "compiled", sql));
+    }
+    let median = |f: &dyn Fn(&Answer) -> f64| {
+        let mut values: Vec<f64> = runs.iter().map(f).collect();
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    };
+    let seconds = median(&|a| a.seconds);
+    let compile_ms = median(&|a| a.compile_ms);
+    let lower_ms = median(&|a| a.lower_ms);
+    let qir_ms = median(&|a| a.qir_ms);
+    let backend_ms = median(&|a| a.backend_ms);
+    let first = runs.swap_remove(0);
+    Answer { seconds, compile_ms, lower_ms, qir_ms, backend_ms, ..first }
 }
 
 /// What a query's code took to make and how big it came out, from its metrics document, as an
