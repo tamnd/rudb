@@ -198,6 +198,11 @@ impl Rt {
         Ok(())
     }
 
+    /// Adds the counters of a worker that has nothing left to fold to these, and keeps it.
+    pub fn retire(&mut self, worker: Rt) {
+        self.keep_worker(worker);
+    }
+
     /// Adds a worker's counters to these and keeps its heap alive.
     fn keep_worker(&mut self, mut worker: Rt) {
         let counters = std::mem::take(&mut worker.counters);

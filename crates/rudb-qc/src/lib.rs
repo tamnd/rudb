@@ -11,15 +11,16 @@
 //! every chunk the scan produces is handed to the compiled body as one morsel. That is what keeps
 //! the storage layer, the zone maps and the pushed down filters out of this crate. An aggregate
 //! over a scan runs on as many workers as the scan has threads, each with its own state and its
-//! own [`Rt`] made by [`Rt::worker`], and each worker's groups are folded into the query's as it
-//! finishes. A pipeline that produces rows or builds a join table still runs on one, because the
-//! order its rows come out in is part of the answer.
+//! own [`Rt`] made by [`Rt::worker`], and the workers' groups are merged into the query's when
+//! they finish. A pipeline that produces rows runs the same way when only a sort reads them, and
+//! its workers' rows are put together in the order the workers finish. Any other pipeline that
+//! produces rows, or builds a join table, runs on one worker, because the order its rows come out
+//! in is part of the answer.
 //!
 //! The breakers between pipelines are run here over the rows the pipeline before them produced,
-//! and so is the fetch that reads whole rows back once a top N has picked them.
-//! A sort, a top N and a limit are cheap on ClickBench, where they sit over a few thousand groups
-//! at most, and doing them a value at a time keeps the rules for comparing values in one place,
-//! `rudb_kernels::compare`.
+//! and so is the fetch that reads whole rows back once a top N has picked them. A sort reads its
+//! keys as numbers or bytes where their type orders that way, and as values compared by
+//! `rudb_kernels::compare` where it does not.
 
 #![allow(unsafe_code)]
 
@@ -165,6 +166,13 @@ impl Compiled {
     /// underneath.
     pub fn run(mut self, plan: &Plan, under: Under<'_>) -> Result<Answer> {
         let mut outputs: Vec<Option<Vec<Chunk>>> = Vec::with_capacity(self.graph.stages.len());
+        // The stages whose rows only a sort reads, which may come in any order.
+        let mut unordered = vec![false; self.graph.stages.len()];
+        for stage in &self.graph.stages {
+            if let Stage::Sort { input, .. } | Stage::TopN { input, .. } = stage {
+                unordered[*input] = true;
+            }
+        }
         for (at, stage) in self.graph.stages.iter().enumerate() {
             let chunks = match stage {
                 Stage::Pipeline(p) => {
@@ -178,6 +186,7 @@ impl Compiled {
                         body,
                         &mut self.rt,
                         under.cancel,
+                        unordered[at],
                     )?;
                     match &p.source {
                         Source::Scan { node, .. } => {

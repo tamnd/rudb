@@ -72,6 +72,8 @@ pub(crate) struct Feed<'a> {
 pub(crate) struct Worker {
     rt: Rt,
     state: Vec<Line>,
+    /// The chunks a result body produced.
+    out: Vec<Chunk>,
 }
 
 /// What a call changes.
@@ -111,6 +113,7 @@ impl<'a> Feed<'a> {
         body: &'a Body,
         rt: &'a mut Rt,
         cancel: &Cancel,
+        unordered: bool,
     ) -> Result<Feed<'a>> {
         let func = tiers
             .func(&body.func)
@@ -158,6 +161,15 @@ impl<'a> Feed<'a> {
             Out::Aggregate(g) if matches!(p.source, Source::Scan { .. }) => {
                 (true, merge::folds(g)?, merge::sets(g))
             }
+            // Rows that only a sort reads may come from many workers in any order. A worker's
+            // runtime has no join tables, so a body that probes one stays on one worker.
+            Out::Result { .. }
+                if unordered
+                    && body.probes.is_empty()
+                    && matches!(p.source, Source::Scan { .. }) =>
+            {
+                (true, Vec::new(), Vec::new())
+            }
             _ => (false, Vec::new(), Vec::new()),
         };
         Ok(Feed {
@@ -200,16 +212,22 @@ impl<'a> Feed<'a> {
             let row = table.address(0) as u64;
             bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
         }
-        Worker { rt, state }
+        Worker { rt, state, out: Vec::new() }
     }
 
     /// Folds a worker that has seen its last morsel into the query's runtime. The first one is
     /// taken as it is, so a pipeline that ran on one worker folds nothing.
-    fn fold(&self, worker: Worker) -> Result<()> {
-        let Out::Aggregate(g) = &self.body.sink else {
-            return Err(Error::internal("a parallel pipeline that is not an aggregate"));
-        };
+    fn fold(&self, mut worker: Worker) -> Result<()> {
         let mut inner = self.lock();
+        let g = match &self.body.sink {
+            Out::Aggregate(g) => g,
+            Out::Result { .. } => {
+                inner.out.append(&mut worker.out);
+                inner.rt.retire(worker.rt);
+                return Ok(());
+            }
+            Out::Build(_) => return Err(Error::internal("a parallel pipeline that builds")),
+        };
         if self.split {
             inner.workers.push(worker.rt);
             Ok(())
@@ -591,7 +609,7 @@ impl Sink for Scan<'_, '_> {
 
     fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress> {
         match local {
-            Some(w) => self.0.run(chunk, &mut w.rt, &mut w.state, &mut Vec::new(), &mut false),
+            Some(w) => self.0.run(chunk, &mut w.rt, &mut w.state, &mut w.out, &mut false),
             None => self.0.push(chunk),
         }
     }
