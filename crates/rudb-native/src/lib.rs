@@ -9909,6 +9909,15 @@ struct Window<'a> {
     size: usize,
 }
 
+impl Window<'_> {
+    /// Where `len` bytes from `at` start in `held`, when all of them are there.
+    #[inline]
+    fn within(&self, at: usize, len: usize) -> Option<usize> {
+        let from = at.checked_sub(self.start)?;
+        (len <= self.held.len().checked_sub(from)?).then_some(from)
+    }
+}
+
 /// How much of a directory a cursor reading one out of the file holds at once.
 const DIRECTORY_WINDOW: usize = 64 << 10;
 
@@ -9956,11 +9965,13 @@ impl<'a> Cursor<'a> {
     /// The next `len` bytes, without moving past them.
     #[inline]
     fn peek(&mut self, len: usize) -> Result<&[u8]> {
-        if self.window.is_none() {
+        let Some(window) = &self.window else {
             let bytes = self.bytes;
             return Ok(&bytes[self.at..self.end(len)?]);
+        };
+        if window.within(self.at, len).is_none() {
+            self.ensure(len)?;
         }
-        self.ensure(len)?;
         Ok(self.held(self.at, len))
     }
 
@@ -9969,15 +9980,22 @@ impl<'a> Cursor<'a> {
     /// Every data page is decoded through this, a byte or a word at a time, so a cursor over bytes
     /// already in memory takes them here and never reaches [`Self::ensure`]. With the window check
     /// on every call, q06 on TPC-H spent a seventh of its instructions in it.
+    ///
+    /// Out of the file most fields are also inside the window already, and those are taken here
+    /// too. Going through [`Self::ensure`] for each of them was about a sixth of what opening the
+    /// `hits` directory cost.
     #[inline]
     fn take(&mut self, len: usize) -> Result<&[u8]> {
-        if self.window.is_none() {
+        let Some(window) = &self.window else {
             let bytes = self.bytes;
             let (at, end) = (self.at, self.end(len)?);
             self.at = end;
             return Ok(&bytes[at..end]);
-        }
-        self.take_windowed(len)
+        };
+        let Some(from) = window.within(self.at, len) else { return self.take_windowed(len) };
+        self.at += len;
+        let held = &self.window.as_ref().expect("a window was just checked").held;
+        Ok(&held[from..from + len])
     }
 
     /// Moves over a checked field without reading its payload from a windowed directory.
@@ -18294,7 +18312,7 @@ mod tests {
         reader.integer_tally(0, 0).expect("tallied");
         assert!(reader.is_verified(0), "the tally checked the integer part");
         let sequence = Sequence::new(&[b"a".as_slice()]).expect("a sequence");
-        reader.rows_holding(0, 1, &sequence, false).expect("answered");
+        reader.rows_holding(0, 1, slice::from_ref(&sequence), false).expect("answered");
         assert!(reader.is_verified(1), "the LIKE checked the text part");
         fs::remove_file(path).expect("remove scratch file");
     }
