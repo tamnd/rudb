@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rudb_common::{Cancel, Error, ErrorCode, Result};
+use rudb_exec::TopCut;
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::Plan;
 use rudb_qc_gen::{Body, Grouping, Out};
@@ -80,6 +81,9 @@ pub(crate) struct Feed<'a> {
     /// The keys an aggregate's tables agree to make groups for, when a limit with no order is all
     /// that reads its groups.
     agreed: Option<Arc<Agreed>>,
+    /// Where the rows of a result body tell the scan under them how good a row has to be to make
+    /// the top N that reads them.
+    cutoff: Option<TopCut>,
     inner: Mutex<Inner<'a>>,
 }
 
@@ -205,6 +209,7 @@ impl<'a> Feed<'a> {
             sets,
             top: None,
             agreed: None,
+            cutoff: None,
             inner: Mutex::new(Inner {
                 rt,
                 state,
@@ -258,6 +263,15 @@ impl<'a> Feed<'a> {
     /// pipeline produces.
     pub(crate) fn topped(mut self, keys: &'a [Key], count: u64) -> Self {
         self.top = Some((keys, count));
+        self
+    }
+
+    /// Says that the top N that reads this pipeline's rows can tell the scan under it to skip the
+    /// parts with no row good enough to make it, through `cut`. Each chunk the body makes is then
+    /// cut to the top N, and the worst key kept is what the scan is told.
+    pub(crate) fn telling(mut self, cut: Option<TopCut>) -> Self {
+        self.cutoff =
+            cut.filter(|_| self.top.is_some() && matches!(self.body.sink, Out::Result { .. }));
         self
     }
 
@@ -464,17 +478,31 @@ impl<'a> Feed<'a> {
     /// parts the scan reads, and the body runs the filter on the rows.
     pub(crate) fn scan(&self, scan: &Plan, pruned: bool, under: Under<'_>) -> Result<()> {
         let sink = Arc::new(Scan(self));
-        let build =
-            if pruned { rudb_exec::build_pruned_into } else { rudb_exec::build_measured_into };
-        let query = build(
-            scan,
-            under.catalog,
-            under.cancel,
-            under.memory,
-            under.seams,
-            under.session,
-            sink,
-        )?;
+        let query = if let Some(cut) = &self.cutoff {
+            rudb_exec::build_cut_into(
+                scan,
+                under.catalog,
+                under.cancel,
+                under.memory,
+                under.seams,
+                under.session,
+                sink,
+                pruned,
+                cut,
+            )?
+        } else {
+            let build =
+                if pruned { rudb_exec::build_pruned_into } else { rudb_exec::build_measured_into };
+            build(
+                scan,
+                under.catalog,
+                under.cancel,
+                under.memory,
+                under.seams,
+                under.session,
+                sink,
+            )?
+        };
         query.run(under.cancel, under.pool)
     }
 
@@ -635,7 +663,23 @@ impl<'a> Feed<'a> {
                     .collect();
                 vectors.push(vector(&slot.logical, &cells)?);
             }
-            out.push(Chunk::with_rows(vectors, n)?);
+            let chunk = Chunk::with_rows(vectors, n)?;
+            match (&self.cutoff, self.top) {
+                (Some(cut), Some((keys, count))) if count > 0 && n as u64 >= count => {
+                    let mut kept = finish::sort(vec![chunk], keys, Some(count), 0)?;
+                    let first = keys.first().and_then(|k| match k.expr.kind {
+                        rudb_qc_plan::Kind::Column(c) => Some(c),
+                        _ => None,
+                    });
+                    if let (Some(last), Some(c)) = (kept.last(), first)
+                        && !last.is_empty()
+                    {
+                        cut.reached(&last.value_at(last.len() - 1, c));
+                    }
+                    out.append(&mut kept);
+                }
+                _ => out.push(chunk),
+            }
         }
         Ok(if *done { Progress::Done } else { Progress::More })
     }
