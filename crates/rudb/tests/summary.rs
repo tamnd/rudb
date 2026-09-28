@@ -711,3 +711,47 @@ fn turning_the_stored_answers_off_reads_the_rows_for_a_two_key_top_count() {
     assert!(!kept(&pair.file, double), "{double} read kept groups with the switch off");
     assert!(scanned(&pair.file, double), "{double} did not scan the file with the switch off");
 }
+
+/// Whether the file counted the groups of this over only the rows of the values its synopsis lists.
+fn coded(db: &Database, query: &str) -> bool {
+    let result = db.query(query).expect("the query ran");
+    let metrics = result.metrics().expect("the query was measured");
+    metrics
+        .operators
+        .iter()
+        .any(|operator| operator.detail.as_deref() == Some("native coded counts"))
+}
+
+/// ClickBench's q15 groups by a small number and a string and keeps the leading counts. The string
+/// is skewed, so the leaders are among the values its synopsis lists and the rows of those values
+/// are all that has to be counted. That is a statistic of the column bounding what the rows can
+/// give, so it stays on with the stored answers off, and it still has to list what memory lists.
+#[test]
+fn a_two_key_top_count_is_counted_over_the_rows_of_the_listed_values() {
+    let skewed = "SELECT CASE WHEN i % 20 * 1000 < i - i % 1000 THEN 'h' || CAST(i % 20 AS VARCHAR) \
+         ELSE 'c' || CAST(i AS VARCHAR) END AS s, i % 3 AS k FROM range(20000) r(i)";
+    let pair = Pair::new("codedtop", skewed);
+    let query = "SELECT k, s, COUNT(*) AS c FROM t WHERE s <> 'h0' GROUP BY k, s ORDER BY c DESC, k, s \
+         LIMIT 5";
+    for db in [&pair.file, &pair.memory] {
+        db.execute("SET stored_answers = false").expect("the switch is a setting");
+    }
+    let found = pair.listing(query);
+    assert_eq!(found.len(), 5, "the limit is the answer's length");
+    assert!(coded(&pair.file, query), "the rows of every value were counted");
+    assert!(!found.iter().any(|row| row[1] == Value::Varchar("h0".into())), "the filter held");
+    // Unfiltered the heaviest value leads, and a null that nothing rejects only raises the bound.
+    let whole = "SELECT k, s, COUNT(*) AS c FROM t GROUP BY k, s ORDER BY c DESC, k, s LIMIT 5";
+    pair.listing(whole);
+    assert!(coded(&pair.file, whole), "an unfiltered top count read every row");
+}
+
+/// With no skew there is no bound to beat, so the count goes back to reading the rows.
+#[test]
+fn a_two_key_top_count_with_no_skew_reads_the_rows() {
+    let flat = "SELECT CAST(i % 1000 AS VARCHAR) AS s, i % 3 AS k FROM range(10000) r(i)";
+    let pair = Pair::new("codedflat", flat);
+    let query = "SELECT k, s, COUNT(*) AS c FROM t GROUP BY k, s ORDER BY c DESC, k, s LIMIT 5";
+    pair.listing(query);
+    assert!(!coded(&pair.file, query), "a boundary that ties the bound was called proven");
+}

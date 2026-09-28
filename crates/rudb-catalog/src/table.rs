@@ -7,8 +7,8 @@ use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{Clustering, ColumnFacts, Error, Field, LogicalType, Result, Value};
 use rudb_encoding::sequence::Sequence;
 use rudb_native::{
-    Common, FrequencyOccurrences, FrequencyPrefix, PairFrequencyCounts, Reader as NativeReader,
-    StoredPart, Stripes,
+    Common, FrequencyCodes, FrequencyOccurrences, FrequencyPrefix, PairFrequencyCounts,
+    Reader as NativeReader, StoredPart, Stripes,
 };
 use rudb_storage::{MemoryTable, Probe, Range};
 use rudb_vector::{Chunk, Form, VECTOR_SIZE, Vector, concat};
@@ -304,6 +304,58 @@ impl Rows {
             // are no longer numbered the way the file numbers them once there are more of them.
             Self::Grown(_, _) => Ok(None),
         }
+    }
+
+    /// One dictionary column's synopsis as the codes its parts carry.
+    ///
+    /// A file only, for the reason [`Self::frequency_occurrences`] gives: the codes are the file's,
+    /// and rows appended since are neither counted in the synopsis nor coded against it.
+    pub fn frequency_codes(&self, column: usize) -> Result<Option<FrequencyCodes>> {
+        match self {
+            Self::Native(reader) => reader.frequency_codes(column),
+            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
+        }
+    }
+
+    /// The ordinals of the rows whose dictionary column holds one of `codes`, in ascending order,
+    /// with the dictionary the codes index.
+    ///
+    /// Every part is read, but for its codes alone, which is what a filter on the column costs
+    /// without its strings. `None` when the table is not a file or a part of the column is not
+    /// written against the one dictionary the rest are.
+    pub fn coded_ordinals(
+        &self,
+        column: usize,
+        codes: &[u32],
+    ) -> Result<Option<(Vec<u64>, Arc<Vector>)>> {
+        let Self::Native(reader) = self else { return Ok(None) };
+        let Some(&most) = codes.iter().max() else { return Ok(None) };
+        let mut wanted = vec![false; most as usize + 1];
+        for &code in codes {
+            wanted[code as usize] = true;
+        }
+        let mut ordinals = Vec::new();
+        let mut dictionary: Option<Arc<Vector>> = None;
+        let mut start = 0_u64;
+        for part in 0..reader.parts() {
+            let held = reader.read(part, &[column])?;
+            let vector = held.column(0)?;
+            let Some((part_codes, values)) = vector.stable_dictionary_parts() else {
+                return Ok(None);
+            };
+            match &dictionary {
+                Some(held) if !Arc::ptr_eq(held, values) => return Ok(None),
+                Some(_) => {}
+                None => dictionary = Some(Arc::clone(values)),
+            }
+            for (row, &code) in part_codes.iter().enumerate() {
+                if wanted.get(code as usize).copied().unwrap_or(false) && !vector.is_null_at(row) {
+                    ordinals.push(start + row as u64);
+                }
+            }
+            start += reader.part_rows(part) as u64;
+        }
+        Ok(dictionary.map(|dictionary| (ordinals, dictionary)))
     }
 
     /// Query-specific pair leaders are not used, including in older native files.
