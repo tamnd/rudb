@@ -257,6 +257,11 @@ pub struct Report {
     pub background: Duration,
     /// Why each of them moved up, with what the decision read.
     pub climbs: Vec<String>,
+    /// How many morsels ran on the version of their function that reads no NULL, because none of
+    /// the columns it reads had one.
+    pub nonull: u64,
+    /// How many morsels a guard sent back to run again on its fallback.
+    pub deopts: u64,
 }
 
 impl fmt::Display for Report {
@@ -275,6 +280,12 @@ impl fmt::Display for Report {
         )?;
         if self.small > 0 {
             write!(f, ", {} on interp for one morsel of input", self.small)?;
+        }
+        if self.nonull > 0 {
+            write!(f, ", {} morsels with no NULL", self.nonull)?;
+        }
+        if self.deopts > 0 {
+            write!(f, ", {} deoptimized", self.deopts)?;
         }
         if self.up > 0 {
             write!(
@@ -324,6 +335,10 @@ pub(crate) struct Tiers {
     /// How many times a morsel ran on another tier than the morsel of the same function before
     /// it, by [`Sink`].
     switches: [AtomicU64; 3],
+    /// Per function, the morsels it was picked for over a guard's fallback and how many of them
+    /// the guard sent back, for the rule of section 9.6 that gives up on it.
+    tried: Vec<AtomicU64>,
+    deopted: Vec<AtomicU64>,
 }
 
 impl fmt::Debug for Tiers {
@@ -367,12 +382,40 @@ impl Tiers {
             morsels,
             last,
             switches,
+            tried: module.funcs.iter().map(|_| AtomicU64::new(0)).collect(),
+            deopted: module.funcs.iter().map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
     /// What the backend did so far.
     pub(crate) fn report(&self) -> Report {
-        self.report.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let sum = |v: &[AtomicU64]| v.iter().map(|n| n.load(Ordering::Relaxed)).sum::<u64>();
+        report.deopts = sum(&self.deopted);
+        report.nonull = sum(&self.tried) - report.deopts;
+        report
+    }
+
+    /// Whether function `f`, a version behind a guard, is still worth picking, and counts the
+    /// morsel it is picked for when it is. Section 9.6 gives up on it after three morsels sent
+    /// back or more than one in sixteen.
+    pub(crate) fn speculate(&self, f: usize) -> bool {
+        let (Some(tried), Some(deopted)) = (self.tried.get(f), self.deopted.get(f)) else {
+            return false;
+        };
+        let (back, all) = (deopted.load(Ordering::Relaxed), tried.load(Ordering::Relaxed));
+        if back >= 3 || (all >= 16 && back * 16 > all) {
+            return false;
+        }
+        tried.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Counts a morsel of function `f` that a guard sent back to its fallback.
+    pub(crate) fn deopt(&self, f: usize) {
+        if let Some(n) = self.deopted.get(f) {
+            n.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Notes how long the plan took to lower and the module to generate, which happened before

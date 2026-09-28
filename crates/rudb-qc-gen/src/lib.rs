@@ -44,7 +44,7 @@ use rudb_plan::CompareOp;
 use rudb_qc_ir::catalogue::proxy;
 use rudb_qc_ir::func::INV;
 use rudb_qc_ir::status::NEED_MEMORY;
-use rudb_qc_ir::{Block, Builder, ErrorKind, Field, Module, Op, Ty, Val, dce, verify};
+use rudb_qc_ir::{Block, Builder, ErrorKind, Field, Func, Module, Op, Ty, Val, dce, verify};
 use rudb_qc_pipe::{Graph, Op as PipeOp, Pipeline, Probe, Sink, Stage};
 use rudb_qc_plan::{Aggregate, Column, Expr, Kind, Refusal, Result};
 use rudb_qc_rt::abi::{COL_SIZE, COL_VALID, HEADER, MORSEL_BEGIN, MORSEL_COLS, MORSEL_END};
@@ -77,6 +77,11 @@ pub struct Body {
     pub sink: Out,
     /// The join tables the body probes, in the order of its probes.
     pub probes: Vec<Probing>,
+    /// The function for a morsel with no NULL in any column the body reads, which skips every
+    /// validity check. It has the same state, sink and probes as [`Body::func`], so the driver
+    /// can call either one on any morsel, and it is a pre-check guard of section 9.6 of
+    /// `spec/compiler/09-tiering-and-caching.md` with `func` as its fallback.
+    pub nonull: Option<String>,
 }
 
 /// Where the body reads a join table it probes, which the driver fills in before the first call.
@@ -304,8 +309,52 @@ fn pipeline(
         }
     }
     reads.sort_unstable();
+    let generic = Pass { name: &name, version: "generic", nonull: false, replay: None };
+    let (func, out, state, probes, made) = emit(stage, p, joins, module, rt, &reads, generic)?;
+    module.funcs.push(func);
+    // The version for a morsel with no NULL in the columns it reads. It shares the generic one's
+    // tables and kernels and has to come out with the same state, or it is left out.
+    let mut nonull = None;
+    if !reads.is_empty() {
+        let variant = format!("{name}_nonull");
+        let pass = Pass { name: &variant, version: "nonull", nonull: true, replay: Some(&made) };
+        if let Ok((f, o, st, pr, _)) = emit(stage, p, joins, module, rt, &reads, pass)
+            && (&o, st, &pr) == (&out, state, &probes)
+        {
+            module.funcs.push(f);
+            module.guard("no NULL in the columns the morsel reads", &name, true);
+            nonull = Some(variant);
+        }
+    }
+    Ok(Body { func: name, reads, state, sink: out, probes, nonull })
+}
+
+/// One pass over a pipeline: the function's name and version, whether it reads every column as
+/// valid, and on the second pass the handles the first one made.
+#[derive(Clone, Copy)]
+struct Pass<'a> {
+    name: &'a str,
+    version: &'a str,
+    nonull: bool,
+    replay: Option<&'a [u64]>,
+}
+
+/// A pipeline's function, its sink, the bytes of state it needs, its probes, and the handles it
+/// made in the runtime.
+type Emitted = (Func, Out, u32, Vec<Probing>, Vec<u64>);
+
+fn emit(
+    stage: usize,
+    p: &Pipeline,
+    joins: &[Building],
+    module: &mut Module,
+    rt: &mut Rt,
+    reads: &[usize],
+    pass: Pass<'_>,
+) -> Result<Emitted> {
+    let source = p.source.columns();
     let mut g = Gen {
-        b: Builder::new(&name, "generic", stage as u32),
+        b: Builder::new(pass.name, pass.version, stage as u32),
         module,
         rt,
         cols: HashMap::new(),
@@ -316,6 +365,9 @@ fn pipeline(
         next: 0,
         joins: joins.to_vec(),
         tables: Vec::new(),
+        nonull: pass.nonull,
+        made: Vec::new(),
+        replay: pass.replay.map(|made| (made, 0)),
     };
     g.b.func_mut().state.push(Field { offset: 0, size: HEADER, name: "header".into() });
 
@@ -393,11 +445,16 @@ fn pipeline(
     let ok = g.b.int(Ty::I64, 0);
     g.b.ret(ok);
 
+    if let Some((made, used)) = g.replay
+        && used != made.len()
+    {
+        return Err(Refusal::new("the second version of a pipeline", "it made fewer handles"));
+    }
     let state = g.next.next_multiple_of(8);
+    let made = std::mem::take(&mut g.made);
     let mut func = g.b.finish();
     dce(&mut func);
-    module.funcs.push(func);
-    Ok(Body { func: name, reads, state, sink: out, probes })
+    Ok((func, out, state, probes, made))
 }
 
 struct Gen<'a> {
@@ -423,6 +480,12 @@ struct Gen<'a> {
     /// Per probe, the directory's address, the shift and the tag table's address, read once in
     /// the entry block.
     tables: Vec<(Val, Val, Val)>,
+    /// Whether every column the body reads is taken as valid, for the `nonull` version.
+    nonull: bool,
+    /// The handles this pass made in the runtime, in order.
+    made: Vec<u64>,
+    /// On the second pass, the first one's handles and how many of them are handed out so far.
+    replay: Option<(&'a [u64], usize)>,
 }
 
 /// A value and whether it is valid.
@@ -476,7 +539,7 @@ impl Gen<'_> {
                 let payload =
                     payload.iter().map(|e| field(e, "payload")).collect::<Result<Vec<_>>>()?;
                 let layout = JoinLayout { keys, payload, size };
-                let table = self.rt.add_join(JoinTable::new(layout.clone()));
+                let table = self.once(|g| g.rt.add_join(JoinTable::new(layout.clone())))?;
                 let buffer = size.next_multiple_of(8);
                 self.field(SINK, buffer, "record");
                 Ok((Out::Build(Building { table, layout, record: SINK }), SINK + buffer))
@@ -512,7 +575,7 @@ impl Gen<'_> {
                     init: vec![0; at as usize],
                 };
                 let acc_offset = Layout::acc_offset(size);
-                let table = self.rt.add_table(GroupTable::new(layout));
+                let table = self.once(|g| g.rt.add_table(GroupTable::new(layout)))?;
                 let (row, state) = if groups.is_empty() {
                     self.field(SINK, 8, "row");
                     (Some(SINK), SINK + 8)
@@ -539,7 +602,7 @@ impl Gen<'_> {
                 if argty.is_float() {
                     return Err(refuse());
                 }
-                AccOp::Distinct(self.rt.add_distinct())
+                AccOp::Distinct(self.once(|g| g.rt.add_distinct())?)
             }
             ("count", false) => AccOp::Count,
             ("sum", _) if argty.is_int() && qir_type(&a.ty)? == Ty::I128 && !unsigned(&arg) => {
@@ -565,7 +628,9 @@ impl Gen<'_> {
         Ok(Acc { offset, op, arg, ty: a.ty.clone() })
     }
 
-    /// Reads every source column `e` uses that is not read yet, in the current block.
+    /// Reads every source column `e` uses that is not read yet, in the current block. In the
+    /// `nonull` version every value is valid, and what the builder folds away with that is every
+    /// validity check downstream of the read.
     fn load_columns(&mut self, e: &Expr) {
         for c in e.columns() {
             if self.loaded.contains_key(&c) {
@@ -573,11 +638,30 @@ impl Gen<'_> {
             }
             let (values, valid, ty) = self.cols[&c];
             let v = self.b.load(ty, values, self.row, ty.bytes(), 0, 0);
+            if self.nonull {
+                let ok = self.truth();
+                self.loaded.insert(c, (v, ok));
+                continue;
+            }
             let ok = self.b.load_bit(valid, self.row);
             let zero = self.zero(ty);
             let v = self.b.select(ok, v, zero);
             self.loaded.insert(c, (v, ok));
         }
+    }
+
+    /// A handle the first pass over a pipeline makes in the runtime with `make`, and the second
+    /// hands out again, so that both versions of the function share their tables and kernels.
+    fn once(&mut self, make: impl FnOnce(&mut Self) -> u64) -> Result<u64> {
+        let Some((made, used)) = self.replay else {
+            let h = make(self);
+            self.made.push(h);
+            return Ok(h);
+        };
+        self.replay = Some((made, used + 1));
+        made.get(used).copied().ok_or_else(|| {
+            Refusal::new("the second version of a pipeline", "it made more handles than the first")
+        })
     }
 
     fn zero(&mut self, ty: Ty) -> Val {
@@ -1038,16 +1122,19 @@ impl Gen<'_> {
         // answered with.
         let (name_, args_, ty_, columns_) =
             (name.to_string(), args.to_vec(), e.ty.clone(), self.columns.clone());
-        let id = self.rt.add_kernel(std::sync::Arc::new(move || {
-            let mut call = vcall::Call::new(&name_, &args_, &ty_, &columns_);
-            Box::new(move |n, buffers| call.run(n, buffers))
-        }));
-        if self.module.kernel(name) != id {
+        let made = self.once(|g| {
+            let id = g.rt.add_kernel(std::sync::Arc::new(move || {
+                let mut call = vcall::Call::new(&name_, &args_, &ty_, &columns_);
+                Box::new(move |n, buffers| call.run(n, buffers))
+            }));
+            if g.module.kernel(name) == id { u64::from(id) } else { u64::MAX }
+        })?;
+        let Ok(id) = u32::try_from(made) else {
             return Err(Refusal::new(
                 format!("the kernel for {name}"),
                 "the runtime and the module number their kernels differently",
             ));
-        }
+        };
         let st = self.b.st();
         let mut buffers = Vec::with_capacity(2 * args.len() + 2);
         for (k, (v, ok)) in pairs.into_iter().enumerate() {

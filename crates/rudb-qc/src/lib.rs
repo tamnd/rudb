@@ -215,6 +215,7 @@ impl Compiled {
                         under.cancel,
                         unordered[at],
                     )?;
+                    let feed = feed.sized(rows);
                     let feed = match topped[at] {
                         Some((keys, count)) => feed.topped(keys, count),
                         None => feed,
