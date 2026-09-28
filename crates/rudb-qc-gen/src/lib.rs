@@ -185,6 +185,11 @@ pub enum AccOp {
     SumFloat,
     /// An `i128` total and an `i64` count after it.
     AvgInt,
+    /// An `i64` total and a seen byte after it, for a sum over values of at most sixteen bits,
+    /// which no group can overflow before it holds 2^48 rows.
+    SumNarrow,
+    /// An `i64` total and an `i64` count after it, for an average over the same.
+    AvgNarrow,
     /// An `f64` total and an `i64` count after it.
     AvgFloat,
     /// The least value at its width and a seen byte after it.
@@ -615,7 +620,11 @@ impl Gen<'_> {
             }
             ("count", false) => AccOp::Count,
             ("sum", _) if argty.is_int() && qir_type(&a.ty)? == Ty::I128 && !unsigned(&arg) => {
-                AccOp::SumInt
+                if argty.bytes() <= 2 {
+                    AccOp::SumNarrow
+                } else {
+                    AccOp::SumInt
+                }
             }
             ("sum", _) if argty.is_float() && qir_type(&a.ty)? == Ty::F64 => AccOp::SumFloat,
             ("avg", _)
@@ -624,7 +633,11 @@ impl Gen<'_> {
                     && !matches!(arg, LogicalType::Decimal { .. })
                     && qir_type(&a.ty)? == Ty::F64 =>
             {
-                AccOp::AvgInt
+                if argty.bytes() <= 2 {
+                    AccOp::AvgNarrow
+                } else {
+                    AccOp::AvgInt
+                }
             }
             ("avg", _) if argty.is_float() && qir_type(&a.ty)? == Ty::F64 => AccOp::AvgFloat,
             ("min", _) if argty == Ty::Str16 => AccOp::MinStr,
@@ -1482,6 +1495,15 @@ impl Gen<'_> {
                 self.b.store(row, Val::NONE, 1, d, total, 0);
                 self.bump(acc.op == AccOp::AvgInt, take, row, d + 16);
             }
+            AccOp::SumNarrow | AccOp::AvgNarrow => {
+                let x = self.widen(v, &acc.arg, Ty::I64);
+                let zero = self.zero(Ty::I64);
+                let x = self.b.select(take, x, zero);
+                let total = self.b.load(Ty::I64, row, Val::NONE, 1, d, 0);
+                let total = self.b.bin(Op::Add, total, x);
+                self.b.store(row, Val::NONE, 1, d, total, 0);
+                self.bump(acc.op == AccOp::AvgNarrow, take, row, d + 8);
+            }
             AccOp::SumFloat | AccOp::AvgFloat => {
                 let x = if self.b.ty(v) == Ty::F32 { self.b.conv(Op::Fext, v, Ty::F64) } else { v };
                 let total = self.b.load(Ty::F64, row, Val::NONE, 1, d, 0);
@@ -1593,7 +1615,7 @@ fn acc_size(acc: &Acc) -> Result<u32> {
     Ok(match acc.op {
         AccOp::CountStar | AccOp::Count => 8,
         AccOp::SumInt | AccOp::AvgInt => 24,
-        AccOp::SumFloat | AccOp::AvgFloat => 16,
+        AccOp::SumNarrow | AccOp::AvgNarrow | AccOp::SumFloat | AccOp::AvgFloat => 16,
         AccOp::Min | AccOp::Max | AccOp::AnyValue => (w + 1).next_multiple_of(8),
         AccOp::MinStr | AccOp::MaxStr => 24,
         AccOp::Distinct(_) => 0,
