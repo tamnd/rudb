@@ -312,6 +312,11 @@ fn a_top_n_over_groups_matches_the_first_engine_in_order() {
         ),
         true,
     );
+    // Many groups have the same count, so the edge the top is cut at moves through ties.
+    same(
+        "TopN 7 offset 2 [#1.1::BIGINT ASC NULLS LAST, #1.0::BIGINT DESC NULLS LAST]\n  Aggregate #1 groups=[#0.0::BIGINT] aggregates=[count_star()::BIGINT]\n    Get memory.main.runs AS runs #0 [k::BIGINT, j::INTEGER]",
+        true,
+    );
     same(
         &format!(
             "Limit 3 offset 2\n  Sort [#0.1::VARCHAR ASC NULLS FIRST, #0.0::INTEGER DESC NULLS FIRST]\n    {SCAN}"

@@ -37,7 +37,7 @@ use rudb_qc_ir::{ErrorKind, Module};
 use rudb_qc_pipe::{Pipeline, Source, Step};
 use rudb_qc_plan::{Column, Key};
 use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
-use rudb_qc_rt::table::{Agreed, Distinct, GroupTable, Job};
+use rudb_qc_rt::table::{Agreed, Distinct, GroupTable, Job, LANE_BITS};
 use rudb_qc_rt::{RUNTIME_ERROR, Rt, text};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
@@ -234,6 +234,9 @@ impl<'a> Feed<'a> {
             && let Some(table) = rt.table_mut(g.table)
         {
             table.cap(WORKER_GROUPS);
+            if self.sets.is_empty() {
+                table.lanes();
+            }
         }
         if let (Some(agreed), Out::Aggregate(g)) = (&self.agreed, &self.body.sink)
             && let Some(table) = rt.table_mut(g.table)
@@ -375,16 +378,7 @@ impl<'a> Feed<'a> {
             // which the fold leaves alone, so without one a new group keeps its worker's row where
             // it is.
             if sets.is_empty() {
-                let mut pages = Vec::new();
-                if let Some(table) = inner.rt.table_mut(g.table) {
-                    pages.append(&mut table.take_pages());
-                }
-                for w in &mut workers {
-                    if let Some(table) = w.table_mut(g.table) {
-                        pages.append(&mut table.take_pages());
-                    }
-                }
-                return self.merge_whole(inner, workers, pages, bits, threads);
+                return self.merge_whole(inner, workers, bits, threads);
             }
             let (merged, made) = {
                 let mine = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
@@ -488,8 +482,7 @@ impl<'a> Feed<'a> {
     fn merge_whole(
         &self,
         mut inner: MutexGuard<'_, Inner<'a>>,
-        workers: Vec<Rt>,
-        pages: Vec<Box<[u8]>>,
+        mut workers: Vec<Rt>,
         bits: u32,
         threads: &Lease<'_>,
     ) -> Result<()> {
@@ -506,13 +499,29 @@ impl<'a> Feed<'a> {
             let tables = std::iter::once(Ok(mine))
                 .chain(workers.iter().map(|w| w.table(g.table).ok_or_else(|| gone(g.table))))
                 .collect::<Result<Vec<&GroupTable>>>()?;
-            let splits = pieces(threads, tables.len(), |at| tables[at].split(bits))?;
+            // A worker's rows are already in a lane a part, which the part reads in order.
+            let laned = tables.iter().all(|t| t.laned());
+            let (bits, splits) = if laned {
+                (LANE_BITS, Vec::new())
+            } else {
+                (bits, pieces(threads, tables.len(), |at| tables[at].split(bits))?)
+            };
             let layout = mine.layout().clone();
             let chunks = pieces(threads, 1 << bits, |part| {
-                let most = splits.iter().map(|s| s[part].len()).sum();
+                let most = if laned {
+                    tables.iter().map(|t| t.lane_len(part)).sum()
+                } else {
+                    splits.iter().map(|s| s[part].len()).sum()
+                };
                 let mut table = GroupTable::with_capacity(layout.clone(), most);
-                for (other, split) in tables.iter().zip(&splits) {
-                    table.absorb_some(other, &split[part], None, true, fold);
+                if laned {
+                    for other in &tables {
+                        table.absorb_lane(other, part, fold);
+                    }
+                } else {
+                    for (other, split) in tables.iter().zip(&splits) {
+                        table.absorb_some(other, &split[part], None, true, fold);
+                    }
                 }
                 table.seal();
                 let gids = counted
@@ -529,6 +538,15 @@ impl<'a> Feed<'a> {
             (chunks, layout)
         };
         // The rows stay where they are until the query is done, as a merged table's would.
+        let mut pages = Vec::new();
+        if let Some(table) = inner.rt.table_mut(g.table) {
+            pages.append(&mut table.take_pages());
+        }
+        for w in &mut workers {
+            if let Some(table) = w.table_mut(g.table) {
+                pages.append(&mut table.take_pages());
+            }
+        }
         let mut kept = GroupTable::new(layout);
         kept.keep(pages);
         inner.rt.settle(workers, g.table, kept)?;

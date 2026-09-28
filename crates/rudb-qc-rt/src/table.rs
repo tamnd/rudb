@@ -68,6 +68,15 @@ impl Layout {
 
 const ROWS_PER_PAGE: usize = 1024;
 
+/// How many bits of a key's hash pick the lane a table that is merged by parts puts its row in.
+pub const LANE_BITS: u32 = 8;
+
+/// The most rows a page of a lane holds. The first page of a lane holds [`FIRST_LANE_ROWS`] and
+/// each one after it twice as many as the one before, so a table with few groups does not zero a
+/// full page for every lane.
+const LANE_ROWS: usize = 256;
+const FIRST_LANE_ROWS: usize = 16;
+
 /// An odd number with its bits spread out, the golden ratio in fixed point.
 const SPREAD: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -101,6 +110,21 @@ pub struct GroupTable {
     /// The groups this table may make, when a limit with no order above the aggregate reads only
     /// that many of them.
     limited: Option<Limited>,
+    /// The rows by the top bits of their hashes, for a table that is merged by parts, which then
+    /// folds each lane of every worker as one part and reads its rows in the order they were made.
+    /// Empty when the rows go in `pages`. A row in a lane starts with its hash and not its group id.
+    lanes: Vec<Lane>,
+    /// How many groups a table with lanes made before its slots were last emptied, which it no
+    /// longer has an address for.
+    gone: usize,
+}
+
+/// The rows of one lane.
+#[derive(Debug, Default)]
+struct Lane {
+    pages: Vec<Box<[u8]>>,
+    /// How many rows of the last page are taken.
+    fill: usize,
 }
 
 /// The groups the tables of a limited aggregate's workers agree on: the first keys any of them
@@ -150,6 +174,8 @@ impl GroupTable {
             cap: 0,
             since: 0,
             limited: None,
+            lanes: Vec::new(),
+            gone: 0,
         };
         if table.layout.keys.is_empty() {
             table.add(&[], 0, None);
@@ -171,6 +197,31 @@ impl GroupTable {
     /// groups are merged by parts after the scan.
     pub fn cap(&mut self, cap: usize) {
         self.cap = cap;
+    }
+
+    /// Puts the rows of the groups made from now on in lanes by their hashes, for a worker whose
+    /// groups are merged by parts after the scan, and forgets the rows it has no slot for once
+    /// [`cap`](GroupTable::cap) empties them. The merge then folds a lane of every table with
+    /// [`absorb_lane`](GroupTable::absorb_lane), and has no use for a group id in a row, so a table
+    /// with a distinct set keeps its rows in pages.
+    pub fn lanes(&mut self) {
+        self.lanes = (0..1 << LANE_BITS).map(|_| Lane::default()).collect();
+    }
+
+    /// Whether the rows are in lanes.
+    #[must_use]
+    pub fn laned(&self) -> bool {
+        !self.lanes.is_empty()
+    }
+
+    /// How many rows lane `lane` holds.
+    #[must_use]
+    pub fn lane_len(&self, lane: usize) -> usize {
+        self.lanes.get(lane).map_or(0, |l| {
+            let rows = l.pages.iter().map(|p| p.len() / self.row_size).sum::<usize>();
+            let last = l.pages.last().map_or(0, |p| p.len() / self.row_size);
+            rows - last + l.fill
+        })
     }
 
     /// Makes a group only for the keys of `agreed`, which the other tables of the same aggregate
@@ -199,7 +250,7 @@ impl GroupTable {
     /// Whether a key may have more than one group, because the slots were emptied.
     #[must_use]
     pub fn forgot(&self) -> bool {
-        self.since != 0
+        self.since != 0 || self.gone != 0
     }
 
     /// The shape of the rows.
@@ -208,16 +259,16 @@ impl GroupTable {
         &self.layout
     }
 
-    /// How many groups there are.
+    /// How many groups there are, counting those a table with lanes forgot the rows of.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.gone + self.rows.len()
     }
 
     /// Whether there are no groups.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.len() == 0
     }
 
     /// The row of group `gid`.
@@ -395,12 +446,52 @@ impl GroupTable {
         }
     }
 
+    /// Folds the rows of lane `lane` of `other` into this table, as
+    /// [`absorb_some`](GroupTable::absorb_some) does with `whole`, which a lane is only made for.
+    /// The rows are read in the order `other` made them, and the ones of a key this table does not
+    /// have yet stay where they are, so whoever [took](GroupTable::take_pages) `other`'s pages
+    /// keeps them as long as this table.
+    pub fn absorb_lane(
+        &mut self,
+        other: &GroupTable,
+        lane: usize,
+        mut combine: impl FnMut(&mut [u8], &[u8]),
+    ) {
+        let Some(from) = other.lanes.get(lane) else { return };
+        let size = self.layout.key_size as usize;
+        let last = from.pages.len().saturating_sub(1);
+        for (i, page) in from.pages.iter().enumerate() {
+            let rows = if i == last { from.fill } else { page.len() / other.row_size };
+            let base = page.as_ptr().addr();
+            for r in 0..rows {
+                let row = base + r * other.row_size;
+                // SAFETY: the first `rows` rows of the page are rows `other` made, and `other` is
+                // borrowed, so the page is still there.
+                let src = unsafe { crate::mem::slice(row, other.row_size) };
+                let hash = u64::from_le_bytes(src[..8].try_into().unwrap_or_default());
+                match self.probe(&src[8..8 + size], hash) {
+                    Ok(gid) => combine(self.row_mut(gid), src),
+                    Err(slot) => {
+                        self.rows.push(row);
+                        self.hashes.push(hash);
+                        self.place(slot, self.rows.len() - 1, hash);
+                    }
+                }
+            }
+        }
+    }
+
     /// Takes the pages this table's rows are in, for a merge whose parts keep the rows where they
     /// are. The rows can still be read and written through their addresses as long as the caller
     /// keeps the pages, and a row the table makes after this goes in a page of its own.
     pub fn take_pages(&mut self) -> Vec<Box<[u8]>> {
         self.fill = ROWS_PER_PAGE;
-        std::mem::take(&mut self.pages)
+        let mut pages = std::mem::take(&mut self.pages);
+        for lane in &mut self.lanes {
+            pages.append(&mut lane.pages);
+            lane.fill = 0;
+        }
+        pages
     }
 
     /// Keeps `pages`, which [`take_pages`](GroupTable::take_pages) took from the tables whose rows
@@ -458,6 +549,8 @@ impl GroupTable {
             cap: 0,
             since: 0,
             limited: None,
+            lanes: Vec::new(),
+            gone: 0,
         };
         (table, ran)
     }
@@ -562,8 +655,25 @@ impl GroupTable {
         true
     }
 
-    /// The address of a row no group has yet, at the end of the last page.
-    fn room(&mut self) -> usize {
+    /// The address of a row no group has yet, at the end of the last page, or of the last page of
+    /// the lane of `hash`.
+    fn room(&mut self, hash: u64) -> usize {
+        if !self.lanes.is_empty() {
+            let at = (hash.wrapping_mul(SPREAD) >> (64 - LANE_BITS)) as usize;
+            let lane = &mut self.lanes[at];
+            let room = lane.pages.last().map_or(0, |p| p.len() / self.row_size);
+            if lane.fill == room {
+                let rows = (room * 2).clamp(FIRST_LANE_ROWS, LANE_ROWS);
+                lane.pages.push(vec![0u8; rows * self.row_size].into_boxed_slice());
+                lane.fill = 0;
+            }
+            let at = lane.fill * self.row_size;
+            lane.fill += 1;
+            return lane
+                .pages
+                .last_mut()
+                .map_or(0, |page| page[at..].as_mut_ptr().expose_provenance());
+        }
         if self.fill == ROWS_PER_PAGE || self.pages.is_empty() {
             self.pages.push(vec![0u8; ROWS_PER_PAGE * self.row_size].into_boxed_slice());
             self.fill = 0;
@@ -574,8 +684,15 @@ impl GroupTable {
     }
 
     fn add(&mut self, key: &[u8], hash: u64, mut heap: Option<&mut Heap>) -> usize {
+        if !self.lanes.is_empty() && self.since != 0 {
+            // The rows the slots forgot are only read again by the merge, from their lanes.
+            self.gone += self.rows.len();
+            self.rows.clear();
+            self.hashes.clear();
+            self.since = 0;
+        }
         let gid = self.rows.len();
-        let address = self.room();
+        let address = self.room(hash);
         let acc = Layout::acc_offset(self.layout.key_size) as usize;
         // SAFETY: `room` gave a row of `row_size` bytes in a page this table owns, and no group
         // points at it yet.
@@ -586,7 +703,8 @@ impl GroupTable {
             )
         };
         let layout = &self.layout;
-        row[..8].copy_from_slice(&(gid as u64).to_le_bytes());
+        let front = if self.lanes.is_empty() { gid as u64 } else { hash };
+        row[..8].copy_from_slice(&front.to_le_bytes());
         row[8..8 + key.len()].copy_from_slice(key);
         for f in &layout.keys {
             let o = 8 + f.offset as usize;
@@ -993,6 +1111,57 @@ mod tests {
             .collect();
         assert_eq!(counts.len(), 250);
         assert_eq!(counts.iter().sum::<u64>(), 450);
+    }
+
+    #[test]
+    fn tables_with_lanes_forget_their_rows_and_a_merge_by_lanes_folds_every_count() {
+        let layout = Layout {
+            keys: vec![KeyField { offset: 0, width: 8, text: false }],
+            key_size: 9,
+            init: vec![0; 8],
+        };
+        let acc = Layout::acc_offset(9) as usize;
+        let mut heap = Heap::new();
+        let mut tables = Vec::new();
+        for first in [0u64, 100] {
+            let mut t = GroupTable::new(layout.clone());
+            t.cap(100);
+            t.lanes();
+            for round in 0..3u64 {
+                for i in 0..150u64 {
+                    let v = first + i + round * 50;
+                    let k = v.to_le_bytes().into_iter().chain([0]).collect::<Vec<_>>();
+                    // SAFETY: the key is alive and has no strings, and the row is the table's.
+                    unsafe {
+                        let row = t.insert(k.as_ptr().expose_provenance(), v * 7, &mut heap);
+                        let count = std::ptr::with_exposed_provenance_mut::<u64>(row + acc);
+                        count.write_unaligned(count.read_unaligned() + 1);
+                    }
+                }
+            }
+            assert!(t.forgot());
+            let made: usize = (0..1 << LANE_BITS).map(|lane| t.lane_len(lane)).sum();
+            assert_eq!(made, t.len());
+            tables.push(t);
+        }
+        let add = |d: &mut [u8], s: &[u8]| {
+            let n = |b: &[u8]| u64::from_le_bytes(b[acc..acc + 8].try_into().unwrap_or_default());
+            let total = n(d) + n(s);
+            d[acc..acc + 8].copy_from_slice(&total.to_le_bytes());
+        };
+        let mut counts = Vec::new();
+        for lane in 0..1 << LANE_BITS {
+            let mut part = GroupTable::new(layout.clone());
+            for t in &tables {
+                part.absorb_lane(t, lane, add);
+            }
+            for gid in 0..part.len() {
+                let row = part.row(gid);
+                counts.push(u64::from_le_bytes(row[acc..acc + 8].try_into().unwrap()));
+            }
+        }
+        assert_eq!(counts.len(), 350);
+        assert_eq!(counts.iter().sum::<u64>(), 900);
     }
 
     #[test]
