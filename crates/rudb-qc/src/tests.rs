@@ -81,6 +81,24 @@ fn catalog() -> Catalog {
         .rows_mut()
         .append_rows(&rows)
         .expect("rows of the table's own types");
+    // `wide` has more keys than a worker's table holds before it forgets them, and every key is
+    // new until the first five thousand come back.
+    let wide = QualifiedName::new("memory", "main", "wide");
+    catalog
+        .create_table(
+            wide.clone(),
+            vec![Field::new("k", LogicalType::BigInt), Field::new("j", LogicalType::Integer)],
+        )
+        .expect("a fresh table");
+    let rows: Vec<Vec<Value>> = (0..50_000i64)
+        .map(|i| vec![Value::BigInt(i % 45_000), Value::Integer((i % 7) as i32)])
+        .collect();
+    catalog
+        .table_mut(&wide)
+        .expect("the table just created")
+        .rows_mut()
+        .append_rows(&rows)
+        .expect("rows of the table's own types");
     let empty = QualifiedName::new("memory", "main", "empty");
     catalog
         .create_table(empty, vec![Field::new("x", LogicalType::Integer)])
@@ -282,6 +300,25 @@ fn a_grouped_aggregate_over_runs_of_one_key_matches_the_first_engine() {
     let scan = "Get memory.main.runs AS runs #0 [k::BIGINT, j::INTEGER]";
     same(&format!("Aggregate #1 groups=[#0.0::BIGINT] {aggs}\n  {scan}"), false);
     same(&format!("Aggregate #1 groups=[#0.0::BIGINT, #0.1::INTEGER] {aggs}\n  {scan}"), false);
+}
+
+#[test]
+fn a_grouped_aggregate_over_more_keys_than_a_worker_holds_matches_the_first_engine() {
+    let group = "Aggregate #1 groups=[#0.0::BIGINT] aggregates=[count_star()::BIGINT, sum(#0.1::INTEGER)::HUGEINT, min(#0.1::INTEGER)::INTEGER]";
+    let scan = "Get memory.main.wide AS wide #0 [k::BIGINT, j::INTEGER]";
+    same(&format!("{group}\n  {scan}"), false);
+    same(
+        &format!(
+            "TopN 4 offset 0 [#1.1::BIGINT DESC NULLS LAST, #1.0::BIGINT DESC NULLS LAST]\n  {group}\n    {scan}"
+        ),
+        true,
+    );
+    same(
+        &format!(
+            "TopN 6 offset 1 [#1.1::BIGINT DESC NULLS LAST, #1.2::HUGEINT ASC NULLS LAST, #1.0::BIGINT ASC NULLS LAST]\n  {group}\n    {scan}"
+        ),
+        true,
+    );
 }
 
 #[test]

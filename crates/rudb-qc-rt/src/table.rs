@@ -473,31 +473,56 @@ impl GroupTable {
     /// [`absorb_some`](GroupTable::absorb_some) does with `whole`, which a lane is only made for.
     /// The rows are read in the order `other` made them, and the ones of a key this table does not
     /// have yet stay where they are, so whoever [took](GroupTable::take_pages) `other`'s pages
-    /// keeps them as long as this table.
+    /// keeps them as long as this table. `seen` gets the group id and the row of every group a row
+    /// of the lane made or was combined into, right after, while the row is in the cache.
     pub fn absorb_lane(
         &mut self,
         other: &GroupTable,
         lane: usize,
         mut combine: impl FnMut(&mut [u8], &[u8]),
+        mut seen: impl FnMut(usize, &[u8]),
     ) {
+        /// How many rows ahead a slot is asked for, and a row twice as far.
+        const AHEAD: usize = 8;
         let Some(from) = other.lanes.get(lane) else { return };
         let size = self.layout.key_size as usize;
         let last = from.pages.len().saturating_sub(1);
+        if self.slots.is_empty() {
+            self.slots = vec![0; 64];
+        }
         for (i, page) in from.pages.iter().enumerate() {
             let rows = if i == last { from.fill } else { page.len() / other.row_size };
             let base = page.as_ptr().addr();
+            let at = |r: usize| base + r * other.row_size;
             for r in 0..rows {
-                let row = base + r * other.row_size;
+                // The rows are read in order and their slots are not, so the slot of a row a few
+                // ahead is asked for with the hash at its front, which was asked for before that.
+                if r + 2 * AHEAD < rows {
+                    prefetch(at(r + 2 * AHEAD));
+                }
+                if r + AHEAD < rows {
+                    // SAFETY: as for `src` below.
+                    let front = unsafe { crate::mem::slice(at(r + AHEAD), 8) };
+                    let hash = u64::from_le_bytes(front.try_into().unwrap_or_default());
+                    let slot = (hash as usize) & (self.slots.len() - 1);
+                    prefetch(self.slots.as_ptr().wrapping_add(slot).addr());
+                }
+                let row = at(r);
                 // SAFETY: the first `rows` rows of the page are rows `other` made, and `other` is
                 // borrowed, so the page is still there.
                 let src = unsafe { crate::mem::slice(row, other.row_size) };
                 let hash = u64::from_le_bytes(src[..8].try_into().unwrap_or_default());
                 match self.probe(&src[8..8 + size], hash) {
-                    Ok(gid) => combine(self.row_mut(gid), src),
+                    Ok(gid) => {
+                        combine(self.row_mut(gid), src);
+                        seen(gid, self.row(gid));
+                    }
                     Err(slot) => {
                         self.rows.push(row);
                         self.hashes.push(hash);
-                        self.place(slot, self.rows.len() - 1, hash);
+                        let gid = self.rows.len() - 1;
+                        self.place(slot, gid, hash);
+                        seen(gid, src);
                     }
                 }
             }
@@ -1188,7 +1213,7 @@ mod tests {
         for lane in 0..1 << LANE_BITS {
             let mut part = GroupTable::new(layout.clone());
             for t in &tables {
-                part.absorb_lane(t, lane, add);
+                part.absorb_lane(t, lane, add, |_, _| {});
             }
             for gid in 0..part.len() {
                 let row = part.row(gid);
@@ -1232,7 +1257,7 @@ mod tests {
         let mut counts = Vec::new();
         for lane in 0..1 << LANE_BITS {
             let mut part = GroupTable::new(layout.clone());
-            part.absorb_lane(&t, lane, add);
+            part.absorb_lane(&t, lane, add, |_, _| {});
             for gid in 0..part.len() {
                 let row = part.row(gid);
                 let key = u64::from_le_bytes(row[8..16].try_into().unwrap());

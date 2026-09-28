@@ -6,7 +6,7 @@
 //! same way: each key is a cell with a null byte after it, and each accumulator is finished into a
 //! cell by the rule its [`AccOp`] names.
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
@@ -204,6 +204,86 @@ pub(crate) fn counted_top(
     let mut gids: Vec<usize> = ranked.iter().map(|&(_, gid)| gid as usize).collect();
     gids.sort_unstable();
     Some(gids)
+}
+
+/// The groups of one table that can be in the first `n` by a descending count, gathered while the
+/// table folds, when each group's row is in the cache anyway, so that [`counted_top`] does not
+/// have to read every row again after.
+///
+/// A count only grows as rows fold into its group, and each time it does the group is offered
+/// again. So a group offered below the edge of the best `n` offered so far is out for good unless
+/// it is offered again. A group can be offered more than once, and only its last offer counts, so
+/// the offers are cut to one a group before an edge is taken from them.
+pub(crate) struct Rising {
+    at: usize,
+    more: bool,
+    n: usize,
+    offers: Vec<(i64, u32)>,
+    edge: Option<i64>,
+    room: usize,
+}
+
+impl Rising {
+    /// For the count [`counted`] found at `at`, or `None` for an ascending one, where a group that
+    /// grows can fall out, and for no rows at all.
+    pub(crate) fn new((at, descending): (usize, bool), more: bool, count: u64) -> Option<Rising> {
+        let n = usize::try_from(count).ok().filter(|&n| n > 0 && descending)?;
+        Some(Rising { at, more, n, offers: Vec::new(), edge: None, room: 2 * n })
+    }
+
+    /// Offers group `gid`, whose row is `row`.
+    pub(crate) fn offer(&mut self, gid: usize, row: &[u8]) {
+        let c = i64::from_le_bytes(row[self.at..self.at + 8].try_into().unwrap_or_default());
+        if let Some(e) = self.edge
+            && (c < e || (c == e && !self.more))
+        {
+            return;
+        }
+        self.offers.push((c, gid as u32));
+        if self.offers.len() >= self.room {
+            self.offers.sort_unstable_by_key(|&(c, gid)| (gid, Reverse(c)));
+            self.offers.dedup_by_key(|o| o.1);
+            if let Some(edge) = self.cut() {
+                self.edge = Some(edge);
+            }
+            self.room = 2 * self.offers.len().max(self.n);
+        }
+    }
+
+    /// Keeps the best `n` offers, and the ties with the last of them when there are `more` keys,
+    /// and gives the count of that last one, when there are more than `n` offers.
+    fn cut(&mut self) -> Option<i64> {
+        if self.offers.len() <= self.n {
+            return None;
+        }
+        self.offers.select_nth_unstable_by_key(self.n - 1, |&(c, _)| Reverse(c));
+        let edge = self.offers[self.n - 1].0;
+        if self.more {
+            self.offers.retain(|&(c, _)| c >= edge);
+        } else {
+            self.offers.truncate(self.n);
+        }
+        Some(edge)
+    }
+
+    /// The groups of `table`, which is done folding, that [`counted_top`] would give.
+    pub(crate) fn finish(mut self, table: &GroupTable) -> Option<Vec<usize>> {
+        if self.n >= table.len() {
+            return None;
+        }
+        self.offers.sort_unstable_by_key(|&(_, gid)| gid);
+        self.offers.dedup_by_key(|o| o.1);
+        // A group's last offer may have been turned away, so its count is read again.
+        let at = self.at;
+        for o in &mut self.offers {
+            let row = table.row(o.1 as usize);
+            o.0 = i64::from_le_bytes(row[at..at + 8].try_into().unwrap_or_default());
+        }
+        self.cut();
+        let mut gids: Vec<usize> = self.offers.iter().map(|&(_, gid)| gid as usize).collect();
+        gids.sort_unstable();
+        Some(gids)
+    }
 }
 
 /// The value of one accumulator, `a` being its bytes in the group row.
