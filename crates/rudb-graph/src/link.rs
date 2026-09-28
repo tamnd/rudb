@@ -593,7 +593,7 @@ impl Link {
     }
 
     /// [`Link::read`] of the bytes of `payload` from `at` on, keeping `payload` for the packed
-    /// parents rather than copying them out of it. See [`Tail`] for why.
+    /// parents rather than copying them out of it. See `Tail` for why.
     ///
     /// # Errors
     ///
