@@ -185,6 +185,42 @@ pub(crate) fn counted(value: &Value) -> Result<u64> {
 }
 
 impl Accumulator {
+    /// A fresh accumulator for a grouped operator, which for an exported call is the aggregate it
+    /// exports rather than a wrapper around it.
+    ///
+    /// [`Accumulator::new`] wraps an exported call so that anything finishing it the ordinary way
+    /// gets the state, and the wrapper is also what keeps it out of every fast path that folds a
+    /// run of groups by the kind of their states. An operator that builds its states through here
+    /// takes those paths for an exported call too, and must finish its states through
+    /// [`Accumulator::finish_as`] so that the state is what comes out.
+    ///
+    /// # Errors
+    ///
+    /// If the name is not an aggregate this crate implements.
+    pub fn folding(name: &str, returns: &LogicalType) -> Result<Self> {
+        if let Some(inner) = name.strip_suffix(EXPORTED)
+            && let LogicalType::AggregateState(state) = returns
+        {
+            return Self::new(inner, &state.returns);
+        }
+        Self::new(name, returns)
+    }
+
+    /// The answer of a state built by [`Accumulator::folding`] for a call returning `returns`, which
+    /// is the state written out when the call exports one and the ordinary answer otherwise.
+    ///
+    /// # Errors
+    ///
+    /// The errors [`Accumulator::finish`] raises, and those of writing the state out.
+    pub fn finish_as(&self, returns: &LogicalType) -> Result<Value> {
+        let wrapped = matches!(&self.state, State::General(general)
+            if matches!(**general, General::Exported { .. }));
+        match returns {
+            LogicalType::AggregateState(state) if !wrapped => self.export(&state.layout),
+            _ => self.finish(),
+        }
+    }
+
     /// The state written out in `layout`, which [`state_layout`] gave for this call.
     ///
     /// # Errors
