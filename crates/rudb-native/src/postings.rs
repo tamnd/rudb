@@ -8,7 +8,8 @@
 //! the scan reads the rows that can pass and no others.
 //!
 //! Built at checkpoint for every `VARCHAR` column with a table wide dictionary on a table of at
-//! least [`FEWEST_ROWS`] rows, out of its own share of the table's column bytes, cheapest first.
+//! least [`FEWEST_ROWS`] rows that holds [`FEWEST_ROWS_PER_VALUE`] rows for each value, out of its
+//! own share of the table's column bytes, cheapest first.
 //! Which columns a query filters is not something the file knows, so the rule is the same for every
 //! column. A part the dictionary does not code, which is every part after a column is demoted, is
 //! recorded as a range of rows that holds any value, so the answer stays a superset of the rows
@@ -34,6 +35,12 @@ pub const VALUE_ROWS_SHARE: u64 = 25;
 /// Tables with fewer rows than this are not given value rows, since reading the whole column costs
 /// less than a millisecond.
 pub const FEWEST_ROWS: usize = 1 << 16;
+
+/// A column whose table holds fewer rows than this for each value of its dictionary is not given
+/// value rows. A scan asks its filter of every value of the dictionary, and on a column with nearly
+/// a value per row, which is `movie_info.info` or `title.title`, that costs what the scan it would
+/// save costs.
+pub const FEWEST_ROWS_PER_VALUE: usize = 32;
 
 /// What recording one column cost and whether it was kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +145,9 @@ pub fn build_value_rows_within(path: &Path, table: &str, share: u64) -> Result<V
 /// written seven bits to a byte.
 fn encode(reader: &Reader, column: usize) -> Result<Option<(usize, Vec<u8>)>> {
     let Some(dictionary) = reader.global_dictionary(column)? else { return Ok(None) };
+    if dictionary.len().saturating_mul(FEWEST_ROWS_PER_VALUE) > reader.table().rows() {
+        return Ok(None);
+    }
     let values = dictionary.len();
     let rows = reader.table().rows();
     let rows_u32 = u32::try_from(rows).map_err(|_| invalid("a table too long for value rows"))?;

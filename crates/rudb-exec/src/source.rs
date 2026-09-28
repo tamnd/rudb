@@ -705,10 +705,6 @@ thread_local! {
     static READER: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
-/// How many rows a table has to hold for each value of a column's dictionary before a filter on the
-/// column is asked of the dictionary to find its rows. See [`Scan::valued_rows`].
-const FEWEST_PER_VALUE: usize = 32;
-
 /// A part whose exact rows keep one row in this many or fewer is read at those rows alone. See
 /// [`Source::read_reduced`].
 const SPARSE_READ: usize = 8;
@@ -2006,9 +2002,8 @@ impl<'a> Scan<'a> {
         for one in &pushed.valued {
             let Some(column) = self.columns[one.input] else { continue };
             let Ok(Some(dictionary)) = reader.global_dictionary(column) else { continue };
-            // The filter is asked of every value of the dictionary, and a dictionary with nearly a
-            // value per row, which is `title.title`, costs as much to ask as the scan it would save.
-            if dictionary.len().saturating_mul(FEWEST_PER_VALUE) > rows {
+            // A file written before the builder left these columns out still holds their rows.
+            if dictionary.len().saturating_mul(rudb_native::postings::FEWEST_ROWS_PER_VALUE) > rows {
                 continue;
             }
             let Some(index) = reader.value_rows(column) else { continue };
