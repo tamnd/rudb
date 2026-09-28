@@ -3639,13 +3639,16 @@ impl<'a> Aggregate<'a> {
         // through the probe and the insert, in order, as the fold's pending rows do.
         let rows: Vec<usize> = slots.iter().map(|&slot| slot - start).collect();
         let length = rows.iter().max().map_or(0, |&row| row + 1);
-        let hashes: Vec<u64> = (start..start + length).map(|slot| source.hash_of(slot)).collect();
+        // Borrowed rather than collected. A scatter hands this one partition's slots out of a run
+        // at a time, and collecting the hashes up to the last of them was a copy of most of the run
+        // for every partition, sixty four copies of the run where one read of it is all there is.
+        let hashes = source.hashes_of(start..start + length);
         let mut targets = vec![usize::MAX; rows.len()];
         let mut walk = Walk::default();
         for from in (0..rows.len()).step_by(crate::table::BATCH) {
             let upto = (from + crate::table::BATCH).min(rows.len());
             into.table.probe_these(
-                &hashes,
+                hashes,
                 keys,
                 &rows[from..upto],
                 &mut targets[from..upto],
