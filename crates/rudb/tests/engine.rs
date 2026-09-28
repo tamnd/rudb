@@ -46,6 +46,29 @@ fn the_compiled_engine_answers_what_the_first_engine_answers() {
 }
 
 #[test]
+fn rows_with_no_order_come_back_in_file_order_from_many_workers_on_the_compiled_engine() {
+    let database = Database::new();
+    for sql in [
+        "SET threads = 8",
+        "CREATE TABLE big (i BIGINT, s VARCHAR)",
+        "INSERT INTO big SELECT i, 'row ' || i FROM range(400000) r(i)",
+    ] {
+        database.execute(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    for sql in
+        ["SELECT i, s FROM big WHERE i % 1000 = 7", "SELECT i * 2, s FROM big WHERE s LIKE '%99%'"]
+    {
+        database.execute("SET engine = 'first'").expect("the first engine");
+        let first = rows(&database, sql);
+        database.execute("SET engine = 'compiled'").expect("the compiled engine");
+        for _ in 0..3 {
+            assert_eq!(first, rows(&database, sql), "{sql}");
+        }
+    }
+    assert_eq!(database.refusals(), Vec::<String>::new());
+}
+
+#[test]
 fn a_limit_with_no_order_over_groups_reads_whole_groups_on_the_compiled_engine() {
     let database = database();
     let whole = rows(&database, "SELECT x, s, count(*), sum(x), min(s) FROM t GROUP BY x, s");

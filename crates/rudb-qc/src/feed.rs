@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rudb_common::{Cancel, Error, ErrorCode, Result};
 use rudb_exec::TopCut;
-use rudb_pipeline::{Lease, Progress, Sink};
+use rudb_pipeline::{Lease, Morsel as Cut, Progress, Sink};
 use rudb_plan::Plan;
 use rudb_qc_gen::{Body, Grouping, Out};
 use rudb_qc_ir::status::{Kind, Status};
@@ -66,6 +66,9 @@ pub(crate) struct Feed<'a> {
     /// Whether the scan may run this pipeline on many workers at once, each with its own state and
     /// runtime, folded together as each one finishes.
     parallel: bool,
+    /// Whether the rows of a result body are put back in the order of the morsels they came from
+    /// once its workers finish, because nothing after it sorts them.
+    ordered: bool,
     /// The state as init left it, which a worker's starts as.
     template: Vec<Line>,
     /// How an aggregate's workers fold their groups together, and its distinct sets.
@@ -93,6 +96,9 @@ pub(crate) struct Worker {
     state: Vec<Line>,
     /// The chunks a result body produced.
     out: Vec<Chunk>,
+    /// The morsel the worker is on, and the morsel each chunk in `out` came from.
+    morsel: u64,
+    from: Vec<u64>,
 }
 
 /// What a call changes.
@@ -102,6 +108,8 @@ struct Inner<'a> {
     state: Vec<Line>,
     /// The chunks a result body produced.
     out: Vec<Chunk>,
+    /// The morsel each chunk in `out` came from, when the workers made them.
+    from: Vec<u64>,
     /// Whether the body said the pipeline may stop.
     done: bool,
     /// The runtimes of the workers that finished, when they are merged all at once.
@@ -180,12 +188,11 @@ impl<'a> Feed<'a> {
             Out::Aggregate(g) if matches!(p.source, Source::Scan { .. }) => {
                 (true, merge::folds(g)?, merge::sets(g))
             }
-            // Rows that only a sort reads may come from many workers in any order. A worker's
-            // runtime has no join tables, so a body that probes one stays on one worker.
+            // The rows of a result come from many workers, and are put back in the order of the
+            // morsels unless only a sort reads them. A worker's runtime has no join tables, so a
+            // body that probes one stays on one worker.
             Out::Result { .. }
-                if unordered
-                    && body.probes.is_empty()
-                    && matches!(p.source, Source::Scan { .. }) =>
+                if body.probes.is_empty() && matches!(p.source, Source::Scan { .. }) =>
             {
                 (true, Vec::new(), Vec::new())
             }
@@ -202,6 +209,7 @@ impl<'a> Feed<'a> {
             columns,
             cancel,
             parallel,
+            ordered: parallel && !unordered && matches!(body.sink, Out::Result { .. }),
             template: state.clone(),
             split: parallel
                 && matches!(&body.sink, Out::Aggregate(g) if !g.keys.is_empty() || !sets.is_empty()),
@@ -214,6 +222,7 @@ impl<'a> Feed<'a> {
                 rt,
                 state,
                 out: Vec::new(),
+                from: Vec::new(),
                 done: false,
                 merged: false,
                 workers: Vec::new(),
@@ -260,7 +269,7 @@ impl<'a> Feed<'a> {
             let row = table.address(0) as u64;
             bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
         }
-        Worker { rt, state, out: Vec::new() }
+        Worker { rt, state, out: Vec::new(), morsel: 0, from: Vec::new() }
     }
 
     /// Says that the pipeline's input has `rows` rows, when that is known.
@@ -311,6 +320,7 @@ impl<'a> Feed<'a> {
             Out::Aggregate(g) => g,
             Out::Result { .. } => {
                 inner.out.append(&mut worker.out);
+                inner.from.append(&mut worker.from);
                 inner.rt.retire(worker.rt);
                 return Ok(());
             }
@@ -830,6 +840,13 @@ impl<'a> Feed<'a> {
     pub(crate) fn finish(self) -> Result<Vec<Chunk>> {
         let inner = self.inner.into_inner().map_err(|_| Error::internal("a feed was poisoned"))?;
         let mut out = inner.out;
+        if self.ordered && inner.from.len() == out.len() {
+            // A morsel is run by one worker from start to end, so a stable sort by morsel puts
+            // the rows back in the order the scan cut them.
+            let mut placed: Vec<(u64, Chunk)> = inner.from.into_iter().zip(out).collect();
+            placed.sort_by_key(|&(morsel, _)| morsel);
+            out = placed.into_iter().map(|(_, chunk)| chunk).collect();
+        }
         for step in &self.steps {
             match step {
                 Step::Init | Step::Body => {}
@@ -1085,9 +1102,24 @@ impl Sink for Scan<'_, '_> {
         true
     }
 
+    fn at(&self, morsel: &Cut, local: &mut Self::Local) -> Result<()> {
+        if let Some(w) = local {
+            w.morsel = morsel.index();
+        }
+        Ok(())
+    }
+
+    fn keeps_morsels(&self) -> bool {
+        self.0.ordered
+    }
+
     fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress> {
         match local {
-            Some(w) => self.0.run(chunk, &mut w.rt, &mut w.state, &mut w.out, &mut false),
+            Some(w) => {
+                let progress = self.0.run(chunk, &mut w.rt, &mut w.state, &mut w.out, &mut false);
+                w.from.resize(w.out.len(), w.morsel);
+                progress
+            }
             None => self.0.push(chunk),
         }
     }

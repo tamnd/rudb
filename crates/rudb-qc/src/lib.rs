@@ -16,10 +16,11 @@
 //! own [`Rt`] made by [`Rt::worker`], and the workers' groups are merged into the query's when
 //! they finish. When only a limit with no order reads the groups, the workers agree on the first
 //! keys any of them sees, as many as the limit reads, and make groups for those keys and no
-//! others. A pipeline that produces rows runs the same way when only a sort reads them, and
-//! its workers' rows are put together in the order the workers finish. Any other pipeline that
-//! produces rows, or builds a join table, runs on one worker, because the order its rows come out
-//! in is part of the answer.
+//! others. A pipeline over a scan that produces rows and probes no join table runs the same way.
+//! When only a sort reads its rows they are put together in the order the workers finish, and
+//! otherwise each chunk keeps the number of the morsel it came from and they are put back in that
+//! order, because then the order is part of the answer. A pipeline that probes or builds a join
+//! table runs on one worker.
 //!
 //! The breakers between pipelines are run here over the rows the pipeline before them produced,
 //! and so is the fetch that reads whole rows back once a top N has picked them. A sort reads its
