@@ -359,17 +359,29 @@ impl<'a> Matcher<'a> {
         self.keys.get(pos as usize).copied().unwrap_or(crate::rules::FIRST_END)
     }
 
+    /// Suspends a node, which every composite node the matcher enters does.
+    ///
+    /// Inlined into the loop because out of line the caller built the frame on its stack a field
+    /// at a time and this read it back as one 32 byte load, which cannot be forwarded from those
+    /// narrower stores and waits for them to reach the cache. That stall was a fifth of the whole
+    /// parse on the ClickBench queries. Inlined, the frame goes straight to the stack's slot.
+    #[inline(always)]
     fn push(&mut self, frame: Frame) -> Result<()> {
         if self.stack.len() >= MAX_DEPTH {
-            let token = self.token(self.pos);
-            return Err(Error::parser(format!(
-                "memory exhausted at or near \"{}\"",
-                token.text(self.query)
-            ))
-            .with_span(token.span()));
+            return Err(self.too_deep());
         }
         self.stack.push(frame);
         Ok(())
+    }
+
+    /// The error for a query nested deeper than [`MAX_DEPTH`], out of line so [`Self::push`] stays
+    /// small.
+    #[cold]
+    #[inline(never)]
+    fn too_deep(&self) -> Error {
+        let token = self.token(self.pos);
+        Error::parser(format!("memory exhausted at or near \"{}\"", token.text(self.query)))
+            .with_span(token.span())
     }
 
     fn alloc(&mut self, node: ParseNode) -> u32 {
