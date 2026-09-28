@@ -257,7 +257,7 @@ fn decoded(
 
 /// Whether a type is one an assembly lays rather than a copy end to end.
 fn nested(ty: &LogicalType) -> bool {
-    matches!(ty, LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _))
+    matches!(ty.storage(), LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _))
 }
 
 /// One column of the chunks laid end to end in a single copy, or `None` to leave it to an assembly.

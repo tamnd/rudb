@@ -448,6 +448,14 @@ impl Accumulator {
     ///
     /// If the name is not an aggregate this crate implements.
     pub fn new(name: &str, returns: &LogicalType) -> Result<Self> {
+        if let Some(inner) = name.strip_suffix(EXPORTED) {
+            let LogicalType::AggregateState(state) = returns else {
+                return Err(Error::internal(format!("{name} returning {returns}")));
+            };
+            let inner = Box::new(Self::new(inner, &state.returns)?);
+            let general = General::Exported { inner, state: Arc::clone(state) };
+            return Ok(Self { state: State::General(Box::new(general)) });
+        }
         if let Some((inner, keys)) = split_ordered(name) {
             if let ("lttb", [key]) = (inner, keys.as_slice()) {
                 let plot = Plot::sorted(returns, *key);
@@ -601,6 +609,13 @@ impl Accumulator {
     ///
     /// The same errors [`Accumulator::update`] raises, for the same reasons.
     pub fn update_run(&mut self, args: &[Vector], rows: usize) -> Result<()> {
+        // An exported state is its inner aggregate until it is written out, so the inner one takes
+        // the whole run in its own fast form rather than a row at a time through the wrapper.
+        if let State::General(general) = &mut self.state
+            && let Some(inner) = general.exported_mut()
+        {
+            return inner.update_run(args, rows);
+        }
         if let State::General(general) = &mut self.state {
             if general.takes_points()
                 && let Some(points) = Points::of(args, rows)
@@ -4017,6 +4032,11 @@ fn extreme<const DIRECT: bool, M: Fn(usize) -> usize>(
     }
     Some(rudb_vector::for_each_layout!(exact, best))
 }
+
+pub(crate) mod export;
+
+pub(crate) use export::state_call;
+pub use export::{EXPORTED, finalize_name, state_layout};
 
 #[cfg(test)]
 mod tests {

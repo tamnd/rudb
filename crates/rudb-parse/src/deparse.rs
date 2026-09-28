@@ -351,7 +351,8 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         Expr::Binary { op, left, right } => binary(ast, op, left, right),
         Expr::Function { name, args, distinct, filter } => {
             let sorted = ast.aggregate_order(index);
-            call(ast, name, args, distinct, filter, ast.named_args(index), sorted)
+            let written = call(ast, name, args, distinct, filter, ast.named_args(index), sorted);
+            if ast.exports_state(index) { written + " EXPORT_STATE" } else { written }
         }
         held @ Expr::Window { .. } => window(ast, held),
         Expr::Cast { operand, ty, try_cast } => {

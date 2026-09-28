@@ -460,7 +460,7 @@ fn duckbox(result: &QueryResult, cells: &[Vec<String>], dots: Option<(usize, usi
             *last += needed.saturating_sub(total);
         }
     }
-    let right: Vec<bool> = result.types().iter().map(LogicalType::is_numeric).collect();
+    let right: Vec<bool> = result.types().iter().map(|ty| ty.storage().is_numeric()).collect();
     let mut out = String::new();
     let _ = writeln!(out, "{}", rule(&sizes, &BOX_GLYPHS.top));
     let heads: Vec<String> =

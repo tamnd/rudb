@@ -12,7 +12,9 @@
 //! correlation and two more variances. Those copies see the same rows and do the same arithmetic,
 //! so here there is one of each piece, which is the same numbers in less room.
 
-use rudb_common::{Error, Result, Value};
+use rudb_common::{Error, LogicalType, Result, Value};
+
+use crate::aggregate::export::{counted, member, packed, real, shape};
 
 /// Which answer a [`Paired`] gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,11 @@ struct Spread {
 }
 
 impl Spread {
+    /// The spread a variance state holds, its mean and its sum of squared differences.
+    fn of(value: &Value) -> Result<Self> {
+        Ok(Self { mean: real(member(value, "mean")?)?, squared: real(member(value, "dsquared")?)? })
+    }
+
     /// Adds `input` as row number `count`, counted from one.
     fn add(&mut self, input: f64, count: f64) {
         let next = self.mean + (input - self.mean) / count;
@@ -165,6 +172,138 @@ impl Paired {
         self.count += source.count;
     }
 
+    /// The layout the pin exports `measure`'s state in, which nests the states of the simpler
+    /// statistics it is built out of.
+    pub(crate) fn layout(measure: Pairing) -> LogicalType {
+        let (d, c) = (LogicalType::Double, LogicalType::UBigInt);
+        let cov = || {
+            shape(&[
+                ("count", c.clone()),
+                ("meanx", d.clone()),
+                ("meany", d.clone()),
+                ("co_moment", d.clone()),
+            ])
+        };
+        let dev = || shape(&[("count", c.clone()), ("mean", d.clone()), ("dsquared", d.clone())]);
+        let corr = || shape(&[("cov_pop", cov()), ("dev_pop_x", dev()), ("dev_pop_y", dev())]);
+        match measure {
+            Pairing::Count => c,
+            Pairing::CovarPop | Pairing::CovarSamp => cov(),
+            Pairing::Corr => corr(),
+            Pairing::AvgX | Pairing::AvgY => shape(&[("sum", d), ("count", c)]),
+            Pairing::Intercept => shape(&[
+                ("count", c.clone()),
+                ("sum_x", d.clone()),
+                ("sum_y", d.clone()),
+                ("slope", shape(&[("cov_pop", cov()), ("var_pop", dev())])),
+            ]),
+            Pairing::R2 => shape(&[("corr", corr()), ("var_pop_x", dev()), ("var_pop_y", dev())]),
+            Pairing::Slope => shape(&[("cov_pop", cov()), ("var_pop", dev())]),
+            Pairing::Sxx | Pairing::Syy => shape(&[("count", c.clone()), ("var_pop", dev())]),
+            Pairing::Sxy => shape(&[("count", c.clone()), ("cov_pop", cov())]),
+        }
+    }
+
+    /// The state written out in [`Self::layout`].
+    pub(crate) fn export(&self) -> Value {
+        let count = || Value::UBigInt(self.count);
+        let cov = || {
+            packed(vec![
+                ("count", count()),
+                ("meanx", Value::Double(self.mean_x)),
+                ("meany", Value::Double(self.mean_y)),
+                ("co_moment", Value::Double(self.co_moment)),
+            ])
+        };
+        let dev = |spread: Spread| {
+            packed(vec![
+                ("count", count()),
+                ("mean", Value::Double(spread.mean)),
+                ("dsquared", Value::Double(spread.squared)),
+            ])
+        };
+        let corr = || {
+            packed(vec![("cov_pop", cov()), ("dev_pop_x", dev(self.x)), ("dev_pop_y", dev(self.y))])
+        };
+        match self.measure {
+            Pairing::Count => count(),
+            Pairing::CovarPop | Pairing::CovarSamp => cov(),
+            Pairing::Corr => corr(),
+            Pairing::AvgX => packed(vec![("sum", Value::Double(self.sum_x)), ("count", count())]),
+            Pairing::AvgY => packed(vec![("sum", Value::Double(self.sum_y)), ("count", count())]),
+            Pairing::Intercept => packed(vec![
+                ("count", count()),
+                ("sum_x", Value::Double(self.sum_x)),
+                ("sum_y", Value::Double(self.sum_y)),
+                ("slope", packed(vec![("cov_pop", cov()), ("var_pop", dev(self.x))])),
+            ]),
+            Pairing::R2 => packed(vec![
+                ("corr", corr()),
+                ("var_pop_x", dev(self.x)),
+                ("var_pop_y", dev(self.y)),
+            ]),
+            Pairing::Slope => packed(vec![("cov_pop", cov()), ("var_pop", dev(self.x))]),
+            Pairing::Sxx => packed(vec![("count", count()), ("var_pop", dev(self.x))]),
+            Pairing::Syy => packed(vec![("count", count()), ("var_pop", dev(self.y))]),
+            Pairing::Sxy => packed(vec![("count", count()), ("cov_pop", cov())]),
+        }
+    }
+
+    /// Puts the state [`Self::export`] wrote into this fresh one. Every part of a nested state
+    /// counted the same rows, since a row with a null in it is skipped by all of them.
+    pub(crate) fn import(&mut self, value: &Value) -> Result<()> {
+        match self.measure {
+            Pairing::Count => self.count = counted(value)?,
+            Pairing::CovarPop | Pairing::CovarSamp => self.take_cov(value)?,
+            Pairing::Corr => self.take_corr(value)?,
+            Pairing::AvgX | Pairing::AvgY => {
+                self.count = counted(member(value, "count")?)?;
+                let sum = real(member(value, "sum")?)?;
+                if self.measure == Pairing::AvgX { self.sum_x = sum } else { self.sum_y = sum }
+            }
+            Pairing::Intercept => {
+                let slope = member(value, "slope")?;
+                self.take_cov(member(slope, "cov_pop")?)?;
+                self.x = Spread::of(member(slope, "var_pop")?)?;
+                self.count = counted(member(value, "count")?)?;
+                self.sum_x = real(member(value, "sum_x")?)?;
+                self.sum_y = real(member(value, "sum_y")?)?;
+            }
+            Pairing::R2 => self.take_corr(member(value, "corr")?)?,
+            Pairing::Slope => {
+                self.take_cov(member(value, "cov_pop")?)?;
+                self.x = Spread::of(member(value, "var_pop")?)?;
+            }
+            Pairing::Sxx | Pairing::Syy => {
+                self.count = counted(member(value, "count")?)?;
+                let held = Spread::of(member(value, "var_pop")?)?;
+                if self.measure == Pairing::Sxx { self.x = held } else { self.y = held }
+            }
+            Pairing::Sxy => {
+                self.take_cov(member(value, "cov_pop")?)?;
+                self.count = counted(member(value, "count")?)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads a covariance state, the count, the two means and the co-moment.
+    fn take_cov(&mut self, value: &Value) -> Result<()> {
+        self.count = counted(member(value, "count")?)?;
+        self.mean_x = real(member(value, "meanx")?)?;
+        self.mean_y = real(member(value, "meany")?)?;
+        self.co_moment = real(member(value, "co_moment")?)?;
+        Ok(())
+    }
+
+    /// Reads a correlation state, a covariance and the spread of each side.
+    fn take_corr(&mut self, value: &Value) -> Result<()> {
+        self.take_cov(member(value, "cov_pop")?)?;
+        self.x = Spread::of(member(value, "dev_pop_x")?)?;
+        self.y = Spread::of(member(value, "dev_pop_y")?)?;
+        Ok(())
+    }
+
     pub(crate) fn finish(&self) -> Value {
         let count = self.count;
         if self.measure == Pairing::Count {
@@ -268,6 +407,47 @@ impl Powers {
         if self.measure != Moment::Skewness {
             self.fourths += input.powf(4.0);
         }
+    }
+
+    /// The layout the pin exports `measure`'s state in.
+    pub(crate) fn layout(measure: Moment) -> LogicalType {
+        let d = LogicalType::Double;
+        let mut fields = vec![
+            ("n", LogicalType::UBigInt),
+            ("sum", d.clone()),
+            ("sum_sqr", d.clone()),
+            ("sum_cub", d.clone()),
+        ];
+        if measure != Moment::Skewness {
+            fields.push(("sum_four", d));
+        }
+        shape(&fields)
+    }
+
+    /// The state written out in [`Self::layout`].
+    pub(crate) fn export(&self) -> Value {
+        let mut fields = vec![
+            ("n", Value::UBigInt(self.count)),
+            ("sum", Value::Double(self.sum)),
+            ("sum_sqr", Value::Double(self.squares)),
+            ("sum_cub", Value::Double(self.cubes)),
+        ];
+        if self.measure != Moment::Skewness {
+            fields.push(("sum_four", Value::Double(self.fourths)));
+        }
+        packed(fields)
+    }
+
+    /// Puts the state [`Self::export`] wrote into this fresh one.
+    pub(crate) fn import(&mut self, value: &Value) -> Result<()> {
+        self.count = counted(member(value, "n")?)?;
+        self.sum = real(member(value, "sum")?)?;
+        self.squares = real(member(value, "sum_sqr")?)?;
+        self.cubes = real(member(value, "sum_cub")?)?;
+        if self.measure != Moment::Skewness {
+            self.fourths = real(member(value, "sum_four")?)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn combine(&mut self, source: &Self) {

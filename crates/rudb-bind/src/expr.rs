@@ -109,7 +109,12 @@ impl Binder<'_> {
             }
             ast::Expr::Function { name, args, distinct, filter } => {
                 let sorted = ast.aggregate_order(expr);
-                self.bind_call(ast, name, args, distinct, filter, sorted, scope)
+                // Only an aggregate reads this, and the pin lets any other call write it and
+                // ignores it, apart from the name of the column.
+                self.exporting = ast.exports_state(expr);
+                let bound = self.bind_call(ast, name, args, distinct, filter, sorted, scope);
+                self.exporting = false;
+                bound
             }
             ast::Expr::Window { name, args, distinct, filter, ignore_nulls, order, spec } => {
                 let written = ast.name(name).last().unwrap_or_default().to_string();
@@ -771,6 +776,9 @@ impl Binder<'_> {
             return Ok(call);
         }
         if let Some(call) = self.struct_call(&written, &bound)? {
+            return Ok(call);
+        }
+        if let Some(call) = self.state_call(&written, &bound)? {
             return Ok(call);
         }
         if let Some(field) = self.struct_field(&written, &bound)? {
@@ -1817,8 +1825,10 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             // `count(*)` is, and it is the one spelling of the three that does not survive as
             // written.
             let empty = ast.expr_list(args).is_empty();
+            // A call that hands out its state says so after everything else it was written with.
+            let exported = if ast.exports_state(expr) { " EXPORT_STATE" } else { "" };
             if (starred || empty) && rudb_catalog::same_name(written, "count") {
-                return format!("count_star(){}", named_filter(ast, filter, semantics));
+                return format!("count_star(){}{exported}", named_filter(ast, filter, semantics));
             }
             if let Some(name) = subscript_name(ast, expr, written, args, semantics) {
                 return name;
@@ -1876,7 +1886,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                 format!(" ORDER BY {}", sorted.join(", "))
             };
             format!(
-                "{name}({word}{}{sorted}){}",
+                "{name}({word}{}{sorted}){}{exported}",
                 arguments.join(", "),
                 named_filter(ast, filter, semantics)
             )
