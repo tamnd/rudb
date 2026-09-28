@@ -168,9 +168,14 @@ impl Compiled {
         let mut outputs: Vec<Option<Vec<Chunk>>> = Vec::with_capacity(self.graph.stages.len());
         // The stages whose rows only a sort reads, which may come in any order.
         let mut unordered = vec![false; self.graph.stages.len()];
+        // The stages whose rows only a top N reads, with its keys and how many rows it keeps.
+        let mut topped = vec![None; self.graph.stages.len()];
         for stage in &self.graph.stages {
             if let Stage::Sort { input, .. } | Stage::TopN { input, .. } = stage {
                 unordered[*input] = true;
+            }
+            if let Stage::TopN { input, keys, count, offset, .. } = stage {
+                topped[*input] = Some((keys.as_slice(), count.saturating_add(*offset)));
             }
         }
         for (at, stage) in self.graph.stages.iter().enumerate() {
@@ -188,6 +193,10 @@ impl Compiled {
                         under.cancel,
                         unordered[at],
                     )?;
+                    let feed = match topped[at] {
+                        Some((keys, count)) => feed.topped(keys, count),
+                        None => feed,
+                    };
                     match &p.source {
                         Source::Scan { node, .. } => {
                             let mut scan = plan.clone();

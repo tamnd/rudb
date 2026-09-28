@@ -34,9 +34,9 @@ use rudb_qc_gen::{Body, Out};
 use rudb_qc_ir::status::{Kind, Status};
 use rudb_qc_ir::{ErrorKind, Module};
 use rudb_qc_pipe::{Pipeline, Source, Step};
-use rudb_qc_plan::Column;
+use rudb_qc_plan::{Column, Key};
 use rudb_qc_rt::abi::{Col, Morsel, StateHeader};
-use rudb_qc_rt::table::{Distinct, GroupTable};
+use rudb_qc_rt::table::{Distinct, GroupTable, Job};
 use rudb_qc_rt::{RUNTIME_ERROR, Rt, text};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
@@ -68,6 +68,10 @@ pub(crate) struct Feed<'a> {
     /// Whether the workers are kept until the last one finishes and then merged a part of the
     /// groups to a thread, which a table with keys and no distinct sets is.
     split: bool,
+    /// The keys and the row count of a top N that is all that reads this pipeline's rows, so a
+    /// merge that makes its groups into chunks keeps only the rows of each chunk that could make
+    /// it.
+    top: Option<(&'a [Key], u64)>,
     inner: Mutex<Inner<'a>>,
 }
 
@@ -189,6 +193,7 @@ impl<'a> Feed<'a> {
                 && matches!(&body.sink, Out::Aggregate(g) if !g.keys.is_empty() || !sets.is_empty()),
             folds,
             sets,
+            top: None,
             inner: Mutex::new(Inner {
                 rt,
                 state,
@@ -221,6 +226,13 @@ impl<'a> Feed<'a> {
             bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
         }
         Worker { rt, state, out: Vec::new() }
+    }
+
+    /// Says that only a top N over `keys` of `count` rows, skipped ones included, reads what this
+    /// pipeline produces.
+    pub(crate) fn topped(mut self, keys: &'a [Key], count: u64) -> Self {
+        self.top = Some((keys, count));
+        self
     }
 
     /// Folds a worker that has seen its last morsel into the query's runtime. The first one is
@@ -310,6 +322,7 @@ impl<'a> Feed<'a> {
                     for (t, (other, split)) in tables.iter().zip(&splits).enumerate() {
                         table.absorb_some(other, &split[part], made.get_mut(t), fold);
                     }
+                    table.seal();
                     (table, made)
                 })?;
                 let (merged, made): (Vec<GroupTable>, Vec<Made>) = merged.into_iter().unzip();
@@ -333,7 +346,17 @@ impl<'a> Feed<'a> {
                         map
                     })?
                 };
-                (GroupTable::join(layout, merged), made)
+                let (joined, ran) = GroupTable::join_with(layout, merged, |jobs| {
+                    let jobs: Vec<Mutex<Option<Job<'_>>>> =
+                        jobs.into_iter().map(|job| Mutex::new(Some(job))).collect();
+                    pieces(threads, jobs.len(), |at| {
+                        if let Some(job) = jobs[at].lock().ok().and_then(|mut job| job.take()) {
+                            job();
+                        }
+                    })
+                });
+                ran?;
+                (joined, made)
             };
             maps = made;
             // The table adopted from the first worker is replaced, and its strings with it, but
@@ -371,11 +394,22 @@ impl<'a> Feed<'a> {
             .map(|&h| inner.rt.distinct(h).map(|d| (h, d)).ok_or_else(|| gone(h)))
             .collect::<Result<Vec<_>>>()?;
         let columns = self.columns;
+        let top = self.top;
         let chunks = pieces(threads, table.len().div_ceil(VECTOR_SIZE), |at| {
-            finish::group_chunk(table, &sets, g, columns, at)
+            let chunk = finish::group_chunk(table, &sets, g, columns, at)?;
+            match top {
+                // Every row of the answer is in the top N of the chunk it is in.
+                Some((keys, count)) if (count as usize) < chunk.len() => {
+                    finish::sort(vec![chunk], keys, Some(count), 0)
+                }
+                _ => Ok(vec![chunk]),
+            }
         })?;
-        let chunks = chunks.into_iter().collect::<Result<_>>()?;
-        inner.out = chunks;
+        let mut out = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            out.append(&mut chunk?);
+        }
+        inner.out = out;
         inner.grouped = true;
         Ok(())
     }
