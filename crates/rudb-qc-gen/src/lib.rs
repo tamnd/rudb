@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use rudb_common::{LogicalType, PhysicalType, Value};
 use rudb_plan::CompareOp;
 use rudb_qc_ir::catalogue::proxy;
+use rudb_qc_ir::eval::pow10;
 use rudb_qc_ir::func::INV;
 use rudb_qc_ir::status::NEED_MEMORY;
 use rudb_qc_ir::{Block, Builder, ErrorKind, Field, Func, Module, Op, Ty, Val, dce, verify};
@@ -627,12 +628,7 @@ impl Gen<'_> {
                 }
             }
             ("sum", _) if argty.is_float() && qir_type(&a.ty)? == Ty::F64 => AccOp::SumFloat,
-            ("avg", _)
-                if argty.is_int()
-                    && !unsigned(&arg)
-                    && !matches!(arg, LogicalType::Decimal { .. })
-                    && qir_type(&a.ty)? == Ty::F64 =>
-            {
+            ("avg", _) if argty.is_int() && !unsigned(&arg) && qir_type(&a.ty)? == Ty::F64 => {
                 if argty.bytes() <= 2 {
                     AccOp::AvgNarrow
                 } else {
@@ -807,7 +803,7 @@ impl Gen<'_> {
         if matches!(input.ty, LogicalType::Decimal { .. })
             || matches!(to, LogicalType::Decimal { .. })
         {
-            return Err(refuse());
+            return self.decimal_cast(&input.ty, to, (v, ok), try_cast)?.ok_or_else(refuse);
         }
         let numeric = |t: &LogicalType| {
             matches!(
@@ -878,8 +874,148 @@ impl Gen<'_> {
         Ok((out, ok))
     }
 
+    /// A cast into a decimal, or out of one into a double, the way the first engine's `to_decimal`
+    /// and `approximate` do it. `None` for any other cast with a decimal on one side.
+    ///
+    /// A decimal is its unscaled integer, so a cast into one is a widening, a multiply or a divide
+    /// by a power of ten for the change of scale, rounded half away from zero the way `rescale`
+    /// rounds, a check that the answer has no more digits than the width, and a narrowing. The
+    /// check is left out where the digits the input can have already fit, which is every cast a
+    /// plan makes to line the two sides of an operator up.
+    fn decimal_cast(
+        &mut self,
+        input: &LogicalType,
+        to: &LogicalType,
+        (v, ok): Pair,
+        try_cast: bool,
+    ) -> Result<Option<Pair>> {
+        let from = qir_type(input)?;
+        let ty = qir_type(to)?;
+        if let (LogicalType::Decimal { scale, .. }, LogicalType::Double) = (input, to) {
+            let x = self.b.conv(Op::Sitof, v, Ty::F64);
+            let p = self.b.f64(pow10(u32::from(*scale)) as f64);
+            return Ok(Some((self.b.bin(Op::Fdiv, x, p), ok)));
+        }
+        let LogicalType::Decimal { width, scale } = *to else { return Ok(None) };
+        if unsigned(input) || from == Ty::I128 && !matches!(input, LogicalType::Decimal { .. }) {
+            return Ok(None);
+        }
+        // The digits before the point the input can have, and the scale it is held at.
+        let Some((digits, held)) = input.decimal_shape() else { return Ok(None) };
+        let whole = digits.saturating_sub(held);
+        // Rounding a scale down can carry into one more digit, 9.99 to 10.0.
+        let carry = u8::from(scale < held);
+        let check = whole + carry > width - scale;
+        if check && try_cast {
+            return Ok(None);
+        }
+        let work = if ty.bits() > from.bits() { ty } else { from };
+        let mut v = if work == from { v } else { self.b.conv(Op::Sext, v, work) };
+        let text =
+            format!("Casting a value of type {input} to type {to} failed: value is out of range!");
+        if scale > held {
+            // Overflowing the working type is past ten to the width too, so the trap is the same
+            // error the check below would have raised.
+            let err = self.error(ErrorKind::Conversion, text.clone());
+            v = self.b.dup(v, u32::from(scale - held), err);
+        } else if scale < held {
+            v = self.b.ddown(v, u32::from(held - scale));
+        }
+        if check {
+            let err = self.error(ErrorKind::Conversion, text);
+            self.within(v, work, width, err);
+        }
+        if ty.bits() < work.bits() {
+            v = self.b.conv(Op::Trunc, v, ty);
+        }
+        Ok(Some((v, ok)))
+    }
+
+    /// Decimal `+`, `-` and `*` on the unscaled integers, the way the first engine's decimal runs
+    /// do them. `None`, with nothing emitted, for a call whose scales are not lined up the way the
+    /// binder lines them up, which the kernel takes instead.
+    ///
+    /// A sum or a difference wants both sides at the answer's scale and a product has the two
+    /// scales added, so neither is rescaled. What is left is the add, the subtract or the multiply
+    /// in the answer's type, trapped when that type overflows, and a check that the answer has no
+    /// more digits than its width. The check is left out when the widths of the two sides already
+    /// say it cannot, which is how the binder picks an answer's width for everything but a width
+    /// capped at 38.
+    fn decimal_arithmetic(
+        &mut self,
+        name: &str,
+        l: &Expr,
+        r: &Expr,
+        e: &Expr,
+    ) -> Result<Option<Pair>> {
+        let LogicalType::Decimal { width, scale } = e.ty else { return Ok(None) };
+        let (Some((lw, ls)), Some((rw, rs))) = (l.ty.decimal_shape(), r.ty.decimal_shape()) else {
+            return Ok(None);
+        };
+        let ty = qir_type(&e.ty)?;
+        let (lt, rt) = (qir_type(&l.ty)?, qir_type(&r.ty)?);
+        let product = name == "*";
+        let lined = if product { ls + rs == scale } else { ls == scale && rs == scale };
+        if !lined
+            || unsigned(&l.ty)
+            || unsigned(&r.ty)
+            || lt.bits() > ty.bits()
+            || rt.bits() > ty.bits()
+        {
+            return Ok(None);
+        }
+        let (a, va) = self.translate(l)?;
+        let (b, vb) = self.translate(r)?;
+        let a = if lt == ty { a } else { self.b.conv(Op::Sext, a, ty) };
+        let b = if rt == ty { b } else { self.b.conv(Op::Sext, b, ty) };
+        let (op, word) = match name {
+            "+" => (Op::SaddT, "addition"),
+            "-" => (Op::SsubT, "subtract"),
+            _ => (Op::SmulT, "multiplication"),
+        };
+        let text = format!("Overflow in {word} of {}", e.ty.physical_name());
+        let err = self.error(ErrorKind::Overflow, text);
+        let v = self.b.checked(op, a, b, err);
+        let reach = if product { lw.saturating_add(rw) } else { lw.max(rw).saturating_add(1) };
+        if reach > width {
+            self.within(v, ty, width, err);
+        }
+        let valid = self.b.bin(Op::And, va, vb);
+        Ok(Some((v, valid)))
+    }
+
+    /// Traps with `err` unless `v`, a decimal's unscaled integer in `ty`, is under ten to `width`
+    /// either way, which is the first engine's test for a value having no more digits than that.
+    fn within(&mut self, v: Val, ty: Ty, width: u8, err: u32) {
+        let limit = pow10(u32::from(width));
+        let high = self.b.int(ty, limit);
+        let low = self.b.int(ty, -limit);
+        let below = self.b.bin(Op::IcmpSlt, v, high);
+        let above = self.b.bin(Op::IcmpSgt, v, low);
+        let fits = self.b.bin(Op::And, below, above);
+        let fail = self.b.block(&[]);
+        let good = self.b.block(&[]);
+        self.b.set_cold(fail);
+        self.b.brif(fits, good, &[], fail, &[]);
+        self.b.switch_to(fail);
+        self.b.trap(err);
+        self.b.switch_to(good);
+    }
+
     fn compare(&mut self, op: CompareOp, left: &Expr, right: &Expr) -> Result<Pair> {
         let ty = qir_type(&left.ty)?;
+        // A decimal is its unscaled integer, so two of them only compare as integers at one scale,
+        // and a decimal and an integer only at scale zero, which the binder does not leave.
+        let scale = |t: &LogicalType| match *t {
+            LogicalType::Decimal { scale, .. } => Some(scale),
+            _ => None,
+        };
+        if scale(&left.ty) != scale(&right.ty) {
+            return Err(Refusal::new(
+                format!("comparing {} with {}", left.ty, right.ty),
+                "the two sides are decimals at different scales",
+            ));
+        }
         if qir_type(&right.ty)? != ty {
             return Err(Refusal::new(
                 format!("comparing {} with {}", left.ty, right.ty),
@@ -982,6 +1118,17 @@ impl Gen<'_> {
             && !matches!(e.ty, LogicalType::Decimal { .. });
         let arithmetic = ty.is_float() || signed;
         Ok(Some(match (name, args) {
+            ("+" | "-" | "*", [l, r]) if matches!(e.ty, LogicalType::Decimal { .. }) => {
+                return self.decimal_arithmetic(name, l, r, e);
+            }
+            ("-", [x]) if matches!(e.ty, LogicalType::Decimal { .. }) && x.ty == e.ty => {
+                // A decimal's range is the same either side of zero, so this only traps where
+                // the type itself does.
+                let (a, ok) = self.translate(x)?;
+                let text = format!("Overflow in negation of {}", e.ty.physical_name());
+                let err = self.error(ErrorKind::Overflow, text);
+                (self.b.checked_neg(a, err), ok)
+            }
             ("+" | "-" | "*", [l, r]) => {
                 if !arithmetic || qir_type(&l.ty)? != ty || qir_type(&r.ty)? != ty {
                     return Ok(None);

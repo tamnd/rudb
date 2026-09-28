@@ -13,6 +13,7 @@ use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
 use rudb_kernels::compare::order;
 use rudb_plan::{Node, NodeRef, Plan};
 use rudb_qc_gen::{AccOp, Grouping, qir_type};
+use rudb_qc_ir::eval::pow10;
 use rudb_qc_plan::{Column, Key, Kind};
 use rudb_qc_rt::table::{Distinct, GroupTable};
 use rudb_qc_rt::{Rt, text};
@@ -286,6 +287,18 @@ impl Rising {
     }
 }
 
+/// What the total of an average over `arg` is divided by, `n` values having gone into it.
+///
+/// The first engine's `divide_mean`: the count times ten to the scale, both as doubles, which for
+/// an integer is the count, since multiplying by one is exact.
+fn divisor(arg: &LogicalType, n: i64) -> f64 {
+    let scale = match *arg {
+        LogicalType::Decimal { scale, .. } => scale,
+        _ => 0,
+    };
+    n as f64 * pow10(u32::from(scale)) as f64
+}
+
 /// The value of one accumulator, `a` being its bytes in the group row.
 fn finish(
     sets: &[(u64, &Distinct)],
@@ -305,11 +318,11 @@ fn finish(
         AccOp::AvgInt => {
             let n = i64_at(16);
             // The first engine's answer: the exact total, then one division in doubles.
-            (n != 0).then(|| cell(&(i128_at(0) as f64 / n as f64).to_le_bytes()))
+            (n != 0).then(|| cell(&(i128_at(0) as f64 / divisor(arg, n)).to_le_bytes()))
         }
         AccOp::AvgNarrow => {
             let n = i64_at(8);
-            (n != 0).then(|| cell(&(i64_at(0) as f64 / n as f64).to_le_bytes()))
+            (n != 0).then(|| cell(&(i64_at(0) as f64 / divisor(arg, n)).to_le_bytes()))
         }
         AccOp::AvgFloat => {
             let n = i64_at(8);
