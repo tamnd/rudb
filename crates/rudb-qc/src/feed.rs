@@ -344,7 +344,12 @@ impl<'a> Feed<'a> {
         if let Some(table) = inner.rt.table_mut(g.table) {
             table.cap(0);
         }
-        let parts = (threads.degree() * 4).next_power_of_two().clamp(16, 1024);
+        // Enough parts that the slots of each fit in the cache of the thread folding it.
+        let mine = inner.rt.table(g.table).map_or(0, GroupTable::len);
+        let parts = ((groups + mine) / PART_GROUPS)
+            .max(threads.degree() * 4)
+            .next_power_of_two()
+            .clamp(16, 4096);
         let bits = parts.trailing_zeros();
         // Which merged group each worker's group became, for the distinct sets.
         let mut maps: Vec<Vec<usize>> = Vec::with_capacity(workers.len() + 1);
@@ -886,6 +891,9 @@ impl Sink for Scan<'_, '_> {
 
 /// How many groups the workers of an aggregate have between them before they are merged in parts.
 const SPLIT_FROM: usize = 1 << 16;
+
+/// About how many groups one part of a merge holds, so that its slots stay in the cache.
+const PART_GROUPS: usize = 1 << 14;
 
 /// How many groups [`piece`] takes at once when it can pick the ones a top N keeps by their count.
 const COUNTED_SPAN: usize = 1 << 16;
