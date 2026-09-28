@@ -432,10 +432,13 @@ impl<'a> Feed<'a> {
     }
 
     /// Runs the body over every chunk of a scan, by building `scan` in the first engine with this
-    /// feed as the root.
-    pub(crate) fn scan(&self, scan: &Plan, under: Under<'_>) -> Result<()> {
+    /// feed as the root. When `pruned` is set the root of `scan` is a filter that only picks the
+    /// parts the scan reads, and the body runs the filter on the rows.
+    pub(crate) fn scan(&self, scan: &Plan, pruned: bool, under: Under<'_>) -> Result<()> {
         let sink = Arc::new(Scan(self));
-        let query = rudb_exec::build_measured_into(
+        let build =
+            if pruned { rudb_exec::build_pruned_into } else { rudb_exec::build_measured_into };
+        let query = build(
             scan,
             under.catalog,
             under.cancel,
