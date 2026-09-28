@@ -514,9 +514,17 @@ impl<'a> Feed<'a> {
                     splits.iter().map(|s| s[part].len()).sum()
                 };
                 let mut table = GroupTable::with_capacity(layout.clone(), most);
+                // A top by a descending count is gathered as the lanes fold.
+                let mut rising = counted
+                    .filter(|_| laned)
+                    .and_then(|(at, more, count)| finish::Rising::new(at, more, count));
                 if laned {
                     for other in &tables {
-                        table.absorb_lane(other, part, fold);
+                        table.absorb_lane(other, part, fold, |gid, row| {
+                            if let Some(r) = &mut rising {
+                                r.offer(gid, row);
+                            }
+                        });
                     }
                 } else {
                     for (other, split) in tables.iter().zip(&splits) {
@@ -524,11 +532,13 @@ impl<'a> Feed<'a> {
                     }
                 }
                 table.seal();
-                let gids = counted
-                    .and_then(|(at, more, count)| {
+                let gids = match rising {
+                    Some(rising) => rising.finish(&table),
+                    None => counted.and_then(|(at, more, count)| {
                         finish::counted_top(&table, at, more, count, 0, table.len())
-                    })
-                    .unwrap_or_else(|| (0..table.len()).collect());
+                    }),
+                }
+                .unwrap_or_else(|| (0..table.len()).collect());
                 let mut out = Vec::new();
                 for gids in gids.chunks(VECTOR_SIZE) {
                     out.append(&mut cut(finish::group_rows(&table, &[], g, columns, gids)?, top)?);
