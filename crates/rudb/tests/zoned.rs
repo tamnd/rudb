@@ -215,17 +215,14 @@ fn a_millisecond_column_is_reached_through_a_cast_and_the_bounds_are_not_asked_t
     // and what the estimator is handed is that cast rather than a column it has two ends for. The
     // estimate falls back to the constant's fifth.
     //
-    // The count on the right should be 1440 and is the whole file, which is issue #959. A count of
-    // milliseconds out of Parquet is read here as a count of microseconds, so every value in the
-    // column sits in 1970 and every one of them is under a constant in 2020. That is a wrong answer
-    // rather than an estimate, it predates the bounds and the binary from before them answers the
-    // same, and fixing it is cast kernel work. This pins what the engine does today, and the number
-    // becomes 1440 when #959 closes.
+    // The count used to be the whole file, which was issue #959: a count of milliseconds out of
+    // Parquet was read as a count of microseconds, so every value sat in 1970. Since #2095 keeps a
+    // millisecond timestamp in its own unit, the count is the day it should be.
     let database = Database::new();
     let predicate = "ms < TIMESTAMP '2020-01-02 00:00:00'";
     let line = planned(&database, &scaled(), predicate);
     assert!(line.contains("[~1638 rows estimated from default]"), "{line}");
-    assert_eq!(counted(&database, &scaled(), predicate), 8192, "issue #959, it should be 1440");
+    assert_eq!(counted(&database, &scaled(), predicate), 1440);
 }
 
 #[test]
