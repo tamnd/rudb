@@ -3,6 +3,12 @@
 //! `GROUP BY ip, ip - 1, ip - 2` has one independent key. Hashing all three values for every
 //! input row makes the hash table wider without separating additional rows. This pass groups by
 //! `ip` and computes the dependent expressions once for each output group.
+//!
+//! A key that reads no column at all, like the `1` of `GROUP BY 1, URL` when `1` is the literal and
+//! not a position, is determined by every other key, so it goes the same way. Left in, it made
+//! ClickBench 35 a different grouping from 34 to every later pass, and 35 hashed ten million rows
+//! where 34 read the counts of the column's values. At least one key stays, since a grouping by
+//! constants alone has no group at all over no rows where a grouping by nothing has one.
 
 use std::collections::HashMap;
 
@@ -49,26 +55,20 @@ fn rewrite(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
             _ => None,
         })
         .collect();
-    if bases.is_empty() {
-        return None;
-    }
-
     let dependent: Vec<bool> = keys
         .iter()
         .map(|&key| {
             if matches!(plan.expr(key), Expr::Column(_)) || walk::volatile(plan, key) {
                 return false;
             }
-            let mut saw_column = false;
             let mut covered = true;
             walk::columns(plan, key, &mut |binding| {
-                saw_column = true;
                 covered &= bases.contains_key(&binding);
             });
-            saw_column && covered && walk::elementwise(plan, key)
+            covered && walk::elementwise(plan, key)
         })
         .collect();
-    if !dependent.iter().any(|&yes| yes) {
+    if !dependent.iter().any(|&yes| yes) || dependent.iter().all(|&yes| yes) {
         return None;
     }
 
@@ -150,6 +150,20 @@ mod tests {
     #[test]
     fn an_expression_with_an_independent_column_stays_in_the_hash_key() {
         let before = "Aggregate #1 groups=[#0.0::INTEGER, \"+\"(#0.0::INTEGER, #0.1::INTEGER)::INTEGER] aggregates=[]\n  Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n";
+        assert_eq!(rewritten(before), before);
+    }
+
+    #[test]
+    fn a_constant_key_is_computed_after_aggregation() {
+        let before = "Aggregate #1 groups=[1::INTEGER, #0.0::VARCHAR] aggregates=[count_star()::BIGINT]\n  Get memory.main.t AS t #0 [u::VARCHAR]\n";
+        let after = rewritten(before);
+        assert!(after.contains("Project #1 [1::INTEGER"), "{after}");
+        assert!(after.contains("Aggregate #2 groups=[#0.0::VARCHAR]"), "{after}");
+    }
+
+    #[test]
+    fn constant_keys_alone_stay_a_grouping() {
+        let before = "Aggregate #1 groups=[1::INTEGER, 2::INTEGER] aggregates=[count_star()::BIGINT]\n  Get memory.main.t AS t #0 [u::VARCHAR]\n";
         assert_eq!(rewritten(before), before);
     }
 }
