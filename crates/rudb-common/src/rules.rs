@@ -14,11 +14,15 @@
 //! 9.2, where every query takes the hash join, the nested loop and the ordinary scan. Both runs must
 //! produce identical answers, and that comparison runs on every commit rather than at a milestone.
 //!
-//! The two masters do not start in the same place. `statistics` starts on, because a better estimate
-//! of a number the planner already needed is not a new behaviour and nobody should have to ask for
-//! it. `graph_sections` starts off, which is what tamnd/rudb#760 asks for, because a stored section
-//! and a new operator are a new behaviour, and a new behaviour earns its default by measuring better
-//! rather than by being written.
+//! Both masters start on. `statistics` always did, because a better estimate of a number the planner
+//! already needed is not a new behaviour and nobody should have to ask for it. `graph_sections`
+//! started off, which is what tamnd/rudb#760 asked for, because a stored section and a new operator
+//! are a new behaviour, and a new behaviour earns its default by measuring better rather than by
+//! being written. It has now measured better: on TPC-H SF1 with the schema's relationships declared,
+//! every one of the 22 queries gives the same answer with the layer on, none runs more instructions,
+//! and q17, q21, q19, q08 and q04 run a quarter to three quarters fewer, which is
+//! `spec/graph/09-measurement.md` section 9.9. A file with no relationship declared has no section
+//! to read, so on is the same as off there.
 //!
 //! [`Rule::StoredAnswers`] is another switch with nothing under it.
 //! The line it draws is between statistics and answers.
@@ -51,10 +55,8 @@ use crate::{Error, Result};
 
 /// One switch.
 ///
-/// Every statistics variant is on by default, so a fresh database behaves as it did before any of
-/// this existed and an ablation is something a run asks for rather than something it inherits.
-/// [`Rule::GraphSections`] is the exception and starts off, because it is a stored structure and a
-/// new path through the executor rather than a better answer to a question already being asked.
+/// Every variant is on by default, so an ablation is something a run asks for rather than something
+/// it inherits. [`Rule::GraphSections`] started off and earned its default, see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rule {
     /// Every statistics consumer. Off means every question answers `Stat::Unknown`.
@@ -152,12 +154,13 @@ impl Rule {
         }
     }
 
-    /// Whether a fresh database has this rule on.
+    /// Whether a fresh database has this rule on, which today is every rule.
     ///
-    /// Everything does except [`Rule::GraphSections`], and the reason is in the module docs.
+    /// Kept as a question rather than folded into its callers, because the next layer to arrive
+    /// starts off the way [`Rule::GraphSections`] did, and this is where it says so.
     #[must_use]
     pub const fn starts_on(self) -> bool {
-        !matches!(self, Self::GraphSections)
+        true
     }
 
     /// The rule a settings key names, in any of its spellings.
@@ -287,8 +290,8 @@ impl Rules {
 
     /// Puts one rule back where a fresh database has it, which is what `RESET` means.
     ///
-    /// Not the same as setting it on, because [`Rule::GraphSections`] starts off and a reset that
-    /// turned it on would be a reset that left the database somewhere it has never been.
+    /// Not written as setting it on, because a rule that starts off, as [`Rule::GraphSections`] did,
+    /// would then be reset to somewhere the database has never been.
     ///
     /// # Errors
     ///
@@ -338,25 +341,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_statistics_rule_starts_on_and_the_graph_sections_start_off() {
+    fn every_rule_starts_on_the_graph_sections_included() {
         let rules = Rules::new();
         for rule in Rule::ALL {
-            if rule == Rule::GraphSections || rule == Rule::GraphReduction {
-                assert!(!rules.enabled(rule), "{} should start off", rule.name());
-            } else {
-                assert!(rules.enabled(rule), "{} should start on", rule.name());
-            }
+            assert!(rules.enabled(rule), "{} should start on", rule.name());
         }
         // A fresh database has nothing to report, off switch included.
         assert_eq!(rules.changed().count(), 0);
     }
 
     #[test]
-    fn turning_the_graph_sections_on_is_a_change_worth_reporting() {
+    fn turning_the_graph_sections_off_is_a_change_worth_reporting() {
         let mut rules = Rules::new();
-        rules.set(Rule::GraphSections, true);
-        assert!(rules.enabled(Rule::GraphSections));
-        assert_eq!(rules.changed().collect::<Vec<_>>(), vec![("graph.sections", true)]);
+        rules.set(Rule::GraphSections, false);
+        assert!(!rules.enabled(Rule::GraphSections));
+        assert_eq!(rules.changed().collect::<Vec<_>>(), vec![("graph.sections", false)]);
     }
 
     #[test]

@@ -102,9 +102,9 @@ fn a_rule_switch_reads_back_as_a_boolean() {
 }
 
 #[test]
-fn a_rule_that_starts_off_reads_back_as_off() {
+fn a_rule_that_starts_on_reads_back_as_on() {
     let database = database();
-    assert_eq!(value(&database, "SELECT current_setting('graph.sections')"), Value::Boolean(false));
+    assert_eq!(value(&database, "SELECT current_setting('graph.sections')"), Value::Boolean(true));
 }
 
 #[test]
