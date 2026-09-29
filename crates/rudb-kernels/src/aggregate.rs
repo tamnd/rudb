@@ -65,7 +65,7 @@ use crate::fallback::{self, Kernel};
 use crate::general::{General, Measure};
 use crate::lttb::{Plot, Points};
 use crate::number::{approximate, fit, integral, pow10, rescale};
-use crate::quantile::Column;
+use crate::quantile::{Column, Held};
 use crate::shape::{identity, nulls_of};
 
 /// Where a row that belongs to no accumulator points.
@@ -671,8 +671,13 @@ impl Accumulator {
                 && let Some(column) = Column::of(input, rows)
             {
                 let valid = input.validity();
-                for row in (0..rows).filter(|&row| valid.is_valid(row)) {
-                    general.push_column(column, row, args)?;
+                let nulls = general.keeps_nulls();
+                for row in 0..rows {
+                    if valid.is_valid(row) {
+                        general.push_column(column, row, args)?;
+                    } else if nulls {
+                        general.push_null()?;
+                    }
                 }
                 return Ok(());
             }
@@ -1198,6 +1203,9 @@ pub fn finish_run(
     let Some(first) = at.first() else {
         return Ok(None);
     };
+    if let Some(vector) = finish_lists(states, at, stride, offset, ty)? {
+        return Ok(Some(vector));
+    }
     let reach = |slot: usize| {
         states
             .get(slot * stride + offset)
@@ -1265,6 +1273,95 @@ pub fn finish_run(
 pub fn whole_answers(answers: &[i128], valid: &[bool], ty: &LogicalType) -> Result<Vector> {
     let data = narrow(answers, valid, ty)?;
     Ok(Vector::flat(ty.clone(), data)?.with_validity(Validity::from_run(valid)))
+}
+
+/// The `list` answers of a run as one list vector, when every group holds its list as numbers of
+/// the column's element type.
+///
+/// The elements go end to end into one child column straight from the numbers the groups hold,
+/// where the answer a group at a time is a `Value` per element that the vector then copies back
+/// out. Over twenty million rows in one group that is 1.3 GB of values the answer never needed. A
+/// group that went over to values, or one whose numbers are not of the element type, sends the
+/// whole run back to the answer a group at a time.
+fn finish_lists(
+    states: &[Accumulator],
+    at: &[usize],
+    stride: usize,
+    offset: usize,
+    ty: &LogicalType,
+) -> Result<Option<Vector>> {
+    let LogicalType::List(element) = ty else {
+        return Ok(None);
+    };
+    let reals = **element == LogicalType::Double;
+    let mut lists = Vec::with_capacity(at.len());
+    for &slot in at {
+        let Some(Accumulator { state: State::General(general) }) =
+            states.get(slot * stride + offset)
+        else {
+            return Ok(None);
+        };
+        let Some(list) = general.listed() else {
+            return Ok(None);
+        };
+        match list {
+            Held::Empty => {}
+            Held::Reals(_) if reals => {}
+            Held::Wholes { whole, .. } if !reals && whole.value(0).logical_type() == **element => {}
+            _ => return Ok(None),
+        }
+        lists.push(list);
+    }
+    let mut wholes: Vec<i64> = Vec::new();
+    let mut doubles: Vec<f64> = Vec::new();
+    let mut entries = Vec::with_capacity(lists.len());
+    let mut valid = Vec::with_capacity(lists.len());
+    for list in lists {
+        let start = wholes.len() + doubles.len();
+        match list {
+            Held::Wholes { values, .. } => wholes.extend_from_slice(values),
+            Held::Reals(values) => doubles.extend_from_slice(values),
+            _ => {}
+        }
+        let start = u32::try_from(start)
+            .map_err(|_| Error::internal("a list column with more than u32 elements in it"))?;
+        let len = u32::try_from(wholes.len() + doubles.len())
+            .map_err(|_| Error::internal("a list column with more than u32 elements in it"))?
+            - start;
+        entries.push((start, len));
+        valid.push(!matches!(list, Held::Empty));
+    }
+    let data =
+        if reals { Data::Float64(doubles.into()) } else { listed_numbers(&wholes, element)? };
+    let child = Vector::flat((**element).clone(), data)?;
+    Ok(Some(Vector::list(entries, child)?.with_validity(Validity::from_run(&valid))))
+}
+
+/// Numbers held as `i64` in the width `ty` stores them in, which they were all widened from.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "every number was widened from this type, so it narrows back without loss"
+)]
+fn listed_numbers(numbers: &[i64], ty: &LogicalType) -> Result<Data> {
+    macro_rules! narrowed {
+        ($variant:ident, $native:ty) => {
+            Data::$variant(numbers.iter().map(|&n| n as $native).collect::<Vec<_>>().into())
+        };
+    }
+    Ok(match ty.physical() {
+        PhysicalType::Int8 => narrowed!(Int8, i8),
+        PhysicalType::Int16 => narrowed!(Int16, i16),
+        PhysicalType::Int32 => narrowed!(Int32, i32),
+        PhysicalType::Int64 => Data::Int64(numbers.to_vec().into()),
+        PhysicalType::Int128 => narrowed!(Int128, i128),
+        PhysicalType::UInt8 => narrowed!(UInt8, u8),
+        PhysicalType::UInt16 => narrowed!(UInt16, u16),
+        PhysicalType::UInt32 => narrowed!(UInt32, u32),
+        other => {
+            return Err(Error::internal(format!("a list of whole numbers cannot be {other:?}")));
+        }
+    })
 }
 
 /// A run of whole answers as the layout `ty` stores, which is the check [`fit`] makes per value.
@@ -1551,12 +1648,22 @@ pub fn update_general(
         _ => None,
     };
     if let Some((column, valid)) = column {
-        for row in (0..rows).filter(|&row| valid.is_valid(row)) {
+        let nulls =
+            matches!(&states[offset].state, State::General(general) if general.keeps_nulls());
+        for row in 0..rows {
+            let present = valid.is_valid(row);
+            if !present && !nulls {
+                continue;
+            }
             let Some(index) = into.index(row) else { continue };
             let Some(Accumulator { state: State::General(general) }) = states.get_mut(index) else {
                 return Err(Error::internal(format!("an aggregate state at {index} is not held")));
             };
-            general.push_column(column, row, inputs)?;
+            if present {
+                general.push_column(column, row, inputs)?;
+            } else {
+                general.push_null()?;
+            }
         }
         return Ok(true);
     }
@@ -4535,6 +4642,77 @@ mod tests {
                         by_column[group * STRIDE + OFFSET].finish().expect("finishes"),
                         "{note}, group {group}"
                     );
+                }
+            }
+        }
+    }
+
+    /// A list folded from a column holds what the row loop holds, nulls in their places, and two
+    /// halves combined hold the whole in order.
+    #[test]
+    fn a_list_folds_a_column_the_way_it_folds_a_row() {
+        let mut rng = Rng(0x0015_7ed0_c0de_5eed);
+        let groups = 7;
+        let rows = 161;
+        for ty in
+            [LogicalType::BigInt, LogicalType::Integer, LogicalType::Double, LogicalType::Varchar]
+        {
+            let returns = LogicalType::List(Box::new(ty.clone()));
+            for nulls in [0_usize, 4, 1] {
+                let note = format!("list of {ty}, one null in {nulls}");
+                let columns = vec![flat(&ty, rows, nulls, &mut rng)];
+                let mut slow = Accumulator::new("list", &returns).expect("known");
+                for row in 0..rows {
+                    slow.update(&[columns[0].value_at(row)]).expect("folds");
+                }
+                let mut fast = Accumulator::new("list", &returns).expect("known");
+                fast.update_run(&columns, rows).expect("folds");
+                let whole = slow.finish().expect("finishes");
+                assert_eq!(whole, fast.finish().expect("finishes"), "{note}");
+                let mut front = Accumulator::new("list", &returns).expect("known");
+                let mut back = Accumulator::new("list", &returns).expect("known");
+                for row in 0..rows {
+                    let half = if row < rows / 2 { &mut front } else { &mut back };
+                    half.update(&[columns[0].value_at(row)]).expect("folds");
+                }
+                front.combine(&back).expect("combines");
+                assert_eq!(whole, front.finish().expect("finishes"), "{note}, combined");
+                let slots = deal(rows, groups);
+                let mut by_row: Vec<Accumulator> = (0..groups)
+                    .map(|_| Accumulator::new("list", &returns).expect("known"))
+                    .collect();
+                for (row, &slot) in slots.iter().enumerate() {
+                    if slot != NOWHERE {
+                        by_row[slot].update(&[columns[0].value_at(row)]).expect("folds");
+                    }
+                }
+                let mut by_column: Vec<Accumulator> = (0..groups * STRIDE)
+                    .map(|_| Accumulator::new("list", &returns).expect("known"))
+                    .collect();
+                let took = update_general(&mut by_column, &slots, STRIDE, OFFSET, &columns, rows)
+                    .expect("folds");
+                assert!(took, "{note}");
+                for group in 0..groups {
+                    assert_eq!(
+                        by_row[group].finish().expect("finishes"),
+                        by_column[group * STRIDE + OFFSET].finish().expect("finishes"),
+                        "{note}, group {group}"
+                    );
+                }
+                let at: Vec<usize> = (0..groups).collect();
+                let run = finish_run(&by_column, &at, STRIDE, OFFSET, &returns).expect("finishes");
+                // Only a list of numbers with no nulls in it is written a run at a time, and the
+                // rest are answered a group at a time by the caller.
+                let typed = nulls == 0 && ty != LogicalType::Varchar;
+                assert_eq!(run.is_some(), typed, "{note}");
+                if let Some(run) = run {
+                    for (group, state) in by_row.iter().enumerate() {
+                        assert_eq!(
+                            run.value_at(group),
+                            state.finish().expect("finishes"),
+                            "{note}, group {group} a run at a time"
+                        );
+                    }
                 }
             }
         }
