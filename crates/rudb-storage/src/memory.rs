@@ -119,6 +119,28 @@ enum Slot {
 /// The largest chunk the tail takes. Anything bigger is already a chunk worth its own slot.
 const TAIL_TAKES: usize = 64;
 
+/// One arrival at the tail, as it arrived.
+#[derive(Debug, Clone)]
+enum Piece {
+    /// A small chunk, held as pages.
+    Chunk(Chunk),
+    /// One row, which is what a prepared `INSERT` brings.
+    ///
+    /// Kept as its values rather than as the one-row chunk its statistics were taken from, because
+    /// laying two thousand one-row vectors end to end cost more than building them had, and the
+    /// values are laid into a column in one call when the tail closes.
+    Row(Vec<Value>),
+}
+
+impl Piece {
+    fn len(&self) -> usize {
+        match self {
+            Self::Chunk(chunk) => chunk.len(),
+            Self::Row(_) => 1,
+        }
+    }
+}
+
 /// A table held in memory as row groups, read a chunk at a time.
 #[derive(Debug, Clone)]
 pub struct MemoryTable {
@@ -143,7 +165,7 @@ pub struct MemoryTable {
     /// still arrive as small chunks and their statistics are still taken as they arrive, so the
     /// zone and the counts stay exact, but they sit behind one slot and are laid into one chunk
     /// when there are [`VECTOR_SIZE`] of them, or when a read asks for them.
-    tail: Vec<Chunk>,
+    tail: Vec<Piece>,
     /// How many rows are in `tail`.
     tail_rows: usize,
     /// One per chunk, in the same numbering as `slots`.
@@ -234,23 +256,31 @@ impl MemoryTable {
         if chunk.is_empty() {
             return Ok(());
         }
-        let started = Instant::now();
-        let zone = Zone::of(&chunk);
-        let zoned = Instant::now();
-        self.counts.add(&chunk);
-        self.counts_ns += zoned.elapsed().as_nanos() as u64;
-        self.stats_ns += started.elapsed().as_nanos() as u64;
+        let zone = self.take_stats(&chunk);
         if chunk.len() <= TAIL_TAKES {
-            return self.trail(chunk, zone);
+            // As pages, so that a read of a tail of one chunk shares it the way an open chunk is
+            // shared.
+            return self.trail(Piece::Chunk(chunk.into_pages()), zone);
         }
         self.place(chunk, zone)
     }
 
-    /// Puts a small chunk whose statistics have been taken at the end of the tail.
+    /// The zone of a chunk about to be kept, with the counts told about its rows.
+    fn take_stats(&mut self, chunk: &Chunk) -> Zone {
+        let started = Instant::now();
+        let zone = Zone::of(chunk);
+        let zoned = Instant::now();
+        self.counts.add(chunk);
+        self.counts_ns += zoned.elapsed().as_nanos() as u64;
+        self.stats_ns += started.elapsed().as_nanos() as u64;
+        zone
+    }
+
+    /// Puts a small piece whose statistics have been taken at the end of the tail.
     ///
-    /// The tail's zone is the zones of its chunks folded together, which is what the zone of the
+    /// The tail's zone is the zones of its pieces folded together, which is what the zone of the
     /// one chunk they are read as would have been, and the counts have already seen the rows.
-    fn trail(&mut self, chunk: Chunk, zone: Zone) -> Result<()> {
+    fn trail(&mut self, piece: Piece, zone: Zone) -> Result<()> {
         match &mut self.open_zone {
             Some(open) => open.widen(&zone),
             None => self.open_zone = Some(zone.clone()),
@@ -261,11 +291,11 @@ impl MemoryTable {
         } else if let Some(last) = self.zones.last_mut() {
             last.widen(&zone);
         }
-        self.rows += chunk.len();
-        self.open_rows += chunk.len();
-        self.tail_rows += chunk.len();
-        // As pages, so that a read of a tail of one chunk shares it the way an open chunk is shared.
-        self.tail.push(chunk.into_pages());
+        let rows = piece.len();
+        self.rows += rows;
+        self.open_rows += rows;
+        self.tail_rows += rows;
+        self.tail.push(piece);
         if self.tail_rows >= VECTOR_SIZE {
             self.close_tail()?;
         }
@@ -282,8 +312,12 @@ impl MemoryTable {
         if self.tail.is_empty() {
             return Ok(());
         }
-        let columns: Vec<usize> = (0..self.types.len()).collect();
-        let chunk = self.tail_read(&columns)?;
+        let chunk = if self.tail.iter().all(|piece| matches!(piece, Piece::Row(_))) {
+            self.lay_rows()?
+        } else {
+            let columns: Vec<usize> = (0..self.types.len()).collect();
+            self.tail_read(&columns)?
+        };
         if let Some(last) = self.slots.last_mut() {
             *last = Slot::Open { at: self.open.len() };
         }
@@ -293,41 +327,72 @@ impl MemoryTable {
         Ok(())
     }
 
+    /// A tail of nothing but rows laid into one chunk, the values moved out of the rows rather than
+    /// copied, since the rows are dropped straight after.
+    fn lay_rows(&mut self) -> Result<Chunk> {
+        let mut columns = Vec::with_capacity(self.types.len());
+        let mut values = Vec::with_capacity(self.tail_rows);
+        for (column, ty) in self.types.iter().enumerate() {
+            values.clear();
+            for piece in &mut self.tail {
+                if let Piece::Row(row) = piece {
+                    values.push(
+                        row.get_mut(column)
+                            .map(|value| std::mem::replace(value, Value::Null))
+                            .unwrap_or(Value::Null),
+                    );
+                }
+            }
+            columns.push(Vector::from_values(ty.clone(), &values)?);
+        }
+        Chunk::with_rows(columns, self.tail_rows)
+    }
+
     /// The named columns of the tail, laid end to end.
     ///
-    /// A column the vector crate will not lay, which the flat columns an `INSERT` builds never
-    /// are, is put back together out of its values instead, so a read never fails over a layout.
+    /// A tail of chunks alone is laid by the vector crate. One that holds rows, or a column the
+    /// vector crate will not lay, which the flat columns an `INSERT` builds never are, is put back
+    /// together out of its values instead, so a read never fails over a layout.
     fn tail_read(&self, columns: &[usize]) -> Result<Chunk> {
-        if let [only] = self.tail.as_slice() {
+        if let [Piece::Chunk(only)] = self.tail.as_slice() {
             let mut picked = Vec::with_capacity(columns.len());
             for &column in columns {
                 picked.push(only.column(column)?.clone());
             }
             return Chunk::with_rows(picked, only.len());
         }
+        let chunks = self.tail.iter().all(|piece| matches!(piece, Piece::Chunk(_)));
         let mut picked = Vec::with_capacity(columns.len());
         let mut pieces = Vec::with_capacity(self.tail.len());
         for &column in columns {
             let ty = self.types.get(column).ok_or_else(|| {
                 Error::internal(format!("column {column} of a table that has {}", self.types.len()))
             })?;
-            pieces.clear();
-            for chunk in &self.tail {
-                pieces.push(chunk.column(column)?);
+            if chunks {
+                pieces.clear();
+                for piece in &self.tail {
+                    if let Piece::Chunk(chunk) = piece {
+                        pieces.push(chunk.column(column)?);
+                    }
+                }
+                if let Ok(Some(vector)) = rudb_vector::concat(ty, &pieces) {
+                    picked.push(vector);
+                    continue;
+                }
             }
-            let vector = match rudb_vector::concat(ty, &pieces) {
-                Ok(Some(vector)) => vector,
-                _ => {
-                    let mut values = Vec::with_capacity(self.tail_rows);
-                    for piece in &pieces {
-                        for row in 0..piece.len() {
-                            values.push(piece.try_value_at(row)?);
+            let mut values = Vec::with_capacity(self.tail_rows);
+            for piece in &self.tail {
+                match piece {
+                    Piece::Chunk(chunk) => {
+                        let vector = chunk.column(column)?;
+                        for row in 0..vector.len() {
+                            values.push(vector.try_value_at(row)?);
                         }
                     }
-                    Vector::from_values(ty.clone(), &values)?
+                    Piece::Row(row) => values.push(row.get(column).cloned().unwrap_or(Value::Null)),
                 }
-            };
-            picked.push(vector);
+            }
+            picked.push(Vector::from_values(ty.clone(), &values)?);
         }
         Chunk::with_rows(picked, self.tail_rows)
     }
@@ -866,6 +931,9 @@ impl MemoryTable {
                 )));
             }
         }
+        if let [row] = rows {
+            return self.append_row(row);
+        }
         for batch in rows.chunks(VECTOR_SIZE) {
             let mut columns = Vec::with_capacity(self.types.len());
             for (position, ty) in self.types.iter().enumerate() {
@@ -875,6 +943,22 @@ impl MemoryTable {
             self.append(Chunk::with_rows(columns, batch.len())?)?;
         }
         Ok(())
+    }
+
+    /// Appends one row, which goes to the tail as its values.
+    ///
+    /// The statistics are taken from a one-row chunk of it, the same chunk [`Self::append`] would
+    /// have been handed, so the zone and the counts come out as they would have. It is the laying
+    /// out that waits for the tail to close.
+    fn append_row(&mut self, row: &[Value]) -> Result<()> {
+        let mut columns = Vec::with_capacity(self.types.len());
+        for (value, ty) in row.iter().zip(&self.types) {
+            columns.push(Vector::from_values(ty.clone(), std::slice::from_ref(value))?);
+        }
+        let chunk = Chunk::with_rows(columns, 1)?;
+        self.check(&chunk)?;
+        let zone = self.take_stats(&chunk);
+        self.trail(Piece::Row(row.to_vec()), zone)
     }
 
     /// One chunk's worth of the named columns, in the order they are named.
@@ -1589,6 +1673,59 @@ mod tests {
         assert_eq!(table.chunk_len(2), Some(100));
         let got = every_row(&table);
         assert_eq!(got, (0..rows + 100).map(Value::Integer).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rows_and_small_chunks_in_one_tail_read_and_count_as_a_bulk_load() {
+        let types = vec![
+            LogicalType::BigInt,
+            LogicalType::Double,
+            LogicalType::Varchar,
+            LogicalType::Date,
+            LogicalType::Decimal { width: 12, scale: 2 },
+        ];
+        let row = |id: i64| {
+            let name =
+                if id % 3 == 0 { Value::Null } else { Value::Varchar(format!("s{}", id % 11)) };
+            vec![
+                Value::BigInt(id - 50),
+                Value::Double(id as f64 / 4.0),
+                name,
+                Value::Date(i32::try_from(id).expect("small") * 3),
+                Value::Decimal { unscaled: i128::from(id) * 7, width: 12, scale: 2 },
+            ]
+        };
+        let rows: Vec<Vec<Value>> = (0..700).map(row).collect();
+        let mut mixed = MemoryTable::new(types.clone());
+        let mut at = 0;
+        while at < rows.len() {
+            // Runs of single rows broken up by small chunks of up to forty rows.
+            let take = if at % 5 == 0 { (at % 40 + 2).min(rows.len() - at) } else { 1 };
+            mixed.append_rows(&rows[at..at + take]).expect("rows");
+            at += take;
+        }
+        let mut whole = MemoryTable::new(types.clone());
+        whole.append_rows(&rows).expect("rows");
+        assert_eq!(mixed.chunk_count(), 1);
+        assert_eq!(mixed.zone(0), whole.zone(0));
+        let columns: Vec<usize> = (0..types.len()).collect();
+        let (left, right) =
+            (mixed.read(0, &columns).expect("read"), whole.read(0, &columns).expect("read"));
+        for row in 0..rows.len() {
+            for column in 0..types.len() {
+                assert_eq!(
+                    left.value_at(row, column),
+                    right.value_at(row, column),
+                    "{row} {column}"
+                );
+            }
+        }
+        for column in 0..types.len() {
+            assert_eq!(mixed.distinct_values(column), whole.distinct_values(column));
+            assert_eq!(mixed.null_count(column).ok(), whole.null_count(column).ok());
+            assert_eq!(mixed.exact_extremes(column).ok(), whole.exact_extremes(column).ok());
+            assert_eq!(mixed.exact_sum(column).ok(), whole.exact_sum(column).ok());
+        }
     }
 
     #[test]
