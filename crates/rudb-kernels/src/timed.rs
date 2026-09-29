@@ -46,10 +46,9 @@ impl Timed {
     /// The state's layout, the pin's for each of the two.
     pub(crate) fn layout(argument: &LogicalType) -> Option<LogicalType> {
         match argument {
-            LogicalType::Interval => Some(shape(&[
-                ("count", LogicalType::BigInt),
-                ("value", LogicalType::Interval),
-            ])),
+            LogicalType::Interval => {
+                Some(shape(&[("count", LogicalType::BigInt), ("value", LogicalType::Interval)]))
+            }
             LogicalType::Time
             | LogicalType::TimeTz
             | LogicalType::Timestamp
@@ -100,8 +99,9 @@ impl Timed {
             Self::Micros { total, count, returns } => {
                 let count = i128::from(*count);
                 let rounded = total / count + i128::from(total % count > count / 2);
-                let micros = i64::try_from(rounded)
-                    .map_err(|_| Error::internal(format!("an average of {rounded} microseconds")))?;
+                let micros = i64::try_from(rounded).map_err(|_| {
+                    Error::internal(format!("an average of {rounded} microseconds"))
+                })?;
                 Ok(match returns {
                     LogicalType::Time => Value::Time(micros),
                     LogicalType::TimeTz => Value::TimeTz(micros),
@@ -231,7 +231,10 @@ mod tests {
         // tamnd/duckdb#18: the microseconds left over are added without being divided.
         let values = [span(0, 0, 5), span(0, 0, 0), span(0, 0, 0)];
         assert_eq!(average(&LogicalType::Interval, &values), "00:00:00.000003");
-        assert_eq!(average(&LogicalType::Interval, &[span(0, -3, 0), span(0, 0, 0)]), "-1 day -12:00:00");
+        assert_eq!(
+            average(&LogicalType::Interval, &[span(0, -3, 0), span(0, 0, 0)]),
+            "-1 day -12:00:00"
+        );
     }
 
     #[test]

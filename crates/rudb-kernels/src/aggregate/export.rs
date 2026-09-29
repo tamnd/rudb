@@ -69,7 +69,7 @@ pub fn state_layout(
         "min" | "max" | "bool_and" | "bool_or" | "bit_and" | "bit_or" | "bit_xor" | "product"
         | "count_if" => returns.clone(),
         "list" | "string_agg" => returns.clone(),
-        "quantile_cont" | "quantile_disc" | "median" => match arguments.first() {
+        "quantile_cont" | "quantile_disc" | "median" | "mad" => match arguments.first() {
             Some(ty) => LogicalType::List(Box::new(ty.clone())),
             None => return Err(not_written(name)),
         },

@@ -12508,6 +12508,61 @@ fn avg_over_a_time_a_timestamp_or_an_interval_answers_in_that_type() {
     assert_eq!(error.message(), "Overflow in addition of INT32 (2000000000 + 2000000000)!");
 }
 
+/// `sum` over BOOLEAN counts the true values into a HUGEINT, `mad` exports the values it holds
+/// the way `median` does, and a `UNION ALL` of two states keeps the left one's type, all against
+/// answers taken from the pin.
+#[test]
+fn sum_of_booleans_the_mad_state_and_a_union_of_two_states_match_the_pin() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    db.execute("SET threads=1").unwrap();
+    for (sql, answer) in [
+        ("SELECT typeof(sum(true) EXPORT_STATE)", "AGGREGATE_STATE"),
+        (
+            "SELECT sum(x), typeof(sum(x)) FROM (VALUES (true), (false), (true), (NULL)) t(x)",
+            "2|HUGEINT",
+        ),
+        ("SELECT finalize(sum(x) EXPORT_STATE) FROM (VALUES (true), (false), (true)) t(x)", "2"),
+        (
+            "SELECT (mad(v) EXPORT_STATE)::VARCHAR, finalize(mad(v) EXPORT_STATE) \
+             FROM (VALUES (1), (1), (5)) t(v)",
+            "[1.0, 1.0, 5.0]|0.0",
+        ),
+        (
+            "SELECT (mad(v) EXPORT_STATE)::VARCHAR, finalize(mad(v) EXPORT_STATE) \
+             FROM (VALUES (1.5), (1.0), (5.25)) t(v)",
+            "[1.50, 1.00, 5.25]|0.50",
+        ),
+        ("SELECT (mad(v) EXPORT_STATE)::VARCHAR FROM (SELECT 1 v WHERE false)", "NULL"),
+        (
+            "WITH states AS (SELECT k, mad(v) EXPORT_STATE AS s \
+             FROM (VALUES (1, 1), (1, 1), (2, 42), (2, 42)) t(k, v) GROUP BY k) \
+             SELECT finalize(combine_aggr(s, CASE k WHEN 1 THEN 3 ELSE 2 END)) FROM states",
+            "0.0",
+        ),
+        (
+            "SELECT finalize(combine_aggr(s)) FROM (\
+             SELECT min({'a': v}) EXPORT_STATE AS s FROM (VALUES (3)) t(v) UNION ALL \
+             SELECT min({'a': v}) EXPORT_STATE AS s \
+             FROM (SELECT NULL::struct(a int) AS v WHERE false) t) t",
+            "{'a': 3}",
+        ),
+        (
+            "SELECT finalize(s) FROM (SELECT sum(1) EXPORT_STATE AS s UNION ALL \
+             SELECT sum(2.5) EXPORT_STATE)",
+            "1;25",
+        ),
+    ] {
+        assert_eq!(text(sql), answer, "{sql}");
+    }
+}
+
 #[test]
 fn combine_aggr_folds_states_as_many_times_as_it_is_told() {
     let db = Database::new();

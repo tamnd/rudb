@@ -1332,6 +1332,16 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     if let Some((cast_to, returns)) = bitstring(entry.name, arguments) {
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
     }
+    // The pin keeps one sum over BOOLEAN, which counts the true values into a HUGEINT, and no
+    // other numeric aggregate takes a boolean.
+    if entry.name == "sum" && arguments == [LogicalType::Boolean] {
+        return Ok(Resolved {
+            name: entry.name,
+            kind: entry.kind,
+            arguments: vec![LogicalType::Integer],
+            returns: LogicalType::HugeInt,
+        });
+    }
     if entry.numeric_only {
         for ty in arguments {
             // A null literal has no type yet and every function accepts one, since the alternative
