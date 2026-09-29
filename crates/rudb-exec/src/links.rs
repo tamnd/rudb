@@ -1,9 +1,10 @@
 //! `rudb_links()`, the table that says what the graph layer knows about this database.
 //!
-//! One row per declared relationship. What is declared comes from the tables' foreign keys and from
+//! One row per declared relationship. What is declared comes from the tables' foreign keys, from
 //! the session, because `SET graph_links` is where a relationship is declared for tables that
-//! arrived from Parquet and Parquet has no foreign keys to read one out of. What is stored comes from the tables themselves,
-//! so a row is a declaration on the left and a measurement on the right, and the two are never
+//! arrived from Parquet and Parquet has no foreign keys to read one out of, and from the links a
+//! file kept from a session like that, which [`known`] says more about. What is stored comes from
+//! the tables themselves, so a row is a declaration on the left and a measurement on the right, and the two are never
 //! mixed: section 2.3 of spec/graph/02-the-data-model.md says a declaration is what somebody
 //! believes and a build is what is true.
 //!
@@ -39,7 +40,7 @@ pub(crate) fn links(
     // through. A session filled in by something other than the settings layer is the other caller,
     // and a declaration it could not parse is one no build will have acted on either, so the table
     // says nothing about it rather than refusing to be read.
-    let declared = declared(catalog, session.links());
+    let declared = known(catalog, session.links());
     let mut rows = Vec::with_capacity(declared.len());
     for link in &declared {
         rows.push(row(catalog, link));
@@ -84,18 +85,68 @@ pub fn declared(catalog: &Catalog, setting: &str) -> Vec<Relationship> {
                 continue;
             };
             let Ok(link) = Relationship::declare(child, parent) else { continue };
-            let named_already = declared.iter().any(|held| {
-                held.child.table.eq_ignore_ascii_case(&link.child.table)
-                    && held.parent.table.eq_ignore_ascii_case(&link.parent.table)
-                    && same_columns(&held.child.columns, &link.child.columns)
-                    && same_columns(&held.parent.columns, &link.parent.columns)
-            });
-            if !named_already {
+            if !named(&declared, &link) {
                 declared.push(link);
             }
         }
     }
     declared
+}
+
+/// Every relationship [`declared`] gives, then one for each link or adjacency a table's file holds
+/// that none of those names.
+///
+/// What the planner plans over and what `rudb_links()` lists. A `SET graph_links` lasts as long as
+/// the session that set it, and the links a CHECKPOINT built from it last as long as the file, so
+/// without this a file loaded from Parquet had its links read by the scan on every later open and
+/// its relationships known to the planner on none of them. Each one here was declared once and
+/// checked by the build that stored it, and a plan reads a link only after checking it is still
+/// bound to the parent as it is now, so none of this can change an answer.
+///
+/// Not what a CHECKPOINT builds from, which stays [`declared`]. A relationship known only from its
+/// stored link has that link already, and building it again on every checkpoint would be work for
+/// nothing.
+#[must_use]
+pub fn known(catalog: &Catalog, setting: &str) -> Vec<Relationship> {
+    let mut known = declared(catalog, setting);
+    for table in catalog.tables() {
+        let Rows::Native(rows) = table.rows() else { continue };
+        for (child_key, parent, parent_key) in rudb_native::graph::stored_relationships(rows) {
+            let Some(parent) = table_named(catalog, &parent) else { continue };
+            let names = |on: &Table, key: usize| {
+                rudb_native::graph::columns_of(key)
+                    .into_iter()
+                    .map(|at| on.columns().get(at).map(|field| field.name.clone()))
+                    .collect::<Option<Vec<String>>>()
+            };
+            let (Some(child_columns), Some(parent_columns)) =
+                (names(table, child_key), names(parent, parent_key))
+            else {
+                continue;
+            };
+            let (Ok(child), Ok(parent)) = (
+                Side::composite(table.name().table.clone(), child_columns),
+                Side::composite(parent.name().table.clone(), parent_columns),
+            ) else {
+                continue;
+            };
+            let Ok(link) = Relationship::declare(child, parent) else { continue };
+            if !named(&known, &link) {
+                known.push(link);
+            }
+        }
+    }
+    known
+}
+
+/// Whether the list already holds this relationship, the same tables and the same columns.
+fn named(held: &[Relationship], link: &Relationship) -> bool {
+    held.iter().any(|held| {
+        held.child.table.eq_ignore_ascii_case(&link.child.table)
+            && held.parent.table.eq_ignore_ascii_case(&link.parent.table)
+            && same_columns(&held.child.columns, &link.child.columns)
+            && same_columns(&held.parent.columns, &link.parent.columns)
+    })
 }
 
 fn same_columns(left: &[String], right: &[String]) -> bool {
