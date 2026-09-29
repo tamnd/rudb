@@ -22,7 +22,7 @@ pub mod undo;
 pub mod zone;
 
 pub use count::{Counting, Counts, Partial};
-pub use deletes::{DeleteVector, Refusal};
+pub use deletes::{DeleteVector, Refusal, Write};
 pub use grams::Grams;
 pub use hot::{HotStripe, Lease, Width};
 pub use memory::MemoryTable;

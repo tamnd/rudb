@@ -255,16 +255,43 @@ fn set(mask: &mut [u64; PART_WORDS], bit: u32) {
     mask[bit as usize / 64] |= 1 << (bit % 64);
 }
 
-/// Why a delete was refused.
+/// Why an update or a delete of a row was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// The row was already deleted as the deleting transaction sees it, by itself or by a commit
+    /// The row was already deleted as the writing transaction sees it, by itself or by a commit
     /// in its snapshot. The statement would not have found the row, so this is a caller's bug
     /// rather than a thing to tell the user.
     Gone,
-    /// Another transaction deleted the row first: it holds an uncommitted delete of it, or
-    /// committed one after this transaction's snapshot. First writer wins, so this one aborts.
+    /// Another transaction wrote the row first: it holds the row, or committed a change to it
+    /// after this transaction's snapshot. First writer wins, so this one aborts.
     Conflict,
+}
+
+/// The kind of write a statement made, which is what picks the text of its conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Write {
+    /// An `UPDATE`, or the update half of an upsert.
+    Update,
+    /// A `DELETE`.
+    Delete,
+}
+
+impl Write {
+    /// The error a write of this kind fails with when its row was refused as a
+    /// [`Refusal::Conflict`].
+    ///
+    /// The text is the pin's and depends only on the write that came second. Which kind of write
+    /// came first does not matter, because an update and a delete take the same row lock. That is
+    /// where rudb and the pin part: the pin checks an update only against updates and a delete
+    /// only against deletes, so an update and a delete of one row both commit and the update is
+    /// lost. rudb refuses the second one, `engine-v4/18-compat.md` section 18.8.
+    #[must_use]
+    pub fn conflict(self) -> Error {
+        Error::transaction(match self {
+            Self::Update => "Conflict on update!",
+            Self::Delete => "Conflict on tuple deletion!",
+        })
+    }
 }
 
 /// A frozen stripe's deletes: the base from its last checkpoint and the list since.
