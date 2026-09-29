@@ -380,7 +380,7 @@ pub fn distinct_per_group(
     if counted.rows() != rows {
         return Ok(None);
     }
-    let Some((low, slots)) = group_slots(reader, group) else { return Ok(None) };
+    let Some((low, width)) = group_span(reader, group) else { return Ok(None) };
     let parts = reader.parts();
     let mut starts = Vec::with_capacity(parts + 1);
     let mut first = 0;
@@ -393,9 +393,43 @@ pub fn distinct_per_group(
         return Ok(None);
     }
     let workers = workers.max(1);
+    let each = parts.div_ceil(workers).max(1);
+
+    // Which values the group holds, so that each gets a slot of its own in value order however
+    // far apart they are. `RegionID` spans 131 thousand values and holds four thousand of them.
+    let seen = std::thread::scope(|scope| {
+        let handles = (0..parts)
+            .step_by(each)
+            .map(|from| {
+                let span = from..(from + each).min(parts);
+                scope.spawn(move || values_held(reader, group, span, low, width))
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().map_err(|_| invalid("a group read worker panicked"))?)
+            .collect::<Result<Vec<_>>>()
+    })?;
+    let mut held = vec![0_u64; width.div_ceil(64)];
+    for one in seen {
+        let Some(one) = one else { return Ok(None) };
+        for (word, bits) in held.iter_mut().zip(one) {
+            *word |= bits;
+        }
+    }
+    let mut dense = vec![0_u16; width];
+    let mut keys = Vec::new();
+    for (at, slot) in dense.iter_mut().enumerate() {
+        if held[at / 64] >> (at % 64) & 1 == 1 {
+            keys.push(low + at as i64);
+            let Ok(next) = u16::try_from(keys.len()) else { return Ok(None) };
+            *slot = next;
+        }
+    }
+    let slots = keys.len() + 1;
+    let dense = &dense;
 
     // Every row's slot, each thread writing the rows of its own run of parts.
-    let each = parts.div_ceil(workers).max(1);
     let mut of_row = vec![0_u16; rows];
     let read = std::thread::scope(|scope| {
         let mut rest = of_row.as_mut_slice();
@@ -405,7 +439,7 @@ pub fn distinct_per_group(
             let (mine, after) = rest.split_at_mut(starts[span.end] - starts[span.start]);
             rest = after;
             let starts = &starts;
-            let place = Place { group, folded, low, slots };
+            let place = Place { group, folded, low, dense, slots };
             handles.push(scope.spawn(move || read_slots(reader, &place, span, starts, mine)));
         }
         handles
@@ -485,16 +519,17 @@ pub fn distinct_per_group(
         if rows == 0 {
             continue;
         }
-        let key = if slot == 0 { None } else { Some(low + (slot - 1) as i64) };
+        let key = if slot == 0 { None } else { Some(keys[slot - 1]) };
         let folds = tally.folds[slot * width..(slot + 1) * width].to_vec();
         out.push(Group { key, rows, distinct, folds });
     }
     Ok(Some(out))
 }
 
-/// The widest range of group values [`distinct_per_group`] indexes, so that a row's slot is two
-/// bytes and the slots of a million rows fit in two megabytes of cache.
-const MOST_GROUP_SLOTS: i128 = 1 << 16;
+/// The widest range of group values [`distinct_per_group`] looks up a slot in, a million, which
+/// is two megabytes of slots. The values held are fewer, since a slot is two bytes, so that the
+/// slots of a million rows fit in two megabytes of cache.
+const MOST_GROUP_VALUES: i128 = 1 << 20;
 
 /// The columns [`read_slots`] reads and where their slots start.
 #[derive(Clone, Copy)]
@@ -502,6 +537,8 @@ struct Place<'a> {
     group: usize,
     folded: &'a [usize],
     low: i64,
+    /// The slot of each value from `low` up, zero for one the group does not hold.
+    dense: &'a [u16],
     slots: usize,
 }
 
@@ -521,7 +558,7 @@ fn read_slots(
     starts: &[usize],
     out: &mut [u16],
 ) -> Result<Option<Tally>> {
-    let Place { group, folded, low, slots } = *place;
+    let Place { group, folded, low, dense, slots } = *place;
     let width = folded.len();
     let mut tally = Tally { rows: vec![0; slots], folds: vec![Fold::EMPTY; slots * width] };
     let mut block = Vec::new();
@@ -539,8 +576,9 @@ fn read_slots(
             *slot = if has_nulls && vector.is_null_at(at) {
                 0
             } else {
-                match value.checked_sub(low).and_then(|gap| usize::try_from(gap).ok()) {
-                    Some(gap) if gap + 1 < slots => gap as u16 + 1,
+                let gap = value.checked_sub(low).and_then(|gap| usize::try_from(gap).ok());
+                match gap.and_then(|gap| dense.get(gap)) {
+                    Some(&slot) if slot != 0 => slot,
                     _ => return Ok(None),
                 }
             };
@@ -563,9 +601,9 @@ fn read_slots(
     Ok(Some(tally))
 }
 
-/// The lowest value of `group` over every stripe and the slots from the null one up to the highest,
-/// or `None` when a stripe records no integer range for it or the range is too wide to index.
-fn group_slots(reader: &Reader, group: usize) -> Option<(i64, usize)> {
+/// The lowest value of `group` over every stripe and how many values there are from it up to the
+/// highest, or `None` when a stripe records no integer range for it or the range is too wide.
+fn group_span(reader: &Reader, group: usize) -> Option<(i64, usize)> {
     let (mut low, mut high) = (None::<i128>, None::<i128>);
     for stripe in reader.table().stripes() {
         let range = stripe.zone().column(group)?;
@@ -578,9 +616,41 @@ fn group_slots(reader: &Reader, group: usize) -> Option<(i64, usize)> {
         low = Some(low.map_or(*from, |low| low.min(*from)));
         high = Some(high.map_or(*to, |high| high.max(*to)));
     }
-    let (Some(low), Some(high)) = (low, high) else { return Some((0, 1)) };
-    let span = high - low + 2;
-    (span <= MOST_GROUP_SLOTS).then_some((i64::try_from(low).ok()?, span as usize))
+    let (Some(low), Some(high)) = (low, high) else { return Some((0, 0)) };
+    let width = high - low + 1;
+    (width <= MOST_GROUP_VALUES).then_some((i64::try_from(low).ok()?, width as usize))
+}
+
+/// Which of the `width` values from `low` up the group column holds in `parts`, a bit each, or
+/// `None` when it is not read as signed integers or holds one outside them.
+fn values_held(
+    reader: &Reader,
+    group: usize,
+    parts: Range<usize>,
+    low: i64,
+    width: usize,
+) -> Result<Option<Vec<u64>>> {
+    let mut held = vec![0_u64; width.div_ceil(64)];
+    let mut block = Vec::new();
+    for part in parts {
+        let len = reader.part_rows(part);
+        let read = reader.read(part, &[group])?;
+        let vector = read.column(0)?;
+        if vector.len() != len || !vector.signed_block(&mut block) || block.len() < len {
+            return Ok(None);
+        }
+        let has_nulls = vector.validity().has_nulls(len);
+        for (at, &value) in block[..len].iter().enumerate() {
+            if has_nulls && vector.is_null_at(at) {
+                continue;
+            }
+            match value.checked_sub(low).and_then(|gap| usize::try_from(gap).ok()) {
+                Some(gap) if gap < width => held[gap / 64] |= 1 << (gap % 64),
+                _ => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(held))
 }
 
 #[cfg(test)]
