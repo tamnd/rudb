@@ -50,6 +50,7 @@
 //! | call | becomes |
 //! |---|---|
 //! | `count_star()` | `n` |
+//! | `count(e)` | `n` when `e` is not null, and 0 when it is |
 //! | `min(e)` | `e` |
 //! | `max(e)` | `e` |
 //! | `sum(e)` | `e * n` |
@@ -76,9 +77,8 @@
 //! this cannot help, and it is the other half of issue #1076: it wants a change in the operator
 //! rather than in the plan.
 //!
-//! `DISTINCT`, a `FILTER` on one of the calls, and `count(e)`. All three can be written out the same
-//! way and none of them is what any measured query does, so they are refused here rather than written
-//! untested.
+//! `DISTINCT` and a `FILTER` on one of the calls. Both can be written out the same way and neither
+//! is what any measured query does, so they are refused here rather than written untested.
 //!
 //! `sum` and `avg` over anything that is not an integer, because a `DOUBLE` added up n times and a
 //! `DOUBLE` multiplied by n are not the same number.
@@ -86,30 +86,24 @@
 //! A volatile expression, which would go from once per row to once per group, and anything that is
 //! not elementwise, which cannot move between two operators at all.
 //!
-//! # Why there is no second stage
+//! # The second stage
 //!
-//! The obvious next step is the case where the group expression is a function of the column rather
-//! than the column: group on the column first so the function runs once per distinct value, then
-//! group on the function. ClickBench query 29 is that shape, and it was built and measured and it
-//! lost. Grouping on the referer first and on `regexp_replace` of it second took 4.62 s against 2.49 s
-//! for the plan that groups on the regular expression directly, because the first stage has to hand
-//! nineteen million resolved strings to the second and that costs more than the sixty one million
-//! regular expression calls it saves. The second stage is only cheap when its own grouping is cheap,
-//! and when its own grouping is cheap the plan without it was never the expensive one. It is not
-//! here because the measurement said not to ship it.
+//! When the group expression is a function of the column rather than the column, [`crate::pregroup`]
+//! groups on the column first and on the function of it second, and hands the first grouping to
+//! this pass straight away so that it becomes the count above. The average it splits into a sum and
+//! a `count(e)` is why `count(e)` is answered here.
 
-use rudb_common::{LogicalType, Result, Span};
-use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice};
+use rudb_common::{LogicalType, Result, Span, Value};
+use rudb_plan::{Arm, ColumnBinding, CompareOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 
 use crate::pass::{Context, Pass};
 use crate::walk;
 
 /// The aggregates that can be written in terms of one value and how many rows held it.
 ///
-/// `count` is not here: see the refusals in the module documentation. An aggregate that reported
-/// which row arrived first would not belong here either, because a count says how many rows a value
-/// stood for and not which rows they were.
-const ANSWERABLE: [&str; 5] = ["avg", "count_star", "max", "min", "sum"];
+/// An aggregate that reported which row arrived first would not belong here, because a count says
+/// how many rows a value stood for and not which rows they were.
+const ANSWERABLE: [&str; 6] = ["avg", "count", "count_star", "max", "min", "sum"];
 
 /// Turns an aggregate that only reads its own group key into a projection over a count.
 #[derive(Debug, Clone, Copy)]
@@ -140,7 +134,7 @@ pub fn collapse_all(plan: &mut Plan) {
 }
 
 /// The collapsed form of `at` when it is an aggregate this applies to, and nothing when it is not.
-fn collapse(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
+pub(crate) fn collapse(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
     let Node::Aggregate { input, index, groups, aggregates } = *plan.node(at) else { return None };
     let keys = plan.expr_list(groups).to_vec();
     let calls = plan.expr_list(aggregates).to_vec();
@@ -221,6 +215,10 @@ fn answers(
         let argument = plan.expr_list(args).first().copied();
         let written = match name.as_str() {
             "count_star" => count,
+            "count" => {
+                let each = replace(plan, argument?, source, value);
+                counted(plan, each, count, span)
+            }
             "min" | "max" => replace(plan, argument?, source, value),
             "sum" => {
                 let each = replace(plan, argument?, source, value);
@@ -296,6 +294,20 @@ fn weighted(plan: &mut Plan, each: ExprRef, weight: ExprRef, span: Span) -> Opti
     let right = cast(plan, weight, &LogicalType::HugeInt, span);
     let product = scalar(plan, "*", &[left, right], span)?;
     (plan.expr_type(product) == &LogicalType::HugeInt).then_some(product)
+}
+
+/// `weight` where `each` is not null and 0 where it is, which is how many of the rows `count(each)`
+/// would have counted, since every row of the group holds the same `each`.
+fn counted(plan: &mut Plan, each: ExprRef, weight: ExprRef, span: Span) -> ExprRef {
+    let ty = plan.expr_type(each).clone();
+    let null = plan.add_value(Value::Null);
+    let null = plan.add_expr_at(Expr::Constant(null), ty, span);
+    let present = Expr::Compare { op: CompareOp::DistinctFrom, left: each, right: null };
+    let present = plan.add_expr_at(present, LogicalType::Boolean, span);
+    let zero = plan.add_value(Value::BigInt(0));
+    let zero = plan.add_expr_at(Expr::Constant(zero), LogicalType::BigInt, span);
+    let arms = plan.add_arms(&[Arm { when: present, then: weight }]);
+    plan.add_expr_at(Expr::Case { arms, otherwise: Some(zero) }, LogicalType::BigInt, span)
 }
 
 /// `total` over `seen` as a `DOUBLE`, which is how `rudb-kernels` finishes an exact mean.
@@ -384,6 +396,19 @@ mod tests {
         assert!(after.contains("\"*\"("), "the total carries the count: {after}");
         assert!(after.contains("\"/\"("), "one division at the end: {after}");
         assert!(!after.contains("avg("), "{after}");
+    }
+
+    #[test]
+    fn a_count_of_an_expression_over_the_group_key_is_the_count_where_it_is_not_null() {
+        let after = collapsed(concat!(
+            "Aggregate #1 groups=[#0.0::VARCHAR] aggregates=[count(length(#0.0::VARCHAR)::BIGINT)::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [a::VARCHAR, b::INTEGER]\n",
+        ));
+        assert!(
+            after.contains("CASE WHEN (length(#2.0::VARCHAR)::BIGINT IS DISTINCT FROM NULL::BIGINT)::BOOLEAN THEN #2.1::BIGINT ELSE 0::BIGINT END"),
+            "{after}"
+        );
+        assert!(after.contains("aggregates=[count_star()::BIGINT]"), "{after}");
     }
 
     #[test]
