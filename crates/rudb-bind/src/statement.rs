@@ -917,6 +917,9 @@ fn create_table(
                 )));
             }
             let ty = read_type(catalog, text)?;
+            if ty == LogicalType::Type {
+                return Err(Error::invalid_input("A table cannot be created with a 'TYPE' column"));
+            }
             let column = ast.string(def.name);
             columns.push(if def.not_null {
                 Field::required(column, ty)

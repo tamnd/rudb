@@ -4227,9 +4227,13 @@ impl<'a> Transform<'a> {
             let names = self.part_slice(names);
             let values = self.expr_slice(args.split_off(1));
             args.push(self.push(Expr::Struct { names, values }));
-        } else if called == "unnest" && over == NONE && !names.is_empty() {
+        } else if matches!(called.as_str(), "unnest" | "make_type")
+            && over == NONE
+            && !names.is_empty()
+        {
             // `unnest(l, recursive := true)` keeps its options beside the call, where the binder
-            // looks for them, and the call itself is the positional arguments alone.
+            // looks for them, and the call itself is the positional arguments alone. The fields
+            // of `make_type('STRUCT', a := t)` are kept the same way.
             let values = args.split_off(args.len() - names.len());
             let named: Vec<Target> =
                 names.into_iter().zip(values).map(|(alias, expr)| Target { expr, alias }).collect();

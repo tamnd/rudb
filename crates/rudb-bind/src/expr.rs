@@ -107,6 +107,20 @@ impl Binder<'_> {
                 let args = ast.expr_list(args).to_vec();
                 self.bind_unnest(ast, expr, &args, scope)
             }
+            ast::Expr::Function { name, args, distinct, filter }
+                if name.len == 1
+                    && !distinct
+                    && filter == NONE
+                    && ["make_type", "get_type"].iter().any(|called| {
+                        rudb_catalog::same_name(ast.name(name).last().unwrap_or_default(), called)
+                    }) =>
+            {
+                let written = ast.name(name).last().unwrap_or_default().to_string();
+                match self.type_call(ast, expr, &written, args, scope)? {
+                    Some(folded) => Ok(folded),
+                    None => self.bind_call(ast, name, args, distinct, filter, &[], scope),
+                }
+            }
             ast::Expr::Function { name, args, distinct, filter } => {
                 let sorted = ast.aggregate_order(expr);
                 // Only an aggregate reads this, and the pin lets any other call write it and

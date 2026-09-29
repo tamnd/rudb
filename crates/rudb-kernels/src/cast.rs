@@ -981,6 +981,11 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
         }
         LogicalType::Interval => to_interval(value),
         LogicalType::Uuid => to_uuid(value),
+        // A type is only ever made by `make_type` and `get_type`, and the pin has no cast to one.
+        LogicalType::Type => Err(Error::conversion(format!(
+            "Unimplemented type for cast ({} -> TYPE)",
+            value.logical_type()
+        ))),
         // An enum value is its string, so a string that is one of the list is already the answer
         // and anything else that is not a string has no cast here, as it has none in the pin.
         LogicalType::Enum(labels) => match value {

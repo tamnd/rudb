@@ -31,6 +31,7 @@ mod scope;
 mod state;
 mod statement;
 mod structs;
+mod typed;
 mod unnest;
 
 pub use binder::{bind, bind_sql, bind_sql_with, bind_with};

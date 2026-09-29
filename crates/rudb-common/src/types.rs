@@ -143,6 +143,12 @@ pub enum LogicalType {
     /// `combine` can pick the aggregate back up. Every value of the type is a value of the layout,
     /// and a vector of it is a vector of the layout, which is what [`LogicalType::storage`] says.
     AggregateState(Arc<StateType>),
+    /// `TYPE`, a type as a value, which is what `make_type` and `get_type` answer.
+    ///
+    /// A value of it is the type's canonical text held as a string, which is all anything does with
+    /// one: `to_aggregate_state` reads a list of them as the types it names, and a cast to `VARCHAR`
+    /// prints them. A table cannot have a column of it, as the pin's cannot.
+    Type,
 }
 
 /// The call an [`LogicalType::AggregateState`] came from and the shape its state is written in.
@@ -368,7 +374,7 @@ impl LogicalType {
                 10..=18 => PhysicalType::Int64,
                 _ => PhysicalType::Int128,
             },
-            Self::Varchar | Self::Blob | Self::Bit => PhysicalType::Varlen,
+            Self::Varchar | Self::Blob | Self::Bit | Self::Type => PhysicalType::Varlen,
             Self::Interval => PhysicalType::Interval,
             // A map is a list of two-field structs, which is how Arrow does it and how every
             // engine that has to interoperate with Arrow ends up doing it.
@@ -739,6 +745,7 @@ impl fmt::Display for LogicalType {
             Self::Struct(fields) => write_fields(f, "STRUCT", fields),
             Self::Union(fields) => write_fields(f, "UNION", fields),
             Self::AggregateState(_) => f.write_str("AGGREGATE_STATE"),
+            Self::Type => f.write_str("TYPE"),
             Self::Enum(labels) => {
                 f.write_str("ENUM(")?;
                 for (index, label) in labels.iter().enumerate() {
@@ -1377,6 +1384,7 @@ fn alias(upper: &str) -> Option<LogicalType> {
         "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => LogicalType::Blob,
         "BIT" | "BITSTRING" => LogicalType::Bit,
         "UUID" | "GUID" => LogicalType::Uuid,
+        "TYPE" => LogicalType::Type,
         "DATE" => LogicalType::Date,
         "TIMETZ" => LogicalType::TimeTz,
         "DATETIME" | "TIMESTAMP_US" => LogicalType::Timestamp,
@@ -1564,6 +1572,7 @@ mod tests {
             LogicalType::Blob,
             LogicalType::Bit,
             LogicalType::Uuid,
+            LogicalType::Type,
             LogicalType::Date,
             LogicalType::Time,
             LogicalType::TimeTz,
