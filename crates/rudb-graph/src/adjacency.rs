@@ -25,11 +25,24 @@ use rudb_encoding::bitpack;
 
 use crate::bits::BitVector;
 use crate::rid::{NO_PARENT, Rid};
-use crate::rids::Rids;
+use crate::rids::{Rids, ones_from, past_zeros};
 use crate::tail::Tail;
 
 /// The payload layout version.
 const LAYOUT: u8 = 1;
+
+/// A member more than this many parents past the last one is found with a select rather than by
+/// reading on through the starts to it.
+///
+/// Reading on costs a word of the starts for every sixty four bits passed, and each parent passed
+/// is a zero and its children ones. On the IMDb load's cast_info, about fourteen children a movie,
+/// a thousand parents is a few hundred words, which is about what one select costs.
+const FAR: u64 = 1024;
+
+/// Child rows a bucket of [`Adjacency::push`] covers, which is eight kilobytes of its bitmap.
+///
+/// A row within a bucket fits a `u16`, so this is at most its range.
+const BUCKET_ROWS: usize = 1 << 16;
 
 /// Bytes of fixed header at the front of a backward adjacency payload.
 ///
@@ -165,10 +178,18 @@ impl Adjacency {
 
     /// How many children the parents of `held` have between them, without reading a child row.
     ///
-    /// Two selects a member, for a caller deciding whether [`Self::push`] is worth its gathers.
-    #[must_use]
-    pub fn reached(&self, held: &Rids) -> u64 {
-        held.iter().filter_map(|parent| self.list(parent)).map(|list| count(list.len())).sum()
+    /// A walk over the starts, for a caller deciding whether [`Self::push`] is worth its gathers.
+    ///
+    /// # Errors
+    ///
+    /// If `held` is not a set over the parent table.
+    pub fn reached(&self, held: &Rids) -> Result<u64> {
+        let mut reached = 0;
+        self.lists(held, |list| {
+            reached += count(list.len());
+            Ok(())
+        })?;
+        Ok(reached)
     }
 
     /// The child rows that point into `held`, which is a set over the parent table.
@@ -178,10 +199,54 @@ impl Adjacency {
     /// sorting the lists together cost a log a child, and the result is the exact set a forward
     /// push of `held` through the link would give.
     ///
+    /// The bits are not set as the lists are read. A child table in another order than its parent
+    /// puts each child of a list anywhere in a bitmap of megabytes, and setting its bit there is a
+    /// trip to memory. So the children are first dealt into one bucket per [`BUCKET_ROWS`] of
+    /// them, which writes to the ends of a few hundred lists that stay in the cache, and then each
+    /// bucket sets its bits in a stretch of the bitmap small enough to stay in the cache while it
+    /// does.
+    ///
     /// # Errors
     ///
     /// If `held` is not a set over the parent table.
     pub fn push(&self, held: &Rids) -> Result<Rids> {
+        let mut words = vec![0_u64; usize::try_from(self.children.div_ceil(64)).unwrap_or(0)];
+        let mut buckets = vec![Vec::new(); words.len().div_ceil(BUCKET_ROWS / 64)];
+        self.lists(held, |list| {
+            for at in list {
+                let child = bitpack::tail_at(&self.rows, self.width, at)?;
+                let bucket = buckets
+                    .get_mut(usize::try_from(child).unwrap_or(usize::MAX) / BUCKET_ROWS)
+                    .ok_or_else(|| malformed(format!("child {child} past the end")))?;
+                #[expect(clippy::cast_possible_truncation, reason = "the row within its bucket")]
+                bucket.push((child % BUCKET_ROWS as u64) as u16);
+            }
+            Ok(())
+        })?;
+        for (words, bucket) in words.chunks_mut(BUCKET_ROWS / 64).zip(&buckets) {
+            for &row in bucket {
+                let row = usize::from(row);
+                *words.get_mut(row / 64).ok_or_else(|| malformed("a child past the end"))? |=
+                    1 << (row % 64);
+            }
+        }
+        Rids::from_words(self.children, words)
+    }
+
+    /// Hands `each` the list of every member of `held`, in rising order of parent.
+    ///
+    /// The members come in order, so the next list starts a few zeros on from where the last one
+    /// ended, and the walk reads on through the starts to it a word at a time. Two selects a member
+    /// was a binary search and a scan each. With 36 million children in no order against 2.5
+    /// million parents, the shape of cast_info against title, and one parent in a hundred held,
+    /// the selects and the scattered bits made the push four times slower than this walk and the
+    /// buckets. A member far past the last one is still found with a select, because reading on to
+    /// it would be a pass over the words between.
+    fn lists(
+        &self,
+        held: &Rids,
+        mut each: impl FnMut(std::ops::Range<usize>) -> Result<()>,
+    ) -> Result<()> {
         if held.rows() != self.parents {
             return Err(Error::internal(format!(
                 "a set over {} rows pushed through an adjacency over {} parents",
@@ -189,20 +254,31 @@ impl Adjacency {
                 self.parents
             )));
         }
-        let mut words = vec![0_u64; usize::try_from(self.children.div_ceil(64)).unwrap_or(0)];
-        for parent in held.iter() {
-            let list = self.list(parent).ok_or_else(|| {
-                malformed(format!("parent {parent} of {} is past the end", self.parents))
-            })?;
-            for at in list {
-                let child = bitpack::tail_at(&self.rows, self.width, at)?;
-                let word = words
-                    .get_mut(usize::try_from(child / 64).unwrap_or(usize::MAX))
-                    .ok_or_else(|| malformed(format!("child {child} past the end")))?;
-                *word |= 1 << (child % 64);
+        let bits = self.starts.words();
+        let len = self.starts.len();
+        // `at` is where the list of parent `parent` starts among the bits, which is past `parent`
+        // zeros, so the children listed before it are `at - parent`.
+        let (mut parent, mut at) = (0_u64, 0_usize);
+        for member in held.iter() {
+            if member > parent {
+                let found = if member - parent > FAR {
+                    self.starts.select0(member - 1).map(|zero| zero + 1)
+                } else {
+                    past_zeros(bits, at, member - parent)
+                };
+                at = found.ok_or_else(|| {
+                    malformed(format!("parent {member} of {} is past the end", self.parents))
+                })?;
+                parent = member;
             }
+            let run = ones_from(bits, at, len);
+            let from = at - usize::try_from(parent).unwrap_or(usize::MAX);
+            each(from..from + run)?;
+            // The zero after the list, which moves on to the next parent.
+            at += run + 1;
+            parent += 1;
         }
-        Rids::from_words(self.children, words)
+        Ok(())
     }
 
     /// Appends the header and the body.
@@ -329,9 +405,41 @@ mod tests {
         let pushed = adjacency.push(&held).expect("push");
         let forward = held.forward(&link).expect("forward").rids;
         assert_eq!(pushed.iter().collect::<Vec<_>>(), forward.iter().collect::<Vec<_>>());
-        assert_eq!(adjacency.reached(&held), pushed.len(), "counted without reading a row");
+        assert_eq!(
+            adjacency.reached(&held).expect("reached"),
+            pushed.len(),
+            "counted without reading a row"
+        );
         let wrong = Rids::from_sorted(parents + 1, vec![0]).expect("wrong");
         assert!(adjacency.push(&wrong).is_err(), "a set over another table");
+    }
+
+    #[test]
+    fn a_push_finds_near_and_far_members_alike() {
+        // Enough parents that the gaps between members are both under and over FAR, and parents
+        // with no children among them, so that both ways of finding a list are taken.
+        let parents = 20 * FAR;
+        let parents_of: Vec<Rid> = (0..60_000_u64)
+            .map(
+                |child| {
+                    if child % 31 == 0 { NO_PARENT } else { (child * 7919 + 5) % (parents - 7) }
+                },
+            )
+            .collect();
+        let adjacency = Adjacency::build(&parents_of, parents).expect("build");
+        let members: Vec<Rid> =
+            [0, 1, 2, FAR, FAR + 1, 3 * FAR + 5, 3 * FAR + 900, 19 * FAR, parents - 1]
+                .into_iter()
+                .collect();
+        let held = Rids::from_sorted(parents, members.clone()).expect("held");
+        let mut expected = Vec::new();
+        for &member in &members {
+            adjacency.children_of(member, &mut expected).expect("list");
+        }
+        expected.sort_unstable();
+        let pushed = adjacency.push(&held).expect("push");
+        assert_eq!(pushed.iter().collect::<Vec<_>>(), expected);
+        assert_eq!(adjacency.reached(&held).expect("reached"), count(expected.len()));
     }
 
     #[test]

@@ -469,6 +469,9 @@ pub(crate) struct Exact {
     /// Whether the key map is over the driving table's own column, so that the rows holding a set
     /// of keys are the rows the map gives for them and there is no link or adjacency to follow.
     own: bool,
+    /// Kept keys are turned into the rows they reach through the adjacency when those are fewer
+    /// than one row of the driving table in this many, which is [`GATHERED`] or [`BARE`].
+    gathered: u64,
 }
 
 /// The files a join's [`Exact`] reads its key map and its link out of.
@@ -494,6 +497,7 @@ impl Exact {
             form: OnceLock::new(),
             stored: None,
             own: false,
+            gathered: GATHERED,
         }
     }
 
@@ -508,6 +512,7 @@ impl Exact {
             form: OnceLock::new(),
             stored: Some(stored),
             own: false,
+            gathered: GATHERED,
         }
     }
 
@@ -537,6 +542,12 @@ impl Exact {
         Self { own: true, ..Self::stored(Stored { parent: table, column, child: None }) }
     }
 
+    /// The same, for a relation that keeps every row its scan reads, which is gathered up to
+    /// [`BARE`] rather than [`GATHERED`].
+    pub(crate) fn bare(self) -> Self {
+        Self { gathered: BARE, ..self }
+    }
+
     fn keys(&self) -> Option<&KeyMap> {
         self.keys
             .get_or_init(|| {
@@ -558,6 +569,7 @@ impl Exact {
             form: OnceLock::new(),
             stored: None,
             own: false,
+            gathered: GATHERED,
         }
     }
 
@@ -1172,7 +1184,7 @@ fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Op
     let Some(held) = held.parents(map, adjacency.parents())? else {
         return Ok(None);
     };
-    if adjacency.reached(held).saturating_mul(LISTED) >= children {
+    if adjacency.reached(held)?.saturating_mul(LISTED) >= children {
         return Ok(None);
     }
     let rids = adjacency.push(held)?;
@@ -1190,7 +1202,8 @@ fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Op
 }
 
 /// The rows of the driving table that hold one of `count` key values, read off the backward
-/// adjacency, when they are fewer than one row in [`GATHERED`].
+/// adjacency, when they are fewer than one row in [`GATHERED`], or in [`BARE`] for a relation with
+/// no filter of its own.
 ///
 /// The same lists [`listed`] reads for a join, for the keys a relation of a consistent reduction
 /// kept, which are values and not the rows of a build side. Every value has to be in the parent's
@@ -1201,7 +1214,7 @@ fn listed_keys(exact: &Exact, count: u64, keys: impl Iterator<Item = i64>) -> Op
         return owned_keys(exact, count, keys);
     }
     let children = exact.children.filter(|&children| children > 0)?;
-    if count.saturating_mul(GATHERED) >= exact.parents.min(children) {
+    if count.saturating_mul(exact.gathered) >= exact.parents.min(children) {
         return None;
     }
     let adjacency = exact.adjacency()?;
@@ -1213,7 +1226,7 @@ fn listed_keys(exact: &Exact, count: u64, keys: impl Iterator<Item = i64>) -> Op
         *words.get_mut(usize::try_from(rid / 64).ok()?)? |= 1 << (rid % 64);
     }
     let held = Rids::from_words(parents, words).ok()?;
-    if adjacency.reached(&held).saturating_mul(GATHERED) >= children {
+    if adjacency.reached(&held).ok()?.saturating_mul(exact.gathered) >= children {
         return None;
     }
     let rids = adjacency.push(&held).ok()?;
@@ -1275,11 +1288,27 @@ fn thin(rids: &Rids) -> bool {
 /// fewer than one row of its table in this many. See [`listed_keys`].
 ///
 /// Higher than [`LISTED`] because of where the work happens. The rows are gathered once the
-/// relation before has finished, on one thread, at about 30 ns a row reached on the IMDb load, while
-/// testing a row's key against the kept keys costs a few nanoseconds and is spread over every
-/// worker of the scan. In JOB 9a the 119,532 movies kept reach 3.37 million rows of cast_info, one
-/// in eleven, and gathering them took longer than the scan they were meant to shorten.
+/// relation before has finished, on one thread, while testing a row's key against the kept keys
+/// costs a few nanoseconds and is spread over every worker of the scan. In JOB 9a the 119,532
+/// movies kept reach 3.37 million rows of cast_info, one in eleven, and gathering them took longer
+/// than the scan they were meant to shorten.
+///
+/// It is also what a filter of the relation's own costs to lose. A scan that reads its rows at the
+/// places they were gathered decodes the filter's column at each of them, where a scan of the whole
+/// part answers a filter such as `note IN (...)` on the column's dictionary codes. In JOB 18a,
+/// gathering the cast_info rows of 45,364 movies, about one row in twenty four, made its scan three
+/// times the CPU it took testing every row.
 const GATHERED: u64 = 64;
+
+/// [`GATHERED`] for a relation with no filter of its own, which loses nothing by being read at its
+/// rows.
+///
+/// Lower because the other cost has come down: the lists are found by reading on through the
+/// adjacency's starts rather than by two selects a movie, see `Adjacency::push`. In JOB 16b the
+/// 24,646 movies left reach 748,000 rows of cast_info, one in forty eight, and gathering them took
+/// the query from 1.88 G instructions to 1.46 G. At one in eight, other queries such as JOB 17a
+/// lost more than that won.
+const BARE: u64 = 16;
 
 /// A build side is read through the adjacency when its parents' children are fewer than one
 /// driving row in this many. See [`listed`].

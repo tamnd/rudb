@@ -640,7 +640,7 @@ fn bit(words: &[u64], at: u64) -> bool {
 ///
 /// A word at a time: the zeros left in the word are counted, and either they are too few and the
 /// walk moves on, or the one wanted is among them and is found with one select in the word.
-fn past_zeros(bits: &[u64], mut at: usize, n: u64) -> Option<usize> {
+pub(crate) fn past_zeros(bits: &[u64], mut at: usize, n: u64) -> Option<usize> {
     let mut left = n - 1;
     loop {
         let shift = at % 64;
@@ -657,7 +657,7 @@ fn past_zeros(bits: &[u64], mut at: usize, n: u64) -> Option<usize> {
 }
 
 /// How many one bits in a row start at bit `at`, stopping at `len`.
-fn ones_from(bits: &[u64], at: usize, len: usize) -> usize {
+pub(crate) fn ones_from(bits: &[u64], at: usize, len: usize) -> usize {
     let mut end = at;
     while end < len {
         let shift = end % 64;
