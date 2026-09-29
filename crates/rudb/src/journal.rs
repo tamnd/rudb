@@ -5,9 +5,11 @@
 //! the rows an append commits go to one lane of the log in `<database>.wal/` before the statement
 //! returns, and the next open replays them.
 //!
-//! Appends, updates and deletes are logged. A schema change checkpoints when it commits instead,
-//! which is durable at the price of writing the tables it changed. So does a write too large for a
-//! block, or of a type the records do not encode.
+//! Appends, updates and deletes are logged. So are the schema changes that replay can run again
+//! from their text alone: a table created without rows, a view, and a drop of either. Their Ddl
+//! record is the statement, and replay runs it at its place among the others. Every other schema
+//! change checkpoints when it commits instead, which is durable at the price of writing the tables
+//! it changed. So does a write too large for a block, or of a type the records do not encode.
 //!
 //! An Update or Delete record names its rows by where they sit in the table, as runs of row
 //! numbers. Those are stable between the statement and the replay, because a table keeps the order
@@ -20,9 +22,10 @@
 //! commits are all at or below the cut, and replay skips them.
 //!
 //! A record's payload is logical: the table's schema and name, the row count, and the values a
-//! column at a time, each a tag byte and its bytes. It is read back against the table's columns,
-//! which cannot have changed between the append and the replay, because a schema change
-//! checkpoints and so moves the cut past every append before it.
+//! column at a time, each a tag byte and its bytes. It is read back against the table's columns as
+//! replay has them when it reaches the record. Those are the columns the table had when the rows
+//! went in, because a change that alters a table's columns checkpoints and so moves the cut past
+//! every append before it, and a drop and a create of the same name are replayed in their place.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -163,6 +166,23 @@ impl Replayed {
         self.kind == Kind::Insert
     }
 
+    /// The statement a Ddl record carries, which replay runs again, or `None` for any other kind.
+    ///
+    /// # Errors
+    ///
+    /// If the payload does not read as one statement's text.
+    pub(crate) fn statement(&self) -> Result<Option<String>> {
+        if self.kind != Kind::Ddl {
+            return Ok(None);
+        }
+        let mut at = self.rest_at;
+        let sql = get_text(&self.payload, &mut at)?;
+        if at != self.payload.len() {
+            return Err(corrupt("a ddl record with bytes after its statement"));
+        }
+        Ok(Some(sql))
+    }
+
     /// The change, with rows typed as `fields` says.
     ///
     /// # Errors
@@ -265,7 +285,7 @@ impl Journal {
             journal.last = journal.last.max(ts);
             for record in block.records {
                 let kind = record.header.kind;
-                if matches!(kind, Kind::Insert | Kind::Update | Kind::Delete) {
+                if matches!(kind, Kind::Insert | Kind::Update | Kind::Delete | Kind::Ddl) {
                     changes.push(read_record(kind, record.payload)?);
                 }
             }
@@ -319,6 +339,18 @@ impl Journal {
         put_runs(&mut out, rows)?;
         put_rows(&mut out, fields, chunks, MOST_STAGED - self.staged_bytes)?;
         Some(Record { kind: Kind::Update, payload: out })
+    }
+
+    /// The Ddl record for the schema change `sql`, which replay runs again as it is. `None` for a
+    /// statement too long for a record's text, which the commit then checkpoints.
+    pub(crate) fn encode_ddl(&self, sql: &str) -> Option<Record> {
+        if self.dirty {
+            return None;
+        }
+        let mut out = vec![VERSION];
+        put_text(&mut out, sql)?;
+        (out.len() <= MOST_STAGED - self.staged_bytes)
+            .then_some(Record { kind: Kind::Ddl, payload: out })
     }
 
     /// Stages a record for the commit, or marks the commit to checkpoint when there is none.
@@ -532,11 +564,21 @@ fn put_rows(out: &mut Vec<u8>, fields: &[Field], chunks: &[Chunk], most: usize) 
     Some(())
 }
 
-/// The name a payload is for, and where the rest of it starts.
+/// The name a payload is for, and where the rest of it starts. A Ddl record names no table, and its
+/// statement starts right after the layout byte.
 fn read_record(kind: Kind, payload: Vec<u8>) -> Result<Replayed> {
     let mut at = 0;
     if take(&payload, &mut at, 1)?[0] != VERSION {
         return Err(corrupt("a record of another layout"));
+    }
+    if kind == Kind::Ddl {
+        return Ok(Replayed {
+            kind,
+            schema: String::new(),
+            table: String::new(),
+            payload,
+            rest_at: at,
+        });
     }
     let schema = get_text(&payload, &mut at)?;
     let table = get_text(&payload, &mut at)?;
