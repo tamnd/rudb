@@ -7426,7 +7426,12 @@ fn dense_partition(
     group_types: &[LogicalType],
 ) -> Result<Vec<Chunk>> {
     let width = dictionary.len().saturating_add(DENSE_PARTITIONS - 1 - number) / DENSE_PARTITIONS;
-    let rows: usize = partition.runs.iter().map(Blocks::len).sum();
+    // Taken rather than read, so that the codes are gone before the chunks are built. The finish
+    // already stops charging for them, and they stayed alive under every later pipeline: on
+    // ClickBench q29 they are 35 MB, one code for each of the 8.7 million rows, and they were still
+    // there at the query's peak, which is the aggregate above this one.
+    let runs = std::mem::take(&mut partition.runs);
+    let rows: usize = runs.iter().map(Blocks::len).sum();
     // The groups in code order either way, as a count per code of the partition's share of the
     // dictionary or, when far fewer rows arrived than there are codes, as the rows sorted and
     // counted in runs. ClickBench 38 groups by `Title`, whose dictionary is millions of codes, and a
@@ -7435,14 +7440,15 @@ fn dense_partition(
     let mut groups: Vec<(u32, i64)> = if rows.saturating_mul(SPARSE_DENSE) < width {
         let mut sorted: Vec<u32> =
             // flatten: the codes arrive as blocks of slices, and sorting them needs one buffer.
-            partition.runs.iter().flat_map(Blocks::slices).flatten().copied().collect();
+            runs.iter().flat_map(Blocks::slices).flatten().copied().collect();
         sorted.sort_unstable();
         sorted.chunk_by(|left, right| left == right).map(|run| (run[0], run.len() as i64)).collect()
     } else if u32::try_from(rows).is_ok() {
-        dense_counts::<u32>(&partition.runs, width, number, bound)
+        dense_counts::<u32>(&runs, width, number, bound)
     } else {
-        dense_counts::<i64>(&partition.runs, width, number, bound)
+        dense_counts::<i64>(&runs, width, number, bound)
     };
+    drop(runs);
     // Under a TopN on the count only the `bound` largest groups of the partition can reach it, and
     // building the rest into chunks is most of the finish: ClickBench 34 groups ten million rows of
     // `URL` into millions of groups for a `LIMIT 10`. They stay in code order, which is the order
