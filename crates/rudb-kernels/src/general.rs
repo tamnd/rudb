@@ -57,8 +57,9 @@ pub(crate) enum General {
     /// `product`, in floating point the way the pin multiplies.
     Product { total: f64, seen: bool },
     /// `string_agg`, the text so far, whether anything has gone into it, and the separator it was
-    /// joined with, which a combine has to put between the two halves.
-    Joined { text: String, seen: bool, separator: String },
+    /// joined with, which a combine has to put between the two halves. A state read back from its
+    /// layout is bound to its separator, and then a row that carries none is joined with that one.
+    Joined { text: String, seen: bool, separator: String, bound: bool },
     /// An aggregate whose call said which order to read its rows in, `list(x ORDER BY y)`.
     ///
     /// Every row is held as it came, the aggregate's arguments followed by the sort keys that are
@@ -66,7 +67,12 @@ pub(crate) enum General {
     /// combine is then two runs of rows put together, which is why the order the threads finish in
     /// does not reach the answer. The sort is stable, so rows that tie on every key keep the order
     /// they arrived in, which is the most the pin promises too.
-    Ordered { keys: Vec<StateKey>, rows: Vec<Vec<Value>>, inner: Box<Accumulator> },
+    Ordered {
+        arguments: usize,
+        keys: Vec<StateKey>,
+        rows: Vec<Vec<Value>>,
+        inner: Box<Accumulator>,
+    },
     /// A call that exports its state, `sum(x) EXPORT_STATE`, which folds rows into `inner` the way
     /// the aggregate always does and answers with the state written out in the layout of `state`,
     /// which every group shares rather than each holding a copy of its own.
@@ -222,9 +228,12 @@ impl General {
             "entropy" => Self::Tally(Tally::Empty),
             "histogram" => Self::Counted { tally: Tally::Empty, key: map_key(returns) },
             "histogram_exact" => Self::Binned(Box::new(Binned::new(true, map_key(returns)))),
-            "string_agg" => {
-                Self::Joined { text: String::new(), seen: false, separator: String::new() }
-            }
+            "string_agg" => Self::Joined {
+                text: String::new(),
+                seen: false,
+                separator: String::new(),
+                bound: false,
+            },
             _ => return None,
         })
     }
@@ -343,21 +352,23 @@ impl General {
                 *count += i128::from(flag);
                 *seen = true;
             }
-            Self::Joined { text, seen, separator: kept } => {
+            Self::Joined { text, seen, separator: kept, bound } => {
                 // A null separator drops the row, which is how the pin answers
                 // `string_agg(x, NULL)` with null.
+                // A state bound to its separator already holds the one to join with.
                 let separator = match args.get(1) {
-                    None => ",",
-                    Some(Value::Varchar(separator)) => separator,
+                    None if *bound => None,
+                    None => Some(","),
+                    Some(Value::Varchar(separator)) => Some(separator.as_str()),
                     Some(_) => return Ok(()),
                 };
                 let Value::Varchar(piece) = value else {
                     return Err(unexpected("string_agg", value));
                 };
-                if *seen {
-                    text.push_str(separator);
-                } else {
-                    separator.clone_into(kept);
+                match separator {
+                    _ if *seen => text.push_str(separator.unwrap_or(kept)),
+                    Some(separator) => separator.clone_into(kept),
+                    None => {}
                 }
                 text.push_str(piece);
                 *seen = true;
@@ -656,8 +667,8 @@ impl General {
                 *seen |= any;
             }
             (
-                Self::Joined { text, seen, separator },
-                Self::Joined { text: theirs, seen: any, separator: their_separator },
+                Self::Joined { text, seen, separator, .. },
+                Self::Joined { text: theirs, seen: any, separator: their_separator, .. },
             ) => {
                 if !*seen {
                     text.clone_from(theirs);
@@ -688,8 +699,8 @@ impl General {
 
     /// The answer.
     pub(crate) fn finish(&self) -> Result<Value> {
-        if let Self::Ordered { keys, rows, inner } = self {
-            return ordered(keys, rows, inner);
+        if let Self::Ordered { arguments, keys, rows, inner } = self {
+            return ordered(*arguments, keys, rows, inner);
         }
         if let Self::Exported { inner, state } = self {
             return inner.export(&state.layout);
@@ -781,20 +792,17 @@ fn map_key(returns: &LogicalType) -> LogicalType {
 
 /// The answer of an ordered aggregate: its rows sorted on the keys and folded into a fresh copy of
 /// the aggregate in that order.
-fn ordered(keys: &[StateKey], rows: &[Vec<Value>], inner: &Accumulator) -> Result<Value> {
-    let Some(width) = rows.first().map(Vec::len) else {
-        return inner.finish();
-    };
-    // The keys held after the arguments are the ones that are not an argument, in order.
-    let arguments = width - keys.iter().filter(|key| key.argument.is_none()).count();
-    let mut after = arguments..;
-    let columns: Vec<usize> =
-        keys.iter().map(|key| key.argument.unwrap_or_else(|| after.next().unwrap_or(0))).collect();
+fn ordered(
+    arguments: usize,
+    keys: &[StateKey],
+    rows: &[Vec<Value>],
+    inner: &Accumulator,
+) -> Result<Value> {
     let mut failure = None;
     let mut sorted: Vec<&Vec<Value>> = rows.iter().collect();
     sorted.sort_by(|left, right| {
-        for (&column, key) in columns.iter().zip(keys) {
-            let (a, b) = (&left[column], &right[column]);
+        for key in keys {
+            let (a, b) = (&left[key.column], &right[key.column]);
             let (descending, nulls_first) = (key.descending, key.nulls_first);
             // Nulls are placed before the direction is applied, so `DESC NULLS LAST` still puts
             // them last.

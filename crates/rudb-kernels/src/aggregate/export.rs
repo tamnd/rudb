@@ -137,12 +137,17 @@ pub fn finalize_name(state: &StateType) -> String {
 }
 
 /// The name of the aggregate that holds `state`, which for an ordered call is the ordered one.
+///
+/// The aggregate inside an ordered state reads only the arguments that were not bound to a
+/// constant, which is what the pin does: a `string_agg` bound to its separator reads the text
+/// alone from each row, and takes the separator from the binding.
 fn accumulated(state: &StateType) -> Cow<'_, str> {
     if state.order.is_empty() {
-        Cow::Borrowed(&state.function)
-    } else {
-        Cow::Owned(ordered_name(&state.function, &state.order))
+        return Cow::Borrowed(&state.function);
     }
+    let bound = state.constants.iter().filter(|constant| constant.is_some()).count();
+    let arguments = state.arguments.len().saturating_sub(bound);
+    Cow::Owned(ordered_name(&state.function, arguments, &state.order))
 }
 
 /// The scale of the decimal a state's call was made over, or 0 when it was not over a decimal.
@@ -242,6 +247,10 @@ pub(crate) fn state_call(
         let constant = constants.get(1).filter(|constant| !constant.is_null());
         let accumulator = Accumulator::import(function, returns, scale, value, constant)?;
         return accumulator.finish().map(Some);
+    }
+    // The binder already cast the data to the state's layout, so it is the state as it is.
+    if name == "to_aggregate_state" {
+        return Ok(args.first().cloned());
     }
     if name != "combine" {
         return Ok(None);
@@ -478,11 +487,17 @@ impl General {
                     LogicalType::List(element) => (**element).clone(),
                     _ => LogicalType::Null,
                 };
+                // The names are the layout's, which are the pin's `v0` and on unless the state
+                // came from `to_aggregate_state` over a struct named otherwise.
+                let names: Vec<String> = match &element {
+                    LogicalType::Struct(fields) => fields.iter().map(|f| f.name.clone()).collect(),
+                    _ => Vec::new(),
+                };
                 let row = |row: &Vec<Value>| {
+                    let name =
+                        |at: usize| names.get(at).cloned().unwrap_or_else(|| format!("v{at}"));
                     let fields = row.iter().enumerate();
-                    Value::Struct(
-                        fields.map(|(at, value)| (format!("v{at}"), value.clone())).collect(),
-                    )
+                    Value::Struct(fields.map(|(at, value)| (name(at), value.clone())).collect())
                 };
                 Value::List { element, values: rows.iter().map(row).collect() }
             }
@@ -557,11 +572,19 @@ impl General {
     /// its layout does not carry: the separator of a `string_agg` and the fraction of a quantile.
     fn bind(&mut self, constant: Option<&Value>) {
         match self {
-            Self::Joined { separator, .. } => {
+            Self::Joined { separator, bound, .. } => {
                 *separator = match constant {
                     Some(Value::Varchar(text)) => text.clone(),
                     _ => ",".to_string(),
                 };
+                *bound = true;
+            }
+            // The rows an ordered state holds do not carry a constant the call was bound with, so
+            // the aggregate that reads them is bound to it instead.
+            Self::Ordered { inner, .. } => {
+                if let State::General(general) = &mut inner.state {
+                    general.bind(constant);
+                }
             }
             Self::Holistic { fraction, .. } => *fraction = constant.cloned().map(Box::new),
             _ => {}

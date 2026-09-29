@@ -12192,6 +12192,125 @@ fn an_ordered_call_exports_the_rows_it_kept_and_sorts_them_when_finished() {
 }
 
 #[test]
+fn to_aggregate_state_types_a_value_as_the_state_of_the_call_it_names() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let joined = "[{'v0': 'b', 'v1': 2}, {'v0': 'a', 'v1': 1}, {'v0': 'c', 'v1': 3}]";
+    for (sql, answer) in [
+        (
+            "SELECT to_aggregate_state({'count': 1, 'value': 42.0}, 'avg', ['DOUBLE'])",
+            "{'count': 1, 'value': 42.0}",
+        ),
+        (
+            "SELECT finalize(to_aggregate_state({'count': 2, 'value': 42.0}, 'avg', ['DOUBLE']))",
+            "21.0",
+        ),
+        ("SELECT typeof(to_aggregate_state(5, 'sum', ['INTEGER']))", "AGGREGATE_STATE"),
+        ("SELECT finalize(to_aggregate_state('5', 'SUM', ['integer']))", "5"),
+        ("SELECT finalize(to_aggregate_state(NULL, 'count', ['INTEGER']))", "NULL"),
+        ("SELECT finalize(to_aggregate_state(5, 'sum', ['INTEGER'], NULL))", "5"),
+        (
+            "SELECT finalize(combine(to_aggregate_state(5, 'sum', ['INTEGER']), \
+             sum(x) EXPORT_STATE)) FROM (VALUES (1), (2)) t(x)",
+            "8",
+        ),
+        (
+            "SELECT finalize(to_aggregate_state([{'v0': 3}, {'v0': NULL}, {'v0': 1}], 'list', \
+             ['INTEGER'], NULL, [{'column': 0, 'order': 'DESC NULLS FIRST'}]))",
+            "[NULL, 3, 1]",
+        ),
+        (
+            "SELECT finalize(to_aggregate_state([{'a': 3, 'b': 1}, {'a': 4, 'b': 0}], 'list', \
+             ['INTEGER'], NULL, [{'column': 1, 'order': 'ASC NULLS LAST'}]))",
+            "[4, 3]",
+        ),
+        (
+            "SELECT to_aggregate_state([{'a': 3, 'b': 1}], 'list', ['INTEGER'], NULL, \
+             [{'column': 1, 'order': 'ASC NULLS LAST'}])",
+            "[{'a': 3, 'b': 1}]",
+        ),
+    ] {
+        assert_eq!(text(sql), answer, "{sql}");
+    }
+    for separator in ["' '", "'|'"] {
+        let sql = format!(
+            "SELECT finalize(to_aggregate_state({joined}, 'string_agg', ['VARCHAR', 'VARCHAR'], \
+             [NULL, {separator}], [{{'column': 1, 'order': 'ASC NULLS LAST'}}]))"
+        );
+        let answer = if separator == "' '" { "a b c" } else { "a|b|c" };
+        assert_eq!(text(&sql), answer, "{sql}");
+    }
+    // A state the call exported reads back through its own layout, the separator column included.
+    let sql = "SELECT finalize(to_aggregate_state((SELECT string_agg(a, ' ' ORDER BY b) \
+               EXPORT_STATE FROM (VALUES ('x', 2), ('y', 1)) t(a, b))::STRUCT(v0 VARCHAR, v1 \
+               VARCHAR, v2 INTEGER)[], 'string_agg', ['VARCHAR', 'VARCHAR'], [NULL, ' '], \
+               [{'column': 2, 'order': 'ASC NULLS LAST'}]))";
+    assert_eq!(text(sql), "y x", "{sql}");
+    for (sql, message) in [
+        (
+            "SELECT to_aggregate_state(5, 'nope', ['INTEGER'])",
+            "Aggregate Function with name nope does not exist",
+        ),
+        ("SELECT to_aggregate_state(5, 'mode', ['INTEGER'])", "cannot convert to its state"),
+        ("SELECT to_aggregate_state(5, 'sum', [NULL])", "the signature cannot contain NULL values"),
+        ("SELECT to_aggregate_state(5, 'sum', [1])", "the signature must be a list of types"),
+        (
+            "SELECT to_aggregate_state(5, 'sum', ['INTEGER'], [NULL, 1])",
+            "has 2 entries but the aggregate has 1 arguments",
+        ),
+        (
+            "SELECT to_aggregate_state(5, 'sum', ['INTEGER'], 3)",
+            "must be a list with one entry per argument",
+        ),
+        (
+            "SELECT to_aggregate_state(5, x, ['INTEGER']) FROM (VALUES ('sum')) t(x)",
+            "must be constant",
+        ),
+        (
+            "SELECT to_aggregate_state([{'v0': 3}], 'list', ['INTEGER'], NULL, [{'column': 0, 'order': 'ASC'}])",
+            "must end with either NULLS FIRST or NULLS LAST",
+        ),
+        (
+            "SELECT to_aggregate_state([{'v0': 3}], 'list', ['INTEGER'], NULL, [{'column': 0, 'order': 'nulls first'}])",
+            "must start with either ASC or DESC",
+        ),
+        (
+            "SELECT to_aggregate_state([{'v0': 3}], 'list', ['INTEGER'], NULL, [])",
+            "must have at least one ORDER BY key",
+        ),
+        (
+            "SELECT to_aggregate_state([3], 'list', ['INTEGER'], NULL, [{'column': 0, 'order': 'ASC NULLS LAST'}])",
+            "must be a LIST of STRUCTs",
+        ),
+        (
+            "SELECT to_aggregate_state([{'v0': 1, 'v1': 10}], 'list', ['INTEGER'], [NULL], [{'column': 5, 'order': 'ASC NULLS LAST'}])",
+            "ORDER BY column 5 is out of range (the state has 2 columns)",
+        ),
+        (
+            "SELECT to_aggregate_state([{'v0': 3}], 'list', ['INTEGER'], NULL, [{'column': 0}])",
+            "must have a non-NULL 'column' and 'order'",
+        ),
+        (
+            "SELECT to_aggregate_state([{'v0': 3}], 'list', ['INTEGER'], NULL, [NULL])",
+            "must be a {column, order} struct",
+        ),
+        (
+            "SELECT to_aggregate_state([{'v0': 3}], 'list', ['INTEGER'], NULL, 'x')",
+            "must be a list of {column, order} structs",
+        ),
+    ] {
+        let error = db.execute(sql).expect_err(sql);
+        assert!(error.message().contains(message), "{sql}: {error}");
+    }
+}
+
+#[test]
 fn combine_aggr_folds_states_as_many_times_as_it_is_told() {
     let db = Database::new();
     let text = |sql: &str| {

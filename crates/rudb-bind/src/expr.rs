@@ -230,13 +230,14 @@ impl Binder<'_> {
                 args.extend(keys.iter().map(|key| key.expr));
                 let flags: Vec<StateKey> = keys
                     .iter()
-                    .map(|key| StateKey {
+                    .zip(1..)
+                    .map(|(key, column)| StateKey {
                         descending: key.descending,
                         nulls_first: key.nulls_first,
-                        argument: None,
+                        column,
                     })
                     .collect();
-                name = rudb_kernels::ordered_name(&name, &flags);
+                name = rudb_kernels::ordered_name(&name, 1, &flags);
             }
             let args = self.plan_mut().add_expr_list(&args);
             let name = self.plan_mut().intern(&name);
