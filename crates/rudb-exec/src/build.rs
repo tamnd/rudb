@@ -1096,7 +1096,7 @@ fn native_distinct_counts(
                 | LogicalType::BigInt
         )
     };
-    let (Expr::Column(group), Expr::Column(counted)) = (*plan.expr(*key), *plan.expr(*argument))
+    let (&Expr::Column(group), &Expr::Column(counted)) = (plan.expr(*key), plan.expr(*argument))
     else {
         return Ok(None);
     };
