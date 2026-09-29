@@ -22,6 +22,15 @@
 //! and nothing else. It goes from the roots down, parents before children, which is the stored order
 //! backwards, keeping each held row whose key its parent kept and folding the extremes in.
 //!
+//! # Trailing a root
+//!
+//! A relation with no children under a root can be scanned after the root rather than before it,
+//! which the plan does where its own filter is dear and the root leaves few of its keys. It is read
+//! against the keys the root kept, like any relation after another in its class. The root cannot
+//! test its rows against a set that is not built yet, so it holds them, and the second sweep starts
+//! by keeping the ones whose key is in the set of every relation that trails it. Only then are the
+//! root's extremes folded in and the keys it hands down taken.
+//!
 //! # Dropping rows in the scan
 //!
 //! Testing a row's keys in the sink is late: by then the scan has read and decoded every column the
@@ -151,8 +160,10 @@ impl Keys {
 struct Role {
     /// Every join column, as a position in what the relation's input produces.
     keys: Vec<usize>,
-    /// For each child, which child and which of `keys` it is joined on.
+    /// For each child scanned before it, which child and which of `keys` it is joined on.
     children: Vec<(usize, usize)>,
+    /// The same for each child that trails it, which only a root has.
+    trailing: Vec<(usize, usize)>,
     /// Which of `keys` the relation shares with its parent, or nothing for a root.
     parent: Option<usize>,
     /// The children the second sweep goes on to, each with which of `keys` it is joined on.
@@ -160,7 +171,8 @@ struct Role {
     /// The extremes read from this relation, each with the column it is read from.
     extremes: Vec<(usize, usize)>,
     /// Whether the rows are kept for the second sweep, and if so which columns, as positions in
-    /// the relation's input.
+    /// the relation's input: the parent's key, the keys of the children that trail it, the keys of
+    /// `down` and the columns of `extremes`, in that order.
     held: Option<Vec<usize>>,
     /// The keys whose kept sets go to other relations' scans, each with the relations and the
     /// column of each that is in the same class. See the module documentation.
@@ -171,6 +183,8 @@ struct Role {
 #[derive(Debug)]
 pub(crate) struct Reduction {
     roles: Vec<Role>,
+    /// The order the second sweep takes the relations in, parents before children.
+    sweep: Vec<usize>,
     /// The type of each extreme, which is also the type of each output column.
     types: Vec<LogicalType>,
     /// Per relation, the keys it kept in the class it shares with its parent, while it is running.
@@ -218,9 +232,14 @@ impl Reduction {
                 })
             };
             let mut children = Vec::new();
+            let mut trailing = Vec::new();
             let mut down = Vec::new();
             for (child, class) in tree.children(position) {
-                children.push((child as usize, slot(class)?));
+                if tree.trailing(child) {
+                    trailing.push((child as usize, slot(class)?));
+                } else {
+                    children.push((child as usize, slot(class)?));
+                }
                 if tree.held(child) {
                     down.push((child as usize, slot(class)?));
                 }
@@ -235,6 +254,7 @@ impl Reduction {
                 .collect();
             let held = tree.held(position).then(|| {
                 let mut columns: Vec<usize> = parent.iter().map(|&key| keys[key]).collect();
+                columns.extend(trailing.iter().map(|&(_, key)| keys[key]));
                 columns.extend(down.iter().map(|&(_, key)| keys[key]));
                 columns.extend(extremes.iter().map(|&(_, column)| column));
                 columns
@@ -249,9 +269,15 @@ impl Reduction {
                     // relation is read against these keys and keeps a subset of them, which it
                     // hands on in turn. The relations further on would test their rows against
                     // this set and then against a smaller one, and the ones already scanned
-                    // would be handed keys they never read.
+                    // would be handed keys they never read. A relation that trails this one is
+                    // under it and is read after it all the same.
                     let readers: Vec<(usize, u32)> = (at + 1..count)
-                        .filter(|&other| !below(tree, other, at))
+                        .filter(|&other| {
+                            !below(tree, other, at)
+                                || tree.leaves[other]
+                                    .parent
+                                    .is_some_and(|edge| edge.leaf as usize == at)
+                        })
                         .find_map(|other| {
                             let column = tree.key(u32::try_from(other).ok()?, key.class)?;
                             Some((other, column))
@@ -261,7 +287,17 @@ impl Reduction {
                     (!readers.is_empty()).then_some((slot, readers))
                 })
                 .collect();
-            roles.push(Role { keys, children, parent, down, extremes, held, published });
+            roles.push(Role { keys, children, trailing, parent, down, extremes, held, published });
+        }
+        // Backwards through the stored order, which puts parents before children, with each
+        // relation that trails a root taken right after it.
+        let mut sweep = Vec::with_capacity(count);
+        for at in (0..count).rev() {
+            if tree.trailing(u32::try_from(at).unwrap_or(u32::MAX)) {
+                continue;
+            }
+            sweep.push(at);
+            sweep.extend(roles[at].trailing.iter().map(|&(child, _)| child));
         }
         let mut extremes = Vec::with_capacity(types.len());
         for (extreme, ty) in tree.extremes.iter().zip(&types) {
@@ -273,6 +309,7 @@ impl Reduction {
             .collect();
         Ok(Self {
             roles,
+            sweep,
             types,
             gathering: (0..count).map(|_| Mutex::new(Keys::default())).collect(),
             publishing,
@@ -346,12 +383,17 @@ impl Sink for Collect<'_> {
 
     fn local(&self) -> Collecting {
         let role = &self.shared.roles[self.at];
-        let root = role.parent.is_none();
+        // Only a root reads extremes and hands keys down as it goes, and not one that relations
+        // trail, which does both in the second sweep.
+        let root = role.parent.is_none() && role.trailing.is_empty();
         Collecting {
             up: Keys::default(),
             published: role.published.iter().map(|_| Keys::default()).collect(),
-            down: role.down.iter().map(|_| Keys::default()).collect(),
-            // Only a root reads extremes as it goes.
+            down: if root {
+                role.down.iter().map(|_| Keys::default()).collect()
+            } else {
+                Vec::new()
+            },
             extremes: (root && !role.extremes.is_empty()).then(|| self.shared.fresh.clone()),
             held: Vec::new(),
             charged: self.shared.memory.reservation(),
@@ -410,7 +452,7 @@ impl Sink for Collect<'_> {
                 local.published[slot].insert(values[row as usize]);
             }
         }
-        if role.parent.is_none() {
+        if role.parent.is_none() && role.trailing.is_empty() {
             for (slot, &(_, key)) in role.down.iter().enumerate() {
                 let values = &local.values[key];
                 for &row in &kept {
@@ -479,6 +521,9 @@ impl Sink for Collect<'_> {
             }
         }
         let _ = shared.up[self.at].set(up);
+        if !role.trailing.is_empty() {
+            return Ok(());
+        }
         for &(child, _) in &role.down {
             let allowed = std::mem::take(&mut *shared.allowing[child].lock().map_err(poisoned)?);
             let _ = shared.allowed[child].set(allowed);
@@ -586,18 +631,29 @@ impl Answer {
         let mut extremes = shared.accumulators()?;
         let count = shared.roles.len();
         let mut allowed: Vec<Option<Keys>> = (0..count).map(|_| None).collect();
-        for at in (0..count).rev() {
+        for &at in &shared.sweep {
             let role = &shared.roles[at];
             let Some(columns) = &role.held else { continue };
             // A child of a root was allowed its keys by the root's sink, and every other held
-            // relation by its parent a step earlier in this loop.
+            // relation by its parent a step earlier in this loop. A root that relations trail is
+            // allowed what they kept instead.
             let owned = allowed[at].take();
-            let permitted: &Keys = match &owned {
-                Some(keys) => keys,
-                None => shared.allowed[at]
-                    .get()
-                    .ok_or_else(|| Error::internal("a held relation with no allowed keys"))?,
+            let permitted: Option<&Keys> = match &owned {
+                Some(keys) => Some(keys),
+                None if role.parent.is_none() => None,
+                None => Some(
+                    shared.allowed[at]
+                        .get()
+                        .ok_or_else(|| Error::internal("a held relation with no allowed keys"))?,
+                ),
             };
+            let mut trailed = Vec::with_capacity(role.trailing.len());
+            for &(child, _) in &role.trailing {
+                trailed.push(shared.up[child].get().ok_or_else(|| {
+                    Error::internal("a root was swept before a relation that trails it finished")
+                })?);
+            }
+            let first = usize::from(role.parent.is_some());
             let mut down: Vec<Keys> = role.down.iter().map(|_| Keys::default()).collect();
             let chunks = std::mem::take(&mut *shared.held[at].lock().map_err(poisoned)?);
             let mut survived = 0usize;
@@ -606,33 +662,47 @@ impl Answer {
             let mut others: Vec<Vec<i64>> = role.down.iter().map(|_| Vec::new()).collect();
             for chunk in &chunks {
                 let rows = chunk.len();
-                // The parent key is the first held column, which `Reduction::new` put there.
-                read(chunk.column(0)?, rows, &mut values, &mut nulls)?;
-                let kept: Vec<u32> = (0..rows)
-                    .filter(|&row| permitted.contains(values[row]))
-                    .map(|row| u32::try_from(row).unwrap_or(u32::MAX))
+                let mut kept: Vec<u32> = (0..u32::try_from(rows)
+                    .map_err(|_| Error::internal("a huge chunk"))?)
                     .collect();
+                // The parent key is the first held column and the keys of the relations that
+                // trail it come next, which `Reduction::new` put there.
+                if let Some(permitted) = permitted {
+                    read(chunk.column(0)?, rows, &mut values, &mut nulls)?;
+                    kept.retain(|&row| permitted.contains(values[row as usize]));
+                }
+                for (slot, keys) in trailed.iter().enumerate() {
+                    if kept.is_empty() {
+                        break;
+                    }
+                    read(chunk.column(first + slot)?, rows, &mut values, &mut nulls)?;
+                    kept.retain(|&row| keys.contains(values[row as usize]));
+                }
                 if kept.is_empty() {
                     continue;
                 }
                 survived += kept.len();
+                let after = first + trailed.len();
                 for (slot, other) in others.iter_mut().enumerate() {
-                    read(chunk.column(1 + slot)?, rows, other, &mut nulls)?;
+                    read(chunk.column(after + slot)?, rows, other, &mut nulls)?;
                     for &row in &kept {
                         down[slot].insert(other[row as usize]);
                     }
                 }
                 let selection = Selection::from_indices(kept);
-                let first = 1 + role.down.len();
+                let after = after + role.down.len();
                 let read: Vec<(usize, usize)> = role
                     .extremes
                     .iter()
                     .enumerate()
-                    .map(|(slot, &(output, _))| (output, first + slot))
+                    .map(|(slot, &(output, _))| (output, after + slot))
                     .collect();
                 fold(&mut extremes, &read, chunk, &selection)?;
             }
-            debug_assert_eq!(columns.len(), 1 + role.down.len() + role.extremes.len());
+            debug_assert_eq!(
+                columns.len(),
+                first + trailed.len() + role.down.len() + role.extremes.len()
+            );
             if survived == 0 {
                 return Ok(None);
             }

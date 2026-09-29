@@ -320,7 +320,8 @@ impl Shape {
             // Every relation is a pipeline of its own ending in the node, which is the sink of all
             // of them and then the source of the one row it answers with. A relation's pipeline
             // waits for its children's, because its rows are checked against the keys they kept as
-            // they arrive, and the node waits for every one of them.
+            // they arrive, or for its parent's where it trails it, and the node waits for every one
+            // of them.
             Node::Consistent { reducer, .. } => {
                 self.of[node as usize] = Some(Placed { operator, gathered: None, pipeline });
                 let tree = plan.reducer(reducer);
@@ -328,8 +329,12 @@ impl Shape {
                 for (at, leaf) in tree.leaves.iter().enumerate() {
                     let own = self.fresh();
                     let at = u32::try_from(at).unwrap_or(u32::MAX);
-                    for (child, _) in tree.children(at) {
+                    for (child, _) in tree.children(at).filter(|&(child, _)| child < at) {
                         self.waits_on(own, filling[child as usize]);
+                    }
+                    // One that trails its parent is read against the keys the parent kept.
+                    if let Some(edge) = leaf.parent.filter(|_| tree.trailing(at)) {
+                        self.waits_on(own, filling[edge.leaf as usize]);
                     }
                     self.waits_on(pipeline, own);
                     self.walk(plan, leaf.input, own, Some(operator));
