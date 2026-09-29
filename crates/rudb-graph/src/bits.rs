@@ -15,11 +15,12 @@
 //!
 //! Section 3.4 budgets "a sampled select structure of one position every four thousand ninety six
 //! ones plus a two-level rank index" at about thirteen percent over the bitmap. The rank index is
-//! stored, because rebuilding it is a pass over ninety four megabytes at SF100 and that is a thing
-//! you notice at open time. The samples are not stored, because rebuilding them is a pass over the
-//! superblock array, which at SF100 is a hundred and eighty three thousand entries and is not.
-//! A number derivable in a microsecond is a number that should not be given the chance to disagree
-//! with the array it describes.
+//! stored, because it is what a reader without anything resident would need. What a lookup reads is
+//! a finer index built at open, one count per word, and select samples one every sixty four bits of
+//! each value, a pass over the bitmap and then over the counts. Neither is stored: a number
+//! derivable at open is a number that should not be given the chance to disagree with the array it
+//! describes, and section 4.2 of spec/graph/04-the-in-memory-model.md already holds these
+//! structures resident once they are first used.
 
 use rudb_common::{Error, Result};
 
@@ -37,10 +38,16 @@ const BLOCK_WORDS: usize = BLOCK_BITS / 64;
 
 /// One select sample every this many ones, and every this many zeros.
 ///
-/// Section 3.4's number. It is a window for a binary search rather than an answer, so a larger
-/// sample costs search steps and not correctness, which is why it can be moved without a format
-/// change: the samples are rebuilt at open.
-const SAMPLE: u64 = 4096;
+/// Section 3.4 budgets one every 4096, and that is what the file would pay if the samples were
+/// stored. They are not, so the number is a resident cost and not a format one, and at sixty four
+/// the sample for a group is usually the word the answer is in or the one before it. With 4096 a
+/// select was a binary search over superblocks, a walk of blocks and a walk of words, about two
+/// hundred instructions, and TPC-H q21 asked for 292,198 of them walking each line to its siblings.
+/// Four bytes every sixty four ones and every sixty four zeros is half the size of the bitmap.
+const SAMPLE: u64 = 64;
+
+/// Words between two samples past which [`BitVector::select`] searches rather than walks.
+const WALK_WORDS: usize = 8;
 
 /// A two level rank index over a bitmap.
 ///
@@ -49,10 +56,20 @@ const SAMPLE: u64 = 4096;
 /// a `popcount` over at most eight words, which is section 3.3's arithmetic and is the reason the
 /// block size is 512: a `u16` cannot hold a count over a wider superblock than 4096, and eight
 /// words is the most a `popcount` loop should have to do.
+///
+/// That is the stored index, and it is what a file pays for. What a lookup reads is `fine`, one `u32`
+/// per word counting the ones before it, built from the bitmap when the index is built or read and
+/// never written. Two loads and one `popcount` answer a rank from it, where the stored index is
+/// three loads and a loop of up to seven more. On TPC-H q21 a key map lookup spent 77 instructions
+/// in the loop version, and there were 292,198 of them. It costs four bytes for every sixty four
+/// bits, half the size of the bitmap, held in memory as spec/graph/04-the-in-memory-model.md section
+/// 4.2 says a key map is, and the superblocks being `u32` already caps the count at what it holds.
 #[derive(Debug, Clone)]
 pub(crate) struct Rank {
     superblocks: Vec<u32>,
     blocks: Vec<u16>,
+    /// Ones before each word, and the total after the last one. Rebuilt, never stored.
+    fine: Vec<u32>,
 }
 
 impl Rank {
@@ -61,6 +78,7 @@ impl Rank {
         let mut index = Self {
             superblocks: Vec::with_capacity(blocks.div_ceil(BLOCKS_PER_SUPERBLOCK)),
             blocks: Vec::with_capacity(blocks),
+            fine: Vec::new(),
         };
         let mut total = 0_u32;
         let mut within = 0_u16;
@@ -85,25 +103,36 @@ impl Rank {
             let ones = ones as u16;
             within += ones;
         }
+        index.refine(bits);
         index
+    }
+
+    /// Fills `fine` from the bitmap this index is over.
+    ///
+    /// A pass over the words, which is what building the stored index cost too, so a reader pays
+    /// for it once when the section is opened and never again. The counts wrap past `u32::MAX`
+    /// ones rather than fail, and a bitmap with that many is already past what the superblocks hold.
+    fn refine(&mut self, bits: &[u64]) {
+        let mut fine = Vec::with_capacity(bits.len() + 1);
+        let mut total = 0_u32;
+        for word in bits {
+            fine.push(total);
+            total = total.wrapping_add(word.count_ones());
+        }
+        fine.push(total);
+        self.fine = fine;
     }
 
     /// How many bits are set strictly below `at`.
     pub(crate) fn rank(&self, bits: &[u64], at: usize) -> u64 {
-        let block = at / BLOCK_BITS;
-        let superblock = block / BLOCKS_PER_SUPERBLOCK;
-        let mut count = u64::from(self.superblocks[superblock]) + u64::from(self.blocks[block]);
-        let from = block * BLOCK_WORDS;
         let word = at / 64;
-        for whole in &bits[from..word] {
-            count += u64::from(whole.count_ones());
-        }
-        let remainder = at % 64;
-        if remainder != 0 {
-            let mask = (1_u64 << remainder) - 1;
-            count += u64::from((bits[word] & mask).count_ones());
-        }
-        count
+        let mask = (1_u64 << (at % 64)) - 1;
+        u64::from(self.fine[word]) + u64::from((bits[word] & mask).count_ones())
+    }
+
+    /// Ones strictly before a word, for any word up to one past the last.
+    fn ones_before_word(&self, word: usize) -> u64 {
+        u64::from(self.fine[word])
     }
 
     pub(crate) fn bytes(&self) -> usize {
@@ -128,8 +157,9 @@ impl Rank {
         }
     }
 
-    /// Reads an index over a bitmap of `words` words from exactly the bytes it takes.
-    pub(crate) fn read(bytes: &[u8], words: usize) -> Result<Self> {
+    /// Reads an index over `bits` from exactly the bytes it takes.
+    pub(crate) fn read(bytes: &[u8], bits: &[u64]) -> Result<Self> {
+        let words = bits.len();
         let (blocks, superblocks) = Self::shape(words);
         let split = superblocks * size_of::<u32>();
         if bytes.len() != split + blocks * size_of::<u16>() {
@@ -137,7 +167,7 @@ impl Rank {
                 "a dense key map's rank index is not the size its range implies",
             ));
         }
-        Ok(Self {
+        let mut index = Self {
             superblocks: bytes[..split]
                 .chunks_exact(size_of::<u32>())
                 .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
@@ -146,17 +176,10 @@ impl Rank {
                 .chunks_exact(size_of::<u16>())
                 .map(|word| u16::from_le_bytes(word.try_into().expect("two bytes")))
                 .collect(),
-        })
-    }
-
-    /// Ones strictly before the first bit of a superblock.
-    fn ones_before_superblock(&self, superblock: usize) -> u64 {
-        u64::from(self.superblocks[superblock])
-    }
-
-    /// Ones strictly before the first bit of a block.
-    fn ones_before_block(&self, block: usize) -> u64 {
-        u64::from(self.superblocks[block / BLOCKS_PER_SUPERBLOCK]) + u64::from(self.blocks[block])
+            fine: Vec::new(),
+        };
+        index.refine(bits);
+        Ok(index)
     }
 }
 
@@ -173,7 +196,7 @@ pub struct BitVector {
     len: usize,
     ones: u64,
     rank: Rank,
-    /// Superblock holding the `SAMPLE * k`th one, for each `k`. Rebuilt at read, never stored.
+    /// Word holding the `SAMPLE * k`th one, for each `k`. Rebuilt at read, never stored.
     ones_sample: Vec<u32>,
     /// The same for zeros.
     zeros_sample: Vec<u32>,
@@ -319,7 +342,7 @@ impl BitVector {
             .chunks_exact(size_of::<u64>())
             .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")))
             .collect::<Vec<u64>>();
-        let rank = Rank::read(&bytes[bitmap..], words)?;
+        let rank = Rank::read(&bytes[bitmap..], &held)?;
         let tail = len % 64;
         if tail != 0 && held[len / 64] >> tail != 0 {
             return Err(malformed("a bit vector has bits set past its length"));
@@ -337,25 +360,25 @@ impl BitVector {
         Ok(vector)
     }
 
-    /// One superblock index per `SAMPLE` ones, and one per `SAMPLE` zeros.
+    /// One word index per `SAMPLE` ones, and one per `SAMPLE` zeros.
     ///
-    /// A pass over the superblock array and not over the bitmap, which is why this is cheap enough
-    /// to do at read rather than store. The sample for group `k` is the answer a search for the
-    /// `k * SAMPLE`th bit would give, so the window for any `nth` in that group is the sample for
-    /// the group and the sample for the next one, and both counts being non-decreasing in the
-    /// superblock index is what makes one forward walk enough to fill either array.
+    /// A pass over the per word counts, which is why this is cheap enough to do at read rather
+    /// than store. The sample for group `k` is the word a search for the `k * SAMPLE`th bit would
+    /// land in, so the answer for any `nth` in that group lies between the sample for the group and
+    /// the sample for the next one, and both counts being non-decreasing in the word index is what
+    /// makes one forward walk enough to fill either array.
     fn sample(&mut self) {
         self.ones_sample = self.samples(true, self.ones);
         self.zeros_sample = self.samples(false, self.zeros());
     }
 
     fn samples(&self, set: bool, total: u64) -> Vec<u32> {
-        let superblocks = self.rank.superblocks.len();
+        let words = self.words.len();
         let mut sample = Vec::with_capacity(usize::try_from(total.div_ceil(SAMPLE)).unwrap_or(0));
         let mut at = 0_usize;
         for group in 0..total.div_ceil(SAMPLE) {
             let target = group * SAMPLE;
-            while at + 1 < superblocks && self.before(set, at + 1) <= target {
+            while at + 1 < words && self.before(set, at + 1) <= target {
                 at += 1;
             }
             sample.push(u32::try_from(at).unwrap_or(u32::MAX));
@@ -363,71 +386,61 @@ impl BitVector {
         sample
     }
 
-    /// Bits of the given value strictly before a superblock's first bit.
-    fn before(&self, set: bool, superblock: usize) -> u64 {
-        let ones = self.rank.ones_before_superblock(superblock);
-        if set { ones } else { bits(superblock * SUPERBLOCK_BITS) - ones }
+    /// Bits of the given value strictly before a word's first bit.
+    fn before(&self, set: bool, word: usize) -> u64 {
+        let ones = self.rank.ones_before_word(word);
+        if set { ones } else { bits(word * 64) - ones }
     }
 
     /// Where the `nth` bit of the given value is.
     ///
-    /// Three narrowings, each over a structure the one above it points into: the sample picks a
-    /// window of superblocks, a binary search picks the superblock, a walk of at most eight blocks
-    /// picks the block, and a walk of at most eight words picks the word. The counts for zeros are
-    /// the counts for ones subtracted from the position, which is why one routine answers both.
+    /// The sample for `nth`'s group and the one after it bound the word it is in. On a vector as
+    /// dense in the value asked for as the monotone link's ones or a key map's bits, those are a
+    /// word or two apart and the walk between them is a load and a compare each. A sparse one can
+    /// put many words between two samples, and there a binary search over the per word counts
+    /// finds the word instead. The counts for zeros are the counts for ones subtracted from the
+    /// position, which is why one routine answers both.
     fn select(&self, nth: u64, set: bool) -> usize {
-        if self.rank.superblocks.is_empty() {
+        let words = self.words.len();
+        if words == 0 {
             return self.len;
         }
         let samples = if set { &self.ones_sample } else { &self.zeros_sample };
-        let last = self.rank.superblocks.len() - 1;
         let group = usize::try_from(nth / SAMPLE).unwrap_or(usize::MAX);
         let from = samples.get(group).map_or(0, |at| *at as usize);
-        let to = samples.get(group + 1).map_or(last, |at| *at as usize);
-        let (mut low, mut high) = (from, to);
-        while low < high {
-            // The upper midpoint, because the search keeps the candidate rather than passing it,
-            // and a lower midpoint with `low = middle` would not terminate.
-            let middle = low + (high - low).div_ceil(2);
-            if self.before(set, middle) <= nth {
-                low = middle;
-            } else {
-                high = middle - 1;
+        let to = samples.get(group + 1).map_or(words - 1, |at| *at as usize);
+        let mut word = from;
+        if to - from > WALK_WORDS {
+            // The last word whose count of bits before it is at most `nth`.
+            let (mut low, mut high) = (from, to);
+            while low < high {
+                let middle = low + (high - low).div_ceil(2);
+                if self.before(set, middle) <= nth {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            word = low;
+        } else {
+            while word < to && self.before(set, word + 1) <= nth {
+                word += 1;
             }
         }
-        let superblock = low;
-        let blocks = self.rank.blocks.len();
-        let first = superblock * BLOCKS_PER_SUPERBLOCK;
-        let within = |block: usize| -> u64 {
-            let ones = self.rank.ones_before_block(block);
-            if set { ones } else { bits(block * BLOCK_BITS) - ones }
-        };
-        let mut block = first;
-        for candidate in first..(first + BLOCKS_PER_SUPERBLOCK).min(blocks) {
-            if within(candidate) <= nth {
-                block = candidate;
-            } else {
-                break;
-            }
+        let held = if set { self.words[word] } else { !self.words[word] };
+        let before = self.before(set, word);
+        if nth < before || nth - before >= u64::from(held.count_ones()) {
+            // Unreachable for an `nth` the callers checked against `ones` or `zeros`, and a
+            // saturating answer rather than a panic if it ever is reached, because section 3.1 says
+            // this layer is allowed to be slow and is not allowed to take the process down.
+            return self.len;
         }
-        let mut before = within(block);
-        for word in block * BLOCK_WORDS..self.words.len() {
-            let held = if set { self.words[word] } else { !self.words[word] };
-            let here = u64::from(held.count_ones());
-            if before + here > nth {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "a word holds at most 64 bits, so the offset within it fits a u32"
-                )]
-                let offset = (nth - before) as u32;
-                return word * 64 + nth_set(held, offset) as usize;
-            }
-            before += here;
-        }
-        // Unreachable for an `nth` the callers checked against `ones` or `zeros`, and a saturating
-        // answer rather than a panic if it ever is reached, because section 3.1 says this layer is
-        // allowed to be slow and is not allowed to take the process down.
-        self.len
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "under the count of one word, so under sixty four"
+        )]
+        let offset = (nth - before) as u32;
+        word * 64 + nth_set(held, offset) as usize
     }
 }
 

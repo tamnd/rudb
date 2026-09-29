@@ -219,6 +219,39 @@ impl Rids {
         }
     }
 
+    /// How many of the runs of `part` rows the table splits into hold a member.
+    ///
+    /// What a scan asks before reading a set's rows, since a part with none is skipped. A dense set
+    /// answers a word at a time rather than a member at a time, which on q09 was 17M instructions
+    /// for 320 thousand members.
+    #[must_use]
+    pub fn parts_touched(&self, part: u64) -> u64 {
+        if part == 0 || self.rows == 0 {
+            return 0;
+        }
+        match &self.body {
+            Body::Full => self.rows.div_ceil(part),
+            Body::Sparse(members) => {
+                let (mut touched, mut last) = (0, u64::MAX);
+                for &member in members {
+                    if member / part != last {
+                        last = member / part;
+                        touched += 1;
+                    }
+                }
+                touched
+            }
+            Body::Dense { .. } => {
+                let parts = self.rows.div_ceil(part);
+                count(
+                    (0..parts)
+                        .filter(|&at| self.any_between(at * part, at * part + part - 1))
+                        .count(),
+                )
+            }
+        }
+    }
+
     /// The members, in increasing order.
     pub fn iter(&self) -> impl Iterator<Item = Rid> + '_ {
         let (full, sparse, dense) = match &self.body {
@@ -737,6 +770,26 @@ mod tests {
                 .collect::<Vec<_>>();
             let len = usize::try_from(len).expect("small");
             assert_eq!(set.offsets_in(first, len), slow, "from {first} for {len}");
+        }
+    }
+
+    #[test]
+    fn the_parts_touched_are_the_parts_a_member_falls_in() {
+        let rows = 50_000;
+        let dense: Vec<Rid> = (0..rows).filter(|rid| rid % 3 == 0 && rid % 7000 < 900).collect();
+        let sparse: Vec<Rid> = vec![5, 2047, 2048, 30_000, 49_999];
+        for members in [dense, sparse, (0..rows).collect(), Vec::new()] {
+            let set = Rids::from_sorted(rows, members.clone()).expect("sorted");
+            for part in [1, 63, 64, 100, 2048, 70_000] {
+                let mut slow: Vec<Rid> = members.iter().map(|rid| rid / part).collect();
+                slow.dedup();
+                assert_eq!(
+                    set.parts_touched(part),
+                    slow.len() as u64,
+                    "{:?} by {part}",
+                    set.form()
+                );
+            }
         }
     }
 

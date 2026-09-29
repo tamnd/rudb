@@ -477,7 +477,7 @@ impl KeyMap {
                     .chunks_exact(size_of::<u64>())
                     .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")))
                     .collect();
-                let rank = Rank::read(&rest[bitmap..], words)?;
+                let rank = Rank::read(&rest[bitmap..], &bits)?;
                 observed.max = Some(
                     base.checked_add(i128::from(range) - 1)
                         .ok_or_else(|| malformed("a dense key map's range overflows"))?,
@@ -541,7 +541,7 @@ impl KeyMap {
                     .chunks_exact(size_of::<u64>())
                     .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")))
                     .collect();
-                let rank = Rank::read(&rest[bitmap..bitmap + ranks], words)?;
+                let rank = Rank::read(&rest[bitmap..bitmap + ranks], &bits)?;
                 let rid_width = usize::from(rest[bitmap + ranks]);
                 if rid_width == 0 || rid_width > 64 {
                     return Err(malformed("a permuted key map's width is not one a u64 can take"));
