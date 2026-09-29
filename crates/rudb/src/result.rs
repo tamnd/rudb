@@ -48,7 +48,11 @@ pub struct QueryResult {
     held: Arc<Reservation>,
     /// What the execution that produced these rows measured about itself, when it was an execution
     /// at all.
-    metrics: Option<Document>,
+    ///
+    /// Boxed because a document is most of a kilobyte and a result is moved about by value. Held
+    /// inline it made every result that large, and a trickled `INSERT` copied its count answer
+    /// four times on the way out.
+    metrics: Option<Box<Document>>,
     /// The session whose zone decides how zoned values are rendered.
     session: Session,
     /// The instant used to choose the offset for a zoned time with no date of its own.
@@ -91,7 +95,7 @@ impl QueryResult {
     /// The same result, carrying the document the execution that produced it filled in.
     #[must_use]
     pub(crate) fn measured(mut self, metrics: Document) -> Self {
-        self.metrics = Some(metrics);
+        self.metrics = Some(Box::new(metrics));
         self
     }
 
@@ -219,7 +223,7 @@ impl QueryResult {
     /// holding the result of a particular one.
     #[must_use]
     pub fn metrics(&self) -> Option<&Document> {
-        self.metrics.as_ref()
+        self.metrics.as_deref()
     }
 
     /// How many columns.
@@ -377,3 +381,7 @@ impl QueryResult {
         self.chunks.iter().map(|chunk| RecordBatch::of(chunk, &self.names)).collect()
     }
 }
+
+// Every statement hands a result back by value through a few layers, so its size is a copy paid
+// per statement. It was 768 bytes with the metrics document held inline.
+const _: () = assert!(size_of::<QueryResult>() <= 256, "a result has grown past 256 bytes");
