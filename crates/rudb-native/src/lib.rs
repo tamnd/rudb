@@ -4593,19 +4593,25 @@ struct Cached {
 /// same pool and under the same budget as the pages, and a page nobody reads any more because its
 /// parts are all held here goes first when the pool is over.
 ///
-/// A part is held once a read wants all of it, or once the reads that wanted some of its rows
-/// have between them decoded as many rows as it has. Until then each of those reads decodes its
-/// own rows and no more and adds them to the count. Decoding the part whole on its second read,
-/// which is what this did first, took JOB 3a's second run from 1.4 to 4.2 billion instructions,
-/// since it decompressed all of `movie_info.info` to use a few rows of it. Counting rows is the
-/// ski rental answer: a part is never decoded whole before sparse reads have already paid about
-/// what that costs, so the most it can cost over decoding only what is asked is about double.
-/// With all of that the 113 queries ran on well under two thirds of the instructions.
+/// A part is held by the first read after the reads before it have between them decoded as many
+/// rows as it has. Until then each read decodes the rows it wants and no more and adds them to the
+/// count, and a read that wants all of it adds all of them. Decoding the part whole on its second
+/// read, which is what this did first, took JOB 3a's second run from 1.4 to 4.2 billion
+/// instructions, since it decompressed all of `movie_info.info` to use a few rows of it. Counting
+/// rows is the ski rental answer: a part is never decoded whole before sparse reads have already
+/// paid about what that costs, so the most it can cost over decoding only what is asked is about
+/// double. With all of that the 113 queries ran on well under two thirds of the instructions.
+///
+/// A whole read pays the rent too, rather than holding the part at once. A query that runs once
+/// reads each part of a column once, and holding what it decoded kept every column it scanned in
+/// memory for nothing: ClickBench q19 peaked at 364 MB against 159 before parts were held, and
+/// the copy the read took of a part it had just put in the pool cost time as well. A part read a
+/// second time is still held from then on.
 #[derive(Debug, Default)]
 enum PartSlot {
     #[default]
     Unseen,
-    /// The rows sparse reads have decoded so far.
+    /// The rows reads have decoded so far.
     Seen(usize),
     Held {
         vector: Arc<Vector>,
@@ -8407,12 +8413,11 @@ impl Reader {
                     PartSlot::Seen(before) => *before,
                     _ => 0,
                 };
-                let Some(kept) = positions else { return Err(true) };
-                let after = before + kept.len();
-                if after >= rows {
+                if before >= rows {
                     return Err(true);
                 }
-                *held = PartSlot::Seen(after);
+                let wanted = positions.map_or(rows, <[u32]>::len);
+                *held = PartSlot::Seen(before.saturating_add(wanted));
                 Err(false)
             }
         }
@@ -16300,8 +16305,8 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A part read a second time comes out of the pool already decoded, a sparse first read only
-    /// marks it, and a part the pool lets go is decoded again from its pages.
+    /// A part is held once reads of it have decoded all its rows, a first read of some or all of
+    /// it only counts them, and a part the pool lets go is decoded again from its pages.
     #[test]
     fn a_pool_keeps_decoded_parts_and_lets_them_go_under_its_budget() {
         let path = path("decoded-parts");
@@ -16328,15 +16333,18 @@ mod tests {
         assert_eq!(sparse.value_at(0, 0), Value::Integer(3));
         assert!(matches!(*slot(0), PartSlot::Seen(1)), "a sparse first read only counts its rows");
         assert_eq!(pool.bytes(), 0, "and keeps nothing");
-        for _ in 0..62 {
+        for _ in 0..63 {
             a.read_rows(0, &[0], &[3], false).expect("one row");
         }
-        assert!(matches!(*slot(0), PartSlot::Seen(63)), "and so do the ones after it");
+        assert!(matches!(*slot(0), PartSlot::Seen(64)), "and so do the ones after it");
         a.read_rows(0, &[0], &[3], false).expect("one row");
         assert!(
             matches!(*slot(0), PartSlot::Held { .. }),
             "until they have decoded as many rows as the part has"
         );
+        let whole = a.read(1, &[0]).expect("a part");
+        assert_eq!(whole.len(), 64);
+        assert!(matches!(*slot(1), PartSlot::Seen(64)), "a whole first read only counts its rows");
 
         for _ in 0..2 {
             for part in 0..parts {
