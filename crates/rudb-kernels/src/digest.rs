@@ -16,7 +16,7 @@
 //! rather than the most negative one, so over values that are all negative the top quantile is
 //! 2.2e-308, above every value, which is tamnd/duckdb#16. This starts it at the most negative one.
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
 
 use crate::quantile::Column;
 
@@ -325,6 +325,107 @@ impl Digest {
             (None, _) => Err(Error::internal("an approx_quantile without its fraction")),
         }
     }
+}
+
+/// The layout of an `approx_quantile` state: how many values went in, the smallest and largest of
+/// them, and the centroids.
+pub(crate) fn digest_layout() -> LogicalType {
+    let centroid = centroid_type();
+    LogicalType::Struct(vec![
+        Field::new("count", LogicalType::UBigInt),
+        Field::new("min", LogicalType::Double),
+        Field::new("max", LogicalType::Double),
+        Field::new("centroids", LogicalType::List(Box::new(centroid))),
+    ])
+}
+
+/// One centroid of the state, its mean and its weight.
+fn centroid_type() -> LogicalType {
+    LogicalType::Struct(vec![
+        Field::new("mean", LogicalType::Double),
+        Field::new("weight", LogicalType::Double),
+    ])
+}
+
+impl Digest {
+    /// The state written out the way the pin writes it, with the waiting values sorted in first,
+    /// or null for a group that saw nothing.
+    pub(crate) fn export(&self) -> Value {
+        let Some(held) = self.digest.as_ref().filter(|_| self.count > 0) else {
+            return Value::Null;
+        };
+        let mut digest = held.clone();
+        digest.process();
+        let centroids = digest.packed.iter().map(|centroid| {
+            Value::Struct(vec![
+                ("mean".to_string(), Value::Double(centroid.mean)),
+                ("weight".to_string(), Value::Double(centroid.weight)),
+            ])
+        });
+        Value::Struct(vec![
+            ("count".to_string(), Value::UBigInt(self.count)),
+            ("min".to_string(), Value::Double(digest.min)),
+            ("max".to_string(), Value::Double(digest.max)),
+            (
+                "centroids".to_string(),
+                Value::List { element: centroid_type(), values: centroids.collect() },
+            ),
+        ])
+    }
+
+    /// The state `export` wrote, read back with the pin's checks, or an empty one for a null.
+    ///
+    /// # Errors
+    ///
+    /// If a field is null, or a state that counted values has no centroids.
+    pub(crate) fn import(value: &Value) -> Result<Self> {
+        let Value::Struct(fields) = value else {
+            return if value.is_null() {
+                Ok(Self::default())
+            } else {
+                Err(Error::internal(format!("an approx_quantile state {value:?}")))
+            };
+        };
+        let field = |name: &str| fields.iter().find(|(held, _)| held == name).map(|(_, v)| v);
+        let (Some(Value::UBigInt(count)), Some(&Value::Double(min)), Some(&Value::Double(max))) =
+            (field("count"), field("min"), field("max"))
+        else {
+            return Err(broken("the state fields cannot be NULL"));
+        };
+        let Some(Value::List { values: centroids, .. }) = field("centroids") else {
+            return Err(broken("the state fields cannot be NULL"));
+        };
+        if *count != 0 && centroids.is_empty() {
+            return Err(broken("non-zero count requires at least one centroid"));
+        }
+        let mut packed = Vec::with_capacity(centroids.len());
+        for centroid in centroids {
+            let Value::Struct(parts) = centroid else {
+                return Err(broken("the centroids cannot be NULL"));
+            };
+            let part = |name: &str| parts.iter().find(|(held, _)| held == name).map(|(_, v)| v);
+            let (Some(&Value::Double(mean)), Some(&Value::Double(weight))) =
+                (part("mean"), part("weight"))
+            else {
+                return Err(broken("the centroids cannot be NULL"));
+            };
+            packed.push(Centroid { mean, weight });
+        }
+        let packed_weight = packed.iter().map(|centroid| centroid.weight).sum();
+        let digest = TDigest {
+            min,
+            max,
+            packed_weight,
+            waiting_weight: 0.0,
+            packed,
+            waiting: Vec::new(),
+        };
+        Ok(Self { digest: Some(digest), count: *count })
+    }
+}
+
+fn broken(what: &str) -> Error {
+    Error::invalid_input(format!("Invalid approx_quantile state - {what}"))
 }
 
 /// A value as the double the digest holds, or `None` for a kind it does not hold.
