@@ -466,7 +466,7 @@ fn rewrite(
 }
 
 /// `expr` with every column of B it reads pointed at the partial aggregate's column for it.
-fn rebind(
+pub(crate) fn rebind(
     plan: &mut Plan,
     expr: ExprRef,
     moved: &HashMap<ColumnBinding, ColumnBinding>,

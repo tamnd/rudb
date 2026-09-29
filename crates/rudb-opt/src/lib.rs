@@ -38,6 +38,7 @@ pub mod nonulls;
 pub mod nulls;
 pub mod order;
 pub mod pass;
+pub mod pregroup;
 pub mod presize;
 pub mod reorder;
 pub mod semi;
@@ -173,6 +174,11 @@ pub const RANK: u8 = 11;
 /// over two inputs with different indexes, and there is nothing to gain by relying on it. It goes
 /// after the average rewrite so that an average beside a sum has already become the sum it can read.
 ///
+/// Grouping by a string column first is right after that and before filter pushdown too. An
+/// average it splits leaves a projection over the aggregate, and a `HAVING` above has to go down
+/// through that projection to the aggregate it tests. Filter pushdown is what moves it there, so
+/// running after pushdown would leave the filter for the next run and the passes would not settle.
+///
 /// Dropping an unread materialisation is after the empty result pullup and before everything that
 /// moves an operator around. After, because the pullup is what turns a body into an empty relation
 /// and a body that has become one reads nothing, so a run that looked before it would find the work
@@ -212,7 +218,7 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 33] = [
+pub static PASSES: [&(dyn Pass + Sync); 34] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -220,6 +226,7 @@ pub static PASSES: [&(dyn Pass + Sync); 33] = [
     &unique::RowsAreGroups,
     &shared::CommonAggregate,
     &total::TotalFromGroups,
+    &pregroup::PreGrouping,
     &filter::FilterPushdown,
     &delim::Deliminator,
     &consistent::ConsistentExtremes,
@@ -358,7 +365,7 @@ pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
 /// searches, and everything after it is choosing how the plan runs, which is what somebody means by
 /// the optimizer. A test holds the index to the pass, so a pass added in front of join ordering
 /// moves the line with it or fails.
-pub const REWRITES: usize = 10;
+pub const REWRITES: usize = 11;
 
 /// [`optimize_with`], saying how many wall nanoseconds of it were the rewrites.
 ///
