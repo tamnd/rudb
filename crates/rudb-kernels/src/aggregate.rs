@@ -4569,7 +4569,7 @@ fn extreme<const DIRECT: bool, M: Fn(usize) -> usize>(
 pub(crate) mod export;
 
 pub(crate) use export::state_call;
-pub use export::{EXPORTED, finalize_name, state_layout};
+pub use export::{EXPORTED, finalize_name, state_constants, state_layout};
 
 #[cfg(test)]
 mod tests {

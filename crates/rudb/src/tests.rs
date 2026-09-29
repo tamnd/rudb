@@ -12068,6 +12068,50 @@ fn export_state_writes_the_states_the_pin_writes_and_finalize_and_combine_read_t
 }
 
 #[test]
+fn a_list_a_string_agg_and_a_quantile_export_their_states_and_combine_the_way_the_pin_does() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let two = |call: &str, from: &str, to: &str| {
+        format!(
+            "SELECT finalize(combine((SELECT {call} EXPORT_STATE FROM range({from}) r(x)), \
+             (SELECT {call} EXPORT_STATE FROM range({to}) r(x))))"
+        )
+    };
+    for (sql, answer) in [
+        (
+            "SELECT list(x) EXPORT_STATE, finalize(list(x) EXPORT_STATE) FROM range(3) r(x)"
+                .to_string(),
+            "[0, 1, 2],[0, 1, 2]",
+        ),
+        ("SELECT list(x) EXPORT_STATE FROM range(0) r(x)".to_string(), "NULL"),
+        (two("list(x)", "2", "5, 7"), "[5, 6, 0, 1]"),
+        (two("string_agg(x::VARCHAR, '|')", "3", "3, 5"), "3|4|0|1|2"),
+        (
+            "SELECT finalize(quantile_cont(x, 0.25) EXPORT_STATE), \
+             finalize(median(x) EXPORT_STATE) FROM range(5) r(x)"
+                .to_string(),
+            "1.0,2.0",
+        ),
+        (two("first(x)", "1, 3", "5, 7"), "5"),
+        (two("last(x)", "1, 3", "5, 7"), "6"),
+        (two("first(x::VARCHAR)", "1, 3", "5, 7"), "5"),
+        (two("last(x::VARCHAR)", "1, 3", "5, 7"), "2"),
+    ] {
+        assert_eq!(text(&sql), answer, "{sql}");
+    }
+    let sql =
+        "SELECT combine(string_agg('a', '|') EXPORT_STATE, string_agg('a', '-') EXPORT_STATE)";
+    let error = db.execute(sql).expect_err(sql);
+    assert!(error.message().contains("different parameters"), "{error}");
+}
+
+#[test]
 fn a_grouped_export_finalizes_to_what_the_plain_aggregate_answers() {
     let db = Database::new();
     let text = |sql: &str| {
