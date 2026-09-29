@@ -1039,7 +1039,7 @@ impl Rows {
         rule: &dyn Fn(&Range) -> bool,
     ) -> bool {
         let memory = |rows: &MemoryTable, stripe| {
-            rows.group_zone(stripe).and_then(|zone| zone.column(column)).is_some_and(rule)
+            rows.group_zone(stripe).is_some_and(|zone| zone.column(column).is_some_and(rule))
         };
         match self {
             Self::Memory(rows) => memory(rows, stripe),
