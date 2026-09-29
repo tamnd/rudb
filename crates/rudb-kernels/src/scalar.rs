@@ -2541,6 +2541,34 @@ impl StableLike {
         }
         let mut bits = [0_u64; LIKE_GROUP / MEMO_VALUES];
         let mut at = first;
+        // One search over the group's values laid end to end, for the reason on `like_joined`: a
+        // name is fifteen bytes and starting a search costs more than running it over them.
+        if let Some(joined_like) = Joined::of(like) {
+            let mut joined = Vec::new();
+            let mut ends = Vec::with_capacity(last - first);
+            while at < last {
+                let stopped = self.dictionary.sweep_text(at, last, &mut |index, text: &[u8]| {
+                    // A value the sweep passes over is an empty string, which matches nothing.
+                    while ends.len() < index - first {
+                        ends.push(joined.len());
+                    }
+                    joined.extend_from_slice(text);
+                    ends.push(joined.len());
+                    Ok(())
+                })?;
+                if stopped <= at {
+                    return Err(Error::internal("a dictionary sweep did not move"));
+                }
+                at = stopped;
+            }
+            let mut held = vec![false; ends.len()];
+            joined_like.search(&joined, &ends, &mut held);
+            for (index, held) in held.into_iter().enumerate() {
+                let (word, shift) = Self::slot(index);
+                bits[word] |= (1 | u64::from(held != like.negated) << 1) << shift;
+            }
+            at = last;
+        }
         while at < last {
             let stopped =
                 self.dictionary.sweep_text(at, last, &mut |index: usize, text: &[u8]| {
@@ -2814,22 +2842,8 @@ fn like_joined<'a>(
     rows: usize,
     returns: &LogicalType,
 ) -> Result<Option<Vector>> {
-    if like.fold_case {
-        return Ok(None);
-    }
-    let (finder, split) = match &like.compiled {
-        Pattern::Contains(finder) => (&**finder, None),
-        Pattern::Segments(split) => {
-            let Some(longest) = split.middles.iter().max_by_key(|finder| finder.needle().len())
-            else {
-                return Ok(None);
-            };
-            (longest, Some(&**split))
-        }
-        _ => return Ok(None),
-    };
-    let needle = finder.needle().len();
-    if needle == 0 || matches!(base, Validity::AllInvalid) {
+    let Some(joined_like) = Joined::of(like) else { return Ok(None) };
+    if matches!(base, Validity::AllInvalid) {
         return Ok(None);
     }
     let mut joined = Vec::new();
@@ -2839,24 +2853,7 @@ fn like_joined<'a>(
         ends.push(joined.len());
     }
     let mut out = vec![false; rows];
-    let (mut from, mut row) = (0, 0);
-    while let Some(found) = joined.get(from..).and_then(|rest| finder.find(rest)) {
-        let at = from + found;
-        while ends[row] <= at {
-            row += 1;
-        }
-        if at + needle <= ends[row] {
-            out[row] = match split {
-                Some(split) => split.holds(text(row)?),
-                None => true,
-            };
-        }
-        from = ends[row];
-        row += 1;
-        if row == rows {
-            break;
-        }
-    }
+    joined_like.search(&joined, &ends, &mut out);
     // A null row answers false underneath its null, which is what the loop a string at a time
     // leaves there, so the two give the same bytes and not only the same values.
     for (index, slot) in out.iter_mut().enumerate() {
@@ -2864,6 +2861,50 @@ fn like_joined<'a>(
             (*slot != like.negated) && !matches!(base, Validity::Mask(mask) if !mask.get(index));
     }
     finish(returns, Data::Bool(out.into()), base.clone().normalize(rows))
+}
+
+/// The search [`like_joined`] runs, for a pattern it speeds up.
+struct Joined<'a> {
+    finder: &'a memmem::Finder<'static>,
+    split: Option<&'a Split>,
+}
+
+impl<'a> Joined<'a> {
+    fn of(like: &'a Like) -> Option<Self> {
+        if like.fold_case {
+            return None;
+        }
+        let (finder, split) = match &like.compiled {
+            Pattern::Contains(finder) => (&**finder, None),
+            Pattern::Segments(split) => {
+                let longest = split.middles.iter().max_by_key(|finder| finder.needle().len())?;
+                (longest, Some(&**split))
+            }
+            _ => return None,
+        };
+        (!finder.needle().is_empty()).then_some(Self { finder, split })
+    }
+
+    /// Sets `out[row]` for each string of `joined` that matches, where string `row` ends at
+    /// `ends[row]` and starts where the one before it ends, leaving the rest alone.
+    fn search(&self, joined: &[u8], ends: &[usize], out: &mut [bool]) {
+        let needle = self.finder.needle().len();
+        let (mut from, mut row) = (0, 0);
+        while row < ends.len()
+            && let Some(found) = joined.get(from..).and_then(|rest| self.finder.find(rest))
+        {
+            let at = from + found;
+            while ends[row] <= at {
+                row += 1;
+            }
+            if at + needle <= ends[row] {
+                let start = if row == 0 { 0 } else { ends[row - 1] };
+                out[row] = self.split.is_none_or(|split| split.holds(&joined[start..ends[row]]));
+            }
+            from = ends[row];
+            row += 1;
+        }
+    }
 }
 
 fn like_vector_run(
