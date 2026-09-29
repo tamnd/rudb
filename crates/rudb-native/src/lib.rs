@@ -4583,6 +4583,11 @@ struct Cached {
     passing: VecDeque<usize>,
 }
 
+/// How many rows of a whole unpack one integer unpacked on its own costs, about. Past one row in
+/// this many [`decode_at`] unpacks the whole part instead, and a read at positions pays this much a
+/// row toward holding its part. See [`paid_at`].
+const SPARSE_RENT: usize = 8;
+
 /// One part of one column as decoding left it, held so that the next scan of it does not decode it
 /// again.
 ///
@@ -4600,7 +4605,8 @@ struct Cached {
 /// instructions, since it decompressed all of `movie_info.info` to use a few rows of it. Counting
 /// rows is the ski rental answer: a part is never decoded whole before sparse reads have already
 /// paid about what that costs, so the most it can cost over decoding only what is asked is about
-/// double. With all of that the 113 queries ran on well under two thirds of the instructions.
+/// double. The rent is counted in what a read cost rather than in the rows it wanted, see
+/// [`paid_at`]. With all of that the 113 queries ran on well under two thirds of the instructions.
 ///
 /// A whole read pays the rent too, rather than holding the part at once. A query that runs once
 /// reads each part of a column once, and holding what it decoded kept every column it scanned in
@@ -8394,6 +8400,9 @@ impl Reader {
             // run into the `Arc` without touching a value.
             let mut vector = match positions {
                 Some(positions) if !keeping => {
+                    if keeps {
+                        self.pay(at, column, paid_at(rows, bytes, positions));
+                    }
                     decode_at(&field.ty, rows, bytes, dictionary, positions)?
                 }
                 _ => decode(&field.ty, rows, bytes, dictionary)?,
@@ -8463,11 +8472,25 @@ impl Reader {
                 if before >= rows || again {
                     return Err(true);
                 }
-                let wanted = positions.map_or(rows, <[u32]>::len);
-                *held = PartSlot::Seen(before.saturating_add(wanted));
+                // A read at positions counts what it cost once it knows how the part is coded.
+                // See [`Self::pay`].
+                if positions.is_none() {
+                    *held = PartSlot::Seen(before.saturating_add(rows));
+                }
                 Err(false)
             }
         }
+    }
+
+    /// Adds `rows` to what reads of part `at` of `column` have paid, unless it is held already.
+    fn pay(&self, at: usize, column: usize, rows: usize) {
+        let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else { return };
+        let before = match &*held {
+            PartSlot::Held { .. } => return,
+            PartSlot::Seen(before) => *before,
+            PartSlot::Unseen => 0,
+        };
+        *held = PartSlot::Seen(before.saturating_add(rows));
     }
 
     /// Holds `vector` as part `at` of `column` and counts it against the pool, and answers what the
@@ -13532,11 +13555,8 @@ fn decode_at(
     }
     // Past about one row in eight, unpacking the whole part and picking the rows out is the cheaper
     // of the two, since a unit unpacks at a fraction of what a row unpacked on its own costs.
-    if bytes.first() == Some(&5)
-        && positions.len().saturating_mul(8) <= rows
-        // Past the codec, the validity flag and the mask a flag of 2 has.
-        && bytes
-            .get(2 + if bytes.get(1) == Some(&2) { rows.div_ceil(8) } else { 0 }..)
+    if positions.len().saturating_mul(SPARSE_RENT) <= rows
+        && cascade_body(rows, bytes)
             .is_some_and(|body| integer::pointed(body) || integer::run_length(body))
     {
         return cascade_at(ty, rows, bytes, positions);
@@ -13565,6 +13585,38 @@ fn decode_at(
     let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
     push_values(&mut values, ty, &ends)?;
     Ok(Vector::flat(ty.clone(), Data::Varlen(values))?.with_validity(validity))
+}
+
+/// The body of an integer cascade page, past the codec, the validity flag and the mask a flag of
+/// 2 has, or `None` for a page of another codec.
+fn cascade_body(rows: usize, bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.first() != Some(&5) {
+        return None;
+    }
+    bytes.get(2 + if bytes.get(1) == Some(&2) { rows.div_ceil(8) } else { 0 }..)
+}
+
+/// What [`decode_at`] costs to read `positions` of a part of `rows` rows, in rows of decoding the
+/// part whole, which is what a read at positions adds to the count [`PartSlot`] keeps.
+///
+/// A compressed string finds a row by decompressing the block it is in, which costs about what the
+/// row costs in a whole read. An integer in packed units found on its own costs about
+/// [`SPARSE_RENT`] times what it costs when its unit is unpacked whole. Everything else costs the
+/// whole part: a page [`decode_at`] decodes whole and gathers from, and a chunk of runs, which
+/// walks every run to find a row. Counting all of those as one row a position was what kept JOB
+/// 20b walking the runs of `cast_info` and 31a expanding them on every warm run, since a read that
+/// paid for the whole part counted a few of its rows and the part was never held.
+fn paid_at(rows: usize, bytes: &[u8], positions: &[u32]) -> usize {
+    let wanted = positions.len();
+    if bytes.first() == Some(&6) {
+        return wanted;
+    }
+    let pointed = cascade_body(rows, bytes).is_some_and(integer::pointed);
+    if pointed && wanted.saturating_mul(SPARSE_RENT) <= rows {
+        wanted.saturating_mul(SPARSE_RENT)
+    } else {
+        rows
+    }
 }
 
 /// The rows `positions` names of an integer cascade page, unpacked at those rows alone.
@@ -16376,28 +16428,32 @@ mod tests {
         let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
         let a = catalog.table("a").expect("a");
         let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
+        let paid = |part: usize| match *slot(part) {
+            PartSlot::Seen(paid) => Some(paid),
+            _ => None,
+        };
         let sparse = a.read_rows(0, &[0], &[3], false).expect("one row");
         assert_eq!(sparse.value_at(0, 0), Value::Integer(3));
-        assert!(matches!(*slot(0), PartSlot::Seen(1)), "a sparse first read only counts its rows");
+        let first = paid(0).expect("a sparse first read only counts what it cost");
+        assert!(first > 0, "which is something");
         assert_eq!(pool.bytes(), 0, "and keeps nothing");
-        for _ in 0..63 {
+        let mut reads = 1;
+        while paid(0).expect("and so do the ones after it") < 64 {
             a.read_rows(0, &[0], &[3], false).expect("one row");
+            reads += 1;
         }
-        assert!(matches!(*slot(0), PartSlot::Seen(64)), "and so do the ones after it");
+        assert!(reads <= 64, "a read pays at least a row");
         a.read_rows(0, &[0], &[3], false).expect("one row");
         assert!(
             matches!(*slot(0), PartSlot::Held { .. }),
-            "until they have decoded as many rows as the part has"
+            "until they have paid for as many rows as the part has"
         );
         let whole = a.read(1, &[0]).expect("a part");
         assert_eq!(whole.len(), 64);
         assert!(matches!(*slot(1), PartSlot::Seen(64)), "a whole first read only counts its rows");
         a.expect_again(0);
         a.read_rows(2, &[0], &[3], false).expect("one row");
-        assert!(
-            matches!(*slot(2), PartSlot::Seen(1)),
-            "a column read again still counts sparse reads"
-        );
+        assert_eq!(paid(2), Some(first), "a column read again still counts sparse reads");
         a.read(3, &[0]).expect("a part");
         assert!(
             matches!(*slot(3), PartSlot::Held { .. }),
