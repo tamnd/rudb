@@ -3369,13 +3369,6 @@ fn floored<const UNIT: i64>(
     })
 }
 
-/// The four `date_part` and `date_trunc` loops, once the form has been turned into a mapping.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the part, the days or microseconds and their mapping, the nulls, the row count, the \
-              type of the answer, the vector whose type picks the arm and which of the two \
-              functions this is"
-)]
 /// The years a run of dates falls in, as the first of them and the day each later one starts.
 ///
 /// A date column in a chunk usually spans a few years, so the year of a date is the first year plus
@@ -3414,6 +3407,13 @@ impl Years {
     }
 }
 
+/// The four `date_part` and `date_trunc` loops, once the form has been turned into a mapping.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the part, the days or microseconds and their mapping, the nulls, the row count, the \
+              type of the answer, the vector whose type picks the arm and which of the two \
+              functions this is"
+)]
 fn date_runs<A: Fn(usize) -> usize>(
     part: Part,
     data: &Data,
