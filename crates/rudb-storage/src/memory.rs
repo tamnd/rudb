@@ -947,10 +947,22 @@ impl MemoryTable {
 
     /// Appends one row, which goes to the tail as its values.
     ///
-    /// The statistics are taken from a one-row chunk of it, the same chunk [`Self::append`] would
-    /// have been handed, so the zone and the counts come out as they would have. It is the laying
+    /// The statistics are the ones a one-row chunk of it would have, the same chunk
+    /// [`Self::append`] would have been handed. For a row of plain values they are worked out from
+    /// the values, and anything else is built into the chunk and taken from that. It is the laying
     /// out that waits for the tail to close.
     fn append_row(&mut self, row: &[Value]) -> Result<()> {
+        // A row of plain values has its zone and counts worked out from the values, which is what
+        // the one-row chunk would have given them without the chunk.
+        let started = Instant::now();
+        if let Some(zone) = Zone::of_row(row, &self.types) {
+            let zoned = Instant::now();
+            self.counts.add_row(row);
+            let done = Instant::now();
+            self.counts_ns += done.duration_since(zoned).as_nanos() as u64;
+            self.stats_ns += done.duration_since(started).as_nanos() as u64;
+            return self.trail(Piece::Row(row.to_vec()), zone);
+        }
         let mut columns = Vec::with_capacity(self.types.len());
         for (value, ty) in row.iter().zip(&self.types) {
             columns.push(Vector::from_values(ty.clone(), std::slice::from_ref(value))?);

@@ -62,8 +62,8 @@
 
 use std::cmp::Ordering;
 
-use rudb_common::Value;
 use rudb_common::bounds::{Bound, Op, certain, excluded, scaled_as};
+use rudb_common::{LogicalType, Value};
 use rudb_vector::{Chunk, Data, Form, Packed, StringView, Vector};
 
 #[cfg(doc)]
@@ -112,6 +112,80 @@ impl Range {
     #[must_use]
     pub fn of(vector: &Vector) -> Self {
         range(vector)
+    }
+
+    /// The range [`Range::of`] gives a one-row vector of `ty` holding `value`, worked out from the
+    /// value without building the vector.
+    ///
+    /// A row inserted on its own used to be a vector a column only for this and the counts to walk,
+    /// and building those was a fifth of what the insert cost. `None` for a value that is not of
+    /// type `ty`, and for the types this does not answer, which are the ones whose walk has more to
+    /// it than one integer, float or string: a decimal, a `UHUGEINT`, a time zone and every nested
+    /// type. The caller builds the vector for those. A test holds the two answers together.
+    #[must_use]
+    pub fn of_one(value: &Value, ty: &LogicalType) -> Option<Self> {
+        let int = |number: i128, sum: Option<i128>| {
+            let bound = Some(scaled_as(Bound::Int(number), ty));
+            Some(Self { low: bound.clone(), high: bound, nulls: 0, exact: true, sum })
+        };
+        let real = |number: f64| {
+            let bound = (!number.is_nan()).then_some(Bound::Real(number));
+            Some(Self { low: bound.clone(), high: bound, nulls: 0, exact: false, sum: None })
+        };
+        use LogicalType as T;
+        match (value, ty) {
+            (Value::Null, T::Float | T::Double) => {
+                Some(Self { nulls: 1, exact: false, ..Self::default() })
+            }
+            (Value::Null, T::Varchar | T::HugeInt) => {
+                Some(Self { nulls: 1, exact: true, ..Self::default() })
+            }
+            (
+                Value::Null,
+                T::Boolean
+                | T::TinyInt
+                | T::SmallInt
+                | T::Integer
+                | T::BigInt
+                | T::UTinyInt
+                | T::USmallInt
+                | T::UInteger
+                | T::UBigInt
+                | T::Date
+                | T::Time
+                | T::Timestamp
+                | T::TimestampS
+                | T::TimestampMs
+                | T::TimestampNs
+                | T::TimestampTz,
+            ) => Some(Self { nulls: 1, exact: true, sum: Some(0), ..Self::default() }),
+            (Value::Boolean(v), T::Boolean) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::TinyInt(v), T::TinyInt) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::SmallInt(v), T::SmallInt) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::Integer(v), T::Integer) | (Value::Date(v), T::Date) => {
+                int(i128::from(*v), Some(i128::from(*v)))
+            }
+            (Value::BigInt(v), T::BigInt)
+            | (Value::Time(v), T::Time)
+            | (Value::Timestamp(v), T::Timestamp)
+            | (Value::TimestampS(v), T::TimestampS)
+            | (Value::TimestampMs(v), T::TimestampMs)
+            | (Value::TimestampNs(v), T::TimestampNs)
+            | (Value::TimestampTz(v), T::TimestampTz) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::UTinyInt(v), T::UTinyInt) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::USmallInt(v), T::USmallInt) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::UInteger(v), T::UInteger) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::UBigInt(v), T::UBigInt) => int(i128::from(*v), Some(i128::from(*v))),
+            // A sixteen byte column has exact ends and no total, the first reason on `sum`.
+            (Value::HugeInt(v), T::HugeInt) => int(*v, None),
+            (Value::Float(v), T::Float) => real(f64::from(*v)),
+            (Value::Double(v), T::Double) => real(*v),
+            (Value::Varchar(text), T::Varchar) => {
+                let bound = Some(Bound::Bytes(text.as_bytes().to_vec()));
+                Some(Self { low: bound.clone(), high: bound, nulls: 0, exact: true, sum: None })
+            }
+            _ => None,
+        }
     }
 
     /// Whether this range says no row of the chunk can pass `probe`.
@@ -190,6 +264,17 @@ pub struct Zone {
 }
 
 impl Zone {
+    /// The zone [`Zone::of`] gives a one-row chunk of `row`, or `None` when some value in it is one
+    /// [`Range::of_one`] does not answer.
+    #[must_use]
+    pub fn of_row(row: &[Value], types: &[LogicalType]) -> Option<Self> {
+        if row.len() != types.len() {
+            return None;
+        }
+        let columns = row.iter().zip(types).map(|(value, ty)| Range::of_one(value, ty));
+        Some(Self { columns: columns.collect::<Option<_>>()? })
+    }
+
     /// Builds a zone from persisted ranges.
     #[must_use]
     pub fn from_ranges(columns: Vec<Range>) -> Self {
@@ -795,6 +880,84 @@ mod tests {
     use rudb_vector::{Bitmap, Chunk, Validity, Vector};
 
     use super::{Bound, Op, Probe, Range, Zone};
+
+    /// Values of every type the value path answers, with the edges each one has: nulls, the ends of
+    /// the range, a NaN and both zeroes, and strings short enough to sit in the view and long enough
+    /// not to.
+    fn samples() -> Vec<(LogicalType, Vec<Value>)> {
+        let long = "a string long enough to live in the arena rather than the view".to_owned();
+        vec![
+            (LogicalType::Boolean, vec![Value::Boolean(true), Value::Boolean(false), Value::Null]),
+            (LogicalType::TinyInt, vec![Value::TinyInt(i8::MIN), Value::TinyInt(7), Value::Null]),
+            (LogicalType::SmallInt, vec![Value::SmallInt(i16::MAX), Value::SmallInt(-3)]),
+            (LogicalType::Integer, vec![Value::Integer(i32::MIN), Value::Integer(0), Value::Null]),
+            (LogicalType::BigInt, vec![Value::BigInt(i64::MAX), Value::BigInt(-1), Value::Null]),
+            (LogicalType::HugeInt, vec![Value::HugeInt(i128::MIN), Value::HugeInt(5), Value::Null]),
+            (LogicalType::UTinyInt, vec![Value::UTinyInt(u8::MAX), Value::Null]),
+            (LogicalType::USmallInt, vec![Value::USmallInt(u16::MAX), Value::USmallInt(0)]),
+            (LogicalType::UInteger, vec![Value::UInteger(u32::MAX), Value::Null]),
+            (LogicalType::UBigInt, vec![Value::UBigInt(u64::MAX), Value::UBigInt(1), Value::Null]),
+            (LogicalType::Date, vec![Value::Date(-719_162), Value::Date(19_000), Value::Null]),
+            (LogicalType::Time, vec![Value::Time(86_399_999_999), Value::Null]),
+            (LogicalType::Timestamp, vec![Value::Timestamp(1_700_000_000_000_000), Value::Null]),
+            (LogicalType::TimestampS, vec![Value::TimestampS(-5), Value::Null]),
+            (LogicalType::TimestampMs, vec![Value::TimestampMs(1_700_000_000_000), Value::Null]),
+            (LogicalType::TimestampNs, vec![Value::TimestampNs(i64::MIN), Value::Null]),
+            (LogicalType::TimestampTz, vec![Value::TimestampTz(0), Value::Null]),
+            (
+                LogicalType::Float,
+                vec![Value::Float(1.5), Value::Float(f32::NAN), Value::Float(-0.0), Value::Null],
+            ),
+            (
+                LogicalType::Double,
+                vec![
+                    Value::Double(f64::INFINITY),
+                    Value::Double(f64::NAN),
+                    Value::Double(-0.0),
+                    Value::Double(0.0),
+                    Value::Double(-2.25),
+                    Value::Null,
+                ],
+            ),
+            (
+                LogicalType::Varchar,
+                vec![
+                    Value::Varchar(String::new()),
+                    Value::Varchar("abc".into()),
+                    Value::Varchar("héllo wörld".into()),
+                    Value::Varchar(long),
+                    Value::Null,
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_range_of_one_value_is_the_range_of_a_vector_of_it() {
+        for (ty, values) in samples() {
+            for value in values {
+                let vector = Vector::from_values(ty.clone(), std::slice::from_ref(&value))
+                    .expect("a column");
+                let one = Range::of_one(&value, &ty);
+                assert_eq!(one, Some(Range::of(&vector)), "{value:?} as {ty}");
+            }
+        }
+        // A value that is not of the column's type, and a type the value path leaves to the vector.
+        assert_eq!(Range::of_one(&Value::Integer(1), &LogicalType::BigInt), None);
+        let decimal = LogicalType::Decimal { width: 9, scale: 2 };
+        assert_eq!(Range::of_one(&Value::Null, &decimal), None);
+        let row = [Value::BigInt(1), Value::Varchar("x".into())];
+        let types = [LogicalType::BigInt, LogicalType::Varchar];
+        let vectors = row
+            .iter()
+            .zip(&types)
+            .map(|(value, ty)| Vector::from_values(ty.clone(), std::slice::from_ref(value)))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("columns");
+        let chunk = Chunk::new(vectors).expect("a chunk");
+        assert_eq!(Zone::of_row(&row, &types), Some(Zone::of(&chunk)));
+        assert_eq!(Zone::of_row(&row, &types[..1]), None);
+    }
 
     /// A chunk of one `INTEGER` column holding `values`.
     fn chunk(values: &[i32]) -> Chunk {
