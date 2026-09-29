@@ -85,7 +85,7 @@ pub fn declared(catalog: &Catalog, setting: &str) -> Vec<Relationship> {
                 continue;
             };
             let Ok(link) = Relationship::declare(child, parent) else { continue };
-            if !named(&declared, &link) {
+            if !listed(&declared, &link) {
                 declared.push(link);
             }
         }
@@ -131,7 +131,7 @@ pub fn known(catalog: &Catalog, setting: &str) -> Vec<Relationship> {
                 continue;
             };
             let Ok(link) = Relationship::declare(child, parent) else { continue };
-            if !named(&known, &link) {
+            if !listed(&known, &link) {
                 known.push(link);
             }
         }
@@ -140,7 +140,7 @@ pub fn known(catalog: &Catalog, setting: &str) -> Vec<Relationship> {
 }
 
 /// Whether the list already holds this relationship, the same tables and the same columns.
-fn named(held: &[Relationship], link: &Relationship) -> bool {
+fn listed(held: &[Relationship], link: &Relationship) -> bool {
     held.iter().any(|held| {
         held.child.table.eq_ignore_ascii_case(&link.child.table)
             && held.parent.table.eq_ignore_ascii_case(&link.parent.table)
