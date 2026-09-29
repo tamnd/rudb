@@ -12813,3 +12813,46 @@ fn a_whole_literal_past_a_hugeint_is_a_uhugeint_and_works_in_that_width() {
         .to_string();
     assert!(error.contains("Overflow in multiplication of UINT128"), "{error}");
 }
+
+#[test]
+fn make_type_and_get_type_answer_a_type_that_names_a_state_signature() {
+    let db = Database::new();
+    let text = |sql: &str| rows(&db, sql)[0].iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        text(
+            "SELECT get_type(1), get_type(NULL), typeof(make_type('int')), \
+             make_type('LIST', make_type('STRUCT', a := make_type('INTEGER'), b := \
+             make_type('VARCHAR'))), make_type('DECIMAL', 10, 2), make_type('MAP', \
+             make_type('INT'), make_type('VARCHAR'))::VARCHAR, make_type('int') = \
+             make_type('INTEGER')"
+        ),
+        [
+            "INTEGER",
+            "\"NULL\"",
+            "TYPE",
+            "STRUCT(a INTEGER, b VARCHAR)[]",
+            "DECIMAL(10,2)",
+            "MAP(INTEGER, VARCHAR)",
+            "true"
+        ]
+    );
+    assert_eq!(
+        text(
+            "SELECT finalize(to_aggregate_state(string_agg(d, '-') EXPORT_STATE, 'string_agg', \
+             [make_type('VARCHAR'), make_type('VARCHAR')], [NULL, '-'])) FROM (VALUES ('a'), \
+             ('b')) t(d)"
+        ),
+        ["a-b"]
+    );
+    for (sql, wanted) in [
+        ("SELECT make_type(x) FROM (VALUES ('INT')) t(x)", "must be constant expressions"),
+        ("SELECT make_type('LIST')", "Type \"LIST\" requires type parameters"),
+        ("SELECT make_type('INTEGER', 3)", "does not take any type parameters"),
+        ("SELECT make_type('STRUCT', make_type('INT'))", "STRUCT type arguments must have names"),
+        ("SELECT 'INTEGER'::TYPE", "Unimplemented type for cast (VARCHAR -> TYPE)"),
+        ("CREATE TABLE t (v TYPE)", "A table cannot be created with a 'TYPE' column"),
+    ] {
+        let error = db.execute(sql).unwrap_err().to_string();
+        assert!(error.contains(wanted), "{sql}: {error}");
+    }
+}

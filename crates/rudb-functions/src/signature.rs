@@ -393,6 +393,8 @@ enum Fixed {
     TimestampTz,
     Interval,
     Uuid,
+    /// `TYPE`, a type as a value.
+    Type,
     /// The type of a bare `NULL`, which is what `setseed` answers.
     Null,
     /// `VARCHAR[]`, which is what the splits answer.
@@ -418,6 +420,7 @@ impl Fixed {
             Self::TimestampTz => LogicalType::TimestampTz,
             Self::Interval => LogicalType::Interval,
             Self::Uuid => LogicalType::Uuid,
+            Self::Type => LogicalType::Type,
             Self::Null => LogicalType::Null,
             Self::VarcharList => LogicalType::list(LogicalType::Varchar),
         }
@@ -974,6 +977,22 @@ const TABLE: &[Entry] = &[
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(1),
         shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    // A type as a value. The binder folds both of these, `make_type` from the name and parameters it
+    // was given and `get_type` from its argument's type, so the executor never sees either call.
+    Entry {
+        name: "make_type",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(1),
+        shape: Shape::LeadingFixedTo(1, Fixed::Varchar, Fixed::Type),
+        numeric_only: false,
+    },
+    Entry {
+        name: "get_type",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::AnyTo(Fixed::Type),
         numeric_only: false,
     },
     // Bit strings. The operators, `bit_count`, `length` and the bit aggregates take them too,
@@ -2790,6 +2809,8 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("typeof", &["typeof(col0 ANY) -> VARCHAR"]),
+    ("make_type", &["make_type(col0 VARCHAR, [ANY...]) -> TYPE"]),
+    ("get_type", &["get_type(col0 ANY) -> TYPE"]),
     ("hash", &["hash(col0 ANY, [ANY...]) -> UBIGINT"]),
     ("current_setting", &["current_setting(setting_name VARCHAR) -> ANY"]),
     ("nextval", &["nextval(sequence_name VARCHAR) -> BIGINT"]),
@@ -3138,6 +3159,7 @@ impl Fixed {
             Self::TimestampTz => "TIMESTAMP WITH TIME ZONE",
             Self::Interval => "INTERVAL",
             Self::Uuid => "UUID",
+            Self::Type => "TYPE",
             Self::Null => "\"NULL\"",
             Self::VarcharList => "VARCHAR[]",
         }
