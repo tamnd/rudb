@@ -93,6 +93,7 @@ mod structs;
 mod subscript;
 mod tally;
 mod text;
+mod timed;
 mod topk;
 
 pub use aggregate::{
