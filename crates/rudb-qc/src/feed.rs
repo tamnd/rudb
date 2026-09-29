@@ -147,6 +147,9 @@ struct Headers {
     /// For each column of [`Body::reads`] and then each `LIKE` of [`Body::likes`], the last
     /// dictionary it came with and how many rows have been read through it, this chunk's too.
     seen: Vec<Option<(Arc<Vector>, usize)>>,
+    /// The buffers a result body writes its rows into, one per column, kept from one chunk to the
+    /// next and grown when a chunk needs more.
+    out: Vec<Buffers>,
     /// `0, 1, 2, ...`, the codes a column made flat is read through, as long as the longest chunk
     /// so far.
     rows: Vec<u32>,
@@ -887,7 +890,9 @@ impl<'a> Feed<'a> {
             cols: cols.as_ptr(),
         };
         let mut room = rows;
-        let mut buffers = Vec::new();
+        // The buffers are only read below the count of rows the body wrote, and it writes every
+        // byte of those, so what an earlier chunk left in them is never read.
+        let mut buffers = std::mem::take(&mut headers.out);
         let sink = match &self.body.sink {
             Out::Result { .. } => tier::Sink::Result,
             Out::Aggregate(_) => tier::Sink::Aggregate,
@@ -915,7 +920,6 @@ impl<'a> Feed<'a> {
             _ => 0,
         };
         'attempt: loop {
-            buffers.clear();
             if let Out::Result { count, columns, capacity } = &self.body.sink {
                 let st = bytes(state);
                 st[*count as usize..*count as usize + 8].fill(0);
@@ -923,18 +927,21 @@ impl<'a> Feed<'a> {
                     st[*at as usize..*at as usize + 8]
                         .copy_from_slice(&(room as u64).to_le_bytes());
                 }
-                for slot in columns {
-                    let mut b = Buffers {
-                        values: vec![0u128; (room * slot.ty.bytes() as usize).div_ceil(16)],
-                        valid: vec![0u8; room],
-                    };
+                buffers.resize_with(buffers.len().max(columns.len()), Buffers::default);
+                for (slot, b) in columns.iter().zip(buffers.iter_mut()) {
+                    let values = (room * slot.ty.bytes() as usize).div_ceil(16);
+                    if b.values.len() < values {
+                        b.values.resize(values, 0);
+                    }
+                    if b.valid.len() < room {
+                        b.valid.resize(room, 0);
+                    }
                     let values = b.values.as_mut_ptr() as u64;
                     let valid = b.valid.as_mut_ptr() as u64;
                     st[slot.values as usize..slot.values as usize + 8]
                         .copy_from_slice(&values.to_le_bytes());
                     st[slot.valid as usize..slot.valid as usize + 8]
                         .copy_from_slice(&valid.to_le_bytes());
-                    buffers.push(b);
                 }
             }
             let st = state.as_mut_ptr().cast::<u8>();
@@ -1050,6 +1057,7 @@ impl<'a> Feed<'a> {
                 _ => out.push(chunk),
             }
         }
+        headers.out = buffers;
         Ok(if *done { Progress::Done } else { Progress::More })
     }
 
@@ -1268,6 +1276,7 @@ fn cut(chunk: Chunk, top: Option<(&[Key], u64)>) -> Result<Vec<Chunk>> {
 }
 
 /// The output buffers of one result column for one call.
+#[derive(Debug, Default)]
 struct Buffers {
     values: Vec<u128>,
     valid: Vec<u8>,
