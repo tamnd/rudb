@@ -12,6 +12,7 @@
 pub mod arena;
 pub mod count;
 pub mod deletes;
+pub mod grams;
 pub mod hot;
 pub mod memory;
 pub mod sieve;
@@ -22,6 +23,7 @@ pub mod zone;
 
 pub use count::{Counting, Counts, Partial};
 pub use deletes::{DeleteVector, Refusal};
+pub use grams::Grams;
 pub use hot::{HotStripe, Lease, Width};
 pub use memory::MemoryTable;
 pub use sieve::{Blocked, Sieve};

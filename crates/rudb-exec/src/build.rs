@@ -373,6 +373,7 @@ fn build_measured_with_sink<'a>(
         reads: false,
         drivers: Vec::new(),
         pruning: Vec::new(),
+        needles: Vec::new(),
         pushing: None,
         sideways: None,
         above: Vec::new(),
@@ -1938,6 +1939,9 @@ struct Building<'a, 'b> {
     /// own input, and the scan arm takes them. It is empty every other time it is read, and empty
     /// means hand out every row group, which is what every scan did before pruning existed.
     pruning: Vec<(usize, Op, Bound)>,
+    /// The text the `LIKE` conjuncts of that same filter need every row to hold, travelling the same
+    /// one step down and cleared everywhere `pruning` is.
+    needles: Vec<(usize, Vec<u8>)>,
     /// The whole filter, offered to the scan directly below it to apply rather than only to prune
     /// with.
     ///
@@ -2186,6 +2190,7 @@ impl<'a> Building<'a, '_> {
             Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
                 let counters = self.watch(reference, id, pipeline, "FileScan", Some(name));
                 let tests = std::mem::take(&mut self.pruning);
+                self.needles.clear();
                 let scan = FileScan::new(
                     plan, index, function, args, options, settings, columns, tests, runtime,
                 )?
@@ -2934,6 +2939,7 @@ impl<'a> Building<'a, '_> {
                 }
                 let filters = Filters {
                     pruning: std::mem::take(&mut self.pruning),
+                    needles: std::mem::take(&mut self.needles),
                     pushed: self.pushing.take(),
                     sideways: self.sideways.take(),
                     also: std::mem::take(&mut self.above),
@@ -3032,13 +3038,16 @@ impl<'a> Building<'a, '_> {
             }
             Node::Filter { input, predicate } if self.pruning_only == Some(reference) => {
                 self.pruning = rudb_opt::bounds::of(plan, input, predicate);
+                self.needles = rudb_opt::bounds::needles(plan, input, predicate);
                 let below = self.node(input)?;
                 self.pruning = Vec::new();
+                self.needles = Vec::new();
                 below
             }
             Node::Filter { input, predicate } => {
                 let marks = self.marking == Some(reference);
                 self.pruning = rudb_opt::bounds::of(plan, input, predicate);
+                self.needles = rudb_opt::bounds::needles(plan, input, predicate);
                 // Which filters can go is not decided here, because `EXPLAIN` has to say the same
                 // thing about the same plan and a second copy of the condition is a second chance
                 // to answer it differently.
@@ -3079,6 +3088,7 @@ impl<'a> Building<'a, '_> {
                 // Cleared whether or not the scan arm took them, because a filter over anything
                 // else leaves them sitting there for whatever scan the walk reaches next.
                 self.pruning = Vec::new();
+                self.needles = Vec::new();
                 // And the offer taken back, for the same reason. An offer that was made and is no
                 // longer there is one the scan below took, which means it is applying this predicate
                 // itself and there is no operator to build here. Anything else and the filter runs
