@@ -64,8 +64,8 @@
 //! which a `COUNT(DISTINCT c)` may be read straight out of, and [`MemoryTable::distinct_estimate`]
 //! is the one the estimator asks.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use rudb_common::bounds::Bound;
@@ -74,6 +74,7 @@ use rudb_vector::vector::VECTOR_SIZE;
 use rudb_vector::{Chunk, Vector};
 
 use crate::count::{Counts, Partial};
+use crate::grams::Grams;
 use crate::zone::{Probe, Range, Zone};
 
 /// One column's statistics over one run of the chunks of an append: its count and a range a chunk.
@@ -177,6 +178,12 @@ pub struct MemoryTable {
     /// every other one to say anything. The sketch is fixed size, so one that sees every row costs
     /// the same as one that sees a chunk.
     counts: Counts,
+    /// The grams of every chunk of each string column, built the first time a `LIKE` asks about
+    /// the column and dropped whenever a row is added. See [`crate::grams`].
+    ///
+    /// One per column, and a chunk whose rows could not all be read has `None`, which is a chunk
+    /// that is always read.
+    grams: Vec<OnceLock<Vec<Option<Grams>>>>,
     rows: usize,
     stats_ns: u64,
     counts_ns: u64,
@@ -187,6 +194,7 @@ impl MemoryTable {
     #[must_use]
     pub fn new(types: Vec<LogicalType>) -> Self {
         let counts = Counts::new(types.len());
+        let grams = types.iter().map(|_| OnceLock::new()).collect();
         Self {
             types,
             groups: Vec::new(),
@@ -198,6 +206,7 @@ impl MemoryTable {
             tail_rows: 0,
             zones: Vec::new(),
             counts,
+            grams,
             rows: 0,
             stats_ns: 0,
             counts_ns: 0,
@@ -253,6 +262,7 @@ impl MemoryTable {
     /// If the chunk's columns are not the table's columns.
     pub fn append(&mut self, chunk: Chunk) -> Result<()> {
         self.check(&chunk)?;
+        self.forget_grams();
         if chunk.is_empty() {
             return Ok(());
         }
@@ -422,6 +432,7 @@ impl MemoryTable {
         for chunk in &chunks {
             self.check(chunk)?;
         }
+        self.forget_grams();
         let chunks: Vec<Chunk> = chunks.into_iter().filter(|chunk| !chunk.is_empty()).collect();
         let per = chunks.len().div_ceil(workers.max(1)).max(1);
         let parts = chunks.len().div_ceil(per);
@@ -792,6 +803,65 @@ impl MemoryTable {
         self.zones.get(index).is_some_and(|zone| zone.skips(probes))
     }
 
+    /// Whether no row of chunk `index` can hold every one of `needles` in the column it names.
+    ///
+    /// The needles are the pieces of the `LIKE` conjuncts of one filter, each with its column, so
+    /// one of them missing rules the chunk out the way one probe does in [`Self::skips`]. The first
+    /// question about a column builds its grams over every chunk, on up to `workers` threads, and
+    /// every question after that reads them. A column that is not a string, and a chunk with no
+    /// grams, rules nothing out.
+    #[must_use]
+    pub fn lacks(&self, index: usize, needles: &[(usize, Vec<u8>)], workers: usize) -> bool {
+        needles.iter().any(|(column, needle)| {
+            self.column_grams(*column, workers)
+                .and_then(|grams| grams.get(index))
+                .and_then(Option::as_ref)
+                .is_some_and(|grams| grams.lacks(needle))
+        })
+    }
+
+    /// The grams of every chunk of `column`, built on first use.
+    fn column_grams(&self, column: usize, workers: usize) -> Option<&[Option<Grams>]> {
+        if self.types.get(column) != Some(&LogicalType::Varchar) {
+            return None;
+        }
+        let built = self.grams.get(column)?.get_or_init(|| {
+            let count = self.chunk_count();
+            let per = count.div_ceil(workers.max(1)).max(1);
+            std::thread::scope(|scope| {
+                let parts: Vec<_> = (0..count)
+                    .step_by(per)
+                    .map(|first| {
+                        let past = (first + per).min(count);
+                        let handle = scope.spawn(move || {
+                            (first..past)
+                                .map(|at| {
+                                    let read = self.read(at, &[column]).ok()?;
+                                    Grams::of(read.column(0).ok()?)
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        (past - first, handle)
+                    })
+                    .collect();
+                // A part that failed still takes up its chunks, as chunks with no grams, so every
+                // part after it lines up with the chunk numbers it was built for.
+                parts
+                    .into_iter()
+                    .flat_map(|(len, handle)| handle.join().unwrap_or_else(|_| vec![None; len]))
+                    .collect()
+            })
+        });
+        Some(built)
+    }
+
+    /// Drops every column's grams, because the rows are about to change under them.
+    fn forget_grams(&mut self) {
+        for grams in &mut self.grams {
+            grams.take();
+        }
+    }
+
     /// Whether the probes keep every row of chunk `index`.
     ///
     /// A chunk with no zone is a chunk that gets compared, for the same reason it is a chunk that
@@ -922,6 +992,7 @@ impl MemoryTable {
     ///
     /// If a row is not as wide as the table, or if a value is not one its column can hold.
     pub fn append_rows(&mut self, rows: &[Vec<Value>]) -> Result<()> {
+        self.forget_grams();
         for (index, row) in rows.iter().enumerate() {
             if row.len() != self.types.len() {
                 return Err(Error::internal(format!(
@@ -1063,6 +1134,25 @@ impl MemoryTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chunk_whose_grams_lack_a_word_is_ruled_out_until_rows_arrive() {
+        let chunk = |text: &str| {
+            let text = Value::Varchar(text.to_string());
+            Chunk::new(vec![Vector::constant(LogicalType::Varchar, text, VECTOR_SIZE)])
+                .expect("one column")
+        };
+        let mut table = MemoryTable::new(vec![LogicalType::Varchar]);
+        table.append(chunk("http://example.com/")).expect("a chunk of the table's type");
+        table.append(chunk("http://google.com/")).expect("a chunk of the table's type");
+        let google = [(0, b"google".to_vec())];
+        assert!(table.lacks(0, &google, 2));
+        assert!(!table.lacks(1, &google, 2));
+        table.append(chunk("https://google.ru/")).expect("a chunk of the table's type");
+        assert!(!table.lacks(2, &google, 2), "the grams were not built again for the new chunk");
+        assert!(table.lacks(0, &google, 2));
+        assert!(!table.lacks(0, &[(1, b"google".to_vec())], 2), "a column past the end");
+    }
 
     fn people() -> MemoryTable {
         let mut table = MemoryTable::new(vec![LogicalType::Integer, LogicalType::Varchar]);

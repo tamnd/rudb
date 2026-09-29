@@ -126,6 +126,66 @@ pub fn into_scan(plan: &Plan, filter: rudb_plan::NodeRef) -> Option<Moved> {
     Some(Moved { whole: !tests.is_empty(), tests, conjuncts })
 }
 
+/// The text every row a filter keeps has to hold, each with the column of the scan it is in.
+///
+/// Read from the `LIKE` conjuncts of the filter, the same way [`of`] reads the comparisons and for
+/// the same kind of caller: a store that can say a stretch of rows holds no such text skips the
+/// stretch. Only a plain `LIKE` of a column against a constant counts. A `NOT LIKE` wants the text
+/// absent, an `ILIKE` matches text the pattern does not spell, and a conjunct under an `OR` says
+/// nothing about the row when it is false, so none of those give anything.
+#[must_use]
+pub fn needles(
+    plan: &Plan,
+    input: rudb_plan::NodeRef,
+    predicate: ExprRef,
+) -> Vec<(usize, Vec<u8>)> {
+    let Some(index) = scanned(plan, input) else { return Vec::new() };
+    let mut out = Vec::new();
+    likes(plan, predicate, index, &mut out);
+    out
+}
+
+/// Every piece of every `LIKE` conjunct of `predicate` on the scan numbered `index`, appended.
+fn likes(plan: &Plan, predicate: ExprRef, index: u32, out: &mut Vec<(usize, Vec<u8>)>) {
+    match *plan.expr(predicate) {
+        Expr::Conjunction { op: ConjunctionOp::And, children } => {
+            for child in plan.expr_list(children) {
+                likes(plan, *child, index, out);
+            }
+        }
+        Expr::Function { name, args } if plan.string(name) == "~~" => {
+            let [column, pattern] = plan.expr_list(args) else { return };
+            let Expr::Column(ColumnBinding { table, column }) = *plan.expr(*column) else {
+                return;
+            };
+            let Expr::Constant(value) = *plan.expr(*pattern) else { return };
+            let rudb_common::Value::Varchar(pattern) = plan.value(value) else { return };
+            if table == index {
+                out.extend(pieces(pattern).into_iter().map(|piece| (column as usize, piece)));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The runs of text a `LIKE` pattern needs every matching row to hold.
+///
+/// The pieces between the wildcards, where `%` and `_` both count as one, and only the pieces of
+/// three bytes or more, since that is the shortest a store keeps. A pattern with a backslash gives
+/// nothing, because whether that is an escape depends on how the `LIKE` was written and a piece read
+/// the wrong way is a stretch skipped that held a match.
+#[must_use]
+pub fn pieces(pattern: &str) -> Vec<Vec<u8>> {
+    if pattern.contains('\\') {
+        return Vec::new();
+    }
+    pattern
+        .split(['%', '_'])
+        .filter(|piece| piece.len() >= 3)
+        .map(|piece| piece.as_bytes().to_vec())
+        .collect()
+}
+
 /// The table index of a scan, or `None` for a node that has no bounds to ask about.
 #[must_use]
 pub fn scanned(plan: &Plan, node: rudb_plan::NodeRef) -> Option<u32> {
@@ -222,7 +282,7 @@ mod tests {
     use rudb_common::bounds::{Bound, Op};
     use rudb_plan::Plan;
 
-    use super::of;
+    use super::{needles, of, pieces};
 
     /// The tests a filter over a one column scan reads as, with the filter written as text.
     fn read(predicate: &str) -> Vec<super::Test> {
@@ -313,5 +373,51 @@ mod tests {
         let plan = Plan::parse(one).expect("parses");
         let moved = super::into_scan(&plan, plan.root()).expect("a filter over a stored table");
         assert!(moved.whole && moved.conjuncts.is_empty(), "no `AND`, nothing to split");
+    }
+
+    /// The needles a filter over a two column string scan reads as, with the filter written as text.
+    fn needled(predicate: &str) -> Vec<(usize, Vec<u8>)> {
+        let text = format!(
+            "Filter {predicate}\n  Get memory.main.t AS t #0 [URL::VARCHAR, Title::VARCHAR]\n"
+        );
+        let plan =
+            Plan::parse(&text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        let rudb_plan::Node::Filter { input, predicate } = *plan.node(plan.root()) else {
+            panic!("the root is the filter");
+        };
+        needles(&plan, input, predicate)
+    }
+
+    #[test]
+    fn every_like_under_an_and_gives_its_pieces_with_its_column() {
+        let found = needled(
+            "(\"~~\"(#0.0::VARCHAR, '%google%'::VARCHAR)::BOOLEAN AND \"~~\"(#0.1::VARCHAR, 'Go_gle%news'::VARCHAR)::BOOLEAN)::BOOLEAN",
+        );
+        assert_eq!(
+            found,
+            vec![(0, b"google".to_vec()), (1, b"gle".to_vec()), (1, b"news".to_vec())]
+        );
+    }
+
+    #[test]
+    fn a_not_like_and_a_like_under_an_or_give_nothing() {
+        assert!(needled("\"!~~\"(#0.0::VARCHAR, '%google%'::VARCHAR)::BOOLEAN").is_empty());
+        assert!(
+            needled(
+                "(\"~~\"(#0.0::VARCHAR, '%google%'::VARCHAR)::BOOLEAN OR \"~~\"(#0.1::VARCHAR, '%yandex%'::VARCHAR)::BOOLEAN)::BOOLEAN"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_pattern_gives_its_pieces_of_three_bytes_or_more() {
+        assert_eq!(pieces("%google%"), vec![b"google".to_vec()]);
+        assert_eq!(
+            pieces("http://%.ru/_x%abc"),
+            vec![b"http://".to_vec(), b".ru/".to_vec(), b"abc".to_vec()]
+        );
+        assert!(pieces("%ab%").is_empty());
+        assert!(pieces("%goo\\%gle%").is_empty(), "an escape is not read");
     }
 }

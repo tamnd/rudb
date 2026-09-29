@@ -976,6 +976,21 @@ impl Rows {
         }
     }
 
+    /// Whether no row of chunk `at` can hold one of the `LIKE` pieces in `needles`, each with the
+    /// table column it has to be in. See [`rudb_storage::grams`].
+    ///
+    /// Only rows in memory keep grams, so a part of a file rules nothing out here.
+    #[must_use]
+    pub fn lacks(&self, at: usize, needles: &[(usize, Vec<u8>)], workers: usize) -> bool {
+        match self {
+            Self::Memory(rows) => rows.lacks(at, needles, workers),
+            Self::Native(_) => false,
+            Self::Grown(reader, rows) => {
+                at >= reader.parts() && rows.lacks(at - reader.parts(), needles, workers)
+            }
+        }
+    }
+
     /// The stored range of one table column over chunk `at`, or `None` where nothing was stored.
     #[must_use]
     pub fn range_of(&self, at: usize, column: usize) -> Option<Range> {

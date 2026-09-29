@@ -419,6 +419,9 @@ pub(crate) struct Scan<'a> {
     columns: Vec<Option<usize>>,
     offsets: Vec<i64>,
     probes: Vec<Probe>,
+    /// The text a `LIKE` of the filter above needs every row it keeps to hold, each with the table
+    /// column it is in, answered against the table's grams. See [`rudb_storage::grams`].
+    needles: Vec<(usize, Vec<u8>)>,
     /// The runtime filter of the join this scan drives, empty for a scan that drives no join.
     sideways: Option<Arc<Sideways<'a>>>,
     /// The runtime filters of joins further up that reached this scan through the joins between,
@@ -678,6 +681,9 @@ pub(crate) struct Filters<'a> {
     /// Tests a zone map can rule a chunk out with, which is as many of the conjuncts as could be
     /// read. One that is missing costs a chunk that gets read and never costs a row.
     pub(crate) pruning: Vec<(usize, Op, Bound)>,
+    /// Text a `LIKE` of the same filter needs every row it keeps to hold, by the same numbering,
+    /// for a table that can say which parts hold none of it.
+    pub(crate) needles: Vec<(usize, Vec<u8>)>,
     /// The whole predicate, for the scan to apply, or `None` when a filter above it is applying it.
     pub(crate) pushed: Option<Pushdown>,
     /// What a join built and handed back down after the plan was already running.
@@ -1232,7 +1238,7 @@ impl<'a> Scan<'a> {
         seams: &Settings,
         session: &Session,
     ) -> Result<Self> {
-        let Filters { pruning, pushed: pushdown, sideways, also, cutoff } = filters;
+        let Filters { pruning, needles, pushed: pushdown, sideways, also, cutoff } = filters;
         let fields = plan.field_list(projection).to_vec();
         let mut columns = Vec::with_capacity(fields.len());
         for field in &fields {
@@ -1250,6 +1256,10 @@ impl<'a> Scan<'a> {
             columns.push(Some(position));
         }
         let probes = onto(&columns, pruning);
+        let needles = needles
+            .into_iter()
+            .filter_map(|(at, needle)| Some((columns.get(at).copied().flatten()?, needle)))
+            .collect();
         let schema = Schema::numbered(fields, index);
         let chunks = Handout::new(table.rows().chunk_count());
         let mut next = 0_i64;
@@ -1290,6 +1300,7 @@ impl<'a> Scan<'a> {
             columns,
             offsets,
             probes,
+            needles,
             sideways,
             also: also.into_iter().map(|sideways| (sideways, Paying::default())).collect(),
             cutoff,
@@ -1981,6 +1992,13 @@ impl<'a> Scan<'a> {
             || (!cutoff.is_empty() && rows.skips(at, cutoff))
             || self.reduced_away(at)
             || self.keyed_away(at)
+            || self.lacking(at)
+    }
+
+    /// Whether part `at` holds none of the text a `LIKE` above needs.
+    fn lacking(&self, at: usize) -> bool {
+        !self.needles.is_empty()
+            && self.table.rows().lacks(at, &self.needles, self.threads.load(Ordering::Relaxed))
     }
 
     /// The key lists the joins above handed down, each with the table column it is about.
@@ -2065,12 +2083,15 @@ impl<'a> Scan<'a> {
             let Some(column) = self.columns[one.input] else { continue };
             let Ok(Some(dictionary)) = reader.global_dictionary(column) else { continue };
             // A file written before the builder left these columns out still holds their rows.
-            if dictionary.len().saturating_mul(rudb_native::postings::FEWEST_ROWS_PER_VALUE) > rows {
+            if dictionary.len().saturating_mul(rudb_native::postings::FEWEST_ROWS_PER_VALUE) > rows
+            {
                 continue;
             }
             let Some(index) = reader.value_rows(column) else { continue };
             if dictionary.len() != index.values()
-                || index.held(&[]).is_none_or(|whole| whole.saturating_mul(SPARSE_READ as u64) > index.rows())
+                || index
+                    .held(&[])
+                    .is_none_or(|whole| whole.saturating_mul(SPARSE_READ as u64) > index.rows())
             {
                 continue;
             }
@@ -2129,13 +2150,18 @@ impl<'a> Scan<'a> {
         // into a scan of a handful, and the instance count should be taken from the handful.
         let keyed = self.keyed().next().is_some();
         let sifting = !probes.is_empty() && worth_sifting(working, threads, rows, weight);
-        if !keyed && !sifting {
+        // Asked whatever the spread too, because the grams are built on the first question and
+        // this is the one moment before any worker is waiting on them.
+        let lacking = !self.needles.is_empty();
+        if !keyed && !sifting && !lacking {
             return (live, rows);
         }
         let mut sifted = 0;
         for stripe in &mut live {
             stripe.parts.retain(|&at| {
-                !(sifting && self.table.rows().skips(at, probes)) && !self.keyed_away(at)
+                !(sifting && self.table.rows().skips(at, probes))
+                    && !self.keyed_away(at)
+                    && !self.lacking(at)
             });
             stripe.rows =
                 stripe.parts.iter().map(|&at| self.table.rows().chunk_len(at).unwrap_or(0)).sum();
@@ -4543,6 +4569,7 @@ mod tests {
                 .map(|at| i64::try_from(at * VECTOR_SIZE).expect("a small table"))
                 .collect(),
             probes,
+            needles: Vec::new(),
             also: Vec::new(),
             sideways: None,
             cutoff: None,
