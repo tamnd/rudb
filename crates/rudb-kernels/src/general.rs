@@ -28,10 +28,10 @@ use crate::hash::Sketch;
 use crate::histogram::Binned;
 use crate::lttb::{Plot, Points};
 use crate::number::{approximate, fit, integral};
-use crate::timed::Timed;
 use crate::quantile::{self, Column, Held, Holistic, Sample};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
 use crate::tally::Tally;
+use crate::timed::Timed;
 use crate::topk::TopK;
 
 /// A running aggregate that is not one of the five the aggregate module keeps inline.

@@ -412,14 +412,8 @@ impl Digest {
             packed.push(Centroid { mean, weight });
         }
         let packed_weight = packed.iter().map(|centroid| centroid.weight).sum();
-        let digest = TDigest {
-            min,
-            max,
-            packed_weight,
-            waiting_weight: 0.0,
-            packed,
-            waiting: Vec::new(),
-        };
+        let digest =
+            TDigest { min, max, packed_weight, waiting_weight: 0.0, packed, waiting: Vec::new() };
         Ok(Self { digest: Some(digest), count: *count })
     }
 }

@@ -551,6 +551,9 @@ impl LogicalType {
         }
         match (self, other) {
             (Self::Null, ty) | (ty, Self::Null) => Some(ty.clone()),
+            // Two states meet at the left one, whatever call the right one came from, and the
+            // right side's layout is cast to the left's, which is the pin's.
+            (Self::AggregateState(_), Self::AggregateState(_)) => Some(self.clone()),
             // A state meets a value of its layout as the state, which is how the pin lets a
             // `UNION ALL` put a plain number next to a state of `sum`.
             (Self::AggregateState(state), other) | (other, Self::AggregateState(state)) => {

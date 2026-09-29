@@ -293,7 +293,10 @@ pub(crate) fn top_layout(ty: &LogicalType) -> LogicalType {
 
 /// One watched value of the state and its count.
 fn watched_type(ty: &LogicalType) -> LogicalType {
-    LogicalType::Struct(vec![Field::new("value", ty.clone()), Field::new("count", LogicalType::UBigInt)])
+    LogicalType::Struct(vec![
+        Field::new("value", ty.clone()),
+        Field::new("count", LogicalType::UBigInt),
+    ])
 }
 
 impl TopK {
