@@ -247,6 +247,51 @@ impl Value {
         }
     }
 
+    /// Whether this value's type is `ty`, which is [`Self::logical_type`] compared with it without
+    /// building the type for the flat ones.
+    ///
+    /// A prepared `INSERT` asks this of every value it is handed, and building the type to compare
+    /// and then dropping it was a seventh of the work that path does itself.
+    #[must_use]
+    pub fn is_of(&self, ty: &LogicalType) -> bool {
+        use LogicalType as T;
+        match (self, ty) {
+            (Self::List { .. } | Self::Struct(_) | Self::Map { .. }, _) => {
+                &self.logical_type() == ty
+            }
+            (Self::Decimal { width, scale, .. }, T::Decimal { width: to, scale: at }) => {
+                width == to && scale == at
+            }
+            (Self::Null, T::Null)
+            | (Self::Boolean(_), T::Boolean)
+            | (Self::TinyInt(_), T::TinyInt)
+            | (Self::SmallInt(_), T::SmallInt)
+            | (Self::Integer(_), T::Integer)
+            | (Self::BigInt(_), T::BigInt)
+            | (Self::HugeInt(_), T::HugeInt)
+            | (Self::UTinyInt(_), T::UTinyInt)
+            | (Self::USmallInt(_), T::USmallInt)
+            | (Self::UInteger(_), T::UInteger)
+            | (Self::UBigInt(_), T::UBigInt)
+            | (Self::UHugeInt(_), T::UHugeInt)
+            | (Self::Float(_), T::Float)
+            | (Self::Double(_), T::Double)
+            | (Self::Varchar(_), T::Varchar)
+            | (Self::Blob(_), T::Blob)
+            | (Self::Bit(_), T::Bit)
+            | (Self::Date(_), T::Date)
+            | (Self::Time(_), T::Time)
+            | (Self::TimeTz(_), T::TimeTz)
+            | (Self::Timestamp(_), T::Timestamp)
+            | (Self::TimestampTz(_), T::TimestampTz)
+            | (Self::TimestampS(_), T::TimestampS)
+            | (Self::TimestampMs(_), T::TimestampMs)
+            | (Self::TimestampNs(_), T::TimestampNs)
+            | (Self::Interval { .. }, T::Interval) => true,
+            _ => false,
+        }
+    }
+
     /// The value as an `i64`, for the integer types that fit in one.
     ///
     /// Used by the planner for the places where a literal has to be a small integer, `LIMIT` and
@@ -809,6 +854,38 @@ mod tests {
         // The element type is carried rather than inferred, which is why an empty list still
         // knows what it is empty of.
         assert_eq!(list.logical_type(), LogicalType::list(LogicalType::Varchar));
+    }
+
+    #[test]
+    fn a_value_is_of_the_type_it_says_it_is_and_no_other() {
+        let values = [
+            Value::Null,
+            Value::Boolean(true),
+            Value::TinyInt(1),
+            Value::SmallInt(1),
+            Value::Integer(1),
+            Value::BigInt(1),
+            Value::HugeInt(1),
+            Value::UBigInt(1),
+            Value::Double(1.0),
+            Value::Float(1.0),
+            Value::Decimal { unscaled: 125, width: 9, scale: 2 },
+            Value::Decimal { unscaled: 125, width: 9, scale: 3 },
+            Value::Varchar("x".into()),
+            Value::Date(1),
+            Value::Timestamp(1),
+            Value::TimestampTz(1),
+            Value::List { element: LogicalType::Integer, values: vec![Value::Integer(1)] },
+            Value::List { element: LogicalType::BigInt, values: Vec::new() },
+            Value::Struct(vec![("a".into(), Value::Integer(1))]),
+        ];
+        let mut types: Vec<LogicalType> = values.iter().map(Value::logical_type).collect();
+        types.extend([LogicalType::Uuid, LogicalType::Interval, LogicalType::Blob]);
+        for value in &values {
+            for ty in &types {
+                assert_eq!(value.is_of(ty), &value.logical_type() == ty, "{value:?} as {ty}");
+            }
+        }
     }
 
     #[test]
