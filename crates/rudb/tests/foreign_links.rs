@@ -83,9 +83,8 @@ fn a_foreign_key_is_a_link_the_plan_reads() {
 /// nothing. Before, the scan read the links in those processes and the planner never heard of them.
 #[test]
 fn a_link_declared_for_one_session_is_known_to_every_later_one() {
-    let file = File(
-        std::env::temp_dir().join(format!("rudb-kept-links-{}.rudb", std::process::id())),
-    );
+    let file =
+        File(std::env::temp_dir().join(format!("rudb-kept-links-{}.rudb", std::process::id())));
     let _ = std::fs::remove_file(&file.0);
     let name = file.0.to_str().expect("a UTF-8 temporary path");
     {
