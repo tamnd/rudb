@@ -275,6 +275,46 @@ pub(crate) fn top_down(plan: &Plan) -> Vec<NodeRef> {
     found
 }
 
+/// The node that introduces a table index, the one a run of the plan would read it from.
+///
+/// Not the first node in the arena with that index. A rewrite that rebuilds a node appends the new
+/// one with the index the old one had, which is how every binding above it stays right, and leaves
+/// the old one behind with its old columns in its old order. A lookup that took the first one found
+/// read the leftover, and the leftover's column 0 was whatever column 0 used to be. On TPC-H q13 with
+/// the relationships declared that was `c_custkey`, so the aggregate over the order counts was sized
+/// for 150,000 groups from 1 when it holds about forty from 0.
+///
+/// One the root reaches is what this returns. A node's children sit behind it in the arena, so one
+/// walk from the root down marks everything reachable before the walk gets to it. When none of the
+/// nodes with the index is reachable, which is a pass asking about a subtree it has built and not
+/// attached yet, the newest of them is the answer, since that is the one the pass just built.
+pub(crate) fn producer(plan: &Plan, table: u32) -> Option<NodeRef> {
+    let count = plan.node_count();
+    let mut reached = vec![false; count];
+    if let Some(root) = reached.get_mut(plan.root() as usize) {
+        *root = true;
+    }
+    let mut newest = None;
+    for at in (0..u32::try_from(count).unwrap_or(u32::MAX)).rev() {
+        let node = plan.node(at);
+        let live = reached[at as usize];
+        if live {
+            for child in node.children().into_iter().flatten() {
+                if let Some(child) = reached.get_mut(child as usize) {
+                    *child = true;
+                }
+            }
+        }
+        if node.table_index() == Some(table) {
+            if live {
+                return Some(at);
+            }
+            newest.get_or_insert(at);
+        }
+    }
+    newest
+}
+
 #[cfg(test)]
 mod tests {
     use super::Context;
@@ -350,5 +390,53 @@ mod tests {
             error.message()
         );
         assert!(error.message().contains("Candidate optimizers:"), "{}", error.message());
+    }
+
+    /// Every node in the arena that carries `table`, in arena order.
+    fn carrying(plan: &rudb_plan::Plan, table: u32) -> Vec<rudb_plan::NodeRef> {
+        (0..u32::try_from(plan.node_count()).expect("a small plan"))
+            .filter(|&at| plan.node(at).table_index() == Some(table))
+            .collect()
+    }
+
+    #[test]
+    fn the_producer_of_an_index_is_the_node_a_run_reads_and_not_one_a_rewrite_left_behind() {
+        let text = "Aggregate #2 groups=[#1.0::INTEGER] aggregates=[count_star()::BIGINT]\n  \
+                    Project #1 [#0.1::INTEGER AS b, #0.0::INTEGER AS a]\n    \
+                    Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n";
+        let mut plan = rudb_plan::Plan::parse(text).expect("the plan parses");
+        let [old] = carrying(&plan, 1)[..] else { panic!("one projection") };
+        let [aggregate] = carrying(&plan, 2)[..] else { panic!("one aggregate") };
+
+        // Built and not attached yet: the one the root reaches is still the answer.
+        let fresh = plan.add_node(plan.node(old).clone());
+        assert_eq!(super::producer(&plan, 1), Some(old));
+
+        // Attached the way a rewrite attaches one, under a new parent the root now is.
+        let mut above = plan.node(aggregate).clone();
+        if let rudb_plan::Node::Aggregate { input, .. } = &mut above {
+            *input = fresh;
+        }
+        let above = plan.add_node(above);
+        plan.set_root(above);
+        assert_eq!(super::producer(&plan, 1), Some(fresh));
+        assert_eq!(super::producer(&plan, 2), Some(above));
+        assert_eq!(super::producer(&plan, 0), carrying(&plan, 0).first().copied());
+        assert_eq!(super::producer(&plan, 7), None);
+    }
+
+    #[test]
+    fn with_nothing_reachable_the_newest_is_the_one_a_pass_just_built() {
+        let text = "Project #1 [#0.0::INTEGER AS a]\n  Get memory.main.t AS t #0 [a::INTEGER]\n";
+        let mut plan = rudb_plan::Plan::parse(text).expect("the plan parses");
+        let [old] = carrying(&plan, 1)[..] else { panic!("one projection") };
+        let mut orphan = plan.node(old).clone();
+        if let rudb_plan::Node::Project { index, .. } = &mut orphan {
+            *index = 5;
+        }
+        let first = plan.add_node(orphan.clone());
+        let second = plan.add_node(orphan);
+        assert_ne!(first, second);
+        assert_eq!(super::producer(&plan, 5), Some(second));
     }
 }
