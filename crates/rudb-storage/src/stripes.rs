@@ -260,12 +260,53 @@ impl StripeDirectory {
         }
     }
 
-    /// Stamps what `txn` did to the rows at `rids` with its commit timestamp `ts`.
+    /// Updates the frozen row at `rid` for transaction `txn` reading at `snapshot` by moving it
+    /// into the head, `engine-v4/07-the-head.md` section 7.8, and returns the rid of the new
+    /// version.
+    ///
+    /// A frozen row is never written in place. Its delete vector entry is taken first, and that
+    /// entry is the row's lock, the same one a delete of it takes, so an update and a delete of
+    /// one frozen row conflict just as they do on a hot row. Then a slot is leased from
+    /// `inserter` and `fill` writes the whole new version into it, because only the caller can
+    /// decode the old row and apply the statement's changes to it. The slot is published as an
+    /// insert by `txn`, so until [`Self::commit`] is given both rids, other transactions see the
+    /// old row and `txn` sees the new one. A hot row is updated in place with
+    /// [`HotStripe::update`] instead.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Gone`] when `txn` does not see the row, which includes a rid of no frozen
+    /// stripe, and [`Refusal::Conflict`] when another transaction holds it or wrote it after
+    /// `snapshot`. `fill` is not called then, and no slot is taken.
+    pub fn migrate(
+        &self,
+        rid: Rid,
+        snapshot: u64,
+        txn: u64,
+        inserter: &mut Inserter,
+        fill: impl FnOnce(&mut Lease, u32),
+    ) -> Result<Rid, Refusal> {
+        match self.find(rid.stripe()) {
+            Some(Stripe::Frozen(stripe)) if rid.slot() < stripe.rows() => {
+                stripe.with_deletes(|deletes| deletes.delete(rid.slot(), snapshot, txn))?;
+            }
+            _ => return Err(Refusal::Gone),
+        }
+        let (lease, slots) = inserter.take(1);
+        fill(lease, slots.start);
+        lease.stripe().insert(slots.clone(), txn);
+        Ok(Rid::new(lease.stripe().id(), slots.start))
+    }
+
+    /// Stamps what `txn` did to the rows at `rids` with its commit timestamp `ts`: its updates
+    /// and deletes, and the rows it inserted, which is how the new version of a migrated row is
+    /// committed beside the delete of the old one.
     pub fn commit(&self, rids: &[Rid], txn: u64, ts: u64) {
         self.finish(rids, |stripe, slots| match stripe {
             Stripe::Hot(stripe) => {
                 for slot in slots {
                     stripe.commit_write(slot, txn, ts);
+                    stripe.commit_insert(slot..slot + 1, txn, ts);
                 }
             }
             Stripe::Frozen(stripe) => {
@@ -274,12 +315,13 @@ impl StripeDirectory {
         });
     }
 
-    /// Takes back what `txn` did to the rows at `rids`.
+    /// Takes back what `txn` did to the rows at `rids`, the rows it inserted included.
     pub fn abort(&self, rids: &[Rid], txn: u64) {
         self.finish(rids, |stripe, slots| match stripe {
             Stripe::Hot(stripe) => {
                 for slot in slots {
                     stripe.abort_write(slot, txn);
+                    stripe.abort_insert(slot..slot + 1, txn);
                 }
             }
             Stripe::Frozen(stripe) => {
@@ -369,7 +411,7 @@ mod tests {
 
     use super::{Inserter, Rid, Stripe, StripeDirectory};
     use crate::deletes::{Base, DeleteVector, Refusal, STRIPE_ROWS};
-    use crate::hot::Width;
+    use crate::hot::{Lease, Width};
     use crate::undo::{UndoBuffer, UndoSpace};
 
     fn directory() -> Arc<StripeDirectory> {
@@ -422,6 +464,53 @@ mod tests {
         }
         table.abort(&again, 10);
         assert_eq!(table.count(3, 10), 10_095);
+    }
+
+    #[test]
+    fn an_updated_frozen_row_moves_into_the_head_under_its_delete_vector_entry() {
+        let table = directory();
+        let frozen = table.attach(100, 1, DeleteVector::default());
+        let mut inserter = Inserter::new(Arc::clone(&table));
+        let mut buffer = UndoBuffer::default();
+        let fill = |value: u128| {
+            move |lease: &mut Lease, slot: u32| lease.stripe().write(slot, 0, Some(value))
+        };
+        let hot = |rid: Rid| match table.find(rid.stripe()) {
+            Some(Stripe::Hot(stripe)) => stripe,
+            _ => panic!("the new version is in a hot stripe"),
+        };
+
+        let old = Rid::new(frozen, 5);
+        let new = table.migrate(old, 2, 8, &mut inserter, fill(500)).expect("migrate");
+        assert_ne!(new.stripe(), frozen);
+        assert_eq!(hot(new).read(new.slot(), 0), Some(500));
+        assert!(hot(new).visible(new.slot(), 2, 8), "its own new version");
+        assert!(!hot(new).visible(new.slot(), 9, 0), "not committed");
+        assert_eq!((table.count(2, 8), table.count(9, 0)), (100, 100));
+
+        let refused = |result| assert_eq!(result, Err(Refusal::Conflict));
+        refused(table.delete(old, 2, 9, &mut buffer));
+        refused(table.migrate(old, 2, 9, &mut inserter, fill(600)).map(|_| ()));
+        table.delete(Rid::new(frozen, 6), 2, 9, &mut buffer).expect("delete");
+        refused(table.migrate(Rid::new(frozen, 6), 2, 8, &mut inserter, fill(700)).map(|_| ()));
+        table.abort(&[Rid::new(frozen, 6)], 9);
+
+        table.commit(&[old, new], 8, 3);
+        assert!(hot(new).visible(new.slot(), 3, 0));
+        assert!(!hot(new).visible(new.slot(), 2, 0), "an older snapshot keeps the old row");
+        assert_eq!((table.count(2, 0), table.count(3, 0)), (100, 100));
+        refused(table.migrate(old, 2, 10, &mut inserter, fill(800)).map(|_| ()));
+        let gone = table.migrate(old, 3, 10, &mut inserter, fill(800));
+        assert_eq!(gone, Err(Refusal::Gone), "its new version has another rid");
+        let missing = table.migrate(new, 3, 10, &mut inserter, fill(800));
+        assert_eq!(missing, Err(Refusal::Gone), "a hot row is updated in place");
+
+        let old = Rid::new(frozen, 7);
+        let new = table.migrate(old, 3, 11, &mut inserter, fill(900)).expect("migrate");
+        table.abort(&[old, new], 11);
+        assert!(!hot(new).visible(new.slot(), 3, 11), "the new version is a hole");
+        assert_eq!(table.count(3, 11), 100, "the old row is back");
+        table.migrate(old, 3, 12, &mut inserter, fill(901)).expect("free again");
     }
 
     #[test]
