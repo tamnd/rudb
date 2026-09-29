@@ -27,25 +27,11 @@ fn unix_micros() -> i64 {
 /// want, and anything that wants a row gets it through [`QueryResult::row`].
 #[derive(Debug, Clone)]
 pub struct QueryResult {
-    // The columns, the chunks and where they start are shared between clones, because nothing
-    // writes to them once the result is made and the one-row count a trickled `INSERT` answers
-    // with is a clone of one held result. Copying the four lists was five allocations a row.
-    names: Arc<[String]>,
-    types: Arc<[LogicalType]>,
-    chunks: Arc<Vec<Chunk>>,
-    /// Where each chunk starts, so a row number finds its chunk by a search rather than by walking.
-    /// The last entry is the row count, which is what makes the search a plain partition point.
-    starts: Arc<[usize]>,
+    /// Everything nothing writes to once the result is made, shared between clones. The one-row
+    /// count a trickled `INSERT` answers with is a clone of one held result, and with each list and
+    /// the session held apart a clone and its drop were a count up and down for every one of them.
+    body: Arc<Body>,
     rows: usize,
-    /// What these chunks are charged against the database's memory limit, given back when the last
-    /// handle on this result is dropped.
-    ///
-    /// Behind an `Arc` because a result is cloneable and a reservation is not. A clone copies the
-    /// chunks and shares the charge, so two handles on one result are charged once. That under
-    /// counts, and it is the direction to under count in: a program that clones a result to hand it
-    /// to another thread has not doubled its data in any sense it would recognize, and refusing its
-    /// next query because it did would be a worse answer than the one it gets.
-    held: Arc<Reservation>,
     /// What the execution that produced these rows measured about itself, when it was an execution
     /// at all.
     ///
@@ -53,13 +39,33 @@ pub struct QueryResult {
     /// inline it made every result that large, and a trickled `INSERT` copied its count answer
     /// four times on the way out.
     metrics: Option<Box<Document>>,
-    /// The session whose zone decides how zoned values are rendered.
-    session: Session,
     /// The instant used to choose the offset for a zoned time with no date of its own.
     rendered_at: i64,
     /// How many rows the statement wrote, when this is the count a writing statement answers with
     /// rather than rows a query produced.
     changes: Option<usize>,
+}
+
+/// The part of a [`QueryResult`] its clones share.
+#[derive(Debug)]
+struct Body {
+    names: Vec<String>,
+    types: Vec<LogicalType>,
+    chunks: Vec<Chunk>,
+    /// Where each chunk starts, so a row number finds its chunk by a search rather than by walking.
+    /// The last entry is the row count, which is what makes the search a plain partition point.
+    starts: Vec<usize>,
+    /// What the chunks are charged against the database's memory limit, given back when the last
+    /// handle on the result is dropped.
+    ///
+    /// Shared because a result is cloneable and a reservation is not. Two handles on one result are
+    /// charged once. That under counts, and it is the direction to under count in: a program that
+    /// clones a result to hand it to another thread has not doubled its data in any sense it would
+    /// recognize, and refusing its next query because it did would be a worse answer than the one
+    /// it gets.
+    held: Reservation,
+    /// The session whose zone decides how zoned values are rendered.
+    session: Session,
 }
 
 impl QueryResult {
@@ -79,14 +85,9 @@ impl QueryResult {
         }
         starts.push(rows);
         Self {
-            names: names.into(),
-            types: types.into(),
-            chunks: Arc::new(chunks),
-            starts: starts.into(),
+            body: Arc::new(Body { names, types, chunks, starts, held, session: Session::new() }),
             rows,
-            held: Arc::new(held),
             metrics: None,
-            session: Session::new(),
             rendered_at: unix_micros(),
             changes: None,
         }
@@ -102,7 +103,12 @@ impl QueryResult {
     /// Carries the session that produced the result so zoned values keep its rendering.
     #[must_use]
     pub(crate) fn in_session(mut self, session: Session) -> Self {
-        self.session = session;
+        // Called on a result straight from `Self::new`, which nothing else holds yet.
+        let body = Arc::get_mut(&mut self.body);
+        debug_assert!(body.is_some(), "a session given to a result already shared");
+        if let Some(body) = body {
+            body.session = session;
+        }
         self
     }
 
@@ -120,7 +126,7 @@ impl QueryResult {
             Value::TimeTz(_) => self.rendered_at,
             other => return other.to_string(),
         };
-        value.to_string_at_offset(self.session.offset_seconds_at(instant))
+        value.to_string_at_offset(self.body.session.offset_seconds_at(instant))
     }
 
     /// One cell rendered under the session that produced this result.
@@ -191,13 +197,13 @@ impl QueryResult {
     /// The column names, in order.
     #[must_use]
     pub fn names(&self) -> &[String] {
-        &self.names
+        &self.body.names
     }
 
     /// The column types, in order.
     #[must_use]
     pub fn types(&self) -> &[LogicalType] {
-        &self.types
+        &self.body.types
     }
 
     /// How many bytes this result is charged against the database's memory limit.
@@ -207,7 +213,7 @@ impl QueryResult {
     /// program deciding whether to keep a result or re-run the query for it.
     #[must_use]
     pub fn footprint(&self) -> u64 {
-        self.held.bytes()
+        self.body.held.bytes()
     }
 
     /// What the execution measured about itself, for a result that came from one.
@@ -229,7 +235,7 @@ impl QueryResult {
     /// How many columns.
     #[must_use]
     pub fn width(&self) -> usize {
-        self.names.len()
+        self.body.names.len()
     }
 
     /// How many rows, across every chunk.
@@ -247,19 +253,19 @@ impl QueryResult {
     /// The name of one column, or the empty string if there is no such column.
     #[must_use]
     pub fn column_name(&self, column: usize) -> &str {
-        self.names.get(column).map_or("", String::as_str)
+        self.body.names.get(column).map_or("", String::as_str)
     }
 
     /// The type of one column, or `NULL` if there is no such column.
     #[must_use]
     pub fn column_type(&self, column: usize) -> LogicalType {
-        self.types.get(column).cloned().unwrap_or(LogicalType::Null)
+        self.body.types.get(column).cloned().unwrap_or(LogicalType::Null)
     }
 
     /// The batches, for a caller that wants the columnar form.
     #[must_use]
     pub fn chunks(&self) -> &[Chunk] {
-        &self.chunks
+        &self.body.chunks
     }
 
     /// How many batches the result is in.
@@ -269,13 +275,13 @@ impl QueryResult {
     /// it that way never builds a row.
     #[must_use]
     pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
+        self.body.chunks.len()
     }
 
     /// One batch, or `None` if it is past the end.
     #[must_use]
     pub fn chunk(&self, at: usize) -> Option<&Chunk> {
-        self.chunks.get(at)
+        self.body.chunks.get(at)
     }
 
     /// The batches, one at a time.
@@ -284,7 +290,7 @@ impl QueryResult {
     /// promise about where the rows came from: they are all here already, and a result that does
     /// not materialize is section 7.5's streaming result, which is a second type beside this one.
     pub fn chunk_iter(&self) -> impl ExactSizeIterator<Item = &Chunk> {
-        self.chunks.iter()
+        self.body.chunks.iter()
     }
 
     /// The batches, taken rather than borrowed.
@@ -293,7 +299,10 @@ impl QueryResult {
     /// table to append to, and would otherwise clone every chunk to do it.
     #[must_use]
     pub fn into_chunks(self) -> Vec<Chunk> {
-        Arc::unwrap_or_clone(self.chunks)
+        match Arc::try_unwrap(self.body) {
+            Ok(body) => body.chunks,
+            Err(shared) => shared.chunks.clone(),
+        }
     }
 
     /// Which chunk a row is in, and where in it, or `None` if the row is past the end.
@@ -305,8 +314,8 @@ impl QueryResult {
         if row >= self.rows {
             return None;
         }
-        let at = self.starts.partition_point(|&start| start <= row) - 1;
-        Some((at, row - self.starts[at]))
+        let at = self.body.starts.partition_point(|&start| start <= row) - 1;
+        Some((at, row - self.body.starts[at]))
     }
 
     /// One value, or null if the row or the column is past the end.
@@ -317,7 +326,7 @@ impl QueryResult {
     #[must_use]
     pub fn value_at(&self, row: usize, column: usize) -> Value {
         match self.locate(row) {
-            Some((at, offset)) => self.chunks[at].value_at(offset, column),
+            Some((at, offset)) => self.body.chunks[at].value_at(offset, column),
             None => Value::Null,
         }
     }
@@ -326,12 +335,15 @@ impl QueryResult {
     #[must_use]
     pub fn row(&self, row: usize) -> Option<Vec<Value>> {
         let (at, offset) = self.locate(row)?;
-        Some(self.chunks[at].row(offset).collect())
+        Some(self.body.chunks[at].row(offset).collect())
     }
 
     /// Every row in order, which is the shape a test and a script both want.
     pub fn rows(&self) -> impl Iterator<Item = Vec<Value>> + '_ {
-        self.chunks.iter().flat_map(|chunk| (0..chunk.len()).map(|row| chunk.row(row).collect()))
+        self.body
+            .chunks
+            .iter()
+            .flat_map(|chunk| (0..chunk.len()).map(|row| chunk.row(row).collect()))
     }
 
     /// One column, top to bottom, across every chunk.
@@ -340,7 +352,8 @@ impl QueryResult {
     /// a program summing a column or handing one to a plotting library never transposes anything.
     pub fn column(&self, column: usize) -> impl Iterator<Item = Value> + '_ {
         let width = self.width();
-        self.chunks
+        self.body
+            .chunks
             .iter()
             .filter(move |_| column < width)
             .flat_map(move |chunk| (0..chunk.len()).map(move |row| chunk.value_at(row, column)))
@@ -357,7 +370,7 @@ impl QueryResult {
     /// For a column of a type Arrow has no counterpart for here yet.
     pub fn arrow_schema(&self) -> Result<Schema> {
         let mut fields = Vec::with_capacity(self.width());
-        for (name, ty) in self.names.iter().zip(self.types.iter()) {
+        for (name, ty) in self.body.names.iter().zip(self.body.types.iter()) {
             fields.push(Field::new(name.clone(), DataType::of(ty)?));
         }
         Ok(Schema::new(fields))
@@ -378,7 +391,7 @@ impl QueryResult {
     /// For a column of a type Arrow has no counterpart for here yet, and for a chunk whose values
     /// are not the layout its type says they are.
     pub fn to_arrow(&self) -> Result<Vec<RecordBatch>> {
-        self.chunks.iter().map(|chunk| RecordBatch::of(chunk, &self.names)).collect()
+        self.body.chunks.iter().map(|chunk| RecordBatch::of(chunk, &self.body.names)).collect()
     }
 }
 
