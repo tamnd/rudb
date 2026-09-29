@@ -1028,7 +1028,7 @@ impl MemoryTable {
     /// # Errors
     ///
     /// If the row is not as wide as the table, or if a value is not one its column can hold.
-    pub fn append_row(&mut self, row: Vec<Value>) -> Result<()> {
+    pub fn append_row(&mut self, row: &[Value]) -> Result<()> {
         self.forget_grams();
         if row.len() != self.types.len() {
             return Err(Error::internal(format!(
@@ -1037,7 +1037,7 @@ impl MemoryTable {
                 self.types.len()
             )));
         }
-        self.push_row(&row)
+        self.push_row(row)
     }
 
     /// Puts one row of the right width on the end of the tail, into the columns being built.
@@ -1831,7 +1831,7 @@ mod tests {
             (0..300).map(|id| vec![Value::BigInt(id), Value::Varchar(format!("n{id}"))]).collect();
         let (mut taken, mut copied) = (MemoryTable::new(types.clone()), MemoryTable::new(types));
         for row in &rows {
-            taken.append_row(row.clone()).expect("a row");
+            taken.append_row(row).expect("a row");
             copied.append_rows(std::slice::from_ref(row)).expect("a row");
         }
         assert_eq!(taken.chunk_count(), copied.chunk_count());
@@ -1844,7 +1844,7 @@ mod tests {
             }
         }
         assert_eq!(taken.distinct_values(1), copied.distinct_values(1));
-        assert!(taken.append_row(vec![Value::BigInt(1)]).is_err(), "one value for two columns");
+        assert!(taken.append_row(&[Value::BigInt(1)]).is_err(), "one value for two columns");
         assert_eq!(taken.len(), 300);
     }
 

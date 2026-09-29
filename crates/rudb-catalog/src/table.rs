@@ -1826,14 +1826,15 @@ impl Table {
         self.rows = rows;
     }
 
-    /// Adds one row, taking it, which is [`Self::append_rows`] with one row and without the copy.
+    /// Adds one row, which is [`Self::append_rows`] with one row. The row is only read, because
+    /// the table builds its values into the columns of its tail, so the caller keeps it.
     ///
     /// # Errors
     ///
     /// As [`Self::append_rows`].
-    pub fn append_row(&mut self, row: Vec<Value>) -> Result<()> {
+    pub fn append_row(&mut self, row: &[Value]) -> Result<()> {
         if !self.guards().is_empty() {
-            return self.append_rows(&[row]);
+            return self.append_rows(&[row.to_vec()]);
         }
         for (at, column) in self.columns.iter().enumerate() {
             if column.not_null && row.get(at).is_some_and(Value::is_null) {
