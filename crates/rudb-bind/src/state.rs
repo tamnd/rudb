@@ -75,6 +75,17 @@ impl Binder<'_> {
     }
 }
 
+/// Refuses a `combine_aggr` over anything but a state.
+pub(crate) fn merged_argument(ty: &LogicalType) -> Result<()> {
+    match ty {
+        LogicalType::AggregateState(_) => Ok(()),
+        other => Err(Error::binder(format!(
+            "Can only \"combine_aggr\" {}, not AGGREGATE_STATE",
+            shown(other)
+        ))),
+    }
+}
+
 /// A type the way the pin names it in these messages, where the null type is quoted.
 fn shown(ty: &LogicalType) -> String {
     if *ty == LogicalType::Null { "\"NULL\"".to_string() } else { ty.to_string() }

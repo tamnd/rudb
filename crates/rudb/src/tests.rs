@@ -12068,6 +12068,48 @@ fn export_state_writes_the_states_the_pin_writes_and_finalize_and_combine_read_t
 }
 
 #[test]
+fn combine_aggr_folds_states_as_many_times_as_it_is_told() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let over = |times: &str, call: &str| {
+        format!(
+            "SELECT finalize(combine_aggr(s{times})) FROM (SELECT {call} EXPORT_STATE s \
+             FROM range(3) r(x))"
+        )
+    };
+    for (sql, answer) in [
+        (
+            "SELECT finalize(combine_aggr(s)) FROM (SELECT sum(x) EXPORT_STATE s \
+             FROM range(10) r(x) GROUP BY x % 3)"
+                .to_string(),
+            "45",
+        ),
+        (over(", 3", "list(x)"), "[0, 1, 2, 0, 1, 2, 0, 1, 2]"),
+        (over(", 2", "string_agg(x::VARCHAR, '|')"), "0|1|2|0|1|2"),
+        (over(", 2", "count(*)"), "6"),
+        (over(", 0", "count(*)"), "0"),
+        (over(", NULL", "count(*)"), "0"),
+        (over(", 0", "sum(x)"), "NULL"),
+        (over(", 2", "avg(x)"), "1.0"),
+    ] {
+        assert_eq!(text(&sql), answer, "{sql}");
+    }
+    for (sql, message) in [
+        (over(", -1", "count(*)"), "combine_aggr multiplicity must be non-negative"),
+        ("SELECT combine_aggr(1)".to_string(), "Can only \"combine_aggr\" INTEGER"),
+    ] {
+        let error = db.execute(&sql).expect_err(&sql);
+        assert!(error.message().contains(message), "{error}");
+    }
+}
+
+#[test]
 fn a_list_a_string_agg_and_a_quantile_export_their_states_and_combine_the_way_the_pin_does() {
     let db = Database::new();
     let text = |sql: &str| {

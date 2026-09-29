@@ -8,6 +8,8 @@
 //! makes `finalize` the accumulator's own finish and `combine` its own combine, and so the same
 //! answers the aggregate gives when nothing was exported at all.
 
+use std::sync::Arc;
+
 use rudb_common::{Error, Field, LogicalType, Result, StateType, Value};
 
 use super::{Accumulator, State, exactly, mean_bits, mean_real};
@@ -109,11 +111,85 @@ fn not_written(name: &str) -> Error {
 
 /// The name a `finalize` of `state` is stored under, which `state_call` reads back.
 pub fn finalize_name(state: &StateType) -> String {
-    let scale = match state.arguments.first() {
+    format!("{FINALIZE} {} {}", state.function, scale(state))
+}
+
+/// The scale of the decimal a state's call was made over, or 0 when it was not over a decimal.
+fn scale(state: &StateType) -> u8 {
+    match state.arguments.first() {
         Some(LogicalType::Decimal { scale, .. }) => *scale,
         _ => 0,
-    };
-    format!("{FINALIZE} {} {scale}", state.function)
+    }
+}
+
+/// A fresh accumulator for the call `state` came from holding the state `value` wrote.
+fn imported(state: &StateType, value: &Value) -> Result<Accumulator> {
+    let constant = state.constants.get(1).and_then(Option::as_ref);
+    Accumulator::import(&state.function, &state.returns, scale(state), value, constant)
+}
+
+/// `combine_aggr`, which folds the exported states of one call into one state of that call.
+///
+/// Each row is a state and how many times to fold it in, once when the call does not say. Every
+/// fold is the aggregate's own combine, the running state first and the row's after it, so a list
+/// keeps its rows in the order they arrived. A repeated state is combined that many times rather
+/// than multiplied, which is what the pin does for every aggregate that has no shortcut of its own
+/// and gives the same answer for the ones that do.
+#[derive(Debug, Clone)]
+pub(crate) struct Merge {
+    held: Option<Box<Accumulator>>,
+    state: Arc<StateType>,
+}
+
+impl Merge {
+    pub(crate) fn new(state: Arc<StateType>) -> Self {
+        Self { held: None, state }
+    }
+
+    /// Folds one row in: a state, and the number of times to fold it when there is one.
+    pub(crate) fn update(&mut self, args: &[Value]) -> Result<()> {
+        let Some(value) = args.first().filter(|value| !value.is_null()) else {
+            return Ok(());
+        };
+        let times = match args.get(1) {
+            None => 1,
+            Some(Value::Null) => return Ok(()),
+            Some(times) => whole(times)?,
+        };
+        if times < 0 {
+            return Err(Error::invalid_input("combine_aggr multiplicity must be non-negative"));
+        }
+        if times == 0 {
+            return Ok(());
+        }
+        let row = imported(&self.state, value)?;
+        let held = match &mut self.held {
+            Some(held) => held,
+            empty => empty.insert(Box::new(imported(&self.state, &Value::Null)?)),
+        };
+        for _ in 0..times {
+            held.combine(&row)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn combine(&mut self, other: &Self) -> Result<()> {
+        match (&mut self.held, &other.held) {
+            (_, None) => {}
+            (None, Some(theirs)) => self.held = Some(theirs.clone()),
+            (Some(held), Some(theirs)) => held.combine(theirs)?,
+        }
+        Ok(())
+    }
+
+    /// The folded state written out. With no row to fold it is the aggregate's empty state, so a
+    /// count of nothing still finalizes to 0 the way it does in the pin.
+    pub(crate) fn finish(&self) -> Result<Value> {
+        match &self.held {
+            None => imported(&self.state, &Value::Null)?.export(&self.state.layout),
+            Some(held) => held.export(&self.state.layout),
+        }
+    }
 }
 
 /// `finalize` or `combine` on one row, or `None` for any other name.
@@ -153,13 +229,6 @@ pub(crate) fn state_call(
     if left.is_null() && right.is_null() {
         return Ok(Some(Value::Null));
     }
-    let scale = match state.arguments.first() {
-        Some(LogicalType::Decimal { scale, .. }) => *scale,
-        _ => 0,
-    };
-    let constant = state.constants.get(1).and_then(Option::as_ref);
-    let import =
-        |value| Accumulator::import(&state.function, &state.returns, scale, value, constant);
     // The pin folds the left state into the right one, so a list comes out as the right rows
     // followed by the left ones. Its `last` of a number keeps the right value when it has one,
     // the way `first` does, where the `last` of a string keeps the left one.
@@ -167,8 +236,8 @@ pub(crate) fn state_call(
     if state.function == "last" && !text {
         return Ok(Some(if right.is_null() { left.clone() } else { right.clone() }));
     }
-    let mut accumulator = import(right)?;
-    accumulator.combine(&import(left)?)?;
+    let mut accumulator = imported(state, right)?;
+    accumulator.combine(&imported(state, left)?)?;
     accumulator.export(&state.layout).map(Some)
 }
 
@@ -374,6 +443,7 @@ impl General {
             Self::Paired(state) => state.export(),
             Self::Powers(state) => state.export(),
             Self::List { .. } | Self::Joined { .. } => self.finish()?,
+            Self::Merged(merge) => merge.finish()?,
             Self::Holistic { values, .. } if values.len() == 0 => Value::Null,
             Self::Holistic { values, .. } => {
                 let element = match layout {
