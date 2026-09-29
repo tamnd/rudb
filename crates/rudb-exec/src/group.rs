@@ -31,8 +31,9 @@ use rudb_common::{
     stage,
 };
 use rudb_kernels::{
-    Accumulator, NOWHERE, finish_run, group_tally, is_true, settle_extremes, update_general,
-    update_runs, update_shared_runs, update_shared_slots, update_tallied, whole_answers,
+    Accumulator, NOWHERE, coded_run, finish_run, group_tally, holds_codes, is_true,
+    settle_extremes, update_general, update_runs, update_shared_runs, update_shared_slots,
+    update_tallied, whole_answers,
 };
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
@@ -3370,8 +3371,6 @@ impl<'a> Aggregate<'a> {
         //
         // A chunk at a time and not all of it, so what is held at once is the answer plus one
         // chunk. The ungrouped case falls out of the same loop with no key columns and one group.
-        let types = self.schema.types();
-        let width = self.groups.len();
         let count = |slot: usize, call: usize| {
             if self.count_only {
                 return counts[slot];
@@ -3418,8 +3417,26 @@ impl<'a> Aggregate<'a> {
         // strings come out of the payload in one ordered sweep here rather than one point read per
         // group down in the loop. Only the groups that are going to be emitted, since the selection
         // above has already thrown the rest away.
+        //
+        // A call whose groups all hold a rank out of one dictionary is not read at all. It goes out
+        // as the codes over that dictionary, see [`coded_run`], and a string is read only for a row
+        // something above asks about.
+        let types = self.schema.types();
+        let width = self.groups.len();
+        let plain = !self.count_only && !self.compact_numeric && width > 0;
+        let coded: Vec<bool> = (0..calls)
+            .map(|at| {
+                let ty = &types[width + at];
+                plain
+                    && self.calls[at].state_of(at) == at
+                    && self.calls[at].affine.is_none()
+                    && self.calls[at].reads_total.is_none()
+                    && matches!(ty, LogicalType::Varchar)
+                    && holds_codes(&states, selected.as_deref(), groups, calls, at, ty)
+            })
+            .collect();
         if !self.count_only && !self.compact_numeric {
-            settle_extremes(&mut states, selected.as_deref(), groups, calls)?;
+            settle_extremes(&mut states, selected.as_deref(), groups, calls, &coded)?;
         }
         // The one buffer the results of a call go through on their way into a vector, kept between
         // chunks and charged once.
@@ -3472,6 +3489,14 @@ impl<'a> Aggregate<'a> {
                 // exactly the way that one does, so it comes through here and the only difference is
                 // the state it is pointed at.
                 let held = self.calls[at].state_of(at);
+                if coded[held]
+                    && self.calls[at].affine.is_none()
+                    && self.calls[at].reads_total.is_none()
+                    && let Some(vector) = coded_run(&states, picked, calls, held, ty)?
+                {
+                    columns.push(vector);
+                    continue;
+                }
                 if !self.count_only
                     && !self.compact_numeric
                     && self.calls[at].finishes_plainly()
