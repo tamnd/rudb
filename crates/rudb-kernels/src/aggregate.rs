@@ -2668,6 +2668,99 @@ fn ranked_extreme(
     Ok(true)
 }
 
+/// Whether every group of a min or a max call is holding a rank out of one dictionary, or nothing,
+/// so that [`coded_run`] can hand the call's column out as codes into that dictionary.
+///
+/// `slots` names the groups that are going to be emitted, and none means the first `groups`.
+#[must_use]
+pub fn holds_codes(
+    states: &[Accumulator],
+    slots: Option<&[usize]>,
+    groups: usize,
+    stride: usize,
+    offset: usize,
+    ty: &LogicalType,
+) -> bool {
+    let emitted = slots.map_or(groups, <[usize]>::len);
+    let slot = |index: usize| slots.map_or(index, |slots| slots[index]);
+    matches!(ranked_codes(states, (0..emitted).map(slot), stride, offset, |_| {}), Ok(Some(held)) if held.logical_type() == ty)
+}
+
+/// The column of a min or a max call whose groups all hold a rank out of one dictionary, as the
+/// codes they hold over that dictionary, with a null for a group that saw no value.
+///
+/// A rank is kept in place of the string it stands for so that the string is read once, at the end,
+/// and [`settle_extremes`] reads them in one sweep for that reason. That is still a string for every
+/// group, and a group that is going to be thrown away by a filter above the aggregate is read for
+/// nothing. The pre-aggregated form of ClickBench q29, which groups by `Referer` first and takes
+/// `MIN(r)` over those 2.7 million groups, settled all four hundred thousand hosts to keep fifteen,
+/// and each of the sixty four partitions swept nearly every block of the dictionary to do it, which
+/// was half of what the query did. Codes over the dictionary the ranks came from are read only where
+/// something asks for the string, and they are the stable codes of that dictionary, so a grouping or
+/// a function above the aggregate answers once per value the way it does over the scan.
+///
+/// `None` when a group holds a value that is not a rank, or a rank out of another dictionary, or when
+/// the dictionary does not hold values of `ty`, and the caller finishes the call a group at a time.
+///
+/// # Errors
+///
+/// If a slot has no state for the call.
+pub fn coded_run(
+    states: &[Accumulator],
+    at: &[usize],
+    stride: usize,
+    offset: usize,
+    ty: &LogicalType,
+) -> Result<Option<Vector>> {
+    let mut codes: Vec<u32> = Vec::with_capacity(at.len());
+    let mut valid = Vec::with_capacity(at.len());
+    let Some(dictionary) = ranked_codes(states, at.iter().copied(), stride, offset, |code| {
+        codes.push(code.unwrap_or(0));
+        valid.push(code.is_some());
+    })?
+    else {
+        return Ok(None);
+    };
+    if dictionary.logical_type() != ty {
+        return Ok(None);
+    }
+    let vector = Vector::stable_dictionary(codes, Arc::clone(dictionary))?;
+    if valid.iter().all(|&valid| valid) {
+        return Ok(Some(vector));
+    }
+    Ok(Some(vector.with_validity(Validity::from_run(&valid))))
+}
+
+/// The dictionary every one of the groups at `slots` ranks in, handing `each` the code a group holds
+/// or none for a group that saw no value, and `None` when they do not all rank in one dictionary.
+fn ranked_codes<'s>(
+    states: &'s [Accumulator],
+    slots: impl Iterator<Item = usize>,
+    stride: usize,
+    offset: usize,
+    mut each: impl FnMut(Option<u32>),
+) -> Result<Option<&'s Arc<Vector>>> {
+    let mut found: Option<&Arc<Vector>> = None;
+    for slot in slots {
+        let Some(state) = states.get(slot * stride + offset) else {
+            return Err(Error::internal(format!("group {slot} has no state for call {offset}")));
+        };
+        match &state.state {
+            State::Extreme { held: None, .. } => each(None),
+            State::Extreme { held: Some(Extremum::Ranked { dictionary, code, .. }), .. } => {
+                match found {
+                    Some(kept) if !Arc::ptr_eq(kept, dictionary) => return Ok(None),
+                    Some(_) => {}
+                    None => found = Some(dictionary),
+                }
+                each(Some(*code));
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(found)
+}
+
 /// Turns the ranks a set of groups is holding into the values they stand for, in one ordered pass.
 ///
 /// A group that won on a rank holds a dictionary code and nothing else, so the string it answers
@@ -2691,6 +2784,7 @@ pub fn settle_extremes(
     slots: Option<&[usize]>,
     groups: usize,
     stride: usize,
+    coded: &[bool],
 ) -> Result<()> {
     /// Which dictionary, which code, and which accumulator wants it.
     type Wanted = (usize, u32, usize);
@@ -2701,6 +2795,10 @@ pub fn settle_extremes(
     for index in 0..emitted {
         let slot = slots.map_or(index, |slots| slots[index]);
         for call in 0..stride {
+            // A call whose groups go out as codes has nothing to read here.
+            if coded.get(call).copied().unwrap_or(false) {
+                continue;
+            }
             let at = slot * stride + call;
             let Some(state) = states.get(at) else {
                 return Err(Error::internal("an extreme to settle is out of range".to_string()));
