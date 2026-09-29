@@ -66,7 +66,8 @@ impl Layout {
     }
 }
 
-const ROWS_PER_PAGE: usize = 1024;
+/// How many rows a page of a table without lanes holds.
+pub const ROWS_PER_PAGE: usize = 1024;
 
 /// How many bits of a key's hash pick the lane a table that is merged by parts puts its row in.
 pub const LANE_BITS: u32 = 8;
@@ -130,6 +131,12 @@ pub struct GroupTable {
     /// How many more keys a table with lanes makes a row for without looking for them, because
     /// most of the keys it was asked for before were new.
     blind: usize,
+    /// For a table of [`runs`](GroupTable::runs), the address of the first row of the last page
+    /// that has no group id yet, zero before the first page.
+    claimed: usize,
+    /// For the same table, the groups whose key another row may have too: the first and the last
+    /// a morsel made, whose runs may go on in another morsel.
+    edges: Vec<usize>,
 }
 
 /// The rows of one lane.
@@ -195,6 +202,8 @@ impl GroupTable {
             gone: 0,
             asked: 0,
             blind: 0,
+            claimed: 0,
+            edges: Vec::new(),
         };
         if table.layout.keys.is_empty() {
             table.add(&[], 0, None);
@@ -264,6 +273,84 @@ impl GroupTable {
     /// after this builds them again.
     pub fn seal(&mut self) {
         self.slots = Vec::new();
+    }
+
+    /// Makes this a table whose rows compiled code writes itself, one group a run of its one key,
+    /// for an aggregate whose key arrives in runs. It has no slots. Compiled code takes the next
+    /// row of the last page for each new run and asks [`page`](GroupTable::page) for another page
+    /// when that one is full, and the driver gives the rows their group ids with
+    /// [`claim`](GroupTable::claim) after each morsel.
+    pub fn runs(&mut self) {
+        self.slots = Vec::new();
+    }
+
+    /// Gives every row of the last page a group id, since compiled code only asks for a page when
+    /// the last one is full, and adds a page, zeroed as a new group's accumulators are. Returns
+    /// the page's address.
+    pub fn page(&mut self) -> usize {
+        if let Some(last) = self.pages.last() {
+            let end = last.as_ptr().expose_provenance() + last.len();
+            self.claim(end);
+        }
+        let page = vec![0u8; ROWS_PER_PAGE * self.row_size].into_boxed_slice();
+        let at = page.as_ptr().expose_provenance();
+        self.pages.push(page);
+        self.fill = ROWS_PER_PAGE;
+        self.claimed = at;
+        at
+    }
+
+    /// Gives a group id to each row of the last page before `next`, the address compiled code
+    /// takes its next row at.
+    pub fn claim(&mut self, next: usize) {
+        while self.claimed != 0 && self.claimed < next {
+            self.rows.push(self.claimed);
+            self.hashes.push(0);
+            self.claimed += self.row_size;
+        }
+    }
+
+    /// Says that group `gid` may share its key with a group another morsel made.
+    pub fn edge(&mut self, gid: usize) {
+        self.edges.push(gid);
+    }
+
+    /// One table of the groups of `parts`, tables of [`runs`](GroupTable::runs) with the layout
+    /// `layout`. A group no morsel's edge touched is the only one of its key and stays where it
+    /// is. The edge groups, at most two a morsel, are folded by key into a table of their own with
+    /// `combine`, which gets that table's row and a part's row of the same key.
+    #[must_use]
+    pub fn close(
+        layout: Layout,
+        mut parts: Vec<GroupTable>,
+        mut combine: impl FnMut(&mut [u8], &[u8]),
+    ) -> GroupTable {
+        let size = layout.key_size as usize;
+        let mut edges = GroupTable::new(layout.clone());
+        for part in &mut parts {
+            let mut picked = std::mem::take(&mut part.edges);
+            if picked.is_empty() {
+                continue;
+            }
+            picked.sort_unstable();
+            picked.dedup();
+            for &gid in &picked {
+                let src = part.row(gid);
+                let key = &src[8..8 + size];
+                let at = edges.find_or_add(key, key_hash(key), None);
+                combine(edges.row_mut(at), src);
+            }
+            let mut next = picked.iter().peekable();
+            let mut gid = 0;
+            part.rows.retain(|_| {
+                let edge = next.next_if_eq(&&gid).is_some();
+                gid += 1;
+                !edge
+            });
+            part.hashes.truncate(part.rows.len());
+        }
+        parts.push(edges);
+        GroupTable::join(layout, parts)
     }
 
     /// Whether a key may have more than one group, because the slots were emptied.
@@ -629,6 +716,8 @@ impl GroupTable {
             gone: 0,
             asked: 0,
             blind: 0,
+            claimed: 0,
+            edges: Vec::new(),
         };
         (table, ran)
     }
@@ -835,6 +924,18 @@ impl GroupTable {
         }
         self.slots = slots;
     }
+}
+
+/// A hash of a key's bytes with the top half zero, as the slots want, for the keys of a table of
+/// runs, which compiled code never hashed.
+fn key_hash(key: &[u8]) -> u64 {
+    let mut h = 0u64;
+    for c in key.chunks(8) {
+        let mut w = [0u8; 8];
+        w[..c.len()].copy_from_slice(c);
+        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(SPREAD).rotate_left(29);
+    }
+    h.wrapping_mul(SPREAD) >> 32
 }
 
 /// Asks for the cache line at `address` ahead of reading it.
@@ -1427,6 +1528,70 @@ mod tests {
         k[9..25].copy_from_slice(&text::make(s).to_le_bytes());
         k[25] = u8::from(null);
         k
+    }
+
+    #[test]
+    fn runs_fold_only_the_groups_at_the_edges_of_a_morsel() {
+        let layout = Layout {
+            keys: vec![KeyField { offset: 0, width: 8, text: false }],
+            key_size: 9,
+            init: vec![0; 8],
+        };
+        let acc = Layout::acc_offset(9) as usize;
+        let size = layout.row_size();
+        // Two workers, each with two morsels of runs, as the compiled code takes their rows: the
+        // key 4 is split between the workers and the key 2000 between the morsels of one.
+        let morsels: [&[&[u64]]; 2] =
+            [&[&[0, 1, 2, 3, 4], &[2000, 2001]], &[&[4, 5, 6], &[1998, 1999, 2000]]];
+        let mut parts = Vec::new();
+        for worker in morsels {
+            let mut t = GroupTable::new(layout.clone());
+            t.runs();
+            let (mut next, mut end) = (0, 0);
+            for keys in worker {
+                let before = t.len();
+                for &k in *keys {
+                    if next == end {
+                        next = t.page();
+                        end = next + ROWS_PER_PAGE * size;
+                    }
+                    // SAFETY: the row is in the page the table just gave.
+                    let row = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            std::ptr::with_exposed_provenance_mut::<u8>(next),
+                            size,
+                        )
+                    };
+                    row[8..16].copy_from_slice(&k.to_le_bytes());
+                    row[acc..acc + 8].copy_from_slice(&3u64.to_le_bytes());
+                    next += size;
+                }
+                t.claim(next);
+                let after = t.len();
+                t.edge(before);
+                t.edge(after - 1);
+            }
+            parts.push(t);
+        }
+        let add = |d: &mut [u8], s: &[u8]| {
+            let n = |b: &[u8]| u64::from_le_bytes(b[acc..acc + 8].try_into().unwrap_or_default());
+            let total = n(d) + n(s);
+            d[acc..acc + 8].copy_from_slice(&total.to_le_bytes());
+        };
+        let merged = GroupTable::close(layout, parts, add);
+        let mut counts: Vec<(u64, u64)> = (0..merged.len())
+            .map(|gid| {
+                let row = merged.row(gid);
+                let n = |at: usize| u64::from_le_bytes(row[at..at + 8].try_into().unwrap());
+                (n(8), n(acc))
+            })
+            .collect();
+        counts.sort_unstable();
+        let mut want: Vec<(u64, u64)> =
+            [0, 1, 2, 3, 5, 6, 1998, 1999, 2001].iter().map(|&k| (k, 3)).collect();
+        want.extend([(4, 6), (2000, 6)]);
+        want.sort_unstable();
+        assert_eq!(counts, want);
     }
 
     #[test]

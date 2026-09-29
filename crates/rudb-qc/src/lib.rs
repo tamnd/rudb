@@ -41,7 +41,7 @@ use rudb_common::bounds::Bound;
 use rudb_common::{Cancel, LogicalType, Memory, Result, Session, Value};
 use rudb_pipeline::{Pool, Progress};
 use rudb_plan::{Node, NodeRef, Plan};
-use rudb_qc_gen::{Known, Query};
+use rudb_qc_gen::{Known, Out, Query};
 use rudb_qc_pipe::{Graph, Source, Stage};
 pub use rudb_qc_plan::Refusal;
 use rudb_qc_plan::{Key, Kind};
@@ -115,6 +115,16 @@ pub fn compile_over(
     options: Options,
 ) -> std::result::Result<Compiled, Refusal> {
     let started = Instant::now();
+    if options.walks
+        && let Some(catalog) = catalog
+        && rudb_exec::walks_siblings(plan, catalog)
+    {
+        return Err(Refusal::new(
+            "Siblings",
+            "the first engine walks a semi or anti join to each row's siblings through a link, \
+             which compiled code does not do yet",
+        ));
+    }
     let rel = rudb_qc_plan::lower(plan)?;
     let graph = rudb_qc_pipe::split(&rel);
     check(&graph)?;
@@ -209,7 +219,7 @@ const DOMAIN: usize = 254;
 fn check(graph: &Graph) -> std::result::Result<(), Refusal> {
     for stage in &graph.stages {
         match stage {
-            Stage::Pipeline(_) | Stage::Limit { .. } => {}
+            Stage::Pipeline(_) | Stage::Limit { .. } | Stage::Marked { .. } => {}
             Stage::Sort { keys, .. } | Stage::TopN { keys, .. } => {
                 if keys.iter().any(|k| !matches!(k.expr.kind, Kind::Column(_))) {
                     return Err(Refusal::new("Sort", "a sort key that is not a column"));
@@ -414,6 +424,17 @@ impl Compiled {
                 Stage::Limit { input, count, offset, .. } => {
                     finish::limit(take(&mut outputs, *input)?, *count, *offset)?
                 }
+                Stage::Marked { build, semi, columns, .. } => {
+                    let Some(Out::Build(b)) = self.query.bodies[*build].as_ref().map(|b| &b.sink)
+                    else {
+                        return Err(rudb_common::Error::internal("marked rows of no build"));
+                    };
+                    let table = self
+                        .rt
+                        .join(b.table)
+                        .ok_or_else(|| rudb_common::Error::internal("a join table is gone"))?;
+                    finish::kept(&table.kept(*semi), &b.layout, columns)?
+                }
                 Stage::Fetch { input, node, row, .. } => {
                     let Kind::Column(ordinal) = row.kind else {
                         return Err(rudb_common::Error::internal("a fetch the check let through"));
@@ -438,8 +459,9 @@ impl Compiled {
 /// For each join table `p` probes whose key is a column its scan reads as a signed integer, that
 /// column, its type and the key the table holds for every build row.
 ///
-/// Every probe is an inner join, so a scanned row whose key no build row holds goes no further,
-/// and the scan may as well not read it. The first engine arms the same handoff between a join and
+/// An inner or semi probe lets no scanned row through whose key no build row holds, and a probe
+/// that marks does nothing with one, so the scan may as well not read it. An anti probe is left
+/// out, since those are the rows it keeps. The first engine arms the same handoff between a join and
 /// the scan under it, see `rudb_exec::Handoff`, and with a stored link from the column the scan
 /// reads only the rows of the parents the build side holds. One key a probe, the first that is a
 /// scanned column, since a row has to match on every key and one is enough to leave it out.
@@ -451,6 +473,9 @@ fn handed(
 ) -> Vec<(u32, LogicalType, Vec<i64>)> {
     let mut out = Vec::new();
     for (probe, probing) in p.probes().zip(&body.probes) {
+        if probe.kind == rudb_qc_plan::JoinType::Anti && !probe.marks {
+            continue;
+        }
         let Some(table) = rt.join(probing.table) else { continue };
         let found = probe.keys.iter().enumerate().find_map(|(at, key)| {
             let Kind::Column(c) = key.kind else { return None };

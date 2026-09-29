@@ -253,6 +253,8 @@ pub enum Rel {
         aggregates: Vec<Aggregate>,
         /// The output columns.
         columns: Vec<Column>,
+        /// Whether the one key arrives in runs, from the plan's `aggregate_cluster` pass.
+        runs: Option<Runs>,
     },
     /// All the rows in order.
     Sort {
@@ -292,9 +294,10 @@ pub enum Rel {
         /// The output columns.
         columns: Vec<Column>,
     },
-    /// An inner equi-join by a hash table, fused into the pipelines per section 10.5 of
+    /// An equi-join by a hash table, fused into the pipelines per section 10.5 of
     /// `spec/compiler/10-joins.md`: the build side fills the table and the other side probes it
-    /// inline. The output is the left columns and then the right ones, whichever side builds.
+    /// inline. The output of an inner join is the left columns and then the right ones, whichever
+    /// side builds, and that of a semi or anti join is the left columns.
     Join {
         /// The left input.
         left: Box<Rel>,
@@ -302,14 +305,51 @@ pub enum Rel {
         right: Box<Rel>,
         /// Which input fills the table.
         build: BuildSide,
+        /// Which left rows come out: every match, or each row once when it has a match or when
+        /// it has none.
+        kind: JoinType,
         /// The equalities, each a key over the left input's columns and one over the right
         /// input's, both of the same type. There is at least one.
         keys: Vec<(Expr, Expr)>,
-        /// The rest of the condition, over the output columns, all of which must be true.
+        /// The rest of the condition, over the left columns and then the right ones, all of which
+        /// must be true.
         residual: Vec<Expr>,
         /// The output columns.
         columns: Vec<Column>,
     },
+}
+
+/// Which left rows a hash join lets through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinType {
+    /// Each left row once per right row it matches, paired with it.
+    Inner,
+    /// Each left row with at least one match, once.
+    Semi,
+    /// Each left row with no match, including one with a null key.
+    Anti,
+}
+
+impl JoinType {
+    /// The spelling the refusals and `EXPLAIN` use.
+    #[must_use]
+    pub fn keyword(self) -> &'static str {
+        match self {
+            JoinType::Inner => "INNER",
+            JoinType::Semi => "SEMI",
+            JoinType::Anti => "ANTI",
+        }
+    }
+}
+
+/// How the rows of an aggregate's one key arrive, when the store says each value's rows are one
+/// run, so a group is finished once the key moves past it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runs {
+    /// The key never goes down, which the driver checks a morsel at a time.
+    Ascending,
+    /// Each value's rows are together, the runs in no order.
+    Grouped,
 }
 
 impl Rel {
@@ -491,11 +531,15 @@ impl Lower<'_> {
                     aggs.push(agg);
                 }
                 let bindings = numbered(index, columns.len());
+                let runs = plan
+                    .clustered(index)
+                    .then(|| if plan.grouped(index) { Runs::Grouped } else { Runs::Ascending });
                 let rel = Rel::Aggregate {
                     input: Box::new(input),
                     groups: gs,
                     aggregates: aggs,
                     columns,
+                    runs,
                 };
                 Ok((rel, bindings))
             }
@@ -535,25 +579,35 @@ impl Lower<'_> {
                 Ok((Rel::Fetch { input: Box::new(input), node: at, row, columns }, bindings))
             }
             Node::Join { left, right, kind, conditions, build } => {
-                if kind != JoinKind::Inner {
-                    return Err(Refusal::new(
-                        format!("Join {}", kind.keyword()),
-                        "only inner joins are compiled so far",
-                    ));
-                }
+                let kind = match kind {
+                    JoinKind::Inner => JoinType::Inner,
+                    JoinKind::Semi => JoinType::Semi,
+                    JoinKind::Anti => JoinType::Anti,
+                    _ => {
+                        return Err(Refusal::new(
+                            format!("Join {}", kind.keyword()),
+                            "only inner, semi and anti joins are compiled so far",
+                        ));
+                    }
+                };
                 let (left, lb) = self.node(left)?;
                 let (right, rb) = self.node(right)?;
-                let bindings: Bindings = lb.iter().chain(&rb).copied().collect();
+                let both: Bindings = lb.iter().chain(&rb).copied().collect();
                 let mut conjuncts = Vec::new();
                 for c in plan.expr_list(conditions) {
-                    flatten(self.expr(*c, &bindings)?, &mut conjuncts);
+                    flatten(self.expr(*c, &both)?, &mut conjuncts);
                 }
                 let (keys, residual) = split(conjuncts, lb.len(), right.columns())?;
-                let columns = left.columns().iter().chain(right.columns()).cloned().collect();
+                let (columns, bindings) = if kind == JoinType::Inner {
+                    (left.columns().iter().chain(right.columns()).cloned().collect(), both)
+                } else {
+                    (left.columns().to_vec(), lb)
+                };
                 let rel = Rel::Join {
                     left: Box::new(left),
                     right: Box::new(right),
                     build,
+                    kind,
                     keys,
                     residual,
                     columns,
@@ -822,6 +876,21 @@ mod tests {
         assert_eq!(residual.len(), 1);
         assert_eq!(residual[0].columns(), [0, 3]);
         assert_eq!(rel.name(), "HashJoin");
+    }
+
+    #[test]
+    fn a_semi_join_keeps_the_left_columns_and_a_residual_over_both() {
+        let rel = lowered(concat!(
+            "Join SEMI on=[(#0.0::INTEGER = #1.1::INTEGER)::BOOLEAN, ",
+            "(#0.1::VARCHAR <> #1.0::VARCHAR)::BOOLEAN]\n",
+            "  Get memory.main.l AS l #0 [a::INTEGER, s::VARCHAR]\n",
+            "  Get memory.main.r AS r #1 [s::VARCHAR, b::INTEGER]\n",
+        ))
+        .unwrap();
+        let Rel::Join { kind, residual, columns, .. } = &rel else { panic!("{rel:?}") };
+        assert_eq!(*kind, JoinType::Semi);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(residual[0].columns(), [1, 2]);
     }
 
     #[test]

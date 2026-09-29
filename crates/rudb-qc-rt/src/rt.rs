@@ -37,6 +37,7 @@ enum Call {
     StrUpper,
     StrConcat,
     HtInsert,
+    HtPage,
     JtAppend,
     AggDistinct,
     AggDistinctInt,
@@ -67,6 +68,7 @@ impl Call {
             "str_upper" => Call::StrUpper,
             "str_concat" => Call::StrConcat,
             "ht_insert" => Call::HtInsert,
+            "ht_page" => Call::HtPage,
             "jt_append" => Call::JtAppend,
             "agg_distinct" => Call::AggDistinct,
             "agg_distinct_int" => Call::AggDistinctInt,
@@ -578,6 +580,12 @@ impl Rt {
                 self.string(&out)
             }
             Call::HtInsert => self.ht_insert(a)?,
+            Call::HtPage => {
+                let Some(Object::Table(table)) = self.objects.get_mut(a[0] as usize) else {
+                    return Err(self.fail(bad_handle(name)));
+                };
+                table.page() as u128
+            }
             Call::JtAppend => {
                 let Some(Object::Join(table)) = self.objects.get_mut(a[0] as usize) else {
                     return Err(self.fail(bad_handle(name)));
@@ -807,6 +815,7 @@ mod tests {
                 "str_like" => vec![u128::from(like), s],
                 "str_regex" | "str_regex_replace" => vec![u128::from(re), s],
                 "ht_insert" => vec![u128::from(table), 0, 5, 0],
+                "ht_page" => vec![u128::from(table)],
                 "jt_append" => vec![u128::from(join), 0, 5],
                 "agg_distinct" | "agg_distinct_int" => vec![u128::from(set), row, s],
                 "agg_distinct_room" => vec![u128::from(set), words.as_mut_ptr() as u128],

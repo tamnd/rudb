@@ -1509,6 +1509,22 @@ fn linked_parent<'a>(
 /// is enough.
 const MOST_SIBLINGS: u64 = 64;
 
+/// Whether a semi or an anti join of `plan` is one the first engine answers by walking each row
+/// to its siblings through a link, with `GRAPH_REDUCTION` on. The compiled engine has no walk yet,
+/// and the hash join it would run instead reads the whole child table a second time.
+#[must_use]
+pub fn walks_siblings(plan: &Plan, catalog: &Catalog) -> bool {
+    fn walks(plan: &Plan, catalog: &Catalog, node: NodeRef) -> bool {
+        if let Node::Join { right, kind, conditions, .. } = *plan.node(node)
+            && walk(plan, catalog, kind, right, conditions).is_some()
+        {
+            return true;
+        }
+        plan.node(node).children().into_iter().flatten().any(|child| walks(plan, catalog, child))
+    }
+    walks(plan, catalog, plan.root())
+}
+
 /// A semi or an anti join that can be answered by walking each row to its siblings, when it is one.
 ///
 /// The other side has to be a scan of a stored child table under nothing but filters, and one of

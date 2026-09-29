@@ -145,7 +145,7 @@ mod tests;
 
 pub use build::{
     Handoff, TopCut, build, build_cut_into, build_handed_into, build_measured, build_measured_into,
-    build_pruned_into, build_with, summarized,
+    build_pruned_into, build_with, summarized, walks_siblings,
 };
 pub use expr::{evaluate, evaluate_all};
 pub use links::{declared, known};

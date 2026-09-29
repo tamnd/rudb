@@ -3010,6 +3010,7 @@ impl Shared {
             switch: self.inner.settings.switch(),
             morsel: self.inner.settings.morsel(),
             ablate: self.inner.settings.ablate(),
+            walks: self.inner.settings.rules().enabled(Rule::GraphReduction),
             ..rudb_qc::Options::default()
         }
     }

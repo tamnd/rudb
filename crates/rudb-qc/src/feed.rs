@@ -185,6 +185,7 @@ impl<'a> Feed<'a> {
             rudb_qc_pipe::Sink::Result { columns, .. }
             | rudb_qc_pipe::Sink::Build { columns, .. }
             | rudb_qc_pipe::Sink::Aggregate { columns, .. } => columns.as_slice(),
+            rudb_qc_pipe::Sink::Mark => &[],
         };
         let mut state = vec![Line([0; 64]); (body.state as usize).div_ceil(64).max(1)];
         // Init. With one worker the local state is the shared state, so the header points at its
@@ -288,9 +289,13 @@ impl<'a> Feed<'a> {
             && let Out::Aggregate(g) = &self.body.sink
             && let Some(table) = rt.table_mut(g.table)
         {
-            table.cap(WORKER_GROUPS);
-            if self.sets.is_empty() && !self.tiers.ablate().off(Ablate::LANES) {
-                table.lanes();
+            if g.runs.is_some() {
+                table.runs();
+            } else {
+                table.cap(WORKER_GROUPS);
+                if self.sets.is_empty() && !self.tiers.ablate().off(Ablate::LANES) {
+                    table.lanes();
+                }
             }
         }
         if self.split {
@@ -353,7 +358,12 @@ impl<'a> Feed<'a> {
     /// rows of the keys left out would add to them.
     pub(crate) fn limited(mut self, count: usize) -> Self {
         let Out::Aggregate(g) = &self.body.sink else { return self };
-        if g.keys.is_empty() || !merge::sets(g).is_empty() || count >= WORKER_GROUPS {
+        // Runs close their groups without looking any up, so there is nothing to agree on.
+        if g.keys.is_empty()
+            || g.runs.is_some()
+            || !merge::sets(g).is_empty()
+            || count >= WORKER_GROUPS
+        {
             return self;
         }
         let agreed = self.lock().rt.table_mut(g.table).map(|table| {
@@ -377,7 +387,9 @@ impl<'a> Feed<'a> {
                 inner.rt.retire(worker.rt);
                 return Ok(());
             }
-            Out::Build(_) => return Err(Error::internal("a parallel pipeline that builds")),
+            Out::Build(_) | Out::Mark => {
+                return Err(Error::internal("a parallel pipeline that builds or probes"));
+            }
         };
         if self.split {
             inner.workers.push(worker.rt);
@@ -409,6 +421,9 @@ impl<'a> Feed<'a> {
         let mut workers = std::mem::take(&mut inner.workers);
         if workers.is_empty() {
             return Ok(());
+        }
+        if g.runs.is_some() {
+            return self.merge_runs(inner, workers, threads);
         }
         // The distinct sets are merged on their own once the groups are, so they are taken out
         // of every worker first.
@@ -542,6 +557,43 @@ impl<'a> Feed<'a> {
         let chunks = pieces(threads, table.len().div_ceil(span), |at| {
             let to = ((at + 1) * span).min(table.len());
             piece(table, &sets, g, columns, (top, counting), at * span, to)
+        })?;
+        let mut out = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            out.append(&mut chunk?);
+        }
+        inner.out = out;
+        inner.grouped = true;
+        Ok(())
+    }
+
+    /// The rest of [`merge`](Feed::merge) for an aggregate whose key arrives in runs. A worker's
+    /// groups are each the only one of their key, but for the edges of its morsels, so only those
+    /// are folded, and the tables are joined as they are.
+    fn merge_runs(
+        &self,
+        mut inner: MutexGuard<'_, Inner<'a>>,
+        mut workers: Vec<Rt>,
+        threads: &Lease<'_>,
+    ) -> Result<()> {
+        let Out::Aggregate(g) = &self.body.sink else {
+            return Ok(());
+        };
+        let folds = &self.folds;
+        let layout = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?.layout().clone();
+        let mut tables = Vec::with_capacity(workers.len());
+        for w in &mut workers {
+            let table = w.table_mut(g.table).ok_or_else(|| gone(g.table))?;
+            tables.push(std::mem::replace(table, GroupTable::new(layout.clone())));
+        }
+        let joined = GroupTable::close(layout, tables, |d, s| merge::fold(folds, d, s));
+        inner.rt.settle(workers, g.table, joined)?;
+        let table = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
+        let (columns, top, counting) = (self.columns, self.top, self.counting());
+        let span = span(top, g, counting);
+        let chunks = pieces(threads, table.len().div_ceil(span), |at| {
+            let to = ((at + 1) * span).min(table.len());
+            piece(table, &[], g, columns, (top, counting), at * span, to)
         })?;
         let mut out = Vec::with_capacity(chunks.len());
         for chunk in chunks {
@@ -828,7 +880,8 @@ impl<'a> Feed<'a> {
         let sink = match &self.body.sink {
             Out::Result { .. } => tier::Sink::Result,
             Out::Aggregate(_) => tier::Sink::Aggregate,
-            Out::Build(_) => tier::Sink::Build,
+            // The marks a probe sets are live in the table it probes, as a build's entries are.
+            Out::Build(_) | Out::Mark => tier::Sink::Build,
         };
         // A morsel with no NULL in what the body reads runs the version that checks none, which is
         // a guard checked before the call and so never sent back.
@@ -846,6 +899,10 @@ impl<'a> Feed<'a> {
             f = v;
         }
         let start = self.tiers.start(f);
+        let before = match &self.body.sink {
+            Out::Aggregate(g) if g.runs.is_some() => rt.table(g.table).map_or(0, GroupTable::len),
+            _ => 0,
+        };
         'attempt: loop {
             buffers.clear();
             if let Out::Result { count, columns, capacity } = &self.body.sink {
@@ -934,6 +991,11 @@ impl<'a> Feed<'a> {
                 }
             }
         }
+        if let Out::Aggregate(g) = &self.body.sink
+            && let Some(at) = g.runs
+        {
+            runs_closed(g, at, bytes(state), rt, before)?;
+        }
         if let Some(start) = start {
             self.tiers.ran(self.module, f, rows, start);
         }
@@ -1002,6 +1064,13 @@ impl<'a> Feed<'a> {
                 Step::Merge => return Err(Error::internal("a merge step with one worker")),
                 Step::Finalize => match &self.body.sink {
                     Out::Aggregate(g) if !inner.grouped => {
+                        if g.runs.is_some() {
+                            let table = inner.rt.table_mut(g.table).ok_or_else(|| gone(g.table))?;
+                            let layout = table.layout().clone();
+                            let mine = std::mem::replace(table, GroupTable::new(layout.clone()));
+                            let fold = |d: &mut [u8], s: &[u8]| merge::fold(&self.folds, d, s);
+                            *table = GroupTable::close(layout, vec![mine], fold);
+                        }
                         let table = inner.rt.table(g.table).ok_or_else(|| gone(g.table))?;
                         let sets = finish::sets(inner.rt, g)?;
                         let span = span(self.top, g, counting);
@@ -1026,7 +1095,7 @@ impl<'a> Feed<'a> {
                         inner.rt.finish_join(b.table)?;
                         out = Vec::new();
                     }
-                    Out::Result { .. } => {}
+                    Out::Result { .. } | Out::Mark => {}
                 },
             }
         }
@@ -1074,6 +1143,78 @@ impl<'a> Feed<'a> {
 
 /// How many groups [`piece`] takes at once: many when a top N by a count reads them, because
 /// then only the groups that can make it are made into values, and a chunk's worth otherwise.
+/// Gives the rows a morsel of runs took their group ids, and marks the groups that may share
+/// their key with another morsel's: its first and its last, since a run may go on past either
+/// end, and every one of them when runs promised ascending were not.
+fn runs_closed(g: &Grouping, at: u32, state: &[u8], rt: &mut Rt, before: usize) -> Result<()> {
+    let at = at as usize;
+    let next = u64::from_le_bytes(state[at..at + 8].try_into().unwrap_or_default());
+    let table = rt.table_mut(g.table).ok_or_else(|| gone(g.table))?;
+    table.claim(next as usize);
+    let after = table.len();
+    if after == before {
+        return Ok(());
+    }
+    table.edge(before);
+    table.edge(after - 1);
+    if g.ascending && !ascending(g, table, before, after) {
+        for gid in before + 1..after - 1 {
+            table.edge(gid);
+        }
+    }
+    Ok(())
+}
+
+/// Whether the keys of groups `from..to` of `table` go up, which a NULL key never does.
+fn ascending(g: &Grouping, table: &GroupTable, from: usize, to: usize) -> bool {
+    let Some((k, ty)) = g.keys.first() else { return true };
+    if *ty == LogicalType::UHugeInt {
+        return false;
+    }
+    let (o, w) = (8 + k.offset as usize, k.width as usize);
+    let float = matches!(ty, LogicalType::Float | LogicalType::Double);
+    let unsigned = matches!(
+        ty,
+        LogicalType::Boolean
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt
+    );
+    let key = |gid: usize| {
+        let row = table.row(gid);
+        if row[8 + k.null() as usize] != 0 {
+            return None;
+        }
+        let mut b = [0u8; 16];
+        b[..w].copy_from_slice(&row[o..o + w]);
+        // Sign extended from the key's width, but for an unsigned one.
+        let shift = 128 - 8 * w as u32;
+        let v = i128::from_le_bytes(b) << shift;
+        Some(if unsigned { (v as u128 >> shift) as i128 } else { v >> shift })
+    };
+    let mut last = None;
+    for gid in from..to {
+        let Some(v) = key(gid) else { return false };
+        if let Some(l) = last {
+            let up = if float {
+                let f = |x: i128| match w {
+                    4 => f64::from(f32::from_bits(x as u32)),
+                    _ => f64::from_bits(x as u64),
+                };
+                f(l) < f(v)
+            } else {
+                l < v
+            };
+            if !up {
+                return false;
+            }
+        }
+        last = Some(v);
+    }
+    true
+}
+
 fn span(top: Option<(&[Key], u64)>, g: &Grouping, counting: bool) -> usize {
     match top {
         Some((keys, _)) if counting && finish::counted(g, keys).is_some() => COUNTED_SPAN,

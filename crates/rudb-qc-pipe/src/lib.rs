@@ -29,7 +29,7 @@ use std::fmt;
 
 use rudb_common::Value;
 use rudb_plan::NodeRef;
-use rudb_qc_plan::{Aggregate, BuildSide, Column, Expr, Key, Kind, Rel};
+use rudb_qc_plan::{Aggregate, BuildSide, Column, Expr, JoinType, Key, Kind, Rel, Runs};
 
 pub use rudb_qc_ir::status::Status;
 pub use rudb_qc_rt::abi::StateHeader;
@@ -92,7 +92,12 @@ pub enum Sink {
         payload: Vec<Expr>,
         /// Their names and types.
         columns: Vec<Column>,
+        /// For a semi or anti join whose left side builds, which one. Each entry gets a mark the
+        /// probe sets, and for an anti join a row with a null key goes in too, since it is kept.
+        marked: Option<JoinType>,
     },
+    /// Nothing out: every row went through a probe that marks the entries it matches.
+    Mark,
     /// A hash aggregate. The output is the groups and then the aggregates.
     Aggregate {
         /// The group expressions, over the source's columns.
@@ -101,6 +106,8 @@ pub enum Sink {
         aggregates: Vec<Aggregate>,
         /// Their names and types.
         columns: Vec<Column>,
+        /// Whether the one key arrives in runs.
+        runs: Option<Runs>,
     },
 }
 
@@ -116,6 +123,16 @@ pub struct Probe {
     pub first: usize,
     /// The payload columns.
     pub columns: Vec<Column>,
+    /// Which rows go on. After an inner probe what follows runs once per match. After a semi
+    /// probe it runs once for a row with a match, and after an anti probe once for a row with
+    /// none, and neither reads the payload.
+    pub kind: JoinType,
+    /// For a semi or an anti probe, what a match has to pass as well to count, over the columns
+    /// so far and the payload. An inner probe's are filters after it.
+    pub residual: Vec<Expr>,
+    /// Whether the probe marks every entry it matches instead, for a semi or anti join whose left
+    /// side builds. It is the last operator, before a [`Sink::Mark`].
+    pub marks: bool,
 }
 
 /// One operator between a pipeline's source and its sink.
@@ -123,7 +140,8 @@ pub struct Probe {
 pub enum Op {
     /// A predicate the row has to pass.
     Filter(Expr),
-    /// A join probe. What follows runs once per match, and a row with none goes no further.
+    /// A join probe. What follows runs once per match, or once per row for a semi or an anti
+    /// probe.
     Probe(Probe),
 }
 
@@ -177,12 +195,14 @@ impl Pipeline {
     /// The state slots the pipeline writes, in the order they are laid out.
     #[must_use]
     pub fn slots(&self) -> Vec<SlotKind> {
-        let mut slots = vec![match &self.sink {
-            Sink::Result { .. } => SlotKind::ResultSink,
-            Sink::Build { .. } => SlotKind::HtBuild,
-            Sink::Aggregate { groups, .. } if groups.is_empty() => SlotKind::ScalarAcc,
-            Sink::Aggregate { .. } => SlotKind::AggTable,
-        }];
+        // A marking probe writes into the table it probes and has no state of its own.
+        let mut slots: Vec<SlotKind> = match &self.sink {
+            Sink::Result { .. } => vec![SlotKind::ResultSink],
+            Sink::Build { .. } => vec![SlotKind::HtBuild],
+            Sink::Aggregate { groups, .. } if groups.is_empty() => vec![SlotKind::ScalarAcc],
+            Sink::Aggregate { .. } => vec![SlotKind::AggTable],
+            Sink::Mark => Vec::new(),
+        };
         slots.extend(self.probes().map(|_| SlotKind::HtProbe));
         slots
     }
@@ -291,6 +311,18 @@ pub enum Stage {
         /// Its columns.
         columns: Vec<Column>,
     },
+    /// The rows of a join table a semi or anti join whose left side builds keeps, once every
+    /// probe marked the entries it matched.
+    Marked {
+        /// The stage that built the table.
+        build: usize,
+        /// The stage that probed it.
+        probe: usize,
+        /// Whether the marked rows are kept, for a semi join, or the rest, for an anti join.
+        semi: bool,
+        /// The build side's columns.
+        columns: Vec<Column>,
+    },
     /// Whole table rows read back by the ordinals an earlier stage produced.
     Fetch {
         /// The stage.
@@ -313,10 +345,12 @@ impl Stage {
                 Sink::Result { columns, .. }
                 | Sink::Build { columns, .. }
                 | Sink::Aggregate { columns, .. } => columns,
+                Sink::Mark => &[],
             },
             Stage::Sort { columns, .. }
             | Stage::TopN { columns, .. }
             | Stage::Limit { columns, .. }
+            | Stage::Marked { columns, .. }
             | Stage::Fetch { columns, .. } => columns,
         }
     }
@@ -329,10 +363,12 @@ impl Stage {
                 Sink::Result { columns, .. }
                 | Sink::Build { columns, .. }
                 | Sink::Aggregate { columns, .. } => columns,
+                Sink::Mark => return,
             },
             Stage::Sort { columns, .. }
             | Stage::TopN { columns, .. }
             | Stage::Limit { columns, .. }
+            | Stage::Marked { columns, .. }
             | Stage::Fetch { columns, .. } => columns,
         };
         for (own, new) in own.iter_mut().zip(columns) {
@@ -356,6 +392,7 @@ impl Stage {
             | Stage::TopN { input, .. }
             | Stage::Limit { input, .. }
             | Stage::Fetch { input, .. } => vec![*input],
+            Stage::Marked { build, probe, .. } => vec![*build, *probe],
         }
     }
 }
@@ -475,7 +512,7 @@ impl Graph {
                 open.columns = columns.clone();
                 open
             }
-            Rel::Aggregate { input, groups, aggregates, columns } => {
+            Rel::Aggregate { input, groups, aggregates, columns, runs } => {
                 let open = self.open(input);
                 let groups = groups.iter().map(|g| g.substitute(&open.exprs)).collect();
                 let aggregates = aggregates
@@ -488,7 +525,8 @@ impl Graph {
                         ty: a.ty.clone(),
                     })
                     .collect();
-                let sink = Sink::Aggregate { groups, aggregates, columns: columns.clone() };
+                let sink =
+                    Sink::Aggregate { groups, aggregates, columns: columns.clone(), runs: *runs };
                 let p = Pipeline { source: open.source, ops: open.ops, sink };
                 self.push(Stage::Pipeline(p))
             }
@@ -516,7 +554,7 @@ impl Graph {
                 let input = self.close(open);
                 self.push(Stage::Limit { input, count: *count, offset: *offset, columns })
             }
-            Rel::Join { left, right, build, keys, residual, columns } => {
+            Rel::Join { left, right, build, kind, keys, residual: residual_of, columns } => {
                 let (built, probing) = match build {
                     BuildSide::Right => (right, left),
                     BuildSide::Left => (left, right),
@@ -527,11 +565,19 @@ impl Graph {
                 };
                 let (build_keys, probe_keys): (Vec<Expr>, Vec<Expr>) =
                     keys.iter().map(side).unzip();
-                let b = self.open(built);
+                let mut b = self.open(built);
+                let inner = *kind == JoinType::Inner;
+                // The probe marks the entries it matches, and the rows come out of the table.
+                let marks = !inner && *build == BuildSide::Left;
+                // A semi or anti probe only reads the payload to test the residual.
+                if !inner && !marks && residual_of.is_empty() {
+                    b.columns.clear();
+                }
                 let sink = Sink::Build {
                     keys: build_keys.iter().map(|k| k.substitute(&b.exprs)).collect(),
-                    payload: b.exprs,
+                    payload: if b.columns.is_empty() { Vec::new() } else { b.exprs },
                     columns: b.columns.clone(),
+                    marked: marks.then_some(*kind),
                 };
                 self.stages.push(Stage::Pipeline(Pipeline { source: b.source, ops: b.ops, sink }));
                 let stage = self.stages.len() - 1;
@@ -544,18 +590,45 @@ impl Graph {
                     .enumerate()
                     .map(|(j, c)| Expr::column(first + j, c.ty.clone()))
                     .collect();
+                // The residual is over the left columns and then the right ones.
+                let mut residual = Vec::new();
+                if !inner {
+                    let both: Vec<Expr> = match build {
+                        BuildSide::Right => open.exprs.iter().chain(&payload).cloned().collect(),
+                        BuildSide::Left => payload.iter().chain(&open.exprs).cloned().collect(),
+                    };
+                    for r in residual_of {
+                        conjuncts(r.substitute(&both), &mut residual);
+                    }
+                }
                 open.ops.push(Op::Probe(Probe {
                     build: stage,
                     keys: probe_keys.iter().map(|k| k.substitute(&open.exprs)).collect(),
                     first,
                     columns: b.columns,
+                    kind: *kind,
+                    residual,
+                    marks,
                 }));
+                if marks {
+                    let source = open.source;
+                    let ops = open.ops;
+                    let sink = Sink::Mark;
+                    self.stages.push(Stage::Pipeline(Pipeline { source, ops, sink }));
+                    let probe = self.stages.len() - 1;
+                    let semi = *kind == JoinType::Semi;
+                    let columns = columns.clone();
+                    return self.push(Stage::Marked { build: stage, probe, semi, columns });
+                }
+                open.columns = columns.clone();
+                if !inner {
+                    return open;
+                }
                 open.exprs = match build {
                     BuildSide::Right => open.exprs.into_iter().chain(payload).collect(),
                     BuildSide::Left => payload.into_iter().chain(open.exprs).collect(),
                 };
-                open.columns = columns.clone();
-                for r in residual {
+                for r in residual_of {
                     let r = r.substitute(&open.exprs);
                     filters(r, &mut open.ops);
                 }
@@ -577,9 +650,16 @@ impl Graph {
 
 /// Adds a filter per conjunct of `e`.
 fn filters(e: Expr, out: &mut Vec<Op>) {
+    let mut each = Vec::new();
+    conjuncts(e, &mut each);
+    out.extend(each.into_iter().map(Op::Filter));
+}
+
+/// Adds each conjunct of `e` to `out`.
+fn conjuncts(e: Expr, out: &mut Vec<Expr>) {
     match e.kind {
-        Kind::And(children) => children.into_iter().for_each(|c| filters(c, out)),
-        kind => out.push(Op::Filter(Expr { kind, ty: e.ty })),
+        Kind::And(children) => children.into_iter().for_each(|c| conjuncts(c, out)),
+        kind => out.push(Expr { kind, ty: e.ty }),
     }
 }
 
@@ -600,18 +680,29 @@ impl fmt::Display for Graph {
                             keys.len(),
                             payload.len()
                         ),
-                        Sink::Aggregate { groups, aggregates, .. } => {
+                        Sink::Aggregate { groups, aggregates, runs, .. } => {
+                            let runs = match runs {
+                                Some(Runs::Ascending) => " arriving ascending",
+                                Some(Runs::Grouped) => " arriving grouped",
+                                None => "",
+                            };
                             format!(
-                                "aggregate by {} keys into {} accumulators",
+                                "aggregate by {} keys{runs} into {} accumulators",
                                 groups.len(),
                                 aggregates.len()
                             )
                         }
+                        Sink::Mark => "nothing out".to_owned(),
                     };
                     let filters = p.ops.iter().filter(|op| matches!(op, Op::Filter(_))).count();
                     let mut ops = vec![format!("{filters} filters")];
                     for probe in p.probes() {
-                        ops.push(format!("probe stage {}", probe.build));
+                        let what = match (probe.kind, probe.marks) {
+                            (_, true) => "marking ".to_owned(),
+                            (JoinType::Inner, false) => String::new(),
+                            (kind, false) => format!("{} ", kind.keyword().to_lowercase()),
+                        };
+                        ops.push(format!("{what}probe stage {}", probe.build));
                     }
                     writeln!(f, "stage {i}: pipeline from {from}, {}, {to}", ops.join(", "))?;
                 }
@@ -629,6 +720,10 @@ impl fmt::Display for Graph {
                 },
                 Stage::Fetch { input, .. } => {
                     writeln!(f, "stage {i}: fetch the rows stage {input} names")?
+                }
+                Stage::Marked { build, probe, semi, .. } => {
+                    let which = if *semi { "marked" } else { "unmarked" };
+                    writeln!(f, "stage {i}: the {which} rows of stage {build} after stage {probe}")?
                 }
             }
         }
@@ -727,6 +822,61 @@ mod tests {
         assert_eq!(probe.columns().len(), 4);
         assert_eq!(g.edges(), [Edge { from: 0, to: 1, kind: EdgeKind::Finalize }]);
         assert!(g.to_string().contains("probe stage 0"), "{g}");
+    }
+
+    #[test]
+    fn a_semi_probe_tests_its_residual_and_passes_on_only_the_probe_side() {
+        let g = graph(concat!(
+            "Aggregate #3 groups=[] aggregates=[sum(#0.1::INTEGER)::BIGINT]\n",
+            "  Join SEMI on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, ",
+            "(#0.1::INTEGER <> #1.1::INTEGER)::BOOLEAN]\n",
+            "    Get memory.main.l AS l #0 [a::INTEGER, x::INTEGER]\n",
+            "    Get memory.main.r AS r #1 [a::INTEGER, y::INTEGER]\n",
+        ));
+        let Stage::Pipeline(probe) = &g.stages[1] else { panic!("{g}") };
+        let [Op::Probe(p)] = &probe.ops[..] else { panic!("{g}") };
+        assert_eq!((p.kind, p.first), (JoinType::Semi, 2));
+        assert_eq!(p.residual[0].columns(), [1, 3]);
+        assert!(g.to_string().contains("semi probe stage 0"), "{g}");
+
+        let g = graph(concat!(
+            "Join ANTI on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+            "  Get memory.main.l AS l #0 [a::INTEGER, x::INTEGER]\n",
+            "  Get memory.main.r AS r #1 [a::INTEGER, y::INTEGER]\n",
+        ));
+        let Stage::Pipeline(build) = &g.stages[0] else { panic!("{g}") };
+        assert!(matches!(&build.sink, Sink::Build { payload, .. } if payload.is_empty()), "{g}");
+        let Stage::Pipeline(probe) = &g.stages[1] else { panic!("{g}") };
+        assert_eq!(probe.columns().len(), 2);
+        assert!(matches!(&probe.sink, Sink::Result { exprs, .. } if exprs.len() == 2), "{g}");
+    }
+
+    #[test]
+    fn an_anti_join_that_builds_on_its_left_marks_the_table_and_reads_it_back() {
+        let g = graph(concat!(
+            "Join ANTI on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN, ",
+            "(#0.1::INTEGER <> #1.1::INTEGER)::BOOLEAN] build=left\n",
+            "  Get memory.main.l AS l #0 [a::INTEGER, x::INTEGER]\n",
+            "  Get memory.main.r AS r #1 [a::INTEGER, y::INTEGER, z::INTEGER]\n",
+        ));
+        assert_eq!(g.stages.len(), 3, "{g}");
+        let Stage::Pipeline(build) = &g.stages[0] else { panic!("{g}") };
+        assert!(
+            matches!(&build.sink, Sink::Build { payload, marked: Some(JoinType::Anti), .. }
+            if payload.len() == 2),
+            "{g}"
+        );
+        let Stage::Pipeline(probe) = &g.stages[1] else { panic!("{g}") };
+        assert!(matches!(probe.sink, Sink::Mark), "{g}");
+        let [Op::Probe(p)] = &probe.ops[..] else { panic!("{g}") };
+        assert!(p.marks);
+        // The payload comes after the probe side's three columns, and the residual reads the
+        // left's second column, which is the payload's second.
+        assert_eq!(p.first, 3);
+        assert_eq!(p.residual[0].columns(), [4, 1]);
+        assert!(matches!(&g.stages[2], Stage::Marked { build: 0, probe: 1, semi: false, .. }));
+        assert_eq!(g.columns().len(), 2);
+        assert!(g.to_string().contains("marking probe stage 0"), "{g}");
     }
 
     #[test]

@@ -53,12 +53,12 @@ use rudb_qc_ir::func::INV;
 use rudb_qc_ir::status::NEED_MEMORY;
 use rudb_qc_ir::{Block, Builder, ErrorKind, Field, Func, Module, Op, Ty, Val, dce, verify};
 use rudb_qc_pipe::{Graph, Op as PipeOp, Pipeline, Probe, Sink, Stage};
-use rudb_qc_plan::{Aggregate, Column, Expr, Kind, Refusal, Result};
+use rudb_qc_plan::{Aggregate, Column, Expr, JoinType, Kind, Refusal, Result, Runs};
 use rudb_qc_rt::abi::{
     COL_CODES, COL_SIZE, COL_VALID, HEADER, MORSEL_BEGIN, MORSEL_COLS, MORSEL_END,
 };
 use rudb_qc_rt::join::{ADDRESS, FOLD, JoinLayout, JoinTable};
-use rudb_qc_rt::table::{GroupTable, KeyField, Layout};
+use rudb_qc_rt::table::{GroupTable, KeyField, Layout, ROWS_PER_PAGE};
 use rudb_qc_rt::{Ablate, Rt, text};
 
 /// Where the sink's fields start.
@@ -156,6 +156,8 @@ pub enum Out {
     Aggregate(Grouping),
     /// A join build.
     Build(Building),
+    /// Nothing, past a probe that marks the entries it matches.
+    Mark,
 }
 
 /// A join build's table and the record the body builds for it.
@@ -209,6 +211,14 @@ pub struct Grouping {
     /// entry past the last key, which a key with a value not in the domains goes to and which is
     /// always zero, so such a key always takes the way through the hash.
     pub dense: Option<u32>,
+    /// For an aggregate by one fixed width key that arrives in runs, the state offset of two
+    /// words: the address of the next row of the table's last page and the address past it. A
+    /// new run takes that row without hashing, and the table has no slots.
+    pub runs: Option<u32>,
+    /// Whether those runs were promised ascending, which the driver checks a morsel at a time.
+    pub ascending: bool,
+    /// The size of a row, which a new run moves past.
+    pub row_size: u32,
 }
 
 /// One accumulator in a group row.
@@ -387,7 +397,9 @@ fn pipeline(
     for op in &p.ops {
         match op {
             PipeOp::Filter(f) => note(f),
-            PipeOp::Probe(probe) => probe.keys.iter().for_each(&mut note),
+            PipeOp::Probe(probe) => {
+                probe.keys.iter().chain(&probe.residual).for_each(&mut note);
+            }
         }
     }
     match &p.sink {
@@ -405,6 +417,7 @@ fn pipeline(
                 }
             }
         }
+        Sink::Mark => {}
     }
     reads.sort_unstable();
     let domains = domains(p, known);
@@ -636,7 +649,7 @@ fn emit(
                 g.ptrs.push(row);
             }
         }
-        Out::Build(_) => {}
+        Out::Build(_) | Out::Mark => {}
     }
 
     let head = g.b.block(&[(Ty::I64, "i")]);
@@ -754,7 +767,8 @@ impl Gen<'_> {
                 });
                 Ok((Out::Result { count: SINK, columns: slots, capacity }, state))
             }
-            Sink::Build { keys, payload, .. } => {
+            Sink::Mark => Ok((Out::Mark, SINK)),
+            Sink::Build { keys, payload, marked, .. } => {
                 let mut size = 0u32;
                 let mut field = |e: &Expr, what: &str| -> Result<KeyField> {
                     let ty = qir_type(&e.ty)?;
@@ -771,13 +785,13 @@ impl Gen<'_> {
                 let keys = keys.iter().map(|e| field(e, "key")).collect::<Result<Vec<_>>>()?;
                 let payload =
                     payload.iter().map(|e| field(e, "payload")).collect::<Result<Vec<_>>>()?;
-                let layout = JoinLayout { keys, payload, size };
+                let layout = JoinLayout { keys, payload, size, marked: marked.is_some() };
                 let table = self.once(|g| g.rt.add_join(JoinTable::new(layout.clone())))?;
                 let buffer = size.next_multiple_of(8);
                 self.field(SINK, buffer, "record");
                 Ok((Out::Build(Building { table, layout, record: SINK }), SINK + buffer))
             }
-            Sink::Aggregate { groups, aggregates, .. } => {
+            Sink::Aggregate { groups, aggregates, runs, .. } => {
                 let mut keys = Vec::with_capacity(groups.len());
                 let mut size = 0u32;
                 for e in groups {
@@ -808,6 +822,7 @@ impl Gen<'_> {
                     init: vec![0; at as usize],
                 };
                 let acc_offset = Layout::acc_offset(size);
+                let row_size = layout.row_size() as u32;
                 let table = self.once(|g| g.rt.add_table(GroupTable::new(layout)))?;
                 let (row, last, state) = if groups.is_empty() {
                     self.field(SINK, 8, "row");
@@ -819,7 +834,19 @@ impl Gen<'_> {
                     self.field(SINK + size + 8, 32, "probe");
                     (None, Some(SINK + size), SINK + size + 40)
                 };
-                let probe = last.filter(|_| !self.rt.ablate().off(Ablate::PROBE)).map(|at| at + 8);
+                // A key that arrives in runs closes its groups as it moves on, which needs one key
+                // the row can hold without the heap, and no distinct set, whose pairs are kept by
+                // group id.
+                let closes = runs.filter(|_| {
+                    keys.len() == 1
+                        && !keys[0].0.text
+                        && self.dense.is_empty()
+                        && !accs.iter().any(|a| matches!(a.op, AccOp::Distinct(..)))
+                        && !self.rt.ablate().off(Ablate::RUNS)
+                });
+                let probe = last
+                    .filter(|_| closes.is_none() && !self.rt.ablate().off(Ablate::PROBE))
+                    .map(|at| at + 8);
                 let (dense, state) = if groups.is_empty() || self.dense.is_empty() {
                     (None, state)
                 } else {
@@ -838,7 +865,31 @@ impl Gen<'_> {
                         state += 16;
                     }
                 }
-                let grouping = Grouping { table, keys, acc_offset, accs, row, last, probe, dense };
+                let (at, state) = match closes {
+                    Some(_) => {
+                        self.field(state, 16, "runs");
+                        (Some(state), state + 16)
+                    }
+                    None => (None, state),
+                };
+                if at.is_some()
+                    && let Some(t) = self.rt.table_mut(table)
+                {
+                    t.runs();
+                }
+                let grouping = Grouping {
+                    table,
+                    keys,
+                    acc_offset,
+                    accs,
+                    row,
+                    last,
+                    probe,
+                    dense,
+                    runs: at,
+                    ascending: closes == Some(Runs::Ascending),
+                    row_size,
+                };
                 Ok((Out::Aggregate(grouping), state))
             }
         }
@@ -1677,23 +1728,73 @@ impl Gen<'_> {
         };
         match op {
             PipeOp::Filter(f) => {
-                let (v, ok) = self.expr(f)?;
-                let pass = self.b.bin(Op::And, v, ok);
-                let then = self.b.block(&[]);
-                self.b.brif(pass, then, &[], skip, &[]);
-                self.b.switch_to(then);
+                self.residual(std::slice::from_ref(f), skip)?;
                 self.ops(rest, probe, skip, depth, sink, out)
             }
-            PipeOp::Probe(p) => {
+            // Every match that passes the residual gets its mark set, and the row goes no further.
+            PipeOp::Probe(p) if p.marks => {
                 let (head, e, stride, advance) = self.probe(p, probe, skip, depth + 1)?;
-                self.ops(rest, probe + 1, advance, depth + 1, sink, out)?;
-                self.b.switch_to(advance);
-                let stride = self.b.int(Ty::I64, i128::from(stride));
-                let e = self.b.bin(Op::Add, e, stride);
-                self.b.br(head, &[e]);
+                self.residual(&p.residual, advance)?;
+                let entry = self.b.conv(Op::Bitcast, e, Ty::Ptr);
+                let at = 8 + self.joins[probe].layout.mark() as i32;
+                let one = self.b.int(Ty::I8, 1);
+                self.b.store(entry, Val::NONE, 1, at, one, 0);
+                self.b.br(advance, &[]);
+                self.next_entry(head, e, stride, advance);
                 Ok(())
             }
+            PipeOp::Probe(p) => match p.kind {
+                JoinType::Inner => {
+                    let (head, e, stride, advance) = self.probe(p, probe, skip, depth + 1)?;
+                    self.ops(rest, probe + 1, advance, depth + 1, sink, out)?;
+                    self.next_entry(head, e, stride, advance);
+                    Ok(())
+                }
+                // The first match that passes the residual sends the row on, once, and leaves
+                // the loop over the entries for good.
+                JoinType::Semi => {
+                    let (head, e, stride, advance) = self.probe(p, probe, skip, depth + 1)?;
+                    self.residual(&p.residual, advance)?;
+                    self.ops(rest, probe + 1, skip, depth, sink, out)?;
+                    self.next_entry(head, e, stride, advance);
+                    Ok(())
+                }
+                // A match that passes the residual drops the row, and a row that runs out of
+                // entries, or never had any, goes on. What the loop read is not read on that
+                // way, so what follows reads it again.
+                JoinType::Anti => {
+                    let before = self.loaded.clone();
+                    let none = self.b.block(&[]);
+                    let (head, e, stride, advance) = self.probe(p, probe, none, depth + 1)?;
+                    self.residual(&p.residual, advance)?;
+                    self.b.br(skip, &[]);
+                    self.next_entry(head, e, stride, advance);
+                    self.b.switch_to(none);
+                    self.loaded = before;
+                    self.ops(rest, probe + 1, skip, depth, sink, out)
+                }
+            },
         }
+    }
+
+    /// Ends the block `advance` of a probe's loop by going on to the entry after `e`.
+    fn next_entry(&mut self, head: Block, e: Val, stride: u32, advance: Block) {
+        self.b.switch_to(advance);
+        let stride = self.b.int(Ty::I64, i128::from(stride));
+        let e = self.b.bin(Op::Add, e, stride);
+        self.b.br(head, &[e]);
+    }
+
+    /// Goes to `fail` unless every one of `residual` is true.
+    fn residual(&mut self, residual: &[Expr], fail: Block) -> Result<()> {
+        for r in residual {
+            let (v, ok) = self.expr(r)?;
+            let pass = self.b.bin(Op::And, v, ok);
+            let then = self.b.block(&[]);
+            self.b.brif(pass, then, &[], fail, &[]);
+            self.b.switch_to(then);
+        }
+        Ok(())
     }
 
     /// The fused probe of section 10.5: hashes the row's keys, tests the tag of the slot the hash
@@ -1896,7 +1997,7 @@ impl Gen<'_> {
                             let (v, ok) = self.expr(e)?;
                             // A null key's value is zeroed, so that keys the same are the same
                             // bytes for the probe below.
-                            let v = if g.probe.is_some() {
+                            let v = if g.probe.is_some() || g.runs.is_some() {
                                 let zero = self.b.konst(self.b.ty(v), 0);
                                 self.b.select(ok, v, zero)
                             } else {
@@ -1935,51 +2036,60 @@ impl Gen<'_> {
                             self.b.brif(same, done, &[seen], new, &[]);
                             self.b.switch_to(new);
                         }
-                        let mut hash = self.b.int(Ty::I64, 0);
-                        for (&(v, ok), (e, (k, _))) in values.iter().zip(groups.iter().zip(&g.keys))
-                        {
-                            let at = (SINK + k.offset) as i32;
-                            self.b.store(st, Val::NONE, 1, at, v, 0);
-                            let null = self.b.un(Op::Not, ok);
-                            self.b.store(st, Val::NONE, 1, at + k.width as i32, null, 0);
-                            hash = self.hash(hash, v, &e.ty)?;
-                            let ok = self.b.conv(Op::Zext, ok, Ty::I64);
-                            hash = self.b.bin(Op::Crc32c, hash, ok);
-                        }
-                        let key = self.offset(st, SINK);
-                        let table = self.handle(g.table);
-                        let (slow, found) = match g.probe {
-                            Some(at) => self.find_group(g, &values, hash, at, depth)?,
-                            None => (self.b.current(), None),
-                        };
-                        self.b.switch_to(slow);
-                        let published = match g.probe {
-                            Some(at) => self.offset(st, at),
-                            None => self.b.konst(Ty::Ptr, 0),
-                        };
-                        let row = self.rt(proxy_id("ht_insert"), &[table, key, hash, published]);
-                        let row = match found {
-                            Some(found) => {
-                                self.b.br(found, &[row]);
-                                self.b.switch_to(found);
-                                self.b.param(found, 0)
+                        if let Some(at) = g.runs {
+                            let row = self.open_run(g, &values, at);
+                            self.b.br(done, &[row]);
+                            self.b.switch_to(done);
+                            self.b.param(done, 0)
+                        } else {
+                            let mut hash = self.b.int(Ty::I64, 0);
+                            for (&(v, ok), (e, (k, _))) in
+                                values.iter().zip(groups.iter().zip(&g.keys))
+                            {
+                                let at = (SINK + k.offset) as i32;
+                                self.b.store(st, Val::NONE, 1, at, v, 0);
+                                let null = self.b.un(Op::Not, ok);
+                                self.b.store(st, Val::NONE, 1, at + k.width as i32, null, 0);
+                                hash = self.hash(hash, v, &e.ty)?;
+                                let ok = self.b.conv(Op::Zext, ok, Ty::I64);
+                                hash = self.b.bin(Op::Crc32c, hash, ok);
                             }
-                            None => row,
-                        };
-                        if let Some(last) = g.last {
-                            self.b.store(st, Val::NONE, 1, last as i32, row, 0);
+                            let key = self.offset(st, SINK);
+                            let table = self.handle(g.table);
+                            let (slow, found) = match g.probe {
+                                Some(at) => self.find_group(g, &values, hash, at, depth)?,
+                                None => (self.b.current(), None),
+                            };
+                            self.b.switch_to(slow);
+                            let published = match g.probe {
+                                Some(at) => self.offset(st, at),
+                                None => self.b.konst(Ty::Ptr, 0),
+                            };
+                            let row =
+                                self.rt(proxy_id("ht_insert"), &[table, key, hash, published]);
+                            let row = match found {
+                                Some(found) => {
+                                    self.b.br(found, &[row]);
+                                    self.b.switch_to(found);
+                                    self.b.param(found, 0)
+                                }
+                                None => row,
+                            };
+                            if let Some(last) = g.last {
+                                self.b.store(st, Val::NONE, 1, last as i32, row, 0);
+                            }
+                            if let (Some(at), Some((slot, known))) = (g.dense, dense) {
+                                // A key with a value not in the domains stores a zero in the entry
+                                // past the last, which keeps it zero.
+                                let row = self.b.conv(Op::Bitcast, row, Ty::I64);
+                                let zero = self.b.int(Ty::I64, 0);
+                                let row = self.b.select(known, row, zero);
+                                self.b.store(st, slot, 8, at as i32, row, 0);
+                            }
+                            self.b.br(done, &[row]);
+                            self.b.switch_to(done);
+                            self.b.param(done, 0)
                         }
-                        if let (Some(at), Some((slot, known))) = (g.dense, dense) {
-                            // A key with a value not in the domains stores a zero in the entry
-                            // past the last, which keeps it zero.
-                            let row = self.b.conv(Op::Bitcast, row, Ty::I64);
-                            let zero = self.b.int(Ty::I64, 0);
-                            let row = self.b.select(known, row, zero);
-                            self.b.store(st, slot, 8, at as i32, row, 0);
-                        }
-                        self.b.br(done, &[row]);
-                        self.b.switch_to(done);
-                        self.b.param(done, 0)
                     }
                 };
                 for (a, acc) in aggregates.iter().zip(&g.accs) {
@@ -1987,15 +2097,21 @@ impl Gen<'_> {
                 }
                 Ok(())
             }
-            (Sink::Build { keys, payload, .. }, Out::Build(b)) => {
-                // A row with a null key can never match, so it stays out of the table.
+            (Sink::Build { keys, payload, marked, .. }, Out::Build(b)) => {
+                // A row with a null key can never match, so it stays out of the table, unless an
+                // anti join keeps it. Then it goes in with its null byte clear, and the rows are
+                // read back by that byte and not by the mark a probe that took it for a zero
+                // might set.
+                let keep = *marked == Some(JoinType::Anti);
                 let mut hash = self.b.int(Ty::I64, 0);
                 let mut values = Vec::with_capacity(keys.len() + payload.len());
                 for e in keys {
                     let (v, ok) = self.expr(e)?;
-                    let then = self.b.block(&[]);
-                    self.b.brif(ok, then, &[], skip, &[]);
-                    self.b.switch_to(then);
+                    if !keep {
+                        let then = self.b.block(&[]);
+                        self.b.brif(ok, then, &[], skip, &[]);
+                        self.b.switch_to(then);
+                    }
                     hash = self.hash(hash, v, &e.ty)?;
                     values.push((v, ok));
                 }
@@ -2013,8 +2129,48 @@ impl Gen<'_> {
                 self.rt(proxy_id("jt_append"), &[table, record, hash]);
                 Ok(())
             }
+            (Sink::Mark, Out::Mark) => Ok(()),
             _ => Err(Refusal::new("the sink", "its layout is of the other kind")),
         }
+    }
+
+    /// Opens the group of a new run of the key `values`: the key goes in the key buffer, which the
+    /// next row compares with, and in the next row of the table's last page, which is zeroed as a
+    /// new group's accumulators are. A full page asks the table for another. Returns the row.
+    fn open_run(&mut self, g: &Grouping, values: &[Pair], at: u32) -> Val {
+        let st = self.b.st();
+        let row_size = g.row_size as usize;
+        let next = self.b.load(Ty::I64, st, Val::NONE, 1, at as i32, 0);
+        let end = self.b.load(Ty::I64, st, Val::NONE, 1, at as i32 + 8, 0);
+        let full = self.b.bin(Op::IcmpEq, next, end);
+        let (page, fresh) = (self.b.block(&[]), self.b.block(&[(Ty::I64, "next")]));
+        self.b.brif(full, page, &[], fresh, &[next]);
+        self.b.switch_to(page);
+        let table = self.handle(g.table);
+        let first = self.rt(proxy_id("ht_page"), &[table]);
+        let first = self.b.conv(Op::Bitcast, first, Ty::I64);
+        let bytes = self.b.int(Ty::I64, (ROWS_PER_PAGE * row_size) as i128);
+        let past = self.b.bin(Op::Add, first, bytes);
+        self.b.store(st, Val::NONE, 1, at as i32 + 8, past, 0);
+        self.b.br(fresh, &[first]);
+        self.b.switch_to(fresh);
+        let next = self.b.param(fresh, 0);
+        let size = self.b.int(Ty::I64, row_size as i128);
+        let after = self.b.bin(Op::Add, next, size);
+        self.b.store(st, Val::NONE, 1, at as i32, after, 0);
+        let row = self.b.conv(Op::Bitcast, next, Ty::Ptr);
+        for (&(v, ok), (k, _)) in values.iter().zip(&g.keys) {
+            let key = (SINK + k.offset) as i32;
+            let null = self.b.un(Op::Not, ok);
+            self.b.store(st, Val::NONE, 1, key, v, 0);
+            self.b.store(st, Val::NONE, 1, key + k.width as i32, null, 0);
+            self.b.store(row, Val::NONE, 1, 8 + k.offset as i32, v, 0);
+            self.b.store(row, Val::NONE, 1, 8 + k.null() as i32, null, 0);
+        }
+        if let Some(last) = g.last {
+            self.b.store(st, Val::NONE, 1, last as i32, row, 0);
+        }
+        row
     }
 
     /// Looks the row's key up in the array of [`Grouping::dense`] at `at`, and goes to `done` with

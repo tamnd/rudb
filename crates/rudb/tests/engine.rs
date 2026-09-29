@@ -202,6 +202,41 @@ fn inner_joins_on_the_compiled_engine_answer_what_the_first_engine_answers() {
 }
 
 #[test]
+fn semi_and_anti_joins_on_the_compiled_engine_answer_what_the_first_engine_answers() {
+    let database = database();
+    for sql in [
+        "CREATE TABLE a (k INTEGER, k2 VARCHAR, v INTEGER)",
+        "CREATE TABLE b (k INTEGER, k2 VARCHAR, w VARCHAR)",
+        "INSERT INTO a SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i % 40 END, 'g' || (i % 3), i FROM range(500) r(i)",
+        "INSERT INTO b SELECT CASE WHEN i % 13 = 0 THEN NULL ELSE i % 25 END, CASE WHEN i % 5 = 0 THEN NULL ELSE 'g' || (i % 3) END, 'a payload longer than twelve bytes ' || i FROM range(120) r(i)",
+    ] {
+        database.execute(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    // The first four probe the smaller b, and the rest ask for rows of b. The planner builds
+    // whichever side it thinks smaller, and in the last b builds and the probe of a marks it. Null
+    // keys, keys with many matches, and a residual that is null.
+    let queries = [
+        "SELECT a.v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY 1",
+        "SELECT a.v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY 1",
+        "SELECT count(*), sum(a.v) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.k2 <> a.k2)",
+        "SELECT a.v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.k2 <> a.k2) ORDER BY 1",
+        "SELECT b.k, b.w FROM b WHERE EXISTS (SELECT 1 FROM a WHERE a.k = b.k) ORDER BY 1, 2",
+        "SELECT b.k, b.w FROM b WHERE NOT EXISTS (SELECT 1 FROM a WHERE a.k = b.k AND a.v > 300) ORDER BY 1 NULLS FIRST, 2",
+        "SELECT b.k2, count(*) FROM b WHERE NOT EXISTS (SELECT 1 FROM a WHERE a.k = b.k AND a.k2 <> b.k2) GROUP BY b.k2 ORDER BY 1 NULLS FIRST",
+    ];
+    for sql in queries {
+        database.execute("SET engine = 'first'").expect("the first engine");
+        let first = rows(&database, sql);
+        database.execute("SET engine = 'compiled'").expect("the compiled engine");
+        let compiled = rows(&database, sql);
+        assert_eq!(first, compiled, "{sql}");
+    }
+    assert_eq!(database.refusals(), Vec::<String>::new());
+    let text = explained(&database, &format!("EXPLAIN (CODEGEN) {}", queries[6]));
+    assert!(text.contains("marking probe"), "{text}");
+}
+
+#[test]
 fn the_engine_setting_takes_two_names_and_resets_to_the_first() {
     let database = database();
     assert_eq!(database.setting("engine").expect("a setting"), "first");
@@ -315,11 +350,11 @@ fn leaving_a_technique_out_answers_the_same() {
     database.execute("SET engine = 'compiled'").expect("the compiled engine");
     for ablate in [
         "none", "probe", "like", "top", "lanes", "stats", "codes", "ranges", "dense", "handoff",
-        "all",
+        "pairs", "runs", "all",
     ] {
         database.execute(&format!("SET qc_ablate = '{ablate}'")).expect("a switch");
         let back = database.setting("qc_ablate").expect("qc_ablate reads back");
-        let all = "probe,like,top,lanes,stats,codes,ranges,dense,handoff";
+        let all = "probe,like,top,lanes,stats,codes,ranges,dense,handoff,pairs,runs";
         assert_eq!(back, if ablate == "all" { all } else { ablate });
         for (sql, first) in queries.iter().zip(&first) {
             assert_eq!(&rows(&database, sql), first, "{sql} with {ablate} off");
