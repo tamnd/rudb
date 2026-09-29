@@ -147,7 +147,7 @@ impl Whole {
 
 impl Held {
     /// How many values are held.
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::Empty => 0,
             Self::Wholes { values, .. } => values.len(),
@@ -167,7 +167,8 @@ impl Held {
         }
     }
 
-    /// Adds a value that is not null.
+    /// Adds a value. A null goes over to values the way a value of another type does, which only
+    /// `list` asks for, since every other caller skips its nulls.
     pub(crate) fn push(&mut self, value: &Value) {
         match self {
             Self::Empty => {
@@ -226,7 +227,7 @@ impl Held {
     }
 
     /// The values, one `Value` each.
-    fn values(&self) -> Vec<Value> {
+    pub(crate) fn values(&self) -> Vec<Value> {
         match self {
             Self::Empty => Vec::new(),
             Self::Wholes { values, whole } => values.iter().map(|&n| whole.value(n)).collect(),

@@ -36,7 +36,11 @@ use crate::topk::TopK;
 #[derive(Debug, Clone)]
 pub(crate) enum General {
     /// `list` and `array_agg`: every value in the order it arrived, nulls included.
-    List { element: LogicalType, values: Vec<Value> },
+    ///
+    /// The values are a [`Held`], so a list of numbers costs eight bytes a value rather than the
+    /// sixty-four a `Value` takes. A group that meets a null or a value of another type goes over
+    /// to values from there on.
+    List { element: LogicalType, values: Held },
     /// `first`, `last` and `any_value`, which keep one row's value.
     Pick { held: Option<Value>, pick: Pick },
     /// `bool_and` and `bool_or`.
@@ -174,7 +178,7 @@ impl General {
                     LogicalType::List(element) => (**element).clone(),
                     _ => LogicalType::Null,
                 };
-                Self::List { element, values: Vec::new() }
+                Self::List { element, values: Held::Empty }
             }
             "first" => pick(Pick::First),
             "last" => pick(Pick::Last),
@@ -234,7 +238,7 @@ impl General {
         };
         match self {
             Self::Arg { state, .. } => state.update(args)?,
-            Self::List { values, .. } => values.push(value.clone()),
+            Self::List { values, .. } => values.push(value),
             Self::Pick { held, pick } => match pick {
                 Pick::First => {
                     if held.is_none() {
@@ -415,11 +419,13 @@ impl General {
         }
     }
 
-    /// Whether this state skips nulls and takes the rest of a column through [`Self::push_column`].
+    /// Whether this state takes a column through [`Self::push_column`]. Every one of them skips
+    /// nulls except the ones [`Self::keeps_nulls`] says yes to.
     pub(crate) fn takes_columns(&self) -> bool {
         matches!(
             self,
-            Self::Holistic { .. }
+            Self::List { .. }
+                | Self::Holistic { .. }
                 | Self::Sampled { .. }
                 | Self::Digested { .. }
                 | Self::Top { .. }
@@ -429,6 +435,25 @@ impl General {
                 | Self::Counted { .. }
                 | Self::Binned(_)
         )
+    }
+
+    /// Whether a null row of a column is a value of this state, which has to be handed to
+    /// [`Self::update`] since a [`Column`] only reads the rows that are not null.
+    pub(crate) fn keeps_nulls(&self) -> bool {
+        matches!(self, Self::List { .. })
+    }
+
+    /// Adds a null row, for a state [`Self::keeps_nulls`] says yes to.
+    pub(crate) fn push_null(&mut self) -> Result<()> {
+        self.update(&[Value::Null])
+    }
+
+    /// What a `list` holds, and `None` for every other state.
+    pub(crate) fn listed(&self) -> Option<&Held> {
+        match self {
+            Self::List { values, .. } => Some(values),
+            _ => None,
+        }
     }
 
     /// Adds the row of a column a [`Column`] reads, with the fraction read off `args` the first
@@ -445,6 +470,10 @@ impl General {
             return Ok(());
         }
         match (&mut *self, column) {
+            (Self::List { values, .. }, column) => {
+                column.push(values, row);
+                return Ok(());
+            }
             (Self::Tally(tally), column) => return tally.push_column(column, row),
             (Self::Counted { tally, .. }, column) if args.len() < 2 => {
                 return tally.push_column(column, row);
@@ -512,9 +541,7 @@ impl General {
     /// Folds another state for the same call into this one, as if its rows came after these.
     pub(crate) fn combine(&mut self, other: &Self) -> Result<()> {
         match (self, other) {
-            (Self::List { values, .. }, Self::List { values: more, .. }) => {
-                values.extend(more.iter().cloned());
-            }
+            (Self::List { values, .. }, Self::List { values: more, .. }) => values.append(more),
             (Self::Arg { state, .. }, Self::Arg { state: theirs, .. }) => state.combine(theirs)?,
             (Self::Ordered { rows, .. }, Self::Ordered { rows: more, .. }) => {
                 rows.extend(more.iter().cloned());
@@ -669,9 +696,9 @@ impl General {
             return digest.finish(fraction.as_deref(), returns);
         }
         Ok(match self {
-            Self::List { values, .. } if values.is_empty() => Value::Null,
+            Self::List { values, .. } if values.len() == 0 => Value::Null,
             Self::List { element, values } => {
-                Value::List { element: element.clone(), values: values.clone() }
+                Value::List { element: element.clone(), values: values.values() }
             }
             Self::Pick { held, .. } => held.clone().unwrap_or(Value::Null),
             Self::Logic { held, .. } => held.map_or(Value::Null, Value::Boolean),
