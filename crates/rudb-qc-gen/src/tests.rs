@@ -38,6 +38,9 @@ fn strings(values: &[&'static str]) -> Column {
     c
 }
 
+/// The codes a flat column is read through, each row its own.
+static ROWS: [u32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
 /// Runs the body of `stage` over the eight rows of `columns` in one morsel, with `state` set up
 /// by the caller.
 fn run(query: &Query, stage: usize, rt: &mut Rt, columns: &[Column], state: &mut [u8]) {
@@ -51,7 +54,11 @@ fn call(query: &Query, stage: usize, rt: &mut Rt, columns: &[Column], state: &mu
     let cols: Vec<Col> = body
         .reads
         .iter()
-        .map(|&c| Col { values: columns[c].values.as_ptr(), valid: columns[c].valid.as_ptr() })
+        .map(|&c| Col {
+            values: columns[c].values.as_ptr(),
+            valid: columns[c].valid.as_ptr(),
+            codes: ROWS.as_ptr(),
+        })
         .collect();
     let rows = 8;
     let morsel = Morsel {

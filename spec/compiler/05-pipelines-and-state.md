@@ -80,6 +80,10 @@ Thirty-two bytes, passed by pointer. `enc` and `flags` carry the per-morsel fact
 
 The morsel size is a constant of the runtime, not of the plan. The dispatcher may hand a worker several consecutive morsels as one task when a pipeline has many morsels and few threads. It never splits one.
 
+### 5.3.2 The column table
+
+The morsel points at a column table with one entry a column the body reads: the values, the validity bitmap, and a codes pointer. A number column is read at its row. A text column is read through its codes, so the value of row `i` is `values[codes[i]]`. A column storage keeps coded into a dictionary hands the codes it came with and a table made once per dictionary: the `str16` header of each value, the answer of a `LIKE` for each value, or the index of each value in a group key's domain. A column that arrives flat hands a shared `0, 1, 2, ...` and a value a row. The body has one way to read text and the driver never copies a row out of a dictionary. Every code is below the dictionary's length because the vector checks that when it is made, so the read needs no bounds check. Before this, the driver made a 16 byte header and a two byte index for every row of TPC-H q1's two flag columns, and those two loops were the hottest part of the driver.
+
 ## 5.4 The step functions
 
 **Each pipeline compiles to up to five steps, all with the same ABI:**

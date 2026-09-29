@@ -144,6 +144,9 @@ struct Headers {
     /// For each column of [`Body::domains`], the last dictionary it came with and the index of
     /// each of that dictionary's values, as [`indexes`] makes them.
     domains: Vec<Option<(Arc<Vector>, Vec<u16>)>>,
+    /// `0, 1, 2, ...`, the codes a column made flat is read through, as long as the longest chunk
+    /// so far.
+    rows: Vec<u32>,
 }
 
 /// A dictionary, its values made flat, and a `str16` header per value.
@@ -705,14 +708,20 @@ impl<'a> Feed<'a> {
         // A `LIKE` over a column coded into a small dictionary, or one it has answered already, is
         // answered for the dictionary's values and read through the codes. Every other `LIKE` is
         // answered further down, over its column made flat.
+        if headers.rows.len() < rows {
+            let top = u32::try_from(rows).map_err(|_| Error::internal("a chunk too long"))?;
+            headers.rows = (0..top).collect();
+        }
+        let each = headers.rows.as_ptr();
         headers.text.resize(self.body.reads.len(), None);
         headers.likes.resize(self.body.likes.len(), None);
-        let mut answers: Vec<Option<Vec<u8>>> = Vec::with_capacity(self.body.likes.len());
+        // The answers of a `LIKE` over a coded column, one a dictionary value.
+        let mut answers: Vec<Option<*const u8>> = Vec::with_capacity(self.body.likes.len());
         for (m, known) in self.body.likes.iter().zip(headers.likes.iter_mut()) {
             let v = chunk.column(m.column)?;
             let codes = !self.tiers.ablate().off(Ablate::CODES);
             answers.push(if codes && worded(v, rows, known.as_ref()) {
-                Some(like_coded(rt, m.like, v, rows, known)?)
+                Some(like_coded(rt, m.like, v, known)?)
             } else {
                 None
             });
@@ -736,29 +745,51 @@ impl<'a> Feed<'a> {
                 keep[m.column] = true;
             }
         }
-        let columns = chunk.into_columns().into_iter().zip(&keep);
-        let columns = columns.map(|(v, &keep)| if keep { Ok(v) } else { v.into_flat() });
-        let chunk = Chunk::with_rows(columns.collect::<Result<_>>()?, rows)?;
+        // A column a `LIKE` reads through its codes and the body reads made flat is kept coded
+        // here too, so that its codes live as long as the morsel.
+        let mut aside = Vec::new();
+        let mut columns = Vec::with_capacity(keep.len());
+        for (c, (v, &keep)) in chunk.into_columns().into_iter().zip(&keep).enumerate() {
+            if keep {
+                columns.push(v);
+                continue;
+            }
+            if by_codes(c) {
+                aside.push((c, v.clone()));
+            }
+            columns.push(v.into_flat()?);
+        }
+        let chunk = Chunk::with_rows(columns, rows)?;
+        let coded_at = |c: usize| -> Result<&Vector> {
+            match aside.iter().find(|(d, _)| *d == c) {
+                Some((_, v)) => Ok(v),
+                None => chunk.column(c),
+            }
+        };
         let mut held = Vec::with_capacity(self.body.reads.len());
         for (&c, known) in self.body.reads.iter().zip(headers.text.iter_mut()) {
             held.push(if keep[c] {
                 Held::coded(chunk.column(c)?, rows, known)?
             } else {
-                Held::of(chunk.column(c)?, rows, true)?
+                Held::of(chunk.column(c)?, rows, true, each)?
             });
         }
         let mut cols: Vec<Col> = held.iter().map(Held::col).collect();
         // Each other `LIKE` the body reads as a column is answered here for the whole morsel.
         let mut valids = Vec::new();
-        for (m, answer) in self.body.likes.iter().zip(answers.iter_mut()) {
-            if answer.is_none() {
-                let like =
-                    rt.like(m.like).ok_or_else(|| Error::internal("a LIKE pattern is gone"))?;
-                let mut out = vec![0u8; rows];
-                answer_flat(like, chunk.column(m.column)?, rows, &mut out);
-                *answer = Some(out);
-            }
-            let out = answer.as_ref().ok_or_else(|| Error::internal("a LIKE left unanswered"))?;
+        let mut flats = Vec::new();
+        for (m, answer) in self.body.likes.iter().zip(&answers) {
+            let (values, codes) = match *answer {
+                Some(values) => (values, codes_of(coded_at(m.column)?, rows)?),
+                None => {
+                    let like =
+                        rt.like(m.like).ok_or_else(|| Error::internal("a LIKE pattern is gone"))?;
+                    let mut out = vec![0u8; rows];
+                    answer_flat(like, chunk.column(m.column)?, rows, &mut out);
+                    flats.push(out);
+                    (flats.last().map_or(std::ptr::null(), Vec::as_ptr), each)
+                }
+            };
             let valid = match self.body.reads.iter().position(|&c| c == m.column) {
                 Some(at) => cols[at].valid,
                 None => {
@@ -769,7 +800,7 @@ impl<'a> Feed<'a> {
                     valids.last().map_or(std::ptr::null(), Vec::as_ptr)
                 }
             };
-            cols.push(Col { values: out.as_ptr(), valid });
+            cols.push(Col { values, valid, codes });
         }
         // Each group key column the body reads as indexes into its values is looked up here, a
         // dictionary's values once.
@@ -777,10 +808,15 @@ impl<'a> Feed<'a> {
         let mut found = Vec::with_capacity(self.body.domains.len());
         let domains = self.body.domains.iter().zip(&self.lookups);
         for ((d, lookup), known) in domains.zip(headers.domains.iter_mut()) {
-            let out = indexes(chunk.column(d.column)?, rows, lookup, known)?;
-            let at = out.as_ptr().cast::<u8>();
-            cols.push(Col { values: at, valid: at });
-            found.push(out);
+            let (values, codes) = match indexes(coded_at(d.column)?, rows, lookup, known)? {
+                Indexes::Coded(values, codes) => (values, codes),
+                Indexes::Rows(out) => {
+                    found.push(out);
+                    (found.last().map_or(std::ptr::null(), Vec::as_ptr), each)
+                }
+            };
+            let at = values.cast::<u8>();
+            cols.push(Col { values: at, valid: at, codes });
         }
         let mut morsel = Morsel {
             source: 0,
@@ -1095,6 +1131,8 @@ fn bytes(state: &mut [Line]) -> &mut [u8] {
 struct Held<'c> {
     values: *const u8,
     valid: Vec<u8>,
+    /// The index into `values` of each row.
+    codes: *const u32,
     /// Whether the column has no NULL in the morsel.
     clean: bool,
     /// The `str16` headers of a string column, which `values` points at.
@@ -1104,8 +1142,9 @@ struct Held<'c> {
 
 impl<'c> Held<'c> {
     /// Holds `v`, and without the strings of a string column when `strings` is false, for a
-    /// column the body reads only the validity of.
-    fn of(v: &'c Vector, rows: usize, strings: bool) -> Result<Held<'c>> {
+    /// column the body reads only the validity of. `each` is `0, 1, 2, ...` for at least `rows`
+    /// rows, since a value is held a row.
+    fn of(v: &'c Vector, rows: usize, strings: bool, each: *const u32) -> Result<Held<'c>> {
         let (valid, clean) = validity(v, rows);
         let data = v.data().ok_or_else(|| Error::internal("a flattened column is not flat"))?;
         let mut text = Vec::new();
@@ -1162,11 +1201,14 @@ impl<'c> Held<'c> {
             }
             _ => return Err(Error::internal("a column of a type the generator refuses")),
         };
-        Ok(Held { values, valid, clean, _text: text, _chunk: std::marker::PhantomData })
+        let codes = each;
+        Ok(Held { values, valid, codes, clean, _text: text, _chunk: std::marker::PhantomData })
     }
 
-    /// A text column held as codes into a dictionary: the header of each row's value, from the
-    /// headers `known` has for the dictionary, made first when it has them for another one.
+    /// A text column held as codes into a dictionary and the headers `known` has for the
+    /// dictionary, made first when it has them for another one. No row is copied: the body reads
+    /// the header of a row's code, and every code is below the dictionary's length because the
+    /// vector checks that when it is made.
     fn coded(v: &'c Vector, rows: usize, known: &mut Option<Flat>) -> Result<Held<'c>> {
         let (codes, dictionary) = v
             .shared_dictionary_parts()
@@ -1187,15 +1229,15 @@ impl<'c> Held<'c> {
         let Some((_, _, made)) = known.as_ref() else {
             return Err(Error::internal("headers made and then not there"));
         };
-        let text: Vec<u128> =
-            codes.iter().map(|&code| made.get(code as usize).copied().unwrap_or(0)).collect();
         let (valid, clean) = validity(v, rows);
-        let values = text.as_ptr().cast::<u8>();
-        Ok(Held { values, valid, clean, _text: text, _chunk: std::marker::PhantomData })
+        let values = made.as_ptr().cast::<u8>();
+        let codes = codes.as_ptr();
+        let text = Vec::new();
+        Ok(Held { values, valid, codes, clean, _text: text, _chunk: std::marker::PhantomData })
     }
 
     fn col(&self) -> Col {
-        Col { values: self.values, valid: self.valid.as_ptr() }
+        Col { values: self.values, valid: self.valid.as_ptr(), codes: self.codes }
     }
 }
 
@@ -1230,19 +1272,12 @@ fn worded(v: &Vector, rows: usize, known: Option<&Answered>) -> bool {
             || dictionary.len() <= rows.max(VECTOR_SIZE))
 }
 
-/// A `LIKE` over a coded column, one answer a row, from the answers `known` has for the
-/// dictionary, made first when it has them for another one.
-fn like_coded(
-    rt: &Rt,
-    like: u64,
-    v: &Vector,
-    rows: usize,
-    known: &mut Option<Answered>,
-) -> Result<Vec<u8>> {
-    let (codes, dictionary) = v
+/// A `LIKE` over a coded column: the answers `known` has for each value of the dictionary, made
+/// first when it has them for another one, which the body reads through the column's codes.
+fn like_coded(rt: &Rt, like: u64, v: &Vector, known: &mut Option<Answered>) -> Result<*const u8> {
+    let (_, dictionary) = v
         .shared_dictionary_parts()
         .ok_or_else(|| Error::internal("a coded column that is not a dictionary"))?;
-    let codes = codes.get(..rows).ok_or_else(|| Error::internal("fewer codes than rows"))?;
     if !known.as_ref().is_some_and(|(d, _)| Arc::ptr_eq(d, dictionary)) {
         let like = rt.like(like).ok_or_else(|| Error::internal("a LIKE pattern is gone"))?;
         let values = (**dictionary).clone().into_flat()?;
@@ -1253,8 +1288,16 @@ fn like_coded(
     let Some((_, made)) = known.as_ref() else {
         return Err(Error::internal("answers made and then not there"));
     };
-    // A NULL row's code may be anything, and its answer is never read because the row is NULL.
-    Ok(codes.iter().map(|&code| made.get(code as usize).copied().unwrap_or(0)).collect())
+    Ok(made.as_ptr())
+}
+
+/// The first `rows` codes of the coded column `v`.
+fn codes_of(v: &Vector, rows: usize) -> Result<*const u32> {
+    let (codes, _) = v
+        .shared_dictionary_parts()
+        .ok_or_else(|| Error::internal("a coded column that is not a dictionary"))?;
+    let codes = codes.get(..rows).ok_or_else(|| Error::internal("fewer codes than rows"))?;
+    Ok(codes.as_ptr())
 }
 
 /// A `LIKE` over the first `rows` strings of a flat text column, one answer a row, with a row that
@@ -1323,13 +1366,14 @@ fn validity(v: &Vector, rows: usize) -> (Vec<u8>, bool) {
 /// The index in `lookup` of each of the first `rows` values of the text column `v`, as the body
 /// reads a column of [`Body::domains`]: the count of values for a NULL, and one more than that for
 /// a value not in them. For a column coded into a dictionary, the dictionary's values are looked
-/// up once and kept in `known` for the next morsel that comes with the same one.
+/// up once and kept in `known` for the next morsel that comes with the same one, and when no row
+/// is NULL the body reads them through the codes.
 fn indexes(
     v: &Vector,
     rows: usize,
     lookup: &HashMap<Vec<u8>, u16>,
     known: &mut Option<(Arc<Vector>, Vec<u16>)>,
-) -> Result<Vec<u16>> {
+) -> Result<Indexes> {
     let n = lookup.len() as u16;
     let each = |flat: &Vector| -> Vec<u16> {
         // A value that is not a string is not in the values, and the hash finds its group.
@@ -1353,6 +1397,9 @@ fn indexes(
             let Some((_, map)) = known.as_ref() else {
                 return Err(Error::internal("indexes made and then not there"));
             };
+            if matches!(v.validity(), Validity::AllValid) {
+                return Ok(Indexes::Coded(map.as_ptr(), codes.as_ptr()));
+            }
             codes[..rows].iter().map(|&c| map.get(c as usize).copied().unwrap_or(n + 1)).collect()
         }
         _ => {
@@ -1371,7 +1418,15 @@ fn indexes(
             }
         }
     }
-    Ok(out)
+    Ok(Indexes::Rows(out))
+}
+
+/// The indexes of a group key column, as [`indexes`] makes them.
+enum Indexes {
+    /// The index of each dictionary value and the codes of the rows.
+    Coded(*const u16, *const u32),
+    /// The index of each row.
+    Rows(Vec<u16>),
 }
 
 /// The root of a scan the first engine runs for us.
@@ -1503,8 +1558,10 @@ mod tests {
         (0..rows)
             .map(|i| {
                 (held.valid[i / 8] & (1 << (i % 8)) != 0).then(|| {
-                    // SAFETY: `values` is `rows` headers whose long strings the test keeps alive.
-                    let h = unsafe { headers.add(i).read_unaligned() };
+                    // SAFETY: `codes` is `rows` codes, each below the count of headers at `values`,
+                    // whose long strings the test keeps alive.
+                    let h =
+                        unsafe { headers.add(held.codes.add(i).read() as usize).read_unaligned() };
                     let len = h as u32 as usize;
                     if len <= text::INLINE {
                         h.to_le_bytes()[4..4 + len].to_vec()
@@ -1552,9 +1609,16 @@ mod tests {
             let like = rt.add_like(pattern, fold);
             let mut known = None;
             assert!(worded(&v, rows, known.as_ref()));
-            let first = like_coded(&rt, like, &v, rows, &mut known).unwrap();
+            let read = |at: *const u8| -> Vec<u8> {
+                let answer = |c: u32| {
+                    // SAFETY: every code is below the count of answers.
+                    unsafe { at.add(c as usize).read() }
+                };
+                codes.iter().map(|&c| answer(c)).collect()
+            };
+            let first = read(like_coded(&rt, like, &v, &mut known).unwrap());
             let made = known.as_ref().map(|(_, answers)| answers.as_ptr());
-            let again = like_coded(&rt, like, &v, rows, &mut known).unwrap();
+            let again = read(like_coded(&rt, like, &v, &mut known).unwrap());
             assert_eq!(made, known.as_ref().map(|(_, answers)| answers.as_ptr()));
             let matcher = rt.like(like).unwrap();
             let want: Vec<u8> = codes

@@ -54,7 +54,9 @@ use rudb_qc_ir::status::NEED_MEMORY;
 use rudb_qc_ir::{Block, Builder, ErrorKind, Field, Func, Module, Op, Ty, Val, dce, verify};
 use rudb_qc_pipe::{Graph, Op as PipeOp, Pipeline, Probe, Sink, Stage};
 use rudb_qc_plan::{Aggregate, Column, Expr, Kind, Refusal, Result};
-use rudb_qc_rt::abi::{COL_SIZE, COL_VALID, HEADER, MORSEL_BEGIN, MORSEL_COLS, MORSEL_END};
+use rudb_qc_rt::abi::{
+    COL_CODES, COL_SIZE, COL_VALID, HEADER, MORSEL_BEGIN, MORSEL_COLS, MORSEL_END,
+};
 use rudb_qc_rt::join::{ADDRESS, FOLD, JoinLayout, JoinTable};
 use rudb_qc_rt::table::{GroupTable, KeyField, Layout};
 use rudb_qc_rt::{Ablate, Rt, text};
@@ -582,19 +584,23 @@ fn emit(
         let values = g.b.load(Ty::Ptr, table, Val::NONE, 1, at, INV);
         let valid = g.b.load(Ty::Ptr, table, Val::NONE, 1, at + COL_VALID, INV);
         let ty = qir_type(&source[c].ty)?;
-        g.cols.insert(c, (values, valid, ty));
+        let codes =
+            (ty == Ty::Str16).then(|| g.b.load(Ty::Ptr, table, Val::NONE, 1, at + COL_CODES, INV));
+        g.cols.insert(c, (values, valid, ty, codes));
     }
     for k in 0..likes.len() {
         let at = (reads.len() + k) as i32 * COL_SIZE;
         let values = g.b.load(Ty::Ptr, table, Val::NONE, 1, at, INV);
         let valid = g.b.load(Ty::Ptr, table, Val::NONE, 1, at + COL_VALID, INV);
-        g.likes.push((values, valid));
+        let codes = g.b.load(Ty::Ptr, table, Val::NONE, 1, at + COL_CODES, INV);
+        g.likes.push((values, valid, codes));
     }
     g.matched = likes.to_vec();
     for (k, d) in pass.domains.iter().enumerate() {
         let at = (reads.len() + likes.len() + k) as i32 * COL_SIZE;
         let values = g.b.load(Ty::Ptr, table, Val::NONE, 1, at, INV);
-        g.dense.push((values, d.values.len() as u32));
+        let codes = g.b.load(Ty::Ptr, table, Val::NONE, 1, at + COL_CODES, INV);
+        g.dense.push((values, codes, d.values.len() as u32));
     }
     let fans_out = p.probes().next().is_some();
     let (out, state) = g.prepare_sink(&p.sink, fans_out)?;
@@ -673,12 +679,13 @@ struct Gen<'a> {
     b: Builder,
     module: &'a mut Module,
     rt: &'a mut Rt,
-    /// Source column to its values address, validity address and type.
-    cols: HashMap<usize, (Val, Val, Ty)>,
-    /// The `LIKE`s the driver answers, and the address of each one's answers and of its column's
-    /// validity.
+    /// Source column to its values address, validity address, type, and the address of its codes
+    /// for a text column, which is read through them.
+    cols: HashMap<usize, (Val, Val, Ty, Option<Val>)>,
+    /// The `LIKE`s the driver answers, and the address of each one's answers, of its column's
+    /// validity and of the codes the answers are read through.
     matched: Vec<Matched>,
-    likes: Vec<(Val, Val)>,
+    likes: Vec<(Val, Val, Val)>,
     /// Source columns already read for the current row, in a block every later use is dominated
     /// by.
     loaded: HashMap<usize, (Val, Val)>,
@@ -706,9 +713,9 @@ struct Gen<'a> {
     known: &'a [Known],
     /// The source columns this version took to be in range so far, each once.
     ranged: Vec<(usize, u32)>,
-    /// Per group key column read as an index, the address of the indexes and how many values
-    /// the column has.
-    dense: Vec<(Val, u32)>,
+    /// Per group key column read as an index, the address of the indexes, of the codes they are
+    /// read through, and how many values the column has.
+    dense: Vec<(Val, Val, u32)>,
 }
 
 /// A value and whether it is valid.
@@ -813,7 +820,7 @@ impl Gen<'_> {
                 let (dense, state) = if groups.is_empty() || self.dense.is_empty() {
                     (None, state)
                 } else {
-                    let slots = self.dense.iter().map(|&(_, n)| n + 1).product::<u32>() + 1;
+                    let slots = self.dense.iter().map(|&(_, _, n)| n + 1).product::<u32>() + 1;
                     self.field(state, slots * 8, "dense");
                     (Some(state), state + slots * 8)
                 };
@@ -873,8 +880,9 @@ impl Gen<'_> {
                 continue;
             }
             // A column only an answered `LIKE` reads is not in the morsel's table.
-            let Some(&(values, valid, ty)) = self.cols.get(&c) else { continue };
-            let v = self.b.load(ty, values, self.row, ty.bytes(), 0, 0);
+            let Some(&(values, valid, ty, codes)) = self.cols.get(&c) else { continue };
+            let at = codes.map_or(self.row, |codes| self.code(codes));
+            let v = self.b.load(ty, values, at, ty.bytes(), 0, 0);
             if self.nonull {
                 let ok = self.truth();
                 self.loaded.insert(c, (v, ok));
@@ -885,6 +893,12 @@ impl Gen<'_> {
             let v = self.b.select(ok, v, zero);
             self.loaded.insert(c, (v, ok));
         }
+    }
+
+    /// The row's index into a table the driver hands with `codes`, as an `i64`.
+    fn code(&mut self, codes: Val) -> Val {
+        let code = self.b.load(Ty::I32, codes, self.row, 4, 0, 0);
+        self.b.conv(Op::Zext, code, Ty::I64)
     }
 
     /// A handle the first pass over a pipeline makes in the runtime with `make`, and the second
@@ -1453,10 +1467,11 @@ impl Gen<'_> {
                 let Kind::Constant(Value::Varchar(p)) = &pattern.kind else { return Ok(None) };
                 let fold = name.contains('*');
                 if let Some(at) = answered(e, &self.matched) {
-                    let (answers, valid) = self.likes[at];
+                    let (answers, valid, codes) = self.likes[at];
                     let ok =
                         if self.nonull { self.truth() } else { self.b.load_bit(valid, self.row) };
-                    let m = self.b.load(Ty::I1, answers, self.row, 1, 0, 0);
+                    let code = self.code(codes);
+                    let m = self.b.load(Ty::I1, answers, code, 1, 0, 0);
                     let no = self.b.bool(false);
                     let m = self.b.select(ok, m, no);
                     let m = if name.starts_with('!') { self.b.un(Op::Not, m) } else { m };
@@ -1996,8 +2011,9 @@ impl Gen<'_> {
         let mut slot = self.b.int(Ty::I64, 0);
         let mut known = self.truth();
         let mut stride = 1u32;
-        for (values, n) in self.dense.clone() {
-            let index = self.b.load(Ty::I16, values, self.row, 2, 0, 0);
+        for (values, codes, n) in self.dense.clone() {
+            let code = self.code(codes);
+            let index = self.b.load(Ty::I16, values, code, 2, 0, 0);
             let index = self.b.conv(Op::Zext, index, Ty::I64);
             let most = self.b.int(Ty::I64, i128::from(n));
             let within = self.b.bin(Op::IcmpUle, index, most);
