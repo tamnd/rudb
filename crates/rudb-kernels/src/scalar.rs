@@ -212,6 +212,9 @@ fn specialized<V: AsRef<Vector>>(
     if matches!(name, "substring" | "substr") {
         return substring_of(args, returns, rows);
     }
+    if matches!(name, "left" | "right") {
+        return end_of(name, args, returns, rows);
+    }
     if name == "coalesce" {
         return coalesced(args, returns, rows);
     }
@@ -609,6 +612,48 @@ fn substring_of<V: AsRef<Vector>>(
     match text {
         Some(text) => cut_each(&text, start, length, base, rows),
         None => Ok(None),
+    }
+}
+
+/// `left` and `right` over a column, with a count that is the same on every row, as the
+/// `substring` each of them is.
+///
+/// `left(text, count)` is `substring(text, 1, count)` and `right(text, count)` is
+/// `substring(text, -count)`, so both go through the loop [`substring_of`] has. On the row at a time
+/// path each row built a `Value`, a `Vec<char>` and a new string, and `count(DISTINCT left(Referer,
+/// 12))` over the ten million row ClickBench file spent 19 seconds there. A negative count keeps all
+/// but that many characters, which is no fixed window, and a `right` of zero keeps nothing where
+/// `substring(text, 0)` keeps everything, so those two stay on the row at a time path, as does a
+/// null count.
+fn end_of<V: AsRef<Vector>>(
+    name: &str,
+    args: &[V],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let [held, count] = args else {
+        return Ok(None);
+    };
+    let count = count.as_ref();
+    if count.form() != Form::Constant || count.is_null_at(0) {
+        return Ok(None);
+    }
+    let count = text::whole(&count.try_value_at(0)?)?;
+    let whole = |at: i128| -> Option<Vector> {
+        let at = i64::try_from(at).ok()?;
+        Some(Vector::constant(LogicalType::BigInt, Value::BigInt(at), rows))
+    };
+    let held = held.as_ref();
+    match (name, count) {
+        ("left", 0..) => match (whole(1), whole(count)) {
+            (Some(start), Some(length)) => substring_of(&[held, &start, &length], returns, rows),
+            _ => Ok(None),
+        },
+        ("right", 1..) => match whole(-count) {
+            Some(start) => substring_of(&[held, &start], returns, rows),
+            None => Ok(None),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -5119,6 +5164,42 @@ mod tests {
                 for length in [-3, -1, 0, 1, 2, 5, 40] {
                     let args = [arg.clone(), begin.clone(), whole(length, rows)];
                     agrees("substring", &args, &LogicalType::Varchar);
+                }
+            }
+        }
+    }
+
+    /// `left` and `right` with a literal count answer what the row at a time path answers over every
+    /// shape a text column comes in, and every count that is not negative, a zero for `right` aside,
+    /// has a loop. The negative counts, which keep all but that many characters, are covered too.
+    #[test]
+    fn left_and_right_with_a_literal_count_agree_with_the_row_at_a_time_path() {
+        let values = ["Ärger", "b", "", "Straße", "13-715-945-6730", "日本語のテキスト"];
+        let kept = Kept(values.iter().map(|text| text.as_bytes().to_vec()).collect());
+        let read = Vector::external_text(LogicalType::Varchar, Arc::new(kept))
+            .expect("the source is text");
+        let coded = Vector::dictionary(vec![4, 0, 2, 1, 3, 5, 4], read.clone())
+            .expect("every code names a value");
+        let mut rng = Rng(0x1eff_0f5b_57e1_0002);
+        let sampled = sample(&LogicalType::Varchar, 96, 7, &mut rng);
+        let mut columns = vec![read, coded];
+        columns.extend(forms(&sampled));
+        for arg in columns {
+            let rows = arg.len();
+            for count in [-99, -3, -1, 0, 1, 2, 3, 7, 99] {
+                let count = Vector::constant(LogicalType::BigInt, Value::BigInt(count), rows);
+                for name in ["left", "right"] {
+                    let args = [arg.clone(), count.clone()];
+                    agrees(name, &args, &LogicalType::Varchar);
+                    let looped = count.constant_value().is_some_and(|held| match held {
+                        Value::BigInt(at) => *at > 0 || (*at == 0 && name == "left"),
+                        _ => false,
+                    });
+                    if looped && arg.form() != Form::Constant {
+                        let taken = end_of(name, &args, &LogicalType::Varchar, rows)
+                            .expect("the call is written");
+                        assert!(taken.is_some(), "{name} on {:?} took the row path", arg.form());
+                    }
                 }
             }
         }
