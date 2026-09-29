@@ -3161,7 +3161,11 @@ impl Shared {
             Some(found) => found,
             None => direct_targets(&catalog, direct)?,
         };
-        let fields = catalog.table(&name).ok()?.columns();
+        // Found once and changed in place. A row that turns back after this has marked the catalog
+        // changed for nothing, which costs a plan made against it being made again and nothing more.
+        let journals = self.journals(&name);
+        let table = catalog.table_mut(&name).ok()?;
+        let fields = table.columns();
         let mut row = vec![Value::Null; fields.len()];
         for (item, &at) in direct.items.iter().zip(&targets) {
             let value = given.value(item)?;
@@ -3185,9 +3189,8 @@ impl Shared {
         }
         // The row is moved into the table, so the log gets a copy made first, and only when there
         // is a log to get one.
-        let staged = self.journals(&name).then(|| [row.clone()]);
+        let staged = journals.then(|| [row.clone()]);
         let result = kept(sql, 0, |_| {
-            let table = catalog.table_mut(&name)?;
             table.append_row(row)?;
             if let Some(rows) = &staged {
                 self.stage_rows(&name, table.columns(), rows);

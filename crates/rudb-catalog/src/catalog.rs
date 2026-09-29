@@ -1469,13 +1469,12 @@ impl Catalog {
     /// If the database, the schema or the table is missing.
     pub fn table_mut(&mut self, name: &QualifiedName) -> Result<&mut Table> {
         self.changed();
-        let table = name.table.clone();
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
         schema
             .tables
             .iter_mut()
-            .find(|held| same_name(&held.name().table, &table))
-            .ok_or_else(|| missing_table(&table))
+            .find(|held| same_name(&held.name().table, &name.table))
+            .ok_or_else(|| missing_table(&name.table))
     }
 
     /// Turns the parts of a written name into the full name of a table or a view that exists.
