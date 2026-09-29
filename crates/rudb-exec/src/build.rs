@@ -924,6 +924,108 @@ fn native_any_groups(
     Ok(Some(NativePairFrequencies { entries }))
 }
 
+/// The most rows [`native_heavy_counts`] fetches before it leaves the count to the aggregate.
+const HEAVY_ROWS: usize = 65_536;
+
+/// The leading groups of a count grouped by several keys, one of them an integer column with value
+/// codes, counted over only the rows of the values of that column held by the most rows.
+///
+/// A group holds no more rows than the value of the coded key it has, so once the values are
+/// visited from the heaviest down, every group not yet seen holds no more rows than the next value
+/// does, or than the nulls of the column. The rows of each value visited are fetched and counted
+/// whole, and the answer stands when the `n`th count is strictly above that bound. ClickBench 19
+/// groups by `UserID` and two other keys, where its ten leaders hold seven rows or more and the
+/// users with that many rows hold a few percent of the table.
+fn native_heavy_counts(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+    top: usize,
+) -> Result<Option<NativePairFrequencies>> {
+    let Some((table, index, columns)) = whole_table(plan, catalog, input)? else {
+        return Ok(None);
+    };
+    let [aggregate] = plan.expr_list(aggregates) else { return Ok(None) };
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
+        return Ok(None);
+    };
+    let keys = plan.expr_list(groups);
+    if top == 0
+        || keys.len() < 2
+        || plan.string(name) != "count_star"
+        || !plan.expr_list(args).is_empty()
+        || distinct
+        || filter.is_some()
+    {
+        return Ok(None);
+    }
+    let fields = plan.field_list(columns);
+    let mut stored = Vec::with_capacity(fields.len());
+    for field in fields {
+        let Some(column) = table.column_index(&field.name) else { return Ok(None) };
+        stored.push(column);
+    }
+    let mut found = None;
+    for &key in keys {
+        if let Expr::Column(binding) = *plan.expr(key)
+            && binding.table == index
+            && let Some(&column) = stored.get(binding.column as usize)
+            && let Some(codes) = table.rows().value_codes(column)
+        {
+            found = Some(codes);
+            break;
+        }
+    }
+    let Some(codes) = found else { return Ok(None) };
+    let schema = Schema::numbered(fields.to_vec(), index);
+    let Ok(prepared) = Prepared::new(plan, keys, &schema) else { return Ok(None) };
+    let types = fields.iter().map(|field| field.ty.clone()).collect::<Vec<_>>();
+    let heaviest = codes.heaviest();
+    let nulls = codes.rows() - codes.rows_of_codes(0..codes.values().len()).len();
+    // A value no other row holds is left out of the heaviest, and its group has that one row.
+    let lone = usize::from(codes.lone().iter().any(|&word| word != 0));
+    let mut counts = RowMap::<u64>::default();
+    let mut ordinals = Vec::new();
+    let mut fetched = 0;
+    let mut next = 0;
+    let mut batch = VECTOR_SIZE;
+    loop {
+        ordinals.clear();
+        while next < heaviest.len() && ordinals.len() < batch {
+            ordinals
+                .extend(codes.rows_of(heaviest[next] as usize).iter().map(|&row| u64::from(row)));
+            next += 1;
+        }
+        fetched += ordinals.len();
+        if fetched > HEAVY_ROWS {
+            return Ok(None);
+        }
+        ordinals.sort_unstable();
+        count_rows(table, &types, &stored, &prepared, &ordinals, &mut counts)?;
+        let rest = heaviest.get(next).map_or(lone, |&code| codes.rows_of(code as usize).len());
+        let bound = rest.max(nulls) as u64;
+        if counts.len() >= top {
+            let mut boundaries = counts.values().copied().collect::<Vec<_>>();
+            boundaries.select_nth_unstable_by(top - 1, |left, right| right.cmp(left));
+            let boundary = boundaries[top - 1];
+            if boundary > bound {
+                let entries = counts
+                    .into_iter()
+                    .filter(|&(_, count)| count >= boundary)
+                    .map(|(key, count)| (key.0, count))
+                    .collect();
+                return Ok(Some(NativePairFrequencies { entries }));
+            }
+        }
+        if next == heaviest.len() {
+            return Ok(None);
+        }
+        batch *= 2;
+    }
+}
+
 /// The most rows [`native_coded_counts`] fetches, a quarter of what the synopsis of a numeric
 /// column keeps the ordinals of, since these are found by reading the codes of every part first.
 const CODED_ROWS: u64 = 32_768;
@@ -1363,20 +1465,33 @@ impl<'a> Anchored<'a> {
 
     /// Adds the rows at `ordinals` to the count of the group each of them falls in.
     fn count(&self, ordinals: &[u64], counts: &mut RowMap<u64>) -> Result<()> {
-        let mut scratch = Scratch::default();
-        let mut vectors = Vec::with_capacity(self.stored.len());
-        for ordinals in ordinals.chunks(VECTOR_SIZE) {
-            let chunk = self.table.rows().rows_at(&self.types, &self.stored, ordinals)?;
-            vectors.clear();
-            self.prepared.evaluate(&chunk, &mut scratch, &mut vectors)?;
-            for row in 0..ordinals.len() {
-                let key =
-                    vectors.iter().map(|vector| vector.try_value_at(row)).collect::<Result<_>>()?;
-                *counts.entry(Key(key)).or_default() += 1;
-            }
-        }
-        Ok(())
+        count_rows(self.table, &self.types, &self.stored, &self.prepared, ordinals, counts)
     }
+}
+
+/// Adds the rows of `table` at `ordinals` to the count of the group `keys` puts each of them in,
+/// reading the columns `stored` of the types `types` that the keys were prepared against.
+fn count_rows(
+    table: &Table,
+    types: &[LogicalType],
+    stored: &[usize],
+    keys: &Prepared,
+    ordinals: &[u64],
+    counts: &mut RowMap<u64>,
+) -> Result<()> {
+    let mut scratch = Scratch::default();
+    let mut vectors = Vec::with_capacity(stored.len());
+    for ordinals in ordinals.chunks(VECTOR_SIZE) {
+        let chunk = table.rows().rows_at(types, stored, ordinals)?;
+        vectors.clear();
+        keys.evaluate(&chunk, &mut scratch, &mut vectors)?;
+        for row in 0..ordinals.len() {
+            let key =
+                vectors.iter().map(|vector| vector.try_value_at(row)).collect::<Result<_>>()?;
+            *counts.entry(Key(key)).or_default() += 1;
+        }
+    }
+    Ok(())
 }
 
 /// One end of a limit, ready to run.
@@ -2944,6 +3059,15 @@ impl<'a> Building<'a, '_> {
                 let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
                 let counters =
                     self.watch(reference, id, pipeline, "Aggregate", Some("native coded counts"));
+                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+            }
+            if let Some(top) = top
+                && let Some(frequencies) =
+                    native_heavy_counts(self.plan, self.catalog, input, groups, aggregates, top)?
+            {
+                let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
+                let counters =
+                    self.watch(reference, id, pipeline, "Aggregate", Some("native heavy counts"));
                 return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
             }
         }

@@ -22,6 +22,7 @@
 
 use std::ops::Range;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use rudb_common::bounds::Bound;
 use rudb_common::{LogicalType, Result};
@@ -207,6 +208,8 @@ pub struct ValueCodes {
     lone: Vec<u64>,
     /// The codes whose value more than one row holds, ascending.
     shared: Vec<u32>,
+    /// The same codes from the one held by the most rows down, sorted the first time it is asked.
+    heaviest: OnceLock<Vec<u32>>,
 }
 
 impl ValueCodes {
@@ -252,7 +255,7 @@ impl ValueCodes {
                 shared.push(code as u32);
             }
         }
-        Some(Self { rows, values, starts, held, lone, shared })
+        Some(Self { rows, values, starts, held, lone, shared, heaviest: OnceLock::new() })
     }
 
     /// The table's rows.
@@ -285,6 +288,17 @@ impl ValueCodes {
     #[must_use]
     pub fn shared(&self) -> &[u32] {
         &self.shared
+    }
+
+    /// The codes of the values more than one row holds, from the one held by the most rows down, a
+    /// tie in code order. Every value left out is held by one row.
+    #[must_use]
+    pub fn heaviest(&self) -> &[u32] {
+        self.heaviest.get_or_init(|| {
+            let mut heaviest = self.shared.clone();
+            heaviest.sort_by_key(|&code| std::cmp::Reverse(self.rows_of(code as usize).len()));
+            heaviest
+        })
     }
 
     /// Where the rows of the value coded `code` start among the rows of every value, for a code up

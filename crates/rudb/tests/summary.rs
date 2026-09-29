@@ -828,3 +828,28 @@ fn a_distinct_count_by_a_small_key_is_counted_from_the_codes_of_a_wide_column() 
     assert_eq!(pair.listing(more).len(), 10);
     assert!(pair.answered(&pair.file, more, "native distinct counts"));
 }
+
+/// ClickBench 19 counts `UserID` beside two other keys and wants the ten biggest groups. A group
+/// holds no more rows than its user, so the users held by the most rows are counted first and the
+/// rest of the table is never read once the tenth count is above the rows of the next user.
+#[test]
+fn a_top_count_by_several_keys_is_counted_over_the_rows_of_the_heaviest_values() {
+    let rows = "SELECT CASE WHEN i < 1600 THEN CAST(floor(sqrt(i)) AS BIGINT) \
+         WHEN i % 20011 = 0 THEN NULL ELSE 1000 + i - i % 2 END AS u, \
+         CASE WHEN i < 1600 THEN 0 ELSE i % 7 END AS m, \
+         CASE WHEN i < 1600 THEN 'h' ELSE 'v' || (i % 5) END AS s \
+         FROM range(200000) t(i)";
+    let pair = Pair::new("heavyusers", rows);
+    let query = "SELECT u, m + 1 AS k, s, COUNT(*) AS c FROM t GROUP BY u, k, s \
+         ORDER BY c DESC LIMIT 10";
+    let found = pair.listing(query);
+    assert_eq!(found.len(), 10, "the limit is the answer's length");
+    assert_eq!(found[0][3], Value::BigInt(79), "the heaviest user leads");
+    assert!(
+        pair.answered(&pair.file, query, "native heavy counts"),
+        "only the rows of the heaviest users were counted"
+    );
+    // Every user holds a row or two past the first hundred, too few to settle a top thousand.
+    let wide = "SELECT u, m, COUNT(*) AS c FROM t GROUP BY u, m ORDER BY c DESC LIMIT 1000";
+    assert!(!pair.answered(&pair.file, wide, "native heavy counts"));
+}

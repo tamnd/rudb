@@ -442,6 +442,13 @@ impl Rows {
         rudb_native::codes::distinct_per_group(reader, group, folded, &codes, workers)
     }
 
+    /// The value codes of a signed integer column, when the file carries them. See
+    /// `rudb_native::codes`.
+    pub fn value_codes(&self, column: usize) -> Option<Arc<rudb_native::codes::ValueCodes>> {
+        let Self::Native(reader) = self else { return None };
+        reader.value_codes(column)
+    }
+
     /// Query-specific pair leaders are not used, including in older native files.
     pub fn top_pair_frequencies(
         &self,
