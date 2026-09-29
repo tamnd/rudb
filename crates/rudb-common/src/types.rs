@@ -561,6 +561,14 @@ impl LogicalType {
                 Some(Self::AggregateState(state.clone()))
             }
             (Self::List(left), Self::List(right)) => Some(Self::list(left.promote(right)?)),
+            (Self::Array(left, size), Self::Array(right, other)) if size == other => {
+                Some(Self::array(left.promote(right)?, *size))
+            }
+            // A map meets a map key by key type and value by value type, so the empty `MAP {}`,
+            // which is a `MAP("NULL", "NULL")`, meets any map as that map.
+            (Self::Map(key, value), Self::Map(other_key, other_value)) => {
+                Some(Self::map(key.promote(other_key)?, value.promote(other_value)?))
+            }
             // An unnamed struct meets any struct of its size field by field, and takes the names
             // of the other side when it has some.
             (Self::Struct(left), Self::Struct(right))
@@ -1511,6 +1519,20 @@ mod promotion_tests {
         let right = LogicalType::list(LogicalType::BigInt);
         assert_eq!(left.promote(&right), Some(LogicalType::list(LogicalType::BigInt)));
         assert_eq!(left.promote(&LogicalType::list(LogicalType::Varchar)), None);
+    }
+
+    #[test]
+    fn a_map_promotes_by_its_key_and_value_and_an_array_by_its_element_at_one_size() {
+        let empty = LogicalType::map(LogicalType::Null, LogicalType::Null);
+        let map = LogicalType::map(LogicalType::Varchar, LogicalType::Integer);
+        assert_eq!(map.promote(&empty), Some(map.clone()));
+        assert_eq!(empty.promote(&map), Some(map.clone()));
+        let wide = LogicalType::map(LogicalType::Varchar, LogicalType::BigInt);
+        assert_eq!(map.promote(&wide), Some(wide));
+        let three = LogicalType::array(LogicalType::Integer, 3);
+        let wider = LogicalType::array(LogicalType::BigInt, 3);
+        assert_eq!(three.promote(&wider), Some(wider));
+        assert_eq!(three.promote(&LogicalType::array(LogicalType::Integer, 2)), None);
     }
 }
 
