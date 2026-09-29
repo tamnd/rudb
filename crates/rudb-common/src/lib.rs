@@ -29,6 +29,7 @@ pub mod bounds;
 pub mod cancel;
 pub mod clustering;
 pub mod error;
+pub mod generated;
 pub mod heap;
 pub mod memory;
 pub mod rules;

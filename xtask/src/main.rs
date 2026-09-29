@@ -171,7 +171,7 @@ fn usage() {
     println!("  msrv     the workspace still builds on the oldest Rust the manifest claims");
     println!("  grammar  the vendored DuckDB grammar is byte for byte what VENDOR recorded");
     println!(
-        "  gen-grammar [--check]  regenerate crates/rudb-parse/src/generated from that grammar"
+        "  gen-grammar [--check]  regenerate the parser's and rudb-common's tables from that grammar"
     );
     println!("  smoke    the query in M0's exit criterion, run on this host, answers checked");
     println!("  conform  the committed corpus in tamnd/rudb-compat, through this tree's shell and");

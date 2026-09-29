@@ -34,7 +34,7 @@ Worth: no direct movement in any published number, and every number below is uni
 
 ## Batch 2, introspection and the session
 
-**The catalog tables.** `duckdb_functions`, `duckdb_settings`, `duckdb_keywords`, `duckdb_types`, `duckdb_tables`, `duckdb_columns`, `duckdb_schemas`, `duckdb_views`, `duckdb_extensions`, `duckdb_optimizers`, `duckdb_databases`, `duckdb_dialects`, `duckdb_grammar_extensions`, the `pragma_*` family and `information_schema`. `crates/rudb-catalog/src/lib.rs` has none of them and the data is already there, the table function mechanism is already there, and `rudb_strategies` already proves a table function backed by an in memory list works. `duckdb_keywords` is nearly free because `crates/rudb-parse/src/generated/keywords.rs` is compiled from the same five vendored `.list` files, so the classification is correct by construction.
+**The catalog tables.** `duckdb_functions`, `duckdb_settings`, `duckdb_keywords`, `duckdb_types`, `duckdb_tables`, `duckdb_columns`, `duckdb_schemas`, `duckdb_views`, `duckdb_extensions`, `duckdb_optimizers`, `duckdb_databases`, `duckdb_dialects`, `duckdb_grammar_extensions`, the `pragma_*` family and `information_schema`. `crates/rudb-catalog/src/lib.rs` has none of them and the data is already there, the table function mechanism is already there, and `rudb_strategies` already proves a table function backed by an in memory list works. `duckdb_keywords` is nearly free because `crates/rudb-common/src/generated/keywords.rs` is compiled from the same five vendored `.list` files, so the classification is correct by construction.
 
 **`current_setting()` and settings as values.** `crates/rudb/src/settings.rs` accepts `SET` for a constant and its own doc says these are missing.
 
