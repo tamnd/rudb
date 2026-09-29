@@ -1262,15 +1262,7 @@ fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Op
     }
     let rids = adjacency.push(held)?;
     let parts = children.div_ceil(PART_ROWS as u64);
-    let mut touched = 0_u64;
-    let mut last = None;
-    for rid in rids.iter() {
-        let part = rid / PART_ROWS as u64;
-        if last != Some(part) {
-            touched += 1;
-            last = Some(part);
-        }
-    }
+    let touched = rids.parts_touched(PART_ROWS as u64);
     Ok(Some(Pushed { rids, parts, skipped: parts - touched, stopped: false }))
 }
 
@@ -1360,13 +1352,7 @@ fn owned_keys(exact: &Exact, count: u64, keys: impl Iterator<Item = i64>) -> Opt
 fn thin(rids: &Rids) -> bool {
     // A stored part is a vector of rows, which is the length the scan compares against.
     let part_rows = VECTOR_SIZE as u64;
-    let (mut touched, mut last) = (0_u64, u64::MAX);
-    for rid in rids.iter() {
-        if rid / part_rows != last {
-            last = rid / part_rows;
-            touched += 1;
-        }
-    }
+    let touched = rids.parts_touched(part_rows);
     rids.len().saturating_mul(LISTED) < touched.saturating_mul(part_rows)
 }
 
