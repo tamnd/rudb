@@ -8,6 +8,14 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.10
+
+The main change is J7 work on JOB. #2156 lets a relation of the consistent operator's tree be read after its root when it has no children and its filter is loose, so on 26a `char_name` is looked up at the few thousand roles the movies leave instead of read whole. The same PR stops a stable dictionary `LIKE` from deciding a whole group of 1024 values for every code a small chunk touches, which is what a gathered read hands it: such a chunk now decides only its own codes, still reading each block once. Over all 113 JOB queries warm on server2 that is 69.8 G instructions against 75.8 G, with all answers equal. #2157 turns the graph sections rule on by default after the TPC-H measurement that #760 was waiting for.
+
+On the compiled engine, #2149 makes values only for the rows that can make a top N when the first sort key is a fixed width column, and #2150 hands the keys a finished join table kept to the scan under the probe, so q05 reads the lines of the kept orders rather than all of `lineitem`. #2151 adds `combine_aggr` over exported states and #2154 exports and imports the `arg_min` and `arg_max` states. For the trickle insert rate, #2153 builds a trickled row straight into the tail's columns and #2155 widens its zones in place.
+
+The native directory format number stays at 30 and the storage format version at 9.
+
 ## 0.8.9
 
 The main change is L10 work on the trickle insert path for W3. A prepared one-row `INSERT` that goes straight into the table now does far less per row. #2134 keeps what it found about its table until the catalog changes, instead of resolving the name and columns every time. #2140 holds each trickled row in the tail as its values and lays the tail out into one chunk when it fills. #2142 works out a row's zone and distinct counts from its values, not from a one-row vector a column. #2145 reads the values by position when the parameters are numbered one to n, and reuses the one-row count result. #2147 moves the row into the table instead of copying it and stops timing statistics for single rows. On server2, 200k prepared inserts into a four column table in memory went from 7.6 us to about 2.4 us a row.
