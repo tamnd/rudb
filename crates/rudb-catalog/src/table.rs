@@ -876,6 +876,16 @@ impl Rows {
         }
     }
 
+    /// Tells a native reader that a query will read `column` whole more than once.
+    ///
+    /// Nothing for an in memory table, which holds all of its chunks anyway.
+    pub fn expect_again(&self, column: usize) {
+        match self {
+            Self::Memory(_) => {}
+            Self::Native(reader) | Self::Grown(reader, _) => reader.expect_again(column),
+        }
+    }
+
     /// Reads only projected columns.
     pub fn read(&self, at: usize, columns: &[usize]) -> Result<Chunk> {
         match self {

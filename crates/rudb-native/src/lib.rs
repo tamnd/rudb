@@ -4642,6 +4642,9 @@ struct Shelf {
     /// How many stripes of one column are kept whatever the budget says. See
     /// [`CACHED_STRIPES_PER_COLUMN`] for what sets it and [`Reader::keep_stripes`] for who raises it.
     kept: AtomicUsize,
+    /// The columns a plan has said it reads more than once. A whole read of one of their parts
+    /// holds it at once rather than counting its rows first. See [`Reader::expect_again`].
+    again: Vec<AtomicBool>,
 }
 
 impl Shelf {
@@ -6637,6 +6640,7 @@ impl Reader {
             places: places.len(),
             held: (0..table_fields).map(|_| AtomicUsize::new(0)).collect(),
             kept: AtomicUsize::new(CACHED_STRIPES_PER_COLUMN),
+            again: (0..table_fields).map(|_| AtomicBool::new(false)).collect(),
         };
         let sieves = (0..table_fields).map(|_| OnceLock::new()).collect();
         let part_ranges = (0..table_fields).map(|_| OnceLock::new()).collect();
@@ -7035,6 +7039,21 @@ impl Reader {
     /// reads a quarter of a megabyte for every part it takes out of it.
     pub fn keep_stripes(&self, stripes: usize) {
         self.cache.kept.fetch_max(stripes, Atomic::Relaxed);
+    }
+
+    /// Says that a query will read `column` whole more than once, so the first whole read of each
+    /// of its parts holds what it decoded.
+    ///
+    /// A whole read counts its rows and holds nothing, so a query that reads a column once does
+    /// not keep it. A query that scans a table twice, the way TPC-H q22 reads `customer` for the
+    /// average and again for the answer, then decoded every part twice, which put q22 at SF1 up
+    /// from 228 to 266 million instructions. The plan knows which columns it reads twice, and this
+    /// is how it says so. It stays said, since a column read twice by one query is likely to be
+    /// read twice by the next one like it.
+    pub fn expect_again(&self, column: usize) {
+        if let Some(again) = self.cache.again.get(column) {
+            again.store(true, Atomic::Relaxed);
+        }
     }
 
     /// Rows in one part, or zero when the part number is past the table.
@@ -8435,7 +8454,13 @@ impl Reader {
                     PartSlot::Seen(before) => *before,
                     _ => 0,
                 };
-                if before >= rows {
+                let again = positions.is_none()
+                    && self
+                        .cache
+                        .again
+                        .get(column)
+                        .is_some_and(|again| again.load(Atomic::Relaxed));
+                if before >= rows || again {
                     return Err(true);
                 }
                 let wanted = positions.map_or(rows, <[u32]>::len);
@@ -16367,6 +16392,17 @@ mod tests {
         let whole = a.read(1, &[0]).expect("a part");
         assert_eq!(whole.len(), 64);
         assert!(matches!(*slot(1), PartSlot::Seen(64)), "a whole first read only counts its rows");
+        a.expect_again(0);
+        a.read_rows(2, &[0], &[3], false).expect("one row");
+        assert!(
+            matches!(*slot(2), PartSlot::Seen(1)),
+            "a column read again still counts sparse reads"
+        );
+        a.read(3, &[0]).expect("a part");
+        assert!(
+            matches!(*slot(3), PartSlot::Held { .. }),
+            "and holds what a whole first read decodes"
+        );
 
         for _ in 0..2 {
             for part in 0..parts {

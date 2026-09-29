@@ -401,6 +401,32 @@ impl<'a> Handoff<'a> {
     }
 }
 
+/// The names of the columns of `name` that a scan of the plan other than `at` reads.
+///
+/// Only the nodes the root still reaches, since a rewrite leaves the scans it replaced in the
+/// arena and they are never run.
+fn read_elsewhere(plan: &Plan, at: NodeRef, name: &QualifiedName) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = vec![false; plan.node_count()];
+    let mut next = vec![plan.root()];
+    while let Some(reference) = next.pop() {
+        let Some(visited) = seen.get_mut(reference as usize) else { continue };
+        if std::mem::replace(visited, true) {
+            continue;
+        }
+        let node = plan.node(reference);
+        if let Node::Get { catalog, schema, table, columns, .. } = *node
+            && reference != at
+            && QualifiedName::new(plan.string(catalog), plan.string(schema), plan.string(table))
+                == *name
+        {
+            names.extend(plan.field_list(columns).iter().map(|field| field.name.clone()));
+        }
+        next.extend(node.children().into_iter().flatten());
+    }
+    names
+}
+
 /// The values of the aggregate `node` of `plan`, when every one of them can be read from the
 /// statistics of the table under it the way the first engine answers such an aggregate without
 /// reading a row, and `None` when one of them needs the rows.
@@ -3082,16 +3108,17 @@ impl<'a> Building<'a, '_> {
                     "Scan",
                     Some(plan.string(table)),
                 );
-                let scan = Scan::new(
-                    plan,
-                    self.catalog.table(&name)?,
-                    index,
-                    columns,
-                    filters,
-                    self.seams,
-                    self.session,
-                )?
-                .watched(counters.clone());
+                // A column another scan of the same table reads too is decoded once and held
+                // rather than decoded by each scan in turn.
+                let table = self.catalog.table(&name)?;
+                for again in read_elsewhere(plan, reference, &name) {
+                    if let Some(column) = table.column_index(&again) {
+                        table.rows().expect_again(column);
+                    }
+                }
+                let scan =
+                    Scan::new(plan, table, index, columns, filters, self.seams, self.session)?
+                        .watched(counters.clone());
                 let schema = scan.schema().clone();
                 Segment::new(Arc::new(Watched::new(scan, counters)), schema).reads()
             }
