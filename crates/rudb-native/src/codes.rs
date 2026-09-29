@@ -257,6 +257,21 @@ impl ValueCodes {
     pub fn rows_of(&self, code: usize) -> &[u32] {
         &self.held[self.starts[code] as usize..self.starts[code + 1] as usize]
     }
+
+    /// Where the rows of the value coded `code` start among the rows of every value, for a code up
+    /// to the count of [`Self::values`].
+    #[inline]
+    #[must_use]
+    pub fn start(&self, code: usize) -> usize {
+        self.starts[code] as usize
+    }
+
+    /// The rows of each of the codes in `codes` one after the other, which is from
+    /// [`Self::start`] of the first up to that of the one past the last.
+    #[must_use]
+    pub fn rows_of_codes(&self, codes: Range<usize>) -> &[u32] {
+        &self.held[self.start(codes.start)..self.start(codes.end)]
+    }
 }
 
 /// The value codes of a column, when the table carries a current section for it.
@@ -370,15 +385,23 @@ pub fn distinct_per_group(
             .map(|from| {
                 let span = from..(from + each).min(codes);
                 scope.spawn(move || {
+                    // The slots of every row of these codes first, a load apiece that nothing waits
+                    // on, so that the misses overlap instead of each one holding up the compare
+                    // that follows it.
+                    let base = counted.start(span.start);
+                    let gathered = counted
+                        .rows_of_codes(span.clone())
+                        .iter()
+                        .map(|&row| of_row[row as usize])
+                        .collect::<Vec<_>>();
                     let mut counts = vec![0_u64; slots];
                     let mut others = Vec::new();
                     for code in span {
-                        let held = counted.rows_of(code);
-                        let Some((&head, tail)) = held.split_first() else { continue };
-                        let slot = of_row[head as usize];
+                        let held =
+                            &gathered[counted.start(code) - base..counted.start(code + 1) - base];
+                        let Some((&slot, tail)) = held.split_first() else { continue };
                         counts[slot as usize] += 1;
-                        for &row in tail {
-                            let other = of_row[row as usize];
+                        for &other in tail {
                             if other != slot {
                                 others.push(other);
                             }
