@@ -8,6 +8,14 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.11
+
+The main change is more L10 work on the trickle insert path for W3. #2159 shares a query result's name, type and chunk lists between its clones instead of copying them. #2162 finds a prepared insert's table once per row instead of twice. #2165 widens only the open tail's zone for a trickled row and folds it into the group's zone when the tail closes. #2172 boxes the metrics document a result carries, which took a result from 768 bytes to under 256, and a result is moved by value a few times per statement. #2173 adds `Value::is_of`, so a prepared insert checks each value's type without building a `LogicalType`. On server2, 200k prepared inserts into a four column table went from 2.20 G to 1.35 G instructions, about 2 us a row on a busy machine.
+
+On the query side, #2160 holds a decoded part only once reads of it have decoded it whole, and #2168 makes a column's part slots the first time a read asks for them. #2169 gathers a bare relation's rows through the adjacency when one row in sixteen or fewer is wanted, and #2171 lets the planner know a relationship a file kept as a link. #2163 reads a binding from the node a run reads rather than one a rewrite left behind. #2170 appends `COUNT(DISTINCT)` pairs in compiled code many at a time. #2164 exports an ordered aggregate's state as the rows it kept and #2166 adds `to_aggregate_state`. #2161 quotes a struct field name that is a keyword when printing a type.
+
+The native directory format number stays at 30 and the storage format version at 9.
+
 ## 0.8.10
 
 The main change is J7 work on JOB. #2156 lets a relation of the consistent operator's tree be read after its root when it has no children and its filter is loose, so on 26a `char_name` is looked up at the few thousand roles the movies leave instead of read whole. The same PR stops a stable dictionary `LIKE` from deciding a whole group of 1024 values for every code a small chunk touches, which is what a gathered read hands it: such a chunk now decides only its own codes, still reading each block once. Over all 113 JOB queries warm on server2 that is 69.8 G instructions against 75.8 G, with all answers equal. #2157 turns the graph sections rule on by default after the TPC-H measurement that #760 was waiting for.
