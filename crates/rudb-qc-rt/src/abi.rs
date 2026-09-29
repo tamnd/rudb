@@ -35,6 +35,11 @@ pub struct Morsel {
 /// `values` holds the column at its physical width, with strings as `str16`. `valid` is a bitmap,
 /// least significant bit first, and is never null: a column with no nulls points at a buffer of
 /// ones, so the body has one way to read validity and the fast path is a later tier's business.
+///
+/// A text column, and each answer or index column made from one, is read through `codes`: the
+/// value of row `i` is `values[codes[i]]`. A column coded into a dictionary hands its codes and a
+/// table made once per dictionary, so no row is copied out, and a flat one hands `0, 1, 2, ...`
+/// and a value a row. Every other column leaves `codes` null and is read at the row.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Col {
@@ -42,6 +47,8 @@ pub struct Col {
     pub values: *const u8,
     /// The validity bitmap.
     pub valid: *const u8,
+    /// The index into `values` of each row, for a column read through one.
+    pub codes: *const u32,
 }
 
 /// The byte offset of [`Morsel::begin`].
@@ -51,9 +58,11 @@ pub const MORSEL_END: i32 = 12;
 /// The byte offset of [`Morsel::cols`].
 pub const MORSEL_COLS: i32 = 32;
 /// The size of a [`Col`].
-pub const COL_SIZE: i32 = 16;
+pub const COL_SIZE: i32 = 24;
 /// The byte offset of [`Col::valid`].
 pub const COL_VALID: i32 = 8;
+/// The byte offset of [`Col::codes`].
+pub const COL_CODES: i32 = 16;
 
 /// The first cache line of every pipeline's state, before the local slots.
 ///
@@ -130,6 +139,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Morsel, cols), MORSEL_COLS as usize);
         assert_eq!(size_of::<Col>(), COL_SIZE as usize);
         assert_eq!(std::mem::offset_of!(Col, valid), COL_VALID as usize);
+        assert_eq!(std::mem::offset_of!(Col, codes), COL_CODES as usize);
         assert_eq!(size_of::<StateHeader>(), HEADER as usize);
         assert_eq!(align_of::<StateHeader>(), 64);
         assert_eq!(std::mem::offset_of!(StateHeader, rt), RT as usize);
