@@ -3140,10 +3140,9 @@ impl Shared {
     pub(crate) fn insert_direct(
         &self,
         direct: &crate::prepared::Direct,
-        parameters: &Parameters,
+        given: crate::prepared::Given<'_>,
         sql: &str,
     ) -> Option<Result<QueryResult>> {
-        use crate::prepared::Item;
         if !self.inner.writable {
             return None;
         }
@@ -3159,10 +3158,7 @@ impl Shared {
         let fields = catalog.table(&name).ok()?.columns();
         let mut row = vec![Value::Null; fields.len()];
         for (item, &at) in direct.items.iter().zip(&targets) {
-            let value = match item {
-                Item::Null => Value::Null,
-                Item::Parameter(name) => parameters.get(name)?.clone(),
-            };
+            let value = given.value(item)?;
             let ty = &fields[at].ty;
             let value = if value.is_null() {
                 Value::Null

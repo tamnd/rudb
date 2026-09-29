@@ -141,6 +141,26 @@ impl QueryResult {
     /// [`Self::changes`] is what tells it apart from a query that happened to produce the same
     /// shape.
     pub(crate) fn changed(rows: usize) -> Result<Self> {
+        // One row is what every trickled `INSERT` answers, and building the column, the chunk and
+        // the session for it was about a twentieth of what the insert cost, so it is built once a
+        // thread and copied. A copy shares the chunk, which nothing writes to.
+        thread_local! {
+            static ONE: std::cell::OnceCell<QueryResult> = const { std::cell::OnceCell::new() };
+        }
+        if rows == 1 {
+            return ONE.with(|one| match one.get() {
+                Some(held) => Ok(held.clone()),
+                None => {
+                    let built = Self::counted(1)?;
+                    Ok(one.get_or_init(|| built).clone())
+                }
+            });
+        }
+        Self::counted(rows)
+    }
+
+    /// The count result [`Self::changed`] hands out, built afresh.
+    fn counted(rows: usize) -> Result<Self> {
         let count = i64::try_from(rows).unwrap_or(i64::MAX);
         let vector = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(count)])?;
         let chunk = Chunk::new(vec![vector])?;
