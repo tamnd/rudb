@@ -939,19 +939,22 @@ impl<'a> Feed<'a> {
                 st[*count as usize..*count as usize + 8].try_into().unwrap_or_default(),
             );
             let n = usize::try_from(n).unwrap_or(usize::MAX).min(room);
+            // Under a top N only the rows that can still make it are made into values.
+            let picked =
+                self.top.and_then(|(keys, count)| contenders(keys, columns, &buffers, n, count));
+            let rows = picked.as_ref().map_or(n, Vec::len);
+            let at = |i: usize| picked.as_ref().map_or(i, |picked| picked[i]);
             let mut vectors = Vec::with_capacity(columns.len());
             for (slot, b) in columns.iter().zip(&buffers) {
                 let w = slot.ty.bytes() as usize;
-                // SAFETY: the buffer is `rows * w` bytes long and was allocated as `u128`s, which
-                // any byte pattern is.
-                let values = unsafe {
-                    std::slice::from_raw_parts(b.values.as_ptr().cast::<u8>(), b.values.len() * 16)
-                };
-                let cells: Vec<Cell> = (0..n)
+                let values = values_of(b);
+                let cells: Vec<Cell> = (0..rows)
+                    .map(at)
                     .map(|i| (b.valid[i] != 0).then(|| cell(&values[i * w..(i + 1) * w])))
                     .collect();
                 vectors.push(vector(&slot.logical, &cells)?);
             }
+            let n = rows;
             let chunk = Chunk::with_rows(vectors, n)?;
             match (&self.cutoff, self.top) {
                 (Some(cut), Some((keys, count))) if count > 0 && n as u64 >= count => {
@@ -1112,6 +1115,71 @@ fn cut(chunk: Chunk, top: Option<(&[Key], u64)>) -> Result<Vec<Chunk>> {
 struct Buffers {
     values: Vec<u128>,
     valid: Vec<u8>,
+}
+
+/// The bytes of a result column's values.
+fn values_of(b: &Buffers) -> &[u8] {
+    // SAFETY: the buffer was allocated as `u128`s, which any byte pattern is, and is read as the
+    // bytes it holds.
+    unsafe { std::slice::from_raw_parts(b.values.as_ptr().cast::<u8>(), b.values.len() * 16) }
+}
+
+/// The first `n` rows of a morsel's result that can still be among the first `count` in the order
+/// of `keys`, in the order they came. `None` when they all can, or when the first key is not a
+/// column of signed numbers, dates or times, which is what this reads.
+///
+/// A row whose first key comes after the first key of the row that is `count`th by that key alone
+/// has `count` rows ahead of it whatever the other keys say, so it cannot make the cut. Rows tied
+/// with that one are kept, and the sort after this orders them by the rest. On ClickBench q25 a
+/// morsel of 2048 rows hands on ten or so of them instead of every row with a search phrase.
+fn contenders(
+    keys: &[Key],
+    columns: &[rudb_qc_gen::Slot],
+    buffers: &[Buffers],
+    n: usize,
+    count: u64,
+) -> Option<Vec<usize>> {
+    let count = usize::try_from(count).ok().filter(|&count| count > 0 && count < n)?;
+    let key = keys.first()?;
+    let rudb_qc_plan::Kind::Column(c) = &key.expr.kind else { return None };
+    let (slot, b) = (columns.get(*c)?, buffers.get(*c)?);
+    let signed = matches!(
+        slot.logical,
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::Date
+            | LogicalType::Time
+            | LogicalType::Timestamp
+            | LogicalType::TimestampS
+            | LogicalType::TimestampMs
+            | LogicalType::TimestampNs
+            | LogicalType::TimestampTz
+    );
+    let w = slot.ty.bytes() as usize;
+    if !signed || !matches!(w, 1 | 2 | 4 | 8) {
+        return None;
+    }
+    let values = values_of(b);
+    // Each row's place as one number that is smaller for a row that comes first: the value with
+    // its sign bit flipped, turned over for `DESC`, and a null before or after every value.
+    let rank = |i: usize| -> u128 {
+        if b.valid[i] == 0 {
+            return if key.nulls_first { 0 } else { 1 << 64 };
+        }
+        let mut word = [0u8; 8];
+        word[..w].copy_from_slice(&values[i * w..(i + 1) * w]);
+        let value = i64::from_le_bytes(word) << (64 - 8 * w) >> (64 - 8 * w);
+        let order = (value as u64) ^ (1 << 63);
+        let order = if key.descending { !order } else { order };
+        u128::from(order) + u128::from(key.nulls_first)
+    };
+    let ranks: Vec<u128> = (0..n).map(rank).collect();
+    let mut sorted = ranks.clone();
+    let (_, &mut worst, _) = sorted.select_nth_unstable(count - 1);
+    let picked: Vec<usize> = (0..n).filter(|&i| ranks[i] <= worst).collect();
+    (picked.len() < n).then_some(picked)
 }
 
 /// Writes the state header, which points at the state's own block.
@@ -1551,6 +1619,50 @@ mod tests {
     use rudb_common::Value;
 
     use super::*;
+
+    /// A result column of `BIGINT`s, `None` a null, and its slot.
+    fn bigints(values: &[Option<i64>]) -> (rudb_qc_gen::Slot, Buffers) {
+        let slot = rudb_qc_gen::Slot {
+            values: 0,
+            valid: 0,
+            ty: rudb_qc_ir::Ty::I64,
+            logical: LogicalType::BigInt,
+        };
+        let mut b =
+            Buffers { values: vec![0; values.len().div_ceil(2)], valid: vec![0; values.len()] };
+        for (i, v) in values.iter().enumerate() {
+            if let Some(v) = v {
+                let (word, half) = (i / 2, (i % 2) * 64);
+                b.values[word] |= u128::from(*v as u64) << half;
+                b.valid[i] = 1;
+            }
+        }
+        (slot, b)
+    }
+
+    fn key(descending: bool, nulls_first: bool) -> Key {
+        let expr =
+            rudb_qc_plan::Expr { kind: rudb_qc_plan::Kind::Column(0), ty: LogicalType::BigInt };
+        Key { expr, descending, nulls_first }
+    }
+
+    #[test]
+    fn only_the_rows_that_can_make_a_top_n_are_picked_with_their_ties() {
+        let (slot, b) = bigints(&[Some(5), Some(-3), None, Some(9), Some(-3), Some(7), Some(0)]);
+        let (slots, buffers) = (vec![slot], vec![b]);
+        let pick = |key: Key, count| contenders(&[key], &slots, &buffers, 7, count);
+        // Ascending, the second smallest is -3 and both rows of it are kept.
+        assert_eq!(pick(key(false, false), 2), Some(vec![1, 4]));
+        assert_eq!(pick(key(false, false), 3), Some(vec![1, 4, 6]));
+        // Descending, 9 then 7, and a null first comes before both.
+        assert_eq!(pick(key(true, false), 2), Some(vec![3, 5]));
+        assert_eq!(pick(key(true, true), 2), Some(vec![2, 3]));
+        // Ascending with nulls last, every row but the null makes the first six.
+        assert_eq!(pick(key(false, false), 6), Some(vec![0, 1, 3, 4, 5, 6]));
+        // As many rows as asked for, or none asked for, leaves every row.
+        assert_eq!(pick(key(false, false), 7), None);
+        assert_eq!(pick(key(false, false), 0), None);
+    }
 
     /// The headers of a column read as codes, dereferenced back to bytes, one per row.
     fn read(held: &Held<'_>, rows: usize) -> Vec<Option<Vec<u8>>> {
