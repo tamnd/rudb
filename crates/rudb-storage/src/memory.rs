@@ -64,6 +64,7 @@
 //! which a `COUNT(DISTINCT c)` may be read straight out of, and [`MemoryTable::distinct_estimate`]
 //! is the one the estimator asks.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -134,6 +135,9 @@ pub struct MemoryTable {
     open_rows: usize,
     /// The zones of the chunks in `open` folded together, so the group's zone is built as it fills
     /// rather than in a second pass at the seal.
+    ///
+    /// The tail is folded in when it closes and not a row at a time, so a trickled row widens the
+    /// tail's zone and nothing else. [`Self::run_zone`] is the fold with the tail in it.
     open_zone: Option<Zone>,
     /// Small chunks that arrived one after another, held as one slot until they add up to a
     /// vector's worth of rows.
@@ -282,10 +286,6 @@ impl MemoryTable {
     /// The tail's zone is the zones of what went into it folded together, which is what the zone of
     /// the one chunk they are read as would have been, and the counts have already seen the rows.
     fn trail(&mut self, zone: Zone, rows: usize) -> Result<()> {
-        match &mut self.open_zone {
-            Some(open) => open.widen(&zone),
-            None => self.open_zone = Some(zone.clone()),
-        }
         if self.tail_rows == 0 {
             self.slots.push(Slot::Tail);
             self.zones.push(zone);
@@ -328,6 +328,12 @@ impl MemoryTable {
             return Ok(());
         }
         self.close_rows()?;
+        if let Some(zone) = self.zones.last() {
+            match &mut self.open_zone {
+                Some(open) => open.widen(zone),
+                None => self.open_zone = Some(zone.clone()),
+            }
+        }
         let chunk = if self.tail.len() == 1 {
             self.tail.pop().expect("one chunk")
         } else {
@@ -620,20 +626,43 @@ impl MemoryTable {
         match self.groups.get(index) {
             Some(group) => group.zone.skips(probes),
             // The open run, which is the entry `group_parts` puts after the groups.
+            // Ruled out when the open chunks and the tail each are, which is never less than the
+            // fold of the two would rule out.
             None if index == self.groups.len() => {
-                self.open_zone.as_ref().is_some_and(|zone| zone.skips(probes))
+                let open = self.open_zone.as_ref();
+                let tail = self.tail_zone();
+                (open.is_some() || tail.is_some())
+                    && open.is_none_or(|zone| zone.skips(probes))
+                    && tail.is_none_or(|zone| zone.skips(probes))
             }
             None => false,
+        }
+    }
+
+    /// The zone of the tail, when it holds rows.
+    fn tail_zone(&self) -> Option<&Zone> {
+        self.zones.last().filter(|_| self.tail_rows > 0)
+    }
+
+    /// The zone of the open run, the open chunks and the tail folded together.
+    fn run_zone(&self) -> Option<Cow<'_, Zone>> {
+        match (&self.open_zone, self.tail_zone()) {
+            (Some(open), Some(tail)) => {
+                let mut zone = open.clone();
+                zone.widen(tail);
+                Some(Cow::Owned(zone))
+            }
+            (open, tail) => open.as_ref().or(tail).map(Cow::Borrowed),
         }
     }
 
     /// The zone of group `index`, with the open run after the groups the way [`Self::group_skips`]
     /// numbers it.
     #[must_use]
-    pub fn group_zone(&self, index: usize) -> Option<&Zone> {
+    pub fn group_zone(&self, index: usize) -> Option<Cow<'_, Zone>> {
         match self.groups.get(index) {
-            Some(group) => Some(&group.zone),
-            None if index == self.groups.len() => self.open_zone.as_ref(),
+            Some(group) => Some(Cow::Borrowed(&group.zone)),
+            None if index == self.groups.len() => self.run_zone(),
             None => None,
         }
     }
@@ -1019,14 +1048,10 @@ impl MemoryTable {
     fn push_row(&mut self, row: &[Value]) -> Result<()> {
         // A row of plain values has its zone and counts worked out from the values, which is what
         // the one-row chunk would have given them without the chunk.
-        // Past the tail's first row the two zones it widens are widened in place from the values.
+        // Past the tail's first row the tail's zone is widened in place from the values.
         if self.tail_rows > 0 && Zone::takes_row(row, &self.types) {
             self.build(row)?;
             self.counts.add_row(row);
-            match &mut self.open_zone {
-                Some(open) => open.widen_row(row, &self.types),
-                None => self.open_zone = Zone::of_row(row, &self.types),
-            }
             if let Some(last) = self.zones.last_mut() {
                 last.widen_row(row, &self.types);
             }
