@@ -200,6 +200,19 @@ impl Column {
         }
     }
 
+    /// Counts one value, which a null adds nothing to.
+    fn add_value(&mut self, value: &Value) {
+        if self.blind || value.is_null() {
+            return;
+        }
+        match hash_value(value) {
+            Some(hash) => {
+                Sink::of(&mut self.sketch, &mut self.tally).add(hash, 1, || value.clone())
+            }
+            None => self.blind(),
+        }
+    }
+
     /// Takes in what `later` counted over the rows that came after this column's.
     ///
     /// The column ends as it would have had it read those rows itself. The union of two bottom-k
@@ -324,6 +337,17 @@ impl Counts {
                 Ok(vector) => self.add_column(at, vector),
                 Err(_) => self.blind(at),
             }
+        }
+    }
+
+    /// Counts one row of values, each of which has to be of its column's type.
+    ///
+    /// The same as [`Self::add`] over a one-row chunk of them, because a flat column is hashed a
+    /// value at a time by the same rule [`hash_value`] states. A value that has no rule blinds its
+    /// column the way a chunk holding it would.
+    pub fn add_row(&mut self, row: &[Value]) {
+        for (column, value) in self.columns.iter_mut().zip(row) {
+            column.add_value(value);
         }
     }
 
@@ -1032,6 +1056,89 @@ mod tests {
     use crate::tally::TALLY_VALUES;
 
     /// A flat `INTEGER` vector of `values`.
+    /// Values of every type the value path answers, with the edges each one has: nulls, the ends of
+    /// the range, a NaN and both zeroes, and strings short enough to sit in the view and long enough
+    /// not to.
+    fn samples() -> Vec<(LogicalType, Vec<Value>)> {
+        let long = "a string long enough to live in the arena rather than the view".to_owned();
+        vec![
+            (LogicalType::Boolean, vec![Value::Boolean(true), Value::Boolean(false), Value::Null]),
+            (LogicalType::TinyInt, vec![Value::TinyInt(i8::MIN), Value::TinyInt(7), Value::Null]),
+            (LogicalType::SmallInt, vec![Value::SmallInt(i16::MAX), Value::SmallInt(-3)]),
+            (LogicalType::Integer, vec![Value::Integer(i32::MIN), Value::Integer(0), Value::Null]),
+            (LogicalType::BigInt, vec![Value::BigInt(i64::MAX), Value::BigInt(-1), Value::Null]),
+            (LogicalType::HugeInt, vec![Value::HugeInt(i128::MIN), Value::HugeInt(5), Value::Null]),
+            (LogicalType::UTinyInt, vec![Value::UTinyInt(u8::MAX), Value::Null]),
+            (LogicalType::USmallInt, vec![Value::USmallInt(u16::MAX), Value::USmallInt(0)]),
+            (LogicalType::UInteger, vec![Value::UInteger(u32::MAX), Value::Null]),
+            (LogicalType::UBigInt, vec![Value::UBigInt(u64::MAX), Value::UBigInt(1), Value::Null]),
+            (LogicalType::Date, vec![Value::Date(-719_162), Value::Date(19_000), Value::Null]),
+            (LogicalType::Time, vec![Value::Time(86_399_999_999), Value::Null]),
+            (LogicalType::Timestamp, vec![Value::Timestamp(1_700_000_000_000_000), Value::Null]),
+            (LogicalType::TimestampS, vec![Value::TimestampS(-5), Value::Null]),
+            (LogicalType::TimestampMs, vec![Value::TimestampMs(1_700_000_000_000), Value::Null]),
+            (LogicalType::TimestampNs, vec![Value::TimestampNs(i64::MIN), Value::Null]),
+            (LogicalType::TimestampTz, vec![Value::TimestampTz(0), Value::Null]),
+            (
+                LogicalType::Float,
+                vec![Value::Float(1.5), Value::Float(f32::NAN), Value::Float(-0.0), Value::Null],
+            ),
+            (
+                LogicalType::Double,
+                vec![
+                    Value::Double(f64::INFINITY),
+                    Value::Double(f64::NAN),
+                    Value::Double(-0.0),
+                    Value::Double(0.0),
+                    Value::Double(-2.25),
+                    Value::Null,
+                ],
+            ),
+            (
+                LogicalType::Varchar,
+                vec![
+                    Value::Varchar(String::new()),
+                    Value::Varchar("abc".into()),
+                    Value::Varchar("héllo wörld".into()),
+                    Value::Varchar(long),
+                    Value::Null,
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_row_of_values_counts_as_a_one_row_chunk_of_them() {
+        for (ty, values) in samples() {
+            // Every value a few times over, then past the tally's cap so the sketch takes over.
+            let mut rows: Vec<Value> =
+                values.iter().cycle().take(values.len() * 3).cloned().collect();
+            if ty == LogicalType::BigInt {
+                rows.extend(
+                    (0..i64::try_from(TALLY_VALUES).expect("small") + 50).map(Value::BigInt),
+                );
+            }
+            if ty == LogicalType::Varchar {
+                rows.extend((0..TALLY_VALUES + 50).map(|n| Value::Varchar(format!("v{n}"))));
+            }
+            let mut by_value = Counts::new(1);
+            let mut by_chunk = Counts::new(1);
+            for value in &rows {
+                by_value.add_row(std::slice::from_ref(value));
+                let vector =
+                    Vector::from_values(ty.clone(), std::slice::from_ref(value)).expect("a column");
+                by_chunk.add(&Chunk::new(vec![vector]).expect("a chunk"));
+            }
+            assert_eq!(by_value.distinct(0), by_chunk.distinct(0), "{ty}");
+            // Printed, because a NaN is not equal to itself and the two lists both hold one.
+            let frequencies = |counts: &Counts| format!("{:?}", counts.frequencies(0));
+            assert_eq!(frequencies(&by_value), frequencies(&by_chunk), "{ty}");
+            let extremes = |counts: &Counts| format!("{:?}", counts.extremes(0));
+            assert_eq!(extremes(&by_value), extremes(&by_chunk), "{ty}");
+            assert_eq!(by_value.exact(0), by_chunk.exact(0), "{ty}");
+        }
+    }
+
     fn flat(values: &[i32]) -> Vector {
         let held: Vec<Value> = values.iter().map(|n| Value::Integer(*n)).collect();
         Vector::from_values(LogicalType::Integer, &held).expect("a column")
