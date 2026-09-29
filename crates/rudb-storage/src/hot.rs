@@ -889,7 +889,7 @@ mod tests {
 
     use super::{FIRST_LEASE, HotStripe, LARGEST_LEASE, Lease, PART_ROWS, PART_WORDS, Width};
     use crate::arena::Space;
-    use crate::deletes::{Refusal, STRIPE_ROWS};
+    use crate::deletes::{Refusal, STRIPE_ROWS, Write};
     use crate::undo::UndoBuffer;
 
     /// A committed row of `values` at a fresh slot, inserted by transaction 1 at timestamp 1.
@@ -1027,6 +1027,46 @@ mod tests {
         assert_eq!(as_of(&stripe, slot, 3, 0)[0], Some(1));
         stripe.delete(slot, 9, 6, &mut buffer).expect("delete");
         assert_eq!(stripe.update(slot, &[(0, Some(1))], 9, 6, &mut buffer), Err(Refusal::Gone));
+    }
+
+    /// The four cases of `engine-v4/18-compat.md` section 18.8. The pin lets an update and a
+    /// delete of one row both commit and loses the update, and rudb refuses whichever came second,
+    /// because the two take the same row lock.
+    #[test]
+    fn an_update_and_a_delete_of_one_row_conflict_either_way_round() {
+        use Write::{Delete, Update};
+        let write =
+            |stripe: &HotStripe, slot, kind, snapshot, txn, buffer: &mut UndoBuffer| match kind {
+                Update => stripe.update(slot, &[(0, Some(9))], snapshot, txn, buffer),
+                Delete => stripe.delete(slot, snapshot, txn, buffer),
+            };
+        for (first, second) in
+            [(Update, Update), (Delete, Delete), (Update, Delete), (Delete, Update)]
+        {
+            let case = format!("{first:?} then {second:?}");
+            let stripe = stripe();
+            let mut buffer = UndoBuffer::default();
+            let slot = row(&stripe, &[Some(1), Some(2), Some(3), Some(4), Some(5)]);
+            write(&stripe, slot, first, 1, 2, &mut buffer).expect("the first writer");
+            let held = write(&stripe, slot, second, 1, 3, &mut buffer);
+            assert_eq!(held, Err(Refusal::Conflict), "{case}, while the first holds the row");
+            stripe.commit_write(slot, 2, 4);
+            let after = write(&stripe, slot, second, 1, 3, &mut buffer);
+            assert_eq!(after, Err(Refusal::Conflict), "{case}, committed after its snapshot");
+            let later = write(&stripe, slot, second, 4, 5, &mut buffer);
+            let expected = if first == Delete { Err(Refusal::Gone) } else { Ok(()) };
+            assert_eq!(later, expected, "{case}, from a snapshot that sees the first");
+            assert_eq!(
+                as_of(&stripe, slot, 4, 0)[0],
+                Some(if first == Update { 9 } else { 1 }),
+                "{case}: the first write is what the row holds"
+            );
+        }
+        assert_eq!(Update.conflict().to_string(), "TransactionContext Error: Conflict on update!");
+        assert_eq!(
+            Delete.conflict().to_string(),
+            "TransactionContext Error: Conflict on tuple deletion!"
+        );
     }
 
     #[test]
