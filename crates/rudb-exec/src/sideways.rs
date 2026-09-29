@@ -76,7 +76,8 @@ use rudb_graph::{Adjacency, KeyMap, Link, PART_ROWS, Pushed, Rids};
 use rudb_metrics::Reduced;
 use rudb_plan::{BuildSide, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 use rudb_storage::{Blocked, Range};
-use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
+use rudb_vector::members::Members;
+use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
 use crate::expr::evaluate_all_in_time_zone;
 use crate::lookup::has_nulls;
@@ -344,32 +345,18 @@ impl Domain {
         // wrapping subtraction [`Self::bit`] is written for, and a range short enough that a key
         // the other side of the wrap cannot land back inside it.
         let armed = i64::try_from(self.base).ok().filter(|_| self.range < 1 << 62);
-        if let Some(base) = armed.filter(|_| keys.none_null()) {
-            // A packed key is tested on its code, with the frame's base folded into the domain's,
-            // because a code is the value less the frame's base and an offset is the value less the
-            // domain's, so the two differ by a constant worked out once a chunk. That leaves the
-            // widening out: no `i64` per row is written down and read back to test a bit with.
-            if let Some(packed) = keys.packed_parts()
-                && let Ok(frame) = i64::try_from(packed.base())
-            {
-                let shift = frame.wrapping_sub(base) as u64;
-                let mut codes = [0_u64; 64];
-                return marked(rows, |from, to| {
-                    let block = &mut codes[..to - from];
-                    packed.unpack(from, block);
-                    block.iter().enumerate().fold(0, |word, (bit, &code)| {
-                        word | u64::from(self.bit(code.wrapping_add(shift))) << bit
-                    })
-                });
-            }
-            // A key already laid out as integers is read where it lies, which for a `BIGINT` column
-            // is the difference between a pass over the chunk and a copy of it followed by one.
-            if let Some(kept) = self.over_flat(keys, rows, base) {
-                return kept;
-            }
+        // A flat or packed column keeps its nulls in its mask and nowhere else, so the faster forms
+        // can test every row as if none were null and clear the null ones a word at a time after.
+        // Asking a row at a time was a call a row, and on the nullable links of `cast_info` and
+        // `movie_info` it was most of the cost of the test.
+        let none_null = keys.none_null();
+        let masked = none_null || keys.data().is_some() || keys.packed_parts().is_some();
+        if let Some(base) = armed.filter(|_| masked)
+            && let Some(kept) = self.unmasked(keys, rows, base)
+        {
+            return if none_null { kept } else { kept.masked(keys.validity()) };
         }
         if keys.signed_block(block) && block.len() >= rows {
-            let none_null = keys.none_null();
             let widened = &block[..rows];
             return marked(rows, |from, to| {
                 widened[from..to].iter().enumerate().fold(0, |word, (bit, &key)| {
@@ -384,6 +371,31 @@ impl Domain {
                 word | u64::from(key.is_some_and(|key| self.holds(key))) << (row - from)
             })
         })
+    }
+
+    /// The two faster forms of [`Self::kept`], which read every row as if it held a key, and `None`
+    /// on a column in neither form.
+    fn unmasked(&self, keys: &Vector, rows: usize, base: i64) -> Option<Kept> {
+        // A packed key is tested on its code, with the frame's base folded into the domain's,
+        // because a code is the value less the frame's base and an offset is the value less the
+        // domain's, so the two differ by a constant worked out once a chunk. That leaves the
+        // widening out: no `i64` per row is written down and read back to test a bit with.
+        if let Some(packed) = keys.packed_parts()
+            && let Ok(frame) = i64::try_from(packed.base())
+        {
+            let shift = frame.wrapping_sub(base) as u64;
+            let mut codes = [0_u64; 64];
+            return Some(marked(rows, |from, to| {
+                let block = &mut codes[..to - from];
+                packed.unpack(from, block);
+                block.iter().enumerate().fold(0, |word, (bit, &code)| {
+                    word | u64::from(self.bit(code.wrapping_add(shift))) << bit
+                })
+            }));
+        }
+        // A key already laid out as integers is read where it lies, which for a `BIGINT` column is
+        // the difference between a pass over the chunk and a copy of it followed by one.
+        self.over_flat(keys, rows, base)
     }
 
     /// [`Self::kept`] over a key column that is already integers of some width, and `None` for one
@@ -403,7 +415,14 @@ impl Domain {
         match keys.data()? {
             Data::Int8(values) => flat!(values),
             Data::Int16(values) => flat!(values),
-            Data::Int32(values) => flat!(values),
+            // The common key, tested eight at a time. See [`Members`].
+            Data::Int32(values) => match Members::new(&self.words, base) {
+                Some(members) => {
+                    let values = values.as_slice().get(..rows)?;
+                    Some(marked(rows, |from, to| members.word(&values[from..to])))
+                }
+                None => flat!(values),
+            },
             Data::Int64(values) => {
                 let values = values.as_slice().get(..rows)?;
                 Some(marked(rows, |from, to| {
@@ -431,6 +450,23 @@ pub(crate) struct Kept {
 }
 
 impl Kept {
+    /// These bits with every row `validity` holds null cleared, for a key column whose nulls are
+    /// all in its mask.
+    fn masked(mut self, validity: &Validity) -> Self {
+        match validity {
+            Validity::AllValid => return self,
+            Validity::AllInvalid => self.bits.fill(0),
+            Validity::Mask(mask) => {
+                let words = mask.words();
+                for (at, bits) in self.bits.iter_mut().enumerate() {
+                    *bits &= words.get(at).copied().unwrap_or(0);
+                }
+            }
+        }
+        self.count = self.bits.iter().map(|bits| bits.count_ones() as usize).sum();
+        self
+    }
+
     /// How many rows were kept.
     pub(crate) fn count(&self) -> usize {
         self.count
@@ -1645,7 +1681,7 @@ mod tests {
     use rudb_common::{Field, LogicalType, SessionTimeZone, Value};
     use rudb_plan::{ColumnBinding, Expr, ExprRef, Plan};
     use rudb_storage::Blocked;
-    use rudb_vector::{Chunk, Vector};
+    use rudb_vector::{Chunk, Validity, Vector};
 
     use rudb_graph::{Adjacency, KeyMap, Link};
 
@@ -1832,11 +1868,11 @@ mod tests {
         assert_eq!(domain.kept(&whole, whole.len(), &mut Vec::new()).indices(), [0, 2]);
     }
 
-    /// The three forms of [`super::Domain::kept`] answer the same rows: a column of integers read
-    /// where it lies, a packed column read on its codes with the frame's base folded in, and the
-    /// widening form a column with nulls in it still takes. Two hundred rows so that the run past
-    /// the last whole word of sixty four is one of the cases, and a frame base each side of the
-    /// domain's so that the folded shift is tested both ways round.
+    /// The forms of [`super::Domain::kept`] answer the same rows: a column of integers read where it
+    /// lies, a packed column read on its codes with the frame's base folded in, either of those
+    /// with nulls in its mask, and the widening form a dictionary takes. Two hundred rows so that
+    /// the run past the last whole word of sixty four is one of the cases, and a frame base each
+    /// side of the domain's so that the folded shift is tested both ways round.
     #[test]
     fn a_bitmap_reads_flat_keys_packed_keys_and_widened_keys_alike() {
         let mut plan = Plan::new();
@@ -1862,7 +1898,15 @@ mod tests {
         assert_eq!(held(&over), [13, 100], "a hundred and sixty three and two hundred and fifty");
         let mut nulls: Vec<Option<i32>> = rows.iter().map(|&row| Some(row as i32)).collect();
         nulls[163] = None;
-        assert_eq!(held(&column(&nulls)), [100], "the widening form, where a null is not a key");
+        let flat = column(&nulls);
+        assert!(!flat.none_null() && flat.data().is_some(), "the flat form with a null");
+        assert_eq!(held(&flat), [100], "a null is not a key");
+        let masked = packed_keys(&rows, 8, 0)
+            .with_validity(Validity::from_iter(200, |row| row != 100 && row != 199));
+        assert_eq!(held(&masked), [163], "the packed form with nulls in its mask");
+        let widened = Vector::dictionary((0..200).collect(), flat).expect("a dictionary");
+        assert!(widened.data().is_none() && widened.packed_parts().is_none());
+        assert_eq!(held(&widened), [100], "a dictionary, which is read a key at a time");
     }
 
     /// A column of those values packed at that width over that base, which is the form the native
