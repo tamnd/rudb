@@ -1768,13 +1768,52 @@ fn persist(
     persist_anchored(path, catalog, pages, database, None)
 }
 
+/// Whether a schema change is one a Ddl record carries, which replay runs again from its text.
+///
+/// A table created without rows, a view, and a drop of either, all in the file's own database. The
+/// text has to name at replay what it named when it ran, so a search path that was set, which
+/// replay does not have, keeps a change off the log, and so does anything a table's rows would
+/// have to come with.
+fn replayable(bound: &Bound, catalog: &Catalog) -> bool {
+    let home = |name: &QualifiedName| name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG);
+    catalog.search_path().is_empty()
+        && match bound {
+            Bound::CreateTable(create) => create.source.is_none() && home(&create.name),
+            Bound::CreateView(create) => home(&create.name),
+            Bound::DropTable(drop) => drop.names.iter().all(home),
+            _ => false,
+        }
+}
+
+/// Runs a schema change a Ddl record carried against `catalog`, through a database in memory that
+/// borrows the catalog for the statement. `runner` is that database, made at the first one.
+fn replay_statement(runner: &mut Option<Database>, catalog: &mut Catalog, sql: &str) -> Result<()> {
+    let runner = match runner {
+        Some(runner) => runner,
+        None => runner.insert(Database::with_config(Config::default().with_threads(1)?)),
+    };
+    std::mem::swap(&mut *runner.shared.write(), catalog);
+    let ran = runner.execute(sql);
+    std::mem::swap(&mut *runner.shared.write(), catalog);
+    ran.map(drop)
+}
+
 /// Puts what the log committed after the file's last checkpoint back into the tables, in order.
 ///
 /// Appends go straight in. A table an update or a delete touches is read into memory once, takes
-/// that change and every one after it there, and is replaced at the end.
+/// that change and every one after it there, and is replaced at the end, or before the next
+/// schema change, which runs against the catalog as the changes before it left it.
 fn replay_changes(catalog: &mut Catalog, changes: Vec<Replayed>) -> Result<()> {
     let mut held: Vec<(QualifiedName, Vec<Chunk>)> = Vec::new();
+    let mut runner = None;
     for replayed in changes {
+        if let Some(sql) = replayed.statement()? {
+            for (name, chunks) in held.drain(..) {
+                catalog.table_mut(&name)?.replace_all(chunks, 1)?;
+            }
+            replay_statement(&mut runner, catalog, &sql)?;
+            continue;
+        }
         let name = QualifiedName {
             catalog: DEFAULT_CATALOG.to_string(),
             schema: replayed.schema.clone(),
@@ -3134,6 +3173,20 @@ impl Shared {
         journal.stage(payload);
     }
 
+    /// Stages the schema change `sql` that just went in as a Ddl record, when `ddl` says it is one
+    /// replay can run again. A drop of a name that was not there under `IF EXISTS` is staged too,
+    /// and replay finds it not there again.
+    fn stage_ddl(&self, ddl: bool, sql: &str) {
+        if !ddl {
+            return;
+        }
+        let mut journal = self.journal();
+        if let Some(journal) = journal.as_mut() {
+            let record = journal.encode_ddl(sql);
+            journal.stage(record);
+        }
+    }
+
     /// Runs a prepared one row `INSERT` without binding it, or says it cannot and leaves everything
     /// as it was, for [`Shared::execute_ast`] to run.
     ///
@@ -3875,9 +3928,12 @@ impl Shared {
                 catalog.default_catalog()
             )));
         }
-        // A plain append, an update and a delete have log records, staged once the rows are in.
+        // A plain append, an update and a delete have log records, staged once the rows are in,
+        // and so does a schema change replay can run again from its text, staged once it is done.
         // Every other change checkpoints when it commits.
-        let logged = matches!(&bound, Bound::Insert(insert)
+        let ddl = parameters.is_empty() && replayable(&bound, &catalog);
+        let logged = ddl
+            || matches!(&bound, Bound::Insert(insert)
             if insert.conflict.is_none()
                 && (insert.write == Write::Append
                     || insert.name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)));
@@ -4088,10 +4144,12 @@ impl Shared {
                     &seams,
                     &session,
                 )?;
+                self.stage_ddl(ddl, sql);
                 Ok(QueryResult::empty())
             }
             Bound::CreateView(create) => {
                 create_view(create, &mut catalog)?;
+                self.stage_ddl(ddl, sql);
                 Ok(QueryResult::empty())
             }
             Bound::DropTable(drop) => {
@@ -4101,6 +4159,7 @@ impl Shared {
                         Entry::View => catalog.drop_view(name)?,
                     }
                 }
+                self.stage_ddl(ddl, sql);
                 Ok(QueryResult::empty())
             }
             Bound::Schema(change) => {

@@ -134,6 +134,51 @@ fn an_update_or_a_delete_is_logged_and_replayed() {
 }
 
 #[test]
+fn a_table_or_a_view_made_or_dropped_is_logged_and_replayed_in_its_place() {
+    let path = path("ddl");
+    let db = open(&path);
+    db.execute("CREATE TABLE t (id INTEGER)").expect("creates");
+    db.execute("INSERT INTO t VALUES (1)").expect("inserts");
+    db.execute("INSERT INTO t VALUES (2)").expect("inserts");
+    let file = std::fs::read(&path).expect("the file");
+    db.execute("CREATE TABLE u (name VARCHAR, n BIGINT)").expect("creates");
+    assert_eq!(std::fs::read(&path).expect("the file"), file, "the create went to the log");
+    db.execute("INSERT INTO u VALUES ('a', 1), ('b', 2)").expect("inserts");
+    db.execute("CREATE VIEW v AS SELECT id * 10 AS x FROM t").expect("makes the view");
+    db.execute("CREATE TABLE gone (x INTEGER)").expect("creates");
+    db.execute("INSERT INTO gone VALUES (5)").expect("inserts");
+    db.execute("DROP TABLE gone").expect("drops");
+    db.execute("CREATE TABLE gone (y VARCHAR)").expect("creates it again, differently");
+    db.execute("INSERT INTO gone VALUES ('again')").expect("inserts");
+    db.execute("BEGIN").expect("begins");
+    db.execute("CREATE TABLE never (x INTEGER)").expect("creates");
+    db.execute("ROLLBACK").expect("rolls back");
+    assert_eq!(std::fs::read(&path).expect("the file"), file, "nothing was checkpointed");
+    crash(db);
+
+    let db = open(&path);
+    assert_eq!(
+        rows(&db, "SELECT id FROM t ORDER BY id"),
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT name, n FROM u ORDER BY n"),
+        vec![
+            vec![Value::Varchar("a".into()), Value::BigInt(1)],
+            vec![Value::Varchar("b".into()), Value::BigInt(2)],
+        ]
+    );
+    assert_eq!(
+        rows(&db, "SELECT x FROM v ORDER BY x"),
+        vec![vec![Value::Integer(10)], vec![Value::Integer(20)]]
+    );
+    assert_eq!(rows(&db, "SELECT * FROM gone"), vec![vec![Value::Varchar("again".into())]]);
+    assert!(db.query("SELECT * FROM never").is_err(), "a rolled back create is not replayed");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn rows_appended_through_the_api_are_logged_too() {
     let path = path("api");
     let db = open(&path);
