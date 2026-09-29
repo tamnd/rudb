@@ -262,7 +262,10 @@ pub enum AccOp {
     /// The greatest string, kept by `agg_max_str`.
     MaxStr,
     /// A count of distinct values kept in the distinct sets behind the handle. No bytes in the row.
-    Distinct(u64),
+    /// For a number that fits in 64 bits, the state offset of two words the body appends each
+    /// value and its group through: where the next pair goes and where the room ends. The runtime
+    /// gives it room with `agg_distinct_room` and the driver takes in what is left after a chunk.
+    Distinct(u64, Option<u32>),
 }
 
 /// Generates a function for every pipeline of the graph.
@@ -824,6 +827,17 @@ impl Gen<'_> {
                     self.field(state, slots * 8, "dense");
                     (Some(state), state + slots * 8)
                 };
+                let mut state = state;
+                for acc in &mut accs {
+                    if let AccOp::Distinct(_, words) = &mut acc.op
+                        && appends(&acc.arg)?
+                        && !self.rt.ablate().off(Ablate::PAIRS)
+                    {
+                        self.field(state, 16, "pairs");
+                        *words = Some(state);
+                        state += 16;
+                    }
+                }
                 let grouping = Grouping { table, keys, acc_offset, accs, row, last, probe, dense };
                 Ok((Out::Aggregate(grouping), state))
             }
@@ -842,7 +856,7 @@ impl Gen<'_> {
                 if argty.is_float() {
                     return Err(refuse());
                 }
-                AccOp::Distinct(self.once(|g| g.rt.add_distinct())?)
+                AccOp::Distinct(self.once(|g| g.rt.add_distinct())?, None)
             }
             ("count", false) => AccOp::Count,
             ("sum", _) if argty.is_int() && qir_type(&a.ty)? == Ty::I128 && !unsigned(&arg) => {
@@ -2231,7 +2245,32 @@ impl Gen<'_> {
                     Ok(())
                 })?;
             }
-            AccOp::Distinct(h) => {
+            AccOp::Distinct(h, Some(at)) => {
+                self.when(take, |g| {
+                    let st = g.b.st();
+                    let x = g.widen(v, &acc.arg, Ty::I64);
+                    let cur = g.b.load(Ty::I64, st, Val::NONE, 1, at as i32, 0);
+                    let end = g.b.load(Ty::I64, st, Val::NONE, 1, at as i32 + 8, 0);
+                    let full = g.b.bin(Op::IcmpEq, cur, end);
+                    let (room, append) = (g.b.block(&[]), g.b.block(&[]));
+                    g.b.set_cold(room);
+                    g.b.brif(full, room, &[], append, &[]);
+                    g.b.switch_to(room);
+                    let set = g.handle(h);
+                    let words = g.offset(st, at);
+                    g.b.rtcall(proxy_id("agg_distinct_room"), &[set, words]);
+                    g.b.br(append, &[]);
+                    g.b.switch_to(append);
+                    let cur = g.b.load(Ty::Ptr, st, Val::NONE, 1, at as i32, 0);
+                    let gid = g.b.load(Ty::I64, row, Val::NONE, 1, 0, 0);
+                    g.b.store(cur, Val::NONE, 1, 0, x, 0);
+                    g.b.store(cur, Val::NONE, 1, 8, gid, 0);
+                    let next = g.offset(cur, 16);
+                    g.b.store(st, Val::NONE, 1, at as i32, next, 0);
+                    Ok(())
+                })?;
+            }
+            AccOp::Distinct(h, None) => {
                 let ty = self.b.ty(v);
                 self.when(take, |g| {
                     let set = g.handle(h);
@@ -2289,8 +2328,15 @@ fn acc_size(acc: &Acc) -> Result<u32> {
         AccOp::SumNarrow | AccOp::AvgNarrow | AccOp::SumFloat | AccOp::AvgFloat => 16,
         AccOp::Min | AccOp::Max | AccOp::AnyValue => (w + 1).next_multiple_of(8),
         AccOp::MinStr | AccOp::MaxStr => 24,
-        AccOp::Distinct(_) => 0,
+        AccOp::Distinct(..) => 0,
     })
+}
+
+/// Whether a `COUNT(DISTINCT)` of `arg` appends its values as numbers that fit in 64 bits, which
+/// every signed number up to that wide and every unsigned one narrower does.
+fn appends(arg: &LogicalType) -> Result<bool> {
+    let ty = qir_type(arg)?;
+    Ok(ty.is_int() && (ty.bytes() < 8 || (ty.bytes() == 8 && !unsigned(arg))))
 }
 
 mod vcall;

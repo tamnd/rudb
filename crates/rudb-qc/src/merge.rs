@@ -96,7 +96,7 @@ pub(crate) fn folds(g: &Grouping) -> Result<Vec<Fold>> {
             }
             AccOp::MinStr => How::Text { least: true },
             AccOp::MaxStr => How::Text { least: false },
-            AccOp::Distinct(_) => How::Outside,
+            AccOp::Distinct(..) => How::Outside,
         };
         folds.push(Fold { at: (g.acc_offset + acc.offset) as usize, how });
     }
@@ -108,7 +108,7 @@ pub(crate) fn sets(g: &Grouping) -> Vec<u64> {
     g.accs
         .iter()
         .filter_map(|acc| match acc.op {
-            AccOp::Distinct(h) => Some(h),
+            AccOp::Distinct(h, _) => Some(h),
             _ => None,
         })
         .collect()

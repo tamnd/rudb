@@ -884,7 +884,13 @@ pub struct Distinct {
     texts: Pairs,
     arena: Vec<u8>,
     counts: Vec<u64>,
+    /// Where compiled code appends pairs of a number and a group for [`Distinct::room`] to take
+    /// in, so that it calls once for many rows instead of once a row.
+    appended: Vec<[u64; 2]>,
 }
+
+/// How many pairs compiled code appends before it calls [`Distinct::room`] again.
+const APPENDED: usize = 1 << 10;
 
 /// One table of pairs. A slot is empty at zero, and otherwise holds the top half of the hash and
 /// one more than the entry's index.
@@ -1201,12 +1207,7 @@ impl Distinct {
     pub fn add_int(&mut self, gid: usize, v: u128) {
         let gid = gid as u64;
         if let Some(x) = narrow(v) {
-            let hash = narrow_hash(gid, x);
-            if let Some(spill) = &mut self.spill {
-                spill.add(gid, x, hash);
-            } else if self.narrow.add(gid, x, hash) {
-                self.counted(gid);
-            }
+            self.add_narrow(gid, x);
             return;
         }
         self.ints.reserve();
@@ -1215,6 +1216,46 @@ impl Distinct {
             self.ints.put(at, Pair { gid, value: v, hash });
             self.counted(gid);
         }
+    }
+
+    fn add_narrow(&mut self, gid: u64, x: u64) {
+        let hash = narrow_hash(gid, x);
+        if let Some(spill) = &mut self.spill {
+            spill.add(gid, x, hash);
+        } else if self.narrow.add(gid, x, hash) {
+            self.counted(gid);
+        }
+    }
+
+    /// Takes in the pairs compiled code appended, and gives it room for more. `words` are where
+    /// it appends the next pair and where the room ends, both zero before the first call. A pair
+    /// is a number sign extended to 64 bits and then its group.
+    pub fn room(&mut self, words: &mut [u64; 2]) {
+        self.settle(words);
+        if self.appended.is_empty() {
+            self.appended = vec![[0; 2]; APPENDED];
+        }
+        let start = self.appended.as_ptr() as u64;
+        *words = [start, start + (APPENDED * 16) as u64];
+    }
+
+    /// Takes in the pairs compiled code appended up to where `words` says, and moves that back
+    /// to the start. Words that are not this set's are left as they are.
+    pub fn settle(&mut self, words: &mut [u64; 2]) {
+        let start = self.appended.as_ptr() as u64;
+        if self.appended.is_empty()
+            || words[0] < start
+            || words[1] != start + (APPENDED * 16) as u64
+        {
+            return;
+        }
+        let n = ((words[0] - start) / 16).min(APPENDED as u64) as usize;
+        let appended = std::mem::take(&mut self.appended);
+        for &[x, gid] in &appended[..n] {
+            self.add_narrow(gid, x);
+        }
+        self.appended = appended;
+        words[0] = start;
     }
 
     /// Adds a string to the set of group `gid`.
@@ -1681,5 +1722,31 @@ mod tests {
         let want: Vec<u64> =
             (0..3).map(|g| want.iter().filter(|&&(gid, _)| gid == g).count() as u64).collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn appended_pairs_count_once_taken_in() {
+        let mut set = Distinct::new();
+        let mut words = [0u64; 2];
+        // Appends the way compiled code does, asking for room when there is none.
+        let append = |set: &mut Distinct, words: &mut [u64; 2], gid: u64, v: i64| {
+            if words[0] == words[1] {
+                set.room(words);
+            }
+            let at = ((words[0] - set.appended.as_ptr() as u64) / 16) as usize;
+            set.appended[at] = [v as u64, gid];
+            words[0] += 16;
+        };
+        for i in 0..APPENDED as i64 * 3 + 5 {
+            append(&mut set, &mut words, (i % 2) as u64, i % 100 - 50);
+        }
+        let mut other = [0u64; 2];
+        set.settle(&mut other);
+        assert_eq!(other, [0; 2], "words that are not the set's are left alone");
+        set.settle(&mut words);
+        assert_eq!(words[0], set.appended.as_ptr() as u64);
+        assert_eq!((set.count(0), set.count(1)), (50, 50));
+        set.settle(&mut words);
+        assert_eq!((set.count(0), set.count(1)), (50, 50));
     }
 }
