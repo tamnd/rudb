@@ -422,6 +422,106 @@ impl Rows {
         Ok(Some((dictionary, rows)))
     }
 
+    /// The least `wanted` values of a text column held in a table wide dictionary that `keep`
+    /// passes, one for each row that holds it, in ascending order.
+    ///
+    /// The dictionary is asked first, so the only values looked for in the rows are the `wanted`
+    /// least of it, and every part is then read for its codes alone, without a string. Any row
+    /// holding another value holds a greater one, so those rows are the answer when there are
+    /// enough of them. `None` when the table is not a file, a part is not written against the one
+    /// dictionary, or fewer than `wanted` rows hold the values found.
+    ///
+    /// # Errors
+    ///
+    /// If the dictionary or a part cannot be read.
+    pub fn least_coded(
+        &self,
+        column: usize,
+        wanted: usize,
+        keep: &(dyn Fn(&str) -> bool + Sync),
+    ) -> Result<Option<Vec<String>>> {
+        const NONE: u16 = u16::MAX;
+        let Self::Native(reader) = self else { return Ok(None) };
+        if wanted == 0 || wanted >= usize::from(NONE) {
+            return Ok(None);
+        }
+        let Some(dictionary) = reader.global_dictionary(column)? else { return Ok(None) };
+        let mut least = std::collections::BinaryHeap::<(&str, u32)>::with_capacity(wanted + 1);
+        for code in 0..dictionary.len() {
+            let Some(text) = dictionary.try_text_at(code)? else { continue };
+            if least.len() == wanted && least.peek().is_some_and(|&(most, _)| text >= most) {
+                continue;
+            }
+            if !keep(text) {
+                continue;
+            }
+            least.push((text, u32::try_from(code).map_err(|_| Error::internal("a code is wide"))?));
+            if least.len() > wanted {
+                least.pop();
+            }
+        }
+        let least = least.into_sorted_vec();
+        let mut slots = vec![NONE; dictionary.len()];
+        for (slot, &(_, code)) in least.iter().enumerate() {
+            slots[code as usize] = slot as u16;
+        }
+        let parts = reader.parts();
+        let workers =
+            std::thread::available_parallelism().map_or(1, usize::from).min(8).min(parts).max(1);
+        let each = parts.div_ceil(workers);
+        let (slots, dictionary, held) = (&slots, &dictionary, least.len());
+        let found = std::thread::scope(|scope| {
+            let handles = (0..workers)
+                .map(|worker| {
+                    let parts = worker * each..((worker + 1) * each).min(parts);
+                    scope.spawn(move || -> Result<Option<Vec<u64>>> {
+                        let mut counts = vec![0_u64; held];
+                        for part in parts {
+                            let read = reader.read(part, &[column])?;
+                            let vector = read.column(0)?;
+                            let Some((codes, values)) = vector.stable_dictionary_parts() else {
+                                return Ok(None);
+                            };
+                            if !Arc::ptr_eq(values, dictionary) {
+                                return Ok(None);
+                            }
+                            for (row, &code) in codes.iter().enumerate() {
+                                let slot = slots.get(code as usize).copied().unwrap_or(NONE);
+                                if slot != NONE && !vector.is_null_at(row) {
+                                    counts[usize::from(slot)] += 1;
+                                }
+                            }
+                        }
+                        Ok(Some(counts))
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| Error::internal("a least value worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let mut counts = vec![0_u64; held];
+        for found in found {
+            let Some(found) = found else { return Ok(None) };
+            for (total, count) in counts.iter_mut().zip(found) {
+                *total += count;
+            }
+        }
+        let mut values = Vec::with_capacity(wanted);
+        for (&(text, _), count) in least.iter().zip(counts) {
+            for _ in 0..count.min((wanted - values.len()) as u64) {
+                values.push(text.to_owned());
+            }
+            if values.len() == wanted {
+                return Ok(Some(values));
+            }
+        }
+        Ok(None)
+    }
+
     /// Every value of `group` with its rows, how many distinct values of `counted` it holds, and a
     /// fold of each of the signed integer columns in `folded`, or `None` when the file carries no
     /// value codes for `counted` or `group` is not a narrow signed integer. See

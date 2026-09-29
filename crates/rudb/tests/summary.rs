@@ -853,3 +853,27 @@ fn a_top_count_by_several_keys_is_counted_over_the_rows_of_the_heaviest_values()
     let wide = "SELECT u, m, COUNT(*) AS c FROM t GROUP BY u, m ORDER BY c DESC LIMIT 1000";
     assert!(!pair.answered(&pair.file, wide, "native heavy counts"));
 }
+
+/// ClickBench 26 wants the ten least search phrases that are not empty, one per row. They are the
+/// ten least of the dictionary, or fewer when one of them is held by several rows, so the rows are
+/// read for their codes alone and no string is compared but the dictionary's own.
+#[test]
+fn the_least_values_of_a_coded_column_are_read_out_of_its_dictionary() {
+    let rows = "SELECT CASE WHEN i % 3 = 0 THEN '' WHEN i % 11 = 0 THEN NULL \
+         ELSE 'p' || (i % 5003) END AS s, i FROM range(100000) t(i)";
+    let pair = Pair::new("leastphrases", rows);
+    let query = "SELECT s FROM t WHERE s <> '' ORDER BY s LIMIT 10";
+    let found = pair.listing(query);
+    assert_eq!(found.len(), 10, "the limit is the answer's length");
+    assert!(pair.answered(&pair.file, query, "native least values"));
+    let offset = "SELECT s FROM t WHERE s <> 'p1' AND s <> '' ORDER BY s LIMIT 5 OFFSET 30";
+    assert_eq!(pair.listing(offset).len(), 5);
+    assert!(pair.answered(&pair.file, offset, "native least values"));
+    // The empty string is the least, and nulls come last whichever way the rows are read.
+    let every = "SELECT s FROM t ORDER BY s LIMIT 40";
+    assert_eq!(pair.listing(every).len(), 40);
+    // A range is not asked of the dictionary.
+    let range = "SELECT s FROM t WHERE s > 'p2' ORDER BY s LIMIT 10";
+    assert_eq!(pair.listing(range).len(), 10);
+    assert!(!pair.answered(&pair.file, range, "native least values"));
+}

@@ -924,6 +924,104 @@ fn native_any_groups(
     Ok(Some(NativePairFrequencies { entries }))
 }
 
+/// The values a filter tests one text column against, each with whether it keeps the rows equal
+/// to it, and whether the filter tests anything else as well.
+///
+/// Only `=` and `<>` of the column and a string are read, since those are settled by keeping or
+/// leaving out values of the column, and a null passes none of them.
+fn string_tests(
+    plan: &Plan,
+    predicate: Option<ExprRef>,
+    binding: ColumnBinding,
+) -> (Vec<(&Value, bool)>, bool) {
+    let mut tests = Vec::new();
+    let Some(predicate) = predicate else { return (tests, false) };
+    let conjuncts = match *plan.expr(predicate) {
+        Expr::Conjunction { op: ConjunctionOp::And, children } => plan.expr_list(children),
+        _ => std::slice::from_ref(&predicate),
+    };
+    for &conjunct in conjuncts {
+        let Expr::Compare { op, left, right } = *plan.expr(conjunct) else { continue };
+        let keeps = match op {
+            CompareOp::Equal => true,
+            CompareOp::NotEqual => false,
+            _ => continue,
+        };
+        let value = match (plan.expr(left), plan.expr(right)) {
+            (Expr::Column(held), Expr::Constant(value))
+            | (Expr::Constant(value), Expr::Column(held))
+                if *held == binding =>
+            {
+                plan.value(*value)
+            }
+            _ => continue,
+        };
+        // Only a string is compared the way the filter will compare it.
+        if !matches!(value, Value::Varchar(_)) {
+            continue;
+        }
+        tests.push((value, keeps));
+    }
+    let untested = tests.len() < conjuncts.len();
+    (tests, untested)
+}
+
+/// The rows of `ORDER BY x LIMIT n` over one text column held in a table wide dictionary, read out
+/// of the least values of its dictionary rather than by sorting the rows.
+///
+/// The filter may only be `=` and `<>` tests of the column, which are asked of the dictionary. On
+/// ClickBench 26 that is ten of a hundred thousand phrases, where the top N it replaces compared
+/// the hundred and thirty thousand rows the filter kept.
+fn native_least_values(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    keys: Slice,
+    wanted: usize,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    let [key] = plan.sort_key_list(keys) else { return Ok(None) };
+    if key.descending || key.nulls_first {
+        return Ok(None);
+    }
+    let Expr::Column(ordered) = *plan.expr(key.expr) else { return Ok(None) };
+    let Node::Project { input, index, exprs, .. } = *plan.node(input) else { return Ok(None) };
+    let [projected] = plan.expr_list(exprs) else { return Ok(None) };
+    let Expr::Column(binding) = *plan.expr(*projected) else { return Ok(None) };
+    if ordered.table != index || ordered.column != 0 {
+        return Ok(None);
+    }
+    let (source, predicate) = match *plan.node(input) {
+        Node::Filter { input, predicate } => (input, Some(predicate)),
+        _ => (input, None),
+    };
+    let Some((table, get, columns)) = whole_table(plan, catalog, source)? else {
+        return Ok(None);
+    };
+    let Some(field) = plan.field_list(columns).get(binding.column as usize) else {
+        return Ok(None);
+    };
+    if binding.table != get || field.ty != LogicalType::Varchar {
+        return Ok(None);
+    }
+    let Some(column) = table.column_index(&field.name) else { return Ok(None) };
+    let (tests, untested) = string_tests(plan, predicate, binding);
+    if untested {
+        return Ok(None);
+    }
+    let tests = tests
+        .into_iter()
+        .map(|(value, keeps)| match value {
+            Value::Varchar(text) => Ok((text.as_str(), keeps)),
+            _ => Err(Error::internal("a string test holds another type")),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let keep = |text: &str| tests.iter().all(|&(against, keeps)| (text == against) == keeps);
+    let Some(values) = table.rows().least_coded(column, wanted, &keep)? else {
+        return Ok(None);
+    };
+    Ok(Some(values.into_iter().map(|text| vec![Value::Varchar(text)]).collect()))
+}
+
 /// The most rows [`native_heavy_counts`] fetches before it leaves the count to the aggregate.
 const HEAVY_ROWS: usize = 65_536;
 
@@ -1095,38 +1193,7 @@ fn native_coded_counts(
     if prefix.entries.len() != codes.entries.len() {
         return Ok(None);
     }
-    // The values the filter tests the key against, each with whether it keeps rows equal to it.
-    let mut tests = Vec::new();
-    let mut untested = false;
-    if let Some(predicate) = predicate {
-        let conjuncts = match *plan.expr(predicate) {
-            Expr::Conjunction { op: ConjunctionOp::And, children } => plan.expr_list(children),
-            _ => std::slice::from_ref(&predicate),
-        };
-        for &conjunct in conjuncts {
-            let Expr::Compare { op, left, right } = *plan.expr(conjunct) else { continue };
-            let keeps = match op {
-                CompareOp::Equal => true,
-                CompareOp::NotEqual => false,
-                _ => continue,
-            };
-            let value = match (plan.expr(left), plan.expr(right)) {
-                (Expr::Column(held), Expr::Constant(value))
-                | (Expr::Constant(value), Expr::Column(held))
-                    if *held == binding =>
-                {
-                    plan.value(*value)
-                }
-                _ => continue,
-            };
-            // Only a string is compared the way the filter will compare it.
-            if !matches!(value, Value::Varchar(_)) {
-                continue;
-            }
-            tests.push((value, keeps));
-        }
-        untested = tests.len() < conjuncts.len();
-    }
+    let (tests, untested) = string_tests(plan, predicate, binding);
     let mut bound = codes.omitted_max;
     let mut wanted = Vec::new();
     let mut held = Vec::new();
@@ -3515,6 +3582,18 @@ impl<'a> Building<'a, '_> {
                     cutoff.about(binding, op);
                 }
                 let schema = below.schema.clone();
+                if self.session.rules().enabled(Rule::StoredAnswers)
+                    && let Ok(wanted) = usize::try_from(count.saturating_add(offset))
+                    && let Some(rows) =
+                        native_least_values(plan, self.catalog, input, keys, wanted)?
+                {
+                    let skipped = usize::try_from(offset).unwrap_or(usize::MAX).min(rows.len());
+                    let rows = rows.into_iter().skip(skipped).collect();
+                    let source = Frequencies::records(schema.clone(), rows)?;
+                    let counters =
+                        self.watch(reference, id, pipeline, "TopN", Some("native least values"));
+                    return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+                }
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
                 let top = top.telling(cutoff).in_session(self.session);
                 let counters = self.watch(reference, id, pipeline, "TopN", None);
