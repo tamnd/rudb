@@ -12120,6 +12120,78 @@ fn arg_min_exports_the_row_it_kept_and_its_ordering_value() {
 }
 
 #[test]
+fn an_ordered_call_exports_the_rows_it_kept_and_sorts_them_when_finished() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let three = "(VALUES (1), (3), (2)) t(i)";
+    let two = |call: &str, left: &str, right: &str| {
+        format!(
+            "SELECT finalize(combine((SELECT {call} EXPORT_STATE FROM (VALUES {left}) t(a, b)), \
+             (SELECT {call} EXPORT_STATE FROM (VALUES {right}) t(a, b))))"
+        )
+    };
+    for (sql, answer) in [
+        (
+            format!("SELECT list(i ORDER BY i DESC) EXPORT_STATE FROM {three}"),
+            "[{'v0': 1}, {'v0': 3}, {'v0': 2}]",
+        ),
+        (
+            format!("SELECT list(i ORDER BY i % 2, i) EXPORT_STATE FROM {three}"),
+            "[{'v0': 1, 'v1': 1}, {'v0': 3, 'v1': 1}, {'v0': 2, 'v1': 0}]",
+        ),
+        (
+            format!("SELECT finalize(list(i ORDER BY i DESC) EXPORT_STATE) FROM {three}"),
+            "[3, 2, 1]",
+        ),
+        (two("list(a ORDER BY b)", "(1, 10), (2, 5)", "(3, 10), (4, 5)"), "[4, 2, 3, 1]"),
+        (two("list(a ORDER BY a)", "(1, 0), (3, 0)", "(2, 0), (4, 0)"), "[1, 2, 3, 4]"),
+        (
+            "SELECT finalize(combine_aggr(s)) FROM (SELECT string_agg(a, ' ' ORDER BY a) \
+             EXPORT_STATE s FROM (VALUES ('d'), ('b')) t(a) UNION ALL SELECT string_agg(a, ' ' \
+             ORDER BY a) EXPORT_STATE FROM (VALUES ('c'), ('a')) t(a))"
+                .to_string(),
+            "a b c d",
+        ),
+        (
+            "SELECT list(i ORDER BY i) EXPORT_STATE FROM (SELECT 1 i WHERE false)".to_string(),
+            "NULL",
+        ),
+        (
+            "SELECT sum(x ORDER BY y) EXPORT_STATE, finalize(sum(x ORDER BY y) EXPORT_STATE) \
+             FROM (VALUES (1, 2), (3, 1)) t(x, y)"
+                .to_string(),
+            "[{'v0': 1, 'v1': 2}, {'v0': 3, 'v1': 1}]|4",
+        ),
+        (
+            "SELECT first(a ORDER BY b DESC) EXPORT_STATE, finalize(first(a ORDER BY b DESC) \
+             EXPORT_STATE) FROM (VALUES (1, 10), (2, 20)) t(a, b)"
+                .to_string(),
+            "[{'v0': 1, 'v1': 10}, {'v0': 2, 'v1': 20}]|2",
+        ),
+        (
+            "SELECT list(x ORDER BY 1) EXPORT_STATE FROM (VALUES (5), (6)) t(x)".to_string(),
+            "[{'v0': 5, 'v1': 1}, {'v0': 6, 'v1': 1}]",
+        ),
+        (
+            "SELECT typeof(list(i ORDER BY i) EXPORT_STATE) FROM (VALUES (1)) t(i)".to_string(),
+            "AGGREGATE_STATE",
+        ),
+    ] {
+        assert_eq!(text(&sql), answer, "{sql}");
+    }
+    let sql =
+        two("list(a ORDER BY a)", "(1, 0)", "(2, 0)").replacen("ORDER BY a", "ORDER BY a DESC", 1);
+    let error = db.execute(&sql).expect_err(&sql);
+    assert!(error.message().contains("created with different parameters"), "{error}");
+}
+
+#[test]
 fn combine_aggr_folds_states_as_many_times_as_it_is_told() {
     let db = Database::new();
     let text = |sql: &str| {

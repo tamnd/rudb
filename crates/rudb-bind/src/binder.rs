@@ -17,7 +17,8 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Stat, Value,
+    Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Stat, StateKey,
+    Value,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -3391,27 +3392,30 @@ impl<'a> Binder<'a> {
         if resolved.name == "lttb" {
             self.lttb_points(cast[2])?;
         }
-        let mut name = self.ordered_aggregate(resolved.name, sorted, &keys, &mut cast);
+        let given = cast.len();
+        let (mut name, order) =
+            self.ordered_aggregate(resolved.name, sorted, &keys, &mut cast, exporting);
         let mut ty = resolved.returns;
         // An exported state is typed with the call it came from, so that `finalize` and `combine`
         // know what to read it back into, and the name says so, which keeps the executor's paths
         // for a plain `sum` or `count` away from a call that answers with something else.
         if exporting {
-            if !sorted.is_empty() {
-                return Err(Error::not_implemented(format!(
-                    "exporting the state of an ordered {} aggregate",
-                    resolved.name
-                )));
-            }
-            let arguments: Vec<LogicalType> =
+            let mut columns: Vec<LogicalType> =
                 cast.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
-            let layout = rudb_kernels::state_layout(resolved.name, &arguments, &ty)?;
+            let arguments = columns[..given].to_vec();
+            // An ordered call keeps its rows until the end whatever the aggregate is, so its state
+            // is those rows, though the aggregate still has to be one that has a state at all.
+            let mut layout = rudb_kernels::state_layout(resolved.name, &arguments, &ty)?;
+            if !order.is_empty() {
+                layout = rudb_kernels::ordered_layout(&columns);
+            }
+            columns.truncate(given);
             let from = rudb_kernels::state_constants(resolved.name);
-            let mut constants = Vec::with_capacity(cast.len());
-            for (at, &arg) in cast.iter().enumerate() {
+            let mut constants = Vec::with_capacity(given);
+            for (at, &arg) in cast[..given].iter().enumerate() {
                 constants.push(if at >= from { fold::value_of(&self.plan, arg)? } else { None });
             }
-            ty = LogicalType::aggregate_state(resolved.name, arguments, ty, layout, constants);
+            ty = LogicalType::aggregate_state(resolved.name, columns, ty, layout, constants, order);
             name.push_str(rudb_kernels::EXPORTED);
         }
         let args = self.plan.add_expr_list(&cast);
@@ -3595,29 +3599,34 @@ impl<'a> Binder<'a> {
         Ok(())
     }
 
-    /// The name of an aggregate with the `ORDER BY` of its call folded in, with the keys that matter
-    /// added to the end of its arguments.
+    /// The name of an aggregate with the `ORDER BY` of its call folded in, and its keys, with the
+    /// keys that are not one of its arguments added to the end of them.
     ///
     /// Only the aggregates whose answer depends on the order the rows come in keep their keys, which
     /// is what the pin does too: `sum(x ORDER BY y)` is `sum(x)` there, named as written and computed
     /// without a sort. A key that is a constant orders nothing and is dropped, so `list(x ORDER BY
     /// 1)` is a plain `list` and not the first column, which is what a number means in the query's
     /// own `ORDER BY` and not what it means here.
+    ///
+    /// A call whose state is exported keeps every key, constant or not, whatever the aggregate,
+    /// because the pin's state of any ordered call is the rows it saw with their keys.
     fn ordered_aggregate(
         &mut self,
         name: &str,
         sorted: &[ast::OrderItem],
         keys: &[ExprRef],
         args: &mut Vec<ExprRef>,
-    ) -> String {
+        exporting: bool,
+    ) -> (String, Vec<StateKey>) {
         const DEPENDS_ON_ORDER: &[&str] =
             &["list", "first", "last", "any_value", "string_agg", "lttb"];
-        if !DEPENDS_ON_ORDER.contains(&name) {
-            return name.to_string();
+        if !exporting && !DEPENDS_ON_ORDER.contains(&name) {
+            return (name.to_string(), Vec::new());
         }
-        let mut flags = Vec::new();
+        let given = args.len();
+        let mut order = Vec::new();
         for (&key, item) in keys.iter().zip(sorted) {
-            if matches!(fold::value_of(&self.plan, key), Ok(Some(_))) {
+            if !exporting && matches!(fold::value_of(&self.plan, key), Ok(Some(_))) {
                 continue;
             }
             let descending = match item.order {
@@ -3630,13 +3639,21 @@ impl<'a> Binder<'a> {
                 Nulls::Last => false,
                 Nulls::Unstated => self.semantics.nulls_first(descending),
             };
-            flags.push((descending, nulls_first));
-            args.push(key);
+            // The plot sorts on a column of its own, so its key is never one of its arguments.
+            let argument = if name == "lttb" {
+                None
+            } else {
+                args[..given].iter().position(|&arg| self.same_expr(arg, key))
+            };
+            if argument.is_none() {
+                args.push(key);
+            }
+            order.push(StateKey { descending, nulls_first, argument });
         }
-        if flags.is_empty() {
-            return name.to_string();
+        if order.is_empty() {
+            return (name.to_string(), Vec::new());
         }
-        rudb_kernels::ordered_name(name, &flags)
+        (rudb_kernels::ordered_name(name, &order), order)
     }
 
     // ----------------------------------------------------------------- windows

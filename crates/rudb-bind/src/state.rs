@@ -50,7 +50,12 @@ impl Binder<'_> {
                         parameters(&right.arguments, &right.constants),
                     )));
                 }
-                if left.arguments != right.arguments {
+                // An ordered state holds its keys too, and the pin tells only the arguments apart
+                // in its message, so two states that sort differently read the same there.
+                if left.arguments != right.arguments
+                    || left.order != right.order
+                    || left.layout != right.layout
+                {
                     return Err(Error::binder(format!(
                         "Cannot COMBINE aggregate states of \"{}\" that were created with \
                          different parameters: [{}] <> [{}]",
