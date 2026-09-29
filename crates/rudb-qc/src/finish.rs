@@ -96,7 +96,7 @@ pub(crate) fn sets<'r>(rt: &'r Rt, g: &Grouping) -> Result<Vec<(u64, &'r Distinc
     g.accs
         .iter()
         .filter_map(|acc| match acc.op {
-            AccOp::Distinct(h) => Some(
+            AccOp::Distinct(h, _) => Some(
                 rt.distinct(h)
                     .map(|d| (h, d))
                     .ok_or_else(|| Error::internal("a distinct set is gone")),
@@ -345,7 +345,7 @@ fn finish(
             (a[w] != 0).then(|| cell(&a[..w]))
         }
         AccOp::MinStr | AccOp::MaxStr => (a[16] != 0).then(|| cell(&a[..16])),
-        AccOp::Distinct(h) => {
+        AccOp::Distinct(h, _) => {
             let d = sets
                 .iter()
                 .find_map(|&(at, d)| (at == h).then_some(d))

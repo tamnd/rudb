@@ -32,7 +32,7 @@ use rudb_common::{Cancel, Error, ErrorCode, LogicalType, Result};
 use rudb_exec::TopCut;
 use rudb_pipeline::{Lease, Morsel as Cut, Progress, Sink};
 use rudb_plan::Plan;
-use rudb_qc_gen::{Body, Grouping, Out};
+use rudb_qc_gen::{AccOp, Body, Grouping, Out};
 use rudb_qc_ir::status::{Kind, Status};
 use rudb_qc_ir::{ErrorKind, Module};
 use rudb_qc_pipe::{Pipeline, Source, Step};
@@ -924,6 +924,16 @@ impl<'a> Feed<'a> {
         }
         drop(held);
         drop(answers);
+        if let Out::Aggregate(g) = &self.body.sink {
+            // The pairs the body appended for a COUNT(DISTINCT) are taken in before anything
+            // reads the sets.
+            let st = bytes(state);
+            for acc in &g.accs {
+                if let AccOp::Distinct(h, Some(at)) = acc.op {
+                    rt.take_appended(h, &mut st[at as usize..at as usize + 16]);
+                }
+            }
+        }
         if let Some(start) = start {
             self.tiers.ran(self.module, f, rows, start);
         }

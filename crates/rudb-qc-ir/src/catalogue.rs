@@ -68,6 +68,9 @@ proxies! {
     "jt_append" (Ptr, Ptr, I64) -> Void, mayfail, effect;
     "agg_distinct" (Ptr, Ptr, Str16) -> Void, mayfail, effect;
     "agg_distinct_int" (Ptr, Ptr, I128) -> Void, mayfail, effect;
+    // Takes in the pairs compiled code appended to a distinct set and gives it room for more,
+    // through the two words at the second argument.
+    "agg_distinct_room" (Ptr, Ptr) -> Void, mayfail, effect;
     "agg_min_str" (Ptr, Str16) -> Void, mayfail, effect;
     "agg_max_str" (Ptr, Str16) -> Void, mayfail, effect;
     // Decimals and dates.

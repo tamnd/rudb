@@ -29,9 +29,11 @@ impl Ablate {
     pub const DENSE: Ablate = Ablate(1 << 7);
     /// A scan under a join probe reading only the rows whose key the join's table holds.
     pub const HANDOFF: Ablate = Ablate(1 << 8);
+    /// A `COUNT(DISTINCT)` of a number appended in compiled code and taken in many rows at a time.
+    pub const PAIRS: Ablate = Ablate(1 << 9);
 
     /// Every switch with its name, in the order a table of them is printed.
-    pub const ALL: [(&'static str, Ablate); 9] = [
+    pub const ALL: [(&'static str, Ablate); 10] = [
         ("probe", Ablate::PROBE),
         ("like", Ablate::LIKE),
         ("top", Ablate::TOP),
@@ -41,6 +43,7 @@ impl Ablate {
         ("ranges", Ablate::RANGES),
         ("dense", Ablate::DENSE),
         ("handoff", Ablate::HANDOFF),
+        ("pairs", Ablate::PAIRS),
     ];
 
     /// Reads a comma separated list of names, where an empty list or `none` is nothing and `all`

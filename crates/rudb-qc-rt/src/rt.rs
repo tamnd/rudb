@@ -40,6 +40,7 @@ enum Call {
     JtAppend,
     AggDistinct,
     AggDistinctInt,
+    AggDistinctRoom,
     AggMinStr,
     AggMaxStr,
     I128Div,
@@ -69,6 +70,7 @@ impl Call {
             "jt_append" => Call::JtAppend,
             "agg_distinct" => Call::AggDistinct,
             "agg_distinct_int" => Call::AggDistinctInt,
+            "agg_distinct_room" => Call::AggDistinctRoom,
             "agg_min_str" => Call::AggMinStr,
             "agg_max_str" => Call::AggMaxStr,
             "i128_div" => Call::I128Div,
@@ -434,6 +436,19 @@ impl Rt {
         }
     }
 
+    /// Takes in the pairs compiled code appended to the distinct sets `handle` through the two
+    /// words at the start of `words`.
+    pub fn take_appended(&mut self, handle: u64, words: &mut [u8]) {
+        let Some(Object::Distinct(set)) = self.objects.get_mut(handle as usize) else {
+            return;
+        };
+        let word =
+            |i: usize| u64::from_le_bytes(words[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+        let mut pair = [word(0), word(1)];
+        set.settle(&mut pair);
+        words[..8].copy_from_slice(&pair[0].to_le_bytes());
+    }
+
     /// Keeps `bytes` in the runtime heap for as long as the query runs.
     pub fn keep(&mut self, bytes: &[u8]) -> u128 {
         self.heap.keep(bytes)
@@ -490,6 +505,25 @@ impl Rt {
         } else {
             set.add_int(gid as usize, a[2]);
         }
+        Ok(0)
+    }
+
+    fn agg_distinct_room(&mut self, a: &[u128]) -> Result<u128, u64> {
+        let Some(Object::Distinct(set)) = self.objects.get_mut(a[0] as usize) else {
+            return Err(self.fail(bad_handle("agg_distinct_room")));
+        };
+        let at = a[1] as usize;
+        // SAFETY: the second argument is the two words in the state compiled code appends through.
+        let bytes = unsafe { mem::slice(at, 16) };
+        let word =
+            |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+        let mut words = [word(0), word(1)];
+        set.room(&mut words);
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&words[0].to_le_bytes());
+        bytes[8..].copy_from_slice(&words[1].to_le_bytes());
+        // SAFETY: as above.
+        unsafe { mem::write(at, &bytes) };
         Ok(0)
     }
 
@@ -555,6 +589,7 @@ impl Rt {
             }
             Call::AggDistinct => self.agg_distinct(a, true)?,
             Call::AggDistinctInt => self.agg_distinct(a, false)?,
+            Call::AggDistinctRoom => self.agg_distinct_room(a)?,
             Call::AggMinStr | Call::AggMaxStr => {
                 let at = a[0] as usize;
                 // SAFETY: the first argument is the accumulator in a group row, a `str16` and a
@@ -674,6 +709,7 @@ impl Runtime for Rt {
             }
             Call::AggDistinct => self.agg_distinct(args, true),
             Call::AggDistinctInt => self.agg_distinct(args, false),
+            Call::AggDistinctRoom => self.agg_distinct_room(args),
             _ => self.call(call, p.name, args),
         };
         match r {
@@ -765,6 +801,7 @@ mod tests {
         let join = rt.add_join(JoinTable::new(crate::join::JoinLayout::default()));
         let row = rt.table(table).unwrap().address(0) as u128;
         let s = text::make(b"abc");
+        let mut words = [0u64; 2];
         for (i, p) in CATALOGUE.iter().enumerate() {
             let args: Vec<u128> = match p.name {
                 "str_like" => vec![u128::from(like), s],
@@ -772,6 +809,7 @@ mod tests {
                 "ht_insert" => vec![u128::from(table), 0, 5, 0],
                 "jt_append" => vec![u128::from(join), 0, 5],
                 "agg_distinct" | "agg_distinct_int" => vec![u128::from(set), row, s],
+                "agg_distinct_room" => vec![u128::from(set), words.as_mut_ptr() as u128],
                 "agg_min_str" | "agg_max_str" => vec![row + 8],
                 "i128_div" => vec![10, 3],
                 _ => vec![s; p.args.len()],
