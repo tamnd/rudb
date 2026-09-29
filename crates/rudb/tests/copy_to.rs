@@ -265,3 +265,28 @@ fn a_parquet_file_of_many_row_groups_reads_back_whole() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn an_exported_state_is_written_as_its_layout_and_reads_back_into_a_state() {
+    let db = Database::new();
+    let path =
+        std::env::temp_dir().join(format!("rudb-copy-to-state-{}.parquet", std::process::id()));
+    let sql = format!(
+        "COPY (SELECT count(*) EXPORT_STATE AS c, sum(42) EXPORT_STATE AS state) TO '{}'",
+        path.display()
+    );
+    db.execute(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    let back = format!("read_parquet('{}')", path.display());
+    let types = values(&db, &format!("SELECT column_type FROM (DESCRIBE SELECT * FROM {back})"));
+    let text = |v: &str| rudb_common::Value::Varchar(v.into());
+    assert_eq!(types, vec![vec![text("BIGINT")], vec![text("DOUBLE")]]);
+    let got = values(
+        &db,
+        &format!(
+            "SELECT to_aggregate_state(state, 'sum', ['INTEGER'])::VARCHAR, \
+             finalize(to_aggregate_state(state, 'sum', ['INTEGER']))::VARCHAR FROM {back}"
+        ),
+    );
+    assert_eq!(got, vec![vec![text("42"), text("42")]]);
+    let _ = std::fs::remove_file(&path);
+}
