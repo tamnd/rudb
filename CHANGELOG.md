@@ -8,6 +8,14 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.9
+
+The main change is L10 work on the trickle insert path for W3. A prepared one-row `INSERT` that goes straight into the table now does far less per row. #2134 keeps what it found about its table until the catalog changes, instead of resolving the name and columns every time. #2140 holds each trickled row in the tail as its values and lays the tail out into one chunk when it fills. #2142 works out a row's zone and distinct counts from its values, not from a one-row vector a column. #2145 reads the values by position when the parameters are numbered one to n, and reuses the one-row count result. #2147 moves the row into the table instead of copying it and stops timing statistics for single rows. On server2, 200k prepared inserts into a four column table in memory went from 7.6 us to about 2.4 us a row.
+
+On the query side, #2135 runs `left` and `right` with a constant count as `substring`, and #2136 drops aggregate calls nothing reads, which fixes #2131. #2137 keeps decoded parts in the page pool beside the pages. #2138 hands a min or max over a native string column out of a grouping as dictionary codes, and #2143 groups by a string column first when the group keys are computed from it. #2144 adds a bitmap per string chunk of the three-byte runs it holds, so a `LIKE '%word%'` can skip chunks. #2139 holds a list of numbers as numbers, which fixes #2132. #2141 reads coded text columns through their codes in compiled bodies, and #2146 adds `EXPORT_STATE` for `list`, `string_agg` and the quantiles.
+
+The native directory format number stays at 30 and the storage format version at 9.
+
 ## 0.8.8
 
 The main change is C5 work on the compiled engine for TPC-H q1. #2115 sums a 64 bit value into an i64 part that spills into the i128 total only when it overflows, #2122 reads each column's range from the zone maps and leaves out the overflow and width checks the ranges rule out, with a per morsel check that sends anything out of range to the version that checks every step, and #2130 finds a group row by the index of each key in its column's values from the statistics, so a key seen before is one array load and no hashing. Together they take compiled q1 from 2310 M to 1241 M hot instructions on one thread at SF1, against 691 M on the first engine. `qc_ablate` gains `ranges` and `dense`, and #2123 adds `codes`, which answers a `LIKE` once for each value of a coded column's dictionary instead of once a row.
