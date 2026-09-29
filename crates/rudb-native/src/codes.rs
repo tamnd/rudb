@@ -307,18 +307,64 @@ fn wide_columns(reader: &Reader) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
-/// How many distinct values of `counted` each value of `group` holds, the way `COUNT(DISTINCT
-/// counted) GROUP BY group` counts them, or `None` when the group column is not a signed integer
-/// narrow enough to index by.
+/// What [`distinct_per_group`] found for one value of the group column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    /// The value, or `None` for the group of the rows where it is null.
+    pub key: Option<i64>,
+    /// The rows in the group.
+    pub rows: u64,
+    /// The distinct values of the counted column the group holds, nulls left out.
+    pub distinct: u64,
+    /// One fold for each of the folded columns, in the order they were asked for.
+    pub folds: Vec<Fold>,
+}
+
+/// The integers of one column in one group, added up and bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fold {
+    /// Their sum.
+    pub total: i128,
+    /// How many there were, nulls left out.
+    pub seen: u64,
+    /// The smallest, meaningless while `seen` is zero.
+    pub low: i64,
+    /// The largest, same.
+    pub high: i64,
+}
+
+impl Fold {
+    const EMPTY: Self = Self { total: 0, seen: 0, low: i64::MAX, high: i64::MIN };
+
+    fn add(&mut self, value: i64) {
+        self.total += i128::from(value);
+        self.seen += 1;
+        self.low = self.low.min(value);
+        self.high = self.high.max(value);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.total += other.total;
+        self.seen += other.seen;
+        self.low = self.low.min(other.low);
+        self.high = self.high.max(other.high);
+    }
+}
+
+/// Every value of `group` with its rows, how many distinct values of `counted` it holds, the way
+/// `COUNT(DISTINCT counted) GROUP BY group` counts them, and a [`Fold`] of each of the signed
+/// integer columns in `folded`, or `None` when one of the columns is not a signed integer or the
+/// group column is too wide to index by.
 ///
 /// Every group comes out, including one whose counted values are all null and so count zero. A
-/// null group comes out as `None`.
+/// null group comes out with a key of `None`.
 ///
 /// Two passes, each split among `workers` threads. The first reads the group column into a slot
 /// per row, the slot being the value's distance from the lowest the stripes record plus one, and
-/// zero for a null. The second goes over the codes, a range of them to each thread, and counts the
-/// slots of each code's rows once each. A user belongs to one region in nearly every row that
-/// holds it, so a code's rows mostly share one slot and are counted with a compare apiece.
+/// zero for a null, and folds the other columns into the slots as it goes. The second goes over the
+/// codes, a range of them to each thread, and counts the slots of each code's rows once each. A
+/// user belongs to one region in nearly every row that holds it, so a code's rows mostly share one
+/// slot and are counted with a compare apiece.
 ///
 /// # Errors
 ///
@@ -326,9 +372,10 @@ fn wide_columns(reader: &Reader) -> impl Iterator<Item = usize> + '_ {
 pub fn distinct_per_group(
     reader: &Reader,
     group: usize,
+    folded: &[usize],
     counted: &ValueCodes,
     workers: usize,
-) -> Result<Option<Vec<(Option<i64>, u64)>>> {
+) -> Result<Option<Vec<Group>>> {
     let rows = reader.table().rows();
     if counted.rows() != rows {
         return Ok(None);
@@ -358,20 +405,22 @@ pub fn distinct_per_group(
             let (mine, after) = rest.split_at_mut(starts[span.end] - starts[span.start]);
             rest = after;
             let starts = &starts;
-            handles.push(
-                scope.spawn(move || read_slots(reader, group, span, starts, low, slots, mine)),
-            );
+            let place = Place { group, folded, low, slots };
+            handles.push(scope.spawn(move || read_slots(reader, &place, span, starts, mine)));
         }
         handles
             .into_iter()
             .map(|handle| handle.join().map_err(|_| invalid("a group read worker panicked"))?)
             .collect::<Result<Vec<_>>>()
     })?;
-    let mut present = vec![false; slots];
+    let mut tally = Tally { rows: vec![0; slots], folds: vec![Fold::EMPTY; slots * folded.len()] };
     for one in read {
         let Some(one) = one else { return Ok(None) };
-        for (slot, here) in present.iter_mut().zip(one) {
-            *slot |= here;
+        for (total, count) in tally.rows.iter_mut().zip(one.rows) {
+            *total += count;
+        }
+        for (total, fold) in tally.folds.iter_mut().zip(&one.folds) {
+            total.merge(fold);
         }
     }
 
@@ -431,12 +480,14 @@ pub fn distinct_per_group(
         }
     }
     let mut out = Vec::new();
-    for (slot, (&here, &count)) in present.iter().zip(&counts).enumerate() {
-        if !here {
+    let width = folded.len();
+    for (slot, (&rows, &distinct)) in tally.rows.iter().zip(&counts).enumerate() {
+        if rows == 0 {
             continue;
         }
-        let value = if slot == 0 { None } else { Some(low + (slot - 1) as i64) };
-        out.push((value, count));
+        let key = if slot == 0 { None } else { Some(low + (slot - 1) as i64) };
+        let folds = tally.folds[slot * width..(slot + 1) * width].to_vec();
+        out.push(Group { key, rows, distinct, folds });
     }
     Ok(Some(out))
 }
@@ -445,19 +496,34 @@ pub fn distinct_per_group(
 /// bytes and the slots of a million rows fit in two megabytes of cache.
 const MOST_GROUP_SLOTS: i128 = 1 << 16;
 
-/// The slot of every row of `parts` of the group column into `out`, and which slots turned up, or
-/// `None` when the column is not read as signed integers or holds a value outside the range the
-/// stripes record.
-fn read_slots(
-    reader: &Reader,
+/// The columns [`read_slots`] reads and where their slots start.
+#[derive(Clone, Copy)]
+struct Place<'a> {
     group: usize,
-    parts: Range<usize>,
-    starts: &[usize],
+    folded: &'a [usize],
     low: i64,
     slots: usize,
+}
+
+/// The rows of each slot and the folds of each slot's folded columns, one after the other.
+struct Tally {
+    rows: Vec<u64>,
+    folds: Vec<Fold>,
+}
+
+/// The slot of every row of `parts` of the group column into `out`, with each slot's rows and its
+/// folds of the other columns, or `None` when a column is not read as signed integers or the group
+/// holds a value outside the range the stripes record.
+fn read_slots(
+    reader: &Reader,
+    place: &Place<'_>,
+    parts: Range<usize>,
+    starts: &[usize],
     out: &mut [u16],
-) -> Result<Option<Vec<bool>>> {
-    let mut present = vec![false; slots];
+) -> Result<Option<Tally>> {
+    let Place { group, folded, low, slots } = *place;
+    let width = folded.len();
+    let mut tally = Tally { rows: vec![0; slots], folds: vec![Fold::EMPTY; slots * width] };
     let mut block = Vec::new();
     let base = starts[parts.start];
     for part in parts {
@@ -469,7 +535,7 @@ fn read_slots(
         }
         let has_nulls = vector.validity().has_nulls(len);
         let out = &mut out[starts[part] - base..starts[part + 1] - base];
-        for (at, (&value, slot)) in block[..len].iter().zip(out).enumerate() {
+        for (at, (&value, slot)) in block[..len].iter().zip(out.iter_mut()).enumerate() {
             *slot = if has_nulls && vector.is_null_at(at) {
                 0
             } else {
@@ -478,10 +544,23 @@ fn read_slots(
                     _ => return Ok(None),
                 }
             };
-            present[*slot as usize] = true;
+            tally.rows[*slot as usize] += 1;
+        }
+        for (at, &column) in folded.iter().enumerate() {
+            let read = reader.read(part, &[column])?;
+            let vector = read.column(0)?;
+            if vector.len() != len || !vector.signed_block(&mut block) || block.len() < len {
+                return Ok(None);
+            }
+            let has_nulls = vector.validity().has_nulls(len);
+            for (row, (&value, &slot)) in block[..len].iter().zip(out.iter()).enumerate() {
+                if !(has_nulls && vector.is_null_at(row)) {
+                    tally.folds[slot as usize * width + at].add(value);
+                }
+            }
         }
     }
-    Ok(Some(present))
+    Ok(Some(tally))
 }
 
 /// The lowest value of `group` over every stripe and the slots from the null one up to the highest,
@@ -612,11 +691,49 @@ mod tests {
             .map(|(region, users)| (region, users.len() as u64))
             .collect::<Vec<_>>();
         for workers in [1, 3, 8] {
-            let mut found = distinct_per_group(&reader, 0, &codes, workers)
+            let mut found = distinct_per_group(&reader, 0, &[], &codes, workers)
                 .expect("counted")
-                .expect("the region is narrow");
+                .expect("the region is narrow")
+                .into_iter()
+                .map(|group| (group.key, group.distinct))
+                .collect::<Vec<_>>();
             found.sort_unstable();
             assert_eq!(found, wanted, "{workers} workers");
+        }
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn the_rows_of_each_group_and_the_columns_folded_beside_it_add_up() {
+        let (path, held) = table_of("folds", 300_000);
+        build_value_codes_within(&path, "hits", 1000).expect("build");
+        let reader = Catalog::open(&path).expect("reopen").table("hits").expect("the table");
+        let codes = value_codes(&reader, 1).expect("the section is in the file");
+        let mut wanted = BTreeMap::<Option<i64>, (u64, Fold)>::new();
+        for (region, user) in &held {
+            let (rows, fold) = wanted.entry(region.map(i64::from)).or_insert((0, Fold::EMPTY));
+            *rows += 1;
+            if let Some(user) = user {
+                fold.add(*user);
+            }
+        }
+        let wanted = wanted.into_iter().collect::<Vec<_>>();
+        for workers in [1, 5] {
+            let mut found = distinct_per_group(&reader, 0, &[1, 0], &codes, workers)
+                .expect("counted")
+                .expect("the region is narrow");
+            found.sort_by_key(|group| group.key);
+            let regions = found.iter().map(|group| {
+                let mut region = Fold::EMPTY;
+                if let Some(key) = group.key {
+                    for _ in 0..group.rows {
+                        region.add(key);
+                    }
+                }
+                assert_eq!(group.folds[1], region, "the key folds as itself");
+                (group.key, (group.rows, group.folds[0]))
+            });
+            assert_eq!(regions.collect::<Vec<_>>(), wanted, "{workers} workers");
         }
         fs::remove_file(&path).expect("clean up");
     }

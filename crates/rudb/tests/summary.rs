@@ -771,7 +771,8 @@ fn a_two_key_top_count_with_no_skew_reads_the_rows() {
 /// at checkpoint, so the pairs of region and user are told apart by the users' codes rather than by
 /// hashing them, and the answer still has to be the one memory gives, the null region and the
 /// users that are null included. The four scattered columns give the table the bytes the codes are
-/// allowed a share of, as the other hundred columns of ClickBench do.
+/// allowed a share of, as the other hundred columns of ClickBench do. The other aggregates of q10
+/// come out of the same pass that reads the regions.
 #[test]
 fn a_distinct_count_by_a_small_key_is_counted_from_the_codes_of_a_wide_column() {
     let rows = "SELECT CASE WHEN i % 101 = 0 THEN NULL ELSE i % 37 END AS r, \
@@ -779,7 +780,8 @@ fn a_distinct_count_by_a_small_key_is_counted_from_the_codes_of_a_wide_column() 
          (i * 2654435761) % 1000000007 * 1000000009 + i % 7919 AS p1, \
          (i * 40503) % 1000000009 * 1000000007 + i % 7907 AS p2, \
          (i * 2246822519) % 998244353 * 1000000021 + i % 7901 AS p3, \
-         (i * 3266489917) % 1000000021 * 998244353 + i % 7883 AS p4 \
+         (i * 3266489917) % 1000000021 * 998244353 + i % 7883 AS p4, \
+         CASE WHEN i % 13 = 0 THEN NULL ELSE CAST(i % 1999 - 900 AS SMALLINT) END AS w \
          FROM range(200000) t(i)";
     let pair = Pair::new("codedusers", rows);
     let query = "SELECT r, COUNT(DISTINCT u) AS c FROM t GROUP BY r ORDER BY c DESC, r LIMIT 10";
@@ -792,4 +794,9 @@ fn a_distinct_count_by_a_small_key_is_counted_from_the_codes_of_a_wide_column() 
     let every = "SELECT r, COUNT(DISTINCT u) AS c FROM t GROUP BY r ORDER BY r NULLS FIRST";
     assert_eq!(pair.listing(every).len(), 38, "every region and the null one");
     assert!(pair.answered(&pair.file, every, "native distinct counts"));
+    // ClickBench's q10 asks for more of each region beside its users.
+    let more = "SELECT r, SUM(w), COUNT(*) AS c, AVG(w), COUNT(DISTINCT u), MIN(w), MAX(u), \
+         COUNT(w) FROM t GROUP BY r ORDER BY c DESC, r LIMIT 10";
+    assert_eq!(pair.listing(more).len(), 10);
+    assert!(pair.answered(&pair.file, more, "native distinct counts"));
 }

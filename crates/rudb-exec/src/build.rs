@@ -1062,31 +1062,25 @@ fn native_coded_counts(
 }
 
 /// `COUNT(DISTINCT x) GROUP BY g` over a whole table, counted from the value codes the file keeps
-/// for `x` rather than by hashing the pairs of the two. See `rudb_native::codes`.
+/// for `x` rather than by hashing the pairs of the two, with any `count(*)`, and any `count`,
+/// `sum`, `avg`, `min` or `max` of a signed integer column beside it folded in the same pass that
+/// reads `g`. See `rudb_native::codes`.
 ///
 /// The group is a signed integer narrow enough to index by, which `RegionID` is and which the
 /// native side checks, and the counted column is one the file coded, which `UserID` is. On
-/// ClickBench 9 that is a million pairs told apart by an array of the users' first regions.
+/// ClickBench 9 that is a million pairs of region and user told apart by the users' rows, and
+/// ClickBench 10 adds a sum, a count and a mean of two more columns.
 fn native_distinct_counts(
     plan: &Plan,
     catalog: &Catalog,
     input: NodeRef,
     groups: Slice,
     aggregates: Slice,
-) -> Result<Option<NativePairFrequencies>> {
+) -> Result<Option<Vec<Vec<Value>>>> {
     let Some((table, index, columns)) = whole_table(plan, catalog, input)? else {
         return Ok(None);
     };
-    let ([key], [aggregate]) = (plan.expr_list(groups), plan.expr_list(aggregates)) else {
-        return Ok(None);
-    };
-    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
-        return Ok(None);
-    };
-    let [argument] = plan.expr_list(args) else { return Ok(None) };
-    if plan.string(name) != "count" || !distinct || filter.is_some() {
-        return Ok(None);
-    }
+    let [key] = plan.expr_list(groups) else { return Ok(None) };
     let signed = |expr: ExprRef| {
         matches!(
             plan.expr_type(expr),
@@ -1096,35 +1090,125 @@ fn native_distinct_counts(
                 | LogicalType::BigInt
         )
     };
-    let (&Expr::Column(group), &Expr::Column(counted)) = (plan.expr(*key), plan.expr(*argument))
-    else {
-        return Ok(None);
-    };
-    if group.table != index || counted.table != index || !signed(*key) || !signed(*argument) {
-        return Ok(None);
-    }
     let fields = plan.field_list(columns);
-    let stored = |binding: ColumnBinding| {
+    // The stored column a signed integer column of this table is, and nothing else.
+    let stored = |expr: ExprRef| {
+        let Expr::Column(binding) = *plan.expr(expr) else { return None };
+        if binding.table != index || !signed(expr) {
+            return None;
+        }
         fields.get(binding.column as usize).and_then(|field| table.column_index(&field.name))
     };
-    let (Some(group_column), Some(counted_column)) = (stored(group), stored(counted)) else {
-        return Ok(None);
-    };
-    let Some(counts) = table.rows().distinct_per_group(group_column, counted_column)? else {
+    let Some(group) = stored(*key) else { return Ok(None) };
+    let mut counted = None;
+    let mut folded = Vec::new();
+    let mut wanted = Vec::new();
+    for &aggregate in plan.expr_list(aggregates) {
+        let Expr::Aggregate { name, args, distinct, filter: None } = *plan.expr(aggregate) else {
+            return Ok(None);
+        };
+        let name = plan.string(name);
+        let returns = plan.expr_type(aggregate).clone();
+        match (name, plan.expr_list(args)) {
+            ("count_star", []) if !distinct => wanted.push(Wanted::Rows),
+            ("count", [argument]) if distinct => {
+                let Some(column) = stored(*argument) else { return Ok(None) };
+                if counted.replace(column).is_some() {
+                    return Ok(None);
+                }
+                wanted.push(Wanted::Distinct);
+            }
+            (name, [argument]) if !distinct => {
+                let mut argument = *argument;
+                // A cast the binder put in so that a mean or a sum comes out in its own type
+                // changes none of the integers added up.
+                if matches!(name, "sum" | "avg")
+                    && let Expr::Cast { input, try_cast: false } = *plan.expr(argument)
+                    && signed(input)
+                    && matches!(
+                        plan.expr_type(argument),
+                        LogicalType::BigInt | LogicalType::HugeInt | LogicalType::Double
+                    )
+                {
+                    argument = input;
+                }
+                let Some(column) = stored(argument) else { return Ok(None) };
+                let fold = folded.len();
+                folded.push(column);
+                let ty = plan.expr_type(argument).clone();
+                wanted.push(match name {
+                    "count" => Wanted::Seen(fold),
+                    "sum" => Wanted::Sum(fold, returns),
+                    "avg" => Wanted::Mean(fold, returns),
+                    "min" => Wanted::Low(fold, ty),
+                    "max" => Wanted::High(fold, ty),
+                    _ => return Ok(None),
+                });
+            }
+            _ => return Ok(None),
+        }
+    }
+    let Some(counted) = counted else { return Ok(None) };
+    let Some(found) = table.rows().distinct_per_group(group, &folded, counted)? else {
         return Ok(None);
     };
     let ty = plan.expr_type(*key);
-    let entries = counts
-        .into_iter()
-        .map(|(value, count)| {
-            let value = match value {
-                Some(value) => signed_value(ty, i128::from(value))?,
-                None => Value::Null,
-            };
-            Ok((vec![value], count))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Some(NativePairFrequencies { entries }))
+    let count = |count: u64| {
+        i64::try_from(count)
+            .map(Value::BigInt)
+            .map_err(|_| Error::internal("a group count exceeds BIGINT"))
+    };
+    let mut records = Vec::with_capacity(found.len());
+    for group in found {
+        let mut record = Vec::with_capacity(wanted.len() + 1);
+        record.push(match group.key {
+            Some(value) => signed_value(ty, i128::from(value))?,
+            None => Value::Null,
+        });
+        for one in &wanted {
+            let fold = |at: usize| group.folds[at];
+            record.push(match one {
+                Wanted::Rows => count(group.rows)?,
+                Wanted::Distinct => count(group.distinct)?,
+                Wanted::Seen(at) => count(fold(*at).seen)?,
+                Wanted::Sum(at, returns) => {
+                    let fold = fold(*at);
+                    Accumulator::exact_sum(fold.total, fold.seen > 0, returns).finish()?
+                }
+                Wanted::Mean(at, returns) => {
+                    let fold = fold(*at);
+                    let seen = i64::try_from(fold.seen)
+                        .map_err(|_| Error::internal("a group count exceeds BIGINT"))?;
+                    Accumulator::exact_avg(fold.total, seen, returns).finish()?
+                }
+                Wanted::Low(at, ty) | Wanted::High(at, ty) => {
+                    let fold = fold(*at);
+                    let end = if matches!(one, Wanted::Low(..)) { fold.low } else { fold.high };
+                    if fold.seen == 0 { Value::Null } else { signed_value(ty, i128::from(end))? }
+                }
+            });
+        }
+        records.push(record);
+    }
+    Ok(Some(records))
+}
+
+/// One aggregate of [`native_distinct_counts`], and where in a group its answer is.
+enum Wanted {
+    /// `count(*)`.
+    Rows,
+    /// The one `count(DISTINCT x)`.
+    Distinct,
+    /// `count(x)` of the fold at this place.
+    Seen(usize),
+    /// `sum(x)`, returning this type.
+    Sum(usize, LogicalType),
+    /// `avg(x)`, same.
+    Mean(usize, LogicalType),
+    /// `min(x)` of a column of this type.
+    Low(usize, LogicalType),
+    /// `max(x)`, same.
+    High(usize, LogicalType),
 }
 
 /// Whether `expr` is the column `binding` names.
@@ -2770,10 +2854,10 @@ impl<'a> Building<'a, '_> {
             return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
         }
         if bound.max_groups.is_none() && bound.having_count.is_none() {
-            if let Some(frequencies) =
+            if let Some(records) =
                 native_distinct_counts(self.plan, self.catalog, input, groups, aggregates)?
             {
-                let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
+                let source = Frequencies::records(schema.clone(), records)?;
                 let counters = self.watch(
                     reference,
                     id,
