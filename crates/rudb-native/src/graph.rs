@@ -1003,7 +1003,13 @@ pub fn adjacency_parent(child: &Reader, child_column: usize) -> Option<(String, 
         .sections()
         .iter()
         .find(|section| section.kind == *section::ADJACENCY && section.id == id)?;
-    if !held.usable(table.generation()) || held.refused().is_some() {
+    bound_to(child, held)
+}
+
+/// The parent table and key a current link or adjacency section was built against, read off the
+/// binding at the front of its payload, or `None` for a section that is stale or a budget record.
+fn bound_to(child: &Reader, held: &section::Section) -> Option<(String, usize)> {
+    if !held.usable(child.table().generation()) || held.refused().is_some() {
         return None;
     }
     let head = child.payload_head(held, 16).ok()?;
@@ -1012,6 +1018,43 @@ pub fn adjacency_parent(child: &Reader, child_column: usize) -> Option<(String, 
     let bytes = child.payload_head(held, 16 + length).ok()?;
     let name = std::str::from_utf8(bytes.get(16..16 + length)?).ok()?;
     Some((name.to_owned(), column))
+}
+
+/// Whether this table carries a link or an adjacency section at all, current or not.
+///
+/// Only the section list is looked at, so it is cheap enough to ask before every query. A caller
+/// that gets `true` asks [`stored_relationships`] for what they are.
+#[must_use]
+pub fn carries_links(child: &Reader) -> bool {
+    child.table().sections().iter().any(|section| {
+        section.kind == *section::FORWARD_LINK || section.kind == *section::ADJACENCY
+    })
+}
+
+/// Every relationship this child table holds a current link or adjacency for, as the child's key,
+/// the parent table's name and the parent's key, each key in [`key_of`]'s numbering.
+///
+/// A link is only built for a relationship somebody declared, and only kept when the parent side
+/// was a key, so each of these was declared once and checked when it was built. The declaration
+/// may have been a `SET graph_links` in the session that checkpointed, which is gone by the next
+/// open, and this is how the next open still knows about it. A relationship over the link budget
+/// can still be here through its adjacency, and one refused both is not.
+#[must_use]
+pub fn stored_relationships(child: &Reader) -> Vec<(usize, String, usize)> {
+    let mut found: Vec<(usize, String, usize)> = Vec::new();
+    for held in child.table().sections() {
+        if held.kind != *section::FORWARD_LINK && held.kind != *section::ADJACENCY {
+            continue;
+        }
+        let Ok(key) = usize::try_from(held.id) else { continue };
+        if found.iter().any(|(child_key, ..)| *child_key == key) {
+            continue;
+        }
+        if let Some((parent, parent_key)) = bound_to(child, held) {
+            found.push((key, parent, parent_key));
+        }
+    }
+    found
 }
 
 /// The parent a column's forward link was built against, as its table, its key column and the
@@ -1098,15 +1141,7 @@ pub fn link_parent(child: &Reader, child_column: usize) -> Option<(String, usize
         .sections()
         .iter()
         .find(|section| section.kind == *section::FORWARD_LINK && section.id == id)?;
-    if !held.usable(table.generation()) || held.refused().is_some() {
-        return None;
-    }
-    let head = child.payload_head(held, 16).ok()?;
-    let column = u32::from_le_bytes(head.get(8..12)?.try_into().ok()?);
-    let length = u32::from_le_bytes(head.get(12..16)?.try_into().ok()?) as usize;
-    let bytes = child.payload_head(held, 16 + length).ok()?;
-    let name = std::str::from_utf8(bytes.get(16..16 + length)?).ok()?;
-    Some((name.to_owned(), column as usize))
+    bound_to(child, held)
 }
 
 /// The child's current forward link section for this edge's child column.

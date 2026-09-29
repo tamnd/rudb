@@ -60,11 +60,57 @@ fn a_foreign_key_is_a_link_the_plan_reads() {
     assert_eq!(listed[0][0], Value::Varchar("lineitem(l_orderkey) -> orders(o_orderkey)".into()));
     assert!(!listed[0][1].is_null(), "the link was not kept: {listed:?}");
 
-    // Off, which is the default: the same file, a hash join and the answer to hold the link to.
+    // Off: the same file, a hash join and the answer to hold the link to.
+    db.execute("SET graph_sections = false").expect("off");
     let wanted = rows(&db, QUERY);
     assert!(!plan(&db).contains("reads the link"), "{}", plan(&db));
 
     // On, with a cache small enough that a table of forty thousand orders does not fit in it.
+    db.execute("SET graph_sections = true").expect("on");
+    db.execute("SET graph_cache_bytes = 1024").expect("a small cache");
+    assert!(plan(&db).contains("reads the link"), "{}", plan(&db));
+    for threads in [1, 4] {
+        db.execute(&format!("SET threads = {threads}")).expect("threads");
+        assert_eq!(rows(&db, QUERY), wanted, "{threads} threads");
+    }
+}
+
+/// A relationship declared with `SET graph_links` in the session that checkpointed is still known
+/// after that session is gone, because the file kept its link and the link says what it is for.
+///
+/// This is how rudb-bench loads TPC-H: the tables arrive from Parquet with no keys, one process
+/// checkpoints with the relationships set, and every query runs in a fresh process that sets
+/// nothing. Before, the scan read the links in those processes and the planner never heard of them.
+#[test]
+fn a_link_declared_for_one_session_is_known_to_every_later_one() {
+    let file =
+        File(std::env::temp_dir().join(format!("rudb-kept-links-{}.rudb", std::process::id())));
+    let _ = std::fs::remove_file(&file.0);
+    let name = file.0.to_str().expect("a UTF-8 temporary path");
+    {
+        let db = Database::open(name).expect("a new file");
+        for sql in [
+            "CREATE TABLE orders(o_orderkey BIGINT, o_orderdate DATE)",
+            "CREATE TABLE lineitem(l_orderkey BIGINT, l_linenumber INTEGER, l_quantity INTEGER)",
+            TABLES[2],
+            TABLES[3],
+        ] {
+            db.execute(sql).expect(sql);
+        }
+        db.execute("SET graph_links = 'lineitem(l_orderkey) -> orders(o_orderkey)'").expect("sets");
+        db.execute("CHECKPOINT").expect("the checkpoint builds the link");
+    }
+    let db = Database::open(name).expect("the file opens again");
+    assert_eq!(rows(&db, "SELECT current_setting('graph_links')"), [[Value::Varchar("".into())]]);
+    let listed = rows(&db, "SELECT name, link FROM rudb_links()");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0][0], Value::Varchar("lineitem(l_orderkey) -> orders(o_orderkey)".into()));
+    assert!(!listed[0][1].is_null(), "the link was not kept: {listed:?}");
+
+    db.execute("SET graph_sections = false").expect("off");
+    let wanted = rows(&db, QUERY);
+    assert!(!plan(&db).contains("reads the link"), "{}", plan(&db));
+
     db.execute("SET graph_sections = true").expect("on");
     db.execute("SET graph_cache_bytes = 1024").expect("a small cache");
     assert!(plan(&db).contains("reads the link"), "{}", plan(&db));
