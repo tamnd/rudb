@@ -3106,6 +3106,12 @@ impl Shared {
         self.inner.journal.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Whether rows put into `name` are staged for the log, which is what [`Self::stage_rows`] does
+    /// with them.
+    fn journals(&self, name: &QualifiedName) -> bool {
+        self.journal().is_some() && name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)
+    }
+
     /// Stages rows [`Database::append`] put into `name`, whose columns are `fields`.
     fn stage_rows(&self, name: &QualifiedName, fields: &[Field], rows: &[Vec<Value>]) {
         let mut journal = self.journal();
@@ -3177,11 +3183,15 @@ impl Shared {
             }
             row[at] = value;
         }
-        let rows = [row];
+        // The row is moved into the table, so the log gets a copy made first, and only when there
+        // is a log to get one.
+        let staged = self.journals(&name).then(|| [row.clone()]);
         let result = kept(sql, 0, |_| {
             let table = catalog.table_mut(&name)?;
-            table.append_rows(&rows)?;
-            self.stage_rows(&name, table.columns(), &rows);
+            table.append_row(row)?;
+            if let Some(rows) = &staged {
+                self.stage_rows(&name, table.columns(), rows);
+            }
             QueryResult::changed(1)
         });
         if result.is_ok() {

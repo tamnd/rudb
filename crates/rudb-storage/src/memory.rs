@@ -690,6 +690,9 @@ impl MemoryTable {
     ///
     /// A load reports this next to its own wall time so that the price of the zone maps is a number
     /// somebody can argue with rather than something buried inside the load. See `zone.rs`.
+    ///
+    /// A row added on its own is not timed. Its statistics are a comparison and a hash a value, and
+    /// the three clock reads it would take to time them cost more than that.
     #[must_use]
     pub fn stats_ns(&self) -> u64 {
         self.stats_ns
@@ -1003,7 +1006,7 @@ impl MemoryTable {
             }
         }
         if let [row] = rows {
-            return self.append_row(row);
+            return self.push_row(row.clone());
         }
         for batch in rows.chunks(VECTOR_SIZE) {
             let mut columns = Vec::with_capacity(self.types.len());
@@ -1016,23 +1019,35 @@ impl MemoryTable {
         Ok(())
     }
 
-    /// Appends one row, which goes to the tail as its values.
+    /// Appends one row, taking it, which is [`Self::append_rows`] with one row and without the copy.
+    ///
+    /// # Errors
+    ///
+    /// If the row is not as wide as the table, or if a value is not one its column can hold.
+    pub fn append_row(&mut self, row: Vec<Value>) -> Result<()> {
+        self.forget_grams();
+        if row.len() != self.types.len() {
+            return Err(Error::internal(format!(
+                "row 0 has {} values and the table has {} columns",
+                row.len(),
+                self.types.len()
+            )));
+        }
+        self.push_row(row)
+    }
+
+    /// Puts one row of the right width into the tail as its values.
     ///
     /// The statistics are the ones a one-row chunk of it would have, the same chunk
     /// [`Self::append`] would have been handed. For a row of plain values they are worked out from
     /// the values, and anything else is built into the chunk and taken from that. It is the laying
     /// out that waits for the tail to close.
-    fn append_row(&mut self, row: &[Value]) -> Result<()> {
+    fn push_row(&mut self, row: Vec<Value>) -> Result<()> {
         // A row of plain values has its zone and counts worked out from the values, which is what
         // the one-row chunk would have given them without the chunk.
-        let started = Instant::now();
-        if let Some(zone) = Zone::of_row(row, &self.types) {
-            let zoned = Instant::now();
-            self.counts.add_row(row);
-            let done = Instant::now();
-            self.counts_ns += done.duration_since(zoned).as_nanos() as u64;
-            self.stats_ns += done.duration_since(started).as_nanos() as u64;
-            return self.trail(Piece::Row(row.to_vec()), zone);
+        if let Some(zone) = Zone::of_row(&row, &self.types) {
+            self.counts.add_row(&row);
+            return self.trail(Piece::Row(row), zone);
         }
         let mut columns = Vec::with_capacity(self.types.len());
         for (value, ty) in row.iter().zip(&self.types) {
@@ -1041,7 +1056,7 @@ impl MemoryTable {
         let chunk = Chunk::with_rows(columns, 1)?;
         self.check(&chunk)?;
         let zone = self.take_stats(&chunk);
-        self.trail(Piece::Row(row.to_vec()), zone)
+        self.trail(Piece::Row(row), zone)
     }
 
     /// One chunk's worth of the named columns, in the order they are named.
@@ -1775,6 +1790,30 @@ mod tests {
         assert_eq!(table.chunk_len(2), Some(100));
         let got = every_row(&table);
         assert_eq!(got, (0..rows + 100).map(Value::Integer).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_row_handed_over_lands_as_a_row_copied_in() {
+        let types = vec![LogicalType::BigInt, LogicalType::Varchar];
+        let rows: Vec<Vec<Value>> =
+            (0..300).map(|id| vec![Value::BigInt(id), Value::Varchar(format!("n{id}"))]).collect();
+        let (mut taken, mut copied) = (MemoryTable::new(types.clone()), MemoryTable::new(types));
+        for row in &rows {
+            taken.append_row(row.clone()).expect("a row");
+            copied.append_rows(std::slice::from_ref(row)).expect("a row");
+        }
+        assert_eq!(taken.chunk_count(), copied.chunk_count());
+        for chunk in 0..taken.chunk_count() {
+            assert_eq!(taken.zone(chunk), copied.zone(chunk));
+            let (left, right) = (taken.read(chunk, &[0, 1]), copied.read(chunk, &[0, 1]));
+            let (left, right) = (left.expect("read"), right.expect("read"));
+            for row in 0..left.len() {
+                assert_eq!(left.value_at(row, 1), right.value_at(row, 1));
+            }
+        }
+        assert_eq!(taken.distinct_values(1), copied.distinct_values(1));
+        assert!(taken.append_row(vec![Value::BigInt(1)]).is_err(), "one value for two columns");
+        assert_eq!(taken.len(), 300);
     }
 
     #[test]

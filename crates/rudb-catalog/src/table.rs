@@ -1816,6 +1816,23 @@ impl Table {
         self.rows = rows;
     }
 
+    /// Adds one row, taking it, which is [`Self::append_rows`] with one row and without the copy.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_rows`].
+    pub fn append_row(&mut self, row: Vec<Value>) -> Result<()> {
+        if !self.guards().is_empty() {
+            return self.append_rows(&[row]);
+        }
+        for (at, column) in self.columns.iter().enumerate() {
+            if column.not_null && row.get(at).is_some_and(Value::is_null) {
+                return Err(self.null_in(&column.name));
+            }
+        }
+        self.rows.to_append()?.append_row(row)
+    }
+
     /// Adds rows of single values, refusing a null in a column that said it would not have one.
     ///
     /// # Errors
