@@ -148,7 +148,7 @@ pub use build::{
     build_pruned_into, build_with, summarized,
 };
 pub use expr::{evaluate, evaluate_all};
-pub use links::declared;
+pub use links::{declared, known};
 pub use prepared::{Prepared, Scratch};
 pub use query::Query;
 pub use register::registries;

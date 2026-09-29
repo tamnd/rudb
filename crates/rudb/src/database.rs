@@ -3551,9 +3551,19 @@ impl Shared {
         }
         let declared = self.inner.settings.links();
         // The common case by a long way, and the one worth not taking a lock for: no relationship
-        // is declared, either by the setting or by a foreign key, so there is nothing to look for
-        // and nothing to cache.
-        if declared.is_empty() && catalog.tables().all(|table| table.foreign().is_empty()) {
+        // is declared, either by the setting or by a foreign key, and no file holds a link from an
+        // earlier declaration, so there is nothing to look for and nothing to cache.
+        if declared.is_empty()
+            && catalog.tables().all(|table| {
+                table.foreign().is_empty()
+                    && match table.rows() {
+                        rudb_catalog::table::Rows::Native(rows) => {
+                            !rudb_native::graph::carries_links(rows)
+                        }
+                        _ => true,
+                    }
+            })
+        {
             return Arc::default();
         }
         let generation = catalog.generation();
@@ -3568,7 +3578,8 @@ impl Shared {
         Arc::clone(&held.2)
     }
 
-    /// Every declared relationship, with whether the files answer for it, read once.
+    /// Every declared relationship and every one a file kept a link for, with whether the files
+    /// answer for it, read once.
     ///
     /// The ones no file answers for are kept rather than dropped. Only a built one licenses a
     /// rewrite, and the planner is careful about that, but a declaration whose link was never built
@@ -3581,7 +3592,7 @@ impl Shared {
     /// there is no link to find for it whatever this did.
     fn related(catalog: &Catalog, declared: &str) -> Vec<rudb_opt::link::Linked> {
         let mut found = Vec::new();
-        for link in rudb_exec::declared(catalog, declared) {
+        for link in rudb_exec::known(catalog, declared) {
             // One column each, or two each for a key like `partsupp`'s. Anything wider has no
             // stored form, so there is nothing to plan over.
             let (child_keys, parent_keys) = (&link.child.columns, &link.parent.columns);
