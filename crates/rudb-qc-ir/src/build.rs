@@ -15,7 +15,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::panic::Location;
 
 use crate::eval;
-use crate::func::{A16, Const, DEAD, INV, NT, header};
+use crate::func::{A16, Const, DEAD, INV, Inst, NT, header};
 use crate::{Block, BlockData, Class, Form, Func, Op, Site, Ty, Val, ValInfo};
 
 impl Func {
@@ -782,26 +782,24 @@ pub fn dce(f: &mut Func) -> usize {
         }
     }
     let mut removed = 0;
+    let mut dead = Vec::new();
     // Removing one instruction can free its operands, so sweep until nothing changes. Each sweep
     // walks blocks backwards, which catches a chain inside one block in a single sweep.
     loop {
         let mut changed = false;
         for b in (0..f.blocks.len()).rev() {
-            let mut dead = Vec::new();
-            let insts: Vec<_> =
-                f.insts(Block(b as u32)).map(|i| (i.at, i.op, i.flags, i.result)).collect();
-            for (at, op, flags, result) in insts.into_iter().rev() {
-                if flags & DEAD != 0 {
+            dead.clear();
+            let insts: Vec<Inst<'_>> = f.insts(Block(b as u32)).collect();
+            for inst in insts.iter().rev() {
+                if inst.dead() {
                     continue;
                 }
-                let Some(r) = result else { continue };
+                let Some(r) = inst.result else { continue };
+                let op = inst.op;
                 let removable =
                     op.is_pure() || matches!(op, Op::Load | Op::LoadBit | Op::LoadStr | Op::Memeq);
                 if removable && uses[r.index()] == 0 {
-                    dead.push(at);
-                    let Some(inst) = f.insts(Block(b as u32)).find(|i| i.at == at) else {
-                        continue;
-                    };
+                    dead.push(inst.at);
                     inst.uses(|v| {
                         if !v.is_const() && v != Val::NONE {
                             uses[v.index()] -= 1;
@@ -809,7 +807,7 @@ pub fn dce(f: &mut Func) -> usize {
                     });
                 }
             }
-            for at in dead {
+            for &at in &dead {
                 f.blocks[b].code[at as usize] |= DEAD << 13;
                 removed += 1;
                 changed = true;
