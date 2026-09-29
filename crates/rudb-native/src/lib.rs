@@ -4630,15 +4630,34 @@ struct Resident {
 #[derive(Debug)]
 struct Shelf {
     columns: Vec<Mutex<Cached>>,
-    /// Every part of every column as decoding left it, a slot per column of the table for each
-    /// part in turn. See [`PartSlot`].
-    parts: Vec<Mutex<PartSlot>>,
+    /// Every part of each column as decoding left it, made the first time a read of the column
+    /// asks, since a query reads a few of a table's columns and a slot for every part of every one
+    /// of them came to 9 MB on ClickBench's hits before the query read a row. See [`PartSlot`].
+    parts: Vec<OnceLock<Box<[Mutex<PartSlot>]>>>,
+    /// How many parts the table has, which is how many slots a column gets.
+    places: usize,
     /// How many pages each column holds right now. Counted outside the column locks so that the
     /// pool can tell whether a column is at its floor without taking a lock it might be under.
     held: Vec<AtomicUsize>,
     /// How many stripes of one column are kept whatever the budget says. See
     /// [`CACHED_STRIPES_PER_COLUMN`] for what sets it and [`Reader::keep_stripes`] for who raises it.
     kept: AtomicUsize,
+}
+
+impl Shelf {
+    /// The slot of part `part` of `column`, if a read of the column has made its slots.
+    fn slot(&self, column: usize, part: usize) -> Option<&Mutex<PartSlot>> {
+        self.parts.get(column)?.get()?.get(part)
+    }
+
+    /// The slot of part `part` of `column`, making the column's slots if no read has yet.
+    fn made(&self, column: usize, part: usize) -> Option<&Mutex<PartSlot>> {
+        let slots = self
+            .parts
+            .get(column)?
+            .get_or_init(|| (0..self.places).map(|_| Mutex::new(PartSlot::Unseen)).collect());
+        slots.get(part)
+    }
 }
 
 /// The pages every reader of one database keeps, under one budget in bytes.
@@ -4683,7 +4702,7 @@ struct Held {
     shelf: Weak<Shelf>,
     column: usize,
     stripe: usize,
-    /// The slot in [`Shelf::parts`] when this is a decoded part rather than a page.
+    /// The part of the column in [`Shelf::parts`] when this is a decoded part rather than a page.
     part: Option<usize>,
     bytes: usize,
     used: Arc<AtomicBool>,
@@ -4772,8 +4791,10 @@ impl PagePool {
             }
         }
         for (shelf, entry) in gone {
-            if let Some(slot) = entry.part {
-                let Some(Ok(mut held)) = shelf.parts.get(slot).map(Mutex::lock) else { continue };
+            if let Some(part) = entry.part {
+                let Some(Ok(mut held)) = shelf.slot(entry.column, part).map(Mutex::lock) else {
+                    continue;
+                };
                 if matches!(&*held, PartSlot::Held { used, .. } if Arc::ptr_eq(used, &entry.used)) {
                     // Dropped after the lock is let go, since the last holder frees the vector.
                     let _vector = std::mem::take(&mut *held);
@@ -6612,7 +6633,8 @@ impl Reader {
         let columns = (0..table_fields).map(|_| Mutex::new(Cached::default())).collect::<Vec<_>>();
         let cache = Shelf {
             columns,
-            parts: (0..places.len() * table_fields).map(|_| Mutex::new(PartSlot::Unseen)).collect(),
+            parts: (0..table_fields).map(|_| OnceLock::new()).collect(),
+            places: places.len(),
             held: (0..table_fields).map(|_| AtomicUsize::new(0)).collect(),
             kept: AtomicUsize::new(CACHED_STRIPES_PER_COLUMN),
         };
@@ -8276,11 +8298,10 @@ impl Reader {
         let mut picked = Vec::with_capacity(columns.len());
         let keeps = self.pool.keeps();
         for &column in columns {
-            let slot = at * self.table.fields.len() + column;
             // Whether this read decodes the part whole and keeps it, when it is not held already.
             let mut keeping = false;
             if keeps {
-                match self.decoded(slot, positions, rows) {
+                match self.decoded(at, column, positions, rows) {
                     Ok(vector) => {
                         picked.push(match positions {
                             None => Arc::unwrap_or_clone(vector),
@@ -8380,7 +8401,7 @@ impl Reader {
             }
             let vector = vector.into_pages();
             if keeping {
-                let vector = self.keep(slot, column, vector);
+                let vector = self.keep(at, column, vector);
                 picked.push(match positions {
                     None => Arc::unwrap_or_clone(vector),
                     Some(positions) => vector.gather(positions)?,
@@ -8392,15 +8413,16 @@ impl Reader {
         Chunk::with_rows(picked, positions.map_or(rows, <[u32]>::len))
     }
 
-    /// The part in `slot` as it was decoded before, or, when it is not held, whether this read
+    /// Part `at` of `column` as it was decoded before, or, when it is not held, whether this read
     /// should decode it whole and keep it. See [`PartSlot`].
     fn decoded(
         &self,
-        slot: usize,
+        at: usize,
+        column: usize,
         positions: Option<&[u32]>,
         rows: usize,
     ) -> std::result::Result<Arc<Vector>, bool> {
-        let Some(Ok(mut held)) = self.cache.parts.get(slot).map(Mutex::lock) else {
+        let Some(Ok(mut held)) = self.cache.made(column, at).map(Mutex::lock) else {
             return Err(false);
         };
         match &*held {
@@ -8423,13 +8445,13 @@ impl Reader {
         }
     }
 
-    /// Holds `vector` as the decoded part in `slot` and counts it against the pool, and answers
-    /// what the read goes on with, which is the one already held if another worker got there first.
-    fn keep(&self, slot: usize, column: usize, vector: Vector) -> Arc<Vector> {
+    /// Holds `vector` as part `at` of `column` and counts it against the pool, and answers what the
+    /// read goes on with, which is the one already held if another worker got there first.
+    fn keep(&self, at: usize, column: usize, vector: Vector) -> Arc<Vector> {
         let bytes = vector.footprint();
         let vector = Arc::new(vector);
         let used = Arc::new(AtomicBool::new(false));
-        let Some(Ok(mut held)) = self.cache.parts.get(slot).map(Mutex::lock) else {
+        let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else {
             return vector;
         };
         if let PartSlot::Held { vector, .. } = &*held {
@@ -8441,7 +8463,7 @@ impl Reader {
             shelf: Arc::downgrade(&self.cache),
             column,
             stripe: 0,
-            part: Some(slot),
+            part: Some(at),
             bytes,
             used,
         });
@@ -16328,7 +16350,7 @@ mod tests {
         let pool = PagePool::new(usize::MAX);
         let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
         let a = catalog.table("a").expect("a");
-        let slot = |part: usize| a.cache.parts[part].lock().expect("the slot");
+        let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
         let sparse = a.read_rows(0, &[0], &[3], false).expect("one row");
         assert_eq!(sparse.value_at(0, 0), Value::Integer(3));
         assert!(matches!(*slot(0), PartSlot::Seen(1)), "a sparse first read only counts its rows");
@@ -16374,7 +16396,8 @@ mod tests {
         assert!(pool.bytes() < all, "the pool kept under what every part takes");
         let held = (0..parts)
             .filter(|&part| {
-                matches!(*a.cache.parts[part].lock().expect("the slot"), PartSlot::Held { .. })
+                let slot = a.cache.slot(0, part).expect("made");
+                matches!(*slot.lock().expect("the slot"), PartSlot::Held { .. })
             })
             .count();
         assert!(held < parts, "some parts were let go");
