@@ -62,6 +62,11 @@ pub fn state_layout(
         }
         "min" | "max" | "bool_and" | "bool_or" | "bit_and" | "bit_or" | "bit_xor" | "product"
         | "count_if" => returns.clone(),
+        "list" | "string_agg" => returns.clone(),
+        "quantile_cont" | "quantile_disc" | "median" => match arguments.first() {
+            Some(ty) => LogicalType::List(Box::new(ty.clone())),
+            None => return Err(not_written(name)),
+        },
         "first" | "last" | "any_value" => {
             LogicalType::Struct(vec![field("value", returns.clone())])
         }
@@ -89,6 +94,15 @@ pub fn state_layout(
     })
 }
 
+/// The position of the first argument of `name` that its state keeps the constant of, which is
+/// past the end for an aggregate that reads every argument on every row.
+pub fn state_constants(name: &str) -> usize {
+    match name {
+        "string_agg" | "quantile_cont" | "quantile_disc" => 1,
+        _ => usize::MAX,
+    }
+}
+
 fn not_written(name: &str) -> Error {
     Error::not_implemented(format!("exporting the state of the {name} aggregate"))
 }
@@ -110,7 +124,9 @@ pub(crate) fn state_call(
 ) -> Result<Option<Value>> {
     if let Some(rest) = name.strip_prefix(FINALIZE) {
         let mut words = rest.split_whitespace();
-        let (Some(function), Some(scale), [value]) = (words.next(), words.next(), args) else {
+        let (Some(function), Some(scale), [value, constants @ ..]) =
+            (words.next(), words.next(), args)
+        else {
             return Err(Error::internal(format!("a finalize stored as {name}")));
         };
         if value.is_null() {
@@ -118,7 +134,8 @@ pub(crate) fn state_call(
         }
         let scale =
             scale.parse().map_err(|_| Error::internal(format!("a finalize stored as {name}")))?;
-        let accumulator = Accumulator::import(function, returns, scale, value)?;
+        let constant = constants.get(1).filter(|constant| !constant.is_null());
+        let accumulator = Accumulator::import(function, returns, scale, value, constant)?;
         return accumulator.finish().map(Some);
     }
     if name != "combine" {
@@ -140,8 +157,18 @@ pub(crate) fn state_call(
         Some(LogicalType::Decimal { scale, .. }) => *scale,
         _ => 0,
     };
-    let mut accumulator = Accumulator::import(&state.function, &state.returns, scale, left)?;
-    accumulator.combine(&Accumulator::import(&state.function, &state.returns, scale, right)?)?;
+    let constant = state.constants.get(1).and_then(Option::as_ref);
+    let import =
+        |value| Accumulator::import(&state.function, &state.returns, scale, value, constant);
+    // The pin folds the left state into the right one, so a list comes out as the right rows
+    // followed by the left ones. Its `last` of a number keeps the right value when it has one,
+    // the way `first` does, where the `last` of a string keeps the left one.
+    let text = matches!(state.returns, LogicalType::Varchar | LogicalType::Blob);
+    if state.function == "last" && !text {
+        return Ok(Some(if right.is_null() { left.clone() } else { right.clone() }));
+    }
+    let mut accumulator = import(right)?;
+    accumulator.combine(&import(left)?)?;
     accumulator.export(&state.layout).map(Some)
 }
 
@@ -257,12 +284,13 @@ impl Accumulator {
                 ("mean".to_string(), Value::Double(*mean)),
                 ("dsquared".to_string(), Value::Double(*squared)),
             ])),
-            State::General(general) => general.export(),
+            State::General(general) => general.export(layout),
         }
     }
 
     /// A fresh accumulator for `function` answering `returns` holding the state `value` wrote,
-    /// where `scale` is the scale of a decimal argument. A null state is an empty one.
+    /// where `scale` is the scale of a decimal argument and `constant` is the one the call was
+    /// bound with, a separator or a fraction. A null state is an empty one.
     ///
     /// # Errors
     ///
@@ -272,8 +300,12 @@ impl Accumulator {
         returns: &LogicalType,
         scale: u8,
         value: &Value,
+        constant: Option<&Value>,
     ) -> Result<Self> {
         let mut accumulator = Self::new(function, returns)?;
+        if let State::General(general) = &mut accumulator.state {
+            general.bind(constant);
+        }
         if value.is_null() {
             return Ok(accumulator);
         }
@@ -314,8 +346,8 @@ impl Accumulator {
 }
 
 impl General {
-    /// The state written out in the layout [`state_layout`] gives it.
-    fn export(&self) -> Result<Value> {
+    /// The state written out in `layout`, which [`state_layout`] gave for it.
+    fn export(&self, layout: &LogicalType) -> Result<Value> {
         let named = |fields: Vec<(&str, Value)>| {
             Value::Struct(
                 fields.into_iter().map(|(name, value)| (name.to_string(), value)).collect(),
@@ -341,6 +373,15 @@ impl General {
             }
             Self::Paired(state) => state.export(),
             Self::Powers(state) => state.export(),
+            Self::List { .. } | Self::Joined { .. } => self.finish()?,
+            Self::Holistic { values, .. } if values.len() == 0 => Value::Null,
+            Self::Holistic { values, .. } => {
+                let element = match layout {
+                    LogicalType::List(element) => (**element).clone(),
+                    _ => LogicalType::Null,
+                };
+                Value::List { element, values: values.values() }
+            }
             _ => return Err(Error::internal("exporting a state that has no layout")),
         })
     }
@@ -366,8 +407,38 @@ impl General {
             }
             Self::Paired(state) => state.import(value)?,
             Self::Powers(state) => state.import(value)?,
+            Self::List { values, .. } | Self::Holistic { values, .. } => {
+                let Value::List { values: held, .. } = value else {
+                    return Err(Error::internal(format!("a list state holding {value:?}")));
+                };
+                for value in held {
+                    values.push(value);
+                }
+            }
+            Self::Joined { text, seen, .. } => {
+                let Value::Varchar(held) = value else {
+                    return Err(Error::internal(format!("a string_agg state holding {value:?}")));
+                };
+                text.clone_from(held);
+                *seen = true;
+            }
             _ => return Err(Error::internal("importing a state that has no layout")),
         }
         Ok(())
+    }
+
+    /// Gives a fresh state the constant its call was bound with, which a state read back from
+    /// its layout does not carry: the separator of a `string_agg` and the fraction of a quantile.
+    fn bind(&mut self, constant: Option<&Value>) {
+        match self {
+            Self::Joined { separator, .. } => {
+                *separator = match constant {
+                    Some(Value::Varchar(text)) => text.clone(),
+                    _ => ",".to_string(),
+                };
+            }
+            Self::Holistic { fraction, .. } => *fraction = constant.cloned().map(Box::new),
+            _ => {}
+        }
     }
 }

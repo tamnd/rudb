@@ -3403,7 +3403,12 @@ impl<'a> Binder<'a> {
             let arguments: Vec<LogicalType> =
                 cast.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
             let layout = rudb_kernels::state_layout(resolved.name, &arguments, &ty)?;
-            ty = LogicalType::aggregate_state(resolved.name, arguments, ty, layout);
+            let from = rudb_kernels::state_constants(resolved.name);
+            let mut constants = Vec::with_capacity(cast.len());
+            for (at, &arg) in cast.iter().enumerate() {
+                constants.push(if at >= from { fold::value_of(&self.plan, arg)? } else { None });
+            }
+            ty = LogicalType::aggregate_state(resolved.name, arguments, ty, layout, constants);
             name.push_str(rudb_kernels::EXPORTED);
         }
         let args = self.plan.add_expr_list(&cast);

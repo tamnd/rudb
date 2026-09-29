@@ -13,6 +13,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::value::Value;
 
 /// A named field of a `STRUCT` or a `UNION`, and a named column of a table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -144,7 +145,7 @@ pub enum LogicalType {
 }
 
 /// The call an [`LogicalType::AggregateState`] came from and the shape its state is written in.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StateType {
     /// The aggregate's name, as it resolved.
     pub function: String,
@@ -154,6 +155,26 @@ pub struct StateType {
     pub returns: LogicalType,
     /// The type the state is written as.
     pub layout: LogicalType,
+    /// The constant each argument was bound to, for the arguments the aggregate reads once at bind
+    /// time rather than on every row, and `None` for the rest. The separator of a `string_agg` and
+    /// the fraction of a `quantile_cont` are these, and two states only combine when theirs match.
+    pub constants: Vec<Option<Value>>,
+}
+
+// A value compares equal to itself here, nulls and NaNs included, which is what a type needs.
+impl Eq for StateType {}
+
+impl std::hash::Hash for StateType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.function.hash(state);
+        self.arguments.hash(state);
+        self.returns.hash(state);
+        self.layout.hash(state);
+        // A value has no hash of its own, and its debug text is one that equal values share.
+        for constant in &self.constants {
+            format!("{constant:?}").hash(state);
+        }
+    }
 }
 
 /// How a value is actually laid out in a vector.
@@ -283,9 +304,16 @@ impl LogicalType {
         arguments: Vec<Self>,
         returns: Self,
         layout: Self,
+        constants: Vec<Option<Value>>,
     ) -> Self {
         let function = function.into();
-        Self::AggregateState(Arc::new(StateType { function, arguments, returns, layout }))
+        Self::AggregateState(Arc::new(StateType {
+            function,
+            arguments,
+            returns,
+            layout,
+            constants,
+        }))
     }
 
     /// How this type is laid out.
