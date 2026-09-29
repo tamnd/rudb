@@ -719,6 +719,59 @@ impl Rows {
         })
     }
 
+    /// Reads the rows at ascending table-wide ordinals a part at a time, handing each part's rows
+    /// to `each` as one chunk.
+    ///
+    /// Scattered rows fetched through [`Self::rows_at`] a vector at a time read every part they
+    /// fall in once for each vector, which is most of the table again for every two thousand rows
+    /// spread over all of it. Here a part is read once, and only for the rows asked of it.
+    ///
+    /// # Errors
+    ///
+    /// If the ordinals do not rise, one is past the table, or a part cannot be read.
+    pub fn each_part_at(
+        &self,
+        types: &[LogicalType],
+        columns: &[usize],
+        ordinals: &[u64],
+        each: &mut dyn FnMut(Chunk) -> Result<()>,
+    ) -> Result<()> {
+        let Self::Native(reader) = self else {
+            for ordinals in ordinals.chunks(VECTOR_SIZE) {
+                each(self.rows_at(types, columns, ordinals)?)?;
+            }
+            return Ok(());
+        };
+        if ordinals.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Error::internal("a fetch by part was given ordinals out of order"));
+        }
+        let mut positions = Vec::new();
+        let mut start = 0_u64;
+        let mut at = 0;
+        for part in 0..reader.parts() {
+            if at == ordinals.len() {
+                break;
+            }
+            let end = start + reader.part_rows(part) as u64;
+            positions.clear();
+            while at < ordinals.len() && ordinals[at] < end {
+                positions.push(
+                    u32::try_from(ordinals[at] - start)
+                        .map_err(|_| Error::internal("a row within a part exceeds u32"))?,
+                );
+                at += 1;
+            }
+            if !positions.is_empty() {
+                each(reader.read_rows(part, columns, &positions, false)?)?;
+            }
+            start = end;
+        }
+        if at < ordinals.len() {
+            return Err(Error::internal("row ordinal is past the table"));
+        }
+        Ok(())
+    }
+
     /// Reads selected rows by table-wide ordinal in the order requested.
     pub fn rows_at(
         &self,

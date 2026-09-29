@@ -61,7 +61,7 @@ use rudb_plan::{
     PipelineRef, Plan, ROOT, Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
-use rudb_vector::VECTOR_SIZE;
+use rudb_vector::{Chunk, VECTOR_SIZE};
 
 use crate::buffer::Buffered;
 use crate::consistent::{Answer, Collect, Reduction};
@@ -1548,15 +1548,22 @@ fn count_rows(
 ) -> Result<()> {
     let mut scratch = Scratch::default();
     let mut vectors = Vec::with_capacity(stored.len());
-    for ordinals in ordinals.chunks(VECTOR_SIZE) {
-        let chunk = table.rows().rows_at(types, stored, ordinals)?;
+    let mut count = |chunk: &Chunk| -> Result<()> {
         vectors.clear();
-        keys.evaluate(&chunk, &mut scratch, &mut vectors)?;
-        for row in 0..ordinals.len() {
+        keys.evaluate(chunk, &mut scratch, &mut vectors)?;
+        for row in 0..chunk.len() {
             let key =
                 vectors.iter().map(|vector| vector.try_value_at(row)).collect::<Result<_>>()?;
             *counts.entry(Key(key)).or_default() += 1;
         }
+        Ok(())
+    };
+    // Rows in ascending order are read a part at a time, each part once.
+    if ordinals.windows(2).all(|pair| pair[0] < pair[1]) {
+        return table.rows().each_part_at(types, stored, ordinals, &mut |chunk| count(&chunk));
+    }
+    for ordinals in ordinals.chunks(VECTOR_SIZE) {
+        count(&table.rows().rows_at(types, stored, ordinals)?)?;
     }
     Ok(())
 }
