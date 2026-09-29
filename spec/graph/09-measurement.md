@@ -95,3 +95,24 @@ The number that matters more is the one underneath it. Had nothing been turned a
 Projected to SF100 by scaling row counts and recomputing each packed width from the parent's row count, holding the measured 3.91 percent rank and select overhead of the monotone form: 1.898 GB of graph sections against 26.60 GB of column bytes, which is 7.14 percent, with the same two relationships monotone and the same two turned away. The projection puts `lineitem -> part` at 1.88 GB, which is the figure document 03 section 3.4 arrived at independently, so the two agree.
 
 C1 is therefore met at SF10 on a real file and met in projection at SF100, and the SF100 run itself is owed on a machine with the disk for it. What the projection cannot settle is build time at scale: the nine links took 3.11 seconds in total at SF10, and whether that stays linear is a measurement and not an argument.
+
+### The layer on TPC-H SF1, which is what moved `graph_sections` to on
+
+Measured on one TPC-H SF1 file loaded the way `rudb-bench` loads it, `CREATE TABLE ... AS SELECT` per table and then `CHECKPOINT`, with one difference: the checkpoint ran under `SET graph_links` naming the schema's ten relationships, every foreign key of the TPC-H schema including the composite `lineitem(l_partkey, l_suppkey) -> partsupp`. Without that the file holds no section at all, because Parquet brings no foreign key, and turning the layer on changes nothing, which is what the bench measured until now. Every query ran at one thread with `graph_sections` off and then on, three times in one process, counting user instructions and cycles.
+
+All 22 answers are the same both ways at one thread and at eight. No query runs more instructions with the layer on, and over the suite the total goes from 8,818 M to 7,485 M, 15 percent less. The queries that move are the ones whose joins reach `lineitem` from a small parent:
+
+| query | instructions off | on | cycles off | on |
+|---|---|---|---|---|
+| q17 | 298 M | 65 M | 208 M | 102 M |
+| q21 | 1,119 M | 654 M | 760 M | 582 M |
+| q19 | 286 M | 163 M | 218 M | 178 M |
+| q08 | 349 M | 241 M | 265 M | 202 M |
+| q04 | 300 M | 225 M | 201 M | 156 M |
+| q09 | 1,065 M | 917 M | 1,014 M | 944 M |
+| q10 | 502 M | 425 M | 334 M | 324 M |
+| q11 | 62 M | 46 M | 59 M | 40 M |
+
+Most of it is the executor and not the optimizer. The query session did not declare the relationships, so the planner had none to rewrite with, and what fired is the scan reading a reduced `lineitem` through the key maps and the backward adjacency the checkpoint wrote. Declaring them in the query session as well takes q09 to 830 M and q12 from 393 M to 342 M, and costs q13 16 M, which is small enough to leave for its own measurement.
+
+That is the measurement #760 asked the default to wait for, so `graph_sections` now starts on. It changes nothing for a file with no relationship declared, and the ablation of section 9.2 is still one `SET graph_sections = 'off'` away.
