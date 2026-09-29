@@ -720,6 +720,12 @@ impl StringColumn {
     pub fn reserve_views(&mut self, count: usize) {
         self.views.reserve(count);
     }
+
+    /// Keeps the first `len` strings and drops the rest. The bytes of a long one dropped stay in the
+    /// arena, where nothing points at them.
+    pub fn truncate(&mut self, len: usize) {
+        self.views.to_mut().truncate(len);
+    }
 }
 
 /// The arenas a run of string columns share, for laying the columns end to end.

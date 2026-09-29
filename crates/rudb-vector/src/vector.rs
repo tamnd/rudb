@@ -5000,6 +5000,162 @@ fn bytes_as(ty: &LogicalType, bytes: &[u8]) -> Value {
     }
 }
 
+/// A column built one value at a time, for rows that arrive one by one.
+///
+/// [`Vector::from_values`] builds a column out of values that are all there already, and a table
+/// written a row at a time would have to hold every row as its values until there were enough to
+/// build from. This takes each value as it comes and puts it where the column keeps it, so the row
+/// is gone the moment it lands and the column is already laid when the rows add up to one.
+///
+/// The column it builds is the one [`Vector::from_values`] would have built from the same values.
+/// A nested type has no flat layout to push into, so for one of those the values are held and
+/// built from at the end, which is what the caller would have done without this.
+#[derive(Debug, Clone)]
+pub struct Builder {
+    ty: LogicalType,
+    held: Held,
+    /// The rows that are null, as a bit each, and how many of them there are.
+    nulls: Vec<u64>,
+    null_count: usize,
+    len: usize,
+    /// How many rows to make room for each time the column starts again.
+    room: usize,
+}
+
+#[derive(Debug, Clone)]
+enum Held {
+    Flat(Data),
+    Values(Vec<Value>),
+}
+
+impl Builder {
+    /// An empty column of `ty`, with room for `room` rows.
+    #[must_use]
+    pub fn new(ty: LogicalType, room: usize) -> Self {
+        let ty = held_as(ty);
+        let held = Self::empty(&ty, room);
+        Self { ty, held, nulls: Vec::new(), null_count: 0, len: 0, room }
+    }
+
+    fn empty(ty: &LogicalType, room: usize) -> Held {
+        match ty {
+            LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(..) => {
+                Held::Values(Vec::with_capacity(room))
+            }
+            _ => data_for(ty, room).map_or_else(|_| Held::Values(Vec::new()), Held::Flat),
+        }
+    }
+
+    /// How many values are in the column so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing has been pushed since the column last started.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Adds one value to the end.
+    ///
+    /// # Errors
+    ///
+    /// If the value is not one the type can hold, and the column is left as it was.
+    pub fn push(&mut self, value: &Value) -> Result<()> {
+        let null = value.is_null();
+        match &mut self.held {
+            Held::Flat(data) => push_value(data, stored(&self.ty, value)?.as_ref())?,
+            Held::Values(values) => values.push(value.clone()),
+        }
+        if null {
+            let (word, bit) = (self.len / 64, self.len % 64);
+            if self.nulls.len() <= word {
+                self.nulls.resize(word + 1, 0);
+            }
+            self.nulls[word] |= 1 << bit;
+            self.null_count += 1;
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Drops every value past the first `len`, which is how a row that one column refused is taken
+    /// back out of the columns before it.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        match &mut self.held {
+            Held::Flat(data) => {
+                macro_rules! cut {
+                    ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+                        match data {
+                            Data::Empty => {}
+                            $(Data::$variant(values) => values.to_mut().truncate(len),)+
+                            Data::Varlen(values) => values.truncate(len),
+                        }
+                    };
+                }
+                crate::for_each_layout!(fixed, cut);
+            }
+            Held::Values(values) => values.truncate(len),
+        }
+        for row in len..self.len {
+            let (word, bit) = (row / 64, row % 64);
+            if let Some(bits) = self.nulls.get_mut(word)
+                && *bits & (1 << bit) != 0
+            {
+                *bits &= !(1 << bit);
+                self.null_count -= 1;
+            }
+        }
+        self.len = len;
+    }
+
+    /// The column so far, leaving it where it is.
+    ///
+    /// # Errors
+    ///
+    /// If held values will not build, which a value [`Self::push`] took always does.
+    pub fn vector(&self) -> Result<Vector> {
+        match &self.held {
+            Held::Flat(data) => Ok(self.laid(data.clone())),
+            Held::Values(values) => Vector::from_values(self.ty.clone(), values),
+        }
+    }
+
+    /// The column so far, and a fresh empty one in its place.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::vector`].
+    pub fn finish(&mut self) -> Result<Vector> {
+        let held = std::mem::replace(&mut self.held, Self::empty(&self.ty, self.room));
+        let vector = match held {
+            Held::Flat(data) => self.laid(data),
+            Held::Values(values) => Vector::from_values(self.ty.clone(), &values)?,
+        };
+        self.nulls.clear();
+        self.null_count = 0;
+        self.len = 0;
+        Ok(vector)
+    }
+
+    fn laid(&self, data: Data) -> Vector {
+        let validity = if self.null_count == 0 {
+            Validity::AllValid
+        } else {
+            let nulls = &self.nulls;
+            Validity::from_iter(self.len, |row| {
+                nulls.get(row / 64).is_none_or(|bits| bits & (1 << (row % 64)) == 0)
+            })
+        };
+        Vector { ty: self.ty.clone(), len: self.len, validity, body: Body::Flat(data) }
+    }
+}
+
 /// An empty run of data of the right layout for a type.
 pub(crate) fn empty_data_for(ty: &LogicalType) -> Result<Data> {
     use rudb_common::PhysicalType as P;
@@ -5211,6 +5367,75 @@ mod tests {
     use crate::fsst::SymbolTable;
     use crate::string::{StringColumn, StringView};
     use crate::validity::Validity;
+
+    #[test]
+    fn a_column_built_a_value_at_a_time_is_the_one_built_from_all_of_them() {
+        let long = "a string long enough to live in the arena rather than its view";
+        let columns: Vec<(LogicalType, Vec<Value>)> = vec![
+            (
+                LogicalType::BigInt,
+                (0..200).map(|i| if i % 7 == 0 { Value::Null } else { Value::BigInt(i) }).collect(),
+            ),
+            (
+                LogicalType::Varchar,
+                (0..200)
+                    .map(|i| match i % 5 {
+                        0 => Value::Null,
+                        1 => Value::Varchar(format!("{long} {i}")),
+                        _ => Value::Varchar(format!("s{i}")),
+                    })
+                    .collect(),
+            ),
+            (LogicalType::Double, (0..200).map(|i| Value::Double(f64::from(i) / 3.0)).collect()),
+            (
+                LogicalType::list(LogicalType::Integer),
+                (0..200)
+                    .map(|i| match i % 3 {
+                        0 => Value::Null,
+                        _ => Value::List {
+                            element: LogicalType::Integer,
+                            values: vec![Value::Integer(i), Value::Null],
+                        },
+                    })
+                    .collect(),
+            ),
+        ];
+        for (ty, values) in columns {
+            let whole = Vector::from_values(ty.clone(), &values).expect("builds");
+            let mut built = super::Builder::new(ty.clone(), 16);
+            for value in &values[..150] {
+                built.push(value).expect("pushes");
+            }
+            let part = built.vector().expect("the column so far");
+            assert_eq!(part.len(), 150);
+            for (row, value) in values[..150].iter().enumerate() {
+                assert_eq!(part.value_at(row), *value, "{ty} row {row}");
+            }
+            for value in &values[150..] {
+                built.push(value).expect("pushes");
+            }
+            // A row taken back and pushed again lands where it was.
+            built.truncate(190);
+            assert_eq!(built.len(), 190);
+            for value in &values[190..] {
+                built.push(value).expect("pushes");
+            }
+            let done = built.finish().expect("the column");
+            assert!(built.is_empty(), "finishing starts the column again");
+            assert_eq!(done.len(), whole.len());
+            assert_eq!(
+                done.validity().count_valid(done.len()),
+                whole.validity().count_valid(whole.len())
+            );
+            for row in 0..values.len() {
+                assert_eq!(done.value_at(row), whole.value_at(row), "{ty} row {row}");
+            }
+        }
+        let mut refused = super::Builder::new(LogicalType::Integer, 4);
+        refused.push(&Value::Integer(1)).expect("pushes");
+        assert!(refused.push(&Value::Varchar("x".into())).is_err());
+        assert_eq!(refused.vector().expect("the column").len(), 1, "a refused value is not kept");
+    }
 
     fn integers(values: &[i32]) -> Vector {
         Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into())).unwrap()
