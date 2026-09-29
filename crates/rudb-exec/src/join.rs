@@ -1790,7 +1790,34 @@ impl Stream for Probe<'_> {
             // pair of numbers per pair of rows, and the columns are gathered at those numbers below.
             left_at.clear();
             right_at.clear();
-            while *row < left.len() && left_at.len() < VECTOR_SIZE {
+            // A table whose every key has one row, asked by an inner, semi or anti join with no
+            // residual, answers each driving row with its first row and nothing else, so the answer
+            // for a whole batch is read off the firsts in one pass. That is a join to a primary
+            // key, most of the joins TPC-H has, and the loop below paid a check of the clock, a
+            // match on the kind and a slice per driving row for it.
+            let batch = residual.exprs.is_empty()
+                && single
+                && *hit == 0
+                && matches!(self.kind, JoinKind::Inner | JoinKind::Semi | JoinKind::Anti);
+            if batch {
+                self.cancel.check()?;
+                let end = left.len().min(*row + VECTOR_SIZE);
+                u32::try_from(end).map_err(|_| too_many_rows())?;
+                let wanted = self.kind != JoinKind::Anti;
+                let inner = self.kind == JoinKind::Inner;
+                for at in *row..end {
+                    let first = firsts.get(at).copied().unwrap_or(NONE);
+                    if (first != NONE) == wanted {
+                        // Under `end`, which fits a `u32` as checked above.
+                        left_at.push(at as u32);
+                        if inner {
+                            right_at.push(first);
+                        }
+                    }
+                }
+                *row = end;
+            }
+            while !batch && *row < left.len() && left_at.len() < VECTOR_SIZE {
                 // Once per driving row, the same granularity the nested loop checks at, and the
                 // only place in this operator that runs long once the table is built.
                 self.cancel.check()?;
