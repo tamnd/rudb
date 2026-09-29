@@ -4558,6 +4558,36 @@ struct Cached {
     passing: VecDeque<usize>,
 }
 
+/// One part of one column as decoding left it, held so that the next scan of it does not decode it
+/// again.
+///
+/// A warm query over a file spends most of its time turning the same bytes into the same vectors
+/// it turned them into on the run before. On JOB, decoding was 28 percent of all the CPU the 113
+/// queries spent warm, and allocating and zeroing what it decoded into was most of another 10.
+/// Holding the pages saves the read and not the decode. So the decoded part is held too, in the
+/// same pool and under the same budget as the pages, and a page nobody reads any more because its
+/// parts are all held here goes first when the pool is over.
+///
+/// A part is held once a read wants all of it, or once the reads that wanted some of its rows
+/// have between them decoded as many rows as it has. Until then each of those reads decodes its
+/// own rows and no more and adds them to the count. Decoding the part whole on its second read,
+/// which is what this did first, took JOB 3a's second run from 1.4 to 4.2 billion instructions,
+/// since it decompressed all of `movie_info.info` to use a few rows of it. Counting rows is the
+/// ski rental answer: a part is never decoded whole before sparse reads have already paid about
+/// what that costs, so the most it can cost over decoding only what is asked is about double.
+/// With all of that the 113 queries ran on well under two thirds of the instructions.
+#[derive(Debug, Default)]
+enum PartSlot {
+    #[default]
+    Unseen,
+    /// The rows sparse reads have decoded so far.
+    Seen(usize),
+    Held {
+        vector: Arc<Vector>,
+        used: Arc<AtomicBool>,
+    },
+}
+
 /// One page a reader holds, and whether anyone has read it since the pool last looked.
 #[derive(Debug, Clone)]
 struct Resident {
@@ -4569,6 +4599,9 @@ struct Resident {
 #[derive(Debug)]
 struct Shelf {
     columns: Vec<Mutex<Cached>>,
+    /// Every part of every column as decoding left it, a slot per column of the table for each
+    /// part in turn. See [`PartSlot`].
+    parts: Vec<Mutex<PartSlot>>,
     /// How many pages each column holds right now. Counted outside the column locks so that the
     /// pool can tell whether a column is at its floor without taking a lock it might be under.
     held: Vec<AtomicUsize>,
@@ -4599,6 +4632,9 @@ struct Shelf {
 pub struct PagePool {
     ring: Arc<Mutex<Ring>>,
     budget: Arc<AtomicUsize>,
+    /// Set when the pool should hold pages only and never a decoded part, which is how the tests
+    /// that count pages see the pages on their own.
+    pages_only: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -4616,6 +4652,8 @@ struct Held {
     shelf: Weak<Shelf>,
     column: usize,
     stripe: usize,
+    /// The slot in [`Shelf::parts`] when this is a decoded part rather than a page.
+    part: Option<usize>,
     bytes: usize,
     used: Arc<AtomicBool>,
 }
@@ -4626,6 +4664,20 @@ impl PagePool {
     pub fn new(budget: usize) -> Self {
         let pool = Self::default();
         pool.budget.store(budget, Atomic::Relaxed);
+        pool
+    }
+
+    /// Whether the pool keeps anything past each column's floor, which a budget of zero says it
+    /// does not.
+    fn keeps(&self) -> bool {
+        self.budget.load(Atomic::Relaxed) > 0 && !self.pages_only.load(Atomic::Relaxed)
+    }
+
+    /// A pool that keeps up to `budget` bytes of pages and no decoded parts.
+    #[must_use]
+    pub fn pages_only(budget: usize) -> Self {
+        let pool = Self::new(budget);
+        pool.pages_only.store(true, Atomic::Relaxed);
         pool
     }
 
@@ -4666,6 +4718,11 @@ impl PagePool {
                     ring.held.push_back(entry);
                     continue;
                 }
+                if entry.part.is_some() {
+                    ring.bytes -= entry.bytes;
+                    gone.push((shelf, entry));
+                    continue;
+                }
                 let count = &shelf.held[entry.column];
                 if count.load(Atomic::Relaxed) <= shelf.kept.load(Atomic::Relaxed).max(1) {
                     ring.held.push_back(entry);
@@ -4684,6 +4741,15 @@ impl PagePool {
             }
         }
         for (shelf, entry) in gone {
+            if let Some(slot) = entry.part {
+                let Some(Ok(mut held)) = shelf.parts.get(slot).map(Mutex::lock) else { continue };
+                if matches!(&*held, PartSlot::Held { used, .. } if Arc::ptr_eq(used, &entry.used)) {
+                    // Dropped after the lock is let go, since the last holder frees the vector.
+                    let _vector = std::mem::take(&mut *held);
+                    drop(held);
+                }
+                continue;
+            }
             let Ok(mut cached) = shelf.columns[entry.column].lock() else { continue };
             if let Some(slot) = cached.pages.get_mut(entry.stripe)
                 && slot.as_ref().is_some_and(|slot| Arc::ptr_eq(&slot.used, &entry.used))
@@ -6515,6 +6581,7 @@ impl Reader {
         let columns = (0..table_fields).map(|_| Mutex::new(Cached::default())).collect::<Vec<_>>();
         let cache = Shelf {
             columns,
+            parts: (0..places.len() * table_fields).map(|_| Mutex::new(PartSlot::Unseen)).collect(),
             held: (0..table_fields).map(|_| AtomicUsize::new(0)).collect(),
             kept: AtomicUsize::new(CACHED_STRIPES_PER_COLUMN),
         };
@@ -8086,6 +8153,7 @@ impl Reader {
                 shelf: Arc::downgrade(&self.cache),
                 column,
                 stripe: at,
+                part: None,
                 bytes,
                 used,
             });
@@ -8148,7 +8216,23 @@ impl Reader {
             self.table.stripes.get(index).ok_or_else(|| invalid("stripe index out of range"))?;
         let rows = place.rows as usize;
         let mut picked = Vec::with_capacity(columns.len());
+        let keeps = self.pool.keeps();
         for &column in columns {
+            let slot = at * self.table.fields.len() + column;
+            // Whether this read decodes the part whole and keeps it, when it is not held already.
+            let mut keeping = false;
+            if keeps {
+                match self.decoded(slot, positions, rows) {
+                    Ok(vector) => {
+                        picked.push(match positions {
+                            None => Arc::unwrap_or_clone(vector),
+                            Some(positions) => vector.gather(positions)?,
+                        });
+                        continue;
+                    }
+                    Err(whole) => keeping = whole,
+                }
+            }
             let field = self
                 .table
                 .fields
@@ -8211,8 +8295,10 @@ impl Reader {
             // the run is a page. One `Arc` per column per part buys all of those, and it moves the
             // run into the `Arc` without touching a value.
             let mut vector = match positions {
-                None => decode(&field.ty, rows, bytes, dictionary)?,
-                Some(positions) => decode_at(&field.ty, rows, bytes, dictionary, positions)?,
+                Some(positions) if !keeping => {
+                    decode_at(&field.ty, rows, bytes, dictionary, positions)?
+                }
+                _ => decode(&field.ty, rows, bytes, dictionary)?,
             };
             // What was decoded is in memory of its own now, so once every part of the page has
             // been, nothing this scan does reads the page again. A part read twice counts twice
@@ -8234,9 +8320,75 @@ impl Reader {
             if self.demoted(column) {
                 vector = vector.loosened();
             }
-            picked.push(vector.into_pages());
+            let vector = vector.into_pages();
+            if keeping {
+                let vector = self.keep(slot, column, vector);
+                picked.push(match positions {
+                    None => Arc::unwrap_or_clone(vector),
+                    Some(positions) => vector.gather(positions)?,
+                });
+                continue;
+            }
+            picked.push(vector);
         }
         Chunk::with_rows(picked, positions.map_or(rows, <[u32]>::len))
+    }
+
+    /// The part in `slot` as it was decoded before, or, when it is not held, whether this read
+    /// should decode it whole and keep it. See [`PartSlot`].
+    fn decoded(
+        &self,
+        slot: usize,
+        positions: Option<&[u32]>,
+        rows: usize,
+    ) -> std::result::Result<Arc<Vector>, bool> {
+        let Some(Ok(mut held)) = self.cache.parts.get(slot).map(Mutex::lock) else {
+            return Err(false);
+        };
+        match &*held {
+            PartSlot::Held { vector, used } => {
+                used.store(true, Atomic::Relaxed);
+                Ok(Arc::clone(vector))
+            }
+            PartSlot::Unseen | PartSlot::Seen(_) => {
+                let before = match &*held {
+                    PartSlot::Seen(before) => *before,
+                    _ => 0,
+                };
+                let Some(kept) = positions else { return Err(true) };
+                let after = before + kept.len();
+                if after >= rows {
+                    return Err(true);
+                }
+                *held = PartSlot::Seen(after);
+                Err(false)
+            }
+        }
+    }
+
+    /// Holds `vector` as the decoded part in `slot` and counts it against the pool, and answers
+    /// what the read goes on with, which is the one already held if another worker got there first.
+    fn keep(&self, slot: usize, column: usize, vector: Vector) -> Arc<Vector> {
+        let bytes = vector.footprint();
+        let vector = Arc::new(vector);
+        let used = Arc::new(AtomicBool::new(false));
+        let Some(Ok(mut held)) = self.cache.parts.get(slot).map(Mutex::lock) else {
+            return vector;
+        };
+        if let PartSlot::Held { vector, .. } = &*held {
+            return Arc::clone(vector);
+        }
+        *held = PartSlot::Held { vector: Arc::clone(&vector), used: Arc::clone(&used) };
+        drop(held);
+        self.pool.admit(Held {
+            shelf: Arc::downgrade(&self.cache),
+            column,
+            stripe: 0,
+            part: Some(slot),
+            bytes,
+            used,
+        });
+        vector
     }
 
     /// Whether persisted statistics prove that a part cannot match the predicates.
@@ -15789,7 +15941,7 @@ mod tests {
         }
         writer.finish().expect("commit");
 
-        let pool = PagePool::new(usize::MAX);
+        let pool = PagePool::pages_only(usize::MAX);
         let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
         let a = catalog.table("a").expect("a");
         let stripes = a.table().stripes().len();
@@ -16050,7 +16202,7 @@ mod tests {
         }
         writer.finish().expect("commit");
 
-        let pool = PagePool::new(usize::MAX);
+        let pool = PagePool::pages_only(usize::MAX);
         let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
         let (a, b) = (catalog.table("a").expect("a"), catalog.table("b").expect("b"));
         let stripes = a.table().stripes().len();
@@ -16093,6 +16245,80 @@ mod tests {
         scan(&c);
         scan(&c);
         assert!(pool.bytes() <= one, "only what the live reader holds is counted");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A part read a second time comes out of the pool already decoded, a sparse first read only
+    /// marks it, and a part the pool lets go is decoded again from its pages.
+    #[test]
+    fn a_pool_keeps_decoded_parts_and_lets_them_go_under_its_budget() {
+        let path = path("decoded-parts");
+        let parts = STRIPE_PARTS * 2;
+        let mut writer =
+            Writer::create(&path, "a", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        for part in 0..parts {
+            let values: Vec<Value> =
+                (0..64).map(|row| Value::Integer((part * 64 + row) as i32)).collect();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Integer, &values).expect("integers"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("a").expect("a");
+        let slot = |part: usize| a.cache.parts[part].lock().expect("the slot");
+        let sparse = a.read_rows(0, &[0], &[3], false).expect("one row");
+        assert_eq!(sparse.value_at(0, 0), Value::Integer(3));
+        assert!(matches!(*slot(0), PartSlot::Seen(1)), "a sparse first read only counts its rows");
+        assert_eq!(pool.bytes(), 0, "and keeps nothing");
+        for _ in 0..62 {
+            a.read_rows(0, &[0], &[3], false).expect("one row");
+        }
+        assert!(matches!(*slot(0), PartSlot::Seen(63)), "and so do the ones after it");
+        a.read_rows(0, &[0], &[3], false).expect("one row");
+        assert!(
+            matches!(*slot(0), PartSlot::Held { .. }),
+            "until they have decoded as many rows as the part has"
+        );
+
+        for _ in 0..2 {
+            for part in 0..parts {
+                let chunk = a.read(part, &[0]).expect("a part");
+                assert_eq!(chunk.len(), 64);
+                assert_eq!(chunk.value_at(63, 0), Value::Integer((part * 64 + 63) as i32));
+                let rows = a.read_rows(part, &[0], &[1, 5], false).expect("two rows");
+                assert_eq!(rows.value_at(1, 0), Value::Integer((part * 64 + 5) as i32));
+            }
+        }
+        assert!((0..parts).all(|part| matches!(*slot(part), PartSlot::Held { .. })));
+        let all = pool.bytes();
+        assert!(all > 0, "the pool counts the parts it keeps");
+
+        drop((a, catalog));
+
+        // A pool with room for a quarter of the parts lets some go, and those read back the same.
+        let pool = PagePool::new(all / 4);
+        let catalog = Catalog::open_in(&path, &pool).expect("again");
+        let a = catalog.table("a").expect("a");
+        for _ in 0..3 {
+            for part in 0..parts {
+                let chunk = a.read(part, &[0]).expect("a part");
+                assert_eq!(chunk.value_at(0, 0), Value::Integer((part * 64) as i32));
+            }
+        }
+        assert!(pool.bytes() < all, "the pool kept under what every part takes");
+        let held = (0..parts)
+            .filter(|&part| {
+                matches!(*a.cache.parts[part].lock().expect("the slot"), PartSlot::Held { .. })
+            })
+            .count();
+        assert!(held < parts, "some parts were let go");
+        drop((a, catalog));
         fs::remove_file(path).expect("remove scratch file");
     }
 
