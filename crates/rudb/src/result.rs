@@ -27,12 +27,15 @@ fn unix_micros() -> i64 {
 /// want, and anything that wants a row gets it through [`QueryResult::row`].
 #[derive(Debug, Clone)]
 pub struct QueryResult {
-    names: Vec<String>,
-    types: Vec<LogicalType>,
-    chunks: Vec<Chunk>,
+    // The columns, the chunks and where they start are shared between clones, because nothing
+    // writes to them once the result is made and the one-row count a trickled `INSERT` answers
+    // with is a clone of one held result. Copying the four lists was five allocations a row.
+    names: Arc<[String]>,
+    types: Arc<[LogicalType]>,
+    chunks: Arc<Vec<Chunk>>,
     /// Where each chunk starts, so a row number finds its chunk by a search rather than by walking.
     /// The last entry is the row count, which is what makes the search a plain partition point.
-    starts: Vec<usize>,
+    starts: Arc<[usize]>,
     rows: usize,
     /// What these chunks are charged against the database's memory limit, given back when the last
     /// handle on this result is dropped.
@@ -72,10 +75,10 @@ impl QueryResult {
         }
         starts.push(rows);
         Self {
-            names,
-            types,
-            chunks,
-            starts,
+            names: names.into(),
+            types: types.into(),
+            chunks: Arc::new(chunks),
+            starts: starts.into(),
             rows,
             held: Arc::new(held),
             metrics: None,
@@ -286,7 +289,7 @@ impl QueryResult {
     /// table to append to, and would otherwise clone every chunk to do it.
     #[must_use]
     pub fn into_chunks(self) -> Vec<Chunk> {
-        self.chunks
+        Arc::unwrap_or_clone(self.chunks)
     }
 
     /// Which chunk a row is in, and where in it, or `None` if the row is past the end.
@@ -350,7 +353,7 @@ impl QueryResult {
     /// For a column of a type Arrow has no counterpart for here yet.
     pub fn arrow_schema(&self) -> Result<Schema> {
         let mut fields = Vec::with_capacity(self.width());
-        for (name, ty) in self.names.iter().zip(&self.types) {
+        for (name, ty) in self.names.iter().zip(self.types.iter()) {
             fields.push(Field::new(name.clone(), DataType::of(ty)?));
         }
         Ok(Schema::new(fields))
