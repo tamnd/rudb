@@ -10,7 +10,9 @@ those most runs use first and those the same runs use next to each other, so a r
 those windows. `crates/rudb-cli/build.rs` passes it to the linker.
 
 Each line of RUNS is a command, run once under callgrind, whose first word is replaced by BINARY. The
-functions a run executed are the ones callgrind saw retire an instruction.
+functions a run executed are the ones callgrind saw retire an instruction. A function the compiler
+was told is cold, which is most of what grows a vector or fills a `OnceLock` in the standard
+library, is in a section of its own under `.text.unlikely.`, and is matched there too.
 
 The script names sections by pattern rather than by symbol. A mangled Rust name carries a hash of
 its crate's version and dependencies, so a release, which moves every crate's version, would leave a
@@ -44,7 +46,7 @@ def executed(binary, command, scratch):
     for line in report.splitlines():
         if line.endswith(suffix):
             name = line[:-len(suffix)].rsplit(':', 1)[-1]
-            if name.startswith(('_R', '_ZN')):
+            if name.startswith(('_R', '_ZN')) or name == 'main':
                 names.add(name)
     os.remove(out)
     return names
@@ -73,7 +75,7 @@ def main():
     patterns = list(dict.fromkeys(pattern(name) for name in order))
     with open(out, 'w') as file:
         file.write('/* Written by scripts/text-order. */\nSECTIONS {\n  .text.hot : {\n')
-        file.writelines(f'    *(.text.{each})\n' for each in patterns)
+        file.writelines(f'    *(.text.{each} .text.unlikely.{each})\n' for each in patterns)
         file.write('  }\n} INSERT BEFORE .text;\n')
 
 
