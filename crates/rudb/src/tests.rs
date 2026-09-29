@@ -12068,6 +12068,58 @@ fn export_state_writes_the_states_the_pin_writes_and_finalize_and_combine_read_t
 }
 
 #[test]
+fn arg_min_exports_the_row_it_kept_and_its_ordering_value() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let rows = "(VALUES (1, 10), (2, 5), (3, 20)) t(a, b)";
+    let two = |call: &str, left: &str, right: &str| {
+        format!(
+            "SELECT finalize(combine((SELECT {call} EXPORT_STATE FROM (VALUES {left}) t(a, b)), \
+             (SELECT {call} EXPORT_STATE FROM (VALUES {right}) t(a, b))))"
+        )
+    };
+    for (sql, answer) in [
+        (format!("SELECT arg_min(a, b) EXPORT_STATE FROM {rows}"), "{'arg': 2, 'by': 5}"),
+        (format!("SELECT finalize(arg_max(a, b) EXPORT_STATE) FROM {rows}"), "3"),
+        (
+            "SELECT arg_min(a, b) EXPORT_STATE FROM (SELECT 1 a, 1 b WHERE false)".to_string(),
+            "NULL",
+        ),
+        (
+            "SELECT arg_min_null(a, b) EXPORT_STATE FROM (VALUES (NULL, 5), (2, 10)) t(a, b)"
+                .to_string(),
+            "{'arg': NULL, 'by': 5}",
+        ),
+        (
+            "SELECT arg_min_nulls_last(a, b) EXPORT_STATE FROM (VALUES (1, NULL)) t(a, b)"
+                .to_string(),
+            "{'arg': 1, 'by': NULL}",
+        ),
+        (two("arg_min(a, b)", "(1, 5)", "(2, 5)"), "2"),
+        (two("arg_max(a, b)", "(1, 5)", "(2, 1)"), "1"),
+        (two("arg_min_nulls_last(a, b)", "(1, NULL::INT)", "(2, 7)"), "2"),
+        (
+            "SELECT finalize(combine_aggr(s)) FROM (SELECT arg_min(a, b) EXPORT_STATE s \
+             FROM (VALUES (1, 10), (2, 5)) t(a, b) UNION ALL SELECT arg_min(a, b) EXPORT_STATE \
+             FROM (VALUES (3, 1)) t(a, b))"
+                .to_string(),
+            "3",
+        ),
+    ] {
+        assert_eq!(text(&sql), answer, "{sql}");
+    }
+    let sql = "SELECT arg_min(a, b, 2) EXPORT_STATE FROM (VALUES (1, 10)) t(a, b)";
+    let error = db.execute(sql).expect_err(sql);
+    assert!(error.message().contains("does not have a state type callback"), "{error}");
+}
+
+#[test]
 fn combine_aggr_folds_states_as_many_times_as_it_is_told() {
     let db = Database::new();
     let text = |sql: &str| {

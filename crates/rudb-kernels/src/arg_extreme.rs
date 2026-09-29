@@ -158,6 +158,34 @@ impl ArgExtreme {
         Ok(())
     }
 
+    /// The state written out as the pin's `STRUCT(arg, by)`, null when no row was kept. A kept
+    /// row with a null `by`, which only `_nulls_last` keeps, writes the `by` out as null.
+    pub(crate) fn export(&self) -> Result<Value> {
+        match self {
+            Self::One { set: false, .. } => Ok(Value::Null),
+            Self::One { arg, by, .. } => Ok(Value::Struct(vec![
+                ("arg".to_string(), arg.clone()),
+                ("by".to_string(), by.clone().unwrap_or(Value::Null)),
+            ])),
+            Self::Many { .. } => Err(Error::internal("exporting the state of arg_min with n")),
+        }
+    }
+
+    /// Puts the row a state kept into this fresh one.
+    ///
+    /// A null `by` reads back as null. The pin reads it back as 0, so its `combine` of two
+    /// `arg_min_nulls_last` states can disagree with the aggregate over the same rows, which is
+    /// tamnd/duckdb#17, and this follows the aggregate.
+    pub(crate) fn import(&mut self, arg: &Value, by: &Value) -> Result<()> {
+        let Self::One { set, arg: held, by: kept, .. } = self else {
+            return Err(Error::internal("importing the state of arg_min with n"));
+        };
+        *set = true;
+        arg.clone_into(held);
+        *kept = (!by.is_null()).then(|| by.clone());
+        Ok(())
+    }
+
     /// The answer.
     pub(crate) fn finish(&self, returns: &LogicalType) -> Result<Value> {
         match self {

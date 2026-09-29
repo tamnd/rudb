@@ -69,6 +69,13 @@ pub fn state_layout(
             Some(ty) => LogicalType::List(Box::new(ty.clone())),
             None => return Err(not_written(name)),
         },
+        "arg_min" | "arg_max" | "arg_min_null" | "arg_max_null" | "arg_min_nulls_last"
+        | "arg_max_nulls_last" => match arguments {
+            [arg, by] => {
+                LogicalType::Struct(vec![field("arg", arg.clone()), field("by", by.clone())])
+            }
+            _ => return Err(no_layout(name)),
+        },
         "first" | "last" | "any_value" => {
             LogicalType::Struct(vec![field("value", returns.clone())])
         }
@@ -86,12 +93,7 @@ pub fn state_layout(
             field("value", LogicalType::Double),
             field("err", LogicalType::Double),
         ]),
-        "entropy" | "histogram" | "mode" | "approx_count_distinct" => {
-            return Err(Error::not_implemented(format!(
-                "Aggregate function \"\"{name}\"\" does not have a state type callback defined - \
-                 cannot export state"
-            )));
-        }
+        "entropy" | "histogram" | "mode" | "approx_count_distinct" => return Err(no_layout(name)),
         _ => return Err(not_written(name)),
     })
 }
@@ -103,6 +105,14 @@ pub fn state_constants(name: &str) -> usize {
         "string_agg" | "quantile_cont" | "quantile_disc" => 1,
         _ => usize::MAX,
     }
+}
+
+/// The pin's error for an aggregate that has no layout to export its state in.
+fn no_layout(name: &str) -> Error {
+    Error::not_implemented(format!(
+        "Aggregate function \"\"{name}\"\" does not have a state type callback defined - cannot \
+         export state"
+    ))
 }
 
 fn not_written(name: &str) -> Error {
@@ -442,6 +452,7 @@ impl General {
             }
             Self::Paired(state) => state.export(),
             Self::Powers(state) => state.export(),
+            Self::Arg { state, .. } => state.export()?,
             Self::List { .. } | Self::Joined { .. } => self.finish()?,
             Self::Merged(merge) => merge.finish()?,
             Self::Holistic { values, .. } if values.len() == 0 => Value::Null,
@@ -477,6 +488,7 @@ impl General {
             }
             Self::Paired(state) => state.import(value)?,
             Self::Powers(state) => state.import(value)?,
+            Self::Arg { state, .. } => state.import(member(value, "arg")?, member(value, "by")?)?,
             Self::List { values, .. } | Self::Holistic { values, .. } => {
                 let Value::List { values: held, .. } = value else {
                     return Err(Error::internal(format!("a list state holding {value:?}")));
