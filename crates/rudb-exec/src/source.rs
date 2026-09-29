@@ -714,6 +714,15 @@ thread_local! {
     static READER: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
+/// How many times the rows the fewest kept keys reach another relation's kept keys may reach and
+/// still be read as rows beside them, see [`Scan::handed`].
+///
+/// Gathering costs a few instructions a row reached, and the rows it saves reading cost hundreds,
+/// strings among them. In JOB 24a the movies kept reach ten times the 23,041 rows of `cast_info`
+/// the people kept reach, and together they leave 43 parts of 4,425 to read instead of 800. In 17c
+/// the movies kept reach 83 times the people's 12,500 rows, a million rows pushed to keep 250.
+const ALONGSIDE: u64 = 32;
+
 /// A part whose exact rows keep one row in this many or fewer is read at those rows alone. See
 /// [`Source::read_reduced`].
 const SPARSE_READ: usize = 8;
@@ -2055,6 +2064,25 @@ impl<'a> Scan<'a> {
         let mut held: Option<Rids> = None;
         for rows in sets {
             held = Some(narrowed(held, rows));
+        }
+        // Of the relations of a consistent reduction that kept keys for this scan, the one whose
+        // keys reach fewest rows is read as those rows, when they are fewer than the rows already
+        // handed, and so is any other within `ALONGSIDE` of it. The rest are tested row by row.
+        // See `Listing`.
+        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
+        let mut reaching: Vec<(u64, &Arc<Sideways<'_>>)> =
+            joins.filter_map(|sideways| Some((sideways.reach(self.index)?, sideways))).collect();
+        reaching.sort_by_key(|(reach, _)| *reach);
+        if let Some(&(fewest, _)) = reaching.first()
+            && held.as_ref().is_none_or(|rows| fewest < rows.len())
+        {
+            for (_, sideways) in
+                reaching.iter().take_while(|(reach, _)| *reach <= fewest.saturating_mul(ALONGSIDE))
+            {
+                if let Some(rows) = sideways.gather(self.index) {
+                    held = Some(narrowed(held, rows.clone()));
+                }
+            }
         }
         // Rows a join handed down that are already few enough to be read alone leave the value
         // rows little to take away, and asking the dictionary and decoding the rows of its values
