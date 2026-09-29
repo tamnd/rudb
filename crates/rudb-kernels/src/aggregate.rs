@@ -79,15 +79,16 @@ pub const NOWHERE: usize = usize::MAX;
 /// The name an aggregate goes by when its call says which order to read its rows in, which is the
 /// plain name followed by one pair of letters per sort key.
 ///
-/// `list(x ORDER BY y DESC, z)` is `list ORDER BY dl,al`, where the first letter is the direction
-/// and the second is where nulls go. The keys are the last arguments of the call, after the ones
-/// the aggregate itself reads, except a key that is the same expression as an argument, which is
-/// written with that argument's position, `list ORDER BY dl@0` for `list(x ORDER BY x DESC)`, and
-/// sorts on it rather than holding it twice. Carrying the order in the name keeps it out of every
+/// `list(x ORDER BY y DESC, z)` is `list ORDER BY dl@1,al@2 AFTER 1`, where the first letter is
+/// the direction, the second is where nulls go, the number after the `@` is the argument the key
+/// sorts on, and the last number is how many of the arguments the aggregate itself reads. The keys
+/// are the last arguments of the call, after the ones the aggregate reads, except a key that is the
+/// same expression as an argument, which sorts on that argument rather than holding it twice, so
+/// `list(x ORDER BY x DESC)` is `list ORDER BY dl@0 AFTER 1`. Carrying the order in the name keeps it out of every
 /// rule that looks at an aggregate by name, none of which knows what to do with an order, and every
 /// rule that walks arguments sees the keys as arguments and keeps them.
 #[must_use]
-pub fn ordered_name(inner: &str, keys: &[StateKey]) -> String {
+pub fn ordered_name(inner: &str, arguments: usize, keys: &[StateKey]) -> String {
     let keys: Vec<String> = keys
         .iter()
         .map(|key| {
@@ -97,25 +98,22 @@ pub fn ordered_name(inner: &str, keys: &[StateKey]) -> String {
                 (true, false) => "dl",
                 (true, true) => "df",
             };
-            match key.argument {
-                Some(at) => format!("{letters}@{at}"),
-                None => letters.to_string(),
-            }
+            format!("{letters}@{}", key.column)
         })
         .collect();
-    format!("{inner} ORDER BY {}", keys.join(","))
+    format!("{inner} ORDER BY {} AFTER {arguments}", keys.join(","))
 }
 
-/// The plain name and the sort keys of a name [`ordered_name`] made, or `None` for any other name.
-fn split_ordered(name: &str) -> Option<(&str, Vec<StateKey>)> {
+/// The plain name, the number of arguments and the sort keys of a name [`ordered_name`] made, or
+/// `None` for any other name.
+fn split_ordered(name: &str) -> Option<(&str, usize, Vec<StateKey>)> {
     let (inner, keys) = name.split_once(" ORDER BY ")?;
+    let (keys, arguments) = keys.rsplit_once(" AFTER ")?;
     let keys = keys
         .split(',')
         .map(|key| {
-            let (letters, argument) = match key.split_once('@') {
-                Some((letters, at)) => (letters, Some(at.parse().ok()?)),
-                None => (key, None),
-            };
+            let (letters, column) = key.split_once('@')?;
+            let column = column.parse().ok()?;
             let (descending, nulls_first) = match letters {
                 "al" => (false, false),
                 "af" => (false, true),
@@ -123,10 +121,10 @@ fn split_ordered(name: &str) -> Option<(&str, Vec<StateKey>)> {
                 "df" => (true, true),
                 _ => return None,
             };
-            Some(StateKey { descending, nulls_first, argument })
+            Some(StateKey { descending, nulls_first, column })
         })
         .collect::<Option<Vec<_>>>()?;
-    Some((inner, keys))
+    Some((inner, arguments.parse().ok()?, keys))
 }
 
 /// A running aggregate.
@@ -483,14 +481,14 @@ impl Accumulator {
             let general = General::Exported { inner, state: Arc::clone(state) };
             return Ok(Self { state: State::General(Box::new(general)) });
         }
-        if let Some((inner, keys)) = split_ordered(name) {
+        if let Some((inner, arguments, keys)) = split_ordered(name) {
             if let ("lttb", [key]) = (inner, keys.as_slice()) {
                 let plot = Plot::sorted(returns, (key.descending, key.nulls_first));
                 let general = General::Plotted { plot: Box::new(plot), returns: returns.clone() };
                 return Ok(Self { state: State::General(Box::new(general)) });
             }
             let inner = Box::new(Self::new(inner, returns)?);
-            let general = General::Ordered { keys, rows: Vec::new(), inner };
+            let general = General::Ordered { arguments, keys, rows: Vec::new(), inner };
             return Ok(Self { state: State::General(Box::new(general)) });
         }
         if let Some(measure) = Measure::named(name) {

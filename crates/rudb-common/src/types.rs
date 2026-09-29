@@ -170,9 +170,9 @@ pub struct StateType {
 pub struct StateKey {
     pub descending: bool,
     pub nulls_first: bool,
-    /// The argument the key sorts on when it is the same expression as one, which the rows then
-    /// hold once. `None` for a key buffered after the arguments, in the order the keys are written.
-    pub argument: Option<usize>,
+    /// The column of the buffered rows the key sorts on. A key that is the same expression as an
+    /// argument sorts on that argument's column, and any other is held after the arguments.
+    pub column: usize,
 }
 
 // A value compares equal to itself here, nulls and NaNs included, which is what a type needs.

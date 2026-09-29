@@ -3645,15 +3645,16 @@ impl<'a> Binder<'a> {
             } else {
                 args[..given].iter().position(|&arg| self.same_expr(arg, key))
             };
-            if argument.is_none() {
+            let column = argument.unwrap_or_else(|| {
                 args.push(key);
-            }
-            order.push(StateKey { descending, nulls_first, argument });
+                args.len() - 1
+            });
+            order.push(StateKey { descending, nulls_first, column });
         }
         if order.is_empty() {
             return (name.to_string(), Vec::new());
         }
-        (rudb_kernels::ordered_name(name, &order), order)
+        (rudb_kernels::ordered_name(name, given, &order), order)
     }
 
     // ----------------------------------------------------------------- windows
