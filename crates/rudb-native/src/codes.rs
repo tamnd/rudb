@@ -362,21 +362,89 @@ pub struct Fold {
     pub high: i64,
 }
 
-impl Fold {
-    const EMPTY: Self = Self { total: 0, seen: 0, low: i64::MAX, high: i64::MIN };
+/// A column [`distinct_per_group`] folds, and whether the smallest and the largest of it are
+/// wanted, which the sum and the count alone do not need kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Folded {
+    pub column: usize,
+    pub extremes: bool,
+}
 
-    fn add(&mut self, value: i64) {
-        self.total += i128::from(value);
-        self.seen += 1;
-        self.low = self.low.min(value);
-        self.high = self.high.max(value);
+/// One folded column of one thread's rows, with a cell for each slot in each of its lists.
+///
+/// Kept apart rather than as a [`Fold`] per slot, because a row adds to the sum alone unless it is
+/// null or the extremes were asked for, and a 64 bit add into a list of them is what keeps the
+/// pass over a column as fast as reading it.
+struct Folding {
+    sums: Vec<i64>,
+    /// What a sum carried out of its cell rather than overflow, empty until one does.
+    carried: Vec<i128>,
+    nulls: Vec<u64>,
+    /// The smallest and the largest of each slot, empty unless they were asked for.
+    low: Vec<i64>,
+    high: Vec<i64>,
+}
+
+impl Folding {
+    fn new(slots: usize, extremes: bool) -> Self {
+        let kept = if extremes { slots } else { 0 };
+        Self {
+            sums: vec![0; slots],
+            carried: Vec::new(),
+            nulls: vec![0; slots],
+            low: vec![i64::MAX; kept],
+            high: vec![i64::MIN; kept],
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, slot: usize, value: i64) {
+        match self.sums[slot].checked_add(value) {
+            Some(sum) => self.sums[slot] = sum,
+            None => self.carry(slot, value),
+        }
+    }
+
+    #[cold]
+    fn carry(&mut self, slot: usize, value: i64) {
+        if self.carried.is_empty() {
+            self.carried = vec![0; self.sums.len()];
+        }
+        self.carried[slot] += i128::from(self.sums[slot]) + i128::from(value);
+        self.sums[slot] = 0;
     }
 
     fn merge(&mut self, other: &Self) {
-        self.total += other.total;
-        self.seen += other.seen;
-        self.low = self.low.min(other.low);
-        self.high = self.high.max(other.high);
+        for (slot, &sum) in other.sums.iter().enumerate() {
+            self.add(slot, sum);
+        }
+        if !other.carried.is_empty() {
+            if self.carried.is_empty() {
+                self.carried = vec![0; self.sums.len()];
+            }
+            for (total, carried) in self.carried.iter_mut().zip(&other.carried) {
+                *total += carried;
+            }
+        }
+        for (total, nulls) in self.nulls.iter_mut().zip(&other.nulls) {
+            *total += nulls;
+        }
+        for (low, other) in self.low.iter_mut().zip(&other.low) {
+            *low = (*low).min(*other);
+        }
+        for (high, other) in self.high.iter_mut().zip(&other.high) {
+            *high = (*high).max(*other);
+        }
+    }
+
+    /// The fold of a slot of `rows` rows.
+    fn fold(&self, slot: usize, rows: u64) -> Fold {
+        Fold {
+            total: i128::from(self.sums[slot]) + self.carried.get(slot).copied().unwrap_or(0),
+            seen: rows - self.nulls[slot],
+            low: self.low.get(slot).copied().unwrap_or(i64::MAX),
+            high: self.high.get(slot).copied().unwrap_or(i64::MIN),
+        }
     }
 }
 
@@ -401,7 +469,7 @@ impl Fold {
 pub fn distinct_per_group(
     reader: &Reader,
     group: usize,
-    folded: &[usize],
+    folded: &[Folded],
     counted: &ValueCodes,
     workers: usize,
 ) -> Result<Option<Vec<Group>>> {
@@ -476,11 +544,7 @@ pub fn distinct_per_group(
             .map(|handle| handle.join().map_err(|_| invalid("a group read worker panicked"))?)
             .collect::<Result<Vec<_>>>()
     })?;
-    let mut tally = Tally {
-        rows: vec![0; slots],
-        lone: vec![0; slots],
-        folds: vec![Fold::EMPTY; slots * folded.len()],
-    };
+    let mut tally = Tally::new(slots, folded);
     for one in read {
         let Some(one) = one else { return Ok(None) };
         for (total, count) in tally.rows.iter_mut().zip(one.rows) {
@@ -489,8 +553,8 @@ pub fn distinct_per_group(
         for (total, count) in tally.lone.iter_mut().zip(one.lone) {
             *total += count;
         }
-        for (total, fold) in tally.folds.iter_mut().zip(&one.folds) {
-            total.merge(fold);
+        for (total, folding) in tally.folds.iter_mut().zip(&one.folds) {
+            total.merge(folding);
         }
     }
 
@@ -551,13 +615,12 @@ pub fn distinct_per_group(
         }
     }
     let mut out = Vec::new();
-    let width = folded.len();
     for (slot, (&rows, &distinct)) in tally.rows.iter().zip(&counts).enumerate() {
         if rows == 0 {
             continue;
         }
         let key = if slot == 0 { None } else { Some(keys[slot - 1]) };
-        let folds = tally.folds[slot * width..(slot + 1) * width].to_vec();
+        let folds = tally.folds.iter().map(|folding| folding.fold(slot, rows)).collect();
         out.push(Group { key, rows, distinct, folds });
     }
     Ok(Some(out))
@@ -572,7 +635,7 @@ const MOST_GROUP_VALUES: i128 = 1 << 20;
 #[derive(Clone, Copy)]
 struct Place<'a> {
     group: usize,
-    folded: &'a [usize],
+    folded: &'a [Folded],
     low: i64,
     /// The slot of each value from `low` up, zero for one the group does not hold.
     dense: &'a [u16],
@@ -581,12 +644,21 @@ struct Place<'a> {
     lone: &'a [u64],
 }
 
-/// The rows of each slot, how many of them hold a value no other row does, and the folds of each
-/// slot's folded columns, one after the other.
+/// The rows of each slot, how many of them hold a value no other row does, and each folded column.
 struct Tally {
     rows: Vec<u64>,
     lone: Vec<u64>,
-    folds: Vec<Fold>,
+    folds: Vec<Folding>,
+}
+
+impl Tally {
+    fn new(slots: usize, folded: &[Folded]) -> Self {
+        Self {
+            rows: vec![0; slots],
+            lone: vec![0; slots],
+            folds: folded.iter().map(|fold| Folding::new(slots, fold.extremes)).collect(),
+        }
+    }
 }
 
 /// The slot of every row of `parts` of the group column into `out`, with each slot's rows and its
@@ -600,12 +672,7 @@ fn read_slots(
     out: &mut [u16],
 ) -> Result<Option<Tally>> {
     let Place { group, folded, low, dense, slots, lone } = *place;
-    let width = folded.len();
-    let mut tally = Tally {
-        rows: vec![0; slots],
-        lone: vec![0; slots],
-        folds: vec![Fold::EMPTY; slots * width],
-    };
+    let mut tally = Tally::new(slots, folded);
     let mut block = Vec::new();
     let base = starts[parts.start];
     for part in parts {
@@ -632,16 +699,30 @@ fn read_slots(
             tally.rows[*slot as usize] += 1;
             tally.lone[*slot as usize] += lone[row / 64] >> (row % 64) & 1;
         }
-        for (at, &column) in folded.iter().enumerate() {
-            let read = reader.read(part, &[column])?;
+        for (fold, folding) in folded.iter().zip(&mut tally.folds) {
+            let read = reader.read(part, &[fold.column])?;
             let vector = read.column(0)?;
             if vector.len() != len || !vector.signed_block(&mut block) || block.len() < len {
                 return Ok(None);
             }
             let has_nulls = vector.validity().has_nulls(len);
-            for (row, (&value, &slot)) in block[..len].iter().zip(out.iter()).enumerate() {
-                if !(has_nulls && vector.is_null_at(row)) {
-                    tally.folds[slot as usize * width + at].add(value);
+            let values = block[..len].iter().zip(out.iter());
+            if !has_nulls && !fold.extremes {
+                for (&value, &slot) in values {
+                    folding.add(slot as usize, value);
+                }
+                continue;
+            }
+            for (row, (&value, &slot)) in values.enumerate() {
+                let slot = slot as usize;
+                if has_nulls && vector.is_null_at(row) {
+                    folding.nulls[slot] += 1;
+                    continue;
+                }
+                folding.add(slot, value);
+                if fold.extremes {
+                    folding.low[slot] = folding.low[slot].min(value);
+                    folding.high[slot] = folding.high[slot].max(value);
                 }
             }
         }
@@ -827,28 +908,43 @@ mod tests {
         build_value_codes_within(&path, "hits", 1000).expect("build");
         let reader = Catalog::open(&path).expect("reopen").table("hits").expect("the table");
         let codes = value_codes(&reader, 1).expect("the section is in the file");
+        const EMPTY: Fold = Fold { total: 0, seen: 0, low: i64::MAX, high: i64::MIN };
+        let add = |fold: &mut Fold, value: i64| {
+            fold.total += i128::from(value);
+            fold.seen += 1;
+            fold.low = fold.low.min(value);
+            fold.high = fold.high.max(value);
+        };
         let mut wanted = BTreeMap::<Option<i64>, (u64, Fold)>::new();
         for (region, user) in &held {
-            let (rows, fold) = wanted.entry(region.map(i64::from)).or_insert((0, Fold::EMPTY));
+            let (rows, fold) = wanted.entry(region.map(i64::from)).or_insert((0, EMPTY));
             *rows += 1;
             if let Some(user) = user {
-                fold.add(*user);
+                add(fold, *user);
             }
         }
         let wanted = wanted.into_iter().collect::<Vec<_>>();
         for workers in [1, 5] {
-            let mut found = distinct_per_group(&reader, 0, &[1, 0], &codes, workers)
+            let folded = [
+                Folded { column: 1, extremes: true },
+                Folded { column: 0, extremes: true },
+                Folded { column: 1, extremes: false },
+            ];
+            let mut found = distinct_per_group(&reader, 0, &folded, &codes, workers)
                 .expect("counted")
                 .expect("the region is narrow");
             found.sort_by_key(|group| group.key);
             let regions = found.iter().map(|group| {
-                let mut region = Fold::EMPTY;
+                let mut region = EMPTY;
                 if let Some(key) = group.key {
                     for _ in 0..group.rows {
-                        region.add(key);
+                        add(&mut region, key);
                     }
                 }
                 assert_eq!(group.folds[1], region, "the key folds as itself");
+                let (total, seen) = (group.folds[0].total, group.folds[0].seen);
+                let summed = Fold { total, seen, ..EMPTY };
+                assert_eq!(group.folds[2], summed, "a sum alone keeps no extremes");
                 (group.key, (group.rows, group.folds[0]))
             });
             assert_eq!(regions.collect::<Vec<_>>(), wanted, "{workers} workers");

@@ -1161,7 +1161,8 @@ fn native_distinct_counts(
                 }
                 let Some(column) = stored(argument) else { return Ok(None) };
                 let fold = folded.len();
-                folded.push(column);
+                let extremes = matches!(name, "min" | "max");
+                folded.push(rudb_native::codes::Folded { column, extremes });
                 let ty = plan.expr_type(argument).clone();
                 wanted.push(match name {
                     "count" => Wanted::Seen(fold),

@@ -433,7 +433,7 @@ impl Rows {
     pub fn distinct_per_group(
         &self,
         group: usize,
-        folded: &[usize],
+        folded: &[rudb_native::codes::Folded],
         counted: usize,
     ) -> Result<Option<Vec<rudb_native::codes::Group>>> {
         let Self::Native(reader) = self else { return Ok(None) };
