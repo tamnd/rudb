@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Write the linker script that puts the code queries run at the front of the shell's binary.
+
+A page of the binary counts toward a query's peak resident size once any byte of it is touched, and
+the kernel maps the pages around a faulting one that are already in memory with it, sixteen at a
+time. Linked in the order the compiler emits them, the functions a query runs are spread over most of
+the binary: `SELECT COUNT(*)` executes 1.4 MB of functions and had 7 MB of code resident. The script
+this writes gathers the functions a set of runs executed into one section in front of the rest,
+those most runs use first and those the same runs use next to each other, so a run touches fewer of
+those windows. `crates/rudb-cli/build.rs` passes it to the linker.
+
+Each line of RUNS is a command, run once under callgrind, whose first word is replaced by BINARY. The
+functions a run executed are the ones callgrind saw retire an instruction.
+
+The script names sections by pattern rather than by symbol. A mangled Rust name carries a hash of
+its crate's version and dependencies, so a release, which moves every crate's version, would leave a
+list of exact names matching nothing. The hash is a `*` here, and so are the back references after
+it, which count bytes from the start of the name and move when the hash's length does, and the suffix
+LLVM gives a local function it promotes. A pattern that matches a function nobody meant only moves
+that function, and a function renamed since the script was written only stays where it would have
+been, so a stale script still links. It is worth writing again when a query's floor creeps up.
+
+Usage: scripts/text-order BINARY RUNS OUT
+"""
+
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+
+def executed(binary, command, scratch):
+    """The mangled names of the functions in BINARY that one run executed."""
+    out = os.path.join(scratch, 'callgrind.out')
+    argv = ['valgrind', '--tool=callgrind', '--demangle=no', '--dump-line=no',
+            f'--callgrind-out-file={out}', binary] + command[1:]
+    subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    report = subprocess.run(['callgrind_annotate', '--threshold=100', out],
+                            capture_output=True, text=True, check=True).stdout
+    names = set()
+    suffix = f' [{os.path.abspath(binary)}]'
+    for line in report.splitlines():
+        if line.endswith(suffix):
+            name = line[:-len(suffix)].rsplit(':', 1)[-1]
+            if name.startswith(('_R', '_ZN')):
+                names.add(name)
+    os.remove(out)
+    return names
+
+
+def pattern(name):
+    """NAME with its crate hashes, back references and LLVM suffix left open."""
+    name = re.sub(r'\.llvm\.[0-9]+$', '.llvm.*', name)
+    name = re.sub(r'17h[0-9a-f]{16}E', '17h*E', name)
+    name = re.sub(r'Cs[0-9A-Za-z]+_', 'Cs*_', name)
+    return re.sub(r'B[0-9A-Za-z]{0,4}_', 'B*_', name)
+
+
+def main():
+    if len(sys.argv) != 4:
+        sys.exit(__doc__.rsplit('\n\n', 1)[-1].strip())
+    binary, runs, out = sys.argv[1:]
+    commands = [shlex.split(line) for line in open(runs) if line.strip()]
+    used = {}
+    with tempfile.TemporaryDirectory() as scratch:
+        for at, command in enumerate(commands):
+            for name in executed(binary, command, scratch):
+                used.setdefault(name, set()).add(at)
+            print(f'{at + 1}/{len(commands)} runs, {len(used)} functions', file=sys.stderr)
+    order = sorted(used, key=lambda name: (-len(used[name]), sorted(used[name]), name))
+    patterns = list(dict.fromkeys(pattern(name) for name in order))
+    with open(out, 'w') as file:
+        file.write('/* Written by scripts/text-order. */\nSECTIONS {\n  .text.hot : {\n')
+        file.writelines(f'    *(.text.{each})\n' for each in patterns)
+        file.write('  }\n} INSERT BEFORE .text;\n')
+
+
+if __name__ == '__main__':
+    main()

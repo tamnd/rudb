@@ -1,4 +1,5 @@
-//! Links the shell as a position dependent executable on Linux.
+//! Links the shell as a position dependent executable on Linux, with the code queries run at
+//! the front.
 //!
 //! A position independent executable has its pointer tables relocated by the loader at every
 //! start. Over this binary that is about forty thousand relocations, a 950 KiB table the loader
@@ -12,9 +13,34 @@
 //! stack still are, and a program embedding the library is linked however that program chooses.
 //! Only the binaries of this package are affected, so the C library and the tests keep the
 //! toolchain's default.
+//!
+//! The code gets the same treatment. A fault on a page of it maps the fifteen around it too, and in
+//! the order the compiler emits functions the ones a query runs are spread over most of the binary,
+//! so `SELECT COUNT(*)` had 7 MiB of code resident to run 1.4 MiB of it. `hot-text.ld` gathers the
+//! functions the ClickBench queries run into one section at the front, those most queries run first,
+//! and takes 3 to 4 MiB off every query's peak. `scripts/text-order` is how it is written. It is
+//! passed only where LLD is the linker the toolchain picks and nothing has named another, since that
+//! is the linker it was measured with.
 fn main() {
-    if std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "linux") {
+    let target = |key: &str| std::env::var(format!("CARGO_CFG_TARGET_{key}")).unwrap_or_default();
+    if target("OS") == "linux" {
         println!("cargo:rustc-link-arg-bins=-no-pie");
+    }
+    let flags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    let default_linker = std::env::var_os("RUSTC_LINKER").is_none()
+        && !flags.split('\u{1f}').any(|flag| {
+            ["linker=", "linker-flavor", "linker-features", "fuse-ld"]
+                .iter()
+                .any(|option| flag.contains(option))
+        });
+    if target("OS") == "linux"
+        && target("ARCH") == "x86_64"
+        && target("ENV") == "gnu"
+        && default_linker
+    {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("hot-text.ld");
+        println!("cargo:rustc-link-arg-bins=-Wl,-T,{}", script.display());
+        println!("cargo:rerun-if-changed=hot-text.ld");
     }
     println!("cargo:rerun-if-changed=build.rs");
 }
