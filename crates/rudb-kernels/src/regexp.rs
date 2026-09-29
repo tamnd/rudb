@@ -296,26 +296,49 @@ struct Memo {
 /// On q29 the answers come to 37 MB. Held one allocation apiece they were 2.7 million blocks for
 /// the allocator to take and later give back one at a time, and the giving back at the end of the
 /// query was a quarter of its cycles.
+///
+/// An answer that is the value it came from is not copied at all, only noted in `selves`, since
+/// the dictionary holds it already. That is every value the pattern does not match, which for a
+/// pattern that picks something out of a value is most of the distinct answers: on q29 it is the
+/// referrers with nothing after the host, and they were most of the 37 MB.
 #[derive(Debug)]
 struct Replaced {
     owns: Box<[u16]>,
     /// Where each owned answer starts and ends in `bytes`, in the order of `owns`.
     spans: Box<[(u32, u32)]>,
     bytes: Box<[u8]>,
+    /// The values within the group whose answer is the value itself and is their own code, in
+    /// order.
+    selves: Box<[u16]>,
+}
+
+/// The answer a group holds for a value that is its own code.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Owned<'a> {
+    /// The answer, out of the group's bytes. Empty for a value that is not its own code.
+    Bytes(&'a [u8]),
+    /// The value itself, which is read out of the dictionary.
+    Itself,
 }
 
 impl Replaced {
     /// The answer at `index` within the group, which is empty unless that value is its own code.
-    fn get(&self, index: usize) -> &[u8] {
-        let Ok(index) = u16::try_from(index) else { return &[] };
-        self.owns.binary_search(&index).map_or(&[], |at| {
+    fn get(&self, index: usize) -> Owned<'_> {
+        let Ok(index) = u16::try_from(index) else { return Owned::Bytes(&[]) };
+        if let Ok(at) = self.owns.binary_search(&index) {
             let (start, end) = self.spans[at];
-            &self.bytes[start as usize..end as usize]
-        })
+            return Owned::Bytes(&self.bytes[start as usize..end as usize]);
+        }
+        if self.selves.binary_search(&index).is_ok() {
+            return Owned::Itself;
+        }
+        Owned::Bytes(&[])
     }
 
     fn footprint(&self) -> usize {
-        self.owns.len() * (size_of::<u16>() + size_of::<(u32, u32)>()) + self.bytes.len()
+        self.owns.len() * (size_of::<u16>() + size_of::<(u32, u32)>())
+            + self.bytes.len()
+            + self.selves.len() * size_of::<u16>()
     }
 }
 
@@ -328,6 +351,8 @@ struct Pending {
     end: u32,
     /// Where in the group the value that gave it first sits.
     index: u16,
+    /// Whether the answer is that value unchanged.
+    itself: bool,
 }
 
 impl Memo {
@@ -404,7 +429,10 @@ impl Memo {
                                             ));
                                         };
                                         mine.extend_from_slice(answer);
-                                        pending.push(Pending { hash, start, end, index });
+                                        // An empty answer costs nothing to copy, and the value
+                                        // under it may be a null the dictionary gives no bytes for.
+                                        let itself = !answer.is_empty() && answer == text;
+                                        pending.push(Pending { hash, start, end, index, itself });
                                         own
                                     }
                                 };
@@ -439,10 +467,29 @@ impl Memo {
         // time may have put its answers in first, and those hold every answer this one will put a
         // code in for: an answer missing from the shared table when this one registers was missing
         // when the other looked too, and the other gave it the same value's code.
+        //
+        // The answers that are their own value stay in `mine` until they are registered, which
+        // compares them, and only the others are copied into the group.
+        let mut bytes = Vec::new();
+        let mut spans = Vec::new();
+        for waiting in pending.iter().filter(|waiting| !waiting.itself) {
+            let start = bytes.len();
+            bytes.extend_from_slice(&mine[waiting.start as usize..waiting.end as usize]);
+            spans.push((start as u32, bytes.len() as u32));
+        }
         let out = Replaced {
-            owns: pending.iter().map(|waiting| waiting.index).collect(),
-            spans: pending.iter().map(|waiting| (waiting.start, waiting.end)).collect(),
-            bytes: mine.as_slice().into(),
+            owns: pending
+                .iter()
+                .filter(|waiting| !waiting.itself)
+                .map(|waiting| waiting.index)
+                .collect(),
+            spans: spans.into(),
+            bytes: bytes.into(),
+            selves: pending
+                .iter()
+                .filter(|waiting| waiting.itself)
+                .map(|waiting| waiting.index)
+                .collect(),
         };
         let held = out.footprint();
         if answers.set(out).is_ok() {
@@ -481,7 +528,29 @@ impl Memo {
         let seen = self.firsts[shard_of(hash)]
             .lock()
             .map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
-        Ok(seen.find(hash, |code| self.owned(code) == Some(answer)))
+        self.find(&seen, hash, answer)
+    }
+
+    /// The code `seen` holds for `answer` under `hash`, reading an answer that is its own value out
+    /// of the dictionary for as long as the comparison takes.
+    fn find(&self, seen: &Seen, hash: u64, answer: &[u8]) -> Result<Option<u32>> {
+        let mut failed = None;
+        let found = seen.find(hash, |code| match self.owned(code) {
+            None => false,
+            Some(Owned::Bytes(bytes)) => bytes == answer,
+            Some(Owned::Itself) => {
+                let mut same = false;
+                let read = self.dictionary.visit_text(&[code], &mut |_, text: &[u8]| {
+                    same = text == answer;
+                    Ok(())
+                });
+                if let Err(error) = read {
+                    failed = Some(error);
+                }
+                same
+            }
+        });
+        failed.map_or(Ok(found), Err)
     }
 
     /// Puts a group's answer in the shared table under `own`, and the code it stands for, which is
@@ -493,7 +562,7 @@ impl Memo {
         let mut seen = self.firsts[shard_of(hash)]
             .lock()
             .map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
-        if let Some(found) = seen.find(hash, |code| self.owned(code) == Some(answer)) {
+        if let Some(found) = self.find(&seen, hash, answer)? {
             return Ok(found);
         }
         *added += seen.insert(hash, own);
@@ -501,7 +570,7 @@ impl Memo {
     }
 
     /// The answer a group put in for the value at `code`, if its group has put its answers in.
-    fn owned(&self, code: u32) -> Option<&[u8]> {
+    fn owned(&self, code: u32) -> Option<Owned<'_>> {
         let code = code as usize;
         let answers = self.answers.get(code / REPLACE_GROUP)?.get()?;
         Some(answers.get(code % REPLACE_GROUP))
@@ -515,7 +584,14 @@ impl Memo {
     /// The answer of the value at `code`.
     fn answer(&self, code: usize) -> Result<&[u8]> {
         let first = self.first(code)?;
-        self.owned(first).ok_or_else(|| Error::internal("a replaced code has no answer"))
+        match self.owned(first) {
+            Some(Owned::Bytes(bytes)) => Ok(bytes),
+            Some(Owned::Itself) => self
+                .dictionary
+                .bytes_at(first as usize)
+                .ok_or_else(|| Error::internal("a replaced value is not in its dictionary")),
+            None => Err(Error::internal("a replaced code has no answer")),
+        }
     }
 }
 
@@ -1036,6 +1112,80 @@ mod tests {
                 let want = Value::Varchar(format!("h{}.ru", index % 13));
                 assert_eq!(got.value_at(row), want, "row {index}");
                 assert_eq!(code, *code_of.entry(index % 13).or_insert(code), "row {index}");
+            }
+        }
+    }
+
+    /// Values the pattern does not match answer with themselves and keep no copy of it, and one
+    /// that reads as another value's host still shares that host's code, whichever group gave it
+    /// first.
+    #[test]
+    fn values_that_answer_themselves_share_codes_with_the_same_answer() {
+        let answer = |index: usize| match index % 4 {
+            3 => format!("plain{index}"),
+            _ => format!("h{}.ru", index % 13),
+        };
+        let texts: Vec<String> = (0..8_192)
+            .map(|index| match index % 4 {
+                0 | 2 => format!("http://h{}.ru/{index}", index % 13),
+                _ => answer(index),
+            })
+            .collect();
+        // The dictionary holds each value once, so the host that stands alone is only its first.
+        let mut unique = std::collections::HashSet::new();
+        let kept: Vec<usize> =
+            (0..texts.len()).filter(|&index| unique.insert(texts[index].clone())).collect();
+        let values: Vec<Value> =
+            kept.iter().map(|&index| Value::Varchar(texts[index].clone())).collect();
+        let dictionary =
+            Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("builds"));
+        let constants = [
+            Value::Varchar("^https?://(?:www\\.)?([^/]+)/.*$".into()),
+            Value::Varchar("\\1".into()),
+        ];
+        let call = Call::read("regexp_replace", &constants.iter().collect::<Vec<_>>())
+            .expect("compiles")
+            .expect("a shape this file handles");
+        let rows = values.len();
+        let groups = rows.div_ceil(1_024);
+        let answers: Vec<Vector> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..groups)
+                .rev()
+                .map(|group| {
+                    let (call, dictionary) = (&call, &dictionary);
+                    scope.spawn(move || {
+                        let codes: Vec<u32> = (group * 1_024..rows.min(group * 1_024 + 1_024))
+                            .map(|row| row as u32)
+                            .collect();
+                        let len = codes.len();
+                        let column = Vector::stable_dictionary(codes, Arc::clone(dictionary))
+                            .expect("codes are in range");
+                        vectorized(
+                            "regexp_replace",
+                            Some(call),
+                            &[&column],
+                            &LogicalType::Varchar,
+                            len,
+                        )
+                        .expect("the call is written")
+                        .expect("text in this form has a loop")
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|thread| thread.join().expect("no panic")).collect()
+        });
+        let mut code_of = std::collections::HashMap::new();
+        for (at, got) in answers.iter().enumerate() {
+            let group = groups - 1 - at;
+            let (codes, _) = got.stable_dictionary_parts().expect("answered as codes");
+            for (row, &code) in codes.iter().enumerate() {
+                let want = answer(kept[group * 1_024 + row]);
+                assert_eq!(
+                    got.value_at(row),
+                    Value::Varchar(want.clone()),
+                    "group {group} row {row}"
+                );
+                assert_eq!(code, *code_of.entry(want).or_insert(code), "group {group} row {row}");
             }
         }
     }
