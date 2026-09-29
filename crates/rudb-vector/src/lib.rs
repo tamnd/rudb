@@ -31,7 +31,7 @@
 //! # Unsafe
 //!
 //! This crate is on the list in `spec/16-testing.md` section 16.7 that is allowed `unsafe`, and the
-//! one place it uses any is [`bytes`], for SSE2's `movemask`. The safe version is the baseline every unsafe version has to beat on a
+//! places it uses any are [`bytes`], for SSE2's `movemask`, and [`members`], for AVX2's gather. The safe version is the baseline every unsafe version has to beat on a
 //! benchmark before it lands, so writing it first is not a detour.
 //!
 //! The lint below is `deny` rather than `forbid` for exactly that reason. Denied means an unsafe
@@ -47,6 +47,7 @@ pub mod bytes;
 pub mod chunk;
 pub mod fsst;
 mod layout;
+pub mod members;
 pub mod selection;
 pub mod string;
 pub mod validity;
