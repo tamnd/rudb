@@ -1,6 +1,9 @@
 //! A statement parsed once and run many times, with values for its parameters.
 
+use std::sync::{Mutex, PoisonError};
+
 use rudb_bind::Parameters;
+use rudb_catalog::QualifiedName;
 use rudb_common::{Error, Result, Value};
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::parse_ast_with_case;
@@ -60,6 +63,40 @@ pub(crate) struct Direct {
     pub(crate) columns: Vec<String>,
     /// The row, one item for each column it names.
     pub(crate) items: Vec<Item>,
+    /// What the last execution worked out about the table, kept while the catalog stays as it was.
+    pub(crate) found: Found,
+}
+
+/// The table a [`Direct`] insert found and where its items land, with the catalog generation it
+/// was found at.
+///
+/// Resolving the name and matching the column list cost more than putting the row in, and neither
+/// changes until the catalog does. The insert itself moves the generation on, so it is the
+/// generation after the insert that is kept.
+#[derive(Debug, Default)]
+pub(crate) struct Found(Mutex<Option<(u64, QualifiedName, Vec<usize>)>>);
+
+impl Found {
+    /// The name and targets found at `generation`, taken out so the caller can hand them back.
+    pub(crate) fn take(&self, generation: u64) -> Option<(QualifiedName, Vec<usize>)> {
+        let mut found = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match found.take() {
+            Some((at, name, targets)) if at == generation => Some((name, targets)),
+            _ => None,
+        }
+    }
+
+    /// Keeps `name` and `targets` as what the catalog holds at `generation`.
+    pub(crate) fn keep(&self, generation: u64, name: QualifiedName, targets: Vec<usize>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((generation, name, targets));
+    }
+}
+
+impl Clone for Found {
+    /// A copy starts over, since nothing it would keep is worth sharing.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// One item of a [`Direct`] row.
@@ -102,6 +139,7 @@ impl Direct {
             name: ast.name(insert.name).map(str::to_owned).collect(),
             columns: ast.name(insert.columns).map(str::to_owned).collect(),
             items,
+            found: Found::default(),
         })
     }
 }
