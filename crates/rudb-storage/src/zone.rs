@@ -124,68 +124,7 @@ impl Range {
     /// type. The caller builds the vector for those. A test holds the two answers together.
     #[must_use]
     pub fn of_one(value: &Value, ty: &LogicalType) -> Option<Self> {
-        let int = |number: i128, sum: Option<i128>| {
-            let bound = Some(scaled_as(Bound::Int(number), ty));
-            Some(Self { low: bound.clone(), high: bound, nulls: 0, exact: true, sum })
-        };
-        let real = |number: f64| {
-            let bound = (!number.is_nan()).then_some(Bound::Real(number));
-            Some(Self { low: bound.clone(), high: bound, nulls: 0, exact: false, sum: None })
-        };
-        use LogicalType as T;
-        match (value, ty) {
-            (Value::Null, T::Float | T::Double) => {
-                Some(Self { nulls: 1, exact: false, ..Self::default() })
-            }
-            (Value::Null, T::Varchar | T::HugeInt) => {
-                Some(Self { nulls: 1, exact: true, ..Self::default() })
-            }
-            (
-                Value::Null,
-                T::Boolean
-                | T::TinyInt
-                | T::SmallInt
-                | T::Integer
-                | T::BigInt
-                | T::UTinyInt
-                | T::USmallInt
-                | T::UInteger
-                | T::UBigInt
-                | T::Date
-                | T::Time
-                | T::Timestamp
-                | T::TimestampS
-                | T::TimestampMs
-                | T::TimestampNs
-                | T::TimestampTz,
-            ) => Some(Self { nulls: 1, exact: true, sum: Some(0), ..Self::default() }),
-            (Value::Boolean(v), T::Boolean) => int(i128::from(*v), Some(i128::from(*v))),
-            (Value::TinyInt(v), T::TinyInt) => int(i128::from(*v), Some(i128::from(*v))),
-            (Value::SmallInt(v), T::SmallInt) => int(i128::from(*v), Some(i128::from(*v))),
-            (Value::Integer(v), T::Integer) | (Value::Date(v), T::Date) => {
-                int(i128::from(*v), Some(i128::from(*v)))
-            }
-            (Value::BigInt(v), T::BigInt)
-            | (Value::Time(v), T::Time)
-            | (Value::Timestamp(v), T::Timestamp)
-            | (Value::TimestampS(v), T::TimestampS)
-            | (Value::TimestampMs(v), T::TimestampMs)
-            | (Value::TimestampNs(v), T::TimestampNs)
-            | (Value::TimestampTz(v), T::TimestampTz) => int(i128::from(*v), Some(i128::from(*v))),
-            (Value::UTinyInt(v), T::UTinyInt) => int(i128::from(*v), Some(i128::from(*v))),
-            (Value::USmallInt(v), T::USmallInt) => int(i128::from(*v), Some(i128::from(*v))),
-            (Value::UInteger(v), T::UInteger) => int(i128::from(*v), Some(i128::from(*v))),
-            (Value::UBigInt(v), T::UBigInt) => int(i128::from(*v), Some(i128::from(*v))),
-            // A sixteen byte column has exact ends and no total, the first reason on `sum`.
-            (Value::HugeInt(v), T::HugeInt) => int(*v, None),
-            (Value::Float(v), T::Float) => real(f64::from(*v)),
-            (Value::Double(v), T::Double) => real(*v),
-            (Value::Varchar(text), T::Varchar) => {
-                let bound = Some(Bound::Bytes(text.as_bytes().to_vec()));
-                Some(Self { low: bound.clone(), high: bound, nulls: 0, exact: true, sum: None })
-            }
-            _ => None,
-        }
+        One::of(value, ty).map(One::range)
     }
 
     /// Whether this range says no row of the chunk can pass `probe`.
@@ -255,6 +194,166 @@ impl Range {
             _ => None,
         };
     }
+
+    /// Opens this range to also cover `one`, the same as widening by its [`One::range`] without
+    /// building it.
+    ///
+    /// A row trickled onto a tail widens two zones, and building the one-row range to do it copied
+    /// a string's bytes twice a row to throw them away unless the string was a new end.
+    fn widen_one(&mut self, one: One<'_>) {
+        let empty = self.exact && self.low.is_none() && self.high.is_none();
+        let (exact, sum) = match one {
+            One::Null { exact, sum } => {
+                // A null the walk could not see past says nothing about the ends, which is how a
+                // float column's range treats one.
+                if !exact {
+                    self.low = None;
+                    self.high = None;
+                }
+                self.nulls += 1;
+                (exact, sum)
+            }
+            One::Int { bound, sum } => {
+                self.reach(empty, |mine| mine.order(&bound), || bound.clone());
+                (true, sum)
+            }
+            One::Real(number) if number.is_nan() => {
+                self.low = None;
+                self.high = None;
+                (false, None)
+            }
+            One::Real(number) => {
+                let bound = Bound::Real(number);
+                self.reach(empty, |mine| mine.order(&bound), || bound.clone());
+                (false, None)
+            }
+            One::Bytes(bytes) => {
+                let order = |mine: &Bound| match mine {
+                    Bound::Bytes(mine) => Some(mine.as_slice().cmp(bytes)),
+                    _ => None,
+                };
+                self.reach(empty, order, || Bound::Bytes(bytes.to_vec()));
+                (true, None)
+            }
+        };
+        self.exact &= exact;
+        self.sum = match (self.sum, sum) {
+            (Some(mine), Some(theirs)) => mine.checked_add(theirs),
+            _ => None,
+        };
+    }
+
+    /// Moves either end out to a value that `order` compares with and `make` builds, which is
+    /// called only for an end it replaces. An empty range takes the value as both ends.
+    fn reach(
+        &mut self,
+        empty: bool,
+        order: impl Fn(&Bound) -> Option<Ordering>,
+        make: impl Fn() -> Bound,
+    ) {
+        if empty {
+            self.low = Some(make());
+            self.high = Some(make());
+            return;
+        }
+        if let Some(low) = &mut self.low
+            && order(low) == Some(Ordering::Greater)
+        {
+            *low = make();
+        }
+        if let Some(high) = &mut self.high
+            && order(high) == Some(Ordering::Less)
+        {
+            *high = make();
+        }
+    }
+}
+
+/// One value the way [`Range::of_one`] reads it, borrowing a string rather than copying it.
+enum One<'a> {
+    /// A null, with whether the walk of its type is exact and the total it starts from.
+    Null { exact: bool, sum: Option<i128> },
+    /// An integer, already in the domain its type hands over, and what it adds to a total.
+    Int { bound: Bound, sum: Option<i128> },
+    /// A float, which has neither an exact walk nor a total.
+    Real(f64),
+    /// A string's bytes.
+    Bytes(&'a [u8]),
+}
+
+impl<'a> One<'a> {
+    /// `value` as a column of `ty` holds it, or `None` for the values [`Range::of_one`] does not
+    /// answer.
+    fn of(value: &'a Value, ty: &LogicalType) -> Option<Self> {
+        let int = |number: i128, sum: Option<i128>| {
+            Some(Self::Int { bound: scaled_as(Bound::Int(number), ty), sum })
+        };
+        use LogicalType as T;
+        match (value, ty) {
+            (Value::Null, T::Float | T::Double) => Some(Self::Null { exact: false, sum: None }),
+            (Value::Null, T::Varchar | T::HugeInt) => Some(Self::Null { exact: true, sum: None }),
+            (
+                Value::Null,
+                T::Boolean
+                | T::TinyInt
+                | T::SmallInt
+                | T::Integer
+                | T::BigInt
+                | T::UTinyInt
+                | T::USmallInt
+                | T::UInteger
+                | T::UBigInt
+                | T::Date
+                | T::Time
+                | T::Timestamp
+                | T::TimestampS
+                | T::TimestampMs
+                | T::TimestampNs
+                | T::TimestampTz,
+            ) => Some(Self::Null { exact: true, sum: Some(0) }),
+            (Value::Boolean(v), T::Boolean) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::TinyInt(v), T::TinyInt) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::SmallInt(v), T::SmallInt) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::Integer(v), T::Integer) | (Value::Date(v), T::Date) => {
+                int(i128::from(*v), Some(i128::from(*v)))
+            }
+            (Value::BigInt(v), T::BigInt)
+            | (Value::Time(v), T::Time)
+            | (Value::Timestamp(v), T::Timestamp)
+            | (Value::TimestampS(v), T::TimestampS)
+            | (Value::TimestampMs(v), T::TimestampMs)
+            | (Value::TimestampNs(v), T::TimestampNs)
+            | (Value::TimestampTz(v), T::TimestampTz) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::UTinyInt(v), T::UTinyInt) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::USmallInt(v), T::USmallInt) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::UInteger(v), T::UInteger) => int(i128::from(*v), Some(i128::from(*v))),
+            (Value::UBigInt(v), T::UBigInt) => int(i128::from(*v), Some(i128::from(*v))),
+            // A sixteen byte column has exact ends and no total, the first reason on `sum`.
+            (Value::HugeInt(v), T::HugeInt) => int(*v, None),
+            (Value::Float(v), T::Float) => Some(Self::Real(f64::from(*v))),
+            (Value::Double(v), T::Double) => Some(Self::Real(*v)),
+            (Value::Varchar(text), T::Varchar) => Some(Self::Bytes(text.as_bytes())),
+            _ => None,
+        }
+    }
+
+    /// The range of a one-row column holding this.
+    fn range(self) -> Range {
+        let one = |bound: Bound, exact: bool, sum: Option<i128>| Range {
+            low: Some(bound.clone()),
+            high: Some(bound),
+            nulls: 0,
+            exact,
+            sum,
+        };
+        match self {
+            Self::Null { exact, sum } => Range { nulls: 1, exact, sum, ..Range::default() },
+            Self::Int { bound, sum } => one(bound, true, sum),
+            Self::Real(number) if number.is_nan() => Range { exact: false, ..Range::default() },
+            Self::Real(number) => one(Bound::Real(number), false, None),
+            Self::Bytes(bytes) => one(Bound::Bytes(bytes.to_vec()), true, None),
+        }
+    }
 }
 
 /// The ranges of every column of one chunk.
@@ -273,6 +372,28 @@ impl Zone {
         }
         let columns = row.iter().zip(types).map(|(value, ty)| Range::of_one(value, ty));
         Some(Self { columns: columns.collect::<Option<_>>()? })
+    }
+
+    /// Whether [`Self::of_row`] answers `row`, which is what [`Self::widen_row`] needs of it.
+    #[must_use]
+    pub fn takes_row(row: &[Value], types: &[LogicalType]) -> bool {
+        row.len() == types.len()
+            && row.iter().zip(types).all(|(value, ty)| One::of(value, ty).is_some())
+    }
+
+    /// Opens this zone to also cover `row`, the same as widening it by [`Self::of_row`] of the row
+    /// but copying a string only when it is a new end.
+    ///
+    /// `row` has to be one [`Self::takes_row`] says yes to. A value it would not answer leaves its
+    /// column's range saying nothing, which is the side that keeps rows.
+    pub fn widen_row(&mut self, row: &[Value], types: &[LogicalType]) {
+        self.columns.truncate(row.len());
+        for ((range, value), ty) in self.columns.iter_mut().zip(row).zip(types) {
+            match One::of(value, ty) {
+                Some(one) => range.widen_one(one),
+                None => *range = Range { nulls: range.nulls, ..Range::default() },
+            }
+        }
     }
 
     /// Builds a zone from persisted ranges.
@@ -930,6 +1051,33 @@ mod tests {
                 ],
             ),
         ]
+    }
+
+    #[test]
+    fn a_zone_widened_by_a_row_in_place_is_one_widened_by_its_zone() {
+        for (ty, values) in samples() {
+            let types = [ty.clone(), LogicalType::Integer];
+            // Every rotation, so each value gets to be the first, a new end and one that is not.
+            for start in 0..values.len() {
+                let rows: Vec<[Value; 2]> = (0..values.len())
+                    .map(|at| {
+                        let at = (start + at) % values.len();
+                        [values[at].clone(), Value::Integer(at as i32)]
+                    })
+                    .collect();
+                let mut folded = Zone::of_row(&rows[0], &types).expect("answered");
+                let mut widened = folded.clone();
+                for row in &rows[1..] {
+                    assert!(Zone::takes_row(row, &types));
+                    folded.widen(&Zone::of_row(row, &types).expect("answered"));
+                    widened.widen_row(row, &types);
+                }
+                assert_eq!(widened, folded, "{ty} from {start}");
+            }
+        }
+        let decimal = [LogicalType::Decimal { width: 9, scale: 2 }];
+        assert!(!Zone::takes_row(&[Value::Null], &decimal));
+        assert!(!Zone::takes_row(&[Value::Null], &[]));
     }
 
     #[test]

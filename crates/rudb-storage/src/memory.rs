@@ -292,6 +292,11 @@ impl MemoryTable {
         } else if let Some(last) = self.zones.last_mut() {
             last.widen(&zone);
         }
+        self.lengthen(rows)
+    }
+
+    /// Counts `rows` onto the tail and closes it or the group when either is full.
+    fn lengthen(&mut self, rows: usize) -> Result<()> {
         self.rows += rows;
         self.open_rows += rows;
         self.tail_rows += rows;
@@ -1014,6 +1019,19 @@ impl MemoryTable {
     fn push_row(&mut self, row: &[Value]) -> Result<()> {
         // A row of plain values has its zone and counts worked out from the values, which is what
         // the one-row chunk would have given them without the chunk.
+        // Past the tail's first row the two zones it widens are widened in place from the values.
+        if self.tail_rows > 0 && Zone::takes_row(row, &self.types) {
+            self.build(row)?;
+            self.counts.add_row(row);
+            match &mut self.open_zone {
+                Some(open) => open.widen_row(row, &self.types),
+                None => self.open_zone = Zone::of_row(row, &self.types),
+            }
+            if let Some(last) = self.zones.last_mut() {
+                last.widen_row(row, &self.types);
+            }
+            return self.lengthen(1);
+        }
         if let Some(zone) = Zone::of_row(row, &self.types) {
             self.build(row)?;
             self.counts.add_row(row);
