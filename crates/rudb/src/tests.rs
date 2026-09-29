@@ -12418,6 +12418,97 @@ fn approx_quantile_and_approx_top_k_export_the_sketch_they_keep() {
 }
 
 #[test]
+fn avg_over_a_time_a_timestamp_or_an_interval_answers_in_that_type() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let over = |values: &str| format!("SELECT avg(x), typeof(avg(x)) FROM (VALUES {values}) t(x)");
+    for (sql, answer) in [
+        (
+            over("(INTERVAL '1 day'), (INTERVAL '2 hours'), (INTERVAL '1 month')"),
+            "10 days 08:40:00|INTERVAL",
+        ),
+        (
+            over("(TIMESTAMP '2020-01-01'), (TIMESTAMP '2020-01-02 01:00:00')"),
+            "2020-01-01 12:30:00|TIMESTAMP",
+        ),
+        (
+            over("(TIMESTAMPTZ '2020-01-01 00:00:00+00'), (TIMESTAMPTZ '2020-01-02 01:00:00+00')"),
+            "2020-01-01 12:30:00+00|TIMESTAMP WITH TIME ZONE",
+        ),
+        (over("(TIME '12:00:00'), (TIME '13:00:01')"), "12:30:00.5|TIME"),
+        (
+            over("(TIMETZ '12:00:00+00'), (TIMETZ '13:00:01+00')"),
+            "12:30:00.5+00|TIME WITH TIME ZONE",
+        ),
+        (over("(DATE '2020-01-01'), (DATE '2020-01-04')"), "2020-01-02 12:00:00|TIMESTAMP"),
+        (over("(TIMESTAMP_S '2020-01-01')"), "2020-01-01 00:00:00|TIMESTAMP"),
+        (
+            over("(TIMESTAMP '1960-01-01 00:00:00.000001'), (TIMESTAMP '1960-01-01')"),
+            "1960-01-01 00:00:00.000001|TIMESTAMP",
+        ),
+        (
+            over("(INTERVAL '5 seconds'), (INTERVAL '0 seconds'), (INTERVAL '0 seconds')"),
+            "00:00:01.666668|INTERVAL",
+        ),
+        (over("(NULL::TIME)"), "NULL|TIME"),
+        (
+            "SELECT avg(x) OVER () FROM (VALUES (TIME '12:00:00'), (TIME '13:00:01')) t(x)"
+                .to_string(),
+            "12:30:00.5;12:30:00.5",
+        ),
+        (
+            "SELECT avg(DISTINCT x), avg(x) FILTER (x > TIME '12:30:00') FROM (VALUES \
+             (TIME '12:00:00'), (TIME '12:00:00'), (TIME '13:00:00')) t(x)"
+                .to_string(),
+            "12:30:00|13:00:00",
+        ),
+        (
+            "SELECT g, avg(x) FROM (VALUES (1, TIME '01:00:00'), (2, TIME '02:00:00'), \
+             (1, TIME '03:00:00')) t(g, x) GROUP BY g ORDER BY g"
+                .to_string(),
+            "1|02:00:00;2|02:00:00",
+        ),
+        (
+            "SELECT typeof(avg(INTERVAL '1 day') EXPORT_STATE), (avg(TIME '12:00:00') \
+             EXPORT_STATE)::VARCHAR, (avg(INTERVAL '1 day') EXPORT_STATE)::VARCHAR"
+                .to_string(),
+            "AGGREGATE_STATE|{'count': 1, 'value': 43200000000}|{'count': 1, 'value': 1 day}",
+        ),
+        (
+            "SELECT finalize(combine_aggr(s)) FROM (SELECT avg(x) EXPORT_STATE s FROM (VALUES \
+             (TIME '01:00:00'), (TIME '02:00:00')) t(x) UNION ALL SELECT avg(x) EXPORT_STATE \
+             FROM (VALUES (TIME '10:00:00')) t(x))"
+                .to_string(),
+            "04:20:00",
+        ),
+        (
+            "SELECT finalize(avg(x) EXPORT_STATE) FROM (SELECT INTERVAL '1 day' x WHERE false)"
+                .to_string(),
+            "NULL",
+        ),
+        (
+            "SELECT finalize(to_aggregate_state({'count': 2, 'value': INTERVAL '1 day'}, 'avg', \
+             ['INTERVAL'])), finalize(to_aggregate_state({'count': 2, 'value': 43200000000}, \
+             'avg', ['TIMETZ']))"
+                .to_string(),
+            "12:00:00|06:00:00+00",
+        ),
+    ] {
+        assert_eq!(text(&sql), answer, "{sql}");
+    }
+    let sql = "SELECT avg(x) FROM (VALUES (INTERVAL '2000000000 days'), (INTERVAL '2000000000 \
+               days')) t(x)";
+    let error = db.execute(sql).expect_err(sql);
+    assert_eq!(error.message(), "Overflow in addition of INT32 (2000000000 + 2000000000)!");
+}
+
+#[test]
 fn combine_aggr_folds_states_as_many_times_as_it_is_told() {
     let db = Database::new();
     let text = |sql: &str| {

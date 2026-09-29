@@ -28,6 +28,7 @@ use crate::hash::Sketch;
 use crate::histogram::Binned;
 use crate::lttb::{Plot, Points};
 use crate::number::{approximate, fit, integral};
+use crate::timed::Timed;
 use crate::quantile::{self, Column, Held, Holistic, Sample};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
 use crate::tally::Tally;
@@ -102,6 +103,8 @@ pub(crate) enum General {
     Kahan { value: f64, err: f64, count: u64, average: bool },
     /// `count_if`, the rows that were true, and whether any row was not null.
     CountIf { count: i128, seen: bool },
+    /// `avg` over a time, a timestamp or an interval, in [`crate::timed`].
+    Timed(Timed),
     /// `entropy`, which counts each distinct value rather than holding them all.
     Tally(Tally),
     /// `histogram(x)`, the count of each distinct value, answered as a map keyed by `key`.
@@ -182,6 +185,9 @@ impl General {
         }
         if let Some(measure) = Moment::named(name) {
             return Some(Self::Powers(Powers::new(measure)));
+        }
+        if name == "avg" {
+            return Timed::new(returns).map(Self::Timed);
         }
         if let Some(measure) = Holistic::named(name) {
             let returns = returns.clone();
@@ -343,6 +349,7 @@ impl General {
                 *count += 1;
             }
             Self::Tally(tally) => tally.push(value)?,
+            Self::Timed(state) => state.update(value)?,
             Self::Exported { inner, .. } => inner.update(args)?,
             Self::Merged(merge) => merge.update(args)?,
             Self::CountIf { count, seen } => {
@@ -649,6 +656,7 @@ impl General {
                 *count += more;
             }
             (Self::Tally(tally), Self::Tally(theirs)) => tally.append(theirs)?,
+            (Self::Timed(state), Self::Timed(theirs)) => state.combine(theirs)?,
             (Self::Counted { tally, .. }, Self::Counted { tally: theirs, .. }) => {
                 tally.append(theirs)?;
             }
@@ -749,6 +757,7 @@ impl General {
                 Value::Double(value / rows + err / rows)
             }
             Self::CountIf { count, .. } => Value::HugeInt(*count),
+            Self::Timed(state) => state.finish()?,
             Self::Tally(tally) => tally.entropy()?,
             Self::Counted { tally, key } => {
                 let entries = tally.sorted()?;

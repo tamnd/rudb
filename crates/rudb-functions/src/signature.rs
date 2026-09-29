@@ -1985,6 +1985,10 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         |ty: &LogicalType| matches!(ty, TinyInt | SmallInt | Integer | UTinyInt | USmallInt | Null);
     match (name, arguments) {
         ("-", [Interval]) => kept(Interval),
+        // The pin averages these in their own type, and a date through a timestamp, which is the
+        // overload it casts a date to.
+        ("avg", [Interval | Time | TimeTz | Timestamp | TimestampTz]) => kept(arguments[0].clone()),
+        ("avg", [Date]) => Some((vec![Timestamp], Timestamp)),
         ("+" | "-", [Date | Timestamp, Interval]) | ("+", [Interval, Date | Timestamp]) => {
             kept(Timestamp)
         }

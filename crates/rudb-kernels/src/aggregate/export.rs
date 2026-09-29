@@ -51,6 +51,9 @@ pub fn state_layout(
             _ => returns.clone(),
         },
         "avg" => {
+            if let Some(layout) = arguments.first().and_then(crate::timed::Timed::layout) {
+                return Ok(layout);
+            }
             let value = match arguments.first() {
                 Some(LogicalType::Float | LogicalType::Double) => LogicalType::Double,
                 Some(LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::UTinyInt) => {
@@ -487,6 +490,7 @@ impl General {
             Self::Powers(state) => state.export(),
             Self::Arg { state, .. } => state.export()?,
             Self::Digested { digest, .. } => digest.export(),
+            Self::Timed(state) => state.export(),
             Self::Top { top, element } => top.export(element),
             Self::Ordered { rows, .. } if rows.is_empty() => Value::Null,
             Self::Ordered { rows, .. } => {
@@ -545,6 +549,7 @@ impl General {
             Self::Powers(state) => state.import(value)?,
             Self::Arg { state, .. } => state.import(member(value, "arg")?, member(value, "by")?)?,
             Self::Digested { digest, .. } => **digest = crate::digest::Digest::import(value)?,
+            Self::Timed(state) => state.import(value)?,
             Self::Top { top, .. } => **top = crate::topk::TopK::import(value)?,
             Self::Ordered { rows, .. } => {
                 let Value::List { values: held, .. } = value else {
