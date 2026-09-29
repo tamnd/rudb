@@ -3376,6 +3376,44 @@ fn floored<const UNIT: i64>(
               type of the answer, the vector whose type picks the arm and which of the two \
               functions this is"
 )]
+/// The years a run of dates falls in, as the first of them and the day each later one starts.
+///
+/// A date column in a chunk usually spans a few years, so the year of a date is the first year plus
+/// how many of those new year days it is on or past, a few compares with nothing to branch on. The
+/// calendar arithmetic that works the year out from scratch was about a hundred instructions a row,
+/// and `extract(year ...)` over `o_orderdate` on TPC-H q09 asked it 320 thousand times.
+struct Years {
+    first: i64,
+    starts: Vec<i32>,
+}
+
+impl Years {
+    /// The most new year days a run is compared against before the arithmetic is cheaper.
+    const MOST: usize = 16;
+
+    /// `None` for no dates, or dates that span more years than [`Self::MOST`] allows. The dates
+    /// under a null are read as well, which only widens the span.
+    fn over(days: impl Iterator<Item = i32>) -> Option<Self> {
+        let (low, high) =
+            days.fold((i32::MAX, i32::MIN), |(low, high), day| (low.min(day), high.max(day)));
+        if low > high {
+            return None;
+        }
+        let (first, _, _) = civil_from_days(low);
+        let (last, _, _) = civil_from_days(high);
+        if usize::try_from(last - first).ok()? > Self::MOST {
+            return None;
+        }
+        let starts = (first + 1..=last).map(|year| days_from_civil(year, 1, 1)).collect();
+        Some(Self { first: i64::from(first), starts })
+    }
+
+    /// The year of `day`, which has to be one of the dates this was made over.
+    fn of(&self, day: i32) -> i64 {
+        self.first + self.starts.iter().map(|&start| i64::from(day >= start)).sum::<i64>()
+    }
+}
+
 fn date_runs<A: Fn(usize) -> usize>(
     part: Part,
     data: &Data,
@@ -3418,10 +3456,19 @@ fn date_runs<A: Fn(usize) -> usize>(
         }
         (LogicalType::Date, Data::Int32(days), false) => {
             let mut out = vec![0i64; rows];
-            let validity = over_valid(rows, base, |index| {
-                out[index] = part.of_days(days[at(index)])?;
-                Ok(())
-            })?;
+            let validity = if part == Part::Year
+                && let Some(years) = Years::over((0..rows).map(|index| days[at(index)]))
+            {
+                over_valid(rows, base, |index| {
+                    out[index] = years.of(days[at(index)]);
+                    Ok(())
+                })?
+            } else {
+                over_valid(rows, base, |index| {
+                    out[index] = part.of_days(days[at(index)])?;
+                    Ok(())
+                })?
+            };
             finish(returns, Data::Int64(out.into()), validity)
         }
         (LogicalType::Date, Data::Int32(days), true) => {
@@ -4346,6 +4393,21 @@ mod tests {
 
     fn called(name: &str, args: &[Value], returns: &LogicalType) -> Value {
         call_values(name, args, returns, None).expect("this call is written")
+    }
+
+    /// The year read off the new year days is the year the calendar arithmetic gives, across leap
+    /// years, dates before 1970 and the last and first day of each year, and a span too wide falls
+    /// back.
+    #[test]
+    fn the_year_of_a_date_is_read_off_the_new_year_days() {
+        let days: Vec<i32> =
+            (-800..5000).step_by(7).chain([-731, -366, -365, -1, 0, 364, 365]).collect();
+        let years = Years::over(days.iter().copied()).expect("a span this short has its years");
+        for &day in &days {
+            assert_eq!(years.of(day), Part::Year.of_days(day).expect("a date"), "day {day}");
+        }
+        assert!(Years::over(std::iter::empty()).is_none());
+        assert!(Years::over([0, 365 * 40].into_iter()).is_none());
     }
 
     /// What `nullif` does with the nulls and with a comparison that was cast. Per #306.

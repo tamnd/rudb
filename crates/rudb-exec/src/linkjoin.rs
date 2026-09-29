@@ -247,10 +247,13 @@ impl LinkJoin {
         } else {
             Some(self.parent.place(rids)?)
         };
-        let mut columns: Vec<Vector> = chunk.columns().to_vec();
+        // Taken rather than copied, since the chunk is replaced below and a copy of a column that
+        // owns its values is a copy of every value. On TPC-H q09 those copies were a tenth of the
+        // query.
+        let mut columns: Vec<Vector> = std::mem::replace(chunk, Chunk::empty(&[])).into_columns();
         for ((column, ty), key) in self.projected.iter().zip(&self.keys) {
             if let Some(child) = *key {
-                let same = chunk.columns().get(child).ok_or_else(|| {
+                let same = columns.get(child).ok_or_else(|| {
                     Error::internal("a link join took a key from a child column it does not have")
                 })?;
                 columns.push(same.clone());
