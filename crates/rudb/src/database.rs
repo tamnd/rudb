@@ -3172,15 +3172,12 @@ impl Shared {
             let ty = &fields[at].ty;
             let value = if value.is_null() {
                 Value::Null
+            } else if value.is_of(ty) {
+                value
+            } else if widens(&value.logical_type(), ty) {
+                rudb_kernels::cast::cast_value(&value, ty, false).ok()?
             } else {
-                let from = value.logical_type();
-                if &from == ty {
-                    value
-                } else if widens(&from, ty) {
-                    rudb_kernels::cast::cast_value(&value, ty, false).ok()?
-                } else {
-                    return None;
-                }
+                return None;
             };
             if value.is_null() && fields[at].not_null {
                 return None;
