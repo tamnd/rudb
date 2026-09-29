@@ -12311,6 +12311,113 @@ fn to_aggregate_state_types_a_value_as_the_state_of_the_call_it_names() {
 }
 
 #[test]
+fn approx_quantile_and_approx_top_k_export_the_sketch_they_keep() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let digest = "STRUCT(\"count\" UBIGINT, \"min\" DOUBLE, \"max\" DOUBLE, centroids \
+                  STRUCT(mean DOUBLE, weight DOUBLE)[])";
+    let top = |ty: &str| {
+        format!(
+            "STRUCT(k UBIGINT, \"values\" STRUCT(\"value\" {ty}, \"count\" UBIGINT)[], \"filter\" UBIGINT[])"
+        )
+    };
+    db.execute("SET threads=1").unwrap();
+    for (sql, answer) in [
+        (
+            "SELECT approx_quantile(i, 0.5) EXPORT_STATE FROM range(0) t(i)".to_string(),
+            "NULL".to_string(),
+        ),
+        (
+            "SELECT finalize(approx_quantile(i, 0.5) EXPORT_STATE) = approx_quantile(i, 0.5) \
+             FROM range(1, 10001) t(i)"
+                .into(),
+            "true".into(),
+        ),
+        (
+            "SELECT finalize(approx_quantile(i, [0.1, 0.5, 0.9]) EXPORT_STATE) = \
+             approx_quantile(i, [0.1, 0.5, 0.9]) FROM range(1, 10001) t(i)"
+                .into(),
+            "true".into(),
+        ),
+        (
+            format!(
+                "SELECT s.\"count\", s.\"min\", s.\"max\" FROM (SELECT (approx_quantile(i, 0.5) \
+                 EXPORT_STATE)::{digest} s FROM range(1, 101) t(i))"
+            ),
+            "100|1.0|100.0".into(),
+        ),
+        (
+            "SELECT finalize(combine_aggr(s)) FROM (SELECT approx_quantile(i, 0.5) EXPORT_STATE s \
+             FROM range(1, 500) t(i) UNION ALL SELECT approx_quantile(i, 0.5) EXPORT_STATE s \
+             FROM range(500, 1001) t(i) UNION ALL SELECT approx_quantile(i, 0.5) EXPORT_STATE s \
+             FROM range(0) t(i))"
+                .into(),
+            "500".into(),
+        ),
+        ("SELECT approx_top_k(x, 3) EXPORT_STATE FROM range(0) t(x)".into(), "NULL".into()),
+        (
+            format!(
+                "SELECT (approx_top_k(x, 2) EXPORT_STATE)::{}.\"values\" FROM (VALUES (5), (5), \
+                 (6)) t(x)",
+                top("INTEGER")
+            ),
+            "[{'value': 5, 'count': 2}, {'value': 6, 'count': 1}]".into(),
+        ),
+        (
+            format!(
+                "SELECT (approx_top_k(x, 1) EXPORT_STATE)::{}.k FROM (VALUES ('a'), ('a'), ('b')) \
+                 t(x)",
+                top("VARCHAR")
+            ),
+            "1".into(),
+        ),
+        (
+            "SELECT finalize(approx_top_k(l, 2) EXPORT_STATE) FROM (VALUES ([1, 2]), ([1, 2]), \
+             ([3])) t(l)"
+                .into(),
+            "[[1, 2], [3]]".into(),
+        ),
+        (
+            "SELECT finalize(combine(approx_top_k(x, 2) EXPORT_STATE, (SELECT approx_top_k(y, 2) \
+             EXPORT_STATE FROM (VALUES ('a'), ('c')) s(y)))) FROM (VALUES ('a'), ('b'), ('a')) t(x)"
+                .into(),
+            "[a, c]".into(),
+        ),
+    ] {
+        assert_eq!(text(&sql), answer, "{sql}");
+    }
+    for (sql, message) in [
+        (
+            "SELECT finalize(to_aggregate_state({'count': 1::UBIGINT, 'min': 0.0::DOUBLE, 'max': \
+             0.0::DOUBLE, 'centroids': []::STRUCT(mean DOUBLE, weight DOUBLE)[]}, \
+             'approx_quantile', ['DOUBLE', 'FLOAT'], [NULL, 0.5::FLOAT]))",
+            "Invalid approx_quantile state - non-zero count requires at least one centroid",
+        ),
+        (
+            "SELECT finalize(to_aggregate_state({'k': 2::UBIGINT, 'values': [{'value': 'a', \
+             'count': 5::UBIGINT}, {'value': 'a', 'count': 3::UBIGINT}]::STRUCT(\"value\" VARCHAR, \
+             \"count\" UBIGINT)[], 'filter': list_transform(range(64), lambda x: 0::UBIGINT)}, \
+             'approx_top_k', ['VARCHAR', 'BIGINT']))",
+            "Invalid approx_top_k state",
+        ),
+        (
+            "SELECT finalize(combine(approx_top_k(x, 2) EXPORT_STATE, (SELECT approx_top_k(y, 3) \
+             EXPORT_STATE FROM (VALUES ('a')) s(y)))) FROM (VALUES ('a')) t(x)",
+            "cannot combine approx_top_K with different k values",
+        ),
+    ] {
+        let error = db.execute(sql).expect_err(sql);
+        assert!(error.message().contains(message), "{sql}: {error}");
+    }
+}
+
+#[test]
 fn combine_aggr_folds_states_as_many_times_as_it_is_told() {
     let db = Database::new();
     let text = |sql: &str| {

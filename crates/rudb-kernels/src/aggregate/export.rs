@@ -94,6 +94,11 @@ pub fn state_layout(
             field("value", LogicalType::Double),
             field("err", LogicalType::Double),
         ]),
+        "approx_quantile" => crate::digest::digest_layout(),
+        "approx_top_k" => match arguments.first() {
+            Some(ty) => crate::topk::top_layout(ty),
+            None => return Err(not_written(name)),
+        },
         "entropy" | "histogram" | "mode" | "approx_count_distinct" => return Err(no_layout(name)),
         _ => return Err(not_written(name)),
     })
@@ -113,7 +118,7 @@ pub fn ordered_layout(columns: &[LogicalType]) -> LogicalType {
 /// past the end for an aggregate that reads every argument on every row.
 pub fn state_constants(name: &str) -> usize {
     match name {
-        "string_agg" | "quantile_cont" | "quantile_disc" => 1,
+        "string_agg" | "quantile_cont" | "quantile_disc" | "approx_quantile" => 1,
         _ => usize::MAX,
     }
 }
@@ -481,6 +486,8 @@ impl General {
             Self::Paired(state) => state.export(),
             Self::Powers(state) => state.export(),
             Self::Arg { state, .. } => state.export()?,
+            Self::Digested { digest, .. } => digest.export(),
+            Self::Top { top, element } => top.export(element),
             Self::Ordered { rows, .. } if rows.is_empty() => Value::Null,
             Self::Ordered { rows, .. } => {
                 let element = match layout {
@@ -537,6 +544,8 @@ impl General {
             Self::Paired(state) => state.import(value)?,
             Self::Powers(state) => state.import(value)?,
             Self::Arg { state, .. } => state.import(member(value, "arg")?, member(value, "by")?)?,
+            Self::Digested { digest, .. } => **digest = crate::digest::Digest::import(value)?,
+            Self::Top { top, .. } => **top = crate::topk::TopK::import(value)?,
             Self::Ordered { rows, .. } => {
                 let Value::List { values: held, .. } = value else {
                     return Err(Error::internal(format!("an ordered state holding {value:?}")));
@@ -586,7 +595,9 @@ impl General {
                     general.bind(constant);
                 }
             }
-            Self::Holistic { fraction, .. } => *fraction = constant.cloned().map(Box::new),
+            Self::Holistic { fraction, .. } | Self::Digested { fraction, .. } => {
+                *fraction = constant.cloned().map(Box::new);
+            }
             _ => {}
         }
     }

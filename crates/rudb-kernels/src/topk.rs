@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 
-use rudb_common::{Error, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
 
 use crate::hash::bytes;
 use crate::quantile::{Column, Whole};
@@ -165,7 +165,7 @@ impl TopK {
         let last = &self.stored[place as usize];
         if last.count > 0 {
             if self.filter.is_empty() {
-                self.filter = vec![0; (self.capacity() * FILTER_RATIO).next_power_of_two()];
+                self.filter = vec![0; self.filter_size()];
             }
             let mask = self.filter.len() as u64 - 1;
             #[expect(clippy::cast_possible_truncation, reason = "the mask keeps it in the filter")]
@@ -267,7 +267,7 @@ impl TopK {
     }
 
     /// The most counted values, up to `k` of them, or null for a group that saw none.
-    pub(crate) fn finish(&self, element: &rudb_common::LogicalType) -> Value {
+    pub(crate) fn finish(&self, element: &LogicalType) -> Value {
         if self.order.is_empty() {
             return Value::Null;
         }
@@ -279,6 +279,131 @@ impl TopK {
             .collect();
         Value::List { element: element.clone(), values }
     }
+}
+
+/// The layout of an `approx_top_k` state over values of `ty`: its `k`, the watched values most
+/// counted first with their counts, and the filter counters.
+pub(crate) fn top_layout(ty: &LogicalType) -> LogicalType {
+    LogicalType::Struct(vec![
+        Field::new("k", LogicalType::UBigInt),
+        Field::new("values", LogicalType::List(Box::new(watched_type(ty)))),
+        Field::new("filter", LogicalType::List(Box::new(LogicalType::UBigInt))),
+    ])
+}
+
+/// One watched value of the state and its count.
+fn watched_type(ty: &LogicalType) -> LogicalType {
+    LogicalType::Struct(vec![Field::new("value", ty.clone()), Field::new("count", LogicalType::UBigInt)])
+}
+
+impl TopK {
+    /// The state written out the way the pin writes it, or null for a group that saw nothing. The
+    /// pin's filter is there from the start, so one that has not been made yet is written as the
+    /// zeros the pin would hold.
+    pub(crate) fn export(&self, element: &LogicalType) -> Value {
+        if self.order.is_empty() {
+            return Value::Null;
+        }
+        let values = self.order.iter().map(|&place| {
+            let entry = &self.stored[place as usize];
+            Value::Struct(vec![
+                ("value".to_string(), entry.value.clone()),
+                ("count".to_string(), Value::UBigInt(entry.count)),
+            ])
+        });
+        let filter: Vec<Value> = if self.filter.is_empty() {
+            vec![Value::UBigInt(0); self.filter_size()]
+        } else {
+            self.filter.iter().map(|&count| Value::UBigInt(count)).collect()
+        };
+        Value::Struct(vec![
+            ("k".to_string(), Value::UBigInt(u64::try_from(self.k).unwrap_or(u64::MAX))),
+            (
+                "values".to_string(),
+                Value::List { element: watched_type(element), values: values.collect() },
+            ),
+            ("filter".to_string(), Value::List { element: LogicalType::UBigInt, values: filter }),
+        ])
+    }
+
+    /// The state `export` wrote, read back with the pin's checks, or an empty one for a null. A
+    /// filter of zeros is left unmade, which is how a group that never ran out of places holds it.
+    ///
+    /// # Errors
+    ///
+    /// If `k` is too large, the values or the filter do not fit it, or a value is null or there
+    /// twice.
+    pub(crate) fn import(value: &Value) -> Result<Self> {
+        let Value::Struct(fields) = value else {
+            return if value.is_null() {
+                Ok(Self::default())
+            } else {
+                Err(Error::internal(format!("an approx_top_k state {value:?}")))
+            };
+        };
+        let field = |name: &str| fields.iter().find(|(held, _)| held == name).map(|(_, v)| v);
+        let (
+            Some(&Value::UBigInt(k)),
+            Some(Value::List { values, .. }),
+            Some(Value::List { values: filter, .. }),
+        ) = (field("k"), field("values"), field("filter"))
+        else {
+            return Err(broken("the state fields cannot be NULL"));
+        };
+        let most = u64::try_from(MOST_K).unwrap_or(u64::MAX);
+        if k > most {
+            return Err(invalid(&format!(
+                "Requested 'k' ({k}) is bigger than accepted max ({MOST_K})"
+            )));
+        }
+        let mut top = Self { k: usize::try_from(k).unwrap_or(usize::MAX), ..Self::default() };
+        if values.len() > top.capacity() || filter.len() != top.filter_size() {
+            return Err(broken("the values/filter sizes do not match the k value"));
+        }
+        let mut key = Vec::new();
+        for watched in values {
+            let (Ok(value), Ok(&Value::UBigInt(count))) =
+                (member(watched, "value"), member(watched, "count"))
+            else {
+                return Err(broken("the state values cannot be NULL"));
+            };
+            if value.is_null() {
+                return Err(broken("the state values cannot be NULL"));
+            }
+            key.clear();
+            watch_key(value, &mut key);
+            let at = place(top.stored.len());
+            if top.lookup.insert(key.as_slice().into(), at).is_some() {
+                return Err(broken("the state values must be unique"));
+            }
+            top.stored.push(Entry { value: canonical(value), hash: bytes(&key), count, index: at });
+            top.order.push(at);
+        }
+        if filter.iter().any(|count| !matches!(count, Value::UBigInt(0))) {
+            let count = |count: &Value| if let Value::UBigInt(count) = count { *count } else { 0 };
+            top.filter = filter.iter().map(count).collect();
+        }
+        Ok(top)
+    }
+
+    /// How many filter counters the pin makes for this `k`.
+    fn filter_size(&self) -> usize {
+        (self.capacity() * FILTER_RATIO).next_power_of_two()
+    }
+}
+
+/// A field of a struct value, or `None` when the struct is null or has no such field.
+fn member<'a>(value: &'a Value, name: &str) -> std::result::Result<&'a Value, ()> {
+    match value {
+        Value::Struct(fields) => {
+            fields.iter().find(|(held, _)| held == name).map(|(_, value)| value).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+fn broken(what: &str) -> Error {
+    invalid(&format!("Invalid approx_top_k state - {what}"))
 }
 
 fn invalid(message: &str) -> Error {
