@@ -3166,27 +3166,36 @@ impl Shared {
         let journals = self.journals(&name);
         let table = catalog.table_mut(&name).ok()?;
         let fields = table.columns();
-        let mut row = vec![Value::Null; fields.len()];
-        for (item, &at) in direct.items.iter().zip(&targets) {
-            let value = given.value(item)?;
-            let ty = &fields[at].ty;
-            let value = if value.is_null() {
-                Value::Null
-            } else if value.is_of(ty) {
-                value
-            } else if widens(&value.logical_type(), ty) {
-                rudb_kernels::cast::cast_value(&value, ty, false).ok()?
-            } else {
-                return None;
-            };
-            if value.is_null() && fields[at].not_null {
-                return None;
+        // The values as they were given are the row when there is one for each column, in order,
+        // and each is already its column's type, and then the table reads them where they are.
+        // Anything else is gathered into a row of its own, which copies every value.
+        let built;
+        let row = match as_given(direct, given, &targets, fields) {
+            Some(values) => values,
+            None => {
+                let mut row = vec![Value::Null; fields.len()];
+                for (item, &at) in direct.items.iter().zip(&targets) {
+                    let value = given.value(item)?;
+                    let ty = &fields[at].ty;
+                    let value = if value.is_null() {
+                        Value::Null
+                    } else if value.is_of(ty) {
+                        value
+                    } else if widens(&value.logical_type(), ty) {
+                        rudb_kernels::cast::cast_value(&value, ty, false).ok()?
+                    } else {
+                        return None;
+                    };
+                    if value.is_null() && fields[at].not_null {
+                        return None;
+                    }
+                    row[at] = value;
+                }
+                built = row;
+                built.as_slice()
             }
-            row[at] = value;
-        }
-        // The row is moved into the table, so the log gets a copy made first, and only when there
-        // is a log to get one.
-        let staged = journals.then(|| [row.clone()]);
+        };
+        let staged = journals.then(|| [row.to_vec()]);
         let result = kept(sql, 0, |_| {
             table.append_row(row)?;
             if let Some(rows) = &staged {
@@ -4755,6 +4764,28 @@ struct Noted {
 /// The table a [`crate::prepared::Direct`] insert names and the column each of its items lands in,
 /// or `None` when the table needs the plan: it is not a plain table of the default database, it
 /// has a constraint, a default the row leaves out, or a column list that does not match.
+/// The values a [`Shared::insert_direct`] was given, when they are its row as they are: given by
+/// position, one for each column of `fields` in order, each landing on its own column, and each a
+/// null its column takes or a value of its column's type.
+fn as_given<'a>(
+    direct: &crate::prepared::Direct,
+    given: crate::prepared::Given<'a>,
+    targets: &[usize],
+    fields: &[Field],
+) -> Option<&'a [Value]> {
+    use crate::prepared::{Given, Item};
+    let Given::Positional(values) = given else { return None };
+    let fits = values.len() == fields.len()
+        && direct.items.len() == fields.len()
+        && direct.items.iter().zip(targets).enumerate().all(|(column, (item, &at))| {
+            at == column && matches!(item, Item::Parameter(_, Some(place)) if *place == column)
+        })
+        && values.iter().zip(fields).all(|(value, field)| {
+            if value.is_null() { !field.not_null } else { value.is_of(&field.ty) }
+        });
+    fits.then_some(values)
+}
+
 fn direct_targets(
     catalog: &Catalog,
     direct: &crate::prepared::Direct,
