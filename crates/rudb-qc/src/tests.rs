@@ -139,6 +139,32 @@ fn catalog() -> Catalog {
         .rows_mut()
         .append_rows(&rows)
         .expect("rows of the table's own types");
+    // `lines` holds prices and rates in the ranges TPC-H's lineitem has them, with no NULL, so
+    // the statistics bound every product of them.
+    let lines = QualifiedName::new("memory", "main", "lines");
+    let money = LogicalType::Decimal { width: 15, scale: 2 };
+    catalog
+        .create_table(
+            lines.clone(),
+            vec![
+                Field::new("k", LogicalType::Integer),
+                Field::new("p", money.clone()),
+                Field::new("r", money),
+            ],
+        )
+        .expect("a fresh table");
+    let rows: Vec<Vec<Value>> = (0..9000i128)
+        .map(|i| {
+            let p = cents(90_000 + i * 7919 % 10_400_000);
+            vec![Value::Integer((i % 4) as i32), p, cents(i % 11)]
+        })
+        .collect();
+    catalog
+        .table_mut(&lines)
+        .expect("the table just created")
+        .rows_mut()
+        .append_rows(&rows)
+        .expect("rows of the table's own types");
     // `names` holds strings on either side of the longest one a header holds whole, and long
     // ones that share their length and first four bytes, in runs and alone.
     let names = QualifiedName::new("memory", "main", "names");
@@ -256,7 +282,8 @@ fn answer(text: &str, options: Options) -> Result<Answer> {
     let pool = Pool::default();
     // The rows are read even where the table's statistics answer, so it is the code that is tested.
     let options = Options { rows: true, ..options };
-    let compiled = compile_with(&plan, &cancel, options).expect("the compiled engine takes it");
+    let compiled = compile_over(&plan, Some(&catalog), &cancel, options)
+        .expect("the compiled engine takes it");
     let memory = Memory::unlimited();
     let seams = rudb_seam::Settings::new();
     let session = Session::new();
@@ -614,6 +641,82 @@ fn decimal_sums_products_and_averages_match_the_first_engine() {
     );
     same(&format!("Aggregate #1 groups=[#0.0::INTEGER] {aggs}\n  {DEC}"), false);
     same(&format!("Aggregate #1 groups=[] {aggs}\n  {DEC}"), true);
+}
+
+#[test]
+fn arithmetic_the_statistics_bound_has_no_overflow_check_in_the_version_with_no_null() {
+    let charge = concat!(
+        "\"*\"(\"*\"(CAST(#0.1::DECIMAL(15,2))::DECIMAL(18,2), ",
+        "\"-\"(1.00::DECIMAL(18,2), CAST(#0.2::DECIMAL(15,2))::DECIMAL(18,2))::DECIMAL(18,2))::DECIMAL(18,4), ",
+        "\"+\"(1.00::DECIMAL(18,2), CAST(#0.2::DECIMAL(15,2))::DECIMAL(18,2))::DECIMAL(18,2))::DECIMAL(18,6)",
+    );
+    let text = format!(
+        "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[sum({charge})::DECIMAL(38,6), avg(#0.1::DECIMAL(15,2))::DOUBLE]\n  Get memory.main.lines AS lines #0 [k::INTEGER, p::DECIMAL(15,2), r::DECIMAL(15,2)]"
+    );
+    same(&text, false);
+    let catalog = catalog();
+    let plan = Plan::parse(&text).expect("a well formed plan");
+    let compiled = compile_over(&plan, Some(&catalog), &Cancel::new(), Options::default())
+        .expect("it is taken");
+    let body = compiled.query.bodies[0].as_ref().expect("a pipeline");
+    let mut ranged: Vec<usize> = body.ranged.iter().map(|&(c, _)| c).collect();
+    ranged.sort_unstable();
+    assert_eq!(ranged, [1, 2]);
+    let printed = rudb_qc_ir::print::print(&compiled.query.module);
+    let nonull = body.nonull.clone().expect("a version with no NULL");
+    let at = printed.find(&format!("func @{nonull} ")).expect("the version is printed");
+    let version = &printed[at..];
+    let version = &version[..version[1..].find("func @").map_or(version.len(), |n| n + 1)];
+    assert!(!version.contains(".t "), "{version}");
+    // Without the statistics the same version checks every step.
+    let compiled = compile_with(&plan, &Cancel::new(), Options::default()).expect("it is taken");
+    let body = compiled.query.bodies[0].as_ref().expect("a pipeline");
+    assert!(body.ranged.is_empty());
+    assert!(rudb_qc_ir::print::print(&compiled.query.module).contains("smul.t"));
+}
+
+#[test]
+fn a_morsel_past_the_ranges_the_code_was_made_for_runs_the_version_that_checks() {
+    let text = concat!(
+        "Aggregate #1 groups=[] aggregates=[sum(\"*\"(\"*\"(CAST(#0.1::DECIMAL(15,2))::DECIMAL(18,2), ",
+        "\"-\"(1.00::DECIMAL(18,2), CAST(#0.2::DECIMAL(15,2))::DECIMAL(18,2))::DECIMAL(18,2))::DECIMAL(18,4), ",
+        "\"+\"(1.00::DECIMAL(18,2), CAST(#0.2::DECIMAL(15,2))::DECIMAL(18,2))::DECIMAL(18,2))::DECIMAL(18,6))::DECIMAL(38,6)]\n",
+        "  Get memory.main.lines AS lines #0 [k::INTEGER, p::DECIMAL(15,2), r::DECIMAL(15,2)]",
+    );
+    let catalog = catalog();
+    let plan = Plan::parse(text).expect("a well formed plan");
+    let cancel = Cancel::new();
+    for tier in [Tier::Interp, Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()) {
+        let options = Options { tier, rows: true, fresh: true, ..Options::default() };
+        let compiled = compile_over(&plan, Some(&catalog), &cancel, options).expect("it is taken");
+        // A price the statistics did not see when the code was made, whose charge is past what
+        // an i64 holds, so that only the checks catch it and leaving them out would wrap.
+        let mut catalog = catalog.clone();
+        let cents = |unscaled: i128| Value::Decimal { unscaled, width: 15, scale: 2 };
+        let wide = vec![vec![Value::Integer(1), cents(999_999_999_999_999), cents(10)]];
+        catalog
+            .table_mut(&QualifiedName::new("memory", "main", "lines"))
+            .expect("the table")
+            .rows_mut()
+            .append_rows(&wide)
+            .expect("a row of the table's own types");
+        let first = rudb_exec::build(&plan, &catalog)
+            .expect("the first engine builds")
+            .collect(&cancel, &Pool::default())
+            .expect_err("the first engine fails");
+        let (pool, memory, seams, session) =
+            (Pool::default(), Memory::unlimited(), rudb_seam::Settings::new(), Session::new());
+        let under = Under {
+            catalog: &catalog,
+            cancel: &cancel,
+            memory: &memory,
+            seams: &seams,
+            session: &session,
+            pool: &pool,
+        };
+        let error = compiled.run(&plan, under).expect_err("the compiled engine fails");
+        assert_eq!(error.code(), first.code(), "{tier}: {error:?} against {first:?}");
+    }
 }
 
 #[test]

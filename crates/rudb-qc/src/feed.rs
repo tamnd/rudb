@@ -783,6 +783,11 @@ impl<'a> Feed<'a> {
         let mut f = self.func;
         if let Some(v) = self.nonull
             && held.iter().all(|h| h.clean)
+            && self
+                .body
+                .ranged
+                .iter()
+                .all(|&(c, k)| chunk.column(c).is_ok_and(|v| inside(v, rows, k)))
             && self.tiers.speculate(v)
         {
             self.tiers.prepare(self.module, v, self.rows, !self.body.probes.is_empty());
@@ -1244,6 +1249,35 @@ fn answer_flat(like: &Like, v: &Vector, rows: usize, out: &mut [u8]) {
         };
         let text = |at: usize| views[at].bytes_in(arena).unwrap_or_default();
         like.answer(rows, arena, place, text, out);
+    }
+}
+
+/// Whether each of the first `rows` values of `v` is at least `-2^k` and under `2^k`, the range the
+/// statistics gave the version of a body that leaves out the overflow checks that range rules out.
+///
+/// Adding `2^k` moves the range to `0..2^(k+1)`, so a value is in it when the sum has no bit at or
+/// above `k + 1`, and or-ing the sums together asks that of every value at once. The loop has no
+/// branch in it, so the compiler makes it vector adds and ors.
+fn inside(v: &Vector, rows: usize, k: u32) -> bool {
+    macro_rules! fits {
+        ($values:expr, $signed:ty, $unsigned:ty) => {{
+            if k + 1 >= <$unsigned>::BITS {
+                return true;
+            }
+            let Some(values) = $values.as_slice().get(..rows) else { return false };
+            let off: $signed = 1 << k;
+            let all =
+                values.iter().fold(0, |all, &x: &$signed| all | x.wrapping_add(off) as $unsigned);
+            all >> (k + 1) == 0
+        }};
+    }
+    match v.data() {
+        Some(Data::Int8(b)) => fits!(b, i8, u8),
+        Some(Data::Int16(b)) => fits!(b, i16, u16),
+        Some(Data::Int32(b)) => fits!(b, i32, u32),
+        Some(Data::Int64(b)) => fits!(b, i64, u64),
+        Some(Data::Int128(b)) => fits!(b, i128, u128),
+        _ => false,
     }
 }
 
