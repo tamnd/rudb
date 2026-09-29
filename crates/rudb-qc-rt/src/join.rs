@@ -78,13 +78,23 @@ pub struct JoinLayout {
     pub payload: Vec<KeyField>,
     /// The bytes of a record, validity bytes included.
     pub size: u32,
+    /// Whether each entry has a byte after its record that a probe sets when it matches the entry,
+    /// for a semi or anti join whose left side builds. The build leaves it zero.
+    pub marked: bool,
 }
 
 impl JoinLayout {
-    /// The distance from one entry to the next: the hash, then the record padded to 8.
+    /// The distance from one entry to the next: the hash, then the record and the mark padded
+    /// to 8.
     #[must_use]
     pub fn stride(&self) -> u32 {
-        8 + self.size.next_multiple_of(8)
+        8 + (self.size + u32::from(self.marked)).next_multiple_of(8)
+    }
+
+    /// Where the mark is in the record.
+    #[must_use]
+    pub fn mark(&self) -> u32 {
+        self.size
     }
 }
 
@@ -271,6 +281,29 @@ impl JoinTable {
         )
     }
 
+    /// The records a semi join keeps, those some probe marked, or with `semi` false the ones an
+    /// anti join keeps, those no probe marked and those with a null key, which the build keeps in
+    /// the table for this. Empty for a table with no marks or not finished.
+    #[must_use]
+    pub fn kept(&self, semi: bool) -> Vec<&[u8]> {
+        if !self.finished || !self.layout.marked {
+            return Vec::new();
+        }
+        // SAFETY: the entries are words, which are bytes with no padding.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.entries.as_ptr().cast::<u8>(), self.entries.len() * 8)
+        };
+        let mark = self.layout.mark() as usize;
+        bytes
+            .chunks_exact(self.stride)
+            .map(|entry| &entry[8..])
+            .filter(|record| {
+                let keyed = self.layout.keys.iter().all(|f| record[f.null() as usize] != 0);
+                if semi { keyed && record[mark] != 0 } else { !keyed || record[mark] == 0 }
+            })
+            .collect()
+    }
+
     /// What a probe reads, once the table is finished.
     #[must_use]
     pub fn published(&self) -> Published {
@@ -345,6 +378,7 @@ mod tests {
             keys: vec![KeyField { offset: 0, width: 8, text: false }],
             payload: vec![KeyField { offset: 16, width: 16, text: true }],
             size: 33,
+            marked: false,
         }
     }
 
@@ -392,6 +426,32 @@ mod tests {
     }
 
     #[test]
+    fn a_semi_join_keeps_the_marked_entries_and_an_anti_join_the_rest() {
+        let mut t = JoinTable::new(JoinLayout { marked: true, ..layout() });
+        let mut heap = Heap::new();
+        for i in 0..4u64 {
+            let mut r = record(i, b"x");
+            // The last one has a null key, which only an anti join keeps.
+            r[8] = u8::from(i < 3);
+            // SAFETY: the record is alive and its string is inline.
+            unsafe { t.append(r.as_ptr().expose_provenance(), i, &mut heap) };
+        }
+        t.finish().unwrap();
+        assert!(t.kept(true).is_empty());
+        assert_eq!(t.kept(false).len(), 4);
+        // What a probe does on a match: set the byte past the record, which is after the hash.
+        let at = 8 + t.layout().mark() as usize;
+        let words = t.stride / 8;
+        let entry = t.entries.chunks_exact_mut(words).find(|e| e[0] == 1).unwrap();
+        entry[at / 8] |= 1 << (at % 8 * 8);
+        let keys = |rows: Vec<&[u8]>| rows.iter().map(|r| r[0]).collect::<Vec<_>>();
+        assert_eq!(keys(t.kept(true)), [1]);
+        let mut rest = keys(t.kept(false));
+        rest.sort_unstable();
+        assert_eq!(rest, [0, 2, 3]);
+    }
+
+    #[test]
     fn integer_keys_read_back_sign_extended() {
         // A two byte key, and an eight byte key that starts three bytes in and so crosses a word.
         let layout = JoinLayout {
@@ -401,6 +461,7 @@ mod tests {
             ],
             payload: vec![KeyField { offset: 16, width: 16, text: true }],
             size: 33,
+            marked: false,
         };
         let mut t = JoinTable::new(layout);
         let mut heap = Heap::new();

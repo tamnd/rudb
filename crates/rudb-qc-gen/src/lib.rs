@@ -53,7 +53,7 @@ use rudb_qc_ir::func::INV;
 use rudb_qc_ir::status::NEED_MEMORY;
 use rudb_qc_ir::{Block, Builder, ErrorKind, Field, Func, Module, Op, Ty, Val, dce, verify};
 use rudb_qc_pipe::{Graph, Op as PipeOp, Pipeline, Probe, Sink, Stage};
-use rudb_qc_plan::{Aggregate, Column, Expr, Kind, Refusal, Result};
+use rudb_qc_plan::{Aggregate, Column, Expr, JoinType, Kind, Refusal, Result};
 use rudb_qc_rt::abi::{
     COL_CODES, COL_SIZE, COL_VALID, HEADER, MORSEL_BEGIN, MORSEL_COLS, MORSEL_END,
 };
@@ -156,6 +156,8 @@ pub enum Out {
     Aggregate(Grouping),
     /// A join build.
     Build(Building),
+    /// Nothing, past a probe that marks the entries it matches.
+    Mark,
 }
 
 /// A join build's table and the record the body builds for it.
@@ -387,7 +389,9 @@ fn pipeline(
     for op in &p.ops {
         match op {
             PipeOp::Filter(f) => note(f),
-            PipeOp::Probe(probe) => probe.keys.iter().for_each(&mut note),
+            PipeOp::Probe(probe) => {
+                probe.keys.iter().chain(&probe.residual).for_each(&mut note);
+            }
         }
     }
     match &p.sink {
@@ -405,6 +409,7 @@ fn pipeline(
                 }
             }
         }
+        Sink::Mark => {}
     }
     reads.sort_unstable();
     let domains = domains(p, known);
@@ -636,7 +641,7 @@ fn emit(
                 g.ptrs.push(row);
             }
         }
-        Out::Build(_) => {}
+        Out::Build(_) | Out::Mark => {}
     }
 
     let head = g.b.block(&[(Ty::I64, "i")]);
@@ -754,7 +759,8 @@ impl Gen<'_> {
                 });
                 Ok((Out::Result { count: SINK, columns: slots, capacity }, state))
             }
-            Sink::Build { keys, payload, .. } => {
+            Sink::Mark => Ok((Out::Mark, SINK)),
+            Sink::Build { keys, payload, marked, .. } => {
                 let mut size = 0u32;
                 let mut field = |e: &Expr, what: &str| -> Result<KeyField> {
                     let ty = qir_type(&e.ty)?;
@@ -771,7 +777,7 @@ impl Gen<'_> {
                 let keys = keys.iter().map(|e| field(e, "key")).collect::<Result<Vec<_>>>()?;
                 let payload =
                     payload.iter().map(|e| field(e, "payload")).collect::<Result<Vec<_>>>()?;
-                let layout = JoinLayout { keys, payload, size };
+                let layout = JoinLayout { keys, payload, size, marked: marked.is_some() };
                 let table = self.once(|g| g.rt.add_join(JoinTable::new(layout.clone())))?;
                 let buffer = size.next_multiple_of(8);
                 self.field(SINK, buffer, "record");
@@ -1677,23 +1683,73 @@ impl Gen<'_> {
         };
         match op {
             PipeOp::Filter(f) => {
-                let (v, ok) = self.expr(f)?;
-                let pass = self.b.bin(Op::And, v, ok);
-                let then = self.b.block(&[]);
-                self.b.brif(pass, then, &[], skip, &[]);
-                self.b.switch_to(then);
+                self.residual(std::slice::from_ref(f), skip)?;
                 self.ops(rest, probe, skip, depth, sink, out)
             }
-            PipeOp::Probe(p) => {
+            // Every match that passes the residual gets its mark set, and the row goes no further.
+            PipeOp::Probe(p) if p.marks => {
                 let (head, e, stride, advance) = self.probe(p, probe, skip, depth + 1)?;
-                self.ops(rest, probe + 1, advance, depth + 1, sink, out)?;
-                self.b.switch_to(advance);
-                let stride = self.b.int(Ty::I64, i128::from(stride));
-                let e = self.b.bin(Op::Add, e, stride);
-                self.b.br(head, &[e]);
+                self.residual(&p.residual, advance)?;
+                let entry = self.b.conv(Op::Bitcast, e, Ty::Ptr);
+                let at = 8 + self.joins[probe].layout.mark() as i32;
+                let one = self.b.int(Ty::I8, 1);
+                self.b.store(entry, Val::NONE, 1, at, one, 0);
+                self.b.br(advance, &[]);
+                self.next_entry(head, e, stride, advance);
                 Ok(())
             }
+            PipeOp::Probe(p) => match p.kind {
+                JoinType::Inner => {
+                    let (head, e, stride, advance) = self.probe(p, probe, skip, depth + 1)?;
+                    self.ops(rest, probe + 1, advance, depth + 1, sink, out)?;
+                    self.next_entry(head, e, stride, advance);
+                    Ok(())
+                }
+                // The first match that passes the residual sends the row on, once, and leaves
+                // the loop over the entries for good.
+                JoinType::Semi => {
+                    let (head, e, stride, advance) = self.probe(p, probe, skip, depth + 1)?;
+                    self.residual(&p.residual, advance)?;
+                    self.ops(rest, probe + 1, skip, depth, sink, out)?;
+                    self.next_entry(head, e, stride, advance);
+                    Ok(())
+                }
+                // A match that passes the residual drops the row, and a row that runs out of
+                // entries, or never had any, goes on. What the loop read is not read on that
+                // way, so what follows reads it again.
+                JoinType::Anti => {
+                    let before = self.loaded.clone();
+                    let none = self.b.block(&[]);
+                    let (head, e, stride, advance) = self.probe(p, probe, none, depth + 1)?;
+                    self.residual(&p.residual, advance)?;
+                    self.b.br(skip, &[]);
+                    self.next_entry(head, e, stride, advance);
+                    self.b.switch_to(none);
+                    self.loaded = before;
+                    self.ops(rest, probe + 1, skip, depth, sink, out)
+                }
+            },
         }
+    }
+
+    /// Ends the block `advance` of a probe's loop by going on to the entry after `e`.
+    fn next_entry(&mut self, head: Block, e: Val, stride: u32, advance: Block) {
+        self.b.switch_to(advance);
+        let stride = self.b.int(Ty::I64, i128::from(stride));
+        let e = self.b.bin(Op::Add, e, stride);
+        self.b.br(head, &[e]);
+    }
+
+    /// Goes to `fail` unless every one of `residual` is true.
+    fn residual(&mut self, residual: &[Expr], fail: Block) -> Result<()> {
+        for r in residual {
+            let (v, ok) = self.expr(r)?;
+            let pass = self.b.bin(Op::And, v, ok);
+            let then = self.b.block(&[]);
+            self.b.brif(pass, then, &[], fail, &[]);
+            self.b.switch_to(then);
+        }
+        Ok(())
     }
 
     /// The fused probe of section 10.5: hashes the row's keys, tests the tag of the slot the hash
@@ -1987,15 +2043,21 @@ impl Gen<'_> {
                 }
                 Ok(())
             }
-            (Sink::Build { keys, payload, .. }, Out::Build(b)) => {
-                // A row with a null key can never match, so it stays out of the table.
+            (Sink::Build { keys, payload, marked, .. }, Out::Build(b)) => {
+                // A row with a null key can never match, so it stays out of the table, unless an
+                // anti join keeps it. Then it goes in with its null byte clear, and the rows are
+                // read back by that byte and not by the mark a probe that took it for a zero
+                // might set.
+                let keep = *marked == Some(JoinType::Anti);
                 let mut hash = self.b.int(Ty::I64, 0);
                 let mut values = Vec::with_capacity(keys.len() + payload.len());
                 for e in keys {
                     let (v, ok) = self.expr(e)?;
-                    let then = self.b.block(&[]);
-                    self.b.brif(ok, then, &[], skip, &[]);
-                    self.b.switch_to(then);
+                    if !keep {
+                        let then = self.b.block(&[]);
+                        self.b.brif(ok, then, &[], skip, &[]);
+                        self.b.switch_to(then);
+                    }
                     hash = self.hash(hash, v, &e.ty)?;
                     values.push((v, ok));
                 }
@@ -2013,6 +2075,7 @@ impl Gen<'_> {
                 self.rt(proxy_id("jt_append"), &[table, record, hash]);
                 Ok(())
             }
+            (Sink::Mark, Out::Mark) => Ok(()),
             _ => Err(Refusal::new("the sink", "its layout is of the other kind")),
         }
     }

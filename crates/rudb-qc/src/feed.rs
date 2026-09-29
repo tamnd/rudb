@@ -185,6 +185,7 @@ impl<'a> Feed<'a> {
             rudb_qc_pipe::Sink::Result { columns, .. }
             | rudb_qc_pipe::Sink::Build { columns, .. }
             | rudb_qc_pipe::Sink::Aggregate { columns, .. } => columns.as_slice(),
+            rudb_qc_pipe::Sink::Mark => &[],
         };
         let mut state = vec![Line([0; 64]); (body.state as usize).div_ceil(64).max(1)];
         // Init. With one worker the local state is the shared state, so the header points at its
@@ -377,7 +378,9 @@ impl<'a> Feed<'a> {
                 inner.rt.retire(worker.rt);
                 return Ok(());
             }
-            Out::Build(_) => return Err(Error::internal("a parallel pipeline that builds")),
+            Out::Build(_) | Out::Mark => {
+                return Err(Error::internal("a parallel pipeline that builds or probes"));
+            }
         };
         if self.split {
             inner.workers.push(worker.rt);
@@ -828,7 +831,8 @@ impl<'a> Feed<'a> {
         let sink = match &self.body.sink {
             Out::Result { .. } => tier::Sink::Result,
             Out::Aggregate(_) => tier::Sink::Aggregate,
-            Out::Build(_) => tier::Sink::Build,
+            // The marks a probe sets are live in the table it probes, as a build's entries are.
+            Out::Build(_) | Out::Mark => tier::Sink::Build,
         };
         // A morsel with no NULL in what the body reads runs the version that checks none, which is
         // a guard checked before the call and so never sent back.
@@ -1026,7 +1030,7 @@ impl<'a> Feed<'a> {
                         inner.rt.finish_join(b.table)?;
                         out = Vec::new();
                     }
-                    Out::Result { .. } => {}
+                    Out::Result { .. } | Out::Mark => {}
                 },
             }
         }

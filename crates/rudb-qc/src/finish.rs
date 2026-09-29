@@ -15,6 +15,7 @@ use rudb_plan::{Node, NodeRef, Plan};
 use rudb_qc_gen::{AccOp, Grouping, qir_type};
 use rudb_qc_ir::eval::pow10;
 use rudb_qc_plan::{Column, Key, Kind};
+use rudb_qc_rt::join::JoinLayout;
 use rudb_qc_rt::table::{Distinct, GroupTable};
 use rudb_qc_rt::{Rt, text};
 use rudb_vector::{Buffer, Chunk, Data, Selection, StringColumn, VECTOR_SIZE, Validity, Vector};
@@ -89,6 +90,25 @@ pub(crate) fn values(rows: &[Vec<Value>], columns: &[Column]) -> Result<Chunk> {
         vectors.push(Vector::from_values(c.ty.clone(), &column)?);
     }
     Chunk::with_rows(vectors, rows.len())
+}
+
+/// The payload of the join table records `rows` as chunks of `columns`, the rows a semi or anti
+/// join whose left side builds keeps.
+pub(crate) fn kept(rows: &[&[u8]], layout: &JoinLayout, columns: &[Column]) -> Result<Vec<Chunk>> {
+    let mut out = Vec::with_capacity(rows.len().div_ceil(VECTOR_SIZE));
+    for rows in rows.chunks(VECTOR_SIZE) {
+        let mut vectors = Vec::with_capacity(columns.len());
+        for (f, c) in layout.payload.iter().zip(columns) {
+            let (at, width) = (f.offset as usize, f.width as usize);
+            let cells: Vec<Cell> = rows
+                .iter()
+                .map(|r| (r[f.null() as usize] != 0).then(|| cell(&r[at..at + width])))
+                .collect();
+            vectors.push(vector(&c.ty, &cells)?);
+        }
+        out.push(Chunk::with_rows(vectors, rows.len())?);
+    }
+    Ok(out)
 }
 
 /// The distinct sets of a hash aggregate, by handle.
