@@ -597,13 +597,14 @@ impl Exact {
 ///
 /// The expression rather than a column number, because the binder writes `p.k::INTEGER = b.k` as a
 /// cast around one operand and the value that goes in the table is the cast one. This is the same
-/// expression the hash table is built on, evaluated the same way.
+/// expression the hash table is built on, evaluated the same way. A caller that runs the build
+/// side itself hands the keys over already made, as the one column of each chunk.
 #[derive(Debug)]
-pub(crate) struct Keyed<'a> {
-    plan: &'a Plan,
-    expr: ExprRef,
-    schema: Schema,
-    time_zone: SessionTimeZone,
+pub(crate) enum Keyed<'a> {
+    /// The key expression over the build side's rows.
+    Evaluated { plan: &'a Plan, expr: ExprRef, schema: Schema, time_zone: SessionTimeZone },
+    /// The keys themselves, the first column of each chunk.
+    Made,
 }
 
 impl<'a> Keyed<'a> {
@@ -614,12 +615,18 @@ impl<'a> Keyed<'a> {
         schema: Schema,
         time_zone: SessionTimeZone,
     ) -> Self {
-        Self { plan, expr, schema, time_zone }
+        Self::Evaluated { plan, expr, schema, time_zone }
     }
 
-    /// The three things the evaluator wants, so that the caller cannot put them in the wrong order.
-    pub(crate) fn parts(&self) -> (&'a Plan, [ExprRef; 1], &Schema, SessionTimeZone) {
-        (self.plan, [self.expr], &self.schema, self.time_zone)
+    /// The keys of `chunk`.
+    pub(crate) fn keys(&self, chunk: &Chunk) -> Result<Option<Vector>> {
+        match self {
+            Self::Evaluated { plan, expr, schema, time_zone } => {
+                let keys = evaluate_all_in_time_zone(plan, &[*expr], schema, chunk, *time_zone)?;
+                Ok(keys.into_iter().next())
+            }
+            Self::Made => Ok(chunk.columns().first().cloned()),
+        }
     }
 }
 
@@ -895,7 +902,7 @@ pub(crate) fn found_for(
     wanted: bool,
     placed: bool,
 ) -> Result<Found> {
-    let (plan, exprs, schema, time_zone) = keyed.parts();
+    let key_of = keyed;
     let rows: usize = chunks.iter().map(Chunk::len).sum();
     // A build side with as many rows as the parent has keys is every parent or close to it, and
     // then the exact set removes about nothing and finding that out costs a lookup in the key map
@@ -962,8 +969,7 @@ pub(crate) fn found_for(
     let settled = exact.is_some() || stopped || reduced.is_some_and(|reduced| reduced.by_key);
     let mut keyed = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
-        keyed.push((keys.into_iter().next(), chunk.len()));
+        keyed.push((key_of.keys(chunk)?, chunk.len()));
     }
     if !settled && domain.is_none() {
         domain = dense(&keyed, rows);
@@ -1325,12 +1331,11 @@ fn held_parents(
     parents: u64,
     chunks: &[Chunk],
 ) -> Result<Option<Rids>> {
-    let (plan, exprs, schema, time_zone) = keyed.parts();
     let mut words = vec![0_u64; usize::try_from(parents.div_ceil(64)).unwrap_or(usize::MAX)];
     let mut block = Vec::new();
     for chunk in chunks {
-        let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
-        let Some(keys) = keys.first() else { continue };
+        let Some(keys) = keyed.keys(chunk)? else { continue };
+        let keys = &keys;
         let nullable = has_nulls(keys, chunk.len());
         let read = keys.signed_block(&mut block) && block.len() >= chunk.len();
         for row in 0..chunk.len() {
@@ -1370,12 +1375,11 @@ enum Pushing {
 fn domain_of(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<(Domain, u64)>> {
     let Some((base, range)) = exact.keys().and_then(KeyMap::span) else { return Ok(None) };
     let Some(len) = words_for(range) else { return Ok(None) };
-    let (plan, exprs, schema, time_zone) = keyed.parts();
     let mut words = vec![0_u64; len];
     let mut block = Vec::new();
     for chunk in chunks {
-        let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
-        let Some(keys) = keys.first() else { continue };
+        let Some(keys) = keyed.keys(chunk)? else { continue };
+        let keys = &keys;
         let nullable = has_nulls(keys, chunk.len());
         // A block of keys at once where the column has one, since a key at a time through
         // `signed_at` was about seventy instructions a row on TPC-H q21's lineitem keys.

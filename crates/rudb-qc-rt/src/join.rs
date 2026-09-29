@@ -240,6 +240,37 @@ impl JoinTable {
         Ok(())
     }
 
+    /// The values of key column `key` over every entry, sign extended, once the table is finished.
+    ///
+    /// `None` for a text key, a key wider than 8 bytes, or a table not finished. The driver hands
+    /// these to the scan of a pipeline that probes the table, which then reads only the rows whose
+    /// key one of these is. See `spec/compiler/10-joins.md` section 10.4.
+    #[must_use]
+    pub fn integers(&self, key: usize) -> Option<Vec<i64>> {
+        let field = self.layout.keys.get(key)?;
+        let width = field.width as usize;
+        if !self.finished || field.text || !matches!(width, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        let words = self.stride / 8;
+        // The record starts after the hash word, and the key is at its offset in the record.
+        let (word, shift) = (1 + field.offset as usize / 8, field.offset as usize % 8 * 8);
+        let bits = width * 8;
+        Some(
+            self.entries
+                .chunks_exact(words)
+                .map(|entry| {
+                    let mut value = entry[word] >> shift;
+                    if shift + bits > 64 {
+                        value |= entry[word + 1] << (64 - shift);
+                    }
+                    // Up to the key's width and back down again, which extends its sign.
+                    ((value << (64 - bits)) as i64) >> (64 - bits)
+                })
+                .collect(),
+        )
+    }
+
     /// What a probe reads, once the table is finished.
     #[must_use]
     pub fn published(&self) -> Published {
@@ -358,6 +389,40 @@ mod tests {
         }
         // SAFETY: as above.
         assert!(unsafe { t.matches(&record(300, b""), 300 * 31) }.is_empty());
+    }
+
+    #[test]
+    fn integer_keys_read_back_sign_extended() {
+        // A two byte key, and an eight byte key that starts three bytes in and so crosses a word.
+        let layout = JoinLayout {
+            keys: vec![
+                KeyField { offset: 0, width: 2, text: false },
+                KeyField { offset: 3, width: 8, text: false },
+            ],
+            payload: vec![KeyField { offset: 16, width: 16, text: true }],
+            size: 33,
+        };
+        let mut t = JoinTable::new(layout);
+        let mut heap = Heap::new();
+        let pairs = [(-3i16, i64::MIN), (7, -1), (i16::MAX, 1 << 40)];
+        for (at, &(a, b)) in pairs.iter().enumerate() {
+            let mut r = record(0, b"");
+            r[..2].copy_from_slice(&a.to_le_bytes());
+            r[2] = 1;
+            r[3..11].copy_from_slice(&b.to_le_bytes());
+            r[11] = 1;
+            // SAFETY: the record is alive and its string is inline.
+            unsafe { t.append(r.as_ptr().expose_provenance(), at as u64, &mut heap) };
+        }
+        assert_eq!(t.integers(0), None, "not before the table is finished");
+        t.finish().unwrap();
+        let mut small = t.integers(0).unwrap();
+        let mut large = t.integers(1).unwrap();
+        small.sort_unstable();
+        large.sort_unstable();
+        assert_eq!(small, vec![-3, 7, i64::from(i16::MAX)]);
+        assert_eq!(large, vec![i64::MIN, -1, 1 << 40]);
+        assert_eq!(t.integers(2), None);
     }
 
     #[test]

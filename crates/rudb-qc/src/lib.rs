@@ -332,6 +332,16 @@ impl Compiled {
                             input.as_ref().map(|chunks| chunks.iter().map(Chunk::len).sum())
                         }
                     };
+                    // The keys of the tables the pipeline probes, taken before the feed borrows the
+                    // runtime, for the scan to read only the rows that can match.
+                    let handed = match &p.source {
+                        Source::Scan { columns, .. }
+                            if !self.tiers.ablate().off(Ablate::HANDOFF) =>
+                        {
+                            handed(p, body, columns, &self.rt)
+                        }
+                        _ => Vec::new(),
+                    };
                     if let Some(f) = self.tiers.func(&body.func) {
                         let probes = !body.probes.is_empty();
                         self.tiers.prepare(&self.query.module, f, rows, probes);
@@ -367,7 +377,20 @@ impl Compiled {
                             let mut scan = plan.clone();
                             let filter = filtered(plan, *node);
                             scan.set_root(filter.unwrap_or(*node));
-                            feed.scan(&scan, filter.is_some(), under)?;
+                            let mut handoffs = Vec::with_capacity(handed.len());
+                            for (at, (column, ty, keys)) in handed.iter().enumerate() {
+                                let handoff = rudb_exec::Handoff::for_scan(
+                                    &scan,
+                                    under.catalog,
+                                    under.session,
+                                    *node,
+                                    *column,
+                                    at > 0,
+                                );
+                                handoff.fill(ty, keys)?;
+                                handoffs.push(handoff);
+                            }
+                            feed.scan(&scan, filter.is_some(), under, &handoffs)?;
                         }
                         Source::Values { rows, columns } => {
                             feed.push(&finish::values(rows, columns)?)?;
@@ -410,6 +433,41 @@ impl Compiled {
             report: self.tiers.report(),
         })
     }
+}
+
+/// For each join table `p` probes whose key is a column its scan reads as a signed integer, that
+/// column, its type and the key the table holds for every build row.
+///
+/// Every probe is an inner join, so a scanned row whose key no build row holds goes no further,
+/// and the scan may as well not read it. The first engine arms the same handoff between a join and
+/// the scan under it, see `rudb_exec::Handoff`, and with a stored link from the column the scan
+/// reads only the rows of the parents the build side holds. One key a probe, the first that is a
+/// scanned column, since a row has to match on every key and one is enough to leave it out.
+fn handed(
+    p: &rudb_qc_pipe::Pipeline,
+    body: &rudb_qc_gen::Body,
+    columns: &[rudb_qc_plan::Column],
+    rt: &Rt,
+) -> Vec<(u32, LogicalType, Vec<i64>)> {
+    let mut out = Vec::new();
+    for (probe, probing) in p.probes().zip(&body.probes) {
+        let Some(table) = rt.join(probing.table) else { continue };
+        let found = probe.keys.iter().enumerate().find_map(|(at, key)| {
+            let Kind::Column(c) = key.kind else { return None };
+            let column = columns.get(c).filter(|column| column.ty == key.ty)?;
+            let signed = matches!(
+                column.ty,
+                LogicalType::TinyInt
+                    | LogicalType::SmallInt
+                    | LogicalType::Integer
+                    | LogicalType::BigInt
+            );
+            let keys = table.integers(at).filter(|_| signed)?;
+            Some((u32::try_from(c).ok()?, column.ty.clone(), keys))
+        });
+        out.extend(found);
+    }
+    out
 }
 
 /// The stage a top N over the rows of `p` can also cut, with the keys it cuts that stage's rows

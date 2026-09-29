@@ -649,34 +649,28 @@ impl<'a> Feed<'a> {
 
     /// Runs the body over every chunk of a scan, by building `scan` in the first engine with this
     /// feed as the root. When `pruned` is set the root of `scan` is a filter that only picks the
-    /// parts the scan reads, and the body runs the filter on the rows.
-    pub(crate) fn scan(&self, scan: &Plan, pruned: bool, under: Under<'_>) -> Result<()> {
+    /// parts the scan reads, and the body runs the filter on the rows. The scan reads only the rows
+    /// `handoffs` leave, which are the rows the joins the body probes can match.
+    pub(crate) fn scan<'p>(
+        &'p self,
+        scan: &'p Plan,
+        pruned: bool,
+        under: Under<'p>,
+        handoffs: &[rudb_exec::Handoff<'p>],
+    ) -> Result<()> {
         let sink = Arc::new(Scan(self));
-        let query = if let Some(cut) = &self.cutoff {
-            rudb_exec::build_cut_into(
-                scan,
-                under.catalog,
-                under.cancel,
-                under.memory,
-                under.seams,
-                under.session,
-                sink,
-                pruned,
-                cut,
-            )?
-        } else {
-            let build =
-                if pruned { rudb_exec::build_pruned_into } else { rudb_exec::build_measured_into };
-            build(
-                scan,
-                under.catalog,
-                under.cancel,
-                under.memory,
-                under.seams,
-                under.session,
-                sink,
-            )?
-        };
+        let query = rudb_exec::build_handed_into(
+            scan,
+            under.catalog,
+            under.cancel,
+            under.memory,
+            under.seams,
+            under.session,
+            sink,
+            pruned,
+            self.cutoff.as_ref(),
+            handoffs,
+        )?;
         query.run(under.cancel, under.pool)
     }
 
