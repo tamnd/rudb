@@ -137,6 +137,14 @@ pub(crate) fn group_rows(
 ) -> Result<Chunk> {
     let mut vectors = Vec::with_capacity(columns.len());
     for (k, ty) in &g.keys {
+        let at = 8 + k.offset as usize;
+        if !k.text
+            && let Some(v) =
+                fixed(ty, table, gids, at, k.width as usize, Some((8 + k.null() as usize, false)))?
+        {
+            vectors.push(v);
+            continue;
+        }
         let cells: Vec<Cell> = gids
             .iter()
             .map(|&gid| {
@@ -148,6 +156,25 @@ pub(crate) fn group_rows(
         vectors.push(vector(ty, &cells)?);
     }
     for acc in &g.accs {
+        let at = (g.acc_offset + acc.offset) as usize;
+        // An accumulator that is already its answer is read as the keys are.
+        let raw = match acc.op {
+            AccOp::CountStar | AccOp::Count => Some((8, None)),
+            AccOp::SumInt => Some((16, Some(16))),
+            AccOp::SumFloat => Some((8, Some(8))),
+            AccOp::Min | AccOp::Max | AccOp::AnyValue => qir_type(&acc.arg)
+                .ok()
+                .map(|t| t.bytes() as usize)
+                .filter(|_| acc.arg == acc.ty)
+                .map(|w| (w, Some(w))),
+            _ => None,
+        };
+        if let Some((w, set)) = raw
+            && let Some(v) = fixed(&acc.ty, table, gids, at, w, set.map(|s| (at + s, true)))?
+        {
+            vectors.push(v);
+            continue;
+        }
         let mut cells = Vec::with_capacity(gids.len());
         for &gid in gids {
             let at = (g.acc_offset + acc.offset) as usize;
@@ -157,6 +184,54 @@ pub(crate) fn group_rows(
         vectors.push(vector(&acc.ty, &cells)?);
     }
     Chunk::with_rows(vectors, gids.len())
+}
+
+/// A column of type `ty` read straight from the `width` bytes at `at` of each group's row, when
+/// the physical type is a number of that width. A value is null when the byte at `flag.0` is
+/// nonzero, or zero when `flag.1` says the byte marks a value that is set, and never without one.
+fn fixed(
+    ty: &LogicalType,
+    table: &GroupTable,
+    gids: &[usize],
+    at: usize,
+    width: usize,
+    flag: Option<(usize, bool)>,
+) -> Result<Option<Vector>> {
+    macro_rules! read {
+        ($variant:ident, $t:ty) => {{
+            const W: usize = std::mem::size_of::<$t>();
+            if W != width {
+                return Ok(None);
+            }
+            let mut values: Vec<$t> = Vec::with_capacity(gids.len());
+            let mut valid = Vec::with_capacity(if flag.is_some() { gids.len() } else { 0 });
+            for &gid in gids {
+                let row = table.row(gid);
+                let ok = flag.is_none_or(|(f, set)| (row[f] != 0) == set);
+                valid.push(ok);
+                let v = <$t>::from_le_bytes(row[at..at + W].try_into().unwrap_or_default());
+                values.push(if ok { v } else { <$t>::default() });
+            }
+            (Data::$variant(Buffer::from(values)), valid)
+        }};
+    }
+    let (data, valid) = match ty.physical() {
+        PhysicalType::Int8 => read!(Int8, i8),
+        PhysicalType::Int16 => read!(Int16, i16),
+        PhysicalType::Int32 => read!(Int32, i32),
+        PhysicalType::Int64 => read!(Int64, i64),
+        PhysicalType::Int128 => read!(Int128, i128),
+        PhysicalType::UInt8 => read!(UInt8, u8),
+        PhysicalType::UInt16 => read!(UInt16, u16),
+        PhysicalType::UInt32 => read!(UInt32, u32),
+        PhysicalType::UInt64 => read!(UInt64, u64),
+        PhysicalType::UInt128 => read!(UInt128, u128),
+        PhysicalType::Float32 => read!(Float32, f32),
+        PhysicalType::Float64 => read!(Float64, f64),
+        _ => return Ok(None),
+    };
+    let validity = if flag.is_some() { Validity::from_run(&valid) } else { Validity::AllValid };
+    Ok(Some(Vector::flat(ty.clone(), data)?.with_validity(validity)))
 }
 
 /// Where the first of a top N's keys is in a group row, and whether it is descending, when that

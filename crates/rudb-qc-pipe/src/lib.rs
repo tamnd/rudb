@@ -29,7 +29,7 @@ use std::fmt;
 
 use rudb_common::Value;
 use rudb_plan::NodeRef;
-use rudb_qc_plan::{Aggregate, BuildSide, Column, Expr, JoinType, Key, Kind, Rel};
+use rudb_qc_plan::{Aggregate, BuildSide, Column, Expr, JoinType, Key, Kind, Rel, Runs};
 
 pub use rudb_qc_ir::status::Status;
 pub use rudb_qc_rt::abi::StateHeader;
@@ -106,6 +106,8 @@ pub enum Sink {
         aggregates: Vec<Aggregate>,
         /// Their names and types.
         columns: Vec<Column>,
+        /// Whether the one key arrives in runs.
+        runs: Option<Runs>,
     },
 }
 
@@ -510,7 +512,7 @@ impl Graph {
                 open.columns = columns.clone();
                 open
             }
-            Rel::Aggregate { input, groups, aggregates, columns } => {
+            Rel::Aggregate { input, groups, aggregates, columns, runs } => {
                 let open = self.open(input);
                 let groups = groups.iter().map(|g| g.substitute(&open.exprs)).collect();
                 let aggregates = aggregates
@@ -523,7 +525,8 @@ impl Graph {
                         ty: a.ty.clone(),
                     })
                     .collect();
-                let sink = Sink::Aggregate { groups, aggregates, columns: columns.clone() };
+                let sink =
+                    Sink::Aggregate { groups, aggregates, columns: columns.clone(), runs: *runs };
                 let p = Pipeline { source: open.source, ops: open.ops, sink };
                 self.push(Stage::Pipeline(p))
             }
@@ -677,9 +680,14 @@ impl fmt::Display for Graph {
                             keys.len(),
                             payload.len()
                         ),
-                        Sink::Aggregate { groups, aggregates, .. } => {
+                        Sink::Aggregate { groups, aggregates, runs, .. } => {
+                            let runs = match runs {
+                                Some(Runs::Ascending) => " arriving ascending",
+                                Some(Runs::Grouped) => " arriving grouped",
+                                None => "",
+                            };
                             format!(
-                                "aggregate by {} keys into {} accumulators",
+                                "aggregate by {} keys{runs} into {} accumulators",
                                 groups.len(),
                                 aggregates.len()
                             )

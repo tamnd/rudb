@@ -31,9 +31,11 @@ impl Ablate {
     pub const HANDOFF: Ablate = Ablate(1 << 8);
     /// A `COUNT(DISTINCT)` of a number appended in compiled code and taken in many rows at a time.
     pub const PAIRS: Ablate = Ablate(1 << 9);
+    /// The groups of a key that arrives in runs closed as the key moves on, with no hash table.
+    pub const RUNS: Ablate = Ablate(1 << 10);
 
     /// Every switch with its name, in the order a table of them is printed.
-    pub const ALL: [(&'static str, Ablate); 10] = [
+    pub const ALL: [(&'static str, Ablate); 11] = [
         ("probe", Ablate::PROBE),
         ("like", Ablate::LIKE),
         ("top", Ablate::TOP),
@@ -44,6 +46,7 @@ impl Ablate {
         ("dense", Ablate::DENSE),
         ("handoff", Ablate::HANDOFF),
         ("pairs", Ablate::PAIRS),
+        ("runs", Ablate::RUNS),
     ];
 
     /// Reads a comma separated list of names, where an empty list or `none` is nothing and `all`

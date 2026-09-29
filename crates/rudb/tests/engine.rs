@@ -212,8 +212,9 @@ fn semi_and_anti_joins_on_the_compiled_engine_answer_what_the_first_engine_answe
     ] {
         database.execute(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
     }
-    // The first four probe the smaller b, and the rest ask for rows of b, so b builds and the
-    // probe of a marks it. Null keys, keys with many matches, and a residual that is null.
+    // The first four probe the smaller b, and the rest ask for rows of b. The planner builds
+    // whichever side it thinks smaller, and in the last b builds and the probe of a marks it. Null
+    // keys, keys with many matches, and a residual that is null.
     let queries = [
         "SELECT a.v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY 1",
         "SELECT a.v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY 1",
@@ -231,7 +232,7 @@ fn semi_and_anti_joins_on_the_compiled_engine_answer_what_the_first_engine_answe
         assert_eq!(first, compiled, "{sql}");
     }
     assert_eq!(database.refusals(), Vec::<String>::new());
-    let text = explained(&database, &format!("EXPLAIN (CODEGEN) {}", queries[5]));
+    let text = explained(&database, &format!("EXPLAIN (CODEGEN) {}", queries[6]));
     assert!(text.contains("marking probe"), "{text}");
 }
 
@@ -349,11 +350,11 @@ fn leaving_a_technique_out_answers_the_same() {
     database.execute("SET engine = 'compiled'").expect("the compiled engine");
     for ablate in [
         "none", "probe", "like", "top", "lanes", "stats", "codes", "ranges", "dense", "handoff",
-        "all",
+        "pairs", "runs", "all",
     ] {
         database.execute(&format!("SET qc_ablate = '{ablate}'")).expect("a switch");
         let back = database.setting("qc_ablate").expect("qc_ablate reads back");
-        let all = "probe,like,top,lanes,stats,codes,ranges,dense,handoff";
+        let all = "probe,like,top,lanes,stats,codes,ranges,dense,handoff,pairs,runs";
         assert_eq!(back, if ablate == "all" { all } else { ablate });
         for (sql, first) in queries.iter().zip(&first) {
             assert_eq!(&rows(&database, sql), first, "{sql} with {ablate} off");

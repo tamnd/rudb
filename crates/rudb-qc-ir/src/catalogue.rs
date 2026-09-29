@@ -64,6 +64,8 @@ proxies! {
     // distinct set, the second the group row `ht_insert` returned. The last argument of
     // `ht_insert` is where it publishes the table for compiled code's own probe, or zero.
     "ht_insert" (Ptr, Ptr, I64, Ptr) -> Ptr, mayfail, effect;
+    // A table of runs adds a page and returns its address, when the last page is full.
+    "ht_page" (Ptr) -> Ptr, mayfail, effect;
     // A join build appends the record in its state and the record's hash to the table.
     "jt_append" (Ptr, Ptr, I64) -> Void, mayfail, effect;
     "agg_distinct" (Ptr, Ptr, Str16) -> Void, mayfail, effect;

@@ -115,6 +115,16 @@ pub fn compile_over(
     options: Options,
 ) -> std::result::Result<Compiled, Refusal> {
     let started = Instant::now();
+    if options.walks
+        && let Some(catalog) = catalog
+        && rudb_exec::walks_siblings(plan, catalog)
+    {
+        return Err(Refusal::new(
+            "Siblings",
+            "the first engine walks a semi or anti join to each row's siblings through a link, \
+             which compiled code does not do yet",
+        ));
+    }
     let rel = rudb_qc_plan::lower(plan)?;
     let graph = rudb_qc_pipe::split(&rel);
     check(&graph)?;

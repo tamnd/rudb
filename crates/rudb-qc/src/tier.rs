@@ -238,6 +238,9 @@ pub struct Options {
     pub rows: bool,
     /// The techniques left out, for measuring what each one is worth.
     pub ablate: Ablate,
+    /// Whether the first engine walks a semi or an anti join to the siblings of each row, which a
+    /// plan with such a join is handed back for.
+    pub walks: bool,
 }
 
 /// What the second tier did with a query's module, for `EXPLAIN (CODEGEN)` and the query log.
@@ -375,7 +378,7 @@ impl fmt::Debug for Tiers {
 impl Tiers {
     /// Lowers `module` for the interpreter and, when `options` asks for it, for the machine.
     pub(crate) fn new(module: &Module, options: Options) -> Tiers {
-        let Options { tier, switch, stay, fresh, morsel, rows, ablate } = options;
+        let Options { tier, switch, stay, fresh, morsel, rows, ablate, walks: _ } = options;
         let program = Program::new(module);
         let counts = (
             AtomicU64::new(0),

@@ -253,6 +253,8 @@ pub enum Rel {
         aggregates: Vec<Aggregate>,
         /// The output columns.
         columns: Vec<Column>,
+        /// Whether the one key arrives in runs, from the plan's `aggregate_cluster` pass.
+        runs: Option<Runs>,
     },
     /// All the rows in order.
     Sort {
@@ -338,6 +340,16 @@ impl JoinType {
             JoinType::Anti => "ANTI",
         }
     }
+}
+
+/// How the rows of an aggregate's one key arrive, when the store says each value's rows are one
+/// run, so a group is finished once the key moves past it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runs {
+    /// The key never goes down, which the driver checks a morsel at a time.
+    Ascending,
+    /// Each value's rows are together, the runs in no order.
+    Grouped,
 }
 
 impl Rel {
@@ -519,11 +531,15 @@ impl Lower<'_> {
                     aggs.push(agg);
                 }
                 let bindings = numbered(index, columns.len());
+                let runs = plan
+                    .clustered(index)
+                    .then(|| if plan.grouped(index) { Runs::Grouped } else { Runs::Ascending });
                 let rel = Rel::Aggregate {
                     input: Box::new(input),
                     groups: gs,
                     aggregates: aggs,
                     columns,
+                    runs,
                 };
                 Ok((rel, bindings))
             }

@@ -53,12 +53,12 @@ use rudb_qc_ir::func::INV;
 use rudb_qc_ir::status::NEED_MEMORY;
 use rudb_qc_ir::{Block, Builder, ErrorKind, Field, Func, Module, Op, Ty, Val, dce, verify};
 use rudb_qc_pipe::{Graph, Op as PipeOp, Pipeline, Probe, Sink, Stage};
-use rudb_qc_plan::{Aggregate, Column, Expr, JoinType, Kind, Refusal, Result};
+use rudb_qc_plan::{Aggregate, Column, Expr, JoinType, Kind, Refusal, Result, Runs};
 use rudb_qc_rt::abi::{
     COL_CODES, COL_SIZE, COL_VALID, HEADER, MORSEL_BEGIN, MORSEL_COLS, MORSEL_END,
 };
 use rudb_qc_rt::join::{ADDRESS, FOLD, JoinLayout, JoinTable};
-use rudb_qc_rt::table::{GroupTable, KeyField, Layout};
+use rudb_qc_rt::table::{GroupTable, KeyField, Layout, ROWS_PER_PAGE};
 use rudb_qc_rt::{Ablate, Rt, text};
 
 /// Where the sink's fields start.
@@ -211,6 +211,14 @@ pub struct Grouping {
     /// entry past the last key, which a key with a value not in the domains goes to and which is
     /// always zero, so such a key always takes the way through the hash.
     pub dense: Option<u32>,
+    /// For an aggregate by one fixed width key that arrives in runs, the state offset of two
+    /// words: the address of the next row of the table's last page and the address past it. A
+    /// new run takes that row without hashing, and the table has no slots.
+    pub runs: Option<u32>,
+    /// Whether those runs were promised ascending, which the driver checks a morsel at a time.
+    pub ascending: bool,
+    /// The size of a row, which a new run moves past.
+    pub row_size: u32,
 }
 
 /// One accumulator in a group row.
@@ -783,7 +791,7 @@ impl Gen<'_> {
                 self.field(SINK, buffer, "record");
                 Ok((Out::Build(Building { table, layout, record: SINK }), SINK + buffer))
             }
-            Sink::Aggregate { groups, aggregates, .. } => {
+            Sink::Aggregate { groups, aggregates, runs, .. } => {
                 let mut keys = Vec::with_capacity(groups.len());
                 let mut size = 0u32;
                 for e in groups {
@@ -814,6 +822,7 @@ impl Gen<'_> {
                     init: vec![0; at as usize],
                 };
                 let acc_offset = Layout::acc_offset(size);
+                let row_size = layout.row_size() as u32;
                 let table = self.once(|g| g.rt.add_table(GroupTable::new(layout)))?;
                 let (row, last, state) = if groups.is_empty() {
                     self.field(SINK, 8, "row");
@@ -825,7 +834,19 @@ impl Gen<'_> {
                     self.field(SINK + size + 8, 32, "probe");
                     (None, Some(SINK + size), SINK + size + 40)
                 };
-                let probe = last.filter(|_| !self.rt.ablate().off(Ablate::PROBE)).map(|at| at + 8);
+                // A key that arrives in runs closes its groups as it moves on, which needs one key
+                // the row can hold without the heap, and no distinct set, whose pairs are kept by
+                // group id.
+                let closes = runs.filter(|_| {
+                    keys.len() == 1
+                        && !keys[0].0.text
+                        && self.dense.is_empty()
+                        && !accs.iter().any(|a| matches!(a.op, AccOp::Distinct(..)))
+                        && !self.rt.ablate().off(Ablate::RUNS)
+                });
+                let probe = last
+                    .filter(|_| closes.is_none() && !self.rt.ablate().off(Ablate::PROBE))
+                    .map(|at| at + 8);
                 let (dense, state) = if groups.is_empty() || self.dense.is_empty() {
                     (None, state)
                 } else {
@@ -844,7 +865,31 @@ impl Gen<'_> {
                         state += 16;
                     }
                 }
-                let grouping = Grouping { table, keys, acc_offset, accs, row, last, probe, dense };
+                let (at, state) = match closes {
+                    Some(_) => {
+                        self.field(state, 16, "runs");
+                        (Some(state), state + 16)
+                    }
+                    None => (None, state),
+                };
+                if at.is_some()
+                    && let Some(t) = self.rt.table_mut(table)
+                {
+                    t.runs();
+                }
+                let grouping = Grouping {
+                    table,
+                    keys,
+                    acc_offset,
+                    accs,
+                    row,
+                    last,
+                    probe,
+                    dense,
+                    runs: at,
+                    ascending: closes == Some(Runs::Ascending),
+                    row_size,
+                };
                 Ok((Out::Aggregate(grouping), state))
             }
         }
@@ -1952,7 +1997,7 @@ impl Gen<'_> {
                             let (v, ok) = self.expr(e)?;
                             // A null key's value is zeroed, so that keys the same are the same
                             // bytes for the probe below.
-                            let v = if g.probe.is_some() {
+                            let v = if g.probe.is_some() || g.runs.is_some() {
                                 let zero = self.b.konst(self.b.ty(v), 0);
                                 self.b.select(ok, v, zero)
                             } else {
@@ -1991,51 +2036,60 @@ impl Gen<'_> {
                             self.b.brif(same, done, &[seen], new, &[]);
                             self.b.switch_to(new);
                         }
-                        let mut hash = self.b.int(Ty::I64, 0);
-                        for (&(v, ok), (e, (k, _))) in values.iter().zip(groups.iter().zip(&g.keys))
-                        {
-                            let at = (SINK + k.offset) as i32;
-                            self.b.store(st, Val::NONE, 1, at, v, 0);
-                            let null = self.b.un(Op::Not, ok);
-                            self.b.store(st, Val::NONE, 1, at + k.width as i32, null, 0);
-                            hash = self.hash(hash, v, &e.ty)?;
-                            let ok = self.b.conv(Op::Zext, ok, Ty::I64);
-                            hash = self.b.bin(Op::Crc32c, hash, ok);
-                        }
-                        let key = self.offset(st, SINK);
-                        let table = self.handle(g.table);
-                        let (slow, found) = match g.probe {
-                            Some(at) => self.find_group(g, &values, hash, at, depth)?,
-                            None => (self.b.current(), None),
-                        };
-                        self.b.switch_to(slow);
-                        let published = match g.probe {
-                            Some(at) => self.offset(st, at),
-                            None => self.b.konst(Ty::Ptr, 0),
-                        };
-                        let row = self.rt(proxy_id("ht_insert"), &[table, key, hash, published]);
-                        let row = match found {
-                            Some(found) => {
-                                self.b.br(found, &[row]);
-                                self.b.switch_to(found);
-                                self.b.param(found, 0)
+                        if let Some(at) = g.runs {
+                            let row = self.open_run(g, &values, at);
+                            self.b.br(done, &[row]);
+                            self.b.switch_to(done);
+                            self.b.param(done, 0)
+                        } else {
+                            let mut hash = self.b.int(Ty::I64, 0);
+                            for (&(v, ok), (e, (k, _))) in
+                                values.iter().zip(groups.iter().zip(&g.keys))
+                            {
+                                let at = (SINK + k.offset) as i32;
+                                self.b.store(st, Val::NONE, 1, at, v, 0);
+                                let null = self.b.un(Op::Not, ok);
+                                self.b.store(st, Val::NONE, 1, at + k.width as i32, null, 0);
+                                hash = self.hash(hash, v, &e.ty)?;
+                                let ok = self.b.conv(Op::Zext, ok, Ty::I64);
+                                hash = self.b.bin(Op::Crc32c, hash, ok);
                             }
-                            None => row,
-                        };
-                        if let Some(last) = g.last {
-                            self.b.store(st, Val::NONE, 1, last as i32, row, 0);
+                            let key = self.offset(st, SINK);
+                            let table = self.handle(g.table);
+                            let (slow, found) = match g.probe {
+                                Some(at) => self.find_group(g, &values, hash, at, depth)?,
+                                None => (self.b.current(), None),
+                            };
+                            self.b.switch_to(slow);
+                            let published = match g.probe {
+                                Some(at) => self.offset(st, at),
+                                None => self.b.konst(Ty::Ptr, 0),
+                            };
+                            let row =
+                                self.rt(proxy_id("ht_insert"), &[table, key, hash, published]);
+                            let row = match found {
+                                Some(found) => {
+                                    self.b.br(found, &[row]);
+                                    self.b.switch_to(found);
+                                    self.b.param(found, 0)
+                                }
+                                None => row,
+                            };
+                            if let Some(last) = g.last {
+                                self.b.store(st, Val::NONE, 1, last as i32, row, 0);
+                            }
+                            if let (Some(at), Some((slot, known))) = (g.dense, dense) {
+                                // A key with a value not in the domains stores a zero in the entry
+                                // past the last, which keeps it zero.
+                                let row = self.b.conv(Op::Bitcast, row, Ty::I64);
+                                let zero = self.b.int(Ty::I64, 0);
+                                let row = self.b.select(known, row, zero);
+                                self.b.store(st, slot, 8, at as i32, row, 0);
+                            }
+                            self.b.br(done, &[row]);
+                            self.b.switch_to(done);
+                            self.b.param(done, 0)
                         }
-                        if let (Some(at), Some((slot, known))) = (g.dense, dense) {
-                            // A key with a value not in the domains stores a zero in the entry
-                            // past the last, which keeps it zero.
-                            let row = self.b.conv(Op::Bitcast, row, Ty::I64);
-                            let zero = self.b.int(Ty::I64, 0);
-                            let row = self.b.select(known, row, zero);
-                            self.b.store(st, slot, 8, at as i32, row, 0);
-                        }
-                        self.b.br(done, &[row]);
-                        self.b.switch_to(done);
-                        self.b.param(done, 0)
                     }
                 };
                 for (a, acc) in aggregates.iter().zip(&g.accs) {
@@ -2078,6 +2132,45 @@ impl Gen<'_> {
             (Sink::Mark, Out::Mark) => Ok(()),
             _ => Err(Refusal::new("the sink", "its layout is of the other kind")),
         }
+    }
+
+    /// Opens the group of a new run of the key `values`: the key goes in the key buffer, which the
+    /// next row compares with, and in the next row of the table's last page, which is zeroed as a
+    /// new group's accumulators are. A full page asks the table for another. Returns the row.
+    fn open_run(&mut self, g: &Grouping, values: &[Pair], at: u32) -> Val {
+        let st = self.b.st();
+        let row_size = g.row_size as usize;
+        let next = self.b.load(Ty::I64, st, Val::NONE, 1, at as i32, 0);
+        let end = self.b.load(Ty::I64, st, Val::NONE, 1, at as i32 + 8, 0);
+        let full = self.b.bin(Op::IcmpEq, next, end);
+        let (page, fresh) = (self.b.block(&[]), self.b.block(&[(Ty::I64, "next")]));
+        self.b.brif(full, page, &[], fresh, &[next]);
+        self.b.switch_to(page);
+        let table = self.handle(g.table);
+        let first = self.rt(proxy_id("ht_page"), &[table]);
+        let first = self.b.conv(Op::Bitcast, first, Ty::I64);
+        let bytes = self.b.int(Ty::I64, (ROWS_PER_PAGE * row_size) as i128);
+        let past = self.b.bin(Op::Add, first, bytes);
+        self.b.store(st, Val::NONE, 1, at as i32 + 8, past, 0);
+        self.b.br(fresh, &[first]);
+        self.b.switch_to(fresh);
+        let next = self.b.param(fresh, 0);
+        let size = self.b.int(Ty::I64, row_size as i128);
+        let after = self.b.bin(Op::Add, next, size);
+        self.b.store(st, Val::NONE, 1, at as i32, after, 0);
+        let row = self.b.conv(Op::Bitcast, next, Ty::Ptr);
+        for (&(v, ok), (k, _)) in values.iter().zip(&g.keys) {
+            let key = (SINK + k.offset) as i32;
+            let null = self.b.un(Op::Not, ok);
+            self.b.store(st, Val::NONE, 1, key, v, 0);
+            self.b.store(st, Val::NONE, 1, key + k.width as i32, null, 0);
+            self.b.store(row, Val::NONE, 1, 8 + k.offset as i32, v, 0);
+            self.b.store(row, Val::NONE, 1, 8 + k.null() as i32, null, 0);
+        }
+        if let Some(last) = g.last {
+            self.b.store(st, Val::NONE, 1, last as i32, row, 0);
+        }
+        row
     }
 
     /// Looks the row's key up in the array of [`Grouping::dense`] at `at`, and goes to `done` with
