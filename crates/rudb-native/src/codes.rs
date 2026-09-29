@@ -203,6 +203,10 @@ pub struct ValueCodes {
     values: Vec<i64>,
     starts: Vec<u32>,
     held: Vec<u32>,
+    /// A bit for each row whose value no other row holds.
+    lone: Vec<u64>,
+    /// The codes whose value more than one row holds, ascending.
+    shared: Vec<u32>,
 }
 
 impl ValueCodes {
@@ -235,7 +239,20 @@ impl ValueCodes {
         {
             return None;
         }
-        Some(Self { rows, values, starts, held })
+        // Most of the values of a column wide enough to code are held by one row alone, and such a
+        // row counts once toward the group it is in without looking at any other row. Marking
+        // them here lets a count pass over them in row order and gather only the rest.
+        let mut lone = vec![0_u64; rows.div_ceil(64)];
+        let mut shared = Vec::new();
+        for (code, pair) in starts.windows(2).enumerate() {
+            if pair[1] - pair[0] == 1 {
+                let row = held[pair[0] as usize] as usize;
+                lone[row / 64] |= 1 << (row % 64);
+            } else {
+                shared.push(code as u32);
+            }
+        }
+        Some(Self { rows, values, starts, held, lone, shared })
     }
 
     /// The table's rows.
@@ -256,6 +273,18 @@ impl ValueCodes {
     #[must_use]
     pub fn rows_of(&self, code: usize) -> &[u32] {
         &self.held[self.starts[code] as usize..self.starts[code + 1] as usize]
+    }
+
+    /// A bit for each row, set when no other row holds its value, the word of rows 64 at a time.
+    #[must_use]
+    pub fn lone(&self) -> &[u64] {
+        &self.lone
+    }
+
+    /// The codes of the values more than one row holds, ascending.
+    #[must_use]
+    pub fn shared(&self) -> &[u32] {
+        &self.shared
     }
 
     /// Where the rows of the value coded `code` start among the rows of every value, for a code up
@@ -439,7 +468,7 @@ pub fn distinct_per_group(
             let (mine, after) = rest.split_at_mut(starts[span.end] - starts[span.start]);
             rest = after;
             let starts = &starts;
-            let place = Place { group, folded, low, dense, slots };
+            let place = Place { group, folded, low, dense, slots, lone: counted.lone() };
             handles.push(scope.spawn(move || read_slots(reader, &place, span, starts, mine)));
         }
         handles
@@ -447,10 +476,17 @@ pub fn distinct_per_group(
             .map(|handle| handle.join().map_err(|_| invalid("a group read worker panicked"))?)
             .collect::<Result<Vec<_>>>()
     })?;
-    let mut tally = Tally { rows: vec![0; slots], folds: vec![Fold::EMPTY; slots * folded.len()] };
+    let mut tally = Tally {
+        rows: vec![0; slots],
+        lone: vec![0; slots],
+        folds: vec![Fold::EMPTY; slots * folded.len()],
+    };
     for one in read {
         let Some(one) = one else { return Ok(None) };
         for (total, count) in tally.rows.iter_mut().zip(one.rows) {
+            *total += count;
+        }
+        for (total, count) in tally.lone.iter_mut().zip(one.lone) {
             *total += count;
         }
         for (total, fold) in tally.folds.iter_mut().zip(&one.folds) {
@@ -458,30 +494,31 @@ pub fn distinct_per_group(
         }
     }
 
-    // Each code's distinct slots, the codes split among the threads.
+    // The distinct slots of each value more than one row holds, the codes split among the
+    // threads. A lone row was counted on the way past.
     let of_row = &of_row;
-    let codes = counted.values().len();
-    let each = codes.div_ceil(workers).max(1);
+    let shared = counted.shared();
+    let each = shared.len().div_ceil(workers).max(1);
     let counted_shares = std::thread::scope(|scope| {
-        let handles = (0..codes)
-            .step_by(each)
-            .map(|from| {
-                let span = from..(from + each).min(codes);
+        let handles = shared
+            .chunks(each)
+            .map(|share| {
                 scope.spawn(move || {
                     // The slots of every row of these codes first, a load apiece that nothing waits
                     // on, so that the misses overlap instead of each one holding up the compare
                     // that follows it.
-                    let base = counted.start(span.start);
-                    let gathered = counted
-                        .rows_of_codes(span.clone())
-                        .iter()
-                        .map(|&row| of_row[row as usize])
-                        .collect::<Vec<_>>();
+                    let mut gathered = Vec::new();
+                    for &code in share {
+                        let held = counted.rows_of(code as usize);
+                        gathered.extend(held.iter().map(|&row| of_row[row as usize]));
+                    }
                     let mut counts = vec![0_u64; slots];
                     let mut others = Vec::new();
-                    for code in span {
-                        let held =
-                            &gathered[counted.start(code) - base..counted.start(code + 1) - base];
+                    let mut at = 0;
+                    for &code in share {
+                        let len = counted.rows_of(code as usize).len();
+                        let held = &gathered[at..at + len];
+                        at += len;
                         let Some((&slot, tail)) = held.split_first() else { continue };
                         counts[slot as usize] += 1;
                         for &other in tail {
@@ -507,7 +544,7 @@ pub fn distinct_per_group(
             .map(|handle| handle.join().map_err(|_| invalid("a code count worker panicked")))
             .collect::<Result<Vec<_>>>()
     })?;
-    let mut counts = vec![0_u64; slots];
+    let mut counts = tally.lone.clone();
     for share in counted_shares {
         for (total, count) in counts.iter_mut().zip(share) {
             *total += count;
@@ -540,11 +577,15 @@ struct Place<'a> {
     /// The slot of each value from `low` up, zero for one the group does not hold.
     dense: &'a [u16],
     slots: usize,
+    /// [`ValueCodes::lone`] of the column counted.
+    lone: &'a [u64],
 }
 
-/// The rows of each slot and the folds of each slot's folded columns, one after the other.
+/// The rows of each slot, how many of them hold a value no other row does, and the folds of each
+/// slot's folded columns, one after the other.
 struct Tally {
     rows: Vec<u64>,
+    lone: Vec<u64>,
     folds: Vec<Fold>,
 }
 
@@ -558,9 +599,13 @@ fn read_slots(
     starts: &[usize],
     out: &mut [u16],
 ) -> Result<Option<Tally>> {
-    let Place { group, folded, low, dense, slots } = *place;
+    let Place { group, folded, low, dense, slots, lone } = *place;
     let width = folded.len();
-    let mut tally = Tally { rows: vec![0; slots], folds: vec![Fold::EMPTY; slots * width] };
+    let mut tally = Tally {
+        rows: vec![0; slots],
+        lone: vec![0; slots],
+        folds: vec![Fold::EMPTY; slots * width],
+    };
     let mut block = Vec::new();
     let base = starts[parts.start];
     for part in parts {
@@ -572,6 +617,7 @@ fn read_slots(
         }
         let has_nulls = vector.validity().has_nulls(len);
         let out = &mut out[starts[part] - base..starts[part + 1] - base];
+        let first = starts[part];
         for (at, (&value, slot)) in block[..len].iter().zip(out.iter_mut()).enumerate() {
             *slot = if has_nulls && vector.is_null_at(at) {
                 0
@@ -582,7 +628,9 @@ fn read_slots(
                     _ => return Ok(None),
                 }
             };
+            let row = first + at;
             tally.rows[*slot as usize] += 1;
+            tally.lone[*slot as usize] += lone[row / 64] >> (row % 64) & 1;
         }
         for (at, &column) in folded.iter().enumerate() {
             let read = reader.read(part, &[column])?;
