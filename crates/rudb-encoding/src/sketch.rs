@@ -53,6 +53,8 @@
 //! That is the ordinary stale-section path and it costs a rebuild. Merging across two hashes would
 //! cost an answer, which is why the identity is in the bytes rather than in a comment.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rudb_common::{Error, Result};
 
 /// The default number of hashes to keep, which puts the relative error a bit under 2 percent.
@@ -94,7 +96,7 @@ pub const DEFAULT_K: usize = 4096;
 /// That costs memory: 16,384 slots of 8 bytes is 128 KB a column at the default k, and a hundred
 /// and five of them is 13 MB. A sorted run of k would have been 32 KB, and the four times is bought
 /// with the load time, which is the scarcer of the two here.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Sketch {
     k: usize,
     /// Open addressed, a power of two long, [`EMPTY`] in a free slot. Empty until the first add, so
@@ -106,6 +108,28 @@ pub struct Sketch {
     threshold: u64,
     /// Whether k distinct hashes have been seen, which is the moment the count stops being exact.
     full: bool,
+    /// The bits of the last estimate [`Sketch::distinct`] worked out, or [`UNKNOWN`] once a hash has
+    /// been kept since. A table is asked for the estimate of every column on every query it plans,
+    /// and working one out walks the whole table of slots, so it is worked out once for each time
+    /// the hashes change.
+    estimate: AtomicU64,
+}
+
+/// The estimate a sketch has not worked out since its hashes last changed. These are the bits of a
+/// NaN, which no estimate is.
+const UNKNOWN: u64 = u64::MAX;
+
+impl Clone for Sketch {
+    fn clone(&self) -> Self {
+        Self {
+            k: self.k,
+            slots: self.slots.clone(),
+            held: self.held,
+            threshold: self.threshold,
+            full: self.full,
+            estimate: AtomicU64::new(self.estimate.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 /// The slot value that means nothing is here.
@@ -171,14 +195,27 @@ impl Sketch {
                 "a sketch of {k} hashes is past the {MAX_K} a sketch will keep"
             )));
         }
-        Ok(Self { k, slots: Vec::new(), held: 0, threshold: EMPTY, full: false })
+        Ok(Self {
+            k,
+            slots: Vec::new(),
+            held: 0,
+            threshold: EMPTY,
+            full: false,
+            estimate: AtomicU64::new(UNKNOWN),
+        })
     }
 
     /// A sketch over a column, at the default k.
     #[must_use]
     pub fn of(values: &[&[u8]]) -> Self {
-        let mut sketch =
-            Self { k: DEFAULT_K, slots: Vec::new(), held: 0, threshold: EMPTY, full: false };
+        let mut sketch = Self {
+            k: DEFAULT_K,
+            slots: Vec::new(),
+            held: 0,
+            threshold: EMPTY,
+            full: false,
+            estimate: AtomicU64::new(UNKNOWN),
+        };
         for value in values {
             sketch.add(value);
         }
@@ -208,6 +245,7 @@ impl Sketch {
     /// part and must not be asked for an estimate.
     pub fn cap_at(&mut self, ceiling: u64) {
         self.threshold = self.threshold.min(ceiling);
+        *self.estimate.get_mut() = UNKNOWN;
     }
 
     /// Adds a value that has already been hashed, for a caller that is hashing anyway.
@@ -227,6 +265,7 @@ impl Sketch {
     /// The part of [`Self::add_hash`] a hash below the threshold gets to.
     #[inline(never)]
     fn insert(&mut self, hash: u64) {
+        *self.estimate.get_mut() = UNKNOWN;
         if self.slots.is_empty() {
             self.slots = vec![EMPTY; slots_for(self.k, 0)];
         }
@@ -411,13 +450,27 @@ impl Sketch {
         if self.is_exact() {
             return self.held as f64;
         }
-        let bottom = self.bottom();
-        let Some(largest) = bottom.last() else {
+        let known = self.estimate.load(Ordering::Relaxed);
+        if known != UNKNOWN {
+            return f64::from_bits(known);
+        }
+        let estimate = self.estimate_from_slots();
+        self.estimate.store(estimate.to_bits(), Ordering::Relaxed);
+        estimate
+    }
+
+    /// [`Self::distinct`] for a full sketch, worked out from the slots. Only the largest of the bottom
+    /// k is read, so it is selected rather than sorted for.
+    fn estimate_from_slots(&self) -> f64 {
+        let mut kept: Vec<u64> = self.slots.iter().copied().filter(|slot| *slot != EMPTY).collect();
+        let held = kept.len().min(self.k);
+        let Some(at) = held.checked_sub(1) else {
             return 0.0;
         };
+        let (_, largest, _) = kept.select_nth_unstable(at);
         let largest = *largest as f64 / u64::MAX as f64;
         if largest <= 0.0 {
-            return bottom.len() as f64;
+            return held as f64;
         }
         (self.k as f64 - 1.0) / largest
     }
@@ -492,7 +545,14 @@ impl Sketch {
     /// For [`Sketch::union`], which works out its answer as a list and then needs it back as a
     /// sketch. A list of k is a sketch that has filled, and anything shorter has not.
     fn holding(k: usize, hashes: &[u64]) -> Self {
-        let mut sketch = Self { k, slots: Vec::new(), held: 0, threshold: EMPTY, full: false };
+        let mut sketch = Self {
+            k,
+            slots: Vec::new(),
+            held: 0,
+            threshold: EMPTY,
+            full: false,
+            estimate: AtomicU64::new(UNKNOWN),
+        };
         if hashes.is_empty() {
             return sketch;
         }
@@ -710,6 +770,22 @@ pub fn hash128(value: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kept_estimate_is_dropped_when_a_hash_arrives() {
+        let mut sketch = Sketch::new(64).expect("sketch");
+        for value in 0..1_000_u64 {
+            sketch.add(&value.to_le_bytes());
+        }
+        let first = sketch.distinct();
+        assert_eq!(first.to_bits(), sketch.clone().distinct().to_bits());
+        for value in 1_000..100_000_u64 {
+            sketch.add(&value.to_le_bytes());
+        }
+        let fresh = Sketch::from_hashes(64, &sketch.hashes()).expect("sketch");
+        assert!(sketch.distinct() > first * 10.0);
+        assert_eq!(sketch.distinct().to_bits(), fresh.distinct().to_bits());
+    }
 
     fn values(count: usize, prefix: &str) -> Vec<Vec<u8>> {
         (0..count).map(|index| format!("{prefix}{index}").into_bytes()).collect()
