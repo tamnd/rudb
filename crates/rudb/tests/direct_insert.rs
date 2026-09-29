@@ -148,6 +148,39 @@ fn a_rollback_takes_the_rows_back() {
     db.execute("ROLLBACK").expect("rolls back");
 }
 
+#[test]
+fn a_table_changed_between_executions_is_found_again() {
+    let db = Database::new();
+    db.execute("CREATE TABLE t (a INTEGER, b VARCHAR)").expect("creates");
+    let insert = db.prepare("INSERT INTO t (b, a) VALUES (?, ?)").expect("prepares");
+    insert.execute(&[Value::Varchar("x".into()), Value::Integer(1)]).expect("inserts");
+    insert.execute(&[Value::Varchar("y".into()), Value::Integer(2)]).expect("inserts");
+
+    // Recreated with the columns the other way round, the list has to land by name again.
+    db.execute("DROP TABLE t").expect("drops");
+    db.execute("CREATE TABLE t (b VARCHAR, c DOUBLE, a INTEGER)").expect("creates");
+    insert.execute(&[Value::Varchar("z".into()), Value::Integer(3)]).expect("inserts");
+    assert_eq!(
+        rows(&db, "SELECT * FROM t"),
+        vec![vec![Value::Varchar("z".into()), Value::Null, Value::Integer(3)]]
+    );
+
+    // A default the list leaves out, or a constraint, sends the row the long way.
+    db.execute("ALTER TABLE t ALTER COLUMN c SET DEFAULT 2.5").expect("alters");
+    insert.execute(&[Value::Varchar("w".into()), Value::Integer(4)]).expect("inserts");
+    assert_eq!(rows(&db, "SELECT c FROM t WHERE a = 4"), vec![vec![Value::Double(2.5)]]);
+
+    // A table that shadows the name in `temp` wins from then on.
+    db.execute("CREATE TEMPORARY TABLE t (a INTEGER, b VARCHAR)").expect("creates");
+    insert.execute(&[Value::Varchar("v".into()), Value::Integer(5)]).expect("inserts");
+    assert_eq!(rows(&db, "SELECT a FROM t"), vec![vec![Value::Integer(5)]]);
+    db.execute("DROP TABLE temp.t").expect("drops");
+    assert_eq!(rows(&db, "SELECT count(*) FROM t"), vec![vec![Value::BigInt(2)]]);
+    db.execute("DROP TABLE t").expect("drops");
+    let error = insert.execute(&[Value::Varchar("u".into()), Value::Integer(6)]).expect_err("gone");
+    assert!(error.to_string().contains("does not exist"), "{error}");
+}
+
 fn path(tag: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("rudb-direct-{tag}-{}.rudb", std::process::id()));
     let _ = std::fs::remove_file(&path);

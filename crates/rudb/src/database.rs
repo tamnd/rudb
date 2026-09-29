@@ -3152,41 +3152,11 @@ impl Shared {
             return None;
         }
         let mut catalog = self.write();
-        let parts: Vec<&str> = direct.name.iter().map(String::as_str).collect();
-        let name = catalog.resolve(&parts).ok()?;
-        if !name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)
-            || catalog.entry(&name).ok()? != Entry::Table
-        {
-            return None;
-        }
-        let table = catalog.table(&name).ok()?;
-        if !table.checks().is_empty()
-            || !table.foreign().is_empty()
-            || !table.keys().is_empty()
-            || !table.guards().is_empty()
-            || table.clustering().is_some()
-        {
-            return None;
-        }
-        let fields = table.columns();
-        let targets: Vec<usize> = if direct.columns.is_empty() {
-            (0..fields.len()).collect()
-        } else {
-            let mut targets = Vec::with_capacity(direct.columns.len());
-            for column in &direct.columns {
-                let at = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))?;
-                if targets.contains(&at) {
-                    return None;
-                }
-                targets.push(at);
-            }
-            targets
+        let (name, targets) = match direct.found.take(catalog.generation()) {
+            Some(found) => found,
+            None => direct_targets(&catalog, direct)?,
         };
-        if targets.len() != direct.items.len()
-            || (0..fields.len()).any(|at| !targets.contains(&at) && table.default(at).is_some())
-        {
-            return None;
-        }
+        let fields = catalog.table(&name).ok()?.columns();
         let mut row = vec![Value::Null; fields.len()];
         for (item, &at) in direct.items.iter().zip(&targets) {
             let value = match item {
@@ -3218,6 +3188,9 @@ impl Shared {
             self.stage_rows(&name, table.columns(), &rows);
             QueryResult::changed(1)
         });
+        if result.is_ok() {
+            direct.found.keep(catalog.generation(), name, targets);
+        }
         drop(catalog);
         let settled = self.settle();
         Some(result.and_then(|result| settled.map(|()| result)))
@@ -4760,6 +4733,51 @@ fn asked_for_mirrors(bound: &Bound) -> bool {
 struct Noted {
     parse_ns: u64,
     bind_ns: u64,
+}
+
+/// The table a [`crate::prepared::Direct`] insert names and the column each of its items lands in,
+/// or `None` when the table needs the plan: it is not a plain table of the default database, it
+/// has a constraint, a default the row leaves out, or a column list that does not match.
+fn direct_targets(
+    catalog: &Catalog,
+    direct: &crate::prepared::Direct,
+) -> Option<(QualifiedName, Vec<usize>)> {
+    let parts: Vec<&str> = direct.name.iter().map(String::as_str).collect();
+    let name = catalog.resolve(&parts).ok()?;
+    if !name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)
+        || catalog.entry(&name).ok()? != Entry::Table
+    {
+        return None;
+    }
+    let table = catalog.table(&name).ok()?;
+    if !table.checks().is_empty()
+        || !table.foreign().is_empty()
+        || !table.keys().is_empty()
+        || !table.guards().is_empty()
+        || table.clustering().is_some()
+    {
+        return None;
+    }
+    let fields = table.columns();
+    let targets: Vec<usize> = if direct.columns.is_empty() {
+        (0..fields.len()).collect()
+    } else {
+        let mut targets = Vec::with_capacity(direct.columns.len());
+        for column in &direct.columns {
+            let at = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))?;
+            if targets.contains(&at) {
+                return None;
+            }
+            targets.push(at);
+        }
+        targets
+    };
+    if targets.len() != direct.items.len()
+        || (0..fields.len()).any(|at| !targets.contains(&at) && table.default(at).is_some())
+    {
+        return None;
+    }
+    Some((name, targets))
 }
 
 /// Whether a value of type `from` goes into a column of type `to` by one of the casts

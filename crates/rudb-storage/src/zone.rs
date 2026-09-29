@@ -60,6 +60,8 @@
 //! answers, and the only way to have that conversation is with both numbers in front of you.
 //! [`MemoryTable::stats_ns`] is what a load reports it spent here.
 
+use std::cmp::Ordering;
+
 use rudb_common::Value;
 use rudb_common::bounds::{Bound, Op, certain, excluded, scaled_as};
 use rudb_vector::{Chunk, Data, Form, Packed, StringView, Vector};
@@ -153,14 +155,24 @@ impl Range {
             self.low = other.low.clone();
             self.high = other.high.clone();
         } else if !empty(other) {
-            self.low = match (self.low.take(), other.low.clone()) {
-                (Some(mine), Some(theirs)) => Some(mine.smaller(theirs)),
-                _ => None,
-            };
-            self.high = match (self.high.take(), other.high.clone()) {
-                (Some(mine), Some(theirs)) => Some(mine.larger(theirs)),
-                _ => None,
-            };
+            // Compared in place and cloned only when the other end wins, because a fold that keeps
+            // its own end, which is most of them, should not copy a string to throw it away.
+            match (&mut self.low, &other.low) {
+                (Some(mine), Some(theirs)) => {
+                    if mine.order(theirs) == Some(Ordering::Greater) {
+                        *mine = theirs.clone();
+                    }
+                }
+                (low, _) => *low = None,
+            }
+            match (&mut self.high, &other.high) {
+                (Some(mine), Some(theirs)) => {
+                    if mine.order(theirs) == Some(Ordering::Less) {
+                        *mine = theirs.clone();
+                    }
+                }
+                (high, _) => *high = None,
+            }
         }
         self.nulls += other.nulls;
         self.exact &= other.exact;
