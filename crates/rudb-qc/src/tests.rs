@@ -5,6 +5,7 @@ use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{Cancel, Error, ErrorCode, Field, LogicalType, Memory, Session, Value};
 use rudb_pipeline::Pool;
 use rudb_plan::Plan;
+use rudb_qc_gen::Out;
 
 use super::*;
 
@@ -743,4 +744,72 @@ fn a_decimal_cast_out_of_range_is_the_error_the_first_engine_raises() {
     let error = compiled(&text).expect_err("the cast is out of range");
     assert_eq!(error.code(), first.code(), "{error:?}");
     assert_eq!(error.code(), ErrorCode::Conversion, "{error:?}");
+}
+
+#[test]
+fn a_grouping_by_text_with_few_values_finds_its_rows_by_the_index_of_each_value() {
+    let text = format!(
+        "Aggregate #1 groups=[#0.1::VARCHAR] aggregates=[count_star()::BIGINT, sum(#0.0::INTEGER)::HUGEINT]\n  {SCAN}"
+    );
+    same(&text, false);
+    let catalog = catalog();
+    let plan = Plan::parse(&text).expect("a well formed plan");
+    let dense = |options: Options| {
+        let compiled =
+            compile_over(&plan, Some(&catalog), &Cancel::new(), options).expect("it is taken");
+        let body = compiled.query.bodies[0].clone().expect("a pipeline");
+        let Out::Aggregate(grouping) = &body.sink else { panic!("an aggregate") };
+        (body.domains.iter().map(|d| d.values.len()).collect::<Vec<_>>(), grouping.dense.is_some())
+    };
+    assert_eq!(dense(Options::default()), (vec![5], true));
+    let options = Options { ablate: Ablate::DENSE, ..Options::default() };
+    assert_eq!(dense(options), (vec![], false));
+}
+
+#[test]
+fn a_value_the_statistics_did_not_have_when_the_code_was_made_goes_through_the_hash() {
+    let text = format!(
+        "Aggregate #1 groups=[#0.1::VARCHAR] aggregates=[count_star()::BIGINT, sum(#0.0::INTEGER)::HUGEINT]\n  {SCAN}"
+    );
+    let catalog = catalog();
+    let plan = Plan::parse(&text).expect("a well formed plan");
+    let cancel = Cancel::new();
+    for tier in [Tier::Interp, Tier::Clif, Tier::Direct].into_iter().filter(|t| t.built()) {
+        let options = Options { tier, rows: true, fresh: true, morsel: 333, ..Options::default() };
+        let compiled = compile_over(&plan, Some(&catalog), &cancel, options).expect("it is taken");
+        let mut catalog = catalog.clone();
+        let words = ["new", "a", "another string longer than twelve bytes", "new"];
+        let more: Vec<Vec<Value>> = (0..800)
+            .map(|i| vec![Value::Integer(i), Value::Varchar(words[i as usize % 4].to_string())])
+            .collect();
+        catalog
+            .table_mut(&QualifiedName::new("memory", "main", "t"))
+            .expect("the table")
+            .rows_mut()
+            .append_rows(&more)
+            .expect("rows of the table's own types");
+        let mut first = rows(
+            &rudb_exec::build(&plan, &catalog)
+                .expect("the first engine builds")
+                .collect(&cancel, &Pool::default())
+                .expect("the first engine runs"),
+        );
+        let (pool, memory, seams, session) =
+            (Pool::default(), Memory::unlimited(), rudb_seam::Settings::new(), Session::new());
+        let under = Under {
+            catalog: &catalog,
+            cancel: &cancel,
+            memory: &memory,
+            seams: &seams,
+            session: &session,
+            pool: &pool,
+        };
+        let mut compiled =
+            rows(&compiled.run(&plan, under).expect("the compiled engine runs").chunks);
+        let key = |r: &Vec<Value>| format!("{r:?}");
+        first.sort_by_key(key);
+        compiled.sort_by_key(key);
+        assert_eq!(first.len(), 8, "{first:?}");
+        assert_eq!(first, compiled, "{tier}");
+    }
 }

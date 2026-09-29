@@ -136,6 +136,8 @@ The planner places every guard and names every deopt target (document 04, 4.7). 
 - No morsel is ever rerun, and aggregation, the most common side effect, needs no rollback.
 - **If no bound is available, the planner does not speculate narrow.** Documents 04 and 11 follow this rule.
 
+**Checked arithmetic becomes a pre-check too.** The body version for a morsel with no NULL is built with each source column's range from the zone maps, as the `k` with every value in `[-2^k, 2^k)`. The generator carries those bounds through columns, constants, widening casts, `+`, `-`, `*` and unary minus, and where the largest magnitude stays under `10^width` of the result it emits the plain op with no overflow or width check. The body lists the columns it relied on, and before each morsel the driver checks them with a branch free add and or over the values. A morsel with a value out of range runs the generic version, which checks every step, so rows added after the code was made are still caught. The `ranges` ablation switch turns it off.
+
 **Restartability rules for in-flight guards** (document 03; document 13, section 13.4):
 
 - R1. Every in-flight guard is placed before the first side effect of the morsel on shared or thread-local state. Or:

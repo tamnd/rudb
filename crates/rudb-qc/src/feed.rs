@@ -23,6 +23,7 @@
 //! again from the start, which is safe because the only thing such a body changes is the buffers
 //! and their count, and both start over.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -88,6 +89,8 @@ pub(crate) struct Feed<'a> {
     /// Where the rows of a result body tell the scan under them how good a row has to be to make
     /// the top N that reads them.
     cutoff: Option<TopCut>,
+    /// For each column of [`Body::domains`], the index of each of its values.
+    lookups: Vec<HashMap<Vec<u8>, u16>>,
     inner: Mutex<Inner<'a>>,
 }
 
@@ -138,6 +141,9 @@ struct Inner<'a> {
 struct Headers {
     text: Vec<Option<Flat>>,
     likes: Vec<Option<Answered>>,
+    /// For each column of [`Body::domains`], the last dictionary it came with and the index of
+    /// each of that dictionary's values, as [`indexes`] makes them.
+    domains: Vec<Option<(Arc<Vector>, Vec<u16>)>>,
 }
 
 /// A dictionary, its values made flat, and a `str16` header per value.
@@ -244,6 +250,11 @@ impl<'a> Feed<'a> {
             top: None,
             agreed: None,
             cutoff: None,
+            lookups: body
+                .domains
+                .iter()
+                .map(|d| d.values.iter().enumerate().map(|(i, v)| (v.clone(), i as u16)).collect())
+                .collect(),
             inner: Mutex::new(Inner {
                 rt,
                 state,
@@ -759,6 +770,17 @@ impl<'a> Feed<'a> {
                 }
             };
             cols.push(Col { values: out.as_ptr(), valid });
+        }
+        // Each group key column the body reads as indexes into its values is looked up here, a
+        // dictionary's values once.
+        headers.domains.resize(self.body.domains.len(), None);
+        let mut found = Vec::with_capacity(self.body.domains.len());
+        let domains = self.body.domains.iter().zip(&self.lookups);
+        for ((d, lookup), known) in domains.zip(headers.domains.iter_mut()) {
+            let out = indexes(chunk.column(d.column)?, rows, lookup, known)?;
+            let at = out.as_ptr().cast::<u8>();
+            cols.push(Col { values: at, valid: at });
+            found.push(out);
         }
         let mut morsel = Morsel {
             source: 0,
@@ -1296,6 +1318,60 @@ fn validity(v: &Vector, rows: usize) -> (Vec<u8>, bool) {
         }
     }
     (valid, clean)
+}
+
+/// The index in `lookup` of each of the first `rows` values of the text column `v`, as the body
+/// reads a column of [`Body::domains`]: the count of values for a NULL, and one more than that for
+/// a value not in them. For a column coded into a dictionary, the dictionary's values are looked
+/// up once and kept in `known` for the next morsel that comes with the same one.
+fn indexes(
+    v: &Vector,
+    rows: usize,
+    lookup: &HashMap<Vec<u8>, u16>,
+    known: &mut Option<(Arc<Vector>, Vec<u16>)>,
+) -> Result<Vec<u16>> {
+    let n = lookup.len() as u16;
+    let each = |flat: &Vector| -> Vec<u16> {
+        // A value that is not a string is not in the values, and the hash finds its group.
+        let Some(Data::Varlen(s)) = flat.data() else { return vec![n + 1; flat.len()] };
+        let arena = s.arena();
+        let at = |bytes: &[u8]| lookup.get(bytes).copied().unwrap_or(n + 1);
+        s.views().iter().map(|view| at(view.bytes_in(arena).unwrap_or_default())).collect()
+    };
+    let mut out = match v.shared_dictionary_parts() {
+        Some((codes, dictionary)) if codes.len() >= rows => {
+            if !known.as_ref().is_some_and(|(d, _)| Arc::ptr_eq(d, dictionary)) {
+                let values = (**dictionary).clone().into_flat()?;
+                let mut map = each(&values);
+                for (i, m) in map.iter_mut().enumerate() {
+                    if values.is_null_at(i) {
+                        *m = n;
+                    }
+                }
+                *known = Some((Arc::clone(dictionary), map));
+            }
+            let Some((_, map)) = known.as_ref() else {
+                return Err(Error::internal("indexes made and then not there"));
+            };
+            codes[..rows].iter().map(|&c| map.get(c as usize).copied().unwrap_or(n + 1)).collect()
+        }
+        _ => {
+            let mut out = match v.data() {
+                Some(_) => each(v),
+                None => each(&v.clone().into_flat()?),
+            };
+            out.resize(rows, n + 1);
+            out
+        }
+    };
+    if !matches!(v.validity(), Validity::AllValid) {
+        for (i, x) in out.iter_mut().enumerate() {
+            if v.is_null_at(i) {
+                *x = n;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The root of a scan the first engine runs for us.
