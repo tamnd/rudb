@@ -776,8 +776,10 @@ fn a_two_key_top_count_with_no_skew_reads_the_rows() {
 fn a_distinct_count_by_a_small_key_is_counted_from_the_codes_of_a_wide_column() {
     let rows = "SELECT CASE WHEN i % 101 = 0 THEN NULL ELSE i % 37 END AS r, \
          CASE WHEN i % 89 = 0 THEN NULL ELSE (i * 7919) % 150000 * 1000003 - 5000000000 END AS u, \
-         (i * 2654435761) % 1000000007 AS p1, (i * 40503) % 1000000009 AS p2, \
-         (i * 2246822519) % 998244353 AS p3, (i * 3266489917) % 1000000021 AS p4 \
+         (i * 2654435761) % 1000000007 * 1000000009 + i % 7919 AS p1, \
+         (i * 40503) % 1000000009 * 1000000007 + i % 7907 AS p2, \
+         (i * 2246822519) % 998244353 * 1000000021 + i % 7901 AS p3, \
+         (i * 3266489917) % 1000000021 * 998244353 + i % 7883 AS p4 \
          FROM range(200000) t(i)";
     let pair = Pair::new("codedusers", rows);
     let query = "SELECT r, COUNT(DISTINCT u) AS c FROM t GROUP BY r ORDER BY c DESC, r LIMIT 10";

@@ -349,7 +349,7 @@ pub fn distinct_per_group(
 
     // Every row's slot, each thread writing the rows of its own run of parts.
     let each = parts.div_ceil(workers).max(1);
-    let mut of_row = vec![0_u32; rows];
+    let mut of_row = vec![0_u16; rows];
     let read = std::thread::scope(|scope| {
         let mut rest = of_row.as_mut_slice();
         let mut handles = Vec::with_capacity(workers);
@@ -441,8 +441,9 @@ pub fn distinct_per_group(
     Ok(Some(out))
 }
 
-/// The widest range of group values [`distinct_per_group`] indexes, a million slots.
-const MOST_GROUP_SLOTS: i128 = 1 << 20;
+/// The widest range of group values [`distinct_per_group`] indexes, so that a row's slot is two
+/// bytes and the slots of a million rows fit in two megabytes of cache.
+const MOST_GROUP_SLOTS: i128 = 1 << 16;
 
 /// The slot of every row of `parts` of the group column into `out`, and which slots turned up, or
 /// `None` when the column is not read as signed integers or holds a value outside the range the
@@ -454,7 +455,7 @@ fn read_slots(
     starts: &[usize],
     low: i64,
     slots: usize,
-    out: &mut [u32],
+    out: &mut [u16],
 ) -> Result<Option<Vec<bool>>> {
     let mut present = vec![false; slots];
     let mut block = Vec::new();
@@ -473,7 +474,7 @@ fn read_slots(
                 0
             } else {
                 match value.checked_sub(low).and_then(|gap| usize::try_from(gap).ok()) {
-                    Some(gap) if gap + 1 < slots => gap as u32 + 1,
+                    Some(gap) if gap + 1 < slots => gap as u16 + 1,
                     _ => return Ok(None),
                 }
             };
