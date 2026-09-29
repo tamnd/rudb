@@ -13,6 +13,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::generated::keywords::{KEYWORDS, LONGEST};
 use crate::value::Value;
 
 /// A named field of a `STRUCT` or a `UNION`, and a named column of a table.
@@ -888,11 +889,26 @@ fn write_fields(f: &mut fmt::Formatter<'_>, keyword: &str, fields: &[Field]) -> 
     f.write_str(")")
 }
 
+/// Whether `name` is a word the grammar puts in a keyword class, folded to lower case.
+fn is_keyword(name: &str) -> bool {
+    if name.len() > LONGEST {
+        return false;
+    }
+    let folded = name.to_ascii_lowercase();
+    KEYWORDS
+        .binary_search_by(|(word, _)| (*word).cmp(folded.as_str()))
+        .is_ok_and(|at| KEYWORDS[at].1 != 0)
+}
+
 /// Writes a field name, quoting it if it would not survive being read back unquoted.
+///
+/// A name that is a keyword in any class is quoted in any case, `"by"` and `"Value"` both, which is
+/// the pin's rule. A word the grammar spells without giving it a class, like `keys`, is not.
 fn write_identifier(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
     let plain = !name.is_empty()
         && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !is_keyword(name);
     if plain {
         f.write_str(name)
     } else {
@@ -1556,6 +1572,20 @@ mod tests {
             ty.to_string(),
             "STRUCT(plain INTEGER, \"has space\" INTEGER, \"has\"\"quote\" INTEGER, \
              \"2leading\" INTEGER)"
+        );
+        assert_eq!(LogicalType::parse(&ty.to_string()).unwrap(), ty);
+    }
+
+    #[test]
+    fn a_field_name_that_is_a_keyword_gets_quoted_the_way_the_pin_quotes_it() {
+        let fields = ["by", "Value", "SELECT", "keys", "alias", "aB", "_u"];
+        let ty = LogicalType::Struct(
+            fields.iter().map(|name| Field::new(*name, LogicalType::Integer)).collect(),
+        );
+        assert_eq!(
+            ty.to_string(),
+            "STRUCT(\"by\" INTEGER, \"Value\" INTEGER, \"SELECT\" INTEGER, keys INTEGER, \
+             alias INTEGER, aB INTEGER, _u INTEGER)"
         );
         assert_eq!(LogicalType::parse(&ty.to_string()).unwrap(), ty);
     }

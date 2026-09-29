@@ -75,7 +75,7 @@ Each override carries a third field, the suggestion state it was constructed wit
 
 ## 20.5 The generator and the rule table
 
-`cargo xtask gen-grammar` reads the vendored tree and writes `crates/rudb-parse/src/generated/`. The output is checked in. CI regenerates and fails on any diff, which is what actually enforces that nobody hand edits the generated file either.
+`cargo xtask gen-grammar` reads the vendored tree and writes `crates/rudb-parse/src/generated/`, apart from the keyword table, which goes to `crates/rudb-common/src/generated/` because printing a type quotes a field name that is a keyword and the type printer is below the parser. The output is checked in. CI regenerates and fails on any diff, which is what actually enforces that nobody hand edits the generated file either.
 
 Four decisions, written down because they will otherwise be relitigated.
 

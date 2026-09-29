@@ -178,6 +178,7 @@ fn from_paths(root: &Path, base: String, paths: Vec<String>) -> Focus {
         }
         if path.starts_with("crates/rudb-parse/grammar/")
             || path.starts_with("crates/rudb-parse/src/generated/")
+            || path.starts_with("crates/rudb-common/src/generated/")
         {
             grammar = true;
         }

@@ -6,5 +6,7 @@
 //! `build.rs` so that the diff of a grammar bump shows what actually changed, which is the whole
 //! point of pinning it. `spec/20-the-grammar.md` section 5.
 
-pub mod keywords;
+/// The keyword table, which is generated in the same run but lives in `rudb-common` so that the
+/// type printer can quote a field name that is a keyword.
+pub use rudb_common::generated::keywords;
 pub mod rules;

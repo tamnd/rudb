@@ -92,7 +92,7 @@ Settings are not a side surface. Nineteen of the 192 change the meaning of a que
 
 Every one of those is a knob that a second dialect would want set differently, which is the argument of document 04 made by DuckDB rather than by us.
 
-`SELECT count(*) FROM duckdb_keywords()` is 505: 75 reserved, 339 unreserved, 55 column name, 36 type function. rudb gets this one for free, because `crates/rudb-parse/src/generated/keywords.rs` is compiled from the same five vendored `.list` files, so the keyword classification is correct by construction and the only work is the table function that exposes it.
+`SELECT count(*) FROM duckdb_keywords()` is 505: 75 reserved, 339 unreserved, 55 column name, 36 type function. rudb gets this one for free, because `crates/rudb-common/src/generated/keywords.rs` is compiled from the same five vendored `.list` files, so the keyword classification is correct by construction and the only work is the table function that exposes it.
 
 The introspection table functions are the surface a tool sees, and rudb answers none of them. The pinned binary has `duckdb_columns`, `duckdb_constraints`, `duckdb_databases`, `duckdb_dependencies`, `duckdb_extensions`, `duckdb_functions`, `duckdb_indexes`, `duckdb_keywords`, `duckdb_optimizers` at 44 rows, `duckdb_schemas`, `duckdb_secrets`, `duckdb_sequences`, `duckdb_settings`, `duckdb_tables`, `duckdb_types`, `duckdb_variables`, `duckdb_views`, `duckdb_dialects`, `duckdb_grammar_extensions` and about a dozen more, plus the whole `pragma_*` family and `information_schema`. `crates/rudb-catalog/src/lib.rs` has none of them and mentions `information_schema` only in a doc comment about name resolution.
 

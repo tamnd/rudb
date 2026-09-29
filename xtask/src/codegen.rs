@@ -11,7 +11,7 @@
 //! benefit of nobody. It is the same rule the vendored tree lives under.
 //!
 //! Two files come out of here. `keywords.rs` is every word the grammar knows and which classes it
-//! is in. `rules.rs` is the grammar itself, compiled to a flat node table with a FIRST set beside
+//! is in, and it goes to `rudb-common` because the type printer below the parser needs it too. `rules.rs` is the grammar itself, compiled to a flat node table with a FIRST set beside
 //! every node. They are generated in one run from one read of the vendored tree, which is what
 //! lets a `Keyword` node in the rule table carry a bare index into the keyword table.
 
@@ -20,9 +20,12 @@ use std::path::Path;
 
 use crate::ruletable::{self, Op, Table};
 
-/// Where the generated files go. One directory so that `@generated` is a property of a path
-/// rather than a thing you have to check per file.
+/// Where the generated files go. Each is under a `src/generated` directory so that `@generated`
+/// is a property of a path rather than a thing you have to check per file.
 const DEST: &str = "crates/rudb-parse/src/generated";
+
+/// Where the keyword table goes, which is below the parser so that printing a type can see it.
+const KEYWORDS: &str = "crates/rudb-common/src/generated";
 
 /// The five keyword classes, in the order their bits are assigned. The names are upstream's file
 /// names without the suffix, because the mapping from a `.list` file to a class should be
@@ -38,23 +41,25 @@ const CLASSES: [(&str, &str); 5] = [
 pub(crate) fn generate(check: bool) -> Result<(), String> {
     let root = crate::root();
     let grammar = root.join(crate::vendor::DEST);
-    let dest = root.join(DEST);
 
     let keywords = keyword_table(&grammar)?;
     let parsed = crate::grammar::parse_dir(&grammar.join("statements"))?;
     let table =
         ruletable::compile(&parsed, &keywords, &overrides(&grammar)?, &memoized(&grammar)?)?;
 
-    let files = [("keywords.rs", emit_keywords(&keywords)), ("rules.rs", emit_rules(&table))];
+    let files = [
+        (KEYWORDS, "keywords.rs", emit_keywords(&keywords)),
+        (DEST, "rules.rs", emit_rules(&table)),
+    ];
 
     if check {
-        for (name, written) in &files {
-            let path = dest.join(name);
+        for (dir, name, written) in &files {
+            let path = root.join(dir).join(name);
             let found = std::fs::read_to_string(&path)
                 .map_err(|e| format!("could not read {}: {e}", path.display()))?;
             if found.replace("\r\n", "\n") != *written {
                 return Err(format!(
-                    "{DEST}/{name} is not what the grammar generates\n  \
+                    "{dir}/{name} is not what the grammar generates\n  \
                      run `cargo xtask gen-grammar` and commit the result\n  \
                      it is generated from the vendored grammar and editing it by hand puts the \
                      parser and the dialect it claims to implement out of step"
@@ -70,15 +75,16 @@ pub(crate) fn generate(check: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    std::fs::create_dir_all(&dest)
-        .map_err(|e| format!("could not make {}: {e}", dest.display()))?;
-    for (name, written) in &files {
+    for (dir, name, written) in &files {
+        let dest = root.join(dir);
+        std::fs::create_dir_all(&dest)
+            .map_err(|e| format!("could not make {}: {e}", dest.display()))?;
         let path = dest.join(name);
         std::fs::write(&path, written)
             .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     }
     println!(
-        "wrote {DEST}/keywords.rs with {} words and {DEST}/rules.rs with {} rules in {} nodes",
+        "wrote {KEYWORDS}/keywords.rs with {} words and {DEST}/rules.rs with {} rules in {} nodes",
         keywords.len(),
         table.rules.len(),
         table.nodes.len()
