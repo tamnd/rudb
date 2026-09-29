@@ -712,6 +712,34 @@ fn turning_the_stored_answers_off_reads_the_rows_for_a_two_key_top_count() {
     assert!(scanned(&pair.file, double), "{double} did not scan the file with the switch off");
 }
 
+/// ClickBench's q13 is the top count of one string column with the empty string left out. The
+/// filter only takes away one value of the grouped column, so the leaders are still entries the
+/// synopsis lists, less the empty one and the null, and the rows need not be read.
+#[test]
+fn a_top_count_that_leaves_out_one_value_is_read_out_of_the_value_frequencies() {
+    let pair = Pair::new(
+        "leftout",
+        "SELECT CASE WHEN i % 3 = 0 THEN '' WHEN i % 7 = 0 THEN NULL \
+         WHEN i % 20 * 1000 < i - i % 1000 THEN 'h' || CAST(i % 20 AS VARCHAR) \
+         ELSE 'c' || CAST(i AS VARCHAR) END AS s FROM range(20000) r(i)",
+    );
+    for query in [
+        "SELECT s, COUNT(*) AS c FROM t WHERE s <> '' GROUP BY s ORDER BY c DESC, s LIMIT 5",
+        "SELECT s, COUNT(*) AS c FROM t WHERE 'h3' <> s GROUP BY s ORDER BY c DESC, s LIMIT 5",
+    ] {
+        assert_eq!(pair.listing(query).len(), 5, "the limit is the answer's length");
+        assert!(
+            pair.answered(&pair.file, query, "native value frequencies"),
+            "{query} read the rows"
+        );
+    }
+    // Any other filter still reads them.
+    let other =
+        "SELECT s, COUNT(*) AS c FROM t WHERE s > 'h' GROUP BY s ORDER BY c DESC, s LIMIT 5";
+    pair.listing(other);
+    assert!(!pair.answered(&pair.file, other, "native value frequencies"));
+}
+
 /// Whether the file counted the groups of this over only the rows of the values its synopsis lists.
 fn coded(db: &Database, query: &str) -> bool {
     let result = db.query(query).expect("the query ran");

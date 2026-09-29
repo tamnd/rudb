@@ -660,6 +660,10 @@ fn native_host_groups(
 /// then the answer is the list, with no row read and no table of a million groups built to throw
 /// all but ten of them away. Every listed value that ties the `n`th count comes along, so the TopN
 /// above still decides the ties the way it would have over the whole table.
+///
+/// A filter that only tells the grouped column apart from one value, the way ClickBench leaves out
+/// the empty search phrase, takes that value's entry out of the list along with the null's, and
+/// leaves every other count and the bound as they were.
 fn native_value_frequencies(
     plan: &Plan,
     catalog: &Catalog,
@@ -668,11 +672,31 @@ fn native_value_frequencies(
     aggregates: Slice,
     top: usize,
 ) -> Result<Option<NativePairFrequencies>> {
-    let Some((table, index, columns)) = whole_table(plan, catalog, input)? else {
+    let (scan, predicate) = match *plan.node(input) {
+        Node::Filter { input, predicate } => (input, Some(predicate)),
+        _ => (input, None),
+    };
+    let Some((table, index, columns)) = whole_table(plan, catalog, scan)? else {
         return Ok(None);
     };
     let [group] = plan.expr_list(groups) else { return Ok(None) };
     let Expr::Column(binding) = *plan.expr(*group) else { return Ok(None) };
+    let mut dropped = None;
+    if let Some(predicate) = predicate {
+        let Expr::Compare { op: CompareOp::NotEqual, left, right } = *plan.expr(predicate) else {
+            return Ok(None);
+        };
+        let constant = match (plan.expr(left), plan.expr(right)) {
+            (Expr::Constant(value), _) if is_binding(plan, right, binding) => *value,
+            (_, Expr::Constant(value)) if is_binding(plan, left, binding) => *value,
+            _ => return Ok(None),
+        };
+        let against = plan.value(constant);
+        if against.is_null() || plan.expr_type(left) != plan.expr_type(right) {
+            return Ok(None);
+        }
+        dropped = Some(against.clone());
+    }
     let [aggregate] = plan.expr_list(aggregates) else { return Ok(None) };
     let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
         return Ok(None);
@@ -693,7 +717,10 @@ fn native_value_frequencies(
     if table.columns().get(column).map(|stored| &stored.ty) != Some(plan.expr_type(*group)) {
         return Ok(None);
     }
-    let Some(prefix) = table.rows().frequency_prefix(column)? else { return Ok(None) };
+    let Some(mut prefix) = table.rows().frequency_prefix(column)? else { return Ok(None) };
+    if let Some(dropped) = &dropped {
+        prefix.entries.retain(|(value, _)| !value.is_null() && value != dropped);
+    }
     let mut counts = prefix.entries.iter().map(|(_, count)| *count).collect::<Vec<_>>();
     if counts.len() < top {
         return Ok(None);
