@@ -1100,6 +1100,13 @@ const TABLE: &[Entry] = &[
     aggregate("reservoir_quantile", Arity::between(2, 3), Shape::Sampled, false),
     aggregate("approx_quantile", Arity::exactly(2), Shape::Digested, false),
     aggregate("approx_top_k", Arity::exactly(2), Shape::Topped, false),
+    // A state and how many times to fold it in, which the pin declares the way it declares `lag`.
+    aggregate(
+        "combine_aggr",
+        Arity::between(1, 2),
+        Shape::ValueThenCountThenValue(Spelled::Any),
+        false,
+    ),
     aggregate("lttb", Arity::exactly(3), Shape::Plotted, false),
     aggregate("median", Arity::exactly(1), Shape::Median, false),
     aggregate("mad", Arity::exactly(1), Shape::Deviation, false),

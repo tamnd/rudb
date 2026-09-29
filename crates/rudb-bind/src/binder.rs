@@ -3381,6 +3381,9 @@ impl<'a> Binder<'a> {
         if resolved.name == "approx_top_k" {
             self.top_k_argument(&bound)?;
         }
+        if resolved.name == "combine_aggr" {
+            crate::state::merged_argument(self.plan.expr_type(bound[0]))?;
+        }
         let mut cast = Vec::with_capacity(bound.len());
         for (arg, wanted) in bound.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);

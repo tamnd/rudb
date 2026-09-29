@@ -19,6 +19,7 @@ use std::sync::Arc;
 use rudb_common::{Error, LogicalType, Result, StateType, Value};
 
 use crate::aggregate::Accumulator;
+use crate::aggregate::export::Merge;
 use crate::arg_extreme::{ArgExtreme, Key};
 use crate::bitstring::Gathered;
 use crate::compare::order_with_nulls;
@@ -70,6 +71,8 @@ pub(crate) enum General {
     /// the aggregate always does and answers with the state written out in the layout of `state`,
     /// which every group shares rather than each holding a copy of its own.
     Exported { inner: Box<Accumulator>, state: Arc<StateType> },
+    /// `combine_aggr`, in [`crate::aggregate::export`].
+    Merged(Merge),
     /// The quantiles, `median`, `mad` and `mode`, which hold every value that is not null and the
     /// fraction the call asked for, and answer in [`crate::quantile`].
     Holistic { values: Held, fraction: Option<Box<Value>>, measure: Holistic, returns: LogicalType },
@@ -161,6 +164,12 @@ impl General {
         };
         if let Some(state) = ArgExtreme::named(name) {
             return Some(Self::Arg { state: Box::new(state), returns: returns.clone() });
+        }
+        if name == "combine_aggr" {
+            let LogicalType::AggregateState(state) = returns else {
+                return None;
+            };
+            return Some(Self::Merged(Merge::new(Arc::clone(state))));
         }
         if let Some(measure) = Pairing::named(name) {
             return Some(Self::Paired(Paired::new(measure)));
@@ -326,6 +335,7 @@ impl General {
             }
             Self::Tally(tally) => tally.push(value)?,
             Self::Exported { inner, .. } => inner.update(args)?,
+            Self::Merged(merge) => merge.update(args)?,
             Self::CountIf { count, seen } => {
                 let Value::Boolean(flag) = *value else {
                     return Err(unexpected("count_if", value));
@@ -549,6 +559,7 @@ impl General {
             (Self::Exported { inner, .. }, Self::Exported { inner: theirs, .. }) => {
                 inner.combine(theirs)?;
             }
+            (Self::Merged(merge), Self::Merged(theirs)) => merge.combine(theirs)?,
             (
                 Self::Holistic { values, fraction, .. },
                 Self::Holistic { values: more, fraction: theirs, .. },
@@ -683,6 +694,9 @@ impl General {
         if let Self::Exported { inner, state } = self {
             return inner.export(&state.layout);
         }
+        if let Self::Merged(merge) = self {
+            return merge.finish();
+        }
         if let Self::Arg { state, returns } = self {
             return state.finish(returns);
         }
@@ -746,6 +760,7 @@ impl General {
             Self::Joined { text, .. } => Value::Varchar(text.clone()),
             Self::Ordered { .. }
             | Self::Exported { .. }
+            | Self::Merged(_)
             | Self::Holistic { .. }
             | Self::Sampled { .. }
             | Self::Digested { .. }
