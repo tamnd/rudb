@@ -25,8 +25,10 @@
 //! the rows of a file a footer read. A projection prunes to no expressions the same way and for the
 //! same reason, and passes the row count of its input through.
 //!
-//! What it does not narrow is an aggregate, a `VALUES` list, either side of a set operation, and the
-//! input of a `DISTINCT` that names no columns. The first two are noted where they are skipped. A set
+//! An aggregate is narrowed too, by the calls nothing reads, and never by its group keys.
+//!
+//! What it does not narrow is a `VALUES` list, either side of a set operation, and the input of a
+//! `DISTINCT` that names no columns. The first is noted where it is skipped. A set
 //! operation lines its two sides up by position rather than binding to them, so narrowing one side
 //! without the other would change what the columns line up with, and narrowing both would take a rule
 //! that maps the set operation's own read set onto each side. That rule is worth writing and is not
@@ -35,7 +37,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use rudb_common::Result;
+use rudb_common::{LogicalType, Result};
 use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 
 use crate::pass::{Context, Pass, top_down};
@@ -110,8 +112,6 @@ fn narrow(
     match *plan.node(node) {
         // A `VALUES` list keeps its columns on purpose rather than by omission. The rows are already
         // in the plan, so narrowing one saves reading nothing and would cost a rewrite of every row.
-        // An aggregate keeps its own on purpose too: an aggregate nobody reads the result of is a
-        // shape the binder does not build, and dropping one would drop whatever it counted.
         Node::Get { index, columns, .. }
         | Node::TableFunction { index, columns, .. }
         | Node::Fetch { index, columns, .. } => {
@@ -166,8 +166,54 @@ fn narrow(
             }
             moved.insert(index, positions(wanted, held));
         }
+        // An aggregate loses the calls nothing reads and keeps every group key, since dropping a
+        // key would change which rows are one group and so how many rows come out. The calls are
+        // where the cost is: `SELECT count(*) FROM (SELECT g, list(x) FROM t GROUP BY g)` otherwise
+        // builds every list and throws them all away. An ungrouped aggregate nothing reads any
+        // call of still produces its one row, and with no keys and no calls it would have no column
+        // to hold it in, so it is left one `count(*)`, the cheapest call there is.
+        Node::Aggregate { index, groups, aggregates, .. } => {
+            let wanted = read.get(&index).unwrap_or(&empty);
+            let keys = plan.expr_list(groups).len() as u32;
+            let calls = plan.expr_list(aggregates).len() as u32;
+            let mut kept: BTreeSet<u32> = (0..keys).collect();
+            kept.extend(wanted.iter().copied().filter(|&at| at >= keys && at < keys + calls));
+            let counted = keys == 0 && kept.is_empty() && calls > 0;
+            if counted && calls == 1 && counts(plan, plan.expr_list(aggregates)[0]) {
+                return;
+            }
+            if !counted && kept.len() as u32 == keys + calls {
+                return;
+            }
+            let chosen: Vec<_> = if counted {
+                let name = plan.intern("count_star");
+                let args = plan.add_expr_list(&[]);
+                let call = Expr::Aggregate { name, args, distinct: false, filter: None };
+                vec![plan.add_expr(call, LogicalType::BigInt)]
+            } else {
+                kept.iter()
+                    .filter(|&&at| at >= keys)
+                    .map(|&at| plan.expr_list(aggregates)[(at - keys) as usize])
+                    .collect()
+            };
+            let narrowed = plan.add_expr_list(&chosen);
+            match plan.node_mut(node) {
+                Node::Aggregate { aggregates, .. } => *aggregates = narrowed,
+                _ => unreachable!("the node was an aggregate a moment ago"),
+            }
+            moved.insert(index, positions(&kept, (keys + calls) as usize));
+        }
         _ => {}
     }
+}
+
+/// Whether `call` is a plain `count(*)`.
+fn counts(plan: &Plan, call: ExprRef) -> bool {
+    matches!(
+        *plan.expr(call),
+        Expr::Aggregate { name, args, filter: None, .. }
+            if plan.string(name) == "count_star" && args.is_empty()
+    )
 }
 
 /// Takes out every interior projection that only hands columns of its input on.
@@ -637,6 +683,38 @@ mod tests {
         let before = "Project #2 [#1.0::VARCHAR AS b]\n  Distinct on=[#1.0::VARCHAR]\n    Project #1 [#0.1::VARCHAR AS b, #0.2::INTEGER AS c]\n      Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR, c::INTEGER]\n";
         let after = "Project #2 [#1.0::VARCHAR AS b]\n  Distinct on=[#1.0::VARCHAR]\n    Project #1 [#0.0::VARCHAR AS b]\n      Get memory.main.t AS t #0 [b::VARCHAR]\n";
         assert_eq!(pruned(before), after);
+    }
+
+    #[test]
+    fn an_aggregate_call_nothing_reads_is_not_computed() {
+        // `SELECT count(*) FROM (SELECT a, list(b) FROM t GROUP BY a)`. The list goes, and with it
+        // the only reason to read `b` at all.
+        let before = "Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n  Aggregate #1 groups=[#0.0::INTEGER] aggregates=[list(#0.1::VARCHAR)::VARCHAR[]]\n    Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR]\n";
+        let after = "Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n  Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n    Get memory.main.t AS t #0 [a::INTEGER]\n";
+        assert_eq!(pruned(before), after);
+    }
+
+    #[test]
+    fn the_aggregate_calls_that_stay_are_read_from_where_they_moved_to() {
+        let before = "Project #2 [#1.0::INTEGER AS a, #1.2::BIGINT AS n]\n  Aggregate #1 groups=[#0.0::INTEGER] aggregates=[list(#0.1::VARCHAR)::VARCHAR[], count(#0.1::VARCHAR)::BIGINT]\n    Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR]\n";
+        let after = "Project #2 [#1.0::INTEGER AS a, #1.1::BIGINT AS n]\n  Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count(#0.1::VARCHAR)::BIGINT]\n    Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR]\n";
+        assert_eq!(pruned(before), after);
+    }
+
+    #[test]
+    fn a_group_key_nothing_reads_is_kept() {
+        // Dropping `a` would make one group of every row and answer 1.
+        let before = "Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n  Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n    Get memory.main.t AS t #0 [a::INTEGER]\n";
+        assert_eq!(pruned(before), before);
+    }
+
+    #[test]
+    fn an_ungrouped_aggregate_nothing_reads_is_left_one_count() {
+        // It still produces its one row, and a row has to be held in something.
+        let before = "Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n  Aggregate #1 groups=[] aggregates=[count(#0.0::INTEGER)::BIGINT, list(#0.1::VARCHAR)::VARCHAR[]]\n    Get memory.main.t AS t #0 [a::INTEGER, b::VARCHAR]\n";
+        let after = "Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n  Aggregate #1 groups=[] aggregates=[count_star()::BIGINT]\n    Get memory.main.t AS t #0 []\n";
+        assert_eq!(pruned(before), after);
+        assert_eq!(pruned(after), after);
     }
 
     #[test]
