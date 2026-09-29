@@ -471,7 +471,7 @@ impl Accumulator {
         if let Some((inner, keys)) = split_ordered(name) {
             if let ("lttb", [key]) = (inner, keys.as_slice()) {
                 let plot = Plot::sorted(returns, *key);
-                let general = General::Plotted { plot, returns: returns.clone() };
+                let general = General::Plotted { plot: Box::new(plot), returns: returns.clone() };
                 return Ok(Self { state: State::General(Box::new(general)) });
             }
             let inner = Box::new(Self::new(inner, returns)?);
@@ -643,6 +643,21 @@ impl Accumulator {
             return inner.update_run(args, rows);
         }
         if let State::General(general) = &mut self.state {
+            if general.takes_reals(args.len())
+                && let Some(columns) = reals(args, rows)
+            {
+                let mut row_values = [0.0; 2];
+                for row in 0..rows {
+                    if columns.iter().any(|(_, valid)| !valid.is_valid(row)) {
+                        continue;
+                    }
+                    for (at, (column, _)) in columns.iter().enumerate() {
+                        row_values[at] = column[row];
+                    }
+                    general.push_reals(&row_values[..columns.len()]);
+                }
+                return Ok(());
+            }
             if general.takes_points()
                 && let Some(points) = Points::of(args, rows)
             {
@@ -1545,6 +1560,27 @@ pub fn update_general(
         }
         return Ok(true);
     }
+    let columns = match &states[offset].state {
+        State::General(general) if general.takes_reals(inputs.len()) => reals(inputs, rows),
+        _ => None,
+    };
+    if let Some(columns) = columns {
+        let mut row_values = [0.0; 2];
+        for row in 0..rows {
+            if columns.iter().any(|(_, valid)| !valid.is_valid(row)) {
+                continue;
+            }
+            let Some(index) = into.index(row) else { continue };
+            let Some(Accumulator { state: State::General(general) }) = states.get_mut(index) else {
+                return Err(Error::internal(format!("an aggregate state at {index} is not held")));
+            };
+            for (at, (column, _)) in columns.iter().enumerate() {
+                row_values[at] = column[row];
+            }
+            general.push_reals(&row_values[..columns.len()]);
+        }
+        return Ok(true);
+    }
     let points = match &states[offset].state {
         State::General(general) if general.takes_points() => Points::of(inputs, rows),
         _ => None,
@@ -1613,6 +1649,21 @@ pub fn update_general(
         state.update(&args)?;
     }
     Ok(true)
+}
+
+/// Every argument read as a flat column of doubles with its validity, or `None` when one of them
+/// is not one, for the states [`General::takes_reals`] says yes to. At most two, which is the most
+/// any of those takes.
+fn reals(args: &[Vector], rows: usize) -> Option<Vec<(&[f64], &Validity)>> {
+    if args.len() > 2 {
+        return None;
+    }
+    args.iter()
+        .map(|input| match Column::of(input, rows)? {
+            Column::Reals(reals) => Some((reals, input.validity())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The second argument of an `arg_min` or `arg_max` call read as a typed column, with its validity,
@@ -4324,6 +4375,71 @@ mod tests {
         // A LogicalType can own a nested schema. Keeping one in every aggregate state cost more
         // than a hundred MiB on ClickBench q33 before the return was narrowed to Return.
         assert!(size_of::<Accumulator>() <= 32, "{} bytes", size_of::<Accumulator>());
+    }
+
+    /// A general state is boxed, and the box is as wide as the widest of them whatever it holds, so
+    /// the wide ones that are rarely grouped on keep their own box inside it. At 224 bytes every
+    /// grouped `corr` and `list` paid for the `lttb` plot it did not have.
+    #[test]
+    fn a_general_state_is_not_as_wide_as_the_widest_rare_one() {
+        assert!(size_of::<General>() <= 96, "{} bytes", size_of::<General>());
+    }
+
+    /// The pair and moment statistics folded a column of doubles at a time, grouped and not, reach
+    /// the bits the row at a time loop reaches.
+    #[test]
+    fn the_pair_and_moment_statistics_fold_a_column_the_way_they_fold_a_row() {
+        let mut rng = Rng(0x5eed_ca11_ab1e_0a1b);
+        let groups = 7;
+        let rows = 161;
+        let calls: [(&str, usize); 6] = [
+            ("corr", 2),
+            ("covar_pop", 2),
+            ("regr_slope", 2),
+            ("regr_r2", 2),
+            ("skewness", 1),
+            ("kurtosis", 1),
+        ];
+        for (name, arity) in calls {
+            let returns = LogicalType::Double;
+            for nulls in [0_usize, 4, 1] {
+                let note = format!("{name}, one null in {nulls}");
+                let columns: Vec<Vector> = (0..arity)
+                    .map(|at| flat(&LogicalType::Double, rows, nulls + at * 3, &mut rng))
+                    .collect();
+                let args = |row: usize| -> Vec<Value> {
+                    columns.iter().map(|column| column.value_at(row)).collect()
+                };
+                let mut slow = Accumulator::new(name, &returns).expect("known");
+                for row in 0..rows {
+                    slow.update(&args(row)).expect("folds");
+                }
+                let mut fast = Accumulator::new(name, &returns).expect("known");
+                fast.update_run(&columns, rows).expect("folds");
+                assert_eq!(slow.finish().expect("finishes"), fast.finish().expect("finishes"));
+                let slots = deal(rows, groups);
+                let mut by_row: Vec<Accumulator> =
+                    (0..groups).map(|_| Accumulator::new(name, &returns).expect("known")).collect();
+                for (row, &slot) in slots.iter().enumerate() {
+                    if slot != NOWHERE {
+                        by_row[slot].update(&args(row)).expect("folds");
+                    }
+                }
+                let mut by_column: Vec<Accumulator> = (0..groups * STRIDE)
+                    .map(|_| Accumulator::new(name, &returns).expect("known"))
+                    .collect();
+                let took = update_general(&mut by_column, &slots, STRIDE, OFFSET, &columns, rows)
+                    .expect("folds");
+                assert!(took, "{note}");
+                for group in 0..groups {
+                    assert_eq!(
+                        by_row[group].finish().expect("finishes"),
+                        by_column[group * STRIDE + OFFSET].finish().expect("finishes"),
+                        "{note}, group {group}"
+                    );
+                }
+            }
+        }
     }
 
     /// A run's total split into two sums is the total an `i128` gives, at the ends of every width.
