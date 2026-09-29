@@ -44,6 +44,9 @@ pub struct Prepared {
     ast: Ast,
     names: Vec<String>,
     direct: Option<Direct>,
+    /// Whether the parameters are `1` to `n` and nothing else, so that `n` values by position are
+    /// exactly the values the statement wants, with nothing missing and nothing left over.
+    numbered: bool,
 }
 
 /// An `INSERT INTO t [(columns)] VALUES (row)` whose items are parameters or `NULL`, with nothing
@@ -102,10 +105,52 @@ impl Clone for Found {
 /// One item of a [`Direct`] row.
 #[derive(Debug, Clone)]
 pub(crate) enum Item {
-    /// A parameter, by its identifier.
-    Parameter(String),
+    /// A parameter, by its identifier, and by its place among values given by position when the
+    /// identifier is a number.
+    Parameter(String, Option<usize>),
     /// A `NULL` written into the statement.
     Null,
+}
+
+/// The values an execution was given, as a [`Direct`] insert reads them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Given<'a> {
+    /// Checked against the statement, by name.
+    Named(&'a Parameters),
+    /// By position, one for each of the parameters `1` to `n`.
+    Positional(&'a [Value]),
+}
+
+impl Given<'_> {
+    /// The value `item` stands for, or `None` for a parameter with no value.
+    pub(crate) fn value(self, item: &Item) -> Option<Value> {
+        match (item, self) {
+            (Item::Null, _) => Some(Value::Null),
+            (Item::Parameter(name, _), Given::Named(parameters)) => parameters.get(name).cloned(),
+            (Item::Parameter(_, at), Given::Positional(values)) => values.get((*at)?).cloned(),
+        }
+    }
+}
+
+/// The place of a parameter named by a number among values given by position, counting from zero.
+///
+/// Only a number written the way [`Parameters::positional`] writes one, so that `$01` is left to
+/// the lookup by name, which does not take it for `1`.
+fn numbered(name: &str) -> Option<usize> {
+    let number: usize = name.parse().ok()?;
+    (number >= 1 && number.to_string() == name).then(|| number - 1)
+}
+
+/// Whether `names` are `1` to `n` in some order, each once.
+fn numbered_one_to_n(names: &[String]) -> bool {
+    let mut seen = vec![false; names.len()];
+    names.iter().all(|name| match numbered(name) {
+        Some(at) if at < seen.len() && !seen[at] => {
+            seen[at] = true;
+            true
+        }
+        _ => false,
+    })
 }
 
 impl Direct {
@@ -130,7 +175,10 @@ impl Direct {
             .expr_list(*row)
             .iter()
             .map(|&expr| match ast.expr(expr) {
-                ast::Expr::Parameter { name } => Some(Item::Parameter(ast.string(name).to_owned())),
+                ast::Expr::Parameter { name } => {
+                    let name = ast.string(name);
+                    Some(Item::Parameter(name.to_owned(), numbered(name)))
+                }
                 ast::Expr::Literal { kind: ast::LiteralKind::Null, .. } => Some(Item::Null),
                 _ => None,
             })
@@ -149,9 +197,10 @@ impl Prepared {
     pub(crate) fn new(shared: Shared, sql: &str) -> Result<Self> {
         let session = shared.session();
         let ast = parse_ast_with_case(sql, session.semantics().identifier_case())?;
-        let names = ast.parameters().into_iter().map(str::to_string).collect();
+        let names: Vec<String> = ast.parameters().into_iter().map(str::to_string).collect();
         let direct = Direct::of(&ast);
-        Ok(Self { shared, sql: sql.to_string(), ast, names, direct })
+        let numbered = numbered_one_to_n(&names);
+        Ok(Self { shared, sql: sql.to_string(), ast, names, direct, numbered })
     }
 
     /// The statement as it was written.
@@ -176,6 +225,16 @@ impl Prepared {
     /// If a parameter was given no value, if a value was given for a parameter the statement does
     /// not use, or anything binding and running the statement reports.
     pub fn execute(&self, values: &[Value]) -> Result<QueryResult> {
+        // The trickle insert, which has the values it wants and nothing else, reads them where they
+        // are rather than copying them into parameters to look them up by name again.
+        if self.numbered
+            && values.len() == self.names.len()
+            && let Some(direct) = &self.direct
+            && let Some(done) =
+                self.shared.insert_direct(direct, Given::Positional(values), &self.sql)
+        {
+            return done.map_err(|error| self.shared.process_error(error));
+        }
         self.run(Parameters::positional(values.to_vec()))
     }
 
@@ -210,7 +269,8 @@ impl Prepared {
     fn run(&self, parameters: Parameters) -> Result<QueryResult> {
         let result = self.check(&parameters).and_then(|()| {
             if let Some(direct) = &self.direct
-                && let Some(done) = self.shared.insert_direct(direct, &parameters, &self.sql)
+                && let Some(done) =
+                    self.shared.insert_direct(direct, Given::Named(&parameters), &self.sql)
             {
                 return done;
             }
@@ -258,7 +318,7 @@ mod tests {
     use rudb_bind::Parameters;
     use rudb_common::Value;
 
-    use super::Direct;
+    use super::{Direct, Given};
     use crate::Database;
 
     /// The tests in `tests/direct_insert.rs` check that the short way lands what the plan lands,
@@ -272,9 +332,12 @@ mod tests {
         let direct = prepared.direct.as_ref().expect("the shape is recognised");
         let values = vec![Value::BigInt(1), Value::Varchar("a".into()), Value::Integer(2)];
         let taken =
-            prepared.shared.insert_direct(direct, &Parameters::positional(values), prepared.sql());
+            prepared.shared.insert_direct(direct, Given::Positional(&values), prepared.sql());
         assert_eq!(taken.expect("taken").expect("runs").value_at(0, 0), Value::BigInt(1));
-        assert_eq!(db.table_len("t").expect("counts"), 1);
+        let named = Parameters::positional(values);
+        let taken = prepared.shared.insert_direct(direct, Given::Named(&named), prepared.sql());
+        assert_eq!(taken.expect("taken").expect("runs").value_at(0, 0), Value::BigInt(1));
+        assert_eq!(db.table_len("t").expect("counts"), 2);
 
         for sql in [
             "INSERT INTO t VALUES (?, ?, ?, ?) RETURNING id",
