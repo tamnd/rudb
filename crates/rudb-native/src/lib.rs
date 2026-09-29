@@ -55,6 +55,7 @@ use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below};
 
 mod anchor;
+pub mod codes;
 mod distinct;
 pub mod grams;
 pub mod graph;
@@ -4380,6 +4381,9 @@ pub struct Reader {
     /// Each coded text column's [`postings`] section, read the first time a filter asks about the
     /// column, and `None` when the table carries none for it.
     value_rows: Arc<Vec<OnceLock<Option<Arc<postings::ValueRows>>>>>,
+    /// Each wide integer column's [`codes`] section, read the first time a query asks about the
+    /// column, and `None` when the table carries none for it.
+    value_codes: Arc<Vec<OnceLock<Option<Arc<codes::ValueCodes>>>>>,
     /// The row id of every part's first row, by table wide part number.
     firsts: Arc<Vec<usize>>,
     /// The key maps, links and adjacencies of this table, each decoded the first time a plan asks.
@@ -6587,6 +6591,7 @@ impl Reader {
             unreleased: Arc::new(unreleased),
             text_grams: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             value_rows: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
+            value_codes: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             firsts: Arc::new(firsts),
             graph: Arc::default(),
             size,
@@ -7585,6 +7590,15 @@ impl Reader {
         self.value_rows
             .get(column)?
             .get_or_init(|| postings::value_rows(self, column).map(Arc::new))
+            .clone()
+    }
+
+    /// The column's [`codes`] section, read once, or `None` when the table carries none.
+    #[must_use]
+    pub fn value_codes(&self, column: usize) -> Option<Arc<codes::ValueCodes>> {
+        self.value_codes
+            .get(column)?
+            .get_or_init(|| codes::value_codes(self, column).map(Arc::new))
             .clone()
     }
 

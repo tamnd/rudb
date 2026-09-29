@@ -422,6 +422,24 @@ impl Rows {
         Ok(Some((dictionary, rows)))
     }
 
+    /// How many distinct values of `counted` each value of `group` holds, every group with its
+    /// count and a null group as `None`, or `None` when the file carries no value codes for
+    /// `counted` or `group` is not a narrow signed integer. See `rudb_native::codes`.
+    ///
+    /// # Errors
+    ///
+    /// If a part cannot be read.
+    pub fn distinct_per_group(
+        &self,
+        group: usize,
+        counted: usize,
+    ) -> Result<Option<Vec<(Option<i64>, u64)>>> {
+        let Self::Native(reader) = self else { return Ok(None) };
+        let Some(codes) = reader.value_codes(counted) else { return Ok(None) };
+        let workers = std::thread::available_parallelism().map_or(1, usize::from).min(8);
+        rudb_native::codes::distinct_per_group(reader, group, &codes, workers)
+    }
+
     /// Query-specific pair leaders are not used, including in older native files.
     pub fn top_pair_frequencies(
         &self,

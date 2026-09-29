@@ -1061,6 +1061,72 @@ fn native_coded_counts(
     signed_coded_counts(&found, ty, first, bound, top)
 }
 
+/// `COUNT(DISTINCT x) GROUP BY g` over a whole table, counted from the value codes the file keeps
+/// for `x` rather than by hashing the pairs of the two. See `rudb_native::codes`.
+///
+/// The group is a signed integer narrow enough to index by, which `RegionID` is and which the
+/// native side checks, and the counted column is one the file coded, which `UserID` is. On
+/// ClickBench 9 that is a million pairs told apart by an array of the users' first regions.
+fn native_distinct_counts(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+) -> Result<Option<NativePairFrequencies>> {
+    let Some((table, index, columns)) = whole_table(plan, catalog, input)? else {
+        return Ok(None);
+    };
+    let ([key], [aggregate]) = (plan.expr_list(groups), plan.expr_list(aggregates)) else {
+        return Ok(None);
+    };
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
+        return Ok(None);
+    };
+    let [argument] = plan.expr_list(args) else { return Ok(None) };
+    if plan.string(name) != "count" || !distinct || filter.is_some() {
+        return Ok(None);
+    }
+    let signed = |expr: ExprRef| {
+        matches!(
+            plan.expr_type(expr),
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+        )
+    };
+    let (Expr::Column(group), Expr::Column(counted)) = (*plan.expr(*key), *plan.expr(*argument))
+    else {
+        return Ok(None);
+    };
+    if group.table != index || counted.table != index || !signed(*key) || !signed(*argument) {
+        return Ok(None);
+    }
+    let fields = plan.field_list(columns);
+    let stored = |binding: ColumnBinding| {
+        fields.get(binding.column as usize).and_then(|field| table.column_index(&field.name))
+    };
+    let (Some(group_column), Some(counted_column)) = (stored(group), stored(counted)) else {
+        return Ok(None);
+    };
+    let Some(counts) = table.rows().distinct_per_group(group_column, counted_column)? else {
+        return Ok(None);
+    };
+    let ty = plan.expr_type(*key);
+    let entries = counts
+        .into_iter()
+        .map(|(value, count)| {
+            let value = match value {
+                Some(value) => signed_value(ty, i128::from(value))?,
+                None => Value::Null,
+            };
+            Ok((vec![value], count))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(NativePairFrequencies { entries }))
+}
+
 /// Whether `expr` is the column `binding` names.
 fn is_binding(plan: &Plan, expr: ExprRef, binding: ColumnBinding) -> bool {
     matches!(*plan.expr(expr), Expr::Column(held) if held == binding)
@@ -2704,6 +2770,19 @@ impl<'a> Building<'a, '_> {
             return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
         }
         if bound.max_groups.is_none() && bound.having_count.is_none() {
+            if let Some(frequencies) =
+                native_distinct_counts(self.plan, self.catalog, input, groups, aggregates)?
+            {
+                let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
+                let counters = self.watch(
+                    reference,
+                    id,
+                    pipeline,
+                    "Aggregate",
+                    Some("native distinct counts"),
+                );
+                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+            }
             let top = bound.top_counts.map(|(bound, _)| bound);
             if let Some(top) = top
                 && let Some(frequencies) = native_value_frequencies(

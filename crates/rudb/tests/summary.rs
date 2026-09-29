@@ -766,3 +766,25 @@ fn a_two_key_top_count_with_no_skew_reads_the_rows() {
     pair.file.query(query).expect("the file answers");
     assert!(!coded(&pair.file, query), "a boundary that ties the bound was called proven");
 }
+
+/// ClickBench's q9 counts the distinct users of each region. The file codes a wide integer column
+/// at checkpoint, so the pairs of region and user are told apart by the users' codes rather than by
+/// hashing them, and the answer still has to be the one memory gives, the null region and the
+/// users that are null included.
+#[test]
+fn a_distinct_count_by_a_small_key_is_counted_from_the_codes_of_a_wide_column() {
+    let rows = "SELECT CASE WHEN i % 101 = 0 THEN NULL ELSE i % 37 END AS r, \
+         CASE WHEN i % 89 = 0 THEN NULL ELSE (i * 7919) % 150000 * 1000003 - 5000000000 END AS u \
+         FROM range(200000) t(i)";
+    let pair = Pair::new("codedusers", rows);
+    let query = "SELECT r, COUNT(DISTINCT u) AS c FROM t GROUP BY r ORDER BY c DESC, r LIMIT 10";
+    let found = pair.listing(query);
+    assert_eq!(found.len(), 10, "the limit is the answer's length");
+    assert!(
+        pair.answered(&pair.file, query, "native distinct counts"),
+        "the users were counted from their codes"
+    );
+    let every = "SELECT r, COUNT(DISTINCT u) AS c FROM t GROUP BY r ORDER BY r NULLS FIRST";
+    assert_eq!(pair.listing(every).len(), 38, "every region and the null one");
+    assert!(pair.answered(&pair.file, every, "native distinct counts"));
+}
