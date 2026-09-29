@@ -11,8 +11,8 @@
 //! With a code per row the pairs are found without a hash. A user belongs to one region in nearly
 //! every row that holds it, so an array with a slot per code, holding the first group seen for it,
 //! tells a new pair from a repeat with one load, and only the few users seen in a second group go
-//! anywhere else. The array for a million users is four megabytes, and split by code range across
-//! the threads each share of it sits in the thread's own cache.
+//! anywhere else. The array for a million users is four megabytes, shared by the threads, and a
+//! repeat is a load that finds its own group already there.
 //!
 //! Built at checkpoint for every signed integer column of a table of at least [`FEWEST_ROWS`] rows
 //! whose exact distinct count is at least [`FEWEST_VALUES`] and is below the table's rows, out of its
@@ -23,7 +23,9 @@
 
 use std::ops::Range;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as Atomic};
 
+use rudb_common::bounds::Bound;
 use rudb_common::{LogicalType, Result};
 
 use crate::graph::BUDGET_FLOOR;
@@ -333,12 +335,12 @@ fn wide_columns(reader: &Reader) -> impl Iterator<Item = usize> + '_ {
 /// Every group comes out, including one whose counted values are all null and so count zero. A
 /// null group comes out as `None`.
 ///
-/// Three passes, the first two over the parts split among `workers` threads and the last over the
-/// codes split among them. The first reads the group column. The second puts each row's code and
-/// group into the share of the codes it belongs to. The third keeps the first group each code was
-/// seen with in an array indexed by the code, which tells a new pair from a repeat with one load,
-/// and puts a code seen with a second group aside, to be told apart once the share is done by
-/// sorting the few there are.
+/// One pass over the parts split among `workers` threads. A group is a slot, its distance from the
+/// lowest value the stripes record plus one, so no worker waits on another to learn the range. The
+/// threads share one array indexed by the code, holding the first slot each code was seen with, and
+/// the one that fills a code's place counts the pair. A thread that finds the place taken by another
+/// slot puts its pair aside, and the pairs put aside are sorted and told apart once every part is
+/// done. A user belongs to one region in nearly every row that holds it, so there are few of them.
 ///
 /// # Errors
 ///
@@ -353,12 +355,8 @@ pub fn distinct_per_group(
     if counted.rows() != rows {
         return Ok(None);
     }
+    let Some((low, slots)) = group_slots(reader, group) else { return Ok(None) };
     let parts = reader.parts();
-    let workers = workers.clamp(1, parts.max(1));
-    let each = parts.div_ceil(workers).max(1);
-    let spans = (0..workers)
-        .map(|worker| (worker * each).min(parts)..((worker + 1) * each).min(parts))
-        .collect::<Vec<_>>();
     let mut starts = Vec::with_capacity(parts + 1);
     let mut first = 0;
     for part in 0..parts {
@@ -370,130 +368,88 @@ pub fn distinct_per_group(
         return Ok(None);
     }
     let starts = &starts;
-
-    // The group column, a worker's parts at a time, with the rows whose group is null marked.
-    let read = std::thread::scope(|scope| {
-        let handles = spans
-            .iter()
-            .map(|span| {
-                let span = span.clone();
-                scope.spawn(move || read_groups(reader, group, span))
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().map_err(|_| invalid("a group read worker panicked"))?)
-            .collect::<Result<Vec<_>>>()
-    })?;
-    let mut groups = Vec::with_capacity(read.len());
-    for one in read {
-        let Some(one) = one else { return Ok(None) };
-        groups.push(one);
-    }
-    let low = groups.iter().filter_map(|one| one.low).min();
-    let high = groups.iter().filter_map(|one| one.high).max();
-    // Slot zero is the null group and a value sits at its distance from the lowest plus one.
-    let slots = match (low, high) {
-        (Some(low), Some(high)) => {
-            let span = i128::from(high) - i128::from(low) + 2;
-            if span > i128::from(MOST_GROUP_SLOTS) {
-                return Ok(None);
-            }
-            span as usize
-        }
-        _ => 1,
-    };
-    let low = low.unwrap_or(0);
-
-    // Each row's code and group, into the share of the codes that owns it.
-    let shares = workers;
-    let null = counted.null();
-    let per_share = (null as usize).div_ceil(shares).max(1);
-    let scattered = std::thread::scope(|scope| {
-        let handles = spans
-            .iter()
-            .zip(&groups)
-            .map(|(span, read)| {
-                let span = span.clone();
+    let workers = workers.clamp(1, parts.max(1));
+    let next = AtomicUsize::new(0);
+    let next = &next;
+    // Zero is a code not seen yet and any other value is the slot it was first seen with plus one.
+    let firsts = (0..counted.null()).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+    let firsts = &firsts;
+    let done = std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
                 scope.spawn(move || {
-                    let rows = starts[span.start]..starts[span.end];
-                    let mut present = vec![false; slots];
-                    let mut out = vec![Vec::new(); shares];
-                    let mut codes = Vec::with_capacity(rows.len());
-                    counted.codes_into(rows, &mut codes);
-                    for (at, (&code, &value)) in codes.iter().zip(&read.values).enumerate() {
-                        let slot = if read.nulls.as_ref().is_some_and(|nulls| nulls[at]) {
-                            0
-                        } else {
-                            (value - low) as usize + 1
-                        };
-                        present[slot] = true;
-                        if code != null {
-                            out[code as usize / per_share]
-                                .push((u64::from(code) << 32) | slot as u64);
+                    let mut seen = Seen {
+                        present: vec![false; slots],
+                        counts: vec![0_u64; slots],
+                        again: Vec::new(),
+                    };
+                    let mut block = Vec::new();
+                    loop {
+                        let part = next.fetch_add(1, Atomic::Relaxed);
+                        if part >= parts {
+                            return Ok(Some(seen));
                         }
-                    }
-                    (present, out)
-                })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().map_err(|_| invalid("a code scatter worker panicked")))
-            .collect::<Result<Vec<_>>>()
-    })?;
-    drop(groups);
-    let mut present = vec![false; slots];
-    for (held, _) in &scattered {
-        for (slot, &here) in present.iter_mut().zip(held) {
-            *slot |= here;
-        }
-    }
-
-    // The pairs of each share of the codes, counted by the group each first turned up with.
-    let scattered = &scattered;
-    let counted_shares = std::thread::scope(|scope| {
-        let handles = (0..shares)
-            .map(|share| {
-                scope.spawn(move || {
-                    let from = share * per_share;
-                    let to = ((share + 1) * per_share).min(null as usize).max(from);
-                    let mut firsts = vec![u32::MAX; to - from];
-                    let mut counts = vec![0_u64; slots];
-                    let mut again = Vec::new();
-                    for (_, out) in scattered {
-                        for &pair in &out[share] {
-                            let code = (pair >> 32) as usize - from;
-                            let slot = pair as u32;
-                            let held = &mut firsts[code];
-                            if *held == u32::MAX {
-                                *held = slot;
-                                counts[slot as usize] += 1;
-                            } else if *held != slot {
-                                again.push(pair);
+                        let rows = starts[part]..starts[part + 1];
+                        let read = reader.read(part, &[group])?;
+                        let vector = read.column(0)?;
+                        if vector.len() != rows.len()
+                            || !vector.signed_block(&mut block)
+                            || block.len() < rows.len()
+                        {
+                            return Ok(None);
+                        }
+                        let has_nulls = vector.validity().has_nulls(rows.len());
+                        for (at, &value) in block[..rows.len()].iter().enumerate() {
+                            let slot = if has_nulls && vector.is_null_at(at) {
+                                0
+                            } else {
+                                match value
+                                    .checked_sub(low)
+                                    .and_then(|gap| usize::try_from(gap).ok())
+                                {
+                                    Some(gap) if gap + 1 < slots => gap + 1,
+                                    // A value outside the range the stripes record.
+                                    _ => return Ok(None),
+                                }
+                            };
+                            seen.present[slot] = true;
+                            let code = counted.code_at(rows.start + at);
+                            let Some(place) = firsts.get(code as usize) else { continue };
+                            let mark = slot as u32 + 1;
+                            match place.compare_exchange(0, mark, Atomic::Relaxed, Atomic::Relaxed)
+                            {
+                                Ok(_) => seen.counts[slot] += 1,
+                                Err(held) if held != mark => {
+                                    seen.again.push((u64::from(code) << 32) | slot as u64);
+                                }
+                                Err(_) => {}
                             }
                         }
                     }
-                    // A code seen with a group other than its first, once for each such group.
-                    again.sort_unstable();
-                    again.dedup();
-                    for pair in again {
-                        counts[pair as u32 as usize] += 1;
-                    }
-                    counts
                 })
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|handle| handle.join().map_err(|_| invalid("a code count worker panicked")))
+            .map(|handle| handle.join().map_err(|_| invalid("a distinct count worker panicked"))?)
             .collect::<Result<Vec<_>>>()
     })?;
+    let mut present = vec![false; slots];
     let mut counts = vec![0_u64; slots];
-    for share in counted_shares {
-        for (total, count) in counts.iter_mut().zip(share) {
-            *total += count;
+    let mut again = Vec::new();
+    for one in done {
+        let Some(one) = one else { return Ok(None) };
+        for (slot, (here, count)) in one.present.into_iter().zip(one.counts).enumerate() {
+            present[slot] |= here;
+            counts[slot] += count;
         }
+        again.extend(one.again);
+    }
+    // A code seen with a group other than its first, once for each such group.
+    again.sort_unstable();
+    again.dedup();
+    for pair in again {
+        counts[pair as u32 as usize] += 1;
     }
     let mut out = Vec::new();
     for (slot, (&here, &count)) in present.iter().zip(&counts).enumerate() {
@@ -507,51 +463,36 @@ pub fn distinct_per_group(
 }
 
 /// The widest range of group values [`distinct_per_group`] indexes, a million slots.
-const MOST_GROUP_SLOTS: u32 = 1 << 20;
+const MOST_GROUP_SLOTS: i128 = 1 << 20;
 
-/// One worker's rows of the group column.
-struct Groups {
-    values: Vec<i64>,
-    /// Which rows are null, only when some are.
-    nulls: Option<Vec<bool>>,
-    low: Option<i64>,
-    high: Option<i64>,
+/// What one worker of [`distinct_per_group`] saw.
+struct Seen {
+    /// Which slots turned up at all.
+    present: Vec<bool>,
+    /// The codes each slot was the first to be seen with.
+    counts: Vec<u64>,
+    /// A code and slot, for a code already seen with another slot.
+    again: Vec<u64>,
 }
 
-/// The group column over `parts`, or `None` when it is not read as signed integers.
-fn read_groups(reader: &Reader, group: usize, parts: Range<usize>) -> Result<Option<Groups>> {
-    let mut values = Vec::new();
-    let mut nulls: Option<Vec<bool>> = None;
-    let mut block = Vec::new();
-    let (mut low, mut high) = (None::<i64>, None::<i64>);
-    for part in parts {
-        let len = reader.part_rows(part);
-        let chunk = reader.read(part, &[group])?;
-        let vector = chunk.column(0)?;
-        if vector.len() != len || !vector.signed_block(&mut block) || block.len() < len {
-            return Ok(None);
+/// The lowest value of `group` over every stripe and the slots from the null one up to the highest,
+/// or `None` when a stripe records no integer range for it or the range is too wide to index.
+fn group_slots(reader: &Reader, group: usize) -> Option<(i64, usize)> {
+    let (mut low, mut high) = (None::<i128>, None::<i128>);
+    for stripe in reader.table().stripes() {
+        let range = stripe.zone().column(group)?;
+        if range.nulls == stripe.rows() {
+            continue;
         }
-        let before = values.len();
-        let has_nulls = vector.validity().has_nulls(len);
-        if has_nulls && nulls.is_none() {
-            nulls = Some(vec![false; before]);
-        }
-        for (at, &value) in block[..len].iter().enumerate() {
-            let null = has_nulls && vector.is_null_at(at);
-            if let Some(nulls) = &mut nulls {
-                nulls.push(null);
-            }
-            // A null row's value is whatever the vector left there, so it stays out of the range.
-            if null {
-                values.push(low.unwrap_or(0));
-                continue;
-            }
-            low = Some(low.map_or(value, |low| low.min(value)));
-            high = Some(high.map_or(value, |high| high.max(value)));
-            values.push(value);
-        }
+        let (Some(Bound::Int(from)), Some(Bound::Int(to))) = (&range.low, &range.high) else {
+            return None;
+        };
+        low = Some(low.map_or(*from, |low| low.min(*from)));
+        high = Some(high.map_or(*to, |high| high.max(*to)));
     }
-    Ok(Some(Groups { values, nulls, low, high }))
+    let (Some(low), Some(high)) = (low, high) else { return Some((0, 1)) };
+    let span = high - low + 2;
+    (span <= MOST_GROUP_SLOTS).then_some((i64::try_from(low).ok()?, span as usize))
 }
 
 #[cfg(test)]
