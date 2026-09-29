@@ -88,7 +88,7 @@ pub const TEXT_GRAMS: &[u8; 8] = b"RUDBTG1\0";
 /// [`crate::postings`]. Paid for out of its own share, so it is on neither budget list below.
 pub const VALUE_ROWS: &[u8; 8] = b"RUDBVR1\0";
 
-/// A dense code for every row of a wide integer column and the values the codes stand for, see
+/// The distinct values of a wide integer column in order and the rows of each, see
 /// [`crate::codes`]. Paid for out of its own share, so it is on neither budget list below.
 pub const VALUE_CODES: &[u8; 8] = b"RUDBVC1\0";
 

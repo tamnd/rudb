@@ -1,18 +1,17 @@
-//! A dense code for every row of a wide integer column, and the values the codes stand for.
+//! The distinct values of a wide integer column in order, each with the rows that hold it.
 //!
-//! A text column held in a table wide dictionary already has this: a code per row that is a small
-//! number, so anything that has to tell its values apart can index an array with it instead of
-//! hashing the value. A wide integer column has nothing of the kind. `UserID` in ClickBench has a
-//! value per ten rows and every one of them is a scattered sixty four bit number, so `COUNT(DISTINCT
-//! UserID) GROUP BY RegionID` has to hash about a million pairs of region and user to throw the
-//! repeats away, and on six threads that was two thirds of a query DuckDB runs in thirty
-//! milliseconds.
+//! A text column held in a table wide dictionary already has a small number per value, so anything
+//! that has to tell its values apart can index an array with it instead of hashing the value. A
+//! wide integer column has nothing of the kind. `UserID` in ClickBench has a value per ten rows and
+//! every one of them is a scattered sixty four bit number, so `COUNT(DISTINCT UserID) GROUP BY
+//! RegionID` has to hash about a million pairs of region and user to throw the repeats away, and on
+//! six threads that was two thirds of a query DuckDB runs in thirty milliseconds.
 //!
-//! With a code per row the pairs are found without a hash. A user belongs to one region in nearly
-//! every row that holds it, so an array with a slot per code, holding the first group seen for it,
-//! tells a new pair from a repeat with one load, and only the few users seen in a second group go
-//! anywhere else. The array for a million users is four megabytes, shared by the threads, and a
-//! repeat is a load that finds its own group already there.
+//! With the rows of each value at hand the pairs are found without a hash. A value's place in the
+//! order is its code, and the threads split the codes between them, so no two ever look at the
+//! same user. A user belongs to one region in nearly every row that holds it, so a user's rows
+//! mostly share one region and count once with a compare apiece, and only the few seen in a second
+//! region are sorted to be told apart.
 //!
 //! Built at checkpoint for every signed integer column of a table of at least [`FEWEST_ROWS`] rows
 //! whose exact distinct count is at least [`FEWEST_VALUES`] and is below the table's rows, out of its
@@ -23,7 +22,6 @@
 
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as Atomic};
 
 use rudb_common::bounds::Bound;
 use rudb_common::{LogicalType, Result};
@@ -33,7 +31,7 @@ use crate::section::{self, Attachment};
 use crate::{Catalog, Reader, invalid};
 
 /// The share of a table's stored column bytes its value codes may cost together.
-pub const VALUE_CODES_SHARE: u64 = 25;
+pub const VALUE_CODES_SHARE: u64 = 50;
 
 /// Tables with fewer rows than this are not given value codes, since hashing every row of them costs
 /// less than a millisecond.
@@ -139,16 +137,14 @@ pub fn build_value_codes_within(path: &Path, table: &str, share: u64) -> Result<
 /// turned out to hold a value per row after all.
 ///
 /// The layout, all little endian: the table's rows as a `u64`, the count `d` of distinct values as
-/// a `u32`, the width `w` of a code in bits as a `u32`, then the `d` values in ascending order as
-/// `i64`, then the codes as a run of `u64` words, the code of row `r` in bits `r * w` up to
-/// `r * w + w` counted from the low bit of the first word, with one word more than the codes need.
-/// A null is the code `d`, which is why `w` has room for one more than the values.
+/// a `u32` and a zero `u32`, then the `d` values in ascending order as `i64`, then `d + 1` starts
+/// as `u32`, then the rows that are not null as `u32`, those holding the value coded `c` from start
+/// `c` up to start `c + 1` in ascending order.
 fn encode(reader: &Reader, column: usize) -> Result<Option<(usize, Vec<u8>)>> {
     let rows = reader.table().rows();
     let rows_u32 = u32::try_from(rows).map_err(|_| invalid("a table too long for value codes"))?;
-    // Every value beside its row, sorted by value, so that a run of equal values is one code and the
-    // codes come out in the order of the values. Sixteen bytes a row, which a checkpoint can afford
-    // and which is paid once.
+    // Every value beside its row, sorted by value and then row, which is the order the rows are
+    // kept in. Twelve bytes a row, which a checkpoint can afford and which is paid once.
     let mut held: Vec<(i64, u32)> = Vec::with_capacity(rows);
     let mut block = Vec::new();
     let mut first = 0_u32;
@@ -172,57 +168,32 @@ fn encode(reader: &Reader, column: usize) -> Result<Option<(usize, Vec<u8>)>> {
     }
     held.sort_unstable();
     let mut values = Vec::new();
-    let mut codes = vec![0_u32; rows];
-    for &(value, row) in &held {
+    let mut starts = Vec::new();
+    for (at, &(value, _)) in held.iter().enumerate() {
         if values.last() != Some(&value) {
             values.push(value);
+            starts.push(at as u32);
         }
-        codes[row as usize] = (values.len() - 1) as u32;
     }
     if values.len() >= held.len() {
         return Ok(None);
     }
-    let null = u32::try_from(values.len()).map_err(|_| invalid("too many values to code"))?;
-    // The rows that were not pushed are the nulls, and their code is the one past the values.
-    let mut coded = vec![false; rows];
-    for &(_, row) in &held {
-        coded[row as usize] = true;
-    }
-    drop(held);
-    for (code, coded) in codes.iter_mut().zip(coded) {
-        if !coded {
-            *code = null;
-        }
-    }
-    let width = u32::BITS - null.leading_zeros();
-    let width = width.max(1);
-    let words = packed_words(rows, width);
-    let mut packed = vec![0_u64; words];
-    for (row, &code) in codes.iter().enumerate() {
-        let bit = row * width as usize;
-        let (word, shift) = (bit / 64, bit % 64);
-        packed[word] |= u64::from(code) << shift;
-        if shift + width as usize > 64 {
-            packed[word + 1] |= u64::from(code) >> (64 - shift);
-        }
-    }
-    let mut bytes = Vec::with_capacity(16 + values.len() * 8 + words * 8);
+    starts.push(held.len() as u32);
+    let count = u32::try_from(values.len()).map_err(|_| invalid("too many values to code"))?;
+    let mut bytes = Vec::with_capacity(16 + values.len() * 12 + 4 + held.len() * 4);
     bytes.extend_from_slice(&(rows as u64).to_le_bytes());
-    bytes.extend_from_slice(&null.to_le_bytes());
-    bytes.extend_from_slice(&width.to_le_bytes());
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
     for value in &values {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    for word in &packed {
-        bytes.extend_from_slice(&word.to_le_bytes());
+    for start in &starts {
+        bytes.extend_from_slice(&start.to_le_bytes());
+    }
+    for &(_, row) in &held {
+        bytes.extend_from_slice(&row.to_le_bytes());
     }
     Ok(Some((values.len(), bytes)))
-}
-
-/// How many words hold `rows` codes of `width` bits, with the one more the reader may load past
-/// the last code.
-fn packed_words(rows: usize, width: u32) -> usize {
-    (rows * width as usize).div_ceil(64) + 1
 }
 
 /// One column's value codes, as read out of the file.
@@ -230,37 +201,44 @@ fn packed_words(rows: usize, width: u32) -> usize {
 pub struct ValueCodes {
     rows: usize,
     values: Vec<i64>,
-    width: u32,
-    packed: Vec<u64>,
+    starts: Vec<u32>,
+    held: Vec<u32>,
 }
 
 impl ValueCodes {
     fn parse(bytes: &[u8]) -> Option<Self> {
-        let word = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
         let long = |at: usize| Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
         let rows = usize::try_from(long(0)?).ok()?;
-        let count = word(8)? as usize;
-        let width = word(12)?;
-        if width == 0 || width > 32 || u64::from(u32::try_from(count).ok()?) >> width != 0 {
+        let count = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
+        let starts_at = 16_usize.checked_add(count.checked_mul(8)?)?;
+        let held_at = starts_at.checked_add(count.checked_add(1)?.checked_mul(4)?)?;
+        let values = bytes
+            .get(16..starts_at)?
+            .chunks_exact(8)
+            .map(|one| i64::from_le_bytes(one.try_into().expect("eight bytes")))
+            .collect::<Vec<_>>();
+        let words = |from: &[u8]| {
+            from.chunks_exact(4)
+                .map(|one| u32::from_le_bytes(one.try_into().expect("four bytes")))
+                .collect::<Vec<_>>()
+        };
+        let starts = words(bytes.get(starts_at..held_at)?);
+        let held = words(bytes.get(held_at..)?);
+        let in_order = |run: &[u32]| run.windows(2).all(|pair| pair[0] < pair[1]);
+        if bytes.len() - held_at != held.len() * 4
+            || starts.first() != Some(&0)
+            || starts.last().map(|&last| last as usize) != Some(held.len())
+            || held.len() > rows
+            || !in_order(&starts)
+            || values.windows(2).any(|pair| pair[0] >= pair[1])
+            || held.iter().any(|&row| row as usize >= rows)
+        {
             return None;
         }
-        let values_at = 16_usize;
-        let packed_at = values_at.checked_add(count.checked_mul(8)?)?;
-        let words = packed_words(rows, width);
-        if bytes.len() != packed_at.checked_add(words.checked_mul(8)?)? {
-            return None;
-        }
-        let values = (0..count)
-            .map(|at| long(values_at + at * 8).map(|value| value as i64))
-            .collect::<Option<Vec<_>>>()?;
-        if values.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return None;
-        }
-        let packed = (0..words).map(|at| long(packed_at + at * 8)).collect::<Option<Vec<_>>>()?;
-        Some(Self { rows, values, width, packed })
+        Some(Self { rows, values, starts, held })
     }
 
-    /// The table's rows, one code each.
+    /// The table's rows.
     #[must_use]
     pub fn rows(&self) -> usize {
         self.rows
@@ -272,26 +250,12 @@ impl ValueCodes {
         &self.values
     }
 
-    /// The code of a null, one past the last value.
-    #[must_use]
-    pub fn null(&self) -> u32 {
-        self.values.len() as u32
-    }
-
-    /// The code of one row, which the caller keeps below [`Self::rows`].
+    /// The rows holding the value coded `code`, in ascending order, for a code below the count of
+    /// [`Self::values`].
     #[inline]
     #[must_use]
-    pub fn code_at(&self, row: usize) -> u32 {
-        let bit = row * self.width as usize;
-        let (word, shift) = (bit / 64, (bit % 64) as u32);
-        // The words are padded by one, so the second load is always in the run.
-        let pair = u128::from(self.packed[word]) | (u128::from(self.packed[word + 1]) << 64);
-        ((pair >> shift) as u32) & (u32::MAX >> (32 - self.width))
-    }
-
-    /// The codes of the rows in `rows`, appended to `out`.
-    pub fn codes_into(&self, rows: Range<usize>, out: &mut Vec<u32>) {
-        out.extend(rows.map(|row| self.code_at(row)));
+    pub fn rows_of(&self, code: usize) -> &[u32] {
+        &self.held[self.starts[code] as usize..self.starts[code + 1] as usize]
     }
 }
 
@@ -335,12 +299,11 @@ fn wide_columns(reader: &Reader) -> impl Iterator<Item = usize> + '_ {
 /// Every group comes out, including one whose counted values are all null and so count zero. A
 /// null group comes out as `None`.
 ///
-/// One pass over the parts split among `workers` threads. A group is a slot, its distance from the
-/// lowest value the stripes record plus one, so no worker waits on another to learn the range. The
-/// threads share one array indexed by the code, holding the first slot each code was seen with, and
-/// the one that fills a code's place counts the pair. A thread that finds the place taken by another
-/// slot puts its pair aside, and the pairs put aside are sorted and told apart once every part is
-/// done. A user belongs to one region in nearly every row that holds it, so there are few of them.
+/// Two passes, each split among `workers` threads. The first reads the group column into a slot
+/// per row, the slot being the value's distance from the lowest the stripes record plus one, and
+/// zero for a null. The second goes over the codes, a range of them to each thread, and counts the
+/// slots of each code's rows once each. A user belongs to one region in nearly every row that
+/// holds it, so a code's rows mostly share one slot and are counted with a compare apiece.
 ///
 /// # Errors
 ///
@@ -367,89 +330,82 @@ pub fn distinct_per_group(
     if first != rows {
         return Ok(None);
     }
-    let starts = &starts;
-    let workers = workers.clamp(1, parts.max(1));
-    let next = AtomicUsize::new(0);
-    let next = &next;
-    // Zero is a code not seen yet and any other value is the slot it was first seen with plus one.
-    let firsts = (0..counted.null()).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
-    let firsts = &firsts;
-    let done = std::thread::scope(|scope| {
-        let handles = (0..workers)
-            .map(|_| {
+    let workers = workers.max(1);
+
+    // Every row's slot, each thread writing the rows of its own run of parts.
+    let each = parts.div_ceil(workers).max(1);
+    let mut of_row = vec![0_u32; rows];
+    let read = std::thread::scope(|scope| {
+        let mut rest = of_row.as_mut_slice();
+        let mut handles = Vec::with_capacity(workers);
+        for from in (0..parts).step_by(each) {
+            let span = from..(from + each).min(parts);
+            let (mine, after) = rest.split_at_mut(starts[span.end] - starts[span.start]);
+            rest = after;
+            let starts = &starts;
+            handles.push(
+                scope.spawn(move || read_slots(reader, group, span, starts, low, slots, mine)),
+            );
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().map_err(|_| invalid("a group read worker panicked"))?)
+            .collect::<Result<Vec<_>>>()
+    })?;
+    let mut present = vec![false; slots];
+    for one in read {
+        let Some(one) = one else { return Ok(None) };
+        for (slot, here) in present.iter_mut().zip(one) {
+            *slot |= here;
+        }
+    }
+
+    // Each code's distinct slots, the codes split among the threads.
+    let of_row = &of_row;
+    let codes = counted.values().len();
+    let each = codes.div_ceil(workers).max(1);
+    let counted_shares = std::thread::scope(|scope| {
+        let handles = (0..codes)
+            .step_by(each)
+            .map(|from| {
+                let span = from..(from + each).min(codes);
                 scope.spawn(move || {
-                    let mut seen = Seen {
-                        present: vec![false; slots],
-                        counts: vec![0_u64; slots],
-                        again: Vec::new(),
-                    };
-                    let mut block = Vec::new();
-                    loop {
-                        let part = next.fetch_add(1, Atomic::Relaxed);
-                        if part >= parts {
-                            return Ok(Some(seen));
-                        }
-                        let rows = starts[part]..starts[part + 1];
-                        let read = reader.read(part, &[group])?;
-                        let vector = read.column(0)?;
-                        if vector.len() != rows.len()
-                            || !vector.signed_block(&mut block)
-                            || block.len() < rows.len()
-                        {
-                            return Ok(None);
-                        }
-                        let has_nulls = vector.validity().has_nulls(rows.len());
-                        for (at, &value) in block[..rows.len()].iter().enumerate() {
-                            let slot = if has_nulls && vector.is_null_at(at) {
-                                0
-                            } else {
-                                match value
-                                    .checked_sub(low)
-                                    .and_then(|gap| usize::try_from(gap).ok())
-                                {
-                                    Some(gap) if gap + 1 < slots => gap + 1,
-                                    // A value outside the range the stripes record.
-                                    _ => return Ok(None),
-                                }
-                            };
-                            seen.present[slot] = true;
-                            let code = counted.code_at(rows.start + at);
-                            let Some(place) = firsts.get(code as usize) else { continue };
-                            let mark = slot as u32 + 1;
-                            match place.compare_exchange(0, mark, Atomic::Relaxed, Atomic::Relaxed)
-                            {
-                                Ok(_) => seen.counts[slot] += 1,
-                                Err(held) if held != mark => {
-                                    seen.again.push((u64::from(code) << 32) | slot as u64);
-                                }
-                                Err(_) => {}
+                    let mut counts = vec![0_u64; slots];
+                    let mut others = Vec::new();
+                    for code in span {
+                        let held = counted.rows_of(code);
+                        let Some((&head, tail)) = held.split_first() else { continue };
+                        let slot = of_row[head as usize];
+                        counts[slot as usize] += 1;
+                        for &row in tail {
+                            let other = of_row[row as usize];
+                            if other != slot {
+                                others.push(other);
                             }
                         }
+                        if !others.is_empty() {
+                            others.sort_unstable();
+                            others.dedup();
+                            for &other in &others {
+                                counts[other as usize] += 1;
+                            }
+                            others.clear();
+                        }
                     }
+                    counts
                 })
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|handle| handle.join().map_err(|_| invalid("a distinct count worker panicked"))?)
+            .map(|handle| handle.join().map_err(|_| invalid("a code count worker panicked")))
             .collect::<Result<Vec<_>>>()
     })?;
-    let mut present = vec![false; slots];
     let mut counts = vec![0_u64; slots];
-    let mut again = Vec::new();
-    for one in done {
-        let Some(one) = one else { return Ok(None) };
-        for (slot, (here, count)) in one.present.into_iter().zip(one.counts).enumerate() {
-            present[slot] |= here;
-            counts[slot] += count;
+    for share in counted_shares {
+        for (total, count) in counts.iter_mut().zip(share) {
+            *total += count;
         }
-        again.extend(one.again);
-    }
-    // A code seen with a group other than its first, once for each such group.
-    again.sort_unstable();
-    again.dedup();
-    for pair in again {
-        counts[pair as u32 as usize] += 1;
     }
     let mut out = Vec::new();
     for (slot, (&here, &count)) in present.iter().zip(&counts).enumerate() {
@@ -465,14 +421,43 @@ pub fn distinct_per_group(
 /// The widest range of group values [`distinct_per_group`] indexes, a million slots.
 const MOST_GROUP_SLOTS: i128 = 1 << 20;
 
-/// What one worker of [`distinct_per_group`] saw.
-struct Seen {
-    /// Which slots turned up at all.
-    present: Vec<bool>,
-    /// The codes each slot was the first to be seen with.
-    counts: Vec<u64>,
-    /// A code and slot, for a code already seen with another slot.
-    again: Vec<u64>,
+/// The slot of every row of `parts` of the group column into `out`, and which slots turned up, or
+/// `None` when the column is not read as signed integers or holds a value outside the range the
+/// stripes record.
+fn read_slots(
+    reader: &Reader,
+    group: usize,
+    parts: Range<usize>,
+    starts: &[usize],
+    low: i64,
+    slots: usize,
+    out: &mut [u32],
+) -> Result<Option<Vec<bool>>> {
+    let mut present = vec![false; slots];
+    let mut block = Vec::new();
+    let base = starts[parts.start];
+    for part in parts {
+        let len = starts[part + 1] - starts[part];
+        let read = reader.read(part, &[group])?;
+        let vector = read.column(0)?;
+        if vector.len() != len || !vector.signed_block(&mut block) || block.len() < len {
+            return Ok(None);
+        }
+        let has_nulls = vector.validity().has_nulls(len);
+        let out = &mut out[starts[part] - base..starts[part + 1] - base];
+        for (at, (&value, slot)) in block[..len].iter().zip(out).enumerate() {
+            *slot = if has_nulls && vector.is_null_at(at) {
+                0
+            } else {
+                match value.checked_sub(low).and_then(|gap| usize::try_from(gap).ok()) {
+                    Some(gap) if gap + 1 < slots => gap as u32 + 1,
+                    _ => return Ok(None),
+                }
+            };
+            present[*slot as usize] = true;
+        }
+    }
+    Ok(Some(present))
 }
 
 /// The lowest value of `group` over every stripe and the slots from the null one up to the highest,
@@ -563,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn a_code_stands_for_the_value_of_its_row() {
+    fn the_rows_of_a_code_are_the_rows_holding_its_value() {
         let (path, held) = table_of("codes", 300_000);
         // Two columns are too few for the codes of one to fit a quarter of them.
         let built = build_value_codes_within(&path, "hits", 1000).expect("build");
@@ -574,13 +559,14 @@ mod tests {
         let codes = value_codes(&reader, 1).expect("the section is in the file");
         let wanted = held.iter().filter_map(|(_, user)| *user).collect::<BTreeSet<_>>();
         assert_eq!(codes.values(), wanted.into_iter().collect::<Vec<_>>().as_slice());
-        for (row, (_, user)) in held.iter().enumerate() {
-            let code = codes.code_at(row);
-            match user {
-                Some(user) => assert_eq!(codes.values()[code as usize], *user, "row {row}"),
-                None => assert_eq!(code, codes.null(), "row {row}"),
+        let mut rows = 0;
+        for (code, value) in codes.values().iter().enumerate() {
+            for &row in codes.rows_of(code) {
+                assert_eq!(held[row as usize].1, Some(*value), "row {row}");
+                rows += 1;
             }
         }
+        assert_eq!(rows, held.iter().filter(|(_, user)| user.is_some()).count());
         fs::remove_file(&path).expect("clean up");
     }
 
