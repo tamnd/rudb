@@ -3595,7 +3595,8 @@ fn relation_column(plan: &Plan, input: NodeRef, column: u32) -> Option<ColumnBin
 /// not have to be in the query. A column that is its own table's unique key and has a key map needs
 /// no adjacency, because the map gives the rows themselves. `None` when the relation is not a
 /// stored table, the column carries neither, or the parent has no key map. See `Found::kept` for
-/// when the rows are read this way.
+/// when the rows are read this way, and `Exact::bare` for why a relation with no filter of its own
+/// is read this way more often.
 fn listing(
     plan: &Plan,
     catalog: &Catalog,
@@ -3609,6 +3610,7 @@ fn listing(
         return Some(Exact::own(child_rows.clone(), child_column));
     }
     let (parent, parent_column) = rudb_native::graph::adjacency_parent(child_rows, child_column)?;
+    let filtered = filters(plan, input);
     let mut name = child_table.name().clone();
     name.table = parent;
     let parent_rows = catalog.table(&name).ok()?.rows().stored()?;
@@ -3621,11 +3623,18 @@ fn listing(
         parent: name.table.clone(),
         parent_column,
     };
-    Some(Exact::stored(Stored {
+    let exact = Exact::stored(Stored {
         parent: parent_rows.clone(),
         column: parent_column,
         child: Some((child_rows.clone(), edge)),
-    }))
+    });
+    Some(if filtered { exact } else { exact.bare() })
+}
+
+/// Whether a filter stands anywhere between `node` and the scans under it.
+fn filters(plan: &Plan, node: NodeRef) -> bool {
+    matches!(plan.node(node), Node::Filter { .. })
+        || plan.node(node).children().into_iter().flatten().any(|child| filters(plan, child))
 }
 
 /// Whether the filter under an aggregate can mark the rows it keeps rather than cut them out.
