@@ -2465,9 +2465,9 @@ const LIKE_GROUP: usize = 1024;
 /// A group is only worth deciding whole where the chunk asking is a scan rather than what a
 /// selective filter left behind. A chunk of ten rows that happen to point at ten distant values has
 /// no use for the ten thousand values either side of them, so it decides the ten. The rule is the
-/// chunk holding at least a group's worth of rows, which is a guess about intent and not a fact
-/// about the query, and it is wrong in the cheap direction: deciding one value at a time is what
-/// this always did.
+/// chunk holding fewer rows than a group and its undecided values being spread thin over the
+/// groups they fall in, which is a guess about intent and not a fact about the query. Both ways
+/// read a block once for the call, so a wrong guess costs searches and never kept memory.
 ///
 /// Two threads can decide the same value or the same group at the same time. They walk the same
 /// values with the same pattern and reach the same answer, so the race is benign: the group write
@@ -2481,6 +2481,11 @@ struct StableLike {
     /// saying it matched, packed thirty two values to the word.
     state: Vec<AtomicU64>,
 }
+
+/// How much more than the values asked about a group walk may search before a sparse chunk decides
+/// only those values. A walk reads its values in order out of a block it decodes once and a visit
+/// sorts and looks each one up, so the walk gets some room.
+const SPARSE_LIKE: usize = 8;
 
 /// How many dictionary values one word of the memo holds, at two bits each.
 const MEMO_VALUES: usize = 32;
@@ -2523,31 +2528,15 @@ impl StableLike {
     /// the collision is rare, and what it costs when it happens is one block decoded twice rather
     /// than every block kept for the length of the query.
     ///
-    /// A chunk too small to be a scan walks the group too. It used to read the one value it asked
-    /// about, and on a filter that leaves a few rows a chunk that is every chunk of the query, so the
-    /// blocks it kept added up to 237 MB of ClickBench q22. Deciding the rest of the block costs a
-    /// search per value on bytes already decoded, and a later chunk asking about them finds them
-    /// decided.
+    /// A small chunk whose values crowd into few groups walks the group too. Small chunks used to
+    /// read the one value they asked about a value at a time, and on a filter that leaves a few
+    /// rows a chunk that is every chunk of the query, so the blocks they kept added up to 237 MB of
+    /// ClickBench q22. A small chunk spread thin goes to [`Self::decide_codes`] instead, which
+    /// reads a block once for the call the way this does.
     fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
         let first = code / LIKE_GROUP * LIKE_GROUP;
         let last = (first + LIKE_GROUP).min(self.dictionary.len());
-        if !like.fold_case
-            && let Pattern::Contains(finder) = &like.compiled
-            && finder.needle().len() >= 4
-            && !self.dictionary.text_block_might_contain(first, finder.needle())?
-        {
-            // A stored signature can only prove absence. Mark the whole group as decided,
-            // with the negated answer when this is NOT LIKE, without decoding its payload.
-            let word = if like.negated { u64::MAX } else { 0x5555_5555_5555_5555 };
-            for step in 0..(last - first).div_ceil(MEMO_VALUES) {
-                let remaining = (last - first - step * MEMO_VALUES).min(MEMO_VALUES);
-                let mask = if remaining == MEMO_VALUES {
-                    u64::MAX
-                } else {
-                    (1_u64 << (remaining * 2)) - 1
-                };
-                self.word(first / MEMO_VALUES + step)?.fetch_or(word & mask, Ordering::Release);
-            }
+        if self.ruled_out(first, last, like)? {
             return Ok(());
         }
         let mut bits = [0_u64; LIKE_GROUP / MEMO_VALUES];
@@ -2569,6 +2558,59 @@ impl StableLike {
             self.word(first / MEMO_VALUES + step)?.fetch_or(*word, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// Decides the values at `codes`, which rise and repeat nothing, and none of the values around
+    /// them.
+    ///
+    /// This is for a chunk that a selective read left behind, such as the rows of `name` a join has
+    /// already narrowed to 42 thousand of its 4 million. Their codes land about ten to a group, so
+    /// deciding each group whole searches a hundred values for every one asked about, which on JOB
+    /// 20b was 117 ms of a query whose other scans took 40. The values are read through
+    /// [`Vector::visit_text`], which decodes each block once for the call and leaves keeping it to
+    /// the source, so this does not bring back the per value reads that kept 237 MB of ClickBench
+    /// q22 alive. A group the stored signature rules out is still decided whole, since that costs
+    /// no decoding at all.
+    fn decide_codes(&self, codes: &[u32], like: &Like, characters: &mut Vec<char>) -> Result<()> {
+        let mut wanted = Vec::with_capacity(codes.len());
+        let mut at = 0;
+        while at < codes.len() {
+            let first = codes[at] as usize / LIKE_GROUP * LIKE_GROUP;
+            let upto =
+                at + codes[at..].partition_point(|&code| (code as usize) < first + LIKE_GROUP);
+            let last = (first + LIKE_GROUP).min(self.dictionary.len());
+            if !self.ruled_out(first, last, like)? {
+                wanted.extend_from_slice(&codes[at..upto]);
+            }
+            at = upto;
+        }
+        self.dictionary.visit_text(&wanted, &mut |at: usize, text: &[u8]| {
+            let held = like.holds_loan(text, characters)?;
+            let (index, shift) = Self::slot(wanted[at] as usize);
+            self.word(index)?.fetch_or((1 | u64::from(held) << 1) << shift, Ordering::Release);
+            Ok(())
+        })
+    }
+
+    /// Whether the stored signature proves no value from `first` to `last` holds the pattern, in
+    /// which case the whole group is marked decided with the answer that proof gives, which is the
+    /// negated one for `NOT LIKE`, without decoding its payload.
+    fn ruled_out(&self, first: usize, last: usize, like: &Like) -> Result<bool> {
+        let Pattern::Contains(finder) = &like.compiled else { return Ok(false) };
+        if like.fold_case
+            || finder.needle().len() < 4
+            || self.dictionary.text_block_might_contain(first, finder.needle())?
+        {
+            return Ok(false);
+        }
+        let word = if like.negated { u64::MAX } else { 0x5555_5555_5555_5555 };
+        for step in 0..(last - first).div_ceil(MEMO_VALUES) {
+            let remaining = (last - first - step * MEMO_VALUES).min(MEMO_VALUES);
+            let mask =
+                if remaining == MEMO_VALUES { u64::MAX } else { (1_u64 << (remaining * 2)) - 1 };
+            self.word(first / MEMO_VALUES + step)?.fetch_or(word & mask, Ordering::Release);
+        }
+        Ok(true)
     }
 
     /// The word of the memo at `index`.
@@ -2912,10 +2954,19 @@ fn like_stable(
     }
     let mut out = vec![false; rows];
     let mut characters = Vec::new();
+    // A chunk of fewer rows than a group is what a selective read left behind, so the rows it
+    // cannot answer yet wait until the loop is done, and then only their values are decided when
+    // they are spread too thin over their groups for a group walk to pay.
+    let sparse = rows < LIKE_GROUP;
+    let mut pending = Vec::new();
     let validity = over_valid(rows, base, |index| {
         let code = codes[index] as usize;
         out[index] = match cache.peek(code) {
             Some(held) => held,
+            None if sparse => {
+                pending.push(index);
+                return Ok(());
+            }
             None => {
                 cache.decide_group(code, like, &mut characters)?;
                 cache
@@ -2925,6 +2976,29 @@ fn like_stable(
         };
         Ok(())
     })?;
+    if !pending.is_empty() {
+        let mut wanted: Vec<u32> = pending.iter().map(|&index| codes[index]).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let groups = 1 + wanted
+            .windows(2)
+            .filter(|pair| pair[0] as usize / LIKE_GROUP != pair[1] as usize / LIKE_GROUP)
+            .count();
+        if wanted.len() * SPARSE_LIKE < groups * LIKE_GROUP {
+            cache.decide_codes(&wanted, like, &mut characters)?;
+        } else {
+            for &code in &wanted {
+                if cache.peek(code as usize).is_none() {
+                    cache.decide_group(code as usize, like, &mut characters)?;
+                }
+            }
+        }
+        for index in pending {
+            out[index] = cache
+                .peek(codes[index] as usize)
+                .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?;
+        }
+    }
     finish(returns, Data::Bool(out.into()), validity)
 }
 
@@ -4688,11 +4762,12 @@ mod tests {
     /// A stable dictionary `LIKE` answers the same whichever way the memo filled.
     ///
     /// The memo fills a whole group of `LIKE_GROUP` values where the chunk is big enough to be a
-    /// scan and fills the one value it was asked about where it is not, so the two have to agree
-    /// over the same dictionary, and a memo a scan filled has to answer for a chunk that comes after
-    /// it. The dictionary here is 2,500 values, which is two whole groups and a part of a third, and
-    /// the codes step by a prime so a chunk lands in every group without repeating a code in order.
-    /// The big chunk runs first so the small one reads decisions it did not make.
+    /// scan and fills only the values it was asked about where it is small and spread thin, so the
+    /// two have to agree over the same dictionary, and each has to answer from a memo the other
+    /// partly filled. The dictionary here is 2,500 values, which is two whole groups and a part of a
+    /// third, and the codes step by a prime so a chunk lands in every group without repeating a code
+    /// in order. A small chunk runs first on an empty memo, the big one then walks groups around
+    /// what it decided, and a small one last reads decisions it did not make.
     #[test]
     fn a_stable_dictionary_like_agrees_whichever_way_the_memo_filled() {
         let values: Vec<Value> = (0..2_500)
@@ -4706,7 +4781,7 @@ mod tests {
         let dictionary =
             Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("builds"));
         let like = Like::of("~~", "%google%").expect("a literal pattern compiles");
-        for rows in [2_000_usize, 64] {
+        for rows in [64_usize, 2_000, 64] {
             let codes: Vec<u32> =
                 (0..rows).map(|row| ((row * 991) % values.len()) as u32).collect();
             let picked: Vec<Value> =

@@ -13,7 +13,16 @@
 //! rather than a detail: every relation comes after all of its children. That is what lets the
 //! first sweep happen while the relations are being scanned rather than after, since by the time a
 //! relation's rows arrive the set of every child's keys is already built, and a row with no partner
-//! in one of them is dropped before it is stored anywhere. A root is last in its tree.
+//! in one of them is dropped before it is stored anywhere.
+//!
+//! There is one exception. A relation with no children of its own whose parent is a root can come
+//! after that root, and is then said to trail it. It is read against the keys the root kept, and the
+//! root holds its rows until every relation trailing it has finished and says which of them have a
+//! partner. That pays where the trailing relation has a filter that is dear to test and the root
+//! narrows it to a few rows: in JOB 26a the pattern on the names of `char_name` tested all three
+//! million of them to keep six percent, while `cast_info`, narrowed by the movies, had 37,085 rows
+//! left and so at most that many roles to look up. Apart from the relations trailing it, a root is
+//! last in its tree.
 //!
 //! A plan can hold a forest rather than a tree, when the query joins groups of relations that
 //! share no class and so are only a cross product of each other. Each tree is reduced on its own,
@@ -109,10 +118,19 @@ impl Reducer {
     /// A root is reduced completely by the first sweep alone, since everything in its tree is
     /// under it, so its extremes and the keys it hands down are read off its rows as they are
     /// scanned. Every other relation the second sweep reaches has to keep its rows until its parent
-    /// has been reduced, and that is the memory this node spends.
+    /// has been reduced, and that is the memory this node spends. So does a root that relations
+    /// trail, since it is not reduced until they finish.
     #[must_use]
     pub fn held(&self, leaf: u32) -> bool {
-        self.leaves[leaf as usize].parent.is_some() && self.wanted(leaf)
+        (self.leaves[leaf as usize].parent.is_some() && self.wanted(leaf))
+            || self.children(leaf).any(|(child, _)| self.trailing(child))
+    }
+
+    /// Whether `leaf` is read after its parent, which only a relation with no children under a
+    /// root is. See the module documentation.
+    #[must_use]
+    pub fn trailing(&self, leaf: u32) -> bool {
+        self.leaves[leaf as usize].parent.is_some_and(|edge| edge.leaf < leaf)
     }
 
     /// Whether `leaf` is `ancestor` or somewhere under it.
@@ -129,8 +147,9 @@ impl Reducer {
 
     /// Checks the promises the executor relies on.
     ///
-    /// A parent after its child, a class that both ends of an edge hold a column of, a class number
-    /// that is in range and an extreme that names a relation there is. Each of these broken is a
+    /// A parent after its child unless the child trails a root, a class that both ends of an edge
+    /// hold a column of, a class number that is in range and an extreme that names a relation
+    /// there is. Each of these broken is a
     /// sweep that reads the wrong column or waits for a set that is built after it is needed, which
     /// is a wrong answer rather than an error, so it is checked where the plan is.
     ///
@@ -145,8 +164,14 @@ impl Reducer {
                 return fail("has a key in a class that is not there");
             }
             if let Some(edge) = leaf.parent {
-                if edge.leaf as usize <= at || edge.leaf as usize >= count {
-                    return fail("hangs under a relation that is not after it");
+                if edge.leaf as usize == at || edge.leaf as usize >= count {
+                    return fail("hangs under a relation that is not there");
+                }
+                if (edge.leaf as usize) < at
+                    && (self.leaves[edge.leaf as usize].parent.is_some()
+                        || self.children(position(at)).next().is_some())
+                {
+                    return fail("comes after its parent without trailing a root");
                 }
                 if self.key(position(at), edge.class).is_none()
                     || self.key(edge.leaf, edge.class).is_none()
@@ -218,6 +243,25 @@ mod tests {
         let mut reducer = line();
         assert!(reducer.validate().is_ok());
         reducer.leaves[2].parent = Some(Edge { leaf: 0, class: 0 });
+        assert!(reducer.validate().is_err());
+    }
+
+    #[test]
+    fn a_relation_can_trail_a_root_and_the_root_then_holds_its_rows() {
+        let mut reducer = line();
+        // `a` read after `b`, which is made the root.
+        reducer.leaves[1].parent = None;
+        reducer.leaves[2].parent = Some(Edge { leaf: 1, class: 1 });
+        reducer.leaves.swap(0, 2);
+        reducer.leaves[0].parent = Some(Edge { leaf: 1, class: 1 });
+        reducer.leaves[2].parent = Some(Edge { leaf: 1, class: 0 });
+        reducer.extremes = vec![Extreme { leaf: 2, column: 1, max: false }];
+        assert!(reducer.validate().is_ok());
+        assert!(reducer.trailing(2) && !reducer.trailing(0));
+        assert!(reducer.held(1), "the root waits for what trails it");
+        assert!(reducer.held(2), "and the extreme is read from a relation below it");
+        // One that trails a relation that is not a root is refused.
+        reducer.leaves[1].parent = Some(Edge { leaf: 0, class: 1 });
         assert!(reducer.validate().is_err());
     }
 

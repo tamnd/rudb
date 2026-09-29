@@ -423,7 +423,7 @@ fn rewrite(
         .collect();
     let weights = with_domains(weights);
     let order = match gyo(&edges, &weights) {
-        Ok(order) => order,
+        Ok(order) => trail(&edges, &weights, order),
         Err(reason) => return because(reason),
     };
 
@@ -1434,6 +1434,90 @@ fn steps(
     Some((found, waiting))
 }
 
+/// The order with the leaves of its root read after the root, where that costs less.
+///
+/// Ears come off children first, so the relations around the dearest one, which the order leaves
+/// for last, are all read before it but one. In JOB 26a that is `cast_info`, which the movies
+/// narrow to 37,085 rows, with `name` and `char_name` hanging off it. `name` has no filter and is
+/// the root, and `char_name` is read first with its pattern tested on all three million names to
+/// keep a sixth of the roles, where read after `cast_info` it would be looked up at a few thousand.
+/// A relation with no children whose parent is a root can trail the root in the executor, see
+/// `Reducer`, so this tries each such leaf after the root, and hands the root on first where the
+/// root is itself a leaf of one other relation, as `name` is of `cast_info`.
+///
+/// The root then holds the rows it keeps until the second sweep, which is charged at [`HOLD`] a
+/// row.
+#[expect(clippy::cast_precision_loss, reason = "a count of rows is a weight here")]
+fn trail(
+    edges: &[BTreeSet<u32>],
+    weights: &[Weight],
+    order: Vec<(usize, Option<usize>)>,
+) -> Vec<(usize, Option<usize>)> {
+    let Some(&(last, None)) = order.last() else { return order };
+    let children = |order: &[(usize, Option<usize>)], of: usize| {
+        order.iter().filter(|&&(_, parent)| parent == Some(of)).count()
+    };
+    let mut tried = order.clone();
+    let mut root = last;
+    if edges[last].len() == 1
+        && let [only] = order
+            .iter()
+            .filter(|&&(_, parent)| parent == Some(last))
+            .map(|&(child, _)| child)
+            .collect::<Vec<_>>()[..]
+    {
+        for (relation, parent) in &mut tried {
+            if *relation == only {
+                *parent = None;
+            } else if *relation == last {
+                *parent = Some(only);
+            }
+        }
+        root = only;
+    }
+    // What an order costs with the rows its root holds, when relations trail it.
+    let cost = |order: &[(usize, Option<usize>)]| {
+        let mut standing = Standing::new();
+        let mut total = 0.0;
+        for &(ear, _) in order {
+            total += weights[ear].cost(&standing, &edges[ear]);
+            if ear == root {
+                let kept = weights[ear].fed(&standing, &edges[ear]) * weights[ear].kept;
+                total += kept * weights[ear].rows as f64 * HOLD;
+            }
+            take(edges, weights, &mut standing, ear);
+        }
+        total
+    };
+    let mut best = priced(edges, weights, &order);
+    let mut moved = false;
+    loop {
+        let at = tried.iter().position(|&(relation, _)| relation == root).unwrap_or_default();
+        let mut cheapest: Option<(f64, Vec<(usize, Option<usize>)>)> = None;
+        for (slot, &(leaf, parent)) in tried[..at].iter().enumerate() {
+            if parent != Some(root) || edges[leaf].len() != 1 || children(&tried, leaf) > 0 {
+                continue;
+            }
+            let mut after = tried.clone();
+            let entry = after.remove(slot);
+            after.push(entry);
+            let total = cost(&after);
+            if total < best && cheapest.as_ref().is_none_or(|(least, _)| total < *least) {
+                cheapest = Some((total, after));
+            }
+        }
+        let Some((total, after)) = cheapest else { break };
+        best = total;
+        tried = after;
+        moved = true;
+    }
+    if moved { tried } else { order }
+}
+
+/// What holding a row of a root that relations trail costs, in the units of [`Weight::cost`]. A
+/// row is copied out of its chunk once and read once more in the second sweep.
+const HOLD: f64 = 2.0;
+
 /// What an order of ears costs, each priced with what the ones before it left standing.
 fn priced(edges: &[BTreeSet<u32>], weights: &[Weight], order: &[(usize, Option<usize>)]) -> f64 {
     let mut standing = Standing::new();
@@ -1611,7 +1695,7 @@ fn rebound(
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{ConsistentExtremes, DECODE, GATHER, Reach, Standing, Weight, gyo, take, widens};
+    use super::{ConsistentExtremes, DECODE, GATHER, Reach, Standing, Weight, gyo, take, trail, widens};
     use crate::pass::{Context, Pass};
     use rudb_common::LogicalType;
     use rudb_common::rules::{Rule, Rules};
@@ -1888,6 +1972,33 @@ mod tests {
         parents(&order);
         let taken: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
         assert_eq!(taken[..2], [0, 1], "{order:?}");
+    }
+
+    /// JOB 26a in small: `title` narrows `cast_info` to a sliver by the movies, `name` has no
+    /// filter and `char_name` has a pattern that keeps six percent of three million names. Read
+    /// first, `char_name` tests all of them, and read after `cast_info` it tests the few left.
+    #[test]
+    fn a_leaf_with_a_loose_filter_trails_the_root_that_narrows_it() {
+        let weights = vec![
+            weight(2_500_000, 1, 0.0005),
+            weight(36_000_000, 0, 1.0),
+            weight(4_000_000, 4, 1.0),
+            weight(3_000_000, 4, 0.06),
+        ];
+        let edges = edges(&[&[0], &[0, 1, 2], &[1], &[2]]);
+        let order = trail(&edges, &weights, gyo(&edges, &weights).expect("acyclic"));
+        let taken: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
+        let root = order.iter().position(|&(_, parent)| parent.is_none()).expect("a root");
+        assert_eq!(order[root].0, 1, "{order:?}");
+        assert!(taken[root + 1..].contains(&3), "{order:?}");
+        assert!(order[root + 1..].iter().all(|&(_, parent)| parent == Some(1)), "{order:?}");
+        // A leaf small enough to read whole costs less than holding the rows the root keeps.
+        let mut weights = weights;
+        weights[3] = weight(100, 4, 0.06);
+        let order = trail(&edges, &weights, gyo(&edges, &weights).expect("acyclic"));
+        let taken: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
+        let root = order.iter().position(|&(_, parent)| parent.is_none()).expect("a root");
+        assert!(taken[..root].contains(&3), "{order:?}");
     }
 
     /// JOB 21a in small: `link_type` keeps two common kinds of eighteen, so `movie_link` keeps half

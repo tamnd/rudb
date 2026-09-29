@@ -3469,7 +3469,8 @@ impl<'a> Building<'a, '_> {
                 // One pipeline per relation, children of the join tree first, each ending in the
                 // sink that runs the first sweep over it, and then this node as the source of the
                 // one row. Each relation's pipeline waits for its children's, because its sink
-                // reads the keys they kept. See `crate::consistent`.
+                // reads the keys they kept, or for its parent's where it trails it. See
+                // `crate::consistent`.
                 let tree = plan.reducer(reducer);
                 let fields = plan.field_list(columns).to_vec();
                 let types = fields.iter().map(|field| field.ty.clone()).collect();
@@ -3511,9 +3512,14 @@ impl<'a> Building<'a, '_> {
                     let below = self.node(leaf.input);
                     self.above.clear();
                     let mut below = below?;
-                    below
-                        .after
-                        .extend(tree.children(position).map(|(child, _)| filled[child as usize]));
+                    below.after.extend(
+                        tree.children(position)
+                            .filter(|&(child, _)| child < position)
+                            .map(|(child, _)| filled[child as usize]),
+                    );
+                    if let Some(edge) = leaf.parent.filter(|_| tree.trailing(position)) {
+                        below.after.push(filled[edge.leaf as usize]);
+                    }
                     // A scan also waits for every relation before it that hands it keys, so that
                     // it reads the whole set and not what was kept by the time it started. The
                     // planner puts the cheap relations first and the dear ones last for exactly

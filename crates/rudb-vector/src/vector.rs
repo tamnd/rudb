@@ -2506,6 +2506,32 @@ impl Vector {
         Ok(first + 1)
     }
 
+    /// Hands `body` the value at each of `indices` with its position in `indices`, in whatever
+    /// order the source reads them in.
+    ///
+    /// The scattered twin of [`Self::sweep_text`]: a file-backed string source with all-valid values
+    /// reads each block the indices land in once for the call, see [`TextSource::visit_at`], and
+    /// every other form reads a value at a time.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading a value raises, and whatever `body` raises.
+    pub fn visit_text(
+        &self,
+        indices: &[u32],
+        body: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        if let Body::ExternalText { source } = &self.body
+            && matches!(self.validity, Validity::AllValid)
+        {
+            return source.visit_at(indices, body);
+        }
+        for (at, &index) in indices.iter().enumerate() {
+            body(at, self.try_bytes_at(index as usize)?.unwrap_or_default())?;
+        }
+        Ok(())
+    }
+
     /// A conservative substring test for the payload block holding `first`.
     ///
     /// Only a file-backed string source with all-valid values can skip a whole block. Every other
