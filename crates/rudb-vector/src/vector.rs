@@ -2532,6 +2532,32 @@ impl Vector {
         Ok(())
     }
 
+    /// Hands `body` the values at `indices`, which rise, with their positions in `indices`, without
+    /// the source keeping what reading them decoded.
+    ///
+    /// For a caller that remembers what it made of each value, so that a block read for it is not
+    /// read for it again and keeping one would only hold memory. See [`TextSource::visit`]. Every
+    /// other form reads a value at a time.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading a value raises, and whatever `body` raises.
+    pub fn visit_text_once(
+        &self,
+        indices: &[usize],
+        body: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        if let Body::ExternalText { source } = &self.body
+            && matches!(self.validity, Validity::AllValid)
+        {
+            return source.visit(indices, body);
+        }
+        for (at, &index) in indices.iter().enumerate() {
+            body(at, self.try_bytes_at(index)?.unwrap_or_default())?;
+        }
+        Ok(())
+    }
+
     /// A conservative substring test for the payload block holding `first`.
     ///
     /// Only a file-backed string source with all-valid values can skip a whole block. Every other
