@@ -64,6 +64,9 @@ pub enum Value {
     Blob(Vec<u8>),
     /// `BIT`, in the layout [`crate::bit`] describes.
     Bit(Vec<u8>),
+    /// `UUID`, in the stored form [`crate::uuid`] describes, which is the pin's and orders the way
+    /// the text does.
+    Uuid(i128),
     /// `DATE`, days since 1970-01-01.
     Date(i32),
     /// `TIME`, microseconds since midnight.
@@ -227,6 +230,7 @@ impl Value {
             Self::Varchar(_) => LogicalType::Varchar,
             Self::Blob(_) => LogicalType::Blob,
             Self::Bit(_) => LogicalType::Bit,
+            Self::Uuid(_) => LogicalType::Uuid,
             Self::Date(_) => LogicalType::Date,
             Self::Time(_) => LogicalType::Time,
             Self::TimeTz(_) => LogicalType::TimeTz,
@@ -279,6 +283,7 @@ impl Value {
             | (Self::Varchar(_), T::Varchar)
             | (Self::Blob(_), T::Blob)
             | (Self::Bit(_), T::Bit)
+            | (Self::Uuid(_), T::Uuid)
             | (Self::Date(_), T::Date)
             | (Self::Time(_), T::Time)
             | (Self::TimeTz(_), T::TimeTz)
@@ -354,6 +359,7 @@ impl fmt::Display for Value {
             Self::Varchar(v) => f.write_str(v),
             Self::Blob(v) => write_blob(f, v),
             Self::Bit(v) => f.write_str(&crate::bit::to_text(v)),
+            Self::Uuid(v) => crate::uuid::write(f, *v),
             Self::Date(v) => write_date(f, *v),
             Self::Time(v) => write_time(f, *v),
             // The unzoned rendering and then the offset, which is what the pin prints and is

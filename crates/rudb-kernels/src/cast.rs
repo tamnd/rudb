@@ -39,7 +39,7 @@ use std::str::FromStr;
 
 use rudb_common::{
     Error, ErrorCode, Field, LogicalType, PhysicalType, Result, SessionTimeZone, Value, bit,
-    civil_from_days, days_from_civil,
+    civil_from_days, days_from_civil, uuid,
 };
 use rudb_vector::{Data, Form, Vector};
 
@@ -950,6 +950,9 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
     if let Value::Bit(bits) = value {
         return from_bit(bits, target);
     }
+    if let Value::Uuid(held) = value {
+        return from_uuid(*held, target);
+    }
     match target {
         LogicalType::Boolean => to_boolean(value),
         LogicalType::TinyInt
@@ -977,6 +980,7 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
             to_precise(value, target)
         }
         LogicalType::Interval => to_interval(value),
+        LogicalType::Uuid => to_uuid(value),
         // An enum value is its string, so a string that is one of the list is already the answer
         // and anything else that is not a string has no cast here, as it has none in the pin.
         LogicalType::Enum(labels) => match value {
@@ -1465,6 +1469,35 @@ fn to_blob(value: &Value) -> Result<Value> {
         at += 1;
     }
     Ok(Value::Blob(out))
+}
+
+/// A UUID out of its text, its sixteen bytes or the UHUGEINT they spell, which are the only three
+/// things the pin casts to one.
+///
+/// Both failures name the 128 bit integer a UUID is stored in rather than the UUID, and a blob of
+/// the wrong length is quoted the way it prints, which is the pin's message for either.
+fn to_uuid(value: &Value) -> Result<Value> {
+    let refused =
+        |text: &str| Error::conversion(format!("Could not convert string '{text}' to INT128"));
+    match value {
+        Value::Varchar(text) => uuid::parse(text).map(Value::Uuid).ok_or_else(|| refused(text)),
+        Value::Blob(bytes) => <[u8; 16]>::try_from(bytes.as_slice())
+            .map(|bytes| Value::Uuid(uuid::from_bytes(bytes)))
+            .map_err(|_| refused(&value.to_string())),
+        Value::UHugeInt(number) => Ok(Value::Uuid(uuid::from_number(*number))),
+        other => Err(no_cast(other, &LogicalType::Uuid)),
+    }
+}
+
+/// A UUID as its text, its sixteen bytes or the number they spell, and the pin's refusal for any
+/// other target.
+fn from_uuid(held: i128, target: &LogicalType) -> Result<Value> {
+    match target {
+        LogicalType::Varchar => Ok(Value::Varchar(Value::Uuid(held).to_string())),
+        LogicalType::Blob => Ok(Value::Blob(uuid::to_bytes(held).to_vec())),
+        LogicalType::UHugeInt => Ok(Value::UHugeInt(uuid::to_number(held))),
+        other => Err(no_cast(&Value::Uuid(held), other)),
+    }
 }
 
 /// One hex digit as a number, either case.
@@ -2420,12 +2453,45 @@ mod tests {
 
     /// The whole reason the error code is checked rather than a second set of functions written.
     #[test]
+    fn a_uuid_reads_from_its_text_its_bytes_and_its_number_and_nothing_else() {
+        let text = "5abf4945-15a5-4d27-8b25-1d9e0e9ddf0f";
+        let held =
+            cast_to(Value::Varchar(text.to_uppercase()), &LogicalType::Uuid).expect("a uuid");
+        assert_eq!(held.to_string(), text);
+        let bytes = cast_to(held.clone(), &LogicalType::Blob).expect("its bytes");
+        assert_eq!(cast_to(bytes, &LogicalType::Uuid).expect("back"), held);
+        let number = cast_to(held.clone(), &LogicalType::UHugeInt).expect("its number");
+        assert_eq!(number, Value::UHugeInt(0x5abf_4945_15a5_4d27_8b25_1d9e_0e9d_df0f));
+        assert_eq!(cast_to(number, &LogicalType::Uuid).expect("back"), held);
+        let refused = |value: Value| cast_to(value, &LogicalType::Uuid).expect_err("not a uuid");
+        assert_eq!(
+            refused(Value::Varchar("zzz".into())).message(),
+            "Could not convert string 'zzz' to INT128"
+        );
+        assert_eq!(
+            refused(Value::Blob(b"ab".to_vec())).message(),
+            "Could not convert string 'ab' to INT128"
+        );
+        assert_eq!(
+            refused(Value::Integer(1)).message(),
+            "Unimplemented type for cast (INTEGER -> UUID)"
+        );
+        assert_eq!(
+            cast_to(held, &LogicalType::HugeInt).expect_err("no number").message(),
+            "Unimplemented type for cast (UUID -> HUGEINT)"
+        );
+        let missing = cast_value(&Value::Varchar("zzz".into()), &LogicalType::Uuid, true);
+        assert_eq!(missing.expect("try_cast answers null"), Value::Null);
+    }
+
+    #[test]
     fn a_try_cast_that_does_not_fit_is_null_and_one_that_is_unimplemented_still_raises() {
         let fitted = cast_value(&Value::BigInt(40_000), &LogicalType::SmallInt, true)
             .expect("try_cast swallows the range failure");
         assert_eq!(fitted, Value::Null);
-        let error = cast_value(&Value::Integer(1), &LogicalType::Uuid, true)
-            .expect_err("try_cast does not invent a uuid");
+        let array = LogicalType::Array(Box::new(LogicalType::Integer), 3);
+        let error = cast_value(&Value::Integer(1), &array, true)
+            .expect_err("try_cast does not invent an array");
         assert_eq!(error.code(), ErrorCode::NotImplemented);
     }
 
@@ -2660,8 +2726,9 @@ mod tests {
         let refused = cast_value(&Value::Date(0), &LogicalType::Integer, true)
             .expect("try_cast swallows a pair duckdb has no cast for");
         assert_eq!(refused, Value::Null);
-        let error = cast_value(&Value::Integer(1), &LogicalType::Uuid, true)
-            .expect_err("try_cast does not invent a uuid");
+        let array = LogicalType::Array(Box::new(LogicalType::Integer), 3);
+        let error = cast_value(&Value::Integer(1), &array, true)
+            .expect_err("try_cast does not invent an array");
         assert_eq!(error.code(), ErrorCode::NotImplemented);
     }
 

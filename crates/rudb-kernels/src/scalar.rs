@@ -3758,6 +3758,17 @@ pub fn call_values(
             Ok(Value::List { element: (**element).clone(), values })
         }
         ("+", [only]) => Ok(only.clone()),
+        ("uuid_extract_version", [Value::Uuid(held)]) => {
+            Ok(Value::UInteger(rudb_common::uuid::version(*held)))
+        }
+        ("uuid_extract_timestamp", [Value::Uuid(held)]) => {
+            match rudb_common::uuid::version(*held) {
+                7 => Ok(Value::TimestampTz(rudb_common::uuid::millis(*held) * 1000)),
+                other => Err(Error::invalid_input(format!(
+                    "Given UUID is with version {other}, not version 7."
+                ))),
+            }
+        }
         ("-", [only @ Value::Interval { .. }]) => datetime::negated(only),
         ("-", [only]) => negate(only, returns),
         ("abs", [only]) => absolute(only, returns),
@@ -4018,6 +4029,21 @@ fn integer_arithmetic(
     ty: &LogicalType,
     written: Written<'_>,
 ) -> Result<Value> {
+    // A UHUGEINT past the top of an i128 has no signed form to work in, so two of them are worked
+    // in their own width.
+    if let (Value::UHugeInt(a), Value::UHugeInt(b)) = (left, right) {
+        if matches!(op, Op::Divide | Op::Modulo) && *b == 0 {
+            return Err(divided_by_zero(written, op.symbol(), left, right));
+        }
+        let wide = match op {
+            Op::Add => a.checked_add(*b),
+            Op::Subtract => a.checked_sub(*b),
+            Op::Multiply => a.checked_mul(*b),
+            Op::Divide => a.checked_div(*b),
+            Op::Modulo => a.checked_rem(*b),
+        };
+        return wide.map(Value::UHugeInt).ok_or_else(|| overflow(op, ty, left, right));
+    }
     let (a, b) = match (integral(left), integral(right)) {
         (Some(a), Some(b)) => (a, b),
         _ => {

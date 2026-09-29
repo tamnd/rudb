@@ -503,7 +503,7 @@ pub(crate) fn sort_key(value: &Value, out: &mut Vec<u8>) {
         Value::USmallInt(v) => out.extend_from_slice(&v.to_be_bytes()),
         Value::UInteger(v) => out.extend_from_slice(&v.to_be_bytes()),
         Value::UBigInt(v) => out.extend_from_slice(&v.to_be_bytes()),
-        Value::HugeInt(v) => huge(*v, out),
+        Value::HugeInt(v) | Value::Uuid(v) => huge(*v, out),
         Value::UHugeInt(v) => out.extend_from_slice(&v.to_be_bytes()),
         Value::Float(v) => out.extend_from_slice(&float_bits(*v).to_be_bytes()),
         Value::Double(v) => out.extend_from_slice(&double_bits(*v).to_be_bytes()),

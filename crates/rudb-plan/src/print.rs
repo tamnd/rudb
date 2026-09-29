@@ -536,6 +536,7 @@ fn write_value<W: Write>(out: &mut W, value: &Value) -> fmt::Result {
         Value::UInteger(held) => write!(out, "{held}"),
         Value::UBigInt(held) => write!(out, "{held}"),
         Value::UHugeInt(held) => write!(out, "{held}"),
+        Value::Uuid(held) => write!(out, "{held}"),
         // The debug formatting of a float is the shortest text that reads back as the same bits,
         // which the display formatting is not: `{}` prints 0.1f32 as 0.1 and so does 0.1f64, and
         // those are different numbers.

@@ -12692,3 +12692,124 @@ fn a_grouped_export_finalizes_to_what_the_plain_aggregate_answers() {
         "0,149500.0,149500.0;1,149501.0,149501.0"
     );
 }
+
+#[test]
+fn a_uuid_column_reads_sorts_groups_and_answers_the_way_the_pin_does() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    db.execute("SET threads=1").unwrap();
+    db.execute("CREATE TABLE t(k INTEGER, u UUID)").unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, '{5ABF4945-15A5-4D27-8B25-1D9E0E9DDF0F}'), \
+         (2, 'ffffffff15a54d278b251d9e0e9ddf0f'), (3, NULL), \
+         (4, '00000000-15a5-4d27-8b25-1d9e0e9ddf0f'), (5, '5abf4945-15a5-4d27-8b25-1d9e0e9ddf0f')",
+    )
+    .unwrap();
+    let low = "00000000-15a5-4d27-8b25-1d9e0e9ddf0f";
+    let middle = "5abf4945-15a5-4d27-8b25-1d9e0e9ddf0f";
+    let high = "ffffffff-15a5-4d27-8b25-1d9e0e9ddf0f";
+    for (sql, answer) in [
+        (
+            "SELECT k, u FROM t ORDER BY u NULLS LAST, k",
+            format!("4|{low};1|{middle};5|{middle};2|{high};3|NULL"),
+        ),
+        (
+            "SELECT u, count(*) FROM t GROUP BY u ORDER BY u",
+            format!("{low}|1;{middle}|2;{high}|1;NULL|1"),
+        ),
+        (
+            "SELECT k FROM t WHERE u = '5abf4945-15a5-4d27-8b25-1d9e0e9ddf0f' ORDER BY k",
+            "1;5".to_string(),
+        ),
+        (
+            "SELECT k FROM t WHERE u > '7fffffff-0000-0000-0000-000000000000' ORDER BY k",
+            "2".to_string(),
+        ),
+        ("SELECT min(u), max(u), count(DISTINCT u) FROM t", format!("{low}|{high}|3")),
+        ("SELECT u::VARCHAR || '!' FROM t WHERE k = 2", format!("{high}!")),
+        ("SELECT hash(u) FROM t WHERE k = 1", "6163393075563179861".to_string()),
+        (
+            "SELECT TRY_CAST('nope' AS UUID), TRY_CAST('5abf4945-15a5-4d27-8b25-1d9e0e9ddf0f' AS UUID)",
+            format!("NULL|{middle}"),
+        ),
+        ("SELECT u::BLOB::UUID = u FROM t WHERE k = 1", "true".to_string()),
+        (
+            "SELECT uuid_extract_version(UUID '0190a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5b'), \
+             uuid_extract_timestamp('0190a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5b')",
+            "7|2024-07-11 16:50:08.725+00".to_string(),
+        ),
+        // tamnd/duckdb#21: a version past 9 comes back as its character less '0'.
+        ("SELECT uuid_extract_version('5abf4945-15a5-ad27-8b25-1d9e0e9ddf0f')", "49".to_string()),
+        (
+            "SELECT k FROM t WHERE u IN ('00000000-15a5-4d27-8b25-1d9e0e9ddf0f', \
+             'ffffffff-15a5-4d27-8b25-1d9e0e9ddf0f') ORDER BY k",
+            "2;4".to_string(),
+        ),
+        (
+            "SELECT typeof(gen_random_uuid()), uuid_extract_version(uuidv4()), \
+             uuid_extract_version(uuidv7())",
+            "UUID|4|7".to_string(),
+        ),
+        ("SELECT list(u ORDER BY k) FROM t", format!("[{middle}, {high}, NULL, {low}, {middle}]")),
+        ("SELECT {'a': u} FROM t WHERE k = 4", format!("{{'a': {low}}}")),
+        ("SELECT (max(u) EXPORT_STATE)::VARCHAR FROM t WHERE k = 1", middle.to_string()),
+    ] {
+        assert_eq!(text(sql), answer, "{sql}");
+    }
+    db.execute("SELECT setseed(0.5)").unwrap();
+    assert_eq!(
+        text("SELECT uuid(), uuid() FROM range(2)"),
+        "4e8de2d9-2ca9-4c5a-8baa-9a9005b24344|8b31c300-db9f-45ea-b7ce-319e8056e58c;\
+         f8db6a10-3fb6-41db-b068-b3ba73ab29fd|953c49b9-8922-4362-8ccb-0fcc8fa25f53"
+    );
+    for (sql, error) in [
+        ("SELECT UUID 'zz'", "Could not convert string 'zz' to INT128"),
+        ("SELECT CAST(42 AS UUID)", "Unimplemented type for cast (INTEGER -> UUID)"),
+        (
+            "SELECT uuid_extract_timestamp(UUID '5abf4945-15a5-4d27-8b25-1d9e0e9ddf0f')",
+            "Given UUID is with version 4, not version 7.",
+        ),
+    ] {
+        let message = db.query(sql).unwrap_err().to_string();
+        assert!(message.contains(error), "{sql}: {message}");
+    }
+}
+
+#[test]
+fn a_whole_literal_past_a_hugeint_is_a_uhugeint_and_works_in_that_width() {
+    let db = Database::new();
+    let text = |sql: &str| rows(&db, sql)[0].iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        text(
+            "SELECT typeof(340282366920938463463374607431768211455), \
+             typeof(170141183460469231731687303715884105727)"
+        ),
+        ["UHUGEINT", "HUGEINT"]
+    );
+    assert_eq!(
+        text(
+            "SELECT 170141183460469231731687303715884105728::UHUGEINT + \
+             170141183460469231731687303715884105727::UHUGEINT, \
+             340282366920938463463374607431768211455::UHUGEINT // 7::UHUGEINT, \
+             340282366920938463463374607431768211455::UHUGEINT % 7::UHUGEINT, \
+             340282366920938463463374607431768211455::UHUGEINT::UUID"
+        ),
+        [
+            "340282366920938463463374607431768211455",
+            "48611766702991209066196372490252601636",
+            "3",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        ]
+    );
+    let error = db
+        .query("SELECT 170141183460469231731687303715884105728::UHUGEINT * 2::UHUGEINT")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Overflow in multiplication of UINT128"), "{error}");
+}

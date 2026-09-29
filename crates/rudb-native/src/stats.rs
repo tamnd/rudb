@@ -1307,7 +1307,7 @@ fn width(value: &Value) -> u64 {
         Value::Boolean(_) | Value::TinyInt(_) | Value::UTinyInt(_) => 1,
         Value::SmallInt(_) | Value::USmallInt(_) => 2,
         Value::Integer(_) | Value::UInteger(_) | Value::Float(_) | Value::Date(_) => 4,
-        Value::HugeInt(_) | Value::UHugeInt(_) | Value::Decimal { .. } => 16,
+        Value::HugeInt(_) | Value::UHugeInt(_) | Value::Uuid(_) | Value::Decimal { .. } => 16,
         Value::Varchar(text) => text.len() as u64,
         Value::Blob(bytes) => bytes.len() as u64,
         // The eight byte types and anything else, which is every remaining scalar. A nested value

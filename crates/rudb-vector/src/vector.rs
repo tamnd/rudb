@@ -2883,7 +2883,7 @@ impl Vector {
                 | Value::TimestampS(x)
                 | Value::TimestampMs(x)
                 | Value::TimestampNs(x) => Some(i128::from(*x)),
-                Value::HugeInt(x) | Value::Decimal { unscaled: x, .. } => Some(*x),
+                Value::HugeInt(x) | Value::Uuid(x) | Value::Decimal { unscaled: x, .. } => Some(*x),
                 _ => None,
             },
             // The same arithmetic [`Self::value_at`] does on a sequence, so the two agree about a
@@ -4965,6 +4965,7 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
         LogicalType::Integer => signed().and_then(|x| i32::try_from(x).ok()).map(Value::Integer),
         LogicalType::BigInt => signed().and_then(|x| i64::try_from(x).ok()).map(Value::BigInt),
         LogicalType::HugeInt => signed().map(Value::HugeInt),
+        LogicalType::Uuid => signed().map(Value::Uuid),
         LogicalType::UTinyInt => unsigned().and_then(|x| u8::try_from(x).ok()).map(Value::UTinyInt),
         LogicalType::USmallInt => {
             unsigned().and_then(|x| u16::try_from(x).ok()).map(Value::USmallInt)
@@ -5370,7 +5371,7 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
         },
         Data::Int128(v) => match value {
             Value::Null => v.push(0),
-            Value::HugeInt(x) => v.push(*x),
+            Value::HugeInt(x) | Value::Uuid(x) => v.push(*x),
             Value::Decimal { unscaled, .. } => v.push(*unscaled),
             other => return Err(Error::internal(format!("{other:?} is not a 128 bit value"))),
         },

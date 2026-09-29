@@ -115,9 +115,10 @@ pub(crate) fn evaluate_in_time_zone(
                     })
                     .map_err(|error| error.with_fallback_span(plan.expr_span(expr)));
             }
-            // `random()` has no argument to take a row count from, so it is given the chunk's.
-            if plan.string(name) == "random" && plan.expr_list(args).is_empty() {
-                return rudb_kernels::random(chunk.len());
+            // `random()` and the UUID makers have no argument to take a row count from, so they are
+            // given the chunk's.
+            if rudb_kernels::draws(plan.string(name)) && plan.expr_list(args).is_empty() {
+                return rudb_kernels::drawn(plan.string(name), chunk.len());
             }
             let args =
                 evaluate_all_in_time_zone(plan, plan.expr_list(args), schema, chunk, time_zone)?;

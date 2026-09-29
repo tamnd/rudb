@@ -254,6 +254,7 @@ mod tag {
     pub(super) const TIMESTAMP_S: u8 = 26;
     pub(super) const TIMESTAMP_MS: u8 = 27;
     pub(super) const TIMESTAMP_NS: u8 = 28;
+    pub(super) const UUID: u8 = 29;
 }
 
 /// Writes one value.
@@ -271,6 +272,7 @@ fn put(out: &mut Sink<'_>, value: &Value, ty: &LogicalType) -> Result<()> {
         Value::UInteger(held) => fixed(out, tag::UINTEGER, &held.to_le_bytes()),
         Value::UBigInt(held) => fixed(out, tag::UBIGINT, &held.to_le_bytes()),
         Value::UHugeInt(held) => fixed(out, tag::UHUGEINT, &held.to_le_bytes()),
+        Value::Uuid(held) => fixed(out, tag::UUID, &held.to_le_bytes()),
         Value::Float(held) => fixed(out, tag::FLOAT, &held.to_le_bytes()),
         Value::Double(held) => fixed(out, tag::DOUBLE, &held.to_le_bytes()),
         Value::Decimal { unscaled, width, scale } => {
@@ -363,6 +365,7 @@ fn get(reader: &mut BufReader<File>, ty: &LogicalType, reuse: Option<Value>) -> 
         tag::UINTEGER => Value::UInteger(u32::from_le_bytes(take(reader)?)),
         tag::UBIGINT => Value::UBigInt(u64::from_le_bytes(take(reader)?)),
         tag::UHUGEINT => Value::UHugeInt(u128::from_le_bytes(take(reader)?)),
+        tag::UUID => Value::Uuid(i128::from_le_bytes(take(reader)?)),
         tag::FLOAT => Value::Float(f32::from_le_bytes(take(reader)?)),
         tag::DOUBLE => Value::Double(f64::from_le_bytes(take(reader)?)),
         tag::DECIMAL => {
@@ -494,6 +497,7 @@ mod tests {
             (LogicalType::UInteger, vec![Value::UInteger(u32::MAX)]),
             (LogicalType::UBigInt, vec![Value::UBigInt(u64::MAX)]),
             (LogicalType::UHugeInt, vec![Value::UHugeInt(u128::MAX)]),
+            (LogicalType::Uuid, vec![Value::Uuid(i128::MIN), Value::Uuid(i128::MAX)]),
             // A nan and both infinities, because the bits are what goes out and a comparison is not
             // what comes back. A nan is never equal to itself, so the assertion on these is on the
             // bits and the round trip has to keep them exactly.
