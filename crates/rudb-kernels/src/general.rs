@@ -68,19 +68,19 @@ pub(crate) enum General {
     Exported { inner: Box<Accumulator>, state: Arc<StateType> },
     /// The quantiles, `median`, `mad` and `mode`, which hold every value that is not null and the
     /// fraction the call asked for, and answer in [`crate::quantile`].
-    Holistic { values: Held, fraction: Option<Value>, measure: Holistic, returns: LogicalType },
+    Holistic { values: Held, fraction: Option<Box<Value>>, measure: Holistic, returns: LogicalType },
     /// `reservoir_quantile`, which keeps a sample of the values rather than all of them.
-    Sampled { sample: Sample, fraction: Option<Value>, returns: LogicalType },
+    Sampled { sample: Box<Sample>, fraction: Option<Box<Value>>, returns: LogicalType },
     /// `approx_quantile`, which keeps a t-digest of the values.
-    Digested { digest: Digest, fraction: Option<Value>, returns: LogicalType },
+    Digested { digest: Box<Digest>, fraction: Option<Box<Value>>, returns: LogicalType },
     /// `approx_top_k`, which watches the most counted values, in [`crate::topk`].
     Top { top: Box<TopK>, element: LogicalType },
     /// `lttb`, which holds every point and thins them when the answer is asked for, in
     /// [`crate::lttb`].
-    Plotted { plot: Plot, returns: LogicalType },
+    Plotted { plot: Box<Plot>, returns: LogicalType },
     /// The `arg_min` and `arg_max` spellings, which keep the row with the least or greatest key,
     /// or the best `n` of them when the call passes a count, and answer in [`crate::arg_extreme`].
-    Arg { state: ArgExtreme, returns: LogicalType },
+    Arg { state: Box<ArgExtreme>, returns: LogicalType },
     /// `corr`, the covariances and the `regr_*` family, over pairs, in [`crate::statistics`].
     Paired(Paired),
     /// `skewness`, `kurtosis` and `kurtosis_pop`, in [`crate::statistics`].
@@ -97,7 +97,7 @@ pub(crate) enum General {
     /// does not say which of the two it is.
     Counted { tally: Tally, key: LogicalType },
     /// `histogram(x, bins)` and `histogram_exact(x, bins)`, in [`crate::histogram`].
-    Binned(Binned),
+    Binned(Box<Binned>),
 }
 
 /// Which row [`General::Pick`] keeps.
@@ -156,7 +156,7 @@ impl General {
             }
         };
         if let Some(state) = ArgExtreme::named(name) {
-            return Some(Self::Arg { state, returns: returns.clone() });
+            return Some(Self::Arg { state: Box::new(state), returns: returns.clone() });
         }
         if let Some(measure) = Pairing::named(name) {
             return Some(Self::Paired(Paired::new(measure)));
@@ -186,11 +186,9 @@ impl General {
             "bit_xor" => bits(BitOp::Xor),
             "bitstring_agg" => Self::Gathered(Gathered::default()),
             "approx_count_distinct" => Self::Sketched(Sketch::default()),
-            "approx_quantile" => Self::Digested {
-                digest: Digest::default(),
-                fraction: None,
-                returns: returns.clone(),
-            },
+            "approx_quantile" => {
+                Self::Digested { digest: Box::default(), fraction: None, returns: returns.clone() }
+            }
             "approx_top_k" => {
                 let element = match returns {
                     LogicalType::List(element) => (**element).clone(),
@@ -198,19 +196,19 @@ impl General {
                 };
                 Self::Top { top: Box::default(), element }
             }
-            "lttb" => Self::Plotted { plot: Plot::new(returns), returns: returns.clone() },
-            "reservoir_quantile" => Self::Sampled {
-                sample: Sample::default(),
-                fraction: None,
-                returns: returns.clone(),
-            },
+            "lttb" => {
+                Self::Plotted { plot: Box::new(Plot::new(returns)), returns: returns.clone() }
+            }
+            "reservoir_quantile" => {
+                Self::Sampled { sample: Box::default(), fraction: None, returns: returns.clone() }
+            }
             "product" => Self::Product { total: 1.0, seen: false },
             "fsum" => Self::Kahan { value: 0.0, err: 0.0, count: 0, average: false },
             "favg" => Self::Kahan { value: 0.0, err: 0.0, count: 0, average: true },
             "count_if" => Self::CountIf { count: 0, seen: false },
             "entropy" => Self::Tally(Tally::Empty),
             "histogram" => Self::Counted { tally: Tally::Empty, key: map_key(returns) },
-            "histogram_exact" => Self::Binned(Binned::new(true, map_key(returns))),
+            "histogram_exact" => Self::Binned(Box::new(Binned::new(true, map_key(returns)))),
             "string_agg" => {
                 Self::Joined { text: String::new(), seen: false, separator: String::new() }
             }
@@ -258,7 +256,7 @@ impl General {
             Self::Counted { key, .. } if args.len() > 1 => {
                 let mut binned = Binned::new(false, key.clone());
                 binned.update(value, args.get(1))?;
-                *self = Self::Binned(binned);
+                *self = Self::Binned(Box::new(binned));
             }
             Self::Counted { tally, .. } => tally.push(value)?,
             Self::Binned(state) => state.update(value, args.get(1))?,
@@ -267,7 +265,7 @@ impl General {
             }
             Self::Holistic { values, fraction, .. } => {
                 if fraction.is_none() {
-                    *fraction = args.get(1).cloned();
+                    *fraction = args.get(1).cloned().map(Box::new);
                 }
                 values.push(value);
             }
@@ -298,14 +296,14 @@ impl General {
             Self::Sketched(sketch) => sketch.insert(value),
             Self::Sampled { sample, fraction, .. } => {
                 if fraction.is_none() {
-                    *fraction = args.get(1).cloned();
+                    *fraction = args.get(1).cloned().map(Box::new);
                 }
                 sample.size(args.get(2));
                 sample.push(value);
             }
             Self::Digested { digest, fraction, .. } => {
                 if fraction.is_none() {
-                    *fraction = args.get(1).cloned();
+                    *fraction = args.get(1).cloned().map(Box::new);
                 }
                 digest.push(value);
             }
@@ -402,6 +400,21 @@ impl General {
         plot.push_row(points, row)
     }
 
+    /// Whether this state takes `arguments` columns of doubles through [`Self::push_reals`], which
+    /// is a pair statistic over two of them or a moment statistic over one.
+    pub(crate) const fn takes_reals(&self, arguments: usize) -> bool {
+        matches!((self, arguments), (Self::Paired(_), 2) | (Self::Powers(_), 1))
+    }
+
+    /// Adds one row of doubles, none of them null, for a state [`Self::takes_reals`] says yes to.
+    pub(crate) fn push_reals(&mut self, row: &[f64]) {
+        match (self, row) {
+            (Self::Paired(state), [y, x]) => state.add(*y, *x),
+            (Self::Powers(state), [input]) => state.add(*input),
+            _ => {}
+        }
+    }
+
     /// Whether this state skips nulls and takes the rest of a column through [`Self::push_column`].
     pub(crate) fn takes_columns(&self) -> bool {
         matches!(
@@ -458,7 +471,8 @@ impl General {
             }
             (Self::Sampled { sample, fraction, .. }, column) => {
                 if fraction.is_none() {
-                    *fraction = args.get(1).map(|given| given.try_value_at(row)).transpose()?;
+                    *fraction =
+                        args.get(1).map(|given| given.try_value_at(row)).transpose()?.map(Box::new);
                     let size = args.get(2).map(|given| given.try_value_at(row)).transpose()?;
                     sample.size(size.as_ref());
                 }
@@ -467,7 +481,8 @@ impl General {
             }
             (Self::Digested { digest, fraction, .. }, column) => {
                 if fraction.is_none() {
-                    *fraction = args.get(1).map(|given| given.try_value_at(row)).transpose()?;
+                    *fraction =
+                        args.get(1).map(|given| given.try_value_at(row)).transpose()?.map(Box::new);
                 }
                 digest.push_column(column, row);
                 return Ok(());
@@ -488,7 +503,7 @@ impl General {
         if fraction.is_none()
             && let Some(given) = args.get(1)
         {
-            *fraction = Some(given.try_value_at(row)?);
+            *fraction = Some(Box::new(given.try_value_at(row)?));
         }
         column.push(values, row);
         Ok(())
@@ -645,13 +660,13 @@ impl General {
             return state.finish(returns);
         }
         if let Self::Holistic { values, fraction, measure, returns } = self {
-            return quantile::finish(*measure, values, fraction.as_ref(), returns);
+            return quantile::finish(*measure, values, fraction.as_deref(), returns);
         }
         if let Self::Sampled { sample, fraction, returns } = self {
-            return sample.finish(fraction.as_ref(), returns);
+            return sample.finish(fraction.as_deref(), returns);
         }
         if let Self::Digested { digest, fraction, returns } = self {
-            return digest.finish(fraction.as_ref(), returns);
+            return digest.finish(fraction.as_deref(), returns);
         }
         Ok(match self {
             Self::List { values, .. } if values.is_empty() => Value::Null,
