@@ -8,6 +8,12 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.13
+
+For W3, #2203 logs a table or a view made or dropped as a Ddl record holding the statement, which runs again in its place at replay, so a small schema change in a file no longer rewrites it with a checkpoint. #2196 shares a query result's parts between its clones behind one Arc, which is 2 to 3% fewer instructions on the prepared insert trickle. For C5, #2198 keeps a memory table's exact extremes per column until rows change, #2199 counts what a read at positions cost toward holding its part and tests bitmap keys eight at a time, #2200 makes the QIR verifier and builder cheaper, #2201 links the code queries run at the front of the shell, and #2202 reads the year of a date off the new year days and moves a link join's columns instead of copying them. On compatibility, #2195 adds the UUID type and its functions the way the pin has them, and #2197 writes an exported aggregate state to Parquet as its layout.
+
+The native directory format number stays at 30 and the storage format version at 9.
+
 ## 0.8.12
 
 The main change is C5 work on the compiled engine's per query overhead on ClickBench. #2185 keeps a sketch's distinct estimate until its hashes change, and #2188 keeps a memory table's frequency lists until rows are added, which together take q1 from 14.85M to 1.00M instructions a run and every other query down by about 14M. #2191 reads a dictionary shared by a whole row group through its codes once the chunks have read as many rows as it has values, instead of copying every string of every chunk out flat, which is up to 13% fewer instructions on q13, q14, q23, q25 and q27. #2193 keeps a result body's buffers from one chunk to the next instead of allocating and zeroing them per chunk, another 21% on q25. #2190 compiles semi and anti joins and groups keys that arrive sorted in runs.
