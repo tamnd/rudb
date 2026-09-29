@@ -565,7 +565,8 @@ mod tests {
     #[test]
     fn a_code_stands_for_the_value_of_its_row() {
         let (path, held) = table_of("codes", 300_000);
-        let built = build_value_codes(&path, "hits").expect("build");
+        // Two columns are too few for the codes of one to fit a quarter of them.
+        let built = build_value_codes_within(&path, "hits", 1000).expect("build");
         assert_eq!(built.len(), 1, "only the user is wide");
         assert!(built[0].built);
         let reader = Catalog::open(&path).expect("reopen").table("hits").expect("the table");
@@ -586,7 +587,7 @@ mod tests {
     #[test]
     fn the_distinct_values_of_each_group_are_counted_across_every_share() {
         let (path, held) = table_of("groups", 300_000);
-        build_value_codes(&path, "hits").expect("build");
+        build_value_codes_within(&path, "hits", 1000).expect("build");
         let reader = Catalog::open(&path).expect("reopen").table("hits").expect("the table");
         let codes = value_codes(&reader, 1).expect("the section is in the file");
         let mut wanted = BTreeMap::<Option<i64>, BTreeSet<i64>>::new();
