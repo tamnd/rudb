@@ -16,7 +16,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use rudb_common::{Error, LogicalType, Result, StateType, Value};
+use rudb_common::{Error, LogicalType, Result, StateKey, StateType, Value};
 
 use crate::aggregate::Accumulator;
 use crate::aggregate::export::Merge;
@@ -61,12 +61,12 @@ pub(crate) enum General {
     Joined { text: String, seen: bool, separator: String },
     /// An aggregate whose call said which order to read its rows in, `list(x ORDER BY y)`.
     ///
-    /// Every row is held as it came, the aggregate's arguments followed by the sort keys, and the
-    /// rows are sorted and handed to a fresh copy of `inner` only when the answer is asked for. A
+    /// Every row is held as it came, the aggregate's arguments followed by the sort keys that are
+    /// not one of the arguments, and the rows are sorted and handed to a fresh copy of `inner` only when the answer is asked for. A
     /// combine is then two runs of rows put together, which is why the order the threads finish in
     /// does not reach the answer. The sort is stable, so rows that tie on every key keep the order
     /// they arrived in, which is the most the pin promises too.
-    Ordered { keys: Vec<(bool, bool)>, rows: Vec<Vec<Value>>, inner: Box<Accumulator> },
+    Ordered { keys: Vec<StateKey>, rows: Vec<Vec<Value>>, inner: Box<Accumulator> },
     /// A call that exports its state, `sum(x) EXPORT_STATE`, which folds rows into `inner` the way
     /// the aggregate always does and answers with the state written out in the layout of `state`,
     /// which every group shares rather than each holding a copy of its own.
@@ -779,14 +779,23 @@ fn map_key(returns: &LogicalType) -> LogicalType {
     }
 }
 
-/// The answer of an ordered aggregate: its rows sorted on the keys at their end and folded into a
-/// fresh copy of the aggregate in that order.
-fn ordered(keys: &[(bool, bool)], rows: &[Vec<Value>], inner: &Accumulator) -> Result<Value> {
+/// The answer of an ordered aggregate: its rows sorted on the keys and folded into a fresh copy of
+/// the aggregate in that order.
+fn ordered(keys: &[StateKey], rows: &[Vec<Value>], inner: &Accumulator) -> Result<Value> {
+    let Some(width) = rows.first().map(Vec::len) else {
+        return inner.finish();
+    };
+    // The keys held after the arguments are the ones that are not an argument, in order.
+    let arguments = width - keys.iter().filter(|key| key.argument.is_none()).count();
+    let mut after = arguments..;
+    let columns: Vec<usize> =
+        keys.iter().map(|key| key.argument.unwrap_or_else(|| after.next().unwrap_or(0))).collect();
     let mut failure = None;
     let mut sorted: Vec<&Vec<Value>> = rows.iter().collect();
     sorted.sort_by(|left, right| {
-        let (left, right) = (&left[left.len() - keys.len()..], &right[right.len() - keys.len()..]);
-        for ((a, b), &(descending, nulls_first)) in left.iter().zip(right).zip(keys) {
+        for (&column, key) in columns.iter().zip(keys) {
+            let (a, b) = (&left[column], &right[column]);
+            let (descending, nulls_first) = (key.descending, key.nulls_first);
             // Nulls are placed before the direction is applied, so `DESC NULLS LAST` still puts
             // them last.
             let placed = match order_with_nulls(a, b, nulls_first) {
@@ -808,7 +817,7 @@ fn ordered(keys: &[(bool, bool)], rows: &[Vec<Value>], inner: &Accumulator) -> R
     }
     let mut fresh = inner.clone();
     for row in sorted {
-        fresh.update(&row[..row.len() - keys.len()])?;
+        fresh.update(&row[..arguments])?;
     }
     fresh.finish()
 }

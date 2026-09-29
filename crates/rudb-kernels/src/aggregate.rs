@@ -56,7 +56,7 @@ use std::array;
 use std::mem;
 use std::sync::Arc;
 
-use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
+use rudb_common::{Error, LogicalType, PhysicalType, Result, StateKey, Value};
 use rudb_vector::{Data, Form, Live, Validity, Vector};
 
 use crate::arg_extreme::Key;
@@ -81,34 +81,49 @@ pub const NOWHERE: usize = usize::MAX;
 ///
 /// `list(x ORDER BY y DESC, z)` is `list ORDER BY dl,al`, where the first letter is the direction
 /// and the second is where nulls go. The keys are the last arguments of the call, after the ones
-/// the aggregate itself reads. Carrying the order in the name keeps it out of every rule that looks
-/// at an aggregate by name, none of which knows what to do with an order, and every rule that walks
-/// arguments sees the keys as arguments and keeps them.
+/// the aggregate itself reads, except a key that is the same expression as an argument, which is
+/// written with that argument's position, `list ORDER BY dl@0` for `list(x ORDER BY x DESC)`, and
+/// sorts on it rather than holding it twice. Carrying the order in the name keeps it out of every
+/// rule that looks at an aggregate by name, none of which knows what to do with an order, and every
+/// rule that walks arguments sees the keys as arguments and keeps them.
 #[must_use]
-pub fn ordered_name(inner: &str, keys: &[(bool, bool)]) -> String {
-    let keys: Vec<&str> = keys
+pub fn ordered_name(inner: &str, keys: &[StateKey]) -> String {
+    let keys: Vec<String> = keys
         .iter()
-        .map(|&(descending, nulls_first)| match (descending, nulls_first) {
-            (false, false) => "al",
-            (false, true) => "af",
-            (true, false) => "dl",
-            (true, true) => "df",
+        .map(|key| {
+            let letters = match (key.descending, key.nulls_first) {
+                (false, false) => "al",
+                (false, true) => "af",
+                (true, false) => "dl",
+                (true, true) => "df",
+            };
+            match key.argument {
+                Some(at) => format!("{letters}@{at}"),
+                None => letters.to_string(),
+            }
         })
         .collect();
     format!("{inner} ORDER BY {}", keys.join(","))
 }
 
 /// The plain name and the sort keys of a name [`ordered_name`] made, or `None` for any other name.
-fn split_ordered(name: &str) -> Option<(&str, Vec<(bool, bool)>)> {
+fn split_ordered(name: &str) -> Option<(&str, Vec<StateKey>)> {
     let (inner, keys) = name.split_once(" ORDER BY ")?;
     let keys = keys
         .split(',')
-        .map(|key| match key {
-            "al" => Some((false, false)),
-            "af" => Some((false, true)),
-            "dl" => Some((true, false)),
-            "df" => Some((true, true)),
-            _ => None,
+        .map(|key| {
+            let (letters, argument) = match key.split_once('@') {
+                Some((letters, at)) => (letters, Some(at.parse().ok()?)),
+                None => (key, None),
+            };
+            let (descending, nulls_first) = match letters {
+                "al" => (false, false),
+                "af" => (false, true),
+                "dl" => (true, false),
+                "df" => (true, true),
+                _ => return None,
+            };
+            Some(StateKey { descending, nulls_first, argument })
         })
         .collect::<Option<Vec<_>>>()?;
     Some((inner, keys))
@@ -470,7 +485,7 @@ impl Accumulator {
         }
         if let Some((inner, keys)) = split_ordered(name) {
             if let ("lttb", [key]) = (inner, keys.as_slice()) {
-                let plot = Plot::sorted(returns, *key);
+                let plot = Plot::sorted(returns, (key.descending, key.nulls_first));
                 let general = General::Plotted { plot: Box::new(plot), returns: returns.clone() };
                 return Ok(Self { state: State::General(Box::new(general)) });
             }
@@ -4569,7 +4584,7 @@ fn extreme<const DIRECT: bool, M: Fn(usize) -> usize>(
 pub(crate) mod export;
 
 pub(crate) use export::state_call;
-pub use export::{EXPORTED, finalize_name, state_constants, state_layout};
+pub use export::{EXPORTED, finalize_name, ordered_layout, state_constants, state_layout};
 
 #[cfg(test)]
 mod tests {

@@ -11,7 +11,7 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    Error, Field, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Session, Value,
+    Error, Field, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Session, StateKey, Value,
     is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
@@ -228,8 +228,14 @@ impl Binder<'_> {
                 let keys = self.plan().sort_key_list(keys).to_vec();
                 args = vec![element];
                 args.extend(keys.iter().map(|key| key.expr));
-                let flags: Vec<(bool, bool)> =
-                    keys.iter().map(|key| (key.descending, key.nulls_first)).collect();
+                let flags: Vec<StateKey> = keys
+                    .iter()
+                    .map(|key| StateKey {
+                        descending: key.descending,
+                        nulls_first: key.nulls_first,
+                        argument: None,
+                    })
+                    .collect();
                 name = rudb_kernels::ordered_name(&name, &flags);
             }
             let args = self.plan_mut().add_expr_list(&args);

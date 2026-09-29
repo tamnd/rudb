@@ -160,6 +160,19 @@ pub struct StateType {
     /// time rather than on every row, and `None` for the rest. The separator of a `string_agg` and
     /// the fraction of a `quantile_cont` are these, and two states only combine when theirs match.
     pub constants: Vec<Option<Value>>,
+    /// The keys of the call's `ORDER BY`, empty when it had none. An ordered call's state is the
+    /// rows it buffered, sorted only when it is finished, so it needs the keys to finish.
+    pub order: Vec<StateKey>,
+}
+
+/// One key of an ordered aggregate's `ORDER BY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StateKey {
+    pub descending: bool,
+    pub nulls_first: bool,
+    /// The argument the key sorts on when it is the same expression as one, which the rows then
+    /// hold once. `None` for a key buffered after the arguments, in the order the keys are written.
+    pub argument: Option<usize>,
 }
 
 // A value compares equal to itself here, nulls and NaNs included, which is what a type needs.
@@ -175,6 +188,7 @@ impl std::hash::Hash for StateType {
         for constant in &self.constants {
             format!("{constant:?}").hash(state);
         }
+        self.order.hash(state);
     }
 }
 
@@ -306,6 +320,7 @@ impl LogicalType {
         returns: Self,
         layout: Self,
         constants: Vec<Option<Value>>,
+        order: Vec<StateKey>,
     ) -> Self {
         let function = function.into();
         Self::AggregateState(Arc::new(StateType {
@@ -314,6 +329,7 @@ impl LogicalType {
             returns,
             layout,
             constants,
+            order,
         }))
     }
 

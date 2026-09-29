@@ -8,11 +8,12 @@
 //! makes `finalize` the accumulator's own finish and `combine` its own combine, and so the same
 //! answers the aggregate gives when nothing was exported at all.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use rudb_common::{Error, Field, LogicalType, Result, StateType, Value};
 
-use super::{Accumulator, State, exactly, mean_bits, mean_real};
+use super::{Accumulator, State, exactly, mean_bits, mean_real, ordered_name};
 use crate::general::General;
 use crate::number::{approximate, integral};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
@@ -98,6 +99,16 @@ pub fn state_layout(
     })
 }
 
+/// The layout of an ordered call's state, which is the rows it buffered, each a struct of the
+/// columns it holds: the arguments and then the sort keys that are not one of them, named `v0`,
+/// `v1` and on, the pin's names.
+#[must_use]
+pub fn ordered_layout(columns: &[LogicalType]) -> LogicalType {
+    let fields =
+        columns.iter().enumerate().map(|(at, ty)| Field::new(format!("v{at}"), ty.clone()));
+    LogicalType::List(Box::new(LogicalType::Struct(fields.collect())))
+}
+
 /// The position of the first argument of `name` that its state keeps the constant of, which is
 /// past the end for an aggregate that reads every argument on every row.
 pub fn state_constants(name: &str) -> usize {
@@ -119,9 +130,19 @@ fn not_written(name: &str) -> Error {
     Error::not_implemented(format!("exporting the state of the {name} aggregate"))
 }
 
-/// The name a `finalize` of `state` is stored under, which `state_call` reads back.
+/// The name a `finalize` of `state` is stored under, which `state_call` reads back. The aggregate
+/// comes last because an ordered one has spaces in its name.
 pub fn finalize_name(state: &StateType) -> String {
-    format!("{FINALIZE} {} {}", state.function, scale(state))
+    format!("{FINALIZE} {} {}", scale(state), accumulated(state))
+}
+
+/// The name of the aggregate that holds `state`, which for an ordered call is the ordered one.
+fn accumulated(state: &StateType) -> Cow<'_, str> {
+    if state.order.is_empty() {
+        Cow::Borrowed(&state.function)
+    } else {
+        Cow::Owned(ordered_name(&state.function, &state.order))
+    }
 }
 
 /// The scale of the decimal a state's call was made over, or 0 when it was not over a decimal.
@@ -135,7 +156,7 @@ fn scale(state: &StateType) -> u8 {
 /// A fresh accumulator for the call `state` came from holding the state `value` wrote.
 fn imported(state: &StateType, value: &Value) -> Result<Accumulator> {
     let constant = state.constants.get(1).and_then(Option::as_ref);
-    Accumulator::import(&state.function, &state.returns, scale(state), value, constant)
+    Accumulator::import(&accumulated(state), &state.returns, scale(state), value, constant)
 }
 
 /// `combine_aggr`, which folds the exported states of one call into one state of that call.
@@ -209,10 +230,8 @@ pub(crate) fn state_call(
     returns: &LogicalType,
 ) -> Result<Option<Value>> {
     if let Some(rest) = name.strip_prefix(FINALIZE) {
-        let mut words = rest.split_whitespace();
-        let (Some(function), Some(scale), [value, constants @ ..]) =
-            (words.next(), words.next(), args)
-        else {
+        let words = rest.trim_start().split_once(' ');
+        let (Some((scale, function)), [value, constants @ ..]) = (words, args) else {
             return Err(Error::internal(format!("a finalize stored as {name}")));
         };
         if value.is_null() {
@@ -243,7 +262,7 @@ pub(crate) fn state_call(
     // followed by the left ones. Its `last` of a number keeps the right value when it has one,
     // the way `first` does, where the `last` of a string keeps the left one.
     let text = matches!(state.returns, LogicalType::Varchar | LogicalType::Blob);
-    if state.function == "last" && !text {
+    if state.function == "last" && state.order.is_empty() && !text {
         return Ok(Some(if right.is_null() { left.clone() } else { right.clone() }));
     }
     let mut accumulator = imported(state, right)?;
@@ -453,6 +472,20 @@ impl General {
             Self::Paired(state) => state.export(),
             Self::Powers(state) => state.export(),
             Self::Arg { state, .. } => state.export()?,
+            Self::Ordered { rows, .. } if rows.is_empty() => Value::Null,
+            Self::Ordered { rows, .. } => {
+                let element = match layout {
+                    LogicalType::List(element) => (**element).clone(),
+                    _ => LogicalType::Null,
+                };
+                let row = |row: &Vec<Value>| {
+                    let fields = row.iter().enumerate();
+                    Value::Struct(
+                        fields.map(|(at, value)| (format!("v{at}"), value.clone())).collect(),
+                    )
+                };
+                Value::List { element, values: rows.iter().map(row).collect() }
+            }
             Self::List { .. } | Self::Joined { .. } => self.finish()?,
             Self::Merged(merge) => merge.finish()?,
             Self::Holistic { values, .. } if values.len() == 0 => Value::Null,
@@ -489,6 +522,17 @@ impl General {
             Self::Paired(state) => state.import(value)?,
             Self::Powers(state) => state.import(value)?,
             Self::Arg { state, .. } => state.import(member(value, "arg")?, member(value, "by")?)?,
+            Self::Ordered { rows, .. } => {
+                let Value::List { values: held, .. } = value else {
+                    return Err(Error::internal(format!("an ordered state holding {value:?}")));
+                };
+                for row in held {
+                    let Value::Struct(fields) = row else {
+                        return Err(Error::internal(format!("an ordered state row {row:?}")));
+                    };
+                    rows.push(fields.iter().map(|(_, value)| value.clone()).collect());
+                }
+            }
             Self::List { values, .. } | Self::Holistic { values, .. } => {
                 let Value::List { values: held, .. } = value else {
                     return Err(Error::internal(format!("a list state holding {value:?}")));
