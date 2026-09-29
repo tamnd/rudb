@@ -45,6 +45,7 @@ use rudb_plan::{
     SetOpKind, Slice,
 };
 
+use crate::pass::producer;
 use crate::{bounds, walk};
 
 /// What one conjunct of a filter is assumed to keep.
@@ -1605,55 +1606,55 @@ fn follow(
     };
     let position = binding.column as usize;
     let rows = missing == Missing::Rows;
-    for at in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
-        match *plan.node(at) {
-            Node::Get { catalog, schema, table, index, columns, .. } if index == binding.table => {
-                let Some(field) = plan.field_list(columns).get(position) else {
-                    return Stat::Unknown;
-                };
-                let catalog = plan.string(catalog);
-                let schema = plan.string(schema);
-                let table = plan.string(table);
-                let distinct =
-                    stats.get(&Key::Distinct { catalog, schema, table, column: &field.name });
-                if matches!(distinct, Stat::Known { .. }) {
-                    return distinct;
-                }
-                // What the store said about itself, which for a native table is the dictionary for
-                // a string column and the span between the two ends for an integer one. Second to
-                // `ANALYZE`, because `ANALYZE` counted the column and this bounds it.
-                let measured = plan.distinct_measured(index, &field.name);
-                if matches!(measured, Stat::Known { .. }) {
-                    return measured;
-                }
-                if !rows {
-                    return Stat::Unknown;
-                }
-                return ceiling(stats.get(&Key::Rows { catalog, schema, table }));
+    let Some(at) = producer(plan, binding.table) else {
+        return Stat::Unknown;
+    };
+    match *plan.node(at) {
+        Node::Get { catalog, schema, table, index, columns, .. } => {
+            let Some(field) = plan.field_list(columns).get(position) else {
+                return Stat::Unknown;
+            };
+            let catalog = plan.string(catalog);
+            let schema = plan.string(schema);
+            let table = plan.string(table);
+            let distinct =
+                stats.get(&Key::Distinct { catalog, schema, table, column: &field.name });
+            if matches!(distinct, Stat::Known { .. }) {
+                return distinct;
             }
-            Node::TableFunction { index, columns, .. } if index == binding.table => {
-                let Some(field) = plan.field_list(columns).get(position) else {
-                    return Stat::Unknown;
-                };
-                let distinct = plan.distinct_measured(index, &field.name);
-                if matches!(distinct, Stat::Known { .. }) {
-                    return distinct;
-                }
-                return if rows { ceiling(plan.measured(index)) } else { Stat::Unknown };
+            // What the store said about itself, which for a native table is the dictionary for
+            // a string column and the span between the two ends for an integer one. Second to
+            // `ANALYZE`, because `ANALYZE` counted the column and this bounds it.
+            let measured = plan.distinct_measured(index, &field.name);
+            if matches!(measured, Stat::Known { .. }) {
+                return measured;
             }
-            Node::Project { index, exprs, .. } if index == binding.table => {
-                let Some(&carried) = plan.expr_list(exprs).get(position) else {
-                    return Stat::Unknown;
-                };
-                let &Expr::Column(carried) = plan.expr(carried) else {
-                    return Stat::Unknown;
-                };
-                return follow(plan, carried, stats, missing, depth);
+            if !rows {
+                return Stat::Unknown;
             }
-            _ => {}
+            ceiling(stats.get(&Key::Rows { catalog, schema, table }))
         }
+        Node::TableFunction { index, columns, .. } => {
+            let Some(field) = plan.field_list(columns).get(position) else {
+                return Stat::Unknown;
+            };
+            let distinct = plan.distinct_measured(index, &field.name);
+            if matches!(distinct, Stat::Known { .. }) {
+                return distinct;
+            }
+            if rows { ceiling(plan.measured(index)) } else { Stat::Unknown }
+        }
+        Node::Project { exprs, .. } => {
+            let Some(&carried) = plan.expr_list(exprs).get(position) else {
+                return Stat::Unknown;
+            };
+            let &Expr::Column(carried) = plan.expr(carried) else {
+                return Stat::Unknown;
+            };
+            follow(plan, carried, stats, missing, depth)
+        }
+        _ => Stat::Unknown,
     }
-    Stat::Unknown
 }
 
 /// How many pairs of values the conditions of a join can match on, where every one is understood.

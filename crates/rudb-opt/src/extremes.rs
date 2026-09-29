@@ -58,7 +58,7 @@ use rudb_common::{Field, LogicalType, Result, Value};
 use rudb_plan::{ColumnBinding, Expr, Node, NodeRef, Plan};
 
 use crate::fold::days_after;
-use crate::pass::{Context, Pass};
+use crate::pass::{Context, Pass, producer};
 
 /// What a zone map bound is read for when it stands in for the query's answer.
 ///
@@ -192,11 +192,12 @@ fn extreme(
 /// This one is sizing a structure and wants a range nothing falls outside of, so a filter is fine
 /// and so is a join: neither can put a value in the column that the column does not hold.
 ///
-/// That is why the scan is found by its table index anywhere in the plan rather than by walking down
-/// from a node. The index is what the binding names, and whatever sits in between only ever removes
-/// rows or carries them through. A projection of a plain column reference is followed because that
-/// is a rename. A cast is not, since a narrowing one moves both ends. An expression is not, since
-/// the ends of `c + 1` are not the ends of `c`.
+/// That is why the scan is found by its table index rather than by walking down from a node, through
+/// [`producer`] so that a node a rewrite left behind is not the one found. The index is what the
+/// binding names, and whatever sits in between only ever removes rows or carries them through. A
+/// projection of a plain column reference is followed because that is a rename. A cast is not,
+/// since a narrowing one moves both ends. An expression is not, since the ends of `c + 1` are not
+/// the ends of `c`.
 ///
 /// Integers only, which is [`Bound::Int`] and so covers the integer types, `BOOLEAN` and `DATE`. A
 /// real and a decimal have ends too and neither has the property a caller of this wants, which is
@@ -207,28 +208,25 @@ fn extreme(
 /// wrong answer, and the classes that can be narrower are the ones this refuses.
 pub(crate) fn span(plan: &Plan, binding: ColumnBinding, depth: u32) -> Option<(i128, i128)> {
     let depth = depth.checked_sub(1)?;
-    for at in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
-        match *plan.node(at) {
-            Node::Get { index, columns, .. } if index == binding.table => {
-                let name = &plan.field_list(columns).get(binding.column as usize)?.name;
-                let zones = plan.zones(index)?;
-                let column = zones.column(name)?;
-                let low = zones.extreme(column, End::Low);
-                let high = zones.extreme(column, End::High);
-                return match (low.read(SPAN)?, high.read(SPAN)?) {
-                    (&Bound::Int(low), &Bound::Int(high)) if low <= high => Some((low, high)),
-                    _ => None,
-                };
+    match *plan.node(producer(plan, binding.table)?) {
+        Node::Get { index, columns, .. } => {
+            let name = &plan.field_list(columns).get(binding.column as usize)?.name;
+            let zones = plan.zones(index)?;
+            let column = zones.column(name)?;
+            let low = zones.extreme(column, End::Low);
+            let high = zones.extreme(column, End::High);
+            match (low.read(SPAN)?, high.read(SPAN)?) {
+                (&Bound::Int(low), &Bound::Int(high)) if low <= high => Some((low, high)),
+                _ => None,
             }
-            Node::Project { index, exprs, .. } if index == binding.table => {
-                let &carried = plan.expr_list(exprs).get(binding.column as usize)?;
-                let &Expr::Column(carried) = plan.expr(carried) else { return None };
-                return span(plan, carried, depth);
-            }
-            _ => {}
         }
+        Node::Project { exprs, .. } => {
+            let &carried = plan.expr_list(exprs).get(binding.column as usize)?;
+            let &Expr::Column(carried) = plan.expr(carried) else { return None };
+            span(plan, carried, depth)
+        }
+        _ => None,
     }
-    None
 }
 
 /// What a zone map bound is read for when it is sizing a structure rather than answering.
