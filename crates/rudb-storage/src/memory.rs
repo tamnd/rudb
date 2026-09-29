@@ -178,6 +178,10 @@ pub struct MemoryTable {
     /// whenever a row is added, like `grams`. The planner asks for every column on every query, and
     /// building a list sorts it and copies each value out of the tally.
     lists: Vec<OnceLock<Option<Arc<[(Value, u64)]>>>>,
+    /// Each column's [`MemoryTable::exact_extremes`], worked out the first time they are asked for
+    /// and dropped whenever a row is added, like `grams`. The compiler asks for them on every query
+    /// and working them out walks the zone of every chunk.
+    extremes: Vec<OnceLock<Option<(Bound, Bound)>>>,
     rows: usize,
     stats_ns: u64,
     counts_ns: u64,
@@ -190,6 +194,7 @@ impl MemoryTable {
         let counts = Counts::new(types.len());
         let grams = types.iter().map(|_| OnceLock::new()).collect();
         let lists = types.iter().map(|_| OnceLock::new()).collect();
+        let extremes = types.iter().map(|_| OnceLock::new()).collect();
         Self {
             types,
             groups: Vec::new(),
@@ -205,6 +210,7 @@ impl MemoryTable {
             counts,
             grams,
             lists,
+            extremes,
             rows: 0,
             stats_ns: 0,
             counts_ns: 0,
@@ -897,6 +903,9 @@ impl MemoryTable {
         for list in &mut self.lists {
             list.take();
         }
+        for ends in &mut self.extremes {
+            ends.take();
+        }
     }
 
     /// Whether the probes keep every row of chunk `index`.
@@ -942,6 +951,21 @@ impl MemoryTable {
     ///
     /// If the column is outside the table.
     pub fn exact_extremes(&self, column: usize) -> Result<Option<(Bound, Bound)>> {
+        let Some(ends) = self.extremes.get(column) else {
+            return Err(Error::internal(format!(
+                "column {column} of a table that has {}",
+                self.types.len()
+            )));
+        };
+        if let Some(held) = ends.get() {
+            return Ok(held.clone());
+        }
+        let found = self.walk_extremes(column)?;
+        Ok(ends.get_or_init(|| found).clone())
+    }
+
+    /// [`MemoryTable::exact_extremes`] worked out from the zones.
+    fn walk_extremes(&self, column: usize) -> Result<Option<(Bound, Bound)>> {
         let mut low: Option<Bound> = None;
         let mut high: Option<Bound> = None;
         for (range, rows) in self.ranges(column)? {
@@ -1322,6 +1346,21 @@ mod tests {
         assert_eq!(after.to_vec(), table.frequencies(0).expect("a column").expect("a list"));
         assert_eq!(after.len(), first.len() + 1);
         assert!(table.frequency_list(1).is_err());
+    }
+
+    #[test]
+    fn kept_extremes_are_worked_out_again_after_rows_are_added() {
+        let mut table = counted(VECTOR_SIZE * 2 + 10);
+        let ends = Some((Bound::Int(0), Bound::Int(6)));
+        assert_eq!(table.exact_extremes(0).expect("a column"), ends);
+        assert_eq!(table.exact_extremes(0).expect("a column"), table.walk_extremes(0).unwrap());
+        table.append_row(&[Value::Integer(-40)]).expect("one integer");
+        let ends = Some((Bound::Int(-40), Bound::Int(6)));
+        assert_eq!(table.exact_extremes(0).expect("a column"), ends);
+        table.append_rows(&[vec![Value::Integer(90)]]).expect("one integer");
+        let ends = Some((Bound::Int(-40), Bound::Int(90)));
+        assert_eq!(table.exact_extremes(0).expect("a column"), ends);
+        assert!(table.exact_extremes(1).is_err());
     }
 
     #[test]
