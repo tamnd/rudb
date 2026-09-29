@@ -115,6 +115,9 @@ pub struct Parent {
     /// Set once a column read whole for a scattered chunk went past the budget, so that later
     /// chunks go by part without trying again.
     refused: AtomicBool,
+    /// Set once a column has been read whole for a scattered chunk and gathered from, so that later
+    /// chunks are placed whole without counting the parts they reach.
+    whole: AtomicBool,
 }
 
 /// Where the parent rows one chunk asked for are, worked out once and used for every column.
@@ -219,6 +222,7 @@ impl Parent {
             spent_parts: AtomicUsize::new(0),
             visited: Mutex::new(HashSet::new()),
             refused: AtomicBool::new(false),
+            whole: AtomicBool::new(false),
         }
     }
 
@@ -239,6 +243,20 @@ impl Parent {
         let starts = directory.starts.as_slice();
         let total = starts.last().copied().unwrap_or(0);
         let parts = starts.len().saturating_sub(1);
+        // Once a chunk has been gathered out of a column read whole, the columns a link join asks for
+        // are held whole and every later chunk is cheapest gathered from them by row id, whichever
+        // parts it reaches. So the rows are checked against the end and nothing else. On TPC-H q09
+        // the count below was about seventy instructions a row against `partsupp` and `orders`,
+        // for an answer that was whole every time.
+        if self.whole.load(Ordering::Relaxed) && !self.refused.load(Ordering::Relaxed) {
+            if let Some(&past) = rids.iter().find(|&&rid| rid != NO_ROW && u64::from(rid) >= total)
+            {
+                return Err(Error::internal(format!(
+                    "a gathered row id {past} is past the {total} rows of its parent"
+                )));
+            }
+            return Ok(Placement { rows: rids.len(), shape: Shape::Whole(parts, rids.to_vec()) });
+        }
         // For each part, its place among the parts this chunk reached, in the order reached.
         let mut numbered = vec![NO_ROW; parts];
         let mut reached: Vec<usize> = Vec::new();
@@ -339,6 +357,7 @@ impl Parent {
             Shape::One(part, offsets) => self.rows_in(column, *part, offsets),
             Shape::Whole(_, rids) => {
                 if let Some(whole) = self.column(column, ty)? {
+                    self.whole.store(true, Ordering::Relaxed);
                     return whole.gather(rids).map(Some);
                 }
                 // Past the budget, so this chunk and every one after it go by part.
@@ -983,6 +1002,25 @@ mod tests {
             let want = if id == NO_ROW { Value::Null } else { Value::Integer(id as i32) };
             assert_eq!(column.value_at(row), want, "row {row}");
         }
+    }
+
+    /// Once a chunk has been gathered out of the column read whole, a later chunk is placed whole
+    /// too, even one that lands in a single part, and still reads the rows it asked for.
+    #[test]
+    fn a_chunk_after_a_whole_gather_is_placed_whole() {
+        let values: Vec<i32> = (0..1024).collect();
+        let parent = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        let scattered = parent.place(&[1000, 3, 300, 700, 129, 900, 500]).expect("placed");
+        parent.gather(0, &LogicalType::Integer, &scattered).expect("read").expect("fits");
+        let ids = [130, NO_ROW, 129];
+        let placed = parent.place(&ids).expect("placed");
+        assert_eq!(placed.parts(), 8, "placed whole rather than in its one part");
+        let column = parent.gather(0, &LogicalType::Integer, &placed).expect("read").expect("fits");
+        let want = [Value::Integer(130), Value::Null, Value::Integer(129)];
+        for (row, want) in want.iter().enumerate() {
+            assert_eq!(&column.value_at(row), want, "row {row}");
+        }
+        assert!(parent.place(&[1024]).is_err(), "a row past the end is still an error");
     }
 
     /// A chunk that reaches more than half the parts is gathered out of the column read whole, and

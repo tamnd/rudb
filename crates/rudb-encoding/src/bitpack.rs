@@ -766,6 +766,13 @@ pub fn unpack_tail_into<U: Copy>(
 /// If `width` exceeds 64, or if the value would run past the end of `input`.
 #[inline]
 pub fn tail_at(input: &[u8], width: usize, index: usize) -> Result<u64> {
+    // The common case ahead of the checks, since it needs none of them: a width of at most 56 bits
+    // starting anywhere in a byte ends inside the eight bytes from that byte, and those are there.
+    // This is the read a link makes for every child it is asked about.
+    let start = index.wrapping_mul(width);
+    if width <= 56 && index <= usize::MAX / 64 && start / 8 + 8 <= input.len() {
+        return Ok((word_at(input, start / 8) >> (start % 8)) & low_mask(width));
+    }
     if width > 64 {
         return Err(Error::internal(format!("a width of {width} is past what a u64 holds")));
     }
