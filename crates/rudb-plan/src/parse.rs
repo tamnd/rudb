@@ -1047,6 +1047,7 @@ fn read_value(text: &str, ty: &LogicalType) -> Result<Value> {
         LogicalType::UInteger => text.parse().map(Value::UInteger).map_err(|_| whole("a UINTEGER")),
         LogicalType::UBigInt => text.parse().map(Value::UBigInt).map_err(|_| whole("a UBIGINT")),
         LogicalType::UHugeInt => text.parse().map(Value::UHugeInt).map_err(|_| whole("a UHUGEINT")),
+        LogicalType::Uuid => text.parse().map(Value::Uuid).map_err(|_| whole("a UUID")),
         LogicalType::Float => text.parse().map(Value::Float).map_err(|_| whole("a FLOAT")),
         LogicalType::Double => text.parse().map(Value::Double).map_err(|_| whole("a DOUBLE")),
         LogicalType::Decimal { width, scale } => read_decimal(text, *width, *scale),

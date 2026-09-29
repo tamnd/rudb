@@ -1132,9 +1132,9 @@ impl Prepared {
                     })?,
                 )
             }
-            // The one call with no argument to take a row count from, so it is given the chunk's.
-            Step::Function { recipe, len: 0, .. } if recipe.name() == "random" => {
-                Some(rudb_kernels::random(chunk.len())?)
+            // The calls with no argument to take a row count from, so they are given the chunk's.
+            Step::Function { recipe, len: 0, .. } if rudb_kernels::draws(recipe.name()) => {
+                Some(rudb_kernels::drawn(recipe.name(), chunk.len())?)
             }
             Step::Function { recipe, written, start, len } => {
                 Some(self.with_operands(*start, *len, chunk, slots, |args| {

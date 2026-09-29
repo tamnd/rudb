@@ -114,6 +114,6 @@ pub use logic::{Connective, combine, is_true};
 pub use membership::{Members, in_set, select_in};
 pub use peel::{Found, Lookup};
 pub use prepare::{Held, Recipe};
-pub use random::random;
+pub use random::{drawn, draws, random};
 pub use scalar::{call, call_prepared, call_values};
 pub use select::{refine as refine_flags, selection};

@@ -1,4 +1,5 @@
-//! `random()` and `setseed()`, drawn the way the pin draws them so a seeded query repeats its rows.
+//! `random()`, `setseed()` and the UUID makers, drawn the way the pin draws them so a seeded query
+//! repeats its rows.
 //!
 //! The pin keeps one PCG32 generator per connection, which `setseed` reseeds, and gives every
 //! `random()` in a query a generator of its own, seeded from sixty four bits of the shared one when
@@ -14,7 +15,7 @@
 
 use std::sync::{Mutex, PoisonError};
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, Result, Value, uuid};
 use rudb_vector::{Data, Vector};
 
 /// The PCG32 the pin uses, `setseq_xsh_rr_64_32` on its default stream.
@@ -83,6 +84,66 @@ pub fn random(rows: usize) -> Result<Vector> {
     Vector::flat(LogicalType::Double, Data::Float64(values.into()))
 }
 
+/// Whether `name` is a call with no arguments that the executor has to give a row count to.
+#[must_use]
+pub fn draws(name: &str) -> bool {
+    matches!(name, "random" | "gen_random_uuid" | "uuid" | "uuidv4" | "uuidv7")
+}
+
+/// `rows` answers for one call to `name`, which [`draws`] said yes to.
+///
+/// # Errors
+///
+/// When `name` is not one of them.
+pub fn drawn(name: &str, rows: usize) -> Result<Vector> {
+    match name {
+        "random" => random(rows),
+        "gen_random_uuid" | "uuid" | "uuidv4" => uuids(rows, version4),
+        "uuidv7" => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+            let millis = now.map_or(0, |now| now.as_millis());
+            uuids(rows, |own| version7(own, millis))
+        }
+        _ => Err(Error::internal(format!("{name} is not drawn"))),
+    }
+}
+
+/// `rows` UUIDs, each made by `make` from a generator seeded the way `random()` seeds its own.
+fn uuids(rows: usize, mut make: impl FnMut(&mut Pcg32) -> [u8; 16]) -> Result<Vector> {
+    let mut own = Pcg32::seeded(with_shared(Pcg32::next64));
+    let values: Vec<i128> = (0..rows).map(|_| uuid::from_bytes(make(&mut own))).collect();
+    Vector::flat(LogicalType::Uuid, Data::Int128(values.into()))
+}
+
+/// A version 4 UUID the pin's way: four outputs laid down low byte first, the version and variant
+/// bits put in, and the top bit flipped, since the pin builds the number without the flip its
+/// stored form has and so every one it prints has that bit the other way round.
+fn version4(own: &mut Pcg32) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    for chunk in bytes.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&own.next().to_le_bytes());
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    bytes[0] ^= 0x80;
+    bytes
+}
+
+/// A version 7 UUID the pin's way: the forty eight bits of `millis`, then ten random bytes from
+/// three outputs laid down high byte first, with the version and variant bits put in.
+fn version7(own: &mut Pcg32, millis: u128) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..6].copy_from_slice(&millis.to_be_bytes()[10..]);
+    let mut random = [0; 12];
+    for chunk in random.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&own.next().to_be_bytes());
+    }
+    bytes[6..].copy_from_slice(&random[..10]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    bytes
+}
+
 /// `setseed(x)`, which reseeds the shared generator and answers NULL. A null seed leaves it alone.
 pub(crate) fn setseed(seed: &Value) -> Result<Value> {
     let Value::Double(seed) = *seed else {
@@ -113,5 +174,23 @@ mod tests {
         assert_eq!(own.double(), 0.564_860_018_730_782_4);
         let mut second = Pcg32::seeded(shared.next64());
         assert_eq!(second.double(), 0.002_978_387_269_385_594);
+    }
+
+    #[test]
+    fn a_seeded_generator_makes_the_pins_uuids() {
+        // `setseed(0.5)` on the pin, then `SELECT uuid(), uuidv7() FROM range(2)`, whose second
+        // call takes the second seed from the shared generator.
+        let mut shared = Pcg32::seeded(u64::from(((0.5 + 1.0) * f64::from(u32::MAX / 2)) as u32));
+        let text = |bytes: [u8; 16]| Value::Uuid(uuid::from_bytes(bytes)).to_string();
+        let mut own = Pcg32::seeded(shared.next64());
+        assert_eq!(text(version4(&mut own)), "4e8de2d9-2ca9-4c5a-8baa-9a9005b24344");
+        assert_eq!(text(version4(&mut own)), "f8db6a10-3fb6-41db-b068-b3ba73ab29fd");
+        let mut own = Pcg32::seeded(shared.next64());
+        assert_eq!(text(version4(&mut own)), "8b31c300-db9f-45ea-b7ce-319e8056e58c");
+        let mut shared = Pcg32::seeded(u64::from(((0.5 + 1.0) * f64::from(u32::MAX / 2)) as u32));
+        let mut own = Pcg32::seeded(shared.next64());
+        let millis = 0x01a0_edf1_eca9;
+        assert_eq!(text(version7(&mut own, millis)), "01a0edf1-eca9-79e2-8dce-5acca92c909a");
+        assert_eq!(text(version7(&mut own, millis)), "01a0edf1-eca9-7443-b205-106adb78dbd1");
     }
 }

@@ -969,7 +969,7 @@ pub fn hash_value(value: &Value) -> Option<u64> {
         | Value::TimestampS(v)
         | Value::TimestampMs(v)
         | Value::TimestampNs(v) => hash_signed(i128::from(*v)),
-        Value::HugeInt(v) => hash_signed(*v),
+        Value::HugeInt(v) | Value::Uuid(v) => hash_signed(*v),
         Value::UTinyInt(v) => hash_unsigned(u128::from(*v)),
         Value::USmallInt(v) => hash_unsigned(u128::from(*v)),
         Value::UInteger(v) => hash_unsigned(u128::from(*v)),

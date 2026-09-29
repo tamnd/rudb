@@ -1117,8 +1117,20 @@ impl Binder<'_> {
         &mut self,
         resolved_name: &str,
         stored_name: Option<&str>,
-        args: Vec<ExprRef>,
+        mut args: Vec<ExprRef>,
     ) -> Result<ExprRef> {
+        // The pin's string literal reaches any parameter type by a cast, and the UUID readers are
+        // the calls here whose one parameter takes nothing else, so a literal is read as a UUID
+        // before the call is resolved rather than refused as a VARCHAR.
+        if matches!(resolved_name, "uuid_extract_version" | "uuid_extract_timestamp") {
+            for arg in &mut args {
+                if let Expr::Constant(value) = *self.plan().expr(*arg)
+                    && matches!(self.plan().value(value), Value::Varchar(_))
+                {
+                    *arg = self.cast_to(*arg, &LogicalType::Uuid);
+                }
+            }
+        }
         let types: Vec<LogicalType> =
             args.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
         let resolved = resolve(resolved_name, &types)?;
@@ -2050,7 +2062,9 @@ fn comparison_type(left: &LogicalType, right: &LogicalType) -> Option<LogicalTyp
         return Some(common);
     }
     let reads_a_string = |ty: &LogicalType| {
-        ty.is_numeric() || ty.is_temporal() || matches!(ty, LogicalType::Boolean)
+        ty.is_numeric()
+            || ty.is_temporal()
+            || matches!(ty, LogicalType::Boolean | LogicalType::Uuid)
     };
     match (left, right) {
         (LogicalType::Varchar, LogicalType::Blob) | (LogicalType::Blob, LogicalType::Varchar) => {
@@ -2373,6 +2387,11 @@ fn number(text: &str, negative: bool) -> Result<Value> {
         if let Ok(value) = written.parse::<i128>() {
             return Ok(Value::HugeInt(value));
         }
+        // Past a HUGEINT and inside a UHUGEINT the pin reads a UHUGEINT, and past that a BIGNUM,
+        // which is a double here.
+        if let Ok(value) = written.parse::<u128>() {
+            return Ok(Value::UHugeInt(value));
+        }
         return Ok(Value::Double(written.parse::<f64>().map_err(|_| unreadable())?));
     };
     // The last dot is the decimal point and every other one counts as a digit of the width, which
@@ -2456,8 +2475,16 @@ mod tests {
         assert_eq!(number("1", false).expect("a number"), Value::Integer(1));
         assert_eq!(number("2147483648", false).expect("a number"), Value::BigInt(2_147_483_648));
         assert_eq!(number("2147483648", true).expect("a number"), Value::Integer(-2_147_483_648));
-        assert!(matches!(
+        assert_eq!(
             number("170141183460469231731687303715884105728", false).expect("a number"),
+            Value::UHugeInt(1 << 127)
+        );
+        assert!(matches!(
+            number("340282366920938463463374607431768211456", false).expect("a number"),
+            Value::Double(_)
+        ));
+        assert!(matches!(
+            number("170141183460469231731687303715884105729", true).expect("a number"),
             Value::Double(_)
         ));
     }

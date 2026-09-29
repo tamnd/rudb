@@ -89,7 +89,18 @@ pub const CONSISTENT: &str = "CONSISTENT";
 pub const VOLATILE: &str = "VOLATILE";
 
 /// The functions the pin reports as volatile with side effects, of the ones rudb has.
-const MOVING: &[&str] = &["currval", "error", "nextval", "random", "setseed", "setval"];
+const MOVING: &[&str] = &[
+    "currval",
+    "error",
+    "gen_random_uuid",
+    "nextval",
+    "random",
+    "setseed",
+    "setval",
+    "uuid",
+    "uuidv4",
+    "uuidv7",
+];
 
 /// The columns `duckdb_functions()` produces, which is DuckDB's twenty one.
 #[must_use]
@@ -489,8 +500,7 @@ mod tests {
         // A function that lands here volatile has to be added to the list on purpose, so this fails
         // for one that arrives without anybody deciding what the column says for it.
         for entry in function_entries().iter().filter(|entry| entry.function_type != "table") {
-            let moving = ["currval", "error", "nextval", "random", "setseed", "setval"]
-                .contains(&entry.name);
+            let moving = super::MOVING.contains(&entry.name);
             let stability = if moving { super::VOLATILE } else { CONSISTENT };
             assert_eq!(entry.stability, Some(stability), "{}", entry.name);
             assert_eq!(entry.has_side_effects, Some(moving), "{}", entry.name);

@@ -631,6 +631,7 @@ mod tag {
     pub(super) const TIMESTAMP_S: u8 = 26;
     pub(super) const TIMESTAMP_MS: u8 = 27;
     pub(super) const TIMESTAMP_NS: u8 = 28;
+    pub(super) const UUID: u8 = 29;
 }
 
 /// Writes one value of a column of `ty`, or says it cannot.
@@ -681,6 +682,10 @@ fn put(out: &mut Vec<u8>, value: &Value, ty: &LogicalType) -> Option<()> {
         Value::UHugeInt(held) => {
             fits(LogicalType::UHugeInt)?;
             fixed(out, tag::UHUGEINT, &held.to_le_bytes())
+        }
+        Value::Uuid(held) => {
+            fits(LogicalType::Uuid)?;
+            fixed(out, tag::UUID, &held.to_le_bytes())
         }
         Value::Float(held) => {
             fits(LogicalType::Float)?;
@@ -813,6 +818,7 @@ fn get(bytes: &[u8], at: &mut usize, ty: &LogicalType) -> Result<Value> {
         tag::UINTEGER => Value::UInteger(u32::from_le_bytes(array(bytes, at)?)),
         tag::UBIGINT => Value::UBigInt(u64::from_le_bytes(array(bytes, at)?)),
         tag::UHUGEINT => Value::UHugeInt(u128::from_le_bytes(array(bytes, at)?)),
+        tag::UUID => Value::Uuid(i128::from_le_bytes(array(bytes, at)?)),
         tag::FLOAT => Value::Float(f32::from_le_bytes(array(bytes, at)?)),
         tag::DOUBLE => Value::Double(f64::from_le_bytes(array(bytes, at)?)),
         tag::DECIMAL => {

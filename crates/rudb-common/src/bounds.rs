@@ -186,7 +186,7 @@ impl Bound {
             Value::SmallInt(number) => Self::Int(i128::from(*number)),
             Value::Integer(number) => Self::Int(i128::from(*number)),
             Value::BigInt(number) => Self::Int(i128::from(*number)),
-            Value::HugeInt(number) => Self::Int(*number),
+            Value::HugeInt(number) | Value::Uuid(number) => Self::Int(*number),
             Value::UTinyInt(number) => Self::Int(i128::from(*number)),
             Value::USmallInt(number) => Self::Int(i128::from(*number)),
             Value::UInteger(number) => Self::Int(i128::from(*number)),

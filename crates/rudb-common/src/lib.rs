@@ -41,6 +41,7 @@ pub mod stage;
 pub mod stat;
 pub mod types;
 pub mod utf8;
+pub mod uuid;
 pub mod value;
 
 pub use bounds::{Bound, Op, excluded};

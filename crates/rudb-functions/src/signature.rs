@@ -392,6 +392,7 @@ enum Fixed {
     Timestamp,
     TimestampTz,
     Interval,
+    Uuid,
     /// The type of a bare `NULL`, which is what `setseed` answers.
     Null,
     /// `VARCHAR[]`, which is what the splits answer.
@@ -416,6 +417,7 @@ impl Fixed {
             Self::Timestamp => LogicalType::Timestamp,
             Self::TimestampTz => LogicalType::TimestampTz,
             Self::Interval => LogicalType::Interval,
+            Self::Uuid => LogicalType::Uuid,
             Self::Null => LogicalType::Null,
             Self::VarcharList => LogicalType::list(LogicalType::Varchar),
         }
@@ -551,6 +553,26 @@ const TABLE: &[Entry] = &[
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(1),
         shape: Shape::FixedTo(Fixed::Double, Fixed::Null),
+        numeric_only: false,
+    },
+    // The UUID makers are volatile like `random` and are handed the row count the same way. The
+    // two readers take a UUID and nothing a cast would have to reach.
+    made("gen_random_uuid"),
+    made("uuid"),
+    made("uuidv4"),
+    made("uuidv7"),
+    Entry {
+        name: "uuid_extract_version",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Uuid, Fixed::UInteger),
+        numeric_only: false,
+    },
+    Entry {
+        name: "uuid_extract_timestamp",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Uuid, Fixed::TimestampTz),
         numeric_only: false,
     },
     number("floor", Arity::exactly(1), Shape::Floored),
@@ -1152,6 +1174,17 @@ const TABLE: &[Entry] = &[
 /// A scalar that takes numbers.
 const fn number(name: &'static str, arity: Arity, shape: Shape) -> Entry {
     Entry { name, kind: FunctionKind::Scalar, arity, shape, numeric_only: true }
+}
+
+/// A UUID maker, which takes nothing and answers a new UUID on every row.
+const fn made(name: &'static str) -> Entry {
+    Entry {
+        name,
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(0),
+        shape: Shape::Constant(Fixed::Uuid),
+        numeric_only: false,
+    }
 }
 
 /// A scalar over bit strings.
@@ -2269,6 +2302,12 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("pi", &["pi() -> DOUBLE"]),
     ("random", &["random() -> DOUBLE"]),
     ("setseed", &["setseed(col0 DOUBLE) -> \"NULL\""]),
+    ("gen_random_uuid", &["gen_random_uuid() -> UUID"]),
+    ("uuid", &["uuid() -> UUID"]),
+    ("uuidv4", &["uuidv4() -> UUID"]),
+    ("uuidv7", &["uuidv7() -> UUID"]),
+    ("uuid_extract_version", &["uuid_extract_version(col0 UUID) -> UINTEGER"]),
+    ("uuid_extract_timestamp", &["uuid_extract_timestamp(col0 UUID) -> TIMESTAMP WITH TIME ZONE"]),
     (
         "floor",
         &[
@@ -3098,6 +3137,7 @@ impl Fixed {
             Self::Timestamp => "TIMESTAMP",
             Self::TimestampTz => "TIMESTAMP WITH TIME ZONE",
             Self::Interval => "INTERVAL",
+            Self::Uuid => "UUID",
             Self::Null => "\"NULL\"",
             Self::VarcharList => "VARCHAR[]",
         }

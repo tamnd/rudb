@@ -3430,7 +3430,7 @@ fn fold_value(state: u64, value: &Value) -> u64 {
         // Two words, low first, the way the 128 bit layouts are read. The width and the scale of a
         // decimal are not mixed, because they are the column's and not the value's, and a flat
         // decimal column is a run of integers with no room to keep them.
-        Value::HugeInt(x) => mix(mix(state, *x as u64), (*x >> 64) as u64),
+        Value::HugeInt(x) | Value::Uuid(x) => mix(mix(state, *x as u64), (*x >> 64) as u64),
         // A decimal is hashed as the layout its width puts it in and not always as a `HUGEINT`,
         // because a `DECIMAL(9, 2)` column is a run of `i32` and the run above hashes it as one
         // word. Hashing the value as two here and the run as one put the same value in two buckets
