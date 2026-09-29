@@ -59,8 +59,8 @@ pub struct Writer<W: Write> {
 /// The type a column of `ty` has to be cast to before it is handed to a [`Writer`].
 ///
 /// Most types are written as themselves. An enum is written as its text and a timestamp in
-/// seconds or milliseconds as one in microseconds, which is what the pin does with them, and a
-/// `HUGEINT` as a `DOUBLE`, which is also what the pin does.
+/// seconds or milliseconds as one in microseconds, which is what the pin does with them, a
+/// `HUGEINT` as a `DOUBLE`, which is also what the pin does, and an aggregate state as its layout.
 ///
 /// # Errors
 ///
@@ -72,6 +72,9 @@ pub fn storage(ty: &LogicalType) -> Result<LogicalType> {
         LogicalType::TimestampS | LogicalType::TimestampMs => LogicalType::Timestamp,
         LogicalType::HugeInt | LogicalType::UHugeInt => LogicalType::Double,
         LogicalType::Null => LogicalType::Integer,
+        // A state is written as its layout, which is what the pin writes, and read back as that
+        // layout, which `to_aggregate_state` turns into a state again.
+        LogicalType::AggregateState(_) => storage(ty.storage())?,
         ty if physical(ty).is_some() => ty.clone(),
         other => {
             return Err(Error::not_implemented(format!(

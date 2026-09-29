@@ -45,7 +45,8 @@ pub fn state_layout(
         return Ok(Powers::layout(measure));
     }
     Ok(match name {
-        "count" | "count_star" => LogicalType::UBigInt,
+        // The pin counts rows into a signed 64 bit state, which is what a Parquet file of one shows.
+        "count" | "count_star" => LogicalType::BigInt,
         "sum" => match arguments.first() {
             Some(LogicalType::Decimal { .. }) => LogicalType::HugeInt,
             _ => returns.clone(),
@@ -370,9 +371,7 @@ impl Accumulator {
     /// If a total does not fit the layout, and an internal error for a state this does not write.
     pub(crate) fn export(&self, layout: &LogicalType) -> Result<Value> {
         match &self.state {
-            State::Counted { count, .. } => {
-                Ok(Value::UBigInt(u64::try_from(*count).unwrap_or_default()))
-            }
+            State::Counted { count, .. } => Ok(Value::BigInt(*count)),
             State::Whole { .. } | State::Real { .. } | State::Extreme { .. } => self.finish(),
             State::Scaled { total, seen, .. } => {
                 Ok(if *seen { Value::HugeInt(*total) } else { Value::Null })
