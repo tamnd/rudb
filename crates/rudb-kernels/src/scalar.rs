@@ -2572,6 +2572,15 @@ impl StableLike {
     /// q22 alive. A group the stored signature rules out is still decided whole, since that costs
     /// no decoding at all.
     fn decide_codes(&self, codes: &[u32], like: &Like, characters: &mut Vec<char>) -> Result<()> {
+        // A pattern that is one run of bytes is searched for about what decoding the values costs,
+        // so deciding a whole group it comes back to is at most one more read of its block, and no
+        // block has to be kept for it. Any other pattern costs many decodes a value, which is what
+        // JOB 20b above paid, so it decides only what it is asked and leaves keeping to the source.
+        let once = !like.fold_case
+            && matches!(
+                like.compiled,
+                Pattern::Exact(_) | Pattern::Prefix(_) | Pattern::Suffix(_) | Pattern::Contains(_)
+            );
         let mut wanted = Vec::with_capacity(codes.len());
         let mut at = 0;
         while at < codes.len() {
@@ -2579,17 +2588,39 @@ impl StableLike {
             let upto =
                 at + codes[at..].partition_point(|&code| (code as usize) < first + LIKE_GROUP);
             let last = (first + LIKE_GROUP).min(self.dictionary.len());
-            if !self.ruled_out(first, last, like)? {
-                wanted.extend_from_slice(&codes[at..upto]);
+            if once && self.touched(first, last) {
+                wanted.extend(first..last);
+            } else if !self.ruled_out(first, last, like)? {
+                wanted.extend(codes[at..upto].iter().map(|&code| code as usize));
             }
             at = upto;
         }
-        self.dictionary.visit_text(&wanted, &mut |at: usize, text: &[u8]| {
+        let mut decide = |at: usize, text: &[u8]| {
             let held = like.holds_loan(text, characters)?;
-            let (index, shift) = Self::slot(wanted[at] as usize);
+            let (index, shift) = Self::slot(wanted[at]);
             self.word(index)?.fetch_or((1 | u64::from(held) << 1) << shift, Ordering::Release);
             Ok(())
-        })
+        };
+        if once {
+            self.dictionary.visit_text_once(&wanted, &mut decide)
+        } else {
+            let codes = wanted.iter().map(|&code| code as u32).collect::<Vec<_>>();
+            self.dictionary.visit_text(&codes, &mut decide)
+        }
+    }
+
+    /// Whether some value from `first` to `last` is decided already, which means an earlier chunk
+    /// read this group's block for a few of its values.
+    ///
+    /// A group a cheap pattern is asked about a second time is decided whole, so that its block is
+    /// read at most twice and no chunk after that reads it at all. Deciding only the values asked about each time read
+    /// the same block again for every chunk that landed in it, and the source kept the block to
+    /// make that cheap: on ClickBench q23 that was 86 MB of `Title` and `URL` held for a filter
+    /// whose answers are two bits a value.
+    fn touched(&self, first: usize, last: usize) -> bool {
+        self.state[first / MEMO_VALUES..last.div_ceil(MEMO_VALUES)]
+            .iter()
+            .any(|word| word.load(Ordering::Acquire) != 0)
     }
 
     /// Whether the stored signature proves no value from `first` to `last` holds the pattern, in
