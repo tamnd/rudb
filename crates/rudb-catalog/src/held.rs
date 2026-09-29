@@ -6,17 +6,19 @@
 //! arrived, and that tally belongs to the table rather than being shared behind a reference count,
 //! so it cannot be handed to a plan the way a file's can.
 //!
-//! So this is a copy, taken once when the statement is bound. That is affordable here and only here,
-//! because of the one property the cap in `tally.rs` gives the lists: a column either holds at most
-//! five hundred and twelve values or holds no list at all. A copy of the zone maps of a table in
-//! memory would be a copy of a summary per chunk and would grow with the rows, which is why
-//! `Rows::zones` still answers `None` for one. A copy of the frequency lists is bounded by the
+//! So this is a copy, built out of the tally the first time a statement is bound after rows arrive
+//! and shared by every statement after it until more rows come. That is affordable here and only
+//! here, because of the one property the cap in `tally.rs` gives the lists: a column either holds
+//! at most five hundred and twelve values or holds no list at all. A copy of the zone maps of a
+//! table in memory would be a copy of a summary per chunk and would grow with the rows, which is
+//! why `Rows::zones` still answers `None` for one. A copy of the frequency lists is bounded by the
 //! schema.
 //!
 //! The names come from the catalog entry, because a table in memory keeps its types and not its
 //! names. That is the same reason `Table::distincts` is on the table rather than on the rows.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use rudb_common::bounds::{Bound, Frequencies, Remainder};
 use rudb_common::stat::{Provenance, Stat};
@@ -24,7 +26,7 @@ use rudb_common::{Field, Value};
 use rudb_storage::MemoryTable;
 
 /// One column's values with the rows holding each, or nothing when the column keeps no list.
-type Listed = Option<Vec<(Value, u64)>>;
+type Listed = Option<Arc<[(Value, u64)]>>;
 
 /// The frequency lists of a table in memory, copied out of it and named.
 #[derive(Debug, Clone)]
@@ -52,7 +54,7 @@ impl Held {
                 // Asked before it is built, because a column with no list is the common case for a
                 // wide table and the question is a comparison where the answer is a copy.
                 let held = match rows.frequency_values(at) {
-                    Some(_) => rows.frequencies(at).ok().flatten(),
+                    Some(_) => rows.frequency_list(at).ok().flatten(),
                     None => None,
                 };
                 any |= held.is_some();
@@ -77,7 +79,7 @@ impl Frequencies for Held {
             return Stat::Unknown;
         };
         let mut comparable = false;
-        for (entry, count) in held {
+        for (entry, count) in held.iter() {
             // A null entry is the column's nulls and no equality matches a null, so it is skipped.
             // It is in the list all the same, because the rows under it are rows the values do not
             // account for and a caller subtracting from the total has to be able to see them.

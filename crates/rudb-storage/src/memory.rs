@@ -66,7 +66,7 @@
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use rudb_common::bounds::Bound;
@@ -174,6 +174,10 @@ pub struct MemoryTable {
     /// One per column, and a chunk whose rows could not all be read has `None`, which is a chunk
     /// that is always read.
     grams: Vec<OnceLock<Vec<Option<Grams>>>>,
+    /// Each column's [`MemoryTable::frequencies`], built the first time the planner asks and dropped
+    /// whenever a row is added, like `grams`. The planner asks for every column on every query, and
+    /// building a list sorts it and copies each value out of the tally.
+    lists: Vec<OnceLock<Option<Arc<[(Value, u64)]>>>>,
     rows: usize,
     stats_ns: u64,
     counts_ns: u64,
@@ -185,6 +189,7 @@ impl MemoryTable {
     pub fn new(types: Vec<LogicalType>) -> Self {
         let counts = Counts::new(types.len());
         let grams = types.iter().map(|_| OnceLock::new()).collect();
+        let lists = types.iter().map(|_| OnceLock::new()).collect();
         Self {
             types,
             groups: Vec::new(),
@@ -199,6 +204,7 @@ impl MemoryTable {
             zones: Vec::new(),
             counts,
             grams,
+            lists,
             rows: 0,
             stats_ns: 0,
             counts_ns: 0,
@@ -765,6 +771,26 @@ impl MemoryTable {
         Ok(Some(held))
     }
 
+    /// [`MemoryTable::frequencies`] shared rather than copied, built once for as long as no row is
+    /// added.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the table.
+    pub fn frequency_list(&self, column: usize) -> Result<Option<Arc<[(Value, u64)]>>> {
+        let Some(list) = self.lists.get(column) else {
+            return Err(Error::internal(format!(
+                "column {column} of a table that has {}",
+                self.types.len()
+            )));
+        };
+        if let Some(held) = list.get() {
+            return Ok(held.clone());
+        }
+        let held: Option<Arc<[(Value, u64)]>> = self.frequencies(column)?.map(Arc::from);
+        Ok(list.get_or_init(|| held).clone())
+    }
+
     /// The smallest and the largest value of one string column, from the values its tally holds.
     ///
     /// Strings only, because they are the one type whose ends the zone maps can fail to give
@@ -862,10 +888,14 @@ impl MemoryTable {
         Some(built)
     }
 
-    /// Drops every column's grams, because the rows are about to change under them.
+    /// Drops every column's grams and frequency list, because the rows are about to change under
+    /// them.
     fn forget_grams(&mut self) {
         for grams in &mut self.grams {
             grams.take();
+        }
+        for list in &mut self.lists {
+            list.take();
         }
     }
 
@@ -1278,6 +1308,20 @@ mod tests {
             .collect();
         table.append_rows(&values).expect("one integer a row");
         table
+    }
+
+    #[test]
+    fn a_shared_frequency_list_is_built_again_after_rows_are_added() {
+        let mut table = counted(100);
+        let first = table.frequency_list(0).expect("a column").expect("a list");
+        assert_eq!(first.to_vec(), table.frequencies(0).expect("a column").expect("a list"));
+        let again = table.frequency_list(0).expect("a column").expect("a list");
+        assert!(Arc::ptr_eq(&first, &again), "the list was built twice for the same rows");
+        table.append_row(&[Value::Integer(100)]).expect("one integer");
+        let after = table.frequency_list(0).expect("a column").expect("a list");
+        assert_eq!(after.to_vec(), table.frequencies(0).expect("a column").expect("a list"));
+        assert_eq!(after.len(), first.len() + 1);
+        assert!(table.frequency_list(1).is_err());
     }
 
     #[test]
