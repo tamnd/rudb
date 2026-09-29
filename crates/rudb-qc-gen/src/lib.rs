@@ -96,6 +96,19 @@ pub struct Body {
     /// The `LIKE` answers the body reads after its source columns in the morsel's column table,
     /// in that order.
     pub likes: Vec<Matched>,
+    /// The group key columns the body reads as the index of each row's value in the column's
+    /// values, after the `LIKE` answers in the morsel's column table.
+    pub domains: Vec<Domain>,
+}
+
+/// A text column the driver hands the body as one `u16` a row: the index of the row's value in
+/// [`Domain::values`], their count for a NULL, and one more than that for a value not in them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Domain {
+    /// The source column.
+    pub column: usize,
+    /// Its values, as the statistics had them when the code was made.
+    pub values: Vec<Vec<u8>>,
 }
 
 /// A `LIKE` of a source column against a constant, which the driver answers for the whole morsel
@@ -189,6 +202,11 @@ pub struct Grouping {
     /// which the body probes itself before it calls: the address of the slots, their mask, the
     /// address of the rows by group id, and how many keys it found that way.
     pub probe: Option<u32>,
+    /// For an aggregate grouped by columns that are all in [`Body::domains`], the state offset of
+    /// an array of rows indexed by the keys' indexes, zero for a key not seen yet. It has one more
+    /// entry past the last key, which a key with a value not in the domains goes to and which is
+    /// always zero, so such a key always takes the way through the hash.
+    pub dense: Option<u32>,
 }
 
 /// One accumulator in a group row.
@@ -255,16 +273,23 @@ pub fn generate(graph: &Graph, rt: &mut Rt) -> Result<Query> {
     generate_with(graph, rt, &[])
 }
 
-/// [`generate`], with what the statistics say about the columns each pipeline scans.
-///
-/// `bits` has one entry per stage, and each of those one per source column: the `k` for which
-/// every value of the column is at least `-2^k` and under `2^k`, or `None` when that is not known.
-/// A stage past the end of `bits` knows nothing.
+/// What the statistics say about one column a pipeline scans.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Known {
+    /// The `k` for which every value of an integer or decimal column is at least `-2^k` and under
+    /// `2^k`, as the unscaled integer of a decimal.
+    pub bits: Option<u32>,
+    /// Every value of a text column, when it has few of them.
+    pub values: Option<Vec<Vec<u8>>>,
+}
+
+/// [`generate`], with what the statistics say about the columns each pipeline scans: one entry
+/// per stage, and in each one per source column. A stage past the end of `known` knows nothing.
 ///
 /// # Errors
 ///
 /// As for [`generate`].
-pub fn generate_with(graph: &Graph, rt: &mut Rt, bits: &[Vec<Option<u32>>]) -> Result<Query> {
+pub fn generate_with(graph: &Graph, rt: &mut Rt, known: &[Vec<Known>]) -> Result<Query> {
     let mut module = Module::new("query");
     let mut bodies: Vec<Option<Body>> = Vec::with_capacity(graph.stages.len());
     for (stage, s) in graph.stages.iter().enumerate() {
@@ -282,7 +307,7 @@ pub fn generate_with(graph: &Graph, rt: &mut Rt, bits: &[Vec<Option<u32>>]) -> R
                         }
                     }
                 }
-                let known = bits.get(stage).map_or(&[][..], Vec::as_slice);
+                let known = known.get(stage).map_or(&[][..], Vec::as_slice);
                 Some(pipeline(stage, p, &joins, &mut module, rt, known)?)
             }
             _ => None,
@@ -335,7 +360,7 @@ fn pipeline(
     joins: &[Building],
     module: &mut Module,
     rt: &mut Rt,
-    bits: &[Option<u32>],
+    known: &[Known],
 ) -> Result<Body> {
     let name = format!("p{stage}");
     let source = p.source.columns();
@@ -377,7 +402,15 @@ fn pipeline(
         }
     }
     reads.sort_unstable();
-    let generic = Pass { name: &name, version: "generic", nonull: false, replay: None, bits: &[] };
+    let domains = domains(p, known);
+    let generic = Pass {
+        name: &name,
+        version: "generic",
+        nonull: false,
+        replay: None,
+        known,
+        domains: &domains,
+    };
     let (func, out, state, probes, made, _) =
         emit(stage, p, joins, module, rt, &reads, &likes, generic)?;
     module.funcs.push(func);
@@ -387,8 +420,14 @@ fn pipeline(
     let mut ranged = Vec::new();
     if !reads.is_empty() || !likes.is_empty() {
         let variant = format!("{name}_nonull");
-        let pass =
-            Pass { name: &variant, version: "nonull", nonull: true, replay: Some(&made), bits };
+        let pass = Pass {
+            name: &variant,
+            version: "nonull",
+            nonull: true,
+            replay: Some(&made),
+            known,
+            domains: &domains,
+        };
         if let Ok((f, o, st, pr, _, r)) = emit(stage, p, joins, module, rt, &reads, &likes, pass)
             && (&o, st, &pr) == (&out, state, &probes)
         {
@@ -398,7 +437,32 @@ fn pipeline(
             ranged = r;
         }
     }
-    Ok(Body { func: name, reads, state, sink: out, probes, nonull, ranged, likes })
+    Ok(Body { func: name, reads, state, sink: out, probes, nonull, ranged, likes, domains })
+}
+
+/// The most entries the array of [`Grouping::dense`] has.
+const DENSE: u64 = 1024;
+
+/// The group key columns of `p`, when its sink is an aggregate grouped by source columns whose
+/// values the statistics all have and few enough of them for an array indexed by every key there
+/// can be. That is the perfect hash on dictionaries of section 11.4 of
+/// `spec/compiler/11-memory-and-data-structures.md`.
+fn domains(p: &Pipeline, known: &[Known]) -> Vec<Domain> {
+    let Sink::Aggregate { groups, .. } = &p.sink else { return Vec::new() };
+    let mut domains = Vec::with_capacity(groups.len());
+    let mut keys = 1u64;
+    for e in groups {
+        let Kind::Column(c) = e.kind else { return Vec::new() };
+        let Some(values) = known.get(c).and_then(|k| k.values.as_ref()) else {
+            return Vec::new();
+        };
+        keys = keys.saturating_mul(values.len() as u64 + 1);
+        domains.push(Domain { column: c, values: values.clone() });
+    }
+    if keys >= DENSE {
+        return Vec::new();
+    }
+    domains
 }
 
 /// The digits after the point of a signed integer or a decimal type, which is none for an integer.
@@ -461,8 +525,10 @@ struct Pass<'a> {
     version: &'a str,
     nonull: bool,
     replay: Option<&'a [u64]>,
-    /// What the statistics say about the source columns, as in [`generate_with`].
-    bits: &'a [Option<u32>],
+    /// What the statistics say about the source columns.
+    known: &'a [Known],
+    /// The group key columns the body reads as indexes.
+    domains: &'a [Domain],
 }
 
 /// A pipeline's function, its sink, the bytes of state it needs, its probes, the handles it made
@@ -498,8 +564,9 @@ fn emit(
         nonull: pass.nonull,
         made: Vec::new(),
         replay: pass.replay.map(|made| (made, 0)),
-        bits: pass.bits,
+        known: pass.known,
         ranged: Vec::new(),
+        dense: Vec::new(),
     };
     g.b.func_mut().state.push(Field { offset: 0, size: HEADER, name: "header".into() });
 
@@ -524,6 +591,11 @@ fn emit(
         g.likes.push((values, valid));
     }
     g.matched = likes.to_vec();
+    for (k, d) in pass.domains.iter().enumerate() {
+        let at = (reads.len() + likes.len() + k) as i32 * COL_SIZE;
+        let values = g.b.load(Ty::Ptr, table, Val::NONE, 1, at, INV);
+        g.dense.push((values, d.values.len() as u32));
+    }
     let fans_out = p.probes().next().is_some();
     let (out, state) = g.prepare_sink(&p.sink, fans_out)?;
     g.next = state;
@@ -630,10 +702,13 @@ struct Gen<'a> {
     made: Vec<u64>,
     /// On the second pass, the first one's handles and how many of them are handed out so far.
     replay: Option<(&'a [u64], usize)>,
-    /// What the statistics say about the source columns, as in [`generate_with`].
-    bits: &'a [Option<u32>],
+    /// What the statistics say about the source columns.
+    known: &'a [Known],
     /// The source columns this version took to be in range so far, each once.
     ranged: Vec<(usize, u32)>,
+    /// Per group key column read as an index, the address of the indexes and how many values
+    /// the column has.
+    dense: Vec<(Val, u32)>,
 }
 
 /// A value and whether it is valid.
@@ -735,7 +810,14 @@ impl Gen<'_> {
                     (None, Some(SINK + size), SINK + size + 40)
                 };
                 let probe = last.filter(|_| !self.rt.ablate().off(Ablate::PROBE)).map(|at| at + 8);
-                let grouping = Grouping { table, keys, acc_offset, accs, row, last, probe };
+                let (dense, state) = if groups.is_empty() || self.dense.is_empty() {
+                    (None, state)
+                } else {
+                    let slots = self.dense.iter().map(|&(_, n)| n + 1).product::<u32>() + 1;
+                    self.field(state, slots * 8, "dense");
+                    (Some(state), state + slots * 8)
+                };
+                let grouping = Grouping { table, keys, acc_offset, accs, row, last, probe, dense };
                 Ok((Out::Aggregate(grouping), state))
             }
         }
@@ -1147,7 +1229,7 @@ impl Gen<'_> {
     fn reach(&self, e: &Expr, used: &mut Vec<(usize, u32)>) -> Option<u128> {
         match &e.kind {
             Kind::Column(c) => {
-                let k = (*self.bits.get(*c)?)?;
+                let k = self.known.get(*c)?.bits?;
                 if !used.iter().any(|&(u, _)| u == *c) {
                     used.push((*c, k));
                 }
@@ -1796,6 +1878,7 @@ impl Gen<'_> {
                         // The key buffer still holds the last row's key, which a key the same
                         // bytes as it finds the same group, so its row is taken again.
                         let done = self.b.block(&[(Ty::Ptr, "row")]);
+                        let dense = g.dense.map(|at| self.dense_row(at, done));
                         if let Some(last) = g.last {
                             let seen = self.b.load(Ty::I64, st, Val::NONE, 1, last as i32, 0);
                             let zero = self.b.int(Ty::I64, 0);
@@ -1857,6 +1940,14 @@ impl Gen<'_> {
                         if let Some(last) = g.last {
                             self.b.store(st, Val::NONE, 1, last as i32, row, 0);
                         }
+                        if let (Some(at), Some((slot, known))) = (g.dense, dense) {
+                            // A key with a value not in the domains stores a zero in the entry
+                            // past the last, which keeps it zero.
+                            let row = self.b.conv(Op::Bitcast, row, Ty::I64);
+                            let zero = self.b.int(Ty::I64, 0);
+                            let row = self.b.select(known, row, zero);
+                            self.b.store(st, slot, 8, at as i32, row, 0);
+                        }
                         self.b.br(done, &[row]);
                         self.b.switch_to(done);
                         self.b.param(done, 0)
@@ -1895,6 +1986,37 @@ impl Gen<'_> {
             }
             _ => Err(Refusal::new("the sink", "its layout is of the other kind")),
         }
+    }
+
+    /// Looks the row's key up in the array of [`Grouping::dense`] at `at`, and goes to `done` with
+    /// the group row when the key has one there. Returns the key's entry and whether every key
+    /// value is in its domain, for the way through the hash to fill the entry in.
+    fn dense_row(&mut self, at: u32, done: Block) -> (Val, Val) {
+        let st = self.b.st();
+        let mut slot = self.b.int(Ty::I64, 0);
+        let mut known = self.truth();
+        let mut stride = 1u32;
+        for (values, n) in self.dense.clone() {
+            let index = self.b.load(Ty::I16, values, self.row, 2, 0, 0);
+            let index = self.b.conv(Op::Zext, index, Ty::I64);
+            let most = self.b.int(Ty::I64, i128::from(n));
+            let within = self.b.bin(Op::IcmpUle, index, most);
+            known = self.b.bin(Op::And, known, within);
+            let step = self.b.int(Ty::I64, i128::from(stride));
+            let part = self.b.bin(Op::Mul, index, step);
+            slot = self.b.bin(Op::Add, slot, part);
+            stride *= n + 1;
+        }
+        let past = self.b.int(Ty::I64, i128::from(stride));
+        let slot = self.b.select(known, slot, past);
+        let seen = self.b.load(Ty::I64, st, slot, 8, at as i32, 0);
+        let zero = self.b.int(Ty::I64, 0);
+        let hit = self.b.bin(Op::IcmpNe, seen, zero);
+        let seen = self.b.conv(Op::Bitcast, seen, Ty::Ptr);
+        let miss = self.b.block(&[]);
+        self.b.brif(hit, done, &[seen], miss, &[]);
+        self.b.switch_to(miss);
+        (slot, known)
     }
 
     fn hash(&mut self, hash: Val, v: Val, logical: &LogicalType) -> Result<Val> {

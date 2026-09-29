@@ -41,7 +41,7 @@ use rudb_common::bounds::Bound;
 use rudb_common::{Cancel, LogicalType, Memory, Result, Session, Value};
 use rudb_pipeline::{Pool, Progress};
 use rudb_plan::{Node, NodeRef, Plan};
-use rudb_qc_gen::Query;
+use rudb_qc_gen::{Known, Query};
 use rudb_qc_pipe::{Graph, Source, Stage};
 pub use rudb_qc_plan::Refusal;
 use rudb_qc_plan::{Key, Kind};
@@ -118,14 +118,11 @@ pub fn compile_over(
     let rel = rudb_qc_plan::lower(plan)?;
     let graph = rudb_qc_pipe::split(&rel);
     check(&graph)?;
-    let bits = catalog
-        .filter(|_| !options.ablate.off(Ablate::RANGES))
-        .map(|catalog| ranges(&graph, plan, catalog))
-        .unwrap_or_default();
+    let known = catalog.map(|catalog| known(&graph, plan, catalog, options)).unwrap_or_default();
     let planned = started.elapsed();
     let mut rt = Rt::new(cancel.clone());
     rt.set_ablate(options.ablate);
-    let query = rudb_qc_gen::generate_with(&graph, &mut rt, &bits)?;
+    let query = rudb_qc_gen::generate_with(&graph, &mut rt, &known)?;
     let generated = started.elapsed().saturating_sub(planned);
     let tiers = Tiers::new(&query.module, options);
     tiers.generated_in(planned, generated);
@@ -134,14 +131,25 @@ pub fn compile_over(
 
 /// For each stage, what the statistics say about each column it scans, in the form
 /// [`rudb_qc_gen::generate_with`] takes.
-fn ranges(graph: &Graph, plan: &Plan, catalog: &Catalog) -> Vec<Vec<Option<u32>>> {
-    let stored = |stage: &Stage| -> Option<Vec<Option<u32>>> {
+fn known(graph: &Graph, plan: &Plan, catalog: &Catalog, options: Options) -> Vec<Vec<Known>> {
+    let stored = |stage: &Stage| -> Option<Vec<Known>> {
         let Stage::Pipeline(p) = stage else { return None };
         let Source::Scan { node, columns, .. } = &p.source else { return None };
         let Node::Get { catalog: c, schema, table, .. } = *plan.node(*node) else { return None };
         let name = QualifiedName::new(plan.string(c), plan.string(schema), plan.string(table));
         let table = catalog.table(&name).ok()?;
-        Some(columns.iter().map(|c| bits(table, &c.name, &c.ty)).collect())
+        // Only a group key column is indexed by its values, so only those are asked for them.
+        let keys: &[rudb_qc_plan::Expr] = match &p.sink {
+            rudb_qc_pipe::Sink::Aggregate { groups, .. } => groups,
+            _ => &[],
+        };
+        let key = |at: usize| keys.iter().any(|e| matches!(e.kind, Kind::Column(c) if c == at));
+        let dense = !options.ablate.off(Ablate::DENSE);
+        let column = |(at, c): (usize, &rudb_qc_plan::Column)| Known {
+            bits: bits(table, &c.name, &c.ty).filter(|_| !options.ablate.off(Ablate::RANGES)),
+            values: (dense && key(at)).then(|| values(table, &c.name, &c.ty)).flatten(),
+        };
+        Some(columns.iter().enumerate().map(column).collect())
     };
     graph.stages.iter().map(|stage| stored(stage).unwrap_or_default()).collect()
 }
@@ -173,6 +181,29 @@ fn bits(table: &rudb_catalog::Table, name: &str, ty: &LogicalType) -> Option<u32
     let (low, high) = (unscaled(low)?, unscaled(high)?);
     (0..127).find(|&k| low >= -(1i128 << k) && high < 1i128 << k)
 }
+
+/// Every value of the text column `name` of `table`, when the statistics hold all of them and
+/// there are few enough for a grouping on the column to index an array by them.
+fn values(table: &rudb_catalog::Table, name: &str, ty: &LogicalType) -> Option<Vec<Vec<u8>>> {
+    if *ty != LogicalType::Varchar {
+        return None;
+    }
+    let all = table.rows().exact_frequencies(table.column_index(name)?).ok()??;
+    let mut values = Vec::with_capacity(all.len());
+    for (value, _) in all {
+        match value {
+            Value::Varchar(text) => values.push(text.into_bytes()),
+            Value::Null => {}
+            _ => return None,
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+    (values.len() <= DOMAIN).then_some(values)
+}
+
+/// The most values [`values`] hands the generator for one column.
+const DOMAIN: usize = 254;
 
 /// Refuses what the driver cannot run yet.
 fn check(graph: &Graph) -> std::result::Result<(), Refusal> {

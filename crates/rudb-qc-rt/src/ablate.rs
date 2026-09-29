@@ -25,9 +25,11 @@ impl Ablate {
     pub const CODES: Ablate = Ablate(1 << 5);
     /// Overflow checks left out where the ranges in the table's statistics rule them out.
     pub const RANGES: Ablate = Ablate(1 << 6);
+    /// Group rows found by the index of each key in its column's values, in front of the hash.
+    pub const DENSE: Ablate = Ablate(1 << 7);
 
     /// Every switch with its name, in the order a table of them is printed.
-    pub const ALL: [(&'static str, Ablate); 7] = [
+    pub const ALL: [(&'static str, Ablate); 8] = [
         ("probe", Ablate::PROBE),
         ("like", Ablate::LIKE),
         ("top", Ablate::TOP),
@@ -35,6 +37,7 @@ impl Ablate {
         ("stats", Ablate::STATS),
         ("codes", Ablate::CODES),
         ("ranges", Ablate::RANGES),
+        ("dense", Ablate::DENSE),
     ];
 
     /// Reads a comma separated list of names, where an empty list or `none` is nothing and `all`

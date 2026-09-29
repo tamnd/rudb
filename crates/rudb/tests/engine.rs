@@ -313,10 +313,12 @@ fn leaving_a_technique_out_answers_the_same() {
     ];
     let first: Vec<_> = queries.iter().map(|sql| rows(&database, sql)).collect();
     database.execute("SET engine = 'compiled'").expect("the compiled engine");
-    for ablate in ["none", "probe", "like", "top", "lanes", "stats", "codes", "ranges", "all"] {
+    for ablate in
+        ["none", "probe", "like", "top", "lanes", "stats", "codes", "ranges", "dense", "all"]
+    {
         database.execute(&format!("SET qc_ablate = '{ablate}'")).expect("a switch");
         let back = database.setting("qc_ablate").expect("qc_ablate reads back");
-        let all = "probe,like,top,lanes,stats,codes,ranges";
+        let all = "probe,like,top,lanes,stats,codes,ranges,dense";
         assert_eq!(back, if ablate == "all" { all } else { ablate });
         for (sql, first) in queries.iter().zip(&first) {
             assert_eq!(&rows(&database, sql), first, "{sql} with {ablate} off");
