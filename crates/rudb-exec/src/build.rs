@@ -61,7 +61,7 @@ use rudb_plan::{
     PipelineRef, Plan, ROOT, Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
-use rudb_vector::VECTOR_SIZE;
+use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
 use crate::consistent::{Answer, Collect, Reduction};
@@ -188,6 +188,7 @@ pub fn build_measured<'a>(
         BuildUnder { cancel, memory, seams, session, report, cutoff: None },
         None,
         None,
+        Vec::new(),
     )
 }
 
@@ -216,6 +217,7 @@ pub fn build_measured_into<'a>(
         BuildUnder { cancel, memory, seams, session, report: &report, cutoff: None },
         Some(sink),
         None,
+        Vec::new(),
     )
 }
 
@@ -250,6 +252,7 @@ pub fn build_pruned_into<'a>(
         BuildUnder { cancel, memory, seams, session, report: &report, cutoff: None },
         Some(sink),
         Some(plan.root()),
+        Vec::new(),
     )
 }
 
@@ -282,7 +285,120 @@ pub fn build_cut_into<'a>(
         BuildUnder { cancel, memory, seams, session, report: &report, cutoff },
         Some(sink),
         pruned.then(|| plan.root()),
+        Vec::new(),
     )
+}
+
+/// [`build_cut_into`] with the cut optional, and the scan reading only the rows `handoffs` leave,
+/// the first as its own and the rest as set aside, the way a scan on the driving side of joins
+/// reads the handoffs of the joins above it.
+///
+/// The compiled engine is the caller. It runs a join's build side itself, so it fills each handoff
+/// from the keys its own table holds, before the scan is built, and the scan reads it as it would
+/// read one the first engine's build side filled. See [`Handoff`].
+///
+/// # Errors
+///
+/// The same as [`build_cut_into`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_handed_into<'a>(
+    plan: &'a Plan,
+    catalog: &'a Catalog,
+    cancel: &Cancel,
+    memory: &Memory,
+    seams: &Settings,
+    session: &Session,
+    sink: Arc<dyn DynSink + 'a>,
+    pruned: bool,
+    cut: Option<&TopCut>,
+    handoffs: &[Handoff<'a>],
+) -> Result<Query<'a>> {
+    if pruned && !matches!(plan.node(plan.root()), Node::Filter { .. }) {
+        return Err(Error::internal("a pruned scan whose root is not a filter"));
+    }
+    let report = Report::new();
+    let cutoff = cut.map(|cut| Arc::clone(&cut.0));
+    build_measured_with_sink(
+        plan,
+        catalog,
+        BuildUnder { cancel, memory, seams, session, report: &report, cutoff },
+        Some(sink),
+        pruned.then(|| plan.root()),
+        handoffs.iter().map(|handoff| Arc::clone(&handoff.0)).collect(),
+    )
+}
+
+/// What a join's build side holds, for a scan on its driving side to read only the rows that can
+/// match, when the caller runs the build side itself.
+///
+/// The same edge the first engine arms between a join and the scan under it, see
+/// `crate::sideways`. It is armed from the scan's column alone: the column's stored link says
+/// which parent its values name, and that parent's key map turns the keys into parents and the
+/// link turns those into the scan's rows. A key the map does not hold sends it back to the filter
+/// over the key values, as it does in the first engine.
+#[derive(Debug)]
+pub struct Handoff<'a>(Arc<Sideways<'a>>);
+
+impl<'a> Handoff<'a> {
+    /// A handoff about column `column` of the `Get` at `get` in `plan`, one of several below the
+    /// scan's own when `aside`. See [`build_handed_into`].
+    #[must_use]
+    pub fn for_scan(
+        plan: &'a Plan,
+        catalog: &'a Catalog,
+        session: &Session,
+        get: NodeRef,
+        column: u32,
+        aside: bool,
+    ) -> Self {
+        let sideways = Sideways::new();
+        if let Node::Get { index, .. } = *plan.node(get) {
+            let binding = ColumnBinding { table: index, column };
+            if session.rules().enabled(Rule::GraphReduction)
+                && let Some(exact) = exact(plan, catalog, None, get, binding)
+            {
+                sideways.exactly(exact);
+            }
+            sideways.keying(Keyed::Made);
+            sideways.about(binding);
+        }
+        if aside {
+            sideways.set_aside();
+        }
+        Self(sideways)
+    }
+
+    /// Fills this from the keys the build side holds, read as `ty`, which is the type of the
+    /// scan's column. Left empty for a type that is not a signed integer, which the scan reads as
+    /// a join that could not hand anything over.
+    ///
+    /// # Errors
+    ///
+    /// When the link or the key map fails to read.
+    // Each key was read out of a column of `ty`, so it fits it and the casts are exact.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn fill(&self, ty: &LogicalType, keys: &[i64]) -> Result<()> {
+        let mut chunks = Vec::with_capacity(keys.len().div_ceil(VECTOR_SIZE));
+        for keys in keys.chunks(VECTOR_SIZE) {
+            let data = match ty {
+                LogicalType::TinyInt => Data::Int8(keys.iter().map(|&key| key as i8).collect()),
+                LogicalType::SmallInt => Data::Int16(keys.iter().map(|&key| key as i16).collect()),
+                LogicalType::Integer => Data::Int32(keys.iter().map(|&key| key as i32).collect()),
+                LogicalType::BigInt => Data::Int64(keys.to_vec().into()),
+                _ => return Ok(()),
+            };
+            chunks.push(Chunk::new(vec![Vector::flat(ty.clone(), data)?])?);
+        }
+        let sideways = &self.0;
+        sideways.found(sideways::found_for(
+            &Keyed::Made,
+            sideways.exact(),
+            &chunks,
+            false,
+            sideways.placed(),
+        )?);
+        Ok(())
+    }
 }
 
 /// The values of the aggregate `node` of `plan`, when every one of them can be read from the
@@ -351,6 +467,7 @@ fn build_measured_with_sink<'a>(
     under: BuildUnder<'_>,
     sink: Option<Arc<dyn DynSink + 'a>>,
     pruning_only: Option<NodeRef>,
+    handoffs: Vec<Arc<Sideways<'a>>>,
 ) -> Result<Query<'a>> {
     let BuildUnder { cancel, memory, seams, session, report, cutoff } = under;
     let shape = Shape::of(plan);
@@ -360,6 +477,7 @@ fn build_measured_with_sink<'a>(
             report.depends(pipeline, *waits_for);
         }
     }
+    let mut handoffs = handoffs.into_iter();
     let mut building = Building {
         plan,
         catalog,
@@ -374,8 +492,8 @@ fn build_measured_with_sink<'a>(
         drivers: Vec::new(),
         pruning: Vec::new(),
         pushing: None,
-        sideways: None,
-        above: Vec::new(),
+        sideways: handoffs.next(),
+        above: handoffs.collect(),
         armed: Vec::new(),
         cutoff,
         top_counts: Vec::new(),
@@ -1291,15 +1409,21 @@ fn scanned<'a>(
 fn exact(
     plan: &Plan,
     catalog: &Catalog,
-    parent: NodeRef,
-    key: ExprRef,
+    parent: Option<(NodeRef, ExprRef)>,
     driving: NodeRef,
     binding: ColumnBinding,
 ) -> Option<Exact> {
-    let Expr::Column(key) = *plan.expr(key) else { return None };
+    let parent = match parent {
+        Some((parent, key)) => {
+            let Expr::Column(key) = *plan.expr(key) else { return None };
+            Some((parent, key))
+        }
+        None => None,
+    };
     let (child_table, child_columns) = scanned(plan, catalog, driving, binding.table).ok()??;
     let child_column = stored_column(plan, child_table, binding.table, child_columns, binding)?;
-    let keyed = traced(plan, parent, key).and_then(|key| {
+    let keyed = parent.and_then(|(parent, key)| {
+        let key = traced(plan, parent, key)?;
         let (parent_table, parent_columns) = scanned(plan, catalog, parent, key.table).ok()??;
         let parent_rows = parent_table.rows().stored()?;
         let parent_column = stored_column(plan, parent_table, key.table, parent_columns, key)?;
@@ -2465,7 +2589,9 @@ impl<'a> Building<'a, '_> {
             }) else {
                 return;
             };
-            if reducing && let Some(exact) = exact(plan, catalog, parent, key, driving, binding) {
+            if reducing
+                && let Some(exact) = exact(plan, catalog, Some((parent, key)), driving, binding)
+            {
                 sideways.exactly(exact);
             }
             sideways.keying(Keyed::new(plan, key, held_schema.clone(), zone));
@@ -3362,12 +3488,11 @@ impl<'a> Building<'a, '_> {
                         feeds.iter().flatten().filter(|(reader, ..)| *reader == at)
                     {
                         if let Some(binding) = relation_column(plan, leaf.input, column) {
-                            if reducing {
-                                if let Some(exact) =
+                            if reducing
+                                && let Some(exact) =
                                     listing(plan, self.catalog, leaf.input, binding)
-                                {
-                                    feed.exactly(exact);
-                                }
+                            {
+                                feed.exactly(exact);
                             }
                             feed.about(binding);
                             self.above.push(Arc::clone(feed));
