@@ -11,6 +11,7 @@
 //! instruction's provenance (section 6.12).
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::panic::Location;
 
 use crate::eval;
@@ -82,10 +83,61 @@ pub struct Builder {
     f: Func,
     cur: Block,
     plan: u32,
-    sites: HashMap<(usize, u32), u32>,
-    consts: HashMap<Const, Val>,
-    cse: HashMap<Box<[u32]>, (Block, Val)>,
+    sites: HashMap<(usize, u32), u32, Quick>,
+    consts: HashMap<Const, Val, Quick>,
+    cse: HashMap<Box<[u32]>, (Block, Val), Quick>,
+    key: Vec<u32>,
     fold: bool,
+}
+
+/// The builder's maps are keyed by what the generator made, never by user data, so they hash
+/// with a multiply and rotate instead of `SipHash`.
+type Quick = BuildHasherDefault<Mix>;
+
+#[derive(Default)]
+struct Mix(u64);
+
+impl Mix {
+    fn add(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for Mix {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let mut w = [0; 8];
+            w.copy_from_slice(c);
+            self.add(u64::from_le_bytes(w));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut w = [0; 8];
+            w[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(w));
+        }
+    }
+
+    fn write_u8(&mut self, x: u8) {
+        self.add(u64::from(x));
+    }
+
+    fn write_u32(&mut self, x: u32) {
+        self.add(u64::from(x));
+    }
+
+    fn write_u64(&mut self, x: u64) {
+        self.add(x);
+    }
+
+    fn write_usize(&mut self, x: usize) {
+        self.add(x as u64);
+    }
 }
 
 impl Builder {
@@ -96,9 +148,10 @@ impl Builder {
             f: Func::new(name, version, plan),
             cur: Block(0),
             plan,
-            sites: HashMap::new(),
-            consts: HashMap::new(),
-            cse: HashMap::new(),
+            sites: HashMap::default(),
+            consts: HashMap::default(),
+            cse: HashMap::default(),
+            key: Vec::new(),
             fold: true,
         }
     }
@@ -283,23 +336,21 @@ impl Builder {
     fn emit(&mut self, op: Op, ty: Ty, flags: u32, ops: &[u32]) -> Option<Val> {
         let rty = op.result(ty);
         let cse = self.fold && rty != Ty::Void && (op.is_pure() || flags & INV != 0);
-        let key: Option<Box<[u32]>> = cse.then(|| {
-            let mut k = Vec::with_capacity(ops.len() + 1);
-            k.push(header(op, ty, flags, ops.len()));
-            k.extend_from_slice(ops);
-            k.into()
-        });
-        if let Some(k) = &key
-            && let Some(&(b, v)) = self.cse.get(k)
-            && (b == self.cur || b == Block(0))
-        {
-            return Some(v);
+        if cse {
+            self.key.clear();
+            self.key.push(header(op, ty, flags, ops.len()));
+            self.key.extend_from_slice(ops);
+            if let Some(&(b, v)) = self.cse.get(self.key.as_slice())
+                && (b == self.cur || b == Block(0))
+            {
+                return Some(v);
+            }
         }
         let result = (rty != Ty::Void).then(|| self.f.new_val(rty, None));
         let site = self.site();
         self.f.push(self.cur, op, ty, flags, result, ops, site);
-        if let (Some(k), Some(v)) = (key, result) {
-            self.cse.insert(k, (self.cur, v));
+        if cse && let Some(v) = result {
+            self.cse.insert(self.key.as_slice().into(), (self.cur, v));
         }
         result
     }

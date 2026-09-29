@@ -120,7 +120,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn want(&mut self, v: Val, ty: Ty, what: &str) {
+    fn want(&mut self, v: Val, ty: Ty, what: impl fmt::Display) {
         let got = self.ty(v);
         if got != ty {
             let name = self.name(v);
@@ -128,7 +128,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn want_int(&mut self, v: Val, what: &str) {
+    fn want_int(&mut self, v: Val, what: impl fmt::Display) {
         let got = self.ty(v);
         if !got.is_int() {
             let name = self.name(v);
@@ -141,11 +141,11 @@ impl<'a> Checker<'a> {
         for b in 0..self.f.blocks.len() {
             self.block = Block(b as u32);
             self.pos = None;
-            self.terminators();
+            let insts: Vec<Inst<'a>> = self.f.insts(self.block).collect();
+            self.terminators(&insts);
             if !self.cfg.reachable(self.block) {
                 continue;
             }
-            let insts: Vec<Inst<'a>> = self.f.insts(self.block).collect();
             for (k, i) in insts.iter().enumerate() {
                 if i.dead() {
                     continue;
@@ -186,8 +186,7 @@ impl<'a> Checker<'a> {
     }
 
     /// V3: one terminator, last.
-    fn terminators(&mut self) {
-        let insts: Vec<Inst<'a>> = self.f.insts(self.block).collect();
+    fn terminators(&mut self, insts: &[Inst<'a>]) {
         match insts.last() {
             None => self.fail("V3", "the block is empty".to_owned()),
             Some(last) if !last.op.is_terminator() || last.dead() => {
@@ -243,17 +242,15 @@ impl<'a> Checker<'a> {
             self.fail("V2", format!("b{} does not exist", target.0));
             return;
         };
-        let params = data.params.clone();
+        let params = &data.params;
         if params.len() != args.len() {
-            self.fail(
-                "V2",
-                format!("b{} takes {} arguments and gets {}", target.0, params.len(), args.len()),
-            );
+            let n = params.len();
+            self.fail("V2", format!("b{} takes {n} arguments and gets {}", target.0, args.len()));
             return;
         }
         for (p, a) in params.iter().zip(args) {
             let ty = self.ty(*p);
-            self.want(Val(*a), ty, &format!("the argument to b{}", target.0));
+            self.want(Val(*a), ty, format_args!("the argument to b{}", target.0));
         }
     }
 
@@ -296,7 +293,7 @@ impl<'a> Checker<'a> {
                     self.fail("V2", format!("{name} widens at most an i64"));
                 }
                 for k in 0..o.len() {
-                    self.want(v(k), ty, &format!("operand {k} of {name}"));
+                    self.want(v(k), ty, format_args!("operand {k} of {name}"));
                 }
             }
             Form::Sel => {
@@ -308,8 +305,8 @@ impl<'a> Checker<'a> {
                 if !ty.is_int() || ty == Ty::I1 {
                     self.fail("V2", format!("{name} needs an integer type, not {}", ty.name()));
                 }
-                self.want(v(0), ty, &format!("operand 0 of {name}"));
-                self.want(v(1), ty, &format!("operand 1 of {name}"));
+                self.want(v(0), ty, format_args!("operand 0 of {name}"));
+                self.want(v(1), ty, format_args!("operand 1 of {name}"));
                 if i.op.form() == Form::EdgeBin {
                     let (ok, ovf) = (Block(o[2]), Block(o[3]));
                     let okp: Vec<Ty> = self
@@ -336,7 +333,7 @@ impl<'a> Checker<'a> {
                 if !ty.is_int() || ty == Ty::I1 {
                     self.fail("V2", format!("{name} needs an integer type, not {}", ty.name()));
                 }
-                self.want(v(0), ty, &format!("the operand of {name}"));
+                self.want(v(0), ty, format_args!("the operand of {name}"));
                 if matches!(i.op.form(), Form::Scale | Form::TrapScale) && o[1] > 38 {
                     self.fail("V8", format!("{name} by 10^{} is past 38", o[1]));
                 }
@@ -364,8 +361,8 @@ impl<'a> Checker<'a> {
                 self.want_int(v(1), "the bit index");
             }
             Form::Memcpy | Form::Memeq => {
-                self.want(v(0), Ty::Ptr, &format!("operand 0 of {name}"));
-                self.want(v(1), Ty::Ptr, &format!("operand 1 of {name}"));
+                self.want(v(0), Ty::Ptr, format_args!("operand 0 of {name}"));
+                self.want(v(1), Ty::Ptr, format_args!("operand 1 of {name}"));
                 if o[2] == 0 || o[2] > 64 {
                     self.fail("V8", format!("{name} of {} bytes is outside 1 to 64", o[2]));
                 }
@@ -376,7 +373,7 @@ impl<'a> Checker<'a> {
                 }
                 self.want(v(0), Ty::Ptr, "the address");
                 for k in 1..o.len() {
-                    self.want(v(k), ty, &format!("operand {k} of {name}"));
+                    self.want(v(k), ty, format_args!("operand {k} of {name}"));
                 }
             }
             Form::StrMk => {
@@ -424,7 +421,7 @@ impl<'a> Checker<'a> {
                     return;
                 }
                 for (k, want) in p.args.iter().enumerate() {
-                    self.want(v(k + 1), *want, &format!("argument {k} of @{}", p.name));
+                    self.want(v(k + 1), *want, format_args!("argument {k} of @{}", p.name));
                 }
             }
             Form::Vcall => {
@@ -663,31 +660,40 @@ impl<'a> Checker<'a> {
 
     /// V12: a trapping instruction on a possibly invalid operand is guarded by its validity.
     fn validity(&mut self) {
-        for &(v, valid) in &self.f.validity.clone() {
-            if valid.is_const() {
-                continue;
-            }
-            for b in self.cfg.rpo.clone() {
-                for (k, i) in self.f.insts(b).enumerate() {
-                    let traps = matches!(
-                        i.op.form(),
+        let f = self.f;
+        if f.validity.iter().all(|(_, valid)| valid.is_const()) {
+            return;
+        }
+        let mut traps: Vec<(Block, u32, Inst<'a>)> = Vec::new();
+        for &b in &self.cfg.rpo {
+            for (k, i) in f.insts(b).enumerate() {
+                let form = i.op.form();
+                if !i.dead()
+                    && matches!(
+                        form,
                         Form::TrapBin
                             | Form::TrapUn
                             | Form::TrapScale
                             | Form::TrapConv
                             | Form::EdgeBin
-                    );
-                    if i.dead() || !traps {
-                        continue;
-                    }
-                    let mut reads = false;
-                    i.uses(|u| reads |= u == v);
-                    if reads && !self.guarded_by(b, valid) {
-                        self.block = b;
-                        self.pos = Some(k as u32);
-                        let (vn, valn) = (self.name(v), self.name(valid));
-                        self.fail("V12", format!("{} traps on {vn}, which may be invalid, and no branch on {valn} guards it", i.op.name()));
-                    }
+                    )
+                {
+                    traps.push((b, k as u32, i));
+                }
+            }
+        }
+        for &(v, valid) in &f.validity {
+            if valid.is_const() {
+                continue;
+            }
+            for (b, k, i) in &traps {
+                let mut reads = false;
+                i.uses(|u| reads |= u == v);
+                if reads && !self.guarded_by(*b, valid) {
+                    self.block = *b;
+                    self.pos = Some(*k);
+                    let (vn, valn) = (self.name(v), self.name(valid));
+                    self.fail("V12", format!("{} traps on {vn}, which may be invalid, and no branch on {valn} guards it", i.op.name()));
                 }
             }
         }
