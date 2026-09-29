@@ -144,6 +144,9 @@ struct Headers {
     /// For each column of [`Body::domains`], the last dictionary it came with and the index of
     /// each of that dictionary's values, as [`indexes`] makes them.
     domains: Vec<Option<(Arc<Vector>, Vec<u16>)>>,
+    /// For each column of [`Body::reads`] and then each `LIKE` of [`Body::likes`], the last
+    /// dictionary it came with and how many rows have been read through it, this chunk's too.
+    seen: Vec<Option<(Arc<Vector>, usize)>>,
     /// `0, 1, 2, ...`, the codes a column made flat is read through, as long as the longest chunk
     /// so far.
     rows: Vec<u32>,
@@ -761,12 +764,17 @@ impl<'a> Feed<'a> {
         let each = headers.rows.as_ptr();
         headers.text.resize(self.body.reads.len(), None);
         headers.likes.resize(self.body.likes.len(), None);
+        let reads = self.body.reads.len();
+        headers.seen.resize(reads + self.body.likes.len(), None);
+        let (read_seen, like_seen) = headers.seen.split_at_mut(reads);
         // The answers of a `LIKE` over a coded column, one a dictionary value.
         let mut answers: Vec<Option<*const u8>> = Vec::with_capacity(self.body.likes.len());
-        for (m, known) in self.body.likes.iter().zip(headers.likes.iter_mut()) {
+        let likes = self.body.likes.iter().zip(headers.likes.iter_mut());
+        for ((m, known), seen) in likes.zip(like_seen) {
             let v = chunk.column(m.column)?;
             let codes = !self.tiers.ablate().off(Ablate::CODES);
-            answers.push(if codes && worded(v, rows, known.as_ref()) {
+            let read = tally(v, rows, seen);
+            answers.push(if codes && worded(v, rows, read, known.as_ref()) {
                 Some(like_coded(rt, m.like, v, known)?)
             } else {
                 None
@@ -783,8 +791,11 @@ impl<'a> Feed<'a> {
         // its strings is made flat too, because the answers read its strings in place, and one
         // the body reads only through answers from its dictionary is not read at all.
         let mut keep = vec![false; chunk.width()];
-        for (&c, known) in self.body.reads.iter().zip(headers.text.iter()) {
-            keep[c] = !flat(c) && coded(chunk.column(c)?, rows, known.as_ref());
+        let text = self.body.reads.iter().zip(headers.text.iter());
+        for ((&c, known), seen) in text.zip(read_seen) {
+            let v = chunk.column(c)?;
+            let read = tally(v, rows, seen);
+            keep[c] = !flat(c) && coded(v, rows, read, known.as_ref());
         }
         for m in &self.body.likes {
             if by_codes(m.column) && !flat(m.column) && !self.body.reads.contains(&m.column) {
@@ -1454,10 +1465,32 @@ impl<'c> Held<'c> {
     }
 }
 
+/// How many rows have been read through `v`'s dictionary, the `rows` of this chunk too, which
+/// `seen` counts across the chunks that share it. A column not coded into a dictionary has only
+/// this chunk's rows.
+fn tally(v: &Vector, rows: usize, seen: &mut Option<(Arc<Vector>, usize)>) -> usize {
+    let Some((_, dictionary)) = v.shared_dictionary_parts() else {
+        *seen = None;
+        return rows;
+    };
+    match seen {
+        Some((d, n)) if Arc::ptr_eq(d, dictionary) => {
+            *n = n.saturating_add(rows);
+            *n
+        }
+        _ => {
+            *seen = Some((Arc::clone(dictionary), rows));
+            rows
+        }
+    }
+}
+
 /// Whether `v` is read as codes into its dictionary, which is when it is text coded into a
 /// dictionary with no NULL in it and either its headers are made already or the dictionary is not
-/// much longer than the chunk, so that making them is no more work than copying out the rows.
-fn coded(v: &Vector, rows: usize, known: Option<&Flat>) -> bool {
+/// much longer than the `read` rows read through it so far, so that making them is no more work
+/// than copying out the rows has been. A dictionary shared by many chunks is taken up once the
+/// chunks before have copied out as many rows as it has values.
+fn coded(v: &Vector, rows: usize, read: usize, known: Option<&Flat>) -> bool {
     if v.logical_type() != &LogicalType::Varchar {
         return false;
     }
@@ -1467,13 +1500,14 @@ fn coded(v: &Vector, rows: usize, known: Option<&Flat>) -> bool {
     codes.len() >= rows
         && !dictionary.validity().has_nulls(dictionary.len())
         && (known.is_some_and(|(d, ..)| Arc::ptr_eq(d, dictionary))
-            || dictionary.len() <= rows.max(VECTOR_SIZE))
+            || dictionary.len() <= read.max(VECTOR_SIZE))
 }
 
 /// Whether a `LIKE` over `v` is answered for its dictionary's values rather than its rows, which is
 /// when it is text coded into a dictionary and either the answers are there already or the
-/// dictionary is not longer than the chunk, so that answering it is no more work than the rows.
-fn worded(v: &Vector, rows: usize, known: Option<&Answered>) -> bool {
+/// dictionary is not longer than the `read` rows read through it so far, so that answering it is
+/// no more work than the rows have been.
+fn worded(v: &Vector, rows: usize, read: usize, known: Option<&Answered>) -> bool {
     if v.logical_type() != &LogicalType::Varchar {
         return false;
     }
@@ -1482,7 +1516,7 @@ fn worded(v: &Vector, rows: usize, known: Option<&Answered>) -> bool {
     };
     codes.len() >= rows
         && (known.is_some_and(|(d, _)| Arc::ptr_eq(d, dictionary))
-            || dictionary.len() <= rows.max(VECTOR_SIZE))
+            || dictionary.len() <= read.max(VECTOR_SIZE))
 }
 
 /// A `LIKE` over a coded column: the answers `known` has for each value of the dictionary, made
@@ -1841,7 +1875,7 @@ mod tests {
         let rows = codes.len();
         let v = Vector::stable_dictionary(codes.clone(), Arc::clone(&dictionary)).unwrap();
         let mut known = None;
-        assert!(coded(&v, rows, known.as_ref()));
+        assert!(coded(&v, rows, rows, known.as_ref()));
         let first = read(&Held::coded(&v, rows, &mut known).unwrap(), rows);
         let made = known.as_ref().map(|(_, values, _)| Arc::as_ptr(values));
         let again = read(&Held::coded(&v, rows, &mut known).unwrap(), rows);
@@ -1850,6 +1884,26 @@ mod tests {
             codes.iter().map(|&c| Some(words[c as usize].as_bytes().to_vec())).collect();
         assert_eq!(first, want);
         assert_eq!(again, want);
+    }
+    #[test]
+    fn a_dictionary_longer_than_a_chunk_is_taken_up_once_its_chunks_have_read_as_many_rows() {
+        let words: Vec<Value> =
+            (0..VECTOR_SIZE * 2).map(|i| Value::Varchar(format!("word {i}"))).collect();
+        let dictionary = Arc::new(Vector::from_values(LogicalType::Varchar, &words).unwrap());
+        let codes: Vec<u32> = (0..VECTOR_SIZE as u32).collect();
+        let rows = codes.len();
+        let v = Vector::stable_dictionary(codes, Arc::clone(&dictionary)).unwrap();
+        let mut seen = None;
+        let read = tally(&v, rows, &mut seen);
+        assert!(!coded(&v, rows, read, None));
+        assert!(!worded(&v, rows, read, None));
+        let read = tally(&v, rows, &mut seen);
+        assert_eq!(read, rows * 2);
+        assert!(coded(&v, rows, read, None));
+        assert!(worded(&v, rows, read, None));
+        let other =
+            Vector::stable_dictionary(vec![0; rows], Arc::new((*dictionary).clone())).unwrap();
+        assert_eq!(tally(&other, rows, &mut seen), rows, "another dictionary starts again");
     }
     #[test]
     fn a_like_over_a_coded_column_answers_each_dictionary_value_once() {
@@ -1865,7 +1919,7 @@ mod tests {
         {
             let like = rt.add_like(pattern, fold);
             let mut known = None;
-            assert!(worded(&v, rows, known.as_ref()));
+            assert!(worded(&v, rows, rows, known.as_ref()));
             let read = |at: *const u8| -> Vec<u8> {
                 let answer = |c: u32| {
                     // SAFETY: every code is below the count of answers.
