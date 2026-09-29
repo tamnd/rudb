@@ -51,6 +51,10 @@ pub fn verify(m: &Module) -> Result<(), Vec<VerifyError>> {
     if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
+fn polls(insts: &[Inst<'_>]) -> bool {
+    insts.iter().any(|i| i.op == Op::Poll && !i.dead())
+}
+
 /// Where a value is defined: its block and its position, with parameters at 0 and instruction
 /// `k` at `k + 1`.
 #[derive(Clone, Copy)]
@@ -60,11 +64,25 @@ struct Def {
     dead: bool,
 }
 
+/// Every instruction of a function, decoded once, with where each block's start.
+#[derive(Default)]
+struct Code<'a> {
+    insts: Vec<Inst<'a>>,
+    starts: Vec<usize>,
+}
+
+impl<'a> Code<'a> {
+    fn of(&self, b: Block) -> &[Inst<'a>] {
+        &self.insts[self.starts[b.index()]..self.starts[b.index() + 1]]
+    }
+}
+
 struct Checker<'a> {
     m: &'a Module,
     f: &'a Func,
     cfg: Cfg,
     defs: Vec<Option<Def>>,
+    code: Code<'a>,
     errors: &'a mut Vec<VerifyError>,
     block: Block,
     pos: Option<u32>,
@@ -72,8 +90,8 @@ struct Checker<'a> {
 
 impl<'a> Checker<'a> {
     fn new(m: &'a Module, f: &'a Func, errors: &'a mut Vec<VerifyError>) -> Checker<'a> {
-        let cfg = Cfg::new(f);
         let mut defs = vec![None; f.vals.len()];
+        let mut code = Code { insts: Vec::new(), starts: Vec::with_capacity(f.blocks.len() + 1) };
         for (b, data) in f.blocks.iter().enumerate() {
             let block = Block(b as u32);
             for p in &data.params {
@@ -81,15 +99,19 @@ impl<'a> Checker<'a> {
                     *d = Some(Def { block, pos: 0, dead: false });
                 }
             }
+            code.starts.push(code.insts.len());
             for (k, i) in f.insts(block).enumerate() {
                 if let Some(r) = i.result
                     && let Some(d) = defs.get_mut(r.index())
                 {
                     *d = Some(Def { block, pos: k as u32 + 1, dead: i.dead() });
                 }
+                code.insts.push(i);
             }
         }
-        Checker { m, f, cfg, defs, errors, block: Block(0), pos: None }
+        code.starts.push(code.insts.len());
+        let cfg = Cfg::with(f, |b| code.of(b).last().copied());
+        Checker { m, f, cfg, defs, code, errors, block: Block(0), pos: None }
     }
 
     fn fail(&mut self, rule: &'static str, message: String) {
@@ -137,12 +159,13 @@ impl<'a> Checker<'a> {
     }
 
     fn run(&mut self) {
+        let code = std::mem::take(&mut self.code);
         self.entry();
         for b in 0..self.f.blocks.len() {
             self.block = Block(b as u32);
             self.pos = None;
-            let insts: Vec<Inst<'a>> = self.f.insts(self.block).collect();
-            self.terminators(&insts);
+            let insts = code.of(self.block);
+            self.terminators(insts);
             if !self.cfg.reachable(self.block) {
                 continue;
             }
@@ -159,10 +182,10 @@ impl<'a> Checker<'a> {
             }
         }
         self.pos = None;
-        self.loops();
-        self.guards_after_effects();
-        self.validity();
-        self.unused();
+        self.loops(&code);
+        self.guards_after_effects(&code);
+        self.validity(&code);
+        self.unused(&code);
     }
 
     /// V5: the entry block has the ABI parameters.
@@ -538,7 +561,7 @@ impl<'a> Checker<'a> {
     }
 
     /// V4 and V11: back edges go to loop headers, depths nest, and unbounded loops poll.
-    fn loops(&mut self) {
+    fn loops(&mut self, code: &Code<'_>) {
         let n = self.f.blocks.len();
         let mut has_back_edge = vec![false; n];
         let mut body_of: Vec<Vec<Block>> = vec![Vec::new(); n];
@@ -555,7 +578,8 @@ impl<'a> Checker<'a> {
                         );
                         continue;
                     }
-                    if !header.batch && !header.bounded && !self.polls(s) && !self.polls(b) {
+                    if !header.batch && !header.bounded && !polls(code.of(s)) && !polls(code.of(b))
+                    {
                         self.fail(
                             "V11",
                             format!(
@@ -603,10 +627,6 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn polls(&self, b: Block) -> bool {
-        self.f.insts(b).any(|i| i.op == Op::Poll && !i.dead())
-    }
-
     fn effect(i: &Inst<'_>) -> bool {
         match i.op {
             Op::Store | Op::StoreStr | Op::Memcpy | Op::Cas | Op::AtomicAdd => true,
@@ -616,7 +636,7 @@ impl<'a> Checker<'a> {
     }
 
     /// V9: no guard is reachable from an effect.
-    fn guards_after_effects(&mut self) {
+    fn guards_after_effects(&mut self, code: &Code<'_>) {
         if self.f.morsel_local {
             return;
         }
@@ -625,7 +645,7 @@ impl<'a> Checker<'a> {
         let mut work: Vec<Block> = self.cfg.rpo.clone();
         let mut queued = vec![true; n];
         let exits = |b: Block, entered: bool| {
-            entered || self.f.insts(b).any(|i| !i.dead() && Self::effect(&i))
+            entered || code.of(b).iter().any(|i| !i.dead() && Self::effect(i))
         };
         while let Some(b) = work.pop() {
             queued[b.index()] = false;
@@ -644,7 +664,7 @@ impl<'a> Checker<'a> {
         for &b in &self.cfg.rpo.clone() {
             self.block = b;
             let mut after = entered[b.index()];
-            for (k, i) in self.f.insts(b).enumerate() {
+            for (k, i) in code.of(b).iter().enumerate() {
                 if i.dead() {
                     continue;
                 }
@@ -652,21 +672,21 @@ impl<'a> Checker<'a> {
                     self.pos = Some(k as u32);
                     self.fail("V9", "a guard is reachable from an effect earlier in the invocation, so rerunning the morsel would repeat it".to_owned());
                 }
-                after |= Self::effect(&i);
+                after |= Self::effect(i);
             }
             self.pos = None;
         }
     }
 
     /// V12: a trapping instruction on a possibly invalid operand is guarded by its validity.
-    fn validity(&mut self) {
+    fn validity(&mut self, code: &Code<'a>) {
         let f = self.f;
         if f.validity.iter().all(|(_, valid)| valid.is_const()) {
             return;
         }
         let mut traps: Vec<(Block, u32, Inst<'a>)> = Vec::new();
         for &b in &self.cfg.rpo {
-            for (k, i) in f.insts(b).enumerate() {
+            for (k, &i) in code.of(b).iter().enumerate() {
                 let form = i.op.form();
                 if !i.dead()
                     && matches!(
@@ -689,7 +709,7 @@ impl<'a> Checker<'a> {
             for (b, k, i) in &traps {
                 let mut reads = false;
                 i.uses(|u| reads |= u == v);
-                if reads && !self.guarded_by(*b, valid) {
+                if reads && !self.guarded_by(code, *b, valid) {
                     self.block = *b;
                     self.pos = Some(*k);
                     let (vn, valn) = (self.name(v), self.name(valid));
@@ -701,14 +721,14 @@ impl<'a> Checker<'a> {
     }
 
     /// Whether every path to `b` took the true edge of a `brif` on `valid`.
-    fn guarded_by(&self, b: Block, valid: Val) -> bool {
+    fn guarded_by(&self, code: &Code<'_>, b: Block, valid: Val) -> bool {
         let mut x = b;
         loop {
             if x == Block(0) {
                 return false;
             }
             let d = self.cfg.idom[x.index()];
-            if let Some(t) = self.f.terminator(d)
+            if let Some(t) = code.of(d).last()
                 && t.op == Op::Brif
                 && Val(t.ops[0]) == valid
             {
@@ -725,10 +745,10 @@ impl<'a> Checker<'a> {
     }
 
     /// V13: nothing computes a value nobody reads, unless it has an effect or can trap.
-    fn unused(&mut self) {
+    fn unused(&mut self, code: &Code<'_>) {
         let mut uses = vec![0u32; self.f.vals.len()];
         for b in 0..self.f.blocks.len() {
-            for i in self.f.insts(Block(b as u32)) {
+            for i in code.of(Block(b as u32)) {
                 if !i.dead() {
                     i.uses(|v| {
                         if !v.is_const() && v != Val::NONE && v.index() < uses.len() {
@@ -740,7 +760,7 @@ impl<'a> Checker<'a> {
         }
         for b in 0..self.f.blocks.len() {
             self.block = Block(b as u32);
-            for (k, i) in self.f.insts(Block(b as u32)).enumerate() {
+            for (k, i) in code.of(Block(b as u32)).iter().enumerate() {
                 let Some(r) = i.result else { continue };
                 if i.dead() || i.op.has_effect() || i.op.traps() || i.flags & DEAD != 0 {
                     continue;

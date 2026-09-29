@@ -5,6 +5,7 @@
 //! walk here. Dominators use the iterative algorithm of Cooper, Harvey and Kennedy, which on a
 //! reducible graph in reverse postorder settles in two passes.
 
+use crate::func::Inst;
 use crate::{Block, Func};
 
 /// The graph of one function.
@@ -26,11 +27,18 @@ impl Cfg {
     /// Builds the graph.
     #[must_use]
     pub fn new(f: &Func) -> Cfg {
+        Cfg::with(f, |b| f.terminator(b))
+    }
+
+    /// Builds the graph with the terminator of each block from `terminator`, for a caller that
+    /// has already decoded the blocks.
+    #[must_use]
+    pub fn with<'a>(f: &Func, terminator: impl Fn(Block) -> Option<Inst<'a>>) -> Cfg {
         let n = f.blocks.len();
         let mut succs = vec![Vec::new(); n];
         let mut preds = vec![Vec::new(); n];
         for (b, out) in succs.iter_mut().enumerate() {
-            if let Some(t) = f.terminator(Block(b as u32)) {
+            if let Some(t) = terminator(Block(b as u32)) {
                 t.succs(|s, _| {
                     if s.index() < n {
                         out.push(s);
