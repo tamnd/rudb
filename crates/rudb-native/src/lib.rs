@@ -4465,6 +4465,16 @@ struct CachedColumn {
 struct HeldPage {
     bytes: PageBytes,
     checked: Vec<AtomicBool>,
+    /// How many more parts are read out of a mapped page before its pages are let go.
+    ///
+    /// Holding a mapped page keeps its index and its place in the pool, and it used to keep every
+    /// page of the file under it mapped into the process too, for as long as the pool kept it. A
+    /// scan reads each part and decodes it into memory of its own, so once it has read as many parts
+    /// as the page has, nothing reads those bytes again soon. They go the way an unheld page's go in
+    /// [`Reader::read_impl`], and the count starts over, so a page read again later faults back in
+    /// from the page cache at a fault per sixteen pages. On ClickBench q24 the `URL` pages a `LIKE`
+    /// held were 38 MB of a 102 MB peak.
+    left: AtomicUsize,
 }
 
 /// Where a held page's bytes are: read into memory of its own, or a range of the mapped file.
@@ -4503,6 +4513,19 @@ impl Drop for PageBytes {
 impl HeldPage {
     fn bytes(&self) -> &[u8] {
         self.bytes.bytes()
+    }
+
+    /// Counts one part of the page as read, and lets a mapped page's pages go once as many have
+    /// been as it has parts. See [`Self::left`].
+    fn read_one(&self) {
+        let PageBytes::Mapped { map, offset, length } = &self.bytes else { return };
+        let parts = self.checked.len();
+        let before = self.left.fetch_update(Atomic::Relaxed, Atomic::Relaxed, |left| {
+            Some(if left <= 1 { parts } else { left - 1 })
+        });
+        if before == Ok(1) {
+            map.release(*offset, *length);
+        }
     }
 
     /// The bytes of part `part`, checked against `span` the first time anyone asks for them.
@@ -8088,7 +8111,11 @@ impl Reader {
                 bytes
             }
         };
-        read(bytes)
+        let answer = read(bytes);
+        if let Some(page) = &held.page {
+            page.read_one();
+        }
+        answer
     }
 
     /// Reads named columns from one part, only at the rows `positions` names.
@@ -8301,7 +8328,8 @@ impl Reader {
                 }
             };
             let checked = index.iter().map(|_| AtomicBool::new(false)).collect();
-            Some(Arc::new(HeldPage { bytes, checked }))
+            let left = AtomicUsize::new(index.len());
+            Some(Arc::new(HeldPage { bytes, checked, left }))
         } else {
             None
         };
@@ -8410,13 +8438,25 @@ impl Reader {
             // What was decoded is in memory of its own now, so once every part of the page has
             // been, nothing this scan does reads the page again. A part read twice counts twice
             // and lets the page go early, which costs the reads after it a fault and no more.
-            if mapped
-                && let Some(map) = self.map.as_deref()
-                && let Some(left) = self.unreleased.get(index * self.table.fields.len() + column)
-                && left.fetch_update(Atomic::Relaxed, Atomic::Relaxed, |left| left.checked_sub(1))
-                    == Ok(1)
-            {
-                map.release(page.offset, page.length as usize);
+            //
+            // A read at positions lets its own part go as well. That is how a filtered scan reads
+            // the columns after its filter and how a late materialization reads a row, and either
+            // one skips the parts with no rows it wants, so the count of a page it reads may never
+            // come down to zero. On ClickBench q24 those parts were 23 MB of the peak, fetching ten
+            // rows of every column and `EventTime` where `URL` matched.
+            if mapped && let Some(map) = self.map.as_deref() {
+                let left = self.unreleased.get(index * self.table.fields.len() + column);
+                if left.is_some_and(|left| {
+                    left.fetch_update(Atomic::Relaxed, Atomic::Relaxed, |left| left.checked_sub(1))
+                        == Ok(1)
+                }) {
+                    map.release(page.offset, page.length as usize);
+                } else if positions.is_some() && !keeping {
+                    map.release(page.offset + span.start as u64, span.length);
+                }
+            }
+            if let Some(page) = &held.page {
+                page.read_one();
             }
             // A demoted column's codes are not the column's codes, only the codes of the stripes
             // written before the demotion, so they are not handed out as if they were. They still
