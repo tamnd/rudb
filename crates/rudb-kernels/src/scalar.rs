@@ -169,6 +169,9 @@ fn run<V: AsRef<Vector>>(
             return Ok(vector);
         }
     }
+    if let Some(vector) = crate::path::vectorized(name, args, rows)? {
+        return Ok(vector);
+    }
     if matches!(name, "strptime" | "try_strptime") {
         let refs: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
         let strict = name == "strptime";
@@ -3967,6 +3970,10 @@ pub fn call_values(
     if let Some(answer) = split::before_nulls(name, args) {
         return answer;
     }
+    // The path functions read a null option as the option not given.
+    if let Some(answer) = crate::path::before_nulls(name, args) {
+        return answer;
+    }
     // `hash` hashes a null like any other value.
     if name == "hash" {
         return Ok(Value::UBigInt(hash::hash_all(args)));
@@ -4115,6 +4122,16 @@ pub fn call_values(
         }
         ("position" | "strpos" | "instr", [haystack, needle]) => text::position(haystack, needle),
         ("contains", [haystack, needle]) => text::contains(haystack, needle),
+        // The signature cast the count to a BIGINT.
+        ("format_bytes" | "formatReadableSize", [Value::BigInt(bytes)]) => {
+            Ok(Value::Varchar(crate::bytes::format_bytes(*bytes, false)))
+        }
+        ("formatReadableDecimalSize", [Value::BigInt(bytes)]) => {
+            Ok(Value::Varchar(crate::bytes::format_bytes(*bytes, true)))
+        }
+        ("parse_formatted_bytes", [Value::Varchar(text)]) => {
+            Ok(Value::UBigInt(crate::bytes::parse_formatted_bytes(text)?))
+        }
         ("levenshtein" | "editdist3", [a, b]) => similarity::levenshtein(a, b),
         ("damerau_levenshtein", [a, b]) => similarity::damerau_levenshtein(a, b),
         ("mismatches" | "hamming", [a, b]) => similarity::mismatches(a, b),
