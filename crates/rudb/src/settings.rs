@@ -295,8 +295,8 @@ impl Settings {
 
     /// The log size after which a commit checkpoints, `SET checkpoint_threshold`.
     pub(crate) fn checkpoint_threshold(&self) -> u64 {
-        let entry = rudb_functions::setting_named("checkpoint_threshold")
-            .expect("the registry has checkpoint_threshold, which its own test checks");
+        let entry = rudb_functions::setting_named("wal_autocheckpoint")
+            .expect("the registry has wal_autocheckpoint, the spelling checkpoint_threshold means");
         parse_size(&self.carried(entry)).unwrap_or(16 << 20)
     }
 
@@ -780,8 +780,8 @@ impl Settings {
         };
         let mut written = typed(entry, value)?;
         // The one knob a commit reads, so it is a size or it is refused, and it reads back the way
-        // the pin prints it.
-        if entry.name == "checkpoint_threshold" {
+        // the pin prints it. Both spellings land here as wal_autocheckpoint.
+        if entry.name == "wal_autocheckpoint" {
             written = human(parse_size(&written)?);
         }
         if matches!(entry.behaviour, Behaviour::DefaultOnly(_))
