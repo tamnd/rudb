@@ -1431,23 +1431,7 @@ impl<'a> Scan<'a> {
         // is holding one, which is a reader that has not had a turn yet rather than an error.
         let slot = reader();
         let mut working = pushed.take(slot);
-        // Charged to its own stage, because otherwise a filter the scan took into itself is time
-        // the document calls reading.
-        let filtering = stage::Timing::start(Stage::Filter);
-        let kept = match &pushed.settles {
-            Some(settles) => {
-                let rows = self.table.rows();
-                let settled: Vec<bool> = settles
-                    .iter()
-                    .map(|probes| probes.as_deref().is_some_and(|probes| rows.certain(at, probes)))
-                    .collect();
-                pushed.predicate.evaluate_settled(chunk, &mut working.scratch, &settled)
-            }
-            None => pushed.predicate.evaluate_filter(chunk, &mut working.scratch),
-        };
-        filtering.stop(0);
-        let mut kept = kept?;
-        self.passed.saw(chunk.len(), kept.len());
+        let mut kept = self.passing(pushed, at, chunk, &mut working)?;
         // After the filter and on its answer rather than on the chunk, so that the filter's kernels
         // read the columns flat as they came off the disk and the chunk is narrowed once. Narrowing
         // it for the reduction first left the filter a selected chunk, and the comparison on a
@@ -1474,6 +1458,34 @@ impl<'a> Scan<'a> {
         }
         pushed.give(slot, working);
         Ok(())
+    }
+
+    /// The rows of `chunk`, part `at` or some of its rows, that the pushed filter keeps.
+    fn passing(
+        &self,
+        pushed: &Pushed,
+        at: usize,
+        chunk: &Chunk,
+        working: &mut Working,
+    ) -> Result<Selection> {
+        // Charged to its own stage, because otherwise a filter the scan took into itself is time
+        // the document calls reading.
+        let filtering = stage::Timing::start(Stage::Filter);
+        let kept = match &pushed.settles {
+            Some(settles) => {
+                let rows = self.table.rows();
+                let settled: Vec<bool> = settles
+                    .iter()
+                    .map(|probes| probes.as_deref().is_some_and(|probes| rows.certain(at, probes)))
+                    .collect();
+                pushed.predicate.evaluate_settled(chunk, &mut working.scratch, &settled)
+            }
+            None => pushed.predicate.evaluate_filter(chunk, &mut working.scratch),
+        };
+        filtering.stop(0);
+        let kept = kept?;
+        self.passed.saw(chunk.len(), kept.len());
+        Ok(kept)
     }
 
     /// Narrows a chunk to the rows a filter kept, leaving out the columns nothing reads afterwards.
@@ -1576,6 +1588,11 @@ impl<'a> Scan<'a> {
                 return Ok(true);
             }
         }
+        let filtered = self.filter_first(at, &mut positions)?;
+        if positions.is_empty() {
+            *out = Chunk::empty(&self.schema.types());
+            return Ok(true);
+        }
         let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
         let read = self.table.rows().read_rows(at, &projected, &positions)?;
         let kept = positions.len();
@@ -1593,9 +1610,63 @@ impl<'a> Scan<'a> {
             }
         }
         *out = Chunk::with_rows(held, kept)?;
-        self.apply_reduced(at, None, out, false)?;
+        if !filtered {
+            self.apply_reduced(at, None, out, false)?;
+        }
         self.sift_exact_but(out, bitmap.map(|(sideways, ..)| sideways))?;
         self.sift_hashed(out)?;
+        Ok(true)
+    }
+
+    /// Runs the pushed filter over the columns it reads at `positions` of part `at`, and narrows
+    /// the positions to what it kept, for [`Self::read_reduced`] to read the other columns at.
+    /// False, with the positions as they were, when there is no filter to run, the part's zones
+    /// settle it, or it has been measured keeping more than half its rows.
+    ///
+    /// On TPC-H q03 the orders before the date hold about one `lineitem` row in ten and the ship
+    /// date after it keeps one in twenty of those, so reading the order key, the price and the
+    /// discount along with the date read nineteen of every twenty of their rows for nothing.
+    fn filter_first(&self, at: usize, positions: &mut Vec<u32>) -> Result<bool> {
+        let Some(pushed) = self.pushed.as_ref() else { return Ok(false) };
+        if self.passed.loose()
+            || self.deferrable.is_empty()
+            || pushed.probes.as_deref().is_some_and(|probes| self.table.rows().certain(at, probes))
+        {
+            return Ok(false);
+        }
+        let first: Vec<usize> = (0..self.columns.len())
+            .filter(|place| !self.deferrable.contains(place))
+            .filter_map(|place| self.columns[place])
+            .collect();
+        if first.is_empty() {
+            return Ok(false);
+        }
+        let read = self.table.rows().read_rows(at, &first, positions)?;
+        let types = self.schema.types();
+        let mut held = Vec::with_capacity(self.columns.len());
+        let mut real = 0;
+        for (place, column) in self.columns.iter().enumerate() {
+            if self.deferrable.contains(&place) {
+                held.push(Vector::constant(types[place].clone(), Value::Null, positions.len()));
+            } else if column.is_some() {
+                held.push(read.column(real)?.clone());
+                real += 1;
+            } else {
+                let first = self.offsets[at];
+                let numbers: Vec<i64> =
+                    positions.iter().map(|&row| first + i64::from(row)).collect();
+                held.push(Vector::flat(LogicalType::BigInt, Data::Int64(numbers.into()))?);
+            }
+        }
+        let chunk = Chunk::with_rows(held, positions.len())?;
+        let slot = reader();
+        let mut working = pushed.take(slot);
+        let kept = self.passing(pushed, at, &chunk, &mut working);
+        pushed.give(slot, working);
+        let kept = kept?;
+        if kept.len() < positions.len() {
+            *positions = kept.iter().map(|index| positions[index]).collect();
+        }
         Ok(true)
     }
 
