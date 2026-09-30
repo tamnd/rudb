@@ -44,7 +44,7 @@ use rudb_plan::{
     ColumnBinding, Expr, ExprRef, Plan, Slice, SortKey, WindowBound, WindowExclude, WindowFrame,
     WindowUnit,
 };
-use rudb_vector::Chunk;
+use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
 use crate::prepared::{Prepared, Scratch};
@@ -172,7 +172,18 @@ struct Call {
 /// The gathered values are one flat vector rather than one per purpose, because they are evaluated
 /// by a single prepared array in one pass over the chunk and cutting them apart per row would
 /// allocate four vectors where one does.
-type Windowed = (Vec<Value>, Vec<Value>, Arrival);
+///
+/// The input row itself is not copied out. It stays in the chunk it came in, and the row carries
+/// which chunk and where in it, so a column the window only passes through costs what the chunk
+/// already spent on it rather than a [`Value`] per row.
+type Windowed = (Vec<Value>, Source, Arrival);
+
+/// Which gathered chunk a row came in, and its position there.
+#[derive(Debug, Clone, Copy)]
+struct Source {
+    chunk: u32,
+    row: u32,
+}
 
 /// The rows of a frame in the order one call reads them.
 ///
@@ -307,6 +318,8 @@ pub(crate) struct Window {
     schema: Schema,
     memory: Memory,
     rows: Mutex<Vec<Windowed>>,
+    /// The chunks the rows came in, which [`Source`] points into.
+    chunks: Mutex<Vec<Chunk>>,
     /// What the gathered rows are charged, given back once the output chunks are charged instead.
     charged: Mutex<Vec<Reservation>>,
     /// What the output chunks are charged, held for as long as they are readable.
@@ -318,6 +331,7 @@ pub(crate) struct Window {
 #[derive(Debug)]
 pub(crate) struct Gathered {
     rows: Vec<Windowed>,
+    chunks: Vec<Chunk>,
     scratch: Scratch,
     charged: Reservation,
     place: Place,
@@ -443,6 +457,7 @@ impl Window {
             schema,
             memory: memory.clone(),
             rows: Mutex::new(Vec::new()),
+            chunks: Mutex::new(Vec::new()),
             charged: Mutex::new(Vec::new()),
             held: Mutex::new(memory.reservation()),
             out: out.clone(),
@@ -538,6 +553,7 @@ impl Sink for Window {
     fn local(&self) -> Gathered {
         Gathered {
             rows: Vec::new(),
+            chunks: Vec::new(),
             scratch: self.values.scratch(),
             charged: self.memory.reservation(),
             place: Place::default(),
@@ -556,19 +572,22 @@ impl Sink for Window {
     fn sink(&self, chunk: &Chunk, local: &mut Gathered) -> Result<Progress> {
         let mut gathered = Vec::new();
         self.values.evaluate(chunk, &mut local.scratch, &mut gathered)?;
-        let mut taken = 0;
-        // row at a time: the same trade the sort makes and for now the same reason. A window that
-        // holds its rows as chunks and its keys as one comparable byte string a row is what makes
-        // the second pass cheap, and neither of those exists yet.
+        let per_row = size_of::<Windowed>() * chunk.len();
+        let mut taken = u64::try_from(chunk.footprint() + per_row).unwrap_or(u64::MAX);
+        let from = u32::try_from(local.chunks.len())
+            .map_err(|_| Error::internal("a window gathering more chunks than a u32 counts"))?;
+        // The keys are still a row at a time: the same trade the sort makes and for now the same
+        // reason. Keys held as one comparable byte string a row is what would make the second pass
+        // cheap, and that does not exist yet. The rest of the row stays in its chunk.
         for row in 0..chunk.len() {
             let held: Vec<Value> =
                 gathered.iter().map(|column| column.try_value_at(row)).collect::<Result<_>>()?;
-            let values: Vec<Value> = (0..chunk.width())
-                .map(|column| chunk.try_value_at(row, column))
-                .collect::<Result<_>>()?;
-            taken += rows::footprint(&held) + rows::footprint(&values);
-            local.rows.push((held, values, local.place.of(row)));
+            taken += rows::footprint(&held);
+            let at = u32::try_from(row)
+                .map_err(|_| Error::internal("a chunk longer than a u32 counts"))?;
+            local.rows.push((held, Source { chunk: from, row: at }, local.place.of(row)));
         }
+        local.chunks.push(chunk.clone());
         local.place.past(chunk.len());
         local.charged.grow(taken)?;
         Ok(Progress::More)
@@ -576,7 +595,13 @@ impl Sink for Window {
 
     fn combine(&self, local: Gathered) -> Result<()> {
         let mut rows = self.rows.lock().map_err(poisoned)?;
-        rows.extend(local.rows);
+        let mut chunks = self.chunks.lock().map_err(poisoned)?;
+        let past = u32::try_from(chunks.len())
+            .map_err(|_| Error::internal("a window gathering more chunks than a u32 counts"))?;
+        rows.extend(local.rows.into_iter().map(|(held, source, arrival)| {
+            (held, Source { chunk: source.chunk + past, row: source.row }, arrival)
+        }));
+        chunks.extend(local.chunks);
         self.charged.lock().map_err(poisoned)?.push(local.charged);
         Ok(())
     }
@@ -596,20 +621,27 @@ impl Sink for Window {
             return Err(error);
         }
 
-        let mut answered: Vec<Vec<Value>> = Vec::with_capacity(gathered.len());
+        let mut answers: Vec<Vec<Value>> =
+            self.calls.iter().map(|_| Vec::with_capacity(gathered.len())).collect();
         let mut start = 0;
         while start < gathered.len() {
             let mut end = start + 1;
             while end < gathered.len() && self.same_partition(&gathered[start], &gathered[end])? {
                 end += 1;
             }
-            self.over(&gathered[start..end], &mut answered)?;
+            self.over(&gathered[start..end], &mut answers)?;
             start = end;
         }
 
+        // Every row is answered, so the keys are done with and go before the output is built rather
+        // than being held alongside it.
+        let sources: Vec<Source> = gathered.iter().map(|row| row.1).collect();
+        drop(gathered);
+        let chunks = std::mem::take(&mut *self.chunks.lock().map_err(poisoned)?);
         let mut held = self.held.lock().map_err(poisoned)?;
-        let chunks = rows::chunks(&self.types, &answered, &mut held)?;
-        self.out.fill(chunks)?;
+        let built = self.built(&chunks, &sources, &answers, &mut held)?;
+        drop(chunks);
+        self.out.fill(built)?;
         // The gathered rows are gone and the chunks are charged instead, so what the instances took
         // is given back here and not before.
         self.charged.lock().map_err(poisoned)?.clear();
@@ -618,8 +650,48 @@ impl Sink for Window {
 }
 
 impl Window {
-    /// Answers every row of one partition and appends the answered rows to `answered`.
-    fn over(&self, rows: &[Windowed], answered: &mut Vec<Vec<Value>>) -> Result<()> {
+    /// The output in chunks, in the order the rows were sorted into: each input column read back
+    /// out of the chunk the row came in, then one column per call.
+    ///
+    /// Built a chunk at a time, so the values read out of the input only ever exist for one chunk's
+    /// worth of rows.
+    fn built(
+        &self,
+        chunks: &[Chunk],
+        sources: &[Source],
+        answers: &[Vec<Value>],
+        held: &mut Reservation,
+    ) -> Result<Vec<Chunk>> {
+        let width = self.types.len() - self.calls.len();
+        let mut built = Vec::with_capacity(sources.len().div_ceil(VECTOR_SIZE));
+        let mut from = 0;
+        while from < sources.len() {
+            let to = (from + VECTOR_SIZE).min(sources.len());
+            let mut columns = Vec::with_capacity(self.types.len());
+            for column in 0..width {
+                let values: Vec<Value> = sources[from..to]
+                    .iter()
+                    .map(|source| {
+                        chunks[source.chunk as usize].try_value_at(source.row as usize, column)
+                    })
+                    .collect::<Result<_>>()?;
+                columns.push(Vector::from_values(self.types[column].clone(), &values)?);
+            }
+            for (which, answered) in answers.iter().enumerate() {
+                let ty = self.types[width + which].clone();
+                columns.push(Vector::from_values(ty, &answered[from..to])?);
+            }
+            let chunk = Chunk::with_rows(columns, to - from)?;
+            held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
+            built.push(chunk);
+            from = to;
+        }
+        Ok(built)
+    }
+
+    /// Answers every row of one partition, appending each call's answers to its own column of
+    /// `answers`.
+    fn over(&self, rows: &[Windowed], answers: &mut [Vec<Value>]) -> Result<()> {
         let peers = self.peer_groups(rows)?;
         // `fill` is answered for the whole partition in one go rather than a row at a time, because
         // every gap in it is read from the nearest value on either side and looking for those per
@@ -644,10 +716,10 @@ impl Window {
             .collect::<Result<_>>()?;
         for at in 0..rows.len() {
             let frame = self.frame_of(rows, &peers, at)?;
-            let mut row = rows[at].1.clone();
             for (which, call) in self.calls.iter().enumerate() {
-                if let Some(column) = &filled[which] {
-                    row.push(column[at].clone());
+                let column = &mut answers[which];
+                if let Some(filled) = &filled[which] {
+                    column.push(filled[at].clone());
                     continue;
                 }
                 match &mut running[which] {
@@ -656,12 +728,11 @@ impl Window {
                             feed(call, rows, gained, accumulator)?;
                         }
                         *fed = frame.end;
-                        row.push(accumulator.finish()?);
+                        column.push(accumulator.finish()?);
                     }
-                    _ => row.push(self.answer(call, rows, &peers, at, frame.clone())?),
+                    _ => column.push(self.answer(call, rows, &peers, at, frame.clone())?),
                 }
             }
-            answered.push(row);
         }
         Ok(())
     }
