@@ -335,6 +335,14 @@ pub(crate) struct Binder<'a> {
     /// `outer_scopes`.
     pub(crate) lateral_scopes: Vec<usize>,
     pub(crate) correlations: Vec<Vec<ColumnBinding>>,
+    /// The column a `COLUMNS` stands for while the expression it is in is bound for that column.
+    pub(crate) star_entry: Option<crate::columns::Picked>,
+    /// The FROM clause a `COLUMNS` argument is picking out of while it is bound, which is what a
+    /// `*` inside it stands for. See `crate::columns`.
+    pub(crate) columns_scope: Option<Scope>,
+    /// The column name a star stands for while a pattern applied to it is tried on that name, as
+    /// in `* LIKE 'a%'`.
+    pub(crate) star_name: Option<String>,
     /// The lambdas whose bodies are being bound, innermost last. See `crate::lambda`.
     pub(crate) lambda_frames: Vec<crate::lambda::Frame>,
     /// Whether the expression being bound is inside a `TRY`, which refuses what it cannot rerun.
@@ -406,6 +414,9 @@ impl<'a> Binder<'a> {
             outer_scopes: Vec::new(),
             lateral_scopes: Vec::new(),
             correlations: Vec::new(),
+            star_entry: None,
+            columns_scope: None,
+            star_name: None,
             lambda_frames: Vec::new(),
             trying: false,
             exporting: false,
@@ -1031,8 +1042,12 @@ impl<'a> Binder<'a> {
 
         if written.filter != NONE {
             self.clause = "WHERE clause";
-            let predicate = self.bind_expr(ast, written.filter, &input)?;
-            let predicate = self.as_boolean(predicate, "WHERE")?;
+            let predicate = if crate::columns::has_star(ast, written.filter) {
+                self.bind_star_predicate(ast, written.filter, &input)?
+            } else {
+                let predicate = self.bind_expr(ast, written.filter, &input)?;
+                self.as_boolean(predicate, "WHERE")?
+            };
             node = self.attach_scalar_subqueries(node);
             node = self.add_node(Node::Filter { input: node, predicate });
         }
@@ -1055,6 +1070,13 @@ impl<'a> Binder<'a> {
             self.unnest_grouping = Some(written.group_by_all);
             let mut groups = Vec::with_capacity(group_items.len());
             for item in &group_items {
+                // `GROUP BY ALL` groups on what a star or a `COLUMNS` in the list stands for.
+                if written.group_by_all
+                    && let Some(expanded) = self.bind_star_each(ast, *item, &input)?
+                {
+                    groups.extend(expanded);
+                    continue;
+                }
                 groups.push(self.bind_expr(ast, *item, &input)?);
             }
             self.unnest_here = false;
@@ -1075,6 +1097,11 @@ impl<'a> Binder<'a> {
         // the GROUP BY, which is the complaint this used to make.
         let mut above = Vec::new();
 
+        // The pin refuses a star in a `HAVING` while it expands the stars, which is before it binds
+        // the select list and finds anything wrong with that.
+        if written.having != NONE && crate::columns::has_star(ast, written.having) {
+            return Err(Error::binder("STAR expression is not supported here"));
+        }
         self.clause = "SELECT clause";
         self.unnest_here = true;
         let (mut exprs, mut names) = self.bind_targets(ast, &targets, &input, &mut above)?;
@@ -1327,45 +1354,61 @@ impl<'a> Binder<'a> {
         let mut exprs = Vec::with_capacity(targets.len());
         let mut names = Vec::with_capacity(targets.len());
         for target in targets {
-            if let ast::Expr::Star { qualifier, replacements } = ast.expr(target.expr) {
-                let table = ast.name(qualifier).last().map(str::to_string);
-                let expanded: Vec<Visible> =
-                    input.star(table.as_deref())?.into_iter().cloned().collect();
-                let replacements = ast.target_list(replacements).to_vec();
-                let mut used = vec![false; replacements.len()];
-                for column in expanded {
-                    let found = replacements.iter().zip(&mut used).find(|(replacement, _)| {
-                        same_name(ast.string(replacement.alias), &column.name)
-                    });
-                    // The replacement takes the column's place and its position, and it is named the
-                    // way the replace list spells it rather than the way the table does. That only
-                    // shows when the two differ in case, and `AS EventDate` over a column called
-                    // `eventdate` is exactly the case that shows it.
-                    let before = self.scalar_subqueries.len();
-                    let (expr, name) = match found {
-                        Some((replacement, used)) => {
-                            *used = true;
-                            let expr = self.bind_expr(ast, replacement.expr, input)?;
-                            (expr, ast.string(replacement.alias).to_string())
-                        }
-                        None => (
-                            self.plan.add_expr(Expr::Column(column.binding), column.ty),
-                            column.name,
-                        ),
-                    };
-                    self.lift_over_aggregate(before, above, input)?;
-                    exprs.push(self.over_aggregate(expr, input)?);
-                    names.push(name);
-                }
-                // A replace list that named something the star did not stand for is a mistake and
-                // not a no op, and it is caught here because this is the first point at which the
-                // set of names the star stands for is known.
-                if let Some((replacement, _)) =
-                    replacements.iter().zip(&used).find(|(_, used)| !**used)
-                {
-                    return Err(missing_replacement(ast.string(replacement.alias), input));
+            if let Some(picks) = self.star_like(ast, target.expr, input)? {
+                let alias = (target.alias != NONE).then(|| ast.string(target.alias));
+                for picked in &picks.entries {
+                    self.star_entry = Some(picked.clone());
+                    let expr = self.bind_picked(ast, input);
+                    self.star_entry = None;
+                    exprs.push(self.over_aggregate(expr?, input)?);
+                    names.push(picks.name(picked, alias)?);
                 }
                 continue;
+            }
+            match crate::columns::find_star(ast, target.expr)? {
+                None => {}
+                Some(crate::columns::Found::Star) => {
+                    for picked in self.star_columns(ast, target.expr, input)? {
+                        // A replacement takes the column's place and its position.
+                        let before = self.scalar_subqueries.len();
+                        let expr = if picked.replacement == NONE {
+                            self.plan
+                                .add_expr(Expr::Column(picked.column.binding), picked.column.ty)
+                        } else {
+                            self.bind_expr(ast, picked.replacement, input)?
+                        };
+                        self.lift_over_aggregate(before, above, input)?;
+                        exprs.push(self.over_aggregate(expr, input)?);
+                        names.push(picked.name);
+                    }
+                    continue;
+                }
+                Some(crate::columns::Found::Columns(columns)) => {
+                    let picks = self.columns_picks(ast, columns, input)?;
+                    let alias = (target.alias != NONE).then(|| ast.string(target.alias));
+                    for picked in &picks.entries {
+                        let before = self.scalar_subqueries.len();
+                        self.star_entry = Some(picked.clone());
+                        let expr = self.bind_expr(ast, target.expr, input);
+                        self.star_entry = None;
+                        let expr = expr?;
+                        self.lift_over_aggregate(before, above, input)?;
+                        exprs.push(self.over_aggregate(expr, input)?);
+                        names.push(picks.name(picked, alias)?);
+                    }
+                    continue;
+                }
+                Some(crate::columns::Found::Unpacked(columns)) => {
+                    if matches!(ast.expr(target.expr), ast::Expr::Columns { .. }) {
+                        return Err(Error::binder(
+                            "*COLUMNS not allowed at the root level, use COLUMNS instead",
+                        ));
+                    }
+                    return Err(Error::not_implemented(format!(
+                        "{} is not supported yet",
+                        rudb_parse::deparse::expression(ast, columns)
+                    )));
+                }
             }
             let before = self.scalar_subqueries.len();
             self.unnest_root = matches!(ast.expr(target.expr), ast::Expr::Function { name, .. }
@@ -1386,6 +1429,9 @@ impl<'a> Binder<'a> {
             } else {
                 ast.string(target.alias).to_string()
             });
+        }
+        if exprs.is_empty() {
+            return Err(Error::binder("SELECT list is empty after resolving * expressions!"));
         }
         Ok((exprs, names))
     }
@@ -1499,6 +1545,25 @@ impl<'a> Binder<'a> {
         let items = ast.order_list(query.order_by).to_vec();
         let mut keys = Vec::with_capacity(items.len());
         for item in items {
+            if let Some(expanded) = self.bind_star_each(ast, item.expr, input)? {
+                for bound in expanded {
+                    let bound = self.over_aggregate(bound, input)?;
+                    let position = match exprs.iter().position(|&held| self.same_expr(held, bound))
+                    {
+                        Some(position) => position,
+                        None => {
+                            exprs.push(bound);
+                            names.push(describe(ast, item.expr, self.semantics));
+                            extra.push(exprs.len() - 1);
+                            exprs.len() - 1
+                        }
+                    };
+                    let ty = self.plan.expr_type(exprs[position]).clone();
+                    let expr = self.column(project, position, ty);
+                    keys.push(self.sort_key(expr, item));
+                }
+                continue;
+            }
             self.check_order_literal(ast, item.expr)?;
             let position = match self.output_position(ast, item.expr, output)? {
                 Some(position) => position,
@@ -1539,6 +1604,12 @@ impl<'a> Binder<'a> {
         let items = ast.order_list(query.order_by).to_vec();
         let mut keys = Vec::with_capacity(items.len());
         for item in items {
+            if let Some(expanded) = self.bind_star_each(ast, item.expr, output)? {
+                for expr in expanded {
+                    keys.push(self.sort_key(expr, item));
+                }
+                continue;
+            }
             self.check_order_literal(ast, item.expr)?;
             let expr = match self.output_position(ast, item.expr, output)? {
                 Some(position) => {
@@ -4279,7 +4350,7 @@ fn null_parameter(function: TableFunction, parameter: &str) -> String {
 ///
 /// It reads like the complaint about any other name that is not there, down to the list of names
 /// that are, because from the writer's side it is the same mistake.
-fn missing_replacement(name: &str, input: &Scope) -> Error {
+pub(crate) fn missing_replacement(name: &str, input: &Scope) -> Error {
     Error::binder(format!(
         "Column \"{name}\" in REPLACE list not found in FROM clause{}",
         input.candidates()

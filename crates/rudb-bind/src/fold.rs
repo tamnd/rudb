@@ -67,30 +67,61 @@ pub const VOLATILE: [&str; 17] = [
 /// If evaluating it raises. A caller that would rather have the expression than the error throws
 /// this away, which is what the folding pass does and what the module documentation explains.
 pub fn value_of(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
+    evaluate(plan, expr, &mut Lambdas { enabled: false, frames: Vec::new() })
+}
+
+/// What an expression comes to, the way [`value_of`] works it out, except that a `list_filter` or a
+/// `list_transform` over a constant list is run element by element rather than left alone.
+///
+/// The argument of a `COLUMNS` is the one place that needs it, because the pin evaluates a lambda
+/// over the column names there before there is a plan to run it in. The folding pass does not ask
+/// for it, so a lambda in a query still runs where it was written.
+///
+/// # Errors
+///
+/// If evaluating it raises.
+pub fn value_with_lambdas(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
+    evaluate(plan, expr, &mut Lambdas { enabled: true, frames: Vec::new() })
+}
+
+/// Whether lambdas are run at all, and the parameter values of the ones being run, innermost last.
+struct Lambdas {
+    enabled: bool,
+    frames: Vec<(u32, [Value; 2])>,
+}
+
+fn evaluate(plan: &Plan, expr: ExprRef, lambdas: &mut Lambdas) -> Result<Option<Value>> {
     let value = match *plan.expr(expr) {
         Expr::Constant(value) => plan.value(value).clone(),
-        Expr::Column(_)
-        | Expr::Aggregate { .. }
-        | Expr::Window { .. }
-        | Expr::Lambda { .. }
-        | Expr::LambdaParam(_) => return Ok(None),
+        Expr::LambdaParam(binding) => {
+            let found = lambdas.frames.iter().rev().find(|(table, _)| *table == binding.table);
+            match found.and_then(|(_, values)| values.get(binding.column as usize)) {
+                Some(value) => value.clone(),
+                None => return Ok(None),
+            }
+        }
+        Expr::Column(_) | Expr::Aggregate { .. } | Expr::Window { .. } | Expr::Lambda { .. } => {
+            return Ok(None);
+        }
         Expr::Cast { input, try_cast } => {
             if plan.expr_type(input) == &LogicalType::TimestampTz
                 && plan.expr_type(expr) == &LogicalType::Varchar
             {
                 return Ok(None);
             }
-            let Some(inner) = value_of(plan, input)? else { return Ok(None) };
+            let Some(inner) = evaluate(plan, input, lambdas)? else { return Ok(None) };
             cast_value(&inner, plan.expr_type(expr), try_cast)?
         }
         Expr::Compare { op, left, right } => {
-            let (Some(left), Some(right)) = (value_of(plan, left)?, value_of(plan, right)?) else {
+            let (Some(left), Some(right)) =
+                (evaluate(plan, left, lambdas)?, evaluate(plan, right, lambdas)?)
+            else {
                 return Ok(None);
             };
             compare_values(comparison(op), &left, &right)?
         }
         Expr::Conjunction { op, children } => {
-            let Some(values) = values_of(plan, children)? else { return Ok(None) };
+            let Some(values) = values_of(plan, children, lambdas)? else { return Ok(None) };
             let vectors: Vec<Vector> = values
                 .into_iter()
                 .map(|value| Vector::constant(LogicalType::Boolean, value, 1))
@@ -103,12 +134,18 @@ pub fn value_of(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
                 return Ok(None);
             }
             if let ("try", [only]) = (name, plan.expr_list(args)) {
-                return match value_of(plan, *only) {
+                return match evaluate(plan, *only, lambdas) {
                     Err(error) if caught(&error) => Ok(Some(Value::Null)),
                     answer => answer,
                 };
             }
-            let Some(values) = values_of(plan, args)? else { return Ok(None) };
+            if lambdas.enabled
+                && let [list, lambda] = plan.expr_list(args)
+                && let Expr::Lambda { table, body, .. } = *plan.expr(*lambda)
+            {
+                return run_lambda(plan, name, expr, *list, table, body, lambdas);
+            }
+            let Some(values) = values_of(plan, args, lambdas)? else { return Ok(None) };
             // The one call the values alone cannot answer, since a value of an enum is its string
             // and the position is in the type.
             if let ("enum_code", [only], [arg]) = (name, values.as_slice(), plan.expr_list(args)) {
@@ -119,9 +156,43 @@ pub fn value_of(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
             // that wanted the value reports what was written around it instead.
             call_values(name, &values, plan.expr_type(expr), None)?
         }
-        Expr::Case { arms, otherwise } => return case(plan, arms, otherwise),
+        Expr::Case { arms, otherwise } => return case(plan, arms, otherwise, lambdas),
     };
     Ok(Some(value))
+}
+
+/// A `list_filter` or a `list_transform` over a list that folds, run once per element with the
+/// element and its position, from 1, as the parameters.
+fn run_lambda(
+    plan: &Plan,
+    name: &str,
+    expr: ExprRef,
+    list: ExprRef,
+    table: u32,
+    body: ExprRef,
+    lambdas: &mut Lambdas,
+) -> Result<Option<Value>> {
+    let filter = match name {
+        "list_filter" => true,
+        "list_transform" => false,
+        _ => return Ok(None),
+    };
+    let Some(list) = evaluate(plan, list, lambdas)? else { return Ok(None) };
+    let Value::List { values, .. } = list else { return Ok(Some(Value::Null)) };
+    let LogicalType::List(element) = plan.expr_type(expr) else { return Ok(None) };
+    let mut out = Vec::with_capacity(values.len());
+    for (at, value) in values.into_iter().enumerate() {
+        lambdas.frames.push((table, [value.clone(), Value::BigInt(at as i64 + 1)]));
+        let answer = evaluate(plan, body, lambdas);
+        lambdas.frames.pop();
+        let Some(answer) = answer? else { return Ok(None) };
+        if !filter {
+            out.push(answer);
+        } else if answer.as_bool() == Some(true) {
+            out.push(value);
+        }
+    }
+    Ok(Some(Value::List { element: (**element).clone(), values: out }))
 }
 
 /// Whether `TRY` answers null for this error rather than passing it on, which is the pin's three
@@ -132,10 +203,10 @@ pub fn caught(error: &rudb_common::Error) -> bool {
 }
 
 /// What a run of expressions comes to, or `None` if any one of them does not come to one thing.
-fn values_of(plan: &Plan, slice: Slice) -> Result<Option<Vec<Value>>> {
+fn values_of(plan: &Plan, slice: Slice, lambdas: &mut Lambdas) -> Result<Option<Vec<Value>>> {
     let mut values = Vec::with_capacity(plan.expr_list(slice).len());
     for &expr in plan.expr_list(slice) {
-        let Some(value) = value_of(plan, expr)? else { return Ok(None) };
+        let Some(value) = evaluate(plan, expr, lambdas)? else { return Ok(None) };
         values.push(value);
     }
     Ok(Some(values))
@@ -147,17 +218,22 @@ fn values_of(plan: &Plan, slice: Slice) -> Result<Option<Vec<Value>>> {
 /// was written not to be evaluated. `CASE WHEN false THEN 1 // 0 ELSE 4 END` is 4 and not a division
 /// by zero, and it is 4 for the same reason at run time, where the executor evaluates an arm only on
 /// the rows that reached it.
-fn case(plan: &Plan, arms: Slice, otherwise: Option<ExprRef>) -> Result<Option<Value>> {
+fn case(
+    plan: &Plan,
+    arms: Slice,
+    otherwise: Option<ExprRef>,
+    lambdas: &mut Lambdas,
+) -> Result<Option<Value>> {
     for arm in plan.arm_list(arms) {
-        let Some(when) = value_of(plan, arm.when)? else { return Ok(None) };
+        let Some(when) = evaluate(plan, arm.when, lambdas)? else { return Ok(None) };
         // A null condition is not a condition that fired, which is the one place this differs from
         // reading it as a boolean.
         if when.as_bool() == Some(true) {
-            return value_of(plan, arm.then);
+            return evaluate(plan, arm.then, lambdas);
         }
     }
     match otherwise {
-        Some(otherwise) => value_of(plan, otherwise),
+        Some(otherwise) => evaluate(plan, otherwise, lambdas),
         None => Ok(Some(Value::Null)),
     }
 }

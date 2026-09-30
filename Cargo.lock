@@ -481,6 +481,7 @@ dependencies = [
  "rudb-kernels",
  "rudb-parse",
  "rudb-plan",
+ "rudb-regex",
  "rudb-seam",
  "rudb-vector",
 ]
