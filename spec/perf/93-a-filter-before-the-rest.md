@@ -10,7 +10,7 @@ In q03 at SF1 the orders before 1995-03-15 hand `lineitem` its exact rows throug
 
 ## Results
 
-Measured on server3 at SF1, one run in a fresh process, threads 1, millions of instructions, against a build before #2290 so only the two queries this touches are listed:
+Measured on server3 at SF1, one run in a fresh process, threads 1, millions of instructions, against #2290. The change was measured before it was rebased onto #2290, so the queries #2290 moved are left out, and no other query moved by more than a few million:
 
 | query | before | after |
 |---|---|---|
