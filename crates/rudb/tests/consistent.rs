@@ -126,6 +126,57 @@ fn every_query_it_fires_on_answers_as_the_join_does() {
 }
 
 #[test]
+fn a_string_under_the_root_is_read_for_the_rows_that_survive() {
+    let database = database();
+    // The two ends of the line, which cannot both be the root, and neither string filtered on.
+    // The second query filters on `a.name`, which then has to be read as it always was.
+    for (sql, late) in [
+        (
+            "SELECT min(a.name), max(c.kind) FROM a JOIN b ON a.id = b.a_id JOIN c ON b.c_id = c.id",
+            true,
+        ),
+        (
+            "SELECT min(a.name) FROM a, b WHERE a.id = b.a_id AND a.name LIKE 'name 2%'",
+            false,
+        ),
+    ] {
+        let plan = explain(&database, sql);
+        let line = plan.lines().find(|line| line.contains("Consistent #")).unwrap_or_default();
+        assert_eq!(line.contains(" of "), late, "{sql}:\n{plan}");
+        both(&database, sql);
+    }
+}
+
+#[test]
+fn a_string_read_late_is_read_a_chunk_at_a_time_and_a_filtered_one_is_not_read_late() {
+    let database = Database::new();
+    // Far more surviving rows than one chunk holds, and a table `d` in front that only joins and
+    // finds every row once, which the rewrite drops and so numbers the rest again.
+    for statement in [
+        "CREATE TABLE d (id BIGINT)",
+        "CREATE TABLE x (id INTEGER, s VARCHAR)",
+        "CREATE TABLE y (id INTEGER, x_id INTEGER, z_id INTEGER, d_id BIGINT)",
+        "CREATE TABLE z (id INTEGER, t VARCHAR)",
+        "INSERT INTO d SELECT r::BIGINT FROM range(50) AS s(r)",
+        "INSERT INTO x SELECT r::INTEGER, 'x ' || r::VARCHAR FROM range(30000) AS s(r)",
+        "INSERT INTO y SELECT r::INTEGER, r::INTEGER, (r % 20000)::INTEGER, (r % 50)::BIGINT \
+         FROM range(30000) AS s(r)",
+        "INSERT INTO z SELECT r::INTEGER, 'z ' || r::VARCHAR FROM range(20000) AS s(r)",
+    ] {
+        database.execute(statement).unwrap_or_else(|error| panic!("{statement} failed: {error}"));
+    }
+    for sql in [
+        "SELECT min(x.s), max(z.t) FROM x JOIN y ON x.id = y.x_id JOIN z ON y.z_id = z.id",
+        "SELECT max(x.s) FROM d, y, x WHERE d.id = y.d_id AND x.id = y.x_id AND x.s LIKE 'x 2%'",
+        "SELECT min(z.t), max(x.s) FROM d, y, x, z WHERE d.id = y.d_id AND x.id = y.x_id \
+         AND y.z_id = z.id AND z.t LIKE 'z 1%'",
+    ] {
+        assert!(fires(&database, sql), "{sql}:\n{}", explain(&database, sql));
+        both(&database, sql);
+    }
+}
+
+#[test]
 fn the_answers_are_the_ones_the_join_gives() {
     let database = database();
     // The two edge cases worth a literal answer rather than only an agreement: an empty join is one

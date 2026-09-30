@@ -741,11 +741,6 @@ impl Rows {
             while upto < locations.len() && locations[upto].0 == part {
                 upto += 1;
             }
-            let held = if dense {
-                reader.read(part, columns)?
-            } else {
-                reader.read_sparse(part, columns)?
-            };
             let selected = locations[from..upto]
                 .iter()
                 .map(|&(_, row)| {
@@ -753,6 +748,21 @@ impl Rows {
                         .map_err(|_| Error::internal("a row within a part exceeds u32"))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            // Rows asked for in order are read at those rows alone, which for a compressed string
+            // page is decompressing them and not the rest of the part.
+            if selected.windows(2).all(|pair| pair[0] < pair[1]) {
+                let held = reader.read_rows(part, columns, &selected, dense)?;
+                for (at, pieces) in pieces.iter_mut().enumerate() {
+                    pieces.push(held.column(at)?.clone());
+                }
+                from = upto;
+                continue;
+            }
+            let held = if dense {
+                reader.read(part, columns)?
+            } else {
+                reader.read_sparse(part, columns)?
+            };
             for (at, pieces) in pieces.iter_mut().enumerate() {
                 pieces.push(held.column(at)?.gather(&selected)?);
             }

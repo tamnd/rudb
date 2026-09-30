@@ -54,12 +54,19 @@
 //! their tables, and the relations here are held by the node rather than being its children, so
 //! pruning would never reach them. Doing it here is doing it once, in the one place that knows which
 //! columns are read.
+//!
+//! A string column an extreme is taken from is not read at all when its relation is under a root
+//! and nothing else reads it. The scan reads each row's place in its table instead, and the value is
+//! fetched for the rows the second sweep keeps, which is all the extreme needs. Such a relation
+//! holds its rows until that sweep, and a string held is a string decoded, copied and laid out
+//! again whether it survives or not.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rudb_common::bounds::{Bound, Reach, Zones};
 use rudb_common::rules::Rule;
 use rudb_common::{Field, LogicalType, Result};
+use rudb_functions::FILE_ROW_NUMBER;
 use rudb_plan::{
     ColumnBinding, CompareOp, ConjunctionOp, Edge, Expr, ExprRef, Extreme, JoinKind, Key, Leaf,
     Node, NodeRef, Plan, Reducer,
@@ -427,6 +434,44 @@ fn rewrite(
         Err(reason) => return because(reason),
     };
 
+    // The string extremes read late, see the module documentation. Each is of a relation with a
+    // parent, and so one that holds its rows, and of a column that is neither a key nor filtered on.
+    let mut read = read;
+    let fetched: BTreeSet<Place> = extremes
+        .iter()
+        .map(|&(place, ..)| place)
+        .filter(|&(relation, column)| {
+            let parented = order.iter().any(|&(held, parent)| held == relation && parent.is_some());
+            let kept = field(plan, &relations, (relation, column));
+            let mut filtered = false;
+            // Only the column is compared, as where `read` is built, since the relations were
+            // numbered again when those that only join were dropped and `find` still has the old
+            // numbers.
+            for &predicate in &relations[relation].local {
+                walk::columns(plan, predicate, &mut |binding| {
+                    filtered |= find.place(plan, binding).is_some_and(|(_, held)| held == column);
+                });
+            }
+            parented
+                && kept.ty == LogicalType::Varchar
+                && kept.name != FILE_ROW_NUMBER
+                && !class_of.contains_key(&(relation, column))
+                && !filtered
+        })
+        .collect();
+    for &(relation, column) in &fetched {
+        read[relation].remove(&column);
+    }
+    // Where each such relation's row places are, which is after everything else it reads.
+    let late: Vec<Option<u32>> = (0..relations.len())
+        .map(|relation| {
+            fetched
+                .iter()
+                .any(|&(held, _)| held == relation)
+                .then(|| count_u32(read[relation].len()))
+        })
+        .collect();
+
     // Each relation as a fresh scan of what is read of it, with its own filters over it.
     let mut position = vec![0usize; relations.len()];
     for (at, &(relation, _)) in order.iter().enumerate() {
@@ -439,7 +484,7 @@ fn rewrite(
         *next += 1;
         let moved: HashMap<u32, u32> =
             read[at].iter().enumerate().map(|(new, &old)| (old, count_u32(new))).collect();
-        let input = narrow(plan, relation, fresh, &read[at], &moved, &find);
+        let input = narrow(plan, relation, fresh, &read[at], late[at].is_some(), &moved, &find);
         narrowed.push((fresh, moved));
         inputs.push(input);
     }
@@ -465,10 +510,22 @@ fn rewrite(
     }
     let produced: Vec<Extreme> = extremes
         .iter()
-        .map(|&((relation, column), max, _)| Extreme {
-            leaf: count_u32(position[relation]),
-            column: narrowed[relation].1[&column],
-            max,
+        .map(|&((relation, column), max, _)| match late[relation] {
+            Some(ordinal) if fetched.contains(&(relation, column)) => Extreme {
+                leaf: count_u32(position[relation]),
+                column: ordinal,
+                max,
+                fetch: {
+                    let name = field(plan, &relations, (relation, column)).name.clone();
+                    Some(plan.intern(&name))
+                },
+            },
+            _ => Extreme {
+                leaf: count_u32(position[relation]),
+                column: narrowed[relation].1[&column],
+                max,
+                fetch: None,
+            },
         })
         .collect();
     let fields: Vec<Field> = extremes
@@ -1630,20 +1687,25 @@ fn finish(
     total
 }
 
-/// A relation written as a fresh scan of the columns in `read`, with its filters over it.
+/// A relation written as a fresh scan of the columns in `read`, with its filters over it, and with
+/// each row's place in its table after them when `placed` says so.
 fn narrow(
     plan: &mut Plan,
     relation: &Relation,
     fresh: u32,
     read: &BTreeSet<u32>,
+    placed: bool,
     moved: &HashMap<u32, u32>,
     find: &Resolver<'_>,
 ) -> NodeRef {
     let Node::Get { catalog, schema, table, alias, columns, .. } = *plan.node(relation.get) else {
         unreachable!("a relation is a scan, which `relation` checked")
     };
-    let kept: Vec<Field> =
+    let mut kept: Vec<Field> =
         read.iter().map(|&column| plan.field_list(columns)[column as usize].clone()).collect();
+    if placed {
+        kept.push(Field::required(FILE_ROW_NUMBER.to_string(), LogicalType::BigInt));
+    }
     let kept = plan.add_fields(&kept);
     let span = plan.node_span(relation.get);
     let scan = plan.add_node_at(

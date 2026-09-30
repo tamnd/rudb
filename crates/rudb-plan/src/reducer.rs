@@ -86,6 +86,13 @@ pub struct Extreme {
     pub column: u32,
     /// Whether this is a MAX rather than a MIN.
     pub max: bool,
+    /// The name of the table column the extreme is of, as a string of the plan, when the relation
+    /// carries each row's place in its table at `column` instead of the value.
+    ///
+    /// Then the value is read only for the rows the second sweep keeps. A relation under a root
+    /// holds its rows until that sweep, and in JOB 7c `person_info` held the text of 84,183
+    /// biographies, all read, copied and laid out again, to fold in the 2,000 or so that survived.
+    pub fetch: Option<u32>,
 }
 
 impl Reducer {
@@ -215,7 +222,7 @@ mod tests {
                 Leaf { input: 2, keys: vec![Key { class: 1, column: 0 }], parent: None },
             ],
             classes: 2,
-            extremes: vec![Extreme { leaf: 0, column: 1, max: false }],
+            extremes: vec![Extreme { leaf: 0, column: 1, max: false, fetch: None }],
         }
     }
 
@@ -234,7 +241,7 @@ mod tests {
         assert!(reducer.held(1), "and the path to it passes through here");
         assert!(!reducer.held(2), "the root is reduced as it is scanned");
         let mut rooted = reducer;
-        rooted.extremes = vec![Extreme { leaf: 2, column: 0, max: true }];
+        rooted.extremes = vec![Extreme { leaf: 2, column: 0, max: true, fetch: None }];
         assert!(!rooted.held(0) && !rooted.held(1), "nothing below the root is read again");
     }
 
@@ -255,7 +262,7 @@ mod tests {
         reducer.leaves.swap(0, 2);
         reducer.leaves[0].parent = Some(Edge { leaf: 1, class: 1 });
         reducer.leaves[2].parent = Some(Edge { leaf: 1, class: 0 });
-        reducer.extremes = vec![Extreme { leaf: 2, column: 1, max: false }];
+        reducer.extremes = vec![Extreme { leaf: 2, column: 1, max: false, fetch: None }];
         assert!(reducer.validate().is_ok());
         assert!(reducer.trailing(2) && !reducer.trailing(0));
         assert!(reducer.held(1), "the root waits for what trails it");

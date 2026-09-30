@@ -1479,6 +1479,14 @@ impl Plan {
                 if tree.leaves.iter().any(|leaf| leaf.input >= reference) {
                     return fail("reads a relation that is not behind it");
                 }
+                if tree
+                    .extremes
+                    .iter()
+                    .filter_map(|extreme| extreme.fetch)
+                    .any(|name| name as usize >= self.strings.len())
+                {
+                    return fail("fetches a column whose name is not in the table");
+                }
                 tree.validate()?;
             }
         }

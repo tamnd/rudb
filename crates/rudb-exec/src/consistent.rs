@@ -74,6 +74,12 @@
 //! with no rows produces a null for every extreme, which is what an ungrouped aggregate over an empty
 //! input produces.
 //!
+//! # Strings read late
+//!
+//! A string extreme of a relation under a root can come as each row's place in its table rather
+//! than the string, see `rudb_plan::Extreme::fetch`. The second sweep then gathers the places of the
+//! rows it keeps and reads the strings at those alone, in the table's order, and folds them in.
+//!
 //! # Stopping early
 //!
 //! A relation that keeps no rows means the join is empty and the answer is all nulls, whatever the
@@ -84,6 +90,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use rudb_catalog::Table;
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::aggregate::Accumulator;
 use rudb_pipeline::{Lease, Morsel, Progress, Sink, Source};
@@ -111,21 +118,53 @@ struct Keys {
 }
 
 impl Keys {
-    /// Puts a key in.
+    /// Puts a key in, which the sinks do a chunk at a time through [`Self::insert_rows`].
+    #[cfg(test)]
     fn insert(&mut self, key: i64) {
         match usize::try_from(key) {
             Ok(at) if at < DENSE => {
-                let word = at >> 6;
-                if word >= self.words.len() {
-                    // Doubling, so that a relation read in ascending key order grows the bitmap a
-                    // logarithmic number of times rather than once per word.
-                    let wanted = (word + 1).next_power_of_two().min(DENSE >> 6);
-                    self.words.resize(wanted, 0);
-                }
-                self.words[word] |= 1 << (at & 63);
+                self.reach(at);
+                self.words[at >> 6] |= 1 << (at & 63);
             }
             _ => {
                 self.spread.insert(key);
+            }
+        }
+    }
+
+    /// Grows the bitmap to hold `at`, which is under [`DENSE`].
+    fn reach(&mut self, at: usize) {
+        let word = at >> 6;
+        if word >= self.words.len() {
+            // Doubling, so that a relation read in ascending key order grows the bitmap a
+            // logarithmic number of times rather than once per word.
+            let wanted = (word + 1).next_power_of_two().min(DENSE >> 6);
+            self.words.resize(wanted, 0);
+        }
+    }
+
+    /// Puts in the key of each row `rows` names.
+    ///
+    /// [`Self::insert`] a row at a time was a call a row that looked at the length of the bitmap
+    /// every time, and on JOB 13d the sink was a third of the query, half of it in those calls.
+    /// Here the bitmap is grown once for the largest key and the loop is a load and an or a row.
+    fn insert_rows(&mut self, values: &[i64], rows: &[u32]) {
+        let top = rows
+            .iter()
+            .filter_map(|&row| usize::try_from(values[row as usize]).ok())
+            .filter(|&at| at < DENSE)
+            .max();
+        if let Some(top) = top {
+            self.reach(top);
+        }
+        let Self { words, spread } = self;
+        for &row in rows {
+            let key = values[row as usize];
+            match usize::try_from(key) {
+                Ok(at) if at < DENSE => words[at >> 6] |= 1 << (at & 63),
+                _ => {
+                    spread.insert(key);
+                }
             }
         }
     }
@@ -138,6 +177,35 @@ impl Keys {
             }
             _ => self.spread.contains(&key),
         }
+    }
+
+    /// Keeps the rows of `rows` whose key in `values` is in.
+    ///
+    /// With `retain` this was a branch a row on whether the key is in, and a child that keeps half
+    /// its parent's keys makes that branch a coin toss. On JOB 13d the bit test was a fifth of the
+    /// sink. Here every row is written and the count moves on by whether it stays, so there is no
+    /// branch to guess. When every key is in the bitmap a key off either end of it, negative ones
+    /// included once taken as unsigned, is past the last word, so one bounds test covers both.
+    fn filter(&self, values: &[i64], rows: &mut Vec<u32>) {
+        if !self.spread.is_empty() {
+            rows.retain(|&row| self.contains(values[row as usize]));
+            return;
+        }
+        let words = &self.words[..];
+        let mut stay = 0;
+        for at in 0..rows.len() {
+            let row = rows[at];
+            // Two's complement makes a negative key a huge offset, past every word.
+            #[allow(clippy::cast_sign_loss)]
+            let key = values[row as usize] as u64;
+            let held = usize::try_from(key >> 6)
+                .ok()
+                .and_then(|word| words.get(word))
+                .map_or(0, |word| (word >> (key & 63)) & 1);
+            rows[stay] = row;
+            stay += held as usize;
+        }
+        rows.truncate(stay);
     }
 
     /// Puts every key of another set in.
@@ -430,34 +498,24 @@ impl Sink for Collect<'_> {
             let Some(allowed) = self.shared.up[child].get() else {
                 return Err(Error::internal("a relation ran before one of its children finished"));
             };
-            let values = &local.values[key];
-            kept.retain(|&row| allowed.contains(values[row as usize]));
+            allowed.filter(&local.values[key], &mut kept);
         }
         if kept.is_empty() {
             return Ok(Progress::More);
         }
         local.kept += kept.len() as u64;
         if let Some(parent) = role.parent {
-            let values = &local.values[parent];
-            for &row in &kept {
-                local.up.insert(values[row as usize]);
-            }
+            local.up.insert_rows(&local.values[parent], &kept);
         }
         for (slot, &(key, _)) in role.published.iter().enumerate() {
             if Some(key) == role.parent {
                 continue;
             }
-            let values = &local.values[key];
-            for &row in &kept {
-                local.published[slot].insert(values[row as usize]);
-            }
+            local.published[slot].insert_rows(&local.values[key], &kept);
         }
         if role.parent.is_none() && role.trailing.is_empty() {
             for (slot, &(_, key)) in role.down.iter().enumerate() {
-                let values = &local.values[key];
-                for &row in &kept {
-                    local.down[slot].insert(values[row as usize]);
-                }
+                local.down[slot].insert_rows(&local.values[key], &kept);
             }
         }
         let selection = Selection::from_indices(kept);
@@ -603,18 +661,51 @@ fn fold(
     Ok(())
 }
 
+/// The most row places read in one go when an extreme is read late, which is one chunk, the most
+/// rows a chunk may hold.
+const FETCHED: usize = rudb_vector::VECTOR_SIZE;
+
+/// Reads the column `column` of `table` at the rows `places` names and folds it into `extreme`.
+fn fetch(
+    extreme: &mut Accumulator,
+    table: &Table,
+    column: usize,
+    ty: &LogicalType,
+    mut places: Vec<i64>,
+) -> Result<()> {
+    places.sort_unstable();
+    places.dedup();
+    let places = places
+        .into_iter()
+        .map(|place| u64::try_from(place).map_err(|_| Error::internal("a negative row place")))
+        .collect::<Result<Vec<u64>>>()?;
+    let types = std::slice::from_ref(ty);
+    for batch in places.chunks(FETCHED) {
+        let read = table.rows().rows_at(types, &[column], batch)?;
+        extreme.update_run(std::slice::from_ref(read.column(0)?), read.len())?;
+    }
+    Ok(())
+}
+
 /// The source of the one row, which runs the second sweep before it produces it.
 #[derive(Debug)]
-pub(crate) struct Answer {
+pub(crate) struct Answer<'a> {
     shared: Arc<Reduction>,
     schema: Schema,
     one: Handout,
+    /// Per extreme, the table and column it is read from when it is read late.
+    fetches: Vec<Option<(&'a Table, usize)>>,
 }
 
-impl Answer {
-    /// The source for a node whose relations are `shared`, producing `schema`.
-    pub(crate) fn new(shared: Arc<Reduction>, schema: Schema) -> Self {
-        Self { shared, schema, one: Handout::new(1) }
+impl<'a> Answer<'a> {
+    /// The source for a node whose relations are `shared`, producing `schema`, with the extremes
+    /// `fetches` names read late.
+    pub(crate) fn new(
+        shared: Arc<Reduction>,
+        schema: Schema,
+        fetches: Vec<Option<(&'a Table, usize)>>,
+    ) -> Self {
+        Self { shared, schema, one: Handout::new(1), fetches }
     }
 
     /// What this produces, which is one column per extreme.
@@ -660,6 +751,7 @@ impl Answer {
             let mut values = Vec::new();
             let mut nulls = Vec::new();
             let mut others: Vec<Vec<i64>> = role.down.iter().map(|_| Vec::new()).collect();
+            let mut places: Vec<Vec<i64>> = role.extremes.iter().map(|_| Vec::new()).collect();
             for chunk in &chunks {
                 let rows = chunk.len();
                 let mut kept: Vec<u32> = (0..u32::try_from(rows)
@@ -669,14 +761,14 @@ impl Answer {
                 // trail it come next, which `Reduction::new` put there.
                 if let Some(permitted) = permitted {
                     read(chunk.column(0)?, rows, &mut values, &mut nulls)?;
-                    kept.retain(|&row| permitted.contains(values[row as usize]));
+                    permitted.filter(&values, &mut kept);
                 }
                 for (slot, keys) in trailed.iter().enumerate() {
                     if kept.is_empty() {
                         break;
                     }
                     read(chunk.column(first + slot)?, rows, &mut values, &mut nulls)?;
-                    kept.retain(|&row| keys.contains(values[row as usize]));
+                    keys.filter(&values, &mut kept);
                 }
                 if kept.is_empty() {
                     continue;
@@ -685,19 +777,26 @@ impl Answer {
                 let after = first + trailed.len();
                 for (slot, other) in others.iter_mut().enumerate() {
                     read(chunk.column(after + slot)?, rows, other, &mut nulls)?;
-                    for &row in &kept {
-                        down[slot].insert(other[row as usize]);
+                    down[slot].insert_rows(other, &kept);
+                }
+                let after = after + role.down.len();
+                let mut direct = Vec::with_capacity(role.extremes.len());
+                for (slot, &(output, _)) in role.extremes.iter().enumerate() {
+                    if self.fetches[output].is_some() {
+                        read(chunk.column(after + slot)?, rows, &mut values, &mut nulls)?;
+                        places[slot].extend(kept.iter().map(|&row| values[row as usize]));
+                    } else {
+                        direct.push((output, after + slot));
                     }
                 }
                 let selection = Selection::from_indices(kept);
-                let after = after + role.down.len();
-                let read: Vec<(usize, usize)> = role
-                    .extremes
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, &(output, _))| (output, after + slot))
-                    .collect();
-                fold(&mut extremes, &read, chunk, &selection)?;
+                fold(&mut extremes, &direct, chunk, &selection)?;
+            }
+            drop(chunks);
+            for (&(output, _), places) in role.extremes.iter().zip(places) {
+                if let Some((table, column)) = self.fetches[output] {
+                    fetch(&mut extremes[output], table, column, &shared.types[output], places)?;
+                }
             }
             debug_assert_eq!(
                 columns.len(),
@@ -714,7 +813,7 @@ impl Answer {
     }
 }
 
-impl Source for Answer {
+impl Source for Answer<'_> {
     fn morsel(&self) -> Option<Morsel> {
         self.one.take()
     }
@@ -776,5 +875,34 @@ mod tests {
             assert!(short.contains(key), "{key}");
         }
         assert!(!short.contains(4));
+    }
+
+    #[test]
+    fn rows_put_in_and_kept_a_chunk_at_a_time_match_a_key_at_a_time() {
+        let far = i64::try_from(DENSE).expect("fits") + 9;
+        let values: Vec<i64> = vec![5, -1, 64, 5, 200_000, far, 0, 63, i64::MIN, 7, 1 << 40, 128];
+        let rows: Vec<u32> = vec![0, 2, 3, 4, 6, 7, 9, 11];
+        for with_far in [false, true] {
+            let mut batch = Keys::default();
+            let mut single = Keys::default();
+            let put: Vec<u32> = if with_far { vec![0, 1, 5, 6, 11] } else { vec![0, 6, 11] };
+            batch.insert_rows(&values, &put);
+            for &row in &put {
+                single.insert(values[row as usize]);
+            }
+            for &value in &values {
+                assert_eq!(batch.contains(value), single.contains(value), "{value}");
+            }
+            let mut kept = rows.clone();
+            batch.filter(&values, &mut kept);
+            let want: Vec<u32> =
+                rows.iter().copied().filter(|&row| single.contains(values[row as usize])).collect();
+            assert_eq!(kept, want, "with far keys {with_far}");
+        }
+        let mut empty = Keys::default();
+        empty.insert_rows(&values, &[]);
+        let mut kept = rows.clone();
+        empty.filter(&values, &mut kept);
+        assert!(kept.is_empty());
     }
 }
