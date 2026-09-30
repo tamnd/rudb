@@ -34,7 +34,8 @@ use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_io::{Filesystem, RealFilesystem};
 use rudb_native::{LaneStart, LogAnchor};
 use rudb_txn::log::{
-    Block, CommitSync, Kind, Lane, Options, SEGMENT_BYTES, SEGMENT_HEADER, replay, segments,
+    Block, CommitSync, Kind, Lane, Options, Payload, SEGMENT_BYTES, SEGMENT_HEADER, replay,
+    segments,
 };
 use rudb_vector::{Chunk, Data, Selection, StringColumn, Validity, Vector};
 
@@ -75,7 +76,7 @@ pub(crate) struct Replayed {
     /// The table.
     pub(crate) table: String,
     /// The payload after the name, which [`Self::change`] reads against the table's columns.
-    payload: Vec<u8>,
+    payload: Payload,
     /// Where the rest starts in it.
     rest_at: usize,
     /// The layout it was written in.
@@ -826,7 +827,7 @@ fn get_text_column(bytes: &[u8], at: &mut usize, field: &Field, rows: usize) -> 
 
 /// The name a payload is for, and where the rest of it starts. A Ddl record names no table, and its
 /// statement starts right after the layout byte.
-fn read_record(kind: Kind, payload: Vec<u8>) -> Result<Replayed> {
+fn read_record(kind: Kind, payload: Payload) -> Result<Replayed> {
     let mut at = 0;
     let version = take(&payload, &mut at, 1)?[0];
     if !(1..=VERSION).contains(&version) {
@@ -1284,7 +1285,7 @@ mod tests {
         let (fields, vectors): (Vec<Field>, Vec<Vector>) = pieces.into_iter().unzip();
         let chunk = Chunk::new(vectors).expect("a chunk");
         let payload = insert(&fields, &[chunk.clone(), chunk.clone()]).expect("carried");
-        let replayed = read_record(Kind::Insert, payload).expect("reads");
+        let replayed = read_record(Kind::Insert, payload.into()).expect("reads");
         assert_eq!((replayed.schema.as_str(), replayed.table.as_str()), ("main", "items"));
         let Change::Insert(back) = replayed.change(&fields).expect("decodes") else {
             panic!("an insert")
@@ -1299,7 +1300,7 @@ mod tests {
     }
 
     fn replayed_insert(fields: &[Field], payload: Vec<u8>) -> Chunk {
-        let replayed = read_record(Kind::Insert, payload).expect("reads");
+        let replayed = read_record(Kind::Insert, payload.into()).expect("reads");
         let Change::Insert(back) = replayed.change(fields).expect("decodes") else {
             panic!("an insert")
         };
@@ -1376,7 +1377,7 @@ mod tests {
         let chunk = Chunk::new(vec![vector]).expect("a chunk");
         let mut out = header("main", "t").expect("a name");
         put_runs(&mut out, &[0, 1, 2, 7, 9, 10]).expect("ascending");
-        let replayed = read_record(Kind::Delete, out.clone()).expect("reads");
+        let replayed = read_record(Kind::Delete, out.clone().into()).expect("reads");
         let Change::Delete(runs) = replayed.change(&fields).expect("decodes") else {
             panic!("a delete")
         };
@@ -1384,7 +1385,7 @@ mod tests {
         let mut update = header("main", "t").expect("a name");
         put_runs(&mut update, &[3, 4, 5, 6, 20]).expect("ascending");
         put_rows(&mut update, &fields, std::slice::from_ref(&chunk), usize::MAX).expect("rows");
-        let replayed = read_record(Kind::Update, update).expect("reads");
+        let replayed = read_record(Kind::Update, update.into()).expect("reads");
         let Change::Update(runs, rows) = replayed.change(&fields).expect("decodes") else {
             panic!("an update")
         };
@@ -1394,7 +1395,7 @@ mod tests {
             let mut update = header("main", "t").expect("a name");
             put_runs(&mut update, &[1]).expect("one row");
             put_rows(&mut update, &fields, &[chunk], usize::MAX).expect("rows");
-            update
+            update.into()
         })
         .expect("reads");
         assert!(short.change(&fields).is_err(), "five rows for one row number");

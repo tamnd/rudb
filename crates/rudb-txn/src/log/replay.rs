@@ -7,14 +7,16 @@
 //! byte to that one. Records after a segment's last Commit belong to a block that never finished
 //! and are dropped, and nobody was told that block committed.
 
+use std::ops::{Deref, Range};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rudb_common::{Error, Result};
 use rudb_io::{Filesystem, OpenMode};
 
 use super::format::{
-    Commit, Kind, RecordHeader, SEGMENT_HEADER, SegmentHeader, decode_record, seed,
+    Commit, Kind, RECORD_HEADER, RecordHeader, SEGMENT_HEADER, SegmentHeader, decode_record, seed,
 };
 use super::lane::segments;
 
@@ -24,7 +26,58 @@ pub struct Record {
     /// Its header.
     pub header: RecordHeader,
     /// Its payload.
-    pub payload: Vec<u8>,
+    pub payload: Payload,
+}
+
+/// A record's payload, held as a range of the segment it was read from so that replay does not
+/// copy every record out of the file's bytes. The segment stays in memory while any of its
+/// payloads do.
+#[derive(Clone)]
+pub struct Payload {
+    segment: Arc<Vec<u8>>,
+    range: Range<usize>,
+}
+
+impl Payload {
+    /// The payload in `bytes`, which it keeps.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        let range = 0..bytes.len();
+        Self { segment: Arc::new(bytes), range }
+    }
+}
+
+impl From<Vec<u8>> for Payload {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl Deref for Payload {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.segment[self.range.clone()]
+    }
+}
+
+impl AsRef<[u8]> for Payload {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl PartialEq for Payload {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for Payload {}
+
+impl std::fmt::Debug for Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Payload").field(&&**self).finish()
+    }
 }
 
 /// A block whose Commit reached the disk, with the records it counts.
@@ -121,6 +174,7 @@ fn read_segment(
         .map_err(|_| Error::invalid_input(format!("{} is too large to replay", path.display())))?;
     let mut bytes = vec![0_u8; len];
     file.read_exact_at(0, &mut bytes)?;
+    let bytes = Arc::new(bytes);
     let Some(header) = SegmentHeader::decode(&bytes) else {
         return Ok(None);
     };
@@ -134,27 +188,34 @@ fn read_segment(
         )));
     }
     let mut blocks = Vec::new();
-    read_blocks(&bytes[SEGMENT_HEADER..], lane, sequence, &mut blocks);
+    read_blocks(&bytes, SEGMENT_HEADER, lane, sequence, &mut blocks);
     Ok(Some(blocks))
 }
 
-/// Appends the committed blocks of one segment's records to `out`, stopping at the first record
+/// Appends the committed blocks of the records in `segment` from `at` on to `out`, stopping at the first record
 /// that does not verify or a Commit that does not match the records before it.
-fn read_blocks(bytes: &[u8], lane: u8, sequence: u64, out: &mut Vec<Committed>) {
+fn read_blocks(
+    segment: &Arc<Vec<u8>>,
+    mut at: usize,
+    lane: u8,
+    sequence: u64,
+    out: &mut Vec<Committed>,
+) {
     let seed = seed(sequence);
-    let mut at = 0;
     let mut records = Vec::new();
     let mut taken = 0_u64;
     while let Some((header, payload, total)) =
-        bytes.get(at..).and_then(|rest| decode_record(rest, seed))
+        segment.get(at..).and_then(|rest| decode_record(rest, seed))
     {
         if header.lane != lane {
             break;
         }
+        let range = at + RECORD_HEADER..at + RECORD_HEADER + payload.len();
         at += total;
         if header.kind != Kind::Commit {
             taken += total as u64;
-            records.push(Record { header, payload: payload.to_vec() });
+            records
+                .push(Record { header, payload: Payload { segment: Arc::clone(segment), range } });
             continue;
         }
         let Some(commit) = Commit::decode(payload) else { break };
