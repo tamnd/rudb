@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ use crate::journal::{Change, Journal, Replayed};
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
 use crate::settings::{COMPILED_ENGINE, Settings, Visibility};
+use crate::txn::{self, Open, Registry};
 use crate::{foreign, upsert};
 
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
@@ -570,6 +571,61 @@ pub struct Database {
 #[derive(Debug, Clone)]
 pub(crate) struct Shared {
     inner: Arc<Inner>,
+    /// The connection this handle speaks for. A [`Database`] is a connection of its own, and each
+    /// [`Database::connect`] makes another.
+    conn: Arc<Conn>,
+}
+
+impl Shared {
+    /// A handle on a new database, speaking for its first connection.
+    fn first(inner: Inner) -> Self {
+        let conn = Arc::new(Conn::new(Arc::clone(&inner.registry)));
+        Self { inner: Arc::new(inner), conn }
+    }
+
+    /// A handle on the same database for a new connection.
+    fn another(&self) -> Self {
+        let conn = Arc::new(Conn::new(Arc::clone(&self.inner.registry)));
+        Self { inner: Arc::clone(&self.inner), conn }
+    }
+}
+
+/// What one connection holds apart from the others. See [`crate::txn`].
+#[derive(Debug)]
+struct Conn {
+    /// The transaction a `BEGIN` opened, until a `COMMIT` or a `ROLLBACK` closes it.
+    open: Mutex<Option<Open>>,
+    /// The transaction's own catalog once it has touched the database, and an empty one otherwise.
+    catalog: RwLock<Catalog>,
+    /// Whether the statements read and write [`Conn::catalog`] rather than the committed catalog.
+    private: AtomicBool,
+    /// The log records the transaction staged for its commit, when the database has a log.
+    staged: Mutex<Option<Journal>>,
+    /// The database's, so a connection dropped in the middle of a transaction can close it.
+    registry: Arc<Mutex<Registry>>,
+}
+
+impl Conn {
+    fn new(registry: Arc<Mutex<Registry>>) -> Self {
+        Self {
+            open: Mutex::default(),
+            catalog: RwLock::new(Catalog::bare()),
+            private: AtomicBool::new(false),
+            staged: Mutex::default(),
+            registry,
+        }
+    }
+}
+
+/// A transaction still open when its connection goes away never committed, so what it changed
+/// goes with it, and the rows it claimed are free for the others.
+impl Drop for Conn {
+    fn drop(&mut self) {
+        let open = self.open.get_mut().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(snapshot) = open.and_then(|open| open.snapshot) {
+            self.registry.lock().unwrap_or_else(PoisonError::into_inner).end(snapshot.id, false);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -585,8 +641,8 @@ struct Inner {
     /// ends, and reads can run while the rows go in. Every other writer takes this too, which is
     /// what stops a checkpoint or a second load from writing the file under the first one.
     writer: Mutex<()>,
-    /// The transaction a `BEGIN` opened, until a `COMMIT` or a `ROLLBACK` closes it.
-    open: Mutex<Option<Open>>,
+    /// Which rows the open transactions have written. See [`crate::txn`].
+    registry: Arc<Mutex<Registry>>,
     /// The log of the file, for a database that has one it may write. Taken after the catalog lock
     /// by whatever holds both.
     journal: Mutex<Option<Journal>>,
@@ -660,32 +716,11 @@ struct CachedNativeAggregate {
 /// The error is swallowed, because a `Drop` has nowhere to put one. [`Database::close`] is the same
 /// write with the error handed back, for a program that wants to know. Nothing is written for an in
 /// memory database, which has no file, or for a read only one, which was asked not to.
-/// A transaction `BEGIN` opened and nothing has closed yet.
-///
-/// The catalog as it was at the `BEGIN` is kept whole, and a `ROLLBACK` puts it back. A table's
-/// rows are chunks that are shared rather than copied when the catalog is cloned, so holding the
-/// old one costs the rows that changed and not the database. One transaction for the database
-/// rather than one per connection, which is as much as a database that runs its statements one at
-/// a time can tell apart.
-#[derive(Debug)]
-struct Open {
-    /// What the catalog was when the transaction began.
-    before: Catalog,
-    /// Whether a statement failed inside it, after which only `COMMIT` and `ROLLBACK` run and both
-    /// of them roll back, which is what the pin does.
-    aborted: bool,
-    /// Whether it was begun `READ ONLY`.
-    read_only: bool,
-}
-
 impl Drop for Inner {
     fn drop(&mut self) {
+        // What the transactions still open changed is in their own catalogs, so this one is only
+        // what was committed.
         let catalog = self.catalog.get_mut().unwrap_or_else(PoisonError::into_inner);
-        // A transaction still open when the database goes away never committed, so what it changed
-        // is not what the file gets.
-        if let Some(open) = self.open.get_mut().unwrap_or_else(PoisonError::into_inner).take() {
-            catalog.restore(open.before);
-        }
         if let Some(path) = self.path.as_ref().filter(|_| self.writable) {
             let journal = self.journal.get_mut().unwrap_or_else(PoisonError::into_inner);
             let _ = persist_main(path, catalog, &self.pages, journal, true);
@@ -1233,7 +1268,7 @@ impl Database {
         let inner = Inner {
             catalog: RwLock::new(Catalog::new()),
             writer: Mutex::default(),
-            open: Mutex::default(),
+            registry: Arc::default(),
             journal: Mutex::default(),
             #[cfg(test)]
             loading: Mutex::default(),
@@ -1251,7 +1286,7 @@ impl Database {
             refusals: Mutex::default(),
             switches: Mutex::default(),
         };
-        Self { shared: Shared { inner: Arc::new(inner) } }
+        Self { shared: Shared::first(inner) }
     }
 
     /// What this database is running with now.
@@ -1413,7 +1448,7 @@ impl Database {
         let inner = Inner {
             catalog: RwLock::new(catalog),
             writer: Mutex::default(),
-            open: Mutex::default(),
+            registry: Arc::default(),
             journal: Mutex::new(journal),
             #[cfg(test)]
             loading: Mutex::default(),
@@ -1431,7 +1466,7 @@ impl Database {
             refusals: Mutex::default(),
             switches: Mutex::default(),
         };
-        Ok(Self { shared: Shared { inner: Arc::new(inner) } })
+        Ok(Self { shared: Shared::first(inner) })
     }
 
     /// Says that the statement about to run is the last one this database will be asked, so a
@@ -1448,7 +1483,7 @@ impl Database {
     /// A connection to this database.
     #[must_use]
     pub fn connect(&self) -> Connection {
-        Connection::new(self.shared.clone())
+        Connection::new(self.shared.another())
     }
 
     /// Writes the file and hands back what went wrong, which dropping the database cannot do.
@@ -1473,8 +1508,8 @@ impl Database {
         };
         let path = path.clone();
         let _writing = self.shared.writing();
-        let mut catalog = self.shared.write();
-        let mut journal = self.shared.journal();
+        let mut catalog = self.shared.committed();
+        let mut journal = self.shared.committed_journal();
         persist_main(&path, &mut catalog, &self.shared.inner.pages, &mut journal, true)?;
         drop(journal);
         for (name, path) in attached_files(&catalog) {
@@ -3202,13 +3237,69 @@ impl Shared {
     /// held the lock, and the catalog is a `Vec` of chunks rather than an invariant somebody was
     /// halfway through breaking, so refusing every later query would turn one panicked query into a
     /// dead database.
+    ///
+    /// Inside a transaction that is the transaction's own catalog, taken here the first time it is
+    /// asked for.
     fn read(&self) -> RwLockReadGuard<'_, Catalog> {
-        self.inner.catalog.read().unwrap_or_else(PoisonError::into_inner)
+        self.catalog().read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The catalog, for writing.
+    /// The catalog, for writing. The transaction's own inside one, as [`Shared::read`] says.
     fn write(&self) -> RwLockWriteGuard<'_, Catalog> {
+        self.catalog().write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The committed catalog, whatever transaction is open, for what writes the file.
+    fn committed(&self) -> RwLockWriteGuard<'_, Catalog> {
         self.inner.catalog.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The log of the committed catalog, whatever transaction is open.
+    fn committed_journal(&self) -> MutexGuard<'_, Option<Journal>> {
+        self.inner.journal.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The catalog this connection's statements run against, taking the transaction's snapshot
+    /// when one is open and has not taken it yet.
+    fn catalog(&self) -> &RwLock<Catalog> {
+        if !self.conn.private.load(Ordering::Acquire) {
+            self.snapshot();
+        }
+        if self.conn.private.load(Ordering::Acquire) {
+            &self.conn.catalog
+        } else {
+            &self.inner.catalog
+        }
+    }
+
+    /// Takes the open transaction's snapshot, if it has none, which it does the first time one of
+    /// its statements reads or writes anything. That is when the pin takes it too, rather than at
+    /// the `BEGIN`.
+    ///
+    /// The revision is read under the committed catalog's lock, and every commit draws its
+    /// revisions under the same lock held for writing, so the snapshot holds exactly the changes
+    /// drawn at or below it.
+    fn snapshot(&self) {
+        if !self.open().as_ref().is_some_and(|open| open.snapshot.is_none()) {
+            return;
+        }
+        let (base, at) = {
+            let committed = self.inner.catalog.read().unwrap_or_else(PoisonError::into_inner);
+            (committed.clone(), rudb_catalog::revision_now())
+        };
+        let shadow = self.committed_journal().as_ref().map(Journal::shadow);
+        let mut open = self.open();
+        let Some(open) = open.as_mut().filter(|open| open.snapshot.is_none()) else { return };
+        let id = self.registry().begin(at);
+        *self.conn.catalog.write().unwrap_or_else(PoisonError::into_inner) = base.clone();
+        *self.conn.staged.lock().unwrap_or_else(PoisonError::into_inner) = shadow;
+        open.snapshot =
+            Some(txn::Snapshot { id, base, at, written: std::collections::HashMap::new() });
+        self.conn.private.store(true, Ordering::Release);
+    }
+
+    fn registry(&self) -> MutexGuard<'_, Registry> {
+        self.inner.registry.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The right to write the file and change the catalog, taken before the catalog lock. See
@@ -3339,11 +3430,17 @@ impl Shared {
 
     /// The open transaction, if there is one.
     fn open(&self) -> MutexGuard<'_, Option<Open>> {
-        self.inner.open.lock().unwrap_or_else(PoisonError::into_inner)
+        self.conn.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The log the statement stages its records in: the transaction's own inside one, and the
+    /// database's otherwise.
     fn journal(&self) -> MutexGuard<'_, Option<Journal>> {
-        self.inner.journal.lock().unwrap_or_else(PoisonError::into_inner)
+        if self.conn.private.load(Ordering::Acquire) {
+            self.conn.staged.lock().unwrap_or_else(PoisonError::into_inner)
+        } else {
+            self.committed_journal()
+        }
     }
 
     /// Whether rows put into `name` are staged for the log, which is what [`Self::stage_rows`] does
@@ -3407,7 +3504,9 @@ impl Shared {
             return None;
         }
         let writing = self.writing();
-        if self.open().as_ref().is_some_and(|open| open.aborted || open.read_only) {
+        // Inside a transaction the row would have to be noted for the commit, which the path
+        // through the plan does.
+        if self.transacting() {
             return None;
         }
         let mut catalog = self.write();
@@ -3479,7 +3578,7 @@ impl Shared {
 
     /// [`Self::over`], taking the journal's lock for the look.
     fn log_full(&self) -> bool {
-        self.journal().as_ref().is_some_and(|held| self.over(held))
+        self.committed_journal().as_ref().is_some_and(|held| self.over(held))
     }
 
     /// Makes what the statement that just ran committed durable, which outside a transaction is
@@ -3502,8 +3601,8 @@ impl Shared {
         let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable) else {
             return Ok(());
         };
-        let mut catalog = self.write();
-        let mut journal = self.journal();
+        let mut catalog = self.committed();
+        let mut journal = self.committed_journal();
         let Some(held) = journal.as_mut() else { return Ok(()) };
         // A block the lane refused is followed by the checkpoint, which makes the same rows
         // durable the slow way.
@@ -3521,8 +3620,8 @@ impl Shared {
                             return Ok(());
                         }
                         let _writing = self.writing();
-                        let mut catalog = self.write();
-                        let mut journal = self.journal();
+                        let mut catalog = self.committed();
+                        let mut journal = self.committed_journal();
                         // Another commit may have checkpointed while this one waited.
                         if waited.is_ok() && !journal.as_ref().is_some_and(|held| self.over(held)) {
                             return Ok(());
@@ -3548,7 +3647,10 @@ impl Shared {
     }
 
     /// `BEGIN`, `COMMIT` or `ROLLBACK`, with the pin's refusals for the ones that do not fit.
-    fn transaction(&self, kind: ast::Transaction, catalog: &mut Catalog) -> Result<QueryResult> {
+    ///
+    /// Called without the catalog held, because a commit takes the committed catalog to put the
+    /// transaction's into it.
+    fn transaction(&self, kind: ast::Transaction) -> Result<QueryResult> {
         let mut open = self.open();
         match kind {
             ast::Transaction::Begin { read_only } => {
@@ -3557,30 +3659,151 @@ impl Shared {
                         "cannot start a transaction within a transaction",
                     ));
                 }
-                *open = Some(Open { before: catalog.clone(), aborted: false, read_only });
+                *open = Some(Open::new(read_only));
             }
             ast::Transaction::Commit => {
                 let Some(closed) = open.take() else {
                     return Err(Error::transaction("cannot commit - no transaction is active"));
                 };
-                if closed.aborted {
-                    catalog.restore(closed.before);
-                    if let Some(journal) = self.journal().as_mut() {
-                        journal.discard();
-                    }
-                }
+                drop(open);
+                let commit = !closed.aborted;
+                self.close_transaction(closed, commit)?;
             }
             ast::Transaction::Rollback => {
                 let Some(closed) = open.take() else {
                     return Err(Error::transaction("cannot rollback - no transaction is active"));
                 };
-                catalog.restore(closed.before);
-                if let Some(journal) = self.journal().as_mut() {
-                    journal.discard();
-                }
+                drop(open);
+                self.close_transaction(closed, false)?;
             }
         }
         Ok(QueryResult::empty())
+    }
+
+    /// Ends a transaction, putting what it did into the committed catalog when `commit` says so and
+    /// it fits, and dropping it otherwise. The records it staged go to the database's log with it,
+    /// for [`Shared::settle`] to write.
+    ///
+    /// # Errors
+    ///
+    /// A commit that conflicts with one made since the snapshot, which then rolls back.
+    fn close_transaction(&self, closed: Open, commit: bool) -> Result<()> {
+        let Some(mut snapshot) = closed.snapshot else { return Ok(()) };
+        let mine = std::mem::replace(
+            &mut *self.conn.catalog.write().unwrap_or_else(PoisonError::into_inner),
+            Catalog::bare(),
+        );
+        let staged = self.conn.staged.lock().unwrap_or_else(PoisonError::into_inner).take();
+        self.conn.private.store(false, Ordering::Release);
+        let mut committed = self.committed();
+        let merged = if commit {
+            let workers = self.inner.pool.threads();
+            txn::merge(&mut committed, mine, &mut snapshot, workers)
+        } else {
+            Ok(())
+        };
+        if commit
+            && merged.is_ok()
+            && let Some(staged) = staged
+            && let Some(journal) = self.committed_journal().as_mut()
+        {
+            journal.absorb(staged);
+        }
+        self.registry().end(snapshot.id, commit && merged.is_ok());
+        merged
+    }
+
+    /// Checks the rows at `flagged` of the table `oid`, which an update or a delete is about to
+    /// change, against the rows the other transactions have claimed and the rows committed since
+    /// this one's snapshot, and hands back what to claim once the change is in. `None` when no
+    /// transaction is open anywhere, which is when nobody could conflict.
+    ///
+    /// `scanned` is how many rows the scan read and `len` how many the table holds, and when they
+    /// differ the row numbers are not the table's and every row is claimed.
+    fn claim(
+        &self,
+        table: &rudb_catalog::Table,
+        delete: bool,
+        flagged: &[u64],
+        scanned: usize,
+    ) -> Result<Option<txn::Marks>> {
+        let key = (table.oid(), delete);
+        let whole = scanned != table.rows().len();
+        let open = self.open();
+        let registry = self.registry();
+        let marks = match open.as_ref().and_then(|open| open.snapshot.as_ref()) {
+            Some(snapshot) => {
+                // A table the transaction created is nobody else's to write.
+                let Some((frame, base)) = snapshot.before(table.oid()) else { return Ok(None) };
+                let rows = match snapshot.written.get(&table.oid()) {
+                    _ if whole => BTreeSet::new(),
+                    Some(written) => written.based(flagged, base),
+                    None => flagged.iter().copied().filter(|&row| row < base).collect(),
+                };
+                let marks = txn::Marks { frame, rows, all: whole };
+                if registry.clashes(Some(snapshot.id), key, &marks, snapshot.at) {
+                    return Err(txn::conflict(delete));
+                }
+                marks
+            }
+            None if registry.watched() => {
+                let rows = if whole { BTreeSet::new() } else { flagged.iter().copied().collect() };
+                let marks = txn::Marks { frame: table.frame(), rows, all: whole };
+                if registry.clashes(None, key, &marks, u64::MAX) {
+                    return Err(txn::conflict(delete));
+                }
+                marks
+            }
+            None => return Ok(None),
+        };
+        Ok(Some(marks))
+    }
+
+    /// Keeps the rows an update or a delete changed as claimed, by this connection's transaction
+    /// until it ends, or as committed for the transactions open now.
+    fn claimed(&self, oid: i64, delete: bool, marks: txn::Marks) {
+        let id = self.open().as_ref().and_then(|open| open.snapshot.as_ref()).map(|held| held.id);
+        let mut registry = self.registry();
+        match id {
+            Some(id) => registry.mark(id, (oid, delete), marks),
+            None => registry.committed((oid, delete), marks),
+        }
+    }
+
+    /// Notes what a statement of this connection's transaction wrote to the table `oid`, for its
+    /// commit. Nothing outside a transaction.
+    fn wrote(&self, oid: i64, note: impl FnOnce(&mut txn::Written, u64)) {
+        let mut open = self.open();
+        if let Some(snapshot) = open.as_mut().and_then(|open| open.snapshot.as_mut()) {
+            let (written, base) = snapshot.written(oid);
+            note(written, base);
+        }
+    }
+
+    /// Refuses a table named `name` when another open transaction created one of that name, in the
+    /// pin's words.
+    fn creating(&self, name: &QualifiedName) -> Result<()> {
+        let id = self.open().as_ref().and_then(|open| open.snapshot.as_ref()).map(|held| held.id);
+        if self.registry().creating(id, name) {
+            return Err(txn::create_conflict(name));
+        }
+        Ok(())
+    }
+
+    /// Notes that this connection's transaction created a table named `name`.
+    fn created(&self, name: QualifiedName) {
+        let id = self.open().as_ref().and_then(|open| open.snapshot.as_ref()).map(|held| held.id);
+        if let Some(id) = id {
+            self.registry().create(id, name);
+        }
+    }
+
+    /// Whether this connection's transaction has written anything, `mine` being its catalog.
+    fn changed_locally(&self, mine: &Catalog) -> bool {
+        self.open()
+            .as_ref()
+            .and_then(|open| open.snapshot.as_ref())
+            .is_some_and(|snapshot| mine.generation() != snapshot.base.generation())
     }
 
     /// Whether a transaction is open, which is what keeps a load from writing the file directly,
@@ -4275,7 +4498,10 @@ impl Shared {
                 self.inner.settings_revision.fetch_add(1, Ordering::Relaxed);
                 Ok(QueryResult::empty())
             }
-            Bound::Transaction(kind) => self.transaction(kind, &mut catalog),
+            Bound::Transaction(kind) => {
+                drop(catalog);
+                self.transaction(kind)
+            }
             Bound::Checkpoint(name) => {
                 // A read only database answers this the way the pinned DuckDB does, which is by
                 // succeeding and writing nothing. It is not an error there and it is not one here.
@@ -4292,12 +4518,21 @@ impl Shared {
                     }
                     return Ok(QueryResult::empty());
                 }
+                // What a transaction changed is not committed, so it is not what the file gets, and
+                // the pin refuses rather than write the file without it.
+                if self.transacting() && self.changed_locally(&catalog) {
+                    return Err(Error::transaction(
+                        "Cannot CHECKPOINT: the current transaction has transaction local changes",
+                    ));
+                }
+                drop(catalog);
+                let mut catalog = self.committed();
                 if let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable) {
                     persist_main(
                         path,
                         &mut catalog,
                         &self.inner.pages,
-                        &mut self.journal(),
+                        &mut self.committed_journal(),
                         false,
                     )?;
                     index(path, &mut catalog, &self.inner.settings.links(), &self.inner.pages)?;
@@ -4394,6 +4629,8 @@ impl Shared {
                         return Ok(QueryResult::empty());
                     }
                 }
+                let name = create.name.clone();
+                self.creating(&name)?;
                 create_table(
                     sql,
                     create,
@@ -4404,6 +4641,7 @@ impl Shared {
                     &seams,
                     &session,
                 )?;
+                self.created(name);
                 self.stage_ddl(ddl, sql);
                 Ok(QueryResult::empty())
             }
@@ -4608,7 +4846,12 @@ impl Shared {
                         let conflict = insert.conflict.take().expect("asked just above");
                         let name = insert.name.clone();
                         let upsert = (conflict, checks.as_mut());
-                        self.upsert(sql, &mut catalog, place, &name, upsert, chunks)?
+                        let done = self.upsert(sql, &mut catalog, place, &name, upsert, chunks)?;
+                        // Rows it may have changed as well as added, which the commit cannot do
+                        // again on a table somebody else changed since.
+                        let oid = catalog.table(&name)?.oid();
+                        self.wrote(oid, |written, _| written.opaque());
+                        done
                     }
                     Write::Append => {
                         if let Some(checks) = checks.as_mut() {
@@ -4626,7 +4869,12 @@ impl Shared {
                             .map(|journal| {
                                 journal.encode(&name.schema, &name.table, fields, &chunks)
                             });
-                        catalog.table_mut(name)?.append_all(chunks, workers)?;
+                        let noted = self.transacting().then(|| chunks.clone());
+                        let table = catalog.table_mut(name)?;
+                        table.append_all(chunks, workers)?;
+                        if let Some(noted) = noted {
+                            self.wrote(table.oid(), |written, _| written.appended(&noted));
+                        }
                         if let Some(payload) = staged
                             && let Some(journal) = self.journal().as_mut()
                         {
@@ -4638,7 +4886,11 @@ impl Shared {
                         let delete = insert.write == Write::Delete;
                         let plain = catalog.table(&insert.name)?.foreign().is_empty();
                         let logs = self.journal().as_ref().is_some_and(Journal::logs);
-                        let needed = wanted || checks.is_some() || !plain || (logs && !delete);
+                        // Which rows changed is what a transaction claims and what one notes for
+                        // its commit, and what a write outside one is checked against theirs by.
+                        let watched = self.transacting() || self.registry().watched();
+                        let needed =
+                            wanted || checks.is_some() || !plain || (logs && !delete) || watched;
                         let (kept, changed, count, flagged, scanned) =
                             split(chunks, delete, needed)?;
                         if let Some(checks) = checks.as_mut() {
@@ -4650,6 +4902,12 @@ impl Shared {
                         foreign::lost(&catalog, &insert.name, &kept)?;
                         let name = &insert.name;
                         let table = catalog.table(name)?;
+                        let claim = if watched {
+                            self.claim(table, delete, &flagged, scanned)?
+                        } else {
+                            None
+                        };
+                        let (oid, len) = (table.oid(), table.rows().len());
                         // The row numbers are the scan's, so they name the table's rows only when
                         // the scan read every row, in order, which it does as long as it read as
                         // many as the table holds.
@@ -4672,7 +4930,26 @@ impl Shared {
                                 )
                             }
                         });
-                        catalog.table_mut(name)?.replace_all(kept, workers)?;
+                        // An update keeps every row where it was, which is what lets another
+                        // transaction's claim on a row still name it afterwards.
+                        let table = catalog.table_mut(name)?;
+                        if delete {
+                            table.replace_all(kept, workers)?;
+                        } else {
+                            table.update_all(kept, workers)?;
+                        }
+                        if let Some(marks) = claim {
+                            self.claimed(oid, delete, marks);
+                        }
+                        self.wrote(oid, |written, base| {
+                            if scanned != len {
+                                written.opaque();
+                            } else if delete {
+                                written.deleted(&flagged, len, base);
+                            } else {
+                                written.updated(&flagged, &changed);
+                            }
+                        });
                         if let Some(record) = staged
                             && let Some(journal) = self.journal().as_mut()
                         {
@@ -4737,7 +5014,12 @@ impl Shared {
             .filter(|_| name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG))
             .map(|journal| journal.encode(&name.schema, &name.table, fields, &chunks));
         let workers = self.inner.pool.threads();
-        catalog.table_mut(name)?.append_all(chunks, workers)?;
+        let noted = self.transacting().then(|| chunks.clone());
+        let table = catalog.table_mut(name)?;
+        table.append_all(chunks, workers)?;
+        if let Some(noted) = noted {
+            self.wrote(table.oid(), |written, _| written.appended(&noted));
+        }
         if let Some(payload) = staged
             && let Some(journal) = self.journal().as_mut()
         {

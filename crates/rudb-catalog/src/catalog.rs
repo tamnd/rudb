@@ -277,7 +277,11 @@ pub struct Catalog {
     default_schema: String,
     /// The search path as `SET schema`, `SET search_path` or `USE` left it, empty for none.
     search: Vec<crate::SearchEntry>,
-    /// Which version of the contents this is, counted from one.
+    /// Which version of the contents this is, drawn from the process's revision counter.
+    ///
+    /// Drawn there rather than counted here because a transaction's copy of the catalog and the
+    /// committed catalog both move on from the same number, and a plan or a set of facts kept for
+    /// one of them must not be taken for the other's.
     ///
     /// Anything that can change what a query would read moves it on, which is every method here
     /// that takes the catalog by mutable reference, including [`Catalog::table_mut`], because a
@@ -286,9 +290,11 @@ pub struct Catalog {
     /// not change anything moves it anyway. Counting a change that did not happen costs a rebuild
     /// nobody needed. Missing one serves a plan facts about a table that is no longer there.
     ///
-    /// Counted from one so that zero can mean no catalog was ever read, which is what a set of
-    /// facts assembled by hand in a test carries.
+    /// Never zero, so that zero can mean no catalog was ever read, which is what a set of facts
+    /// assembled by hand in a test carries.
     generation: u64,
+    /// Which version of everything but the rows this is. See [`Catalog::shape`].
+    shape: u64,
     /// The next oid to hand out.
     ///
     /// A counter rather than a position, because a position changes when the thing before it is
@@ -345,6 +351,24 @@ impl Catalog {
             search: Vec::new(),
             next,
             generation: 1,
+            shape: crate::table::next_revision(),
+            mirrors: Vec::new(),
+        }
+    }
+
+    /// A catalog with nothing in it, not even the databases every session starts with, which is
+    /// what a connection holds in the place of a transaction's own catalog while it has none. Much
+    /// cheaper than [`Catalog::new`], which builds the system views.
+    #[must_use]
+    pub fn bare() -> Self {
+        Self {
+            databases: Vec::new(),
+            default_catalog: DEFAULT_CATALOG.to_string(),
+            default_schema: DEFAULT_SCHEMA.to_string(),
+            search: Vec::new(),
+            next: 1,
+            generation: 1,
+            shape: 0,
             mirrors: Vec::new(),
         }
     }
@@ -364,7 +388,17 @@ impl Catalog {
     /// Called by every method that takes the catalog by mutable reference rather than by the ones
     /// that really wrote something, which is deliberate and the field's own comment says why.
     fn changed(&mut self) {
-        self.generation += 1;
+        self.generation = crate::table::next_revision();
+        self.shape = crate::table::next_revision();
+    }
+
+    /// Which version of everything but the rows of the tables this is: the schemas, the tables and
+    /// their columns, the views, the sequences and the rest. Drawn from the same counter as a
+    /// table's revision, so a transaction can tell whether anything but rows changed since its
+    /// snapshot, in its own copy or in the committed one.
+    #[must_use]
+    pub fn shape(&self) -> u64 {
+        self.shape
     }
 
     /// Puts back a catalog kept from before, which is what a `ROLLBACK` does.
@@ -380,6 +414,18 @@ impl Catalog {
         self.generation = generation;
         self.next = next;
         self.changed();
+    }
+
+    /// Makes a transaction's catalog the committed one, shape and all.
+    ///
+    /// Unlike [`Catalog::restore`], the shape is the one `next` carries, so a transaction that only
+    /// changed rows leaves the shape the other open transactions took their snapshots at. The
+    /// generation moves on as it does there, and the oid counter keeps the higher of the two.
+    pub fn install(&mut self, next: Self) {
+        let counter = self.next.max(next.next);
+        *self = next;
+        self.generation = crate::table::next_revision();
+        self.next = counter;
     }
 
     /// The next oid, and moves the counter on.
@@ -1468,13 +1514,16 @@ impl Catalog {
     ///
     /// If the database, the schema or the table is missing.
     pub fn table_mut(&mut self, name: &QualifiedName) -> Result<&mut Table> {
-        self.changed();
+        // The rows change and the shape does not, so the generation moves and the shape stays.
+        self.generation = crate::table::next_revision();
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
-        schema
+        let table = schema
             .tables
             .iter_mut()
             .find(|held| same_name(&held.name().table, &name.table))
-            .ok_or_else(|| missing_table(&name.table))
+            .ok_or_else(|| missing_table(&name.table))?;
+        table.touch();
+        Ok(table)
     }
 
     /// Turns the parts of a written name into the full name of a table or a view that exists.

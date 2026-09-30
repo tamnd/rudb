@@ -119,6 +119,7 @@ mod result;
 mod settings;
 mod statements;
 mod syntax;
+mod txn;
 mod upsert;
 
 #[cfg(test)]

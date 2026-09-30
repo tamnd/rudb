@@ -1,6 +1,7 @@
 //! A table: a name, some columns, and the rows.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
@@ -17,6 +18,27 @@ use crate::catalog::DETACHED;
 use crate::held::Held;
 use crate::keys::{ForeignKey, Key, Seen};
 use crate::name::{QualifiedName, same_name};
+
+/// Where table revisions are counted from, one counter for the process.
+///
+/// One counter rather than one per catalog, because a transaction compares a table in the catalog
+/// it took a snapshot of with the same table in the committed catalog, and the two catalogs count
+/// their own changes apart from that point on. A number drawn here is never drawn again, so two
+/// tables with the same revision are the same rows.
+static REVISION: AtomicU64 = AtomicU64::new(1);
+
+/// A revision nothing has been given yet.
+#[must_use]
+pub fn next_revision() -> u64 {
+    REVISION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// The last revision handed out, which a snapshot keeps to tell the changes made after it from the
+/// ones made before.
+#[must_use]
+pub fn revision_now() -> u64 {
+    REVISION.load(Ordering::Relaxed)
+}
 
 /// Refuses a column list that names the same column twice.
 ///
@@ -1287,6 +1309,14 @@ pub struct Table {
     /// The sequences its defaults call `nextval` on, which it depends on the way the pin records it:
     /// a `DROP SEQUENCE` without `CASCADE` is refused while this table is there.
     sequences: Vec<QualifiedName>,
+    /// Which version of the rows this is, drawn from [`next_revision`] whenever the catalog hands
+    /// the table out to be changed. A clone keeps it, so a transaction can tell whether the
+    /// committed table is still the one its snapshot holds.
+    revision: u64,
+    /// Which numbering of the rows this is. An append or an update in place keeps every row where
+    /// it was, and anything else draws a new one, so two tables with the same frame agree on what
+    /// row number `n` means for every row both of them have.
+    frame: u64,
 }
 
 impl Table {
@@ -1316,6 +1346,8 @@ impl Table {
             foreign: Vec::new(),
             order: Vec::new(),
             sequences: Vec::new(),
+            revision: next_revision(),
+            frame: next_revision(),
         })
     }
 
@@ -1345,6 +1377,8 @@ impl Table {
             foreign,
             order: Vec::new(),
             sequences: Vec::new(),
+            revision: next_revision(),
+            frame: next_revision(),
         })
     }
 
@@ -1549,6 +1583,23 @@ impl Table {
             .collect()
     }
 
+    /// Which version of the rows this is. See the field.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Which numbering of the rows this is. See the field.
+    #[must_use]
+    pub fn frame(&self) -> u64 {
+        self.frame
+    }
+
+    /// Draws a new revision, for a table about to be changed.
+    pub(crate) fn touch(&mut self) {
+        self.revision = next_revision();
+    }
+
     /// Replaces an empty mutable table with its committed native snapshot.
     ///
     /// # Errors
@@ -1637,7 +1688,30 @@ impl Table {
         for chunk in &chunks {
             self.refuse_nulls(chunk)?;
         }
-        let seen = self.appended_keys(&chunks)?;
+        self.append_checked(chunks, workers, false)
+    }
+
+    /// [`Self::append_all`] for the rows a transaction added, going into the committed table when
+    /// the commit finds rows committed by others since its snapshot. A key that is already there is
+    /// refused in the words the pin fails a commit with.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::append`].
+    pub fn append_committing(&mut self, chunks: Vec<Chunk>, workers: usize) -> Result<()> {
+        for chunk in &chunks {
+            self.refuse_nulls(chunk)?;
+        }
+        self.append_checked(chunks, workers, true)
+    }
+
+    fn append_checked(
+        &mut self,
+        chunks: Vec<Chunk>,
+        workers: usize,
+        committing: bool,
+    ) -> Result<()> {
+        let seen = self.appended_keys(&chunks, committing)?;
         self.rows.to_append()?.append_all(chunks, workers)?;
         self.hold_keys(seen);
         Ok(())
@@ -1666,6 +1740,25 @@ impl Table {
         rows.append_all(chunks, workers)?;
         self.rows = Rows::Memory(rows);
         self.hold_keys(seen);
+        self.frame = next_revision();
+        Ok(())
+    }
+
+    /// [`Self::replace_all`] for rows that are the table's own in the same order, some of them with
+    /// new values and perhaps some new ones after them, which is how an `UPDATE` lands. Every row
+    /// keeps its number, so the frame does too.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::append`], and if there are fewer rows than the table has.
+    pub fn update_all(&mut self, chunks: Vec<Chunk>, workers: usize) -> Result<()> {
+        let count = chunks.iter().map(Chunk::len).sum::<usize>();
+        if count < self.rows.len() {
+            return Err(Error::internal("an update in place that lost rows"));
+        }
+        let frame = self.frame;
+        self.replace_all(chunks, workers)?;
+        self.frame = frame;
         Ok(())
     }
 
@@ -1812,14 +1905,14 @@ impl Table {
         }
         self.keys = keys;
         self.seen = vec![None; self.guards().len()];
-        let seen = self.appended_keys(&[])?;
+        let seen = self.appended_keys(&[], false)?;
         self.hold_keys(seen);
         Ok(())
     }
 
     /// The key sets the table holds once these rows are appended, or the refusal of the first key
     /// they repeat. Builds the set of a key from the rows already held the first time it is asked.
-    fn appended_keys(&mut self, chunks: &[Chunk]) -> Result<Vec<Seen>> {
+    fn appended_keys(&mut self, chunks: &[Chunk], committing: bool) -> Result<Vec<Seen>> {
         let guards = self.guards();
         if guards.is_empty() {
             return Ok(Vec::new());
@@ -1839,7 +1932,7 @@ impl Table {
                     held
                 }
             };
-            sets.push(held.with(chunks, key, &self.columns)?);
+            sets.push(held.with(chunks, key, &self.columns, committing)?);
         }
         Ok(sets)
     }
