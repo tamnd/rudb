@@ -356,6 +356,27 @@ impl Domain {
         {
             return if none_null { kept } else { kept.masked(keys.validity()) };
         }
+        // A dictionary is tested once an entry and then read a code a row. The file keeps a link to
+        // a small table such as `info_type` or `role_type` this way, and those are about a quarter
+        // of the keys the suite tests. Going through `signed_block` widened every entry, wrote a key
+        // a row, tested each with the wide arithmetic of `holds` and asked `is_null_at` a row on a
+        // nullable link. An entry that is null is not kept by the test of the entries, and a row
+        // that is null in the codes is cleared by the mask after.
+        if let Some((codes, values)) = keys.dictionary_parts()
+            && values.len() <= rows.max(1024)
+            && let Some(codes) = codes.get(..rows)
+        {
+            let entries = self.kept(values, values.len(), block);
+            let held = &entries.bits;
+            let kept = marked(rows, |from, to| {
+                codes[from..to].iter().enumerate().fold(0, |word, (bit, &code)| {
+                    let code = code as usize;
+                    let set = held.get(code / 64).is_some_and(|bits| bits >> (code % 64) & 1 == 1);
+                    word | u64::from(set) << bit
+                })
+            });
+            return kept.masked(keys.validity());
+        }
         if keys.signed_block(block) && block.len() >= rows {
             let widened = &block[..rows];
             return marked(rows, |from, to| {
@@ -1906,7 +1927,20 @@ mod tests {
         assert_eq!(held(&masked), [163], "the packed form with nulls in its mask");
         let widened = Vector::dictionary((0..200).collect(), flat).expect("a dictionary");
         assert!(widened.data().is_none() && widened.packed_parts().is_none());
-        assert_eq!(held(&widened), [100], "a dictionary, which is read a key at a time");
+        assert_eq!(held(&widened), [100], "a dictionary, whose entries are tested once each");
+        let entries = column(&[Some(163), None, Some(7), Some(100)]);
+        let codes: Vec<u32> = (0..200).map(|row| [2, 0, 1, 3][row % 4]).collect();
+        let repeated = Vector::dictionary(codes, entries).expect("a dictionary");
+        let every = |step: usize| (0..200).skip(step).step_by(4).collect::<Vec<u32>>();
+        let both: Vec<u32> = {
+            let mut both = [every(1), every(3)].concat();
+            both.sort_unstable();
+            both
+        };
+        assert_eq!(held(&repeated), both, "entries shared by many rows, one of them null");
+        let nullable = repeated.with_validity(Validity::from_iter(200, |row| row != 1 && row != 7));
+        let kept: Vec<u32> = both.into_iter().filter(|&row| row != 1 && row != 7).collect();
+        assert_eq!(held(&nullable), kept, "a dictionary with nulls in its codes");
     }
 
     /// A column of those values packed at that width over that base, which is the form the native
