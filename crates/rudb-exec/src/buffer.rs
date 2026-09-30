@@ -22,7 +22,8 @@ use rudb_vector::Chunk;
 /// A list of finished chunks.
 #[derive(Debug, Default)]
 struct Shared {
-    chunks: Mutex<Vec<Chunk>>,
+    /// The chunks, each `None` once a read on the shared cursor has taken it.
+    chunks: Mutex<Vec<Option<Chunk>>>,
     /// What the chunks are charged, where the operator that kept them handed the charge on with
     /// them. It leaves with the chunks when they are taken, so the limit sees them go when they do.
     charged: Mutex<Vec<Reservation>>,
@@ -33,10 +34,25 @@ struct Shared {
 /// Cloning one gives another handle on the same list and the same cursor, which is how the sink
 /// half and the source half of a pipeline breaker end up looking at the same thing. Reading the
 /// list a second time from the start is [`Buffered::reader`] instead.
-#[derive(Debug, Default, Clone)]
+///
+/// The shared cursor hands each chunk out once, so a read through it takes the chunk out of the
+/// list rather than copying it, and the rows go when whatever read them is done with them. Kept,
+/// they stayed until the query ended: ClickBench q29 counts 8.7 million rows into 2.7 million
+/// groups and hands them to a second aggregate, and those 32 MB were still held at the peak of
+/// the second one, which only ever read each of them once.
+#[derive(Debug, Clone)]
 pub(crate) struct Buffered {
     shared: Arc<Shared>,
     handed: Arc<AtomicU64>,
+    /// Whether a read takes its chunk, which is the shared cursor's way. A [`Buffered::reader`]
+    /// leaves the chunks for the other readers of the same list.
+    takes: bool,
+}
+
+impl Default for Buffered {
+    fn default() -> Self {
+        Self { shared: Arc::default(), handed: Arc::default(), takes: true }
+    }
 }
 
 impl Buffered {
@@ -53,7 +69,7 @@ impl Buffered {
     /// saw the chunks another read had not taken yet would be a wrong answer rather than a slower
     /// one.
     pub(crate) fn reader(&self) -> Self {
-        Self { shared: Arc::clone(&self.shared), handed: Arc::new(AtomicU64::new(0)) }
+        Self { shared: Arc::clone(&self.shared), handed: Arc::new(AtomicU64::new(0)), takes: false }
     }
 
     /// Hand the finished chunks over, which is what a [`Sink::finalize`] does with its result.
@@ -63,7 +79,7 @@ impl Buffered {
     /// [`ErrorCode::Internal`](rudb_common::ErrorCode::Internal) if a thread panicked while holding
     /// the list.
     pub(crate) fn fill(&self, chunks: Vec<Chunk>) -> Result<()> {
-        *self.shared.chunks.lock().map_err(poisoned)? = chunks;
+        *self.shared.chunks.lock().map_err(poisoned)? = chunks.into_iter().map(Some).collect();
         Ok(())
     }
 
@@ -94,9 +110,13 @@ impl Buffered {
     ///
     /// # Errors
     ///
-    /// The same as [`Buffered::fill`].
+    /// The same as [`Buffered::fill`], and an internal error when the shared cursor has taken a
+    /// chunk already.
     pub(crate) fn take(&self) -> Result<(Vec<Chunk>, Vec<Reservation>)> {
-        let chunks = std::mem::take(&mut *self.shared.chunks.lock().map_err(poisoned)?);
+        let chunks = std::mem::take(&mut *self.shared.chunks.lock().map_err(poisoned)?)
+            .into_iter()
+            .map(|chunk| chunk.ok_or_else(|| Error::internal("a finished chunk was read already")))
+            .collect::<Result<_>>()?;
         let charged = std::mem::take(&mut *self.shared.charged.lock().map_err(poisoned)?);
         Ok((chunks, charged))
     }
@@ -105,9 +125,25 @@ impl Buffered {
     ///
     /// # Errors
     ///
-    /// The same as [`Buffered::fill`].
+    /// The same as [`Buffered::fill`], and an internal error for a chunk the shared cursor has
+    /// taken already.
     pub(crate) fn at(&self, index: usize) -> Result<Option<Chunk>> {
-        Ok(self.shared.chunks.lock().map_err(poisoned)?.get(index).cloned())
+        match self.shared.chunks.lock().map_err(poisoned)?.get(index) {
+            Some(Some(chunk)) => Ok(Some(chunk.clone())),
+            Some(None) => Err(Error::internal("a finished chunk was read already")),
+            None => Ok(None),
+        }
+    }
+
+    /// The chunk at `index` taken out of the list, or `None` past the end.
+    fn take_at(&self, index: usize) -> Result<Option<Chunk>> {
+        match self.shared.chunks.lock().map_err(poisoned)?.get_mut(index) {
+            Some(slot) => slot
+                .take()
+                .map(Some)
+                .ok_or_else(|| Error::internal("a finished chunk was read already")),
+            None => Ok(None),
+        }
     }
 }
 
@@ -123,14 +159,15 @@ impl Source for Buffered {
 
     fn morsels(&self, threads: usize, _weight: usize) -> Option<usize> {
         let chunks = self.shared.chunks.lock().ok()?;
-        let rows = chunks.iter().map(Chunk::len).sum::<usize>();
+        let rows = chunks.iter().flatten().map(Chunk::len).sum::<usize>();
         let useful = rows.div_ceil(50_000).clamp(1, 4);
         Some(chunks.len().min(threads).min(useful))
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let index = morsel.cursor() as usize;
-        match self.at(index)? {
+        let chunk = if self.takes { self.take_at(index)? } else { self.at(index)? };
+        match chunk {
             Some(chunk) => {
                 *out = chunk;
                 morsel.advance(1);
@@ -219,6 +256,29 @@ mod tests {
         let along = one.clone();
         assert_eq!(along.morsel().expect("the clone carries on").cursor(), 1);
         assert!(one.morsel().is_none(), "and the pair of them have taken both");
+    }
+
+    /// The shared cursor takes what it reads, so the list stops holding it, and a reader of its own
+    /// leaves the chunks where they are for the next one.
+    #[test]
+    fn the_shared_cursor_takes_its_chunks_and_a_reader_does_not() {
+        let buffered = Buffered::new();
+        buffered.fill(vec![chunk(&[1]), chunk(&[2])]).expect("two chunks");
+
+        let reader = buffered.reader();
+        let mut morsel = reader.morsel().expect("the first chunk");
+        let mut out = Chunk::empty(&[]);
+        reader.read(&mut morsel, &mut out).expect("it is there");
+        assert_eq!(out.value_at(0, 0), Value::Integer(1));
+        assert!(buffered.at(0).expect("still there").is_some(), "a reader leaves it");
+
+        let mut morsel = buffered.morsel().expect("the first chunk");
+        buffered.read(&mut morsel, &mut out).expect("it is there");
+        assert_eq!(out.value_at(0, 0), Value::Integer(1));
+        assert_eq!(buffered.len().expect("readable"), 2, "the list keeps its length");
+        let why = buffered.at(0).expect_err("the shared cursor took it");
+        assert!(why.to_string().contains("read already"), "{why}");
+        assert!(buffered.at(1).expect("readable").is_some(), "and nothing else");
     }
 
     #[test]
