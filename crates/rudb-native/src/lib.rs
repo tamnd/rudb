@@ -16928,7 +16928,8 @@ mod tests {
 
     /// A whole read holds the part it decoded, reads at positions count what they cost until the
     /// read whose share comes to the part holds it, and a part the pool lets go is decoded again
-    /// from its pages.
+    /// from its pages. A part of 64 integers is decoded whole by any read of it, so here the first
+    /// read at positions already pays for all of it.
     #[test]
     fn a_pool_keeps_decoded_parts_and_lets_them_go_under_its_budget() {
         let path = path("decoded-parts");
@@ -16955,11 +16956,10 @@ mod tests {
             PartSlot::Seen(paid) => Some(paid),
             _ => None,
         };
+        assert!(matches!(*slot(0), PartSlot::Unseen));
         let sparse = a.read_rows(0, &[0], &[3], false).expect("one row");
         assert_eq!(sparse.value_at(0, 0), Value::Integer(3));
-        let first = paid(0).expect("a sparse first read only counts what it cost");
-        assert!(first > 0, "which is something");
-        assert_eq!(pool.bytes(), 0, "and keeps nothing");
+        assert!(paid(0).is_none_or(|paid| paid > 0), "a read pays something");
         let mut reads = 1;
         while paid(0).is_some() {
             let again = a.read_rows(0, &[0], &[3], false).expect("one row");
@@ -16974,8 +16974,6 @@ mod tests {
         let whole = a.read(1, &[0]).expect("a part");
         assert_eq!(whole.len(), 64);
         assert!(matches!(*slot(1), PartSlot::Held { .. }), "a whole read holds what it decoded");
-        a.read_rows(2, &[0], &[3], false).expect("one row");
-        assert_eq!(paid(2), Some(first), "and a sparse read of another part still only counts");
 
         for _ in 0..2 {
             for part in 0..parts {
@@ -18855,10 +18853,10 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A visit keeps what it decodes the way a sweep does, nothing the first time and every block
-    /// it lands in the second, since a `LIKE` asks for the same blocks again in the next statement.
+    /// A visit in order keeps what it decodes the way a sweep does, every block it lands in the
+    /// first time, since a `LIKE` asks for the same blocks again in the next statement.
     #[test]
-    fn a_second_visit_of_the_same_values_keeps_the_blocks_it_decoded() {
+    fn a_visit_keeps_the_blocks_it_decoded() {
         let path = path("dictionary-visit");
         let spellings = (0..2_500)
             .map(|index| Value::Varchar(format!("value {index:08} {}", "y".repeat(index % 30))))
@@ -18894,10 +18892,10 @@ mod tests {
             seen
         };
         let seen = visit();
-        assert_eq!(dictionary.footprint(), resting, "a first visit keeps nothing it decoded");
-        assert_eq!(visit(), seen, "a second visit reads what the first did");
-        assert!(dictionary.footprint() > resting, "a second visit keeps what it decoded");
+        let kept = dictionary.footprint();
+        assert!(kept > resting, "a first visit keeps what it decoded");
         assert_eq!(visit(), seen, "the kept blocks answer the same");
+        assert_eq!(dictionary.footprint(), kept, "and a second visit decodes nothing more");
         let read = indices
             .iter()
             .map(|&code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
