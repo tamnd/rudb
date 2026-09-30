@@ -649,6 +649,12 @@ fn laid(ty: &LogicalType, pieces: &[&Vector]) -> Result<Option<Vector>> {
     // full row group is eight thousand values of slack carried for the life of the table.
     let mut data = data_for(ty, rows)?;
     let mut arenas = arenas_of(pieces);
+    // The arena too, for the reason `interleave_placed` gives. A join holding a long text column,
+    // the biographies of `person_info` in JOB 7c, grew it by doubling and spent a fifth of the
+    // query faulting in the copies.
+    if let Data::Varlen(column) = &mut data {
+        column.reserve_bytes(arenas.bytes());
+    }
     for piece in pieces {
         let from = piece
             .data()

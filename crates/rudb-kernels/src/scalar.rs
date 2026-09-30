@@ -3006,6 +3006,9 @@ fn like_ranked(
     finish(returns, Data::Bool(out.into()), base)
 }
 
+/// How many rows of a chunk [`like_stable`] looks up in the memo before trusting it with the rest.
+const PROBED: usize = 64;
+
 fn like_stable(
     dictionary: &Arc<Vector>,
     codes: &[u32],
@@ -3023,6 +3026,34 @@ fn like_stable(
     });
     if !Arc::ptr_eq(&cache.dictionary, dictionary) {
         return like_vector_run(dictionary, codes, like, base, rows, returns);
+    }
+    // Once the memo has seen the values a chunk points at, which after the first few chunks of a
+    // scan is nearly every chunk, the answer is one load and a test a row. So that is tried first
+    // as a loop with nothing in it that can stop it, and only a chunk with a row the memo has not
+    // decided goes the long way below. On JOB 19c the long way was an eighth of the query, spent
+    // on rows the memo already knew. Where the values are too many for the memo ever to know most
+    // of them, as the four million names of JOB 17f, the whole loop ran and then the long way did
+    // too, so the first rows are looked at before the rest and one the memo has not decided sends
+    // the chunk the long way at once.
+    let pair = |code: u32| {
+        let (index, shift) = StableLike::slot(code as usize);
+        cache.state.get(index).map_or(0, |word| word.load(Ordering::Acquire)) >> shift
+    };
+    let first = rows.min(PROBED);
+    if rows > 0
+        && codes.len() >= rows
+        && codes[..first].iter().all(|&code| pair(code) & 1 == 1)
+    {
+        let mut out = vec![false; rows];
+        let mut undecided = 0;
+        for (slot, &code) in out.iter_mut().zip(&codes[..rows]) {
+            let pair = pair(code);
+            undecided |= !pair & 1;
+            *slot = pair & 3 == 3;
+        }
+        if undecided == 0 {
+            return finish(returns, Data::Bool(out.into()), base.normalize(rows));
+        }
     }
     let mut out = vec![false; rows];
     let mut characters = Vec::new();

@@ -1014,17 +1014,36 @@ where
                 return Ok(Some(answers));
             }
         }
+        // An empty literal is settled by the length alone, which for a dictionary is one load of two
+        // offsets rather than a walk to wherever the value's bytes live.
+        let equal_at = |values: &Vector, at: usize| -> Result<bool> {
+            Ok(if literal.is_empty() {
+                values.try_bytes_len_at(at)?.is_some_and(|length| length == 0)
+            } else {
+                values.try_bytes_at(at)?.is_some_and(|bytes| bytes == literal)
+            })
+        };
+        // Without a memo the values are still fewer than the rows, so each is decided once and the
+        // rows look their code up. The note of `cast_info` in JOB 25a came this way a row at a time,
+        // a walk through the dictionary and a compare for every row of every literal of the list.
+        if let Some((codes, values)) = column.positions()
+            && values.len() <= len
+        {
+            let decided =
+                (0..values.len()).map(|at| equal_at(values, at)).collect::<Result<Vec<_>>>()?;
+            let mut answers = Vec::with_capacity(len);
+            for slot in 0..len {
+                let code = *codes
+                    .get(map(slot))
+                    .ok_or_else(|| Error::internal("a row is past the end of its codes"))?;
+                let equal = decided.get(code as usize).copied().unwrap_or(false);
+                answers.push(equal == same);
+            }
+            return Ok(Some(answers));
+        }
         let mut answers = Vec::with_capacity(len);
         for slot in 0..len {
-            let row = map(slot);
-            // An empty literal is settled by the length alone, which for a dictionary is one load
-            // of two offsets rather than a walk to wherever the value's bytes live.
-            let equal = if literal.is_empty() {
-                column.try_bytes_len_at(row)?.is_some_and(|length| length == 0)
-            } else {
-                column.try_bytes_at(row)?.is_some_and(|bytes| bytes == literal)
-            };
-            answers.push(equal == same);
+            answers.push(equal_at(column, map(slot))? == same);
         }
         return Ok(Some(answers));
     }
