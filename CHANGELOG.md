@@ -8,6 +8,14 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.14
+
+For the JOB work under J7, #2219 reads a string MIN or MAX in a consistent node late, only for the rows the second sweep keeps, and tests and fills the sweeps' key sets a chunk at a time. #2220 reads selected packed values with one width check, reserves a string arena when rows are laid out again, decides a dictionary equality once per value and tries a stable LIKE memo first for a whole chunk. Together they take the JOB suite on server2 from 42.16 to 39.99 G cycles, 5.1% fewer, with 7c down 30%. #2211 reads a part at a few rows for less and places a scattered chunk whole once its columns are held, and #2209 lets go of the mapped pages of held pages and of parts read at positions.
+
+For C5, #2212 keeps a worker's group table in the L2 and goes blind sooner, #2215 appends blind group rows to the lanes in compiled code, #2216 answers a join to a key of one row a batch at a time, #2217 gathers fixed width dictionary values straight through the codes, #2206 gathers the cold functions queries run with the rest of the hot text, #2207 decodes a function once in the verifier, and #2213 takes finished chunks out of a breaker's buffer as the shared cursor reads them. On compatibility, #2205 promotes maps by key and value type, #2208 adds the TYPE type with make_type and get_type, #2210 and #2214 bind COLUMNS, the star's EXCLUDE, REPLACE, RENAME and LIKE forms and *COLUMNS unpacking, and add greatest and least, and #2218 adds list comprehensions, GLOB and LIKE ESCAPE.
+
+The native directory format number stays at 30 and the storage format version at 9.
+
 ## 0.8.13
 
 For W3, #2203 logs a table or a view made or dropped as a Ddl record holding the statement, which runs again in its place at replay, so a small schema change in a file no longer rewrites it with a checkpoint. #2196 shares a query result's parts between its clones behind one Arc, which is 2 to 3% fewer instructions on the prepared insert trickle. For C5, #2198 keeps a memory table's exact extremes per column until rows change, #2199 counts what a read at positions cost toward holding its part and tests bitmap keys eight at a time, #2200 makes the QIR verifier and builder cheaper, #2201 links the code queries run at the front of the shell, and #2202 reads the year of a date off the new year days and moves a link join's columns instead of copying them. On compatibility, #2195 adds the UUID type and its functions the way the pin has them, and #2197 writes an exported aggregate state to Parquet as its layout.
