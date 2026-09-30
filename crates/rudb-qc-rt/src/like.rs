@@ -1,4 +1,5 @@
-//! `LIKE` and `ILIKE` against a constant pattern.
+//! `LIKE` and `ILIKE` against a constant pattern, and a comparison of text against a constant,
+//! which the compiled engine answers for a whole morsel or dictionary the same way.
 //!
 //! The same shapes and the same walk as the first engine's kernel in `rudb-kernels`, so the two
 //! engines answer alike. There is no escape character, because the first engine has none.
@@ -18,8 +19,18 @@ enum Pattern {
     Prefix(Vec<u8>),
     Suffix(Vec<u8>),
     Contains(Box<memmem::Finder<'static>>),
-    Segments { prefix: Vec<u8>, suffix: Vec<u8>, middles: Vec<memmem::Finder<'static>> },
+    Segments {
+        prefix: Vec<u8>,
+        suffix: Vec<u8>,
+        middles: Vec<memmem::Finder<'static>>,
+    },
     General(Vec<char>),
+    /// A comparison against a constant, true when the text's order against it, less, equal or
+    /// greater, is one `keep` holds. Text is ordered by its bytes, as the first engine orders it.
+    Ordered {
+        literal: Vec<u8>,
+        keep: [bool; 3],
+    },
 }
 
 impl Like {
@@ -28,6 +39,16 @@ impl Like {
     pub fn new(spelling: &str, fold: bool) -> Like {
         let spelling = if fold { spelling.to_lowercase() } else { spelling.to_owned() };
         Like { pattern: Pattern::compile(&spelling), fold }
+    }
+
+    /// A comparison against `literal`, true for the text that orders before it when `keep[0]`, the
+    /// same as it when `keep[1]` and after it when `keep[2]`.
+    #[must_use]
+    pub fn ordered(literal: &str, keep: [bool; 3]) -> Like {
+        Like {
+            pattern: Pattern::Ordered { literal: literal.as_bytes().to_vec(), keep },
+            fold: false,
+        }
     }
 
     /// Whether `text` matches.
@@ -195,6 +216,7 @@ impl Pattern {
                 let text: Vec<char> = String::from_utf8_lossy(text).chars().collect();
                 walk(&text, p)
             }
+            Pattern::Ordered { literal, keep } => keep[(text.cmp(literal) as i8 + 1) as usize],
         }
     }
 }
@@ -253,6 +275,17 @@ mod tests {
             assert_eq!(Like::new(p, false).matches(t.as_bytes()), want, "{t} LIKE {p}");
         }
         assert!(Like::new("%GOOGLE%", true).matches(b"www.Google.com"));
+    }
+
+    #[test]
+    fn a_comparison_orders_by_bytes() {
+        let not_empty = Like::ordered("", [false, false, true]);
+        assert!(!not_empty.matches(b"") && not_empty.matches(b"a"));
+        let at_most = Like::ordered("b%", [true, true, false]);
+        assert!(at_most.matches(b"b%") && at_most.matches(b"a") && at_most.matches(b"b"));
+        assert!(
+            !at_most.matches(b"b%a") && !at_most.matches(b"c") && !at_most.matches("é".as_bytes())
+        );
     }
 
     #[test]

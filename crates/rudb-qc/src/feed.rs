@@ -850,6 +850,9 @@ impl<'a> Feed<'a> {
         // Each other `LIKE` the body reads as a column is answered here for the whole morsel.
         let mut valids = Vec::new();
         let mut flats = Vec::new();
+        // Whether no row is NULL in a column the body reads only through answers, which the
+        // version for morsels with no NULL takes as said as it does for the columns it reads.
+        let mut answered_clean = true;
         for (m, answer) in self.body.likes.iter().zip(&answers) {
             let (values, codes) = match *answer {
                 Some(values) => (values, codes_of(coded_at(m.column)?, rows)?),
@@ -867,7 +870,8 @@ impl<'a> Feed<'a> {
                 None => {
                     // The body reads the column only through its answers, so only its validity
                     // is held and not its strings.
-                    let (valid, _) = validity(chunk.column(m.column)?, rows);
+                    let (valid, clean) = validity(chunk.column(m.column)?, rows);
+                    answered_clean &= clean;
                     valids.push(valid);
                     valids.last().map_or(std::ptr::null(), Vec::as_ptr)
                 }
@@ -933,6 +937,7 @@ impl<'a> Feed<'a> {
         let mut f = self.func;
         if let Some(v) = self.nonull
             && held.iter().all(|h| h.clean)
+            && answered_clean
             && self
                 .body
                 .ranged

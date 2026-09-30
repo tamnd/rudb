@@ -337,6 +337,12 @@ impl Rt {
         self.add(Object::Like(Like::new(pattern, fold)))
     }
 
+    /// A handle on a comparison of text against `literal`, answered through the same handle as a
+    /// `LIKE`, see [`Like::ordered`].
+    pub fn add_ordered(&mut self, literal: &str, keep: [bool; 3]) -> u64 {
+        self.add(Object::Like(Like::ordered(literal, keep)))
+    }
+
     /// The `LIKE` pattern behind a handle.
     #[must_use]
     pub fn like(&self, handle: u64) -> Option<&Like> {

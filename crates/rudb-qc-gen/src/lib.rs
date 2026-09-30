@@ -134,6 +134,10 @@ pub struct Matched {
     pub pattern: String,
     /// Whether it is `ILIKE`.
     pub fold: bool,
+    /// For a comparison of the column against a constant rather than a `LIKE`, the orders of the
+    /// column's text against the constant, less, equal and greater, that make it true. The
+    /// constant is then [`Matched::pattern`].
+    pub order: Option<[bool; 3]>,
     /// The pattern's handle in the runtime.
     pub like: u64,
 }
@@ -403,7 +407,10 @@ fn pipeline(
         matched(f, source.len(), &mut likes);
     }
     for m in &mut likes {
-        m.like = rt.add_like(&m.pattern, m.fold);
+        m.like = match m.order {
+            Some(keep) => rt.add_ordered(&m.pattern, keep),
+            None => rt.add_like(&m.pattern, m.fold),
+        };
     }
     let mut reads = Vec::new();
     // Only the source's columns are read from the morsel. The rest are what the probes bring, and
@@ -547,35 +554,76 @@ fn scale_of(ty: &LogicalType) -> Option<u8> {
 fn read_by(e: &Expr, sources: usize, likes: &[Matched], reads: &mut Vec<usize>) {
     match &e.kind {
         Kind::Column(c) if *c < sources && !reads.contains(c) => reads.push(*c),
-        Kind::Function { .. } if answered(e, likes).is_some() => {}
+        Kind::Function { .. } | Kind::Compare { .. } if answered(e, likes).is_some() => {}
         _ => e.children(|c| read_by(c, sources, likes, reads)),
     }
 }
 
-/// The index in `likes` of the `LIKE` that `e` is, if it is one of them.
+/// The index in `likes` of the `LIKE` or comparison that `e` is, if it is one of them.
 fn answered(e: &Expr, likes: &[Matched]) -> Option<usize> {
-    let Kind::Function { name, args } = &e.kind else { return None };
-    let ("~~" | "!~~" | "~~*" | "!~~*", [s, pattern]) = (name.as_str(), args.as_slice()) else {
-        return None;
-    };
-    let (Kind::Column(column), Kind::Constant(Value::Varchar(p))) = (&s.kind, &pattern.kind) else {
-        return None;
-    };
-    let fold = name.contains('*');
-    likes.iter().position(|m| (m.column, m.pattern.as_str(), m.fold) == (*column, p, fold))
+    let (column, text, fold, order) = asked(e)?;
+    likes.iter().position(|m| {
+        (m.column, m.pattern.as_str(), m.fold, m.order) == (column, text, fold, order)
+    })
 }
 
-/// Adds every `LIKE` in `e` of a source column against a constant to `likes`, each once.
+/// The column, the constant, whether it is `ILIKE` and for a comparison the orders that make it
+/// true, of a `LIKE` of a text column against a constant or a comparison of one with a constant.
+///
+/// An order against a constant is asked of the whole morsel like a `LIKE` is, because a row at a
+/// time it is a runtime call a row, and a column coded into a dictionary then answers it once a
+/// value. An equality is left to the body, which asks it inline: on ClickBench, answering
+/// `<> ''` for the morsel saved up to 8% of the cycles where the column came coded and cost as much
+/// where it came flat.
+fn asked(e: &Expr) -> Option<(usize, &str, bool, Option<[bool; 3]>)> {
+    let text = |s: &Expr| match &s.kind {
+        Kind::Column(c) if s.ty == LogicalType::Varchar => Some(*c),
+        _ => None,
+    };
+    fn constant(p: &Expr) -> Option<&str> {
+        match &p.kind {
+            Kind::Constant(Value::Varchar(p)) => Some(p.as_str()),
+            _ => None,
+        }
+    }
+    match &e.kind {
+        Kind::Function { name, args } => {
+            let ("~~" | "!~~" | "~~*" | "!~~*", [s, pattern]) = (name.as_str(), args.as_slice())
+            else {
+                return None;
+            };
+            Some((text(s)?, constant(pattern)?, name.contains('*'), None))
+        }
+        Kind::Compare { op, left, right } => {
+            let keep = match op {
+                CompareOp::Less => [true, false, false],
+                CompareOp::LessOrEqual => [true, true, false],
+                CompareOp::Greater => [false, false, true],
+                CompareOp::GreaterOrEqual => [false, true, true],
+                CompareOp::Equal
+                | CompareOp::NotEqual
+                | CompareOp::DistinctFrom
+                | CompareOp::NotDistinctFrom => return None,
+            };
+            match (text(left), constant(right), text(right), constant(left)) {
+                (Some(c), Some(p), ..) => Some((c, p, false, Some(keep))),
+                // The constant on the left orders the other way round.
+                (_, _, Some(c), Some(p)) => Some((c, p, false, Some([keep[2], keep[1], keep[0]]))),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Adds every `LIKE` in `e` of a source column against a constant, and every order of one against
+/// a constant, to `likes`, each once.
 fn matched(e: &Expr, sources: usize, likes: &mut Vec<Matched>) {
-    if let Kind::Function { name, args } = &e.kind
-        && let ("~~" | "!~~" | "~~*" | "!~~*", [s, pattern]) = (name.as_str(), args.as_slice())
-        && let (Kind::Column(column), Kind::Constant(Value::Varchar(p))) = (&s.kind, &pattern.kind)
-        && *column < sources
-        && s.ty == LogicalType::Varchar
+    if let Some((column, text, fold, order)) = asked(e)
+        && column < sources
     {
         if answered(e, likes).is_none() {
-            let fold = name.contains('*');
-            likes.push(Matched { column: *column, pattern: p.clone(), fold, like: 0 });
+            likes.push(Matched { column, pattern: text.to_owned(), fold, order, like: 0 });
         }
         return;
     }
@@ -995,6 +1043,17 @@ impl Gen<'_> {
         Ok(Acc { offset, op, arg, ty: a.ty.clone() })
     }
 
+    /// The row's answer to the `LIKE` or comparison `at` of [`Gen::matched`], which the driver
+    /// made for the whole morsel, and whether its column is valid.
+    fn answer(&mut self, at: usize) -> Pair {
+        let (answers, valid, codes) = self.likes[at];
+        let ok = if self.nonull { self.truth() } else { self.b.load_bit(valid, self.row) };
+        let code = self.code(codes);
+        let m = self.b.load(Ty::I1, answers, code, 1, 0, 0);
+        let no = self.b.bool(false);
+        (self.b.select(ok, m, no), ok)
+    }
+
     /// Reads every source column `e` uses that is not read yet, in the current block. In the
     /// `nonull` version every value is valid, and what the builder folds away with that is every
     /// validity check downstream of the read.
@@ -1059,7 +1118,10 @@ impl Gen<'_> {
             Kind::Column(c) => Ok(self.loaded[c]),
             Kind::Constant(v) => self.constant(v, &e.ty, ty),
             Kind::Cast { input, try_cast } => self.cast(input, &e.ty, ty, *try_cast),
-            Kind::Compare { op, left, right } => self.compare(*op, left, right),
+            Kind::Compare { op, left, right } => match answered(e, &self.matched) {
+                Some(at) => Ok(self.answer(at)),
+                None => self.compare(*op, left, right),
+            },
             Kind::And(children) => {
                 let (mut all_valid, mut any_false, mut value) =
                     (self.truth(), self.b.bool(false), self.truth());
@@ -1591,13 +1653,7 @@ impl Gen<'_> {
                 let Kind::Constant(Value::Varchar(p)) = &pattern.kind else { return Ok(None) };
                 let fold = name.contains('*');
                 if let Some(at) = answered(e, &self.matched) {
-                    let (answers, valid, codes) = self.likes[at];
-                    let ok =
-                        if self.nonull { self.truth() } else { self.b.load_bit(valid, self.row) };
-                    let code = self.code(codes);
-                    let m = self.b.load(Ty::I1, answers, code, 1, 0, 0);
-                    let no = self.b.bool(false);
-                    let m = self.b.select(ok, m, no);
+                    let (m, ok) = self.answer(at);
                     let m = if name.starts_with('!') { self.b.un(Op::Not, m) } else { m };
                     return Ok(Some((m, ok)));
                 }
