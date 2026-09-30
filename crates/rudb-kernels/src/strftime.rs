@@ -14,7 +14,7 @@ use rudb_vector::{Form, Vector};
 
 /// One thing a format writes that is not literal text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Spec {
+pub(crate) enum Spec {
     WeekdayShort,
     WeekdayLong,
     /// Sunday is zero.
@@ -58,8 +58,8 @@ enum Spec {
 /// A format taken apart, with one more literal than there are specifiers.
 #[derive(Clone, Debug)]
 pub struct Format {
-    literals: Vec<String>,
-    specs: Vec<Spec>,
+    pub(crate) literals: Vec<String>,
+    pub(crate) specs: Vec<Spec>,
 }
 
 /// The pieces of a moment every specifier reads from.
@@ -74,10 +74,10 @@ struct Moment {
     nanos: i64,
 }
 
-const WEEKDAYS: [&str; 7] =
+pub(crate) const WEEKDAYS: [&str; 7] =
     ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
-const MONTHS: [&str; 12] = [
+pub(crate) const MONTHS: [&str; 12] = [
     "January",
     "February",
     "March",
@@ -206,6 +206,18 @@ impl Format {
         }
         literals.push(literal);
         Ok(Self { literals, specs })
+    }
+
+    /// Whether `%n` is in the format, which makes `strptime` answer a nanosecond timestamp.
+    #[must_use]
+    pub fn has_nanos(&self) -> bool {
+        self.specs.contains(&Spec::Nanos)
+    }
+
+    /// Whether `%z` is in the format, which makes `strptime` answer a timestamp with a time zone.
+    #[must_use]
+    pub fn has_offset(&self) -> bool {
+        self.specs.contains(&Spec::Offset)
     }
 
     /// Writes a date, a timestamp or a nanosecond timestamp out.

@@ -842,6 +842,30 @@ const TABLE: &[Entry] = &[
         shape: Shape::Exact(Fixed::Date, Fixed::Varchar),
         numeric_only: false,
     },
+    // A moment rounded down to the start of its bucket, from the default origin, an origin of the
+    // caller's or an offset.
+    Entry {
+        name: "time_bucket",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 3),
+        shape: Shape::Exact(Fixed::Interval, Fixed::Timestamp),
+        numeric_only: false,
+    },
+    // A timestamp read out of text in a format, or in the first of a list of formats that fits.
+    Entry {
+        name: "strptime",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::Timestamp),
+        numeric_only: false,
+    },
+    Entry {
+        name: "try_strptime",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::Timestamp),
+        numeric_only: false,
+    },
     // The seven that read a name, a day or a count off a date, a timestamp, a time or an interval.
     // Every one of them is answered by the `temporal` hook, and what it does not answer is refused.
     Entry {
@@ -2150,6 +2174,33 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         ("strftime", [Null, LogicalType::Varchar | Null]) => {
             Some((vec![Date, LogicalType::Varchar], LogicalType::Varchar))
         }
+        // A string literal is read as the width, which is the one place upstream has only an interval.
+        ("time_bucket", [Interval | LogicalType::Varchar, Date | Timestamp | Time]) => {
+            Some((vec![Interval, arguments[1].clone()], arguments[1].clone()))
+        }
+        ("time_bucket", [Interval | LogicalType::Varchar, Date | Timestamp | Time, Interval]) => {
+            Some((vec![Interval, arguments[1].clone(), Interval], arguments[1].clone()))
+        }
+        ("time_bucket", [Interval | LogicalType::Varchar, when, origin]) if when == origin => {
+            Some((vec![Interval, when.clone(), when.clone()], when.clone()))
+        }
+        // A date against a timestamp is bucketed as two timestamps.
+        ("time_bucket", [Interval | LogicalType::Varchar, Date, Timestamp])
+        | ("time_bucket", [Interval | LogicalType::Varchar, Timestamp, Date]) => {
+            Some((vec![Interval, Timestamp, Timestamp], Timestamp))
+        }
+        // The type a format reads into is settled by the binder once it has the format, since `%n`
+        // and `%z` make it a nanosecond timestamp or one with a time zone.
+        (
+            "strptime" | "try_strptime",
+            [LogicalType::Varchar | Null, LogicalType::Varchar | Null],
+        ) => Some((vec![LogicalType::Varchar, LogicalType::Varchar], Timestamp)),
+        (
+            "strptime" | "try_strptime",
+            [LogicalType::Varchar | Null, LogicalType::List(element)],
+        ) if matches!(**element, LogicalType::Varchar | Null) => {
+            Some((vec![LogicalType::Varchar, arguments[1].clone()], Timestamp))
+        }
         ("dayname" | "monthname", [Date | Timestamp | TimestampTz]) => kept(LogicalType::Varchar),
         ("last_day", [Date | Timestamp | TimestampTz]) => kept(Date),
         ("nanosecond" | "epoch_ns", [TimestampNs]) => kept(BigInt),
@@ -2383,6 +2434,21 @@ fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
     Error::binder(message)
 }
 
+/// The functions that read something off a moment, or read a moment out of text, and take nothing
+/// but the types `temporal` names.
+const READ_OFF: &[&str] = &[
+    "dayname",
+    "monthname",
+    "last_day",
+    "nanosecond",
+    "epoch_us",
+    "epoch_ns",
+    "strftime",
+    "strptime",
+    "try_strptime",
+    "time_bucket",
+];
+
 /// What the reference prints under `Candidate functions:`, per function, byte for byte.
 ///
 /// Copied off the pinned binary rather than generated from [`TABLE`], because it is not derivable
@@ -2394,11 +2460,39 @@ fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
 ///
 /// A name missing from here gets the sentence with no block under it, which is what every function
 /// outside the string family does today.
-/// The functions that read something off a moment and take nothing but the types `temporal` names.
-const READ_OFF: &[&str] =
-    &["dayname", "monthname", "last_day", "nanosecond", "epoch_us", "epoch_ns", "strftime"];
-
 const CANDIDATES: &[(&str, &[&str])] = &[
+    (
+        "time_bucket",
+        &[
+            "time_bucket(col0 INTERVAL, col1 DATE) -> DATE",
+            "time_bucket(col0 INTERVAL, col1 DATE, col2 DATE) -> DATE",
+            "time_bucket(col0 INTERVAL, col1 DATE, col2 INTERVAL) -> DATE",
+            "time_bucket(col0 INTERVAL, col1 TIME) -> TIME",
+            "time_bucket(col0 INTERVAL, col1 TIME, col2 INTERVAL) -> TIME",
+            "time_bucket(col0 INTERVAL, col1 TIME, col2 TIME) -> TIME",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP) -> TIMESTAMP",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP, col2 INTERVAL) -> TIMESTAMP",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP, col2 TIMESTAMP) -> TIMESTAMP",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP WITH TIME ZONE) -> TIMESTAMP WITH TIME ZONE",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP WITH TIME ZONE, col2 INTERVAL) -> TIMESTAMP WITH TIME ZONE",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP WITH TIME ZONE, col2 TIMESTAMP WITH TIME ZONE) -> TIMESTAMP WITH TIME ZONE",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP WITH TIME ZONE, col2 VARCHAR) -> TIMESTAMP WITH TIME ZONE",
+        ],
+    ),
+    (
+        "strptime",
+        &[
+            "strptime(\"text\" VARCHAR, format VARCHAR) -> TIMESTAMP",
+            "strptime(\"text\" VARCHAR, format VARCHAR[]) -> TIMESTAMP",
+        ],
+    ),
+    (
+        "try_strptime",
+        &[
+            "try_strptime(\"text\" VARCHAR, format VARCHAR) -> TIMESTAMP",
+            "try_strptime(\"text\" VARCHAR, format VARCHAR[]) -> TIMESTAMP",
+        ],
+    ),
     // What reads a name or a count off a date, word for word the pin's lists.
     (
         "strftime",
@@ -4074,6 +4168,7 @@ mod tests {
                         arguments[0] = strings();
                     }
                     _ if entry.name == "strftime" => arguments[1] = LogicalType::Varchar,
+                    _ if entry.name == "time_bucket" => arguments[1] = LogicalType::Date,
                     Shape::Histogram if count == 2 => arguments[1] = strings(),
                     Shape::Bits => {
                         arguments = match entry.name {

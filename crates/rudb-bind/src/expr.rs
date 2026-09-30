@@ -945,6 +945,23 @@ impl Binder<'_> {
                 }
             }
         }
+        // `strptime` is the same, and a list of formats is taken apart one by one.
+        let reads = ["strptime", "try_strptime"]
+            .into_iter()
+            .find(|name| rudb_catalog::same_name(&written, name));
+        if let (Some(name), [_, format]) = (reads, bound.as_slice()) {
+            match fold::value_of(self.plan(), *format) {
+                Ok(Some(format)) => {
+                    rudb_kernels::strptime::Formats::from_value(&format)?;
+                }
+                _ => {
+                    return Err(Error::binder(format!(
+                        "The \"format\" argument in function \"{name}\" must be a constant \
+                         expression"
+                    )));
+                }
+            }
+        }
         self.call(&written, bound)
     }
 
@@ -1636,6 +1653,14 @@ impl Binder<'_> {
     fn narrowed_part(&self, name: &str, args: &[ExprRef], returns: LogicalType) -> LogicalType {
         if matches!(name, "round" | "trunc" | "round_even") {
             return self.narrowed_scale(args, returns);
+        }
+        if matches!(name, "strptime" | "try_strptime") {
+            let Some(&format) = args.get(1) else { return returns };
+            let Ok(Some(format)) = fold::value_of(self.plan(), format) else { return returns };
+            return match rudb_kernels::strptime::Formats::from_value(&format) {
+                Ok(Some(formats)) => formats.returns(),
+                _ => returns,
+            };
         }
         if name != "date_part" {
             return returns;

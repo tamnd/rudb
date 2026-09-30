@@ -162,6 +162,13 @@ fn run<V: AsRef<Vector>>(
             return Ok(vector);
         }
     }
+    if matches!(name, "strptime" | "try_strptime") {
+        let refs: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
+        let strict = name == "strptime";
+        if let Some(vector) = crate::strptime::vectorized(&refs, returns, strict, rows)? {
+            return Ok(vector);
+        }
+    }
     // The one call whose answer is how its argument is stored rather than what it says, so it is
     // answered off the vector before anything reads a value out of it as a string.
     if let ("enum_code", [only]) = (name, args) {
@@ -4117,6 +4124,10 @@ pub fn call_values(
         }
         ("epoch_ms", [when]) if *returns == LogicalType::BigInt => datetime::read_off(name, when),
         ("strftime", [left, right]) => crate::strftime::value(left, right),
+        ("time_bucket", [_, _] | [_, _, _]) => crate::timebucket::value(args),
+        ("strptime" | "try_strptime", [text, format]) => {
+            crate::strptime::value(text, format, returns, name == "strptime")
+        }
         ("epoch_ms", [millis]) => made_timestamp_value(millis),
         ("array_extract", [target, index]) => subscript::extract(target, index),
         ("array_slice", [target, begin, end]) => subscript::slice(target, begin, end, None),
