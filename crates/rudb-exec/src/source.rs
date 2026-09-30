@@ -37,7 +37,7 @@ use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
 use crate::prepared::{Prepared, Scratch};
 use crate::register::compaction;
 use crate::schema::Schema;
-use crate::sideways::{Keys, Sideways};
+use crate::sideways::{Domain, Keys, Sideways};
 use crate::stream::{later_passes, marking_pays};
 use crate::table::{Across, hash};
 
@@ -1543,7 +1543,12 @@ impl<'a> Scan<'a> {
     ///
     /// Past one survivor in [`SPARSE_READ`] rows the part is read whole, because decoding at a
     /// position costs more than decoding in a run and a part that keeps many rows is closer to the
-    /// run.
+    /// run. The exception is a part a join's bitmap can cut further on one column, see
+    /// [`Self::first_bitmap`]. That column is read at the rows alone and tested, and the other
+    /// columns are read at what the test kept. On TPC-H q05 the orders of one year keep about one
+    /// `lineitem` row in seven, the suppliers of one region keep one in five of those, and reading
+    /// the part whole decoded every order key and gathered four columns at the first set of rows to
+    /// keep a fifth of them.
     fn read_reduced(&self, at: usize, out: &mut Chunk) -> Result<bool> {
         let Some((rows, first)) = self.reduced(at).filter(|(rows, _)| !rows.is_full()) else {
             return Ok(false);
@@ -1551,10 +1556,26 @@ impl<'a> Scan<'a> {
         let len = self.table.rows().chunk_len(at)?;
         // Counted before the offsets are written down, since a part past the line reads whole and
         // would throw them away.
-        if rows.count_in(first, len).saturating_mul(SPARSE_READ) > len {
-            return Ok(false);
+        let bitmap = if rows.count_in(first, len).saturating_mul(SPARSE_READ) > len {
+            let Some(bitmap) = self.first_bitmap() else { return Ok(false) };
+            Some(bitmap)
+        } else {
+            None
+        };
+        let mut positions = rows.offsets_in(first, len);
+        if let Some((_, column, domain, paying)) = bitmap {
+            let keys = self.table.rows().read_rows(at, &[column], &positions)?;
+            let kept = domain.kept(keys.column(0)?, positions.len(), &mut Vec::new());
+            paying.saw(positions.len(), kept.count());
+            if kept.count() < positions.len() {
+                positions =
+                    kept.indices().into_iter().map(|index| positions[index as usize]).collect();
+            }
+            if positions.is_empty() {
+                *out = Chunk::empty(&self.schema.types());
+                return Ok(true);
+            }
         }
-        let positions = rows.offsets_in(first, len);
         let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
         let read = self.table.rows().read_rows(at, &projected, &positions)?;
         let kept = positions.len();
@@ -1573,8 +1594,32 @@ impl<'a> Scan<'a> {
         }
         *out = Chunk::with_rows(held, kept)?;
         self.apply_reduced(at, None, out, false)?;
-        self.sift(out)?;
+        self.sift_exact_but(out, bitmap.map(|(sideways, ..)| sideways))?;
+        self.sift_hashed(out)?;
         Ok(true)
+    }
+
+    /// The first bitmap [`Self::sift_exact`] would test a chunk against, with the handoff it came
+    /// from, the stored column it tests in the table's numbering and the count it answers to.
+    ///
+    /// `None` when there is none, or when the one the chunk would be tested against first is on a
+    /// column the scan makes up rather than reads.
+    fn first_bitmap(&self) -> Option<(&Arc<Sideways<'a>>, usize, &Domain, &Paying)> {
+        let own = self.sideways.iter().map(|sideways| (sideways, &self.paying));
+        let handoffs = own.chain(self.also.iter().map(|(sideways, paying)| (sideways, paying)));
+        for (sideways, paying) in handoffs {
+            let own = self.sideways.as_ref().is_some_and(|own| Arc::ptr_eq(own, sideways));
+            let domain = sideways
+                .domain(self.index)
+                .or_else(|| if own { None } else { sideways.spare(self.index) });
+            let Some((place, domain)) = domain else { continue };
+            if !paying.worth() {
+                continue;
+            }
+            let column = self.columns.get(place).copied().flatten()?;
+            return Some((sideways, column, domain, paying));
+        }
+        None
     }
 
     /// Runs the filter this scan took off the operator above it and the joins' runtime filters over
@@ -1929,6 +1974,12 @@ impl<'a> Scan<'a> {
     /// The bitmaps half of [`Self::sift`], which is cheap enough to go in front of the pushed
     /// filter. See [`Self::narrow_read`].
     fn sift_exact(&self, chunk: &mut Chunk) -> Result<()> {
+        self.sift_exact_but(chunk, None)
+    }
+
+    /// [`Self::sift_exact`] with the bitmap of `done` left out, for a chunk it was already tested
+    /// against as it was read. See [`Self::read_reduced`].
+    fn sift_exact_but(&self, chunk: &mut Chunk, done: Option<&Arc<Sideways<'a>>>) -> Result<()> {
         let handoffs = || {
             let own = self.sideways.iter().map(|sideways| (sideways, &self.paying));
             own.chain(self.also.iter().map(|(sideways, paying)| (sideways, paying)))
@@ -1940,6 +1991,9 @@ impl<'a> Scan<'a> {
         // going in front of it, see `Found::domain`.
         let mut block = Vec::new();
         for (sideways, paying) in handoffs() {
+            if done.is_some_and(|done| Arc::ptr_eq(done, sideways)) {
+                continue;
+            }
             // A join above that is not this scan's own placed its answer as exact rows this scan
             // does not read, so it is tested by the bitmap kept beside them.
             let own = self.sideways.as_ref().is_some_and(|own| Arc::ptr_eq(own, sideways));
