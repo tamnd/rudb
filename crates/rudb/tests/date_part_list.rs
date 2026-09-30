@@ -165,3 +165,24 @@ fn a_moment_without_a_zone_is_no_distance_from_utc() {
         assert!(said.contains(expected), "{sql}: {said}");
     }
 }
+
+#[test]
+fn a_date_truncated_past_the_end_of_the_timestamps_is_refused() {
+    assert_eq!(answered("date_trunc('year', DATE '290000-05-01')"), "290000-01-01 00:00:00");
+    assert_eq!(
+        answered("date_trunc('month', DATE 'infinity'), date_trunc('month', DATE '-infinity')"),
+        "infinity|-infinity"
+    );
+    for sql in [
+        "date_trunc('microseconds', DATE '5000000-01-01')",
+        "datetrunc('milliseconds', DATE '-2005205-7-28')",
+        "datetrunc('year', DATE '-2005205-7-28')",
+        "date_trunc('month', d) FROM (VALUES (DATE '1992-01-01'), (DATE '5000000-01-01')) t(d)",
+    ] {
+        let said = refused(sql);
+        assert!(
+            said.contains("Conversion Error: Date and time not in timestamp range"),
+            "{sql}: {said}"
+        );
+    }
+}

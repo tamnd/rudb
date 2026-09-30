@@ -3580,7 +3580,7 @@ fn date_runs<A: Fn(usize) -> usize>(
         (LogicalType::Date, Data::Int32(days), true) if *returns == LogicalType::Timestamp => {
             let mut out = vec![0i64; rows];
             let validity = over_valid(rows, base, |index| {
-                out[index] = cast::stamp_of_day(part.truncate_days(days[at(index)])?);
+                out[index] = datetime::checked_midnight(part.truncate_days(days[at(index)])?)?;
                 Ok(())
             })?;
             finish(returns, Data::Int64(out.into()), validity)
@@ -3674,14 +3674,15 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
         Value::Timestamp(micros) | Value::TimestampTz(micros) => datetime::infinite_stamp(*micros),
         _ => false,
     };
-    // A date truncated for a timestamp answer is its midnight, the infinities included.
+    // A date truncated for a timestamp answer is its midnight, the infinities included, and a
+    // midnight past the end of the timestamps is refused.
     let midnight = |days: i32| match returns {
-        LogicalType::Timestamp => Value::Timestamp(cast::stamp_of_day(days)),
-        _ => Value::Date(days),
+        LogicalType::Timestamp => datetime::checked_midnight(days).map(Value::Timestamp),
+        _ => Ok(Value::Date(days)),
     };
     if infinite {
         return Ok(match (name == "date_trunc", when) {
-            (true, Value::Date(days)) => midnight(*days),
+            (true, Value::Date(days)) => midnight(*days)?,
             (true, _) => when.clone(),
             (false, _) => Value::Null,
         });
@@ -3729,7 +3730,7 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
         (false, Value::Interval { months, days, micros }) => {
             part.of_an_interval(spelling)?.of_interval(*months, *days, *micros).map(Value::BigInt)
         }
-        (true, Value::Date(days)) => part.truncate_days(*days).map(midnight),
+        (true, Value::Date(days)) => part.truncate_days(*days).and_then(midnight),
         (true, Value::Timestamp(micros)) => part.truncate_micros(*micros).map(Value::Timestamp),
         // The truncation comes back zoned, because `date_trunc` answers the type it was handed and
         // the plan holds that type next to the value. Which moment it lands on is the calendar's

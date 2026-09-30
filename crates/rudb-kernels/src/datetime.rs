@@ -929,6 +929,18 @@ pub(crate) fn infinite_stamp(stamp: i64) -> bool {
     stamp == i64::MAX || stamp == -i64::MAX
 }
 
+/// A date as the timestamp at its midnight, the infinities kept, or the pin's refusal when the
+/// midnight is past either end of the timestamps.
+pub(crate) fn checked_midnight(days: i32) -> Result<i64> {
+    if infinite_day(days) {
+        return Ok(cast::stamp_of_day(days));
+    }
+    i64::from(days)
+        .checked_mul(MICROS_PER_DAY)
+        .filter(|stamp| !infinite_stamp(*stamp))
+        .ok_or_else(not_in_range)
+}
+
 fn not_in_range() -> Error {
     Error::conversion("Date and time not in timestamp range")
 }
