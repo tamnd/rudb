@@ -639,17 +639,21 @@ impl<'a> Feed<'a> {
             let tables = std::iter::once(Ok(mine))
                 .chain(workers.iter().map(|w| w.table(g.table).ok_or_else(|| gone(g.table))))
                 .collect::<Result<Vec<&GroupTable>>>()?;
-            // A worker's rows are already in a lane a part, which the part reads in order.
+            // A worker's rows are already in lanes, which a part reads in order, as many lanes a
+            // part as there are more lanes than parts. Each part costs a table and a chunk of its
+            // own, which with few groups a lane was more than the groups.
             let laned = tables.iter().all(|t| t.laned());
             let (bits, splits) = if laned {
-                (LANE_BITS, Vec::new())
+                (bits.min(LANE_BITS), Vec::new())
             } else {
                 (bits, pieces(threads, tables.len(), |at| tables[at].split(bits))?)
             };
             let layout = mine.layout().clone();
+            let each = 1 << LANE_BITS.saturating_sub(bits);
             let chunks = pieces(threads, 1 << bits, |part| {
+                let lanes = part * each..(part + 1) * each;
                 let most = if laned {
-                    tables.iter().map(|t| t.lane_len(part)).sum()
+                    lanes.clone().map(|l| tables.iter().map(|t| t.lane_len(l)).sum::<usize>()).sum()
                 } else {
                     splits.iter().map(|s| s[part].len()).sum()
                 };
@@ -659,12 +663,14 @@ impl<'a> Feed<'a> {
                     .filter(|_| laned)
                     .and_then(|(at, more, count)| finish::Rising::new(at, more, count));
                 if laned {
-                    for other in &tables {
-                        table.absorb_lane(other, part, fold, |gid, row| {
-                            if let Some(r) = &mut rising {
-                                r.offer(gid, row);
-                            }
-                        });
+                    for lane in lanes {
+                        for other in &tables {
+                            table.absorb_lane(other, lane, fold, |gid, row| {
+                                if let Some(r) = &mut rising {
+                                    r.offer(gid, row);
+                                }
+                            });
+                        }
                     }
                 } else {
                     for (other, split) in tables.iter().zip(&splits) {
