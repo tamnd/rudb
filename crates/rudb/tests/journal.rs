@@ -376,3 +376,54 @@ fn a_commit_that_waits_for_nothing_loses_at_most_the_tail_of_the_log() {
     db.close().expect("closes");
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn visibility_is_a_setting_that_reads_back_and_refuses_what_it_is_not() {
+    let db = Database::new();
+    let read = |db: &Database| db.setting("visibility").expect("reads back");
+    assert_eq!(read(&db), "durable");
+    db.execute("SET visibility = 'COMMITTED'").expect("sets");
+    assert_eq!(read(&db), "committed");
+    let error = db.execute("SET visibility = 'soon'").expect_err("refused");
+    assert!(error.to_string().contains("visibility is durable or committed"), "{error}");
+    db.execute("RESET visibility").expect("resets");
+    assert_eq!(read(&db), "durable");
+}
+
+/// Under `visibility = committed` a commit lets go of the writer lock before it waits for its
+/// sync, so commits from several connections share one. Every one of them is still durable when
+/// it returns, so a crash after they all returned loses none.
+#[test]
+fn commits_from_several_connections_that_share_a_sync_all_survive_a_crash() {
+    let path = path("group");
+    let db = open(&path);
+    db.execute("SET visibility = 'committed'").expect("sets");
+    db.execute("CREATE TABLE t (id INTEGER, name VARCHAR)").expect("creates");
+    db.execute("INSERT INTO t VALUES (0, 'zero')").expect("inserts");
+    let writers: Vec<_> = (0..8)
+        .map(|writer| {
+            let connection = db.connect();
+            std::thread::spawn(move || {
+                for row in 0..100 {
+                    let id = 1 + writer * 100 + row;
+                    connection
+                        .execute(&format!("INSERT INTO t VALUES ({id}, 'row {id}')"))
+                        .expect("inserts");
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().expect("the writer finished");
+    }
+    assert!(segments(&path) > 0, "the inserts went to the log");
+    crash(db);
+    let db = open(&path);
+    assert_eq!(
+        rows(&db, "SELECT count(*), count(DISTINCT id), sum(id) FROM t"),
+        vec![vec![Value::BigInt(801), Value::BigInt(801), Value::HugeInt(320_400)]]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(wal(&path));
+}

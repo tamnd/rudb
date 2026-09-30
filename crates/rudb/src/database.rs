@@ -26,7 +26,7 @@ use crate::connection::{Connection, single};
 use crate::journal::{Change, Journal, Replayed};
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
-use crate::settings::{COMPILED_ENGINE, Settings};
+use crate::settings::{COMPILED_ENGINE, Settings, Visibility};
 use crate::{foreign, upsert};
 
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
@@ -1501,10 +1501,10 @@ impl Database {
     /// What the closure changed checkpoints when it returns, since there is no telling what it was.
     /// A checkpoint that fails is tried again by the next commit.
     pub fn with_catalog_mut<T>(&self, write: impl FnOnce(&mut Catalog) -> T) -> T {
-        let _writing = self.shared.writing();
+        let writing = self.shared.writing();
         self.shared.unlogged();
         let written = write(&mut self.shared.write());
-        let _ = self.shared.settle();
+        let _ = self.shared.settle(writing);
         written
     }
 
@@ -1520,13 +1520,13 @@ impl Database {
     /// table already exists, or if two of the columns have the same name.
     pub fn create_table(&self, name: &str, columns: Vec<Field>) -> Result<()> {
         let parts: Vec<&str> = name.split('.').collect();
-        let _writing = self.shared.writing();
+        let writing = self.shared.writing();
         self.shared.unlogged();
         let created = {
             let mut catalog = self.shared.write();
             catalog.resolve_for_create(&parts).and_then(|name| catalog.create_table(name, columns))
         };
-        let settled = self.shared.settle();
+        let settled = self.shared.settle(writing);
         created.and(settled)
     }
 
@@ -1537,13 +1537,13 @@ impl Database {
     /// If the name does not resolve or the table does not exist.
     pub fn drop_table(&self, name: &str) -> Result<()> {
         let parts: Vec<&str> = name.split('.').collect();
-        let _writing = self.shared.writing();
+        let writing = self.shared.writing();
         self.shared.unlogged();
         let dropped = {
             let mut catalog = self.shared.write();
             catalog.resolve(&parts).and_then(|name| catalog.drop_table(&name))
         };
-        let settled = self.shared.settle();
+        let settled = self.shared.settle(writing);
         dropped.and(settled)
     }
 
@@ -1559,9 +1559,9 @@ impl Database {
     /// If the name does not resolve, if a row is not as wide as the table, or if a value cannot be
     /// converted to its column's type.
     pub fn append(&self, name: &str, rows: &[Vec<Value>]) -> Result<()> {
-        let _writing = self.shared.writing();
+        let writing = self.shared.writing();
         let appended = self.append_held(name, rows);
-        let settled = self.shared.settle();
+        let settled = self.shared.settle(writing);
         appended.and(settled)
     }
 
@@ -1625,9 +1625,9 @@ impl Database {
     /// Writes chunks an [`Appender`](crate::Appender) built, the way an `INSERT` of the same rows
     /// would: `CHECK`, `NOT NULL`, keys and foreign keys, then the log, then the commit.
     pub(crate) fn append_chunks(&self, name: &QualifiedName, chunks: Vec<Chunk>) -> Result<()> {
-        let _writing = self.shared.writing();
+        let writing = self.shared.writing();
         let appended = self.shared.append_chunks(name, chunks);
-        let settled = self.shared.settle();
+        let settled = self.shared.settle(writing);
         appended.and(settled)
     }
 
@@ -3286,7 +3286,7 @@ impl Shared {
         if !self.inner.writable {
             return None;
         }
-        let _writing = self.writing();
+        let writing = self.writing();
         if self.open().as_ref().is_some_and(|open| open.aborted || open.read_only) {
             return None;
         }
@@ -3341,7 +3341,7 @@ impl Shared {
             direct.found.keep(catalog.generation(), name, targets);
         }
         drop(catalog);
-        let settled = self.settle();
+        let settled = self.settle(writing);
         Some(result.and_then(|result| settled.map(|()| result)))
     }
 
@@ -3359,8 +3359,10 @@ impl Shared {
     /// database, which writes what changed into the file along with the new cut. A statement that
     /// failed comes here too, because what it did before it failed is not undone.
     ///
-    /// Called with the writer lock held, so nothing commits between the statement and this.
-    fn settle(&self) -> Result<()> {
+    /// Takes the writer lock the statement ran under, so nothing commits between the statement and
+    /// this. Under `visibility = committed` the lock is let go once the block is queued and before
+    /// the wait, so the next statement's block can join the same sync.
+    fn settle(&self, writing: MutexGuard<'_, ()>) -> Result<()> {
         if self.transacting() {
             return Ok(());
         }
@@ -3372,8 +3374,34 @@ impl Shared {
         let Some(held) = journal.as_mut() else { return Ok(()) };
         // A block the lane refused is followed by the checkpoint, which makes the same rows
         // durable the slow way.
-        if !held.needs_checkpoint() && held.commit(self.inner.settings.commit_sync()).is_ok() {
-            return Ok(());
+        if !held.needs_checkpoint() {
+            match held.enqueue(self.inner.settings.commit_sync()) {
+                Ok(None) => return Ok(()),
+                Ok(Some(pending)) => {
+                    if self.inner.settings.visibility() == Visibility::Committed {
+                        drop(journal);
+                        drop(catalog);
+                        drop(writing);
+                        if pending.wait().is_ok() {
+                            return Ok(());
+                        }
+                        let _writing = self.writing();
+                        let mut catalog = self.write();
+                        let mut journal = self.journal();
+                        return persist_main(
+                            path,
+                            &mut catalog,
+                            &self.inner.pages,
+                            &mut journal,
+                            false,
+                        );
+                    }
+                    if pending.wait().is_ok() {
+                        return Ok(());
+                    }
+                }
+                Err(_) => {}
+            }
         }
         persist_main(path, &mut catalog, &self.inner.pages, &mut journal, false)
     }
@@ -3936,11 +3964,11 @@ impl Shared {
         cancel: &Cancel,
         parse_ns: u64,
     ) -> Result<QueryResult> {
-        let _writing = self.writing();
+        let writing = self.writing();
         let result = kept(sql, parse_ns, |noted| {
             self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
         });
-        let settled = self.settle();
+        let settled = self.settle(writing);
         let result = result?;
         settled?;
         Ok(result)

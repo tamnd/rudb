@@ -73,6 +73,22 @@ fn committed_blocks_read_back_in_order() {
 }
 
 #[test]
+fn blocks_queued_before_a_wait_share_its_one_sync() {
+    let sim = SimFilesystem::new();
+    let lane = open(&sim, Options { segment_bytes: 1 << 16, ..options(CommitSync::Full) });
+    let before = lane.stats().syncs;
+    let ends: Vec<u64> = (0..5).map(|n| lane.enqueue(&block(n)).expect("queued")).collect();
+    assert_eq!(lane.durable(), 0, "nothing is written until somebody waits");
+    lane.settle(ends[4], CommitSync::Full).expect("settles");
+    assert_eq!(lane.stats().syncs - before, 1, "one sync covers every queued block");
+    for &end in &ends {
+        assert_eq!(lane.settle(end, CommitSync::Full).expect("already durable"), end);
+    }
+    assert_eq!(lane.stats().syncs - before, 1, "a block already durable waits for nothing");
+    assert_eq!(txns(&sim), (0..5).collect::<Vec<_>>());
+}
+
+#[test]
 fn a_full_segment_is_synced_before_the_next_one_gets_a_record() {
     let sim = SimFilesystem::new();
     let lane = open(&sim, options(CommitSync::Os));
