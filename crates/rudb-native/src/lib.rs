@@ -8033,13 +8033,18 @@ impl Reader {
                 }
                 held.iter_mut().zip(one).for_each(|(held, one)| *held |= one);
             }
-            let valid = |row: usize| mask.is_none_or(|mask| mask[row / 8] >> (row % 8) & 1 == 1);
-            Ok(Some(
-                (0..rows)
-                    .filter(|&row| held[row] != negated && valid(row))
-                    .map(|row| row as u32)
-                    .collect(),
-            ))
+            // Every row is written and the count moves only past the kept ones, so there is no
+            // branch a row. With `NOT LIKE` nearly every row is kept, and a filtered collect paid a
+            // push and a guessed branch for each of them on q13.
+            let mut kept = vec![0_u32; rows];
+            let mut count = 0;
+            for (row, &held) in held.iter().enumerate() {
+                let valid = mask.is_none_or(|mask| mask[row / 8] >> (row % 8) & 1 == 1);
+                kept[count] = row as u32;
+                count += usize::from((held != negated) & valid);
+            }
+            kept.truncate(count);
+            Ok(Some(kept))
         })
     }
 
