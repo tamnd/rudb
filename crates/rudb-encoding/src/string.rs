@@ -347,6 +347,13 @@ pub fn holds_in_where(
     Ok(Some(held))
 }
 
+/// Whether [`decode_flat_at`] reads a few values of this chunk for less than decoding all of it,
+/// which only a compressed chunk does. Every other kind is decoded whole and picked from.
+#[must_use]
+pub fn pointed(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&Kind::Fsst.tag())
+}
+
 /// Decodes only the values at `positions` of a chunk written by [`encode`], in that order.
 ///
 /// A compressed chunk keeps every run's length, so the runs that are not wanted are stepped over

@@ -13630,7 +13630,14 @@ fn decode_at(
 /// The body of an integer cascade page, past the codec, the validity flag and the mask a flag of
 /// 2 has, or `None` for a page of another codec.
 fn cascade_body(rows: usize, bytes: &[u8]) -> Option<&[u8]> {
-    if bytes.first() != Some(&5) {
+    body_of(5, rows, bytes)
+}
+
+/// The body of a page of codec `codec`, past the codec, the validity flag and the mask a flag of 2
+/// has, or `None` for a page of another codec. Integer cascades and compressed text lay their
+/// pages out this way.
+fn body_of(codec: u8, rows: usize, bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.first() != Some(&codec) {
         return None;
     }
     bytes.get(2 + if bytes.get(1) == Some(&2) { rows.div_ceil(8) } else { 0 }..)
@@ -13639,17 +13646,18 @@ fn cascade_body(rows: usize, bytes: &[u8]) -> Option<&[u8]> {
 /// What [`decode_at`] costs to read `positions` of a part of `rows` rows, in rows of decoding the
 /// part whole, which is what a read at positions adds to the count [`PartSlot`] keeps.
 ///
-/// A compressed string finds a row by decompressing the block it is in, which costs about what the
-/// row costs in a whole read. An integer in packed units found on its own costs about
-/// [`SPARSE_RENT`] times what it costs when its unit is unpacked whole. Everything else costs the
-/// whole part: a page [`decode_at`] decodes whole and gathers from, and a chunk of runs, which
-/// walks every run to find a row. Counting all of those as one row a position was what kept JOB
-/// 20b walking the runs of `cast_info` and 31a expanding them on every warm run, since a read that
-/// paid for the whole part counted a few of its rows and the part was never held.
+/// An FSST compressed string decompresses only the rows it wants, which costs about what they cost
+/// in a whole read. An integer in packed units found on its own costs about [`SPARSE_RENT`] times
+/// what it costs when its unit is unpacked whole. Everything else costs the whole part: a page
+/// [`decode_at`] decodes whole and gathers from, a string chunk of any other kind, which
+/// [`string::decode_flat_at`] decodes whole, and a chunk of runs, which walks every run to find a
+/// row. Counting all of those as one row a position was what kept JOB 20b walking the runs of
+/// `cast_info` and 31a expanding them on every warm run, since a read that paid for the whole part
+/// counted a few of its rows and the part was never held.
 fn paid_at(rows: usize, bytes: &[u8], positions: &[u32]) -> usize {
     let wanted = positions.len();
     if bytes.first() == Some(&6) {
-        return wanted;
+        return if body_of(6, rows, bytes).is_some_and(string::pointed) { wanted } else { rows };
     }
     let pointed = cascade_body(rows, bytes).is_some_and(integer::pointed);
     if pointed && wanted.saturating_mul(SPARSE_RENT) <= rows {

@@ -533,12 +533,28 @@ pub fn unpack_unit_into<U: Copy>(
 /// If `width` exceeds 64, `index` is outside a full unit, or `input` is not the exact byte length
 /// of a full unit at that width.
 pub fn unpack_u64_at(input: &[u8], width: usize, index: usize) -> Result<u64> {
+    let mut value = 0;
+    unpack_u64_each(input, width, [index], |found| value = found)?;
+    Ok(value)
+}
+
+/// [`unpack_u64_at`] for many values of one unit, which hands `each` the value at each place of
+/// `indices` in turn.
+///
+/// The unit is checked once rather than once a value. A scan narrowed by a join reads a few rows of
+/// most units of a key column, and on JOB 6f the checks and the call a value were as much of the
+/// read as the loads and shifts that find the values.
+///
+/// # Errors
+///
+/// As [`unpack_u64_at`], for the first index outside a full unit.
+pub fn unpack_u64_each(
+    input: &[u8],
+    width: usize,
+    indices: impl IntoIterator<Item = usize>,
+    mut each: impl FnMut(u64),
+) -> Result<()> {
     check_width::<u64>(width)?;
-    if index >= VALUES {
-        return Err(Error::internal(format!(
-            "packed value {index} is outside a {VALUES} value unit"
-        )));
-    }
     let expected = packed_len::<u64>(width) * size_of::<u64>();
     if input.len() != expected {
         return Err(Error::internal(format!(
@@ -546,10 +562,20 @@ pub fn unpack_u64_at(input: &[u8], width: usize, index: usize) -> Result<u64> {
             input.len()
         )));
     }
-    if width == 0 {
-        return Ok(0);
+    for index in indices {
+        if index >= VALUES {
+            return Err(Error::internal(format!(
+                "packed value {index} is outside a {VALUES} value unit"
+            )));
+        }
+        each(if width == 0 { 0 } else { unit_value(input, width, index) });
     }
+    Ok(())
+}
 
+/// The value at `index` of a full unit `input` at `width` bits, which the callers have checked.
+#[inline]
+fn unit_value(input: &[u8], width: usize, index: usize) -> u64 {
     let lanes = <u64 as Packable>::LANES;
     let block = index / lanes;
     let lane = index % lanes;
@@ -567,7 +593,7 @@ pub fn unpack_u64_at(input: &[u8], width: usize, index: usize) -> Result<u64> {
         let high = word_at(input, ((word + 1) * lanes + lane) * size_of::<u64>());
         (low >> shift) | (high << (<u64 as Packable>::WIDTH - shift))
     };
-    Ok(bits & low_mask(width))
+    bits & low_mask(width)
 }
 
 /// How many bytes [`pack_tail`] writes for `count` values at `width` bits.

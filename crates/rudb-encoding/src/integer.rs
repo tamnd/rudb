@@ -432,7 +432,8 @@ pub fn pointed(bytes: &[u8]) -> bool {
             let word = |at: usize| {
                 bytes
                     .get(at..at + 4)
-                    .map(|four| u32::from_le_bytes(four.try_into().expect("four bytes")) as usize)
+                    .and_then(|four| <[u8; 4]>::try_from(four).ok())
+                    .map(|four| u32::from_le_bytes(four) as usize)
             };
             match (word(1), word(1 + 4 + 1)) {
                 (Some(rows), Some(runs)) => runs.saturating_mul(RLE_WALKED) <= rows,
@@ -1232,10 +1233,12 @@ fn decode_selected_chunk(reader: &mut Reader<'_>, positions: &[usize]) -> Result
                     out.extend(positions[from..upto].iter().map(|&position| unit[position - done]));
                 } else if wanted == VALUES {
                     let bytes = reader.bytes(bitpack::unit_len(width))?;
-                    for &position in &positions[from..upto] {
-                        let offset = bitpack::unpack_u64_at(bytes, width, position - done)?;
-                        out.push(value_from(offset, base));
-                    }
+                    bitpack::unpack_u64_each(
+                        bytes,
+                        width,
+                        positions[from..upto].iter().map(|&position| position - done),
+                        |offset| out.push(value_from(offset, base)),
+                    )?;
                 } else {
                     let bytes = reader.bytes(bitpack::tail_len(wanted, width))?;
                     for &position in &positions[from..upto] {
@@ -2217,6 +2220,30 @@ mod tests {
         let short = encode_only(Kind::Rle, &short).unwrap().expect("runs apply");
         assert!(pointed(&long));
         assert!(!pointed(&short));
+    }
+
+    #[test]
+    fn selected_rows_of_a_run_length_chunk_match_a_full_decode_however_many_are_wanted() {
+        let mut random = Random::new();
+        let mut values = Vec::new();
+        while values.len() < 8192 {
+            let length = 1 + (random.next() % 40) as usize;
+            let value = (random.next() % 1000) as i64 - 500;
+            values.extend(std::iter::repeat_n(value, length));
+        }
+        values.truncate(8192);
+        let bytes = encode_only(Kind::Rle, &values).unwrap().expect("runs apply");
+        for one_in in [1, 2, 7, 60, 900, 5000] {
+            let positions: Vec<usize> =
+                (0..8192).filter(|_| random.next() % one_in == 0).collect();
+            let expected: Vec<i64> = positions.iter().map(|&position| values[position]).collect();
+            assert_eq!(decode_selected(&bytes, &positions).unwrap(), expected, "one in {one_in}");
+        }
+        for position in [0, 1, 8190, 8191] {
+            assert_eq!(decode_selected(&bytes, &[position]).unwrap(), [values[position]]);
+        }
+        assert!(decode_selected(&bytes, &[3000, 5]).is_err());
+        assert!(decode_selected(&bytes, &[8192]).is_err());
     }
 
     #[test]
