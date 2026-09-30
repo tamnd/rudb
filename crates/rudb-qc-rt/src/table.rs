@@ -87,7 +87,13 @@ const LANE_ROWS: usize = 256;
 const FIRST_LANE_ROWS: usize = 16;
 
 /// An odd number with its bits spread out, the golden ratio in fixed point.
-const SPREAD: u64 = 0x9e37_79b9_7f4a_7c15;
+pub const SPREAD: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// The lane of a row with hash `hash`, from the top bits of the hash times [`SPREAD`], which
+/// compiled code that appends to a lane works out the same way.
+fn lane_of(hash: u64) -> usize {
+    (hash.wrapping_mul(SPREAD) >> (64 - LANE_BITS)) as usize
+}
 
 /// One piece of the work of [`GroupTable::join_with`].
 pub type Job<'a> = Box<dyn FnOnce() + Send + 'a>;
@@ -123,6 +129,11 @@ pub struct GroupTable {
     /// folds each lane of every worker as one part and reads its rows in the order they were made.
     /// Empty when the rows go in `pages`. A row in a lane starts with its hash and not its group id.
     lanes: Vec<Lane>,
+    /// For each lane, the address of the next row of its last page and the address past that
+    /// page, both zero before its first page. Compiled code that makes rows without looking
+    /// appends to a lane through these, and the table works out how full the last page is from
+    /// them.
+    tails: Vec<[u64; 2]>,
     /// How many groups a table with lanes made before its slots were last emptied, which it no
     /// longer has an address for.
     gone: usize,
@@ -139,16 +150,12 @@ pub struct GroupTable {
     edges: Vec<usize>,
 }
 
-/// The rows of one lane.
+/// The rows of one lane. Where the next row goes is in the table's `tails`.
 #[derive(Debug, Default)]
 struct Lane {
     pages: Vec<Box<[u8]>>,
-    /// How many rows of the last page are taken.
-    fill: usize,
     /// How many rows the last page holds, zero before the first.
     room: usize,
-    /// The address of the next row of the last page.
-    next: usize,
 }
 
 /// The groups the tables of a limited aggregate's workers agree on: the first keys any of them
@@ -199,6 +206,7 @@ impl GroupTable {
             since: 0,
             limited: None,
             lanes: Vec::new(),
+            tails: Vec::new(),
             gone: 0,
             asked: 0,
             blind: 0,
@@ -234,6 +242,7 @@ impl GroupTable {
     /// with a distinct set keeps its rows in pages.
     pub fn lanes(&mut self) {
         self.lanes = (0..1 << LANE_BITS).map(|_| Lane::default()).collect();
+        self.tails = vec![[0; 2]; 1 << LANE_BITS];
     }
 
     /// Whether the rows are in lanes.
@@ -248,8 +257,18 @@ impl GroupTable {
         self.lanes.get(lane).map_or(0, |l| {
             let rows = l.pages.iter().map(|p| p.len() / self.row_size).sum::<usize>();
             let last = l.pages.last().map_or(0, |p| p.len() / self.row_size);
-            rows - last + l.fill
+            rows - last + self.lane_fill(lane)
         })
+    }
+
+    /// How many rows of the last page of lane `lane` are taken.
+    fn lane_fill(&self, lane: usize) -> usize {
+        match (self.lanes.get(lane).and_then(|l| l.pages.last()), self.tails.get(lane)) {
+            (Some(page), Some(&[next, _])) => {
+                (next as usize - page.as_ptr().addr()) / self.row_size
+            }
+            _ => 0,
+        }
     }
 
     /// Makes a group only for the keys of `agreed`, which the other tables of the same aggregate
@@ -441,6 +460,33 @@ impl GroupTable {
         ]
     }
 
+    /// What compiled code needs to make rows without looking itself, while the table does: the
+    /// address of the lanes' [`tails`](GroupTable::tails) and how many more rows it may make that
+    /// way. Both zero when it may not, which is when the table looks for keys, has an [`Agreed`]
+    /// set, starts its accumulators at anything but zero, or has a string key, whose long strings
+    /// have to be copied into the heap. The words are good until the next insert.
+    #[must_use]
+    pub fn blind_words(&self) -> [u64; 2] {
+        if self.blind == 0
+            || self.lanes.is_empty()
+            || self.limited.is_some()
+            || self.layout.keys.iter().any(|f| f.text)
+            || self.layout.init.iter().any(|&b| b != 0)
+        {
+            return [0; 2];
+        }
+        [self.tails.as_ptr().expose_provenance() as u64, self.blind as u64]
+    }
+
+    /// Takes in the rows compiled code made without looking through the last
+    /// [`blind_words`](GroupTable::blind_words), when `left` is how many more it said it may still
+    /// make. The rows are already in their lanes.
+    pub fn made_blind(&mut self, left: u64) {
+        let made = self.blind.saturating_sub(left as usize);
+        self.blind -= made;
+        self.gone += made;
+    }
+
     /// Counts `n` keys compiled code found through [`published`](GroupTable::published) words,
     /// which a table with lanes weighs against the groups it makes.
     pub fn found(&mut self, n: usize) {
@@ -604,8 +650,9 @@ impl GroupTable {
         if self.slots.is_empty() {
             self.slots = vec![0; 64];
         }
+        let fill = other.lane_fill(lane);
         for (i, page) in from.pages.iter().enumerate() {
-            let rows = if i == last { from.fill } else { page.len() / other.row_size };
+            let rows = if i == last { fill } else { page.len() / other.row_size };
             let base = page.as_ptr().addr();
             let at = |r: usize| base + r * other.row_size;
             for r in 0..rows {
@@ -651,9 +698,9 @@ impl GroupTable {
         let mut pages = std::mem::take(&mut self.pages);
         for lane in &mut self.lanes {
             pages.append(&mut lane.pages);
-            lane.fill = 0;
             lane.room = 0;
         }
+        self.tails.fill([0; 2]);
         pages
     }
 
@@ -713,6 +760,7 @@ impl GroupTable {
             since: 0,
             limited: None,
             lanes: Vec::new(),
+            tails: Vec::new(),
             gone: 0,
             asked: 0,
             blind: 0,
@@ -835,19 +883,19 @@ impl GroupTable {
     /// the lane of `hash`.
     fn room(&mut self, hash: u64) -> usize {
         if !self.lanes.is_empty() {
-            let at = (hash.wrapping_mul(SPREAD) >> (64 - LANE_BITS)) as usize;
-            let lane = &mut self.lanes[at];
-            if lane.fill == lane.room {
+            let at = lane_of(hash);
+            let tail = &mut self.tails[at];
+            if tail[0] == tail[1] {
+                let lane = &mut self.lanes[at];
                 let rows = (lane.room * 2).clamp(FIRST_LANE_ROWS, LANE_ROWS);
                 let mut page = vec![0u8; rows * self.row_size].into_boxed_slice();
-                lane.next = page.as_mut_ptr().expose_provenance();
+                let first = page.as_mut_ptr().expose_provenance() as u64;
+                *tail = [first, first + page.len() as u64];
                 lane.pages.push(page);
                 lane.room = rows;
-                lane.fill = 0;
             }
-            let address = lane.next;
-            lane.next += self.row_size;
-            lane.fill += 1;
+            let address = tail[0] as usize;
+            tail[0] += self.row_size as u64;
             return address;
         }
         if self.fill == ROWS_PER_PAGE || self.pages.is_empty() {
@@ -1762,6 +1810,73 @@ mod tests {
         counts.sort_unstable();
         let want: Vec<(u64, u64)> = (0..500).map(|v| (v, if v < 100 { 4 } else { 1 })).collect();
         assert_eq!(counts, want);
+    }
+
+    #[test]
+    fn rows_appended_through_the_blind_words_count_as_groups_and_merge_like_inserted_ones() {
+        let layout = Layout {
+            keys: vec![KeyField { offset: 0, width: 8, text: false }],
+            key_size: 9,
+            init: vec![0; 8],
+        };
+        let acc = Layout::acc_offset(9) as usize;
+        let mut heap = Heap::new();
+        let mut t = GroupTable::new(layout.clone());
+        t.cap(100);
+        t.lanes();
+        assert_eq!(t.blind_words(), [0; 2]);
+        let mut words = [0u64; 2];
+        let mut appended = 0;
+        for v in 0..2000u64 {
+            let hash = v * 7;
+            // Append the way compiled code does, and insert when it may not.
+            let lane = lane_of(hash);
+            let row = if words[1] != 0 && t.tails[lane][0] != t.tails[lane][1] {
+                let tail = &mut t.tails[lane];
+                let row = tail[0] as usize;
+                tail[0] += t.row_size as u64;
+                words[1] -= 1;
+                appended += 1;
+                // SAFETY: the row is the next of its lane's page, which came zeroed.
+                unsafe {
+                    std::ptr::with_exposed_provenance_mut::<u64>(row).write_unaligned(hash);
+                    std::ptr::with_exposed_provenance_mut::<u64>(row + 8).write_unaligned(v);
+                }
+                row
+            } else {
+                if words[0] != 0 {
+                    t.made_blind(words[1]);
+                }
+                let k = v.to_le_bytes().into_iter().chain([0]).collect::<Vec<_>>();
+                // SAFETY: the key is alive and has no strings.
+                let row = unsafe { t.insert(k.as_ptr().expose_provenance(), hash, &mut heap) };
+                words = t.blind_words();
+                row
+            };
+            // SAFETY: the row is the table's.
+            unsafe {
+                let count = std::ptr::with_exposed_provenance_mut::<u64>(row + acc);
+                count.write_unaligned(count.read_unaligned() + 1);
+            }
+        }
+        if words[0] != 0 {
+            t.made_blind(words[1]);
+        }
+        assert!(appended > 1000);
+        assert_eq!(t.len(), 2000);
+        let made: usize = (0..1 << LANE_BITS).map(|lane| t.lane_len(lane)).sum();
+        assert_eq!(made, t.len());
+        let mut keys = Vec::new();
+        for lane in 0..1 << LANE_BITS {
+            let mut part = GroupTable::new(layout.clone());
+            part.absorb_lane(&t, lane, |_, _| {}, |_, _| {});
+            for gid in 0..part.len() {
+                let row = part.row(gid);
+                keys.push(u64::from_le_bytes(row[8..16].try_into().unwrap()));
+            }
+        }
+        keys.sort_unstable();
+        assert_eq!(keys, (0..2000).collect::<Vec<_>>());
     }
 
     #[test]

@@ -33,9 +33,12 @@ impl Ablate {
     pub const PAIRS: Ablate = Ablate(1 << 9);
     /// The groups of a key that arrives in runs closed as the key moves on, with no hash table.
     pub const RUNS: Ablate = Ablate(1 << 10);
+    /// Rows for new keys appended to a table's lanes in compiled code while the table has stopped
+    /// looking for keys, with no `ht_insert` call.
+    pub const APPEND: Ablate = Ablate(1 << 11);
 
     /// Every switch with its name, in the order a table of them is printed.
-    pub const ALL: [(&'static str, Ablate); 11] = [
+    pub const ALL: [(&'static str, Ablate); 12] = [
         ("probe", Ablate::PROBE),
         ("like", Ablate::LIKE),
         ("top", Ablate::TOP),
@@ -47,6 +50,7 @@ impl Ablate {
         ("handoff", Ablate::HANDOFF),
         ("pairs", Ablate::PAIRS),
         ("runs", Ablate::RUNS),
+        ("append", Ablate::APPEND),
     ];
 
     /// Reads a comma separated list of names, where an empty list or `none` is nothing and `all`

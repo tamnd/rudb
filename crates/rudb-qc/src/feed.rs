@@ -1008,6 +1008,23 @@ impl<'a> Feed<'a> {
                     rt.take_appended(h, &mut st[at as usize..at as usize + 16]);
                 }
             }
+            // So are the rows it appended to the table's lanes without looking, which count as
+            // its groups.
+            if let Some(at) = g.probe {
+                let word = |i: usize| {
+                    let from = at as usize + i * 8;
+                    u64::from_le_bytes(st[from..from + 8].try_into().unwrap_or_default())
+                };
+                if word(4) != 0
+                    && let Some(table) = rt.table_mut(g.table)
+                {
+                    table.made_blind(word(5));
+                    let [tails, left] = table.blind_words();
+                    let from = at as usize + 32;
+                    st[from..from + 8].copy_from_slice(&tails.to_le_bytes());
+                    st[from + 8..from + 16].copy_from_slice(&left.to_le_bytes());
+                }
+            }
         }
         if let Out::Aggregate(g) = &self.body.sink
             && let Some(at) = g.runs

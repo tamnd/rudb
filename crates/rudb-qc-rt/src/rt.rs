@@ -752,15 +752,16 @@ impl Runtime for Rt {
     }
 }
 
-/// Inserts the key at `key` into `table`. When `at` is not zero it is the address of the four
+/// Inserts the key at `key` into `table`. When `at` is not zero it is the address of the six
 /// words of the state where compiled code finds a key's row without calling here: the slots, their
-/// mask, the rows and how many keys it found that way since the last call, which this adds to the
-/// table's count and zeroes before it publishes the first three again, since the insert may have
-/// moved them.
+/// mask, the rows, how many keys it found that way since the last call, and the lanes' tails and
+/// how many more rows it may append to them without looking. This adds the found keys to the
+/// table's count and the rows appended to its groups, and publishes all six again with the count
+/// zeroed, since the insert may have moved them.
 ///
 /// # Safety
 ///
-/// `key` must be a key laid out as the table's layout says and `at` zero or the address of four
+/// `key` must be a key laid out as the table's layout says and `at` zero or the address of six
 /// writable words.
 unsafe fn insert(
     table: &mut GroupTable,
@@ -774,12 +775,18 @@ unsafe fn insert(
         return unsafe { table.insert(key, hash, heap) };
     }
     // SAFETY: the caller's contract.
-    let found = unsafe { mem::slice(at + 24, 8) };
-    table.found(u64::from_le_bytes(found.try_into().unwrap_or_default()) as usize);
+    let old = unsafe { mem::slice(at + 24, 24) };
+    let word = |i: usize| u64::from_le_bytes(old[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+    table.found(word(0) as usize);
+    if word(1) != 0 {
+        table.made_blind(word(2));
+    }
     // SAFETY: the caller's contract.
     let row = unsafe { table.insert(key, hash, heap) };
-    let mut words = [0u8; 32];
-    for (w, v) in words.chunks_exact_mut(8).zip(table.published()) {
+    let mut words = [0u8; 48];
+    let [slots, mask, rows] = table.published();
+    let [tails, left] = table.blind_words();
+    for (w, v) in words.chunks_exact_mut(8).zip([slots, mask, rows, 0, tails, left]) {
         w.copy_from_slice(&v.to_le_bytes());
     }
     // SAFETY: the caller's contract.
