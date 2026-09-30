@@ -441,7 +441,7 @@ mod tests {
                 },
             ],
             classes: 1,
-            extremes: vec![crate::Extreme { leaf: 0, column: 1, max: false }],
+            extremes: vec![crate::Extreme { leaf: 0, column: 1, max: false, fetch: None }],
         });
         let columns = plan.add_fields(&[Field::new("b", LogicalType::Integer)]);
         let node = plan.add_node(Node::Consistent { index: 2, columns, reducer });

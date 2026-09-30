@@ -3579,7 +3579,24 @@ impl<'a> Building<'a, '_> {
                     self.close(below, own, Arc::new(collect));
                     filled.push(own);
                 }
-                let answer = Answer::new(shared, Schema::numbered(fields, index));
+                // The extremes read late, each with the table its relation scans and the column.
+                let fetches = tree
+                    .extremes
+                    .iter()
+                    .map(|extreme| {
+                        let Some(name) = extreme.fetch else { return Ok(None) };
+                        let input = tree.leaves[extreme.leaf as usize].input;
+                        let lost = || Error::internal("a consistent node fetches from no table");
+                        let binding = relation_column(plan, input, extreme.column).ok_or_else(lost)?;
+                        let (table, _) =
+                            scanned(plan, self.catalog, input, binding.table)?.ok_or_else(lost)?;
+                        let column = table.column_index(plan.string(name)).ok_or_else(|| {
+                            Error::internal("a consistent node fetches a column its table lacks")
+                        })?;
+                        Ok(Some((table, column)))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let answer = Answer::new(shared, Schema::numbered(fields, index), fetches);
                 let schema = answer.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Consistent", None);
                 Segment {

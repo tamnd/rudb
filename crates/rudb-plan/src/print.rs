@@ -248,7 +248,7 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
         Node::Consistent { index, columns, reducer } => {
             write!(out, " #{index} ")?;
             write_schema(plan, out, columns)?;
-            write_reducer(plan.reducer(reducer), out)
+            write_reducer(plan, plan.reducer(reducer), out)
         }
     }
 }
@@ -258,8 +258,9 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
 /// Three lists, each numbering the relations by the order they are printed underneath. `keys` is
 /// which class each relation's join columns are in, as class at column. `tree` is each relation that
 /// has a parent, the parent and the class they share. `extremes` is where each produced column is
-/// read from, as relation at column.
-fn write_reducer<W: Write>(reducer: &crate::Reducer, out: &mut W) -> fmt::Result {
+/// read from, as relation at column, followed by the table column it names when the relation
+/// carries row places there instead.
+fn write_reducer<W: Write>(plan: &Plan, reducer: &crate::Reducer, out: &mut W) -> fmt::Result {
     out.write_str(" keys=[")?;
     for (at, leaf) in reducer.leaves.iter().enumerate() {
         if at > 0 {
@@ -291,6 +292,9 @@ fn write_reducer<W: Write>(reducer: &crate::Reducer, out: &mut W) -> fmt::Result
         }
         let name = if extreme.max { "max" } else { "min" };
         write!(out, "{name} {}@{}", extreme.leaf, extreme.column)?;
+        if let Some(fetched) = extreme.fetch {
+            write!(out, " of {}", plan.string(fetched))?;
+        }
     }
     out.write_char(']')
 }
