@@ -1257,30 +1257,53 @@ fn decode_selected_chunk(reader: &mut Reader<'_>, positions: &[usize]) -> Result
             let run_value_count = skip_chunk(&mut run_value_reader)?;
             let run_value_len = run_value_reader.used();
             reader.skip(run_value_len)?;
-            let run_lengths = decode_chunk(reader)?;
-            if run_value_count != run_lengths.len() {
+            let mut ends = decode_chunk(reader)?;
+            if run_value_count != ends.len() {
                 return Err(Error::internal("an RLE chunk has more runs than run lengths"));
             }
-            // Each position's run, as its place among the runs wanted, found by walking the ends
-            // of the runs alongside the positions. The values are then read once per run and put
-            // back per position, rather than a repeat per run and a push per run.
-            let length = |length: i64| {
-                usize::try_from(length).map_err(|_| Error::internal("a negative RLE run length"))
-            };
+            // The lengths summed in place into where each run ends, with their signs gathered on
+            // the way so that one test after the loop stands for a test a run. A sum that would
+            // pass the top of `i64` stops there and then disagrees with the row count.
+            let mut signs = 0i64;
+            let mut end = 0i64;
+            for length in &mut ends {
+                signs |= *length;
+                end = end.saturating_add(*length);
+                *length = end;
+            }
+            if signs < 0 {
+                return Err(Error::internal("a negative RLE run length"));
+            }
+            check_count(usize::try_from(end).unwrap_or(usize::MAX), count)?;
+            // The last run ends at the row count, which is past every position, so the walk
+            // below always stops at a run. A run of no rows ends where the one before it did and
+            // is walked past.
+            let run_values = &run_value_bytes[..run_value_len];
+            if !pointed(run_values) {
+                // Run values that cannot be read at a few runs, which for the order key of TPC-H
+                // lineitem are deltas, are decoded once and read straight out by run.
+                let values = decode_chunk(&mut Reader::new(run_values))?;
+                check_count(values.len(), run_value_count)?;
+                let mut out = Vec::with_capacity(positions.len());
+                let mut run = 0;
+                for &position in positions {
+                    let position = position as i64;
+                    while ends[run] <= position {
+                        run += 1;
+                    }
+                    out.push(values[run]);
+                }
+                return Ok(out);
+            }
+            // Each position's run, as its place among the runs wanted. The values are then read
+            // once per run and put back per position.
             let mut wanted_runs = Vec::new();
             let mut places = Vec::with_capacity(positions.len());
-            let mut lengths = run_lengths.iter().enumerate();
-            let mut end = 0usize;
             let mut run = 0;
             for &position in positions {
-                while position >= end {
-                    let (next, &next_length) = lengths.next().ok_or_else(|| {
-                        Error::internal("an RLE chunk ended before a selected position")
-                    })?;
-                    end = end
-                        .checked_add(length(next_length)?)
-                        .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
-                    run = next;
+                let position = position as i64;
+                while ends[run] <= position {
+                    run += 1;
                 }
                 if wanted_runs.last() != Some(&run) {
                     wanted_runs.push(run);
@@ -1288,13 +1311,7 @@ fn decode_selected_chunk(reader: &mut Reader<'_>, positions: &[usize]) -> Result
                 // Under the number of positions, which is under a part's rows.
                 places.push((wanted_runs.len() - 1) as u32);
             }
-            for (_, &rest) in lengths {
-                end = end
-                    .checked_add(length(rest)?)
-                    .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
-            }
-            check_count(end, count)?;
-            let run_values = decode_selected(&run_value_bytes[..run_value_len], &wanted_runs)?;
+            let run_values = decode_selected(run_values, &wanted_runs)?;
             Ok(places.into_iter().map(|place| run_values[place as usize]).collect())
         }
         // The steps and the codes are chunks of their own, read at the same rows, and the dictionary
