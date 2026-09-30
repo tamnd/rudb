@@ -166,6 +166,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let mut wrong = Vec::new();
     let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut compiles = Vec::new();
+    let mut slower = Vec::new();
     let ups = database.tier_ups();
     for (name, sql) in &queries {
         if !only.is_empty() && !only.contains(&name.as_str()) {
@@ -174,12 +175,15 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         if explain {
             explained(&database, name, sql);
         }
-        let first = answer(&database, "first", sql);
+        let mut first = answer(&database, "first", sql);
+        if repeat > 1 {
+            first = steadied(&database, "first", sql, first, repeat);
+        }
         let up = database.tier_ups();
         let logged = database.refusals().len();
         let mut compiled = answer(&database, "compiled", sql);
         if repeat > 1 && database.refusals().len() == logged {
-            compiled = steadied(&database, sql, compiled, repeat);
+            compiled = steadied(&database, "compiled", sql, compiled, repeat);
         }
         let refusal = database.refusals().get(logged).cloned();
         let verdict = match (&first.rows, &compiled.rows, &refusal) {
@@ -216,6 +220,9 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         };
         if refusal.is_none() {
             compiles.push(compiled.compile_ms);
+            if compiled.seconds > first.seconds {
+                slower.push(format!("{name} {:.2}x", compiled.seconds / first.seconds.max(1e-9)));
+            }
         }
         let moved = database.tier_ups() - up;
         let verdict = if moved > 0 { format!("{verdict}, {moved} up to clif") } else { verdict };
@@ -239,6 +246,9 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         println!("{ups} pipeline functions moved up from direct to clif as they ran");
     }
     compiled_in(&mut compiles);
+    if !slower.is_empty() {
+        println!("slower than first: {}", slower.join(", "));
+    }
     if !reasons.is_empty() {
         println!();
         println!("refusals, by reason:");
@@ -283,7 +293,7 @@ fn ablate(
     println!();
     let run = |sql: &str| {
         let first = answer(database, "compiled", sql);
-        if repeat > 1 { steadied(database, sql, first, repeat) } else { first }
+        if repeat > 1 { steadied(database, "compiled", sql, first, repeat) } else { first }
     };
     let mut logs = vec![0.0_f64; switches.len()];
     let (mut counted, mut wrong) = (0, Vec::new());
@@ -490,13 +500,14 @@ fn answer(database: &Database, engine: &str, sql: &str) -> Answer {
     Answer { rows, seconds: began.elapsed().as_secs_f64(), ..sizes }
 }
 
-/// `first` with its timings replaced by the median of `repeat` runs of the same query on the
-/// compiled engine, so one slow compile does not stand for the query. The rows are the first run's,
-/// which is the one the verdict is about.
-fn steadied(database: &Database, sql: &str, first: Answer, repeat: usize) -> Answer {
+/// `first` with its timings replaced by the median of `repeat` runs of the same query on `engine`,
+/// so one slow run or compile does not stand for the query. Both engines are steadied the same way,
+/// so the two times compare like for like. The rows are the first run's, which is the one the
+/// verdict is about.
+fn steadied(database: &Database, engine: &str, sql: &str, first: Answer, repeat: usize) -> Answer {
     let mut runs = vec![first];
     for _ in 1..repeat {
-        runs.push(answer(database, "compiled", sql));
+        runs.push(answer(database, engine, sql));
     }
     let median = |f: &dyn Fn(&Answer) -> f64| {
         let mut values: Vec<f64> = runs.iter().map(f).collect();
