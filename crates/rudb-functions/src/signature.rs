@@ -851,6 +851,59 @@ const TABLE: &[Entry] = &[
         shape: Shape::Exact(Fixed::Interval, Fixed::Timestamp),
         numeric_only: false,
     },
+    // A time or a timestamp built out of its fields, or a timestamp out of a count since 1970.
+    Entry {
+        name: "make_time",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Exact(Fixed::BigInt, Fixed::Time),
+        numeric_only: false,
+    },
+    Entry {
+        name: "make_timestamp",
+        kind: FunctionKind::Scalar,
+        arity: Arity::one_of(&[1, 6]),
+        shape: Shape::Exact(Fixed::BigInt, Fixed::Timestamp),
+        numeric_only: false,
+    },
+    Entry {
+        name: "make_timestamp_ns",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::BigInt, Fixed::Timestamp),
+        numeric_only: false,
+    },
+    // A part counted between two moments, as the boundaries crossed or as the whole parts that fit.
+    // The aliases are entries of their own because upstream names the one written in its errors,
+    // and `date_sub` has one overload fewer than `date_diff` to list.
+    Entry {
+        name: "date_diff",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "datediff",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "date_sub",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "datesub",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::BigInt),
+        numeric_only: false,
+    },
     // A timestamp read out of text in a format, or in the first of a list of formats that fits.
     Entry {
         name: "strptime",
@@ -2184,6 +2237,41 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         ("time_bucket", [Interval | LogicalType::Varchar, when, origin]) if when == origin => {
             Some((vec![Interval, when.clone(), when.clone()], when.clone()))
         }
+        // The fields are whole numbers and the seconds are a double.
+        ("make_time", [hour, minute, seconds])
+            if [hour, minute].into_iter().all(|ty| counted(ty) || *ty == Null)
+                && number(seconds) =>
+        {
+            Some((vec![BigInt, BigInt, Double], Time))
+        }
+        ("make_timestamp", [count]) if counted(count) || *count == Null => {
+            Some((vec![BigInt], Timestamp))
+        }
+        ("make_timestamp_ns", [count]) if counted(count) || *count == Null => {
+            Some((vec![BigInt], TimestampNs))
+        }
+        ("make_timestamp", [fields @ .., seconds])
+            if fields.len() == 5
+                && fields.iter().all(|ty| counted(ty) || *ty == Null)
+                && number(seconds) =>
+        {
+            Some((vec![BigInt, BigInt, BigInt, BigInt, BigInt, Double], Timestamp))
+        }
+        // Two moments of one kind, where a null or a string takes the type of the other and a date
+        // against a timestamp is counted as two timestamps. Two nulls are ambiguous upstream.
+        (
+            "date_diff" | "datediff" | "date_sub" | "datesub",
+            [LogicalType::Varchar | Null, start, end],
+        ) => {
+            let moment = match (start, end) {
+                (Date | Timestamp | Time, Null | LogicalType::Varchar) => start.clone(),
+                (Null | LogicalType::Varchar, Date | Timestamp | Time) => end.clone(),
+                (Date, Timestamp) | (Timestamp, Date) => Timestamp,
+                (Date, Date) | (Timestamp, Timestamp) | (Time, Time) => start.clone(),
+                _ => return None,
+            };
+            Some((vec![LogicalType::Varchar, moment.clone(), moment], BigInt))
+        }
         // A date against a timestamp is bucketed as two timestamps.
         ("time_bucket", [Interval | LogicalType::Varchar, Date, Timestamp])
         | ("time_bucket", [Interval | LogicalType::Varchar, Timestamp, Date]) => {
@@ -2447,6 +2535,13 @@ const READ_OFF: &[&str] = &[
     "strptime",
     "try_strptime",
     "time_bucket",
+    "date_diff",
+    "datediff",
+    "date_sub",
+    "datesub",
+    "make_time",
+    "make_timestamp",
+    "make_timestamp_ns",
 ];
 
 /// What the reference prints under `Candidate functions:`, per function, byte for byte.
@@ -2461,6 +2556,53 @@ const READ_OFF: &[&str] = &[
 /// A name missing from here gets the sentence with no block under it, which is what every function
 /// outside the string family does today.
 const CANDIDATES: &[(&str, &[&str])] = &[
+    ("make_time", &["make_time(col0 BIGINT, col1 BIGINT, col2 DOUBLE) -> TIME"]),
+    (
+        "make_timestamp",
+        &[
+            "make_timestamp(col0 BIGINT, col1 BIGINT, col2 BIGINT, col3 BIGINT, col4 BIGINT, col5 DOUBLE) -> TIMESTAMP",
+            "make_timestamp(col0 BIGINT) -> TIMESTAMP",
+        ],
+    ),
+    ("make_timestamp_ns", &["make_timestamp_ns(col0 BIGINT) -> TIMESTAMP_NS"]),
+    (
+        "date_diff",
+        &[
+            "date_diff(col0 VARCHAR, col1 DATE, col2 DATE) -> BIGINT",
+            "date_diff(col0 VARCHAR, col1 TIME, col2 TIME) -> BIGINT",
+            "date_diff(col0 VARCHAR, col1 TIMESTAMP, col2 TIMESTAMP) -> BIGINT",
+            "date_diff(col0 VARCHAR, col1 TIMESTAMP WITH TIME ZONE, col2 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+            "date_diff(col0 VARCHAR, col1 TIMESTAMPTZ_NS, col2 TIMESTAMPTZ_NS) -> BIGINT",
+        ],
+    ),
+    (
+        "datediff",
+        &[
+            "datediff(col0 VARCHAR, col1 DATE, col2 DATE) -> BIGINT",
+            "datediff(col0 VARCHAR, col1 TIME, col2 TIME) -> BIGINT",
+            "datediff(col0 VARCHAR, col1 TIMESTAMP, col2 TIMESTAMP) -> BIGINT",
+            "datediff(col0 VARCHAR, col1 TIMESTAMP WITH TIME ZONE, col2 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+            "datediff(col0 VARCHAR, col1 TIMESTAMPTZ_NS, col2 TIMESTAMPTZ_NS) -> BIGINT",
+        ],
+    ),
+    (
+        "date_sub",
+        &[
+            "date_sub(col0 VARCHAR, col1 DATE, col2 DATE) -> BIGINT",
+            "date_sub(col0 VARCHAR, col1 TIME, col2 TIME) -> BIGINT",
+            "date_sub(col0 VARCHAR, col1 TIMESTAMP, col2 TIMESTAMP) -> BIGINT",
+            "date_sub(col0 VARCHAR, col1 TIMESTAMP WITH TIME ZONE, col2 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+        ],
+    ),
+    (
+        "datesub",
+        &[
+            "datesub(col0 VARCHAR, col1 DATE, col2 DATE) -> BIGINT",
+            "datesub(col0 VARCHAR, col1 TIME, col2 TIME) -> BIGINT",
+            "datesub(col0 VARCHAR, col1 TIMESTAMP, col2 TIMESTAMP) -> BIGINT",
+            "datesub(col0 VARCHAR, col1 TIMESTAMP WITH TIME ZONE, col2 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+        ],
+    ),
     (
         "time_bucket",
         &[
@@ -4169,6 +4311,14 @@ mod tests {
                     }
                     _ if entry.name == "strftime" => arguments[1] = LogicalType::Varchar,
                     _ if entry.name == "time_bucket" => arguments[1] = LogicalType::Date,
+                    _ if matches!(
+                        entry.name,
+                        "date_diff" | "datediff" | "date_sub" | "datesub"
+                    ) =>
+                    {
+                        arguments[1] = LogicalType::Date;
+                        arguments[2] = LogicalType::Date;
+                    }
                     Shape::Histogram if count == 2 => arguments[1] = strings(),
                     Shape::Bits => {
                         arguments = match entry.name {

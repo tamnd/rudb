@@ -162,6 +162,12 @@ fn run<V: AsRef<Vector>>(
             return Ok(vector);
         }
     }
+    if matches!(name, "date_diff" | "datediff" | "date_sub" | "datesub") {
+        let refs: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
+        if let Some(vector) = crate::datediff::vectorized(name, &refs, returns, rows)? {
+            return Ok(vector);
+        }
+    }
     if matches!(name, "strptime" | "try_strptime") {
         let refs: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
         let strict = name == "strptime";
@@ -3757,7 +3763,7 @@ fn made_date_value(days: &Value) -> Result<Value> {
 /// date that was never there, and that catches the month length and the leap year without a table of
 /// either. The message names the three numbers the way they were written, unpadded, which is what
 /// the binary prints.
-fn made_civil_value(year: &Value, month: &Value, day: &Value) -> Result<Value> {
+pub(crate) fn made_civil_value(year: &Value, month: &Value, day: &Value) -> Result<Value> {
     let (Some(year), Some(month), Some(day)) = (year.as_i64(), month.as_i64(), day.as_i64()) else {
         return Err(Error::internal("make_date of something that is not three numbers"));
     };
@@ -4139,6 +4145,12 @@ pub fn call_values(
         ("epoch_ms", [when]) if *returns == LogicalType::BigInt => datetime::read_off(name, when),
         ("strftime", [left, right]) => crate::strftime::value(left, right),
         ("time_bucket", [_, _] | [_, _, _]) => crate::timebucket::value(args),
+        ("make_time" | "make_timestamp" | "make_timestamp_ns", _) => {
+            crate::maketime::value(name, args)
+        }
+        ("date_diff" | "datediff" | "date_sub" | "datesub", [part, start, end]) => {
+            crate::datediff::value(name, part, start, end)
+        }
         ("strptime" | "try_strptime", [text, format]) => {
             crate::strptime::value(text, format, returns, name == "strptime")
         }
