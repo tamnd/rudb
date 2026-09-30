@@ -293,6 +293,11 @@ impl Func {
         Insts { code: &self.blocks[b.index()].code, at: 0 }
     }
 
+    /// The instruction whose header is at word `at` of block `b`.
+    pub(crate) fn inst_at(&self, b: Block, at: u32) -> Option<Inst<'_>> {
+        Insts { code: &self.blocks[b.index()].code, at: at as usize }.next()
+    }
+
     /// The last instruction of a block, which a well formed block has as its terminator.
     #[must_use]
     pub fn terminator(&self, b: Block) -> Option<Inst<'_>> {
