@@ -8843,10 +8843,13 @@ impl Reader {
             // run into the `Arc` without touching a value.
             let mut vector = match positions {
                 Some(positions) if !keeping => {
-                    if keeps {
-                        self.pay(at, column, paid_at(rows, bytes, positions));
+                    if keeps && self.pay_or_hold(at, column, paid_at(rows, bytes, positions), rows)
+                    {
+                        keeping = true;
+                        decode(&field.ty, rows, bytes, dictionary)?
+                    } else {
+                        decode_at(&field.ty, rows, bytes, dictionary, positions)?
                     }
-                    decode_at(&field.ty, rows, bytes, dictionary, positions)?
                 }
                 _ => decode(&field.ty, rows, bytes, dictionary)?,
             };
@@ -8931,6 +8934,30 @@ impl Reader {
                 Err(false)
             }
         }
+    }
+
+    /// Adds `paid` to what reads of part `at` of `column` have paid, or answers that this read
+    /// should decode the part whole and hold it, which is when the rent with this read's share in
+    /// it comes to the whole part.
+    ///
+    /// The share is counted before the read rather than after. Counted after, a read that costs the
+    /// whole part anyway, which is every read of a page [`decode_at`] decodes whole, paid for the
+    /// part and let it go, and the next run of the query decoded it whole a second time to hold it:
+    /// on JOB 19a that second run cost twice what the third did.
+    fn pay_or_hold(&self, at: usize, column: usize, paid: usize, rows: usize) -> bool {
+        let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else {
+            return false;
+        };
+        let before = match &*held {
+            PartSlot::Held { .. } => return false,
+            PartSlot::Seen(before) => *before,
+            PartSlot::Unseen => 0,
+        };
+        if before.saturating_add(paid) >= rows {
+            return true;
+        }
+        *held = PartSlot::Seen(before + paid);
+        false
     }
 
     /// Adds `rows` to what reads of part `at` of `column` have paid, unless it is held already.
