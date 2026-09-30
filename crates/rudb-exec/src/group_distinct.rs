@@ -173,6 +173,20 @@ impl Shape {
         self.columns().iter().map(Column::kind).collect()
     }
 
+    /// The lowest valid code and how many codes there are from it, when that is known.
+    ///
+    /// A single column is its own code space. A composite starts at zero and is every column's
+    /// span multiplied, since a null takes a column's zero rather than the record's validity.
+    fn span(&self) -> Option<(i64, i64)> {
+        match self {
+            Self::Alone(column) => Some((column.low()?, column.width()?)),
+            Self::Many(composite) => Some((
+                0,
+                composite.spans.iter().try_fold(1_i64, |all, &span| all.checked_mul(span))?,
+            )),
+        }
+    }
+
     /// One group's code put back into the values its columns held.
     fn values(&self, group: Grouped) -> Result<Vec<Value>> {
         match self {
@@ -633,6 +647,10 @@ fn count_groups(
         .iter()
         .map(|part| part.splits[split].len() + part.tallied[split].len())
         .sum::<usize>();
+    if let Some((low, codes)) = dense_span(shape, input) {
+        reserving.stop(0);
+        return count_dense(parts, split, piece.whole, low, codes, shape, bound, memory);
+    }
     let ceiling = input.saturating_mul(2).max(SPLIT_SEED).next_power_of_two();
     let capacity = SPLIT_SEED.min(ceiling);
     let mut working = memory.reservation();
@@ -673,6 +691,102 @@ fn count_groups(
         return Ok(Tallied::Part(Partial { split, groups, counts, held }));
     }
     emit(&groups, &counts, shape, bound, memory).map(Tallied::Whole)
+}
+
+/// The code space a split's groups can be counted in by position, when it is small beside them.
+///
+/// A group held as a dictionary code, a narrow integer or a composite of those has a code space of
+/// known size, and when that is not much bigger than the pairs the split was handed, a count per code
+/// is cheaper than a table: no hash, no probe, no growing, and a walk of the counts afterwards that
+/// reads them in order. `COUNT(DISTINCT UserID) GROUP BY SearchPhrase` over the million row ClickBench
+/// file hands a single thread's split 131 thousand pairs in 108 thousand groups of a dictionary a
+/// little bigger than that, which a table grows eleven times to hold.
+fn dense_span(shape: &Shape, input: usize) -> Option<(i64, usize)> {
+    let (low, codes) = shape.span()?;
+    let codes = usize::try_from(codes).ok()?;
+    let room = input.saturating_mul(DENSE_SPREAD).max(DENSE_FLOOR).min(DENSE_MOST);
+    (codes < room).then_some((low, codes))
+}
+
+/// How many codes a pair may stand beside before a split is counted in a table instead.
+const DENSE_SPREAD: usize = 4;
+
+/// The code space a split is always counted in by position under, however few pairs it has.
+const DENSE_FLOOR: usize = 1 << 12;
+
+/// The most codes a split is counted in by position, sixteen megabytes of counts.
+const DENSE_MOST: usize = 1 << 21;
+
+/// [`count_groups`] over a code space of `codes` codes from `low`, with a count per code.
+///
+/// The null group has the first count to itself, which is why every other code is one past its
+/// place.
+#[allow(clippy::too_many_arguments)]
+fn count_dense(
+    parts: &[Counted],
+    split: usize,
+    whole: bool,
+    low: i64,
+    codes: usize,
+    shape: &Shape,
+    bound: usize,
+    memory: &Memory,
+) -> Result<Tallied> {
+    let timing = stage::Timing::start(Stage::Count);
+    let mut working = memory.reservation();
+    working.grow(width((codes + 1) * size_of::<i64>()))?;
+    let mut counts = vec![0_i64; codes + 1];
+    let mut null = None;
+    let mut place = |pair: Grouped| -> Result<usize> {
+        if !pair.valid {
+            null.get_or_insert(pair);
+            return Ok(0);
+        }
+        usize::try_from(i64::from(pair.group) - low)
+            .ok()
+            .filter(|&at| at < codes)
+            .map(|at| at + 1)
+            .ok_or_else(|| Error::internal("a group code is outside the space its shape gave it"))
+    };
+    for part in parts {
+        for &pair in &part.splits[split] {
+            counts[place(pair)?] += 1;
+        }
+        for &(pair, by) in &part.tallied[split] {
+            let count = &mut counts[place(pair)?];
+            *count = count
+                .checked_add(i64::from(by))
+                .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
+        }
+    }
+    let mut groups = Vec::new();
+    let mut found = Vec::new();
+    for (at, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        groups.push(match at {
+            0 => {
+                null.ok_or_else(|| Error::internal("the null group was counted without a pair"))?
+            }
+            // In range, because the code was checked on its way in.
+            at => Grouped { group: (at as i64 - 1 + low) as i32, valid: true },
+        });
+        found.push(count);
+    }
+    drop(counts);
+    let kept =
+        width(groups.capacity() * size_of::<Grouped>() + found.capacity() * size_of::<i64>());
+    let mut held = memory.reservation();
+    held.grow(kept)?;
+    drop(working);
+    timing.stop(0);
+    if !whole {
+        return Ok(Tallied::Part(Partial { split, groups, counts: found, held }));
+    }
+    let output = emit(&groups, &found, shape, bound, memory);
+    drop(held);
+    output.map(Tallied::Whole)
 }
 
 /// The table [`count_groups`] counts a split's groups into.
