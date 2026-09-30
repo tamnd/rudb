@@ -928,6 +928,23 @@ impl Binder<'_> {
                 return self.call_as(operator, stored, bound);
             }
         }
+        // The pin takes the format apart once when it binds, so a format that is not a constant is
+        // refused and one that does not parse is refused before any row is read.
+        if rudb_catalog::same_name(&written, "strftime") && bound.len() == 2 {
+            let at = usize::from(*self.plan().expr_type(bound[0]) != LogicalType::Varchar);
+            match fold::value_of(self.plan(), bound[at]) {
+                Ok(Some(Value::Varchar(format))) => {
+                    rudb_kernels::strftime::Format::parse(&format)?;
+                }
+                Ok(Some(_)) => {}
+                _ => {
+                    return Err(Error::binder(
+                        "The \"format\" argument in function \"strftime\" must be a constant \
+                         expression",
+                    ));
+                }
+            }
+        }
         self.call(&written, bound)
     }
 

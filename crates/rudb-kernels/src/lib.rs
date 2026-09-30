@@ -90,6 +90,7 @@ mod sequence;
 mod shape;
 mod split;
 mod statistics;
+pub mod strftime;
 mod structs;
 mod subscript;
 mod tally;

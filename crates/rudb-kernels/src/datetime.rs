@@ -661,6 +661,16 @@ fn iso_week(days: i32) -> (i32, i32) {
     (year, week)
 }
 
+/// The ISO year a day falls in, which is what `%G` writes.
+pub(crate) fn iso_year_of(days: i32) -> i32 {
+    iso_week(days).0
+}
+
+/// The ISO week a day falls in, which is what `%V` writes.
+pub(crate) fn iso_week_of(days: i32) -> i32 {
+    iso_week(days).1
+}
+
 /// The day an ISO year starts on, which is the Monday of the week 4 January is in.
 fn iso_year_start(year: i32) -> i32 {
     let fourth = days_from_civil(year, 1, 4);
@@ -893,6 +903,104 @@ pub(crate) fn infinite_stamp(stamp: i64) -> bool {
 
 fn not_in_range() -> Error {
     Error::conversion("Date and time not in timestamp range")
+}
+
+const DAY_NAMES: [&str; 7] =
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+const MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// What `dayname`, `monthname`, `last_day`, `nanosecond`, `epoch_ms`, `epoch_us` and `epoch_ns`
+/// read off a date, a timestamp, a time or an interval.
+///
+/// An infinity has no day, month or count in it and the pin answers null for every one of these.
+/// An interval counts a month as thirty days here, so `epoch_us(INTERVAL 1 MONTH)` is thirty days of
+/// microseconds, and the two coarser epochs divide towards zero, which makes a timestamp a tenth of
+/// a millisecond before the epoch zero milliseconds and not minus one.
+///
+/// # Errors
+///
+/// If the value is not one the binder lets through, or if its nanoseconds do not fit a `BIGINT`.
+pub(crate) fn read_off(name: &str, when: &Value) -> Result<Value> {
+    let infinite = match when {
+        Value::Date(day) => infinite_day(*day),
+        Value::Timestamp(stamp) | Value::TimestampTz(stamp) | Value::TimestampNs(stamp) => {
+            infinite_stamp(*stamp)
+        }
+        _ => false,
+    };
+    if infinite || when.is_null() {
+        return Ok(Value::Null);
+    }
+    let unread = || Error::internal(format!("{name} cannot read {when:?}"));
+    if matches!(name, "dayname" | "monthname" | "last_day") {
+        let days = match when {
+            Value::Date(day) => *day,
+            Value::Timestamp(stamp) | Value::TimestampTz(stamp) => day_of(*stamp)?,
+            _ => return Err(unread()),
+        };
+        let (year, month, _) = civil_from_days(days);
+        let month_index = usize::try_from(month - 1).map_err(|_| unread())?;
+        return Ok(match name {
+            "dayname" => {
+                let weekday = usize::try_from((days + 4).rem_euclid(7)).map_err(|_| unread())?;
+                Value::Varchar(DAY_NAMES[weekday].to_string())
+            }
+            "monthname" => Value::Varchar(MONTH_NAMES[month_index].to_string()),
+            _ => Value::Date(days_from_civil(year, month, days_in_month(year, month))),
+        });
+    }
+    // A nanosecond timestamp keeps the nanoseconds the other types never had.
+    if let Value::TimestampNs(ticks) = when {
+        return Ok(Value::BigInt(match name {
+            "nanosecond" => ticks.rem_euclid(MICROS_PER_DAY * 1_000) % 60_000_000_000,
+            "epoch_ns" => *ticks,
+            "epoch_us" => ticks / 1_000,
+            _ => ticks / 1_000_000,
+        }));
+    }
+    if name == "nanosecond" {
+        let micros = match when {
+            Value::Date(_) => 0,
+            Value::Timestamp(micros) | Value::TimestampTz(micros) | Value::Time(micros) => {
+                Part::Microsecond.of_micros(*micros)?
+            }
+            Value::Interval { months, days, micros } => {
+                Part::Microsecond.of_interval(*months, *days, *micros)?
+            }
+            _ => return Err(unread()),
+        };
+        return Ok(Value::BigInt(micros * 1_000));
+    }
+    let micros = match when {
+        Value::Date(day) => i64::from(*day) * MICROS_PER_DAY,
+        Value::Timestamp(micros) | Value::TimestampTz(micros) | Value::Time(micros) => *micros,
+        Value::Interval { months, days, micros } => (i64::from(*months) * 30 + i64::from(*days))
+            .checked_mul(MICROS_PER_DAY)
+            .and_then(|whole| whole.checked_add(*micros))
+            .ok_or_else(|| Error::out_of_range("interval micros out of range"))?,
+        _ => return Err(unread()),
+    };
+    Ok(Value::BigInt(match name {
+        "epoch_ms" => micros / 1_000,
+        "epoch_us" => micros,
+        _ => micros
+            .checked_mul(1_000)
+            .ok_or_else(|| Error::out_of_range("Could not convert to nanoseconds"))?,
+    }))
 }
 
 /// Two intervals added or taken apart, which is field by field and not by length.
