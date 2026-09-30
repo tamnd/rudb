@@ -724,8 +724,8 @@ fn a_top_count_that_leaves_out_one_value_is_read_out_of_the_value_frequencies() 
          ELSE 'c' || CAST(i AS VARCHAR) END AS s FROM range(20000) r(i)",
     );
     for query in [
-        "SELECT s, COUNT(*) AS c FROM t WHERE s <> '' GROUP BY s ORDER BY c DESC, s LIMIT 5",
-        "SELECT s, COUNT(*) AS c FROM t WHERE 'h3' <> s GROUP BY s ORDER BY c DESC, s LIMIT 5",
+        "SELECT s, COUNT(*) AS c FROM t WHERE s <> '' GROUP BY s ORDER BY c DESC LIMIT 5",
+        "SELECT s, COUNT(*) AS c FROM t WHERE 'h3' <> s GROUP BY s ORDER BY c DESC LIMIT 5",
     ] {
         assert_eq!(pair.listing(query).len(), 5, "the limit is the answer's length");
         assert!(
@@ -837,7 +837,11 @@ fn a_top_count_by_several_keys_is_counted_over_the_rows_of_the_heaviest_values()
     let rows = "SELECT CASE WHEN i < 1600 THEN CAST(floor(sqrt(i)) AS BIGINT) \
          WHEN i % 20011 = 0 THEN NULL ELSE 1000 + i - i % 2 END AS u, \
          CASE WHEN i < 1600 THEN 0 ELSE i % 7 END AS m, \
-         CASE WHEN i < 1600 THEN 'h' ELSE 'v' || (i % 5) END AS s \
+         CASE WHEN i < 1600 THEN 'h' ELSE 'v' || (i % 5) END AS s, \
+         (i * 2654435761) % 1000000007 * 1000000009 + i % 7919 AS p1, \
+         (i * 40503) % 1000000009 * 1000000007 + i % 7907 AS p2, \
+         (i * 2246822519) % 998244353 * 1000000021 + i % 7901 AS p3, \
+         (i * 3266489917) % 1000000021 * 998244353 + i % 7883 AS p4 \
          FROM range(200000) t(i)";
     let pair = Pair::new("heavyusers", rows);
     let query = "SELECT u, m + 1 AS k, s, COUNT(*) AS c FROM t GROUP BY u, k, s \
