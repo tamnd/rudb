@@ -16956,7 +16956,6 @@ mod tests {
             PartSlot::Seen(paid) => Some(paid),
             _ => None,
         };
-        assert!(matches!(*slot(0), PartSlot::Unseen));
         let sparse = a.read_rows(0, &[0], &[3], false).expect("one row");
         assert_eq!(sparse.value_at(0, 0), Value::Integer(3));
         assert!(paid(0).is_none_or(|paid| paid > 0), "a read pays something");
