@@ -2559,12 +2559,27 @@ impl StableLike {
         // One search over the group's values laid end to end, for the reason on `like_joined`: a
         // name is fifteen bytes and starting a search costs more than running it over them.
         if let Some(joined_like) = Joined::of(like) {
+            let mut held = vec![false; last - first];
+            // A source that keeps its values laid end to end is searched where they lie, and only
+            // one that does not has them copied into one buffer first.
+            while at < last {
+                let found = self.dictionary.sweep_text_runs(at, last, &mut |from, run, ends| {
+                    joined_like.search(run, ends, &mut held[from - first..]);
+                    Ok(())
+                })?;
+                let Some(stopped) = found else { break };
+                if stopped <= at {
+                    return Err(Error::internal("a dictionary sweep did not move"));
+                }
+                at = stopped;
+            }
+            let copied = at;
             let mut joined = Vec::new();
-            let mut ends = Vec::with_capacity(last - first);
+            let mut ends = Vec::with_capacity(last - at);
             while at < last {
                 let stopped = self.dictionary.sweep_text(at, last, &mut |index, text: &[u8]| {
                     // A value the sweep passes over is an empty string, which matches nothing.
-                    while ends.len() < index - first {
+                    while ends.len() < index - copied {
                         ends.push(joined.len());
                     }
                     joined.extend_from_slice(text);
@@ -2576,8 +2591,7 @@ impl StableLike {
                 }
                 at = stopped;
             }
-            let mut held = vec![false; ends.len()];
-            joined_like.search(&joined, &ends, &mut held);
+            joined_like.search(&joined, &ends, &mut held[copied - first..]);
             for (index, held) in held.into_iter().enumerate() {
                 let (word, shift) = Self::slot(index);
                 bits[word] |= (1 | u64::from(held != like.negated) << 1) << shift;

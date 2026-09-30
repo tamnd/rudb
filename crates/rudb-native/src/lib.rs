@@ -6152,6 +6152,45 @@ impl TextSource for NativeText {
         Ok(last)
     }
 
+    /// The rest of the block holding `first`, handed over where it lies with the ends of its values
+    /// counted from the start of the run.
+    fn sweep_runs(
+        &self,
+        first: usize,
+        limit: usize,
+        body: &mut dyn FnMut(usize, &[u8], &[usize]) -> Result<()>,
+    ) -> Result<Option<usize>> {
+        let limit = limit.min(self.values);
+        if first >= limit {
+            return Ok(Some(first));
+        }
+        let block = first / TEXT_PAYLOAD_VALUES;
+        let last = ((block + 1) * TEXT_PAYLOAD_VALUES).min(limit);
+        let mut decoded = Vec::new();
+        let bytes = self.loaned_block(block, &mut decoded, false)?;
+        let ends = self.ends_within(first, last)?;
+        if ends.len() != last - first {
+            return Err(invalid("global dictionary offsets are short"));
+        }
+        let start = u64::from(self.start_within(first)?);
+        let mut before = start;
+        let mut within = Vec::with_capacity(ends.len());
+        for &end in &ends {
+            if end < before {
+                return Err(invalid("global dictionary value is past its block"));
+            }
+            within.push(usize::try_from(end - start).map_err(|_| invalid("offset overflow"))?);
+            before = end;
+        }
+        let run = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(before).ok())
+            .and_then(|(from, to)| bytes.get(from..to))
+            .ok_or_else(|| invalid("global dictionary value is past its block"))?;
+        body(first, run, &within)?;
+        Ok(Some(last))
+    }
+
     /// The values at `indices` a block at a time, each block read once for the call.
     ///
     /// The positions are put in code order first, because the codes of a vector are in row order
@@ -18995,6 +19034,27 @@ mod tests {
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a sweep answers what a point read answers");
+        // A run sweep starting partway into a block hands over the same values laid end to end.
+        let mut ran: Vec<Vec<u8>> = Vec::new();
+        let mut at = 100;
+        while at < dictionary.len() {
+            let stopped = dictionary
+                .sweep_text_runs(at, dictionary.len(), &mut |from, run, ends| {
+                    assert_eq!(from, 100 + ran.len(), "a run sweep hands its runs over in order");
+                    let mut start = 0;
+                    for &end in ends {
+                        ran.push(run[start..end].to_vec());
+                        start = end;
+                    }
+                    assert_eq!(start, run.len(), "the last end is the end of the run");
+                    Ok(())
+                })
+                .expect("a run sweep reads")
+                .expect("a stored dictionary lays its values end to end");
+            assert!(stopped > at, "a run sweep moves");
+            at = stopped;
+        }
+        assert_eq!(ran, read[100..], "a run sweep answers what a point read answers");
         fs::remove_file(path).expect("remove scratch file");
     }
 
