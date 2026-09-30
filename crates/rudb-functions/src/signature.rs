@@ -345,6 +345,16 @@ enum Shape {
     /// The pin has an overload for each element type and picks the one that is cheaper to cast
     /// both lists to, which [`folded`] works out.
     Folded,
+    /// Two arrays of FLOAT or of DOUBLE of one size folded into one number. `array_distance`, the
+    /// array inner products and the array cosines.
+    ///
+    /// The overload is picked the way [`Shape::Folded`] picks it, and then the pin's bind meets
+    /// the two element types and refuses a meeting that is neither FLOAT nor DOUBLE, which
+    /// [`array_folded`] follows.
+    ArrayFolded,
+    /// Two arrays of three FLOAT or DOUBLE and the array of three they cross into.
+    /// `array_cross_product`, which takes a list as the array it casts to.
+    Crossed,
     /// A list, the length it should have, and what to pad it with. `list_resize`.
     ///
     /// The length is cast to UBIGINT, which is where the pin sends it, so a negative length is that
@@ -1230,6 +1240,14 @@ const TABLE: &[Entry] = &[
     list_row("list_cosine_similarity", 2, Shape::Folded),
     list_row("list_cosine_distance", 2, Shape::Folded),
     list_row("<=>", 2, Shape::Folded),
+    list_row("array_distance", 2, Shape::ArrayFolded),
+    list_row("array_inner_product", 2, Shape::ArrayFolded),
+    list_row("array_dot_product", 2, Shape::ArrayFolded),
+    list_row("array_negative_inner_product", 2, Shape::ArrayFolded),
+    list_row("array_negative_dot_product", 2, Shape::ArrayFolded),
+    list_row("array_cosine_similarity", 2, Shape::ArrayFolded),
+    list_row("array_cosine_distance", 2, Shape::ArrayFolded),
+    list_row("array_cross_product", 2, Shape::Crossed),
     Entry {
         name: "list_sort",
         kind: FunctionKind::Scalar,
@@ -2195,6 +2213,8 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             (vec![LogicalType::list(element.clone()), element], to.ty())
         }
         Shape::Folded => folded(entry.name, arguments)?,
+        Shape::ArrayFolded => array_folded(entry.name, arguments)?,
+        Shape::Crossed => crossed(entry.name, arguments)?,
         Shape::ListsMet(to) => {
             let (Some(left), Some(right)) =
                 (element_of_list(&arguments[0]), element_of_list(&arguments[1]))
@@ -2780,6 +2800,67 @@ fn folded(name: &str, arguments: &[LogicalType]) -> Result<(Vec<LogicalType>, Lo
     }
     let element = if floats && to_float < to_double { Float } else { Double };
     Ok((vec![LogicalType::list(element.clone()); arguments.len()], element))
+}
+
+/// The array folds, which the pin declares over `FLOAT[ANY]` and `DOUBLE[ANY]` and so only takes
+/// arrays and nulls, a list having no size to cast to. A null takes the type of the other side,
+/// and then the two sizes have to agree and the two element types meet at FLOAT or DOUBLE, so
+/// two arrays of integers are refused where an array of integers and one of doubles is not.
+fn array_folded(name: &str, arguments: &[LogicalType]) -> Result<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{Array, Double, Float, Null};
+    if arguments.iter().any(|ty| !matches!(ty, Null | Array(..))) {
+        return Err(no_match(name, arguments));
+    }
+    let (_, returns) = folded(name, arguments)?;
+    let [left, right] = arguments else {
+        return Err(no_match(name, arguments));
+    };
+    let (left, right) = match (left, right) {
+        (Null, other) | (other, Null) => (other, other),
+        sides => sides,
+    };
+    let (Array(left, size), Array(right, other)) = (left, right) else {
+        return Err(no_match(name, arguments));
+    };
+    if size != other {
+        return Err(Error::binder(format!(
+            "{}: Array arguments must be of the same size",
+            identifier(name)
+        )));
+    }
+    let common = left.promote(right).map_err(|_| {
+        Error::binder(format!(
+            "{}: Cannot infer common element type (left = '{left}', right = '{right}')",
+            identifier(name)
+        ))
+    })?;
+    if !matches!(common, Float | Double) {
+        return Err(Error::binder(format!(
+            "{}: Arguments must be arrays of FLOAT or DOUBLE",
+            identifier(name)
+        )));
+    }
+    Ok((vec![LogicalType::array(common, *size); 2], returns))
+}
+
+/// `array_cross_product`, which the pin declares over `FLOAT[3]` and `DOUBLE[3]` with no bind of
+/// its own, so a list casts to the array and an array of another size matches neither.
+fn crossed(name: &str, arguments: &[LogicalType]) -> Result<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{Array, List, Null};
+    if arguments.iter().any(|ty| !matches!(ty, Null | List(_) | Array(_, 3))) {
+        return Err(no_match(name, arguments));
+    }
+    let (_, element) = folded(name, arguments)?;
+    let array = LogicalType::array(element, 3);
+    Ok((vec![array.clone(); arguments.len()], array))
+}
+
+/// A function name the way the pin's `SQLIdentifier` writes it in a message, quoted when it is
+/// not a plain lower case word.
+fn identifier(name: &str) -> String {
+    let plain = name.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        && !name.starts_with('_');
+    if plain { name.to_string() } else { format!("\"{}\"", name.replace('"', "\"\"")) }
 }
 
 fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
@@ -3846,6 +3927,62 @@ const CANDIDATES: &[(&str, &[&str])] = &[
             "\"<=>\"(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
         ],
     ),
+    (
+        "array_distance",
+        &[
+            "array_distance(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_distance(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_inner_product",
+        &[
+            "array_inner_product(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_inner_product(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_dot_product",
+        &[
+            "array_dot_product(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_dot_product(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_negative_inner_product",
+        &[
+            "array_negative_inner_product(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_negative_inner_product(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_negative_dot_product",
+        &[
+            "array_negative_dot_product(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_negative_dot_product(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_cosine_similarity",
+        &[
+            "array_cosine_similarity(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_cosine_similarity(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_cosine_distance",
+        &[
+            "array_cosine_distance(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_cosine_distance(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_cross_product",
+        &[
+            "array_cross_product(col0 FLOAT[3], col1 FLOAT[3]) -> FLOAT[3]",
+            "array_cross_product(col0 DOUBLE[3], col1 DOUBLE[3]) -> DOUBLE[3]",
+        ],
+    ),
     ("length_grapheme", &["length_grapheme(col0 VARCHAR) -> BIGINT"]),
     ("left_grapheme", &["left_grapheme(col0 VARCHAR, col1 BIGINT) -> VARCHAR"]),
     ("right_grapheme", &["right_grapheme(col0 VARCHAR, col1 BIGINT) -> VARCHAR"]),
@@ -4469,6 +4606,8 @@ impl Shape {
             }
             Self::Flattened => (all("T[][]"), SAME_LIST),
             Self::Folded => (all(SAME_LIST), SAME),
+            Self::ArrayFolded => (all("T[ANY]"), SAME),
+            Self::Crossed => (all("T[3]"), "T[3]"),
             Self::Resized => (leading(1, ANY_LIST, ANY), ANY_LIST),
             Self::Sorted => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
             Self::Graded => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
@@ -5045,6 +5184,9 @@ mod tests {
                     Shape::Flattened => arguments = vec![LogicalType::list(strings())],
                     Shape::Folded => {
                         arguments = vec![LogicalType::list(LogicalType::Double); count]
+                    }
+                    Shape::ArrayFolded | Shape::Crossed => {
+                        arguments = vec![LogicalType::array(LogicalType::Double, 3); count]
                     }
                     Shape::Resized => arguments[0] = strings(),
                     Shape::Ranged => arguments = vec![LogicalType::BigInt; count],
