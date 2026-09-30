@@ -4156,6 +4156,9 @@ pub fn call_values(
         ("formatReadableDecimalSize", [Value::BigInt(bytes)]) => {
             Ok(Value::Varchar(crate::bytes::format_bytes(*bytes, true)))
         }
+        // The signature cast every argument after the format to a kind the formatter reads.
+        ("format", [Value::Varchar(pattern), rest @ ..]) => crate::printf::format(pattern, rest),
+        ("printf", [Value::Varchar(pattern), rest @ ..]) => crate::printf::printf(pattern, rest),
         ("parse_formatted_bytes", [Value::Varchar(text)]) => {
             Ok(Value::UBigInt(crate::bytes::parse_formatted_bytes(text)?))
         }
