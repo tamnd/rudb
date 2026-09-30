@@ -2644,8 +2644,9 @@ fn the_session_context_answers_for_the_clock_the_catalog_and_the_user() {
     // A call with arguments is not one of these and reaches the signature table, which has a row per
     // name so that the message is the arity error the pin gives rather than a missing function.
     assert!(
-        failure(&db, "SELECT now(1)")
-            .starts_with("No function matches the given name and argument types 'now(INTEGER)'"),
+        failure(&db, "SELECT now(1)").starts_with(
+            "No function matches the given name and argument types 'now(INTEGER_LITERAL)'"
+        ),
         "an arity error rather than a missing function"
     );
     // A zoned value keeps its zone through arithmetic, which is the half of this that is not about

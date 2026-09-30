@@ -205,6 +205,13 @@ enum Shape {
     /// [`Shape::Extracted`] follows and is upstream's: `substring('abcdef', 2.5, 3)` is a binder
     /// error there listing the two overloads rather than a substring from the second character.
     TextThenIndex(usize, Fixed),
+    /// Two strings that have to be strings already, then an optional cutoff that is cast to a
+    /// DOUBLE, and a DOUBLE back. `jaro_similarity(a, b, 0.9)`.
+    ///
+    /// The cutoff is the one argument a cast reaches. Upstream answers
+    /// `jaro_similarity('a', 'b', '0.5')` by reading the string as a number, while
+    /// `jaro_similarity(1, 'b')` is a binder error listing both overloads.
+    TextThenCutoff,
     /// Every argument promotes, and the result is the first argument's own type. `nullif`.
     ///
     /// The promotion is for the comparison and not for the answer, which is what makes this its own
@@ -706,6 +713,34 @@ const TABLE: &[Entry] = &[
     // `contains` is also the list search when its first argument is a list, and [`resolve`] sends
     // it to `list_contains` in that case. This row is the string overload.
     text("contains", Arity::exactly(2), Fixed::Boolean),
+    // The prefix and suffix tests. `^@` is the operator the transformer writes for `starts_with`, and
+    // each spelling is a row because upstream names the one written in its errors.
+    text("starts_with", Arity::exactly(2), Fixed::Boolean),
+    text("prefix", Arity::exactly(2), Fixed::Boolean),
+    text("^@", Arity::exactly(2), Fixed::Boolean),
+    text("ends_with", Arity::exactly(2), Fixed::Boolean),
+    text("suffix", Arity::exactly(2), Fixed::Boolean),
+    // The string distances, which count bytes and not characters the way upstream does.
+    text("levenshtein", Arity::exactly(2), Fixed::BigInt),
+    text("editdist3", Arity::exactly(2), Fixed::BigInt),
+    text("damerau_levenshtein", Arity::exactly(2), Fixed::BigInt),
+    text("mismatches", Arity::exactly(2), Fixed::BigInt),
+    text("hamming", Arity::exactly(2), Fixed::BigInt),
+    text("jaccard", Arity::exactly(2), Fixed::Double),
+    Entry {
+        name: "jaro_similarity",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 3),
+        shape: Shape::TextThenCutoff,
+        numeric_only: false,
+    },
+    Entry {
+        name: "jaro_winkler_similarity",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 3),
+        shape: Shape::TextThenCutoff,
+        numeric_only: false,
+    },
     text("strpos", Arity::exactly(2), Fixed::BigInt),
     text("instr", Arity::exactly(2), Fixed::BigInt),
     text("trim", Arity::between(1, 2), Fixed::Varchar),
@@ -1954,6 +1989,24 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             }
             (cast_to, result.ty())
         }
+        Shape::TextThenCutoff => {
+            let (text, cutoff) = arguments.split_at(2.min(arguments.len()));
+            for ty in text {
+                if *ty != LogicalType::Varchar && *ty != LogicalType::Null {
+                    return Err(no_match(entry.name, arguments));
+                }
+            }
+            for ty in cutoff {
+                if !ty.is_numeric() && *ty != LogicalType::Varchar && *ty != LogicalType::Null {
+                    return Err(no_match(entry.name, arguments));
+                }
+            }
+            let mut cast_to = vec![LogicalType::Varchar; arguments.len()];
+            for slot in cast_to.iter_mut().skip(2) {
+                *slot = LogicalType::Double;
+            }
+            (cast_to, LogicalType::Double)
+        }
         Shape::ValueThenCountThenValue(_) => {
             let first = arguments[0].clone();
             let mut cast_to = vec![first.clone(); arguments.len()];
@@ -3195,6 +3248,31 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("strpos", &["strpos(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("starts_with", &["starts_with(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("prefix", &["prefix(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("^@", &["\"^@\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("ends_with", &["ends_with(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("suffix", &["suffix(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("levenshtein", &["levenshtein(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("editdist3", &["editdist3(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("damerau_levenshtein", &["damerau_levenshtein(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("mismatches", &["mismatches(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("hamming", &["hamming(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("jaccard", &["jaccard(col0 VARCHAR, col1 VARCHAR) -> DOUBLE"]),
+    (
+        "jaro_similarity",
+        &[
+            "jaro_similarity(col0 VARCHAR, col1 VARCHAR) -> DOUBLE",
+            "jaro_similarity(col0 VARCHAR, col1 VARCHAR, col2 DOUBLE) -> DOUBLE",
+        ],
+    ),
+    (
+        "jaro_winkler_similarity",
+        &[
+            "jaro_winkler_similarity(col0 VARCHAR, col1 VARCHAR) -> DOUBLE",
+            "jaro_winkler_similarity(col0 VARCHAR, col1 VARCHAR, col2 DOUBLE) -> DOUBLE",
+        ],
+    ),
     ("instr", &["instr(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
     (
         "trim",
@@ -3722,6 +3800,7 @@ impl Shape {
             Self::TextThenIndex(taken, to) => {
                 (leading(taken, Fixed::Varchar.name(), "BIGINT"), to.name())
             }
+            Self::TextThenCutoff => (leading(2, Fixed::Varchar.name(), "DOUBLE"), "DOUBLE"),
             // The value, then a row count, then another value of the first one's type. The third
             // one is `ANY` and not the spelling of the first, which is the pin's row for `lag` and
             // is where the declaration stops being the rule: the binder casts the default to the
@@ -4323,6 +4402,7 @@ mod tests {
                 let leading = match entry.shape {
                     Shape::Extracted | Shape::Sliced | Shape::ListCounted | Shape::Resized => 1,
                     Shape::TextThenIndex(leading, _) => leading,
+                    Shape::TextThenCutoff => 2,
                     _ => count,
                 };
                 for bound in arguments.iter_mut().skip(leading) {
