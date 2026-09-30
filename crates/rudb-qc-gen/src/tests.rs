@@ -59,6 +59,13 @@ fn call(query: &Query, stage: usize, rt: &mut Rt, columns: &[Column], state: &mu
             valid: columns[c].valid.as_ptr(),
             codes: ROWS.as_ptr(),
         })
+        // A body that reads its group rows by the key's codes has one more column for their
+        // array, which a null address leaves unused.
+        .chain(body.keyed.map(|_| Col {
+            values: std::ptr::null(),
+            valid: std::ptr::null(),
+            codes: std::ptr::null(),
+        }))
         .collect();
     let rows = 8;
     let morsel = Morsel {
