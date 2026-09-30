@@ -6980,10 +6980,12 @@ fn rudb_links_says_what_shape_the_relationship_turned_out_to_have() {
         &db,
         "SELECT child_table FROM rudb_links() WHERE gather_locality < 1 ORDER BY child_table",
     );
+    // `skewed` is no longer declared, but the file kept its link from the first checkpoint, and it
+    // is as clustered as it was.
     assert_eq!(
         locality,
-        vec![vec![Value::Varchar("orders".into())]],
-        "the clustered one gathers inside a cache line and the scattered one does not"
+        vec![vec![Value::Varchar("orders".into())], vec![Value::Varchar("skewed".into())]],
+        "the clustered ones gather inside a cache line and the scattered one does not"
     );
     let far = rows(&db, "SELECT child_table FROM rudb_links() WHERE gather_locality > 1000");
     assert_eq!(far, vec![vec![Value::Varchar("scattered".into())]]);
@@ -7206,9 +7208,12 @@ fn a_checkpoint_builds_a_key_map_over_the_parent_of_every_declared_relationship(
         rows(&reopened, "SELECT count(*), max(c_custkey) FROM customer"),
         vec![vec![Value::BigInt(4000), Value::Integer(4000)]]
     );
-    assert!(
-        rows(&reopened, "SELECT name FROM rudb_links()").is_empty(),
-        "a declaration is a session's and not the file's"
+    // The declaration is the session's, but the link it built is the file's, and a link the file
+    // kept is a relationship known without declaring it again.
+    assert_eq!(
+        rows(&reopened, "SELECT key_map FROM rudb_links()"),
+        vec![vec![Value::Varchar("identity".into())]],
+        "the link the file kept is listed before anything is declared"
     );
     reopened.execute(declaration).unwrap();
     assert_eq!(
