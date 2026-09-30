@@ -57,14 +57,21 @@ const SEGMENT: u64 = SEGMENT_BYTES / 4;
 /// meet it; what does is a load, which the checkpoint writes as pages anyway.
 const MOST_STAGED: usize = (SEGMENT / 4) as usize;
 
+/// How many inserted rows a transaction may log before its commit checkpoints instead: half a
+/// stripe, the line between the head and the bulk path in `engine-v4/07-the-head.md` section
+/// 7.10. Rows past it are a load, and the checkpoint appends them to the file as pages without
+/// logging them first, so a load is written once rather than twice.
+const BULK_ROWS: usize = 262_144;
+
 /// How many bytes of blocks `commit_sync = none` lets queue before it writes them out.
 const QUEUED: u64 = 1 << 20;
 
-/// A record staged for the commit: its kind and its payload.
+/// A record staged for the commit: its kind, its payload, and the rows it inserts.
 #[derive(Debug)]
 pub(crate) struct Record {
     kind: Kind,
     payload: Vec<u8>,
+    inserted: usize,
 }
 
 /// A change read back out of the log, for the table it names.
@@ -329,8 +336,9 @@ impl Journal {
     }
 
     /// The Insert record for the rows of `chunks` appended to `schema.table`, whose columns are
-    /// `fields`, or `None` when they cannot be logged. Built before the rows go in, so a failed
-    /// append has nothing to take back, and [`Self::stage`]d once they are in.
+    /// `fields`, or `None` when they cannot be logged or bring the transaction's inserted rows to
+    /// [`BULK_ROWS`]. Built before the rows go in, so a failed append has nothing to take back,
+    /// and [`Self::stage`]d once they are in.
     pub(crate) fn encode(
         &self,
         schema: &str,
@@ -338,12 +346,14 @@ impl Journal {
         fields: &[Field],
         chunks: &[Chunk],
     ) -> Option<Record> {
-        if self.dirty {
+        let inserted = chunks.iter().map(Chunk::len).sum::<usize>();
+        let staged = self.staged.iter().map(|record| record.inserted).sum::<usize>();
+        if self.dirty || staged + inserted >= BULK_ROWS {
             return None;
         }
         let mut out = header(schema, table)?;
         put_rows(&mut out, fields, chunks, MOST_STAGED - self.staged_bytes)?;
-        Some(Record { kind: Kind::Insert, payload: out })
+        Some(Record { kind: Kind::Insert, payload: out, inserted })
     }
 
     /// The Delete record for the rows at `rows` of `schema.table`, the row numbers ascending.
@@ -353,8 +363,11 @@ impl Journal {
         }
         let mut out = header(schema, table)?;
         put_runs(&mut out, rows)?;
-        (out.len() <= MOST_STAGED - self.staged_bytes)
-            .then_some(Record { kind: Kind::Delete, payload: out })
+        (out.len() <= MOST_STAGED - self.staged_bytes).then_some(Record {
+            kind: Kind::Delete,
+            payload: out,
+            inserted: 0,
+        })
     }
 
     /// The Update record that gives the rows at `rows` of `schema.table` the rows of `chunks`, in
@@ -373,7 +386,7 @@ impl Journal {
         let mut out = header(schema, table)?;
         put_runs(&mut out, rows)?;
         put_rows(&mut out, fields, chunks, MOST_STAGED - self.staged_bytes)?;
-        Some(Record { kind: Kind::Update, payload: out })
+        Some(Record { kind: Kind::Update, payload: out, inserted: 0 })
     }
 
     /// The Ddl record for the schema change `sql`, which replay runs again as it is. `None` for a
@@ -384,8 +397,11 @@ impl Journal {
         }
         let mut out = vec![VERSION];
         put_text(&mut out, sql)?;
-        (out.len() <= MOST_STAGED - self.staged_bytes)
-            .then_some(Record { kind: Kind::Ddl, payload: out })
+        (out.len() <= MOST_STAGED - self.staged_bytes).then_some(Record {
+            kind: Kind::Ddl,
+            payload: out,
+            inserted: 0,
+        })
     }
 
     /// Stages a record for the commit, or marks the commit to checkpoint when there is none.
