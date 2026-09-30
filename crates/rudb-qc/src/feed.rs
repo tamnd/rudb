@@ -89,6 +89,9 @@ pub(crate) struct Feed<'a> {
     /// Where the rows of a result body tell the scan under them how good a row has to be to make
     /// the top N that reads them.
     cutoff: Option<TopCut>,
+    /// The worst place by the first key of the top N that some morsel already has as many rows at
+    /// or before as the top N keeps, so a row placed after it in a later morsel cannot make it.
+    bar: Mutex<u128>,
     /// For each column of [`Body::domains`], the index of each of its values.
     lookups: Vec<HashMap<Vec<u8>, u16>>,
     inner: Mutex<Inner<'a>>,
@@ -264,6 +267,7 @@ impl<'a> Feed<'a> {
             top: None,
             agreed: None,
             cutoff: None,
+            bar: Mutex::new(u128::MAX),
             lookups: body
                 .domains
                 .iter()
@@ -1075,9 +1079,14 @@ impl<'a> Feed<'a> {
             );
             let n = usize::try_from(n).unwrap_or(usize::MAX).min(room);
             // Under a top N only the rows that can still make it are made into values.
-            let picked =
-                self.top.and_then(|(keys, count)| contenders(keys, columns, &buffers, n, count));
+            let picked = self
+                .top
+                .and_then(|(keys, count)| contenders(keys, columns, &buffers, n, count, &self.bar));
             let rows = picked.as_ref().map_or(n, Vec::len);
+            if rows == 0 {
+                headers.out = buffers;
+                return Ok(if *done { Progress::Done } else { Progress::More });
+            }
             let at = |i: usize| picked.as_ref().map_or(i, |picked| picked[i]);
             let mut vectors = Vec::with_capacity(columns.len());
             for (slot, b) in columns.iter().zip(&buffers) {
@@ -1342,20 +1351,26 @@ fn values_of(b: &Buffers) -> &[u8] {
 
 /// The first `n` rows of a morsel's result that can still be among the first `count` in the order
 /// of `keys`, in the order they came. `None` when they all can, or when the first key is not a
-/// column of signed numbers, dates or times, which is what this reads.
+/// column of signed numbers, dates, times or text, which is what this reads.
 ///
 /// A row whose first key comes after the first key of the row that is `count`th by that key alone
 /// has `count` rows ahead of it whatever the other keys say, so it cannot make the cut. Rows tied
 /// with that one are kept, and the sort after this orders them by the rest. On ClickBench q25 a
 /// morsel of 2048 rows hands on ten or so of them instead of every row with a search phrase.
+///
+/// The place of the `count`th row is kept in `bar` for the morsels after, so once a morsel has
+/// filled the top N a later one hands on only the rows that beat it, which is most often none.
+/// Text is placed by its first eight bytes, which orders two strings whenever they differ there,
+/// and keeps the rows that tie on them for the sort.
 fn contenders(
     keys: &[Key],
     columns: &[rudb_qc_gen::Slot],
     buffers: &[Buffers],
     n: usize,
     count: u64,
+    bar: &Mutex<u128>,
 ) -> Option<Vec<usize>> {
-    let count = usize::try_from(count).ok().filter(|&count| count > 0 && count < n)?;
+    let count = usize::try_from(count).ok().filter(|&count| count > 0)?;
     let key = keys.first()?;
     let rudb_qc_plan::Kind::Column(c) = &key.expr.kind else { return None };
     let (slot, b) = (columns.get(*c)?, buffers.get(*c)?);
@@ -1374,28 +1389,51 @@ fn contenders(
             | LogicalType::TimestampTz
     );
     let w = slot.ty.bytes() as usize;
-    if !signed || !matches!(w, 1 | 2 | 4 | 8) {
+    let textual = slot.logical == LogicalType::Varchar && w == 16;
+    if !(textual || signed && matches!(w, 1 | 2 | 4 | 8)) {
         return None;
     }
     let values = values_of(b);
-    // Each row's place as one number that is smaller for a row that comes first: the value with
-    // its sign bit flipped, turned over for `DESC`, and a null before or after every value.
+    // The order of a row that is not null as a number that is smaller for a row that comes first
+    // ascending: the value with its sign bit flipped, or the first eight bytes of text read big
+    // endian with zeros after a shorter one.
+    let order = |i: usize| -> u64 {
+        let bytes = &values[i * w..(i + 1) * w];
+        if textual {
+            let header = u128::from_le_bytes(bytes.try_into().unwrap_or_default());
+            // SAFETY: the header of a row that is not null was made by the body over a column
+            // buffer or the runtime's heap, both of which outlive the call that made it.
+            let text = unsafe { text::bytes(&header) };
+            let mut word = [0u8; 8];
+            let k = text.len().min(8);
+            word[..k].copy_from_slice(&text[..k]);
+            return u64::from_be_bytes(word);
+        }
+        let mut word = [0u8; 8];
+        word[..w].copy_from_slice(bytes);
+        let value = i64::from_le_bytes(word) << (64 - 8 * w) >> (64 - 8 * w);
+        (value as u64) ^ (1 << 63)
+    };
+    // Each row's place as one number that is smaller for a row that comes first: the order turned
+    // over for `DESC`, and a null before or after every value.
     let rank = |i: usize| -> u128 {
         if b.valid[i] == 0 {
             return if key.nulls_first { 0 } else { 1 << 64 };
         }
-        let mut word = [0u8; 8];
-        word[..w].copy_from_slice(&values[i * w..(i + 1) * w]);
-        let value = i64::from_le_bytes(word) << (64 - 8 * w) >> (64 - 8 * w);
-        let order = (value as u64) ^ (1 << 63);
-        let order = if key.descending { !order } else { order };
+        let order = if key.descending { !order(i) } else { order(i) };
         u128::from(order) + u128::from(key.nulls_first)
     };
-    let ranks: Vec<u128> = (0..n).map(rank).collect();
-    let mut sorted = ranks.clone();
-    let (_, &mut worst, _) = sorted.select_nth_unstable(count - 1);
-    let picked: Vec<usize> = (0..n).filter(|&i| ranks[i] <= worst).collect();
-    (picked.len() < n).then_some(picked)
+    let before = *bar.lock().unwrap_or_else(|held| held.into_inner());
+    let mut ranked: Vec<(u128, usize)> =
+        (0..n).map(|i| (rank(i), i)).filter(|&(rank, _)| rank <= before).collect();
+    if ranked.len() >= count {
+        let (_, &mut (worst, _), _) = ranked.select_nth_unstable(count - 1);
+        let mut held = bar.lock().unwrap_or_else(|held| held.into_inner());
+        *held = (*held).min(worst);
+        ranked.retain(|&(rank, _)| rank <= worst);
+        ranked.sort_unstable_by_key(|&(_, i)| i);
+    }
+    (ranked.len() < n).then(|| ranked.into_iter().map(|(_, i)| i).collect())
 }
 
 /// Writes the state header, which points at the state's own block.
@@ -1922,7 +1960,9 @@ mod tests {
     fn only_the_rows_that_can_make_a_top_n_are_picked_with_their_ties() {
         let (slot, b) = bigints(&[Some(5), Some(-3), None, Some(9), Some(-3), Some(7), Some(0)]);
         let (slots, buffers) = (vec![slot], vec![b]);
-        let pick = |key: Key, count| contenders(&[key], &slots, &buffers, 7, count);
+        let pick = |key: Key, count| {
+            contenders(&[key], &slots, &buffers, 7, count, &Mutex::new(u128::MAX))
+        };
         // Ascending, the second smallest is -3 and both rows of it are kept.
         assert_eq!(pick(key(false, false), 2), Some(vec![1, 4]));
         assert_eq!(pick(key(false, false), 3), Some(vec![1, 4, 6]));
@@ -1934,6 +1974,46 @@ mod tests {
         // As many rows as asked for, or none asked for, leaves every row.
         assert_eq!(pick(key(false, false), 7), None);
         assert_eq!(pick(key(false, false), 0), None);
+    }
+
+    #[test]
+    fn a_morsel_after_one_that_filled_the_top_n_hands_on_only_the_rows_that_beat_it() {
+        let bar = Mutex::new(u128::MAX);
+        let pick = |values: &[Option<i64>], count| {
+            let (slot, b) = bigints(values);
+            contenders(&[key(false, false)], &[slot], &[b], values.len(), count, &bar)
+        };
+        assert_eq!(pick(&[Some(8), Some(4), Some(6)], 2), Some(vec![1, 2]));
+        // Six is the second smallest seen, so only rows at or before it are worth anything now.
+        assert_eq!(pick(&[Some(7), Some(9)], 2), Some(vec![]));
+        assert_eq!(pick(&[Some(6), Some(1), Some(7)], 2), Some(vec![0, 1]));
+        assert_eq!(pick(&[Some(5), Some(3)], 2), None);
+        assert_eq!(pick(&[Some(4), Some(6), Some(2)], 2), Some(vec![0, 2]));
+        assert_eq!(pick(&[Some(5), Some(0)], 2), Some(vec![1]));
+    }
+
+    #[test]
+    fn text_is_placed_by_its_first_eight_bytes_and_ties_there_are_kept() {
+        let words = ["pear", "", "applesauce", "apple", "applesauces", "zoo"];
+        let slot = rudb_qc_gen::Slot {
+            values: 0,
+            valid: 0,
+            ty: rudb_qc_ir::Ty::Str16,
+            logical: LogicalType::Varchar,
+        };
+        let b = Buffers {
+            values: words.iter().map(|w| text::make(w.as_bytes())).collect(),
+            valid: vec![1; words.len()],
+        };
+        let (slots, buffers) = (vec![slot], vec![b]);
+        let pick = |key: Key, count| {
+            contenders(&[key], &slots, &buffers, words.len(), count, &Mutex::new(u128::MAX))
+        };
+        // The empty string and then "apple" come first, and the two that start "applesau" tie on
+        // their first eight bytes, so the third place holds both of them.
+        assert_eq!(pick(key(false, false), 2), Some(vec![1, 3]));
+        assert_eq!(pick(key(false, false), 3), Some(vec![1, 2, 3, 4]));
+        assert_eq!(pick(key(true, false), 2), Some(vec![0, 5]));
     }
 
     /// The headers of a column read as codes, dereferenced back to bytes, one per row.

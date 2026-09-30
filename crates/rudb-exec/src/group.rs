@@ -714,10 +714,12 @@ fn short_runs(slots: &[usize]) -> bool {
     block.len() > 1 && starts * 4 > block.len()
 }
 
-/// The most groups a chunk can have and still be read by slot rather than by run, which is where the
-/// four copies of every group's totals [`rudb_kernels::update_shared_slots`] keeps still fit in a few
-/// cache lines each.
-const FEW_SLOTS: usize = 16;
+/// The most groups a chunk can have and still be read by slot rather than by run.
+///
+/// Up to sixteen groups [`rudb_kernels::update_shared_slots`] keeps four copies of every group's
+/// totals, and past that one, since two rows in a row are then rarely in the same group. A thousand
+/// groups of eight totals is under a hundred kilobytes to clear a chunk of eight thousand rows.
+const FEW_SLOTS: usize = 1024;
 
 /// How many slots [`slot_runs_of`] reads a mask of starts over, which is one bit a row of a `u64`.
 const RUN_BLOCK: usize = 64;
@@ -2890,14 +2892,12 @@ impl<'a> Aggregate<'a> {
                 codes.places(*length, coded_places);
                 let mut row = 0;
                 loop {
-                    while row < *length {
-                        let found = slot_at(coded_map[coded_places[row]]);
-                        if found == NOWHERE {
-                            break;
-                        }
-                        slots[row] = found;
-                        row += 1;
-                    }
+                    row = crate::table::slots_from(
+                        coded_map,
+                        &coded_places[..*length],
+                        &mut slots[..*length],
+                        row,
+                    );
                     if row == *length {
                         break;
                     }

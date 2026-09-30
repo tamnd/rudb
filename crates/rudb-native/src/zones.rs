@@ -50,7 +50,7 @@ use std::sync::Arc;
 use rudb_common::Result;
 use rudb_common::bounds::{Bound, End, Frequencies, Reach, Remainder, Spread, Test, Zones, kept};
 use rudb_common::stat::{Direction, Provenance};
-use rudb_common::{ColumnFacts, Stat, Value};
+use rudb_common::{ColumnFacts, LogicalType, Stat, Value};
 use rudb_storage::Probe;
 
 use crate::Reader;
@@ -228,11 +228,15 @@ impl Zones for Stripes {
 /// actually holds, so that count is exact and comes back as such. The dictionary page is not opened
 /// to answer, which matters: this runs once per table per statement bound.
 ///
-/// Every other column is answered from its two ends, where they are integers. A column of integers
+/// Every other column is answered from its two ends, where they are integers or decimals. A column of integers
 /// between `low` and `high` cannot hold more than `high - low + 1` distinct values, so the span is a
 /// ceiling, and on the columns that decide a join order it is a tight one. TPC-H nationkey runs 0 to
 /// 24 and holds 25 values, regionkey 0 to 4 and holds 5. On `l_orderkey` the span is six million
 /// against a true one and a half, which is loose and still safe, for the reason below.
+///
+/// A decimal is the integers it stores at its scale, so `l_discount` between 0.00 and 0.10 at scale
+/// two holds at most eleven values. The optimizer's factoring pass reads that to group q01 by its
+/// discount and its tax, which `spec/perf/89` goes into.
 ///
 /// # Why a ceiling is the safe end here
 ///
@@ -260,8 +264,22 @@ pub fn distincts(reader: &Reader) -> Result<Vec<(String, Stat<u64>)>> {
             counted.push((field.name.clone(), Stat::exact(exact, Provenance::Dictionary)));
             continue;
         }
-        let Some((Bound::Int(low), Bound::Int(high))) = reader.exact_extremes(at)? else {
+        let Some(ends) = reader.exact_extremes(at)? else {
             continue;
+        };
+        let (low, high) = match (ends, &field.ty) {
+            ((Bound::Int(low), Bound::Int(high)), _) => (low, high),
+            // A decimal holds integers at its own scale, so ends stated at that scale bound how many
+            // of them it holds the way an integer's ends do. Ends at another scale could put two
+            // values on one integer, so those say nothing.
+            (
+                (
+                    Bound::Scaled { unscaled: low, scale: one },
+                    Bound::Scaled { unscaled: high, scale: other },
+                ),
+                LogicalType::Decimal { scale, .. },
+            ) if one == *scale && other == *scale => (low, high),
+            _ => continue,
         };
         let Some(span) = high.checked_sub(low).and_then(|span| u64::try_from(span).ok()) else {
             continue;

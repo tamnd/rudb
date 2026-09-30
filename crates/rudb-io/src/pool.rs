@@ -511,6 +511,10 @@ impl File for Pooled {
         self.file.sync()
     }
 
+    fn sync_data(&self) -> Result<()> {
+        self.file.sync_data()
+    }
+
     fn truncate(&self, len: u64) -> Result<()> {
         self.file.truncate(len)
     }

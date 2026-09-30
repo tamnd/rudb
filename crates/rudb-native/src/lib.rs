@@ -4912,11 +4912,12 @@ const SPARSE_RENT: usize = 8;
 /// double. The rent is counted in what a read cost rather than in the rows it wanted, see
 /// [`paid_at`]. With all of that the 113 queries ran on well under two thirds of the instructions.
 ///
-/// A whole read pays the rent too, rather than holding the part at once. A query that runs once
-/// reads each part of a column once, and holding what it decoded kept every column it scanned in
-/// memory for nothing: ClickBench q19 peaked at 364 MB against 159 before parts were held, and
-/// the copy the read took of a part it had just put in the pool cost time as well. A part read a
-/// second time is still held from then on.
+/// A whole read holds the part at once, and a read at positions holds it when its own share of the
+/// rent brings the count to the part's rows rather than leaving that to the read after it. Both
+/// used to only pay rent, which put every part's decode on the second run of a query and none on
+/// the third: across JOB the second run of each query cost 60 billion cycles against 35 for the
+/// third. Holding on the read that paid for the part moved 19a's second run from 1.65 to 0.83
+/// billion. It costs memory for a query that runs once, and the pool's budget is what bounds that.
 #[derive(Debug, Default)]
 enum PartSlot {
     #[default]
@@ -4952,9 +4953,6 @@ struct Shelf {
     /// How many stripes of one column are kept whatever the budget says. See
     /// [`CACHED_STRIPES_PER_COLUMN`] for what sets it and [`Reader::keep_stripes`] for who raises it.
     kept: AtomicUsize,
-    /// The columns a plan has said it reads more than once. A whole read of one of their parts
-    /// holds it at once rather than counting its rows first. See [`Reader::expect_again`].
-    again: Vec<AtomicBool>,
 }
 
 impl Shelf {
@@ -5262,11 +5260,11 @@ struct NativeText {
     payload_kept: AtomicUsize,
     /// Which payload blocks a sweep or a visit has decoded before, one flag a block.
     ///
-    /// A sweep keeps a block the second time it decodes it and not the first. A process that runs
-    /// one statement, which is how a benchmark or a script uses the engine, sweeps each block once
-    /// and so keeps nothing: on ten million rows a `URL LIKE` held 396 MB with every block kept and
-    /// 97 MB with none, for the same processor time. A session that asks again pays the decode one
-    /// more time and reads kept blocks from then on, under the same [`TEXT_KEEP_BUDGET`].
+    /// A sweep keeps a block the first time it decodes it, and a visit the second time. Keeping
+    /// nothing on the first sweep held a `URL LIKE` on ten million rows at 97 MB rather than 396,
+    /// but it also made the second run of every JOB query that sweeps `name` decode it all again,
+    /// and a sweep reads each block once and whole, so what it keeps is what the next statement
+    /// reads. [`TEXT_KEEP_BUDGET`] bounds what a column keeps either way.
     swept: Vec<AtomicBool>,
     /// How many blocks [`TextSource::visit_at`] has decoded and dropped because the column was
     /// already holding its [`TEXT_KEEP_BUDGET`].
@@ -5683,7 +5681,7 @@ impl NativeText {
         }
         let again = kept.is_none()
             && self.swept.get(block).is_some_and(|swept| swept.swap(true, Atomic::Relaxed));
-        let keep = again
+        let keep = (again || !scattered)
             && (self.payload_kept.load(Atomic::Relaxed) < self.keep_budget
                 || (scattered && self.visit_dropped.load(Atomic::Relaxed) >= self.blocks.len()));
         if keep {
@@ -6150,6 +6148,45 @@ impl TextSource for NativeText {
             start = end;
         }
         Ok(last)
+    }
+
+    /// The rest of the block holding `first`, handed over where it lies with the ends of its values
+    /// counted from the start of the run.
+    fn sweep_runs(
+        &self,
+        first: usize,
+        limit: usize,
+        body: &mut dyn FnMut(usize, &[u8], &[usize]) -> Result<()>,
+    ) -> Result<Option<usize>> {
+        let limit = limit.min(self.values);
+        if first >= limit {
+            return Ok(Some(first));
+        }
+        let block = first / TEXT_PAYLOAD_VALUES;
+        let last = ((block + 1) * TEXT_PAYLOAD_VALUES).min(limit);
+        let mut decoded = Vec::new();
+        let bytes = self.loaned_block(block, &mut decoded, false)?;
+        let ends = self.ends_within(first, last)?;
+        if ends.len() != last - first {
+            return Err(invalid("global dictionary offsets are short"));
+        }
+        let start = u64::from(self.start_within(first)?);
+        let mut before = start;
+        let mut within = Vec::with_capacity(ends.len());
+        for &end in &ends {
+            if end < before {
+                return Err(invalid("global dictionary value is past its block"));
+            }
+            within.push(usize::try_from(end - start).map_err(|_| invalid("offset overflow"))?);
+            before = end;
+        }
+        let run = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(before).ok())
+            .and_then(|(from, to)| bytes.get(from..to))
+            .ok_or_else(|| invalid("global dictionary value is past its block"))?;
+        body(first, run, &within)?;
+        Ok(Some(last))
     }
 
     /// The values at `indices` a block at a time, each block read once for the call.
@@ -6978,7 +7015,6 @@ impl Reader {
             places: places.len(),
             held: (0..table_fields).map(|_| AtomicUsize::new(0)).collect(),
             kept: AtomicUsize::new(CACHED_STRIPES_PER_COLUMN),
-            again: (0..table_fields).map(|_| AtomicBool::new(false)).collect(),
         };
         let sieves = (0..table_fields).map(|_| OnceLock::new()).collect();
         let part_ranges = (0..table_fields).map(|_| OnceLock::new()).collect();
@@ -7377,21 +7413,6 @@ impl Reader {
     /// reads a quarter of a megabyte for every part it takes out of it.
     pub fn keep_stripes(&self, stripes: usize) {
         self.cache.kept.fetch_max(stripes, Atomic::Relaxed);
-    }
-
-    /// Says that a query will read `column` whole more than once, so the first whole read of each
-    /// of its parts holds what it decoded.
-    ///
-    /// A whole read counts its rows and holds nothing, so a query that reads a column once does
-    /// not keep it. A query that scans a table twice, the way TPC-H q22 reads `customer` for the
-    /// average and again for the answer, then decoded every part twice, which put q22 at SF1 up
-    /// from 228 to 266 million instructions. The plan knows which columns it reads twice, and this
-    /// is how it says so. It stays said, since a column read twice by one query is likely to be
-    /// read twice by the next one like it.
-    pub fn expect_again(&self, column: usize) {
-        if let Some(again) = self.cache.again.get(column) {
-            again.store(true, Atomic::Relaxed);
-        }
     }
 
     /// Rows in one part, or zero when the part number is past the table.
@@ -8804,10 +8825,13 @@ impl Reader {
             // run into the `Arc` without touching a value.
             let mut vector = match positions {
                 Some(positions) if !keeping => {
-                    if keeps {
-                        self.pay(at, column, paid_at(rows, bytes, positions));
+                    if keeps && self.pay_or_hold(at, column, paid_at(rows, bytes, positions), rows)
+                    {
+                        keeping = true;
+                        decode(&field.ty, rows, bytes, dictionary)?
+                    } else {
+                        decode_at(&field.ty, rows, bytes, dictionary, positions)?
                     }
-                    decode_at(&field.ty, rows, bytes, dictionary, positions)?
                 }
                 _ => decode(&field.ty, rows, bytes, dictionary)?,
             };
@@ -8866,7 +8890,7 @@ impl Reader {
         positions: Option<&[u32]>,
         rows: usize,
     ) -> std::result::Result<Arc<Vector>, bool> {
-        let Some(Ok(mut held)) = self.cache.made(column, at).map(Mutex::lock) else {
+        let Some(Ok(held)) = self.cache.made(column, at).map(Mutex::lock) else {
             return Err(false);
         };
         match &*held {
@@ -8879,23 +8903,43 @@ impl Reader {
                     PartSlot::Seen(before) => *before,
                     _ => 0,
                 };
-                let again = positions.is_none()
-                    && self
-                        .cache
-                        .again
-                        .get(column)
-                        .is_some_and(|again| again.load(Atomic::Relaxed));
-                if before >= rows || again {
+                // A whole read holds the part at once. It has decoded all of it anyway, so what
+                // holding costs is the memory and not the time, and the run after it is the one
+                // that pays otherwise: on JOB the second run of each query cost 60 billion cycles
+                // across the suite against 35 for the third, nearly all of it decoding again the
+                // parts the first run had decoded and let go.
+                if before >= rows || positions.is_none() {
                     return Err(true);
                 }
                 // A read at positions counts what it cost once it knows how the part is coded.
                 // See [`Self::pay`].
-                if positions.is_none() {
-                    *held = PartSlot::Seen(before.saturating_add(rows));
-                }
                 Err(false)
             }
         }
+    }
+
+    /// Adds `paid` to what reads of part `at` of `column` have paid, or answers that this read
+    /// should decode the part whole and hold it, which is when the rent with this read's share in
+    /// it comes to the whole part.
+    ///
+    /// The share is counted before the read rather than after. Counted after, a read that costs the
+    /// whole part anyway, which is every read of a page [`decode_at`] decodes whole, paid for the
+    /// part and let it go, and the next run of the query decoded it whole a second time to hold it:
+    /// on JOB 19a that second run cost twice what the third did.
+    fn pay_or_hold(&self, at: usize, column: usize, paid: usize, rows: usize) -> bool {
+        let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else {
+            return false;
+        };
+        let before = match &*held {
+            PartSlot::Held { .. } => return false,
+            PartSlot::Seen(before) => *before,
+            PartSlot::Unseen => 0,
+        };
+        if before.saturating_add(paid) >= rows {
+            return true;
+        }
+        *held = PartSlot::Seen(before + paid);
+        false
     }
 
     /// Adds `rows` to what reads of part `at` of `column` have paid, unless it is held already.
@@ -16882,8 +16926,10 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A part is held once reads of it have decoded all its rows, a first read of some or all of
-    /// it only counts them, and a part the pool lets go is decoded again from its pages.
+    /// A whole read holds the part it decoded, reads at positions count what they cost until the
+    /// read whose share comes to the part holds it, and a part the pool lets go is decoded again
+    /// from its pages. A part of 64 integers is decoded whole by any read of it, so here the first
+    /// read at positions already pays for all of it.
     #[test]
     fn a_pool_keeps_decoded_parts_and_lets_them_go_under_its_budget() {
         let path = path("decoded-parts");
@@ -16912,31 +16958,21 @@ mod tests {
         };
         let sparse = a.read_rows(0, &[0], &[3], false).expect("one row");
         assert_eq!(sparse.value_at(0, 0), Value::Integer(3));
-        let first = paid(0).expect("a sparse first read only counts what it cost");
-        assert!(first > 0, "which is something");
-        assert_eq!(pool.bytes(), 0, "and keeps nothing");
+        assert!(paid(0).is_none_or(|paid| paid > 0), "a read pays something");
         let mut reads = 1;
-        while paid(0).expect("and so do the ones after it") < 64 {
-            a.read_rows(0, &[0], &[3], false).expect("one row");
+        while paid(0).is_some() {
+            let again = a.read_rows(0, &[0], &[3], false).expect("one row");
+            assert_eq!(again.value_at(0, 0), Value::Integer(3));
             reads += 1;
         }
         assert!(reads <= 64, "a read pays at least a row");
-        a.read_rows(0, &[0], &[3], false).expect("one row");
         assert!(
             matches!(*slot(0), PartSlot::Held { .. }),
-            "until they have paid for as many rows as the part has"
+            "until the read whose share comes to as many rows as the part has holds it"
         );
         let whole = a.read(1, &[0]).expect("a part");
         assert_eq!(whole.len(), 64);
-        assert!(matches!(*slot(1), PartSlot::Seen(64)), "a whole first read only counts its rows");
-        a.expect_again(0);
-        a.read_rows(2, &[0], &[3], false).expect("one row");
-        assert_eq!(paid(2), Some(first), "a column read again still counts sparse reads");
-        a.read(3, &[0]).expect("a part");
-        assert!(
-            matches!(*slot(3), PartSlot::Held { .. }),
-            "and holds what a whole first read decodes"
-        );
+        assert!(matches!(*slot(1), PartSlot::Held { .. }), "a whole read holds what it decoded");
 
         for _ in 0..2 {
             for part in 0..parts {
@@ -18735,14 +18771,12 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A sweep of the dictionary reads every value, and the second sweep keeps what it read, up to
-    /// the budget.
+    /// A sweep of the dictionary reads every value and keeps what it read, up to the budget.
     ///
     /// The point of the sweep is the resident size rather than the answer, so both are checked
-    /// here. The first sweep keeps nothing, because a process that runs one statement never reads
-    /// a block twice. A dictionary this small is well under [`TEXT_KEEP_BUDGET`], so the second
-    /// sweep keeps everything and a third decodes nothing, which is what makes a session asking the
-    /// same question again cost what it should. The ceiling is the other half of it and it has its own
+    /// here. A dictionary this small is well under [`TEXT_KEEP_BUDGET`], so the first sweep keeps
+    /// everything and the second decodes nothing, which is what makes a session asking the same
+    /// question again cost what it should. The ceiling is the other half of it and it has its own
     /// test below, because a ceiling that never binds is not a ceiling anybody checked.
     #[test]
     fn a_dictionary_sweep_reads_every_value_and_keeps_it_under_the_budget() {
@@ -18798,10 +18832,10 @@ mod tests {
             swept
         };
         let swept = sweep();
-        assert_eq!(dictionary.footprint(), resting, "a first sweep keeps nothing it decoded");
-        assert_eq!(sweep(), swept, "a second sweep reads what the first did");
         let after = dictionary.footprint();
-        assert!(after > resting, "a second sweep under the budget keeps what it decoded");
+        assert!(after > resting, "a first sweep under the budget keeps what it decoded");
+        assert_eq!(sweep(), swept, "a second sweep reads what the first did");
+        assert_eq!(dictionary.footprint(), after, "and decodes nothing more");
 
         let read = (0..dictionary.len())
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
@@ -18818,10 +18852,10 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A visit keeps what it decodes the way a sweep does, nothing the first time and every block
-    /// it lands in the second, since a `LIKE` asks for the same blocks again in the next statement.
+    /// A visit in order keeps what it decodes the way a sweep does, every block it lands in the
+    /// first time, since a `LIKE` asks for the same blocks again in the next statement.
     #[test]
-    fn a_second_visit_of_the_same_values_keeps_the_blocks_it_decoded() {
+    fn a_visit_keeps_the_blocks_it_decoded() {
         let path = path("dictionary-visit");
         let spellings = (0..2_500)
             .map(|index| Value::Varchar(format!("value {index:08} {}", "y".repeat(index % 30))))
@@ -18857,10 +18891,10 @@ mod tests {
             seen
         };
         let seen = visit();
-        assert_eq!(dictionary.footprint(), resting, "a first visit keeps nothing it decoded");
-        assert_eq!(visit(), seen, "a second visit reads what the first did");
-        assert!(dictionary.footprint() > resting, "a second visit keeps what it decoded");
+        let kept = dictionary.footprint();
+        assert!(kept > resting, "a first visit keeps what it decoded");
         assert_eq!(visit(), seen, "the kept blocks answer the same");
+        assert_eq!(dictionary.footprint(), kept, "and a second visit decodes nothing more");
         let read = indices
             .iter()
             .map(|&code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
@@ -18995,6 +19029,27 @@ mod tests {
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a sweep answers what a point read answers");
+        // A run sweep starting partway into a block hands over the same values laid end to end.
+        let mut ran: Vec<Vec<u8>> = Vec::new();
+        let mut at = 100;
+        while at < dictionary.len() {
+            let stopped = dictionary
+                .sweep_text_runs(at, dictionary.len(), &mut |from, run, ends| {
+                    assert_eq!(from, 100 + ran.len(), "a run sweep hands its runs over in order");
+                    let mut start = 0;
+                    for &end in ends {
+                        ran.push(run[start..end].to_vec());
+                        start = end;
+                    }
+                    assert_eq!(start, run.len(), "the last end is the end of the run");
+                    Ok(())
+                })
+                .expect("a run sweep reads")
+                .expect("a stored dictionary lays its values end to end");
+            assert!(stopped > at, "a run sweep moves");
+            at = stopped;
+        }
+        assert_eq!(ran, read[100..], "a run sweep answers what a point read answers");
         fs::remove_file(path).expect("remove scratch file");
     }
 

@@ -855,7 +855,7 @@ impl Valued {
     fn passing(
         &self,
         types: &[LogicalType],
-        dictionary: &Vector,
+        dictionary: &Arc<Vector>,
         threads: usize,
     ) -> Option<Vec<u32>> {
         let nulls = self.over(types, 1, None)?;
@@ -893,10 +893,16 @@ impl Valued {
     }
 
     /// The codes in `range` of `dictionary` every test passes, a window at a time.
+    ///
+    /// Each window is handed to the tests as codes over the dictionary rather than as a cut of it.
+    /// The dictionary is the file's own text, and a cut of that copies every string of the window
+    /// out, and not copying it took the 113 JOB queries from 38.09 to 36.71 billion warm cycles.
+    /// As codes, a `LIKE` reads the strings where they lie, and the answers it keeps for each code
+    /// are the ones the scan asks for again when it reads the rows.
     fn codes_in(
         &self,
         types: &[LogicalType],
-        dictionary: &Vector,
+        dictionary: &Arc<Vector>,
         range: Range<usize>,
     ) -> Option<Vec<u32>> {
         let mut scratches = self.tests.iter().map(Prepared::scratch).collect::<Vec<_>>();
@@ -904,7 +910,12 @@ impl Valued {
         let mut pass = Vec::new();
         for at in range.clone().step_by(VECTOR_SIZE) {
             let len = VECTOR_SIZE.min(range.end - at);
-            let values = self.over(types, len, Some(dictionary.slice(at, len).ok()?))?;
+            let window: Vec<u32> = (at..at + len).map(|code| code as u32).collect();
+            let highest = window.last().copied();
+            let window =
+                Vector::stable_dictionary_validated(window, Arc::clone(dictionary), highest)
+                    .ok()?;
+            let values = self.over(types, len, Some(window))?;
             pass.clear();
             pass.resize(len, 0_usize);
             for (test, scratch) in self.tests.iter().zip(&mut scratches) {

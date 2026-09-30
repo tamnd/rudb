@@ -56,7 +56,7 @@ use crate::{bounds, walk};
 /// anded together take a table to one row in a hundred and twenty five. That compounding is the
 /// part most likely to be wrong, and it is kept because the alternative is to treat a query with
 /// three conditions as though it were as selective as a query with one.
-const KEPT_BY_A_CONDITION: f64 = 0.2;
+pub(crate) const KEPT_BY_A_CONDITION: f64 = 0.2;
 
 /// What a group by is assumed to collapse its input to.
 ///
