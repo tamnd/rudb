@@ -85,6 +85,7 @@ mod maps;
 mod math;
 pub mod membership;
 mod nested_text;
+mod normalize;
 mod number;
 mod path;
 mod peel;
