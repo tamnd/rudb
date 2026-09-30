@@ -608,6 +608,27 @@ enum Body {
     },
 }
 
+impl Body {
+    /// A flat body over `data`, held as pages when its values are fixed width.
+    ///
+    /// A vector is written once, by whatever built it, and read after that, so its values are put
+    /// behind an `Arc` as it is made. Cloning or cutting the vector then moves a pointer instead
+    /// of copying every value, and a write through it copies out only when somebody else is still
+    /// reading the same values. Each place that passed a column along used to decide for itself
+    /// whether it could take the column or had to copy it, and on TPC-H q09 the copies that were
+    /// left were a tenth of the query.
+    ///
+    /// Strings are the exception and keep an arena of their own. A cut of an owned arena copies
+    /// only the bytes it keeps, and a page would hold every byte of the column for as long as any
+    /// cut of it lives, which for a string column read once and filtered is most of what it holds.
+    fn flat(data: Data) -> Self {
+        match data {
+            Data::Varlen(_) => Self::Flat(data),
+            data => Self::Flat(data.into_pages()),
+        }
+    }
+}
+
 /// Random access to immutable text kept by a storage reader.
 pub trait TextSource: std::fmt::Debug + Send + Sync {
     /// Number of values available.
@@ -920,7 +941,7 @@ impl Vector {
                 layout_of(&data)
             )));
         }
-        Ok(Self { ty, len, validity: Validity::AllValid, body: Body::Flat(data) })
+        Ok(Self { ty, len, validity: Validity::AllValid, body: Body::flat(data) })
     }
 
     /// A flat vector built from single values, with the nulls among them turning into validity.
@@ -959,7 +980,7 @@ impl Vector {
             push_value(&mut data, &value)?;
         }
         let validity = Validity::from_iter(values.len(), |index| !values[index].is_null());
-        Ok(Self { ty, len: values.len(), validity, body: Body::Flat(data) })
+        Ok(Self { ty, len: values.len(), validity, body: Body::flat(data) })
     }
 
     /// A list vector of `element`, built from one [`Value::List`] per row.
@@ -3334,7 +3355,7 @@ impl Vector {
                 for index in at..end {
                     out.push_bytes(source.bytes_at(index)?.unwrap_or_default());
                 }
-                Body::Flat(Data::Varlen(out))
+                Body::flat(Data::Varlen(out))
             }
             // The one form with nowhere to point, so its range is copied out. A run and not a
             // gather: this used to build a vector of the positions `at..end` and hand it to
@@ -3343,7 +3364,7 @@ impl Vector {
             // passes and three allocations to say `memcpy`, and on a scan it was the largest thing
             // in the program after the aggregation itself, because every chunk of every column of
             // every page comes through here.
-            Body::Flat(data) => Body::Flat(run_of(data, at, end)),
+            Body::Flat(data) => Body::flat(run_of(data, at, end)),
         };
         Ok(Self { ty: self.ty.clone(), len, validity, body })
     }
@@ -3449,7 +3470,7 @@ impl Vector {
             ty: self.ty.clone(),
             len: rows,
             validity: Validity::AllValid,
-            body: Body::Flat(data),
+            body: Body::flat(data),
         })
     }
 
@@ -3490,7 +3511,7 @@ impl Vector {
             ty: self.ty.clone(),
             len: self.len,
             validity: Validity::AllValid,
-            body: Body::Flat(body),
+            body: Body::flat(body),
         })
     }
 
@@ -3627,7 +3648,7 @@ impl Vector {
         } else {
             Validity::AllValid
         };
-        Some(Self { ty: self.ty.clone(), len: indices.len(), validity, body: Body::Flat(data) })
+        Some(Self { ty: self.ty.clone(), len: indices.len(), validity, body: Body::flat(data) })
     }
 
     /// A gather off a stable dictionary, which is its codes gathered over the same values.
@@ -3734,7 +3755,7 @@ impl Vector {
             ty: self.ty.clone(),
             len: indices.len(),
             validity: Validity::AllValid,
-            body: Body::Flat(data),
+            body: Body::flat(data),
         })
     }
 
@@ -3866,11 +3887,11 @@ impl Vector {
                 for &index in &at {
                     push_value(&mut data, if index == NOWHERE { &Value::Null } else { &value })?;
                 }
-                Body::Flat(data)
+                Body::flat(data)
             }
             // A sequence is arithmetic rather than storage, so the gather is the arithmetic done at
             // the positions asked for, and a null writes the zero every other layout writes.
-            Body::Sequence { start, step } => Body::Flat(Data::Int64(
+            Body::Sequence { start, step } => Body::flat(Data::Int64(
                 at.iter()
                     .map(|&index| if index == NOWHERE { 0 } else { start + step * index as i64 })
                     .collect(),
@@ -3881,12 +3902,12 @@ impl Vector {
             Body::Flat(Data::Empty) => {
                 return Ok(Self::constant(self.ty.clone(), Value::Null, rows));
             }
-            Body::Flat(data) => Body::Flat(copy_of(data, &at)),
+            Body::Flat(data) => Body::flat(copy_of(data, &at)),
             // The one form whose copy is arithmetic rather than a move of bytes. It goes through a
             // typed loop per layout the way the flat copy does, because the alternative is a `Value`
             // per row and this is the path a flatten of a scanned column takes.
             Body::Packed { words, width, base, offset } => {
-                Body::Flat(unpack(&self.ty, words, *offset, *width, *base, &at)?)
+                Body::flat(unpack(&self.ty, words, *offset, *width, *base, &at)?)
             }
             // A gather keeps the form, which is what makes selecting rows out of a string column
             // cost sixteen bytes a row instead of the bytes of the strings. The arena it shares is
@@ -3907,7 +3928,7 @@ impl Vector {
             // which nobody asked to have given up: a result set of six million strings used to copy
             // every byte of them out of the pages they were already sitting in.
             Body::Views { views, arena } if arena.is_shared() => {
-                Body::Flat(Data::Varlen(StringColumn::from_parts(
+                Body::flat(Data::Varlen(StringColumn::from_parts(
                     at.iter()
                         .map(|&index| views.get(index).copied().unwrap_or_else(StringView::empty))
                         .collect(),
@@ -3930,14 +3951,14 @@ impl Vector {
                     let bytes = views.get(index).and_then(|view| view.bytes_in(arena));
                     out.push_bytes(bytes.unwrap_or_default());
                 }
-                Body::Flat(Data::Varlen(out))
+                Body::flat(Data::Varlen(out))
             }
             Body::ExternalText { source } => {
                 let mut out = StringColumn::with_capacity(at.len());
                 for &index in &at {
                     out.push_bytes(source.bytes_at(index)?.unwrap_or_default());
                 }
-                Body::Flat(Data::Varlen(out))
+                Body::flat(Data::Varlen(out))
             }
             // A gather keeps the form, because the codes do not move and a span survives being put
             // in an order the codes are not in. A position that resolved to nowhere gets the empty
@@ -3966,7 +3987,7 @@ impl Vector {
                     }
                     out.push_bytes(&scratch);
                 }
-                Body::Flat(Data::Varlen(out))
+                Body::flat(Data::Varlen(out))
             }
             // The entries move and the child does not, which is the same trade the string forms
             // make and is why a gather of a list column costs eight bytes a row however long the
@@ -5344,7 +5365,7 @@ impl Builder {
                 nulls.get(row / 64).is_none_or(|bits| bits & (1 << (row % 64)) == 0)
             })
         };
-        Vector { ty: self.ty.clone(), len: self.len, validity, body: Body::Flat(data) }
+        Vector { ty: self.ty.clone(), len: self.len, validity, body: Body::flat(data) }
     }
 }
 
@@ -6626,14 +6647,25 @@ mod tests {
         assert_eq!(run.as_slice().as_ptr() as usize, address + 16 * 8);
         assert_eq!(run.as_slice(), &(16i64..24).collect::<Vec<_>>()[..]);
         assert_eq!(cut.value_at(0), Value::BigInt(16));
-        // And the same cut of an owned run says the same thing, by copying it.
+        // And a run the vector was handed as its own is made a page as the vector is made, so its
+        // cut and its clone point into it as well.
         let owned = Vector::flat(LogicalType::BigInt, Data::Int64((0i64..64).collect())).unwrap();
-        let copied = owned.slice(16, 8).unwrap();
-        let Some(Data::Int64(run)) = copied.data() else {
+        let Some(Data::Int64(whole)) = owned.data() else {
             panic!("the layout changed under the test")
         };
-        assert!(!run.is_shared());
+        let start = whole.as_slice().as_ptr() as usize;
+        let cut = owned.slice(16, 8).unwrap();
+        let Some(Data::Int64(run)) = cut.data() else {
+            panic!("the layout changed under the test")
+        };
+        assert!(run.is_shared());
+        assert_eq!(run.as_slice().as_ptr() as usize, start + 16 * 8);
         assert_eq!(run.as_slice(), &(16i64..24).collect::<Vec<_>>()[..]);
+        let copy = owned.clone();
+        let Some(Data::Int64(again)) = copy.data() else {
+            panic!("the layout changed under the test")
+        };
+        assert_eq!(again.as_slice().as_ptr() as usize, start);
     }
 
     /// `into_pages` is how a producer says its values will be handed out many times. A flat body is

@@ -85,6 +85,12 @@
 //! caller that means its run to be cut many times says so once, with [`Buffer::into_page`], and
 //! after that the cuts are free. Cutting an owned run still copies, which is the same answer `Cow`
 //! gives and is why [`Buffer::slice`] is where the decision is made rather than at each call site.
+//!
+//! A [`Vector`](crate::Vector) makes that call for every flat body of fixed width values it is
+//! built over, because a vector is written by whoever built it and only read after that. So cloning
+//! or cutting a column moves a pointer, and the writes that do come later go through
+//! [`Buffer::to_mut`], which takes a whole page back without copying it when no other buffer is
+//! holding it.
 
 use std::any::Any;
 use std::ops::Deref;
@@ -313,16 +319,32 @@ impl<T: Clone> Buffer<T> {
     ///
     /// The copy on write point, and the only one. Everything that mutates a buffer goes through
     /// here, so a variant that is not owned needs a case in this function and in nothing else.
+    ///
+    /// A whole page nobody else is holding is taken back rather than copied, which is the case for
+    /// a vector that was made as a page and is written by whoever made it before anyone read it.
     #[inline]
     pub fn to_mut(&mut self) -> &mut Vec<T> {
-        if let Store::Shared { page, from, len } = &self.store {
-            self.store = Store::Owned(page[*from..*from + *len].to_vec());
+        if matches!(self.store, Store::Shared { .. }) {
+            self.own();
         }
         match &mut self.store {
             Store::Owned(values) => values,
             // A page cannot be here: the line above just replaced it.
             Store::Shared { .. } => unreachable!("a shared page was copied out one statement ago"),
         }
+    }
+
+    /// A shared run as an owned one, copied only when the page is not this buffer's alone.
+    #[cold]
+    fn own(&mut self) {
+        let values = match std::mem::replace(&mut self.store, Store::Owned(Vec::new())) {
+            Store::Owned(values) => values,
+            Store::Shared { page, from, len } if from == 0 && len == page.len() => {
+                Arc::try_unwrap(page).unwrap_or_else(|page| page.to_vec())
+            }
+            Store::Shared { page, from, len } => page[from..from + len].to_vec(),
+        };
+        self.store = Store::Owned(values);
     }
 
     /// Appends one value.
