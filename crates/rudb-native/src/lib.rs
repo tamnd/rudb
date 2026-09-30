@@ -4862,6 +4862,16 @@ type SieveSlot = OnceLock<Arc<Vec<Option<Sieve>>>>;
 
 type RangeSlot = OnceLock<Arc<Vec<Range>>>;
 
+/// How many values of a dictionary each row asked about stands for before the dictionary turns its
+/// sorted order round for a grouped min or max.
+///
+/// The map is four bytes a value. A row read out of the payload instead decodes the block of values
+/// it is in, which is kept, and a block of a thousand ClickBench URLs is about seventy kilobytes. So
+/// the map holds less once the rows come to about one for every seventeen thousand values, which is
+/// what q23 showed: its 1091 rows over 2.6 million URLs held 22 MB more read out of the payload than
+/// with the map. A power of two under that.
+const RANKS_WORTH: usize = 16384;
+
 #[derive(Debug)]
 struct NativeText {
     file: Arc<File>,
@@ -4933,6 +4943,9 @@ struct NativeText {
     /// only when something asks, which is a grouped min or max over this column and nothing else,
     /// and that reader was going to read the payload of this column once per row otherwise.
     code_ranks: OnceLock<Option<Vec<u32>>>,
+    /// How many rows grouped readers have asked the rank of while [`Self::code_ranks`] is not
+    /// built, which [`TextSource::code_ranks_for`] weighs against [`RANKS_WORTH`].
+    ranks_asked: AtomicUsize,
     /// Where each block of the payload starts in the file, and how many stored bytes it is.
     ///
     /// Absolute rather than an offset from a base the blocks share, because a block is written the
@@ -5990,6 +6003,22 @@ impl TextSource for NativeText {
             return Err(invalid("global dictionary order names a code it does not have"));
         }
         Ok(code)
+    }
+
+    /// The map once the rows asked about come to a [`RANKS_WORTH`] share of the values.
+    ///
+    /// The map is four bytes a value and a read of the whole sorted order, and a reader that looks
+    /// up a few rows gets their text out of the payload for less. ClickBench q22 takes `MIN(URL)`
+    /// over 44 rows and turned round the order of 2.6 million URLs for them, 10 MB of the 55 MB it
+    /// held at its peak. q23 asks about 1091 rows and q29 about 2.7 million, and both build it.
+    fn code_ranks_for(&self, rows: usize) -> Option<&[u32]> {
+        if self.code_ranks.get().is_none() {
+            let asked = self.ranks_asked.fetch_add(rows, Atomic::Relaxed).saturating_add(rows);
+            if asked < self.len() / RANKS_WORTH {
+                return None;
+            }
+        }
+        self.code_ranks()
     }
 
     fn code_ranks(&self) -> Option<&[u32]> {
@@ -13459,6 +13488,7 @@ fn open_global_dictionary(
             rank_blocks: (0..rank_blocks).map(|_| OnceLock::new()).collect(),
             code_bits: code_width(count),
             code_ranks: OnceLock::new(),
+            ranks_asked: AtomicUsize::new(0),
             starts,
             lengths,
             hashes,

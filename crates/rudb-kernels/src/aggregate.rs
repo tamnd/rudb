@@ -1549,15 +1549,7 @@ pub fn update_tallied(
         // `&str` that was turned straight back into the bytes it came from. It is paid where it
         // means something instead, which is the row that becomes a group's answer.
         //
-        // row at a time: each input belongs to one group; only a new extreme owns its text.
-        for row in 0..rows {
-            if !nulls.is_valid(row) {
-                continue;
-            }
-            let Some(index) = into.index(row) else { continue };
-            let bytes = input.try_bytes_at(row)?.ok_or_else(|| {
-                Error::internal("a valid varchar row had no borrowed text".to_string())
-            })?;
+        let mut offer = |index: usize, bytes: &[u8]| -> Result<()> {
             let State::Extreme { held, least } = &mut states[index].state else {
                 return Err(Error::internal("a string extreme into another state".to_string()));
             };
@@ -1585,6 +1577,31 @@ pub fn update_tallied(
                     *held = Some(Extremum::Held(Box::new(text)));
                 }
             }
+            Ok(())
+        };
+        // A column read out of storage hands the source the whole vector, which decodes each block
+        // its rows land in once for the call. Read a row at a time, every block a row lands in is
+        // decoded and kept for the rest of the query, which for a few hundred rows scattered over
+        // the URLs of ClickBench is most of the payload.
+        let visited = input.try_visit_text(&mut |row, bytes| {
+            match (row < rows).then(|| into.index(row)).flatten() {
+                Some(index) => offer(index, bytes),
+                None => Ok(()),
+            }
+        })?;
+        if visited {
+            return Ok(());
+        }
+        // row at a time: each input belongs to one group; only a new extreme owns its text.
+        for row in 0..rows {
+            if !nulls.is_valid(row) {
+                continue;
+            }
+            let Some(index) = into.index(row) else { continue };
+            let bytes = input.try_bytes_at(row)?.ok_or_else(|| {
+                Error::internal("a valid varchar row had no borrowed text".to_string())
+            })?;
+            offer(index, bytes)?;
         }
         return Ok(());
     }
@@ -2692,9 +2709,10 @@ fn run_total<T: Copy + Into<i128>>(run: &[T]) -> Option<i128> {
 /// block per row for eight hundred thousand rows and one fetch per group for ninety five thousand
 /// groups.
 ///
-/// `false` when the input is not a dictionary, or is one that does not know its order, and the
-/// caller then takes whichever of the slower paths fits. Nothing here decides an answer differently
-/// from those, only more cheaply: a rank order is the byte order of the values by the promise
+/// `false` when the input is not a dictionary, or is one that does not know its order, or one whose
+/// order the rows so far are too few to pay for turning round, and the caller then takes whichever
+/// of the slower paths fits. Nothing here decides an answer differently from those, only more
+/// cheaply: a rank order is the byte order of the values by the promise
 /// [`rudb_vector::TextSource::ranks`] makes.
 fn ranked_extremes(
     states: &mut [Accumulator],
@@ -2705,7 +2723,7 @@ fn ranked_extremes(
     least: bool,
 ) -> Result<bool> {
     let Some((codes, dictionary)) = input.shared_dictionary_parts() else { return Ok(false) };
-    let Some(ranks) = dictionary.code_ranks() else { return Ok(false) };
+    let Some(ranks) = dictionary.code_ranks_for(rows) else { return Ok(false) };
     if codes.len() < rows {
         return Ok(false);
     }
