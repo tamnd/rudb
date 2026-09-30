@@ -42,6 +42,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod crc;
 pub mod device;
 pub mod glob;
 pub mod machine;
@@ -60,6 +61,7 @@ use std::path::{Path, PathBuf};
 
 use rudb_common::Result;
 
+pub use crc::crc32c_extend;
 pub use glob::expand;
 pub use machine::{default_memory_limit, execution_cores, physical_memory};
 pub use map::Mapped;

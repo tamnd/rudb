@@ -170,6 +170,11 @@ impl Replayed {
         self.kind == Kind::Insert
     }
 
+    /// Whether this is a Ddl record, which [`Self::statement`] reads.
+    pub(crate) fn is_statement(&self) -> bool {
+        self.kind == Kind::Ddl
+    }
+
     /// The statement a Ddl record carries, which replay runs again, or `None` for any other kind.
     ///
     /// # Errors

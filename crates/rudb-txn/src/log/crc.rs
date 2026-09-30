@@ -1,10 +1,9 @@
 //! CRC-32C, the checksum every segment header and every record carries.
 //!
-//! The Castagnoli polynomial, reflected, computed eight bytes at a time from eight tables built at
-//! compile time. The x86 and arm instructions for it would be faster still, but they need `unsafe`
-//! or a dependency, and this crate has neither. A record is checksummed once when it is written and
-//! once when it is replayed, and at about a byte a cycle that is well under the cost of the copy
-//! into the lane buffer, so it can wait until a profile says otherwise.
+//! The Castagnoli polynomial, reflected. On x86 with SSE 4.2 and on arm with the CRC extension it
+//! is the processor's own instruction, eight bytes at a time. Anywhere else it is eight tables
+//! built at compile time, at about a byte a cycle. Replay checks every byte of the log, and on a
+//! 1 GiB log the tables were a larger share of the open than reading the disk.
 
 /// The reflected Castagnoli polynomial.
 const POLY: u32 = 0x82F6_3B78;
@@ -44,6 +43,13 @@ const fn tables() -> [[u32; 256]; 8] {
 /// are checksummed as one without being copied together first.
 #[must_use]
 pub(crate) fn extend(crc: u32, bytes: &[u8]) -> u32 {
+    // The instruction does eight bytes in the time the tables do one, and replay checks every
+    // byte of the log.
+    rudb_io::crc32c_extend(crc, bytes).unwrap_or_else(|| software(crc, bytes))
+}
+
+/// [`extend`] eight bytes at a time through the tables, for a machine without the instruction.
+fn software(crc: u32, bytes: &[u8]) -> u32 {
     let mut crc = !crc;
     let mut steps = bytes.chunks_exact(8);
     for step in &mut steps {
@@ -81,6 +87,16 @@ mod tests {
         // RFC 3720 appendix B.4: thirty two zero bytes and thirty two 0xFF bytes.
         assert_eq!(crc32c(&[0; 32]), 0x8A91_36AA);
         assert_eq!(crc32c(&[0xFF; 32]), 0x62A8_AB43);
+    }
+
+    #[test]
+    fn the_instruction_and_the_tables_agree() {
+        let bytes: Vec<u8> = (0..1000_u32).map(|n| (n * 131 + 17) as u8).collect();
+        for len in [0, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 999, 1000] {
+            for seed in [0, 1, 0xDEAD_BEEF] {
+                assert_eq!(extend(seed, &bytes[..len]), software(seed, &bytes[..len]), "{len}");
+            }
+        }
     }
 
     #[test]
