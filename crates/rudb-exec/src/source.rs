@@ -913,7 +913,8 @@ impl Valued {
             let window: Vec<u32> = (at..at + len).map(|code| code as u32).collect();
             let highest = window.last().copied();
             let window =
-                Vector::stable_dictionary_validated(window, Arc::clone(dictionary), highest).ok()?;
+                Vector::stable_dictionary_validated(window, Arc::clone(dictionary), highest)
+                    .ok()?;
             let values = self.over(types, len, Some(window))?;
             pass.clear();
             pass.resize(len, 0_usize);
