@@ -192,6 +192,21 @@ pub trait File: Debug + Send + Sync {
     /// dirty pages, so a second call may return success while the data is gone.
     fn sync(&self) -> Result<()>;
 
+    /// Makes every write issued before this call durable, leaving out metadata such as the
+    /// modification time when the platform can.
+    ///
+    /// Only for a file whose length is already durable, such as a log segment written whole and
+    /// synced when it was made: a write inside it changes no metadata a crash could lose, so the
+    /// data is all there is to sync. Anywhere else a short read after a crash follows, which is why
+    /// [`Self::sync`] syncs everything. The default is [`Self::sync`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::sync`], and a failed call is just as final.
+    fn sync_data(&self) -> Result<()> {
+        self.sync()
+    }
+
     /// Asks for `length` bytes from `offset` to start on their way to the device, without waiting
     /// for them and without making them durable.
     ///
