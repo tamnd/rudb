@@ -1513,7 +1513,7 @@ mod tests {
     /// the column comes out the same as reading the rows itself, or absorbing parts that were not.
     #[test]
     fn a_part_under_the_column_ceiling_leaves_the_same_column() {
-        let values: Vec<i32> = (0..60_000).map(|n| n.wrapping_mul(7919) % 50_000).collect();
+        let values: Vec<i32> = (0..60_000_i32).map(|n| n.wrapping_mul(7919) % 50_000).collect();
         let mut whole = Counts::new(1);
         let mut capped = Counts::new(1);
         let mut plain = Counts::new(1);
