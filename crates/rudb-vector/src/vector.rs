@@ -720,13 +720,15 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
         let _ = (first, literal);
         Ok(true)
     }
-    /// Hands over the values at `indices`, which rise, without keeping what reading them decoded.
+    /// Hands over the values at `indices`, which rise, without keeping what a first read of them
+    /// decoded.
     ///
-    /// The scattered twin of [`sweep`](Self::sweep). A caller that wants a few hundred values spread
-    /// over the whole source once, which is what turning a frequency synopsis's codes into values
-    /// is, would otherwise leave every block it touched decoded and held for the rest of the
-    /// source's life. On ClickBench `SearchPhrase` that is a hundred and twenty five blocks, the
-    /// larger part of what a query answered out of the synopsis was holding.
+    /// The scattered twin of [`sweep`](Self::sweep), and a source keeps what it decodes here by the
+    /// same rule. A caller that wants a few hundred values spread over the whole source once, which
+    /// is what turning a frequency synopsis's codes into values is, would otherwise leave every
+    /// block it touched decoded and held for the rest of the source's life. On ClickBench
+    /// `SearchPhrase` that is a hundred and twenty five blocks, the larger part of what a query
+    /// answered out of the synopsis was holding.
     ///
     /// `body` is told the position in `indices` and the bytes. The default reads through
     /// `bytes_at`, which is right for every source that keeps everything anyway.
@@ -2540,11 +2542,11 @@ impl Vector {
     }
 
     /// Hands `body` the values at `indices`, which rise, with their positions in `indices`, without
-    /// the source keeping what reading them decoded.
+    /// the source keeping what a first read of them decoded.
     ///
     /// For a caller that remembers what it made of each value, so that a block read for it is not
-    /// read for it again and keeping one would only hold memory. See [`TextSource::visit`]. Every
-    /// other form reads a value at a time.
+    /// read for it again within the statement. See [`TextSource::visit`]. Every other form reads a
+    /// value at a time.
     ///
     /// # Errors
     ///
@@ -3495,6 +3497,20 @@ impl Vector {
             let inside = below(indices, codes.len());
             return self.stable_gathered(codes, values, indices, inside, |index| index as usize);
         }
+        // The same for a dictionary that promises nothing across parts but whose values are the
+        // file's own, which is a demoted column read out of a stripe written before the demotion.
+        // The values are shared by every part of the column already, so pointing at them holds no
+        // memory a copy would free. Copying them was the strings of every row a sift kept, and on
+        // JOB 3a that was a fifth of the query, spent on `movie_info.info` values only an equality
+        // then looked at.
+        if let Body::Dictionary { codes, values, stable: false } = &self.body
+            && matches!(values.body, Body::ExternalText { .. })
+        {
+            let inside = below(indices, codes.len());
+            return Ok(self
+                .stable_gathered(codes, values, indices, inside, |index| index as usize)?
+                .loosened());
+        }
         // A constant gathered is the same constant at the new length, as long as every position is
         // a row of it or the value is null anyway. A join's probe gathers every column of its driving
         // side, and a scan hands up a null constant for a column only its filter read.
@@ -3731,6 +3747,14 @@ impl Vector {
         if forms_stay && let Body::Dictionary { codes, values, stable: true } = &self.body {
             let inside = at.iter().max().is_none_or(|&top| top < codes.len());
             return self.stable_gathered(codes, values, &at, inside, |index| index);
+        }
+        // A demoted column's part, the way `gather` keeps it.
+        if forms_stay
+            && let Body::Dictionary { codes, values, stable: false } = &self.body
+            && matches!(values.body, Body::ExternalText { .. })
+        {
+            let inside = at.iter().max().is_none_or(|&top| top < codes.len());
+            return Ok(self.stable_gathered(codes, values, &at, inside, |index| index)?.loosened());
         }
         let (at, leaf) = self.resolve(at);
         let live: Vec<bool> = at.iter().map(|&index| index != NOWHERE).collect();
@@ -7440,6 +7464,45 @@ mod tests {
         assert!(constant.footprint() < 200, "a constant is one value: {}", constant.footprint());
         let sequence = Vector::sequence(0, 1, 1_000_000);
         assert!(sequence.footprint() < 200, "a sequence is two numbers: {}", sequence.footprint());
+    }
+
+    /// Text held by something other than a vector, the way a file's dictionary is.
+    #[derive(Debug)]
+    struct Filed(Vec<Vec<u8>>);
+
+    impl super::TextSource for Filed {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn bytes_at(&self, index: usize) -> rudb_common::Result<Option<&[u8]>> {
+            Ok(self.0.get(index).map(Vec::as_slice))
+        }
+
+        fn footprint(&self) -> usize {
+            self.0.iter().map(Vec::len).sum()
+        }
+    }
+
+    #[test]
+    fn a_gather_off_a_loose_dictionary_over_filed_text_keeps_the_codes() {
+        let words = ["north", "east", "south", "west"];
+        let filed = Filed(words.iter().map(|word| word.as_bytes().to_vec()).collect());
+        let values =
+            Arc::new(Vector::external_text(LogicalType::Varchar, Arc::new(filed)).unwrap());
+        let codes = vec![3, 0, 2, 1, 0, 3];
+        let loose = Vector::dictionary_over(codes.clone(), Arc::clone(&values)).unwrap().loosened();
+        let picks: Vec<u32> = vec![5, 2, 0, 4];
+        for taken in [loose.gather(&picks).unwrap(), loose.copied(vec![5, 2, 0, 4], true).unwrap()]
+        {
+            let (kept, over) = taken.shared_dictionary_parts().expect("still a dictionary");
+            assert_eq!(kept, &[3, 2, 3, 0], "the codes of the rows picked");
+            assert!(Arc::ptr_eq(over, &values), "over the same values");
+            assert!(taken.stable_dictionary_parts().is_none(), "and promising no more than before");
+            for (row, &pick) in picks.iter().enumerate() {
+                assert_eq!(taken.value_at(row), loose.value_at(pick as usize), "row {row}");
+            }
+        }
     }
 
     #[test]

@@ -2654,12 +2654,33 @@ impl StableLike {
     /// Whether the stored signature proves no value from `first` to `last` holds the pattern, in
     /// which case the whole group is marked decided with the answer that proof gives, which is the
     /// negated one for `NOT LIKE`, without decoding its payload.
+    ///
+    /// Every piece of literal text in the pattern has to be somewhere in a value that matches, so
+    /// one piece the signature rules out is enough. Asking only about `%abc%` left the pattern
+    /// `'%Downey%Robert%'` of JOB 6d decoding all four million names to find the two it keeps.
     fn ruled_out(&self, first: usize, last: usize, like: &Like) -> Result<bool> {
-        let Pattern::Contains(finder) = &like.compiled else { return Ok(false) };
-        if like.fold_case
-            || finder.needle().len() < 4
-            || self.dictionary.text_block_might_contain(first, finder.needle())?
-        {
+        if like.fold_case {
+            return Ok(false);
+        }
+        let pieces: Vec<&[u8]> = match &like.compiled {
+            Pattern::Contains(finder) => vec![finder.needle()],
+            Pattern::Segments(split) => {
+                let ends = [split.prefix.as_bytes(), split.suffix.as_bytes()];
+                split.middles.iter().map(memmem::Finder::needle).chain(ends).collect()
+            }
+            Pattern::Exact(text) | Pattern::Prefix(text) | Pattern::Suffix(text) => {
+                vec![text.as_bytes()]
+            }
+            Pattern::General(_) => return Ok(false),
+        };
+        let mut absent = false;
+        for piece in pieces.into_iter().filter(|piece| piece.len() >= 4) {
+            if !self.dictionary.text_block_might_contain(first, piece)? {
+                absent = true;
+                break;
+            }
+        }
+        if !absent {
             return Ok(false);
         }
         let word = if like.negated { u64::MAX } else { 0x5555_5555_5555_5555 };
@@ -5033,6 +5054,98 @@ mod tests {
             for row in 0..rows {
                 assert_eq!(got.value_at(row), want.value_at(row), "{rows} rows, row {row}");
             }
+        }
+    }
+
+    /// Text behind a reader with a substring signature per block of [`LIKE_GROUP`] values, which
+    /// counts every value read out of a block the signature rules out.
+    #[derive(Debug)]
+    struct Signed {
+        values: Vec<Vec<u8>>,
+        wasted: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Signed {
+        fn block(&self, first: usize) -> &[Vec<u8>] {
+            let start = first / LIKE_GROUP * LIKE_GROUP;
+            &self.values[start..(start + LIKE_GROUP).min(self.values.len())]
+        }
+
+        fn has(&self, first: usize, literal: &[u8]) -> bool {
+            self.block(first).iter().any(|value| memmem::find(value, literal).is_some())
+        }
+    }
+
+    impl rudb_vector::TextSource for Signed {
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
+            if !self.has(index, b"Downey") {
+                self.wasted.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(self.values.get(index).map(Vec::as_slice))
+        }
+
+        fn might_contain(&self, first: usize, literal: &[u8]) -> Result<bool> {
+            Ok(self.has(first, literal))
+        }
+
+        fn footprint(&self) -> usize {
+            self.values.iter().map(Vec::len).sum()
+        }
+    }
+
+    /// A pattern of several pieces skips a block the signature rules out any one piece of.
+    ///
+    /// Only the second of three blocks holds `Downey`, so `'%Downey%Robert%'` and the other shapes
+    /// with a piece of four bytes or more read nothing from the other two, and still answer what
+    /// comparing the strings answers, for `NOT LIKE` as well.
+    #[test]
+    fn a_pattern_of_several_pieces_skips_the_blocks_its_signature_rules_out() {
+        let values: Vec<Vec<u8>> = (0..3 * LIKE_GROUP)
+            .map(|index| match (index / LIKE_GROUP, index % 5) {
+                (1, 0) => format!("Downey Jr., Robert {index}"),
+                (1, 1) => format!("Downey, Kim {index}"),
+                (_, 2) => format!("Robert {index}"),
+                _ => format!("Somebody {index}"),
+            })
+            .map(String::into_bytes)
+            .collect();
+        let rows = values.len();
+        let codes: Vec<u32> = (0..rows).map(|row| row as u32).collect();
+        let strings: Vec<Value> = values
+            .iter()
+            .map(|value| Value::Varchar(String::from_utf8(value.clone()).expect("text")))
+            .collect();
+        let flat = Vector::from_values(LogicalType::Varchar, &strings).expect("builds");
+        for (name, spelling) in [
+            ("~~", "%Downey%Robert%"),
+            ("!~~", "%Downey%Robert%"),
+            ("~~", "Downey%"),
+            ("~~", "%Downey, Kim 1026"),
+        ] {
+            let source = Arc::new(Signed { values: values.clone(), wasted: Default::default() });
+            let shared: Arc<dyn rudb_vector::TextSource> = Arc::clone(&source) as _;
+            let read =
+                Vector::external_text(LogicalType::Varchar, shared).expect("the source is text");
+            let column = Vector::stable_dictionary(codes.clone(), Arc::new(read))
+                .expect("codes are in range");
+            let like = Like::of(name, spelling).expect("the pattern compiles");
+            let pattern =
+                Vector::constant(LogicalType::Varchar, Value::Varchar(spelling.into()), rows);
+            let answer = |text: &Vector| {
+                like_of(name, Some(&like), text, &pattern, &LogicalType::Boolean, rows)
+                    .expect("the call is written")
+                    .expect("text in this form has a loop of its own")
+            };
+            let want = answer(&flat);
+            let got = answer(&column);
+            for row in 0..rows {
+                assert_eq!(got.value_at(row), want.value_at(row), "{name} {spelling} row {row}");
+            }
+            assert_eq!(source.wasted.load(Ordering::Relaxed), 0, "{name} {spelling}");
         }
     }
 
