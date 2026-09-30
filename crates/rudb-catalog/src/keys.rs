@@ -176,16 +176,32 @@ impl Seen {
     ///
     /// A key that is already held is found first, over all the new rows, and only then a key the
     /// new rows repeat among themselves, which is the order the pin finds them in.
-    pub(crate) fn with(&self, chunks: &[Chunk], key: &Key, columns: &[Field]) -> Result<Self> {
+    ///
+    /// `committing` says the rows are a transaction's, going into the table it committed to, and a
+    /// key already held is then named the way the pin names it when a commit fails.
+    pub(crate) fn with(
+        &self,
+        chunks: &[Chunk],
+        key: &Key,
+        columns: &[Field],
+        committing: bool,
+    ) -> Result<Self> {
         let mut scratch = Vec::new();
         for chunk in chunks {
             for row in 0..chunk.len() {
                 if encode(chunk, key, row, &mut scratch)? && self.0.contains(scratch.as_slice()) {
-                    return Err(Error::constraint(format!(
-                        "Duplicate key \"{}\" violates {} constraint.",
-                        named(chunk, key, columns, row)?,
-                        key.kind()
-                    )));
+                    return Err(Error::constraint(if committing {
+                        format!(
+                            "PRIMARY KEY or UNIQUE constraint violation: duplicate key \"{}\"",
+                            bare(chunk, key, row)?
+                        )
+                    } else {
+                        format!(
+                            "Duplicate key \"{}\" violates {} constraint.",
+                            named(chunk, key, columns, row)?,
+                            key.kind()
+                        )
+                    }));
                 }
             }
         }

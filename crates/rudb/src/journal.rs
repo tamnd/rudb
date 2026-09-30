@@ -377,6 +377,33 @@ impl Journal {
             .then_some(Record { kind: Kind::Ddl, payload: out })
     }
 
+    /// A journal that only stages, for a transaction to stage its records in apart from every
+    /// other connection's, until its commit hands them to this one with [`Self::absorb`].
+    pub(crate) fn shadow(&self) -> Self {
+        Self {
+            fs: Arc::clone(&self.fs),
+            dir: self.dir.clone(),
+            database: self.database,
+            last: self.last,
+            lane: None,
+            staged: Vec::new(),
+            staged_bytes: 0,
+            dirty: false,
+            anchored: self.anchored,
+        }
+    }
+
+    /// Takes what a [`Self::shadow`] staged, for the commit of the transaction that staged it.
+    pub(crate) fn absorb(&mut self, shadow: Self) {
+        if shadow.dirty {
+            self.dirty();
+            return;
+        }
+        for record in shadow.staged {
+            self.stage(Some(record));
+        }
+    }
+
     /// Stages a record for the commit, or marks the commit to checkpoint when there is none.
     pub(crate) fn stage(&mut self, record: Option<Record>) {
         if self.dirty {
