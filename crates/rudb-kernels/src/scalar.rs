@@ -3061,10 +3061,7 @@ fn like_stable(
         cache.state.get(index).map_or(0, |word| word.load(Ordering::Acquire)) >> shift
     };
     let first = rows.min(PROBED);
-    if rows > 0
-        && codes.len() >= rows
-        && codes[..first].iter().all(|&code| pair(code) & 1 == 1)
-    {
+    if rows > 0 && codes.len() >= rows && codes[..first].iter().all(|&code| pair(code) & 1 == 1) {
         let mut out = vec![false; rows];
         let mut undecided = 0;
         for (slot, &code) in out.iter_mut().zip(&codes[..rows]) {
@@ -3364,6 +3361,9 @@ fn date_of(
             let Some(data) = when.data() else {
                 return Ok(None);
             };
+            if holds_infinity(data) {
+                return Ok(None);
+            }
             date_runs(part, data, identity, base, rows, returns, when, truncating)
         }
         Form::Dictionary | Form::Rle => {
@@ -3376,12 +3376,28 @@ fn date_of(
             let Some(data) = values.data() else {
                 return Ok(None);
             };
+            if holds_infinity(data) {
+                return Ok(None);
+            }
             let at = move |index: usize| codes[index] as usize;
             date_runs(part, data, at, base, rows, returns, when, truncating)
         }
         // No constant arm, because the part is constant in every query that reaches this at all and
         // a constant date under a constant part is one row of work that `call` has already done.
         _ => Ok(None),
+    }
+}
+
+/// Whether a run of dates or timestamps has one of the two infinities in it.
+///
+/// The loops below read every value as a place on the calendar, and an infinity is not one, so a
+/// run that holds any goes the row at a time way instead. The values under a null are looked at as
+/// well, which can only send a run there that did not need to go.
+fn holds_infinity(data: &Data) -> bool {
+    match data {
+        Data::Int32(days) => days.iter().any(|&day| datetime::infinite_day(day)),
+        Data::Int64(micros) => micros.iter().any(|&stamp| datetime::infinite_stamp(stamp)),
+        _ => false,
     }
 }
 
@@ -3605,6 +3621,16 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
         return Err(Error::internal(format!("{name} of a {} part", spec.logical_type())));
     };
     let part = Part::parse(spelling)?;
+    // An infinity has no calendar fields, so every part of it is null and truncating it leaves it
+    // where it is. The part is still parsed first, so a misspelled one is refused the same way.
+    let infinite = match when {
+        Value::Date(days) => datetime::infinite_day(*days),
+        Value::Timestamp(micros) | Value::TimestampTz(micros) => datetime::infinite_stamp(*micros),
+        _ => false,
+    };
+    if infinite {
+        return Ok(if name == "date_trunc" { when.clone() } else { Value::Null });
+    }
     let doubled = *returns == LogicalType::Double;
     match (name == "date_trunc", when) {
         (false, Value::Date(days)) if doubled => part.double_of_days(*days).map(Value::Double),
@@ -3673,7 +3699,8 @@ fn made_civil_value(year: &Value, month: &Value, day: &Value) -> Result<Value> {
         return Err(out_of_range());
     }
     let days = days_from_civil(fitted, month, day);
-    if civil_from_days(days) != (fitted, month, day) {
+    // The two ends of the range are the infinities, so a date that lands on one is out of range.
+    if datetime::infinite_day(days) || civil_from_days(days) != (fitted, month, day) {
         return Err(out_of_range());
     }
     Ok(Value::Date(days))

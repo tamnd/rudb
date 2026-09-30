@@ -1520,11 +1520,9 @@ fn to_date(value: &Value) -> Result<Value> {
         return to_date(&Value::Timestamp(micros));
     }
     match value {
-        Value::Timestamp(micros) | Value::TimestampTz(micros) => {
-            i32::try_from(micros.div_euclid(MICROS_PER_DAY))
-                .map(Value::Date)
-                .map_err(|_| out_of_range(value, &LogicalType::Date))
-        }
+        Value::Timestamp(micros) | Value::TimestampTz(micros) => day_of_stamp(*micros)
+            .map(Value::Date)
+            .ok_or_else(|| out_of_range(value, &LogicalType::Date)),
         Value::Varchar(text) => match parse_date(text) {
             Ok(days) => Ok(Value::Date(days)),
             // A zone that is written like an offset and is not one has a sentence of its own for a
@@ -1546,6 +1544,11 @@ fn to_time(value: &Value) -> Result<Value> {
         return to_time(&Value::Timestamp(micros));
     }
     match value {
+        Value::Timestamp(micros) | Value::TimestampTz(micros)
+            if *micros == i64::MAX || *micros == -i64::MAX =>
+        {
+            Err(Error::conversion("Can't get TIME of infinite TIMESTAMP"))
+        }
         Value::Timestamp(micros) | Value::TimestampTz(micros) | Value::TimeTz(micros) => {
             Ok(Value::Time(micros.rem_euclid(MICROS_PER_DAY)))
         }
@@ -1578,7 +1581,7 @@ fn to_timestamp_tz(value: &Value) -> Result<Value> {
         return Ok(Value::TimestampTz(micros));
     }
     match value {
-        Value::Date(days) => Ok(Value::TimestampTz(i64::from(*days) * MICROS_PER_DAY)),
+        Value::Date(days) => Ok(Value::TimestampTz(stamp_of_day(*days))),
         Value::Timestamp(micros) => Ok(Value::TimestampTz(*micros)),
         Value::Varchar(text) => match parse_timestamp(text) {
             Ok(micros) => Ok(Value::TimestampTz(micros)),
@@ -1600,7 +1603,7 @@ fn to_timestamp(value: &Value) -> Result<Value> {
         return Ok(Value::Timestamp(micros));
     }
     match value {
-        Value::Date(days) => Ok(Value::Timestamp(i64::from(*days) * MICROS_PER_DAY)),
+        Value::Date(days) => Ok(Value::Timestamp(stamp_of_day(*days))),
         Value::TimestampTz(micros) => Ok(Value::Timestamp(*micros)),
         Value::Varchar(text) => match parse_timestamp(text) {
             Ok(micros) => Ok(Value::Timestamp(micros)),
@@ -1672,40 +1675,36 @@ fn to_precise(value: &Value, target: &LogicalType) -> Result<Value> {
         _ => Value::TimestampNs(ticks),
     };
     let finer = || Error::conversion("Could not convert Timestamp to higher precision.");
-    let (ticks, from) = match value {
-        Value::Varchar(text) => {
-            let unread = || not_convertible(text, &LogicalType::BigInt);
-            let micros = parse_timestamp(text).map_err(|_| unread())?;
-            if per_second < 1_000_000 {
-                return Ok(wrap(restamp(micros, 1_000_000, per_second).ok_or_else(unread)?));
+    let (ticks, from) =
+        match value {
+            Value::Varchar(text) => {
+                let unread = || not_convertible(text, &LogicalType::BigInt);
+                let micros = parse_timestamp(text).map_err(|_| unread())?;
+                if per_second < 1_000_000 || micros == i64::MAX || micros == -i64::MAX {
+                    return Ok(wrap(restamp(micros, 1_000_000, per_second).ok_or_else(unread)?));
+                }
+                // A finite timestamp that lands on the top of the range reads as infinity, and the
+                // pin refuses that rather than answering with it.
+                let nanos = micros
+                    .checked_mul(1_000)
+                    .and_then(|nanos| nanos.checked_add(sub_micros(text)))
+                    .filter(|nanos| *nanos != i64::MAX && *nanos != -i64::MAX)
+                    .ok_or_else(unread)?;
+                return Ok(wrap(nanos));
             }
-            // A finite timestamp that lands on the top of the range reads as infinity, and the
-            // pin refuses that rather than answering with it.
-            let nanos = micros
-                .checked_mul(1_000)
-                .and_then(|nanos| nanos.checked_add(sub_micros(text)))
-                .filter(|nanos| *nanos != i64::MAX && *nanos != -i64::MAX)
-                .ok_or_else(unread)?;
-            return Ok(wrap(nanos));
-        }
-        Value::Date(days) => {
-            let micros = match *days {
-                i32::MAX => i64::MAX,
-                days if days == -i32::MAX => -i64::MAX,
-                days => i64::from(days) * MICROS_PER_DAY,
-            };
-            return restamp(micros, 1_000_000, per_second).map(wrap).ok_or_else(|| {
+            Value::Date(days) => {
+                return restamp(stamp_of_day(*days), 1_000_000, per_second).map(wrap).ok_or_else(|| {
                 Error::conversion(format!(
                     "Type INT32 with value {value} can't be cast to the destination type INT64"
                 ))
             });
-        }
-        Value::Timestamp(micros) | Value::TimestampTz(micros) => (*micros, 1_000_000),
-        Value::TimestampS(ticks) => (*ticks, 1),
-        Value::TimestampMs(ticks) => (*ticks, 1_000),
-        Value::TimestampNs(ticks) if per_second != 1 => (*ticks, 1_000_000_000),
-        _ => return Err(no_cast(value, target)),
-    };
+            }
+            Value::Timestamp(micros) | Value::TimestampTz(micros) => (*micros, 1_000_000),
+            Value::TimestampS(ticks) => (*ticks, 1),
+            Value::TimestampMs(ticks) => (*ticks, 1_000),
+            Value::TimestampNs(ticks) if per_second != 1 => (*ticks, 1_000_000_000),
+            _ => return Err(no_cast(value, target)),
+        };
     restamp(ticks, from, per_second).map(wrap).ok_or_else(finer)
 }
 
@@ -1780,6 +1779,9 @@ impl Fault {
 /// is the first of January and `'2020-01-01 abc'` is a format failure rather than a date with
 /// something ignored after it.
 fn parse_date(text: &str) -> Parsed<i32> {
+    if let Some(days) = special_day(text) {
+        return Ok(days);
+    }
     let (date, era, time) = split_parts(text.trim())?;
     let days = parse_day(date, era)?;
     if let Some(time) = time {
@@ -1790,6 +1792,9 @@ fn parse_date(text: &str) -> Parsed<i32> {
 
 /// `YYYY-MM-DD` with an optional `HH:MM:SS[.ffffff]` after it, as microseconds since the epoch.
 fn parse_timestamp(text: &str) -> Parsed<i64> {
+    if let Some(days) = special_day(text) {
+        return Ok(stamp_of_day(days));
+    }
     let (date, era, time) = split_parts(text.trim())?;
     let days = i64::from(parse_day(date, era)?);
     let micros = match time {
@@ -1806,6 +1811,58 @@ fn parse_timestamp(text: &str) -> Parsed<i64> {
         return Err(Fault::Range);
     }
     Ok(stamp)
+}
+
+/// The words a date or a timestamp can be written as instead of numbers, as days since the epoch.
+///
+/// This is the pin's `TryConvertDateSpecial`, character for character. Spaces around the word are
+/// allowed and so is a minus sign in front of it, which makes `infinity` the other infinity and
+/// does nothing to `epoch`. Case does not matter. `infinity` may be cut short to `inf`, but only
+/// when the text ends right there, so `'inf'` is a date and `'inf '` is not.
+fn special_day(text: &str) -> Option<i32> {
+    let bytes = text.as_bytes();
+    let mut at = bytes.iter().take_while(|byte| byte.is_ascii_whitespace()).count();
+    let negative = bytes.get(at) == Some(&b'-');
+    if negative {
+        at += 1;
+    }
+    if bytes.get(at).is_none_or(u8::is_ascii_digit) {
+        return None;
+    }
+    let spelled = |word: &[u8], short: usize| -> Option<usize> {
+        let mut read = 0;
+        while at + read < bytes.len() && read < word.len() {
+            if bytes[at + read].to_ascii_lowercase() != word[read] {
+                return None;
+            }
+            read += 1;
+        }
+        (read == word.len() || read == short).then_some(at + read)
+    };
+    let (days, end) = if let Some(end) = spelled(b"infinity", 3) {
+        (if negative { -i32::MAX } else { i32::MAX }, end)
+    } else {
+        (0, spelled(b"epoch", 5)?)
+    };
+    bytes[end..].iter().all(u8::is_ascii_whitespace).then_some(days)
+}
+
+/// Midnight at the start of a day, with the two infinite days kept infinite.
+pub(crate) fn stamp_of_day(days: i32) -> i64 {
+    match days {
+        i32::MAX => i64::MAX,
+        days if days == -i32::MAX => -i64::MAX,
+        days => i64::from(days) * MICROS_PER_DAY,
+    }
+}
+
+/// The day a timestamp falls on, with the two infinite timestamps kept infinite.
+fn day_of_stamp(micros: i64) -> Option<i32> {
+    match micros {
+        i64::MAX => Some(i32::MAX),
+        micros if micros == -i64::MAX => Some(-i32::MAX),
+        micros => i32::try_from(micros.div_euclid(MICROS_PER_DAY)).ok(),
+    }
 }
 
 /// The date and the time in a written timestamp, which are separated by a space or by a `T`.
