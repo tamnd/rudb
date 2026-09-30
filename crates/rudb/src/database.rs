@@ -3792,6 +3792,15 @@ impl Shared {
                 Some(head) if head.form == rudb_graph::link::Form::Monotone => linked.monotone(),
                 _ => linked,
             };
+            let linked = if built.is_some() && second.is_none() {
+                linked.spanned(stored_spans(
+                    catalog,
+                    (&link.child.table, child_key),
+                    (&link.parent.table, parent_key),
+                ))
+            } else {
+                linked
+            };
             found.push(match second {
                 Some((child, parent)) => linked.and(child, parent),
                 None if parent_keyed(catalog, &link.parent.table, parent_keys) => linked.keyed(),
@@ -4804,6 +4813,50 @@ fn stored_link(
         parent_column,
     };
     rudb_native::graph::stored_link_counts(child_rows, parent_rows, &edge)
+}
+
+/// The spans the child's file measured for a relationship over one column, by column name.
+///
+/// Only asked for a relationship [`stored_link`] found, so the link's binding has already been
+/// checked against the parent as it is now. A span names its columns by position, which is what the
+/// file stores, and the plan names them, so they are turned into names here against the tables the
+/// positions were measured in.
+fn stored_spans(
+    catalog: &Catalog,
+    child: (&str, &String),
+    parent: (&str, &String),
+) -> Vec<rudb_opt::link::Span> {
+    let (Some(child_table), Some(parent_table)) =
+        (table_named(catalog, child.0), table_named(catalog, parent.0))
+    else {
+        return Vec::new();
+    };
+    let (
+        rudb_catalog::table::Rows::Native(child_rows),
+        rudb_catalog::table::Rows::Native(parent_rows),
+    ) = (child_table.rows(), parent_table.rows())
+    else {
+        return Vec::new();
+    };
+    let Some(child_column) = key_in(child_table, std::slice::from_ref(child.1)) else {
+        return Vec::new();
+    };
+    let (child_fields, parent_fields) = (child_rows.table().fields(), parent_rows.table().fields());
+    rudb_native::graph::stored_spans(child_rows, child_column)
+        .into_iter()
+        .filter_map(|span| {
+            let child = child_fields.get(span.child as usize)?;
+            let parent = parent_fields.get(span.parent as usize)?;
+            Some(rudb_opt::link::Span {
+                child_column: child.name.clone(),
+                parent_column: parent.name.clone(),
+                low: span.low,
+                high: span.high,
+                onto_parent: span.onto_parent,
+                onto_child: span.onto_child,
+            })
+        })
+        .collect()
 }
 
 /// Whether the parent's file holds a key map over its key column, which says the column is a key.
