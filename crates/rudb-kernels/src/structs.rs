@@ -34,23 +34,27 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Result
         ("struct_values", [Value::Struct(fields)]) => Ok(Some(Value::Struct(
             fields.iter().map(|(_, value)| (String::new(), value.clone())).collect(),
         ))),
+        // The pin looks at every field and keeps the last one that matches, so `struct_position`
+        // is the place of the last match. It also finds a null field when it is looking for a
+        // null, where `struct_contains` answers null for a null needle.
         ("struct_contains" | "struct_position", [held, needle]) => {
             let Value::Struct(fields) = held else {
                 return Ok(Some(Value::Null));
             };
-            if needle.is_null() {
-                return Ok(Some(Value::Null));
-            }
-            let at = fields.iter().position(|(_, value)| {
+            let same = |value: &Value| {
                 !value.is_null()
                     && crate::compare::order(value, needle).ok() == Some(std::cmp::Ordering::Equal)
-            });
-            Ok(Some(match (name, at) {
-                ("struct_contains", at) => Value::Boolean(at.is_some()),
-                (_, Some(at)) => Value::Integer(at as i32 + 1),
-                (_, None) => Value::Null,
+            };
+            Ok(Some(match (name, needle.is_null()) {
+                ("struct_contains", true) => Value::Null,
+                ("struct_contains", false) => Value::Boolean(fields.iter().any(|(_, v)| same(v))),
+                (_, nulls) => fields
+                    .iter()
+                    .rposition(|(_, value)| if nulls { value.is_null() } else { same(value) })
+                    .map_or(Value::Null, |at| Value::Integer(at as i32 + 1)),
             }))
         }
+        ("list_zip", _) => Ok(Some(zipped(args, returns)?)),
         ("struct_extract", [input, key]) => Ok(Some(match (input, place(key)) {
             (Value::Struct(fields), Some(at)) => {
                 fields.get(at).map_or(Value::Null, |(_, value)| value.clone())
@@ -106,6 +110,39 @@ fn merged(name: &str, args: &[Value], fields: &[Field]) -> Vec<(String, Value)> 
     }
     values.resize(fields.len(), Value::Null);
     fields.iter().map(|field| field.name.clone()).zip(values).collect()
+}
+
+/// One list of `list_zip`, whose rows are the lists' elements side by side as unnamed structs.
+///
+/// A row is as long as the longest list, with a null for each list that ran out, or as the shortest
+/// one when the trailing flag is true. A null list is read as an empty one and a null flag as false,
+/// which is what the pin does with both.
+fn zipped(args: &[Value], returns: &LogicalType) -> Result<Value> {
+    let LogicalType::List(element) = returns else {
+        return Err(Error::internal(format!("list_zip returning {returns}")));
+    };
+    let LogicalType::Struct(fields) = &**element else {
+        return Err(Error::internal(format!("list_zip returning {returns}")));
+    };
+    let lists: Vec<&[Value]> = args[..fields.len()]
+        .iter()
+        .map(|arg| match arg {
+            Value::List { values, .. } => values.as_slice(),
+            _ => &[],
+        })
+        .collect();
+    let lengths = lists.iter().map(|list| list.len());
+    let length = match args.get(fields.len()) {
+        Some(Value::Boolean(true)) => lengths.min(),
+        _ => lengths.max(),
+    };
+    let values = (0..length.unwrap_or(0))
+        .map(|at| {
+            let row = lists.iter().map(|list| (String::new(), list.get(at).cloned()));
+            Value::Struct(row.map(|(name, value)| (name, value.unwrap_or(Value::Null))).collect())
+        })
+        .collect();
+    Ok(Value::List { element: (**element).clone(), values })
 }
 
 /// The field a `struct_extract` key names, which the binder records as its place counted from one.
