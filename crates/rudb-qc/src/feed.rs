@@ -1758,8 +1758,11 @@ const PART_PAIRS: usize = 1 << 14;
 const COUNTED_SPAN: usize = 1 << 16;
 
 /// How many groups a worker's table holds before it forgets them and starts again, so that its
-/// slots and the rows it is filling stay in the cache.
-const WORKER_GROUPS: usize = 1 << 15;
+/// slots and the rows it is filling stay in the core's own cache. At 32K groups the slots, the row
+/// addresses and the rows of a count by one number take about 1.7 MB, more than the L2 of the
+/// machines we measure on, and the probes cost more than the extra rows a smaller table leaves for
+/// the merge.
+const WORKER_GROUPS: usize = 1 << 12;
 
 fn gone(table: u64) -> Error {
     Error::internal(format!("the group table or distinct set {table} is gone"))
