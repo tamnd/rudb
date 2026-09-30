@@ -8,6 +8,14 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.17
+
+For J7, #2249 hands a text dictionary's windows to a scan's early tests as codes into the dictionary rather than a copy of its strings, #2252 searches a kept dictionary block for a `LIKE` substring where its values lie instead of copying each one out first, #2240 tests narrow key bitmaps in a register, #2242 gathers nullable masks a word at a time, and #2250 tests a dictionary's keys against a sideways domain once per entry. On server2 each was measured against the main it landed on: #2249 took the 113 JOB queries from 38.09 G to 36.71 G warm user cycles, #2252 from 39.33 G to 38.18 G, and #2242 from 37.65 G to 37.12 G.
+
+#2245 and #2246 read distinct columns, closed runs and text sort keys without per row copies and answer text orders for the whole morsel. #2237 folds several lanes in one merge part when groups are few, #2238 keeps window input rows in their chunks, #2244 caps malloc arenas at a quarter of the cores, #2247 lets commits from several connections share one log sync, #2251 logs an insert's columns a run at a time, and #2231 checkpoints a grown table by writing only the rows added since its stripes. #2239, #2243 and #2248 answer the infinite dates and timestamps, the date part functions, calendar names, `strftime`, `strptime` and `time_bucket`.
+
+#2241 checks section extents with the kilobyte wide hash. The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.16
 
 For J7, #2235 answers a string equality or an `IN` list of strings on compressed text pages by comparing codes, lets that compare step aside once the part is held, skips LIKE blocks when the signature rules out any one piece of the pattern, keeps the blocks a second text visit decodes, and counts graph offsets before writing them. Warm user cycles over the 113 JOB queries on server2 go from 39.1 G to 38.18 G, with 14b down from 0.618 G to 0.401 G and 18a from 0.870 G to 0.728 G.
