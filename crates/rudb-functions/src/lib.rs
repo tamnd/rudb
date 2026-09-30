@@ -41,7 +41,7 @@ pub use settingcatalog::{
     unknown_setting,
 };
 pub use signature::{
-    FunctionKind, FunctionRow, Resolved, function_rows, kind_of, part_type, resolve,
+    FunctionKind, FunctionRow, Resolved, function_rows, kind_of, named_mismatch, part_type, resolve,
 };
 pub use table::{
     Columns, FILE_ROW_NUMBER, ResolvedTable, TableFunction, codec_metric_fields,

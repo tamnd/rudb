@@ -68,6 +68,7 @@ use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
 use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
 use crate::shape::{first, identity, nulls_of, single};
+use crate::similarity;
 use crate::split;
 use crate::structs;
 use crate::subscript;
@@ -161,6 +162,15 @@ fn run<V: AsRef<Vector>>(
         if let Some(vector) = crate::strftime::vectorized(&refs, rows)? {
             return Ok(vector);
         }
+    }
+    if matches!(name, "date_diff" | "datediff" | "date_sub" | "datesub") {
+        let refs: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
+        if let Some(vector) = crate::datediff::vectorized(name, &refs, returns, rows)? {
+            return Ok(vector);
+        }
+    }
+    if let Some(vector) = crate::path::vectorized(name, args, rows)? {
+        return Ok(vector);
     }
     if matches!(name, "strptime" | "try_strptime") {
         let refs: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
@@ -2652,6 +2662,33 @@ impl StableLike {
             }
             at = upto;
         }
+        // The values are copied end to end and searched once, for the reason on `like_joined`.
+        // Asking a value at a time started a search per title on JOB 14b, and starting them was a
+        // third of the query.
+        if let Some(joined_like) = Joined::of(like) {
+            let (mut joined, mut ends) = (Vec::new(), Vec::with_capacity(wanted.len()));
+            let mut visited = Vec::with_capacity(wanted.len());
+            let mut gather = |at: usize, text: &[u8]| {
+                joined.extend_from_slice(text);
+                ends.push(joined.len());
+                visited.push(wanted[at]);
+                Ok(())
+            };
+            if once {
+                self.dictionary.visit_text_once(&wanted, &mut gather)?;
+            } else {
+                let codes = wanted.iter().map(|&code| code as u32).collect::<Vec<_>>();
+                self.dictionary.visit_text(&codes, &mut gather)?;
+            }
+            let mut held = vec![false; ends.len()];
+            joined_like.search(&joined, &ends, &mut held);
+            for (code, held) in visited.into_iter().zip(held) {
+                let (index, shift) = Self::slot(code);
+                let pair = (1 | u64::from(held != like.negated) << 1) << shift;
+                self.word(index)?.fetch_or(pair, Ordering::Release);
+            }
+            return Ok(());
+        }
         let mut decide = |at: usize, text: &[u8]| {
             let held = like.holds_loan(text, characters)?;
             let (index, shift) = Self::slot(wanted[at]);
@@ -3574,7 +3611,7 @@ fn date_runs<A: Fn(usize) -> usize>(
         (LogicalType::Date, Data::Int32(days), true) if *returns == LogicalType::Timestamp => {
             let mut out = vec![0i64; rows];
             let validity = over_valid(rows, base, |index| {
-                out[index] = cast::stamp_of_day(part.truncate_days(days[at(index)])?);
+                out[index] = datetime::checked_midnight(part.truncate_days(days[at(index)])?)?;
                 Ok(())
             })?;
             finish(returns, Data::Int64(out.into()), validity)
@@ -3668,14 +3705,15 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
         Value::Timestamp(micros) | Value::TimestampTz(micros) => datetime::infinite_stamp(*micros),
         _ => false,
     };
-    // A date truncated for a timestamp answer is its midnight, the infinities included.
+    // A date truncated for a timestamp answer is its midnight, the infinities included, and a
+    // midnight past the end of the timestamps is refused.
     let midnight = |days: i32| match returns {
-        LogicalType::Timestamp => Value::Timestamp(cast::stamp_of_day(days)),
-        _ => Value::Date(days),
+        LogicalType::Timestamp => datetime::checked_midnight(days).map(Value::Timestamp),
+        _ => Ok(Value::Date(days)),
     };
     if infinite {
         return Ok(match (name == "date_trunc", when) {
-            (true, Value::Date(days)) => midnight(*days),
+            (true, Value::Date(days)) => midnight(*days)?,
             (true, _) => when.clone(),
             (false, _) => Value::Null,
         });
@@ -3694,6 +3732,9 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
                     | Part::Millisecond
                     | Part::Microsecond
                     | Part::Epoch
+                    | Part::Timezone
+                    | Part::TimezoneHour
+                    | Part::TimezoneMinute
             );
             if !timed {
                 return Err(Error::not_implemented(format!(
@@ -3720,7 +3761,7 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
         (false, Value::Interval { months, days, micros }) => {
             part.of_an_interval(spelling)?.of_interval(*months, *days, *micros).map(Value::BigInt)
         }
-        (true, Value::Date(days)) => part.truncate_days(*days).map(midnight),
+        (true, Value::Date(days)) => part.truncate_days(*days).and_then(midnight),
         (true, Value::Timestamp(micros)) => part.truncate_micros(*micros).map(Value::Timestamp),
         // The truncation comes back zoned, because `date_trunc` answers the type it was handed and
         // the plan holds that type next to the value. Which moment it lands on is the calendar's
@@ -3757,7 +3798,7 @@ fn made_date_value(days: &Value) -> Result<Value> {
 /// date that was never there, and that catches the month length and the leap year without a table of
 /// either. The message names the three numbers the way they were written, unpadded, which is what
 /// the binary prints.
-fn made_civil_value(year: &Value, month: &Value, day: &Value) -> Result<Value> {
+pub(crate) fn made_civil_value(year: &Value, month: &Value, day: &Value) -> Result<Value> {
     let (Some(year), Some(month), Some(day)) = (year.as_i64(), month.as_i64(), day.as_i64()) else {
         return Err(Error::internal("make_date of something that is not three numbers"));
     };
@@ -3956,6 +3997,10 @@ pub fn call_values(
     if let Some(answer) = split::before_nulls(name, args) {
         return answer;
     }
+    // The path functions read a null option as the option not given.
+    if let Some(answer) = crate::path::before_nulls(name, args) {
+        return answer;
+    }
     // `hash` hashes a null like any other value.
     if name == "hash" {
         return Ok(Value::UBigInt(hash::hash_all(args)));
@@ -4104,6 +4149,31 @@ pub fn call_values(
         }
         ("position" | "strpos" | "instr", [haystack, needle]) => text::position(haystack, needle),
         ("contains", [haystack, needle]) => text::contains(haystack, needle),
+        // The signature cast the count to a BIGINT.
+        ("format_bytes" | "formatReadableSize", [Value::BigInt(bytes)]) => {
+            Ok(Value::Varchar(crate::bytes::format_bytes(*bytes, false)))
+        }
+        ("formatReadableDecimalSize", [Value::BigInt(bytes)]) => {
+            Ok(Value::Varchar(crate::bytes::format_bytes(*bytes, true)))
+        }
+        // The signature cast every argument after the format to a kind the formatter reads.
+        ("format", [Value::Varchar(pattern), rest @ ..]) => crate::printf::format(pattern, rest),
+        ("printf", [Value::Varchar(pattern), rest @ ..]) => crate::printf::printf(pattern, rest),
+        ("parse_formatted_bytes", [Value::Varchar(text)]) => {
+            Ok(Value::UBigInt(crate::bytes::parse_formatted_bytes(text)?))
+        }
+        ("levenshtein" | "editdist3", [a, b]) => similarity::levenshtein(a, b),
+        ("damerau_levenshtein", [a, b]) => similarity::damerau_levenshtein(a, b),
+        ("mismatches" | "hamming", [a, b]) => similarity::mismatches(a, b),
+        ("jaccard", [a, b]) => similarity::jaccard(a, b),
+        ("jaro_similarity", [a, b, cutoff @ ..]) => {
+            similarity::jaro_similarity(a, b, cutoff.first())
+        }
+        ("jaro_winkler_similarity", [a, b, cutoff @ ..]) => {
+            similarity::jaro_winkler_similarity(a, b, cutoff.first())
+        }
+        ("starts_with" | "prefix" | "^@", [text, affix]) => similarity::affix(text, affix, false),
+        ("ends_with" | "suffix", [text, affix]) => similarity::affix(text, affix, true),
         ("left" | "right", [held, count]) => text::end(name, held, count),
         ("replace", [held, needle, replacement]) => text::replace(held, needle, replacement),
         ("chr", [code]) => text::chr(code),
@@ -4127,10 +4197,39 @@ pub fn call_values(
             "like_escape" | "not_like_escape" | "ilike_escape" | "not_ilike_escape",
             [text, pattern, escape],
         ) => escaped_like(name, text, pattern, escape),
+        // A list of parts is each part on its own, one to a field of the struct the binder made.
+        ("date_part", [Value::List { values, .. }, when]) => {
+            let LogicalType::Struct(fields) = returns else {
+                return Err(Error::internal(format!("date_part of a list returning {returns}")));
+            };
+            let mut parts = Vec::with_capacity(fields.len());
+            for (spec, field) in values.iter().zip(fields) {
+                parts.push((field.name.clone(), date_value(name, spec, when, &field.ty)?));
+            }
+            Ok(Value::Struct(parts))
+        }
         ("date_part" | "date_trunc", [spec, when]) => date_value(name, spec, when, returns),
         ("age", [later, earlier]) => datetime::age(later, earlier),
         ("trunc", [only]) => truncated(only),
         (_, [count]) if datetime::is_interval(name) => interval_value(name, count),
+        ("make_date", [Value::Struct(fields)]) => {
+            let field = |wanted: &str| {
+                fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(wanted)).map(|(_, v)| v)
+            };
+            let (Some(year), Some(month), Some(day)) =
+                (field("year"), field("month"), field("day"))
+            else {
+                return Err(Error::internal("make_date of a struct without a year, month and day"));
+            };
+            if [year, month, day].iter().any(|value| value.is_null()) {
+                return Ok(Value::Null);
+            }
+            // The fields are read as INTEGERs, so one too wide for that is refused as the cast.
+            for value in [year, month, day] {
+                cast::narrow(value.as_i64().unwrap_or_default())?;
+            }
+            made_civil_value(year, month, day)
+        }
         ("make_date", [days]) => made_date_value(days),
         ("make_date", [year, month, day]) => made_civil_value(year, month, day),
         ("dayname" | "monthname" | "last_day" | "nanosecond" | "epoch_us" | "epoch_ns", [when]) => {
@@ -4139,6 +4238,12 @@ pub fn call_values(
         ("epoch_ms", [when]) if *returns == LogicalType::BigInt => datetime::read_off(name, when),
         ("strftime", [left, right]) => crate::strftime::value(left, right),
         ("time_bucket", [_, _] | [_, _, _]) => crate::timebucket::value(args),
+        ("make_time" | "make_timestamp" | "make_timestamp_ns", _) => {
+            crate::maketime::value(name, args)
+        }
+        ("date_diff" | "datediff" | "date_sub" | "datesub", [part, start, end]) => {
+            crate::datediff::value(name, part, start, end)
+        }
         ("strptime" | "try_strptime", [text, format]) => {
             crate::strptime::value(text, format, returns, name == "strptime")
         }

@@ -205,6 +205,13 @@ enum Shape {
     /// [`Shape::Extracted`] follows and is upstream's: `substring('abcdef', 2.5, 3)` is a binder
     /// error there listing the two overloads rather than a substring from the second character.
     TextThenIndex(usize, Fixed),
+    /// Two strings that have to be strings already, then an optional cutoff that is cast to a
+    /// DOUBLE, and a DOUBLE back. `jaro_similarity(a, b, 0.9)`.
+    ///
+    /// The cutoff is the one argument a cast reaches. Upstream answers
+    /// `jaro_similarity('a', 'b', '0.5')` by reading the string as a number, while
+    /// `jaro_similarity(1, 'b')` is a binder error listing both overloads.
+    TextThenCutoff,
     /// Every argument promotes, and the result is the first argument's own type. `nullif`.
     ///
     /// The promotion is for the comparison and not for the answer, which is what makes this its own
@@ -706,11 +713,75 @@ const TABLE: &[Entry] = &[
     // `contains` is also the list search when its first argument is a list, and [`resolve`] sends
     // it to `list_contains` in that case. This row is the string overload.
     text("contains", Arity::exactly(2), Fixed::Boolean),
+    // The prefix and suffix tests. `^@` is the operator the transformer writes for `starts_with`, and
+    // each spelling is a row because upstream names the one written in its errors.
+    text("starts_with", Arity::exactly(2), Fixed::Boolean),
+    text("prefix", Arity::exactly(2), Fixed::Boolean),
+    text("^@", Arity::exactly(2), Fixed::Boolean),
+    text("ends_with", Arity::exactly(2), Fixed::Boolean),
+    text("suffix", Arity::exactly(2), Fixed::Boolean),
+    // The string distances, which count bytes and not characters the way upstream does.
+    text("levenshtein", Arity::exactly(2), Fixed::BigInt),
+    text("editdist3", Arity::exactly(2), Fixed::BigInt),
+    text("damerau_levenshtein", Arity::exactly(2), Fixed::BigInt),
+    text("mismatches", Arity::exactly(2), Fixed::BigInt),
+    text("hamming", Arity::exactly(2), Fixed::BigInt),
+    text("jaccard", Arity::exactly(2), Fixed::Double),
+    Entry {
+        name: "jaro_similarity",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 3),
+        shape: Shape::TextThenCutoff,
+        numeric_only: false,
+    },
+    Entry {
+        name: "jaro_winkler_similarity",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 3),
+        shape: Shape::TextThenCutoff,
+        numeric_only: false,
+    },
     text("strpos", Arity::exactly(2), Fixed::BigInt),
     text("instr", Arity::exactly(2), Fixed::BigInt),
     text("trim", Arity::between(1, 2), Fixed::Varchar),
     text("ltrim", Arity::between(1, 2), Fixed::Varchar),
     text("rtrim", Arity::between(1, 2), Fixed::Varchar),
+    // The path functions. `parse_filename` reads its second argument as the separator or as
+    // `trim_extension` by its type, so its arguments are read off by [`filename`] rather than by
+    // the shape.
+    text("parse_path", Arity::between(1, 2), Fixed::VarcharList),
+    text("parse_dirname", Arity::between(1, 2), Fixed::Varchar),
+    text("parse_dirpath", Arity::between(1, 2), Fixed::Varchar),
+    text("parse_filename", Arity::between(1, 3), Fixed::Varchar),
+    text("path_join", Arity::at_least(1), Fixed::Varchar),
+    // A count of bytes as a person writes one, and back. The two ClickHouse spellings are rows of
+    // their own because the pin names them in their errors, in the case they are written in here.
+    Entry {
+        name: "format_bytes",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Widened(Fixed::BigInt, Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "formatReadableSize",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Widened(Fixed::BigInt, Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "formatReadableDecimalSize",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Widened(Fixed::BigInt, Fixed::Varchar),
+        numeric_only: false,
+    },
+    text("parse_formatted_bytes", Arity::exactly(1), Fixed::UBigInt),
+    // The formatters, whose arguments after the format are cast by [`printed`] to the kinds the
+    // formatting library tells apart.
+    text("format", Arity::at_least(1), Fixed::Varchar),
+    text("printf", Arity::at_least(1), Fixed::Varchar),
     // Pattern matching. The transformer emits the operator spellings, so those are the names, and
     // `LIKE` is one of them rather than a keyword the binder has to know about separately.
     text("~~", Arity::exactly(2), Fixed::Boolean),
@@ -851,6 +922,59 @@ const TABLE: &[Entry] = &[
         shape: Shape::Exact(Fixed::Interval, Fixed::Timestamp),
         numeric_only: false,
     },
+    // A time or a timestamp built out of its fields, or a timestamp out of a count since 1970.
+    Entry {
+        name: "make_time",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Exact(Fixed::BigInt, Fixed::Time),
+        numeric_only: false,
+    },
+    Entry {
+        name: "make_timestamp",
+        kind: FunctionKind::Scalar,
+        arity: Arity::one_of(&[1, 6]),
+        shape: Shape::Exact(Fixed::BigInt, Fixed::Timestamp),
+        numeric_only: false,
+    },
+    Entry {
+        name: "make_timestamp_ns",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::BigInt, Fixed::Timestamp),
+        numeric_only: false,
+    },
+    // A part counted between two moments, as the boundaries crossed or as the whole parts that fit.
+    // The aliases are entries of their own because upstream names the one written in its errors,
+    // and `date_sub` has one overload fewer than `date_diff` to list.
+    Entry {
+        name: "date_diff",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "datediff",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "date_sub",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "datesub",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::BigInt),
+        numeric_only: false,
+    },
     // A timestamp read out of text in a format, or in the first of a list of formats that fits.
     Entry {
         name: "strptime",
@@ -961,6 +1085,16 @@ const TABLE: &[Entry] = &[
         kind: FunctionKind::Scalar,
         arity: Arity::between(2, 4),
         shape: Shape::LeadingFixedTo(2, Fixed::Varchar, Fixed::Varchar),
+        numeric_only: false,
+    },
+    // Every match rather than the first. The third argument is a group number or a list of names,
+    // and the two are overloads with different answers, so the types are decided in `every_match`
+    // and the shape here is only the row the catalog lists.
+    Entry {
+        name: "regexp_extract_all",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 4),
+        shape: Shape::LeadingFixedTo(2, Fixed::Varchar, Fixed::VarcharList),
         numeric_only: false,
     },
     // Subscripting. A bracket is one of these two calls by the time the transformer is done with it,
@@ -1480,6 +1614,20 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     if let Some((cast_to, returns)) = temporal(entry.name, arguments) {
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
     }
+    if entry.name == "regexp_extract_all" {
+        let (cast_to, returns) = every_match(arguments).ok_or_else(|| no_match(name, arguments))?;
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
+    if entry.name == "parse_filename" {
+        let cast_to = filename(arguments).ok_or_else(|| no_match(name, arguments))?;
+        let returns = LogicalType::Varchar;
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
+    if matches!(entry.name, "format" | "printf") {
+        let cast_to = printed(arguments).ok_or_else(|| no_match(name, arguments))?;
+        let returns = LogicalType::Varchar;
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
     if READ_OFF.contains(&entry.name) {
         return Err(no_match(entry.name, arguments));
     }
@@ -1901,6 +2049,24 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             }
             (cast_to, result.ty())
         }
+        Shape::TextThenCutoff => {
+            let (text, cutoff) = arguments.split_at(2.min(arguments.len()));
+            for ty in text {
+                if *ty != LogicalType::Varchar && *ty != LogicalType::Null {
+                    return Err(no_match(entry.name, arguments));
+                }
+            }
+            for ty in cutoff {
+                if !ty.is_numeric() && *ty != LogicalType::Varchar && *ty != LogicalType::Null {
+                    return Err(no_match(entry.name, arguments));
+                }
+            }
+            let mut cast_to = vec![LogicalType::Varchar; arguments.len()];
+            for slot in cast_to.iter_mut().skip(2) {
+                *slot = LogicalType::Double;
+            }
+            (cast_to, LogicalType::Double)
+        }
         Shape::ValueThenCountThenValue(_) => {
             let first = arguments[0].clone();
             let mut cast_to = vec![first.clone(); arguments.len()];
@@ -2165,6 +2331,16 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         // The pin truncates a date as the timestamp at its midnight, so the answer is a timestamp
         // whatever the part, and `date_trunc('month', DATE '2020-05-07')` is 2020-05-01 00:00:00.
         ("date_trunc", [_, Date]) => Some((vec![LogicalType::Varchar, Date], Timestamp)),
+        // A list of parts answers a struct with a field for each, and which fields those are is
+        // only known once the list is, so the struct here is empty and `narrowed_part` in
+        // `rudb-bind` fills it in from the constant.
+        (
+            "date_part",
+            [LogicalType::List(element), Date | Timestamp | TimestampTz | Time | Interval],
+        ) if matches!(**element, LogicalType::Varchar | Null) => Some((
+            vec![LogicalType::List(Box::new(LogicalType::Varchar)), arguments[1].clone()],
+            LogicalType::Struct(Vec::new()),
+        )),
         ("strftime", [Date | Timestamp | TimestampTz, LogicalType::Varchar | Null]) => {
             Some((vec![arguments[0].clone(), LogicalType::Varchar], LogicalType::Varchar))
         }
@@ -2183,6 +2359,54 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         }
         ("time_bucket", [Interval | LogicalType::Varchar, when, origin]) if when == origin => {
             Some((vec![Interval, when.clone(), when.clone()], when.clone()))
+        }
+        // A struct of a year, a month and a day, which are matched by name in any order and any
+        // case, the way the pin casts one struct to another.
+        ("make_date", [LogicalType::Struct(fields)])
+            if fields.len() == 3
+                && ["year", "month", "day"].iter().all(|wanted| {
+                    fields.iter().any(|field| field.name.eq_ignore_ascii_case(wanted))
+                })
+                && fields.iter().all(|field| counted(&field.ty) || field.ty == Null) =>
+        {
+            let fields =
+                fields.iter().map(|field| Field::new(field.name.clone(), BigInt)).collect();
+            Some((vec![LogicalType::Struct(fields)], Date))
+        }
+        // The fields are whole numbers and the seconds are a double.
+        ("make_time", [hour, minute, seconds])
+            if [hour, minute].into_iter().all(|ty| counted(ty) || *ty == Null)
+                && number(seconds) =>
+        {
+            Some((vec![BigInt, BigInt, Double], Time))
+        }
+        ("make_timestamp", [count]) if counted(count) || *count == Null => {
+            Some((vec![BigInt], Timestamp))
+        }
+        ("make_timestamp_ns", [count]) if counted(count) || *count == Null => {
+            Some((vec![BigInt], TimestampNs))
+        }
+        ("make_timestamp", [fields @ .., seconds])
+            if fields.len() == 5
+                && fields.iter().all(|ty| counted(ty) || *ty == Null)
+                && number(seconds) =>
+        {
+            Some((vec![BigInt, BigInt, BigInt, BigInt, BigInt, Double], Timestamp))
+        }
+        // Two moments of one kind, where a null or a string takes the type of the other and a date
+        // against a timestamp is counted as two timestamps. Two nulls are ambiguous upstream.
+        (
+            "date_diff" | "datediff" | "date_sub" | "datesub",
+            [LogicalType::Varchar | Null, start, end],
+        ) => {
+            let moment = match (start, end) {
+                (Date | Timestamp | Time, Null | LogicalType::Varchar) => start.clone(),
+                (Null | LogicalType::Varchar, Date | Timestamp | Time) => end.clone(),
+                (Date, Timestamp) | (Timestamp, Date) => Timestamp,
+                (Date, Date) | (Timestamp, Timestamp) | (Time, Time) => start.clone(),
+                _ => return None,
+            };
+            Some((vec![LogicalType::Varchar, moment.clone(), moment], BigInt))
         }
         // A date against a timestamp is bucketed as two timestamps.
         ("time_bucket", [Interval | LogicalType::Varchar, Date, Timestamp])
@@ -2420,6 +2644,11 @@ fn fractioned(fraction: &LogicalType, answer: LogicalType) -> LogicalType {
 
 fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
     let types = arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    no_match_spelled(name, &types)
+}
+
+/// The pin's refusal of a call no overload takes, with the argument types already written out.
+fn no_match_spelled(name: &str, types: &str) -> Error {
     let mut message = format!(
         "No function matches the given name and argument types '{name}({types})'. You might need to add explicit type casts."
     );
@@ -2432,6 +2661,98 @@ fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
         message.push('\n');
     }
     Error::binder(message)
+}
+
+/// The pin's refusal of a call whose named arguments fit none of the function's lists of
+/// parameters, or fit two of them in different orders, with each argument already spelled the way
+/// the pin spells it and a named one written `"name" := TYPE`.
+pub fn named_mismatch(name: &str, spelled: &[String], ambiguous: bool) -> Error {
+    let arguments = spelled.join(", ");
+    if !ambiguous {
+        return no_match_spelled(name, &arguments);
+    }
+    Error::binder(format!(
+        "Could not choose a best candidate function for the function call \"{name}({arguments})\". In order to select one, please add explicit type casts."
+    ))
+}
+
+/// The types `regexp_extract_all` reads its arguments as, and the type of its answer.
+///
+/// The text and the pattern have to be strings already, the way they do on the pin, where
+/// `regexp_extract_all(1234, '\d')` is refused. A group number is an `INTEGER` and only the types
+/// that widen into one are taken, so a decimal is refused rather than rounded. A list of names
+/// answers a list of structs with a field for each name, and which fields those are is only known
+/// once the list is, so the struct here is empty and the binder fills it in from the constant.
+fn every_match(arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{Integer, Null, SmallInt, TinyInt, USmallInt, UTinyInt, Varchar};
+    let text = |ty: &LogicalType| matches!(ty, Varchar | Null);
+    let (leading, rest) = arguments.split_at(arguments.len().min(2));
+    if leading.len() < 2 || !leading.iter().all(text) {
+        return None;
+    }
+    let mut cast_to = vec![Varchar, Varchar];
+    let mut returns = LogicalType::list(Varchar);
+    if let [third, options @ ..] = rest {
+        match third {
+            Null | TinyInt | SmallInt | Integer | UTinyInt | USmallInt => cast_to.push(Integer),
+            LogicalType::List(element) if text(element) => {
+                cast_to.push(LogicalType::list(Varchar));
+                returns = LogicalType::list(LogicalType::Struct(Vec::new()));
+            }
+            _ => return None,
+        }
+        if !options.iter().all(text) {
+            return None;
+        }
+        cast_to.extend(options.iter().map(|_| Varchar));
+    }
+    Some((cast_to, returns))
+}
+
+/// The types `parse_filename` reads its arguments as.
+///
+/// The pin has four overloads and the second argument picks between two of them by its type, a
+/// string being the separator and a boolean being `trim_extension`. With three arguments the second
+/// one is always `trim_extension`, and the binder has already cast a string literal there to a
+/// boolean, which is the pin's cast too and why `parse_filename('a', 'system', 'system')` is a
+/// conversion error. A string column there is refused.
+fn filename(arguments: &[LogicalType]) -> Option<Vec<LogicalType>> {
+    use LogicalType::{Boolean, Null, Varchar};
+    let text = |ty: &LogicalType| matches!(ty, Varchar | Null);
+    match arguments {
+        [path] if text(path) => Some(vec![Varchar]),
+        [path, Boolean] if text(path) => Some(vec![Varchar, Boolean]),
+        [path, separator] if text(path) && text(separator) => Some(vec![Varchar, Varchar]),
+        [path, Boolean | Null, separator] if text(path) && text(separator) => {
+            Some(vec![Varchar, Boolean, Varchar])
+        }
+        _ => None,
+    }
+}
+
+/// The types `format` and `printf` read their arguments as.
+///
+/// The format has to be a string already, so `printf(1)` is refused. Every other argument is cast
+/// the way the pin's `PrintfFunction` binds it: a signed integer to a BIGINT, an unsigned one to a
+/// UBIGINT, the two 128 bit integers and a boolean and a string to themselves, any other number to
+/// a DOUBLE, and anything else to its text.
+fn printed(arguments: &[LogicalType]) -> Option<Vec<LogicalType>> {
+    use LogicalType as T;
+    let (format, rest) = arguments.split_first()?;
+    if !matches!(format, T::Varchar | T::Null) {
+        return None;
+    }
+    let mut cast_to = vec![T::Varchar];
+    cast_to.extend(rest.iter().map(|ty| match ty {
+        T::Boolean => T::Boolean,
+        T::TinyInt | T::SmallInt | T::Integer | T::BigInt => T::BigInt,
+        T::UTinyInt | T::USmallInt | T::UInteger | T::UBigInt => T::UBigInt,
+        T::HugeInt => T::HugeInt,
+        T::UHugeInt => T::UHugeInt,
+        T::Float | T::Double | T::Decimal { .. } => T::Double,
+        _ => T::Varchar,
+    }));
+    Some(cast_to)
 }
 
 /// The functions that read something off a moment, or read a moment out of text, and take nothing
@@ -2447,6 +2768,13 @@ const READ_OFF: &[&str] = &[
     "strptime",
     "try_strptime",
     "time_bucket",
+    "date_diff",
+    "datediff",
+    "date_sub",
+    "datesub",
+    "make_time",
+    "make_timestamp",
+    "make_timestamp_ns",
 ];
 
 /// What the reference prints under `Candidate functions:`, per function, byte for byte.
@@ -2461,6 +2789,61 @@ const READ_OFF: &[&str] = &[
 /// A name missing from here gets the sentence with no block under it, which is what every function
 /// outside the string family does today.
 const CANDIDATES: &[(&str, &[&str])] = &[
+    (
+        "make_date",
+        &[
+            "make_date(col0 INTEGER) -> DATE",
+            "make_date(col0 BIGINT, col1 BIGINT, col2 BIGINT) -> DATE",
+            "make_date(col0 STRUCT(\"year\" BIGINT, \"month\" BIGINT, \"day\" BIGINT)) -> DATE",
+        ],
+    ),
+    ("make_time", &["make_time(col0 BIGINT, col1 BIGINT, col2 DOUBLE) -> TIME"]),
+    (
+        "make_timestamp",
+        &[
+            "make_timestamp(col0 BIGINT, col1 BIGINT, col2 BIGINT, col3 BIGINT, col4 BIGINT, col5 DOUBLE) -> TIMESTAMP",
+            "make_timestamp(col0 BIGINT) -> TIMESTAMP",
+        ],
+    ),
+    ("make_timestamp_ns", &["make_timestamp_ns(col0 BIGINT) -> TIMESTAMP_NS"]),
+    (
+        "date_diff",
+        &[
+            "date_diff(col0 VARCHAR, col1 DATE, col2 DATE) -> BIGINT",
+            "date_diff(col0 VARCHAR, col1 TIME, col2 TIME) -> BIGINT",
+            "date_diff(col0 VARCHAR, col1 TIMESTAMP, col2 TIMESTAMP) -> BIGINT",
+            "date_diff(col0 VARCHAR, col1 TIMESTAMP WITH TIME ZONE, col2 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+            "date_diff(col0 VARCHAR, col1 TIMESTAMPTZ_NS, col2 TIMESTAMPTZ_NS) -> BIGINT",
+        ],
+    ),
+    (
+        "datediff",
+        &[
+            "datediff(col0 VARCHAR, col1 DATE, col2 DATE) -> BIGINT",
+            "datediff(col0 VARCHAR, col1 TIME, col2 TIME) -> BIGINT",
+            "datediff(col0 VARCHAR, col1 TIMESTAMP, col2 TIMESTAMP) -> BIGINT",
+            "datediff(col0 VARCHAR, col1 TIMESTAMP WITH TIME ZONE, col2 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+            "datediff(col0 VARCHAR, col1 TIMESTAMPTZ_NS, col2 TIMESTAMPTZ_NS) -> BIGINT",
+        ],
+    ),
+    (
+        "date_sub",
+        &[
+            "date_sub(col0 VARCHAR, col1 DATE, col2 DATE) -> BIGINT",
+            "date_sub(col0 VARCHAR, col1 TIME, col2 TIME) -> BIGINT",
+            "date_sub(col0 VARCHAR, col1 TIMESTAMP, col2 TIMESTAMP) -> BIGINT",
+            "date_sub(col0 VARCHAR, col1 TIMESTAMP WITH TIME ZONE, col2 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+        ],
+    ),
+    (
+        "datesub",
+        &[
+            "datesub(col0 VARCHAR, col1 DATE, col2 DATE) -> BIGINT",
+            "datesub(col0 VARCHAR, col1 TIME, col2 TIME) -> BIGINT",
+            "datesub(col0 VARCHAR, col1 TIMESTAMP, col2 TIMESTAMP) -> BIGINT",
+            "datesub(col0 VARCHAR, col1 TIMESTAMP WITH TIME ZONE, col2 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+        ],
+    ),
     (
         "time_bucket",
         &[
@@ -3004,6 +3387,41 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("strpos", &["strpos(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("starts_with", &["starts_with(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("prefix", &["prefix(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("^@", &["\"^@\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("ends_with", &["ends_with(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("suffix", &["suffix(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("levenshtein", &["levenshtein(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("editdist3", &["editdist3(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("damerau_levenshtein", &["damerau_levenshtein(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("mismatches", &["mismatches(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("hamming", &["hamming(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    ("jaccard", &["jaccard(col0 VARCHAR, col1 VARCHAR) -> DOUBLE"]),
+    (
+        "regexp_extract_all",
+        &[
+            "regexp_extract_all(string VARCHAR, regex VARCHAR) -> VARCHAR[]",
+            "regexp_extract_all(string VARCHAR, regex VARCHAR, \"group\" INTEGER) -> VARCHAR[]",
+            "regexp_extract_all(string VARCHAR, regex VARCHAR, \"group\" INTEGER, \"options\" VARCHAR) -> VARCHAR[]",
+            "regexp_extract_all(string VARCHAR, regex VARCHAR, name_list VARCHAR[]) -> VARCHAR[]",
+            "regexp_extract_all(string VARCHAR, regex VARCHAR, name_list VARCHAR[], \"options\" VARCHAR) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "jaro_similarity",
+        &[
+            "jaro_similarity(col0 VARCHAR, col1 VARCHAR) -> DOUBLE",
+            "jaro_similarity(col0 VARCHAR, col1 VARCHAR, col2 DOUBLE) -> DOUBLE",
+        ],
+    ),
+    (
+        "jaro_winkler_similarity",
+        &[
+            "jaro_winkler_similarity(col0 VARCHAR, col1 VARCHAR) -> DOUBLE",
+            "jaro_winkler_similarity(col0 VARCHAR, col1 VARCHAR, col2 DOUBLE) -> DOUBLE",
+        ],
+    ),
     ("instr", &["instr(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
     (
         "trim",
@@ -3011,6 +3429,43 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ),
     ("ltrim", &["ltrim(col0 VARCHAR) -> VARCHAR", "ltrim(col0 VARCHAR, col1 VARCHAR) -> VARCHAR"]),
     ("rtrim", &["rtrim(col0 VARCHAR) -> VARCHAR", "rtrim(col0 VARCHAR, col1 VARCHAR) -> VARCHAR"]),
+    (
+        "parse_path",
+        &[
+            "parse_path(col0 VARCHAR) -> VARCHAR[]",
+            "parse_path(col0 VARCHAR, col1 VARCHAR) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "parse_dirname",
+        &[
+            "parse_dirname(col0 VARCHAR) -> VARCHAR",
+            "parse_dirname(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+        ],
+    ),
+    (
+        "parse_dirpath",
+        &[
+            "parse_dirpath(col0 VARCHAR) -> VARCHAR",
+            "parse_dirpath(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+        ],
+    ),
+    (
+        "parse_filename",
+        &[
+            "parse_filename(col0 VARCHAR) -> VARCHAR",
+            "parse_filename(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+            "parse_filename(col0 VARCHAR, col1 BOOLEAN) -> VARCHAR",
+            "parse_filename(col0 VARCHAR, col1 BOOLEAN, col2 VARCHAR) -> VARCHAR",
+        ],
+    ),
+    ("path_join", &["path_join(col0 VARCHAR, [VARCHAR...]) -> VARCHAR"]),
+    ("format", &["format(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
+    ("printf", &["printf(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
+    ("format_bytes", &["format_bytes(col0 BIGINT) -> VARCHAR"]),
+    ("formatReadableSize", &["formatReadableSize(col0 BIGINT) -> VARCHAR"]),
+    ("formatReadableDecimalSize", &["formatReadableDecimalSize(col0 BIGINT) -> VARCHAR"]),
+    ("parse_formatted_bytes", &["parse_formatted_bytes(col0 VARCHAR) -> UBIGINT"]),
     ("~~", &["\"~~\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
     ("!~~", &["\"!~~\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
     ("~~*", &["\"~~*\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
@@ -3531,6 +3986,7 @@ impl Shape {
             Self::TextThenIndex(taken, to) => {
                 (leading(taken, Fixed::Varchar.name(), "BIGINT"), to.name())
             }
+            Self::TextThenCutoff => (leading(2, Fixed::Varchar.name(), "DOUBLE"), "DOUBLE"),
             // The value, then a row count, then another value of the first one's type. The third
             // one is `ANY` and not the spelling of the first, which is the pin's row for `lag` and
             // is where the declaration stops being the rule: the binder casts the default to the
@@ -3634,6 +4090,7 @@ fn canonical(name: &str) -> &str {
 /// `list_slice`, exactly as `len(1)` says `length`.
 const ALIASES: &[(&str, &str)] = &[
     ("ceiling", "ceil"),
+    ("pg_size_pretty", "format_bytes"),
     ("datepart", "date_part"),
     ("datetrunc", "date_trunc"),
     ("power", "pow"),
@@ -3982,9 +4439,11 @@ mod tests {
         assert_eq!(civil.returns, LogicalType::Date);
         assert_eq!(civil.arguments, vec![LogicalType::Integer; 3]);
         let error = resolve("make_date", &vec![LogicalType::Integer; 2]).unwrap_err();
-        assert_eq!(
-            error.message(),
-            "No function matches the given name and argument types 'make_date(INTEGER, INTEGER)'. You might need to add explicit type casts."
+        assert!(
+            error.message().starts_with(
+                "No function matches the given name and argument types 'make_date(INTEGER, INTEGER)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tmake_date(col0 INTEGER) -> DATE"
+            ),
+            "{error}"
         );
     }
 
@@ -4130,6 +4589,7 @@ mod tests {
                 let leading = match entry.shape {
                     Shape::Extracted | Shape::Sliced | Shape::ListCounted | Shape::Resized => 1,
                     Shape::TextThenIndex(leading, _) => leading,
+                    Shape::TextThenCutoff => 2,
                     _ => count,
                 };
                 for bound in arguments.iter_mut().skip(leading) {
@@ -4168,7 +4628,21 @@ mod tests {
                         arguments[0] = strings();
                     }
                     _ if entry.name == "strftime" => arguments[1] = LogicalType::Varchar,
+                    _ if entry.name == "regexp_extract_all" && count > 2 => {
+                        arguments[2] = LogicalType::Integer;
+                    }
+                    _ if entry.name == "parse_filename" && count == 3 => {
+                        arguments[1] = LogicalType::Boolean;
+                    }
                     _ if entry.name == "time_bucket" => arguments[1] = LogicalType::Date,
+                    _ if matches!(
+                        entry.name,
+                        "date_diff" | "datediff" | "date_sub" | "datesub"
+                    ) =>
+                    {
+                        arguments[1] = LogicalType::Date;
+                        arguments[2] = LogicalType::Date;
+                    }
                     Shape::Histogram if count == 2 => arguments[1] = strings(),
                     Shape::Bits => {
                         arguments = match entry.name {

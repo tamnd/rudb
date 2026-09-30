@@ -130,6 +130,15 @@ impl Binder<'_> {
                     None => self.bind_call(ast, name, args, distinct, filter, &[], scope),
                 }
             }
+            ast::Expr::Function { name, args, .. } if !ast.named_args(expr).is_empty() => {
+                let written = ast.name(name).last().unwrap_or_default().to_string();
+                let sorted = ast.aggregate_order(expr);
+                self.refuse_named(ast, expr, &written, ast.expr_list(args), sorted, scope)
+            }
+            ast::Expr::Window { name, args, .. } if !ast.named_args(expr).is_empty() => {
+                let written = ast.name(name).last().unwrap_or_default().to_string();
+                self.refuse_named(ast, expr, &written, ast.expr_list(args), &[], scope)
+            }
             ast::Expr::Function { name, args, distinct, filter } => {
                 let sorted = ast.aggregate_order(expr);
                 // Only an aggregate reads this, and the pin lets any other call write it and
@@ -638,6 +647,7 @@ impl Binder<'_> {
             let right = self.as_boolean(right, word)?;
             return Ok(self.conjunction(connective, vec![left, right]));
         }
+        let written = [left, right];
         let left = self.bind_expr(ast, left, scope)?;
         let mut right = self.bind_expr(ast, right, scope)?;
         if let Some(comparison) = comparison_of(op) {
@@ -655,6 +665,14 @@ impl Binder<'_> {
             BinaryOp::SimilarTo => return self.regex_operator(left, right, false, false, true),
             BinaryOp::NotSimilarTo => {
                 return self.regex_operator(left, right, false, true, true);
+            }
+            // `^@` is `starts_with` under another name, and the pin refuses it over anything but
+            // strings with the sentence a call gets, literals spelled as literals.
+            BinaryOp::StartsWith => {
+                let types = [left, right].map(|arg| self.plan().expr_type(arg).clone());
+                return self
+                    .call("^@", vec![left, right])
+                    .map_err(|error| literals_spelled(ast, error, &written, &types));
             }
             _ => {}
         }
@@ -887,10 +905,28 @@ impl Binder<'_> {
         if rudb_catalog::same_name(&written, "age") && bound.len() == 1 {
             bound.insert(0, self.current_date());
         }
-        if let Some(&(name, part)) =
-            PART_SHORTCUTS.iter().find(|(name, _)| rudb_catalog::same_name(&written, name))
+        // `timezone` of one moment is its offset, and of a zone and a moment is a conversion that is
+        // a different function, so only the first is the shortcut.
+        if let Some(&(name, part)) = PART_SHORTCUTS
+            .iter()
+            .find(|(name, _)| rudb_catalog::same_name(&written, name))
+            .filter(|(name, _)| *name != "timezone" || bound.len() == 1)
         {
             return self.bind_part_shortcut(ast, name, part, &arguments, &bound);
+        }
+        // The byte formatters are declared over a BIGINT and nothing else, and a string literal
+        // reaches that by a cast where a VARCHAR does not, so `format_bytes('1')` is one byte,
+        // `format_bytes('x')` is the pin's conversion error and `format_bytes('1'::VARCHAR)` is
+        // refused. Only the syntax can tell the first and the last apart.
+        if ["format_bytes", "pg_size_pretty", "formatReadableSize", "formatReadableDecimalSize"]
+            .into_iter()
+            .any(|name| rudb_catalog::same_name(&written, name))
+        {
+            for (arg, bound) in arguments.iter().zip(bound.iter_mut()) {
+                if matches!(ast.expr(*arg), ast::Expr::Literal { kind: LiteralKind::String, .. }) {
+                    *bound = self.cast_to(*bound, &LogicalType::BigInt);
+                }
+            }
         }
         if let Some(function) = ["coalesce", "greatest", "least"]
             .into_iter()
@@ -962,7 +998,9 @@ impl Binder<'_> {
                 }
             }
         }
-        self.call(&written, bound)
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+        self.call(&written, bound).map_err(|error| literals_spelled(ast, error, &arguments, &types))
     }
 
     /// `list_append` and the five names like it, which are macros on the pin and are expanded the
@@ -1238,6 +1276,18 @@ impl Binder<'_> {
                 }
             }
         }
+        // The same holds for `trim_extension` in the three argument `parse_filename`, which is a
+        // BOOLEAN and the only overload with three arguments, so `'true'` there is read as true
+        // and `'system'` is the pin's conversion error rather than a separator. A third argument
+        // that is not a string is the pin's binder error, which comes before any cast.
+        if resolved_name == "parse_filename"
+            && let [_, trim, separator] = args.as_mut_slice()
+            && matches!(self.plan().expr_type(*separator), LogicalType::Varchar | LogicalType::Null)
+            && let Expr::Constant(value) = *self.plan().expr(*trim)
+            && matches!(self.plan().value(value), Value::Varchar(_))
+        {
+            *trim = self.checked_cast_to(*trim, &LogicalType::Boolean, false)?;
+        }
         let types: Vec<LogicalType> =
             args.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
         let resolved = resolve(resolved_name, &types)?;
@@ -1267,7 +1317,21 @@ impl Binder<'_> {
         for (arg, wanted) in args.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
         }
-        let returns = self.narrowed_part(resolved.name, &cast, resolved.returns);
+        if resolved.name == "regexp_extract_all" {
+            self.settled_options(&cast)?;
+        }
+        let returns = match resolved.returns {
+            LogicalType::Struct(fields) if resolved.name == "date_part" && fields.is_empty() => {
+                self.part_list(cast[0])?
+            }
+            LogicalType::List(element)
+                if resolved.name == "regexp_extract_all"
+                    && matches!(&*element, LogicalType::Struct(fields) if fields.is_empty()) =>
+            {
+                self.group_names(&cast)?
+            }
+            returns => self.narrowed_part(resolved.name, &cast, returns),
+        };
         let args = self.plan_mut().add_expr_list(&cast);
         // With `ieee_floating_point_ops` off, the math functions raise on a value outside their
         // domain instead of answering a NaN or an infinity, and the kernel is told which reading it
@@ -1577,6 +1641,47 @@ impl Binder<'_> {
         Ok(None)
     }
 
+    /// A call whose named arguments the parser could not put in places, because they fit none of
+    /// the function's lists of parameters or fit two of them in different orders. It is refused in
+    /// the pin's words, with every argument spelled the way the pin spells it. The key of a
+    /// `WITHIN GROUP` is the first argument there, since that is the place it fills.
+    fn refuse_named(
+        &mut self,
+        ast: &Ast,
+        call: ast::ExprRef,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        sorted: &[ast::OrderItem],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let function = written.to_ascii_lowercase();
+        let mut spelled = Vec::new();
+        let implicit = match sorted {
+            [key] if function.starts_with("quantile_") => {
+                let bound = self.bind_expr(ast, key.expr, scope)?;
+                spelled.push(self.plan().expr_type(bound).to_string());
+                1
+            }
+            _ => 0,
+        };
+        for &arg in arguments {
+            let bound = self.bind_expr(ast, arg, scope)?;
+            spelled.push(spelled_type(ast, arg, self.plan().expr_type(bound)));
+        }
+        let named = ast.named_args(call);
+        for target in named {
+            let bound = self.bind_expr(ast, target.expr, scope)?;
+            let ty = spelled_type(ast, target.expr, self.plan().expr_type(bound));
+            spelled.push(format!("\"{}\" := {ty}", ast.string(target.alias)));
+        }
+        let names: Vec<&str> = named.iter().map(|target| ast.string(target.alias)).collect();
+        let ambiguous = matches!(
+            rudb_parse::parameters::arrange(&function, implicit, arguments.len(), &names),
+            Ok(rudb_parse::parameters::Arranged::Ambiguous)
+        );
+        Err(rudb_functions::named_mismatch(&function, &spelled, ambiguous))
+    }
+
     /// `year(x)` and the other names that read one part of a date, bound as the `date_part` call
     /// they are on the pin.
     ///
@@ -1592,20 +1697,10 @@ impl Binder<'_> {
         arguments: &[ast::ExprRef],
         bound: &[ExprRef],
     ) -> Result<ExprRef> {
-        let written = |ty: &LogicalType, arg: ast::ExprRef| match ast.expr(arg) {
-            ast::Expr::Literal { kind: LiteralKind::String, .. } => "STRING_LITERAL".to_string(),
-            ast::Expr::Literal { kind: LiteralKind::Number, text }
-                if ast.string(text).bytes().all(|byte| byte.is_ascii_digit()) =>
-            {
-                "INTEGER_LITERAL".to_string()
-            }
-            _ if *ty == LogicalType::Null => "\"NULL\"".to_string(),
-            _ => ty.to_string(),
-        };
         let types: Vec<LogicalType> =
             bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
         let spelled: Vec<String> =
-            types.iter().zip(arguments).map(|(ty, &arg)| written(ty, arg)).collect();
+            types.iter().zip(arguments).map(|(ty, &arg)| spelled_type(ast, arg, ty)).collect();
         let interval = name != "julian";
         let timed = TIMED_SHORTCUTS.contains(&name);
         let [only] = bound[..] else {
@@ -1669,6 +1764,112 @@ impl Binder<'_> {
         let Expr::Constant(value) = *self.plan().expr(spec) else { return returns };
         let Value::Varchar(spelling) = self.plan().value(value) else { return returns };
         part_type(spelling)
+    }
+
+    /// The struct `date_part` answers for a list of parts, with a field named for each part and
+    /// typed the way the part would be on its own.
+    ///
+    /// The pin reads the list once when it binds, so a list that is not a constant is refused, and
+    /// so are an empty one, a null in it and a part named twice, all in the pin's words. A part
+    /// that names nothing is left for the kernel to refuse, as it is for a single part.
+    fn part_list(&self, list: ExprRef) -> Result<LogicalType> {
+        let Ok(Some(Value::List { values, .. })) = fold::value_of(self.plan(), list) else {
+            return Err(Error::binder(
+                "The \"part_list\" argument in function \"date_part\" must be a constant expression",
+            ));
+        };
+        if values.is_empty() {
+            return Err(Error::binder("\"date_part\" requires non-empty lists of part names"));
+        }
+        let mut fields: Vec<Field> = Vec::with_capacity(values.len());
+        for value in values {
+            let Value::Varchar(spelling) = value else {
+                return Err(Error::binder("NULL struct entry name in \"date_part\""));
+            };
+            if fields.iter().any(|field| field.name == spelling) {
+                return Err(Error::binder(format!(
+                    "Duplicate struct entry name \"{spelling}\" in \"date_part\""
+                )));
+            }
+            let ty = part_type(&spelling);
+            fields.push(Field::new(spelling, ty));
+        }
+        Ok(LogicalType::Struct(fields))
+    }
+
+    /// The option string of `regexp_extract_all`, which the pin reads once when it binds, so one
+    /// that is not a constant is refused and so is a null one, each in the pin's words.
+    fn settled_options(&self, args: &[ExprRef]) -> Result<()> {
+        let Some(&options) = args.get(3) else { return Ok(()) };
+        match fold::value_of(self.plan(), options) {
+            Ok(Some(Value::Null)) => {
+                Err(Error::invalid_input("Regex options field must not be NULL"))
+            }
+            Ok(Some(_)) => Ok(()),
+            _ => Err(Error::binder(
+                "The \"options\" argument in function \"regexp_extract_all\" must be a constant expression",
+            )),
+        }
+    }
+
+    /// The structs `regexp_extract_all` answers for a list of names, with a string field for each
+    /// name holding the group in the same place.
+    ///
+    /// The pin reads the pattern and the list once when it binds, so either one that is not a
+    /// constant is refused. So are a null list, an empty one, a null name, a name given twice, a
+    /// pattern that does not compile and more names than the pattern has groups, all in the pin's
+    /// words.
+    fn group_names(&self, args: &[ExprRef]) -> Result<LogicalType> {
+        let (Some(&pattern), Some(&names)) = (args.get(1), args.get(2)) else {
+            return Err(Error::internal("regexp_extract_all with a list and no pattern"));
+        };
+        let Ok(Some(Value::Varchar(pattern))) = fold::value_of(self.plan(), pattern) else {
+            return Err(Error::binder(
+                "\"regexp_extract_all\" with LIST requires a constant pattern",
+            ));
+        };
+        let values = match fold::value_of(self.plan(), names) {
+            Ok(Some(Value::List { values, .. })) => values,
+            Ok(Some(_)) => {
+                return Err(Error::binder("Group specification must be a non-NULL LIST"));
+            }
+            _ => {
+                return Err(Error::binder(
+                    "The \"name_list\" argument in function \"regexp_extract_all\" must be a constant expression",
+                ));
+            }
+        };
+        if values.is_empty() {
+            return Err(Error::binder("Group name list must be non-empty"));
+        }
+        let mut fields: Vec<Field> = Vec::with_capacity(values.len());
+        for value in values {
+            let Value::Varchar(name) = value else {
+                return Err(Error::binder("NULL group name in regexp_extract_all"));
+            };
+            if fields.iter().any(|field| field.name == name) {
+                return Err(Error::binder(format!(
+                    "Duplicate group name '{name}' in regexp_extract_all"
+                )));
+            }
+            fields.push(Field::new(name, LogicalType::Varchar));
+        }
+        let spelling = match args.get(3).map(|&options| fold::value_of(self.plan(), options)) {
+            Some(Ok(Some(Value::Varchar(spelling)))) => spelling,
+            _ => String::new(),
+        };
+        let options = rudb_regex::Options::parse(&spelling)?;
+        let regex = rudb_regex::Regex::with_options(&pattern, options).map_err(|error| {
+            Error::binder(format!("Pattern failed to parse: {}", error.message()))
+        })?;
+        if regex.groups() < fields.len() {
+            return Err(Error::binder(format!(
+                "Not enough capturing groups ({}) for provided names ({})",
+                regex.groups(),
+                fields.len()
+            )));
+        }
+        Ok(LogicalType::list(LogicalType::Struct(fields)))
     }
 
     /// The scale a decimal keeps once rounded to the digits the second argument asks for.
@@ -2170,9 +2371,10 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             // `count(UserID)` and `count(DISTINCT UserID)` are two different answers and a result
             // that called them both the first one would be reporting the wrong one.
             let word = if distinct { "DISTINCT " } else { "" };
+            let (list, named) = ast.written_args(expr, args);
             let mut arguments: Vec<String> =
-                ast.expr_list(args).iter().map(|&arg| describe(ast, arg, semantics)).collect();
-            for target in ast.named_args(expr) {
+                list.iter().map(|&arg| describe(ast, arg, semantics)).collect();
+            for target in named {
                 let value = describe(ast, target.expr, semantics);
                 arguments.push(format!("{} := {value}", quoted(ast.string(target.alias))));
             }
@@ -2793,11 +2995,23 @@ const PART_SHORTCUTS: &[(&str, &str)] = &[
     ("isoyear", "isoyear"),
     ("yearweek", "yearweek"),
     ("julian", "julian"),
+    ("timezone_hour", "timezone_hour"),
+    ("timezone_minute", "timezone_minute"),
+    ("timezone", "timezone"),
 ];
 
 /// The part shortcuts that read a time of day as well, which are the ones whose part a time has.
-const TIMED_SHORTCUTS: &[&str] =
-    &["hour", "minute", "second", "millisecond", "microsecond", "epoch"];
+const TIMED_SHORTCUTS: &[&str] = &[
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "epoch",
+    "timezone",
+    "timezone_hour",
+    "timezone_minute",
+];
 
 /// The part shortcuts whose names are keywords, which the pin quotes when it lists the overloads.
 const KEYWORD_SHORTCUTS: &[&str] = &[
@@ -2815,6 +3029,52 @@ const KEYWORD_SHORTCUTS: &[&str] = &[
     "week",
     "year",
 ];
+
+/// A refusal of a call no overload takes, with the arguments that were literals in the query spelled
+/// the way the pin spells them there.
+///
+/// The signature table only sees types, so it writes `levenshtein(INTEGER, INTEGER)` for
+/// `levenshtein(1, 2)`, where the pin writes `levenshtein(INTEGER_LITERAL, INTEGER_LITERAL)`
+/// because the literals have not been given a type yet when it looks for an overload.
+fn literals_spelled(
+    ast: &Ast,
+    error: Error,
+    arguments: &[ast::ExprRef],
+    types: &[LogicalType],
+) -> Error {
+    let plain = types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    let spelled = types
+        .iter()
+        .zip(arguments)
+        .map(|(ty, &arg)| spelled_type(ast, arg, ty))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (from, to) = (format!("({plain})'. You might"), format!("({spelled})'. You might"));
+    if plain == spelled || !error.message().contains(&from) {
+        return error;
+    }
+    let message = error.message().replacen(&from, &to, 1);
+    let respelled = Error::new(error.code(), message);
+    match error.span() {
+        Some(span) => respelled.with_span(span),
+        None => respelled,
+    }
+}
+
+/// An argument's type the way the pin's messages spell it, which names a string written in the
+/// query `STRING_LITERAL`, a whole number written in it `INTEGER_LITERAL` and a null `"NULL"`.
+fn spelled_type(ast: &Ast, arg: ast::ExprRef, ty: &LogicalType) -> String {
+    match ast.expr(arg) {
+        ast::Expr::Literal { kind: LiteralKind::String, .. } => "STRING_LITERAL".to_string(),
+        ast::Expr::Literal { kind: LiteralKind::Number, text }
+            if ast.string(text).bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            "INTEGER_LITERAL".to_string()
+        }
+        _ if *ty == LogicalType::Null => "\"NULL\"".to_string(),
+        _ => ty.to_string(),
+    }
+}
 
 /// The pin's refusal of a part shortcut given something it has no overload for.
 ///

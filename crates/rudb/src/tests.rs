@@ -1019,15 +1019,15 @@ fn the_regular_expression_functions_answer_the_way_duckdb_does() {
 /// `trim` was the wrong answer this engine was quietest about, so the rules of its shape are
 /// asserted where it was seen rather than only in the transformer. Per #313.
 ///
-/// `trim` itself answers now and that is #314. The other rules of the shape still refuse, and the
-/// refusal is the point: a rule that wrote a keyword was stepped through as if it were a precedence
-/// level, which left the argument behind as the answer.
+/// `trim` itself answers now and that is #314. The call this used to refuse answers too, since a
+/// name on a function that takes any number of arguments is one more of them, and the point is still
+/// the same: a rule that wrote a keyword was stepped through as if it were a precedence level, which
+/// left the argument behind as the answer.
 #[test]
 fn a_function_that_is_not_implemented_does_not_answer_its_own_argument() {
     let db = database();
-    let message = failure(&db, "SELECT list_value(1, recursive := true)");
-    assert!(message.contains("not supported yet"), "{message}");
-    assert!(message.starts_with("recursive := true is not supported yet"), "{message}");
+    let answer = rows(&db, "SELECT list_value(true, recursive := true)");
+    assert_eq!(answer[0][0].to_string(), "[true, true]");
 }
 
 /// The four string functions with a grammar rule of their own, end to end. Per #314.
@@ -2644,8 +2644,9 @@ fn the_session_context_answers_for_the_clock_the_catalog_and_the_user() {
     // A call with arguments is not one of these and reaches the signature table, which has a row per
     // name so that the message is the arity error the pin gives rather than a missing function.
     assert!(
-        failure(&db, "SELECT now(1)")
-            .starts_with("No function matches the given name and argument types 'now(INTEGER)'"),
+        failure(&db, "SELECT now(1)").starts_with(
+            "No function matches the given name and argument types 'now(INTEGER_LITERAL)'"
+        ),
         "an arity error rather than a missing function"
     );
     // A zoned value keeps its zone through arithmetic, which is the half of this that is not about

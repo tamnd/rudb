@@ -17,6 +17,7 @@ pub mod dialect;
 pub mod generate;
 pub mod generated;
 pub mod matcher;
+pub mod parameters;
 pub mod rules;
 pub mod token;
 pub mod tokenize;
