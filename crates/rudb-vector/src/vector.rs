@@ -3530,7 +3530,7 @@ impl Vector {
         self.copied(indices.iter().map(|&index| index as usize).collect(), true)
     }
 
-    /// A gather off a flat run of fixed width values with no nulls, every position inside it.
+    /// A gather off a flat run of fixed width values, every position inside it.
     ///
     /// That is what a join hands out on both of its sides, and the general copy below made a run of
     /// wide positions, walked them for nulls, made a flag per row and a validity out of the flags
@@ -3538,9 +3538,6 @@ impl Vector {
     /// one pass for the range and one for the values, and `None` for anything else.
     fn flat_at(&self, indices: &[u32]) -> Option<Self> {
         let Body::Flat(data) = &self.body else { return None };
-        if self.validity.has_nulls(self.len) {
-            return None;
-        }
         if !below(indices, self.len) {
             return None;
         }
@@ -3558,12 +3555,14 @@ impl Vector {
             };
         }
         let data = crate::for_each_layout!(fixed, gathered);
-        Some(Self {
-            ty: self.ty.clone(),
-            len: indices.len(),
-            validity: Validity::AllValid,
-            body: Body::Flat(data),
-        })
+        // A nullable column takes the same path with its mask gathered beside the values. The
+        // value under a null is whatever the column stored there, which nothing reads.
+        let validity = if self.validity.has_nulls(self.len) {
+            self.validity.gathered(self.len, indices, |index| index as usize)
+        } else {
+            Validity::AllValid
+        };
+        Some(Self { ty: self.ty.clone(), len: indices.len(), validity, body: Body::Flat(data) })
     }
 
     /// A gather off a stable dictionary, which is its codes gathered over the same values.
@@ -3601,6 +3600,10 @@ impl Vector {
         // above answers it for the whole column at once.
         let validity = if self.never_null() && at.iter().all(|&at| index(at) < self.len) {
             Validity::AllValid
+        } else if values.never_null() {
+            // The values hold no null, so every null is in the codes' own mask and the answer is
+            // that mask gathered, a word at a time rather than a read through to the values a row.
+            self.validity.gathered(self.len, at, &index)
         } else {
             Validity::from_iter(rows, |row| {
                 at.get(row)

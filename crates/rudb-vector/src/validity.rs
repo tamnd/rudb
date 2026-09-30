@@ -223,6 +223,36 @@ impl Validity {
         Self::Mask(Bitmap { words }).normalize(len)
     }
 
+    /// The validity of the rows at `at` of a vector of `len` rows whose validity this is, with a
+    /// position past `len` null.
+    ///
+    /// A gather asked [`Self::is_valid`] once a row and set a bit at a time with
+    /// [`Self::from_iter`], which on a nullable column such as `movie_companies.note` was two
+    /// dependent read modify writes a row. This reads the bit it needs and builds each word of the
+    /// answer in a register, the way [`Self::from_run`] does.
+    #[must_use]
+    pub fn gathered<T: Copy>(&self, len: usize, at: &[T], index: impl Fn(T) -> usize) -> Self {
+        let source: &[u64] = match self {
+            Self::AllInvalid if !at.is_empty() => return Self::AllInvalid,
+            Self::AllValid | Self::AllInvalid => &[],
+            Self::Mask(mask) => &mask.words,
+        };
+        let masked = matches!(self, Self::Mask(_));
+        let mut words = vec![0u64; at.len().div_ceil(64)];
+        for (word, run) in words.iter_mut().zip(at.chunks(64)) {
+            let mut packed = if run.len() == 64 { 0 } else { u64::MAX << run.len() };
+            for (bit, &at) in run.iter().enumerate() {
+                let index = index(at);
+                let valid = index < len
+                    && (!masked
+                        || source.get(index / 64).is_some_and(|w| w >> (index % 64) & 1 == 1));
+                packed |= u64::from(valid) << bit;
+            }
+            *word = packed;
+        }
+        Self::Mask(Bitmap { words }).normalize(at.len())
+    }
+
     /// The validity of `len` rows starting at `at`.
     ///
     /// The two flag arms are the point. A cut of a column with no nulls in it has no nulls in it,
@@ -570,6 +600,26 @@ mod tests {
             let live = validity.live();
             for row in 0..24 {
                 assert_eq!(live.at(row), validity.is_valid(row), "row {row} of {validity:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_gathered_mask_is_the_one_asked_row_by_row() {
+        let len = 200;
+        let mut mask = Bitmap::all_valid(len);
+        for row in (0..len).filter(|row| row % 3 == 0 || row % 7 == 1) {
+            mask.set(row, false);
+        }
+        let at: Vec<u32> = (0..300).map(|row| (row * 37 % 230) as u32).collect();
+        for validity in [Validity::AllValid, Validity::AllInvalid, Validity::Mask(mask)] {
+            for cut in [0, 1, 63, 64, 65, 300] {
+                let at = &at[..cut];
+                let expected = Validity::from_iter(cut, |row| {
+                    let index = at[row] as usize;
+                    index < len && validity.is_valid(index)
+                });
+                assert_eq!(validity.gathered(len, at, |index| index as usize), expected);
             }
         }
     }
