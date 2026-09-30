@@ -743,6 +743,8 @@ pub(crate) fn shift(left: &Value, right: &Value, subtract: bool) -> Result<Value
     let days = i64::from(*days) * sign;
     let micros = i128::from(*micros) * i128::from(sign);
     match when {
+        // An infinite date is an infinite moment and no interval moves it.
+        Value::Date(day) if infinite_day(*day) => Ok(Value::Timestamp(cast::stamp_of_day(*day))),
         Value::Date(day) => {
             // The date becomes a timestamp before anything is added to it, which is upstream's
             // order and is why a date too old or too new to be a moment fails as a moment rather
@@ -778,6 +780,9 @@ pub(crate) fn shift(left: &Value, right: &Value, subtract: bool) -> Result<Value
 /// A timestamp moved by an interval's three fields, already signed, which is the arm of [`shift`]
 /// a vector of timestamps takes without making a `Value` of each one.
 pub(crate) fn shifted_stamp(stamp: i64, months: i64, days: i64, micros: i128) -> Result<i64> {
+    if infinite_stamp(stamp) {
+        return Ok(stamp);
+    }
     let day = i32::try_from(stamp.div_euclid(MICROS_PER_DAY)).map_err(|_| not_in_range())?;
     let within = stamp.rem_euclid(MICROS_PER_DAY);
     moved(shifted_days(day, months, days)?, within, micros)
@@ -819,6 +824,9 @@ pub fn came_round(when: &Value, interval: &Value, subtract: bool) -> bool {
 /// The day an interval's months and days land on, which is where both of the date range failures
 /// are and where upstream has a different sentence for each of them.
 pub(crate) fn shifted_days(day: i32, months: i64, days: i64) -> Result<i32> {
+    if infinite_day(day) {
+        return Ok(day);
+    }
     let day = if months == 0 { day } else { shifted_months(day, months)? };
     let moved = i64::from(day) + days;
     match i32::try_from(moved) {
@@ -856,6 +864,9 @@ fn shifted_months(day: i32, months: i64) -> Result<i32> {
 /// A timestamp moved by a count of microseconds, which is [`shifted_stamp`] with no months and no
 /// days. Every timestamp's day is a date, so the only thing that can fail is the sum.
 pub(crate) fn nudged_stamp(stamp: i64, micros: i64) -> Result<i64> {
+    if infinite_stamp(stamp) {
+        return Ok(stamp);
+    }
     match stamp.checked_add(micros) {
         Some(stamp) if (OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(&stamp) => Ok(stamp),
         _ => Err(not_in_range()),
@@ -868,6 +879,16 @@ fn moved(day: i32, within: i64, micros: i128) -> Result<i64> {
         Ok(stamp) if (OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(&stamp) => Ok(stamp),
         _ => Err(not_in_range()),
     }
+}
+
+/// Whether a date is one of the two infinities, which the pin keeps at the two ends of an `i32`.
+pub(crate) fn infinite_day(day: i32) -> bool {
+    day == i32::MAX || day == -i32::MAX
+}
+
+/// Whether a timestamp is one of the two infinities, kept at the two ends of an `i64`.
+pub(crate) fn infinite_stamp(stamp: i64) -> bool {
+    stamp == i64::MAX || stamp == -i64::MAX
 }
 
 fn not_in_range() -> Error {
@@ -1095,6 +1116,9 @@ pub(crate) fn apart(left: &Value, right: &Value) -> Result<Value> {
         }
         (Value::Timestamp(late), Value::Timestamp(early))
         | (Value::TimestampTz(late), Value::TimestampTz(early)) => {
+            if infinite_stamp(*late) || infinite_stamp(*early) {
+                return Err(Error::invalid_input("Cannot subtract infinite timestamps"));
+            }
             let apart = late.checked_sub(*early).ok_or_else(too_far)?;
             // The day count of a difference that fits an `i64` of microseconds is about a hundred
             // million, so the narrowing cannot fail, and it reports the same sentence rather than
@@ -1138,6 +1162,10 @@ pub(crate) fn age(left: &Value, right: &Value) -> Result<Value> {
     else {
         return Err(Error::internal(format!("{left} and {right} are not two moments")));
     };
+    // There is no count of calendar fields between a moment and the end of time.
+    if infinite_stamp(*first) || infinite_stamp(*second) {
+        return Ok(Value::Null);
+    }
     let backwards = first < second;
     let (late, early) = if backwards { (*second, *first) } else { (*first, *second) };
     let late = fields_of(late)?;
@@ -1204,6 +1232,10 @@ pub(crate) fn joined(left: &Value, right: &Value) -> Result<Value> {
         }
         _ => return Err(Error::internal(format!("{left} and {right} are not a date and a time"))),
     };
+    if infinite_day(day) {
+        let stamp = cast::stamp_of_day(day);
+        return Ok(if zoned { Value::TimestampTz(stamp) } else { Value::Timestamp(stamp) });
+    }
     let stamp = i128::from(day) * i128::from(MICROS_PER_DAY) + i128::from(clock);
     match i64::try_from(stamp) {
         Ok(stamp) if (OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(&stamp) => {

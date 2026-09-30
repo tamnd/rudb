@@ -2070,6 +2070,8 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         |ty: &LogicalType| matches!(ty, TinyInt | SmallInt | Integer | UTinyInt | USmallInt | Null);
     match (name, arguments) {
         ("-", [Interval]) => kept(Interval),
+        // A date or a timestamp can be one of the two infinities, so these read it as it is.
+        ("isinf" | "isfinite", [Date | Timestamp | TimestampTz]) => kept(LogicalType::Boolean),
         // The pin averages these in their own type, and a date through a timestamp, which is the
         // overload it casts a date to.
         ("avg", [Interval | Time | TimeTz | Timestamp | TimestampTz]) => kept(arguments[0].clone()),

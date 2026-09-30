@@ -135,6 +135,12 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
         ("nextafter", [from, to]) => two(from, to, next_after),
         ("signbit", [only]) => double(only).map(|x| Value::Boolean(x.is_sign_negative())),
         ("isnan", [only]) => double(only).map(|x| Value::Boolean(x.is_nan())),
+        ("isinf" | "isfinite", [Value::Date(day)]) => {
+            Ok(Value::Boolean(crate::datetime::infinite_day(*day) == (name == "isinf")))
+        }
+        ("isinf" | "isfinite", [Value::Timestamp(stamp) | Value::TimestampTz(stamp)]) => {
+            Ok(Value::Boolean(crate::datetime::infinite_stamp(*stamp) == (name == "isinf")))
+        }
         ("isinf", [only]) => double(only).map(|x| Value::Boolean(x.is_infinite())),
         ("isfinite", [only]) => double(only).map(|x| Value::Boolean(x.is_finite())),
         ("sign", [only]) => Ok(Value::TinyInt(sign(only))),

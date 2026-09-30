@@ -370,6 +370,8 @@ impl fmt::Display for Value {
                 f.write_str(UTC)
             }
             Self::Timestamp(v) => write_timestamp(f, *v),
+            // An infinity has no offset to print, which is how the pin spells it.
+            Self::TimestampTz(v) if *v == i64::MAX || *v == -i64::MAX => write_timestamp(f, *v),
             Self::TimestampTz(v) => {
                 write_timestamp(f, *v)?;
                 f.write_str(UTC)
@@ -438,6 +440,9 @@ impl Value {
         // The offset is spelled out only in the two arms that print it. Two of the three arms here
         // do not, and building the text for them was a string allocated and dropped per value.
         match self {
+            Self::TimestampTz(micros) if *micros == i64::MAX || *micros == -i64::MAX => {
+                self.to_string()
+            }
             Self::TimestampTz(micros) => {
                 let local = micros.saturating_add(i64::from(offset_seconds) * 1_000_000);
                 format!("{}{}", Self::Timestamp(local), offset_text(offset_seconds))
