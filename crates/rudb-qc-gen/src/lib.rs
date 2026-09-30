@@ -101,6 +101,11 @@ pub struct Body {
     /// The group key columns the body reads as the index of each row's value in the column's
     /// values, after the `LIKE` answers in the morsel's column table.
     pub domains: Vec<Domain>,
+    /// The source columns that are not text but that the body reads through codes as it reads
+    /// text, because the statistics said most of their rows are coded into a dictionary. The
+    /// driver hands such a column as its dictionary's values and its codes when a morsel has it
+    /// coded, and as its values and the codes `0, 1, 2, ...` when not.
+    pub coded: Vec<usize>,
 }
 
 /// A text column the driver hands the body as one `u16` a row: the index of the row's value in
@@ -298,6 +303,8 @@ pub struct Known {
     pub bits: Option<u32>,
     /// Every value of a text column, when it has few of them.
     pub values: Option<Vec<Vec<u8>>>,
+    /// Whether most rows of a column that is not text are coded into a dictionary.
+    pub coded: bool,
 }
 
 /// [`generate`], with what the statistics say about the columns each pipeline scans: one entry
@@ -457,7 +464,8 @@ fn pipeline(
             ranged = r;
         }
     }
-    Ok(Body { func: name, reads, state, sink: out, probes, nonull, ranged, likes, domains })
+    let coded = reads.iter().copied().filter(|&c| known.get(c).is_some_and(|k| k.coded)).collect();
+    Ok(Body { func: name, reads, state, sink: out, probes, nonull, ranged, likes, domains, coded })
 }
 
 /// The most entries the array of [`Grouping::dense`] has.
@@ -602,8 +610,8 @@ fn emit(
         let values = g.b.load(Ty::Ptr, table, Val::NONE, 1, at, INV);
         let valid = g.b.load(Ty::Ptr, table, Val::NONE, 1, at + COL_VALID, INV);
         let ty = qir_type(&source[c].ty)?;
-        let codes =
-            (ty == Ty::Str16).then(|| g.b.load(Ty::Ptr, table, Val::NONE, 1, at + COL_CODES, INV));
+        let coded = ty == Ty::Str16 || g.known.get(c).is_some_and(|k| k.coded);
+        let codes = coded.then(|| g.b.load(Ty::Ptr, table, Val::NONE, 1, at + COL_CODES, INV));
         g.cols.insert(c, (values, valid, ty, codes));
     }
     for k in 0..likes.len() {

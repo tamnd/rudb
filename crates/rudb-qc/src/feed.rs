@@ -790,7 +790,8 @@ impl<'a> Feed<'a> {
             self.body.likes.iter().zip(&answers).any(|(m, a)| m.column == c && a.is_none())
         };
         // A text column the body reads is kept coded when its dictionary is small or its headers
-        // are made already, and every other column is made flat. A column a `LIKE` answers over
+        // are made already, a number column the body reads through codes when its dictionary is
+        // flat, and every other column is made flat. A column a `LIKE` answers over
         // its strings is made flat too, because the answers read its strings in place, and one
         // the body reads only through answers from its dictionary is not read at all.
         let mut keep = vec![false; chunk.width()];
@@ -798,7 +799,8 @@ impl<'a> Feed<'a> {
         for ((&c, known), seen) in text.zip(read_seen) {
             let v = chunk.column(c)?;
             let read = tally(v, rows, seen);
-            keep[c] = !flat(c) && coded(v, rows, read, known.as_ref());
+            let numbers = self.body.coded.contains(&c);
+            keep[c] = !flat(c) && coded(v, rows, read, known.as_ref(), numbers);
         }
         for m in &self.body.likes {
             if by_codes(m.column) && !flat(m.column) && !self.body.reads.contains(&m.column) {
@@ -1403,19 +1405,6 @@ impl<'c> Held<'c> {
                 text = vec![0u128; rows];
                 text.as_ptr().cast::<u8>()
             }
-            Data::Bool(b) => b.as_slice().as_ptr().cast(),
-            Data::Int8(b) => b.as_slice().as_ptr().cast(),
-            Data::Int16(b) => b.as_slice().as_ptr().cast(),
-            Data::Int32(b) => b.as_slice().as_ptr().cast(),
-            Data::Int64(b) => b.as_slice().as_ptr().cast(),
-            Data::Int128(b) => b.as_slice().as_ptr().cast(),
-            Data::UInt8(b) => b.as_slice().as_ptr().cast(),
-            Data::UInt16(b) => b.as_slice().as_ptr().cast(),
-            Data::UInt32(b) => b.as_slice().as_ptr().cast(),
-            Data::UInt64(b) => b.as_slice().as_ptr().cast(),
-            Data::UInt128(b) => b.as_slice().as_ptr().cast(),
-            Data::Float32(b) => b.as_slice().as_ptr().cast(),
-            Data::Float64(b) => b.as_slice().as_ptr().cast(),
             Data::Varlen(_) if !strings => std::ptr::null(),
             Data::Varlen(s) => {
                 let arena = s.arena();
@@ -1449,7 +1438,8 @@ impl<'c> Held<'c> {
                 }
                 text.as_ptr().cast::<u8>()
             }
-            _ => return Err(Error::internal("a column of a type the generator refuses")),
+            _ => fixed(data)
+                .ok_or_else(|| Error::internal("a column of a type the generator refuses"))?,
         };
         let codes = each;
         Ok(Held { values, valid, codes, clean, _text: text, _chunk: std::marker::PhantomData })
@@ -1464,6 +1454,14 @@ impl<'c> Held<'c> {
             .shared_dictionary_parts()
             .ok_or_else(|| Error::internal("a coded column that is not a dictionary"))?;
         let codes = codes.get(..rows).ok_or_else(|| Error::internal("fewer codes than rows"))?;
+        // A number is read from the dictionary's values where they lie, which the chunk keeps.
+        if let Some(values) = dictionary.data().and_then(fixed) {
+            let (valid, clean) = validity(v, rows);
+            let codes = codes.as_ptr();
+            let text = Vec::new();
+            let chunk = std::marker::PhantomData;
+            return Ok(Held { values, valid, codes, clean, _text: text, _chunk: chunk });
+        }
         if !known.as_ref().is_some_and(|(d, ..)| Arc::ptr_eq(d, dictionary)) {
             // The headers of long values point into `values`, which is kept with them.
             let values = Arc::new((**dictionary).clone().into_flat()?);
@@ -1516,13 +1514,18 @@ fn tally(v: &Vector, rows: usize, seen: &mut Option<(Arc<Vector>, usize)>) -> us
 /// much longer than the `read` rows read through it so far, so that making them is no more work
 /// than copying out the rows has been. A dictionary shared by many chunks is taken up once the
 /// chunks before have copied out as many rows as it has values.
-fn coded(v: &Vector, rows: usize, read: usize, known: Option<&Flat>) -> bool {
-    if v.logical_type() != &LogicalType::Varchar {
-        return false;
-    }
+fn coded(v: &Vector, rows: usize, read: usize, known: Option<&Flat>, numbers: bool) -> bool {
     let Some((codes, dictionary)) = v.shared_dictionary_parts() else {
         return false;
     };
+    if v.logical_type() != &LogicalType::Varchar {
+        // Numbers are read through the codes from values that are flat already, which costs no
+        // more than the gather that would make the column flat and saves writing it out.
+        return numbers
+            && codes.len() >= rows
+            && dictionary.data().and_then(fixed).is_some()
+            && !dictionary.validity().has_nulls(dictionary.len());
+    }
     codes.len() >= rows
         && !dictionary.validity().has_nulls(dictionary.len())
         && (known.is_some_and(|(d, ..)| Arc::ptr_eq(d, dictionary))
@@ -1597,6 +1600,10 @@ fn answer_flat(like: &Like, v: &Vector, rows: usize, out: &mut [u8]) {
 /// above `k + 1`, and or-ing the sums together asks that of every value at once. The loop has no
 /// branch in it, so the compiler makes it vector adds and ors.
 fn inside(v: &Vector, rows: usize, k: u32) -> bool {
+    // A coded column's rows are among its dictionary's values, and every value is looked at.
+    if let Some((codes, dictionary)) = v.shared_dictionary_parts() {
+        return codes.len() >= rows && inside(dictionary, dictionary.len(), k);
+    }
     macro_rules! fits {
         ($values:expr, $signed:ty, $unsigned:ty) => {{
             if k + 1 >= <$unsigned>::BITS {
@@ -1617,6 +1624,26 @@ fn inside(v: &Vector, rows: usize, k: u32) -> bool {
         Some(Data::Int128(b)) => fits!(b, i128, u128),
         _ => false,
     }
+}
+
+/// The address of the values of `data` when they are numbers, which the body reads in place.
+fn fixed(data: &Data) -> Option<*const u8> {
+    Some(match data {
+        Data::Bool(b) => b.as_slice().as_ptr().cast(),
+        Data::Int8(b) => b.as_slice().as_ptr().cast(),
+        Data::Int16(b) => b.as_slice().as_ptr().cast(),
+        Data::Int32(b) => b.as_slice().as_ptr().cast(),
+        Data::Int64(b) => b.as_slice().as_ptr().cast(),
+        Data::Int128(b) => b.as_slice().as_ptr().cast(),
+        Data::UInt8(b) => b.as_slice().as_ptr().cast(),
+        Data::UInt16(b) => b.as_slice().as_ptr().cast(),
+        Data::UInt32(b) => b.as_slice().as_ptr().cast(),
+        Data::UInt64(b) => b.as_slice().as_ptr().cast(),
+        Data::UInt128(b) => b.as_slice().as_ptr().cast(),
+        Data::Float32(b) => b.as_slice().as_ptr().cast(),
+        Data::Float64(b) => b.as_slice().as_ptr().cast(),
+        _ => return None,
+    })
 }
 
 /// The validity bitmap of the first `rows` rows of `v`, and whether none of them is NULL.
@@ -1904,7 +1931,7 @@ mod tests {
         let rows = codes.len();
         let v = Vector::stable_dictionary(codes.clone(), Arc::clone(&dictionary)).unwrap();
         let mut known = None;
-        assert!(coded(&v, rows, rows, known.as_ref()));
+        assert!(coded(&v, rows, rows, known.as_ref(), false));
         let first = read(&Held::coded(&v, rows, &mut known).unwrap(), rows);
         let made = known.as_ref().map(|(_, values, _)| Arc::as_ptr(values));
         let again = read(&Held::coded(&v, rows, &mut known).unwrap(), rows);
@@ -1915,6 +1942,26 @@ mod tests {
         assert_eq!(again, want);
     }
     #[test]
+    fn a_number_dictionary_is_read_in_place_through_its_codes_only_when_the_body_reads_codes() {
+        let values: Vec<Value> = [7i64, -3, 1 << 40].into_iter().map(Value::BigInt).collect();
+        let dictionary = Arc::new(Vector::from_values(LogicalType::BigInt, &values).unwrap());
+        let codes = vec![2, 0, 1, 2, 2, 0, 1, 0, 2];
+        let rows = codes.len();
+        let v = Vector::stable_dictionary(codes.clone(), Arc::clone(&dictionary)).unwrap();
+        assert!(!coded(&v, rows, rows, None, false));
+        assert!(coded(&v, rows, rows, None, true));
+        let held = Held::coded(&v, rows, &mut None).unwrap();
+        let Some(Data::Int64(flat)) = dictionary.data() else { panic!("flat values") };
+        assert_eq!(held.values, flat.as_slice().as_ptr().cast::<u8>());
+        // SAFETY: the codes are the vector's, which it holds for `rows` rows.
+        let read = unsafe { std::slice::from_raw_parts(held.codes, rows) };
+        assert_eq!(read, codes.as_slice());
+        assert!(held.clean);
+        assert!(inside(&v, rows, 41));
+        assert!(!inside(&v, rows, 40));
+    }
+
+    #[test]
     fn a_dictionary_longer_than_a_chunk_is_taken_up_once_its_chunks_have_read_as_many_rows() {
         let words: Vec<Value> =
             (0..VECTOR_SIZE * 2).map(|i| Value::Varchar(format!("word {i}"))).collect();
@@ -1924,11 +1971,11 @@ mod tests {
         let v = Vector::stable_dictionary(codes, Arc::clone(&dictionary)).unwrap();
         let mut seen = None;
         let read = tally(&v, rows, &mut seen);
-        assert!(!coded(&v, rows, read, None));
+        assert!(!coded(&v, rows, read, None, false));
         assert!(!worded(&v, rows, read, None));
         let read = tally(&v, rows, &mut seen);
         assert_eq!(read, rows * 2);
-        assert!(coded(&v, rows, read, None));
+        assert!(coded(&v, rows, read, None, false));
         assert!(worded(&v, rows, read, None));
         let other =
             Vector::stable_dictionary(vec![0; rows], Arc::new((*dictionary).clone())).unwrap();

@@ -964,6 +964,31 @@ impl MemoryTable {
         Ok(ends.get_or_init(|| found).clone())
     }
 
+    /// How many rows of one column are in sealed groups whose page for it is coded into a
+    /// dictionary, and how many rows the table has, for a reader deciding whether to read the
+    /// column through its codes.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the table.
+    pub fn dictionary_rows(&self, column: usize) -> Result<(usize, usize)> {
+        if column >= self.types.len() {
+            return Err(Error::internal(format!(
+                "column {column} of a table that has {}",
+                self.types.len()
+            )));
+        }
+        let coded = self
+            .groups
+            .iter()
+            .filter(|g| {
+                g.columns.get(column).is_some_and(|v| v.shared_dictionary_parts().is_some())
+            })
+            .map(|g| g.rows)
+            .sum();
+        Ok((coded, self.len()))
+    }
+
     /// [`MemoryTable::exact_extremes`] worked out from the zones.
     fn walk_extremes(&self, column: usize) -> Result<Option<(Bound, Bound)>> {
         let mut low: Option<Bound> = None;

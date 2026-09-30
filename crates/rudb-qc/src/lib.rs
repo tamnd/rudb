@@ -155,13 +155,25 @@ fn known(graph: &Graph, plan: &Plan, catalog: &Catalog, options: Options) -> Vec
         };
         let key = |at: usize| keys.iter().any(|e| matches!(e.kind, Kind::Column(c) if c == at));
         let dense = !options.ablate.off(Ablate::DENSE);
+        let coded = !options.ablate.off(Ablate::CODED);
         let column = |(at, c): (usize, &rudb_qc_plan::Column)| Known {
             bits: bits(table, &c.name, &c.ty).filter(|_| !options.ablate.off(Ablate::RANGES)),
             values: (dense && key(at)).then(|| values(table, &c.name, &c.ty)).flatten(),
+            coded: coded && mostly_coded(table, &c.name, &c.ty),
         };
         Some(columns.iter().enumerate().map(column).collect())
     };
     graph.stages.iter().map(|stage| stored(stage).unwrap_or_default()).collect()
+}
+
+/// Whether most rows of the column `name` of `table` are numbers coded into a dictionary, which
+/// the body is then made to read through the codes as it reads text.
+fn mostly_coded(table: &rudb_catalog::Table, name: &str, ty: &LogicalType) -> bool {
+    if *ty == LogicalType::Varchar {
+        return false;
+    }
+    let Some(column) = table.column_index(name) else { return false };
+    matches!(table.rows().dictionary_rows(column), Ok(Some((coded, rows))) if coded > 0 && coded * 2 >= rows)
 }
 
 /// The fewest `k` for which every value of the integer or decimal column `name` of `table` is at
