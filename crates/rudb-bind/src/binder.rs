@@ -483,7 +483,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Joins scalar query results into the row stream that contains their expressions.
-    fn attach_scalar_subqueries(&mut self, mut input: NodeRef) -> NodeRef {
+    pub(crate) fn attach_scalar_subqueries(&mut self, mut input: NodeRef) -> NodeRef {
         let subqueries = std::mem::take(&mut self.scalar_subqueries);
         for pending in subqueries {
             input = self.attach_subquery(input, pending);

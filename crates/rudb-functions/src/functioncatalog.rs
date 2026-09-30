@@ -245,6 +245,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::DuckdbOptimizers,
     TableFunction::DuckdbDialects,
     TableFunction::DuckdbGrammarExtensions,
+    TableFunction::DuckdbVariables,
     TableFunction::PragmaTableInfo,
     TableFunction::PragmaShow,
     TableFunction::PragmaStorageInfo,
@@ -290,6 +291,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::DuckdbOptimizers
         | TableFunction::DuckdbDialects
         | TableFunction::DuckdbGrammarExtensions
+        | TableFunction::DuckdbVariables
         | TableFunction::PragmaVersion
         | TableFunction::PragmaPlatform
         | TableFunction::PragmaUserAgent
@@ -348,6 +350,8 @@ fn named(name: &str, count: usize) -> Vec<String> {
 const PARAMETER_NAMES: &[(&str, &[&str])] = &[
     ("current_setting", &["setting_name"]),
     ("error", &["message"]),
+    ("getvariable", &["variable_name"]),
+    ("in_search_path", &["database_name", "schema_name"]),
     ("regexp_split_to_array", &["string", "regex"]),
     ("regexp_split_to_array", &["string", "regex", "options"]),
     ("split", &["string", "separator"]),

@@ -4270,6 +4270,15 @@ pub fn call_values(
             [Value::Varchar(text), Value::BigInt(offset), Value::BigInt(length)],
         ) => Ok(Value::Varchar(crate::graphemes::substring(text, *offset, *length)?.to_string())),
         ("regexp_escape", [Value::Varchar(text)]) => Ok(crate::strings::regexp_escape(text)),
+        // The process's environment, read when the row is, the way the pin reads it. A variable
+        // that is not set, or is not text, is the empty string there rather than a null.
+        // The standard library may panic on a name no environment can hold, so one of those is
+        // answered as not set without asking.
+        ("getenv", [Value::Varchar(name)]) => {
+            let holdable = !name.is_empty() && !name.contains(['=', '\0']);
+            let found = holdable.then(|| std::env::var(name).ok()).flatten();
+            Ok(Value::Varchar(found.unwrap_or_default()))
+        }
         ("nfc_normalize", [Value::Varchar(text)]) => {
             Ok(Value::Varchar(normalize::nfc(text).into_owned()))
         }

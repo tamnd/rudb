@@ -51,7 +51,7 @@ pub use error::{Error, ErrorCode, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human};
 pub use rules::{Rule, Rules, looks_like_rule, rule_names};
 pub use session::{
-    DefaultNullOrder, IdentifierCase, Semantics, Session, SessionTimeZone, ShowBehavior,
+    DefaultNullOrder, IdentifierCase, Semantics, Session, SessionTimeZone, ShowBehavior, Variable,
 };
 pub use slow::{Cause, Tally};
 pub use spread::{Spread, serially};

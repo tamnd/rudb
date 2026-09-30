@@ -866,9 +866,13 @@ impl<'a> Transform<'a> {
     ///
     /// `SET VARIABLE x = 1` is the other alternative and is a different feature: a variable is a
     /// value the session holds and `getvariable` reads back, where a setting is a knob on the
-    /// engine. Refused rather than treated as a setting of that name.
+    /// engine. It lands in the same arena entry with [`Scope::Variable`], which is what tells the
+    /// binder it is not a setting of that name.
     fn setting_name(&mut self, node: u32) -> Result<(StrRef, Scope)> {
         let inner = self.first(node);
+        if self.name(inner) == "SetVariable" {
+            return Ok((self.identifier(self.find(inner, "Identifier")), Scope::Variable));
+        }
         if self.name(inner) != "SetSetting" {
             return self.unsupported(inner);
         }

@@ -16,7 +16,7 @@
 //! is where that is written down.
 
 use rudb_common::{LogicalType, Result, Session, Value};
-use rudb_functions::{SETTINGS, UNSET, setting_fields};
+use rudb_functions::{SETTINGS, UNSET, setting_fields, variable_fields};
 use rudb_plan::{Plan, Slice};
 
 use crate::metadata::{Metadata, text};
@@ -51,6 +51,30 @@ pub(crate) fn settingnames(
         ]);
     }
     Metadata::new("duckdb_settings", &setting_fields(), &rows, plan, index, columns)
+}
+
+/// `duckdb_variables()`, every variable this session holds, in the order they were first set.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn variablenames(
+    session: &Session,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let rows: Vec<Vec<Value>> = session
+        .variables()
+        .map(|held| {
+            let value = match &held.value {
+                Value::Null => Value::Null,
+                value => text(&value.to_string()),
+            };
+            vec![text(&held.name), value, text(&held.ty.to_string())]
+        })
+        .collect();
+    Metadata::new("duckdb_variables", &variable_fields(), &rows, plan, index, columns)
 }
 
 /// The `VARCHAR[]` of other spellings, empty for a setting that has none.

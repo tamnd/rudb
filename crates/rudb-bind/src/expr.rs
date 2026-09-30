@@ -53,6 +53,26 @@ impl Binder<'_> {
         self.bind_expr(ast, expr, &Scope::empty())
     }
 
+    /// Binds the value of a `SET VARIABLE` as a query of one row with one column.
+    ///
+    /// A bare word is text here too, which is how the pin reads `SET VARIABLE a = x`. A query
+    /// inside the value is joined in under the projection the way one in a `SELECT` with no `FROM`
+    /// is, so a value that is a query that finds several rows is refused in the same words.
+    pub(crate) fn bind_variable_value(
+        &mut self,
+        ast: &Ast,
+        expr: ast::ExprRef,
+    ) -> Result<rudb_plan::NodeRef> {
+        let value = self.bind_setting_value(ast, expr)?;
+        let dummy = self.add_node(rudb_plan::Node::Dummy);
+        let input = self.attach_scalar_subqueries(dummy);
+        let index = self.fresh_index();
+        let exprs = self.plan_mut().add_expr_list(&[value]);
+        let name = self.plan_mut().intern("value");
+        let names = self.plan_mut().add_name_list(&[name]);
+        Ok(self.add_node(rudb_plan::Node::Project { input, index, exprs, names }))
+    }
+
     /// Binds one written expression against `scope`.
     pub(crate) fn bind_expr(
         &mut self,
@@ -883,6 +903,20 @@ impl Binder<'_> {
         {
             return Ok(folded);
         }
+        // `getvariable` is folded for the reason `current_setting` is: it is declared to return
+        // ANY and the type is the variable's, which is only known once the name is read.
+        if rudb_catalog::same_name(&written, "getvariable")
+            && bound.len() == 1
+            && let Some(folded) = self.variable(bound[0])
+        {
+            return Ok(folded);
+        }
+        if rudb_catalog::same_name(&written, "in_search_path")
+            && let [catalog, schema] = bound[..]
+            && let Some(answered) = self.in_search_path(catalog, schema)?
+        {
+            return Ok(answered);
+        }
         if rudb_catalog::same_name(&written, "current_schemas")
             && bound.len() == 1
             && let Some(folded) = self.current_schemas(bound[0])?
@@ -1586,6 +1620,79 @@ impl Binder<'_> {
             _ => Value::Varchar(text.to_string()),
         };
         Ok(Some(self.add_constant(value)))
+    }
+
+    /// A call to `getvariable` with the name it reads, which is the variable's value at its type,
+    /// or a null with no type for a name nothing has set, which is what the pin answers.
+    ///
+    /// `None` for a name that is not a constant, which the table then refuses in the pin's words.
+    fn variable(&mut self, argument: ExprRef) -> Option<ExprRef> {
+        let Expr::Constant(held) = *self.plan().expr(argument) else { return None };
+        let (value, ty) = match self.plan().value(held) {
+            Value::Varchar(name) => match self.session.variable(name) {
+                Some(found) => (found.value.clone(), found.ty.clone()),
+                None => (Value::Null, LogicalType::Null),
+            },
+            Value::Null => (Value::Null, LogicalType::Null),
+            _ => return None,
+        };
+        let reference = self.plan_mut().add_value(value);
+        Some(self.add_expr(Expr::Constant(reference), ty))
+    }
+
+    /// `in_search_path(catalog, schema)`, which is whether that schema is one a bare name is
+    /// looked for in.
+    ///
+    /// The pin walks its search path, which is `temp.main`, then what `SET search_path` wrote,
+    /// then the default database's `main`, `system.main` and `system.pg_catalog`. An entry written
+    /// without a database matches its schema under the empty name and under the default
+    /// database's, which is why `in_search_path('', 'main')` is true there. Names match without
+    /// regard to case.
+    ///
+    /// Two constants are answered here. Anything else is the same test written as a lookup in the
+    /// list of pairs the path comes to, so a null on either side is a null the way it is on the
+    /// pin. `None` when either side is not a string, which the table then refuses.
+    fn in_search_path(&mut self, catalog: ExprRef, schema: ExprRef) -> Result<Option<ExprRef>> {
+        let text = |ty: &LogicalType| matches!(ty, LogicalType::Varchar | LogicalType::Null);
+        if !text(self.plan().expr_type(catalog)) || !text(self.plan().expr_type(schema)) {
+            return Ok(None);
+        }
+        let default = self.catalog().default_catalog().to_ascii_lowercase();
+        let mut pairs = Vec::new();
+        for (database, name) in self.catalog().search_pairs() {
+            let name = name.to_ascii_lowercase();
+            if database.is_empty() {
+                pairs.push(format!("{default}\u{1}{name}"));
+            }
+            pairs.push(format!("{}\u{1}{name}", database.to_ascii_lowercase()));
+        }
+        let constant = |binder: &Self, at: ExprRef| match *binder.plan().expr(at) {
+            Expr::Constant(held) => Some(binder.plan().value(held).clone()),
+            _ => None,
+        };
+        if let (Some(written), Some(named)) = (constant(self, catalog), constant(self, schema)) {
+            let answer = match (written, named) {
+                (Value::Varchar(written), Value::Varchar(named)) => {
+                    let wanted = format!(
+                        "{}\u{1}{}",
+                        written.to_ascii_lowercase(),
+                        named.to_ascii_lowercase()
+                    );
+                    Value::Boolean(pairs.contains(&wanted))
+                }
+                _ => Value::Null,
+            };
+            let reference = self.plan_mut().add_value(answer);
+            return Ok(Some(self.add_expr(Expr::Constant(reference), LogicalType::Boolean)));
+        }
+        let separator = self.add_constant(Value::Varchar("\u{1}".to_string()));
+        let catalog = self.call("lower", vec![catalog])?;
+        let schema = self.call("lower", vec![schema])?;
+        let key = self.call("||", vec![catalog, separator])?;
+        let key = self.call("||", vec![key, schema])?;
+        let values = pairs.into_iter().map(Value::Varchar).collect();
+        let list = self.add_constant(Value::List { element: LogicalType::Varchar, values });
+        self.call("list_contains", vec![list, key]).map(Some)
     }
 
     /// The value of a setting rudb has and DuckDB does not.

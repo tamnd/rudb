@@ -222,6 +222,9 @@ pub enum Scope {
     Session,
     /// `LOCAL`.
     Local,
+    /// `VARIABLE`, which is not a copy of a setting at all but a value the session holds under
+    /// that name for `getvariable` to read back.
+    Variable,
 }
 
 impl Scope {
@@ -233,6 +236,7 @@ impl Scope {
             Self::Global => "GLOBAL",
             Self::Session => "SESSION",
             Self::Local => "LOCAL",
+            Self::Variable => "VARIABLE",
         }
     }
 }
