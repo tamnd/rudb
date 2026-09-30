@@ -156,6 +156,45 @@ const PARAMETERS: &[(&str, &[&[Parameter]])] = &[
     ("union_extract", &[&[p("union"), p("tag")]]),
 ];
 
+/// The functions that take any number of arguments after a fixed few, with that few, harvested
+/// from the pin's `duckdb_functions()` where `varargs` is set.
+///
+/// A name on one of these names nothing. Once the fixed places are filled, a named argument is one
+/// more of the rest, in the order it was written, so `list_value(true, recursive := true)` is
+/// `[true, true]` on the pin. A call that names an argument before the fixed places are filled is
+/// refused for the first one it left empty.
+const VARIADIC: &[(&str, usize)] = &[
+    ("aggregate", 2),
+    ("array_aggr", 2),
+    ("array_aggregate", 2),
+    ("cardinality", 1),
+    ("concat", 1),
+    ("concat_ws", 2),
+    ("constant_or_null", 2),
+    ("create_sort_key", 1),
+    ("format", 1),
+    ("greatest", 1),
+    ("hash", 1),
+    ("index_key", 2),
+    ("invoke", 2),
+    ("json_deep_merge", 2),
+    ("json_merge_patch", 2),
+    ("least", 1),
+    ("list_aggr", 2),
+    ("list_aggregate", 2),
+    ("list_pack", 1),
+    ("list_value", 1),
+    ("path_join", 1),
+    ("printf", 1),
+    ("write_log", 1),
+];
+
+/// How many places a function that takes any number of arguments fixes before the rest, or none
+/// when the function is not one of those.
+pub fn variadic(function: &str) -> Option<usize> {
+    VARIADIC.iter().find(|(name, _)| name.eq_ignore_ascii_case(function)).map(|(_, fixed)| *fixed)
+}
+
 /// The parameter lists of a function, or none when no overload of it has names.
 pub fn lists(function: &str) -> &'static [&'static [Parameter]] {
     PARAMETERS

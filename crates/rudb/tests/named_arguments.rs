@@ -133,3 +133,43 @@ fn names_that_fit_no_parameter_are_refused_in_the_pins_words() {
         assert!(said.contains(expected), "{sql}: {said}");
     }
 }
+
+#[test]
+fn a_name_on_a_function_that_takes_any_number_of_arguments_is_one_more_of_them() {
+    let cases = [
+        ("SELECT concat('a', x := 'b')", "concat('a', x := 'b')", "ab"),
+        ("SELECT greatest(1, x := 2)", "greatest(1, x := 2)", "2"),
+        ("SELECT list_value(1, x := 2, y := 3)", "list_value(1, x := 2, y := 3)", "[1, 2, 3]"),
+        (
+            "SELECT list_value(true, recursive := true)",
+            "list_value(true, \"recursive\" := true)",
+            "[true, true]",
+        ),
+    ];
+    for (sql, name, value) in cases {
+        let (names, rows) = answered(sql);
+        assert_eq!((names[0].as_str(), rows[0].as_str()), (name, value), "{sql}");
+    }
+    let cases = [
+        (
+            "SELECT list_value(x := 1, y := 2)",
+            "Binder Error: Missing value for parameter \"col0\" in function call to \"list_value\"",
+        ),
+        (
+            "SELECT concat_ws('-', x := 'a')",
+            "Missing value for parameter \"col1\" in function call to \"concat_ws\"",
+        ),
+        (
+            "SELECT hash(x := 1)",
+            "Missing value for parameter \"col0\" in function call to \"hash\"",
+        ),
+        (
+            "SELECT md5(x := 'a')",
+            "No function matches the given name and argument types 'md5(\"x\" := STRING_LITERAL)'",
+        ),
+    ];
+    for (sql, expected) in cases {
+        let said = refused(sql);
+        assert!(said.contains(expected), "{sql}: {said}");
+    }
+}

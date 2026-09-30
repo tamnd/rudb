@@ -4375,32 +4375,42 @@ impl<'a> Transform<'a> {
             let implicit = usize::from(within != NONE);
             let targets: Vec<Target> =
                 names.iter().zip(&values).map(|(&alias, &expr)| Target { expr, alias }).collect();
-            match parameters::arrange(&function, implicit, positional, &written) {
-                Err(Refilled { named, parameter }) => {
+            if let Some(fixed) = parameters::variadic(&function) {
+                if positional < fixed {
                     return Err(Error::binder(format!(
-                        "Named argument '{}' cannot be used for parameter '\"{parameter}\"' because it has already been provided as a positional argument in function call to '\"{function}\"'",
-                        crate::deparse::expression(&self.ast, values[named])
+                        "Missing value for parameter \"col{positional}\" in function call to \"{function}\""
                     )));
                 }
-                Ok(Arranged::Slots(slots)) => {
-                    let mut ordered = Vec::with_capacity(slots.len());
-                    for slot in slots {
-                        match slot {
-                            Slot::Written(index) if index < implicit => {}
-                            Slot::Written(index) if index < implicit + positional => {
-                                ordered.push(args[index - implicit]);
-                            }
-                            Slot::Written(index) => {
-                                ordered.push(values[index - implicit - positional])
-                            }
-                            Slot::Default(sql) => ordered.push(self.default_value(sql)),
-                        }
+                args.extend_from_slice(&values);
+                placed = Some((positional, self.target_slice(targets)));
+            } else {
+                match parameters::arrange(&function, implicit, positional, &written) {
+                    Err(Refilled { named, parameter }) => {
+                        return Err(Error::binder(format!(
+                            "Named argument '{}' cannot be used for parameter '\"{parameter}\"' because it has already been provided as a positional argument in function call to '\"{function}\"'",
+                            crate::deparse::expression(&self.ast, values[named])
+                        )));
                     }
-                    args = ordered;
-                    placed = Some((positional, self.target_slice(targets)));
-                }
-                Ok(Arranged::Unmatched | Arranged::Ambiguous) => {
-                    unplaced = Some(self.target_slice(targets));
+                    Ok(Arranged::Slots(slots)) => {
+                        let mut ordered = Vec::with_capacity(slots.len());
+                        for slot in slots {
+                            match slot {
+                                Slot::Written(index) if index < implicit => {}
+                                Slot::Written(index) if index < implicit + positional => {
+                                    ordered.push(args[index - implicit]);
+                                }
+                                Slot::Written(index) => {
+                                    ordered.push(values[index - implicit - positional])
+                                }
+                                Slot::Default(sql) => ordered.push(self.default_value(sql)),
+                            }
+                        }
+                        args = ordered;
+                        placed = Some((positional, self.target_slice(targets)));
+                    }
+                    Ok(Arranged::Unmatched | Arranged::Ambiguous) => {
+                        unplaced = Some(self.target_slice(targets));
+                    }
                 }
             }
         }
