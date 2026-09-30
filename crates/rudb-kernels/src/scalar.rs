@@ -4190,6 +4190,33 @@ pub fn call_values(
             };
             crate::strings::to_base(*number, *radix, min_length)
         }
+        // The signature cast every argument of these to a type the pin declares for it. A FLOAT
+        // or a DOUBLE given to `hex` or `bin` stands for the BIGNUM the pin casts it to.
+        ("md5" | "md5_number" | "sha1" | "sha256", [Value::Varchar(text)]) => {
+            Ok(crate::hashing::hashed(name, text.as_bytes()))
+        }
+        ("md5" | "md5_number" | "sha1" | "sha256", [Value::Blob(blob)]) => {
+            Ok(crate::hashing::hashed(name, blob))
+        }
+        ("hex" | "to_hex", [held]) => crate::codec::written(false, held),
+        ("bin" | "to_binary", [held]) => crate::codec::written(true, held),
+        ("unhex" | "from_hex", [Value::Varchar(text)]) => {
+            Ok(Value::Blob(crate::codec::unhex(text)?))
+        }
+        ("unbin" | "from_binary", [Value::Varchar(text)]) => {
+            Ok(Value::Blob(crate::codec::unbin(text)?))
+        }
+        ("encode", [Value::Varchar(text)]) => Ok(Value::Blob(text.as_bytes().to_vec())),
+        ("decode", [Value::Blob(blob)]) => Ok(Value::Varchar(crate::codec::decode(blob, None)?)),
+        ("decode", [Value::Blob(blob), Value::Varchar(behavior)]) => {
+            Ok(Value::Varchar(crate::codec::decode(blob, Some(behavior))?))
+        }
+        ("base64" | "to_base64", [Value::Blob(blob)]) => {
+            Ok(Value::Varchar(crate::codec::base64(blob)))
+        }
+        ("from_base64", [Value::Varchar(text)]) => {
+            Ok(Value::Blob(crate::codec::from_base64(text)?))
+        }
         ("parse_formatted_bytes", [Value::Varchar(text)]) => {
             Ok(Value::UBigInt(crate::bytes::parse_formatted_bytes(text)?))
         }
