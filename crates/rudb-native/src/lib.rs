@@ -5414,6 +5414,27 @@ impl NativeGrams {
 /// larger one would be wrong.
 const TEXT_SEARCH_MEMO: usize = 64;
 
+/// How a read borrows a block of a string column's dictionary, which decides whether a block it
+/// decodes is kept. See [`NativeText::loaned_block`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Loan {
+    /// A read of values in order. It keeps a block the second time it decodes it, and the first
+    /// time too before the last statement, since the next statement is likely to read it again.
+    InOrder,
+    /// A read by code rather than in order. It keeps only on the second decode, and stops dropping
+    /// once it has dropped a column's worth of blocks, for the reason
+    /// [`NativeText::visit_dropped`] gives.
+    Scattered,
+    /// A read of every value in the block by a caller that remembers what it made of each one.
+    ///
+    /// That caller will not ask for the block again, so in the last statement there is no one left
+    /// to keep it for, even when it is the block's second decode. A `LIKE` deciding a whole group
+    /// the second time a chunk lands in it is this read, and keeping the block because it was the
+    /// second decode held 80 MB of `Title` and `URL` in ClickBench q23 for a filter already
+    /// answered.
+    Whole,
+}
+
 /// How many values of a dictionary go in one block of the payload.
 ///
 /// The block is the unit the string cascade encodes, the unit a checksum covers, and the unit a
@@ -5712,14 +5733,12 @@ impl NativeText {
     /// A block something already kept is read where it is. One nothing kept is kept the second
     /// time a loaned read decodes it while the column is holding less than [`Self::keep_budget`],
     /// and decoded into `decoded` and dropped with it otherwise, which is the policy
-    /// [`TextSource::sweep`] explains. `scattered` is a read by code rather than in order, which
-    /// stops dropping once it has dropped a column's worth of blocks, for the reason
-    /// [`Self::visit_dropped`] gives.
+    /// [`TextSource::sweep`] explains, with the exceptions [`Loan`] lists.
     fn loaned_block<'a>(
         &'a self,
         block: usize,
         decoded: &'a mut Vec<u8>,
-        scattered: bool,
+        loan: Loan,
     ) -> Result<&'a [u8]> {
         let kept = self.blocks.get(block).and_then(OnceLock::get);
         if let Some(Ok(kept)) = kept {
@@ -5727,7 +5746,14 @@ impl NativeText {
         }
         let again = kept.is_none()
             && self.swept.get(block).is_some_and(|swept| swept.swap(true, Atomic::Relaxed));
-        let keep = (again || !(scattered || self.last.load(Atomic::Relaxed)))
+        let last = self.last.load(Atomic::Relaxed);
+        let scattered = loan == Loan::Scattered;
+        let wanted = match loan {
+            Loan::InOrder => again || !last,
+            Loan::Scattered => again,
+            Loan::Whole => !last,
+        };
+        let keep = wanted
             && (self.payload_kept.load(Atomic::Relaxed) < self.keep_budget
                 || (scattered && self.visit_dropped.load(Atomic::Relaxed) >= self.blocks.len()));
         if keep {
@@ -6176,7 +6202,7 @@ impl TextSource for NativeText {
         let block = first / TEXT_PAYLOAD_VALUES;
         let last = ((block + 1) * TEXT_PAYLOAD_VALUES).min(limit);
         let mut decoded = Vec::new();
-        let bytes = self.loaned_block(block, &mut decoded, false)?;
+        let bytes = self.loaned_block(block, &mut decoded, Loan::InOrder)?;
         let ends = self.ends_within(first, last)?;
         if ends.len() != last - first {
             return Err(invalid("global dictionary offsets are short"));
@@ -6211,7 +6237,7 @@ impl TextSource for NativeText {
         let block = first / TEXT_PAYLOAD_VALUES;
         let last = ((block + 1) * TEXT_PAYLOAD_VALUES).min(limit);
         let mut decoded = Vec::new();
-        let bytes = self.loaned_block(block, &mut decoded, false)?;
+        let bytes = self.loaned_block(block, &mut decoded, Loan::InOrder)?;
         let ends = self.ends_within(first, last)?;
         if ends.len() != last - first {
             return Err(invalid("global dictionary offsets are short"));
@@ -6265,7 +6291,7 @@ impl TextSource for NativeText {
                 break;
             };
             let upto = run + order[run..].partition_point(|&at| block_of(at) == Some(block));
-            let bytes = self.loaned_block(block, &mut decoded, true)?;
+            let bytes = self.loaned_block(block, &mut decoded, Loan::Scattered)?;
             for &at in &order[run..upto] {
                 let (start, end) = self.span_within(indices[at] as usize)?;
                 let value = bytes
@@ -6281,7 +6307,8 @@ impl TextSource for NativeText {
     /// Each block the indices land in, decoded once for the call, or read where it is already kept.
     ///
     /// Kept the way [`Self::sweep`] keeps, the second time a block is decoded and under the budget,
-    /// so a read that comes once keeps nothing. A synopsis turned into values is turned once and
+    /// so a read that comes once keeps nothing. A call that asks for every value of a block is the
+    /// exception in the last statement, for the reason [`Loan::Whole`] gives. A synopsis turned into values is turned once and
     /// remembered by the reader as values. A `LIKE` is not: the memo it fills belongs to its
     /// statement, so the same blocks are asked for again by the next statement, and by each arm of
     /// an `OR` of patterns in the same one. Never keeping them had JOB 14b decode the blocks of
@@ -6301,7 +6328,10 @@ impl TextSource for NativeText {
             if wanted.iter().any(|&index| index >= self.values) {
                 return Err(invalid("a visited value is past the global dictionary"));
             }
-            let bytes = self.loaned_block(block, &mut decoded, false)?;
+            let whole =
+                wanted.len() == TEXT_PAYLOAD_VALUES.min(self.values - block * TEXT_PAYLOAD_VALUES);
+            let loan = if whole { Loan::Whole } else { Loan::InOrder };
+            let bytes = self.loaned_block(block, &mut decoded, loan)?;
             for (offset, &index) in wanted.iter().enumerate() {
                 let (start, end) = self.span_within(index)?;
                 let value = bytes
