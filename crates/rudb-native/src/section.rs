@@ -312,6 +312,9 @@ pub struct Extent {
     pub length: u32,
     /// Checksum over those bytes.
     pub hash: u64,
+    /// Whether `hash` is the kilobyte wide part hash format 31 writes rather than xxHash64, which
+    /// the top bit of the length says on disk.
+    pub wide: bool,
     /// How many logical elements precede this extent, so that a random access can find the extent
     /// holding an element without reading any of them.
     pub first: u64,
@@ -319,6 +322,10 @@ pub struct Extent {
 
 /// Bytes one extent entry takes in an extent table.
 pub const EXTENT_BYTES: usize = 28;
+
+/// The top bit of an extent's length on disk, set when its hash is the wide one. No length reaches
+/// it, because an extent is at most [`MAX_EXTENT`].
+const WIDE_EXTENT: u32 = 1 << 31;
 
 impl Extent {
     /// Appends this extent's twenty eight bytes.
@@ -333,8 +340,9 @@ impl Extent {
                 self.length
             )));
         }
+        let length = if self.wide { self.length | WIDE_EXTENT } else { self.length };
         out.extend_from_slice(&self.offset.to_le_bytes());
-        out.extend_from_slice(&self.length.to_le_bytes());
+        out.extend_from_slice(&length.to_le_bytes());
         out.extend_from_slice(&self.hash.to_le_bytes());
         out.extend_from_slice(&self.first.to_le_bytes());
         Ok(())
@@ -349,10 +357,12 @@ impl Extent {
         if bytes.len() != EXTENT_BYTES {
             return Err(malformed("an extent entry is not twenty eight bytes"));
         }
+        let length = u32::from_le_bytes(bytes[8..12].try_into().expect("four bytes"));
         let extent = Self {
             offset: u64::from_le_bytes(bytes[0..8].try_into().expect("eight bytes")),
-            length: u32::from_le_bytes(bytes[8..12].try_into().expect("four bytes")),
+            length: length & !WIDE_EXTENT,
             hash: u64::from_le_bytes(bytes[12..20].try_into().expect("eight bytes")),
+            wide: length & WIDE_EXTENT != 0,
             first: u64::from_le_bytes(bytes[20..28].try_into().expect("eight bytes")),
         };
         if extent.length > MAX_EXTENT {
@@ -537,26 +547,35 @@ mod tests {
         // The bound is the point of the split, so the boundary is the case worth pinning: sixty
         // four megabytes exactly has to work, because a payload that is a multiple of it would
         // otherwise be unwritable.
-        let at_bound = Extent { offset: 4096, length: MAX_EXTENT, hash: 9, first: 0 };
-        let mut bytes = Vec::new();
-        at_bound.encode(&mut bytes).expect("an extent at the bound encodes");
-        assert_eq!(bytes.len(), EXTENT_BYTES);
-        assert_eq!(Extent::decode(&bytes).expect("decode"), at_bound);
+        for wide in [false, true] {
+            let at_bound = Extent { offset: 4096, length: MAX_EXTENT, hash: 9, wide, first: 0 };
+            let mut bytes = Vec::new();
+            at_bound.encode(&mut bytes).expect("an extent at the bound encodes");
+            assert_eq!(bytes.len(), EXTENT_BYTES);
+            assert_eq!(Extent::decode(&bytes).expect("decode"), at_bound);
+        }
 
-        let past = Extent { offset: 4096, length: MAX_EXTENT + 1, hash: 9, first: 0 };
+        let past = Extent { offset: 4096, length: MAX_EXTENT + 1, hash: 9, wide: false, first: 0 };
         assert!(past.encode(&mut Vec::new()).is_err());
     }
 
     fn table() -> Vec<Extent> {
         vec![
-            Extent { offset: 1024, length: MAX_EXTENT, hash: 1, first: 0 },
+            Extent { offset: 1024, length: MAX_EXTENT, hash: 1, wide: true, first: 0 },
             Extent {
                 offset: 1024 + u64::from(MAX_EXTENT),
                 length: MAX_EXTENT,
                 hash: 2,
+                wide: false,
                 first: 100,
             },
-            Extent { offset: 1024 + 2 * u64::from(MAX_EXTENT), length: 512, hash: 3, first: 250 },
+            Extent {
+                offset: 1024 + 2 * u64::from(MAX_EXTENT),
+                length: 512,
+                hash: 3,
+                wide: true,
+                first: 250,
+            },
         ]
     }
 
