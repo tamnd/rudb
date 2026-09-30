@@ -1568,7 +1568,8 @@ impl<'a> Scan<'a> {
             let kept = domain.kept(keys.column(0)?, positions.len(), &mut Vec::new());
             paying.saw(positions.len(), kept.count());
             if kept.count() < positions.len() {
-                positions = kept.indices().into_iter().map(|index| positions[index as usize]).collect();
+                positions =
+                    kept.indices().into_iter().map(|index| positions[index as usize]).collect();
             }
             if positions.is_empty() {
                 *out = Chunk::empty(&self.schema.types());
