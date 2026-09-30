@@ -2892,14 +2892,12 @@ impl<'a> Aggregate<'a> {
                 codes.places(*length, coded_places);
                 let mut row = 0;
                 loop {
-                    while row < *length {
-                        let found = slot_at(coded_map[coded_places[row]]);
-                        if found == NOWHERE {
-                            break;
-                        }
-                        slots[row] = found;
-                        row += 1;
-                    }
+                    row = crate::table::slots_from(
+                        coded_map,
+                        &coded_places[..*length],
+                        &mut slots[..*length],
+                        row,
+                    );
                     if row == *length {
                         break;
                     }

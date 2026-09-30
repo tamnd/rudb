@@ -1511,6 +1511,27 @@ pub(crate) fn slot_at(held: u32) -> usize {
     if held == UNSEEN { NOWHERE } else { held as usize }
 }
 
+/// Fills each row's slot from `from` on out of `map` at the row's place, and gives the first row
+/// whose place holds nothing, or the end.
+///
+/// A loop of its own over plain slices, because written in [`crate::group`] against the fields it
+/// borrows the store into a slot could have changed any of them, so every row loaded the places,
+/// the map and both lengths again. That was a quarter of what the fold itself cost in q01 once it
+/// grouped by four keys (`spec/perf/90`).
+pub(crate) fn slots_from(map: &[u32], places: &[usize], slots: &mut [usize], from: usize) -> usize {
+    let (Some(places), Some(slots)) = (places.get(from..), slots.get_mut(from..)) else {
+        return from;
+    };
+    for (at, (slot, &place)) in slots.iter_mut().zip(places).enumerate() {
+        let held = map[place];
+        if held == UNSEEN {
+            return from + at;
+        }
+        *slot = held as usize;
+    }
+    from + slots.len().min(places.len())
+}
+
 /// What a place of the map holds for `slot`, [`UNSEEN`] for `NOWHERE`.
 #[inline(always)]
 pub(crate) fn held_at(slot: usize) -> u32 {
