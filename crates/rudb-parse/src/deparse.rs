@@ -354,10 +354,11 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         Expr::Binary { op, left, right } => binary(ast, op, left, right),
         Expr::Function { name, args, distinct, filter } => {
             let sorted = ast.aggregate_order(index);
-            let written = call(ast, name, args, distinct, filter, ast.named_args(index), sorted);
+            let (list, named) = ast.written_args(index, args);
+            let written = call(ast, name, list, distinct, filter, named, sorted);
             if ast.exports_state(index) { written + " EXPORT_STATE" } else { written }
         }
-        held @ Expr::Window { .. } => window(ast, held),
+        held @ Expr::Window { .. } => window(ast, index, held),
         Expr::Cast { operand, ty, try_cast } => {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
             format!("{word}({} AS {})", expr(ast, operand), typename(ast.string(ty)))
@@ -667,14 +668,13 @@ fn binary(ast: &Ast, op: BinaryOp, left: ExprRef, right: ExprRef) -> String {
 fn call(
     ast: &Ast,
     name: Slice,
-    args: Slice,
+    list: &[ExprRef],
     distinct: bool,
     filter: ExprRef,
     named: &[Target],
     sorted: &[OrderItem],
 ) -> String {
     let written = parts(ast, name);
-    let list = ast.expr_list(args);
     // `count(*)` is a different function from `count`, and the star is how it is spelled rather than
     // an argument it takes, so it prints under the name it really has. `count()` with nothing in it
     // is the third spelling of the same function and prints under that name too.
@@ -687,23 +687,22 @@ fn call(
         }
     }
     let word = if distinct { "DISTINCT " } else { "" };
-    // Named arguments come after the positional ones, the way they had to be written.
-    let mut listed = exprs(ast, args);
-    for target in named {
-        if !listed.is_empty() {
-            listed.push_str(", ");
-        }
-        listed.push_str(&format!(
-            "{} := {}",
-            quoted(ast.string(target.alias)),
-            expr(ast, target.expr)
-        ));
-    }
+    let mut listed = argument_list(ast, list, named);
     if !sorted.is_empty() {
         let items: Vec<String> = sorted.iter().map(|item| order(ast, item)).collect();
         listed.push_str(&format!(" ORDER BY {}", items.join(", ")));
     }
     format!("{}({word}{listed}){}", operator(ast, name, &written), filtered(ast, filter))
+}
+
+/// The arguments of a call, with the named ones after the positional ones, the way they had to be
+/// written.
+fn argument_list(ast: &Ast, list: &[ExprRef], named: &[Target]) -> String {
+    let mut listed: Vec<String> = list.iter().map(|&item| expr(ast, item)).collect();
+    for target in named {
+        listed.push(format!("{} := {}", quoted(ast.string(target.alias)), expr(ast, target.expr)));
+    }
+    listed.join(", ")
 }
 
 /// The `FILTER` a call was written with, or nothing at all when it was written without one.
@@ -723,7 +722,7 @@ fn filtered(ast: &Ast, filter: ExprRef) -> String {
 ///
 /// The whole expression is taken rather than its parts, because there are eight of them now and a
 /// call with eight arguments is one the reader has to count along to read.
-fn window(ast: &Ast, held: Expr) -> String {
+fn window(ast: &Ast, index: ExprRef, held: Expr) -> String {
     let Expr::Window { name, args, distinct, filter, ignore_nulls, order: sorted, spec } = held
     else {
         return String::new();
@@ -744,11 +743,11 @@ fn window(ast: &Ast, held: Expr) -> String {
     // `count(*) OVER ()` comes back as `count() OVER ()`, where the same call without a window
     // comes back as `count_star()`. The star goes and the name stays, which is upstream's answer
     // and not the one the ordinary call path gives.
-    let list = ast.expr_list(args);
+    let (list, named) = ast.written_args(index, args);
     let bare = list.len() == 1
         && matches!(ast.expr(list[0]), Expr::Star { qualifier, replacements }
             if qualifier.is_empty() && replacements.is_empty());
-    let inner = if bare { String::new() } else { exprs(ast, args) };
+    let inner = if bare { String::new() } else { argument_list(ast, list, named) };
     let call = format!(
         "{}({word}{inner}{sorted}{nulls}){}",
         operator(ast, name, &written),

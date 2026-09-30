@@ -30,6 +30,7 @@ use crate::ast::{
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
+use crate::parameters::{self, Arranged, Refilled, Slot};
 use crate::token::{Kind, Token};
 use crate::tokenize::tokenize;
 
@@ -4298,7 +4299,7 @@ impl<'a> Transform<'a> {
         // call with any positional argument stays a call, for the binder to turn down in the pin's
         // words. `struct_insert(s, b := 2)` and `struct_update` take the named arguments as the
         // fields to add or replace, so those are gathered into one struct handed over as the last
-        // argument. A name on any other call is a parameter the binder does not have yet.
+        // argument. A name on any other call names one of the function's parameters.
         let called = if name.len == 1 {
             self.ast.name(name).last().map(str::to_ascii_lowercase).unwrap_or_default()
         } else {
@@ -4325,6 +4326,8 @@ impl<'a> Transform<'a> {
         if inside != NONE && over == NONE && rewritten {
             return self.unsupported(inside);
         }
+        let mut placed = None;
+        let mut unplaced = None;
         if merges && over == NONE && !names.is_empty() && names.len() + 1 == args.len() {
             let names = self.part_slice(names);
             let values = self.expr_slice(args.split_off(1));
@@ -4344,8 +4347,62 @@ impl<'a> Transform<'a> {
             let call = self.push(Expr::Function { name, args, distinct, filter });
             self.ast.named_args.push((call, named));
             return Ok(call);
-        } else if !names.is_empty() && (!packs || names.len() == args.len()) {
+        } else if packs && !names.is_empty() && names.len() == args.len() {
             return self.unsupported(first_named);
+        } else if !packs && !names.is_empty() {
+            // Any other call with names has them put in the places the function gives those
+            // names, with a default written into a place that was skipped, and keeps them as
+            // written beside the call for its name. Names that fit no list of parameters, or two
+            // lists in different orders, are kept beside the call instead, for the binder to
+            // refuse with the types.
+            let function = if called.starts_with("percentile_") {
+                called.replace("percentile_", "quantile_")
+            } else {
+                called.clone()
+            };
+            let positional = args.len() - names.len();
+            let values = args.split_off(positional);
+            let texts: Vec<String> =
+                names.iter().map(|&alias| self.ast.string(alias).to_string()).collect();
+            for (index, text) in texts.iter().enumerate() {
+                if texts[..index].iter().any(|before| before.eq_ignore_ascii_case(text)) {
+                    return Err(Error::binder(format!(
+                        "Duplicate named argument \"{text}\" in function call to '\"{function}\"'"
+                    )));
+                }
+            }
+            let written: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let implicit = usize::from(within != NONE);
+            let targets: Vec<Target> =
+                names.iter().zip(&values).map(|(&alias, &expr)| Target { expr, alias }).collect();
+            match parameters::arrange(&function, implicit, positional, &written) {
+                Err(Refilled { named, parameter }) => {
+                    return Err(Error::binder(format!(
+                        "Named argument '{}' cannot be used for parameter '\"{parameter}\"' because it has already been provided as a positional argument in function call to '\"{function}\"'",
+                        crate::deparse::expression(&self.ast, values[named])
+                    )));
+                }
+                Ok(Arranged::Slots(slots)) => {
+                    let mut ordered = Vec::with_capacity(slots.len());
+                    for slot in slots {
+                        match slot {
+                            Slot::Written(index) if index < implicit => {}
+                            Slot::Written(index) if index < implicit + positional => {
+                                ordered.push(args[index - implicit]);
+                            }
+                            Slot::Written(index) => {
+                                ordered.push(values[index - implicit - positional])
+                            }
+                            Slot::Default(sql) => ordered.push(self.default_value(sql)),
+                        }
+                    }
+                    args = ordered;
+                    placed = Some((positional, self.target_slice(targets)));
+                }
+                Ok(Arranged::Unmatched | Arranged::Ambiguous) => {
+                    unplaced = Some(self.target_slice(targets));
+                }
+            }
         }
         // A call with an `OVER` on it is a window call and none of the rewrites below apply to it.
         // The reference binary agrees on the one case where that is visible: `ifnull(1) OVER ()`
@@ -4354,7 +4411,7 @@ impl<'a> Transform<'a> {
         if over != NONE {
             let args = self.expr_slice(args);
             let spec = self.over(over)?;
-            return Ok(self.push(Expr::Window {
+            let call = self.push(Expr::Window {
                 name,
                 args,
                 distinct,
@@ -4362,7 +4419,9 @@ impl<'a> Transform<'a> {
                 ignore_nulls,
                 order: inner,
                 spec,
-            }));
+            });
+            self.keep_names(call, placed, unplaced);
+            return Ok(call);
         }
         // `IFNULL` is an ordinary call in the grammar and is not one by the time DuckDB's parser is
         // done with it: `ifnull(NULL, 3)` comes back named `COALESCE(NULL, 3)` there, and so does
@@ -4375,10 +4434,13 @@ impl<'a> Transform<'a> {
             }
             let args = self.expr_slice(args);
             let name = self.function_name("coalesce");
-            return Ok(self.push(Expr::Function { name, args, distinct, filter }));
+            let call = self.push(Expr::Function { name, args, distinct, filter });
+            self.keep_names(call, placed, unplaced);
+            return Ok(call);
         }
         let args = self.expr_slice(args);
         let call = self.push(Expr::Function { name, args, distinct, filter });
+        self.keep_names(call, placed, unplaced);
         if inner.len > 0 {
             self.ast.aggregate_orders.push((call, inner));
         }
@@ -4386,6 +4448,36 @@ impl<'a> Transform<'a> {
             self.ast.exported.push(call);
         }
         Ok(call)
+    }
+
+    /// Keeps a call's named arguments beside it: as written, when they were put in their places,
+    /// or as they are, when they could not be.
+    fn keep_names(
+        &mut self,
+        call: ExprRef,
+        placed: Option<(usize, Slice)>,
+        unplaced: Option<Slice>,
+    ) {
+        if let Some((positional, named)) = placed {
+            #[expect(clippy::cast_possible_truncation, reason = "a call has few arguments")]
+            self.ast.named_written.push((call, positional as u32, named));
+        }
+        if let Some(named) = unplaced {
+            self.ast.named_args.push((call, named));
+        }
+    }
+
+    /// The default of a parameter a call skipped, which is one of the three values the table in
+    /// `parameters` has.
+    fn default_value(&mut self, sql: &str) -> ExprRef {
+        let kind = match sql {
+            "NULL" => LiteralKind::Null,
+            "false" => LiteralKind::False,
+            "true" => LiteralKind::True,
+            _ => LiteralKind::Number,
+        };
+        let text = self.intern(sql);
+        self.push(Expr::Literal { kind, text })
     }
 
     /// `WithinGroupClause <- 'WITHIN' 'GROUP' Parens(OrderByClause)`.

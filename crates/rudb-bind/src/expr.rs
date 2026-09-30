@@ -130,6 +130,15 @@ impl Binder<'_> {
                     None => self.bind_call(ast, name, args, distinct, filter, &[], scope),
                 }
             }
+            ast::Expr::Function { name, args, .. } if !ast.named_args(expr).is_empty() => {
+                let written = ast.name(name).last().unwrap_or_default().to_string();
+                let sorted = ast.aggregate_order(expr);
+                self.refuse_named(ast, expr, &written, ast.expr_list(args), sorted, scope)
+            }
+            ast::Expr::Window { name, args, .. } if !ast.named_args(expr).is_empty() => {
+                let written = ast.name(name).last().unwrap_or_default().to_string();
+                self.refuse_named(ast, expr, &written, ast.expr_list(args), &[], scope)
+            }
             ast::Expr::Function { name, args, distinct, filter } => {
                 let sorted = ast.aggregate_order(expr);
                 // Only an aggregate reads this, and the pin lets any other call write it and
@@ -1586,6 +1595,47 @@ impl Binder<'_> {
         Ok(None)
     }
 
+    /// A call whose named arguments the parser could not put in places, because they fit none of
+    /// the function's lists of parameters or fit two of them in different orders. It is refused in
+    /// the pin's words, with every argument spelled the way the pin spells it. The key of a
+    /// `WITHIN GROUP` is the first argument there, since that is the place it fills.
+    fn refuse_named(
+        &mut self,
+        ast: &Ast,
+        call: ast::ExprRef,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        sorted: &[ast::OrderItem],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let function = written.to_ascii_lowercase();
+        let mut spelled = Vec::new();
+        let implicit = match sorted {
+            [key] if function.starts_with("quantile_") => {
+                let bound = self.bind_expr(ast, key.expr, scope)?;
+                spelled.push(self.plan().expr_type(bound).to_string());
+                1
+            }
+            _ => 0,
+        };
+        for &arg in arguments {
+            let bound = self.bind_expr(ast, arg, scope)?;
+            spelled.push(spelled_type(ast, arg, self.plan().expr_type(bound)));
+        }
+        let named = ast.named_args(call);
+        for target in named {
+            let bound = self.bind_expr(ast, target.expr, scope)?;
+            let ty = spelled_type(ast, target.expr, self.plan().expr_type(bound));
+            spelled.push(format!("\"{}\" := {ty}", ast.string(target.alias)));
+        }
+        let names: Vec<&str> = named.iter().map(|target| ast.string(target.alias)).collect();
+        let ambiguous = matches!(
+            rudb_parse::parameters::arrange(&function, implicit, arguments.len(), &names),
+            Ok(rudb_parse::parameters::Arranged::Ambiguous)
+        );
+        Err(rudb_functions::named_mismatch(&function, &spelled, ambiguous))
+    }
+
     /// `year(x)` and the other names that read one part of a date, bound as the `date_part` call
     /// they are on the pin.
     ///
@@ -1601,20 +1651,10 @@ impl Binder<'_> {
         arguments: &[ast::ExprRef],
         bound: &[ExprRef],
     ) -> Result<ExprRef> {
-        let written = |ty: &LogicalType, arg: ast::ExprRef| match ast.expr(arg) {
-            ast::Expr::Literal { kind: LiteralKind::String, .. } => "STRING_LITERAL".to_string(),
-            ast::Expr::Literal { kind: LiteralKind::Number, text }
-                if ast.string(text).bytes().all(|byte| byte.is_ascii_digit()) =>
-            {
-                "INTEGER_LITERAL".to_string()
-            }
-            _ if *ty == LogicalType::Null => "\"NULL\"".to_string(),
-            _ => ty.to_string(),
-        };
         let types: Vec<LogicalType> =
             bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
         let spelled: Vec<String> =
-            types.iter().zip(arguments).map(|(ty, &arg)| written(ty, arg)).collect();
+            types.iter().zip(arguments).map(|(ty, &arg)| spelled_type(ast, arg, ty)).collect();
         let interval = name != "julian";
         let timed = TIMED_SHORTCUTS.contains(&name);
         let [only] = bound[..] else {
@@ -2210,9 +2250,10 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             // `count(UserID)` and `count(DISTINCT UserID)` are two different answers and a result
             // that called them both the first one would be reporting the wrong one.
             let word = if distinct { "DISTINCT " } else { "" };
+            let (list, named) = ast.written_args(expr, args);
             let mut arguments: Vec<String> =
-                ast.expr_list(args).iter().map(|&arg| describe(ast, arg, semantics)).collect();
-            for target in ast.named_args(expr) {
+                list.iter().map(|&arg| describe(ast, arg, semantics)).collect();
+            for target in named {
                 let value = describe(ast, target.expr, semantics);
                 arguments.push(format!("{} := {value}", quoted(ast.string(target.alias))));
             }
@@ -2872,6 +2913,21 @@ const KEYWORD_SHORTCUTS: &[&str] = &[
 ///
 /// The overloads are listed in the pin's order, and a name that reads a time lists the three time
 /// types among them.
+/// An argument's type the way the pin's messages spell it, which names a string written in the
+/// query `STRING_LITERAL`, a whole number written in it `INTEGER_LITERAL` and a null `"NULL"`.
+fn spelled_type(ast: &Ast, arg: ast::ExprRef, ty: &LogicalType) -> String {
+    match ast.expr(arg) {
+        ast::Expr::Literal { kind: LiteralKind::String, .. } => "STRING_LITERAL".to_string(),
+        ast::Expr::Literal { kind: LiteralKind::Number, text }
+            if ast.string(text).bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            "INTEGER_LITERAL".to_string()
+        }
+        _ if *ty == LogicalType::Null => "\"NULL\"".to_string(),
+        _ => ty.to_string(),
+    }
+}
+
 fn part_mismatch(name: &str, spelled: &[String], interval: bool, timed: bool) -> Error {
     let returns = if matches!(name, "epoch" | "julian") { "DOUBLE" } else { "BIGINT" };
     let shown =
