@@ -51,6 +51,24 @@ fn run(query: &Query, stage: usize, rt: &mut Rt, columns: &[Column], state: &mut
 /// Like [`run`], and returns the status rather than wanting it to be `Ok`.
 fn call(query: &Query, stage: usize, rt: &mut Rt, columns: &[Column], state: &mut [u8]) -> u64 {
     let body = query.bodies[stage].as_ref().expect("a pipeline");
+    // Each `LIKE` or comparison the body reads as a column is answered here for the morsel, as
+    // the driver does, into one byte a row read through the rows as codes.
+    let answers: Vec<Vec<u8>> = body
+        .likes
+        .iter()
+        .map(|m| {
+            let like = rt.like(m.like).expect("the pattern the body was made with");
+            let values = &columns[m.column].values;
+            (0..8)
+                .map(|i| {
+                    let header =
+                        u128::from_le_bytes(values[16 * i..16 * (i + 1)].try_into().unwrap());
+                    // SAFETY: the header was made by `text::make` over a `'static` string.
+                    u8::from(like.matches(unsafe { text::bytes(&header) }))
+                })
+                .collect()
+        })
+        .collect();
     let cols: Vec<Col> = body
         .reads
         .iter()
@@ -59,6 +77,11 @@ fn call(query: &Query, stage: usize, rt: &mut Rt, columns: &[Column], state: &mu
             valid: columns[c].valid.as_ptr(),
             codes: ROWS.as_ptr(),
         })
+        .chain(body.likes.iter().zip(&answers).map(|(m, answer)| Col {
+            values: answer.as_ptr(),
+            valid: columns[m.column].valid.as_ptr(),
+            codes: ROWS.as_ptr(),
+        }))
         // A body that reads its group rows by the key's codes has one more column for their
         // array, which a null address leaves unused.
         .chain(body.keyed.map(|_| Col {

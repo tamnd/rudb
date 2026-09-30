@@ -427,10 +427,20 @@ fn strings_around_the_inline_length_group_and_compare_as_the_first_engine_does()
     let aggs = "aggregates=[count_star()::BIGINT, sum(#0.1::INTEGER)::HUGEINT]";
     same(&format!("Aggregate #1 groups=[#0.0::VARCHAR] {aggs}\n  {scan}"), false);
     same(&format!("Aggregate #1 groups=[#0.0::VARCHAR, #0.1::INTEGER] {aggs}\n  {scan}"), false);
+    // Each comparison is answered for the whole morsel, and a NULL row is kept out even when the
+    // body reads the column only through those answers.
     for w in ["twelve bytes", "twelve bytes?", "a string that is longer than twelve bites", ""] {
+        for op in ["=", "<>", "<=", ">"] {
+            same(
+                &format!(
+                    "Project #1 [#0.1::INTEGER AS k]\n  Filter (#0.0::VARCHAR {op} '{w}'::VARCHAR)::BOOLEAN\n    {scan}"
+                ),
+                true,
+            );
+        }
         same(
             &format!(
-                "Project #1 [#0.1::INTEGER AS k]\n  Filter (#0.0::VARCHAR = '{w}'::VARCHAR)::BOOLEAN\n    {scan}"
+                "Project #1 [#0.1::INTEGER AS k]\n  Filter \"!~~\"(#0.0::VARCHAR, '{w}'::VARCHAR)::BOOLEAN\n    {scan}"
             ),
             true,
         );
