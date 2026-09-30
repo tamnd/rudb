@@ -90,6 +90,7 @@ pub mod scalar;
 pub mod select;
 mod sequence;
 mod shape;
+mod similarity;
 mod split;
 mod statistics;
 pub mod strftime;

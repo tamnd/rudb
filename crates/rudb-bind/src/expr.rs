@@ -647,6 +647,7 @@ impl Binder<'_> {
             let right = self.as_boolean(right, word)?;
             return Ok(self.conjunction(connective, vec![left, right]));
         }
+        let written = [left, right];
         let left = self.bind_expr(ast, left, scope)?;
         let mut right = self.bind_expr(ast, right, scope)?;
         if let Some(comparison) = comparison_of(op) {
@@ -664,6 +665,14 @@ impl Binder<'_> {
             BinaryOp::SimilarTo => return self.regex_operator(left, right, false, false, true),
             BinaryOp::NotSimilarTo => {
                 return self.regex_operator(left, right, false, true, true);
+            }
+            // `^@` is `starts_with` under another name, and the pin refuses it over anything but
+            // strings with the sentence a call gets, literals spelled as literals.
+            BinaryOp::StartsWith => {
+                let types = [left, right].map(|arg| self.plan().expr_type(arg).clone());
+                return self
+                    .call("^@", vec![left, right])
+                    .map_err(|error| literals_spelled(ast, error, &written, &types));
             }
             _ => {}
         }
@@ -975,7 +984,9 @@ impl Binder<'_> {
                 }
             }
         }
-        self.call(&written, bound)
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+        self.call(&written, bound).map_err(|error| literals_spelled(ast, error, &arguments, &types))
     }
 
     /// `list_append` and the five names like it, which are macros on the pin and are expanded the
@@ -2909,10 +2920,37 @@ const KEYWORD_SHORTCUTS: &[&str] = &[
     "year",
 ];
 
-/// The pin's refusal of a part shortcut given something it has no overload for.
+/// A refusal of a call no overload takes, with the arguments that were literals in the query spelled
+/// the way the pin spells them there.
 ///
-/// The overloads are listed in the pin's order, and a name that reads a time lists the three time
-/// types among them.
+/// The signature table only sees types, so it writes `levenshtein(INTEGER, INTEGER)` for
+/// `levenshtein(1, 2)`, where the pin writes `levenshtein(INTEGER_LITERAL, INTEGER_LITERAL)`
+/// because the literals have not been given a type yet when it looks for an overload.
+fn literals_spelled(
+    ast: &Ast,
+    error: Error,
+    arguments: &[ast::ExprRef],
+    types: &[LogicalType],
+) -> Error {
+    let plain = types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    let spelled = types
+        .iter()
+        .zip(arguments)
+        .map(|(ty, &arg)| spelled_type(ast, arg, ty))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (from, to) = (format!("({plain})'. You might"), format!("({spelled})'. You might"));
+    if plain == spelled || !error.message().contains(&from) {
+        return error;
+    }
+    let message = error.message().replacen(&from, &to, 1);
+    let respelled = Error::new(error.code(), message);
+    match error.span() {
+        Some(span) => respelled.with_span(span),
+        None => respelled,
+    }
+}
+
 /// An argument's type the way the pin's messages spell it, which names a string written in the
 /// query `STRING_LITERAL`, a whole number written in it `INTEGER_LITERAL` and a null `"NULL"`.
 fn spelled_type(ast: &Ast, arg: ast::ExprRef, ty: &LogicalType) -> String {
@@ -2928,6 +2966,10 @@ fn spelled_type(ast: &Ast, arg: ast::ExprRef, ty: &LogicalType) -> String {
     }
 }
 
+/// The pin's refusal of a part shortcut given something it has no overload for.
+///
+/// The overloads are listed in the pin's order, and a name that reads a time lists the three time
+/// types among them.
 fn part_mismatch(name: &str, spelled: &[String], interval: bool, timed: bool) -> Error {
     let returns = if matches!(name, "epoch" | "julian") { "DOUBLE" } else { "BIGINT" };
     let shown =

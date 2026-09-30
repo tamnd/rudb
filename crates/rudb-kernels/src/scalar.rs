@@ -68,6 +68,7 @@ use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
 use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
 use crate::shape::{first, identity, nulls_of, single};
+use crate::similarity;
 use crate::split;
 use crate::structs;
 use crate::subscript;
@@ -4114,6 +4115,18 @@ pub fn call_values(
         }
         ("position" | "strpos" | "instr", [haystack, needle]) => text::position(haystack, needle),
         ("contains", [haystack, needle]) => text::contains(haystack, needle),
+        ("levenshtein" | "editdist3", [a, b]) => similarity::levenshtein(a, b),
+        ("damerau_levenshtein", [a, b]) => similarity::damerau_levenshtein(a, b),
+        ("mismatches" | "hamming", [a, b]) => similarity::mismatches(a, b),
+        ("jaccard", [a, b]) => similarity::jaccard(a, b),
+        ("jaro_similarity", [a, b, cutoff @ ..]) => {
+            similarity::jaro_similarity(a, b, cutoff.first())
+        }
+        ("jaro_winkler_similarity", [a, b, cutoff @ ..]) => {
+            similarity::jaro_winkler_similarity(a, b, cutoff.first())
+        }
+        ("starts_with" | "prefix" | "^@", [text, affix]) => similarity::affix(text, affix, false),
+        ("ends_with" | "suffix", [text, affix]) => similarity::affix(text, affix, true),
         ("left" | "right", [held, count]) => text::end(name, held, count),
         ("replace", [held, needle, replacement]) => text::replace(held, needle, replacement),
         ("chr", [code]) => text::chr(code),
