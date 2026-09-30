@@ -1931,11 +1931,7 @@ fn replay_changes(catalog: &mut Catalog, changes: Vec<Replayed>) -> Result<()> {
 
 /// The changes of `run`, decoded on up to `workers` threads, each with the index of its table in
 /// the list that comes back beside them, which holds each table's name and columns once.
-fn decode_run(
-    catalog: &Catalog,
-    run: &[Replayed],
-    workers: usize,
-) -> Result<Decoded> {
+fn decode_run(catalog: &Catalog, run: &[Replayed], workers: usize) -> Result<Decoded> {
     let mut tables: Vec<(QualifiedName, Vec<Field>)> = Vec::new();
     let mut of = Vec::with_capacity(run.len());
     for replayed in run {
@@ -3812,6 +3808,25 @@ impl Shared {
         self.open().is_some()
     }
 
+    /// Whether `ast` touches only the open transaction's own catalog and log, and so runs without
+    /// the writer lock, beside the statements of other connections rather than behind them. That
+    /// is a query, an insert, an update or a delete inside a transaction. Neither streams into the
+    /// file there, and what they did reaches the committed catalog at `COMMIT`, which takes the
+    /// lock. Everything else still takes it: a schema change, which the committed catalog will
+    /// have to hold, and anything that writes the file or ends the transaction.
+    fn private_statement(&self, ast: &Ast) -> bool {
+        self.transacting()
+            && ast.statements.iter().all(|statement| {
+                matches!(
+                    statement,
+                    ast::Statement::Query(_)
+                        | ast::Statement::Insert(_)
+                        | ast::Statement::Update(_)
+                        | ast::Statement::Delete(_)
+                )
+            })
+    }
+
     /// Reuse a simple native aggregate plan while the table and settings are unchanged.
     /// Execution still runs for every call, producing a fresh answer and metrics document.
     fn cached_native_aggregate(&self, sql: &str, cancel: &Cancel) -> Result<Option<QueryResult>> {
@@ -4339,6 +4354,11 @@ impl Shared {
         cancel: &Cancel,
         parse_ns: u64,
     ) -> Result<QueryResult> {
+        if self.private_statement(ast) {
+            return kept(sql, parse_ns, |noted| {
+                self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
+            });
+        }
         let writing = self.writing();
         let result = kept(sql, parse_ns, |noted| {
             self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
@@ -6127,6 +6147,31 @@ mod tests {
         native_single_average_shape, native_single_distinct_shape, native_three_aggregate_shape,
         publish,
     };
+
+    /// A statement inside a transaction works on the transaction's own catalog, so it runs while
+    /// another connection holds the writer lock, and only the commit waits for it.
+    #[test]
+    fn a_write_inside_a_transaction_runs_while_another_connection_holds_the_writer_lock() {
+        let database = Database::new();
+        database.execute("CREATE TABLE t (id INTEGER)").expect("creates");
+        let connection = database.connect();
+        connection.execute("BEGIN").expect("begins");
+        let writing = database.shared.writing();
+        let (done, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            connection.execute("INSERT INTO t VALUES (1), (2)").expect("inserts");
+            connection.execute("UPDATE t SET id = id + 10 WHERE id = 2").expect("updates");
+            let seen = connection.query("SELECT sum(id) FROM t").expect("reads").value_at(0, 0);
+            done.send(seen).expect("sends");
+            connection.execute("COMMIT").expect("commits");
+        });
+        let seen = finished.recv_timeout(Duration::from_secs(60));
+        assert_eq!(seen, Ok(Value::HugeInt(13)), "the statements ran under the held lock");
+        drop(writing);
+        worker.join().expect("the worker");
+        let sum = database.query("SELECT sum(id) FROM t").expect("reads").value_at(0, 0);
+        assert_eq!(sum, Value::HugeInt(13));
+    }
 
     #[test]
     fn grouped_counts_read_rows_instead_of_returning_a_saved_frequency_list() {
