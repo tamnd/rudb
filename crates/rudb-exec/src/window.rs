@@ -6,11 +6,10 @@
 //! depend on row a million, and unlike a sort it cannot even start until the rows are in order.
 //!
 //! So this reads everything, sorts by the partition keys and then the order keys, and walks each
-//! partition once. Every row gets a fresh accumulator over its own frame, which is quadratic in the
-//! size of a partition for a frame that grows with it. A running accumulator that is only reset
-//! when the frame's start moves backwards would make the common frames linear, and it is not here
-//! because it is correct for some frames and not others, and getting the general case right first
-//! is what makes it safe to add. The milestone asks for this to work rather than to be fast.
+//! partition once. An aggregate over a frame that starts at the partition's start keeps one
+//! accumulator for the partition and feeds it the rows each frame gains, so a running total is
+//! linear. Every other frame gets a fresh accumulator per row, which is quadratic in the size of a
+//! partition for a frame that grows with it.
 //!
 //! # Where the rows are ordered
 //!
@@ -193,6 +192,15 @@ impl Iterator for Visiting {
         match self {
             Self::Straight(frame) => frame.next(),
             Self::Sorted(sorted) => sorted.next(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for Visiting {
+    fn next_back(&mut self) -> Option<usize> {
+        match self {
+            Self::Straight(frame) => frame.next_back(),
+            Self::Sorted(sorted) => sorted.next_back(),
         }
     }
 }
@@ -621,18 +629,52 @@ impl Window {
             .iter()
             .map(|call| (call.reads == Reads::Filled).then(|| self.filling(call, rows)))
             .collect();
+        // An aggregate over a frame that starts at the partition's start and leaves nothing out
+        // grows from one row to the next, so it keeps one accumulator for the partition and feeds
+        // it only the rows the frame gained. That is what makes a running total linear instead of
+        // summing the frame again for every row.
+        let mut running: Vec<Option<(Accumulator, usize)>> = self
+            .calls
+            .iter()
+            .map(|call| {
+                self.runs(call)
+                    .then(|| Accumulator::new(&call.name, &call.returns).map(|fresh| (fresh, 0)))
+                    .transpose()
+            })
+            .collect::<Result<_>>()?;
         for at in 0..rows.len() {
             let frame = self.frame_of(rows, &peers, at)?;
             let mut row = rows[at].1.clone();
             for (which, call) in self.calls.iter().enumerate() {
-                match &filled[which] {
-                    Some(column) => row.push(column[at].clone()),
-                    None => row.push(self.answer(call, rows, &peers, at, frame.clone())?),
+                if let Some(column) = &filled[which] {
+                    row.push(column[at].clone());
+                    continue;
+                }
+                match &mut running[which] {
+                    Some((accumulator, fed)) if frame.start == 0 && frame.end >= *fed => {
+                        for gained in *fed..frame.end {
+                            feed(call, rows, gained, accumulator)?;
+                        }
+                        *fed = frame.end;
+                        row.push(accumulator.finish()?);
+                    }
+                    _ => row.push(self.answer(call, rows, &peers, at, frame.clone())?),
                 }
             }
             answered.push(row);
         }
         Ok(())
+    }
+
+    /// Whether a call can keep one accumulator for its whole partition, which is an aggregate over
+    /// a frame that starts at the partition's start, reads its rows in the partition's order, counts
+    /// each one and cuts none out.
+    fn runs(&self, call: &Call) -> bool {
+        call.reads == Reads::Frame
+            && self.frame.start == WindowBound::UnboundedPreceding
+            && self.frame.exclude == WindowExclude::NoOthers
+            && call.order.is_empty()
+            && !call.distinct
     }
 
     /// Which peer group each row of the partition belongs to, numbered from zero.
@@ -854,9 +896,9 @@ impl Window {
             _ => {
                 let Some(group) = landed(peers[at]) else { return Ok(0) };
                 if after {
-                    peers.iter().rposition(|&held| held <= group).map_or(0, |end| end + 1)
+                    peers.partition_point(|&held| held <= group)
                 } else {
-                    peers.iter().position(|&held| held >= group).unwrap_or(rows.len())
+                    peers.partition_point(|&held| held < group)
                 }
             }
         })
@@ -915,22 +957,16 @@ impl Window {
             if self.excluded(peers, at, row) {
                 continue;
             }
-            if let Some(filter) = call.filter_at
-                && rows[row].0[filter].as_bool() != Some(true)
-            {
-                continue;
-            }
-            let args: Vec<Value> = rows[row].0[call.args_at..call.args_at + call.args].to_vec();
-            if call.ignore_nulls && args.iter().any(Value::is_null) {
-                continue;
-            }
             if call.distinct {
+                let Some(args) = counted(call, rows, row) else { continue };
                 if seen.contains(&args) {
                     continue;
                 }
                 seen.push(args.clone());
+                accumulator.update(&args)?;
+                continue;
             }
-            accumulator.update(&args)?;
+            feed(call, rows, row, &mut accumulator)?;
         }
         accumulator.finish()
     }
@@ -973,25 +1009,37 @@ impl Window {
                 Some(usize::try_from(count).unwrap_or(usize::MAX))
             }
         };
+        // The last row is found from the end of the frame, so a frame that grows with the row, the
+        // default one under an `ORDER BY`, is not walked from its start for every row.
+        if wanted.is_none() {
+            for row in reading(call, rows, frame)?.rev() {
+                if self.excluded(peers, at, row) {
+                    continue;
+                }
+                let value = &rows[row].0[call.args_at];
+                if call.ignore_nulls && value.is_null() {
+                    continue;
+                }
+                return Ok(value.clone());
+            }
+            return Ok(Value::Null);
+        }
         let mut seen = 0_usize;
-        let mut last = Value::Null;
         for row in reading(call, rows, frame)? {
             if self.excluded(peers, at, row) {
                 continue;
             }
-            let value = rows[row].0[call.args_at].clone();
+            let value = &rows[row].0[call.args_at];
             if call.ignore_nulls && value.is_null() {
                 continue;
             }
             seen += 1;
             if wanted == Some(seen) {
-                return Ok(value);
+                return Ok(value.clone());
             }
-            last = value;
         }
-        // Reaching the end means the count ran past the frame for the two that count, and means the
-        // answer for the one that wanted the end of it.
-        Ok(if wanted.is_none() { last } else { Value::Null })
+        // Reaching the end means the count ran past the frame.
+        Ok(Value::Null)
     }
 
     /// One `fill` call's whole column for one partition.
@@ -1056,6 +1104,29 @@ impl Window {
             // one exclusion that does not cut a contiguous piece out of the frame.
             WindowExclude::Ties => peers[row] == peers[at] && row != at,
         }
+    }
+}
+
+/// The arguments one row hands an aggregate, or nothing when its `FILTER` or `IGNORE NULLS` passes
+/// it over.
+fn counted(call: &Call, rows: &[Windowed], row: usize) -> Option<Vec<Value>> {
+    if let Some(filter) = call.filter_at
+        && rows[row].0[filter].as_bool() != Some(true)
+    {
+        return None;
+    }
+    let args = &rows[row].0[call.args_at..call.args_at + call.args];
+    if call.ignore_nulls && args.iter().any(Value::is_null) {
+        return None;
+    }
+    Some(args.to_vec())
+}
+
+/// Hands one row to an aggregate unless its `FILTER` or `IGNORE NULLS` passes it over.
+fn feed(call: &Call, rows: &[Windowed], row: usize, accumulator: &mut Accumulator) -> Result<()> {
+    match counted(call, rows, row) {
+        Some(args) => accumulator.update(&args),
+        None => Ok(()),
     }
 }
 
@@ -1348,13 +1419,16 @@ fn digits(unscaled: i128) -> u32 {
 }
 
 /// The first row of the peer group numbered `group`.
+///
+/// Group numbers only ever go up along the partition, so this is a binary search. A walk would do
+/// it for every row of the partition and make the default `RANGE` frame quadratic.
 fn first_of(peers: &[usize], group: usize) -> usize {
-    peers.iter().position(|&held| held == group).unwrap_or(0)
+    peers.partition_point(|&held| held < group)
 }
 
-/// The last row of the peer group numbered `group`.
+/// The last row of the peer group numbered `group`, found the same way as [`first_of`].
 fn last_of(peers: &[usize], group: usize) -> usize {
-    peers.iter().rposition(|&held| held == group).unwrap_or(0)
+    peers.partition_point(|&held| held <= group).saturating_sub(1)
 }
 
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> Error {

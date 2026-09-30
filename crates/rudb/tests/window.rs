@@ -1138,3 +1138,91 @@ fn exclude_under_an_inner_order_is_refused_in_the_pinned_binarys_own_words() {
         "{error}"
     );
 }
+
+/// `last_value` is found from the end of its frame, so each of the ways a row can be passed over has
+/// to be passed over from that end too: a null under `IGNORE NULLS`, a row cut out by `EXCLUDE`,
+/// the call's own `ORDER BY`, and a frame that holds nothing.
+#[test]
+fn last_value_passes_over_the_same_rows_from_the_end_of_the_frame() {
+    let rows = "FROM (VALUES (1, 'a'), (2, NULL), (3, 'c'), (4, NULL)) t(i, v)";
+    let listed = |call: &str, rows: &str| {
+        let sql = format!("SELECT list(lv ORDER BY i)::VARCHAR FROM (SELECT i, {call} lv {rows})");
+        let database = Database::new();
+        let result = database.query(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        let row = result.rows().next().expect("one row");
+        format!("{}", row[0])
+    };
+    let cases = [
+        ("last_value(v IGNORE NULLS) OVER (ORDER BY i)", "[a, a, c, c]"),
+        (
+            "last_value(v) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE \
+             CURRENT ROW)",
+            "[NULL, c, NULL, c]",
+        ),
+        (
+            "last_value(v IGNORE NULLS) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND \
+             UNBOUNDED FOLLOWING EXCLUDE GROUP)",
+            "[c, c, a, c]",
+        ),
+        (
+            "last_value(v) OVER (ORDER BY i ROWS BETWEEN 3 PRECEDING AND 2 PRECEDING)",
+            "[NULL, NULL, a, NULL]",
+        ),
+    ];
+    for (call, expected) in cases {
+        assert_eq!(listed(call, rows), expected, "{call}");
+    }
+    let sorted = "FROM (VALUES (1, 'b'), (2, 'a'), (3, 'c'), (4, NULL)) t(i, v)";
+    assert_eq!(
+        listed("last_value(v ORDER BY v DESC) OVER (ORDER BY i)", sorted),
+        "[b, a, a, NULL]"
+    );
+}
+
+/// An aggregate whose frame starts at the partition's start keeps one accumulator and feeds it the
+/// rows each frame gains, so every frame end, `FILTER`, a tie under `RANGE` and a new partition has
+/// to come out the same as summing each frame afresh.
+#[test]
+fn a_frame_from_the_partition_start_answers_the_same_as_summing_it_afresh() {
+    let listed = |sql: &str| {
+        let sql = format!("SELECT list(s ORDER BY {sql}");
+        let database = Database::new();
+        let result = database.query(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        let row = result.rows().next().expect("one row");
+        format!("{}", row[0])
+    };
+    let cases = [
+        (
+            "i)::VARCHAR FROM (SELECT i, sum(v) OVER (ORDER BY i) s FROM (VALUES (1, 10), \
+             (2, NULL), (2, 5), (3, 1), (4, 7)) t(i, v))",
+            "[10, 15, 15, 16, 23]",
+        ),
+        (
+            "i)::VARCHAR FROM (SELECT i, count(v) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED \
+             PRECEDING AND 1 PRECEDING) s FROM (VALUES (1, 10), (2, NULL), (3, 5), (4, 1), \
+             (5, 7)) t(i, v))",
+            "[0, 1, 1, 2, 3]",
+        ),
+        (
+            "i)::VARCHAR FROM (SELECT i, sum(v) FILTER (WHERE v > 4) OVER (ORDER BY i ROWS \
+             BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) s FROM (VALUES (1, 10), (2, NULL), \
+             (3, 5), (4, 1), (5, 7)) t(i, v))",
+            "[10, 15, 15, 22, 22]",
+        ),
+        (
+            "p, i)::VARCHAR FROM (SELECT p, i, string_agg(v::VARCHAR, '-') OVER (PARTITION BY p \
+             ORDER BY i) s FROM (VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30), (2, 2, NULL), \
+             (2, 3, 50)) t(p, i, v))",
+            "[10, 10-20, 30, 30, 30-50]",
+        ),
+        (
+            "i)::VARCHAR FROM (SELECT i, avg(v) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED \
+             PRECEDING AND 1 FOLLOWING) s FROM (VALUES (1, 10), (2, NULL), (3, 5), (5, 1), \
+             (6, 7)) t(i, v))",
+            "[10.0, 7.5, 7.5, 5.75, 5.75]",
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(listed(sql), expected, "{sql}");
+    }
+}
