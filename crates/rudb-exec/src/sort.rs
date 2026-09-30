@@ -1432,7 +1432,7 @@ mod tests {
     use rudb_vector::VECTOR_SIZE;
 
     use super::{Normalized, merged};
-    use crate::normal::WIDTH;
+    use crate::normal::{self, WIDTH};
 
     /// Rows with keys that repeat a lot and an arrival that settles every tie, shuffled.
     fn shuffled(count: usize) -> Vec<(u64, u64)> {
