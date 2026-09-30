@@ -10,7 +10,7 @@
 //!
 //! A segment is created whole before a record goes into it: the header, zeros to its full size,
 //! a sync, and a sync of the directory, so a later write never grows the file and a sync of it
-//! never has metadata to carry. A block never spans two segments, and the old segment is synced
+//! never has metadata to carry, which is why the lane syncs with `fdatasync`. A block never spans two segments, and the old segment is synced
 //! before the first write to the new one, so replay can treat a bad record as the end of its
 //! segment and still read the next one.
 
@@ -488,7 +488,7 @@ impl Lane {
                 // The old segment is synced before the new one gets a byte, so a segment with
                 // records in it always follows one that is complete on the disk.
                 if open.dirty {
-                    open.file.sync()?;
+                    open.file.sync_data()?;
                     led.syncs += 1;
                 }
                 led.durable = Some(written);
@@ -505,7 +505,7 @@ impl Lane {
         }
         if sync {
             if open.dirty {
-                open.file.sync()?;
+                open.file.sync_data()?;
                 open.dirty = false;
                 led.syncs += 1;
             }

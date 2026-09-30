@@ -158,6 +158,10 @@ impl File for RealFile {
         self.file.sync_all().map_err(|e| Error::io(format!("sync failed: {e}")))
     }
 
+    fn sync_data(&self) -> Result<()> {
+        self.file.sync_data().map_err(|e| Error::io(format!("sync failed: {e}")))
+    }
+
     fn start_writeback(&self, offset: u64, length: u64) {
         crate::writeback::start_writeback(&self.file, offset, length);
     }
