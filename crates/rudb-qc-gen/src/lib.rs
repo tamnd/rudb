@@ -19,7 +19,7 @@
 //! returns `NeedMemory` for the driver to grow them and run the morsel again. An aggregate sink has
 //! the key buffer the body builds each row's key in before `ht_insert`, or for an aggregate with no
 //! groups the address of the one group row, which the driver writes there before the first call.
-//! When every key is fixed width it also has the row of the last key and four words `ht_insert`
+//! When every key is fixed width it also has the row of the last key and six words `ht_insert`
 //! publishes the table in, so that the body finds a key's group itself and calls only for a new one. A
 //! join build has the record buffer the body builds each row's record in before `jt_append`. After
 //! the sink come three words per probe, which the driver fills from the built table at init: the
@@ -58,7 +58,7 @@ use rudb_qc_rt::abi::{
     COL_CODES, COL_SIZE, COL_VALID, HEADER, MORSEL_BEGIN, MORSEL_COLS, MORSEL_END,
 };
 use rudb_qc_rt::join::{ADDRESS, FOLD, JoinLayout, JoinTable};
-use rudb_qc_rt::table::{GroupTable, KeyField, Layout, ROWS_PER_PAGE};
+use rudb_qc_rt::table::{GroupTable, KeyField, LANE_BITS, Layout, ROWS_PER_PAGE, SPREAD};
 use rudb_qc_rt::{Ablate, Rt, text};
 
 /// Where the sink's fields start.
@@ -202,9 +202,11 @@ pub struct Grouping {
     /// last key went to, zero before the first. A row whose key is the last one's goes to the same
     /// row without hashing or probing, which is most rows of a file sorted on its keys.
     pub last: Option<u32>,
-    /// For the same aggregates, the state offset of four words `ht_insert` publishes the table in,
+    /// For the same aggregates, the state offset of six words `ht_insert` publishes the table in,
     /// which the body probes itself before it calls: the address of the slots, their mask, the
-    /// address of the rows by group id, and how many keys it found that way.
+    /// address of the rows by group id, how many keys it found that way, and while the table makes
+    /// rows without looking, the address of its lanes' tails and how many more rows the body may
+    /// append to them itself.
     pub probe: Option<u32>,
     /// For an aggregate grouped by columns that are all in [`Body::domains`], the state offset of
     /// an array of rows indexed by the keys' indexes, zero for a key not seen yet. It has one more
@@ -831,8 +833,8 @@ impl Gen<'_> {
                     let size = size.next_multiple_of(8);
                     self.field(SINK, size, "key");
                     self.field(SINK + size, 8, "last");
-                    self.field(SINK + size + 8, 32, "probe");
-                    (None, Some(SINK + size), SINK + size + 40)
+                    self.field(SINK + size + 8, 48, "probe");
+                    (None, Some(SINK + size), SINK + size + 56)
                 };
                 // A key that arrives in runs closes its groups as it moves on, which needs one key
                 // the row can hold without the heap, and no distinct set, whose pairs are kept by
@@ -1900,7 +1902,16 @@ impl Gen<'_> {
         let zero = self.b.int(Ty::I64, 0);
         let published = self.b.bin(Op::IcmpNe, word, zero);
         let look = self.b.block(&[]);
-        self.b.brif(published, look, &[], slow, &[]);
+        // A table that stopped looking for keys publishes its lanes instead, which a key with no
+        // string appends its row to while the page has room and the table says it may.
+        let text = g.keys.iter().any(|(k, _)| k.text);
+        let blind =
+            if text || self.rt.ablate().off(Ablate::APPEND) { slow } else { self.b.block(&[]) };
+        self.b.brif(published, look, &[], blind, &[]);
+        if blind != slow {
+            self.b.switch_to(blind);
+            self.append_blind(g, values, hash, at, slow, found);
+        }
         self.b.switch_to(look);
         let mask = self.b.load(Ty::I64, st, Val::NONE, 1, at + 8, 0);
         let rows = self.b.load(Ty::Ptr, st, Val::NONE, 1, at + 16, 0);
@@ -1957,6 +1968,54 @@ impl Gen<'_> {
         let j = self.b.bin(Op::And, j, mask);
         self.b.br(head, &[j]);
         Ok((slow, Some(found)))
+    }
+
+    /// Appends the row of the key in `values` to its lane through the words `ht_insert` published
+    /// at `at`, the way [`GroupTable`] does while it makes rows without looking, and goes to
+    /// `found` with it. Goes to `slow` when nothing is published, the table may make no more rows
+    /// this way or the lane's page is full. The page came zeroed, which is how every accumulator
+    /// starts, so only the hash and the key are written.
+    fn append_blind(
+        &mut self,
+        g: &Grouping,
+        values: &[Pair],
+        hash: Val,
+        at: i32,
+        slow: Block,
+        found: Block,
+    ) {
+        let st = self.b.st();
+        let zero = self.b.int(Ty::I64, 0);
+        let tails = self.b.load(Ty::Ptr, st, Val::NONE, 1, at + 32, 0);
+        let left = self.b.load(Ty::I64, st, Val::NONE, 1, at + 40, 0);
+        let may = self.b.bin(Op::IcmpNe, left, zero);
+        let lane = self.b.block(&[]);
+        self.b.brif(may, lane, &[], slow, &[]);
+        self.b.switch_to(lane);
+        let spread = self.b.konst(Ty::I64, u128::from(SPREAD));
+        let spread = self.b.bin(Op::Mul, hash, spread);
+        let shift = self.b.int(Ty::I64, i128::from(64 - LANE_BITS));
+        let index = self.b.bin(Op::Lshr, spread, shift);
+        let next = self.b.load(Ty::I64, tails, index, 16, 0, 0);
+        let end = self.b.load(Ty::I64, tails, index, 16, 8, 0);
+        let full = self.b.bin(Op::IcmpEq, next, end);
+        let room = self.b.block(&[]);
+        self.b.brif(full, slow, &[], room, &[]);
+        self.b.switch_to(room);
+        let size = self.b.int(Ty::I64, i128::from(g.row_size));
+        let after = self.b.bin(Op::Add, next, size);
+        self.b.store(tails, index, 16, 0, after, 0);
+        let one = self.b.int(Ty::I64, 1);
+        let left = self.b.bin(Op::Sub, left, one);
+        self.b.store(st, Val::NONE, 1, at + 40, left, 0);
+        let row = self.b.conv(Op::Bitcast, next, Ty::Ptr);
+        self.b.store(row, Val::NONE, 1, 0, hash, 0);
+        for (&(v, ok), (k, _)) in values.iter().zip(&g.keys) {
+            let null = self.b.un(Op::Not, ok);
+            self.b.store(row, Val::NONE, 1, 8 + k.offset as i32, v, 0);
+            self.b.store(row, Val::NONE, 1, 8 + k.null() as i32, null, 0);
+        }
+        self.b.br(found, &[row]);
     }
 
     fn sink(&mut self, sink: &Sink, out: &Out, skip: Block, depth: u8) -> Result<()> {
