@@ -4892,6 +4892,15 @@ struct Cached {
 /// row toward holding its part. See [`paid_at`].
 const SPARSE_RENT: usize = 8;
 
+/// How many rows toward holding its part a read at positions of a packed integer pays for each row
+/// it wants. This is well past [`SPARSE_RENT`], the most such a read costs, because what it saves
+/// is not one decode but every sparse read of the part that would come after. On JOB the probes
+/// into `cast_info.movie_id` and the other foreign keys come back into the same parts on every
+/// warm run, a few hundred rows a time, and paying only what each read cost left them unpacking
+/// the same units again until the rent ran out. Held after the first read, the suite at one
+/// thread went from 26.5 G to 23.7 G user cycles, and peak memory from 2.02 GB to 2.28 GB.
+const HOLD_RENT: usize = 8192;
+
 /// One part of one column as decoding left it, held so that the next scan of it does not decode it
 /// again.
 ///
@@ -14126,7 +14135,8 @@ fn body_of(codec: u8, rows: usize, bytes: &[u8]) -> Option<&[u8]> {
 ///
 /// An FSST compressed string decompresses only the rows it wants, which costs about what they cost
 /// in a whole read. An integer in packed units found on its own costs about [`SPARSE_RENT`] times
-/// what it costs when its unit is unpacked whole. Everything else costs the whole part: a page
+/// what it costs when its unit is unpacked whole, and pays [`HOLD_RENT`] a row, which holds most
+/// parts on the first read that touches them. Everything else costs the whole part: a page
 /// [`decode_at`] decodes whole and gathers from, a string chunk of any other kind, which
 /// [`string::decode_flat_at`] decodes whole, and a chunk of runs, which walks every run to find a
 /// row. Counting all of those as one row a position was what kept JOB 20b walking the runs of
@@ -14139,7 +14149,7 @@ fn paid_at(rows: usize, bytes: &[u8], positions: &[u32]) -> usize {
     }
     let pointed = cascade_body(rows, bytes).is_some_and(integer::pointed);
     if pointed && wanted.saturating_mul(SPARSE_RENT) <= rows {
-        wanted.saturating_mul(SPARSE_RENT)
+        wanted.saturating_mul(HOLD_RENT).min(rows)
     } else {
         rows
     }
