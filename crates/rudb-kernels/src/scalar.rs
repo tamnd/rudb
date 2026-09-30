@@ -3632,6 +3632,29 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
         return Ok(if name == "date_trunc" { when.clone() } else { Value::Null });
     }
     let doubled = *returns == LogicalType::Double;
+    // A time of day is read as the moment it is on the first day of 1970, which gives the pin's
+    // answer for the six parts a time has. The rest are refused in the pin's words, since a time
+    // is on no day at all.
+    let when = &match when {
+        Value::Time(micros) if name != "date_trunc" => {
+            let timed = matches!(
+                part,
+                Part::Hour
+                    | Part::Minute
+                    | Part::Second
+                    | Part::Millisecond
+                    | Part::Microsecond
+                    | Part::Epoch
+            );
+            if !timed {
+                return Err(Error::not_implemented(format!(
+                    "\"time\" units \"{spelling}\" not recognized"
+                )));
+            }
+            Value::Timestamp(*micros)
+        }
+        other => other.clone(),
+    };
     match (name == "date_trunc", when) {
         (false, Value::Date(days)) if doubled => part.double_of_days(*days).map(Value::Double),
         (false, Value::Timestamp(micros) | Value::TimestampTz(micros)) if doubled => {

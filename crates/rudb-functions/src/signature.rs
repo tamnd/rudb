@@ -3356,6 +3356,8 @@ fn canonical(name: &str) -> &str {
 /// `list_slice`, exactly as `len(1)` says `length`.
 const ALIASES: &[(&str, &str)] = &[
     ("ceiling", "ceil"),
+    ("datepart", "date_part"),
+    ("datetrunc", "date_trunc"),
     ("power", "pow"),
     ("**", "pow"),
     ("^", "pow"),

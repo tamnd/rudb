@@ -887,6 +887,11 @@ impl Binder<'_> {
         if rudb_catalog::same_name(&written, "age") && bound.len() == 1 {
             bound.insert(0, self.current_date());
         }
+        if let Some(&(name, part)) =
+            PART_SHORTCUTS.iter().find(|(name, _)| rudb_catalog::same_name(&written, name))
+        {
+            return self.bind_part_shortcut(ast, name, part, &arguments, &bound);
+        }
         if let Some(function) = ["coalesce", "greatest", "least"]
             .into_iter()
             .find(|name| rudb_catalog::same_name(&written, name))
@@ -1536,6 +1541,63 @@ impl Binder<'_> {
             )));
         }
         Ok(None)
+    }
+
+    /// `year(x)` and the other names that read one part of a date, bound as the `date_part` call
+    /// they are on the pin.
+    ///
+    /// Each one is declared over a date, a timestamp, a zoned timestamp and an interval, so an
+    /// argument that is none of those is refused under the name that was written, with the pin's
+    /// list of the four. A string literal or a null could be any of them and the pin will not pick
+    /// one. `julian` has no interval reading, since an interval is not a day anywhere.
+    fn bind_part_shortcut(
+        &mut self,
+        ast: &Ast,
+        name: &str,
+        part: &str,
+        arguments: &[ast::ExprRef],
+        bound: &[ExprRef],
+    ) -> Result<ExprRef> {
+        let written = |ty: &LogicalType, arg: ast::ExprRef| match ast.expr(arg) {
+            ast::Expr::Literal { kind: LiteralKind::String, .. } => "STRING_LITERAL".to_string(),
+            ast::Expr::Literal { kind: LiteralKind::Number, text }
+                if ast.string(text).bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                "INTEGER_LITERAL".to_string()
+            }
+            _ if *ty == LogicalType::Null => "\"NULL\"".to_string(),
+            _ => ty.to_string(),
+        };
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+        let spelled: Vec<String> =
+            types.iter().zip(arguments).map(|(ty, &arg)| written(ty, arg)).collect();
+        let interval = name != "julian";
+        let timed = TIMED_SHORTCUTS.contains(&name);
+        let [only] = bound[..] else {
+            return Err(part_mismatch(name, &spelled, interval, timed));
+        };
+        let wanted = match &types[0] {
+            LogicalType::Date | LogicalType::Timestamp | LogicalType::TimestampTz => None,
+            LogicalType::Interval if interval => None,
+            LogicalType::Time if timed => None,
+            LogicalType::TimestampS | LogicalType::TimestampMs | LogicalType::TimestampNs => {
+                Some(LogicalType::Timestamp)
+            }
+            _ if matches!(spelled[0].as_str(), "STRING_LITERAL" | "\"NULL\"") => {
+                return Err(Error::binder(format!(
+                    "Could not choose a best candidate function for the function call \"{name}({})\". In order to select one, please add explicit type casts.",
+                    spelled[0]
+                )));
+            }
+            _ => return Err(part_mismatch(name, &spelled, interval, timed)),
+        };
+        let when = match wanted {
+            Some(ty) => self.cast_to(only, &ty),
+            None => only,
+        };
+        let spec = self.add_constant(Value::Varchar(part.to_string()));
+        self.call("date_part", vec![spec, when])
     }
 
     /// The answer type of a `date_part`, which is the one call whose type comes from the value of
@@ -2658,6 +2720,90 @@ fn volatile(plan: &Plan, expr: ExprRef) -> bool {
         }
         _ => false,
     }
+}
+
+/// The names that read one part of a date, and the part each one reads.
+///
+/// The pin has each of these as a function of its own with its own overloads, and every one of them
+/// answers what `date_part` does with that part, including the type.
+const PART_SHORTCUTS: &[(&str, &str)] = &[
+    ("year", "year"),
+    ("month", "month"),
+    ("day", "day"),
+    ("dayofmonth", "day"),
+    ("hour", "hour"),
+    ("minute", "minute"),
+    ("second", "second"),
+    ("millisecond", "millisecond"),
+    ("microsecond", "microsecond"),
+    ("week", "week"),
+    ("weekofyear", "week"),
+    ("weekday", "dow"),
+    ("dayofweek", "dow"),
+    ("isodow", "isodow"),
+    ("dayofyear", "doy"),
+    ("quarter", "quarter"),
+    ("decade", "decade"),
+    ("century", "century"),
+    ("millennium", "millennium"),
+    ("era", "era"),
+    ("epoch", "epoch"),
+    ("isoyear", "isoyear"),
+    ("yearweek", "yearweek"),
+    ("julian", "julian"),
+];
+
+/// The part shortcuts that read a time of day as well, which are the ones whose part a time has.
+const TIMED_SHORTCUTS: &[&str] =
+    &["hour", "minute", "second", "millisecond", "microsecond", "epoch"];
+
+/// The part shortcuts whose names are keywords, which the pin quotes when it lists the overloads.
+const KEYWORD_SHORTCUTS: &[&str] = &[
+    "century",
+    "day",
+    "decade",
+    "hour",
+    "microsecond",
+    "millennium",
+    "millisecond",
+    "minute",
+    "month",
+    "quarter",
+    "second",
+    "week",
+    "year",
+];
+
+/// The pin's refusal of a part shortcut given something it has no overload for.
+///
+/// The overloads are listed in the pin's order, and a name that reads a time lists the three time
+/// types among them.
+fn part_mismatch(name: &str, spelled: &[String], interval: bool, timed: bool) -> Error {
+    let returns = if matches!(name, "epoch" | "julian") { "DOUBLE" } else { "BIGINT" };
+    let shown =
+        if KEYWORD_SHORTCUTS.contains(&name) { format!("\"{name}\"") } else { name.to_string() };
+    let mut message = format!(
+        "No function matches the given name and argument types '{name}({})'. You might need to add explicit type casts.\n\tCandidate functions:",
+        spelled.join(", ")
+    );
+    let over: &[&str] = match (interval, timed) {
+        (_, true) => &[
+            "DATE",
+            "INTERVAL",
+            "TIME",
+            "TIMESTAMP",
+            "TIME WITH TIME ZONE",
+            "TIME_NS",
+            "TIMESTAMP WITH TIME ZONE",
+        ],
+        (true, false) => &["DATE", "INTERVAL", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE"],
+        (false, false) => &["DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE"],
+    };
+    for ty in over {
+        message += &format!("\n\t{shown}(col0 {ty}) -> {returns}");
+    }
+    message.push('\n');
+    Error::binder(message)
 }
 
 #[cfg(test)]
