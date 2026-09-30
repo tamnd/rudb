@@ -4578,6 +4578,30 @@ impl<'a> Aggregate<'a> {
     ) -> Result<u64> {
         let calls = self.calls.len();
         let mut aside = 0;
+        // A BIGINT set's column read as flat integers once for the chunk, so that a row costs a
+        // validity bit and a load rather than a null test and a signed read that each find the
+        // column's form again. On TPC-H q16 those two were about a hundred and twenty instructions
+        // a row of the `count(DISTINCT ps_suppkey)`.
+        let wide = slots
+            .iter()
+            .find(|&&slot| slot != NOWHERE)
+            .is_some_and(|&slot| matches!(seen[slot * calls + at], DistinctSet::BigInt(_)));
+        let flat = match rows.arguments[at].as_slice() {
+            [column] if wide => Some(column.flatten()?),
+            _ => None,
+        };
+        let ints = flat.as_ref().and_then(|flat| {
+            let values = match flat.data()? {
+                Data::Int64(values) => Ints::Wide(values.as_slice()),
+                Data::Int32(values) => Ints::Narrow(values.as_slice()),
+                _ => return None,
+            };
+            let long = match values {
+                Ints::Wide(values) => values.len(),
+                Ints::Narrow(values) => values.len(),
+            };
+            (long >= slots.len()).then_some((values, flat.validity()))
+        });
         // row at a time: a set of rows is what `DISTINCT` is, and the table that would replace this
         // one is the one #237 built for grouping. Until that is shared, this is the honest loop.
         for (row, &slot) in slots.iter().enumerate() {
@@ -4592,6 +4616,20 @@ impl<'a> Aggregate<'a> {
             if let (DistinctSet::BigInt(set), [column]) =
                 (&mut seen[slot * calls + at], rows.arguments[at].as_slice())
             {
+                if let Some((values, validity)) = &ints {
+                    if !validity.is_valid(row) {
+                        continue;
+                    }
+                    let value = match values {
+                        Ints::Wide(values) => values[row],
+                        Ints::Narrow(values) => i64::from(values[row]),
+                    };
+                    if set.insert(value) {
+                        aside += width_of(size_of::<i64>() * 2);
+                        states[slot * calls + at].update(&[Value::BigInt(value)])?;
+                    }
+                    continue;
+                }
                 if column.is_null_at(row) {
                     continue;
                 }
@@ -5777,6 +5815,12 @@ struct Spilled<'s> {
     types: Vec<LogicalType>,
     row: Vec<Value>,
     columns: Vec<Vec<Value>>,
+}
+
+/// The values of a flat integer column, for [`Aggregate::distinct`].
+enum Ints<'a> {
+    Wide(&'a [i64]),
+    Narrow(&'a [i32]),
 }
 
 /// Values already accepted by one `DISTINCT` aggregate in one group.
