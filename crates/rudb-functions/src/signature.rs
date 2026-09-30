@@ -1356,6 +1356,26 @@ const TABLE: &[Entry] = &[
         shape: Shape::Setting,
         numeric_only: false,
     },
+    // The value of a variable `SET VARIABLE` left, which the binder folds for the reason it folds
+    // `current_setting`, and which reaches the table only when the name is not a constant.
+    Entry {
+        name: "getvariable",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Setting,
+        numeric_only: false,
+    },
+    // Whether a schema is on the search path. The binder answers it from the catalog, and the row
+    // is here for the argument types and the arity error.
+    Entry {
+        name: "in_search_path",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::Boolean),
+        numeric_only: false,
+    },
+    // An environment variable of the process, the empty string for one that is not set.
+    text("getenv", Arity::exactly(1), Fixed::Varchar),
     // The sequence functions. The binder checks the name is a constant and turns it into the
     // sequence's counter before the kernel sees it, so these rows are here for the argument types
     // and the arity errors.
@@ -2199,8 +2219,15 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         // Reaching here means the binder could not fold the call, and the only reason it cannot is
         // an argument that is not a constant. The pin says exactly this and names the parameter.
         Shape::Setting => {
+            // A name that is not a string has no overload, which the pin says before it asks for
+            // a constant.
+            if !matches!(arguments[0], LogicalType::Varchar | LogicalType::Null) {
+                return Err(no_match(entry.name, arguments));
+            }
+            let parameter =
+                if entry.name == "getvariable" { "variable_name" } else { "setting_name" };
             return Err(Error::binder(format!(
-                "The \"setting_name\" argument in function \"{}\" must be a constant expression",
+                "The \"{parameter}\" argument in function \"{}\" must be a constant expression",
                 entry.name
             )));
         }
@@ -3072,7 +3099,7 @@ fn rewritten(
             declared(wanted, Varchar)
         }
         "base64" | "to_base64" => declared(vec![Blob], Varchar),
-        "reverse" | "regexp_escape" | "nfc_normalize" | "strip_accents" => {
+        "reverse" | "regexp_escape" | "nfc_normalize" | "strip_accents" | "getenv" => {
             declared(vec![Varchar], Varchar)
         }
         "length_grapheme" => declared(vec![Varchar], BigInt),
@@ -4143,6 +4170,9 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("get_type", &["get_type(col0 ANY) -> TYPE"]),
     ("hash", &["hash(col0 ANY, [ANY...]) -> UBIGINT"]),
     ("current_setting", &["current_setting(setting_name VARCHAR) -> ANY"]),
+    ("getvariable", &["getvariable(variable_name VARCHAR) -> ANY"]),
+    ("in_search_path", &["in_search_path(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
+    ("getenv", &["getenv(col0 VARCHAR) -> VARCHAR"]),
     ("nextval", &["nextval(sequence_name VARCHAR) -> BIGINT"]),
     ("currval", &["currval(sequence_name VARCHAR) -> BIGINT"]),
     (

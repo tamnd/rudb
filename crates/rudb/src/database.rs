@@ -4498,6 +4498,30 @@ impl Shared {
                 self.inner.settings_revision.fetch_add(1, Ordering::Relaxed);
                 Ok(QueryResult::empty())
             }
+            Bound::Variable { name, value } => {
+                // The value is computed the way a query is, since that is how the pin computes it,
+                // and the one row of the one column is what is kept, at the column's type.
+                let value = match value {
+                    None => None,
+                    Some(mut plan) => {
+                        optimized(&mut plan, &context)?;
+                        let under = Under::new(
+                            self.budget(),
+                            context.facts(),
+                            &seams,
+                            &session,
+                            Rows::ForACaller,
+                        );
+                        let result = run(sql, &plan, &catalog, cancel, under)?;
+                        let value =
+                            if result.is_empty() { Value::Null } else { result.value_at(0, 0) };
+                        Some((value, result.column_type(0)))
+                    }
+                };
+                self.inner.settings.set_variable(&name, value);
+                self.inner.settings_revision.fetch_add(1, Ordering::Relaxed);
+                Ok(QueryResult::empty())
+            }
             Bound::Transaction(kind) => {
                 drop(catalog);
                 self.transaction(kind)

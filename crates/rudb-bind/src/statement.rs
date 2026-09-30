@@ -55,6 +55,13 @@ pub enum Bound {
     Insert(Insert),
     /// `SET name = value`, or `RESET name`, which is the same thing with no value.
     Setting(Setting),
+    /// `SET VARIABLE name = value`, with the plan that computes the value, or `RESET VARIABLE name`,
+    /// with none.
+    ///
+    /// A plan rather than a value because the pin computes a variable the way it computes a query,
+    /// so `SET VARIABLE a = (SELECT 42)` and `SET VARIABLE a = random() < 2` are both taken, where
+    /// a setting has to be a constant. The plan answers one row with one column.
+    Variable { name: String, value: Option<Plan> },
     /// Flushes a persistent database snapshot, of the named database when one is named.
     Checkpoint(Option<String>),
     /// `ATTACH`.
@@ -1770,6 +1777,14 @@ fn setting(
 ) -> Result<Bound> {
     let written = ast.setting(index);
     let name = ast.string(written.name).to_string();
+    if written.scope == ast::Scope::Variable {
+        if written.value == NONE {
+            return Ok(Bound::Variable { name, value: None });
+        }
+        let mut binder = Binder::with(catalog, parameters, session);
+        let root = binder.bind_variable_value(ast, written.value)?;
+        return Ok(Bound::Variable { name, value: Some(finish(binder, root)?) });
+    }
     let value = if written.value == NONE {
         None
     } else {

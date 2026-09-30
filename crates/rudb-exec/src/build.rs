@@ -91,7 +91,7 @@ use crate::query::Query;
 use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
-use crate::settingnames::settingnames;
+use crate::settingnames::{settingnames, variablenames};
 use crate::siblings::{Children, Siblings, Walk};
 use crate::sideways::{self, Exact, Keyed, Sideways, Stored};
 use crate::sort::Sort;
@@ -2397,6 +2397,7 @@ impl<'a> Building<'a, '_> {
                 | TableFunction::DuckdbOptimizers
                 | TableFunction::DuckdbDialects
                 | TableFunction::DuckdbGrammarExtensions
+                | TableFunction::DuckdbVariables
                 | TableFunction::PragmaVersion
                 | TableFunction::PragmaPlatform
                 | TableFunction::PragmaUserAgent
@@ -2441,6 +2442,9 @@ impl<'a> Building<'a, '_> {
                     TableFunction::DuckdbDialects => dialects(plan, index, columns)?,
                     TableFunction::DuckdbGrammarExtensions => {
                         grammar_extensions(plan, index, columns)?
+                    }
+                    TableFunction::DuckdbVariables => {
+                        variablenames(self.session, plan, index, columns)?
                     }
                     TableFunction::PragmaVersion => version(plan, index, columns)?,
                     TableFunction::PragmaPlatform => platform(plan, index, columns)?,

@@ -476,6 +476,20 @@ impl Catalog {
         schemas
     }
 
+    /// The whole search path as pairs of a database and a schema, in the order the pin walks it:
+    /// `temp.main`, the entries that were set, then `main` with no database, `system.main` and
+    /// `system.pg_catalog`. An entry written without a database has an empty one, and so does the
+    /// implicit `main`, which is how the pin holds them and what `in_search_path` compares.
+    #[must_use]
+    pub fn search_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = vec![("temp".to_string(), "main".to_string())];
+        pairs.extend(self.search.iter().map(|entry| (entry.catalog.clone(), entry.schema.clone())));
+        pairs.push((String::new(), "main".to_string()));
+        pairs.push(("system".to_string(), "main".to_string()));
+        pairs.push(("system".to_string(), "pg_catalog".to_string()));
+        pairs
+    }
+
     /// Takes a `SET schema`, when `one` is set, or a `SET search_path`, with the pin's checks: each
     /// entry has to name a schema that is there, or for a lone name a database, which stands for
     /// its `main`. A lone schema is taken to be in the database the path already starts in.

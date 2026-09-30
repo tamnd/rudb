@@ -19,6 +19,8 @@ use chrono::{Offset, TimeZone as _, Utc};
 use chrono_tz::Tz;
 
 use crate::Rules;
+use crate::types::LogicalType;
+use crate::value::Value;
 
 /// The settings a session has, by name.
 ///
@@ -37,7 +39,40 @@ pub struct Session {
     rules: Rules,
     links: String,
     seams: String,
+    variables: Variables,
 }
+
+/// One value `SET VARIABLE` left behind, with the type it was computed at.
+///
+/// The type is held beside the value rather than read off it, because a variable set to a query
+/// that found no row is a null that is still an INTEGER, and `typeof(getvariable('a'))` says so on
+/// the pin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Variable {
+    /// The name as it was written, which is what `duckdb_variables()` lists.
+    pub name: String,
+    /// What the expression came to.
+    pub value: Value,
+    /// The type the expression had.
+    pub ty: LogicalType,
+}
+
+/// The variables of a session, in the order they were first set.
+///
+/// Shared between copies for the reason the settings are, and compared by what they hold so that a
+/// session is still something a cached plan can be checked against. A value is compared with its
+/// own equality, so a variable holding a NaN makes two sessions differ, which costs a cached plan
+/// and nothing else.
+#[derive(Debug, Clone, Default)]
+struct Variables(Arc<Vec<Variable>>);
+
+impl PartialEq for Variables {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl Eq for Variables {}
 
 /// The meaning-changing session choices consumed while a query is bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +263,7 @@ impl Default for Session {
             rules: Rules::new(),
             links: String::new(),
             seams: String::new(),
+            variables: Variables::default(),
         }
     }
 }
@@ -380,6 +416,23 @@ impl Session {
     #[must_use]
     pub fn seams(&self) -> &str {
         &self.seams
+    }
+
+    /// Records the variables `SET VARIABLE` has left, in the order they were first set.
+    pub fn set_variables(&mut self, variables: Vec<Variable>) {
+        self.variables = Variables(Arc::new(variables));
+    }
+
+    /// The variable of that name, which is matched without regard to case the way the pin matches
+    /// it, so `SET VARIABLE A = 1` is read back by `getvariable('a')`.
+    #[must_use]
+    pub fn variable(&self, name: &str) -> Option<&Variable> {
+        self.variables.0.iter().find(|held| held.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Every variable, in the order they were first set.
+    pub fn variables(&self) -> impl Iterator<Item = &Variable> {
+        self.variables.0.iter()
     }
 
     /// Whether this name is the one the relationship declarations are written under.

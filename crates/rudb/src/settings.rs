@@ -57,8 +57,9 @@ use std::sync::{Mutex, PoisonError, RwLock};
 
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{
-    Clustering, Declared, DefaultNullOrder, Error, IdentifierCase, Memory, Result, Rules, Session,
-    ShowBehavior, Value, human, looks_like_rule, parse_clustering, rule_names,
+    Clustering, Declared, DefaultNullOrder, Error, IdentifierCase, LogicalType, Memory, Result,
+    Rules, Session, ShowBehavior, Value, Variable, human, looks_like_rule, parse_clustering,
+    rule_names,
 };
 use rudb_functions::{Behaviour, LOCAL, SETTINGS, SettingEntry};
 use rudb_parse::ast::Scope;
@@ -199,6 +200,11 @@ pub(crate) struct Settings {
     commit_sync: RwLock<CommitSync>,
     /// When a commit's rows are seen by other connections, as `SET visibility` has left it.
     visibility: RwLock<Visibility>,
+    /// What `SET VARIABLE` has left, in the order the names were first set.
+    ///
+    /// Not a setting, but the session is where `getvariable` and `duckdb_variables()` read one,
+    /// and this is what builds the session.
+    variables: RwLock<Vec<Variable>>,
     /// How many times a statement has been let at the settings, counted after it is done.
     changes: AtomicU64,
     /// The last session [`Settings::session`] built, and the count of changes it was built at.
@@ -251,9 +257,36 @@ impl Settings {
             ablate: RwLock::new(rudb_qc::Ablate::NONE),
             commit_sync: RwLock::new(CommitSync::Full),
             visibility: RwLock::new(Visibility::Durable),
+            variables: RwLock::new(Vec::new()),
             changes: AtomicU64::new(0),
             built: Mutex::new(None),
         }
+    }
+
+    /// Takes a `SET VARIABLE`, or a `RESET VARIABLE` when there is no value.
+    ///
+    /// A variable set again keeps the spelling it was first set under, which is the name
+    /// `duckdb_variables()` lists on the pin. The pin lists them in the order of its hash map, so
+    /// the order here, the order they were first set in, is not the pin's. Resetting one nothing
+    /// set is not an error there either.
+    pub(crate) fn set_variable(&self, name: &str, value: Option<(Value, LogicalType)>) {
+        let mut held = self.variables.write().unwrap_or_else(PoisonError::into_inner);
+        let at = held.iter().position(|variable| variable.name.eq_ignore_ascii_case(name));
+        match (at, value) {
+            (Some(at), Some((value, ty))) => {
+                held[at].value = value;
+                held[at].ty = ty;
+            }
+            (None, Some((value, ty))) => {
+                held.push(Variable { name: name.to_string(), value, ty });
+            }
+            (Some(at), None) => {
+                held.remove(at);
+            }
+            (None, None) => {}
+        }
+        drop(held);
+        self.changes.fetch_add(1, AtomicOrdering::AcqRel);
     }
 
     /// The passes `SET disabled_optimizers` turned off, for building an optimizer context.
@@ -1078,6 +1111,8 @@ impl Settings {
         session.set_rules(self.rules());
         session.set_links(self.links());
         session.set_seams(self.seams().written());
+        session
+            .set_variables(self.variables.read().unwrap_or_else(PoisonError::into_inner).clone());
         for entry in SETTINGS {
             if entry.behaviour != Behaviour::Honoured {
                 session.set(entry.name, self.carried(entry));

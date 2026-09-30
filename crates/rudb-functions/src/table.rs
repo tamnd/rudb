@@ -136,6 +136,8 @@ pub enum TableFunction {
     DuckdbDialects,
     /// `duckdb_grammar_extensions()`, every installed grammar extension.
     DuckdbGrammarExtensions,
+    /// `duckdb_variables()`, every variable `SET VARIABLE` has left in this session.
+    DuckdbVariables,
     /// `pragma_table_info(name)`, the columns of one table or view, in SQLite's six columns.
     PragmaTableInfo,
     /// `pragma_show(name)`, the same columns again in the six `DESCRIBE` answers with.
@@ -198,6 +200,7 @@ impl TableFunction {
             Self::DuckdbOptimizers => "duckdb_optimizers",
             Self::DuckdbDialects => "duckdb_dialects",
             Self::DuckdbGrammarExtensions => "duckdb_grammar_extensions",
+            Self::DuckdbVariables => "duckdb_variables",
             Self::PragmaTableInfo => "pragma_table_info",
             Self::PragmaShow => "pragma_show",
             Self::PragmaStorageInfo => "pragma_storage_info",
@@ -390,6 +393,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("duckdb_grammar_extensions") {
             return Some(Self::DuckdbGrammarExtensions);
+        }
+        if name.eq_ignore_ascii_case("duckdb_variables") {
+            return Some(Self::DuckdbVariables);
         }
         if name.eq_ignore_ascii_case("pragma_table_info") {
             return Some(Self::PragmaTableInfo);
@@ -708,6 +714,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbOptimizers
         | TableFunction::DuckdbDialects
         | TableFunction::DuckdbGrammarExtensions
+        | TableFunction::DuckdbVariables
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo
@@ -746,6 +753,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::DuckdbOptimizers => Some(optimizer_fields()),
         TableFunction::DuckdbDialects => Some(dialect_fields()),
         TableFunction::DuckdbGrammarExtensions => Some(grammar_extension_fields()),
+        TableFunction::DuckdbVariables => Some(variable_fields()),
         TableFunction::PragmaVersion => Some(version_fields()),
         TableFunction::PragmaPlatform => Some(platform_fields()),
         TableFunction::PragmaUserAgent => Some(user_agent_fields()),
@@ -1193,6 +1201,17 @@ pub fn dialect_fields() -> Vec<Field> {
 #[must_use]
 pub fn grammar_extension_fields() -> Vec<Field> {
     vec![Field::new("name", LogicalType::Varchar), Field::new("description", LogicalType::Varchar)]
+}
+
+/// The columns `duckdb_variables()` produces, which are the pin's three. The value is its text,
+/// the way the pin prints it there.
+#[must_use]
+pub fn variable_fields() -> Vec<Field> {
+    vec![
+        Field::new("name", LogicalType::Varchar),
+        Field::new("value", LogicalType::Varchar),
+        Field::new("type", LogicalType::Varchar),
+    ]
 }
 
 /// The four categories DuckDB sorts a keyword into.
