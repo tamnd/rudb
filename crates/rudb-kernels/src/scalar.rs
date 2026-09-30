@@ -3959,6 +3959,10 @@ pub fn call_values(
         }
         return Ok(Value::Varchar(out));
     }
+    // `concat_ws` passes a null piece by the same way, though a null separator is a null answer.
+    if name == "concat_ws" {
+        return crate::strings::concat_ws(args);
+    }
     // `list_concat` is the fourth one above the null rule and it follows `concat`'s rule rather than
     // the operator's. A null argument is a list with nothing in it here, so `list_concat([1], NULL)`
     // is `[1]` upstream while `[1] || NULL` is null, and the two spellings are not the same function
@@ -4159,6 +4163,33 @@ pub fn call_values(
         // The signature cast every argument after the format to a kind the formatter reads.
         ("format", [Value::Varchar(pattern), rest @ ..]) => crate::printf::format(pattern, rest),
         ("printf", [Value::Varchar(pattern), rest @ ..]) => crate::printf::printf(pattern, rest),
+        // The signature cast every argument of these to the type the pin declares for it.
+        ("repeat", [held, count]) => crate::strings::repeat(held, count, returns),
+        ("lpad" | "rpad", [Value::Varchar(text), Value::Integer(length), Value::Varchar(pad)]) => {
+            crate::strings::pad(name, text, *length, pad)
+        }
+        ("ascii" | "unicode" | "ord", [Value::Varchar(text)]) => {
+            Ok(crate::strings::code_point(name, text))
+        }
+        ("translate", [Value::Varchar(text), Value::Varchar(from), Value::Varchar(to)]) => {
+            Ok(crate::strings::translate(text, from, to))
+        }
+        ("url_encode", [Value::Varchar(text)]) => Ok(crate::strings::url_encode(text)),
+        ("url_decode", [Value::Varchar(text)]) => crate::strings::url_decode(text),
+        ("bar", [Value::Double(x), Value::Double(min), Value::Double(max), most @ ..]) => {
+            let most = match most {
+                [Value::Double(most)] => *most,
+                _ => 80.0,
+            };
+            crate::strings::bar(*x, *min, *max, most)
+        }
+        ("to_base", [Value::BigInt(number), Value::Integer(radix), min_length @ ..]) => {
+            let min_length = match min_length {
+                [Value::Integer(min_length)] => *min_length,
+                _ => 0,
+            };
+            crate::strings::to_base(*number, *radix, min_length)
+        }
         ("parse_formatted_bytes", [Value::Varchar(text)]) => {
             Ok(Value::UBigInt(crate::bytes::parse_formatted_bytes(text)?))
         }
