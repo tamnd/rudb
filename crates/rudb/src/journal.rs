@@ -231,6 +231,9 @@ pub(crate) struct Journal {
     /// Records waiting for the commit.
     staged: Vec<Record>,
     staged_bytes: usize,
+    /// The payload bytes committed to the log since the last checkpoint, replayed ones included,
+    /// which a commit checks against `checkpoint_threshold`.
+    logged: u64,
     /// Whether the commit has to checkpoint rather than log.
     dirty: bool,
     /// Whether the file has an anchor this log is replayed against. Until it does a commit
@@ -290,6 +293,7 @@ impl Journal {
             lane: None,
             staged: Vec::new(),
             staged_bytes: 0,
+            logged: 0,
             dirty: false,
             anchored: anchor.is_some(),
         };
@@ -310,6 +314,7 @@ impl Journal {
             for record in block.records {
                 let kind = record.header.kind;
                 if matches!(kind, Kind::Insert | Kind::Update | Kind::Delete | Kind::Ddl) {
+                    journal.logged += record.payload.len() as u64;
                     changes.push(read_record(kind, record.payload)?);
                 }
             }
@@ -442,6 +447,12 @@ impl Journal {
         self.dirty || (!self.anchored && !self.staged.is_empty())
     }
 
+    /// Whether the log has grown to `threshold` bytes since the last checkpoint, after which the
+    /// commit that grew it checkpoints so the next open has at most that much to replay.
+    pub(crate) fn over(&self, threshold: u64) -> bool {
+        self.logged >= threshold
+    }
+
     /// Queues what was staged in the lane as one committed block and hands back what is left to
     /// wait for, which the caller may do after letting go of its locks. `None` when there is
     /// nothing to wait for: nothing was staged, or `sync` is `none`.
@@ -476,6 +487,7 @@ impl Journal {
         };
         let end = lane.enqueue(&block)?;
         self.last = ts;
+        self.logged += staged.iter().map(|record| record.payload.len() as u64).sum::<u64>();
         if sync == CommitSync::None {
             if lane.unwritten() >= QUEUED {
                 lane.write_out()?;
@@ -513,6 +525,7 @@ impl Journal {
         }
         self.discard();
         self.anchored = true;
+        self.logged = 0;
         let below = self.lane.as_ref().map_or(u64::MAX, |lane| lane.position().0);
         self.remove_below(below)
     }
@@ -525,6 +538,7 @@ impl Journal {
     pub(crate) fn close(&mut self) -> Result<()> {
         self.discard();
         self.lane = None;
+        self.logged = 0;
         self.remove_below(u64::MAX)?;
         if self.fs.is_dir(&self.dir) && self.fs.read_dir(&self.dir)?.is_empty() {
             std::fs::remove_dir(&self.dir).map_err(|error| Error::io(error.to_string()))?;

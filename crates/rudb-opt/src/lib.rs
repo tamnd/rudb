@@ -25,6 +25,7 @@ pub mod eager;
 pub mod eliminate;
 pub mod empty;
 pub mod estimate;
+pub mod exists;
 pub mod explain;
 pub mod extremes;
 pub mod factor;
@@ -249,6 +250,7 @@ pub static PASSES: [&(dyn Pass + Sync); 35] = [
     &constant::ConstantOrder,
     &columns::UnusedColumns,
     &reorder::FilterOrder,
+    &exists::ExistsOrder,
     &limit::LimitPushdown,
     &topn::TopN,
     &late::LateMaterialization,

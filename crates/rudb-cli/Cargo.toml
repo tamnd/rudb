@@ -33,9 +33,9 @@ libmimalloc-sys = { workspace = true, optional = true }
 rudb.workspace = true
 
 [features]
-default = []
-# Off by default since the system allocator measured ahead on the queries, see `main.rs`. On gives
-# the mimalloc build back for a workload that is mostly cross thread frees.
+default = ["mimalloc"]
+# On by default since it measured ahead of the system allocator on both JOB and ClickBench, see
+# `main.rs`. Off gives the glibc build, which holds less memory.
 mimalloc = ["dep:libmimalloc-sys"]
 # The query compiler's second tier, see `rudb-qc`.
 qc-clif = ["rudb/qc-clif"]

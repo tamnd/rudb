@@ -950,6 +950,18 @@ const KEYS: usize = 4;
 /// seventeen places with the null one, and the four keys take 3,468 places together.
 const COMBOS: usize = 4096;
 
+/// The most places the direct map covers when the key is several columns.
+///
+/// Wider than [`COMBOS`], which bounds what one column may bring, because a key of several small
+/// columns multiplies past it long before any of them is wide. TPC-H q1 grouped a step further, by
+/// its two flags and by `l_discount` and `l_tax`, is three and two dictionary values and two
+/// columns packed four bits wide, so 4 x 3 x 17 x 17 places counting each column's null place, which
+/// is 3,468. Refused at 2,048 it was hashed, and with four key columns compared a row the grouping
+/// cost about 680 instructions a row for a few hundred groups. The map is carried from one chunk to
+/// the next for as long as the pages are packed the same way, so it is cleared once a row group and
+/// sixteen thousand places of `u32` is 64 KB, which stays in the second level cache.
+const PRODUCT: usize = 1 << 14;
+
 /// The most places the direct map covers when the whole key is one dictionary.
 ///
 /// Larger than [`COMBOS`] by a factor of a hundred and twenty eight, and the reason is that one
@@ -1134,9 +1146,22 @@ impl CodedColumn<'_> {
                     *place += codes[row] as usize * stride;
                 }
             }
+            // Sixty four codes at a time out of the words, since a code at a time works out its word,
+            // reads it through a bound and asks whether it straddles the next, which was twenty
+            // instructions a row on a key of `l_discount` and `l_tax`. The first block ends where the
+            // packed rows reach a whole word, so that every block after it unpacks as one.
             Places::Bits { packed } => {
-                for (row, place) in into.iter_mut().enumerate() {
-                    *place += packed.code(row) as usize * stride;
+                let mut block = [0_u64; 64];
+                let lead = (64 - packed.offset() % 64) % 64;
+                let (first, rest) = into.split_at_mut(lead.min(into.len()));
+                let mut from = 0;
+                for places in std::iter::once(first).chain(rest.chunks_mut(64)) {
+                    let codes = &mut block[..places.len()];
+                    packed.unpack(from, codes);
+                    for (place, &code) in places.iter_mut().zip(codes.iter()) {
+                        *place += code as usize * stride;
+                    }
+                    from += places.len();
                 }
             }
             Places::CodedBits { at, packed } => {
@@ -1415,7 +1440,7 @@ pub(crate) fn coded_within<'a>(
     }
     // One column's places are the values it holds and several columns' places are their product,
     // which is why the two get different room. See [`WIDE_COMBOS`].
-    let room = if keys.len() == 1 { WIDE_COMBOS } else { COMBOS };
+    let room = if keys.len() == 1 { WIDE_COMBOS } else { PRODUCT };
     // The columns with places of their own first, because what they take out of the room is what
     // a window is allowed to be.
     let mut found = [None; KEYS];
@@ -1509,6 +1534,27 @@ pub(crate) const UNSEEN: u32 = u32::MAX;
 #[inline(always)]
 pub(crate) fn slot_at(held: u32) -> usize {
     if held == UNSEEN { NOWHERE } else { held as usize }
+}
+
+/// Fills each row's slot from `from` on out of `map` at the row's place, and gives the first row
+/// whose place holds nothing, or the end.
+///
+/// A loop of its own over plain slices, because written in [`crate::group`] against the fields it
+/// borrows the store into a slot could have changed any of them, so every row loaded the places,
+/// the map and both lengths again. That was a quarter of what the fold itself cost in q01 once it
+/// grouped by four keys (`spec/perf/90`).
+pub(crate) fn slots_from(map: &[u32], places: &[usize], slots: &mut [usize], from: usize) -> usize {
+    let (Some(places), Some(slots)) = (places.get(from..), slots.get_mut(from..)) else {
+        return from;
+    };
+    for (at, (slot, &place)) in slots.iter_mut().zip(places).enumerate() {
+        let held = map[place];
+        if held == UNSEEN {
+            return from + at;
+        }
+        *slot = held as usize;
+    }
+    from + slots.len().min(places.len())
 }
 
 /// What a place of the map holds for `slot`, [`UNSEEN`] for `NOWHERE`.
@@ -1620,7 +1666,16 @@ fn window_of(
     let mut current = into.first().copied().unwrap_or_default();
     let mut keeping = keep_runs && !nullable;
     let most_runs = into.len() / 8 + 1;
-    let scanned: &[i64] = if selected { &[] } else { into };
+    // A key of several columns keeps no runs, and when it is packed the page already says the
+    // lowest and highest value it can hold, so the widened values need no pass to find them. The
+    // window is then the width's rather than the chunk's, which is a few places more on a column
+    // like `l_discount` and none of the compare and blend a value that was a fifth of q01's fold.
+    let ends = if keep_runs || selected { None } else { packed_ends(key, limit) };
+    if let Some((low, high)) = ends {
+        lowest = low;
+        highest = high;
+    }
+    let scanned: &[i64] = if selected || ends.is_some() { &[] } else { into };
     for (block, values) in scanned.chunks(128).enumerate() {
         if nullable {
             for (row, &value) in values.iter().enumerate() {
@@ -1705,6 +1760,18 @@ fn window_of(
     let slack_below = if climbing { 0 } else { (wanted - width) / 2 };
     let low = i64::try_from(bottom - slack_below).or_else(|_| i64::try_from(bottom)).ok()?;
     Some((low, usize::try_from(wanted).ok()?.checked_add(1)?, nullable))
+}
+
+/// The lowest and highest value a packed key column can hold, as its page says, when the two are
+/// fewer than `limit` places apart. A packed run behind the rows a filter kept says the same.
+fn packed_ends(key: &Vector, limit: usize) -> Option<(i64, i64)> {
+    let packed = match key.dictionary_parts() {
+        Some((_, values)) => values.packed_parts()?,
+        None => key.packed_parts()?,
+    };
+    let low = i64::try_from(packed.base()).ok()?;
+    let high = i64::try_from(packed.ceiling()).ok()?;
+    (i128::from(high) - i128::from(low) < limit as i128).then_some((low, high))
 }
 
 /// The values and the runs of a key a filter cut out of a flat integer column, with the runs found
@@ -4433,6 +4500,22 @@ mod tests {
         places
     }
 
+    /// A packed column cut part way into a word and longer than a block places every row by its own
+    /// code, since the codes are unpacked sixty four at a time from where the cut lands.
+    #[test]
+    fn a_packed_column_cut_inside_a_word_places_every_row_by_its_code() {
+        let values: Vec<i64> = (0..300).map(|row| (row * 7) % 11).collect();
+        let cut = packed_numbers(&values, 4, 0).slice(5, 290).expect("a cut of the packed column");
+        assert!(cut.packed_parts().is_some_and(|packed| packed.offset() == 5));
+        let flags = coded_letters((0..290).map(|row| row % 3).collect(), &["A", "N", "R"]);
+        let keys = [cut, flags];
+        let coded = coded(&keys, 290).expect("a packed column and a small dictionary");
+        let places = placed(&coded, 290);
+        for (row, &place) in places.iter().enumerate() {
+            assert_eq!(place, values[row + 5] as usize + (row % 3) * 17, "row {row}");
+        }
+    }
+
     /// The pair TPC-H q1 groups by, and the six places their codes take between them.
     #[test]
     fn two_small_dictionaries_give_every_row_the_place_its_codes_say() {
@@ -4651,6 +4734,20 @@ mod tests {
         assert!(coded(&narrow, 2).is_some(), "their product is still inside the small bound");
     }
 
+    /// Several small columns multiply past what one column may bring, and the key of q1 grouped by
+    /// its discount and tax as well is one of those.
+    #[test]
+    fn four_small_columns_are_read_as_codes_past_one_columns_bound() {
+        let keys = [
+            wide_dictionary(3),
+            wide_dictionary(2),
+            packed_numbers(&[0, 1], 4, 0),
+            packed_numbers(&[0, 1], 4, 0),
+        ];
+        let coded = coded(&keys, 2).expect("a product of 3,468 places is read as codes");
+        assert_eq!(coded.combos(), 4 * 3 * 17 * 17);
+    }
+
     /// A wide dictionary the cheap null question cannot answer is given up rather than scanned,
     /// because that scan is a pass over the dictionary for every chunk of a few thousand rows.
     #[test]
@@ -4796,7 +4893,7 @@ mod tests {
     }
 
     /// Values further apart than the map allows are hashed, and so is a pair of columns whose
-    /// windows multiply past the small bound.
+    /// windows multiply past the bound for several columns.
     #[test]
     fn values_spread_wider_than_the_map_allows_are_refused() {
         let mut values = Widened::default();
@@ -4804,7 +4901,7 @@ mod tests {
         assert!(coded_within(&wide, 2, &[], Some(&mut values)).is_none());
         let fits = [integers(&[Some(0), Some(WIDE_COMBOS as i32 - 2)])];
         assert!(coded_within(&fits, 2, &[], Some(&mut values)).is_some());
-        let pair = [integers(&[Some(0), Some(100)]), integers(&[Some(0), Some(100)])];
+        let pair = [integers(&[Some(0), Some(200)]), integers(&[Some(0), Some(200)])];
         assert!(coded_within(&pair, 2, &[], Some(&mut values)).is_none());
         let small = [integers(&[Some(0), Some(10)]), integers(&[Some(0), Some(10)])];
         let coded = coded_within(&small, 2, &[], Some(&mut values)).expect("a product of 144");
