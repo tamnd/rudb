@@ -31,11 +31,11 @@
 //!
 //! **What is not here yet.** Buffers are owned. Section 7.1 says a vector borrowed from a buffer
 //! managed page carries a pin, and there is no buffer manager until M2, so there is nothing to pin
-//! and pretending otherwise would be an interface built against an imaginary caller. `ARRAY` is not
-//! stored yet either, and it is a composition of what is here rather than a new shape: it is a list
-//! whose length is the type's rather than the row's, the way a `MAP` is a list whose child is a two
-//! field struct of keys and values. `UNION` is the one that is genuinely different, since it is one
-//! child per member plus a tag saying which member each row is in.
+//! and pretending otherwise would be an interface built against an imaginary caller. `UNION` is not
+//! stored yet, and it is the one type that is genuinely different, since it is one child per member
+//! plus a tag saying which member each row is in. `ARRAY` is a composition of what is here rather
+//! than a new shape: it is a list whose length is the type's rather than the row's, the way a `MAP`
+//! is a list whose child is a two field struct of keys and values.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -933,13 +933,19 @@ impl Vector {
     /// # Errors
     ///
     /// If a value is not one the type can hold, or if the type is one there is no vector for yet,
-    /// which today means `ARRAY` and `UNION`. A `LIST`, a `STRUCT` and a `MAP` are routed to their own
+    /// which today means `UNION`. A `LIST`, a `STRUCT` and a `MAP` are routed to their own
     /// builders and come back built.
     pub fn from_values(ty: LogicalType, values: &[Value]) -> Result<Self> {
         let ty = held_as(ty);
         match &ty {
             LogicalType::List(element) => {
                 return Self::list_from_values(element.as_ref().clone(), values);
+            }
+            // An array is laid out as a list is, and only its type says every row has one length.
+            LogicalType::Array(element, _) => {
+                let mut list = Self::list_from_values(element.as_ref().clone(), values)?;
+                list.ty = ty.clone();
+                return Ok(list);
             }
             LogicalType::Struct(fields) => return Self::struct_from_values(fields, values),
             LogicalType::Map(key, value) => {
@@ -1024,6 +1030,24 @@ impl Vector {
             validity: Validity::AllValid,
             body: Body::Nested { entries, child: Arc::new(child) },
         })
+    }
+
+    /// The same rows under a type that is held the same way, which is a `LIST` read as an `ARRAY`
+    /// of its element or the other way round. Every other pair is refused by handing the vector
+    /// back unchanged, since no other two types share a layout this can promise.
+    #[must_use]
+    pub fn relabeled(mut self, ty: LogicalType) -> Self {
+        let element = |ty: &LogicalType| match ty {
+            LogicalType::List(element) | LogicalType::Array(element, _) => Some(element.clone()),
+            _ => None,
+        };
+        if matches!(self.body, Body::Nested { .. } | Body::Constant(_))
+            && element(&self.ty).is_some()
+            && element(&self.ty) == element(&ty)
+        {
+            self.ty = ty;
+        }
+        self
     }
 
     /// A struct vector of `fields`, built from one [`Value::Struct`] per row.
@@ -3338,7 +3362,7 @@ impl Vector {
     ///
     /// # Errors
     ///
-    /// If the type is one there is no vector for yet, which today means `ARRAY` and `UNION`. A `LIST`
+    /// If the type is one there is no vector for yet, which today means `UNION`. A `LIST`
     /// and a `MAP` flatten to themselves and a `STRUCT` to a struct of flattened fields, since none of
     /// the three has a data slice in any form and there is nothing flatter to become.
     pub fn flatten(&self) -> Result<Self> {
@@ -3528,7 +3552,7 @@ impl Vector {
     ///
     /// # Errors
     ///
-    /// If the type is one there is no vector for yet, which today means `ARRAY` and `UNION`. A `LIST`
+    /// If the type is one there is no vector for yet, which today means `UNION`. A `LIST`
     /// and a `MAP` gather by permuting their entries and a `STRUCT` by gathering every field.
     pub fn gather(&self, indices: &[u32]) -> Result<Self> {
         // Straight off the positions a filter handed over, since a gather of a stable dictionary is
@@ -3812,7 +3836,10 @@ impl Vector {
             Body::Constant(value)
                 if matches!(
                     self.ty,
-                    LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _)
+                    LogicalType::List(_)
+                        | LogicalType::Array(..)
+                        | LogicalType::Struct(_)
+                        | LogicalType::Map(_, _)
                 ) =>
             {
                 if forms_stay && matches!(validity, Validity::AllValid) {
@@ -5203,9 +5230,10 @@ impl Builder {
 
     fn empty(ty: &LogicalType, room: usize) -> Held {
         match ty {
-            LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(..) => {
-                Held::Values(Vec::with_capacity(room))
-            }
+            LogicalType::List(_)
+            | LogicalType::Array(..)
+            | LogicalType::Struct(_)
+            | LogicalType::Map(..) => Held::Values(Vec::with_capacity(room)),
             _ => data_for(ty, room).map_or_else(|_| Held::Values(Vec::new()), Held::Flat),
         }
     }

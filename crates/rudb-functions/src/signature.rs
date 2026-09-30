@@ -267,6 +267,9 @@ enum Shape {
     /// No arguments at all is `"NULL"[]`, which is the pin's answer for `[]` and is a list whose
     /// element type is the untyped null rather than a guess at what somebody meant to put in it.
     Listed,
+    /// `array_value`, which is [`Shape::Listed`] with the length in the type. The pin refuses a call
+    /// of no arguments, since an array of no length is not a type it will make.
+    Arrayed,
     /// `quantile_disc(x, q)`, which answers with one of its values, so in the type it was given,
     /// and with a list of them when `q` is a list of fractions.
     Discrete,
@@ -1178,6 +1181,14 @@ const TABLE: &[Entry] = &[
         shape: Shape::Listed,
         numeric_only: false,
     },
+    // Building an array, which is building a list whose length goes into its type.
+    Entry {
+        name: "array_value",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(0),
+        shape: Shape::Arrayed,
+        numeric_only: false,
+    },
     // Joining lists end to end. The pin prints one overload, `list_concat([ANY[]...]) -> ANY[]`,
     // and answers to four names for it, three of which are aliases below. It is the named form of
     // `||` over two lists and is not quite the same function, because a null argument is skipped
@@ -1981,9 +1992,21 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let element = list_element(arguments)?;
             (vec![element.clone(); arguments.len()], LogicalType::list(element))
         }
+        Shape::Arrayed => {
+            let size =
+                u32::try_from(arguments.len()).ok().filter(|&size| size > 0).ok_or_else(|| {
+                    Error::invalid_input("array_value requires at least one argument")
+                })?;
+            let element = list_element(arguments)?;
+            (vec![element.clone(); arguments.len()], LogicalType::array(element, size))
+        }
         Shape::Concatenated => {
-            let left = &arguments[0];
-            let right = &arguments[1];
+            // An array is joined as the list it is held as, so what comes out has no fixed length.
+            let listed = |ty: &LogicalType| match ty {
+                LogicalType::Array(element, _) => LogicalType::List(element.clone()),
+                other => other.clone(),
+            };
+            let (left, right) = (&listed(&arguments[0]), &listed(&arguments[1]));
             match (left, right) {
                 (LogicalType::List(_), _) | (_, LogicalType::List(_)) => {
                     // A null on one side is not a list and is not the string reading either, so it
@@ -2018,9 +2041,12 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
                 if *ty == LogicalType::Null {
                     continue;
                 }
-                if !matches!(ty, LogicalType::List(_)) {
-                    return Err(no_match(entry.name, arguments));
-                }
+                // An array is joined as the list it is held as, the way `||` joins one.
+                let ty = &match ty {
+                    LogicalType::List(_) => ty.clone(),
+                    LogicalType::Array(element, _) => LogicalType::List(element.clone()),
+                    _ => return Err(no_match(entry.name, arguments)),
+                };
                 // An argument of the wrong shape is the candidate block above and an argument whose
                 // elements will not meet the rest is the operator's sentence, which is the pin's
                 // split too: `list_concat([1], 2)` is a candidate block and
@@ -4414,6 +4440,8 @@ impl Shape {
             // arguments to meet. Both rows are the pin's, which carries the two of them for this
             // name and nothing in between.
             Self::Listed => (all(SAME), if count == 0 { NULL_LIST } else { SAME_LIST }),
+            // The pin's one row, whose length is not in the name any more than a width is.
+            Self::Arrayed => (all(ANY), "ARRAY"),
             // The string reading's row, which is the one the pin lists first for this name. The list
             // reading gets no row of its own because an entry here is a name and an argument count,
             // and this name at two arguments is already spoken for.
@@ -4968,6 +4996,11 @@ mod tests {
                 continue;
             }
             for count in entry.arity.counts() {
+                // `array_value()` is accepted by the table so that the pin's own error answers it,
+                // which `tests/arrays.rs` holds it to, rather than a list of candidates.
+                if entry.shape == Shape::Arrayed && count == 0 {
+                    continue;
+                }
                 // A shape that names the type it wants is asked for it, since `chr` wants an
                 // INTEGER and refuses a string the way upstream does.
                 let ty = match (entry.numeric_only, entry.shape) {
