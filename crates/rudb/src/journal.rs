@@ -36,13 +36,15 @@ use rudb_native::{LaneStart, LogAnchor};
 use rudb_txn::log::{
     Block, CommitSync, Kind, Lane, Options, SEGMENT_BYTES, SEGMENT_HEADER, replay, segments,
 };
-use rudb_vector::{Chunk, Selection, Vector};
+use rudb_vector::{Chunk, Data, Selection, StringColumn, Validity, Vector};
 
 /// The lane every record goes to, until there are more.
 const LANE: u8 = 0;
 
-/// The one payload layout of each record kind.
-const VERSION: u8 = 1;
+/// The payload layout records are written in. Layout 1 put every value of an Insert or Update
+/// with a tag of its own; layout 2 puts a column a run at a time where it can, and replay reads
+/// both.
+const VERSION: u8 = 2;
 
 /// How large a segment is. Smaller than the log's default, because a segment is written out whole
 /// when the lane opens it and a database that commits one small insert should not wait for 64 MiB
@@ -76,6 +78,8 @@ pub(crate) struct Replayed {
     payload: Vec<u8>,
     /// Where the rest starts in it.
     rest_at: usize,
+    /// The layout it was written in.
+    version: u8,
 }
 
 /// What a replayed record does to its table.
@@ -191,7 +195,7 @@ impl Replayed {
     pub(crate) fn change(&self, fields: &[Field]) -> Result<Change> {
         let bytes = &self.payload[self.rest_at..];
         match self.kind {
-            Kind::Insert => Ok(Change::Insert(decode_rows(bytes, fields)?)),
+            Kind::Insert => Ok(Change::Insert(decode_rows(bytes, fields, self.version)?)),
             Kind::Delete => {
                 let mut at = 0;
                 let runs = get_runs(bytes, &mut at)?;
@@ -203,7 +207,7 @@ impl Replayed {
             _ => {
                 let mut at = 0;
                 let runs = get_runs(bytes, &mut at)?;
-                let rows = decode_rows(&bytes[at..], fields)?;
+                let rows = decode_rows(&bytes[at..], fields, self.version)?;
                 if runs.iter().map(|run| run.1).sum::<u64>() != rows.len() as u64 {
                     return Err(corrupt("an update record whose rows and row numbers differ"));
                 }
@@ -540,35 +544,253 @@ fn get_runs(bytes: &[u8], at: &mut usize) -> Result<Vec<(u64, u64)>> {
 /// The rows of `chunks` a column at a time, or `None` when a column's type or a value is one the
 /// records do not carry. Gives up once the payload passes `most` bytes, which is what keeps a large
 /// load from being encoded whole only to be checkpointed instead.
+///
+/// Each column starts with how it is laid out, one of [`mode`]: text and blobs as their lengths
+/// and then their bytes, a column every chunk holds flat as its values' bytes, and anything else a
+/// value at a time with its tag.
 fn put_rows(out: &mut Vec<u8>, fields: &[Field], chunks: &[Chunk], most: usize) -> Option<()> {
     if !fields.iter().all(|field| carried(&field.ty)) {
         return None;
     }
+    if chunks.iter().any(|chunk| chunk.width() != fields.len()) {
+        return None;
+    }
     let rows: usize = chunks.iter().map(Chunk::len).sum();
+    u32::try_from(rows).ok()?;
     out.extend_from_slice(&u16::try_from(fields.len()).ok()?.to_le_bytes());
     out.extend_from_slice(&u32::try_from(rows).ok()?.to_le_bytes());
     for (column, field) in fields.iter().enumerate() {
-        for chunk in chunks {
-            if chunk.width() != fields.len() {
-                return None;
+        let vectors: Vec<&Vector> =
+            chunks.iter().map(|chunk| chunk.column(column)).collect::<Result<_>>().ok()?;
+        if matches!(field.ty, LogicalType::Varchar | LogicalType::Blob) {
+            put_text_column(out, &vectors, rows, most)?;
+        } else if let Some(layout) = fixed_layout(&vectors) {
+            out.push(mode::FIXED);
+            out.push(layout);
+            put_validity(out, &vectors, rows);
+            for vector in &vectors {
+                put_fixed(out, vector.data()?, vector.len())?;
             }
-            // row at a time: only a small insert is logged this way, and `most` caps its bytes.
-            for row in 0..chunk.len() {
-                put(out, &chunk.value_at(row, column), &field.ty)?;
+        } else {
+            out.push(mode::VALUES);
+            for (vector, chunk) in vectors.iter().zip(chunks) {
+                for row in 0..chunk.len() {
+                    put(out, &vector.value_at(row), &field.ty)?;
+                }
+                if out.len() > most {
+                    return None;
+                }
             }
-            if out.len() > most {
-                return None;
-            }
+        }
+        if out.len() > most {
+            return None;
         }
     }
     Some(())
+}
+
+/// How a column of an Insert or Update payload is laid out, from layout 2 on.
+mod mode {
+    /// A value at a time, each with its tag, which every carried type can take.
+    pub(super) const VALUES: u8 = 0;
+    /// The nulls, then each value's bytes at the width of its layout.
+    pub(super) const FIXED: u8 = 1;
+    /// The nulls, then each value's length as four bytes, then all their bytes.
+    pub(super) const TEXT: u8 = 2;
+}
+
+/// The nulls of a column: a zero byte when there are none, or a one and a bit a row, set meaning
+/// valid, first row in the lowest bit.
+fn put_validity(out: &mut Vec<u8>, vectors: &[&Vector], rows: usize) {
+    if vectors.iter().all(|vector| vector.never_null()) {
+        out.push(0);
+        return;
+    }
+    out.push(1);
+    let start = out.len();
+    out.resize(start + rows.div_ceil(8), 0);
+    let mut row = 0;
+    for vector in vectors {
+        for at in 0..vector.len() {
+            if !vector.is_null_at(at) {
+                out[start + row / 8] |= 1 << (row % 8);
+            }
+            row += 1;
+        }
+    }
+}
+
+fn get_validity(bytes: &[u8], at: &mut usize, rows: usize) -> Result<Validity> {
+    match take(bytes, at, 1)?[0] {
+        0 => Ok(Validity::AllValid),
+        1 => Ok(Validity::from_bytes(rows, take(bytes, at, rows.div_ceil(8))?)),
+        _ => Err(corrupt("a column whose nulls are neither absent nor a bitmap")),
+    }
+}
+
+/// A text or blob column as [`mode::TEXT`].
+fn put_text_column(out: &mut Vec<u8>, vectors: &[&Vector], rows: usize, most: usize) -> Option<()> {
+    let mut texts = Vec::with_capacity(rows);
+    for vector in vectors {
+        for at in 0..vector.len() {
+            texts.push(vector.try_bytes_at(at).ok()?);
+        }
+    }
+    let bytes: usize = texts.iter().map(|text| text.map_or(0, <[u8]>::len)).sum();
+    if out.len() + bytes > most {
+        return None;
+    }
+    out.push(mode::TEXT);
+    if texts.iter().all(Option::is_some) {
+        out.push(0);
+    } else {
+        out.push(1);
+        let start = out.len();
+        out.resize(start + rows.div_ceil(8), 0);
+        for (row, text) in texts.iter().enumerate() {
+            if text.is_some() {
+                out[start + row / 8] |= 1 << (row % 8);
+            }
+        }
+    }
+    out.reserve(4 * rows + bytes);
+    for text in &texts {
+        out.extend_from_slice(&u32::try_from(text.map_or(0, <[u8]>::len)).ok()?.to_le_bytes());
+    }
+    for text in texts.into_iter().flatten() {
+        out.extend_from_slice(text);
+    }
+    Some(())
+}
+
+/// The layout byte every one of `vectors` shares when each is flat over data of a fixed width.
+fn fixed_layout(vectors: &[&Vector]) -> Option<u8> {
+    let mut shared = None;
+    for vector in vectors {
+        let data = vector.data()?;
+        if data.len() < vector.len() {
+            return None;
+        }
+        let layout = match data {
+            Data::Bool(_) => 1,
+            Data::Int8(_) => 2,
+            Data::Int16(_) => 3,
+            Data::Int32(_) => 4,
+            Data::Int64(_) => 5,
+            Data::Int128(_) => 6,
+            Data::UInt8(_) => 7,
+            Data::UInt16(_) => 8,
+            Data::UInt32(_) => 9,
+            Data::UInt64(_) => 10,
+            Data::UInt128(_) => 11,
+            Data::Float32(_) => 12,
+            Data::Float64(_) => 13,
+            _ => return None,
+        };
+        if shared.is_some_and(|shared| shared != layout) {
+            return None;
+        }
+        shared = Some(layout);
+    }
+    shared
+}
+
+/// The first `len` values of `data` as their little endian bytes.
+fn put_fixed(out: &mut Vec<u8>, data: &Data, len: usize) -> Option<()> {
+    macro_rules! bytes {
+        ($held:expr) => {
+            for value in &$held.as_slice()[..len] {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        };
+    }
+    match data {
+        Data::Bool(held) => out.extend(held.as_slice()[..len].iter().map(|&value| u8::from(value))),
+        Data::Int8(held) => bytes!(held),
+        Data::Int16(held) => bytes!(held),
+        Data::Int32(held) => bytes!(held),
+        Data::Int64(held) => bytes!(held),
+        Data::Int128(held) => bytes!(held),
+        Data::UInt8(held) => bytes!(held),
+        Data::UInt16(held) => bytes!(held),
+        Data::UInt32(held) => bytes!(held),
+        Data::UInt64(held) => bytes!(held),
+        Data::UInt128(held) => bytes!(held),
+        Data::Float32(held) => bytes!(held),
+        Data::Float64(held) => bytes!(held),
+        _ => return None,
+    }
+    Some(())
+}
+
+/// `rows` values of layout `layout` read back as data.
+fn get_fixed(bytes: &[u8], at: &mut usize, layout: u8, rows: usize) -> Result<Data> {
+    macro_rules! read {
+        ($variant:ident, $ty:ty) => {{
+            const WIDTH: usize = std::mem::size_of::<$ty>();
+            let held = take(
+                bytes,
+                at,
+                rows.checked_mul(WIDTH).ok_or_else(|| corrupt("a column too long"))?,
+            )?;
+            Data::$variant(
+                held.chunks_exact(WIDTH)
+                    .map(|one| <$ty>::from_le_bytes(one.try_into().expect("WIDTH bytes")))
+                    .collect(),
+            )
+        }};
+    }
+    Ok(match layout {
+        1 => Data::Bool(take(bytes, at, rows)?.iter().map(|&byte| byte != 0).collect()),
+        2 => read!(Int8, i8),
+        3 => read!(Int16, i16),
+        4 => read!(Int32, i32),
+        5 => read!(Int64, i64),
+        6 => read!(Int128, i128),
+        7 => read!(UInt8, u8),
+        8 => read!(UInt16, u16),
+        9 => read!(UInt32, u32),
+        10 => read!(UInt64, u64),
+        11 => read!(UInt128, u128),
+        12 => read!(Float32, f32),
+        13 => read!(Float64, f64),
+        _ => return Err(corrupt(&format!("a column of layout {layout}"))),
+    })
+}
+
+/// A column written as [`mode::TEXT`], as a vector of `field`'s type.
+fn get_text_column(bytes: &[u8], at: &mut usize, field: &Field, rows: usize) -> Result<Vector> {
+    let validity = get_validity(bytes, at, rows)?;
+    let lengths =
+        take(bytes, at, rows.checked_mul(4).ok_or_else(|| corrupt("a column too long"))?)?;
+    let total: usize = lengths
+        .chunks_exact(4)
+        .map(|one| u32::from_le_bytes(one.try_into().expect("four bytes")) as usize)
+        .sum();
+    let mut body = take(bytes, at, total)?;
+    let text = field.ty == LogicalType::Varchar;
+    let mut column = StringColumn::with_capacity(rows);
+    for one in lengths.chunks_exact(4) {
+        let len = u32::from_le_bytes(one.try_into().expect("four bytes")) as usize;
+        let (value, rest) = body.split_at(len);
+        body = rest;
+        if text {
+            let value =
+                std::str::from_utf8(value).map_err(|_| corrupt("logged text that is not UTF-8"))?;
+            column.push(value);
+        } else {
+            column.push_bytes(value);
+        }
+    }
+    Ok(Vector::flat(field.ty.clone(), Data::Varlen(column))?.with_validity(validity))
 }
 
 /// The name a payload is for, and where the rest of it starts. A Ddl record names no table, and its
 /// statement starts right after the layout byte.
 fn read_record(kind: Kind, payload: Vec<u8>) -> Result<Replayed> {
     let mut at = 0;
-    if take(&payload, &mut at, 1)?[0] != VERSION {
+    let version = take(&payload, &mut at, 1)?[0];
+    if !(1..=VERSION).contains(&version) {
         return Err(corrupt("a record of another layout"));
     }
     if kind == Kind::Ddl {
@@ -578,15 +800,19 @@ fn read_record(kind: Kind, payload: Vec<u8>) -> Result<Replayed> {
             table: String::new(),
             payload,
             rest_at: at,
+            version,
         });
     }
     let schema = get_text(&payload, &mut at)?;
     let table = get_text(&payload, &mut at)?;
-    Ok(Replayed { kind, schema, table, payload, rest_at: at })
+    Ok(Replayed { kind, schema, table, payload, rest_at: at, version })
 }
 
 /// The rows of an Insert payload, from its column count on, as a chunk of `fields`.
-fn decode_rows(bytes: &[u8], fields: &[Field]) -> Result<Chunk> {
+///
+/// A payload of layout 1 has every column a value at a time; one of layout 2 says how each column
+/// is laid out first.
+fn decode_rows(bytes: &[u8], fields: &[Field], version: u8) -> Result<Chunk> {
     let mut at = 0;
     let width = u16::from_le_bytes(array(bytes, &mut at)?) as usize;
     let rows = u32::from_le_bytes(array(bytes, &mut at)?) as usize;
@@ -598,11 +824,25 @@ fn decode_rows(bytes: &[u8], fields: &[Field]) -> Result<Chunk> {
     }
     let mut columns = Vec::with_capacity(width);
     for field in fields {
-        let mut values = Vec::with_capacity(rows);
-        for _ in 0..rows {
-            values.push(get(bytes, &mut at, &field.ty)?);
-        }
-        columns.push(Vector::from_values(field.ty.clone(), &values)?);
+        let layout = if version == 1 { mode::VALUES } else { take(bytes, &mut at, 1)?[0] };
+        let column = match layout {
+            mode::VALUES => {
+                let mut values = Vec::with_capacity(rows.min(bytes.len()));
+                for _ in 0..rows {
+                    values.push(get(bytes, &mut at, &field.ty)?);
+                }
+                Vector::from_values(field.ty.clone(), &values)?
+            }
+            mode::FIXED => {
+                let layout = take(bytes, &mut at, 1)?[0];
+                let validity = get_validity(bytes, &mut at, rows)?;
+                let data = get_fixed(bytes, &mut at, layout, rows)?;
+                Vector::flat(field.ty.clone(), data)?.with_validity(validity)
+            }
+            mode::TEXT => get_text_column(bytes, &mut at, field, rows)?,
+            other => return Err(corrupt(&format!("a column laid out as {other}"))),
+        };
+        columns.push(column);
     }
     if at != bytes.len() {
         return Err(corrupt("an insert record with bytes after its rows"));
@@ -959,7 +1199,7 @@ mod tests {
     use rudb_txn::log::Kind;
     use rudb_vector::{Chunk, Vector};
 
-    use super::{Change, decode_rows, header, put_rows, put_runs, read_record};
+    use super::{Change, decode_rows, header, put, put_rows, put_runs, put_text, read_record};
 
     fn insert(fields: &[Field], chunks: &[Chunk]) -> Option<Vec<u8>> {
         let mut out = header("main", "items")?;
@@ -1016,7 +1256,71 @@ mod tests {
                 assert_eq!(back.value_at(row, col), chunk.value_at(row % 2, col), "{row} {col}");
             }
         }
-        assert!(decode_rows(&[1, 0, 0, 0, 0, 0], &fields).is_err(), "a width that differs");
+        assert!(decode_rows(&[1, 0, 0, 0, 0, 0], &fields, 2).is_err(), "a width that differs");
+    }
+
+    fn replayed_insert(fields: &[Field], payload: Vec<u8>) -> Chunk {
+        let replayed = read_record(Kind::Insert, payload).expect("reads");
+        let Change::Insert(back) = replayed.change(fields).expect("decodes") else {
+            panic!("an insert")
+        };
+        back
+    }
+
+    #[test]
+    fn a_record_of_the_first_layout_still_replays() {
+        let fields =
+            [Field::new("id", LogicalType::BigInt), Field::new("name", LogicalType::Varchar)];
+        let rows = [[Value::BigInt(7), Value::Varchar("seven".into())], [Value::Null, Value::Null]];
+        let mut payload = vec![1];
+        put_text(&mut payload, "main").expect("a name");
+        put_text(&mut payload, "items").expect("a name");
+        payload.extend_from_slice(&2_u16.to_le_bytes());
+        payload.extend_from_slice(&2_u32.to_le_bytes());
+        for (column, field) in fields.iter().enumerate() {
+            for row in &rows {
+                put(&mut payload, &row[column], &field.ty).expect("carried");
+            }
+        }
+        let back = replayed_insert(&fields, payload);
+        for (at, row) in rows.iter().enumerate() {
+            assert_eq!(back.value_at(at, 0), row[0]);
+            assert_eq!(back.value_at(at, 1), row[1]);
+        }
+    }
+
+    #[test]
+    fn columns_that_are_not_flat_or_differ_between_chunks_go_a_value_at_a_time() {
+        let fields = [
+            Field::new("n", LogicalType::Integer),
+            Field::new("b", LogicalType::Blob),
+            Field::new("s", LogicalType::Varchar),
+        ];
+        let first = Chunk::new(vec![
+            Vector::constant(LogicalType::Integer, Value::Integer(5), 3),
+            Vector::from_values(
+                LogicalType::Blob,
+                &[Value::Blob(vec![0xFF, 0]), Value::Null, Value::Blob(vec![])],
+            )
+            .expect("blobs"),
+            Vector::constant(LogicalType::Varchar, Value::Varchar("same".into()), 3),
+        ])
+        .expect("a chunk");
+        let second = Chunk::new(vec![
+            Vector::from_values(LogicalType::Integer, &[Value::Integer(-1)]).expect("ints"),
+            Vector::from_values(LogicalType::Blob, &[Value::Blob(b"x".to_vec())]).expect("blobs"),
+            Vector::from_values(LogicalType::Varchar, &[Value::Null]).expect("text"),
+        ])
+        .expect("a chunk");
+        let payload = insert(&fields, &[first.clone(), second.clone()]).expect("carried");
+        let back = replayed_insert(&fields, payload);
+        assert_eq!(back.len(), 4);
+        for col in 0..fields.len() {
+            for row in 0..3 {
+                assert_eq!(back.value_at(row, col), first.value_at(row, col), "{row} {col}");
+            }
+            assert_eq!(back.value_at(3, col), second.value_at(0, col), "3 {col}");
+        }
     }
 
     #[test]
