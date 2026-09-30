@@ -501,6 +501,26 @@ fn an_ungrouped_aggregate_matches_the_first_engine_on_rows_and_on_none() {
 }
 
 #[test]
+fn a_sum_into_a_bigint_as_a_split_aggregate_makes_one_matches_the_first_engine() {
+    let aggs = "aggregates=[sum(#0.0::INTEGER)::BIGINT, count_star()::BIGINT]";
+    same(&format!("Aggregate #1 groups=[#0.1::VARCHAR] {aggs}\n  {SCAN}"), false);
+    same(&format!("Aggregate #1 groups=[] {aggs}\n  {SCAN}"), true);
+    same(
+        &format!("Aggregate #1 groups=[] {aggs}\n  Get memory.main.empty AS empty #0 [x::INTEGER]"),
+        true,
+    );
+    // The first engine answers this one from the table's statistics when it builds, with the
+    // error the compiled engine gives after reading the rows.
+    let scan = "Get memory.main.huge AS huge #0 [k::INTEGER, v::BIGINT]";
+    let error = compiled(&format!(
+        "Aggregate #1 groups=[] aggregates=[sum(#0.1::BIGINT)::BIGINT]\n  {scan}"
+    ))
+    .expect_err("the sum does not fit");
+    assert_eq!(error.code(), ErrorCode::OutOfRange, "{error:?}");
+    assert!(error.to_string().contains("does not fit in BIGINT"), "{error}");
+}
+
+#[test]
 fn a_count_distinct_matches_the_first_engine() {
     same(
         &format!(
