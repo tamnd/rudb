@@ -240,11 +240,11 @@ pub(crate) fn fresh_index(plan: &Plan) -> u32 {
 /// the base table before one of them came out of it after. Everything else stops the walk, and a
 /// projection stops it because the column it produces is its own.
 ///
-/// Two passes ask this, for the two things that follow from it. [`crate::eliminate`] wants a key
-/// that is still the base table's key, so that a certificate about the base table is a certificate
-/// about the rows the join sees. [`crate::estimate::never_null`] wants a value that is still the
-/// base table's value, so that a null count the file wrote is a null count of what a predicate up
-/// here is reading.
+/// Two passes ask this or [`key_origin`], its wider form, for the two things that follow from it.
+/// [`crate::eliminate`] wants a key that is still the base table's key, so that a certificate about
+/// the base table is a certificate about the rows the join sees. [`crate::estimate::never_null`]
+/// wants a value that is still the base table's value, so that a null count the file wrote is a
+/// null count of what a predicate up here is reading.
 ///
 /// An outer join stops the walk for both of them, and for a different reason each. The side it pads
 /// comes out holding nulls the base table does not have, which is the null count's problem. The side
@@ -264,31 +264,50 @@ pub(crate) fn scan_of(plan: &Plan, at: NodeRef, index: u32) -> Option<NodeRef> {
     }
 }
 
-/// The scan `binding` under `at` is a column of, and the binding in that scan's own naming.
+/// The scan a key column came out of and the column it was there, through the operators that pass
+/// a value along unchanged.
 ///
-/// Through filters, projections that name a column, the side of an inner join that holds the
-/// binding, and the left side of a semi or anti join, which is the side whose rows come out. Each of
-/// those hands a stored value up unchanged, so the column the walk ends at holds what `binding`
-/// reads. `None` for anything else, and for a projection that computes the value.
+/// Through filters, sorts, limits and top Ns, which keep some of the rows they are given and change
+/// none of them, the side of an inner join or link join that holds the binding, and the left side of
+/// a semi or anti join, which is the side whose rows come out. A projection that names a column
+/// forwards its value. An aggregate's group column holds, in every row it produces, a value some
+/// input row held in the column it groups on, so a key that is a group on a plain column is still
+/// that column's value, only with the repeats gone. None of these puts a null in the column that the
+/// base table did not have, or makes a row whose key the base table never held, so the column the
+/// walk ends at holds what `key` reads. `None` for anything else, for a projection that computes the
+/// value and for an aggregate's own columns.
 pub(crate) fn key_origin(
     plan: &Plan,
     at: NodeRef,
-    binding: ColumnBinding,
+    key: ColumnBinding,
 ) -> Option<(NodeRef, ColumnBinding)> {
     match *plan.node(at) {
-        Node::Get { index, .. } if index == binding.table => Some((at, binding)),
-        Node::Filter { input, .. } => key_origin(plan, input, binding),
-        Node::Project { input, index, exprs, .. } if index == binding.table => {
-            let &expr = plan.expr_list(exprs).get(usize::try_from(binding.column).ok()?)?;
-            let Expr::Column(below) = *plan.expr(expr) else { return None };
-            key_origin(plan, input, below)
-        }
+        Node::Get { index, .. } if index == key.table => Some((at, key)),
+        Node::Filter { input, .. }
+        | Node::Sort { input, .. }
+        | Node::Limit { input, .. }
+        | Node::TopN { input, .. } => key_origin(plan, input, key),
         Node::Join { left, right, kind: JoinKind::Inner, .. }
+        | Node::LinkJoin { child: left, parent: right, kind: JoinKind::Inner, .. }
         | Node::CrossProduct { left, right } => {
-            key_origin(plan, left, binding).or_else(|| key_origin(plan, right, binding))
+            key_origin(plan, left, key).or_else(|| key_origin(plan, right, key))
         }
         Node::Join { left, kind: JoinKind::Semi | JoinKind::Anti, .. } => {
-            key_origin(plan, left, binding)
+            key_origin(plan, left, key)
+        }
+        Node::Aggregate { input, index, groups, .. } if index == key.table => {
+            let group = *plan.expr_list(groups).get(usize::try_from(key.column).ok()?)?;
+            match *plan.expr(group) {
+                Expr::Column(below) => key_origin(plan, input, below),
+                _ => None,
+            }
+        }
+        Node::Project { input, index, exprs, .. } if index == key.table => {
+            let forwarded = *plan.expr_list(exprs).get(usize::try_from(key.column).ok()?)?;
+            match *plan.expr(forwarded) {
+                Expr::Column(below) => key_origin(plan, input, below),
+                _ => None,
+            }
         }
         _ => None,
     }
