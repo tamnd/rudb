@@ -184,7 +184,7 @@ impl Inst<'_> {
 }
 
 /// A block: its parameters, its code and what the builder declared about it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BlockData {
     /// The block's parameters, each a value defined at the head of the block.
     pub params: Vec<Val>,
@@ -205,7 +205,7 @@ pub struct BlockData {
 }
 
 /// What a value is, beyond its number.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ValInfo {
     /// The value's type.
     pub ty: Ty,
@@ -225,7 +225,7 @@ pub struct Const {
 }
 
 /// A field of the pipeline's state, for rule V6.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Field {
     /// Byte offset from `%st`.
     pub offset: u32,
@@ -236,7 +236,7 @@ pub struct Field {
 }
 
 /// Where an instruction came from: the plan node, and the generator line that appended it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Site {
     /// The plan node id.
     pub plan: u32,
@@ -247,7 +247,7 @@ pub struct Site {
 }
 
 /// One pipeline function: `fn(state: ptr, morsel: ptr) -> i64 status`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Func {
     /// The function's name, `query.pipeline.version` by convention.
     pub name: String,
