@@ -1260,8 +1260,13 @@ impl<'a> Coded<'a> {
     /// vector of places for it, one pass to write each row's place and one to read it back. Here a
     /// row's place is worked out in a register and used at once. The rows that found nothing are
     /// the first of each combination and need their place again, so when there are any the caller
-    /// asks [`Self::places`] for them the long way. `None` is a key this does not answer.
-    pub(crate) fn look_up(&self, map: &[u32], slots: &mut [usize]) -> Option<bool> {
+    /// asks [`Self::places`] for them the long way. `None` is a key this does not answer, with
+    /// `slots` left as it was.
+    ///
+    /// The slots are written by extending them, not over a vector filled first, since filling
+    /// every row's slot with `NOWHERE` only to write it again was a second store of every row of
+    /// q1.
+    pub(crate) fn look_up(&self, map: &[u32], rows: usize, slots: &mut Vec<usize>) -> Option<bool> {
         let mut plain = self.columns.iter().flatten().map(|column| match column.places {
             Places::Codes { codes, .. } if !column.nullable => Some((codes, column.stride)),
             _ => None,
@@ -1271,22 +1276,27 @@ impl<'a> Coded<'a> {
         if plain.next().is_some() {
             return None;
         }
+        let second = match second {
+            Some(second) => Some(second?),
+            None => None,
+        };
+        if first.len() < rows || second.is_some_and(|(other, _)| other.len() < rows) {
+            return None;
+        }
         let mut missed = false;
+        slots.clear();
         match second {
-            None => {
-                for (slot, &code) in slots.iter_mut().zip(first) {
-                    let found = map[code as usize * stride];
-                    missed |= found == UNSEEN;
-                    *slot = slot_at(found);
-                }
-            }
-            Some(second) => {
-                let (other, across) = second?;
-                for ((slot, &code), &next) in slots.iter_mut().zip(first).zip(other) {
+            None => slots.extend(first[..rows].iter().map(|&code| {
+                let found = map[code as usize * stride];
+                missed |= found == UNSEEN;
+                slot_at(found)
+            })),
+            Some((other, across)) => {
+                slots.extend(first[..rows].iter().zip(&other[..rows]).map(|(&code, &next)| {
                     let found = map[code as usize * stride + next as usize * across];
                     missed |= found == UNSEEN;
-                    *slot = slot_at(found);
-                }
+                    slot_at(found)
+                }));
             }
         }
         Some(missed)
