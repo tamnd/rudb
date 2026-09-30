@@ -380,9 +380,24 @@ impl Link {
     pub fn forward_each(&self, children: &[Rid], out: &mut Vec<Rid>) {
         out.clear();
         out.reserve(children.len());
-        let Body::Monotone { vector } = &self.body else {
-            out.extend(children.iter().map(|&child| self.forward(child).unwrap_or(NO_PARENT)));
-            return;
+        let vector = match &self.body {
+            Body::Monotone { vector } => vector,
+            // The body matched once for the chunk rather than once a child, with the same answers
+            // as `forward`.
+            Body::Packed { bytes, width, .. } => {
+                let absent = reserved(*width);
+                out.extend(children.iter().map(|&child| {
+                    if child >= self.children {
+                        return NO_PARENT;
+                    }
+                    usize::try_from(child)
+                        .ok()
+                        .and_then(|child| bitpack::tail_at(bytes, *width, child).ok())
+                        .filter(|&value| value != absent)
+                        .unwrap_or(NO_PARENT)
+                }));
+                return;
+            }
         };
         let words = vector.words();
         // The last child answered, the position of its bit and its parent.

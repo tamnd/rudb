@@ -367,7 +367,12 @@ pub fn fold(bytes: &[u8], mut emit: impl FnMut(i64, u64) -> Result<()>) -> Resul
 
 /// How few of a packed unit's values a selected decode has to want before it finds each one on its
 /// own rather than unpacking the unit, as one in this many.
-const SPARSE: usize = 32;
+///
+/// Unpacking a unit is about three thousand instructions and finding one value in it is about
+/// twenty five, so the two cost the same at around a hundred and twenty values of the thousand. At
+/// one in thirty two, TPC-H q09 unpacked every unit of the `lineitem` columns it reads to keep the
+/// fifty or so rows the parts it wants have in each.
+const SPARSE: usize = 8;
 
 /// Decodes selected row positions from a chunk written by [`encode`].
 ///
@@ -1253,40 +1258,41 @@ fn decode_selected_chunk(reader: &mut Reader<'_>, positions: &[usize]) -> Result
             if run_value_count != run_lengths.len() {
                 return Err(Error::internal("an RLE chunk has more runs than run lengths"));
             }
+            // Each position's run, as its place among the runs wanted, found by walking the ends
+            // of the runs alongside the positions. The values are then read once per run and put
+            // back per position, rather than a repeat per run and a push per run.
+            let length = |length: i64| {
+                usize::try_from(length).map_err(|_| Error::internal("a negative RLE run length"))
+            };
             let mut wanted_runs = Vec::new();
-            let mut selected_per_run = Vec::new();
-            let mut selected = 0;
-            let mut at = 0usize;
-            for (run, length) in run_lengths.into_iter().enumerate() {
-                let length = usize::try_from(length)
-                    .map_err(|_| Error::internal("a negative RLE run length"))?;
-                let end = at
-                    .checked_add(length)
-                    .filter(|end| *end <= count)
-                    .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
-                let before = selected;
-                while selected < positions.len() && positions[selected] < end {
-                    if positions[selected] < at {
-                        return Err(Error::internal("selected integer positions went backwards"));
-                    }
-                    selected += 1;
+            let mut places = Vec::with_capacity(positions.len());
+            let mut lengths = run_lengths.iter().enumerate();
+            let mut end = 0usize;
+            let mut run = 0;
+            for &position in positions {
+                while position >= end {
+                    let (next, &next_length) = lengths.next().ok_or_else(|| {
+                        Error::internal("an RLE chunk ended before a selected position")
+                    })?;
+                    end = end
+                        .checked_add(length(next_length)?)
+                        .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
+                    run = next;
                 }
-                if selected != before {
+                if wanted_runs.last() != Some(&run) {
                     wanted_runs.push(run);
-                    selected_per_run.push(selected - before);
                 }
-                at = end;
+                // Under the number of positions, which is under a part's rows.
+                places.push((wanted_runs.len() - 1) as u32);
             }
-            check_count(at, count)?;
-            if selected != positions.len() {
-                return Err(Error::internal("an RLE chunk ended before a selected position"));
+            for (_, &rest) in lengths {
+                end = end
+                    .checked_add(length(rest)?)
+                    .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
             }
+            check_count(end, count)?;
             let run_values = decode_selected(&run_value_bytes[..run_value_len], &wanted_runs)?;
-            let mut out = Vec::with_capacity(positions.len());
-            for (value, repeat) in run_values.into_iter().zip(selected_per_run) {
-                out.extend(std::iter::repeat_n(value, repeat));
-            }
-            Ok(out)
+            Ok(places.into_iter().map(|place| run_values[place as usize]).collect())
         }
         // The steps and the codes are chunks of their own, read at the same rows, and the dictionary
         // is read whole since a code can point anywhere in it.
@@ -2187,6 +2193,14 @@ mod tests {
             let selected = decode_selected(&bytes, &positions).unwrap();
             let expected = positions.iter().map(|&position| values[position]).collect::<Vec<_>>();
             assert_eq!(selected, expected, "{}", kind.name());
+            // Some units wanted densely enough to be unpacked and some a value at a time, and
+            // several rows of the same run.
+            let mixed: Vec<usize> = (0..8192)
+                .filter(|at| if at < &3000 { at % 3 == 0 } else { at % 97 == 5 })
+                .collect();
+            let selected = decode_selected(&bytes, &mixed).unwrap();
+            let expected = mixed.iter().map(|&position| values[position]).collect::<Vec<_>>();
+            assert_eq!(selected, expected, "{} mixed", kind.name());
             let shape = describe(&bytes).unwrap();
             // A run length chunk on top whose runs average several rows walks its runs.
             let simple = kind == Kind::Rle || (!shape.contains("RLE") && !shape.contains("DELTA"));

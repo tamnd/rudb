@@ -1510,11 +1510,10 @@ impl<'a> Scan<'a> {
                 held.push(read.column(real)?.clone());
                 real += 1;
             } else {
-                let numbers = positions
-                    .iter()
-                    .map(|&row| Value::BigInt(self.offsets[at] + i64::from(row)))
-                    .collect::<Vec<_>>();
-                held.push(Vector::from_values(LogicalType::BigInt, &numbers)?);
+                let first = self.offsets[at];
+                let numbers: Vec<i64> =
+                    positions.iter().map(|&row| first + i64::from(row)).collect();
+                held.push(Vector::flat(LogicalType::BigInt, Data::Int64(numbers.into()))?);
             }
         }
         *out = Chunk::with_rows(held, kept)?;
