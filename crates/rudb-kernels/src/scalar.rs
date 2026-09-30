@@ -156,6 +156,19 @@ fn run<V: AsRef<Vector>>(
     if let Some(vector) = crate::sequence::call(name, args, rows)? {
         return Ok(vector);
     }
+    if name == "strftime" {
+        let refs: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
+        if let Some(vector) = crate::strftime::vectorized(&refs, rows)? {
+            return Ok(vector);
+        }
+    }
+    if matches!(name, "strptime" | "try_strptime") {
+        let refs: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
+        let strict = name == "strptime";
+        if let Some(vector) = crate::strptime::vectorized(&refs, returns, strict, rows)? {
+            return Ok(vector);
+        }
+    }
     // The one call whose answer is how its argument is stored rather than what it says, so it is
     // answered off the vector before anything reads a value out of it as a string.
     if let ("enum_code", [only]) = (name, args) {
@@ -376,7 +389,9 @@ fn one_of<A: Fn(usize) -> usize>(
             _ => Ok(None),
         },
         "make_date" => made_date(data, at, base, rows, returns),
-        "epoch_ms" => made_timestamp(data, at, base, rows, returns),
+        "epoch_ms" if *returns == LogicalType::Timestamp => {
+            made_timestamp(data, at, base, rows, returns)
+        }
         name if datetime::is_interval(name) => made_interval(name, data, at, base, rows, returns),
         "~" | "bit_count" => bits_of(name == "~", data, at, &base, rows, returns),
         _ => math::vectorized(name, data, at, base, rows, returns),
@@ -3342,7 +3357,10 @@ fn date_of(
     // fractional parts make it. Anything else is a cast the binder put there, which the row at a
     // time path handles and counts.
     if truncating {
-        if returns != when.logical_type() {
+        // A date truncates to the date or to its midnight, which is what the binder asks for.
+        let midnight =
+            *returns == LogicalType::Timestamp && *when.logical_type() == LogicalType::Date;
+        if returns != when.logical_type() && !midnight {
             return Ok(None);
         }
     } else if !matches!(returns, LogicalType::BigInt | LogicalType::Double) {
@@ -3539,6 +3557,14 @@ fn date_runs<A: Fn(usize) -> usize>(
             };
             finish(returns, Data::Int64(out.into()), validity)
         }
+        (LogicalType::Date, Data::Int32(days), true) if *returns == LogicalType::Timestamp => {
+            let mut out = vec![0i64; rows];
+            let validity = over_valid(rows, base, |index| {
+                out[index] = cast::stamp_of_day(part.truncate_days(days[at(index)])?);
+                Ok(())
+            })?;
+            finish(returns, Data::Int64(out.into()), validity)
+        }
         (LogicalType::Date, Data::Int32(days), true) => {
             let mut out = vec![0i32; rows];
             let validity = over_valid(rows, base, |index| {
@@ -3628,8 +3654,17 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
         Value::Timestamp(micros) | Value::TimestampTz(micros) => datetime::infinite_stamp(*micros),
         _ => false,
     };
+    // A date truncated for a timestamp answer is its midnight, the infinities included.
+    let midnight = |days: i32| match returns {
+        LogicalType::Timestamp => Value::Timestamp(cast::stamp_of_day(days)),
+        _ => Value::Date(days),
+    };
     if infinite {
-        return Ok(if name == "date_trunc" { when.clone() } else { Value::Null });
+        return Ok(match (name == "date_trunc", when) {
+            (true, Value::Date(days)) => midnight(*days),
+            (true, _) => when.clone(),
+            (false, _) => Value::Null,
+        });
     }
     let doubled = *returns == LogicalType::Double;
     // A time of day is read as the moment it is on the first day of 1970, which gives the pin's
@@ -3671,7 +3706,7 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
         (false, Value::Interval { months, days, micros }) => {
             part.of_an_interval(spelling)?.of_interval(*months, *days, *micros).map(Value::BigInt)
         }
-        (true, Value::Date(days)) => part.truncate_days(*days).map(Value::Date),
+        (true, Value::Date(days)) => part.truncate_days(*days).map(midnight),
         (true, Value::Timestamp(micros)) => part.truncate_micros(*micros).map(Value::Timestamp),
         // The truncation comes back zoned, because `date_trunc` answers the type it was handed and
         // the plan holds that type next to the value. Which moment it lands on is the calendar's
@@ -4084,6 +4119,15 @@ pub fn call_values(
         (_, [count]) if datetime::is_interval(name) => interval_value(name, count),
         ("make_date", [days]) => made_date_value(days),
         ("make_date", [year, month, day]) => made_civil_value(year, month, day),
+        ("dayname" | "monthname" | "last_day" | "nanosecond" | "epoch_us" | "epoch_ns", [when]) => {
+            datetime::read_off(name, when)
+        }
+        ("epoch_ms", [when]) if *returns == LogicalType::BigInt => datetime::read_off(name, when),
+        ("strftime", [left, right]) => crate::strftime::value(left, right),
+        ("time_bucket", [_, _] | [_, _, _]) => crate::timebucket::value(args),
+        ("strptime" | "try_strptime", [text, format]) => {
+            crate::strptime::value(text, format, returns, name == "strptime")
+        }
         ("epoch_ms", [millis]) => made_timestamp_value(millis),
         ("array_extract", [target, index]) => subscript::extract(target, index),
         ("array_slice", [target, begin, end]) => subscript::slice(target, begin, end, None),

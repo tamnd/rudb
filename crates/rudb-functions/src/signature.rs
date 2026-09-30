@@ -834,6 +834,82 @@ const TABLE: &[Entry] = &[
         shape: Shape::FixedTo(Fixed::BigInt, Fixed::Timestamp),
         numeric_only: true,
     },
+    // A date or a timestamp written out in a format, which comes second or first.
+    Entry {
+        name: "strftime",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Exact(Fixed::Date, Fixed::Varchar),
+        numeric_only: false,
+    },
+    // A moment rounded down to the start of its bucket, from the default origin, an origin of the
+    // caller's or an offset.
+    Entry {
+        name: "time_bucket",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 3),
+        shape: Shape::Exact(Fixed::Interval, Fixed::Timestamp),
+        numeric_only: false,
+    },
+    // A timestamp read out of text in a format, or in the first of a list of formats that fits.
+    Entry {
+        name: "strptime",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::Timestamp),
+        numeric_only: false,
+    },
+    Entry {
+        name: "try_strptime",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::Timestamp),
+        numeric_only: false,
+    },
+    // The seven that read a name, a day or a count off a date, a timestamp, a time or an interval.
+    // Every one of them is answered by the `temporal` hook, and what it does not answer is refused.
+    Entry {
+        name: "dayname",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Date, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "monthname",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Date, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "last_day",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Date, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "nanosecond",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Date, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "epoch_us",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Date, Fixed::BigInt),
+        numeric_only: false,
+    },
+    Entry {
+        name: "epoch_ns",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Date, Fixed::BigInt),
+        numeric_only: false,
+    },
     // The thirteen ways to build an interval out of a count of one unit, which is what
     // `INTERVAL 1 DAY` is once the transformer has rewritten it, and `to_days(1)` written out by
     // hand is the same call. Eleven of them count whole units and the two that can carry a fraction
@@ -1403,6 +1479,9 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     }
     if let Some((cast_to, returns)) = temporal(entry.name, arguments) {
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
+    if READ_OFF.contains(&entry.name) {
+        return Err(no_match(entry.name, arguments));
     }
     if let Some((cast_to, returns)) = bitstring(entry.name, arguments) {
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
@@ -2055,6 +2134,19 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
     // casts each of them to a plain timestamp and answers as it would for one, so `NS + INTERVAL`
     // is a `TIMESTAMP` and `NS - NS` is an interval.
     let precise = |ty: &LogicalType| matches!(ty, TimestampS | TimestampMs | TimestampNs);
+    if matches!((name, arguments), ("nanosecond" | "epoch_ns", [TimestampNs])) {
+        return Some((arguments.to_vec(), BigInt));
+    }
+    // The nanoseconds are what `%n` writes, so this one keeps them too.
+    match (name, arguments) {
+        ("strftime", [TimestampNs, LogicalType::Varchar | Null]) => {
+            return Some((vec![TimestampNs, LogicalType::Varchar], LogicalType::Varchar));
+        }
+        ("strftime", [LogicalType::Varchar, TimestampNs]) => {
+            return Some((arguments.to_vec(), LogicalType::Varchar));
+        }
+        _ => {}
+    }
     if arguments.iter().any(precise) {
         let plain: Vec<LogicalType> =
             arguments.iter().map(|ty| if precise(ty) { Timestamp } else { ty.clone() }).collect();
@@ -2070,6 +2162,52 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         |ty: &LogicalType| matches!(ty, TinyInt | SmallInt | Integer | UTinyInt | USmallInt | Null);
     match (name, arguments) {
         ("-", [Interval]) => kept(Interval),
+        // The pin truncates a date as the timestamp at its midnight, so the answer is a timestamp
+        // whatever the part, and `date_trunc('month', DATE '2020-05-07')` is 2020-05-01 00:00:00.
+        ("date_trunc", [_, Date]) => Some((vec![LogicalType::Varchar, Date], Timestamp)),
+        ("strftime", [Date | Timestamp | TimestampTz, LogicalType::Varchar | Null]) => {
+            Some((vec![arguments[0].clone(), LogicalType::Varchar], LogicalType::Varchar))
+        }
+        ("strftime", [LogicalType::Varchar, Date | Timestamp | TimestampTz]) => {
+            kept(LogicalType::Varchar)
+        }
+        ("strftime", [Null, LogicalType::Varchar | Null]) => {
+            Some((vec![Date, LogicalType::Varchar], LogicalType::Varchar))
+        }
+        // A string literal is read as the width, which is the one place upstream has only an interval.
+        ("time_bucket", [Interval | LogicalType::Varchar, Date | Timestamp | Time]) => {
+            Some((vec![Interval, arguments[1].clone()], arguments[1].clone()))
+        }
+        ("time_bucket", [Interval | LogicalType::Varchar, Date | Timestamp | Time, Interval]) => {
+            Some((vec![Interval, arguments[1].clone(), Interval], arguments[1].clone()))
+        }
+        ("time_bucket", [Interval | LogicalType::Varchar, when, origin]) if when == origin => {
+            Some((vec![Interval, when.clone(), when.clone()], when.clone()))
+        }
+        // A date against a timestamp is bucketed as two timestamps.
+        ("time_bucket", [Interval | LogicalType::Varchar, Date, Timestamp])
+        | ("time_bucket", [Interval | LogicalType::Varchar, Timestamp, Date]) => {
+            Some((vec![Interval, Timestamp, Timestamp], Timestamp))
+        }
+        // The type a format reads into is settled by the binder once it has the format, since `%n`
+        // and `%z` make it a nanosecond timestamp or one with a time zone.
+        (
+            "strptime" | "try_strptime",
+            [LogicalType::Varchar | Null, LogicalType::Varchar | Null],
+        ) => Some((vec![LogicalType::Varchar, LogicalType::Varchar], Timestamp)),
+        (
+            "strptime" | "try_strptime",
+            [LogicalType::Varchar | Null, LogicalType::List(element)],
+        ) if matches!(**element, LogicalType::Varchar | Null) => {
+            Some((vec![LogicalType::Varchar, arguments[1].clone()], Timestamp))
+        }
+        ("dayname" | "monthname", [Date | Timestamp | TimestampTz]) => kept(LogicalType::Varchar),
+        ("last_day", [Date | Timestamp | TimestampTz]) => kept(Date),
+        ("nanosecond" | "epoch_ns", [TimestampNs]) => kept(BigInt),
+        (
+            "nanosecond" | "epoch_ms" | "epoch_us" | "epoch_ns",
+            [Date | Timestamp | TimestampTz | Time | Interval],
+        ) => kept(BigInt),
         // A date or a timestamp can be one of the two infinities, so these read it as it is.
         ("isinf" | "isfinite", [Date | Timestamp | TimestampTz]) => kept(LogicalType::Boolean),
         // The pin averages these in their own type, and a date through a timestamp, which is the
@@ -2296,6 +2434,21 @@ fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
     Error::binder(message)
 }
 
+/// The functions that read something off a moment, or read a moment out of text, and take nothing
+/// but the types `temporal` names.
+const READ_OFF: &[&str] = &[
+    "dayname",
+    "monthname",
+    "last_day",
+    "nanosecond",
+    "epoch_us",
+    "epoch_ns",
+    "strftime",
+    "strptime",
+    "try_strptime",
+    "time_bucket",
+];
+
 /// What the reference prints under `Candidate functions:`, per function, byte for byte.
 ///
 /// Copied off the pinned binary rather than generated from [`TABLE`], because it is not derivable
@@ -2308,6 +2461,131 @@ fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
 /// A name missing from here gets the sentence with no block under it, which is what every function
 /// outside the string family does today.
 const CANDIDATES: &[(&str, &[&str])] = &[
+    (
+        "time_bucket",
+        &[
+            "time_bucket(col0 INTERVAL, col1 DATE) -> DATE",
+            "time_bucket(col0 INTERVAL, col1 DATE, col2 DATE) -> DATE",
+            "time_bucket(col0 INTERVAL, col1 DATE, col2 INTERVAL) -> DATE",
+            "time_bucket(col0 INTERVAL, col1 TIME) -> TIME",
+            "time_bucket(col0 INTERVAL, col1 TIME, col2 INTERVAL) -> TIME",
+            "time_bucket(col0 INTERVAL, col1 TIME, col2 TIME) -> TIME",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP) -> TIMESTAMP",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP, col2 INTERVAL) -> TIMESTAMP",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP, col2 TIMESTAMP) -> TIMESTAMP",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP WITH TIME ZONE) -> TIMESTAMP WITH TIME ZONE",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP WITH TIME ZONE, col2 INTERVAL) -> TIMESTAMP WITH TIME ZONE",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP WITH TIME ZONE, col2 TIMESTAMP WITH TIME ZONE) -> TIMESTAMP WITH TIME ZONE",
+            "time_bucket(col0 INTERVAL, col1 TIMESTAMP WITH TIME ZONE, col2 VARCHAR) -> TIMESTAMP WITH TIME ZONE",
+        ],
+    ),
+    (
+        "strptime",
+        &[
+            "strptime(\"text\" VARCHAR, format VARCHAR) -> TIMESTAMP",
+            "strptime(\"text\" VARCHAR, format VARCHAR[]) -> TIMESTAMP",
+        ],
+    ),
+    (
+        "try_strptime",
+        &[
+            "try_strptime(\"text\" VARCHAR, format VARCHAR) -> TIMESTAMP",
+            "try_strptime(\"text\" VARCHAR, format VARCHAR[]) -> TIMESTAMP",
+        ],
+    ),
+    // What reads a name or a count off a date, word for word the pin's lists.
+    (
+        "strftime",
+        &[
+            "strftime(\"data\" DATE, format VARCHAR) -> VARCHAR",
+            "strftime(format VARCHAR, \"data\" DATE) -> VARCHAR",
+            "strftime(\"data\" TIMESTAMP, format VARCHAR) -> VARCHAR",
+            "strftime(format VARCHAR, \"data\" TIMESTAMP) -> VARCHAR",
+            "strftime(\"data\" TIMESTAMP_NS, format VARCHAR) -> VARCHAR",
+            "strftime(format VARCHAR, \"data\" TIMESTAMP_NS) -> VARCHAR",
+            "strftime(\"data\" TIMESTAMP WITH TIME ZONE, format VARCHAR) -> VARCHAR",
+            "strftime(format VARCHAR, \"data\" TIMESTAMP WITH TIME ZONE) -> VARCHAR",
+            "strftime(\"data\" TIMESTAMPTZ_NS, format VARCHAR) -> VARCHAR",
+            "strftime(format VARCHAR, \"data\" TIMESTAMPTZ_NS) -> VARCHAR",
+        ],
+    ),
+    (
+        "dayname",
+        &[
+            "dayname(col0 DATE) -> VARCHAR",
+            "dayname(col0 TIMESTAMP) -> VARCHAR",
+            "dayname(col0 TIMESTAMP WITH TIME ZONE) -> VARCHAR",
+        ],
+    ),
+    (
+        "monthname",
+        &[
+            "monthname(col0 DATE) -> VARCHAR",
+            "monthname(col0 TIMESTAMP) -> VARCHAR",
+            "monthname(col0 TIMESTAMP WITH TIME ZONE) -> VARCHAR",
+        ],
+    ),
+    (
+        "last_day",
+        &[
+            "last_day(col0 DATE) -> DATE",
+            "last_day(col0 TIMESTAMP) -> DATE",
+            "last_day(col0 TIMESTAMP WITH TIME ZONE) -> DATE",
+        ],
+    ),
+    (
+        "nanosecond",
+        &[
+            "nanosecond(col0 DATE) -> BIGINT",
+            "nanosecond(col0 TIMESTAMP) -> BIGINT",
+            "nanosecond(col0 INTERVAL) -> BIGINT",
+            "nanosecond(col0 TIME) -> BIGINT",
+            "nanosecond(col0 TIME_NS) -> BIGINT",
+            "nanosecond(col0 TIME WITH TIME ZONE) -> BIGINT",
+            "nanosecond(col0 TIMESTAMP_NS) -> BIGINT",
+            "nanosecond(col0 TIMESTAMPTZ_NS) -> BIGINT",
+            "nanosecond(col0 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+        ],
+    ),
+    (
+        "epoch_us",
+        &[
+            "epoch_us(col0 DATE) -> BIGINT",
+            "epoch_us(col0 TIMESTAMP) -> BIGINT",
+            "epoch_us(col0 INTERVAL) -> BIGINT",
+            "epoch_us(col0 TIME) -> BIGINT",
+            "epoch_us(col0 TIME_NS) -> BIGINT",
+            "epoch_us(col0 TIME WITH TIME ZONE) -> BIGINT",
+            "epoch_us(col0 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+        ],
+    ),
+    (
+        "epoch_ns",
+        &[
+            "epoch_ns(col0 DATE) -> BIGINT",
+            "epoch_ns(col0 TIMESTAMP) -> BIGINT",
+            "epoch_ns(col0 INTERVAL) -> BIGINT",
+            "epoch_ns(col0 TIME) -> BIGINT",
+            "epoch_ns(col0 TIME_NS) -> BIGINT",
+            "epoch_ns(col0 TIME WITH TIME ZONE) -> BIGINT",
+            "epoch_ns(col0 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+            "epoch_ns(col0 TIMESTAMP_NS) -> BIGINT",
+            "epoch_ns(col0 TIMESTAMPTZ_NS) -> BIGINT",
+        ],
+    ),
+    (
+        "epoch_ms",
+        &[
+            "epoch_ms(col0 DATE) -> BIGINT",
+            "epoch_ms(col0 TIMESTAMP) -> BIGINT",
+            "epoch_ms(col0 INTERVAL) -> BIGINT",
+            "epoch_ms(col0 TIME) -> BIGINT",
+            "epoch_ms(col0 TIME_NS) -> BIGINT",
+            "epoch_ms(col0 TIME WITH TIME ZONE) -> BIGINT",
+            "epoch_ms(col0 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+            "epoch_ms(col0 BIGINT) -> TIMESTAMP",
+        ],
+    ),
     // The math family, word for word the pin's lists.
     ("sqrt", &["sqrt(col0 DOUBLE) -> DOUBLE"]),
     ("cbrt", &["cbrt(col0 DOUBLE) -> DOUBLE"]),
@@ -3688,7 +3966,7 @@ mod tests {
         assert_eq!(part.arguments, vec![LogicalType::Varchar, LogicalType::Timestamp]);
         let truncated = resolve("date_trunc", &[LogicalType::Varchar, LogicalType::Date])
             .expect("a truncated date");
-        assert_eq!(truncated.returns, LogicalType::Date);
+        assert_eq!(truncated.returns, LogicalType::Timestamp, "the pin's midnight of the date");
         assert_eq!(truncated.arguments, vec![LogicalType::Varchar, LogicalType::Date]);
     }
 
@@ -3889,6 +4167,8 @@ mod tests {
                         arguments = vec![LogicalType::Varchar; count];
                         arguments[0] = strings();
                     }
+                    _ if entry.name == "strftime" => arguments[1] = LogicalType::Varchar,
+                    _ if entry.name == "time_bucket" => arguments[1] = LogicalType::Date,
                     Shape::Histogram if count == 2 => arguments[1] = strings(),
                     Shape::Bits => {
                         arguments = match entry.name {

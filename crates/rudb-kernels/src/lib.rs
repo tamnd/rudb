@@ -90,10 +90,13 @@ mod sequence;
 mod shape;
 mod split;
 mod statistics;
+pub mod strftime;
+pub mod strptime;
 mod structs;
 mod subscript;
 mod tally;
 mod text;
+mod timebucket;
 mod timed;
 mod topk;
 
