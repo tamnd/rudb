@@ -4912,11 +4912,12 @@ const SPARSE_RENT: usize = 8;
 /// double. The rent is counted in what a read cost rather than in the rows it wanted, see
 /// [`paid_at`]. With all of that the 113 queries ran on well under two thirds of the instructions.
 ///
-/// A whole read pays the rent too, rather than holding the part at once. A query that runs once
-/// reads each part of a column once, and holding what it decoded kept every column it scanned in
-/// memory for nothing: ClickBench q19 peaked at 364 MB against 159 before parts were held, and
-/// the copy the read took of a part it had just put in the pool cost time as well. A part read a
-/// second time is still held from then on.
+/// A whole read holds the part at once, and a read at positions holds it when its own share of the
+/// rent brings the count to the part's rows rather than leaving that to the read after it. Both
+/// used to only pay rent, which put every part's decode on the second run of a query and none on
+/// the third: across JOB the second run of each query cost 60 billion cycles against 35 for the
+/// third. Holding on the read that paid for the part moved 19a's second run from 1.65 to 0.83
+/// billion. It costs memory for a query that runs once, and the pool's budget is what bounds that.
 #[derive(Debug, Default)]
 enum PartSlot {
     #[default]
@@ -4952,9 +4953,6 @@ struct Shelf {
     /// How many stripes of one column are kept whatever the budget says. See
     /// [`CACHED_STRIPES_PER_COLUMN`] for what sets it and [`Reader::keep_stripes`] for who raises it.
     kept: AtomicUsize,
-    /// The columns a plan has said it reads more than once. A whole read of one of their parts
-    /// holds it at once rather than counting its rows first. See [`Reader::expect_again`].
-    again: Vec<AtomicBool>,
 }
 
 impl Shelf {
@@ -5262,11 +5260,11 @@ struct NativeText {
     payload_kept: AtomicUsize,
     /// Which payload blocks a sweep or a visit has decoded before, one flag a block.
     ///
-    /// A sweep keeps a block the second time it decodes it and not the first. A process that runs
-    /// one statement, which is how a benchmark or a script uses the engine, sweeps each block once
-    /// and so keeps nothing: on ten million rows a `URL LIKE` held 396 MB with every block kept and
-    /// 97 MB with none, for the same processor time. A session that asks again pays the decode one
-    /// more time and reads kept blocks from then on, under the same [`TEXT_KEEP_BUDGET`].
+    /// A sweep keeps a block the first time it decodes it, and a visit the second time. Keeping
+    /// nothing on the first sweep held a `URL LIKE` on ten million rows at 97 MB rather than 396,
+    /// but it also made the second run of every JOB query that sweeps `name` decode it all again,
+    /// and a sweep reads each block once and whole, so what it keeps is what the next statement
+    /// reads. [`TEXT_KEEP_BUDGET`] bounds what a column keeps either way.
     swept: Vec<AtomicBool>,
     /// How many blocks [`TextSource::visit_at`] has decoded and dropped because the column was
     /// already holding its [`TEXT_KEEP_BUDGET`].
@@ -7017,7 +7015,6 @@ impl Reader {
             places: places.len(),
             held: (0..table_fields).map(|_| AtomicUsize::new(0)).collect(),
             kept: AtomicUsize::new(CACHED_STRIPES_PER_COLUMN),
-            again: (0..table_fields).map(|_| AtomicBool::new(false)).collect(),
         };
         let sieves = (0..table_fields).map(|_| OnceLock::new()).collect();
         let part_ranges = (0..table_fields).map(|_| OnceLock::new()).collect();
@@ -7416,21 +7413,6 @@ impl Reader {
     /// reads a quarter of a megabyte for every part it takes out of it.
     pub fn keep_stripes(&self, stripes: usize) {
         self.cache.kept.fetch_max(stripes, Atomic::Relaxed);
-    }
-
-    /// Says that a query will read `column` whole more than once, so the first whole read of each
-    /// of its parts holds what it decoded.
-    ///
-    /// A whole read counts its rows and holds nothing, so a query that reads a column once does
-    /// not keep it. A query that scans a table twice, the way TPC-H q22 reads `customer` for the
-    /// average and again for the answer, then decoded every part twice, which put q22 at SF1 up
-    /// from 228 to 266 million instructions. The plan knows which columns it reads twice, and this
-    /// is how it says so. It stays said, since a column read twice by one query is likely to be
-    /// read twice by the next one like it.
-    pub fn expect_again(&self, column: usize) {
-        if let Some(again) = self.cache.again.get(column) {
-            again.store(true, Atomic::Relaxed);
-        }
     }
 
     /// Rows in one part, or zero when the part number is past the table.
@@ -8908,7 +8890,7 @@ impl Reader {
         positions: Option<&[u32]>,
         rows: usize,
     ) -> std::result::Result<Arc<Vector>, bool> {
-        let Some(Ok(mut held)) = self.cache.made(column, at).map(Mutex::lock) else {
+        let Some(Ok(held)) = self.cache.made(column, at).map(Mutex::lock) else {
             return Err(false);
         };
         match &*held {
@@ -16944,8 +16926,9 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A part is held once reads of it have decoded all its rows, a first read of some or all of
-    /// it only counts them, and a part the pool lets go is decoded again from its pages.
+    /// A whole read holds the part it decoded, reads at positions count what they cost until the
+    /// read whose share comes to the part holds it, and a part the pool lets go is decoded again
+    /// from its pages.
     #[test]
     fn a_pool_keeps_decoded_parts_and_lets_them_go_under_its_budget() {
         let path = path("decoded-parts");
@@ -16978,27 +16961,21 @@ mod tests {
         assert!(first > 0, "which is something");
         assert_eq!(pool.bytes(), 0, "and keeps nothing");
         let mut reads = 1;
-        while paid(0).expect("and so do the ones after it") < 64 {
-            a.read_rows(0, &[0], &[3], false).expect("one row");
+        while paid(0).is_some() {
+            let again = a.read_rows(0, &[0], &[3], false).expect("one row");
+            assert_eq!(again.value_at(0, 0), Value::Integer(3));
             reads += 1;
         }
         assert!(reads <= 64, "a read pays at least a row");
-        a.read_rows(0, &[0], &[3], false).expect("one row");
         assert!(
             matches!(*slot(0), PartSlot::Held { .. }),
-            "until they have paid for as many rows as the part has"
+            "until the read whose share comes to as many rows as the part has holds it"
         );
         let whole = a.read(1, &[0]).expect("a part");
         assert_eq!(whole.len(), 64);
-        assert!(matches!(*slot(1), PartSlot::Seen(64)), "a whole first read only counts its rows");
-        a.expect_again(0);
+        assert!(matches!(*slot(1), PartSlot::Held { .. }), "a whole read holds what it decoded");
         a.read_rows(2, &[0], &[3], false).expect("one row");
-        assert_eq!(paid(2), Some(first), "a column read again still counts sparse reads");
-        a.read(3, &[0]).expect("a part");
-        assert!(
-            matches!(*slot(3), PartSlot::Held { .. }),
-            "and holds what a whole first read decodes"
-        );
+        assert_eq!(paid(2), Some(first), "and a sparse read of another part still only counts");
 
         for _ in 0..2 {
             for part in 0..parts {
@@ -18797,14 +18774,12 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A sweep of the dictionary reads every value, and the second sweep keeps what it read, up to
-    /// the budget.
+    /// A sweep of the dictionary reads every value and keeps what it read, up to the budget.
     ///
     /// The point of the sweep is the resident size rather than the answer, so both are checked
-    /// here. The first sweep keeps nothing, because a process that runs one statement never reads
-    /// a block twice. A dictionary this small is well under [`TEXT_KEEP_BUDGET`], so the second
-    /// sweep keeps everything and a third decodes nothing, which is what makes a session asking the
-    /// same question again cost what it should. The ceiling is the other half of it and it has its own
+    /// here. A dictionary this small is well under [`TEXT_KEEP_BUDGET`], so the first sweep keeps
+    /// everything and the second decodes nothing, which is what makes a session asking the same
+    /// question again cost what it should. The ceiling is the other half of it and it has its own
     /// test below, because a ceiling that never binds is not a ceiling anybody checked.
     #[test]
     fn a_dictionary_sweep_reads_every_value_and_keeps_it_under_the_budget() {
@@ -18860,10 +18835,10 @@ mod tests {
             swept
         };
         let swept = sweep();
-        assert_eq!(dictionary.footprint(), resting, "a first sweep keeps nothing it decoded");
-        assert_eq!(sweep(), swept, "a second sweep reads what the first did");
         let after = dictionary.footprint();
-        assert!(after > resting, "a second sweep under the budget keeps what it decoded");
+        assert!(after > resting, "a first sweep under the budget keeps what it decoded");
+        assert_eq!(sweep(), swept, "a second sweep reads what the first did");
+        assert_eq!(dictionary.footprint(), after, "and decodes nothing more");
 
         let read = (0..dictionary.len())
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
