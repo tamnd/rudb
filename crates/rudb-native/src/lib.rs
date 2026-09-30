@@ -135,7 +135,9 @@ const FORMAT: u32 = 31;
 /// top bit of the part's length in the index, which no real length reaches because a page is at most
 /// [`MAX_PAGE`]. A part without the bit is checked with xxHash64, which is every part of an older
 /// file and every part appended to one, so a build that can only read format 30 still reads a
-/// format 30 file this build has added a table to.
+/// format 30 file this build has added a table to. A section's extents are checked the same way and
+/// say which hash they have in the top bit of their length, which a sixty four megabyte extent never
+/// reaches either, and sections attached to a format 30 file keep xxHash64.
 ///
 /// This is not a general compatibility promise. Eight formats are readable because there was a
 /// specific reason for each, and the list shrinks again the moment the older ones stop being worth
@@ -4035,6 +4037,7 @@ impl Writer {
                     &mut self.at,
                     &section::Attachment { kind, id, flags: 0, header_bytes, bytes },
                     self.generation,
+                    self.wide,
                 )?;
                 self.table.sections.push(written);
             }
@@ -4232,6 +4235,7 @@ fn write_section(
     at: &mut u64,
     one: &section::Attachment<'_>,
     generation: u64,
+    wide: bool,
 ) -> Result<Section> {
     // A payload of nothing is the exception, and it is not a special case so much as a different
     // reading of the same field: an entry with no bytes has no header to be longer than them, and
@@ -4254,7 +4258,8 @@ fn write_section(
         extents.push(section::Extent {
             offset,
             length: u32::try_from(chunk.len()).map_err(|_| invalid("extent length overflow"))?,
-            hash: checksum(chunk),
+            hash: if wide { part_checksum(chunk) } else { checksum(chunk) },
+            wide,
             first,
         });
         first += chunk.len() as u64;
@@ -4343,7 +4348,7 @@ pub fn attach(
     let mut held = decode_directory(&directory, size)?;
     let mut cursor = size;
     for one in attachments {
-        let written = write_section(file, &mut cursor, one, held.generation)?;
+        let written = write_section(file, &mut cursor, one, held.generation, version >= 31)?;
         held.sections.retain(|old| !(old.kind == one.kind && old.id == one.id));
         held.sections.push(written);
     }
@@ -7958,7 +7963,8 @@ impl Reader {
             return Err(invalid("an extent is outside the file"));
         }
         read_at(&self.file, of.offset, bytes)?;
-        if checksum(bytes) != of.hash {
+        let sum = if of.wide { part_checksum(bytes) } else { checksum(bytes) };
+        if sum != of.hash {
             return Err(invalid("an extent does not checksum"));
         }
         Ok(())
