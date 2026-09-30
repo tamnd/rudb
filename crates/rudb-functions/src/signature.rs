@@ -734,6 +734,22 @@ const TABLE: &[Entry] = &[
         shape: Shape::Promoted,
         numeric_only: false,
     },
+    // `greatest` and `least` promote across every argument the way `coalesce` does, and they
+    // skip a null argument rather than answering null for it.
+    Entry {
+        name: "greatest",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(1),
+        shape: Shape::Promoted,
+        numeric_only: false,
+    },
+    Entry {
+        name: "least",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(1),
+        shape: Shape::Promoted,
+        numeric_only: false,
+    },
     // `nullif(a, b)` is a macro upstream, `CASE WHEN a = b THEN NULL ELSE a END`, and it is a
     // function here because the column it produces is named after the call rather than after the
     // expansion. What that costs is the message for the wrong number of arguments: upstream's is a

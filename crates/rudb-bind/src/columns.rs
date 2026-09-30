@@ -511,10 +511,9 @@ impl Binder<'_> {
             _ => match find_star(ast, expr)? {
                 None | Some(Found::Star) => vec![self.bind_expr(ast, expr, input)?],
                 Some(Found::Unpacked(columns)) => {
-                    return Err(Error::not_implemented(format!(
-                        "{} is not supported yet",
-                        deparse::expression(ast, columns)
-                    )));
+                    let picks = self.columns_picks(ast, columns, input)?;
+                    let copy = self.unpacked(ast, expr, &picks);
+                    vec![self.bind_expr(&copy, expr, input)?]
                 }
                 Some(Found::Columns(columns)) => {
                     let picks = self.columns_picks(ast, columns, input)?;
@@ -563,6 +562,11 @@ impl Binder<'_> {
         }
         let columns = match find_star(ast, expr)? {
             Some(Found::Columns(columns)) => columns,
+            Some(Found::Unpacked(columns)) => {
+                let picks = self.columns_picks(ast, columns, input)?;
+                let copy = self.unpacked(ast, expr, &picks);
+                return Ok(Some(vec![self.bind_expr(&copy, expr, input)?]));
+            }
             Some(Found::Star) => {
                 let mut bound = Vec::new();
                 for picked in self.star_columns(ast, expr, input)? {
@@ -585,6 +589,90 @@ impl Binder<'_> {
             bound.push(expr?);
         }
         Ok(Some(bound))
+    }
+
+    /// A copy of `ast` with every `*COLUMNS` in `expr` written out as the columns it picks, in the
+    /// argument list, the list, the row or the `IN` list it was written in, which is where the pin
+    /// unpacks one. The copy keeps every index the original has and only adds to them, so `expr`
+    /// and everything else in the statement mean the same thing in both.
+    ///
+    /// Each column is written with the name the pin gives it, which is how the item is named: a
+    /// column of a table in the catalog is `memory.main.t.a`, and one of an alias or a subquery is
+    /// the alias and the column.
+    pub(crate) fn unpacked(&self, ast: &Ast, expr: ast::ExprRef, picks: &Picks) -> Ast {
+        let mut copy = ast.clone();
+        let span = ast.expr_span(expr);
+        let columns: Vec<ast::ExprRef> = picks
+            .entries
+            .iter()
+            .map(|picked| {
+                let column = &picked.column;
+                let mut parts = Vec::with_capacity(4);
+                if !column.table.is_empty() {
+                    let catalog = self.catalog();
+                    let name = rudb_catalog::QualifiedName::new(
+                        catalog.default_catalog(),
+                        catalog.default_schema(),
+                        column.table.as_str(),
+                    );
+                    if catalog.entry(&name).is_ok() {
+                        parts.push(catalog.default_catalog().to_string());
+                        parts.push(catalog.default_schema().to_string());
+                    }
+                    parts.push(column.table.clone());
+                }
+                parts.push(column.name.clone());
+                let start = copy.parts.len() as u32;
+                for part in parts {
+                    copy.parts.push(copy.strings.len() as ast::StrRef);
+                    copy.strings.push(part);
+                }
+                let name = ast::Slice { start, len: copy.parts.len() as u32 - start };
+                copy.exprs.push(ast::Expr::Column { name });
+                copy.expr_spans.push(span);
+                (copy.exprs.len() - 1) as ast::ExprRef
+            })
+            .collect();
+        let mut stack = vec![expr];
+        while let Some(at) = stack.pop() {
+            stack.extend(children(ast, at));
+            let mut expand = |slice: ast::Slice| {
+                let items: Vec<(ast::ExprRef, bool)> = copy
+                    .expr_list(slice)
+                    .iter()
+                    .map(|&item| {
+                        (item, matches!(copy.expr(item), ast::Expr::Columns { unpacked: true, .. }))
+                    })
+                    .collect();
+                if !items.iter().any(|&(_, unpacked)| unpacked) {
+                    return None;
+                }
+                let start = copy.expr_lists.len() as u32;
+                for (item, unpacked) in items {
+                    if unpacked {
+                        copy.expr_lists.extend(&columns);
+                    } else {
+                        copy.expr_lists.push(item);
+                    }
+                }
+                Some(ast::Slice { start, len: copy.expr_lists.len() as u32 - start })
+            };
+            let rewritten = match ast.expr(at) {
+                ast::Expr::Function { name, args, distinct, filter } => {
+                    expand(args).map(|args| ast::Expr::Function { name, args, distinct, filter })
+                }
+                ast::Expr::List { items } => expand(items).map(|items| ast::Expr::List { items }),
+                ast::Expr::Row { items } => expand(items).map(|items| ast::Expr::Row { items }),
+                ast::Expr::In { operand, list, negated } => {
+                    expand(list).map(|list| ast::Expr::In { operand, list, negated })
+                }
+                _ => None,
+            };
+            if let Some(rewritten) = rewritten {
+                copy.exprs[at as usize] = rewritten;
+            }
+        }
+        copy
     }
 
     /// The `COLUMNS` being bound for one of its columns, as that column.

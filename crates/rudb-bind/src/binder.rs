@@ -1067,13 +1067,12 @@ impl<'a> Binder<'a> {
             // and makes the rows that are grouped. `SELECT unnest(tags) AS tag, count(*) ... GROUP
             // BY tag` counts the rows each tag appears in.
             self.unnest_here = true;
-            self.unnest_grouping = Some(written.group_by_all);
+            let everything = groups_everything(ast, &written)?;
+            self.unnest_grouping = Some(everything);
             let mut groups = Vec::with_capacity(group_items.len());
             for item in &group_items {
                 // `GROUP BY ALL` groups on what a star or a `COLUMNS` in the list stands for.
-                if written.group_by_all
-                    && let Some(expanded) = self.bind_star_each(ast, *item, &input)?
-                {
+                if everything && let Some(expanded) = self.bind_star_each(ast, *item, &input)? {
                     groups.extend(expanded);
                     continue;
                 }
@@ -1404,10 +1403,18 @@ impl<'a> Binder<'a> {
                             "*COLUMNS not allowed at the root level, use COLUMNS instead",
                         ));
                     }
-                    return Err(Error::not_implemented(format!(
-                        "{} is not supported yet",
-                        rudb_parse::deparse::expression(ast, columns)
-                    )));
+                    let picks = self.columns_picks(ast, columns, input)?;
+                    let copy = self.unpacked(ast, target.expr, &picks);
+                    let before = self.scalar_subqueries.len();
+                    let expr = self.bind_expr(&copy, target.expr, input)?;
+                    self.lift_over_aggregate(before, above, input)?;
+                    exprs.push(self.over_aggregate(expr, input)?);
+                    names.push(if target.alias == NONE {
+                        self.output_name(&copy, target.expr, input)
+                    } else {
+                        ast.string(target.alias).to_string()
+                    });
+                    continue;
                 }
             }
             let before = self.scalar_subqueries.len();
@@ -1456,6 +1463,7 @@ impl<'a> Binder<'a> {
                 }
                 return found.name.clone();
             }
+            return rudb_parse::quoted(parts.last().copied().unwrap_or_default());
         }
         describe(ast, target, self.semantics)
     }
@@ -1467,7 +1475,7 @@ impl<'a> Binder<'a> {
         select: &ast::Select,
         targets: &[ast::Target],
     ) -> Result<Vec<ast::ExprRef>> {
-        if select.group_by_all {
+        if groups_everything(ast, select)? {
             // GROUP BY ALL means every target that is not itself an aggregate, which is the set
             // that would otherwise have to be written out again by hand.
             return Ok(targets
@@ -4604,4 +4612,24 @@ fn share(value: &Value) -> Option<f64> {
         Value::Decimal { unscaled, scale, .. } => unscaled as f64 / 10f64.powi(i32::from(scale)),
         _ => return None,
     })
+}
+
+/// Whether a `GROUP BY` groups on every target that is not an aggregate, which `GROUP BY ALL` and
+/// `GROUP BY *` on its own both ask for. A star with a list on it, or next to anything else, is
+/// turned down the way the pin turns it down while it expands the stars.
+fn groups_everything(ast: &Ast, select: &ast::Select) -> Result<bool> {
+    let written = ast.expr_list(select.group_by);
+    let alone = match *written {
+        [only] => match ast.expr(only) {
+            ast::Expr::Star { replacements, .. } => {
+                replacements.is_empty() && ast.star_lists(only) == ast::StarLists::default()
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if !alone && written.iter().any(|&item| crate::columns::has_star(ast, item)) {
+        return Err(Error::binder("STAR expression is not supported here"));
+    }
+    Ok(select.group_by_all || alone)
 }

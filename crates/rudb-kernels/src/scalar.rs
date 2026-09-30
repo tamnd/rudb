@@ -3715,6 +3715,20 @@ pub fn call_values(
         let found = args.iter().find(|value| !value.is_null());
         return Ok(found.cloned().unwrap_or(Value::Null));
     }
+    // `greatest` and `least` look past a null argument, so the answer is null only when every
+    // argument is.
+    if matches!(name, "greatest" | "least") {
+        let wanted =
+            if name == "greatest" { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+        let mut best: Option<&Value> = None;
+        for value in args.iter().filter(|value| !value.is_null()) {
+            best = match best {
+                Some(held) if compare::order(value, held)? != wanted => Some(held),
+                _ => Some(value),
+            };
+        }
+        return Ok(best.cloned().unwrap_or(Value::Null));
+    }
     // `list_value` is above the null rule because a null argument is an element of the list rather
     // than an answer for the whole call. `[1, NULL]` is a list of two things on the pin and not null,
     // and the difference between a null list and a list holding a null is the difference this whole
