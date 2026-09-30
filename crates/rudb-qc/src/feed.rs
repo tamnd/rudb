@@ -144,6 +144,10 @@ struct Headers {
     /// For each column of [`Body::domains`], the last dictionary it came with and the index of
     /// each of that dictionary's values, as [`indexes`] makes them.
     domains: Vec<Option<(Arc<Vector>, Vec<u16>)>>,
+    /// For the column of [`Body::keyed`], the last dictionary it came with and the group row of
+    /// each of its codes so far, zero for a code not seen yet. A row stays where it is until the
+    /// merge after the scan, so an entry is good for as long as the dictionary is the same.
+    keyed: Option<(Arc<Vector>, Vec<u64>)>,
     /// For each column of [`Body::reads`] and then each `LIKE` of [`Body::likes`], the last
     /// dictionary it came with and how many rows have been read through it, this chunk's too.
     seen: Vec<Option<(Arc<Vector>, usize)>>,
@@ -879,6 +883,23 @@ impl<'a> Feed<'a> {
             };
             let at = values.cast::<u8>();
             cols.push(Col { values: at, valid: at, codes });
+        }
+        // The group rows by the code of the key, when the body reads the key through the codes of
+        // a dictionary this morsel, and a null address when not.
+        if let Some(c) = self.body.keyed {
+            let mut at = std::ptr::null::<u8>();
+            if keep.get(c).copied().unwrap_or(false)
+                && let Some((_, dictionary)) = chunk.column(c)?.shared_dictionary_parts()
+                && dictionary.len() <= KEYED_ROWS
+            {
+                if !headers.keyed.as_ref().is_some_and(|(d, _)| Arc::ptr_eq(d, dictionary)) {
+                    headers.keyed = Some((Arc::clone(dictionary), vec![0; dictionary.len()]));
+                }
+                if let Some((_, rows)) = headers.keyed.as_mut() {
+                    at = rows.as_mut_ptr().cast::<u8>();
+                }
+            }
+            cols.push(Col { values: at, valid: at, codes: std::ptr::null() });
         }
         let mut morsel = Morsel {
             source: 0,
@@ -1807,6 +1828,11 @@ const COUNTED_SPAN: usize = 1 << 16;
 /// machines we measure on, and the probes cost more than the extra rows a smaller table leaves for
 /// the merge.
 const WORKER_GROUPS: usize = 1 << 12;
+
+/// The longest dictionary whose codes a worker keeps an array of group rows for, eight bytes a
+/// value. The array is allocated zeroed, so a page of it costs something only once a code on it
+/// is read.
+const KEYED_ROWS: usize = 1 << 20;
 
 fn gone(table: u64) -> Error {
     Error::internal(format!("the group table or distinct set {table} is gone"))

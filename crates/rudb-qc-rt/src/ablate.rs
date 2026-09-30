@@ -38,9 +38,12 @@ impl Ablate {
     pub const APPEND: Ablate = Ablate(1 << 11);
     /// A number column coded into a dictionary read through its codes rather than made flat.
     pub const CODED: Ablate = Ablate(1 << 12);
+    /// Group rows found through an array indexed by the code of a key coded into a dictionary, in
+    /// front of the hash.
+    pub const KEYED: Ablate = Ablate(1 << 13);
 
     /// Every switch with its name, in the order a table of them is printed.
-    pub const ALL: [(&'static str, Ablate); 13] = [
+    pub const ALL: [(&'static str, Ablate); 14] = [
         ("probe", Ablate::PROBE),
         ("like", Ablate::LIKE),
         ("top", Ablate::TOP),
@@ -54,6 +57,7 @@ impl Ablate {
         ("runs", Ablate::RUNS),
         ("append", Ablate::APPEND),
         ("coded", Ablate::CODED),
+        ("keyed", Ablate::KEYED),
     ];
 
     /// Reads a comma separated list of names, where an empty list or `none` is nothing and `all`

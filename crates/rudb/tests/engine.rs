@@ -343,6 +343,7 @@ fn leaving_a_technique_out_answers_the_same() {
     let queries = [
         "SELECT k, count(*) AS c FROM u GROUP BY k ORDER BY c DESC, k LIMIT 5",
         "SELECT count(*) FROM u WHERE url LIKE '%host1%'",
+        "SELECT url, count(*) AS c, min(k) FROM u GROUP BY url ORDER BY c DESC, url LIMIT 5",
         "SELECT regexp_replace(url, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS h, count(*) AS c FROM u GROUP BY h ORDER BY c DESC, h LIMIT 5",
         "SELECT count(*), max(k) FROM u",
     ];
@@ -350,11 +351,11 @@ fn leaving_a_technique_out_answers_the_same() {
     database.execute("SET engine = 'compiled'").expect("the compiled engine");
     for ablate in [
         "none", "probe", "like", "top", "lanes", "stats", "codes", "ranges", "dense", "handoff",
-        "pairs", "runs", "append", "coded", "all",
+        "pairs", "runs", "append", "coded", "keyed", "all",
     ] {
         database.execute(&format!("SET qc_ablate = '{ablate}'")).expect("a switch");
         let back = database.setting("qc_ablate").expect("qc_ablate reads back");
-        let all = "probe,like,top,lanes,stats,codes,ranges,dense,handoff,pairs,runs,append,coded";
+        let all = "probe,like,top,lanes,stats,codes,ranges,dense,handoff,pairs,runs,append,coded,keyed";
         assert_eq!(back, if ablate == "all" { all } else { ablate });
         for (sql, first) in queries.iter().zip(&first) {
             assert_eq!(&rows(&database, sql), first, "{sql} with {ablate} off");
