@@ -179,7 +179,7 @@ pub(crate) fn group_rows(
         for &gid in gids {
             let at = (g.acc_offset + acc.offset) as usize;
             let a = &table.row(gid)[at..];
-            cells.push(finish(sets, acc.op, &acc.arg, a, gid)?);
+            cells.push(finish(sets, (acc.op, &acc.ty), &acc.arg, a, gid)?);
         }
         vectors.push(vector(&acc.ty, &cells)?);
     }
@@ -389,6 +389,17 @@ fn split(a: &[u8]) -> i128 {
     total.wrapping_add(i128::from(part))
 }
 
+/// A whole sum as a cell of `ty`, which is `HUGEINT` unless the plan summed into a `BIGINT`, as a
+/// split aggregate does with its counts. A total that does not fit is the first engine's error.
+fn whole(total: i128, ty: &LogicalType) -> Result<Cell> {
+    if *ty != LogicalType::BigInt {
+        return Ok(Some(cell(&total.to_le_bytes())));
+    }
+    let total = i64::try_from(total)
+        .map_err(|_| Error::out_of_range(format!("a sum of {total} does not fit in {ty}")))?;
+    Ok(Some(cell(&total.to_le_bytes())))
+}
+
 /// What the total of an average over `arg` is divided by, `n` values having gone into it.
 ///
 /// The first engine's `divide_mean`: the count times ten to the scale, both as doubles, which for
@@ -404,7 +415,7 @@ fn divisor(arg: &LogicalType, n: i64) -> f64 {
 /// The value of one accumulator, `a` being its bytes in the group row.
 fn finish(
     sets: &[(u64, &Distinct)],
-    op: AccOp,
+    (op, ty): (AccOp, &LogicalType),
     arg: &LogicalType,
     a: &[u8],
     gid: usize,
@@ -415,12 +426,14 @@ fn finish(
     Ok(match op {
         AccOp::CountStar | AccOp::Count => Some(cell(&a[..8])),
         AccOp::SumInt => (a[16] != 0).then(|| cell(&a[..16])),
-        AccOp::SumSplit => (a[24] != 0).then(|| cell(&split(a).to_le_bytes())),
+        AccOp::SumSplit if a[24] != 0 => whole(split(a), ty)?,
+        AccOp::SumSplit => None,
         AccOp::AvgSplit => {
             let n = i64_at(24);
             (n != 0).then(|| cell(&(split(a) as f64 / divisor(arg, n)).to_le_bytes()))
         }
-        AccOp::SumNarrow => (a[8] != 0).then(|| cell(&i128::from(i64_at(0)).to_le_bytes())),
+        AccOp::SumNarrow if a[8] != 0 => whole(i128::from(i64_at(0)), ty)?,
+        AccOp::SumNarrow => None,
         AccOp::SumFloat => (a[8] != 0).then(|| cell(&a[..8])),
         AccOp::AvgInt => {
             let n = i64_at(16);
