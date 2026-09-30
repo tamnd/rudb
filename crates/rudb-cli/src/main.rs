@@ -29,23 +29,25 @@
 //! answer. It recovers two percent of the load, it is the quickest of the three on the queries by a
 //! margin too small to choose on, and it holds the most memory, so it is not the one.
 //!
-//! # Why it is no longer the default
+//! # Why it was not the default for a while, and is again
 //!
 //! The table above was taken when a load freed tens of thousands of chunks on a thread other than
-//! the one that made them. The engine has changed since, and measured again on server3, eight EPYC
-//! cores, the system allocator is ahead. Over the 43 ClickBench queries on the native 10m table,
-//! one process per query, glibc took 23.56 seconds of CPU against mimalloc's 26.66 and summed to
-//! 2448 MB of peak resident memory against 3082. Over the same queries on the Parquet file it was
-//! 23.27 seconds against 25.85 and 2416 MB against 2916. Nearly all of the CPU is system time, 6.2
-//! seconds against 8.2, and it is page faults: mimalloc touched 10 to 25 percent more pages on the
-//! large grouping queries, 67,000 against 60,000 on q33, and every one of them is a page the kernel
-//! has to clear. Growing a large `Vec` is part of it, since glibc grows a mapped block with
-//! `mremap` where mimalloc allocates a new one and copies. The loads no longer pay for the switch:
-//! the 20 million row CTAS above took 2.49 seconds of CPU on glibc against 2.91, the same faults,
-//! and the first million rows of ClickBench loaded with less system time.
+//! the one that made them. Measured again later on server3, the system allocator came out ahead.
+//! Over the 43 ClickBench queries on the native 10m table, one process per query, glibc took 23.56
+//! seconds of CPU against mimalloc's 26.66 and summed to 2448 MB of peak resident memory against
+//! 3082, and nearly all of the difference was system time spent on page faults. So for a while the
+//! default build installed nothing.
 //!
-//! So the default build installs nothing and the `mimalloc` feature puts it back. Everything below
-//! is about that build.
+//! The engine has changed again since, and the two suites now agree the other way. On the 42
+//! ClickBench queries past the first over the 10m Parquet file on server3, one process per query,
+//! glibc took 20.2 seconds of CPU against mimalloc's 19.6, and 37.4 against 34.7 with each query
+//! run three times in its process. On JOB, where a session runs many statements, glibc spent about
+//! 15 percent of the warm user cycles inside `malloc` and `free` alone, and the 113 queries took
+//! 32.20 billion warm user cycles against mimalloc's 30.16. The first run of each JOB query, which
+//! is mostly faulting in pages, took 107 seconds of task clock on glibc against 93.5. What
+//! mimalloc still costs is memory: the ClickBench peaks summed to 2128 MB against 1764. That is
+//! the trade taken, so the `mimalloc` feature is on by default and a build that wants glibc turns
+//! default features off.
 //!
 //! # The two features in the manifest
 //!
@@ -68,7 +70,7 @@
 //! A global allocator is a property of a program. A library that sets one takes the choice away
 //! from every program that embeds it, which for `rudb` means the Rust API, the C API and anything
 //! linking either, and none of those asked. So the attribute goes on the one binary in the
-//! workspace that ships, and only when `cargo build --features mimalloc` asks for it.
+//! workspace that ships, and only while its `mimalloc` feature is on, which it is by default.
 
 // `deny` rather than `forbid`, and the difference buys exactly one thing. [`heap`] implements a
 // trait that cannot be implemented safely, because it is the thing the safe world is built on, and
