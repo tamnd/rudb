@@ -746,6 +746,38 @@ const TABLE: &[Entry] = &[
     text("trim", Arity::between(1, 2), Fixed::Varchar),
     text("ltrim", Arity::between(1, 2), Fixed::Varchar),
     text("rtrim", Arity::between(1, 2), Fixed::Varchar),
+    // The path functions. `parse_filename` reads its second argument as the separator or as
+    // `trim_extension` by its type, so its arguments are read off by [`filename`] rather than by
+    // the shape.
+    text("parse_path", Arity::between(1, 2), Fixed::VarcharList),
+    text("parse_dirname", Arity::between(1, 2), Fixed::Varchar),
+    text("parse_dirpath", Arity::between(1, 2), Fixed::Varchar),
+    text("parse_filename", Arity::between(1, 3), Fixed::Varchar),
+    text("path_join", Arity::at_least(1), Fixed::Varchar),
+    // A count of bytes as a person writes one, and back. The two ClickHouse spellings are rows of
+    // their own because the pin names them in their errors, in the case they are written in here.
+    Entry {
+        name: "format_bytes",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Widened(Fixed::BigInt, Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "formatReadableSize",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Widened(Fixed::BigInt, Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "formatReadableDecimalSize",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Widened(Fixed::BigInt, Fixed::Varchar),
+        numeric_only: false,
+    },
+    text("parse_formatted_bytes", Arity::exactly(1), Fixed::UBigInt),
     // Pattern matching. The transformer emits the operator spellings, so those are the names, and
     // `LIKE` is one of them rather than a keyword the binder has to know about separately.
     text("~~", Arity::exactly(2), Fixed::Boolean),
@@ -1049,6 +1081,16 @@ const TABLE: &[Entry] = &[
         kind: FunctionKind::Scalar,
         arity: Arity::between(2, 4),
         shape: Shape::LeadingFixedTo(2, Fixed::Varchar, Fixed::Varchar),
+        numeric_only: false,
+    },
+    // Every match rather than the first. The third argument is a group number or a list of names,
+    // and the two are overloads with different answers, so the types are decided in `every_match`
+    // and the shape here is only the row the catalog lists.
+    Entry {
+        name: "regexp_extract_all",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 4),
+        shape: Shape::LeadingFixedTo(2, Fixed::Varchar, Fixed::VarcharList),
         numeric_only: false,
     },
     // Subscripting. A bracket is one of these two calls by the time the transformer is done with it,
@@ -1566,6 +1608,15 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         return resolve("list_contains", arguments);
     }
     if let Some((cast_to, returns)) = temporal(entry.name, arguments) {
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
+    if entry.name == "regexp_extract_all" {
+        let (cast_to, returns) = every_match(arguments).ok_or_else(|| no_match(name, arguments))?;
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
+    if entry.name == "parse_filename" {
+        let cast_to = filename(arguments).ok_or_else(|| no_match(name, arguments))?;
+        let returns = LogicalType::Varchar;
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
     }
     if READ_OFF.contains(&entry.name) {
@@ -2616,6 +2667,60 @@ pub fn named_mismatch(name: &str, spelled: &[String], ambiguous: bool) -> Error 
     ))
 }
 
+/// The types `regexp_extract_all` reads its arguments as, and the type of its answer.
+///
+/// The text and the pattern have to be strings already, the way they do on the pin, where
+/// `regexp_extract_all(1234, '\d')` is refused. A group number is an `INTEGER` and only the types
+/// that widen into one are taken, so a decimal is refused rather than rounded. A list of names
+/// answers a list of structs with a field for each name, and which fields those are is only known
+/// once the list is, so the struct here is empty and the binder fills it in from the constant.
+fn every_match(arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{Integer, Null, SmallInt, TinyInt, USmallInt, UTinyInt, Varchar};
+    let text = |ty: &LogicalType| matches!(ty, Varchar | Null);
+    let (leading, rest) = arguments.split_at(arguments.len().min(2));
+    if leading.len() < 2 || !leading.iter().all(text) {
+        return None;
+    }
+    let mut cast_to = vec![Varchar, Varchar];
+    let mut returns = LogicalType::list(Varchar);
+    if let [third, options @ ..] = rest {
+        match third {
+            Null | TinyInt | SmallInt | Integer | UTinyInt | USmallInt => cast_to.push(Integer),
+            LogicalType::List(element) if text(element) => {
+                cast_to.push(LogicalType::list(Varchar));
+                returns = LogicalType::list(LogicalType::Struct(Vec::new()));
+            }
+            _ => return None,
+        }
+        if !options.iter().all(text) {
+            return None;
+        }
+        cast_to.extend(options.iter().map(|_| Varchar));
+    }
+    Some((cast_to, returns))
+}
+
+/// The types `parse_filename` reads its arguments as.
+///
+/// The pin has four overloads and the second argument picks between two of them by its type, a
+/// string being the separator and a boolean being `trim_extension`. With three arguments the second
+/// one is always `trim_extension`, and the binder has already cast a string literal there to a
+/// boolean, which is the pin's cast too and why `parse_filename('a', 'system', 'system')` is a
+/// conversion error. A string column there is refused.
+fn filename(arguments: &[LogicalType]) -> Option<Vec<LogicalType>> {
+    use LogicalType::{Boolean, Null, Varchar};
+    let text = |ty: &LogicalType| matches!(ty, Varchar | Null);
+    match arguments {
+        [path] if text(path) => Some(vec![Varchar]),
+        [path, Boolean] if text(path) => Some(vec![Varchar, Boolean]),
+        [path, separator] if text(path) && text(separator) => Some(vec![Varchar, Varchar]),
+        [path, Boolean | Null, separator] if text(path) && text(separator) => {
+            Some(vec![Varchar, Boolean, Varchar])
+        }
+        _ => None,
+    }
+}
+
 /// The functions that read something off a moment, or read a moment out of text, and take nothing
 /// but the types `temporal` names.
 const READ_OFF: &[&str] = &[
@@ -3260,6 +3365,16 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("hamming", &["hamming(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
     ("jaccard", &["jaccard(col0 VARCHAR, col1 VARCHAR) -> DOUBLE"]),
     (
+        "regexp_extract_all",
+        &[
+            "regexp_extract_all(string VARCHAR, regex VARCHAR) -> VARCHAR[]",
+            "regexp_extract_all(string VARCHAR, regex VARCHAR, \"group\" INTEGER) -> VARCHAR[]",
+            "regexp_extract_all(string VARCHAR, regex VARCHAR, \"group\" INTEGER, \"options\" VARCHAR) -> VARCHAR[]",
+            "regexp_extract_all(string VARCHAR, regex VARCHAR, name_list VARCHAR[]) -> VARCHAR[]",
+            "regexp_extract_all(string VARCHAR, regex VARCHAR, name_list VARCHAR[], \"options\" VARCHAR) -> VARCHAR[]",
+        ],
+    ),
+    (
         "jaro_similarity",
         &[
             "jaro_similarity(col0 VARCHAR, col1 VARCHAR) -> DOUBLE",
@@ -3280,6 +3395,41 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ),
     ("ltrim", &["ltrim(col0 VARCHAR) -> VARCHAR", "ltrim(col0 VARCHAR, col1 VARCHAR) -> VARCHAR"]),
     ("rtrim", &["rtrim(col0 VARCHAR) -> VARCHAR", "rtrim(col0 VARCHAR, col1 VARCHAR) -> VARCHAR"]),
+    (
+        "parse_path",
+        &[
+            "parse_path(col0 VARCHAR) -> VARCHAR[]",
+            "parse_path(col0 VARCHAR, col1 VARCHAR) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "parse_dirname",
+        &[
+            "parse_dirname(col0 VARCHAR) -> VARCHAR",
+            "parse_dirname(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+        ],
+    ),
+    (
+        "parse_dirpath",
+        &[
+            "parse_dirpath(col0 VARCHAR) -> VARCHAR",
+            "parse_dirpath(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+        ],
+    ),
+    (
+        "parse_filename",
+        &[
+            "parse_filename(col0 VARCHAR) -> VARCHAR",
+            "parse_filename(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+            "parse_filename(col0 VARCHAR, col1 BOOLEAN) -> VARCHAR",
+            "parse_filename(col0 VARCHAR, col1 BOOLEAN, col2 VARCHAR) -> VARCHAR",
+        ],
+    ),
+    ("path_join", &["path_join(col0 VARCHAR, [VARCHAR...]) -> VARCHAR"]),
+    ("format_bytes", &["format_bytes(col0 BIGINT) -> VARCHAR"]),
+    ("formatReadableSize", &["formatReadableSize(col0 BIGINT) -> VARCHAR"]),
+    ("formatReadableDecimalSize", &["formatReadableDecimalSize(col0 BIGINT) -> VARCHAR"]),
+    ("parse_formatted_bytes", &["parse_formatted_bytes(col0 VARCHAR) -> UBIGINT"]),
     ("~~", &["\"~~\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
     ("!~~", &["\"!~~\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
     ("~~*", &["\"~~*\"(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
@@ -3904,6 +4054,7 @@ fn canonical(name: &str) -> &str {
 /// `list_slice`, exactly as `len(1)` says `length`.
 const ALIASES: &[(&str, &str)] = &[
     ("ceiling", "ceil"),
+    ("pg_size_pretty", "format_bytes"),
     ("datepart", "date_part"),
     ("datetrunc", "date_trunc"),
     ("power", "pow"),
@@ -4441,6 +4592,12 @@ mod tests {
                         arguments[0] = strings();
                     }
                     _ if entry.name == "strftime" => arguments[1] = LogicalType::Varchar,
+                    _ if entry.name == "regexp_extract_all" && count > 2 => {
+                        arguments[2] = LogicalType::Integer;
+                    }
+                    _ if entry.name == "parse_filename" && count == 3 => {
+                        arguments[1] = LogicalType::Boolean;
+                    }
                     _ if entry.name == "time_bucket" => arguments[1] = LogicalType::Date,
                     _ if matches!(
                         entry.name,

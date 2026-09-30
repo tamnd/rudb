@@ -1,7 +1,7 @@
 //! The regular expression functions, over a pattern that is the same on every row.
 //!
-//! `regexp_replace`, `regexp_matches`, `regexp_full_match` and `regexp_extract`, with the engine in
-//! `rudb-regex` under them. What this file is for is the thing that separates a usable
+//! `regexp_replace`, `regexp_matches`, `regexp_full_match`, `regexp_extract` and
+//! `regexp_extract_all`, with the engine in `rudb-regex` under them. What this file is for is the thing that separates a usable
 //! implementation from one that is technically correct: the pattern is compiled once per vector.
 //! ClickBench query 29 runs one pattern over a hundred million rows, and compiling it per row would
 //! cost more than matching it.
@@ -27,8 +27,8 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rudb_common::{Error, LogicalType, Result, Value};
-use rudb_regex::{Options, Regex, Rewrite};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_regex::{Captures, Options, Regex, Rewrite};
 use rudb_vector::{Data, StringColumn, TextSource, Validity, Vector};
 
 use crate::number::integral;
@@ -37,7 +37,14 @@ use crate::shape::nulls_of;
 
 /// Whether a name is one of the functions here.
 pub(crate) fn is_regexp(name: &str) -> bool {
-    matches!(name, "regexp_replace" | "regexp_matches" | "regexp_full_match" | "regexp_extract")
+    matches!(
+        name,
+        "regexp_replace"
+            | "regexp_matches"
+            | "regexp_full_match"
+            | "regexp_extract"
+            | "regexp_extract_all"
+    )
 }
 
 /// What a recipe can lift out of a call to one of these, given the arguments that were literals.
@@ -125,6 +132,23 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
             })?;
             finish(returns, Data::Varlen(out), validity)
         }
+        ("regexp_extract_all", LogicalType::List(element)) => {
+            let Some(every) = &call.every else { return Ok(None) };
+            if let (Every::Group(group), LogicalType::Varchar) = (every, &**element) {
+                return every_group(call, *group, &source, base, rows).map(Some);
+            }
+            // The struct form is a struct per match, which is rarer and is built from values, but
+            // with the pattern compiled once for the vector rather than once for each row.
+            let mut values = Vec::with_capacity(rows);
+            for index in 0..rows {
+                values.push(if base.is_valid(index) {
+                    extracted_all(call, source.get(index)?)?
+                } else {
+                    Value::Null
+                });
+            }
+            Ok(Some(Vector::from_values(returns.clone(), &values)?))
+        }
         ("regexp_matches" | "regexp_full_match", LogicalType::Boolean) => {
             let whole = name == "regexp_full_match";
             let mut out = vec![false; rows];
@@ -162,6 +186,7 @@ pub(crate) fn value(name: &str, args: &[Value]) -> Result<Value> {
             Value::Varchar(call.regex.extract(text, call.group).unwrap_or_default().to_string())
         }
         "regexp_full_match" => Value::Boolean(call.regex.is_full_match(text)),
+        "regexp_extract_all" => extracted_all(&call, text)?,
         _ => Value::Boolean(call.regex.is_match(text)),
     })
 }
@@ -177,10 +202,22 @@ pub(crate) struct Call {
     global: bool,
     /// Which group `regexp_extract` wants, where zero is the whole match.
     group: usize,
+    /// What `regexp_extract_all` answers with for each match, and `None` for the other functions.
+    every: Option<Every>,
     /// The fixed host extraction used by ClickBench q29.
     host: bool,
     /// What `regexp_replace` gave for the values of a dictionary that outlives the chunk.
     stable: OnceLock<StableReplace>,
+}
+
+/// What `regexp_extract_all` answers with for each match.
+#[derive(Debug)]
+enum Every {
+    /// One group of it as a string, where zero is the whole match. A negative group is `None`, and
+    /// the pin answers it with an empty list without looking for a match at all.
+    Group(Option<usize>),
+    /// A struct with a field for each name, the first holding the first group.
+    Names(Vec<String>),
 }
 
 impl Call {
@@ -856,9 +893,25 @@ impl Call {
         // type and `regexp_extract` is the only one that takes both.
         let mut group = 0;
         let mut spelling = "";
+        let mut every = None;
         for value in rest {
             match value {
                 Value::Varchar(held) => spelling = held,
+                // A null group index is a null answer, which the null rule gives on the row at a
+                // time path this sends the call to.
+                Value::Null if name == "regexp_extract_all" => return Ok(None),
+                Value::List { values, .. } if name == "regexp_extract_all" => {
+                    let mut names = Vec::with_capacity(values.len());
+                    for held in values {
+                        let Value::Varchar(held) = held else { return Ok(None) };
+                        names.push(held.clone());
+                    }
+                    every = Some(Every::Names(names));
+                }
+                other if name == "regexp_extract_all" => {
+                    let Some(held) = integral(other) else { return Ok(None) };
+                    every = Some(Every::Group(usize::try_from(held).ok()));
+                }
                 // A null group index is not a number and keeps the null path it already had.
                 Value::Null => {}
                 // DuckDB takes zero to nine and refuses everything else with this sentence, per
@@ -888,7 +941,15 @@ impl Call {
                 }
             }
         }
+        if name == "regexp_extract_all" && every.is_none() {
+            every = Some(Every::Group(Some(0)));
+        }
         let options = Options::parse(spelling)?;
+        if options.global && name == "regexp_extract_all" {
+            return Err(Error::invalid_input(
+                "Option 'g' (global replace) is only valid for regexp_replace",
+            ));
+        }
         let host = name == "regexp_replace"
             && pattern == "^https?://(?:www\\.)?([^/]+)/.*$"
             && replacement == "\\1"
@@ -900,10 +961,117 @@ impl Call {
             rewrite,
             global: options.global,
             group,
+            every,
             host,
             stable: OnceLock::new(),
         }))
     }
+}
+
+/// Runs `each` over every match of `regexp_extract_all`, walked the way the pin walks them.
+///
+/// The next search starts where the last match ended, and one character further on when that
+/// match was empty, so an empty match right after a longer one is still a match and
+/// `regexp_extract_all('aabca', 'a*')` is `[aa, '', '', a, '']`. What the pin measures is how far
+/// the match ended from where the search started rather than how long the match was, so a search
+/// that finds an empty match further on moves to it without stepping past it, and finds it again
+/// from there. That is why `regexp_extract_all('ab', '$')` is `['', '']` upstream, and it is
+/// reported to the fork as tamnd/duckdb#23. It is kept here because the answers are the pin's.
+///
+/// A group the pattern does not have is refused at the first match, and a text with no match
+/// answers an empty list whatever group was asked for, which is the pin's order as well.
+fn walk(call: &Call, group: usize, text: &str, mut each: impl FnMut(&Captures)) -> Result<()> {
+    let mut start = 0;
+    let mut first = true;
+    while let Some(found) = call.regex.find_at(text, start) {
+        if first && group > call.regex.groups() {
+            return Err(Error::invalid_input(format!(
+                "Pattern has {} groups. Cannot access group {group}",
+                call.regex.groups()
+            )));
+        }
+        first = false;
+        each(&found);
+        if found.end() > start {
+            start = found.end();
+        } else {
+            start += 1;
+            while start < text.len() && !text.is_char_boundary(start) {
+                start += 1;
+            }
+            if start > text.len() {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `regexp_extract_all` of one text, as a list of strings or a list of structs.
+fn extracted_all(call: &Call, text: &str) -> Result<Value> {
+    let piece = |found: &Captures, group: usize| match found.group(group) {
+        Some((from, to)) => Value::Varchar(text[from..to].to_string()),
+        None => Value::Null,
+    };
+    let mut values = Vec::new();
+    let element = match &call.every {
+        Some(Every::Names(names)) => {
+            walk(call, 0, text, |found| {
+                let fields = names
+                    .iter()
+                    .enumerate()
+                    .map(|(at, name)| (name.clone(), piece(found, at + 1)))
+                    .collect();
+                values.push(Value::Struct(fields));
+            })?;
+            LogicalType::Struct(
+                names.iter().map(|name| Field::new(name.clone(), LogicalType::Varchar)).collect(),
+            )
+        }
+        Some(Every::Group(Some(group))) => {
+            walk(call, *group, text, |found| values.push(piece(found, *group)))?;
+            LogicalType::Varchar
+        }
+        _ => LogicalType::Varchar,
+    };
+    Ok(Value::List { element, values })
+}
+
+/// `regexp_extract_all` of a column into a list of strings, built as one child column of every
+/// match in the vector rather than as a list value for each row.
+fn every_group(
+    call: &Call,
+    group: Option<usize>,
+    source: &Source<'_>,
+    base: Validity,
+    rows: usize,
+) -> Result<Vector> {
+    let mut entries = Vec::with_capacity(rows);
+    let mut child = StringColumn::with_capacity(rows);
+    let mut valid = Vec::with_capacity(rows);
+    for index in 0..rows {
+        let begin = child.len();
+        if let (true, Some(group)) = (base.is_valid(index), group) {
+            let text = source.get(index)?;
+            walk(call, group, text, |found| match found.group(group) {
+                Some((from, to)) => {
+                    child.push(&text[from..to]);
+                    valid.push(true);
+                }
+                None => {
+                    child.push("");
+                    valid.push(false);
+                }
+            })?;
+        }
+        let offset = u32::try_from(begin).map_err(|_| Error::internal("a list over 4GB"))?;
+        let len =
+            u32::try_from(child.len() - begin).map_err(|_| Error::internal("a list over 4GB"))?;
+        entries.push((offset, len));
+    }
+    let child = Vector::flat(LogicalType::Varchar, Data::Varlen(child))?
+        .with_validity(Validity::from_run(&valid));
+    Ok(Vector::list(entries, child)?.with_validity(base))
 }
 
 /// The captured host, or the original text when the anchored pattern does not match.

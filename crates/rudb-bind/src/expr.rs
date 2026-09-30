@@ -914,6 +914,20 @@ impl Binder<'_> {
         {
             return self.bind_part_shortcut(ast, name, part, &arguments, &bound);
         }
+        // The byte formatters are declared over a BIGINT and nothing else, and a string literal
+        // reaches that by a cast where a VARCHAR does not, so `format_bytes('1')` is one byte,
+        // `format_bytes('x')` is the pin's conversion error and `format_bytes('1'::VARCHAR)` is
+        // refused. Only the syntax can tell the first and the last apart.
+        if ["format_bytes", "pg_size_pretty", "formatReadableSize", "formatReadableDecimalSize"]
+            .into_iter()
+            .any(|name| rudb_catalog::same_name(&written, name))
+        {
+            for (arg, bound) in arguments.iter().zip(bound.iter_mut()) {
+                if matches!(ast.expr(*arg), ast::Expr::Literal { kind: LiteralKind::String, .. }) {
+                    *bound = self.cast_to(*bound, &LogicalType::BigInt);
+                }
+            }
+        }
         if let Some(function) = ["coalesce", "greatest", "least"]
             .into_iter()
             .find(|name| rudb_catalog::same_name(&written, name))
@@ -1262,6 +1276,18 @@ impl Binder<'_> {
                 }
             }
         }
+        // The same holds for `trim_extension` in the three argument `parse_filename`, which is a
+        // BOOLEAN and the only overload with three arguments, so `'true'` there is read as true
+        // and `'system'` is the pin's conversion error rather than a separator. A third argument
+        // that is not a string is the pin's binder error, which comes before any cast.
+        if resolved_name == "parse_filename"
+            && let [_, trim, separator] = args.as_mut_slice()
+            && matches!(self.plan().expr_type(*separator), LogicalType::Varchar | LogicalType::Null)
+            && let Expr::Constant(value) = *self.plan().expr(*trim)
+            && matches!(self.plan().value(value), Value::Varchar(_))
+        {
+            *trim = self.checked_cast_to(*trim, &LogicalType::Boolean, false)?;
+        }
         let types: Vec<LogicalType> =
             args.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
         let resolved = resolve(resolved_name, &types)?;
@@ -1291,9 +1317,18 @@ impl Binder<'_> {
         for (arg, wanted) in args.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
         }
+        if resolved.name == "regexp_extract_all" {
+            self.settled_options(&cast)?;
+        }
         let returns = match resolved.returns {
             LogicalType::Struct(fields) if resolved.name == "date_part" && fields.is_empty() => {
                 self.part_list(cast[0])?
+            }
+            LogicalType::List(element)
+                if resolved.name == "regexp_extract_all"
+                    && matches!(&*element, LogicalType::Struct(fields) if fields.is_empty()) =>
+            {
+                self.group_names(&cast)?
             }
             returns => self.narrowed_part(resolved.name, &cast, returns),
         };
@@ -1760,6 +1795,81 @@ impl Binder<'_> {
             fields.push(Field::new(spelling, ty));
         }
         Ok(LogicalType::Struct(fields))
+    }
+
+    /// The option string of `regexp_extract_all`, which the pin reads once when it binds, so one
+    /// that is not a constant is refused and so is a null one, each in the pin's words.
+    fn settled_options(&self, args: &[ExprRef]) -> Result<()> {
+        let Some(&options) = args.get(3) else { return Ok(()) };
+        match fold::value_of(self.plan(), options) {
+            Ok(Some(Value::Null)) => {
+                Err(Error::invalid_input("Regex options field must not be NULL"))
+            }
+            Ok(Some(_)) => Ok(()),
+            _ => Err(Error::binder(
+                "The \"options\" argument in function \"regexp_extract_all\" must be a constant expression",
+            )),
+        }
+    }
+
+    /// The structs `regexp_extract_all` answers for a list of names, with a string field for each
+    /// name holding the group in the same place.
+    ///
+    /// The pin reads the pattern and the list once when it binds, so either one that is not a
+    /// constant is refused. So are a null list, an empty one, a null name, a name given twice, a
+    /// pattern that does not compile and more names than the pattern has groups, all in the pin's
+    /// words.
+    fn group_names(&self, args: &[ExprRef]) -> Result<LogicalType> {
+        let (Some(&pattern), Some(&names)) = (args.get(1), args.get(2)) else {
+            return Err(Error::internal("regexp_extract_all with a list and no pattern"));
+        };
+        let Ok(Some(Value::Varchar(pattern))) = fold::value_of(self.plan(), pattern) else {
+            return Err(Error::binder(
+                "\"regexp_extract_all\" with LIST requires a constant pattern",
+            ));
+        };
+        let values = match fold::value_of(self.plan(), names) {
+            Ok(Some(Value::List { values, .. })) => values,
+            Ok(Some(_)) => {
+                return Err(Error::binder("Group specification must be a non-NULL LIST"));
+            }
+            _ => {
+                return Err(Error::binder(
+                    "The \"name_list\" argument in function \"regexp_extract_all\" must be a constant expression",
+                ));
+            }
+        };
+        if values.is_empty() {
+            return Err(Error::binder("Group name list must be non-empty"));
+        }
+        let mut fields: Vec<Field> = Vec::with_capacity(values.len());
+        for value in values {
+            let Value::Varchar(name) = value else {
+                return Err(Error::binder("NULL group name in regexp_extract_all"));
+            };
+            if fields.iter().any(|field| field.name == name) {
+                return Err(Error::binder(format!(
+                    "Duplicate group name '{name}' in regexp_extract_all"
+                )));
+            }
+            fields.push(Field::new(name, LogicalType::Varchar));
+        }
+        let spelling = match args.get(3).map(|&options| fold::value_of(self.plan(), options)) {
+            Some(Ok(Some(Value::Varchar(spelling)))) => spelling,
+            _ => String::new(),
+        };
+        let options = rudb_regex::Options::parse(&spelling)?;
+        let regex = rudb_regex::Regex::with_options(&pattern, options).map_err(|error| {
+            Error::binder(format!("Pattern failed to parse: {}", error.message()))
+        })?;
+        if regex.groups() < fields.len() {
+            return Err(Error::binder(format!(
+                "Not enough capturing groups ({}) for provided names ({})",
+                regex.groups(),
+                fields.len()
+            )));
+        }
+        Ok(LogicalType::list(LogicalType::Struct(fields)))
     }
 
     /// The scale a decimal keeps once rounded to the digits the second argument asks for.
