@@ -103,6 +103,8 @@
 //! another three gigabytes that is not held while the assembly runs.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::{Mutex, RwLock};
@@ -115,6 +117,7 @@ use rudb_vector::{
     strings_placeable,
 };
 
+use crate::key::Digest;
 use crate::merged::{ORDER, Sorted, order_of, ordering};
 use crate::normal::{self, Normal};
 use crate::pairs::in_parallel;
@@ -324,7 +327,7 @@ impl Ranked {
             written += wide;
         }
         rows.sort_unstable_by(|left, right| {
-            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+            normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
         });
         self.rows = rows;
         Ok(())
@@ -332,32 +335,42 @@ impl Ranked {
 
     /// Where each row's value of key `position` falls among the distinct values of that key, the
     /// rows of each chunk after the one before, and zero for a null.
+    ///
+    /// Each row is looked up among the values seen so far and only the distinct values are sorted.
+    /// A sort key of text is almost always a grouped column with few values, a brand or a type on
+    /// TPC-H q16, and sorting every row's bytes compared the same few strings over and over.
     fn ranks(&self, position: usize) -> Result<Vec<u32>> {
-        let mut values: Vec<(&[u8], u32)> = Vec::with_capacity(self.arrivals.len());
-        let mut row = 0_u32;
+        let mut seen: HashMap<&[u8], u32, BuildHasherDefault<Digest>> = HashMap::default();
+        let mut distinct: Vec<&[u8]> = Vec::new();
+        let mut ids: Vec<u32> = Vec::with_capacity(self.arrivals.len());
         for columns in &self.keys {
             let column = columns.get(position).ok_or_else(mismatched)?;
             for at in 0..column.len() {
                 match column.bytes_at(at) {
-                    Some(bytes) => values.push((bytes, row)),
-                    None if column.is_null_at(at) => {}
+                    Some(bytes) => {
+                        let next = u32::try_from(distinct.len()).map_err(|_| too_many())?;
+                        let id = *seen.entry(bytes).or_insert(next);
+                        if id == next {
+                            distinct.push(bytes);
+                        }
+                        ids.push(id);
+                    }
+                    None if column.is_null_at(at) => ids.push(u32::MAX),
                     None => return Err(Error::internal("a ranked sort key with no bytes")),
                 }
-                row = row.checked_add(1).ok_or_else(too_many)?;
             }
         }
-        values.sort_unstable_by(|left, right| left.0.cmp(right.0));
-        let mut ranks = vec![0_u32; row as usize];
-        let mut rank = 0_u32;
-        let mut last: Option<&[u8]> = None;
-        for (bytes, row) in values {
-            if last.is_some_and(|last| last != bytes) {
-                rank += 1;
-            }
-            last = Some(bytes);
-            ranks[row as usize] = rank;
+        u32::try_from(ids.len()).map_err(|_| too_many())?;
+        let mut order: Vec<u32> =
+            (0..u32::try_from(distinct.len()).map_err(|_| too_many())?).collect();
+        order.sort_unstable_by(|&left, &right| {
+            distinct[left as usize].cmp(distinct[right as usize])
+        });
+        let mut rank_of = vec![0_u32; distinct.len()];
+        for (rank, &id) in (0_u32..).zip(&order) {
+            rank_of[id as usize] = rank;
         }
-        Ok(ranks)
+        Ok(ids.into_iter().map(|id| rank_of.get(id as usize).copied().unwrap_or(0)).collect())
     }
 
     /// What the rows were charged when they arrived: their key columns and an arrival a row.
@@ -419,7 +432,7 @@ impl Keyed {
         match self {
             Self::Normal(rows) => {
                 rows.sort_unstable_by(|left, right| {
-                    left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                    normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
                 });
                 Ok(())
             }
@@ -768,7 +781,7 @@ impl Sink for Sort {
         // `finalize`, which sorts it the way it always has.
         if let Keyed::Normal(rows) = &mut local.held.rows {
             rows.sort_unstable_by(|left, right| {
-                left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
             });
         }
         self.runs.lock().map_err(poisoned)?.extend(local.runs);
@@ -917,7 +930,7 @@ fn merged(
             .ok_or_else(|| Error::internal("a sorted row pointing outside the chunks it came from"))
     };
     let first = |left: &Normalized, right: &Normalized| {
-        left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
     };
     let degree = threads.degree().max(1);
     let parts = if runs.len() > 1 { degree * PARTS_A_THREAD } else { 1 };
@@ -1419,7 +1432,7 @@ mod tests {
     use rudb_vector::VECTOR_SIZE;
 
     use super::{Normalized, merged};
-    use crate::normal::WIDTH;
+    use crate::normal::{self, WIDTH};
 
     /// Rows with keys that repeat a lot and an arrival that settles every tie, shuffled.
     fn shuffled(count: usize) -> Vec<(u64, u64)> {
@@ -1463,7 +1476,7 @@ mod tests {
                         })
                         .collect();
                     run.sort_unstable_by(|left, right| {
-                        left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                        normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
                     });
                     runs.push((chunk as u32, run));
                     at += length;

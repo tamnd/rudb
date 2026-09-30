@@ -52,6 +52,8 @@
 //! the decimals. A clustered load on `date_trunc('month', l_shipdate), l_orderkey, l_linenumber` is
 //! nineteen bytes of this.
 
+use std::cmp::Ordering;
+
 #[cfg(test)]
 use rudb_common::Value;
 use rudb_common::{Error, LogicalType, PhysicalType, Result};
@@ -68,6 +70,23 @@ pub(crate) const WIDTH: usize = 24;
 
 /// One row's keys, in priority order, ready to compare with a byte compare.
 pub(crate) type Normal = [u8; WIDTH];
+
+/// Two keys in their order, compared a big endian word at a time.
+///
+/// The same answer as comparing the arrays, which the compiler turns into a call to `memcmp` and a
+/// byte loop behind it. On TPC-H q16 that call was most of a sort of eighteen thousand rows.
+#[inline]
+pub(crate) fn compare(left: &Normal, right: &Normal) -> Ordering {
+    let (left, _) = left.as_chunks::<8>();
+    let (right, _) = right.as_chunks::<8>();
+    for (left, right) in left.iter().zip(right) {
+        match u64::from_be_bytes(*left).cmp(&u64::from_be_bytes(*right)) {
+            Ordering::Equal => {}
+            other => return other,
+        }
+    }
+    Ordering::Equal
+}
 
 /// How wide each key of a list encodes, or `None` when the list has no normalized form.
 ///
@@ -366,7 +385,24 @@ mod tests {
     use rudb_common::LogicalType;
     use rudb_vector::Vector;
 
-    use super::{Normal, WIDTH, layout, write, write_column};
+    use super::{Normal, WIDTH, compare, layout, write, write_column};
+
+    #[test]
+    fn comparing_by_words_agrees_with_comparing_the_bytes() {
+        let mut keys: Vec<Normal> = Vec::new();
+        for at in [0, 7, 8, 15, 16, 23] {
+            for byte in [0, 1, 0x7f, 0x80, 0xff] {
+                let mut key = [0x40; WIDTH];
+                key[at] = byte;
+                keys.push(key);
+            }
+        }
+        for left in &keys {
+            for right in &keys {
+                assert_eq!(compare(left, right), left.cmp(right), "{left:?} and {right:?}");
+            }
+        }
+    }
 
     /// A key with nothing but the direction and the null placement set, since `write` reads no more.
     fn key(descending: bool, nulls_first: bool) -> SortKey {
