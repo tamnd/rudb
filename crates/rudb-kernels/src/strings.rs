@@ -1,6 +1,6 @@
 //! The functions that build a string out of pieces or rewrite one a character at a time:
 //! `concat_ws`, `repeat`, `lpad`, `rpad`, `ascii`, `unicode`, `translate`, `url_encode`,
-//! `url_decode`, `bar` and `to_base`.
+//! `url_decode`, `bar`, `to_base` and `regexp_escape`.
 //!
 //! Each one takes the steps the pin's takes, so a character is a code point and not a grapheme, a
 //! URL is encoded byte by byte, and a bar is cut into eighths of a block. The signature has already
@@ -317,6 +317,26 @@ pub(crate) fn to_base(number: i64, radix: i32, min_length: i32) -> Result<Value>
     }
     digits.reverse();
     Ok(Value::Varchar(digits.into_iter().map(char::from).collect()))
+}
+
+/// `regexp_escape`, which is RE2's `QuoteMeta`.
+///
+/// A backslash goes before every ASCII byte that is not a letter, a digit or an underscore, and a
+/// NUL is written as `\x00` because RE2 cannot take one after a backslash. Bytes of a multibyte
+/// character are left alone, so `é` stays as it was.
+pub(crate) fn regexp_escape(text: &str) -> Value {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character == '\0' {
+            out.push_str("\\x00");
+            continue;
+        }
+        if character.is_ascii() && !character.is_ascii_alphanumeric() && character != '_' {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    Value::Varchar(out)
 }
 
 #[cfg(test)]

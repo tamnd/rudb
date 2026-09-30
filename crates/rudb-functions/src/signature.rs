@@ -817,6 +817,14 @@ const TABLE: &[Entry] = &[
     text("base64", Arity::exactly(1), Fixed::Varchar),
     text("to_base64", Arity::exactly(1), Fixed::Varchar),
     text("from_base64", Arity::exactly(1), Fixed::Varchar),
+    // The functions that count a grapheme cluster as one character, and `reverse`, which reverses
+    // clusters rather than code points. The counts are BIGINT parameters that take nothing wider.
+    text("length_grapheme", Arity::exactly(1), Fixed::BigInt),
+    text("left_grapheme", Arity::exactly(2), Fixed::Varchar),
+    text("right_grapheme", Arity::exactly(2), Fixed::Varchar),
+    text("substring_grapheme", Arity::between(2, 3), Fixed::Varchar),
+    text("reverse", Arity::exactly(1), Fixed::Varchar),
+    text("regexp_escape", Arity::exactly(1), Fixed::Varchar),
     // Pattern matching. The transformer emits the operator spellings, so those are the names, and
     // `LIKE` is one of them rather than a keyword the binder has to know about separately.
     text("~~", Arity::exactly(2), Fixed::Boolean),
@@ -2877,6 +2885,13 @@ fn rewritten(
             declared(wanted, Varchar)
         }
         "base64" | "to_base64" => declared(vec![Blob], Varchar),
+        "reverse" | "regexp_escape" => declared(vec![Varchar], Varchar),
+        "length_grapheme" => declared(vec![Varchar], BigInt),
+        "left_grapheme" | "right_grapheme" | "substring_grapheme" => {
+            let mut wanted = vec![Varchar];
+            wanted.extend(arguments.iter().skip(1).map(|_| BigInt));
+            declared(wanted, Varchar)
+        }
         "concat_ws" => {
             let (separator, rest) = arguments.split_first()?;
             if !text(separator) {
@@ -3664,6 +3679,18 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("decode", &["decode(col0 BLOB) -> VARCHAR", "decode(col0 BLOB, col1 VARCHAR) -> VARCHAR"]),
     ("base64", &["base64(col0 BLOB) -> VARCHAR"]),
     ("to_base64", &["to_base64(col0 BLOB) -> VARCHAR"]),
+    ("length_grapheme", &["length_grapheme(col0 VARCHAR) -> BIGINT"]),
+    ("left_grapheme", &["left_grapheme(col0 VARCHAR, col1 BIGINT) -> VARCHAR"]),
+    ("right_grapheme", &["right_grapheme(col0 VARCHAR, col1 BIGINT) -> VARCHAR"]),
+    (
+        "substring_grapheme",
+        &[
+            "substring_grapheme(col0 VARCHAR, col1 BIGINT, col2 BIGINT) -> VARCHAR",
+            "substring_grapheme(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+        ],
+    ),
+    ("reverse", &["reverse(col0 VARCHAR) -> VARCHAR"]),
+    ("regexp_escape", &["regexp_escape(col0 VARCHAR) -> VARCHAR"]),
     ("format", &["format(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
     ("concat_ws", &["concat_ws(col0 VARCHAR, col1 ANY, [ANY...]) -> VARCHAR"]),
     (
@@ -4874,6 +4901,9 @@ mod tests {
                         arguments[1] = LogicalType::Integer;
                     }
                     _ if entry.name == "repeat" => arguments[1] = LogicalType::BigInt,
+                    _ if entry.name.ends_with("_grapheme") && count > 1 => {
+                        arguments[1..].fill(LogicalType::BigInt);
+                    }
                     _ if matches!(entry.name, "decode" | "base64" | "to_base64") => {
                         arguments[0] = LogicalType::Blob;
                     }

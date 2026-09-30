@@ -72,6 +72,7 @@ mod digest;
 pub mod fallback;
 mod general;
 mod glob;
+mod graphemes;
 mod hash;
 mod hashing;
 mod histogram;

@@ -3049,6 +3049,9 @@ fn declared_parameter(written: &str, at: usize, count: usize) -> Option<LogicalT
         _ if named("to_base") => Some(LogicalType::Integer),
         _ if named("bar") && (3..=4).contains(&count) => Some(LogicalType::Double),
         0 if named("decode") || named("base64") || named("to_base64") => Some(LogicalType::Blob),
+        1.. if ["left_grapheme", "right_grapheme", "substring_grapheme"].into_iter().any(named) => {
+            Some(LogicalType::BigInt)
+        }
         _ => None,
     }
 }
