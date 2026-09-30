@@ -89,6 +89,24 @@ pub fn cast_in_time_zone(
     if input.logical_type() == target {
         return Ok(input.clone());
     }
+    if let (LogicalType::Array(_, from), LogicalType::Array(_, into)) =
+        (input.logical_type(), target)
+        && from != into
+    {
+        return Err(Error::conversion(format!(
+            "Cannot cast array of size {from} to array of size {into}"
+        )));
+    }
+    // An array going to a list of the same element is the same rows, so it keeps them.
+    if let (LogicalType::Array(element, _), LogicalType::List(wanted)) =
+        (input.logical_type(), target)
+        && element == wanted
+    {
+        let relabeled = input.clone().relabeled(target.clone());
+        if relabeled.logical_type() == target {
+            return Ok(relabeled);
+        }
+    }
     if input.is_empty() {
         return Ok(Vector::constant(target.clone(), Value::Null, 0));
     }
@@ -736,6 +754,22 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
     if let (LogicalType::List(wanted), Value::List { values, .. }) = (target, value) {
         return to_list(values, wanted, try_cast);
     }
+    // An array is held as a list, so a list and an array going to an array are the same cast and
+    // differ only in who checked the length. An array of the wrong size is refused before a row is
+    // read, by `cast`, so the one that reaches here is a list.
+    if let (LogicalType::Array(wanted, size), Value::List { values, .. }) = (target, value) {
+        if values.len() != *size as usize {
+            return if try_cast {
+                Ok(Value::Null)
+            } else {
+                Err(Error::conversion(format!(
+                    "Cannot cast list with length {} to array with length {size}",
+                    values.len()
+                )))
+            };
+        }
+        return to_list(values, wanted, try_cast);
+    }
     if let (LogicalType::Struct(wanted), Value::Struct(fields)) = (target, value) {
         return to_struct(fields, wanted, try_cast);
     }
@@ -901,11 +935,11 @@ fn to_map(
     }
 }
 
-/// A list, a struct or a map read out of the text it prints as, or `None` when the target is none
-/// of those. The text is split by [`nested_text`] and every piece is cast to the type its place
-/// has, so `'[1, x]'` fails on the `x` as a cast of `'x'` to an integer would, and a `TRY_CAST`
-/// makes only that element null. Text that is not the shape at all is refused naming the whole
-/// string, or is a null under `TRY_CAST`.
+/// A list, an array, a struct or a map read out of the text it prints as, or `None` when the target
+/// is none of those. The text is split by [`nested_text`] and every piece is cast to the type its
+/// place has, so `'[1, x]'` fails on the `x` as a cast of `'x'` to an integer would, and a
+/// `TRY_CAST` makes only that element null. Text that is not the shape at all is refused naming the
+/// whole string, or is a null under `TRY_CAST`.
 fn from_text(text: &str, target: &LogicalType, try_cast: bool) -> Option<Result<Value>> {
     let piece = |piece: Option<String>, ty: &LogicalType| match piece {
         Some(piece) => cast_value(&Value::Varchar(piece), ty, try_cast),
@@ -916,6 +950,22 @@ fn from_text(text: &str, target: &LogicalType, try_cast: bool) -> Option<Result<
             let values = items.into_iter().map(|item| piece(item, element));
             Ok(Value::List { element: (**element).clone(), values: values.collect::<Result<_>>()? })
         }),
+        // Text that is not a list at all is refused in the same words as a list of the wrong
+        // length, which is the pin's.
+        LogicalType::Array(element, size) => {
+            match nested_text::list(text).filter(|items| items.len() == *size as usize) {
+                Some(items) => {
+                    let values = items.into_iter().map(|item| piece(item, element));
+                    let values = values.collect::<Result<_>>();
+                    Some(values.map(|values| Value::List { element: (**element).clone(), values }))
+                }
+                None if try_cast => Some(Ok(Value::Null)),
+                None => Some(Err(Error::conversion(format!(
+                    "Type VARCHAR with value '{text}' can't be cast to the destination type \
+                     {target}, the size of the array must match the destination type"
+                )))),
+            }
+        }
         LogicalType::Struct(wanted) => {
             let names: Vec<&str> = wanted.iter().map(|field| field.name.as_str()).collect();
             nested_text::fields(text, &names, Field::unnamed(wanted)).map(|found| {
@@ -988,6 +1038,11 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
         ))),
         // An enum value is its string, so a string that is one of the list is already the answer
         // and anything else that is not a string has no cast here, as it has none in the pin.
+        // Only a list and a string go into an array, and the pin has no cast from anything else.
+        LogicalType::Array(..) => Err(Error::conversion(format!(
+            "Unimplemented type for cast ({} -> {target})",
+            value.logical_type()
+        ))),
         LogicalType::Enum(labels) => match value {
             Value::Varchar(text) if labels.contains(text) => Ok(value.clone()),
             Value::Varchar(text) => Err(not_convertible(text, target)),
@@ -2551,9 +2606,9 @@ mod tests {
         let fitted = cast_value(&Value::BigInt(40_000), &LogicalType::SmallInt, true)
             .expect("try_cast swallows the range failure");
         assert_eq!(fitted, Value::Null);
-        let array = LogicalType::Array(Box::new(LogicalType::Integer), 3);
-        let error = cast_value(&Value::Integer(1), &array, true)
-            .expect_err("try_cast does not invent an array");
+        let union = LogicalType::Union(vec![Field::new("a", LogicalType::Integer)]);
+        let error = cast_value(&Value::Integer(1), &union, true)
+            .expect_err("try_cast does not invent a union");
         assert_eq!(error.code(), ErrorCode::NotImplemented);
     }
 
@@ -2788,9 +2843,9 @@ mod tests {
         let refused = cast_value(&Value::Date(0), &LogicalType::Integer, true)
             .expect("try_cast swallows a pair duckdb has no cast for");
         assert_eq!(refused, Value::Null);
-        let array = LogicalType::Array(Box::new(LogicalType::Integer), 3);
-        let error = cast_value(&Value::Integer(1), &array, true)
-            .expect_err("try_cast does not invent an array");
+        let union = LogicalType::Union(vec![Field::new("a", LogicalType::Integer)]);
+        let error = cast_value(&Value::Integer(1), &union, true)
+            .expect_err("try_cast does not invent a union");
         assert_eq!(error.code(), ErrorCode::NotImplemented);
     }
 

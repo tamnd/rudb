@@ -602,7 +602,7 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
     rows: usize,
 ) -> Result<Option<Vector>> {
     match (name, args) {
-        ("list_value", [_, ..]) => built(args, returns, rows),
+        ("list_value" | "array_value", [_, ..]) => built(args, returns, rows),
         ("range" | "generate_series", [_, ..]) => {
             series(name == "generate_series", args, returns, rows)
         }
@@ -637,7 +637,7 @@ fn built<V: AsRef<Vector>>(
     returns: &LogicalType,
     rows: usize,
 ) -> Result<Option<Vector>> {
-    let LogicalType::List(element) = returns else {
+    let (LogicalType::List(element) | LogicalType::Array(element, _)) = returns else {
         return Ok(None);
     };
     if nested_or_null(element) || args.iter().any(|arg| arg.as_ref().logical_type() != &**element) {
@@ -652,7 +652,7 @@ fn built<V: AsRef<Vector>>(
     let child = interleave(element, &pieces, &order)?;
     let count = entry(width)?;
     let entries = (0..rows).map(|row| Ok((entry(row * width)?, count))).collect::<Result<_>>()?;
-    Vector::list(entries, child).map(Some)
+    Ok(Some(Vector::list(entries, child)?.relabeled(returns.clone())))
 }
 
 /// `range` and `generate_series` over integer columns, with every row's series written straight

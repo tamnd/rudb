@@ -3934,9 +3934,9 @@ pub fn call_values(
     if let Some(value) = structs::value(name, args, returns)? {
         return Ok(value);
     }
-    if name == "list_value" {
-        let LogicalType::List(element) = returns else {
-            return Err(Error::internal(format!("list_value returning {returns}")));
+    if name == "list_value" || name == "array_value" {
+        let (LogicalType::List(element) | LogicalType::Array(element, _)) = returns else {
+            return Err(Error::internal(format!("{name} returning {returns}")));
         };
         return Ok(Value::List { element: (**element).clone(), values: args.to_vec() });
     }
