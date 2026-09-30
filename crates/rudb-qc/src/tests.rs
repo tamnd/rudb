@@ -578,11 +578,11 @@ fn fails_the_same(text: &str) -> Error {
 }
 
 #[test]
-fn a_function_the_first_engine_does_not_have_fails_the_same_way_on_both() {
-    // `md5` binds, since it is in the signature table, but no kernel computes it. The compiled
-    // engine used to refuse it by name. It runs it through a `vcall` now, and the kernel's error is
-    // the one the first engine raises.
-    fails_the_same(&format!("Project #1 [md5(#0.1::VARCHAR)::VARCHAR AS h]\n  {SCAN}"));
+fn a_kernel_error_through_a_vcall_is_the_error_the_first_engine_raises() {
+    // `from_base64` has no translator, so the compiled engine runs it through a `vcall`, and a
+    // string that is not base64 has to fail there with the kernel's error, which is the one the
+    // first engine raises.
+    fails_the_same(&format!("Project #1 [from_base64('YWJ'::VARCHAR)::BLOB AS h]\n  {SCAN}"));
 }
 
 #[test]

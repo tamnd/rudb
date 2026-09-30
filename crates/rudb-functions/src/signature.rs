@@ -797,6 +797,26 @@ const TABLE: &[Entry] = &[
     text("url_decode", Arity::exactly(1), Fixed::Varchar),
     text("bar", Arity::between(3, 4), Fixed::Varchar),
     text("to_base", Arity::between(2, 3), Fixed::Varchar),
+    // The digests and the functions that write bytes or numbers as text and read them back. Each
+    // has overloads over types other than strings, so these are read off by [`rewritten`] too, and
+    // every spelling has a row of its own so a refusal names the one that was written.
+    text("md5", Arity::exactly(1), Fixed::Varchar),
+    text("md5_number", Arity::exactly(1), Fixed::Varchar),
+    text("sha1", Arity::exactly(1), Fixed::Varchar),
+    text("sha256", Arity::exactly(1), Fixed::Varchar),
+    text("hex", Arity::exactly(1), Fixed::Varchar),
+    text("to_hex", Arity::exactly(1), Fixed::Varchar),
+    text("bin", Arity::exactly(1), Fixed::Varchar),
+    text("to_binary", Arity::exactly(1), Fixed::Varchar),
+    text("unhex", Arity::exactly(1), Fixed::Varchar),
+    text("from_hex", Arity::exactly(1), Fixed::Varchar),
+    text("unbin", Arity::exactly(1), Fixed::Varchar),
+    text("from_binary", Arity::exactly(1), Fixed::Varchar),
+    text("encode", Arity::exactly(1), Fixed::Varchar),
+    text("decode", Arity::between(1, 2), Fixed::Varchar),
+    text("base64", Arity::exactly(1), Fixed::Varchar),
+    text("to_base64", Arity::exactly(1), Fixed::Varchar),
+    text("from_base64", Arity::exactly(1), Fixed::Varchar),
     // Pattern matching. The transformer emits the operator spellings, so those are the names, and
     // `LIKE` is one of them rather than a keyword the binder has to know about separately.
     text("~~", Arity::exactly(2), Fixed::Boolean),
@@ -2787,17 +2807,25 @@ fn printed(arguments: &[LogicalType]) -> Option<Vec<LogicalType>> {
 /// one, since that is the one the pin picks, and a fixed size array repeats into a list.
 /// `concat_ws` casts a list to a list of strings and anything else to a string, and a list of lists
 /// is the pin's binder error rather than a cast.
+///
+/// `hex` and `bin` take a string, a blob for `hex` only, or a whole number, and a whole number up
+/// to a BIGINT is read as a BIGINT. A FLOAT or a DOUBLE is the pin's implicit cast to BIGNUM, which
+/// this engine does not have, so it is left as it is and the kernel writes the BIGNUM's bytes.
 fn rewritten(
     name: &str,
     arguments: &[LogicalType],
 ) -> Option<Result<(Vec<LogicalType>, LogicalType)>> {
-    use LogicalType::{Array, BigInt, Blob, Double, Integer, List, Null, Varchar};
+    use LogicalType::{
+        Array, BigInt, Blob, Double, Float, HugeInt, Integer, List, Null, SmallInt, TinyInt,
+        UBigInt, UHugeInt, UInteger, USmallInt, UTinyInt, Varchar,
+    };
     let text = |ty: &LogicalType| matches!(ty, Varchar | Null);
     let reaches = |ty: &LogicalType, wanted: &LogicalType| match wanted {
         Varchar => text(ty),
         List(element) => {
             *ty == Null || matches!(ty, List(held) | Array(held, _) if held == element)
         }
+        Blob => matches!(ty, Blob | Null),
         _ => *ty == Null || (ty.is_numeric() && ty.promote(wanted).as_ref() == Some(wanted)),
     };
     let declared = |wanted: Vec<LogicalType>, returns: LogicalType| {
@@ -2825,6 +2853,30 @@ fn rewritten(
             };
             declared(vec![held.clone(), BigInt], held)
         }
+        "md5" | "md5_number" | "sha1" | "sha256" => {
+            let returns = if name == "md5_number" { UHugeInt } else { Varchar };
+            let takes = if arguments == [Blob] { Blob } else { Varchar };
+            declared(vec![takes], returns)
+        }
+        "hex" | "to_hex" | "bin" | "to_binary" => {
+            let takes = match arguments {
+                [Varchar | Null] => Varchar,
+                [Blob] if matches!(name, "hex" | "to_hex") => Blob,
+                [ty @ (Float | Double | UBigInt | HugeInt | UHugeInt)] => ty.clone(),
+                [TinyInt | SmallInt | Integer | BigInt | UTinyInt | USmallInt | UInteger] => BigInt,
+                _ => return Some(Err(no_match(name, arguments))),
+            };
+            declared(vec![takes], Varchar)
+        }
+        "unhex" | "from_hex" | "unbin" | "from_binary" | "from_base64" | "encode" => {
+            declared(vec![Varchar], Blob)
+        }
+        "decode" => {
+            let mut wanted = vec![Blob];
+            wanted.extend(arguments.iter().skip(1).map(|_| Varchar));
+            declared(wanted, Varchar)
+        }
+        "base64" | "to_base64" => declared(vec![Blob], Varchar),
         "concat_ws" => {
             let (separator, rest) = arguments.split_first()?;
             if !text(separator) {
@@ -3553,6 +3605,65 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("path_join", &["path_join(col0 VARCHAR, [VARCHAR...]) -> VARCHAR"]),
+    ("md5", &["md5(col0 VARCHAR) -> VARCHAR", "md5(col0 BLOB) -> VARCHAR"]),
+    ("sha1", &["sha1(col0 VARCHAR) -> VARCHAR", "sha1(col0 BLOB) -> VARCHAR"]),
+    ("sha256", &["sha256(col0 VARCHAR) -> VARCHAR", "sha256(col0 BLOB) -> VARCHAR"]),
+    ("md5_number", &["md5_number(col0 VARCHAR) -> UHUGEINT", "md5_number(col0 BLOB) -> UHUGEINT"]),
+    (
+        "hex",
+        &[
+            "hex(col0 VARCHAR) -> VARCHAR",
+            "hex(col0 BIGNUM) -> VARCHAR",
+            "hex(col0 BLOB) -> VARCHAR",
+            "hex(col0 BIGINT) -> VARCHAR",
+            "hex(col0 UBIGINT) -> VARCHAR",
+            "hex(col0 HUGEINT) -> VARCHAR",
+            "hex(col0 UHUGEINT) -> VARCHAR",
+        ],
+    ),
+    (
+        "to_hex",
+        &[
+            "to_hex(col0 VARCHAR) -> VARCHAR",
+            "to_hex(col0 BIGNUM) -> VARCHAR",
+            "to_hex(col0 BLOB) -> VARCHAR",
+            "to_hex(col0 BIGINT) -> VARCHAR",
+            "to_hex(col0 UBIGINT) -> VARCHAR",
+            "to_hex(col0 HUGEINT) -> VARCHAR",
+            "to_hex(col0 UHUGEINT) -> VARCHAR",
+        ],
+    ),
+    (
+        "bin",
+        &[
+            "bin(col0 VARCHAR) -> VARCHAR",
+            "bin(col0 BIGNUM) -> VARCHAR",
+            "bin(col0 UBIGINT) -> VARCHAR",
+            "bin(col0 BIGINT) -> VARCHAR",
+            "bin(col0 HUGEINT) -> VARCHAR",
+            "bin(col0 UHUGEINT) -> VARCHAR",
+        ],
+    ),
+    (
+        "to_binary",
+        &[
+            "to_binary(col0 VARCHAR) -> VARCHAR",
+            "to_binary(col0 BIGNUM) -> VARCHAR",
+            "to_binary(col0 UBIGINT) -> VARCHAR",
+            "to_binary(col0 BIGINT) -> VARCHAR",
+            "to_binary(col0 HUGEINT) -> VARCHAR",
+            "to_binary(col0 UHUGEINT) -> VARCHAR",
+        ],
+    ),
+    ("unhex", &["unhex(col0 VARCHAR) -> BLOB"]),
+    ("from_hex", &["from_hex(col0 VARCHAR) -> BLOB"]),
+    ("unbin", &["unbin(col0 VARCHAR) -> BLOB"]),
+    ("from_binary", &["from_binary(col0 VARCHAR) -> BLOB"]),
+    ("encode", &["encode(col0 VARCHAR) -> BLOB"]),
+    ("from_base64", &["from_base64(col0 VARCHAR) -> BLOB"]),
+    ("decode", &["decode(col0 BLOB) -> VARCHAR", "decode(col0 BLOB, col1 VARCHAR) -> VARCHAR"]),
+    ("base64", &["base64(col0 BLOB) -> VARCHAR"]),
+    ("to_base64", &["to_base64(col0 BLOB) -> VARCHAR"]),
     ("format", &["format(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
     ("concat_ws", &["concat_ws(col0 VARCHAR, col1 ANY, [ANY...]) -> VARCHAR"]),
     (
@@ -4763,6 +4874,9 @@ mod tests {
                         arguments[1] = LogicalType::Integer;
                     }
                     _ if entry.name == "repeat" => arguments[1] = LogicalType::BigInt,
+                    _ if matches!(entry.name, "decode" | "base64" | "to_base64") => {
+                        arguments[0] = LogicalType::Blob;
+                    }
                     _ if entry.name == "bar" => arguments = vec![LogicalType::Double; count],
                     _ if entry.name == "to_base" => {
                         arguments = vec![LogicalType::Integer; count];
