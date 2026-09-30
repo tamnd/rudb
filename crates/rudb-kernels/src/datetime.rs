@@ -212,8 +212,10 @@ impl Part {
             Self::Era => i64::from(year > 0),
             Self::IsoYear => i64::from(iso_week(days).0),
             Self::YearWeek => {
+                // The week takes the sign of the year, so 44 BC in its eleventh week is -4311.
                 let (year, week) = iso_week(days);
-                i64::from(year) * 100 + i64::from(week)
+                let week = if year < 0 { -i64::from(week) } else { i64::from(week) };
+                i64::from(year) * 100 + week
             }
             // The two that carry a fraction are doubles, and the binder knows it: a call that asks
             // for either of them is a double call and never reaches this. Reaching it anyway is a
@@ -1892,6 +1894,15 @@ mod tests {
             let found = part(spelling).of_micros(moment()).expect("a part of a timestamp");
             assert_eq!(found, answer, "date_part('{spelling}', ...)");
         }
+    }
+
+    #[test]
+    fn a_year_week_before_the_common_era_is_negative_all_the_way_through() {
+        let at = |year, month, day| i64::from(days_from_civil(year, month, day)) * MICROS_PER_DAY;
+        let yearweek = part("yearweek");
+        assert_eq!(yearweek.of_micros(at(-43, 3, 15)).unwrap(), -4311);
+        assert_eq!(yearweek.of_micros(at(-1000, 3, 15)).unwrap(), -100_011);
+        assert_eq!(yearweek.of_micros(at(0, 1, 1)).unwrap(), -152);
     }
 
     #[test]
