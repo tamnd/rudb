@@ -106,6 +106,12 @@ pub struct Body {
     /// driver hands such a column as its dictionary's values and its codes when a morsel has it
     /// coded, and as its values and the codes `0, 1, 2, ...` when not.
     pub coded: Vec<usize>,
+    /// For an aggregate by one key column read through codes, that column. The driver hands the
+    /// body an array of group rows indexed by the key's code after [`Body::domains`] in the
+    /// morsel's column table, kept by each worker for as long as the column comes with the same
+    /// dictionary, or a null address for a morsel whose column is not coded. A row whose code has
+    /// a row there takes it without hashing, and the way through the hash fills the entry in.
+    pub keyed: Option<usize>,
 }
 
 /// A text column the driver hands the body as one `u16` a row: the index of the row's value in
@@ -430,6 +436,7 @@ fn pipeline(
     }
     reads.sort_unstable();
     let domains = domains(p, known);
+    let keyed = keyed(p, known, &domains, rt.ablate());
     let generic = Pass {
         name: &name,
         version: "generic",
@@ -437,6 +444,7 @@ fn pipeline(
         replay: None,
         known,
         domains: &domains,
+        keyed,
     };
     let (func, out, state, probes, made, _) =
         emit(stage, p, joins, module, rt, &reads, &likes, generic)?;
@@ -454,6 +462,7 @@ fn pipeline(
             replay: Some(&made),
             known,
             domains: &domains,
+            keyed,
         };
         if let Ok((f, o, st, pr, _, r)) = emit(stage, p, joins, module, rt, &reads, &likes, pass)
             && (&o, st, &pr) == (&out, state, &probes)
@@ -465,7 +474,35 @@ fn pipeline(
         }
     }
     let coded = reads.iter().copied().filter(|&c| known.get(c).is_some_and(|k| k.coded)).collect();
-    Ok(Body { func: name, reads, state, sink: out, probes, nonull, ranged, likes, domains, coded })
+    Ok(Body {
+        func: name,
+        reads,
+        state,
+        sink: out,
+        probes,
+        nonull,
+        ranged,
+        likes,
+        domains,
+        coded,
+        keyed,
+    })
+}
+
+/// The one group key column of `p` whose codes can index an array of group rows: a text column,
+/// which is always read through codes, or one the statistics say is mostly coded. Not when the
+/// key is in [`Body::domains`], whose array does the same from the statistics' values.
+fn keyed(p: &Pipeline, known: &[Known], domains: &[Domain], ablate: Ablate) -> Option<usize> {
+    let Sink::Aggregate { groups, .. } = &p.sink else { return None };
+    let [key] = groups.as_slice() else { return None };
+    let Kind::Column(c) = key.kind else { return None };
+    // A column a probe brings is not in the morsel, and has no codes.
+    if c >= p.source.columns().len() {
+        return None;
+    }
+    let text = qir_type(&key.ty).is_ok_and(|ty| ty == Ty::Str16);
+    let coded = text || known.get(c).is_some_and(|k| k.coded);
+    (coded && domains.is_empty() && !ablate.off(Ablate::KEYED)).then_some(c)
 }
 
 /// The most entries the array of [`Grouping::dense`] has.
@@ -557,6 +594,8 @@ struct Pass<'a> {
     known: &'a [Known],
     /// The group key columns the body reads as indexes.
     domains: &'a [Domain],
+    /// The group key column whose codes index the array of [`Body::keyed`].
+    keyed: Option<usize>,
 }
 
 /// A pipeline's function, its sink, the bytes of state it needs, its probes, the handles it made
@@ -595,6 +634,7 @@ fn emit(
         known: pass.known,
         ranged: Vec::new(),
         dense: Vec::new(),
+        keyed: None,
     };
     g.b.func_mut().state.push(Field { offset: 0, size: HEADER, name: "header".into() });
 
@@ -627,6 +667,13 @@ fn emit(
         let values = g.b.load(Ty::Ptr, table, Val::NONE, 1, at, INV);
         let codes = g.b.load(Ty::Ptr, table, Val::NONE, 1, at + COL_CODES, INV);
         g.dense.push((values, codes, d.values.len() as u32));
+    }
+    if let Some(c) = pass.keyed
+        && let Some(&(_, _, _, Some(codes))) = g.cols.get(&c)
+    {
+        let at = (reads.len() + likes.len() + pass.domains.len()) as i32 * COL_SIZE;
+        let rows = g.b.load(Ty::Ptr, table, Val::NONE, 1, at, INV);
+        g.keyed = Some((rows, codes));
     }
     let fans_out = p.probes().next().is_some();
     let (out, state) = g.prepare_sink(&p.sink, fans_out)?;
@@ -742,6 +789,8 @@ struct Gen<'a> {
     /// Per group key column read as an index, the address of the indexes, of the codes they are
     /// read through, and how many values the column has.
     dense: Vec<(Val, Val, u32)>,
+    /// The address of the array of [`Body::keyed`] and of the codes that index it.
+    keyed: Option<(Val, Val)>,
 }
 
 /// A value and whether it is valid.
@@ -2076,6 +2125,12 @@ impl Gen<'_> {
                         // bytes as it finds the same group, so its row is taken again.
                         let done = self.b.block(&[(Ty::Ptr, "row")]);
                         let dense = g.dense.map(|at| self.dense_row(at, done));
+                        let keyed = match self.keyed {
+                            Some((rows, codes)) if g.runs.is_none() => {
+                                Some(self.keyed_row(rows, codes, values[0].1, done))
+                            }
+                            _ => None,
+                        };
                         if let Some(last) = g.last {
                             let seen = self.b.load(Ty::I64, st, Val::NONE, 1, last as i32, 0);
                             let zero = self.b.int(Ty::I64, 0);
@@ -2144,6 +2199,15 @@ impl Gen<'_> {
                             };
                             if let Some(last) = g.last {
                                 self.b.store(st, Val::NONE, 1, last as i32, row, 0);
+                            }
+                            if let Some((entry, used)) = keyed {
+                                let (fill, on) = (self.b.block(&[]), self.b.block(&[]));
+                                self.b.brif(used, fill, &[], on, &[]);
+                                self.b.switch_to(fill);
+                                let row = self.b.conv(Op::Bitcast, row, Ty::I64);
+                                self.b.store(entry, Val::NONE, 1, 0, row, 0);
+                                self.b.br(on, &[]);
+                                self.b.switch_to(on);
                             }
                             if let (Some(at), Some((slot, known))) = (g.dense, dense) {
                                 // A key with a value not in the domains stores a zero in the entry
@@ -2238,6 +2302,31 @@ impl Gen<'_> {
             self.b.store(st, Val::NONE, 1, last as i32, row, 0);
         }
         row
+    }
+
+    /// Looks the row's key up in the array of [`Body::keyed`] at `rows` by its code, and goes to
+    /// `done` with the group row when the code has one. A null key and a morsel with no array
+    /// take the way through the hash. Returns the entry's address and whether the array is used,
+    /// for that way to fill the entry in.
+    fn keyed_row(&mut self, rows: Val, codes: Val, ok: Val, done: Block) -> (Val, Val) {
+        let word = self.b.conv(Op::Bitcast, rows, Ty::I64);
+        let zero = self.b.int(Ty::I64, 0);
+        let held = self.b.bin(Op::IcmpNe, word, zero);
+        let used = self.b.bin(Op::And, held, ok);
+        let code = self.code(codes);
+        let eight = self.b.int(Ty::I64, 8);
+        let bytes = self.b.bin(Op::Mul, code, eight);
+        let entry = self.b.bin(Op::Add, word, bytes);
+        let entry = self.b.conv(Op::Bitcast, entry, Ty::Ptr);
+        let (look, miss) = (self.b.block(&[]), self.b.block(&[]));
+        self.b.brif(used, look, &[], miss, &[]);
+        self.b.switch_to(look);
+        let row = self.b.load(Ty::I64, entry, Val::NONE, 1, 0, 0);
+        let hit = self.b.bin(Op::IcmpNe, row, zero);
+        let row = self.b.conv(Op::Bitcast, row, Ty::Ptr);
+        self.b.brif(hit, done, &[row], miss, &[]);
+        self.b.switch_to(miss);
+        (entry, used)
     }
 
     /// Looks the row's key up in the array of [`Grouping::dense`] at `at`, and goes to `done` with
