@@ -5079,7 +5079,7 @@ struct NativeText {
     /// a little early, which is the harmless direction, and it costs one relaxed add a block rather
     /// than a lock on the path every scan of a string column goes through.
     payload_kept: AtomicUsize,
-    /// Which payload blocks a sweep has decoded before, one flag a block.
+    /// Which payload blocks a sweep or a visit has decoded before, one flag a block.
     ///
     /// A sweep keeps a block the second time it decodes it and not the first. A process that runs
     /// one statement, which is how a benchmark or a script uses the engine, sweeps each block once
@@ -6014,17 +6014,21 @@ impl TextSource for NativeText {
         Ok(())
     }
 
-    /// Each block the indices land in, decoded once and dropped, or read where it is already kept.
+    /// Each block the indices land in, decoded once for the call, or read where it is already kept.
     ///
-    /// Never kept, unlike [`Self::sweep`] under its budget, because a scattered read is a one off:
-    /// a synopsis turned into values is turned once and remembered by the reader as values, a few
-    /// kilobytes, where the blocks it went through are megabytes nobody asks for again.
+    /// Kept the way [`Self::sweep`] keeps, the second time a block is decoded and under the budget,
+    /// so a read that comes once keeps nothing. A synopsis turned into values is turned once and
+    /// remembered by the reader as values. A `LIKE` is not: the memo it fills belongs to its
+    /// statement, so the same blocks are asked for again by the next statement, and by each arm of
+    /// an `OR` of patterns in the same one. Never keeping them had JOB 14b decode the blocks of
+    /// `title` its three patterns touch three times a run, a quarter of the query.
     fn visit(
         &self,
         indices: &[usize],
         body: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
     ) -> Result<()> {
         let mut at = 0;
+        let mut decoded = Vec::new();
         while at < indices.len() {
             let block = indices[at] / TEXT_PAYLOAD_VALUES;
             let upto =
@@ -6033,14 +6037,7 @@ impl TextSource for NativeText {
             if wanted.iter().any(|&index| index >= self.values) {
                 return Err(invalid("a visited value is past the global dictionary"));
             }
-            let decoded;
-            let bytes: &[u8] = match self.blocks.get(block).and_then(OnceLock::get) {
-                Some(Ok(kept)) => kept,
-                _ => {
-                    decoded = self.decode_block(block)?;
-                    &decoded
-                }
-            };
+            let bytes = self.loaned_block(block, &mut decoded, false)?;
             for (offset, &index) in wanted.iter().enumerate() {
                 let (start, end) = self.span_within(index)?;
                 let value = bytes
@@ -8170,6 +8167,67 @@ impl Reader {
                     .filter(|&row| held[row] != negated && valid(row))
                     .map(|row| row as u32)
                     .collect(),
+            ))
+        })
+    }
+
+    /// The rows of one text part whose value is one of `literals`, nulls not among them, answered
+    /// on the compressed page by comparing codes. `None` for a part that is not compressed text,
+    /// which the caller reads the usual way. See [`string::equals_in`].
+    ///
+    /// # Errors
+    ///
+    /// If a part, column, page, or checksum is invalid.
+    pub fn rows_equal(
+        &self,
+        part: usize,
+        column: usize,
+        literals: &[&[u8]],
+    ) -> Result<Option<Vec<u32>>> {
+        let place = *self.places.get(part).ok_or_else(|| invalid("part index out of range"))?;
+        let field =
+            self.table.fields.get(column).ok_or_else(|| invalid("column index out of range"))?;
+        if field.ty != LogicalType::Varchar {
+            return Ok(None);
+        }
+        let rows = place.rows as usize;
+        // Comparing codes beats decoding the part once, and loses to a part decoded and held. So
+        // this pays the rent of a whole read, see [`PartSlot`], and steps aside for the usual read
+        // once the part is held or the next whole read would hold it. JOB 18a compared the codes of
+        // `cast_info.note` on every warm run and spent half again what the held strings cost.
+        if let Some(Ok(slot)) = self.cache.made(column, part).map(Mutex::lock) {
+            match *slot {
+                PartSlot::Held { .. } => return Ok(None),
+                PartSlot::Seen(before) if before >= rows => return Ok(None),
+                PartSlot::Seen(_) | PartSlot::Unseen => {}
+            }
+        }
+        self.with_part(part, column, |bytes| {
+            if bytes.first() != Some(&6) {
+                return Ok(None);
+            }
+            self.pay(part, column, rows);
+            let mut cur = Cursor::new(bytes);
+            cur.u8()?;
+            let mask = match cur.u8()? {
+                0 => None,
+                1 => return Ok(Some(Vec::new())),
+                2 => {
+                    let from = cur.at;
+                    cur.take(rows.div_ceil(8))?;
+                    Some(&bytes[from..cur.at])
+                }
+                _ => return Err(invalid("page validity tag differs")),
+            };
+            let Some(held) = string::equals_in(&bytes[cur.at..], literals)? else {
+                return Ok(None);
+            };
+            if held.len() != rows {
+                return Err(invalid("compressed text page holds the wrong number of rows"));
+            }
+            let valid = |row: usize| mask.is_none_or(|mask| mask[row / 8] >> (row % 8) & 1 == 1);
+            Ok(Some(
+                (0..rows).filter(|&row| held[row] && valid(row)).map(|row| row as u32).collect(),
             ))
         })
     }
@@ -18573,6 +18631,57 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
+    /// A visit keeps what it decodes the way a sweep does, nothing the first time and every block
+    /// it lands in the second, since a `LIKE` asks for the same blocks again in the next statement.
+    #[test]
+    fn a_second_visit_of_the_same_values_keeps_the_blocks_it_decoded() {
+        let path = path("dictionary-visit");
+        let spellings = (0..2_500)
+            .map(|index| Value::Varchar(format!("value {index:08} {}", "y".repeat(index % 30))))
+            .collect::<Vec<_>>();
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in spellings.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        let indices = (0..dictionary.len()).step_by(7).collect::<Vec<_>>();
+        let resting = dictionary.footprint();
+        let visit = || {
+            let mut seen = Vec::new();
+            dictionary
+                .visit_text_once(&indices, &mut |at: usize, text: &[u8]| {
+                    assert_eq!(at, seen.len(), "a visit hands its values over in order");
+                    seen.push(text.to_vec());
+                    Ok(())
+                })
+                .expect("a visit reads");
+            seen
+        };
+        let seen = visit();
+        assert_eq!(dictionary.footprint(), resting, "a first visit keeps nothing it decoded");
+        assert_eq!(visit(), seen, "a second visit reads what the first did");
+        assert!(dictionary.footprint() > resting, "a second visit keeps what it decoded");
+        assert_eq!(visit(), seen, "the kept blocks answer the same");
+        let read = indices
+            .iter()
+            .map(|&code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(seen, read, "a visit answers what a point read answers");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
     #[test]
     fn a_narrow_signature_of_an_older_file_answers_by_its_own_width() {
         let path = path("narrow-substring-signature");
@@ -18992,6 +19101,46 @@ mod tests {
         let sequence = Sequence::new(&[b"a".as_slice()]).expect("a sequence");
         reader.rows_holding(0, 1, slice::from_ref(&sequence), false).expect("answered");
         assert!(reader.is_verified(1), "the LIKE checked the text part");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// An equality on the compressed text pays toward holding the part the way a whole read does,
+    /// and leaves the part to the usual read once that read would hold it, and after.
+    #[test]
+    fn an_equality_on_the_compressed_text_gives_way_to_the_held_part() {
+        let path = path("equal-held");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        let words = ["carefully", "final", "deposits", "sleep", "furiously", "quickly", "among"];
+        // More rows than the writer samples before it decides, all of them new, so the column
+        // drops its dictionary and the part is compressed text.
+        let text: Vec<Value> = (0..5_000_usize)
+            .map(|row| {
+                let pick = |at: usize| words[(row * 7 + at * 3) % words.len()];
+                Value::Varchar(format!("{} {} {} number {row}", pick(0), pick(1), pick(2)))
+            })
+            .collect();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::Varchar, &text).expect("text")])
+                .expect("one column");
+        writer.append(&chunk).expect("one part");
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("items").expect("items");
+        let Value::Varchar(wanted) = &text[1_234] else { unreachable!() };
+        let literals = [wanted.as_bytes(), b"nowhere".as_slice()];
+        let first = a.rows_equal(0, 0, &literals).expect("answered");
+        assert_eq!(first, Some(vec![1_234]), "a first equality compares codes");
+        let slot = || a.cache.slot(0, 0).expect("made").lock().expect("the slot");
+        assert!(matches!(*slot(), PartSlot::Seen(rows) if rows > 1_234), "and pays a whole read");
+        assert_eq!(a.rows_equal(0, 0, &literals).expect("answered"), None, "then gives way");
+        a.read(0, &[0]).expect("a part");
+        assert!(matches!(*slot(), PartSlot::Held { .. }), "to a read that holds the part");
+        assert_eq!(a.rows_equal(0, 0, &literals).expect("answered"), None, "and stays out");
+        drop((a, catalog));
         fs::remove_file(path).expect("remove scratch file");
     }
 

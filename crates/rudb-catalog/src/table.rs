@@ -990,6 +990,28 @@ impl Rows {
         }
     }
 
+    /// The rows of one part whose string column `column` is one of `literals`, nulls not among
+    /// them, when the part can say without its strings being read. `None` when it cannot, as for
+    /// [`Self::rows_holding`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`].
+    pub fn rows_equal(
+        &self,
+        at: usize,
+        column: usize,
+        literals: &[&[u8]],
+    ) -> Result<Option<Vec<u32>>> {
+        match self {
+            Self::Native(reader) => reader.rows_equal(at, column, literals),
+            Self::Grown(reader, _) if at < reader.parts() => {
+                reader.rows_equal(at, column, literals)
+            }
+            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
+        }
+    }
+
     /// Whether statistics prove this chunk cannot match.
     #[must_use]
     pub fn skips(&self, at: usize, probes: &[Probe]) -> bool {

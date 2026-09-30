@@ -347,6 +347,55 @@ pub fn holds_in_where(
     Ok(Some(held))
 }
 
+/// Which values of a compressed chunk are one of `literals`, compared on the codes, or `None` for
+/// a chunk of another kind.
+///
+/// Compressing is a function of the table and the bytes, so a value is a literal exactly when its
+/// run is the literal compressed against the chunk's table. Each literal is compressed once and
+/// every run is a length check and, for the few of the right length, a compare of a few bytes.
+/// Nothing is decompressed. On JOB this is `movie_info.info IN ('Sweden', 'Norway', ...)` over the
+/// stripes written after the column's dictionary stopped taking values, where decompressing six
+/// million values to compare them was most of the scan.
+///
+/// # Errors
+///
+/// As [`decode`].
+pub fn equals_in(bytes: &[u8], literals: &[&[u8]]) -> Result<Option<Vec<bool>>> {
+    if bytes.first() != Some(&Kind::Fsst.tag()) {
+        return Ok(None);
+    }
+    let mut reader = Reader::new(bytes);
+    reader.u8()?;
+    let count = reader.u32()? as usize;
+    let runs = read_compressed(&mut reader, count)?;
+    let mut wanted: Vec<Vec<u8>> = literals
+        .iter()
+        .map(|literal| {
+            let mut codes = Vec::with_capacity(literal.len() * 2);
+            runs.table.compress(literal, &mut codes);
+            codes
+        })
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut held = Vec::with_capacity(count);
+    let mut payload = runs.payload;
+    for &run in &runs.lengths {
+        let Some((codes, rest)) = payload.split_at_checked(run) else {
+            return Err(Error::internal("a compressed run is past the end of its chunk"));
+        };
+        payload = rest;
+        held.push(wanted.iter().any(|one| one.as_slice() == codes));
+    }
+    if reader.remaining() != 0 {
+        return Err(Error::internal(format!(
+            "{} bytes left over after decoding a string chunk",
+            reader.remaining()
+        )));
+    }
+    Ok(Some(held))
+}
+
 /// Whether [`decode_flat_at`] reads a few values of this chunk for less than decoding all of it,
 /// which only a compressed chunk does. Every other kind is decoded whole and picked from.
 #[must_use]
@@ -1433,6 +1482,31 @@ mod tests {
         }
         let fsst = encode_only(Kind::Fsst, &refs).expect("encoded").expect("compressible");
         assert_eq!(decode_flat_at(&fsst, &positions).expect("decoded").into_values(), wanted);
+    }
+
+    /// An equality on the codes picks out the values a compare of the strings would, through a
+    /// column table too, and a chunk of another kind is left to the caller.
+    #[test]
+    fn equals_in_answers_what_comparing_the_strings_answers() {
+        let mut values = urls(1000);
+        values[7] = b"Sweden".to_vec();
+        values[500] = b"Sweden".to_vec();
+        values[901] = Vec::new();
+        let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        let literals: [&[u8]; 4] = [b"Sweden", refs[3], refs[998], b"not there at all"];
+        let wanted: Vec<bool> = refs.iter().map(|value| literals.contains(value)).collect();
+        let fsst = encode_only(Kind::Fsst, &refs).expect("encoded").expect("compressible");
+        assert_eq!(equals_in(&fsst, &literals).expect("answered"), Some(wanted.clone()));
+        assert_eq!(equals_in(&fsst, &[]).expect("answered"), Some(vec![false; 1000]));
+        let empty = equals_in(&fsst, &[b"".as_slice()]).expect("answered").expect("fsst");
+        assert!(empty[901] && empty.iter().filter(|&&one| one).count() == 1);
+        let shape = with_symbols(front_lz(), &[refs[..512].to_vec()]);
+        let shared = encode_with(&refs, &shape).expect("encoded");
+        if let Some(held) = equals_in(&shared, &literals).expect("answered") {
+            assert_eq!(held, wanted, "against the column table");
+        }
+        let plain = encode_only(Kind::Plain, &refs).expect("encoded").expect("plain");
+        assert_eq!(equals_in(&plain, &literals).expect("answered"), None);
     }
 
     fn front_lz() -> Settled {

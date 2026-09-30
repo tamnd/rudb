@@ -533,7 +533,9 @@ impl Rids {
                     .collect()
             }
             Body::Dense { words, .. } => {
-                let mut out = Vec::new();
+                // Counted first, because pushing onto an empty vector grew it several times a part,
+                // and a reduced scan of `cast_info` in JOB asks this of four thousand parts.
+                let mut out = Vec::with_capacity(self.count_in(first, len));
                 let mut at = first;
                 while at < end {
                     let word = words.get(index(at / 64)).copied().unwrap_or(0) >> (at % 64);
@@ -546,6 +548,38 @@ impl Rids {
                     at += span;
                 }
                 out
+            }
+        }
+    }
+
+    /// How many members there are from `first` for `len` rows, which is the length
+    /// [`Self::offsets_in`] answers with, without writing them down.
+    #[must_use]
+    pub fn count_in(&self, first: Rid, len: usize) -> usize {
+        let end = first.saturating_add(count(len)).min(self.rows);
+        if first >= end {
+            return 0;
+        }
+        match &self.body {
+            Body::Full => index(end - first),
+            Body::Sparse(members) => {
+                members.partition_point(|&member| member < end)
+                    - members.partition_point(|&member| member < first)
+            }
+            Body::Dense { words, .. } => {
+                let (low, high) = (first / 64, (end - 1) / 64);
+                let mut held = 0;
+                for at in low..=high {
+                    let mut word = words.get(index(at)).copied().unwrap_or(0);
+                    if at == low {
+                        word &= u64::MAX << (first % 64);
+                    }
+                    if at == high {
+                        word &= u64::MAX >> (63 - (end - 1) % 64);
+                    }
+                    held += word.count_ones() as usize;
+                }
+                held
             }
         }
     }
@@ -770,6 +804,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let len = usize::try_from(len).expect("small");
             assert_eq!(set.offsets_in(first, len), slow, "from {first} for {len}");
+            assert_eq!(set.count_in(first, len), slow.len(), "counted from {first} for {len}");
         }
     }
 
@@ -1032,6 +1067,7 @@ mod tests {
                     "{:?}",
                     set.form()
                 );
+                assert_eq!(set.count_in(first, index(u64::from(len))), expected.len());
             }
         }
     }

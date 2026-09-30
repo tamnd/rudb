@@ -986,8 +986,8 @@ impl Late {
     }
 }
 
-/// A filter that is one `LIKE '%a%b%'` on a string column, or an `OR` of them, answered by the
-/// pages rather than by the strings.
+/// A filter that is one `LIKE '%a%b%'` on a string column, or an `OR` of them, or one equality
+/// with a string or an `IN` list of them, answered by the pages rather than by the strings.
 #[derive(Debug)]
 struct Stored {
     /// The column, in the scan's numbering.
@@ -995,6 +995,8 @@ struct Stored {
     /// The patterns, any one of which keeps a row.
     sequences: Vec<Sequence>,
     negated: bool,
+    /// The values, any one of which keeps a row, for an equality instead of patterns.
+    equals: Vec<Vec<u8>>,
 }
 
 /// The column, the pieces and whether it is a `NOT LIKE`, when `predicate` is a `LIKE` whose pattern
@@ -1008,6 +1010,10 @@ struct Stored {
 /// pages leave it out already. JOB 20c asks `chn.name IS NOT NULL AND (chn.name LIKE '%man%' OR
 /// chn.name LIKE '%Man%')` of three million names, and decompressing them to search them was half
 /// the query.
+///
+/// An `IN` list of strings is an `OR` of equalities by now and comes here the same way, answered
+/// by comparing codes. JOB asks that of `movie_info.info` in a third of its queries, and part of
+/// that column is compressed text rather than a dictionary.
 fn stored_like(plan: &Plan, schema: &Schema, predicate: ExprRef) -> Option<Stored> {
     let conjuncts = match *plan.expr(predicate) {
         Expr::Conjunction { op: ConjunctionOp::And, children } => plan.expr_list(children).to_vec(),
@@ -1025,21 +1031,38 @@ fn stored_like(plan: &Plan, schema: &Schema, predicate: ExprRef) -> Option<Store
         }
         found = Some(match *plan.expr(conjunct) {
             Expr::Conjunction { op: ConjunctionOp::Or, children } => {
+                let children = plan.expr_list(children);
                 let mut input = None;
                 let mut sequences = Vec::new();
-                for &child in plan.expr_list(children) {
-                    let (column, sequence, negated) = one_like(plan, schema, child)?;
-                    if negated || input.is_some_and(|input| input != column) {
-                        return None;
+                let mut equals = Vec::new();
+                if one_equal(plan, schema, children[0]).is_some() {
+                    for &child in children {
+                        let (column, value) = one_equal(plan, schema, child)?;
+                        if input.is_some_and(|input| input != column) {
+                            return None;
+                        }
+                        input = Some(column);
+                        equals.push(value);
                     }
-                    input = Some(column);
-                    sequences.push(sequence);
+                } else {
+                    for &child in children {
+                        let (column, sequence, negated) = one_like(plan, schema, child)?;
+                        if negated || input.is_some_and(|input| input != column) {
+                            return None;
+                        }
+                        input = Some(column);
+                        sequences.push(sequence);
+                    }
                 }
-                Stored { input: input?, sequences, negated: false }
+                Stored { input: input?, sequences, negated: false, equals }
             }
             _ => {
-                let (input, sequence, negated) = one_like(plan, schema, conjunct)?;
-                Stored { input, sequences: vec![sequence], negated }
+                if let Some((input, value)) = one_equal(plan, schema, conjunct) {
+                    Stored { input, sequences: Vec::new(), negated: false, equals: vec![value] }
+                } else {
+                    let (input, sequence, negated) = one_like(plan, schema, conjunct)?;
+                    Stored { input, sequences: vec![sequence], negated, equals: Vec::new() }
+                }
             }
         });
     }
@@ -1061,6 +1084,25 @@ fn present_column(plan: &Plan, schema: &Schema, predicate: ExprRef) -> Option<us
         return None;
     }
     schema.position_of(binding)
+}
+
+/// One equality of [`stored_like`] between a string column and a string, as the column and the
+/// string's bytes.
+fn one_equal(plan: &Plan, schema: &Schema, predicate: ExprRef) -> Option<(usize, Vec<u8>)> {
+    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(predicate) else {
+        return None;
+    };
+    let (column, constant) = match (plan.expr(left), plan.expr(right)) {
+        (Expr::Column(binding), Expr::Constant(value)) => (*binding, *value),
+        (Expr::Constant(value), Expr::Column(binding)) => (*binding, *value),
+        _ => return None,
+    };
+    let Value::Varchar(spelling) = plan.value(constant) else { return None };
+    let input = schema.position_of(column)?;
+    if schema.types().get(input) != Some(&LogicalType::Varchar) {
+        return None;
+    }
+    Some((input, spelling.as_bytes().to_vec()))
 }
 
 /// One `LIKE` of [`stored_like`], as its column, its pieces and whether it is negated.
@@ -1496,10 +1538,12 @@ impl<'a> Scan<'a> {
             return Ok(false);
         };
         let len = self.table.rows().chunk_len(at)?;
-        let positions = rows.offsets_in(first, len);
-        if positions.len().saturating_mul(SPARSE_READ) > len {
+        // Counted before the offsets are written down, since a part past the line reads whole and
+        // would throw them away.
+        if rows.count_in(first, len).saturating_mul(SPARSE_READ) > len {
             return Ok(false);
         }
+        let positions = rows.offsets_in(first, len);
         let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
         let read = self.table.rows().read_rows(at, &projected, &positions)?;
         let kept = positions.len();
@@ -1590,7 +1634,12 @@ impl<'a> Scan<'a> {
         let rows = self.table.rows();
         // A LIKE answered on the pages is string work, and it is the whole of the filter here.
         let searching = stage::Timing::start(Stage::Strings);
-        let holding = rows.rows_holding(at, column, &stored.sequences, stored.negated);
+        let holding = if stored.equals.is_empty() {
+            rows.rows_holding(at, column, &stored.sequences, stored.negated)
+        } else {
+            let literals: Vec<&[u8]> = stored.equals.iter().map(Vec::as_slice).collect();
+            rows.rows_equal(at, column, &literals)
+        };
         searching.stop(0);
         let Some(kept) = holding? else {
             return Ok(false);
@@ -4717,10 +4766,9 @@ mod tests {
                 &Session::default(),
             )
             .expect("two projected columns");
-            scan.pushed
-                .as_ref()
-                .and_then(|pushed| pushed.stored.as_ref())
-                .map(|stored| (stored.input, stored.sequences.len(), stored.negated))
+            scan.pushed.as_ref().and_then(|pushed| pushed.stored.as_ref()).map(|stored| {
+                (stored.input, stored.sequences.len() + stored.equals.len(), stored.negated)
+            })
         };
         let man = "(\"~~\"(#0.0::VARCHAR, '%man%'::VARCHAR)::BOOLEAN OR \
                    \"~~\"(#0.0::VARCHAR, '%Man%'::VARCHAR)::BOOLEAN)::BOOLEAN";
@@ -4733,6 +4781,15 @@ mod tests {
         assert_eq!(stored(&mixed), None, "two columns");
         let kind = "(#0.1::VARCHAR IS DISTINCT FROM NULL::VARCHAR)::BOOLEAN";
         assert_eq!(stored(&format!("({kind} AND {man})::BOOLEAN")), None, "a second column");
+        let sweden = "(#0.0::VARCHAR = 'Sweden'::VARCHAR)::BOOLEAN";
+        let norway = "('Norway'::VARCHAR = #0.0::VARCHAR)::BOOLEAN";
+        assert_eq!(stored(sweden), Some((0, 1, false)), "one equality");
+        assert_eq!(stored(&format!("({sweden} OR {norway})::BOOLEAN")), Some((0, 2, false)));
+        let mixed =
+            format!("({sweden} OR \"~~\"(#0.0::VARCHAR, '%man%'::VARCHAR)::BOOLEAN)::BOOLEAN");
+        assert_eq!(stored(&mixed), None, "an equality and a LIKE");
+        let elsewhere = "(#0.1::VARCHAR = 'Sweden'::VARCHAR)::BOOLEAN";
+        assert_eq!(stored(&format!("({sweden} OR {elsewhere})::BOOLEAN")), None, "two columns");
     }
 
     /// A necessary LIKE can read one column first without changing the full AND answer.

@@ -1712,6 +1712,11 @@ fn narrow(
         Node::Get { catalog, schema, table, alias, index: fresh, columns: kept },
         span,
     );
+    // The bounds follow the scan to its new index, since they are looked up by it and the estimates
+    // over the filters below would otherwise fall back to the default.
+    if let Some(zones) = plan.zones(relation.index).cloned() {
+        plan.set_zones(fresh, zones);
+    }
     if relation.local.is_empty() {
         return scan;
     }
