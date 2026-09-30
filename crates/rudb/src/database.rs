@@ -1805,9 +1805,20 @@ fn replay_statement(runner: &mut Option<Database>, catalog: &mut Catalog, sql: &
 /// schema change, which runs against the catalog as the changes before it left it.
 fn replay_changes(catalog: &mut Catalog, changes: Vec<Replayed>) -> Result<()> {
     let mut held: Vec<(QualifiedName, Vec<Chunk>)> = Vec::new();
+    // Plain appends to a table nothing else has touched yet, gathered so they go in a batch at a
+    // time. An append counts its statistics on as many threads as it is given, and a log of small
+    // inserts replayed one record at a time spent most of its open doing that on one.
+    let mut appends: Vec<(QualifiedName, Vec<Chunk>)> = Vec::new();
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let flush = |catalog: &mut Catalog, name: &QualifiedName, chunks: Vec<Chunk>| {
+        catalog.table_mut(name)?.append_all(chunks, workers)
+    };
     let mut runner = None;
     for replayed in changes {
         if let Some(sql) = replayed.statement()? {
+            for (name, chunks) in appends.drain(..) {
+                flush(catalog, &name, chunks)?;
+            }
             for (name, chunks) in held.drain(..) {
                 catalog.table_mut(&name)?.replace_all(chunks, 1)?;
             }
@@ -1825,11 +1836,27 @@ fn replay_changes(catalog: &mut Catalog, changes: Vec<Replayed>) -> Result<()> {
             Some(at) => at,
             None if replayed.appends() => {
                 if let Change::Insert(chunk) = change {
-                    catalog.table_mut(&name)?.append_all(vec![chunk], 1)?;
+                    let at = match appends.iter().position(|(pending, _)| *pending == name) {
+                        Some(at) => at,
+                        None => {
+                            appends.push((name, Vec::new()));
+                            appends.len() - 1
+                        }
+                    };
+                    appends[at].1.push(chunk);
+                    if appends[at].1.len() >= APPEND_BATCH {
+                        let (name, chunks) = appends.swap_remove(at);
+                        flush(catalog, &name, chunks)?;
+                    }
                 }
                 continue;
             }
             None => {
+                // The table's own appends go in first, because the change reads its rows.
+                if let Some(at) = appends.iter().position(|(pending, _)| *pending == name) {
+                    let (name, chunks) = appends.swap_remove(at);
+                    flush(catalog, &name, chunks)?;
+                }
                 let rows = catalog.table(&name)?.rows();
                 let all = (0..fields.len()).collect::<Vec<_>>();
                 let chunks = (0..rows.chunk_count())
@@ -1841,11 +1868,17 @@ fn replay_changes(catalog: &mut Catalog, changes: Vec<Replayed>) -> Result<()> {
         };
         change.apply(&fields, &mut held[at].1)?;
     }
+    for (name, chunks) in appends {
+        flush(catalog, &name, chunks)?;
+    }
     for (name, chunks) in held {
         catalog.table_mut(&name)?.replace_all(chunks, 1)?;
     }
     Ok(())
 }
+
+/// How many replayed inserts into one table go in as one append.
+const APPEND_BATCH: usize = 256;
 
 /// A checkpoint of the default database, which writes the log's anchor into the file and then
 /// recycles the segments that made redundant, or with `closing` the whole log.
