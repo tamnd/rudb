@@ -567,8 +567,18 @@ impl LogicalType {
                 Some(Self::AggregateState(state.clone()))
             }
             (Self::List(left), Self::List(right)) => Some(Self::list(left.promote(right)?)),
-            (Self::Array(left, size), Self::Array(right, other)) if size == other => {
-                Some(Self::array(left.promote(right)?, *size))
+            // Two arrays meet at the longer length, and the shorter one then fails its cast when a
+            // row reaches it, which is the pin's.
+            (Self::Array(left, size), Self::Array(right, other)) => {
+                Some(Self::array(left.promote(right)?, *size.max(other)))
+            }
+            // A list meets an array as the array when its elements go into the array's, since a
+            // list to an array costs the pin its element cast and an array to a list costs one
+            // more. When they do not the array goes to a list.
+            (Self::Array(element, size), Self::List(other))
+            | (Self::List(other), Self::Array(element, size)) => {
+                let met = element.promote(other)?;
+                Some(if met == **element { Self::array(met, *size) } else { Self::list(met) })
             }
             // A map meets a map key by key type and value by value type, so the empty `MAP {}`,
             // which is a `MAP("NULL", "NULL")`, meets any map as that map.
@@ -1084,6 +1094,9 @@ struct TypeParser<'a> {
     resolve: &'a mut dyn FnMut(&[String]) -> Option<LogicalType>,
 }
 
+/// The longest array the pin will declare, which is its `ArrayType::MAX_ARRAY_SIZE`.
+pub const MAX_ARRAY_SIZE: u32 = 100_000;
+
 impl TypeParser<'_> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.position)
@@ -1119,6 +1132,14 @@ impl TypeParser<'_> {
             if let Some(&Token::Number(length)) = self.peek() {
                 self.position += 1;
                 expect(self.eat(&Token::RightBracket), "]")?;
+                if length < 1 {
+                    return Err(Error::binder("ARRAY type size must be at least 1"));
+                }
+                if length > MAX_ARRAY_SIZE {
+                    return Err(Error::binder(format!(
+                        "ARRAY type size must be at most {MAX_ARRAY_SIZE}"
+                    )));
+                }
                 ty = LogicalType::array(ty, length);
             } else {
                 expect(self.eat(&Token::RightBracket), "]")?;
@@ -1540,7 +1561,12 @@ mod promotion_tests {
         let three = LogicalType::array(LogicalType::Integer, 3);
         let wider = LogicalType::array(LogicalType::BigInt, 3);
         assert_eq!(three.promote(&wider), Some(wider));
-        assert_eq!(three.promote(&LogicalType::array(LogicalType::Integer, 2)), None);
+        let two = LogicalType::array(LogicalType::Integer, 2);
+        assert_eq!(three.promote(&two), Some(three.clone()));
+        let list = LogicalType::list(LogicalType::Integer);
+        assert_eq!(list.promote(&three), Some(three.clone()));
+        let doubles = LogicalType::list(LogicalType::Double);
+        assert_eq!(three.promote(&doubles), Some(doubles));
     }
 }
 

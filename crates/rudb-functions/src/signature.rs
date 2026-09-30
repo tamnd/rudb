@@ -267,6 +267,9 @@ enum Shape {
     /// No arguments at all is `"NULL"[]`, which is the pin's answer for `[]` and is a list whose
     /// element type is the untyped null rather than a guess at what somebody meant to put in it.
     Listed,
+    /// `array_value`, which is [`Shape::Listed`] with the length in the type. The pin refuses a call
+    /// of no arguments, since an array of no length is not a type it will make.
+    Arrayed,
     /// `quantile_disc(x, q)`, which answers with one of its values, so in the type it was given,
     /// and with a list of them when `q` is a list of fractions.
     Discrete,
@@ -336,6 +339,22 @@ enum Shape {
     ListPicked(Fixed),
     /// A list of lists, and the list of their elements. `flatten`.
     Flattened,
+    /// Two lists of FLOAT or of DOUBLE folded into one number of the same type. `list_distance`,
+    /// the inner products and the cosines.
+    ///
+    /// The pin has an overload for each element type and picks the one that is cheaper to cast
+    /// both lists to, which [`folded`] works out.
+    Folded,
+    /// Two arrays of FLOAT or of DOUBLE of one size folded into one number. `array_distance`, the
+    /// array inner products and the array cosines.
+    ///
+    /// The overload is picked the way [`Shape::Folded`] picks it, and then the pin's bind meets
+    /// the two element types and refuses a meeting that is neither FLOAT nor DOUBLE, which
+    /// [`array_folded`] follows.
+    ArrayFolded,
+    /// Two arrays of three FLOAT or DOUBLE and the array of three they cross into.
+    /// `array_cross_product`, which takes a list as the array it casts to.
+    Crossed,
     /// A list, the length it should have, and what to pad it with. `list_resize`.
     ///
     /// The length is cast to UBIGINT, which is where the pin sends it, so a negative length is that
@@ -782,6 +801,49 @@ const TABLE: &[Entry] = &[
     // formatting library tells apart.
     text("format", Arity::at_least(1), Fixed::Varchar),
     text("printf", Arity::at_least(1), Fixed::Varchar),
+    // The functions that build a string out of pieces or rewrite one a character at a time. Each
+    // declares a list of parameter types that differs from one position to the next, so their
+    // arguments are read off by [`rewritten`] rather than by the shape.
+    text("concat_ws", Arity::at_least(2), Fixed::Varchar),
+    text("repeat", Arity::exactly(2), Fixed::Varchar),
+    text("lpad", Arity::exactly(3), Fixed::Varchar),
+    text("rpad", Arity::exactly(3), Fixed::Varchar),
+    text("ascii", Arity::exactly(1), Fixed::Integer),
+    text("unicode", Arity::exactly(1), Fixed::Integer),
+    text("ord", Arity::exactly(1), Fixed::Integer),
+    text("translate", Arity::exactly(3), Fixed::Varchar),
+    text("url_encode", Arity::exactly(1), Fixed::Varchar),
+    text("url_decode", Arity::exactly(1), Fixed::Varchar),
+    text("bar", Arity::between(3, 4), Fixed::Varchar),
+    text("to_base", Arity::between(2, 3), Fixed::Varchar),
+    // The digests and the functions that write bytes or numbers as text and read them back. Each
+    // has overloads over types other than strings, so these are read off by [`rewritten`] too, and
+    // every spelling has a row of its own so a refusal names the one that was written.
+    text("md5", Arity::exactly(1), Fixed::Varchar),
+    text("md5_number", Arity::exactly(1), Fixed::Varchar),
+    text("sha1", Arity::exactly(1), Fixed::Varchar),
+    text("sha256", Arity::exactly(1), Fixed::Varchar),
+    text("hex", Arity::exactly(1), Fixed::Varchar),
+    text("to_hex", Arity::exactly(1), Fixed::Varchar),
+    text("bin", Arity::exactly(1), Fixed::Varchar),
+    text("to_binary", Arity::exactly(1), Fixed::Varchar),
+    text("unhex", Arity::exactly(1), Fixed::Varchar),
+    text("from_hex", Arity::exactly(1), Fixed::Varchar),
+    text("unbin", Arity::exactly(1), Fixed::Varchar),
+    text("from_binary", Arity::exactly(1), Fixed::Varchar),
+    text("encode", Arity::exactly(1), Fixed::Varchar),
+    text("decode", Arity::between(1, 2), Fixed::Varchar),
+    text("base64", Arity::exactly(1), Fixed::Varchar),
+    text("to_base64", Arity::exactly(1), Fixed::Varchar),
+    text("from_base64", Arity::exactly(1), Fixed::Varchar),
+    // The functions that count a grapheme cluster as one character, and `reverse`, which reverses
+    // clusters rather than code points. The counts are BIGINT parameters that take nothing wider.
+    text("length_grapheme", Arity::exactly(1), Fixed::BigInt),
+    text("left_grapheme", Arity::exactly(2), Fixed::Varchar),
+    text("right_grapheme", Arity::exactly(2), Fixed::Varchar),
+    text("substring_grapheme", Arity::between(2, 3), Fixed::Varchar),
+    text("reverse", Arity::exactly(1), Fixed::Varchar),
+    text("regexp_escape", Arity::exactly(1), Fixed::Varchar),
     // Pattern matching. The transformer emits the operator spellings, so those are the names, and
     // `LIKE` is one of them rather than a keyword the binder has to know about separately.
     text("~~", Arity::exactly(2), Fixed::Boolean),
@@ -1129,6 +1191,14 @@ const TABLE: &[Entry] = &[
         shape: Shape::Listed,
         numeric_only: false,
     },
+    // Building an array, which is building a list whose length goes into its type.
+    Entry {
+        name: "array_value",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(0),
+        shape: Shape::Arrayed,
+        numeric_only: false,
+    },
     // Joining lists end to end. The pin prints one overload, `list_concat([ANY[]...]) -> ANY[]`,
     // and answers to four names for it, three of which are aliases below. It is the named form of
     // `||` over two lists and is not quite the same function, because a null argument is skipped
@@ -1158,6 +1228,26 @@ const TABLE: &[Entry] = &[
     list_row("list_where", 2, Shape::ListPicked(Fixed::Boolean)),
     list_row("list_select", 2, Shape::ListPicked(Fixed::BigInt)),
     list_row("flatten", 1, Shape::Flattened),
+    // The folds of two lists into a number. The aliases are rows of their own because the pin
+    // writes the name that was called in every error, and `<->` and `<=>` are only reachable as
+    // quoted names, since the pin's parser has no operator for them.
+    list_row("list_distance", 2, Shape::Folded),
+    list_row("<->", 2, Shape::Folded),
+    list_row("list_inner_product", 2, Shape::Folded),
+    list_row("list_dot_product", 2, Shape::Folded),
+    list_row("list_negative_inner_product", 2, Shape::Folded),
+    list_row("list_negative_dot_product", 2, Shape::Folded),
+    list_row("list_cosine_similarity", 2, Shape::Folded),
+    list_row("list_cosine_distance", 2, Shape::Folded),
+    list_row("<=>", 2, Shape::Folded),
+    list_row("array_distance", 2, Shape::ArrayFolded),
+    list_row("array_inner_product", 2, Shape::ArrayFolded),
+    list_row("array_dot_product", 2, Shape::ArrayFolded),
+    list_row("array_negative_inner_product", 2, Shape::ArrayFolded),
+    list_row("array_negative_dot_product", 2, Shape::ArrayFolded),
+    list_row("array_cosine_similarity", 2, Shape::ArrayFolded),
+    list_row("array_cosine_distance", 2, Shape::ArrayFolded),
+    list_row("array_cross_product", 2, Shape::Crossed),
     Entry {
         name: "list_sort",
         kind: FunctionKind::Scalar,
@@ -1628,6 +1718,10 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         let returns = LogicalType::Varchar;
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
     }
+    if let Some(read) = rewritten(entry.name, arguments) {
+        let (cast_to, returns) = read?;
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
     if READ_OFF.contains(&entry.name) {
         return Err(no_match(entry.name, arguments));
     }
@@ -1916,9 +2010,21 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let element = list_element(arguments)?;
             (vec![element.clone(); arguments.len()], LogicalType::list(element))
         }
+        Shape::Arrayed => {
+            let size =
+                u32::try_from(arguments.len()).ok().filter(|&size| size > 0).ok_or_else(|| {
+                    Error::invalid_input("array_value requires at least one argument")
+                })?;
+            let element = list_element(arguments)?;
+            (vec![element.clone(); arguments.len()], LogicalType::array(element, size))
+        }
         Shape::Concatenated => {
-            let left = &arguments[0];
-            let right = &arguments[1];
+            // An array is joined as the list it is held as, so what comes out has no fixed length.
+            let listed = |ty: &LogicalType| match ty {
+                LogicalType::Array(element, _) => LogicalType::List(element.clone()),
+                other => other.clone(),
+            };
+            let (left, right) = (&listed(&arguments[0]), &listed(&arguments[1]));
             match (left, right) {
                 (LogicalType::List(_), _) | (_, LogicalType::List(_)) => {
                     // A null on one side is not a list and is not the string reading either, so it
@@ -1953,9 +2059,12 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
                 if *ty == LogicalType::Null {
                     continue;
                 }
-                if !matches!(ty, LogicalType::List(_)) {
-                    return Err(no_match(entry.name, arguments));
-                }
+                // An array is joined as the list it is held as, the way `||` joins one.
+                let ty = &match ty {
+                    LogicalType::List(_) => ty.clone(),
+                    LogicalType::Array(element, _) => LogicalType::List(element.clone()),
+                    _ => return Err(no_match(entry.name, arguments)),
+                };
                 // An argument of the wrong shape is the candidate block above and an argument whose
                 // elements will not meet the rest is the operator's sentence, which is the pin's
                 // split too: `list_concat([1], 2)` is a candidate block and
@@ -2103,6 +2212,9 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let element = deduce(entry, &element, &arguments[1])?;
             (vec![LogicalType::list(element.clone()), element], to.ty())
         }
+        Shape::Folded => folded(entry.name, arguments)?,
+        Shape::ArrayFolded => array_folded(entry.name, arguments)?,
+        Shape::Crossed => crossed(entry.name, arguments)?,
         Shape::ListsMet(to) => {
             let (Some(left), Some(right)) =
                 (element_of_list(&arguments[0]), element_of_list(&arguments[1]))
@@ -2642,6 +2754,115 @@ fn fractioned(fraction: &LogicalType, answer: LogicalType) -> LogicalType {
     if matches!(fraction, LogicalType::List(_)) { LogicalType::list(answer) } else { answer }
 }
 
+/// The types a fold over two lists reads them as, and the type of its answer.
+///
+/// The pin has a FLOAT overload and a DOUBLE one and takes the one that costs less to cast both
+/// arguments to, adding up its implicit cast costs. A list that already has the element type costs
+/// nothing, any other number and the null type cost 110 to become a FLOAT and 104 to become a
+/// DOUBLE, and a DOUBLE never becomes a FLOAT. So two lists of integers are DOUBLE, a BIGINT list
+/// against a FLOAT list is FLOAT, and a bare null costs the same either way, which makes two of
+/// them the pin's ambiguity error with the DOUBLE overload listed first.
+///
+/// A string is refused. The pin casts a string literal to whichever list the other side picks,
+/// which a signature that only sees types cannot tell from a VARCHAR column, and a column is the
+/// pin's refusal.
+fn folded(name: &str, arguments: &[LogicalType]) -> Result<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{Array, Double, Float, List, Null};
+    let (mut to_float, mut to_double, mut floats) = (0, 0, true);
+    for ty in arguments {
+        let element = match ty {
+            Null => continue,
+            List(element) | Array(element, _) => &**element,
+            _ => return Err(no_match(name, arguments)),
+        };
+        match element {
+            Float => to_double += 104,
+            Double => floats = false,
+            Null => (to_float, to_double) = (to_float + 110, to_double + 104),
+            other if other.is_numeric() => {
+                (to_float, to_double) = (to_float + 110, to_double + 104);
+            }
+            _ => return Err(no_match(name, arguments)),
+        }
+    }
+    if floats && to_float == to_double {
+        let spelled = arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+        let mut message = format!(
+            "Could not choose a best candidate function for the function call \"{name}({spelled})\". In order to select one, please add explicit type casts.\n\tCandidate functions:"
+        );
+        let overloads = CANDIDATES.iter().find(|(entry, _)| *entry == name).map(|(_, rows)| *rows);
+        for overload in overloads.unwrap_or_default().iter().rev() {
+            message.push_str("\n\t");
+            message.push_str(overload);
+        }
+        message.push('\n');
+        return Err(Error::binder(message));
+    }
+    let element = if floats && to_float < to_double { Float } else { Double };
+    Ok((vec![LogicalType::list(element.clone()); arguments.len()], element))
+}
+
+/// The array folds, which the pin declares over `FLOAT[ANY]` and `DOUBLE[ANY]` and so only takes
+/// arrays and nulls, a list having no size to cast to. A null takes the type of the other side,
+/// and then the two sizes have to agree and the two element types meet at FLOAT or DOUBLE, so
+/// two arrays of integers are refused where an array of integers and one of doubles is not.
+fn array_folded(name: &str, arguments: &[LogicalType]) -> Result<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{Array, Double, Float, Null};
+    if arguments.iter().any(|ty| !matches!(ty, Null | Array(..))) {
+        return Err(no_match(name, arguments));
+    }
+    let (_, returns) = folded(name, arguments)?;
+    let [left, right] = arguments else {
+        return Err(no_match(name, arguments));
+    };
+    let (left, right) = match (left, right) {
+        (Null, other) | (other, Null) => (other, other),
+        sides => sides,
+    };
+    let (Array(left, size), Array(right, other)) = (left, right) else {
+        return Err(no_match(name, arguments));
+    };
+    if size != other {
+        return Err(Error::binder(format!(
+            "{}: Array arguments must be of the same size",
+            identifier(name)
+        )));
+    }
+    let common = left.promote(right).map_err(|_| {
+        Error::binder(format!(
+            "{}: Cannot infer common element type (left = '{left}', right = '{right}')",
+            identifier(name)
+        ))
+    })?;
+    if !matches!(common, Float | Double) {
+        return Err(Error::binder(format!(
+            "{}: Arguments must be arrays of FLOAT or DOUBLE",
+            identifier(name)
+        )));
+    }
+    Ok((vec![LogicalType::array(common, *size); 2], returns))
+}
+
+/// `array_cross_product`, which the pin declares over `FLOAT[3]` and `DOUBLE[3]` with no bind of
+/// its own, so a list casts to the array and an array of another size matches neither.
+fn crossed(name: &str, arguments: &[LogicalType]) -> Result<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{Array, List, Null};
+    if arguments.iter().any(|ty| !matches!(ty, Null | List(_) | Array(_, 3))) {
+        return Err(no_match(name, arguments));
+    }
+    let (_, element) = folded(name, arguments)?;
+    let array = LogicalType::array(element, 3);
+    Ok((vec![array.clone(); arguments.len()], array))
+}
+
+/// A function name the way the pin's `SQLIdentifier` writes it in a message, quoted when it is
+/// not a plain lower case word.
+fn identifier(name: &str) -> String {
+    let plain = name.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        && !name.starts_with('_');
+    if plain { name.to_string() } else { format!("\"{}\"", name.replace('"', "\"\"")) }
+}
+
 fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
     let types = arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
     no_match_spelled(name, &types)
@@ -2652,7 +2873,8 @@ fn no_match_spelled(name: &str, types: &str) -> Error {
     let mut message = format!(
         "No function matches the given name and argument types '{name}({types})'. You might need to add explicit type casts."
     );
-    if let Some((_, overloads)) = CANDIDATES.iter().find(|(entry, _)| *entry == name) {
+    let mut known = CANDIDATES.iter().chain(SETTLED);
+    if let Some((_, overloads)) = known.find(|(entry, _)| *entry == name) {
         message.push_str("\n\tCandidate functions:");
         for overload in *overloads {
             message.push_str("\n\t");
@@ -2662,6 +2884,16 @@ fn no_match_spelled(name: &str, types: &str) -> Error {
     }
     Error::binder(message)
 }
+
+/// Candidate blocks for calls that rudb-bind settles itself and that have no entry in [`TABLE`],
+/// which are the struct searches and `struct_extract_at`. The binder refuses them with these.
+const SETTLED: &[(&str, &[&str])] = &[
+    ("struct_contains", &["struct_contains(col0 TUPLE, col1 ANY) -> BOOLEAN"]),
+    ("struct_has", &["struct_has(col0 TUPLE, col1 ANY) -> BOOLEAN"]),
+    ("struct_position", &["struct_position(col0 TUPLE, col1 ANY) -> INTEGER"]),
+    ("struct_indexof", &["struct_indexof(col0 TUPLE, col1 ANY) -> INTEGER"]),
+    ("struct_extract_at", &["struct_extract_at(\"struct\" STRUCT, \"index\" BIGINT) -> ANY"]),
+];
 
 /// The pin's refusal of a call whose named arguments fit none of the function's lists of
 /// parameters, or fit two of them in different orders, with each argument already spelled the way
@@ -2753,6 +2985,119 @@ fn printed(arguments: &[LogicalType]) -> Option<Vec<LogicalType>> {
         _ => T::Varchar,
     }));
     Some(cast_to)
+}
+
+/// The types a string builder reads its arguments as and the type it answers, or `None` when the
+/// call is not to one of them.
+///
+/// Each of these has a fixed list of parameter types per overload in the pin. A string parameter
+/// takes a string and nothing else, so `ascii(65)` and `ascii('a'::BLOB)` are refused, and a
+/// number parameter takes a number that widens to it, so `lpad('a', 3::UTINYINT, 'x')` is answered
+/// and `lpad('a', 3::BIGINT, 'x')` is refused. A string literal in a number's place was cast by
+/// the binder before it got here, which is the pin's cast too.
+///
+/// `repeat` has three overloads and the first argument picks one. An untyped null picks the BLOB
+/// one, since that is the one the pin picks, and a fixed size array repeats into a list.
+/// `concat_ws` casts a list to a list of strings and anything else to a string, and a list of lists
+/// is the pin's binder error rather than a cast.
+///
+/// `hex` and `bin` take a string, a blob for `hex` only, or a whole number, and a whole number up
+/// to a BIGINT is read as a BIGINT. A FLOAT or a DOUBLE is the pin's implicit cast to BIGNUM, which
+/// this engine does not have, so it is left as it is and the kernel writes the BIGNUM's bytes.
+fn rewritten(
+    name: &str,
+    arguments: &[LogicalType],
+) -> Option<Result<(Vec<LogicalType>, LogicalType)>> {
+    use LogicalType::{
+        Array, BigInt, Blob, Double, Float, HugeInt, Integer, List, Null, SmallInt, TinyInt,
+        UBigInt, UHugeInt, UInteger, USmallInt, UTinyInt, Varchar,
+    };
+    let text = |ty: &LogicalType| matches!(ty, Varchar | Null);
+    let reaches = |ty: &LogicalType, wanted: &LogicalType| match wanted {
+        Varchar => text(ty),
+        List(element) => {
+            *ty == Null || matches!(ty, List(held) | Array(held, _) if held == element)
+        }
+        Blob => matches!(ty, Blob | Null),
+        _ => *ty == Null || (ty.is_numeric() && ty.promote(wanted).as_ref() == Some(wanted)),
+    };
+    let declared = |wanted: Vec<LogicalType>, returns: LogicalType| {
+        let fits = wanted.len() == arguments.len()
+            && arguments.iter().zip(&wanted).all(|(ty, wanted)| reaches(ty, wanted));
+        Some(if fits { Ok((wanted, returns)) } else { Err(no_match(name, arguments)) })
+    };
+    match name {
+        "lpad" | "rpad" => declared(vec![Varchar, Integer, Varchar], Varchar),
+        "ascii" | "unicode" | "ord" => declared(vec![Varchar], Integer),
+        "translate" => declared(vec![Varchar; 3], Varchar),
+        "url_encode" | "url_decode" => declared(vec![Varchar], Varchar),
+        "bar" => declared(vec![Double; arguments.len()], Varchar),
+        "to_base" => {
+            let mut wanted = vec![BigInt, Integer];
+            wanted.extend(arguments.iter().skip(2).map(|_| Integer));
+            declared(wanted, Varchar)
+        }
+        "repeat" => {
+            let held = match arguments.first() {
+                Some(Varchar) => Varchar,
+                Some(Blob | Null) => Blob,
+                Some(List(element) | Array(element, _)) => List(element.clone()),
+                _ => return Some(Err(no_match(name, arguments))),
+            };
+            declared(vec![held.clone(), BigInt], held)
+        }
+        "md5" | "md5_number" | "sha1" | "sha256" => {
+            let returns = if name == "md5_number" { UHugeInt } else { Varchar };
+            let takes = if arguments == [Blob] { Blob } else { Varchar };
+            declared(vec![takes], returns)
+        }
+        "hex" | "to_hex" | "bin" | "to_binary" => {
+            let takes = match arguments {
+                [Varchar | Null] => Varchar,
+                [Blob] if matches!(name, "hex" | "to_hex") => Blob,
+                [ty @ (Float | Double | UBigInt | HugeInt | UHugeInt)] => ty.clone(),
+                [TinyInt | SmallInt | Integer | BigInt | UTinyInt | USmallInt | UInteger] => BigInt,
+                _ => return Some(Err(no_match(name, arguments))),
+            };
+            declared(vec![takes], Varchar)
+        }
+        "unhex" | "from_hex" | "unbin" | "from_binary" | "from_base64" | "encode" => {
+            declared(vec![Varchar], Blob)
+        }
+        "decode" => {
+            let mut wanted = vec![Blob];
+            wanted.extend(arguments.iter().skip(1).map(|_| Varchar));
+            declared(wanted, Varchar)
+        }
+        "base64" | "to_base64" => declared(vec![Blob], Varchar),
+        "reverse" | "regexp_escape" => declared(vec![Varchar], Varchar),
+        "length_grapheme" => declared(vec![Varchar], BigInt),
+        "left_grapheme" | "right_grapheme" | "substring_grapheme" => {
+            let mut wanted = vec![Varchar];
+            wanted.extend(arguments.iter().skip(1).map(|_| BigInt));
+            declared(wanted, Varchar)
+        }
+        "concat_ws" => {
+            let (separator, rest) = arguments.split_first()?;
+            if !text(separator) {
+                return Some(Err(no_match(name, arguments)));
+            }
+            let mut cast_to = vec![Varchar];
+            for ty in rest {
+                cast_to.push(match ty {
+                    List(element) if matches!(**element, List(_)) => {
+                        return Some(Err(Error::binder(
+                            "concat_ws() does not support nested lists".to_string(),
+                        )));
+                    }
+                    List(_) => LogicalType::list(Varchar),
+                    _ => Varchar,
+                });
+            }
+            Some(Ok((cast_to, Varchar)))
+        }
+        _ => None,
+    }
 }
 
 /// The functions that read something off a moment, or read a moment out of text, and take nothing
@@ -3460,7 +3805,228 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("path_join", &["path_join(col0 VARCHAR, [VARCHAR...]) -> VARCHAR"]),
+    ("md5", &["md5(col0 VARCHAR) -> VARCHAR", "md5(col0 BLOB) -> VARCHAR"]),
+    ("sha1", &["sha1(col0 VARCHAR) -> VARCHAR", "sha1(col0 BLOB) -> VARCHAR"]),
+    ("sha256", &["sha256(col0 VARCHAR) -> VARCHAR", "sha256(col0 BLOB) -> VARCHAR"]),
+    ("md5_number", &["md5_number(col0 VARCHAR) -> UHUGEINT", "md5_number(col0 BLOB) -> UHUGEINT"]),
+    (
+        "hex",
+        &[
+            "hex(col0 VARCHAR) -> VARCHAR",
+            "hex(col0 BIGNUM) -> VARCHAR",
+            "hex(col0 BLOB) -> VARCHAR",
+            "hex(col0 BIGINT) -> VARCHAR",
+            "hex(col0 UBIGINT) -> VARCHAR",
+            "hex(col0 HUGEINT) -> VARCHAR",
+            "hex(col0 UHUGEINT) -> VARCHAR",
+        ],
+    ),
+    (
+        "to_hex",
+        &[
+            "to_hex(col0 VARCHAR) -> VARCHAR",
+            "to_hex(col0 BIGNUM) -> VARCHAR",
+            "to_hex(col0 BLOB) -> VARCHAR",
+            "to_hex(col0 BIGINT) -> VARCHAR",
+            "to_hex(col0 UBIGINT) -> VARCHAR",
+            "to_hex(col0 HUGEINT) -> VARCHAR",
+            "to_hex(col0 UHUGEINT) -> VARCHAR",
+        ],
+    ),
+    (
+        "bin",
+        &[
+            "bin(col0 VARCHAR) -> VARCHAR",
+            "bin(col0 BIGNUM) -> VARCHAR",
+            "bin(col0 UBIGINT) -> VARCHAR",
+            "bin(col0 BIGINT) -> VARCHAR",
+            "bin(col0 HUGEINT) -> VARCHAR",
+            "bin(col0 UHUGEINT) -> VARCHAR",
+        ],
+    ),
+    (
+        "to_binary",
+        &[
+            "to_binary(col0 VARCHAR) -> VARCHAR",
+            "to_binary(col0 BIGNUM) -> VARCHAR",
+            "to_binary(col0 UBIGINT) -> VARCHAR",
+            "to_binary(col0 BIGINT) -> VARCHAR",
+            "to_binary(col0 HUGEINT) -> VARCHAR",
+            "to_binary(col0 UHUGEINT) -> VARCHAR",
+        ],
+    ),
+    ("unhex", &["unhex(col0 VARCHAR) -> BLOB"]),
+    ("from_hex", &["from_hex(col0 VARCHAR) -> BLOB"]),
+    ("unbin", &["unbin(col0 VARCHAR) -> BLOB"]),
+    ("from_binary", &["from_binary(col0 VARCHAR) -> BLOB"]),
+    ("encode", &["encode(col0 VARCHAR) -> BLOB"]),
+    ("from_base64", &["from_base64(col0 VARCHAR) -> BLOB"]),
+    ("decode", &["decode(col0 BLOB) -> VARCHAR", "decode(col0 BLOB, col1 VARCHAR) -> VARCHAR"]),
+    ("base64", &["base64(col0 BLOB) -> VARCHAR"]),
+    ("to_base64", &["to_base64(col0 BLOB) -> VARCHAR"]),
+    (
+        "list_distance",
+        &[
+            "list_distance(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_distance(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "<->",
+        &[
+            "\"<->\"(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "\"<->\"(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_inner_product",
+        &[
+            "list_inner_product(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_inner_product(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_dot_product",
+        &[
+            "list_dot_product(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_dot_product(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_negative_inner_product",
+        &[
+            "list_negative_inner_product(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_negative_inner_product(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_negative_dot_product",
+        &[
+            "list_negative_dot_product(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_negative_dot_product(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_cosine_similarity",
+        &[
+            "list_cosine_similarity(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_cosine_similarity(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_cosine_distance",
+        &[
+            "list_cosine_distance(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_cosine_distance(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "<=>",
+        &[
+            "\"<=>\"(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "\"<=>\"(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_distance",
+        &[
+            "array_distance(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_distance(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_inner_product",
+        &[
+            "array_inner_product(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_inner_product(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_dot_product",
+        &[
+            "array_dot_product(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_dot_product(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_negative_inner_product",
+        &[
+            "array_negative_inner_product(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_negative_inner_product(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_negative_dot_product",
+        &[
+            "array_negative_dot_product(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_negative_dot_product(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_cosine_similarity",
+        &[
+            "array_cosine_similarity(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_cosine_similarity(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_cosine_distance",
+        &[
+            "array_cosine_distance(col0 FLOAT[ANY], col1 FLOAT[ANY]) -> FLOAT",
+            "array_cosine_distance(col0 DOUBLE[ANY], col1 DOUBLE[ANY]) -> DOUBLE",
+        ],
+    ),
+    (
+        "array_cross_product",
+        &[
+            "array_cross_product(col0 FLOAT[3], col1 FLOAT[3]) -> FLOAT[3]",
+            "array_cross_product(col0 DOUBLE[3], col1 DOUBLE[3]) -> DOUBLE[3]",
+        ],
+    ),
+    ("length_grapheme", &["length_grapheme(col0 VARCHAR) -> BIGINT"]),
+    ("left_grapheme", &["left_grapheme(col0 VARCHAR, col1 BIGINT) -> VARCHAR"]),
+    ("right_grapheme", &["right_grapheme(col0 VARCHAR, col1 BIGINT) -> VARCHAR"]),
+    (
+        "substring_grapheme",
+        &[
+            "substring_grapheme(col0 VARCHAR, col1 BIGINT, col2 BIGINT) -> VARCHAR",
+            "substring_grapheme(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+        ],
+    ),
+    ("reverse", &["reverse(col0 VARCHAR) -> VARCHAR"]),
+    ("regexp_escape", &["regexp_escape(col0 VARCHAR) -> VARCHAR"]),
     ("format", &["format(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
+    ("concat_ws", &["concat_ws(col0 VARCHAR, col1 ANY, [ANY...]) -> VARCHAR"]),
+    (
+        "repeat",
+        &[
+            "repeat(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+            "repeat(col0 BLOB, col1 BIGINT) -> BLOB",
+            "repeat(col0 T[], col1 BIGINT) -> T[]",
+        ],
+    ),
+    ("lpad", &["lpad(col0 VARCHAR, col1 INTEGER, col2 VARCHAR) -> VARCHAR"]),
+    ("rpad", &["rpad(col0 VARCHAR, col1 INTEGER, col2 VARCHAR) -> VARCHAR"]),
+    ("ascii", &["ascii(col0 VARCHAR) -> INTEGER"]),
+    ("unicode", &["unicode(col0 VARCHAR) -> INTEGER"]),
+    ("ord", &["ord(col0 VARCHAR) -> INTEGER"]),
+    ("translate", &["translate(col0 VARCHAR, col1 VARCHAR, col2 VARCHAR) -> VARCHAR"]),
+    ("url_encode", &["url_encode(col0 VARCHAR) -> VARCHAR"]),
+    ("url_decode", &["url_decode(col0 VARCHAR) -> VARCHAR"]),
+    (
+        "bar",
+        &[
+            "bar(col0 DOUBLE, col1 DOUBLE, col2 DOUBLE, col3 DOUBLE) -> VARCHAR",
+            "bar(col0 DOUBLE, col1 DOUBLE, col2 DOUBLE) -> VARCHAR",
+        ],
+    ),
+    (
+        "to_base",
+        &[
+            "to_base(col0 BIGINT, col1 INTEGER) -> VARCHAR",
+            "to_base(col0 BIGINT, col1 INTEGER, col2 INTEGER) -> VARCHAR",
+        ],
+    ),
     ("printf", &["printf(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
     ("format_bytes", &["format_bytes(col0 BIGINT) -> VARCHAR"]),
     ("formatReadableSize", &["formatReadableSize(col0 BIGINT) -> VARCHAR"]),
@@ -4011,6 +4577,8 @@ impl Shape {
             // arguments to meet. Both rows are the pin's, which carries the two of them for this
             // name and nothing in between.
             Self::Listed => (all(SAME), if count == 0 { NULL_LIST } else { SAME_LIST }),
+            // The pin's one row, whose length is not in the name any more than a width is.
+            Self::Arrayed => (all(ANY), "ARRAY"),
             // The string reading's row, which is the one the pin lists first for this name. The list
             // reading gets no row of its own because an entry here is a name and an argument count,
             // and this name at two arguments is already spoken for.
@@ -4037,6 +4605,9 @@ impl Shape {
                 (leading(1, SAME_LIST, picks), SAME_LIST)
             }
             Self::Flattened => (all("T[][]"), SAME_LIST),
+            Self::Folded => (all(SAME_LIST), SAME),
+            Self::ArrayFolded => (all("T[ANY]"), SAME),
+            Self::Crossed => (all("T[3]"), "T[3]"),
             Self::Resized => (leading(1, ANY_LIST, ANY), ANY_LIST),
             Self::Sorted => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
             Self::Graded => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
@@ -4564,6 +5135,11 @@ mod tests {
                 continue;
             }
             for count in entry.arity.counts() {
+                // `array_value()` is accepted by the table so that the pin's own error answers it,
+                // which `tests/arrays.rs` holds it to, rather than a list of candidates.
+                if entry.shape == Shape::Arrayed && count == 0 {
+                    continue;
+                }
                 // A shape that names the type it wants is asked for it, since `chr` wants an
                 // INTEGER and refuses a string the way upstream does.
                 let ty = match (entry.numeric_only, entry.shape) {
@@ -4606,6 +5182,12 @@ mod tests {
                         arguments = vec![strings(), LogicalType::list(by.ty())]
                     }
                     Shape::Flattened => arguments = vec![LogicalType::list(strings())],
+                    Shape::Folded => {
+                        arguments = vec![LogicalType::list(LogicalType::Double); count]
+                    }
+                    Shape::ArrayFolded | Shape::Crossed => {
+                        arguments = vec![LogicalType::array(LogicalType::Double, 3); count]
+                    }
                     Shape::Resized => arguments[0] = strings(),
                     Shape::Ranged => arguments = vec![LogicalType::BigInt; count],
                     Shape::Continuous | Shape::Deviation => {
@@ -4635,6 +5217,21 @@ mod tests {
                         arguments[1] = LogicalType::Boolean;
                     }
                     _ if entry.name == "time_bucket" => arguments[1] = LogicalType::Date,
+                    _ if matches!(entry.name, "lpad" | "rpad") => {
+                        arguments[1] = LogicalType::Integer;
+                    }
+                    _ if entry.name == "repeat" => arguments[1] = LogicalType::BigInt,
+                    _ if entry.name.ends_with("_grapheme") && count > 1 => {
+                        arguments[1..].fill(LogicalType::BigInt);
+                    }
+                    _ if matches!(entry.name, "decode" | "base64" | "to_base64") => {
+                        arguments[0] = LogicalType::Blob;
+                    }
+                    _ if entry.name == "bar" => arguments = vec![LogicalType::Double; count],
+                    _ if entry.name == "to_base" => {
+                        arguments = vec![LogicalType::Integer; count];
+                        arguments[0] = LogicalType::BigInt;
+                    }
                     _ if matches!(
                         entry.name,
                         "date_diff" | "datediff" | "date_sub" | "datesub"

@@ -918,14 +918,15 @@ impl Binder<'_> {
         // reaches that by a cast where a VARCHAR does not, so `format_bytes('1')` is one byte,
         // `format_bytes('x')` is the pin's conversion error and `format_bytes('1'::VARCHAR)` is
         // refused. Only the syntax can tell the first and the last apart.
-        if ["format_bytes", "pg_size_pretty", "formatReadableSize", "formatReadableDecimalSize"]
-            .into_iter()
-            .any(|name| rudb_catalog::same_name(&written, name))
-        {
-            for (arg, bound) in arguments.iter().zip(bound.iter_mut()) {
-                if matches!(ast.expr(*arg), ast::Expr::Literal { kind: LiteralKind::String, .. }) {
-                    *bound = self.cast_to(*bound, &LogicalType::BigInt);
-                }
+        // The string builders that take a number somewhere are the same, so `lpad('a', '3', 'x')`
+        // pads to three and `repeat('ab', '2')` repeats twice, and so are the calls that take a
+        // blob, so `base64('abc')` is the blob of those three bytes.
+        let count = bound.len();
+        for (at, (arg, bound)) in arguments.iter().zip(bound.iter_mut()).enumerate() {
+            if matches!(ast.expr(*arg), ast::Expr::Literal { kind: LiteralKind::String, .. })
+                && let Some(ty) = declared_parameter(&written, at, count)
+            {
+                *bound = self.cast_to(*bound, &ty);
             }
         }
         if let Some(function) = ["coalesce", "greatest", "least"]
@@ -3029,6 +3030,31 @@ const KEYWORD_SHORTCUTS: &[&str] = &[
     "week",
     "year",
 ];
+
+/// The type a call declares at an argument's position, for the calls whose one list of parameters
+/// puts a number or a blob there, which a string literal written there is cast to before the call
+/// is resolved.
+fn declared_parameter(written: &str, at: usize, count: usize) -> Option<LogicalType> {
+    let named = |name: &str| rudb_catalog::same_name(written, name);
+    if ["format_bytes", "pg_size_pretty", "formatReadableSize", "formatReadableDecimalSize"]
+        .into_iter()
+        .any(named)
+    {
+        return Some(LogicalType::BigInt);
+    }
+    match at {
+        1 if named("lpad") || named("rpad") => Some(LogicalType::Integer),
+        1 if named("repeat") => Some(LogicalType::BigInt),
+        0 if named("to_base") => Some(LogicalType::BigInt),
+        _ if named("to_base") => Some(LogicalType::Integer),
+        _ if named("bar") && (3..=4).contains(&count) => Some(LogicalType::Double),
+        0 if named("decode") || named("base64") || named("to_base64") => Some(LogicalType::Blob),
+        1.. if ["left_grapheme", "right_grapheme", "substring_grapheme"].into_iter().any(named) => {
+            Some(LogicalType::BigInt)
+        }
+        _ => None,
+    }
+}
 
 /// A refusal of a call no overload takes, with the arguments that were literals in the query spelled
 /// the way the pin spells them there.

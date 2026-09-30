@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use rudb_common::{Field, LogicalType, Result, Value};
-use rudb_io::{Crash, Op, SimFilesystem};
+use rudb_io::{Crash, Filesystem, Op, SimFilesystem};
 use rudb_native::{Reader, STRIPE_PARTS, Writer};
 use rudb_vector::{Chunk, Vector};
 
@@ -70,6 +70,9 @@ fn part(index: usize) -> Chunk {
 /// Runs the whole load against `fs`, stopping at the first call that fails.
 fn load(fs: &SimFilesystem, parts: &[Chunk]) -> Result<()> {
     let mut writer = Writer::create_in(fs, Path::new(PATH), "t", fields())?;
+    // The file's name is the directory's to make durable, and a caller that did not sync it could
+    // find no file at all after a crash that kept every byte of it.
+    fs.sync_dir(Path::new("/db"))?;
     for chunk in parts {
         writer.append(chunk)?;
     }

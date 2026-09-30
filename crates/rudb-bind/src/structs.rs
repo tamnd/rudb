@@ -21,6 +21,9 @@ pub(crate) const STRUCT_PACK: &str = "struct_pack";
 /// The name the plan records for picking one field out of a struct.
 pub(crate) const STRUCT_EXTRACT: &str = "struct_extract";
 
+/// The call that picks a field out of any struct by its place, named or not.
+const STRUCT_EXTRACT_AT: &str = "struct_extract_at";
+
 impl Binder<'_> {
     /// A struct built from bound values and the names they were written with.
     ///
@@ -59,6 +62,9 @@ impl Binder<'_> {
         written: &str,
         bound: &[ExprRef],
     ) -> Result<Option<ExprRef>> {
+        if rudb_catalog::same_name(written, STRUCT_EXTRACT_AT) {
+            return self.extract_at(bound).map(Some);
+        }
         let extract = rudb_catalog::same_name(written, STRUCT_EXTRACT);
         let subscript = ["array_extract", "list_extract", "list_element"]
             .iter()
@@ -77,11 +83,7 @@ impl Binder<'_> {
             Ok(Some(value)) if value.logical_type().is_integer() && Field::unnamed(&fields) => {
                 let index = value.as_i64().unwrap_or(0);
                 if index < 1 || index > fields.len() as i64 {
-                    return Err(Error::binder(format!(
-                        "Key index {index} for struct_extract out of range - expected an index \
-                         between 1 and {}",
-                        fields.len()
-                    )));
+                    return Err(out_of_range(index, fields.len()));
                 }
                 index as usize - 1
             }
@@ -105,6 +107,45 @@ impl Binder<'_> {
         Ok(Some(self.add_expr(Expr::Function { name: recorded, args }, fields[at].ty.clone())))
     }
 
+    /// `struct_extract_at(s, i)`, the field at place `i` counted from one, in a named struct as well
+    /// as an unnamed one.
+    ///
+    /// The place decides the type of the answer, so it has to be known before the query runs. A
+    /// string is read as a number the way the pin casts a literal to its BIGINT, and a null place or
+    /// a null struct is the untyped null.
+    fn extract_at(&mut self, bound: &[ExprRef]) -> Result<ExprRef> {
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+        let fields = match types.as_slice() {
+            [LogicalType::Struct(fields), index] if takes_place(index) => Some(fields.clone()),
+            [LogicalType::Null, index] if takes_place(index) => None,
+            _ => return Err(mismatch(STRUCT_EXTRACT_AT, &types)),
+        };
+        let Ok(Some(index)) = fold::value_of(self.plan(), bound[1]) else {
+            return Err(Error::binder(
+                "The \"index\" argument in function \"struct_extract_at\" must be a constant \
+                 expression",
+            ));
+        };
+        let (Some(fields), false) = (fields, index.is_null()) else {
+            return Ok(self.add_constant(Value::Null));
+        };
+        let index = match index {
+            Value::Varchar(text) => text.trim().parse::<i64>().map_err(|_| {
+                Error::invalid_input(format!("Could not convert string '{text}' to INT64"))
+            })?,
+            other => other.as_i64().unwrap_or(0),
+        };
+        if index < 1 || index > fields.len() as i64 {
+            return Err(out_of_range(index, fields.len()));
+        }
+        let key = self.add_constant(Value::BigInt(index));
+        let args = self.plan_mut().add_expr_list(&[bound[0], key]);
+        let recorded = self.plan_mut().intern(STRUCT_EXTRACT);
+        let returns = fields[index as usize - 1].ty.clone();
+        Ok(self.add_expr(Expr::Function { name: recorded, args }, returns))
+    }
+
     /// Where the field of that name is, found without case, or the pin's refusal naming them all.
     fn field_named(&self, fields: &[Field], name: &str) -> Result<usize> {
         fields.iter().position(|field| field.name.eq_ignore_ascii_case(name)).ok_or_else(|| {
@@ -118,7 +159,8 @@ impl Binder<'_> {
     }
 
     /// `struct_insert`, `struct_update`, `struct_concat`, `struct_keys`, `struct_values`,
-    /// `struct_contains` and `struct_position`, or `None` for any other call.
+    /// `struct_contains` and `struct_position` with their spellings `struct_has` and
+    /// `struct_indexof`, and `list_zip` with its spelling `array_zip`, or `None` for any other call.
     ///
     /// Each answers a type made out of the fields of its arguments, so the type is worked out here
     /// and the kernel in `rudb_kernels::structs` puts the values where the type says they go.
@@ -134,6 +176,8 @@ impl Binder<'_> {
             Some(LogicalType::Struct(fields)) => Some(fields.clone()),
             _ => None,
         };
+        // An alias is refused in its own name but recorded under the name the kernel answers to.
+        let mut recorded: &str = &name;
         let returns = match name.as_str() {
             "struct_insert" | "struct_update" => {
                 let Some(mut fields) = fields_of(0) else {
@@ -213,21 +257,90 @@ impl Binder<'_> {
                     LogicalType::Struct(unnamed.collect())
                 }
             }
-            "struct_contains" | "struct_position" => {
-                let Some(fields) = fields_of(0).filter(|_| bound.len() == 2) else {
-                    return Ok(None);
+            "struct_contains" | "struct_has" | "struct_position" | "struct_indexof" => {
+                let position = matches!(name.as_str(), "struct_position" | "struct_indexof");
+                match types.as_slice() {
+                    // The pin folds `struct_contains(NULL, x)` to a BOOLEAN null before binding, and
+                    // binds `struct_position(NULL, x)` to the untyped null, since only the second
+                    // one looks at a null argument itself.
+                    [LogicalType::Null, _] if position => {
+                        return Ok(Some(self.add_constant(Value::Null)));
+                    }
+                    [LogicalType::Null, _] => {}
+                    [LogicalType::Struct(fields), _] if fields.is_empty() => {}
+                    [LogicalType::Struct(fields), _] if !Field::unnamed(fields) => {
+                        return Err(Error::binder(format!(
+                            "\"{name}\" can only be used on unnamed structs"
+                        )));
+                    }
+                    [LogicalType::Struct(_), _] => {}
+                    _ => return Err(mismatch(&name, &types)),
+                }
+                recorded = if position { "struct_position" } else { "struct_contains" };
+                if position { LogicalType::Integer } else { LogicalType::Boolean }
+            }
+            "list_zip" | "array_zip" => {
+                let Some(last) = types.last() else {
+                    return Err(Error::binder(format!("Provide at least one argument to {name}")));
                 };
-                if !Field::unnamed(&fields) {
+                // A trailing BOOLEAN is the flag that cuts every row to its shortest list, and it is
+                // only a flag in the last place.
+                let lists = types.len() - usize::from(*last == LogicalType::Boolean);
+                if lists == 0 {
                     return Err(Error::binder(format!(
-                        "\"{name}\" can only be used on unnamed structs"
+                        "Provide at least one list argument to {name}"
                     )));
                 }
-                if name == "struct_contains" { LogicalType::Boolean } else { LogicalType::Integer }
+                let mut fields = Vec::with_capacity(lists);
+                for ty in &types[..lists] {
+                    fields.push(Field::new(
+                        "",
+                        match ty {
+                            LogicalType::List(element) => (**element).clone(),
+                            LogicalType::Null => LogicalType::Null,
+                            _ => return Err(Error::binder("Parameter type needs to be List")),
+                        },
+                    ));
+                }
+                recorded = "list_zip";
+                LogicalType::list(LogicalType::Struct(fields))
             }
             _ => return Ok(None),
         };
         let args = self.plan_mut().add_expr_list(bound);
-        let recorded = self.plan_mut().intern(&name);
+        let recorded = self.plan_mut().intern(recorded);
         Ok(Some(self.add_expr(Expr::Function { name: recorded, args }, returns)))
     }
+}
+
+/// Whether a place of this type is one `struct_extract_at` takes, which is what the pin casts to a
+/// BIGINT without being asked: the narrower integers, a string and the untyped null.
+fn takes_place(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::Null
+            | LogicalType::Varchar
+            | LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+    )
+}
+
+/// The pin's refusal of a place outside the struct, which names `struct_extract` whichever of the
+/// two calls it came from.
+fn out_of_range(index: i64, fields: usize) -> Error {
+    Error::binder(format!(
+        "Key index {index} for struct_extract out of range - expected an index between 1 and \
+         {fields}"
+    ))
+}
+
+/// The pin's refusal of a struct call that none of its overloads takes, naming what it was given.
+fn mismatch(name: &str, types: &[LogicalType]) -> Error {
+    let spelled: Vec<String> = types.iter().map(ToString::to_string).collect();
+    rudb_functions::named_mismatch(name, &spelled, false)
 }

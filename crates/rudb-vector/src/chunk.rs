@@ -322,7 +322,7 @@ impl Chunk {
     /// # Errors
     ///
     /// If the selection points past the end of the chunk, or if a column has a type there is no
-    /// vector for, which today means `ARRAY` and `UNION`.
+    /// vector for, which today means `UNION`.
     pub fn compact(self, selection: &Selection) -> Result<Self> {
         marked_twice(self.marked.as_ref())?;
         if let Some(bad) = selection.iter().find(|&index| index >= self.rows) {
@@ -381,7 +381,7 @@ impl Chunk {
     ///
     /// # Errors
     ///
-    /// If a column has a type there is no vector for, which today means `ARRAY` and `UNION`. A `LIST`
+    /// If a column has a type there is no vector for, which today means `UNION`. A `LIST`
     /// and a `MAP` flatten to themselves and a `STRUCT` to a struct of flattened fields, since none of
     /// the three has a data slice for a caller to read and there is nothing flatter to become.
     pub fn flatten(&self) -> Result<Self> {

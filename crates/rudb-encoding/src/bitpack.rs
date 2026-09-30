@@ -790,15 +790,24 @@ pub fn unpack_tail_into<U: Copy>(
 /// # Errors
 ///
 /// If `width` exceeds 64, or if the value would run past the end of `input`.
-#[inline]
+#[inline(always)]
 pub fn tail_at(input: &[u8], width: usize, index: usize) -> Result<u64> {
     // The common case ahead of the checks, since it needs none of them: a width of at most 56 bits
     // starting anywhere in a byte ends inside the eight bytes from that byte, and those are there.
-    // This is the read a link makes for every child it is asked about.
+    // This is the read a link makes for every child it is asked about. The rest is a function of
+    // its own so that this much is inlined into the loops that call it. With all of it in one
+    // body the compiler kept it a call, and on JOB the call a child cost as much as the read.
     let start = index.wrapping_mul(width);
     if width <= 56 && index <= usize::MAX / 64 && start / 8 + 8 <= input.len() {
         return Ok((word_at(input, start / 8) >> (start % 8)) & low_mask(width));
     }
+    tail_at_rest(input, width, index)
+}
+
+/// [`tail_at`] for a value too wide for one load or too near the end of `input` for one.
+#[cold]
+#[inline(never)]
+fn tail_at_rest(input: &[u8], width: usize, index: usize) -> Result<u64> {
     if width > 64 {
         return Err(Error::internal(format!("a width of {width} is past what a u64 holds")));
     }

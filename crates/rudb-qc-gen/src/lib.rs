@@ -1017,7 +1017,14 @@ impl Gen<'_> {
                 AccOp::Distinct(self.once(|g| g.rt.add_distinct())?, None)
             }
             ("count", false) => AccOp::Count,
-            ("sum", _) if argty.is_int() && qir_type(&a.ty)? == Ty::I128 && !unsigned(&arg) => {
+            // A sum into a `BIGINT` is kept as wide as any other and checked once at the end, as
+            // the first engine does.
+            ("sum", _)
+                if argty.is_int()
+                    && !unsigned(&arg)
+                    && (qir_type(&a.ty)? == Ty::I128
+                        || a.ty == LogicalType::BigInt && argty.bytes() <= 8) =>
+            {
                 match argty.bytes() {
                     ..=2 => AccOp::SumNarrow,
                     3..=8 => AccOp::SumSplit,

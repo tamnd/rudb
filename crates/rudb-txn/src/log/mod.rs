@@ -21,7 +21,7 @@ pub use format::{
 pub use lane::{
     Block, CommitSync, Lane, Options, Stats, parse_segment_name, segment_name, segments,
 };
-pub use replay::{Committed, Record, Replayed, replay};
+pub use replay::{Committed, Payload, Record, Replayed, replay};
 
 #[cfg(test)]
 mod tests;

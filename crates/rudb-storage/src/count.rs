@@ -279,6 +279,13 @@ impl Counting<'_> {
         self.column.add(vector);
     }
 
+    /// The hash at and above which this column's sketch keeps nothing, once it has filled. A
+    /// [`Partial::under`] it gives the same column when absorbed and costs less to count.
+    #[must_use]
+    pub fn ceiling(&self) -> Option<u64> {
+        self.column.sketch.ceiling()
+    }
+
     /// Takes in a count of the rows that came after every row this column has seen.
     ///
     /// Parts have to be absorbed in the order of their rows, the way chunks have to be added in it,
@@ -304,6 +311,22 @@ impl Partial {
     #[must_use]
     pub fn new() -> Self {
         Self { column: Column::new() }
+    }
+
+    /// A count for rows that will be absorbed into a column whose sketch keeps nothing at or above
+    /// `ceiling`, which is what [`Counting::ceiling`] reports.
+    ///
+    /// Every hash this turns away is one the union would have dropped, so the column ends the
+    /// same. What it saves is the part filling its own bottom k from nothing: on a replay that
+    /// appends a table in batches, every part of every batch did that for every column, and it
+    /// was the largest cost of the statistics.
+    #[must_use]
+    pub fn under(ceiling: Option<u64>) -> Self {
+        let mut part = Self::new();
+        if let Some(ceiling) = ceiling {
+            part.column.sketch.cap_at(ceiling);
+        }
+        part
     }
 
     /// Counts one vector, the same as [`Counting::add`] does.
@@ -1484,6 +1507,33 @@ mod tests {
         let held = [f64::NAN, other].map(Value::Double).to_vec();
         let vector = Vector::from_values(LogicalType::Double, &held).expect("a column");
         assert_eq!(count(vector), Some((1, true)));
+    }
+
+    /// A part capped at the column's ceiling turns away only what the union would have dropped, so
+    /// the column comes out the same as reading the rows itself, or absorbing parts that were not.
+    #[test]
+    fn a_part_under_the_column_ceiling_leaves_the_same_column() {
+        let values: Vec<i32> = (0..60_000_i32).map(|n| n.wrapping_mul(7919) % 50_000).collect();
+        let mut whole = Counts::new(1);
+        let mut capped = Counts::new(1);
+        let mut plain = Counts::new(1);
+        for (at, run) in values.chunks(6_000).enumerate() {
+            whole.add(&Chunk::new(vec![flat(run)]).expect("a chunk"));
+            for (counts, under) in [(&mut capped, true), (&mut plain, false)] {
+                let mut columns = counts.columns_mut();
+                let column = columns.first_mut().expect("one column");
+                let ceiling = column.ceiling();
+                assert_eq!(ceiling.is_some(), at > 0, "the sketch filled in the first run");
+                let mut part = if under { Partial::under(ceiling) } else { Partial::new() };
+                for piece in run.chunks(1_000) {
+                    part.add(&flat(piece));
+                }
+                column.absorb(part);
+            }
+        }
+        assert_eq!(whole.sketch(0), capped.sketch(0));
+        assert_eq!(whole.sketch(0), plain.sketch(0));
+        assert_eq!(whole.distinct(0), capped.distinct(0));
     }
 
     /// A column this cannot read says nothing rather than saying something low.

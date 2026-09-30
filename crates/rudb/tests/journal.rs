@@ -83,6 +83,36 @@ fn inserted_rows_survive_a_crash_before_any_checkpoint_and_replay_once() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Half a stripe of rows or more in one transaction is a load. The commit appends it to the file
+/// rather than logging it, so it is written once, and it is still there after a crash.
+#[test]
+fn a_load_of_half_a_stripe_goes_to_the_file_and_not_the_log() {
+    let path = path("bulk");
+    let db = open(&path);
+    db.execute("CREATE TABLE t (id BIGINT)").expect("creates");
+    db.execute("INSERT INTO t VALUES (0)").expect("inserts");
+    db.execute("INSERT INTO t SELECT range + 1 FROM range(262144)").expect("loads");
+    assert_eq!(segments(&path), 0, "the load went to the file");
+    db.execute("BEGIN").expect("begins");
+    for start in (0..262_144).step_by(65_536) {
+        let from = 262_145 + start;
+        let sql = format!("INSERT INTO t SELECT range + {from} FROM range(65536)");
+        db.execute(&sql).expect("inserts");
+    }
+    db.execute("COMMIT").expect("commits");
+    assert_eq!(segments(&path), 0, "four inserts that add up to a load went to the file too");
+    db.execute("INSERT INTO t SELECT range + 524289 FROM range(1000)").expect("inserts");
+    assert!(segments(&path) > 0, "a smaller insert is logged");
+    crash(db);
+
+    let db = open(&path);
+    let want = vec![vec![Value::BigInt(525_289), Value::BigInt(525_289), Value::BigInt(525_288)]];
+    let got = rows(&db, "SELECT count(*), count(DISTINCT id), max(id) FROM t");
+    assert_eq!(got, want, "every row once");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn a_rolled_back_insert_is_not_replayed_and_a_committed_one_is() {
     let path = path("rollback");
