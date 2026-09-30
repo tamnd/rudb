@@ -279,6 +279,16 @@ impl Rows {
         }
     }
 
+    /// How many rows of one column are coded into a dictionary and how many rows there are, for
+    /// an in memory table. A file and a table grown past one say nothing, since what their parts
+    /// are coded as is only known once they are read.
+    pub fn dictionary_rows(&self, column: usize) -> Result<Option<(usize, usize)>> {
+        match self {
+            Self::Memory(rows) => rows.dictionary_rows(column).map(Some),
+            Self::Native(_) | Self::Grown(_, _) => Ok(None),
+        }
+    }
+
     /// The sum of one integer column and the rows that went into it, from the zone maps of an in
     /// memory table or the directory of a file.
     pub fn exact_sum(&self, column: usize) -> Result<Option<(i128, u64)>> {

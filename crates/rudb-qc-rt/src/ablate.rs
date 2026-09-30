@@ -36,9 +36,11 @@ impl Ablate {
     /// Rows for new keys appended to a table's lanes in compiled code while the table has stopped
     /// looking for keys, with no `ht_insert` call.
     pub const APPEND: Ablate = Ablate(1 << 11);
+    /// A number column coded into a dictionary read through its codes rather than made flat.
+    pub const CODED: Ablate = Ablate(1 << 12);
 
     /// Every switch with its name, in the order a table of them is printed.
-    pub const ALL: [(&'static str, Ablate); 12] = [
+    pub const ALL: [(&'static str, Ablate); 13] = [
         ("probe", Ablate::PROBE),
         ("like", Ablate::LIKE),
         ("top", Ablate::TOP),
@@ -51,6 +53,7 @@ impl Ablate {
         ("pairs", Ablate::PAIRS),
         ("runs", Ablate::RUNS),
         ("append", Ablate::APPEND),
+        ("coded", Ablate::CODED),
     ];
 
     /// Reads a comma separated list of names, where an empty list or `none` is nothing and `all`
