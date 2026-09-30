@@ -66,6 +66,18 @@ use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
 use rudb_txn::log::CommitSync;
 
+/// When the rows a commit wrote are seen by the other connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Visibility {
+    /// Once the commit is as durable as `commit_sync` asks, which is when it returns. The writer
+    /// lock is held through the wait, so every commit has a sync of its own.
+    Durable,
+    /// As soon as the commit's block is queued in the log. The writer lock is let go before the
+    /// wait, so commits from several connections share one sync, and a crash can lose rows
+    /// another connection read. The commit itself still returns only once durable.
+    Committed,
+}
+
 use crate::config::{Config, parse_size};
 
 /// The settings of one database, and what `RESET` puts them back to.
@@ -185,6 +197,8 @@ pub(crate) struct Settings {
     ///
     /// Not a DuckDB setting, for the reason the seams are not.
     commit_sync: RwLock<CommitSync>,
+    /// When a commit's rows are seen by other connections, as `SET visibility` has left it.
+    visibility: RwLock<Visibility>,
     /// How many times a statement has been let at the settings, counted after it is done.
     changes: AtomicU64,
     /// The last session [`Settings::session`] built, and the count of changes it was built at.
@@ -236,6 +250,7 @@ impl Settings {
             morsel: RwLock::new(0),
             ablate: RwLock::new(rudb_qc::Ablate::NONE),
             commit_sync: RwLock::new(CommitSync::Full),
+            visibility: RwLock::new(Visibility::Durable),
             changes: AtomicU64::new(0),
             built: Mutex::new(None),
         }
@@ -276,6 +291,11 @@ impl Settings {
     /// What `SET commit_sync` left a commit waiting for.
     pub(crate) fn commit_sync(&self) -> CommitSync {
         *self.commit_sync.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// What `SET visibility` left a commit showing its rows at.
+    pub(crate) fn visibility(&self) -> Visibility {
+        *self.visibility.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The engine `SET engine` picked, `first` or `compiled`.
@@ -425,6 +445,20 @@ impl Settings {
                 Error::invalid_input(format!("commit_sync is full, os or none, not {written}"))
             })?;
             *self.commit_sync.write().unwrap_or_else(|held| held.into_inner()) = sync;
+            return Ok(());
+        }
+        if is_visibility(name) {
+            let written = value.map_or_else(|| "durable".to_string(), text_of);
+            let visibility = match written.trim().to_ascii_lowercase().as_str() {
+                "durable" => Visibility::Durable,
+                "committed" => Visibility::Committed,
+                _ => {
+                    return Err(Error::invalid_input(format!(
+                        "visibility is durable or committed, not {written}"
+                    )));
+                }
+            };
+            *self.visibility.write().unwrap_or_else(|held| held.into_inner()) = visibility;
             return Ok(());
         }
         if is_ablate(name) {
@@ -819,6 +853,13 @@ impl Settings {
         if is_commit_sync(name) {
             return Ok(sync_name(self.commit_sync()).to_string());
         }
+        if is_visibility(name) {
+            let word = match self.visibility() {
+                Visibility::Durable => "durable",
+                Visibility::Committed => "committed",
+            };
+            return Ok(word.to_string());
+        }
         if is_ablate(name) {
             return Ok(self.ablate().to_string());
         }
@@ -1147,6 +1188,11 @@ fn is_morsel(name: &str) -> bool {
 /// Whether this name is the log's commit setting, the same shape as [`is_engine`].
 fn is_commit_sync(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("commit_sync")
+}
+
+/// Whether this name is the commit visibility setting, the same shape as [`is_engine`].
+fn is_visibility(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("visibility")
 }
 
 /// The commit setting a word names. `barrier` is taken and is `full` until the log has a second

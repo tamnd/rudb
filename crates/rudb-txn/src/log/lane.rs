@@ -331,6 +331,20 @@ impl Lane {
     /// If the block is larger than a segment, which needs the spill that is not written yet, or
     /// the lane failed, now or earlier.
     pub fn commit(&self, block: &Block) -> Result<u64> {
+        let end = self.enqueue(block)?;
+        self.settle(end, self.options.commit_sync)
+    }
+
+    /// Queues `block` for the next leader and returns the lane position just past it, without
+    /// waiting for anything. Until [`Self::settle`] says so it may be neither written nor synced.
+    ///
+    /// A committer that queues under its own lock and waits after letting go of it is what lets a
+    /// second committer's block into the same sync.
+    ///
+    /// # Errors
+    ///
+    /// If the block is larger than a segment, or the lane failed earlier.
+    pub fn enqueue(&self, block: &Block) -> Result<u64> {
         let len = block.len() as u64;
         if len > self.options.segment_bytes - SEGMENT_HEADER as u64 {
             return Err(Error::invalid_input(format!(
@@ -353,9 +367,19 @@ impl Lane {
         state.reserved = end;
         state.stats.bytes += len;
         state.stats.commits += 1;
-        match self.options.commit_sync {
-            CommitSync::Full | CommitSync::Barrier => self.wait(state, end, true),
-            CommitSync::Os => self.wait(state, end, false),
+        Ok(end)
+    }
+
+    /// Waits until lane position `end`, from [`Self::enqueue`], is as far as `sync` asks: synced
+    /// for `full` and `barrier`, handed to the operating system for `os`, and nowhere for `none`.
+    ///
+    /// # Errors
+    ///
+    /// If the lane failed, now or earlier.
+    pub fn settle(&self, end: u64, sync: CommitSync) -> Result<u64> {
+        match sync {
+            CommitSync::Full | CommitSync::Barrier => self.wait(self.lock(), end, true),
+            CommitSync::Os => self.wait(self.lock(), end, false),
             CommitSync::None => Ok(end),
         }
     }

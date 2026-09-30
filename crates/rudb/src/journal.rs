@@ -223,7 +223,7 @@ pub(crate) struct Journal {
     /// The newest commit timestamp handed out, or the cut the file was opened at.
     last: u64,
     /// Opened at the first commit, because opening one makes a segment.
-    lane: Option<Lane>,
+    lane: Option<Arc<Lane>>,
     /// Records waiting for the commit.
     staged: Vec<Record>,
     staged_bytes: usize,
@@ -232,6 +232,26 @@ pub(crate) struct Journal {
     /// Whether the file has an anchor this log is replayed against. Until it does a commit
     /// checkpoints, because a log beside a file without one is taken for another file's.
     anchored: bool,
+}
+
+/// A block queued in the lane that its commit has not waited for yet.
+#[derive(Debug)]
+pub(crate) struct Pending {
+    lane: Arc<Lane>,
+    end: u64,
+    sync: CommitSync,
+}
+
+impl Pending {
+    /// Waits until the block is as far as the commit's `commit_sync` asks, leading the lane's next
+    /// write and sync when nobody else is, which carries every block queued behind this one too.
+    ///
+    /// # Errors
+    ///
+    /// If the lane failed, now or earlier.
+    pub(crate) fn wait(self) -> Result<()> {
+        self.lane.settle(self.end, self.sync).map(|_| ())
+    }
 }
 
 /// The log directory of the database file at `path`.
@@ -391,7 +411,9 @@ impl Journal {
         self.dirty || (!self.anchored && !self.staged.is_empty())
     }
 
-    /// Writes what was staged to the lane as one committed block and waits for what `sync` says.
+    /// Queues what was staged in the lane as one committed block and hands back what is left to
+    /// wait for, which the caller may do after letting go of its locks. `None` when there is
+    /// nothing to wait for: nothing was staged, or `sync` is `none`.
     ///
     /// Under [`CommitSync::None`] the blocks queue in the lane and nothing waits, and once a
     /// megabyte of them is queued they are handed to the operating system in one write, so a crash
@@ -401,9 +423,9 @@ impl Journal {
     ///
     /// If the lane cannot be opened or written. The staged records are dropped either way; a
     /// failed commit is followed by a checkpoint, which the caller asks for.
-    pub(crate) fn commit(&mut self, sync: CommitSync) -> Result<()> {
+    pub(crate) fn enqueue(&mut self, sync: CommitSync) -> Result<Option<Pending>> {
         if self.staged.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let staged = std::mem::take(&mut self.staged);
         self.staged_bytes = 0;
@@ -412,21 +434,24 @@ impl Journal {
         for record in &staged {
             block.push(record.kind, 0, &record.payload)?;
         }
-        let lane = match self.lane.take() {
-            Some(lane) => lane,
+        let lane = match &self.lane {
+            Some(lane) => Arc::clone(lane),
             None => {
                 let options = Options { segment_bytes: SEGMENT, ..Options::new(self.database) };
-                Lane::open(Arc::clone(&self.fs), &self.dir, options)?
+                let lane = Arc::new(Lane::open(Arc::clone(&self.fs), &self.dir, options)?);
+                self.lane = Some(Arc::clone(&lane));
+                lane
             }
         };
-        let lane = self.lane.insert(lane);
-        lane.set_commit_sync(sync);
-        lane.commit(&block)?;
+        let end = lane.enqueue(&block)?;
         self.last = ts;
-        if sync == CommitSync::None && lane.unwritten() >= QUEUED {
-            lane.write_out()?;
+        if sync == CommitSync::None {
+            if lane.unwritten() >= QUEUED {
+                lane.write_out()?;
+            }
+            return Ok(None);
         }
-        Ok(())
+        Ok(Some(Pending { lane, end, sync }))
     }
 
     /// The anchor a checkpoint of everything committed so far writes into the file.
