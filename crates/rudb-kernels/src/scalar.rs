@@ -60,6 +60,7 @@ use crate::cast;
 use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
+use crate::folds;
 use crate::hash;
 use crate::histogram;
 use crate::lists;
@@ -240,6 +241,9 @@ fn specialized<V: AsRef<Vector>>(
     }
     if name == "coalesce" {
         return coalesced(args, returns, rows);
+    }
+    if let Some(vector) = folds::vectorized(name, args, returns, rows)? {
+        return Ok(Some(vector));
     }
     if let Some(vector) = lists::vectorized(name, args, returns, rows)? {
         return Ok(Some(vector));
@@ -4020,6 +4024,9 @@ pub fn call_values(
         return answer;
     }
     if let Some(answer) = lists::value(name, args, returns) {
+        return answer;
+    }
+    if let Some(answer) = folds::value(name, args) {
         return answer;
     }
     if let Some(answer) = maps::value(name, args, returns) {

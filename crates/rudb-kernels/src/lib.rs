@@ -70,6 +70,7 @@ mod datediff;
 mod datetime;
 mod digest;
 pub mod fallback;
+mod folds;
 mod general;
 mod glob;
 mod graphemes;
