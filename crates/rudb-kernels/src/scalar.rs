@@ -60,6 +60,7 @@ use crate::cast;
 use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
+use crate::folds;
 use crate::hash;
 use crate::histogram;
 use crate::lists;
@@ -240,6 +241,9 @@ fn specialized<V: AsRef<Vector>>(
     }
     if name == "coalesce" {
         return coalesced(args, returns, rows);
+    }
+    if let Some(vector) = folds::vectorized(name, args, returns, rows)? {
+        return Ok(Some(vector));
     }
     if let Some(vector) = lists::vectorized(name, args, returns, rows)? {
         return Ok(Some(vector));
@@ -3959,6 +3963,10 @@ pub fn call_values(
         }
         return Ok(Value::Varchar(out));
     }
+    // `concat_ws` passes a null piece by the same way, though a null separator is a null answer.
+    if name == "concat_ws" {
+        return crate::strings::concat_ws(args);
+    }
     // `list_concat` is the fourth one above the null rule and it follows `concat`'s rule rather than
     // the operator's. A null argument is a list with nothing in it here, so `list_concat([1], NULL)`
     // is `[1]` upstream while `[1] || NULL` is null, and the two spellings are not the same function
@@ -4016,6 +4024,9 @@ pub fn call_values(
         return answer;
     }
     if let Some(answer) = lists::value(name, args, returns) {
+        return answer;
+    }
+    if let Some(answer) = folds::value(name, args) {
         return answer;
     }
     if let Some(answer) = maps::value(name, args, returns) {
@@ -4159,6 +4170,78 @@ pub fn call_values(
         // The signature cast every argument after the format to a kind the formatter reads.
         ("format", [Value::Varchar(pattern), rest @ ..]) => crate::printf::format(pattern, rest),
         ("printf", [Value::Varchar(pattern), rest @ ..]) => crate::printf::printf(pattern, rest),
+        // The signature cast every argument of these to the type the pin declares for it.
+        ("repeat", [held, count]) => crate::strings::repeat(held, count, returns),
+        ("lpad" | "rpad", [Value::Varchar(text), Value::Integer(length), Value::Varchar(pad)]) => {
+            crate::strings::pad(name, text, *length, pad)
+        }
+        ("ascii" | "unicode" | "ord", [Value::Varchar(text)]) => {
+            Ok(crate::strings::code_point(name, text))
+        }
+        ("translate", [Value::Varchar(text), Value::Varchar(from), Value::Varchar(to)]) => {
+            Ok(crate::strings::translate(text, from, to))
+        }
+        ("url_encode", [Value::Varchar(text)]) => Ok(crate::strings::url_encode(text)),
+        ("url_decode", [Value::Varchar(text)]) => crate::strings::url_decode(text),
+        ("bar", [Value::Double(x), Value::Double(min), Value::Double(max), most @ ..]) => {
+            let most = match most {
+                [Value::Double(most)] => *most,
+                _ => 80.0,
+            };
+            crate::strings::bar(*x, *min, *max, most)
+        }
+        ("to_base", [Value::BigInt(number), Value::Integer(radix), min_length @ ..]) => {
+            let min_length = match min_length {
+                [Value::Integer(min_length)] => *min_length,
+                _ => 0,
+            };
+            crate::strings::to_base(*number, *radix, min_length)
+        }
+        // The signature cast every argument of these to a type the pin declares for it. A FLOAT
+        // or a DOUBLE given to `hex` or `bin` stands for the BIGNUM the pin casts it to.
+        ("md5" | "md5_number" | "sha1" | "sha256", [Value::Varchar(text)]) => {
+            Ok(crate::hashing::hashed(name, text.as_bytes()))
+        }
+        ("md5" | "md5_number" | "sha1" | "sha256", [Value::Blob(blob)]) => {
+            Ok(crate::hashing::hashed(name, blob))
+        }
+        ("hex" | "to_hex", [held]) => crate::codec::written(false, held),
+        ("bin" | "to_binary", [held]) => crate::codec::written(true, held),
+        ("unhex" | "from_hex", [Value::Varchar(text)]) => {
+            Ok(Value::Blob(crate::codec::unhex(text)?))
+        }
+        ("unbin" | "from_binary", [Value::Varchar(text)]) => {
+            Ok(Value::Blob(crate::codec::unbin(text)?))
+        }
+        ("encode", [Value::Varchar(text)]) => Ok(Value::Blob(text.as_bytes().to_vec())),
+        ("decode", [Value::Blob(blob)]) => Ok(Value::Varchar(crate::codec::decode(blob, None)?)),
+        ("decode", [Value::Blob(blob), Value::Varchar(behavior)]) => {
+            Ok(Value::Varchar(crate::codec::decode(blob, Some(behavior))?))
+        }
+        ("base64" | "to_base64", [Value::Blob(blob)]) => {
+            Ok(Value::Varchar(crate::codec::base64(blob)))
+        }
+        ("from_base64", [Value::Varchar(text)]) => {
+            Ok(Value::Blob(crate::codec::from_base64(text)?))
+        }
+        ("length_grapheme", [Value::Varchar(text)]) => {
+            Ok(Value::BigInt(crate::graphemes::count(text)))
+        }
+        ("reverse", [Value::Varchar(text)]) => Ok(Value::Varchar(crate::graphemes::reverse(text))),
+        ("left_grapheme", [Value::Varchar(text), Value::BigInt(count)]) => {
+            Ok(Value::Varchar(crate::graphemes::left(text, *count)?.to_string()))
+        }
+        ("right_grapheme", [Value::Varchar(text), Value::BigInt(count)]) => {
+            Ok(Value::Varchar(crate::graphemes::right(text, *count)?.to_string()))
+        }
+        ("substring_grapheme", [Value::Varchar(text), Value::BigInt(offset)]) => {
+            Ok(Value::Varchar(crate::graphemes::substring_rest(text, *offset)?.to_string()))
+        }
+        (
+            "substring_grapheme",
+            [Value::Varchar(text), Value::BigInt(offset), Value::BigInt(length)],
+        ) => Ok(Value::Varchar(crate::graphemes::substring(text, *offset, *length)?.to_string())),
+        ("regexp_escape", [Value::Varchar(text)]) => Ok(crate::strings::regexp_escape(text)),
         ("parse_formatted_bytes", [Value::Varchar(text)]) => {
             Ok(Value::UBigInt(crate::bytes::parse_formatted_bytes(text)?))
         }

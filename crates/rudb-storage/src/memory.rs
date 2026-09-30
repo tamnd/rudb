@@ -441,6 +441,9 @@ impl MemoryTable {
         });
         let tasks: Vec<(usize, usize)> =
             columns.iter().flat_map(|&column| (0..parts).map(move |part| (column, part))).collect();
+        // Each part turns away what the column's sketch would drop anyway, see [`Partial::under`].
+        let ceilings: Vec<Option<u64>> =
+            self.counts.columns_mut().iter().map(|counting| counting.ceiling()).collect();
         let done: Vec<Mutex<Option<Counted>>> =
             (0..self.types.len() * parts).map(|_| Mutex::new(None)).collect();
         let next = AtomicUsize::new(0);
@@ -454,7 +457,7 @@ impl MemoryTable {
                 let run = chunks.get(part * per..chunks.len().min((part + 1) * per)).unwrap_or(&[]);
                 let started = Instant::now();
                 let mut counting_ns = 0;
-                let mut partial = Partial::new();
+                let mut partial = Partial::under(ceilings.get(column).copied().flatten());
                 let mut ranges = Vec::with_capacity(run.len());
                 for chunk in run {
                     let Ok(vector) = chunk.column(column) else { continue };

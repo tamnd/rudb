@@ -45,6 +45,7 @@ mod stats;
 mod style;
 mod timing;
 mod topcount;
+mod unicode;
 mod vendor;
 mod version;
 
@@ -61,6 +62,11 @@ fn main() -> ExitCode {
         Some("grammar") => vendor::verify(),
         Some("gen-grammar") => {
             codegen::generate(std::env::args().nth(2).as_deref() == Some("--check"))
+        }
+        Some("gen-unicode") => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let source = rest.iter().find(|arg| *arg != "--check").map(String::as_str);
+            unicode::generate(source, rest.iter().any(|arg| arg == "--check"))
         }
         Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
         Some("version") => version::set(&root(), std::env::args().nth(2).as_deref()),
@@ -173,6 +179,8 @@ fn usage() {
     println!(
         "  gen-grammar [--check]  regenerate the parser's and rudb-common's tables from that grammar"
     );
+    println!("  gen-unicode <utf8proc_data.cpp> [--check]  regenerate the grapheme break table");
+    println!("           from the pin's copy of utf8proc, out of a duckdb checkout at the pin");
     println!("  smoke    the query in M0's exit criterion, run on this host, answers checked");
     println!("  conform  the committed corpus in tamnd/rudb-compat, through this tree's shell and");
     println!("           through this tree's library. needs a checkout beside this one, or");
