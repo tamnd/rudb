@@ -91,7 +91,8 @@ fn read_at(file: &File, offset: u64, into: &mut [u8], path: &str) -> Result<()> 
 /// made against, or `None` where there is nowhere to put one or the file changed while it was read.
 ///
 /// `config` is the asking database's, so the load runs under the same memory limit and threads as
-/// the query that asked, with mirroring off so that the load reads the file itself.
+/// the query that asked, with mirroring off so that the load reads the file itself. `pages` is the
+/// database's pool, so the mirror hears it when the statement running is the last one.
 ///
 /// # Errors
 ///
@@ -100,6 +101,7 @@ pub(crate) fn ensure(
     path: &str,
     binary_as_string: bool,
     config: Config,
+    pages: &rudb_native::PagePool,
 ) -> Result<Option<(FileStamp, rudb_native::Reader)>> {
     let Some(directory) = directory() else { return Ok(None) };
     let Some(stamp) = FileStamp::of(Path::new(path)) else { return Ok(None) };
@@ -115,7 +117,7 @@ pub(crate) fn ensure(
             return Ok(None);
         }
     }
-    let native = rudb_native::Catalog::open(&mirror)?;
+    let native = rudb_native::Catalog::open_in(&mirror, &rudb_native::PagePool::following(pages))?;
     Ok(Some((stamp, native.table(TABLE)?)))
 }
 

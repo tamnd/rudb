@@ -4996,6 +4996,9 @@ pub struct PagePool {
     /// Set when the pool should hold pages only and never a decoded part, which is how the tests
     /// that count pages see the pages on their own.
     pages_only: Arc<AtomicBool>,
+    /// Set when the statement running now is the last one anything will read through this pool.
+    /// See [`PagePool::last_statement`].
+    last: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -5032,6 +5035,30 @@ impl PagePool {
     /// does not.
     fn keeps(&self) -> bool {
         self.budget.load(Atomic::Relaxed) > 0 && !self.pages_only.load(Atomic::Relaxed)
+    }
+
+    /// Says that no statement after the one about to run will read through this pool, so a read
+    /// holds what it decoded only when this statement reads it again.
+    ///
+    /// A read holds a part the first time it decodes it whole, and a dictionary sweep keeps the
+    /// blocks it decodes, so that the next statement asking the same question does not decode them
+    /// again. When there is no next statement that is memory for nothing. A shell running a file
+    /// knows when it has reached the last statement in it, and ClickBench runs each query that way,
+    /// one process a query. A part this statement reads twice is still held on the second read.
+    pub fn last_statement(&self) {
+        self.last.store(true, Atomic::Relaxed);
+    }
+
+    /// A pool with no budget of its own that hears [`PagePool::last_statement`] when `other`
+    /// does, for a file a database reads beside its own, the way it reads a Parquet file's mirror.
+    #[must_use]
+    pub fn following(other: &Self) -> Self {
+        Self { last: Arc::clone(&other.last), ..Self::default() }
+    }
+
+    /// Whether [`PagePool::last_statement`] has been said.
+    fn is_last(&self) -> bool {
+        self.last.load(Atomic::Relaxed)
     }
 
     /// A pool that keeps up to `budget` bytes of pages and no decoded parts.
@@ -5250,6 +5277,9 @@ struct NativeText {
     /// How many decoded payload bytes this column keeps before a sweep stops keeping what it reads.
     /// [`TEXT_KEEP_BUDGET`] everywhere but in the test of the ceiling.
     keep_budget: usize,
+    /// The pool's word that no statement after this one reads the column, which has a sweep keep a
+    /// block only when it decodes it a second time. See [`PagePool::last_statement`].
+    last: Arc<AtomicBool>,
     /// Roughly how many decoded payload bytes are being kept, which is what [`TEXT_KEEP_BUDGET`]
     /// is measured against.
     ///
@@ -5681,7 +5711,7 @@ impl NativeText {
         }
         let again = kept.is_none()
             && self.swept.get(block).is_some_and(|swept| swept.swap(true, Atomic::Relaxed));
-        let keep = (again || !scattered)
+        let keep = (again || !(scattered || self.last.load(Atomic::Relaxed)))
             && (self.payload_kept.load(Atomic::Relaxed) < self.keep_budget
                 || (scattered && self.visit_dropped.load(Atomic::Relaxed) >= self.blocks.len()));
         if keep {
@@ -8102,6 +8132,7 @@ impl Reader {
             page,
             &self.table.fields[column].ty,
             TEXT_KEEP_BUDGET,
+            Arc::clone(&self.pool.last),
         )?);
         let _ = self.dictionaries[column].set(Arc::clone(&dictionary));
         Ok(Some(dictionary))
@@ -8825,8 +8856,11 @@ impl Reader {
             // run into the `Arc` without touching a value.
             let mut vector = match positions {
                 Some(positions) if !keeping => {
-                    if keeps && self.pay_or_hold(at, column, paid_at(rows, bytes, positions), rows)
-                    {
+                    let paid = paid_at(rows, bytes, positions);
+                    if keeps && self.pool.is_last() {
+                        self.pay(at, column, paid);
+                        decode_at(&field.ty, rows, bytes, dictionary, positions)?
+                    } else if keeps && self.pay_or_hold(at, column, paid, rows) {
                         keeping = true;
                         decode(&field.ty, rows, bytes, dictionary)?
                     } else {
@@ -8890,7 +8924,7 @@ impl Reader {
         positions: Option<&[u32]>,
         rows: usize,
     ) -> std::result::Result<Arc<Vector>, bool> {
-        let Some(Ok(held)) = self.cache.made(column, at).map(Mutex::lock) else {
+        let Some(Ok(mut held)) = self.cache.made(column, at).map(Mutex::lock) else {
             return Err(false);
         };
         match &*held {
@@ -8908,8 +8942,13 @@ impl Reader {
                 // that pays otherwise: on JOB the second run of each query cost 60 billion cycles
                 // across the suite against 35 for the third, nearly all of it decoding again the
                 // parts the first run had decoded and let go.
-                if before >= rows || positions.is_none() {
+                if before >= rows || (positions.is_none() && !self.pool.is_last()) {
                     return Err(true);
+                }
+                // With no statement after this one, a whole read only counts its rows, and a
+                // second read of the part in this statement is the one that holds it.
+                if positions.is_none() {
+                    *held = PartSlot::Seen(before.saturating_add(rows));
                 }
                 // A read at positions counts what it cost once it knows how the part is coded.
                 // See [`Self::pay`].
@@ -13717,6 +13756,7 @@ fn open_global_dictionary(
     page: Page,
     ty: &LogicalType,
     keep_budget: usize,
+    last: Arc<AtomicBool>,
 ) -> Result<Vector> {
     if !coded_type(ty) {
         return Err(invalid("global dictionary belongs to a non-string column"));
@@ -13887,6 +13927,7 @@ fn open_global_dictionary(
             blocks: (0..blocks).map(|_| OnceLock::new()).collect(),
             char_lens: (0..blocks).map(|_| OnceLock::new()).collect(),
             keep_budget,
+            last,
             payload_kept: AtomicUsize::new(0),
             swept: (0..blocks).map(|_| AtomicBool::new(false)).collect(),
             visit_dropped: AtomicUsize::new(0),
@@ -16926,6 +16967,37 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
+    /// After the last statement is announced a whole read only counts its rows, and the part is
+    /// held by the second read of it, which is the same statement reading it again.
+    #[test]
+    fn the_last_statement_holds_a_part_on_its_second_read() {
+        let path = path("last-statement");
+        let mut writer =
+            Writer::create(&path, "a", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        let values: Vec<Value> = (0..64).map(Value::Integer).collect();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::Integer, &values).expect("integers")])
+                .expect("matching rows");
+        writer.append(&chunk).expect("one part");
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        pool.last_statement();
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("a").expect("a");
+        let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
+        let first = a.read(0, &[0]).expect("a part");
+        assert_eq!(first.value_at(63, 0), Value::Integer(63));
+        assert!(matches!(*slot(0), PartSlot::Seen(64)), "the first read only counts its rows");
+        assert_eq!(pool.bytes(), 0, "and keeps nothing");
+        let second = a.read(0, &[0]).expect("a part");
+        assert_eq!(second.value_at(63, 0), Value::Integer(63));
+        assert!(matches!(*slot(0), PartSlot::Held { .. }), "the second read holds it");
+        drop((a, catalog));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
     /// A whole read holds the part it decoded, reads at positions count what they cost until the
     /// read whose share comes to the part holds it, and a part the pool lets go is decoded again
     /// from its pages. A part of 64 integers is decoded whole by any read of it, so here the first
@@ -18718,9 +18790,14 @@ mod tests {
             .collect::<Vec<_>>();
         let (path, reader) = stored_spellings("string-kernels", &spellings);
         let page = reader.table.dictionaries[0].expect("a string column has one");
-        let starved =
-            open_global_dictionary(Arc::clone(&reader.file), page, &LogicalType::Varchar, 0)
-                .expect("a dictionary opens whatever it may keep");
+        let starved = open_global_dictionary(
+            Arc::clone(&reader.file),
+            page,
+            &LogicalType::Varchar,
+            0,
+            Arc::default(),
+        )
+        .expect("a dictionary opens whatever it may keep");
         let starved = Arc::new(starved);
         let (codes, valid) = scattered_rows(spellings.len());
         let rows = Vector::dictionary_over(codes.clone(), Arc::clone(&starved))
@@ -19207,9 +19284,14 @@ mod tests {
                 length: u32::try_from(length).expect("a test dictionary is small"),
                 hash: checksum(&encoded.index),
             };
-            let opened =
-                open_global_dictionary(file, page, &LogicalType::Varchar, TEXT_KEEP_BUDGET)
-                    .expect("a dictionary laid out either way opens");
+            let opened = open_global_dictionary(
+                file,
+                page,
+                &LogicalType::Varchar,
+                TEXT_KEEP_BUDGET,
+                Arc::default(),
+            )
+            .expect("a dictionary laid out either way opens");
             let mut swept: Vec<Vec<u8>> = Vec::new();
             let mut at = 0;
             while at < opened.len() {
@@ -19261,7 +19343,7 @@ mod tests {
         let reader = Reader::open(&path).expect("valid directory");
         let page = reader.table.dictionaries[0].expect("a string column has one");
         let file = Arc::clone(&reader.file);
-        let starved = open_global_dictionary(file, page, &LogicalType::Varchar, 0)
+        let starved = open_global_dictionary(file, page, &LogicalType::Varchar, 0, Arc::default())
             .expect("a dictionary opens whatever it may keep");
 
         let resting = starved.footprint();

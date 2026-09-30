@@ -78,6 +78,9 @@ pub struct Shell {
     /// anything does not leave an empty file behind for a harness to trip over.
     metrics: Option<PathBuf>,
     started: bool,
+    /// Whether the input running now is the last the shell will be given, so that its last
+    /// statement can tell the database nothing follows it. See [`Database::last_statement`].
+    closing: bool,
 }
 
 impl std::fmt::Debug for Shell {
@@ -112,6 +115,7 @@ impl Shell {
             failed: false,
             metrics: options.metrics.clone(),
             started: false,
+            closing: false,
         }
     }
 
@@ -149,8 +153,12 @@ impl Shell {
     }
 
     /// Runs everything the command line asked for, in order.
-    pub fn run_commands(&mut self, commands: &[Command]) -> Stop {
-        for command in commands {
+    ///
+    /// `last` says the shell will be given nothing after these, which is what `-f`, `-c` and
+    /// `-no-stdin` promise, so the last statement of the last command is the last one it runs.
+    pub fn run_commands(&mut self, commands: &[Command], last: bool) -> Stop {
+        for (at, command) in commands.iter().enumerate() {
+            self.closing = last && at + 1 == commands.len();
             let stop = match command {
                 Command::Sql(sql) => self.run_input(sql),
                 Command::File(path) => self.run_file(path),
@@ -159,7 +167,17 @@ impl Shell {
                 return Stop::Failed;
             }
         }
+        self.closing = false;
         Stop::Done
+    }
+
+    /// Runs a block of input that nothing will follow, which is standard input when it is not a
+    /// terminal and has been read to its end.
+    pub fn run_last_input(&mut self, text: &str) -> Stop {
+        self.closing = true;
+        let stop = self.run_input(text);
+        self.closing = false;
+        stop
     }
 
     /// Runs a file of SQL and dot commands.
@@ -213,7 +231,7 @@ impl Shell {
             pending.push_str(line);
             if rudb::is_complete(&pending) {
                 let statement = std::mem::take(&mut pending);
-                if self.run_sql(&statement) == Stop::Failed {
+                if self.run_sql(&statement, false) == Stop::Failed {
                     return Stop::Done;
                 }
             }
@@ -226,11 +244,19 @@ impl Shell {
     /// not. Lines accumulate into a statement until the tokenizer says the statement is finished,
     /// which is how a multi line `CREATE TABLE` works at a prompt and in a file alike.
     pub fn run_input(&mut self, text: &str) -> Stop {
+        let closing = self.closing;
+        let lines = text.lines().collect::<Vec<_>>();
+        // The last line with something on it. What runs there or after it is the last thing this
+        // input runs, and a `.read` anywhere before it is followed by more.
+        let end = lines.iter().rposition(|line| !line.trim().is_empty()).unwrap_or(0);
         let mut pending = String::new();
-        for line in text.lines() {
+        for (at, line) in lines.into_iter().enumerate() {
             if pending.trim().is_empty() && line.trim_start().starts_with('.') {
                 pending.clear();
-                if self.run_dot(line.trim()) == Stop::Failed {
+                self.closing = closing && at >= end;
+                let stop = self.run_dot(line.trim());
+                self.closing = closing;
+                if stop == Stop::Failed {
                     return Stop::Failed;
                 }
                 continue;
@@ -241,7 +267,7 @@ impl Shell {
             pending.push_str(line);
             if rudb::is_complete(&pending) {
                 let statement = std::mem::take(&mut pending);
-                if self.run_sql(&statement) == Stop::Failed {
+                if self.run_sql(&statement, closing && at >= end) == Stop::Failed {
                     return Stop::Failed;
                 }
             }
@@ -249,11 +275,12 @@ impl Shell {
         if pending.trim().is_empty() {
             return Stop::Done;
         }
-        self.run_sql(&pending)
+        self.run_sql(&pending, closing)
     }
 
-    /// Runs whatever statements are in one piece of text.
-    fn run_sql(&mut self, text: &str) -> Stop {
+    /// Runs whatever statements are in one piece of text, the last of them the last the shell
+    /// runs when `last` says so.
+    fn run_sql(&mut self, text: &str, last: bool) -> Stop {
         let found = match rudb::statements(text) {
             Ok(found) => found,
             Err(problem) => {
@@ -261,7 +288,11 @@ impl Shell {
                 return self.after_error();
             }
         };
-        for statement in found {
+        let count = found.len();
+        for (at, statement) in found.into_iter().enumerate() {
+            if last && at + 1 == count {
+                self.database.last_statement();
+            }
             if self.echo {
                 let _ = writeln!(self.out, "{}", statement.sql());
             }

@@ -1435,6 +1435,17 @@ impl Database {
         Ok(Self { shared: Shared { inner: Arc::new(inner) } })
     }
 
+    /// Says that the statement about to run is the last one this database will be asked, so a
+    /// read keeps what it decodes only when the same statement reads it again.
+    ///
+    /// What a read keeps is there for the next statement, and a program that runs one statement
+    /// and exits, which is how a script or a benchmark uses the shell, never has one. The answers
+    /// do not change, and a statement after this one is still answered, only without what the
+    /// last one would have kept for it.
+    pub fn last_statement(&self) {
+        self.shared.inner.pages.last_statement();
+    }
+
     /// A connection to this database.
     #[must_use]
     pub fn connect(&self) -> Connection {
@@ -3635,11 +3646,12 @@ impl Shared {
     fn mirror(&self, wanted: &[(String, bool)]) {
         let config = self.inner.settings.config();
         for (path, binary_as_string) in wanted {
-            let added = crate::mirror::ensure(path, *binary_as_string, config).and_then(|found| {
-                let Some((stamp, reader)) = found else { return Ok(false) };
-                self.write().add_mirror(path, *binary_as_string, stamp, reader)?;
-                Ok(true)
-            });
+            let added = crate::mirror::ensure(path, *binary_as_string, config, &self.inner.pages)
+                .and_then(|found| {
+                    let Some((stamp, reader)) = found else { return Ok(false) };
+                    self.write().add_mirror(path, *binary_as_string, stamp, reader)?;
+                    Ok(true)
+                });
             if !matches!(added, Ok(true)) {
                 self.inner
                     .declined

@@ -78,9 +78,9 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
                 }
             };
             let mut shell = Shell::new(&options, database, out, err);
-            let mut stop = shell.run_commands(&settings(&options.sets));
+            let mut stop = shell.run_commands(&settings(&options.sets), false);
             if stop == Stop::Done {
-                stop = shell.run_commands(&options.commands);
+                stop = shell.run_commands(&options.commands, options.stop_after_commands);
             }
             if stop == Stop::Done && !options.stop_after_commands {
                 stop = read_input(&mut shell, &options);
@@ -128,7 +128,7 @@ fn read_input(shell: &mut Shell, options: &Options) -> Stop {
         if stdin.lock().read_to_string(&mut text).is_err() {
             return Stop::Done;
         }
-        return shell.run_input(&text);
+        return shell.run_last_input(&text);
     }
     shell.greet();
     shell.prompt(&stdin)
