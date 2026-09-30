@@ -8,6 +8,14 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.16
+
+For J7, #2235 answers a string equality or an `IN` list of strings on compressed text pages by comparing codes, lets that compare step aside once the part is held, skips LIKE blocks when the signature rules out any one piece of the pattern, keeps the blocks a second text visit decodes, and counts graph offsets before writing them. Warm user cycles over the 113 JOB queries on server2 go from 39.1 G to 38.18 G, with 14b down from 0.618 G to 0.401 G and 18a from 0.870 G to 0.728 G.
+
+#2230 checks column parts with a kilobyte wide hash, which takes 8.6 percent off the TPC-H SF1 suite in instructions. #2232 keeps window frames linear with a running accumulator and peer group searches. #2234 cuts lane pages from slabs in the group table. #2233 passes the keyed column in the generator test harness.
+
+The native directory format number goes to 31 with #2230, and format 30 files still open and read. The storage format version stays at 9.
+
 ## 0.8.15
 
 For C5, #2222 reads number columns held in shared dictionaries through their codes in compiled code instead of flattening them first, and #2225 finds a group row by the code of a dictionary coded key before it hashes, which cuts the text key queries q13 and q14 by 6 to 8%. #2226 counts a column's dictionary coded rows once until rows are added and finds cached machine code by the function itself instead of its written out text, and #2228 keeps short CSE keys in place and cuts other allocations in the builder, which together bring the median compile time over ClickBench from about 0.39 ms to under 0.3 ms on server2. #2223 steadies the first engine's times in the compiled suite the same way as the compiled engine's and names the queries compiled code is slower on. #2227 builds a dictionary's rank map only once enough rows ask for it.
