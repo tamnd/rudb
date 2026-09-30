@@ -4771,7 +4771,16 @@ impl<'a> Aggregate<'a> {
                     answers[group] = (end(group) - start as usize) as i128;
                 }
             } else {
-                let argument = rows.arguments[at][0].clone().into_flat()?;
+                // A flat argument is read where it lies. Cloning it first copied the whole chunk's
+                // values once per call on q18, before a single run was added up.
+                let flattened;
+                let argument = match rows.arguments[at][0].data() {
+                    Some(_) => &rows.arguments[at][0],
+                    None => {
+                        flattened = rows.arguments[at][0].clone().into_flat()?;
+                        &flattened
+                    }
+                };
                 let nulls = argument.validity().has_nulls(rows.rows).then(|| argument.validity());
                 let counting = self.calls[at].name == "count";
                 let least = match self.calls[at].name.as_str() {
@@ -4781,7 +4790,7 @@ impl<'a> Aggregate<'a> {
                 };
                 let values = match counting {
                     true => None,
-                    false => match integers(&argument, rows.rows) {
+                    false => match integers(argument, rows.rows) {
                         Some(values) => Some(values),
                         None => return Ok(None),
                     },
@@ -5423,19 +5432,20 @@ fn run_extreme(values: &[i64], least: bool) -> i128 {
 
 /// A flat column of whole numbers read as `i64`, the raw integers of a decimal included.
 ///
-/// `None` for any other layout, which leaves the chunk to the table.
-fn integers(flat: &Vector, rows: usize) -> Option<Vec<i64>> {
+/// `None` for any other layout, which leaves the chunk to the table. An `i64` column is borrowed
+/// rather than copied, since it is already what the caller reads.
+fn integers(flat: &Vector, rows: usize) -> Option<Cow<'_, [i64]>> {
     macro_rules! widened {
         ($values:expr) => {{
             let values = $values.as_slice();
-            values.get(..rows)?.iter().map(|&value| i64::from(value)).collect()
+            Cow::Owned(values.get(..rows)?.iter().map(|&value| i64::from(value)).collect())
         }};
     }
     Some(match flat.data() {
         Some(Data::Int8(values)) => widened!(values),
         Some(Data::Int16(values)) => widened!(values),
         Some(Data::Int32(values)) => widened!(values),
-        Some(Data::Int64(values)) => widened!(values),
+        Some(Data::Int64(values)) => Cow::Borrowed(values.as_slice().get(..rows)?),
         Some(Data::UInt8(values)) => widened!(values),
         Some(Data::UInt16(values)) => widened!(values),
         Some(Data::UInt32(values)) => widened!(values),
