@@ -8,6 +8,14 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.15
+
+For C5, #2222 reads number columns held in shared dictionaries through their codes in compiled code instead of flattening them first, and #2225 finds a group row by the code of a dictionary coded key before it hashes, which cuts the text key queries q13 and q14 by 6 to 8%. #2226 counts a column's dictionary coded rows once until rows are added and finds cached machine code by the function itself instead of its written out text, and #2228 keeps short CSE keys in place and cuts other allocations in the builder, which together bring the median compile time over ClickBench from about 0.39 ms to under 0.3 ms on server2. #2223 steadies the first engine's times in the compiled suite the same way as the compiled engine's and names the queries compiled code is slower on. #2227 builds a dictionary's rank map only once enough rows ask for it.
+
+#2224 types string literals in coalesce, greatest and least the way the pin does.
+
+The native directory format number stays at 30 and the storage format version at 9.
+
 ## 0.8.14
 
 For the JOB work under J7, #2219 reads a string MIN or MAX in a consistent node late, only for the rows the second sweep keeps, and tests and fills the sweeps' key sets a chunk at a time. #2220 reads selected packed values with one width check, reserves a string arena when rows are laid out again, decides a dictionary equality once per value and tries a stable LIKE memo first for a whole chunk. Together they take the JOB suite on server2 from 42.16 to 39.99 G cycles, 5.1% fewer, with 7c down 30%. #2211 reads a part at a few rows for less and places a scattered chunk whole once its columns are held, and #2209 lets go of the mapped pages of held pages and of parts read at positions.
