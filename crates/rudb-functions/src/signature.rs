@@ -844,6 +844,8 @@ const TABLE: &[Entry] = &[
     text("substring_grapheme", Arity::between(2, 3), Fixed::Varchar),
     text("reverse", Arity::exactly(1), Fixed::Varchar),
     text("regexp_escape", Arity::exactly(1), Fixed::Varchar),
+    text("nfc_normalize", Arity::exactly(1), Fixed::Varchar),
+    text("strip_accents", Arity::exactly(1), Fixed::Varchar),
     // Pattern matching. The transformer emits the operator spellings, so those are the names, and
     // `LIKE` is one of them rather than a keyword the binder has to know about separately.
     text("~~", Arity::exactly(2), Fixed::Boolean),
@@ -2828,7 +2830,7 @@ fn array_folded(name: &str, arguments: &[LogicalType]) -> Result<(Vec<LogicalTyp
             identifier(name)
         )));
     }
-    let common = left.promote(right).map_err(|_| {
+    let common = left.promote(right).ok_or_else(|| {
         Error::binder(format!(
             "{}: Cannot infer common element type (left = '{left}', right = '{right}')",
             identifier(name)
@@ -3070,7 +3072,9 @@ fn rewritten(
             declared(wanted, Varchar)
         }
         "base64" | "to_base64" => declared(vec![Blob], Varchar),
-        "reverse" | "regexp_escape" => declared(vec![Varchar], Varchar),
+        "reverse" | "regexp_escape" | "nfc_normalize" | "strip_accents" => {
+            declared(vec![Varchar], Varchar)
+        }
         "length_grapheme" => declared(vec![Varchar], BigInt),
         "left_grapheme" | "right_grapheme" | "substring_grapheme" => {
             let mut wanted = vec![Varchar];
@@ -3995,6 +3999,8 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ),
     ("reverse", &["reverse(col0 VARCHAR) -> VARCHAR"]),
     ("regexp_escape", &["regexp_escape(col0 VARCHAR) -> VARCHAR"]),
+    ("nfc_normalize", &["nfc_normalize(col0 VARCHAR) -> VARCHAR"]),
+    ("strip_accents", &["strip_accents(col0 VARCHAR) -> VARCHAR"]),
     ("format", &["format(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
     ("concat_ws", &["concat_ws(col0 VARCHAR, col1 ANY, [ANY...]) -> VARCHAR"]),
     (

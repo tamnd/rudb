@@ -65,6 +65,7 @@ use crate::hash;
 use crate::histogram;
 use crate::lists;
 use crate::maps;
+use crate::normalize;
 use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
 use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
@@ -398,7 +399,7 @@ fn one_of<A: Fn(usize) -> usize>(
         "-" | "abs" if arg.logical_type() == returns => {
             sign_of(name, data, at, base, rows, returns, arg)
         }
-        "length" | "strlen" | "lower" | "upper" => match data {
+        "length" | "strlen" | "lower" | "upper" | "nfc_normalize" | "strip_accents" => match data {
             Data::Varlen(column) => text_of(name, &Text::Held { column, at }, base, rows, returns),
             _ => Ok(None),
         },
@@ -516,6 +517,7 @@ fn text_of<A: Fn(usize) -> usize>(
         "length" => length_of(text, base, rows, returns),
         "strlen" => bytes_of(text, base, rows, returns),
         "lower" | "upper" => fold_of(name, text, base, rows, returns),
+        "nfc_normalize" | "strip_accents" => normalized_of(name, text, base, rows, returns),
         _ => Ok(None),
     }
 }
@@ -1029,6 +1031,32 @@ fn fold_of<A: Fn(usize) -> usize>(
         // `to_string` and the packing pass, which was three allocations of the four.
         let folded = if lowering { value.to_lowercase() } else { value.to_uppercase() };
         into.push(&folded);
+        Ok(())
+    })?;
+    finish(returns, Data::Varlen(out), base.normalize(rows))
+}
+
+/// `nfc_normalize` and `strip_accents`.
+fn normalized_of<A: Fn(usize) -> usize>(
+    name: &str,
+    text: &Text<'_, A>,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    if returns != &LogicalType::Varchar {
+        return Ok(None);
+    }
+    let map = if name == "nfc_normalize" { normalize::nfc } else { normalize::strip_accents };
+    if let Text::Read(vector) = text {
+        let visited =
+            visited_strings(vector, &base, rows, |value, into| into.push_str(&map(value)))?;
+        if let Some(out) = visited {
+            return finish(returns, Data::Varlen(out), base.normalize(rows));
+        }
+    }
+    let out = try_each_string(rows, &base, |index, into| {
+        into.push(&map(text.get(index)?));
         Ok(())
     })?;
     finish(returns, Data::Varlen(out), base.normalize(rows))
@@ -4242,6 +4270,12 @@ pub fn call_values(
             [Value::Varchar(text), Value::BigInt(offset), Value::BigInt(length)],
         ) => Ok(Value::Varchar(crate::graphemes::substring(text, *offset, *length)?.to_string())),
         ("regexp_escape", [Value::Varchar(text)]) => Ok(crate::strings::regexp_escape(text)),
+        ("nfc_normalize", [Value::Varchar(text)]) => {
+            Ok(Value::Varchar(normalize::nfc(text).into_owned()))
+        }
+        ("strip_accents", [Value::Varchar(text)]) => {
+            Ok(Value::Varchar(normalize::strip_accents(text).into_owned()))
+        }
         ("parse_formatted_bytes", [Value::Varchar(text)]) => {
             Ok(Value::UBigInt(crate::bytes::parse_formatted_bytes(text)?))
         }
