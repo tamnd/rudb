@@ -5683,7 +5683,7 @@ impl NativeText {
         }
         let again = kept.is_none()
             && self.swept.get(block).is_some_and(|swept| swept.swap(true, Atomic::Relaxed));
-        let keep = again
+        let keep = (again || !scattered)
             && (self.payload_kept.load(Atomic::Relaxed) < self.keep_budget
                 || (scattered && self.visit_dropped.load(Atomic::Relaxed) >= self.blocks.len()));
         if keep {
@@ -8918,20 +8918,16 @@ impl Reader {
                     PartSlot::Seen(before) => *before,
                     _ => 0,
                 };
-                let again = positions.is_none()
-                    && self
-                        .cache
-                        .again
-                        .get(column)
-                        .is_some_and(|again| again.load(Atomic::Relaxed));
-                if before >= rows || again {
+                // A whole read holds the part at once. It has decoded all of it anyway, so what
+                // holding costs is the memory and not the time, and the run after it is the one
+                // that pays otherwise: on JOB the second run of each query cost 60 billion cycles
+                // across the suite against 35 for the third, nearly all of it decoding again the
+                // parts the first run had decoded and let go.
+                if before >= rows || positions.is_none() {
                     return Err(true);
                 }
                 // A read at positions counts what it cost once it knows how the part is coded.
                 // See [`Self::pay`].
-                if positions.is_none() {
-                    *held = PartSlot::Seen(before.saturating_add(rows));
-                }
                 Err(false)
             }
         }
