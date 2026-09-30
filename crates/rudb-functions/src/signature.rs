@@ -2828,7 +2828,7 @@ fn array_folded(name: &str, arguments: &[LogicalType]) -> Result<(Vec<LogicalTyp
             identifier(name)
         )));
     }
-    let common = left.promote(right).map_err(|_| {
+    let common = left.promote(right).ok_or_else(|| {
         Error::binder(format!(
             "{}: Cannot infer common element type (left = '{left}', right = '{right}')",
             identifier(name)
