@@ -4133,10 +4133,39 @@ pub fn call_values(
             "like_escape" | "not_like_escape" | "ilike_escape" | "not_ilike_escape",
             [text, pattern, escape],
         ) => escaped_like(name, text, pattern, escape),
+        // A list of parts is each part on its own, one to a field of the struct the binder made.
+        ("date_part", [Value::List { values, .. }, when]) => {
+            let LogicalType::Struct(fields) = returns else {
+                return Err(Error::internal(format!("date_part of a list returning {returns}")));
+            };
+            let mut parts = Vec::with_capacity(fields.len());
+            for (spec, field) in values.iter().zip(fields) {
+                parts.push((field.name.clone(), date_value(name, spec, when, &field.ty)?));
+            }
+            Ok(Value::Struct(parts))
+        }
         ("date_part" | "date_trunc", [spec, when]) => date_value(name, spec, when, returns),
         ("age", [later, earlier]) => datetime::age(later, earlier),
         ("trunc", [only]) => truncated(only),
         (_, [count]) if datetime::is_interval(name) => interval_value(name, count),
+        ("make_date", [Value::Struct(fields)]) => {
+            let field = |wanted: &str| {
+                fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(wanted)).map(|(_, v)| v)
+            };
+            let (Some(year), Some(month), Some(day)) =
+                (field("year"), field("month"), field("day"))
+            else {
+                return Err(Error::internal("make_date of a struct without a year, month and day"));
+            };
+            if [year, month, day].iter().any(|value| value.is_null()) {
+                return Ok(Value::Null);
+            }
+            // The fields are read as INTEGERs, so one too wide for that is refused as the cast.
+            for value in [year, month, day] {
+                cast::narrow(value.as_i64().unwrap_or_default())?;
+            }
+            made_civil_value(year, month, day)
+        }
         ("make_date", [days]) => made_date_value(days),
         ("make_date", [year, month, day]) => made_civil_value(year, month, day),
         ("dayname" | "monthname" | "last_day" | "nanosecond" | "epoch_us" | "epoch_ns", [when]) => {

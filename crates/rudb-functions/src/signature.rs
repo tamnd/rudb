@@ -2218,6 +2218,16 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         // The pin truncates a date as the timestamp at its midnight, so the answer is a timestamp
         // whatever the part, and `date_trunc('month', DATE '2020-05-07')` is 2020-05-01 00:00:00.
         ("date_trunc", [_, Date]) => Some((vec![LogicalType::Varchar, Date], Timestamp)),
+        // A list of parts answers a struct with a field for each, and which fields those are is
+        // only known once the list is, so the struct here is empty and `narrowed_part` in
+        // `rudb-bind` fills it in from the constant.
+        (
+            "date_part",
+            [LogicalType::List(element), Date | Timestamp | TimestampTz | Time | Interval],
+        ) if matches!(**element, LogicalType::Varchar | Null) => Some((
+            vec![LogicalType::List(Box::new(LogicalType::Varchar)), arguments[1].clone()],
+            LogicalType::Struct(Vec::new()),
+        )),
         ("strftime", [Date | Timestamp | TimestampTz, LogicalType::Varchar | Null]) => {
             Some((vec![arguments[0].clone(), LogicalType::Varchar], LogicalType::Varchar))
         }
@@ -2236,6 +2246,19 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         }
         ("time_bucket", [Interval | LogicalType::Varchar, when, origin]) if when == origin => {
             Some((vec![Interval, when.clone(), when.clone()], when.clone()))
+        }
+        // A struct of a year, a month and a day, which are matched by name in any order and any
+        // case, the way the pin casts one struct to another.
+        ("make_date", [LogicalType::Struct(fields)])
+            if fields.len() == 3
+                && ["year", "month", "day"].iter().all(|wanted| {
+                    fields.iter().any(|field| field.name.eq_ignore_ascii_case(wanted))
+                })
+                && fields.iter().all(|field| counted(&field.ty) || field.ty == Null) =>
+        {
+            let fields =
+                fields.iter().map(|field| Field::new(field.name.clone(), BigInt)).collect();
+            Some((vec![LogicalType::Struct(fields)], Date))
         }
         // The fields are whole numbers and the seconds are a double.
         ("make_time", [hour, minute, seconds])
@@ -2556,6 +2579,14 @@ const READ_OFF: &[&str] = &[
 /// A name missing from here gets the sentence with no block under it, which is what every function
 /// outside the string family does today.
 const CANDIDATES: &[(&str, &[&str])] = &[
+    (
+        "make_date",
+        &[
+            "make_date(col0 INTEGER) -> DATE",
+            "make_date(col0 BIGINT, col1 BIGINT, col2 BIGINT) -> DATE",
+            "make_date(col0 STRUCT(\"year\" BIGINT, \"month\" BIGINT, \"day\" BIGINT)) -> DATE",
+        ],
+    ),
     ("make_time", &["make_time(col0 BIGINT, col1 BIGINT, col2 DOUBLE) -> TIME"]),
     (
         "make_timestamp",
@@ -4124,9 +4155,11 @@ mod tests {
         assert_eq!(civil.returns, LogicalType::Date);
         assert_eq!(civil.arguments, vec![LogicalType::Integer; 3]);
         let error = resolve("make_date", &vec![LogicalType::Integer; 2]).unwrap_err();
-        assert_eq!(
-            error.message(),
-            "No function matches the given name and argument types 'make_date(INTEGER, INTEGER)'. You might need to add explicit type casts."
+        assert!(
+            error.message().starts_with(
+                "No function matches the given name and argument types 'make_date(INTEGER, INTEGER)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tmake_date(col0 INTEGER) -> DATE"
+            ),
+            "{error}"
         );
     }
 
