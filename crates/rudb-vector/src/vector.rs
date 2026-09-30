@@ -689,6 +689,26 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
         body(first, self.bytes_at(first)?.unwrap_or_default())?;
         Ok(first + 1)
     }
+    /// [`Self::sweep`] a stretch at a time rather than a value at a time: `body` gets the index of
+    /// the first value, the values laid end to end, and where each of them ends in that run.
+    ///
+    /// A source that stores its values in blocks already has them laid end to end, so a caller that
+    /// wants one search over many values, which is how a substring `LIKE` runs, can search the
+    /// block where it is rather than copy every value out of it first. `None` is a source that has
+    /// no such run, and the caller goes back to [`Self::sweep`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the values raises, and whatever `body` raises.
+    fn sweep_runs(
+        &self,
+        first: usize,
+        limit: usize,
+        body: &mut dyn FnMut(usize, &[u8], &[usize]) -> Result<()>,
+    ) -> Result<Option<usize>> {
+        let _ = (first, limit, body);
+        Ok(None)
+    }
     /// Hands `body` the value at each of `indices`, in whatever order suits the source, with the
     /// position in `indices` it belongs to.
     ///
@@ -2513,6 +2533,27 @@ impl Vector {
         }
         body(first, self.try_bytes_at(first)?.unwrap_or_default())?;
         Ok(first + 1)
+    }
+
+    /// [`Self::sweep_text`] a run of values at a time, for a source that keeps them laid end to end.
+    /// See [`TextSource::sweep_runs`]. `None` is every other form, and the caller sweeps a value at
+    /// a time instead.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the values raises, and whatever `body` raises.
+    pub fn sweep_text_runs(
+        &self,
+        first: usize,
+        limit: usize,
+        body: &mut dyn FnMut(usize, &[u8], &[usize]) -> Result<()>,
+    ) -> Result<Option<usize>> {
+        match &self.body {
+            Body::ExternalText { source } if matches!(self.validity, Validity::AllValid) => {
+                source.sweep_runs(first, limit.min(self.len), body)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Hands `body` the value at each of `indices` with its position in `indices`, in whatever
