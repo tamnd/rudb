@@ -33,6 +33,8 @@
 //! writes into pages that are already there. The top of the heap is held rather than given back
 //! until there is a lot of it free. And when the heap does have to grow it grows by more than was
 //! asked for, so a query that climbs to its peak in many steps pays for one growth rather than many.
+//! Beside the three, a limit on how many arenas the threads share, so the free space the thresholds
+//! keep is kept in a few places rather than one per worker.
 //!
 //! All three or none. Setting one of them tells glibc to stop adjusting the others on its own, and
 //! its own adjustment is not a bad one, so one alone is worse than nothing at all. Query 16 over
@@ -101,7 +103,7 @@ pub fn keep_pages() -> bool {
 // worker in `pool.rs`, which has an invariant to uphold. This one has a signature to get right.
 #[allow(unsafe_code, reason = "the mallopt declaration, which is the only way to ask glibc this")]
 mod glibc {
-    //! The three `mallopt` parameters and the one call that sets them.
+    //! The three `mallopt` parameters, the arena limit and the one call that sets them.
 
     /// Do not return the top of the heap to the system until this much of it is free.
     ///
@@ -139,17 +141,36 @@ mod glibc {
     /// documentation.
     const MMAP_THRESHOLD: i32 = 4 * 1024 * 1024;
 
+    /// How many arenas threads allocate out of at most.
+    const M_ARENA_MAX: i32 = -8;
+
+    /// The most arenas, a quarter of the cores and never fewer than two.
+    ///
+    /// glibc gives a thread its own arena until there are eight a core, so every worker kept one,
+    /// each holding the free space its own frees left, and the thresholds above make that space
+    /// stay. Two arenas on the eight core server3 held less on nearly every ClickBench query, 211
+    /// MB against 192 on q29, 43 against 35 on q21 and 97 against 89 on q24, about 66 MB over the
+    /// native suite and 69 MB over parquet. The CPU did not go up: over five runs of the twelve
+    /// heaviest queries user time was 19.13 seconds against 19.57 and system time 8.12 against
+    /// 10.08, since fewer arenas is fewer pages to fault in. A quarter of the cores keeps threads
+    /// from queueing on one lock on a larger machine.
+    fn arenas() -> i32 {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        i32::try_from(cores / 4).unwrap_or(i32::MAX).max(2)
+    }
+
     unsafe extern "C" {
         /// Sets one allocator parameter, and returns non zero when it took.
         fn mallopt(parameter: i32, value: i32) -> i32;
     }
 
-    /// Sets all three, and reports whether every one of them took.
+    /// Sets all three and the arena limit, and reports whether every one of them took.
     pub(super) fn keep_pages() -> bool {
         let settings = [
             (M_TRIM_THRESHOLD, TRIM_THRESHOLD),
             (M_TOP_PAD, TOP_PAD),
             (M_MMAP_THRESHOLD, MMAP_THRESHOLD),
+            (M_ARENA_MAX, arenas()),
         ];
         let mut all = true;
         for (parameter, value) in settings {
