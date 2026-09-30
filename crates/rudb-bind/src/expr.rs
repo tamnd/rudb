@@ -887,8 +887,12 @@ impl Binder<'_> {
         if rudb_catalog::same_name(&written, "age") && bound.len() == 1 {
             bound.insert(0, self.current_date());
         }
-        if let Some(&(name, part)) =
-            PART_SHORTCUTS.iter().find(|(name, _)| rudb_catalog::same_name(&written, name))
+        // `timezone` of one moment is its offset, and of a zone and a moment is a conversion that is
+        // a different function, so only the first is the shortcut.
+        if let Some(&(name, part)) = PART_SHORTCUTS
+            .iter()
+            .find(|(name, _)| rudb_catalog::same_name(&written, name))
+            .filter(|(name, _)| *name != "timezone" || bound.len() == 1)
         {
             return self.bind_part_shortcut(ast, name, part, &arguments, &bound);
         }
@@ -2829,11 +2833,23 @@ const PART_SHORTCUTS: &[(&str, &str)] = &[
     ("isoyear", "isoyear"),
     ("yearweek", "yearweek"),
     ("julian", "julian"),
+    ("timezone_hour", "timezone_hour"),
+    ("timezone_minute", "timezone_minute"),
+    ("timezone", "timezone"),
 ];
 
 /// The part shortcuts that read a time of day as well, which are the ones whose part a time has.
-const TIMED_SHORTCUTS: &[&str] =
-    &["hour", "minute", "second", "millisecond", "microsecond", "epoch"];
+const TIMED_SHORTCUTS: &[&str] = &[
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "epoch",
+    "timezone",
+    "timezone_hour",
+    "timezone_minute",
+];
 
 /// The part shortcuts whose names are keywords, which the pin quotes when it lists the overloads.
 const KEYWORD_SHORTCUTS: &[&str] = &[

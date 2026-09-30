@@ -3700,6 +3700,9 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
                     | Part::Millisecond
                     | Part::Microsecond
                     | Part::Epoch
+                    | Part::Timezone
+                    | Part::TimezoneHour
+                    | Part::TimezoneMinute
             );
             if !timed {
                 return Err(Error::not_implemented(format!(

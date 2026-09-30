@@ -70,7 +70,7 @@ impl Unit {
             Some(Part::Second | Part::Epoch) => Self::Second,
             Some(Part::Millisecond) => Self::Millisecond,
             Some(Part::Microsecond) => Self::Microsecond,
-            Some(Part::Era) | None => {
+            Some(Part::Era | Part::Timezone | Part::TimezoneHour | Part::TimezoneMinute) | None => {
                 let function = if subtracting { "DATESUB" } else { "DATEDIFF" };
                 return Err(Error::not_implemented(format!(
                     "Specifier type not implemented for {function}"

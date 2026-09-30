@@ -112,3 +112,56 @@ fn a_date_is_made_out_of_a_struct_of_its_fields() {
         assert!(said.contains(expected), "{sql}: {said}");
     }
 }
+
+#[test]
+fn a_moment_without_a_zone_is_no_distance_from_utc() {
+    let cases = [
+        (
+            "date_part('timezone', TIMESTAMP '1992-02-03 01:02:03'), date_part('timezone_hour', TIMESTAMP '1992-02-03 01:02:03'), date_part('timezone_minute', TIMESTAMP '1992-02-03')",
+            "0|0|0",
+        ),
+        (
+            "date_part('timezone', TIME '01:02:03'), date_part('timezone_hour', TIME '01:02:03')",
+            "0|0",
+        ),
+        (
+            "date_part('timezone', TIMESTAMP 'infinity'), date_part('timezone_hour', DATE '-infinity')",
+            "NULL|NULL",
+        ),
+        (
+            "timezone_hour(TIMESTAMP '1992-02-03 01:02:03'), timezone_minute(TIME '01:02:03'), timezone(TIMESTAMP '1992-02-03 01:02:03'), typeof(timezone_minute(TIMESTAMP '1992-02-03'))",
+            "0|0|0|BIGINT",
+        ),
+        ("date_part(['timezone'], TIMESTAMP '1992-02-03 01:02:03')", "{'timezone': 0}"),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(answered(sql), expected, "{sql}");
+    }
+    let cases = [
+        (
+            "date_part('TIMEZONE', DATE '1992-02-03')",
+            "Not implemented Error: \"date\" units \"timezone\" not recognized",
+        ),
+        (
+            "date_part('Timezone_Hour', INTERVAL '1 hour')",
+            "Not implemented Error: \"interval\" units \"Timezone_Hour\" not recognized",
+        ),
+        (
+            "timezone_hour(DATE '1992-02-03')",
+            "Not implemented Error: \"date\" units \"timezone_hour\" not recognized",
+        ),
+        ("timezone_hour(INTERVAL '1 hour')", "\"interval\" units \"timezone_hour\" not recognized"),
+        (
+            "date_trunc('timezone', DATE '1992-02-03')",
+            "Not implemented Error: Specifier type not implemented for DATETRUNC",
+        ),
+        (
+            "date_trunc('timezone', TIMESTAMP '1992-02-03 01:02:03')",
+            "Not implemented Error: Specifier type not implemented for DATETRUNC",
+        ),
+    ];
+    for (sql, expected) in cases {
+        let said = refused(sql);
+        assert!(said.contains(expected), "{sql}: {said}");
+    }
+}
