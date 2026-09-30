@@ -98,7 +98,7 @@ const SAMPLED_PARTS: usize = 4;
 const PICKED_PARTS: usize = 32;
 /// The most rows [`Reader::picked`] keeps the values of before it stops.
 const MOST_PICKED: usize = 1024;
-const FORMAT: u32 = 30;
+const FORMAT: u32 = 31;
 
 /// Formats this build can open.
 ///
@@ -131,10 +131,16 @@ const FORMAT: u32 = 30;
 /// format 29 catalog has no room for and a format 29 reader would call trailing bytes. A catalog
 /// that ends before it is a file with no card, which is every older file.
 ///
-/// This is not a general compatibility promise. Seven formats are readable because there was a
+/// Format 31 checks each column part with [`part_checksum`] rather than xxHash64, and says so in the
+/// top bit of the part's length in the index, which no real length reaches because a page is at most
+/// [`MAX_PAGE`]. A part without the bit is checked with xxHash64, which is every part of an older
+/// file and every part appended to one, so a build that can only read format 30 still reads a
+/// format 30 file this build has added a table to.
+///
+/// This is not a general compatibility promise. Eight formats are readable because there was a
 /// specific reason for each, and the list shrinks again the moment the older ones stop being worth
 /// carrying.
-const READABLE: &[u32] = &[22, 23, 24, 25, 26, 27, 28, 29, FORMAT];
+const READABLE: &[u32] = &[22, 23, 24, 25, 26, 27, 28, 29, 30, FORMAT];
 
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
@@ -350,6 +356,69 @@ fn dictionary_bytes(table: &Table, at: usize) -> u64 {
 /// 8 is about five percent of the query.
 fn checksum(bytes: &[u8]) -> u64 {
     seeded_checksum(bytes, 0)
+}
+
+/// The top bit of a part's length in a column index, set when the part is checked with
+/// [`part_checksum`] rather than [`checksum`].
+const WIDE_PART: u32 = 1 << 31;
+
+/// One key per word of a kilobyte, for [`part_checksum`], drawn from splitmix64 so that no two are
+/// related by anything simpler than the generator.
+const PART_KEYS: [u64; 128] = {
+    let mut keys = [0_u64; 128];
+    let mut state = 0x243f_6a88_85a3_08d3_u64;
+    let mut at = 0;
+    while at < keys.len() {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut mixed = state;
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        keys[at] = mixed ^ (mixed >> 31);
+        at += 1;
+    }
+    keys
+};
+
+/// The hash a format 31 part is checked against, about three times cheaper than xxHash64.
+///
+/// xxHash64 is a chain of dependent multiplies in four lanes, and every byte a query reads from a
+/// column page goes through it once, which across TPC-H is about six percent of all the work. This
+/// one sums a keyed thirty two by thirty two bit product per word over each kilobyte, the way XXH3
+/// does its long inputs, and a sum does not care which order it is added in, so the compiler turns
+/// the kilobyte into straight vector loads and multiplies. Each kilobyte's sum is then folded into
+/// the running hash with a full multiply, so kilobytes that trade places do not cancel. It is a
+/// check against a damaged file and not against someone who wants to forge one, which is also all
+/// xxHash64 was here.
+fn part_checksum(bytes: &[u8]) -> u64 {
+    fn kilobyte(block: &[u8; 1024]) -> u64 {
+        let (words, _) = block.as_chunks::<8>();
+        let mut sum = 0_u64;
+        for (word, key) in words.iter().zip(&PART_KEYS) {
+            let word = u64::from_le_bytes(*word);
+            let mixed = word ^ key;
+            sum = sum
+                .wrapping_add((mixed & 0xffff_ffff).wrapping_mul(mixed >> 32))
+                .wrapping_add(word);
+        }
+        sum
+    }
+    fn fold(hash: u64, sum: u64) -> u64 {
+        let product = u128::from(hash ^ sum) * u128::from(0x9e37_79b1_85eb_ca87_u64);
+        (product as u64) ^ (product >> 64) as u64
+    }
+    let (blocks, rest) = bytes.as_chunks::<1024>();
+    let mut hash = (bytes.len() as u64) ^ 0x27d4_eb2f_1656_67c5;
+    for block in blocks {
+        hash = fold(hash, kilobyte(block));
+    }
+    if !rest.is_empty() {
+        let mut last = [0_u8; 1024];
+        last[..rest.len()].copy_from_slice(rest);
+        hash = fold(hash, kilobyte(&last));
+    }
+    hash ^= hash >> 37;
+    hash = hash.wrapping_mul(0x1656_6791_9e37_79f9);
+    hash ^ (hash >> 32)
 }
 
 /// A hundred and twenty eight bit name for `bytes`, as two xxHash64 walks under different seeds,
@@ -2040,6 +2109,9 @@ pub struct Writer {
     at: u64,
     /// How far into the file the kernel has been asked to start writing, see [`WRITEBACK_STRETCH`].
     written_back: u64,
+    /// Whether parts are checked with [`part_checksum`], which is every file but one opened to
+    /// append to that an older build wrote, see [`FORMAT`].
+    wide: bool,
     table: Table,
     generation: u64,
     /// The first and the last source position in every stripe, in the order the stripes were
@@ -2276,6 +2348,9 @@ impl Writer {
         let (slot, bytes, _) = committed_slot(&*file, size)?;
         let (mut closed, views, card, anchor) = decode_catalog(&bytes, size)?;
         let card = card_for(path.as_ref(), card);
+        let mut version = [0; 4];
+        read_at(&*file, 8, &mut version)?;
+        let wide = u32::from_le_bytes(version) >= 31;
         // A table already in the file under this name is only in the way if it holds rows. One that
         // holds none has no pages for this generation to carry and no reader that could lose
         // anything, so the table being started here takes its place in the catalog rather than
@@ -2306,6 +2381,7 @@ impl Writer {
             // says it is and keeps naming a file a reader can still open.
             at: size,
             written_back: size,
+            wide,
             dictionaries: fields
                 .iter()
                 .map(|field| coded_type(&field.ty).then(GlobalDictionary::new))
@@ -2385,6 +2461,7 @@ impl Writer {
             file,
             at: HEADER,
             written_back: HEADER,
+            wide: true,
             dictionaries: fields
                 .iter()
                 .map(|field| coded_type(&field.ty).then(GlobalDictionary::new))
@@ -2502,11 +2579,12 @@ impl Writer {
             }
             self.closed.remove(at);
         }
-        let Self { file, at, generation, mut closed, views, card, anchor, .. } = self;
+        let Self { file, at, wide, generation, mut closed, views, card, anchor, .. } = self;
         closed.push(entry);
         Ok(Self {
             file,
             written_back: at,
+            wide,
             at,
             generation,
             closed,
@@ -2787,7 +2865,7 @@ impl Writer {
         // membership index per stripe. Those do not come through here. See [`prepare`].
         let sieve =
             Sieve::of(column, &range, SIEVE_BUDGET).filter(|sieve| sieve.len() < bytes.len());
-        stripe.sums.push(checksum(&bytes));
+        stripe.sums.push(part_checksum(&bytes));
         stripe.pages.push(bytes);
         stripe.codes.push(None);
         stripe.sieves.push(sieve);
@@ -2910,11 +2988,19 @@ impl Writer {
                 return Err(Error::internal("a stripe's pages came without their checksums"));
             }
             for (bytes, &sum) in stripe.pages.iter().zip(&stripe.sums) {
-                put_u32(
-                    &mut index,
-                    u32::try_from(bytes.len()).map_err(|_| invalid("part length overflow"))?,
-                );
-                put_u64(&mut index, sum);
+                let part = u32::try_from(bytes.len())
+                    .ok()
+                    .filter(|&length| length < WIDE_PART)
+                    .ok_or_else(|| invalid("part length overflow"))?;
+                // The sums are made with [`part_checksum`] wherever the pages are encoded, and a
+                // file an older build wrote gets xxHash64 again here, which is rare enough to pay.
+                if self.wide {
+                    put_u32(&mut index, part | WIDE_PART);
+                    put_u64(&mut index, sum);
+                } else {
+                    put_u32(&mut index, part);
+                    put_u64(&mut index, checksum(bytes));
+                }
                 out.push(bytes.as_slice());
                 length = length
                     .checked_add(bytes.len())
@@ -3397,7 +3483,7 @@ impl Writer {
             read_at(&self.file, page.offset, &mut bytes)?;
             for (span, &rows) in spans.iter().zip(&stripe.parts) {
                 let part = part_bytes(&bytes, *span)?;
-                if checksum(part) != span.hash {
+                if span.sum(part) != span.hash {
                     return Err(invalid("column page checksum differs while building frequencies"));
                 }
                 let rows = rows as usize;
@@ -3501,7 +3587,7 @@ impl Writer {
                 let part_end = part_start.saturating_add(u64::from(rows));
                 if wanted < ordinals.len() && ordinals[wanted] < part_end {
                     let part = part_bytes(&bytes, *span)?;
-                    if checksum(part) != span.hash {
+                    if span.sum(part) != span.hash {
                         return Err(invalid(
                             "column page checksum differs while building pair frequencies",
                         ));
@@ -4212,9 +4298,9 @@ fn write_section(
 ///
 /// # Errors
 ///
-/// If the file has no valid committed directory, is an older format than this build writes, holds
-/// no table of that name, names a section whose payload cannot be written, or would end up naming
-/// more sections than the format allows.
+/// If the file has no valid committed directory, is older than format 30, holds no table of that
+/// name, names a section whose payload cannot be written, or would end up naming more sections than
+/// the format allows.
 pub fn attach(
     path: impl AsRef<Path>,
     table: &str,
@@ -4238,7 +4324,12 @@ pub fn attach(
     // format 22 and is not, which is worse than refusing. Rewriting it with this build is the
     // answer, and the format is at 0.3.x, so nobody has one of these that this project did not
     // just make.
-    if version != FORMAT {
+    //
+    // Format 30 is taken as well, because what 31 changed is the hash on a column part and this
+    // writes no column part, so a format 30 file with sections attached by this build is still a
+    // format 30 file. Refusing it would leave every file a harness had already loaded without its
+    // sections until somebody noticed, which spec/perf/85 is the story of.
+    if version != FORMAT && version != 30 {
         return Err(invalid(&format!(
             "the file is format {version} and a graph section needs format {FORMAT}, so it has \
              to be written again"
@@ -4441,6 +4532,15 @@ struct PartSpan {
     start: usize,
     length: usize,
     hash: u64,
+    /// Whether `hash` is a [`part_checksum`] rather than a [`checksum`].
+    wide: bool,
+}
+
+impl PartSpan {
+    /// The hash of `bytes` the way this span's hash was made.
+    fn sum(&self, bytes: &[u8]) -> u64 {
+        if self.wide { part_checksum(bytes) } else { checksum(bytes) }
+    }
 }
 
 /// What a reader holds for one stripe of one column.
@@ -4542,7 +4642,7 @@ impl HeldPage {
 
 /// Checks one part's bytes against the hash its index carries for them.
 fn verify_part(bytes: &[u8], span: PartSpan) -> Result<()> {
-    let got = checksum(bytes);
+    let got = span.sum(bytes);
     if got != span.hash {
         return Err(invalid(&format!(
             "column page checksum differs, part at {}+{} bytes, wanted {:016x} and got {got:016x}",
@@ -6172,9 +6272,11 @@ fn read_index_span<F: Positional + ?Sized>(
     let mut start = 0_usize;
     for part in 0..parts {
         let at = part * INDEX_ENTRY;
-        let length = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes")) as usize;
+        let length = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+        let wide = length & WIDE_PART != 0;
+        let length = (length & !WIDE_PART) as usize;
         let hash = u64::from_le_bytes(bytes[at + 4..at + 12].try_into().expect("eight bytes"));
-        spans.push(PartSpan { start, length, hash });
+        spans.push(PartSpan { start, length, hash, wide });
         start = start.checked_add(length).ok_or_else(|| invalid("column page length overflow"))?;
     }
     if start != page.length as usize {
@@ -10932,7 +11034,7 @@ fn quick_integer_fold(
                 .checked_add(span.start as u64)
                 .ok_or_else(|| invalid("part range overflow"))?;
             read_at(file, at, &mut bytes)?;
-            if checksum(&bytes) != span.hash {
+            if span.sum(&bytes) != span.hash {
                 return Err(invalid("integer part checksum differs"));
             }
             if bytes.first() == Some(&5) && bytes.get(1) == Some(&0) {
@@ -15274,6 +15376,59 @@ mod tests {
         writer.finish().expect("commit");
         let catalog = Catalog::open(&path).expect("the file opens again");
         assert_eq!(catalog.names().collect::<Vec<_>>(), vec!["items"]);
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// The part hash sees every byte, the order of the kilobytes and the length, and is not
+    /// xxHash64 under another name.
+    #[test]
+    fn the_part_checksum_sees_each_byte_and_where_it_is() {
+        let bytes: Vec<u8> =
+            (0..5000_u32).map(|at| (at.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let whole = part_checksum(&bytes);
+        assert_ne!(whole, checksum(&bytes));
+        assert_eq!(whole, part_checksum(&bytes.clone()));
+        for at in [0, 7, 8, 1023, 1024, 3000, 4095, 4096, 4999] {
+            let mut flipped = bytes.clone();
+            flipped[at] ^= 1;
+            assert_ne!(part_checksum(&flipped), whole, "a flipped bit at {at}");
+        }
+        let mut swapped = bytes.clone();
+        let (first, second) = swapped.split_at_mut(1024);
+        first.swap_with_slice(&mut second[..1024]);
+        assert_ne!(part_checksum(&swapped), whole, "two kilobytes traded places");
+        // The last kilobyte is padded with zeros, so the length is what tells these apart.
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_ne!(part_checksum(&longer), whole, "a trailing zero byte");
+        assert_ne!(part_checksum(&[]), part_checksum(&[0]));
+    }
+
+    /// A new file has its parts checked with the part hash, and a table added to a format 30 file
+    /// keeps to xxHash64, so the build that wrote the file can still read all of it.
+    #[test]
+    fn a_table_added_to_a_format_thirty_file_keeps_the_older_part_hash() {
+        let path = path("format-thirty-append");
+        let field = || vec![Field::required("id", LogicalType::Integer)];
+        let mut writer = Writer::create(&path, "items", field()).expect("new file");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+        let file = OpenOptions::new().write(true).open(&path).expect("reopen to patch");
+        write_at(&file, 8, &30_u32.to_le_bytes()).expect("stamp format 30");
+        drop(file);
+
+        let mut writer = Writer::open(&path, "more", field()).expect("append a table");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+
+        let catalog = Catalog::open(&path).expect("the file opens");
+        for (name, wide) in [("items", true), ("more", false)] {
+            let reader = catalog.table(name).expect("the table opens");
+            let spans =
+                read_index(&*reader.file, &reader.table.stripes[0], 0).expect("the index reads");
+            assert!(spans.iter().all(|span| span.wide == wide), "{name}");
+            assert_eq!(reader.read(0, &[0]).expect("the part checks").len(), 3, "{name}");
+        }
         fs::remove_file(&path).expect("clean up");
     }
 

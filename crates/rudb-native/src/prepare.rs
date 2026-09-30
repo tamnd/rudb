@@ -55,8 +55,8 @@ use rudb_vector::{Bitmap, Chunk, Data, StringColumn, Validity, Vector};
 use super::{
     ColumnStripe, DICTIONARY_CHECK_SEED, DICTIONARY_DECIDE_ROWS, DICTIONARY_DISTINCT_IN_TEN,
     EncodedBlock, GlobalDictionary, MAX_ENCODE_WORKERS, MAX_PAGE, Part, PendingChunk, STRIPE_PARTS,
-    Settling, Spread, Unencoded, Writer, checksum, coded_page, invalid, push_validity,
-    seeded_checksum, stats, unique_codes, weight,
+    Settling, Spread, Unencoded, Writer, checksum, coded_page, invalid, part_checksum,
+    push_validity, seeded_checksum, stats, unique_codes, weight,
 };
 
 /// How many stripes are being prepared or paged right now, across every writer in the process.
@@ -1273,7 +1273,7 @@ fn code_pages(parts: &[LocalPart], global: &[u32]) -> Result<ColumnStripe> {
         if bytes.len() > MAX_PAGE {
             return Err(invalid("column page exceeds the configured bound"));
         }
-        stripe.sums.push(checksum(&bytes));
+        stripe.sums.push(part_checksum(&bytes));
         stripe.pages.push(bytes);
         stripe.codes.push(Some(unique_codes(&codes)));
         // None, because the codes already give the stripe an exact membership index, and an
