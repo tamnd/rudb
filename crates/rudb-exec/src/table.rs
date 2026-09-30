@@ -4593,7 +4593,7 @@ mod tests {
     /// which is where a key like `l_suppkey` lands.
     #[test]
     fn a_packed_column_wider_than_the_map_allows_is_refused() {
-        let keys = [packed_numbers(&[0, 1], 12, 0)];
+        let keys = [packed_numbers(&[0, 1], 13, 0)];
         assert!(coded(&keys, 2).is_none());
     }
 
