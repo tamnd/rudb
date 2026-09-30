@@ -264,6 +264,36 @@ pub(crate) fn scan_of(plan: &Plan, at: NodeRef, index: u32) -> Option<NodeRef> {
     }
 }
 
+/// The scan `binding` under `at` is a column of, and the binding in that scan's own naming.
+///
+/// Through filters, projections that name a column, the side of an inner join that holds the
+/// binding, and the left side of a semi or anti join, which is the side whose rows come out. Each of
+/// those hands a stored value up unchanged, so the column the walk ends at holds what `binding`
+/// reads. `None` for anything else, and for a projection that computes the value.
+pub(crate) fn key_origin(
+    plan: &Plan,
+    at: NodeRef,
+    binding: ColumnBinding,
+) -> Option<(NodeRef, ColumnBinding)> {
+    match *plan.node(at) {
+        Node::Get { index, .. } if index == binding.table => Some((at, binding)),
+        Node::Filter { input, .. } => key_origin(plan, input, binding),
+        Node::Project { input, index, exprs, .. } if index == binding.table => {
+            let &expr = plan.expr_list(exprs).get(usize::try_from(binding.column).ok()?)?;
+            let Expr::Column(below) = *plan.expr(expr) else { return None };
+            key_origin(plan, input, below)
+        }
+        Node::Join { left, right, kind: JoinKind::Inner, .. }
+        | Node::CrossProduct { left, right } => {
+            key_origin(plan, left, binding).or_else(|| key_origin(plan, right, binding))
+        }
+        Node::Join { left, kind: JoinKind::Semi | JoinKind::Anti, .. } => {
+            key_origin(plan, left, binding)
+        }
+        _ => None,
+    }
+}
+
 /// Rewrites the operands of one expression, rebuilding it only if one of them moved.
 ///
 /// One level deep, and `child` decides whether to go further. The two callers want different
