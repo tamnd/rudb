@@ -95,6 +95,9 @@ impl Binder<'_> {
                 Some(names) => Ok(names),
                 None => Err(Error::binder(format!("* is not allowed in the {}", self.clause))),
             },
+            ast::Expr::Columns { unpacked: true, .. } => {
+                Err(Error::binder("*COLUMNS() can not be used in this place"))
+            }
             ast::Expr::Columns { .. } => self.bind_picked(ast, scope),
             ast::Expr::Column { name } => self.bind_column(ast, name, scope),
             ast::Expr::Literal { kind, text } => self.bind_literal(ast, kind, text),
@@ -789,7 +792,7 @@ impl Binder<'_> {
             return Err(Error::binder("This scalar function does not support lambdas!"));
         }
         let mut bound = Vec::with_capacity(arguments.len());
-        for arg in arguments {
+        for &arg in &arguments {
             bound.push(self.bind_expr(ast, arg, scope)?);
         }
         if let Some(expanded) = self.list_macro(&written, &bound)? {
@@ -801,10 +804,26 @@ impl Binder<'_> {
         if let Some(aggregated) = self.list_aggregate(&written, &bound)? {
             return Ok(aggregated);
         }
+        // A column passed to `struct_pack` without a name gives the field its own name, which is
+        // how `struct_pack(*COLUMNS(*))` packs a whole row.
         if rudb_catalog::same_name(&written, crate::structs::STRUCT_PACK) {
-            return Err(Error::binder(
-                "Need named argument for struct pack, e.g. STRUCT_PACK(a := b)",
-            ));
+            let mut names = Vec::with_capacity(arguments.len());
+            for &arg in &arguments {
+                let ast::Expr::Column { name } = ast.expr(arg) else {
+                    return Err(Error::binder(
+                        "Need named argument for struct pack, e.g. STRUCT_PACK(a := b)",
+                    ));
+                };
+                let parts: Vec<&str> = ast.name(name).collect();
+                let found = scope.resolve(&parts).map(|found| found.name.clone());
+                let field =
+                    found.unwrap_or_else(|_| parts.last().copied().unwrap_or_default().into());
+                if names.iter().any(|earlier: &String| earlier.eq_ignore_ascii_case(&field)) {
+                    return Err(Error::binder(format!("Duplicate struct entry name \"{field}\"")));
+                }
+                names.push(field);
+            }
+            return self.pack_struct(&names, &bound);
         }
         if let Some(call) = self.map_call(&written, &bound)? {
             return Ok(call);
@@ -1794,7 +1813,10 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                 format!("{}.*", ast.name_text(qualifier))
             }
         }
-        ast::Expr::Column { name } => quoted(ast.name(name).last().unwrap_or_default()),
+        // A column inside an expression keeps every part it was written with, so `a.i + 1` is
+        // named `(a.i + 1)`. A column on its own is named by its last part, which the caller sees
+        // to before it gets here.
+        ast::Expr::Column { name } => ast.name(name).map(quoted).collect::<Vec<_>>().join("."),
         ast::Expr::Columns { .. } => rudb_parse::deparse::expression(ast, expr),
         // The deparser is the answer for a window and not an approximation of one. Every other
         // shape here is written out again because the name DuckDB gives it is not quite what its

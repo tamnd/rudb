@@ -68,7 +68,7 @@ use crate::tables::TableSet;
 /// ask not to. The list is short because rudb has few functions, and the way it goes wrong is a
 /// function added here that quietly swallows a null, so a function that has an opinion about null
 /// arguments belongs in this list on the same commit that adds it.
-pub const TOLERANT: [&str; 1] = ["coalesce"];
+pub const TOLERANT: [&str; 3] = ["coalesce", "greatest", "least"];
 
 /// What a predicate evaluates to over a row whose columns from one side are all null.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
