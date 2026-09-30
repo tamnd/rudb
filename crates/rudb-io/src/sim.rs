@@ -19,18 +19,31 @@
 //! hardware. The subsets are enumerated by the test, exhaustively, which is what lets a crash test
 //! prove something rather than merely fail to find a bug.
 //!
-//! # What this does not model yet
+//! # Names are durable apart from contents
 //!
-//! Directory entry durability. A rename here takes effect immediately, where on a real filesystem
-//! the rename is atomic but the directory entry reaching the disk is a separate question that
-//! [`Filesystem::sync_dir`] answers. Modelling that means a pending list per directory as well as
-//! per file, and it is the difference between testing the atomic replace pattern properly and
-//! testing most of it. It is tracked as issue #19 rather than left as a surprise, and it is needed
-//! before the M6 crash tests can claim to cover the header swap in `spec/05-storage.md`.
+//! A file's bytes and the directory entry that names it reach the disk separately. Creating a file,
+//! renaming one and removing one each push an entry onto the pending list of the directory the
+//! name is in, and only [`Filesystem::sync_dir`] on that directory makes them durable. So a file
+//! that was written and synced and whose directory was not can come back from a crash with every
+//! byte on the disk and no name pointing at it, which is the outcome issue #19 asked to be able to
+//! express. A file is held by an inode number under its names, the way a real one is, so a rename
+//! that did not survive leaves the bytes written through the new name under the old one.
 //!
-//! Torn writes within a single `write_at` are not modelled either. A 4 KiB write is atomic on
-//! essentially every device this will run on, and a larger one is decomposed by the caller into
-//! block sized writes, so the interesting reordering is between writes rather than inside one.
+//! A directory entry takes a sequence number from the same counter as a write, so [`Crash::Keeping`]
+//! can keep a rename and lose the write before it, or the other way round. A rename within one
+//! directory is one entry and survives whole or not at all. A rename between two directories is two
+//! entries, the name leaving one and arriving in the other, and a crash can keep either half.
+//!
+//! Directories themselves are made durable when they are made. Nothing here creates directories
+//! on a path where their loss would be the interesting failure, and modelling it would make every
+//! test that makes one sync its parent first.
+//!
+//! # Torn writes
+//!
+//! [`Crash::Torn`] keeps the start of one write and loses the rest of it, which is what a power cut
+//! in the middle of a large write leaves on a device that writes a sector at a time. A log record
+//! or a page with a checksum over it has to read as not written when that happens, never as a
+//! shorter record that verifies.
 //!
 //! # The read side
 //!
@@ -138,6 +151,17 @@ pub enum Crash {
     /// This is the variant the exhaustive enumeration uses. With three unsynced writes there are
     /// eight subsets and the test runs all eight.
     Keeping(Vec<u64>),
+    /// The ones in `keeping`, and the first `bytes` bytes of the write numbered `torn`.
+    ///
+    /// A truncate or a directory entry cannot be torn, and one numbered `torn` is lost.
+    Torn {
+        /// What survived whole.
+        keeping: Vec<u64>,
+        /// The write that survived in part.
+        torn: u64,
+        /// How much of it did.
+        bytes: usize,
+    },
 }
 
 impl Crash {
@@ -145,7 +169,17 @@ impl Crash {
         match self {
             Self::LosingUnsynced => false,
             Self::KeepingEverything => true,
-            Self::Keeping(kept) => kept.contains(&seq),
+            Self::Keeping(kept) | Self::Torn { keeping: kept, .. } => kept.contains(&seq),
+        }
+    }
+
+    /// How much of the write numbered `seq` survived, if it was torn.
+    fn torn(&self, seq: u64) -> Option<usize> {
+        match self {
+            Self::Torn { torn, bytes, keeping } if *torn == seq && !keeping.contains(&seq) => {
+                Some(*bytes)
+            }
+            _ => None,
         }
     }
 }
@@ -154,7 +188,59 @@ impl Crash {
 #[derive(Debug, Clone)]
 struct Pending {
     seq: u64,
+    /// The name it was written through, for [`SimFilesystem::pending`].
+    path: PathBuf,
     change: Change,
+}
+
+/// A change to a directory that has been made and not yet made durable.
+#[derive(Debug, Clone)]
+struct DirPending {
+    seq: u64,
+    /// The directory whose sync makes it durable.
+    dir: PathBuf,
+    entry: Entry,
+}
+
+/// One change to the names in a directory.
+#[derive(Debug, Clone)]
+enum Entry {
+    /// A name now points at a file.
+    Link { name: PathBuf, inode: u64 },
+    /// A name is gone.
+    Unlink { name: PathBuf },
+    /// A file moved from one name to another in the same directory, which is one entry.
+    Rename { from: PathBuf, to: PathBuf, inode: u64 },
+}
+
+impl Entry {
+    /// The name a caller reading [`SimFilesystem::pending`] knows this change by.
+    fn name(&self) -> &Path {
+        match self {
+            Self::Link { name, .. } | Self::Unlink { name } => name,
+            Self::Rename { to, .. } => to,
+        }
+    }
+
+    fn apply(&self, names: &mut BTreeMap<PathBuf, u64>) {
+        match self {
+            Self::Link { name, inode } => {
+                names.insert(name.clone(), *inode);
+            }
+            Self::Unlink { name } => {
+                names.remove(name);
+            }
+            Self::Rename { from, to, inode } => {
+                names.remove(from);
+                names.insert(to.clone(), *inode);
+            }
+        }
+    }
+}
+
+/// The directory a name is in, which is the one whose sync makes a change to the name durable.
+fn parent(path: &Path) -> PathBuf {
+    path.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
@@ -184,15 +270,17 @@ impl SimFile {
 
 fn apply(bytes: &mut Vec<u8>, change: &Change) {
     match change {
-        Change::Write { offset, data } => {
-            let end = *offset as usize + data.len();
-            if bytes.len() < end {
-                bytes.resize(end, 0);
-            }
-            bytes[*offset as usize..end].copy_from_slice(data);
-        }
+        Change::Write { offset, data } => write(bytes, *offset, data),
         Change::Truncate { len } => bytes.resize(*len as usize, 0),
     }
+}
+
+fn write(bytes: &mut Vec<u8>, offset: u64, data: &[u8]) {
+    let end = offset as usize + data.len();
+    if bytes.len() < end {
+        bytes.resize(end, 0);
+    }
+    bytes[offset as usize..end].copy_from_slice(data);
 }
 
 /// The order a batch handed to `submit` comes back in.
@@ -229,7 +317,15 @@ struct ReadFaults {
 
 #[derive(Debug, Default)]
 struct Inner {
-    files: BTreeMap<PathBuf, SimFile>,
+    /// Every file by its inode number, named or not.
+    files: BTreeMap<u64, SimFile>,
+    next_inode: u64,
+    /// The names a process sees.
+    names: BTreeMap<PathBuf, u64>,
+    /// The names on the disk.
+    durable_names: BTreeMap<PathBuf, u64>,
+    /// The changes to names that are not on the disk yet, in the order they were made.
+    dir_pending: Vec<DirPending>,
     dirs: BTreeSet<PathBuf>,
     log: Vec<Op>,
     next_seq: u64,
@@ -253,11 +349,35 @@ impl Inner {
         Ok(())
     }
 
+    /// The next sequence number, shared by writes and directory entries.
+    fn next_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
+    }
+
+    /// Records a change to the names in the directory `path` is in.
+    fn change_dir(&mut self, path: &Path, entry: Entry) {
+        let seq = self.next_seq();
+        self.dir_pending.push(DirPending { seq, dir: parent(path), entry });
+    }
+
+    /// The file a name points at now.
+    fn file(&self, path: &Path) -> Option<&SimFile> {
+        self.names.get(path).and_then(|inode| self.files.get(inode))
+    }
+
     /// Serves one read, applying whatever fault was addressed at this read.
     ///
     /// The read is counted before anything else can go wrong with it, so an injected failure on
     /// read seven does not shift what read eight is.
-    fn serve_read(&mut self, path: &Path, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    fn serve_read(
+        &mut self,
+        inode: u64,
+        path: &Path,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize> {
         let number = self.reads.served;
         self.reads.served += 1;
         let failing = self.reads.failing.remove(&number);
@@ -267,7 +387,8 @@ impl Inner {
         }
         let file = self
             .files
-            .get(path)
+            .get(&inode)
+            .filter(|_| self.names.values().any(|named| *named == inode))
             .ok_or_else(|| Error::io(format!("{} was removed while open", path.display())))?;
         let bytes = file.visible();
         let start = offset as usize;
@@ -413,44 +534,70 @@ impl SimFilesystem {
         inner.reads.order = Completions::InOrder;
     }
 
-    /// The writes that have been issued and not made durable, as sequence numbers with their file.
+    /// The writes and the changes to names that have been made and not made durable, as sequence
+    /// numbers with the name each was made through.
     ///
     /// These are the numbers [`Crash::Keeping`] takes. The order is the order they were issued in,
     /// across all files, because two writes to different files race with each other exactly the way
-    /// two writes to one file do.
+    /// two writes to one file do, and a rename races with both.
     #[must_use]
     pub fn pending(&self) -> Vec<(u64, PathBuf)> {
         let inner = self.lock();
         let mut out: Vec<(u64, PathBuf)> = inner
             .files
-            .iter()
-            .flat_map(|(path, file)| file.pending.iter().map(|p| (p.seq, path.clone())))
+            .values()
+            .flat_map(|file| file.pending.iter().map(|p| (p.seq, p.path.clone())))
+            .chain(inner.dir_pending.iter().map(|p| (p.seq, p.entry.name().to_path_buf())))
             .collect();
         out.sort_by_key(|(seq, _)| *seq);
         out
     }
 
+    /// Only the changes to names from [`Self::pending`], for a test that enumerates those and keeps
+    /// every write.
+    #[must_use]
+    pub fn pending_names(&self) -> Vec<(u64, PathBuf)> {
+        let inner = self.lock();
+        inner.dir_pending.iter().map(|p| (p.seq, p.entry.name().to_path_buf())).collect()
+    }
+
     /// The filesystem a process would find after a crash.
     ///
-    /// The durable image, plus whichever pending writes `crash` says survived, applied in the order
-    /// they were issued. The result is a fresh filesystem with an empty log, because the log
-    /// belongs to the process that died.
+    /// The durable names and the durable image of each file, plus whichever pending writes and
+    /// changes to names `crash` says survived, applied in the order they were issued. A file no
+    /// surviving name points at is gone. The result is a fresh filesystem with an empty log, because
+    /// the log belongs to the process that died.
     #[must_use]
     pub fn crash(&self, crash: &Crash) -> Self {
         let inner = self.lock();
+        let mut names = inner.durable_names.clone();
+        for pending in &inner.dir_pending {
+            if crash.keeps(pending.seq) {
+                pending.entry.apply(&mut names);
+            }
+        }
         let mut files = BTreeMap::new();
-        for (path, file) in &inner.files {
+        for inode in names.values() {
+            let Some(file) = inner.files.get(inode) else { continue };
             let mut bytes = file.durable.clone();
             for entry in &file.pending {
                 if crash.keeps(entry.seq) {
                     apply(&mut bytes, &entry.change);
+                } else if let (Some(kept), Change::Write { offset, data }) =
+                    (crash.torn(entry.seq), &entry.change)
+                {
+                    write(&mut bytes, *offset, &data[..kept.min(data.len())]);
                 }
             }
-            files.insert(path.clone(), SimFile { durable: bytes, pending: Vec::new() });
+            files.insert(*inode, SimFile { durable: bytes, pending: Vec::new() });
         }
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 files,
+                next_inode: inner.next_inode,
+                durable_names: names.clone(),
+                names,
+                dir_pending: Vec::new(),
                 dirs: inner.dirs.clone(),
                 log: Vec::new(),
                 next_seq: 0,
@@ -460,25 +607,32 @@ impl SimFilesystem {
         }
     }
 
-    /// The durable contents of a file, ignoring anything unsynced.
+    /// The durable contents of the file a name points at now, ignoring any unsynced write to it.
     ///
     /// For a test that wants to assert what is on the disk without going through a crash first.
+    /// Whether the name itself is on the disk is [`Self::durable_names`].
     #[must_use]
     pub fn durable_contents(&self, path: &Path) -> Option<Vec<u8>> {
-        self.lock().files.get(path).map(|file| file.durable.clone())
+        self.lock().file(path).map(|file| file.durable.clone())
+    }
+
+    /// The names that would survive a crash that lost every unsynced change, in order.
+    #[must_use]
+    pub fn durable_names(&self) -> Vec<PathBuf> {
+        self.lock().durable_names.keys().cloned().collect()
     }
 
     /// The contents a reader would see right now, unsynced writes included.
     #[must_use]
     pub fn contents(&self, path: &Path) -> Option<Vec<u8>> {
-        self.lock().files.get(path).map(SimFile::visible)
+        self.lock().file(path).map(SimFile::visible)
     }
 }
 
 impl Filesystem for SimFilesystem {
     fn open(&self, path: &Path, mode: OpenMode) -> Result<Box<dyn File>> {
         let mut inner = self.lock();
-        let exists = inner.files.contains_key(path);
+        let exists = inner.names.contains_key(path);
         match mode {
             OpenMode::Read | OpenMode::ReadWrite if !exists => {
                 // Recorded before the error, so that a test enumerating failure points sees the
@@ -493,17 +647,28 @@ impl Filesystem for SimFilesystem {
             _ => {}
         }
         inner.record(Op::Open { path: path.to_path_buf(), mode })?;
-        inner.files.entry(path.to_path_buf()).or_default();
+        let inode = match inner.names.get(path) {
+            Some(inode) => *inode,
+            None => {
+                let inode = inner.next_inode;
+                inner.next_inode += 1;
+                inner.files.insert(inode, SimFile::default());
+                inner.names.insert(path.to_path_buf(), inode);
+                inner.change_dir(path, Entry::Link { name: path.to_path_buf(), inode });
+                inode
+            }
+        };
         Ok(Box::new(SimHandle {
             fs: self.clone(),
             path: path.to_path_buf(),
+            inode,
             writable: mode.writable(),
         }))
     }
 
     fn exists(&self, path: &Path) -> bool {
         let inner = self.lock();
-        inner.files.contains_key(path) || inner.dirs.contains(path)
+        inner.names.contains_key(path) || inner.dirs.contains(path)
     }
 
     fn is_dir(&self, path: &Path) -> bool {
@@ -519,7 +684,7 @@ impl Filesystem for SimFilesystem {
         // Not recorded in the operation log. The log is what the crash tests replay and a listing
         // changes nothing, so an entry for it would be a line every test that lists has to expect.
         let mut found: Vec<PathBuf> = inner
-            .files
+            .names
             .keys()
             .chain(inner.dirs.iter())
             .filter(|entry| entry.parent() == Some(path))
@@ -533,19 +698,27 @@ impl Filesystem for SimFilesystem {
     fn remove(&self, path: &Path) -> Result<()> {
         let mut inner = self.lock();
         inner.record(Op::Remove { path: path.to_path_buf() })?;
-        if inner.files.remove(path).is_none() {
+        if inner.names.remove(path).is_none() {
             return Err(Error::io(format!("{} does not exist", path.display())));
         }
+        inner.change_dir(path, Entry::Unlink { name: path.to_path_buf() });
         Ok(())
     }
 
     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         let mut inner = self.lock();
         inner.record(Op::Rename { from: from.to_path_buf(), to: to.to_path_buf() })?;
-        let Some(file) = inner.files.remove(from) else {
+        let Some(inode) = inner.names.remove(from) else {
             return Err(Error::io(format!("{} does not exist", from.display())));
         };
-        inner.files.insert(to.to_path_buf(), file);
+        inner.names.insert(to.to_path_buf(), inode);
+        let (from, to) = (from.to_path_buf(), to.to_path_buf());
+        if parent(&from) == parent(&to) {
+            inner.change_dir(&to.clone(), Entry::Rename { from, to, inode });
+        } else {
+            inner.change_dir(&from.clone(), Entry::Unlink { name: from });
+            inner.change_dir(&to.clone(), Entry::Link { name: to, inode });
+        }
         Ok(())
     }
 
@@ -562,7 +735,15 @@ impl Filesystem for SimFilesystem {
 
     fn sync_dir(&self, path: &Path) -> Result<()> {
         let mut inner = self.lock();
-        inner.record(Op::SyncDir { path: path.to_path_buf() })
+        inner.record(Op::SyncDir { path: path.to_path_buf() })?;
+        let pending = std::mem::take(&mut inner.dir_pending);
+        let (synced, rest): (Vec<_>, Vec<_>) =
+            pending.into_iter().partition(|pending| pending.dir == path);
+        for pending in synced {
+            pending.entry.apply(&mut inner.durable_names);
+        }
+        inner.dir_pending = rest;
+        Ok(())
     }
 }
 
@@ -570,7 +751,10 @@ impl Filesystem for SimFilesystem {
 #[derive(Debug)]
 struct SimHandle {
     fs: SimFilesystem,
+    /// The name it was opened by, which is what the log records its calls under.
     path: PathBuf,
+    /// The file, which keeps being this handle's file under whatever name it is renamed to.
+    inode: u64,
     writable: bool,
 }
 
@@ -578,11 +762,23 @@ impl SimHandle {
     fn missing(&self) -> Error {
         Error::io(format!("{} was removed while open", self.path.display()))
     }
+
+    /// This handle's file, while some name still points at it.
+    ///
+    /// A real file stays writable after its last name is removed. Here that is an error, because a
+    /// caller writing to a file nothing names is writing bytes no crash can bring back, and a test
+    /// wants to hear about that rather than have it succeed.
+    fn file<'a>(&self, inner: &'a mut Inner) -> Result<&'a mut SimFile> {
+        if !inner.names.values().any(|inode| *inode == self.inode) {
+            return Err(self.missing());
+        }
+        inner.files.get_mut(&self.inode).ok_or_else(|| self.missing())
+    }
 }
 
 impl File for SimHandle {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        self.fs.lock().serve_read(&self.path, offset, buf)
+        self.fs.lock().serve_read(self.inode, &self.path, offset, buf)
     }
 
     fn submit(&self, requests: Vec<Request>) -> Completion {
@@ -609,17 +805,18 @@ impl File for SimHandle {
         }
         let mut inner = self.fs.lock();
         inner.record(Op::Write { path: self.path.clone(), offset, len: data.len() })?;
-        let seq = inner.next_seq;
-        inner.next_seq += 1;
-        let file = inner.files.get_mut(&self.path).ok_or_else(|| self.missing())?;
-        file.pending.push(Pending { seq, change: Change::Write { offset, data: data.to_vec() } });
+        self.file(&mut inner)?;
+        let seq = inner.next_seq();
+        let path = self.path.clone();
+        let change = Change::Write { offset, data: data.to_vec() };
+        self.file(&mut inner)?.pending.push(Pending { seq, path, change });
         Ok(())
     }
 
     fn sync(&self) -> Result<()> {
         let mut inner = self.fs.lock();
         inner.record(Op::Sync { path: self.path.clone() })?;
-        let file = inner.files.get_mut(&self.path).ok_or_else(|| self.missing())?;
+        let file = self.file(&mut inner)?;
         let pending = std::mem::take(&mut file.pending);
         let mut durable = std::mem::take(&mut file.durable);
         for entry in &pending {
@@ -635,17 +832,20 @@ impl File for SimHandle {
         }
         let mut inner = self.fs.lock();
         inner.record(Op::Truncate { path: self.path.clone(), len })?;
-        let seq = inner.next_seq;
-        inner.next_seq += 1;
-        let file = inner.files.get_mut(&self.path).ok_or_else(|| self.missing())?;
-        file.pending.push(Pending { seq, change: Change::Truncate { len } });
+        self.file(&mut inner)?;
+        let seq = inner.next_seq();
+        let path = self.path.clone();
+        self.file(&mut inner)?.pending.push(Pending {
+            seq,
+            path,
+            change: Change::Truncate { len },
+        });
         Ok(())
     }
 
     fn len(&self) -> Result<u64> {
-        let inner = self.fs.lock();
-        let file = inner.files.get(&self.path).ok_or_else(|| self.missing())?;
-        Ok(file.visible().len() as u64)
+        let mut inner = self.fs.lock();
+        Ok(self.file(&mut inner)?.visible().len() as u64)
     }
 }
 
@@ -659,6 +859,7 @@ mod tests {
 
     fn write_two_unsynced(fs: &SimFilesystem) {
         let file = fs.open(Path::new("/db"), OpenMode::Create).unwrap();
+        fs.sync_dir(Path::new("/")).unwrap();
         file.write_at(0, b"AAAA").unwrap();
         file.sync().unwrap();
         file.write_at(0, b"BBBB").unwrap();
@@ -685,12 +886,13 @@ mod tests {
         // four outcomes are real. A crash test that only checks the truncation case misses the
         // bugs that actually happen on hardware.
         let mut seen = Vec::new();
-        for kept in [vec![], vec![1], vec![2], vec![1, 2]] {
+        for kept in [vec![], vec![0], vec![1], vec![0, 1]] {
             let fs = SimFilesystem::new();
             write_two_unsynced(&fs);
             let pending = fs.pending();
             assert_eq!(pending.len(), 2, "both writes are unsynced");
-            let after = fs.crash(&Crash::Keeping(kept.clone()));
+            let kept = kept.iter().map(|at: &usize| pending[*at].0).collect();
+            let after = fs.crash(&Crash::Keeping(kept));
             seen.push(after.durable_contents(Path::new("/db")).unwrap());
         }
         assert_eq!(seen[0], b"AAAA".to_vec(), "neither landed");
@@ -766,7 +968,7 @@ mod tests {
         fs.fail_at(2);
         assert!(file.sync().is_err());
         assert_eq!(fs.durable_contents(Path::new("/db")).unwrap(), Vec::<u8>::new());
-        assert_eq!(fs.pending().len(), 1);
+        assert_eq!(fs.pending().len(), 2, "the write, and the name nothing synced either");
     }
 
     #[test]
@@ -776,6 +978,7 @@ mod tests {
         // to work before something depends on it being right.
         let fs = SimFilesystem::new();
         let file = fs.open(Path::new("/db"), OpenMode::Create).unwrap();
+        fs.sync_dir(Path::new("/")).unwrap();
         file.write_at(0, b"1").unwrap();
         file.write_at(1, b"2").unwrap();
         file.write_at(2, b"3").unwrap();
@@ -797,6 +1000,127 @@ mod tests {
         // scheme where two subsets produced the same bytes would be one where the enumeration was
         // doing less work than it looks like.
         assert_eq!(outcomes.len(), 8);
+    }
+
+    #[test]
+    fn a_synced_file_in_a_directory_nobody_synced_has_no_name_after_a_crash() {
+        // Durable in its contents and absent by name, the outcome issue #19 wanted expressible.
+        let fs = SimFilesystem::new();
+        fs.create_dir_all(Path::new("/data")).unwrap();
+        let file = fs.open(Path::new("/data/db"), OpenMode::CreateNew).unwrap();
+        file.write_at(0, b"kept").unwrap();
+        file.sync().unwrap();
+        assert!(fs.durable_names().is_empty());
+        let after = fs.crash(&Crash::LosingUnsynced);
+        assert_eq!(after.contents(Path::new("/data/db")), None);
+        assert!(!after.exists(Path::new("/data/db")));
+        assert_eq!(after.read_dir(Path::new("/data")).unwrap(), Vec::<std::path::PathBuf>::new());
+
+        fs.sync_dir(Path::new("/data")).unwrap();
+        let after = fs.crash(&Crash::LosingUnsynced);
+        assert_eq!(after.contents(Path::new("/data/db")).unwrap(), b"kept".to_vec());
+    }
+
+    #[test]
+    fn a_rename_that_did_not_survive_leaves_the_writes_after_it_under_the_old_name() {
+        let fs = SimFilesystem::new();
+        fs.create_dir_all(Path::new("/data")).unwrap();
+        let file = fs.open(Path::new("/data/db.tmp"), OpenMode::CreateNew).unwrap();
+        fs.sync_dir(Path::new("/data")).unwrap();
+        fs.rename(Path::new("/data/db.tmp"), Path::new("/data/db")).unwrap();
+        file.write_at(0, b"after").unwrap();
+        file.sync().unwrap();
+        assert_eq!(fs.contents(Path::new("/data/db")).unwrap(), b"after".to_vec());
+        let pending = fs.pending();
+        assert_eq!(pending.len(), 1, "the rename, since the write was synced: {pending:?}");
+
+        let lost = fs.crash(&Crash::LosingUnsynced);
+        assert_eq!(lost.contents(Path::new("/data/db.tmp")).unwrap(), b"after".to_vec());
+        assert!(!lost.exists(Path::new("/data/db")));
+        let kept = fs.crash(&Crash::Keeping(vec![pending[0].0]));
+        assert_eq!(kept.contents(Path::new("/data/db")).unwrap(), b"after".to_vec());
+        assert!(!kept.exists(Path::new("/data/db.tmp")));
+    }
+
+    #[test]
+    fn an_atomic_replace_is_the_old_file_or_the_new_one_until_the_directory_is_synced() {
+        let fs = SimFilesystem::new();
+        fs.create_dir_all(Path::new("/data")).unwrap();
+        for (name, bytes) in [("/data/db", b"old"), ("/data/db.tmp", b"new")] {
+            let file = fs.open(Path::new(name), OpenMode::CreateNew).unwrap();
+            file.write_at(0, bytes).unwrap();
+            file.sync().unwrap();
+        }
+        fs.sync_dir(Path::new("/data")).unwrap();
+        fs.rename(Path::new("/data/db.tmp"), Path::new("/data/db")).unwrap();
+        let (seq, name) = fs.pending().pop().expect("the rename is pending");
+        assert_eq!(name, Path::new("/data/db"));
+
+        let lost = fs.crash(&Crash::LosingUnsynced);
+        assert_eq!(lost.contents(Path::new("/data/db")).unwrap(), b"old".to_vec());
+        assert_eq!(lost.contents(Path::new("/data/db.tmp")).unwrap(), b"new".to_vec());
+        let kept = fs.crash(&Crash::Keeping(vec![seq]));
+        assert_eq!(kept.contents(Path::new("/data/db")).unwrap(), b"new".to_vec());
+        assert!(!kept.exists(Path::new("/data/db.tmp")), "one entry, so both halves or neither");
+
+        fs.sync_dir(Path::new("/data")).unwrap();
+        let synced = fs.crash(&Crash::LosingUnsynced);
+        assert_eq!(synced.contents(Path::new("/data/db")).unwrap(), b"new".to_vec());
+    }
+
+    #[test]
+    fn a_rename_between_directories_can_lose_either_half() {
+        let fs = SimFilesystem::new();
+        fs.create_dir_all(Path::new("/a")).unwrap();
+        fs.create_dir_all(Path::new("/b")).unwrap();
+        let file = fs.open(Path::new("/a/f"), OpenMode::CreateNew).unwrap();
+        file.write_at(0, b"f").unwrap();
+        file.sync().unwrap();
+        fs.sync_dir(Path::new("/a")).unwrap();
+        fs.rename(Path::new("/a/f"), Path::new("/b/f")).unwrap();
+        let halves = fs.pending_names();
+        assert_eq!(halves.len(), 2, "leaving /a and arriving in /b: {halves:?}");
+
+        let names = |crash: Crash| {
+            let after = fs.crash(&crash);
+            (after.exists(Path::new("/a/f")), after.exists(Path::new("/b/f")))
+        };
+        assert_eq!(names(Crash::LosingUnsynced), (true, false));
+        assert_eq!(names(Crash::Keeping(vec![halves[0].0])), (false, false), "gone from both");
+        assert_eq!(names(Crash::Keeping(vec![halves[1].0])), (true, true), "named twice");
+        assert_eq!(names(Crash::KeepingEverything), (false, true));
+
+        fs.sync_dir(Path::new("/b")).unwrap();
+        assert_eq!(fs.pending_names().len(), 1, "a sync of /b leaves /a's half pending");
+    }
+
+    #[test]
+    fn a_torn_write_keeps_its_start_and_nothing_after() {
+        let fs = SimFilesystem::new();
+        write_two_unsynced(&fs);
+        let pending = fs.pending();
+        let (first, second) = (pending[0].0, pending[1].0);
+        let torn = |keeping: Vec<u64>, torn: u64, bytes: usize| {
+            fs.crash(&Crash::Torn { keeping, torn, bytes })
+                .contents(Path::new("/db"))
+                .expect("the name was synced")
+        };
+        assert_eq!(torn(vec![], first, 2), b"BBAA".to_vec());
+        assert_eq!(torn(vec![first], second, 1), b"BBBBC".to_vec());
+        assert_eq!(torn(vec![], second, 0), b"AAAA".to_vec(), "none of it, then");
+        assert_eq!(torn(vec![], second, 99), b"AAAACCCC".to_vec(), "all of it at most");
+    }
+
+    #[test]
+    fn a_handle_keeps_its_file_across_a_rename() {
+        let fs = SimFilesystem::new();
+        let file = fs.open(Path::new("/one"), OpenMode::Create).unwrap();
+        fs.rename(Path::new("/one"), Path::new("/two")).unwrap();
+        file.write_at(0, b"x").unwrap();
+        assert_eq!(file.len().unwrap(), 1);
+        let mut byte = [0];
+        file.read_exact_at(0, &mut byte).unwrap();
+        assert_eq!(fs.contents(Path::new("/two")).unwrap(), b"x".to_vec());
     }
 
     #[test]

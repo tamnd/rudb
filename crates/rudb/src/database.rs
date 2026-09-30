@@ -5794,7 +5794,7 @@ mod tests {
 
     use rudb_common::Value;
 
-    use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
+    use rudb_io::{Crash, Filesystem, Op, OpenMode, SimFilesystem};
 
     use super::{
         Database, NativeExtremaValues, native_extrema_shape, native_nonzero_shape,
@@ -6359,6 +6359,8 @@ mod tests {
         assert!(matches!(ops[0], Op::Rename { .. }), "{ops:?}");
         assert_eq!(ops[1], Op::SyncDir { path: "/data".into() });
         assert_eq!(fs.contents(Path::new("/data/db")).unwrap(), b"new".to_vec());
+        let after = fs.crash(&Crash::LosingUnsynced);
+        assert_eq!(after.contents(Path::new("/data/db")).unwrap(), b"new".to_vec());
     }
 
     #[test]
