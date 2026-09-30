@@ -283,7 +283,8 @@ pub(crate) fn key_origin(
             let Expr::Column(below) = *plan.expr(expr) else { return None };
             key_origin(plan, input, below)
         }
-        Node::Join { left, right, kind: JoinKind::Inner, .. } | Node::CrossProduct { left, right } => {
+        Node::Join { left, right, kind: JoinKind::Inner, .. }
+        | Node::CrossProduct { left, right } => {
             key_origin(plan, left, binding).or_else(|| key_origin(plan, right, binding))
         }
         Node::Join { left, kind: JoinKind::Semi | JoinKind::Anti, .. } => {
