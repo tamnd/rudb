@@ -170,6 +170,11 @@ impl Replayed {
         self.kind == Kind::Insert
     }
 
+    /// Whether this is a Ddl record, which [`Self::statement`] reads.
+    pub(crate) fn is_statement(&self) -> bool {
+        self.kind == Kind::Ddl
+    }
+
     /// The statement a Ddl record carries, which replay runs again, or `None` for any other kind.
     ///
     /// # Errors
@@ -834,19 +839,26 @@ fn get_text_column(bytes: &[u8], at: &mut usize, field: &Field, rows: usize) -> 
         .chunks_exact(4)
         .map(|one| u32::from_le_bytes(one.try_into().expect("four bytes")) as usize)
         .sum();
-    let mut body = take(bytes, at, total)?;
-    let text = field.ty == LogicalType::Varchar;
+    let body = take(bytes, at, total)?;
     let mut column = StringColumn::with_capacity(rows);
-    for one in lengths.chunks_exact(4) {
-        let len = u32::from_le_bytes(one.try_into().expect("four bytes")) as usize;
-        let (value, rest) = body.split_at(len);
-        body = rest;
-        if text {
+    let mut from = 0;
+    if field.ty == LogicalType::Varchar {
+        // Checked as one run, and each string is then a slice of it that has to start and end on
+        // a character. Checking a string at a time spent more on the calls than on the bytes.
+        let text =
+            std::str::from_utf8(body).map_err(|_| corrupt("logged text that is not UTF-8"))?;
+        for one in lengths.chunks_exact(4) {
+            let end = from + u32::from_le_bytes(one.try_into().expect("four bytes")) as usize;
             let value =
-                std::str::from_utf8(value).map_err(|_| corrupt("logged text that is not UTF-8"))?;
+                text.get(from..end).ok_or_else(|| corrupt("logged text cut inside a character"))?;
             column.push(value);
-        } else {
-            column.push_bytes(value);
+            from = end;
+        }
+    } else {
+        for one in lengths.chunks_exact(4) {
+            let end = from + u32::from_le_bytes(one.try_into().expect("four bytes")) as usize;
+            column.push_bytes(&body[from..end]);
+            from = end;
         }
     }
     Ok(Vector::flat(field.ty.clone(), Data::Varlen(column))?.with_validity(validity))
