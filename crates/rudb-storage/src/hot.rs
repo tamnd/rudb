@@ -27,11 +27,13 @@
 use std::ops::Range;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use rudb_common::Error;
 
 use crate::arena::{Arena, Place, Space};
 use crate::deletes::{PART_ROWS, PART_WORDS, Refusal, STRIPE_ROWS, UNCOMMITTED};
+use crate::park::{self, Wait};
 use crate::undo::{Image, UndoBuffer, UndoKind, UndoRef, UndoSpace};
 
 /// Parts in a stripe.
@@ -50,13 +52,13 @@ const ROWS: usize = PART_ROWS as usize;
 const LIVE: u64 = u64::MAX;
 
 /// The lock word's bit for a row a writer holds. The holder's id has the top bit set already.
-const HELD: u64 = 1 << 63;
+pub(crate) const HELD: u64 = 1 << 63;
 
 /// The lock word's bit for a row someone is parked on, `08-concurrency.md` section 8.3.
-const WAITERS: u64 = 1 << 62;
+pub(crate) const WAITERS: u64 = 1 << 62;
 
 /// The lock word's bit for a row an uncommitted delta names.
-const DELTA: u64 = 1 << 61;
+pub(crate) const DELTA: u64 = 1 << 61;
 
 /// The stamp of an undo record whose writer aborted. It is nobody's id, not even that of a reader
 /// with none, and like an id it is past every snapshot: every reader applies the record, which
@@ -476,7 +478,9 @@ impl HotStripe {
     /// # Errors
     ///
     /// [`Refusal::Gone`] when `txn` does not see the row, and [`Refusal::Conflict`] when another
-    /// transaction holds it or changed it after `snapshot`. Both leave the row as it was.
+    /// transaction holds it or changed it after `snapshot`. Both leave the row as it was. A row
+    /// another transaction holds is waited for as `wait` allows, and a wait that runs out is a
+    /// conflict too.
     ///
     /// # Panics
     ///
@@ -487,10 +491,11 @@ impl HotStripe {
         changes: &[(usize, Option<u128>)],
         snapshot: u64,
         txn: u64,
+        wait: Wait,
         buffer: &mut UndoBuffer,
     ) -> Result<(), Refusal> {
         let me = txn | UNCOMMITTED;
-        self.claim(slot, snapshot, me)?;
+        self.claim(slot, snapshot, me, wait)?;
         let images: Vec<Image> = changes
             .iter()
             .map(|&(column, _)| Image { column: column as u16, value: self.read(slot, column) })
@@ -509,7 +514,7 @@ impl HotStripe {
     ///
     /// [`Refusal::Gone`] when `txn` does not see the row, because it was never inserted as far as
     /// `txn` can tell or was already deleted, and [`Refusal::Conflict`] when another transaction
-    /// holds it or changed it after `snapshot`.
+    /// holds it or changed it after `snapshot`, after waiting for it as `wait` allows.
     ///
     /// # Panics
     ///
@@ -519,10 +524,11 @@ impl HotStripe {
         slot: u32,
         snapshot: u64,
         txn: u64,
+        wait: Wait,
         buffer: &mut UndoBuffer,
     ) -> Result<(), Refusal> {
         let me = txn | UNCOMMITTED;
-        self.claim(slot, snapshot, me)?;
+        self.claim(slot, snapshot, me, wait)?;
         let (part, at) = place(slot);
         let deleted = &self.deleted.get_or(part, || AtomicU64::new(LIVE))[at];
         self.push_undo(slot, UndoKind::Delete, me, &[], buffer);
@@ -612,10 +618,10 @@ impl HotStripe {
     }
 
     /// Takes the row lock of `slot` for `me` and checks that nothing committed after `snapshot`
-    /// changed the row, `08-concurrency.md` section 8.3. Nobody waits yet: a row another
-    /// transaction holds is a conflict at once, which is the pin's behaviour with
-    /// `lock_timeout = 0`.
-    fn claim(&self, slot: u32, snapshot: u64, me: u64) -> Result<(), Refusal> {
+    /// changed the row, `08-concurrency.md` section 8.3. A row another transaction holds is
+    /// waited for when `wait` allows it by wait-die, section 8.4, and is a conflict otherwise,
+    /// which with [`Wait::NEVER`] is the pin's behaviour.
+    fn claim(&self, slot: u32, snapshot: u64, me: u64, wait: Wait) -> Result<(), Refusal> {
         let (part, at) = place(slot);
         let created = self.created.get(part).map_or(0, |part| part[at].load(Ordering::Acquire));
         if created.wrapping_sub(1) >= snapshot && created != me {
@@ -624,8 +630,15 @@ impl HotStripe {
         let lock = &self.lock.get_or(part, || AtomicU64::new(0))[at];
         let mut word = lock.load(Ordering::Acquire);
         loop {
-            if word & HELD != 0 && word & !(WAITERS | DELTA) != me {
-                return Err(Refusal::Conflict);
+            let holder = word & !(WAITERS | DELTA);
+            if word & HELD != 0 && holder != me {
+                if !wait.allows(me, holder) {
+                    return Err(Refusal::Conflict);
+                }
+                if !park::wait(lock, me, Instant::now() + wait.timeout) {
+                    return Err(Refusal::Conflict);
+                }
+                break;
             }
             if word & HELD != 0 {
                 // Its own row: nothing else can have changed it, but it may have deleted it.
@@ -716,7 +729,7 @@ impl HotStripe {
     fn release(&self, slot: u32) {
         let (part, at) = place(slot);
         if let Some(lock) = self.lock.get(part) {
-            lock[at].fetch_and(WAITERS | DELTA, Ordering::Release);
+            park::release(&lock[at]);
         }
     }
 
@@ -884,12 +897,14 @@ impl Lease {
 mod tests {
     use std::sync::Arc;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use super::{FIRST_LEASE, HotStripe, LARGEST_LEASE, Lease, PART_ROWS, PART_WORDS, Width};
     use crate::arena::Space;
     use crate::deletes::{Refusal, STRIPE_ROWS, Write};
+    use crate::park::{self, Wait};
     use crate::undo::UndoBuffer;
 
     /// A committed row of `values` at a fresh slot, inserted by transaction 1 at timestamp 1.
@@ -966,23 +981,31 @@ mod tests {
         let slots = stripe.lease(2).expect("slots");
         stripe.insert(slots.clone(), 1);
         let first = slots.start;
-        assert_eq!(stripe.delete(first, 0, 2, &mut buffer), Err(Refusal::Gone), "not visible");
+        assert_eq!(
+            stripe.delete(first, 0, 2, Wait::NEVER, &mut buffer),
+            Err(Refusal::Gone),
+            "not visible"
+        );
         stripe.commit_insert(slots.clone(), 1, 5);
-        stripe.delete(first, 5, 2, &mut buffer).expect("delete");
+        stripe.delete(first, 5, 2, Wait::NEVER, &mut buffer).expect("delete");
         assert!(!stripe.visible(first, 5, 2), "its own delete");
         assert!(stripe.visible(first, 9, 3), "someone else's uncommitted delete");
-        assert_eq!(stripe.delete(first, 5, 2, &mut buffer), Err(Refusal::Gone));
-        assert_eq!(stripe.delete(first, 5, 3, &mut buffer), Err(Refusal::Conflict));
+        assert_eq!(stripe.delete(first, 5, 2, Wait::NEVER, &mut buffer), Err(Refusal::Gone));
+        assert_eq!(stripe.delete(first, 5, 3, Wait::NEVER, &mut buffer), Err(Refusal::Conflict));
         stripe.commit_write(first, 2, 8);
         assert!(stripe.visible(first, 7, 3), "a snapshot before the delete");
         assert!(!stripe.visible(first, 8, 3));
-        assert_eq!(stripe.delete(first, 7, 3, &mut buffer), Err(Refusal::Conflict), "too late");
-        assert_eq!(stripe.delete(first, 8, 3, &mut buffer), Err(Refusal::Gone));
+        assert_eq!(
+            stripe.delete(first, 7, 3, Wait::NEVER, &mut buffer),
+            Err(Refusal::Conflict),
+            "too late"
+        );
+        assert_eq!(stripe.delete(first, 8, 3, Wait::NEVER, &mut buffer), Err(Refusal::Gone));
 
-        stripe.delete(first + 1, 5, 4, &mut buffer).expect("delete");
+        stripe.delete(first + 1, 5, 4, Wait::NEVER, &mut buffer).expect("delete");
         stripe.abort_write(first + 1, 4);
         assert!(stripe.visible(first + 1, 5, 6));
-        stripe.delete(first + 1, 5, 5, &mut buffer).expect("the row is live again");
+        stripe.delete(first + 1, 5, 5, Wait::NEVER, &mut buffer).expect("the row is live again");
     }
 
     #[test]
@@ -991,11 +1014,15 @@ mod tests {
         let mut buffer = UndoBuffer::default();
         let slot = row(&stripe, &[Some(1), Some(2), Some(3), Some(4), Some(5)]);
         let before = as_of(&stripe, slot, 1, 9);
-        stripe.update(slot, &[(1, Some(20)), (3, None)], 1, 2, &mut buffer).expect("update");
+        stripe
+            .update(slot, &[(1, Some(20)), (3, None)], 1, 2, Wait::NEVER, &mut buffer)
+            .expect("update");
         let after = vec![Some(1), Some(20), Some(3), None, Some(5)];
         assert_eq!(as_of(&stripe, slot, 1, 2), after, "its own writes");
         assert_eq!(as_of(&stripe, slot, 100, 9), before, "not committed yet");
-        stripe.update(slot, &[(1, Some(21)), (0, Some(10))], 1, 2, &mut buffer).expect("again");
+        stripe
+            .update(slot, &[(1, Some(21)), (0, Some(10))], 1, 2, Wait::NEVER, &mut buffer)
+            .expect("again");
         assert_eq!(as_of(&stripe, slot, 100, 9), before, "both records applied");
         stripe.commit_write(slot, 2, 6);
         assert_eq!(as_of(&stripe, slot, 5, 9), before);
@@ -1011,22 +1038,32 @@ mod tests {
         let stripe = stripe();
         let mut buffer = UndoBuffer::default();
         let slot = row(&stripe, &[Some(1), Some(2), Some(3), Some(4), Some(5)]);
-        stripe.update(slot, &[(0, Some(7))], 1, 2, &mut buffer).expect("the first writer");
-        assert_eq!(stripe.update(slot, &[(0, Some(8))], 1, 3, &mut buffer), Err(Refusal::Conflict));
-        assert_eq!(stripe.delete(slot, 1, 3, &mut buffer), Err(Refusal::Conflict));
+        stripe
+            .update(slot, &[(0, Some(7))], 1, 2, Wait::NEVER, &mut buffer)
+            .expect("the first writer");
+        assert_eq!(
+            stripe.update(slot, &[(0, Some(8))], 1, 3, Wait::NEVER, &mut buffer),
+            Err(Refusal::Conflict)
+        );
+        assert_eq!(stripe.delete(slot, 1, 3, Wait::NEVER, &mut buffer), Err(Refusal::Conflict));
         stripe.commit_write(slot, 2, 4);
         assert_eq!(
-            stripe.update(slot, &[(0, Some(8))], 3, 3, &mut buffer),
+            stripe.update(slot, &[(0, Some(8))], 3, 3, Wait::NEVER, &mut buffer),
             Err(Refusal::Conflict),
             "a change committed after its snapshot"
         );
-        stripe.update(slot, &[(0, Some(8))], 4, 5, &mut buffer).expect("a later snapshot");
+        stripe
+            .update(slot, &[(0, Some(8))], 4, 5, Wait::NEVER, &mut buffer)
+            .expect("a later snapshot");
         stripe.commit_write(slot, 5, 9);
         assert_eq!(as_of(&stripe, slot, 4, 0)[0], Some(7));
         assert_eq!(as_of(&stripe, slot, 9, 0)[0], Some(8));
         assert_eq!(as_of(&stripe, slot, 3, 0)[0], Some(1));
-        stripe.delete(slot, 9, 6, &mut buffer).expect("delete");
-        assert_eq!(stripe.update(slot, &[(0, Some(1))], 9, 6, &mut buffer), Err(Refusal::Gone));
+        stripe.delete(slot, 9, 6, Wait::NEVER, &mut buffer).expect("delete");
+        assert_eq!(
+            stripe.update(slot, &[(0, Some(1))], 9, 6, Wait::NEVER, &mut buffer),
+            Err(Refusal::Gone)
+        );
     }
 
     /// The four cases of `engine-v4/18-compat.md` section 18.8. The pin lets an update and a
@@ -1037,8 +1074,8 @@ mod tests {
         use Write::{Delete, Update};
         let write =
             |stripe: &HotStripe, slot, kind, snapshot, txn, buffer: &mut UndoBuffer| match kind {
-                Update => stripe.update(slot, &[(0, Some(9))], snapshot, txn, buffer),
-                Delete => stripe.delete(slot, snapshot, txn, buffer),
+                Update => stripe.update(slot, &[(0, Some(9))], snapshot, txn, Wait::NEVER, buffer),
+                Delete => stripe.delete(slot, snapshot, txn, Wait::NEVER, buffer),
             };
         for (first, second) in
             [(Update, Update), (Delete, Delete), (Update, Delete), (Delete, Update)]
@@ -1075,15 +1112,21 @@ mod tests {
         let mut buffer = UndoBuffer::default();
         let slot = row(&stripe, &[Some(1), Some(2), Some(3), Some(4), Some(5)]);
         let before = as_of(&stripe, slot, 1, 0);
-        stripe.update(slot, &[(0, Some(100)), (4, None)], 1, 2, &mut buffer).expect("update");
-        stripe.update(slot, &[(0, Some(200)), (2, Some(300))], 1, 2, &mut buffer).expect("more");
-        stripe.delete(slot, 1, 2, &mut buffer).expect("and delete");
+        stripe
+            .update(slot, &[(0, Some(100)), (4, None)], 1, 2, Wait::NEVER, &mut buffer)
+            .expect("update");
+        stripe
+            .update(slot, &[(0, Some(200)), (2, Some(300))], 1, 2, Wait::NEVER, &mut buffer)
+            .expect("more");
+        stripe.delete(slot, 1, 2, Wait::NEVER, &mut buffer).expect("and delete");
         stripe.abort_write(slot, 2);
         let row: Vec<_> = (0..5).map(|column| stripe.read(slot, column)).collect();
         assert_eq!(row, before, "in place");
         assert_eq!(as_of(&stripe, slot, 1, 0), before, "through the chain");
         assert!(stripe.visible(slot, 1, 0));
-        stripe.update(slot, &[(0, Some(9))], 1, 3, &mut buffer).expect("an old snapshot writes");
+        stripe
+            .update(slot, &[(0, Some(9))], 1, 3, Wait::NEVER, &mut buffer)
+            .expect("an old snapshot writes");
         stripe.commit_write(slot, 3, 2);
         assert_eq!(as_of(&stripe, slot, 1, 0), before);
         assert_eq!(as_of(&stripe, slot, 2, 0)[0], Some(9));
@@ -1103,7 +1146,9 @@ mod tests {
         stripe.insert(slots.clone(), 1);
         stripe.commit_insert(slots.clone(), 1, 1);
         let new = stripe.stage_text(b"its replacement, longer still", &mut space).expect("room");
-        stripe.update(slots.start, &[(0, Some(new))], 1, 2, &mut buffer).expect("update");
+        stripe
+            .update(slots.start, &[(0, Some(new))], 1, 2, Wait::NEVER, &mut buffer)
+            .expect("update");
         stripe.commit_write(slots.start, 2, 2);
         let mut view = [None];
         let mut text = Vec::new();
@@ -1153,12 +1198,14 @@ mod tests {
             let text = format!("value number {ts:020}");
             let view = stripe.stage_text(text.as_bytes(), &mut space).expect("room");
             let changes = [(0, Some(u128::from(ts))), (1, Some(u128::from(ts))), (2, Some(view))];
-            stripe.update(slot, &changes, ts - 1, ts, &mut buffer).expect("the only writer");
+            stripe
+                .update(slot, &changes, ts - 1, ts, Wait::NEVER, &mut buffer)
+                .expect("the only writer");
             if ts % 7 == 0 {
                 stripe.abort_write(slot, ts);
                 let changes =
                     [(0, Some(u128::from(ts))), (1, Some(u128::from(ts))), (2, Some(view))];
-                stripe.update(slot, &changes, ts - 1, ts, &mut buffer).expect("again");
+                stripe.update(slot, &changes, ts - 1, ts, Wait::NEVER, &mut buffer).expect("again");
             }
             stripe.commit_write(slot, ts, ts);
             committed.store(ts, Ordering::Release);
@@ -1287,5 +1334,118 @@ mod tests {
         }
         assert_eq!(visible(&stripe, 1, 99), 160_000);
         assert!(stripe.reserved() >= 160_000 && stripe.reserved() <= 160_000 + 8 * 1024);
+    }
+
+    fn waiting(millis: u64, holds_nothing: bool) -> Wait {
+        Wait { timeout: Duration::from_millis(millis), holds_nothing }
+    }
+
+    fn lock_word(stripe: &HotStripe, slot: u32) -> &AtomicU64 {
+        let (part, at) = super::place(slot);
+        &stripe.lock.get(part).expect("the row was locked")[at]
+    }
+
+    /// Yields until `waiters` transactions are parked on the row at `slot`.
+    fn until_parked(stripe: &HotStripe, slot: u32, waiters: usize) {
+        while park::parked(lock_word(stripe, slot)) < waiters {
+            thread::yield_now();
+        }
+    }
+
+    /// Wait-die, `engine-v4/08-concurrency.md` section 8.4: a writer that holds nothing may wait
+    /// for anyone, an older one waits for a younger one, and the rest fail at once.
+    #[test]
+    fn wait_die_lets_the_older_and_the_empty_handed_wait_and_the_rest_die() {
+        let stripe = stripe();
+        let mut buffer = UndoBuffer::default();
+        let slot = row(&stripe, &[Some(1), Some(2), Some(3), Some(4), Some(5)]);
+        stripe.update(slot, &[(0, Some(7))], 1, 5, Wait::NEVER, &mut buffer).expect("holder");
+        let started = Instant::now();
+        let younger =
+            stripe.update(slot, &[(0, Some(8))], 1, 6, waiting(60_000, false), &mut buffer);
+        assert_eq!(younger, Err(Refusal::Conflict), "a younger writer holding a row dies");
+        assert!(started.elapsed() < Duration::from_secs(30), "and dies at once");
+        for (txn, holds_nothing, case) in [(4, false, "an older writer"), (6, true, "empty-handed")]
+        {
+            let started = Instant::now();
+            let waited = stripe.update(
+                slot,
+                &[(0, Some(8))],
+                1,
+                txn,
+                waiting(30, holds_nothing),
+                &mut buffer,
+            );
+            assert_eq!(waited, Err(Refusal::Conflict), "{case} runs out of time");
+            assert!(started.elapsed() >= Duration::from_millis(30), "{case} waited");
+        }
+        let held = lock_word(&stripe, slot).load(Ordering::Acquire);
+        assert_eq!(held, 5 | super::HELD, "the holder keeps the row and nobody is left parked");
+        assert_eq!(stripe.delete(slot, 1, 4, Wait::NEVER, &mut buffer), Err(Refusal::Conflict));
+    }
+
+    #[test]
+    fn a_waiter_gets_the_row_when_the_holder_aborts_and_a_conflict_when_it_commits() {
+        let stripe = Arc::new(stripe());
+        let mut buffer = UndoBuffer::default();
+        let slot = row(&stripe, &[Some(1), Some(2), Some(3), Some(4), Some(5)]);
+        let spawn = |snapshot: u64, txn: u64| {
+            let stripe = Arc::clone(&stripe);
+            thread::spawn(move || {
+                let mut buffer = UndoBuffer::default();
+                let wait = waiting(60_000, true);
+                stripe.update(slot, &[(0, Some(u128::from(txn)))], snapshot, txn, wait, &mut buffer)
+            })
+        };
+
+        stripe.update(slot, &[(0, Some(50))], 1, 5, Wait::NEVER, &mut buffer).expect("holder");
+        let waiter = spawn(1, 4);
+        until_parked(&stripe, slot, 1);
+        stripe.abort_write(slot, 5);
+        assert_eq!(waiter.join().expect("the waiter"), Ok(()), "the holder aborted");
+        assert_eq!(as_of(&stripe, slot, 1, 4)[0], Some(4));
+        stripe.commit_write(slot, 4, 6);
+
+        stripe.update(slot, &[(0, Some(80))], 6, 8, Wait::NEVER, &mut buffer).expect("holder");
+        let waiter = spawn(6, 9);
+        until_parked(&stripe, slot, 1);
+        stripe.commit_write(slot, 8, 9);
+        assert_eq!(
+            waiter.join().expect("the waiter"),
+            Err(Refusal::Conflict),
+            "the holder committed after the waiter's snapshot"
+        );
+        assert_eq!(lock_word(&stripe, slot).load(Ordering::Acquire), 0, "the row is free");
+        assert_eq!(as_of(&stripe, slot, 9, 0)[0], Some(80));
+    }
+
+    #[test]
+    fn a_release_hands_the_row_to_the_oldest_waiter() {
+        let stripe = Arc::new(stripe());
+        let mut buffer = UndoBuffer::default();
+        let slot = row(&stripe, &[Some(1), Some(2), Some(3), Some(4), Some(5)]);
+        stripe.update(slot, &[(0, Some(9))], 1, 9, Wait::NEVER, &mut buffer).expect("holder");
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut waiters = Vec::new();
+        for (parked, txn) in [5_u64, 3, 7].into_iter().enumerate() {
+            let shared = Arc::clone(&stripe);
+            let order = Arc::clone(&order);
+            waiters.push(thread::spawn(move || {
+                let mut buffer = UndoBuffer::default();
+                let wait = waiting(60_000, false);
+                shared.update(slot, &[(0, Some(u128::from(txn)))], 1, txn, wait, &mut buffer)?;
+                order.lock().expect("order").push(txn);
+                shared.abort_write(slot, txn);
+                Ok::<(), Refusal>(())
+            }));
+            until_parked(&stripe, slot, parked + 1);
+        }
+        stripe.abort_write(slot, 9);
+        for waiter in waiters {
+            waiter.join().expect("a waiter").expect("every waiter gets the row");
+        }
+        assert_eq!(*order.lock().expect("order"), [3, 5, 7], "oldest first");
+        assert_eq!(lock_word(&stripe, slot).load(Ordering::Acquire), 0);
+        assert_eq!(as_of(&stripe, slot, 1, 0)[0], Some(1), "every write was taken back");
     }
 }

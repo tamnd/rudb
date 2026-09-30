@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::deletes::{DeleteVector, PART_ROWS, PART_WORDS, Refusal};
 use crate::hot::{HotStripe, Lease, Width};
+use crate::park::Wait;
 use crate::undo::{UndoBuffer, UndoSpace};
 
 /// A row's place: its stripe id in the high 32 bits and its slot in the low 32.
@@ -244,15 +245,18 @@ impl StripeDirectory {
     ///
     /// [`Refusal::Gone`] when `txn` does not see the row, which includes a rid of no stripe, and
     /// [`Refusal::Conflict`] when another transaction holds it or deleted it after `snapshot`.
+    /// `wait` says whether a hot row another transaction holds is waited for; a frozen row's
+    /// entry is a conflict at once.
     pub fn delete(
         &self,
         rid: Rid,
         snapshot: u64,
         txn: u64,
+        wait: Wait,
         buffer: &mut UndoBuffer,
     ) -> Result<(), Refusal> {
         match self.find(rid.stripe()) {
-            Some(Stripe::Hot(stripe)) => stripe.delete(rid.slot(), snapshot, txn, buffer),
+            Some(Stripe::Hot(stripe)) => stripe.delete(rid.slot(), snapshot, txn, wait, buffer),
             Some(Stripe::Frozen(stripe)) if rid.slot() < stripe.rows() => {
                 stripe.with_deletes(|deletes| deletes.delete(rid.slot(), snapshot, txn))
             }
@@ -412,6 +416,7 @@ mod tests {
     use super::{Inserter, Rid, Stripe, StripeDirectory};
     use crate::deletes::{Base, DeleteVector, Refusal, STRIPE_ROWS};
     use crate::hot::{Lease, Width};
+    use crate::park::Wait;
     use crate::undo::{UndoBuffer, UndoSpace};
 
     fn directory() -> Arc<StripeDirectory> {
@@ -446,21 +451,33 @@ mod tests {
         let mut buffer = UndoBuffer::default();
         let rids = [Rid::new(frozen, 5), Rid::new(frozen, 6), Rid::new(hot, 3)];
         for &rid in &rids {
-            table.delete(rid, 2, 8, &mut buffer).expect("delete");
+            table.delete(rid, 2, 8, Wait::NEVER, &mut buffer).expect("delete");
         }
         assert_eq!(table.count(2, 8), 10_095, "its own deletes");
         assert_eq!(table.count(9, 0), 10_098, "not committed");
-        assert_eq!(table.delete(Rid::new(frozen, 5), 2, 9, &mut buffer), Err(Refusal::Conflict));
-        assert_eq!(table.delete(Rid::new(frozen, 0), 2, 9, &mut buffer), Err(Refusal::Gone));
-        assert_eq!(table.delete(Rid::new(frozen, 20_000), 2, 9, &mut buffer), Err(Refusal::Gone));
-        assert_eq!(table.delete(Rid::new(99, 0), 2, 9, &mut buffer), Err(Refusal::Gone));
+        assert_eq!(
+            table.delete(Rid::new(frozen, 5), 2, 9, Wait::NEVER, &mut buffer),
+            Err(Refusal::Conflict)
+        );
+        assert_eq!(
+            table.delete(Rid::new(frozen, 0), 2, 9, Wait::NEVER, &mut buffer),
+            Err(Refusal::Gone)
+        );
+        assert_eq!(
+            table.delete(Rid::new(frozen, 20_000), 2, 9, Wait::NEVER, &mut buffer),
+            Err(Refusal::Gone)
+        );
+        assert_eq!(
+            table.delete(Rid::new(99, 0), 2, 9, Wait::NEVER, &mut buffer),
+            Err(Refusal::Gone)
+        );
         table.commit(&rids, 8, 3);
         assert_eq!(table.count(2, 0), 10_098);
         assert_eq!(table.count(3, 0), 10_095);
 
         let again = [Rid::new(frozen, 7), Rid::new(hot, 4)];
         for &rid in &again {
-            table.delete(rid, 3, 10, &mut buffer).expect("delete");
+            table.delete(rid, 3, 10, Wait::NEVER, &mut buffer).expect("delete");
         }
         table.abort(&again, 10);
         assert_eq!(table.count(3, 10), 10_095);
@@ -489,9 +506,9 @@ mod tests {
         assert_eq!((table.count(2, 8), table.count(9, 0)), (100, 100));
 
         let refused = |result| assert_eq!(result, Err(Refusal::Conflict));
-        refused(table.delete(old, 2, 9, &mut buffer));
+        refused(table.delete(old, 2, 9, Wait::NEVER, &mut buffer));
         refused(table.migrate(old, 2, 9, &mut inserter, fill(600)).map(|_| ()));
-        table.delete(Rid::new(frozen, 6), 2, 9, &mut buffer).expect("delete");
+        table.delete(Rid::new(frozen, 6), 2, 9, Wait::NEVER, &mut buffer).expect("delete");
         refused(table.migrate(Rid::new(frozen, 6), 2, 8, &mut inserter, fill(700)).map(|_| ()));
         table.abort(&[Rid::new(frozen, 6)], 9);
 
