@@ -7,6 +7,7 @@
 /// `crc` continued over `bytes`, in the same convention as a checksum started at zero, or `None`
 /// when this machine has no CRC-32C instruction.
 #[must_use]
+#[allow(unsafe_code, reason = "the CRC-32C instructions are only there once the check finds them")]
 pub fn crc32c_extend(crc: u32, bytes: &[u8]) -> Option<u32> {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("sse4.2") {
