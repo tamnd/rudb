@@ -3623,6 +3623,7 @@ impl<'a> Transform<'a> {
                 "NullIfExpression" => return self.null_if(node),
                 "TryExpression" => return self.try_expression(node),
                 "LambdaExpression" => return self.lambda(node),
+                "ListComprehensionExpression" => return self.list_comprehension(node),
                 "SubstringExpression" => return self.substring(node),
                 "PositionExpression" => return self.position(node),
                 "TrimExpression" => return self.trim(node),
@@ -3873,10 +3874,28 @@ impl<'a> Transform<'a> {
             }
             // `LikeClause <- LikeVariations x EscapeClause?`.
             "LikeClause" => {
-                if self.find(inner, "EscapeClause") != NONE {
-                    return self.unsupported(inner);
-                }
                 let variation = self.name(self.first(self.first(inner)));
+                // A `LIKE` with an `ESCAPE` is a call to `like_escape` or one of its relatives,
+                // with the escape as the third argument, and a `NOT` in front stays a negation.
+                let escape = self.find(inner, "EscapeClause");
+                if escape != NONE {
+                    // The spellings `!~~` and `!~~*` keep their operator and so have no call that
+                    // takes an escape, which the binder turns down for the three arguments.
+                    let called = match variation {
+                        "LikeToken" => "like_escape",
+                        "ILikeToken" => "ilike_escape",
+                        "NotLikeOp" => "!~~",
+                        "NotILikeOp" => "!~~*",
+                        _ => return self.unsupported(inner),
+                    };
+                    let pattern = self.expr(self.nth(inner, 1))?;
+                    let escape = self.expr(self.first(escape))?;
+                    let call = self.call(called, vec![operand, pattern, escape]);
+                    if negated {
+                        return Ok(self.push(Expr::Unary { op: UnaryOp::Not, operand: call }));
+                    }
+                    return Ok(call);
+                }
                 let op = match (variation, negated) {
                     ("LikeToken", false) | ("NotLikeOp", true) => BinaryOp::Like,
                     ("LikeToken", true) | ("NotLikeOp", false) => BinaryOp::NotLike,
@@ -4661,6 +4680,66 @@ impl<'a> Transform<'a> {
         let params = self.part_slice(names);
         let body = self.expr(body)?;
         Ok(self.push(Expr::Lambda { params, body }))
+    }
+
+    /// `ListComprehensionExpression <- '[' Expression 'FOR' List(ColIdOrString) 'IN' Expression
+    /// ListComprehensionFilter? ']'`.
+    ///
+    /// The pin's transformer writes a comprehension out as the lambda calls it stands for, and the
+    /// column is named after those, so it is written out the same way here. `[r FOR x IN l]` is
+    /// `list_apply(l, lambda x: r)`. With an `IF c` every element is first packed with its filter,
+    /// `struct_pack("filter" := c, result := r)`, then the ones whose filter holds are kept and the
+    /// result is taken back out of each, which is how the condition and the result both get to
+    /// see the parameters.
+    fn list_comprehension(&mut self, node: u32) -> Result<ExprRef> {
+        let kids: Vec<u32> = self.kids(node).collect();
+        let filtered = kids.last().is_some_and(|&kid| self.name(kid) == "ListComprehensionFilter");
+        let end = kids.len() - usize::from(filtered);
+        if end < 3 {
+            return self.unsupported(node);
+        }
+        let result = self.expr(kids[0])?;
+        let mut names = Vec::with_capacity(end - 2);
+        for &param in &kids[1..end - 1] {
+            names.push(self.identifier(param));
+        }
+        let list = self.expr(kids[end - 1])?;
+        let params = self.part_slice(names);
+        let Some(&filter) = kids.last().filter(|_| filtered) else {
+            let lambda = self.push(Expr::Lambda { params, body: result });
+            return Ok(self.call("list_apply", vec![list, lambda]));
+        };
+        let condition = self.expr(self.first(filter))?;
+        let fields = vec![self.intern("filter"), self.intern("result")];
+        let names = self.part_slice(fields);
+        let values = self.expr_slice(vec![condition, result]);
+        let packed = self.push(Expr::Struct { names, values });
+        let lambda = self.push(Expr::Lambda { params, body: packed });
+        let packed = self.call("list_apply", vec![list, lambda]);
+        let kept = self.field_lambda("filter");
+        let kept = self.call("list_filter", vec![packed, kept]);
+        let taken = self.field_lambda("result");
+        Ok(self.call("list_apply", vec![kept, taken]))
+    }
+
+    /// `lambda elem: struct_extract(elem, 'field')`, the two lambdas a filtered comprehension
+    /// unpacks its elements with.
+    fn field_lambda(&mut self, field: &str) -> ExprRef {
+        let elem = self.intern("elem");
+        let name = self.part_slice(vec![elem]);
+        let column = self.push(Expr::Column { name });
+        let text = self.intern(field);
+        let field = self.push(Expr::Literal { kind: LiteralKind::String, text });
+        let body = self.call("struct_extract", vec![column, field]);
+        let params = self.part_slice(vec![elem]);
+        self.push(Expr::Lambda { params, body })
+    }
+
+    /// A plain call to `name` with these arguments.
+    fn call(&mut self, name: &str, args: Vec<ExprRef>) -> ExprRef {
+        let name = self.function_name(name);
+        let args = self.expr_slice(args);
+        self.push(Expr::Function { name, args, distinct: false, filter: NONE })
     }
 
     /// `NullIfExpression <- 'NULLIF' Parens(NullIfArguments)` and

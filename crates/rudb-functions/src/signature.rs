@@ -717,6 +717,13 @@ const TABLE: &[Entry] = &[
     text("!~~", Arity::exactly(2), Fixed::Boolean),
     text("~~*", Arity::exactly(2), Fixed::Boolean),
     text("!~~*", Arity::exactly(2), Fixed::Boolean),
+    // `GLOB` is `~~~`, and a `LIKE` with an `ESCAPE` on it is one of these four with the escape
+    // as the third argument.
+    text("~~~", Arity::exactly(2), Fixed::Boolean),
+    text("like_escape", Arity::exactly(3), Fixed::Boolean),
+    text("not_like_escape", Arity::exactly(3), Fixed::Boolean),
+    text("ilike_escape", Arity::exactly(3), Fixed::Boolean),
+    text("not_ilike_escape", Arity::exactly(3), Fixed::Boolean),
     // Logic. `AND` and `OR` are conjunctions in the plan rather than calls, so only `NOT` is here.
     Entry {
         name: "not",

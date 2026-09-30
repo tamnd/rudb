@@ -68,6 +68,7 @@ mod datetime;
 mod digest;
 pub mod fallback;
 mod general;
+mod glob;
 mod hash;
 mod histogram;
 mod lists;
