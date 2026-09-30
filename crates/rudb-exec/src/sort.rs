@@ -324,7 +324,7 @@ impl Ranked {
             written += wide;
         }
         rows.sort_unstable_by(|left, right| {
-            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+            normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
         });
         self.rows = rows;
         Ok(())
@@ -419,7 +419,7 @@ impl Keyed {
         match self {
             Self::Normal(rows) => {
                 rows.sort_unstable_by(|left, right| {
-                    left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                    normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
                 });
                 Ok(())
             }
@@ -768,7 +768,7 @@ impl Sink for Sort {
         // `finalize`, which sorts it the way it always has.
         if let Keyed::Normal(rows) = &mut local.held.rows {
             rows.sort_unstable_by(|left, right| {
-                left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
             });
         }
         self.runs.lock().map_err(poisoned)?.extend(local.runs);
@@ -917,7 +917,7 @@ fn merged(
             .ok_or_else(|| Error::internal("a sorted row pointing outside the chunks it came from"))
     };
     let first = |left: &Normalized, right: &Normalized| {
-        left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
     };
     let degree = threads.degree().max(1);
     let parts = if runs.len() > 1 { degree * PARTS_A_THREAD } else { 1 };
@@ -1463,7 +1463,7 @@ mod tests {
                         })
                         .collect();
                     run.sort_unstable_by(|left, right| {
-                        left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                        normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
                     });
                     runs.push((chunk as u32, run));
                     at += length;
