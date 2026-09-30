@@ -8,6 +8,7 @@
 //! and are dropped, and nobody was told that block committed.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rudb_common::{Error, Result};
 use rudb_io::{Filesystem, OpenMode};
@@ -56,31 +57,85 @@ pub struct Replayed {
 /// If a segment cannot be read, or a verified header names another lane, sequence or database,
 /// which is a file copied in from somewhere else and not something a crash leaves.
 pub fn replay(fs: &dyn Filesystem, dir: &Path, lane: u8, database: u64) -> Result<Replayed> {
-    let mut replayed = Replayed::default();
-    for (sequence, path) in segments(fs, dir, lane)? {
-        let file = fs.open(&path, OpenMode::Read)?;
-        let len = usize::try_from(file.len()?).map_err(|_| {
-            Error::invalid_input(format!("{} is too large to replay", path.display()))
-        })?;
-        let mut bytes = vec![0_u8; len];
-        file.read_exact_at(0, &mut bytes)?;
-        let Some(header) = SegmentHeader::decode(&bytes) else {
-            replayed.unreadable += 1;
-            continue;
-        };
-        if header.lane != lane || header.sequence != sequence || header.database != database {
-            return Err(Error::invalid_input(format!(
-                "{} holds lane {} segment {} of database {:#x}, not lane {lane} segment {sequence} of {database:#x}",
-                path.display(),
-                header.lane,
-                header.sequence,
-                header.database
-            )));
+    let segments = segments(fs, dir, lane)?;
+    // A block never spans two segments, so each one is read and verified on its own, and the
+    // segments of a large log are read side by side before their blocks are put back in order.
+    let threads = std::thread::available_parallelism().map_or(1, usize::from).min(segments.len());
+    let read = if threads > 1 {
+        let next = AtomicUsize::new(0);
+        let mut read: Vec<Option<Result<Option<Vec<Committed>>>>> =
+            (0..segments.len()).map(|_| None).collect();
+        let done = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let at = next.fetch_add(1, Ordering::Relaxed);
+                            let Some((sequence, path)) = segments.get(at) else { return mine };
+                            mine.push((at, read_segment(fs, path, *sequence, lane, database)));
+                        }
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap_or_default())
+                .collect::<Vec<_>>()
+        });
+        for (at, segment) in done {
+            read[at] = Some(segment);
         }
-        read_blocks(&bytes[SEGMENT_HEADER..], lane, sequence, &mut replayed.blocks);
-        replayed.segments += 1;
+        read.into_iter()
+            .map(|segment| segment.unwrap_or_else(|| Err(Error::io("a replay worker stopped"))))
+            .collect::<Vec<_>>()
+    } else {
+        segments
+            .iter()
+            .map(|(sequence, path)| read_segment(fs, path, *sequence, lane, database))
+            .collect()
+    };
+    let mut replayed = Replayed::default();
+    for segment in read {
+        match segment? {
+            Some(blocks) => {
+                replayed.blocks.extend(blocks);
+                replayed.segments += 1;
+            }
+            None => replayed.unreadable += 1,
+        }
     }
     Ok(replayed)
+}
+
+/// The committed blocks of the segment at `path`, or `None` when its header does not verify.
+fn read_segment(
+    fs: &dyn Filesystem,
+    path: &Path,
+    sequence: u64,
+    lane: u8,
+    database: u64,
+) -> Result<Option<Vec<Committed>>> {
+    let file = fs.open(path, OpenMode::Read)?;
+    let len = usize::try_from(file.len()?)
+        .map_err(|_| Error::invalid_input(format!("{} is too large to replay", path.display())))?;
+    let mut bytes = vec![0_u8; len];
+    file.read_exact_at(0, &mut bytes)?;
+    let Some(header) = SegmentHeader::decode(&bytes) else {
+        return Ok(None);
+    };
+    if header.lane != lane || header.sequence != sequence || header.database != database {
+        return Err(Error::invalid_input(format!(
+            "{} holds lane {} segment {} of database {:#x}, not lane {lane} segment {sequence} of {database:#x}",
+            path.display(),
+            header.lane,
+            header.sequence,
+            header.database
+        )));
+    }
+    let mut blocks = Vec::new();
+    read_blocks(&bytes[SEGMENT_HEADER..], lane, sequence, &mut blocks);
+    Ok(Some(blocks))
 }
 
 /// Appends the committed blocks of one segment's records to `out`, stopping at the first record
