@@ -2595,17 +2595,19 @@ fn write_parts(
     let mut count = 0;
     for at in from..rows.chunk_count() {
         let chunk = rows.read(at, &columns)?;
-        if held.is_empty() && chunk.len() >= PART_ROWS {
+        // What is held goes out before a chunk that would take it past a part, because a chunk is
+        // at most one vector long and two 5,000-row chunks joined are not.
+        if !held.is_empty() && count + chunk.len() > PART_ROWS {
+            open.append(&joined(&held, fields, count)?)?;
+            held.clear();
+            count = 0;
+        }
+        if chunk.len() >= PART_ROWS {
             open.append(&chunk)?;
             continue;
         }
         count += chunk.len();
         held.push(chunk);
-        if count >= PART_ROWS {
-            open.append(&joined(&held, fields, count)?)?;
-            held.clear();
-            count = 0;
-        }
     }
     if !held.is_empty() {
         open.append(&joined(&held, fields, count)?)?;

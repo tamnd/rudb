@@ -427,3 +427,35 @@ fn commits_from_several_connections_that_share_a_sync_all_survive_a_crash() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(wal(&path));
 }
+
+/// Replay hands back each record's rows as one chunk, 5,000 rows for a 5,000-row insert. The
+/// checkpoint gathers small chunks into parts of up to a vector, and two such chunks side by side
+/// are more than one, so it has to write what it holds before the second rather than join them.
+#[test]
+fn replayed_chunks_that_do_not_fit_a_part_together_still_checkpoint() {
+    let path = path("parts");
+    let db = open(&path);
+    db.execute("CREATE TABLE t (id BIGINT, name VARCHAR)").expect("creates");
+    db.execute("INSERT INTO t VALUES (-1, 'first')").expect("inserts");
+    for k in 0..3 {
+        db.execute(&format!(
+            "INSERT INTO t SELECT range, 'name ' || range FROM range({}, {})",
+            k * 5_000,
+            (k + 1) * 5_000
+        ))
+        .expect("inserts");
+    }
+    crash(db);
+
+    let db = open(&path);
+    db.execute("CHECKPOINT").expect("checkpoints");
+    db.close().expect("closes");
+    let db = open(&path);
+    assert_eq!(
+        rows(&db, "SELECT count(*), count(DISTINCT name), sum(id) FROM t"),
+        vec![vec![Value::BigInt(15_001), Value::BigInt(15_001), Value::HugeInt(112_492_499)]]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(wal(&path));
+}
