@@ -2153,7 +2153,11 @@ fn update_shared(
         return Ok(0);
     }
     let groups = states.len().checked_div(stride).unwrap_or(usize::MAX);
-    if groups > FEW || groups.saturating_mul(4) > rows {
+    let most_groups = match walk {
+        Walk::Runs(_) => FEW,
+        Walk::Slots(_) => MANY,
+    };
+    if groups > most_groups || groups.saturating_mul(4) > rows {
         return Ok(0);
     }
     let mut ready = Vec::new();
@@ -2393,13 +2397,19 @@ fn many_runs<T: Copy + TryInto<i64>>(
             8
         ),
         Walk::Slots(slots) => {
-            let Some(copies) = cells.checked_add(span).and_then(|one| one.checked_mul(COPIES))
-            else {
+            // Past a handful of groups two rows in a row are rarely in the same one, so there is no
+            // store to wait on and one copy of the totals is a quarter of the memory to clear.
+            let over = if groups <= FEW_COPIED { COPIES } else { 1 };
+            let Some(copies) = cells.checked_add(span).and_then(|one| one.checked_mul(over)) else {
                 return Ok(false);
             };
             let mut copied = vec![0_i64; copies];
-            let walked =
-                widths!(&mut copied, walk_slots, (slots, groups), false, 0, 1, 2, 3, 4, 5, 6, 7, 8);
+            let by = (slots, groups);
+            let walked = if over == COPIES {
+                widths!(&mut copied, walk_copied, by, false, 0, 1, 2, 3, 4, 5, 6, 7, 8)
+            } else {
+                widths!(&mut copied, walk_once, by, false, 0, 1, 2, 3, 4, 5, 6, 7, 8)
+            };
             // The copies added up into the one set of totals the rest reads, leaving out the group
             // past the last that the rows in none of them went to.
             walked
@@ -2504,21 +2514,51 @@ fn walk_runs<const W: usize, T: Copy + TryInto<i64>>(
 /// How many copies of the totals [`walk_slots`] adds into, one for each of this many rows in a row.
 const COPIES: usize = 4;
 
+/// The most groups [`walk_slots`] keeps [`COPIES`] of the totals for. Past it one copy is kept.
+const FEW_COPIED: usize = 16;
+
+/// The most groups a shared pass by slot takes, which is where one copy of every group's totals for
+/// eight calls is still under a hundred kilobytes to clear once a chunk.
+///
+/// A key of four small columns, such as a flag, a status, a discount and a tax, has a few hundred
+/// groups and rows in no order, so it is read by slot rather than by run. Held to [`FEW`] it went
+/// through a scatter per call, each reaching an accumulator per row, which cost three times the
+/// shared pass.
+const MANY: usize = 1024;
+
+/// [`walk_slots`] with [`COPIES`] of the totals, for a handful of groups.
+fn walk_copied<const W: usize, T: Copy + TryInto<i64>>(
+    folded: &mut [i64],
+    by: (&[usize], usize),
+    group: &[(usize, Feed, &[T])],
+) -> bool {
+    walk_slots::<W, COPIES, T>(folded, by, group)
+}
+
+/// [`walk_slots`] with one copy of the totals, for more groups than [`FEW_COPIED`].
+fn walk_once<const W: usize, T: Copy + TryInto<i64>>(
+    folded: &mut [i64],
+    by: (&[usize], usize),
+    group: &[(usize, Feed, &[T])],
+) -> bool {
+    walk_slots::<W, 1, T>(folded, by, group)
+}
+
 /// [`many_runs`]'s walk of the rows by slot, for a pass whose width the compiler knows.
 ///
-/// `folded` is [`COPIES`] runs of `groups + 1` groups of totals, each a group's `W` totals and then its
-/// row count, and row `r` adds into copy `r % COPIES`. The group past the last is where a row in no
+/// `folded` is `C` runs of `groups + 1` groups of totals, each a group's `W` totals and then its row
+/// count, and row `r` adds into copy `r % C`. The group past the last is where a row in no
 /// group goes, and nothing reads it. See [`update_shared_slots`] for why there are copies.
 ///
 /// `false` for the misses [`walk_runs`] documents.
-fn walk_slots<const W: usize, T: Copy + TryInto<i64>>(
+fn walk_slots<const W: usize, const C: usize, T: Copy + TryInto<i64>>(
     folded: &mut [i64],
     (slots, groups): (&[usize], usize),
     group: &[(usize, Feed, &[T])],
 ) -> bool {
     let span = W + 1;
     let copy = (groups + 1) * span;
-    if folded.len() != copy * COPIES {
+    if folded.len() != copy * C {
         return false;
     }
     let Ok(group): std::result::Result<&[(usize, Feed, &[T]); W], _> = group.try_into() else {
@@ -2559,13 +2599,13 @@ fn walk_slots<const W: usize, T: Copy + TryInto<i64>>(
         // Every column was cut to `whole` rows above, so each has a block `at` as the slots do.
         let values: [&[T; SLOT_BLOCK]; W] = array::from_fn(|call| &columns_by_block[call][at]);
         for (row, &slot) in block.iter().enumerate() {
-            if !add(row % COPIES, slot, values.map(|column| column[row])) {
+            if !add(row % C, slot, values.map(|column| column[row])) {
                 return false;
             }
         }
     }
     for (row, &slot) in slots.iter().enumerate().skip(whole) {
-        if !add(row % COPIES, slot, columns.map(|column| column[row])) {
+        if !add(row % C, slot, columns.map(|column| column[row])) {
             return false;
         }
     }

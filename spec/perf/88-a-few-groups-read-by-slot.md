@@ -29,3 +29,20 @@ The instructions come out level: `slot_runs_of` is gone from the fold, and the s
 The slot walk is still about 40 instructions a row for five totals and a count, where the adds themselves are about 25. The compiler runs out of registers and reloads where the totals start once a column. Holding the totals in a fixed array on the stack with the index masked into range was tried, and the mask cost what the bounds check had cost. Reading a column at a time over an index of where each row's totals start should keep every pointer in a register and is the next thing to measure.
 
 Unpacking the stored decimals into `i64` before they are summed is still 14 percent of q01. A group's total of packed values is its count times the frame base plus the total of the packed codes, so the codes could be summed as they are.
+
+## A few hundred groups
+
+The slot walk now takes a chunk of up to 1,024 groups rather than 16. It keeps the four copies up to 16 groups, where two rows of one group next to each other are likely, and holds one copy past that, where they are not and four copies of a few hundred groups would not stay in cache. The direct map takes a combination of keys with up to 4,096 places rather than 2,048, so that q01 grouped by its flag, status, discount and tax, which is 3,468 places, is placed by the map rather than hashed.
+
+This is what note 89's rewrite of q01 needs, since it groups by those four keys, and it is worth measuring on its own. server3, SF1 native, instructions at one thread:
+
+| | main | this |
+|---|---|---|
+| q01 by flag, status, discount and tax | 1180 M | 805 M |
+| q01 | 883 M | 861 M |
+| q05 | 477 M | 454 M |
+| q13 | 318 M | 308 M |
+| q16 | 243 M | 212 M |
+| q17 | 76 M | 83 M |
+
+The other queries moved by 4 M or less, and every answer is the same as main's at one thread and at eight.

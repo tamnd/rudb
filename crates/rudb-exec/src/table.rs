@@ -944,7 +944,11 @@ const KEYS: usize = 4;
 /// a thousand rows is one where building it costs more than the probe it replaces. A map that lives
 /// into the next chunk costs nothing at all, which is the ordinary case, but the first chunk of a
 /// row group still has to pay for one.
-const COMBOS: usize = 2048;
+///
+/// Four thousand and ninety six rather than half that since q01 is grouped by its discount and its tax
+/// under the flag and the status (spec/perf/89). Each of the two is packed in four bits, so its span is
+/// seventeen places with the null one, and the four keys take 3,468 places together.
+const COMBOS: usize = 4096;
 
 /// The most places the direct map covers when the whole key is one dictionary.
 ///
@@ -4589,7 +4593,7 @@ mod tests {
     /// which is where a key like `l_suppkey` lands.
     #[test]
     fn a_packed_column_wider_than_the_map_allows_is_refused() {
-        let keys = [packed_numbers(&[0, 1], 12, 0)];
+        let keys = [packed_numbers(&[0, 1], 13, 0)];
         assert!(coded(&keys, 2).is_none());
     }
 
