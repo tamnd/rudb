@@ -19,8 +19,9 @@
 //! DuckDB is not being consistent there and neither are we, on purpose.
 //!
 //! Most parts are whole numbers, but `epoch` and `julian` are not, so each reader here has a double
-//! twin next to it and the binder decides which one a query gets. What is missing is `timezone`,
-//! `timezone_hour` and `timezone_minute`, which need a session time zone before they mean anything.
+//! twin next to it and the binder decides which one a query gets. The three time zone parts are
+//! zero for a timestamp and a time, which carry no zone, and are refused for a date and an interval
+//! the way the pin refuses them.
 
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 
@@ -70,6 +71,11 @@ pub(crate) enum Part {
     /// day starts at noon and DuckDB's starts at midnight. `date_part('julian', DATE '2020-01-01')`
     /// is 2458850 where an almanac says the Julian day of that midnight is 2458849.5, measured.
     Julian,
+    /// The offset from UTC in seconds, and its hours and minutes, which are all zero for a moment
+    /// that carries no time zone.
+    Timezone,
+    TimezoneHour,
+    TimezoneMinute,
 }
 
 /// Every spelling DuckDB accepts, each one checked against the binary rather than guessed at.
@@ -139,6 +145,9 @@ const NAMES: &[(&str, Part)] = &[
     ("epoch", Part::Epoch),
     ("julian", Part::Julian),
     ("jd", Part::Julian),
+    ("timezone", Part::Timezone),
+    ("timezone_hour", Part::TimezoneHour),
+    ("timezone_minute", Part::TimezoneMinute),
 ];
 
 /// The day the Julian count starts, as a count of days from 1970, which is the number that turns
@@ -212,7 +221,24 @@ impl Part {
             Self::Epoch | Self::Julian => {
                 return Err(Error::internal(format!("{self:?} is a double and this is not")));
             }
+            // A date has no zone and the pin says so, naming the part the way it names it rather
+            // than the way it was written.
+            Self::Timezone | Self::TimezoneHour | Self::TimezoneMinute => {
+                return Err(Error::not_implemented(format!(
+                    "\"date\" units \"{}\" not recognized",
+                    self.zone_name()
+                )));
+            }
         })
+    }
+
+    /// The name the pin gives a time zone part in its refusals.
+    fn zone_name(self) -> &'static str {
+        match self {
+            Self::TimezoneHour => "timezone_hour",
+            Self::TimezoneMinute => "timezone_minute",
+            _ => "timezone",
+        }
     }
 
     /// The part of a timestamp, which is a count of microseconds since 1970-01-01.
@@ -231,6 +257,8 @@ impl Part {
             // Postgres both answer, so 59.654321 seconds is 59654 and 59654321.
             Self::Millisecond => within / 1_000 % 60_000,
             Self::Microsecond => within % 60_000_000,
+            // A plain timestamp is in no zone, so it is no distance from UTC.
+            Self::Timezone | Self::TimezoneHour | Self::TimezoneMinute => 0,
             _ => return self.of_days(day_of(micros)?),
         })
     }
@@ -331,7 +359,7 @@ impl Part {
             // DuckDB has no truncation for an era and says so rather than guessing, and this is its
             // message down to the word statistics, which is a word about where in DuckDB the check
             // happens to live.
-            Self::Era => {
+            Self::Era | Self::Timezone | Self::TimezoneHour | Self::TimezoneMinute => {
                 return Err(Error::not_implemented(
                     "Specifier type not implemented for DATETRUNC statistics",
                 ));
@@ -492,7 +520,7 @@ impl Part {
             Self::Second | Self::Epoch => (months, days, clipped(MICROS_PER_SECOND)),
             Self::Millisecond => (months, days, clipped(1_000)),
             Self::Microsecond => (months, days, micros),
-            Self::Era => {
+            Self::Era | Self::Timezone | Self::TimezoneHour | Self::TimezoneMinute => {
                 return Err(Error::not_implemented("Specifier type not implemented for DATETRUNC"));
             }
         })
@@ -899,6 +927,18 @@ pub(crate) fn infinite_day(day: i32) -> bool {
 /// Whether a timestamp is one of the two infinities, kept at the two ends of an `i64`.
 pub(crate) fn infinite_stamp(stamp: i64) -> bool {
     stamp == i64::MAX || stamp == -i64::MAX
+}
+
+/// A date as the timestamp at its midnight, the infinities kept, or the pin's refusal when the
+/// midnight is past either end of the timestamps.
+pub(crate) fn checked_midnight(days: i32) -> Result<i64> {
+    if infinite_day(days) {
+        return Ok(cast::stamp_of_day(days));
+    }
+    i64::from(days)
+        .checked_mul(MICROS_PER_DAY)
+        .filter(|stamp| !infinite_stamp(*stamp))
+        .ok_or_else(not_in_range)
 }
 
 fn not_in_range() -> Error {
