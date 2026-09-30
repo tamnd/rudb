@@ -4999,6 +4999,9 @@ pub struct PagePool {
     /// Set when the statement running now is the last one anything will read through this pool.
     /// See [`PagePool::last_statement`].
     last: Arc<AtomicBool>,
+    /// Set by [`PagePool::last_statement`] and never cleared, so that [`PagePool::rereads`] can put
+    /// `last` back for a statement that reads nothing twice.
+    told: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -5046,7 +5049,20 @@ impl PagePool {
     /// knows when it has reached the last statement in it, and ClickBench runs each query that way,
     /// one process a query. A part this statement reads twice is still held on the second read.
     pub fn last_statement(&self) {
+        self.told.store(true, Atomic::Relaxed);
         self.last.store(true, Atomic::Relaxed);
+    }
+
+    /// Says whether the statement about to run reads some table more than once, so that after
+    /// [`PagePool::last_statement`] its reads hold what they decode the way every statement before
+    /// the last one does.
+    ///
+    /// The statement after is not the only one a held part serves. TPC-H q22 reads `customer` once
+    /// for the average balance and once for the answer, q02 reads `partsupp` and the suppliers of a
+    /// region twice and q20 reads `lineitem` and `part` twice. Holding a part only on its second read
+    /// decoded every phone number twice in q22, 19 M instructions of decompression becoming 39 M.
+    pub fn rereads(&self, rereads: bool) {
+        self.last.store(self.told.load(Atomic::Relaxed) && !rereads, Atomic::Relaxed);
     }
 
     /// A pool with no budget of its own that hears [`PagePool::last_statement`] when `other`
@@ -16994,6 +17010,37 @@ mod tests {
         let second = a.read(0, &[0]).expect("a part");
         assert_eq!(second.value_at(63, 0), Value::Integer(63));
         assert!(matches!(*slot(0), PartSlot::Held { .. }), "the second read holds it");
+        drop((a, catalog));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A statement that reads a table twice holds a part on its first read even after the last
+    /// statement is announced, and one that does not goes back to only counting.
+    #[test]
+    fn a_last_statement_that_reads_twice_holds_on_the_first_read() {
+        let path = path("last-rereads");
+        let mut writer =
+            Writer::create(&path, "a", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        let values: Vec<Value> = (0..64).map(Value::Integer).collect();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::Integer, &values).expect("integers")])
+                .expect("matching rows");
+        writer.append(&chunk).expect("two parts");
+        writer.append(&chunk).expect("two parts");
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        pool.last_statement();
+        pool.rereads(true);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("a").expect("a");
+        let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
+        a.read(0, &[0]).expect("a part");
+        assert!(matches!(*slot(0), PartSlot::Held { .. }), "the first read holds it");
+        pool.rereads(false);
+        a.read(1, &[0]).expect("a part");
+        assert!(matches!(*slot(1), PartSlot::Seen(64)), "a statement reading once only counts");
         drop((a, catalog));
         fs::remove_file(path).expect("remove scratch file");
     }
