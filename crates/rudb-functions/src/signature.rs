@@ -2766,7 +2766,8 @@ fn no_match_spelled(name: &str, types: &str) -> Error {
     let mut message = format!(
         "No function matches the given name and argument types '{name}({types})'. You might need to add explicit type casts."
     );
-    if let Some((_, overloads)) = CANDIDATES.iter().find(|(entry, _)| *entry == name) {
+    let mut known = CANDIDATES.iter().chain(SETTLED);
+    if let Some((_, overloads)) = known.find(|(entry, _)| *entry == name) {
         message.push_str("\n\tCandidate functions:");
         for overload in *overloads {
             message.push_str("\n\t");
@@ -2776,6 +2777,16 @@ fn no_match_spelled(name: &str, types: &str) -> Error {
     }
     Error::binder(message)
 }
+
+/// Candidate blocks for calls that rudb-bind settles itself and that have no entry in [`TABLE`],
+/// which are the struct searches and `struct_extract_at`. The binder refuses them with these.
+const SETTLED: &[(&str, &[&str])] = &[
+    ("struct_contains", &["struct_contains(col0 TUPLE, col1 ANY) -> BOOLEAN"]),
+    ("struct_has", &["struct_has(col0 TUPLE, col1 ANY) -> BOOLEAN"]),
+    ("struct_position", &["struct_position(col0 TUPLE, col1 ANY) -> INTEGER"]),
+    ("struct_indexof", &["struct_indexof(col0 TUPLE, col1 ANY) -> INTEGER"]),
+    ("struct_extract_at", &["struct_extract_at(\"struct\" STRUCT, \"index\" BIGINT) -> ANY"]),
+];
 
 /// The pin's refusal of a call whose named arguments fit none of the function's lists of
 /// parameters, or fit two of them in different orders, with each argument already spelled the way
