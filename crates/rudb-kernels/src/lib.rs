@@ -84,6 +84,7 @@ mod nested_text;
 mod number;
 mod path;
 mod peel;
+mod printf;
 pub mod prepare;
 mod quantile;
 mod random;
