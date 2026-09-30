@@ -12,6 +12,12 @@
 //! is within 2^30 of zero. Inside those bounds a key under the base wraps round to an offset past
 //! the last bit, so one unsigned clamp is the range test at both ends. Past them there is no
 //! [`Members`], and the caller tests its keys the way it did before.
+//!
+//! A bitmap whose set bits all sit in its first 256 fits in one register, and then the eight words
+//! are picked out of it with a permute rather than gathered from memory. Zen 1 spends about 1.3 ns a
+//! key on the gather even with the bitmap in L1, and the permute about half that. JOB asks this of a
+//! link to `info_type` or `kind_type` on a quarter of the keys it tests, where the build side is one
+//! or two types out of a hundred.
 
 /// A bitmap over the keys from a base, ready to test `i32` keys against. See the module docs.
 #[derive(Debug, Clone, Copy)]
@@ -20,6 +26,8 @@ pub struct Members<'a> {
     base: i32,
     /// The offset of the last bit of `words`.
     last: u32,
+    /// Whether every set bit is among the first 256, which [`Self::avx2`] then holds in a register.
+    narrow: bool,
 }
 
 /// The most bits a bitmap may have, and the furthest its base may be from zero, for 32-bit lanes
@@ -35,7 +43,13 @@ impl<'a> Members<'a> {
         if words.is_empty() || bits > REACH || !(-REACH..=REACH).contains(&base) {
             return None;
         }
-        Some(Self { words, base: i32::try_from(base).ok()?, last: u32::try_from(bits - 1).ok()? })
+        let narrow = words.len() <= 4 || (words.len() == 5 && words[4] == 0);
+        Some(Self {
+            words,
+            base: i32::try_from(base).ok()?,
+            last: u32::try_from(bits - 1).ok()?,
+            narrow,
+        })
     }
 
     /// Bit `i` set when the bitmap holds `keys[i]`, for at most 64 keys.
@@ -80,8 +94,8 @@ impl<'a> Members<'a> {
         use std::arch::x86_64::{
             __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_castsi256_ps,
             _mm256_cmpeq_epi32, _mm256_i32gather_epi32, _mm256_loadu_si256, _mm256_min_epu32,
-            _mm256_movemask_ps, _mm256_set1_epi32, _mm256_sllv_epi32, _mm256_srli_epi32,
-            _mm256_sub_epi32,
+            _mm256_movemask_ps, _mm256_permutevar8x32_epi32, _mm256_set1_epi32, _mm256_sllv_epi32,
+            _mm256_srli_epi32, _mm256_sub_epi32,
         };
         let mut chunks = keys.chunks_exact(8);
         let mut word = 0u64;
@@ -95,20 +109,44 @@ impl<'a> Members<'a> {
             #[allow(clippy::cast_possible_wrap)]
             let last = _mm256_set1_epi32(self.last as i32);
             let low = _mm256_set1_epi32(31);
-            let words = self.words.as_ptr().cast::<i32>();
-            for (at, eight) in (&mut chunks).enumerate() {
-                let keys = _mm256_loadu_si256(eight.as_ptr().cast::<__m256i>());
-                let offset = _mm256_sub_epi32(keys, base);
-                let clamped = _mm256_min_epu32(offset, last);
-                let inside = _mm256_cmpeq_epi32(clamped, offset);
-                let lanes = _mm256_i32gather_epi32::<4>(words, _mm256_srli_epi32::<5>(clamped));
-                // Shifting left by 31 less the bit's place in its lane puts the bit in the sign.
-                let lifted = _mm256_sllv_epi32(lanes, _mm256_andnot_si256(clamped, low));
-                let held = _mm256_and_si256(lifted, inside);
-                // `movemask` of eight lanes sets only the low eight bits.
-                #[allow(clippy::cast_sign_loss)]
-                let bits = _mm256_movemask_ps(_mm256_castsi256_ps(held)) as u32;
-                word |= u64::from(bits) << (8 * at);
+            if self.narrow {
+                let mut first = [0_u64; 4];
+                let set = self.words.len().min(4);
+                first[..set].copy_from_slice(&self.words[..set]);
+                let first = _mm256_loadu_si256(first.as_ptr().cast::<__m256i>());
+                // A key past bit 255 has a clear bit, so clamping to 255 and calling it outside is
+                // the same answer, and it keeps the word index under eight for the permute.
+                #[allow(clippy::cast_possible_wrap)]
+                let last = _mm256_set1_epi32(self.last.min(255) as i32);
+                for (at, eight) in (&mut chunks).enumerate() {
+                    let keys = _mm256_loadu_si256(eight.as_ptr().cast::<__m256i>());
+                    let offset = _mm256_sub_epi32(keys, base);
+                    let clamped = _mm256_min_epu32(offset, last);
+                    let inside = _mm256_cmpeq_epi32(clamped, offset);
+                    let lanes = _mm256_permutevar8x32_epi32(first, _mm256_srli_epi32::<5>(clamped));
+                    let lifted = _mm256_sllv_epi32(lanes, _mm256_andnot_si256(clamped, low));
+                    let held = _mm256_and_si256(lifted, inside);
+                    #[allow(clippy::cast_sign_loss)]
+                    let bits = _mm256_movemask_ps(_mm256_castsi256_ps(held)) as u32;
+                    word |= u64::from(bits) << (8 * at);
+                }
+            } else {
+                let words = self.words.as_ptr().cast::<i32>();
+                for (at, eight) in (&mut chunks).enumerate() {
+                    let keys = _mm256_loadu_si256(eight.as_ptr().cast::<__m256i>());
+                    let offset = _mm256_sub_epi32(keys, base);
+                    let clamped = _mm256_min_epu32(offset, last);
+                    let inside = _mm256_cmpeq_epi32(clamped, offset);
+                    let lanes = _mm256_i32gather_epi32::<4>(words, _mm256_srli_epi32::<5>(clamped));
+                    // Shifting left by 31 less the bit's place in its lane puts the bit in the
+                    // sign.
+                    let lifted = _mm256_sllv_epi32(lanes, _mm256_andnot_si256(clamped, low));
+                    let held = _mm256_and_si256(lifted, inside);
+                    // `movemask` of eight lanes sets only the low eight bits.
+                    #[allow(clippy::cast_sign_loss)]
+                    let bits = _mm256_movemask_ps(_mm256_castsi256_ps(held)) as u32;
+                    word |= u64::from(bits) << (8 * at);
+                }
             }
         }
         let done = keys.len() - chunks.remainder().len();
@@ -133,8 +171,14 @@ mod tests {
             seed
         };
         for round in 0..500 {
-            let len = 1 + (next() % 40) as usize;
-            let words: Vec<u64> = (0..len).map(|_| next() & next()).collect();
+            // A third of the rounds are bitmaps narrow enough to be held in a register, some with
+            // a clear word on the end the way a domain leaves one.
+            let widest = if round % 3 == 0 { 5 } else { 40 };
+            let len = 1 + (next() % widest) as usize;
+            let mut words: Vec<u64> = (0..len).map(|_| next() & next()).collect();
+            if len == 5 && next() % 2 == 0 {
+                words[4] = 0;
+            }
             let base = (next() % 2001) as i64 - 1000;
             let members = Members::new(&words, base).expect("a small bitmap");
             let count = (next() % 65) as usize;
