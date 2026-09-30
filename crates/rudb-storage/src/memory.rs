@@ -182,6 +182,10 @@ pub struct MemoryTable {
     /// and dropped whenever a row is added, like `grams`. The compiler asks for them on every query
     /// and working them out walks the zone of every chunk.
     extremes: Vec<OnceLock<Option<(Bound, Bound)>>>,
+    /// Each column's rows in groups coded into a dictionary, for [`MemoryTable::dictionary_rows`],
+    /// counted the first time they are asked for and dropped whenever a row is added, like `grams`.
+    /// The compiler asks for every column it scans on every query, and counting walks every group.
+    coded: Vec<OnceLock<usize>>,
     rows: usize,
     stats_ns: u64,
     counts_ns: u64,
@@ -195,6 +199,7 @@ impl MemoryTable {
         let grams = types.iter().map(|_| OnceLock::new()).collect();
         let lists = types.iter().map(|_| OnceLock::new()).collect();
         let extremes = types.iter().map(|_| OnceLock::new()).collect();
+        let coded = types.iter().map(|_| OnceLock::new()).collect();
         Self {
             types,
             groups: Vec::new(),
@@ -211,6 +216,7 @@ impl MemoryTable {
             grams,
             lists,
             extremes,
+            coded,
             rows: 0,
             stats_ns: 0,
             counts_ns: 0,
@@ -906,6 +912,9 @@ impl MemoryTable {
         for ends in &mut self.extremes {
             ends.take();
         }
+        for coded in &mut self.coded {
+            coded.take();
+        }
     }
 
     /// Whether the probes keep every row of chunk `index`.
@@ -972,20 +981,21 @@ impl MemoryTable {
     ///
     /// If the column is outside the table.
     pub fn dictionary_rows(&self, column: usize) -> Result<(usize, usize)> {
-        if column >= self.types.len() {
+        let Some(held) = self.coded.get(column) else {
             return Err(Error::internal(format!(
                 "column {column} of a table that has {}",
                 self.types.len()
             )));
-        }
-        let coded = self
-            .groups
-            .iter()
-            .filter(|g| {
-                g.columns.get(column).is_some_and(|v| v.shared_dictionary_parts().is_some())
-            })
-            .map(|g| g.rows)
-            .sum();
+        };
+        let coded = *held.get_or_init(|| {
+            self.groups
+                .iter()
+                .filter(|g| {
+                    g.columns.get(column).is_some_and(|v| v.shared_dictionary_parts().is_some())
+                })
+                .map(|g| g.rows)
+                .sum()
+        });
         Ok((coded, self.len()))
     }
 
@@ -2023,5 +2033,36 @@ mod tests {
             table.exact_sum(0).ok().flatten().map(|(sum, _)| sum),
             Some((0..rows as i128).sum())
         );
+    }
+
+    #[test]
+    fn the_coded_rows_are_counted_again_after_more_rows_come() {
+        let types = vec![LogicalType::BigInt, LogicalType::Varchar];
+        let words: Vec<Value> =
+            ["apple", "pear"].iter().map(|word| Value::Varchar((*word).to_string())).collect();
+        let dictionary = Vector::from_values(LogicalType::Varchar, &words).expect("two words");
+        let chunk = || {
+            let numbers: Vec<Value> = (0..VECTOR_SIZE as i64).map(Value::BigInt).collect();
+            let codes: Vec<u32> = (0..VECTOR_SIZE as u32).map(|row| row % 2).collect();
+            Chunk::new(vec![
+                Vector::from_values(LogicalType::BigInt, &numbers).expect("numbers"),
+                Vector::dictionary(codes, dictionary.clone()).expect("words"),
+            ])
+            .expect("a chunk")
+        };
+        let mut table = MemoryTable::new(types);
+        let fill = |table: &mut MemoryTable| {
+            for _ in 0..ROWS_PER_GROUP / VECTOR_SIZE {
+                table.append(chunk()).expect("the table's own types");
+            }
+        };
+        fill(&mut table);
+        let (first, rows) = table.dictionary_rows(1).expect("the words");
+        assert!(first > 0 && first <= rows, "{first} of {rows}");
+        assert_eq!(table.dictionary_rows(0).expect("the numbers").0, 0);
+        fill(&mut table);
+        let (again, more) = table.dictionary_rows(1).expect("the words");
+        assert!(again > first && more > rows, "{again} of {more} after {first} of {rows}");
+        assert!(table.dictionary_rows(2).is_err());
     }
 }

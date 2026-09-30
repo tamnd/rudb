@@ -2,11 +2,13 @@
 //!
 //! Machine code is kept per process, keyed on the backend and the whole function with its name,
 //! version and plan number left out, so the same pipeline in another query, or in the same query
-//! run again, takes the code instead of compiling it. The key is the function's full `Debug` text
-//! and a lookup compares all of it, so two functions that differ in anything a backend could read
-//! never share code. The cache holds at most [`BUDGET`] bytes of code and forgets the entry used
-//! longest ago past that. A query holds the code it took by an `Arc`, so forgetting an entry never
-//! pulls code out from under a query that runs it.
+//! run again, takes the code instead of compiling it. The key is the whole function and a lookup
+//! compares all of it, so two functions that differ in anything a backend could read never share
+//! code. It used to be the function's `Debug` text, which took longer to write out for each
+//! function of each query than hashing and comparing the function does. The cache holds at most
+//! [`BUDGET`] bytes of code and forgets the entry used longest ago past that. A query holds the
+//! code it took by an `Arc`, so forgetting an entry never pulls code out from under a query that
+//! runs it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -19,9 +21,16 @@ pub(crate) const BUDGET: usize = 64 << 20;
 
 /// What a function's code is found by: the backend that made it and every part of the function
 /// the backend reads.
-pub(crate) fn key(backend: &str, f: &Func) -> String {
-    let bare = Func { name: String::new(), version: String::new(), plan: 0, ..f.clone() };
-    format!("{backend}\n{bare:?}")
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Key {
+    backend: &'static str,
+    func: Func,
+}
+
+/// The key of `f`'s code from `backend`.
+pub(crate) fn key(backend: &'static str, f: &Func) -> Key {
+    let func = Func { name: String::new(), version: String::new(), plan: 0, ..f.clone() };
+    Key { backend, func }
 }
 
 struct Entry {
@@ -32,7 +41,7 @@ struct Entry {
 
 #[derive(Default)]
 struct Cache {
-    entries: HashMap<String, Entry>,
+    entries: HashMap<Key, Entry>,
     bytes: usize,
     clock: u64,
 }
@@ -40,7 +49,7 @@ struct Cache {
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
 /// The code cached under `key`, if any.
-pub(crate) fn get(key: &str) -> Option<Arc<Code>> {
+pub(crate) fn get(key: &Key) -> Option<Arc<Code>> {
     let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
     let cache = cache.get_or_insert_with(Cache::default);
     cache.clock += 1;
@@ -52,7 +61,7 @@ pub(crate) fn get(key: &str) -> Option<Arc<Code>> {
 
 /// Keeps `code` under `key`, and forgets the entries used longest ago while the cache is over its
 /// budget. Code bigger than the whole budget is not kept.
-pub(crate) fn put(key: String, code: &Arc<Code>) {
+pub(crate) fn put(key: Key, code: &Arc<Code>) {
     let bytes = code.len();
     if bytes > BUDGET {
         return;
