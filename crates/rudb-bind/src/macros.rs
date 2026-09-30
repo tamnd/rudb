@@ -10,8 +10,14 @@
 //! The macros that already have a function or an expansion of their own here are not in the table.
 //! The `list_` aggregates are `crate::listaggr`, `list_append` and its five relatives are in
 //! `crate::expr`, and `if` and `nullif` bind as the CASE they stand for. The json macros wait for a
-//! JSON type, `md5_number_lower` and `md5_number_upper` wait for BIT, and `days_in_month` waits for
-//! `last_day`.
+//! JSON type.
+//!
+//! The pin keeps the PostgreSQL shims, `pg_typeof`, the `has_*_privilege` pairs and the
+//! `pg_*_is_visible` family among them, in `pg_catalog` and the rest in `main`. Both are on the
+//! search path, so a bare call finds either, and the table does not tell them apart.
+//! `pg_get_viewdef` and `pg_get_constraintdef` wait for arguments that are bound where the call is,
+//! since their bodies are queries of a table whose columns would capture an argument written as
+//! `view_oid`, where the pin reads the caller's column.
 
 use rudb_common::{Error, Result};
 use rudb_parse::{Ast, Kind, ast, deparse, parse_ast_with_case, tokenize};
@@ -63,22 +69,82 @@ const MACROS: &[Macro] = &[
         "CASE  WHEN (condition) THEN (NULL) ELSE \
          \"error\"(COALESCE(('Assertion: ' || message), 'Assertion failed')) END",
     ),
+    define("col_description", &["table_oid", "column_number"], "NULL"),
     define("current_role", &[], "'duckdb'"),
     define("date_add", &["date", "interval"], "(date + \"interval\")"),
+    define("days_in_month", &["date"], "\"day\"(last_day(date))"),
     define("fdiv", &["x", "y"], "floor((x / y))"),
     define("fmod", &["x", "y"], "(x - (y * floor((x / y))))"),
-    define("geomean", &["x"], "exp(avg(ln(x)))"),
     define(
         "generate_subscripts",
         &["arr", "dim"],
         "unnest(generate_series(1, array_length(arr, dim)))",
     ),
+    define("geomean", &["x"], "exp(avg(ln(x)))"),
     define("geometric_mean", &["x"], "geomean(x)"),
+    define("has_any_column_privilege", &["table", "privilege"], "true"),
+    define("has_any_column_privilege", &["user", "table", "privilege"], "true"),
+    define("has_column_privilege", &["table", "column", "privilege"], "true"),
+    define("has_column_privilege", &["user", "table", "column", "privilege"], "true"),
+    define("has_database_privilege", &["database", "privilege"], "true"),
+    define("has_database_privilege", &["user", "database", "privilege"], "true"),
+    define("has_foreign_data_wrapper_privilege", &["fdw", "privilege"], "true"),
+    define("has_foreign_data_wrapper_privilege", &["user", "fdw", "privilege"], "true"),
+    define("has_function_privilege", &["function", "privilege"], "true"),
+    define("has_function_privilege", &["user", "function", "privilege"], "true"),
+    define("has_language_privilege", &["language", "privilege"], "true"),
+    define("has_language_privilege", &["user", "language", "privilege"], "true"),
+    define("has_schema_privilege", &["schema", "privilege"], "true"),
+    define("has_schema_privilege", &["user", "schema", "privilege"], "true"),
+    define("has_sequence_privilege", &["sequence", "privilege"], "true"),
+    define("has_sequence_privilege", &["user", "sequence", "privilege"], "true"),
+    define("has_server_privilege", &["server", "privilege"], "true"),
+    define("has_server_privilege", &["user", "server", "privilege"], "true"),
+    define("has_table_privilege", &["table", "privilege"], "true"),
+    define("has_table_privilege", &["user", "table", "privilege"], "true"),
+    define("has_tablespace_privilege", &["tablespace", "privilege"], "true"),
+    define("has_tablespace_privilege", &["user", "tablespace", "privilege"], "true"),
+    define("inet_client_addr", &[], "NULL"),
+    define("inet_client_port", &[], "NULL"),
+    define("inet_server_addr", &[], "NULL"),
+    define("inet_server_port", &[], "NULL"),
+    define(
+        "md5_number_lower",
+        &["param"],
+        "CAST(CAST(CAST(CAST(md5_number(param) AS BIT) AS VARCHAR)[:64] AS BIT) AS uint64)",
+    ),
+    define(
+        "md5_number_upper",
+        &["param"],
+        "CAST(CAST(CAST(CAST(md5_number(param) AS BIT) AS VARCHAR)[65:] AS BIT) AS uint64)",
+    ),
+    define("obj_description", &["object_oid", "catalog_name"], "NULL"),
+    define("pg_collation_is_visible", &["collation_oid"], "true"),
+    define("pg_conf_load_time", &[], "current_timestamp"),
+    define("pg_conversion_is_visible", &["conversion_oid"], "true"),
+    define("pg_function_is_visible", &["function_oid"], "true"),
+    define("pg_get_expr", &["pg_node_tree", "relation_oid"], "pg_node_tree"),
+    define("pg_has_role", &["role", "privilege"], "true"),
+    define("pg_has_role", &["user", "role", "privilege"], "true"),
+    define("pg_is_other_temp_schema", &["schema_id"], "false"),
+    define("pg_my_temp_schema", &[], "0"),
+    define("pg_opclass_is_visible", &["opclass_oid"], "true"),
+    define("pg_operator_is_visible", &["operator_oid"], "true"),
+    define("pg_opfamily_is_visible", &["opclass_oid"], "true"),
+    define("pg_postmaster_start_time", &[], "current_timestamp"),
+    define("pg_table_is_visible", &["table_oid"], "true"),
+    define("pg_ts_config_is_visible", &["config_oid"], "true"),
+    define("pg_ts_dict_is_visible", &["dict_oid"], "true"),
+    define("pg_ts_parser_is_visible", &["parser_oid"], "true"),
+    define("pg_ts_template_is_visible", &["template_oid"], "true"),
+    define("pg_type_is_visible", &["type_oid"], "true"),
+    define("pg_typeof", &["expression"], "lower(typeof(expression))"),
     define(
         "regexp_split_to_table",
         &["text", "pattern"],
         "unnest(string_split_regex(\"text\", pattern))",
     ),
+    define("shobj_description", &["object_oid", "catalog_name"], "NULL"),
     define(
         "split_part",
         &["string", "delimiter", "position"],

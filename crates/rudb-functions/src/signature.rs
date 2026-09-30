@@ -2568,6 +2568,10 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         }
         ("dayname" | "monthname", [Date | Timestamp | TimestampTz]) => kept(LogicalType::Varchar),
         ("last_day", [Date | Timestamp | TimestampTz]) => kept(Date),
+        // A null costs less to make a date than a timestamp, so the pin reads it through the date
+        // overload.
+        ("dayname" | "monthname", [Null]) => Some((vec![Date], LogicalType::Varchar)),
+        ("last_day", [Null]) => Some((vec![Date], Date)),
         ("nanosecond" | "epoch_ns", [TimestampNs]) => kept(BigInt),
         (
             "nanosecond" | "epoch_ms" | "epoch_us" | "epoch_ns",
