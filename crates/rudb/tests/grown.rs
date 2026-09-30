@@ -182,3 +182,76 @@ fn a_string_group_over_a_grown_table_counts_the_rows_since() {
     drop(second);
     std::fs::remove_file(path).expect("removes the temporary database");
 }
+
+/// A checkpoint of a grown table keeps the stripes the file already has and writes the rows since
+/// after them, so it costs the rows that were appended and not the table.
+///
+/// The old stripes' strings are coded against the table's dictionary and the new ones are not, so
+/// the answers that lean on the dictionary, a group, a distinct count and an equality, have to come
+/// out the same across the two, and again after a second extension and a reopen.
+#[test]
+fn a_checkpoint_of_a_grown_table_writes_only_the_rows_since() {
+    let path = scratch("extend");
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let first = Database::open(&name).expect("opens");
+    first.execute("CREATE TABLE t (a BIGINT, b VARCHAR, c VARCHAR)").expect("creates");
+    first
+        .execute(
+            "INSERT INTO t SELECT i, CASE WHEN i % 10 = 0 THEN NULL ELSE 'v' || (i % 97) END, \
+             'a long enough comment number ' || (i % 50) FROM range(300000) r(i)",
+        )
+        .expect("loads");
+    first.execute("CHECKPOINT").expect("commits");
+    drop(first);
+    let before = std::fs::read(&path).expect("the file");
+    let size = before.len();
+
+    let check = |database: &Database, extra: i64| {
+        let value = |sql: &str| database.value(sql).expect("reads").to_string();
+        assert_eq!(value("SELECT count(*) FROM t"), (300_003 + 2 * extra).to_string());
+        assert_eq!(value("SELECT count(DISTINCT b) FROM t"), "98");
+        assert_eq!(value("SELECT count(*) FROM t WHERE b = 'v5'"), (2_785 + extra).to_string());
+        assert_eq!(value("SELECT count(*) FROM t WHERE b = 'new'"), "1");
+        assert_eq!(value("SELECT count(*) FROM t WHERE b IS NULL"), (30_001 + extra).to_string());
+        assert_eq!(value("SELECT max(a) FROM t"), (1_000_000 + extra).to_string());
+        assert_eq!(
+            value("SELECT count(*) FROM t WHERE c LIKE '%number 7%'"),
+            (6_001 + extra).to_string()
+        );
+        assert_eq!(value("SELECT count(*) FROM t WHERE c LIKE '%fresh%'"), "1");
+        assert_eq!(
+            value("SELECT count(*) FROM (SELECT b, count(*) FROM t GROUP BY b)"),
+            "99",
+            "the groups over coded and plain stripes did not meet"
+        );
+    };
+    let second = Database::open(&name).expect("reopens");
+    second
+        .execute(
+            "INSERT INTO t VALUES (1000000, 'new', 'a long enough comment number 7'), \
+             (7, 'v5', 'fresh text'), (8, NULL, NULL)",
+        )
+        .expect("appends");
+    second.execute("CHECKPOINT").expect("extends");
+    // Everything past the header slots is where it was, and what the checkpoint wrote is on the
+    // end. A rewrite would have renamed a new file over this one.
+    let after = std::fs::read(&path).expect("the file");
+    assert_eq!(after[80..size], before[80..], "the stripes the file had were written again");
+    let grown = after.len() - size;
+    assert!(grown * 20 < size, "a checkpoint of three rows wrote {grown} bytes of a {size} file");
+    check(&second, 0);
+    second
+        .execute("INSERT INTO t VALUES (1000001, 'v5', 'a long enough comment number 7'), (9, NULL, 'x')")
+        .expect("appends again");
+    second.execute("CHECKPOINT").expect("extends again");
+    check(&second, 1);
+    drop(second);
+    let third = Database::open(&name).expect("reopens");
+    check(&third, 1);
+    assert_eq!(
+        third.value("SELECT sum(a) FROM t").expect("reads").to_string(),
+        (299_999_i64 * 300_000 / 2 + 1_000_000 + 7 + 8 + 1_000_001 + 9).to_string()
+    );
+    drop(third);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}

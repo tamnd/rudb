@@ -1929,10 +1929,9 @@ fn persist_anchored(
     for name in &names {
         let table = catalog.table(name)?;
         let fields = table.columns().to_vec();
-        let columns = (0..fields.len()).collect::<Vec<_>>();
         let mut open = match writer.take() {
-            None => rudb_native::Writer::create(&temporary, name.table.clone(), fields)?,
-            Some(writer) => writer.next(name.table.clone(), fields)?,
+            None => rudb_native::Writer::create(&temporary, name.table.clone(), fields.clone())?,
+            Some(writer) => writer.next(name.table.clone(), fields.clone())?,
         };
         if let Some(clustering) = table.clustering() {
             open = open.declare(clustering.clone())?;
@@ -1941,9 +1940,7 @@ fn persist_anchored(
         if !constraints.is_empty() {
             open = open.constrain(constraints)?;
         }
-        for at in 0..table.rows().chunk_count() {
-            open.append(&table.rows().read(at, &columns)?)?;
-        }
+        write_parts(&mut open, table.rows(), 0, &fields)?;
         writer = Some(open);
     }
     let mut writer = writer.ok_or_else(|| Error::internal("a catalog with tables wrote none"))?;
@@ -2488,6 +2485,11 @@ fn rebind(
 /// those statements rewrote the whole database, which made loading the 21 tables of the JOB schema
 /// one at a time cost more than twenty times what loading them took.
 ///
+/// A table the file holds with rows, which rows were appended to since, is extended rather than
+/// written again: its stripes stay where they are and only the rows since are written after them,
+/// see `rudb_native::Writer::extend`. Before this, one row inserted into a table of a hundred
+/// million made the next checkpoint write all hundred million again.
+///
 /// It cannot when the file is not there, when nothing in the catalog is native yet, or when the two
 /// disagree about which tables exist, and the caller writes the whole file instead. A file that is
 /// there but is not a native file this build can read is an error either way, so the error from
@@ -2510,13 +2512,28 @@ fn appended(
         .collect::<BTreeSet<_>>();
     let dirty =
         names.iter().filter(|name| !native.contains(&name.table)).cloned().collect::<Vec<_>>();
+    // A table the file holds that rows were only appended to keeps its stripes, and this
+    // generation writes the appended rows after them. Where it has to be written whole instead,
+    // which is a file of an older format, it is one of the disagreements below.
+    let mut extended = BTreeMap::new();
+    for name in &dirty {
+        let table = catalog.table(name)?;
+        let Some((rows, parts)) = table.rows().grown_from() else { continue };
+        if held.get(&name.table) == Some(&rows)
+            && rudb_native::extendable(path, &name.table, table.columns(), rows)?
+        {
+            extended.insert(name.table.clone(), parts);
+        }
+    }
     // Every table the file holds is either carried forward as it is or is an empty one the new
     // generation takes the place of, and the writer drops an empty entry of the same name when it
     // starts that table. A table the file holds with rows in it that the catalog no longer has as
     // native is rows this generation would have to rewrite, and that is the whole file path.
     let replaced = |name: &String| held.get(name).is_some_and(|rows| *rows == 0);
     let carried = held.keys().all(|name| {
-        native.contains(name) || (replaced(name) && dirty.iter().any(|d| &d.table == name))
+        native.contains(name)
+            || extended.contains_key(name)
+            || (replaced(name) && dirty.iter().any(|d| &d.table == name))
     });
     if !carried || !native.iter().all(|name| held.contains_key(name)) {
         return Ok(false);
@@ -2525,10 +2542,13 @@ fn appended(
     for name in &dirty {
         let table = catalog.table(name)?;
         let fields = table.columns().to_vec();
-        let columns = (0..fields.len()).collect::<Vec<_>>();
-        let mut open = match writer.take() {
-            None => rudb_native::Writer::open(path, name.table.clone(), fields)?,
-            Some(writer) => writer.next(name.table.clone(), fields)?,
+        let kept = extended.get(&name.table).copied();
+        let copy = fields.clone();
+        let mut open = match (writer.take(), kept) {
+            (None, None) => rudb_native::Writer::open(path, name.table.clone(), copy)?,
+            (None, Some(_)) => rudb_native::Writer::extend(path, name.table.clone(), copy)?,
+            (Some(writer), None) => writer.next(name.table.clone(), copy)?,
+            (Some(writer), Some(_)) => writer.next_extending(name.table.clone(), copy)?,
         };
         // The tables already in the file keep theirs, because they are carried forward by
         // directory pointer and their bytes are not rewritten. Only the ones being written here
@@ -2540,9 +2560,7 @@ fn appended(
         if !constraints.is_empty() {
             open = open.constrain(constraints)?;
         }
-        for at in 0..table.rows().chunk_count() {
-            open.append(&table.rows().read(at, &columns)?)?;
-        }
+        write_parts(&mut open, table.rows(), kept.unwrap_or(0), &fields)?;
         writer = Some(open);
     }
     let Some(mut writer) = writer else { return Ok(false) };
@@ -2554,6 +2572,68 @@ fn appended(
     // from the first of those.
     writer.with_views(views.to_vec()).finish()?;
     Ok(true)
+}
+
+/// How many rows a checkpoint gathers small chunks into before writing them as one part.
+const PART_ROWS: usize = 8_192;
+
+/// Writes a table's chunks from `from` on, with runs of small ones joined into parts of about
+/// [`PART_ROWS`] rows.
+///
+/// Each chunk handed to the writer is a part of its own in the file. A table filled by single row
+/// inserts holds a chunk for every one, and written one for one that was a thousand parts of one
+/// row for a thousand inserts, which cost the checkpoint a second and every scan after it a
+/// thousand part headers to walk.
+fn write_parts(
+    open: &mut rudb_native::Writer,
+    rows: &rudb_catalog::Rows,
+    from: usize,
+    fields: &[Field],
+) -> Result<()> {
+    let columns = (0..fields.len()).collect::<Vec<_>>();
+    let mut held: Vec<Chunk> = Vec::new();
+    let mut count = 0;
+    for at in from..rows.chunk_count() {
+        let chunk = rows.read(at, &columns)?;
+        if held.is_empty() && chunk.len() >= PART_ROWS {
+            open.append(&chunk)?;
+            continue;
+        }
+        count += chunk.len();
+        held.push(chunk);
+        if count >= PART_ROWS {
+            open.append(&joined(&held, fields, count)?)?;
+            held.clear();
+            count = 0;
+        }
+    }
+    if !held.is_empty() {
+        open.append(&joined(&held, fields, count)?)?;
+    }
+    Ok(())
+}
+
+/// Chunks of the same columns laid end to end as one, `rows` long.
+fn joined(held: &[Chunk], fields: &[Field], rows: usize) -> Result<Chunk> {
+    if let [only] = held {
+        return Ok(only.clone());
+    }
+    let mut columns = Vec::with_capacity(fields.len());
+    for (column, field) in fields.iter().enumerate() {
+        let pieces = held.iter().map(|chunk| chunk.column(column)).collect::<Result<Vec<_>>>()?;
+        if let Ok(Some(vector)) = rudb_vector::concat(&field.ty, &pieces) {
+            columns.push(vector);
+            continue;
+        }
+        let mut values = Vec::with_capacity(rows);
+        for vector in &pieces {
+            for row in 0..vector.len() {
+                values.push(vector.try_value_at(row)?);
+            }
+        }
+        columns.push(Vector::from_values(field.ty.clone(), &values)?);
+    }
+    Chunk::with_rows(columns, rows)
 }
 
 /// The rows an `UPDATE` or a `DELETE` source produced, split by the flag column after the table's.

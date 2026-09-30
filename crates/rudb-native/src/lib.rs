@@ -2132,6 +2132,9 @@ pub struct Writer {
     /// [`Writer::merger`] until the table is closed. `dictionaries` and `gathers` are empty then.
     lent: Option<Arc<Lent>>,
     pending: Vec<PendingChunk>,
+    /// What a table this writer is extending keeps of the directory it had, see
+    /// [`Writer::extend`]. `None` for a table written from nothing.
+    carried: Option<Carried>,
     /// The tables already closed in this generation, in the order they were written.
     closed: Vec<Entry>,
     /// The views the next commit writes down, which [`Writer::with_views`] sets.
@@ -2150,6 +2153,21 @@ pub struct Writer {
     /// charges them once per stripe and once per worker, never per chunk. See
     /// `rudb_metrics::LoadProfile` for why that is the grain.
     profile: Option<Arc<LoadProfile>>,
+}
+
+/// The parts of an extended table's old directory that [`Writer::close`] would otherwise work out
+/// again from the rows it was handed, which are only the new ones.
+///
+/// The old stripes' string pages are coded against the dictionaries the table already has, so
+/// those pages stay where they are and the table names them again. The new stripes are written
+/// plainly, and each column that had a dictionary is marked demoted, which is what a load does to
+/// a column whose dictionary stopped taking values partway through. A reader already knows that
+/// such a dictionary decodes the pages coded against it and promises nothing about the rest.
+#[derive(Debug)]
+struct Carried {
+    dictionaries: Vec<Option<Page>>,
+    payloads: Vec<u64>,
+    demoted: Vec<bool>,
 }
 
 /// A chunk that has arrived and is waiting for the rest of its stripe.
@@ -2339,11 +2357,43 @@ impl Writer {
         name: impl Into<String>,
         fields: Vec<Field>,
     ) -> Result<Self> {
+        Self::begin(fs, path.as_ref(), name.into(), fields, false)
+    }
+
+    /// [`Writer::open`] for a table the file already holds with rows, whose stripes the new
+    /// generation keeps where they are. What this writer is handed goes on after them as new
+    /// stripes, and only those, the table's directory and the catalog are written.
+    ///
+    /// This is a checkpoint of a table that rows were appended to costing the rows that were
+    /// appended, rather than the table. The price is the table's statistics: the frequencies, the
+    /// distinct counts and the sketches were about the old rows alone, and working them out again
+    /// would mean reading the whole table back, so the directory is written without them and a
+    /// query works the way it does for a column that never had them. The graph sections go too,
+    /// since the rows they describe are not all the rows any more. Call [`extendable`] first.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::open`], except that a table of this name with rows is the point, and
+    /// if that table's directory does not read back or its columns are not `fields`.
+    pub fn extend(
+        path: impl AsRef<Path>,
+        name: impl Into<String>,
+        fields: Vec<Field>,
+    ) -> Result<Self> {
+        Self::begin(&RealFilesystem::new(), path.as_ref(), name.into(), fields, true)
+    }
+
+    fn begin(
+        fs: &dyn Filesystem,
+        path: &Path,
+        name: String,
+        fields: Vec<Field>,
+        extend: bool,
+    ) -> Result<Self> {
         for field in &fields {
             type_tag(&field.ty)?;
         }
-        let name = name.into();
-        let file = fs.open(path.as_ref(), OpenMode::ReadWrite)?;
+        let file = fs.open(path, OpenMode::ReadWrite)?;
         let size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
         let (mut closed, views, card, anchor) = decode_catalog(&bytes, size)?;
@@ -2361,11 +2411,12 @@ impl Writer {
         // table. Before this, the second statement had to build the whole table in memory because
         // the first had already put the name in the file, which is how a load of a table larger
         // than memory became a load that needed memory the size of the table.
+        let mut held = None;
         if let Some(at) = closed.iter().position(|held| held.name == name) {
-            if closed[at].rows > 0 {
+            if closed[at].rows > 0 && !extend {
                 return Err(invalid("two tables in one native file have the same name"));
             }
-            closed.remove(at);
+            held = Some(closed.remove(at));
         }
         // The generation of the slot whose bytes checksummed, and not the highest number in the
         // header. A slot torn across a write can hold any number at all, and taking that one would
@@ -2375,7 +2426,7 @@ impl Writer {
             .generation
             .checked_add(1)
             .ok_or_else(|| invalid("native file generation overflow"))?;
-        Ok(Self {
+        let mut writer = Self {
             file,
             // The end of the file, so that the committed generation's catalog stays where its slot
             // says it is and keeps naming a file a reader can still open.
@@ -2412,13 +2463,18 @@ impl Writer {
             generation,
             order: Vec::new(),
             next_order: 0,
+            carried: None,
             pending: Vec::with_capacity(STRIPE_PARTS),
             closed,
             views,
             card,
             anchor,
             profile: None,
-        })
+        };
+        if let Some(entry) = held.filter(|entry| entry.rows > 0) {
+            writer.seed(&entry, size)?;
+        }
+        Ok(writer)
     }
 
     /// Creates a new v10 file and its first table.
@@ -2492,6 +2548,7 @@ impl Writer {
             generation: 1,
             order: Vec::new(),
             next_order: 0,
+            carried: None,
             pending: Vec::with_capacity(STRIPE_PARTS),
             closed: Vec::new(),
             views: Vec::new(),
@@ -2561,11 +2618,24 @@ impl Writer {
     ///
     /// If the name repeats a table already closed, a field has no scalar encoding, or the table
     /// being closed cannot be written.
-    pub fn next(mut self, name: impl Into<String>, fields: Vec<Field>) -> Result<Self> {
+    pub fn next(self, name: impl Into<String>, fields: Vec<Field>) -> Result<Self> {
+        self.follow(name.into(), fields, false)
+    }
+
+    /// [`Writer::next`] for a table the file already holds with rows, the way [`Writer::extend`]
+    /// is [`Writer::open`] for one.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::next`] and [`Writer::extend`].
+    pub fn next_extending(self, name: impl Into<String>, fields: Vec<Field>) -> Result<Self> {
+        self.follow(name.into(), fields, true)
+    }
+
+    fn follow(mut self, name: String, fields: Vec<Field>, extend: bool) -> Result<Self> {
         for field in &fields {
             type_tag(&field.ty)?;
         }
-        let name = name.into();
         let entry = self.close()?;
         if entry.name == name {
             return Err(invalid("two tables in one native file have the same name"));
@@ -2573,15 +2643,16 @@ impl Writer {
         // An empty table the committed generation holds under this name steps aside for this one,
         // the same as it does for the first table in [`Writer::open`], and for the same reason: it
         // has no pages to carry and the load writing it now is the one that fills it.
+        let mut held = None;
         if let Some(at) = self.closed.iter().position(|held| held.name == name) {
-            if self.closed[at].rows > 0 {
+            if self.closed[at].rows > 0 && !extend {
                 return Err(invalid("two tables in one native file have the same name"));
             }
-            self.closed.remove(at);
+            held = Some(self.closed.remove(at));
         }
         let Self { file, at, wide, generation, mut closed, views, card, anchor, .. } = self;
         closed.push(entry);
-        Ok(Self {
+        let mut writer = Self {
             file,
             written_back: at,
             wide,
@@ -2621,8 +2692,71 @@ impl Writer {
             },
             order: Vec::new(),
             next_order: 0,
+            carried: None,
             pending: Vec::with_capacity(STRIPE_PARTS),
-        })
+        };
+        if let Some(entry) = held.filter(|entry| entry.rows > 0) {
+            let bound = writer.at;
+            writer.seed(&entry, bound)?;
+        }
+        Ok(writer)
+    }
+
+    /// Starts this writer's table from the directory `entry` names, so that the old stripes are
+    /// the first of the table and whatever is appended goes on after them.
+    ///
+    /// Each old stripe gets an order of its own ahead of every new one, which is what lets
+    /// [`Writer::close`] sort the stripes and check them the way it does for a table it wrote
+    /// from nothing.
+    fn seed(&mut self, entry: &Entry, size: u64) -> Result<()> {
+        let mut directory = vec![0; entry.directory.length as usize];
+        read_at(&*self.file, entry.directory.offset, &mut directory)?;
+        if checksum(&directory) != entry.directory.hash {
+            return Err(invalid(&format!(
+                "the directory of table {} does not checksum",
+                entry.name
+            )));
+        }
+        let held = decode_directory(&directory, size)?;
+        if held.fields != self.table.fields {
+            return Err(invalid(&format!("table {} was extended with other columns", entry.name)));
+        }
+        let width = held.fields.len();
+        let stripes = held.stripes.len() as u64;
+        self.order = (0..stripes).map(|at| ((at, 0), (at, 0))).collect();
+        self.next_order = stripes;
+        self.dictionaries = (0..width).map(|_| None).collect();
+        self.coded = Arc::new(prepare::Coding::new((0..width).map(|_| false)));
+        let mut payloads = held.dictionary_payloads;
+        payloads.resize(width, 0);
+        self.carried = Some(Carried {
+            demoted: held.dictionaries.iter().map(Option::is_some).collect(),
+            dictionaries: held.dictionaries,
+            payloads,
+        });
+        // A text sketch and a column's value rows are a row at a time in row order, so the ones the
+        // table had are still right about the rows they were built over, and a reader takes every
+        // row after those as one it cannot rule out. They go on at this generation, and the next
+        // checkpoint builds them again once they cover too little of the table. Every other
+        // section is about all of the rows and is left behind.
+        let generation = self.table.generation;
+        self.table.sections = held
+            .sections
+            .into_iter()
+            .filter(|kept| {
+                kept.among(&[section::TEXT_GRAMS, section::VALUE_ROWS])
+                    && kept.current(held.generation)
+            })
+            .map(|mut kept| {
+                kept.generation = generation;
+                kept
+            })
+            .collect();
+        self.table.stripes = held.stripes;
+        self.table.rows = held.rows;
+        self.table.clustering = held.clustering;
+        self.table.constraints = held.constraints;
+        Ok(())
     }
 
     /// Sets the views the next commit writes down, replacing whatever was carried forward.
@@ -3537,6 +3671,11 @@ impl Writer {
 
     /// The columns that get numeric frequencies, which are the integer, date and timestamp ones.
     fn numeric_columns(&self) -> Vec<usize> {
+        // Counting an extended table's values means reading every stripe it had back, which is
+        // the cost extending it is there to avoid.
+        if self.carried.is_some() {
+            return Vec::new();
+        }
         self.table
             .fields
             .iter()
@@ -3783,6 +3922,12 @@ impl Writer {
                     .map_err(|_| invalid("dictionary page length overflow"))?,
                 hash: checksum(&encoded.index),
             });
+        }
+        if let Some(carried) = self.carried.take() {
+            self.table.dictionaries = carried.dictionaries;
+            self.table.dictionary_payloads = carried.payloads;
+            self.table.demoted =
+                if carried.demoted.contains(&true) { carried.demoted } else { Vec::new() };
         }
         drop(timing);
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
@@ -4276,6 +4421,37 @@ fn write_section(
         flags: one.flags,
         header_bytes: one.header_bytes,
     })
+}
+
+/// Whether [`Writer::extend`] can keep the stripes of `table` in the file at `path` and add to
+/// them, which needs the file to be this build's format and to hold the table with `rows` rows
+/// and these columns.
+///
+/// A file of an older format is written again whole instead, which is also what moves it to this
+/// one.
+///
+/// # Errors
+///
+/// If the file has no valid committed catalog.
+pub fn extendable(
+    path: impl AsRef<Path>,
+    table: &str,
+    fields: &[Field],
+    rows: usize,
+) -> Result<bool> {
+    let file = RealFilesystem::new().open(path.as_ref(), OpenMode::Read)?;
+    let file = &*file;
+    let size = file.len()?;
+    let mut version = [0; 4];
+    read_at(file, 8, &mut version)?;
+    if u32::from_le_bytes(version) != FORMAT {
+        return Ok(false);
+    }
+    let (_, bytes, _) = committed_slot(file, size)?;
+    let (entries, ..) = decode_catalog(&bytes, size)?;
+    Ok(entries.iter().any(|entry| {
+        entry.name == table && entry.rows == rows && rows > 0 && entry.fields == fields
+    }))
 }
 
 /// Attaches graph sections to a table already committed in a file, without rewriting a page.

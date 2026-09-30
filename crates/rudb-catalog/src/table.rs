@@ -61,9 +61,9 @@ pub enum Rows {
     /// writer stored and the rows in memory are not in there, so the ones that cannot be combined
     /// without reading the column say nothing at all rather than saying the file's answer as if it
     /// were the table's. The two that add up, which are the null count and the integer sum, are
-    /// added up. This is also why a checkpoint rewrites the file rather than carrying the table
-    /// forward: [`Rows::is_native`] is false here, so the table is one the file and the catalog
-    /// disagree about and the honest answer is to write it again.
+    /// added up. [`Rows::is_native`] is false here, so a checkpoint does not carry the table
+    /// forward as it is. It keeps the file's stripes and writes the rows since after them, which
+    /// [`Rows::grown_from`] says where to start.
     Grown(NativeReader, MemoryTable),
 }
 
@@ -828,6 +828,17 @@ impl Rows {
     #[must_use]
     pub fn is_native(&self) -> bool {
         matches!(self, Self::Native(_))
+    }
+
+    /// For rows appended to a committed native snapshot, how many rows and parts the snapshot
+    /// holds. The parts after those are the appended rows, which is all a checkpoint that keeps
+    /// the snapshot's stripes has to write.
+    #[must_use]
+    pub fn grown_from(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Grown(reader, _) => Some((reader.table().rows(), reader.parts())),
+            Self::Memory(_) | Self::Native(_) => None,
+        }
     }
 
     /// Number of independently readable chunks or parts.
