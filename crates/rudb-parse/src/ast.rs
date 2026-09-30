@@ -1425,10 +1425,16 @@ pub struct Ast {
     pub ctes: Vec<Cte>,
     /// Backing store for every [`Slice`] of materialised `WITH` indexes.
     pub cte_lists: Vec<u32>,
-    /// The named arguments of the calls that take any, each call with a run of targets whose alias
-    /// is the name. Only `unnest` takes them so far, and a side table keeps every other call as it
-    /// was rather than carrying an empty list on each.
+    /// The named arguments a call keeps as names, each call with a run of targets whose alias is
+    /// the name. `unnest` and `make_type` read theirs as options, and any other call here had names
+    /// the parser could not put in places, which the binder refuses. A side table keeps every
+    /// other call as it was rather than carrying an empty list on each.
     pub named_args: Vec<(ExprRef, Slice)>,
+    /// The calls whose named arguments were put in the places their names have, each with how many
+    /// arguments were written before the first name and the named ones as they were written. The
+    /// call carries its arguments in the function's order, and this is kept so that the call is
+    /// named and printed the way it was written.
+    pub named_written: Vec<(ExprRef, u32, Slice)>,
     /// The lists written `ARRAY[...]` rather than `[...]`. They are the same list, and only the
     /// name of a column holding one tells them apart.
     pub array_lists: Vec<ExprRef>,
@@ -1554,6 +1560,18 @@ impl Ast {
             .iter()
             .find(|(held, _)| *held == call)
             .map_or(&[], |&(_, slice)| self.target_list(slice))
+    }
+
+    /// The arguments of a call the way they were written: the positional ones, then the named
+    /// ones. For most calls that is the arguments it carries and its named arguments, and for a
+    /// call whose names were put in their places it is the call as it was before that.
+    pub fn written_args(&self, call: ExprRef, args: Slice) -> (&[ExprRef], &[Target]) {
+        match self.named_written.iter().find(|(held, _, _)| *held == call) {
+            Some(&(_, positional, named)) => {
+                (&self.expr_list(args)[..positional as usize], self.target_list(named))
+            }
+            None => (self.expr_list(args), self.named_args(call)),
+        }
     }
 
     /// Whether a call was written with `EXPORT_STATE` after it.

@@ -2531,6 +2531,11 @@ fn fractioned(fraction: &LogicalType, answer: LogicalType) -> LogicalType {
 
 fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
     let types = arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    no_match_spelled(name, &types)
+}
+
+/// The pin's refusal of a call no overload takes, with the argument types already written out.
+fn no_match_spelled(name: &str, types: &str) -> Error {
     let mut message = format!(
         "No function matches the given name and argument types '{name}({types})'. You might need to add explicit type casts."
     );
@@ -2543,6 +2548,19 @@ fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
         message.push('\n');
     }
     Error::binder(message)
+}
+
+/// The pin's refusal of a call whose named arguments fit none of the function's lists of
+/// parameters, or fit two of them in different orders, with each argument already spelled the way
+/// the pin spells it and a named one written `"name" := TYPE`.
+pub fn named_mismatch(name: &str, spelled: &[String], ambiguous: bool) -> Error {
+    let arguments = spelled.join(", ");
+    if !ambiguous {
+        return no_match_spelled(name, &arguments);
+    }
+    Error::binder(format!(
+        "Could not choose a best candidate function for the function call \"{name}({arguments})\". In order to select one, please add explicit type casts."
+    ))
 }
 
 /// The functions that read something off a moment, or read a moment out of text, and take nothing
