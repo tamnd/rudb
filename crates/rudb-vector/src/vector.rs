@@ -3396,12 +3396,17 @@ impl Vector {
         if !below(codes, values.len) {
             return None;
         }
-        let at = codes.iter().map(|&code| code as usize).collect::<Vec<_>>();
+        // Fixed width values are gathered straight through the codes. Only strings need the
+        // positions, and making them for every column cost as much as the gather.
+        let body = match copy_by_codes(data, codes) {
+            Some(flat) => flat,
+            None => copy_of(data, &codes.iter().map(|&code| code as usize).collect::<Vec<_>>()),
+        };
         Some(Self {
             ty: self.ty.clone(),
             len: self.len,
             validity: Validity::AllValid,
-            body: Body::Flat(copy_of(data, &at)),
+            body: Body::Flat(body),
         })
     }
 
@@ -4876,6 +4881,27 @@ pub(crate) fn placed_of(data: &Data, inverse: &[u32]) -> Data {
         };
     }
     crate::for_each_layout!(fixed, placed)
+}
+
+/// The fixed width values at `codes`, copied in one pass without making the positions first.
+/// `None` for strings and for no data, which [`copy_of`] copies.
+fn copy_by_codes(data: &Data, codes: &[u32]) -> Option<Data> {
+    macro_rules! copied {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => {
+                    let values = values.as_slice();
+                    let mut out: Vec<$native> = Vec::with_capacity(codes.len());
+                    out.extend(
+                        codes.iter().map(|&code| values.get(code as usize).copied().unwrap_or($zero)),
+                    );
+                    Some(Data::$variant(Buffer::from_vec(out)))
+                })+
+                _ => None,
+            }
+        };
+    }
+    crate::for_each_layout!(fixed, copied)
 }
 
 pub(crate) fn copy_of(data: &Data, at: &[usize]) -> Data {
