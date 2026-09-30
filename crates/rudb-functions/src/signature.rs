@@ -336,6 +336,12 @@ enum Shape {
     ListPicked(Fixed),
     /// A list of lists, and the list of their elements. `flatten`.
     Flattened,
+    /// Two lists of FLOAT or of DOUBLE folded into one number of the same type. `list_distance`,
+    /// the inner products and the cosines.
+    ///
+    /// The pin has an overload for each element type and picks the one that is cheaper to cast
+    /// both lists to, which [`folded`] works out.
+    Folded,
     /// A list, the length it should have, and what to pad it with. `list_resize`.
     ///
     /// The length is cast to UBIGINT, which is where the pin sends it, so a negative length is that
@@ -1201,6 +1207,18 @@ const TABLE: &[Entry] = &[
     list_row("list_where", 2, Shape::ListPicked(Fixed::Boolean)),
     list_row("list_select", 2, Shape::ListPicked(Fixed::BigInt)),
     list_row("flatten", 1, Shape::Flattened),
+    // The folds of two lists into a number. The aliases are rows of their own because the pin
+    // writes the name that was called in every error, and `<->` and `<=>` are only reachable as
+    // quoted names, since the pin's parser has no operator for them.
+    list_row("list_distance", 2, Shape::Folded),
+    list_row("<->", 2, Shape::Folded),
+    list_row("list_inner_product", 2, Shape::Folded),
+    list_row("list_dot_product", 2, Shape::Folded),
+    list_row("list_negative_inner_product", 2, Shape::Folded),
+    list_row("list_negative_dot_product", 2, Shape::Folded),
+    list_row("list_cosine_similarity", 2, Shape::Folded),
+    list_row("list_cosine_distance", 2, Shape::Folded),
+    list_row("<=>", 2, Shape::Folded),
     Entry {
         name: "list_sort",
         kind: FunctionKind::Scalar,
@@ -2150,6 +2168,7 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let element = deduce(entry, &element, &arguments[1])?;
             (vec![LogicalType::list(element.clone()), element], to.ty())
         }
+        Shape::Folded => folded(entry.name, arguments)?,
         Shape::ListsMet(to) => {
             let (Some(left), Some(right)) =
                 (element_of_list(&arguments[0]), element_of_list(&arguments[1]))
@@ -2687,6 +2706,54 @@ fn digested(arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)
 /// A quantile's answer, which is a list of them when the fractions are a list.
 fn fractioned(fraction: &LogicalType, answer: LogicalType) -> LogicalType {
     if matches!(fraction, LogicalType::List(_)) { LogicalType::list(answer) } else { answer }
+}
+
+/// The types a fold over two lists reads them as, and the type of its answer.
+///
+/// The pin has a FLOAT overload and a DOUBLE one and takes the one that costs less to cast both
+/// arguments to, adding up its implicit cast costs. A list that already has the element type costs
+/// nothing, any other number and the null type cost 110 to become a FLOAT and 104 to become a
+/// DOUBLE, and a DOUBLE never becomes a FLOAT. So two lists of integers are DOUBLE, a BIGINT list
+/// against a FLOAT list is FLOAT, and a bare null costs the same either way, which makes two of
+/// them the pin's ambiguity error with the DOUBLE overload listed first.
+///
+/// A string is refused. The pin casts a string literal to whichever list the other side picks,
+/// which a signature that only sees types cannot tell from a VARCHAR column, and a column is the
+/// pin's refusal.
+fn folded(name: &str, arguments: &[LogicalType]) -> Result<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{Array, Double, Float, List, Null};
+    let (mut to_float, mut to_double, mut floats) = (0, 0, true);
+    for ty in arguments {
+        let element = match ty {
+            Null => continue,
+            List(element) | Array(element, _) => &**element,
+            _ => return Err(no_match(name, arguments)),
+        };
+        match element {
+            Float => to_double += 104,
+            Double => floats = false,
+            Null => (to_float, to_double) = (to_float + 110, to_double + 104),
+            other if other.is_numeric() => {
+                (to_float, to_double) = (to_float + 110, to_double + 104);
+            }
+            _ => return Err(no_match(name, arguments)),
+        }
+    }
+    if floats && to_float == to_double {
+        let spelled = arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+        let mut message = format!(
+            "Could not choose a best candidate function for the function call \"{name}({spelled})\". In order to select one, please add explicit type casts.\n\tCandidate functions:"
+        );
+        let overloads = CANDIDATES.iter().find(|(entry, _)| *entry == name).map(|(_, rows)| *rows);
+        for overload in overloads.unwrap_or_default().iter().rev() {
+            message.push_str("\n\t");
+            message.push_str(overload);
+        }
+        message.push('\n');
+        return Err(Error::binder(message));
+    }
+    let element = if floats && to_float < to_double { Float } else { Double };
+    Ok((vec![LogicalType::list(element.clone()); arguments.len()], element))
 }
 
 fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
@@ -3679,6 +3746,69 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("decode", &["decode(col0 BLOB) -> VARCHAR", "decode(col0 BLOB, col1 VARCHAR) -> VARCHAR"]),
     ("base64", &["base64(col0 BLOB) -> VARCHAR"]),
     ("to_base64", &["to_base64(col0 BLOB) -> VARCHAR"]),
+    (
+        "list_distance",
+        &[
+            "list_distance(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_distance(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "<->",
+        &[
+            "\"<->\"(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "\"<->\"(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_inner_product",
+        &[
+            "list_inner_product(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_inner_product(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_dot_product",
+        &[
+            "list_dot_product(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_dot_product(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_negative_inner_product",
+        &[
+            "list_negative_inner_product(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_negative_inner_product(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_negative_dot_product",
+        &[
+            "list_negative_dot_product(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_negative_dot_product(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_cosine_similarity",
+        &[
+            "list_cosine_similarity(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_cosine_similarity(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "list_cosine_distance",
+        &[
+            "list_cosine_distance(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "list_cosine_distance(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
+    (
+        "<=>",
+        &[
+            "\"<=>\"(col0 FLOAT[], col1 FLOAT[]) -> FLOAT",
+            "\"<=>\"(col0 DOUBLE[], col1 DOUBLE[]) -> DOUBLE",
+        ],
+    ),
     ("length_grapheme", &["length_grapheme(col0 VARCHAR) -> BIGINT"]),
     ("left_grapheme", &["left_grapheme(col0 VARCHAR, col1 BIGINT) -> VARCHAR"]),
     ("right_grapheme", &["right_grapheme(col0 VARCHAR, col1 BIGINT) -> VARCHAR"]),
@@ -4299,6 +4429,7 @@ impl Shape {
                 (leading(1, SAME_LIST, picks), SAME_LIST)
             }
             Self::Flattened => (all("T[][]"), SAME_LIST),
+            Self::Folded => (all(SAME_LIST), SAME),
             Self::Resized => (leading(1, ANY_LIST, ANY), ANY_LIST),
             Self::Sorted => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
             Self::Graded => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
@@ -4868,6 +4999,9 @@ mod tests {
                         arguments = vec![strings(), LogicalType::list(by.ty())]
                     }
                     Shape::Flattened => arguments = vec![LogicalType::list(strings())],
+                    Shape::Folded => {
+                        arguments = vec![LogicalType::list(LogicalType::Double); count]
+                    }
                     Shape::Resized => arguments[0] = strings(),
                     Shape::Ranged => arguments = vec![LogicalType::BigInt; count],
                     Shape::Continuous | Shape::Deviation => {
