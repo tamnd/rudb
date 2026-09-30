@@ -62,6 +62,17 @@ pub fn current(reader: &Reader) -> bool {
             held.kind == *section::TEXT_GRAMS
                 && u64::try_from(column) == Ok(held.id)
                 && held.current(table.generation())
+                && (held.extents == 0
+                    || reader.extents(held).is_ok_and(|extents| {
+                        // A column decided against holds no bytes and states in its header what
+                        // the sketch would have cost, which is as many rows as it was decided over.
+                        let bytes = match extents.iter().map(|one| u64::from(one.length)).sum() {
+                            0 if held.header_bytes == u32::MAX => return true,
+                            0 => u64::from(held.header_bytes),
+                            bytes => bytes,
+                        };
+                        crate::postings::enough(bytes / 8, table.rows())
+                    }))
         })
     })
 }
@@ -162,15 +173,17 @@ pub fn text_grams(reader: &Reader, column: usize) -> Option<Vec<u64>> {
         return None;
     }
     let bytes = reader.payload(held).ok()?;
-    if bytes.len() != table.rows().checked_mul(8)? {
+    if bytes.is_empty() || bytes.len() % 8 != 0 || bytes.len() > table.rows().checked_mul(8)? {
         return None;
     }
-    Some(
-        bytes
-            .chunks_exact(8)
-            .map(|word| u64::from_le_bytes(word.try_into().unwrap_or_default()))
-            .collect(),
-    )
+    let mut words = bytes
+        .chunks_exact(8)
+        .map(|word| u64::from_le_bytes(word.try_into().unwrap_or_default()))
+        .collect::<Vec<_>>();
+    // Rows after the ones the sketch was built over, which a table extended since has, get a word
+    // with every bit set, which rules nothing out and sends them to be walked.
+    words.resize(table.rows(), u64::MAX);
+    Some(words)
 }
 
 fn text_columns(reader: &Reader) -> impl Iterator<Item = usize> + '_ {

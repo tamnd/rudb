@@ -64,8 +64,20 @@ pub fn current(reader: &Reader) -> bool {
             held.kind == *section::VALUE_ROWS
                 && u64::try_from(column) == Ok(held.id)
                 && held.current(table.generation())
+                && (held.extents == 0
+                    || covered(reader, held).is_some_and(|rows| enough(rows, table.rows())))
         })
     })
+}
+
+/// Whether a section built over the first `covered` rows of a table of `rows` is still worth
+/// reading rather than building again. A table extended since the section was built has rows it
+/// does not cover, which a reader has to take as rows that may hold anything, and a checkpoint
+/// builds it again once they are a quarter of the table. Waiting for a quarter is what keeps
+/// the rebuild paid for: it reads the whole table, and it comes once the table has grown by a
+/// third since the last one.
+pub(crate) fn enough(covered: u64, rows: usize) -> bool {
+    covered.saturating_mul(4) >= (rows as u64).saturating_mul(3)
 }
 
 /// Records every coded text column of a table and attaches them in one commit.
@@ -395,8 +407,26 @@ pub fn value_rows(reader: &Reader, column: usize) -> Option<ValueRows> {
     if !held.usable(table.generation()) {
         return None;
     }
-    let parsed = ValueRows::parse(reader.payload(held).ok()?)?;
-    (parsed.rows == table.rows() as u64).then_some(parsed)
+    let mut parsed = ValueRows::parse(reader.payload(held).ok()?)?;
+    let rows = table.rows() as u64;
+    // Rows after the ones the section was built over, which a table extended since has, are rows
+    // it knows nothing about, the same as the rows of a part the dictionary does not code.
+    if parsed.rows < rows {
+        parsed.whole.push((parsed.rows, rows - parsed.rows));
+        parsed.rows = rows;
+    }
+    (parsed.rows == rows).then_some(parsed)
+}
+
+/// The rows a value rows section was built over, from the front of its payload. A record of one
+/// decided against holds no bytes and stands as it is, since what it would cost grows with the
+/// table and the budget does not.
+fn covered(reader: &Reader, held: &section::Section) -> Option<u64> {
+    let head = reader.payload_head(held, 8).ok()?;
+    if head.is_empty() {
+        return Some(u64::MAX);
+    }
+    Some(u64::from_le_bytes(head.get(..8)?.try_into().ok()?))
 }
 
 fn coded_columns(reader: &Reader) -> impl Iterator<Item = usize> + '_ {
