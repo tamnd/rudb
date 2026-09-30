@@ -15,7 +15,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::panic::Location;
 
 use crate::eval;
-use crate::func::{A16, Const, DEAD, INV, Inst, NT, header};
+use crate::func::{A16, Const, DEAD, INV, NT, header};
 use crate::{Block, BlockData, Class, Form, Func, Op, Site, Ty, Val, ValInfo};
 
 impl Func {
@@ -38,7 +38,11 @@ impl Func {
 
     /// Adds an empty block.
     pub fn add_block(&mut self) -> Block {
-        self.blocks.push(BlockData::default());
+        // Room for a dozen or so instructions from the start, so a block's code is not grown
+        // again and again as the generator appends to it.
+        let code = Vec::with_capacity(64);
+        let prov = Vec::with_capacity(16);
+        self.blocks.push(BlockData { code, prov, ..BlockData::default() });
         Block((self.blocks.len() - 1) as u32)
     }
 
@@ -85,7 +89,7 @@ pub struct Builder {
     plan: u32,
     sites: HashMap<(usize, u32), u32, Quick>,
     consts: HashMap<Const, Val, Quick>,
-    cse: HashMap<Box<[u32]>, (Block, Val), Quick>,
+    cse: HashMap<Key, (Block, Val), Quick>,
     key: Vec<u32>,
     fold: bool,
 }
@@ -93,6 +97,29 @@ pub struct Builder {
 /// The builder's maps are keyed by what the generator made, never by user data, so they hash
 /// with a multiply and rotate instead of `SipHash`.
 type Quick = BuildHasherDefault<Mix>;
+
+/// The most words of an instruction a CSE key holds in place.
+const SHORT: usize = 6;
+
+/// A CSE key: an instruction's header and operands. Nearly every pure instruction has a header
+/// and at most five operands, so its key is kept in place and not boxed, which saved an
+/// allocation for each one the generator appended.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum Key {
+    Short(u8, [u32; SHORT]),
+    Long(Box<[u32]>),
+}
+
+impl Key {
+    fn of(words: &[u32]) -> Key {
+        if words.len() > SHORT {
+            return Key::Long(words.into());
+        }
+        let mut short = [0; SHORT];
+        short[..words.len()].copy_from_slice(words);
+        Key::Short(words.len() as u8, short)
+    }
+}
 
 #[derive(Default)]
 struct Mix(u64);
@@ -340,7 +367,7 @@ impl Builder {
             self.key.clear();
             self.key.push(header(op, ty, flags, ops.len()));
             self.key.extend_from_slice(ops);
-            if let Some(&(b, v)) = self.cse.get(self.key.as_slice())
+            if let Some(&(b, v)) = self.cse.get(&Key::of(&self.key))
                 && (b == self.cur || b == Block(0))
             {
                 return Some(v);
@@ -350,7 +377,7 @@ impl Builder {
         let site = self.site();
         self.f.push(self.cur, op, ty, flags, result, ops, site);
         if cse && let Some(v) = result {
-            self.cse.insert(self.key.as_slice().into(), (self.cur, v));
+            self.cse.insert(Key::of(&self.key), (self.cur, v));
         }
         result
     }
@@ -702,9 +729,10 @@ impl Builder {
         let mut ops = vec![proxy];
         ops.extend(args.iter().map(|v| v.0));
         if self.fold && p.pure && !p.mayfail {
-            let key: Box<[u32]> = std::iter::once(header(Op::Rtcall, p.ret, 0, ops.len()))
+            let words: Vec<u32> = std::iter::once(header(Op::Rtcall, p.ret, 0, ops.len()))
                 .chain(ops.iter().copied())
                 .collect();
+            let key = Key::of(&words);
             if let Some(&(b, v)) = self.cse.get(&key)
                 && (b == self.cur || b == Block(0))
             {
@@ -783,14 +811,17 @@ pub fn dce(f: &mut Func) -> usize {
     }
     let mut removed = 0;
     let mut dead = Vec::new();
+    let mut starts = Vec::new();
     // Removing one instruction can free its operands, so sweep until nothing changes. Each sweep
     // walks blocks backwards, which catches a chain inside one block in a single sweep.
     loop {
         let mut changed = false;
         for b in (0..f.blocks.len()).rev() {
             dead.clear();
-            let insts: Vec<Inst<'_>> = f.insts(Block(b as u32)).collect();
-            for inst in insts.iter().rev() {
+            starts.clear();
+            starts.extend(f.insts(Block(b as u32)).map(|inst| inst.at));
+            for &at in starts.iter().rev() {
+                let Some(inst) = f.inst_at(Block(b as u32), at) else { continue };
                 if inst.dead() {
                     continue;
                 }
