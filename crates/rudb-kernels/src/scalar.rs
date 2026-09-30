@@ -4217,6 +4217,24 @@ pub fn call_values(
         ("from_base64", [Value::Varchar(text)]) => {
             Ok(Value::Blob(crate::codec::from_base64(text)?))
         }
+        ("length_grapheme", [Value::Varchar(text)]) => {
+            Ok(Value::BigInt(crate::graphemes::count(text)))
+        }
+        ("reverse", [Value::Varchar(text)]) => Ok(Value::Varchar(crate::graphemes::reverse(text))),
+        ("left_grapheme", [Value::Varchar(text), Value::BigInt(count)]) => {
+            Ok(Value::Varchar(crate::graphemes::left(text, *count)?.to_string()))
+        }
+        ("right_grapheme", [Value::Varchar(text), Value::BigInt(count)]) => {
+            Ok(Value::Varchar(crate::graphemes::right(text, *count)?.to_string()))
+        }
+        ("substring_grapheme", [Value::Varchar(text), Value::BigInt(offset)]) => {
+            Ok(Value::Varchar(crate::graphemes::substring_rest(text, *offset)?.to_string()))
+        }
+        (
+            "substring_grapheme",
+            [Value::Varchar(text), Value::BigInt(offset), Value::BigInt(length)],
+        ) => Ok(Value::Varchar(crate::graphemes::substring(text, *offset, *length)?.to_string())),
+        ("regexp_escape", [Value::Varchar(text)]) => Ok(crate::strings::regexp_escape(text)),
         ("parse_formatted_bytes", [Value::Varchar(text)]) => {
             Ok(Value::UBigInt(crate::bytes::parse_formatted_bytes(text)?))
         }
