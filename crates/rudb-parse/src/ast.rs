@@ -988,6 +988,14 @@ pub enum Expr {
         /// other expression and name pair already lives in.
         replacements: Slice,
     },
+    /// `COLUMNS(...)`, which stands for one column at a time of the set its argument picks, and
+    /// `*COLUMNS(...)`, which stands for all of them at once as the arguments of a call.
+    Columns {
+        /// A star, a regex, a list of names or a lambda over the names.
+        inner: ExprRef,
+        /// Whether it was written with the star in front.
+        unpacked: bool,
+    },
     /// A column reference, qualified or not.
     Column {
         /// The name, as a run of [`StrRef`], outermost first, so `s.t.a` is three parts.
@@ -1431,6 +1439,19 @@ pub struct Ast {
     /// The aggregate calls written with `EXPORT_STATE` after them, which answer with the state
     /// they reached rather than with their result.
     pub exported: Vec<ExprRef>,
+    /// The `EXCLUDE` and `RENAME` lists of the stars written with either, beside the star they
+    /// belong to. Kept to one side because a star with neither is by far the usual one.
+    pub star_lists: Vec<(ExprRef, StarLists)>,
+}
+
+/// The `EXCLUDE` and `RENAME` lists of one star.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StarLists {
+    /// The columns left out, as a run of qualified names in the name list arena.
+    pub exclude: Slice,
+    /// The columns renamed, as a run of [`Target`] whose expression is a column reference to the
+    /// column and whose alias is the new name.
+    pub renames: Slice,
 }
 
 impl Ast {
@@ -1546,6 +1567,14 @@ impl Ast {
             .iter()
             .find(|(held, _)| *held == call)
             .map_or(&[], |&(_, slice)| self.order_list(slice))
+    }
+
+    /// The `EXCLUDE` and `RENAME` lists of a star, both empty for a star written with neither.
+    pub fn star_lists(&self, star: ExprRef) -> StarLists {
+        self.star_lists
+            .iter()
+            .find(|(held, _)| *held == star)
+            .map_or_else(StarLists::default, |&(_, lists)| lists)
     }
 
     /// Whether a list was written `ARRAY[...]`.

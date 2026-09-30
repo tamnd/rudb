@@ -344,7 +344,10 @@ pub fn expression(ast: &Ast, index: ExprRef) -> String {
 /// One expression.
 fn expr(ast: &Ast, index: ExprRef) -> String {
     match ast.expr(index) {
-        Expr::Star { qualifier, replacements } => star(ast, qualifier, replacements),
+        Expr::Star { qualifier, replacements } => star(ast, index, qualifier, replacements),
+        Expr::Columns { inner, unpacked } => {
+            format!("{}COLUMNS({})", if unpacked { "*" } else { "" }, expr(ast, inner))
+        }
         Expr::Column { name } => parts(ast, name),
         Expr::Literal { kind, text } => literal(ast, kind, text),
         Expr::Unary { op, operand } => unary(ast, op, operand),
@@ -438,13 +441,24 @@ fn negated_comparison(op: BinaryOp) -> BinaryOp {
 }
 
 /// A star, with the qualifier and the replace list it may have been written with.
-fn star(ast: &Ast, qualifier: Slice, replacements: Slice) -> String {
+fn star(ast: &Ast, index: ExprRef, qualifier: Slice, replacements: Slice) -> String {
     let mut out =
         if qualifier.is_empty() { "*".to_string() } else { format!("{}.*", parts(ast, qualifier)) };
+    let lists = ast.star_lists(index);
+    if !lists.exclude.is_empty() {
+        let written: Vec<String> =
+            ast.name_list(lists.exclude).iter().map(|&name| parts(ast, name)).collect();
+        out += &format!(" EXCLUDE ({})", written.join(", "));
+    }
     if !replacements.is_empty() {
         let written: Vec<String> =
             ast.target_list(replacements).iter().map(|target| aliased(ast, target)).collect();
         out += &format!(" REPLACE ({})", written.join(", "));
+    }
+    if !lists.renames.is_empty() {
+        let written: Vec<String> =
+            ast.target_list(lists.renames).iter().map(|target| aliased(ast, target)).collect();
+        out += &format!(" RENAME ({})", written.join(", "));
     }
     out
 }

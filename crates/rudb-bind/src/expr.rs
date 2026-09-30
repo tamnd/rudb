@@ -87,9 +87,15 @@ impl Binder<'_> {
             return Err(Error::binder("TRY can not be used in combination with a scalar subquery"));
         }
         match written {
-            ast::Expr::Star { .. } => {
-                Err(Error::binder(format!("* is not allowed in the {}", self.clause)))
+            ast::Expr::Star { .. } if self.star_name.is_some() => {
+                let name = self.star_name.clone().unwrap_or_default();
+                Ok(self.add_constant(Value::Varchar(name)))
             }
+            ast::Expr::Star { .. } => match self.star_names(ast, expr)? {
+                Some(names) => Ok(names),
+                None => Err(Error::binder(format!("* is not allowed in the {}", self.clause))),
+            },
+            ast::Expr::Columns { .. } => self.bind_picked(ast, scope),
             ast::Expr::Column { name } => self.bind_column(ast, name, scope),
             ast::Expr::Literal { kind, text } => self.bind_literal(ast, kind, text),
             ast::Expr::Unary { op, operand } => self.bind_unary(ast, op, operand, scope),
@@ -463,6 +469,12 @@ impl Binder<'_> {
             }
         }
         let Some((at, binding, ty)) = found else {
+            if self.columns_scope.is_some() {
+                return Err(Error::binder(format!(
+                    "Failed to bind \"{}\" - COLUMNS expression can only contain lambda parameters",
+                    parts.join(".")
+                )));
+            }
             if let Some(field) = self.struct_path(parts, scope)? {
                 return Ok(field);
             }
@@ -722,7 +734,8 @@ impl Binder<'_> {
             matches!(ast.expr(arg), ast::Expr::Star { qualifier, replacements }
                 if qualifier.is_empty() && replacements.is_empty())
         });
-        if starred {
+        // Inside the argument of a `COLUMNS` a star is the list of names it stands for.
+        if starred && self.columns_scope.is_none() && self.star_name.is_none() {
             if !rudb_catalog::same_name(&written, "count") || arguments.len() != 1 {
                 return Err(Error::binder(format!("* is not allowed in {written}()")));
             }
@@ -1639,6 +1652,7 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
     }
     match ast.expr(expr) {
         ast::Expr::Star { .. }
+        | ast::Expr::Columns { .. }
         | ast::Expr::Column { .. }
         | ast::Expr::Literal { .. }
         | ast::Expr::Parameter { .. }
@@ -1781,6 +1795,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             }
         }
         ast::Expr::Column { name } => quoted(ast.name(name).last().unwrap_or_default()),
+        ast::Expr::Columns { .. } => rudb_parse::deparse::expression(ast, expr),
         // The deparser is the answer for a window and not an approximation of one. Every other
         // shape here is written out again because the name DuckDB gives it is not quite what its
         // own deparser would write, and a window is the one where the two agree.

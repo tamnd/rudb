@@ -25,8 +25,8 @@ use crate::ast::{
     AlterAction, Ast, Attach, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, Constraint,
     CopyTo, CreateTable, CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert,
     JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope,
-    Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement, StrRef, Target,
-    Transaction, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
+    Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, StarLists, Statement, StrRef,
+    Target, Transaction, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -3603,6 +3603,7 @@ impl<'a> Transform<'a> {
                     return Ok(self.push(Expr::Column { name }));
                 }
                 "StarExpression" => return self.star(node),
+                "ColumnsExpression" => return self.columns(node),
                 "NumberLiteral" => {
                     let text = self.text(node).to_string();
                     let text = self.intern(&text);
@@ -4069,20 +4070,102 @@ impl<'a> Transform<'a> {
     }
 
     /// `StarExpression <- StarQualifierList? '*' ExcludeList? ReplaceList? RenameList?`.
+    ///
+    /// A name may sit in only one of the three lists and only once in the exclude list, which the
+    /// pin decides here as a Parser Error because it needs no table to decide. A rename written
+    /// twice is not refused, and the later one wins.
     fn star(&mut self, node: u32) -> Result<ExprRef> {
-        for name in ["ExcludeList", "RenameList"] {
-            let list = self.find(node, name);
-            if list != NONE {
-                return self.unsupported(list);
-            }
-        }
         let replace = self.find(node, "ReplaceList");
         let replacements =
             if replace == NONE { Slice::default() } else { self.replacements(replace)? };
         let qualifier = self.find(node, "StarQualifierList");
         let qualifier =
             if qualifier == NONE { Slice::default() } else { self.name_parts(qualifier) };
-        Ok(self.push(Expr::Star { qualifier, replacements }))
+        let exclude = self.find(node, "ExcludeList");
+        let exclude = if exclude == NONE { Vec::new() } else { self.star_names(exclude) };
+        let rename = self.find(node, "RenameList");
+        let renames = if rename == NONE { Vec::new() } else { self.star_names(rename) };
+        let text = |ast: &Ast, name: Slice| ast.name(name).collect::<Vec<_>>().join(".");
+        for (at, &name) in exclude.iter().enumerate() {
+            let written = text(&self.ast, name);
+            if exclude[..at]
+                .iter()
+                .any(|&seen| text(&self.ast, seen).eq_ignore_ascii_case(&written))
+            {
+                return Err(Error::parser(format!(
+                    "Duplicate entry \"{written}\" in EXCLUDE list"
+                )));
+            }
+        }
+        let replaced: Vec<String> = self
+            .ast
+            .target_list(replacements)
+            .iter()
+            .map(|target| self.ast.string(target.alias).to_string())
+            .collect();
+        let mut targets = Vec::with_capacity(renames.len() / 2);
+        for pair in renames.chunks(2) {
+            let [from, to] = *pair else { break };
+            let written = text(&self.ast, from);
+            if exclude.iter().any(|&seen| text(&self.ast, seen).eq_ignore_ascii_case(&written)) {
+                return Err(Error::parser(format!(
+                    "Column \"{written}\" cannot occur in both EXCLUDE and RENAME list"
+                )));
+            }
+            if replaced.iter().any(|seen| seen.eq_ignore_ascii_case(&written)) {
+                return Err(Error::parser(format!(
+                    "Column \"{written}\" cannot occur in both REPLACE and RENAME list"
+                )));
+            }
+            let expr = self.push(Expr::Column { name: from });
+            let alias = self.ast.name(to).last().map(str::to_string).unwrap_or_default();
+            let alias = self.intern(&alias);
+            targets.push(Target { expr, alias });
+        }
+        let star = self.push(Expr::Star { qualifier, replacements });
+        if !exclude.is_empty() || !targets.is_empty() {
+            let exclude = self.name_list_slice(exclude);
+            let renames = self.target_slice(targets);
+            self.ast.star_lists.push((star, StarLists { exclude, renames }));
+        }
+        Ok(star)
+    }
+
+    /// The names under an `ExcludeList` or a `RenameList`, in the order they were written. A rename
+    /// entry gives two, the column and then its new name.
+    fn star_names(&mut self, node: u32) -> Vec<Slice> {
+        let mut found = Vec::new();
+        self.collect_star_names(node, &mut found);
+        found.into_iter().map(|name| self.name_parts(name)).collect()
+    }
+
+    fn collect_star_names(&self, node: u32, found: &mut Vec<u32>) {
+        for kid in self.kids(node).collect::<Vec<_>>() {
+            match self.name(kid) {
+                "ExcludeName" | "Identifier" => found.push(kid),
+                _ => self.collect_star_names(kid, found),
+            }
+        }
+    }
+
+    /// `ColumnsExpression <- StarSymbol? 'COLUMNS' Parens(Expression)`.
+    fn columns(&mut self, node: u32) -> Result<ExprRef> {
+        let unpacked = self.find(node, "StarSymbol") != NONE;
+        let Some(inner) = self.kids(node).filter(|&kid| self.name(kid) != "StarSymbol").last()
+        else {
+            return self.unsupported(node);
+        };
+        let mut inner = self.expr(inner)?;
+        // A lambda picks the names it is true of, which the pin writes as a filter over the list a
+        // star stands for.
+        if matches!(self.ast.expr(inner), Expr::Lambda { .. }) {
+            let star = self
+                .push(Expr::Star { qualifier: Slice::default(), replacements: Slice::default() });
+            let name = self.function_name("list_filter");
+            let args = self.expr_slice(vec![star, inner]);
+            inner = self.push(Expr::Function { name, args, distinct: false, filter: NONE });
+        }
+        Ok(self.push(Expr::Columns { inner, unpacked }))
     }
 
     /// `ReplaceList <- 'REPLACE' ReplaceEntries`, where an entry is `Expression 'AS'
@@ -5456,6 +5539,9 @@ mod tests {
             ast.expr_list(slice).iter().map(|&item| show(ast, item)).collect::<Vec<_>>().join(", ")
         };
         match ast.expr(expr) {
+            Expr::Columns { inner, unpacked } => {
+                format!("{}COLUMNS({})", if unpacked { "*" } else { "" }, show(ast, inner))
+            }
             Expr::Star { qualifier, replacements } => {
                 let star = if qualifier.is_empty() {
                     "*".to_string()
@@ -7066,10 +7152,7 @@ mod tests {
     /// Per #313.
     #[test]
     fn a_keyword_is_not_stepped_through_on_the_way_to_its_one_argument() {
-        for (sql, rule) in [
-            ("SELECT unpack([1])", "UnpackExpression"),
-            ("SELECT columns('a')", "ColumnsExpression"),
-        ] {
+        for (sql, rule) in [("SELECT unpack([1])", "UnpackExpression")] {
             let error = parse_ast(sql).expect_err(sql);
             assert!(error.message().ends_with(rule), "{sql}: {error}");
         }

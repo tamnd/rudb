@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod binder;
+mod columns;
 mod context;
 mod expr;
 pub mod fold;

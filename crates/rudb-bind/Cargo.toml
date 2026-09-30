@@ -17,6 +17,7 @@ rudb-common.workspace = true
 rudb-vector.workspace = true
 rudb-parse.workspace = true
 rudb-kernels.workspace = true
+rudb-regex.workspace = true
 rudb-plan.workspace = true
 rudb-catalog.workspace = true
 rudb-functions.workspace = true
