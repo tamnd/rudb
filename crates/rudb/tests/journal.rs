@@ -67,7 +67,7 @@ fn inserted_rows_survive_a_crash_before_any_checkpoint_and_replay_once() {
     assert_eq!(want[0][1], Value::Varchar("one".into()));
     assert_eq!(want[1][1], Value::Null);
     assert_eq!(want[2][1], Value::Varchar("three".into()));
-    assert_eq!(segments(&path), 0, "the open checkpointed what it replayed");
+    assert!(segments(&path) > 0, "the open left the log it replayed for the next checkpoint");
     db.execute("INSERT INTO t VALUES (4, 'four', 4.00, NULL, NULL)").expect("inserts");
     crash(db);
 

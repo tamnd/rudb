@@ -1399,15 +1399,14 @@ impl Database {
             }
             anchor = native.log_anchor().cloned();
         }
-        // What the log committed after the file's last checkpoint goes back into the tables, and
-        // a database that may write checkpoints it straight away, so the log it replayed can go.
+        // What the log committed after the file's last checkpoint goes back into the tables. The
+        // log stays until the next checkpoint writes those rows, which is what keeps an open after
+        // a crash to the time it takes to read the log: checkpointing a gigabyte of replayed rows
+        // here made the first query wait minutes. A commit after this opens a new segment after
+        // the replayed ones, so a second crash replays both.
         let (journal, changes) = Journal::recover(&path, anchor.as_ref(), writable)?;
-        let replayed = !changes.is_empty();
         replay_changes(&mut catalog, changes)?;
-        let mut journal = writable.then_some(journal);
-        if replayed && writable {
-            persist_main(&path, &mut catalog, &pages, &mut journal, false)?;
-        }
+        let journal = writable.then_some(journal);
         let memory = Memory::new(config.memory_limit());
         let pool = runtime(&config);
         let settings = Settings::new(config);
