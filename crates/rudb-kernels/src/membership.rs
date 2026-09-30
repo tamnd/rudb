@@ -360,6 +360,20 @@ pub fn in_set(input: &Vector, members: &Members, returns: &LogicalType) -> Resul
             if codes.len() < rows {
                 return row_at_a_time(input, members, &base, rows, returns);
             }
+            // A dictionary of the chunk's own, or one the memo above was not built on, is still
+            // asked once a value where it has fewer values than the chunk has rows. On JOB 12a the
+            // chunks of `movie_info.info` come with their own dictionaries, and comparing a string
+            // a row was a fifth of the query.
+            if let (Held::Text(set), Some(Data::Varlen(column))) = (&members.held, values.data())
+                && values.len() < rows
+            {
+                let found: Vec<bool> = (0..values.len())
+                    .map(|value| column.bytes(value).is_some_and(|text| set.contains(text)))
+                    .collect();
+                return answer(rows, &base, members, returns, |index| {
+                    found.get(codes[index] as usize).copied().unwrap_or(false)
+                });
+            }
             let at = move |index: usize| codes[index] as usize;
             match (values.data(), values.packed_parts()) {
                 (Some(data), _) => look(data, at, members, &base, rows, returns),

@@ -175,6 +175,31 @@ pub struct Linked {
     /// not stored in the order of that column. See `../../spec/graph/12-the-order-the-suite-asks-for.md`
     /// section 12.5.
     pub monotone: bool,
+    /// How far the child's dates sit from the parent's, per pair of date columns, as the build
+    /// measured them over every child row that found a parent. Empty for a relationship with no
+    /// link, since a span is only true of the pairs a link joins. See [`crate::span`].
+    pub spans: Vec<Span>,
+}
+
+/// One pair of date columns across a relationship and how far apart they ever are, in days.
+///
+/// `lineitem(l_shipdate) - orders(o_orderdate)` is 1 to 121 at every TPC-H scale. The file stores
+/// it by column position and the catalog turns that into names, which is what a plan reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    /// The child table's column.
+    pub child_column: String,
+    /// The parent table's column.
+    pub parent_column: String,
+    /// The smallest `child - parent`.
+    pub low: i64,
+    /// The largest.
+    pub high: i64,
+    /// Whether a test on the child's column may be carried onto the parent's, which a parent
+    /// without a date where its child has one rules out.
+    pub onto_parent: bool,
+    /// Whether a test on the parent's column may be carried onto the child's.
+    pub onto_child: bool,
 }
 
 impl Linked {
@@ -222,6 +247,7 @@ impl Linked {
             unique: false,
             second: None,
             monotone: false,
+            spans: Vec::new(),
         }
     }
 
@@ -229,6 +255,12 @@ impl Linked {
     #[must_use]
     pub fn keyed(self) -> Self {
         Self { unique: true, ..self }
+    }
+
+    /// The same relationship with the spans its build measured.
+    #[must_use]
+    pub fn spanned(self, spans: Vec<Span>) -> Self {
+        Self { spans, ..self }
     }
 
     /// The same relationship with its stored link in the monotone form.

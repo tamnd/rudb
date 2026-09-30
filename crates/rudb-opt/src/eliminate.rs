@@ -333,7 +333,7 @@ pub fn unread_side(plan: &Plan, join: NodeRef, side: NodeRef) -> bool {
 }
 
 /// The operator numbers a subtree's nodes bind their output columns to.
-fn indices(plan: &Plan, at: NodeRef, found: &mut Vec<u32>) {
+pub(crate) fn indices(plan: &Plan, at: NodeRef, found: &mut Vec<u32>) {
     if let Some(outputs) = walk::outputs(plan, at) {
         for (binding, _) in outputs {
             if !found.contains(&binding.table) {

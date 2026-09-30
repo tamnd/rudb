@@ -2662,6 +2662,33 @@ impl StableLike {
             }
             at = upto;
         }
+        // The values are copied end to end and searched once, for the reason on `like_joined`.
+        // Asking a value at a time started a search per title on JOB 14b, and starting them was a
+        // third of the query.
+        if let Some(joined_like) = Joined::of(like) {
+            let (mut joined, mut ends) = (Vec::new(), Vec::with_capacity(wanted.len()));
+            let mut visited = Vec::with_capacity(wanted.len());
+            let mut gather = |at: usize, text: &[u8]| {
+                joined.extend_from_slice(text);
+                ends.push(joined.len());
+                visited.push(wanted[at]);
+                Ok(())
+            };
+            if once {
+                self.dictionary.visit_text_once(&wanted, &mut gather)?;
+            } else {
+                let codes = wanted.iter().map(|&code| code as u32).collect::<Vec<_>>();
+                self.dictionary.visit_text(&codes, &mut gather)?;
+            }
+            let mut held = vec![false; ends.len()];
+            joined_like.search(&joined, &ends, &mut held);
+            for (code, held) in visited.into_iter().zip(held) {
+                let (index, shift) = Self::slot(code);
+                let pair = (1 | u64::from(held != like.negated) << 1) << shift;
+                self.word(index)?.fetch_or(pair, Ordering::Release);
+            }
+            return Ok(());
+        }
         let mut decide = |at: usize, text: &[u8]| {
             let held = like.holds_loan(text, characters)?;
             let (index, shift) = Self::slot(wanted[at]);
@@ -4129,6 +4156,9 @@ pub fn call_values(
         ("formatReadableDecimalSize", [Value::BigInt(bytes)]) => {
             Ok(Value::Varchar(crate::bytes::format_bytes(*bytes, true)))
         }
+        // The signature cast every argument after the format to a kind the formatter reads.
+        ("format", [Value::Varchar(pattern), rest @ ..]) => crate::printf::format(pattern, rest),
+        ("printf", [Value::Varchar(pattern), rest @ ..]) => crate::printf::printf(pattern, rest),
         ("parse_formatted_bytes", [Value::Varchar(text)]) => {
             Ok(Value::UBigInt(crate::bytes::parse_formatted_bytes(text)?))
         }

@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Thirty five passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
+//! Thirty seven passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
 //! is the start of it. Column pruning came first, because it is the pass whose absence is measured
 //! in gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -46,6 +46,7 @@ pub mod reorder;
 pub mod semi;
 pub mod shared;
 pub mod sides;
+pub mod span;
 pub mod tables;
 pub mod topn;
 pub mod total;
@@ -224,7 +225,7 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 35] = [
+pub static PASSES: [&(dyn Pass + Sync); 37] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -261,6 +262,7 @@ pub static PASSES: [&(dyn Pass + Sync); 35] = [
     &dense::AggregateDense,
     &cluster::AggregateCluster,
     &link::LinkJoinRewrite,
+    &span::LinkSpans,
 ];
 
 /// Every name `SET disabled_optimizers` accepts, which is every name DuckDB accepts.

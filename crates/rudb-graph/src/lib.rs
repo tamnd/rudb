@@ -38,6 +38,7 @@ pub mod link;
 pub mod rel;
 pub mod rid;
 pub mod rids;
+pub mod span;
 mod tail;
 pub mod wire;
 
@@ -49,4 +50,5 @@ pub use link::{Bounds, Counts, Cursor, Link};
 pub use rel::{Cardinality, Relationship, Side, parse_links};
 pub use rid::{NO_PARENT, PART_ROWS, Place, Places, Rid, STRIPE_PARTS};
 pub use rids::{Pushed, Rids, SPARSE_RATIO, STOP_AFTER};
+pub use span::Span;
 pub use wire::Payload;

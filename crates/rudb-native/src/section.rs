@@ -72,6 +72,10 @@ pub const SKETCHES: &[u8; 8] = b"RUDBSK1\0";
 /// are found the same way and a rebuild replaces both.
 pub const DEGREES: &[u8; 8] = b"RUDBGD1\0";
 
+/// How far a child's dates sit from its parent's, per `spec/stats/07-graph-statistics.md` section
+/// 7.9. Written by the link build beside [`DEGREES`] and under the same id, for the same reasons.
+pub const SPANS: &[u8; 8] = b"RUDBLS1\0";
+
 /// Rows sorted by one column and covering a second column. The payload holds row values,
 /// not grouped counts. A changed table generation makes the section stale.
 pub const SORTED_PROJECTION: &[u8; 8] = b"RUDBSP1\0";
@@ -107,7 +111,7 @@ pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
 /// better answer available, since this build cannot know which document invented it, and charging
 /// it to both would make every budget here tighter than the document says by an amount that depends
 /// on what some other build did.
-pub const STATISTICS_KINDS: &[&[u8; 8]] = &[SUMMARY, SKETCHES, DEGREES];
+pub const STATISTICS_KINDS: &[&[u8; 8]] = &[SUMMARY, SKETCHES, DEGREES, SPANS];
 
 /// One entry in a table's section table.
 ///
@@ -225,6 +229,7 @@ impl Section {
                 | SUMMARY
                 | SKETCHES
                 | DEGREES
+                | SPANS
                 | SORTED_PROJECTION
                 | RUN_PROJECTION
                 | TEXT_GRAMS

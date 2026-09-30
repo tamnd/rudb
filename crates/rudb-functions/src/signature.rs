@@ -778,6 +778,10 @@ const TABLE: &[Entry] = &[
         numeric_only: false,
     },
     text("parse_formatted_bytes", Arity::exactly(1), Fixed::UBigInt),
+    // The formatters, whose arguments after the format are cast by [`printed`] to the kinds the
+    // formatting library tells apart.
+    text("format", Arity::at_least(1), Fixed::Varchar),
+    text("printf", Arity::at_least(1), Fixed::Varchar),
     // Pattern matching. The transformer emits the operator spellings, so those are the names, and
     // `LIKE` is one of them rather than a keyword the binder has to know about separately.
     text("~~", Arity::exactly(2), Fixed::Boolean),
@@ -1616,6 +1620,11 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     }
     if entry.name == "parse_filename" {
         let cast_to = filename(arguments).ok_or_else(|| no_match(name, arguments))?;
+        let returns = LogicalType::Varchar;
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
+    if matches!(entry.name, "format" | "printf") {
+        let cast_to = printed(arguments).ok_or_else(|| no_match(name, arguments))?;
         let returns = LogicalType::Varchar;
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
     }
@@ -2721,6 +2730,31 @@ fn filename(arguments: &[LogicalType]) -> Option<Vec<LogicalType>> {
     }
 }
 
+/// The types `format` and `printf` read their arguments as.
+///
+/// The format has to be a string already, so `printf(1)` is refused. Every other argument is cast
+/// the way the pin's `PrintfFunction` binds it: a signed integer to a BIGINT, an unsigned one to a
+/// UBIGINT, the two 128 bit integers and a boolean and a string to themselves, any other number to
+/// a DOUBLE, and anything else to its text.
+fn printed(arguments: &[LogicalType]) -> Option<Vec<LogicalType>> {
+    use LogicalType as T;
+    let (format, rest) = arguments.split_first()?;
+    if !matches!(format, T::Varchar | T::Null) {
+        return None;
+    }
+    let mut cast_to = vec![T::Varchar];
+    cast_to.extend(rest.iter().map(|ty| match ty {
+        T::Boolean => T::Boolean,
+        T::TinyInt | T::SmallInt | T::Integer | T::BigInt => T::BigInt,
+        T::UTinyInt | T::USmallInt | T::UInteger | T::UBigInt => T::UBigInt,
+        T::HugeInt => T::HugeInt,
+        T::UHugeInt => T::UHugeInt,
+        T::Float | T::Double | T::Decimal { .. } => T::Double,
+        _ => T::Varchar,
+    }));
+    Some(cast_to)
+}
+
 /// The functions that read something off a moment, or read a moment out of text, and take nothing
 /// but the types `temporal` names.
 const READ_OFF: &[&str] = &[
@@ -3426,6 +3460,8 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("path_join", &["path_join(col0 VARCHAR, [VARCHAR...]) -> VARCHAR"]),
+    ("format", &["format(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
+    ("printf", &["printf(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
     ("format_bytes", &["format_bytes(col0 BIGINT) -> VARCHAR"]),
     ("formatReadableSize", &["formatReadableSize(col0 BIGINT) -> VARCHAR"]),
     ("formatReadableDecimalSize", &["formatReadableDecimalSize(col0 BIGINT) -> VARCHAR"]),

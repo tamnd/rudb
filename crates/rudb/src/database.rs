@@ -1434,6 +1434,17 @@ impl Database {
         Ok(Self { shared: Shared { inner: Arc::new(inner) } })
     }
 
+    /// Says that the statement about to run is the last one this database will be asked, so a
+    /// read keeps what it decodes only when the same statement reads it again.
+    ///
+    /// What a read keeps is there for the next statement, and a program that runs one statement
+    /// and exits, which is how a script or a benchmark uses the shell, never has one. The answers
+    /// do not change, and a statement after this one is still answered, only without what the
+    /// last one would have kept for it.
+    pub fn last_statement(&self) {
+        self.shared.inner.pages.last_statement();
+    }
+
     /// A connection to this database.
     #[must_use]
     pub fn connect(&self) -> Connection {
@@ -3765,11 +3776,12 @@ impl Shared {
     fn mirror(&self, wanted: &[(String, bool)]) {
         let config = self.inner.settings.config();
         for (path, binary_as_string) in wanted {
-            let added = crate::mirror::ensure(path, *binary_as_string, config).and_then(|found| {
-                let Some((stamp, reader)) = found else { return Ok(false) };
-                self.write().add_mirror(path, *binary_as_string, stamp, reader)?;
-                Ok(true)
-            });
+            let added = crate::mirror::ensure(path, *binary_as_string, config, &self.inner.pages)
+                .and_then(|found| {
+                    let Some((stamp, reader)) = found else { return Ok(false) };
+                    self.write().add_mirror(path, *binary_as_string, stamp, reader)?;
+                    Ok(true)
+                });
             if !matches!(added, Ok(true)) {
                 self.inner
                     .declined
@@ -3919,6 +3931,15 @@ impl Shared {
             let linked = match built {
                 Some(head) if head.form == rudb_graph::link::Form::Monotone => linked.monotone(),
                 _ => linked,
+            };
+            let linked = if built.is_some() && second.is_none() {
+                linked.spanned(stored_spans(
+                    catalog,
+                    (&link.child.table, child_key),
+                    (&link.parent.table, parent_key),
+                ))
+            } else {
+                linked
             };
             found.push(match second {
                 Some((child, parent)) => linked.and(child, parent),
@@ -4932,6 +4953,50 @@ fn stored_link(
         parent_column,
     };
     rudb_native::graph::stored_link_counts(child_rows, parent_rows, &edge)
+}
+
+/// The spans the child's file measured for a relationship over one column, by column name.
+///
+/// Only asked for a relationship [`stored_link`] found, so the link's binding has already been
+/// checked against the parent as it is now. A span names its columns by position, which is what the
+/// file stores, and the plan names them, so they are turned into names here against the tables the
+/// positions were measured in.
+fn stored_spans(
+    catalog: &Catalog,
+    child: (&str, &String),
+    parent: (&str, &String),
+) -> Vec<rudb_opt::link::Span> {
+    let (Some(child_table), Some(parent_table)) =
+        (table_named(catalog, child.0), table_named(catalog, parent.0))
+    else {
+        return Vec::new();
+    };
+    let (
+        rudb_catalog::table::Rows::Native(child_rows),
+        rudb_catalog::table::Rows::Native(parent_rows),
+    ) = (child_table.rows(), parent_table.rows())
+    else {
+        return Vec::new();
+    };
+    let Some(child_column) = key_in(child_table, std::slice::from_ref(child.1)) else {
+        return Vec::new();
+    };
+    let (child_fields, parent_fields) = (child_rows.table().fields(), parent_rows.table().fields());
+    rudb_native::graph::stored_spans(child_rows, child_column)
+        .into_iter()
+        .filter_map(|span| {
+            let child = child_fields.get(span.child as usize)?;
+            let parent = parent_fields.get(span.parent as usize)?;
+            Some(rudb_opt::link::Span {
+                child_column: child.name.clone(),
+                parent_column: parent.name.clone(),
+                low: span.low,
+                high: span.high,
+                onto_parent: span.onto_parent,
+                onto_child: span.onto_child,
+            })
+        })
+        .collect()
 }
 
 /// Whether the parent's file holds a key map over its key column, which says the column is a key.

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rudb_common::{LogicalType, Result, Value};
-use rudb_graph::{Adjacency, Degrees, Form, KeyMap, Keys, NO_PARENT, link, wire};
+use rudb_graph::{Adjacency, Degrees, Form, KeyMap, Keys, NO_PARENT, Rid, Span, link, span, wire};
 use rudb_vector::Chunk;
 
 use crate::section::{self, Attachment};
@@ -553,6 +553,10 @@ pub struct BuiltLink {
     /// pass that resolves every child's parent is the pass that counts degrees. They are stored in
     /// their own section and are what `rudb_links()` reports in its degree columns.
     pub degrees: Option<Degrees>,
+    /// How far each date column of the child sits from each date column of the parent, over the
+    /// rows that found a parent. Measured in the same pass as the degrees and stored beside them,
+    /// see `spec/stats/07-graph-statistics.md` section 7.9.
+    pub spans: Vec<Span>,
     /// Whether it is in the file.
     pub built: bool,
     /// What the backward adjacency takes in the file or would have, and zero when the link is
@@ -650,6 +654,7 @@ fn links_of_one_table(
                     bytes: 0,
                     table_bytes: column_bytes,
                     degrees: None,
+                    spans: Vec::new(),
                     built: false,
                     adjacency_bytes: 0,
                     adjacency: false,
@@ -788,8 +793,82 @@ fn links_of_one_table(
             bytes,
         });
     }
+    // The spans ride with the degrees and for the same reason: a span says how a relationship's
+    // dates line up, which a plan can only use when it can follow the relationship. A built link
+    // with no spans still writes an empty set, so the spans of whatever link this column had before
+    // are replaced rather than left to be read as this one's.
+    let spanned = report
+        .iter()
+        .filter(|built| built.built)
+        .map(|built| {
+            let mut bytes = Vec::with_capacity(5 + built.spans.len() * span::BYTES);
+            span::write(&built.spans, &mut bytes);
+            (built.edge.child_column, bytes)
+        })
+        .collect::<Vec<_>>();
+    for (column, bytes) in &spanned {
+        attachments.push(Attachment {
+            kind: *section::SPANS,
+            id: u64::try_from(*column).map_err(|_| invalid("column index overflow"))?,
+            flags: 0,
+            header_bytes: 0,
+            bytes,
+        });
+    }
     crate::attach(path, table, &attachments)?;
     Ok(report)
+}
+
+/// Date columns on either side of a relationship that a span is measured for, at most.
+///
+/// A span costs a read of the child column and a subtraction per linked row, so the pairs are
+/// bounded rather than the product of whatever two wide tables hold. TPC-H has three by one.
+const SPAN_PAIRS: usize = 16;
+
+/// Every span between a date column of the child and a date column of the parent.
+///
+/// The parent's dates are read once each into an array by row, which is what a row id indexes, and
+/// the child's are read once each and compared against every parent column in the same pass.
+fn spans_of(child: &Reader, parent: &Reader, parents_of: &[Rid]) -> Result<Vec<Span>> {
+    let dates = |reader: &Reader| -> Vec<usize> {
+        let fields = reader.table().fields();
+        (0..fields.len()).filter(|&at| fields[at].ty == LogicalType::Date).collect()
+    };
+    let (children, parents) = (dates(child), dates(parent));
+    if children.is_empty() || parents.is_empty() || children.len() * parents.len() > SPAN_PAIRS {
+        return Ok(Vec::new());
+    }
+    let mut held = Vec::with_capacity(parents.len());
+    for &column in &parents {
+        let mut values = Vec::with_capacity(parent.table().rows());
+        KeyColumn::new(parent, column)?.scan(&mut |value| {
+            values.push(value.and_then(|value| i64::try_from(value).ok()));
+            Ok(())
+        })?;
+        held.push(values);
+    }
+    let mut spans = Vec::new();
+    for &column in &children {
+        let mut measures = parents
+            .iter()
+            .map(|&other| span::Measure::new(column as u32, other as u32))
+            .collect::<Vec<_>>();
+        let mut row = 0;
+        KeyColumn::new(child, column)?.scan(&mut |value| {
+            let owner = parents_of.get(row).copied().unwrap_or(NO_PARENT);
+            row += 1;
+            if owner == NO_PARENT {
+                return Ok(());
+            }
+            let value = value.and_then(|value| i64::try_from(value).ok());
+            for (measure, values) in measures.iter_mut().zip(&held) {
+                measure.add(value, values.get(owner as usize).copied().flatten());
+            }
+            Ok(())
+        })?;
+        spans.extend(measures.into_iter().filter_map(span::Measure::finish));
+    }
+    Ok(spans)
 }
 
 /// A built link, its payload, and the payload of its adjacency when it has one.
@@ -843,6 +922,7 @@ fn one_link(
     // read of the child column, which the build makes twice already, so fusing would save the cheap
     // half and put a histogram inside a function whose job is to choose a form.
     let degrees = Degrees::of(&parents_of, map.len(), true);
+    let spans = spans_of(child, &parent, &parents_of).map_err(|error| error.to_string())?;
     let bytes = encode_link(&link, &parent, edge).map_err(|error| error.to_string())?;
     // A monotone link answers the backward direction itself, so the adjacency is only for the
     // packed form. It is built from the same slice the link was, a counting sort over it.
@@ -865,6 +945,7 @@ fn one_link(
             bytes: bytes.len(),
             table_bytes: 0,
             degrees: Some(degrees),
+            spans,
             built: false,
             adjacency_bytes: adjacency.as_ref().map_or(0, Vec::len),
             adjacency: false,
@@ -1193,6 +1274,28 @@ pub fn stored_degrees(child: &Reader, child_column: usize) -> Option<Degrees> {
         return None;
     }
     Degrees::read(&child.payload(held).ok()?).ok()
+}
+
+/// How far the child's dates sit from the parent's for the link on this child column, when the
+/// child table carries it.
+///
+/// Stamped with the child's generation like [`stored_degrees`], and like those it says nothing
+/// about whether the link can still be followed, which a caller asks [`stored_link_counts`] for. A
+/// span of a relationship whose parent was rewritten describes rows that are gone, so a caller that
+/// drops rows on the strength of one has to have the link's word first.
+#[must_use]
+pub fn stored_spans(child: &Reader, child_column: usize) -> Vec<Span> {
+    let table = child.table();
+    let Ok(id) = u64::try_from(child_column) else { return Vec::new() };
+    let Some(held) =
+        table.sections().iter().find(|section| section.kind == *section::SPANS && section.id == id)
+    else {
+        return Vec::new();
+    };
+    if !held.usable(table.generation()) {
+        return Vec::new();
+    }
+    child.payload(held).ok().and_then(|bytes| span::read(&bytes).ok()).unwrap_or_default()
 }
 
 /// Whether this table holds a key map over this column at its current generation.
