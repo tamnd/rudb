@@ -47,7 +47,7 @@ fn matches(read: &Committed, n: u64) -> bool {
         && read.commit.commit_ts == 100 + n
         && read.commit.dep_ts == 99 + n
         && read.records.len() == written.records()
-        && read.records.iter().map(|r| r.payload.clone()).collect::<Vec<_>>() == expected
+        && read.records.iter().map(|r| r.payload.to_vec()).collect::<Vec<_>>() == expected
         && read.records.iter().all(|r| r.header.kind == Kind::Insert && r.header.gsn == 100 + n)
 }
 
