@@ -78,7 +78,7 @@ pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32c, extend};
+    use super::{crc32c, extend, software};
 
     #[test]
     fn the_check_value_is_the_one_every_implementation_agrees_on() {
