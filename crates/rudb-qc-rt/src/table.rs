@@ -77,7 +77,7 @@ pub const LANE_BITS: u32 = 8;
 /// [`cap`](GroupTable::cap) keys without looking for it. The merge folds the rows of a key that
 /// has more than one, as it does for the keys the slots forgot, and the table looks again after,
 /// in case the keys changed.
-const MISSES: usize = 5;
+const MISSES: usize = 3;
 const BLIND_TABLES: usize = 8;
 
 /// The most rows a page of a lane holds. The first page of a lane holds [`FIRST_LANE_ROWS`] and
