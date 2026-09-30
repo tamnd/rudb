@@ -86,6 +86,11 @@ const BLIND_TABLES: usize = 8;
 const LANE_ROWS: usize = 256;
 const FIRST_LANE_ROWS: usize = 16;
 
+/// How many bytes the pages of the lanes are cut from at a time. A worker with tens of thousands
+/// of groups made a page for every lane several times over, and spent more time allocating,
+/// zeroing and freeing them one by one than on the rows.
+const SLAB_BYTES: usize = 64 << 10;
+
 /// An odd number with its bits spread out, the golden ratio in fixed point.
 pub const SPREAD: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -134,6 +139,10 @@ pub struct GroupTable {
     /// appends to a lane through these, and the table works out how full the last page is from
     /// them.
     tails: Vec<[u64; 2]>,
+    /// What the pages of the lanes are cut from, zeroed.
+    slabs: Vec<Box<[u8]>>,
+    /// The address of the first byte of the last slab no page has yet, and the address past it.
+    cut: [usize; 2],
     /// How many groups a table with lanes made before its slots were last emptied, which it no
     /// longer has an address for.
     gone: usize,
@@ -153,7 +162,8 @@ pub struct GroupTable {
 /// The rows of one lane. Where the next row goes is in the table's `tails`.
 #[derive(Debug, Default)]
 struct Lane {
-    pages: Vec<Box<[u8]>>,
+    /// The address and the length in bytes of each page, which the table's `slabs` hold.
+    pages: Vec<[usize; 2]>,
     /// How many rows the last page holds, zero before the first.
     room: usize,
 }
@@ -207,6 +217,8 @@ impl GroupTable {
             limited: None,
             lanes: Vec::new(),
             tails: Vec::new(),
+            slabs: Vec::new(),
+            cut: [0; 2],
             gone: 0,
             asked: 0,
             blind: 0,
@@ -255,8 +267,8 @@ impl GroupTable {
     #[must_use]
     pub fn lane_len(&self, lane: usize) -> usize {
         self.lanes.get(lane).map_or(0, |l| {
-            let rows = l.pages.iter().map(|p| p.len() / self.row_size).sum::<usize>();
-            let last = l.pages.last().map_or(0, |p| p.len() / self.row_size);
+            let rows = l.pages.iter().map(|p| p[1] / self.row_size).sum::<usize>();
+            let last = l.pages.last().map_or(0, |p| p[1] / self.row_size);
             rows - last + self.lane_fill(lane)
         })
     }
@@ -264,9 +276,7 @@ impl GroupTable {
     /// How many rows of the last page of lane `lane` are taken.
     fn lane_fill(&self, lane: usize) -> usize {
         match (self.lanes.get(lane).and_then(|l| l.pages.last()), self.tails.get(lane)) {
-            (Some(page), Some(&[next, _])) => {
-                (next as usize - page.as_ptr().addr()) / self.row_size
-            }
+            (Some(page), Some(&[next, _])) => (next as usize - page[0]) / self.row_size,
             _ => 0,
         }
     }
@@ -652,8 +662,8 @@ impl GroupTable {
         }
         let fill = other.lane_fill(lane);
         for (i, page) in from.pages.iter().enumerate() {
-            let rows = if i == last { fill } else { page.len() / other.row_size };
-            let base = page.as_ptr().addr();
+            let rows = if i == last { fill } else { page[1] / other.row_size };
+            let base = page[0];
             let at = |r: usize| base + r * other.row_size;
             for r in 0..rows {
                 // The rows are read in order and their slots are not, so the slot of a row a few
@@ -696,11 +706,13 @@ impl GroupTable {
     pub fn take_pages(&mut self) -> Vec<Box<[u8]>> {
         self.fill = ROWS_PER_PAGE;
         let mut pages = std::mem::take(&mut self.pages);
+        pages.append(&mut self.slabs);
         for lane in &mut self.lanes {
-            pages.append(&mut lane.pages);
+            lane.pages.clear();
             lane.room = 0;
         }
         self.tails.fill([0; 2]);
+        self.cut = [0; 2];
         pages
     }
 
@@ -761,6 +773,8 @@ impl GroupTable {
             limited: None,
             lanes: Vec::new(),
             tails: Vec::new(),
+            slabs: Vec::new(),
+            cut: [0; 2],
             gone: 0,
             asked: 0,
             blind: 0,
@@ -884,16 +898,15 @@ impl GroupTable {
     fn room(&mut self, hash: u64) -> usize {
         if !self.lanes.is_empty() {
             let at = lane_of(hash);
-            let tail = &mut self.tails[at];
-            if tail[0] == tail[1] {
-                let lane = &mut self.lanes[at];
-                let rows = (lane.room * 2).clamp(FIRST_LANE_ROWS, LANE_ROWS);
-                let mut page = vec![0u8; rows * self.row_size].into_boxed_slice();
-                let first = page.as_mut_ptr().expose_provenance() as u64;
-                *tail = [first, first + page.len() as u64];
-                lane.pages.push(page);
-                lane.room = rows;
+            if self.tails[at][0] == self.tails[at][1] {
+                let rows = (self.lanes[at].room * 2).clamp(FIRST_LANE_ROWS, LANE_ROWS);
+                let bytes = rows * self.row_size;
+                let first = self.carve(bytes);
+                self.tails[at] = [first as u64, (first + bytes) as u64];
+                self.lanes[at].pages.push([first, bytes]);
+                self.lanes[at].room = rows;
             }
+            let tail = &mut self.tails[at];
             let address = tail[0] as usize;
             tail[0] += self.row_size as u64;
             return address;
@@ -905,6 +918,19 @@ impl GroupTable {
         let at = self.fill * self.row_size;
         self.fill += 1;
         self.pages.last_mut().map_or(0, |page| page[at..].as_mut_ptr().expose_provenance())
+    }
+
+    /// The address of `bytes` zeroed bytes of the last slab, after a new slab if it has fewer left.
+    fn carve(&mut self, bytes: usize) -> usize {
+        if self.cut[1] - self.cut[0] < bytes {
+            let mut slab = vec![0u8; bytes.max(SLAB_BYTES)].into_boxed_slice();
+            let first = slab.as_mut_ptr().expose_provenance();
+            self.cut = [first, first + slab.len()];
+            self.slabs.push(slab);
+        }
+        let at = self.cut[0];
+        self.cut[0] += bytes;
+        at
     }
 
     fn add(&mut self, key: &[u8], hash: u64, heap: Option<&mut Heap>) -> usize {
