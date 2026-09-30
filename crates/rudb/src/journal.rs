@@ -308,11 +308,7 @@ impl Journal {
             }
             return Ok((journal, Vec::new()));
         };
-        let traced = std::time::Instant::now();
         let read = replay(fs.as_ref(), &dir, LANE, anchor.database)?;
-        if std::env::var_os("RUDB_TRACE_OPEN").is_some() {
-            eprintln!("trace: read and verify {:?}", traced.elapsed());
-        }
         let mut changes = Vec::new();
         for block in read.blocks {
             let ts = block.commit.commit_ts;
