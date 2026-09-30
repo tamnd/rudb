@@ -824,6 +824,13 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
     fn code_ranks(&self) -> Option<&[u32]> {
         None
     }
+    /// [`code_ranks`](Self::code_ranks) for a reader about to look up the ranks of `rows` more
+    /// codes, which a source may answer `None` to while the rows asked about so far are too few to
+    /// pay for building the map.
+    fn code_ranks_for(&self, rows: usize) -> Option<&[u32]> {
+        let _ = rows;
+        self.code_ranks()
+    }
     /// Whether another source presents the same values.
     fn equal(&self, other: &dyn TextSource) -> bool {
         self.len() == other.len()
@@ -2783,6 +2790,16 @@ impl Vector {
     pub fn code_ranks(&self) -> Option<&[u32]> {
         match &self.body {
             Body::ExternalText { source } => source.code_ranks(),
+            _ => None,
+        }
+    }
+
+    /// The rank of every value, for a reader about to look up `rows` more. See
+    /// [`TextSource::code_ranks_for`].
+    #[must_use]
+    pub fn code_ranks_for(&self, rows: usize) -> Option<&[u32]> {
+        match &self.body {
+            Body::ExternalText { source } => source.code_ranks_for(rows),
             _ => None,
         }
     }
