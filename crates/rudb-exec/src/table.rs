@@ -950,6 +950,18 @@ const KEYS: usize = 4;
 /// seventeen places with the null one, and the four keys take 3,468 places together.
 const COMBOS: usize = 4096;
 
+/// The most places the direct map covers when the key is several columns.
+///
+/// Wider than [`COMBOS`], which bounds what one column may bring, because a key of several small
+/// columns multiplies past it long before any of them is wide. TPC-H q1 grouped a step further, by
+/// its two flags and by `l_discount` and `l_tax`, is three and two dictionary values and two
+/// columns packed four bits wide, so 4 x 3 x 17 x 17 places counting each column's null place, which
+/// is 3,468. Refused at 2,048 it was hashed, and with four key columns compared a row the grouping
+/// cost about 680 instructions a row for a few hundred groups. The map is carried from one chunk to
+/// the next for as long as the pages are packed the same way, so it is cleared once a row group and
+/// sixteen thousand places of `u32` is 64 KB, which stays in the second level cache.
+const PRODUCT: usize = 1 << 14;
+
 /// The most places the direct map covers when the whole key is one dictionary.
 ///
 /// Larger than [`COMBOS`] by a factor of a hundred and twenty eight, and the reason is that one
@@ -1415,7 +1427,7 @@ pub(crate) fn coded_within<'a>(
     }
     // One column's places are the values it holds and several columns' places are their product,
     // which is why the two get different room. See [`WIDE_COMBOS`].
-    let room = if keys.len() == 1 { WIDE_COMBOS } else { COMBOS };
+    let room = if keys.len() == 1 { WIDE_COMBOS } else { PRODUCT };
     // The columns with places of their own first, because what they take out of the room is what
     // a window is allowed to be.
     let mut found = [None; KEYS];
@@ -4672,6 +4684,20 @@ mod tests {
         assert!(coded(&narrow, 2).is_some(), "their product is still inside the small bound");
     }
 
+    /// Several small columns multiply past what one column may bring, and the key of q1 grouped by
+    /// its discount and tax as well is one of those.
+    #[test]
+    fn four_small_columns_are_read_as_codes_past_one_columns_bound() {
+        let keys = [
+            wide_dictionary(3),
+            wide_dictionary(2),
+            packed_numbers(&[0, 1], 4, 0),
+            packed_numbers(&[0, 1], 4, 0),
+        ];
+        let coded = coded(&keys, 2).expect("a product of 3,468 places is read as codes");
+        assert_eq!(coded.combos(), 4 * 3 * 17 * 17);
+    }
+
     /// A wide dictionary the cheap null question cannot answer is given up rather than scanned,
     /// because that scan is a pass over the dictionary for every chunk of a few thousand rows.
     #[test]
@@ -4817,7 +4843,7 @@ mod tests {
     }
 
     /// Values further apart than the map allows are hashed, and so is a pair of columns whose
-    /// windows multiply past the small bound.
+    /// windows multiply past the bound for several columns.
     #[test]
     fn values_spread_wider_than_the_map_allows_are_refused() {
         let mut values = Widened::default();
@@ -4825,7 +4851,7 @@ mod tests {
         assert!(coded_within(&wide, 2, &[], Some(&mut values)).is_none());
         let fits = [integers(&[Some(0), Some(WIDE_COMBOS as i32 - 2)])];
         assert!(coded_within(&fits, 2, &[], Some(&mut values)).is_some());
-        let pair = [integers(&[Some(0), Some(100)]), integers(&[Some(0), Some(100)])];
+        let pair = [integers(&[Some(0), Some(200)]), integers(&[Some(0), Some(200)])];
         assert!(coded_within(&pair, 2, &[], Some(&mut values)).is_none());
         let small = [integers(&[Some(0), Some(10)]), integers(&[Some(0), Some(10)])];
         let coded = coded_within(&small, 2, &[], Some(&mut values)).expect("a product of 144");
