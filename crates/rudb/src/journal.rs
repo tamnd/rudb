@@ -395,6 +395,7 @@ impl Journal {
             staged_bytes: 0,
             dirty: false,
             anchored: self.anchored,
+            logged: 0,
         }
     }
 
