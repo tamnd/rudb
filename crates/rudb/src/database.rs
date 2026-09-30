@@ -1404,8 +1404,13 @@ impl Database {
         // a crash to the time it takes to read the log: checkpointing a gigabyte of replayed rows
         // here made the first query wait minutes. A commit after this opens a new segment after
         // the replayed ones, so a second crash replays both.
+        let traced = Instant::now();
         let (journal, changes) = Journal::recover(&path, anchor.as_ref(), writable)?;
+        let recovered = traced.elapsed();
         replay_changes(&mut catalog, changes)?;
+        if std::env::var_os("RUDB_TRACE_OPEN").is_some() {
+            eprintln!("trace: recover {recovered:?}, replay {:?}", traced.elapsed() - recovered);
+        }
         let journal = writable.then_some(journal);
         let memory = Memory::new(config.memory_limit());
         let pool = runtime(&config);
