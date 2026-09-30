@@ -293,6 +293,13 @@ impl Settings {
         *self.commit_sync.read().unwrap_or_else(|held| held.into_inner())
     }
 
+    /// The log size after which a commit checkpoints, `SET checkpoint_threshold`.
+    pub(crate) fn checkpoint_threshold(&self) -> u64 {
+        let entry = rudb_functions::setting_named("checkpoint_threshold")
+            .expect("the registry has checkpoint_threshold, which its own test checks");
+        parse_size(&self.carried(entry)).unwrap_or(16 << 20)
+    }
+
     /// What `SET visibility` left a commit showing its rows at.
     pub(crate) fn visibility(&self) -> Visibility {
         *self.visibility.read().unwrap_or_else(|held| held.into_inner())
@@ -771,7 +778,12 @@ impl Settings {
             self.carried.write().unwrap_or_else(|held| held.into_inner()).remove(entry.name);
             return Ok(());
         };
-        let written = typed(entry, value)?;
+        let mut written = typed(entry, value)?;
+        // The one knob a commit reads, so it is a size or it is refused, and it reads back the way
+        // the pin prints it.
+        if entry.name == "checkpoint_threshold" {
+            written = human(parse_size(&written)?);
+        }
         if matches!(entry.behaviour, Behaviour::DefaultOnly(_))
             && !written.eq_ignore_ascii_case(default)
         {

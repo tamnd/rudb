@@ -427,3 +427,47 @@ fn commits_from_several_connections_that_share_a_sync_all_survive_a_crash() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(wal(&path));
 }
+
+/// `checkpoint_threshold` is a size, reads back the way the pin prints one, and refuses text that
+/// is not a size.
+#[test]
+fn the_checkpoint_threshold_is_a_size_and_reads_back_like_the_pins() {
+    let db = Database::new();
+    let read = |db: &Database| db.setting("checkpoint_threshold").expect("reads back");
+    assert_eq!(read(&db), "16.0 MiB");
+    db.execute("SET wal_autocheckpoint = '1GB'").expect("sets");
+    assert_eq!(read(&db), "953.6 MiB");
+    assert!(db.execute("SET checkpoint_threshold = 'soon'").is_err(), "not a size");
+    db.execute("RESET checkpoint_threshold").expect("resets");
+    assert_eq!(read(&db), "16.0 MiB");
+}
+
+/// A commit that takes the log past `checkpoint_threshold` checkpoints, so the log never holds much
+/// more than that and an open after a crash replays only what came after the last one.
+#[test]
+fn a_log_past_the_checkpoint_threshold_is_checkpointed_and_recycled() {
+    let path = path("threshold");
+    let db = open(&path);
+    db.execute("SET checkpoint_threshold = '4KiB'").expect("sets");
+    db.execute("CREATE TABLE t (id INTEGER, name VARCHAR)").expect("creates");
+    db.execute("INSERT INTO t VALUES (0, 'zero')").expect("inserts");
+    let before = std::fs::metadata(&path).expect("the file is there").len();
+    for id in 1..=200 {
+        db.execute(&format!("INSERT INTO t VALUES ({id}, 'name {id}')")).expect("inserts");
+    }
+    assert!(
+        std::fs::metadata(&path).expect("the file is there").len() > before,
+        "the commits that passed the threshold checkpointed into the file"
+    );
+    assert!(segments(&path) <= 1, "the checkpoints recycled the segments behind them");
+    crash(db);
+
+    let db = open(&path);
+    assert_eq!(
+        rows(&db, "SELECT count(*), count(DISTINCT id), sum(id) FROM t"),
+        vec![vec![Value::BigInt(201), Value::BigInt(201), Value::HugeInt(20_100)]]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(wal(&path));
+}

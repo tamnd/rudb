@@ -3352,6 +3352,16 @@ impl Shared {
         }
     }
 
+    /// Whether the log has passed `checkpoint_threshold` since the last checkpoint.
+    fn over(&self, journal: &Journal) -> bool {
+        journal.over(self.inner.settings.checkpoint_threshold())
+    }
+
+    /// [`Self::over`], taking the journal's lock for the look.
+    fn log_full(&self) -> bool {
+        self.journal().as_ref().is_some_and(|held| self.over(held))
+    }
+
     /// Makes what the statement that just ran committed durable, which outside a transaction is
     /// every statement and inside one is the `COMMIT`.
     ///
@@ -3362,6 +3372,9 @@ impl Shared {
     /// Takes the writer lock the statement ran under, so nothing commits between the statement and
     /// this. Under `visibility = committed` the lock is let go once the block is queued and before
     /// the wait, so the next statement's block can join the same sync.
+    ///
+    /// A commit that takes the log past `checkpoint_threshold` checkpoints once its block is
+    /// durable, so what an open after a crash has to replay stays under that size.
     fn settle(&self, writing: MutexGuard<'_, ()>) -> Result<()> {
         if self.transacting() {
             return Ok(());
@@ -3376,18 +3389,24 @@ impl Shared {
         // durable the slow way.
         if !held.needs_checkpoint() {
             match held.enqueue(self.inner.settings.commit_sync()) {
-                Ok(None) => return Ok(()),
+                Ok(None) if !self.over(held) => return Ok(()),
+                Ok(None) => {}
                 Ok(Some(pending)) => {
                     if self.inner.settings.visibility() == Visibility::Committed {
                         drop(journal);
                         drop(catalog);
                         drop(writing);
-                        if pending.wait().is_ok() {
+                        let waited = pending.wait();
+                        if waited.is_ok() && !self.log_full() {
                             return Ok(());
                         }
                         let _writing = self.writing();
                         let mut catalog = self.write();
                         let mut journal = self.journal();
+                        // Another commit may have checkpointed while this one waited.
+                        if waited.is_ok() && !journal.as_ref().is_some_and(|held| self.over(held)) {
+                            return Ok(());
+                        }
                         return persist_main(
                             path,
                             &mut catalog,
@@ -3396,7 +3415,9 @@ impl Shared {
                             false,
                         );
                     }
-                    if pending.wait().is_ok() {
+                    if pending.wait().is_ok()
+                        && !journal.as_ref().is_some_and(|held| self.over(held))
+                    {
                         return Ok(());
                     }
                 }
