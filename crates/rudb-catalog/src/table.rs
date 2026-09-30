@@ -446,21 +446,46 @@ impl Rows {
             return Ok(None);
         }
         let Some(dictionary) = reader.global_dictionary(column)? else { return Ok(None) };
-        let mut least = std::collections::BinaryHeap::<(&str, u32)>::with_capacity(wanted + 1);
-        for code in 0..dictionary.len() {
-            let Some(text) = dictionary.try_text_at(code)? else { continue };
-            if least.len() == wanted && least.peek().is_some_and(|&(most, _)| text >= most) {
-                continue;
+        let text = |bytes| {
+            std::str::from_utf8(bytes)
+                .map_err(|error| Error::conversion(format!("invalid UTF-8 in VARCHAR: {error}")))
+        };
+        let mut least = Vec::with_capacity(wanted);
+        if dictionary.ranks() == Some(dictionary.len()) {
+            // The file wrote the values down in order, so the least are the first ranks that pass.
+            for rank in 0..dictionary.len() {
+                if least.len() == wanted {
+                    break;
+                }
+                let code = dictionary.code_at_rank(rank)?;
+                let Some(bytes) = dictionary.try_bytes_at(code as usize)? else { continue };
+                let value = text(bytes)?;
+                if keep(value) {
+                    least.push((value, code));
+                }
             }
-            if !keep(text) {
-                continue;
+        } else {
+            // Compared as bytes, which orders them the way the text does, and only a value that
+            // would be kept is checked as text.
+            let mut heap = std::collections::BinaryHeap::<(&[u8], u32)>::with_capacity(wanted + 1);
+            for code in 0..dictionary.len() {
+                let Some(bytes) = dictionary.try_bytes_at(code)? else { continue };
+                if heap.len() == wanted && heap.peek().is_some_and(|&(most, _)| bytes >= most) {
+                    continue;
+                }
+                if !keep(text(bytes)?) {
+                    continue;
+                }
+                let code = u32::try_from(code).map_err(|_| Error::internal("a code is wide"))?;
+                heap.push((bytes, code));
+                if heap.len() > wanted {
+                    heap.pop();
+                }
             }
-            least.push((text, u32::try_from(code).map_err(|_| Error::internal("a code is wide"))?));
-            if least.len() > wanted {
-                least.pop();
+            for (bytes, code) in heap.into_sorted_vec() {
+                least.push((text(bytes)?, code));
             }
         }
-        let least = least.into_sorted_vec();
         let mut slots = vec![NONE; dictionary.len()];
         for (slot, &(_, code)) in least.iter().enumerate() {
             slots[code as usize] = slot as u16;

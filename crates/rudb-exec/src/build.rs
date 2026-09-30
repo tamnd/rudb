@@ -1089,17 +1089,24 @@ fn native_heavy_counts(
     let mut fetched = 0;
     let mut next = 0;
     let mut batch = VECTOR_SIZE;
+    // The `n`th count so far. No count falls, so the answer's `n`th is at least this, and a
+    // value holding fewer rows cannot reach it, while every value holding as many has to be read
+    // before the answer stands. Those are taken in one go rather than by doubling.
+    let mut floor = u64::MAX;
     loop {
         ordinals.clear();
-        while next < heaviest.len() && ordinals.len() < batch {
-            ordinals
-                .extend(codes.rows_of(heaviest[next] as usize).iter().map(|&row| u64::from(row)));
+        while next < heaviest.len() {
+            let rows = codes.rows_of(heaviest[next] as usize);
+            if ordinals.len() >= batch && (rows.len() as u64) < floor {
+                break;
+            }
+            if fetched + ordinals.len() + rows.len() > HEAVY_ROWS {
+                return Ok(None);
+            }
+            ordinals.extend(rows.iter().map(|&row| u64::from(row)));
             next += 1;
         }
         fetched += ordinals.len();
-        if fetched > HEAVY_ROWS {
-            return Ok(None);
-        }
         ordinals.sort_unstable();
         count_rows(table, &types, &stored, &prepared, &ordinals, &mut counts)?;
         let rest = heaviest.get(next).map_or(lone, |&code| codes.rows_of(code as usize).len());
@@ -1116,6 +1123,7 @@ fn native_heavy_counts(
                     .collect();
                 return Ok(Some(NativePairFrequencies { entries }));
             }
+            floor = boundary;
         }
         if next == heaviest.len() {
             return Ok(None);
