@@ -409,7 +409,10 @@ impl Binder<'_> {
         }
         let entries = self.star_columns(ast, applied.star, input)?;
         let every: Vec<Visible> = entries.iter().map(|picked| picked.column.clone()).collect();
-        let pattern = deparse::expression(ast, applied.pattern);
+        let mut pattern = deparse::expression(ast, applied.pattern);
+        if applied.third != NONE {
+            pattern = format!("{pattern}, {}", deparse::expression(ast, applied.third));
+        }
         let inverse = inverse != applied.inverse;
         if !inverse
             && applied.name == "regexp_full_match"
@@ -718,6 +721,8 @@ struct Applied {
     infix: bool,
     /// Whether the pin writes it as a `NOT` around the function, as `NOT SIMILAR TO` is.
     inverse: bool,
+    /// A third argument written on a call, the escape of `like_escape(*, 'a$%', '$')`.
+    third: ast::ExprRef,
 }
 
 /// The function or operator `expr` is when its first argument is a star, the way the pin sees it.
@@ -731,6 +736,7 @@ fn star_call(ast: &Ast, expr: ast::ExprRef) -> Option<Applied> {
         arity,
         infix,
         inverse,
+        third: NONE,
     };
     let found = match ast.expr(expr) {
         ast::Expr::Binary { op, left, right } => {
@@ -776,7 +782,10 @@ fn star_call(ast: &Ast, expr: ast::ExprRef) -> Option<Applied> {
         ast::Expr::Function { name, args, .. } if (2..=3).contains(&args.len) => {
             let arguments = ast.expr_list(args);
             let written = ast.name(name).last().unwrap_or_default();
-            Some(applied(written, arguments[0], arguments[1], arguments.len(), false, false))
+            let mut found =
+                applied(written, arguments[0], arguments[1], arguments.len(), false, false);
+            found.third = arguments.get(2).copied().unwrap_or(NONE);
+            Some(found)
         }
         _ => None,
     }?;

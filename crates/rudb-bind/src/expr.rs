@@ -2195,6 +2195,7 @@ fn function_of(op: BinaryOp) -> Option<&'static str> {
         BinaryOp::NotLike => "!~~",
         BinaryOp::ILike => "~~*",
         BinaryOp::NotILike => "!~~*",
+        BinaryOp::Glob => "~~~",
         _ => return None,
     })
 }

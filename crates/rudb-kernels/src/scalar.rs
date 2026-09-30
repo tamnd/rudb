@@ -3968,6 +3968,14 @@ pub fn call_values(
         ("!~~", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, false))),
         ("~~*", [text, pattern]) => Ok(Value::Boolean(matches(text, pattern, true))),
         ("!~~*", [text, pattern]) => Ok(Value::Boolean(!matches(text, pattern, true))),
+        ("~~~", [text, pattern]) => {
+            let (text, pattern) = (text.to_string(), pattern.to_string());
+            Ok(Value::Boolean(crate::glob::glob(text.as_bytes(), pattern.as_bytes())))
+        }
+        (
+            "like_escape" | "not_like_escape" | "ilike_escape" | "not_ilike_escape",
+            [text, pattern, escape],
+        ) => escaped_like(name, text, pattern, escape),
         ("date_part" | "date_trunc", [spec, when]) => date_value(name, spec, when, returns),
         ("age", [later, earlier]) => datetime::age(later, earlier),
         ("trunc", [only]) => truncated(only),
@@ -4387,6 +4395,25 @@ fn matches(text: &Value, pattern: &Value, fold_case: bool) -> bool {
     let text: Vec<char> = text.chars().collect();
     let pattern: Vec<char> = pattern.chars().collect();
     like(&text, &pattern)
+}
+
+/// `like_escape` and its three relatives, which are `LIKE`, `NOT LIKE`, `ILIKE` and `NOT ILIKE`
+/// with an `ESCAPE` written on them. An empty escape is no escape at all.
+fn escaped_like(name: &str, text: &Value, pattern: &Value, escape: &Value) -> Result<Value> {
+    let fold_case = name.contains("ilike");
+    let Some(escape) = crate::glob::escape_char(escape)? else {
+        let held = matches(text, pattern, fold_case);
+        return Ok(Value::Boolean(held != name.starts_with("not_")));
+    };
+    let (text, pattern) = if fold_case {
+        (text.to_string().to_lowercase(), pattern.to_string().to_lowercase())
+    } else {
+        (text.to_string(), pattern.to_string())
+    };
+    let text: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let held = crate::glob::like_escaped(&text, &pattern, escape)?;
+    Ok(Value::Boolean(held != name.starts_with("not_")))
 }
 
 /// The `LIKE` walk itself, on characters that somebody else has already decoded and case folded.
