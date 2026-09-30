@@ -782,6 +782,21 @@ const TABLE: &[Entry] = &[
     // formatting library tells apart.
     text("format", Arity::at_least(1), Fixed::Varchar),
     text("printf", Arity::at_least(1), Fixed::Varchar),
+    // The functions that build a string out of pieces or rewrite one a character at a time. Each
+    // declares a list of parameter types that differs from one position to the next, so their
+    // arguments are read off by [`rewritten`] rather than by the shape.
+    text("concat_ws", Arity::at_least(2), Fixed::Varchar),
+    text("repeat", Arity::exactly(2), Fixed::Varchar),
+    text("lpad", Arity::exactly(3), Fixed::Varchar),
+    text("rpad", Arity::exactly(3), Fixed::Varchar),
+    text("ascii", Arity::exactly(1), Fixed::Integer),
+    text("unicode", Arity::exactly(1), Fixed::Integer),
+    text("ord", Arity::exactly(1), Fixed::Integer),
+    text("translate", Arity::exactly(3), Fixed::Varchar),
+    text("url_encode", Arity::exactly(1), Fixed::Varchar),
+    text("url_decode", Arity::exactly(1), Fixed::Varchar),
+    text("bar", Arity::between(3, 4), Fixed::Varchar),
+    text("to_base", Arity::between(2, 3), Fixed::Varchar),
     // Pattern matching. The transformer emits the operator spellings, so those are the names, and
     // `LIKE` is one of them rather than a keyword the binder has to know about separately.
     text("~~", Arity::exactly(2), Fixed::Boolean),
@@ -1626,6 +1641,10 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     if matches!(entry.name, "format" | "printf") {
         let cast_to = printed(arguments).ok_or_else(|| no_match(name, arguments))?;
         let returns = LogicalType::Varchar;
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
+    if let Some(read) = rewritten(entry.name, arguments) {
+        let (cast_to, returns) = read?;
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
     }
     if READ_OFF.contains(&entry.name) {
@@ -2755,6 +2774,80 @@ fn printed(arguments: &[LogicalType]) -> Option<Vec<LogicalType>> {
     Some(cast_to)
 }
 
+/// The types a string builder reads its arguments as and the type it answers, or `None` when the
+/// call is not to one of them.
+///
+/// Each of these has a fixed list of parameter types per overload in the pin. A string parameter
+/// takes a string and nothing else, so `ascii(65)` and `ascii('a'::BLOB)` are refused, and a
+/// number parameter takes a number that widens to it, so `lpad('a', 3::UTINYINT, 'x')` is answered
+/// and `lpad('a', 3::BIGINT, 'x')` is refused. A string literal in a number's place was cast by
+/// the binder before it got here, which is the pin's cast too.
+///
+/// `repeat` has three overloads and the first argument picks one. An untyped null picks the BLOB
+/// one, since that is the one the pin picks, and a fixed size array repeats into a list.
+/// `concat_ws` casts a list to a list of strings and anything else to a string, and a list of lists
+/// is the pin's binder error rather than a cast.
+fn rewritten(
+    name: &str,
+    arguments: &[LogicalType],
+) -> Option<Result<(Vec<LogicalType>, LogicalType)>> {
+    use LogicalType::{Array, BigInt, Blob, Double, Integer, List, Null, Varchar};
+    let text = |ty: &LogicalType| matches!(ty, Varchar | Null);
+    let reaches = |ty: &LogicalType, wanted: &LogicalType| match wanted {
+        Varchar => text(ty),
+        List(element) => {
+            *ty == Null || matches!(ty, List(held) | Array(held, _) if held == element)
+        }
+        _ => *ty == Null || (ty.is_numeric() && ty.promote(wanted).as_ref() == Some(wanted)),
+    };
+    let declared = |wanted: Vec<LogicalType>, returns: LogicalType| {
+        let fits = wanted.len() == arguments.len()
+            && arguments.iter().zip(&wanted).all(|(ty, wanted)| reaches(ty, wanted));
+        Some(if fits { Ok((wanted, returns)) } else { Err(no_match(name, arguments)) })
+    };
+    match name {
+        "lpad" | "rpad" => declared(vec![Varchar, Integer, Varchar], Varchar),
+        "ascii" | "unicode" | "ord" => declared(vec![Varchar], Integer),
+        "translate" => declared(vec![Varchar; 3], Varchar),
+        "url_encode" | "url_decode" => declared(vec![Varchar], Varchar),
+        "bar" => declared(vec![Double; arguments.len()], Varchar),
+        "to_base" => {
+            let mut wanted = vec![BigInt, Integer];
+            wanted.extend(arguments.iter().skip(2).map(|_| Integer));
+            declared(wanted, Varchar)
+        }
+        "repeat" => {
+            let held = match arguments.first() {
+                Some(Varchar) => Varchar,
+                Some(Blob | Null) => Blob,
+                Some(List(element) | Array(element, _)) => List(element.clone()),
+                _ => return Some(Err(no_match(name, arguments))),
+            };
+            declared(vec![held.clone(), BigInt], held)
+        }
+        "concat_ws" => {
+            let (separator, rest) = arguments.split_first()?;
+            if !text(separator) {
+                return Some(Err(no_match(name, arguments)));
+            }
+            let mut cast_to = vec![Varchar];
+            for ty in rest {
+                cast_to.push(match ty {
+                    List(element) if matches!(**element, List(_)) => {
+                        return Some(Err(Error::binder(
+                            "concat_ws() does not support nested lists".to_string(),
+                        )));
+                    }
+                    List(_) => LogicalType::list(Varchar),
+                    _ => Varchar,
+                });
+            }
+            Some(Ok((cast_to, Varchar)))
+        }
+        _ => None,
+    }
+}
+
 /// The functions that read something off a moment, or read a moment out of text, and take nothing
 /// but the types `temporal` names.
 const READ_OFF: &[&str] = &[
@@ -3461,6 +3554,37 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ),
     ("path_join", &["path_join(col0 VARCHAR, [VARCHAR...]) -> VARCHAR"]),
     ("format", &["format(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
+    ("concat_ws", &["concat_ws(col0 VARCHAR, col1 ANY, [ANY...]) -> VARCHAR"]),
+    (
+        "repeat",
+        &[
+            "repeat(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+            "repeat(col0 BLOB, col1 BIGINT) -> BLOB",
+            "repeat(col0 T[], col1 BIGINT) -> T[]",
+        ],
+    ),
+    ("lpad", &["lpad(col0 VARCHAR, col1 INTEGER, col2 VARCHAR) -> VARCHAR"]),
+    ("rpad", &["rpad(col0 VARCHAR, col1 INTEGER, col2 VARCHAR) -> VARCHAR"]),
+    ("ascii", &["ascii(col0 VARCHAR) -> INTEGER"]),
+    ("unicode", &["unicode(col0 VARCHAR) -> INTEGER"]),
+    ("ord", &["ord(col0 VARCHAR) -> INTEGER"]),
+    ("translate", &["translate(col0 VARCHAR, col1 VARCHAR, col2 VARCHAR) -> VARCHAR"]),
+    ("url_encode", &["url_encode(col0 VARCHAR) -> VARCHAR"]),
+    ("url_decode", &["url_decode(col0 VARCHAR) -> VARCHAR"]),
+    (
+        "bar",
+        &[
+            "bar(col0 DOUBLE, col1 DOUBLE, col2 DOUBLE, col3 DOUBLE) -> VARCHAR",
+            "bar(col0 DOUBLE, col1 DOUBLE, col2 DOUBLE) -> VARCHAR",
+        ],
+    ),
+    (
+        "to_base",
+        &[
+            "to_base(col0 BIGINT, col1 INTEGER) -> VARCHAR",
+            "to_base(col0 BIGINT, col1 INTEGER, col2 INTEGER) -> VARCHAR",
+        ],
+    ),
     ("printf", &["printf(col0 VARCHAR, [ANY...]) -> VARCHAR"]),
     ("format_bytes", &["format_bytes(col0 BIGINT) -> VARCHAR"]),
     ("formatReadableSize", &["formatReadableSize(col0 BIGINT) -> VARCHAR"]),
@@ -4635,6 +4759,15 @@ mod tests {
                         arguments[1] = LogicalType::Boolean;
                     }
                     _ if entry.name == "time_bucket" => arguments[1] = LogicalType::Date,
+                    _ if matches!(entry.name, "lpad" | "rpad") => {
+                        arguments[1] = LogicalType::Integer;
+                    }
+                    _ if entry.name == "repeat" => arguments[1] = LogicalType::BigInt,
+                    _ if entry.name == "bar" => arguments = vec![LogicalType::Double; count],
+                    _ if entry.name == "to_base" => {
+                        arguments = vec![LogicalType::Integer; count];
+                        arguments[0] = LogicalType::BigInt;
+                    }
                     _ if matches!(
                         entry.name,
                         "date_diff" | "datediff" | "date_sub" | "datesub"

@@ -96,6 +96,7 @@ mod shape;
 mod similarity;
 mod split;
 mod statistics;
+mod strings;
 pub mod strftime;
 pub mod strptime;
 mod structs;
