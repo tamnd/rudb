@@ -887,6 +887,28 @@ impl Binder<'_> {
         if rudb_catalog::same_name(&written, "age") && bound.len() == 1 {
             bound.insert(0, self.current_date());
         }
+        if let Some(function) = ["coalesce", "greatest", "least"]
+            .into_iter()
+            .find(|name| rudb_catalog::same_name(&written, name))
+        {
+            let kinds: Vec<Literal> = arguments
+                .iter()
+                .map(|&arg| match ast.expr(arg) {
+                    ast::Expr::Literal { kind: LiteralKind::String, .. } => Literal::Text,
+                    ast::Expr::Literal { kind: LiteralKind::Number, text }
+                        if ast.string(text).bytes().all(|byte| byte.is_ascii_digit()) =>
+                    {
+                        Literal::Integer
+                    }
+                    _ => Literal::Other,
+                })
+                .collect();
+            self.adopt_literals(function, &kinds, &mut bound)?;
+        }
+        if rudb_catalog::same_name(&written, "coalesce") && bound.len() > 1 {
+            let call = self.call(&written, bound)?;
+            return self.lazy_coalesce(call);
+        }
         // `divide` and `mod` are `//` and `%` by another name, and the pin's division by zero message
         // quotes them as called, `divide(7, 0)` rather than `(7 // 0)`. They are stored under a
         // private name so the message can tell, and a zero divisor is null under the setting the
@@ -1555,6 +1577,93 @@ impl Binder<'_> {
         LogicalType::Decimal { width, scale: kept }
     }
 
+    /// Casts the string literals among the arguments of a call that promotes across all of them to
+    /// the type the other arguments meet at, which is how the pin types `coalesce(1, '2')` as an
+    /// `INTEGER` rather than refusing it.
+    ///
+    /// The pin folds the types left to right and a string literal takes the type of whatever it
+    /// meets. Two string literals, or a string literal and a null, meet at `VARCHAR`, which is no
+    /// longer a literal, so `coalesce(NULL, '2', 3)` is still refused. `kinds` says which arguments
+    /// were literals in the query, since a constant `'2'::VARCHAR` is not one. Two types that do
+    /// not meet are refused here with the pin's sentence for the call, which names an integer
+    /// literal as `INTEGER_LITERAL` while it has not met anything yet.
+    fn adopt_literals(
+        &mut self,
+        function: &str,
+        kinds: &[Literal],
+        bound: &mut [ExprRef],
+    ) -> Result<()> {
+        let mut met: Option<(LogicalType, Literal)> = None;
+        for (&arg, &kind) in bound.iter().zip(kinds) {
+            let ty = self.plan().expr_type(arg).clone();
+            met = Some(match (met, kind) {
+                (None, _) => (ty, kind),
+                (Some((_, Literal::Text)), Literal::Text) => (LogicalType::Varchar, Literal::Other),
+                (Some((LogicalType::Null, _)), Literal::Text) => {
+                    (LogicalType::Varchar, Literal::Other)
+                }
+                (Some((before, _)), Literal::Text) => (before, Literal::Other),
+                (Some((_, Literal::Text)), _) if ty == LogicalType::Null => {
+                    (LogicalType::Varchar, Literal::Other)
+                }
+                (Some((_, Literal::Text)), _) => (ty, Literal::Other),
+                (Some((before, held)), _) => match before.promote(&ty) {
+                    Some(common) => (common, Literal::Other),
+                    None => {
+                        let name = |ty: &LogicalType, kind: Literal| match kind {
+                            Literal::Integer => "INTEGER_LITERAL".to_string(),
+                            _ => ty.to_string(),
+                        };
+                        let (left, right) = (name(&before, held), name(&ty, kind));
+                        return Err(Error::binder(if function == "coalesce" {
+                            format!(
+                                "Cannot mix values of type {left} and {right} in COALESCE operator - an explicit cast is required"
+                            )
+                        } else {
+                            format!(
+                                "Cannot combine types of {left} and {right} - an explicit cast is required"
+                            )
+                        }));
+                    }
+                },
+            });
+        }
+        let Some((target, held)) = met else { return Ok(()) };
+        if held == Literal::Text || matches!(target, LogicalType::Varchar | LogicalType::Null) {
+            return Ok(());
+        }
+        for (arg, &kind) in bound.iter_mut().zip(kinds) {
+            if kind == Literal::Text {
+                *arg = self.cast_to(*arg, &target);
+            }
+        }
+        Ok(())
+    }
+
+    /// A `coalesce` whose later arguments could fail on a row it never reads, written as the `CASE`
+    /// it means so that they are only read where every argument before them was null.
+    ///
+    /// The pin evaluates `coalesce` lazily, so `coalesce(1, 'x')` answers 1 rather than failing to
+    /// read `'x'` as a number. The kernel reads every argument of every row, which is faster and
+    /// gives the same answer whenever nothing can fail, so the `CASE` is only used when a later
+    /// argument casts text, the one conversion that fails on the data rather than on the types.
+    fn lazy_coalesce(&mut self, call: ExprRef) -> Result<ExprRef> {
+        let Expr::Function { args, .. } = *self.plan().expr(call) else { return Ok(call) };
+        let args = self.plan().expr_list(args).to_vec();
+        if !args[1..].iter().any(|&arg| casts_text(self.plan(), arg)) {
+            return Ok(call);
+        }
+        let ty = self.plan().expr_type(call).clone();
+        let (&otherwise, tested) = args.split_last().expect("more than one argument");
+        let mut arms = Vec::with_capacity(tested.len());
+        for &then in tested {
+            let when = self.against_null(CompareOp::DistinctFrom, then)?;
+            arms.push(Arm { when, then });
+        }
+        let arms = self.plan_mut().add_arms(&arms);
+        Ok(self.add_expr(Expr::Case { arms, otherwise: Some(otherwise) }, ty))
+    }
+
     /// A cast to `ty`, or the expression itself when it is already that type.
     pub(crate) fn cast_to(&mut self, expr: ExprRef, ty: &LogicalType) -> ExprRef {
         if self.plan().expr_type(expr) == ty {
@@ -1651,6 +1760,39 @@ impl Binder<'_> {
         let condition = self.as_boolean(expr, "IS")?;
         let constant = self.add_constant(Value::Boolean(wanted));
         self.compare(op, condition, constant)
+    }
+}
+
+/// What an argument of `coalesce`, `greatest` or `least` was written as, for the pin's rule that a
+/// literal takes the type it meets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Literal {
+    /// A string literal, `'2'`.
+    Text,
+    /// A whole number written out, `2`, which the pin's messages call an `INTEGER_LITERAL`.
+    Integer,
+    /// Anything else.
+    Other,
+}
+
+/// Whether an expression casts text to another type anywhere inside it, which is the conversion
+/// that can fail on one row and not the next.
+fn casts_text(plan: &Plan, expr: ExprRef) -> bool {
+    match *plan.expr(expr) {
+        Expr::Cast { input, try_cast } => {
+            (!try_cast && *plan.expr_type(input) == LogicalType::Varchar) || casts_text(plan, input)
+        }
+        Expr::Compare { left, right, .. } => casts_text(plan, left) || casts_text(plan, right),
+        Expr::Conjunction { children: args, .. } | Expr::Function { args, .. } => {
+            plan.expr_list(args).iter().any(|&arg| casts_text(plan, arg))
+        }
+        Expr::Case { arms, otherwise } => {
+            plan.arm_list(arms)
+                .iter()
+                .any(|arm| casts_text(plan, arm.when) || casts_text(plan, arm.then))
+                || otherwise.is_some_and(|otherwise| casts_text(plan, otherwise))
+        }
+        _ => false,
     }
 }
 
