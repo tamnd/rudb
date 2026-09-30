@@ -40,11 +40,14 @@
 //!
 //! # Where this sits in the sequence
 //!
-//! Right after [`crate::topn`], because what it moves is a top N and that pass is the one that makes
-//! them. Before the build side choice, which then sees the small side it made and builds on it, and
-//! before the link join rewrite, which would otherwise have replaced the join with a link read of
-//! every child row. It is governed by the same rule as join elimination, because the licence is the
-//! same certificate.
+//! After [`crate::topn`], because what it moves is a top N and that pass is the one that makes them.
+//! After [`crate::eager`] and the pass in [`crate::unique`] that turns a grouping over joined rows
+//! into a projection, because in q10 those two are what put the sums below the join to `customer`
+//! and take away the aggregate over the customer columns, and before them the top N sits on that
+//! aggregate and cannot move. Before the build side choice, which then sees the small side it made
+//! and builds on it, and before the link join rewrite, which would otherwise have replaced the join
+//! with a link read of every child row. It is governed by the same rule as join elimination,
+//! because the licence is the same certificate.
 
 use rudb_common::Result;
 use rudb_common::rules::Rule;
