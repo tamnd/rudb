@@ -25,10 +25,11 @@
 //! A column, an aggregate and a window function each answer per row or per group, so there is no one
 //! value and the answer is `None`. A volatile call is `None` for a different reason: asking twice
 //! can give two answers, so writing one of them down is a choice this has no business making. A
-//! `TIMESTAMPTZ` printed as text is `None` for a third: the text depends on the session zone, and
-//! the optimizer has no session by design.
+//! cast into or out of `TIMESTAMPTZ` is `None` for a third: the answer depends on the session zone,
+//! and the optimizer has no session by design.
 
 use rudb_common::{ErrorCode, LogicalType, Result, Value};
+use rudb_kernels::cast::reads_time_zone;
 use rudb_kernels::{Comparison, Connective, call_values, cast_value, combine, compare_values};
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan, Slice};
 use rudb_vector::Vector;
@@ -104,9 +105,7 @@ fn evaluate(plan: &Plan, expr: ExprRef, lambdas: &mut Lambdas) -> Result<Option<
             return Ok(None);
         }
         Expr::Cast { input, try_cast } => {
-            if plan.expr_type(input) == &LogicalType::TimestampTz
-                && plan.expr_type(expr) == &LogicalType::Varchar
-            {
+            if reads_time_zone(plan.expr_type(input), plan.expr_type(expr)) {
                 return Ok(None);
             }
             let Some(inner) = evaluate(plan, input, lambdas)? else { return Ok(None) };

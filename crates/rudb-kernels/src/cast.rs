@@ -171,7 +171,37 @@ fn cast_value_in_time_zone(
     {
         return Ok(Value::Varchar(value.to_string_at_offset(time_zone.offset_seconds_at(*micros))));
     }
-    cast_value(value, target, try_cast)
+    let zone = time_zone.unwrap_or_default();
+    let zoned = match (value, target) {
+        (Value::Null, _) => None,
+        (_, LogicalType::TimestampTz) if value.logical_type() != LogicalType::TimestampTz => {
+            Some(to_timestamp_tz_in(value, zone))
+        }
+        (Value::TimestampTz(micros), LogicalType::Timestamp | LogicalType::Date)
+        | (
+            Value::TimestampTz(micros),
+            LogicalType::TimestampS | LogicalType::TimestampMs | LogicalType::TimestampNs,
+        ) => Some(to_local(*micros, zone).and_then(|local| cast_value(&local, target, try_cast))),
+        // The pin's ICU casts have no way from an instant to a bare time of day.
+        (Value::TimestampTz(_), LogicalType::Time) => Some(Err(Error::conversion(
+            "Unimplemented type for cast (TIMESTAMP WITH TIME ZONE -> TIME)",
+        ))),
+        _ => None,
+    };
+    match zoned {
+        Some(Err(error)) if try_cast && recoverable(&error) => Ok(Value::Null),
+        Some(answer) => answer,
+        None => cast_value(value, target, try_cast),
+    }
+}
+
+/// Whether a cast from one type to another reads the session time zone, which is every cast
+/// between a `TIMESTAMP WITH TIME ZONE` and a type without one, so that folding one while the
+/// query is planned, where there is no session, would answer it in UTC.
+#[must_use]
+pub fn reads_time_zone(from: &LogicalType, to: &LogicalType) -> bool {
+    (from == &LogicalType::TimestampTz) != (to == &LogicalType::TimestampTz)
+        && !matches!(from, LogicalType::Null)
 }
 
 /// Every value of a vector converted without a [`Value`] being built for any of them, or `None`
@@ -1640,10 +1670,73 @@ fn to_timestamp_tz(value: &Value) -> Result<Value> {
         Value::Timestamp(micros) => Ok(Value::TimestampTz(*micros)),
         Value::Varchar(text) => match parse_timestamp(text) {
             Ok(micros) => Ok(Value::TimestampTz(micros)),
-            Err(fault) => Err(fault.said("timestamp with time zone", text, TIMESTAMP_FORMAT)),
+            Err(fault) => Err(fault.for_date().said("timestamp", text, TIMESTAMP_FORMAT)),
         },
         _ => Err(no_cast(value, &LogicalType::TimestampTz)),
     }
+}
+
+/// A cast to `TIMESTAMP WITH TIME ZONE` that reads a wall clock in `zone`, the way the pin's ICU
+/// casts read one.
+///
+/// A date is midnight in the zone and a timestamp is its wall clock in the zone. Text is read the
+/// same way unless it says where it is: an offset or a `Z` on the end names the instant outright,
+/// and a zone name on the end is the zone to read the wall clock in instead of the session's.
+fn to_timestamp_tz_in(value: &Value, zone: SessionTimeZone) -> Result<Value> {
+    let naive = match value {
+        Value::Varchar(text) => {
+            let (micros, written) = parse_timestamp_zoned(text)
+                .map_err(|fault| fault.for_date().said("timestamp", text, TIMESTAMP_FORMAT))?;
+            match written {
+                Suffix::Nothing => micros,
+                Suffix::Named(name) => {
+                    let Some(named) = SessionTimeZone::named(name) else {
+                        return Err(Error::conversion(format!("Unknown TimeZone '{name}'!")));
+                    };
+                    return from_local(micros, named);
+                }
+                Suffix::Offset(seconds) => {
+                    if micros == i64::MAX || micros == -i64::MAX {
+                        return Ok(Value::TimestampTz(micros));
+                    }
+                    return micros
+                        .checked_sub(seconds * MICROS_PER_SECOND)
+                        .filter(|instant| (OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(instant))
+                        .map(Value::TimestampTz)
+                        .ok_or_else(|| Fault::Range.said("timestamp", text, TIMESTAMP_FORMAT));
+                }
+            }
+        }
+        Value::Date(days) => stamp_of_day(*days),
+        Value::Timestamp(micros) => *micros,
+        _ => match coarse_micros(value, "higher precision")? {
+            Some(micros) => micros,
+            None => return to_timestamp_tz(value),
+        },
+    };
+    from_local(naive, zone)
+}
+
+/// The instant a wall clock reading in `zone` names, with the two infinities kept infinite.
+fn from_local(micros: i64, zone: SessionTimeZone) -> Result<Value> {
+    if micros == i64::MAX || micros == -i64::MAX {
+        return Ok(Value::TimestampTz(micros));
+    }
+    zone.instant_of_local(micros)
+        .filter(|instant| (OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(instant))
+        .map(Value::TimestampTz)
+        .ok_or_else(|| Error::conversion("ICU date overflows timestamp range"))
+}
+
+/// The wall clock `zone` reads at an instant, as a `TIMESTAMP`, with the infinities kept infinite.
+fn to_local(micros: i64, zone: SessionTimeZone) -> Result<Value> {
+    if micros == i64::MAX || micros == -i64::MAX {
+        return Ok(Value::Timestamp(micros));
+    }
+    zone.local_of_instant(micros)
+        .filter(|local| (OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(local))
+        .map(Value::Timestamp)
+        .ok_or_else(|| Error::conversion("Unable to convert TIMESTAMPTZ to local TIMESTAMP"))
 }
 
 /// The one failure a written time has, which says the format even though it is the range sentence.
@@ -1847,14 +1940,38 @@ fn parse_date(text: &str) -> Parsed<i32> {
 
 /// `YYYY-MM-DD` with an optional `HH:MM:SS[.ffffff]` after it, as microseconds since the epoch.
 fn parse_timestamp(text: &str) -> Parsed<i64> {
+    parse_timestamp_zoned(text).map(|(micros, _)| micros)
+}
+
+/// What was written after the clock of a timestamp, which a `TIMESTAMP` checks and throws away
+/// and a `TIMESTAMP WITH TIME ZONE` reads.
+enum Suffix<'a> {
+    /// Nothing, so the wall clock is read in the session time zone.
+    Nothing,
+    /// An offset east of UTC in seconds, or a `Z`, which names the instant outright.
+    Offset(i64),
+    /// A zone name, which the wall clock is read in instead of the session's.
+    Named(&'a str),
+}
+
+/// A written timestamp as the wall clock it spells, and what was written after the clock.
+///
+/// `epoch` and the infinities are instants rather than wall clocks, so they come back with an
+/// offset of zero and are not moved by the session time zone.
+fn parse_timestamp_zoned(text: &str) -> Parsed<(i64, Suffix<'_>)> {
     if let Some(days) = special_day(text) {
-        return Ok(stamp_of_day(days));
+        return Ok((stamp_of_day(days), Suffix::Offset(0)));
     }
     let (date, era, time) = split_parts(text.trim())?;
     let days = i64::from(parse_day(date, era)?);
-    let micros = match time {
-        None => 0,
-        Some(time) => parse_time(time)?,
+    let (micros, written) = match time {
+        None => (0, Suffix::Nothing),
+        Some(time) => {
+            let (clock, zone) = split_zone(time);
+            let micros = parse_clock_fields(clock)?;
+            parse_zone(zone)?;
+            (micros, written_zone(zone))
+        }
     };
     let stamp = days
         .checked_mul(MICROS_PER_DAY)
@@ -1865,7 +1982,25 @@ fn parse_timestamp(text: &str) -> Parsed<i64> {
     if !(OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(&stamp) {
         return Err(Fault::Range);
     }
-    Ok(stamp)
+    Ok((stamp, written))
+}
+
+/// The zone [`parse_zone`] accepted, read rather than checked. The offset's fields are not range
+/// checked, the same as upstream, so `+99` is ninety nine hours.
+fn written_zone(text: &str) -> Suffix<'_> {
+    let zone = text.trim_end();
+    if let Some(name) = zone.strip_prefix(' ') {
+        return Suffix::Named(name);
+    }
+    let Some(digits) = zone.strip_prefix('+').or_else(|| zone.strip_prefix('-')) else {
+        return if zone == "Z" { Suffix::Offset(0) } else { Suffix::Nothing };
+    };
+    let seconds = digits
+        .split(':')
+        .zip([3_600, 60, 1])
+        .map(|(field, scale)| field.parse::<i64>().unwrap_or_default() * scale)
+        .sum::<i64>();
+    Suffix::Offset(if zone.starts_with('-') { -seconds } else { seconds })
 }
 
 /// The words a date or a timestamp can be written as instead of numbers, as days since the epoch.
