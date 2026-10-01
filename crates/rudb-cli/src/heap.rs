@@ -120,6 +120,26 @@ const fn given(size: usize, align: usize) -> bool {
     align <= GIVEN && align <= size
 }
 
+/// The smallest block mimalloc 2 serves from a medium page, one past `MI_SMALL_OBJ_SIZE_MAX`.
+const MEDIUM_FROM: usize = 16 * 1024 + 1;
+
+/// The largest block mimalloc 2 serves from a medium page, `MI_MEDIUM_OBJ_SIZE_MAX`.
+const MEDIUM_UPTO: usize = 128 * 1024;
+
+/// The size to ask mimalloc for when the caller wants `size`, which is `size` rounded up to a power
+/// of two when it is a medium block and `size` otherwise.
+///
+/// mimalloc keeps a page per size class per thread, and a medium page is 512 KiB. There are four
+/// classes to every doubling, so the twelve from 16 KiB to 128 KiB can hold six megabytes a thread
+/// that is committed and mostly empty. A vector is 8192 values, which puts most of what a scan
+/// takes and frees in exactly that range, at widths of one, two, four, eight and sixteen bytes and
+/// at every string length in between. On ClickBench q10 at eight threads the live heap peaked at 39
+/// MB and the process at 71. Rounding leaves three classes in the range, so a thread holds at most
+/// three medium pages, and a block that grows into the slack is grown where it is.
+const fn binned(size: usize) -> usize {
+    if size >= MEDIUM_FROM && size <= MEDIUM_UPTO { size.next_power_of_two() } else { size }
+}
+
 /// mimalloc, with the alignment decided at the call rather than inside the library.
 #[derive(Debug)]
 pub(crate) struct MiMalloc;
@@ -136,9 +156,9 @@ unsafe impl GlobalAlloc for MiMalloc {
         // alignment.
         unsafe {
             if given(layout.size(), layout.align()) {
-                mi_malloc(layout.size()).cast()
+                mi_malloc(binned(layout.size())).cast()
             } else {
-                mi_malloc_aligned(layout.size(), layout.align()).cast()
+                mi_malloc_aligned(binned(layout.size()), layout.align()).cast()
             }
         }
     }
@@ -147,9 +167,9 @@ unsafe impl GlobalAlloc for MiMalloc {
         // SAFETY: as [`GlobalAlloc::alloc`], and the zeroing is mimalloc's own.
         unsafe {
             if given(layout.size(), layout.align()) {
-                mi_zalloc(layout.size()).cast()
+                mi_zalloc(binned(layout.size())).cast()
             } else {
-                mi_zalloc_aligned(layout.size(), layout.align()).cast()
+                mi_zalloc_aligned(binned(layout.size()), layout.align()).cast()
             }
         }
     }
@@ -167,9 +187,9 @@ unsafe impl GlobalAlloc for MiMalloc {
         // both of those are a size mimalloc aligns anyway.
         unsafe {
             if given(layout.size().min(size), layout.align()) {
-                mi_realloc(ptr.cast(), size).cast()
+                mi_realloc(ptr.cast(), binned(size)).cast()
             } else {
-                mi_realloc_aligned(ptr.cast(), size, layout.align()).cast()
+                mi_realloc_aligned(ptr.cast(), binned(size), layout.align()).cast()
             }
         }
     }
@@ -177,7 +197,10 @@ unsafe impl GlobalAlloc for MiMalloc {
 
 #[cfg(test)]
 mod tests {
-    use super::{GIVEN, given, keep_everything_at_exit, keep_freed_memory, purge_delay};
+    use super::{
+        GIVEN, MEDIUM_FROM, MEDIUM_UPTO, binned, given, keep_everything_at_exit, keep_freed_memory,
+        purge_delay,
+    };
 
     /// The option set is the purge delay, which mimalloc 2 starts at ten milliseconds, and not some
     /// other entry of the enum the constant could have drifted to, and the one set at exit turns
@@ -208,5 +231,17 @@ mod tests {
         assert!(!given(4_096, 64), "a cache line aligned block still has to ask");
         assert!(!given(8, GIVEN), "a block narrower than its alignment still has to ask");
         assert!(!given(0, 1), "and a block of nothing is nobody's fast path");
+    }
+
+    /// A medium block is rounded up to a power of two and nothing else is touched.
+    #[test]
+    fn only_a_medium_block_is_rounded() {
+        assert_eq!(binned(MEDIUM_FROM - 1), MEDIUM_FROM - 1, "the largest small block");
+        assert_eq!(binned(MEDIUM_FROM), 32 * 1024);
+        assert_eq!(binned(40 * 1024), 64 * 1024, "a column of five thousand i64");
+        assert_eq!(binned(64 * 1024), 64 * 1024, "a column of 8192 i64 is already a class");
+        assert_eq!(binned(MEDIUM_UPTO), MEDIUM_UPTO);
+        assert_eq!(binned(MEDIUM_UPTO + 1), MEDIUM_UPTO + 1, "a large block has a page of its own");
+        assert_eq!(binned(0), 0);
     }
 }
