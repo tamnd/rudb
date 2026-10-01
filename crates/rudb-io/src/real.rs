@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use rudb_common::{Error, Result};
 
-use crate::{File, Filesystem, OpenMode};
+use crate::{File, Filesystem, Mapped, OpenMode};
 
 /// Files on the machine this process is running on.
 #[derive(Debug, Default, Clone, Copy)]
@@ -175,6 +175,10 @@ impl File for RealFile {
 
     fn len(&self) -> Result<u64> {
         Ok(self.file.metadata().map_err(|e| Error::io(format!("stat failed: {e}")))?.len())
+    }
+
+    fn map(&self) -> Option<Mapped> {
+        Mapped::open(&self.file, self.len().ok()?)
     }
 }
 

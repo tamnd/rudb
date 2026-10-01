@@ -243,6 +243,13 @@ pub trait File: Debug + Send + Sync {
     fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
+
+    /// The whole file mapped read only, or `None` where it cannot be, which is the default and
+    /// every file that is not on the real filesystem. The caller makes the promise [`Mapped`]
+    /// asks for: nothing rewrites or cuts the bytes while the mapping is held.
+    fn map(&self) -> Option<Mapped> {
+        None
+    }
 }
 
 /// A place files live.

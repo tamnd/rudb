@@ -698,17 +698,46 @@ impl MemoryTable {
     /// it was flat and did not hold a flat run of its own length, which the vector crate believes is
     /// impossible, and the safe thing for a table to do about a layout it cannot build is to keep
     /// the rows it was given rather than to fail an insert over it.
+    ///
+    /// The columns are laid on threads of their own once the group is a full one. Each is a copy
+    /// of every row into fresh memory, and one after the other they were most of the time a replay
+    /// of the log spent outside its decoders, with the other cores idle.
     fn laid(&self) -> Option<Vec<Vector>> {
-        let mut pages = Vec::with_capacity(self.types.len());
-        let mut pieces = Vec::with_capacity(self.open.len());
-        for (column, ty) in self.types.iter().enumerate() {
-            pieces.clear();
-            for chunk in &self.open {
-                pieces.push(chunk.column(column).ok()?.clone());
-            }
-            pages.push(rudb_vector::concat(ty, &pieces).ok()??);
+        let open = &self.open;
+        let lay = |column: usize, ty: &LogicalType| -> Option<Vector> {
+            let pieces = open
+                .iter()
+                .map(|chunk| chunk.column(column).ok().cloned())
+                .collect::<Option<Vec<_>>>()?;
+            rudb_vector::concat(ty, &pieces).ok()?
+        };
+        let threads =
+            std::thread::available_parallelism().map_or(1, usize::from).min(self.types.len());
+        if threads < 2 || self.open_rows < ROWS_PER_GROUP {
+            return self.types.iter().enumerate().map(|(column, ty)| lay(column, ty)).collect();
         }
-        Some(pages)
+        let next = AtomicUsize::new(0);
+        let laid: Vec<Mutex<Option<Vector>>> =
+            self.types.iter().map(|_| Mutex::new(None)).collect();
+        let work = || {
+            loop {
+                let column = next.fetch_add(1, Ordering::Relaxed);
+                let (Some(ty), Some(slot)) = (self.types.get(column), laid.get(column)) else {
+                    return;
+                };
+                let page = lay(column, ty);
+                if let Ok(mut slot) = slot.lock() {
+                    *slot = page;
+                }
+            }
+        };
+        std::thread::scope(|scope| {
+            for _ in 1..threads {
+                scope.spawn(work);
+            }
+            work();
+        });
+        laid.into_iter().map(|slot| slot.into_inner().ok().flatten()).collect()
     }
 
     /// How long this table has spent building statistics, in nanoseconds.
