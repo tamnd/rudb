@@ -138,7 +138,8 @@ impl Rank {
         if from >= words || u64::from(self.fine[from]) > nth || u64::from(self.fine[words]) <= nth {
             return None;
         }
-        let word = from + self.fine[from..words].partition_point(|&ones| u64::from(ones) <= nth) - 1;
+        let word =
+            from + self.fine[from..words].partition_point(|&ones| u64::from(ones) <= nth) - 1;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "the rank is inside the word, which holds at most sixty four ones"
