@@ -19,7 +19,7 @@ use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
 use rudb_parse::{Ast, NONE};
 use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 
-use crate::binder::{Binder, PendingSubquery, WindowCall};
+use crate::binder::{AliasClause, Binder, PendingSubquery, WindowCall};
 use crate::fold;
 use crate::scope::Scope;
 
@@ -466,11 +466,43 @@ impl Binder<'_> {
 
     fn bind_column(&mut self, ast: &Ast, name: ast::Slice, scope: &Scope) -> Result<ExprRef> {
         let parts: Vec<&str> = ast.name(name).collect();
-        self.bind_column_parts(&parts, scope)
+        self.bind_column_parts(Some(ast), &parts, scope)
+    }
+
+    /// The alias of this block's select list that `parts` may name in the clause being bound.
+    ///
+    /// Only a bare name is one, since the pin reads `t.y` as a column of `t` whatever the select
+    /// list calls things. Inside an aggregate's arguments only the select list reads aliases, which
+    /// is the pin's: `SELECT x AS y, sum(y)` sums `x` and `HAVING sum(y)` is a missing column.
+    fn alias_for(&self, parts: &[&str]) -> Option<(usize, ast::ExprRef, usize)> {
+        let [word] = parts else { return None };
+        let aliases = self.aliases.as_ref()?;
+        if self.in_aggregate && aliases.clause != AliasClause::Select {
+            return None;
+        }
+        aliases.find(word)
+    }
+
+    /// Whether `binding` is a column this block groups by as it is, with nothing around it.
+    fn grouped(&self, binding: rudb_plan::ColumnBinding) -> bool {
+        self.aggregation.as_ref().is_some_and(|aggregation| {
+            aggregation.groups.iter().any(|&group| {
+                matches!(self.plan().expr(group), Expr::Column(column) if *column == binding)
+            })
+        })
     }
 
     /// A column named by its written parts, or a field of a struct column when no column is.
-    fn bind_column_parts(&mut self, parts: &[&str], scope: &Scope) -> Result<ExprRef> {
+    ///
+    /// With the statement's tree in hand, a bare name may also be one of the block's aliases, in
+    /// the order [`Self::alias_for`] and the clause being bound decide. Without it, which is the
+    /// front of a struct path, it is never one, since the pin does not look into an alias's fields.
+    fn bind_column_parts(
+        &mut self,
+        ast: Option<&Ast>,
+        parts: &[&str],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
         // A lambda parameter beats a column of the same name, so `lambda l: l + 1` over a table with
         // a column `l` reads the element. The innermost lambda that has the name is the one meant.
         if let [word] = parts
@@ -483,15 +515,29 @@ impl Binder<'_> {
         // rather than the fold happening when resolution fails, so that two tables carrying the name
         // is still the ambiguity error. Both halves were measured against the pin. See
         // `crate::context`.
+        let alias = ast.and_then(|ast| Some((ast, self.alias_for(parts)?)));
         if let [word] = parts
+            && alias.is_none()
             && !scope.names(word)
             && !self.outer_scopes.iter().any(|outer| outer.names(word))
             && let Some(folded) = self.context_keyword(word)
         {
             return Ok(folded);
         }
+        let clause = self.aliases.as_ref().map(|aliases| aliases.clause);
         if let Some(found) = scope.resolve_optional(parts)? {
+            // In a `HAVING` an alias beats a column the block does not group by, so `SELECT sum(x)
+            // AS x FROM t HAVING x > 6` compares the sum.
+            if let Some((ast, alias)) = alias
+                && clause == Some(AliasClause::Having)
+                && !self.grouped(found.binding)
+            {
+                return self.bind_alias(ast, parts[0], alias, scope);
+            }
             return Ok(self.add_expr(Expr::Column(found.binding), found.ty.clone()));
+        }
+        if let Some((ast, alias)) = alias {
+            return self.bind_alias(ast, parts[0], alias, scope);
         }
         let mut found = None;
         for (at, outer) in self.outer_scopes.iter().enumerate().rev() {
@@ -509,6 +555,19 @@ impl Binder<'_> {
             }
             if let Some(field) = self.struct_path(parts, scope)? {
                 return Ok(field);
+            }
+            // The pin's own words for a name that is neither a column nor an alias in these two.
+            if let ([word], Some(_)) = (parts, ast) {
+                if clause == Some(AliasClause::Qualify) && !self.in_aggregate {
+                    return Err(Error::binder(format!(
+                        "Referenced column {word} not found in FROM clause and can't find in alias map."
+                    )));
+                }
+                if clause == Some(AliasClause::Having) && !self.in_aggregate {
+                    return Err(Error::binder(format!(
+                        "column \"{word}\" must appear in the GROUP BY clause or be used in an aggregate function"
+                    )));
+                }
             }
             return scope.resolve(parts).map(|_| unreachable!());
         };
@@ -576,7 +635,7 @@ impl Binder<'_> {
     /// missing in its own words.
     fn struct_path(&mut self, parts: &[&str], scope: &Scope) -> Result<Option<ExprRef>> {
         for split in (1..parts.len()).rev() {
-            let Ok(mut expr) = self.bind_column_parts(&parts[..split], scope) else {
+            let Ok(mut expr) = self.bind_column_parts(None, &parts[..split], scope) else {
                 continue;
             };
             if !matches!(self.plan().expr_type(expr), LogicalType::Struct(_) | LogicalType::Map(..))

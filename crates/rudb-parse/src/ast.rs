@@ -711,6 +711,8 @@ pub struct Select {
     pub group_by_all: bool,
     /// The `HAVING` expression, or `NONE`.
     pub having: ExprRef,
+    /// The `QUALIFY` expression, or `NONE`.
+    pub qualify: ExprRef,
 }
 
 impl Select {
@@ -724,6 +726,7 @@ impl Select {
             group_by: Slice { start: 0, len: 0 },
             group_by_all: false,
             having: NONE,
+            qualify: NONE,
         }
     }
 }

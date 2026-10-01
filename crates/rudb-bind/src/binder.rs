@@ -108,6 +108,70 @@ pub(crate) struct Aggregation {
     pub(crate) aggregates: Vec<ExprRef>,
 }
 
+/// The clause a select block's aliases are being read from, which decides how they are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AliasClause {
+    /// One that may not read them, such as a join condition or the `GROUP BY`, which follows the
+    /// aliases its own way.
+    None,
+    /// The select list, where an alias is read once the target it names has been bound.
+    Select,
+    /// `WHERE`, where a column of the `FROM` wins over an alias of the same name.
+    Where,
+    /// `HAVING`, where an alias wins over a column that is not grouped.
+    Having,
+    /// `QUALIFY`, which reads them as `WHERE` does.
+    Qualify,
+}
+
+/// The aliases of a select block's targets, which a clause of the block may name in place of the
+/// expression they were written for.
+///
+/// The pin binds the expression again where the alias is named rather than reading the target's
+/// column, so `SELECT x + 1 AS y FROM t WHERE y > 1` filters on `x + 1`, and that is what happens
+/// here. An alias is not followed while it is being bound, so `SELECT y + 1 AS y FROM t WHERE y >
+/// 1` over a table without a `y` is the column missing and not a loop.
+#[derive(Debug, Clone)]
+pub(crate) struct Aliases {
+    /// Each alias, the expression it was written for and the position of its target.
+    entries: Vec<(String, ast::ExprRef, usize)>,
+    /// The clause being bound.
+    pub(crate) clause: AliasClause,
+    /// How many targets of the select list are bound, while the select list is.
+    pub(crate) defined: usize,
+    /// The aliases whose expressions are being bound.
+    visiting: Vec<usize>,
+}
+
+impl Aliases {
+    /// The aliases a select block writes, of which the last of a name is the one that counts.
+    fn of(ast: &Ast, select: &ast::Select) -> Self {
+        let entries = ast
+            .target_list(select.targets)
+            .iter()
+            .enumerate()
+            .filter(|(_, target)| {
+                target.alias != NONE && !crate::columns::has_star(ast, target.expr)
+            })
+            .map(|(at, target)| (ast.string(target.alias).to_string(), target.expr, at))
+            .collect();
+        Self { entries, clause: AliasClause::None, defined: 0, visiting: Vec::new() }
+    }
+
+    /// The entry for `name` that the clause being bound may follow.
+    pub(crate) fn find(&self, name: &str) -> Option<(usize, ast::ExprRef, usize)> {
+        if self.clause == AliasClause::None {
+            return None;
+        }
+        let at = self.entries.iter().rposition(|(alias, ..)| same_name(alias, name))?;
+        if self.visiting.contains(&at) {
+            return None;
+        }
+        let (_, expr, target) = self.entries[at];
+        Some((at, expr, target))
+    }
+}
+
 /// One run of window calls that agree on where the rows come from and in what order.
 ///
 /// The run is the unit the plan has an operator for, so two calls that write the same partition,
@@ -294,6 +358,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) in_filter: bool,
     /// The window runs this select block has collected, in the order they were first written.
     pub(crate) windows: Vec<WindowRun>,
+    /// The select block's own aliases while a clause that may read them is bound.
+    pub(crate) aliases: Option<Aliases>,
     /// The `unnest` calls this select block has written, in the order they were written.
     pub(crate) unnests: Vec<crate::unnest::UnnestCall>,
     /// The table index the block's `unnest` calls produce their columns under, once there is one.
@@ -399,6 +465,7 @@ impl<'a> Binder<'a> {
             in_aggregate: false,
             in_filter: false,
             windows: Vec::new(),
+            aliases: None,
             unnests: Vec::new(),
             unnest_index: None,
             unnest_here: false,
@@ -1013,6 +1080,44 @@ impl<'a> Binder<'a> {
 
     // ----------------------------------------------------------------- select
 
+    /// The expression the alias `word` was written for, bound where the alias is named.
+    pub(crate) fn bind_alias(
+        &mut self,
+        ast: &Ast,
+        word: &str,
+        (at, expr, target): (usize, ast::ExprRef, usize),
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let Some(aliases) = &mut self.aliases else {
+            unreachable!("an alias was found without any")
+        };
+        if aliases.clause == AliasClause::Select {
+            if target >= aliases.defined {
+                return Err(Error::binder(format!(
+                    "Column \"{word}\" referenced that exists in the SELECT clause - but this column cannot be referenced before it is defined"
+                )));
+            }
+            if crate::columns::has_subquery(ast, expr) {
+                return Err(Error::binder(format!(
+                    "Alias \"{word}\" referenced in a SELECT clause - but the expression has a subquery. This is not yet supported."
+                )));
+            }
+        }
+        aliases.visiting.push(at);
+        let bound = self.bind_expr(ast, expr, scope);
+        if let Some(aliases) = &mut self.aliases {
+            aliases.visiting.pop();
+        }
+        bound
+    }
+
+    /// Which clause the select block's aliases are being read from, if any.
+    fn alias_clause(&mut self, clause: AliasClause) {
+        if let Some(aliases) = &mut self.aliases {
+            aliases.clause = clause;
+        }
+    }
+
     fn bind_select(
         &mut self,
         ast: &Ast,
@@ -1037,11 +1142,16 @@ impl<'a> Binder<'a> {
         // inside that stretch has its own set, so the outer block's is put aside rather than left
         // where the inner one would clear it.
         let outer_joined_above = std::mem::take(&mut self.joined_above);
+        // A block reads its own aliases and not the ones of the block it sits in, which the pin
+        // allows and this does not yet.
+        let outer_aliases = self.aliases.take();
         let (mut node, input) = self.bind_from(ast, written.from)?;
         node = self.attach_scalar_subqueries(node);
+        self.aliases = Some(Aliases::of(ast, &written));
 
         if written.filter != NONE {
             self.clause = "WHERE clause";
+            self.alias_clause(AliasClause::Where);
             let predicate = if crate::columns::has_star(ast, written.filter) {
                 self.bind_star_predicate(ast, written.filter, &input)?
             } else {
@@ -1051,6 +1161,7 @@ impl<'a> Binder<'a> {
             node = self.attach_scalar_subqueries(node);
             node = self.add_node(Node::Filter { input: node, predicate });
         }
+        self.alias_clause(AliasClause::None);
 
         let targets = ast.target_list(written.targets).to_vec();
         if targets.is_empty() {
@@ -1060,6 +1171,7 @@ impl<'a> Binder<'a> {
         let group_items = self.group_items(ast, &written, &targets)?;
         let aggregating = !group_items.is_empty()
             || written.having != NONE
+            || has_aggregate(ast, written.qualify)
             || targets.iter().any(|target| has_aggregate(ast, target.expr));
         if aggregating {
             self.clause = "GROUP BY clause";
@@ -1101,20 +1213,59 @@ impl<'a> Binder<'a> {
         if written.having != NONE && crate::columns::has_star(ast, written.having) {
             return Err(Error::binder("STAR expression is not supported here"));
         }
-        self.clause = "SELECT clause";
-        self.unnest_here = true;
-        let (mut exprs, mut names) = self.bind_targets(ast, &targets, &input, &mut above)?;
-        self.unnest_here = false;
-        let visible = exprs.len();
-
+        // `HAVING` and then `QUALIFY` are bound before the select list, which is the pin's order and
+        // decides which of two mistakes is the one reported.
         let mut having = None;
         if written.having != NONE {
             self.clause = "HAVING clause";
+            self.alias_clause(AliasClause::Having);
             let before = self.scalar_subqueries.len();
             let predicate = self.bind_expr(ast, written.having, &input)?;
             self.lift_over_aggregate(before, &mut above, &input)?;
             let predicate = self.over_aggregate(predicate, &input)?;
             having = Some(self.as_boolean(predicate, "HAVING")?);
+        }
+
+        // `QUALIFY` filters the rows after the windows have run over them, so it is bound with the
+        // windows allowed, and its filter and the queries it wrote go in above them. A column it
+        // reads that is not grouped is reported after the select list's, as the pin does.
+        let mut qualify = None;
+        let mut over_windows = Vec::new();
+        if written.qualify != NONE {
+            if groups_everything(ast, &written)? {
+                return Err(Error::binder(
+                    "Combining QUALIFY with GROUP BY ALL is not supported yet",
+                ));
+            }
+            self.clause = "QUALIFY clause";
+            self.alias_clause(AliasClause::Qualify);
+            let before = self.scalar_subqueries.len();
+            qualify = Some(self.bind_expr(ast, written.qualify, &input)?);
+            if self.aggregation.is_some() {
+                self.lift_over_aggregate(before, &mut over_windows, &input)?;
+            } else {
+                over_windows = self.scalar_subqueries.split_off(before);
+            }
+        }
+
+        self.clause = "SELECT clause";
+        self.unnest_here = true;
+        self.alias_clause(AliasClause::Select);
+        let (mut exprs, mut names) = self.bind_targets(ast, &targets, &input, &mut above)?;
+        self.unnest_here = false;
+        let visible = exprs.len();
+        self.aliases = outer_aliases;
+
+        if let Some(predicate) = qualify {
+            self.clause = "QUALIFY clause";
+            let predicate = self.over_aggregate(predicate, &input)?;
+            // Without a window the clause would be a `WHERE` or a `HAVING` written late.
+            if self.windows.is_empty() {
+                return Err(Error::binder(
+                    "at least one window function must appear in the SELECT column or QUALIFY clause",
+                ));
+            }
+            qualify = Some(self.as_boolean(predicate, "QUALIFY")?);
         }
 
         // The projection's index has to exist before the sort keys are built, because a key is a
@@ -1185,6 +1336,14 @@ impl<'a> Binder<'a> {
                 frame: run.frame,
                 expressions,
             });
+        }
+        if !over_windows.is_empty() {
+            let below = std::mem::replace(&mut self.scalar_subqueries, over_windows);
+            node = self.attach_scalar_subqueries(node);
+            self.scalar_subqueries = below;
+        }
+        if let Some(predicate) = qualify {
+            node = self.add_node(Node::Filter { input: node, predicate });
         }
         // After the windows, which is also the pin's order: `SELECT unnest([1, 2]), count(*) OVER
         // ()` counts one row and then makes two of it.
@@ -1352,7 +1511,10 @@ impl<'a> Binder<'a> {
     ) -> Result<(Vec<ExprRef>, Vec<String>)> {
         let mut exprs = Vec::with_capacity(targets.len());
         let mut names = Vec::with_capacity(targets.len());
-        for target in targets {
+        for (at, target) in targets.iter().enumerate() {
+            if let Some(aliases) = &mut self.aliases {
+                aliases.defined = at;
+            }
             if let Some(picks) = self.star_like(ast, target.expr, input)? {
                 let alias = (target.alias != NONE).then(|| ast.string(target.alias));
                 for picked in &picks.entries {
@@ -3780,7 +3942,7 @@ impl<'a> Binder<'a> {
         // which is upstream's wording and not a simplification: `ON sum(a.i) OVER () = b.i` is
         // refused there with the words a window in a `WHERE` is refused with.
         let clause = if self.clause == "JOIN condition" { "WHERE clause" } else { self.clause };
-        if clause != "SELECT clause" && clause != "ORDER BY clause" {
+        if clause != "SELECT clause" && clause != "ORDER BY clause" && clause != "QUALIFY clause" {
             return Err(Error::binder(format!("{clause} cannot contain window functions!")));
         }
 
@@ -4109,8 +4271,14 @@ impl<'a> Binder<'a> {
             Expr::Column(binding) => {
                 let read = self.ungrouped_correlation(binding).unwrap_or(binding);
                 let name = self.name_of(read, scope);
+                // The pin words it differently in a `HAVING`, where it gives no hint.
+                if self.clause == "HAVING clause" {
+                    return Err(Error::binder(format!(
+                        "column {name} must appear in the GROUP BY clause or be used in an aggregate function"
+                    )));
+                }
                 Err(Error::binder(format!(
-                    "column {name} must appear in the GROUP BY clause or must be part of an aggregate function"
+                    "column {name} must appear in the GROUP BY clause or must be part of an aggregate function.\nEither add it to the GROUP BY list, or use ANY_VALUE({name}) if the exact value of {name} is not important."
                 )))
             }
             Expr::Constant(_)

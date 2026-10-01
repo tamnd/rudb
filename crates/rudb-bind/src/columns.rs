@@ -182,6 +182,17 @@ fn walk(
     }
 }
 
+/// Whether a subquery is anywhere in `expr`.
+pub(crate) fn has_subquery(ast: &Ast, expr: ast::ExprRef) -> bool {
+    matches!(
+        ast.expr(expr),
+        ast::Expr::Subquery { .. }
+            | ast::Expr::Exists { .. }
+            | ast::Expr::InSubquery { .. }
+            | ast::Expr::QuantifiedSubquery { .. }
+    ) || children(ast, expr).into_iter().any(|child| has_subquery(ast, child))
+}
+
 /// Whether a star or a `COLUMNS` is anywhere in `expr` outside a subquery.
 pub(crate) fn has_star(ast: &Ast, expr: ast::ExprRef) -> bool {
     match ast.expr(expr) {
