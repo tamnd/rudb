@@ -9508,7 +9508,7 @@ impl Reader {
             }
             let vector = vector.into_pages();
             if keeping {
-                let vector = self.keep(at, column, vector);
+                let vector = self.keep(at, column, vector, positions.is_some());
                 picked.push(match positions {
                     None => Arc::unwrap_or_clone(vector),
                     Some(positions) => vector.gather(positions)?,
@@ -9599,7 +9599,14 @@ impl Reader {
 
     /// Holds `vector` as part `at` of `column` and counts it against the pool, and answers what the
     /// read goes on with, which is the one already held if another worker got there first.
-    fn keep(&self, at: usize, column: usize, vector: Vector) -> Arc<Vector> {
+    /// Holds a decoded part in the pool, flat when the read that kept it wanted only some rows.
+    ///
+    /// A part kept by a read of a few of its rows is one a join or a filter gathers from, and a
+    /// gather out of a packed part unpacks the rows it wants every time. A part kept by a read of
+    /// all of it stays packed, since the kernels that read whole parts work on the codes and the
+    /// packed part is a fraction of the memory.
+    fn keep(&self, at: usize, column: usize, vector: Vector, gathered: bool) -> Arc<Vector> {
+        let vector = if gathered { vector.unpacked_to_hold() } else { vector };
         let bytes = vector.footprint();
         let vector = Arc::new(vector);
         let used = Arc::new(AtomicBool::new(false));
