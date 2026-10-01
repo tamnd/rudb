@@ -986,6 +986,15 @@ const TABLE: &[Entry] = &[
         shape: Shape::Exact(Fixed::Interval, Fixed::Timestamp),
         numeric_only: false,
     },
+    // A moment read in a zone the call names: the wall clock an instant shows there, or the instant
+    // a wall clock there names. `timezone` of one moment is its offset, which is `date_part`.
+    Entry {
+        name: "timezone",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Exact(Fixed::Varchar, Fixed::Timestamp),
+        numeric_only: false,
+    },
     // A time or a timestamp built out of its fields, or a timestamp out of a count since 1970.
     Entry {
         name: "make_time",
@@ -2492,15 +2501,38 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
             Some((vec![Date, LogicalType::Varchar], LogicalType::Varchar))
         }
         // A string literal is read as the width, which is the one place upstream has only an interval.
-        ("time_bucket", [Interval | LogicalType::Varchar, Date | Timestamp | Time]) => {
-            Some((vec![Interval, arguments[1].clone()], arguments[1].clone()))
-        }
-        ("time_bucket", [Interval | LogicalType::Varchar, Date | Timestamp | Time, Interval]) => {
-            Some((vec![Interval, arguments[1].clone(), Interval], arguments[1].clone()))
-        }
+        (
+            "time_bucket",
+            [Interval | LogicalType::Varchar, Date | Timestamp | TimestampTz | Time],
+        ) => Some((vec![Interval, arguments[1].clone()], arguments[1].clone())),
+        (
+            "time_bucket",
+            [Interval | LogicalType::Varchar, Date | Timestamp | TimestampTz | Time, Interval],
+        ) => Some((vec![Interval, arguments[1].clone(), Interval], arguments[1].clone())),
+        // The third argument names the zone the buckets are cut in.
+        (
+            "time_bucket",
+            [Interval | LogicalType::Varchar, TimestampTz, LogicalType::Varchar | Null],
+        ) => Some((vec![Interval, TimestampTz, LogicalType::Varchar], TimestampTz)),
         ("time_bucket", [Interval | LogicalType::Varchar, when, origin]) if when == origin => {
             Some((vec![Interval, when.clone(), when.clone()], when.clone()))
         }
+        // An instant gives the wall clock it shows in the zone, and anything else is read as a wall
+        // clock in the zone and gives the instant it names there.
+        // A null moment is taken as a `TIME WITH TIME ZONE`, which is the pin's pick of the three.
+        ("timezone", [LogicalType::Varchar | Null, Null]) => {
+            Some((vec![LogicalType::Varchar, TimeTz], TimeTz))
+        }
+        ("timezone", [LogicalType::Varchar | Null, TimestampTz]) => {
+            Some((vec![LogicalType::Varchar, TimestampTz], Timestamp))
+        }
+        (
+            "timezone",
+            [
+                LogicalType::Varchar | Null,
+                Date | Timestamp | TimestampS | TimestampMs | TimestampNs,
+            ],
+        ) => Some((vec![LogicalType::Varchar, Timestamp], TimestampTz)),
         // A struct of a year, a month and a day, which are matched by name in any order and any
         // case, the way the pin casts one struct to another.
         ("make_date", [LogicalType::Struct(fields)])
@@ -2541,10 +2573,15 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
             [LogicalType::Varchar | Null, start, end],
         ) => {
             let moment = match (start, end) {
-                (Date | Timestamp | Time, Null | LogicalType::Varchar) => start.clone(),
-                (Null | LogicalType::Varchar, Date | Timestamp | Time) => end.clone(),
+                (Date | Timestamp | TimestampTz | Time, Null | LogicalType::Varchar) => {
+                    start.clone()
+                }
+                (Null | LogicalType::Varchar, Date | Timestamp | TimestampTz | Time) => end.clone(),
                 (Date, Timestamp) | (Timestamp, Date) => Timestamp,
-                (Date, Date) | (Timestamp, Timestamp) | (Time, Time) => start.clone(),
+                (Date, Date)
+                | (Timestamp, Timestamp)
+                | (TimestampTz, TimestampTz)
+                | (Time, Time) => start.clone(),
                 _ => return None,
             };
             Some((vec![LogicalType::Varchar, moment.clone(), moment], BigInt))
@@ -3155,6 +3192,7 @@ const READ_OFF: &[&str] = &[
     "make_time",
     "make_timestamp",
     "make_timestamp_ns",
+    "timezone",
 ];
 
 /// What the reference prints under `Candidate functions:`, per function, byte for byte.
@@ -3186,6 +3224,22 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("make_timestamp_ns", &["make_timestamp_ns(col0 BIGINT) -> TIMESTAMP_NS"]),
+    (
+        "timezone",
+        &[
+            "timezone(col0 DATE) -> BIGINT",
+            "timezone(col0 INTERVAL) -> BIGINT",
+            "timezone(col0 INTERVAL, col1 TIME WITH TIME ZONE) -> TIME WITH TIME ZONE",
+            "timezone(col0 TIME) -> BIGINT",
+            "timezone(col0 TIMESTAMP) -> BIGINT",
+            "timezone(col0 TIME WITH TIME ZONE) -> BIGINT",
+            "timezone(col0 TIME_NS) -> BIGINT",
+            "timezone(col0 TIMESTAMP WITH TIME ZONE) -> BIGINT",
+            "timezone(col0 VARCHAR, col1 TIMESTAMP) -> TIMESTAMP WITH TIME ZONE",
+            "timezone(col0 VARCHAR, col1 TIMESTAMP WITH TIME ZONE) -> TIMESTAMP",
+            "timezone(col0 VARCHAR, col1 TIME WITH TIME ZONE) -> TIME WITH TIME ZONE",
+        ],
+    ),
     (
         "date_diff",
         &[
@@ -5279,6 +5333,9 @@ mod tests {
                     {
                         arguments[1] = LogicalType::Date;
                         arguments[2] = LogicalType::Date;
+                    }
+                    _ if entry.name == "timezone" && count == 2 => {
+                        arguments[1] = LogicalType::Timestamp;
                     }
                     Shape::Histogram if count == 2 => arguments[1] = strings(),
                     Shape::Bits => {

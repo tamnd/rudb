@@ -688,6 +688,8 @@ impl Binder<'_> {
             }
             // `^@` is `starts_with` under another name, and the pin refuses it over anything but
             // strings with the sentence a call gets, literals spelled as literals.
+            // `x AT TIME ZONE z` is `timezone(z, x)`, the arguments swapped.
+            BinaryOp::AtTimeZone => return self.call("timezone", vec![right, left]),
             BinaryOp::StartsWith => {
                 let types = [left, right].map(|arg| self.plan().expr_type(arg).clone());
                 return self

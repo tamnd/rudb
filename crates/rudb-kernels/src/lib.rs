@@ -111,6 +111,7 @@ mod text;
 mod timebucket;
 mod timed;
 mod topk;
+mod zoned;
 
 pub use aggregate::{
     Accumulator, EXPORTED, NOWHERE, coded_run, finalize_name, finish_run, group_tally, holds_codes,
@@ -132,4 +133,5 @@ pub use peel::{Found, Lookup};
 pub use prepare::{Held, Recipe};
 pub use random::{drawn, draws, random};
 pub use scalar::{call, call_prepared, call_values};
+pub use zoned::{call_in_time_zone, zoned_steps};
 pub use select::{refine as refine_flags, selection};

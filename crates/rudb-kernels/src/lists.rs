@@ -321,7 +321,7 @@ pub fn moment_steps(
 }
 
 /// The longest list the pin builds for a series, which is the most entries a list can hold.
-const MAX_SERIES: usize = u32::MAX as usize;
+pub(crate) const MAX_SERIES: usize = u32::MAX as usize;
 
 /// The pin's refusal of a series longer than [`MAX_SERIES`].
 fn too_long() -> Error {

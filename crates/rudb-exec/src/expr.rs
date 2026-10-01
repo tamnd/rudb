@@ -124,7 +124,11 @@ pub(crate) fn evaluate_in_time_zone(
                 evaluate_all_in_time_zone(plan, plan.expr_list(args), schema, chunk, time_zone)?;
             // The renderer runs only if a kernel asks for it, which is only on the row that divides
             // by zero, so a chunk that computes nothing but answers pays nothing for it.
-            rudb_kernels::call(plan.string(name), &args, &ty, Some(&|| written(plan, expr, schema)))
+            let name = plan.string(name);
+            match rudb_kernels::call_in_time_zone(name, &args, &ty, time_zone) {
+                Some(answer) => answer,
+                None => rudb_kernels::call(name, &args, &ty, Some(&|| written(plan, expr, schema))),
+            }
         }
         Expr::Aggregate { name, .. } => Err(Error::internal(format!(
             "the {} aggregate was evaluated as an ordinary expression",

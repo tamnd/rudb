@@ -124,9 +124,44 @@ impl QueryResult {
         let instant = match value {
             Value::TimestampTz(micros) => *micros,
             Value::TimeTz(_) => self.rendered_at,
+            // A zoned value inside a list, a struct or a map is written in the session zone too,
+            // which UTC already is.
+            Value::List { .. } | Value::Struct(_) | Value::Map { .. }
+                if zoned_inside(value) && !self.body.session.session_time_zone().is_utc() =>
+            {
+                return self.written_inside(value).to_string();
+            }
             other => return other.to_string(),
         };
         value.to_string_at_offset(self.body.session.offset_seconds_at(instant))
+    }
+
+    /// A nested value with every zoned value in it replaced by its text in the session zone, which
+    /// prints the same as the zoned value would, quotes and all, since an element is quoted by what
+    /// its text holds and not by its type.
+    fn written_inside(&self, value: &Value) -> Value {
+        match value {
+            Value::TimestampTz(_) | Value::TimeTz(_) => Value::Varchar(self.value_text(value)),
+            Value::List { element, values } => Value::List {
+                element: element.clone(),
+                values: values.iter().map(|value| self.written_inside(value)).collect(),
+            },
+            Value::Struct(fields) => Value::Struct(
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), self.written_inside(value)))
+                    .collect(),
+            ),
+            Value::Map { key, value, entries } => Value::Map {
+                key: key.clone(),
+                value: value.clone(),
+                entries: entries
+                    .iter()
+                    .map(|(key, value)| (self.written_inside(key), self.written_inside(value)))
+                    .collect(),
+            },
+            other => other.clone(),
+        }
     }
 
     /// One cell rendered under the session that produced this result.
@@ -398,3 +433,16 @@ impl QueryResult {
 // Every statement hands a result back by value through a few layers, so its size is a copy paid
 // per statement. It was 768 bytes with the metrics document held inline.
 const _: () = assert!(size_of::<QueryResult>() <= 256, "a result has grown past 256 bytes");
+
+/// Whether a value holds a `TIMESTAMPTZ` or a `TIMETZ` anywhere inside it.
+fn zoned_inside(value: &Value) -> bool {
+    match value {
+        Value::TimestampTz(_) | Value::TimeTz(_) => true,
+        Value::List { values, .. } => values.iter().any(zoned_inside),
+        Value::Struct(fields) => fields.iter().any(|(_, value)| zoned_inside(value)),
+        Value::Map { entries, .. } => {
+            entries.iter().any(|(key, value)| zoned_inside(key) || zoned_inside(value))
+        }
+        _ => false,
+    }
+}

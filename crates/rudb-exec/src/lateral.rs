@@ -16,7 +16,7 @@
 //! opening the file, and it refuses a name that is not a constant, so `read_csv` of a correlated
 //! column never reaches a plan at all.
 
-use rudb_common::{Cancel, Error, LogicalType, Result, Session, Value};
+use rudb_common::{Cancel, Error, LogicalType, Result, Session, SessionTimeZone, Value};
 use rudb_functions::{TableFunction, series_length};
 use rudb_kernels::Stepping;
 use rudb_pipeline::{Progress, Stream};
@@ -39,6 +39,8 @@ pub(crate) struct LateralSeries {
     types: Vec<LogicalType>,
     /// The type of the column the series produces, BIGINT or a moment.
     produced: LogicalType,
+    /// The zone a series of `TIMESTAMPTZ` steps its days and months in.
+    time_zone: SessionTimeZone,
     cancel: Cancel,
 }
 
@@ -66,6 +68,7 @@ impl LateralSeries {
     #[must_use]
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.args = self.args.in_session(session);
+        self.time_zone = session.session_time_zone();
         self
     }
 
@@ -122,6 +125,7 @@ impl LateralSeries {
             types: schema.types(),
             produced: made,
             schema,
+            time_zone: SessionTimeZone::default(),
             cancel: cancel.clone(),
         })
     }
@@ -149,7 +153,7 @@ impl LateralSeries {
             for row in 0..chunk.len() {
                 let (start, stop, step) =
                     (start.value_at(row), stop.value_at(row), step.value_at(row));
-                calls.push(moments(self.function, &start, &stop, &step)?);
+                calls.push(moments(self.function, &start, &stop, &step, self.time_zone)?);
             }
             return Ok(calls);
         }
