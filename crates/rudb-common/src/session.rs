@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use chrono::{Offset, TimeZone as _, Utc};
+use chrono::{LocalResult, Offset, TimeDelta, TimeZone as _, Utc};
 use chrono_tz::Tz;
 
 use crate::Rules;
@@ -243,14 +243,125 @@ impl Default for SessionTimeZone {
     }
 }
 
+/// Seconds in 400 Gregorian years, after which the calendar and every rule written in it repeat.
+const CYCLE_SECONDS: i64 = 146_097 * 86_400;
+
+/// Seconds either side of 1970 that chrono can turn into a date, which stops near the year 262143.
+const HELD_SECONDS: i64 = 8_000_000_000_000;
+
+/// The same moment of the 400 year cycle moved inside what chrono holds.
+///
+/// A timestamp reaches the year 294247 and chrono does not, but a zone's offset only depends on
+/// where in the cycle a moment is, so the offset of the moved moment is the offset of the real one.
+fn held(seconds: i64) -> i64 {
+    if seconds.abs() <= HELD_SECONDS {
+        return seconds;
+    }
+    let cycles = (seconds.abs() - HELD_SECONDS) / CYCLE_SECONDS + 1;
+    seconds - seconds.signum() * cycles * CYCLE_SECONDS
+}
+
+/// The first second of 2038, where the bundled zone tables stop listing transitions.
+const TABLE_END: i64 = 2_145_916_800;
+
+/// The years a moment after [`TABLE_END`] is moved into, which are recent enough to follow the
+/// rules a zone has now and long enough to hold every layout a year can have.
+const RULE_YEARS: std::ops::RangeInclusive<i32> = 2010..=2037;
+
+fn leap(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
 impl SessionTimeZone {
+    /// The offset chrono holds for a moment it can turn into a date.
+    fn listed_offset(self, seconds: i64) -> i32 {
+        let Some(utc) = Utc.timestamp_opt(seconds, 0).single() else { return 0 };
+        self.0.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc()
+    }
+
+    /// The same moment of a year that the zone tables list, which has the offset the real moment
+    /// has under the zone's current rules.
+    ///
+    /// The tables stop in 2037, and after that chrono answers the last offset it listed forever,
+    /// which is winter time in New York for the rest of the calendar. ICU carries the zone's last
+    /// rule on instead, so a zone still changing its clocks in 2037 gets the moment moved to one of
+    /// [`RULE_YEARS`] that starts on the same weekday and is a leap year exactly when the real year
+    /// is, where every rule written as a weekday of a month lands on the same dates.
+    fn listed(self, seconds: i64) -> i64 {
+        let seconds = held(seconds);
+        if seconds < TABLE_END
+            || self.listed_offset(TABLE_END - 183 * 86_400) == self.listed_offset(TABLE_END - 1)
+        {
+            return seconds;
+        }
+        let Ok(days) = i32::try_from(seconds.div_euclid(86_400)) else { return seconds };
+        let (year, _, _) = crate::civil_from_days(days);
+        let start = i64::from(crate::days_from_civil(year, 1, 1));
+        RULE_YEARS
+            .rev()
+            .map(|candidate| (candidate, i64::from(crate::days_from_civil(candidate, 1, 1))))
+            .find(|(candidate, first)| {
+                leap(*candidate) == leap(year) && (start - first).rem_euclid(7) == 0
+            })
+            .map_or(seconds, |(_, first)| seconds - (start - first) * 86_400)
+    }
+
+    /// The zone a name spells, with case ignored the way the pin's ICU lookup ignores it, or `None`
+    /// for a name the bundled time zone database does not know.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        if let Ok(zone) = name.parse::<Tz>() {
+            return Some(Self(zone));
+        }
+        chrono_tz::TZ_VARIANTS
+            .iter()
+            .find(|zone| zone.name().eq_ignore_ascii_case(name))
+            .map(|zone| Self(*zone))
+    }
+
+    /// Whether the zone is UTC, where every wall clock is its instant and nothing needs moving.
+    #[must_use]
+    pub fn is_utc(self) -> bool {
+        matches!(self.0, chrono_tz::UTC | chrono_tz::Etc::UTC)
+    }
+
+    /// The canonical IANA name of the zone.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        self.0.name()
+    }
+
     /// The UTC offset in seconds at an instant expressed as Unix microseconds.
     #[must_use]
     pub fn offset_seconds_at(self, micros: i64) -> i32 {
-        let seconds = micros.div_euclid(1_000_000);
-        let nanos = u32::try_from(micros.rem_euclid(1_000_000) * 1_000).unwrap_or_default();
-        let Some(utc) = Utc.timestamp_opt(seconds, nanos).single() else { return 0 };
-        self.0.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc()
+        self.listed_offset(self.listed(micros.div_euclid(1_000_000)))
+    }
+
+    /// The wall clock this zone reads at an instant, both as Unix microseconds, or `None` when the
+    /// reading is past the end of the `i64`.
+    #[must_use]
+    pub fn local_of_instant(self, micros: i64) -> Option<i64> {
+        micros.checked_add(i64::from(self.offset_seconds_at(micros)) * 1_000_000)
+    }
+
+    /// The instant a wall clock reading in this zone names, both as Unix microseconds.
+    ///
+    /// This is what an ICU calendar answers when its fields are set, which settles the two readings
+    /// that do not name exactly one instant the way ICU's defaults do. A reading the clocks skipped
+    /// over is read with the offset from before the jump, so 02:30 on the morning New York moves to
+    /// summer time is 03:30 summer time. A reading the clocks passed twice is the second of the two.
+    /// `None` when the instant is past the end of the `i64`.
+    #[must_use]
+    pub fn instant_of_local(self, micros: i64) -> Option<i64> {
+        let seconds = self.listed(micros.div_euclid(1_000_000));
+        let local = Utc.timestamp_opt(seconds, 0).single()?.naive_utc();
+        let offset = match self.0.offset_from_local_datetime(&local) {
+            LocalResult::Single(offset) | LocalResult::Ambiguous(_, offset) => offset.fix(),
+            LocalResult::None => {
+                self.0.offset_from_utc_datetime(&(local - TimeDelta::days(1))).fix()
+            }
+        };
+        micros.checked_sub(i64::from(offset.local_minus_utc()) * 1_000_000)
     }
 }
 
@@ -282,7 +393,7 @@ impl Session {
 
     /// Sets the time zone after it has been validated by the setting layer.
     pub fn set_time_zone(&mut self, name: &str) {
-        self.time_zone = name.parse().unwrap_or(chrono_tz::UTC);
+        self.time_zone = SessionTimeZone::named(name).map_or(chrono_tz::UTC, |zone| zone.0);
     }
 
     /// The canonical IANA name of the session time zone.
@@ -447,7 +558,7 @@ impl Session {
     /// Whether the bundled time-zone database knows this name.
     #[must_use]
     pub fn knows_time_zone(name: &str) -> bool {
-        name.parse::<Tz>().is_ok()
+        SessionTimeZone::named(name).is_some()
     }
 
     /// The UTC offset in seconds at an instant expressed as Unix microseconds.

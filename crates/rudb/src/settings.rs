@@ -600,10 +600,13 @@ impl Settings {
                     None => self.default_time_zone.clone(),
                     Some(value) => text_of(value),
                 };
-                if !Session::knows_time_zone(&zone) {
+                // The pin keeps the name its lookup found, so a zone set in the wrong case reads
+                // back in the right one.
+                let Some(named) = rudb_common::SessionTimeZone::named(&zone) else {
                     return Err(Error::not_implemented(format!("Unknown TimeZone '{zone}'!")));
-                }
-                *self.time_zone.write().unwrap_or_else(|held| held.into_inner()) = zone;
+                };
+                *self.time_zone.write().unwrap_or_else(|held| held.into_inner()) =
+                    named.name().to_string();
             }
             "allow_parser_override_extension" => {
                 let written = value.map_or("DEFAULT".to_string(), text_of);

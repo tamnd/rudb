@@ -443,9 +443,11 @@ impl Value {
             Self::TimestampTz(micros) if *micros == i64::MAX || *micros == -i64::MAX => {
                 self.to_string()
             }
+            // The wall clock moves by the whole offset and the offset is written in whole minutes,
+            // the way the pin's ICU cast writes it, so New York before 1883 is `19:03:58-04:56`.
             Self::TimestampTz(micros) => {
                 let local = micros.saturating_add(i64::from(offset_seconds) * 1_000_000);
-                format!("{}{}", Self::Timestamp(local), offset_text(offset_seconds))
+                format!("{}{}", Self::Timestamp(local), offset_text(offset_seconds / 60 * 60))
             }
             Self::TimeTz(micros) => {
                 format!("{}{}", Self::Time(*micros), offset_text(offset_seconds))
@@ -455,7 +457,10 @@ impl Value {
     }
 }
 
-fn offset_text(seconds: i32) -> String {
+/// An offset from UTC the way the pin writes one: the hours, then the minutes and the seconds only
+/// when they are not zero, so `-04`, `+05:30` and `-04:56:02`.
+#[must_use]
+pub fn offset_text(seconds: i32) -> String {
     let sign = if seconds < 0 { '-' } else { '+' };
     let absolute = seconds.unsigned_abs();
     let hours = absolute / 3600;
