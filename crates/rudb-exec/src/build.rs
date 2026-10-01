@@ -1505,8 +1505,10 @@ pub fn walks_siblings(plan: &Plan, catalog: &Catalog) -> bool {
 /// the equalities has to hold that table's linked column equal to a column of the rows the join
 /// keeps or drops. That link has to reach every child, since a child with no parent is one the
 /// walk cannot find, and the parent has to have a key map over the column the link was built
-/// against. The rest of the conditions have to be more than that one equality, because a join
-/// that is only the equality is a link join already and costs less. See `crate::siblings`.
+/// against. The rest of the conditions have to be more than that one equality, because a join of
+/// equalities alone is a link join already and costs less, with one exception: the one equality
+/// over the child table read whole, which only asks whether the row's parent has a child at all.
+/// See `crate::siblings`.
 ///
 /// `None` on anything else, including a catalog error, because the join it falls back to is the
 /// same hash join it always was.
@@ -1521,14 +1523,18 @@ fn walk(
         return None;
     }
     let conditions = plan.expr_list(conditions);
-    if conditions.iter().all(|&condition| equated(plan, condition).is_some()) {
-        return None;
-    }
     let mut tests = Vec::new();
     let mut node = right;
     while let Node::Filter { input, predicate } = *plan.node(node) {
         tests.push(predicate);
         node = input;
+    }
+    // The one equality over the child read whole is a test of whether the row's parent has a child
+    // at all, which the link or the adjacency answers without the child table being read. TPC-H q22
+    // asks for customers with no orders this way, and the hash join read all of `orders` for it.
+    let bare = conditions.len() == 1 && tests.is_empty();
+    if !bare && conditions.iter().all(|&condition| equated(plan, condition).is_some()) {
+        return None;
     }
     let (table, index, columns) = whole_table(plan, catalog, node).ok()??;
     let rows = table.rows().stored()?;
@@ -1554,8 +1560,8 @@ fn walk(
     if link.linked() != link.children() {
         return None;
     }
-    let degrees = rudb_native::graph::stored_degrees(rows, child_column)?;
-    if degrees.highest() > MOST_SIBLINGS {
+    // No pair is made when there is nothing to test, so a parent with many children costs nothing.
+    if !bare && rudb_native::graph::stored_degrees(rows, child_column)?.highest() > MOST_SIBLINGS {
         return None;
     }
     let children = if link.form() == rudb_graph::link::Form::Monotone {
