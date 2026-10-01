@@ -2320,6 +2320,18 @@ fn index_section(parts: usize) -> Result<usize> {
         .ok_or_else(|| invalid("index page length overflow"))
 }
 
+/// What a writer starting a table does with a table of the same name the committed generation
+/// holds with rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Same {
+    /// Refuses it, for a writer that means to add a table the file does not have.
+    Refuse,
+    /// Keeps its stripes and writes after them. See [`Writer::extend`].
+    Extend,
+    /// Drops it from the catalog and writes the table from nothing. See [`Writer::replace`].
+    Replace,
+}
+
 impl Writer {
     /// Opens a committed file and starts a table in the generation after the one it holds.
     ///
@@ -2359,7 +2371,7 @@ impl Writer {
         name: impl Into<String>,
         fields: Vec<Field>,
     ) -> Result<Self> {
-        Self::begin(fs, path.as_ref(), name.into(), fields, false)
+        Self::begin(fs, path.as_ref(), name.into(), fields, Same::Refuse)
     }
 
     /// [`Writer::open`] for a table the file already holds with rows, whose stripes the new
@@ -2382,7 +2394,27 @@ impl Writer {
         name: impl Into<String>,
         fields: Vec<Field>,
     ) -> Result<Self> {
-        Self::begin(&RealFilesystem::new(), path.as_ref(), name.into(), fields, true)
+        Self::begin(&RealFilesystem::new(), path.as_ref(), name.into(), fields, Same::Extend)
+    }
+
+    /// [`Writer::open`] for a table the file already holds with rows, which this generation writes
+    /// again from nothing. The old stripes stay in the file where they are, named by the
+    /// generations before this one and by nothing after it.
+    ///
+    /// This is a checkpoint of a table that rows were deleted from or changed in costing that
+    /// table, and not every other table in the file as well. The space the old stripes held is
+    /// only given back by a rewrite of the whole file, which the caller weighs against how much of
+    /// the file is still live.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::open`], except that a table of this name with rows is the point.
+    pub fn replace(
+        path: impl AsRef<Path>,
+        name: impl Into<String>,
+        fields: Vec<Field>,
+    ) -> Result<Self> {
+        Self::begin(&RealFilesystem::new(), path.as_ref(), name.into(), fields, Same::Replace)
     }
 
     fn begin(
@@ -2390,7 +2422,7 @@ impl Writer {
         path: &Path,
         name: String,
         fields: Vec<Field>,
-        extend: bool,
+        taking: Same,
     ) -> Result<Self> {
         for field in &fields {
             type_tag(&field.ty)?;
@@ -2415,10 +2447,11 @@ impl Writer {
         // than memory became a load that needed memory the size of the table.
         let mut held = None;
         if let Some(at) = closed.iter().position(|held| held.name == name) {
-            if closed[at].rows > 0 && !extend {
+            if closed[at].rows > 0 && taking == Same::Refuse {
                 return Err(invalid("two tables in one native file have the same name"));
             }
-            held = Some(closed.remove(at));
+            let entry = closed.remove(at);
+            held = (taking == Same::Extend).then_some(entry);
         }
         // The generation of the slot whose bytes checksummed, and not the highest number in the
         // header. A slot torn across a write can hold any number at all, and taking that one would
@@ -2621,7 +2654,7 @@ impl Writer {
     /// If the name repeats a table already closed, a field has no scalar encoding, or the table
     /// being closed cannot be written.
     pub fn next(self, name: impl Into<String>, fields: Vec<Field>) -> Result<Self> {
-        self.follow(name.into(), fields, false)
+        self.follow(name.into(), fields, Same::Refuse)
     }
 
     /// [`Writer::next`] for a table the file already holds with rows, the way [`Writer::extend`]
@@ -2631,10 +2664,20 @@ impl Writer {
     ///
     /// The same as [`Writer::next`] and [`Writer::extend`].
     pub fn next_extending(self, name: impl Into<String>, fields: Vec<Field>) -> Result<Self> {
-        self.follow(name.into(), fields, true)
+        self.follow(name.into(), fields, Same::Extend)
     }
 
-    fn follow(mut self, name: String, fields: Vec<Field>, extend: bool) -> Result<Self> {
+    /// [`Writer::next`] for a table the file already holds with rows, the way
+    /// [`Writer::replace`] is [`Writer::open`] for one.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::next`] and [`Writer::replace`].
+    pub fn next_replacing(self, name: impl Into<String>, fields: Vec<Field>) -> Result<Self> {
+        self.follow(name.into(), fields, Same::Replace)
+    }
+
+    fn follow(mut self, name: String, fields: Vec<Field>, taking: Same) -> Result<Self> {
         for field in &fields {
             type_tag(&field.ty)?;
         }
@@ -2647,10 +2690,11 @@ impl Writer {
         // has no pages to carry and the load writing it now is the one that fills it.
         let mut held = None;
         if let Some(at) = self.closed.iter().position(|held| held.name == name) {
-            if self.closed[at].rows > 0 && !extend {
+            if self.closed[at].rows > 0 && taking == Same::Refuse {
                 return Err(invalid("two tables in one native file have the same name"));
             }
-            held = Some(self.closed.remove(at));
+            let entry = self.closed.remove(at);
+            held = (taking == Same::Extend).then_some(entry);
         }
         let Self { file, at, wide, generation, mut closed, views, card, anchor, .. } = self;
         closed.push(entry);
