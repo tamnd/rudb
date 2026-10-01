@@ -48,7 +48,7 @@ use crate::datetime::{
     OLDEST_TIMESTAMP, days_in_month,
 };
 use crate::fallback::{self, Kernel};
-use crate::number::{approximate, digits, fit, integral, pow10, rescale};
+use crate::number::{EXACT_IN_DOUBLE, approximate, digits, fit, integral, pow10, rescale};
 use crate::shape::{identity, nulls_of};
 use crate::{maps, nested_text};
 
@@ -736,7 +736,14 @@ fn loosened<M: Fn(usize) -> usize>(
             } else {
                 let factor = pow10(scale) as f64;
                 for index in 0..rows {
-                    out.push(values[at(index)] as f64 / factor);
+                    let value = values[at(index)];
+                    let whole = value as f64;
+                    // Past the exact fast path the division rounds twice, see `decimal_double`.
+                    out.push(if whole.abs() <= EXACT_IN_DOUBLE && scale <= 22 {
+                        whole / factor
+                    } else {
+                        format!("{value}e-{scale}").parse().unwrap_or(whole / factor)
+                    });
                 }
             }
             out
