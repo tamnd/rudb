@@ -70,6 +70,9 @@ pub struct Gone {
     /// For each column, whether an update wrote it, so what the file says about the others still
     /// holds. Empty when nothing was updated.
     touched: Vec<bool>,
+    /// Whether an update wrote rows since the file last said, so the file's record of them is
+    /// behind.
+    fresh: bool,
 }
 
 /// Two records are the same when they mark the same rows and hold the same patches, which are
@@ -79,6 +82,7 @@ impl PartialEq for Gone {
         self.parts == other.parts
             && self.total == other.total
             && self.touched == other.touched
+            && self.fresh == other.fresh
             && self.patches.len() == other.patches.len()
             && self.patches.iter().zip(&other.patches).all(|pair| match pair {
                 (Some(one), Some(two)) => Arc::ptr_eq(one, two),
@@ -98,6 +102,7 @@ impl Gone {
             total: 0,
             patches: vec![None; parts],
             touched: Vec::new(),
+            fresh: false,
         }
     }
 
@@ -118,6 +123,14 @@ impl Gone {
             gone.counts[*part] = lost;
             gone.total += lost as usize;
         }
+        for patch in &stored.patches {
+            let held = gone.patches.get_mut(patch.part).ok_or_else(|| {
+                Error::internal("patched rows name a part the file does not have")
+            })?;
+            let rows = Chunk::with_rows(patch.columns.clone(), patch.slots.len())?;
+            *held = Some(Arc::new(Patch { slots: patch.slots.clone(), rows }));
+        }
+        gone.touched.clone_from(&stored.touched);
         Ok(gone)
     }
 
@@ -130,7 +143,37 @@ impl Gone {
             .enumerate()
             .filter_map(|(part, bits)| bits.as_ref().map(|bits| (part, Box::from(&bits[..]))))
             .collect();
-        rudb_native::GoneRows { parts, total: self.total, sums: Vec::new() }
+        let patches = self
+            .patches
+            .iter()
+            .enumerate()
+            .filter_map(|(part, patch)| {
+                patch.as_ref().map(|patch| rudb_native::PatchedRows {
+                    part,
+                    slots: patch.slots.clone(),
+                    columns: patch.rows.columns().to_vec(),
+                })
+            })
+            .collect();
+        rudb_native::GoneRows {
+            parts,
+            total: self.total,
+            sums: Vec::new(),
+            patches,
+            touched: self.touched.clone(),
+        }
+    }
+
+    /// Whether an update wrote rows since the file last said.
+    #[must_use]
+    pub fn is_fresh(&self) -> bool {
+        self.fresh
+    }
+
+    /// How many rows the updates wrote over, in all.
+    #[must_use]
+    pub fn patched_rows(&self) -> usize {
+        self.patches.iter().flatten().map(|patch| patch.slots.len()).sum()
     }
 
     /// How many rows are gone in all.
@@ -200,7 +243,11 @@ impl Gone {
                     .columns()
                     .iter()
                     .map(|column| {
-                        assemble::interleave(column.logical_type(), &[column.clone()], &order)
+                        assemble::interleave(
+                            column.logical_type(),
+                            std::slice::from_ref(column),
+                            &order,
+                        )
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Patch { slots, rows: Chunk::with_rows(columns, order.len())? }
@@ -238,6 +285,7 @@ impl Gone {
             }
         };
         *held = Some(Arc::new(patch));
+        self.fresh = true;
         let width = rows.width().max(self.touched.len());
         self.touched.resize(width, false);
         for &column in columns {

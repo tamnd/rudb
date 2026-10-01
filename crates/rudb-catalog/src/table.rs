@@ -65,6 +65,11 @@ pub fn duplicate_check(columns: &[Field]) -> Result<()> {
     Ok(())
 }
 
+/// The share of a file's rows an update can have written over before a checkpoint writes the table
+/// again rather than the rows beside it: a quarter. Each read of a patched part lays the new rows
+/// over the old, and past that point a table written again reads faster than the work saved.
+const PATCHED_SHARE: usize = 4;
+
 /// Rows held while a table is being built or read from a committed native snapshot.
 #[derive(Debug, Clone)]
 pub enum Rows {
@@ -994,7 +999,7 @@ impl Rows {
             // The rows gone only ever grow from what the file recorded, so the same count is the
             // same rows.
             Self::Masked(reader, gone) => {
-                !gone.is_patched() && reader.gone().map_or(0, |stored| stored.total) == gone.total()
+                !gone.is_fresh() && reader.gone().map_or(0, |stored| stored.total) == gone.total()
             }
             Self::Memory(_) | Self::Grown(..) => false,
         }
@@ -1004,12 +1009,16 @@ impl Rows {
     #[must_use]
     pub fn markable(&self) -> bool {
         matches!(self, Self::Masked(reader, gone)
-            if !gone.is_patched() && !self.is_stored() && gone.total() * 2 <= reader.table().rows())
+            if !self.is_stored()
+                && gone.total() * 2 <= reader.table().rows()
+                && gone.patched_rows() * PATCHED_SHARE <= reader.table().rows())
     }
 
     /// For a table whose file is still the one it was read from and some of whose rows a delete
     /// took out since the file last said, every row gone from it, for a checkpoint to write down
     /// beside the file rather than write the rest of the table again.
+    ///
+    /// The rows an update wrote over go with it, see [`PATCHED_SHARE`].
     ///
     /// `None` once half the file's rows are gone. The gone rows still take their space in the
     /// file, and past that point writing the rest of the table again is what gives it back, at a
@@ -1805,7 +1814,9 @@ impl Table {
             Rows::Memory(_) | Rows::Grown(_, _) => false,
             // Rows taken out of an order leave the rest in it, so a table with rows gone keeps the
             // declaration its file was written under. Rows an update wrote need not.
-            Rows::Masked(_, gone) if gone.is_patched() => false,
+            Rows::Masked(reader, gone) if gone.is_patched() => {
+                reader.table().clustering().is_none() && self.clustering.is_none()
+            }
             Rows::Native(reader) | Rows::Masked(reader, _) => {
                 reader.table().clustering() == self.clustering.as_ref()
             }

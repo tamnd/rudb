@@ -90,6 +90,9 @@ const DEVICE_CARD: &[u8; 8] = b"RUDBDV10";
 /// it is a file it refuses rather than one it reads with those rows back in. A file nothing was
 /// deleted from never writes the extension and still opens in those builds.
 const GONE_ROWS: &[u8; 8] = b"RUDBGR10";
+/// The same record, written instead of [`GONE_ROWS`] when a table also holds rows an update wrote,
+/// so a build that cannot lay those over the table refuses the file rather than read old values.
+const GONE_PATCHED: &[u8; 8] = b"RUDBGR11";
 const MAX_CATALOG_FREQUENCIES: usize = 64;
 /// How many parts [`Reader::matched`] runs a pattern over, spread evenly across the table.
 ///
@@ -1379,6 +1382,8 @@ struct Entry {
     /// Where the rows a delete took out of the table are recorded, when any were. See
     /// [`GoneRows`].
     gone: Option<Page>,
+    /// Whether that record holds rows an update wrote too, see [`GoneRows::patches`].
+    patched: bool,
 }
 
 type StoredIntegerExtremes = Option<Option<(i128, i128)>>;
@@ -1395,7 +1400,7 @@ type StoredIntegerExtremes = Option<Option<(i128, i128)>>;
 /// right, but a count or a sum is not, and the catalog keeps none of those for a table with rows
 /// gone from it. A reader that reads the rows of such a table without going through these bits
 /// reads the gone ones back, which is why [`Catalog::table_fields`] says nothing about it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GoneRows {
     /// Each part that lost a row, rising, with its bits.
     pub parts: Vec<(usize, Box<[u64]>)>,
@@ -1405,9 +1410,40 @@ pub struct GoneRows {
     /// were counted, so a sum over the table is the file's sum less this one rather than a scan.
     /// Empty when no column was counted. See [`Reader::gone_sums`].
     pub sums: Vec<Option<(i128, u64)>>,
+    /// The rows an `UPDATE` wrote over rows of the table, by part, rising. Empty when no update
+    /// wrote any.
+    pub patches: Vec<PatchedRows>,
+    /// For each column, whether an update wrote it, so what the file says about the others still
+    /// holds. Empty when no update wrote any.
+    pub touched: Vec<bool>,
+}
+
+/// Reads the bytes of one page of a file, for [`GoneRows::decode_patched`].
+type PageRead<'a> = &'a mut dyn FnMut(&Page) -> Result<Vec<u8>>;
+
+/// The rows an `UPDATE` wrote into one part of a committed table, kept beside the table the way
+/// its gone rows are rather than by writing the table again. A read of the part lays them over the
+/// rows they replace.
+///
+/// Each column of them is a page of its own, written the way a part's pages are, and the record
+/// names the pages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatchedRows {
+    /// The part, numbered the way [`Reader::part_rows`] numbers them.
+    pub part: usize,
+    /// The rows of the part the new rows replace, rising.
+    pub slots: Vec<u32>,
+    /// Every column of the new rows, one value for each of `slots` in the same order.
+    pub columns: Vec<Vector>,
 }
 
 impl GoneRows {
+    /// Whether an update wrote any row.
+    #[must_use]
+    pub fn is_patched(&self) -> bool {
+        !self.touched.is_empty()
+    }
+
     /// The bits of part `part`, when it lost any rows.
     #[must_use]
     pub fn bits(&self, part: usize) -> Option<&[u64]> {
@@ -1415,8 +1451,10 @@ impl GoneRows {
     }
 
     /// The record as it goes into the file: how many parts there are, then each part's number, the
-    /// count of its words and the words.
-    fn encode(&self) -> Result<Vec<u8>> {
+    /// count of its words and the words. When `pages` is there the rows an update wrote follow,
+    /// `pages` being where each column of each patch went in the file. A patched record always
+    /// says how many sums it has, even none, because the patches come after them.
+    fn encode_naming(&self, pages: Option<&[Vec<Page>]>) -> Result<Vec<u8>> {
         let words = self.parts.iter().map(|(_, bits)| bits.len()).sum::<usize>();
         let mut out = Vec::with_capacity(4 + self.parts.len() * 8 + words * 8);
         put_u32(&mut out, u32::try_from(self.parts.len()).map_err(|_| invalid("too many parts"))?);
@@ -1428,7 +1466,7 @@ impl GoneRows {
             }
         }
         // The sums go after the bits, so a record without them is the bits alone.
-        if !self.sums.is_empty() {
+        if !self.sums.is_empty() || pages.is_some() {
             put_u32(
                 &mut out,
                 u32::try_from(self.sums.len()).map_err(|_| invalid("too many columns"))?,
@@ -1440,11 +1478,52 @@ impl GoneRows {
                 put_u64(&mut out, count);
             }
         }
+        if let Some(pages) = pages {
+            if pages.len() != self.patches.len() {
+                return Err(invalid("patch pages differ from the patches"));
+            }
+            put_u32(
+                &mut out,
+                u32::try_from(self.touched.len()).map_err(|_| invalid("too many columns"))?,
+            );
+            out.extend(self.touched.iter().map(|&touched| u8::from(touched)));
+            put_u32(
+                &mut out,
+                u32::try_from(self.patches.len()).map_err(|_| invalid("too many patches"))?,
+            );
+            for (patch, pages) in self.patches.iter().zip(pages) {
+                put_u32(
+                    &mut out,
+                    u32::try_from(patch.part).map_err(|_| invalid("part number overflow"))?,
+                );
+                put_u32(
+                    &mut out,
+                    u32::try_from(patch.slots.len()).map_err(|_| invalid("patch too long"))?,
+                );
+                for &slot in &patch.slots {
+                    put_u32(&mut out, slot);
+                }
+                if pages.len() != self.touched.len() {
+                    return Err(invalid("patch pages differ from the table's columns"));
+                }
+                for page in pages {
+                    put_u64(&mut out, page.offset);
+                    put_u32(&mut out, page.length);
+                    put_u64(&mut out, page.hash);
+                }
+            }
+        }
         Ok(out)
     }
 
     /// Reads the record back, checking each part against the rows the table says it has.
-    fn decode(bytes: &[u8], places: &[Place]) -> Result<Self> {
+    /// Reads the record back, and when `patched` is there the rows an update wrote too, of the
+    /// table of those fields, each page through the reader it hands.
+    fn decode_patched(
+        bytes: &[u8],
+        places: &[Place],
+        patched: Option<(&[Field], PageRead<'_>)>,
+    ) -> Result<Self> {
         let mut cur = Cursor::new(bytes);
         let count = cur.u32()? as usize;
         if count > places.len() {
@@ -1476,7 +1555,7 @@ impl GoneRows {
         let mut sums = Vec::new();
         if !cur.done() {
             let width = cur.u32()? as usize;
-            if width == 0 || width > bytes.len() {
+            if (width == 0 && patched.is_none()) || width > bytes.len() {
                 return Err(invalid("gone row sums have a bad width"));
             }
             for _ in 0..width {
@@ -1492,10 +1571,67 @@ impl GoneRows {
                 });
             }
         }
+        let mut patches = Vec::new();
+        let mut touched = Vec::new();
+        if let Some((fields, read)) = patched {
+            let width = cur.u32()? as usize;
+            if width != fields.len() {
+                return Err(invalid("patched rows differ from the table's columns"));
+            }
+            for _ in 0..width {
+                touched.push(match cur.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(invalid("patched column tag differs")),
+                });
+            }
+            if !touched.contains(&true) {
+                return Err(invalid("patched rows name no column"));
+            }
+            let count = cur.u32()? as usize;
+            if count == 0 || count > places.len() {
+                return Err(invalid("patched rows name no part or more than the table has"));
+            }
+            for _ in 0..count {
+                let part = cur.u32()? as usize;
+                if patches.last().is_some_and(|last: &PatchedRows| last.part >= part)
+                    || part >= places.len()
+                {
+                    return Err(invalid("patched rows name parts out of order or past the table"));
+                }
+                let rows = places[part].rows;
+                let len = cur.u32()? as usize;
+                if len == 0 || len > rows as usize {
+                    return Err(invalid("patched rows are more than their part"));
+                }
+                let mut slots = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let slot = cur.u32()?;
+                    if slot >= rows || slots.last().is_some_and(|&last| last >= slot) {
+                        return Err(invalid("patched rows are out of order or past their part"));
+                    }
+                    slots.push(slot);
+                }
+                let mut columns = Vec::with_capacity(width);
+                for field in fields {
+                    let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+                    let bytes = read(&page)?;
+                    if checksum(&bytes) != page.hash {
+                        return Err(invalid("a patched page does not checksum"));
+                    }
+                    let column = decode(&field.ty, len, &bytes, None)?;
+                    if column.len() != len {
+                        return Err(invalid("a patched page differs from its rows"));
+                    }
+                    columns.push(column);
+                }
+                patches.push(PatchedRows { part, slots, columns });
+            }
+        }
         if !cur.done() {
             return Err(invalid("gone rows have trailing bytes"));
         }
-        Ok(Self { parts, total, sums })
+        Ok(Self { parts, total, sums, patches, touched })
     }
 }
 
@@ -1512,10 +1648,35 @@ fn mark_gone(
     entry: &mut Entry,
     gone: &GoneRows,
 ) -> Result<()> {
-    entry.gone = if gone.total == 0 {
+    entry.patched = gone.is_patched();
+    entry.gone = if gone.total == 0 && !entry.patched {
         None
     } else {
-        let bytes = gone.encode()?;
+        // The pages of the rows an update wrote go first, so the record can name them.
+        let mut pages = Vec::with_capacity(gone.patches.len());
+        for patch in &gone.patches {
+            if patch.columns.len() != entry.fields.len()
+                || patch.columns.len() != gone.touched.len()
+            {
+                return Err(invalid("patched rows differ from the table's columns"));
+            }
+            let mut named = Vec::with_capacity(patch.columns.len());
+            for column in &patch.columns {
+                if column.len() != patch.slots.len() {
+                    return Err(invalid("patched rows differ from the rows they replace"));
+                }
+                let bytes = encode(column, &mut Settling::default())?;
+                let offset = append(file, at, &bytes)?;
+                named.push(Page {
+                    offset,
+                    length: u32::try_from(bytes.len())
+                        .map_err(|_| invalid("patched page too long"))?,
+                    hash: checksum(&bytes),
+                });
+            }
+            pages.push(named);
+        }
+        let bytes = gone.encode_naming(entry.patched.then_some(&pages[..]))?;
         let offset = append(file, at, &bytes)?;
         Some(Page {
             offset,
@@ -4179,6 +4340,7 @@ impl Writer {
             extremes: table_integer_extremes(&self.table),
             frequencies: table_complete_numeric_frequencies(&self.table),
             gone: None,
+            patched: false,
             directory: Page {
                 offset,
                 length: u32::try_from(directory.len())
@@ -7025,7 +7187,23 @@ impl Catalog {
             if checksum(&bytes) != page.hash {
                 return Err(invalid(&format!("the gone rows of table {name} do not checksum")));
             }
-            let gone = GoneRows::decode(&bytes, &reader.places)?;
+            let size = self.size;
+            let file = &self.file;
+            let mut read = |page: &Page| -> Result<Vec<u8>> {
+                let end = page
+                    .offset
+                    .checked_add(u64::from(page.length))
+                    .ok_or_else(|| invalid("patched page offset overflow"))?;
+                if page.offset < HEADER || end > size || page.length as usize > MAX_PAGE {
+                    return Err(invalid("patched page range is outside the file"));
+                }
+                let mut bytes = vec![0; page.length as usize];
+                read_at(&**file, page.offset, &mut bytes)?;
+                Ok(bytes)
+            };
+            let fields = reader.table.fields.clone();
+            let patched = entry.patched.then_some((&fields[..], &mut read as PageRead<'_>));
+            let gone = GoneRows::decode_patched(&bytes, &reader.places, patched)?;
             if !gone.sums.is_empty() && gone.sums.len() != reader.table.fields.len() {
                 return Err(invalid("gone row sums differ from the table's columns"));
             }
@@ -10766,12 +10944,13 @@ fn encode_catalog(
         }
     }
     if entries.iter().any(|entry| entry.gone.is_some()) {
-        out.extend_from_slice(GONE_ROWS);
+        let patched = entries.iter().any(|entry| entry.patched);
+        out.extend_from_slice(if patched { GONE_PATCHED } else { GONE_ROWS });
         for entry in entries {
             match &entry.gone {
                 None => out.push(0),
                 Some(page) => {
-                    out.push(1);
+                    out.push(if entry.patched { 2 } else { 1 });
                     put_u64(&mut out, page.offset);
                     put_u32(&mut out, page.length);
                     put_u64(&mut out, page.hash);
@@ -10856,6 +11035,7 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<Decoded> {
             extremes,
             frequencies,
             gone: None,
+            patched: false,
         });
     }
     // A catalog that ends where the tables end is a catalog with no views in it, which is every
@@ -11051,12 +11231,19 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<Decoded> {
     // first magic it does not know, which is how a file it cannot read whole says so.
     while !cur.done() {
         let tag = cur.take(8)?;
-        if tag == GONE_ROWS && !gone && card.is_none() && anchor.is_none() {
+        if (tag == GONE_ROWS || tag == GONE_PATCHED) && !gone && card.is_none() && anchor.is_none()
+        {
             gone = true;
+            let holds_patches = tag == GONE_PATCHED;
             for entry in &mut entries {
-                entry.gone = match cur.u8()? {
+                let kind = cur.u8()?;
+                entry.patched = kind == 2;
+                if entry.patched && !holds_patches {
+                    return Err(invalid("patched rows under a record that has none"));
+                }
+                entry.gone = match kind {
                     0 => None,
-                    1 => {
+                    1 | 2 => {
                         let page =
                             Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
                         let end = page
@@ -16242,6 +16429,7 @@ mod tests {
             extremes: vec![None],
             frequencies: vec![None],
             gone: None,
+            patched: false,
         };
         let anchor = LogAnchor {
             database: 0xfeed,
@@ -16304,6 +16492,7 @@ mod tests {
             extremes: vec![None],
             frequencies: vec![None],
             gone: None,
+            patched: false,
         };
         let card = KeptCard { device: "dev:42".to_string(), bytes: vec![1, 2, 3] };
         let bytes = encode_catalog(&[entry()], &[], Some(&card), None).expect("encodes");
@@ -16406,6 +16595,8 @@ mod tests {
             parts: vec![(0, vec![0b101].into_boxed_slice())],
             total: 2,
             sums: Vec::new(),
+            patches: Vec::new(),
+            touched: Vec::new(),
         };
         Writer::restate_marking(&path, &[], None, &[("items".to_string(), gone.clone())])
             .expect("marks");
@@ -16429,8 +16620,17 @@ mod tests {
             parts: vec![(0, vec![0b1000].into_boxed_slice())],
             total: 1,
             sums: Vec::new(),
+            patches: Vec::new(),
+            touched: Vec::new(),
         };
-        assert!(GoneRows::decode(&bad.encode().expect("encodes"), &reader.places).is_err());
+        assert!(
+            GoneRows::decode_patched(
+                &bad.encode_naming(None).expect("encodes"),
+                &reader.places,
+                None
+            )
+            .is_err()
+        );
         fs::remove_file(&path).expect("clean up");
     }
 
@@ -16519,8 +16719,12 @@ mod tests {
             second_gone.sums,
             vec![Some((ids, second.len() as u64)), Some((total, count)), None]
         );
-        let back = GoneRows::decode(&second_gone.encode().expect("encodes"), &reader.places)
-            .expect("decodes");
+        let back = GoneRows::decode_patched(
+            &second_gone.encode_naming(None).expect("encodes"),
+            &reader.places,
+            None,
+        )
+        .expect("decodes");
         assert_eq!(back, second_gone);
         fs::remove_file(&path).expect("clean up");
     }
@@ -16540,6 +16744,7 @@ mod tests {
                 extremes: vec![None],
                 frequencies: vec![None],
                 gone: None,
+                patched: false,
             }],
             &[sample_view("items")],
             None,
