@@ -1138,7 +1138,12 @@ impl Prepared {
             }
             Step::Function { recipe, written, start, len } => {
                 Some(self.with_operands(*start, *len, chunk, slots, |args| {
-                    rudb_kernels::call_prepared(recipe, args, ty, Some(&|| written.clone()))
+                    match rudb_kernels::call_in_time_zone(recipe.name(), args, ty, self.time_zone) {
+                        Some(answer) => answer,
+                        None => {
+                            rudb_kernels::call_prepared(recipe, args, ty, Some(&|| written.clone()))
+                        }
+                    }
                 })?)
             }
             Step::InSet { input, members } => {

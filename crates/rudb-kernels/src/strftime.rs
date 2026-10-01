@@ -72,6 +72,9 @@ struct Moment {
     minute: i64,
     second: i64,
     nanos: i64,
+    /// The offset and the name of the zone a `TIMESTAMPTZ` is written in, which `%z` and `%Z`
+    /// write, or `None` for a moment with no zone.
+    zone: Option<(i32, &'static str)>,
 }
 
 pub(crate) const WEEKDAYS: [&str; 7] =
@@ -229,6 +232,16 @@ impl Format {
     ///
     /// If the value is not one of those, which the binder does not let through.
     pub fn write(&self, when: &Value) -> Result<Value> {
+        self.write_in(when, None)
+    }
+
+    /// Writes a moment out the way [`Format::write`] does, with `zone` the offset and the zone
+    /// name that a `TIMESTAMPTZ` already moved to its wall clock was read in.
+    ///
+    /// # Errors
+    ///
+    /// The same ones as [`Format::write`].
+    pub fn write_in(&self, when: &Value, zone: Option<(i32, &'static str)>) -> Result<Value> {
         let (days, nanos_of_day) = match when {
             Value::Null => return Ok(Value::Null),
             Value::Date(day) if crate::datetime::infinite_day(*day) => {
@@ -264,6 +277,7 @@ impl Format {
             minute: seconds / 60 % 60,
             second: seconds % 60,
             nanos: nanos_of_day % 1_000_000_000,
+            zone,
         };
         let mut out = String::with_capacity(32);
         for (literal, spec) in self.literals.iter().zip(&self.specs) {
@@ -325,8 +339,14 @@ impl Moment {
             Spec::Millis => write!(out, "{:03}", self.nanos / 1_000_000),
             Spec::Nanos => write!(out, "{:09}", self.nanos),
             // A plain timestamp is at no offset, and the pin writes that as the hours alone.
-            Spec::Offset => write!(out, "+00"),
-            Spec::ZoneName => Ok(()),
+            Spec::Offset => match self.zone {
+                Some((offset, _)) => write!(out, "{}", rudb_common::offset_text(offset)),
+                None => write!(out, "+00"),
+            },
+            Spec::ZoneName => match self.zone {
+                Some((_, name)) => write!(out, "{name}"),
+                None => Ok(()),
+            },
             Spec::DayOfYearPadded => write!(out, "{:03}", day_of_year + 1),
             Spec::DayOfYear => write!(out, "{}", day_of_year + 1),
             Spec::SundayWeek => write!(out, "{:02}", (day_of_year + 7 - weekday) / 7),

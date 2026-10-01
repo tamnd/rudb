@@ -2472,7 +2472,8 @@ impl<'a> Building<'a, '_> {
                 Segment::new(Arc::new(Watched::new(table, counters)), schema)
             }
             _ => {
-                let series = Series::new(plan, index, name, args)?;
+                let series =
+                    Series::new(plan, index, name, args, self.session.session_time_zone())?;
                 let schema = series.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Series", Some(name));
                 Segment::new(Arc::new(Watched::new(series, counters)), schema)

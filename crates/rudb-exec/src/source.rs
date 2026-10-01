@@ -15,14 +15,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_catalog::Table;
 use rudb_common::stage::{self, Stage};
-use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Session, SessionTimeZone, Value};
 use rudb_csv::{Part, Reader as CsvReader, Split};
 use rudb_encoding::sequence::Sequence;
 use rudb_functions::{
     FILE_ROW_NUMBER, Given, TableFunction, csv_given, open_csv, open_parquet, series_length,
 };
 use rudb_graph::Rids;
-use rudb_kernels::{Stepping, cast, moment_steps};
+use rudb_kernels::{Stepping, cast, moment_steps, zoned_steps};
 use rudb_metrics::Counters;
 use rudb_native::{Reader as NativeReader, RunProjectionPart, RunProjectionScan};
 use rudb_parquet::{Bound, Op, Reader, Test, skips};
@@ -3014,14 +3014,20 @@ impl Series {
     /// # Errors
     ///
     /// Whatever evaluating an argument reports, and a step of zero.
-    pub(crate) fn new(plan: &Plan, index: u32, function: &str, args: Slice) -> Result<Self> {
+    pub(crate) fn new(
+        plan: &Plan,
+        index: u32,
+        function: &str,
+        args: Slice,
+        time_zone: SessionTimeZone,
+    ) -> Result<Self> {
         let Some(function) = TableFunction::lookup(function) else {
             return Err(Error::internal(format!("a plan with a table function called {function}")));
         };
         let exprs: Vec<ExprRef> = plan.expr_list(args).to_vec();
         let source = Schema::empty();
         let one = Chunk::with_rows(Vec::new(), 1)?;
-        let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
+        let evaluated = evaluate_all_in_time_zone(plan, &exprs, &source, &one, time_zone)?;
         if let [start, stop, step] = evaluated.as_slice()
             && *step.logical_type() == LogicalType::Interval
         {
@@ -3029,7 +3035,8 @@ impl Series {
             let schema = Schema::numbered(vec![Field::new(function.name(), ty.clone())], index);
             let empty = Self { ty, ..Self::empty(schema.clone()) };
             let values = (start.value_at(0), stop.value_at(0), step.value_at(0));
-            let Some(stepping) = moments(function, &values.0, &values.1, &values.2)? else {
+            let Some(stepping) = moments(function, &values.0, &values.1, &values.2, time_zone)?
+            else {
                 return Ok(empty);
             };
             let rows = u64::try_from(stepping.len()).unwrap_or(u64::MAX);
@@ -3155,7 +3162,9 @@ pub(crate) fn moments(
     start: &Value,
     stop: &Value,
     step: &Value,
+    time_zone: SessionTimeZone,
 ) -> Result<Option<Stepping>> {
+    let zoned = matches!(start, Value::TimestampTz(_));
     let moment = |value: &Value| match value {
         Value::Timestamp(stamp) | Value::TimestampTz(stamp) => Ok(Some(*stamp)),
         Value::Null => Ok(None),
@@ -3179,7 +3188,11 @@ pub(crate) fn moments(
             "RANGE with composite interval that has mixed signs is not supported",
         ));
     }
-    moment_steps(function.inclusive(), start, stop, (*months, *days, *micros)).map(Some)
+    let interval = (*months, *days, *micros);
+    if zoned {
+        return zoned_steps(function.inclusive(), start, stop, interval, time_zone).map(Some);
+    }
+    moment_steps(function.inclusive(), start, stop, interval).map(Some)
 }
 
 /// A scan of one or more files, Parquet or CSV.

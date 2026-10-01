@@ -174,6 +174,27 @@ fn cast_value_in_time_zone(
     let zone = time_zone.unwrap_or_default();
     let zoned = match (value, target) {
         (Value::Null, _) => None,
+        // A list is cast an element at a time, so an element that reads the zone reads it here.
+        (
+            Value::List { values, .. },
+            LogicalType::List(element) | LogicalType::Array(element, _),
+        ) if reads_time_zone(&value.logical_type(), target) => Some(
+            values
+                .iter()
+                .map(|value| cast_value_in_time_zone(value, element, try_cast, time_zone))
+                .collect::<Result<Vec<_>>>()
+                .and_then(|values| {
+                    let list = Value::List { element: element.as_ref().clone(), values };
+                    cast_value(&list, target, try_cast)
+                }),
+        ),
+        // Text of a nested value writes every zoned value in it the way it writes one on its own.
+        (Value::List { .. } | Value::Struct(_) | Value::Map { .. }, LogicalType::Varchar)
+            if time_zone.is_some() && holds_time_zone(&value.logical_type()) =>
+        {
+            let written = written_in(value, zone);
+            Some(cast_value(&written, target, try_cast))
+        }
         (_, LogicalType::TimestampTz) if value.logical_type() != LogicalType::TimestampTz => {
             Some(to_timestamp_tz_in(value, zone))
         }
@@ -198,10 +219,57 @@ fn cast_value_in_time_zone(
 /// Whether a cast from one type to another reads the session time zone, which is every cast
 /// between a `TIMESTAMP WITH TIME ZONE` and a type without one, so that folding one while the
 /// query is planned, where there is no session, would answer it in UTC.
+///
+/// A nested type reads the zone when one inside it does, and a nested type cast to text reads it
+/// when it holds a zoned value at all, since the text writes that value in the zone.
 #[must_use]
 pub fn reads_time_zone(from: &LogicalType, to: &LogicalType) -> bool {
-    (from == &LogicalType::TimestampTz) != (to == &LogicalType::TimestampTz)
-        && !matches!(from, LogicalType::Null)
+    use LogicalType::{Array, List, Map, Struct, Varchar};
+    match (from, to) {
+        (List(from) | Array(from, _), List(to) | Array(to, _)) => reads_time_zone(from, to),
+        (List(_) | Array(..) | Struct(_) | Map(..), Varchar) => holds_time_zone(from),
+        _ => {
+            (from == &LogicalType::TimestampTz) != (to == &LogicalType::TimestampTz)
+                && !matches!(from, LogicalType::Null)
+        }
+    }
+}
+
+/// Whether a type is or holds a `TIMESTAMP WITH TIME ZONE`.
+fn holds_time_zone(ty: &LogicalType) -> bool {
+    match ty {
+        LogicalType::TimestampTz => true,
+        LogicalType::List(element) | LogicalType::Array(element, _) => holds_time_zone(element),
+        LogicalType::Struct(fields) => fields.iter().any(|field| holds_time_zone(&field.ty)),
+        LogicalType::Map(key, value) => holds_time_zone(key) || holds_time_zone(value),
+        _ => false,
+    }
+}
+
+/// A nested value with every `TIMESTAMPTZ` in it replaced by its text in `zone`, which casts to
+/// the same text the value would, since an element is quoted by what its text holds.
+fn written_in(value: &Value, zone: SessionTimeZone) -> Value {
+    match value {
+        Value::TimestampTz(micros) => {
+            Value::Varchar(value.to_string_at_offset(zone.offset_seconds_at(*micros)))
+        }
+        Value::List { element, values } => Value::List {
+            element: element.clone(),
+            values: values.iter().map(|value| written_in(value, zone)).collect(),
+        },
+        Value::Struct(fields) => Value::Struct(
+            fields.iter().map(|(name, value)| (name.clone(), written_in(value, zone))).collect(),
+        ),
+        Value::Map { key, value, entries } => Value::Map {
+            key: key.clone(),
+            value: value.clone(),
+            entries: entries
+                .iter()
+                .map(|(key, value)| (written_in(key, zone), written_in(value, zone)))
+                .collect(),
+        },
+        other => other.clone(),
+    }
 }
 
 /// Every value of a vector converted without a [`Value`] being built for any of them, or `None`
