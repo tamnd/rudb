@@ -63,9 +63,11 @@ fn the_space_a_table_written_again_leaves_is_given_back() {
     let path = path("space");
     let db = open(&path);
     // Hashed so the columns are most of the file, the way they are in any table worth the question.
-    db.execute("CREATE TABLE big AS SELECT range AS id, hash(range) AS v FROM range(600000)")
+    // The table the deletes go to is most of the file too, so that once enough of it is gone for
+    // the checkpoint to write it again, the space its old stripes leave is most of the file.
+    db.execute("CREATE TABLE big AS SELECT range AS id, hash(range) AS v FROM range(100000)")
         .expect("creates");
-    db.execute("CREATE TABLE t AS SELECT range AS id, hash(range) AS v FROM range(200000)")
+    db.execute("CREATE TABLE t AS SELECT range AS id, hash(range) AS v FROM range(600000)")
         .expect("creates");
     db.execute("CHECKPOINT").expect("checkpoints");
     let first = size(&path);
@@ -83,8 +85,8 @@ fn the_space_a_table_written_again_leaves_is_given_back() {
     drop(db);
 
     let db = open(&path);
-    assert_eq!(value(&db, "SELECT count(*) FROM big"), Value::BigInt(600_000));
-    assert_eq!(value(&db, "SELECT count(*) FROM t"), Value::BigInt(40_000));
+    assert_eq!(value(&db, "SELECT count(*) FROM big"), Value::BigInt(100_000));
+    assert_eq!(value(&db, "SELECT count(*) FROM t"), Value::BigInt(120_000));
     assert_eq!(value(&db, "SELECT count(*) FROM t WHERE id % 10 < 8"), Value::BigInt(0));
     drop(db);
     remove(&path);

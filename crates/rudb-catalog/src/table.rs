@@ -907,6 +907,52 @@ impl Rows {
         matches!(self, Self::Native(_))
     }
 
+    /// The rows of a committed file, with the rows the file records as gone taken out.
+    ///
+    /// # Errors
+    ///
+    /// If what the file records names a part it does not have.
+    pub fn of_file(reader: NativeReader) -> Result<Self> {
+        let Some(stored) = reader.gone() else { return Ok(Self::Native(reader)) };
+        let gone = Gone::stored(reader.parts(), stored)?;
+        Ok(Self::Masked(reader, Arc::new(gone)))
+    }
+
+    /// Whether the file behind these rows already says everything about them, so a checkpoint
+    /// carries the table forward as it is. A table some rows were deleted from counts once the file
+    /// records those rows as gone.
+    #[must_use]
+    pub fn is_stored(&self) -> bool {
+        match self {
+            Self::Native(_) => true,
+            // The rows gone only ever grow from what the file recorded, so the same count is the
+            // same rows.
+            Self::Masked(reader, gone) => {
+                reader.gone().map_or(0, |stored| stored.total) == gone.total()
+            }
+            Self::Memory(_) | Self::Grown(..) => false,
+        }
+    }
+
+    /// For a table whose file is still the one it was read from and some of whose rows a delete
+    /// took out since the file last said, every row gone from it, for a checkpoint to write down
+    /// beside the file rather than write the rest of the table again.
+    ///
+    /// `None` once half the file's rows are gone. The gone rows still take their space in the
+    /// file, and past that point writing the rest of the table again is what gives it back, at a
+    /// cost no more than the rows that are left.
+    #[must_use]
+    pub fn marks(&self) -> Option<rudb_native::GoneRows> {
+        match self {
+            Self::Masked(reader, gone)
+                if !self.is_stored() && gone.total() * 2 <= reader.table().rows() =>
+            {
+                Some(gone.marks())
+            }
+            _ => None,
+        }
+    }
+
     /// For rows appended to a committed native snapshot, how many rows and parts the snapshot
     /// holds. The parts after those are the appended rows, which is all a checkpoint that keeps
     /// the snapshot's stripes has to write.
@@ -1468,7 +1514,7 @@ impl Table {
         Ok(Self {
             name,
             columns,
-            rows: Rows::Native(reader),
+            rows: Rows::of_file(reader)?,
             oid: DETACHED,
             clustering,
             // Not read into sets here. A key's set is built from the rows the first time a write
@@ -1635,8 +1681,12 @@ impl Table {
         match &self.rows {
             // A table with rows in memory has rows the file does not, so the file is going to be
             // written again whatever the declaration says, and answering false here says so once.
-            Rows::Memory(_) | Rows::Grown(_, _) | Rows::Masked(..) => false,
-            Rows::Native(reader) => reader.table().clustering() == self.clustering.as_ref(),
+            Rows::Memory(_) | Rows::Grown(_, _) => false,
+            // Rows taken out of an order leave the rest in it, so a table with rows gone keeps the
+            // declaration its file was written under.
+            Rows::Native(reader) | Rows::Masked(reader, _) => {
+                reader.table().clustering() == self.clustering.as_ref()
+            }
         }
     }
 
@@ -1741,14 +1791,16 @@ impl Table {
         if reader.table().fields() != self.columns {
             return Err(Error::internal("a committed native snapshot changed its table schema"));
         }
-        if reader.table().rows() != self.rows.len() {
+        let clustering = reader.table().clustering().cloned();
+        let rows = Rows::of_file(reader)?;
+        if rows.len() != self.rows.len() {
             return Err(Error::internal("a committed native snapshot changed its row count"));
         }
         // The file is the record, so the declaration comes back from it rather than being kept
         // from before. If the checkpoint did not write what this table asked for, this is where
         // that shows up, as the declaration going away rather than as a claim nothing backs.
-        self.clustering = reader.table().clustering().cloned();
-        self.rows = Rows::Native(reader);
+        self.clustering = clustering;
+        self.rows = rows;
         Ok(())
     }
 

@@ -84,6 +84,12 @@ const DISTINCT_COUNTS: &[u8; 8] = b"RUDBDC10";
 const INTEGER_EXTREMES: &[u8; 8] = b"RUDBEX10";
 const COMPLETE_FREQUENCIES: &[u8; 8] = b"RUDBFQ10";
 const DEVICE_CARD: &[u8; 8] = b"RUDBDV10";
+/// The catalog extension that says where each table's gone rows are, see [`GoneRows`].
+///
+/// An older build stops at a catalog extension it does not know, so a file with rows deleted from
+/// it is a file it refuses rather than one it reads with those rows back in. A file nothing was
+/// deleted from never writes the extension and still opens in those builds.
+const GONE_ROWS: &[u8; 8] = b"RUDBGR10";
 const MAX_CATALOG_FREQUENCIES: usize = 64;
 /// How many parts [`Reader::matched`] runs a pattern over, spread evenly across the table.
 ///
@@ -1370,9 +1376,114 @@ struct Entry {
     extremes: Vec<StoredIntegerExtremes>,
     /// Complete bounded numeric frequencies, including NULL when present.
     frequencies: Vec<StoredNumericFrequencies>,
+    /// Where the rows a delete took out of the table are recorded, when any were. See
+    /// [`GoneRows`].
+    gone: Option<Page>,
 }
 
 type StoredIntegerExtremes = Option<Option<(i128, i128)>>;
+
+/// The rows a `DELETE` took out of a committed table, recorded beside its stripes rather than by
+/// writing the rest of them again, `engine-v4/03-the-shape.md` section 3.5.
+///
+/// A part that lost any rows has a bit for each of its rows, set for one that is gone, and a part
+/// that lost none is not here at all. The parts are the table's own, numbered the way
+/// [`Reader::part_rows`] numbers them.
+///
+/// The stripes, their bounds and the table's sections are all still about every row the file
+/// holds, gone or not. A bound over a part is still a bound over what is left of it, so that is
+/// right, but a count or a sum is not, and the catalog keeps none of those for a table with rows
+/// gone from it. A reader that reads the rows of such a table without going through these bits
+/// reads the gone ones back, which is why [`Catalog::table_fields`] says nothing about it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GoneRows {
+    /// Each part that lost a row, rising, with its bits.
+    pub parts: Vec<(usize, Box<[u64]>)>,
+    /// How many rows are gone in all.
+    pub total: usize,
+}
+
+impl GoneRows {
+    /// The record as it goes into the file: how many parts there are, then each part's number, the
+    /// count of its words and the words.
+    fn encode(&self) -> Result<Vec<u8>> {
+        let words = self.parts.iter().map(|(_, bits)| bits.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(4 + self.parts.len() * 8 + words * 8);
+        put_u32(&mut out, u32::try_from(self.parts.len()).map_err(|_| invalid("too many parts"))?);
+        for (part, bits) in &self.parts {
+            put_u32(&mut out, u32::try_from(*part).map_err(|_| invalid("part number overflow"))?);
+            put_u32(&mut out, u32::try_from(bits.len()).map_err(|_| invalid("part too long"))?);
+            for word in bits {
+                put_u64(&mut out, *word);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reads the record back, checking each part against the rows the table says it has.
+    fn decode(bytes: &[u8], places: &[Place]) -> Result<Self> {
+        let mut cur = Cursor::new(bytes);
+        let count = cur.u32()? as usize;
+        if count > places.len() {
+            return Err(invalid("gone rows name more parts than the table has"));
+        }
+        let mut parts = Vec::with_capacity(count);
+        let mut total = 0;
+        for _ in 0..count {
+            let part = cur.u32()? as usize;
+            if parts.last().is_some_and(|(last, _)| *last >= part) || part >= places.len() {
+                return Err(invalid("gone rows name parts out of order or past the table"));
+            }
+            let rows = places[part].rows as usize;
+            let words = cur.u32()? as usize;
+            if words != rows.div_ceil(64) {
+                return Err(invalid("gone rows of a part differ from its length"));
+            }
+            let mut bits = Vec::with_capacity(words);
+            for _ in 0..words {
+                bits.push(cur.u64()?);
+            }
+            if !rows.is_multiple_of(64) && bits.last().is_some_and(|last| last >> (rows % 64) != 0) {
+                return Err(invalid("gone rows mark a row past their part"));
+            }
+            total += bits.iter().map(|word| word.count_ones() as usize).sum::<usize>();
+            parts.push((part, bits.into_boxed_slice()));
+        }
+        if !cur.done() {
+            return Err(invalid("gone rows have trailing bytes"));
+        }
+        Ok(Self { parts, total })
+    }
+}
+
+/// Writes `gone` down for the table of `entry` and points the entry at it, or points it at nothing
+/// when no row is gone. The counts the catalog keeps for the table stop being right about it, so
+/// they go.
+fn mark_gone(
+    file: &dyn rudb_io::File,
+    at: &mut u64,
+    entry: &mut Entry,
+    gone: &GoneRows,
+) -> Result<()> {
+    entry.gone = if gone.total == 0 {
+        None
+    } else {
+        let bytes = gone.encode()?;
+        let offset = append(file, at, &bytes)?;
+        Some(Page {
+            offset,
+            length: u32::try_from(bytes.len()).map_err(|_| invalid("gone rows too long"))?,
+            hash: checksum(&bytes),
+        })
+    };
+    let width = entry.fields.len();
+    entry.nonzero = vec![None; width];
+    entry.aggregates = vec![None; width];
+    entry.distincts = vec![None; width];
+    entry.extremes = vec![None; width];
+    entry.frequencies = vec![None; width];
+    Ok(())
+}
 type StoredNumericFrequencies = Option<NumericFrequencies>;
 
 /// One view's line in the catalog directory.
@@ -2155,6 +2266,9 @@ pub struct Writer {
     /// charges them once per stripe and once per worker, never per chunk. See
     /// `rudb_metrics::LoadProfile` for why that is the grain.
     profile: Option<Arc<LoadProfile>>,
+    /// The rows deleted since from tables this generation carries forward, which
+    /// [`Writer::with_marks`] sets and [`Writer::finish`] writes down beside them.
+    marks: Vec<(String, GoneRows)>,
 }
 
 /// The parts of an extended table's old directory that [`Writer::close`] would otherwise work out
@@ -2451,6 +2565,11 @@ impl Writer {
                 return Err(invalid("two tables in one native file have the same name"));
             }
             let entry = closed.remove(at);
+            if taking == Same::Extend && entry.gone.is_some() {
+                return Err(invalid(
+                    "a table with rows gone from it is written again, not extended",
+                ));
+            }
             held = (taking == Same::Extend).then_some(entry);
         }
         // The generation of the slot whose bytes checksummed, and not the highest number in the
@@ -2505,6 +2624,7 @@ impl Writer {
             card,
             anchor,
             profile: None,
+            marks: Vec::new(),
         };
         if let Some(entry) = held.filter(|entry| entry.rows > 0) {
             writer.seed(&entry, size)?;
@@ -2590,6 +2710,7 @@ impl Writer {
             card: card_for(path.as_ref(), None),
             anchor: None,
             profile: None,
+            marks: Vec::new(),
         })
     }
 
@@ -2709,6 +2830,7 @@ impl Writer {
             card,
             anchor,
             profile: None,
+            marks: Vec::new(),
             dictionaries: fields
                 .iter()
                 .map(|field| coded_type(&field.ty).then(GlobalDictionary::new))
@@ -2817,6 +2939,16 @@ impl Writer {
     #[must_use]
     pub fn with_views(mut self, views: Vec<ViewEntry>) -> Self {
         self.views = views;
+        self
+    }
+
+    /// Sets the rows deleted since from tables the file already holds, by table, which the next
+    /// commit writes down beside each table without writing a page of it again. Each one replaces
+    /// what the file recorded for that table, so it is every row gone from it and not the new ones.
+    /// A table named here has to be one this generation carries forward as it is.
+    #[must_use]
+    pub fn with_marks(mut self, marks: Vec<(String, GoneRows)>) -> Self {
+        self.marks = marks;
         self
     }
 
@@ -3999,6 +4131,7 @@ impl Writer {
             distincts: self.table.distincts.clone(),
             extremes: table_integer_extremes(&self.table),
             frequencies: table_complete_numeric_frequencies(&self.table),
+            gone: None,
             directory: Page {
                 offset,
                 length: u32::try_from(directory.len())
@@ -4251,6 +4384,12 @@ impl Writer {
         let profile = self.profile.take();
         let _timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let mut tables = std::mem::take(&mut self.closed);
+        for (name, gone) in std::mem::take(&mut self.marks) {
+            let held = tables.iter_mut().find(|held| held.name == name).ok_or_else(|| {
+                invalid(&format!("rows gone from {name}, which this generation does not carry"))
+            })?;
+            mark_gone(&*self.file, &mut self.at, held, &gone)?;
+        }
         tables.push(entry);
         let catalog =
             encode_catalog(&tables, &self.views, self.card.as_ref(), self.anchor.as_ref())?;
@@ -4304,10 +4443,32 @@ impl Writer {
         views: &[ViewEntry],
         anchor: Option<&LogAnchor>,
     ) -> Result<()> {
+        Self::restate_marking(path, views, anchor, &[])
+    }
+
+    /// [`Writer::restate`] that also writes down the rows deleted since from tables the file holds,
+    /// the way [`Writer::with_marks`] has [`Writer::finish`] do it. A checkpoint after deletes and
+    /// nothing else costs the bits of the rows that went and a catalog.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::restate`], and if a mark names a table the file does not hold.
+    pub fn restate_marking(
+        path: impl AsRef<Path>,
+        views: &[ViewEntry],
+        anchor: Option<&LogAnchor>,
+        marks: &[(String, GoneRows)],
+    ) -> Result<()> {
         let file = RealFilesystem::new().open(path.as_ref(), OpenMode::ReadWrite)?;
-        let size = file.len()?;
+        let mut size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
-        let (closed, _, card, held) = decode_catalog(&bytes, size)?;
+        let (mut closed, _, card, held) = decode_catalog(&bytes, size)?;
+        for (name, gone) in marks {
+            let held = closed.iter_mut().find(|held| held.name == *name).ok_or_else(|| {
+                invalid(&format!("rows gone from {name}, which the file does not hold"))
+            })?;
+            mark_gone(&*file, &mut size, held, gone)?;
+        }
         let anchor = anchor.cloned().or(held);
         let generation = slot
             .generation
@@ -4362,7 +4523,9 @@ impl Writer {
         let (_, size, slot, bytes, _) = slot_bytes(path)?;
         let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
         let native = Catalog::open(path)?;
-        for entry in &mut entries {
+        // A table with rows gone from it is left without them, because its stripes still hold
+        // those rows and a count taken off the stripes would count them.
+        for entry in entries.iter_mut().filter(|entry| entry.gone.is_none()) {
             let reader = native.table(&entry.name)?;
             entry.nonzero.fill(None);
             entry.aggregates = reader_aggregate_sums(&reader)?;
@@ -4499,7 +4662,11 @@ pub fn extendable(
     let (_, bytes, _) = committed_slot(file, size)?;
     let (entries, ..) = decode_catalog(&bytes, size)?;
     Ok(entries.iter().any(|entry| {
-        entry.name == table && entry.rows == rows && rows > 0 && entry.fields == fields
+        entry.name == table
+            && entry.rows == rows
+            && rows > 0
+            && entry.fields == fields
+            && entry.gone.is_none()
     }))
 }
 
@@ -4698,6 +4865,8 @@ pub struct Reader {
     value_rows: Arc<Vec<OnceLock<Option<Arc<postings::ValueRows>>>>>,
     /// The row id of every part's first row, by table wide part number.
     firsts: Arc<Vec<usize>>,
+    /// The rows a delete took out of the table, when any were. See [`GoneRows`].
+    gone: Option<Arc<GoneRows>>,
     /// The key maps, links and adjacencies of this table, each decoded the first time a plan asks.
     /// See [`graph::Decoded`].
     graph: Arc<graph::Decoded>,
@@ -6794,7 +6963,7 @@ impl Catalog {
         let mut opening = self.opening;
         opening.reads += 1;
         opening.bytes += u64::from(entry.directory.length);
-        Reader::build(
+        let mut reader = Reader::build(
             Arc::clone(&self.file),
             self.map.clone(),
             self.size,
@@ -6802,7 +6971,27 @@ impl Catalog {
             u64::from(entry.directory.length),
             opening,
             self.pool.clone(),
-        )
+        )?;
+        if let Some(page) = &entry.gone {
+            let mut bytes = vec![0; page.length as usize];
+            read_at(&*self.file, page.offset, &mut bytes)?;
+            if checksum(&bytes) != page.hash {
+                return Err(invalid(&format!("the gone rows of table {name} do not checksum")));
+            }
+            reader.gone = Some(Arc::new(GoneRows::decode(&bytes, &reader.places)?));
+        }
+        Ok(reader)
+    }
+
+    /// The entry of a table no row was deleted from, which is the only kind whose counts the
+    /// catalog can answer without reading the table's gone rows.
+    fn whole(&self, name: &str) -> Result<Option<&Entry>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        Ok(entry.gone.is_none().then_some(entry))
     }
 
     /// Counts one signed integer column from its encoded parts without building metadata for
@@ -6837,11 +7026,7 @@ impl Catalog {
         column: usize,
         mut emit: impl FnMut(i64, u64) -> Result<()>,
     ) -> Result<Option<()>> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(entry) = self.whole(name)? else { return Ok(None) };
         let field =
             entry.fields.get(column).ok_or_else(|| invalid("integer column index out of range"))?;
         if !signed_integer(&field.ty) {
@@ -6867,11 +7052,7 @@ impl Catalog {
     /// building a reader for every stripe. Returns `None` when the bounded frequency synopsis
     /// cannot prove the count, so callers can use the ordinary query path.
     pub fn nonzero_count(&self, name: &str, column: usize) -> Result<Option<u64>> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(entry) = self.whole(name)? else { return Ok(None) };
         let Some(field) = entry.fields.get(column) else {
             return Err(invalid("frequency column index out of range"));
         };
@@ -6912,11 +7093,7 @@ impl Catalog {
     /// Exact signed-integer sums and non-null counts from the small catalog. The table directory
     /// checksum is still checked once before any certificate can answer a query.
     pub fn aggregate_sums(&self, name: &str, columns: &[usize]) -> Result<Option<CertifiedSums>> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(entry) = self.whole(name)? else { return Ok(None) };
         let mut sums = Vec::with_capacity(columns.len());
         for &column in columns {
             let Some(field) = entry.fields.get(column) else {
@@ -6939,11 +7116,7 @@ impl Catalog {
 
     /// Exact non-null distinct count from the small catalog, after checking the table directory.
     pub fn distinct_count(&self, name: &str, column: usize) -> Result<Option<u64>> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(entry) = self.whole(name)? else { return Ok(None) };
         let Some(count) = entry.distincts.get(column).copied() else {
             return Err(invalid("distinct column index out of range"));
         };
@@ -6957,11 +7130,7 @@ impl Catalog {
 
     /// Exact integer or date ends from the small catalog after checking the table directory.
     pub fn integer_extremes(&self, name: &str, column: usize) -> Result<Option<IntegerExtremes>> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(entry) = self.whole(name)? else { return Ok(None) };
         let Some(extremes) = entry.extremes.get(column).copied() else {
             return Err(invalid("extremes column index out of range"));
         };
@@ -6982,11 +7151,7 @@ impl Catalog {
         name: &str,
         column: usize,
     ) -> Result<Option<NumericFrequencies>> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(entry) = self.whole(name)? else { return Ok(None) };
         let Some(frequencies) = entry.frequencies.get(column).cloned() else {
             return Err(invalid("numeric frequency column index out of range"));
         };
@@ -6999,8 +7164,15 @@ impl Catalog {
     }
 
     /// The schema copied into the small file catalog, available without opening the table directory.
+    ///
+    /// `None` for a table some of whose rows a delete took out, as well as for one the file does not
+    /// hold. What asks for this goes on to read the table's stripes as they are, and those still hold
+    /// the gone rows. See [`GoneRows`].
     pub fn table_fields(&self, name: &str) -> Option<&[Field]> {
-        self.entries.iter().find(|entry| entry.name == name).map(|entry| entry.fields.as_slice())
+        self.entries
+            .iter()
+            .find(|entry| entry.name == name && entry.gone.is_none())
+            .map(|entry| entry.fields.as_slice())
     }
 }
 
@@ -7160,6 +7332,7 @@ impl Reader {
             text_grams: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             value_rows: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             firsts: Arc::new(firsts),
+            gone: None,
             graph: Arc::default(),
             size,
             directory,
@@ -7512,6 +7685,13 @@ impl Reader {
     /// reads a quarter of a megabyte for every part it takes out of it.
     pub fn keep_stripes(&self, stripes: usize) {
         self.cache.kept.fetch_max(stripes, Atomic::Relaxed);
+    }
+
+    /// The rows a delete took out of this table, when any were. A part reads back with them in it,
+    /// and dropping them is the caller's to do. See [`GoneRows`].
+    #[must_use]
+    pub fn gone(&self) -> Option<&GoneRows> {
+        self.gone.as_deref()
     }
 
     /// Rows in one part, or zero when the part number is past the table.
@@ -10437,6 +10617,20 @@ fn encode_catalog(
             }
         }
     }
+    if entries.iter().any(|entry| entry.gone.is_some()) {
+        out.extend_from_slice(GONE_ROWS);
+        for entry in entries {
+            match &entry.gone {
+                None => out.push(0),
+                Some(page) => {
+                    out.push(1);
+                    put_u64(&mut out, page.offset);
+                    put_u32(&mut out, page.length);
+                    put_u64(&mut out, page.hash);
+                }
+            }
+        }
+    }
     if let Some(card) = card {
         out.extend_from_slice(DEVICE_CARD);
         let device = card.device.as_bytes();
@@ -10513,6 +10707,7 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<Decoded> {
             distincts,
             extremes,
             frequencies,
+            gone: None,
         });
     }
     // A catalog that ends where the tables end is a catalog with no views in it, which is every
@@ -10703,11 +10898,32 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<Decoded> {
     }
     let mut card = None;
     let mut anchor = None;
+    let mut gone = false;
     // The extensions in the order they are written, each at most once. An older build stops at the
     // first magic it does not know, which is how a file it cannot read whole says so.
     while !cur.done() {
         let tag = cur.take(8)?;
-        if tag == DEVICE_CARD && card.is_none() && anchor.is_none() {
+        if tag == GONE_ROWS && !gone && card.is_none() && anchor.is_none() {
+            gone = true;
+            for entry in &mut entries {
+                entry.gone = match cur.u8()? {
+                    0 => None,
+                    1 => {
+                        let page =
+                            Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+                        let end = page
+                            .offset
+                            .checked_add(u64::from(page.length))
+                            .ok_or_else(|| invalid("gone rows offset overflow"))?;
+                        if page.offset < HEADER || end > size || page.length as usize > MAX_PAGE {
+                            return Err(invalid("gone rows range is outside the file"));
+                        }
+                        Some(page)
+                    }
+                    _ => return Err(invalid("gone rows tag differs")),
+                };
+            }
+        } else if tag == DEVICE_CARD && card.is_none() && anchor.is_none() {
             let device = cur.text()?;
             let len = cur.u32()? as usize;
             if len > MAX_CARD {
@@ -15877,6 +16093,7 @@ mod tests {
             distincts: vec![None],
             extremes: vec![None],
             frequencies: vec![None],
+            gone: None,
         };
         let anchor = LogAnchor {
             database: 0xfeed,
@@ -15938,6 +16155,7 @@ mod tests {
             distincts: vec![None],
             extremes: vec![None],
             frequencies: vec![None],
+            gone: None,
         };
         let card = KeptCard { device: "dev:42".to_string(), bytes: vec![1, 2, 3] };
         let bytes = encode_catalog(&[entry()], &[], Some(&card), None).expect("encodes");
@@ -16025,6 +16243,41 @@ mod tests {
         fs::remove_file(&path).expect("clean up");
     }
 
+    /// Rows deleted from a table are written down beside it, and the stripes do not move.
+    #[test]
+    fn rows_gone_from_a_table_are_written_beside_it_and_read_back() {
+        let path = path("gone");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+        let fields = [Field::required("id", LogicalType::Integer)];
+        assert!(extendable(&path, "items", &fields, 3).expect("reads"));
+        let gone = GoneRows { parts: vec![(0, vec![0b101].into_boxed_slice())], total: 2 };
+        Writer::restate_marking(&path, &[], None, &[("items".to_string(), gone.clone())])
+            .expect("marks");
+        let catalog = Catalog::open(&path).expect("reopen");
+        let reader = catalog.table("items").expect("the table");
+        assert_eq!(reader.gone(), Some(&gone));
+        assert_eq!(reader.table().rows, 3, "the stripes still hold every row");
+        // Nothing that reads the stripes as they are is told about the table, and nothing extends
+        // it, which would keep the stripes and lose the record.
+        assert!(catalog.table_fields("items").is_none());
+        assert_eq!(catalog.distinct_count("items", 0).expect("reads"), None);
+        assert!(!extendable(&path, "items", &fields, 3).expect("reads"));
+        // A restate after that carries the record forward, and a mark naming a table the file
+        // does not hold is refused.
+        Writer::restate(&path, &[], None).expect("restates");
+        let reader = Catalog::open(&path).expect("reopen").table("items").expect("the table");
+        assert_eq!(reader.gone(), Some(&gone));
+        assert!(Writer::restate_marking(&path, &[], None, &[("other".to_string(), gone)]).is_err());
+        // A record past the part's rows is a torn file and not a table.
+        let bad = GoneRows { parts: vec![(0, vec![0b1000].into_boxed_slice())], total: 1 };
+        assert!(GoneRows::decode(&bad.encode().expect("encodes"), &reader.places).is_err());
+        fs::remove_file(&path).expect("clean up");
+    }
+
     /// Two entries under one name is a catalog no lookup can answer, whichever two they are.
     #[test]
     fn a_view_named_after_a_table_is_refused_when_the_catalog_is_read() {
@@ -16039,6 +16292,7 @@ mod tests {
                 distincts: vec![None],
                 extremes: vec![None],
                 frequencies: vec![None],
+                gone: None,
             }],
             &[sample_view("items")],
             None,

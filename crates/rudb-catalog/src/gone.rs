@@ -27,6 +27,38 @@ impl Gone {
         Self { parts: vec![None; parts], counts: vec![0; parts], total: 0 }
     }
 
+    /// The rows a file of `parts` parts records as gone, see [`rudb_native::GoneRows`].
+    ///
+    /// # Errors
+    ///
+    /// If the record names a part past the file's.
+    pub fn stored(parts: usize, stored: &rudb_native::GoneRows) -> Result<Self> {
+        let mut gone = Self::none(parts);
+        for (part, bits) in &stored.parts {
+            let held = gone
+                .parts
+                .get_mut(*part)
+                .ok_or_else(|| Error::internal("gone rows name a part the file does not have"))?;
+            let lost = bits.iter().map(|word| word.count_ones()).sum::<u32>();
+            *held = Some(Arc::from(&bits[..]));
+            gone.counts[*part] = lost;
+            gone.total += lost as usize;
+        }
+        Ok(gone)
+    }
+
+    /// The record of these rows the file keeps, see [`rudb_native::GoneRows`].
+    #[must_use]
+    pub fn marks(&self) -> rudb_native::GoneRows {
+        let parts = self
+            .parts
+            .iter()
+            .enumerate()
+            .filter_map(|(part, bits)| bits.as_ref().map(|bits| (part, Box::from(&bits[..]))))
+            .collect();
+        rudb_native::GoneRows { parts, total: self.total }
+    }
+
     /// How many rows are gone in all.
     #[must_use]
     pub fn total(&self) -> usize {
@@ -134,6 +166,18 @@ mod tests {
         assert!(!live.contains(&3) && !live.contains(&70) && !live.contains(&99));
         assert_eq!(gone.slots(1), vec![3, 70, 99]);
         assert!(gone.contains(1, 70) && !gone.contains(1, 71) && !gone.contains(2, 70));
+    }
+
+    #[test]
+    fn the_record_a_file_keeps_reads_back_the_same() {
+        let mut gone = Gone::none(4);
+        gone.take(0, 8192, &[0, 63, 64, 8191]).unwrap();
+        gone.take(3, 100, &[99]).unwrap();
+        let marks = gone.marks();
+        assert_eq!(marks.total, 5);
+        assert_eq!(marks.parts.iter().map(|(part, _)| *part).collect::<Vec<_>>(), vec![0, 3]);
+        assert_eq!(Gone::stored(4, &marks).unwrap(), gone);
+        assert!(Gone::stored(3, &marks).is_err());
     }
 
     #[test]

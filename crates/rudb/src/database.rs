@@ -2094,7 +2094,7 @@ fn persist_anchored(
     // before the declaration existed from being decided as nothing to do and quietly lost.
     let clean = catalog
         .stored_tables_in(database)
-        .all(|table| table.rows().is_native() && table.clustering_is_stored());
+        .all(|table| table.rows().is_stored() && table.clustering_is_stored());
     let held = committed(path)?;
     // The views are compared by what they are rather than by their whole record, because the column
     // list on a record is a cache the binder writes over every time somebody selects from the view.
@@ -2118,10 +2118,16 @@ fn persist_anchored(
         rudb_native::Writer::empty(&temporary, &views, anchor)?;
         return rename(&temporary, path);
     }
-    // Only the views moved, so nothing has to be written again. Everything the file holds is still
-    // the right bytes in the right place and the commit is a new catalog naming the same pages.
-    if clean && held.is_some_and(|held| held.tables == wanted(&names)) {
-        rudb_native::Writer::restate(path, &views, anchor)?;
+    // Only the views moved, or rows were deleted from tables the file holds and nothing else
+    // happened to them, so nothing has to be written again. Everything the file holds is still the
+    // right bytes in the right place and the commit is a new catalog naming the same pages, with
+    // the rows gone written down beside the tables they went from.
+    let marks = marks(catalog, &names)?;
+    let marked = catalog.stored_tables_in(database).all(|table| {
+        (table.rows().is_stored() || table.rows().marks().is_some()) && table.clustering_is_stored()
+    });
+    if marked && held.is_some_and(|held| held.tables == wanted(&names)) {
+        rudb_native::Writer::restate_marking(path, &views, anchor, &marks)?;
         return rebind(path, catalog, &names, pages);
     }
     if appended(path, catalog, &names, &views, anchor)? {
@@ -2708,10 +2714,14 @@ fn appended(
     if held.is_empty() {
         return Ok(false);
     }
+    // A table some rows were deleted from is carried forward too, with the rows gone written down
+    // beside it, see [`marks`].
+    let marks = marks(catalog, names)?;
     let native = names
         .iter()
-        .filter(|name| catalog.table(name).is_ok_and(|table| table.rows().is_native()))
+        .filter(|name| catalog.table(name).is_ok_and(|table| table.rows().is_stored()))
         .map(|name| name.table.clone())
+        .chain(marks.iter().map(|(name, _)| name.clone()))
         .collect::<BTreeSet<_>>();
     let dirty =
         names.iter().filter(|name| !native.contains(&name.table)).cloned().collect::<Vec<_>>();
@@ -2775,6 +2785,7 @@ fn appended(
         writer = Some(open);
     }
     let Some(mut writer) = writer else { return Ok(false) };
+    writer = writer.with_marks(marks);
     if let Some(anchor) = anchor {
         writer = writer.with_log_anchor(anchor.clone());
     }
@@ -2783,6 +2794,22 @@ fn appended(
     // from the first of those.
     writer.with_views(views.to_vec()).finish()?;
     Ok(true)
+}
+
+/// The rows deleted from each table since its file last said, for the tables whose file is still
+/// the one they were read from, see `rudb_catalog::Rows::marks`. A checkpoint writes these down
+/// beside the tables rather than write the rows they kept again.
+fn marks(
+    catalog: &Catalog,
+    names: &[QualifiedName],
+) -> Result<Vec<(String, rudb_native::GoneRows)>> {
+    let mut marks = Vec::new();
+    for name in names {
+        if let Some(gone) = catalog.table(name)?.rows().marks() {
+            marks.push((name.table.clone(), gone));
+        }
+    }
+    Ok(marks)
 }
 
 /// Whether the tables a checkpoint keeps where they are, the native ones and the ones it extends,
@@ -2803,15 +2830,19 @@ fn mostly_live(
     let mut live = 0u64;
     for name in names {
         let reader = match catalog.table(name)?.rows() {
-            rudb_catalog::Rows::Native(reader) => reader,
+            rudb_catalog::Rows::Native(reader) | rudb_catalog::Rows::Masked(reader, _) => reader,
             rudb_catalog::Rows::Grown(reader, _) if extended.contains_key(&name.table) => reader,
             _ => continue,
         };
         let layout = reader.layout();
-        live = live
-            .saturating_add(layout.columns_total())
-            .saturating_add(layout.indexes)
-            .saturating_add(layout.directory);
+        let mut held = layout.columns_total().saturating_add(layout.indexes);
+        // Rows gone from a table still take their space, so only the share left counts as live.
+        if let Some(gone) = catalog.table(name)?.rows().gone() {
+            let rows = reader.table().rows().max(1) as u128;
+            let left = rows.saturating_sub(gone.total() as u128);
+            held = u64::try_from(u128::from(held) * left / rows).unwrap_or(held);
+        }
+        live = live.saturating_add(held).saturating_add(layout.directory);
     }
     Ok(live.saturating_mul(2) >= size)
 }
@@ -2954,7 +2985,7 @@ fn appendable(path: &Path, catalog: &Catalog, target: &QualifiedName) -> Result<
     let others = catalog.stored_tables().filter(|table| table.name() != target).count();
     let native = catalog
         .stored_tables()
-        .filter(|table| table.name() != target && table.rows().is_native())
+        .filter(|table| table.name() != target && table.rows().is_stored())
         .map(|table| table.name().table.clone())
         .collect::<BTreeSet<_>>();
     // The count as well as the set, because a table that is in neither is a table with rows in
