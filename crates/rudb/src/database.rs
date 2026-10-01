@@ -2723,17 +2723,22 @@ fn appended(
             extended.insert(name.table.clone(), parts);
         }
     }
-    // Every table the file holds is either carried forward as it is or is an empty one the new
-    // generation takes the place of, and the writer drops an empty entry of the same name when it
-    // starts that table. A table the file holds with rows in it that the catalog no longer has as
-    // native is rows this generation would have to rewrite, and that is the whole file path.
-    let replaced = |name: &String| held.get(name).is_some_and(|rows| *rows == 0);
+    // Every table the file holds is carried forward as it is, extended, or written again by this
+    // generation, which drops the old entry of the same name when it starts the table. A table
+    // written again with rows in it leaves its old stripes in the file as space nothing names, and
+    // that is only worth it while most of the file is still live. Past that the whole file is
+    // written again, which is what gives the space back.
+    let again = |name: &String| held.contains_key(name) && !extended.contains_key(name);
+    let rewritten = dirty.iter().any(|d| again(&d.table) && held[&d.table] > 0);
     let carried = held.keys().all(|name| {
         native.contains(name)
             || extended.contains_key(name)
-            || (replaced(name) && dirty.iter().any(|d| &d.table == name))
+            || dirty.iter().any(|d| &d.table == name)
     });
     if !carried || !native.iter().all(|name| held.contains_key(name)) {
+        return Ok(false);
+    }
+    if rewritten && !mostly_live(path, catalog, names, &extended)? {
         return Ok(false);
     }
     let mut writer: Option<rudb_native::Writer> = None;
@@ -2742,11 +2747,14 @@ fn appended(
         let fields = table.columns().to_vec();
         let kept = extended.get(&name.table).copied();
         let copy = fields.clone();
-        let mut open = match (writer.take(), kept) {
-            (None, None) => rudb_native::Writer::open(path, name.table.clone(), copy)?,
-            (None, Some(_)) => rudb_native::Writer::extend(path, name.table.clone(), copy)?,
-            (Some(writer), None) => writer.next(name.table.clone(), copy)?,
-            (Some(writer), Some(_)) => writer.next_extending(name.table.clone(), copy)?,
+        let table_name = name.table.clone();
+        let mut open = match (writer.take(), kept, again(&name.table)) {
+            (None, Some(_), _) => rudb_native::Writer::extend(path, table_name, copy)?,
+            (None, None, true) => rudb_native::Writer::replace(path, table_name, copy)?,
+            (None, None, false) => rudb_native::Writer::open(path, table_name, copy)?,
+            (Some(writer), Some(_), _) => writer.next_extending(table_name, copy)?,
+            (Some(writer), None, true) => writer.next_replacing(table_name, copy)?,
+            (Some(writer), None, false) => writer.next(table_name, copy)?,
         };
         // The tables already in the file keep theirs, because they are carried forward by
         // directory pointer and their bytes are not rewritten. Only the ones being written here
@@ -2770,6 +2778,37 @@ fn appended(
     // from the first of those.
     writer.with_views(views.to_vec()).finish()?;
     Ok(true)
+}
+
+/// Whether the tables a checkpoint keeps where they are, the native ones and the ones it extends,
+/// hold at least half of the file. Below that, a checkpoint that writes a table again rather than
+/// the whole file would leave a file that is mostly space nothing names, and writing the whole
+/// file costs at most twice what the tables being written cost anyway.
+///
+/// So the space a table written again leaves behind is given back by the first checkpoint after
+/// it reaches half the file, and a database whose small tables take updates and deletes does not
+/// write its large tables again at every checkpoint.
+fn mostly_live(
+    path: &Path,
+    catalog: &Catalog,
+    names: &[QualifiedName],
+    extended: &BTreeMap<String, usize>,
+) -> Result<bool> {
+    let size = std::fs::metadata(path)?.len();
+    let mut live = 0u64;
+    for name in names {
+        let reader = match catalog.table(name)?.rows() {
+            rudb_catalog::Rows::Native(reader) => reader,
+            rudb_catalog::Rows::Grown(reader, _) if extended.contains_key(&name.table) => reader,
+            _ => continue,
+        };
+        let layout = reader.layout();
+        live = live
+            .saturating_add(layout.columns_total())
+            .saturating_add(layout.indexes)
+            .saturating_add(layout.directory);
+    }
+    Ok(live.saturating_mul(2) >= size)
 }
 
 /// How many rows a checkpoint gathers small chunks into before writing them as one part.
