@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rudb_common::{Error, Result};
-use rudb_io::{Filesystem, OpenMode};
+use rudb_io::{Filesystem, Mapped, OpenMode};
 
 use super::format::{
     Commit, Kind, RECORD_HEADER, RecordHeader, SEGMENT_HEADER, SegmentHeader, decode_record, seed,
@@ -34,7 +34,7 @@ pub struct Record {
 /// payloads do.
 #[derive(Clone)]
 pub struct Payload {
-    segment: Arc<Vec<u8>>,
+    segment: Arc<Segment>,
     range: Range<usize>,
 }
 
@@ -42,7 +42,31 @@ impl Payload {
     /// The payload in `bytes`, which it keeps.
     pub fn new(bytes: Vec<u8>) -> Self {
         let range = 0..bytes.len();
-        Self { segment: Arc::new(bytes), range }
+        Self { segment: Arc::new(Segment::Read(bytes)), range }
+    }
+}
+
+/// The bytes of a segment, mapped where the filesystem can map it and read into memory where not.
+///
+/// Reading a segment copies it into a buffer the kernel zeroes a page at a time first, and on a
+/// gigabyte of log that zeroing and the copy were a fifth of the CPU an open spent, for bytes the
+/// page cache already held. The mapping hands out the cache's own pages. It is safe to hold
+/// because nothing writes a segment that replay reads: the lane opens a new segment after the
+/// replayed ones, and the replayed ones are only recycled by a checkpoint, after replay has
+/// dropped every payload.
+enum Segment {
+    Read(Vec<u8>),
+    Mapped(Mapped),
+}
+
+impl Deref for Segment {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Read(bytes) => bytes,
+            Self::Mapped(mapped) => mapped.get(0, mapped.len()).unwrap_or_default(),
+        }
     }
 }
 
@@ -170,10 +194,17 @@ fn read_segment(
     database: u64,
 ) -> Result<Option<Vec<Committed>>> {
     let file = fs.open(path, OpenMode::Read)?;
-    let len = usize::try_from(file.len()?)
-        .map_err(|_| Error::invalid_input(format!("{} is too large to replay", path.display())))?;
-    let mut bytes = vec![0_u8; len];
-    file.read_exact_at(0, &mut bytes)?;
+    let bytes = match file.map() {
+        Some(mapped) => Segment::Mapped(mapped),
+        None => {
+            let len = usize::try_from(file.len()?).map_err(|_| {
+                Error::invalid_input(format!("{} is too large to replay", path.display()))
+            })?;
+            let mut bytes = vec![0_u8; len];
+            file.read_exact_at(0, &mut bytes)?;
+            Segment::Read(bytes)
+        }
+    };
     let bytes = Arc::new(bytes);
     let Some(header) = SegmentHeader::decode(&bytes) else {
         return Ok(None);
@@ -195,7 +226,7 @@ fn read_segment(
 /// Appends the committed blocks of the records in `segment` from `at` on to `out`, stopping at the first record
 /// that does not verify or a Commit that does not match the records before it.
 fn read_blocks(
-    segment: &Arc<Vec<u8>>,
+    segment: &Arc<Segment>,
     mut at: usize,
     lane: u8,
     sequence: u64,

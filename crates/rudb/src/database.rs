@@ -1849,92 +1849,114 @@ fn replay_statement(runner: &mut Option<Database>, catalog: &mut Catalog, sql: &
 /// that change and every one after it there, and is replaced at the end, or before the next
 /// schema change, which runs against the catalog as the changes before it left it.
 fn replay_changes(catalog: &mut Catalog, changes: Vec<Replayed>) -> Result<()> {
-    let mut held: Vec<(QualifiedName, Vec<Chunk>)> = Vec::new();
-    // Plain appends to a table nothing else has touched yet, gathered so they go in a batch at a
-    // time. An append counts its statistics on as many threads as it is given, and a log of small
-    // inserts replayed one record at a time spent most of its open doing that on one.
-    let mut appends: Vec<(QualifiedName, Vec<Chunk>)> = Vec::new();
+    let mut pending = Pending::default();
     let workers = std::thread::available_parallelism().map_or(1, usize::from);
-    let flush = |catalog: &mut Catalog, name: &QualifiedName, chunks: Vec<Chunk>| {
-        catalog.table_mut(name)?.append_all(chunks, workers)
-    };
     let mut runner = None;
     let mut changes = changes.into_iter().peekable();
     loop {
-        // The row changes up to the next statement are decoded side by side, since no table's
-        // columns change between them, and then applied in the order they committed.
-        let mut run = Vec::new();
-        while run.len() < DECODE_RUN {
-            let Some(next) = changes.next_if(|replayed| !replayed.is_statement()) else { break };
-            run.push(next);
+        // The row changes up to the next statement, which no table's columns change in.
+        let mut span = Vec::new();
+        while let Some(next) = changes.next_if(|replayed| !replayed.is_statement()) {
+            span.push(next);
         }
-        if run.is_empty() {
-            let Some(replayed) = changes.next() else { break };
-            let Some(sql) = replayed.statement()? else { continue };
-            for (name, chunks) in appends.drain(..) {
-                flush(catalog, &name, chunks)?;
-            }
-            for (name, chunks) in held.drain(..) {
-                catalog.table_mut(&name)?.replace_all(chunks, 1)?;
-            }
-            replay_statement(&mut runner, catalog, &sql)?;
-            continue;
+        if !span.is_empty() {
+            replay_span(catalog, &span, workers, &mut pending)?;
         }
-        let (tables, decoded) = decode_run(catalog, &run, workers)?;
-        drop(run);
-        for (table, change) in decoded {
-            let (name, fields) = &tables[table];
-            let at = match held.iter().position(|(held, _)| held == name) {
-                Some(at) => at,
-                None if matches!(change, Change::Insert(_)) => {
-                    let Change::Insert(chunk) = change else { continue };
-                    let at = match appends.iter().position(|(pending, _)| pending == name) {
+        let Some(replayed) = changes.next() else { break };
+        let Some(sql) = replayed.statement()? else { continue };
+        pending.settle(catalog, workers)?;
+        replay_statement(&mut runner, catalog, &sql)?;
+    }
+    pending.settle(catalog, workers)
+}
+
+/// The row changes replay has taken and not yet put into the catalog.
+#[derive(Default)]
+struct Pending {
+    /// The tables an update or a delete touched, read into memory with every change since.
+    held: Vec<(QualifiedName, Vec<Chunk>)>,
+    /// Plain appends to a table nothing else has touched yet, gathered so they go in a batch at a
+    /// time. An append counts its statistics on as many threads as it is given, and a log of small
+    /// inserts replayed one record at a time spent most of its open doing that on one.
+    appends: Vec<(QualifiedName, Vec<Chunk>)>,
+}
+
+impl Pending {
+    /// Takes one decoded change to the table `name`, whose columns are `fields`.
+    fn take(
+        &mut self,
+        catalog: &mut Catalog,
+        name: &QualifiedName,
+        fields: &[Field],
+        change: Change,
+        workers: usize,
+    ) -> Result<()> {
+        let at = match self.held.iter().position(|(held, _)| held == name) {
+            Some(at) => at,
+            None => match change {
+                Change::Insert(chunk) => {
+                    let at = match self.appends.iter().position(|(pending, _)| pending == name) {
                         Some(at) => at,
                         None => {
-                            appends.push((name.clone(), Vec::new()));
-                            appends.len() - 1
+                            self.appends.push((name.clone(), Vec::new()));
+                            self.appends.len() - 1
                         }
                     };
-                    appends[at].1.push(chunk);
-                    if appends[at].1.len() >= APPEND_BATCH {
-                        let (name, chunks) = appends.swap_remove(at);
-                        flush(catalog, &name, chunks)?;
+                    self.appends[at].1.push(chunk);
+                    if self.appends[at].1.len() >= APPEND_BATCH {
+                        let (name, chunks) = self.appends.swap_remove(at);
+                        catalog.table_mut(&name)?.append_all(chunks, workers)?;
                     }
-                    continue;
+                    return Ok(());
                 }
-                None => {
+                change => {
                     // The table's own appends go in first, because the change reads its rows.
-                    if let Some(at) = appends.iter().position(|(pending, _)| pending == name) {
-                        let (name, chunks) = appends.swap_remove(at);
-                        flush(catalog, &name, chunks)?;
+                    if let Some(at) = self.appends.iter().position(|(pending, _)| pending == name) {
+                        let (name, chunks) = self.appends.swap_remove(at);
+                        catalog.table_mut(&name)?.append_all(chunks, workers)?;
                     }
                     let rows = catalog.table(name)?.rows();
                     let all = (0..fields.len()).collect::<Vec<_>>();
                     let chunks = (0..rows.chunk_count())
                         .map(|at| rows.read(at, &all).and_then(Chunk::settled))
                         .collect::<Result<Vec<_>>>()?;
-                    held.push((name.clone(), chunks));
-                    held.len() - 1
+                    self.held.push((name.clone(), chunks));
+                    let at = self.held.len() - 1;
+                    return change.apply(fields, &mut self.held[at].1);
                 }
-            };
-            change.apply(fields, &mut held[at].1)?;
+            },
+        };
+        change.apply(fields, &mut self.held[at].1)
+    }
+
+    /// Puts everything taken into the catalog.
+    fn settle(&mut self, catalog: &mut Catalog, workers: usize) -> Result<()> {
+        for (name, chunks) in self.appends.drain(..) {
+            catalog.table_mut(&name)?.append_all(chunks, workers)?;
         }
+        for (name, chunks) in self.held.drain(..) {
+            catalog.table_mut(&name)?.replace_all(chunks, 1)?;
+        }
+        Ok(())
     }
-    for (name, chunks) in appends {
-        flush(catalog, &name, chunks)?;
-    }
-    for (name, chunks) in held {
-        catalog.table_mut(&name)?.replace_all(chunks, 1)?;
-    }
-    Ok(())
 }
 
-/// The changes of `run`, decoded on up to `workers` threads, each with the index of its table in
-/// the list that comes back beside them, which holds each table's name and columns once.
-fn decode_run(catalog: &Catalog, run: &[Replayed], workers: usize) -> Result<Decoded> {
+/// Replays `span`, row changes with no statement between them, so that every table keeps the
+/// columns it has now for all of them.
+///
+/// A thread decodes the span a run at a time, each run side by side on `workers` threads, while
+/// this one puts the run before it into the tables. Decoding and appending each took about half of
+/// an open, one after the other, and the appends count their statistics on threads of their own,
+/// so the two overlap rather than wait on each other.
+fn replay_span(
+    catalog: &mut Catalog,
+    span: &[Replayed],
+    workers: usize,
+    pending: &mut Pending,
+) -> Result<()> {
     let mut tables: Vec<(QualifiedName, Vec<Field>)> = Vec::new();
-    let mut of = Vec::with_capacity(run.len());
-    for replayed in run {
+    let mut of = Vec::with_capacity(span.len());
+    for replayed in span {
         let name = QualifiedName {
             catalog: DEFAULT_CATALOG.to_string(),
             schema: replayed.schema.clone(),
@@ -1950,13 +1972,43 @@ fn decode_run(catalog: &Catalog, run: &[Replayed], workers: usize) -> Result<Dec
         };
         of.push(at);
     }
+    let (tables, of) = (&tables, &of);
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        scope.spawn(move || {
+            for (run, records) in span.chunks(DECODE_RUN).enumerate() {
+                let decoded = decode_run(tables, &of[run * DECODE_RUN..], records, workers);
+                let failed = decoded.is_err();
+                // A closed channel is the applying side stopping on an error of its own.
+                if send.send(decoded).is_err() || failed {
+                    return;
+                }
+            }
+        });
+        for decoded in receive {
+            for (table, change) in decoded? {
+                let (name, fields) = &tables[table];
+                pending.take(catalog, name, fields, change, workers)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The changes of `run` decoded on up to `workers` threads, each with the index in `tables` of its
+/// table, which `of` holds a record at a time.
+fn decode_run(
+    tables: &[(QualifiedName, Vec<Field>)],
+    of: &[usize],
+    run: &[Replayed],
+    workers: usize,
+) -> Result<Vec<(usize, Change)>> {
     let per = run.len().div_ceil(workers.max(1)).max(1);
-    let (fields, of) = (&tables, &of);
     let decode = move |start: usize, records: &[Replayed]| {
         records
             .iter()
             .zip(&of[start..])
-            .map(|(replayed, &table)| Ok((table, replayed.change(&fields[table].1)?)))
+            .map(|(replayed, &table)| Ok((table, replayed.change(&tables[table].1)?)))
             .collect::<Result<Vec<_>>>()
     };
     let parts = if run.len() <= per {
@@ -1982,16 +2034,13 @@ fn decode_run(catalog: &Catalog, run: &[Replayed], workers: usize) -> Result<Dec
     for part in parts {
         decoded.extend(part?);
     }
-    Ok((tables, decoded))
+    Ok(decoded)
 }
 
-/// What [`decode_run`] gives back: each table once with its columns, and the changes in order,
-/// each with its table's place in that list.
-type Decoded = (Vec<(QualifiedName, Vec<Field>)>, Vec<(usize, Change)>);
-
-/// How many row changes are decoded together before they are applied, which bounds how many
-/// decoded chunks are held beside their records at once.
-const DECODE_RUN: usize = 4096;
+/// How many row changes are decoded together, the unit the decoding thread hands over. Small
+/// enough that the appends start soon after the open does, and large enough that each of the
+/// decoding threads gets a few dozen records of it.
+const DECODE_RUN: usize = 512;
 
 /// How many replayed inserts into one table go in as one append.
 const APPEND_BATCH: usize = 256;
