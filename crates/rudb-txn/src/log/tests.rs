@@ -8,7 +8,7 @@ use rudb_io::{Crash, Filesystem, Op, OpenMode, SimFilesystem};
 
 use super::{
     Block, CommitSync, Committed, Kind, Lane, Options, SEGMENT_HEADER, SegmentHeader, replay,
-    segment_name,
+    segment_name, spares,
 };
 
 const DATABASE: u64 = 0x5EED;
@@ -199,6 +199,102 @@ fn records_left_in_a_recycled_segment_do_not_replay() {
     let replayed = replay(&sim, &dir(), 0, DATABASE).expect("replay");
     assert_eq!(replayed.segments, 2);
     assert_eq!(replayed.blocks.iter().map(|b| b.commit.txn).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+}
+
+/// A lane with blocks `0..100` committed over several segments.
+fn filled(sim: &SimFilesystem) -> Lane {
+    let lane = open(sim, options(CommitSync::Full));
+    for n in 0..100 {
+        lane.commit(&block(n)).expect("commit");
+    }
+    lane
+}
+
+#[test]
+fn a_checkpoint_retires_segments_the_lane_then_recycles() {
+    let sim = SimFilesystem::new();
+    let lane = filled(&sim);
+    lane.retire(lane.position().0).expect("retire");
+    // Only the segment being written is left, and two of the retired ones wait as spares.
+    let kept = txns(&sim);
+    assert!(!kept.is_empty() && kept.len() < 50, "{kept:?}");
+    assert_eq!(spares(&sim, &dir(), 0).expect("spares").len(), 2);
+    let before = lane.stats();
+    for n in 100..200 {
+        lane.commit(&block(n)).expect("commit");
+    }
+    let after = lane.stats();
+    assert!(after.segments - before.segments > 2, "a hundred blocks cross segments");
+    assert_eq!(after.recycled, 2, "the spares are used before a segment is filled with zeros");
+    assert!(spares(&sim, &dir(), 0).expect("spares").is_empty());
+    // The retired blocks are gone, and nothing the recycled segments held comes back.
+    assert_eq!(txns(&sim), (kept[0]..200).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_crash_anywhere_in_retiring_and_recycling_leaves_a_log_that_replays_and_reopens() {
+    let mut index = 0;
+    loop {
+        let sim = SimFilesystem::new();
+        let lane = filled(&sim);
+        // The blocks of the segment being written, which a retire keeps. The ones before it are
+        // behind the checkpoint's cut, so a crash may leave any of them and replay skips them.
+        let writing = lane.position().0;
+        let cut = replay(&sim, &dir(), 0, DATABASE)
+            .expect("replay")
+            .blocks
+            .iter()
+            .find(|b| b.sequence == writing)
+            .expect("a block in the open segment")
+            .commit
+            .txn;
+        sim.clear_log();
+        sim.fail_at(index);
+        let mut acked = None;
+        let finished = lane.retire(lane.position().0).is_ok()
+            && (100..160).all(|n| {
+                let ok = lane.commit(&block(n)).is_ok();
+                if ok {
+                    acked = Some(n);
+                }
+                ok
+            });
+        sim.clear_failure();
+        if finished {
+            assert!(index > 0, "the run did something");
+            break;
+        }
+        drop(lane);
+        let pending: Vec<u64> = sim.pending().into_iter().map(|(seq, _)| seq).collect();
+        let mut crashes = vec![Crash::LosingUnsynced, Crash::KeepingEverything];
+        if pending.len() <= 6 {
+            for mask in 0..1_u32 << pending.len() {
+                crashes.push(Crash::Keeping(
+                    pending
+                        .iter()
+                        .enumerate()
+                        .filter(|(bit, _)| mask & (1 << bit) != 0)
+                        .map(|(_, &seq)| seq)
+                        .collect(),
+                ));
+            }
+        }
+        for crash in &crashes {
+            let after = sim.crash(crash);
+            let read = txns(&after);
+            let (behind, kept): (Vec<u64>, Vec<u64>) = read.iter().partition(|&&n| n < cut);
+            assert!(behind.is_sorted(), "op {index}: {crash:?}");
+            assert_eq!(kept, (cut..cut + kept.len() as u64).collect::<Vec<_>>(), "op {index}");
+            assert!(kept.last() >= acked.as_ref().max(Some(&99)), "op {index}: {crash:?}");
+            // The next run adopts whatever spares the crash left and goes on writing.
+            let lane = open(&after, options(CommitSync::Full));
+            lane.commit(&block(1000)).expect("a commit after the crash");
+            let reread = txns(&after);
+            assert_eq!(reread[..read.len()], read[..], "op {index}");
+            assert_eq!(reread.last(), Some(&1000), "op {index}");
+        }
+        index += 1;
+    }
 }
 
 #[test]
