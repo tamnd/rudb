@@ -2124,13 +2124,13 @@ fn persist_anchored(
     // the rows gone written down beside the tables they went from.
     let marks = marks(catalog, &names)?;
     let marked = catalog.stored_tables_in(database).all(|table| {
-        (table.rows().is_stored() || table.rows().marks().is_some()) && table.clustering_is_stored()
+        (table.rows().is_stored() || table.rows().markable()) && table.clustering_is_stored()
     });
     if marked && held.is_some_and(|held| held.tables == wanted(&names)) {
         rudb_native::Writer::restate_marking(path, &views, anchor, &marks)?;
         return rebind(path, catalog, &names, pages);
     }
-    if appended(path, catalog, &names, &views, anchor)? {
+    if appended(path, catalog, &names, &views, anchor, marks)? {
         return rebind(path, catalog, &names, pages);
     }
     let temporary = scratch(path)?;
@@ -2709,6 +2709,7 @@ fn appended(
     names: &[QualifiedName],
     views: &[rudb_native::ViewEntry],
     anchor: Option<&LogAnchor>,
+    marks: Vec<(String, rudb_native::GoneRows)>,
 ) -> Result<bool> {
     let Some(held) = held_rows(path)? else { return Ok(false) };
     if held.is_empty() {
@@ -2716,7 +2717,6 @@ fn appended(
     }
     // A table some rows were deleted from is carried forward too, with the rows gone written down
     // beside it, see [`marks`].
-    let marks = marks(catalog, names)?;
     let native = names
         .iter()
         .filter(|name| catalog.table(name).is_ok_and(|table| table.rows().is_stored()))
@@ -2805,7 +2805,7 @@ fn marks(
 ) -> Result<Vec<(String, rudb_native::GoneRows)>> {
     let mut marks = Vec::new();
     for name in names {
-        if let Some(gone) = catalog.table(name)?.rows().marks() {
+        if let Some(gone) = catalog.table(name)?.rows().marks()? {
             marks.push((name.table.clone(), gone));
         }
     }
