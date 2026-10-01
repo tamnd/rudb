@@ -94,7 +94,7 @@
 
 use rudb_common::{LogicalType, Provenance, Result, Stat};
 use rudb_plan::{
-    BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice,
+    BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
 };
 
 use crate::estimate::{self, Facts};
@@ -443,7 +443,7 @@ fn copied(plan: &mut Plan, at: NodeRef, renames: &mut Vec<(u32, u32)>) -> Option
             let fresh = walk::fresh_index(plan);
             let copy = Node::Get { catalog, schema, table, alias, index: fresh, columns };
             let node = plan.add_node_at(copy, span);
-            carry(plan, index, fresh, columns);
+            carry(plan, index, fresh);
             renames.push((index, fresh));
             Some(node)
         }
@@ -452,7 +452,7 @@ fn copied(plan: &mut Plan, at: NodeRef, renames: &mut Vec<(u32, u32)>) -> Option
             let copy =
                 Node::TableFunction { index: fresh, function, args, options, settings, columns };
             let node = plan.add_node_at(copy, span);
-            carry(plan, index, fresh, columns);
+            carry(plan, index, fresh);
             renames.push((index, fresh));
             Some(node)
         }
@@ -491,22 +491,13 @@ fn copied(plan: &mut Plan, at: NodeRef, renames: &mut Vec<(u32, u32)>) -> Option
 
 /// Gives the copy of a scan what the binder found out about the original.
 ///
-/// The counts, the bounds and the distinct values are all recorded against the table index, and the
-/// copy has an index of its own, so without this it reads back as a relation nobody measured. It is
-/// the same table read the same way, so the answers are the same answers, and a copy the estimates
-/// say nothing about is one the passes after this cannot size or pick a build side for.
-fn carry(plan: &mut Plan, was: u32, fresh: u32, columns: Slice) {
-    plan.measure(fresh, plan.measured(was));
-    if let Some(zones) = plan.zones(was).cloned() {
-        plan.set_zones(fresh, zones);
-    }
-    for name in plan.field_list(columns).iter().map(|field| field.name.clone()).collect::<Vec<_>>()
-    {
-        let distinct = plan.distinct_measured(was, &name);
-        if !matches!(distinct, Stat::Unknown) {
-            plan.measure_distinct(fresh, &name, distinct);
-        }
-    }
+/// The counts, the bounds, the distinct values and the synopsis are all recorded against the table
+/// index, and the copy has an index of its own, so without this it reads back as a relation nobody
+/// measured. It is the same table read the same way, so the answers are the same answers, and a
+/// copy the estimates say nothing about is one the passes after this cannot size or pick a build
+/// side for.
+fn carry(plan: &mut Plan, was: u32, fresh: u32) {
+    plan.follow(was, fresh);
 }
 
 /// `expr` with every column of a copied operator read out of the copy instead.
