@@ -23,6 +23,9 @@
 //! allocates and copies rather than growing a block where it is. Sixteen is the alignment of an
 //! `i128`, so a growing `Vec` of decimals or of an aggregate's accumulators copied itself every
 //! time.
+//!
+//! A block of 256 KiB or more does not go to mimalloc at all on Linux. It is mapped from the system
+//! on its own, grown with `mremap`, and unmapped when it is freed; [`MAPPED_FROM`] says why.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::{c_int, c_long};
@@ -146,6 +149,123 @@ const fn binned(size: usize) -> usize {
     if size >= ROUNDED_FROM && size <= ROUNDED_UPTO { size.next_power_of_two() } else { size }
 }
 
+/// The smallest block mapped from the system on its own rather than taken from mimalloc, on Linux.
+///
+/// The big blocks of a query are vectors that grow by doubling, an aggregate's accumulators or a
+/// partition's group table, and the copies they leave behind. mimalloc grows a block that size by
+/// taking a new one, copying and freeing the old one, and holds what was freed for its purge delay,
+/// a tenth of a second, which is as long as most of a query runs. On ClickBench q29 at eight
+/// threads the live heap peaked at 177 MB and the process at 348, against 193 and 230 on one
+/// thread, and with the purge delay at zero it was 210. A mapping grows with `mremap`, which moves
+/// the pages rather than copying them, the slack past what was written is never touched, and an
+/// unmapped block is gone at once without the purge of every small page that a zero delay costs.
+///
+/// Over the 43 ClickBench queries, with the same binary and only this bound changed, 256 KiB took
+/// 81 MB off the summed peak over the native file and 51 MB over Parquet, 512 KiB 62 and 44, and
+/// 1 MiB 37 and 21. Below 256 KiB a block is one of mimalloc's medium or small ones, which the
+/// rounding above already keeps in few classes.
+const MAPPED_FROM: usize = 256 * 1024;
+
+/// Whether blocks are mapped on their own on this target. The constants in [`system`] are the ones
+/// of the Linux targets named here.
+const MAPS: bool =
+    cfg!(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")));
+
+/// The smallest page size Linux has, and so an alignment every mapping has.
+const PAGE: usize = 4096;
+
+/// Whether a block of this size and alignment is a mapping of its own.
+///
+/// A pure function of the layout, so that the call that frees or grows a block, which is given the
+/// layout it was made with, reaches the same answer the call that made it did.
+const fn mapped(size: usize, align: usize) -> bool {
+    MAPS && size >= MAPPED_FROM && align <= PAGE
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod system {
+    use std::ffi::{c_int, c_void};
+
+    const PROT_READ_WRITE: c_int = 0x1 | 0x2;
+    const MAP_PRIVATE_ANONYMOUS: c_int = 0x02 | 0x20;
+    const MREMAP_MAYMOVE: c_int = 0x1;
+    const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+
+    // Declared as in the C library's headers, for the reason the two options above are.
+    #[allow(unsafe_code)]
+    unsafe extern "C" {
+        fn mmap(
+            addr: *mut c_void,
+            length: usize,
+            prot: c_int,
+            flags: c_int,
+            fd: c_int,
+            offset: i64,
+        ) -> *mut c_void;
+        fn munmap(addr: *mut c_void, length: usize) -> c_int;
+        fn mremap(
+            old: *mut c_void,
+            old_length: usize,
+            new_length: usize,
+            flags: c_int,
+            ...
+        ) -> *mut c_void;
+    }
+
+    /// A fresh zeroed mapping of at least `size` bytes, or null.
+    pub(super) fn map(size: usize) -> *mut u8 {
+        // SAFETY: an anonymous private mapping at an address of the kernel's choosing touches no
+        // memory the program holds.
+        #[allow(unsafe_code)]
+        let block = unsafe {
+            mmap(std::ptr::null_mut(), size, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, -1, 0)
+        };
+        if block == MAP_FAILED { std::ptr::null_mut() } else { block.cast() }
+    }
+
+    /// Gives back a mapping [`map`] or [`remap`] made of `size` bytes.
+    ///
+    /// # Safety
+    ///
+    /// `block` is such a mapping and nothing reads it after.
+    #[allow(unsafe_code)]
+    pub(super) unsafe fn unmap(block: *mut u8, size: usize) {
+        // SAFETY: the caller's. The kernel rounds the length up to the page as it did at the map.
+        unsafe {
+            munmap(block.cast(), size);
+        }
+    }
+
+    /// The mapping of `old` bytes at `block` resized to `new`, moved if it has to be, or null with
+    /// the old one left as it was.
+    ///
+    /// # Safety
+    ///
+    /// `block` is a mapping [`map`] or [`remap`] made of `old` bytes.
+    #[allow(unsafe_code)]
+    pub(super) unsafe fn remap(block: *mut u8, old: usize, new: usize) -> *mut u8 {
+        // SAFETY: the caller's, and a failed resize leaves the mapping where it was.
+        let moved = unsafe { mremap(block.cast(), old, new, MREMAP_MAYMOVE) };
+        if moved == MAP_FAILED { std::ptr::null_mut() } else { moved.cast() }
+    }
+}
+
+/// The stand in where nothing is mapped, which [`mapped`] never lets anything reach.
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+mod system {
+    pub(super) fn map(_size: usize) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+
+    #[allow(unsafe_code)]
+    pub(super) unsafe fn unmap(_block: *mut u8, _size: usize) {}
+
+    #[allow(unsafe_code)]
+    pub(super) unsafe fn remap(_block: *mut u8, _old: usize, _new: usize) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+}
+
 /// mimalloc, with the alignment decided at the call rather than inside the library.
 #[derive(Debug)]
 pub(crate) struct MiMalloc;
@@ -154,10 +274,17 @@ pub(crate) struct MiMalloc;
 // the blocks are mimalloc's blocks and they are freed by the one call that takes one back. What
 // this implementation adds is the choice of entry point, and [`given`] is the whole of it: a size
 // and alignment it accepts are ones mimalloc itself would have served from the plain allocator
-// after reaching the same conclusion, so the pointer satisfies the layout it was asked for.
+// after reaching the same conclusion, so the pointer satisfies the layout it was asked for. The
+// exception is a block [`mapped`] accepts, which is a mapping of its own: page aligned, so aligned
+// for any alignment up to a page, which is all `mapped` accepts, and zeroed by the kernel. Whether
+// a block is one is decided from its layout alone, so it is freed and grown by the calls that
+// match the one that made it.
 #[allow(unsafe_code)]
 unsafe impl GlobalAlloc for MiMalloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if mapped(layout.size(), layout.align()) {
+            return system::map(layout.size());
+        }
         // SAFETY: mimalloc takes any size, and [`given`] picks the call that answers this
         // alignment.
         unsafe {
@@ -170,6 +297,10 @@ unsafe impl GlobalAlloc for MiMalloc {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if mapped(layout.size(), layout.align()) {
+            // A fresh mapping is zeroed by the kernel.
+            return system::map(layout.size());
+        }
         // SAFETY: as [`GlobalAlloc::alloc`], and the zeroing is mimalloc's own.
         unsafe {
             if given(layout.size(), layout.align()) {
@@ -180,10 +311,17 @@ unsafe impl GlobalAlloc for MiMalloc {
         }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        // SAFETY: the pointer came from one of the calls above, all four of which are mimalloc's,
-        // and `mi_free` is how mimalloc takes a block back whichever of them made it.
-        unsafe { mi_free(ptr.cast()) }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the pointer came from one of the calls above with this layout. A mapped one is
+        // unmapped, and the rest are mimalloc's, which `mi_free` takes back whichever call made
+        // them.
+        unsafe {
+            if mapped(layout.size(), layout.align()) {
+                system::unmap(ptr, layout.size());
+            } else {
+                mi_free(ptr.cast());
+            }
+        }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
@@ -192,6 +330,22 @@ unsafe impl GlobalAlloc for MiMalloc {
         // aligned enough both as it is and as it will be, and the plain call is only taken when
         // both of those are a size mimalloc aligns anyway.
         unsafe {
+            let was = mapped(layout.size(), layout.align());
+            let will = mapped(size, layout.align());
+            if was && will {
+                return system::remap(ptr, layout.size(), size);
+            }
+            if was || will {
+                // Across the bound the block changes hands, so it is copied into one the other
+                // side made, and the old one is kept if that fails, as `realloc` promises.
+                let grown = Layout::from_size_align_unchecked(size, layout.align());
+                let moved = self.alloc(grown);
+                if !moved.is_null() {
+                    std::ptr::copy_nonoverlapping(ptr, moved, layout.size().min(size));
+                    self.dealloc(ptr, layout);
+                }
+                return moved;
+            }
             if given(layout.size().min(size), layout.align()) {
                 mi_realloc(ptr.cast(), binned(size)).cast()
             } else {
@@ -203,9 +357,11 @@ unsafe impl GlobalAlloc for MiMalloc {
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::{GlobalAlloc, Layout};
+
     use super::{
-        GIVEN, ROUNDED_FROM, ROUNDED_UPTO, binned, given, keep_everything_at_exit,
-        keep_freed_memory, purge_delay,
+        GIVEN, MAPPED_FROM, MAPS, MiMalloc, PAGE, ROUNDED_FROM, ROUNDED_UPTO, binned, given,
+        keep_everything_at_exit, keep_freed_memory, mapped, purge_delay,
     };
 
     /// The option set is the purge delay, which mimalloc 2 starts at ten milliseconds, and not some
@@ -255,5 +411,59 @@ mod tests {
             "a large block has a span of its own"
         );
         assert_eq!(binned(0), 0);
+    }
+
+    /// Only a block from the bound up, at no more than a page of alignment, is mapped, and only
+    /// where mapping is on.
+    #[test]
+    fn only_a_big_block_is_mapped() {
+        assert_eq!(mapped(MAPPED_FROM, 8), MAPS);
+        assert_eq!(mapped(64 << 20, PAGE), MAPS, "a page of alignment is a mapping's own");
+        assert!(!mapped(MAPPED_FROM - 1, 8), "a medium block stays with mimalloc");
+        assert!(!mapped(MAPPED_FROM, 2 * PAGE), "and so does one that wants more than a page");
+        assert!(!mapped(0, 1));
+    }
+
+    /// A block keeps what was written to it as it grows within the mappings, shrinks back across
+    /// the bound to mimalloc and grows across it again, and a zeroed one reads as zeros.
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_block_keeps_its_bytes_across_the_bound() {
+        let heap = MiMalloc;
+        let fill = |block: *mut u8, size: usize| {
+            for at in (0..size).step_by(4093) {
+                // SAFETY: `at` is inside the block of `size` bytes.
+                unsafe { block.add(at).write((at % 251) as u8) };
+            }
+        };
+        let check = |block: *const u8, size: usize| {
+            for at in (0..size).step_by(4093) {
+                // SAFETY: as in `fill`.
+                assert_eq!(unsafe { block.add(at).read() }, (at % 251) as u8, "byte {at}");
+            }
+        };
+        // SAFETY: each call is given the layout the block has at that point.
+        unsafe {
+            let small = 100 * 1024;
+            let layout = Layout::from_size_align(MAPPED_FROM + 3, 8).expect("a layout");
+            let block = heap.alloc_zeroed(layout);
+            assert!(!block.is_null());
+            assert!((0..layout.size()).step_by(997).all(|at| block.add(at).read() == 0));
+            fill(block, layout.size());
+            let big = 8 << 20;
+            let block = heap.realloc(block, layout, big);
+            assert!(!block.is_null());
+            check(block, layout.size());
+            fill(block, big);
+            let layout = Layout::from_size_align(big, 8).expect("a layout");
+            let block = heap.realloc(block, layout, small);
+            assert!(!block.is_null());
+            check(block, small);
+            let layout = Layout::from_size_align(small, 8).expect("a layout");
+            let block = heap.realloc(block, layout, MAPPED_FROM * 2);
+            assert!(!block.is_null());
+            check(block, small);
+            heap.dealloc(block, Layout::from_size_align(MAPPED_FROM * 2, 8).expect("a layout"));
+        }
     }
 }
