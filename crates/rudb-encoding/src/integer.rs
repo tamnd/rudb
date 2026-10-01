@@ -2252,7 +2252,7 @@ mod tests {
         let bytes = encode_only(Kind::Rle, &values).unwrap().expect("runs apply");
         for one_in in [1, 2, 7, 60, 900, 5000] {
             let positions: Vec<usize> =
-                (0..8192).filter(|_| random.next() % one_in == 0).collect();
+                (0..8192).filter(|_| random.next().is_multiple_of(one_in)).collect();
             let expected: Vec<i64> = positions.iter().map(|&position| values[position]).collect();
             assert_eq!(decode_selected(&bytes, &positions).unwrap(), expected, "one in {one_in}");
         }
