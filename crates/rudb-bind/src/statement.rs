@@ -2279,9 +2279,13 @@ fn change(
     };
     let hit = column(&mut binder, width);
     let hit = binder.checked_cast_to(hit, &LogicalType::Boolean, false)?;
+    let returning = returning(ast, catalog, parameters, session, written.returning)?;
+    // A delete that marks its rows gone needs only which rows those are, so the source reads the
+    // columns of the condition and not the rest. See [`Catalog::takes_rows`].
+    let narrow = delete && returning.is_none() && catalog.takes_rows(&name);
     let mut exprs = Vec::with_capacity(width);
     let mut names = Vec::with_capacity(width);
-    for (at, field) in fields.iter().enumerate() {
+    for (at, field) in fields.iter().enumerate().filter(|_| !narrow) {
         let old = column(&mut binder, at);
         let expr = match targets.iter().position(|&target| target == at) {
             Some(from) => {
@@ -2315,7 +2319,6 @@ fn change(
     let index = binder.fresh_index();
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
     let source = finish(binder, root)?;
-    let returning = returning(ast, catalog, parameters, session, written.returning)?;
     let write = if delete { Write::Delete } else { Write::Update };
     let checks = if delete { None } else { bind_checks(catalog, parameters, session, &name)? };
     Ok(Bound::Insert(Insert { name, source, write, returning, conflict: None, checks }))

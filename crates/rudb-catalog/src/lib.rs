@@ -16,6 +16,7 @@
 
 pub mod alter;
 pub mod catalog;
+pub mod gone;
 pub mod held;
 pub mod index;
 pub mod keys;
@@ -31,6 +32,7 @@ pub use alter::Alteration;
 pub use catalog::{
     Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, DETACHED, Database, Entry, Schema, Sequence, UserType,
 };
+pub use gone::Gone;
 pub use held::Held;
 pub use index::Index;
 pub use keys::{Constraint, ForeignKey, Key};

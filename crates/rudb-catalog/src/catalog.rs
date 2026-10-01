@@ -1713,6 +1713,18 @@ impl Catalog {
             .flat_map(|schema| schema.tables.iter())
     }
 
+    /// Whether a `DELETE` from `name` can mark its rows gone without reading the rows it keeps.
+    ///
+    /// The table has to say it can, see [`Table::takes_rows`], and no foreign key may point into
+    /// it, because checking that a delete left nobody's parent behind reads the rows that stay.
+    /// The binder asks this to read only the condition, and the statement asks it again to take
+    /// the rows, both under the same lock and so with the same answer.
+    #[must_use]
+    pub fn takes_rows(&self, name: &QualifiedName) -> bool {
+        self.table(name).is_ok_and(Table::takes_rows)
+            && !self.tables().any(|held| held.foreign().iter().any(|key| &key.table == name))
+    }
+
     /// The native mirror of the Parquet file at `path`, where there is one made from the file as
     /// it is now.
     ///

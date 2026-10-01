@@ -15,6 +15,7 @@ use rudb_storage::{MemoryTable, Probe, Range};
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector, concat};
 
 use crate::catalog::DETACHED;
+use crate::gone::Gone;
 use crate::held::Held;
 use crate::keys::{ForeignKey, Key, Seen};
 use crate::name::{QualifiedName, same_name};
@@ -87,6 +88,16 @@ pub enum Rows {
     /// forward as it is. It keeps the file's stripes and writes the rows since after them, which
     /// [`Rows::grown_from`] says where to start.
     Grown(NativeReader, MemoryTable),
+    /// A committed file some of whose rows a `DELETE` took out since.
+    ///
+    /// The file stays the file and [`Gone`] says which of its rows are no longer there, so a
+    /// delete costs one bit a row it took rather than reading every row it kept into memory. A part
+    /// is read and then has its gone rows dropped, which is all a scan sees. The parts keep the
+    /// file's numbering, so a part can come back shorter than the file says, down to no rows.
+    ///
+    /// Like a grown table it gives up the statistics that would count the gone rows, and keeps the
+    /// bounds, because a bound over every row of a part is still a bound over the rows left of it.
+    Masked(NativeReader, Arc<Gone>),
 }
 
 /// Two columns fetched at sparse native row ordinals without materializing their string values.
@@ -122,14 +133,46 @@ impl Rows {
     /// Never in practice. The branch that would report one is the committed file that was replaced
     /// on the line above, which the compiler cannot see is gone.
     pub fn to_append(&mut self) -> Result<&mut MemoryTable> {
+        // Rows appended after a delete join what the delete left in memory. Keeping the file and
+        // its gone rows with a third part beside them is the better shape, and not one any query
+        // has needed yet.
+        if let Self::Masked(..) = self {
+            *self = Self::Memory(self.materialized()?);
+        }
         if let Self::Native(reader) = self {
             let types = reader.table().fields().iter().map(|field| field.ty.clone()).collect();
             *self = Self::Grown(reader.clone(), MemoryTable::new(types));
         }
         match self {
             Self::Memory(rows) | Self::Grown(_, rows) => Ok(rows),
-            Self::Native(_) => Err(Error::internal("a committed table took no append buffer")),
+            Self::Native(_) | Self::Masked(..) => {
+                Err(Error::internal("a committed table took no append buffer"))
+            }
         }
+    }
+
+    /// Every row read into a table in memory.
+    fn materialized(&self) -> Result<MemoryTable> {
+        let types = self.types();
+        let columns = (0..types.len()).collect::<Vec<_>>();
+        let mut chunks = Vec::with_capacity(self.chunk_count());
+        for at in 0..self.chunk_count() {
+            // Loosened for the reason a grown table's file parts are: the rows appended after
+            // these have no codes in the file's dictionary.
+            let chunk = self.read(at, &columns)?.loosened();
+            if !chunk.is_empty() {
+                chunks.push(chunk);
+            }
+        }
+        let mut rows = MemoryTable::new(types);
+        rows.append_all(chunks, 1)?;
+        Ok(rows)
+    }
+
+    /// The rows of part `at` of a file with some rows gone that are still there, or `None` when
+    /// all of them are.
+    fn live(reader: &NativeReader, gone: &Gone, at: usize) -> Option<Vec<u32>> {
+        gone.live(at, reader.part_rows(at))
     }
 
     /// The file behind a table whose rows are all in it, for whoever wants a stored section.
@@ -149,7 +192,7 @@ impl Rows {
     pub fn stored(&self) -> Option<&NativeReader> {
         match self {
             Self::Native(reader) => Some(reader),
-            Self::Memory(_) | Self::Grown(..) => None,
+            Self::Memory(_) | Self::Grown(..) | Self::Masked(..) => None,
         }
     }
 
@@ -160,7 +203,9 @@ impl Rows {
     fn stripes_in_file(&self) -> usize {
         match self {
             Self::Memory(_) => 0,
-            Self::Native(reader) | Self::Grown(reader, _) => reader.stripe_parts().len(),
+            Self::Native(reader) | Self::Grown(reader, _) | Self::Masked(reader, _) => {
+                reader.stripe_parts().len()
+            }
         }
     }
 
@@ -176,7 +221,7 @@ impl Rows {
             Self::Native(reader) => reader.top_frequencies(column, top),
             // A count descending prefix of the file is not one of the table, because a value the
             // rows in memory hold a hundred of can be anywhere in the file's list or absent from it.
-            Self::Grown(_, _) => Ok(None),
+            Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -204,7 +249,7 @@ impl Rows {
                 .map(|entries| FrequencyPrefix { entries, omitted_max: 0 })),
             Self::Native(reader) => reader.frequency_prefix(column),
             // Neither half holds the other's rows, so neither the list nor the bound is the table's.
-            Self::Grown(_, _) => Ok(None),
+            Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -227,7 +272,7 @@ impl Rows {
             Self::Memory(rows) => rows.frequencies(column),
             Self::Native(reader) => reader.exact_frequencies(column),
             // Exact means every value with its row count, and neither half has the other's rows.
-            Self::Grown(_, _) => Ok(None),
+            Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -249,7 +294,7 @@ impl Rows {
             Self::Native(reader) => reader.distinct_values(column),
             // Two exact counts do not add up, because a value in both halves is one value and the
             // sum says two, and this answer is read as the result of a `COUNT(DISTINCT c)`.
-            Self::Grown(_, _) => Ok(None),
+            Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -261,6 +306,8 @@ impl Rows {
         match self {
             Self::Memory(rows) => Ok(Some(rows.null_count(column)? as u64)),
             Self::Native(reader) => reader.null_count(column).map(Some),
+            // The file counted the gone rows too, and which of them were null is a read away.
+            Self::Masked(..) => Ok(None),
             // Nulls do add up, because a null row is a row and both halves counted every one of
             // theirs, so this one stays exact rather than going quiet like the rest.
             Self::Grown(reader, rows) => {
@@ -285,7 +332,7 @@ impl Rows {
             // Widening one half's pair with the other's would mean ordering two values, and a
             // value here is not ordered, which is what the kernels are for. Both ends of a string
             // column are a read of the column away, so saying nothing costs the caller that.
-            Self::Grown(_, _) => Ok(None),
+            Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -297,7 +344,7 @@ impl Rows {
             Self::Native(reader) => reader.exact_extremes(column),
             // The same as the pair above, and this one is asked of every column rather than of the
             // string ones, so it is the one worth folding in when a bound learns how to widen.
-            Self::Grown(_, _) => Ok(None),
+            Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -307,7 +354,7 @@ impl Rows {
     pub fn dictionary_rows(&self, column: usize) -> Result<Option<(usize, usize)>> {
         match self {
             Self::Memory(rows) => rows.dictionary_rows(column).map(Some),
-            Self::Native(_) | Self::Grown(_, _) => Ok(None),
+            Self::Native(_) | Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -317,6 +364,7 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.exact_sum(column),
             Self::Native(reader) => reader.exact_sum(column),
+            Self::Masked(..) => Ok(None),
             // A sum and a row count both add, so the pair adds, and an answer needs both halves
             // because a sum over some of the rows is not a sum over the table.
             Self::Grown(reader, rows) => {
@@ -346,7 +394,7 @@ impl Rows {
             Self::Native(reader) => reader.frequency_occurrences(column),
             // The ordinals a candidate set covers are ordinals of the file, and the table's rows
             // are no longer numbered the way the file numbers them once there are more of them.
-            Self::Grown(_, _) => Ok(None),
+            Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -357,7 +405,7 @@ impl Rows {
     pub fn frequency_codes(&self, column: usize) -> Result<Option<FrequencyCodes>> {
         match self {
             Self::Native(reader) => reader.frequency_codes(column),
-            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
+            Self::Memory(_) | Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -613,6 +661,12 @@ impl Rows {
                 }
                 reader.part_rows(at)
             }
+            Self::Masked(reader, gone) => {
+                if at >= reader.parts() {
+                    return Err(Error::internal("row ordinal names a missing part"));
+                }
+                reader.part_rows(at) - gone.lost(at)
+            }
             Self::Grown(reader, rows) => {
                 if at < reader.parts() {
                     reader.part_rows(at)
@@ -821,7 +875,7 @@ impl Rows {
     pub fn types(&self) -> Vec<LogicalType> {
         match self {
             Self::Memory(rows) => rows.types().to_vec(),
-            Self::Native(reader) | Self::Grown(reader, _) => {
+            Self::Native(reader) | Self::Grown(reader, _) | Self::Masked(reader, _) => {
                 reader.table().fields().iter().map(|field| field.ty.clone()).collect()
             }
         }
@@ -834,6 +888,7 @@ impl Rows {
             Self::Memory(rows) => rows.len(),
             Self::Native(reader) => reader.table().rows(),
             Self::Grown(reader, rows) => reader.table().rows().saturating_add(rows.len()),
+            Self::Masked(reader, gone) => reader.table().rows().saturating_sub(gone.total()),
         }
     }
 
@@ -859,7 +914,16 @@ impl Rows {
     pub fn grown_from(&self) -> Option<(usize, usize)> {
         match self {
             Self::Grown(reader, _) => Some((reader.table().rows(), reader.parts())),
-            Self::Memory(_) | Self::Native(_) => None,
+            Self::Memory(_) | Self::Native(_) | Self::Masked(..) => None,
+        }
+    }
+
+    /// The rows a `DELETE` took out of the file behind this table, when it has one and some are.
+    #[must_use]
+    pub fn gone(&self) -> Option<&Gone> {
+        match self {
+            Self::Masked(_, gone) => Some(gone),
+            Self::Memory(_) | Self::Native(_) | Self::Grown(..) => None,
         }
     }
 
@@ -868,7 +932,7 @@ impl Rows {
     pub fn chunk_count(&self) -> usize {
         match self {
             Self::Memory(rows) => rows.chunk_count(),
-            Self::Native(reader) => reader.parts(),
+            Self::Native(reader) | Self::Masked(reader, _) => reader.parts(),
             Self::Grown(reader, rows) => reader.parts().saturating_add(rows.chunk_count()),
         }
     }
@@ -883,7 +947,7 @@ impl Rows {
     pub fn stripe_parts(&self) -> Vec<std::ops::Range<usize>> {
         match self {
             Self::Memory(rows) => rows.group_parts(),
-            Self::Native(reader) => reader.stripe_parts(),
+            Self::Native(reader) | Self::Masked(reader, _) => reader.stripe_parts(),
             // The file's stripes and then the row groups of what arrived since, moved up by the
             // parts in front of them so that a range here still names parts [`Self::read`] takes.
             Self::Grown(reader, rows) => {
@@ -908,6 +972,13 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.group_rows(stripe),
             Self::Native(reader) => reader.stripe_rows(stripe),
+            Self::Masked(reader, gone) => {
+                let lost = reader
+                    .stripe_parts()
+                    .get(stripe)
+                    .map_or(0, |parts| parts.clone().map(|part| gone.lost(part)).sum());
+                reader.stripe_rows(stripe) - lost
+            }
             Self::Grown(reader, rows) => {
                 let held = self.stripes_in_file();
                 if stripe < held {
@@ -925,7 +996,9 @@ impl Rows {
     pub fn keep_stripes(&self, stripes: usize) {
         match self {
             Self::Memory(_) => {}
-            Self::Native(reader) | Self::Grown(reader, _) => reader.keep_stripes(stripes),
+            Self::Native(reader) | Self::Grown(reader, _) | Self::Masked(reader, _) => {
+                reader.keep_stripes(stripes);
+            }
         }
     }
 
@@ -934,6 +1007,21 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.read(at, columns),
             Self::Native(reader) => reader.read(at, columns),
+            Self::Masked(reader, gone) => {
+                let part = reader.read(at, columns)?;
+                match Self::live(reader, gone, at) {
+                    // Gathered rather than selected, so what a checkpoint writes from it is a plain
+                    // column and not a window onto the rows it is leaving behind.
+                    Some(live) => {
+                        let mut columns = Vec::with_capacity(part.width());
+                        for column in 0..part.width() {
+                            columns.push(part.column(column)?.gather(&live)?);
+                        }
+                        Chunk::with_rows(columns, live.len())
+                    }
+                    None => Ok(part),
+                }
+            }
             // A part of the file keeps the file's string codes, and they are not the codes of the
             // rows that arrived since, which have none. A caller told the codes were stable would
             // count the file's rows by code and never meet the others.
@@ -975,6 +1063,19 @@ impl Rows {
     ) -> Result<Chunk> {
         match self {
             Self::Native(reader) => reader.read_rows(at, columns, positions, whole),
+            // The positions count the rows left, and the file counts every row it wrote.
+            Self::Masked(reader, gone) => match Self::live(reader, gone, at) {
+                Some(live) => {
+                    let mut held = Vec::with_capacity(positions.len());
+                    for &position in positions {
+                        held.push(*live.get(position as usize).ok_or_else(|| {
+                            Error::internal("a selection keeps a row past its part")
+                        })?);
+                    }
+                    reader.read_rows(at, columns, &held, whole)
+                }
+                None => reader.read_rows(at, columns, positions, whole),
+            },
             Self::Grown(reader, _) if at < reader.parts() => {
                 reader.read_rows(at, columns, positions, whole).map(Chunk::loosened)
             }
@@ -1009,7 +1110,7 @@ impl Rows {
             Self::Grown(reader, _) if at < reader.parts() => {
                 reader.rows_holding(at, column, sequences, negated)
             }
-            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
+            Self::Memory(_) | Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -1031,7 +1132,7 @@ impl Rows {
             Self::Grown(reader, _) if at < reader.parts() => {
                 reader.rows_equal(at, column, literals)
             }
-            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
+            Self::Memory(_) | Self::Grown(_, _) | Self::Masked(..) => Ok(None),
         }
     }
 
@@ -1040,7 +1141,7 @@ impl Rows {
     pub fn skips(&self, at: usize, probes: &[Probe]) -> bool {
         match self {
             Self::Memory(rows) => rows.skips(at, probes),
-            Self::Native(reader) => reader.skips(at, probes),
+            Self::Native(reader) | Self::Masked(reader, _) => reader.skips(at, probes),
             Self::Grown(reader, rows) => {
                 if at < reader.parts() {
                     reader.skips(at, probes)
@@ -1059,7 +1160,7 @@ impl Rows {
     pub fn lacks(&self, at: usize, needles: &[(usize, Vec<u8>)], workers: usize) -> bool {
         match self {
             Self::Memory(rows) => rows.lacks(at, needles, workers),
-            Self::Native(_) => false,
+            Self::Native(_) | Self::Masked(..) => false,
             Self::Grown(reader, rows) => {
                 at >= reader.parts() && rows.lacks(at - reader.parts(), needles, workers)
             }
@@ -1072,7 +1173,7 @@ impl Rows {
         let memory = |rows: &MemoryTable, at| rows.zone(at)?.column(column).cloned();
         match self {
             Self::Memory(rows) => memory(rows, at),
-            Self::Native(reader) => reader.part_range(at, column),
+            Self::Native(reader) | Self::Masked(reader, _) => reader.part_range(at, column),
             Self::Grown(reader, rows) => {
                 if at < reader.parts() {
                     reader.part_range(at, column)
@@ -1094,7 +1195,7 @@ impl Rows {
         };
         match self {
             Self::Memory(rows) => memory(rows, at),
-            Self::Native(reader) => reader.ruled_by(at, column, rule),
+            Self::Native(reader) | Self::Masked(reader, _) => reader.ruled_by(at, column, rule),
             Self::Grown(reader, rows) => {
                 if at < reader.parts() {
                     reader.ruled_by(at, column, rule)
@@ -1118,7 +1219,9 @@ impl Rows {
         };
         match self {
             Self::Memory(rows) => memory(rows, stripe),
-            Self::Native(reader) => reader.stripe_ruled_by(stripe, column, rule),
+            Self::Native(reader) | Self::Masked(reader, _) => {
+                reader.stripe_ruled_by(stripe, column, rule)
+            }
             Self::Grown(reader, rows) => {
                 let held = self.stripes_in_file();
                 if stripe < held {
@@ -1138,7 +1241,7 @@ impl Rows {
     pub fn certain(&self, at: usize, probes: &[Probe]) -> bool {
         match self {
             Self::Memory(rows) => rows.certain(at, probes),
-            Self::Native(reader) => reader.certain(at, probes),
+            Self::Native(reader) | Self::Masked(reader, _) => reader.certain(at, probes),
             Self::Grown(reader, rows) => {
                 if at < reader.parts() {
                     reader.certain(at, probes)
@@ -1159,7 +1262,7 @@ impl Rows {
     pub fn stripe_skips(&self, stripe: usize, probes: &[Probe]) -> bool {
         match self {
             Self::Memory(rows) => rows.group_skips(stripe, probes),
-            Self::Native(reader) => reader.stripe_skips(stripe, probes),
+            Self::Native(reader) | Self::Masked(reader, _) => reader.stripe_skips(stripe, probes),
             Self::Grown(reader, rows) => {
                 let held = self.stripes_in_file();
                 if stripe < held {
@@ -1184,7 +1287,7 @@ impl Rows {
             Self::Native(reader) => Some(Arc::new(Stripes::new(reader.clone()))),
             // The file's stripes are not the table's stripes any more, and a bound that covers some
             // of the rows is not a bound, so the planner is told nothing rather than told half.
-            Self::Grown(_, _) => None,
+            Self::Grown(_, _) | Self::Masked(..) => None,
         }
     }
 
@@ -1198,7 +1301,7 @@ impl Rows {
         match self {
             Self::Memory(_) => None,
             Self::Native(reader) => Some(Arc::new(Common::new(reader.clone()))),
-            Self::Grown(_, _) => None,
+            Self::Grown(_, _) | Self::Masked(..) => None,
         }
     }
 
@@ -1210,7 +1313,7 @@ impl Rows {
     #[must_use]
     pub fn distincts(&self) -> Vec<(String, Stat<u64>)> {
         match self {
-            Self::Memory(_) | Self::Grown(_, _) => Vec::new(),
+            Self::Memory(_) | Self::Grown(_, _) | Self::Masked(..) => Vec::new(),
             // A reader that cannot answer its own directory is a reader that will fail the scan a
             // moment later with the same error, and the planner is not the place to raise it. An
             // empty list reads back as a table nobody counted, which is where this started.
@@ -1225,7 +1328,7 @@ impl Rows {
     #[must_use]
     pub fn facts(&self) -> Option<Arc<ColumnFacts>> {
         match self {
-            Self::Memory(_) | Self::Grown(_, _) => None,
+            Self::Memory(_) | Self::Grown(_, _) | Self::Masked(..) => None,
             Self::Native(reader) => Some(rudb_native::facts(reader)),
         }
     }
@@ -1239,7 +1342,8 @@ impl Rows {
     pub fn ascending(&self) -> Vec<String> {
         match self {
             Self::Memory(_) | Self::Grown(_, _) => Vec::new(),
-            Self::Native(reader) => rudb_native::ascending(reader),
+            // Rows that never went down still do not once some of them are gone.
+            Self::Native(reader) | Self::Masked(reader, _) => rudb_native::ascending(reader),
         }
     }
 
@@ -1251,7 +1355,7 @@ impl Rows {
     pub fn widths(&self) -> Vec<(String, u64)> {
         match self {
             Self::Memory(_) | Self::Grown(_, _) => Vec::new(),
-            Self::Native(reader) => rudb_native::widths(reader),
+            Self::Native(reader) | Self::Masked(reader, _) => rudb_native::widths(reader),
         }
     }
 
@@ -1265,7 +1369,7 @@ impl Rows {
     pub fn chunk(&self, at: usize) -> Option<Chunk> {
         match self {
             Self::Memory(rows) => rows.chunk(at),
-            Self::Native(_) => None,
+            Self::Native(_) | Self::Masked(..) => None,
             Self::Grown(reader, rows) => {
                 at.checked_sub(reader.parts()).and_then(|at| rows.chunk(at))
             }
@@ -1472,7 +1576,9 @@ impl Table {
     pub fn stored(&self, column: usize) -> Result<Vec<StoredPart>> {
         match &self.rows {
             Rows::Memory(_) => Ok(Vec::new()),
-            Rows::Native(reader) | Rows::Grown(reader, _) => reader.stored(column),
+            Rows::Native(reader) | Rows::Grown(reader, _) | Rows::Masked(reader, _) => {
+                reader.stored(column)
+            }
         }
     }
 
@@ -1529,7 +1635,7 @@ impl Table {
         match &self.rows {
             // A table with rows in memory has rows the file does not, so the file is going to be
             // written again whatever the declaration says, and answering false here says so once.
-            Rows::Memory(_) | Rows::Grown(_, _) => false,
+            Rows::Memory(_) | Rows::Grown(_, _) | Rows::Masked(..) => false,
             Rows::Native(reader) => reader.table().clustering() == self.clustering.as_ref(),
         }
     }
@@ -1759,6 +1865,70 @@ impl Table {
         let frame = self.frame;
         self.replace_all(chunks, workers)?;
         self.frame = frame;
+        Ok(())
+    }
+
+    /// Whether a `DELETE` can mark rows gone here rather than hand back the rows it keeps.
+    ///
+    /// A table with a file behind it and no rows beside it can, as long as nothing has to be
+    /// checked about the rows that stay. A key is, because [`Self::replace_all`] gathers what the
+    /// table holds afterwards for the next write to be checked against, and that is the read of
+    /// every row this is here to save.
+    #[must_use]
+    pub fn takes_rows(&self) -> bool {
+        matches!(self.rows, Rows::Native(_) | Rows::Masked(..)) && self.guards().is_empty()
+    }
+
+    /// Takes rows out by their number in the table, which rise, without reading the others.
+    ///
+    /// The file stays where it is and the rows are marked gone beside it, see [`Rows::Masked`].
+    /// Every row after the first one taken moves down, so the frame is new, as it is for
+    /// [`Self::replace_all`].
+    ///
+    /// # Errors
+    ///
+    /// If the table cannot take rows this way, see [`Self::takes_rows`], or a number is past it.
+    pub fn take_rows(&mut self, numbers: &[u64]) -> Result<()> {
+        if !self.takes_rows() {
+            return Err(Error::internal("rows taken out of a table that keeps them in memory"));
+        }
+        let (reader, mut gone) = match &self.rows {
+            Rows::Native(reader) => (reader.clone(), Gone::none(reader.parts())),
+            Rows::Masked(reader, gone) => (reader.clone(), Gone::clone(gone)),
+            _ => return Err(Error::internal("rows taken out of a table that is not a file")),
+        };
+        let mut numbers = numbers.iter().copied().peekable();
+        let mut start = 0_u64;
+        let mut slots = Vec::new();
+        for part in 0..reader.parts() {
+            let rows = reader.part_rows(part);
+            let live = gone.live(part, rows);
+            let end = start + (rows - gone.lost(part)) as u64;
+            slots.clear();
+            while let Some(number) = numbers.next_if(|&number| number < end) {
+                let at = number
+                    .checked_sub(start)
+                    .ok_or_else(|| Error::internal("the rows a delete took out do not rise"))?
+                    as usize;
+                slots.push(live.as_ref().map_or(at as u32, |live| live[at]));
+            }
+            if !slots.is_empty() {
+                gone.take(part, rows, &slots)?;
+            }
+            start = end;
+        }
+        if numbers.next().is_some() {
+            return Err(Error::internal("a delete took out a row past the table"));
+        }
+        // A file with every row gone is an empty table, which memory holds for nothing.
+        self.rows = if gone.total() >= reader.table().rows() {
+            Rows::Memory(MemoryTable::new(self.types()))
+        } else if gone.is_empty() {
+            Rows::Native(reader)
+        } else {
+            Rows::Masked(reader, Arc::new(gone))
+        };
+        self.frame = next_revision();
         Ok(())
     }
 

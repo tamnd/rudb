@@ -84,7 +84,9 @@ fn demoted(database: &Database, column: usize) -> bool {
         let name = QualifiedName::new("memory".to_owned(), "main".to_owned(), "t".to_owned());
         match catalog.table(&name).expect("the table").rows() {
             Rows::Native(reader) => reader.demoted(column),
-            Rows::Memory(_) | Rows::Grown(_, _) => panic!("the table is not in a file"),
+            Rows::Memory(_) | Rows::Grown(_, _) | Rows::Masked(..) => {
+                panic!("the table is not in a file")
+            }
         }
     })
 }
