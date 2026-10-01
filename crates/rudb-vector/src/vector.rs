@@ -3426,6 +3426,21 @@ impl Vector {
         }
     }
 
+    /// The vector in the form a part held in memory is read from: a packed column with no nulls
+    /// written out flat, anything else as it was.
+    ///
+    /// A part that stays in memory to be gathered from is read again and again, a few rows at a time,
+    /// and every gather out of a packed column unpacks the codes it wants once more. Over the TPC-H
+    /// suite those unpacks were about a sixth of the hot instructions. Writing the part out once when
+    /// it is kept makes every gather after it a plain load per row.
+    #[must_use]
+    pub fn unpacked_to_hold(self) -> Self {
+        match self.unpacked_whole() {
+            Some(flat) => flat.into_pages(),
+            None => self,
+        }
+    }
+
     /// A packed column with no nulls written out whole, a block of 64 codes at a time.
     ///
     /// The general copy builds a list of every position and then reads each code on its own, working

@@ -9508,7 +9508,7 @@ impl Reader {
             }
             let vector = vector.into_pages();
             if keeping {
-                let vector = self.keep(at, column, vector);
+                let vector = self.keep(at, column, vector, positions.is_some());
                 picked.push(match positions {
                     None => Arc::unwrap_or_clone(vector),
                     Some(positions) => vector.gather(positions)?,
@@ -9599,16 +9599,23 @@ impl Reader {
 
     /// Holds `vector` as part `at` of `column` and counts it against the pool, and answers what the
     /// read goes on with, which is the one already held if another worker got there first.
-    fn keep(&self, at: usize, column: usize, vector: Vector) -> Arc<Vector> {
-        let bytes = vector.footprint();
-        let vector = Arc::new(vector);
-        let used = Arc::new(AtomicBool::new(false));
+    ///
+    /// A part kept by a read of some of its rows is held flat. It is one a join or a filter gathers
+    /// from, and a gather out of a packed part unpacks the rows it wants every time. A part kept by a
+    /// read of all of it stays packed, since the kernels that read whole parts work on the codes and
+    /// the packed part is a fraction of the memory. The slot is asked first, so a part another worker
+    /// already holds is not written out flat for nothing.
+    fn keep(&self, at: usize, column: usize, vector: Vector, gathered: bool) -> Arc<Vector> {
         let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else {
-            return vector;
+            return Arc::new(vector);
         };
         if let PartSlot::Held { vector, .. } = &*held {
             return Arc::clone(vector);
         }
+        let vector = if gathered { vector.unpacked_to_hold() } else { vector };
+        let bytes = vector.footprint();
+        let vector = Arc::new(vector);
+        let used = Arc::new(AtomicBool::new(false));
         *held = PartSlot::Held { vector: Arc::clone(&vector), used: Arc::clone(&used) };
         drop(held);
         self.pool.admit(Held {
