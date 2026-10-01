@@ -180,7 +180,8 @@ impl Rows {
     }
 
     /// Part `at` of a file read as `part`, holding `columns`, with the rows an update wrote into
-    /// it laid over the rows they replace.
+    /// it laid over the rows they replace, and every column an update wrote anywhere without the
+    /// file's string codes.
     fn patched(
         reader: &NativeReader,
         gone: &Gone,
@@ -188,21 +189,26 @@ impl Rows {
         columns: &[usize],
         part: Chunk,
     ) -> Result<Chunk> {
-        let Some(patch) = gone.patch(at).filter(|_| gone.changes(at, columns.iter().copied()))
-        else {
+        if !columns.iter().any(|&column| gone.touched(column)) {
             return Ok(part);
-        };
+        }
+        let patch = gone.patch(at);
         let fields = reader.table().fields();
         let rows = part.len();
         let mut laid = Vec::with_capacity(part.width());
         for (read, &column) in part.into_columns().into_iter().zip(columns) {
-            laid.push(if gone.touched(column) {
-                let field = fields
-                    .get(column)
-                    .ok_or_else(|| Error::internal("a read names a column past the table"))?;
-                patch.over(&field.ty, &read, column)?
-            } else {
-                read
+            laid.push(match patch {
+                Some(patch) if gone.touched(column) => {
+                    let field = fields
+                        .get(column)
+                        .ok_or_else(|| Error::internal("a read names a column past the table"))?;
+                    patch.over(&field.ty, &read, column)?
+                }
+                // A part the update left alone still loses the file's string codes, because the
+                // parts it wrote into have none and a group that took codes from one part and
+                // strings from the next would hold every key twice.
+                None if gone.touched(column) => read.loosened(),
+                _ => read,
             });
         }
         Chunk::with_rows(laid, rows)
@@ -1207,18 +1213,21 @@ impl Rows {
                 Chunk::with_rows(selected, positions.len())
             }
             // The positions count the rows left, and the file counts every row it wrote.
-            Self::Masked(reader, gone) => match Self::live(reader, gone, at) {
-                Some(live) => {
-                    let mut held = Vec::with_capacity(positions.len());
-                    for &position in positions {
-                        held.push(*live.get(position as usize).ok_or_else(|| {
-                            Error::internal("a selection keeps a row past its part")
-                        })?);
+            Self::Masked(reader, gone) => {
+                let part = match Self::live(reader, gone, at) {
+                    Some(live) => {
+                        let mut held = Vec::with_capacity(positions.len());
+                        for &position in positions {
+                            held.push(*live.get(position as usize).ok_or_else(|| {
+                                Error::internal("a selection keeps a row past its part")
+                            })?);
+                        }
+                        reader.read_rows(at, columns, &held, whole)?
                     }
-                    reader.read_rows(at, columns, &held, whole)
-                }
-                None => reader.read_rows(at, columns, positions, whole),
-            },
+                    None => reader.read_rows(at, columns, positions, whole)?,
+                };
+                Self::patched(reader, gone, at, columns, part)
+            }
             Self::Grown(reader, _) if at < reader.parts() => {
                 reader.read_rows(at, columns, positions, whole).map(Chunk::loosened)
             }
