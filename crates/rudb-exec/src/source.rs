@@ -531,6 +531,10 @@ const TIGHT: usize = 16;
 struct Paying {
     seen: AtomicUsize,
     kept: AtomicUsize,
+    /// The rows the bitmap was timed over and the nanoseconds it took, with the chunk narrowed to
+    /// the rows it kept, see [`Scan::sift_exact_but`].
+    timed: AtomicUsize,
+    spent: AtomicU64,
 }
 
 impl Paying {
@@ -562,6 +566,25 @@ impl Paying {
             return 0.5;
         }
         self.kept.load(Ordering::Relaxed) as f64 / seen as f64
+    }
+
+    /// What the bitmap costs for each row it drops, in nanoseconds, or `guess` a row before it was
+    /// timed over a few chunks.
+    #[expect(clippy::cast_precision_loss, reason = "counts of rows and nanoseconds are weights")]
+    fn rank(&self, guess: f64) -> f64 {
+        let timed = self.timed.load(Ordering::Relaxed);
+        let each = if timed < 4 * VECTOR_SIZE {
+            guess
+        } else {
+            self.spent.load(Ordering::Relaxed) as f64 / timed as f64
+        };
+        each / (1.0 - self.passing()).max(0.01)
+    }
+
+    /// Records the nanoseconds testing `rows` rows against the bitmap took.
+    fn took(&self, rows: usize, nanos: u64) {
+        self.timed.fetch_add(rows, Ordering::Relaxed);
+        self.spent.fetch_add(nanos, Ordering::Relaxed);
     }
 
     /// Records what one chunk put through the filter and what came out.
@@ -2087,30 +2110,40 @@ impl<'a> Scan<'a> {
                 continue;
             }
             let Ok(column) = chunk.column(at) else { continue };
-            tests.push((crate::sideways::repeated(column).mul_add(-0.85, 1.0), paying, at, domain));
+            // Before it is timed, a lookup is taken at three nanoseconds a row, and a row whose
+            // eight keys repeat the one before them at a sixth of that.
+            let guess = 3.0 * crate::sideways::repeated(column).mul_add(-0.85, 1.0);
+            tests.push((paying.rank(guess), paying, at, domain));
         }
-        // The test that costs least for each row it throws away goes first, so the dearer ones see
-        // fewer rows. A key that comes in runs is looked up once a run, see `Domain::kept`: in JOB
-        // 17f the people of `name` keep one row of `cast_info` in eight and its movies one in thirty,
-        // but the people are in runs and the movies are not, and testing the movies first looked up
-        // every row of the table.
+        // The bitmap that costs least for each row it throws away goes first, so the dearer ones
+        // see fewer rows, which is the order that costs least when the bitmaps drop rows apart from
+        // each other. What a bitmap costs is timed rather than worked out, because it is mostly
+        // where the bitmap sits in the cache and whether the keys come in runs, see
+        // `Domain::kept`. In JOB 17f the people of `name` keep one row of `cast_info` in eight and
+        // its movies one in thirty, but the people come in runs and the movies do not, and testing
+        // the movies first looked up every row of the table. In JOB 16b one keyword keeps one row
+        // of `movie_keyword` in two hundred from a bitmap that fits in the first level of the cache,
+        // and goes before the movies of `movie_companies` though those come in runs.
         if tests.len() > 1 {
-            let rank = |&(cost, paying, ..): &(f64, &Paying, usize, &Domain)| {
-                cost / (1.0 - paying.passing()).max(0.01)
-            };
-            tests.sort_by(|one, other| rank(one).total_cmp(&rank(other)));
+            tests.sort_by(|one, other| one.0.total_cmp(&other.0));
         }
+        let timing = tests.len() > 1;
         for (_, paying, at, domain) in tests {
             if chunk.is_empty() {
                 return Ok(());
             }
             let Ok(column) = chunk.column(at) else { continue };
             let rows = chunk.len();
+            let start = timing.then(std::time::Instant::now);
             let kept = domain.kept(column, rows, &mut block);
             paying.saw(rows, kept.count());
             if kept.count() < rows {
                 let whole = std::mem::replace(chunk, Chunk::empty(&[]));
                 *chunk = whole.select(&Selection::from_indices(kept.indices()))?;
+            }
+            if let Some(start) = start {
+                let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                paying.took(rows, nanos);
             }
         }
         Ok(())
