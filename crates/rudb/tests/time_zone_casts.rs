@@ -163,3 +163,18 @@ fn a_zone_name_is_matched_without_regard_to_case_and_kept_as_found() {
     let error = database.execute("SET TimeZone = 'nope'").unwrap_err().to_string();
     assert!(error.starts_with("Not implemented Error: Unknown TimeZone 'nope'!"), "{error}");
 }
+
+#[test]
+fn the_last_instant_prints_its_wall_clock_even_past_the_last_timestamp() {
+    assert_eq!(
+        under(
+            "Europe/Berlin",
+            "SELECT '294247-01-10 04:00:54.775806+00'::TIMESTAMPTZ, '294247-01-10 03:30:00+00'::TIMESTAMPTZ::VARCHAR, ['294247-01-10 04:00:54.775806+00'::TIMESTAMPTZ]"
+        ),
+        "294247-01-10 05:00:54.775806+01|294247-01-10 04:30:00+01|['294247-01-10 05:00:54.775806+01']"
+    );
+    assert_eq!(
+        under("America/New_York", "SELECT make_timestamptz(9223372036854775806)"),
+        "294247-01-09 23:00:54.775806-05"
+    );
+}

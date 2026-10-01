@@ -445,9 +445,26 @@ impl Value {
             }
             // The wall clock moves by the whole offset and the offset is written in whole minutes,
             // the way the pin's ICU cast writes it, so New York before 1883 is `19:03:58-04:56`.
+            // The wall clock can run past the last instant a timestamp holds, so the last instant
+            // in Berlin is `294247-01-10 05:00:54.775806+01`. It is split into a day and a time
+            // rather than made a timestamp, which would saturate it into `infinity`.
             Self::TimestampTz(micros) => {
-                let local = micros.saturating_add(i64::from(offset_seconds) * 1_000_000);
-                format!("{}{}", Self::Timestamp(local), offset_text(offset_seconds / 60 * 60))
+                const MICROS_PER_DAY: i128 = 86_400 * 1_000_000;
+                let local = i128::from(*micros) + i128::from(offset_seconds) * 1_000_000;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "an i64 of microseconds and an offset of hours is about 10^8 days"
+                )]
+                let (days, within) = (
+                    local.div_euclid(MICROS_PER_DAY) as i32,
+                    local.rem_euclid(MICROS_PER_DAY) as i64,
+                );
+                format!(
+                    "{} {}{}",
+                    Self::Date(days),
+                    Self::Time(within),
+                    offset_text(offset_seconds / 60 * 60)
+                )
             }
             other => other.to_string(),
         }
