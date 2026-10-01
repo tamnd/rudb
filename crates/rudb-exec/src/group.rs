@@ -2884,11 +2884,14 @@ impl<'a> Aggregate<'a> {
                     start = end;
                 }
                 runs_found = true;
-            } else if codes.look_up(coded_map, nowhere(slots, *length)) != Some(false) {
+            } else if codes.look_up(coded_map, *length, slots) != Some(false) {
                 // One pass that finds every row's slot straight out of the map when the key is one
                 // or two dictionary columns, which is the whole chunk once a row group's first rows
                 // are in. Only a chunk where some row found nothing, or a key the pass does not
-                // read, goes through the places and the loop here.
+                // read, goes through the places and the loop here, which writes every row's slot.
+                if slots.len() != *length {
+                    nowhere(slots, *length);
+                }
                 codes.places(*length, coded_places);
                 let mut row = 0;
                 loop {
