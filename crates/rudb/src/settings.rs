@@ -54,6 +54,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, PoisonError, RwLock};
+use std::time::Duration;
 
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{
@@ -198,6 +199,11 @@ pub(crate) struct Settings {
     ///
     /// Not a DuckDB setting, for the reason the seams are not.
     commit_sync: RwLock<CommitSync>,
+    /// The longest a write waits for a row another transaction holds, as `SET lock_timeout` has
+    /// left it. Zero never waits, which is what the pin does. See `08-concurrency.md` section 8.4.
+    ///
+    /// Not a DuckDB setting either.
+    lock_timeout: RwLock<Duration>,
     /// When a commit's rows are seen by other connections, as `SET visibility` has left it.
     visibility: RwLock<Visibility>,
     /// What `SET VARIABLE` has left, in the order the names were first set.
@@ -256,6 +262,7 @@ impl Settings {
             morsel: RwLock::new(0),
             ablate: RwLock::new(rudb_qc::Ablate::NONE),
             commit_sync: RwLock::new(CommitSync::Full),
+            lock_timeout: RwLock::new(LOCK_TIMEOUT),
             visibility: RwLock::new(Visibility::Durable),
             variables: RwLock::new(Vec::new()),
             changes: AtomicU64::new(0),
@@ -324,6 +331,11 @@ impl Settings {
     /// What `SET commit_sync` left a commit waiting for.
     pub(crate) fn commit_sync(&self) -> CommitSync {
         *self.commit_sync.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// What `SET lock_timeout` left a write waiting for a held row.
+    pub(crate) fn lock_timeout(&self) -> Duration {
+        *self.lock_timeout.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The log size after which a commit checkpoints, `SET checkpoint_threshold`.
@@ -485,6 +497,21 @@ impl Settings {
                 Error::invalid_input(format!("commit_sync is full, os or none, not {written}"))
             })?;
             *self.commit_sync.write().unwrap_or_else(|held| held.into_inner()) = sync;
+            return Ok(());
+        }
+        if is_lock_timeout(name) {
+            let timeout = match value {
+                None => LOCK_TIMEOUT,
+                Some(value) => {
+                    let written = text_of(value);
+                    duration_named(&written).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "lock_timeout is a length of time like 0, 500ms or 1s, not {written}"
+                        ))
+                    })?
+                }
+            };
+            *self.lock_timeout.write().unwrap_or_else(|held| held.into_inner()) = timeout;
             return Ok(());
         }
         if is_visibility(name) {
@@ -898,6 +925,9 @@ impl Settings {
         if is_commit_sync(name) {
             return Ok(sync_name(self.commit_sync()).to_string());
         }
+        if is_lock_timeout(name) {
+            return Ok(duration_name(self.lock_timeout()));
+        }
         if is_visibility(name) {
             let word = match self.visibility() {
                 Visibility::Durable => "durable",
@@ -1235,6 +1265,45 @@ fn is_morsel(name: &str) -> bool {
 /// Whether this name is the log's commit setting, the same shape as [`is_engine`].
 fn is_commit_sync(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("commit_sync")
+}
+
+/// Whether this name is the row lock wait setting, the same shape as [`is_engine`].
+fn is_lock_timeout(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("lock_timeout")
+}
+
+/// How long a write waits for a held row until a statement says otherwise, the second section
+/// 8.4 of the concurrency spec gives it.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The length of time a `lock_timeout` value names. A bare number is milliseconds, the unit
+/// Postgres reads one in, and `us`, `ms`, `s` and `min` say otherwise.
+fn duration_named(word: &str) -> Option<Duration> {
+    let word = word.trim().to_ascii_lowercase();
+    let at = word.find(|c: char| !c.is_ascii_digit()).unwrap_or(word.len());
+    let (number, unit) = word.split_at(at);
+    let number = number.parse::<u64>().ok()?;
+    match unit.trim() {
+        "" | "ms" => Some(Duration::from_millis(number)),
+        "us" => Some(Duration::from_micros(number)),
+        "s" => Some(Duration::from_secs(number)),
+        "min" => number.checked_mul(60).map(Duration::from_secs),
+        _ => None,
+    }
+}
+
+/// How `current_setting` writes a `lock_timeout`, in the largest unit that keeps it whole.
+fn duration_name(timeout: Duration) -> String {
+    let micros = timeout.as_micros();
+    if micros == 0 {
+        "0".to_string()
+    } else if micros.is_multiple_of(1_000_000) {
+        format!("{}s", micros / 1_000_000)
+    } else if micros.is_multiple_of(1_000) {
+        format!("{}ms", micros / 1_000)
+    } else {
+        format!("{micros}us")
+    }
 }
 
 /// Whether this name is the commit visibility setting, the same shape as [`is_engine`].
