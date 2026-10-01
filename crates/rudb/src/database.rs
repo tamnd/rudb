@@ -2888,8 +2888,9 @@ fn joined(held: &[Chunk], fields: &[Field], rows: usize) -> Result<Chunk> {
 /// flagged either way. The flag column is taken off both.
 ///
 /// Last come the row numbers of the flagged rows among all the rows, and how many rows there were,
-/// which is what a log record names them by.
-fn split(chunks: Vec<Chunk>, delete: bool, wanted: bool) -> Result<Split> {
+/// which is what a log record names them by. Without `keeping` the first half is left empty, for a
+/// delete that only needs those numbers.
+fn split(chunks: Vec<Chunk>, delete: bool, wanted: bool, keeping: bool) -> Result<Split> {
     let mut kept = Vec::with_capacity(chunks.len());
     let mut changed = Vec::new();
     let mut count = 0;
@@ -2907,6 +2908,9 @@ fn split(chunks: Vec<Chunk>, delete: bool, wanted: bool) -> Result<Split> {
         let chunk = chunk.project(&columns)?;
         if wanted && !hit.is_empty() {
             changed.push(chunk.clone().select(&hit)?);
+        }
+        if !keeping {
+            continue;
         }
         if delete {
             let rest = hit.complement(chunk.len());
@@ -4358,7 +4362,9 @@ impl Shared {
                 // the loop below leaves every one of its columns out and this is never read. It is
                 // the sketch rather than the dictionary because the rows nobody has counted are the
                 // ones in memory.
-                rudb_catalog::table::Rows::Grown(_, _) => Provenance::Sketch,
+                rudb_catalog::table::Rows::Grown(_, _) | rudb_catalog::table::Rows::Masked(..) => {
+                    Provenance::Sketch
+                }
             };
             for (at, column) in table.columns().iter().enumerate() {
                 // A table that cannot answer leaves the column out, which is a column of a native
@@ -5077,8 +5083,23 @@ impl Shared {
                         let watched = self.transacting() || self.registry().watched();
                         let needed =
                             wanted || checks.is_some() || !plain || (logs && !delete) || watched;
+                        // A delete from a file nothing points into marks its rows gone beside the
+                        // file, which needs their numbers and not the rows that stay, as long as
+                        // the scan read every row in order.
+                        let width = catalog.table(&insert.name)?.columns().len();
+                        let rows = catalog.table(&insert.name)?.rows().len();
+                        let taken = delete
+                            && catalog.takes_rows(&insert.name)
+                            && chunks.iter().map(Chunk::len).sum::<usize>() == rows;
+                        // The binder reads only the condition when it expects the rows taken, and
+                        // a source without the table's columns has no rows to keep.
+                        if !taken && chunks.first().is_some_and(|chunk| chunk.width() <= width) {
+                            return Err(Error::internal(
+                                "a delete read only its condition and cannot keep the other rows",
+                            ));
+                        }
                         let (kept, changed, count, flagged, scanned) =
-                            split(chunks, delete, needed)?;
+                            split(chunks, delete, needed, !taken)?;
                         if let Some(checks) = checks.as_mut() {
                             self.check(sql, &mut catalog, place, &insert.name, checks, &changed)?;
                         }
@@ -5119,7 +5140,9 @@ impl Shared {
                         // An update keeps every row where it was, which is what lets another
                         // transaction's claim on a row still name it afterwards.
                         let table = catalog.table_mut(name)?;
-                        if delete {
+                        if taken {
+                            table.take_rows(&flagged)?;
+                        } else if delete {
                             table.replace_all(kept, workers)?;
                         } else {
                             table.update_all(kept, workers)?;
