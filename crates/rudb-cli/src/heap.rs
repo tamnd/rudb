@@ -120,24 +120,30 @@ const fn given(size: usize, align: usize) -> bool {
     align <= GIVEN && align <= size
 }
 
-/// The smallest block mimalloc 2 serves from a medium page, one past `MI_SMALL_OBJ_SIZE_MAX`.
-const MEDIUM_FROM: usize = 16 * 1024 + 1;
+/// The smallest block that is rounded, one past a kilobyte.
+///
+/// A bound of 512 bytes, tried with the upper bound at 2 MiB, held no less on ClickBench.
+const ROUNDED_FROM: usize = 1024 + 1;
 
-/// The largest block mimalloc 2 serves from a medium page, `MI_MEDIUM_OBJ_SIZE_MAX`.
-const MEDIUM_UPTO: usize = 128 * 1024;
+/// The largest block mimalloc 2 serves from a medium page, `MI_MEDIUM_OBJ_SIZE_MAX`, and the
+/// largest that is rounded. A larger block has a span of its own rather than a slot in a page.
+const ROUNDED_UPTO: usize = 128 * 1024;
 
 /// The size to ask mimalloc for when the caller wants `size`, which is `size` rounded up to a power
-/// of two when it is a medium block and `size` otherwise.
+/// of two from a kilobyte to 128 KiB and `size` otherwise.
 ///
-/// mimalloc keeps a page per size class per thread, and a medium page is 512 KiB. There are four
-/// classes to every doubling, so the twelve from 16 KiB to 128 KiB can hold six megabytes a thread
-/// that is committed and mostly empty. A vector is 8192 values, which puts most of what a scan
-/// takes and frees in exactly that range, at widths of one, two, four, eight and sixteen bytes and
-/// at every string length in between. On ClickBench q10 at eight threads the live heap peaked at 39
-/// MB and the process at 71. Rounding leaves three classes in the range, so a thread holds at most
-/// three medium pages, and a block that grows into the slack is grown where it is.
+/// mimalloc keeps a page per size class per thread, and there are four classes to every doubling.
+/// A medium page, for blocks from 16 KiB to 128 KiB, is 512 KiB, so the twelve classes there can
+/// hold six megabytes a thread that is committed and mostly empty. A vector is 8192 values, which
+/// puts most of what a scan takes and frees in exactly that range, at widths of one, two, four,
+/// eight and sixteen bytes and at every string length in between. On ClickBench q10 at eight
+/// threads the live heap peaked at 39 MB and the process at 71. A small page is 64 KiB and the
+/// sixteen classes from a kilobyte to 16 KiB cost less each, but q10 takes and frees nearly
+/// thirty thousand blocks there, and rounding them as well took another 33 MB off the 43 ClickBench
+/// queries over the native file and 55 MB over Parquet. Rounding leaves seven classes in the whole
+/// range, and a block that grows into the slack is grown where it is.
 const fn binned(size: usize) -> usize {
-    if size >= MEDIUM_FROM && size <= MEDIUM_UPTO { size.next_power_of_two() } else { size }
+    if size >= ROUNDED_FROM && size <= ROUNDED_UPTO { size.next_power_of_two() } else { size }
 }
 
 /// mimalloc, with the alignment decided at the call rather than inside the library.
@@ -198,8 +204,8 @@ unsafe impl GlobalAlloc for MiMalloc {
 #[cfg(test)]
 mod tests {
     use super::{
-        GIVEN, MEDIUM_FROM, MEDIUM_UPTO, binned, given, keep_everything_at_exit, keep_freed_memory,
-        purge_delay,
+        GIVEN, ROUNDED_FROM, ROUNDED_UPTO, binned, given, keep_everything_at_exit,
+        keep_freed_memory, purge_delay,
     };
 
     /// The option set is the purge delay, which mimalloc 2 starts at ten milliseconds, and not some
@@ -233,15 +239,21 @@ mod tests {
         assert!(!given(0, 1), "and a block of nothing is nobody's fast path");
     }
 
-    /// A medium block is rounded up to a power of two and nothing else is touched.
+    /// A block from a kilobyte to 128 KiB is rounded up to a power of two and nothing else is
+    /// touched.
     #[test]
-    fn only_a_medium_block_is_rounded() {
-        assert_eq!(binned(MEDIUM_FROM - 1), MEDIUM_FROM - 1, "the largest small block");
-        assert_eq!(binned(MEDIUM_FROM), 32 * 1024);
+    fn only_a_block_from_a_kilobyte_to_a_medium_one_is_rounded() {
+        assert_eq!(binned(ROUNDED_FROM - 1), ROUNDED_FROM - 1, "a kilobyte is already a class");
+        assert_eq!(binned(ROUNDED_FROM), 2 * 1024);
+        assert_eq!(binned(5 * 1024), 8 * 1024, "a selection of 1280 rows");
         assert_eq!(binned(40 * 1024), 64 * 1024, "a column of five thousand i64");
         assert_eq!(binned(64 * 1024), 64 * 1024, "a column of 8192 i64 is already a class");
-        assert_eq!(binned(MEDIUM_UPTO), MEDIUM_UPTO);
-        assert_eq!(binned(MEDIUM_UPTO + 1), MEDIUM_UPTO + 1, "a large block has a page of its own");
+        assert_eq!(binned(ROUNDED_UPTO), ROUNDED_UPTO);
+        assert_eq!(
+            binned(ROUNDED_UPTO + 1),
+            ROUNDED_UPTO + 1,
+            "a large block has a span of its own"
+        );
         assert_eq!(binned(0), 0);
     }
 }
