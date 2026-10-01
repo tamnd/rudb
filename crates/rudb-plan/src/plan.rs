@@ -326,6 +326,30 @@ impl Plan {
         self.frequencies.get(&index)
     }
 
+    /// Gives the table bound at `fresh` everything the stores said about the one bound at `was`.
+    ///
+    /// For a pass that reads a table again under an index of its own. Every answer here is kept by
+    /// table index, so a copy that is not given them reads back as a table nobody measured, and an
+    /// equality on it falls back from the synopsis to the distinct count. In JOB 33a that turned
+    /// the 84,843 companies with `country_code = '[us]'` into 1,093 and put them first in the order.
+    pub fn follow(&mut self, was: u32, fresh: u32) {
+        if let Some(&rows) = self.measured.get(&was) {
+            self.measured.insert(fresh, rows);
+        }
+        if let Some(distincts) = self.distincts.get(&was).cloned() {
+            self.distincts.insert(fresh, distincts);
+        }
+        if let Some(facts) = self.facts.get(&was).cloned() {
+            self.facts.insert(fresh, facts);
+        }
+        if let Some(zones) = self.zones.get(&was).cloned() {
+            self.zones.insert(fresh, zones);
+        }
+        if let Some(frequencies) = self.frequencies.get(&was).cloned() {
+            self.frequencies.insert(fresh, frequencies);
+        }
+    }
+
     /// How many tables carry a frequency synopsis, which is what a test about this asks.
     #[must_use]
     pub fn frequencies_count(&self) -> usize {
