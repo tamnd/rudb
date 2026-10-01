@@ -902,7 +902,8 @@ fn the_grouping_rule_applies_inside_the_over_as_well_as_to_the_arguments() {
         assert_eq!(
             failure(query),
             "column \"counter\" must appear in the GROUP BY clause or must be part of an \
-             aggregate function",
+             aggregate function.\nEither add it to the GROUP BY list, or use ANY_VALUE(\"counter\") \
+             if the exact value of \"counter\" is not important.",
             "{query}"
         );
     }

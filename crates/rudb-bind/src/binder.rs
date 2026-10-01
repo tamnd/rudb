@@ -4131,8 +4131,14 @@ impl<'a> Binder<'a> {
             Expr::Column(binding) => {
                 let read = self.ungrouped_correlation(binding).unwrap_or(binding);
                 let name = self.name_of(read, scope);
+                // The pin words it differently in a `HAVING`, where it gives no hint.
+                if self.clause == "HAVING clause" {
+                    return Err(Error::binder(format!(
+                        "column {name} must appear in the GROUP BY clause or be used in an aggregate function"
+                    )));
+                }
                 Err(Error::binder(format!(
-                    "column {name} must appear in the GROUP BY clause or must be part of an aggregate function"
+                    "column {name} must appear in the GROUP BY clause or must be part of an aggregate function.\nEither add it to the GROUP BY list, or use ANY_VALUE({name}) if the exact value of {name} is not important."
                 )))
             }
             Expr::Constant(_)
