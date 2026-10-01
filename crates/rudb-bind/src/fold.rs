@@ -109,7 +109,11 @@ fn evaluate(plan: &Plan, expr: ExprRef, lambdas: &mut Lambdas) -> Result<Option<
                 return Ok(None);
             }
             let Some(inner) = evaluate(plan, input, lambdas)? else { return Ok(None) };
-            cast_value(&inner, plan.expr_type(expr), try_cast)?
+            let (from, target) = (plan.expr_type(input), plan.expr_type(expr));
+            match rudb_kernels::json::cast_typed(&inner, from, target, try_cast, None) {
+                Some(cast) => cast?,
+                None => cast_value(&inner, target, try_cast)?,
+            }
         }
         Expr::Compare { op, left, right } => {
             let (Some(left), Some(right)) =

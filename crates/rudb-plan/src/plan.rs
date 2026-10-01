@@ -1172,11 +1172,12 @@ impl Plan {
                     return fail("names a constant that is not in the value table");
                 }
                 // A null literal takes its type from context, so it is the one case where the
-                // stored type is allowed to disagree with the value. A `TYPE` is held as its text,
-                // which is a string.
+                // stored type is allowed to disagree with the value. A `TYPE` and a `JSON` are held
+                // as their text, which is a string.
                 let held = self.value(value);
                 let ty = self.expr_type(reference);
-                let text = *ty == LogicalType::Type && matches!(held, Value::Varchar(_));
+                let text = matches!(ty, LogicalType::Type | LogicalType::Json)
+                    && matches!(held, Value::Varchar(_));
                 if !held.is_null() && !text && held.logical_type() != *ty {
                     return fail("is a constant whose type disagrees with the value it holds");
                 }

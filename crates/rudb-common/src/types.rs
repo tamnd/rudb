@@ -149,6 +149,13 @@ pub enum LogicalType {
     /// one: `to_aggregate_state` reads a list of them as the types it names, and a cast to `VARCHAR`
     /// prints them. A table cannot have a column of it, as the pin's cannot.
     Type,
+    /// `JSON`, a string that holds a JSON document.
+    ///
+    /// Held as the text of the document, byte for byte as it was written when it came from a
+    /// string and minified when it was made from a value, which is the pin's: a cast from `VARCHAR`
+    /// checks the text parses and keeps it, so `'{"a" : 1}'::JSON` prints with its spaces. It sorts
+    /// and compares as that text, and every string function takes it as the string it is.
+    Json,
 }
 
 /// The call an [`LogicalType::AggregateState`] came from and the shape its state is written in.
@@ -374,7 +381,9 @@ impl LogicalType {
                 10..=18 => PhysicalType::Int64,
                 _ => PhysicalType::Int128,
             },
-            Self::Varchar | Self::Blob | Self::Bit | Self::Type => PhysicalType::Varlen,
+            Self::Varchar | Self::Blob | Self::Bit | Self::Type | Self::Json => {
+                PhysicalType::Varlen
+            }
             Self::Interval => PhysicalType::Interval,
             // A map is a list of two-field structs, which is how Arrow does it and how every
             // engine that has to interoperate with Arrow ends up doing it.
@@ -630,6 +639,9 @@ impl LogicalType {
             (Self::Enum(_), Self::Enum(_) | Self::Varchar) | (Self::Varchar, Self::Enum(_)) => {
                 Some(Self::Varchar)
             }
+            // A document meets a string as a document, so the string has to parse, which is how
+            // the pin's `coalesce`, list and `UNION` take the two.
+            (Self::Json, Self::Varchar) | (Self::Varchar, Self::Json) => Some(Self::Json),
             _ => None,
         }
     }
@@ -756,6 +768,7 @@ impl fmt::Display for LogicalType {
             Self::Union(fields) => write_fields(f, "UNION", fields),
             Self::AggregateState(_) => f.write_str("AGGREGATE_STATE"),
             Self::Type => f.write_str("TYPE"),
+            Self::Json => f.write_str("JSON"),
             Self::Enum(labels) => {
                 f.write_str("ENUM(")?;
                 for (index, label) in labels.iter().enumerate() {
@@ -1406,6 +1419,7 @@ fn alias(upper: &str) -> Option<LogicalType> {
         "BIT" | "BITSTRING" => LogicalType::Bit,
         "UUID" | "GUID" => LogicalType::Uuid,
         "TYPE" => LogicalType::Type,
+        "JSON" => LogicalType::Json,
         "DATE" => LogicalType::Date,
         "TIMETZ" => LogicalType::TimeTz,
         "DATETIME" | "TIMESTAMP_US" => LogicalType::Timestamp,
@@ -1599,6 +1613,7 @@ mod tests {
             LogicalType::Bit,
             LogicalType::Uuid,
             LogicalType::Type,
+            LogicalType::Json,
             LogicalType::Date,
             LogicalType::Time,
             LogicalType::TimeTz,

@@ -353,6 +353,8 @@ const PARAMETER_NAMES: &[(&str, &[&str])] = &[
     ("error", &["message"]),
     ("getvariable", &["variable_name"]),
     ("in_search_path", &["database_name", "schema_name"]),
+    ("json_array_length", &["json", "path"]),
+    ("json_keys", &["json", "path"]),
     ("make_timestamp_ms", &["nanos"]),
     ("normalized_interval", &["interval"]),
     ("regexp_split_to_array", &["string", "regex"]),

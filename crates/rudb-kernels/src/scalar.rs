@@ -3936,6 +3936,9 @@ pub fn call_values(
     if let Some(value) = crate::aggregate::state_call(name, args, returns)? {
         return Ok(value);
     }
+    if let Some(value) = crate::json::call(name, args, returns)? {
+        return Ok(value);
+    }
     if let ("__rudb_zero_to_null", [value]) = (name, args) {
         return Ok(if approximate(value) == Some(0.0) { Value::Null } else { value.clone() });
     }

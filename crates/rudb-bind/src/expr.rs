@@ -726,6 +726,17 @@ impl Binder<'_> {
             let right = self.as_boolean(right, word)?;
             return Ok(self.conjunction(connective, vec![left, right]));
         }
+        // The grammar reads `a -> b ->> c` as `a -> (b ->> c)`, since what follows an arrow is a
+        // whole expression for the old lambdas. The pin puts it back as `(a -> b) ->> c` when the
+        // arrow is not a lambda, which is how `doc -> 'a' ->> 0` reads the first element of `a`.
+        if op == BinaryOp::Arrow
+            && let ast::Expr::Binary { op: BinaryOp::LongArrow, left: inner, right: last } =
+                ast.expr(right)
+        {
+            let picked = self.bind_binary(ast, BinaryOp::Arrow, left, inner, scope)?;
+            let last = self.bind_expr(ast, last, scope)?;
+            return self.call("->>", vec![picked, last]);
+        }
         let written = [left, right];
         let left = self.bind_expr(ast, left, scope)?;
         let mut right = self.bind_expr(ast, right, scope)?;
@@ -753,6 +764,15 @@ impl Binder<'_> {
                 let types = [left, right].map(|arg| self.plan().expr_type(arg).clone());
                 return self
                     .call("^@", vec![left, right])
+                    .map_err(|error| literals_spelled(ast, error, &written, &types));
+            }
+            // `doc -> path` is `json_extract` and `doc ->> path` is a function of its own name
+            // that answers as `json_extract_string` does, which is how the pin's refusals name them.
+            BinaryOp::Arrow | BinaryOp::LongArrow => {
+                let name = if op == BinaryOp::Arrow { "json_extract" } else { "->>" };
+                let types = [left, right].map(|arg| self.plan().expr_type(arg).clone());
+                return self
+                    .call(name, vec![left, right])
                     .map_err(|error| literals_spelled(ast, error, &written, &types));
             }
             _ => {}
@@ -1439,6 +1459,12 @@ impl Binder<'_> {
             }
             returns => self.narrowed_part(resolved.name, &cast, returns),
         };
+        let returns = match cast.as_slice() {
+            [_, path] if rudb_kernels::json::NAMES.contains(&resolved.name) => {
+                self.json_path(resolved.name, *path, returns)?
+            }
+            _ => returns,
+        };
         let args = self.plan_mut().add_expr_list(&cast);
         // With `ieee_floating_point_ops` off, the math functions raise on a value outside their
         // domain instead of answering a NaN or an infinity, and the kernel is told which reading it
@@ -1450,6 +1476,42 @@ impl Binder<'_> {
         let name =
             self.plan_mut().intern(strict.as_deref().or(stored_name).unwrap_or(resolved.name));
         Ok(self.add_expr(Expr::Function { name, args }, returns))
+    }
+
+    /// The type a `JSON` function answers once its path is known, refusing a path the pin refuses
+    /// before it reads a row.
+    ///
+    /// A constant path is read here, so a malformed one is a binder error, and one with a wildcard
+    /// answers a list of every value it picks. A list of paths has to be a constant, has no null in
+    /// it and no wildcard, since its answer is one value for each path.
+    fn json_path(&self, name: &str, path: ExprRef, returns: LogicalType) -> Result<LogicalType> {
+        let constant = fold::value_of(self.plan(), path).ok().flatten();
+        let listed = matches!(self.plan().expr_type(path), LogicalType::List(_));
+        match constant {
+            Some(Value::List { values, .. }) if listed => {
+                for path in &values {
+                    if path.is_null() {
+                        return Err(Error::binder("JSON path cannot be NULL"));
+                    }
+                    if rudb_kernels::json::wild_path(path)? {
+                        return Err(Error::binder(
+                            "Cannot have wildcards in JSON path when supplying multiple paths",
+                        ));
+                    }
+                }
+                Ok(returns)
+            }
+            Some(_) if listed => Ok(returns),
+            None if listed => {
+                let parameter =
+                    if matches!(name, "json_keys" | "json_array_length") { "path" } else { "col1" };
+                Err(Error::binder(format!(
+                    "The \"{parameter}\" argument in function \"{name}\" must be a constant expression"
+                )))
+            }
+            Some(path) if rudb_kernels::json::wild_path(&path)? => Ok(LogicalType::list(returns)),
+            _ => Ok(returns),
+        }
     }
 
     /// `enum_code`, `enum_first`, `enum_last`, `enum_range` and `enum_range_boundary`.

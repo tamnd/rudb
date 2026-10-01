@@ -334,6 +334,7 @@ fn type_name(ty: &LogicalType) -> String {
         LogicalType::Bit => "bit".to_string(),
         LogicalType::Uuid => "uuid".to_string(),
         LogicalType::Type => "type".to_string(),
+        LogicalType::Json => "json".to_string(),
         LogicalType::Date => "date".to_string(),
         LogicalType::Time => "time".to_string(),
         LogicalType::TimeTz => "time with time zone".to_string(),
