@@ -152,6 +152,24 @@ impl StringView {
         if self.is_inline() { Some(&self.payload[..self.len()]) } else { None }
     }
 
+    /// A key that orders strings held whole in their views the way their bytes order, or `None`
+    /// for one in the arena: the zero padded payload read big-endian, then the length, which
+    /// breaks the tie between a string and the same string with zero bytes on the end.
+    ///
+    /// Two of these compare as one integer comparison, where comparing the bytes is a call to
+    /// `memcmp` with a length to work out first. Finding the ends of a column whose strings share
+    /// their first four bytes, a name or a code with a fixed lead, took a `memcmp` a row.
+    #[must_use]
+    #[inline]
+    pub fn inline_key(&self) -> Option<u128> {
+        if !self.is_inline() {
+            return None;
+        }
+        let mut wide = [0u8; 16];
+        wide[..12].copy_from_slice(&self.payload);
+        Some(u128::from_be_bytes(wide) | u128::from(self.length))
+    }
+
     /// The string, when it is short enough to be in the view.
     #[must_use]
     pub fn as_inline_str(&self) -> Option<&str> {
@@ -847,6 +865,33 @@ mod tests {
 
     use super::{Arenas, INLINE_LIMIT, StringColumn, StringView};
     use crate::buffer::Buffer;
+
+    #[test]
+    fn inline_keys_order_strings_the_way_their_bytes_do() {
+        let texts = [
+            "",
+            "\0",
+            "a",
+            "a\0",
+            "a\0\0",
+            "ab",
+            "abc",
+            "name 1",
+            "name 10",
+            "name 9",
+            "zzzzzzzzzzzz",
+        ];
+        for left in texts {
+            for right in texts {
+                let key = |text: &str| StringView::inline(text).inline_key().expect("inline");
+                assert_eq!(key(left).cmp(&key(right)), left.as_bytes().cmp(right.as_bytes()));
+            }
+        }
+        let long = "a string too long for the view";
+        let mut column = StringColumn::new();
+        column.push(long);
+        assert_eq!(column.views()[0].inline_key(), None);
+    }
 
     #[test]
     fn an_order_the_views_decide_is_the_byte_order_and_only_a_shared_prefix_is_left_open() {

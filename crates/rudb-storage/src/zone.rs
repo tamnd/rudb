@@ -974,25 +974,53 @@ fn viewed(vector: &Vector, views: &[StringView], arena: &[u8]) -> (Option<Bound>
     let validity = vector.validity();
     let bytes =
         |index: usize| views.get(index).and_then(|view| view.bytes_in(arena)).unwrap_or_default();
-    let mut ends: Option<(usize, u32, usize, u32)> = None;
+    // Each end keeps its row, its prefix and its key. Two strings that both sit whole in their
+    // views compare by key, one integer comparison, and that is every row of a column of short
+    // strings with a shared lead, a name or a code, which used to take two `memcmp` calls a row.
+    let order =
+        |row: usize, key: Option<u128>, end: usize, end_key: Option<u128>| match (key, end_key) {
+            (Some(key), Some(end_key)) => key.cmp(&end_key),
+            _ => bytes(row).cmp(bytes(end)),
+        };
+    let mut ends: Option<(End, End)> = None;
     for (index, view) in views.iter().enumerate() {
         if !validity.is_valid(index) {
             continue;
         }
         let prefix = u32::from_be_bytes(view.prefix());
-        let Some((low, low_prefix, high, high_prefix)) = ends.as_mut() else {
-            ends = Some((index, prefix, index, prefix));
+        let Some((low, high)) = ends.as_mut() else {
+            let end = End { row: index, prefix, key: view.inline_key() };
+            ends = Some((end, end));
             continue;
         };
-        if prefix < *low_prefix || (prefix == *low_prefix && bytes(index) < bytes(*low)) {
-            (*low, *low_prefix) = (index, prefix);
+        if prefix < low.prefix {
+            *low = End { row: index, prefix, key: view.inline_key() };
+        } else if prefix == low.prefix {
+            let key = view.inline_key();
+            if order(index, key, low.row, low.key).is_lt() {
+                *low = End { row: index, prefix, key };
+            }
         }
-        if prefix > *high_prefix || (prefix == *high_prefix && bytes(index) > bytes(*high)) {
-            (*high, *high_prefix) = (index, prefix);
+        if prefix > high.prefix {
+            *high = End { row: index, prefix, key: view.inline_key() };
+        } else if prefix == high.prefix {
+            let key = view.inline_key();
+            if order(index, key, high.row, high.key).is_gt() {
+                *high = End { row: index, prefix, key };
+            }
         }
     }
-    let Some((low, _, high, _)) = ends else { return (None, None) };
-    (Some(Bound::Bytes(bytes(low).to_vec())), Some(Bound::Bytes(bytes(high).to_vec())))
+    let Some((low, high)) = ends else { return (None, None) };
+    (Some(Bound::Bytes(bytes(low.row).to_vec())), Some(Bound::Bytes(bytes(high.row).to_vec())))
+}
+
+/// One end of a column of strings while [`viewed`] looks for it.
+#[derive(Clone, Copy)]
+struct End {
+    row: usize,
+    prefix: u32,
+    /// [`StringView::inline_key`], `None` for a string in the arena.
+    key: Option<u128>,
 }
 
 #[cfg(test)]
