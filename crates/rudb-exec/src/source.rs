@@ -21,7 +21,7 @@ use rudb_encoding::sequence::Sequence;
 use rudb_functions::{
     FILE_ROW_NUMBER, Given, TableFunction, csv_given, open_csv, open_parquet, series_length,
 };
-use rudb_graph::Rids;
+use rudb_graph::{NO_PARENT, Rid, Rids};
 use rudb_kernels::{Stepping, cast, moment_steps, zoned_steps};
 use rudb_metrics::Counters;
 use rudb_native::{Reader as NativeReader, RunProjectionPart, RunProjectionScan};
@@ -1626,13 +1626,23 @@ impl<'a> Scan<'a> {
             *out = Chunk::empty(&self.schema.types());
             return Ok(true);
         }
-        let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
-        let read = self.table.rows().read_rows(at, &projected, &positions)?;
+        let mut linked = self.keys_from_link(at, &positions)?;
+        let projected: Vec<usize> = (0..self.columns.len())
+            .filter(|&place| linked.as_ref().is_none_or(|(from, _)| *from != place))
+            .filter_map(|place| self.columns[place])
+            .collect();
+        let read = if projected.is_empty() {
+            Chunk::empty(&[])
+        } else {
+            self.table.rows().read_rows(at, &projected, &positions)?
+        };
         let kept = positions.len();
         let mut held = Vec::with_capacity(self.columns.len());
         let mut real = 0;
-        for column in &self.columns {
-            if column.is_some() {
+        for (place, column) in self.columns.iter().enumerate() {
+            if let Some((_, keys)) = linked.take_if(|(from, _)| *from == place) {
+                held.push(keys);
+            } else if column.is_some() {
                 held.push(read.column(real)?.clone());
                 real += 1;
             } else {
@@ -1649,6 +1659,58 @@ impl<'a> Scan<'a> {
         self.sift_exact_but(out, bitmap.map(|(sideways, ..)| sideways))?;
         self.sift_hashed(out)?;
         Ok(true)
+    }
+
+    /// A column of the scan that a join's link was built on, with its values at `positions` of part
+    /// `at` taken from the parent's key map rather than read, or `None` when no join can say them.
+    ///
+    /// A row a link points at a parent holds the key that parent holds, since that is how the link
+    /// was made, so the parent's key map answers the column at any row with a parent. Only a link
+    /// and a key map a reduction already read are used, and only an integer column. A row with no
+    /// parent leaves the column to be read. On TPC-H q03 the order key of `lineitem` is kept as runs
+    /// of deltas, and reading it at a few rows of a part decoded every run of the part, about one
+    /// tenth of the query. The orders key map gives it in a rank search a row.
+    fn keys_from_link(&self, at: usize, positions: &[u32]) -> Result<Option<(usize, Vector)>> {
+        let Some(first) = self.offsets.get(at).and_then(|&first| Rid::try_from(first).ok()) else {
+            return Ok(None);
+        };
+        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
+        for sideways in joins {
+            let Some((place, link, map)) = sideways.linked(self.index) else { continue };
+            let Some(ty) = self.columns.get(place).copied().flatten().and_then(|_| {
+                self.schema.types().into_iter().nth(place).filter(|ty| {
+                    matches!(
+                        ty,
+                        LogicalType::BigInt
+                            | LogicalType::Integer
+                            | LogicalType::SmallInt
+                            | LogicalType::TinyInt
+                    )
+                })
+            }) else {
+                continue;
+            };
+            let children: Vec<Rid> =
+                positions.iter().map(|&row| first + Rid::from(row)).collect();
+            let mut parents = Vec::with_capacity(children.len());
+            link.forward_each(&children, &mut parents);
+            if parents.contains(&NO_PARENT) {
+                continue;
+            }
+            let Some(keys) = map.keys_at(&parents) else { continue };
+            fn fitted<T: TryFrom<i128>>(keys: &[i128]) -> Option<Vec<T>> {
+                keys.iter().map(|&key| T::try_from(key).ok()).collect()
+            }
+            let data = match ty {
+                LogicalType::BigInt => fitted(&keys).map(|keys| Data::Int64(keys.into())),
+                LogicalType::Integer => fitted(&keys).map(|keys| Data::Int32(keys.into())),
+                LogicalType::SmallInt => fitted(&keys).map(|keys| Data::Int16(keys.into())),
+                _ => fitted(&keys).map(|keys| Data::Int8(keys.into())),
+            };
+            let Some(data) = data else { continue };
+            return Ok(Some((place, Vector::flat(ty, data)?)));
+        }
+        Ok(None)
     }
 
     /// Runs the pushed filter over the columns it reads at `positions` of part `at`, and narrows

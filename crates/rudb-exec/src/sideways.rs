@@ -666,6 +666,19 @@ impl Exact {
         Self { gathered: BARE, ..self }
     }
 
+    /// The link to the parent and the parent's key map, when a reduction has read both already.
+    /// Never reads either, since a scan asking this wants a key it would otherwise decode and is
+    /// not the place to pay for opening the link. `None` for a key map over the driving table's
+    /// own column, which has no link to follow.
+    fn loaded(&self) -> Option<(&Link, &KeyMap)> {
+        if self.own {
+            return None;
+        }
+        let link = self.link.get()?.as_deref()?;
+        let keys = self.keys.get()?.as_deref()?;
+        Some((link, keys))
+    }
+
     fn keys(&self) -> Option<&KeyMap> {
         self.keys
             .get_or_init(|| {
@@ -943,6 +956,19 @@ impl<'a> Sideways<'a> {
             return None;
         }
         Some((binding.column as usize, self.found.get()?.keys.as_ref()?))
+    }
+
+    /// The scan of `index`'s column this join's link was built on, with the link and the parent's
+    /// key map, when a reduction has read both. A row of the scan with a parent holds the key that
+    /// parent holds, so the scan can take the column from the key map at its rows instead of
+    /// decoding it. See `Scan::keys_from_link`.
+    pub(crate) fn linked(&self, index: u32) -> Option<(usize, &Link, &KeyMap)> {
+        let binding = self.binding.get()?;
+        if binding.table != index {
+            return None;
+        }
+        let (link, keys) = self.exact.get()?.loaded()?;
+        Some((binding.column as usize, link, keys))
     }
 
     /// The build side's keys as a bitmap the scan of `index` tests its rows against, and which of

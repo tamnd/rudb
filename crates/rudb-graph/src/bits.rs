@@ -130,6 +130,23 @@ impl Rank {
         u64::from(self.fine[word]) + u64::from((bits[word] & mask).count_ones())
     }
 
+    /// The word holding the one of rank `nth`, counting from zero, and how many ones of that word
+    /// come before it, searching from word `from` on. `None` when the bitmap has `nth` ones or
+    /// fewer, or when word `from` already starts past it.
+    pub(crate) fn word_holding(&self, nth: u64, from: usize) -> Option<(usize, u32)> {
+        let words = self.fine.len().checked_sub(1)?;
+        if from >= words || u64::from(self.fine[from]) > nth || u64::from(self.fine[words]) <= nth {
+            return None;
+        }
+        let word = from + self.fine[from..words].partition_point(|&ones| u64::from(ones) <= nth) - 1;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the rank is inside the word, which holds at most sixty four ones"
+        )]
+        let within = (nth - u64::from(self.fine[word])) as u32;
+        Some((word, within))
+    }
+
     /// Ones strictly before a word, for any word up to one past the last.
     fn ones_before_word(&self, word: usize) -> u64 {
         u64::from(self.fine[word])
