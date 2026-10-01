@@ -8,6 +8,16 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.19
+
+For W3, deletes on a table that lives in the file. #2309 checkpoints a table that took an update or a delete by writing that table again on its own, after the end of the file, instead of writing every table. #2310 marks the rows a delete takes as gone, one bit per row for each part that lost any, instead of reading the rest of the table into memory, and reads only the columns the condition needs. #2314 writes those marks into the file under a new catalog extension, `RUDBGR10`, so a checkpoint after a 1% delete on 20M rows takes 1.5 s instead of 17 to 20 s and grows the file by 2.5 MB. A file with no deletes does not carry the extension and still opens in older builds. #2316 keeps the sum of the deleted values beside the marks, so `sum` over a table with rows gone does not read it. #2308 adds `lock_timeout`: a write that meets a row another transaction holds waits up to 1 s under wait-die. #2311 streams a load into a table with a primary key or a unique constraint and checks the keys once at the end, so loading a JOB table with 36 million rows no longer runs out of memory. #2306 maps the log's segments at replay and decodes while appending, and #2307 finds a string column's ends by integer keys.
+
+For TPC-H and JOB, #2304 holds a part after the first sparse integer read that touches it, #2312 walks a run length chunk's ends in one pass when it is read at a few rows, and #2315 keeps what the stores said about a scan when a pass reads it again under a fresh index.
+
+On compatibility, #2305 adds the PostgreSQL shim macros, `days_in_month` and the `md5_number` halves, and #2313 reads and writes `TIMESTAMPTZ` in the session time zone.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.18
 
 W3 gives each connection its own transaction in #2300. A transaction takes its snapshot when it first reads or writes, as the pin does, and works on its own copy of the catalog. Two updates or two deletes of one row fail at the second write with the pin's texts, and a duplicate key fails at the second commit. Commits from different connections to the same table are merged. #2302 runs a transaction's queries and row writes without the writer lock, so they no longer wait behind other connections.
