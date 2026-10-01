@@ -436,11 +436,13 @@ impl Domain {
         match keys.data()? {
             Data::Int8(values) => flat!(values),
             Data::Int16(values) => flat!(values),
-            // The common key, tested eight at a time. See [`Members`].
+            // The common key, tested eight at a time, and once a run where it comes in runs. See
+            // [`Members::word_after`].
             Data::Int32(values) => match Members::new(&self.words, base) {
                 Some(members) => {
                     let values = values.as_slice().get(..rows)?;
-                    Some(marked(rows, |from, to| members.word(&values[from..to])))
+                    let mut before = None;
+                    Some(marked(rows, |from, to| members.word_after(&values[from..to], &mut before)))
                 }
                 None => flat!(values),
             },
