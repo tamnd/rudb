@@ -211,7 +211,10 @@ pub(crate) fn stand_in(
 ///
 /// Both certificates and the shape that makes them apply, which is a parent that is a bare scan and
 /// a child key that came out of a base table without passing through anything that could null it.
-fn verified(
+/// The key may come up through an aggregate that groups on it, which is how TPC-H q10 and q18 read:
+/// the orders are summed per customer first and the customers joined to the sums, and a sum per
+/// `o_custkey` has exactly one customer for the same reason an order does.
+pub(crate) fn verified(
     plan: &Plan,
     child: NodeRef,
     parent: NodeRef,
@@ -229,7 +232,7 @@ fn verified(
             (true, false) => [keys[1], keys[0]],
             _ => return false,
         };
-    let Some(scan) = walk::scan_of(plan, child, child_key.table) else {
+    let Some((scan, child_key)) = walk::key_origin(plan, child, child_key) else {
         return false;
     };
     let Node::Get { table: child_name, columns: child_columns, .. } = *plan.node(scan) else {
@@ -361,7 +364,10 @@ fn mark(plan: &Plan, at: NodeRef, inside: &mut [bool]) {
 /// The same shape [`crate::link::LinkJoinRewrite`] asks for and for the same reason: one condition,
 /// because a second one is a restriction no certificate covers, and two plain columns, because a
 /// relationship is between columns.
-fn equated_pair(plan: &Plan, conditions: rudb_plan::Slice) -> Option<[ColumnBinding; 2]> {
+pub(crate) fn equated_pair(
+    plan: &Plan,
+    conditions: rudb_plan::Slice,
+) -> Option<[ColumnBinding; 2]> {
     let [condition] = plan.expr_list(conditions) else {
         return None;
     };

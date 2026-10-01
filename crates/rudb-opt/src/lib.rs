@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Thirty seven passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
+//! Thirty eight passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
 //! is the start of it. Column pruning came first, because it is the pass whose absence is measured
 //! in gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -48,6 +48,7 @@ pub mod shared;
 pub mod sides;
 pub mod span;
 pub mod tables;
+pub mod toplink;
 pub mod topn;
 pub mod total;
 mod transitive;
@@ -225,7 +226,7 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 37] = [
+pub static PASSES: [&(dyn Pass + Sync); 38] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -257,6 +258,7 @@ pub static PASSES: [&(dyn Pass + Sync); 37] = [
     &late::LateMaterialization,
     &eager::EagerAggregation,
     &unique::JoinedRowsAreGroups,
+    &toplink::TopNThroughLinks,
     &sides::BuildSideProbeSide,
     &presize::AggregatePresize,
     &dense::AggregateDense,
