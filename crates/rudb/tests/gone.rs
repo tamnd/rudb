@@ -38,6 +38,8 @@ const QUERIES: &[&str] = &[
     "SELECT count(v), sum(v), min(id), max(id) FROM t",
     "SELECT count(*) FROM t WHERE v IS NULL",
     "SELECT s, count(*), sum(id) FROM t GROUP BY s ORDER BY s",
+    "SELECT s, count(*) FROM t GROUP BY s ORDER BY s",
+    "SELECT count(DISTINCT s) FROM t",
     "SELECT k, count(DISTINCT s) FROM t GROUP BY k ORDER BY k",
     "SELECT count(DISTINCT k), count(DISTINCT id) FROM t",
     "SELECT * FROM t WHERE id BETWEEN 50000 AND 50020 ORDER BY id",
@@ -319,6 +321,17 @@ fn an_update_beside_a_file_is_replayed_and_rolled_back() {
     // The log has the update and the file does not, so this is replay putting it back.
     let file = open(&path);
     same(&file, &memory, "after the log was replayed");
+    drop(file);
+    remove(&path);
+}
+
+#[test]
+fn a_string_written_into_some_parts_groups_with_the_same_string_in_the_rest() {
+    let (path, file, memory) = loaded("update-some-parts");
+    // The first part only, so the parts after it still hold the file's codes for these strings.
+    both(&file, &memory, "UPDATE t SET s = 'late' WHERE id < 1000");
+    assert!(patched(&file), "the update read the table into memory");
+    same(&file, &memory, "after an update of one part");
     drop(file);
     remove(&path);
 }
