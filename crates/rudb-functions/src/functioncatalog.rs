@@ -348,6 +348,7 @@ fn named(name: &str, count: usize) -> Vec<String> {
 /// `col0` at an arity this list does not cover rather than being given the wrong names, and one
 /// with two named arities has a row for each.
 const PARAMETER_NAMES: &[(&str, &[&str])] = &[
+    ("can_cast_implicitly", &["source_type", "target_type"]),
     ("current_setting", &["setting_name"]),
     ("error", &["message"]),
     ("getvariable", &["variable_name"]),

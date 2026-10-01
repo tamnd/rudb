@@ -1377,6 +1377,15 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::UBigInt),
         numeric_only: false,
     },
+    // Whether a value of the first argument's type casts to the second's without being asked to.
+    // The binder folds it from the two types, as the pin does, so the executor never sees it.
+    Entry {
+        name: "can_cast_implicitly",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Boolean),
+        numeric_only: false,
+    },
     // Whether a value is the key `histogram(x, bins)` counts the values no bin took under.
     Entry {
         name: "is_histogram_other_bin",
@@ -4299,6 +4308,7 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("make_type", &["make_type(col0 VARCHAR, [ANY...]) -> TYPE"]),
     ("get_type", &["get_type(col0 ANY) -> TYPE"]),
     ("hash", &["hash(col0 ANY, [ANY...]) -> UBIGINT"]),
+    ("can_cast_implicitly", &["can_cast_implicitly(col0 ANY, col1 ANY) -> BOOLEAN"]),
     ("current_setting", &["current_setting(setting_name VARCHAR) -> ANY"]),
     ("getvariable", &["getvariable(variable_name VARCHAR) -> ANY"]),
     ("in_search_path", &["in_search_path(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),

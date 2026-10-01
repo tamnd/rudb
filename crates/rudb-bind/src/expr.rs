@@ -894,6 +894,17 @@ impl Binder<'_> {
             let named = self.plan().expr_type(bound[0]).to_string();
             return Ok(self.add_constant(Value::Varchar(named)));
         }
+        // `can_cast_implicitly` is answered from the two types the same way, which is what the pin
+        // does too. A null on either side is answered by the same rule, since a null becomes
+        // anything and nothing becomes a null.
+        if rudb_catalog::same_name(&written, "can_cast_implicitly") && bound.len() == 2 {
+            self.over_aggregate(bound[0], scope)?;
+            self.over_aggregate(bound[1], scope)?;
+            let (source, target) =
+                (self.plan().expr_type(bound[0]), self.plan().expr_type(bound[1]));
+            let casts = rudb_functions::implicit::cost(source, target).is_some();
+            return Ok(self.add_constant(Value::Boolean(casts)));
+        }
         // `current_setting` is the other one the binder answers, and it has to be answered here
         // rather than by a kernel for a reason `typeof` does not have: its declared return type is
         // ANY, so there is no type for a plan to carry until the name is read. Upstream folds it
