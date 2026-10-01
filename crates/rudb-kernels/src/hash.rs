@@ -175,6 +175,33 @@ fn normalized(months: i32, days: i32, micros: i64) -> (i64, i64, i64) {
     (months, days.rem_euclid(30), micros)
 }
 
+/// `normalized_interval`, which is [`normalized`] put back into the three fields. A count of months
+/// or days too big for its field keeps the most it can hold and hands the rest down to the next
+/// field, and that one saturates, which is the pin's `Borrow`.
+pub(crate) fn normalized_interval(months: i32, days: i32, micros: i64) -> Value {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    fn borrow(most: i64, least: &mut i64, scale: i64) -> i32 {
+        let Ok(kept) = i32::try_from(most) else {
+            let kept = if most > 0 { i32::MAX } else { i32::MIN };
+            let rest = most - i64::from(kept);
+            let room = i64::MAX / scale - 1;
+            *least = if rest > room {
+                i64::MAX
+            } else if rest < -room {
+                i64::MIN
+            } else {
+                least.saturating_add(rest * scale)
+            };
+            return kept;
+        };
+        kept
+    }
+    let (months, mut days, mut micros) = normalized(months, days, micros);
+    let months = borrow(months, &mut days, 30);
+    let days = borrow(days, &mut micros, MICROS_PER_DAY);
+    Value::Interval { months, days, micros }
+}
+
 /// The sketch `approx_count_distinct` keeps: the pin's HyperLogLog with 1024 registers, which
 /// estimates the same count from the same values in any order.
 #[derive(Debug, Clone)]

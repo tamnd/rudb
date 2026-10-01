@@ -1,4 +1,4 @@
-//! `make_time`, `make_timestamp` and `make_timestamp_ns`, which build a moment out of numbers.
+//! `make_time`, `make_timestamp` and the rest of the calls that build a moment out of numbers.
 //!
 //! These follow upstream's `make_date.cpp`. The seconds come in as a double and are split into whole
 //! seconds and rounded microseconds, and the whole seconds are truncated when they are between 0 and
@@ -72,7 +72,71 @@ fn counted(count: &Value) -> Result<i64> {
     Ok(count)
 }
 
-/// One of the three on one row.
+/// The seconds since 1970 in a double as microseconds, which `to_timestamp` rounds half to even
+/// the way the pin's checked cast to `BIGINT` does.
+fn epoch_seconds(seconds: f64) -> Result<i64> {
+    let micros = (seconds * 1_000_000.0).round_ties_even();
+    if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&micros) {
+        return Err(Error::conversion("Epoch seconds out of range for TIMESTAMP WITH TIME ZONE"));
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "the range is checked above")]
+    Ok(micros as i64)
+}
+
+/// The wall clock `make_timestamptz` names, in microseconds, which the pin works out with a lenient
+/// ICU calendar.
+///
+/// Every field is checked into an INT32 and then carried, so month 13 is January of the next year
+/// and day 0 is the last day of the month before. A year below zero counts from 1 BC rather than
+/// from year 0, so `-1` and `0` are both 1 BC. The seconds are rounded half to even into whole
+/// seconds and what is left is split into milliseconds and rounded microseconds, which is how
+/// `61.5` comes out a second and a half past the minute after next.
+///
+/// # Errors
+///
+/// A field that does not fit an INT32, and a wall clock past the end of the timestamps.
+pub(crate) fn wall_clock(fields: &[Value]) -> Result<i64> {
+    let [year, month, day, hour, minute, Value::Double(seconds)] = fields else {
+        return Err(Error::internal("make_timestamptz takes five whole numbers and a double"));
+    };
+    let whole = |field: &Value| {
+        field.as_i64().ok_or_else(|| Error::internal("make_timestamptz takes whole numbers"))
+    };
+    let year = whole(year)?;
+    let year = narrow(year + i64::from(year < 0))?;
+    let month = narrow(whole(month)?.checked_sub(1).ok_or_else(|| {
+        Error::out_of_range("Overflow in subtraction of INT64 (-9223372036854775808 - 1)!")
+    })?)?;
+    let (day, hour, minute) =
+        (narrow(whole(day)?)?, narrow(whole(hour)?)?, narrow(whole(minute)?)?);
+    let rounded = seconds.round_ties_even();
+    if !(-2_147_483_648.0..2_147_483_648.0).contains(&rounded) {
+        return Err(Error::invalid_input(format!(
+            "Type DOUBLE with value {} can't be cast because the value is out of range for the destination type INT32",
+            Value::Double(*seconds)
+        )));
+    }
+    let left = (seconds - rounded) * 1_000.0;
+    #[expect(clippy::cast_possible_truncation, reason = "the pin truncates the milliseconds")]
+    let millis = left as i64;
+    #[expect(clippy::cast_possible_truncation, reason = "a fraction of a millisecond")]
+    let micros = ((left - millis as f64) * 1_000.0).round() as i64;
+    // The year is taken a 400 year cycle at a time, since the carried one need not fit a date.
+    let months = i64::from(year) * 12 + i64::from(month);
+    let (cycles, year) = (months.div_euclid(12 * 400), months.rem_euclid(12 * 400));
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the year is within one cycle and the month is 1 to 12"
+    )]
+    let first = rudb_common::days_from_civil((year / 12) as i32, (year % 12 + 1) as u32, 1);
+    let days = i128::from(cycles) * 146_097 + i128::from(first) + i128::from(day) - 1;
+    let seconds = (i128::from(hour) * 60 + i128::from(minute)) * 60 + rounded as i128;
+    let total = (days * 86_400 + seconds) * 1_000_000 + i128::from(millis * 1_000 + micros);
+    i64::try_from(total).map_err(|_| Error::conversion("ICU date overflows timestamp range"))
+}
+
+/// One of them on one row.
 ///
 /// # Errors
 ///
@@ -86,6 +150,15 @@ pub(crate) fn value(name: &str, args: &[Value]) -> Result<Value> {
         ("make_time", [hour, minute, seconds]) => Ok(Value::Time(time_of(hour, minute, seconds)?)),
         ("make_timestamp", [count]) => Ok(Value::Timestamp(counted(count)?)),
         ("make_timestamp_ns", [count]) => Ok(Value::TimestampNs(counted(count)?)),
+        ("make_timestamptz", [count]) => Ok(Value::TimestampTz(counted(count)?)),
+        ("make_timestamp_ms", [count]) => count
+            .as_i64()
+            .and_then(|millis| millis.checked_mul(1_000))
+            .map(Value::Timestamp)
+            .ok_or_else(|| Error::conversion("Could not convert Timestamp(MS) to Timestamp(US)")),
+        ("to_timestamp", [Value::Double(seconds)]) => {
+            Ok(Value::TimestampTz(epoch_seconds(*seconds)?))
+        }
         ("make_timestamp", [year, month, day, hour, minute, seconds]) => {
             let fields = [year, month, day].map(|field| field.as_i64().map(narrow));
             let [Some(year), Some(month), Some(day)] = fields else {

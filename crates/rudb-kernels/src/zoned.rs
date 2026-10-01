@@ -36,6 +36,11 @@ pub fn call_in_time_zone<V: AsRef<Vector>>(
     if let ("timezone", [named, when]) = (name, args.as_slice()) {
         return Some(converted(named, when, returns));
     }
+    // The fields of a wall clock are read in the zone named last or else the session zone, though
+    // none of the arguments is an instant.
+    if name == "make_timestamptz" && args.len() > 1 {
+        return Some(rows(&args, returns, |row| made_instant(row, zone)));
+    }
     if !args.iter().any(|arg| zoned(arg)) {
         return None;
     }
@@ -366,6 +371,17 @@ fn moved_time(named: &Value, when: &Value) -> Result<Value> {
     };
     let moved = (time_tz::at_utc(*key) + shift).rem_euclid(MICROS_PER_DAY);
     Ok(Value::TimeTz(time_tz::pack(moved, offset)))
+}
+
+/// `make_timestamptz` of the fields of a wall clock and maybe a zone, as the instant it names.
+fn made_instant(row: &[Value], zone: SessionTimeZone) -> Result<Value> {
+    let (fields, named) = row.split_at(6);
+    let wall = crate::maketime::wall_clock(fields)?;
+    let zone = match named {
+        [Value::Varchar(name)] => zone_named(name)?,
+        _ => zone,
+    };
+    instant_of(wall, zone).map(Value::TimestampTz)
 }
 
 /// A zone named in a call, refused the way `SET TimeZone` refuses one it does not know.
