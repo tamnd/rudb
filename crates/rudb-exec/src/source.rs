@@ -1690,8 +1690,7 @@ impl<'a> Scan<'a> {
             }) else {
                 continue;
             };
-            let children: Vec<Rid> =
-                positions.iter().map(|&row| first + Rid::from(row)).collect();
+            let children: Vec<Rid> = positions.iter().map(|&row| first + Rid::from(row)).collect();
             let mut parents = Vec::with_capacity(children.len());
             link.forward_each(&children, &mut parents);
             if parents.contains(&NO_PARENT) {

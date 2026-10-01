@@ -1274,7 +1274,8 @@ mod tests {
             assert_eq!(map.form(), form);
             let rows = column.len() as u64;
             // Rising with gaps, then falling back, then the last row.
-            let mut rids: Vec<u64> = (0..rows).filter(|rid| rid % 7 == 2 || rid % 11 == 0).collect();
+            let mut rids: Vec<u64> =
+                (0..rows).filter(|rid| rid % 7 == 2 || rid % 11 == 0).collect();
             rids.extend([3, 0, rows - 1]);
             let wanted: Vec<i128> =
                 rids.iter().map(|&rid| column[rid as usize].expect("a key")).collect();
