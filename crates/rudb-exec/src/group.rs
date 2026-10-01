@@ -7489,60 +7489,113 @@ fn dense_partition(
     // there at the query's peak, which is the aggregate above this one.
     let runs = std::mem::take(&mut partition.runs);
     let rows: usize = runs.iter().map(Blocks::len).sum();
+    let mut out = DenseChunks::new(dictionary, constants, group_types);
     // The groups in code order either way, as a count per code of the partition's share of the
     // dictionary or, when far fewer rows arrived than there are codes, as the rows sorted and
     // counted in runs. ClickBench 38 groups by `Title`, whose dictionary is millions of codes, and a
     // filter leaves it a few thousand rows, so the array was megabytes of fresh pages to fault in
     // and zero and then read back to find those rows in.
-    let mut groups: Vec<(u32, i64)> = if rows.saturating_mul(SPARSE_DENSE) < width {
+    if rows.saturating_mul(SPARSE_DENSE) < width {
         let mut sorted: Vec<u32> =
             // flatten: the codes arrive as blocks of slices, and sorting them needs one buffer.
             runs.iter().flat_map(Blocks::slices).flatten().copied().collect();
+        drop(runs);
         sorted.sort_unstable();
-        sorted.chunk_by(|left, right| left == right).map(|run| (run[0], run.len() as i64)).collect()
-    } else if u32::try_from(rows).is_ok() {
-        dense_counts::<u32>(&runs, width, number, bound)
-    } else {
-        dense_counts::<i64>(&runs, width, number, bound)
-    };
-    drop(runs);
-    // Under a TopN on the count only the `bound` largest groups of the partition can reach it, and
-    // building the rest into chunks is most of the finish: ClickBench 34 groups ten million rows of
-    // `URL` into millions of groups for a `LIMIT 10`. They stay in code order, which is the order
-    // the TopN would have seen them in and settles its ties by.
-    if let Some(bound) = bound.filter(|&bound| bound < groups.len()) {
-        let mut best = largest(groups.len(), bound, |slot| groups[slot].1);
-        best.sort_unstable();
-        groups = best.into_iter().map(|slot| groups[slot]).collect();
-    }
-    let mut chunks = Vec::new();
-    let mut codes = Vec::with_capacity(VECTOR_SIZE);
-    let mut counts = Vec::with_capacity(VECTOR_SIZE);
-    let mut valid = Vec::with_capacity(VECTOR_SIZE);
-    for (code, count) in groups {
-        codes.push(code);
-        counts.push(count);
-        valid.push(true);
-        if codes.len() == VECTOR_SIZE {
-            chunks.push(dense_chunk(dictionary, &codes, &counts, &valid, constants, group_types)?);
-            codes.clear();
-            counts.clear();
-            valid.clear();
+        let mut groups: Vec<(u32, i64)> = sorted
+            .chunk_by(|left, right| left == right)
+            .map(|run| (run[0], run.len() as i64))
+            .collect();
+        // Under a TopN on the count only the `bound` largest groups of the partition can reach it,
+        // and building the rest into chunks is most of the finish: ClickBench 34 groups ten million
+        // rows of `URL` into millions of groups for a `LIMIT 10`. They stay in code order, which is
+        // the order the TopN would have seen them in and settles its ties by.
+        if let Some(bound) = bound.filter(|&bound| bound < groups.len()) {
+            let mut best = largest(groups.len(), bound, |slot| groups[slot].1);
+            best.sort_unstable();
+            groups = best.into_iter().map(|slot| groups[slot]).collect();
         }
+        for (code, count) in groups {
+            out.push(code, count, true)?;
+        }
+    } else if u32::try_from(rows).is_ok() {
+        dense_counts::<u32>(runs, width, number, bound, &mut out)?;
+    } else {
+        dense_counts::<i64>(runs, width, number, bound, &mut out)?;
     }
     if number == 0 && partition.nulls != 0 {
-        codes.push(0);
-        counts.push(partition.nulls);
-        valid.push(false);
+        out.push(0, partition.nulls, false)?;
     }
-    if !codes.is_empty() {
-        chunks.push(dense_chunk(dictionary, &codes, &counts, &valid, constants, group_types)?);
-    }
-    Ok(chunks)
+    out.finish()
 }
 
-/// How many rows of `runs` hold each code of partition `number`'s share of the dictionary, as the
-/// codes seen and their counts in code order.
+/// The chunks of a dense finish, filled a group at a time in the order the groups are found.
+///
+/// The groups used to be listed whole first, a sixteen byte pair each grown by doubling, and only
+/// then copied into chunks. On ClickBench q29 the inner count is 2.7 million `Referer` codes over
+/// four partitions finishing at once, so that list was 43 MB held beside the arrays and 127 MB of
+/// blocks taken and given back on the way to it.
+struct DenseChunks<'a> {
+    dictionary: &'a Arc<Vector>,
+    constants: &'a [Option<Value>],
+    group_types: &'a [LogicalType],
+    codes: Vec<u32>,
+    counts: Vec<i64>,
+    valid: Vec<bool>,
+    chunks: Vec<Chunk>,
+}
+
+impl<'a> DenseChunks<'a> {
+    fn new(
+        dictionary: &'a Arc<Vector>,
+        constants: &'a [Option<Value>],
+        group_types: &'a [LogicalType],
+    ) -> Self {
+        Self {
+            dictionary,
+            constants,
+            group_types,
+            codes: Vec::with_capacity(VECTOR_SIZE),
+            counts: Vec::with_capacity(VECTOR_SIZE),
+            valid: Vec::with_capacity(VECTOR_SIZE),
+            chunks: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, code: u32, count: i64, valid: bool) -> Result<()> {
+        self.codes.push(code);
+        self.counts.push(count);
+        self.valid.push(valid);
+        if self.codes.len() == VECTOR_SIZE {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if !self.codes.is_empty() {
+            self.chunks.push(dense_chunk(
+                self.dictionary,
+                &self.codes,
+                &self.counts,
+                &self.valid,
+                self.constants,
+                self.group_types,
+            )?);
+            self.codes.clear();
+            self.counts.clear();
+            self.valid.clear();
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<Chunk>> {
+        self.flush()?;
+        Ok(self.chunks)
+    }
+}
+
+/// How many rows of `runs` hold each code of partition `number`'s share of the dictionary, handed
+/// to `out` as the codes seen and their counts in code order.
 ///
 /// The counts are four bytes wide when the rows are few enough that no count can pass that, which
 /// is every partition of a file under four billion rows, and it halves the array: `URL` on
@@ -7553,22 +7606,24 @@ fn dense_partition(
 /// group was listed first and cut down after, and on ClickBench 34 that list was a million sixteen
 /// byte pairs a partition grown by doubling, a third of the page faults of the query for ten rows.
 fn dense_counts<C>(
-    runs: &[Blocks<u32>],
+    runs: Vec<Blocks<u32>>,
     width: usize,
     number: usize,
     bound: Option<usize>,
-) -> Vec<(u32, i64)>
+    out: &mut DenseChunks<'_>,
+) -> Result<()>
 where
     C: Copy + Default + PartialEq + std::ops::AddAssign + From<u8> + Into<i64>,
 {
     let mut dense = vec![C::default(); width];
-    for run in runs {
+    for run in &runs {
         for block in run.slices() {
             for &code in block {
                 dense[code as usize / DENSE_PARTITIONS] += C::from(1);
             }
         }
     }
+    drop(runs);
     let code = |slot: usize| (slot * DENSE_PARTITIONS + number) as u32;
     if let Some(bound) = bound {
         // Largest first and in slot order among equals, which is code order, and a zero only
@@ -7576,14 +7631,17 @@ where
         let mut best = largest(width, bound, |slot| dense[slot].into());
         best.retain(|&slot| dense[slot] != C::default());
         best.sort_unstable();
-        return best.into_iter().map(|slot| (code(slot), dense[slot].into())).collect();
+        for slot in best {
+            out.push(code(slot), dense[slot].into(), true)?;
+        }
+        return Ok(());
     }
-    dense
-        .iter()
-        .enumerate()
-        .filter(|(_, count)| **count != C::default())
-        .map(|(slot, &count)| (code(slot), count.into()))
-        .collect()
+    for (slot, &count) in dense.iter().enumerate() {
+        if count != C::default() {
+            out.push(code(slot), count.into(), true)?;
+        }
+    }
+    Ok(())
 }
 
 fn dense_chunk(
