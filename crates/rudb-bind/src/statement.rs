@@ -339,6 +339,10 @@ pub struct Insert {
     pub conflict: Option<Conflict>,
     /// The table's `CHECK` constraints, for the rows an append or an update writes.
     pub checks: Option<Checks>,
+    /// For an `UPDATE` that writes its rows beside the file rather than the whole table again,
+    /// the columns it sets, see [`rudb_catalog::Table::patch_rows`]. The source then reads the new
+    /// value of each of them, null where the row did not match, and the flag, and nothing else.
+    pub patched: Option<Vec<usize>>,
 }
 
 /// The `CHECK` constraints of a table, bound as one query over it.
@@ -2107,7 +2111,15 @@ fn insert(
         None => None,
     };
     let checks = bind_checks(catalog, parameters, session, &name)?;
-    Ok(Bound::Insert(Insert { name, source, write: Write::Append, returning, conflict, checks }))
+    Ok(Bound::Insert(Insert {
+        name,
+        source,
+        write: Write::Append,
+        returning,
+        conflict,
+        checks,
+        patched: None,
+    }))
 }
 
 /// Which key an `ON CONFLICT` is about and what it does, refused the way the pin refuses one that
@@ -2282,9 +2294,27 @@ fn change(
     let returning = returning(ast, catalog, parameters, session, written.returning)?;
     // A delete that marks its rows gone needs only which rows those are, so the source reads the
     // columns of the condition and not the rest. See [`Catalog::takes_rows`].
-    let narrow = delete && returning.is_none() && catalog.takes_rows(&name);
+    let narrow = returning.is_none() && catalog.takes_rows(&name);
+    // An update that writes its rows beside the file reads the new values and not the old ones,
+    // so a column it does not set is not read at all.
+    let patched = (narrow && !delete).then(|| targets.clone());
     let mut exprs = Vec::with_capacity(width);
     let mut names = Vec::with_capacity(width);
+    for (from, &at) in targets.iter().enumerate().filter(|_| patched.is_some()) {
+        let field = &fields[at];
+        let then = if defaulted[from] {
+            binder.bind_default(table.default(at), &field.ty)?
+        } else {
+            let new = column(&mut binder, width + 1 + from);
+            binder.checked_cast_to(new, &field.ty, false)?
+        };
+        let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then }]);
+        let null = binder.add_constant(Value::Null);
+        let otherwise = Some(binder.checked_cast_to(null, &field.ty, false)?);
+        exprs.push(binder.plan_mut().add_expr(Expr::Case { arms, otherwise }, field.ty.clone()));
+        let interned = binder.plan_mut().intern(&field.name);
+        names.push(interned);
+    }
     for (at, field) in fields.iter().enumerate().filter(|_| !narrow) {
         let old = column(&mut binder, at);
         let expr = match targets.iter().position(|&target| target == at) {
@@ -2321,5 +2351,5 @@ fn change(
     let source = finish(binder, root)?;
     let write = if delete { Write::Delete } else { Write::Update };
     let checks = if delete { None } else { bind_checks(catalog, parameters, session, &name)? };
-    Ok(Bound::Insert(Insert { name, source, write, returning, conflict: None, checks }))
+    Ok(Bound::Insert(Insert { name, source, write, returning, conflict: None, checks, patched }))
 }

@@ -5176,6 +5176,59 @@ impl Shared {
                         }
                         (added, written)
                     }
+                    // An update that writes the rows it changed beside the file, which reads those
+                    // rows and none of the others. See `Insert::patched`.
+                    Write::Update if insert.patched.is_some() => {
+                        let targets = insert.patched.clone().unwrap_or_default();
+                        let name = &insert.name;
+                        let logs = self.journal().as_ref().is_some_and(Journal::logs);
+                        let watched = self.transacting() || self.registry().watched();
+                        let (_, values, count, flagged, scanned) =
+                            split(chunks, false, true, false)?;
+                        let table = catalog.table(name)?;
+                        // The row numbers are the scan's, so they name the table's rows only when
+                        // the scan read every row in order, and the source read only the columns
+                        // the update sets, so there is nothing to write the table again from.
+                        if scanned != table.rows().len() || !catalog.takes_rows(name) {
+                            return Err(Error::internal(
+                                "an update read only the columns it sets and cannot write the \
+                                 table again",
+                            ));
+                        }
+                        let changed = table.patched_rows(&flagged, &targets, &values)?;
+                        if let Some(checks) = checks.as_mut() {
+                            self.check(sql, &mut catalog, place, name, checks, &changed)?;
+                        }
+                        foreign::missing(&catalog, name, &changed)?;
+                        let table = catalog.table(name)?;
+                        let claim = if watched {
+                            self.claim(table, false, &flagged, scanned)?
+                        } else {
+                            None
+                        };
+                        let oid = table.oid();
+                        let staged = logs.then(|| {
+                            let journal = self.journal();
+                            journal.as_ref()?.encode_update(
+                                &name.schema,
+                                &name.table,
+                                table.columns(),
+                                &flagged,
+                                &changed,
+                            )
+                        });
+                        catalog.table_mut(name)?.patch_rows(&flagged, &targets, &changed)?;
+                        if let Some(marks) = claim {
+                            self.claimed(oid, false, marks);
+                        }
+                        self.wrote(oid, |written, _| written.updated(&flagged, &changed));
+                        if let Some(record) = staged
+                            && let Some(journal) = self.journal().as_mut()
+                        {
+                            journal.stage(record);
+                        }
+                        (count, changed)
+                    }
                     Write::Update | Write::Delete => {
                         let delete = insert.write == Write::Delete;
                         let plain = catalog.table(&insert.name)?.foreign().is_empty();
