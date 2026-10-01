@@ -138,8 +138,8 @@ const ROUNDED_UPTO: usize = 128 * 1024;
 /// puts most of what a scan takes and frees in exactly that range, at widths of one, two, four,
 /// eight and sixteen bytes and at every string length in between. On ClickBench q10 at eight
 /// threads the live heap peaked at 39 MB and the process at 71. A small page is 64 KiB and the
-/// sixteen classes from a kilobyte to 16 KiB cost less each, but q10 takes and frees thirty
-/// thousand blocks there, and rounding them as well took another 33 MB off the 43 ClickBench
+/// sixteen classes from a kilobyte to 16 KiB cost less each, but q10 takes and frees nearly
+/// thirty thousand blocks there, and rounding them as well took another 33 MB off the 43 ClickBench
 /// queries over the native file and 55 MB over Parquet. Rounding leaves seven classes in the whole
 /// range, and a block that grows into the slack is grown where it is.
 const fn binned(size: usize) -> usize {
