@@ -256,6 +256,48 @@ fn an_update_of_a_file_writes_its_rows_beside_it_and_reads_as_if_they_were_there
 }
 
 #[test]
+fn a_checkpoint_after_an_update_writes_the_rows_it_changed_and_not_the_table() {
+    let (path, file, memory) = loaded("update-marks");
+    let before = std::fs::metadata(&path).expect("the file is there").len();
+    both(&file, &memory, "UPDATE t SET v = v + 1, s = 'moved' WHERE id % 100 = 7");
+    file.execute("CHECKPOINT").expect("checkpoints");
+    let grown = std::fs::metadata(&path).expect("the file is there").len() - before;
+    // A thousand rows of four columns and a catalog.
+    assert!(grown < before / 20, "the checkpoint wrote {grown} bytes over a file of {before}");
+    assert!(patched(&file), "the checkpoint read the table back into memory");
+    same(&file, &memory, "after the checkpoint");
+    drop(file);
+    let file = open(&path);
+    assert!(patched(&file), "the file did not say which rows an update wrote");
+    same(&file, &memory, "after the reopen");
+    // Over the rows the file holds, and a delete of some of them.
+    both(&file, &memory, "UPDATE t SET k = 8 WHERE id % 200 = 7 OR id % 1000 = 1");
+    both(&file, &memory, "DELETE FROM t WHERE id % 400 = 7");
+    same(&file, &memory, "after an update over the file's updated rows");
+    file.execute("CHECKPOINT").expect("checkpoints");
+    drop(file);
+    let file = open(&path);
+    assert!(patched(&file), "the second update was not written down beside the file");
+    same(&file, &memory, "after a second update and a reopen");
+    // A checkpoint with nothing new writes no rows again, at most a catalog that says how much of
+    // the log the file holds.
+    let before = std::fs::metadata(&path).expect("the file is there").len();
+    file.execute("CHECKPOINT").expect("checkpoints");
+    let grown = std::fs::metadata(&path).expect("the file is there").len() - before;
+    assert!(grown < 1024, "a checkpoint with nothing new wrote {grown} bytes");
+    // Past a quarter of the rows the table is written again instead.
+    both(&file, &memory, "UPDATE t SET v = 0 WHERE k < 3");
+    file.execute("CHECKPOINT").expect("checkpoints");
+    assert!(!patched(&file), "a table mostly updated was not written again");
+    same(&file, &memory, "after the table was written again");
+    drop(file);
+    let file = open(&path);
+    same(&file, &memory, "after the last reopen");
+    drop(file);
+    remove(&path);
+}
+
+#[test]
 fn an_update_beside_a_file_is_replayed_and_rolled_back() {
     let (path, file, memory) = loaded("update-log");
     both(&file, &memory, "UPDATE t SET v = -v, s = 'neg' WHERE k = 3");
