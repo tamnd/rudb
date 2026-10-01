@@ -221,6 +221,9 @@ fn selection(ast: &Ast, index: SelectRef) -> String {
     if held.having != NONE {
         out += &format!(" HAVING {}", expr(ast, held.having));
     }
+    if held.qualify != NONE {
+        out += &format!(" QUALIFY {}", expr(ast, held.qualify));
+    }
     out
 }
 

@@ -1060,6 +1060,7 @@ impl<'a> Binder<'a> {
         let group_items = self.group_items(ast, &written, &targets)?;
         let aggregating = !group_items.is_empty()
             || written.having != NONE
+            || has_aggregate(ast, written.qualify)
             || targets.iter().any(|target| has_aggregate(ast, target.expr));
         if aggregating {
             self.clause = "GROUP BY clause";
@@ -1115,6 +1116,24 @@ impl<'a> Binder<'a> {
             self.lift_over_aggregate(before, &mut above, &input)?;
             let predicate = self.over_aggregate(predicate, &input)?;
             having = Some(self.as_boolean(predicate, "HAVING")?);
+        }
+
+        // `QUALIFY` filters the rows after the windows have run over them, so it is bound with the
+        // windows allowed and its filter goes in above them. The pin asks for a window somewhere in
+        // the block, since without one the clause is a `WHERE` or a `HAVING` written late.
+        let mut qualify = None;
+        if written.qualify != NONE {
+            self.clause = "QUALIFY clause";
+            let before = self.scalar_subqueries.len();
+            let predicate = self.bind_expr(ast, written.qualify, &input)?;
+            self.lift_over_aggregate(before, &mut above, &input)?;
+            let predicate = self.over_aggregate(predicate, &input)?;
+            if self.windows.is_empty() {
+                return Err(Error::binder(
+                    "at least one window function must appear in the SELECT column or QUALIFY clause",
+                ));
+            }
+            qualify = Some(self.as_boolean(predicate, "QUALIFY")?);
         }
 
         // The projection's index has to exist before the sort keys are built, because a key is a
@@ -1185,6 +1204,9 @@ impl<'a> Binder<'a> {
                 frame: run.frame,
                 expressions,
             });
+        }
+        if let Some(predicate) = qualify {
+            node = self.add_node(Node::Filter { input: node, predicate });
         }
         // After the windows, which is also the pin's order: `SELECT unnest([1, 2]), count(*) OVER
         // ()` counts one row and then makes two of it.
@@ -3780,7 +3802,7 @@ impl<'a> Binder<'a> {
         // which is upstream's wording and not a simplification: `ON sum(a.i) OVER () = b.i` is
         // refused there with the words a window in a `WHERE` is refused with.
         let clause = if self.clause == "JOIN condition" { "WHERE clause" } else { self.clause };
-        if clause != "SELECT clause" && clause != "ORDER BY clause" {
+        if clause != "SELECT clause" && clause != "ORDER BY clause" && clause != "QUALIFY clause" {
             return Err(Error::binder(format!("{clause} cannot contain window functions!")));
         }
 

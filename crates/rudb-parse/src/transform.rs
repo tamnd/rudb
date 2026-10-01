@@ -3142,11 +3142,9 @@ impl<'a> Transform<'a> {
     /// `SimpleSelect <- SelectFrom WhereClause? GroupByClause? HavingClause? WindowClause?
     /// QualifyClause? SampleClause?`.
     fn simple_select(&mut self, node: u32) -> Result<SelectRef> {
-        for name in ["QualifyClause", "SampleClause"] {
-            let clause = self.find(node, name);
-            if clause != NONE {
-                return self.unsupported(clause);
-            }
+        let sample = self.find(node, "SampleClause");
+        if sample != NONE {
+            return self.unsupported(sample);
         }
         // The named windows go in before anything that could use one is walked, which is every
         // other clause of the block, including the target list that the grammar puts first.
@@ -3168,6 +3166,10 @@ impl<'a> Transform<'a> {
         let having = self.find(node, "HavingClause");
         if having != NONE {
             select.having = self.expr(self.first(having))?;
+        }
+        let qualify = self.find(node, "QualifyClause");
+        if qualify != NONE {
+            select.qualify = self.expr(self.first(qualify))?;
         }
         self.named_windows.truncate(mark);
         Ok(self.push_select(select))
@@ -5985,6 +5987,9 @@ mod tests {
                 }
                 if select.having != NONE {
                     out += &format!(" HAVING {}", show(ast, select.having));
+                }
+                if select.qualify != NONE {
+                    out += &format!(" QUALIFY {}", show(ast, select.qualify));
                 }
                 out
             }

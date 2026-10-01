@@ -257,6 +257,7 @@ fn native_nonzero_shape(ast: &Ast) -> Option<(&str, &str, &str)> {
         || select.group_by.len != 0
         || select.group_by_all
         || select.having != NONE
+        || select.qualify != NONE
     {
         return None;
     }
@@ -354,6 +355,7 @@ fn native_three_aggregate_shape(ast: &Ast) -> Option<(&str, &str, &str, [String;
         || select.group_by.len != 0
         || select.group_by_all
         || select.having != NONE
+        || select.qualify != NONE
     {
         return None;
     }
@@ -411,6 +413,7 @@ fn native_single_average_shape(ast: &Ast) -> Option<(&str, &str, String)> {
         || select.group_by.len != 0
         || select.group_by_all
         || select.having != NONE
+        || select.qualify != NONE
     {
         return None;
     }
@@ -452,6 +455,7 @@ fn native_single_distinct_shape(ast: &Ast) -> Option<(&str, &str, String)> {
         || select.group_by.len != 0
         || select.group_by_all
         || select.having != NONE
+        || select.qualify != NONE
     {
         return None;
     }
@@ -504,6 +508,7 @@ fn native_extrema_shape(ast: &Ast) -> Option<(&str, &str, [String; 2])> {
         || select.group_by.len != 0
         || select.group_by_all
         || select.having != NONE
+        || select.qualify != NONE
     {
         return None;
     }
@@ -6099,6 +6104,7 @@ fn simple_literal_filter(ast: &Ast) -> bool {
         || select.group_by_all
         || select.filter == rudb_parse::NONE
         || select.having != rudb_parse::NONE
+        || select.qualify != rudb_parse::NONE
     {
         return false;
     }
