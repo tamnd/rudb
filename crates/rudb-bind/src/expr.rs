@@ -1819,7 +1819,7 @@ impl Binder<'_> {
         let wanted = match &types[0] {
             LogicalType::Date | LogicalType::Timestamp | LogicalType::TimestampTz => None,
             LogicalType::Interval if interval => None,
-            LogicalType::Time if timed => None,
+            LogicalType::Time | LogicalType::TimeTz if timed => None,
             LogicalType::TimestampS | LogicalType::TimestampMs | LogicalType::TimestampNs => {
                 Some(LogicalType::Timestamp)
             }
@@ -2119,11 +2119,22 @@ impl Binder<'_> {
     ) -> Result<ExprRef> {
         let left_type = self.plan().expr_type(left).clone();
         let right_type = self.plan().expr_type(right).clone();
-        let common = comparison_type(&left_type, &right_type).ok_or_else(|| {
-            Error::binder(format!(
-                "Cannot compare values of type {left_type} and type {right_type}"
-            ))
-        })?;
+        let equality = matches!(
+            op,
+            CompareOp::Equal
+                | CompareOp::NotEqual
+                | CompareOp::DistinctFrom
+                | CompareOp::NotDistinctFrom
+        );
+        let common = match comparison_type(&left_type, &right_type) {
+            Some(common) => common,
+            None if equality => forced_type(&left_type, &right_type),
+            None => {
+                return Err(Error::binder(format!(
+                    "Cannot compare values of type {left_type} and type {right_type} - an explicit cast is required"
+                )));
+            }
+        };
         let left = self.checked_cast_to(left, &common, false)?;
         let right = self.checked_cast_to(right, &common, false)?;
         let (left, right) = (self.by_position(left), self.by_position(right));
@@ -2690,6 +2701,56 @@ fn comparison_type(left: &LogicalType, right: &LogicalType) -> Option<LogicalTyp
             Some(other.clone())
         }
         _ => None,
+    }
+}
+
+/// The type an equality between two types with nothing in common is forced to, which is the pin's
+/// `ForceMaxLogicalType`: the one that ranks higher, and the left one when the two rank the same.
+///
+/// An order between two such types is refused, but an equality is cast and the cast decides. So
+/// `1 = DATE '2020-01-01'` fails to cast the number to a date, and `TIME '12:00' = TIMETZ
+/// '12:00:00+00'` reads the zoned time as a time and is true, while the same two the other way
+/// round read the time in the session zone and are false in New York. All measured.
+fn forced_type(left: &LogicalType, right: &LogicalType) -> LogicalType {
+    if rank(left) < rank(right) { right.clone() } else { left.clone() }
+}
+
+/// The pin's `GetLogicalTypeScore`, which is what [`forced_type`] picks by.
+fn rank(ty: &LogicalType) -> u32 {
+    use LogicalType::*;
+    match ty {
+        Null => 0,
+        Boolean => 10,
+        UTinyInt => 11,
+        TinyInt => 12,
+        USmallInt => 13,
+        SmallInt => 14,
+        UInteger => 15,
+        Integer => 16,
+        UBigInt => 17,
+        BigInt => 18,
+        UHugeInt => 19,
+        HugeInt => 20,
+        Decimal { .. } => 21,
+        Float => 22,
+        Double => 23,
+        Time | TimeTz => 50,
+        Date => 52,
+        TimestampS => 53,
+        TimestampMs => 54,
+        Timestamp | TimestampTz => 55,
+        TimestampNs => 56,
+        Interval => 58,
+        Varchar => 77,
+        Enum(_) => 78,
+        Bit => 100,
+        Blob => 101,
+        Uuid => 102,
+        Struct(_) => 125,
+        List(_) | Array(..) => 126,
+        Map(..) => 127,
+        Union(_) => 150,
+        _ => 1000,
     }
 }
 

@@ -23,7 +23,7 @@
 //! zero for a timestamp and a time, which carry no zone, and are refused for a date and an interval
 //! the way the pin refuses them.
 
-use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
+use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil, time_tz};
 
 use crate::cast;
 use crate::scalar::{Op, negation_overflow, overflow};
@@ -804,17 +804,20 @@ pub(crate) fn shift(left: &Value, right: &Value, subtract: bool) -> Result<Value
         }
         // A time is a clock and not a point in history, so the whole days go nowhere and what is
         // left wraps. `TIME '10:00:00' + INTERVAL '-1 day 1 hour'` is eleven in the morning.
-        Value::Time(clock) | Value::TimeTz(clock) => {
-            let day = i128::from(MICROS_PER_DAY);
-            let wrapped = (i128::from(*clock) + micros).rem_euclid(day);
-            let wrapped = i64::try_from(wrapped).map_err(|_| not_in_range())?;
-            Ok(match when {
-                Value::TimeTz(_) => Value::TimeTz(wrapped),
-                _ => Value::Time(wrapped),
-            })
+        // A zoned time moves its own reading and keeps its offset.
+        Value::Time(clock) => Ok(Value::Time(wrapped_clock(*clock, micros)?)),
+        Value::TimeTz(key) => {
+            let clock = wrapped_clock(time_tz::micros(*key), micros)?;
+            Ok(Value::TimeTz(time_tz::pack(clock, time_tz::offset(*key))))
         }
         other => Err(Error::internal(format!("{other} takes no interval"))),
     }
+}
+
+/// A time of day moved by some microseconds and brought round at midnight.
+fn wrapped_clock(clock: i64, micros: i128) -> Result<i64> {
+    let wrapped = (i128::from(clock) + micros).rem_euclid(i128::from(MICROS_PER_DAY));
+    i64::try_from(wrapped).map_err(|_| not_in_range())
 }
 
 /// A timestamp moved by an interval's three fields, already signed, which is the arm of [`shift`]
@@ -849,8 +852,10 @@ pub(crate) fn shifted_stamp(stamp: i64, months: i64, days: i64, micros: i128) ->
 /// counted as the shortest one there is, since any whole month is longer than the day a clock holds
 /// and so takes the bound off the end of the range whichever month it lands in.
 pub fn came_round(when: &Value, interval: &Value, subtract: bool) -> bool {
-    let (Value::Time(clock) | Value::TimeTz(clock)) = when else {
-        return false;
+    let clock = match when {
+        Value::Time(clock) => *clock,
+        Value::TimeTz(key) => time_tz::micros(*key),
+        _ => return false,
     };
     let Value::Interval { months, days, micros } = interval else {
         return false;
@@ -858,7 +863,7 @@ pub fn came_round(when: &Value, interval: &Value, subtract: bool) -> bool {
     let day = i128::from(MICROS_PER_DAY);
     let sign = if subtract { -1 } else { 1 };
     let distance = i128::from(*months) * 28 * day + i128::from(*days) * day + i128::from(*micros);
-    !(0..day).contains(&(i128::from(*clock) + distance * i128::from(sign)))
+    !(0..day).contains(&(i128::from(clock) + distance * i128::from(sign)))
 }
 
 /// The day an interval's months and days land on, which is where both of the date range failures
@@ -1020,6 +1025,7 @@ pub(crate) fn read_off(name: &str, when: &Value) -> Result<Value> {
             Value::Timestamp(micros) | Value::TimestampTz(micros) | Value::Time(micros) => {
                 Part::Microsecond.of_micros(*micros)?
             }
+            Value::TimeTz(key) => Part::Microsecond.of_micros(time_tz::micros(*key))?,
             Value::Interval { months, days, micros } => {
                 Part::Microsecond.of_interval(*months, *days, *micros)?
             }
@@ -1030,6 +1036,7 @@ pub(crate) fn read_off(name: &str, when: &Value) -> Result<Value> {
     let micros = match when {
         Value::Date(day) => i64::from(*day) * MICROS_PER_DAY,
         Value::Timestamp(micros) | Value::TimestampTz(micros) | Value::Time(micros) => *micros,
+        Value::TimeTz(key) => time_tz::micros(*key),
         Value::Interval { months, days, micros } => (i64::from(*months) * 30 + i64::from(*days))
             .checked_mul(MICROS_PER_DAY)
             .and_then(|whole| whole.checked_add(*micros))
@@ -1377,8 +1384,10 @@ pub(crate) fn joined(left: &Value, right: &Value) -> Result<Value> {
         (Value::Date(day), Value::Time(clock)) | (Value::Time(clock), Value::Date(day)) => {
             (*day, *clock, false)
         }
-        (Value::Date(day), Value::TimeTz(clock)) | (Value::TimeTz(clock), Value::Date(day)) => {
-            (*day, *clock, true)
+        // The reading is taken back to UTC by its offset, so the date is the day in that offset.
+        (Value::Date(day), Value::TimeTz(key)) | (Value::TimeTz(key), Value::Date(day)) => {
+            let offset = i64::from(time_tz::offset(*key)) * MICROS_PER_SECOND;
+            (*day, time_tz::micros(*key) - offset, true)
         }
         _ => return Err(Error::internal(format!("{left} and {right} are not a date and a time"))),
     };

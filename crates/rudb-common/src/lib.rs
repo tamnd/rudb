@@ -39,6 +39,7 @@ pub mod slow;
 pub mod spread;
 pub mod stage;
 pub mod stat;
+pub mod time_tz;
 pub mod types;
 pub mod utf8;
 pub mod uuid;

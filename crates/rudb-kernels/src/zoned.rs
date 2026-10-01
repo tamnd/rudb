@@ -10,11 +10,12 @@
 //! which names the zone, and for `time_bucket`, `date_diff` and `date_sub`, whose kernels know only
 //! a plain timestamp. That keeps the common case on the vectorized kernels.
 
-use rudb_common::{Error, LogicalType, Result, SessionTimeZone, Value};
+use rudb_common::{Error, LogicalType, Result, SessionTimeZone, Value, time_tz};
 use rudb_vector::Vector;
 
 use crate::datetime::{
-    MICROS_PER_DAY, NEWEST_TIMESTAMP, OLDEST_TIMESTAMP, Part, infinite_stamp, shifted_stamp,
+    MICROS_PER_DAY, MICROS_PER_SECOND, NEWEST_TIMESTAMP, OLDEST_TIMESTAMP, Part, infinite_stamp,
+    shifted_stamp,
 };
 use crate::lists::{MAX_SERIES, Stepping, moment_steps};
 
@@ -317,11 +318,11 @@ fn converted(named: &Vector, when: &Vector, returns: &LogicalType) -> Result<Vec
     let convert = |when: &Vector, zone: SessionTimeZone| {
         if zoned(when) { to_stamps(when, Some(zone)) } else { to_zoned(when, Some(zone)) }
     };
-    // Only a null reaches here as a time of day, since nothing else of that type binds yet.
-    let null = named.constant_value().is_some_and(Value::is_null)
-        || (*returns == LogicalType::TimeTz && when.constant_value().is_some_and(Value::is_null));
-    if null {
+    if named.constant_value().is_some_and(Value::is_null) {
         return Ok(Vector::constant(returns.clone(), Value::Null, when.len()));
+    }
+    if *returns == LogicalType::TimeTz {
+        return rows(&[named, when], returns, |row| moved_time(&row[0], &row[1]));
     }
     match named.constant_value() {
         Some(Value::Varchar(name)) => convert(when, zone_named(name)?),
@@ -333,6 +334,38 @@ fn converted(named: &Vector, when: &Vector, returns: &LogicalType) -> Result<Vec
             convert(&when, zone_named(name)?)?.try_value_at(0)
         }),
     }
+}
+
+/// A zoned time read at another offset: the zone's offset now for a zone name, and the interval's
+/// microseconds for an interval, which is PostgreSQL's `timezone(INTERVAL, TIMETZ)`. The instant is
+/// taken to UTC first and moved by the offset inside one day, so `12:00:00+05` in Tokyo is
+/// `16:00:00+09`.
+fn moved_time(named: &Value, when: &Value) -> Result<Value> {
+    let Value::TimeTz(key) = when else {
+        return Ok(Value::Null);
+    };
+    let (offset, shift) = match named {
+        Value::Varchar(name) => {
+            let offset = zone_named(name)?.offset_seconds_now();
+            (offset, i64::from(offset) * MICROS_PER_SECOND)
+        }
+        // The pin moves the time by the whole interval and takes the offset from its microseconds,
+        // and an offset past sixteen hours is bits it cannot hold, which it prints as garbage.
+        Value::Interval { micros, .. } => {
+            let offset = i32::try_from(micros / MICROS_PER_SECOND)
+                .ok()
+                .filter(|offset| time_tz::holds(*offset))
+                .ok_or_else(|| {
+                    Error::out_of_range(format!(
+                        "Time zone offset of {micros} microseconds is out of range"
+                    ))
+                })?;
+            (offset, *micros)
+        }
+        _ => return Ok(Value::Null),
+    };
+    let moved = (time_tz::at_utc(*key) + shift).rem_euclid(MICROS_PER_DAY);
+    Ok(Value::TimeTz(time_tz::pack(moved, offset)))
 }
 
 /// A zone named in a call, refused the way `SET TimeZone` refuses one it does not know.

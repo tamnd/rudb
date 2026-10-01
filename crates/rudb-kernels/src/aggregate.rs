@@ -60,7 +60,7 @@ use rudb_common::{Error, LogicalType, PhysicalType, Result, StateKey, Value};
 use rudb_vector::{Data, Form, Live, Validity, Vector};
 
 use crate::arg_extreme::Key;
-use crate::compare::order;
+use crate::compare::extreme_order as order;
 use crate::fallback::{self, Kernel};
 use crate::general::{General, Measure};
 use crate::lttb::{Plot, Points};
@@ -840,6 +840,9 @@ impl Accumulator {
             {
                 Want::Whole
             }
+            // The winner of a vector is found on its numbers, and a zoned time's number is its sort
+            // key, which is not the order the pin's `min` keeps. See [`order`].
+            (State::Extreme { .. }, LogicalType::TimeTz) => return Ok(false),
             (State::Extreme { .. }, _) => Want::Extreme(least),
             // A scale that does not match, a count, and any total over a column that is not a
             // number. All three go to the row at a time loop, which is right about them.

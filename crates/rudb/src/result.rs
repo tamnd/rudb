@@ -7,12 +7,6 @@ use rudb_common::{LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_metrics::Document;
 use rudb_vector::{Chunk, Vector};
 
-fn unix_micros() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
-}
-
 /// The rows a query produced, with the names and types of its columns.
 ///
 /// Materialized rather than streamed. A streaming result would have to hold the operator tree,
@@ -39,8 +33,6 @@ pub struct QueryResult {
     /// inline it made every result that large, and a trickled `INSERT` copied its count answer
     /// four times on the way out.
     metrics: Option<Box<Document>>,
-    /// The instant used to choose the offset for a zoned time with no date of its own.
-    rendered_at: i64,
     /// How many rows the statement wrote, when this is the count a writing statement answers with
     /// rather than rows a query produced.
     changes: Option<usize>,
@@ -88,7 +80,6 @@ impl QueryResult {
             body: Arc::new(Body { names, types, chunks, starts, held, session: Session::new() }),
             rows,
             metrics: None,
-            rendered_at: unix_micros(),
             changes: None,
         }
     }
@@ -123,7 +114,6 @@ impl QueryResult {
     pub fn value_text(&self, value: &Value) -> String {
         let instant = match value {
             Value::TimestampTz(micros) => *micros,
-            Value::TimeTz(_) => self.rendered_at,
             // A zoned value inside a list, a struct or a map is written in the session zone too,
             // which UTC already is.
             Value::List { .. } | Value::Struct(_) | Value::Map { .. }
@@ -141,7 +131,7 @@ impl QueryResult {
     /// its text holds and not by its type.
     fn written_inside(&self, value: &Value) -> Value {
         match value {
-            Value::TimestampTz(_) | Value::TimeTz(_) => Value::Varchar(self.value_text(value)),
+            Value::TimestampTz(_) => Value::Varchar(self.value_text(value)),
             Value::List { element, values } => Value::List {
                 element: element.clone(),
                 values: values.iter().map(|value| self.written_inside(value)).collect(),
@@ -434,10 +424,11 @@ impl QueryResult {
 // per statement. It was 768 bytes with the metrics document held inline.
 const _: () = assert!(size_of::<QueryResult>() <= 256, "a result has grown past 256 bytes");
 
-/// Whether a value holds a `TIMESTAMPTZ` or a `TIMETZ` anywhere inside it.
+/// Whether a value holds a `TIMESTAMPTZ` anywhere inside it. A `TIMETZ` carries its own offset and
+/// is written the same in every session.
 fn zoned_inside(value: &Value) -> bool {
     match value {
-        Value::TimestampTz(_) | Value::TimeTz(_) => true,
+        Value::TimestampTz(_) => true,
         Value::List { values, .. } => values.iter().any(zoned_inside),
         Value::Struct(fields) => fields.iter().any(|(_, value)| zoned_inside(value)),
         Value::Map { entries, .. } => {

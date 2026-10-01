@@ -74,9 +74,10 @@ pub(crate) fn hash(value: &Value) -> u64 {
         Value::UTinyInt(v) => murmur(u64::from(*v)),
         Value::USmallInt(v) => murmur(u64::from(*v)),
         Value::UInteger(v) => murmur(u64::from(*v)),
+        // A zoned time is held as the pin's sort key and hashed as the pin's own bits.
+        Value::TimeTz(key) => wide(rudb_common::time_tz::bits(*key)),
         Value::BigInt(v)
         | Value::Time(v)
-        | Value::TimeTz(v)
         | Value::Timestamp(v)
         | Value::TimestampTz(v)
         | Value::TimestampS(v)

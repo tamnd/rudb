@@ -2486,7 +2486,7 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         // `rudb-bind` fills it in from the constant.
         (
             "date_part",
-            [LogicalType::List(element), Date | Timestamp | TimestampTz | Time | Interval],
+            [LogicalType::List(element), Date | Timestamp | TimestampTz | Time | TimeTz | Interval],
         ) if matches!(**element, LogicalType::Varchar | Null) => Some((
             vec![LogicalType::List(Box::new(LogicalType::Varchar)), arguments[1].clone()],
             LogicalType::Struct(Vec::new()),
@@ -2523,6 +2523,11 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         ("timezone", [LogicalType::Varchar | Null, Null]) => {
             Some((vec![LogicalType::Varchar, TimeTz], TimeTz))
         }
+        // A zoned time is read at the zone's offset now, or at the offset an interval gives.
+        ("timezone", [LogicalType::Varchar | Null, TimeTz]) => {
+            Some((vec![LogicalType::Varchar, TimeTz], TimeTz))
+        }
+        ("timezone", [Interval, TimeTz | Null]) => Some((vec![Interval, TimeTz], TimeTz)),
         ("timezone", [LogicalType::Varchar | Null, TimestampTz]) => {
             Some((vec![LogicalType::Varchar, TimestampTz], Timestamp))
         }
@@ -2612,7 +2617,7 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         ("nanosecond" | "epoch_ns", [TimestampNs]) => kept(BigInt),
         (
             "nanosecond" | "epoch_ms" | "epoch_us" | "epoch_ns",
-            [Date | Timestamp | TimestampTz | Time | Interval],
+            [Date | Timestamp | TimestampTz | Time | TimeTz | Interval],
         ) => kept(BigInt),
         // A date or a timestamp can be one of the two infinities, so these read it as it is.
         ("isinf" | "isfinite", [Date | Timestamp | TimestampTz]) => kept(LogicalType::Boolean),

@@ -2362,6 +2362,25 @@ pub(crate) fn float_order(left: f64, right: f64) -> Ordering {
     }
 }
 
+/// The order `min`, `max`, `arg_min`, `arg_max`, `greatest` and `least` keep, which is [`order`]
+/// but for a zoned time.
+///
+/// The pin picks the extreme of a `TIME WITH TIME ZONE` by its stored bits rather than by its sort
+/// key, so the time of day in its own offset comes first and the instant does not matter: `min` of
+/// `06:00:00+00` and `01:00:00-05` is `01:00:00-05`, though `<` puts the other first.
+///
+/// # Errors
+///
+/// The ones [`order`] has.
+pub fn extreme_order(left: &Value, right: &Value) -> Result<Ordering> {
+    match (left, right) {
+        (Value::TimeTz(left), Value::TimeTz(right)) => {
+            Ok(rudb_common::time_tz::bits(*left).cmp(&rudb_common::time_tz::bits(*right)))
+        }
+        _ => order(left, right),
+    }
+}
+
 /// The order of two values with nulls in it, for a sort key.
 ///
 /// A sort has to put nulls somewhere and SQL lets the query say where, so this takes the answer
