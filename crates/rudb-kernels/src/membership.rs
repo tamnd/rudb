@@ -138,9 +138,13 @@ struct Text {
 /// The bytes of a value of at most eight bytes as one word, the first byte lowest.
 #[inline]
 fn word(value: &[u8]) -> u64 {
-    let mut bytes = [0_u8; 8];
-    bytes[..value.len()].copy_from_slice(value);
-    u64::from_le_bytes(bytes)
+    // A byte at a time rather than a copy into a buffer, which is a call to `memcpy` for a length
+    // the compiler cannot see and cost more than the rest of the lookup.
+    let mut word = 0_u64;
+    for (at, &byte) in value.iter().enumerate() {
+        word |= u64::from(byte) << (8 * at);
+    }
+    word
 }
 
 impl Text {
@@ -180,6 +184,13 @@ impl Text {
         } else {
             self.set.contains(value)
         }
+    }
+
+    /// The prefix length and the mask over a view's first four bytes that keeps it, when the list
+    /// is over a prefix that short and is held as words.
+    fn within_view(&self) -> Option<(usize, u32)> {
+        let length = self.prefix.filter(|&length| length <= 4 && !self.words.is_empty())?;
+        Some((length, u32::MAX >> (32 - 8 * length)))
     }
 
     fn iter(&self) -> impl Iterator<Item = &[u8]> {
@@ -628,9 +639,22 @@ fn look<A: Fn(usize) -> usize>(
     returns: &LogicalType,
 ) -> Result<Vector> {
     match (&members.held, data) {
-        (Held::Text(set), Data::Varlen(column)) => answer(rows, base, members, returns, |index| {
-            column.bytes(at(index)).is_some_and(|text| set.contains(text))
-        }),
+        (Held::Text(set), Data::Varlen(column)) => match set.within_view() {
+            // Every view holds the first four bytes of its string, so a list over that many
+            // characters or fewer is answered from the views and no string is read.
+            Some((length, mask)) => {
+                let views = column.views();
+                answer(rows, base, members, returns, |index| {
+                    views.get(at(index)).is_some_and(|view| {
+                        let held = u64::from(u32::from_le_bytes(view.prefix()) & mask);
+                        view.len() >= length && set.words.iter().any(|&(word, _)| word == held)
+                    })
+                })
+            }
+            None => answer(rows, base, members, returns, |index| {
+                column.bytes(at(index)).is_some_and(|text| set.contains(text))
+            }),
+        },
         (Held::Whole(set), Data::Int8(held)) => {
             answer(rows, base, members, returns, |index| holds(set, held.as_slice(), at(index)))
         }
@@ -779,25 +803,30 @@ mod tests {
 
     #[test]
     fn a_prefixed_list_answers_what_the_substring_would() {
-        let texts = ["13-555", "1", "", "130", "é3", "31", "3", "31é", "13"];
+        let texts = ["13-555", "1", "", "130", "é3", "31", "3", "31é", "13", "31-xxé", "31-x"];
         let mut values: Vec<Value> =
             texts.iter().map(|text| Value::Varchar((*text).into())).collect();
         values.push(Value::Null);
         let input = Vector::from_values(LogicalType::Varchar, &values).expect("strings");
-        let list = [Value::Varchar("13".into()), Value::Varchar("31".into())];
-        for negated in [false, true] {
-            let mut members = Members::of(&list, negated).expect("this list folds");
-            assert!(members.prefixed(2));
-            let answer = in_set(&input, &members, &LogicalType::Boolean).expect("the lookup runs");
-            for (row, value) in values.iter().enumerate() {
-                let wanted = match value {
-                    Value::Varchar(text) => {
-                        let cut: String = text.chars().take(2).collect();
-                        Value::Boolean((cut == "13" || cut == "31") != negated)
-                    }
-                    _ => Value::Null,
-                };
-                assert_eq!(answer.value_at(row), wanted, "{value:?}");
+        // Two characters, which the views answer, and five, which reads the strings.
+        for (list, length) in [(["13", "31"], 2), (["13-55", "31-xx"], 5)] {
+            let list = list.map(|text| Value::Varchar(text.into()));
+            for negated in [false, true] {
+                let mut members = Members::of(&list, negated).expect("this list folds");
+                assert!(members.prefixed(length));
+                let answer =
+                    in_set(&input, &members, &LogicalType::Boolean).expect("the lookup runs");
+                for (row, value) in values.iter().enumerate() {
+                    let wanted = match value {
+                        Value::Varchar(text) => {
+                            let cut: String = text.chars().take(length).collect();
+                            let found = list.contains(&Value::Varchar(cut));
+                            Value::Boolean(found != negated)
+                        }
+                        _ => Value::Null,
+                    };
+                    assert_eq!(answer.value_at(row), wanted, "{value:?} in {list:?}");
+                }
             }
         }
         // A list with an entry of another length, or of a character past ASCII, is left whole.
