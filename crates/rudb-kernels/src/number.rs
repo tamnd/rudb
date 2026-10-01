@@ -43,10 +43,31 @@ pub(crate) fn approximate(value: &Value) -> Option<f64> {
     match *value {
         Value::Float(v) => Some(f64::from(v)),
         Value::Double(v) => Some(v),
-        Value::Decimal { unscaled, scale, .. } => Some(unscaled as f64 / pow10(scale) as f64),
+        Value::Decimal { unscaled, scale, .. } => Some(decimal_double(unscaled, scale)),
         Value::UHugeInt(v) => Some(v as f64),
         _ => integral(value).map(|whole| whole as f64),
     }
+}
+
+/// The largest whole number every smaller one of which a double holds exactly.
+pub(crate) const EXACT_IN_DOUBLE: f64 = 9_007_199_254_740_992.0;
+
+/// A decimal as the double nearest to it, which is the pin's cast.
+///
+/// Dividing the unscaled number by the power of ten rounds once when both of them are exact, which
+/// the pin takes as its fast path. Past 2^53, or past the powers of ten a double holds, the
+/// division rounds twice and can land one step off, so `9223372036.854775::DOUBLE` would be
+/// `9223372036.854776`. The pin reads the digits there instead, and so does this.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the conversion is exact on the fast path, which is the only one that uses it"
+)]
+pub(crate) fn decimal_double(unscaled: i128, scale: u8) -> f64 {
+    let whole = unscaled as f64;
+    if scale == 0 || (whole.abs() <= EXACT_IN_DOUBLE && scale <= 22) {
+        return whole / pow10(scale) as f64;
+    }
+    format!("{unscaled}e-{scale}").parse().unwrap_or(whole / pow10(scale) as f64)
 }
 
 /// Ten to the power of a decimal scale.
@@ -152,5 +173,18 @@ mod tests {
         assert_eq!(fit(300, &LogicalType::TinyInt), None);
         assert_eq!(fit(-1, &LogicalType::UInteger), None);
         assert_eq!(fit(127, &LogicalType::TinyInt), Some(Value::TinyInt(127)));
+    }
+
+    #[test]
+    fn a_decimal_becomes_the_double_nearest_to_it() {
+        assert_eq!(decimal_double(9_223_372_036_854_775, 6), 9_223_372_036.854_774);
+        assert_eq!(decimal_double(-9_223_372_036_854_775, 6), -9_223_372_036.854_774);
+        assert_eq!(decimal_double(1_234_567_890_123_456_789, 1), 1.234_567_890_123_456_8e17);
+        assert_eq!(
+            decimal_double(12_345_678_901_234_567_890_123_456_789, 9),
+            1.234_567_890_123_456_7e19
+        );
+        assert_eq!(decimal_double(1, 1), 0.1);
+        assert_eq!(decimal_double(15, 1), 1.5);
     }
 }
