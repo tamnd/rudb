@@ -8155,6 +8155,58 @@ fn a_file_backed_insert_streams_into_a_snapshot_that_a_new_process_can_read() {
     std::fs::remove_file(path).expect("the temporary native database is removed");
 }
 
+/// A table with a primary key is loaded as a stream too, with its keys checked before the file says
+/// the rows are there. JOB declares an `id` key on every table, and loading its 36 million row
+/// `cast_info` through memory took more than the 4 GB the machine had.
+#[test]
+fn a_keyed_insert_streams_and_a_repeated_key_is_refused_the_way_the_pin_does() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-keyed-stream-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let database = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the new native database opens");
+    database.execute("CREATE TABLE seen (id INTEGER PRIMARY KEY, name VARCHAR)").unwrap();
+    database.execute("CREATE TABLE kept (id INTEGER PRIMARY KEY, name VARCHAR UNIQUE)").unwrap();
+    database.execute("CHECKPOINT").unwrap();
+    let native = |name: &str| {
+        database.with_catalog(|catalog| {
+            let name = rudb_catalog::QualifiedName::new("memory", "main", name);
+            catalog.table(&name).expect("the table is there").rows().is_native()
+        })
+    };
+    assert_eq!(
+        refusal(&database, "INSERT INTO seen SELECT i % 5000, 'x' FROM range(10000) AS r(i)"),
+        "PRIMARY KEY or UNIQUE constraint violation: duplicate key \"0\"",
+    );
+    assert_eq!(
+        refusal(&database, "INSERT INTO kept SELECT i, 'n' || (i % 7) FROM range(100) AS r(i)"),
+        "PRIMARY KEY or UNIQUE constraint violation: duplicate key \"n0\"",
+    );
+    assert_eq!(rows(&database, "SELECT count(*) FROM seen"), vec![vec![Value::BigInt(0)]]);
+    database.execute("INSERT INTO seen SELECT i, 'x' FROM range(10000) AS r(i)").unwrap();
+    assert!(native("seen"), "the load streamed into the file");
+    // The keys of the empty table, built by the refused load, are not the keys of the full one.
+    assert_eq!(
+        refusal(&database, "INSERT INTO seen VALUES (42, 'y')"),
+        "Duplicate key \"id: 42\" violates primary key constraint.",
+    );
+    database.execute("INSERT INTO seen VALUES (10000, 'y')").unwrap();
+    database.execute("CHECKPOINT").unwrap();
+    drop(database);
+    let reopened = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    assert_eq!(
+        rows(&reopened, "SELECT count(*), count(DISTINCT id) FROM seen"),
+        vec![vec![Value::BigInt(10001), Value::BigInt(10001)]]
+    );
+    drop(reopened);
+    std::fs::remove_file(path).expect("the temporary native database is removed");
+}
+
 /// A schema committed by an earlier session is still loaded as a stream rather than through memory.
 ///
 /// What says whether a table already in the file is in the way of the one being written is how many

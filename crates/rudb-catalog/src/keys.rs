@@ -63,17 +63,66 @@ impl Key {
 /// Behind an [`Arc`] so that the copy of the catalog a transaction keeps to roll back to shares it,
 /// and the first write after the copy is the one that pays for a set of its own.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Seen(Arc<HashSet<Box<[u8]>>>);
+pub(crate) struct Seen(Arc<Held>);
 
-/// The key of one row, or `None` when a column of it is null.
-fn encode(chunk: &Chunk, key: &Key, row: usize, out: &mut Vec<u8>) -> Result<bool> {
+/// The keys themselves. A key of one integer column is kept as the integer, which is about a fifth
+/// of the memory of its encoding in a box of its own. Built over the 36 million rows of the JOB
+/// `cast_info`, the boxes alone were more than the 4 GB a load into it had.
+#[derive(Debug, Clone, Default)]
+struct Held {
+    /// The keys of one `INTEGER` or `BIGINT` column.
+    ints: HashSet<i64>,
+    /// Every other key, encoded.
+    bytes: HashSet<Box<[u8]>>,
+}
+
+/// What one row's key is: none for a key with a null in it, an integer, or the encoding written
+/// into the caller's scratch buffer.
+#[derive(Clone, Copy)]
+enum Encoded {
+    Null,
+    Int(i64),
+    Bytes,
+}
+
+/// The key of one row. The two integer types are the ones [`push`] writes as an `i64` behind the
+/// same tag, so a key of one of them is the same key whichever set it lands in.
+fn encode(chunk: &Chunk, key: &Key, row: usize, out: &mut Vec<u8>) -> Result<Encoded> {
     out.clear();
+    if let &[column] = key.columns.as_slice() {
+        let value = chunk.column(column)?.value_at(row);
+        return Ok(match value {
+            Value::Integer(v) => Encoded::Int(i64::from(v)),
+            Value::BigInt(v) => Encoded::Int(v),
+            value if push(&value, out) => Encoded::Bytes,
+            _ => Encoded::Null,
+        });
+    }
     for &column in &key.columns {
         if !push(&chunk.column(column)?.value_at(row), out) {
-            return Ok(false);
+            return Ok(Encoded::Null);
         }
     }
-    Ok(true)
+    Ok(Encoded::Bytes)
+}
+
+impl Held {
+    fn contains(&self, encoded: Encoded, scratch: &[u8]) -> bool {
+        match encoded {
+            Encoded::Null => false,
+            Encoded::Int(v) => self.ints.contains(&v),
+            Encoded::Bytes => self.bytes.contains(scratch),
+        }
+    }
+
+    /// Adds a key and says whether it was new. A null key always is.
+    fn insert(&mut self, encoded: Encoded, scratch: &[u8]) -> bool {
+        match encoded {
+            Encoded::Null => true,
+            Encoded::Int(v) => self.ints.insert(v),
+            Encoded::Bytes => self.bytes.insert(scratch.into()),
+        }
+    }
 }
 
 /// One column of a key onto the end of its encoding, or false for a null.
@@ -145,41 +194,55 @@ impl Seen {
     /// which is how an `UPDATE` or a `DELETE` lands, and a repeat there is reported the way the pin
     /// reports a key that was already there.
     pub(crate) fn of(chunks: &[Chunk], key: &Key, columns: &[Field], fresh: bool) -> Result<Self> {
-        let mut seen = HashSet::new();
-        let mut scratch = Vec::new();
+        let mut seen = Self::default();
         for chunk in chunks {
-            for row in 0..chunk.len() {
-                if !encode(chunk, key, row, &mut scratch)? {
-                    continue;
-                }
-                if !seen.insert(scratch.clone().into_boxed_slice()) {
-                    return Err(if fresh {
-                        Error::constraint(format!(
-                            "Duplicate key \"{}\" violates {} constraint.",
-                            named(chunk, key, columns, row)?,
-                            key.kind()
-                        ))
-                    } else {
-                        Error::constraint(format!(
-                            "PRIMARY KEY or UNIQUE constraint violation: duplicate key \"{}\"",
-                            bare(chunk, key, row)?
-                        ))
-                    });
-                }
-            }
+            seen.absorb(chunk, key, columns, fresh)?;
         }
-        Ok(Self(Arc::new(seen)))
+        Ok(seen)
+    }
+
+    /// Adds the keys of one more chunk of the rows [`Self::of`] is given, so a caller reading a
+    /// table a part at a time holds one part and the keys rather than the whole table.
+    pub(crate) fn absorb(
+        &mut self,
+        chunk: &Chunk,
+        key: &Key,
+        columns: &[Field],
+        fresh: bool,
+    ) -> Result<()> {
+        let held = Arc::make_mut(&mut self.0);
+        let mut scratch = Vec::new();
+        for row in 0..chunk.len() {
+            let encoded = encode(chunk, key, row, &mut scratch)?;
+            if held.insert(encoded, &scratch) {
+                continue;
+            }
+            return Err(if fresh {
+                Error::constraint(format!(
+                    "Duplicate key \"{}\" violates {} constraint.",
+                    named(chunk, key, columns, row)?,
+                    key.kind()
+                ))
+            } else {
+                Error::constraint(format!(
+                    "PRIMARY KEY or UNIQUE constraint violation: duplicate key \"{}\"",
+                    bare(chunk, key, row)?
+                ))
+            });
+        }
+        Ok(())
     }
 
     /// Checks rows about to be appended against the ones held and against each other, and returns
-    /// the set the table holds once they are in. Nothing is changed when a key repeats.
+    /// their keys for [`Self::extend`] to add once every key of the table has passed. Nothing is
+    /// changed here, so a refusal leaves the set as it was.
     ///
     /// A key that is already held is found first, over all the new rows, and only then a key the
     /// new rows repeat among themselves, which is the order the pin finds them in.
     ///
     /// `committing` says the rows are a transaction's, going into the table it committed to, and a
     /// key already held is then named the way the pin names it when a commit fails.
-    pub(crate) fn with(
+    pub(crate) fn check(
         &self,
         chunks: &[Chunk],
         key: &Key,
@@ -189,7 +252,8 @@ impl Seen {
         let mut scratch = Vec::new();
         for chunk in chunks {
             for row in 0..chunk.len() {
-                if encode(chunk, key, row, &mut scratch)? && self.0.contains(scratch.as_slice()) {
+                let encoded = encode(chunk, key, row, &mut scratch)?;
+                if self.0.contains(encoded, &scratch) {
                     return Err(Error::constraint(if committing {
                         format!(
                             "PRIMARY KEY or UNIQUE constraint violation: duplicate key \"{}\"",
@@ -205,9 +269,65 @@ impl Seen {
                 }
             }
         }
-        let added = Self::of(chunks, key, columns, false)?;
-        let mut all = self.0.clone();
-        Arc::make_mut(&mut all).extend(added.0.iter().cloned());
-        Ok(Self(all))
+        Self::of(chunks, key, columns, false)
+    }
+
+    /// Adds the keys [`Self::check`] passed. The set is copied only when a transaction's copy of
+    /// the catalog still shares it.
+    pub(crate) fn extend(&mut self, added: Self) {
+        // The first load into a table, where copying the keys into an empty set would hold them
+        // twice at the peak.
+        if self.0.ints.is_empty() && self.0.bytes.is_empty() {
+            *self = added;
+            return;
+        }
+        let held = Arc::make_mut(&mut self.0);
+        held.ints.extend(added.0.ints.iter().copied());
+        held.bytes.extend(added.0.bytes.iter().cloned());
+    }
+}
+
+/// The keys of the rows a load streams into an empty table, kept as compactly as they can be so the
+/// load is checked for a repeated key once, at the end, instead of holding its rows to do it.
+///
+/// A key of one integer column is eight bytes a row. Loading the JOB `cast_info`, 36 million rows
+/// with an `id` primary key, through the table instead took more than the 4 GB of the machine it
+/// ran on.
+#[derive(Debug, Default)]
+pub struct KeyLog {
+    ints: Vec<i64>,
+    bytes: Vec<Box<[u8]>>,
+}
+
+impl KeyLog {
+    /// Notes the key of every row of the chunk. A key with a null in it is no key and is skipped.
+    ///
+    /// # Errors
+    ///
+    /// If the chunk has no column the key names.
+    pub fn record(&mut self, chunk: &Chunk, key: &Key) -> Result<()> {
+        let mut scratch = Vec::new();
+        for row in 0..chunk.len() {
+            match encode(chunk, key, row, &mut scratch)? {
+                Encoded::Null => {}
+                Encoded::Int(v) => self.ints.push(v),
+                Encoded::Bytes => self.bytes.push(scratch.as_slice().into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes in the keys another instance of the same load noted.
+    pub fn merge(&mut self, other: Self) {
+        self.ints.extend(other.ints);
+        self.bytes.extend(other.bytes);
+    }
+
+    /// Whether any key was noted twice. Sorts what it holds to find out.
+    pub fn repeats(&mut self) -> bool {
+        self.ints.sort_unstable();
+        self.bytes.sort_unstable();
+        self.ints.windows(2).any(|pair| pair[0] == pair[1])
+            || self.bytes.windows(2).any(|pair| pair[0] == pair[1])
     }
 }

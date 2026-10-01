@@ -1616,6 +1616,8 @@ impl Table {
         }
         self.clustering = reader.table().clustering().cloned();
         self.rows = Rows::Native(reader);
+        // The keys of an empty table, if a write had built them, which are not this table's now.
+        self.seen = vec![None; self.guards().len()];
         Ok(())
     }
 
@@ -1789,12 +1791,7 @@ impl Table {
     pub(crate) fn add_index(&mut self, index: crate::Index) -> Result<()> {
         if index.unique && index.plain {
             let key = Key { columns: index.columns.clone(), primary: false };
-            let all: Vec<usize> = (0..self.columns.len()).collect();
-            let mut stored = Vec::with_capacity(self.rows.chunk_count());
-            for chunk in 0..self.rows.chunk_count() {
-                stored.push(self.rows.read(chunk, &all)?);
-            }
-            if Seen::of(&stored, &key, &self.columns, true).is_err() {
+            if self.stored_keys(&key).is_err() {
                 return Err(Error::constraint("Data contains duplicates on indexed column(s)"));
             }
         }
@@ -1917,24 +1914,44 @@ impl Table {
         if guards.is_empty() {
             return Ok(Vec::new());
         }
+        // Taken out rather than cloned, so the set is not copied to add a few keys to it. A
+        // refusal puts them back as they were. An append that fails after this leaves them out,
+        // and the next write builds them again from the rows.
         let mut sets = Vec::with_capacity(guards.len());
         for (at, key) in guards.iter().enumerate() {
-            let held = match &self.seen[at] {
-                Some(held) => held.clone(),
-                None => {
-                    let all: Vec<usize> = (0..self.columns.len()).collect();
-                    let mut stored = Vec::with_capacity(self.rows.chunk_count());
-                    for chunk in 0..self.rows.chunk_count() {
-                        stored.push(self.rows.read(chunk, &all)?);
-                    }
-                    let held = Seen::of(&stored, key, &self.columns, true)?;
-                    self.seen[at] = Some(held.clone());
-                    held
-                }
+            let held = match self.seen[at].take() {
+                Some(held) => held,
+                None => self.stored_keys(key)?,
             };
-            sets.push(held.with(chunks, key, &self.columns, committing)?);
+            sets.push(held);
+        }
+        let mut added = Vec::with_capacity(guards.len());
+        for (held, key) in sets.iter().zip(&guards) {
+            match held.check(chunks, key, &self.columns, committing) {
+                Ok(keys) => added.push(keys),
+                Err(error) => {
+                    self.hold_keys(sets);
+                    return Err(error);
+                }
+            }
+        }
+        for (held, keys) in sets.iter_mut().zip(added) {
+            held.extend(keys);
         }
         Ok(sets)
+    }
+
+    /// The keys of every row the table holds for `key`, read a part at a time and only from the
+    /// key's own columns, so building them holds one part beside the set rather than every column
+    /// of every row.
+    fn stored_keys(&self, key: &Key) -> Result<Seen> {
+        let projected = Key { columns: (0..key.columns.len()).collect(), primary: key.primary };
+        let fields = key.columns.iter().map(|&at| self.columns[at].clone()).collect::<Vec<_>>();
+        let mut seen = Seen::default();
+        for chunk in 0..self.rows.chunk_count() {
+            seen.absorb(&self.rows.read(chunk, &key.columns)?, &projected, &fields, true)?;
+        }
+        Ok(seen)
     }
 
     fn hold_keys(&mut self, seen: Vec<Seen>) {

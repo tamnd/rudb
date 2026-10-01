@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, Rw
 use std::time::{Duration, Instant};
 
 use rudb_bind::{Bound, Parameters, Write};
-use rudb_catalog::{Catalog, DEFAULT_CATALOG, Entry, QualifiedName, View};
+use rudb_catalog::{Catalog, DEFAULT_CATALOG, Entry, Key, KeyLog, QualifiedName, View};
 use rudb_common::stat::Provenance;
 use rudb_common::{
     Cancel, Clustering, Error, Field, LogicalType, Memory, Result, Rule, Session, Value,
@@ -2947,6 +2947,8 @@ struct NativePlace {
     inside_cpu: u64,
     rows: u64,
     bytes: u64,
+    /// The keys of the rows this instance kept, one log for each key of the table.
+    logs: Vec<KeyLog>,
 }
 
 impl NativePlace {
@@ -3015,6 +3017,14 @@ struct NativeSink {
     table: String,
     fields: Vec<Field>,
     profile: Arc<LoadProfile>,
+    /// The table's primary key and unique constraints, which the rows are checked against once
+    /// they have all arrived and before the file says they are there.
+    keys: Vec<Key>,
+    /// What the instances noted of the keys, one log for each key.
+    logged: Mutex<Vec<KeyLog>>,
+    /// Whether the check found a key twice, which is the caller's sign to load the rows through
+    /// the table instead and let it name the key the way the pin does.
+    repeated: AtomicBool,
 }
 
 impl NativeSink {
@@ -3031,6 +3041,12 @@ impl NativeSink {
                     "NOT NULL constraint failed: {}.{}",
                     self.table, field.name
                 )));
+            }
+        }
+        if !self.keys.is_empty() {
+            place.logs.resize_with(self.keys.len(), KeyLog::default);
+            for (log, key) in place.logs.iter_mut().zip(&self.keys) {
+                log.record(&chunk, key)?;
             }
         }
         place.start();
@@ -3056,6 +3072,7 @@ impl NativeSink {
         fields: Vec<Field>,
         clustering: Option<Clustering>,
         limit: Option<u64>,
+        keys: Vec<Key>,
     ) -> Result<Self> {
         let temporary = target.with_extension(format!("{}.tmp", std::process::id()));
         if temporary.exists() {
@@ -3075,6 +3092,9 @@ impl NativeSink {
             table: name,
             fields,
             profile,
+            keys,
+            logged: Mutex::default(),
+            repeated: AtomicBool::new(false),
         })
     }
 
@@ -3086,6 +3106,7 @@ impl NativeSink {
         fields: Vec<Field>,
         clustering: Option<Clustering>,
         limit: Option<u64>,
+        keys: Vec<Key>,
     ) -> Result<Self> {
         let profile = LoadProfile::begin(name.clone());
         let writer = rudb_native::Writer::open(target, name.clone(), fields.clone())?
@@ -3101,6 +3122,9 @@ impl NativeSink {
             table: name,
             fields,
             profile,
+            keys,
+            logged: Mutex::default(),
+            repeated: AtomicBool::new(false),
         })
     }
 
@@ -3223,6 +3247,14 @@ impl Sink for NativeSink {
     }
 
     fn combine(&self, mut local: Self::Local) -> Result<()> {
+        if !local.logs.is_empty() {
+            let mut logged =
+                self.logged.lock().map_err(|_| Error::internal("a key log panicked"))?;
+            logged.resize_with(self.keys.len(), KeyLog::default);
+            for (log, theirs) in logged.iter_mut().zip(std::mem::take(&mut local.logs)) {
+                log.merge(theirs);
+            }
+        }
         let handed = self.hand_over(&mut local);
         if let Some(started) = local.started.take() {
             let (wall, cpu) = started.stop();
@@ -3237,6 +3269,18 @@ impl Sink for NativeSink {
     }
 
     fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
+        // Before the commit, so a load that repeats a key leaves the database as it was.
+        let mut logged = std::mem::take(
+            &mut *self.logged.lock().map_err(|_| Error::internal("a key log panicked"))?,
+        );
+        if logged.iter_mut().any(KeyLog::repeats) {
+            self.repeated.store(true, Ordering::Relaxed);
+            if let Some(temporary) = &self.temporary {
+                let _ = std::fs::remove_file(temporary);
+            }
+            return Err(Error::constraint("a streamed load repeated a key"));
+        }
+        drop(logged);
         let writer = self
             .writer
             .lock()
@@ -4690,9 +4734,16 @@ impl Shared {
                         // there is nowhere a declaration could have come from yet.
                         let limit = self.inner.memory.limit();
                         let sink = Arc::new(if alone {
-                            NativeSink::create(path, table.clone(), fields, None, limit)?
+                            NativeSink::create(
+                                path,
+                                table.clone(),
+                                fields,
+                                None,
+                                limit,
+                                Vec::new(),
+                            )?
                         } else {
-                            NativeSink::open(path, table.clone(), fields, None, limit)?
+                            NativeSink::open(path, table.clone(), fields, None, limit, Vec::new())?
                         });
                         // The rows go in under a read lock, so queries run while they do. Nothing
                         // else can change the catalog in the gap between the two locks, because
@@ -4864,15 +4915,14 @@ impl Shared {
                     && insert.name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)
                     && !self.transacting();
                 if let Some(path) = self.inner.path.as_ref().filter(|_| {
-                    // A table with a key checks every row against the ones it holds, which the sink
-                    // does not, so it takes the path through the table.
+                    // A table with a foreign key checks every row against another table, which the
+                    // sink does not, so it takes the path through the table. A key of its own the
+                    // sink does check, once the rows are in and before the file says so.
                     writable
                         && insert.write == Write::Append
                         && insert.returning.is_none()
                         && insert.checks.is_none()
-                        && catalog.table(&insert.name).is_ok_and(|table| {
-                            table.guards().is_empty() && table.foreign().is_empty()
-                        })
+                        && catalog.table(&insert.name).is_ok_and(|table| table.foreign().is_empty())
                 }) {
                     let target = catalog.table(&insert.name)?;
                     // Rows go from the source to the file without the table being held in memory on
@@ -4897,10 +4947,18 @@ impl Shared {
                         // soon as this returns.
                         let clustering = target.clustering().cloned();
                         let limit = self.inner.memory.limit();
+                        let keys = target.guards();
                         let sink = Arc::new(if alone {
-                            NativeSink::create(path, table.clone(), fields, clustering, limit)?
+                            NativeSink::create(
+                                path,
+                                table.clone(),
+                                fields,
+                                clustering,
+                                limit,
+                                keys,
+                            )?
                         } else {
-                            NativeSink::open(path, table.clone(), fields, clustering, limit)?
+                            NativeSink::open(path, table.clone(), fields, clustering, limit, keys)?
                         });
                         let query = rudb_exec::build_measured_into(
                             &insert.source,
@@ -4909,20 +4967,33 @@ impl Shared {
                             &self.inner.memory,
                             &seams,
                             &session,
-                            sink,
+                            Arc::<NativeSink>::clone(&sink),
                         )?;
-                        query.run(cancel, &self.inner.pool)?;
+                        let ran = query.run(cancel, &self.inner.pool);
                         drop(query);
-                        // By name out of the file's catalog rather than as the one table in the
-                        // file, because after an append it is not the one table in the file.
-                        let reader = rudb_native::Catalog::open(path)?.table(&table)?;
-                        let added = reader.table().rows();
-                        catalog.table_mut(&insert.name)?.commit_native(reader)?;
-                        // The rows are in the file already. What is left is a file the sink may
-                        // have written without an anchor, which the checkpoint puts back, and
-                        // which costs a new catalog and nothing else.
-                        self.unlogged();
-                        return QueryResult::changed(added);
+                        let repeated = sink.repeated.load(Ordering::Relaxed);
+                        drop(sink);
+                        match ran {
+                            // A repeated key. The path through the table below finds it again and
+                            // names the first one in the order the rows came, in the pin's words,
+                            // which the sink cannot do without holding the rows. A load that
+                            // fails that way pays for reading its source twice.
+                            Err(_) if repeated => {}
+                            Err(error) => return Err(error),
+                            Ok(_) => {
+                                // By name out of the file's catalog rather than as the one table
+                                // in the file, because after an append it is not the one table in
+                                // the file.
+                                let reader = rudb_native::Catalog::open(path)?.table(&table)?;
+                                let added = reader.table().rows();
+                                catalog.table_mut(&insert.name)?.commit_native(reader)?;
+                                // The rows are in the file already. What is left is a file the
+                                // sink may have written without an anchor, which the checkpoint
+                                // puts back, and which costs a new catalog and nothing else.
+                                self.unlogged();
+                                return QueryResult::changed(added);
+                            }
+                        }
                     }
                 }
                 let facts = context.facts();

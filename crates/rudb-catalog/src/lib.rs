@@ -33,7 +33,7 @@ pub use catalog::{
 };
 pub use held::Held;
 pub use index::Index;
-pub use keys::{Constraint, ForeignKey, Key};
+pub use keys::{Constraint, ForeignKey, Key, KeyLog};
 pub use mirror::{FileStamp, MIRROR_CATALOG};
 pub use name::{QualifiedName, same_name};
 pub use parent::{Parent, Placement};
