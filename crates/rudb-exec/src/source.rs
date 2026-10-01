@@ -554,6 +554,16 @@ impl Paying {
         seen >= WARMUP && self.kept.load(Ordering::Relaxed).saturating_mul(TIGHT) < seen
     }
 
+    /// The share of the rows put through the filter that came out, or a half before any did.
+    #[expect(clippy::cast_precision_loss, reason = "a count of rows is a share here")]
+    fn passing(&self) -> f64 {
+        let seen = self.seen.load(Ordering::Relaxed);
+        if seen == 0 {
+            return 0.5;
+        }
+        self.kept.load(Ordering::Relaxed) as f64 / seen as f64
+    }
+
     /// Records what one chunk put through the filter and what came out.
     fn saw(&self, rows: usize, kept: usize) {
         self.seen.fetch_add(rows, Ordering::Relaxed);
@@ -2061,6 +2071,7 @@ impl<'a> Scan<'a> {
         // keeps nearly every row stops being asked. It takes the place of the filter rather than
         // going in front of it, see `Found::domain`.
         let mut block = Vec::new();
+        let mut tests = Vec::new();
         for (sideways, paying) in handoffs() {
             if done.is_some_and(|done| Arc::ptr_eq(done, sideways)) {
                 continue;
@@ -2074,6 +2085,24 @@ impl<'a> Scan<'a> {
             let Some((at, domain)) = domain else { continue };
             if !paying.worth() {
                 continue;
+            }
+            let Ok(column) = chunk.column(at) else { continue };
+            tests.push((crate::sideways::repeated(column).mul_add(-0.85, 1.0), paying, at, domain));
+        }
+        // The test that costs least for each row it throws away goes first, so the dearer ones see
+        // fewer rows. A key that comes in runs is looked up once a run, see `Domain::kept`: in JOB
+        // 17f the people of `name` keep one row of `cast_info` in eight and its movies one in thirty,
+        // but the people are in runs and the movies are not, and testing the movies first looked up
+        // every row of the table.
+        if tests.len() > 1 {
+            let rank = |&(cost, paying, ..): &(f64, &Paying, usize, &Domain)| {
+                cost / (1.0 - paying.passing()).max(0.01)
+            };
+            tests.sort_by(|one, other| rank(one).total_cmp(&rank(other)));
+        }
+        for (_, paying, at, domain) in tests {
+            if chunk.is_empty() {
+                return Ok(());
             }
             let Ok(column) = chunk.column(at) else { continue };
             let rows = chunk.len();
