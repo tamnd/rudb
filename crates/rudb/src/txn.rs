@@ -141,7 +141,7 @@ impl Written {
         for chunk in new {
             let these = &rows[at..at + chunk.len()];
             at += chunk.len();
-            changes.push(Change::Update(runs(these), chunk.clone()));
+            changes.push(Change::Update(runs(these), vec![chunk.clone()]));
         }
     }
 

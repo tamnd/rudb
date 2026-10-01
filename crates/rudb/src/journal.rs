@@ -37,7 +37,7 @@ use rudb_txn::log::{
     Block, CommitSync, Kind, Lane, Options, Payload, SEGMENT_BYTES, SEGMENT_HEADER, replay,
     segments,
 };
-use rudb_vector::{Chunk, Data, Selection, StringColumn, Validity, Vector};
+use rudb_vector::{Chunk, Data, Selection, StringColumn, VECTOR_SIZE, Validity, Vector};
 
 /// The lane every record goes to, until there are more.
 const LANE: u8 = 0;
@@ -97,8 +97,9 @@ pub(crate) enum Change {
     Insert(Chunk),
     /// The rows in these runs of row numbers taken out.
     Delete(Vec<(u64, u64)>),
-    /// The rows in these runs given the rows of the chunk, in order.
-    Update(Vec<(u64, u64)>, Chunk),
+    /// The rows in these runs given the rows of the chunks, in order. More than one chunk when an
+    /// update wrote more rows than a chunk holds.
+    Update(Vec<(u64, u64)>, Vec<Chunk>),
 }
 
 impl Change {
@@ -137,6 +138,12 @@ impl Change {
                 }
             }
             Self::Update(runs, new) => {
+                // Where each new row is, by its place among them.
+                let places = new
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(at, chunk)| (0..chunk.len()).map(move |row| (at, row)))
+                    .collect::<Vec<_>>();
                 let mut rows = runs.iter().flat_map(|&(first, len)| first..first + len).peekable();
                 let mut offset = 0;
                 let mut next = 0;
@@ -156,7 +163,8 @@ impl Change {
                             .map(|row| chunk.value_at(row, column))
                             .collect::<Vec<_>>();
                         for (at, &row) in hits.iter().enumerate() {
-                            values[row] = new.value_at(next + at, column);
+                            let (chunk, place) = places[next + at];
+                            values[row] = new[chunk].value_at(place, column);
                         }
                         columns.push(Vector::from_values(field.ty.clone(), &values)?);
                     }
@@ -215,11 +223,21 @@ impl Replayed {
             _ => {
                 let mut at = 0;
                 let runs = get_runs(bytes, &mut at)?;
-                let rows = decode_rows(&bytes[at..], fields, self.version)?;
-                if runs.iter().map(|run| run.1).sum::<u64>() != rows.len() as u64 {
+                let (columns, rows) = decode_columns(&bytes[at..], fields, self.version)?;
+                if runs.iter().map(|run| run.1).sum::<u64>() != rows as u64 {
                     return Err(corrupt("an update record whose rows and row numbers differ"));
                 }
-                Ok(Change::Update(runs, rows))
+                // An update writes all its rows in one record, which can be more than a chunk.
+                let mut chunks = Vec::with_capacity(rows.div_ceil(VECTOR_SIZE));
+                for start in (0..rows).step_by(VECTOR_SIZE) {
+                    let len = VECTOR_SIZE.min(rows - start);
+                    let piece = columns
+                        .iter()
+                        .map(|column| column.slice(start, len))
+                        .collect::<Result<Vec<_>>>()?;
+                    chunks.push(Chunk::with_rows(piece, len)?);
+                }
+                Ok(Change::Update(runs, chunks))
             }
         }
     }
@@ -904,6 +922,12 @@ fn read_record(kind: Kind, payload: Payload) -> Result<Replayed> {
 /// A payload of layout 1 has every column a value at a time; one of layout 2 says how each column
 /// is laid out first.
 fn decode_rows(bytes: &[u8], fields: &[Field], version: u8) -> Result<Chunk> {
+    let (columns, rows) = decode_columns(bytes, fields, version)?;
+    Chunk::with_rows(columns, rows)
+}
+
+/// The columns of a payload's rows and how many rows there are, which may be more than a chunk.
+fn decode_columns(bytes: &[u8], fields: &[Field], version: u8) -> Result<(Vec<Vector>, usize)> {
     let mut at = 0;
     let width = u16::from_le_bytes(array(bytes, &mut at)?) as usize;
     let rows = u32::from_le_bytes(array(bytes, &mut at)?) as usize;
@@ -938,7 +962,7 @@ fn decode_rows(bytes: &[u8], fields: &[Field], version: u8) -> Result<Chunk> {
     if at != bytes.len() {
         return Err(corrupt("an insert record with bytes after its rows"));
     }
-    Chunk::new(columns)
+    Ok((columns, rows))
 }
 
 /// Whether values of `ty` go into a record and come back as themselves.
@@ -1440,7 +1464,7 @@ mod tests {
         let Change::Update(runs, rows) = replayed.change(&fields).expect("decodes") else {
             panic!("an update")
         };
-        assert_eq!((runs, rows.len()), (vec![(3, 4), (20, 1)], 5));
+        assert_eq!((runs, rows.iter().map(Chunk::len).sum::<usize>()), (vec![(3, 4), (20, 1)], 5));
         assert!(put_runs(&mut Vec::new(), &[4, 2]).is_none(), "row numbers that fall");
         let short = read_record(Kind::Update, {
             let mut update = header("main", "t").expect("a name");

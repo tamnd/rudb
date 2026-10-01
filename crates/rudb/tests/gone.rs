@@ -317,9 +317,19 @@ fn an_update_beside_a_file_is_replayed_and_rolled_back() {
     connection.execute("ROLLBACK").expect("rolls back");
     drop(connection);
     same(&file, &memory, "after the rollback");
+    both(&file, &memory, "DELETE FROM t WHERE k = 6");
     drop(file);
-    // The log has the update and the file does not, so this is replay putting it back.
+    // The log has the update and the file does not, so this is replay putting it back, beside the
+    // file the way the statements did, with only the columns the update set marked as set.
     let file = open(&path);
+    assert!(patched(&file) && masked(&file), "replay read the table into memory");
+    let set = file.with_catalog(|catalog| {
+        let name = catalog.resolve(&["t"]).expect("resolves");
+        let gone = catalog.table(&name).expect("the table is there").rows().gone().cloned();
+        let gone = gone.expect("rows gone");
+        (0..4).map(|column| gone.touched(column)).collect::<Vec<_>>()
+    });
+    assert_eq!(set, [false, false, true, true]);
     same(&file, &memory, "after the log was replayed");
     drop(file);
     remove(&path);
@@ -332,6 +342,23 @@ fn a_string_written_into_some_parts_groups_with_the_same_string_in_the_rest() {
     both(&file, &memory, "UPDATE t SET s = 'late' WHERE id < 1000");
     assert!(patched(&file), "the update read the table into memory");
     same(&file, &memory, "after an update of one part");
+    drop(file);
+    remove(&path);
+}
+
+#[test]
+fn an_update_of_more_rows_than_a_chunk_holds_is_replayed_after_a_crash() {
+    let (path, file, memory) = loaded("update-crash");
+    file.execute("SET checkpoint_threshold = '64GiB'").expect("sets");
+    // Twenty thousand rows in one record, more than a chunk holds, and a delete after them.
+    both(&file, &memory, "UPDATE t SET v = v + 1, s = 'late' WHERE id < 20000");
+    both(&file, &memory, "DELETE FROM t WHERE id % 1000 = 9");
+    same(&file, &memory, "before the crash");
+    // Gone without a checkpoint, the way a crash leaves it.
+    std::mem::forget(file);
+    let file = open(&path);
+    assert!(patched(&file) && masked(&file), "replay read the table into memory");
+    same(&file, &memory, "after the crash");
     drop(file);
     remove(&path);
 }
