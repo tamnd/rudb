@@ -2140,8 +2140,12 @@ impl Table {
             .collect::<Result<Vec<_>>>()?;
         let mut out = Vec::with_capacity(places.len());
         for place in &places {
-            let mut columns =
-                self.rows.read_rows(place.part, &all, &place.positions)?.loosened().into_columns();
+            // Sparse, because an update that changed a row in every part has a few rows of each.
+            let mut columns = self
+                .rows
+                .read_selected(place.part, &all, &place.positions)?
+                .loosened()
+                .into_columns();
             let picks = place.picks();
             for (new, &column) in laid.iter().zip(targets) {
                 columns[column] = new.gather(&picks)?;

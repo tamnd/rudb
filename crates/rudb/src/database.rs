@@ -2929,9 +2929,7 @@ fn split(chunks: Vec<Chunk>, delete: bool, wanted: bool, keeping: bool) -> Resul
     let mut scanned = 0;
     for chunk in chunks {
         let width = chunk.width().saturating_sub(1);
-        let hit = Selection::from_predicate(chunk.len(), |row| {
-            chunk.value_at(row, width) == Value::Boolean(true)
-        });
+        let hit = hits(&chunk, width)?;
         count += hit.len();
         flagged.extend(hit.iter().map(|row| (scanned + row) as u64));
         scanned += chunk.len();
@@ -2953,6 +2951,21 @@ fn split(chunks: Vec<Chunk>, delete: bool, wanted: bool, keeping: bool) -> Resul
         }
     }
     Ok((kept, changed, count, flagged, scanned))
+}
+
+/// The rows of `chunk` whose column `flag` is true, which is the source of every `UPDATE` and
+/// `DELETE` and so has as many rows as the table. The bytes of a flat column are read as they are,
+/// because a value made and dropped for each of them was most of what a narrow update cost.
+fn hits(chunk: &Chunk, flag: usize) -> Result<Selection> {
+    let flags = chunk.column(flag)?;
+    if let Some(Data::Bool(bytes)) = flags.data() {
+        return Ok(Selection::from_predicate(chunk.len(), |row| {
+            bytes[row] && !flags.is_null_at(row)
+        }));
+    }
+    Ok(Selection::from_predicate(chunk.len(), |row| {
+        chunk.value_at(row, flag) == Value::Boolean(true)
+    }))
 }
 
 /// What [`split`] hands back.
