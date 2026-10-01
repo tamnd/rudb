@@ -1213,13 +1213,8 @@ impl<'a> Binder<'a> {
         if written.having != NONE && crate::columns::has_star(ast, written.having) {
             return Err(Error::binder("STAR expression is not supported here"));
         }
-        self.clause = "SELECT clause";
-        self.unnest_here = true;
-        self.alias_clause(AliasClause::Select);
-        let (mut exprs, mut names) = self.bind_targets(ast, &targets, &input, &mut above)?;
-        self.unnest_here = false;
-        let visible = exprs.len();
-
+        // `HAVING` and then `QUALIFY` are bound before the select list, which is the pin's order and
+        // decides which of two mistakes is the one reported.
         let mut having = None;
         if written.having != NONE {
             self.clause = "HAVING clause";
@@ -1232,16 +1227,39 @@ impl<'a> Binder<'a> {
         }
 
         // `QUALIFY` filters the rows after the windows have run over them, so it is bound with the
-        // windows allowed and its filter goes in above them. The pin asks for a window somewhere in
-        // the block, since without one the clause is a `WHERE` or a `HAVING` written late.
+        // windows allowed, and its filter and the queries it wrote go in above them. A column it
+        // reads that is not grouped is reported after the select list's, as the pin does.
         let mut qualify = None;
+        let mut over_windows = Vec::new();
         if written.qualify != NONE {
+            if groups_everything(ast, &written)? {
+                return Err(Error::binder(
+                    "Combining QUALIFY with GROUP BY ALL is not supported yet",
+                ));
+            }
             self.clause = "QUALIFY clause";
             self.alias_clause(AliasClause::Qualify);
             let before = self.scalar_subqueries.len();
-            let predicate = self.bind_expr(ast, written.qualify, &input)?;
-            self.lift_over_aggregate(before, &mut above, &input)?;
+            qualify = Some(self.bind_expr(ast, written.qualify, &input)?);
+            if self.aggregation.is_some() {
+                self.lift_over_aggregate(before, &mut over_windows, &input)?;
+            } else {
+                over_windows = self.scalar_subqueries.split_off(before);
+            }
+        }
+
+        self.clause = "SELECT clause";
+        self.unnest_here = true;
+        self.alias_clause(AliasClause::Select);
+        let (mut exprs, mut names) = self.bind_targets(ast, &targets, &input, &mut above)?;
+        self.unnest_here = false;
+        let visible = exprs.len();
+        self.aliases = outer_aliases;
+
+        if let Some(predicate) = qualify {
+            self.clause = "QUALIFY clause";
             let predicate = self.over_aggregate(predicate, &input)?;
+            // Without a window the clause would be a `WHERE` or a `HAVING` written late.
             if self.windows.is_empty() {
                 return Err(Error::binder(
                     "at least one window function must appear in the SELECT column or QUALIFY clause",
@@ -1249,7 +1267,6 @@ impl<'a> Binder<'a> {
             }
             qualify = Some(self.as_boolean(predicate, "QUALIFY")?);
         }
-        self.aliases = outer_aliases;
 
         // The projection's index has to exist before the sort keys are built, because a key is a
         // reference to a projected column even when the expression it sorts on is not selected.
@@ -1319,6 +1336,11 @@ impl<'a> Binder<'a> {
                 frame: run.frame,
                 expressions,
             });
+        }
+        if !over_windows.is_empty() {
+            let below = std::mem::replace(&mut self.scalar_subqueries, over_windows);
+            node = self.attach_scalar_subqueries(node);
+            self.scalar_subqueries = below;
         }
         if let Some(predicate) = qualify {
             node = self.add_node(Node::Filter { input: node, predicate });
