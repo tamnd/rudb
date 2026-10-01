@@ -1920,6 +1920,11 @@ impl Pending {
                         let (name, chunks) = self.appends.swap_remove(at);
                         catalog.table_mut(&name)?.append_all(chunks, workers)?;
                     }
+                    // A table still in its file takes the change beside the file, the way the
+                    // statement did, rather than read every row into memory to take a few.
+                    if catalog.table(name)?.takes_rows() {
+                        return beside(catalog.table_mut(name)?, change);
+                    }
                     let rows = catalog.table(name)?.rows();
                     let all = (0..fields.len()).collect::<Vec<_>>();
                     let chunks = (0..rows.chunk_count())
@@ -1944,6 +1949,71 @@ impl Pending {
         }
         Ok(())
     }
+}
+
+/// Puts a delete or an update into a table that is still in its file, marking the rows gone or
+/// writing the new ones beside the file, see [`rudb_catalog::Table::takes_rows`].
+///
+/// The record of an update holds every column of the rows it wrote, and not which of them it
+/// set, so those are the columns whose values differ from the rows there now. A column it did not
+/// set keeps what the file says about it, which is what lets a filter on it still skip parts.
+fn beside(table: &mut rudb_catalog::Table, change: Change) -> Result<()> {
+    let numbers = |runs: &[(u64, u64)]| {
+        runs.iter().flat_map(|&(first, len)| first..first + len).collect::<Vec<_>>()
+    };
+    match change {
+        Change::Delete(runs) => table.take_rows(&numbers(&runs)),
+        Change::Update(runs, new) => {
+            let numbers = numbers(&runs);
+            let width = table.columns().len();
+            // Where each new row is, by its place among them.
+            let places = new
+                .iter()
+                .enumerate()
+                .flat_map(|(at, chunk)| (0..chunk.len()).map(move |row| (at, row)))
+                .collect::<Vec<_>>();
+            if places.len() != numbers.len() || new.iter().any(|chunk| chunk.width() != width) {
+                return Err(Error::internal("an update record's rows differ from its row numbers"));
+            }
+            let old = table.patched_rows(&numbers, &[], &[])?;
+            let mut set = vec![false; width];
+            let mut next = 0;
+            for chunk in &old {
+                for (column, set) in set.iter_mut().enumerate().filter(|(_, set)| !**set) {
+                    *set = (0..chunk.len()).any(|row| {
+                        let (at, place) = places[next + row];
+                        !same(&chunk.value_at(row, column), &new[at].value_at(place, column))
+                    });
+                }
+                next += chunk.len();
+            }
+            let targets = (0..width).filter(|&column| set[column]).collect::<Vec<_>>();
+            if targets.is_empty() {
+                return Ok(());
+            }
+            table.patch_rows(&numbers, &targets, &new)
+        }
+        Change::Insert(_) => Err(Error::internal("an insert taken beside a file")),
+    }
+}
+
+/// Whether two values are the same value and not only equal, so `-0.0` is not `0.0`. A value
+/// that holds a float somewhere inside it is compared by how it prints, which tells those apart.
+fn same(one: &Value, two: &Value) -> bool {
+    one == two
+        && (matches!(
+            one,
+            Value::Null
+                | Value::Boolean(_)
+                | Value::TinyInt(_)
+                | Value::SmallInt(_)
+                | Value::Integer(_)
+                | Value::BigInt(_)
+                | Value::HugeInt(_)
+                | Value::Varchar(_)
+                | Value::Date(_)
+                | Value::Timestamp(_)
+        ) || format!("{one:?}") == format!("{two:?}"))
 }
 
 /// Replays `span`, row changes with no statement between them, so that every table keeps the
