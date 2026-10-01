@@ -93,8 +93,9 @@ pub(crate) struct Replayed {
 /// What a replayed record does to its table.
 #[derive(Debug)]
 pub(crate) enum Change {
-    /// Rows appended at the end.
-    Insert(Chunk),
+    /// Rows appended at the end. More than one chunk when an insert logged more rows than a chunk
+    /// holds.
+    Insert(Vec<Chunk>),
     /// The rows in these runs of row numbers taken out.
     Delete(Vec<(u64, u64)>),
     /// The rows in these runs given the rows of the chunks, in order. More than one chunk when an
@@ -111,7 +112,7 @@ impl Change {
     /// If a row number is past the last row, or new values do not fit their columns.
     pub(crate) fn apply(self, fields: &[Field], chunks: &mut Vec<Chunk>) -> Result<()> {
         match self {
-            Self::Insert(chunk) => chunks.push(chunk),
+            Self::Insert(new) => chunks.extend(new),
             Self::Delete(runs) => {
                 let mut rows = runs.iter().flat_map(|&(first, len)| first..first + len).peekable();
                 let mut offset = 0;
@@ -211,7 +212,7 @@ impl Replayed {
     pub(crate) fn change(&self, fields: &[Field]) -> Result<Change> {
         let bytes = &self.payload[self.rest_at..];
         match self.kind {
-            Kind::Insert => Ok(Change::Insert(decode_rows(bytes, fields, self.version)?)),
+            Kind::Insert => Ok(Change::Insert(decode_rows(bytes, fields, self.version)?.1)),
             Kind::Delete => {
                 let mut at = 0;
                 let runs = get_runs(bytes, &mut at)?;
@@ -223,19 +224,9 @@ impl Replayed {
             _ => {
                 let mut at = 0;
                 let runs = get_runs(bytes, &mut at)?;
-                let (columns, rows) = decode_columns(&bytes[at..], fields, self.version)?;
+                let (rows, chunks) = decode_rows(&bytes[at..], fields, self.version)?;
                 if runs.iter().map(|run| run.1).sum::<u64>() != rows as u64 {
                     return Err(corrupt("an update record whose rows and row numbers differ"));
-                }
-                // An update writes all its rows in one record, which can be more than a chunk.
-                let mut chunks = Vec::with_capacity(rows.div_ceil(VECTOR_SIZE));
-                for start in (0..rows).step_by(VECTOR_SIZE) {
-                    let len = VECTOR_SIZE.min(rows - start);
-                    let piece = columns
-                        .iter()
-                        .map(|column| column.slice(start, len))
-                        .collect::<Result<Vec<_>>>()?;
-                    chunks.push(Chunk::with_rows(piece, len)?);
                 }
                 Ok(Change::Update(runs, chunks))
             }
@@ -917,13 +908,25 @@ fn read_record(kind: Kind, payload: Payload) -> Result<Replayed> {
     Ok(Replayed { kind, schema, table, payload, rest_at: at, version })
 }
 
-/// The rows of an Insert payload, from its column count on, as a chunk of `fields`.
+/// The rows of a payload, from its column count on, as chunks of `fields`, and how many there
+/// are. One record holds all the rows of a statement, which can be more than a chunk, so they are
+/// cut at the chunk size.
 ///
 /// A payload of layout 1 has every column a value at a time; one of layout 2 says how each column
 /// is laid out first.
-fn decode_rows(bytes: &[u8], fields: &[Field], version: u8) -> Result<Chunk> {
+fn decode_rows(bytes: &[u8], fields: &[Field], version: u8) -> Result<(usize, Vec<Chunk>)> {
     let (columns, rows) = decode_columns(bytes, fields, version)?;
-    Chunk::with_rows(columns, rows)
+    if rows <= VECTOR_SIZE {
+        return Ok((rows, vec![Chunk::with_rows(columns, rows)?]));
+    }
+    let mut chunks = Vec::with_capacity(rows.div_ceil(VECTOR_SIZE));
+    for start in (0..rows).step_by(VECTOR_SIZE) {
+        let len = VECTOR_SIZE.min(rows - start);
+        let piece =
+            columns.iter().map(|column| column.slice(start, len)).collect::<Result<Vec<_>>>()?;
+        chunks.push(Chunk::with_rows(piece, len)?);
+    }
+    Ok((rows, chunks))
 }
 
 /// The columns of a payload's rows and how many rows there are, which may be more than a chunk.
@@ -1365,6 +1368,7 @@ mod tests {
         let Change::Insert(back) = replayed.change(&fields).expect("decodes") else {
             panic!("an insert")
         };
+        let [back] = <[Chunk; 1]>::try_from(back).expect("one chunk");
         assert_eq!(back.len(), 4);
         for row in 0..4 {
             for col in 0..fields.len() {
@@ -1379,7 +1383,33 @@ mod tests {
         let Change::Insert(back) = replayed.change(fields).expect("decodes") else {
             panic!("an insert")
         };
-        back
+        <[Chunk; 1]>::try_from(back).expect("one chunk").into_iter().next().expect("one")
+    }
+
+    #[test]
+    fn an_insert_of_more_rows_than_a_chunk_holds_comes_back_cut_into_chunks() {
+        let fields = vec![Field::new("n", LogicalType::BigInt)];
+        let chunks = (0..3_i64)
+            .map(|at| {
+                let values =
+                    (0..8_000).map(|row| Value::BigInt(at * 8_000 + row)).collect::<Vec<_>>();
+                let column = Vector::from_values(LogicalType::BigInt, &values).expect("a column");
+                Chunk::new(vec![column]).expect("a chunk")
+            })
+            .collect::<Vec<_>>();
+        let payload = insert(&fields, &chunks).expect("carried");
+        let replayed = read_record(Kind::Insert, payload.into()).expect("reads");
+        let Change::Insert(back) = replayed.change(&fields).expect("decodes") else {
+            panic!("an insert")
+        };
+        assert_eq!(back.iter().map(Chunk::len).collect::<Vec<_>>(), [8_192, 8_192, 7_616]);
+        let mut next = 0;
+        for chunk in &back {
+            for row in 0..chunk.len() {
+                assert_eq!(chunk.value_at(row, 0), Value::BigInt(next));
+                next += 1;
+            }
+        }
     }
 
     #[test]

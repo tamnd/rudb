@@ -1904,7 +1904,7 @@ impl Pending {
         let at = match self.held.iter().position(|(held, _)| held == name) {
             Some(at) => at,
             None => match change {
-                Change::Insert(chunk) => {
+                Change::Insert(chunks) => {
                     let at = match self.appends.iter().position(|(pending, _)| pending == name) {
                         Some(at) => at,
                         None => {
@@ -1912,7 +1912,7 @@ impl Pending {
                             self.appends.len() - 1
                         }
                     };
-                    self.appends[at].1.push(chunk);
+                    self.appends[at].1.extend(chunks);
                     if self.appends[at].1.len() >= APPEND_BATCH {
                         let (name, chunks) = self.appends.swap_remove(at);
                         catalog.table_mut(&name)?.append_all(chunks, workers)?;

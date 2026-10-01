@@ -83,6 +83,32 @@ fn inserted_rows_survive_a_crash_before_any_checkpoint_and_replay_once() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// One statement logs all its rows in one record, which can be more rows than a chunk holds, and
+/// the open that replays it cuts them back into chunks.
+#[test]
+fn an_insert_of_more_rows_than_a_chunk_holds_is_replayed_after_a_crash() {
+    let path = path("wide-insert");
+    let db = open(&path);
+    db.execute("CREATE TABLE t AS SELECT range AS id, 'x' || range AS s FROM range(10)")
+        .expect("creates");
+    db.execute("INSERT INTO t SELECT range + 10, 'y' || range FROM range(50000)").expect("inserts");
+    assert!(segments(&path) > 0, "the insert went to the log");
+    crash(db);
+
+    let db = open(&path);
+    let want = vec![vec![
+        Value::BigInt(50_010),
+        Value::HugeInt((0..50_010).sum()),
+        Value::Varchar("y49999".into()),
+    ]];
+    assert_eq!(
+        rows(&db, "SELECT count(*), sum(id), max(s) FILTER (WHERE id = 50009) FROM t"),
+        want
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Half a stripe of rows or more in one transaction is a load. The commit appends it to the file
 /// rather than logging it, so it is written once, and it is still there after a crash.
 #[test]
