@@ -352,6 +352,8 @@ const PARAMETER_NAMES: &[(&str, &[&str])] = &[
     ("error", &["message"]),
     ("getvariable", &["variable_name"]),
     ("in_search_path", &["database_name", "schema_name"]),
+    ("make_timestamp_ms", &["nanos"]),
+    ("normalized_interval", &["interval"]),
     ("regexp_split_to_array", &["string", "regex"]),
     ("regexp_split_to_array", &["string", "regex", "options"]),
     ("split", &["string", "separator"]),
@@ -362,6 +364,7 @@ const PARAMETER_NAMES: &[(&str, &[&str])] = &[
     ("string_split_regex", &["string", "regex"]),
     ("string_split_regex", &["string", "regex", "options"]),
     ("string_to_array", &["string", "separator"]),
+    ("to_timestamp", &["sec"]),
 ];
 
 #[cfg(test)]

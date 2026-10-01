@@ -1017,6 +1017,38 @@ const TABLE: &[Entry] = &[
         shape: Shape::Exact(Fixed::BigInt, Fixed::Timestamp),
         numeric_only: false,
     },
+    Entry {
+        name: "make_timestamp_ms",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::BigInt, Fixed::Timestamp),
+        numeric_only: false,
+    },
+    // An instant out of the fields of a wall clock in the session zone or a zone named last, or out
+    // of a count of microseconds since 1970.
+    Entry {
+        name: "make_timestamptz",
+        kind: FunctionKind::Scalar,
+        arity: Arity::one_of(&[1, 6, 7]),
+        shape: Shape::Exact(Fixed::BigInt, Fixed::TimestampTz),
+        numeric_only: false,
+    },
+    // An instant out of a count of seconds since 1970, which PostgreSQL spells this way.
+    Entry {
+        name: "to_timestamp",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Double, Fixed::TimestampTz),
+        numeric_only: false,
+    },
+    // An interval with its microseconds carried into days and its days into months.
+    Entry {
+        name: "normalized_interval",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Interval, Fixed::Interval),
+        numeric_only: false,
+    },
     // A part counted between two moments, as the boundaries crossed or as the whole parts that fit.
     // The aliases are entries of their own because upstream names the one written in its errors,
     // and `date_sub` has one overload fewer than `date_diff` to list.
@@ -2564,12 +2596,32 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         ("make_timestamp_ns", [count]) if counted(count) || *count == Null => {
             Some((vec![BigInt], TimestampNs))
         }
-        ("make_timestamp", [fields @ .., seconds])
+        ("make_timestamp_ms", [count]) if counted(count) || *count == Null => {
+            Some((vec![BigInt], Timestamp))
+        }
+        ("make_timestamptz", [count]) if counted(count) || *count == Null => {
+            Some((vec![BigInt], TimestampTz))
+        }
+        ("make_timestamptz", [fields @ .., seconds, zone])
+            if fields.len() == 5
+                && fields.iter().all(|ty| counted(ty) || *ty == Null)
+                && number(seconds)
+                && matches!(zone, LogicalType::Varchar | Null) =>
+        {
+            Some((
+                vec![BigInt, BigInt, BigInt, BigInt, BigInt, Double, LogicalType::Varchar],
+                TimestampTz,
+            ))
+        }
+        ("to_timestamp", [seconds]) if number(seconds) => Some((vec![Double], TimestampTz)),
+        ("normalized_interval", [Interval | Null]) => Some((vec![Interval], Interval)),
+        ("make_timestamp" | "make_timestamptz", [fields @ .., seconds])
             if fields.len() == 5
                 && fields.iter().all(|ty| counted(ty) || *ty == Null)
                 && number(seconds) =>
         {
-            Some((vec![BigInt, BigInt, BigInt, BigInt, BigInt, Double], Timestamp))
+            let returns = if name == "make_timestamp" { Timestamp } else { TimestampTz };
+            Some((vec![BigInt, BigInt, BigInt, BigInt, BigInt, Double], returns))
         }
         // Two moments of one kind, where a null or a string takes the type of the other and a date
         // against a timestamp is counted as two timestamps. Two nulls are ambiguous upstream.
@@ -3197,6 +3249,10 @@ const READ_OFF: &[&str] = &[
     "make_time",
     "make_timestamp",
     "make_timestamp_ns",
+    "make_timestamp_ms",
+    "make_timestamptz",
+    "to_timestamp",
+    "normalized_interval",
     "timezone",
 ];
 
@@ -3229,6 +3285,17 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("make_timestamp_ns", &["make_timestamp_ns(col0 BIGINT) -> TIMESTAMP_NS"]),
+    ("make_timestamp_ms", &["make_timestamp_ms(col0 BIGINT) -> TIMESTAMP"]),
+    (
+        "make_timestamptz",
+        &[
+            "make_timestamptz(col0 BIGINT, col1 BIGINT, col2 BIGINT, col3 BIGINT, col4 BIGINT, col5 DOUBLE) -> TIMESTAMP WITH TIME ZONE",
+            "make_timestamptz(col0 BIGINT, col1 BIGINT, col2 BIGINT, col3 BIGINT, col4 BIGINT, col5 DOUBLE, col6 VARCHAR) -> TIMESTAMP WITH TIME ZONE",
+            "make_timestamptz(col0 BIGINT) -> TIMESTAMP WITH TIME ZONE",
+        ],
+    ),
+    ("to_timestamp", &["to_timestamp(col0 DOUBLE) -> TIMESTAMP WITH TIME ZONE"]),
+    ("normalized_interval", &["normalized_interval(col0 INTERVAL) -> INTERVAL"]),
     (
         "timezone",
         &[
@@ -5338,6 +5405,10 @@ mod tests {
                     {
                         arguments[1] = LogicalType::Date;
                         arguments[2] = LogicalType::Date;
+                    }
+                    _ if entry.name == "make_timestamptz" && count == 7 => {
+                        arguments[5] = LogicalType::Double;
+                        arguments[6] = LogicalType::Varchar;
                     }
                     _ if entry.name == "timezone" && count == 2 => {
                         arguments[1] = LogicalType::Timestamp;

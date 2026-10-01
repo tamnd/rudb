@@ -44,7 +44,6 @@ pub const fn micros(key: i64) -> i64 {
 /// The offset a key was read at, in seconds east of UTC.
 #[must_use]
 pub const fn offset(key: i64) -> i32 {
-    #[expect(clippy::cast_possible_truncation, reason = "the mask keeps 24 bits")]
     let biased = (key & OFFSET_MASK) as i32;
     MAX_OFFSET - biased
 }

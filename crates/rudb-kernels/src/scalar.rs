@@ -4391,8 +4391,13 @@ pub fn call_values(
         ("epoch_ms", [when]) if *returns == LogicalType::BigInt => datetime::read_off(name, when),
         ("strftime", [left, right]) => crate::strftime::value(left, right),
         ("time_bucket", [_, _] | [_, _, _]) => crate::timebucket::value(args),
-        ("make_time" | "make_timestamp" | "make_timestamp_ns", _) => {
-            crate::maketime::value(name, args)
+        (
+            "make_time" | "make_timestamp" | "make_timestamp_ns" | "make_timestamp_ms"
+            | "make_timestamptz" | "to_timestamp",
+            _,
+        ) => crate::maketime::value(name, args),
+        ("normalized_interval", [Value::Interval { months, days, micros }]) => {
+            Ok(hash::normalized_interval(*months, *days, *micros))
         }
         ("date_diff" | "datediff" | "date_sub" | "datesub", [part, start, end]) => {
             crate::datediff::value(name, part, start, end)
