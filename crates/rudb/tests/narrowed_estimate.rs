@@ -10,8 +10,8 @@ use rudb::Database;
 
 #[test]
 fn an_equality_on_a_narrowed_scan_is_estimated_from_the_synopsis() {
-    let path = std::env::temp_dir()
-        .join(format!("rudb-narrowed-estimate-{}.rudb", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("rudb-narrowed-estimate-{}.rudb", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let name = path.to_str().expect("a UTF-8 temporary path");
     {
