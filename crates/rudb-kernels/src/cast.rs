@@ -110,6 +110,9 @@ pub fn cast_in_time_zone(
     if input.is_empty() {
         return Ok(Vector::constant(target.clone(), Value::Null, 0));
     }
+    if let Some(vector) = crate::json::cast_vector(input, target, try_cast, time_zone)? {
+        return Ok(vector);
+    }
     if input.form() == Form::Constant {
         let single = cast_value_in_time_zone(&input.try_value_at(0)?, target, try_cast, time_zone)?;
         return Ok(Vector::constant(target.clone(), single, input.len()));
@@ -860,6 +863,10 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
     }
     if &value.logical_type() == target {
         return Ok(value.clone());
+    }
+    if matches!(target, LogicalType::Json) {
+        let from = value.logical_type();
+        return crate::json::cast_to_json(value, &from, try_cast, None);
     }
     if let (LogicalType::List(wanted), Value::List { values, .. }) = (target, value) {
         return to_list(values, wanted, try_cast);

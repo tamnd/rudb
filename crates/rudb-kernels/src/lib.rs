@@ -77,6 +77,7 @@ mod graphemes;
 mod hash;
 mod hashing;
 mod histogram;
+pub mod json;
 mod lists;
 pub mod logic;
 mod lttb;

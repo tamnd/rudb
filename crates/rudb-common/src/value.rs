@@ -380,13 +380,17 @@ impl fmt::Display for Value {
             Self::TimestampMs(v) => write_coarse(f, *v, 1_000),
             Self::TimestampNs(v) => write_nanos(f, *v),
             Self::Interval { months, days, micros } => write_interval(f, *months, *days, *micros),
-            Self::List { values, .. } => {
+            // A `JSON` element is written as the document it is, with no quotes round it.
+            Self::List { element, values } => {
                 f.write_str("[")?;
                 for (index, value) in values.iter().enumerate() {
                     if index > 0 {
                         f.write_str(", ")?;
                     }
-                    write_element(f, value)?;
+                    match (element, value) {
+                        (LogicalType::Json, Self::Varchar(text)) => f.write_str(text)?,
+                        _ => write_element(f, value)?,
+                    }
                 }
                 f.write_str("]")
             }

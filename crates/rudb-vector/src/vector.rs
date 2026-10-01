@@ -5145,9 +5145,11 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
         LogicalType::Decimal { width, scale } => {
             signed().map(|unscaled| Value::Decimal { unscaled, width: *width, scale: *scale })
         }
-        LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit | LogicalType::Type => {
-            data.bytes_at(index).map(|bytes| bytes_as(ty, bytes))
-        }
+        LogicalType::Varchar
+        | LogicalType::Blob
+        | LogicalType::Bit
+        | LogicalType::Type
+        | LogicalType::Json => data.bytes_at(index).map(|bytes| bytes_as(ty, bytes)),
         LogicalType::Enum(labels) => unsigned()
             .and_then(|code| labels.get(usize::try_from(code).ok()?))
             .map(|label| Value::Varchar(label.clone())),
@@ -5203,7 +5205,7 @@ fn fields_of(ty: &LogicalType) -> &[Field] {
 /// something else in it is a bug somewhere earlier that a read should not turn into a crash.
 fn bytes_as(ty: &LogicalType, bytes: &[u8]) -> Value {
     match ty {
-        LogicalType::Varchar | LogicalType::Type => {
+        LogicalType::Varchar | LogicalType::Type | LogicalType::Json => {
             std::str::from_utf8(bytes).map_or(Value::Null, |text| Value::Varchar(text.to_owned()))
         }
         LogicalType::Blob => Value::Blob(bytes.to_vec()),

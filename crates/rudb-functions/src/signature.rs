@@ -1202,6 +1202,93 @@ const TABLE: &[Entry] = &[
         shape: Shape::LeadingFixedTo(2, Fixed::Varchar, Fixed::VarcharList),
         numeric_only: false,
     },
+    // The `JSON` functions. A document comes in as a string or a `JSON`, and the overloads differ
+    // in what a list of paths answers, so the types are decided in `jsoned` and the rows that
+    // `duckdb_functions()` lists are read off their candidates.
+    Entry {
+        name: "json",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_valid",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_type",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(1, 2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_array_length",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(1, 2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_keys",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(1, 2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_extract",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_extract_path",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_extract_string",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_extract_path_text",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "->>",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_value",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_exists",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
     // Subscripting. A bracket is one of these two calls by the time the transformer is done with it,
     // `x[2]` being `array_extract(x, 2)` and `x[1:2]` being `array_slice(x, 1, 2)`, which is what
     // DuckDB's own transformer writes as well. Both take a string or a list and give back a piece of
@@ -1748,12 +1835,14 @@ pub fn part_type(spelling: &str) -> LogicalType {
 pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     // An `ENUM` goes wherever a string does, which is how `upper(mood)` binds on the pin. It is
     // tried as itself first so that a function that takes anything keeps the enum, and the failure
-    // that is reported is the one about the types that were written.
+    // that is reported is the one about the types that were written. A `JSON` is text the same way,
+    // which is how `upper(doc)` answers a `VARCHAR`.
+    let texty = |ty: &LogicalType| ty.labels().is_some() || *ty == LogicalType::Json;
     match resolved(name, arguments) {
-        Err(error) if arguments.iter().any(|ty| ty.labels().is_some()) => {
+        Err(error) if arguments.iter().any(texty) => {
             let texts: Vec<LogicalType> = arguments
                 .iter()
-                .map(|ty| if ty.labels().is_some() { LogicalType::Varchar } else { ty.clone() })
+                .map(|ty| if texty(ty) { LogicalType::Varchar } else { ty.clone() })
                 .collect();
             resolved(name, &texts).map_err(|_| error)
         }
@@ -1774,6 +1863,11 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         return resolve("list_contains", arguments);
     }
     if let Some((cast_to, returns)) = temporal(entry.name, arguments) {
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
+    if JSON_NAMES.contains(&entry.name) {
+        let (cast_to, returns) =
+            jsoned(entry.name, arguments).ok_or_else(|| no_match(entry.name, arguments))?;
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
     }
     if entry.name == "regexp_extract_all" {
@@ -3009,7 +3103,7 @@ fn no_match_spelled(name: &str, types: &str) -> Error {
     let mut message = format!(
         "No function matches the given name and argument types '{name}({types})'. You might need to add explicit type casts."
     );
-    let mut known = CANDIDATES.iter().chain(SETTLED);
+    let mut known = CANDIDATES.iter().chain(SETTLED).chain(JSONED);
     if let Some((_, overloads)) = known.find(|(entry, _)| *entry == name) {
         message.push_str("\n\tCandidate functions:");
         for overload in *overloads {
@@ -3042,6 +3136,180 @@ pub fn named_mismatch(name: &str, spelled: &[String], ambiguous: bool) -> Error 
     Error::binder(format!(
         "Could not choose a best candidate function for the function call \"{name}({arguments})\". In order to select one, please add explicit type casts."
     ))
+}
+
+/// The overloads of the `JSON` functions, in the pin's order. Each takes its document as a string or
+/// as a `JSON`, and the candidate list is also where `duckdb_functions()` reads their rows from,
+/// since the overloads differ in their return types in a way no [`Shape`] says.
+const JSONED: &[(&str, &[&str])] = &[
+    ("json_valid", &["json_valid(col0 VARCHAR) -> BOOLEAN", "json_valid(col0 JSON) -> BOOLEAN"]),
+    (
+        "json_type",
+        &[
+            "json_type(col0 VARCHAR) -> VARCHAR",
+            "json_type(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+            "json_type(col0 VARCHAR, col1 VARCHAR[]) -> VARCHAR[]",
+            "json_type(col0 JSON) -> VARCHAR",
+            "json_type(col0 JSON, col1 VARCHAR) -> VARCHAR",
+            "json_type(col0 JSON, col1 VARCHAR[]) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "json_array_length",
+        &[
+            "json_array_length(col0 VARCHAR) -> UBIGINT",
+            "json_array_length(\"json\" VARCHAR, path VARCHAR) -> UBIGINT",
+            "json_array_length(\"json\" VARCHAR, path VARCHAR[]) -> UBIGINT[]",
+            "json_array_length(col0 JSON) -> UBIGINT",
+            "json_array_length(\"json\" JSON, path VARCHAR) -> UBIGINT",
+            "json_array_length(\"json\" JSON, path VARCHAR[]) -> UBIGINT[]",
+        ],
+    ),
+    (
+        "json_keys",
+        &[
+            "json_keys(col0 VARCHAR) -> VARCHAR[]",
+            "json_keys(\"json\" VARCHAR, path VARCHAR) -> VARCHAR[]",
+            "json_keys(\"json\" VARCHAR, path VARCHAR[]) -> VARCHAR[][]",
+            "json_keys(col0 JSON) -> VARCHAR[]",
+            "json_keys(\"json\" JSON, path VARCHAR) -> VARCHAR[]",
+            "json_keys(\"json\" JSON, path VARCHAR[]) -> VARCHAR[][]",
+        ],
+    ),
+    (
+        "json_extract",
+        &[
+            "json_extract(col0 VARCHAR, col1 BIGINT) -> JSON",
+            "json_extract(col0 VARCHAR, col1 VARCHAR) -> JSON",
+            "json_extract(col0 VARCHAR, col1 VARCHAR[]) -> JSON[]",
+            "json_extract(col0 JSON, col1 BIGINT) -> JSON",
+            "json_extract(col0 JSON, col1 VARCHAR) -> JSON",
+            "json_extract(col0 JSON, col1 VARCHAR[]) -> JSON[]",
+        ],
+    ),
+    (
+        "json_extract_path",
+        &[
+            "json_extract_path(col0 VARCHAR, col1 BIGINT) -> JSON",
+            "json_extract_path(col0 VARCHAR, col1 VARCHAR) -> JSON",
+            "json_extract_path(col0 VARCHAR, col1 VARCHAR[]) -> JSON[]",
+            "json_extract_path(col0 JSON, col1 BIGINT) -> JSON",
+            "json_extract_path(col0 JSON, col1 VARCHAR) -> JSON",
+            "json_extract_path(col0 JSON, col1 VARCHAR[]) -> JSON[]",
+        ],
+    ),
+    (
+        "json_extract_string",
+        &[
+            "json_extract_string(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+            "json_extract_string(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+            "json_extract_string(col0 VARCHAR, col1 VARCHAR[]) -> VARCHAR[]",
+            "json_extract_string(col0 JSON, col1 BIGINT) -> VARCHAR",
+            "json_extract_string(col0 JSON, col1 VARCHAR) -> VARCHAR",
+            "json_extract_string(col0 JSON, col1 VARCHAR[]) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "json_extract_path_text",
+        &[
+            "json_extract_path_text(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+            "json_extract_path_text(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+            "json_extract_path_text(col0 VARCHAR, col1 VARCHAR[]) -> VARCHAR[]",
+            "json_extract_path_text(col0 JSON, col1 BIGINT) -> VARCHAR",
+            "json_extract_path_text(col0 JSON, col1 VARCHAR) -> VARCHAR",
+            "json_extract_path_text(col0 JSON, col1 VARCHAR[]) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "->>",
+        &[
+            "\"->>\"(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+            "\"->>\"(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+            "\"->>\"(col0 VARCHAR, col1 VARCHAR[]) -> VARCHAR[]",
+            "\"->>\"(col0 JSON, col1 BIGINT) -> VARCHAR",
+            "\"->>\"(col0 JSON, col1 VARCHAR) -> VARCHAR",
+            "\"->>\"(col0 JSON, col1 VARCHAR[]) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "json_value",
+        &[
+            "json_value(col0 VARCHAR, col1 BIGINT) -> VARCHAR",
+            "json_value(col0 VARCHAR, col1 VARCHAR) -> VARCHAR",
+            "json_value(col0 VARCHAR, col1 VARCHAR[]) -> VARCHAR[]",
+            "json_value(col0 JSON, col1 BIGINT) -> VARCHAR",
+            "json_value(col0 JSON, col1 VARCHAR) -> VARCHAR",
+            "json_value(col0 JSON, col1 VARCHAR[]) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "json_exists",
+        &[
+            "json_exists(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN",
+            "json_exists(col0 VARCHAR, col1 VARCHAR[]) -> BOOLEAN[]",
+            "json_exists(col0 JSON, col1 VARCHAR) -> BOOLEAN",
+            "json_exists(col0 JSON, col1 VARCHAR[]) -> BOOLEAN[]",
+        ],
+    ),
+];
+
+/// The names [`JSONED`] has overloads for, which [`jsoned`] decides the types of.
+const JSON_NAMES: &[&str] = &[
+    "json",
+    "json_valid",
+    "json_type",
+    "json_array_length",
+    "json_keys",
+    "json_extract",
+    "json_extract_path",
+    "json_extract_string",
+    "json_extract_path_text",
+    "->>",
+    "json_value",
+    "json_exists",
+];
+
+/// The types a `JSON` function reads its arguments as, and the type of its answer.
+///
+/// The document is a string or a `JSON` as it was written, and anything else is cast to `JSON`,
+/// which writes it as one, as the pin does for `json_type(42)`. A path is a string, a list of strings,
+/// which answers a list with one answer for each path, or for the functions that pick a value out a
+/// whole number, which is an index into an array. Whether a constant path has a wildcard in it,
+/// which also answers a list, is read by the binder once it has the constant.
+fn jsoned(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{BigInt, Json, Null, Varchar};
+    let (one, takes_path, needs_path) = match name {
+        "json" | "json_valid" => {
+            (if name == "json" { Json } else { LogicalType::Boolean }, false, false)
+        }
+        "json_type" => (Varchar, true, false),
+        "json_array_length" => (LogicalType::UBigInt, true, false),
+        "json_keys" => (LogicalType::list(Varchar), true, false),
+        "json_extract" | "json_extract_path" => (Json, true, true),
+        "json_exists" => (LogicalType::Boolean, true, true),
+        _ => (Varchar, true, true),
+    };
+    let indexed = !matches!(name, "json_type" | "json_array_length" | "json_keys" | "json_exists");
+    let (document, path) = match arguments {
+        [document] if !needs_path => (document, None),
+        [document, path] if takes_path => (document, Some(path)),
+        _ => return None,
+    };
+    let document = match document {
+        Varchar | Json => document.clone(),
+        Null => Varchar,
+        _ => Json,
+    };
+    let Some(path) = path else { return Some((vec![document], one)) };
+    let (path, returns) = match path {
+        Varchar | Json | Null => (Varchar, one),
+        LogicalType::List(element) if matches!(**element, Varchar | Null) => {
+            (LogicalType::list(Varchar), LogicalType::list(one))
+        }
+        ty if indexed && ty.is_integer() => (BigInt, one),
+        _ => return None,
+    };
+    Some((vec![document, path], returns))
 }
 
 /// The types `regexp_extract_all` reads its arguments as, and the type of its answer.
@@ -4587,6 +4855,10 @@ pub struct FunctionRow {
 pub fn function_rows() -> Vec<FunctionRow> {
     let mut rows = Vec::new();
     for entry in TABLE {
+        if JSON_NAMES.contains(&entry.name) {
+            rows.extend(json_rows(entry));
+            continue;
+        }
         for count in entry.arity.every_count() {
             let (types, returns) = entry.shape.declared(count);
             rows.push(FunctionRow {
@@ -4611,6 +4883,35 @@ pub fn function_rows() -> Vec<FunctionRow> {
         rows.append(&mut aliased);
     }
     rows
+}
+
+/// The rows of a `JSON` function, read off its candidates, and none for `json`, which the pin has
+/// as a macro rather than a function.
+fn json_rows(entry: &Entry) -> Vec<FunctionRow> {
+    let Some((_, overloads)) = JSONED.iter().find(|(name, _)| *name == entry.name) else {
+        return Vec::new();
+    };
+    overloads
+        .iter()
+        .filter_map(|overload| {
+            let (call, returns) = overload.split_once(" -> ")?;
+            let open = call.find("(col0").or_else(|| call.find("(\"json\""))?;
+            let inside = &call[open + 1..call.len() - 1];
+            let types = inside
+                .split(", ")
+                .filter_map(|argument| argument.split_once(' '))
+                .map(|(_, ty)| ty)
+                .collect();
+            Some(FunctionRow {
+                name: entry.name,
+                kind: entry.kind,
+                alias_of: None,
+                types,
+                returns,
+                varargs: None,
+            })
+        })
+        .collect()
 }
 
 impl Arity {
