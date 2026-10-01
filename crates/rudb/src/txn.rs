@@ -125,7 +125,7 @@ impl Written {
             origin.extend(std::iter::repeat_n(u64::MAX, added));
         }
         if let Some(changes) = self.changes.as_mut() {
-            changes.extend(chunks.iter().cloned().map(Change::Insert));
+            changes.extend(chunks.iter().map(|chunk| Change::Insert(vec![chunk.clone()])));
         }
     }
 
@@ -497,9 +497,10 @@ fn rebase(
         let chunks = changes
             .into_iter()
             .filter_map(|change| match change {
-                Change::Insert(chunk) => Some(chunk),
+                Change::Insert(chunks) => Some(chunks),
                 _ => None,
             })
+            .flatten()
             .collect::<Vec<_>>();
         return committed.table_mut(name)?.append_committing(chunks, workers).map_err(|error| {
             if error.code() == rudb_common::ErrorCode::Constraint {
