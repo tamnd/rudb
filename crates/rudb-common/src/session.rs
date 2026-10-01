@@ -337,6 +337,16 @@ impl SessionTimeZone {
         self.listed_offset(self.listed(micros.div_euclid(1_000_000)))
     }
 
+    /// The UTC offset in seconds right now, which is the offset the pin puts on a time of day that
+    /// came without one, since a time of day has no date to look an offset up at.
+    #[must_use]
+    pub fn offset_seconds_now(self) -> i32 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX));
+        self.offset_seconds_at(now)
+    }
+
     /// The wall clock this zone reads at an instant, both as Unix microseconds, or `None` when the
     /// reading is past the end of the `i64`.
     #[must_use]

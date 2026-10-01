@@ -71,7 +71,8 @@ pub enum Value {
     Date(i32),
     /// `TIME`, microseconds since midnight.
     Time(i64),
-    /// `TIME WITH TIME ZONE`, microseconds since midnight UTC.
+    /// `TIME WITH TIME ZONE`, a time of day and the offset it was read at, packed into the pin's
+    /// sort key by [`crate::time_tz::pack`].
     ///
     /// An arm of its own rather than a [`Value::Time`] under a type that says the zone, because the
     /// plan holds a constant's type and its value in two places and checks that the two agree, and
@@ -362,12 +363,11 @@ impl fmt::Display for Value {
             Self::Uuid(v) => crate::uuid::write(f, *v),
             Self::Date(v) => write_date(f, *v),
             Self::Time(v) => write_time(f, *v),
-            // The unzoned rendering and then the offset, which is what the pin prints and is
-            // `+00` until there is a session time zone to print something else. The offset is not
-            // optional there: a zoned value always ends in one.
+            // The time as it was read and then the offset it was read at, which the session zone
+            // does not change. The offset is not optional there: a zoned time always ends in one.
             Self::TimeTz(v) => {
-                write_time(f, *v)?;
-                f.write_str(UTC)
+                write_time(f, crate::time_tz::micros(*v))?;
+                f.write_str(&offset_text(crate::time_tz::offset(*v)))
             }
             Self::Timestamp(v) => write_timestamp(f, *v),
             // An infinity has no offset to print, which is how the pin spells it.
@@ -448,9 +448,6 @@ impl Value {
             Self::TimestampTz(micros) => {
                 let local = micros.saturating_add(i64::from(offset_seconds) * 1_000_000);
                 format!("{}{}", Self::Timestamp(local), offset_text(offset_seconds / 60 * 60))
-            }
-            Self::TimeTz(micros) => {
-                format!("{}{}", Self::Time(*micros), offset_text(offset_seconds))
             }
             other => other.to_string(),
         }

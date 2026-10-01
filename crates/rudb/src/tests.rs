@@ -2726,7 +2726,8 @@ fn the_session_time_zone_moves_local_context_and_one_argument_age() {
         panic!("the four context values had the wrong types: {:?}", answer[0]);
     };
     assert_eq!(local - utc, -4 * 60 * 60 * 1_000_000, "New York is EDT in September");
-    assert_eq!(zoned_time, local_time);
+    assert_eq!(rudb_common::time_tz::micros(*zoned_time), *local_time);
+    assert_eq!(rudb_common::time_tz::offset(*zoned_time), -4 * 60 * 60);
     assert_eq!(
         rows(
             &db,

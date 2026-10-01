@@ -11,7 +11,7 @@
 //! microseconds. The last step adds the microseconds left over without dividing them, which is
 //! tamnd/duckdb#18, and is kept here so the answers are the pin's.
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, Result, Value, time_tz};
 
 use crate::aggregate::export::{counted, member, packed, shape, whole};
 use crate::datetime::{MICROS_PER_DAY, combine};
@@ -104,7 +104,7 @@ impl Timed {
                 })?;
                 Ok(match returns {
                     LogicalType::Time => Value::Time(micros),
-                    LogicalType::TimeTz => Value::TimeTz(micros),
+                    LogicalType::TimeTz => Value::TimeTz(time_tz::pack(micros, 0)),
                     LogicalType::TimestampTz => Value::TimestampTz(micros),
                     _ => Value::Timestamp(micros),
                 })
@@ -160,7 +160,7 @@ fn zero() -> Value {
 fn micros(value: &Value) -> Result<i64> {
     match *value {
         Value::Time(micros) | Value::Timestamp(micros) | Value::TimestampTz(micros) => Ok(micros),
-        Value::TimeTz(micros) => Ok(micros.rem_euclid(MICROS_PER_DAY)),
+        Value::TimeTz(key) => Ok(time_tz::at_utc(key)),
         _ => Err(Error::internal(format!("avg over {value:?}"))),
     }
 }
@@ -215,8 +215,16 @@ mod tests {
     #[test]
     fn a_zoned_time_is_averaged_in_utc_inside_one_day() {
         let hour = 3_600_000_000;
-        let values = [Value::TimeTz(-hour), Value::TimeTz(3 * hour)];
-        assert_eq!(average(&LogicalType::TimeTz, &values), "13:00:00+00");
+        let values = [
+            Value::TimeTz(time_tz::pack(12 * hour, 5 * 3_600)),
+            Value::TimeTz(time_tz::pack(14 * hour, 0)),
+        ];
+        assert_eq!(average(&LogicalType::TimeTz, &values), "10:30:00+00");
+        let values = [
+            Value::TimeTz(time_tz::pack(23 * hour, -5 * 3_600)),
+            Value::TimeTz(time_tz::pack(3 * hour, 0)),
+        ];
+        assert_eq!(average(&LogicalType::TimeTz, &values), "03:30:00+00");
     }
 
     #[test]

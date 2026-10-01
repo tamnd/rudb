@@ -39,7 +39,7 @@ use std::str::FromStr;
 
 use rudb_common::{
     Error, ErrorCode, Field, LogicalType, PhysicalType, Result, SessionTimeZone, Value, bit,
-    civil_from_days, days_from_civil, uuid,
+    civil_from_days, days_from_civil, time_tz, uuid,
 };
 use rudb_vector::{Data, Form, Vector};
 
@@ -198,6 +198,9 @@ fn cast_value_in_time_zone(
         (_, LogicalType::TimestampTz) if value.logical_type() != LogicalType::TimestampTz => {
             Some(to_timestamp_tz_in(value, zone))
         }
+        (Value::Varchar(_) | Value::Time(_) | Value::TimestampTz(_), LogicalType::TimeTz) => {
+            Some(to_time_tz_in(value, zone))
+        }
         (Value::TimestampTz(micros), LogicalType::Timestamp | LogicalType::Date)
         | (
             Value::TimestampTz(micros),
@@ -228,6 +231,8 @@ pub fn reads_time_zone(from: &LogicalType, to: &LogicalType) -> bool {
     match (from, to) {
         (List(from) | Array(from, _), List(to) | Array(to, _)) => reads_time_zone(from, to),
         (List(_) | Array(..) | Struct(_) | Map(..), Varchar) => holds_time_zone(from),
+        // A time of day takes the zone's offset now, and so does text that has no offset in it.
+        (Varchar | LogicalType::Time, LogicalType::TimeTz) => true,
         _ => {
             (from == &LogicalType::TimestampTz) != (to == &LogicalType::TimestampTz)
                 && !matches!(from, LogicalType::Null)
@@ -1146,6 +1151,11 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
             Value::Varchar(text) => Err(not_convertible(text, target)),
             other => Err(no_cast(other, target)),
         },
+        // A nested type reached here with a value of another shape, a struct for a list or a list
+        // for a map, which the pin has no cast for either.
+        LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(..) => {
+            Err(no_cast(value, target))
+        }
         other => {
             Err(Error::not_implemented(format!("a cast from {} to {other}", value.logical_type())))
         }
@@ -1702,33 +1712,186 @@ fn to_time(value: &Value) -> Result<Value> {
         {
             Err(Error::conversion("Can't get TIME of infinite TIMESTAMP"))
         }
-        Value::Timestamp(micros) | Value::TimestampTz(micros) | Value::TimeTz(micros) => {
+        Value::Timestamp(micros) | Value::TimestampTz(micros) => {
             Ok(Value::Time(micros.rem_euclid(MICROS_PER_DAY)))
         }
+        // The time as it was read, with the offset dropped rather than applied.
+        Value::TimeTz(key) => Ok(Value::Time(time_tz::micros(*key))),
         Value::Varchar(text) => parse_clock(text).map(Value::Time).ok_or_else(|| bad_time(text)),
         _ => Err(no_cast(value, &LogicalType::Time)),
     }
 }
 
-/// A cast to `TIME WITH TIME ZONE`, which is the same reading with the offset kept.
+/// A cast to `TIME WITH TIME ZONE` in UTC, which is the answer the zoned casts give there.
 ///
-/// Dropping a zone and putting one on are both the identity while the only session time zone rudb
-/// has is UTC, and both of them move the reading by the offset once there is a zone to move it by.
-/// That is the time zone box and not this one, and this is the answer that box gives for UTC.
+/// A time of day with no offset of its own takes `+00`, and an instant is read at UTC. The session
+/// zone is [`to_time_tz_in`]. A timestamp is read off as it is in every zone, which is the pin's
+/// own cast and not its ICU one, and the other timestamps and a date have no cast at all.
 fn to_time_tz(value: &Value) -> Result<Value> {
     match value {
-        Value::Time(micros) | Value::Timestamp(micros) | Value::TimestampTz(micros) => {
-            Ok(Value::TimeTz(micros.rem_euclid(MICROS_PER_DAY)))
+        Value::TimeTz(_) => Ok(value.clone()),
+        Value::Time(micros) => Ok(Value::TimeTz(time_tz::pack(*micros, 0))),
+        Value::Timestamp(micros) => {
+            Ok(Value::TimeTz(time_tz::pack(micros.rem_euclid(MICROS_PER_DAY), 0)))
         }
-        Value::Varchar(text) => parse_clock(text).map(Value::TimeTz).ok_or_else(|| bad_time(text)),
+        _ => to_time_tz_in(value, SessionTimeZone::default()),
+    }
+}
+
+/// A cast to `TIME WITH TIME ZONE` that reads the session zone, which is the pin's ICU cast.
+///
+/// An instant becomes the wall clock in the zone and the zone's offset at that instant, and an
+/// infinite one is NULL rather than an error. A time of day, or text without an offset, takes the
+/// zone's offset now, since it has no date to look one up at.
+fn to_time_tz_in(value: &Value, zone: SessionTimeZone) -> Result<Value> {
+    match value {
+        Value::TimestampTz(micros) if *micros == i64::MAX || *micros == -i64::MAX => {
+            Ok(Value::Null)
+        }
+        Value::TimestampTz(micros) => {
+            let offset = zone.offset_seconds_at(*micros);
+            let local = micros.saturating_add(i64::from(offset) * 1_000_000);
+            Ok(Value::TimeTz(time_tz::pack(local.rem_euclid(MICROS_PER_DAY), offset)))
+        }
+        Value::Time(micros) => Ok(Value::TimeTz(time_tz::pack(*micros, zone.offset_seconds_now()))),
+        Value::Varchar(text) => {
+            let (micros, offset) = parse_time_tz(text).ok_or_else(|| bad_time(text))?;
+            let offset = offset.unwrap_or_else(|| zone.offset_seconds_now());
+            Ok(Value::TimeTz(time_tz::pack(micros, offset)))
+        }
+        Value::Timestamp(_) | Value::TimeTz(_) => to_time_tz(value),
         _ => Err(no_cast(value, &LogicalType::TimeTz)),
     }
 }
 
+/// Text read as a time of day and the offset written after it, if there was one, which is the
+/// pin's `Time::TryConvertTimeTZ`.
+///
+/// The time is read leniently, so the minutes and the seconds take one digit or two and can be
+/// left off at the end, and the offset strictly, so it is `±HH`, then `MM` or `:MM`, then `:SS`
+/// after a colon, with two digits each. Spaces may stand between the two and whatever follows the
+/// offset is not read at all, so `'12:00:00+05abc'` is five hours east. Text that is not a time is
+/// tried as a timestamp, with an offset but not a zone name, read at UTC and kept as a time with no
+/// offset, so a session in Berlin reads `'2020-01-01 12:00:00+05'` as `07:00:00+02`.
+fn parse_time_tz(text: &str) -> Option<(i64, Option<i32>)> {
+    let bytes = text.as_bytes();
+    let Some((micros, mut pos)) = lenient_time(bytes) else {
+        let (micros, written) = parse_timestamp_zoned(text).ok()?;
+        let micros = match written {
+            Suffix::Nothing => micros,
+            Suffix::Offset(seconds) => micros.checked_sub(seconds * MICROS_PER_SECOND)?,
+            Suffix::Named(_) => return None,
+        };
+        let finite = micros != i64::MAX && micros != -i64::MAX;
+        return finite.then(|| (micros.rem_euclid(MICROS_PER_DAY), None));
+    };
+    if micros > MICROS_PER_DAY {
+        return None;
+    }
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    if pos == bytes.len() {
+        return Some((micros, None));
+    }
+    let offset = strict_offset(&bytes[pos..])?;
+    time_tz::holds(offset).then_some((micros, Some(offset)))
+}
+
+/// The pin's `Time::TryConvertInternal` in its lenient form: the microseconds since midnight and
+/// where the reading stopped. The hour is up to nine digits, since the same reader takes the time
+/// part of an interval, and a caller checks it against a day.
+fn lenient_time(bytes: &[u8]) -> Option<(i64, usize)> {
+    let mut pos = bytes.iter().take_while(|byte| byte.is_ascii_whitespace()).count();
+    let digits = bytes[pos..].iter().take_while(|byte| byte.is_ascii_digit()).count();
+    if digits == 0 || digits > 9 {
+        return None;
+    }
+    let hour: i64 = std::str::from_utf8(&bytes[pos..pos + digits]).ok()?.parse().ok()?;
+    pos += digits;
+    if bytes.get(pos) != Some(&b':') {
+        return None;
+    }
+    pos += 1;
+    let minute = if pos == bytes.len() { 0 } else { double_digit(bytes, &mut pos)? };
+    let second = if pos == bytes.len() {
+        0
+    } else {
+        if bytes[pos] != b':' {
+            return None;
+        }
+        pos += 1;
+        if pos == bytes.len() { 0 } else { double_digit(bytes, &mut pos)? }
+    };
+    if minute >= 60 || second >= 60 {
+        return None;
+    }
+    let mut micros = 0;
+    if bytes.get(pos) == Some(&b'.') {
+        pos += 1;
+        let mut scale = 100_000;
+        while let Some(digit) = bytes.get(pos).filter(|byte| byte.is_ascii_digit()) {
+            micros += i64::from(digit - b'0') * scale;
+            scale /= 10;
+            pos += 1;
+        }
+    }
+    Some((((hour * 60 + minute) * 60 + second) * 1_000_000 + micros, pos))
+}
+
+/// One digit or two at `pos`, which is moved past them, the pin's `Date::ParseDoubleDigit`.
+fn double_digit(bytes: &[u8], pos: &mut usize) -> Option<i64> {
+    let first = bytes.get(*pos).filter(|byte| byte.is_ascii_digit())?;
+    *pos += 1;
+    let mut value = i64::from(first - b'0');
+    if let Some(second) = bytes.get(*pos).filter(|byte| byte.is_ascii_digit()) {
+        value = value * 10 + i64::from(second - b'0');
+        *pos += 1;
+    }
+    Some(value)
+}
+
+/// The pin's `Timestamp::TryParseUTCOffset` in its strict form, in seconds east of UTC.
+fn strict_offset(bytes: &[u8]) -> Option<i32> {
+    let pair = |at: usize| -> Option<i32> {
+        let tens = bytes.get(at).filter(|byte| byte.is_ascii_digit())?;
+        let ones = bytes.get(at + 1).filter(|byte| byte.is_ascii_digit())?;
+        Some(i32::from(tens - b'0') * 10 + i32::from(ones - b'0'))
+    };
+    if bytes.len() < 3 {
+        return None;
+    }
+    let sign = match bytes[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let hours = pair(1)?;
+    let mut at = 3;
+    if at == bytes.len() {
+        return Some(sign * hours * 3_600);
+    }
+    let colons = bytes[at] == b':';
+    if colons {
+        at += 1;
+    }
+    // Minutes that are not there end the offset, unless a colon promised them.
+    if at + 2 > bytes.len() || !bytes[at].is_ascii_digit() {
+        return (!colons).then_some(sign * hours * 3_600);
+    }
+    let minutes = pair(at)?;
+    at += 2;
+    let mut seconds = 0;
+    if colons && bytes.get(at) == Some(&b':') {
+        seconds = pair(at + 1)?;
+    }
+    Some(sign * ((hours * 60 + minutes) * 60 + seconds))
+}
+
 /// A cast to `TIMESTAMP WITH TIME ZONE`, which is the same instant read as a point in time.
 ///
-/// See [`to_time_tz`] for why this is the identity today. A date becomes midnight the way it does
-/// for `TIMESTAMP`, which is midnight UTC here and midnight in the session zone upstream.
+/// This is the cast in UTC and [`to_timestamp_tz_in`] is the one in the session zone. A date becomes
+/// midnight the way it does for `TIMESTAMP`, which is midnight UTC here.
 fn to_timestamp_tz(value: &Value) -> Result<Value> {
     if let Some(micros) = coarse_micros(value, "higher precision")? {
         return Ok(Value::TimestampTz(micros));

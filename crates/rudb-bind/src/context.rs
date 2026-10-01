@@ -138,7 +138,10 @@ impl Binder<'_> {
                 let days = local.div_euclid(MICROS_PER_DAY);
                 Value::Date(i32::try_from(days).unwrap_or(i32::MAX))
             }
-            Context::ZonedTime => Value::TimeTz(midnight()),
+            Context::ZonedTime => {
+                let offset = i32::try_from((local - instant) / 1_000_000).unwrap_or(0);
+                Value::TimeTz(rudb_common::time_tz::pack(midnight(), offset))
+            }
             Context::LocalTime => Value::Time(midnight()),
             Context::Database => Value::Varchar(self.catalog().default_catalog().to_string()),
             Context::Schema => Value::Varchar(self.catalog().default_schema().to_string()),

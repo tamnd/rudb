@@ -3754,6 +3754,33 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
     // A time of day is read as the moment it is on the first day of 1970, which gives the pin's
     // answer for the six parts a time has. The rest are refused in the pin's words, since a time
     // is on no day at all.
+    // A zoned time answers the same six from its own time of day, read where it was written, and
+    // the three zone parts from its offset, which is `-19800`, `-5` and `-30` for `-05:30`.
+    if let Value::TimeTz(key) = when
+        && name != "date_trunc"
+    {
+        let micros = rudb_common::time_tz::micros(*key);
+        let offset = i64::from(rudb_common::time_tz::offset(*key));
+        let whole = match part {
+            Part::Epoch if doubled => {
+                return Ok(Value::Double(micros as f64 / 1_000_000.0));
+            }
+            Part::Hour => micros / 3_600_000_000,
+            Part::Minute => micros / 60_000_000 % 60,
+            Part::Second => micros / 1_000_000 % 60,
+            Part::Millisecond => micros / 1_000 % 60_000,
+            Part::Microsecond => micros % 60_000_000,
+            Part::Timezone => offset,
+            Part::TimezoneHour => offset / 3_600,
+            Part::TimezoneMinute => offset / 60 % 60,
+            _ => {
+                return Err(Error::not_implemented(format!(
+                    "\"time with time zone\" units \"{spelling}\" not recognized"
+                )));
+            }
+        };
+        return Ok(if doubled { Value::Double(whole as f64) } else { Value::BigInt(whole) });
+    }
     let when = &match when {
         Value::Time(micros) if name != "date_trunc" => {
             let timed = matches!(
@@ -3947,7 +3974,7 @@ pub fn call_values(
         let mut best: Option<&Value> = None;
         for value in args.iter().filter(|value| !value.is_null()) {
             best = match best {
-                Some(held) if compare::order(value, held)? != wanted => Some(held),
+                Some(held) if compare::extreme_order(value, held)? != wanted => Some(held),
                 _ => Some(value),
             };
         }

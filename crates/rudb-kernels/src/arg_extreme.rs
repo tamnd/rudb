@@ -19,7 +19,7 @@
 
 use rudb_common::{Error, LogicalType, Result, Value};
 
-use crate::compare::{float_order, order};
+use crate::compare::{extreme_order, float_order};
 use crate::number::integral;
 use crate::quantile::{Column, Whole};
 
@@ -234,7 +234,7 @@ fn capacity(n: &Value) -> Result<usize> {
 
 /// Whether `by` is strictly better than `kept`, less for a min and greater for a max.
 fn beats(by: &Value, kept: &Value, least: bool) -> Result<bool> {
-    let ordering = order(by, kept)?;
+    let ordering = extreme_order(by, kept)?;
     Ok(if least { ordering.is_lt() } else { ordering.is_gt() })
 }
 
