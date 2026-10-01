@@ -2,9 +2,12 @@
 //! and what the commit makes of two transactions that wrote the same table.
 //!
 //! The first few follow `conflicts.test` in the compatibility corpus, whose answers were captured
-//! on the pin.
+//! on the pin, and so run with `lock_timeout` at zero, which never waits for a held row the way the
+//! pin never does. The ones at the end wait.
 
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rudb::{Connection, Database};
 use rudb_common::Value;
@@ -26,9 +29,15 @@ fn fails(connection: &Connection, sql: &str, text: &str) {
 }
 
 fn two() -> (Database, Connection, Connection) {
+    waiting("0")
+}
+
+/// [`two`] with `lock_timeout` at `timeout`.
+fn waiting(timeout: &str) -> (Database, Connection, Connection) {
     let database = Database::new();
     let one = database.connect();
     let two = database.connect();
+    one.execute(&format!("SET lock_timeout = '{timeout}'")).expect("sets");
     one.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").expect("creates");
     one.execute("INSERT INTO t VALUES (1, 10), (2, 20)").expect("inserts");
     (database, one, two)
@@ -237,4 +246,91 @@ fn two_transactions_that_committed_survive_a_crash() {
     drop(connection);
     drop(database);
     remove(&path);
+}
+
+#[test]
+fn lock_timeout_is_a_second_until_set() {
+    let database = Database::new();
+    let connection = database.connect();
+    let setting = || database.setting("lock_timeout").expect("reads");
+    assert_eq!(setting(), "1s");
+    connection.execute("SET lock_timeout = '250ms'").expect("sets");
+    assert_eq!(setting(), "250ms");
+    connection.execute("SET lock_timeout = 0").expect("sets");
+    assert_eq!(setting(), "0");
+    connection.execute("RESET lock_timeout").expect("resets");
+    assert_eq!(setting(), "1s");
+    fails(&connection, "SET lock_timeout = 'soon'", "lock_timeout is a length of time");
+}
+
+#[test]
+fn a_write_waits_for_a_holder_that_rolls_back_and_then_goes_ahead() {
+    let (_database, one, two) = waiting("10s");
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 11 WHERE id = 1").expect("updates");
+    two.execute("BEGIN").expect("begins");
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| two.execute("UPDATE t SET v = 12 WHERE id = 1"));
+        thread::sleep(Duration::from_millis(100));
+        one.execute("ROLLBACK").expect("rolls back");
+        waiter.join().expect("joins").expect("updates once the row is free");
+    });
+    two.execute("COMMIT").expect("commits");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 12), (2, 20)]));
+}
+
+#[test]
+fn a_transaction_that_waited_for_a_holder_that_commits_conflicts() {
+    let (_database, one, two) = waiting("10s");
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 11 WHERE id = 1").expect("updates");
+    two.execute("BEGIN").expect("begins");
+    assert_eq!(two.value("SELECT count(*) FROM t").expect("reads"), Value::BigInt(2));
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| two.execute("UPDATE t SET v = 12 WHERE id = 1"));
+        thread::sleep(Duration::from_millis(100));
+        one.execute("COMMIT").expect("commits");
+        let error = waiter.join().expect("joins").expect_err("the row changed after the snapshot");
+        assert!(error.to_string().contains("Conflict on update!"), "{error}");
+    });
+    two.execute("ROLLBACK").expect("rolls back");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 11), (2, 20)]));
+}
+
+#[test]
+fn a_write_outside_a_transaction_waits_for_the_holder_to_commit() {
+    let (_database, one, two) = waiting("10s");
+    one.execute("BEGIN").expect("begins");
+    one.execute("DELETE FROM t WHERE id = 2").expect("deletes");
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| two.execute("DELETE FROM t WHERE id >= 2"));
+        thread::sleep(Duration::from_millis(100));
+        one.execute("INSERT INTO t VALUES (3, 30)").expect("inserts");
+        one.execute("COMMIT").expect("commits");
+        waiter.join().expect("joins").expect("deletes once the row is free");
+    });
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 10)]));
+}
+
+#[test]
+fn a_wait_gives_up_after_lock_timeout() {
+    let (_database, one, two) = waiting("50ms");
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 11 WHERE id = 1").expect("updates");
+    let started = Instant::now();
+    fails(&two, "UPDATE t SET v = 12 WHERE id = 1", "Conflict on update!");
+    assert!(started.elapsed() >= Duration::from_millis(50), "{:?}", started.elapsed());
+    two.execute("UPDATE t SET v = 21 WHERE id = 2").expect("updates another row");
+}
+
+#[test]
+fn a_younger_transaction_that_holds_a_row_does_not_wait() {
+    let (_database, one, two) = waiting("10s");
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 11 WHERE id = 1").expect("updates");
+    two.execute("BEGIN").expect("begins");
+    two.execute("UPDATE t SET v = 22 WHERE id = 2").expect("updates");
+    let started = Instant::now();
+    fails(&two, "UPDATE t SET v = 12 WHERE id = 1", "Conflict on update!");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
 }

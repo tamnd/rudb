@@ -173,11 +173,6 @@ impl Change {
 }
 
 impl Replayed {
-    /// Whether this only appends, which replay can do without reading the table.
-    pub(crate) fn appends(&self) -> bool {
-        self.kind == Kind::Insert
-    }
-
     /// Whether this is a Ddl record, which [`Self::statement`] reads.
     pub(crate) fn is_statement(&self) -> bool {
         self.kind == Kind::Ddl

@@ -21,10 +21,20 @@
 //! committed table: its appends go on the end, and its updates and deletes land on the same rows, as
 //! long as nothing committed since has moved any row to a new number. Anything else fails the commit.
 //!
+//! A write that meets a row another open transaction holds may wait for it to end rather than fail,
+//! for as long as `lock_timeout` says, and [`Registry::may_wait`] says when by wait-die, the rule
+//! section 8.4 of the concurrency spec gives: a writer that holds nothing may wait for anyone, an
+//! older transaction waits for a younger one, and anything else fails at once. Every wait then goes
+//! from older to younger or from a writer nobody can be waiting on, so no cycle forms. When the
+//! holder rolls back the write goes ahead, and when it commits the write meets a row committed
+//! after its snapshot and fails the way it would have without waiting.
+//!
 //! This is the step before `engine-v4/08-concurrency.md`'s design, which keeps one copy of each row
 //! with an undo chain and a lock word in it, and the conflicts it reports are the same ones.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use rudb_catalog::{Catalog, QualifiedName, Table};
 use rudb_common::{Error, Result};
@@ -179,6 +189,53 @@ pub(crate) struct Registry {
     done: Vec<Done>,
 }
 
+/// The [`Registry`] and what a write waiting on one of its transactions sleeps on. One per
+/// database.
+#[derive(Debug, Default)]
+pub(crate) struct Board {
+    registry: Mutex<Registry>,
+    /// Told whenever a transaction ends.
+    ended: Condvar,
+}
+
+impl Board {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Registry> {
+        self.registry.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// [`Registry::end`], waking whoever waits for a transaction to end.
+    pub(crate) fn end(&self, me: u64, committed: bool) {
+        self.lock().end(me, committed);
+        self.ended.notify_all();
+    }
+
+    /// Waits until transaction `holder` has ended or `deadline` has passed, and says which.
+    pub(crate) fn wait_for(&self, holder: u64, deadline: Instant) -> bool {
+        let mut registry = self.lock();
+        while registry.open.contains_key(&holder) {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            registry = self
+                .ended
+                .wait_timeout(registry, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+}
+
+/// What a write met in [`Registry::clashes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Clash {
+    /// A row the open transaction of this id holds.
+    Open(u64),
+    /// A row committed after the writer's snapshot, which waiting cannot help.
+    Done,
+}
+
 /// What one open transaction has written.
 #[derive(Debug, Default)]
 struct Claims {
@@ -245,16 +302,34 @@ impl Registry {
         (oid, delete): (i64, bool),
         marks: &Marks,
         since: u64,
-    ) -> bool {
-        let open = self
-            .open
+    ) -> Option<Clash> {
+        let done = self.done.iter().any(|done| {
+            done.oid == oid && done.delete == delete && done.at > since && done.marks.meets(marks)
+        });
+        if done {
+            return Some(Clash::Done);
+        }
+        // The oldest holder, since a writer older than that one is older than every holder.
+        self.open
             .iter()
             .filter(|(id, _)| Some(**id) != me)
-            .filter_map(|(_, claims)| claims.tables.get(&(oid, delete)))
-            .any(|held| held.meets(marks));
-        open || self.done.iter().any(|done| {
-            done.oid == oid && done.delete == delete && done.at > since && done.marks.meets(marks)
-        })
+            .filter(|(_, claims)| {
+                claims.tables.get(&(oid, delete)).is_some_and(|held| held.meets(marks))
+            })
+            .map(|(id, _)| *id)
+            .min()
+            .map(Clash::Open)
+    }
+
+    /// Whether writer `me`, a transaction or a statement outside one, may wait for `holder` rather
+    /// than fail, by wait-die: when it holds nothing, or when it is the older of the two.
+    pub(crate) fn may_wait(&self, me: Option<u64>, holder: u64) -> bool {
+        let Some(me) = me else { return true };
+        let holds_nothing = self
+            .open
+            .get(&me)
+            .is_none_or(|claims| claims.tables.is_empty() && claims.creating.is_empty());
+        holds_nothing || me < holder
     }
 
     /// Records that transaction `me` wrote `marks` in the table `oid`.

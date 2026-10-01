@@ -27,7 +27,7 @@ use crate::journal::{Change, Journal, Replayed};
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
 use crate::settings::{COMPILED_ENGINE, Settings, Visibility};
-use crate::txn::{self, Open, Registry};
+use crate::txn::{self, Board, Open, Registry};
 use crate::{foreign, upsert};
 
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
@@ -602,17 +602,22 @@ struct Conn {
     /// The log records the transaction staged for its commit, when the database has a log.
     staged: Mutex<Option<Journal>>,
     /// The database's, so a connection dropped in the middle of a transaction can close it.
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Board>,
+    /// The transaction the last statement met a row of and may wait for, zero for none. Set by
+    /// [`Shared::claim`] as it fails the statement, and taken by [`Shared::execute_ast`], which
+    /// waits once the statement has let go of everything and runs it again.
+    blocked: AtomicU64,
 }
 
 impl Conn {
-    fn new(registry: Arc<Mutex<Registry>>) -> Self {
+    fn new(registry: Arc<Board>) -> Self {
         Self {
             open: Mutex::default(),
             catalog: RwLock::new(Catalog::bare()),
             private: AtomicBool::new(false),
             staged: Mutex::default(),
             registry,
+            blocked: AtomicU64::new(0),
         }
     }
 }
@@ -623,7 +628,7 @@ impl Drop for Conn {
     fn drop(&mut self) {
         let open = self.open.get_mut().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(snapshot) = open.and_then(|open| open.snapshot) {
-            self.registry.lock().unwrap_or_else(PoisonError::into_inner).end(snapshot.id, false);
+            self.registry.end(snapshot.id, false);
         }
     }
 }
@@ -642,7 +647,7 @@ struct Inner {
     /// what stops a checkpoint or a second load from writing the file under the first one.
     writer: Mutex<()>,
     /// Which rows the open transactions have written. See [`crate::txn`].
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Board>,
     /// The log of the file, for a database that has one it may write. Taken after the catalog lock
     /// by whatever holds both.
     journal: Mutex<Option<Journal>>,
@@ -3344,7 +3349,7 @@ impl Shared {
     }
 
     fn registry(&self) -> MutexGuard<'_, Registry> {
-        self.inner.registry.lock().unwrap_or_else(PoisonError::into_inner)
+        self.inner.registry.lock()
     }
 
     /// The right to write the file and change the catalog, taken before the catalog lock. See
@@ -3754,7 +3759,7 @@ impl Shared {
         {
             journal.absorb(staged);
         }
-        self.registry().end(snapshot.id, commit && merged.is_ok());
+        self.inner.registry.end(snapshot.id, commit && merged.is_ok());
         merged
     }
 
@@ -3786,22 +3791,43 @@ impl Shared {
                     None => flagged.iter().copied().filter(|&row| row < base).collect(),
                 };
                 let marks = txn::Marks { frame, rows, all: whole };
-                if registry.clashes(Some(snapshot.id), key, &marks, snapshot.at) {
-                    return Err(txn::conflict(delete));
-                }
+                let clash = registry.clashes(Some(snapshot.id), key, &marks, snapshot.at);
+                self.clashed(&registry, Some(snapshot.id), clash, delete)?;
                 marks
             }
             None if registry.watched() => {
                 let rows = if whole { BTreeSet::new() } else { flagged.iter().copied().collect() };
                 let marks = txn::Marks { frame: table.frame(), rows, all: whole };
-                if registry.clashes(None, key, &marks, u64::MAX) {
-                    return Err(txn::conflict(delete));
-                }
+                let clash = registry.clashes(None, key, &marks, u64::MAX);
+                self.clashed(&registry, None, clash, delete)?;
                 marks
             }
             None => return Ok(None),
         };
         Ok(Some(marks))
+    }
+
+    /// Fails a write that met `clash`, in the pin's words, and notes the holder for
+    /// [`Shared::execute_ast`] to wait for when `lock_timeout` and wait-die let the writer `me`
+    /// wait.
+    fn clashed(
+        &self,
+        registry: &Registry,
+        me: Option<u64>,
+        clash: Option<txn::Clash>,
+        delete: bool,
+    ) -> Result<()> {
+        match clash {
+            None => Ok(()),
+            Some(txn::Clash::Open(holder))
+                if !self.inner.settings.lock_timeout().is_zero()
+                    && registry.may_wait(me, holder) =>
+            {
+                self.conn.blocked.store(holder, Ordering::Release);
+                Err(txn::conflict(delete))
+            }
+            Some(_) => Err(txn::conflict(delete)),
+        }
     }
 
     /// Keeps the rows an update or a delete changed as claimed, by this connection's transaction
@@ -4396,6 +4422,34 @@ impl Shared {
     /// execution would make a statement prepared once and run a thousand times report the same
     /// parse a thousand times.
     pub(crate) fn execute_ast(
+        &self,
+        ast: &Ast,
+        sql: &str,
+        parameters: &Parameters,
+        cancel: &Cancel,
+        parse_ns: u64,
+    ) -> Result<QueryResult> {
+        let mut deadline = None;
+        loop {
+            self.conn.blocked.store(0, Ordering::Release);
+            let result = self.execute_once(ast, sql, parameters, cancel, parse_ns);
+            let holder = self.conn.blocked.swap(0, Ordering::AcqRel);
+            if result.is_ok() || holder == 0 {
+                return result;
+            }
+            // The statement met a row another transaction holds and changed nothing. It has let go
+            // of every lock by now, so it waits for the holder without holding up anyone else and
+            // runs again once the holder is done, all within one `lock_timeout`.
+            let deadline = *deadline
+                .get_or_insert_with(|| Instant::now() + self.inner.settings.lock_timeout());
+            if !self.inner.registry.wait_for(holder, deadline) {
+                return result;
+            }
+        }
+    }
+
+    /// [`Shared::execute_ast`] once, without waiting for a held row.
+    fn execute_once(
         &self,
         ast: &Ast,
         sql: &str,
