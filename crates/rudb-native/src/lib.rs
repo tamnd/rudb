@@ -1401,9 +1401,19 @@ pub struct GoneRows {
     pub parts: Vec<(usize, Box<[u64]>)>,
     /// How many rows are gone in all.
     pub total: usize,
+    /// For each column, the sum and the non-null count of the values the gone rows held, when they
+    /// were counted, so a sum over the table is the file's sum less this one rather than a scan.
+    /// Empty when no column was counted. See [`Reader::gone_sums`].
+    pub sums: Vec<Option<(i128, u64)>>,
 }
 
 impl GoneRows {
+    /// The bits of part `part`, when it lost any rows.
+    #[must_use]
+    pub fn bits(&self, part: usize) -> Option<&[u64]> {
+        self.parts.binary_search_by_key(&part, |(at, _)| *at).ok().map(|at| &self.parts[at].1[..])
+    }
+
     /// The record as it goes into the file: how many parts there are, then each part's number, the
     /// count of its words and the words.
     fn encode(&self) -> Result<Vec<u8>> {
@@ -1415,6 +1425,19 @@ impl GoneRows {
             put_u32(&mut out, u32::try_from(bits.len()).map_err(|_| invalid("part too long"))?);
             for word in bits {
                 put_u64(&mut out, *word);
+            }
+        }
+        // The sums go after the bits, so a record without them is the bits alone.
+        if !self.sums.is_empty() {
+            put_u32(
+                &mut out,
+                u32::try_from(self.sums.len()).map_err(|_| invalid("too many columns"))?,
+            );
+            for sum in &self.sums {
+                let (total, count) = sum.unwrap_or_default();
+                out.push(u8::from(sum.is_some()));
+                out.extend_from_slice(&total.to_le_bytes());
+                put_u64(&mut out, count);
             }
         }
         Ok(out)
@@ -1443,17 +1466,41 @@ impl GoneRows {
             for _ in 0..words {
                 bits.push(cur.u64()?);
             }
-            if !rows.is_multiple_of(64) && bits.last().is_some_and(|last| last >> (rows % 64) != 0) {
+            if !rows.is_multiple_of(64) && bits.last().is_some_and(|last| last >> (rows % 64) != 0)
+            {
                 return Err(invalid("gone rows mark a row past their part"));
             }
             total += bits.iter().map(|word| word.count_ones() as usize).sum::<usize>();
             parts.push((part, bits.into_boxed_slice()));
         }
+        let mut sums = Vec::new();
+        if !cur.done() {
+            let width = cur.u32()? as usize;
+            if width == 0 || width > bytes.len() {
+                return Err(invalid("gone row sums have a bad width"));
+            }
+            for _ in 0..width {
+                let counted = cur.u8()?;
+                let low = cur.u64()?;
+                let high = cur.u64()?;
+                let total = i128::from(low) | (i128::from(high as i64) << 64);
+                let count = cur.u64()?;
+                sums.push(match counted {
+                    0 => None,
+                    1 if count <= total_rows(places) => Some((total, count)),
+                    _ => return Err(invalid("gone row sums are not a sum and a count")),
+                });
+            }
+        }
         if !cur.done() {
             return Err(invalid("gone rows have trailing bytes"));
         }
-        Ok(Self { parts, total })
+        Ok(Self { parts, total, sums })
     }
+}
+
+fn total_rows(places: &[Place]) -> u64 {
+    places.iter().map(|place| u64::from(place.rows)).sum()
 }
 
 /// Writes `gone` down for the table of `entry` and points the entry at it, or points it at nothing
@@ -6978,7 +7025,11 @@ impl Catalog {
             if checksum(&bytes) != page.hash {
                 return Err(invalid(&format!("the gone rows of table {name} do not checksum")));
             }
-            reader.gone = Some(Arc::new(GoneRows::decode(&bytes, &reader.places)?));
+            let gone = GoneRows::decode(&bytes, &reader.places)?;
+            if !gone.sums.is_empty() && gone.sums.len() != reader.table.fields.len() {
+                return Err(invalid("gone row sums differ from the table's columns"));
+            }
+            reader.gone = Some(Arc::new(gone));
         }
         Ok(reader)
     }
@@ -8297,6 +8348,103 @@ impl Reader {
             rows = rows.saturating_add(stripe.rows as u64 - range.nulls as u64);
         }
         Ok(Some((total, rows)))
+    }
+
+    /// For each column, the sum and non-null count of the values the rows of `gone` held, for a
+    /// checkpoint to write down with them, see [`GoneRows::sums`].
+    ///
+    /// The rows `before` recorded are counted already, so when it has sums only the rows gone
+    /// since are read, and a part no new row went from is not read at all. A column is counted
+    /// when it is a signed integer whose sum the file keeps, since that sum is the one the counts
+    /// are taken from, and is `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// If a part of the file does not read back.
+    ///
+    /// # Panics
+    ///
+    /// If a thread counting parts panics.
+    pub fn gone_sums(
+        &self,
+        gone: &GoneRows,
+        before: Option<&GoneRows>,
+    ) -> Result<Vec<Option<(i128, u64)>>> {
+        let width = self.table.fields.len();
+        let before = before.filter(|before| before.sums.len() == width);
+        let mut sums = Vec::with_capacity(width);
+        for column in 0..width {
+            let counted =
+                signed_integer(&self.table.fields[column].ty) && self.exact_sum(column)?.is_some();
+            sums.push(match before {
+                _ if !counted => None,
+                Some(before) => before.sums[column],
+                None => Some((0, 0)),
+            });
+        }
+        let columns: Vec<usize> = (0..width).filter(|&column| sums[column].is_some()).collect();
+        if columns.is_empty() {
+            return Ok(sums);
+        }
+        // Each part's rows gone since `before`, as row numbers.
+        let fresh: Vec<(usize, Vec<u32>)> = gone
+            .parts
+            .iter()
+            .filter_map(|(part, bits)| {
+                let old = before.and_then(|before| before.bits(*part));
+                let mut rows = Vec::new();
+                for (at, &word) in bits.iter().enumerate() {
+                    let mut word = word & !old.and_then(|old| old.get(at)).copied().unwrap_or(0);
+                    while word != 0 {
+                        rows.push(at as u32 * 64 + word.trailing_zeros());
+                        word &= word - 1;
+                    }
+                }
+                (!rows.is_empty()).then_some((*part, rows))
+            })
+            .collect();
+        let workers =
+            std::thread::available_parallelism().map_or(1, usize::from).min(fresh.len().max(1));
+        let share = fresh.len().div_ceil(workers).max(1);
+        let pieces = std::thread::scope(|scope| {
+            let handles: Vec<_> = fresh
+                .chunks(share)
+                .map(|parts| {
+                    let columns = &columns;
+                    scope.spawn(move || -> Result<Vec<Option<(i128, u64)>>> {
+                        let mut sums = vec![Some((0_i128, 0_u64)); columns.len()];
+                        for (part, rows) in parts {
+                            let chunk = self.read(*part, columns)?;
+                            for (at, sum) in sums.iter_mut().enumerate() {
+                                let Some((total, count)) = *sum else { continue };
+                                let taken = chunk.column(at)?.gather(rows)?;
+                                let range = Range::of(&taken);
+                                *sum = range.sum.and_then(|part| {
+                                    let valid = (rows.len() - range.nulls) as u64;
+                                    Some((total.checked_add(part)?, count + valid))
+                                });
+                            }
+                        }
+                        Ok(sums)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a gone sum worker does not panic"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for piece in pieces {
+            for (&column, part) in columns.iter().zip(piece) {
+                sums[column] = match (sums[column], part) {
+                    (Some((total, count)), Some((more, added))) => {
+                        total.checked_add(more).map(|total| (total, count + added))
+                    }
+                    _ => None,
+                };
+            }
+        }
+        Ok(sums)
     }
 
     /// Legacy derived host groups are parsed for file compatibility but never used as query output.
@@ -16254,7 +16402,11 @@ mod tests {
         writer.finish().expect("commit");
         let fields = [Field::required("id", LogicalType::Integer)];
         assert!(extendable(&path, "items", &fields, 3).expect("reads"));
-        let gone = GoneRows { parts: vec![(0, vec![0b101].into_boxed_slice())], total: 2 };
+        let gone = GoneRows {
+            parts: vec![(0, vec![0b101].into_boxed_slice())],
+            total: 2,
+            sums: Vec::new(),
+        };
         Writer::restate_marking(&path, &[], None, &[("items".to_string(), gone.clone())])
             .expect("marks");
         let catalog = Catalog::open(&path).expect("reopen");
@@ -16273,8 +16425,103 @@ mod tests {
         assert_eq!(reader.gone(), Some(&gone));
         assert!(Writer::restate_marking(&path, &[], None, &[("other".to_string(), gone)]).is_err());
         // A record past the part's rows is a torn file and not a table.
-        let bad = GoneRows { parts: vec![(0, vec![0b1000].into_boxed_slice())], total: 1 };
+        let bad = GoneRows {
+            parts: vec![(0, vec![0b1000].into_boxed_slice())],
+            total: 1,
+            sums: Vec::new(),
+        };
         assert!(GoneRows::decode(&bad.encode().expect("encodes"), &reader.places).is_err());
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// The values the gone rows held are counted once, and a second record counts only the rows
+    /// gone since the first, so the two together are the sum over every row gone.
+    #[test]
+    fn the_sums_of_the_rows_gone_are_counted_and_read_back() {
+        let path = path("gone-sums");
+        let fields = vec![
+            Field::required("id", LogicalType::BigInt),
+            Field::new("v", LogicalType::Integer),
+            Field::new("s", LogicalType::Varchar),
+        ];
+        let rows = 5_000_i64;
+        let ids = Vector::from_values(
+            LogicalType::BigInt,
+            &(0..rows).map(Value::BigInt).collect::<Vec<_>>(),
+        )
+        .expect("ids");
+        let values = (0..rows)
+            .map(
+                |row| if row % 7 == 0 { Value::Null } else { Value::Integer(row as i32 * 3 - 900) },
+            )
+            .collect::<Vec<_>>();
+        let v = Vector::from_values(LogicalType::Integer, &values).expect("values");
+        let s = Vector::from_values(
+            LogicalType::Varchar,
+            &(0..rows).map(|row| Value::Varchar(format!("s{row}"))).collect::<Vec<_>>(),
+        )
+        .expect("text");
+        let mut writer = Writer::create(&path, "items", fields).expect("new file");
+        writer.append(&Chunk::new(vec![ids, v, s]).expect("chunk")).expect("rows");
+        writer.finish().expect("commit");
+        let catalog = Catalog::open(&path).expect("open");
+        let reader = catalog.table("items").expect("the table");
+        let bits = |rows: &[u32]| {
+            let mut gone = GoneRows::default();
+            for &row in rows {
+                let part = reader.places.iter().scan(0_u32, |start, place| {
+                    let at = *start;
+                    *start += place.rows;
+                    Some(at)
+                });
+                let (part, start) = part
+                    .enumerate()
+                    .filter(|&(_, start)| start <= row)
+                    .last()
+                    .expect("a part holds the row");
+                let words = (reader.places[part].rows as usize).div_ceil(64);
+                let at = match gone.parts.binary_search_by_key(&part, |(at, _)| *at) {
+                    Ok(at) => at,
+                    Err(at) => {
+                        gone.parts.insert(at, (part, vec![0; words].into_boxed_slice()));
+                        at
+                    }
+                };
+                let slot = (row - start) as usize;
+                gone.parts[at].1[slot / 64] |= 1 << (slot % 64);
+                gone.total += 1;
+            }
+            gone
+        };
+        let sum = |rows: &[u32]| {
+            rows.iter().fold((0_i128, 0_u64, 0_i128), |(ids, count, total), &row| {
+                let value = &values[row as usize];
+                let Value::Integer(value) = value else {
+                    return (ids + i128::from(row), count, total);
+                };
+                (ids + i128::from(row), count + 1, total + i128::from(*value))
+            })
+        };
+        let first: Vec<u32> = (0..rows as u32).filter(|row| row % 97 == 3).collect();
+        let mut first_gone = bits(&first);
+        first_gone.sums = reader.gone_sums(&first_gone, None).expect("counts");
+        let (ids, count, total) = sum(&first);
+        assert_eq!(
+            first_gone.sums,
+            vec![Some((ids, first.len() as u64)), Some((total, count)), None]
+        );
+        let second: Vec<u32> =
+            (0..rows as u32).filter(|row| row % 97 == 3 || row % 11 == 1).collect();
+        let mut second_gone = bits(&second);
+        second_gone.sums = reader.gone_sums(&second_gone, Some(&first_gone)).expect("counts");
+        let (ids, count, total) = sum(&second);
+        assert_eq!(
+            second_gone.sums,
+            vec![Some((ids, second.len() as u64)), Some((total, count)), None]
+        );
+        let back = GoneRows::decode(&second_gone.encode().expect("encodes"), &reader.places)
+            .expect("decodes");
+        assert_eq!(back, second_gone);
         fs::remove_file(&path).expect("clean up");
     }
 

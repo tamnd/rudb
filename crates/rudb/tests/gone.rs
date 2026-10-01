@@ -78,6 +78,15 @@ fn masked(db: &Database) -> bool {
     })
 }
 
+/// The sum and non-null count of `v` as the table answers them without reading its rows, which
+/// for a table with rows gone is the file's sum less the one written down with those rows.
+fn summed(db: &Database) -> Option<(i128, u64)> {
+    db.with_catalog(|catalog| {
+        let name = catalog.resolve(&["t"]).expect("resolves");
+        catalog.table(&name).expect("the table is there").rows().exact_sum(3).expect("sums")
+    })
+}
+
 fn loaded(tag: &str) -> (PathBuf, Database, Database) {
     let path = path(tag);
     let file = open(&path);
@@ -130,12 +139,20 @@ fn a_checkpoint_after_a_delete_writes_the_rows_gone_and_not_the_rows_kept() {
     let file = open(&path);
     assert!(masked(&file), "the file did not say which rows were gone");
     same(&file, &memory, "after the reopen");
+    let want = memory.query("SELECT sum(v)::HUGEINT, count(v) FROM t").expect("sums");
+    let want = format!("{:?}", want.rows().next().expect("one row"));
+    let got = summed(&file).expect("the sum of what is left is known without a scan");
+    assert_eq!(
+        want,
+        format!("{:?}", [rudb::Value::HugeInt(got.0), rudb::Value::BigInt(got.1 as i64)])
+    );
     both(&file, &memory, "DELETE FROM t WHERE k = 5");
     file.execute("CHECKPOINT").expect("checkpoints");
     drop(file);
     let file = open(&path);
     assert!(masked(&file), "the second delete was not written down beside the file");
     same(&file, &memory, "after a second delete and a reopen");
+    assert!(summed(&file).is_some(), "the second record did not count what its rows held");
     both(&file, &memory, "INSERT INTO t VALUES (300000, 1, 'late', 1)");
     file.execute("CHECKPOINT").expect("checkpoints");
     drop(file);

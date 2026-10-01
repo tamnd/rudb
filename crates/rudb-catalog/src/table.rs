@@ -364,7 +364,20 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.exact_sum(column),
             Self::Native(reader) => reader.exact_sum(column),
-            Self::Masked(..) => Ok(None),
+            // The file's sum less what the rows it records as gone held, while those are all the
+            // rows gone. A delete since then has taken rows nobody counted.
+            Self::Masked(reader, gone) => {
+                let Some(stored) = reader.gone().filter(|stored| stored.total == gone.total())
+                else {
+                    return Ok(None);
+                };
+                let (Some((held, counted)), Some(Some((lost, fewer)))) =
+                    (reader.exact_sum(column)?, stored.sums.get(column).copied())
+                else {
+                    return Ok(None);
+                };
+                Ok(held.checked_sub(lost).zip(counted.checked_sub(fewer)))
+            }
             // A sum and a row count both add, so the pair adds, and an answer needs both halves
             // because a sum over some of the rows is not a sum over the table.
             Self::Grown(reader, rows) => {
@@ -934,6 +947,13 @@ impl Rows {
         }
     }
 
+    /// Whether [`Self::marks`] has a record to hand back, without reading anything for it.
+    #[must_use]
+    pub fn markable(&self) -> bool {
+        matches!(self, Self::Masked(reader, gone)
+            if !self.is_stored() && gone.total() * 2 <= reader.table().rows())
+    }
+
     /// For a table whose file is still the one it was read from and some of whose rows a delete
     /// took out since the file last said, every row gone from it, for a checkpoint to write down
     /// beside the file rather than write the rest of the table again.
@@ -941,15 +961,21 @@ impl Rows {
     /// `None` once half the file's rows are gone. The gone rows still take their space in the
     /// file, and past that point writing the rest of the table again is what gives it back, at a
     /// cost no more than the rows that are left.
-    #[must_use]
-    pub fn marks(&self) -> Option<rudb_native::GoneRows> {
+    ///
+    /// The record carries what the gone rows held of each integer column the file keeps a sum
+    /// of, so a sum over what is left is still answered without reading the table.
+    ///
+    /// # Errors
+    ///
+    /// If a part the new rows went from does not read back.
+    pub fn marks(&self) -> Result<Option<rudb_native::GoneRows>> {
         match self {
-            Self::Masked(reader, gone)
-                if !self.is_stored() && gone.total() * 2 <= reader.table().rows() =>
-            {
-                Some(gone.marks())
+            Self::Masked(reader, gone) if self.markable() => {
+                let mut marks = gone.marks();
+                marks.sums = reader.gone_sums(&marks, reader.gone())?;
+                Ok(Some(marks))
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 

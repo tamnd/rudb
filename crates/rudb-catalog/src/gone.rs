@@ -56,7 +56,7 @@ impl Gone {
             .enumerate()
             .filter_map(|(part, bits)| bits.as_ref().map(|bits| (part, Box::from(&bits[..]))))
             .collect();
-        rudb_native::GoneRows { parts, total: self.total }
+        rudb_native::GoneRows { parts, total: self.total, sums: Vec::new() }
     }
 
     /// How many rows are gone in all.
