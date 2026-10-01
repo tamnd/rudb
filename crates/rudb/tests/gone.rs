@@ -116,6 +116,36 @@ fn rows_gone_from_a_file_stay_gone_through_a_checkpoint_and_a_reopen() {
 }
 
 #[test]
+fn a_checkpoint_after_a_delete_writes_the_rows_gone_and_not_the_rows_kept() {
+    let (path, file, memory) = loaded("marks");
+    let before = std::fs::metadata(&path).expect("the file is there").len();
+    both(&file, &memory, "DELETE FROM t WHERE id % 10 = 3 OR id BETWEEN 40000 AND 41000");
+    file.execute("CHECKPOINT").expect("checkpoints");
+    let grown = std::fs::metadata(&path).expect("the file is there").len() - before;
+    // A bit for each row of every part that lost one, which is every part here, and a catalog.
+    assert!(grown < before / 20, "the checkpoint wrote {grown} bytes over a file of {before}");
+    assert!(masked(&file), "the checkpoint read the table back into memory");
+    same(&file, &memory, "after the checkpoint");
+    drop(file);
+    let file = open(&path);
+    assert!(masked(&file), "the file did not say which rows were gone");
+    same(&file, &memory, "after the reopen");
+    both(&file, &memory, "DELETE FROM t WHERE k = 5");
+    file.execute("CHECKPOINT").expect("checkpoints");
+    drop(file);
+    let file = open(&path);
+    assert!(masked(&file), "the second delete was not written down beside the file");
+    same(&file, &memory, "after a second delete and a reopen");
+    both(&file, &memory, "INSERT INTO t VALUES (300000, 1, 'late', 1)");
+    file.execute("CHECKPOINT").expect("checkpoints");
+    drop(file);
+    let file = open(&path);
+    same(&file, &memory, "after an insert into a table with rows gone and a reopen");
+    drop(file);
+    remove(&path);
+}
+
+#[test]
 fn rows_gone_from_a_file_come_back_when_the_transaction_rolls_back() {
     let (path, file, memory) = loaded("rollback");
     let connection = file.connect();
