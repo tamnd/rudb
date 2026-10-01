@@ -3130,14 +3130,32 @@ impl NativePlace {
 /// the right rows in the right order with nothing saying so. The table is then rebound to what the
 /// file says, so the declaration would be gone from the catalog as well, on the statement that
 /// honoured it.
+///
+/// The keys go down with it for the same reason. A table loaded this way is not written again at
+/// the next checkpoint, so a key the file does not hold is a key the next open does not have.
 fn declared(
     writer: rudb_native::Writer,
     clustering: Option<Clustering>,
+    keys: &[Key],
 ) -> Result<rudb_native::Writer> {
-    match clustering {
-        None => Ok(writer),
-        Some(clustering) => writer.declare(clustering),
+    let writer = match clustering {
+        None => writer,
+        Some(clustering) => writer.declare(clustering)?,
+    };
+    if keys.is_empty() {
+        return Ok(writer);
     }
+    let mut stored = rudb_native::Constraints::default();
+    for key in keys {
+        let columns = key
+            .columns
+            .iter()
+            .map(|&column| u16::try_from(column))
+            .collect::<std::result::Result<Vec<u16>, _>>()
+            .map_err(|_| Error::internal("a key over a column past what a file can name"))?;
+        stored.keys.push((columns, key.primary));
+    }
+    writer.constrain(stored)
 }
 
 /// How many rows a load asks the scan under it to gather small row groups into, as one morsel.
@@ -3244,7 +3262,7 @@ impl NativeSink {
         let writer = rudb_native::Writer::create(&temporary, name.clone(), fields.clone())?
             .with_profile(Arc::clone(&profile))
             .with_dictionary_cap(dictionary_budget(limit));
-        let mut writer = declared(writer, clustering)?;
+        let mut writer = declared(writer, clustering, &keys)?;
         Ok(Self {
             preparer: writer.preparer(),
             merger: writer.merger()?,
@@ -3274,7 +3292,7 @@ impl NativeSink {
         let writer = rudb_native::Writer::open(target, name.clone(), fields.clone())?
             .with_profile(Arc::clone(&profile))
             .with_dictionary_cap(dictionary_budget(limit));
-        let mut writer = declared(writer, clustering)?;
+        let mut writer = declared(writer, clustering, &keys)?;
         Ok(Self {
             preparer: writer.preparer(),
             merger: writer.merger()?,
