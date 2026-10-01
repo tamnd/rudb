@@ -16,6 +16,7 @@
 pub mod entrycatalog;
 pub mod file;
 pub mod functioncatalog;
+pub mod implicit;
 pub mod pragmacatalog;
 pub mod settingcatalog;
 pub mod signature;
