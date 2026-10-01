@@ -1,6 +1,6 @@
 //! A delete from a table that lives in a file marks its rows gone beside the file rather than
 //! reading every row it keeps into memory, and every query over the table still answers as if
-//! the rows had been taken out.
+//! the rows had been taken out. An update writes the rows it changed beside the file the same way.
 //!
 //! Each test runs the same statements on a file and on a database in memory, which keeps its rows
 //! the ordinary way, and compares the answers.
@@ -217,6 +217,86 @@ fn a_delete_that_returns_its_rows_or_is_logged_still_marks_them() {
     // The log has the delete and the file does not, so this is replay putting it back.
     let file = open(&path);
     same(&file, &memory, "after the log was replayed");
+    drop(file);
+    remove(&path);
+}
+
+fn patched(db: &Database) -> bool {
+    db.with_catalog(|catalog| {
+        let name = catalog.resolve(&["t"]).expect("resolves");
+        let table = catalog.table(&name).expect("the table is there");
+        table.rows().gone().is_some_and(rudb_catalog::Gone::is_patched)
+    })
+}
+
+#[test]
+fn an_update_of_a_file_writes_its_rows_beside_it_and_reads_as_if_they_were_there() {
+    let (path, file, memory) = loaded("update");
+    both(&file, &memory, "UPDATE t SET v = v + 1 WHERE id % 100 = 7");
+    assert!(patched(&file), "the update read the table into memory");
+    same(&file, &memory, "after one update");
+    // The column a part's bounds answer a filter on, moved out of those bounds.
+    both(&file, &memory, "UPDATE t SET id = id + 1000000, s = 'moved' WHERE id % 997 = 0");
+    same(&file, &memory, "after an update of the column the filters test");
+    // Over rows written before, so the newer of the two has to win.
+    both(&file, &memory, "UPDATE t SET v = NULL, k = 9 WHERE id % 100 = 7 AND id < 50000");
+    same(&file, &memory, "after an update over updated rows");
+    both(&file, &memory, "DELETE FROM t WHERE id % 3 = 0");
+    assert!(patched(&file) && masked(&file), "the delete read the table into memory");
+    same(&file, &memory, "after a delete of some updated rows");
+    both(&file, &memory, "UPDATE t SET s = s || '!' WHERE k = 4");
+    same(&file, &memory, "after an update of a table with rows gone");
+    file.execute("CHECKPOINT").expect("checkpoints");
+    same(&file, &memory, "after the checkpoint");
+    drop(file);
+    let file = open(&path);
+    same(&file, &memory, "after the reopen");
+    drop(file);
+    remove(&path);
+}
+
+#[test]
+fn an_update_beside_a_file_is_replayed_and_rolled_back() {
+    let (path, file, memory) = loaded("update-log");
+    both(&file, &memory, "UPDATE t SET v = -v, s = 'neg' WHERE k = 3");
+    assert!(patched(&file), "the update read the table into memory");
+    let connection = file.connect();
+    connection.execute("BEGIN").expect("begins");
+    connection.execute("UPDATE t SET v = 0 WHERE k = 1").expect("updates");
+    assert_eq!(
+        connection
+            .value("SELECT count(*) FROM t WHERE k = 1 AND v = 0")
+            .expect("counts")
+            .to_string(),
+        memory.value("SELECT count(*) FROM t WHERE k = 1").expect("counts").to_string()
+    );
+    connection.execute("ROLLBACK").expect("rolls back");
+    drop(connection);
+    same(&file, &memory, "after the rollback");
+    drop(file);
+    // The log has the update and the file does not, so this is replay putting it back.
+    let file = open(&path);
+    same(&file, &memory, "after the log was replayed");
+    drop(file);
+    remove(&path);
+}
+
+#[test]
+fn an_update_beside_a_file_keeps_to_the_table_constraints() {
+    let path = path("update-checks");
+    let file = open(&path);
+    file.execute(
+        "CREATE TABLE c (a INTEGER NOT NULL, b INTEGER CHECK (b < 1000)); \
+         INSERT INTO c SELECT range, range FROM range(100)",
+    )
+    .expect("loads");
+    file.execute("CHECKPOINT").expect("checkpoints");
+    assert!(file.execute("UPDATE c SET a = NULL WHERE a = 5").is_err());
+    assert!(file.execute("UPDATE c SET b = b + 1000 WHERE a = 6").is_err());
+    file.execute("UPDATE c SET b = b + 500 WHERE a < 10").expect("updates");
+    // Ten rows moved up by 500 each, and nothing from the two that were refused.
+    assert_eq!(file.value("SELECT sum(b) FROM c").expect("sums").to_string(), "9950");
+    assert_eq!(file.value("SELECT count(a) FROM c").expect("counts").to_string(), "100");
     drop(file);
     remove(&path);
 }
