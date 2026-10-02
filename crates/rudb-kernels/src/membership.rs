@@ -130,32 +130,48 @@ struct Text {
     words: Vec<(u64, usize)>,
     short: Vec<Box<[u8]>>,
     set: HashSet<Box<[u8]>>,
+    /// The bytes of a row that are looked up, when the list was over the first that many
+    /// characters of it and every entry is that many ASCII characters. See [`Members::prefixed`].
+    prefix: Option<usize>,
 }
 
 /// The bytes of a value of at most eight bytes as one word, the first byte lowest.
 #[inline]
 fn word(value: &[u8]) -> u64 {
-    let mut bytes = [0_u8; 8];
-    bytes[..value.len()].copy_from_slice(value);
-    u64::from_le_bytes(bytes)
+    // A byte at a time rather than a copy into a buffer, which is a call to `memcpy` for a length
+    // the compiler cannot see and cost more than the rest of the lookup.
+    let mut word = 0_u64;
+    for (at, &byte) in value.iter().enumerate() {
+        word |= u64::from(byte) << (8 * at);
+    }
+    word
 }
 
 impl Text {
     fn of(set: HashSet<String>) -> Self {
         let held = set.into_iter().map(|text| text.into_bytes().into_boxed_slice());
         if held.len() > SHORT {
-            return Self { words: Vec::new(), short: Vec::new(), set: held.collect() };
+            return Self {
+                words: Vec::new(),
+                short: Vec::new(),
+                set: held.collect(),
+                prefix: None,
+            };
         }
         let short: Vec<Box<[u8]>> = held.collect();
         if short.iter().all(|text| text.len() <= 8) {
             let words = short.iter().map(|text| (word(text), text.len())).collect();
-            return Self { words, short, set: HashSet::new() };
+            return Self { words, short, set: HashSet::new(), prefix: None };
         }
-        Self { words: Vec::new(), short, set: HashSet::new() }
+        Self { words: Vec::new(), short, set: HashSet::new(), prefix: None }
     }
 
     #[inline]
     fn contains(&self, value: &[u8]) -> bool {
+        let value = match self.prefix {
+            Some(length) if value.len() > length => &value[..length],
+            _ => value,
+        };
         if !self.words.is_empty() {
             if value.len() > 8 {
                 return false;
@@ -168,6 +184,13 @@ impl Text {
         } else {
             self.set.contains(value)
         }
+    }
+
+    /// The prefix length and the mask over a view's first four bytes that keeps it, when the list
+    /// is over a prefix that short and is held as words.
+    fn within_view(&self) -> Option<(usize, u32)> {
+        let length = self.prefix.filter(|&length| length <= 4 && !self.words.is_empty())?;
+        Some((length, u32::MAX >> (32 - 8 * length)))
     }
 
     fn iter(&self) -> impl Iterator<Item = &[u8]> {
@@ -228,6 +251,24 @@ impl Members {
         Some(Self { held, has_null, negated, sought: OnceLock::new(), peel: Peel::default() })
     }
 
+    /// The same list, asked of the first `length` characters of a row rather than of all of it.
+    ///
+    /// `substring(x, 1, 2) IN ('13', '31')` is how TPC-H q22 asks for a phone number's country
+    /// code, and making the substring of every row cost more than reading the column did. When every
+    /// entry is `length` ASCII characters, the first `length` characters of a row are one of them
+    /// exactly when its first `length` bytes are, since an ASCII byte is never part of a longer
+    /// character. A row shorter than that is its own substring and is no entry either way. So the
+    /// row's bytes are cut where they lie and nothing is made. `false`, with the list left as it
+    /// was, for a list of anything else.
+    pub fn prefixed(&mut self, length: usize) -> bool {
+        let Held::Text(set) = &mut self.held else { return false };
+        if length == 0 || !set.iter().all(|text| text.len() == length && text.is_ascii()) {
+            return false;
+        }
+        set.prefix = Some(length);
+        true
+    }
+
     /// Which codes of `column`'s dictionary hold one of this list's values, or `None` when there is no
     /// sorted order to find them with.
     ///
@@ -241,6 +282,10 @@ impl Members {
     /// to the loop below, which reads the codes' values as a run and is already one lookup a row.
     fn sought(&self, column: &Vector) -> Option<Result<&[bool]>> {
         let Held::Text(set) = &self.held else { return None };
+        // A search finds whole values, and a row that only starts with an entry is not one.
+        if set.prefix.is_some() {
+            return None;
+        }
         let (_, dictionary) = column.shared_dictionary_parts()?;
         if self.sought.get().is_none() {
             let ranks = dictionary.ranks()?;
@@ -594,9 +639,22 @@ fn look<A: Fn(usize) -> usize>(
     returns: &LogicalType,
 ) -> Result<Vector> {
     match (&members.held, data) {
-        (Held::Text(set), Data::Varlen(column)) => answer(rows, base, members, returns, |index| {
-            column.bytes(at(index)).is_some_and(|text| set.contains(text))
-        }),
+        (Held::Text(set), Data::Varlen(column)) => match set.within_view() {
+            // Every view holds the first four bytes of its string, so a list over that many
+            // characters or fewer is answered from the views and no string is read.
+            Some((length, mask)) => {
+                let views = column.views();
+                answer(rows, base, members, returns, |index| {
+                    views.get(at(index)).is_some_and(|view| {
+                        let held = u64::from(u32::from_le_bytes(view.prefix()) & mask);
+                        view.len() >= length && set.words.iter().any(|&(word, _)| word == held)
+                    })
+                })
+            }
+            None => answer(rows, base, members, returns, |index| {
+                column.bytes(at(index)).is_some_and(|text| set.contains(text))
+            }),
+        },
         (Held::Whole(set), Data::Int8(held)) => {
             answer(rows, base, members, returns, |index| holds(set, held.as_slice(), at(index)))
         }
@@ -741,6 +799,41 @@ mod tests {
         let members = Members::of(list, negated).expect("this list folds");
         let answer = in_set(input, &members, &LogicalType::Boolean).expect("the lookup runs");
         (0..input.len()).map(|row| answer.value_at(row)).collect()
+    }
+
+    #[test]
+    fn a_prefixed_list_answers_what_the_substring_would() {
+        let texts = ["13-555", "1", "", "130", "é3", "31", "3", "31é", "13", "31-xxé", "31-x"];
+        let mut values: Vec<Value> =
+            texts.iter().map(|text| Value::Varchar((*text).into())).collect();
+        values.push(Value::Null);
+        let input = Vector::from_values(LogicalType::Varchar, &values).expect("strings");
+        // Two characters, which the views answer, and five, which reads the strings.
+        for (list, length) in [(["13", "31"], 2), (["13-55", "31-xx"], 5)] {
+            let list = list.map(|text| Value::Varchar(text.into()));
+            for negated in [false, true] {
+                let mut members = Members::of(&list, negated).expect("this list folds");
+                assert!(members.prefixed(length));
+                let answer =
+                    in_set(&input, &members, &LogicalType::Boolean).expect("the lookup runs");
+                for (row, value) in values.iter().enumerate() {
+                    let wanted = match value {
+                        Value::Varchar(text) => {
+                            let cut: String = text.chars().take(length).collect();
+                            let found = list.contains(&Value::Varchar(cut));
+                            Value::Boolean(found != negated)
+                        }
+                        _ => Value::Null,
+                    };
+                    assert_eq!(answer.value_at(row), wanted, "{value:?} in {list:?}");
+                }
+            }
+        }
+        // A list with an entry of another length, or of a character past ASCII, is left whole.
+        for other in ["1", "é", "131"] {
+            let list = [Value::Varchar("13".into()), Value::Varchar(other.into())];
+            assert!(!Members::of(&list, false).expect("this list folds").prefixed(2), "{other}");
+        }
     }
 
     fn numbers() -> Vector {

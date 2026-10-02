@@ -1537,9 +1537,16 @@ impl Prepared {
             };
             values.push(plan.value(reference).clone());
         }
-        let (Some(subject), Some(members)) = (subject, Members::of(&values, op == Connective::And))
+        let (Some(subject), Some(mut members)) =
+            (subject, Members::of(&values, op == Connective::And))
         else {
             return Ok(None);
+        };
+        // A list over the first characters of a text column is asked of the column as it is, so no
+        // substring is made. See [`Members::prefixed`].
+        let subject = match leading(plan, subject) {
+            Some((text, length)) if members.prefixed(length) => text,
+            _ => subject,
         };
         Ok(Some(Step::InSet { input: self.push(plan, subject, schema)?, members }))
     }
@@ -1621,6 +1628,29 @@ fn stamped_seconds(plan: &Plan, expr: ExprRef) -> Option<(ExprRef, ExprRef)> {
     );
     (plan.string(name) == "to_seconds" && plan.expr_type(cast) == &LogicalType::Double && whole)
         .then_some((stamp, input))
+}
+
+/// The text and the character count of `substring(text, 1, count)`, when that is what `expr` is.
+fn leading(plan: &Plan, expr: ExprRef) -> Option<(ExprRef, usize)> {
+    let Expr::Function { name, args } = *plan.expr(expr) else { return None };
+    let &[text, start, count] = plan.expr_list(args) else { return None };
+    if !matches!(plan.string(name), "substring" | "substr")
+        || plan.expr_type(text) != &LogicalType::Varchar
+    {
+        return None;
+    }
+    let whole = |at: ExprRef| match plan.expr(at) {
+        Expr::Constant(value) => match plan.value(*value) {
+            Value::BigInt(held) => Some(*held),
+            Value::Integer(held) => Some(i64::from(*held)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if whole(start)? != 1 {
+        return None;
+    }
+    Some((text, usize::try_from(whole(count)?).ok()?))
 }
 
 fn same(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
