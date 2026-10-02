@@ -1110,6 +1110,7 @@ pub(crate) fn found_for(
     let mut held =
         Held { keyed, chunks, by_key: by_key.as_ref().map(|(domain, _)| domain), made: None };
     let listed = match exact.filter(|_| placed) {
+        Some(exact) if exact.own => owned(exact, keyed, chunks)?,
         Some(exact) => listed(exact, chunks, &mut held)?,
         None => None,
     };
@@ -1421,6 +1422,31 @@ fn gathered(exact: &Exact, planned: &Planned) -> Option<Pushed> {
             Some(Pushed { rids, parts, skipped: 0, stopped: false })
         }
     }
+}
+
+/// The driving rows that hold the build side's keys, when the driving column is its table's own
+/// unique key, read off that column's key map.
+///
+/// A join whose build side is not a stored parent, such as the orders TPC-H q18 keeps after
+/// grouping `lineitem`, has no link to follow, and without this the scan of `orders` tested all
+/// 1.5 million of its rows against a bitmap of 57 keys. The map turns each key into its row, so the
+/// scan reads those rows and no others. `None` past what [`owned_keys`] takes.
+fn owned(exact: &Exact, keyed: &Keyed<'_>, chunks: &[Chunk]) -> Result<Option<Pushed>> {
+    let rows: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+    if exact.parents == 0 || rows.saturating_mul(GATHERED) >= exact.parents {
+        return Ok(None);
+    }
+    let mut keys = Vec::with_capacity(usize::try_from(rows).unwrap_or(0));
+    for chunk in chunks {
+        let Some(column) = keyed.keys(chunk)? else { return Ok(None) };
+        for row in 0..chunk.len() {
+            // A null key matches nothing, and a key past `i64` is in no `BIGINT` key map.
+            if let Some(key) = column.signed_at(row).and_then(|key| i64::try_from(key).ok()) {
+                keys.push(key);
+            }
+        }
+    }
+    Ok(owned_keys(exact, rows, keys.into_iter()))
 }
 
 /// The rows of a table whose own unique column holds one of `count` key values, read off its key

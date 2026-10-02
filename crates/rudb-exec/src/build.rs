@@ -1432,8 +1432,15 @@ fn exact(
         rudb_native::graph::holds_key_map(parent_rows, parent_column)
             .then_some((parent_table, parent_column))
     });
-    let (parent_table, parent_column) =
-        keyed.or_else(|| linked_parent(catalog, child_table, child_column))?;
+    let Some((parent_table, parent_column)) =
+        keyed.or_else(|| linked_parent(catalog, child_table, child_column))
+    else {
+        // A build side that is not a stored parent, joined to the driving table's own unique key,
+        // is turned into driving rows by that key's map. See `sideways::owned`.
+        let child_rows = child_table.rows().stored()?;
+        return (parent.is_some() && rudb_native::graph::holds_key_map(child_rows, child_column))
+            .then(|| Exact::own(child_rows.clone(), child_column));
+    };
     let parent_rows = parent_table.rows().stored()?;
     // No link is a join that still has the key map, and the key map alone is enough for an exact
     // test of the driving column's values, see `sideways::Domain`. A link over the budget is not in
