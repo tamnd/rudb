@@ -5532,12 +5532,18 @@ impl PagePool {
     /// does, for a file a database reads beside its own, the way it reads a Parquet file's mirror.
     #[must_use]
     pub fn following(other: &Self) -> Self {
-        Self { last: Arc::clone(&other.last), ..Self::default() }
+        Self { last: Arc::clone(&other.last), told: Arc::clone(&other.told), ..Self::default() }
     }
 
     /// Whether [`PagePool::last_statement`] has been said.
     fn is_last(&self) -> bool {
         self.last.load(Atomic::Relaxed)
+    }
+
+    /// Whether no statement after the one running reads through this pool, whether or not this one
+    /// reads a table twice. See [`paid_at`].
+    fn is_final(&self) -> bool {
+        self.told.load(Atomic::Relaxed)
     }
 
     /// A pool that keeps up to `budget` bytes of pages and no decoded parts.
@@ -9514,7 +9520,7 @@ impl Reader {
             // run into the `Arc` without touching a value.
             let mut vector = match positions {
                 Some(positions) if !keeping => {
-                    let paid = paid_at(rows, bytes, positions);
+                    let paid = paid_at(rows, bytes, positions, self.pool.is_final());
                     if keeps && self.pool.is_last() {
                         self.pay(at, column, paid);
                         decode_at(&field.ty, rows, bytes, dictionary, positions)?
@@ -9658,6 +9664,11 @@ impl Reader {
     /// read of all of it stays packed, since the kernels that read whole parts work on the codes and
     /// the packed part is a fraction of the memory. The slot is asked first, so a part another worker
     /// already holds is not written out flat for nothing.
+    ///
+    /// In the last statement a part is kept packed either way. What it is gathered from after this
+    /// read is at most the statement's own second read, and writing out a whole part to save a few
+    /// unpacks there cost more than it saved: TPC-H q17 reads three rows a part of `lineitem`, and
+    /// writing its held parts out flat was a third of the query, most of it page faults.
     fn keep(&self, at: usize, column: usize, vector: Vector, gathered: bool) -> Arc<Vector> {
         let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else {
             return Arc::new(vector);
@@ -9665,7 +9676,8 @@ impl Reader {
         if let PartSlot::Held { vector, .. } = &*held {
             return Arc::clone(vector);
         }
-        let vector = if gathered { vector.unpacked_to_hold() } else { vector };
+        let vector =
+            if gathered && !self.pool.is_final() { vector.unpacked_to_hold() } else { vector };
         let bytes = vector.footprint();
         let vector = Arc::new(vector);
         let used = Arc::new(AtomicBool::new(false));
@@ -14849,14 +14861,21 @@ fn body_of(codec: u8, rows: usize, bytes: &[u8]) -> Option<&[u8]> {
 /// row. Counting all of those as one row a position was what kept JOB 20b walking the runs of
 /// `cast_info` and 31a expanding them on every warm run, since a read that paid for the whole part
 /// counted a few of its rows and the part was never held.
-fn paid_at(rows: usize, bytes: &[u8], positions: &[u32]) -> usize {
+///
+/// With `last` no statement after this one reads through the pool, even when this one reads a table
+/// twice, and a packed integer pays [`SPARSE_RENT`] a row, what the read costs, so a part is held
+/// only once this statement's own reads of it come to a whole decode. [`HOLD_RENT`] is paid for the
+/// statements after, and with none there is nothing for it to buy. TPC-H q17 reads `lineitem`
+/// twice at about three rows a part, and holding every part it touched on the first read decoded
+/// and unpacked each of them whole.
+fn paid_at(rows: usize, bytes: &[u8], positions: &[u32], last: bool) -> usize {
     let wanted = positions.len();
     if bytes.first() == Some(&6) {
         return if body_of(6, rows, bytes).is_some_and(string::pointed) { wanted } else { rows };
     }
     let pointed = cascade_body(rows, bytes).is_some_and(integer::pointed);
     if pointed && wanted.saturating_mul(SPARSE_RENT) <= rows {
-        wanted.saturating_mul(HOLD_RENT).min(rows)
+        wanted.saturating_mul(if last { SPARSE_RENT } else { HOLD_RENT }).min(rows)
     } else {
         rows
     }
@@ -17915,6 +17934,21 @@ mod tests {
         assert!(matches!(*slot(1), PartSlot::Seen(64)), "a statement reading once only counts");
         drop((a, catalog));
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A read of a few packed integers in the last statement pays what it costs toward holding the
+    /// part, even when the statement reads the table twice, where before the last statement it pays
+    /// enough to hold the part at once.
+    #[test]
+    fn a_sparse_read_in_the_last_statement_pays_what_it_costs() {
+        let values: Vec<i64> = (0..2048).map(|i| i * 2_654_435_761 / 128 % 1000).collect();
+        let packed = integer::encode_only(integer::Kind::Packed, &values)
+            .expect("packed")
+            .expect("these values pack");
+        let page = [&[5, 0][..], &packed].concat();
+        assert!(cascade_body(2048, &page).is_some_and(integer::pointed), "a page read by rows");
+        assert_eq!(paid_at(2048, &page, &[5, 900, 1500], true), 24, "three rows pay eight each");
+        assert_eq!(paid_at(2048, &page, &[5, 900, 1500], false), 2048, "or the whole part");
     }
 
     /// A whole read holds the part it decoded, reads at positions count what they cost until the
