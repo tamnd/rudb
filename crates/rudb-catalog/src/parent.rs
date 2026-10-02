@@ -79,7 +79,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::{Error, LogicalType, Result, Spread, Value, serially};
-use rudb_vector::{Form, NO_ROW, Validity, Vector, concat_on, picked};
+use rudb_vector::{Form, NO_ROW, Validity, Vector, concat, concat_on, picked};
 
 use crate::table::Rows;
 
@@ -137,6 +137,9 @@ enum Shape {
     /// and for each row which of those parts and which of its offsets, with [`NO_ROW`] as the part
     /// of a row that has no parent.
     Many(Vec<(usize, Vec<u32>)>, Vec<(u32, u32)>),
+    /// Several parts reached one after another by rows that rise, each with the offsets of its
+    /// rows, so the pieces lay end to end in the chunk's order with nothing to interleave.
+    Rising(Vec<(usize, Vec<u32>)>),
     /// More than half the parts, kept as the row ids themselves and gathered out of the column read
     /// whole, with the number of parts reached.
     Whole(usize, Vec<u32>),
@@ -149,7 +152,7 @@ impl Placement {
         match &self.shape {
             Shape::Nowhere => 0,
             Shape::One(..) => 1,
-            Shape::Many(parts, _) => parts.len(),
+            Shape::Many(parts, _) | Shape::Rising(parts) => parts.len(),
             Shape::Whole(parts, _) => *parts,
         }
     }
@@ -257,6 +260,19 @@ impl Parent {
             }
             return Ok(Placement { rows: rids.len(), shape: Shape::Whole(parts, rids.to_vec()) });
         }
+        if let Some(shape) = rising(directory, rids)? {
+            if !(shape.len() > 1
+                && shape.len() * 2 > parts
+                && !self.refused.load(Ordering::Relaxed))
+            {
+                let shape = match <[_; 1]>::try_from(shape) {
+                    Ok([(part, offsets)]) => Shape::One(part, Arc::new(offsets)),
+                    Err(shape) if shape.is_empty() => Shape::Nowhere,
+                    Err(shape) => Shape::Rising(shape),
+                };
+                return Ok(Placement { rows: rids.len(), shape });
+            }
+        }
         // For each part, its place among the parts this chunk reached, in the order reached.
         let mut numbered = vec![NO_ROW; parts];
         let mut reached: Vec<usize> = Vec::new();
@@ -363,6 +379,36 @@ impl Parent {
                 // Past the budget, so this chunk and every one after it go by part.
                 self.refused.store(true, Ordering::Relaxed);
                 self.gather(column, ty, &self.place(rids)?)
+            }
+            Shape::Rising(parts) => {
+                let mut pieces = Vec::with_capacity(parts.len());
+                for (part, offsets) in parts {
+                    let Some(piece) = self.rows_in(column, *part, offsets)? else {
+                        return Ok(None);
+                    };
+                    pieces.push(piece);
+                }
+                if pieces.iter().all(|piece| piece.form() == Form::Flat)
+                    && let Some(whole) = concat(ty, &pieces)?
+                {
+                    return Ok(Some(whole));
+                }
+                // Pieces in forms that do not lay end to end as they are, codes into dictionaries
+                // of their own among them, are picked a row at a time like a chunk in no order.
+                let mut picks = Vec::with_capacity(placement.rows);
+                for (piece, (_, offsets)) in parts.iter().enumerate() {
+                    // Under the part count and the chunk's length, both far under a `u32`.
+                    picks.extend((0..offsets.len()).map(|row| (piece as u32, row as u32)));
+                }
+                let held: Vec<&Vector> = pieces.iter().collect();
+                if let Some(picked) = picked(ty, &held, &picks)? {
+                    return Ok(Some(picked));
+                }
+                let values: Vec<Value> = pieces
+                    .iter()
+                    .flat_map(|piece| (0..piece.len()).map(|row| piece.value_at(row)))
+                    .collect();
+                Vector::from_values(ty.clone(), &values).map(Some)
             }
             Shape::Many(parts, picks) => {
                 // Each part's own rows first, which is where the part's form is dealt with: a
@@ -674,6 +720,46 @@ impl Parent {
         // decoded. See the module doc for why this is a decode the hash join pays as well.
         Ok(Some(piece.flatten()?))
     }
+}
+
+/// The parts a chunk of rising row ids reaches, each with the offsets of its rows in it, or `None`
+/// when the ids do not rise or one of them has no parent.
+///
+/// A child stored in its parent's order, which a monotone link is, hands up parents that rise, and
+/// then the rows of each part are one stretch of the chunk. Finding the end of each stretch is a
+/// search, and an offset is a subtraction, where the general placement looked up the part of every
+/// row twice and the gather then picked the rows back into order one at a time. On TPC-H q09 the
+/// two were a tenth of the query for the dates of `orders`.
+fn rising(directory: &Directory, rids: &[u32]) -> Result<Option<Vec<(usize, Vec<u32>)>>> {
+    if !rids.windows(2).all(|pair| pair[0] <= pair[1]) {
+        return Ok(None);
+    }
+    let starts = directory.starts.as_slice();
+    let total = starts.last().copied().unwrap_or(0);
+    match rids.last() {
+        None => return Ok(Some(Vec::new())),
+        Some(&NO_ROW) => return Ok(None),
+        Some(&last) if u64::from(last) >= total => {
+            return Err(Error::internal(format!(
+                "a gathered row id {last} is past the {total} rows of its parent"
+            )));
+        }
+        Some(_) => {}
+    }
+    let mut shape = Vec::new();
+    let mut at = 0;
+    while at < rids.len() {
+        let part = directory.part_of(u64::from(rids[at]));
+        let (start, end) = (starts[part], starts[part + 1]);
+        let stop = at + rids[at..].partition_point(|&rid| u64::from(rid) < end);
+        // In the part, so under its row count, which is a `usize` the part was read into.
+        shape.push((
+            part,
+            rids[at..stop].iter().map(|&rid| (u64::from(rid) - start) as u32).collect(),
+        ));
+        at = stop;
+    }
+    Ok(Some(shape))
 }
 
 /// The pieces of a column as one run of codes into the dictionary they all share, or `None` when
@@ -1002,6 +1088,32 @@ mod tests {
             let want = if id == NO_ROW { Value::Null } else { Value::Integer(id as i32) };
             assert_eq!(column.value_at(row), want, "row {row}");
         }
+    }
+
+    /// Rows that rise, which is a child stored in its parent's order, are placed as a stretch per
+    /// part and come back in the order asked, repeats and all, whatever the column's form.
+    #[test]
+    fn a_gather_of_rising_rows_lays_the_parts_end_to_end() {
+        let values: Vec<i32> = (0..1000).collect();
+        let parent = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        let ids = [5, 5, 127, 128, 300, 301, 301];
+        let rising = parent.place(&ids).expect("placed");
+        assert_eq!(rising.parts(), 3);
+        let column = parent.gather(0, &LogicalType::Integer, &rising).expect("read").expect("fits");
+        assert_eq!(column.len(), ids.len());
+        for (row, &id) in ids.iter().enumerate() {
+            assert_eq!(column.value_at(row), Value::Integer(id as i32), "row {row}");
+        }
+
+        let names: Vec<String> = (0..1000).map(|at| format!("name {at}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let parent = Parent::new(strings(&names, 128), 64 * 1024 * 1024);
+        let rising = parent.place(&ids).expect("placed");
+        let column = parent.gather(0, &LogicalType::Varchar, &rising).expect("read").expect("fits");
+        for (row, &id) in ids.iter().enumerate() {
+            assert_eq!(column.value_at(row), Value::Varchar(format!("name {id}")), "row {row}");
+        }
+        assert_eq!(parent.place(&[]).expect("placed").parts(), 0);
     }
 
     /// Once a chunk has been gathered out of the column read whole, a later chunk is placed whole
