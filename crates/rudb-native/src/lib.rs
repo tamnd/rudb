@@ -9664,6 +9664,11 @@ impl Reader {
     /// read of all of it stays packed, since the kernels that read whole parts work on the codes and
     /// the packed part is a fraction of the memory. The slot is asked first, so a part another worker
     /// already holds is not written out flat for nothing.
+    ///
+    /// In the last statement a part is kept packed either way. What it is gathered from after this
+    /// read is at most the statement's own second read, and writing out a whole part to save a few
+    /// unpacks there cost more than it saved: TPC-H q17 reads three rows a part of `lineitem`, and
+    /// writing its held parts out flat was a third of the query, most of it page faults.
     fn keep(&self, at: usize, column: usize, vector: Vector, gathered: bool) -> Arc<Vector> {
         let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else {
             return Arc::new(vector);
@@ -9671,7 +9676,8 @@ impl Reader {
         if let PartSlot::Held { vector, .. } = &*held {
             return Arc::clone(vector);
         }
-        let vector = if gathered { vector.unpacked_to_hold() } else { vector };
+        let vector =
+            if gathered && !self.pool.is_final() { vector.unpacked_to_hold() } else { vector };
         let bytes = vector.footprint();
         let vector = Arc::new(vector);
         let used = Arc::new(AtomicBool::new(false));
