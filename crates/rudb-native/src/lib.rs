@@ -17941,42 +17941,14 @@ mod tests {
     /// enough to hold the part at once.
     #[test]
     fn a_sparse_read_in_the_last_statement_pays_what_it_costs() {
-        let path = path("sparse-rent");
-        let mut writer =
-            Writer::create(&path, "a", vec![Field::required("id", LogicalType::BigInt)])
-                .expect("new file");
-        let values: Vec<Value> =
-            (0..2048_i64).map(|i| Value::BigInt(i * 2_654_435_761 / 128 % 1000)).collect();
-        let chunk =
-            Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &values).expect("integers")])
-                .expect("matching rows");
-        writer.append(&chunk).expect("one part");
-        writer.finish().expect("commit");
-
-        let pool = PagePool::new(usize::MAX);
-        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
-        let a = catalog.table("a").expect("a");
-        let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
-        let positions = [5, 900, 1500];
-        pool.last_statement();
-        pool.rereads(true);
-        let read = a.read_rows(0, &[0], &positions, true).expect("three rows");
-        assert_eq!(read.value_at(1, 0), values[900]);
-        let paid = slot(0);
-        assert!(matches!(*paid, PartSlot::Seen(24)), "three rows pay eight each, not {paid:?}");
-        drop(paid);
-        drop((a, catalog));
-
-        let pool = PagePool::new(usize::MAX);
-        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
-        let a = catalog.table("a").expect("a");
-        let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
-        a.read_rows(0, &[0], &positions, true).expect("three rows");
-        let held = slot(0);
-        assert!(matches!(*held, PartSlot::Held { .. }), "with statements after, not {held:?}");
-        drop(held);
-        drop((a, catalog));
-        fs::remove_file(path).expect("remove scratch file");
+        let values: Vec<i64> = (0..2048).map(|i| i * 2_654_435_761 / 128 % 1000).collect();
+        let packed = integer::encode_only(integer::Kind::Packed, &values)
+            .expect("packed")
+            .expect("these values pack");
+        let page = [&[5, 0][..], &packed].concat();
+        assert!(cascade_body(2048, &page).is_some_and(integer::pointed), "a page read by rows");
+        assert_eq!(paid_at(2048, &page, &[5, 900, 1500], true), 24, "three rows pay eight each");
+        assert_eq!(paid_at(2048, &page, &[5, 900, 1500], false), 2048, "or the whole part");
     }
 
     /// A whole read holds the part it decoded, reads at positions count what they cost until the
