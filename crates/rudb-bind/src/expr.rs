@@ -1468,6 +1468,9 @@ impl Binder<'_> {
             [_, path] if rudb_kernels::json::NAMES.contains(&resolved.name) => {
                 self.json_path(resolved.name, *path, returns)?
             }
+            [_, structure] if rudb_kernels::json::TRANSFORMS.contains(&resolved.name) => {
+                self.json_shape(resolved.name, *structure)?
+            }
             _ => returns,
         };
         let args = self.plan_mut().add_expr_list(&cast);
@@ -1517,6 +1520,21 @@ impl Binder<'_> {
             Some(path) if rudb_kernels::json::wild_path(&path)? => Ok(LogicalType::list(returns)),
             _ => Ok(returns),
         }
+    }
+
+    /// The type `json_transform` answers, which is the one its structure names, so the structure has
+    /// to be a constant that is read before there are any rows. A null structure answers a null.
+    fn json_shape(&self, name: &str, structure: ExprRef) -> Result<LogicalType> {
+        let Some(constant) = fold::value_of(self.plan(), structure)? else {
+            let parameter = if name.ends_with("_strict") { "col1" } else { "structure" };
+            return Err(Error::binder(format!(
+                "The \"{parameter}\" argument in function \"{name}\" must be a constant expression"
+            )));
+        };
+        let Value::Varchar(text) = constant else { return Ok(LogicalType::Null) };
+        rudb_kernels::json::structure_type(&text, &mut |written| {
+            crate::statement::read_type(self.catalog(), written)
+        })
     }
 
     /// The pin's refusals of a call to one of the `JSON` builders, which it makes when it binds the

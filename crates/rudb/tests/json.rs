@@ -313,3 +313,123 @@ fn a_deep_document_is_merged_and_matched_without_running_out_of_stack() {
         ("SELECT length(json_pretty(repeat('[', 1000) || repeat(']', 1000)))", "3996002"),
     ]);
 }
+
+#[test]
+fn a_transform_reads_a_document_into_the_type_its_structure_names() {
+    check(&[
+        (
+            r#"SELECT json_transform('{"a":1,"b":"x"}', '{"a":"INTEGER"}'), typeof(json_transform('{"a":1,"b":"x"}', '{"a":"INTEGER"}'))"#,
+            "{'a': 1}|STRUCT(a INTEGER)",
+        ),
+        (
+            r#"SELECT json_transform('{"a":1}', '{"a":"INTEGER","c":"VARCHAR"}'), json_transform_strict('{"a":1}', '{"a":"INTEGER"}')"#,
+            "{'a': 1, 'c': NULL}|{'a': 1}",
+        ),
+        (
+            r#"SELECT json_transform('{"a":"x"}', '{"a":"INTEGER"}'), json_transform('[1,2]', '{"a":"INTEGER"}'), json_transform('{"a":1}', '["INTEGER"]'), json_transform('"x"', '"INTEGER"')"#,
+            "{'a': NULL}|{'a': NULL}|NULL|NULL",
+        ),
+        (
+            r#"SELECT json_transform('[1,"2",3.7,true,null]', '["INTEGER"]'), json_transform('[1,2]', '["VARCHAR"]'), json_transform('{"a":{"b":[1]}}', '{"a":"JSON"}'), typeof(json_transform('{"a":{"b":[1]}}', '{"a":"JSON"}'))"#,
+            r#"[1, 2, 4, 1, NULL]|[1, 2]|{'a': '{"b":[1]}'}|STRUCT(a JSON)"#,
+        ),
+        (
+            r#"SELECT json_transform('{"a":1,"a":2}', '{"a":"INTEGER"}'), json_transform_strict('{"a":1,"b":2}', '{"a":"INTEGER"}'), from_json('{"a":1}', '{"a":"INTEGER"}'), from_json_strict('{"a":1}', '{"a":"INTEGER"}')"#,
+            "{'a': 1}|{'a': 1}|{'a': 1}|{'a': 1}",
+        ),
+        (
+            r#"SELECT json_transform('{"a":1}', NULL), typeof(json_transform('{"a":1}', NULL)), json_transform(NULL, '{"a":"INTEGER"}'), json_transform('null', '{"a":"INTEGER"}')"#,
+            r#"NULL|"NULL"|NULL|NULL"#,
+        ),
+        (
+            r#"SELECT json_transform('{"k":1,"j":2}', '"MAP(VARCHAR, INTEGER)"'), json_transform('[1,2,3]', '"INTEGER[2]"'), json_transform('["2020-01-01","x"]', '["DATE"]')"#,
+            "{k=1, j=2}|NULL|[2020-01-01, NULL]",
+        ),
+        (
+            r#"SELECT json_transform('{"a":"1.5"}', '{"a":"INTEGER"}'), json_transform('{"a":"1e2"}', '{"a":"INTEGER"}'), json_transform('{"a":12345.5}', '{"a":"DECIMAL(4,2)"}'), json_transform('[[1,2],[3]]', '[["INTEGER"]]')"#,
+            "{'a': 2}|{'a': 100}|{'a': NULL}|[[1, 2], [3]]",
+        ),
+        (
+            r#"SELECT json_transform_strict('[" 2 ","0x10","-01"]', '["INTEGER"]'), json_transform_strict('["t","yes","no"]', '["BOOLEAN"]'), json_transform_strict('[" 1.5","1.","inf"]', '["DOUBLE"]')"#,
+            "[2, 16, -1]|[true, true, false]|[1.5, 1.0, inf]",
+        ),
+        (
+            r#"SELECT json_transform(j, '{"a":"INTEGER"}') FROM (VALUES ('{"a":1}'), ('{"a":"x"}'), (NULL), ('[]')) t(j)"#,
+            "{'a': 1}\n{'a': NULL}\nNULL\n{'a': NULL}",
+        ),
+    ]);
+    let cases = [
+        (
+            r#"SELECT json_transform_strict('{"a":1,"a":2}', '{"a":"INTEGER"}')"#,
+            r#"Invalid Input Error: Object {"a":1,"a":2} has duplicate key "a""#,
+        ),
+        (
+            r#"SELECT json_transform_strict('{"a":1}', '{"a":"INTEGER","b":"INTEGER"}')"#,
+            r#"Invalid Input Error: Object {"a":1} does not have key "b""#,
+        ),
+        (
+            r#"SELECT json_transform_strict('{"a":"1.5"}', '{"a":"INTEGER"}')"#,
+            r#"Invalid Input Error: Failed to cast value to numerical: "1.5""#,
+        ),
+        (
+            r#"SELECT json_transform_strict('["1"]', '["BOOLEAN"]')"#,
+            r#"Invalid Input Error: Failed to cast value to numerical: "1""#,
+        ),
+        (
+            r#"SELECT json_transform_strict('{"a":12345.5}', '{"a":"DECIMAL(4,2)"}')"#,
+            "Invalid Input Error: Failed to cast value to decimal: 12345.5",
+        ),
+        (
+            r#"SELECT json_transform_strict('[1]', '{"a":"INTEGER"}')"#,
+            "Invalid Input Error: Expected OBJECT, but got ARRAY: [1]",
+        ),
+        (
+            r#"SELECT json_transform_strict('[1,2]', '"INTEGER[3]"')"#,
+            "Invalid Input Error: Expected array of size 3, but got '[1,2]' with size 2",
+        ),
+        (
+            r#"SELECT json_transform_strict('{"a":1}', '"MAP(INTEGER, INTEGER)"')"#,
+            r#"Conversion Error: Failed to cast value to numerical: "a". Cannot default to NULL, because map keys cannot be NULL"#,
+        ),
+        (
+            r#"SELECT '{"a":1,"a":2}'::JSON::STRUCT(a INTEGER)"#,
+            r#"Conversion Error: Object {"a":1,"a":2} has duplicate key "a""#,
+        ),
+        (
+            r#"SELECT '{"a":"1.5"}'::JSON::STRUCT(a INTEGER)"#,
+            r#"Conversion Error: Failed to cast value to numerical: "1.5""#,
+        ),
+        (
+            r#"SELECT json_transform('{"a":1}', '["INTEGER","VARCHAR"]')"#,
+            "Binder Error: Too many values in array of JSON structure",
+        ),
+        (
+            r#"SELECT json_transform('{"a":1}', '{}')"#,
+            "Binder Error: Empty object in JSON structure",
+        ),
+        (r#"SELECT json_transform('{"a":1}', '1')"#, "Binder Error: invalid JSON structure"),
+        (
+            r#"SELECT json_transform('{"a":1}', '{"a":"INTEGER","a":"INTEGER"}')"#,
+            r#"Invalid Input Error: Duplicate keys in object in JSON structure: "INTEGER""#,
+        ),
+        (
+            r#"SELECT json_transform('{"a":1}', 'INTEGER')"#,
+            r#"Invalid Input Error: Malformed JSON at byte 0 of input: unexpected character.  Input: "INTEGER""#,
+        ),
+        (
+            r#"SELECT json_transform('{"a":1}', s) FROM (VALUES ('{"a":"INTEGER"}')) t(s)"#,
+            r#"Binder Error: The "structure" argument in function "json_transform" must be a constant expression"#,
+        ),
+        (
+            r#"SELECT from_json_strict('{"a":1}', s) FROM (VALUES ('{"a":"INTEGER"}')) t(s)"#,
+            r#"Binder Error: The "col1" argument in function "from_json_strict" must be a constant expression"#,
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(refused(sql), expected, "{sql}");
+    }
+    assert_eq!(
+        refused(r#"SELECT json_transform('{"a":1}', 1)"#),
+        "Binder Error: No function matches the given name and argument types 'json_transform(STRING_LITERAL, INTEGER_LITERAL)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tjson_transform(\"json\" VARCHAR, structure VARCHAR) -> ANY\n\tjson_transform(\"json\" JSON, structure VARCHAR) -> ANY\n"
+    );
+}
