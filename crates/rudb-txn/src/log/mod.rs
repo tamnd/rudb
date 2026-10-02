@@ -4,8 +4,8 @@
 //! commits, and then go to a lane as one block ending in a Commit record. Nothing is undone at
 //! recovery because nothing uncommitted was ever written.
 //!
-//! This is one lane. The spec's lanes, the spill of a transaction too large to hold, and the
-//! checkpoint that lets segments be recycled come after it, and each is a change to how blocks
+//! This is one lane, which recycles the segments a checkpoint retires. The spec's lanes and the
+//! spill of a transaction too large to hold come after it, and each is a change to how blocks
 //! reach a lane, not to the bytes a lane holds.
 
 mod crc;
@@ -19,7 +19,7 @@ pub use format::{
     encode_record, record_bytes, seed,
 };
 pub use lane::{
-    Block, CommitSync, Lane, Options, Stats, parse_segment_name, segment_name, segments,
+    Block, CommitSync, Lane, Options, Stats, parse_segment_name, segment_name, segments, spares,
 };
 pub use replay::{Committed, Payload, Record, Replayed, replay};
 

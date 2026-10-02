@@ -18,7 +18,7 @@
 //!
 //! The file's `RUDBWL1` anchor is what keeps a replay from applying a commit twice. Every
 //! checkpoint writes the newest commit timestamp into it as the durable cut, and only then are the
-//! segments behind the lane's position removed. A crash between the two leaves segments whose
+//! segments behind the lane's position retired, a couple kept to be recycled and the rest removed. A crash between the two leaves segments whose
 //! commits are all at or below the cut, and replay skips them.
 //!
 //! A record's payload is logical: the table's schema and name, the row count, and the values a
@@ -35,7 +35,7 @@ use rudb_io::{Filesystem, RealFilesystem};
 use rudb_native::{LaneStart, LogAnchor};
 use rudb_txn::log::{
     Block, CommitSync, Kind, Lane, Options, Payload, SEGMENT_BYTES, SEGMENT_HEADER, replay,
-    segments,
+    segments, spares,
 };
 use rudb_vector::{Chunk, Data, Selection, StringColumn, VECTOR_SIZE, Validity, Vector};
 
@@ -316,7 +316,7 @@ impl Journal {
         };
         let Some(anchor) = anchor else {
             if writable {
-                journal.remove_below(u64::MAX)?;
+                journal.remove_all()?;
             }
             return Ok((journal, Vec::new()));
         };
@@ -539,11 +539,12 @@ impl Journal {
     }
 
     /// Recycles what a checkpoint that wrote [`Self::anchor`] made redundant: the staged state
-    /// and every segment before the one the lane writes next.
+    /// and every segment before the one the lane writes next, which the lane keeps a couple of to
+    /// make its next segments from and removes the rest of.
     ///
     /// # Errors
     ///
-    /// If a segment cannot be removed.
+    /// If a segment cannot be renamed or removed.
     pub(crate) fn checkpointed(&mut self) -> Result<()> {
         // Blocks still queued under `commit_sync = none` go out first, so none of them is left to
         // be written into a segment this is about to remove.
@@ -553,8 +554,10 @@ impl Journal {
         self.discard();
         self.anchored = true;
         self.logged = 0;
-        let below = self.lane.as_ref().map_or(u64::MAX, |lane| lane.position().0);
-        self.remove_below(below)
+        match &self.lane {
+            Some(lane) => lane.retire(lane.position().0),
+            None => self.remove_all(),
+        }
     }
 
     /// Removes the log, for a database whose file was just written whole on the way out.
@@ -566,18 +569,20 @@ impl Journal {
         self.discard();
         self.lane = None;
         self.logged = 0;
-        self.remove_below(u64::MAX)?;
+        self.remove_all()?;
         if self.fs.is_dir(&self.dir) && self.fs.read_dir(&self.dir)?.is_empty() {
             std::fs::remove_dir(&self.dir).map_err(|error| Error::io(error.to_string()))?;
         }
         Ok(())
     }
 
-    fn remove_below(&self, below: u64) -> Result<()> {
-        for (sequence, path) in segments(self.fs.as_ref(), &self.dir, LANE)? {
-            if sequence < below {
-                self.fs.remove(&path)?;
-            }
+    /// Removes every segment and spare of the lane.
+    fn remove_all(&self) -> Result<()> {
+        for (_, path) in segments(self.fs.as_ref(), &self.dir, LANE)? {
+            self.fs.remove(&path)?;
+        }
+        for path in spares(self.fs.as_ref(), &self.dir, LANE)? {
+            self.fs.remove(&path)?;
         }
         Ok(())
     }

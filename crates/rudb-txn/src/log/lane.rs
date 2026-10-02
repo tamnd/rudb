@@ -29,6 +29,10 @@ use super::format::{
 /// How many zero bytes a new segment is filled with a write at a time.
 const ZERO_CHUNK: usize = 1 << 20;
 
+/// How many retired segments a lane keeps to recycle, `09-the-log.md` section 9.3. A checkpoint
+/// retires the segments behind it, so two cover a log that checkpoints every couple of segments.
+const SPARES: usize = 2;
+
 /// What a commit waits for before it returns, the `commit_sync` setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CommitSync {
@@ -106,6 +110,34 @@ pub fn segments(fs: &dyn Filesystem, dir: &Path, lane: u8) -> Result<Vec<(u64, P
         .collect();
     found.sort_by_key(|&(sequence, _)| sequence);
     Ok(found)
+}
+
+/// The name a retired segment of `lane` waits under until the lane recycles it: its old name with
+/// `.spare` after it, which [`parse_segment_name`] does not read as a segment's, so neither replay
+/// nor [`segments`] sees it.
+fn spare_name(lane: u8, sequence: u64) -> String {
+    format!("{}.spare", segment_name(lane, sequence))
+}
+
+/// The retired segments of `lane` in `dir` waiting to be recycled.
+///
+/// # Errors
+///
+/// If the directory cannot be listed.
+pub fn spares(fs: &dyn Filesystem, dir: &Path, lane: u8) -> Result<Vec<PathBuf>> {
+    if !fs.is_dir(dir) {
+        return Ok(Vec::new());
+    }
+    Ok(fs
+        .read_dir(dir)?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str()?.strip_suffix(".spare"))
+                .and_then(parse_segment_name)
+                .is_some_and(|(of, _)| of == lane)
+        })
+        .collect())
 }
 
 /// One transaction's records, which reach the lane together and end with its Commit.
@@ -197,6 +229,8 @@ pub struct Stats {
     pub syncs: u64,
     /// Segments created.
     pub segments: u64,
+    /// Of those, the ones made from a retired segment rather than filled with zeros.
+    pub recycled: u64,
 }
 
 /// An encoded block waiting for a leader to write it.
@@ -236,6 +270,8 @@ struct State {
     /// say, so the lane refuses everything after it and the database goes read only.
     failed: Option<String>,
     stats: Stats,
+    /// Retired segments, full size, that the next new segments are made from.
+    spares: Vec<PathBuf>,
 }
 
 impl State {
@@ -298,6 +334,18 @@ impl Lane {
         }
         let sequence =
             segments(fs.as_ref(), dir, options.lane)?.last().map_or(1, |(last, _)| last + 1);
+        // Spares a run before this one retired are recycled like this run's own, unless the
+        // segment size changed since.
+        let mut kept = Vec::new();
+        for spare in spares(fs.as_ref(), dir, options.lane)? {
+            if kept.len() < SPARES
+                && fs.open(&spare, OpenMode::Read)?.len()? == options.segment_bytes
+            {
+                kept.push(spare);
+            } else {
+                fs.remove(&spare)?;
+            }
+        }
         let lane = Self {
             fs,
             dir: dir.to_path_buf(),
@@ -313,6 +361,7 @@ impl Lane {
                 flushing: false,
                 failed: None,
                 stats: Stats::default(),
+                spares: kept,
             }),
             changed: Condvar::new(),
         };
@@ -439,6 +488,49 @@ impl Lane {
         self.lock().stats
     }
 
+    /// Retires every segment before `below` that is not being written, once a checkpoint has made
+    /// them redundant: up to [`SPARES`] of them are kept under a spare name to be recycled as the
+    /// lane's next segments, and the rest are removed.
+    ///
+    /// The directory is synced before this returns, so a spare's header is never rewritten while
+    /// a crash could still bring back its old name.
+    ///
+    /// # Errors
+    ///
+    /// If a segment cannot be renamed or removed, or the directory cannot be synced.
+    pub fn retire(&self, below: u64) -> Result<()> {
+        let (writing, mut wanted) = {
+            let state = self.lock();
+            (
+                state.open.as_ref().map(|open| open.sequence),
+                SPARES.saturating_sub(state.spares.len()),
+            )
+        };
+        let mut retired = Vec::new();
+        let mut changed = false;
+        for (sequence, path) in segments(self.fs.as_ref(), &self.dir, self.options.lane)? {
+            if sequence >= below || Some(sequence) == writing {
+                continue;
+            }
+            changed = true;
+            if wanted > 0
+                && self.fs.open(&path, OpenMode::Read)?.len()? == self.options.segment_bytes
+            {
+                let spare = self.dir.join(spare_name(self.options.lane, sequence));
+                self.fs.rename(&path, &spare)?;
+                retired.push(spare);
+                wanted -= 1;
+            } else {
+                self.fs.remove(&path)?;
+            }
+        }
+        if changed {
+            self.fs.sync_dir(&self.dir)?;
+        }
+        self.lock().spares.extend(retired);
+        Ok(())
+    }
+
     /// The directory the lane's segments are in.
     #[must_use]
     pub fn dir(&self) -> &Path {
@@ -541,11 +633,26 @@ impl Lane {
 
     /// Creates segment `sequence` whole: header, zeros to its size, a sync, and a sync of the
     /// directory so the name survives too.
+    ///
+    /// A spare is recycled instead when there is one: its header is rewritten and synced under the
+    /// spare name and only then renamed, so a crash leaves either a spare, which nothing reads, or
+    /// a segment whose header says its name. The records it still holds were seeded with its old
+    /// sequence and fail under the new one, so replay stops where the new records do.
     fn create_segment(&self, sequence: u64) -> Result<Box<dyn File>> {
         let path = self.dir.join(segment_name(self.options.lane, sequence));
-        let file = self.fs.open(&path, OpenMode::CreateNew)?;
         let header =
             SegmentHeader { lane: self.options.lane, sequence, database: self.options.database };
+        let spare = self.lock().spares.pop();
+        if let Some(spare) = spare {
+            let file = self.fs.open(&spare, OpenMode::ReadWrite)?;
+            file.write_at(0, &header.encode())?;
+            file.sync_data()?;
+            self.fs.rename(&spare, &path)?;
+            self.fs.sync_dir(&self.dir)?;
+            self.lock().stats.recycled += 1;
+            return Ok(file);
+        }
+        let file = self.fs.open(&path, OpenMode::CreateNew)?;
         file.write_at(0, &header.encode())?;
         let size = self.options.segment_bytes;
         let zeros = vec![0_u8; ZERO_CHUNK.min((size - SEGMENT_HEADER as u64) as usize)];
