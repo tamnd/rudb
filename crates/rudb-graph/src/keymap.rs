@@ -33,7 +33,7 @@
 use rudb_common::{Error, Result};
 use rudb_encoding::bitpack;
 
-use crate::bits::Rank;
+use crate::bits::{Rank, nth_set};
 use crate::rid::Rid;
 
 /// How dense a range has to be before the bitmap form beats the sorted form.
@@ -692,6 +692,35 @@ impl KeyMap {
         Ok(Some(out))
     }
 
+    /// The key each of `rids` holds, the other way round from [`Self::lookup`].
+    ///
+    /// A child row of a link holds the key of the parent the link points it at, so a scan that
+    /// knows which parent each of its rows has can take its key column from here rather than decode
+    /// it. Only the identity and dense forms answer, since a row's key there is its place among the
+    /// keys present, and the rows a link hands over usually rise, so each search starts at the word
+    /// the last one ended in. `None` for the other forms, or for a row past the last.
+    #[must_use]
+    pub fn keys_at(&self, rids: &[Rid]) -> Option<Vec<i128>> {
+        match &self.body {
+            Body::Identity { base, count } => {
+                rids.iter().map(|&rid| (rid < *count).then(|| base + i128::from(rid))).collect()
+            }
+            Body::Dense { base, bits, rank, .. } => {
+                let mut out = Vec::with_capacity(rids.len());
+                let mut last = (0, 0);
+                for &rid in rids {
+                    let from = if rid >= last.0 { last.1 } else { 0 };
+                    let (word, within) = rank.word_holding(rid, from)?;
+                    let offset = word as u64 * 64 + u64::from(nth_set(bits[word], within));
+                    out.push(base + i128::from(offset));
+                    last = (rid, word);
+                }
+                Some(out)
+            }
+            Body::Sorted { .. } | Body::Permuted { .. } => None,
+        }
+    }
+
     /// The `rid` of the row holding this key, or `None` when no row holds it.
     ///
     /// `None` is the ordinary answer and not an exceptional one: a child key with no matching
@@ -1233,6 +1262,28 @@ mod tests {
         let sorted = keys(&(0..1000).map(|value| value * 1000).collect::<Vec<i128>>());
         let map = KeyMap::build(&sorted).expect("build");
         assert_eq!(map.rows_of_span(&[0; 4], 1000).expect("rows"), None, "no span");
+    }
+
+    #[test]
+    fn the_keys_at_some_rows_are_the_keys_those_rows_hold() {
+        let identity = keys(&(5..1005).collect::<Vec<i128>>());
+        let dense = keys(&(0..3000).filter(|value| value % 3 != 1).collect::<Vec<i128>>());
+        for (column, form) in [(identity, Form::Identity), (dense, Form::Dense)] {
+            let map = KeyMap::build(&column).expect("build");
+            assert_eq!(map.form(), form);
+            let rows = column.len() as u64;
+            // Rising with gaps, then falling back, then the last row.
+            let mut rids: Vec<u64> =
+                (0..rows).filter(|rid| rid % 7 == 2 || rid % 11 == 0).collect();
+            rids.extend([3, 0, rows - 1]);
+            let wanted: Vec<i128> =
+                rids.iter().map(|&rid| column[rid as usize].expect("a key")).collect();
+            assert_eq!(map.keys_at(&rids), Some(wanted), "{form:?}");
+            assert_eq!(map.keys_at(&[rows]), None, "{form:?} past the last row");
+        }
+        let sorted = keys(&(0..1000).map(|value| value * 1000).collect::<Vec<i128>>());
+        let map = KeyMap::build(&sorted).expect("build");
+        assert_eq!(map.keys_at(&[0]), None, "the sorted form does not answer");
     }
 
     #[test]
