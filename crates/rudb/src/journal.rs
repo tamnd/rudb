@@ -572,7 +572,11 @@ impl Journal {
     /// If a segment or the directory cannot be removed.
     pub(crate) fn close(&mut self) -> Result<()> {
         self.discard();
-        self.lane = None;
+        // A lane still shared with a committer outlives this, and its spares thread with it, so
+        // that thread is stopped here rather than left to make a spare after the removal.
+        if let Some(lane) = self.lane.take() {
+            lane.stop();
+        }
         self.logged = 0;
         self.remove_all()?;
         if self.fs.is_dir(&self.dir) && self.fs.read_dir(&self.dir)?.is_empty() {

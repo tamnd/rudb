@@ -19,7 +19,13 @@ fn dir() -> PathBuf {
 
 /// Small segments so a few blocks cross one.
 fn options(commit_sync: CommitSync) -> Options {
-    Options { lane: 0, database: DATABASE, segment_bytes: 2 * SEGMENT_HEADER as u64, commit_sync }
+    Options {
+        lane: 0,
+        database: DATABASE,
+        segment_bytes: 2 * SEGMENT_HEADER as u64,
+        commit_sync,
+        spare_ahead: false,
+    }
 }
 
 fn open(sim: &SimFilesystem, options: Options) -> Lane {
@@ -224,7 +230,7 @@ fn a_checkpoint_retires_segments_the_lane_then_recycles() {
         lane.commit(&block(n)).expect("commit");
     }
     let after = lane.stats();
-    assert!(after.segments - before.segments > 2, "a hundred blocks cross segments");
+    assert!(after.segments - before.segments > 2, "two hundred blocks cross segments");
     assert_eq!(after.recycled, 2, "the spares are used before a segment is filled with zeros");
     assert!(spares(&sim, &dir(), 0).expect("spares").is_empty());
     // The retired blocks are gone, and nothing the recycled segments held comes back.
@@ -373,4 +379,67 @@ fn committers_on_many_threads_share_syncs() {
     let stats = lane.stats();
     assert_eq!(stats.commits, 400);
     assert!(stats.syncs <= 400);
+}
+
+/// Waits for the lane's thread to have made `count` spares in all, which on the simulated file
+/// system takes well under a second.
+fn made(lane: &Lane, count: u64) {
+    let start = std::time::Instant::now();
+    while lane.stats().made < count {
+        assert!(start.elapsed().as_secs() < 20, "the lane made {} spares", lane.stats().made);
+        thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_lane_makes_spares_ahead_and_starts_its_segments_from_them() {
+    let sim = SimFilesystem::new();
+    let options = Options { spare_ahead: true, ..options(CommitSync::Full) };
+    let lane = open(&sim, options);
+    made(&lane, 2);
+    assert_eq!(spares(&sim, &dir(), 0).expect("spares").len(), 2);
+    for n in 0..200 {
+        lane.commit(&block(n)).expect("commit");
+    }
+    let stats = lane.stats();
+    assert!(stats.segments > 3, "two hundred blocks cross segments, {stats:?}");
+    assert!(stats.recycled >= 2, "the spares made ahead are used, {stats:?}");
+    lane.stop();
+    assert_eq!(txns(&sim), (0..200).collect::<Vec<_>>());
+    // Every spare left is whole, and named apart from every segment that was ever written.
+    let left = spares(&sim, &dir(), 0).expect("spares");
+    assert!(left.len() <= 2, "{left:?}");
+    for spare in &left {
+        let size = sim.open(spare, OpenMode::Read).expect("a spare").len().expect("its size");
+        assert_eq!(size, 2 * SEGMENT_HEADER as u64);
+    }
+}
+
+#[test]
+fn a_reopened_lane_takes_up_the_spares_it_made_and_names_new_ones_apart() {
+    let sim = SimFilesystem::new();
+    let options = Options { spare_ahead: true, ..options(CommitSync::Full) };
+    let lane = open(&sim, options);
+    made(&lane, 2);
+    drop(lane);
+    let before = spares(&sim, &dir(), 0).expect("spares");
+    assert_eq!(before.len(), 2);
+    let lane = open(&sim, options);
+    // The reopened lane started its segment from one of them and makes one more.
+    made(&lane, 1);
+    lane.stop();
+    assert_eq!(lane.stats().recycled, 1);
+    let after = spares(&sim, &dir(), 0).expect("spares");
+    assert_eq!(after.len(), 2);
+    assert!(after.iter().filter(|spare| before.contains(spare)).count() == 1, "{after:?}");
+}
+
+#[test]
+fn a_stopped_lane_creates_nothing_more() {
+    let sim = SimFilesystem::new();
+    let lane = open(&sim, Options { spare_ahead: true, ..options(CommitSync::Full) });
+    lane.stop();
+    let files = sim.read_dir(&dir()).expect("the directory");
+    thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(sim.read_dir(&dir()).expect("the directory"), files);
 }
