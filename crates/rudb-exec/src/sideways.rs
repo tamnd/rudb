@@ -442,7 +442,9 @@ impl Domain {
                 Some(members) => {
                     let values = values.as_slice().get(..rows)?;
                     let mut before = None;
-                    Some(marked(rows, |from, to| members.word_after(&values[from..to], &mut before)))
+                    Some(marked(rows, |from, to| {
+                        members.word_after(&values[from..to], &mut before)
+                    }))
                 }
                 None => flat!(values),
             },
