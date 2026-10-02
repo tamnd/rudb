@@ -1932,6 +1932,7 @@ pub const WHOLE: &[&str] = &[
     "json_deep_merge",
     "json_merge_patch_diff",
     "json_pretty",
+    "json_normalize",
     "json_strip_nulls",
     "json_contains",
     "json_structure",
@@ -2004,6 +2005,11 @@ fn whole(name: &str, args: &[Value]) -> Result<Option<Value>> {
                     }
                     "json_strip_nulls" => {
                         document.write_styled(0, Style { pretty: false, strip: true }, &mut out);
+                    }
+                    "json_normalize" => {
+                        let mut document = document;
+                        document.sort_keys();
+                        out = document.minified();
                     }
                     _ => out = document.structure(),
                 }
@@ -2801,6 +2807,18 @@ impl Document {
             };
         }
         answer.minified()
+    }
+}
+
+impl Document {
+    /// Puts the keys of every object in byte order, keeping a repeated key's values in the order
+    /// they were written, which is what `json_normalize` does before it writes a document out.
+    fn sort_keys(&mut self) {
+        for node in &mut self.nodes {
+            if let Node::Object(members) = node {
+                members.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+            }
+        }
     }
 }
 
