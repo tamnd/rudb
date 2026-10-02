@@ -436,11 +436,13 @@ impl Domain {
         match keys.data()? {
             Data::Int8(values) => flat!(values),
             Data::Int16(values) => flat!(values),
-            // The common key, tested eight at a time. See [`Members`].
+            // The common key, tested eight at a time, and once a run where it comes in runs. See
+            // [`Members::word_after`].
             Data::Int32(values) => match Members::new(&self.words, base) {
                 Some(members) => {
                     let values = values.as_slice().get(..rows)?;
-                    Some(marked(rows, |from, to| members.word(&values[from..to])))
+                    let mut before = None;
+                    Some(marked(rows, |from, to| members.word_after(&values[from..to], &mut before)))
                 }
                 None => flat!(values),
             },
@@ -511,6 +513,27 @@ impl Kept {
 ///
 /// Sixty four rows a word is what makes the row loop a fold into a register: no store a row, no
 /// length to move on, and the count comes out of a popcount a word rather than being carried.
+/// The share of the leading eights of `keys` that hold one key the eight before them ended on,
+/// which [`Domain::kept`] tests without a lookup. A key that is not a flat `INTEGER` counts none.
+pub(crate) fn repeated(keys: &Vector) -> f64 {
+    const EIGHTS: usize = 16;
+    let Some(Data::Int32(values)) = keys.data() else { return 0.0 };
+    let values = values.as_slice();
+    let eights = (values.len() / 8).min(EIGHTS);
+    if eights < 2 {
+        return 0.0;
+    }
+    let held = (1..eights)
+        .filter(|&eight| {
+            let before = values[eight * 8 - 1];
+            values[eight * 8..eight * 8 + 8].iter().all(|&key| key == before)
+        })
+        .count();
+    #[expect(clippy::cast_precision_loss, reason = "a count of sixteen at most")]
+    let share = held as f64 / (eights - 1) as f64;
+    share
+}
+
 fn marked(rows: usize, mut word_of: impl FnMut(usize, usize) -> u64) -> Kept {
     let mut bits = Vec::with_capacity(rows / 64 + 1);
     let mut count = 0;

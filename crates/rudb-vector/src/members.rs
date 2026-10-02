@@ -67,6 +67,29 @@ impl<'a> Members<'a> {
         }
     }
 
+    /// [`Self::word`] for keys that come in runs, given the key before them and whether the bitmap
+    /// holds it, which this then moves on to the last of `keys` for the next call.
+    ///
+    /// Eight keys that all equal the one before them have its answer, and the gather is skipped. A
+    /// fact table loaded in the order of one of its keys holds that key in runs: `cast_info` is in
+    /// the order of its people, and two in three of its blocks of eight rows are one person, so
+    /// testing it against the people a filter on `name` kept gathered three times as often as it
+    /// had to. A key in no order costs a compare and a branch that is never taken.
+    #[must_use]
+    #[inline]
+    pub fn word_after(&self, keys: &[i32], before: &mut Option<(i32, bool)>) -> u64 {
+        debug_assert!(keys.len() <= 64, "a word holds 64 keys");
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if !self.narrow {
+            return self.avx2_runs(keys, before);
+        }
+        let word = self.word(keys);
+        if let Some(&key) = keys.last() {
+            *before = Some((key, word >> (keys.len() - 1) & 1 == 1));
+        }
+        word
+    }
+
     /// Whether the bitmap holds `key`.
     #[must_use]
     #[inline]
@@ -155,6 +178,60 @@ impl<'a> Members<'a> {
         }
         word
     }
+
+    /// [`Self::word_after`] eight keys a step over a bitmap gathered from, and the last few a key
+    /// at a time.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline]
+    #[allow(unsafe_code)]
+    fn avx2_runs(&self, keys: &[i32], before: &mut Option<(i32, bool)>) -> u64 {
+        use std::arch::x86_64::{
+            __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_castsi256_ps,
+            _mm256_cmpeq_epi32, _mm256_i32gather_epi32, _mm256_loadu_si256, _mm256_min_epu32,
+            _mm256_movemask_ps, _mm256_set1_epi32, _mm256_sllv_epi32, _mm256_srli_epi32,
+            _mm256_sub_epi32,
+        };
+        let mut chunks = keys.chunks_exact(8);
+        let mut word = 0u64;
+        let mut last_seen = *before;
+        // SAFETY: as in `avx2`. The build enables AVX2, each load reads one exact chunk of `keys`,
+        // and each gather reads at an index the clamp keeps inside `words`.
+        unsafe {
+            let base = _mm256_set1_epi32(self.base);
+            #[allow(clippy::cast_possible_wrap)]
+            let last = _mm256_set1_epi32(self.last as i32);
+            let low = _mm256_set1_epi32(31);
+            let words = self.words.as_ptr().cast::<i32>();
+            for (at, eight) in (&mut chunks).enumerate() {
+                let keys = _mm256_loadu_si256(eight.as_ptr().cast::<__m256i>());
+                if let Some((key, held)) = last_seen {
+                    let same = _mm256_cmpeq_epi32(keys, _mm256_set1_epi32(key));
+                    if _mm256_movemask_ps(_mm256_castsi256_ps(same)) == 0xff {
+                        word |= if held { 0xff << (8 * at) } else { 0 };
+                        continue;
+                    }
+                }
+                let offset = _mm256_sub_epi32(keys, base);
+                let clamped = _mm256_min_epu32(offset, last);
+                let inside = _mm256_cmpeq_epi32(clamped, offset);
+                let lanes = _mm256_i32gather_epi32::<4>(words, _mm256_srli_epi32::<5>(clamped));
+                let lifted = _mm256_sllv_epi32(lanes, _mm256_andnot_si256(clamped, low));
+                let held = _mm256_and_si256(lifted, inside);
+                #[allow(clippy::cast_sign_loss)]
+                let bits = _mm256_movemask_ps(_mm256_castsi256_ps(held)) as u32;
+                word |= u64::from(bits) << (8 * at);
+                last_seen = Some((eight[7], bits >> 7 & 1 == 1));
+            }
+        }
+        let done = keys.len() - chunks.remainder().len();
+        for (at, &key) in chunks.remainder().iter().enumerate() {
+            let held = self.holds(key);
+            word |= u64::from(held) << (done + at);
+            last_seen = Some((key, held));
+        }
+        *before = last_seen;
+        word
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +275,44 @@ mod tests {
             });
             assert_eq!(members.word(&keys), want, "round {round}");
             assert_eq!(members.portable(&keys), want, "round {round}");
+        }
+    }
+
+    #[test]
+    fn keys_in_runs_get_the_bits_they_get_one_at_a_time() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..300 {
+            let len = 1 + (next() % 40) as usize;
+            let words: Vec<u64> = (0..len).map(|_| next() & next()).collect();
+            let members = Members::new(&words, 0).expect("a small bitmap");
+            // Runs of one key from one row to a few dozen, with a key past the end now and then.
+            let mut keys = Vec::new();
+            while keys.len() < 500 {
+                let inside = (next() % (len as u64 * 64)) as i32;
+                let key = if next() % 20 == 0 { i32::MAX } else { inside };
+                let run = 1 + (next() % if round % 2 == 0 { 40 } else { 4 }) as usize;
+                keys.extend(std::iter::repeat_n(key, run));
+            }
+            let mut before = None;
+            let mut from = 0;
+            while from < keys.len() {
+                let to = (from + 1 + (next() % 64) as usize).min(keys.len());
+                let piece = &keys[from..to];
+                assert_eq!(
+                    members.word_after(piece, &mut before),
+                    members.portable(piece),
+                    "round {round} at {from}"
+                );
+                let &key = piece.last().expect("a piece has keys");
+                assert_eq!(before, Some((key, members.holds(key))), "round {round} at {from}");
+                from = to;
+            }
         }
     }
 
