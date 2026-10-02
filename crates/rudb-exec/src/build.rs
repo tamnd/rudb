@@ -80,6 +80,7 @@ use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{Broadcast, CrossProduct, Gathered, Join, Marking, Padding, Probe};
+use crate::jsonwalk::LateralJson;
 use crate::key::{Digest, Key, RowMap};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
@@ -2356,6 +2357,24 @@ impl<'a> Building<'a, '_> {
                 Segment::new(Arc::new(dummy), below)
                     .then(Arc::new(Watched::new(unnest, counters)), schema)
             }
+            Some(function @ (TableFunction::JsonEach | TableFunction::JsonTree)) => {
+                let dummy = Dummy::new();
+                let below = dummy.schema().clone();
+                let walk = LateralJson::new(
+                    plan,
+                    &below,
+                    index,
+                    function.name(),
+                    args,
+                    columns,
+                    self.cancel,
+                )?
+                .in_session(self.session);
+                let schema = walk.schema().clone();
+                let counters = self.watch(reference, id, pipeline, "JsonWalk", Some(name));
+                Segment::new(Arc::new(dummy), below)
+                    .then(Arc::new(Watched::new(walk, counters)), schema)
+            }
             Some(TableFunction::PragmaStorageInfo) => {
                 let written = pragma_name(plan, args)?;
                 let table = storage_info(self.catalog, &written, plan, index, columns)?;
@@ -3140,6 +3159,24 @@ impl<'a> Building<'a, '_> {
                     let counters = self.watch(reference, id, pipeline, "Unnest", None);
                     return Ok(below.then(Arc::new(Watched::new(unnest, counters)), schema));
                 }
+                if matches!(
+                    TableFunction::lookup(name),
+                    Some(TableFunction::JsonEach | TableFunction::JsonTree)
+                ) {
+                    let walk = LateralJson::new(
+                        plan,
+                        &below.schema,
+                        index,
+                        name,
+                        args,
+                        columns,
+                        self.cancel,
+                    )?
+                    .in_session(self.session);
+                    let schema = walk.schema().clone();
+                    let counters = self.watch(reference, id, pipeline, "JsonWalk", Some(name));
+                    return Ok(below.then(Arc::new(Watched::new(walk, counters)), schema));
+                }
                 let lateral = LateralSeries::new(
                     plan,
                     &below.schema,
@@ -3565,7 +3602,8 @@ impl<'a> Building<'a, '_> {
                         let Some(name) = extreme.fetch else { return Ok(None) };
                         let input = tree.leaves[extreme.leaf as usize].input;
                         let lost = || Error::internal("a consistent node fetches from no table");
-                        let binding = relation_column(plan, input, extreme.column).ok_or_else(lost)?;
+                        let binding =
+                            relation_column(plan, input, extreme.column).ok_or_else(lost)?;
                         let (table, _) =
                             scanned(plan, self.catalog, input, binding.table)?.ok_or_else(lost)?;
                         let column = table.column_index(plan.string(name)).ok_or_else(|| {

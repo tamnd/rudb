@@ -88,6 +88,10 @@ pub enum TableFunction {
     GenerateSeries,
     /// `unnest(list)`, one row per element of a list or an array.
     Unnest,
+    /// `json_each(json)` and `json_each(json, path)`, one row per value inside a document.
+    JsonEach,
+    /// `json_tree(json)` and `json_tree(json, path)`, one row per value anywhere in a document.
+    JsonTree,
     /// `read_parquet(path)`, the rows of a Parquet file.
     ReadParquet,
     /// `read_csv(path)`, the rows of a CSV file, with everything about how it is written sniffed.
@@ -176,6 +180,8 @@ impl TableFunction {
             Self::Range => "range",
             Self::GenerateSeries => "generate_series",
             Self::Unnest => "unnest",
+            Self::JsonEach => "json_each",
+            Self::JsonTree => "json_tree",
             Self::ReadParquet => "read_parquet",
             Self::ReadCsv => "read_csv",
             Self::RudbStrategies => "rudb_strategies",
@@ -318,6 +324,12 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("unnest") {
             return Some(Self::Unnest);
+        }
+        if name.eq_ignore_ascii_case("json_each") {
+            return Some(Self::JsonEach);
+        }
+        if name.eq_ignore_ascii_case("json_tree") {
+            return Some(Self::JsonTree);
         }
         if name.eq_ignore_ascii_case("read_parquet") || name.eq_ignore_ascii_case("parquet_scan") {
             return Some(Self::ReadParquet);
@@ -543,6 +555,9 @@ fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<R
     if function == TableFunction::Unnest {
         return unnest(arguments);
     }
+    if matches!(function, TableFunction::JsonEach | TableFunction::JsonTree) {
+        return json_walk(function, arguments);
+    }
     let arity = arguments.len();
     // The metadata tables take nothing and their columns are fixed, which makes them the simplest
     // case here. They are one arm rather than one each because the only thing that differs is the
@@ -629,6 +644,53 @@ fn unnest(arguments: &[LogicalType]) -> Result<ResolvedTable> {
     })
 }
 
+/// `json_each` or `json_tree`, a document and an optional path, which are the pin's eight columns.
+///
+/// The pin has a `VARCHAR` and a `JSON` overload of each, and a document of any other type goes to
+/// the `JSON` one, since every type casts to `JSON` and that cast is the cheaper one. So a list is
+/// walked as the array it is written out as, and a number as the scalar it is.
+fn json_walk(function: TableFunction, arguments: &[LogicalType]) -> Result<ResolvedTable> {
+    let document = match arguments.first() {
+        Some(LogicalType::Varchar | LogicalType::Null) => LogicalType::Varchar,
+        Some(_) => LogicalType::Json,
+        None => return Err(no_walk(function, arguments)),
+    };
+    let wanted = match arguments.len() {
+        1 => vec![document],
+        2 => vec![document, LogicalType::Varchar],
+        _ => return Err(no_walk(function, arguments)),
+    };
+    Ok(ResolvedTable { function, arguments: wanted, columns: Columns::Fixed(json_walk_fields()) })
+}
+
+/// The columns `json_each` and `json_tree` produce.
+#[must_use]
+pub fn json_walk_fields() -> Vec<Field> {
+    vec![
+        Field::new("key", LogicalType::Varchar),
+        Field::new("value", LogicalType::Json),
+        Field::new("type", LogicalType::Varchar),
+        Field::new("atom", LogicalType::Json),
+        Field::new("id", LogicalType::UBigInt),
+        Field::new("parent", LogicalType::UBigInt),
+        Field::new("fullkey", LogicalType::Varchar),
+        Field::new("path", LogicalType::Varchar),
+    ]
+}
+
+/// The pin's refusal of a `json_each` or `json_tree` call with the wrong number of arguments, with
+/// its four candidates.
+fn no_walk(function: TableFunction, arguments: &[LogicalType]) -> Error {
+    let name = function.name();
+    let written: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+    Error::binder(format!(
+        "No function matches the given name and argument types '{name}({})'. You might need to \
+         add explicit type casts.\n\tCandidate functions:\n\t\"{name}\"(VARCHAR)\n\t\"{name}\"(VARCHAR, \
+         VARCHAR)\n\t\"{name}\"(JSON)\n\t\"{name}\"(JSON, VARCHAR)\n",
+        written.join(", ")
+    ))
+}
+
 /// The pin's refusal of a `range` or `generate_series` call with a date or an interval in it that
 /// fits neither the whole number overloads nor the moment one, with its five candidates.
 fn no_series(function: TableFunction, arguments: &[LogicalType]) -> Error {
@@ -692,6 +754,8 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::Unnest
+        | TableFunction::JsonEach
+        | TableFunction::JsonTree
         | TableFunction::RudbStrategies
         | TableFunction::RudbLinks
         | TableFunction::RudbDeviceCard
@@ -764,6 +828,8 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::Unnest
+        | TableFunction::JsonEach
+        | TableFunction::JsonTree
         | TableFunction::ReadParquet
         | TableFunction::ReadCsv
         | TableFunction::RudbDeviceCard

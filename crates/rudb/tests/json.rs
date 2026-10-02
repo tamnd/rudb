@@ -1,7 +1,7 @@
 //! The `JSON` type, the casts into and out of it, and the functions that read a document: checking
 //! it, naming the type of a value in it, picking values out of it by a path, and its operators, and
-//! the functions that build, merge, print, match and edit whole documents, and the macros that
-//! gather rows into one.
+//! the functions that build, merge, print, match and edit whole documents, the macros that gather
+//! rows into one, and the table functions that turn one into rows.
 //!
 //! Every expected answer here was taken from the pinned duckdb binary and not from rudb.
 
@@ -568,5 +568,74 @@ fn the_edit_functions_change_one_place_in_a_document() {
         "Binder Error: No function matches the given name and argument types \
          'json_set(STRING_LITERAL, INTEGER, STRING_LITERAL)'. You might need to add explicit type \
          casts.\n\tCandidate functions:\n\tjson_set(col0 JSON, col1 VARCHAR, col2 JSON) -> JSON"
+    ));
+}
+
+#[test]
+fn json_each_and_json_tree_make_a_row_of_each_value_in_a_document() {
+    let document = r#"'{"a":1,"b":[2,3],"c":{"d":null}}'"#;
+    check(&[
+        (
+            &format!("SELECT * FROM json_each({document})"),
+            "a|1|UBIGINT|1|2|NULL|$.a|$\nb|[2,3]|ARRAY|NULL|4|NULL|$.b|$\n\
+             c|{\"d\":null}|OBJECT|NULL|8|NULL|$.c|$",
+        ),
+        (
+            &format!("SELECT * FROM json_tree({document})"),
+            "NULL|{\"a\":1,\"b\":[2,3],\"c\":{\"d\":null}}|OBJECT|NULL|0|NULL|$|$\n\
+             a|1|UBIGINT|1|2|0|$.a|$\nb|[2,3]|ARRAY|NULL|4|0|$.b|$\n0|2|UBIGINT|2|5|4|$.b[0]|$.b\n\
+             1|3|UBIGINT|3|6|4|$.b[1]|$.b\nc|{\"d\":null}|OBJECT|NULL|8|0|$.c|$\n\
+             d|null|NULL|NULL|10|8|$.c.d|$.c",
+        ),
+        (
+            r#"SELECT * FROM json_tree('{"a":{"b":[1,2]}}', '$.a')"#,
+            "NULL|{\"b\":[1,2]}|OBJECT|NULL|2|NULL|$.a|$.a\nb|[1,2]|ARRAY|NULL|4|2|$.a.b|$.a\n\
+             0|1|UBIGINT|1|5|4|$.a.b[0]|$.a.b\n1|2|UBIGINT|2|6|4|$.a.b[1]|$.a.b",
+        ),
+        ("SELECT * FROM json_each('3')", "NULL|3|UBIGINT|3|0|NULL|$|$"),
+        (r#"SELECT * FROM json_each('"s"')"#, "NULL|\"s\"|VARCHAR|\"s\"|0|NULL|$|$"),
+        (
+            r#"SELECT count(*) FROM json_each(NULL) UNION ALL SELECT count(*) FROM json_each('{}') UNION ALL SELECT count(*) FROM json_each('{"a":1}', '$.x') UNION ALL SELECT count(*) FROM json_each('[1]', NULL)"#,
+            "0\n0\n0\n0",
+        ),
+        (r#"SELECT fullkey, path FROM json_each('{"a":[{"b":1}]}', 'a')"#, "$.\"a\"[0]|$.\"a\""),
+        (
+            r#"SELECT key, fullkey FROM json_each('{"":1,"_a":2,"a_":3,"c.d":4,"e\"f":5}')"#,
+            "|$.\"\"\n_a|$.\"_a\"\na_|$.a_\nc.d|$.\"c.d\"\ne\"f|$.\"e\\\"f\"",
+        ),
+        (
+            r#"SELECT t.x, e.key, e.value FROM (VALUES ('{"a":1,"b":2}'), ('[5]')) t(x), json_each(t.x) e ORDER BY ALL"#,
+            "[5]|0|5\n{\"a\":1,\"b\":2}|a|1\n{\"a\":1,\"b\":2}|b|2",
+        ),
+        (
+            r#"SELECT t.p, e.key FROM (VALUES ('$.a'), ('$.b')) t(p), json_each('{"a":{"x":1},"b":[7]}', t.p) e ORDER BY 1, 2"#,
+            "$.a|x\n$.b|0",
+        ),
+        (
+            r#"SELECT key, (SELECT count(*) FROM json_each(value)) FROM json_each('{"a":[1,2],"b":3}') ORDER BY 1"#,
+            "a|2\nb|1",
+        ),
+        ("SELECT k, v FROM json_each('{\"a\":1}') AS e(k, v)", "a|1"),
+        (
+            "SELECT parameter_types FROM duckdb_functions() WHERE function_name = 'json_tree' ORDER BY ALL",
+            "[JSON]\n[JSON, VARCHAR]\n[VARCHAR]\n[VARCHAR, VARCHAR]",
+        ),
+    ]);
+    assert_eq!(
+        refused("SELECT * FROM json_each('{\"a\":1}', '/a')"),
+        "Binder Error: JSON path must start with '$' for json_each/json_tree"
+    );
+    assert_eq!(
+        refused("SELECT * FROM json_each('[{\"a\":1}]', '$[*]')"),
+        "Binder Error: Wildcard JSON path not supported in json_each/json_tree"
+    );
+    assert!(refused("SELECT * FROM json_each('{\"a\":1')").starts_with(
+        "Invalid Input Error: Malformed JSON at byte 6 of input: unexpected end of data."
+    ));
+    assert!(refused("SELECT * FROM json_each('[1]', '$', 3)").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+         'json_each(VARCHAR, VARCHAR, INTEGER)'. You might need to add explicit type casts.\n\t\
+         Candidate functions:\n\t\"json_each\"(VARCHAR)\n\t\"json_each\"(VARCHAR, VARCHAR)\n\t\
+         \"json_each\"(JSON)\n\t\"json_each\"(JSON, VARCHAR)\n"
     ));
 }

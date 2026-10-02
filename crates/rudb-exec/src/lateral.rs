@@ -12,9 +12,10 @@
 //! distinct keys makes five hundred calls and not a million. That is the same bargain every other
 //! rule in the unnesting pass strikes.
 //!
-//! Only the series family arrives. A reader takes a file name, the binder settles the columns by
-//! opening the file, and it refuses a name that is not a constant, so `read_csv` of a correlated
-//! column never reaches a plan at all.
+//! Only the series family arrives here, since `unnest` and the two document walks have operators of
+//! their own. A reader takes a file name, the binder settles the columns by opening the file, and
+//! it refuses a name that is not a constant, so `read_csv` of a correlated column never reaches a
+//! plan at all.
 
 use rudb_common::{Cancel, Error, LogicalType, Result, Session, SessionTimeZone, Value};
 use rudb_functions::{TableFunction, series_length};

@@ -2804,6 +2804,183 @@ impl Document {
     }
 }
 
+/// One row of `json_each` or `json_tree`, in the order of the columns the pin gives them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The key in its object, the index in its array as text, or nothing for the value the walk
+    /// started at.
+    pub key: Option<String>,
+    /// The value written out.
+    pub value: String,
+    /// What `json_type` says the value is.
+    pub kind: &'static str,
+    /// The value written out when it is a scalar other than null.
+    pub atom: Option<String>,
+    /// Where the value sits in the pin's reading of the whole document, counting keys too.
+    pub id: u64,
+    /// The id of the container the value is in, which only `json_tree` says.
+    pub parent: Option<u64>,
+    /// The path to the value.
+    pub fullkey: String,
+    /// The path to the container the value is in.
+    pub path: String,
+}
+
+/// The pin's refusal of a path `json_each` and `json_tree` cannot start from.
+fn not_from_root() -> Error {
+    Error::binder("JSON path must start with '$' for json_each/json_tree")
+}
+
+/// The rows `json_each` makes of a document, or `json_tree` when `tree` is set, starting at the
+/// value a path picks, which is the whole document when there is no path.
+///
+/// `json_each` makes one row for each value inside the one the path picks, or one for that value
+/// when it is a scalar. `json_tree` makes one for it and then one for everything under it, depth
+/// first. A path that picks nothing makes no rows.
+///
+/// # Errors
+///
+/// A path that is not a `$` path or has a wildcard in it, as the pin's binder errors although the
+/// pin raises them for each row, and a malformed document.
+pub fn entries(document_text: &str, path: Option<&str>, tree: bool) -> Result<Vec<Entry>> {
+    let base = match path {
+        None => "$".to_string(),
+        Some(text) => match written_path(text, true)? {
+            Path::Wild(_) => {
+                return Err(Error::binder(
+                    "Wildcard JSON path not supported in json_each/json_tree",
+                ));
+            }
+            Path::Root | Path::Pointer(_) => return Err(not_from_root()),
+            Path::Steps(_) if text.starts_with('$') => text.to_string(),
+            // A bare key, which the pin reads as the quoted key it stands for and then writes out
+            // that way in every path it gives back.
+            Path::Steps(_) => format!("$.\"{text}\""),
+        },
+    };
+    let document = document(document_text)?;
+    let Path::Steps(steps) = written_path(&base, true)? else {
+        return Err(Error::internal("a json_each path that is not a $ path"));
+    };
+    let Some(start) = steps.iter().try_fold(0, |at, step| document.child(at, step)) else {
+        return Ok(Vec::new());
+    };
+    let ids = document.yyjson_ids();
+    let mut rows = Vec::new();
+    let container = matches!(document.nodes[start], Node::Array(_) | Node::Object(_));
+    if !container || tree {
+        rows.push(document.entry(&ids, start, None, None, base.clone(), base.clone()));
+    }
+    if !container {
+        return Ok(rows);
+    }
+    // The containers being walked, each with its own path and how far into it the walk is, so a
+    // document a million deep is walked without recursing.
+    let mut stack: Vec<(usize, String, usize)> = vec![(start, base, 0)];
+    while let Some((parent, path, next)) = stack.last_mut() {
+        let parent = *parent;
+        let found = match &document.nodes[parent] {
+            Node::Array(items) => items.get(*next).map(|&item| (None, item)),
+            Node::Object(members) => members.get(*next).map(|(key, value)| (Some(key), *value)),
+            _ => None,
+        };
+        let Some((key, child)) = found else {
+            stack.pop();
+            continue;
+        };
+        let index = *next;
+        *next += 1;
+        let path = path.clone();
+        let mut fullkey = path.clone();
+        let key = match key {
+            Some(key) => {
+                push_path_key(key, &mut fullkey);
+                key.to_string()
+            }
+            None => {
+                fullkey.push_str(&format!("[{index}]"));
+                index.to_string()
+            }
+        };
+        let above = tree.then(|| ids[parent]);
+        rows.push(document.entry(&ids, child, Some(key), above, fullkey.clone(), path));
+        if tree && matches!(document.nodes[child], Node::Array(_) | Node::Object(_)) {
+            stack.push((child, fullkey, 0));
+        }
+    }
+    Ok(rows)
+}
+
+/// Writes `.key` onto a path, quoting the key unless it is an ASCII letter followed by ASCII
+/// letters, digits and underscores, which is when the pin leaves it bare.
+fn push_path_key(key: &str, path: &mut String) {
+    path.push('.');
+    let bytes = key.as_bytes();
+    let bare = bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes[1..].iter().all(|&byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if bare {
+        path.push_str(key);
+        return;
+    }
+    path.push('"');
+    for character in key.chars() {
+        if character == '"' || character == '\\' {
+            path.push('\\');
+        }
+        path.push(character);
+    }
+    path.push('"');
+}
+
+impl Document {
+    /// The position yyjson gives every value, which is its place in a walk of the document in order
+    /// where an object's keys take a place each too.
+    fn yyjson_ids(&self) -> Vec<u64> {
+        let mut ids = vec![0; self.nodes.len()];
+        let mut next = 0;
+        let mut stack = vec![0];
+        while let Some(at) = stack.pop() {
+            ids[at] = next;
+            next += 1;
+            match &self.nodes[at] {
+                Node::Array(items) => stack.extend(items.iter().rev()),
+                // The key takes the place before its value, which is the same as the value taking
+                // one more.
+                Node::Object(members) => {
+                    for (_, value) in members.iter().rev() {
+                        stack.push(*value);
+                        stack.push(usize::MAX);
+                    }
+                }
+                _ => {}
+            }
+            while stack.last() == Some(&usize::MAX) {
+                stack.pop();
+                next += 1;
+            }
+        }
+        ids
+    }
+
+    fn entry(
+        &self,
+        ids: &[u64],
+        at: usize,
+        key: Option<String>,
+        parent: Option<u64>,
+        fullkey: String,
+        path: String,
+    ) -> Entry {
+        let node = &self.nodes[at];
+        let value = self.written(at);
+        let atom = match node {
+            Node::Null | Node::Array(_) | Node::Object(_) => None,
+            _ => Some(value.clone()),
+        };
+        Entry { key, value, kind: type_name(node), atom, id: ids[at], parent, fullkey, path }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

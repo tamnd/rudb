@@ -100,6 +100,7 @@ mod group_distinct;
 mod group_mixed;
 mod group_ranged;
 mod join;
+mod jsonwalk;
 mod key;
 mod keywords;
 mod lambda;

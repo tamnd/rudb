@@ -2143,8 +2143,8 @@ impl<'a> Binder<'a> {
         // made once per domain value. That is `domain.rs`.
         //
         // Nothing has to be turned down here for the functions that would not survive it. The only
-        // table functions taking an argument that is not a name are the series family, which is the
-        // family that operator answers, and a name that is not a constant is refused where the
+        // table functions taking an argument that is not a name are the series family, `unnest` and
+        // the two document walks, which are what that operator answers, and a name that is not a constant is refused where the
         // columns are settled, because settling them means opening the file or reading the catalog.
         Ok((node, scope, here))
     }
@@ -2636,7 +2636,13 @@ impl<'a> Binder<'a> {
         };
         let series = matches!(
             TableFunction::lookup(self.plan.string(function)),
-            Some(TableFunction::Range | TableFunction::GenerateSeries | TableFunction::Unnest)
+            Some(
+                TableFunction::Range
+                    | TableFunction::GenerateSeries
+                    | TableFunction::Unnest
+                    | TableFunction::JsonEach
+                    | TableFunction::JsonTree
+            )
         );
         if !series {
             return node;

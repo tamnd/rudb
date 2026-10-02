@@ -186,20 +186,14 @@ fn tables() -> Vec<FunctionEntry> {
                 parameters.push((*name).to_string());
                 parameter_types.push(ty.to_string());
             }
-            entries.push(FunctionEntry {
-                name: function.name(),
-                function_type: "table",
-                alias_of: None,
-                // Null, and upstream's is null too. A table function produces columns rather than a
-                // value, so there is no one type to name, and the columns are in `duckdb_columns()`
-                // for a table and in the file for a file reader.
-                return_type: None,
-                parameters,
-                parameter_types,
-                varargs: None,
-                has_side_effects: None,
-                stability: None,
-            });
+            // The two document walks take a `JSON` document as well as a `VARCHAR` one, and the
+            // pin lists the two as separate rows.
+            if matches!(function, TableFunction::JsonEach | TableFunction::JsonTree) {
+                let mut json = parameter_types.clone();
+                json[0] = "JSON".to_string();
+                entries.push(table_entry(*function, parameters.clone(), json));
+            }
+            entries.push(table_entry(*function, parameters, parameter_types));
         }
     }
     for (alias, function) in TABLE_ALIASES {
@@ -216,11 +210,35 @@ fn tables() -> Vec<FunctionEntry> {
     entries
 }
 
+/// One row for a table function taking these parameters.
+fn table_entry(
+    function: TableFunction,
+    parameters: Vec<String>,
+    parameter_types: Vec<String>,
+) -> FunctionEntry {
+    FunctionEntry {
+        name: function.name(),
+        function_type: "table",
+        alias_of: None,
+        // Null, and upstream's is null too. A table function produces columns rather than a value,
+        // so there is no one type to name, and the columns are in `duckdb_columns()` for a table and
+        // in the file for a file reader.
+        return_type: None,
+        parameters,
+        parameter_types,
+        varargs: None,
+        has_side_effects: None,
+        stability: None,
+    }
+}
+
 /// The table functions, in no particular order, since [`function_entries`] sorts.
 const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::Range,
     TableFunction::GenerateSeries,
     TableFunction::Unnest,
+    TableFunction::JsonEach,
+    TableFunction::JsonTree,
     TableFunction::ReadParquet,
     TableFunction::ReadCsv,
     TableFunction::RudbStrategies,
@@ -263,7 +281,9 @@ const TABLE_ALIASES: &[(&str, TableFunction)] =
 fn positional_counts(function: TableFunction) -> Vec<usize> {
     match function {
         TableFunction::Range | TableFunction::GenerateSeries => vec![1, 2, 3],
-        TableFunction::RudbDeviceCard => vec![1, 2],
+        TableFunction::RudbDeviceCard | TableFunction::JsonEach | TableFunction::JsonTree => {
+            vec![1, 2]
+        }
         TableFunction::Unnest
         | TableFunction::ReadParquet
         | TableFunction::ReadCsv
@@ -309,6 +329,8 @@ const fn positional_type(function: TableFunction, at: usize) -> &'static str {
         TableFunction::Unnest => "ANY",
         TableFunction::ReadParquet
         | TableFunction::ReadCsv
+        | TableFunction::JsonEach
+        | TableFunction::JsonTree
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo => "VARCHAR",
