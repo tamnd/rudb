@@ -121,6 +121,9 @@ enum Slot {
 /// The largest chunk the tail takes. Anything bigger is already a chunk worth its own slot.
 const TAIL_TAKES: usize = 64;
 
+/// How many values an append counts statistics for on each thread it starts, at least.
+const VALUES_PER_THREAD: usize = 1 << 16;
+
 /// A table held in memory as row groups, read a chunk at a time.
 #[derive(Debug, Clone)]
 pub struct MemoryTable {
@@ -473,12 +476,20 @@ impl MemoryTable {
                 *slot = Some((partial, ranges));
             }
         };
-        std::thread::scope(|scope| {
-            for _ in 1..workers.clamp(1, tasks.len().max(1)) {
-                scope.spawn(work);
-            }
+        // A thread is only worth starting for enough values to count. A single-row insert used to
+        // start one per column and spent more on the starts than on the row.
+        let values = chunks.iter().map(Chunk::len).sum::<usize>() * self.types.len();
+        let threads = workers.clamp(1, tasks.len().max(1)).min(values.div_ceil(VALUES_PER_THREAD));
+        if threads <= 1 {
             work();
-        });
+        } else {
+            std::thread::scope(|scope| {
+                for _ in 1..threads {
+                    scope.spawn(work);
+                }
+                work();
+            });
+        }
         let mut done = done.into_iter();
         let mut ranges = Vec::with_capacity(self.types.len());
         for mut counting in self.counts.columns_mut() {
