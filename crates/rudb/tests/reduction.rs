@@ -213,6 +213,33 @@ fn a_child_with_no_link_is_reduced_through_the_parents_key_map() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A build side that is not a stored parent, joined to a table's own unique key, is turned into the
+/// rows of that table by the key's map, which is the shape of TPC-H q18 where the orders kept by a
+/// grouping of `lineitem` are looked up in `orders`. The scan of `customer` reads those rows alone.
+#[test]
+fn a_join_to_a_tables_own_key_reads_the_rows_its_key_map_gives() {
+    let (database, path) = database("own");
+    let sql = "SELECT count(*), min(c_name), max(c_name) FROM customer WHERE c_custkey IN (SELECT \
+               o_custkey FROM orders WHERE o_orderkey % 30000 = 7)";
+    let reduced = rows(&database, sql);
+    assert_eq!(reduced[0][0], Value::BigInt(10));
+    let line = scan_of(&database, "customer", sql);
+    assert!(line.contains("kept 10 of 30000"), "the key map should give the rows: {line}");
+    assert!(line.contains("[10 rows"), "the scan should read only those rows: {line}");
+    // Two orders of each customer kept, so the join has to repeat each customer row.
+    let doubled = "SELECT count(*), sum(c_custkey), max(c_name) FROM customer JOIN (SELECT \
+                   o_custkey FROM orders WHERE o_orderkey % 30000 IN (7, 8)) AS t ON c_custkey = \
+                   t.o_custkey";
+    let twice = rows(&database, doubled);
+    assert_eq!(twice[0][0], Value::BigInt(20));
+
+    database.execute("SET graph_sections = 'off'").expect("the layer has a switch");
+    assert_eq!(rows(&database, sql), reduced, "the key map changed an answer");
+    assert_eq!(rows(&database, doubled), twice, "the key map changed an answer");
+    drop(database);
+    std::fs::remove_file(&path).ok();
+}
+
 /// Every kind of join the runtime filter is armed for, and a few it is not, against the same
 /// queries with the layer off.
 #[test]
