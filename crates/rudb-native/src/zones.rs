@@ -199,12 +199,13 @@ impl Zones for Stripes {
         // The ends of every part, which is a page per stripe of the column read once and kept by
         // the reader, and which the scan reads anyway to decide what to skip.
         let parts = self.reader.parts();
-        let (mut low, mut high, mut spans) = (i128::MAX, i128::MIN, 0.0_f64);
+        let (mut low, mut high) = (i128::MAX, i128::MIN);
+        let mut spans = Vec::with_capacity(parts);
         for part in 0..parts {
             let range = self.reader.part_range(part, column)?;
             match (range.low, range.high) {
                 (Some(Bound::Int(from)), Some(Bound::Int(to))) if from <= to => {
-                    spans += (to - from + 1) as f64;
+                    spans.push((to - from + 1) as f64);
                     low = low.min(from);
                     high = high.max(to);
                 }
@@ -214,7 +215,16 @@ impl Zones for Stripes {
             }
         }
         let values = u64::try_from(high.checked_sub(low)?.checked_add(1)?).ok()?;
-        Some(Reach { parts: u64::try_from(parts).ok()?, values, per_value: spans / values as f64 })
+        let each = values as f64 / parts.max(1) as f64;
+        let wide: Vec<f64> =
+            spans.iter().copied().filter(|&span| span > Reach::WIDE * each).collect();
+        Some(Reach {
+            parts: u64::try_from(parts).ok()?,
+            values,
+            per_value: spans.iter().sum::<f64>() / values as f64,
+            wide: u64::try_from(wide.len()).ok()?,
+            wide_per_value: wide.iter().sum::<f64>() / values as f64,
+        })
     }
 }
 
