@@ -1141,6 +1141,17 @@ impl Binder<'_> {
         }
         let types: Vec<LogicalType> =
             bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+        // A whole number written in the query has no cast to a document, so `json_pretty(42)` is
+        // refused while `json_pretty(42::BIGINT)` writes the number.
+        let count = arguments.len();
+        if arguments.iter().enumerate().any(|(at, &arg)| {
+            integer_literal(ast, arg) && rudb_functions::json_text_at(&written, at, count)
+        }) {
+            let spelled: Vec<String> =
+                types.iter().zip(&arguments).map(|(ty, &arg)| spelled_type(ast, arg, ty)).collect();
+            let name = written.to_ascii_lowercase();
+            return Err(rudb_functions::named_mismatch(&name, &spelled, false));
+        }
         self.call(&written, bound).map_err(|error| literals_spelled(ast, error, &arguments, &types))
     }
 
@@ -3471,13 +3482,24 @@ fn literals_spelled(
 fn spelled_type(ast: &Ast, arg: ast::ExprRef, ty: &LogicalType) -> String {
     match ast.expr(arg) {
         ast::Expr::Literal { kind: LiteralKind::String, .. } => "STRING_LITERAL".to_string(),
-        ast::Expr::Literal { kind: LiteralKind::Number, text }
-            if ast.string(text).bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            "INTEGER_LITERAL".to_string()
-        }
+        _ if integer_literal(ast, arg) => "INTEGER_LITERAL".to_string(),
         _ if *ty == LogicalType::Null => "\"NULL\"".to_string(),
         _ => ty.to_string(),
+    }
+}
+
+/// Whether an argument is a whole number written in the query, which the pin keeps as a literal
+/// with no type yet when it looks for an overload, and so is `-3`, which it reads as one number.
+fn integer_literal(ast: &Ast, arg: ast::ExprRef) -> bool {
+    match ast.expr(arg) {
+        ast::Expr::Literal { kind: LiteralKind::Number, text } => {
+            ast.string(text).bytes().all(|byte| byte.is_ascii_digit())
+        }
+        ast::Expr::Unary { op: UnaryOp::Negate, operand } => {
+            matches!(ast.expr(operand), ast::Expr::Literal { kind: LiteralKind::Number, text }
+                if ast.string(text).bytes().all(|byte| byte.is_ascii_digit()))
+        }
+        _ => false,
     }
 }
 

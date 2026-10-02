@@ -1,7 +1,8 @@
 //! The `JSON` type, the casts into and out of it, and the functions that read a document: checking
 //! it, naming the type of a value in it, picking values out of it by a path, and its operators, and
 //! the functions that build, merge, print, match and edit whole documents, the macros that gather
-//! rows into one, and the table functions that turn one into rows.
+//! rows into one, the table functions that turn one into rows, and the one that puts a document in a
+//! canonical form.
 //!
 //! Every expected answer here was taken from the pinned duckdb binary and not from rudb.
 
@@ -637,5 +638,62 @@ fn json_each_and_json_tree_make_a_row_of_each_value_in_a_document() {
          'json_each(VARCHAR, VARCHAR, INTEGER)'. You might need to add explicit type casts.\n\t\
          Candidate functions:\n\t\"json_each\"(VARCHAR)\n\t\"json_each\"(VARCHAR, VARCHAR)\n\t\
          \"json_each\"(JSON)\n\t\"json_each\"(JSON, VARCHAR)\n"
+    ));
+}
+
+#[test]
+fn json_normalize_sorts_the_keys_and_writes_the_document_minified() {
+    check(&[
+        (
+            r#"SELECT json_normalize('{"b":1,"a":{"d":[{"z":1,"y":2}],"c":0}}')"#,
+            r#"{"a":{"c":0,"d":[{"y":2,"z":1}]},"b":1}"#,
+        ),
+        (
+            r#"SELECT json_normalize('[3, {"b":1, "a":2}]'), json_normalize('5'), json_normalize(NULL), typeof(json_normalize('1'))"#,
+            r#"[3,{"a":2,"b":1}]|5|NULL|VARCHAR"#,
+        ),
+        (
+            r#"SELECT json_normalize('{"b":1,"a":2,"b":0,"B":3,"é":1,"":2}')"#,
+            r#"{"":2,"B":3,"a":2,"b":1,"b":0,"é":1}"#,
+        ),
+        (r#"SELECT json_normalize('  {"x" : 1.50, "a": 1e2}  ')"#, r#"{"a":100.0,"x":1.5}"#),
+        ("SELECT json_normalize([1,2])", "[1,2]"),
+        (
+            r#"SELECT TRY(json_normalize(j)) FROM (VALUES ('{"b":1,"a":2}'::VARCHAR), ('{"a":')) t(j)"#,
+            "{\"a\":2,\"b\":1}\nNULL",
+        ),
+        (
+            "SELECT function_name, parameters, parameter_types, return_type FROM duckdb_functions() WHERE function_name = 'json_normalize'",
+            "json_normalize|[col0]|[JSON]|VARCHAR",
+        ),
+    ]);
+    assert!(refused("SELECT json_normalize('{\"a\":')").starts_with(
+        "Conversion Error: Malformed JSON at byte 5 of input: unexpected end of data.  Input: \"{\"a\":\""
+    ));
+    assert!(refused("SELECT json_normalize(42)").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+         'json_normalize(INTEGER_LITERAL)'. You might need to add explicit type casts.\n\tCandidate \
+         functions:\n\tjson_normalize(col0 JSON) -> VARCHAR"
+    ));
+}
+
+#[test]
+fn a_whole_number_written_in_the_query_is_not_a_document() {
+    check(&[(
+        "SELECT json_type(42::BIGINT), json_normalize(1.5), json_extract('[1,2]', 1), json_extract('[1,2]', -1)",
+        "UBIGINT|1.5|2|2",
+    )]);
+    assert!(refused("SELECT json_pretty(-3)").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+         'json_pretty(INTEGER_LITERAL)'. You might need to add explicit type casts."
+    ));
+    assert!(refused("SELECT json_merge_patch(42, 1)").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+         'json_merge_patch(INTEGER_LITERAL, INTEGER_LITERAL)'. You might need to add explicit type \
+         casts.\n\tCandidate functions:\n\tjson_merge_patch(col0 JSON, col1 JSON, [JSON...]) -> JSON"
+    ));
+    assert!(refused("SELECT json_array_length(5, '$')").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+         'json_array_length(INTEGER_LITERAL, STRING_LITERAL)'."
     ));
 }

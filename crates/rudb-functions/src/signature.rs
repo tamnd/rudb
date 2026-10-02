@@ -1390,6 +1390,13 @@ const TABLE: &[Entry] = &[
         numeric_only: false,
     },
     Entry {
+        name: "json_normalize",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
         name: "json_strip_nulls",
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(1),
@@ -3414,6 +3421,7 @@ const JSONED: &[(&str, &[&str])] = &[
     ("json_replace", &["json_replace(col0 JSON, col1 VARCHAR, col2 JSON) -> JSON"]),
     ("json_remove", &["json_remove(col0 JSON, col1 VARCHAR) -> JSON"]),
     ("json_pretty", &["json_pretty(col0 JSON) -> VARCHAR"]),
+    ("json_normalize", &["json_normalize(col0 JSON) -> VARCHAR"]),
     ("json_strip_nulls", &["json_strip_nulls(col0 JSON) -> JSON"]),
     (
         "json_contains",
@@ -3458,6 +3466,37 @@ const JSONED: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Whether every overload of the `JSON` function `name` with `count` arguments reads the one at `at`
+/// as a string or a document, which a whole number written in the query has no cast to, so the pin
+/// refuses `json_pretty(42)` and `json_contains(42, 1)` while it takes `json_pretty(42::BIGINT)`.
+pub fn json_text_at(name: &str, at: usize, count: usize) -> bool {
+    let Some((_, overloads)) = JSONED.iter().find(|(entry, _)| entry.eq_ignore_ascii_case(name))
+    else {
+        return false;
+    };
+    let fitting: Vec<&str> = overloads
+        .iter()
+        .filter_map(|overload| {
+            let (call, _) = overload.split_once(" -> ")?;
+            let inside = &call[call.find('(')? + 1..call.len() - 1];
+            let mut fixed = Vec::new();
+            let mut varargs = None;
+            for argument in inside.split(", ") {
+                match argument.strip_prefix('[').and_then(|rest| rest.strip_suffix("...]")) {
+                    Some(ty) => varargs = Some(ty),
+                    None => fixed.push(argument.rsplit_once(' ')?.1),
+                }
+            }
+            match (fixed.get(at).copied(), varargs) {
+                _ if count < fixed.len() || (varargs.is_none() && count > fixed.len()) => None,
+                (Some(ty), _) | (None, Some(ty)) => Some(ty),
+                (None, None) => None,
+            }
+        })
+        .collect();
+    !fitting.is_empty() && fitting.iter().all(|ty| matches!(*ty, "VARCHAR" | "JSON"))
+}
+
 /// The names [`JSONED`] has overloads for, which [`jsoned`] decides the types of.
 const JSON_NAMES: &[&str] = &[
     "json",
@@ -3486,6 +3525,7 @@ const JSON_NAMES: &[&str] = &[
     "json_replace",
     "json_remove",
     "json_pretty",
+    "json_normalize",
     "json_strip_nulls",
     "json_contains",
     "json_structure",
@@ -3498,10 +3538,11 @@ const JSON_NAMES: &[&str] = &[
 /// The types a `JSON` function reads its arguments as, and the type of its answer.
 ///
 /// The document is a string or a `JSON` as it was written, and anything else is cast to `JSON`,
-/// which writes it as one, as the pin does for `json_type(42)`. A path is a string, a list of strings,
-/// which answers a list with one answer for each path, or for the functions that pick a value out a
-/// whole number, which is an index into an array. Whether a constant path has a wildcard in it,
-/// which also answers a list, is read by the binder once it has the constant.
+/// which writes it as one, as the pin does for `json_type(42::BIGINT)`. A whole number written in
+/// the query is the exception, which the binder refuses before it gets here. A path is a string, a
+/// list of strings, which answers a list with one answer for each path, or for the functions that
+/// pick a value out a whole number, which is an index into an array. Whether a constant path has a
+/// wildcard in it, which also answers a list, is read by the binder once it has the constant.
 fn jsoned(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
     use LogicalType::{BigInt, Json, Null, Varchar};
     // A document read whole is a `JSON` and anything else is cast to one, except where the
@@ -3528,7 +3569,7 @@ fn jsoned(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, Lo
             }
             return Some(([Json, Varchar, Json][..arguments.len()].to_vec(), Json));
         }
-        ("json_pretty", [_]) => return Some((vec![Json], Varchar)),
+        ("json_pretty" | "json_normalize", [_]) => return Some((vec![Json], Varchar)),
         ("json_strip_nulls", [_]) => return Some((vec![Json], Json)),
         ("json_contains", [haystack, needle]) => {
             return Some((vec![whole(haystack), whole(needle)], LogicalType::Boolean));
