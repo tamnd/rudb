@@ -17930,6 +17930,44 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
+    /// A read of a few packed integers in the last statement pays what it costs toward holding the
+    /// part, even when the statement reads the table twice, where before the last statement it pays
+    /// enough to hold the part at once.
+    #[test]
+    fn a_sparse_read_in_the_last_statement_pays_what_it_costs() {
+        let path = path("sparse-rent");
+        let mut writer =
+            Writer::create(&path, "a", vec![Field::required("id", LogicalType::BigInt)])
+                .expect("new file");
+        let values: Vec<Value> = (0..2048).map(|i| Value::BigInt(i * 7919 % 100_003)).collect();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &values).expect("integers")])
+                .expect("matching rows");
+        writer.append(&chunk).expect("one part");
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("a").expect("a");
+        let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
+        let positions = [5, 900, 1500];
+        pool.last_statement();
+        pool.rereads(true);
+        let read = a.read_rows(0, &[0], &positions, true).expect("three rows");
+        assert_eq!(read.value_at(1, 0), values[900]);
+        assert!(matches!(*slot(0), PartSlot::Seen(24)), "three rows pay eight each");
+        drop((a, catalog));
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("a").expect("a");
+        let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
+        a.read_rows(0, &[0], &positions, true).expect("three rows");
+        assert!(matches!(*slot(0), PartSlot::Held { .. }), "with statements after, it is held");
+        drop((a, catalog));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
     /// A whole read holds the part it decoded, reads at positions count what they cost until the
     /// read whose share comes to the part holds it, and a part the pool lets go is decoded again
     /// from its pages. A part of 64 integers is decoded whole by any read of it, so here the first
