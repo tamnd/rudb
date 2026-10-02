@@ -111,7 +111,8 @@ pub fn build_value_rows_within(path: &Path, table: &str, share: u64) -> Result<V
     let mut payloads = Vec::with_capacity(columns.len());
     for &column in &columns {
         let payload = if rows >= FEWEST_ROWS { encode(&reader, column)? } else { None };
-        let (coded, bytes) = payload.as_ref().map_or((0, 0), |(coded, bytes)| (*coded, bytes.len()));
+        let (coded, bytes) =
+            payload.as_ref().map_or((0, 0), |(coded, bytes)| (*coded, bytes.len()));
         report.push(Built { column, coded, bytes, built: false });
         payloads.push(payload.map(|(_, bytes)| bytes).unwrap_or_default());
     }
@@ -342,7 +343,8 @@ impl ValueRows {
         let total =
             self.held(codes).ok_or_else(|| invalid("a code past the end of its dictionary"))?;
         let dense = total.saturating_mul(64) >= self.rows;
-        let mut words = if dense { vec![0_u64; self.rows.div_ceil(64) as usize] } else { Vec::new() };
+        let mut words =
+            if dense { vec![0_u64; self.rows.div_ceil(64) as usize] } else { Vec::new() };
         let mut members = if dense { Vec::new() } else { Vec::with_capacity(total as usize) };
         let mut put = |row: u64| {
             if dense {
@@ -452,7 +454,8 @@ mod tests {
 
     fn path(label: &str) -> PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("time advances").as_nanos();
-        std::env::temp_dir().join(format!("rudb-postings-{label}-{}-{stamp}.rdb", std::process::id()))
+        std::env::temp_dir()
+            .join(format!("rudb-postings-{label}-{}-{stamp}.rdb", std::process::id()))
     }
 
     /// A table of a note drawn from a few values with nulls among them, and a number.
