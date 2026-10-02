@@ -39,7 +39,9 @@ use std::fs::File;
 use std::mem::{size_of, size_of_val};
 use std::path::Path;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering as Atomic};
+use std::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as Atomic,
+};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
@@ -5735,14 +5737,14 @@ struct NativeText {
     /// a little early, which is the harmless direction, and it costs one relaxed add a block rather
     /// than a lock on the path every scan of a string column goes through.
     payload_kept: AtomicUsize,
-    /// Which payload blocks a sweep or a visit has decoded before, one flag a block.
+    /// How many times a sweep or a visit has decoded each payload block, counted up to two.
     ///
     /// A sweep keeps a block the first time it decodes it, and a visit the second time. Keeping
     /// nothing on the first sweep held a `URL LIKE` on ten million rows at 97 MB rather than 396,
     /// but it also made the second run of every JOB query that sweeps `name` decode it all again,
     /// and a sweep reads each block once and whole, so what it keeps is what the next statement
     /// reads. [`TEXT_KEEP_BUDGET`] bounds what a column keeps either way.
-    swept: Vec<AtomicBool>,
+    swept: Vec<AtomicU8>,
     /// How many blocks [`TextSource::visit_at`] has decoded and dropped because the column was
     /// already holding its [`TEXT_KEEP_BUDGET`].
     ///
@@ -5849,8 +5851,16 @@ const TEXT_SEARCH_MEMO: usize = 64;
 /// decodes is kept. See [`NativeText::loaned_block`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Loan {
-    /// A read of values in order. It keeps a block the second time it decodes it, and the first
-    /// time too before the last statement, since the next statement is likely to read it again.
+    /// A read of values in order. It keeps a block the first time it decodes it before the last
+    /// statement, since the next statement is likely to read it again, and in the last statement
+    /// the third time.
+    ///
+    /// Not the second. A caller that reads in order remembers what it made of the values, a `LIKE`
+    /// or a `regexp_replace` a group at a time, and a second decode in one statement is mostly that
+    /// caller deciding the rest of a group it first asked a few values of. It does not come back
+    /// after that. Keeping the block on that decode held 50 MB of `Title` and `URL` in ClickBench
+    /// q23 that nothing read again. A third decode is something else reading the block, an arm of
+    /// an `OR` of patterns over the same column, and that keeps it for the arms still to come.
     InOrder,
     /// A read by code rather than in order. It keeps only on the second decode, and stops dropping
     /// once it has dropped a column's worth of blocks, for the reason
@@ -6175,13 +6185,19 @@ impl NativeText {
         if let Some(Ok(kept)) = kept {
             return Ok(kept);
         }
-        let again = kept.is_none()
-            && self.swept.get(block).is_some_and(|swept| swept.swap(true, Atomic::Relaxed));
+        let before = match (kept, self.swept.get(block)) {
+            (None, Some(swept)) => swept
+                .fetch_update(Atomic::Relaxed, Atomic::Relaxed, |count| {
+                    (count < 2).then_some(count + 1)
+                })
+                .unwrap_or_else(|count| count),
+            _ => 0,
+        };
         let last = self.last.load(Atomic::Relaxed);
         let scattered = loan == Loan::Scattered;
         let wanted = match loan {
-            Loan::InOrder => again || !last,
-            Loan::Scattered => again,
+            Loan::InOrder => before >= 2 || !last,
+            Loan::Scattered => before >= 1,
             Loan::Whole => !last,
         };
         let keep = wanted
@@ -6195,7 +6211,7 @@ impl NativeText {
             return Ok(kept);
         }
         *decoded = self.decode_block(block)?;
-        if scattered && again {
+        if scattered && before >= 1 {
             self.visit_dropped.fetch_add(1, Atomic::Relaxed);
         }
         Ok(decoded)
@@ -14586,7 +14602,7 @@ fn open_global_dictionary(
             keep_budget,
             last,
             payload_kept: AtomicUsize::new(0),
-            swept: (0..blocks).map(|_| AtomicBool::new(false)).collect(),
+            swept: (0..blocks).map(|_| AtomicU8::new(0)).collect(),
             visit_dropped: AtomicUsize::new(0),
             searched: Mutex::new(HashMap::new()),
         }),
