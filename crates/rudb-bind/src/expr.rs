@@ -180,7 +180,10 @@ impl Binder<'_> {
                     order,
                     spec,
                 };
-                self.bind_window(ast, &call, scope)
+                match self.builtin_window_macro(ast, &call, scope)? {
+                    Some(expanded) => Ok(expanded),
+                    None => self.bind_window(ast, &call, scope),
+                }
             }
             ast::Expr::Cast { operand, ty, try_cast } => {
                 let input = self.bind_expr(ast, operand, scope)?;
@@ -877,6 +880,13 @@ impl Binder<'_> {
             };
             return self.bind_try(ast, only, scope);
         }
+        let modified = distinct || filter != NONE || !sorted.is_empty();
+        if modified && crate::macros::is_macro(&written) {
+            return Err(Error::invalid_input(format!(
+                "Function \"{written}\" is a Macro Function. \"DISTINCT\", \"FILTER\", and \
+                 \"ORDER BY\" are only applicable to window and aggregate functions."
+            )));
+        }
         if let Some(expanded) = self.builtin_macro(ast, &written, &arguments, scope)? {
             return Ok(expanded);
         }
@@ -892,7 +902,6 @@ impl Binder<'_> {
         // Upstream's sentence, which names all three modifiers whichever one was written, and which
         // it reaches only once the name has resolved: `nosuch(DISTINCT x)` is a catalog error there
         // and not this, so a name this does not know falls through and gets the catalog's answer.
-        let modified = distinct || filter != NONE || !sorted.is_empty();
         if modified && kind_of(&written) == Some(FunctionKind::Scalar) {
             return Err(Error::invalid_input(format!(
                 "Function \"{written}\" is a Scalar Function. \"DISTINCT\", \"FILTER\", and \

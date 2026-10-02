@@ -9,8 +9,8 @@
 //!
 //! The macros that already have a function or an expansion of their own here are not in the table.
 //! The `list_` aggregates are `crate::listaggr`, `list_append` and its five relatives are in
-//! `crate::expr`, and `if` and `nullif` bind as the CASE they stand for. The json macros wait for a
-//! JSON type.
+//! `crate::expr`, and `if` and `nullif` bind as the CASE they stand for. The `json` macro is a
+//! function here.
 //!
 //! The pin keeps the PostgreSQL shims, `pg_typeof`, the `has_*_privilege` pairs and the
 //! `pg_*_is_visible` family among them, in `pg_catalog` and the rest in `main`. Both are on the
@@ -23,7 +23,9 @@ use rudb_common::{Error, Result};
 use rudb_parse::{Ast, Kind, ast, deparse, parse_ast_with_case, tokenize};
 use rudb_plan::ExprRef;
 
-use crate::binder::Binder;
+use rudb_functions::{FunctionKind, kind_of};
+
+use crate::binder::{Binder, WindowCall};
 use crate::scope::Scope;
 
 /// One overload of a built-in macro, as `duckdb_functions()` lists it.
@@ -109,6 +111,21 @@ const MACROS: &[Macro] = &[
     define("inet_server_addr", &[], "NULL"),
     define("inet_server_port", &[], "NULL"),
     define(
+        "json_group_array",
+        &["x"],
+        "CAST((('[' || string_agg(CASE  WHEN ((x IS NULL)) THEN (CAST('null' AS \"JSON\")) \
+         ELSE to_json(x) END, ',')) || ']') AS \"JSON\")",
+    ),
+    define(
+        "json_group_object",
+        &["n", "v"],
+        "CAST((('{' || string_agg(((CASE  WHEN ((n IS NULL)) THEN \
+         (\"error\"('json_group_object key cannot be NULL')) ELSE to_json(CAST(n AS VARCHAR)) \
+         END || ':') || CASE  WHEN ((v IS NULL)) THEN (CAST('null' AS \"JSON\")) ELSE to_json(v) \
+         END), ',')) || '}') AS \"JSON\")",
+    ),
+    define("json_group_structure", &["x"], "(json_structure(json_group_array(x)) -> 0)"),
+    define(
         "md5_number_lower",
         &["param"],
         "CAST(CAST(CAST(CAST(md5_number(param) AS BIT) AS VARCHAR)[:64] AS BIT) AS uint64)",
@@ -162,11 +179,49 @@ const MACROS: &[Macro] = &[
 
 /// The macros whose body aggregates, which make the select block they are in aggregate the way a
 /// call to an aggregate does.
-const AGGREGATING: &[&str] = &["geomean", "geometric_mean", "wavg", "weighted_avg"];
+const AGGREGATING: &[&str] = &[
+    "geomean",
+    "geometric_mean",
+    "json_group_array",
+    "json_group_object",
+    "json_group_structure",
+    "wavg",
+    "weighted_avg",
+];
 
 /// Whether a call to `name` aggregates, which has to be known before anything in its block binds.
 pub(crate) fn aggregates(name: &str) -> bool {
     AGGREGATING.iter().any(|held| rudb_catalog::same_name(name, held))
+}
+
+/// Whether `name` is one of the macros in the table, which a call written with `DISTINCT`, a
+/// `FILTER` or an `ORDER BY` is refused for.
+pub(crate) fn is_macro(name: &str) -> bool {
+    MACROS.iter().any(|held| rudb_catalog::same_name(name, held.name))
+}
+
+/// The overload of `written` that takes `count` arguments, or `None` if `written` is not a macro.
+fn chosen(written: &str, count: usize) -> Result<Option<&'static Macro>> {
+    let overloads: Vec<&'static Macro> =
+        MACROS.iter().filter(|held| rudb_catalog::same_name(written, held.name)).collect();
+    let Some(first) = overloads.first() else {
+        return Ok(None);
+    };
+    match overloads.iter().find(|held| held.parameters.len() == count) {
+        Some(&chosen) => Ok(Some(chosen)),
+        None => {
+            let candidates: Vec<String> = overloads
+                .iter()
+                .map(|held| format!("\t{}({})", first.name, held.parameters.join(", ")))
+                .collect();
+            Err(Error::binder(format!(
+                "Macro {}() does not support the supplied arguments. You might need to add \
+                 explicit type casts.\nCandidate macros:\n{}",
+                first.name,
+                candidates.join("\n")
+            )))
+        }
+    }
 }
 
 impl Binder<'_> {
@@ -181,27 +236,81 @@ impl Binder<'_> {
         arguments: &[ast::ExprRef],
         scope: &Scope,
     ) -> Result<Option<ExprRef>> {
-        let overloads: Vec<&Macro> =
-            MACROS.iter().filter(|held| rudb_catalog::same_name(written, held.name)).collect();
-        let Some(first) = overloads.first() else {
+        let Some(chosen) = chosen(written, arguments.len())? else {
             return Ok(None);
-        };
-        let Some(chosen) = overloads.iter().find(|held| held.parameters.len() == arguments.len())
-        else {
-            let candidates: Vec<String> = overloads
-                .iter()
-                .map(|held| format!("\t{}({})", first.name, held.parameters.join(", ")))
-                .collect();
-            return Err(Error::binder(format!(
-                "Macro {}() does not support the supplied arguments. You might need to add \
-                 explicit type casts.\nCandidate macros:\n{}",
-                first.name,
-                candidates.join("\n")
-            )));
         };
         let texts: Vec<String> =
             arguments.iter().map(|&argument| deparse::expression(ast, argument)).collect();
         let text = substitute(chosen.body, chosen.parameters, &texts)?;
+        self.bind_macro_body(chosen.name, &text, scope).map(Some)
+    }
+
+    /// The expansion of a call to a built-in macro written with a window, or `None` if the name is
+    /// not one.
+    ///
+    /// The pin pushes the window down onto the one aggregate in the body, so that
+    /// `json_group_array(v) OVER (ORDER BY v)` is the `string_agg` in its body over that window,
+    /// and refuses a body with no aggregate or more than one, which a macro that calls another
+    /// macro is. The `DISTINCT` and the `FILTER` go with the window, and so does `IGNORE NULLS`,
+    /// which the aggregate then refuses. An `ORDER BY` inside the brackets is dropped, the way the
+    /// pin drops it.
+    pub(crate) fn builtin_window_macro(
+        &mut self,
+        ast: &Ast,
+        call: &WindowCall<'_>,
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        let Some(chosen) = chosen(call.name, call.args.len())? else {
+            return Ok(None);
+        };
+        let body = chosen.body;
+        let tokens = tokenize(body)?;
+        let calls: Vec<usize> = (0..tokens.len())
+            .filter(|&at| {
+                let word = tokens[at].text(body);
+                let word =
+                    word.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(word);
+                tokens.get(at + 1).is_some_and(|next| next.text(body) == "(")
+                    && kind_of(word) == Some(FunctionKind::Aggregate)
+            })
+            .collect();
+        let [aggregate] = calls[..] else {
+            return Err(Error::binder(
+                "Window function macro bodies must contain exactly one aggregate function",
+            ));
+        };
+        let open = tokens[aggregate + 1].end as usize;
+        let mut depth = 0usize;
+        let close = tokens[aggregate + 1..]
+            .iter()
+            .find(|token| {
+                match token.text(body) {
+                    "(" => depth += 1,
+                    ")" => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map(|token| token.start as usize)
+            .ok_or_else(|| Error::internal(format!("the body of {}", chosen.name)))?;
+        let texts: Vec<String> =
+            call.args.iter().map(|&argument| deparse::expression(ast, argument)).collect();
+        let parameters = chosen.parameters;
+        let text = format!(
+            "{}{}{}{}){} {}{}",
+            substitute(&body[..open], parameters, &texts)?,
+            if call.distinct { "DISTINCT " } else { "" },
+            substitute(&body[open..close], parameters, &texts)?,
+            if call.ignore_nulls { " IGNORE NULLS" } else { "" },
+            deparse::filtered(ast, call.filter),
+            deparse::over(ast, call.spec),
+            substitute(&body[close + 1..], parameters, &texts)?,
+        );
+        self.bind_macro_body(chosen.name, &text, scope).map(Some)
+    }
+
+    /// The text a macro's body came to once its arguments were put in, bound where the call was.
+    fn bind_macro_body(&mut self, name: &str, text: &str, scope: &Scope) -> Result<ExprRef> {
         let body =
             parse_ast_with_case(&format!("SELECT {text}"), self.semantics.identifier_case())?;
         let expr = match body.statements.first() {
@@ -213,13 +322,13 @@ impl Binder<'_> {
             },
             _ => None,
         };
-        let expr = expr.ok_or_else(|| Error::internal(format!("the body of {}", chosen.name)))?;
+        let expr = expr.ok_or_else(|| Error::internal(format!("the body of {name}")))?;
         // Everything the body binds to is placed where the call was written, since the body's own
         // text is not anything the user wrote and a caret into it would point at the wrong words.
         let outer = self.pinned_span.replace(self.current_span);
         let bound = self.bind_expr(&body, expr, scope);
         self.pinned_span = outer;
-        bound.map(Some)
+        bound
     }
 }
 

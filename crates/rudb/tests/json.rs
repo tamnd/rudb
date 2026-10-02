@@ -1,6 +1,7 @@
 //! The `JSON` type, the casts into and out of it, and the functions that read a document: checking
 //! it, naming the type of a value in it, picking values out of it by a path, and its operators, and
-//! the functions that build, merge, print and match whole documents.
+//! the functions that build, merge, print and match whole documents, and the macros that gather rows
+//! into one.
 //!
 //! Every expected answer here was taken from the pinned duckdb binary and not from rudb.
 
@@ -432,4 +433,77 @@ fn a_transform_reads_a_document_into_the_type_its_structure_names() {
         refused(r#"SELECT json_transform('{"a":1}', 1)"#),
         "Binder Error: No function matches the given name and argument types 'json_transform(STRING_LITERAL, INTEGER_LITERAL)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tjson_transform(\"json\" VARCHAR, structure VARCHAR) -> ANY\n\tjson_transform(\"json\" JSON, structure VARCHAR) -> ANY\n"
     );
+}
+
+#[test]
+fn the_group_macros_gather_rows_into_a_document_and_take_a_window() {
+    check(&[
+        ("SELECT json_group_array(x) FROM (VALUES (1),(NULL),(3)) t(x)", "[1,null,3]"),
+        (
+            r#"SELECT json_group_array(x), typeof(json_group_array(x)) FROM (VALUES ('a'),('b"')) t(x)"#,
+            r#"["a","b\""]|JSON"#,
+        ),
+        ("SELECT json_group_array(x) FROM range(0) t(x)", "NULL"),
+        (
+            "SELECT json_group_object(k, v) FROM (VALUES ('a',1),('b',NULL),('a',3)) t(k,v)",
+            r#"{"a":1,"b":null,"a":3}"#,
+        ),
+        (
+            "SELECT json_group_object(k, v) FROM (VALUES (1,{'x':1}),(2,{'x':2})) t(k,v)",
+            r#"{"1":{"x":1},"2":{"x":2}}"#,
+        ),
+        (
+            r#"SELECT json_group_structure(j) FROM (VALUES ('{"a":1}'::JSON),('{"b":"x"}'::JSON)) t(j)"#,
+            r#"{"a":"UBIGINT","b":"VARCHAR"}"#,
+        ),
+        ("SELECT json_group_structure(j) FROM (VALUES (1),(2.5)) t(j)", r#""DOUBLE""#),
+        (
+            "SELECT json_group_array(v) OVER (ORDER BY v) FROM range(1, 4) t(v)",
+            "[1]\n[1,2]\n[1,2,3]",
+        ),
+        (
+            "SELECT DISTINCT json_group_object(k, v) OVER (PARTITION BY g) FROM (VALUES (1, 'a', 10), (1, 'b', 20), (2, 'c', 30)) t(g,k,v) ORDER BY 1",
+            "{\"a\":10,\"b\":20}\n{\"c\":30}",
+        ),
+        ("SELECT json_group_array(DISTINCT v) OVER () FROM (VALUES (1),(1)) t(v)", "[1]\n[1]"),
+        (
+            "SELECT json_group_array(v) FILTER (WHERE v > 1) OVER () FROM range(1, 3) t(v)",
+            "[2]\n[2]",
+        ),
+        (
+            "SELECT json_group_array(v ORDER BY v DESC) OVER () FROM range(1, 3) t(v)",
+            "[1,2]\n[1,2]",
+        ),
+        ("SELECT geomean(v) OVER (ORDER BY v) FROM (VALUES (1),(4)) t(v)", "1.0\n2.0"),
+    ]);
+    assert_eq!(
+        refused("SELECT json_group_object(k, v) FROM (VALUES (NULL,1)) t(k,v)"),
+        "Invalid Input Error: json_group_object key cannot be NULL"
+    );
+    assert_eq!(
+        refused("SELECT json_group_array(DISTINCT v) FROM range(2) t(v)"),
+        "Invalid Input Error: Function \"json_group_array\" is a Macro Function. \"DISTINCT\", \
+         \"FILTER\", and \"ORDER BY\" are only applicable to window and aggregate functions."
+    );
+    for sql in [
+        "SELECT json_group_structure(v) OVER () FROM range(2) t(v)",
+        "SELECT weighted_avg(v, v) OVER () FROM range(2) t(v)",
+    ] {
+        assert_eq!(
+            refused(sql),
+            "Binder Error: Window function macro bodies must contain exactly one aggregate function"
+        );
+    }
+    assert_eq!(
+        refused("SELECT json_group_array(v IGNORE NULLS) OVER () FROM range(2) t(v)"),
+        "Binder Error: RESPECT/IGNORE NULLS is not supported for windowed aggregates"
+    );
+    assert_eq!(
+        refused("SELECT json_group_array(json_group_array(v)) FROM range(2) t(v)"),
+        "Binder Error: aggregate function calls cannot be nested"
+    );
+    assert!(refused("SELECT json_group_object(1)").starts_with(
+        "Binder Error: Macro json_group_object() does not support the supplied arguments. You \
+         might need to add explicit type casts.\nCandidate macros:\n\tjson_group_object(n, v)"
+    ));
 }
