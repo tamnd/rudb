@@ -1,5 +1,6 @@
 //! The `JSON` type, the casts into and out of it, and the functions that read a document: checking
-//! it, naming the type of a value in it, picking values out of it by a path, and its operators.
+//! it, naming the type of a value in it, picking values out of it by a path, and its operators, and
+//! the functions that build, merge, print and match whole documents.
 //!
 //! Every expected answer here was taken from the pinned duckdb binary and not from rudb.
 
@@ -205,4 +206,110 @@ fn a_path_the_pin_cannot_read_is_refused_in_its_words() {
             "{sql}"
         );
     }
+}
+
+#[test]
+fn the_builders_write_a_value_as_a_document() {
+    check(&[
+        (
+            r#"SELECT to_json('{"a":1}'), to_json('{"a":1}'::JSON), to_json(1.5::DECIMAL(20,2)), to_json(NULL::INTEGER) IS NULL, typeof(to_json(1))"#,
+            r#""{\"a\":1}"|{"a":1}|1.50|true|JSON"#,
+        ),
+        (
+            r#"SELECT to_json(DATE '2020-01-02'), to_json(INTERVAL 1 DAY), to_json('ab'::BLOB), to_json({'a': [1, NULL], 'b': 'x'}), json_quote('x"y')"#,
+            r#""2020-01-02"|"1 day"|"ab"|{"a":[1,null],"b":"x"}|"x\"y""#,
+        ),
+        (
+            "SELECT array_to_json([1, 2]), array_to_json(NULL), row_to_json({'a': 1}), row_to_json(NULL)",
+            r#"[1,2]|NULL|{"a":1}|NULL"#,
+        ),
+        (
+            "SELECT json_array(), json_array(1, 'a', NULL, [true]), json_array(NULL), json_object(), json_object('a', 1, 'a', 2, 'b', NULL)",
+            r#"[]|[1,"a",null,[true]]|[null]|{}|{"a":1,"a":2,"b":null}"#,
+        ),
+    ]);
+    let cases = [
+        ("SELECT to_json()", "Binder Error: to_json() takes exactly one argument"),
+        (
+            "SELECT array_to_json(1)",
+            "Binder Error: array_to_json() argument type must be LIST or ARRAY",
+        ),
+        ("SELECT row_to_json([1])", "Binder Error: row_to_json() argument type must be STRUCT"),
+        (
+            "SELECT json_object('a')",
+            "Binder Error: json_object() requires an even number of arguments",
+        ),
+        (
+            "SELECT json_object(1, 2)",
+            r#"Binder Error: json_object() keys must be VARCHAR, add an explicit cast to argument ""1"""#,
+        ),
+        (
+            "SELECT json_object(k, 1) FROM (VALUES (NULL::VARCHAR)) t(k)",
+            "Invalid Input Error: JSON key cannot be NULL",
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(refused(sql), expected, "{sql}");
+    }
+}
+
+#[test]
+fn the_whole_document_functions_merge_print_and_match() {
+    check(&[
+        (
+            r#"SELECT json_merge_patch('{"a":1,"b":2}', '{"b":null,"c":3}'), json_merge_patch('[1]', '{"a":1}'), json_merge_patch('{"a":{"x":1}}', '{"a":{"y":2}}', '{"z":0}'), json_merge_patch(NULL, '{"a":1}'), json_merge_patch('{"a":1}', NULL)"#,
+            r#"{"a":1,"c":3}|{"a":1}|{"a":{"x":1,"y":2},"z":0}|{"a":1}|NULL"#,
+        ),
+        (
+            r#"SELECT json_deep_merge('{"a":{"x":1},"b":1}', '{"a":{"y":2},"b":null}'), json_deep_merge('1', 'null'), json_deep_merge('{"a":[1]}', '{"a":[2]}')"#,
+            r#"{"b":1,"a":{"x":1,"y":2}}|1|{"a":[2]}"#,
+        ),
+        (
+            r#"SELECT json_merge_patch_diff('{"a":1,"b":2,"c":{"x":1}}', '{"a":1,"c":{"x":2},"d":4}'), json_merge_patch_diff('{"a":1}', '{"a":1}'), json_merge_patch_diff('[1]', '[2]'), json_merge_patch_diff(NULL, '{"a":1}')"#,
+            r#"{"b":null,"c":{"x":2},"d":4}|{}|[2]|{"a":1}"#,
+        ),
+        (
+            r#"SELECT json_pretty('{"a":[1,{"b":null}],"c":{},"d":[]}')"#,
+            "{\n    \"a\": [\n        1,\n        {\n            \"b\": null\n        }\n    ],\n    \"c\": {},\n    \"d\": []\n}",
+        ),
+        (
+            r#"SELECT json_strip_nulls('{"a":null,"b":[null,{"c":null,"d":1}]}'), typeof(json_pretty('1')), typeof(json_strip_nulls('1'))"#,
+            r#"{"b":[null,{"d":1}]}|VARCHAR|JSON"#,
+        ),
+        (
+            r#"SELECT json_contains('{"a":1,"b":[1,2,{"c":3}]}', '{"c":3}'), json_contains('[1,2,3]', '[3,1]'), json_contains('{"a":1}', '1.0'), json_contains('{"a":{"b":1,"c":2}}', '{"b":1}'), json_contains('[1]', '"1"')"#,
+            "true|true|false|true|false",
+        ),
+        (
+            r#"SELECT json_structure('{"a":1,"b":[1,2.5],"c":null,"d":"x","e":true}'), json_structure('[1,"a"]'), json_structure('[]'), json_structure('{}'), json_structure('[{"a":1},{"b":-1}]')"#,
+            r#"{"a":"UBIGINT","b":["DOUBLE"],"c":"NULL","d":"VARCHAR","e":"BOOLEAN"}|["JSON"]|["NULL"]|"JSON"|[{"a":"UBIGINT","b":"BIGINT"}]"#,
+        ),
+        (
+            r#"SELECT json_structure('[1,18446744073709551615]'), json_structure('[-1,18446744073709551615]'), json_structure('[null,1]'), json_structure('{"a":1,"a":"x"}')"#,
+            r#"["UBIGINT"]|["HUGEINT"]|["UBIGINT"]|{"a":"JSON"}"#,
+        ),
+    ]);
+    assert_eq!(
+        refused("SELECT json_contains('{x', '1')"),
+        r#"Invalid Input Error: Malformed JSON at byte 1 of input: unexpected character.  Input: "{x""#
+    );
+}
+
+#[test]
+fn a_deep_document_is_merged_and_matched_without_running_out_of_stack() {
+    let deep =
+        |value: &str| format!(r#"repeat('{{"a":', 50000) || '{value}' || repeat('}}', 50000)"#);
+    let (one, two) = (deep("1"), deep("2"));
+    check(&[
+        (
+            &format!(
+                "SELECT length(json_merge_patch({one}, {two})), length(json_deep_merge({one}, {two})), length(json_merge_patch_diff({one}, {two}))"
+            ),
+            "300001|300001|300001",
+        ),
+        ("SELECT json_contains(repeat('[', 50000) || '1' || repeat(']', 50000), '1')", "true"),
+        // The pin crashes past about 25000 levels here, tamnd/duckdb#31.
+        ("SELECT length(json_structure(repeat('[', 20000) || repeat(']', 20000)))", "40006"),
+        ("SELECT length(json_pretty(repeat('[', 1000) || repeat(']', 1000)))", "3996002"),
+    ]);
 }

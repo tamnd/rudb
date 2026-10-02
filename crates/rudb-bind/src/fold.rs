@@ -163,6 +163,13 @@ fn evaluate(plan: &Plan, expr: ExprRef, lambdas: &mut Lambdas) -> Result<Option<
             if let ("enum_code", [only], [arg]) = (name, values.as_slice(), plan.expr_list(args)) {
                 return rudb_vector::enum_position(plan.expr_type(*arg), only).map(Some);
             }
+            // The `JSON` builders write a string and a `JSON` differently, and both are held as
+            // text, so they are handed the types as well.
+            if rudb_kernels::json::BUILDERS.contains(&name) {
+                let types: Vec<LogicalType> =
+                    plan.expr_list(args).iter().map(|arg| plan.expr_type(*arg).clone()).collect();
+                return rudb_kernels::json::build(name, &values, &types, None);
+            }
             // No expression to name, because there is no expression to keep. A caller that wanted
             // the expression rather than the error is throwing the error away anyway, and the one
             // that wanted the value reports what was written around it instead.
