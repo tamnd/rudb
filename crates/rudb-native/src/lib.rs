@@ -17940,7 +17940,7 @@ mod tests {
             Writer::create(&path, "a", vec![Field::required("id", LogicalType::BigInt)])
                 .expect("new file");
         let values: Vec<Value> =
-            (0..2048_i64).map(|i| Value::BigInt((i * 2_654_435_761 >> 7) % 1000)).collect();
+            (0..2048_i64).map(|i| Value::BigInt(i * 2_654_435_761 / 128 % 1000)).collect();
         let chunk =
             Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &values).expect("integers")])
                 .expect("matching rows");
