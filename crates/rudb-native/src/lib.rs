@@ -17939,7 +17939,8 @@ mod tests {
         let mut writer =
             Writer::create(&path, "a", vec![Field::required("id", LogicalType::BigInt)])
                 .expect("new file");
-        let values: Vec<Value> = (0..2048).map(|i| Value::BigInt(i * 7919 % 100_003)).collect();
+        let values: Vec<Value> =
+            (0..2048_i64).map(|i| Value::BigInt((i * 2_654_435_761 >> 7) % 1000)).collect();
         let chunk =
             Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &values).expect("integers")])
                 .expect("matching rows");
@@ -17955,7 +17956,9 @@ mod tests {
         pool.rereads(true);
         let read = a.read_rows(0, &[0], &positions, true).expect("three rows");
         assert_eq!(read.value_at(1, 0), values[900]);
-        assert!(matches!(*slot(0), PartSlot::Seen(24)), "three rows pay eight each");
+        let paid = slot(0);
+        assert!(matches!(*paid, PartSlot::Seen(24)), "three rows pay eight each, not {paid:?}");
+        drop(paid);
         drop((a, catalog));
 
         let pool = PagePool::new(usize::MAX);
@@ -17963,7 +17966,9 @@ mod tests {
         let a = catalog.table("a").expect("a");
         let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
         a.read_rows(0, &[0], &positions, true).expect("three rows");
-        assert!(matches!(*slot(0), PartSlot::Held { .. }), "with statements after, it is held");
+        let held = slot(0);
+        assert!(matches!(*held, PartSlot::Held { .. }), "with statements after, not {held:?}");
+        drop(held);
         drop((a, catalog));
         fs::remove_file(path).expect("remove scratch file");
     }
