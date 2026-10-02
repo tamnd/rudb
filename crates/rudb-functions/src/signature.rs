@@ -1348,6 +1348,34 @@ const TABLE: &[Entry] = &[
         numeric_only: false,
     },
     Entry {
+        name: "json_set",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_insert",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_replace",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_remove",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
         name: "json_merge_patch_diff",
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(2),
@@ -3381,6 +3409,10 @@ const JSONED: &[(&str, &[&str])] = &[
     ("json_merge_patch", &["json_merge_patch(col0 JSON, col1 JSON, [JSON...]) -> JSON"]),
     ("json_deep_merge", &["json_deep_merge(col0 JSON, col1 JSON, [JSON...]) -> JSON"]),
     ("json_merge_patch_diff", &["json_merge_patch_diff(col0 JSON, col1 JSON) -> JSON"]),
+    ("json_set", &["json_set(col0 JSON, col1 VARCHAR, col2 JSON) -> JSON"]),
+    ("json_insert", &["json_insert(col0 JSON, col1 VARCHAR, col2 JSON) -> JSON"]),
+    ("json_replace", &["json_replace(col0 JSON, col1 VARCHAR, col2 JSON) -> JSON"]),
+    ("json_remove", &["json_remove(col0 JSON, col1 VARCHAR) -> JSON"]),
     ("json_pretty", &["json_pretty(col0 JSON) -> VARCHAR"]),
     ("json_strip_nulls", &["json_strip_nulls(col0 JSON) -> JSON"]),
     (
@@ -3449,6 +3481,10 @@ const JSON_NAMES: &[&str] = &[
     "json_merge_patch",
     "json_deep_merge",
     "json_merge_patch_diff",
+    "json_set",
+    "json_insert",
+    "json_replace",
+    "json_remove",
     "json_pretty",
     "json_strip_nulls",
     "json_contains",
@@ -3484,6 +3520,13 @@ fn jsoned(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, Lo
         }
         ("json_merge_patch" | "json_deep_merge" | "json_merge_patch_diff", _) => {
             return Some((vec![Json; arguments.len()], Json));
+        }
+        // The pin casts nothing but a string to these, so `json_set(j, 1, '2')` is refused.
+        ("json_set" | "json_insert" | "json_replace", [_, _, _]) | ("json_remove", [_, _]) => {
+            if !arguments.iter().all(|ty| matches!(ty, Varchar | Json | Null)) {
+                return None;
+            }
+            return Some(([Json, Varchar, Json][..arguments.len()].to_vec(), Json));
         }
         ("json_pretty", [_]) => return Some((vec![Json], Varchar)),
         ("json_strip_nulls", [_]) => return Some((vec![Json], Json)),

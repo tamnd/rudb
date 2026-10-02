@@ -1,7 +1,7 @@
 //! The `JSON` type, the casts into and out of it, and the functions that read a document: checking
 //! it, naming the type of a value in it, picking values out of it by a path, and its operators, and
-//! the functions that build, merge, print and match whole documents, and the macros that gather rows
-//! into one.
+//! the functions that build, merge, print, match and edit whole documents, and the macros that
+//! gather rows into one.
 //!
 //! Every expected answer here was taken from the pinned duckdb binary and not from rudb.
 
@@ -505,5 +505,68 @@ fn the_group_macros_gather_rows_into_a_document_and_take_a_window() {
     assert!(refused("SELECT json_group_object(1)").starts_with(
         "Binder Error: Macro json_group_object() does not support the supplied arguments. You \
          might need to add explicit type casts.\nCandidate macros:\n\tjson_group_object(n, v)"
+    ));
+}
+
+#[test]
+fn the_edit_functions_change_one_place_in_a_document() {
+    check(&[
+        (
+            r#"SELECT json_set('{"a":1}', '$.b', '2'), json_insert('{"a":1}', '$.a', '2'), json_replace('{"a":1}', '$.b', '2'), json_remove('{"a":1,"b":2}', '$.a')"#,
+            r#"{"a":1,"b":2}|{"a":1}|{"a":1}|{"b":2}"#,
+        ),
+        (
+            r#"SELECT json_set('{"a":1}', '$.x.y[0].z', '2'), json_insert('{}', '$.x[1]', '2'), json_insert('{}', '$.x[0]', '2')"#,
+            r#"{"a":1,"x":{"y":[{"z":2}]}}|{}|{"x":[2]}"#,
+        ),
+        (
+            "SELECT json_set('[1,2,3]', '$[1]', '9'), json_set('[1,2,3]', '$[3]', '9'), json_set('[1,2,3]', '$[4]', '9'), json_set('[1,2,3]', '$[#]', '9')",
+            "[1,9,3]|[1,2,3,9]|[1,2,3]|[1,2,3,9]",
+        ),
+        (
+            "SELECT json_set('[1,2,3]', '$[-1]', '9'), json_set('[1,2,3]', '$[#-0]', '9'), json_set('[1,2,3]', '$[-3]', '9'), json_set('[1,2,3]', '$[-4]', '9')",
+            "[1,2,9]|[1,2,3,9]|[9,2,3]|[1,2,3]",
+        ),
+        (
+            r#"SELECT json_set('{"a":1}', '', '5'), json_insert('{"a":1}', '$', '5'), json_remove('{"a":1}', '$'), json_remove('{"$":1}', '$'), json_set('{"a":1}', '1', '2')"#,
+            r#"5|{"a":1}|NULL|NULL|{"a":1,"1":2}"#,
+        ),
+        (
+            r#"SELECT json_set('{"a":1,"b":2,"a":3}', '$.a', '9'), json_remove('{"a":1,"b":2,"a":3}', '/a'), json_set('{"a":[1]}', '$.a[#][#]', '9'), json_set('{"a":1}', '$.a.b', '9')"#,
+            r#"{"a":9,"b":2}|{"b":2}|{"a":[1,[9]]}|{"a":1}"#,
+        ),
+        (
+            r#"SELECT json_set('{"a":{}}', '/a/c/d', '5'), json_insert('{"a":[1,2]}', '/a/-', '5'), json_set('{"a":[1,2]}', '/a/1', '5'), json_set('{"a":[1,2]}', '/a/3', '5'), json_set('{"a":[1,2]}', '/a/01', '5')"#,
+            r#"{"a":{"c":{"d":5}}}|{"a":[1,2,5]}|{"a":[1,5]}|{"a":[1,2]}|{"a":[1,2]}"#,
+        ),
+        (
+            r#"SELECT json_set('{}', '/a/0/b', '1'), json_set('[[]]', '/0/0/x', '1'), json_remove('{"a":{"~/":1}}', '/a/~0~1'), json_set('{"a":1}', '/a~', '2')"#,
+            r#"{"a":{"0":{"b":1}}}|[[{"x":1}]]|{"a":{}}|{"a":1}"#,
+        ),
+        (
+            r#"SELECT json_set(NULL, '$.a', '1'), json_set('{}', NULL, '1'), json_remove('{}', NULL), typeof(json_set('{}', '$.a', '1'))"#,
+            "NULL|NULL|NULL|JSON",
+        ),
+        (
+            r#"SELECT TRY(json_set(j, p, v)) FROM (VALUES ('{"a":1}', '$.b', '2'), ('{}', '$.*', '1')) t(j,p,v)"#,
+            "{\"a\":1,\"b\":2}\nNULL",
+        ),
+        ("SELECT CASE WHEN false THEN json_set('{}', '$.*', '1') END", "NULL"),
+    ]);
+    assert_eq!(
+        refused("SELECT json_set('{\"a\":1}', '$..a', '1')"),
+        "Invalid Input Error: JSON path wildcards are not supported in JSON modification functions"
+    );
+    assert_eq!(
+        refused("SELECT json_set('{\"a\":1}', '$.a[', '5')"),
+        "Invalid Input Error: JSON path error near '['"
+    );
+    assert!(refused("SELECT json_set('{\"a\":1}', '$.a', 'x')").starts_with(
+        "Conversion Error: Malformed JSON at byte 0 of input: unexpected character.  Input: \"x\""
+    ));
+    assert!(refused("SELECT json_set('{}', 5::INTEGER, '1')").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+         'json_set(STRING_LITERAL, INTEGER, STRING_LITERAL)'. You might need to add explicit type \
+         casts.\n\tCandidate functions:\n\tjson_set(col0 JSON, col1 VARCHAR, col2 JSON) -> JSON"
     ));
 }

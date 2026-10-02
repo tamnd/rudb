@@ -1786,6 +1786,9 @@ pub fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<Option<
     if let Some(answer) = whole(name, args)? {
         return Ok(Some(answer));
     }
+    if let Some(answer) = edit(name, args)? {
+        return Ok(Some(answer));
+    }
     if !NAMES.contains(&name) {
         return Ok(None);
     }
@@ -2010,6 +2013,298 @@ fn whole(name: &str, args: &[Value]) -> Result<Option<Value>> {
         _ => None,
     };
     Ok(Some(answer.unwrap_or(Value::Null)))
+}
+
+/// The functions that change one place in a document: `json_set` writes a value there whether or
+/// not there was one, `json_insert` only where there was none, `json_replace` only where there was
+/// one, and `json_remove` takes it out.
+pub const EDITS: &[&str] = &["json_set", "json_insert", "json_replace", "json_remove"];
+
+/// Which of the [`EDITS`] a call is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    Set,
+    Insert,
+    Replace,
+    Remove,
+}
+
+impl Edit {
+    /// Whether the edit makes the containers missing on the way to the place it writes, the way
+    /// SQLite does, which an edit that only touches what is there does not.
+    fn creates(self) -> bool {
+        matches!(self, Self::Set | Self::Insert)
+    }
+}
+
+/// One of the [`EDITS`] on one row, and nothing for a name that is not one of them.
+///
+/// The place is the pin's: nothing is the whole document, a `/` starts a JSON pointer, a `$` a
+/// path, and anything else is the one key it spells. A path with a wildcard is refused, and so is
+/// one the pin cannot read, both when a row reaches them and not when the call is bound, so that a
+/// `TRY` around the call catches them.
+fn edit(name: &str, args: &[Value]) -> Result<Option<Value>> {
+    let edit = match name {
+        "json_set" => Edit::Set,
+        "json_insert" => Edit::Insert,
+        "json_replace" => Edit::Replace,
+        "json_remove" => Edit::Remove,
+        _ => return Ok(None),
+    };
+    let mut texts = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            Value::Varchar(text) => texts.push(text.as_str()),
+            _ => return Ok(Some(Value::Null)),
+        }
+    }
+    let (place, mut document, value) = match texts[..] {
+        [document_text, place] => (place, document(document_text)?, 0),
+        [document_text, place, value] => {
+            let value = document(value)?;
+            let (joined, value) = joined(document(document_text)?, &value);
+            (place, joined, value)
+        }
+        _ => return Ok(Some(Value::Null)),
+    };
+    let root = if place.is_empty() {
+        root_after(edit, value)
+    } else if place.starts_with('/') {
+        document.edit_pointer(place, edit, value);
+        Some(0)
+    } else {
+        let steps = if place.starts_with('$') {
+            let (steps, wild) = parse_path(place, false)?;
+            if wild {
+                return Err(Error::invalid_input(
+                    "JSON path wildcards are not supported in JSON modification functions",
+                ));
+            }
+            steps
+        } else {
+            vec![Step::Key(place.to_string())]
+        };
+        if steps.is_empty() {
+            root_after(edit, value)
+        } else {
+            document.edit_steps(&steps, edit, value);
+            Some(0)
+        }
+    };
+    Ok(Some(root.map_or(Value::Null, |root| Value::Varchar(document.written(root)))))
+}
+
+/// The root once an edit at the whole document is made: a new one for a set or a replace, the same
+/// one for an insert, since there is always a root, and none for a remove.
+fn root_after(edit: Edit, value: usize) -> Option<usize> {
+    match edit {
+        Edit::Set | Edit::Replace => Some(value),
+        Edit::Insert => Some(0),
+        Edit::Remove => None,
+    }
+}
+
+/// Where an array step lands in an array of `length` elements, which may be one past the end and
+/// no further: `[#]` and `[-0]` are the end itself, and `[-n]` is `n` back from it.
+fn landing(length: usize, step: &Step) -> Option<usize> {
+    let at = match *step {
+        Step::Index(index) => usize::try_from(index).ok()?,
+        Step::Back(back) => length.checked_sub(usize::try_from(back).ok()?)?,
+        Step::Append => length,
+        Step::Key(_) => return None,
+    };
+    (at <= length).then_some(at)
+}
+
+/// A JSON pointer token where an array is, which is a whole number with no leading zero or the `-`
+/// that is one past the end.
+fn pointer_landing(length: usize, token: &str) -> Option<usize> {
+    let at = if token == "-" { length } else { array_token(token.as_bytes())? };
+    (at <= length).then_some(at)
+}
+
+impl Document {
+    fn push(&mut self, node: Node) -> usize {
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+
+    /// Writes `value` under `key` in an object, over the first member of that name, with the others
+    /// of that name dropped, or after the last member when there is none.
+    fn put(&mut self, object: usize, key: &str, value: usize) {
+        let Node::Object(members) = &mut self.nodes[object] else { return };
+        match members.iter().position(|(name, _)| name == key) {
+            Some(first) => {
+                members[first].1 = value;
+                let mut at = 0;
+                members.retain(|(name, _)| {
+                    at += 1;
+                    at - 1 == first || name != key
+                });
+            }
+            None => members.push((key.to_string(), value)),
+        }
+    }
+
+    /// Hangs a container made on the way down under the step that was missing, which for an array
+    /// is always its end.
+    fn hang(&mut self, parent: usize, step: &Step, child: usize) {
+        match (&mut self.nodes[parent], step) {
+            (Node::Object(_), Step::Key(key)) => self.put(parent, key, child),
+            (Node::Array(items), _) => items.push(child),
+            _ => {}
+        }
+    }
+
+    /// An edit at a `$` path. The containers missing on the way are made, an object where the next
+    /// step is a key and an array where it is not, but are only hung in the document once the edit
+    /// at the end of the path is made, so a set that ends up changing nothing leaves nothing behind.
+    fn edit_steps(&mut self, steps: &[Step], edit: Edit, value: usize) {
+        let mut at = 0;
+        let mut made: Option<(usize, usize, usize)> = None;
+        for (index, pair) in steps.windows(2).enumerate() {
+            let (step, next) = (&pair[0], &pair[1]);
+            let child = match (&self.nodes[at], step) {
+                (Node::Object(members), Step::Key(key)) => {
+                    members.iter().find(|(name, _)| name == key).map(|member| member.1)
+                }
+                (Node::Array(items), _) => match landing(items.len(), step) {
+                    Some(position) => items.get(position).copied(),
+                    None => return,
+                },
+                _ => return,
+            };
+            at = match child {
+                Some(child) => child,
+                None if edit.creates() => {
+                    let fresh = self.push(if matches!(next, Step::Key(_)) {
+                        Node::Object(Vec::new())
+                    } else {
+                        Node::Array(Vec::new())
+                    });
+                    match made {
+                        None => made = Some((at, index, fresh)),
+                        Some(_) => self.hang(at, step, fresh),
+                    }
+                    fresh
+                }
+                None => return,
+            };
+        }
+        let Some(last) = steps.last() else { return };
+        if self.edit_at(at, last, edit, value)
+            && let Some((parent, index, fresh)) = made
+        {
+            self.hang(parent, &steps[index], fresh);
+        }
+    }
+
+    /// The edit at the last step of a path, and whether it changed anything.
+    fn edit_at(&mut self, parent: usize, step: &Step, edit: Edit, value: usize) -> bool {
+        match (&mut self.nodes[parent], step) {
+            (Node::Object(members), Step::Key(key)) => {
+                let there = members.iter().any(|(name, _)| name == key);
+                match edit {
+                    Edit::Insert if there => false,
+                    Edit::Replace | Edit::Remove if !there => false,
+                    Edit::Remove => {
+                        members.retain(|(name, _)| name != key);
+                        true
+                    }
+                    _ => {
+                        self.put(parent, key, value);
+                        true
+                    }
+                }
+            }
+            (Node::Array(items), _) => {
+                let Some(position) = landing(items.len(), step) else { return false };
+                edit_item(items, position, edit, value)
+            }
+            _ => false,
+        }
+    }
+
+    /// An edit at a JSON pointer, which is read the way yyjson reads one: the containers missing on
+    /// the way are objects whatever the token, and are made for a set or an insert only.
+    fn edit_pointer(&mut self, pointer: &str, edit: Edit, value: usize) {
+        let mut tokens = Vec::new();
+        for raw in pointer[1..].split('/') {
+            let mut token = String::with_capacity(raw.len());
+            let mut chars = raw.chars();
+            while let Some(next) = chars.next() {
+                if next != '~' {
+                    token.push(next);
+                    continue;
+                }
+                match chars.next() {
+                    Some('0') => token.push('~'),
+                    Some('1') => token.push('/'),
+                    _ => return,
+                }
+            }
+            tokens.push(token);
+        }
+        let Some((last, walk)) = tokens.split_last() else { return };
+        let mut at = 0;
+        for token in walk {
+            let child = match &self.nodes[at] {
+                Node::Object(members) => {
+                    members.iter().find(|(name, _)| name == token).map(|m| m.1)
+                }
+                Node::Array(items) => match pointer_landing(items.len(), token) {
+                    Some(position) => items.get(position).copied(),
+                    None => return,
+                },
+                _ => return,
+            };
+            at = match child {
+                Some(child) => child,
+                None if edit.creates() => {
+                    let fresh = self.push(Node::Object(Vec::new()));
+                    match &mut self.nodes[at] {
+                        Node::Array(items) => items.push(fresh),
+                        _ => self.put(at, token, fresh),
+                    }
+                    fresh
+                }
+                None => return,
+            };
+        }
+        match &mut self.nodes[at] {
+            Node::Object(members) => {
+                let there = members.iter().any(|(name, _)| name == last);
+                match edit {
+                    Edit::Insert if there => {}
+                    Edit::Replace | Edit::Remove if !there => {}
+                    Edit::Remove => members.retain(|(name, _)| name != last),
+                    _ => self.put(at, last, value),
+                }
+            }
+            Node::Array(items) => {
+                if let Some(position) = pointer_landing(items.len(), last) {
+                    edit_item(items, position, edit, value);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// An edit at a position in an array that is at most one past its end, and whether it changed
+/// anything. Only a set and an insert write past the end, and only an insert leaves an element that
+/// is there alone.
+fn edit_item(items: &mut Vec<usize>, position: usize, edit: Edit, value: usize) -> bool {
+    let there = position < items.len();
+    match edit {
+        Edit::Set | Edit::Insert if !there => items.push(value),
+        Edit::Set | Edit::Replace if there => items[position] = value,
+        Edit::Remove if there => {
+            items.remove(position);
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// Two documents in one, the second after the first, and where the second's root is now, so that a
