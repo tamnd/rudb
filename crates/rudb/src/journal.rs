@@ -204,6 +204,11 @@ impl Replayed {
         Ok(Some(sql))
     }
 
+    /// How many bytes of the log the change took.
+    pub(crate) fn size(&self) -> usize {
+        self.payload.len()
+    }
+
     /// The change, with rows typed as `fields` says.
     ///
     /// # Errors
@@ -718,10 +723,19 @@ fn put_validity(out: &mut Vec<u8>, vectors: &[&Vector], rows: usize) {
     }
 }
 
-fn get_validity(bytes: &[u8], at: &mut usize, rows: usize) -> Result<Validity> {
+fn get_validity(bytes: &[u8], at: &mut usize, cuts: &[(usize, usize)]) -> Result<Vec<Validity>> {
+    let rows = cuts.last().map_or(0, |&(start, len)| start + len);
     match take(bytes, at, 1)?[0] {
-        0 => Ok(Validity::AllValid),
-        1 => Ok(Validity::from_bytes(rows, take(bytes, at, rows.div_ceil(8))?)),
+        0 => Ok(vec![Validity::AllValid; cuts.len()]),
+        1 => {
+            let bitmap = take(bytes, at, rows.div_ceil(8))?;
+            Ok(cuts
+                .iter()
+                .map(|&(start, len)| {
+                    Validity::from_bytes(len, &bitmap[start / 8..(start + len).div_ceil(8)])
+                })
+                .collect())
+        }
         _ => Err(corrupt("a column whose nulls are neither absent nor a bitmap")),
     }
 }
@@ -856,9 +870,15 @@ fn get_fixed(bytes: &[u8], at: &mut usize, layout: u8, rows: usize) -> Result<Da
     })
 }
 
-/// A column written as [`mode::TEXT`], as a vector of `field`'s type.
-fn get_text_column(bytes: &[u8], at: &mut usize, field: &Field, rows: usize) -> Result<Vector> {
-    let validity = get_validity(bytes, at, rows)?;
+/// A column written as [`mode::TEXT`], as vectors of `field`'s type cut at `cuts`.
+fn get_text_column(
+    bytes: &[u8],
+    at: &mut usize,
+    field: &Field,
+    cuts: &[(usize, usize)],
+) -> Result<Vec<Vector>> {
+    let rows = cuts.last().map_or(0, |&(start, len)| start + len);
+    let validity = get_validity(bytes, at, cuts)?;
     let lengths =
         take(bytes, at, rows.checked_mul(4).ok_or_else(|| corrupt("a column too long"))?)?;
     let total: usize = lengths
@@ -866,28 +886,35 @@ fn get_text_column(bytes: &[u8], at: &mut usize, field: &Field, rows: usize) -> 
         .map(|one| u32::from_le_bytes(one.try_into().expect("four bytes")) as usize)
         .sum();
     let body = take(bytes, at, total)?;
-    let mut column = StringColumn::with_capacity(rows);
-    let mut from = 0;
-    if field.ty == LogicalType::Varchar {
-        // Checked as one run, and each string is then a slice of it that has to start and end on
-        // a character. Checking a string at a time spent more on the calls than on the bytes.
-        let text =
-            std::str::from_utf8(body).map_err(|_| corrupt("logged text that is not UTF-8"))?;
-        for one in lengths.chunks_exact(4) {
-            let end = from + u32::from_le_bytes(one.try_into().expect("four bytes")) as usize;
-            let value =
-                text.get(from..end).ok_or_else(|| corrupt("logged text cut inside a character"))?;
-            column.push(value);
-            from = end;
-        }
+    // Checked as one run, and each string is then a slice of it that has to start and end on a
+    // character. Checking a string at a time spent more on the calls than on the bytes.
+    let text = if field.ty == LogicalType::Varchar {
+        Some(std::str::from_utf8(body).map_err(|_| corrupt("logged text that is not UTF-8"))?)
     } else {
-        for one in lengths.chunks_exact(4) {
+        None
+    };
+    let mut from = 0;
+    let mut pieces = Vec::with_capacity(cuts.len());
+    for (&(start, len), validity) in cuts.iter().zip(validity) {
+        let mut column = StringColumn::with_capacity(len);
+        for one in lengths[start * 4..(start + len) * 4].chunks_exact(4) {
             let end = from + u32::from_le_bytes(one.try_into().expect("four bytes")) as usize;
-            column.push_bytes(&body[from..end]);
+            match text {
+                Some(text) => {
+                    let value = text
+                        .get(from..end)
+                        .ok_or_else(|| corrupt("logged text cut inside a character"))?;
+                    column.push(value);
+                }
+                None => {
+                    column.push_bytes(&body[from..end]);
+                }
+            }
             from = end;
         }
+        pieces.push(Vector::flat(field.ty.clone(), Data::Varlen(column))?.with_validity(validity));
     }
-    Ok(Vector::flat(field.ty.clone(), Data::Varlen(column))?.with_validity(validity))
+    Ok(pieces)
 }
 
 /// The name a payload is for, and where the rest of it starts. A Ddl record names no table, and its
@@ -921,21 +948,30 @@ fn read_record(kind: Kind, payload: Payload) -> Result<Replayed> {
 /// is laid out first.
 fn decode_rows(bytes: &[u8], fields: &[Field], version: u8) -> Result<(usize, Vec<Chunk>)> {
     let (columns, rows) = decode_columns(bytes, fields, version)?;
-    if rows <= VECTOR_SIZE {
-        return Ok((rows, vec![Chunk::with_rows(columns, rows)?]));
-    }
-    let mut chunks = Vec::with_capacity(rows.div_ceil(VECTOR_SIZE));
-    for start in (0..rows).step_by(VECTOR_SIZE) {
+    let mut columns = columns.into_iter().map(Vec::into_iter).collect::<Vec<_>>();
+    let mut chunks = Vec::with_capacity(rows.div_ceil(VECTOR_SIZE).max(1));
+    for start in (0..rows.max(1)).step_by(VECTOR_SIZE) {
         let len = VECTOR_SIZE.min(rows - start);
-        let piece =
-            columns.iter().map(|column| column.slice(start, len)).collect::<Result<Vec<_>>>()?;
+        let piece = columns
+            .iter_mut()
+            .map(|pieces| pieces.next().ok_or_else(|| corrupt("a column cut short")))
+            .collect::<Result<Vec<_>>>()?;
         chunks.push(Chunk::with_rows(piece, len)?);
     }
     Ok((rows, chunks))
 }
 
-/// The columns of a payload's rows and how many rows there are, which may be more than a chunk.
-fn decode_columns(bytes: &[u8], fields: &[Field], version: u8) -> Result<(Vec<Vector>, usize)> {
+/// The rows of a payload as the pieces of each column, a chunk's worth a piece and at least one
+/// piece, and how many rows there are, which may be more than a chunk.
+///
+/// A column laid out flat or as text is read straight into its pieces. Read whole and then cut, as
+/// it was, every value was copied twice, and on a replay of fifty million rows the cutting was as
+/// much work as the reading.
+fn decode_columns(
+    bytes: &[u8],
+    fields: &[Field],
+    version: u8,
+) -> Result<(Vec<Vec<Vector>>, usize)> {
     let mut at = 0;
     let width = u16::from_le_bytes(array(bytes, &mut at)?) as usize;
     let rows = u32::from_le_bytes(array(bytes, &mut at)?) as usize;
@@ -945,27 +981,44 @@ fn decode_columns(bytes: &[u8], fields: &[Field], version: u8) -> Result<(Vec<Ve
             fields.len()
         )));
     }
+    // Where each piece starts and how long it is. A chunk is a whole number of bytes of a null
+    // bitmap long, so every piece's bits start on a byte.
+    let cuts = (0..rows.max(1))
+        .step_by(VECTOR_SIZE)
+        .map(|start| (start, VECTOR_SIZE.min(rows - start)))
+        .collect::<Vec<_>>();
     let mut columns = Vec::with_capacity(width);
     for field in fields {
         let layout = if version == 1 { mode::VALUES } else { take(bytes, &mut at, 1)?[0] };
-        let column = match layout {
+        let pieces = match layout {
             mode::VALUES => {
                 let mut values = Vec::with_capacity(rows.min(bytes.len()));
                 for _ in 0..rows {
                     values.push(get(bytes, &mut at, &field.ty)?);
                 }
-                Vector::from_values(field.ty.clone(), &values)?
+                let column = Vector::from_values(field.ty.clone(), &values)?;
+                if cuts.len() == 1 {
+                    vec![column]
+                } else {
+                    cuts.iter()
+                        .map(|&(start, len)| column.slice(start, len))
+                        .collect::<Result<Vec<_>>>()?
+                }
             }
             mode::FIXED => {
                 let layout = take(bytes, &mut at, 1)?[0];
-                let validity = get_validity(bytes, &mut at, rows)?;
-                let data = get_fixed(bytes, &mut at, layout, rows)?;
-                Vector::flat(field.ty.clone(), data)?.with_validity(validity)
+                let validity = get_validity(bytes, &mut at, &cuts)?;
+                let mut pieces = Vec::with_capacity(cuts.len());
+                for (&(_, len), validity) in cuts.iter().zip(validity) {
+                    let data = get_fixed(bytes, &mut at, layout, len)?;
+                    pieces.push(Vector::flat(field.ty.clone(), data)?.with_validity(validity));
+                }
+                pieces
             }
-            mode::TEXT => get_text_column(bytes, &mut at, field, rows)?,
+            mode::TEXT => get_text_column(bytes, &mut at, field, &cuts)?,
             other => return Err(corrupt(&format!("a column laid out as {other}"))),
         };
-        columns.push(column);
+        columns.push(pieces);
     }
     if at != bytes.len() {
         return Err(corrupt("an insert record with bytes after its rows"));

@@ -511,9 +511,25 @@ impl MemoryTable {
         }
         self.stats_ns += spent.into_inner();
         self.counts_ns += counted.into_inner();
+        if !chunks.is_empty() {
+            self.close_tail()?;
+        }
+        // The runs this fills are laid together, a column of a run a task, rather than as each
+        // one fills. Laid as they filled, each took a thread per column, and the string column
+        // was most of it, so a replay that put tens of millions of rows back spent seconds laying
+        // strings on one thread with the other cores idle.
+        let mut full = Vec::new();
         for chunk in chunks {
             let zone = Zone::from_ranges(ranges.iter_mut().filter_map(Iterator::next).collect());
-            self.place(chunk, zone)?;
+            self.open_chunk(chunk, zone);
+            if self.open_rows >= ROWS_PER_GROUP {
+                full.push(self.take_open());
+            }
+        }
+        let runs = full.iter().map(|run| run.chunks.as_slice()).collect::<Vec<_>>();
+        let laid = lay_runs(&self.types, &runs, workers);
+        for (run, columns) in full.into_iter().zip(laid) {
+            self.settle(run, columns);
         }
         Ok(())
     }
@@ -542,6 +558,15 @@ impl MemoryTable {
     /// Puts a chunk whose statistics have been taken into the group that is filling.
     fn place(&mut self, chunk: Chunk, zone: Zone) -> Result<()> {
         self.close_tail()?;
+        self.open_chunk(chunk, zone);
+        if self.open_rows >= ROWS_PER_GROUP {
+            self.seal()?;
+        }
+        Ok(())
+    }
+
+    /// Adds a chunk to the open run, leaving sealing it to the caller, see [`Self::place`].
+    fn open_chunk(&mut self, chunk: Chunk, zone: Zone) {
         match &mut self.open_zone {
             Some(open) => open.widen(&zone),
             None => self.open_zone = Some(zone.clone()),
@@ -554,10 +579,6 @@ impl MemoryTable {
         // fallback is never laid end to end and this is what makes reading it a reference count bump
         // rather than a copy. A page laid end to end afterwards is copied out of once, here.
         self.open.push(chunk.into_pages());
-        if self.open_rows >= ROWS_PER_GROUP {
-            self.seal()?;
-        }
-        Ok(())
     }
 
     /// Lays the open chunks end to end into one group, or keeps them as the chunks they are.
@@ -576,24 +597,47 @@ impl MemoryTable {
         if self.open.is_empty() {
             return Ok(());
         }
+        // The columns are laid on threads of their own once the group is a full one. Each is a
+        // copy of every row into fresh memory, and one after the other they were most of the time
+        // a replay of the log spent outside its decoders, with the other cores idle.
+        let threads = if self.open_rows >= ROWS_PER_GROUP {
+            std::thread::available_parallelism().map_or(1, usize::from)
+        } else {
+            1
+        };
+        let laid = lay_runs(&self.types, &[self.open.as_slice()], threads).pop().flatten();
+        let run = self.take_open();
+        self.settle(run, laid);
+        Ok(())
+    }
+
+    /// The open run, taken away to be sealed, which leaves no run open.
+    fn take_open(&mut self) -> Run {
         let first = self.slots.len() - self.open.len();
-        let last = self.slots.len();
-        match self.laid() {
+        self.open_rows = 0;
+        Run { first, chunks: std::mem::take(&mut self.open), zone: self.open_zone.take() }
+    }
+
+    /// Makes `run` a group of the pages `laid`, or a group per chunk when it would not lay.
+    fn settle(&mut self, run: Run, laid: Option<Vec<Vector>>) {
+        let Run { first, chunks, zone } = run;
+        let last = first + chunks.len();
+        match laid {
             Some(columns) => {
                 let group = self.groups.len();
                 let mut at = 0;
-                for (slot, chunk) in self.slots[first..].iter_mut().zip(&self.open) {
+                for (slot, chunk) in self.slots[first..last].iter_mut().zip(&chunks) {
                     *slot = Slot::Window { group, at, len: chunk.len() };
                     at += chunk.len();
                 }
-                let zone = self.open_zone.take().unwrap_or_default();
+                let zone = zone.unwrap_or_default();
                 self.groups.push(Group { columns, rows: at, chunks: first..last, zone });
             }
             None => {
                 // A group per chunk, so each one's zone is the chunk's own and the fold is thrown
                 // away. It is the right answer rather than a shortcut: a group covering one chunk
                 // that claimed the range of a hundred and twenty would rule out nothing.
-                for (at, chunk) in (first..last).zip(self.open.drain(..)) {
+                for (at, chunk) in (first..last).zip(chunks) {
                     let group = self.groups.len();
                     let rows = chunk.len();
                     self.slots[at] = Slot::Window { group, at: 0, len: rows };
@@ -603,10 +647,6 @@ impl MemoryTable {
                 }
             }
         }
-        self.open.clear();
-        self.open_rows = 0;
-        self.open_zone = None;
-        Ok(())
     }
 
     /// The chunks of each row group, in the numbering [`Self::read`] takes.
@@ -697,58 +737,6 @@ impl MemoryTable {
             None if index == self.groups.len() => self.run_zone(),
             None => None,
         }
-    }
-
-    /// The open chunks as one page per column, or `None` if any column will not lay end to end.
-    ///
-    /// Collected a column at a time rather than a chunk at a time because that is the direction the
-    /// pages run in, and the borrow of each chunk's column ends inside the loop, so nothing is
-    /// cloned to build the list handed to [`rudb_vector::concat()`].
-    ///
-    /// An error from the concatenation is treated as a run that will not lay. It means a piece said
-    /// it was flat and did not hold a flat run of its own length, which the vector crate believes is
-    /// impossible, and the safe thing for a table to do about a layout it cannot build is to keep
-    /// the rows it was given rather than to fail an insert over it.
-    ///
-    /// The columns are laid on threads of their own once the group is a full one. Each is a copy
-    /// of every row into fresh memory, and one after the other they were most of the time a replay
-    /// of the log spent outside its decoders, with the other cores idle.
-    fn laid(&self) -> Option<Vec<Vector>> {
-        let open = &self.open;
-        let lay = |column: usize, ty: &LogicalType| -> Option<Vector> {
-            let pieces = open
-                .iter()
-                .map(|chunk| chunk.column(column).ok().cloned())
-                .collect::<Option<Vec<_>>>()?;
-            rudb_vector::concat(ty, &pieces).ok()?
-        };
-        let threads =
-            std::thread::available_parallelism().map_or(1, usize::from).min(self.types.len());
-        if threads < 2 || self.open_rows < ROWS_PER_GROUP {
-            return self.types.iter().enumerate().map(|(column, ty)| lay(column, ty)).collect();
-        }
-        let next = AtomicUsize::new(0);
-        let laid: Vec<Mutex<Option<Vector>>> =
-            self.types.iter().map(|_| Mutex::new(None)).collect();
-        let work = || {
-            loop {
-                let column = next.fetch_add(1, Ordering::Relaxed);
-                let (Some(ty), Some(slot)) = (self.types.get(column), laid.get(column)) else {
-                    return;
-                };
-                let page = lay(column, ty);
-                if let Ok(mut slot) = slot.lock() {
-                    *slot = page;
-                }
-            }
-        };
-        std::thread::scope(|scope| {
-            for _ in 1..threads {
-                scope.spawn(work);
-            }
-            work();
-        });
-        laid.into_iter().map(|slot| slot.into_inner().ok().flatten()).collect()
     }
 
     /// How long this table has spent building statistics, in nanoseconds.
@@ -1322,6 +1310,69 @@ impl MemoryTable {
     }
 }
 
+/// An open run taken away to be sealed: the slot of its first chunk, its chunks, and its zone.
+struct Run {
+    first: usize,
+    chunks: Vec<Chunk>,
+    zone: Option<Zone>,
+}
+
+/// Each of `runs` as one page per column of `types`, or `None` for a run with a column that will
+/// not lay end to end, a column of a run a task on up to `threads` threads.
+///
+/// Collected a column at a time rather than a chunk at a time because that is the direction the
+/// pages run in, and the borrow of each chunk's column ends inside the loop, so nothing is cloned
+/// to build the list handed to [`rudb_vector::concat()`].
+///
+/// An error from the concatenation is treated as a run that will not lay. It means a piece said it
+/// was flat and did not hold a flat run of its own length, which the vector crate believes is
+/// impossible, and the safe thing for a table to do about a layout it cannot build is to keep the
+/// rows it was given rather than to fail an insert over it.
+fn lay_runs(types: &[LogicalType], runs: &[&[Chunk]], threads: usize) -> Vec<Option<Vec<Vector>>> {
+    let lay = |run: &[Chunk], column: usize| -> Option<Vector> {
+        let pieces = run
+            .iter()
+            .map(|chunk| chunk.column(column).ok().cloned())
+            .collect::<Option<Vec<_>>>()?;
+        rudb_vector::concat(types.get(column)?, &pieces).ok()?
+    };
+    let width = types.len();
+    let tasks = runs.len() * width;
+    let threads = threads.clamp(1, tasks.max(1));
+    if threads < 2 {
+        return runs
+            .iter()
+            .map(|run| (0..width).map(|column| lay(run, column)).collect())
+            .collect();
+    }
+    let next = AtomicUsize::new(0);
+    let laid: Vec<Mutex<Option<Vector>>> = (0..tasks).map(|_| Mutex::new(None)).collect();
+    let work = || {
+        loop {
+            let task = next.fetch_add(1, Ordering::Relaxed);
+            let (Some(run), Some(slot)) = (runs.get(task / width), laid.get(task)) else {
+                return;
+            };
+            let page = lay(run, task % width);
+            if let Ok(mut slot) = slot.lock() {
+                *slot = page;
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..threads {
+            scope.spawn(work);
+        }
+        work();
+    });
+    let mut laid = laid.into_iter().map(|slot| slot.into_inner().ok().flatten());
+    // Taken a run at a time before any is judged, because a column that would not lay stops a
+    // collect into an `Option` short of the run's end.
+    runs.iter()
+        .map(|_| laid.by_ref().take(width).collect::<Vec<_>>().into_iter().collect())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1783,6 +1834,62 @@ mod tests {
         let probes = [Probe { column: 0, op, value: Bound::Int(VECTOR_SIZE as i128) }];
         assert!(table.group_skips(0, &probes), "chunk 0 holds 0 and 1, and not that");
         assert!(!table.group_skips(1, &probes), "chunk 1 is the one holding it");
+    }
+
+    /// An append that fills several groups lays them together, and a group in the middle that
+    /// will not lay leaves a group per chunk there without moving the groups after it.
+    #[test]
+    fn an_append_of_several_groups_lays_each_and_keeps_one_that_will_not_as_its_chunks() {
+        let per = ROWS_PER_GROUP / VECTOR_SIZE;
+        let total = 3 * per + 2;
+        let chunks = (0..total)
+            .map(|chunk| {
+                let base = (chunk * VECTOR_SIZE) as i64;
+                let flat = (0..VECTOR_SIZE).map(|row| Value::BigInt(base + row as i64));
+                let flat = Vector::from_values(LogicalType::BigInt, &flat.collect::<Vec<_>>())
+                    .expect("bigints");
+                let second = if (per..2 * per).contains(&chunk) {
+                    let values = Vector::from_values(
+                        LogicalType::BigInt,
+                        &[Value::BigInt(base), Value::BigInt(base + 1)],
+                    )
+                    .expect("two distinct values");
+                    let codes: Vec<u32> = (0..VECTOR_SIZE).map(|row| (row % 2) as u32).collect();
+                    Vector::dictionary(codes, values).expect("a dictionary column")
+                } else {
+                    flat.clone()
+                };
+                Chunk::new(vec![flat, second]).expect("two columns")
+            })
+            .collect::<Vec<_>>();
+        let wanted = |row: usize| {
+            let chunk = row / VECTOR_SIZE;
+            let base = (chunk * VECTOR_SIZE) as i64;
+            let second =
+                if (per..2 * per).contains(&chunk) { base + (row % 2) as i64 } else { row as i64 };
+            vec![Value::BigInt(row as i64), Value::BigInt(second)]
+        };
+        for workers in [1, 4] {
+            let mut table = MemoryTable::new(vec![LogicalType::BigInt, LogicalType::BigInt]);
+            table.append_all(chunks.clone(), workers).expect("the append");
+            let mut parts = Vec::with_capacity(per + 3);
+            parts.push(0..per);
+            parts.extend((per..2 * per).map(|at| at..at + 1));
+            parts.push(2 * per..3 * per);
+            parts.push(3 * per..total);
+            assert_eq!(table.group_count(), per + 2, "on {workers} threads");
+            assert_eq!(table.group_parts(), parts, "on {workers} threads");
+            let mut row = 0;
+            for at in 0..table.chunk_count() {
+                let chunk = table.read(at, &[0, 1]).expect("a chunk the table says it has");
+                for one in 0..chunk.len() {
+                    let got = vec![chunk.value_at(one, 0), chunk.value_at(one, 1)];
+                    assert_eq!(got, wanted(row), "row {row} on {workers} threads");
+                    row += 1;
+                }
+            }
+            assert_eq!(row, total * VECTOR_SIZE);
+        }
     }
 
     /// Nulls are the thing a laid out page can silently lose, since they live beside the values.
