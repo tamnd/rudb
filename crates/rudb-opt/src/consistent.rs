@@ -1395,8 +1395,14 @@ fn search(
         // 29a building them for every set reached took most of its planning.
         let mut next: BTreeMap<u64, (f64, u64, usize, Option<usize>)> = BTreeMap::new();
         for (&taken, (cost, standing, order)) in &layer {
-            let (found, waiting) = steps(ranked, weights, holders, taken)?;
-            let found = if found.is_empty() { waiting.into_iter().collect() } else { found };
+            // An ear that waits is a choice here too, charged at a whole read, because taking
+            // it can be what lets a dearer relation be read late. In JOB 33a `movie_link` is an
+            // ear only once every relation on one side of it is gone, the side of the second
+            // movie needs its companies gone, and those have no filter. Held back, they left
+            // the side of the first movie to go first, which read 1,153,798 rows of
+            // `movie_companies` where read after `movie_link` it is a few hundred.
+            let (mut found, waiting) = steps(ranked, weights, holders, taken)?;
+            found.extend(waiting);
             for (ear, parent) in found {
                 let total = cost + weights[ear].cost(standing, &edges[ear]);
                 let key = taken | 1 << ear;
@@ -1443,7 +1449,7 @@ fn search(
 }
 
 /// The ears left once the relations in `taken` are, with a set of relations written as bits, and
-/// the first ear that waits. `None` for a relation that shares two classes with the rest.
+/// the ears that wait. `None` for a relation that shares two classes with the rest.
 ///
 /// Planning JOB 29a spent most of its time building the sets [`ears`] builds for each set of
 /// relations the search reaches, and each one follows from which relations hold each class.
@@ -1452,9 +1458,9 @@ fn steps(
     weights: &[Weight],
     holders: &[Vec<u64>],
     taken: u64,
-) -> Option<(Vec<(usize, Option<usize>)>, Option<(usize, Option<usize>)>)> {
+) -> Option<(Vec<(usize, Option<usize>)>, Vec<(usize, Option<usize>)>)> {
     let mut found = Vec::new();
-    let mut waiting = None;
+    let mut waiting = Vec::new();
     let left = ranked.iter().fold(0, |mask, &relation| mask | 1 << relation) & !taken;
     for &ear in ranked {
         let bit = 1 << ear;
@@ -1485,7 +1491,7 @@ fn steps(
         if narrowed {
             found.push((ear, parent));
         } else {
-            waiting = waiting.or(Some((ear, parent)));
+            waiting.push((ear, parent));
         }
     }
     Some((found, waiting))
@@ -1628,7 +1634,7 @@ fn ears(
         }
         found.push((cost, slot(ear), parent));
     }
-    Ok((found, waiting.map(|(ear, parent)| (slot(ear), parent))))
+    Ok((found, waiting.first().map(|&(ear, parent)| (slot(ear), parent))))
 }
 
 /// What is left standing of each of its classes once `ear` is taken.
