@@ -1382,6 +1382,34 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::Varchar),
         numeric_only: false,
     },
+    Entry {
+        name: "json_transform",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_transform_strict",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "from_json",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "from_json_strict",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
     // Subscripting. A bracket is one of these two calls by the time the transformer is done with it,
     // `x[2]` being `array_extract(x, 2)` and `x[1:2]` being `array_slice(x, 1, 2)`, which is what
     // DuckDB's own transformer writes as well. Both take a string or a list and give back a piece of
@@ -3368,6 +3396,34 @@ const JSONED: &[(&str, &[&str])] = &[
         "json_structure",
         &["json_structure(col0 VARCHAR) -> JSON", "json_structure(col0 JSON) -> JSON"],
     ),
+    (
+        "json_transform",
+        &[
+            "json_transform(\"json\" VARCHAR, structure VARCHAR) -> ANY",
+            "json_transform(\"json\" JSON, structure VARCHAR) -> ANY",
+        ],
+    ),
+    (
+        "from_json",
+        &[
+            "from_json(\"json\" VARCHAR, structure VARCHAR) -> ANY",
+            "from_json(\"json\" JSON, structure VARCHAR) -> ANY",
+        ],
+    ),
+    (
+        "json_transform_strict",
+        &[
+            "json_transform_strict(col0 VARCHAR, col1 VARCHAR) -> ANY",
+            "json_transform_strict(col0 JSON, col1 VARCHAR) -> ANY",
+        ],
+    ),
+    (
+        "from_json_strict",
+        &[
+            "from_json_strict(col0 VARCHAR, col1 VARCHAR) -> ANY",
+            "from_json_strict(col0 JSON, col1 VARCHAR) -> ANY",
+        ],
+    ),
 ];
 
 /// The names [`JSONED`] has overloads for, which [`jsoned`] decides the types of.
@@ -3397,6 +3453,10 @@ const JSON_NAMES: &[&str] = &[
     "json_strip_nulls",
     "json_contains",
     "json_structure",
+    "json_transform",
+    "json_transform_strict",
+    "from_json",
+    "from_json_strict",
 ];
 
 /// The types a `JSON` function reads its arguments as, and the type of its answer.
@@ -3431,6 +3491,18 @@ fn jsoned(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, Lo
             return Some((vec![whole(haystack), whole(needle)], LogicalType::Boolean));
         }
         ("json_structure", [document]) => return Some((vec![whole(document)], Json)),
+        // The answer is the type the structure names, which the binder reads off the constant.
+        (
+            "json_transform" | "json_transform_strict" | "from_json" | "from_json_strict",
+            [document, structure],
+        ) => {
+            let text = |ty: &LogicalType| matches!(ty, Varchar | Json | Null);
+            if !text(document) || !text(structure) {
+                return None;
+            }
+            let document = if *document == Json { Json } else { Varchar };
+            return Some((vec![document, Varchar], Varchar));
+        }
         _ => {}
     }
     let (one, takes_path, needs_path) = match name {

@@ -12,7 +12,7 @@
 //! what is in it. Nothing here recurses on the depth of a document, so `[[[[...]]]]` a million deep
 //! is read, written, walked, merged and matched without running out of stack.
 
-use rudb_common::{Error, LogicalType, Result, SessionTimeZone, Value};
+use rudb_common::{Error, Field, LogicalType, Result, SessionTimeZone, Value};
 use rudb_vector::Vector;
 
 use crate::cast::cast_value;
@@ -1001,19 +1001,83 @@ pub fn cast_from_json(text: &str, target: &LogicalType, try_cast: bool) -> Resul
         Err(_) if try_cast => return Ok(Value::Null),
         Err(malformed) => return Err(Error::conversion(malformed.describe(text))),
     };
-    document.convert(0, target, try_cast)
+    document.convert(0, target, if try_cast { Reading::Try } else { Reading::Cast })
+}
+
+/// How strictly a document is read into a type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// A cast, which refuses a key the struct has no field for as well as all that `Strict` does.
+    Cast,
+    /// `json_transform_strict`, which refuses a missing key, a repeated one and a value that does
+    /// not convert, and passes over a key the struct has no field for.
+    Strict,
+    /// `json_transform`, where what does not convert is a null in its place.
+    Lenient,
+    /// A `TRY_CAST`, which is lenient but for a key a map cannot read, which it still raises.
+    Try,
+}
+
+/// The functions that read a document into the type a constant structure names, which the binder
+/// works out from the structure and hands over as the type of the answer.
+pub const TRANSFORMS: &[&str] =
+    &["json_transform", "json_transform_strict", "from_json", "from_json_strict"];
+
+/// Calls one of the [`TRANSFORMS`] on one row, and nothing for a name that is not one of them.
+fn transform(name: &str, args: &[Value], returns: &LogicalType) -> Result<Option<Value>> {
+    if !TRANSFORMS.contains(&name) {
+        return Ok(None);
+    }
+    let Some(Value::Varchar(text)) = args.first() else { return Ok(Some(Value::Null)) };
+    let document = document(text)?;
+    if *returns == LogicalType::Null {
+        return Ok(Some(Value::Null));
+    }
+    let reading = if name.ends_with("_strict") { Reading::Strict } else { Reading::Lenient };
+    match document.convert(0, returns, reading) {
+        Ok(value) => Ok(Some(value)),
+        // The pin raises a key it cannot read as it is, where anything else it reports as input.
+        Err(error) if error.message().ends_with(NULL_KEY) => Err(error),
+        Err(error) => Err(Error::invalid_input(error.message())),
+    }
+}
+
+/// What the pin adds to the reason a key of an object could not be read into the key type of a
+/// map, since a map has no place for a null key.
+const NULL_KEY: &str = ". Cannot default to NULL, because map keys cannot be NULL";
+
+/// The type a structure given to `json_transform` names, where an array of one element is a list
+/// of it, an object is a struct with a field for each key, and a string is a type name, which
+/// `named` reads.
+///
+/// # Errors
+///
+/// A malformed structure and the pin's refusals of one that names no type, and what `named`
+/// reports for a type name it does not know.
+pub fn structure_type(
+    text: &str,
+    named: &mut dyn FnMut(&str) -> Result<LogicalType>,
+) -> Result<LogicalType> {
+    document(text)?.structure_type(0, named)
 }
 
 impl Document {
     /// The value at a position read as a type. A `TRY_CAST` is lenient the way the pin's is, where
     /// what does not convert is a null in its place rather than the whole value, so a struct read
     /// from an array is a struct of nulls and a key the struct has no field for is passed over.
-    fn convert(&self, at: usize, target: &LogicalType, lenient: bool) -> Result<Value> {
+    fn convert(&self, at: usize, target: &LogicalType, reading: Reading) -> Result<Value> {
+        let lenient = matches!(reading, Reading::Lenient | Reading::Try);
         let node = &self.nodes[at];
         if matches!(node, Node::Null) {
             return Ok(Value::Null);
         }
-        let outcome = self.converted(at, target, lenient);
+        let outcome = self.converted(at, target, reading);
+        if let Err(error) = &outcome
+            && reading == Reading::Try
+            && error.message().ends_with(NULL_KEY)
+        {
+            return outcome;
+        }
         if lenient && outcome.is_err() {
             if let LogicalType::Struct(fields) = target {
                 let nulls = fields.iter().map(|field| (field.name.clone(), Value::Null)).collect();
@@ -1024,7 +1088,8 @@ impl Document {
         outcome
     }
 
-    fn converted(&self, at: usize, target: &LogicalType, lenient: bool) -> Result<Value> {
+    fn converted(&self, at: usize, target: &LogicalType, reading: Reading) -> Result<Value> {
+        let lenient = matches!(reading, Reading::Lenient | Reading::Try);
         let node = &self.nodes[at];
         let expected = |wanted: &str| {
             Error::conversion(format!(
@@ -1052,18 +1117,29 @@ impl Document {
                 }
                 let values = children
                     .iter()
-                    .map(|&child| self.convert(child, element, lenient))
+                    .map(|&child| self.convert(child, element, reading))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Value::List { element: element.as_ref().clone(), values })
             }
             LogicalType::Struct(fields) => {
                 let Node::Object(children) = node else { return Err(expected("OBJECT")) };
+                let mut seen = vec![false; fields.len()];
                 for (key, _) in children {
-                    if !lenient && !fields.iter().any(|field| field.name == *key) {
-                        return Err(Error::conversion(format!(
-                            "Object {} has unknown key \"{key}\"",
-                            self.written(at)
-                        )));
+                    match fields.iter().position(|field| field.name == *key) {
+                        Some(field) if seen[field] && !lenient => {
+                            return Err(Error::conversion(format!(
+                                "Object {} has duplicate key \"{key}\"",
+                                self.written(at)
+                            )));
+                        }
+                        Some(field) => seen[field] = true,
+                        None if reading == Reading::Cast => {
+                            return Err(Error::conversion(format!(
+                                "Object {} has unknown key \"{key}\"",
+                                self.written(at)
+                            )));
+                        }
+                        None => {}
                     }
                 }
                 let mut values = Vec::with_capacity(fields.len());
@@ -1080,7 +1156,7 @@ impl Document {
                             field.name
                         )));
                     };
-                    values.push((field.name.clone(), self.convert(*child, &field.ty, lenient)?));
+                    values.push((field.name.clone(), self.convert(*child, &field.ty, reading)?));
                 }
                 Ok(Value::Struct(values))
             }
@@ -1089,20 +1165,36 @@ impl Document {
                 let entries = children
                     .iter()
                     .map(|(name, child)| {
-                        let name = cast_value(&Value::Varchar(name.clone()), key, false)?;
-                        Ok((name, self.convert(*child, value, lenient)?))
+                        let name = Document { nodes: vec![Node::Str(name.clone())] }
+                            .converted(0, key, reading)
+                            .map_err(|error| {
+                                Error::conversion(format!("{}{NULL_KEY}", error.message()))
+                            })?;
+                        Ok((name, self.convert(*child, value, reading)?))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Value::map(key.as_ref().clone(), value.as_ref().clone(), entries))
             }
-            _ if target.is_numeric() => {
+            // A boolean is read the way a number is, as the pin does.
+            _ if target.is_numeric() || *target == LogicalType::Boolean => {
+                let kind = if matches!(target, LogicalType::Decimal { .. }) {
+                    "decimal"
+                } else {
+                    "numerical"
+                };
                 let failed = || {
                     Error::conversion(format!(
-                        "Failed to cast value to numerical: {}",
+                        "Failed to cast value to {kind}: {}",
                         self.written(at)
                     ))
                 };
                 let scalar = self.scalar_value(node).ok_or_else(failed)?;
+                if let Value::Varchar(text) = &scalar
+                    && reading != Reading::Lenient
+                    && !strict_text(text, target)
+                {
+                    return Err(failed());
+                }
                 match cast_value(&scalar, target, true) {
                     Ok(Value::Null) | Err(_) => Err(failed()),
                     Ok(value) => Ok(value),
@@ -1121,6 +1213,38 @@ impl Document {
         }
     }
 
+    /// The type the structure at a position names, as [`structure_type`] reads it.
+    fn structure_type(
+        &self,
+        at: usize,
+        named: &mut dyn FnMut(&str) -> Result<LogicalType>,
+    ) -> Result<LogicalType> {
+        match &self.nodes[at] {
+            Node::Array(children) => match children[..] {
+                [only] => Ok(LogicalType::list(self.structure_type(only, named)?)),
+                _ => Err(Error::binder("Too many values in array of JSON structure")),
+            },
+            Node::Object(children) => {
+                let mut fields: Vec<Field> = Vec::with_capacity(children.len());
+                for (key, child) in children {
+                    if fields.iter().any(|field| field.name == *key) {
+                        return Err(Error::invalid_input(format!(
+                            "Duplicate keys in object in JSON structure: {}",
+                            self.written(*child)
+                        )));
+                    }
+                    fields.push(Field::new(key.clone(), self.structure_type(*child, named)?));
+                }
+                if fields.is_empty() {
+                    return Err(Error::binder("Empty object in JSON structure"));
+                }
+                Ok(LogicalType::Struct(fields))
+            }
+            Node::Str(name) => named(name),
+            _ => Err(Error::binder("invalid JSON structure")),
+        }
+    }
+
     /// The SQL value a scalar of a document is, and nothing for a container.
     fn scalar_value(&self, node: &Node) -> Option<Value> {
         Some(match node {
@@ -1133,6 +1257,38 @@ impl Document {
             Node::Array(_) | Node::Object(_) => return None,
         })
     }
+}
+
+/// Whether a string a strict reading turns into a number is written the way the pin's strict cast
+/// takes one. That refuses a leading plus, a leading zero, and for a whole number a fraction, an
+/// exponent or an underscore between digits, while a hexadecimal or binary one is still taken. A
+/// real number may not have spaces after it, and a boolean may not be `y`, `n`, `1` or `0`. A
+/// decimal is read the same either way.
+fn strict_text(text: &str, target: &LogicalType) -> bool {
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r');
+    let body = text.trim_start_matches(space);
+    let bytes = body.as_bytes();
+    let leading_zero = bytes.len() > 1 && bytes[0] == b'0' && bytes[1].is_ascii_digit();
+    if *target == LogicalType::Boolean {
+        return !matches!(text.to_ascii_lowercase().as_str(), "y" | "n" | "1" | "0");
+    }
+    if body.starts_with('+') {
+        return false;
+    }
+    if target.is_integer() {
+        let body = body.trim_end_matches(space);
+        if let Some(digits) = body.strip_prefix('-') {
+            return digits.bytes().all(|byte| byte.is_ascii_digit());
+        }
+        if matches!(bytes, [b'0', b'x' | b'X' | b'b' | b'B', ..]) {
+            return true;
+        }
+        return !leading_zero && body.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    if matches!(target, LogicalType::Float | LogicalType::Double) {
+        return !leading_zero && !body.ends_with(space);
+    }
+    true
 }
 
 /// One step of a `$` path.
@@ -1624,6 +1780,9 @@ fn answer_type(name: &str) -> LogicalType {
 ///
 /// A malformed document, and a path a row holds that the pin refuses.
 pub fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<Option<Value>> {
+    if let Some(answer) = transform(name, args, returns)? {
+        return Ok(Some(answer));
+    }
     if let Some(answer) = whole(name, args)? {
         return Ok(Some(answer));
     }
