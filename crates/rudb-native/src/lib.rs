@@ -5532,12 +5532,18 @@ impl PagePool {
     /// does, for a file a database reads beside its own, the way it reads a Parquet file's mirror.
     #[must_use]
     pub fn following(other: &Self) -> Self {
-        Self { last: Arc::clone(&other.last), ..Self::default() }
+        Self { last: Arc::clone(&other.last), told: Arc::clone(&other.told), ..Self::default() }
     }
 
     /// Whether [`PagePool::last_statement`] has been said.
     fn is_last(&self) -> bool {
         self.last.load(Atomic::Relaxed)
+    }
+
+    /// Whether no statement after the one running reads through this pool, whether or not this one
+    /// reads a table twice. See [`paid_at`].
+    fn is_final(&self) -> bool {
+        self.told.load(Atomic::Relaxed)
     }
 
     /// A pool that keeps up to `budget` bytes of pages and no decoded parts.
@@ -9514,7 +9520,7 @@ impl Reader {
             // run into the `Arc` without touching a value.
             let mut vector = match positions {
                 Some(positions) if !keeping => {
-                    let paid = paid_at(rows, bytes, positions);
+                    let paid = paid_at(rows, bytes, positions, self.pool.is_final());
                     if keeps && self.pool.is_last() {
                         self.pay(at, column, paid);
                         decode_at(&field.ty, rows, bytes, dictionary, positions)?
@@ -14849,14 +14855,21 @@ fn body_of(codec: u8, rows: usize, bytes: &[u8]) -> Option<&[u8]> {
 /// row. Counting all of those as one row a position was what kept JOB 20b walking the runs of
 /// `cast_info` and 31a expanding them on every warm run, since a read that paid for the whole part
 /// counted a few of its rows and the part was never held.
-fn paid_at(rows: usize, bytes: &[u8], positions: &[u32]) -> usize {
+///
+/// With `last` no statement after this one reads through the pool, even when this one reads a table
+/// twice, and a packed integer pays [`SPARSE_RENT`] a row, what the read costs, so a part is held
+/// only once this statement's own reads of it come to a whole decode. [`HOLD_RENT`] is paid for the
+/// statements after, and with none there is nothing for it to buy. TPC-H q17 reads `lineitem`
+/// twice at about three rows a part, and holding every part it touched on the first read decoded
+/// and unpacked each of them whole.
+fn paid_at(rows: usize, bytes: &[u8], positions: &[u32], last: bool) -> usize {
     let wanted = positions.len();
     if bytes.first() == Some(&6) {
         return if body_of(6, rows, bytes).is_some_and(string::pointed) { wanted } else { rows };
     }
     let pointed = cascade_body(rows, bytes).is_some_and(integer::pointed);
     if pointed && wanted.saturating_mul(SPARSE_RENT) <= rows {
-        wanted.saturating_mul(HOLD_RENT).min(rows)
+        wanted.saturating_mul(if last { SPARSE_RENT } else { HOLD_RENT }).min(rows)
     } else {
         rows
     }
