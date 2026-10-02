@@ -59,6 +59,19 @@ impl Children {
             Self::Listed(adjacency) => adjacency.children_of(parent, out),
         }
     }
+
+    /// Whether `parent` has a child at all, without reading one.
+    fn any(&self, parent: Rid, cursor: &mut Cursor) -> Result<bool> {
+        match self {
+            Self::Runs(link) => {
+                let run = link
+                    .backward_from(parent, cursor)
+                    .ok_or_else(|| Error::internal("a link has no run for a parent it holds"))?;
+                Ok(!run.is_empty())
+            }
+            Self::Listed(adjacency) => Ok(adjacency.degree(parent)? > 0),
+        }
+    }
 }
 
 /// What the builder found, handed over whole.
@@ -117,6 +130,10 @@ enum Tests {
         column: usize,
         other: Box<Prepared>,
     },
+    /// None, because the equality was the whole join and the child side was its table read whole.
+    /// A row is then kept or dropped on whether its parent has a child at all, which the link or
+    /// the adjacency says without a child row being read.
+    Bare,
 }
 
 #[derive(Debug)]
@@ -166,6 +183,7 @@ impl Siblings {
         let missing = || Error::internal("a sibling walk reads a column its rows do not have");
         let key = arriving.position_of(walk.key).ok_or_else(missing)?;
         let tests = match compared(plan, &walk) {
+            _ if walk.tests.is_empty() => Tests::Bare,
             Some((at, op, column, other)) => {
                 let mut fields = Vec::with_capacity(walk.read.len());
                 let mut bindings = Vec::with_capacity(walk.read.len());
@@ -259,6 +277,7 @@ impl Siblings {
                 column,
                 other: Box::new(other.in_session(session)),
             },
+            Tests::Bare => Tests::Bare,
         };
         self
     }
@@ -292,6 +311,9 @@ impl Siblings {
         let block = !keys.validity().has_nulls(rows)
             && keys.signed_block(&mut local.keys)
             && local.keys.len() >= rows;
+        if matches!(self.tests, Tests::Bare) {
+            return self.parented(keys, block, local);
+        }
         self.clear(local);
         // The parent of the row before and where its siblings are in the batch, so that a run of
         // rows with one parent looks it up and finds its siblings once.
@@ -363,10 +385,35 @@ impl Siblings {
         Ok(())
     }
 
+    /// Marks the rows whose parent has a child, for a walk with nothing to test. A run of rows
+    /// with one key looks its parent up once.
+    fn parented(&self, keys: &Vector, block: bool, local: &mut Walking) -> Result<()> {
+        let mut last: Option<(i128, bool)> = None;
+        for row in 0..local.hit.len() {
+            // A null key matches nothing, and neither does a key the parent does not hold, since
+            // every child with a key has the parent that key names.
+            let key = if block { Some(i128::from(local.keys[row])) } else { keys.signed_at(row) };
+            let Some(key) = key else { continue };
+            let found = match last {
+                Some((held, found)) if held == key => found,
+                _ => {
+                    let parent = self.keys.lookup(key)?.unwrap_or(NO_PARENT);
+                    let found =
+                        parent != NO_PARENT && self.children.any(parent, &mut local.cursor)?;
+                    last = Some((key, found));
+                    found
+                }
+            };
+            local.hit[row] = found;
+        }
+        Ok(())
+    }
+
     fn flush(&self, chunk: &Chunk, local: &mut Walking) -> Result<()> {
         match &self.tests {
             Tests::Pairs { carried, tests } => self.pairs(chunk, carried, tests, local),
             Tests::Compared { own, op, column, .. } => self.compare(own, *op, *column, local),
+            Tests::Bare => Ok(()),
         }
     }
 
@@ -686,6 +733,7 @@ impl Stream for Siblings {
             scratch: match &self.tests {
                 Tests::Pairs { tests, .. } => tests.iter().map(Prepared::scratch).collect(),
                 Tests::Compared { own, .. } => own.iter().map(Prepared::scratch).collect(),
+                Tests::Bare => Vec::new(),
             },
             keys: Vec::new(),
             rids: Vec::new(),
@@ -696,7 +744,7 @@ impl Stream for Siblings {
             values: Vec::new(),
             moved: Vec::new(),
             other: match &self.tests {
-                Tests::Pairs { .. } => Scratch::default(),
+                Tests::Pairs { .. } | Tests::Bare => Scratch::default(),
                 Tests::Compared { other, .. } => other.scratch(),
             },
             rising: true,

@@ -62,7 +62,7 @@ fn plan(database: &Database, sql: &str) -> String {
 
 /// The shape of TPC-H q21, one `EXISTS` and one `NOT EXISTS` over the other children of the
 /// same parent, each with a condition the key alone does not answer.
-const QUERIES: [&str; 6] = [
+const QUERIES: [&str; 10] = [
     "SELECT count(*), sum(o1.o_orderkey) FROM orders o1 WHERE o1.o_late AND EXISTS (SELECT * \
      FROM orders o2 WHERE o2.o_custkey = o1.o_custkey AND o2.o_clerk <> o1.o_clerk) AND NOT \
      EXISTS (SELECT * FROM orders o3 WHERE o3.o_custkey = o1.o_custkey AND o3.o_clerk <> \
@@ -81,6 +81,18 @@ const QUERIES: [&str; 6] = [
     "SELECT count(*), sum(c_custkey) FROM (SELECT c_custkey + 2990 AS c_custkey FROM customer) c \
      WHERE NOT EXISTS (SELECT * FROM orders o WHERE o.o_custkey = c.c_custkey AND o.o_clerk > \
      c.c_custkey % 5)",
+    // The key and nothing else, which asks only whether the parent has a child, with keys past the
+    // last parent and null keys among them.
+    "SELECT count(*), sum(c_custkey) FROM (SELECT CASE WHEN c_custkey % 9 = 0 THEN NULL ELSE \
+     c_custkey * 2 END AS c_custkey FROM customer) c WHERE NOT EXISTS (SELECT * FROM orders o \
+     WHERE o.o_custkey = c.c_custkey)",
+    "SELECT count(*), sum(c_custkey) FROM (SELECT CASE WHEN c_custkey % 9 = 0 THEN NULL ELSE \
+     c_custkey * 2 END AS c_custkey FROM customer) c WHERE EXISTS (SELECT * FROM orders o WHERE \
+     o.o_custkey = c.c_custkey)",
+    "SELECT count(*) FROM customer WHERE NOT EXISTS (SELECT * FROM orders WHERE o_custkey = \
+     c_custkey)",
+    "SELECT count(*), sum(o_orderkey) FROM orders o1 WHERE EXISTS (SELECT * FROM orders o2 WHERE \
+     o2.o_custkey = o1.o_orderkey)",
 ];
 
 fn answers_the_same(shuffled: bool) {
@@ -97,6 +109,13 @@ fn answers_the_same(shuffled: bool) {
         .lines()
         .find(|line| line.contains("Get ") && line.contains(" o2 "))
         .unwrap_or_else(|| panic!("no scan of o2 on the tree:\n{text}"));
+    assert!(scan.contains("not measured"), "{text}");
+    // Nor is it when the key is the whole condition, since the parent's child count says it all.
+    let text = plan(&database, QUERIES[8]);
+    let scan = text
+        .lines()
+        .find(|line| line.contains("Get ") && line.contains("orders"))
+        .unwrap_or_else(|| panic!("no scan of orders on the tree:\n{text}"));
     assert!(scan.contains("not measured"), "{text}");
     drop(database);
     std::fs::remove_file(&path).ok();

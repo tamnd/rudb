@@ -176,6 +176,18 @@ impl Adjacency {
         Ok(())
     }
 
+    /// How many child rows point at `parent`, read off the starts without reading any of them.
+    ///
+    /// # Errors
+    ///
+    /// If `parent` is past the end.
+    pub fn degree(&self, parent: Rid) -> Result<u64> {
+        let list = self.list(parent).ok_or_else(|| {
+            malformed(format!("parent {parent} of {} is past the end", self.parents))
+        })?;
+        Ok(count(list.len()))
+    }
+
     /// How many children the parents of `held` have between them, without reading a child row.
     ///
     /// A walk over the starts, for a caller deciding whether [`Self::push`] is worth its gathers.
