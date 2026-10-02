@@ -13,10 +13,16 @@
 //! never has metadata to carry, which is why the lane syncs with `fdatasync`. A block never spans two segments, and the old segment is synced
 //! before the first write to the new one, so replay can treat a bad record as the end of its
 //! segment and still read the next one.
+//!
+//! Filling a segment with zeros and syncing it is the slow part, and a commit that starts one would
+//! otherwise do it while every committer behind it waits. So the lane keeps a couple of spares, the
+//! segments a checkpoint retired or ones a thread of its own filled with zeros ahead of time, and a
+//! new segment is a spare with a new header and a new name.
 
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
 
 use rudb_common::{Error, Result};
 use rudb_io::{File, Filesystem, OpenMode};
@@ -32,6 +38,10 @@ const ZERO_CHUNK: usize = 1 << 20;
 /// How many retired segments a lane keeps to recycle, `09-the-log.md` section 9.3. A checkpoint
 /// retires the segments behind it, so two cover a log that checkpoints every couple of segments.
 const SPARES: usize = 2;
+
+/// The first sequence a spare the lane made itself is named under. A segment's sequence counts up
+/// from 1 and never gets near it, so such a spare's name is never one a retired segment takes.
+const MADE: u64 = 1 << 63;
 
 /// What a commit waits for before it returns, the `commit_sync` setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,13 +70,24 @@ pub struct Options {
     pub segment_bytes: u64,
     /// What a commit waits for.
     pub commit_sync: CommitSync,
+    /// Whether the lane fills spares with zeros on a thread of its own whenever it has fewer than
+    /// [`SPARES`], so a commit that starts a segment renames one rather than writes the whole
+    /// segment while every committer behind it waits. Off for a test that counts the operations
+    /// the lane does, which a thread of its own would make vary from run to run.
+    pub spare_ahead: bool,
 }
 
 impl Options {
     /// Lane 0 of `database` with 64 MiB segments and full syncs.
     #[must_use]
     pub fn new(database: u64) -> Self {
-        Self { lane: 0, database, segment_bytes: SEGMENT_BYTES, commit_sync: CommitSync::Full }
+        Self {
+            lane: 0,
+            database,
+            segment_bytes: SEGMENT_BYTES,
+            commit_sync: CommitSync::Full,
+            spare_ahead: true,
+        }
     }
 }
 
@@ -229,8 +250,10 @@ pub struct Stats {
     pub syncs: u64,
     /// Segments created.
     pub segments: u64,
-    /// Of those, the ones made from a retired segment rather than filled with zeros.
+    /// Of those, the ones made from a spare rather than filled with zeros on the spot.
     pub recycled: u64,
+    /// Spares the lane filled with zeros on a thread of its own.
+    pub made: u64,
 }
 
 /// An encoded block waiting for a leader to write it.
@@ -270,8 +293,15 @@ struct State {
     /// say, so the lane refuses everything after it and the database goes read only.
     failed: Option<String>,
     stats: Stats,
-    /// Retired segments, full size, that the next new segments are made from.
+    /// Retired segments and spares made ahead, full size, that the next new segments are made
+    /// from.
     spares: Vec<PathBuf>,
+    /// The sequence the next spare made ahead is named under, from [`MADE`] up.
+    made: u64,
+    /// A thread is making spares.
+    making: bool,
+    /// The lane is closing and starts no more of them.
+    stopped: bool,
 }
 
 impl State {
@@ -301,8 +331,10 @@ pub struct Lane {
     fs: Arc<dyn Filesystem>,
     dir: PathBuf,
     options: Options,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     changed: Condvar,
+    /// The thread making spares ahead, joined before another starts and when the lane stops.
+    maker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Lane {
@@ -337,10 +369,14 @@ impl Lane {
         // Spares a run before this one retired are recycled like this run's own, unless the
         // segment size changed since.
         let mut kept = Vec::new();
+        let mut made = MADE;
         for spare in spares(fs.as_ref(), dir, options.lane)? {
             if kept.len() < SPARES
                 && fs.open(&spare, OpenMode::Read)?.len()? == options.segment_bytes
             {
+                if let Some((_, sequence)) = spare_sequence(&spare) {
+                    made = made.max(sequence.saturating_add(1));
+                }
                 kept.push(spare);
             } else {
                 fs.remove(&spare)?;
@@ -350,7 +386,7 @@ impl Lane {
             fs,
             dir: dir.to_path_buf(),
             options,
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 tail_sequence: sequence,
                 tail_offset: SEGMENT_HEADER as u64,
                 pending: Vec::new(),
@@ -362,14 +398,19 @@ impl Lane {
                 failed: None,
                 stats: Stats::default(),
                 spares: kept,
-            }),
+                made,
+                making: false,
+                stopped: false,
+            })),
             changed: Condvar::new(),
+            maker: Mutex::new(None),
         };
         let file = lane.create_segment(sequence)?;
         let mut state = lane.lock();
         state.open = Some(Open { sequence, file, dirty: false });
         state.stats.segments = 1;
         drop(state);
+        lane.spare_ahead();
         Ok(lane)
     }
 
@@ -531,6 +572,51 @@ impl Lane {
         Ok(())
     }
 
+    /// Stops making spares ahead and waits for a spare being made to be done, so nothing creates
+    /// a file in the directory after this returns. For a lane whose log is about to be removed.
+    pub fn stop(&self) {
+        self.lock().stopped = true;
+        self.join_maker();
+    }
+
+    /// Starts a thread making spares when the lane has fewer than [`SPARES`] and none is at it.
+    fn spare_ahead(&self) {
+        if !self.options.spare_ahead {
+            return;
+        }
+        {
+            let mut state = self.lock();
+            if state.making
+                || state.stopped
+                || state.failed.is_some()
+                || state.spares.len() >= SPARES
+            {
+                return;
+            }
+            state.making = true;
+        }
+        self.join_maker();
+        let (fs, dir, state) = (Arc::clone(&self.fs), self.dir.clone(), Arc::clone(&self.state));
+        let (lane, size) = (self.options.lane, self.options.segment_bytes);
+        let spawned = std::thread::Builder::new()
+            .name("rudb-log-spares".into())
+            .spawn(move || make_spares(fs.as_ref(), &dir, lane, size, &state));
+        match spawned {
+            Ok(handle) => {
+                *self.maker.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
+            }
+            // No thread means the next segment is filled on the spot, as it was before.
+            Err(_) => self.lock().making = false,
+        }
+    }
+
+    fn join_maker(&self) {
+        let handle = self.maker.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
     /// The directory the lane's segments are in.
     #[must_use]
     pub fn dir(&self) -> &Path {
@@ -582,6 +668,11 @@ impl Lane {
                     state.stats.writes += led.writes;
                     state.stats.syncs += led.syncs;
                     state.stats.segments += led.segments;
+                    if led.segments > 0 && state.spares.len() < SPARES && !state.making {
+                        drop(state);
+                        self.spare_ahead();
+                        state = self.lock();
+                    }
                 }
                 Err(error) => state.failed = Some(error.to_string()),
             }
@@ -666,4 +757,58 @@ impl Lane {
         self.fs.sync_dir(&self.dir)?;
         Ok(file)
     }
+}
+
+impl Drop for Lane {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The lane and sequence a spare's file name says.
+fn spare_sequence(path: &Path) -> Option<(u8, u64)> {
+    parse_segment_name(path.file_name()?.to_str()?.strip_suffix(".spare")?)
+}
+
+/// Makes spares of `size` bytes for `lane` in `dir` until the lane has [`SPARES`] of them or
+/// stops, each filled with zeros and synced, with the directory, before the lane is given it.
+///
+/// A spare is all zeros, header included, which is what a retired segment's records come to as
+/// far as a new sequence is concerned: [`Lane::create_segment`] writes the header when it renames
+/// the spare, and nothing after it reads as a record. One that fails halfway is removed, and the
+/// lane fills its next segment on the spot as it would have without a thread.
+fn make_spares(fs: &dyn Filesystem, dir: &Path, lane: u8, size: u64, state: &Mutex<State>) {
+    let lock = || state.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        let path = {
+            let mut state = lock();
+            if state.stopped || state.failed.is_some() || state.spares.len() >= SPARES {
+                state.making = false;
+                return;
+            }
+            state.made += 1;
+            dir.join(spare_name(lane, state.made - 1))
+        };
+        if fill(fs, &path, size).and_then(|()| fs.sync_dir(dir)).is_err() {
+            let _ = fs.remove(&path);
+            lock().making = false;
+            return;
+        }
+        let mut state = lock();
+        state.spares.insert(0, path);
+        state.stats.made += 1;
+    }
+}
+
+/// Creates `path` as `size` zero bytes and syncs it.
+fn fill(fs: &dyn Filesystem, path: &Path, size: u64) -> Result<()> {
+    let file = fs.open(path, OpenMode::CreateNew)?;
+    let zeros = vec![0_u8; ZERO_CHUNK.min(size as usize)];
+    let mut at = 0;
+    while at < size {
+        let run = zeros.len().min((size - at) as usize);
+        file.write_at(at, &zeros[..run])?;
+        at += run as u64;
+    }
+    file.sync()
 }

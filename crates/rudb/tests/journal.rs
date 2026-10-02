@@ -24,8 +24,16 @@ fn wal(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The log's segments, leaving out the spares the lane keeps to start its next ones from.
 fn segments(path: &Path) -> usize {
-    std::fs::read_dir(wal(path)).map_or(0, |dir| dir.count())
+    std::fs::read_dir(wal(path)).map_or(0, |dir| {
+        dir.filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|entry| !entry.file_name().to_string_lossy().ends_with(".spare"))
+        })
+        .count()
+    })
 }
 
 fn open(path: &Path) -> Database {
