@@ -544,6 +544,28 @@ fn seeded_checksum(bytes: &[u8], seed: u64) -> u64 {
     finish_checksum(lanes, rest, bytes.len() as u64)
 }
 
+/// How much of a mapped range [`released_checksum`] reads before it lets go of what it read.
+const RELEASED_WINDOW: usize = 1 << 20;
+
+/// [`checksum`] of `bytes`, which are the mapping's at `offset`, letting go of each stretch of the
+/// mapping once it is hashed, so that checking a range leaves none of it resident.
+fn released_checksum(map: &Mapped, offset: u64, bytes: &[u8]) -> u64 {
+    if bytes.len() < 32 {
+        return checksum(bytes);
+    }
+    let whole = bytes.len() - bytes.len() % 32;
+    let mut lanes = [XXH_P1.wrapping_add(XXH_P2), XXH_P2, 0, 0_u64.wrapping_sub(XXH_P1)];
+    let mut at = 0;
+    for window in bytes[..whole].chunks(RELEASED_WINDOW) {
+        for block in window.chunks_exact(32) {
+            checksum_block(&mut lanes, block);
+        }
+        map.release(offset + at as u64, window.len());
+        at += window.len();
+    }
+    finish_checksum(lanes, &bytes[whole..], bytes.len() as u64)
+}
+
 const XXH_P1: u64 = 11_400_714_785_074_694_791;
 const XXH_P2: u64 = 14_029_467_366_897_019_727;
 const XXH_P3: u64 = 1_609_587_929_392_839_161;
@@ -5197,6 +5219,14 @@ impl PageBytes {
             Self::Mapped { map, offset, length } => map.get(*offset, *length).unwrap_or_default(),
         }
     }
+
+    /// The memory of its own this holds, which for a range of the mapped file is none.
+    fn held(&self) -> usize {
+        match self {
+            Self::Read(bytes) => bytes.capacity(),
+            Self::Mapped { .. } => 0,
+        }
+    }
 }
 
 /// A mapped page lets its pages go when the last holder does.
@@ -5641,9 +5671,15 @@ struct NativeText {
     /// reader decodes a whole block and slices it, so an offset into the payload is a number it
     /// would have to subtract a base from anyway.
     ///
-    /// The vector is the index as it was read, so the offsets start after the header, and
-    /// [`Self::packed`] is where they are read from.
-    offsets: Vec<u8>,
+    /// The bytes are the index as it was read, or its range of the mapped file, so the offsets
+    /// start after the header, and [`Self::packed`] is where they are read from.
+    ///
+    /// Mapped where the file is. On a dictionary of millions of values the offsets are megabytes,
+    /// `URL` and `Referer` on ClickBench six apiece, and a query reading a few hundred rows of a
+    /// column touches a few pages of them. Read into memory they were all resident from the moment
+    /// the column was opened, 12 MB of the 54 MB heap of ClickBench q40, which reads 600 rows. Left
+    /// in the page cache they cost the pages a read lands in.
+    offsets: PageBytes,
     /// Bits one offset is packed at, which is what the largest block of this column spans and is the
     /// same for every block of it.
     offset_bits: usize,
@@ -6269,7 +6305,7 @@ impl NativeText {
 
     /// The packed offsets, which is the index past its header.
     fn packed(&self) -> &[u8] {
-        self.offsets.get(DICTIONARY_HEADER..).unwrap_or_default()
+        self.offsets.bytes().get(DICTIONARY_HEADER..).unwrap_or_default()
     }
 
     /// Where the value at `index` ends inside its payload block.
@@ -6905,7 +6941,7 @@ impl TextSource for NativeText {
     }
 
     fn footprint(&self) -> usize {
-        self.offsets.capacity()
+        self.offsets.held()
             + self
                 .value_ends
                 .get()
@@ -8750,6 +8786,7 @@ impl Reader {
         self.opened.fetch_add(1, Atomic::Relaxed);
         let dictionary = Arc::new(open_global_dictionary(
             Arc::clone(&self.file),
+            self.map.as_ref(),
             page,
             &self.table.fields[column].ty,
             TEXT_KEEP_BUDGET,
@@ -14426,6 +14463,7 @@ fn encode_ranks(order: &[(u64, u32)], code_bits: usize) -> Result<(Vec<u8>, Vec<
 /// a quarter of a gigabyte of dictionary to reach it.
 fn open_global_dictionary(
     file: Arc<File>,
+    map: Option<&Arc<Mapped>>,
     page: Page,
     ty: &LogicalType,
     keep_budget: usize,
@@ -14484,10 +14522,21 @@ fn open_global_dictionary(
     if index_len > page.length as usize {
         return Err(invalid("global dictionary offset index exceeds its page"));
     }
-    let mut index = vec![0; index_len];
-    index[..DICTIONARY_HEADER].copy_from_slice(&header);
-    read_at(&file, page.offset + DICTIONARY_HEADER as u64, &mut index[DICTIONARY_HEADER..])?;
-    if checksum(&index) != page.hash {
+    // Read where the file is mapped, and let go of a stretch at a time as the checksum passes it,
+    // so that opening the column leaves only the pages its reads land in, for the reason on
+    // [`NativeText::offsets`].
+    let mapped = map.and_then(|map| Some((map, map.get(page.offset, index_len)?)));
+    let mut read = None;
+    let (index, sum) = if let Some((map, index)) = mapped {
+        (index, released_checksum(map, page.offset, index))
+    } else {
+        let mut bytes = vec![0; index_len];
+        bytes[..DICTIONARY_HEADER].copy_from_slice(&header);
+        read_at(&file, page.offset + DICTIONARY_HEADER as u64, &mut bytes[DICTIONARY_HEADER..])?;
+        let bytes = read.insert(bytes);
+        (bytes.as_slice(), checksum(bytes))
+    };
+    if sum != page.hash {
         return Err(invalid("global dictionary index checksum differs"));
     }
     let word_end = index_len - usize::from(has_grams) * 8;
@@ -14529,8 +14578,18 @@ fn open_global_dictionary(
     // The offsets stay where they were read, behind the header, rather than being copied out. On a
     // dictionary of millions of values they are megabytes, and a copy is as many fresh pages to
     // fault in again on a query that may want a handful of strings.
-    let mut offsets = index;
-    offsets.truncate(DICTIONARY_HEADER + offset_len);
+    let offsets = match (mapped, read) {
+        (_, Some(mut offsets)) => {
+            offsets.truncate(DICTIONARY_HEADER + offset_len);
+            PageBytes::Read(offsets)
+        }
+        (Some((map, _)), None) => PageBytes::Mapped {
+            map: Arc::clone(map),
+            offset: page.offset,
+            length: DICTIONARY_HEADER + offset_len,
+        },
+        (None, None) => return Err(invalid("global dictionary index was neither read nor mapped")),
+    };
     let hashes = words.split_off(blocks * (payload_words - 1));
     let (starts, lengths) = if scattered {
         let mut starts = Vec::with_capacity(blocks);
@@ -19652,6 +19711,7 @@ mod tests {
         let page = reader.table.dictionaries[0].expect("a string column has one");
         let starved = open_global_dictionary(
             Arc::clone(&reader.file),
+            None,
             page,
             &LogicalType::Varchar,
             0,
@@ -20144,32 +20204,62 @@ mod tests {
                 length: u32::try_from(length).expect("a test dictionary is small"),
                 hash: checksum(&encoded.index),
             };
-            let opened = open_global_dictionary(
-                file,
-                page,
-                &LogicalType::Varchar,
-                TEXT_KEEP_BUDGET,
-                Arc::default(),
-            )
-            .expect("a dictionary laid out either way opens");
-            let mut swept: Vec<Vec<u8>> = Vec::new();
-            let mut at = 0;
-            while at < opened.len() {
-                at = opened
-                    .sweep_text(at, opened.len(), &mut |_index: usize, text: &[u8]| {
-                        swept.push(text.to_vec());
-                        Ok(())
-                    })
-                    .expect("a sweep reads");
+            let length = fs::metadata(&path).expect("it is there").len();
+            let map = Mapped::open(&file, length).map(Arc::new);
+            assert!(map.is_some(), "a test file maps");
+            // Read into memory and left in the map, the same page gives the same values.
+            let mut both: Vec<Vec<Vec<u8>>> = Vec::new();
+            for map in [None, map.as_ref()] {
+                let opened = open_global_dictionary(
+                    Arc::clone(&file),
+                    map,
+                    page,
+                    &LogicalType::Varchar,
+                    TEXT_KEEP_BUDGET,
+                    Arc::default(),
+                )
+                .expect("a dictionary laid out either way opens");
+                let mut swept: Vec<Vec<u8>> = Vec::new();
+                let mut at = 0;
+                while at < opened.len() {
+                    at = opened
+                        .sweep_text(at, opened.len(), &mut |_index: usize, text: &[u8]| {
+                            swept.push(text.to_vec());
+                            Ok(())
+                        })
+                        .expect("a sweep reads");
+                }
+                both.push(swept);
             }
             fs::remove_file(&path).expect("clean up");
-            read.push(swept);
+            assert_eq!(both[1], both[0], "a mapped index reads what a read one does");
+            read.push(both.swap_remove(0));
         }
         let wanted =
             spellings.iter().map(|text| text.as_bytes().to_vec()).collect::<Vec<Vec<u8>>>();
         assert_eq!(read[0], wanted, "the blocks outside the page hold the values");
         assert_eq!(read[1], read[0], "the blocks inside the page hold the same values");
         assert_eq!(read[2], read[0], "the blocks behind one another hold the same values");
+    }
+
+    /// A checksum that hands back the mapped pages behind it sums what a plain one does.
+    #[test]
+    fn a_released_checksum_matches_a_plain_one() {
+        let path = path("released-checksum");
+        let bytes =
+            (0..3 * RELEASED_WINDOW + 4_099).map(|at| (at * 31 % 251) as u8).collect::<Vec<_>>();
+        fs::write(&path, &bytes).expect("written");
+        let file = File::open(&path).expect("it opens");
+        let map = Mapped::open(&file, bytes.len() as u64).expect("a test file maps");
+        for (from, to) in [(0, 0), (0, 31), (5, 70), (0, bytes.len()), (65_537, bytes.len() - 3)] {
+            let mapped = map.get(from as u64, to - from).expect("inside the file");
+            assert_eq!(
+                released_checksum(&map, from as u64, mapped),
+                checksum(&bytes[from..to]),
+                "the bytes from {from} to {to}"
+            );
+        }
+        fs::remove_file(&path).expect("clean up");
     }
 
     /// A dictionary at its budget sweeps without keeping, and still answers what it answered.
@@ -20203,8 +20293,9 @@ mod tests {
         let reader = Reader::open(&path).expect("valid directory");
         let page = reader.table.dictionaries[0].expect("a string column has one");
         let file = Arc::clone(&reader.file);
-        let starved = open_global_dictionary(file, page, &LogicalType::Varchar, 0, Arc::default())
-            .expect("a dictionary opens whatever it may keep");
+        let starved =
+            open_global_dictionary(file, None, page, &LogicalType::Varchar, 0, Arc::default())
+                .expect("a dictionary opens whatever it may keep");
 
         let resting = starved.footprint();
         let mut swept: Vec<Vec<u8>> = Vec::new();
