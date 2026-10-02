@@ -1767,7 +1767,9 @@ fn rebound(
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{ConsistentExtremes, DECODE, GATHER, Reach, Standing, Weight, gyo, take, trail, widens};
+    use super::{
+        ConsistentExtremes, DECODE, GATHER, Reach, Standing, Weight, gyo, take, trail, widens,
+    };
     use crate::pass::{Context, Pass};
     use rudb_common::LogicalType;
     use rudb_common::rules::{Rule, Rules};
@@ -1937,7 +1939,10 @@ mod tests {
     #[test]
     fn a_relation_written_in_the_order_of_a_narrowed_class_goes_before_a_smaller_one() {
         let mut clustered = weight(36_000_000, 0, 1.0);
-        clustered.reach = vec![(0, Reach { parts: 4_425, values: 2_500_000, per_value: 1.0 })];
+        clustered.reach = vec![(
+            0,
+            Reach { parts: 4_425, values: 2_500_000, per_value: 1.0, wide: 0, wide_per_value: 0.0 },
+        )];
         let weights = [weight(2_500_000, 0, 0.0001), clustered, weight(3_100_000, 4, 0.06)];
         let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights).expect("acyclic");
         let scanned: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
@@ -1947,7 +1952,16 @@ mod tests {
         // because the two left are priced as a pair and `char_name` read after it is read at the
         // roles left, where read first it is read whole and `cast_info` is still read whole after.
         let mut spread = weight(36_000_000, 0, 1.0);
-        spread.reach = vec![(0, Reach { parts: 4_425, values: 2_500_000, per_value: 4_425.0 })];
+        spread.reach = vec![(
+            0,
+            Reach {
+                parts: 4_425,
+                values: 2_500_000,
+                per_value: 4_425.0,
+                wide: 0,
+                wide_per_value: 0.0,
+            },
+        )];
         let weights = [weight(2_500_000, 0, 0.0001), spread, weight(3_100_000, 4, 0.06)];
         let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights).expect("acyclic");
         let scanned: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
@@ -1961,7 +1975,16 @@ mod tests {
     #[test]
     fn the_last_two_are_ordered_by_what_the_pair_costs() {
         let mut spread = weight(36_000_000, 0, 1.0);
-        spread.reach = vec![(0, Reach { parts: 4_425, values: 2_500_000, per_value: 4_425.0 })];
+        spread.reach = vec![(
+            0,
+            Reach {
+                parts: 4_425,
+                values: 2_500_000,
+                per_value: 4_425.0,
+                wide: 0,
+                wide_per_value: 0.0,
+            },
+        )];
         let weights = [weight(2_500_000, 0, 0.0001), spread, weight(4_000_000, 4, 0.4)];
         let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights).expect("acyclic");
         let scanned: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
@@ -2079,7 +2102,10 @@ mod tests {
     fn a_relation_leaves_no_more_values_standing_than_the_rows_it_keeps() {
         let mut movie_link = weight(30_000, 0, 1.0);
         movie_link.skew = vec![(1, 5.0, 18)];
-        movie_link.reach = vec![(0, Reach { parts: 4, values: 2_500_000, per_value: 1.0 })];
+        movie_link.reach = vec![(
+            0,
+            Reach { parts: 4, values: 2_500_000, per_value: 1.0, wide: 0, wide_per_value: 0.0 },
+        )];
         movie_link.domain = vec![(0, 2_500_000)];
         let edges = edges(&[&[0, 1]]);
         let mut standing = Standing::from([(1, 2.0 / 18.0)]);
@@ -2124,7 +2150,10 @@ mod tests {
     #[test]
     fn a_named_value_costs_the_parts_its_ends_hold_it_in() {
         let mut movie_info = weight(14_835_720, 4, 0.1);
-        movie_info.reach = vec![(0, Reach { parts: 1_812, values: 110, per_value: 94.0 })];
+        movie_info.reach = vec![(
+            0,
+            Reach { parts: 1_812, values: 110, per_value: 94.0, wide: 0, wide_per_value: 0.0 },
+        )];
         movie_info.domain = vec![(0, 113)];
         let standing = Standing::from([(0, 1.0 / 113.0)]);
         let classes = BTreeSet::from([0]);

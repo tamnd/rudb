@@ -596,20 +596,43 @@ pub struct Reach {
     ///
     /// One for a column written in order, and every part for a column written in no order at all.
     pub per_value: f64,
+    /// How many of the parts are wide, spanning more than [`Reach::WIDE`] times the values a part
+    /// would span were the column written in order.
+    pub wide: u64,
+    /// The share of `per_value` the wide parts account for.
+    pub wide_per_value: f64,
 }
 
 impl Reach {
+    /// How many times the values it would span in order a part spans before it counts as wide.
+    pub const WIDE: f64 = 16.0;
+
     /// The share of the parts that `keys` values, spread over the column, fall inside the ends of.
     ///
-    /// Each value lands inside a given part's ends with the chance `per_value / parts`, and a part
-    /// is opened when any of them does.
+    /// Each value lands inside a given part's ends with the chance that part's span over the
+    /// values, and a part is opened when any of them does. The wide parts and the rest are taken
+    /// apart, because the average of the two is no part's chance. `cast_info` is written mostly in
+    /// `person_id` order, but a few hundred of its parts span nearly every person, and those put the
+    /// average part at 1,312 of the 4,470. At that chance the 2,664 people JOB 17c keeps open every
+    /// part, where they left half of them closed.
     #[must_use]
     pub fn touched(&self, keys: f64) -> f64 {
         if self.parts == 0 {
             return 1.0;
         }
-        let one = (self.per_value / self.parts as f64).clamp(0.0, 1.0);
-        (1.0 - (1.0 - one).powf(keys.max(0.0))).clamp(0.0, 1.0)
+        let keys = keys.max(0.0);
+        let opened = |parts: f64, per_value: f64| {
+            if parts <= 0.0 {
+                return 0.0;
+            }
+            let one = (per_value / parts).clamp(0.0, 1.0);
+            parts * (1.0 - (1.0 - one).powf(keys))
+        };
+        let wide = self.wide.min(self.parts) as f64;
+        let narrow = self.parts as f64 - wide;
+        let wide_per_value = self.wide_per_value.clamp(0.0, self.per_value);
+        let opened = opened(narrow, self.per_value - wide_per_value) + opened(wide, wide_per_value);
+        (opened / self.parts as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -1067,8 +1090,25 @@ fn torn(what: impl Into<String>) -> Error {
 mod tests {
     use std::cmp::Ordering;
 
-    use super::{Bound, MICROS, Op, Test, certain, excluded, kept};
+    use super::{Bound, MICROS, Op, Reach, Test, certain, excluded, kept};
     use crate::{LogicalType, Value};
+
+    /// A column written in order but for a few parts that span it all leaves most parts closed to a
+    /// few thousand keys, where the average span of a part says every part is opened.
+    #[test]
+    fn a_few_wide_parts_leave_the_narrow_ones_closed() {
+        let (parts, values) = (4_470_u64, 4_000_000_u64);
+        let wide = 1_200_u64;
+        let narrow = (parts - wide) as f64 * (values as f64 / parts as f64) / values as f64;
+        let wide_per_value = wide as f64;
+        let per_value = narrow + wide_per_value;
+        let split = Reach { parts, values, per_value, wide, wide_per_value };
+        let even = Reach { wide: 0, wide_per_value: 0.0, ..split };
+        assert!(even.touched(2_664.0) > 0.99, "{}", even.touched(2_664.0));
+        let touched = split.touched(2_664.0);
+        assert!((0.4..0.75).contains(&touched), "{touched}");
+        assert!((split.touched(0.0)).abs() < 1e-9);
+    }
 
     /// The range 10 to 20, which every test here asks about.
     fn range() -> (Bound, Bound) {
