@@ -962,6 +962,11 @@ impl Binder<'_> {
         if let Some(call) = self.enum_call(&written, &bound)? {
             return Ok(call);
         }
+        if let Some(&builder) =
+            rudb_kernels::json::BUILDERS.iter().find(|name| rudb_catalog::same_name(&written, name))
+        {
+            self.json_builder(ast, builder, &arguments, &bound, scope)?;
+        }
         // `typeof` is answered here rather than by a kernel, because the type is settled the moment
         // its argument is bound and nothing about it changes per row. The argument still has to be
         // a legal expression where it was written, so it goes through the aggregate rules first and
@@ -1511,6 +1516,51 @@ impl Binder<'_> {
             }
             Some(path) if rudb_kernels::json::wild_path(&path)? => Ok(LogicalType::list(returns)),
             _ => Ok(returns),
+        }
+    }
+
+    /// The pin's refusals of a call to one of the `JSON` builders, which it makes when it binds the
+    /// call since every one of them takes any number of anything.
+    fn json_builder(
+        &self,
+        ast: &Ast,
+        name: &str,
+        arguments: &[ast::ExprRef],
+        bound: &[ExprRef],
+        scope: &Scope,
+    ) -> Result<()> {
+        let types: Vec<&LogicalType> =
+            bound.iter().map(|&arg| self.plan().expr_type(arg)).collect();
+        let spelled = if name == "json_quote" { "to_json" } else { name };
+        match (name, types.as_slice()) {
+            ("json_array", _) => Ok(()),
+            ("json_object", _) if !types.len().is_multiple_of(2) => {
+                Err(Error::binder("json_object() requires an even number of arguments"))
+            }
+            ("json_object", _) => {
+                for (&arg, ty) in arguments.iter().zip(&types).step_by(2) {
+                    if **ty != LogicalType::Varchar {
+                        let named = self.output_name(ast, arg, scope);
+                        return Err(Error::binder(format!(
+                            "json_object() keys must be VARCHAR, add an explicit cast to argument \"\"{named}\"\""
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            (_, [ty]) => match (name, ty) {
+                (
+                    "array_to_json",
+                    LogicalType::List(_) | LogicalType::Array(..) | LogicalType::Null,
+                )
+                | ("row_to_json", LogicalType::Struct(_) | LogicalType::Null)
+                | ("to_json" | "json_quote", _) => Ok(()),
+                ("array_to_json", _) => {
+                    Err(Error::binder("array_to_json() argument type must be LIST or ARRAY"))
+                }
+                _ => Err(Error::binder("row_to_json() argument type must be STRUCT")),
+            },
+            _ => Err(Error::binder(format!("{spelled}() takes exactly one argument"))),
         }
     }
 

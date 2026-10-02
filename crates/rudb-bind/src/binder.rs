@@ -1610,7 +1610,7 @@ impl<'a> Binder<'a> {
     /// A bare column keeps the spelling the table was created with rather than the spelling the
     /// query used, so `SELECT USERID FROM hits` has a column called `UserID`. Identifiers match
     /// without regard to case and the catalog is the one that holds the case.
-    fn output_name(&self, ast: &Ast, target: ast::ExprRef, input: &Scope) -> String {
+    pub(crate) fn output_name(&self, ast: &Ast, target: ast::ExprRef, input: &Scope) -> String {
         if let ast::Expr::Column { name } = ast.expr(target) {
             let parts: Vec<&str> = ast.name(name).collect();
             if let Ok(found) = input.resolve(&parts) {

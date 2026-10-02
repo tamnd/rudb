@@ -156,6 +156,9 @@ fn run<V: AsRef<Vector>>(
         return Vector::from_values(returns.clone(), &[]);
     }
 
+    if let Some(answer) = crate::json::build_vectors(name, args, None) {
+        return answer;
+    }
     if let Some(vector) = crate::sequence::call(name, args, rows)? {
         return Ok(vector);
     }

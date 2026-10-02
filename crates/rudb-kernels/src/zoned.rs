@@ -31,6 +31,11 @@ pub fn call_in_time_zone<V: AsRef<Vector>>(
     returns: &LogicalType,
     zone: SessionTimeZone,
 ) -> Option<Result<Vector>> {
+    // The `JSON` builders write a `TIMESTAMPTZ` as it reads in the session zone, and need the types
+    // of their arguments in any zone, so they are answered here whatever the zone is.
+    if let Some(answer) = crate::json::build_vectors(name, args, Some(zone)) {
+        return Some(answer);
+    }
     let args: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
     // A zone named in the call is read whatever the session zone is, and from a plain timestamp too.
     if let ("timezone", [named, when]) = (name, args.as_slice()) {

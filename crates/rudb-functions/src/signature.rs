@@ -1289,6 +1289,99 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::Varchar),
         numeric_only: false,
     },
+    // The builders, which take anything and whose refusals are the binder's, and the functions
+    // that read whole documents.
+    Entry {
+        name: "to_json",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(0),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_quote",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(0),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "array_to_json",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(0),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "row_to_json",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(0),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_array",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(0),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_object",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(0),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_merge_patch",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_deep_merge",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_merge_patch_diff",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_pretty",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_strip_nulls",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_contains",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "json_structure",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::AnyTo(Fixed::Varchar),
+        numeric_only: false,
+    },
     // Subscripting. A bracket is one of these two calls by the time the transformer is done with it,
     // `x[2]` being `array_extract(x, 2)` and `x[1:2]` being `array_slice(x, 1, 2)`, which is what
     // DuckDB's own transformer writes as well. Both take a string or a list and give back a piece of
@@ -3251,6 +3344,30 @@ const JSONED: &[(&str, &[&str])] = &[
             "json_exists(col0 JSON, col1 VARCHAR[]) -> BOOLEAN[]",
         ],
     ),
+    ("to_json", &["to_json([ANY...]) -> JSON"]),
+    ("json_quote", &["json_quote([ANY...]) -> JSON"]),
+    ("array_to_json", &["array_to_json([ANY...]) -> JSON"]),
+    ("row_to_json", &["row_to_json([ANY...]) -> JSON"]),
+    ("json_array", &["json_array([ANY...]) -> JSON"]),
+    ("json_object", &["json_object([ANY...]) -> JSON"]),
+    ("json_merge_patch", &["json_merge_patch(col0 JSON, col1 JSON, [JSON...]) -> JSON"]),
+    ("json_deep_merge", &["json_deep_merge(col0 JSON, col1 JSON, [JSON...]) -> JSON"]),
+    ("json_merge_patch_diff", &["json_merge_patch_diff(col0 JSON, col1 JSON) -> JSON"]),
+    ("json_pretty", &["json_pretty(col0 JSON) -> VARCHAR"]),
+    ("json_strip_nulls", &["json_strip_nulls(col0 JSON) -> JSON"]),
+    (
+        "json_contains",
+        &[
+            "json_contains(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN",
+            "json_contains(col0 VARCHAR, col1 JSON) -> BOOLEAN",
+            "json_contains(col0 JSON, col1 VARCHAR) -> BOOLEAN",
+            "json_contains(col0 JSON, col1 JSON) -> BOOLEAN",
+        ],
+    ),
+    (
+        "json_structure",
+        &["json_structure(col0 VARCHAR) -> JSON", "json_structure(col0 JSON) -> JSON"],
+    ),
 ];
 
 /// The names [`JSONED`] has overloads for, which [`jsoned`] decides the types of.
@@ -3267,6 +3384,19 @@ const JSON_NAMES: &[&str] = &[
     "->>",
     "json_value",
     "json_exists",
+    "to_json",
+    "json_quote",
+    "array_to_json",
+    "row_to_json",
+    "json_array",
+    "json_object",
+    "json_merge_patch",
+    "json_deep_merge",
+    "json_merge_patch_diff",
+    "json_pretty",
+    "json_strip_nulls",
+    "json_contains",
+    "json_structure",
 ];
 
 /// The types a `JSON` function reads its arguments as, and the type of its answer.
@@ -3278,6 +3408,31 @@ const JSON_NAMES: &[&str] = &[
 /// which also answers a list, is read by the binder once it has the constant.
 fn jsoned(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
     use LogicalType::{BigInt, Json, Null, Varchar};
+    // A document read whole is a `JSON` and anything else is cast to one, except where the
+    // function also has an overload over strings.
+    let whole = |ty: &LogicalType| match ty {
+        Varchar | Json => ty.clone(),
+        _ => Json,
+    };
+    match (name, arguments) {
+        (
+            "to_json" | "json_quote" | "array_to_json" | "row_to_json" | "json_array"
+            | "json_object",
+            _,
+        ) => {
+            return Some((arguments.to_vec(), Json));
+        }
+        ("json_merge_patch" | "json_deep_merge" | "json_merge_patch_diff", _) => {
+            return Some((vec![Json; arguments.len()], Json));
+        }
+        ("json_pretty", [_]) => return Some((vec![Json], Varchar)),
+        ("json_strip_nulls", [_]) => return Some((vec![Json], Json)),
+        ("json_contains", [haystack, needle]) => {
+            return Some((vec![whole(haystack), whole(needle)], LogicalType::Boolean));
+        }
+        ("json_structure", [document]) => return Some((vec![whole(document)], Json)),
+        _ => {}
+    }
     let (one, takes_path, needs_path) = match name {
         "json" | "json_valid" => {
             (if name == "json" { Json } else { LogicalType::Boolean }, false, false)
@@ -4895,20 +5050,24 @@ fn json_rows(entry: &Entry) -> Vec<FunctionRow> {
         .iter()
         .filter_map(|overload| {
             let (call, returns) = overload.split_once(" -> ")?;
-            let open = call.find("(col0").or_else(|| call.find("(\"json\""))?;
+            let open = call.find("(col0").or_else(|| call.find("(\"json\""));
+            let open = open.or_else(|| call.find("(["))?;
             let inside = &call[open + 1..call.len() - 1];
             let types = inside
                 .split(", ")
                 .filter_map(|argument| argument.split_once(' '))
                 .map(|(_, ty)| ty)
                 .collect();
+            let varargs = inside
+                .split(", ")
+                .find_map(|argument| argument.strip_prefix('[')?.strip_suffix("...]"));
             Some(FunctionRow {
                 name: entry.name,
                 kind: entry.kind,
                 alias_of: None,
                 types,
                 returns,
-                varargs: None,
+                varargs,
             })
         })
         .collect()

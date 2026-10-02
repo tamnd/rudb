@@ -10,7 +10,7 @@
 //!
 //! A document is held flat, every value in one vector and a container holding the positions of
 //! what is in it. Nothing here recurses on the depth of a document, so `[[[[...]]]]` a million deep
-//! is read, written and walked without running out of stack.
+//! is read, written, walked, merged and matched without running out of stack.
 
 use rudb_common::{Error, LogicalType, Result, SessionTimeZone, Value};
 use rudb_vector::Vector;
@@ -567,24 +567,32 @@ impl Document {
 
     /// Writes the value at a position, with a stack of its own for the containers.
     fn write(&self, root: usize, out: &mut String) {
-        // Each entry is a container and how many of its children are written.
-        let mut stack: Vec<(usize, usize)> = Vec::new();
+        self.write_styled(root, Style::default(), out);
+    }
+
+    /// Writes the value at a position in a style, which is how `json_pretty` and
+    /// `json_strip_nulls` share the one writer.
+    fn write_styled(&self, root: usize, style: Style, out: &mut String) {
+        // Each entry is a container, how many of its children have been looked at and how many of
+        // those were written, which differ once a null member is left out.
+        let mut stack: Vec<(usize, usize, usize)> = Vec::new();
         let mut next = Some(root);
         loop {
             if let Some(at) = next.take() {
                 match &self.nodes[at] {
                     Node::Array(_) => {
                         out.push('[');
-                        stack.push((at, 0));
+                        stack.push((at, 0, 0));
                     }
                     Node::Object(_) => {
                         out.push('{');
-                        stack.push((at, 0));
+                        stack.push((at, 0, 0));
                     }
                     node => scalar_text(node, out),
                 }
             }
-            let Some((at, done)) = stack.last_mut() else { return };
+            let depth = stack.len();
+            let Some((at, done, wrote)) = stack.last_mut() else { return };
             let (count, child) = match &self.nodes[*at] {
                 Node::Array(children) => (children.len(), children.get(*done).copied()),
                 Node::Object(children) => {
@@ -593,18 +601,29 @@ impl Document {
                 _ => (0, None),
             };
             if *done == count {
+                if style.pretty && *wrote > 0 {
+                    indent(out, depth - 1);
+                }
                 out.push(if matches!(self.nodes[*at], Node::Array(_)) { ']' } else { '}' });
                 stack.pop();
                 continue;
             }
-            if *done > 0 {
+            let object = matches!(self.nodes[*at], Node::Object(_));
+            *done += 1;
+            if style.strip && object && child.is_some_and(|child| self.nodes[child] == Node::Null) {
+                continue;
+            }
+            if *wrote > 0 {
                 out.push(',');
             }
-            if let Node::Object(children) = &self.nodes[*at] {
-                string_text(&children[*done].0, out);
-                out.push(':');
+            *wrote += 1;
+            if style.pretty {
+                indent(out, depth);
             }
-            *done += 1;
+            if let Node::Object(children) = &self.nodes[*at] {
+                string_text(&children[*done - 1].0, out);
+                out.push_str(if style.pretty { ": " } else { ":" });
+            }
             next = child;
         }
     }
@@ -613,6 +632,23 @@ impl Document {
         let mut out = String::new();
         self.write(at, &mut out);
         out
+    }
+}
+
+/// How a document is written out.
+#[derive(Debug, Clone, Copy, Default)]
+struct Style {
+    /// One value to a line, indented four spaces a level, as yyjson's pretty writer does.
+    pretty: bool,
+    /// Every member of an object whose value is null left out, at any depth.
+    strip: bool,
+}
+
+/// A new line and the indent for a depth.
+fn indent(out: &mut String, depth: usize) {
+    out.push('\n');
+    for _ in 0..depth {
+        out.push_str("    ");
     }
 }
 
@@ -1588,6 +1624,9 @@ fn answer_type(name: &str) -> LogicalType {
 ///
 /// A malformed document, and a path a row holds that the pin refuses.
 pub fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<Option<Value>> {
+    if let Some(answer) = whole(name, args)? {
+        return Ok(Some(answer));
+    }
     if !NAMES.contains(&name) {
         return Ok(None);
     }
@@ -1631,6 +1670,684 @@ pub fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<Option<
         return Ok(Some(Value::List { element: answer_type(name), values }));
     }
     Ok(Some(answer(name, &document, document.find(&path))))
+}
+
+/// The functions that make a document out of values of any type, which need the types and not only
+/// the values, since a string and a `JSON` are both held as text and are written differently.
+pub const BUILDERS: &[&str] =
+    &["to_json", "json_quote", "array_to_json", "row_to_json", "json_array", "json_object"];
+
+/// Calls one of the [`BUILDERS`] on one row, and nothing for a name that is not one of them.
+///
+/// `to_json` and the two that check their argument answer null for a null, where `json_array`
+/// writes a null as `null` and `json_object` refuses one as a key.
+///
+/// # Errors
+///
+/// A null key, and a value that cannot be written as text.
+pub fn build(
+    name: &str,
+    args: &[Value],
+    types: &[LogicalType],
+    zone: Option<SessionTimeZone>,
+) -> Result<Option<Value>> {
+    if !BUILDERS.contains(&name) {
+        return Ok(None);
+    }
+    let mut out = String::new();
+    match name {
+        "json_array" => {
+            out.push('[');
+            for (index, (value, ty)) in args.iter().zip(types).enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                value_text(value, ty, zone, &mut out)?;
+            }
+            out.push(']');
+        }
+        "json_object" => {
+            out.push('{');
+            for (index, pair) in args.chunks(2).zip(types.chunks(2)).enumerate() {
+                let ([key, value], [_, ty]) = pair else { continue };
+                let Value::Varchar(key) = key else {
+                    return Err(Error::invalid_input("JSON key cannot be NULL"));
+                };
+                if index > 0 {
+                    out.push(',');
+                }
+                string_text(key, &mut out);
+                out.push(':');
+                value_text(value, ty, zone, &mut out)?;
+            }
+            out.push('}');
+        }
+        _ => match (args, types) {
+            ([Value::Null], _) | ([], _) => return Ok(Some(Value::Null)),
+            ([value, ..], [ty, ..]) => value_text(value, ty, zone, &mut out)?,
+            _ => return Ok(Some(Value::Null)),
+        },
+    }
+    Ok(Some(Value::Varchar(out)))
+}
+
+/// Calls one of the [`BUILDERS`] on a batch, and nothing for a name that is not one of them.
+///
+/// # Errors
+///
+/// What [`build`] reports.
+pub fn build_vectors<V: AsRef<Vector>>(
+    name: &str,
+    args: &[V],
+    zone: Option<SessionTimeZone>,
+) -> Option<Result<Vector>> {
+    if !BUILDERS.contains(&name) {
+        return None;
+    }
+    let types: Vec<LogicalType> =
+        args.iter().map(|arg| arg.as_ref().logical_type().clone()).collect();
+    let rows = args.first().map_or(1, |arg| arg.as_ref().len());
+    let answer = (|| {
+        let mut row = Vec::with_capacity(args.len());
+        let mut values = Vec::with_capacity(rows);
+        // row at a time: each row is a document written whole from values of any type.
+        for index in 0..rows {
+            row.clear();
+            for arg in args {
+                row.push(arg.as_ref().try_value_at(index)?);
+            }
+            values.push(build(name, &row, &types, zone)?.unwrap_or(Value::Null));
+        }
+        Vector::from_values(LogicalType::Json, &values)
+    })();
+    Some(answer)
+}
+
+/// The functions that read whole documents and answer one, or answer something about them, which
+/// [`call`] answers along with the ones that take a path.
+pub const WHOLE: &[&str] = &[
+    "json_merge_patch",
+    "json_deep_merge",
+    "json_merge_patch_diff",
+    "json_pretty",
+    "json_strip_nulls",
+    "json_contains",
+    "json_structure",
+];
+
+/// One of the [`WHOLE`] functions on one row, and nothing for a name that is not one of them.
+fn whole(name: &str, args: &[Value]) -> Result<Option<Value>> {
+    if !WHOLE.contains(&name) {
+        return Ok(None);
+    }
+    let text = |value: &Value| match value {
+        Value::Varchar(text) => Some(text.clone()),
+        _ => None,
+    };
+    let answer = match (name, args) {
+        ("json_merge_patch" | "json_deep_merge", [first, rest @ ..]) => {
+            let mut merged: Option<(Document, usize)> = match text(first) {
+                Some(first) => Some((document(&first)?, 0)),
+                None => None,
+            };
+            for patch in rest {
+                let patch = match text(patch) {
+                    Some(patch) => document(&patch)?,
+                    None => {
+                        merged = None;
+                        continue;
+                    }
+                };
+                merged = Some(match merged {
+                    None => (patch, 0),
+                    Some((original, root)) => {
+                        let (mut joined, patched) = joined(original, &patch);
+                        let root = if name == "json_merge_patch" {
+                            joined.merge_patch(root, patched)
+                        } else {
+                            joined.deep_merge(root, patched)
+                        };
+                        (joined, root)
+                    }
+                });
+            }
+            merged.map(|(document, root)| Value::Varchar(document.written(root)))
+        }
+        ("json_merge_patch_diff", [old, new]) => match (text(old), text(new)) {
+            (_, None) => None,
+            (None, Some(new)) => Some(Value::Varchar(document(&new)?.minified())),
+            (Some(old), Some(new)) => {
+                let new = document(&new)?;
+                let (mut joined, new) = joined(document(&old)?, &new);
+                let root = joined.diff(0, new);
+                Some(Value::Varchar(joined.written(root)))
+            }
+        },
+        ("json_contains", [haystack, needle]) => match (text(haystack), text(needle)) {
+            (Some(haystack), Some(needle)) => {
+                let needle = document(&needle)?;
+                let (joined, needle) = joined(document(&haystack)?, &needle);
+                Some(Value::Boolean((0..needle).any(|at| joined.fuzzy(at, needle))))
+            }
+            _ => None,
+        },
+        (_, [only]) => match text(only) {
+            None => None,
+            Some(only) => {
+                let document = document(&only)?;
+                let mut out = String::new();
+                match name {
+                    "json_pretty" => {
+                        document.write_styled(0, Style { pretty: true, strip: false }, &mut out);
+                    }
+                    "json_strip_nulls" => {
+                        document.write_styled(0, Style { pretty: false, strip: true }, &mut out);
+                    }
+                    _ => out = document.structure(),
+                }
+                Some(Value::Varchar(out))
+            }
+        },
+        _ => None,
+    };
+    Ok(Some(answer.unwrap_or(Value::Null)))
+}
+
+/// Two documents in one, the second after the first, and where the second's root is now, so that a
+/// value made out of both can point into either without copying.
+fn joined(mut first: Document, second: &Document) -> (Document, usize) {
+    let offset = first.nodes.len();
+    first.nodes.extend(second.nodes.iter().map(|node| match node {
+        Node::Array(children) => Node::Array(children.iter().map(|at| at + offset).collect()),
+        Node::Object(children) => {
+            Node::Object(children.iter().map(|(key, at)| (key.clone(), at + offset)).collect())
+        }
+        other => other.clone(),
+    }));
+    (first, offset)
+}
+
+/// Where one of a document's values comes from while a merge or a diff is put together: a slot
+/// that is to hold the merge of a value, if there is one, with another.
+type Pending = (usize, Option<usize>, usize);
+
+/// An array, or an object, that a needle is being matched against: the needle's child it is on and,
+/// for an array, the haystack's element that child is being tried against.
+#[derive(Debug, Clone, Copy)]
+struct Matching {
+    haystack: usize,
+    needle: usize,
+    looking: usize,
+    trying: usize,
+}
+
+impl Document {
+    fn is_object(&self, at: usize) -> bool {
+        matches!(self.nodes[at], Node::Object(_))
+    }
+
+    fn is_null(&self, at: usize) -> bool {
+        matches!(self.nodes[at], Node::Null)
+    }
+
+    /// The first value an object has for a key, which is the one yyjson finds.
+    fn member(&self, object: usize, key: &str) -> Option<usize> {
+        match &self.nodes[object] {
+            Node::Object(children) => {
+                children.iter().find(|(name, _)| name == key).map(|entry| entry.1)
+            }
+            _ => None,
+        }
+    }
+
+    fn members(&self, object: usize) -> Vec<(String, usize)> {
+        match &self.nodes[object] {
+            Node::Object(children) => children.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn slot(&mut self) -> usize {
+        self.nodes.push(Node::Null);
+        self.nodes.len() - 1
+    }
+
+    /// `json_merge_patch`, which is RFC 7386 when both sides are objects and the patch otherwise,
+    /// as MySQL's is. A null in the patch takes the key out and an object in it merges into what
+    /// the key held, and the keys the patch does not name come first in the order they were in.
+    fn merge_patch(&mut self, original: usize, patch: usize) -> usize {
+        if !self.is_object(original) || !self.is_object(patch) {
+            return patch;
+        }
+        let root = self.slot();
+        let mut pending: Vec<Pending> = vec![(root, Some(original), patch)];
+        while let Some((slot, original, patch)) = pending.pop() {
+            if !self.is_object(patch) {
+                self.nodes[slot] = self.nodes[patch].clone();
+                continue;
+            }
+            let original = original.filter(|&at| self.is_object(at));
+            let mut entries = Vec::new();
+            if let Some(original) = original {
+                for (key, value) in self.members(original) {
+                    if self.member(patch, &key).is_none() {
+                        entries.push((key, value));
+                    }
+                }
+            }
+            for (key, value) in self.members(patch) {
+                if self.is_null(value) {
+                    continue;
+                }
+                let held = original.and_then(|original| self.member(original, &key));
+                let child = self.slot();
+                pending.push((child, held, value));
+                entries.push((key, child));
+            }
+            self.nodes[slot] = Node::Object(entries);
+        }
+        root
+    }
+
+    /// `json_deep_merge`, where a null in the patch keeps what was there rather than taking it out
+    /// and objects on both sides merge.
+    fn deep_merge(&mut self, original: usize, patch: usize) -> usize {
+        if !self.is_object(original) || !self.is_object(patch) {
+            return if self.is_null(patch) { original } else { patch };
+        }
+        let root = self.slot();
+        let mut pending: Vec<Pending> = vec![(root, Some(original), patch)];
+        while let Some((slot, Some(original), patch)) = pending.pop() {
+            let mut entries = Vec::new();
+            for (key, value) in self.members(original) {
+                if self.member(patch, &key).is_none_or(|at| self.is_null(at)) {
+                    entries.push((key, value));
+                }
+            }
+            for (key, value) in self.members(patch) {
+                if self.is_null(value) {
+                    continue;
+                }
+                match self.member(original, &key) {
+                    Some(held) if self.is_object(held) && self.is_object(value) => {
+                        let child = self.slot();
+                        pending.push((child, Some(held), value));
+                        entries.push((key, child));
+                    }
+                    _ => entries.push((key, value)),
+                }
+            }
+            self.nodes[slot] = Node::Object(entries);
+        }
+        root
+    }
+
+    /// `json_merge_patch_diff`, the smallest patch that makes the old document the new one: a key
+    /// taken out is a null, a value that changed is the new one, two objects are the diff of them
+    /// and are left out when it is empty, and a key whose value is the same is left out.
+    fn diff(&mut self, old: usize, new: usize) -> usize {
+        if !self.is_object(old) || !self.is_object(new) {
+            return new;
+        }
+        let root = self.slot();
+        let mut made = Vec::new();
+        let mut pending: Vec<Pending> = vec![(root, Some(old), new)];
+        while let Some((slot, Some(old), new)) = pending.pop() {
+            made.push(slot);
+            let mut entries = Vec::new();
+            for (key, _) in self.members(old) {
+                if self.member(new, &key).is_none() {
+                    let removed = self.slot();
+                    entries.push((key, removed));
+                }
+            }
+            for (key, value) in self.members(new) {
+                match self.member(old, &key) {
+                    Some(held) if self.is_object(held) && self.is_object(value) => {
+                        let child = self.slot();
+                        pending.push((child, Some(held), value));
+                        entries.push((key, child));
+                    }
+                    Some(held) if self.equal(held, value) => {}
+                    _ => entries.push((key, value)),
+                }
+            }
+            self.nodes[slot] = Node::Object(entries);
+        }
+        // An object is made after the one that holds it, so going back over them sees every one
+        // after everything in it, and an object left with nothing in it goes from its parent.
+        let mut empty = vec![false; self.nodes.len()];
+        for &slot in made.iter().rev() {
+            if let Node::Object(entries) = &mut self.nodes[slot] {
+                entries.retain(|(_, at)| !empty[*at]);
+                empty[slot] = entries.is_empty() && slot != root;
+            }
+        }
+        root
+    }
+
+    /// Whether two values are the same as yyjson compares them: numbers by their kind and bits, so
+    /// `1` is not `1.0`, objects by their keys in any order and arrays element by element.
+    fn equal(&self, left: usize, right: usize) -> bool {
+        let mut pending = vec![(left, right)];
+        while let Some((left, right)) = pending.pop() {
+            let same = match (&self.nodes[left], &self.nodes[right]) {
+                (Node::Null, Node::Null) => true,
+                (Node::Bool(a), Node::Bool(b)) => a == b,
+                (Node::Unsigned(a), Node::Unsigned(b)) => a == b,
+                (Node::Signed(a), Node::Signed(b)) => a == b,
+                (Node::Unsigned(a), Node::Signed(b)) | (Node::Signed(b), Node::Unsigned(a)) => {
+                    u64::try_from(*b).is_ok_and(|b| b == *a)
+                }
+                (Node::Real(a), Node::Real(b)) => a.to_bits() == b.to_bits(),
+                (Node::Raw(a), Node::Raw(b)) | (Node::Str(a), Node::Str(b)) => a == b,
+                (Node::Array(a), Node::Array(b)) => {
+                    pending.extend(a.iter().copied().zip(b.iter().copied()));
+                    a.len() == b.len()
+                }
+                (Node::Object(a), Node::Object(b)) => {
+                    a.len() == b.len()
+                        && a.iter().all(|(key, at)| match self.member(right, key) {
+                            Some(other) => {
+                                pending.push((*at, other));
+                                true
+                            }
+                            None => false,
+                        })
+                }
+                _ => false,
+            };
+            if !same {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a needle is in a value the way `json_contains` reads it: the same value, or an
+    /// array with an element in it for each of the needle's, or an object with each of the
+    /// needle's keys holding what the needle's does.
+    fn fuzzy(&self, haystack: usize, needle: usize) -> bool {
+        // `answer` is what the last match that finished said, which the frame under it reads.
+        let mut stack: Vec<Matching> = Vec::new();
+        let mut answer = self.begin(haystack, needle, &mut stack);
+        while let Some(&frame) = stack.last() {
+            let Matching { haystack, needle, mut looking, mut trying } = frame;
+            match (&self.nodes[haystack], &self.nodes[needle]) {
+                (Node::Array(elements), Node::Array(wanted)) => {
+                    match answer.take() {
+                        Some(true) => {
+                            looking += 1;
+                            trying = 0;
+                        }
+                        Some(false) => trying += 1,
+                        None => {}
+                    }
+                    if looking == wanted.len() || trying == elements.len() {
+                        stack.pop();
+                        answer = Some(looking == wanted.len());
+                        continue;
+                    }
+                    *stack.last_mut().expect("the frame is there") =
+                        Matching { haystack, needle, looking, trying };
+                    answer = self.begin(elements[trying], wanted[looking], &mut stack);
+                }
+                (Node::Object(_), Node::Object(wanted)) => {
+                    match answer.take() {
+                        Some(false) => {
+                            stack.pop();
+                            answer = Some(false);
+                            continue;
+                        }
+                        Some(true) => looking += 1,
+                        None => {}
+                    }
+                    let held =
+                        wanted.get(looking).map(|(key, at)| (self.member(haystack, key), *at));
+                    match held {
+                        None => {
+                            stack.pop();
+                            answer = Some(true);
+                        }
+                        Some((None, _)) => {
+                            stack.pop();
+                            answer = Some(false);
+                        }
+                        Some((Some(held), wanted)) => {
+                            *stack.last_mut().expect("the frame is there") =
+                                Matching { haystack, needle, looking, trying };
+                            answer = self.begin(held, wanted, &mut stack);
+                        }
+                    }
+                }
+                _ => {
+                    stack.pop();
+                    answer = Some(false);
+                }
+            }
+        }
+        answer.unwrap_or(false)
+    }
+
+    /// Starts matching a needle against a value, answering at once when the two are equal or cannot
+    /// match, and otherwise pushing the frame that goes through the needle's children.
+    fn begin(&self, haystack: usize, needle: usize, stack: &mut Vec<Matching>) -> Option<bool> {
+        if self.equal(haystack, needle) {
+            return Some(true);
+        }
+        match (&self.nodes[haystack], &self.nodes[needle]) {
+            (Node::Array(_), Node::Array(_)) | (Node::Object(_), Node::Object(_)) => {
+                stack.push(Matching { haystack, needle, looking: 0, trying: 0 });
+                None
+            }
+            _ => Some(false),
+        }
+    }
+}
+
+/// What `json_structure` says one kind of value is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Null,
+    Boolean,
+    UBigInt,
+    BigInt,
+    HugeInt,
+    Double,
+    Varchar,
+    List,
+    Struct,
+}
+
+impl Shape {
+    fn of(node: &Node) -> Self {
+        match node {
+            Node::Null => Self::Null,
+            Node::Bool(_) => Self::Boolean,
+            Node::Unsigned(_) => Self::UBigInt,
+            Node::Signed(_) => Self::BigInt,
+            Node::Real(_) | Node::Raw(_) => Self::Double,
+            Node::Str(_) => Self::Varchar,
+            Node::Array(_) => Self::List,
+            Node::Object(_) => Self::Struct,
+        }
+    }
+
+    fn numeric(self) -> bool {
+        matches!(self, Self::UBigInt | Self::BigInt | Self::HugeInt | Self::Double)
+    }
+
+    /// The number type two different ones meet at, where a signed and an unsigned one need a
+    /// `HUGEINT` between them.
+    fn widest(self, other: Self) -> Self {
+        if self == Self::Double || other == Self::Double {
+            Self::Double
+        } else if self == Self::HugeInt
+            || other == Self::HugeInt
+            || matches!(
+                (self, other),
+                (Self::BigInt, Self::UBigInt) | (Self::UBigInt, Self::BigInt)
+            )
+        {
+            Self::HugeInt
+        } else {
+            Self::BigInt
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Null => "NULL",
+            Self::Boolean => "BOOLEAN",
+            Self::UBigInt => "UBIGINT",
+            Self::BigInt => "BIGINT",
+            Self::HugeInt => "HUGEINT",
+            Self::Double => "DOUBLE",
+            Self::Varchar => "VARCHAR",
+            Self::List => "LIST",
+            Self::Struct => "STRUCT",
+        }
+    }
+}
+
+/// One kind of value seen at a place in a document, and for a list or a struct where its element or
+/// its fields are described.
+#[derive(Debug)]
+struct Described {
+    shape: Shape,
+    element: Option<usize>,
+    fields: Vec<(String, usize)>,
+}
+
+/// Every kind of value seen at one place, in the order they were first seen. More than one kind is
+/// a `JSON` in the answer.
+#[derive(Debug, Default)]
+struct Place {
+    kinds: Vec<Described>,
+}
+
+/// The places of a structure, the root first.
+#[derive(Debug)]
+struct Structure {
+    places: Vec<Place>,
+}
+
+impl Structure {
+    fn place(&mut self) -> usize {
+        self.places.push(Place::default());
+        self.places.len() - 1
+    }
+
+    /// The kind a value of a shape is at a place, which is the pin's rules: a null alone is replaced
+    /// by what comes next, a null after anything is not recorded, and two numbers are one kind.
+    fn kind(&mut self, place: usize, shape: Shape) -> usize {
+        let kinds = &mut self.places[place].kinds;
+        let fresh = Described { shape, element: None, fields: Vec::new() };
+        if kinds.is_empty() {
+            kinds.push(fresh);
+            return 0;
+        }
+        if kinds.len() == 1 && kinds[0].shape == Shape::Null {
+            kinds[0].shape = shape;
+            return 0;
+        }
+        if shape == Shape::Null {
+            return kinds.len() - 1;
+        }
+        for (index, kind) in kinds.iter_mut().enumerate() {
+            if kind.shape == shape {
+                return index;
+            }
+            if shape.numeric() && kind.shape.numeric() {
+                kind.shape = shape.widest(kind.shape);
+                return index;
+            }
+        }
+        kinds.push(fresh);
+        kinds.len() - 1
+    }
+}
+
+impl Document {
+    /// `json_structure`: the type of every place in the document, as the pin infers it when it
+    /// reads one, with a list's elements merged into one and the objects at a place merged into
+    /// one struct whose fields are every key any of them has.
+    fn structure(&self) -> String {
+        let mut structure = Structure { places: vec![Place::default()] };
+        // In the order a walk down the document meets values, which is the order the pin sees
+        // them in and so the order the keys of a struct come in.
+        let mut pending = vec![(0, 0)];
+        while let Some((at, place)) = pending.pop() {
+            let shape = Shape::of(&self.nodes[at]);
+            let kind = structure.kind(place, shape);
+            match &self.nodes[at] {
+                Node::Array(children) => {
+                    let element = match structure.places[place].kinds[kind].element {
+                        Some(element) => element,
+                        None => {
+                            let element = structure.place();
+                            structure.places[place].kinds[kind].element = Some(element);
+                            element
+                        }
+                    };
+                    pending.extend(children.iter().rev().map(|&child| (child, element)));
+                }
+                Node::Object(children) => {
+                    let mut found = Vec::with_capacity(children.len());
+                    for (key, child) in children {
+                        let known = structure.places[place].kinds[kind]
+                            .fields
+                            .iter()
+                            .find(|(name, _)| name == key)
+                            .map(|field| field.1);
+                        let field = match known {
+                            Some(field) => field,
+                            None => {
+                                let field = structure.place();
+                                structure.places[place].kinds[kind]
+                                    .fields
+                                    .push((key.clone(), field));
+                                field
+                            }
+                        };
+                        found.push((*child, field));
+                    }
+                    pending.extend(found.into_iter().rev());
+                }
+                _ => {}
+            }
+        }
+        // The answer is a document of its own, one node for each place, written by the writer.
+        let mut answer = Document { nodes: vec![Node::Null] };
+        let mut pending = vec![(0, 0)];
+        while let Some((place, slot)) = pending.pop() {
+            let kinds = &structure.places[place].kinds;
+            let named = |name: &str| Node::Str(name.to_string());
+            answer.nodes[slot] = match kinds.as_slice() {
+                [] => named("NULL"),
+                [kind] => match kind.shape {
+                    Shape::List => {
+                        let child = answer.slot();
+                        pending.push((kind.element.unwrap_or_default(), child));
+                        Node::Array(vec![child])
+                    }
+                    Shape::Struct if kind.fields.is_empty() => named("JSON"),
+                    Shape::Struct => {
+                        let mut entries = Vec::with_capacity(kind.fields.len());
+                        for (key, field) in &kind.fields {
+                            let child = answer.slot();
+                            pending.push((*field, child));
+                            entries.push((key.clone(), child));
+                        }
+                        Node::Object(entries)
+                    }
+                    shape => named(shape.name()),
+                },
+                _ => named("JSON"),
+            };
+        }
+        answer.minified()
+    }
 }
 
 #[cfg(test)]
