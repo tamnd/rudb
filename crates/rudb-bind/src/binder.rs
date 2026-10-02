@@ -3537,9 +3537,7 @@ impl<'a> Binder<'a> {
             return Err(Error::binder("aggregate functions are not allowed in FILTER"));
         }
         if self.in_aggregate {
-            return Err(Error::binder(format!(
-                "aggregate function calls cannot be nested, and {name}() is inside one"
-            )));
+            return Err(Error::binder("aggregate function calls cannot be nested"));
         }
         if self.aggregation.is_none() {
             // A join condition is the `WHERE` clause here too, the way it is for a window.
@@ -3988,6 +3986,13 @@ impl<'a> Binder<'a> {
 
         let types: Vec<LogicalType> =
             parts.args.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
+        // Upstream refuses this once the arguments are bound and before it looks for an overload,
+        // so it is said even of an aggregate the arguments do not fit.
+        if ignore_nulls && kind_of(name) == Some(FunctionKind::Aggregate) {
+            return Err(Error::binder(
+                "RESPECT/IGNORE NULLS is not supported for windowed aggregates",
+            ));
+        }
         let resolved = window_signature(name, &types)?;
         // `fill` reads the sort key rather than the frame, so what it needs from the query is not
         // what any other window needs and it is refused on its own terms.

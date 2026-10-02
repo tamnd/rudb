@@ -66,7 +66,7 @@
 use crate::ast::{
     Ast, BinaryOp, CaseArm, CreateViewRef, Distinct, Expr, ExprRef, JoinKind, LiteralKind, Nulls,
     Order, OrderItem, Quantifier, QueryBody, QueryRef, SelectRef, SetOp, Slice, Source, SourceRef,
-    StrRef, Target, UnaryOp, WindowBound, WindowExclude, WindowUnit,
+    StrRef, Target, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowUnit,
 };
 use crate::matcher::NONE;
 use crate::tokenize::quoted;
@@ -712,7 +712,8 @@ fn argument_list(ast: &Ast, list: &[ExprRef], named: &[Target]) -> String {
 ///
 /// The word `WHERE` is always printed even when it was not written, because upstream prints it: a
 /// view defined with `FILTER (x > 1)` comes back with `FILTER (WHERE (x > 1))`.
-fn filtered(ast: &Ast, filter: ExprRef) -> String {
+#[must_use]
+pub fn filtered(ast: &Ast, filter: ExprRef) -> String {
     if filter == NONE { String::new() } else { format!(" FILTER (WHERE {})", expr(ast, filter)) }
 }
 
@@ -751,11 +752,18 @@ fn window(ast: &Ast, index: ExprRef, held: Expr) -> String {
         && matches!(ast.expr(list[0]), Expr::Star { qualifier, replacements }
             if qualifier.is_empty() && replacements.is_empty());
     let inner = if bare { String::new() } else { argument_list(ast, list, named) };
-    let call = format!(
-        "{}({word}{inner}{sorted}{nulls}){}",
+    format!(
+        "{}({word}{inner}{sorted}{nulls}){} {}",
         operator(ast, name, &written),
-        filtered(ast, filter)
-    );
+        filtered(ast, filter),
+        over(ast, spec)
+    )
+}
+
+/// The `OVER (...)` of a window call, which the expansion of a macro written with one puts after
+/// the aggregate in its body.
+#[must_use]
+pub fn over(ast: &Ast, spec: WindowRef) -> String {
     let held = ast.window(spec);
     let mut inside: Vec<String> = Vec::new();
     if !held.partition.is_empty() {
@@ -782,7 +790,7 @@ fn window(ast: &Ast, index: ExprRef, held: Expr) -> String {
         };
         inside.push(frame);
     }
-    format!("{call} OVER ({})", inside.join(" "))
+    format!("OVER ({})", inside.join(" "))
 }
 
 /// One end of a window frame.
