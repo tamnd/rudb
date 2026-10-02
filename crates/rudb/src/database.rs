@@ -2056,8 +2056,19 @@ fn replay_span(
     std::thread::scope(|scope| {
         let (send, receive) = std::sync::mpsc::sync_channel(1);
         scope.spawn(move || {
-            for (run, records) in span.chunks(DECODE_RUN).enumerate() {
-                let decoded = decode_run(tables, &of[run * DECODE_RUN..], records, workers);
+            let mut start = 0;
+            while start < span.len() {
+                let mut end = start;
+                let mut bytes = 0;
+                while end < span.len()
+                    && end - start < DECODE_RUN
+                    && (end - start < workers || bytes < DECODE_BYTES)
+                {
+                    bytes += span[end].size();
+                    end += 1;
+                }
+                let decoded = decode_run(tables, &of[start..], &span[start..end], workers);
+                start = end;
                 let failed = decoded.is_err();
                 // A closed channel is the applying side stopping on an error of its own.
                 if send.send(decoded).is_err() || failed {
@@ -2117,10 +2128,15 @@ fn decode_run(
     Ok(decoded)
 }
 
-/// How many row changes are decoded together, the unit the decoding thread hands over. Small
-/// enough that the appends start soon after the open does, and large enough that each of the
-/// decoding threads gets a few dozen records of it.
+/// The most row changes decoded together, the unit the decoding thread hands over. Small enough
+/// that the appends start soon after the open does, and large enough that each of the decoding
+/// threads gets a few dozen records of it.
 const DECODE_RUN: usize = 512;
+
+/// How many bytes of the log a run stops at once each decoding thread has a record of it. A run
+/// counted only in records waited for 512 of them however large they were, and a log of 50,000
+/// row inserts held its first 41 million rows back from the appends while they were decoded.
+const DECODE_BYTES: usize = 16 << 20;
 
 /// How many replayed inserts into one table go in as one append.
 const APPEND_BATCH: usize = 256;

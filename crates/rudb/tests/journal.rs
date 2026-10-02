@@ -84,25 +84,42 @@ fn inserted_rows_survive_a_crash_before_any_checkpoint_and_replay_once() {
 }
 
 /// One statement logs all its rows in one record, which can be more rows than a chunk holds, and
-/// the open that replays it cuts them back into chunks.
+/// the open that replays it cuts them back into chunks, nulls and long strings with them.
 #[test]
 fn an_insert_of_more_rows_than_a_chunk_holds_is_replayed_after_a_crash() {
     let path = path("wide-insert");
     let db = open(&path);
-    db.execute("CREATE TABLE t AS SELECT range AS id, 'x' || range AS s FROM range(10)")
-        .expect("creates");
-    db.execute("INSERT INTO t SELECT range + 10, 'y' || range FROM range(50000)").expect("inserts");
+    db.execute(
+        "CREATE TABLE t AS SELECT range AS id, 'x' || range AS s, range AS n FROM range(10)",
+    )
+    .expect("creates");
+    db.execute(
+        "INSERT INTO t SELECT range + 10, CASE WHEN range % 11 = 5 THEN NULL WHEN range % 3 = 0 \
+         THEN 'a string longer than a view holds ' || range ELSE 'y' || range END, \
+         CASE WHEN range % 7 = 0 THEN NULL ELSE range END FROM range(50000)",
+    )
+    .expect("inserts");
     assert!(segments(&path) > 0, "the insert went to the log");
     crash(db);
 
     let db = open(&path);
+    let texts = 10 + (0..50_000).filter(|row| row % 11 != 5).count() as i64;
+    let numbers = (0..50_000_i128).filter(|row| row % 7 != 0);
     let want = vec![vec![
         Value::BigInt(50_010),
         Value::HugeInt((0..50_010).sum()),
         Value::Varchar("y49999".into()),
+        Value::Varchar("a string longer than a view holds 49998".into()),
+        Value::BigInt(texts),
+        Value::BigInt(10 + numbers.clone().count() as i64),
+        Value::HugeInt(45 + numbers.sum::<i128>()),
     ]];
     assert_eq!(
-        rows(&db, "SELECT count(*), sum(id), max(s) FILTER (WHERE id = 50009) FROM t"),
+        rows(
+            &db,
+            "SELECT count(*), sum(id), max(s) FILTER (WHERE id = 50009), \
+             max(s) FILTER (WHERE id = 50008), count(s), count(n), sum(n) FROM t"
+        ),
         want
     );
     drop(db);
