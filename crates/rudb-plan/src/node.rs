@@ -228,9 +228,9 @@ pub enum Node {
     /// back beside their outer row sit above this and read the domain columns where it reads them
     /// everywhere else.
     ///
-    /// Only the series family reaches here. A reader takes a file name, the binder settles the
-    /// columns by opening the file, and a name that is not a constant is refused there, so a
-    /// correlated `read_csv` never gets this far.
+    /// Only the series family, `unnest` and the two document walks reach here. A reader takes a file
+    /// name, the binder settles the columns by opening the file, and a name that is not a constant
+    /// is refused there, so a correlated `read_csv` never gets this far.
     LateralFunction {
         /// The rows the call is made against, one call per row.
         input: NodeRef,
