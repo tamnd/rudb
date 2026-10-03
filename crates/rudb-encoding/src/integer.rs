@@ -894,25 +894,33 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<i64>> {
             // the frame of reference base and put the value it belongs to where it goes, so there
             // is no unit of raw offsets in between and no second pass to fold the base back in, and
             // both read the packed bytes where the chunk put them rather than through a copy.
-            let mut values = vec![0i64; count];
-            let mut done = 0;
-            while done < count {
+            //
+            // A whole unit is unpacked on the stack and appended, rather than into a vector of
+            // zeroes. The allocator writes those zeroes itself, so the buffer was written twice,
+            // and on ClickBench 23, where the token lengths and offsets of every text block come
+            // through here, that zeroing was 8 percent of the query.
+            let mut values = Vec::with_capacity(count);
+            if count >= VALUES {
+                let mut unit = [0i64; VALUES];
+                while count - values.len() >= VALUES {
+                    let base = reader.i64()?;
+                    let width = reader.u8()? as usize;
+                    let packed = reader.bytes(bitpack::unit_len(width))?;
+                    bitpack::unpack_unit_into(packed, width, &mut unit, |offset| {
+                        value_from(offset, base)
+                    })?;
+                    values.extend_from_slice(&unit);
+                }
+            }
+            if values.len() < count {
                 let base = reader.i64()?;
                 let width = reader.u8()? as usize;
-                let wanted = (count - done).min(VALUES);
-                let into = &mut values[done..done + wanted];
-                if wanted == VALUES {
-                    let unit = reader.bytes(bitpack::unit_len(width))?;
-                    bitpack::unpack_unit_into(unit, width, into, |offset| {
-                        value_from(offset, base)
-                    })?;
-                } else {
-                    let bytes = reader.bytes(bitpack::tail_len(wanted, width))?;
-                    bitpack::unpack_tail_into(bytes, width, into, |offset| {
-                        value_from(offset, base)
-                    })?;
-                }
-                done += wanted;
+                let at = values.len();
+                let bytes = reader.bytes(bitpack::tail_len(count - at, width))?;
+                values.resize(count, 0);
+                bitpack::unpack_tail_into(bytes, width, &mut values[at..], |offset| {
+                    value_from(offset, base)
+                })?;
             }
             Ok(values)
         }
@@ -1105,46 +1113,50 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>) -> Result<Vec<T>> {
     match kind {
         Kind::Constant => Ok(vec![lane(reader.i64()?)?; count]),
         Kind::Packed => {
-            let mut values = vec![T::default(); count];
-            let mut wide = [0i64; VALUES];
-            let mut done = 0;
-            while done < count {
-                let base = reader.i64()?;
-                let width = reader.u8()? as usize;
-                let wanted = (count - done).min(VALUES);
-                let into = &mut values[done..done + wanted];
-                let whole = wanted == VALUES;
-                let bytes = if whole {
-                    reader.bytes(bitpack::unit_len(width))?
-                } else {
-                    reader.bytes(bitpack::tail_len(wanted, width))?
-                };
-                // Every value of a block is between its base and the base plus the widest offset its
-                // width holds, so when both ends fit the whole block does and the unpack writes the
-                // target type with no check a value. A block that could hold more than the type,
-                // which a width rounded up past the range can, is unpacked wide and checked.
-                let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
-                let top = i64::try_from(i128::from(base) + i128::from(mask)).ok();
-                if T::fit(base).is_some() && top.and_then(T::fit).is_some() {
-                    let map = |offset| T::wrap(value_from(offset, base));
-                    if whole {
-                        bitpack::unpack_unit_into(bytes, width, into, map)?;
+            // Whole units are unpacked on the stack and appended, for the reason
+            // [`decode_chunk`] gives.
+            let mut values = Vec::with_capacity(count);
+            if count >= VALUES {
+                let mut narrow = [T::default(); VALUES];
+                let mut wide = [0i64; VALUES];
+                while count - values.len() >= VALUES {
+                    let base = reader.i64()?;
+                    let width = reader.u8()? as usize;
+                    let bytes = reader.bytes(bitpack::unit_len(width))?;
+                    if packed_fits::<T>(base, width) {
+                        bitpack::unpack_unit_into(bytes, width, &mut narrow, |offset| {
+                            T::wrap(value_from(offset, base))
+                        })?;
+                        values.extend_from_slice(&narrow);
                     } else {
-                        bitpack::unpack_tail_into(bytes, width, into, map)?;
-                    }
-                } else {
-                    let wide = &mut wide[..wanted];
-                    let map = |offset| value_from(offset, base);
-                    if whole {
-                        bitpack::unpack_unit_into(bytes, width, wide, map)?;
-                    } else {
-                        bitpack::unpack_tail_into(bytes, width, wide, map)?;
-                    }
-                    for (value, &held) in into.iter_mut().zip(wide.iter()) {
-                        *value = lane(held)?;
+                        bitpack::unpack_unit_into(bytes, width, &mut wide, |offset| {
+                            value_from(offset, base)
+                        })?;
+                        for &held in &wide {
+                            values.push(lane(held)?);
+                        }
                     }
                 }
-                done += wanted;
+            }
+            if values.len() < count {
+                let base = reader.i64()?;
+                let width = reader.u8()? as usize;
+                let at = values.len();
+                let bytes = reader.bytes(bitpack::tail_len(count - at, width))?;
+                if packed_fits::<T>(base, width) {
+                    values.resize(count, T::default());
+                    bitpack::unpack_tail_into(bytes, width, &mut values[at..], |offset| {
+                        T::wrap(value_from(offset, base))
+                    })?;
+                } else {
+                    let mut wide = vec![0i64; count - at];
+                    bitpack::unpack_tail_into(bytes, width, &mut wide, |offset| {
+                        value_from(offset, base)
+                    })?;
+                    for held in wide {
+                        values.push(lane(held)?);
+                    }
+                }
             }
             Ok(values)
         }
@@ -1177,6 +1189,18 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>) -> Result<Vec<T>> {
             Err(Error::internal("a chunk kind that decodes wide reached the narrow decoder"))
         }
     }
+}
+
+/// Whether every value a packed block with this base and width can hold fits `T`.
+///
+/// Every value of a block is between its base and the base plus the widest offset its width holds,
+/// so when both ends fit the whole block does and the unpack writes the target type with no check a
+/// value. A block that could hold more than the type, which a width rounded up past the range can,
+/// is unpacked wide and checked.
+fn packed_fits<T: Lane>(base: i64, width: usize) -> bool {
+    let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let top = i64::try_from(i128::from(base) + i128::from(mask)).ok();
+    T::fit(base).is_some() && top.and_then(T::fit).is_some()
 }
 
 fn decode_selected_chunk(reader: &mut Reader<'_>, positions: &[usize]) -> Result<Vec<i64>> {
