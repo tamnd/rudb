@@ -44,6 +44,12 @@ const FAR: u64 = 1024;
 /// A row within a bucket fits a `u16`, so this is at most its range.
 const BUCKET_ROWS: usize = 1 << 16;
 
+/// How many lists [`Adjacency::push`] has asked memory for before it reads the first of them.
+///
+/// Enough to cover a trip to memory with the work of reading the lists in between, which is a few
+/// dozen nanoseconds a list.
+const AHEAD: usize = 16;
+
 /// Bytes of fixed header at the front of a backward adjacency payload.
 ///
 /// `children`, `parents`, `edges`, then the width, the layout and padding to an eight byte boundary.
@@ -223,8 +229,8 @@ impl Adjacency {
     /// If `held` is not a set over the parent table.
     pub fn push(&self, held: &Rids) -> Result<Rids> {
         let mut words = vec![0_u64; usize::try_from(self.children.div_ceil(64)).unwrap_or(0)];
-        let mut buckets = vec![Vec::new(); words.len().div_ceil(BUCKET_ROWS / 64)];
-        self.lists(held, |list| {
+        let mut buckets: Vec<Vec<u16>> = vec![Vec::new(); words.len().div_ceil(BUCKET_ROWS / 64)];
+        let mut deal = |list: std::ops::Range<usize>| -> Result<()> {
             for at in list {
                 let child = bitpack::tail_at(&self.rows, self.width, at)?;
                 let bucket = buckets
@@ -234,7 +240,23 @@ impl Adjacency {
                 bucket.push((child % BUCKET_ROWS as u64) as u16);
             }
             Ok(())
+        };
+        // A list is asked for from memory when the walk reaches it and read [`AHEAD`] lists later.
+        // The lists of a sparse set of parents are a cache line or two each, megabytes apart, and
+        // read where the walk found them every one was a wait on memory. On JOB 17f that was most
+        // of the push, which was a sixth of the query. Which order the lists are dealt in does not
+        // matter, because each child is a bit.
+        let mut waiting: [std::ops::Range<usize>; AHEAD] = std::array::from_fn(|_| 0..0);
+        let mut next = 0;
+        self.lists(held, |list| {
+            self.ask(&list);
+            let due = std::mem::replace(&mut waiting[next], list);
+            next = (next + 1) % AHEAD;
+            deal(due)
         })?;
+        for list in waiting {
+            deal(list)?;
+        }
         for (words, bucket) in words.chunks_mut(BUCKET_ROWS / 64).zip(&buckets) {
             for &row in bucket {
                 let row = usize::from(row);
@@ -243,6 +265,20 @@ impl Adjacency {
             }
         }
         Rids::from_words(self.children, words)
+    }
+
+    /// Asks for the cache lines the packed rows of `list` start and end in, ahead of reading them.
+    ///
+    /// Most lists are one or two lines. One longer than that is read in order, and the hardware
+    /// sees that and fetches what is between for itself.
+    fn ask(&self, list: &std::ops::Range<usize>) {
+        let rows: &[u8] = &self.rows;
+        let first = list.start.saturating_mul(self.width) / 8;
+        let end = list.end.saturating_mul(self.width).div_ceil(8).min(rows.len());
+        if first < end {
+            prefetch(&rows[first]);
+            prefetch(&rows[end - 1]);
+        }
     }
 
     /// Hands `each` the list of every member of `held`, in rising order of parent.
@@ -374,6 +410,20 @@ fn number(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| malformed("a header is torn"))?))
 }
 
+/// Asks for the cache line that holds `byte`, without waiting for it.
+#[inline]
+fn prefetch(byte: &u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is a hint. It reads nothing into the program and does not fault whatever
+    // the address, and this one is of a byte the caller holds a reference to anyway.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+            std::ptr::from_ref(byte).cast::<i8>(),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = byte;
+}
 fn malformed(message: impl Into<String>) -> Error {
     Error::invalid_input(format!("invalid rudb backward adjacency: {}", message.into()))
 }
@@ -452,6 +502,24 @@ mod tests {
         let pushed = adjacency.push(&held).expect("push");
         assert_eq!(pushed.iter().collect::<Vec<_>>(), expected);
         assert_eq!(adjacency.reached(&held).expect("reached"), count(expected.len()));
+    }
+
+    #[test]
+    fn a_push_of_more_members_than_it_reads_ahead_misses_none_of_them() {
+        // Every third parent, so the lists asked for ahead fill the window many times over, and a
+        // count that is not a multiple of the window, so the drain at the end has some left.
+        let (parents_of, parents) = scattered();
+        let adjacency = Adjacency::build(&parents_of, parents).expect("build");
+        let members: Vec<Rid> = (0..parents).step_by(3).collect();
+        assert!(members.len() > AHEAD && members.len() % AHEAD != 0);
+        let held = Rids::from_sorted(parents, members.clone()).expect("held");
+        let mut expected = Vec::new();
+        for &member in &members {
+            adjacency.children_of(member, &mut expected).expect("list");
+        }
+        expected.sort_unstable();
+        let pushed = adjacency.push(&held).expect("push");
+        assert_eq!(pushed.iter().collect::<Vec<_>>(), expected);
     }
 
     #[test]
