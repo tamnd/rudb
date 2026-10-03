@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use rudb_io::{Crash, Filesystem, Op, OpenMode, SimFilesystem};
 
@@ -431,6 +432,51 @@ fn committers_on_many_threads_share_syncs() {
     let stats = lane.stats();
     assert_eq!(stats.commits, 400);
     assert!(stats.syncs <= 400);
+}
+
+#[test]
+fn a_waiter_spins_through_a_short_turn_and_parks_for_a_long_one() {
+    for (sync, delay, spin) in [
+        (CommitSync::Os, Duration::ZERO, true),
+        (CommitSync::Full, Duration::from_millis(2), false),
+    ] {
+        let sim = SimFilesystem::new();
+        sim.slow_syncs(delay);
+        let lane = Arc::new(
+            Lane::open(
+                Arc::new(sim.clone()),
+                &dir(),
+                Options { segment_bytes: 1 << 20, spare_ahead: false, ..options(sync) },
+            )
+            .expect("the lane opens"),
+        );
+        let threads: Vec<_> = (0..4_u64)
+            .map(|thread| {
+                let lane = Arc::clone(&lane);
+                thread::spawn(move || {
+                    for n in 0..100 {
+                        lane.commit(&block(thread * 1000 + n)).expect("commit");
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("the committer finishes");
+        }
+        lane.flush().expect("flushes");
+        let mut read = txns(&sim.crash(&Crash::LosingUnsynced));
+        read.sort_unstable();
+        assert_eq!(read.len(), 400, "{sync:?}");
+        let stats = lane.stats();
+        // A spin that runs out parks, which a loaded machine can make happen on a short turn too,
+        // and the first waiter spins before the lane has timed a turn, so only the side that cannot
+        // happen by chance is checked.
+        if spin {
+            assert!(stats.spun > 0 || stats.parked == 0, "{stats:?}");
+        } else {
+            assert!(stats.parked > stats.spun, "{stats:?}");
+        }
+    }
 }
 
 /// Waits for the lane's thread to have made `count` spares in all, which on the simulated file

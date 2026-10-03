@@ -14,6 +14,12 @@
 //! before the first write to the new one, so replay can treat a bad record as the end of its
 //! segment and still read the next one.
 //!
+//! A committer whose blocks went to a leader already at the disk waits for that leader the way
+//! `13-the-point-path.md` section 13.7 says: when the lane's recent turns at the disk took under
+//! [`SPIN_UNDER`], it spins on the count of turns, because parking and waking a thread would be a
+//! large share of a commit that short, and otherwise it parks on the lane's condition variable and
+//! the leader wakes everyone at once. A spin that runs out parks all the same.
+//!
 //! Filling a segment with zeros and syncing it is the slow part, and a commit that starts one would
 //! otherwise do it while every committer behind it waits. So the lane keeps a couple of spares, the
 //! segments a checkpoint retired or ones a thread of its own filled with zeros ahead of time, and a
@@ -21,8 +27,10 @@
 
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use rudb_common::{Error, Result};
 use rudb_io::{File, Filesystem, OpenMode};
@@ -42,6 +50,10 @@ const SPARES: usize = 2;
 /// The first sequence a spare the lane made itself is named under. A segment's sequence counts up
 /// from 1 and never gets near it, so such a spare's name is never one a retired segment takes.
 const MADE: u64 = 1 << 63;
+
+/// A leader's turn at the disk shorter than this, on the lane's recent average, is one a waiter
+/// spins through rather than parks for, `13-the-point-path.md` section 13.7.
+const SPIN_UNDER: Duration = Duration::from_micros(50);
 
 /// What a commit waits for before it returns, the `commit_sync` setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -256,6 +268,10 @@ pub struct Stats {
     pub recycled: u64,
     /// Spares the lane filled with zeros on a thread of its own.
     pub made: u64,
+    /// Waits for another committer's turn at the disk that spun until it ended.
+    pub spun: u64,
+    /// Waits that parked until it did.
+    pub parked: u64,
 }
 
 /// An encoded block waiting for a leader to write it.
@@ -349,6 +365,11 @@ pub struct Lane {
     options: Options,
     state: Arc<Mutex<State>>,
     changed: Condvar,
+    /// How many turns leaders have finished at the disk, raised under the lock before the wake,
+    /// which is what a spinning waiter watches.
+    turns: AtomicU64,
+    /// The recent average of a turn in nanoseconds, which says whether to spin.
+    turn_ns: AtomicU64,
     /// The thread making spares ahead, joined before another starts and when the lane stops.
     maker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -420,6 +441,8 @@ impl Lane {
                 stopped: false,
             })),
             changed: Condvar::new(),
+            turns: AtomicU64::new(0),
+            turn_ns: AtomicU64::new(0),
             maker: Mutex::new(None),
         };
         let file = lane.create_segment(sequence)?;
@@ -659,7 +682,7 @@ impl Lane {
                 return Ok(end);
             }
             if state.flushing {
-                state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+                state = self.await_turn(state);
                 continue;
             }
             let Some(mut open) = state.open.take() else {
@@ -671,7 +694,11 @@ impl Lane {
             let pieces = mem::take(&mut state.pending);
             let written = state.written;
             drop(state);
+            let started = Instant::now();
             let outcome = self.lead(&mut open, &pieces, written, reach);
+            let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let average = self.turn_ns.load(Ordering::Relaxed);
+            self.turn_ns.store(average - average / 4 + took / 4, Ordering::Relaxed);
             drop(pieces);
             state = self.lock();
             state.flushing = false;
@@ -696,8 +723,40 @@ impl Lane {
                 }
                 Err(error) => state.failed = Some(error.to_string()),
             }
+            self.turns.fetch_add(1, Ordering::Release);
             self.changed.notify_all();
         }
+    }
+
+    /// Waits for the leader at the disk to finish its turn, spinning when turns are short and
+    /// parking otherwise, and hands the lock back for the caller to look again.
+    ///
+    /// A leader raises `turns` holding the lock and wakes the parked after, so a waiter that looks
+    /// under the lock and finds the count unchanged parks before the wake and cannot miss it.
+    fn await_turn<'a>(&'a self, state: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
+        let seen = self.turns.load(Ordering::Acquire);
+        let mut state = state;
+        let average = Duration::from_nanos(self.turn_ns.load(Ordering::Relaxed));
+        if average < SPIN_UNDER {
+            drop(state);
+            let started = Instant::now();
+            let mut spins = 0_u32;
+            while self.turns.load(Ordering::Acquire) == seen {
+                spins = spins.wrapping_add(1);
+                // The clock is read every so often, a spin being far shorter than a read of it.
+                if spins.is_multiple_of(64) && started.elapsed() >= SPIN_UNDER {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            state = self.lock();
+            if self.turns.load(Ordering::Acquire) != seen || !state.flushing {
+                state.stats.spun += 1;
+                return state;
+            }
+        }
+        state.stats.parked += 1;
+        self.changed.wait(state).unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Writes `pieces`, which start at lane position `written`, a segment's run at a time, and
