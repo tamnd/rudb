@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use crate::deletes::{DeleteVector, PART_ROWS, PART_WORDS, Refusal};
 use crate::hot::{HotStripe, Lease, Width};
 use crate::park::Wait;
-use crate::undo::{UndoBuffer, UndoSpace};
+use crate::undo::{Heads, UndoBuffer, UndoRef, UndoSpace};
 
 /// A row's place: its stripe id in the high 32 bits and its slot in the low 32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -181,6 +181,8 @@ pub struct StripeDirectory {
     next: AtomicU32,
     widths: Arc<[Width]>,
     undos: Arc<UndoSpace>,
+    /// The table's id, which its stripes' undo records name.
+    table: u32,
 }
 
 impl StripeDirectory {
@@ -193,7 +195,15 @@ impl StripeDirectory {
             next: AtomicU32::new(0),
             widths: widths.into(),
             undos,
+            table: 0,
         }
+    }
+
+    /// The same table with id `table`, which its undo records are held to the horizon of.
+    #[must_use]
+    pub fn in_table(mut self, table: u32) -> Self {
+        self.table = table;
+        self
     }
 
     /// The stripes as they are now, for a scan to keep.
@@ -230,7 +240,10 @@ impl StripeDirectory {
                 continue;
             }
             let id = self.next.fetch_add(1, Ordering::Relaxed);
-            let hot = Arc::new(HotStripe::with_undo(id, &self.widths, Arc::clone(&self.undos)));
+            let hot = Arc::new(
+                HotStripe::with_undo(id, &self.widths, Arc::clone(&self.undos))
+                    .in_table(self.table),
+            );
             let mut next = guard.to_vec();
             next.push(Stripe::Hot(Arc::clone(&hot)));
             *guard = next.into();
@@ -366,6 +379,17 @@ impl StripeDirectory {
         next.push(make(id));
         *guard = next.into();
         id
+    }
+}
+
+impl Heads for StripeDirectory {
+    fn unlink(&self, table: u32, rid: u64, record: UndoRef, older: bool) {
+        let rid = Rid::from_u64(rid);
+        if table == self.table
+            && let Some(Stripe::Hot(stripe)) = self.find(rid.stripe())
+        {
+            stripe.unlink(rid.slot(), record, older);
+        }
     }
 }
 

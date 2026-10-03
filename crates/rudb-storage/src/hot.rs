@@ -34,7 +34,7 @@ use rudb_common::Error;
 use crate::arena::{Arena, Place, Space};
 use crate::deletes::{PART_ROWS, PART_WORDS, Refusal, STRIPE_ROWS, UNCOMMITTED};
 use crate::park::{self, Wait};
-use crate::undo::{Image, UndoBuffer, UndoKind, UndoRef, UndoSpace};
+use crate::undo::{ABORTED, Image, Row, UndoBuffer, UndoKind, UndoRef, UndoSpace};
 
 /// Parts in a stripe.
 pub const PARTS: usize = (STRIPE_ROWS / PART_ROWS) as usize;
@@ -59,12 +59,6 @@ pub(crate) const WAITERS: u64 = 1 << 62;
 
 /// The lock word's bit for a row an uncommitted delta names.
 pub(crate) const DELTA: u64 = 1 << 61;
-
-/// The stamp of an undo record whose writer aborted. It is nobody's id, not even that of a reader
-/// with none, and like an id it is past every snapshot: every reader applies the record, which
-/// holds the values the abort put back, and a writer checking for a newer committed change skips
-/// it.
-const ABORTED: u64 = u64::MAX;
 
 /// How many bytes a fixed-width column's values take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +225,8 @@ struct Column {
 #[derive(Debug)]
 pub struct HotStripe {
     id: u32,
+    /// The table it belongs to, which its undo records name for the collector.
+    table: u32,
     /// Slots handed out so far. It can pass the end of the stripe, since leases are taken with
     /// a plain `fetch_add`, and anything at or past the end was never handed out.
     reserved: AtomicU32,
@@ -266,6 +262,7 @@ impl HotStripe {
             .collect();
         Self {
             id,
+            table: 0,
             reserved: AtomicU32::new(0),
             columns,
             created: Parts::new(ROWS),
@@ -275,6 +272,14 @@ impl HotStripe {
             arena: Arena::new(),
             undos,
         }
+    }
+
+    /// The same stripe, in table `table`, which is what its undo records are held to the horizon
+    /// of. A stripe made with no table is in table 0.
+    #[must_use]
+    pub fn in_table(mut self, table: u32) -> Self {
+        self.table = table;
+        self
     }
 
     /// Its id, which the table assigned and never reuses.
@@ -686,6 +691,10 @@ impl HotStripe {
 
     /// Writes an undo record for `me` at `slot` and publishes it as the row's newest, then fences
     /// so the values written after it cannot be seen without it.
+    ///
+    /// The head is set by compare-and-swap because the collector may take the newest record out
+    /// of the chain while this is written. The writer holds the row, so nobody else adds one, and
+    /// on a lost race the record's oldest piece is pointed at the new head before trying again.
     fn push_undo(
         &self,
         slot: u32,
@@ -696,13 +705,53 @@ impl HotStripe {
     ) {
         let (part, at) = place(slot);
         let head = &self.undo.get_or(part, || AtomicU32::new(0))[at];
-        let rid = (u64::from(self.id) << 32) | u64::from(slot);
-        let prev = head.load(Ordering::Acquire);
+        let row = Row { table: self.table, rid: (u64::from(self.id) << 32) | u64::from(slot) };
+        let mut prev = head.load(Ordering::Acquire);
         let record = buffer
-            .write(&self.undos, kind, me, rid, prev, images)
-            .expect("the undo space holds 64 GiB of records before garbage collection");
-        head.store(record, Ordering::Release);
+            .write(&self.undos, kind, me, row, prev, images)
+            .expect("the undo space holds 64 GiB of records the collector cannot free yet");
+        while let Err(now) =
+            head.compare_exchange(prev, record, Ordering::AcqRel, Ordering::Acquire)
+        {
+            let mut oldest = self.undos.record(record).expect("just written");
+            while oldest.prev() != prev {
+                oldest = self.undos.record(oldest.prev()).expect("a piece of the same write");
+            }
+            oldest.set_prev(now);
+            prev = now;
+        }
         fence(Ordering::Release);
+    }
+
+    /// Takes `record` out of the chain of `slot`, if it is still in it: the record before it, or
+    /// the row's head, is pointed at the record after it, or at none when the `older` records go
+    /// too. Only the collector calls this, one call at a time.
+    pub(crate) fn unlink(&self, slot: u32, record: UndoRef, older: bool) {
+        let (part, at) = place(slot);
+        let Some(undo) = self.undo.get(part) else { return };
+        let Some(after) = self.undos.record(record).map(|record| record.prev()) else { return };
+        let after = if older { 0 } else { after };
+        let head = &undo[at];
+        loop {
+            let mut next = head.load(Ordering::Acquire);
+            if next == record {
+                // A writer that pushed a record on top since is found by the walk on the next
+                // pass.
+                if head.compare_exchange(record, after, Ordering::AcqRel, Ordering::Acquire).is_ok()
+                {
+                    return;
+                }
+                continue;
+            }
+            while let Some(newer) = self.undos.record(next) {
+                if newer.prev() == record {
+                    newer.set_prev(after);
+                    return;
+                }
+                next = newer.prev();
+            }
+            return;
+        }
     }
 
     /// Runs `f` over the undo records of `slot` that `me` wrote, newest first.
