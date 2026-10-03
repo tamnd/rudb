@@ -4436,6 +4436,43 @@ impl Packed<'_> {
     }
 }
 
+impl Packed<'_> {
+    /// Which of the 64 rows from `from` have a code between `low` and `low + span`, as a word with
+    /// row `from + i` in bit `i`.
+    ///
+    /// A filter over a packed column wants a bit a row and not the codes, so a block whose rows start
+    /// on a word and whose width the lanes take is compared eight codes at a time in vector registers
+    /// and never unpacked, see the `lanes` module. Anything else, which is a cut that starts inside a
+    /// word, a width over 25 and the last block of the words, is unpacked and compared a code at a
+    /// time. The caller has 64 rows from `from`.
+    #[must_use]
+    #[inline]
+    pub fn within(&self, from: usize, low: u64, span: u64) -> u64 {
+        if low > self.mask() {
+            return 0;
+        }
+        let span = span.min(self.mask());
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            let (row, width) = (self.offset + from, self.width as usize);
+            if row % 64 == 0 && width <= crate::lanes::LANE_WIDTH_MAX {
+                let start = row / 64 * width * size_of::<u64>();
+                let bytes = crate::lanes::bytes_of(self.words);
+                if let Some(block) = bytes.get(start..start + crate::lanes::readable(width)) {
+                    #[expect(clippy::cast_possible_truncation, reason = "both are under 2^25")]
+                    return crate::lanes::within(block, width, low as u32, span as u32);
+                }
+            }
+        }
+        let mut codes = [0_u64; 64];
+        self.unpack(from, &mut codes);
+        codes
+            .iter()
+            .enumerate()
+            .fold(0, |word, (bit, &code)| word | u64::from(code.wrapping_sub(low) <= span) << bit)
+    }
+}
+
 /// Sixty four codes of `width` bits out of the `width` words that hold them, with the width made a
 /// constant so that the loop in [`unpack_width`] has nothing left to work out as it goes.
 fn unpack_block(words: &[u64], width: u32, out: &mut [u64; 64]) {
@@ -7979,6 +8016,37 @@ mod tests {
                     .map(|row| i64::try_from(cut.signed_at(row).expect("a row")).expect("fits"))
                     .collect();
                 assert_eq!(block, want, "width {width} cut at {at} for {len}");
+            }
+        }
+    }
+
+    /// Which rows of a block hold a code in a range, for cuts that do and do not start a word, at
+    /// widths the lanes take and widths they do not, up to the last block of the words.
+    #[test]
+    fn a_packed_block_says_which_rows_are_in_a_range_as_each_row_does() {
+        let words: Vec<u64> =
+            (0..400_u64).map(|word| word.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        for width in [1, 4, 7, 13, 25, 26, 33] {
+            let rows = 400 * 64 / width as usize;
+            let whole = Vector::packed(LogicalType::BigInt, words.clone(), width, 0, rows)
+                .expect("the codes the words hold");
+            let top = (1_u64 << width) - 1;
+            for at in [0, 1, 64, 130] {
+                let cut = whole.slice(at, rows - at).expect("a cut inside the column");
+                let packed = cut.packed_parts().expect("a cut stays packed");
+                for (low, span) in [(0, top), (top / 3, top / 4), (top, 0), (top + 1, 5)] {
+                    for from in (0..=rows - at - 64).step_by(64).chain([rows - at - 64]) {
+                        let want = (0..64).fold(0, |word, bit| {
+                            let held = packed.code(from + bit).wrapping_sub(low) <= span;
+                            word | u64::from(held) << bit
+                        });
+                        let got = packed.within(from, low, span);
+                        assert_eq!(
+                            got, want,
+                            "width {width} cut {at} rows {from} range {low}+{span}"
+                        );
+                    }
+                }
             }
         }
     }
