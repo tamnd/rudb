@@ -1593,6 +1593,9 @@ pub struct Table {
     foreign: Vec<ForeignKey>,
     /// The constraints in the order they were written, as far as that is known.
     order: Vec<crate::Constraint>,
+    /// The keys written as constraints of the table, `PRIMARY KEY (a)`, rather than on a column,
+    /// by place in `keys`. Only `duckdb_tables().sql` tells the two apart.
+    apart: Vec<usize>,
     /// The indexes over it, in the order they were created.
     indexes: Vec<crate::Index>,
     /// The sequences its defaults call `nextval` on, which it depends on the way the pin records it:
@@ -1634,6 +1637,7 @@ impl Table {
             checks: Vec::new(),
             foreign: Vec::new(),
             order: Vec::new(),
+            apart: Vec::new(),
             sequences: Vec::new(),
             revision: next_revision(),
             frame: next_revision(),
@@ -1654,6 +1658,7 @@ impl Table {
         let defaults = stored.defaults.clone();
         let checks = stored.checks.clone();
         let order = restored_order(stored);
+        let apart = restored_apart(stored);
         let indexes = restored_indexes(stored);
         Ok(Self {
             name,
@@ -1674,6 +1679,7 @@ impl Table {
             checks,
             foreign,
             order,
+            apart,
             sequences: Vec::new(),
             revision: next_revision(),
             frame: next_revision(),
@@ -1725,8 +1731,11 @@ impl Table {
             stored.defaults.resize(self.columns.len(), None);
         }
         stored.checks.clone_from(&self.checks);
+        // A key is 0, or 4 when it was written apart from its columns, a check 1, a foreign key 2
+        // and a `NOT NULL` 3.
         for constraint in &self.order {
             let (kind, at) = match *constraint {
+                crate::Constraint::Key(at) if self.apart.contains(&at) => (4, at),
                 crate::Constraint::Key(at) => (0, at),
                 crate::Constraint::Check(at) => (1, at),
                 crate::Constraint::Foreign(at) => match kept.get(at).copied().flatten() {
@@ -2420,6 +2429,19 @@ impl Table {
         self.order = order;
     }
 
+    /// Declares which keys were written as constraints of the table rather than on a column, by
+    /// place in [`Table::keys`].
+    pub fn set_apart(&mut self, apart: Vec<usize>) {
+        self.apart = apart;
+    }
+
+    /// Whether the key at `at` was written as a constraint of the table, `PRIMARY KEY (a)`, rather
+    /// than on its column.
+    #[must_use]
+    pub fn written_apart(&self, at: usize) -> bool {
+        self.apart.contains(&at)
+    }
+
     /// Every constraint of the table, in the order the pin lists them.
     ///
     /// That is the order they were written in, then the `NOT NULL` of each column that has one
@@ -2835,6 +2857,8 @@ impl Table {
         // NULL` a primary key brings straight after the key.
         self.order = self.constraints();
         self.order.push(crate::Constraint::Key(self.keys.len()));
+        // The pin writes a key added later apart from its columns, the way `PRIMARY KEY (a)` is.
+        self.apart.push(self.keys.len());
         if primary {
             for &column in &key.columns {
                 if !self.columns[column].not_null {
@@ -2898,7 +2922,7 @@ fn restored_order(stored: &rudb_native::Constraints) -> Vec<crate::Constraint> {
         .filter_map(|&(kind, at)| {
             let at = usize::from(at);
             match kind {
-                0 => Some(crate::Constraint::Key(at)),
+                0 | 4 => Some(crate::Constraint::Key(at)),
                 1 => Some(crate::Constraint::Check(at)),
                 2 => Some(crate::Constraint::Foreign(at)),
                 3 => Some(crate::Constraint::NotNull(at)),
@@ -2906,6 +2930,11 @@ fn restored_order(stored: &rudb_native::Constraints) -> Vec<crate::Constraint> {
             }
         })
         .collect()
+}
+
+/// The keys [`Table::stored_constraints`] wrote down as written apart from their columns.
+fn restored_apart(stored: &rudb_native::Constraints) -> Vec<usize> {
+    stored.order.iter().filter(|&&(kind, _)| kind == 4).map(|&(_, at)| usize::from(at)).collect()
 }
 
 /// A table's indexes out of what [`Table::stored_constraints`] wrote, with no oid yet: the catalog

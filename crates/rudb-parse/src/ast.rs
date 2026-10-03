@@ -299,8 +299,11 @@ pub struct CreateTable {
 /// One constraint of a `CREATE TABLE`, by its place in the list of its kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Constraint {
-    /// One of `CreateTable::keys`.
+    /// One of `CreateTable::keys`, written on its column.
     Key(u32),
+    /// One of `CreateTable::keys`, written as a constraint of the table, `PRIMARY KEY (a)`. The pin
+    /// writes it back out that way, apart from the column, even when it names one column.
+    TableKey(u32),
     /// One of `CreateTable::checks`.
     Check(u32),
     /// One of `CreateTable::foreign`.

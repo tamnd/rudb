@@ -150,7 +150,7 @@ pub(crate) fn tablenames(
                     .unwrap_or(i64::MAX),
             ),
             Value::BigInt(i64::try_from(table.checks().len()).unwrap_or(i64::MAX)),
-            text(&create_table(table)),
+            text(&create_table(catalog, table)),
         ]);
     }
     Metadata::new("duckdb_tables", &table_fields(), &rows, plan, index, columns)
@@ -288,6 +288,14 @@ pub(crate) fn constraintnames(
         }
     }
     Metadata::new("duckdb_constraints", &constraint_fields(), &rows, plan, index, columns)
+}
+
+/// The `constraint_text` of one constraint, which is also how `duckdb_tables().sql` writes it.
+fn constraint_text(catalog: &Catalog, table: &Table, held: Constraint) -> String {
+    match constraint_row(catalog, table, held).swap_remove(1) {
+        Value::Varchar(text) => text,
+        _ => String::new(),
+    }
 }
 
 /// The columns of one constraint from `constraint_type` on.
@@ -709,16 +717,57 @@ fn entries(catalog: &Catalog) -> impl Iterator<Item = (&Database, &Schema, &Tabl
 /// with odd spacing and lower case type names comes back normalised, so the column is a deparse of
 /// the entry and not the text somebody typed. Identifiers go through [`rudb_parse::quoted`], which
 /// is the rule the binder already uses for a generated column name.
-fn create_table(table: &Table) -> String {
-    let columns: Vec<String> = table
+///
+/// The constraints follow the pin's own deparse. A key of one column written on that column stays
+/// on it, as `PRIMARY KEY` or `UNIQUE`. Every other key, check and foreign key goes after the
+/// columns in the order they were written. A `NOT NULL` is left off a column of a primary key,
+/// which has it anyway.
+fn create_table(catalog: &Catalog, table: &Table) -> String {
+    let width = table.columns().len();
+    let mut not_null = vec![false; width];
+    let mut primary = vec![false; width];
+    let mut inline = vec![None; width];
+    let mut after = Vec::new();
+    for held in table.constraints() {
+        match held {
+            Constraint::NotNull(at) => not_null[at] = true,
+            Constraint::Key(at) => {
+                let key = &table.keys()[at];
+                if key.primary {
+                    for &column in &key.columns {
+                        primary[column] = true;
+                    }
+                }
+                match key.columns.as_slice() {
+                    &[column] if !table.written_apart(at) => {
+                        inline[column] = Some(if key.primary { " PRIMARY KEY" } else { " UNIQUE" });
+                    }
+                    _ => after.push(constraint_text(catalog, table, held)),
+                }
+            }
+            Constraint::Check(_) | Constraint::Foreign(_) => {
+                after.push(constraint_text(catalog, table, held));
+            }
+        }
+    }
+    let mut parts: Vec<String> = table
         .columns()
         .iter()
-        .map(|column| {
-            let null = if column.not_null { " NOT NULL" } else { "" };
-            format!("{} {}{null}", quoted(&column.name), column.ty)
+        .enumerate()
+        .map(|(at, column)| {
+            let mut part = format!("{} {}", quoted(&column.name), column.ty);
+            if let Some(default) = table.default(at) {
+                part.push_str(&format!(" DEFAULT({default})"));
+            }
+            if not_null[at] && !primary[at] {
+                part.push_str(" NOT NULL");
+            }
+            part.push_str(inline[at].unwrap_or(""));
+            part
         })
         .collect();
-    format!("CREATE TABLE {}({});", quoted(&table.name().table), columns.join(", "))
+    parts.extend(after);
+    format!("CREATE TABLE {}({});", quoted(&table.name().table), parts.join(", "))
 }
 
 /// An empty `MAP(VARCHAR, VARCHAR)`, which is what `tags` and `options` are on every row.

@@ -6840,6 +6840,9 @@ fn create_table(
     if !create.order.is_empty() {
         catalog.table_mut(&create.name)?.set_order(create.order);
     }
+    if !create.apart.is_empty() {
+        catalog.table_mut(&create.name)?.set_apart(create.apart);
+    }
     if !create.foreign.is_empty() {
         catalog.table_mut(&create.name)?.set_foreign(create.foreign);
     }
