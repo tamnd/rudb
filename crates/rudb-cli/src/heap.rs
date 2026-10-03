@@ -25,10 +25,12 @@
 //! time.
 //!
 //! A block of 256 KiB or more does not go to mimalloc at all on Linux. It is mapped from the system
-//! on its own, grown with `mremap`, and unmapped when it is freed; [`MAPPED_FROM`] says why.
+//! on its own, grown with `mremap`, and unmapped when it is freed, or held for the next block of
+//! its length; [`MAPPED_FROM`] and [`HELD_UPTO`] say why.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::{c_int, c_long};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use libmimalloc_sys::{
     mi_free, mi_malloc, mi_malloc_aligned, mi_realloc, mi_realloc_aligned, mi_zalloc,
@@ -174,6 +176,146 @@ const MAPS: bool =
 /// The smallest page size Linux has, and so an alignment every mapping has.
 const PAGE: usize = 4096;
 
+/// The length of the mapping a block of `size` bytes is given: `size` rounded up to a quarter of
+/// the power of two at or above it, and so to a page from [`MAPPED_FROM`] up.
+///
+/// A pure function of the size, like [`mapped`], so that the call that frees or grows a block
+/// unmaps the length the call that made it mapped. Four lengths to a doubling is what lets a freed
+/// block be taken again by the next one near its size, and what it costs is address space: the
+/// slack past `size` is never touched unless the block grows into it, which it then does in place.
+const fn span(size: usize) -> usize {
+    let step = size.next_power_of_two() / 4;
+    let step = if step < PAGE { PAGE } else { step };
+    size.div_ceil(step) * step
+}
+
+/// The most freed mapped memory held for the next block of the same length.
+///
+/// A query takes and frees its big blocks over and over: the bitmaps a consistent node grows to its
+/// largest key, the adjacency a gather builds, the text a `LIKE` copies out to search. Each one was
+/// a fresh mapping, so every page of it was a fault the kernel answered with a cleared page, and
+/// every unmap stopped the other threads to drop the page from their TLBs. Over the 113 JOB queries
+/// on server2 a third of rudb's cycles were the kernel's, against a twelfth of DuckDB's, and most
+/// of them were those faults and unmaps. A block held here is taken again with its pages still in.
+const HELD_UPTO: usize = 128 << 20;
+
+/// How many freed mappings are held at once.
+const HELD_SLOTS: usize = 64;
+
+/// The freed mappings held for reuse, under a lock that is only ever held to look through them.
+///
+/// Atomics under a spin lock rather than a `Mutex`, because this is the allocator and a lock that
+/// can allocate or park cannot be taken here. A block this big is a few a query, so the lock is
+/// never contended long.
+mod held {
+    use super::{AtomicBool, AtomicPtr, AtomicUsize, HELD_SLOTS, HELD_UPTO, Ordering};
+
+    static LOCK: AtomicBool = AtomicBool::new(false);
+    static BLOCKS: [AtomicPtr<u8>; HELD_SLOTS] =
+        [const { AtomicPtr::new(std::ptr::null_mut()) }; HELD_SLOTS];
+    static LENGTHS: [AtomicUsize; HELD_SLOTS] = [const { AtomicUsize::new(0) }; HELD_SLOTS];
+    static HELD: AtomicUsize = AtomicUsize::new(0);
+
+    fn locked<T>(work: impl FnOnce() -> T) -> T {
+        while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err()
+        {
+            std::hint::spin_loop();
+        }
+        let done = work();
+        LOCK.store(false, Ordering::Release);
+        done
+    }
+
+    /// A held mapping of exactly `length` bytes, or null.
+    pub(super) fn take(length: usize) -> *mut u8 {
+        if HELD.load(Ordering::Relaxed) < length {
+            return std::ptr::null_mut();
+        }
+        locked(|| {
+            for (block, held) in BLOCKS.iter().zip(&LENGTHS) {
+                if held.load(Ordering::Relaxed) == length {
+                    held.store(0, Ordering::Relaxed);
+                    HELD.fetch_sub(length, Ordering::Relaxed);
+                    return block.swap(std::ptr::null_mut(), Ordering::Relaxed);
+                }
+            }
+            std::ptr::null_mut()
+        })
+    }
+
+    /// Holds a mapping of `length` bytes, or says it was not held because that would hold more
+    /// than [`HELD_UPTO`] or every slot is taken.
+    pub(super) fn keep(block: *mut u8, length: usize) -> bool {
+        if HELD.load(Ordering::Relaxed) + length > HELD_UPTO {
+            return false;
+        }
+        locked(|| {
+            if HELD.load(Ordering::Relaxed) + length > HELD_UPTO {
+                return false;
+            }
+            for (slot, held) in BLOCKS.iter().zip(&LENGTHS) {
+                if held.load(Ordering::Relaxed) == 0 {
+                    slot.store(block, Ordering::Relaxed);
+                    held.store(length, Ordering::Relaxed);
+                    HELD.fetch_add(length, Ordering::Relaxed);
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
+    /// Every held mapping, let go of, for the caller to unmap.
+    pub(super) fn drain(mut each: impl FnMut(*mut u8, usize)) {
+        let mut taken = [(std::ptr::null_mut(), 0); HELD_SLOTS];
+        locked(|| {
+            for ((slot, held), taken) in BLOCKS.iter().zip(&LENGTHS).zip(&mut taken) {
+                *taken = (
+                    slot.swap(std::ptr::null_mut(), Ordering::Relaxed),
+                    held.swap(0, Ordering::Relaxed),
+                );
+            }
+            HELD.store(0, Ordering::Relaxed);
+        });
+        for (block, length) in taken {
+            if length != 0 {
+                each(block, length);
+            }
+        }
+    }
+}
+
+/// A mapping of `size` bytes, a held one if there is one of its length.
+fn map(size: usize) -> *mut u8 {
+    let length = span(size);
+    let block = held::take(length);
+    if block.is_null() { system::map(length) } else { block }
+}
+
+/// Lets go of a mapping of `size` bytes, held for the next block if there is room.
+///
+/// # Safety
+///
+/// `block` is a mapping [`map`] made for `size` bytes, or one grown to it, and nothing reads it
+/// after.
+#[allow(unsafe_code)]
+unsafe fn unmap(block: *mut u8, size: usize) {
+    let length = span(size);
+    if !held::keep(block, length) {
+        // SAFETY: the caller's.
+        unsafe { system::unmap(block, length) };
+    }
+}
+
+/// Unmaps every held mapping, which is what a release asks for: a load lets go of a stripe's
+/// buffers at once and is the moment holding them costs the most.
+pub(crate) fn release() {
+    // SAFETY: a held mapping is one nothing holds any more, and draining takes it out of the slots
+    // before it is unmapped.
+    #[allow(unsafe_code)]
+    held::drain(|block, length| unsafe { system::unmap(block, length) });
+}
+
 /// Whether a block of this size and alignment is a mapping of its own.
 ///
 /// A pure function of the layout, so that the call that frees or grows a block, which is given the
@@ -283,7 +425,7 @@ pub(crate) struct MiMalloc;
 unsafe impl GlobalAlloc for MiMalloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if mapped(layout.size(), layout.align()) {
-            return system::map(layout.size());
+            return map(layout.size());
         }
         // SAFETY: mimalloc takes any size, and [`given`] picks the call that answers this
         // alignment.
@@ -298,8 +440,15 @@ unsafe impl GlobalAlloc for MiMalloc {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if mapped(layout.size(), layout.align()) {
-            // A fresh mapping is zeroed by the kernel.
-            return system::map(layout.size());
+            let length = span(layout.size());
+            let block = held::take(length);
+            if block.is_null() {
+                // A fresh mapping is zeroed by the kernel.
+                return system::map(length);
+            }
+            // SAFETY: a held block is a mapping of `length` bytes, at least the size asked for.
+            unsafe { block.write_bytes(0, layout.size()) };
+            return block;
         }
         // SAFETY: as [`GlobalAlloc::alloc`], and the zeroing is mimalloc's own.
         unsafe {
@@ -317,7 +466,7 @@ unsafe impl GlobalAlloc for MiMalloc {
         // them.
         unsafe {
             if mapped(layout.size(), layout.align()) {
-                system::unmap(ptr, layout.size());
+                unmap(ptr, layout.size());
             } else {
                 mi_free(ptr.cast());
             }
@@ -333,7 +482,8 @@ unsafe impl GlobalAlloc for MiMalloc {
             let was = mapped(layout.size(), layout.align());
             let will = mapped(size, layout.align());
             if was && will {
-                return system::remap(ptr, layout.size(), size);
+                let (old, new) = (span(layout.size()), span(size));
+                return if old == new { ptr } else { system::remap(ptr, old, new) };
             }
             if was || will {
                 // Across the bound the block changes hands, so it is copied into one the other
@@ -361,7 +511,7 @@ mod tests {
 
     use super::{
         GIVEN, MAPPED_FROM, MAPS, MiMalloc, PAGE, ROUNDED_FROM, ROUNDED_UPTO, binned, given,
-        keep_everything_at_exit, keep_freed_memory, mapped, purge_delay,
+        keep_everything_at_exit, keep_freed_memory, mapped, purge_delay, release, span,
     };
 
     /// The option set is the purge delay, which mimalloc 2 starts at ten milliseconds, and not some
@@ -465,5 +615,36 @@ mod tests {
             check(block, small);
             heap.dealloc(block, Layout::from_size_align(MAPPED_FROM * 2, 8).expect("a layout"));
         }
+    }
+
+    /// A mapping is four lengths to a doubling, and a freed one is taken again, cleared when it is
+    /// asked for zeroed, by the next block of its length.
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_freed_mapping_is_taken_again() {
+        assert_eq!(span(MAPPED_FROM), MAPPED_FROM);
+        assert_eq!(span(MAPPED_FROM + 1), MAPPED_FROM / 2 * 3);
+        assert_eq!(span(300 * 1024), 384 * 1024);
+        assert_eq!(span(1 << 20), 1 << 20);
+        assert_eq!(span((1 << 20) + 1), 3 << 19);
+        assert!((MAPPED_FROM..64 << 20).step_by(4093).all(|size| span(size) % PAGE == 0));
+        if !MAPS {
+            return;
+        }
+        let heap = MiMalloc;
+        // A length no other test here asks for, since the held blocks are the process's.
+        let layout = Layout::from_size_align((3 << 20) + 5, 8).expect("a layout");
+        // SAFETY: each block is freed with the layout it was made with.
+        unsafe {
+            let block = heap.alloc(layout);
+            assert!(!block.is_null());
+            block.write_bytes(7, layout.size());
+            heap.dealloc(block, layout);
+            let again = heap.alloc_zeroed(layout);
+            assert_eq!(again, block, "the freed mapping is the one taken");
+            assert!((0..layout.size()).step_by(997).all(|at| again.add(at).read() == 0));
+            heap.dealloc(again, layout);
+        }
+        release();
     }
 }

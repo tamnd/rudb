@@ -95,7 +95,10 @@ static ALLOCATOR: heap::MiMalloc = heap::MiMalloc;
 
 fn main() -> ExitCode {
     #[cfg(feature = "mimalloc")]
-    heap::keep_freed_memory();
+    {
+        heap::keep_freed_memory();
+        rudb::heap::on_release(heap::release);
+    }
     #[cfg(all(not(feature = "mimalloc"), target_os = "linux", target_env = "gnu"))]
     trim::install();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
