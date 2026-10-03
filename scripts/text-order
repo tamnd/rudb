@@ -42,10 +42,12 @@ def executed(binary, command, scratch):
     report = subprocess.run(['callgrind_annotate', '--threshold=100', out],
                             capture_output=True, text=True, check=True).stdout
     names = set()
-    suffix = f' [{os.path.abspath(binary)}]'
+    # callgrind_annotate leaves the object of many functions as ???, so take those too. Only
+    # the binary holds Rust names, since the standard library is linked into it.
+    suffixes = (f' [{os.path.abspath(binary)}]', ' [???]')
     for line in report.splitlines():
-        if line.endswith(suffix):
-            name = line[:-len(suffix)].rsplit(':', 1)[-1]
+        if line.endswith(suffixes):
+            name = line.rsplit(' [', 1)[0].rsplit(':', 1)[-1]
             if name.startswith(('_R', '_ZN')) or name == 'main':
                 names.add(name)
     os.remove(out)
