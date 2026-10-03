@@ -837,7 +837,7 @@ mod tests {
 
     use rudb_common::{LogicalType, Result, Value};
     use rudb_storage::MemoryTable;
-    use rudb_vector::{Chunk, NO_ROW, Validity, Vector};
+    use rudb_vector::{Chunk, Form, NO_ROW, Validity, Vector};
 
     use super::{Directory, Parent};
     use crate::table::Rows;
@@ -1020,7 +1020,7 @@ mod tests {
         // a share of a page the table is holding anyway is charged as the share it is.
         for part in 0..2 {
             // Spread over the whole of an `i32`, so that the column is not packed smaller.
-            let held: Vec<Value> = (part * 1000..part * 1000 + 1000)
+            let held: Vec<Value> = (part * 1000_i32..part * 1000 + 1000)
                 .map(|row| Value::Integer(row.wrapping_mul(2_000_006_014)))
                 .collect();
             let first = Vector::from_values(LogicalType::Integer, &held).expect("a column");
