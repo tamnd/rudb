@@ -143,8 +143,10 @@ impl<'a> Query<'a> {
     pub fn run(&self, cancel: &Cancel, pool: &Pool) -> Result<()> {
         for (pipeline, driver) in self.pipelines.iter().zip(&self.drivers) {
             // Both numbers out of one call, because asking is what makes the source read its
-            // statistics and cut its morsels. See [`Pipeline::widths`].
-            let (wanted, width) = pipeline.widths(pool.threads());
+            // statistics and cut its morsels. See [`Pipeline::widths`]. The ceiling and not the
+            // setting, so a scan on a busy machine does not plan for threads it will not get. See
+            // [`Pool::ceiling`].
+            let (wanted, width) = pipeline.widths(pool.ceiling());
             let lease = pool.lease(width);
             let degree = wanted.min(lease.degree());
             let spread = {

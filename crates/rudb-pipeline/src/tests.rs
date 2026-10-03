@@ -1393,3 +1393,10 @@ fn a_yielding_pool_still_lends_the_caller_and_never_more_than_it_has() {
     let lease = pool.lease(16);
     assert!((1..=4).contains(&lease.degree()));
 }
+
+#[test]
+fn a_pool_that_does_not_yield_plans_for_every_thread_it_has_and_a_yielding_one_for_at_most_that() {
+    assert_eq!(Pool::new(4).ceiling(), 4);
+    assert!((1..=4).contains(&Pool::new(4).yielding().ceiling()));
+    assert_eq!(Pool::new(1).yielding().ceiling(), 1);
+}
