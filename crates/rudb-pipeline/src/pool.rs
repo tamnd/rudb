@@ -199,6 +199,17 @@ impl Pool {
         }
     }
 
+    /// Take every copy of `batch` still in the queue out of it, and say how many there were.
+    ///
+    /// The caller owes each of them a run and a count down, which is what keeps the batch's count
+    /// honest for the guard that waits on it.
+    fn reclaim(&self, batch: &Arc<Batch>) -> usize {
+        let mut queue = self.shared.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = queue.jobs.len();
+        queue.jobs.retain(|job| !Arc::ptr_eq(job, batch));
+        before - queue.jobs.len()
+    }
+
     /// Run one queued job on this thread, for when a worker could not be started.
     ///
     /// Any job will do rather than one of the caller's own. They are all work somebody is waiting
@@ -426,7 +437,18 @@ impl Lease<'_> {
         self.pool.enqueue(&batch, extra);
         let value = {
             let _joined = Joined { batch: &batch };
-            body()
+            let value = body();
+            // Copies of this batch no worker has picked up yet are run here rather than waited
+            // for. Every user of this hands out its pieces off a shared counter, so once the
+            // caller's own body is back there is nothing left for them to find, and waiting is
+            // only waiting for a woken thread to be scheduled. On a loaded machine that was most
+            // of a small query: JOB 4b ran in 24 to 27 ms on one thread and 34 to 36 on six at a
+            // load of 28, with each pipeline's wall twice its CPU.
+            for _ in 0..self.pool.reclaim(&batch) {
+                batch.run();
+                batch.finish();
+            }
+            value
         };
         (value, batch.panicked.load(Ordering::Relaxed))
     }
