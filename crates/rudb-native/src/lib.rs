@@ -17985,6 +17985,53 @@ mod tests {
         assert_eq!(paid_at(2048, &page, &[5, 900, 1500], false), 2048, "or the whole part");
     }
 
+    /// A part held by a read of a few of its rows stays packed, and one held by a read of many of
+    /// its rows is written out flat, and both give back the values they were written with.
+    #[test]
+    fn a_part_held_by_a_sparse_read_stays_packed() {
+        let path = path("held-packed");
+        let mut writer =
+            Writer::create(&path, "a", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        let values: Vec<Value> = (0..4096_i64)
+            .map(|i| Value::Integer((i * 2_654_435_761 / 128 % 1000) as i32))
+            .collect();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::Integer, &values).expect("integers")])
+                .expect("matching rows");
+        writer.append(&chunk).expect("two parts");
+        writer.append(&chunk).expect("two parts");
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("a").expect("a");
+        let held = |part: usize| {
+            match &*a.cache.slot(0, part).expect("made").lock().expect("the slot") {
+                PartSlot::Held { vector, .. } => Some(vector.form()),
+                _ => None,
+            }
+        };
+        let sparse: Vec<u32> = (0..4096).step_by(64).collect();
+        let dense: Vec<u32> = (0..4096).step_by(2).collect();
+        for (part, rows) in [(0, &sparse), (1, &dense)] {
+            for _ in 0..64 {
+                if held(part).is_some() {
+                    break;
+                }
+                a.read_rows(part, &[0], rows, false).expect("rows");
+            }
+            let read = a.read_rows(part, &[0], rows, false).expect("rows");
+            for (at, &row) in rows.iter().enumerate() {
+                assert_eq!(read.value_at(at, 0), values[row as usize]);
+            }
+        }
+        assert_eq!(held(0), Some(rudb_vector::Form::BitPacked), "one row in 64 keeps it packed");
+        assert_eq!(held(1), Some(rudb_vector::Form::Flat), "one row in two writes it out flat");
+        drop((a, catalog));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
     /// A whole read holds the part it decoded, reads at positions count what they cost until the
     /// read whose share comes to the part holds it, and a part the pool lets go is decoded again
     /// from its pages. A part of 64 integers is decoded whole by any read of it, so here the first
