@@ -937,6 +937,14 @@ impl<'a> Binder<'a> {
             bound.push(items);
         }
         self.clause = previous;
+        // The rows of an `INSERT ... VALUES` are cast to the columns they land in, one by one,
+        // rather than to a type they all agree on first. So `('a'), (2)` goes into a VARCHAR
+        // column and `('1'), (2.5)` into an INTEGER one, both of which the pin takes, though
+        // neither pair has a type in common on its own.
+        if let Some(defaults) = defaults.as_ref().filter(|defaults| defaults.len() == width) {
+            let types = defaults.iter().map(|(ty, _)| ty.clone()).collect();
+            return self.values_node(ast, query, &bound, types);
+        }
         let mut types = Vec::with_capacity(width);
         for at in 0..width {
             let mut ty = self.plan.expr_type(bound[0][at]).clone();
@@ -951,8 +959,19 @@ impl<'a> Binder<'a> {
             }
             types.push(ty);
         }
+        self.values_node(ast, query, &bound, types)
+    }
+
+    /// The `VALUES` node over rows already bound, each cast to the type of its column.
+    fn values_node(
+        &mut self,
+        ast: &Ast,
+        query: &ast::Query,
+        bound: &[Vec<ExprRef>],
+        types: Vec<LogicalType>,
+    ) -> Result<(NodeRef, Scope)> {
         let mut slices = Vec::with_capacity(bound.len());
-        for row in &bound {
+        for row in bound {
             let items: Vec<ExprRef> = row
                 .iter()
                 .zip(&types)
