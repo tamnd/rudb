@@ -436,7 +436,11 @@ fn written(plan: &mut Plan, push: &Push) -> Option<NodeRef> {
 /// `renames` collects the index each copied operator was given, which is what [`renamed`] rewrites
 /// the expressions above it with. It is filled in the order the copy is built, so an operator's own
 /// index goes in after its input's expressions have been rewritten and not before.
-pub(crate) fn copied(plan: &mut Plan, at: NodeRef, renames: &mut Vec<(u32, u32)>) -> Option<NodeRef> {
+pub(crate) fn copied(
+    plan: &mut Plan,
+    at: NodeRef,
+    renames: &mut Vec<(u32, u32)>,
+) -> Option<NodeRef> {
     let span = plan.node_span(at);
     match plan.node(at).clone() {
         Node::Get { catalog, schema, table, alias, index, columns } => {

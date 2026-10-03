@@ -52,10 +52,12 @@
 //! on them.
 
 use rudb_common::Result;
-use rudb_plan::{BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
+use rudb_plan::{
+    BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+};
 
 use crate::estimate::{self, Facts};
-use crate::keys::{copyable, copied, descent, renamed};
+use crate::keys::{copied, copyable, descent, renamed};
 use crate::pass::{Context, Pass, top_down};
 use crate::tables::{TableSet, produced};
 use crate::walk;
@@ -221,9 +223,11 @@ fn scanned(plan: &Plan, at: NodeRef, key: ColumnBinding) -> Option<(NodeRef, Col
 fn scans(plan: &Plan, at: NodeRef, stats: &Facts) -> Option<u64> {
     match *plan.node(at) {
         Node::Get { .. } | Node::TableFunction { .. } => estimate::rows(plan, at, stats),
-        _ => plan.node(at).children().into_iter().flatten().try_fold(0u64, |total, child| {
-            Some(total.saturating_add(scans(plan, child, stats)?))
-        }),
+        _ => {
+            plan.node(at).children().into_iter().flatten().try_fold(0u64, |total, child| {
+                Some(total.saturating_add(scans(plan, child, stats)?))
+            })
+        }
     }
 }
 
