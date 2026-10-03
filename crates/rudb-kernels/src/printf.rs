@@ -1762,7 +1762,11 @@ mod tests {
             ("{:x}", Value::UHugeInt(u128::MAX), "ffffffffffffffffffffffffffffffff"),
         ];
         for (pattern, value, expected) in written {
-            assert_eq!(formatted(pattern, std::slice::from_ref(&value)), expected, "{pattern} {value:?}");
+            assert_eq!(
+                formatted(pattern, std::slice::from_ref(&value)),
+                expected,
+                "{pattern} {value:?}"
+            );
         }
         let printed_cases = [
             ("%x", i(-5), "fffffffffffffffb"),
@@ -1830,7 +1834,11 @@ mod tests {
             ("%c", Value::Boolean(true), "\u{1}"),
         ];
         for (pattern, value, expected) in printed_cases {
-            assert_eq!(printed(pattern, std::slice::from_ref(&value)), expected, "{pattern} {value:?}");
+            assert_eq!(
+                printed(pattern, std::slice::from_ref(&value)),
+                expected,
+                "{pattern} {value:?}"
+            );
         }
     }
 

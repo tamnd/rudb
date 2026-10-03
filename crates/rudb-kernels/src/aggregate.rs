@@ -1586,11 +1586,12 @@ pub fn update_tallied(
         // its rows land in once for the call. Read a row at a time, every block a row lands in is
         // decoded and kept for the rest of the query, which for a few hundred rows scattered over
         // the URLs of ClickBench is most of the payload.
-        let visited = input.try_visit_text(&mut |row, bytes| {
-            match (row < rows).then(|| into.index(row)).flatten() {
-                Some(index) => offer(index, bytes),
-                None => Ok(()),
-            }
+        let visited = input.try_visit_text(&mut |row, bytes| match (row < rows)
+            .then(|| into.index(row))
+            .flatten()
+        {
+            Some(index) => offer(index, bytes),
+            None => Ok(()),
         })?;
         if visited {
             return Ok(());
