@@ -1228,8 +1228,61 @@ fn backoff(shares: impl IntoIterator<Item = f64>) -> f64 {
 /// within a hundredth of a percent of one for any share over a billionth.
 const COUNTED: usize = 16;
 
-/// What is left standing of each class, as the share of its values.
-type Standing = BTreeMap<u32, f64>;
+/// What is left standing of each class, as the share of its values, and nothing for a class no
+/// relation taken so far holds.
+///
+/// A slot a class rather than a map, as the classes are numbered from zero. The search copies one
+/// of these for every set of relations it keeps and the cost model looks a class up in one for every
+/// step of every order it weighs, and as a `BTreeMap` the copies and the lookups were most of what
+/// planning JOB 33a spent outside the cost model itself.
+#[derive(Debug, Clone, Default)]
+struct Standing {
+    /// The share by class, `NAN` for a class nothing taken holds.
+    shares: Vec<f64>,
+}
+
+impl Standing {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, class: &u32) -> Option<&f64> {
+        self.shares.get(*class as usize).filter(|share| !share.is_nan())
+    }
+
+    /// The share standing of `class`, all of it where nothing taken holds the class yet.
+    fn held(&mut self, class: u32) -> &mut f64 {
+        let at = class as usize;
+        if at >= self.shares.len() {
+            self.shares.resize(at + 1, f64::NAN);
+        }
+        let share = &mut self.shares[at];
+        if share.is_nan() {
+            *share = 1.0;
+        }
+        share
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> From<[(u32, f64); N]> for Standing {
+    fn from(shares: [(u32, f64); N]) -> Self {
+        let mut standing = Self::new();
+        for (class, share) in shares {
+            *standing.held(class) = share;
+        }
+        standing
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<&u32> for Standing {
+    type Output = f64;
+
+    fn index(&self, class: &u32) -> &f64 {
+        self.get(class).expect("a class something taken holds")
+    }
+}
 
 /// What decoding a part for a gather costs, as a share of scanning it. A gather decodes the columns
 /// it reads of the part and tests no filter over it, and on the IMDb load a part of `cast_info` took
@@ -1317,14 +1370,15 @@ fn gyo(
                 .collect()
         })
         .collect();
-    let searched = search(edges, weights, &holders, &left);
+    let mut prices = Prices::new(edges, weights);
+    let searched = search(edges, weights, &holders, &left, &mut prices);
     if let Some((_, found, false)) = searched {
         return Ok(found);
     }
     // The share of each class's values the relations taken so far have left standing.
     let mut standing: Standing = Standing::new();
     while !left.is_empty() {
-        let (mut ears, waiting) = ears(edges, weights, &holders, &left, &standing)?;
+        let (mut ears, waiting) = ears(edges, weights, &holders, &left, &standing, &mut prices)?;
         // The cheapest few ears, each priced with the rest of the order taken greedily after it.
         // One step alone does not see what an ear leaves the others: in JOB 13a `company_name`
         // costs more to read than the movie side, and each time the order took the movie side
@@ -1337,7 +1391,7 @@ fn gyo(
                 let taken = rest.remove(ear.1);
                 let mut after = standing.clone();
                 take(edges, weights, &mut after, taken);
-                ear.0 += finish(edges, weights, &holders, rest, after);
+                ear.0 += finish(edges, weights, &holders, rest, after, &mut prices);
             }
         }
         let best = ears
@@ -1379,6 +1433,7 @@ fn search(
     weights: &[Weight],
     holders: &[Vec<u64>],
     ranked: &[usize],
+    prices: &mut Prices<'_>,
 ) -> Option<(f64, Vec<(usize, Option<usize>)>, bool)> {
     type Reached = (f64, Standing, Vec<(usize, Option<usize>)>);
     let mut place = vec![0; edges.len()];
@@ -1404,7 +1459,7 @@ fn search(
             let (mut found, waiting) = steps(ranked, weights, holders, taken)?;
             found.extend(waiting);
             for (ear, parent) in found {
-                let total = cost + weights[ear].cost(standing, &edges[ear]);
+                let total = cost + prices.cost(ear, standing);
                 let key = taken | 1 << ear;
                 // Orders that cost the same, as a sum taken in another order can differ in its
                 // last bits, go to the one that takes the cheaper relations first, which is what
@@ -1446,6 +1501,53 @@ fn search(
             .collect();
     }
     layer.into_values().next().map(|(cost, _, order)| (cost, order, beamed))
+}
+
+/// What [`Weight::cost`] came to for each relation, by what was left standing of the classes it
+/// reads, for [`search`] to ask again.
+///
+/// A relation's cost reads what is standing of its own classes and nothing else, and most of the
+/// sets of relations the search reaches differ only in relations that hold none of them. So in JOB
+/// 33a the search priced the same relation at the same standing thousands of times, each one a pass
+/// over its key columns with a `powf` and a sort in it. Kept for relations of up to [`HELD`] classes,
+/// which is all of them in JOB, and priced afresh past that.
+struct Prices<'a> {
+    edges: &'a [BTreeSet<u32>],
+    weights: &'a [Weight],
+    /// Whether each relation's cost is kept, which is when it reads no class past its own few.
+    kept: Vec<bool>,
+    known: HashMap<(usize, [u64; HELD]), f64>,
+}
+
+/// The most classes of a relation [`Prices`] keeps the cost of.
+const HELD: usize = 4;
+
+impl<'a> Prices<'a> {
+    fn new(edges: &'a [BTreeSet<u32>], weights: &'a [Weight]) -> Self {
+        let kept = edges
+            .iter()
+            .zip(weights)
+            .map(|(classes, weight)| {
+                let mut read = weight.reach.iter().map(|(class, _)| class).chain(&weight.gathered);
+                classes.len() <= HELD && read.all(|class| classes.contains(class))
+            })
+            .collect();
+        Self { edges, weights, kept, known: HashMap::new() }
+    }
+
+    fn cost(&mut self, ear: usize, standing: &Standing) -> f64 {
+        let (classes, weight) = (&self.edges[ear], &self.weights[ear]);
+        if !self.kept[ear] {
+            return weight.cost(standing, classes);
+        }
+        let mut key = [f64::NAN.to_bits(); HELD];
+        for (slot, class) in key.iter_mut().zip(classes) {
+            if let Some(share) = standing.get(class) {
+                *slot = share.to_bits();
+            }
+        }
+        *self.known.entry((ear, key)).or_insert_with(|| weight.cost(standing, classes))
+    }
 }
 
 /// The ears left once the relations in `taken` are, with a set of relations written as bits, and
@@ -1614,6 +1716,7 @@ fn ears(
     holders: &[Vec<u64>],
     left: &[usize],
     standing: &Standing,
+    prices: &mut Prices<'_>,
 ) -> std::result::Result<(Vec<Ear>, Option<(usize, Option<usize>)>), String> {
     let slot = |ear: usize| left.iter().position(|&relation| relation == ear).unwrap_or_default();
     let taken = !left.iter().fold(0, |mask, &relation| mask | 1 << relation);
@@ -1622,7 +1725,7 @@ fn ears(
     };
     let mut found = Vec::with_capacity(steps.len());
     for (ear, parent) in steps {
-        let mut cost = weights[ear].cost(standing, &edges[ear]);
+        let mut cost = prices.cost(ear, standing);
         // With two relations left the one taken second is the root, and what it costs follows
         // from the first: read `cast_info` first and `name` is gathered at the people it kept.
         // So the pair is charged in total, which the cheaper single step does not see.
@@ -1630,7 +1733,7 @@ fn ears(
             let last = if ear == one { other } else { one };
             let mut after = standing.clone();
             take(edges, weights, &mut after, ear);
-            cost += weights[last].cost(&after, &edges[last]);
+            cost += prices.cost(last, &after);
         }
         found.push((cost, slot(ear), parent));
     }
@@ -1652,7 +1755,7 @@ fn take(edges: &[BTreeSet<u32>], weights: &[Weight], standing: &mut Standing, ea
         let values =
             weights[ear].domain.iter().find(|(held, _)| *held == class).map(|&(_, values)| values);
         let named = values.map_or(1.0, |values| (rows / values as f64).min(1.0));
-        let held = standing.entry(class).or_insert(1.0);
+        let held = standing.held(class);
         *held = held.min(share).min(named);
     }
 }
@@ -1665,10 +1768,11 @@ fn finish(
     holders: &[Vec<u64>],
     mut left: Vec<usize>,
     mut standing: Standing,
+    prices: &mut Prices<'_>,
 ) -> f64 {
     let mut total = 0.0;
     while !left.is_empty() {
-        let Ok((ears, waiting)) = ears(edges, weights, holders, &left, &standing) else {
+        let Ok((ears, waiting)) = ears(edges, weights, holders, &left, &standing, prices) else {
             return f64::INFINITY;
         };
         let best = ears.iter().copied().reduce(|best, ear| if ear.0 < best.0 { ear } else { best });
@@ -1682,7 +1786,7 @@ fn finish(
                 slot
             }
             (None, Some((slot, _))) => {
-                total += weights[left[slot]].cost(&standing, &edges[left[slot]]);
+                total += prices.cost(left[slot], &standing);
                 slot
             }
             (None, None) => return f64::INFINITY,
