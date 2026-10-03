@@ -27,8 +27,8 @@ struct Pair {
 
 impl Pair {
     fn new(name: &str) -> Self {
-        let path =
-            std::env::temp_dir().join(format!("rudb-value-rows-{name}-{}.rudb", std::process::id()));
+        let path = std::env::temp_dir()
+            .join(format!("rudb-value-rows-{name}-{}.rudb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let memory = Database::new();
         for sql in TABLES {

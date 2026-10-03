@@ -135,10 +135,7 @@ fn a_string_under_the_root_is_read_for_the_rows_that_survive() {
             "SELECT min(a.name), max(c.kind) FROM a JOIN b ON a.id = b.a_id JOIN c ON b.c_id = c.id",
             true,
         ),
-        (
-            "SELECT min(a.name) FROM a, b WHERE a.id = b.a_id AND a.name LIKE 'name 2%'",
-            false,
-        ),
+        ("SELECT min(a.name) FROM a, b WHERE a.id = b.a_id AND a.name LIKE 'name 2%'", false),
     ] {
         let plan = explain(&database, sql);
         let line = plan.lines().find(|line| line.contains("Consistent #")).unwrap_or_default();

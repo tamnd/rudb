@@ -355,7 +355,8 @@ fn leaving_a_technique_out_answers_the_same() {
     ] {
         database.execute(&format!("SET qc_ablate = '{ablate}'")).expect("a switch");
         let back = database.setting("qc_ablate").expect("qc_ablate reads back");
-        let all = "probe,like,top,lanes,stats,codes,ranges,dense,handoff,pairs,runs,append,coded,keyed";
+        let all =
+            "probe,like,top,lanes,stats,codes,ranges,dense,handoff,pairs,runs,append,coded,keyed";
         assert_eq!(back, if ablate == "all" { all } else { ablate });
         for (sql, first) in queries.iter().zip(&first) {
             assert_eq!(&rows(&database, sql), first, "{sql} with {ablate} off");
