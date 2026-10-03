@@ -4341,6 +4341,13 @@ impl Shared {
                     Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns },
                 )
             }
+            // `CALL enable_logging()` parses as the query it is short for, so it can arrive here
+            // and is run the way the statement path runs it.
+            Bound::Call(call) => {
+                self.inner.settings.call(&call)?;
+                self.inner.settings_revision.fetch_add(1, Ordering::Relaxed);
+                Ok(QueryResult::empty())
+            }
             _ => Err(Error::not_implemented("a statement that is not a query, on the query path")),
         }
     }
@@ -5031,6 +5038,11 @@ impl Shared {
                 if setting.pragma && setting.name.eq_ignore_ascii_case("device_card_refresh") =>
             {
                 self.refresh_device_card()?;
+                Ok(QueryResult::empty())
+            }
+            Bound::Call(call) => {
+                self.inner.settings.call(&call)?;
+                self.inner.settings_revision.fetch_add(1, Ordering::Relaxed);
                 Ok(QueryResult::empty())
             }
             Bound::Setting(setting) if setting.pragma => {

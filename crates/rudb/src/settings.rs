@@ -68,18 +68,51 @@ use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
 use rudb_txn::log::CommitSync;
 
-/// The values `lambda_syntax` takes, in the order the pin declares them, which is the order its
-/// suggestions break ties in.
+/// The values `lambda_syntax` takes, in the order the pin declares them.
 const LAMBDA_SYNTAXES: [&str; 3] = ["DEFAULT", "ENABLE_SINGLE_ARROW", "DISABLE_SINGLE_ARROW"];
 
-/// The knobs whose value is one of a fixed set of words, each with the enum the pin names when it
-/// refuses another word and the words in the order the pin declares them.
 /// The values `default_transaction_invalidation_policy` takes, in the order the pin declares them.
 const INVALIDATION_POLICIES: [&str; 2] =
     ["ALL_ERRORS_INVALIDATE_TRANSACTION", "SYNTACTIC_ERRORS_DO_NOT_INVALIDATE"];
 
-const KNOB_WORDS: &[(&str, &str, &[&str])] =
-    &[("explain_output", "ExplainOutputType", &["ALL", "OPTIMIZED_ONLY", "PHYSICAL_ONLY"])];
+/// The knobs whose value is one of a fixed set of words, each with the enum the pin names when it
+/// refuses another word and the words in the order the pin declares them.
+const KNOB_WORDS: &[(&str, &str, &[&str])] = &[
+    ("explain_output", "ExplainOutputType", &["ALL", "OPTIMIZED_ONLY", "PHYSICAL_ONLY"]),
+    ("logging_level", "LogLevel", &LOG_LEVELS),
+    ("logging_mode", "LogMode", &["LEVEL_ONLY", "DISABLE_SELECTED", "ENABLE_SELECTED"]),
+];
+
+/// The knobs that read back as the word the enum spells rather than as it was written, so
+/// `SET logging_level = 'debug'` reads back as `DEBUG`. `explain_output` is not one of them.
+const SPELLED_KNOBS: [&str; 2] = ["logging_level", "logging_mode"];
+
+/// The log levels, most verbose first, which is the order a level compares in.
+const LOG_LEVELS: [&str; 6] = ["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "FATAL"];
+
+/// The log types `enable_logging` takes, spelled the way `enabled_log_types` reads them back, each
+/// with the level it is written at. Turning a type on lowers the level to that one, so asking for
+/// `FileSystem` alone is asking for `TRACE`. The pin writes a `Transaction` type and a `Checkpoint`
+/// one too, and refuses both by name here, so they are not in the list.
+const LOG_TYPES: [(&str, &str); 9] = [
+    ("AdaptiveFilter", "DEBUG"),
+    ("AsyncTaskSchedule", "DEBUG"),
+    ("ExternalResource", "INFO"),
+    ("FileSystem", "TRACE"),
+    ("HTTP", "DEBUG"),
+    ("Metrics", "INFO"),
+    ("ParquetPrefetch", "DEBUG"),
+    ("PhysicalOperator", "DEBUG"),
+    ("QueryLog", "INFO"),
+];
+
+/// The log storages, by the name a statement uses and the class name the pin's messages use.
+const LOG_STORAGES: [(&str, &str); 4] = [
+    ("memory", "InMemoryLogStorage"),
+    ("stdout", "StdOutLogStorage"),
+    ("file", "FileLogStorage"),
+    ("shell_log_storage", "ShellLogStorage"),
+];
 
 /// When the rows a commit wrote are seen by the other connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -945,6 +978,26 @@ impl Settings {
         {
             return Err(Error::not_implemented(unknown_enum_value(&written, enum_name, words)));
         }
+        if let Some((_, _, words)) = KNOB_WORDS.iter().find(|(name, ..)| *name == entry.name)
+            && SPELLED_KNOBS.contains(&entry.name)
+            && let Some(word) = words.iter().find(|word| word.eq_ignore_ascii_case(&written))
+        {
+            written = (*word).to_string();
+        }
+        // The pin takes this one as a boolean and reads it back as the number, `1` or `0`.
+        if entry.name == "enable_logging" {
+            written = if written == "true" { "1" } else { "0" }.to_string();
+        }
+        // A storage is looked up by name and kept in lower case, and one the pin has not heard of
+        // is refused rather than carried, so a later read does not report a storage nothing has.
+        if entry.name == "logging_storage" {
+            written = written.to_lowercase();
+            if !LOG_STORAGES.iter().any(|(name, _)| *name == written) {
+                return Err(Error::invalid_input(format!(
+                    "Log storage '{written}' is not yet registered"
+                )));
+            }
+        }
         // The one knob a commit reads, so it is a size or it is refused, and it reads back the way
         // the pin prints it. Both spellings land here as wal_autocheckpoint.
         if entry.name == "wal_autocheckpoint" {
@@ -986,6 +1039,40 @@ impl Settings {
         let carried = self.carry(entry, Some(&Value::Varchar(value.to_string())));
         self.changes.fetch_add(1, AtomicOrdering::AcqRel);
         carried
+    }
+
+    /// Runs `enable_logging` or `disable_logging`, which are table functions called for what they
+    /// write and which answer no rows.
+    ///
+    /// Both write the logging knobs and nothing else, because rudb keeps no log. That is the same
+    /// footing as a `SET enable_logging = true`, which the pin takes and rudb carries: the settings
+    /// read back the way the pin's do, and `duckdb_logs()` is not there to show what was not kept.
+    /// The one storage refused is `file`, because the pin creates the file and a query that reads it
+    /// back would find it missing here.
+    ///
+    /// `enable_logging` with types turns on exactly those and sets the level to the most verbose of
+    /// them, ignoring a `level` written next to them, which is what the pin does. With no types it
+    /// turns on every type at `level`, or at `INFO` when no level was written either.
+    ///
+    /// # Errors
+    ///
+    /// For the arguments the pin refuses, in its words: a second positional argument, one that is
+    /// not text or a list of text, a named parameter it does not take, a level that is not a level,
+    /// a storage it has not registered, a configuration the storage does not read, and a type it
+    /// does not log.
+    pub(crate) fn call(&self, call: &rudb_bind::Call) -> Result<()> {
+        let writes = if call.name.eq_ignore_ascii_case("disable_logging") {
+            disable_logging(call)?
+        } else {
+            enable_logging(call, &self.value("logging_storage")?)?
+        };
+        for (name, value) in writes {
+            let entry = rudb_functions::setting_named(name)
+                .expect("a logging setting the registry has, which its own test checks");
+            self.carry(entry, Some(&Value::Varchar(value)))?;
+        }
+        self.changes.fetch_add(1, AtomicOrdering::AcqRel);
+        Ok(())
     }
 
     /// What a setting rudb does not read is at now, which is its default until a statement sets it.
@@ -1662,6 +1749,164 @@ fn boolean_of(value: &Value) -> Result<bool> {
             text_of(value)
         ))
     })
+}
+
+/// The writes `CALL enable_logging(...)` makes, checked in the order the pin checks them.
+///
+/// `current` is the storage in use, which is the one kept when the call names none and gives no
+/// path. Several types are written back in the reverse of the order they were first named, with a
+/// type named twice kept once, which is the order the pin reads them back in.
+fn enable_logging(call: &rudb_bind::Call, current: &str) -> Result<Vec<(&'static str, String)>> {
+    let mut level = None;
+    let mut storage = None;
+    let mut shape = None;
+    let mut config: Vec<(String, Value)> = Vec::new();
+    for (name, value) in &call.named {
+        match name.to_ascii_lowercase().as_str() {
+            "level" => level = Some(logged_text(value)),
+            "storage" => storage = Some(logged_text(value)),
+            "storage_config" => shape = Some(value),
+            "storage_path" => config.push(("path".to_string(), value.clone())),
+            "storage_buffer_size" => config.push(("buffer_size".to_string(), value.clone())),
+            "storage_normalize" => config.push(("normalize".to_string(), value.clone())),
+            _ => {
+                return Err(Error::binder(format!(
+                    "Invalid named parameter \"{name}\" for function enable_logging\nCandidates:\n    level VARCHAR\n    storage VARCHAR\n    storage_buffer_size UBIGINT\n    storage_config ANY\n    storage_normalize BOOLEAN\n    storage_path VARCHAR\n"
+                )));
+            }
+        }
+    }
+    if call.positional.len() > 1 {
+        return Err(Error::invalid_input("EnableLogging: expected 0 or 1 parameter"));
+    }
+    let types: Option<Vec<String>> = match call.positional.first() {
+        None => None,
+        Some(Value::Varchar(text)) => Some(vec![text.clone()]),
+        Some(Value::List { element: LogicalType::Varchar, values }) => {
+            Some(values.iter().map(logged_text).collect())
+        }
+        Some(_) => {
+            return Err(Error::binder("Unexpected type positional parameter to enable_logging"));
+        }
+    };
+    let level = match level {
+        None => None,
+        Some(written) => match LOG_LEVELS.iter().find(|word| word.eq_ignore_ascii_case(&written)) {
+            Some(word) => Some(*word),
+            None => {
+                return Err(Error::not_implemented(unknown_enum_value(
+                    &written,
+                    "LogLevel",
+                    &LOG_LEVELS,
+                )));
+            }
+        },
+    };
+    if let Some(value) = shape {
+        let Value::Struct(fields) = value else {
+            return Err(Error::invalid_input("EnableLogging: storage_config must be a struct"));
+        };
+        config.extend(fields.iter().cloned());
+    }
+    // A path is a file, so naming one is enough to ask for the file storage, even a null one.
+    let path = config.iter().find(|(key, _)| key.eq_ignore_ascii_case("path"));
+    let storage = storage
+        .unwrap_or_else(|| if path.is_some() { "file".to_string() } else { current.to_string() });
+    let Some(&(_, class)) =
+        LOG_STORAGES.iter().find(|(name, _)| name.eq_ignore_ascii_case(&storage))
+    else {
+        return Err(Error::invalid_input(format!("Log storage '{storage}' is not yet registered")));
+    };
+    if class == "FileLogStorage" {
+        if path.is_none_or(|(_, path)| matches!(path, Value::Null) || text_of(path).is_empty()) {
+            return Err(Error::invalid_input(
+                "Cannot enable 'file' log storage without a valid path. Provide one via storage_path, e.g. CALL enable_logging(storage='file', storage_path='mylog.csv');",
+            ));
+        }
+        return Err(Error::not_implemented(
+            "CALL enable_logging with the file storage is not implemented. rudb keeps no log, so the file a later query reads back would not be there.",
+        ));
+    }
+    if class == "ShellLogStorage" && !config.is_empty() {
+        return Err(Error::invalid_input(
+            "Log storage 'ShellLogStorage' does not support passing configuration",
+        ));
+    }
+    if let Some((key, _)) = config
+        .iter()
+        .rev()
+        .find(|(key, _)| !["buffer_size", "only_flush_on_full_buffer"].contains(&key.as_str()))
+    {
+        return Err(Error::invalid_input(format!(
+            "Unrecognized log storage config option for storage: '{class}': '{key}'"
+        )));
+    }
+    let mut writes = vec![("enable_logging", "true".to_string()), ("logging_storage", storage)];
+    let Some(types) = types else {
+        writes.push(("enabled_log_types", String::new()));
+        writes.push(("logging_mode", "LEVEL_ONLY".to_string()));
+        writes.push(("logging_level", level.unwrap_or("INFO").to_string()));
+        return Ok(writes);
+    };
+    let mut named: Vec<&str> = Vec::new();
+    let mut verbose = "INFO";
+    for written in &types {
+        // An empty name is taken and turns nothing on, which is what the pin does with it.
+        let name = if written.is_empty() {
+            ""
+        } else {
+            let Some(&(name, at)) =
+                LOG_TYPES.iter().find(|(name, _)| name.eq_ignore_ascii_case(written))
+            else {
+                return Err(Error::invalid_input(format!("Unknown log type: '{written}'")));
+            };
+            let rank = |level: &str| LOG_LEVELS.iter().position(|word| *word == level);
+            if rank(at) < rank(verbose) {
+                verbose = at;
+            }
+            name
+        };
+        if !named.contains(&name) {
+            named.push(name);
+        }
+    }
+    named.reverse();
+    writes.push(("enabled_log_types", named.join(",")));
+    writes.push(("logging_mode", "ENABLE_SELECTED".to_string()));
+    writes.push(("logging_level", verbose.to_string()));
+    Ok(writes)
+}
+
+/// The write `CALL disable_logging()` makes, which turns the logger off and leaves its level, its
+/// types and its storage where they were for the next `enable_logging`.
+///
+/// # Errors
+///
+/// For any argument, in the words the pin uses for a function that takes none.
+fn disable_logging(call: &rudb_bind::Call) -> Result<Vec<(&'static str, String)>> {
+    if let Some((name, _)) = call.named.first() {
+        return Err(Error::binder(format!(
+            "Invalid named parameter \"{name}\" for function disable_logging\nFunction does not accept any named parameters."
+        )));
+    }
+    if !call.positional.is_empty() {
+        let types: Vec<String> =
+            call.positional.iter().map(|value| value.logical_type().to_string()).collect();
+        return Err(Error::binder(format!(
+            "No function matches the given name and argument types 'disable_logging({})'. You might need to add explicit type casts.\n\tCandidate functions:\n\t\"disable_logging\"()\n",
+            types.join(", ")
+        )));
+    }
+    Ok(vec![("enable_logging", "false".to_string())])
+}
+
+/// A logging argument as text, where a null is the word, because that is what the pin puts in the
+/// message when it refuses one.
+fn logged_text(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        other => text_of(other),
+    }
 }
 
 /// A value in the text its setting's own type reads it back as.
