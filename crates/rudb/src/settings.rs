@@ -222,11 +222,30 @@ pub(crate) struct Settings {
     built: Mutex<Option<(u64, Session)>>,
 }
 
+/// The zone `TZ` names, if it names one exactly.
+///
+/// The pin reads `TZ` before it asks the system, so `TZ=UTC` opens a database in UTC on a machine
+/// whose clock is in Berlin. That is how the upstream corpus runs, on CI machines that are in UTC,
+/// and it is how a run here matches it. A leading colon is dropped the way the C library drops it.
+/// The match is exact, so `TZ=utc` is not a zone and the system's zone is used, which is what the
+/// pin does too.
+fn environment_time_zone() -> Option<String> {
+    zone_in(&std::env::var("TZ").ok()?)
+}
+
+/// The zone a `TZ` value names, split out so a test can ask without changing the environment.
+fn zone_in(value: &str) -> Option<String> {
+    let name = value.strip_prefix(':').unwrap_or(value);
+    rudb_common::SessionTimeZone::named(name)
+        .filter(|zone| zone.name() == name)
+        .map(|_| name.to_string())
+}
+
 impl Settings {
     /// The settings a database opened with this configuration starts at.
     pub(crate) fn new(config: Config) -> Self {
-        let default_time_zone = iana_time_zone::get_timezone()
-            .ok()
+        let default_time_zone = environment_time_zone()
+            .or_else(|| iana_time_zone::get_timezone().ok())
             .filter(|zone| Session::knows_time_zone(zone))
             .unwrap_or_else(|| "UTC".to_string());
         Self {
@@ -1668,7 +1687,7 @@ fn bytes_of(text: &str) -> Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Catalog, Settings, bytes_of};
+    use super::{Catalog, Settings, bytes_of, zone_in};
     use crate::config::Config;
     use rudb_common::{Memory, Value};
     use rudb_parse::ast::Scope;
@@ -2029,5 +2048,16 @@ mod tests {
             error.message(),
             "Failed to cast value: Could not convert string 'abc' to INT64"
         );
+    }
+
+    #[test]
+    fn tz_names_the_zone_only_when_it_is_spelled_exactly() {
+        assert_eq!(zone_in("UTC").as_deref(), Some("UTC"));
+        assert_eq!(zone_in(":UTC").as_deref(), Some("UTC"));
+        assert_eq!(zone_in("Asia/Tokyo").as_deref(), Some("Asia/Tokyo"));
+        assert_eq!(zone_in("EST5EDT").as_deref(), Some("EST5EDT"));
+        assert_eq!(zone_in("utc"), None);
+        assert_eq!(zone_in(""), None);
+        assert_eq!(zone_in("Nonsense/Zone"), None);
     }
 }
