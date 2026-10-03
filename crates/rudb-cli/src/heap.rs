@@ -25,10 +25,12 @@
 //! time.
 //!
 //! A block of 256 KiB or more does not go to mimalloc at all on Linux. It is mapped from the system
-//! on its own, grown with `mremap`, and unmapped when it is freed; [`MAPPED_FROM`] says why.
+//! on its own, and kept for the next such block when it is freed, up to [`KEPT_BYTES`];
+//! [`MAPPED_FROM`] and [`Kept`] say why.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::{c_int, c_long};
+use std::sync::{Mutex, PoisonError};
 
 use libmimalloc_sys::{
     mi_free, mi_malloc, mi_malloc_aligned, mi_realloc, mi_realloc_aligned, mi_zalloc,
@@ -174,6 +176,234 @@ const MAPS: bool =
 /// The smallest page size Linux has, and so an alignment every mapping has.
 const PAGE: usize = 4096;
 
+/// How many bytes of freed mappings are kept for the blocks that come after them.
+///
+/// A mapping unmapped when its block is freed is gone, and the next block that size is a fresh one
+/// whose every page the kernel clears on first touch. A warm query frees its big blocks at the end
+/// of the statement and takes the same ones again at the start of the next, so on TPC-H SF1 at one
+/// thread q11 spent as many cycles in the kernel as in the query, 31 M against 31 M a run, nearly
+/// all of it faulting in its aggregate's table, and q18 spent 94 M against 227 M. Kept, a block
+/// comes back with its pages still in place, and a zeroed one is cleared with a `memset` over pages
+/// already resident, which is a fraction of what faulting them in costs.
+///
+/// The bound is what keeping can add to a process's peak, since a kept mapping still counts as
+/// resident until a block takes it.
+const KEPT_BYTES: usize = 64 << 20;
+
+/// How many ranges are kept at most, which bounds the walk a big allocation makes.
+const KEPT_BLOCKS: usize = 16;
+
+/// A size rounded up to whole pages, which is the length of the mapping a block of that size is.
+const fn paged(size: usize) -> usize {
+    size.div_ceil(PAGE) * PAGE
+}
+
+/// Ranges of freed mappings waiting for a block, oldest first, as start address and length, both
+/// on a page.
+///
+/// What is kept is address ranges rather than blocks, because the kernel's calls take any range of
+/// pages whatever call mapped them. That matters for the way a big block is made, which is a vector
+/// that starts small and doubles. Kept whole, the 32 MB mapping such a vector ended at was cut down
+/// to the 256 KiB it started at on the next run, losing every page past that, and each doubling
+/// after it faulted its new half in again. Here a block takes the part of a range it wants and the
+/// rest stays kept, a block that grows takes the range right after it when that is kept, so it
+/// grows where it is, and ranges freed next to each other join again. See [`MiMalloc::realloc`].
+struct Kept {
+    ranges: [(usize, usize); KEPT_BLOCKS],
+    count: usize,
+    bytes: usize,
+}
+
+static KEPT: Mutex<Kept> = Mutex::new(Kept { ranges: [(0, 0); KEPT_BLOCKS], count: 0, bytes: 0 });
+
+/// The ranges [`Kept::put`] pushed out, for the caller to unmap once the lock is let go.
+type Out = ([(usize, usize); KEPT_BLOCKS + 1], usize);
+
+impl Kept {
+    fn remove(&mut self, at: usize) -> (usize, usize) {
+        let range = self.ranges[at];
+        self.ranges.copy_within(at + 1..self.count, at);
+        self.count -= 1;
+        self.bytes -= range.1;
+        range
+    }
+
+    /// The start of `len` bytes cut from the shortest range that holds them, with what is left of
+    /// that range still kept.
+    fn fit(&mut self, len: usize) -> Option<usize> {
+        let lens = self.ranges[..self.count].iter().map(|range| range.1).enumerate();
+        let (at, _) = lens.filter(|&(_, have)| have >= len).min_by_key(|&(_, have)| have)?;
+        let (start, have) = self.ranges[at];
+        if have == len {
+            self.remove(at);
+        } else {
+            self.ranges[at] = (start + len, have - len);
+            self.bytes -= len;
+        }
+        Some(start)
+    }
+
+    /// The longest range, taken whole, for a block bigger than any of them.
+    fn longest(&mut self) -> Option<(usize, usize)> {
+        let lens = self.ranges[..self.count].iter().map(|range| range.1).enumerate();
+        let (at, _) = lens.max_by_key(|&(_, have)| have)?;
+        Some(self.remove(at))
+    }
+
+    /// Whether `len` bytes starting at `start` were kept and are now taken, which is how a block
+    /// ending at `start` grows where it is.
+    fn after(&mut self, start: usize, len: usize) -> bool {
+        let Some(at) = self.ranges[..self.count].iter().position(|range| range.0 == start) else {
+            return false;
+        };
+        let (_, have) = self.ranges[at];
+        if have < len {
+            return false;
+        }
+        if have == len {
+            self.remove(at);
+        } else {
+            self.ranges[at] = (start + len, have - len);
+            self.bytes -= len;
+        }
+        true
+    }
+
+    /// Keeps a range, joined to any kept range on either side of it, and returns what had to leave
+    /// to keep the set inside its bounds, oldest first. A range past the bound leaves itself.
+    fn put(&mut self, mut start: usize, mut len: usize) -> Out {
+        loop {
+            let ranges = &self.ranges[..self.count];
+            if let Some(at) = ranges.iter().position(|range| range.0 + range.1 == start) {
+                let (before, more) = self.remove(at);
+                (start, len) = (before, len + more);
+            } else if let Some(at) = ranges.iter().position(|range| range.0 == start + len) {
+                len += self.remove(at).1;
+            } else {
+                break;
+            }
+        }
+        let mut out = ([(0, 0); KEPT_BLOCKS + 1], 0);
+        if len > KEPT_BYTES {
+            out.0[0] = (start, len);
+            out.1 = 1;
+            return out;
+        }
+        while self.count == KEPT_BLOCKS || self.bytes + len > KEPT_BYTES {
+            out.0[out.1] = self.remove(0);
+            out.1 += 1;
+        }
+        self.ranges[self.count] = (start, len);
+        self.count += 1;
+        self.bytes += len;
+        out
+    }
+}
+
+fn kept() -> std::sync::MutexGuard<'static, Kept> {
+    KEPT.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Keeps `len` bytes of mapping at `start` and unmaps whatever that pushed out.
+///
+/// # Safety
+///
+/// The range is mapped, on a page at both ends, and nothing reads it after.
+#[allow(unsafe_code)]
+unsafe fn keep(start: usize, len: usize) {
+    let (out, left) = kept().put(start, len);
+    for &(at, len) in &out[..left] {
+        // SAFETY: a range that left the set is one nothing holds.
+        unsafe { system::unmap(at as *mut u8, len) };
+    }
+}
+
+/// A mapping for a block of `size` bytes, out of the kept ranges when they have one and fresh
+/// otherwise, with how many of its first bytes hold whatever was last in them, which is none for a
+/// fresh one.
+#[allow(unsafe_code)]
+fn mapping(size: usize) -> (*mut u8, usize) {
+    let len = paged(size);
+    let (fit, longest) = {
+        let mut kept = kept();
+        match kept.fit(len) {
+            Some(start) => (Some(start), None),
+            None => (None, kept.longest()),
+        }
+    };
+    if let Some(start) = fit {
+        return (start as *mut u8, size);
+    }
+    if let Some((start, have)) = longest {
+        let block = start as *mut u8;
+        // SAFETY: `block` is `have` bytes of mapping that nothing holds any more.
+        let grown = unsafe { system::remap(block, have, len) };
+        if !grown.is_null() {
+            return (grown, have);
+        }
+        // SAFETY: as above, and the failed resize left it as it was.
+        unsafe { keep(start, have) };
+    }
+    (system::map(size), 0)
+}
+
+/// A mapped block of `old` bytes made `new` bytes long, keeping its first `old.min(new)` bytes, or
+/// null with the block left as it was.
+///
+/// A block that shrinks keeps its tail rather than unmapping it, and one that grows takes the kept
+/// range right after it when there is one, so a vector that doubles into the space a vector before
+/// it held grows without a page fault. Failing that it moves into a kept range long enough, which
+/// copies what it holds and still faults nothing, and only then asks the kernel to resize it.
+///
+/// # Safety
+///
+/// `block` is a mapped block of `old` bytes that [`mapping`] or this made.
+#[allow(unsafe_code)]
+unsafe fn remapping(block: *mut u8, old: usize, new: usize) -> *mut u8 {
+    let (from, to) = (paged(old), paged(new));
+    let start = block as usize;
+    if to <= from {
+        if to < from {
+            // SAFETY: the tail past `to` is the block's own and nothing reads it after.
+            unsafe { keep(start + to, from - to) };
+        }
+        return block;
+    }
+    let moved = {
+        let mut kept = kept();
+        if kept.after(start + from, to - from) {
+            return block;
+        }
+        kept.fit(to)
+    };
+    if let Some(moved) = moved {
+        let moved = moved as *mut u8;
+        // SAFETY: `moved` is `to` bytes nothing else holds, and the block is `old` bytes apart
+        // from it, which are then kept since nothing reads them after.
+        unsafe {
+            std::ptr::copy_nonoverlapping(block, moved, old);
+            keep(start, from);
+        }
+        return moved;
+    }
+    // SAFETY: the caller's.
+    let grown = unsafe { system::remap(block, old, new) };
+    if !grown.is_null() {
+        return grown;
+    }
+    // A block put together out of two kept ranges can span two of the kernel's mappings, which
+    // `mremap` refuses, so the last way is a fresh mapping and a copy.
+    let fresh = system::map(new);
+    if !fresh.is_null() {
+        // SAFETY: as for a kept range above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(block, fresh, old);
+            keep(start, from);
+        }
+    }
+    fresh
+}
+
 /// Whether a block of this size and alignment is a mapping of its own.
 ///
 /// A pure function of the layout, so that the call that frees or grows a block, which is given the
@@ -283,7 +513,7 @@ pub(crate) struct MiMalloc;
 unsafe impl GlobalAlloc for MiMalloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if mapped(layout.size(), layout.align()) {
-            return system::map(layout.size());
+            return mapping(layout.size()).0;
         }
         // SAFETY: mimalloc takes any size, and [`given`] picks the call that answers this
         // alignment.
@@ -298,8 +528,14 @@ unsafe impl GlobalAlloc for MiMalloc {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if mapped(layout.size(), layout.align()) {
-            // A fresh mapping is zeroed by the kernel.
-            return system::map(layout.size());
+            // A fresh mapping is zeroed by the kernel and a kept one is not. Growing a kept one
+            // adds pages the kernel zeroes too, so only the part the last block had is cleared.
+            let (block, used) = mapping(layout.size());
+            if used > 0 && !block.is_null() {
+                // SAFETY: the block is a mapping of `layout.size()` bytes and `used` is no more.
+                unsafe { std::ptr::write_bytes(block, 0, used) };
+            }
+            return block;
         }
         // SAFETY: as [`GlobalAlloc::alloc`], and the zeroing is mimalloc's own.
         unsafe {
@@ -317,7 +553,7 @@ unsafe impl GlobalAlloc for MiMalloc {
         // them.
         unsafe {
             if mapped(layout.size(), layout.align()) {
-                system::unmap(ptr, layout.size());
+                keep(ptr as usize, paged(layout.size()));
             } else {
                 mi_free(ptr.cast());
             }
@@ -333,7 +569,7 @@ unsafe impl GlobalAlloc for MiMalloc {
             let was = mapped(layout.size(), layout.align());
             let will = mapped(size, layout.align());
             if was && will {
-                return system::remap(ptr, layout.size(), size);
+                return remapping(ptr, layout.size(), size);
             }
             if was || will {
                 // Across the bound the block changes hands, so it is copied into one the other
@@ -360,8 +596,9 @@ mod tests {
     use std::alloc::{GlobalAlloc, Layout};
 
     use super::{
-        GIVEN, MAPPED_FROM, MAPS, MiMalloc, PAGE, ROUNDED_FROM, ROUNDED_UPTO, binned, given,
-        keep_everything_at_exit, keep_freed_memory, mapped, purge_delay,
+        GIVEN, KEPT_BLOCKS, KEPT_BYTES, Kept, MAPPED_FROM, MAPS, MiMalloc, PAGE, ROUNDED_FROM,
+        ROUNDED_UPTO, binned, given, keep_everything_at_exit, keep_freed_memory, mapped,
+        purge_delay,
     };
 
     /// The option set is the purge delay, which mimalloc 2 starts at ten milliseconds, and not some
@@ -422,6 +659,46 @@ mod tests {
         assert!(!mapped(MAPPED_FROM - 1, 8), "a medium block stays with mimalloc");
         assert!(!mapped(MAPPED_FROM, 2 * PAGE), "and so does one that wants more than a page");
         assert!(!mapped(0, 1));
+    }
+
+    /// A block takes its length out of the shortest kept range that holds it, grows into the range
+    /// right after it, and ranges freed next to each other join again.
+    #[test]
+    fn a_kept_range_is_cut_and_joined() {
+        const K: usize = 1 << 10;
+        let mut kept = Kept { ranges: [(0, 0); KEPT_BLOCKS], count: 0, bytes: 0 };
+        assert_eq!(kept.put(1 << 30, 64 * K).1, 0);
+        assert_eq!(kept.put(2 << 30, 1024 * K).1, 0);
+        assert_eq!(kept.fit(256 * K), Some(2 << 30), "the shortest range that holds it");
+        assert_eq!(kept.bytes, 832 * K, "and the rest of it stays kept");
+        assert!(kept.after((2 << 30) + 256 * K, 256 * K), "a block grows where it is");
+        assert!(!kept.after((2 << 30) + 256 * K, 256 * K), "but only into what is kept");
+        assert_eq!(kept.put(2 << 30, 512 * K).1, 0);
+        assert_eq!(kept.count, 2, "the freed block joined the range after it");
+        assert_eq!(kept.longest(), Some((2 << 30, 1024 * K)), "and is whole again");
+        let (out, left) = kept.put(3 << 30, KEPT_BYTES);
+        assert_eq!(&out[..left], &[(1 << 30, 64 * K)], "the oldest goes to make room");
+        assert_eq!(kept.put(4 << 30, KEPT_BYTES + PAGE).1, 1, "a range past the bound leaves");
+    }
+
+    /// A freed big block comes back to the next one, grown or shrunk to it, and a zeroed one reads
+    /// as zeros even though the block before it wrote to every byte.
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_kept_mapping_comes_back_cleared() {
+        let heap = MiMalloc;
+        for size in [MAPPED_FROM * 4, MAPPED_FROM * 2 + 5, MAPPED_FROM * 8, MAPPED_FROM * 8] {
+            let layout = Layout::from_size_align(size, 8).expect("a layout");
+            // SAFETY: the block is `size` bytes and is freed with the layout it was made with.
+            unsafe {
+                let block = heap.alloc_zeroed(layout);
+                assert!(!block.is_null());
+                assert!((0..size).step_by(509).all(|at| block.add(at).read() == 0), "{size}");
+                assert_eq!(block.add(size - 1).read(), 0, "the last byte of {size}");
+                block.write_bytes(0xa5, size);
+                heap.dealloc(block, layout);
+            }
+        }
     }
 
     /// A block keeps what was written to it as it grows within the mappings, shrinks back across
