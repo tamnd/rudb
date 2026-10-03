@@ -42,6 +42,13 @@ pub enum NativeExtremaValues {
     Date { low: i32, high: i32 },
 }
 
+/// Whether `sql` starts with `PREPARE`, `EXECUTE` or `DEALLOCATE`, which a connection answers
+/// itself.
+fn names_prepared(sql: &str) -> bool {
+    let word = sql.trim_start().split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+    ["prepare", "execute", "deallocate"].iter().any(|keyword| word.eq_ignore_ascii_case(keyword))
+}
+
 fn native_simple_identifier(text: &str) -> bool {
     let mut bytes = text.bytes();
     matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
@@ -612,6 +619,18 @@ struct Conn {
     /// [`Shared::claim`] as it fails the statement, and taken by [`Shared::execute_ast`], which
     /// waits once the statement has let go of everything and runs it again.
     blocked: AtomicU64,
+    /// The statements `PREPARE` named, by the name in lower case, since the pin finds `"S"` under
+    /// `s`.
+    prepared: Mutex<BTreeMap<String, Arc<Named>>>,
+}
+
+/// A statement `PREPARE` gave a name to, parsed, with its parameters in the order they were
+/// written.
+#[derive(Debug)]
+struct Named {
+    sql: String,
+    ast: Ast,
+    names: Vec<String>,
 }
 
 impl Conn {
@@ -623,6 +642,7 @@ impl Conn {
             staged: Mutex::default(),
             registry,
             blocked: AtomicU64::new(0),
+            prepared: Mutex::default(),
         }
     }
 }
@@ -3667,6 +3687,11 @@ impl Shared {
         if let Some(script) = several(sql) {
             return self.run_script(&script, cancel, Self::query);
         }
+        // These answer through the connection rather than the catalog, and `EXECUTE` answers with
+        // whatever the statement it runs does, so they take the path that may write.
+        if names_prepared(sql) {
+            return self.execute(sql, cancel);
+        }
         self.in_transaction(sql, || {
             if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
                 return Ok(answer);
@@ -4645,8 +4670,124 @@ impl Shared {
             let (ast, parse_ns) = timed(|| {
                 rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case())
             })?;
+            if let Some(answer) = self.prepared_statement(&ast, sql, cancel) {
+                return answer;
+            }
             self.execute_ast(&ast, sql, &Parameters::new(), cancel, parse_ns)
         })
+    }
+
+    /// The statements this connection holds by name.
+    fn prepared(&self) -> MutexGuard<'_, BTreeMap<String, Arc<Named>>> {
+        self.conn.prepared.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Runs `PREPARE`, `EXECUTE` or `DEALLOCATE`, which work on the statements the connection
+    /// holds rather than on the database, or answers `None` for any other statement.
+    fn prepared_statement(
+        &self,
+        ast: &Ast,
+        sql: &str,
+        cancel: &Cancel,
+    ) -> Option<Result<QueryResult>> {
+        let answer = match *ast.statements.first()? {
+            ast::Statement::Prepare { name, text } => {
+                self.prepare_named(ast.string(name), ast.string(text))
+            }
+            ast::Statement::Execute { name, values } => {
+                self.execute_named(ast, ast.string(name), values, sql, cancel)
+            }
+            // The pin says nothing about a name it does not hold.
+            ast::Statement::Deallocate(name) => {
+                self.prepared().remove(&ast.string(name).to_lowercase());
+                Ok(QueryResult::empty())
+            }
+            _ => return None,
+        };
+        Some(answer)
+    }
+
+    /// Parses `text` and holds it under `name`, in place of whatever was held there.
+    ///
+    /// The pin binds the statement as it prepares it, so a table or a column that is not there is
+    /// refused now rather than at the first `EXECUTE`. There are no values yet, so the statement
+    /// is bound with each parameter `NULL` and only the errors about names are kept, since a value
+    /// for a parameter could not have changed those.
+    fn prepare_named(&self, name: &str, text: &str) -> Result<QueryResult> {
+        let session = self.session();
+        let ast = rudb_parse::parse_ast_with_case(text, session.semantics().identifier_case())?;
+        let names: Vec<String> = ast.parameters().into_iter().map(str::to_string).collect();
+        let mut trial = Parameters::new();
+        for parameter in &names {
+            trial.set(parameter.clone(), Value::Null);
+        }
+        let bound = rudb_bind::bind_statement_with(&ast, &self.read(), &trial, &session);
+        if let Err(error) = bound
+            && (error.code() == rudb_common::ErrorCode::Catalog
+                || error.message().starts_with("Referenced column"))
+        {
+            return Err(error);
+        }
+        let named = Arc::new(Named { sql: text.to_string(), ast, names });
+        self.prepared().insert(name.to_lowercase(), named);
+        Ok(QueryResult::empty())
+    }
+
+    /// Runs the statement held under `name` with the values the query `values` answers, by the
+    /// names that query gives its columns or by position when it gives them none.
+    fn execute_named(
+        &self,
+        ast: &Ast,
+        name: &str,
+        values: ast::QueryRef,
+        sql: &str,
+        cancel: &Cancel,
+    ) -> Result<QueryResult> {
+        let named = self.prepared().get(&name.to_lowercase()).cloned();
+        let named = named.ok_or_else(|| {
+            Error::binder(format!("Prepared statement \"{name}\" does not exist"))
+        })?;
+        let mut parameters = Parameters::new();
+        if values != rudb_parse::NONE {
+            let mut asked = ast.clone();
+            asked.statements = vec![ast::Statement::Query(values)];
+            let row = self.execute_ast(&asked, sql, &Parameters::new(), cancel, 0)?;
+            let ast::QueryBody::Select(select) = ast.query(values).body else {
+                return Err(Error::internal("the values of an EXECUTE are not a select list"));
+            };
+            for (at, target) in ast.target_list(ast.select(select).targets).iter().enumerate() {
+                let name = if target.alias == rudb_parse::NONE {
+                    (at + 1).to_string()
+                } else {
+                    ast.string(target.alias).to_string()
+                };
+                parameters.set(name, row.value_at(0, at));
+            }
+        }
+        // Excess first, which is the order the pin checks in from SQL.
+        let excess: Vec<&str> = parameters
+            .names()
+            .filter(|name| !named.names.iter().any(|held| held.eq_ignore_ascii_case(name)))
+            .collect();
+        if !excess.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "Parameter argument/count mismatch, identifiers of the excess parameters: {}",
+                excess.join(", ")
+            )));
+        }
+        let missing: Vec<&str> = named
+            .names
+            .iter()
+            .filter(|name| parameters.get(name).is_none())
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "Values were not provided for the following parameters: {}",
+                missing.join(", ")
+            )));
+        }
+        self.execute_ast(&named.ast, &named.sql, &parameters, cancel, 0)
     }
 
     /// Runs a script of several statements one after another and answers with what the last one

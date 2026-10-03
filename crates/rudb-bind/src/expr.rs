@@ -457,11 +457,9 @@ impl Binder<'_> {
     fn bind_parameter(&mut self, ast: &Ast, name: ast::StrRef) -> Result<ExprRef> {
         let name = ast.string(name);
         let Some(value) = self.parameters.get(name) else {
-            // DuckDB's first line, then ours, because the second half of its sentence names PREPARE
-            // and PREPARE is #152. The library route works today.
             return Err(Error::invalid_input(
                 "Prepared statement parameters cannot be used directly\nTo use prepared statement \
-                 parameters, prepare the statement first, which is Connection::prepare",
+                 parameters, use PREPARE to prepare a statement, followed by EXECUTE",
             ));
         };
         Ok(self.add_constant(value.clone()))
@@ -576,6 +574,19 @@ impl Binder<'_> {
                         "column \"{word}\" must appear in the GROUP BY clause or be used in an aggregate function"
                     )));
                 }
+            }
+            // With nothing in scope here or outside, the pin says the `FROM` clause is missing.
+            if scope.len() == 0 && self.outer_scopes.iter().all(|outer| outer.len() == 0) {
+                return Err(Error::binder(match parts {
+                    [word] => format!(
+                        "Referenced column \"{word}\" was not found because the FROM clause is \
+                         missing"
+                    ),
+                    _ => format!(
+                        "Referenced table \"{}\" not found!",
+                        parts[..parts.len() - 1].join(".")
+                    ),
+                }));
             }
             return scope.resolve(parts).map(|_| unreachable!());
         };

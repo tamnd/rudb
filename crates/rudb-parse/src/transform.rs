@@ -501,8 +501,87 @@ impl<'a> Transform<'a> {
                 let query = self.call_query(inner)?;
                 Ok(Statement::Query(query))
             }
+            "PrepareStatement" => self.prepare_statement(inner),
+            "ExecuteStatement" => self.execute_statement(inner),
+            "DeallocateStatement" => {
+                Ok(Statement::Deallocate(self.identifier(self.find(inner, "Identifier"))))
+            }
             _ => self.unsupported(inner),
         }
+    }
+
+    /// `PrepareStatement <- 'PREPARE' Identifier TypeList? 'AS' Statement`.
+    ///
+    /// The statement is kept as its text and parsed again when it is prepared, so here it is only
+    /// checked for being one the pin prepares. A type list is refused in the pin's words, since the
+    /// pin parses one and does nothing with it.
+    fn prepare_statement(&mut self, node: u32) -> Result<Statement> {
+        if self.find(node, "TypeList") != NONE {
+            return Err(Error::not_implemented(
+                "TypeList for prepared statement has not been implemented.",
+            ));
+        }
+        let statement = self.find(node, "Statement");
+        let kind = match self.name(self.first(statement)) {
+            "PrepareStatement" => Some("PREPARE_STATEMENT"),
+            "ExecuteStatement" => Some("EXECUTE_STATEMENT"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            return Err(Error::parser(format!("{kind} is not a preparable statement")));
+        }
+        let name = self.identifier(self.find(node, "Identifier"));
+        let text = self.text(statement).to_string();
+        let text = self.intern(&text);
+        Ok(Statement::Prepare { name, text })
+    }
+
+    /// `ExecuteStatement <- 'EXECUTE' Identifier TableFunctionArguments?`.
+    ///
+    /// The values are written the way a table function's arguments are, by position or as `name :=
+    /// value`, and become a query of one row with the names as aliases. A value has to be worked
+    /// out from itself alone, so the pin refuses a column or a subquery anywhere in one, and it
+    /// refuses names and positions mixed in one call.
+    fn execute_statement(&mut self, node: u32) -> Result<Statement> {
+        let name = self.identifier(self.find(node, "Identifier"));
+        let list = self.find(node, "TableFunctionArguments");
+        let first = self.ast.exprs.len();
+        let mut values = Vec::new();
+        if list != NONE {
+            for kid in self.kids(list) {
+                values.push(self.table_argument(kid)?);
+            }
+        }
+        if values.is_empty() {
+            return Ok(Statement::Execute { name, values: NONE });
+        }
+        let scalar = self.ast.exprs[first..].iter().all(|expr| {
+            !matches!(
+                expr,
+                Expr::Star { .. }
+                    | Expr::Columns { .. }
+                    | Expr::Column { .. }
+                    | Expr::Subquery { .. }
+                    | Expr::InSubquery { .. }
+                    | Expr::QuantifiedSubquery { .. }
+                    | Expr::Exists { .. }
+            )
+        });
+        if !scalar {
+            return Err(Error::invalid_input(
+                "Only scalar parameters, named parameters or NULL supported for EXECUTE",
+            ));
+        }
+        let named = values.iter().filter(|value| value.alias != NONE).count();
+        if named != 0 && named != values.len() {
+            return Err(Error::not_implemented(
+                "Mixing named parameters and positional parameters is not supported yet",
+            ));
+        }
+        let targets = self.target_slice(values);
+        let select = self.push_select(Select { targets, ..Select::empty() });
+        let values = self.push_query(Query::bare(QueryBody::Select(select)));
+        Ok(Statement::Execute { name, values })
     }
 
     /// `ExplainStatement <- 'EXPLAIN' AnalyzeKeyword? ExplainOptionList? ExplainableStatements`.
@@ -6410,6 +6489,16 @@ mod tests {
                     .collect::<String>();
                 format!("COPY ({}) TO {}{options}", show_query(&ast, copy.query), copy.path)
             }
+            Statement::Prepare { name, text } => {
+                format!("PREPARE {} AS {}", ast.string(name), ast.string(text))
+            }
+            Statement::Execute { name, values } if values == NONE => {
+                format!("EXECUTE {}", ast.string(name))
+            }
+            Statement::Execute { name, values } => {
+                format!("EXECUTE {} {}", ast.string(name), show_query(&ast, values))
+            }
+            Statement::Deallocate(name) => format!("DEALLOCATE {}", ast.string(name)),
         }
     }
 
