@@ -1333,6 +1333,92 @@ impl MemoryTable {
     }
 }
 
+impl MemoryTable {
+    /// Writes `values` over the columns `targets` of row `place` of chunk `chunk`, which is how an
+    /// `UPDATE` of one row lands without the table being built again, and says whether it could.
+    ///
+    /// A row of the tail is not written here, because the tail is laid out again whenever it is
+    /// read, and the caller takes the long way for it. A column of a sealed group is written where
+    /// it is, see [`Vector::put`], so the cost is the row unless somebody still holds the page.
+    ///
+    /// The zones of the chunk and of the run it is in take the new values and stop saying their
+    /// ends and totals are exact, the counts take them as [`Counts::rewrite`] says, and what was
+    /// worked out from the rows is dropped the way an append drops it.
+    ///
+    /// # Errors
+    ///
+    /// If there is no such row or column, or a value is not one its column holds.
+    pub fn put_row(
+        &mut self,
+        chunk: usize,
+        place: usize,
+        targets: &[usize],
+        values: &[Value],
+    ) -> Result<bool> {
+        let slot = *self
+            .slots
+            .get(chunk)
+            .ok_or_else(|| Error::internal("a row written in a chunk that is not there"))?;
+        if place >= self.rows_of(slot) {
+            return Err(Error::internal("a row written past the end of its chunk"));
+        }
+        if targets.len() != values.len() {
+            return Err(Error::internal("a row written with a value short or over"));
+        }
+        for (&column, value) in targets.iter().zip(values) {
+            let ty = self
+                .types
+                .get(column)
+                .ok_or_else(|| Error::internal("a row written in a column past the table"))?;
+            if !value.is_null() && !value.is_of(ty) {
+                return Err(Error::internal("a row written with a value of another type"));
+            }
+        }
+        match slot {
+            Slot::Window { group, .. } if group >= self.groups.len() => {
+                return Err(Error::internal("a chunk names a group that is not there"));
+            }
+            Slot::Open { at } if self.open.get(at).is_none_or(|held| held.kept().is_some()) => {
+                return Ok(false);
+            }
+            Slot::Tail => return Ok(false),
+            _ => {}
+        }
+        self.forget_grams();
+        for (&column, value) in targets.iter().zip(values) {
+            let was_null = match slot {
+                Slot::Window { group, at, .. } => {
+                    let held = &mut self.groups[group];
+                    let page = &mut held.columns[column];
+                    let was_null = page.try_value_at(at + place)?.is_null();
+                    page.put(at + place, value)?;
+                    held.zone.rewrite(column, was_null, value, &self.types[column]);
+                    was_null
+                }
+                Slot::Open { at } => {
+                    let held = std::mem::replace(&mut self.open[at], Chunk::empty(&[]));
+                    let rows = held.len();
+                    let mut columns = held.into_columns();
+                    let was_null = columns[column].try_value_at(place)?.is_null();
+                    let put = columns[column].put(place, value);
+                    self.open[at] = Chunk::with_rows(columns, rows)?;
+                    put?;
+                    if let Some(zone) = &mut self.open_zone {
+                        zone.rewrite(column, was_null, value, &self.types[column]);
+                    }
+                    was_null
+                }
+                Slot::Tail => return Ok(false),
+            };
+            if let Some(zone) = self.zones.get_mut(chunk) {
+                zone.rewrite(column, was_null, value, &self.types[column]);
+            }
+            self.counts.rewrite(column, value);
+        }
+        Ok(true)
+    }
+}
+
 /// An open run taken away to be sealed: the slot of its first chunk, its chunks, and its zone.
 struct Run {
     first: usize,

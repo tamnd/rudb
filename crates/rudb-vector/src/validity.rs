@@ -157,6 +157,20 @@ impl Validity {
         Self::Mask(mask)
     }
 
+    /// The validity of a vector where `index` has just been given a value.
+    ///
+    /// The other half of [`Self::with_null`], by value for the same reason.
+    #[must_use]
+    pub fn with_value(self, index: usize, len: usize) -> Self {
+        let mut mask = match self {
+            Self::AllValid => return Self::AllValid,
+            Self::AllInvalid => Bitmap::all_invalid(len),
+            Self::Mask(mask) => mask,
+        };
+        mask.set(index, true);
+        Self::Mask(mask)
+    }
+
     /// Validity built from a per-value predicate, normalized.
     pub fn from_iter(len: usize, valid: impl Fn(usize) -> bool) -> Self {
         let mut mask = Bitmap::all_valid(len);

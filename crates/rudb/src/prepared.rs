@@ -45,6 +45,7 @@ pub struct Prepared {
     names: Vec<String>,
     direct: Option<Direct>,
     lookup: Option<Lookup>,
+    write: Option<PointWrite>,
     /// Whether the parameters are `1` to `n` and nothing else, so that `n` values by position are
     /// exactly the values the statement wants, with nothing missing and nothing left over.
     numbered: bool,
@@ -126,6 +127,61 @@ pub(crate) struct Lookup {
     pub(crate) found: Resolved,
 }
 
+/// The equalities of a `WHERE` that is `column = parameter` joined by `AND` and nothing else, as
+/// the column written and the parameter's item.
+fn equalities(ast: &Ast, filter: ast::ExprRef) -> Option<Vec<(Vec<String>, Item)>> {
+    let words = |slice| ast.name(slice).map(str::to_owned).collect::<Vec<_>>();
+    let mut equal = Vec::new();
+    let mut pending = vec![filter];
+    while let Some(expr) = pending.pop() {
+        let ast::Expr::Binary { op, left, right } = ast.expr(expr) else { return None };
+        match op {
+            ast::BinaryOp::And => pending.extend([right, left]),
+            ast::BinaryOp::Eq => {
+                let (column, parameter) = match (ast.expr(left), ast.expr(right)) {
+                    (ast::Expr::Column { name }, ast::Expr::Parameter { name: parameter })
+                    | (ast::Expr::Parameter { name: parameter }, ast::Expr::Column { name }) => {
+                        (name, parameter)
+                    }
+                    _ => return None,
+                };
+                let parameter = ast.string(parameter);
+                equal.push((
+                    words(column),
+                    Item::Parameter(parameter.to_owned(), numbered(parameter)),
+                ));
+            }
+            _ => return None,
+        }
+    }
+    Some(equal)
+}
+
+/// An `UPDATE` of one table whose `WHERE` is a [`Lookup`]'s, and whose `SET` gives each column
+/// a parameter, a `NULL` or the column itself plus or minus a parameter, with no `FROM` and no
+/// `RETURNING`.
+///
+/// That is the write by key of `13-the-point-path.md` section 13.4, and the plan for it reads every
+/// row of the table to change one. An execution that finds a plain table and the row by its key
+/// writes the row where it is. Anything the shape cannot settle by itself, a column in a key, a
+/// constraint to check or a value that is not already its column's type, goes the long way.
+#[derive(Debug, Clone)]
+pub(crate) struct PointWrite {
+    /// The table and the key, as a [`Lookup`] of every column.
+    pub(crate) lookup: Lookup,
+    /// Each column the `SET` names, as written, with what it is set to.
+    pub(crate) sets: Vec<(String, Set)>,
+}
+
+/// What one column of a [`PointWrite`] is set to.
+#[derive(Debug, Clone)]
+pub(crate) enum Set {
+    /// An item as it is.
+    To(Item),
+    /// The column as it was plus the item, or minus it when this says so.
+    Add(Item, bool),
+}
+
 /// One entry of a [`Lookup`] select list.
 #[derive(Debug, Clone)]
 pub(crate) enum Pick {
@@ -147,6 +203,8 @@ pub(crate) struct Target {
     /// Whether a column may hold a `TIMESTAMPTZ`, which is the one kind of value a result needs
     /// the session to write.
     pub(crate) zoned: bool,
+    /// The columns a [`PointWrite`] sets, in the order of its `SET`, and nothing for a lookup.
+    pub(crate) sets: Vec<usize>,
 }
 
 /// The [`Target`] a [`Lookup`] resolved to, with the catalog's [`naming`] it was resolved at.
@@ -308,30 +366,107 @@ impl Lookup {
                 _ => return None,
             });
         }
-        let mut equal = Vec::new();
-        let mut pending = vec![select.filter];
-        while let Some(expr) = pending.pop() {
-            let ast::Expr::Binary { op, left, right } = ast.expr(expr) else { return None };
-            match op {
-                ast::BinaryOp::And => pending.extend([right, left]),
-                ast::BinaryOp::Eq => {
-                    let (column, parameter) = match (ast.expr(left), ast.expr(right)) {
-                        (ast::Expr::Column { name }, ast::Expr::Parameter { name: parameter })
-                        | (ast::Expr::Parameter { name: parameter }, ast::Expr::Column { name }) => {
-                            (name, parameter)
-                        }
-                        _ => return None,
-                    };
-                    let parameter = ast.string(parameter);
-                    equal.push((
-                        words(column),
-                        Item::Parameter(parameter.to_owned(), numbered(parameter)),
-                    ));
+        let equal = equalities(ast, select.filter)?;
+        Some(Self { name: words(name), alias, picks, equal, found: Resolved::default() })
+    }
+}
+
+impl PointWrite {
+    /// The shape of `ast`, if it is one statement of it.
+    ///
+    /// The statement is held as `SELECT *, hit, values... FROM table`, see the parser's
+    /// `changed_rows`, so that is the query looked for here.
+    fn of(ast: &Ast) -> Option<Self> {
+        let [ast::Statement::Update(at)] = ast.statements.as_slice() else { return None };
+        let update = ast.insert(*at);
+        if update.returning.is_some()
+            || update.conflict.is_some()
+            || update.copy
+            || update.source == rudb_parse::NONE
+        {
+            return None;
+        }
+        let query = ast.query(update.source);
+        let ast::QueryBody::Select(select) = query.body else { return None };
+        if query != ast::Query::bare(query.body) {
+            return None;
+        }
+        let select = ast.select(select);
+        if select.distinct != ast::Distinct::No
+            || select.group_by.len != 0
+            || select.group_by_all
+            || select.having != rudb_parse::NONE
+            || select.qualify != rudb_parse::NONE
+            || select.filter != rudb_parse::NONE
+        {
+            return None;
+        }
+        let [source] = ast.source_list(select.from) else { return None };
+        let ast::Source::Table { name, alias, columns } = ast.source(*source) else { return None };
+        if columns.len != 0 {
+            return None;
+        }
+        let [star, hit, values @ ..] = ast.target_list(select.targets) else { return None };
+        let bare_star = matches!(
+            ast.expr(star.expr),
+            ast::Expr::Star { qualifier, replacements }
+                if qualifier.len == 0 && replacements.len == 0
+        ) && ast.star_lists(star.expr) == ast::StarLists::default();
+        if !bare_star || star.alias != rudb_parse::NONE || hit.alias != rudb_parse::NONE {
+            return None;
+        }
+        let equal = equalities(ast, hit.expr)?;
+        let columns: Vec<String> = ast.name(update.columns).map(str::to_owned).collect();
+        if columns.is_empty() || columns.len() != values.len() {
+            return None;
+        }
+        let parameter = |expr| match ast.expr(expr) {
+            ast::Expr::Parameter { name } => {
+                let name = ast.string(name);
+                Some(Item::Parameter(name.to_owned(), numbered(name)))
+            }
+            _ => None,
+        };
+        let mut sets = Vec::with_capacity(columns.len());
+        for (column, value) in columns.into_iter().zip(values) {
+            if sets.iter().any(|(held, _): &(String, Set)| held.eq_ignore_ascii_case(&column)) {
+                return None;
+            }
+            // The column itself, unqualified, which is the only way the shape reads it.
+            let itself = |expr| match ast.expr(expr) {
+                ast::Expr::Column { name } => {
+                    let mut words = ast.name(name);
+                    words.next().is_some_and(|word| word.eq_ignore_ascii_case(&column))
+                        && words.next().is_none()
+                }
+                _ => false,
+            };
+            let set = match ast.expr(value.expr) {
+                ast::Expr::Parameter { .. } => Set::To(parameter(value.expr)?),
+                ast::Expr::Literal { kind: ast::LiteralKind::Null, .. } => Set::To(Item::Null),
+                ast::Expr::Binary { op: ast::BinaryOp::Add, left, right } if itself(left) => {
+                    Set::Add(parameter(right)?, false)
+                }
+                ast::Expr::Binary { op: ast::BinaryOp::Add, left, right } if itself(right) => {
+                    Set::Add(parameter(left)?, false)
+                }
+                ast::Expr::Binary { op: ast::BinaryOp::Subtract, left, right } if itself(left) => {
+                    Set::Add(parameter(right)?, true)
                 }
                 _ => return None,
-            }
+            };
+            sets.push((column, set));
         }
-        Some(Self { name: words(name), alias, picks, equal, found: Resolved::default() })
+        let words = |slice| ast.name(slice).map(str::to_owned).collect::<Vec<_>>();
+        let alias = (alias != rudb_parse::NONE).then(|| ast.string(alias).to_owned());
+        let lookup = Lookup {
+            name: words(name),
+            alias,
+            picks: vec![Pick::All(Vec::new())],
+            equal,
+            found: Resolved::default(),
+        };
+        Some(Self { lookup, sets })
     }
 }
 
@@ -343,8 +478,9 @@ impl Prepared {
         let names: Vec<String> = ast.parameters().into_iter().map(str::to_string).collect();
         let direct = Direct::of(&ast);
         let lookup = Lookup::of(&ast);
+        let write = PointWrite::of(&ast);
         let numbered = numbered_one_to_n(&names);
-        Ok(Self { shared, sql: sql.to_string(), ast, names, direct, lookup, numbered })
+        Ok(Self { shared, sql: sql.to_string(), ast, names, direct, lookup, write, numbered })
     }
 
     /// The statement as it was written.
@@ -384,6 +520,14 @@ impl Prepared {
             && values.len() == self.names.len()
             && let Some(lookup) = &self.lookup
             && let Some(done) = self.shared.lookup(lookup, Given::Positional(values), &self.sql)
+        {
+            return done.map_err(|error| self.shared.process_error(error));
+        }
+        // The write by key, likewise.
+        if self.numbered
+            && values.len() == self.names.len()
+            && let Some(write) = &self.write
+            && let Some(done) = self.shared.write_point(write, Given::Positional(values), &self.sql)
         {
             return done.map_err(|error| self.shared.process_error(error));
         }
@@ -428,6 +572,12 @@ impl Prepared {
             }
             if let Some(lookup) = &self.lookup
                 && let Some(done) = self.shared.lookup(lookup, Given::Named(&parameters), &self.sql)
+            {
+                return done;
+            }
+            if let Some(write) = &self.write
+                && let Some(done) =
+                    self.shared.write_point(write, Given::Named(&parameters), &self.sql)
             {
                 return done;
             }
@@ -537,6 +687,47 @@ mod tests {
             "SELECT name FROM t",
         ] {
             assert!(db.prepare(sql).expect("prepares").lookup.is_none(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_write_by_key_takes_the_short_way() {
+        let db = Database::new();
+        db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR, n BIGINT)")
+            .expect("creates");
+        db.execute("INSERT INTO t SELECT i, 'v' || i, i FROM range(3000) r(i)").expect("inserts");
+        let prepared =
+            db.prepare("UPDATE t SET name = ?, n = n + ? WHERE id = ?").expect("prepares");
+        let write = prepared.write.as_ref().expect("the shape is recognised");
+        let values = vec![Value::Varchar("b".into()), Value::BigInt(5), Value::BigInt(2)];
+        let taken = prepared.shared.write_point(write, Given::Positional(&values), prepared.sql());
+        assert_eq!(taken.expect("taken").expect("runs").value_at(0, 0), Value::BigInt(1));
+        let values = vec![Value::Varchar("c".into()), Value::BigInt(5), Value::BigInt(-2)];
+        let taken = prepared.shared.write_point(write, Given::Positional(&values), prepared.sql());
+        assert_eq!(taken.expect("taken").expect("runs").value_at(0, 0), Value::BigInt(0));
+        let read = db.execute("SELECT name, n FROM t WHERE id = 2").expect("reads");
+        assert_eq!(read.value_at(0, 0), Value::Varchar("b".into()));
+        assert_eq!(read.value_at(0, 1), Value::BigInt(7));
+        let values = vec![Value::Varchar("c".into()), Value::BigInt(i64::MAX), Value::BigInt(2)];
+        let taken = prepared.shared.write_point(write, Given::Positional(&values), prepared.sql());
+        assert!(taken.is_none(), "a sum that overflows goes to the plan");
+        let prepared = db.prepare("UPDATE t SET id = ? WHERE id = ?").expect("prepares");
+        let write = prepared.write.as_ref().expect("the shape is recognised");
+        let values = vec![Value::BigInt(-1), Value::BigInt(2)];
+        let taken = prepared.shared.write_point(write, Given::Positional(&values), prepared.sql());
+        assert!(taken.is_none(), "a key written goes to the plan");
+
+        for sql in [
+            "UPDATE t SET name = ? WHERE id = ? RETURNING id",
+            "UPDATE t SET name = ? WHERE id = ? OR id = ?",
+            "UPDATE t SET name = upper(?) WHERE id = ?",
+            "UPDATE t SET n = n * ? WHERE id = ?",
+            "UPDATE t SET n = id + ? WHERE id = ?",
+            "UPDATE t SET name = ? FROM t AS u WHERE t.id = ?",
+            "UPDATE t SET name = ?",
+            "DELETE FROM t WHERE id = ?",
+        ] {
+            assert!(db.prepare(sql).expect("prepares").write.is_none(), "{sql}");
         }
     }
 }

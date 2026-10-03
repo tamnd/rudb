@@ -3970,6 +3970,128 @@ impl Shared {
         (!unanswered).then_some(result)
     }
 
+    /// Runs a prepared write by key without binding it, or says it cannot and leaves everything as
+    /// it was, for [`Shared::execute_ast`] to run, see [`crate::prepared::PointWrite`].
+    ///
+    /// Outside a transaction only, and only while no transaction is open on the database, since
+    /// then nobody holds a claim on the row or a snapshot that has to be kept from it. Everything
+    /// that could make the plan's answer differ is checked before anything is touched: a table
+    /// with checks, a declared order or a foreign key either way, a column the `SET` names in a key
+    /// or a unique index, a value that is not already its column's type or a widening of it, a sum
+    /// that does not fit its column, and a null for a `NOT NULL` column. The row is read by its
+    /// key, written where it is, logged the way the plan's update of it would be, and committed.
+    pub(crate) fn write_point(
+        &self,
+        write: &crate::prepared::PointWrite,
+        given: crate::prepared::Given<'_>,
+        sql: &str,
+    ) -> Option<Result<QueryResult>> {
+        use crate::prepared::Set;
+        if !self.inner.writable {
+            return None;
+        }
+        let keys = write
+            .lookup
+            .equal
+            .iter()
+            .map(|(_, item)| given.value(item))
+            .collect::<Option<Vec<_>>>()?;
+        let writing = self.writing();
+        if self.transacting() || self.registry().watched() {
+            return None;
+        }
+        let mut catalog = self.write();
+        let target = match write.lookup.found.get(catalog.naming()) {
+            Some(target) => target,
+            None => {
+                let target = Arc::new(point_write_target(&catalog, write)?);
+                write.lookup.found.keep(catalog.naming(), Arc::clone(&target));
+                target
+            }
+        };
+        let name = &target.name;
+        let sets = target.sets.as_slice();
+        let table = catalog.table(name).ok()?;
+        let touches = |columns: &[usize]| columns.iter().any(|column| sets.contains(column));
+        if table.guards().iter().any(|key| touches(&key.columns))
+            || table.indexes().iter().any(|index| index.unique && touches(&index.columns))
+            || !table.checks().is_empty()
+            || !table.foreign().is_empty()
+            || table.clustering().is_some()
+            || catalog.tables().any(|held| held.foreign().iter().any(|key| &key.table == name))
+        {
+            return None;
+        }
+        let Some((spot, row)) = table.spot(&target.key, &keys, &target.columns).ok()?? else {
+            // No row holds the key, so nothing changes and there is nothing to commit.
+            drop(catalog);
+            drop(writing);
+            return Some(kept(sql, 0, |_| QueryResult::changed(0)));
+        };
+        let fields = table.columns();
+        let mut values = Vec::with_capacity(sets.len());
+        for ((_, set), &column) in write.sets.iter().zip(sets) {
+            let ty = &fields[column].ty;
+            let value = match set {
+                Set::To(item) => {
+                    let value = given.value(item)?;
+                    if value.is_null() || value.is_of(ty) {
+                        value
+                    } else if widens(&value.logical_type(), ty) {
+                        rudb_kernels::cast::cast_value(&value, ty, false).ok()?
+                    } else {
+                        return None;
+                    }
+                }
+                Set::Add(item, minus) => {
+                    let was = row.column(column).ok()?.try_value_at(0).ok()?;
+                    shifted(&was, &given.value(item)?, *minus, ty)?
+                }
+            };
+            if value.is_null() && fields[column].not_null {
+                return None;
+            }
+            values.push(value);
+        }
+        let mut columns = row.loosened().into_columns();
+        for (&column, value) in sets.iter().zip(&values) {
+            let ty = fields[column].ty.clone();
+            columns[column] = Vector::from_values(ty, std::slice::from_ref(value)).ok()?;
+        }
+        let row = Chunk::with_rows(columns, 1).ok()?;
+        let logs = self.journal().as_ref().is_some_and(Journal::logs);
+        let staged = logs.then(|| {
+            let journal = self.journal();
+            let number = [spot.number];
+            journal.as_ref()?.encode_update(
+                &name.schema,
+                &name.table,
+                fields,
+                &number,
+                std::slice::from_ref(&row),
+            )
+        });
+        let mut unanswered = false;
+        let result = kept(sql, 0, |_| {
+            if !catalog.put_row(name, spot, sets, &values, &row)? {
+                unanswered = true;
+                return Err(Error::internal("a write by key the row cannot take where it is"));
+            }
+            if let Some(record) = staged
+                && let Some(journal) = self.journal().as_mut()
+            {
+                journal.stage(record);
+            }
+            QueryResult::changed(1)
+        });
+        if unanswered {
+            return None;
+        }
+        drop(catalog);
+        let settled = self.settle(writing);
+        Some(result.and_then(|result| settled.map(|()| result)))
+    }
+
     /// Marks the commit of what is being written to checkpoint rather than log.
     fn unlogged(&self) {
         if let Some(journal) = self.journal().as_mut() {
@@ -6332,7 +6454,58 @@ fn lookup_target(
     let key = lookup.equal.iter().map(|(written, _)| column(written)).collect::<Option<_>>()?;
     let types: Vec<LogicalType> = columns.iter().map(|&at| fields[at].ty.clone()).collect();
     let zoned = types.iter().any(|ty| !unzoned(ty));
-    Some(crate::prepared::Target { name, key, columns, names, types, zoned })
+    Some(crate::prepared::Target { name, key, columns, names, types, zoned, sets: Vec::new() })
+}
+
+/// What a [`crate::prepared::PointWrite`] writes: its lookup's target, every column, with the
+/// columns the `SET` names by place. `None` for a table of an attached database, whose writes the
+/// log does not carry, and for a column the table does not have once.
+fn point_write_target(
+    catalog: &Catalog,
+    write: &crate::prepared::PointWrite,
+) -> Option<crate::prepared::Target> {
+    let mut target = lookup_target(catalog, &write.lookup)?;
+    if !target.name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) {
+        return None;
+    }
+    let fields = catalog.table(&target.name).ok()?.columns();
+    for (column, _) in &write.sets {
+        let mut found = fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name.eq_ignore_ascii_case(column))
+            .map(|(at, _)| at);
+        let at = found.next()?;
+        if found.next().is_some() {
+            return None;
+        }
+        target.sets.push(at);
+    }
+    Some(target)
+}
+
+/// The integer `was` of a column of type `ty` plus `by`, or minus it, for an `UPDATE` that sets a
+/// column to itself and a parameter. `None` for anything but integers the column holds as they
+/// are, or an answer that does not fit, which leaves it to the plan and its words for the overflow.
+fn shifted(was: &Value, by: &Value, minus: bool, ty: &LogicalType) -> Option<Value> {
+    let wide = |value: &Value| match value {
+        Value::Integer(value) => Some(i128::from(*value)),
+        Value::BigInt(value) => Some(i128::from(*value)),
+        _ => None,
+    };
+    if by.is_null() || was.is_null() {
+        return matches!(ty, LogicalType::Integer | LogicalType::BigInt).then_some(Value::Null);
+    }
+    let (was, by) = (wide(was)?, wide(by)?);
+    let value = if minus { was - by } else { was + by };
+    match ty {
+        LogicalType::Integer => {
+            i32::try_from(by).ok()?;
+            Some(Value::Integer(i32::try_from(value).ok()?))
+        }
+        LogicalType::BigInt => Some(Value::BigInt(i64::try_from(value).ok()?)),
+        _ => None,
+    }
 }
 
 /// Whether a value of type `from` goes into a column of type `to` by one of the casts

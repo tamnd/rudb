@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use rudb_common::sequence::Counter;
-use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
 
 use crate::name::{QualifiedName, same_name};
 use crate::system::{
@@ -1556,6 +1556,34 @@ impl Catalog {
             .ok_or_else(|| missing_table(&name.table))?;
         table.touch();
         Ok(table)
+    }
+
+    /// Writes `values` over the columns `targets` of the row of table `name` at `spot`, `row`
+    /// being every column of it afterwards, and says whether it could, see [`Table::put_row`].
+    ///
+    /// The generation moves as it does for [`Self::table_mut`]. The table draws a new revision and
+    /// keeps where its keys are, so the next lookup by key does not look for them again.
+    ///
+    /// # Errors
+    ///
+    /// If the table is missing, or as [`Table::put_row`] says.
+    pub fn put_row(
+        &mut self,
+        name: &QualifiedName,
+        spot: crate::Spot,
+        targets: &[usize],
+        values: &[Value],
+        row: &rudb_vector::Chunk,
+    ) -> Result<bool> {
+        self.generation = crate::table::next_revision();
+        let schema = self.schema_mut(&name.catalog, &name.schema)?;
+        let table = schema
+            .tables
+            .iter_mut()
+            .find(|held| same_name(&held.name().table, &name.table))
+            .ok_or_else(|| missing_table(&name.table))?;
+        table.touch_rows();
+        table.put_row(spot, targets, values, row)
     }
 
     /// Turns the parts of a written name into the full name of a table or a view that exists.

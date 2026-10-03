@@ -411,6 +411,21 @@ impl Counts {
         }
     }
 
+    /// Counts `value` written over one row of column `column`, which an `UPDATE` of a row does.
+    ///
+    /// The value it replaced may have been the last of its kind in the column, and nothing here
+    /// can tell, so a column whose answers are exact gives them up. One whose sketch is already an
+    /// estimate counts the new value in and goes on estimating, which is what it would say had the
+    /// row been added rather than written over.
+    pub fn rewrite(&mut self, column: usize, value: &Value) {
+        let Some(held) = self.columns.get_mut(column) else { return };
+        if held.tally.counting() || held.sketch.is_exact() {
+            held.blind();
+        } else {
+            held.add_value(value);
+        }
+    }
+
     /// Gives up on a column, which is what a form with no hash rule leaves behind.
     fn blind(&mut self, at: usize) {
         if let Some(column) = self.columns.get_mut(at) {
