@@ -43,9 +43,17 @@
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Instant;
+
+/// How long a reading of the machine's runnable tasks is trusted before it is read again.
+///
+/// A lease is taken per pipeline, and a query of a few milliseconds takes dozens, so reading the
+/// count each time would be a file read per pipeline. The load a lease cares about changes on the
+/// scale of other people's queries and builds, which is much slower than this.
+const LOAD_KEPT_NANOS: u64 = 10_000_000;
 
 /// The pool behind [`Lease::alone`], which never lends anything and never starts a thread.
 static SOLO: OnceLock<Pool> = OnceLock::new();
@@ -58,6 +66,7 @@ pub struct Pool {
     shared: Arc<Shared>,
     hired: Mutex<Vec<JoinHandle<()>>>,
     live: AtomicUsize,
+    yielding: bool,
 }
 
 impl Pool {
@@ -76,7 +85,26 @@ impl Pool {
             shared: Arc::new(Shared::default()),
             hired: Mutex::new(Vec::new()),
             live: AtomicUsize::new(0),
+            yielding: false,
         }
+    }
+
+    /// The same pool, but one that lends no more threads than the machine has cores sitting idle.
+    ///
+    /// This is for a database on a machine it shares. Six threads on six cores that thirty other
+    /// tasks also want do not get six cores, they get a share of them, and a parallel pipeline
+    /// ends at a barrier that waits for its slowest worker, which is whichever one was descheduled
+    /// last. On the JOB bench machine at a load of about 28 the suite's hot total was 9134 ms on
+    /// one thread against 11696 ms on six, and one thread was faster on 97 of the 113 queries.
+    /// 17e went from 206 ms to 418 and 29b from 100 to 243. Nothing about the plan changes, only
+    /// how many workers run it, so the answer and the plan are the same either way.
+    ///
+    /// The tests make their pools with [`Pool::new`] and do not get this, because a test that
+    /// counts workers should not count fewer when the machine running it is busy.
+    #[must_use]
+    pub fn yielding(mut self) -> Self {
+        self.yielding = true;
+        self
     }
 
     /// The most that may run at once.
@@ -106,7 +134,10 @@ impl Pool {
     /// a busy pool should do is make a query serial.
     #[must_use]
     pub fn lease(&self, want: usize) -> Lease<'_> {
-        let wanted = want.saturating_sub(1);
+        let mut wanted = want.saturating_sub(1);
+        if self.yielding && wanted > 0 {
+            wanted = wanted.min(idle_cores());
+        }
         let mut busy = self.busy.load(Ordering::Relaxed);
         loop {
             let spare = self.threads().saturating_sub(1).saturating_sub(busy);
@@ -458,4 +489,42 @@ impl Drop for Lease<'_> {
     fn drop(&mut self) {
         self.pool.busy.fetch_sub(self.extra, Ordering::Relaxed);
     }
+}
+
+/// How many of this machine's cores nothing is running on right now, as far as Linux can say.
+///
+/// The count comes from the fourth field of `/proc/loadavg`, which is the number of tasks that
+/// are runnable at the moment it is read, this one included and this pool's busy workers
+/// included. Cores less that is what a lease can add without taking a core from somebody, its
+/// own query's other pipelines among them. A machine with no such file, or one whose file this
+/// cannot read, is taken to be idle, which is how the pool behaved before it looked.
+fn idle_cores() -> usize {
+    static BORN: OnceLock<Instant> = OnceLock::new();
+    static CORES: OnceLock<usize> = OnceLock::new();
+    static READ_AT: AtomicU64 = AtomicU64::new(0);
+    static RUNNING: AtomicUsize = AtomicUsize::new(0);
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let born = *BORN.get_or_init(Instant::now);
+    // One past the real reading so a read at the very first nanosecond is not taken for none.
+    let now = u64::try_from(born.elapsed().as_nanos()).unwrap_or(u64::MAX).saturating_add(1);
+    let then = READ_AT.load(Ordering::Relaxed);
+    let running = if then != 0 && now.saturating_sub(then) < LOAD_KEPT_NANOS {
+        RUNNING.load(Ordering::Relaxed)
+    } else {
+        let running = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|text| runnable(&text))
+            .unwrap_or(1);
+        RUNNING.store(running, Ordering::Relaxed);
+        READ_AT.store(now, Ordering::Relaxed);
+        running
+    };
+    cores.saturating_sub(running)
+}
+
+/// The runnable count out of the text of `/proc/loadavg`, which reads like
+/// `34.03 31.59 29.48 36/708 2154999`, where it is the 36.
+pub(crate) fn runnable(loadavg: &str) -> Option<usize> {
+    let field = loadavg.split_ascii_whitespace().nth(3)?;
+    field.split_once('/')?.0.parse().ok()
 }

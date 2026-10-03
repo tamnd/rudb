@@ -1378,3 +1378,18 @@ fn a_worker_that_panics_fails_the_query_rather_than_leaving_it_waiting() {
     assert_eq!(error.message(), "a thread running part of this query panicked");
     assert_eq!(sink.finalizes.load(Ordering::Relaxed), 0, "a failed pipeline has no answer");
 }
+
+#[test]
+fn the_runnable_count_is_read_off_the_fourth_field_of_loadavg() {
+    assert_eq!(crate::pool::runnable("34.03 31.59 29.48 36/708 2154999\n"), Some(36));
+    assert_eq!(crate::pool::runnable("0.00 0.01 0.05 1/120 77"), Some(1));
+    assert_eq!(crate::pool::runnable("0.00 0.01 0.05"), None);
+    assert_eq!(crate::pool::runnable(""), None);
+}
+
+#[test]
+fn a_yielding_pool_still_lends_the_caller_and_never_more_than_it_has() {
+    let pool = Pool::new(4).yielding();
+    let lease = pool.lease(16);
+    assert!((1..=4).contains(&lease.degree()));
+}

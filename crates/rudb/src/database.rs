@@ -800,7 +800,7 @@ fn dictionary_budget(limit: Option<u64>) -> u64 {
 
 fn runtime(config: &Config) -> Pool {
     keep_pages();
-    Pool::new(config.threads())
+    Pool::new(config.threads()).yielding()
 }
 
 impl Database {
