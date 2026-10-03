@@ -182,3 +182,75 @@ fn read_csv_takes_a_null_string_or_a_list_of_them() {
         "{error}"
     );
 }
+
+/// Every row of `sql` as text, one line per row with the columns between bars.
+fn shown(database: &Database, sql: &str) -> String {
+    rows(database, sql)
+        .iter()
+        .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join("|"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A JSON file is read as the table's columns by name, and the pin's answers were measured with
+/// these bytes: a key the table does not have is skipped and a column the object lacks is null.
+#[test]
+fn a_json_file_is_read_by_key_as_the_tables_columns() {
+    let lines = "{\"d\":\"03-27-1996\",\"x\":1}\n{\"x\":2,\"d\":\"03-28-1996\"}\n";
+    let file = Scratch::new("lines.json", lines);
+    let array = Scratch::new("array.json", "[{\"a\":1,\"b\":\"x\"},{\"b\":\"y\",\"a\":2}]");
+    let other = Scratch::new("lines.txt", lines);
+    for (table, options, answer) in [
+        ("(d DATE)", "(dateformat '%m-%d-%Y')", "1996-03-27\n1996-03-28"),
+        ("(d DATE)", "(date_format '%m-%d-%Y', COLUMNS {'zz': 'INT'})", "1996-03-27\n1996-03-28"),
+        ("(d VARCHAR)", "", "03-27-1996\n03-28-1996"),
+        ("(x INT, d VARCHAR)", "", "1|03-27-1996\n2|03-28-1996"),
+        ("(z INT)", "", "NULL\nNULL"),
+        ("(d VARCHAR)", "(ignore_errors, sample_size 10)", "03-27-1996\n03-28-1996"),
+    ] {
+        let database = Database::new();
+        database.execute(&format!("CREATE TABLE t {table}")).expect("creates");
+        let sql = format!("COPY t FROM '{}' {options}", file.path());
+        database.execute(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+        assert_eq!(shown(&database, "SELECT * FROM t"), answer, "{sql}");
+    }
+    let database = Database::new();
+    database.execute("CREATE TABLE t (x INT, d VARCHAR)").expect("creates");
+    database.execute(&format!("COPY t (d) FROM '{}'", file.path())).expect("loads");
+    assert_eq!(shown(&database, "SELECT * FROM t"), "NULL|03-27-1996\nNULL|03-28-1996");
+    database.execute("CREATE TABLE u (b VARCHAR, a INT)").expect("creates");
+    database.execute(&format!("COPY u FROM '{}'", array.path())).expect("loads");
+    database
+        .execute(&format!("COPY u FROM '{}' (FORMAT json, ARRAY true)", array.path()))
+        .expect("loads");
+    assert_eq!(shown(&database, "SELECT * FROM u"), "x|1\ny|2\nx|1\ny|2");
+    database.execute("CREATE TABLE v (d VARCHAR)").expect("creates");
+    for format in ["json", "ndjson", "jsonl", "'json'"] {
+        let sql = format!("COPY v FROM '{}' (FORMAT {format})", other.path());
+        database.execute(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    assert_eq!(shown(&database, "SELECT count(*) FROM v"), "8");
+}
+
+#[test]
+fn a_json_copy_refuses_what_the_pin_refuses() {
+    let file = Scratch::new("refused.json", "{\"d\":\"03-27-1996\"}\n");
+    let database = Database::new();
+    database.execute("CREATE TABLE t (d DATE)").expect("creates");
+    for (options, message) in [
+        ("(dateformat)", "Binder Error: COPY parameter \"dateformat\" expects a single argument"),
+        (
+            "(filename true)",
+            "Not implemented Error: Unsupported option for COPY FROM: \"filename\"",
+        ),
+        ("(header true)", "Not implemented Error: Unsupported option for COPY FROM: \"header\""),
+        ("(bogus 1)", "Not implemented Error: Unsupported option for COPY FROM: \"bogus\""),
+    ] {
+        let sql = format!("COPY t FROM '{}' {options}", file.path());
+        let error = database.execute(&sql).expect_err(&sql).to_string();
+        assert_eq!(error, message, "{sql}");
+    }
+    let sql = format!("COPY t FROM '{}'", file.path());
+    let error = database.execute(&sql).expect_err(&sql).to_string();
+    assert!(error.contains("invalid date field format: \"03-27-1996\""), "{error}");
+}
