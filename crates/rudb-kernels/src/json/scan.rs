@@ -138,6 +138,30 @@ impl Compression {
     }
 }
 
+/// Whether a call's `allow_empty` is true, read before its files are looked for.
+///
+/// The pin casts every named parameter before it expands a pattern and checks what the values mean
+/// after, so `allow_empty='x'` on a missing file is the cast error and `format='nope'` on one is
+/// the missing file. This is the cast, for the one parameter whose value decides the expansion.
+///
+/// # Errors
+///
+/// The pin's refusal of a value that does not cast to a boolean.
+pub fn allows_empty(written: &[(&str, Value)]) -> Result<bool> {
+    let Some((_, value)) =
+        written.iter().rev().find(|(name, _)| name.eq_ignore_ascii_case("allow_empty"))
+    else {
+        return Ok(false);
+    };
+    if value.is_null() {
+        return Ok(false);
+    }
+    let cast = cast_value(value, &LogicalType::Boolean, false).map_err(|error| {
+        Error::invalid_input(format!("Failed to cast value: {}", error.message()))
+    })?;
+    Ok(matches!(cast, Value::Boolean(true)))
+}
+
 /// What a call's named parameters say.
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -576,8 +600,10 @@ impl Options {
                 };
             }
             "union_by_name" => self.union_by_name = flag(),
-            "allow_empty"
-            | "geojson"
+            // Read by the binder through [`allows_empty`] before it expands the patterns, which is
+            // the only place it changes anything.
+            "allow_empty" => {}
+            "geojson"
             | "hive_partitioning"
             | "hive_types"
             | "hive_types_autocast" => {
@@ -1845,6 +1871,19 @@ fn bind_one(options: &Options, file: &str, text: Arc<str>) -> Result<Bound> {
 /// Whatever reading a file reports, the refusals of detection, and every error the pin raises
 /// while it samples, which include a malformed unit early in a file.
 pub fn bind(options: &Options, files: &[String], load: Load<'_>) -> Result<(Vec<Field>, Settled)> {
+    if files.is_empty() {
+        // Only `allow_empty` gets here. The pin answers one BOOLEAN column named `empty` with no
+        // rows, whatever columns the call gave and without the one `filename` would add.
+        let name = "empty".to_string();
+        let settled = Settled {
+            records: false,
+            detected: false,
+            templates: false,
+            keys: vec![name.clone()],
+            names: vec![name.clone()],
+        };
+        return Ok((vec![Field::new(name, LogicalType::Boolean)], settled));
+    }
     let (mut fields, settled) = bind_columns(options, files, load)?;
     if let Some(name) = &options.filename {
         if fields.iter().any(|field| field.name.eq_ignore_ascii_case(name)) {
