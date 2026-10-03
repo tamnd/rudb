@@ -91,3 +91,56 @@ fn the_space_a_table_written_again_leaves_is_given_back() {
     drop(db);
     remove(&path);
 }
+
+/// The format number in the header of the file at `path`.
+fn format(path: &Path) -> u32 {
+    let bytes = std::fs::read(path).expect("the file is there");
+    u32::from_le_bytes(bytes[8..12].try_into().expect("four bytes"))
+}
+
+/// Writes `format` into the header of the file at `path`, the way a file an older build wrote
+/// would have it.
+fn stamp(path: &Path, format: u32) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file =
+        std::fs::OpenOptions::new().write(true).open(path).expect("the file opens to write");
+    file.seek(SeekFrom::Start(8)).expect("seeks");
+    file.write_all(&format.to_le_bytes()).expect("writes");
+}
+
+/// A file of the format before this one opens and answers as it is, and takes deletes, updates
+/// and inserts and checkpoints them, with no step that moves the file to the new format first.
+///
+/// The header keeps the older number after the write, which is on purpose: a table this build
+/// writes into an older file keeps the older part hash, so the build that wrote the file can still
+/// read all of it. A file only moves to this build's format when it is written again whole.
+#[test]
+fn a_file_of_the_previous_format_takes_writes_with_no_migration_first() {
+    let path = path("previous");
+    let db = open(&path);
+    db.execute("CREATE TABLE big AS SELECT range AS id, hash(range) AS v FROM range(200000)")
+        .expect("creates");
+    db.execute("CREATE TABLE t AS SELECT range AS id, range AS v FROM range(1000)")
+        .expect("creates");
+    drop(db);
+    let current = format(&path);
+    stamp(&path, current - 1);
+
+    let db = open(&path);
+    assert_eq!(value(&db, "SELECT count(*) FROM big"), Value::BigInt(200_000));
+    assert_eq!(value(&db, "SELECT sum(v) FROM t"), Value::HugeInt(499_500));
+    db.execute("DELETE FROM t WHERE id < 10").expect("deletes");
+    db.execute("UPDATE t SET v = v + 1 WHERE id >= 990").expect("updates");
+    db.execute("INSERT INTO t VALUES (1000, 1000)").expect("inserts");
+    db.execute("CHECKPOINT").expect("checkpoints");
+    drop(db);
+    assert_eq!(format(&path), current - 1, "the write kept the file readable by the older build");
+
+    let db = open(&path);
+    assert_eq!(value(&db, "SELECT count(DISTINCT v) FROM big"), Value::BigInt(200_000));
+    assert_eq!(value(&db, "SELECT count(*) FROM t"), Value::BigInt(991));
+    assert_eq!(value(&db, "SELECT sum(v) FROM t"), Value::HugeInt(499_500 - 45 + 10 + 1000));
+    assert_eq!(value(&db, "SELECT min(id) FROM t"), Value::BigInt(10));
+    drop(db);
+    remove(&path);
+}
