@@ -1795,10 +1795,19 @@ impl Stream for Probe<'_> {
             // for a whole batch is read off the firsts in one pass. That is a join to a primary
             // key, most of the joins TPC-H has, and the loop below paid a check of the clock, a
             // match on the kind and a slice per driving row for it.
+            //
+            // A semi or anti join with no residual only asks whether a key has a row at all, so it
+            // goes this way whatever the table holds. The loop below copied out the whole chain of
+            // a key before asking whether it was empty, and the `c_nationkey` semi join in q05 has
+            // five keys over 2003 suppliers, so each of the 30 thousand customers it kept walked a
+            // chain of 400 rows. That was a third of the query.
             let batch = residual.exprs.is_empty()
-                && single
                 && *hit == 0
-                && matches!(self.kind, JoinKind::Inner | JoinKind::Semi | JoinKind::Anti);
+                && match self.kind {
+                    JoinKind::Inner => single,
+                    JoinKind::Semi | JoinKind::Anti => true,
+                    _ => false,
+                };
             if batch {
                 self.cancel.check()?;
                 let end = left.len().min(*row + VECTOR_SIZE);
@@ -4066,6 +4075,43 @@ mod tests {
             probed(&probe, &chunk(&[1, 2, 3]), 2),
             [vec![Value::Integer(2), Value::BigInt(2)], vec![Value::Integer(3), Value::BigInt(3)]]
         );
+    }
+
+    /// A semi or anti join against a side where a key has many rows keeps each driving row once or
+    /// not at all, by whether its key has any row, the same as against a side of distinct keys.
+    #[test]
+    fn a_semi_or_anti_join_over_repeated_keys_keeps_a_driving_row_once() {
+        for (kind, wanted) in [(JoinKind::Semi, vec![1, 4, 7, 4]), (JoinKind::Anti, vec![2, 9])] {
+            let mut plan = Plan::new();
+            let (left, right) = sides();
+            let narrow = column(&mut plan, 0, LogicalType::Integer);
+            let widened =
+                plan.add_expr(Expr::Cast { input: narrow, try_cast: false }, LogicalType::BigInt);
+            let other = column(&mut plan, 1, LogicalType::BigInt);
+            let condition = equal(&mut plan, widened, other);
+            let conditions = plan.add_expr_list(&[condition]);
+
+            let memory = Memory::unlimited();
+            let (keep, rows) = Keep::new(&memory);
+            let mut local = keep.local();
+            keep.sink(&wide_chunk(&[4, 4, 4, 1, 4, 7, 7]), &mut local).expect("the gathered rows");
+            keep.combine(local).expect("the one instance");
+            keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
+            let probe = Probe::new(
+                &plan,
+                &left,
+                &Gathered { schema: &right, chunks: rows, marker: None, swapped: false },
+                kind,
+                conditions,
+                &Cancel::new(),
+                &memory,
+            )
+            .expect("a lookup answers a semi or anti join on one equality");
+
+            let kept: Vec<Vec<Value>> =
+                wanted.into_iter().map(|key| vec![Value::Integer(key)]).collect();
+            assert_eq!(probed(&probe, &chunk(&[1, 2, 4, 7, 9, 4]), 1), kept, "{kind:?}");
+        }
     }
 
     /// A gathered side whose chunks came out of key order, the way a scan on several threads hands
