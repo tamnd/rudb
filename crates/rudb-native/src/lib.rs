@@ -42,7 +42,7 @@ use std::slice;
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as Atomic,
 };
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
 use rudb_common::{Clustering, Error, Field, LogicalType, PhysicalType, Result, Value, Width};
@@ -5465,6 +5465,9 @@ pub struct PagePool {
     /// Set by [`PagePool::last_statement`] and never cleared, so that [`PagePool::rereads`] can put
     /// `last` back for a statement that reads nothing twice.
     told: Arc<AtomicBool>,
+    /// The tables the statement running now reads more than once, by name in lower case, which
+    /// are the ones whose parts are still held in the last statement. See [`PagePool::rereads`].
+    reread: Arc<RwLock<Vec<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -5524,20 +5527,41 @@ impl PagePool {
     /// for the average balance and once for the answer, q02 reads `partsupp` and the suppliers of a
     /// region twice and q20 reads `lineitem` and `part` twice. Holding a part only on its second read
     /// decoded every phone number twice in q22, 19 M instructions of decompression becoming 39 M.
-    pub fn rereads(&self, rereads: bool) {
-        self.last.store(self.told.load(Atomic::Relaxed) && !rereads, Atomic::Relaxed);
+    ///
+    /// It is said by table, because holding is only worth it for the table read twice. TPC-H q07
+    /// and q08 read `nation` twice, and when that held every part of `lineitem` and `orders` they
+    /// read once, each part decoded went into memory of its own that stayed taken to the end, and
+    /// the kernel faulting in and zeroing those pages cost about what the query's own work did.
+    /// Let go after the chunk, the next part decodes into the same memory.
+    pub fn rereads<S: AsRef<str>>(&self, tables: &[S]) {
+        let tables: Vec<String> =
+            tables.iter().map(|table| table.as_ref().to_ascii_lowercase()).collect();
+        self.last.store(self.told.load(Atomic::Relaxed) && tables.is_empty(), Atomic::Relaxed);
+        *self.reread.write().unwrap_or_else(PoisonError::into_inner) = tables;
     }
 
     /// A pool with no budget of its own that hears [`PagePool::last_statement`] when `other`
     /// does, for a file a database reads beside its own, the way it reads a Parquet file's mirror.
     #[must_use]
     pub fn following(other: &Self) -> Self {
-        Self { last: Arc::clone(&other.last), told: Arc::clone(&other.told), ..Self::default() }
+        Self {
+            last: Arc::clone(&other.last),
+            told: Arc::clone(&other.told),
+            reread: Arc::clone(&other.reread),
+            ..Self::default()
+        }
     }
 
-    /// Whether [`PagePool::last_statement`] has been said.
-    fn is_last(&self) -> bool {
-        self.last.load(Atomic::Relaxed)
+    /// Whether [`PagePool::last_statement`] has been said and this statement reads `table` once,
+    /// so that a read of it holds nothing it decodes. See [`PagePool::rereads`].
+    fn is_last_for(&self, table: &str) -> bool {
+        self.told.load(Atomic::Relaxed)
+            && !self
+                .reread
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|reread| reread.eq_ignore_ascii_case(table))
     }
 
     /// Whether no statement after the one running reads through this pool, whether or not this one
@@ -9521,7 +9545,7 @@ impl Reader {
             let mut vector = match positions {
                 Some(positions) if !keeping => {
                     let paid = paid_at(rows, bytes, positions, self.pool.is_final());
-                    if keeps && self.pool.is_last() {
+                    if keeps && self.pool.is_last_for(&self.table.name) {
                         self.pay(at, column, paid);
                         decode_at(&field.ty, rows, bytes, dictionary, positions)?
                     } else if keeps && self.pay_or_hold(at, column, paid, rows) {
@@ -9606,7 +9630,7 @@ impl Reader {
                 // that pays otherwise: on JOB the second run of each query cost 60 billion cycles
                 // across the suite against 35 for the third, nearly all of it decoding again the
                 // parts the first run had decoded and let go.
-                if before >= rows || (positions.is_none() && !self.pool.is_last()) {
+                if before >= rows || (positions.is_none() && !self.pool.is_last_for(&self.table.name)) {
                     return Err(true);
                 }
                 // With no statement after this one, a whole read only counts its rows, and a
@@ -17923,15 +17947,15 @@ mod tests {
 
         let pool = PagePool::new(usize::MAX);
         pool.last_statement();
-        pool.rereads(true);
+        pool.rereads(&["A"]);
         let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
         let a = catalog.table("a").expect("a");
         let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
         a.read(0, &[0]).expect("a part");
         assert!(matches!(*slot(0), PartSlot::Held { .. }), "the first read holds it");
-        pool.rereads(false);
+        pool.rereads(&["b"]);
         a.read(1, &[0]).expect("a part");
-        assert!(matches!(*slot(1), PartSlot::Seen(64)), "a statement reading once only counts");
+        assert!(matches!(*slot(1), PartSlot::Seen(64)), "a table read once only counts");
         drop((a, catalog));
         fs::remove_file(path).expect("remove scratch file");
     }

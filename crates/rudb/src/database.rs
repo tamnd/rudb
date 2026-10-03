@@ -4197,7 +4197,7 @@ impl Shared {
         cancel: &Cancel,
         under: Under<'_>,
     ) -> Result<QueryResult> {
-        self.inner.pages.rereads(reads_a_table_twice(plan));
+        self.inner.pages.rereads(&tables_read_twice(plan));
         if self.inner.settings.engine() == COMPILED_ENGINE {
             // A query the first engine answers out of the statistics kept about its tables,
             // without reading a row, has nothing for compiled code to make faster.
@@ -6242,9 +6242,9 @@ fn aggregates_a_table(plan: &Plan, node: NodeRef) -> bool {
     plan.node(node).children().into_iter().flatten().any(|child| aggregates_a_table(plan, child))
 }
 
-/// Whether two scans in `plan` read the same table, which is what a part held by the first of them
-/// serves inside one statement. See [`rudb_native::PagePool::rereads`].
-fn reads_a_table_twice(plan: &Plan) -> bool {
+/// The tables two scans in `plan` both read, whose parts a read holds for the other scan inside one
+/// statement. See [`rudb_native::PagePool::rereads`].
+fn tables_read_twice(plan: &Plan) -> Vec<&str> {
     fn tables<'p>(plan: &'p Plan, node: NodeRef, found: &mut Vec<(&'p str, &'p str, &'p str)>) {
         if let Node::Get { catalog, schema, table, .. } = *plan.node(node) {
             found.push((plan.string(catalog), plan.string(schema), plan.string(table)));
@@ -6256,7 +6256,10 @@ fn reads_a_table_twice(plan: &Plan) -> bool {
     let mut found = Vec::new();
     tables(plan, plan.root(), &mut found);
     found.sort_unstable();
-    found.windows(2).any(|pair| pair[0] == pair[1])
+    let mut twice: Vec<&str> =
+        found.windows(2).filter(|pair| pair[0] == pair[1]).map(|pair| pair[0].2).collect();
+    twice.dedup();
+    twice
 }
 
 /// Runs a query the first engine built, and fills in the metrics document `run` returns.
