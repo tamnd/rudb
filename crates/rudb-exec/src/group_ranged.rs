@@ -541,11 +541,9 @@ mod tests {
             &[Value::BigInt(1), Value::BigInt(2), Value::BigInt(3)],
         )
         .expect("arguments");
-        let holed = Vector::from_values(
-            LogicalType::BigInt,
-            &[Value::Null, Value::BigInt(2), Value::Null],
-        )
-        .expect("arguments");
+        let holed =
+            Vector::from_values(LogicalType::BigInt, &[Value::Null, Value::BigInt(2), Value::Null])
+                .expect("arguments");
         for argument in [&full, &holed, &full] {
             let mut local = Local::new(&memory);
             exchange.count(&key, &[Some(argument), None], 3, &mut local).expect("counts");
