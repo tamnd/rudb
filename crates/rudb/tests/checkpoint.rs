@@ -144,3 +144,54 @@ fn a_file_of_the_previous_format_takes_writes_with_no_migration_first() {
     drop(db);
     remove(&path);
 }
+
+#[test]
+fn defaults_checks_and_indexes_come_back_after_a_reopen() {
+    let path = path("declared");
+    let db = open(&path);
+    db.execute("CREATE TABLE d (a INTEGER DEFAULT 42, b INTEGER CHECK (b > 0), UNIQUE (b))")
+        .expect("creates");
+    db.execute("INSERT INTO d (b) VALUES (1)").expect("inserts");
+    db.execute("CREATE TABLE big AS SELECT range AS id, range % 7 AS g FROM range(2000000)")
+        .expect("creates");
+    db.execute("CHECKPOINT").expect("checkpoints");
+    let before = size(&path);
+    db.execute("CREATE UNIQUE INDEX big_id ON big (id)").expect("indexes");
+    db.execute("CREATE INDEX big_g ON big (g)").expect("indexes");
+    db.execute("ALTER TABLE d ALTER COLUMN a SET NOT NULL").expect("alters");
+    db.execute("CHECKPOINT").expect("checkpoints");
+    let after = size(&path);
+    assert!(after < before + before / 10, "the file went from {before} to {after} bytes");
+    drop(db);
+
+    let db = open(&path);
+    db.execute("INSERT INTO d (b) VALUES (2)").expect("inserts");
+    assert_eq!(value(&db, "SELECT sum(a) FROM d"), Value::HugeInt(84));
+    let refused = db.execute("INSERT INTO d VALUES (1, -1)").expect_err("the check holds");
+    assert!(refused.to_string().contains("CHECK constraint failed"), "{refused}");
+    let refused = db.execute("INSERT INTO d VALUES (NULL, 3)").expect_err("the column refuses it");
+    assert!(refused.to_string().contains("NOT NULL constraint failed: d.a"), "{refused}");
+    let refused = db.execute("INSERT INTO big VALUES (5, 1)").expect_err("the index holds");
+    assert!(refused.to_string().contains("Duplicate key \"id: 5\""), "{refused}");
+    assert_eq!(
+        value(&db, "SELECT string_agg(index_name, ',' ORDER BY index_name) FROM duckdb_indexes()"),
+        Value::Varchar("big_g,big_id".into())
+    );
+    assert_eq!(
+        value(&db, "SELECT count(DISTINCT index_oid) FROM duckdb_indexes()"),
+        Value::BigInt(2)
+    );
+    assert_eq!(
+        value(&db, "SELECT count(*) FROM duckdb_constraints() WHERE table_name = 'd'"),
+        Value::BigInt(3)
+    );
+    db.execute("DROP INDEX big_id").expect("drops");
+    drop(db);
+
+    let db = open(&path);
+    db.execute("INSERT INTO big VALUES (5, 1)").expect("no index refuses it now");
+    assert_eq!(value(&db, "SELECT count(*) FROM duckdb_indexes()"), Value::BigInt(1));
+    assert_eq!(value(&db, "SELECT count(*) FROM big"), Value::BigInt(2_000_001));
+    drop(db);
+    remove(&path);
+}

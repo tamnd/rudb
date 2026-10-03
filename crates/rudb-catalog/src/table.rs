@@ -1649,7 +1649,12 @@ impl Table {
         let columns = reader.table().fields().to_vec();
         duplicate_check(&columns)?;
         let clustering = reader.table().clustering().cloned();
-        let (keys, foreign) = restored(&name, reader.table().constraints());
+        let stored = reader.table().constraints();
+        let (keys, foreign) = restored(&name, stored);
+        let defaults = stored.defaults.clone();
+        let checks = stored.checks.clone();
+        let order = restored_order(stored);
+        let indexes = restored_indexes(stored);
         Ok(Self {
             name,
             columns,
@@ -1658,25 +1663,30 @@ impl Table {
             clustering,
             // Not read into sets here. A key's set is built from the rows the first time a write
             // asks for it, so opening a file of a hundred million keyed rows reads none of them.
-            seen: vec![None; keys.len()],
+            seen: vec![
+                None;
+                keys.len()
+                    + indexes.iter().filter(|index| index.unique && index.plain).count()
+            ],
             keys,
-            indexes: Vec::new(),
-            defaults: Vec::new(),
-            checks: Vec::new(),
+            indexes,
+            defaults,
+            checks,
             foreign,
-            order: Vec::new(),
+            order,
             sequences: Vec::new(),
             revision: next_revision(),
             frame: next_revision(),
         })
     }
 
-    /// The keys and foreign keys in the form the file stores them, for a checkpoint to write.
+    /// The keys, foreign keys, defaults, checks and indexes in the form the file stores them, for a
+    /// checkpoint to write.
     ///
     /// # Errors
     ///
     /// If a key names a column past what a file can. A foreign key into another schema is left out,
-    /// since a file of one schema has no way to name it.
+    /// since a file of one schema has no way to name it, and so is its place in the order.
     pub fn stored_constraints(&self) -> Result<rudb_native::Constraints> {
         let places = |columns: &[usize]| {
             columns
@@ -1685,22 +1695,56 @@ impl Table {
                 .collect::<std::result::Result<Vec<u16>, _>>()
                 .map_err(|_| Error::internal("a key over a column past what a file can name"))
         };
+        let place = |at: usize| {
+            u16::try_from(at).map_err(|_| Error::internal("a constraint past what a file can name"))
+        };
         let mut stored = rudb_native::Constraints::default();
         for key in &self.keys {
             stored.keys.push((places(&key.columns)?, key.primary));
         }
+        // Where each foreign key lands among the stored ones, for the order below.
+        let mut kept = Vec::with_capacity(self.foreign.len());
         for foreign in &self.foreign {
             // A file of one schema has no way to name a table in another, and a checkpoint that
             // refused would lose every row to keep one declaration, so this one is left out.
             if !same_name(&foreign.table.schema, &self.name.schema)
                 || !same_name(&foreign.table.catalog, &self.name.catalog)
             {
+                kept.push(None);
                 continue;
             }
+            kept.push(Some(stored.foreign.len()));
             stored.foreign.push(rudb_native::StoredForeign {
                 columns: places(&foreign.columns)?,
                 table: foreign.table.table.clone(),
                 referenced: places(&foreign.referenced)?,
+            });
+        }
+        if self.defaults.iter().any(Option::is_some) {
+            stored.defaults.clone_from(&self.defaults);
+            stored.defaults.resize(self.columns.len(), None);
+        }
+        stored.checks.clone_from(&self.checks);
+        for constraint in &self.order {
+            let (kind, at) = match *constraint {
+                crate::Constraint::Key(at) => (0, at),
+                crate::Constraint::Check(at) => (1, at),
+                crate::Constraint::Foreign(at) => match kept.get(at).copied().flatten() {
+                    Some(at) => (2, at),
+                    None => continue,
+                },
+                crate::Constraint::NotNull(at) => (3, at),
+            };
+            stored.order.push((kind, place(at)?));
+        }
+        for index in &self.indexes {
+            stored.indexes.push(rudb_native::StoredIndex {
+                name: index.name.clone(),
+                unique: index.unique,
+                plain: index.plain,
+                columns: places(&index.columns)?,
+                expressions: index.expressions.clone(),
+                sql: index.sql.clone(),
             });
         }
         Ok(stored)
@@ -1715,6 +1759,31 @@ impl Table {
     /// Stamps the oid, which only [`crate::Catalog::create_table`] does.
     pub(crate) fn stamp(&mut self, oid: i64) {
         self.oid = oid;
+    }
+
+    /// Stamps an oid on each index read back out of a file, drawn from `next`.
+    pub(crate) fn stamp_indexes(&mut self, mut next: impl FnMut() -> i64) {
+        for index in &mut self.indexes {
+            index.oid = next();
+        }
+    }
+
+    /// Whether the file the rows are in holds what this table is declared with, its keys,
+    /// defaults, checks, indexes and which columns refuse nulls. True for a table with no file
+    /// behind it, which a checkpoint writes whole anyway.
+    ///
+    /// # Errors
+    ///
+    /// If a declaration names a column past what a file can.
+    pub fn declared_is_stored(&self) -> Result<bool> {
+        match &self.rows {
+            Rows::Memory(_) => Ok(true),
+            Rows::Native(reader) | Rows::Grown(reader, _) | Rows::Masked(reader, _) => {
+                let stored = reader.table().fields().iter().map(|field| field.not_null);
+                Ok(stored.eq(self.columns.iter().map(|column| column.not_null))
+                    && reader.table().constraints() == &self.stored_constraints()?)
+            }
+        }
     }
 
     /// The three part name.
@@ -2718,6 +2787,43 @@ fn restored(
         })
         .collect();
     (keys, foreign)
+}
+
+/// The order of a table's constraints out of what [`Table::stored_constraints`] wrote, leaving out
+/// a kind this build does not know.
+fn restored_order(stored: &rudb_native::Constraints) -> Vec<crate::Constraint> {
+    stored
+        .order
+        .iter()
+        .filter_map(|&(kind, at)| {
+            let at = usize::from(at);
+            match kind {
+                0 => Some(crate::Constraint::Key(at)),
+                1 => Some(crate::Constraint::Check(at)),
+                2 => Some(crate::Constraint::Foreign(at)),
+                3 => Some(crate::Constraint::NotNull(at)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// A table's indexes out of what [`Table::stored_constraints`] wrote, with no oid yet: the catalog
+/// stamps one on each as it takes the table, see [`Table::stamp_indexes`].
+fn restored_indexes(stored: &rudb_native::Constraints) -> Vec<crate::Index> {
+    stored
+        .indexes
+        .iter()
+        .map(|index| crate::Index {
+            name: index.name.clone(),
+            unique: index.unique,
+            columns: index.columns.iter().map(|&column| usize::from(column)).collect(),
+            plain: index.plain,
+            expressions: index.expressions.clone(),
+            sql: index.sql.clone(),
+            oid: DETACHED,
+        })
+        .collect()
 }
 
 /// Some of the rows an update names that are in one part of a file, see [`Table::places`].

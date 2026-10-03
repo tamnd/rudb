@@ -2208,9 +2208,12 @@ fn persist_anchored(
     // Every table already in the file, and every declaration in the file already the one the
     // catalog holds. The second half is what stops a `CLUSTER BY` on a table that was checkpointed
     // before the declaration existed from being decided as nothing to do and quietly lost.
-    let clean = catalog
-        .stored_tables_in(database)
-        .all(|table| table.rows().is_stored() && table.clustering_is_stored());
+    let mut clean = true;
+    for table in catalog.stored_tables_in(database) {
+        clean &= table.rows().is_stored()
+            && table.clustering_is_stored()
+            && table.declared_is_stored()?;
+    }
     let held = committed(path)?;
     // The views are compared by what they are rather than by their whole record, because the column
     // list on a record is a cache the binder writes over every time somebody selects from the view.
@@ -2238,15 +2241,16 @@ fn persist_anchored(
     // happened to them, so nothing has to be written again. Everything the file holds is still the
     // right bytes in the right place and the commit is a new catalog naming the same pages, with
     // the rows gone written down beside the tables they went from.
+    let restated = restate(path, catalog, &names, held.as_ref())?;
     let marks = marks(catalog, &names)?;
     let marked = catalog.stored_tables_in(database).all(|table| {
         (table.rows().is_stored() || table.rows().markable()) && table.clustering_is_stored()
     });
-    if marked && held.is_some_and(|held| held.tables == wanted(&names)) {
+    if restated && marked && held.is_some_and(|held| held.tables == wanted(&names)) {
         rudb_native::Writer::restate_marking(path, &views, anchor, &marks)?;
         return rebind(path, catalog, &names, pages);
     }
-    if appended(path, catalog, &names, &views, anchor, marks)? {
+    if restated && appended(path, catalog, &names, &views, anchor, marks)? {
         return rebind(path, catalog, &names, pages);
     }
     let temporary = scratch(path)?;
@@ -2275,6 +2279,36 @@ fn persist_anchored(
     writer.with_views(views).finish()?;
     rename(&temporary, path)?;
     rebind(path, catalog, &names, pages)
+}
+
+/// Writes into the file what each table it holds is now declared with, where that changed and the
+/// rows did not, so that the paths that carry a table forward by pointer carry the new declaration
+/// with it. A `CREATE INDEX` on a table of a hundred million rows is then a new directory rather
+/// than the table written again.
+///
+/// Returns false when a table could not be restated because the file is of a format this build
+/// writes no directory into, and the caller writes the whole file instead. The readers still hold
+/// the declarations they were opened with until the caller rebinds them, which every path after
+/// this one does.
+fn restate(
+    path: &Path,
+    catalog: &Catalog,
+    names: &[QualifiedName],
+    held: Option<&Held>,
+) -> Result<bool> {
+    let Some(held) = held else { return Ok(true) };
+    for name in names {
+        let table = catalog.table(name)?;
+        let carried = table.rows().is_stored() || table.rows().markable();
+        if !carried || table.declared_is_stored()? || !held.tables.contains(&name.table) {
+            continue;
+        }
+        let not_null: Vec<bool> = table.columns().iter().map(|column| column.not_null).collect();
+        if !rudb_native::restate(path, &name.table, table.stored_constraints()?, &not_null)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// A path beside the database for the file being built, with anything left there removed first.
@@ -2893,10 +2927,9 @@ fn appended(
         if let Some(clustering) = table.clustering() {
             open = open.declare(clustering.clone())?;
         }
-        let constraints = table.stored_constraints()?;
-        if !constraints.is_empty() {
-            open = open.constrain(constraints)?;
-        }
+        // Said even when there is nothing, because a table extended in place starts from what
+        // its old directory held, and an index dropped since is still in that.
+        open = open.constrain(table.stored_constraints()?)?;
         write_parts(&mut open, table.rows(), kept.unwrap_or(0), &fields)?;
         writer = Some(open);
     }
