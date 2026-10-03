@@ -4629,20 +4629,26 @@ impl Shared {
         facts
     }
 
-    /// The query timeout this database was opened with.
-    pub(crate) fn timeout(&self) -> Option<Duration> {
-        self.inner.settings.config().query_timeout()
+    /// A fresh token for one statement, sharing `cancel`'s flag and carrying the time limit.
+    ///
+    /// The limit is `max_execution_time` when a statement has set it above zero, and the query
+    /// timeout the database was opened with otherwise. The two are told apart in the sentence a
+    /// stopped query gets, which is the pin's for the setting.
+    pub(crate) fn restart(&self, cancel: &Cancel) -> Cancel {
+        let millis = self.inner.settings.max_execution_time();
+        if millis > 0 {
+            let limit = Duration::from_millis(millis.unsigned_abs());
+            return cancel.restart(Some(limit)).from_setting();
+        }
+        cancel.restart(self.inner.settings.config().query_timeout())
     }
 
     /// The token a statement of this database's runs under, when nobody holds one of their own.
     ///
-    /// It carries the configured query timeout and nothing can interrupt it, because there is
-    /// nobody holding the other half. [`Connection`] is where the other half lives.
+    /// It carries the time limit and nothing can interrupt it, because there is nobody holding the
+    /// other half. [`Connection`] is where the other half lives.
     pub(crate) fn token(&self) -> Cancel {
-        match self.inner.settings.config().query_timeout() {
-            Some(timeout) => Cancel::after(timeout),
-            None => Cancel::new(),
-        }
+        self.restart(&Cancel::new())
     }
 
     /// The plan a query runs.
@@ -4805,10 +4811,12 @@ impl Shared {
         let Some((final_statement, before)) = script.split_last() else {
             return Err(Error::binder("no statement to bind"));
         };
+        // Each statement gets a clock of its own, so a `SET max_execution_time` early in a script
+        // limits the statements after it, and a limit is on one statement and not on the script.
         for statement in before {
-            self.execute(statement, cancel)?;
+            self.execute(statement, &self.restart(cancel))?;
         }
-        last(self, final_statement, cancel)
+        last(self, final_statement, &self.restart(cancel))
     }
 
     /// Runs one parsed statement, with values for its parameters.

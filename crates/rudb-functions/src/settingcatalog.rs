@@ -1162,7 +1162,7 @@ pub static SETTINGS: &[SettingEntry] = &[
         input_type: "BIGINT",
         scope: GLOBAL,
         aliases: &[],
-        behaviour: Behaviour::DefaultOnly("0"),
+        behaviour: Behaviour::Honoured,
     },
     SettingEntry {
         name: "max_expression_depth",
@@ -1820,7 +1820,7 @@ mod tests {
         assert_eq!(setting_named("nothing_called_this"), None);
     }
 
-    /// Twenty four names are read by the engine and the rest are taken and kept, or taken at one
+    /// Twenty five names are read by the engine and the rest are taken and kept, or taken at one
     /// value and refused at the others. The counts are here so that moving a setting from one case
     /// to another is a line in a diff rather than something nobody notices.
     #[test]
@@ -1828,9 +1828,9 @@ mod tests {
         let count = |wanted: fn(&Behaviour) -> bool| {
             SETTINGS.iter().filter(|entry| wanted(&entry.behaviour)).count()
         };
-        assert_eq!(count(|b| matches!(b, Behaviour::Honoured)), 24);
+        assert_eq!(count(|b| matches!(b, Behaviour::Honoured)), 25);
         assert_eq!(count(|b| matches!(b, Behaviour::Knob(_))), 136);
-        assert_eq!(count(|b| matches!(b, Behaviour::DefaultOnly(_))), 32);
+        assert_eq!(count(|b| matches!(b, Behaviour::DefaultOnly(_))), 31);
         assert_eq!(
             setting_named("memory_limit").expect("a setting").behaviour,
             Behaviour::Honoured

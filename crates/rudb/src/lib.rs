@@ -66,7 +66,7 @@
 //!
 //! let db = Database::with_config(Config::new().with_query_timeout(Duration::from_millis(50)));
 //! let error = db.query("SELECT count(*) FROM range(100000000000)").expect_err("too slow");
-//! assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+//! assert_eq!(error.code().duckdb_name(), "INTERRUPT Error");
 //! ```
 //!
 //! A query stops at its next chunk boundary rather than immediately, which is a thousand rows of

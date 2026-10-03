@@ -32,7 +32,7 @@ impl Connection {
     /// Stops the statement this connection is running.
     ///
     /// Returns straight away. The statement stops at its next chunk boundary and the thread running
-    /// it gets an `Interrupt Error` back, so a caller that wants to know it has stopped waits on
+    /// it gets an `INTERRUPT Error` back, so a caller that wants to know it has stopped waits on
     /// that thread rather than on this call. A connection with nothing running is unaffected,
     /// because the flag is cleared at the top of each statement.
     ///
@@ -46,7 +46,7 @@ impl Connection {
 
     /// The token for one statement: this connection's flag, and the configured time limit.
     fn token(&self) -> Cancel {
-        self.cancel.restart(self.shared.timeout())
+        self.shared.restart(&self.cancel)
     }
 
     /// Runs one query and returns every row it produced.

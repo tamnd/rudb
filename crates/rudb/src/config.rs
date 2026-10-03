@@ -109,7 +109,7 @@ impl Config {
     ///
     /// Enforced. The clock starts when the statement starts, so it is a limit on one statement
     /// rather than on a session, and a statement over the limit stops at its next chunk boundary
-    /// with an `Interrupt Error` saying what limit it passed. See [`crate::Cancel`] for what a
+    /// with an `INTERRUPT Error` saying what limit it passed. See [`crate::Cancel`] for what a
     /// chunk boundary costs in response time and why it is the right place to check.
     #[must_use]
     pub fn query_timeout(&self) -> Option<Duration> {
