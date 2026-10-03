@@ -1485,6 +1485,12 @@ fn alter(
             rewrite: None,
         }));
     }
+    if kind == Entry::View && matches!(written.action, ast::AlterAction::AddKey { .. }) {
+        return Err(Error::binder(
+            "Cannot execute the `ALTER TABLE` statement on `View`, only `Table` entries are \
+             accepted.",
+        ));
+    }
     if kind == Entry::View {
         return Err(Error::catalog("Can only modify view with ALTER VIEW statement"));
     }
@@ -1591,6 +1597,19 @@ fn alter(
         }
         ast::AlterAction::NotNull { column, set } => {
             rudb_catalog::Alteration::NotNull { column: found(column)?, set }
+        }
+        ast::AlterAction::AddKey { columns, primary } => {
+            let mut places = Vec::new();
+            for column in ast.name(columns) {
+                let at = fields.iter().position(|field| same_name(&field.name, column));
+                places.push(at.ok_or_else(|| {
+                    Error::catalog(format!(
+                        "table \"{}\" does not have a column named \"{column}\"",
+                        name.table
+                    ))
+                })?);
+            }
+            rudb_catalog::Alteration::AddKey { columns: places, primary }
         }
         ast::AlterAction::Type { column, ty, using } => {
             let at = found(column)?;

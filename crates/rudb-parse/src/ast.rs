@@ -507,6 +507,14 @@ pub enum AlterAction {
         /// Whether it is `SET`.
         set: bool,
     },
+    /// `ADD PRIMARY KEY (columns)` or `ADD UNIQUE (columns)`, the two constraints the pin can add
+    /// to a table that already exists.
+    AddKey {
+        /// The columns, as a run of parts, in the order written.
+        columns: Slice,
+        /// Whether it is the primary key.
+        primary: bool,
+    },
     /// `ALTER COLUMN column SET DATA TYPE type USING expression`, either of which can be left out,
     /// though not both. `NONE` for a missing one.
     Type {

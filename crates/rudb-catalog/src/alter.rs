@@ -58,6 +58,13 @@ pub enum Alteration {
         /// Whether it is `SET`.
         set: bool,
     },
+    /// `ADD PRIMARY KEY` or `ADD UNIQUE`.
+    AddKey {
+        /// The columns, by place, in the order written.
+        columns: Vec<usize>,
+        /// Whether it is the primary key.
+        primary: bool,
+    },
     /// `SET DATA TYPE`.
     Type {
         /// The column, by place.
