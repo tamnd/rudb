@@ -148,6 +148,13 @@ fn with(ast: &Ast, ctes: Slice) -> String {
             } else {
                 format!(" ({})", names(ast, held.columns))
             };
+            if held.recursive {
+                return format!(
+                    "{}{columns} AS ({})",
+                    quoted(ast.string(held.name)),
+                    recursive(ast, held.query)
+                );
+            }
             format!(
                 "{}{columns} AS MATERIALIZED ({})",
                 quoted(ast.string(held.name)),
@@ -155,7 +162,18 @@ fn with(ast: &Ast, ctes: Slice) -> String {
             )
         })
         .collect();
-    format!("WITH {}", written.join(", "))
+    let recursive = ast.cte_list(ctes).iter().any(|&index| ast.cte(index).recursive);
+    format!("WITH {}{}", if recursive { "RECURSIVE " } else { "" }, written.join(", "))
+}
+
+/// The query of a definition that reads itself, which upstream prints with a spacing of its own:
+/// `(SELECT 1) UNION  ALL (SELECT ...)`, with two spaces in front of `ALL`. Measured.
+fn recursive(ast: &Ast, held: QueryRef) -> String {
+    let QueryBody::SetOp { quantifier, left, right, .. } = ast.query(held).body else {
+        return query(ast, held);
+    };
+    let all = if quantifier == Quantifier::All { " ALL " } else { "" };
+    format!("({}) UNION {all}({})", query(ast, left), query(ast, right))
 }
 
 /// A set operation, with the spacing bug upstream has in it.
@@ -1093,6 +1111,21 @@ mod tests {
         assert_eq!(
             whole(r#"CREATE VIEW v ("Weird Name", "x y") AS SELECT 1, 2"#),
             r#"CREATE VIEW v ("Weird Name", "x y") AS SELECT 1, 2;"#
+        );
+    }
+
+    /// Two spaces before `ALL`, and none before the body. Both measured.
+    #[test]
+    fn a_recursive_definition_is_written_as_its_two_sides() {
+        assert_eq!(
+            body(
+                "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t"
+            ),
+            "WITH RECURSIVE t (n) AS ((SELECT 1) UNION  ALL (SELECT (n + 1) FROM t WHERE (n < 3)))SELECT * FROM t"
+        );
+        assert_eq!(
+            body("WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n FROM t) SELECT * FROM t"),
+            "WITH RECURSIVE t (n) AS ((SELECT 1) UNION (SELECT n FROM t))SELECT * FROM t"
         );
     }
 

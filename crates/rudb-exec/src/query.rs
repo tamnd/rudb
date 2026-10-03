@@ -27,7 +27,7 @@ use rudb_common::{Cancel, Error, Result};
 use rudb_metrics::Driver;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use rudb_pipeline::{Pipeline, Pool, RootReader, run_parallel};
+use rudb_pipeline::{Lease, Pipeline, Pool, RootReader, run_parallel};
 use rudb_vector::Chunk;
 
 use crate::schema::Schema;
@@ -158,6 +158,23 @@ impl<'a> Query<'a> {
                 spread.finalize_ns,
                 spread.stagger_ns,
             );
+            self.worker_cpu_ns.fetch_add(spread.worker_cpu_ns, Ordering::Relaxed);
+            self.widest.fetch_max(degree, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Runs every pipeline on threads that are already lent, which is what a query run from inside
+    /// another one's finish has to do, since asking the pool again would wait for itself.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Query::run`].
+    pub(crate) fn run_on(&self, cancel: &Cancel, lease: &Lease<'_>) -> Result<()> {
+        for pipeline in &self.pipelines {
+            let (wanted, _) = pipeline.widths(lease.degree());
+            let degree = wanted.min(lease.degree());
+            let spread = run_parallel(pipeline, cancel, lease, degree)?;
             self.worker_cpu_ns.fetch_add(spread.worker_cpu_ns, Ordering::Relaxed);
             self.widest.fetch_max(degree, Ordering::Relaxed);
         }

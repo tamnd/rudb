@@ -89,6 +89,10 @@ pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
             *definition = children[0];
             *body = children[1];
         }
+        Node::RecursiveCte { anchor, recursive, .. } => {
+            *anchor = children[0];
+            *recursive = children[1];
+        }
         Node::LateralFunction { input, .. } => *input = children[0],
         Node::Get { .. }
         | Node::Dummy
@@ -118,6 +122,7 @@ pub(crate) fn outputs(plan: &Plan, at: NodeRef) -> Option<Vec<(ColumnBinding, Lo
         | Node::Fetch { index, columns, .. }
         | Node::TableFetch { index, columns, .. }
         | Node::CteScan { index, columns, .. }
+        | Node::RecursiveCte { index, columns, .. }
         | Node::Consistent { index, columns, .. } => Some(
             plan.field_list(columns)
                 .iter()

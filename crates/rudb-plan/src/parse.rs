@@ -398,6 +398,31 @@ impl Reader<'_> {
                 let columns = read_schema(plan, c)?;
                 Ok(Built::leaf(Node::CteScan { index, cte, name, columns }))
             }
+            "RecursiveCte" => {
+                let name = read_name(plan, c)?;
+                let cte = read_cte_index(c)?;
+                let all = if c.eat_word("ALL") {
+                    true
+                } else if c.eat_word("DISTINCT") {
+                    false
+                } else {
+                    return Err(c.error("expected ALL or DISTINCT"));
+                };
+                let index = read_table_index(c)?;
+                let columns = read_schema(plan, c)?;
+                Ok(Built {
+                    arity: 2,
+                    assemble: Box::new(move |anchor, recursive| Node::RecursiveCte {
+                        anchor,
+                        recursive,
+                        index,
+                        cte,
+                        name,
+                        all,
+                        columns,
+                    }),
+                })
+            }
             "SetOp" => {
                 let kind = read_keyword(c, &SetOpKind::ALL, SetOpKind::keyword, "a set operation")?;
                 let all = if c.eat_word("ALL") {

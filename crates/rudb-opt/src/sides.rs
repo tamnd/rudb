@@ -269,6 +269,7 @@ fn width(plan: &Plan, node: NodeRef) -> Option<u64> {
         Node::Values { columns, .. }
         | Node::TableFunction { columns, .. }
         | Node::CteScan { columns, .. }
+        | Node::RecursiveCte { columns, .. }
         | Node::Consistent { columns, .. } => Some(fields(columns)),
         Node::Project { exprs: list, .. } => Some(exprs(list)),
         Node::Aggregate { groups, aggregates, .. } => Some(exprs(groups) + exprs(aggregates)),

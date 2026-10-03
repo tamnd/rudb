@@ -360,7 +360,10 @@ fn untouched(plan: &Plan, order: &[NodeRef]) -> HashSet<NodeRef> {
     }
     for &node in order {
         match *plan.node(node) {
-            Node::SetOp { left, right, .. } => {
+            // A recursive definition is the same lining up by position, and its recursive side is
+            // also read back through the working table, which narrowing could not follow.
+            Node::SetOp { left, right, .. }
+            | Node::RecursiveCte { anchor: left, recursive: right, .. } => {
                 found.insert(left);
                 found.insert(right);
             }
@@ -390,6 +393,7 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
         | Node::SetOp { .. }
         | Node::CrossProduct { .. }
         | Node::MaterializedCte { .. }
+        | Node::RecursiveCte { .. }
         | Node::CteScan { .. }
         | Node::Consistent { .. } => {}
         Node::Values { rows, .. } => {

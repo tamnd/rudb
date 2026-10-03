@@ -274,7 +274,10 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Keys]) -> Keys {
 
         // A set operation that is not `ALL` eliminates duplicates over its whole output, and one
         // that is `ALL` is a concatenation and keeps nothing: the same row may come from both sides.
-        Node::SetOp { all, .. } => {
+        //
+        // A recursive definition without `ALL` adds a row only when it is not already there, which
+        // is the same promise.
+        Node::SetOp { all, .. } | Node::RecursiveCte { all, .. } => {
             if all {
                 Keys::unknown()
             } else {

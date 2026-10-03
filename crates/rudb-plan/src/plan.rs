@@ -968,6 +968,7 @@ impl Plan {
             | Node::CteScan { .. }
             | Node::Consistent { .. }
             | Node::MaterializedCte { .. }
+            | Node::RecursiveCte { .. }
             | Node::CrossProduct { .. }
             | Node::SetOp { .. }
             | Node::Limit { .. }
@@ -1485,7 +1486,7 @@ impl Plan {
                 }
                 self.checked_field_list(columns, reference)?;
             }
-            Node::CteScan { name, columns, .. } => {
+            Node::CteScan { name, columns, .. } | Node::RecursiveCte { name, columns, .. } => {
                 if name as usize >= self.strings.len() {
                     return fail("names a string that is not in the table");
                 }
@@ -1568,6 +1569,7 @@ impl Plan {
             | Node::Dummy
             | Node::CrossProduct { .. }
             | Node::MaterializedCte { .. }
+            | Node::RecursiveCte { .. }
             | Node::CteScan { .. }
             | Node::Consistent { .. }
             | Node::SetOp { .. } => Vec::new(),

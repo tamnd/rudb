@@ -557,6 +557,33 @@ pub enum Node {
         /// The produced columns with their types, into the field pool.
         columns: Slice,
     },
+    /// A `WITH RECURSIVE` definition that reads itself, run to a fixpoint.
+    ///
+    /// The anchor runs once. Then the recursive side runs over the rows the round before it added,
+    /// and again over what that run added, until a run adds nothing. Every row any round added is
+    /// what this produces. With `all` unset a row that was already produced is not added again,
+    /// which is also what stops a cycle.
+    ///
+    /// It is always the definition of a [`Node::MaterializedCte`] with the same `cte`, so a read of
+    /// the name in the body is a [`Node::CteScan`] of the finished rows the way any held definition
+    /// is read. A [`Node::CteScan`] of that `cte` inside `recursive` reads the previous round
+    /// instead, which is the only place in the plan where one scan number means two sets of rows.
+    RecursiveCte {
+        /// The query run once at the start.
+        anchor: NodeRef,
+        /// The query run once per round.
+        recursive: NodeRef,
+        /// The table index the produced columns bind against.
+        index: u32,
+        /// Which materialisation the reads inside `recursive` name.
+        cte: u32,
+        /// The name it was written with.
+        name: StrRef,
+        /// Whether a row already produced is produced again, which is `UNION ALL`.
+        all: bool,
+        /// The produced columns with their types, into the field pool.
+        columns: Slice,
+    },
     /// A MIN or MAX over an acyclic chain of inner equi-joins, answered without running the join.
     ///
     /// What it replaces is an ungrouped aggregate whose every call is a MIN or a MAX of one
@@ -624,6 +651,7 @@ impl Node {
             Self::CrossProduct { .. } => "CrossProduct",
             Self::MaterializedCte { .. } => "MaterializedCte",
             Self::CteScan { .. } => "CteScan",
+            Self::RecursiveCte { .. } => "RecursiveCte",
             Self::Consistent { .. } => "Consistent",
             Self::SetOp { .. } => "SetOp",
         }
@@ -661,6 +689,7 @@ impl Node {
             | Self::CrossProduct { left, right }
             | Self::SetOp { left, right, .. } => [Some(left), Some(right)],
             Self::MaterializedCte { definition, body, .. } => [Some(definition), Some(body)],
+            Self::RecursiveCte { anchor, recursive, .. } => [Some(anchor), Some(recursive)],
         }
     }
 
@@ -685,6 +714,7 @@ impl Node {
             | Self::Window { index, .. }
             | Self::CteScan { index, .. }
             | Self::Consistent { index, .. }
+            | Self::RecursiveCte { index, .. }
             | Self::SetOp { index, .. } => Some(index),
             _ => None,
         }
