@@ -313,7 +313,7 @@ fn measured(plan: &Plan, at: NodeRef, stats: &Facts) -> bool {
 /// restriction is a join above it and the node holding it is one of the nodes passed on the way
 /// down. q20 is that shape: the keys are partsupp's and partsupp is unfiltered, but the outer side
 /// joins it to the parts named `forest%`, and that join is what makes the keys worth pushing.
-fn descent(plan: &Plan, at: NodeRef, wanted: &TableSet) -> Vec<NodeRef> {
+pub(crate) fn descent(plan: &Plan, at: NodeRef, wanted: &TableSet) -> Vec<NodeRef> {
     let mut path = Vec::new();
     let mut here = at;
     if !wanted.is_subset_of(&produced(plan, here)) {
@@ -381,7 +381,7 @@ fn traced(plan: &Plan, at: NodeRef, binding: ColumnBinding) -> Option<(NodeRef, 
 /// other kinds are not: an outer join's padding and a mark join's flag are columns the copy would
 /// have to reproduce rather than rows, and an anti join is the one shape here whose output grows
 /// when its right side loses a row.
-fn copyable(plan: &Plan, at: NodeRef) -> bool {
+pub(crate) fn copyable(plan: &Plan, at: NodeRef) -> bool {
     match *plan.node(at) {
         Node::Get { .. } | Node::TableFunction { .. } => true,
         Node::Filter { input, predicate } => {
@@ -436,7 +436,7 @@ fn written(plan: &mut Plan, push: &Push) -> Option<NodeRef> {
 /// `renames` collects the index each copied operator was given, which is what [`renamed`] rewrites
 /// the expressions above it with. It is filled in the order the copy is built, so an operator's own
 /// index goes in after its input's expressions have been rewritten and not before.
-fn copied(plan: &mut Plan, at: NodeRef, renames: &mut Vec<(u32, u32)>) -> Option<NodeRef> {
+pub(crate) fn copied(plan: &mut Plan, at: NodeRef, renames: &mut Vec<(u32, u32)>) -> Option<NodeRef> {
     let span = plan.node_span(at);
     match plan.node(at).clone() {
         Node::Get { catalog, schema, table, alias, index, columns } => {
@@ -504,7 +504,7 @@ fn carry(plan: &mut Plan, was: u32, fresh: u32) {
 ///
 /// Appended rather than edited, because the expression it is written from is still read by the
 /// relation that was copied.
-fn renamed(plan: &mut Plan, expr: ExprRef, renames: &[(u32, u32)]) -> ExprRef {
+pub(crate) fn renamed(plan: &mut Plan, expr: ExprRef, renames: &[(u32, u32)]) -> ExprRef {
     if let Expr::Column(binding) = *plan.expr(expr) {
         let Some(&(_, fresh)) = renames.iter().find(|&&(was, _)| was == binding.table) else {
             return expr;
