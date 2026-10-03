@@ -666,7 +666,7 @@ pub static SETTINGS: &[SettingEntry] = &[
         input_type: "VARCHAR",
         scope: GLOBAL,
         aliases: &[],
-        behaviour: Behaviour::DefaultOnly("ALL_ERRORS_INVALIDATE_TRANSACTION"),
+        behaviour: Behaviour::Honoured,
     },
     SettingEntry {
         name: "delim_join_as_cte",
@@ -1820,7 +1820,7 @@ mod tests {
         assert_eq!(setting_named("nothing_called_this"), None);
     }
 
-    /// Twenty five names are read by the engine and the rest are taken and kept, or taken at one
+    /// Twenty six names are read by the engine and the rest are taken and kept, or taken at one
     /// value and refused at the others. The counts are here so that moving a setting from one case
     /// to another is a line in a diff rather than something nobody notices.
     #[test]
@@ -1828,9 +1828,9 @@ mod tests {
         let count = |wanted: fn(&Behaviour) -> bool| {
             SETTINGS.iter().filter(|entry| wanted(&entry.behaviour)).count()
         };
-        assert_eq!(count(|b| matches!(b, Behaviour::Honoured)), 25);
+        assert_eq!(count(|b| matches!(b, Behaviour::Honoured)), 26);
         assert_eq!(count(|b| matches!(b, Behaviour::Knob(_))), 136);
-        assert_eq!(count(|b| matches!(b, Behaviour::DefaultOnly(_))), 31);
+        assert_eq!(count(|b| matches!(b, Behaviour::DefaultOnly(_))), 30);
         assert_eq!(
             setting_named("memory_limit").expect("a setting").behaviour,
             Behaviour::Honoured

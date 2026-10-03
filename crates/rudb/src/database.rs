@@ -3735,12 +3735,15 @@ impl Shared {
         }
         let result = run();
         // A statement rudb does not run yet leaves the transaction open. The pin would have run it,
-        // so aborting here would turn one gap into a refusal of everything after it.
-        let aborts = result.as_ref().err().is_some_and(|error| {
-            !matches!(
-                error.code(),
-                rudb_common::ErrorCode::Parser | rudb_common::ErrorCode::NotImplemented
-            )
+        // so aborting here would turn one gap into a refusal of everything after it. Under
+        // `SYNTACTIC_ERRORS_DO_NOT_INVALIDATE` a binder or catalog error leaves it open too, and
+        // on the pin that goes by the kind of error rather than by where it was raised, so a
+        // `CREATE TABLE` of a name that is taken leaves it open and a failed cast does not.
+        let keeps = self.inner.settings.syntactic_errors_keep_transaction();
+        let aborts = result.as_ref().err().is_some_and(|error| match error.code() {
+            rudb_common::ErrorCode::Parser | rudb_common::ErrorCode::NotImplemented => false,
+            rudb_common::ErrorCode::Binder | rudb_common::ErrorCode::Catalog => !keeps,
+            _ => true,
         });
         if aborts && let Some(open) = self.open().as_mut() {
             open.aborted = true;
