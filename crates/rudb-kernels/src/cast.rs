@@ -163,7 +163,7 @@ pub fn cast_in_time_zone(
     Vector::from_values(target.clone(), &values)
 }
 
-fn cast_value_in_time_zone(
+pub(crate) fn cast_value_in_time_zone(
     value: &Value,
     target: &LogicalType,
     try_cast: bool,
@@ -2246,6 +2246,43 @@ fn written_zone(text: &str) -> Suffix<'_> {
         .map(|(field, scale)| field.parse::<i64>().unwrap_or_default() * scale)
         .sum::<i64>();
     Suffix::Offset(if zone.starts_with('-') { -seconds } else { seconds })
+}
+
+/// A string read as a `DATE` with nothing after the day, which is the pin's strict date parse and
+/// what `read_json` asks of a string before it calls a column of them dates.
+pub(crate) fn strict_date(text: &str) -> Option<i32> {
+    if let Some(days) = special_day(text) {
+        return Some(days);
+    }
+    match split_parts(text.trim()).ok()? {
+        (date, era, None) => parse_day(date, era).ok(),
+        _ => None,
+    }
+}
+
+/// A string read as a `TIME` with nothing but a clock in it, which is the pin's strict time parse:
+/// no date in front and nothing after but space.
+pub(crate) fn strict_time(text: &str) -> Option<i64> {
+    let clock = text.trim();
+    if clock.is_empty()
+        || !clock.bytes().all(|byte| byte.is_ascii_digit() || byte == b':' || byte == b'.')
+    {
+        return None;
+    }
+    parse_clock_fields(clock).ok()
+}
+
+/// Whether a string reads as a timestamp with an offset, without one, or not as a timestamp, which
+/// is what `read_json` asks of the strings it may detect as `TIMESTAMP WITH TIME ZONE`.
+pub(crate) fn timestamp_offset(text: &str) -> Option<bool> {
+    if special_day(text).is_some() {
+        return None;
+    }
+    match parse_timestamp_zoned(text) {
+        Ok((_, Suffix::Offset(_))) => Some(true),
+        Ok(_) => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// The words a date or a timestamp can be written as instead of numbers, as days since the epoch.

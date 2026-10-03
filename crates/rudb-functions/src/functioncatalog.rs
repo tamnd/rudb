@@ -48,6 +48,7 @@
 //! `CONSISTENT_WITHIN_QUERY` row.
 
 use rudb_common::{Field, LogicalType};
+use rudb_kernels::json::scan;
 
 use crate::signature::{FunctionKind, FunctionRow, function_rows};
 use crate::table::TableFunction;
@@ -184,7 +185,33 @@ fn tables() -> Vec<FunctionEntry> {
                 (0..count).map(|at| positional_type(*function, at).to_string()).collect();
             for (name, ty) in function.parameters() {
                 parameters.push((*name).to_string());
-                parameter_types.push(ty.to_string());
+                // A parameter that takes any value is held as the null type, and printed as the
+                // pin prints it.
+                parameter_types.push(if *ty == LogicalType::Null {
+                    "ANY".to_string()
+                } else {
+                    ty.to_string()
+                });
+            }
+            // The JSON readers take a path, a list of them or a variant, and the pin lists their
+            // named parameters in its catalog's order rather than in this one's.
+            if let Some(kind) = function.json() {
+                let mut parameters = positional(1);
+                let mut types = vec![String::new()];
+                for name in scan::listed(kind) {
+                    parameters.push((*name).to_string());
+                    let found =
+                        function.parameters().iter().find(|(parameter, _)| parameter == name);
+                    types.push(match found {
+                        Some((_, ty)) if *ty != LogicalType::Null => ty.to_string(),
+                        _ => "ANY".to_string(),
+                    });
+                }
+                for first in ["ANY[]", "VARCHAR", "VARIANT"] {
+                    types[0] = first.to_string();
+                    entries.push(table_entry(*function, parameters.clone(), types.clone()));
+                }
+                continue;
             }
             // The two document walks take a `JSON` document as well as a `VARCHAR` one, and the
             // pin lists the two as separate rows.
@@ -241,6 +268,10 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::JsonTree,
     TableFunction::ReadParquet,
     TableFunction::ReadCsv,
+    TableFunction::ReadJson,
+    TableFunction::ReadNdjson,
+    TableFunction::ReadJsonObjects,
+    TableFunction::ReadNdjsonObjects,
     TableFunction::RudbStrategies,
     TableFunction::RudbLinks,
     TableFunction::RudbDeviceCard,
@@ -273,9 +304,14 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::PragmaDatabaseSize,
 ];
 
-/// The second name each of the two file readers answers to.
-const TABLE_ALIASES: &[(&str, TableFunction)] =
-    &[("parquet_scan", TableFunction::ReadParquet), ("read_csv_auto", TableFunction::ReadCsv)];
+/// The second name each of the file readers answers to.
+const TABLE_ALIASES: &[(&str, TableFunction)] = &[
+    ("parquet_scan", TableFunction::ReadParquet),
+    ("read_csv_auto", TableFunction::ReadCsv),
+    ("read_json_auto", TableFunction::ReadJson),
+    ("read_ndjson_auto", TableFunction::ReadNdjson),
+    ("read_json_objects_auto", TableFunction::ReadJsonObjects),
+];
 
 /// How many positional arguments a table function takes, one count per row it produces.
 fn positional_counts(function: TableFunction) -> Vec<usize> {
@@ -287,6 +323,10 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         TableFunction::Unnest
         | TableFunction::ReadParquet
         | TableFunction::ReadCsv
+        | TableFunction::ReadJson
+        | TableFunction::ReadNdjson
+        | TableFunction::ReadJsonObjects
+        | TableFunction::ReadNdjsonObjects
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo => vec![1],
@@ -329,6 +369,10 @@ const fn positional_type(function: TableFunction, at: usize) -> &'static str {
         TableFunction::Unnest => "ANY",
         TableFunction::ReadParquet
         | TableFunction::ReadCsv
+        | TableFunction::ReadJson
+        | TableFunction::ReadNdjson
+        | TableFunction::ReadJsonObjects
+        | TableFunction::ReadNdjsonObjects
         | TableFunction::JsonEach
         | TableFunction::JsonTree
         | TableFunction::PragmaTableInfo

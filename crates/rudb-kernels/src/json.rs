@@ -17,6 +17,8 @@ use rudb_vector::Vector;
 
 use crate::cast::cast_value;
 
+pub mod scan;
+
 /// One value in a document.
 #[derive(Debug, Clone, PartialEq)]
 enum Node {
@@ -432,7 +434,7 @@ impl Reader<'_> {
         let Some(frame) = stack.last_mut() else { return };
         match &mut nodes[frame.at] {
             Node::Array(children) => {
-                if !children.contains(&child) {
+                if children.last() != Some(&child) {
                     children.push(child);
                 }
             }
@@ -496,8 +498,22 @@ impl Reader<'_> {
 ///
 /// Where and why the pin's reader stops on the same text.
 pub fn read(text: &str) -> std::result::Result<Document, Malformed> {
-    let mut reader = Reader { bytes: text.as_bytes(), cur: 0 };
     let mut nodes = Vec::new();
+    read_into(text, &mut nodes, false)?;
+    Ok(Document { nodes })
+}
+
+/// Reads one document onto the end of `nodes`, answering where its root went and how many bytes of
+/// the text it took. With `stop` the read ends at the end of the document, as the pin's
+/// `YYJSON_READ_STOP_WHEN_DONE` does, and whatever follows is left for the caller to judge.
+/// Nothing is added when the text is malformed.
+fn read_into(
+    text: &str,
+    nodes: &mut Vec<Node>,
+    stop: bool,
+) -> std::result::Result<(usize, usize), Malformed> {
+    let mut reader = Reader { bytes: text.as_bytes(), cur: 0 };
+    let base = nodes.len();
     let outcome = (|| {
         if text.is_empty() {
             return Err((0, Kind::Empty, "input length is 0"));
@@ -507,11 +523,14 @@ pub fn read(text: &str) -> std::result::Result<Document, Malformed> {
             return Err((0, Kind::Empty, "input data is empty"));
         }
         match reader.at(reader.cur) {
-            b'{' | b'[' => reader.container(&mut nodes)?,
+            b'{' | b'[' => reader.container(nodes)?,
             _ => {
                 let node = reader.scalar()?;
                 nodes.push(node);
             }
+        }
+        if stop {
+            return Ok(());
         }
         reader.skip();
         if reader.cur < reader.bytes.len() {
@@ -520,8 +539,9 @@ pub fn read(text: &str) -> std::result::Result<Document, Malformed> {
         Ok(())
     })();
     match outcome {
-        Ok(()) => Ok(Document { nodes }),
+        Ok(()) => Ok((base, reader.cur)),
         Err((at, kind, message)) => {
+            nodes.truncate(base);
             if kind != Kind::Empty && reader.truncated(at, kind) {
                 Err(Malformed { at: text.len(), message: "unexpected end of data" })
             } else {

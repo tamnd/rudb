@@ -22,9 +22,10 @@ use rudb_common::{
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
-    csv_fields, csv_given, files, is_file, is_pattern, kind_of, parquet_footers, parquet_outline,
-    resolve, resolve_pragma, resolve_table,
+    csv_fields, csv_given, files, is_file, is_pattern, json_text, kind_of, parquet_footers,
+    parquet_outline, resolve, resolve_pragma, resolve_table,
 };
+use rudb_kernels::json::scan;
 use rudb_kernels::{percentage, row_count};
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, identifier_parts, parse_ast_with_case};
@@ -2480,7 +2481,7 @@ impl<'a> Binder<'a> {
                 bound.push(expr);
             } else {
                 let name = ast.string(argument.alias).to_string();
-                let (parameter, value) = self.named_argument(called, &name, expr)?;
+                let (parameter, value) = self.named_argument(called, function_name, &name, expr)?;
                 written_options.push((parameter, value, expr));
             }
         }
@@ -2553,6 +2554,9 @@ impl<'a> Binder<'a> {
                     // Parquet takes the first file's footer as the answer and CSV sniffs all of
                     // them, which is not a choice made here. See `csv_fields`.
                     Columns::Csv => csv_fields(&paths, options.given.clone())?,
+                    Columns::Json => {
+                        self.json_fields(resolved.function, &paths, &mut written_options)?
+                    }
                     _ => {
                         let footers = self.footers(&paths, mirrorable.as_deref())?;
                         if let Some(path) = mirrorable.as_deref() {
@@ -2660,6 +2664,35 @@ impl<'a> Binder<'a> {
             settings,
             columns,
         })
+    }
+
+    /// The columns of a JSON read, detected from the files or given by `columns`.
+    ///
+    /// The files are read here the way the executor will read them, because the columns come out
+    /// of a sample of their documents, and how the detection settled goes into the plan as a hidden
+    /// setting. The executor needs it to know which key each column is read from, since two keys
+    /// that differ only in case answer as two names, and to word its errors the way the pin does.
+    fn json_fields(
+        &mut self,
+        function: TableFunction,
+        paths: &[String],
+        written: &mut Vec<(&'static str, Value, ExprRef)>,
+    ) -> Result<Vec<Field>> {
+        let Some(kind) = function.json() else {
+            return Err(Error::internal("a JSON read of a function that is not one"));
+        };
+        let named: Vec<(&str, Value)> =
+            written.iter().map(|(parameter, value, _)| (*parameter, value.clone())).collect();
+        let catalog = self.catalog;
+        let mut resolve = |text: &str| crate::statement::read_type(catalog, text);
+        let options = scan::Options::parse(kind, &named, Some(&mut resolve))?;
+        let mut load = |path: &str| json_text(path, options.compression);
+        let (fields, settled) = scan::bind(&options, paths, &mut load)?;
+        let value = Value::Varchar(settled.written());
+        let reference = self.plan.add_value(value.clone());
+        let expr = self.plan.add_expr(Expr::Constant(reference), LogicalType::Varchar);
+        written.push((scan::SETTLED, value, expr));
+        Ok(fields)
     }
 
     /// The columns of the `read_csv` a `COPY t FROM` became, which are the table's.
@@ -2863,9 +2896,17 @@ impl<'a> Binder<'a> {
     fn named_argument(
         &mut self,
         function: TableFunction,
+        spelled: &str,
         name: &str,
         expr: ExprRef,
     ) -> Result<(&'static str, Value)> {
+        // The JSON readers name the function as it was called, `_auto` and all, and list a
+        // parameter that takes any value as `ANY`.
+        let called = if function.json().is_some() {
+            spelled.to_ascii_lowercase()
+        } else {
+            function.name().to_string()
+        };
         let known = function
             .parameters()
             .iter()
@@ -2874,19 +2915,23 @@ impl<'a> Binder<'a> {
             let candidates: Vec<String> = function
                 .parameters()
                 .iter()
-                .map(|(parameter, ty)| format!("    {parameter} {ty}"))
+                .map(|(parameter, ty)| {
+                    if *ty == LogicalType::Null {
+                        format!("    {parameter} ANY")
+                    } else {
+                        format!("    {parameter} {ty}")
+                    }
+                })
                 .collect();
             // A function with no named parameters at all says so rather than listing none.
             if candidates.is_empty() {
                 return Err(Error::binder(format!(
-                    "Invalid named parameter \"{name}\" for function {}\nFunction does not \
-                     accept any named parameters.",
-                    function.name()
+                    "Invalid named parameter \"{name}\" for function {called}\nFunction does not \
+                     accept any named parameters."
                 )));
             }
             return Err(Error::binder(format!(
-                "Invalid named parameter \"{name}\" for function {}\nCandidates:\n{}\n",
-                function.name(),
+                "Invalid named parameter \"{name}\" for function {called}\nCandidates:\n{}\n",
                 candidates.join("\n")
             )));
         };
@@ -2897,8 +2942,17 @@ impl<'a> Binder<'a> {
                 "the named parameter {parameter} with a value that is not a constant"
             )));
         };
+        if value == Value::Null && function.json().is_some() && *parameter == "filename" {
+            // The one the shared file options refuse rather than the JSON reader's own list.
+            return Err(Error::invalid_input("Cannot use NULL as argument for \"filename\""));
+        }
         if value == Value::Null {
             return Err(Error::binder(null_parameter(function, parameter)));
+        }
+        // The JSON readers cast what they are given to the parameter's type themselves, and say
+        // so in their own words when it does not cast.
+        if function.json().is_some() {
+            return Ok((parameter, value));
         }
         let given = self.plan.expr_type(expr).clone();
         // `nullstr` takes one string or a list of them, which is the one parameter so far that
@@ -2982,6 +3036,7 @@ impl<'a> Binder<'a> {
             }
             mirrorable = Some(canonical);
         }
+        let mut written = Vec::new();
         let read = match function {
             TableFunction::ReadParquet => {
                 let footers = self.footers(&paths, mirrorable.as_deref())?;
@@ -2995,11 +3050,14 @@ impl<'a> Binder<'a> {
                     zones: footers.zones,
                 }
             }
+            TableFunction::ReadJson => {
+                Read::uncounted(self.json_fields(function, &paths, &mut written)?)
+            }
             _ => Read::uncounted(csv_fields(&paths, Given::default())?),
         };
         let arguments: Vec<ExprRef> = paths.iter().map(|path| self.path_constant(path)).collect();
         let names: Vec<&str> = ast.name(columns).collect();
-        self.table_function_source(function, &arguments, &[], read, &label, &names)
+        self.table_function_source(function, &arguments, &written, read, &label, &names)
     }
 
     /// What the footers of `paths` say, from the outline alone where this bind is outlined and the
@@ -3044,6 +3102,9 @@ impl<'a> Binder<'a> {
         }
         if extension.eq_ignore_ascii_case("csv") || extension.eq_ignore_ascii_case("tsv") {
             return Some(TableFunction::ReadCsv);
+        }
+        if ["json", "jsonl", "ndjson"].iter().any(|json| extension.eq_ignore_ascii_case(json)) {
+            return Some(TableFunction::ReadJson);
         }
         None
     }
@@ -4526,6 +4587,9 @@ fn meet(left: &LogicalType, right: &LogicalType) -> Result<LogicalType> {
 /// text compares all of it. Anything not measured gets the first one, which is the most general of
 /// the three.
 fn null_parameter(function: TableFunction, parameter: &str) -> String {
+    if function.json().is_some() {
+        return format!("Cannot use NULL as argument to key \"{parameter}\"");
+    }
     match parameter {
         "header" => format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)"),
         "all_varchar" => format!("{} \"{parameter}\" cannot be NULL", function.name()),

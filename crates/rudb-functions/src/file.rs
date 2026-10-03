@@ -29,9 +29,11 @@ use std::sync::Arc;
 use rudb_common::bounds::Zones;
 use rudb_common::stat::Direction;
 use rudb_common::{Error, Field, Provenance, Result, Stat, Value};
+use rudb_compress::{gzip, zstd};
 use rudb_csv::{Given, Reader as CsvReader};
 use rudb_io::glob::has_magic;
 use rudb_io::{File, Filesystem, OpenMode, RealFilesystem, expand};
+use rudb_kernels::json::scan;
 use rudb_parquet::Reader;
 
 /// A reader over the Parquet file at `path`, positioned before its first row group.
@@ -85,6 +87,31 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
         }
     }
     Ok(given)
+}
+
+/// The text of a JSON file, which the JSON readers take whole, decompressed the way the call said.
+///
+/// # Errors
+///
+/// An IO error for a file that cannot be read or does not decompress, and an invalid input error
+/// for one that is not UTF-8, which no JSON document can be. The two decompression errors a file
+/// that is not compressed at all meets are the pin's words for them.
+pub fn json_text(path: &str, compression: scan::Compression) -> Result<String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| Error::io(format!("Cannot open file \"{path}\": {error}")))?;
+    let bytes = match compression.of(path) {
+        scan::Compression::Gzip if !gzip::is_gzip(&bytes) => {
+            return Err(Error::io(format!("Input is not a GZIP stream: {path}")));
+        }
+        scan::Compression::Gzip => gzip::decompress(&bytes)?,
+        scan::Compression::Zstd if !bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) => {
+            return Err(Error::io("Unknown frame descriptor"));
+        }
+        scan::Compression::Zstd => zstd::decompress(&bytes)?,
+        scan::Compression::Auto | scan::Compression::None => bytes,
+    };
+    String::from_utf8(bytes)
+        .map_err(|_| Error::invalid_input(format!("File \"{path}\" is not valid UTF-8")))
 }
 
 /// The name of the setting the binder writes into a `COPY t FROM` plan to say the column types are

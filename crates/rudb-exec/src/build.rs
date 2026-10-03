@@ -2334,7 +2334,14 @@ impl<'a> Building<'a, '_> {
         let runtime = self.sideways.take();
         self.above.clear();
         Ok(match TableFunction::lookup(name) {
-            Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
+            Some(
+                function @ (TableFunction::ReadParquet
+                | TableFunction::ReadCsv
+                | TableFunction::ReadJson
+                | TableFunction::ReadNdjson
+                | TableFunction::ReadJsonObjects
+                | TableFunction::ReadNdjsonObjects),
+            ) => {
                 let counters = self.watch(reference, id, pipeline, "FileScan", Some(name));
                 let tests = std::mem::take(&mut self.pruning);
                 self.needles.clear();

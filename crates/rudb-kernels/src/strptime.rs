@@ -208,6 +208,17 @@ fn special(data: &[u8]) -> Option<(Special, usize)> {
     })
 }
 
+/// A string read as a date with one format, which is how `read_json` tries its date formats.
+pub(crate) fn try_date(format: &Format, text: &str) -> Option<i32> {
+    i32::try_from(parse(format, text).ok()?.days()?).ok()
+}
+
+/// A string read as a timestamp with one format, which is how `read_json` tries its timestamp
+/// formats.
+pub(crate) fn try_timestamp(format: &Format, text: &str) -> Option<i64> {
+    parse(format, text).ok()?.micros(false).ok().flatten()
+}
+
 /// Upstream's `StrpTimeFormat::Parse`.
 #[allow(clippy::too_many_lines)]
 fn parse(format: &Format, text: &str) -> std::result::Result<Parsed, Failure> {

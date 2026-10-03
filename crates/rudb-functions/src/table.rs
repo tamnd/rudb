@@ -66,6 +66,7 @@
 //! `rudb_exec` knows either name.
 
 use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_kernels::json::scan;
 
 use crate::entrycatalog::{
     column_fields, constraint_fields, database_fields, index_fields, schema_fields,
@@ -96,6 +97,15 @@ pub enum TableFunction {
     ReadParquet,
     /// `read_csv(path)`, the rows of a CSV file, with everything about how it is written sniffed.
     ReadCsv,
+    /// `read_json(path)` and `read_json_auto(path)`, the rows of a file of JSON documents, with the
+    /// layout and the columns detected.
+    ReadJson,
+    /// `read_ndjson(path)` and `read_ndjson_auto(path)`, the same with one document a line.
+    ReadNdjson,
+    /// `read_json_objects(path)` and `read_json_objects_auto(path)`, each document as one `JSON`.
+    ReadJsonObjects,
+    /// `read_ndjson_objects(path)`, the same with one document a line.
+    ReadNdjsonObjects,
     /// `rudb_strategies()`, every seam and every implementation registered against it.
     RudbStrategies,
     /// `rudb_links()`, every relationship declared and what is stored for it.
@@ -184,6 +194,10 @@ impl TableFunction {
             Self::JsonTree => "json_tree",
             Self::ReadParquet => "read_parquet",
             Self::ReadCsv => "read_csv",
+            Self::ReadJson => "read_json",
+            Self::ReadNdjson => "read_ndjson",
+            Self::ReadJsonObjects => "read_json_objects",
+            Self::ReadNdjsonObjects => "read_ndjson_objects",
             Self::RudbStrategies => "rudb_strategies",
             Self::RudbLinks => "rudb_links",
             Self::RudbDeviceCard => "rudb_device_card",
@@ -309,7 +323,22 @@ impl TableFunction {
         match self {
             Self::ReadParquet => READ_PARQUET,
             Self::ReadCsv => READ_CSV.as_slice(),
-            _ => &[],
+            _ => match self.json() {
+                Some(function) => scan::parameters(function),
+                None => &[],
+            },
+        }
+    }
+
+    /// Which of the JSON readers this is, and `None` for a function that is not one.
+    #[must_use]
+    pub const fn json(self) -> Option<scan::Function> {
+        match self {
+            Self::ReadJson => Some(scan::Function::Json),
+            Self::ReadNdjson => Some(scan::Function::Ndjson),
+            Self::ReadJsonObjects => Some(scan::Function::Objects),
+            Self::ReadNdjsonObjects => Some(scan::Function::NdjsonObjects),
+            _ => None,
         }
     }
 
@@ -339,6 +368,20 @@ impl TableFunction {
         // function, which is why they are the same variant here.
         if name.eq_ignore_ascii_case("read_csv") || name.eq_ignore_ascii_case("read_csv_auto") {
             return Some(Self::ReadCsv);
+        }
+        // The `_auto` spellings are older names for the same functions, as `read_csv_auto` is.
+        for (spelled, function) in [
+            ("read_json", Self::ReadJson),
+            ("read_json_auto", Self::ReadJson),
+            ("read_ndjson", Self::ReadNdjson),
+            ("read_ndjson_auto", Self::ReadNdjson),
+            ("read_json_objects", Self::ReadJsonObjects),
+            ("read_json_objects_auto", Self::ReadJsonObjects),
+            ("read_ndjson_objects", Self::ReadNdjsonObjects),
+        ] {
+            if name.eq_ignore_ascii_case(spelled) {
+                return Some(function);
+            }
         }
         if name.eq_ignore_ascii_case("rudb_strategies") {
             return Some(Self::RudbStrategies);
@@ -458,6 +501,9 @@ pub enum Columns {
     Parquet,
     /// The columns of the CSV file the first argument names, which are sniffed out of its front.
     Csv,
+    /// The columns of the JSON files the first argument names, which are detected from a sample of
+    /// their documents or given by `columns`.
+    Json,
 }
 
 /// A resolved table function call.
@@ -496,7 +542,13 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
             return Err(Error::catalog(format!("Table Function with name {name} does not exist!")));
         }
     };
-    resolve_found(function, arguments)
+    resolve_found(function, arguments).map_err(|error| match function.json() {
+        // The JSON readers print the name as it was called, where the others print their own.
+        Some(kind) if error.message().starts_with("No function matches") => {
+            json_no_overload(kind, name, arguments)
+        }
+        _ => error,
+    })
 }
 
 /// The same resolution once the name has been settled, which is where the two spellings meet.
@@ -751,6 +803,10 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
     match function {
         TableFunction::ReadParquet => Some(Columns::Parquet),
         TableFunction::ReadCsv => Some(Columns::Csv),
+        TableFunction::ReadJson
+        | TableFunction::ReadNdjson
+        | TableFunction::ReadJsonObjects
+        | TableFunction::ReadNdjsonObjects => Some(Columns::Json),
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::Unnest
@@ -832,6 +888,10 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         | TableFunction::JsonTree
         | TableFunction::ReadParquet
         | TableFunction::ReadCsv
+        | TableFunction::ReadJson
+        | TableFunction::ReadNdjson
+        | TableFunction::ReadJsonObjects
+        | TableFunction::ReadNdjsonObjects
         | TableFunction::RudbDeviceCard
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
@@ -1330,6 +1390,35 @@ fn no_overload(function: TableFunction, arguments: &[LogicalType]) -> Error {
     ))
 }
 
+/// The pin's message for a JSON reader call that matched no overload, which lists all three of its
+/// overloads with every named parameter, in its catalog's order, after the positional one.
+fn json_no_overload(kind: scan::Function, spelled: &str, arguments: &[LogicalType]) -> Error {
+    let written: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+    let mut named = String::new();
+    for name in scan::listed(kind) {
+        let ty = scan::parameters(kind).iter().find(|(parameter, _)| parameter == name);
+        let ty = match ty {
+            Some((_, LogicalType::Null)) | None => "ANY".to_string(),
+            Some((_, ty)) => ty.to_string(),
+        };
+        // Quoted when the name is a keyword, which three of them are.
+        if matches!(*name, "columns" | "compression" | "array") {
+            named.push_str(&format!(", \"{name}\" : {ty}"));
+        } else {
+            named.push_str(&format!(", {name} : {ty}"));
+        }
+    }
+    let mut candidates = String::new();
+    for first in ["VARCHAR", "ANY[]", "VARIANT"] {
+        candidates.push_str(&format!("\t\"{spelled}\"({first}{named})\n"));
+    }
+    Error::binder(format!(
+        "No function matches the given name and argument types '{spelled}({})'. You might need \
+         to add explicit type casts.\n\tCandidate functions:\n{candidates}",
+        written.join(", ")
+    ))
+}
+
 /// The same message for a pragma, which has one overload and prints its own name quoted.
 ///
 /// The quoting is upstream's and is not a mistake being copied for its own sake. A pragma is
@@ -1439,7 +1528,7 @@ mod tests {
     fn fixed(resolved: &ResolvedTable) -> &[Field] {
         match &resolved.columns {
             Columns::Fixed(fields) => fields,
-            Columns::Parquet | Columns::Csv => {
+            Columns::Parquet | Columns::Csv | Columns::Json => {
                 panic!("{} resolves to a file", resolved.function.name())
             }
         }
