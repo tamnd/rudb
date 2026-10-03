@@ -242,3 +242,40 @@ fn each_reader_lists_three_overloads_in_the_catalog() {
         "3"
     );
 }
+
+#[test]
+fn read_single_json_file_reads_one_file_named_as_it_is() {
+    let files = Files::new();
+    files.check(&[
+        ("SELECT * FROM read_single_json_file('D/m1.json')", "1\n2"),
+        ("SELECT a FROM read_single_json_file('D/nd.json') WHERE a > 1", "2"),
+        ("SELECT * FROM read_single_json_file('D/m1.json', columns={a: 'VARCHAR'})", "1\n2"),
+        (
+            "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'read_single_json_file'",
+            "1",
+        ),
+    ]);
+    assert_eq!(
+        files.refused("SELECT * FROM read_single_json_file('D/m*.json')"),
+        "IO Error: Cannot open file \"D/m*.json\": No such file or directory"
+    );
+    assert!(files.refused("SELECT * FROM read_single_json_file(['D/m1.json'])").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+                 'read_single_json_file(VARCHAR[])'. You might need to add explicit type casts.\n\
+                 \tCandidate functions:\n\t\"read_single_json_file\"(VARCHAR, \
+                 convert_strings_to_integers : BOOLEAN, maximum_sample_files : BIGINT, "
+    ));
+    assert!(
+        files
+            .refused("SELECT * FROM read_single_json_file('D/m1.json', filename=true)")
+            .starts_with(
+                "Binder Error: Invalid named parameter \"filename\" for function \
+                 read_single_json_file\nCandidates:\n    array BOOLEAN\n    auto_detect BOOLEAN\n"
+            )
+    );
+    assert_eq!(
+        files.refused("SELECT * FROM read_single_json_file('D/m1.json', auto_detect=false)"),
+        "Binder Error: When auto_detect=false, read_json requires columns to be specified through \
+         the \"columns\" parameter."
+    );
+}

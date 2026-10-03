@@ -106,6 +106,9 @@ pub enum TableFunction {
     ReadJsonObjects,
     /// `read_ndjson_objects(path)`, the same with one document a line.
     ReadNdjsonObjects,
+    /// `read_single_json_file(path)`, `read_json` over one file named as it is, with no glob and
+    /// no list.
+    ReadSingleJsonFile,
     /// `read_text(path)`, one row per file with its whole content as text.
     ReadText,
     /// `read_blob(path)`, the same with the content as bytes.
@@ -202,6 +205,7 @@ impl TableFunction {
             Self::ReadNdjson => "read_ndjson",
             Self::ReadJsonObjects => "read_json_objects",
             Self::ReadNdjsonObjects => "read_ndjson_objects",
+            Self::ReadSingleJsonFile => "read_single_json_file",
             Self::ReadText => "read_text",
             Self::ReadBlob => "read_blob",
             Self::RudbStrategies => "rudb_strategies",
@@ -363,6 +367,7 @@ impl TableFunction {
             Self::ReadNdjson => Some(scan::Function::Ndjson),
             Self::ReadJsonObjects => Some(scan::Function::Objects),
             Self::ReadNdjsonObjects => Some(scan::Function::NdjsonObjects),
+            Self::ReadSingleJsonFile => Some(scan::Function::Single),
             _ => None,
         }
     }
@@ -403,6 +408,7 @@ impl TableFunction {
             ("read_json_objects", Self::ReadJsonObjects),
             ("read_json_objects_auto", Self::ReadJsonObjects),
             ("read_ndjson_objects", Self::ReadNdjsonObjects),
+            ("read_single_json_file", Self::ReadSingleJsonFile),
             ("read_text", Self::ReadText),
             ("read_blob", Self::ReadBlob),
         ] {
@@ -593,7 +599,9 @@ fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<R
         // objection to it is that it names no file, which is what the reader says about it rather
         // than what this table says.
         let single = arguments.len() == 1 && arguments[0] == LogicalType::Varchar;
+        // The one file reader has no list overload.
         let many = arguments.len() == 1
+            && function != TableFunction::ReadSingleJsonFile
             && matches!(&arguments[0], LogicalType::List(element)
                 if **element == LogicalType::Varchar || **element == LogicalType::Null);
         // A bare null matches, and is a sentence about nulls rather than about overloads, which is
@@ -836,7 +844,8 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         TableFunction::ReadJson
         | TableFunction::ReadNdjson
         | TableFunction::ReadJsonObjects
-        | TableFunction::ReadNdjsonObjects => Some(Columns::Json),
+        | TableFunction::ReadNdjsonObjects
+        | TableFunction::ReadSingleJsonFile => Some(Columns::Json),
         TableFunction::ReadText
         | TableFunction::ReadBlob
         | TableFunction::Range
@@ -924,6 +933,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         | TableFunction::ReadNdjson
         | TableFunction::ReadJsonObjects
         | TableFunction::ReadNdjsonObjects
+        | TableFunction::ReadSingleJsonFile
         | TableFunction::ReadText
         | TableFunction::ReadBlob
         | TableFunction::RudbDeviceCard
@@ -1481,8 +1491,13 @@ fn json_no_overload(kind: scan::Function, spelled: &str, arguments: &[LogicalTyp
             named.push_str(&format!(", {name} : {ty}"));
         }
     }
+    let firsts: &[&str] = if kind == scan::Function::Single {
+        &["VARCHAR"]
+    } else {
+        &["VARCHAR", "ANY[]", "VARIANT"]
+    };
     let mut candidates = String::new();
-    for first in ["VARCHAR", "ANY[]", "VARIANT"] {
+    for first in firsts {
         candidates.push_str(&format!("\t\"{spelled}\"({first}{named})\n"));
     }
     Error::binder(format!(
