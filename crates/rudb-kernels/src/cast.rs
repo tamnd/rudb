@@ -2338,10 +2338,42 @@ fn day_of_stamp(micros: i64) -> Option<i32> {
 }
 
 /// The date and the time in a written timestamp, which are separated by a space or by a `T`.
+///
+/// A date written with spaces between its fields ends after its third field instead of at the
+/// first space, so `'1996 03 27 01:02:03'` is a date and a time the way `'1996-03-27 01:02:03'`
+/// is. When something other than a separator follows that field the whole text is taken as the
+/// date, which is then badly written.
 fn split_time(text: &str) -> (&str, Option<&str>) {
+    if date_separator(text) == Some(b' ') {
+        let bytes = text.as_bytes();
+        let digits = |from: usize| bytes[from..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let month = usize::from(bytes.first() == Some(&b'-'));
+        let month = month + digits(month) + 1;
+        let day = month + digits(month);
+        if bytes.get(day) == Some(&b' ') {
+            let end = day + 1 + digits(day + 1);
+            return match bytes.get(end) {
+                None => (text, None),
+                Some(b' ' | b'T') => (&text[..end], Some(&text[end + 1..])),
+                Some(_) => (text, None),
+            };
+        }
+    }
     match text.split_once([' ', 'T']) {
         Some((date, time)) => (date, Some(time)),
         None => (text, None),
+    }
+}
+
+/// The character between the fields of a written date, which is whatever follows the year when it
+/// is one of the four the pin accepts: a dash, a slash, a backslash or a space.
+fn date_separator(text: &str) -> Option<u8> {
+    let bytes = text.as_bytes();
+    let start = usize::from(bytes.first() == Some(&b'-'));
+    let year = bytes[start..].iter().take_while(|b| b.is_ascii_digit()).count();
+    match bytes.get(start + year) {
+        Some(&separator @ (b'-' | b'/' | b'\\' | b' ')) if year > 0 => Some(separator),
+        _ => None,
     }
 }
 
@@ -2383,10 +2415,11 @@ fn parse_day(text: &str, era: bool) -> Parsed<i32> {
         Some(rest) => (true, rest),
         None => (false, text),
     };
-    let mut parts = rest.split('-');
+    let separator = date_separator(rest).map_or('-', char::from);
+    let mut parts = rest.split(separator);
     let written: i32 = field(parts.next())?;
-    let month: u32 = field(parts.next())?;
-    let day: u32 = field(parts.next())?;
+    let month: u32 = field(short(parts.next())?)?;
+    let day: u32 = field(short(parts.next())?)?;
     if parts.next().is_some() {
         return Err(Fault::Format);
     }
@@ -2409,6 +2442,14 @@ fn parse_day(text: &str, era: bool) -> Parsed<i32> {
         return Err(Fault::Range);
     }
     Ok(days)
+}
+
+/// A month or a day, which is written with one digit or two, so `'1996-003-07'` is refused.
+fn short(part: Option<&str>) -> Parsed<Option<&str>> {
+    match part {
+        Some(part) if part.len() > 2 => Err(Fault::Format),
+        part => Ok(part),
+    }
 }
 
 /// One field of a written date, which has to be there and has to be digits.
@@ -3309,6 +3350,53 @@ mod tests {
                 cast_to(Value::Varchar(text.into()), &LogicalType::Date).expect_err("no such day");
             assert_eq!(error.message(), format!("date field value out of range: \"{text}\""));
         }
+    }
+
+    /// A slash, a backslash or a space can stand between the fields of a date in place of the
+    /// dash, as long as both are the same one. Every line was measured against the pin.
+    #[test]
+    fn a_date_can_be_written_with_slashes_or_spaces_between_its_fields() {
+        let date = |text: &str| cast_to(Value::Varchar(text.into()), &LogicalType::Date);
+        let stamp = |text: &str| cast_to(Value::Varchar(text.into()), &LogicalType::Timestamp);
+        for (text, printed) in [
+            ("1996/03/27", "1996-03-27"),
+            ("1996/3/7", "1996-03-07"),
+            ("1996\\3\\7", "1996-03-07"),
+            ("1996 03 27", "1996-03-27"),
+            ("96/03/27", "0096-03-27"),
+            ("  1996/03/27  ", "1996-03-27"),
+            ("-1996/03/27", "1997-03-27 (BC)"),
+            ("1996 03 27 (BC)", "1996-03-27 (BC)"),
+            ("1996 03 27 01:02:03", "1996-03-27"),
+        ] {
+            assert_eq!(date(text).expect(text).to_string(), printed, "{text}");
+        }
+        for (text, printed) in [
+            ("1996 03 27 01:02:03", "1996-03-27 01:02:03"),
+            ("1996/03/27T01:02:03", "1996-03-27 01:02:03"),
+            ("1996\\03\\27 01:02:03", "1996-03-27 01:02:03"),
+        ] {
+            assert_eq!(stamp(text).expect(text).to_string(), printed, "{text}");
+        }
+        for text in [
+            "1996-03/27",
+            "1996/03-27",
+            "1996.03.27",
+            "1996_03_27",
+            "1996/003/07",
+            "1996-003-07",
+            "1996  03 27",
+            "1996 03  27",
+            "1996 03 27abc",
+        ] {
+            let error = date(text).expect_err(text);
+            assert_eq!(
+                error.message(),
+                format!("invalid date field format: \"{text}\", expected format is (YYYY-MM-DD)")
+            );
+        }
+        let error = date("1996/02/30").expect_err("no such day");
+        assert_eq!(error.message(), "date field value out of range: \"1996/02/30\"");
     }
 
     /// The era is a suffix on the date and the sign is a prefix on the year, they say the same
