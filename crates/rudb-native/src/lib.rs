@@ -9591,7 +9591,7 @@ impl Reader {
             }
             let vector = vector.into_pages();
             if keeping {
-                let vector = self.keep(at, column, vector, positions.is_some());
+                let vector = self.keep(at, column, vector, positions.map(<[u32]>::len));
                 picked.push(match positions {
                     None => Arc::unwrap_or_clone(vector),
                     Some(positions) => vector.gather(positions)?,
@@ -9685,25 +9685,33 @@ impl Reader {
     /// Holds `vector` as part `at` of `column` and counts it against the pool, and answers what the
     /// read goes on with, which is the one already held if another worker got there first.
     ///
-    /// A part kept by a read of some of its rows is held flat. It is one a join or a filter gathers
+    /// A part kept by a read of many of its rows is held flat. It is one a join or a filter gathers
     /// from, and a gather out of a packed part unpacks the rows it wants every time. A part kept by a
     /// read of all of it stays packed, since the kernels that read whole parts work on the codes and
     /// the packed part is a fraction of the memory. The slot is asked first, so a part another worker
     /// already holds is not written out flat for nothing.
     ///
+    /// A part kept by a read of fewer than one row in [`SPARSE_RENT`] stays packed too. Such a read
+    /// lands a row or two in each line of a flat part, so what it pays is the memory the part spans
+    /// and not the unpacking, and a flat part spans eight bytes a row against the few bits a packed
+    /// one does. On TPC-H q09 the green parts keep one `lineitem` row in twenty, the flat parts of
+    /// the five columns read there came to 240 MB, and the gathers out of them were a fifth of the
+    /// query, waiting on memory. That is a cost an instruction count does not see.
+    ///
     /// In the last statement a part is kept packed either way. What it is gathered from after this
     /// read is at most the statement's own second read, and writing out a whole part to save a few
     /// unpacks there cost more than it saved: TPC-H q17 reads three rows a part of `lineitem`, and
     /// writing its held parts out flat was a third of the query, most of it page faults.
-    fn keep(&self, at: usize, column: usize, vector: Vector, gathered: bool) -> Arc<Vector> {
+    fn keep(&self, at: usize, column: usize, vector: Vector, wanted: Option<usize>) -> Arc<Vector> {
         let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else {
             return Arc::new(vector);
         };
         if let PartSlot::Held { vector, .. } = &*held {
             return Arc::clone(vector);
         }
+        let dense = wanted.is_some_and(|wanted| wanted.saturating_mul(SPARSE_RENT) > vector.len());
         let vector =
-            if gathered && !self.pool.is_final() { vector.unpacked_to_hold() } else { vector };
+            if dense && !self.pool.is_final() { vector.unpacked_to_hold() } else { vector };
         let bytes = vector.footprint();
         let vector = Arc::new(vector);
         let used = Arc::new(AtomicBool::new(false));
@@ -17975,6 +17983,52 @@ mod tests {
         assert!(cascade_body(2048, &page).is_some_and(integer::pointed), "a page read by rows");
         assert_eq!(paid_at(2048, &page, &[5, 900, 1500], true), 24, "three rows pay eight each");
         assert_eq!(paid_at(2048, &page, &[5, 900, 1500], false), 2048, "or the whole part");
+    }
+
+    /// A part held by a read of a few of its rows stays packed, and one held by a read of many of
+    /// its rows is written out flat, and both give back the values they were written with.
+    #[test]
+    fn a_part_held_by_a_sparse_read_stays_packed() {
+        let path = path("held-packed");
+        let mut writer =
+            Writer::create(&path, "a", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        let values: Vec<Value> = (0..4096_i64)
+            .map(|i| Value::Integer((i * 2_654_435_761 / 128 % 1000) as i32))
+            .collect();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::Integer, &values).expect("integers")])
+                .expect("matching rows");
+        writer.append(&chunk).expect("two parts");
+        writer.append(&chunk).expect("two parts");
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("a").expect("a");
+        // No slot until the first read of the column makes them.
+        let held = |part: usize| match &*a.cache.slot(0, part)?.lock().expect("the slot") {
+            PartSlot::Held { vector, .. } => Some(vector.form()),
+            _ => None,
+        };
+        let sparse: Vec<u32> = (0..4096).step_by(64).collect();
+        let dense: Vec<u32> = (0..4096).step_by(2).collect();
+        for (part, rows) in [(0, &sparse), (1, &dense)] {
+            for _ in 0..64 {
+                if held(part).is_some() {
+                    break;
+                }
+                a.read_rows(part, &[0], rows, false).expect("rows");
+            }
+            let read = a.read_rows(part, &[0], rows, false).expect("rows");
+            for (at, &row) in rows.iter().enumerate() {
+                assert_eq!(read.value_at(at, 0), values[row as usize]);
+            }
+        }
+        assert_eq!(held(0), Some(rudb_vector::Form::BitPacked), "one row in 64 keeps it packed");
+        assert_eq!(held(1), Some(rudb_vector::Form::Flat), "one row in two writes it out flat");
+        drop((a, catalog));
+        fs::remove_file(path).expect("remove scratch file");
     }
 
     /// A whole read holds the part it decoded, reads at positions count what they cost until the
