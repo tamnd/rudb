@@ -9073,11 +9073,26 @@ mod tests {
     /// not seen and into one it has, count the values of both instances once.
     #[test]
     fn a_distinct_set_taken_whole_into_a_new_group_counts_what_merging_it_would() {
-        let plan = parsed(
-            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count(DISTINCT #0.1::INTEGER)::BIGINT, \
-             count(DISTINCT #0.2::VARCHAR)::BIGINT]",
+        let plan = Plan::parse(concat!(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count(DISTINCT #0.1::INTEGER)::BIGINT, ",
+            "count(DISTINCT #0.2::VARCHAR)::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [g::INTEGER, x::INTEGER, s::VARCHAR]",
+        ))
+        .expect("two distinct counts by a group");
+        let schema = Schema::numbered(
+            vec![
+                Field::new("g", LogicalType::Integer),
+                Field::new("x", LogicalType::Integer),
+                Field::new("s", LogicalType::Varchar),
+            ],
+            0,
         );
-        let (aggregate, out) = aggregate(&plan);
+        let rudb_plan::Node::Aggregate { groups, aggregates, .. } = *plan.node(plan.root()) else {
+            panic!("the root is an aggregate")
+        };
+        let (aggregate, out) =
+            Aggregate::new(&plan, &schema, 1, groups, aggregates, &Memory::unlimited())
+                .expect("distinct count aggregates");
         let rows = |rows: &[(i32, i32, &str)]| {
             let column = |values: Vec<Value>, ty: LogicalType| {
                 Vector::from_values(ty, &values).expect("one type a column")
