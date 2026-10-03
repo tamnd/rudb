@@ -3364,7 +3364,7 @@ fn preserve_identifier_case_keeps_legacy_boolean_aliases_and_metadata() {
 }
 
 #[test]
-fn allow_parser_override_extension_matches_the_only_installed_mode() {
+fn allow_parser_override_extension_takes_the_pins_three_modes() {
     let db = database();
     assert_eq!(
         rows(&db, "SELECT current_setting('allow_parser_override_extension')"),
@@ -3372,9 +3372,13 @@ fn allow_parser_override_extension_matches_the_only_installed_mode() {
     );
     db.execute("SET allow_parser_override_extension = DEFAULT").expect("the default mode");
     db.execute("SET allow_parser_override_extension = 'default'").expect("case insensitive mode");
-    let invalid = db
-        .execute("SET allow_parser_override_extension = true")
-        .expect_err("the pin has no enabled mode");
+    assert_eq!(db.setting("allow_parser_override_extension").expect("the mode"), "default");
+    db.execute("SET allow_parser_override_extension = strict").expect("the strict mode");
+    assert_eq!(db.setting("allow_parser_override_extension").expect("the mode"), "strict");
+    db.execute("SET allow_parser_override_extension = 'FALLBACK'").expect("the fallback mode");
+    assert_eq!(db.setting("allow_parser_override_extension").expect("the mode"), "FALLBACK");
+    let invalid =
+        db.execute("SET allow_parser_override_extension = true").expect_err("not one of the modes");
     assert_eq!(invalid.code().duckdb_name(), "Not implemented Error");
     assert_eq!(
         invalid.message(),
@@ -3396,7 +3400,7 @@ fn allow_parser_override_extension_matches_the_only_installed_mode() {
 }
 
 #[test]
-fn warnings_as_errors_matches_the_pin_without_a_logger() {
+fn warnings_as_errors_needs_a_logger() {
     let db = database();
     assert_eq!(
         rows(&db, "SELECT current_setting('warnings_as_errors')"),
@@ -3404,6 +3408,7 @@ fn warnings_as_errors_matches_the_pin_without_a_logger() {
     );
     db.execute("SET warnings_as_errors = false").expect("warnings stay warnings");
     db.execute("SET warnings_as_errors = 'no'").expect("the boolean alias");
+    db.execute("SET enable_logging = false").expect("no logger");
     let error = db.execute("SET warnings_as_errors = true").expect_err("there is no logger");
     assert_eq!(error.code().duckdb_name(), "Settings Error");
     assert_eq!(

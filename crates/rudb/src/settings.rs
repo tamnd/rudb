@@ -62,7 +62,7 @@ use rudb_common::{
     Rules, Session, ShowBehavior, Value, Variable, human, looks_like_rule, parse_clustering,
     rule_names,
 };
-use rudb_functions::{Behaviour, LOCAL, SETTINGS, SettingEntry, unknown_enum_value};
+use rudb_functions::{Behaviour, LOCAL, SettingEntry, UNSET, every_setting, unknown_enum_value};
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
@@ -79,6 +79,11 @@ const INVALIDATION_POLICIES: [&str; 2] =
 /// refuses another word and the words in the order the pin declares them.
 const KNOB_WORDS: &[(&str, &str, &[&str])] = &[
     ("explain_output", "ExplainOutputType", &["ALL", "OPTIMIZED_ONLY", "PHYSICAL_ONLY"]),
+    (
+        "force_bitpacking_mode",
+        "BitpackingMode",
+        &["AUTO", "CONSTANT", "CONSTANT_DELTA", "DELTA_FOR", "FOR"],
+    ),
     ("logging_level", "LogLevel", &LOG_LEVELS),
     ("logging_mode", "LogMode", &["LEVEL_ONLY", "DISABLE_SELECTED", "ENABLE_SELECTED"]),
 ];
@@ -86,6 +91,46 @@ const KNOB_WORDS: &[(&str, &str, &[&str])] = &[
 /// The knobs that read back as the word the enum spells rather than as it was written, so
 /// `SET logging_level = 'debug'` reads back as `DEBUG`. `explain_output` is not one of them.
 const SPELLED_KNOBS: [&str; 2] = ["logging_level", "logging_mode"];
+
+/// The settings the pin warns about when one is written, because it is going away.
+///
+/// `profiling_mode` warns as well and in words of its own, which [`deprecation`] has.
+const DEPRECATED: [&str; 11] = [
+    "delim_join_as_cte",
+    "enable_object_cache",
+    "experimental_metadata_reuse",
+    "extension_directory",
+    "force_column_metadata_reuse",
+    "legacy_disable_null_type",
+    "legacy_metrics_format",
+    "null_on_division_by_zero",
+    "old_implicit_casting",
+    "regex_match_operator_semantics",
+    "table_function_identifier_conversion",
+];
+
+/// The pragmas that do nothing on the pin any more and warn that they are going away.
+const DEPRECATED_PRAGMAS: [&str; 4] =
+    ["disable_object_cache", "disable_verification", "enable_object_cache", "enable_verification"];
+
+/// The warning the pin raises when a deprecated setting is written, and `None` for the rest.
+fn deprecation(name: &str) -> Option<String> {
+    if name == "profiling_mode" {
+        return Some(
+            "the profiling_mode setting is deprecated: detailed profiling information is always collected - use \"PRAGMA enable_profiling\" to enable profiling instead"
+                .to_string(),
+        );
+    }
+    DEPRECATED.contains(&name).then(|| {
+        format!("The '{name}' setting is deprecated and will be removed in a future release.")
+    })
+}
+
+/// The words `allow_parser_override_extension` takes, in the order the pin declares them.
+const PARSER_OVERRIDES: [&str; 3] = ["DEFAULT", "FALLBACK", "STRICT"];
+
+/// The words `profiling_mode` takes, in the order the pin lists them when it refuses another.
+const PROFILING_MODES: [&str; 3] = ["standard", "detailed", "all"];
 
 /// The log levels, most verbose first, which is the order a level compares in.
 const LOG_LEVELS: [&str; 6] = ["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "FATAL"];
@@ -688,6 +733,16 @@ impl Settings {
         let Some(entry) = rudb_functions::setting_named(canonical(name)) else {
             return Err(Error::catalog(rudb_functions::unknown_setting(name)));
         };
+        // A deprecated setting warns when it is written, and with warnings as errors the warning
+        // is the error and the value is not kept. The value is still read first, so one of the
+        // wrong type is refused for its type, which is the order the pin does the two in.
+        if let Some(value) = value
+            && *self.warnings_as_errors.read().unwrap_or_else(|held| held.into_inner())
+            && let Some(warning) = deprecation(entry.name)
+        {
+            typed(entry, value)?;
+            return Err(Error::invalid_input(warning));
+        }
         if entry.behaviour != Behaviour::Honoured {
             return self.carry(entry, value);
         }
@@ -706,16 +761,21 @@ impl Settings {
                     named.name().to_string();
             }
             "allow_parser_override_extension" => {
+                // Which parser an extension may put in front of the built in one, and no extension
+                // here has one, so every mode parses with the same parser. The pin keeps the word as
+                // it was written, so `strict` reads back in lower case and a reset as `DEFAULT`.
                 let written = value.map_or("DEFAULT".to_string(), text_of);
-                if !written.eq_ignore_ascii_case("default") {
-                    return Err(Error::not_implemented(format!(
-                        "Enum value: unrecognized value \"{written}\" for enum \"AllowParserOverride\"\n\nCandidates: \"DEFAULT\""
+                if !PARSER_OVERRIDES.iter().any(|mode| mode.eq_ignore_ascii_case(&written)) {
+                    return Err(Error::not_implemented(unknown_enum_value(
+                        &written,
+                        "AllowParserOverride",
+                        &PARSER_OVERRIDES,
                     )));
                 }
                 *self
                     .allow_parser_override_extension
                     .write()
-                    .unwrap_or_else(|held| held.into_inner()) = "DEFAULT".to_string();
+                    .unwrap_or_else(|held| held.into_inner()) = written;
             }
             "current_dialect" => {
                 let written = value.map_or("duckdb".to_string(), text_of);
@@ -941,12 +1001,16 @@ impl Settings {
             }
             "warnings_as_errors" => {
                 let enabled = value.map_or(Ok(false), boolean_of)?;
-                if enabled {
+                // A warning is raised through the logger, so there has to be one to raise it
+                // through. Turning the logger off afterwards leaves this on, as the pin does.
+                let logging = rudb_functions::setting_named("enable_logging")
+                    .is_some_and(|entry| self.carried(entry) == "1");
+                if enabled && !logging {
                     return Err(Error::settings(
                         "Can not set 'warnings_as_errors=true'; no logger is available. To solve, run: 'SET enable_logging=true;'",
                     ));
                 }
-                *self.warnings_as_errors.write().unwrap_or_else(|held| held.into_inner()) = false;
+                *self.warnings_as_errors.write().unwrap_or_else(|held| held.into_inner()) = enabled;
             }
             _ => unreachable!("the name was an honoured setting a moment ago"),
         }
@@ -998,6 +1062,23 @@ impl Settings {
                 )));
             }
         }
+        // Deprecated on the pin, which still checks the word and then reads back `standard` whatever
+        // was written, because every mode collects the same detail now. Setting it turns profiling
+        // on in the pin's default format when profiling is off, and leaves a format already chosen.
+        if entry.name == "profiling_mode" {
+            if !PROFILING_MODES.iter().any(|mode| mode.eq_ignore_ascii_case(&written)) {
+                return Err(Error::parser(format!(
+                    "Unrecognized profiling mode \"{written}\", supported formats: [{}]",
+                    PROFILING_MODES.join(", ")
+                )));
+            }
+            written = "standard".to_string();
+            let mut carried = self.carried.write().unwrap_or_else(|held| held.into_inner());
+            let profiling = carried.entry("enable_profiling").or_insert_with(|| UNSET.to_string());
+            if profiling == UNSET {
+                *profiling = "query_tree".to_string();
+            }
+        }
         // The one knob a commit reads, so it is a size or it is refused, and it reads back the way
         // the pin prints it. Both spellings land here as wal_autocheckpoint.
         if entry.name == "wal_autocheckpoint" {
@@ -1031,6 +1112,14 @@ impl Settings {
                 "Pragma Function with name {name} does not exist!"
             )));
         };
+        if DEPRECATED_PRAGMAS.contains(&pragma.name)
+            && *self.warnings_as_errors.read().unwrap_or_else(|held| held.into_inner())
+        {
+            return Err(Error::invalid_input(format!(
+                "The '{}' pragma no longer has any effect; it is deprecated and will be removed in a future release.",
+                pragma.name
+            )));
+        }
         let Some((setting, value)) = pragma.writes else {
             return Ok(());
         };
@@ -1344,7 +1433,7 @@ impl Settings {
         session.set_seams(self.seams().written());
         session
             .set_variables(self.variables.read().unwrap_or_else(PoisonError::into_inner).clone());
-        for entry in SETTINGS {
+        for entry in every_setting() {
             if entry.behaviour != Behaviour::Honoured {
                 session.set(entry.name, self.carried(entry));
                 continue;

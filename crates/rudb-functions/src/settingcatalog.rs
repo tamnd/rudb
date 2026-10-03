@@ -1646,6 +1646,81 @@ pub static SETTINGS: &[SettingEntry] = &[
     },
 ];
 
+/// The settings the pin takes, keeps and reads back but leaves out of `duckdb_settings()`.
+///
+/// `SET enable_caching_operators = false` works there and `current_setting` answers for it, and
+/// the table that lists every setting has no row for it, so these are found by name and suggested
+/// for a misspelling the way a listed one is, and are never a row. Nothing prints a description for
+/// one, which is why each has an empty one rather than a sentence made up to fill the field.
+///
+/// `profiling_mode` is deprecated on the pin and still checks its word, reads back `standard`
+/// whatever was written and turns profiling on, which `rudb` does in its settings module.
+/// `old_implicit_casting` lets a value be cast to text to fit an overload, which changes which
+/// overload a call picks, so it is held at off.
+pub static UNLISTED: &[SettingEntry] = &[
+    SettingEntry {
+        name: "enable_caching_operators",
+        description: "",
+        input_type: "BOOLEAN",
+        scope: LOCAL,
+        aliases: &[],
+        behaviour: Behaviour::Knob("true"),
+    },
+    SettingEntry {
+        name: "extension_directory",
+        description: "",
+        input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+        behaviour: Behaviour::Knob(""),
+    },
+    SettingEntry {
+        name: "force_bitpacking_mode",
+        description: "",
+        input_type: "VARCHAR",
+        scope: GLOBAL,
+        aliases: &[],
+        behaviour: Behaviour::Knob("AUTO"),
+    },
+    SettingEntry {
+        name: "force_mbedtls_unsafe",
+        description: "",
+        input_type: "BOOLEAN",
+        scope: GLOBAL,
+        aliases: &[],
+        behaviour: Behaviour::Knob("false"),
+    },
+    SettingEntry {
+        name: "force_update_to_del_and_insert",
+        description: "",
+        input_type: "BOOLEAN",
+        scope: LOCAL,
+        aliases: &[],
+        behaviour: Behaviour::Knob("false"),
+    },
+    SettingEntry {
+        name: "old_implicit_casting",
+        description: "",
+        input_type: "BOOLEAN",
+        scope: LOCAL,
+        aliases: &[],
+        behaviour: Behaviour::DefaultOnly("false"),
+    },
+    SettingEntry {
+        name: "profiling_mode",
+        description: "",
+        input_type: "VARCHAR",
+        scope: LOCAL,
+        aliases: &[],
+        behaviour: Behaviour::Knob(UNSET),
+    },
+];
+
+/// Every setting a name can reach, the listed ones first and then the ones the pin leaves out.
+pub fn every_setting() -> impl Iterator<Item = &'static SettingEntry> {
+    SETTINGS.iter().chain(UNLISTED)
+}
+
 /// The columns `duckdb_settings()` returns, in the pin's order.
 #[must_use]
 pub fn setting_fields() -> Vec<Field> {
@@ -1667,7 +1742,7 @@ pub fn setting_fields() -> Vec<Field> {
 /// turns it, so a setting name is matched the way an identifier is and not the way a string is.
 #[must_use]
 pub fn setting_named(name: &str) -> Option<&'static SettingEntry> {
-    SETTINGS.iter().find(|entry| entry.name.eq_ignore_ascii_case(name))
+    every_setting().find(|entry| entry.name.eq_ignore_ascii_case(name))
 }
 
 /// What the engine says when it is handed a name that is not a setting.
@@ -1683,7 +1758,7 @@ pub fn setting_named(name: &str) -> Option<&'static SettingEntry> {
 #[must_use]
 pub fn unknown_setting(name: &str) -> String {
     let mut scored: Vec<(usize, &'static str)> =
-        SETTINGS.iter().map(|entry| (distance(name, entry.name), entry.name)).collect();
+        every_setting().map(|entry| (distance(name, entry.name), entry.name)).collect();
     // Ties go to the name that sorts first, so the list is the same one twice for the same input.
     scored.sort_unstable();
     let near: Vec<String> = scored
@@ -1763,7 +1838,8 @@ fn distance(written: &str, candidate: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        Behaviour, GLOBAL, LOCAL, SETTINGS, setting_fields, setting_named, unknown_setting,
+        Behaviour, GLOBAL, LOCAL, SETTINGS, UNLISTED, setting_fields, setting_named,
+        unknown_setting,
     };
 
     #[test]
@@ -1775,6 +1851,21 @@ mod tests {
     #[test]
     fn the_names_are_sorted_because_the_pin_returns_them_that_way() {
         let names: Vec<&str> = SETTINGS.iter().map(|entry| entry.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn an_unlisted_setting_is_found_by_name_and_is_no_row() {
+        for entry in UNLISTED {
+            assert!(!SETTINGS.iter().any(|listed| listed.name.eq_ignore_ascii_case(entry.name)));
+            assert_eq!(
+                setting_named(&entry.name.to_uppercase()).map(|it| it.name),
+                Some(entry.name)
+            );
+        }
+        let names: Vec<&str> = UNLISTED.iter().map(|entry| entry.name).collect();
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted);
