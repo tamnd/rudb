@@ -70,27 +70,93 @@ impl<'a> KeyColumn<'a> {
     }
 }
 
-impl Keys for KeyColumn<'_> {
-    fn scan(&self, each: &mut dyn FnMut(Option<i128>) -> Result<()>) -> Result<()> {
-        for part in 0..self.reader.parts() {
-            let chunk = self.reader.read(part, &self.columns)?;
-            let first = chunk.column(0)?;
-            let second = if self.columns.len() == 2 { Some(chunk.column(1)?) } else { None };
-            for row in 0..chunk.len() {
-                let key = key_at(&chunk, first, 0, row)?;
-                let key = match second {
-                    None => key,
-                    Some(second) => match (key, key_at(&chunk, second, 1, row)?) {
-                        (Some(high), Some(low)) => Some(fold(high, low)?),
-                        // A composite with a null in it matches nothing, the way SQL compares it.
-                        _ => None,
-                    },
-                };
-                each(key)?;
-            }
+impl KeyColumn<'_> {
+    /// The keys of one part, in row order, which is the scan below cut at a part.
+    fn scan_part(
+        &self,
+        part: usize,
+        each: &mut dyn FnMut(Option<i128>) -> Result<()>,
+    ) -> Result<()> {
+        let chunk = self.reader.read(part, &self.columns)?;
+        let first = chunk.column(0)?;
+        let second = if self.columns.len() == 2 { Some(chunk.column(1)?) } else { None };
+        for row in 0..chunk.len() {
+            let key = key_at(&chunk, first, 0, row)?;
+            let key = match second {
+                None => key,
+                Some(second) => match (key, key_at(&chunk, second, 1, row)?) {
+                    (Some(high), Some(low)) => Some(fold(high, low)?),
+                    // A composite with a null in it matches nothing, the way SQL compares it.
+                    _ => None,
+                },
+            };
+            each(key)?;
         }
         Ok(())
     }
+}
+
+impl Keys for KeyColumn<'_> {
+    fn scan(&self, each: &mut dyn FnMut(Option<i128>) -> Result<()>) -> Result<()> {
+        for part in 0..self.reader.parts() {
+            self.scan_part(part, each)?;
+        }
+        Ok(())
+    }
+}
+
+/// Fills `out` one part of a table at a time on every worker the machine has, each part writing
+/// only its own rows, `per_row` elements a row.
+///
+/// For a build whose answer is one value per row in row order, which is a scan of the parts in
+/// order cut where the parts are cut. The slice is allocated once by the caller, so spreading the
+/// work holds no more memory than the scan in order did. A checkpoint of JOB on server2 spent most
+/// of a minute in such scans on one thread while the other five waited.
+///
+/// # Errors
+///
+/// If the parts do not add up to the slice, or `fill` fails on any part.
+pub(crate) fn by_part<T: Send>(
+    reader: &Reader,
+    out: &mut [T],
+    per_row: usize,
+    fill: &(dyn Fn(usize, &mut [T]) -> Result<()> + Sync),
+) -> Result<()> {
+    let parts = reader.parts();
+    let total = (0..parts).map(|part| reader.part_rows(part) * per_row).sum::<usize>();
+    if total != out.len() {
+        return Err(invalid("a table's parts do not add up to its rows"));
+    }
+    let mut runs = Vec::with_capacity(parts);
+    let mut rest = out;
+    for part in 0..parts {
+        let (run, after) = rest.split_at_mut(reader.part_rows(part) * per_row);
+        runs.push((part, run));
+        rest = after;
+    }
+    let workers = crate::close_workers().min(parts);
+    if workers <= 1 {
+        return runs.into_iter().try_for_each(|(part, run)| fill(part, run));
+    }
+    let queue = Mutex::new(runs.into_iter());
+    std::thread::scope(|scope| {
+        (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    loop {
+                        let next =
+                            queue.lock().map_err(|_| invalid("a part queue was poisoned"))?.next();
+                        let Some((part, run)) = next else { return Ok(()) };
+                        fill(part, run)?;
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .try_for_each(|handle| {
+                handle.join().map_err(|_| rudb_common::Error::internal("a part worker panicked"))?
+            })
+    })
 }
 
 /// Where a key over two columns sits among the column numbers.
@@ -895,26 +961,23 @@ fn one_link(
         return Err(format!("the key of {} is not unique", edge.parent));
     }
     let keys = KeyColumn::new(child, edge.child_column).map_err(|error| error.to_string())?;
-    let mut parents_of = Vec::with_capacity(child.table().rows());
-    let mut failed = None;
-    keys.scan(&mut |key| {
-        let parent = match key {
-            None => NO_PARENT,
-            Some(key) => match map.lookup(key) {
-                Ok(found) => found.unwrap_or(NO_PARENT),
-                Err(error) => {
-                    failed = Some(error.to_string());
-                    NO_PARENT
-                }
-            },
-        };
-        parents_of.push(parent);
-        Ok(())
+    let mut parents_of = vec![NO_PARENT; child.table().rows()];
+    by_part(child, &mut parents_of, 1, &|part, run| {
+        let mut rows = run.iter_mut();
+        keys.scan_part(part, &mut |key| {
+            let row =
+                rows.next().ok_or_else(|| invalid("a part holds more rows than its place says"))?;
+            if let Some(key) = key {
+                *row = map.lookup(key)?.unwrap_or(NO_PARENT);
+            }
+            Ok(())
+        })?;
+        match rows.next() {
+            None => Ok(()),
+            Some(_) => Err(invalid("a part holds fewer rows than its place says")),
+        }
     })
     .map_err(|error| error.to_string())?;
-    if let Some(failed) = failed {
-        return Err(failed);
-    }
     let link = link::Link::build(&parents_of, map.len()).map_err(|error| error.to_string())?;
     // The parent key is unique, because the check above refused the relationship otherwise. So the
     // certificate is recorded here rather than discovered: a link only exists over a key map whose

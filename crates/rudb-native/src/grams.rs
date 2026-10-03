@@ -12,11 +12,12 @@
 //! Deleting the section changes no answer, only how many strings a `LIKE` walks.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rudb_common::{LogicalType, Result};
 use rudb_encoding::sequence::grams;
 
-use crate::graph::BUDGET_FLOOR;
+use crate::graph::{BUDGET_FLOOR, by_part};
 use crate::section::{self, Attachment};
 use crate::{Catalog, Reader, invalid};
 
@@ -109,20 +110,24 @@ pub fn build_text_grams_within(path: &Path, table: &str, share: u64) -> Result<V
     let mut report = Vec::with_capacity(columns.len());
     let mut payloads = Vec::with_capacity(columns.len());
     for &column in &columns {
-        let mut words = Vec::with_capacity(rows * 8);
-        let mut text_bytes = 0_u64;
-        for part in 0..reader.parts() {
+        let mut words = vec![0_u8; rows * 8];
+        let text_bytes = AtomicU64::new(0);
+        by_part(&reader, &mut words, 8, &|part, run| {
             let chunk = reader.read(part, &[column])?;
             let values = chunk.column(0)?;
-            for row in 0..chunk.len() {
-                let text = values.bytes_at(row).unwrap_or_default();
-                text_bytes += text.len() as u64;
-                words.extend_from_slice(&grams(text).to_le_bytes());
+            if chunk.len() * 8 != run.len() {
+                return Err(invalid("a text sketch's row count differs from its table"));
             }
-        }
-        if words.len() != rows * 8 {
-            return Err(invalid("a text sketch's row count differs from its table"));
-        }
+            let mut bytes = 0_u64;
+            for (row, word) in run.chunks_exact_mut(8).enumerate() {
+                let text = values.bytes_at(row).unwrap_or_default();
+                bytes += text.len() as u64;
+                word.copy_from_slice(&grams(text).to_le_bytes());
+            }
+            text_bytes.fetch_add(bytes, Ordering::Relaxed);
+            Ok(())
+        })?;
+        let text_bytes = text_bytes.into_inner();
         report.push(Built { column, rows, text_bytes, bytes: words.len(), built: false });
         payloads.push(words);
     }
