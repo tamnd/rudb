@@ -4784,20 +4784,21 @@ fn unpack(
 ///
 /// Zero for bits past the end of the words, which keeps a read of a row that is not there from
 /// panicking and matches what every other accessor here does with one.
+///
+/// Both words are read every time and put together as one `u128`, so there is no branch on
+/// whether the code straddles them. Rows read out of order straddle at random, and a branch that
+/// goes wrong a third of the time throws away the loads behind it. In the gather of the rows a
+/// filter kept, that left one cache miss in flight at a time, and in q14 90 percent of the
+/// gather's samples sat on the load of the word.
 #[inline]
 fn code_at(words: &[u64], bit: usize, width: u32) -> u64 {
     let word = bit / u64::BITS as usize;
-    let shift = (bit % u64::BITS as usize) as u32;
+    let shift = bit % u64::BITS as usize;
     let mask = u64::MAX >> (u64::BITS - width);
-    let low = words.get(word).copied().unwrap_or(0) >> shift;
-    let taken = u64::BITS - shift;
-    if taken >= width {
-        return low & mask;
-    }
-    // The code straddles two words, and `taken` is under the width here so it is under sixty four,
-    // which is what makes the shift below one the hardware will do rather than one it refuses.
-    let high = words.get(word + 1).copied().unwrap_or(0) << taken;
-    (low | high) & mask
+    let low = words.get(word).copied().unwrap_or(0);
+    let high = words.get(word + 1).copied().unwrap_or(0);
+    let both = u128::from(high) << u64::BITS | u128::from(low);
+    (both >> shift) as u64 & mask
 }
 
 /// Writes `width` bits of `code` starting at `bit`, over words that started out zero.
@@ -5800,6 +5801,27 @@ mod tests {
         assert_eq!(super::extent(&[7]), Some((7, 7)));
         let rows = [0x8000_0000, 3, u32::MAX, 0x7fff_ffff, 9];
         assert_eq!(super::extent(&rows), Some((3, u32::MAX)));
+    }
+
+    /// A code read at any bit, of any width, is the bits there one at a time, whether it sits in
+    /// one word or straddles two, and the bits past the last word read as zero.
+    #[test]
+    fn a_code_is_the_bits_it_starts_at_at_every_width_and_place() {
+        let mut state = 0x0dd_c0de_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let words: Vec<u64> = (0..5).map(|_| next()).collect();
+        let bit_at = |bit: usize| words.get(bit / 64).map_or(0, |word| word >> (bit % 64) & 1);
+        for width in 1..=64_u32 {
+            for start in 0..words.len() * 64 + 70 {
+                let want = (0..width as usize).fold(0, |code, at| code | bit_at(start + at) << at);
+                assert_eq!(super::code_at(&words, start, width), want, "width {width} at {start}");
+            }
+        }
     }
 
     #[test]
