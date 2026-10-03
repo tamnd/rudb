@@ -162,6 +162,11 @@ impl File for RealFile {
         self.file.sync_data().map_err(|e| Error::io(format!("sync failed: {e}")))
     }
 
+    #[cfg(target_os = "macos")]
+    fn sync_barrier(&self) -> Result<()> {
+        barrier::sync(&self.file)
+    }
+
     fn start_writeback(&self, offset: u64, length: u64) {
         crate::writeback::start_writeback(&self.file, offset, length);
     }
@@ -252,6 +257,36 @@ mod vectored {
                     n = 0;
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+/// `F_BARRIERFSYNC`, which std has no call for.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "fcntl has no wrapper in std")]
+mod barrier {
+    use std::ffi::c_int;
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+
+    use rudb_common::{Error, Result};
+
+    const F_BARRIERFSYNC: c_int = 85;
+
+    unsafe extern "C" {
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    }
+
+    pub(super) fn sync(file: &File) -> Result<()> {
+        // SAFETY: the descriptor is open for as long as `file` is borrowed, and the call reads
+        // and writes no memory of ours.
+        let rc = unsafe { fcntl(file.as_raw_fd(), F_BARRIERFSYNC) };
+        if rc == -1 {
+            return Err(Error::io(format!(
+                "barrier sync failed: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         Ok(())
     }

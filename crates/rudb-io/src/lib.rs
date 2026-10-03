@@ -209,6 +209,21 @@ pub trait File: Debug + Send + Sync {
         self.sync()
     }
 
+    /// Puts every write issued before this call ahead of every write issued after it on the
+    /// device, without waiting for the drive to empty its cache, where the platform can.
+    ///
+    /// That is `F_BARRIERFSYNC` on macOS, which a log uses for `commit_sync = barrier`: a power
+    /// loss can take the last commits away but never a commit and keep one after it. Elsewhere
+    /// there is no such call and this is [`Self::sync_data`], which promises more. The same rule
+    /// about the file's length applies as for [`Self::sync_data`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::sync`], and a failed call is just as final.
+    fn sync_barrier(&self) -> Result<()> {
+        self.sync_data()
+    }
+
     /// Asks for `length` bytes from `offset` to start on their way to the device, without waiting
     /// for them and without making them durable.
     ///
