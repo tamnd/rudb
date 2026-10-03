@@ -21,6 +21,12 @@
 //! values cannot overflow that total, and a sum of 128 bit ones, which is what q11's
 //! `DECIMAL(34,2)` product is, checks each add the way the general sum does.
 //!
+//! What a call counts is the rows of a group less its nulls, and not its values that are not null.
+//! The two are the same number, but the first is a pass over the places only when a chunk has a
+//! null in it, and on q13 none does. Counting the values that were not null was a second add at
+//! every row's place, into an array of a million bytes and more that the first add had already
+//! missed the cache on, and those two passes were a third of the query.
+//!
 //! The range is the one the values are inside of, so nothing should ever land outside it. A value
 //! that does anyway is counted in a small map beside the arrays, which keeps a wrong bound from
 //! ever turning into a wrong answer, the same promise the direct index in the general table makes.
@@ -55,7 +61,7 @@ impl Counted {
 /// Where one call's state lives in the tallies.
 #[derive(Debug, Clone, Copy)]
 struct Lane {
-    valid: Option<usize>,
+    nulls: Option<usize>,
     sum: Option<usize>,
 }
 
@@ -84,13 +90,16 @@ pub(crate) struct Local {
 /// The counts, one array for the rows, one per call that counts values and one per sum, each
 /// `width + 2` long.
 ///
+/// A call that counts values keeps the nulls it saw rather than the values, and its array is empty
+/// until the first null comes, so a column with none costs no array and no pass at all.
+///
 /// The place past the range is the null key's and the one past that takes the rows whose value
 /// the range does not cover, which are counted again in `outside`. Giving those rows a place the
 /// answer never reads keeps the loops over the places free of a branch.
 #[derive(Debug)]
 struct Tallies {
     rows: Vec<i64>,
-    valid: Vec<Vec<i64>>,
+    nulls: Vec<Vec<i64>>,
     sums: Vec<Vec<i128>>,
     outside: HashMap<i64, Vec<(i64, i128)>>,
 }
@@ -101,22 +110,30 @@ impl Tallies {
         let sums = calls.iter().filter(|call| matches!(call, Counted::Sum(_))).count();
         Self {
             rows: vec![0; width + 2],
-            valid: (0..valid).map(|_| vec![0; width + 2]).collect(),
+            nulls: vec![Vec::new(); valid],
             sums: (0..sums).map(|_| vec![0; width + 2]).collect(),
             outside: HashMap::new(),
         }
     }
 
     fn footprint(&self) -> usize {
-        self.rows.len()
-            * ((1 + self.valid.len()) * size_of::<i64>() + self.sums.len() * size_of::<i128>())
+        self.rows.len() * (size_of::<i64>() + self.sums.len() * size_of::<i128>())
+    }
+
+    /// The rows of `place` whose argument in the call counting into `lane` was not null.
+    fn valid(&self, lane: usize, place: usize) -> i64 {
+        self.rows[place] - self.nulls[lane].get(place).copied().unwrap_or(0)
     }
 
     fn add(&mut self, other: Self) -> Result<()> {
         for (into, from) in self.rows.iter_mut().zip(&other.rows) {
             *into += from;
         }
-        for (into, from) in self.valid.iter_mut().zip(&other.valid) {
+        for (into, from) in self.nulls.iter_mut().zip(other.nulls) {
+            if into.is_empty() {
+                *into = from;
+                continue;
+            }
             for (into, from) in into.iter_mut().zip(from) {
                 *into += from;
             }
@@ -155,15 +172,15 @@ impl Local {
 
 impl Exchange {
     pub(crate) fn new(key: LogicalType, low: i64, width: usize, calls: Vec<Counted>) -> Self {
-        let (mut valid, mut sum) = (0, 0);
+        let (mut nulls, mut sum) = (0, 0);
         let lanes = calls
             .iter()
             .map(|call| {
                 let lane = Lane {
-                    valid: call.counts_valid().then_some(valid),
+                    nulls: call.counts_valid().then_some(nulls),
                     sum: matches!(call, Counted::Sum(_)).then_some(sum),
                 };
-                valid += usize::from(lane.valid.is_some());
+                nulls += usize::from(lane.nulls.is_some());
                 sum += usize::from(lane.sum.is_some());
                 lane
             })
@@ -197,7 +214,7 @@ impl Exchange {
             local.memory.grow(u64::try_from(tallies.footprint()).unwrap_or(u64::MAX))?;
             local.tallies = Some(tallies);
         }
-        let Local { tallies, block, argument: read, places, .. } = local;
+        let Local { tallies, block, argument: read, places, memory } = local;
         let tallies = tallies.as_mut().expect("made above");
         block.read(rows, key)?;
         let values = block.cut(rows)?;
@@ -219,7 +236,7 @@ impl Exchange {
             tallies.rows[place as usize] += 1;
         }
         for (lane, argument) in self.lanes.iter().zip(arguments) {
-            let Some(valid) = lane.valid else { continue };
+            let Some(nulls) = lane.nulls else { continue };
             let argument =
                 argument.ok_or_else(|| Error::internal("a ranged call with no argument"))?;
             if let Some(sum) = lane.sum {
@@ -233,16 +250,17 @@ impl Exchange {
                     }
                 }
             }
-            let into = &mut tallies.valid[valid];
             if argument.none_null() {
-                for &place in places.iter() {
-                    into[place as usize] += 1;
-                }
-            } else {
-                let validity = argument.validity();
-                for (row, &place) in places.iter().enumerate() {
-                    into[place as usize] += i64::from(validity.is_valid(row));
-                }
+                continue;
+            }
+            let into = &mut tallies.nulls[nulls];
+            if into.is_empty() {
+                memory.grow(u64::try_from((width + 2) * size_of::<i64>()).unwrap_or(u64::MAX))?;
+                *into = vec![0; width + 2];
+            }
+            let validity = argument.validity();
+            for (row, &place) in places.iter().enumerate() {
+                into[place as usize] += i64::from(!validity.is_valid(row));
             }
         }
         // The rows the range did not cover, which should be none, counted again by their value.
@@ -310,7 +328,7 @@ impl Exchange {
             let key = (place < self.width).then(|| self.low + place as i64);
             out.keys.push(key);
             for (call, lane) in self.lanes.iter().enumerate() {
-                let count = lane.valid.map_or(rows, |valid| tallies.valid[valid][place]);
+                let count = lane.nulls.map_or(rows, |nulls| tallies.valid(nulls, place));
                 let sum = lane.sum.map_or(0, |sum| tallies.sums[sum][place]);
                 out.counts[call].push((count, sum));
             }
@@ -503,6 +521,41 @@ mod tests {
                 vec![Value::Null, big(2), big(2)],
                 vec![int(99), big(2), big(0)],
             ]
+        );
+    }
+
+    /// A count of values is the rows less the nulls, whichever instance saw the nulls, and an
+    /// instance that saw none adds its rows to one that did.
+    #[test]
+    fn a_count_of_values_is_the_rows_less_the_nulls_across_instances() {
+        let memory = Memory::unlimited();
+        let exchange =
+            Exchange::new(LogicalType::Integer, 0, 3, vec![Counted::Valid, Counted::Rows]);
+        let key = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(0), Value::Integer(2), Value::Integer(0)],
+        )
+        .expect("keys");
+        let full = Vector::from_values(
+            LogicalType::BigInt,
+            &[Value::BigInt(1), Value::BigInt(2), Value::BigInt(3)],
+        )
+        .expect("arguments");
+        let holed = Vector::from_values(
+            LogicalType::BigInt,
+            &[Value::Null, Value::BigInt(2), Value::Null],
+        )
+        .expect("arguments");
+        for argument in [&full, &holed, &full] {
+            let mut local = Local::new(&memory);
+            exchange.count(&key, &[Some(argument), None], 3, &mut local).expect("counts");
+            exchange.combine(local).expect("combines");
+        }
+        let int = Value::Integer;
+        let big = Value::BigInt;
+        assert_eq!(
+            answer(&exchange, &memory),
+            vec![vec![int(0), big(4), big(6)], vec![int(2), big(3), big(3)]]
         );
     }
 
