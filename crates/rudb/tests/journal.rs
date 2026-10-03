@@ -584,3 +584,43 @@ fn replayed_chunks_that_do_not_fit_a_part_together_still_checkpoint() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(wal(&path));
 }
+
+#[test]
+fn a_checkpoint_notes_the_tables_it_wrote_in_the_log_and_replay_skips_the_note() {
+    use rudb_io::RealFilesystem;
+    use rudb_txn::log::{Checkpointed, Kind, SegmentHeader, replay, segments};
+
+    let path = path("checkpoint-record");
+    let db = open(&path);
+    db.execute("CREATE TABLE t (id INTEGER)").expect("creates");
+    db.execute("INSERT INTO t VALUES (1)").expect("inserts");
+    db.execute("INSERT INTO t VALUES (2)").expect("inserts");
+    db.execute("CHECKPOINT").expect("checkpoints");
+
+    let fs = RealFilesystem::new();
+    let dir = wal(&path);
+    let first = segments(&fs, &dir, 0).expect("lists").into_iter().next().expect("a segment");
+    let header = SegmentHeader::decode(&std::fs::read(&first.1).expect("reads")).expect("a header");
+    let read = replay(&fs, &dir, 0, header.database).expect("replays");
+    let notes = read
+        .blocks
+        .iter()
+        .flat_map(|block| &block.records)
+        .filter(|record| record.header.kind == Kind::Checkpoint)
+        .map(|record| (record.header.gsn, Checkpointed::decode(&record.payload).expect("decodes")))
+        .collect::<Vec<_>>();
+    let [(gsn, entries)] = notes.as_slice() else { panic!("one Checkpoint record: {notes:?}") };
+    assert_eq!(entries.len(), 1, "the one table");
+    assert_eq!(entries[0].c_s, *gsn, "the cut the anchor took");
+
+    db.execute("INSERT INTO t VALUES (3)").expect("inserts");
+    crash(db);
+    let db = open(&path);
+    assert_eq!(
+        rows(&db, "SELECT id FROM t ORDER BY id"),
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)], vec![Value::Integer(3)]]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(wal(&path));
+}

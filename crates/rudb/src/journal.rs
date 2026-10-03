@@ -34,8 +34,8 @@ use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_io::{Filesystem, RealFilesystem};
 use rudb_native::{LaneStart, LogAnchor};
 use rudb_txn::log::{
-    Block, CommitSync, Kind, Lane, Options, Payload, SEGMENT_BYTES, SEGMENT_HEADER, replay,
-    segments, spares,
+    Block, Checkpointed, CommitSync, Kind, Lane, Options, Payload, SEGMENT_BYTES, SEGMENT_HEADER,
+    replay, segments, spares,
 };
 use rudb_vector::{Chunk, Data, Selection, StringColumn, VECTOR_SIZE, Validity, Vector};
 
@@ -545,12 +545,17 @@ impl Journal {
 
     /// Recycles what a checkpoint that wrote [`Self::anchor`] made redundant: the staged state
     /// and every segment before the one the lane writes next, which the lane keeps a couple of to
-    /// make its next segments from and removes the rest of.
+    /// make its next segments from and removes the rest of. Then notes the round in the lane as a
+    /// Checkpoint record naming the tables it wrote, `09-the-log.md` section 9.4.
+    ///
+    /// The record goes in after the file took the anchor, so a crash can leave the anchor without
+    /// the record and never the other way round. It is a block of its own whose commit timestamp
+    /// is the anchor's cut, which replay skips like every other block at or below the cut.
     ///
     /// # Errors
     ///
-    /// If a segment cannot be renamed or removed.
-    pub(crate) fn checkpointed(&mut self) -> Result<()> {
+    /// If a segment cannot be renamed or removed, or the record cannot be written.
+    pub(crate) fn checkpointed(&mut self, tables: &[i64], generation: u64) -> Result<()> {
         // Blocks still queued under `commit_sync = none` go out first, so none of them is left to
         // be written into a segment this is about to remove.
         if let Some(lane) = &self.lane {
@@ -559,10 +564,17 @@ impl Journal {
         self.discard();
         self.anchored = true;
         self.logged = 0;
-        match &self.lane {
-            Some(lane) => lane.retire(lane.position().0),
-            None => self.remove_all(),
-        }
+        let Some(lane) = &self.lane else { return self.remove_all() };
+        lane.retire(lane.position().0)?;
+        let entries = tables
+            .iter()
+            .filter_map(|&oid| u32::try_from(oid).ok())
+            .map(|table| Checkpointed { table, stripe: 0, c_s: self.last, root: 0, generation })
+            .collect::<Vec<_>>();
+        let mut block = Block::new(0, self.last, self.last);
+        block.push(Kind::Checkpoint, 0, &Checkpointed::encode(&entries))?;
+        lane.enqueue(&block)?;
+        lane.write_out()
     }
 
     /// Removes the log, for a database whose file was just written whole on the way out.
