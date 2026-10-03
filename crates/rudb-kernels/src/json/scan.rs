@@ -75,6 +75,9 @@ pub enum Function {
     Objects,
     /// `read_ndjson_objects`.
     NdjsonObjects,
+    /// `read_single_json_file`, which is `read_json` over exactly one file, without the options
+    /// that belong to reading several.
+    Single,
 }
 
 impl Function {
@@ -204,7 +207,32 @@ pub const fn listed(function: Function) -> &'static [&'static str] {
         "union_by_name",
         "filename",
     ];
-    if function.objects() { OBJECTS } else { JSON }
+    const SINGLE: &[&str] = &[
+        "convert_strings_to_integers",
+        "maximum_sample_files",
+        "maximum_object_size",
+        "array",
+        "format",
+        "ignore_errors",
+        "map_inference_threshold",
+        "date_format",
+        "compression",
+        "maximum_depth",
+        "columns",
+        "sample_size",
+        "auto_detect",
+        "geojson",
+        "records",
+        "dateformat",
+        "timestamp_format",
+        "field_appearance_threshold",
+        "timestampformat",
+    ];
+    match function {
+        Function::Objects | Function::NdjsonObjects => OBJECTS,
+        Function::Single => SINGLE,
+        Function::Json | Function::Ndjson => JSON,
+    }
 }
 
 /// The parameters each function takes, and the type each is read as.
@@ -249,7 +277,33 @@ pub fn parameters(function: Function) -> &'static [(&'static str, LogicalType)] 
         ("maximum_object_size", LogicalType::UInteger),
         ("union_by_name", LogicalType::Boolean),
     ];
-    if function.objects() { OBJECTS } else { JSON }
+    // The options of one file, which leaves out the six that say how several files come together.
+    const SINGLE: &[(&str, LogicalType)] = &[
+        ("array", LogicalType::Boolean),
+        ("auto_detect", LogicalType::Boolean),
+        ("columns", LogicalType::Null),
+        ("compression", LogicalType::Varchar),
+        ("convert_strings_to_integers", LogicalType::Boolean),
+        ("date_format", LogicalType::Varchar),
+        ("dateformat", LogicalType::Varchar),
+        ("field_appearance_threshold", LogicalType::Double),
+        ("format", LogicalType::Varchar),
+        ("geojson", LogicalType::Boolean),
+        ("ignore_errors", LogicalType::Boolean),
+        ("map_inference_threshold", LogicalType::BigInt),
+        ("maximum_depth", LogicalType::BigInt),
+        ("maximum_object_size", LogicalType::UInteger),
+        ("maximum_sample_files", LogicalType::BigInt),
+        ("records", LogicalType::Varchar),
+        ("sample_size", LogicalType::BigInt),
+        ("timestamp_format", LogicalType::Varchar),
+        ("timestampformat", LogicalType::Varchar),
+    ];
+    match function {
+        Function::Objects | Function::NdjsonObjects => OBJECTS,
+        Function::Single => SINGLE,
+        Function::Json | Function::Ndjson => JSON,
+    }
 }
 
 /// The name the pin's candidate list gives a parameter's type, where `ANY` is written as null.
@@ -259,7 +313,11 @@ fn parameter_type_name(ty: &LogicalType) -> String {
 
 /// The pin's refusal of a named parameter a function does not take.
 fn unknown_parameter(function: Function, name: &str) -> Error {
-    let called = if function.objects() { "read_json_objects" } else { "read_json" };
+    let called = match function {
+        Function::Objects | Function::NdjsonObjects => "read_json_objects",
+        Function::Single => "read_single_json_file",
+        Function::Json | Function::Ndjson => "read_json",
+    };
     let candidates: Vec<String> = parameters(function)
         .iter()
         .map(|(name, ty)| format!("    {name} {}", parameter_type_name(ty)))
@@ -282,7 +340,7 @@ impl Options {
             function,
             format: match function {
                 Function::Ndjson | Function::NdjsonObjects => Format::Newline,
-                Function::Json | Function::Objects => Format::Auto,
+                Function::Json | Function::Objects | Function::Single => Format::Auto,
             },
             format_specified: false,
             records: if objects { Records::Records } else { Records::Auto },

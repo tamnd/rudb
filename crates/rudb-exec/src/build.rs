@@ -2348,7 +2348,8 @@ impl<'a> Building<'a, '_> {
                 | TableFunction::ReadJson
                 | TableFunction::ReadNdjson
                 | TableFunction::ReadJsonObjects
-                | TableFunction::ReadNdjsonObjects),
+                | TableFunction::ReadNdjsonObjects
+                | TableFunction::ReadSingleJsonFile),
             ) => {
                 let counters = self.watch(reference, id, pipeline, "FileScan", Some(name));
                 let tests = std::mem::take(&mut self.pruning);

@@ -2562,7 +2562,11 @@ impl<'a> Binder<'a> {
                 // matched. The executor is handed names rather than a pattern, so it never walks a
                 // directory and the answer cannot change between binding a prepared statement and
                 // running it, which is the same reason the schema is settled here.
-                let paths = self.file_paths(cast[0], resolved.function.name())?;
+                let paths = if resolved.function == TableFunction::ReadSingleJsonFile {
+                    self.single_path(cast[0], resolved.function.name())?
+                } else {
+                    self.file_paths(cast[0], resolved.function.name())?
+                };
                 let mut mirrorable = None;
                 if resolved.function == TableFunction::ReadParquet
                     && !options.file_row_number
@@ -3268,6 +3272,18 @@ impl<'a> Binder<'a> {
             paths.extend(files(&pattern)?);
         }
         Ok(paths)
+    }
+
+    /// The one file `read_single_json_file` reads, taken as it is written. Nothing is expanded, so
+    /// a glob is the name of a file that is not there, which is how the pin answers it.
+    fn single_path(&self, expr: ExprRef, name: &str) -> Result<Vec<String>> {
+        let path = self.file_patterns(expr, name)?.into_iter().next().unwrap_or_default();
+        if !std::path::Path::new(&path).is_file() {
+            return Err(Error::io(format!(
+                "Cannot open file \"{path}\": No such file or directory"
+            )));
+        }
+        Ok(vec![path])
     }
 
     /// The patterns a table function argument names, which have to be constants.

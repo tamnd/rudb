@@ -207,8 +207,14 @@ fn tables() -> Vec<FunctionEntry> {
                         _ => "ANY".to_string(),
                     });
                 }
-                for first in ["ANY[]", "VARCHAR", "VARIANT"] {
-                    types[0] = first.to_string();
+                // The one file reader has the one overload.
+                let firsts: &[&str] = if kind == scan::Function::Single {
+                    &["VARCHAR"]
+                } else {
+                    &["ANY[]", "VARCHAR", "VARIANT"]
+                };
+                for first in firsts {
+                    types[0] = (*first).to_string();
                     entries.push(table_entry(*function, parameters.clone(), types.clone()));
                 }
                 continue;
@@ -284,6 +290,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::ReadNdjson,
     TableFunction::ReadJsonObjects,
     TableFunction::ReadNdjsonObjects,
+    TableFunction::ReadSingleJsonFile,
     TableFunction::ReadText,
     TableFunction::ReadBlob,
     TableFunction::RudbStrategies,
@@ -341,6 +348,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::ReadNdjson
         | TableFunction::ReadJsonObjects
         | TableFunction::ReadNdjsonObjects
+        | TableFunction::ReadSingleJsonFile
         | TableFunction::ReadText
         | TableFunction::ReadBlob
         | TableFunction::PragmaTableInfo
@@ -389,6 +397,7 @@ const fn positional_type(function: TableFunction, at: usize) -> &'static str {
         | TableFunction::ReadNdjson
         | TableFunction::ReadJsonObjects
         | TableFunction::ReadNdjsonObjects
+        | TableFunction::ReadSingleJsonFile
         | TableFunction::ReadText
         | TableFunction::ReadBlob
         | TableFunction::JsonEach
