@@ -72,6 +72,21 @@ fn a_key_both_inserted_fails_at_the_second_commit() {
 }
 
 #[test]
+fn a_key_committed_after_the_snapshot_fails_at_the_statement() {
+    let (_database, one, two) = two();
+    two.execute("BEGIN").expect("begins");
+    assert_eq!(two.value("SELECT count(*) FROM t").expect("reads"), Value::BigInt(2));
+    one.execute("INSERT INTO t VALUES (3, 30)").expect("inserts");
+    fails(
+        &two,
+        "INSERT INTO t VALUES (3, 31)",
+        "Duplicate key \"id: 3\" violates primary key constraint.",
+    );
+    two.execute("ROLLBACK").expect("rolls back");
+    assert_eq!(rows(&two, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 10), (2, 20), (3, 30)]));
+}
+
+#[test]
 fn a_second_delete_of_one_row_fails_at_once() {
     let (_database, one, two) = two();
     one.execute("BEGIN").expect("begins");

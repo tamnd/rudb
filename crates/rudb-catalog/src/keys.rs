@@ -272,6 +272,41 @@ impl Seen {
         Self::of(chunks, key, columns, false)
     }
 
+    /// Refuses the first row of `chunks` whose key is held here and was not held in the set
+    /// `before` gives, one this set grew from, in the pin's words for a key already there. That
+    /// set is built only once a key is found here, which is the rare case.
+    pub(crate) fn refuse_added(
+        &self,
+        before: impl FnOnce() -> Result<Self>,
+        chunks: &[Chunk],
+        key: &Key,
+        columns: &[Field],
+    ) -> Result<()> {
+        let mut before = Some(before);
+        let mut then: Option<Self> = None;
+        let mut scratch = Vec::new();
+        for chunk in chunks {
+            for row in 0..chunk.len() {
+                let encoded = encode(chunk, key, row, &mut scratch)?;
+                if !self.0.contains(encoded, &scratch) {
+                    continue;
+                }
+                if then.is_none() {
+                    then = Some(before.take().expect("built once")()?);
+                }
+                if then.as_ref().is_some_and(|then| then.0.contains(encoded, &scratch)) {
+                    continue;
+                }
+                return Err(Error::constraint(format!(
+                    "Duplicate key \"{}\" violates {} constraint.",
+                    named(chunk, key, columns, row)?,
+                    key.kind()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Adds the keys [`Self::check`] passed. The set is copied only when a transaction's copy of
     /// the catalog still shares it.
     pub(crate) fn extend(&mut self, added: Self) {
