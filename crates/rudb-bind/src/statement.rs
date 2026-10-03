@@ -2556,6 +2556,7 @@ fn change(
             scope.len()
         )));
     }
+    picked_first(&mut binder, root, width, scope.len());
     let column = |binder: &mut Binder<'_>, at: usize| {
         let column = &scope.columns[at];
         binder.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone())
@@ -2623,4 +2624,42 @@ fn change(
     let write = if delete { Write::Delete } else { Write::Update };
     let checks = if delete { None } else { bind_checks(catalog, parameters, session, &name)? };
     Ok(Bound::Insert(Insert { name, source, write, returning, conflict: None, checks, patched }))
+}
+
+/// Has each value of an `UPDATE` source worked out only for the rows its condition picks, as
+/// `CASE WHEN condition THEN value END`.
+///
+/// The source is `SELECT *, condition, values... FROM table` over every row, since the rows the
+/// condition leaves out are written back as they were, and a value worked out for every row fails
+/// on rows the statement never meant to change. `SET i = s::INTEGER WHERE s SIMILAR TO '[0-9]+'`
+/// would fail on the first `s` that is not a number, and `SET n = n + 1 WHERE false` on an `n`
+/// at the top of its type. The pin works the values out for the rows the `WHERE` keeps and for
+/// nothing else. A column, a constant or a parameter cannot fail and is left as it is, and so is
+/// every value when the condition is not a plain boolean or calls something volatile, which asked
+/// a second time could pick a row the flag did not. `count` is how many columns the source has,
+/// and a root that is not the projection of them is left alone.
+fn picked_first(binder: &mut Binder<'_>, root: rudb_plan::NodeRef, width: usize, count: usize) {
+    let Node::Project { exprs, .. } = *binder.plan().node(root) else { return };
+    let mut values = binder.plan().expr_list(exprs).to_vec();
+    let Some(&hit) = values.get(width).filter(|_| values.len() == count) else { return };
+    let plan = binder.plan();
+    if *plan.expr_type(hit) != LogicalType::Boolean || crate::expr::volatile(plan, hit) {
+        return;
+    }
+    let mut changed = false;
+    for value in values.iter_mut().skip(width + 1) {
+        if matches!(binder.plan().expr(*value), Expr::Column(_) | Expr::Constant(_)) {
+            continue;
+        }
+        let ty = binder.plan().expr_type(*value).clone();
+        let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then: *value }]);
+        *value = binder.plan_mut().add_expr(Expr::Case { arms, otherwise: None }, ty);
+        changed = true;
+    }
+    if changed {
+        let list = binder.plan_mut().add_expr_list(&values);
+        if let Node::Project { exprs, .. } = binder.plan_mut().node_mut(root) {
+            *exprs = list;
+        }
+    }
 }

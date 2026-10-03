@@ -2135,6 +2135,38 @@ fn a_reduction_is_refused_the_way_the_pin_refuses_it() {
     );
 }
 
+/// An `UPDATE` works its values out for the rows its `WHERE` keeps and no others, so a value that
+/// would fail on a row the statement does not change does not fail it, as in the pin.
+#[test]
+fn an_update_works_its_values_out_only_for_the_rows_it_changes() {
+    let db = Database::new();
+    db.execute("CREATE TABLE t (id BIGINT, n BIGINT, s VARCHAR, b INTEGER)").expect("creates");
+    db.execute(
+        "INSERT INTO t SELECT i, i * 3, CASE WHEN i % 2 = 0 THEN i::VARCHAR ELSE 'x' || i END, \
+         i % 3 FROM range(5000) r(i)",
+    )
+    .expect("loads");
+    let changed = |sql: &str| db.execute(sql).expect(sql).value_at(0, 0);
+    assert_eq!(changed("UPDATE t SET n = n + 9223372036854775807 WHERE n < 0"), Value::BigInt(0));
+    assert_eq!(
+        db.execute("UPDATE t SET n = n + 9223372036854775807 WHERE id = 13")
+            .expect_err("overflows")
+            .message(),
+        "Overflow in addition of INT64 (39 + 9223372036854775807)!"
+    );
+    assert_eq!(changed("UPDATE t SET n = s::BIGINT WHERE id % 2 = 0"), Value::BigInt(2500));
+    assert_eq!(changed("UPDATE t SET b = 6 // b WHERE b <> 0"), Value::BigInt(3333));
+    let sums = db.execute("SELECT sum(n), sum(b) FROM t").expect("sums");
+    assert_eq!(sums.value_at(0, 0), Value::HugeInt(24_997_500));
+    assert_eq!(sums.value_at(0, 1), Value::HugeInt(1667 * 6 + 1666 * 3));
+    // A volatile condition is asked once, so every row it picks gets its value.
+    db.execute("UPDATE t SET n = n + 1 WHERE random() < 0.5").expect("updates");
+    assert_eq!(
+        db.execute("SELECT count(*) FROM t WHERE n IS NULL").expect("counts").value_at(0, 0),
+        Value::BigInt(0)
+    );
+}
+
 /// `invoke` runs a lambda once per row over the arguments after it. Per #467.
 #[test]
 fn an_invoked_lambda_runs_over_its_arguments() {

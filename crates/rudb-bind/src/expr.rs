@@ -3396,7 +3396,7 @@ const STRICT_MATH: &[&str] = &[
 ];
 
 /// Whether a bound expression calls anything in [`fold::VOLATILE`], anywhere in it.
-fn volatile(plan: &Plan, expr: ExprRef) -> bool {
+pub(crate) fn volatile(plan: &Plan, expr: ExprRef) -> bool {
     let within = |slice| plan.expr_list(slice).iter().any(|&child| volatile(plan, child));
     match *plan.expr(expr) {
         Expr::Function { name, args } => {
