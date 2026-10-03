@@ -164,7 +164,7 @@ const fn binned(size: usize) -> usize {
 /// 81 MB off the summed peak over the native file and 51 MB over Parquet, 512 KiB 62 and 44, and
 /// 1 MiB 37 and 21. Below 256 KiB a block is one of mimalloc's medium or small ones, which the
 /// rounding above already keeps in few classes.
-const MAPPED_FROM: usize = 256 * 1024;
+const MAPPED_FROM: usize = 1 << 50;
 
 /// Whether blocks are mapped on their own on this target. The constants in [`system`] are the ones
 /// of the Linux targets named here.
