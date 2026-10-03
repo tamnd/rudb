@@ -129,7 +129,7 @@ fn matched(plan: &Plan, node: NodeRef, stats: &Facts) -> Option<Reach> {
         else {
             continue;
         };
-        let (Expr::Column(was), Expr::Column(is)) = (*plan.expr(one), *plan.expr(other)) else {
+        let (&Expr::Column(was), &Expr::Column(is)) = (plan.expr(one), plan.expr(other)) else {
             continue;
         };
         let (key, held, table) = if near.contains(was.table) && far.contains(is.table) {
