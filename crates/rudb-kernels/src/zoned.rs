@@ -118,7 +118,7 @@ fn zoned(vector: &Vector) -> bool {
 }
 
 /// The wall clock an instant shows in `zone`, with the two infinities kept infinite.
-fn wall_of(micros: i64, zone: SessionTimeZone) -> Result<i64> {
+pub(crate) fn wall_of(micros: i64, zone: SessionTimeZone) -> Result<i64> {
     if infinite_stamp(micros) {
         return Ok(micros);
     }
