@@ -44,6 +44,24 @@ fn text_is_read_in_the_zone_it_names_or_else_the_session_zone() {
 }
 
 #[test]
+fn an_offset_may_be_written_as_four_digits_with_no_colon() {
+    assert_eq!(
+        under(
+            "UTC",
+            "SELECT '2023-02-07T14:12:28+0530'::TIMESTAMPTZ, '2023-02-07T14:12:28-0800'::TIMESTAMPTZ, '2023-02-07T14:12:28+0530'::TIMESTAMP"
+        ),
+        "2023-02-07 08:42:28+00|2023-02-07 22:12:28+00|2023-02-07 14:12:28"
+    );
+    for written in ["+05300", "+0530:15"] {
+        assert!(
+            refused("UTC", &format!("SELECT '2023-02-07T14:12:28{written}'::TIMESTAMPTZ"))
+                .contains("invalid timestamp field format"),
+            "{written}"
+        );
+    }
+}
+
+#[test]
 fn a_wall_clock_becomes_an_instant_in_the_session_zone_and_back() {
     assert_eq!(
         under(

@@ -2240,8 +2240,12 @@ fn written_zone(text: &str) -> Suffix<'_> {
     let Some(digits) = zone.strip_prefix('+').or_else(|| zone.strip_prefix('-')) else {
         return if zone == "Z" { Suffix::Offset(0) } else { Suffix::Nothing };
     };
-    let seconds = digits
-        .split(':')
+    let fields = match digits.len() {
+        4 if !digits.contains(':') => vec![&digits[..2], &digits[2..]],
+        _ => digits.split(':').collect(),
+    };
+    let seconds = fields
+        .into_iter()
         .zip([3_600, 60, 1])
         .map(|(field, scale)| field.parse::<i64>().unwrap_or_default() * scale)
         .sum::<i64>();
@@ -2526,6 +2530,11 @@ fn parse_zone(text: &str) -> Parsed<()> {
 fn offset_width(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut at = 1 + two_digits(bytes.get(1..)?)?;
+    // `+0530` is the hours and the minutes with no colon, and nothing may follow it, so `+05300`
+    // and `+0530:15` are format failures. Measured on the pin.
+    if let Some(minutes) = bytes.get(at..).and_then(two_digits) {
+        return Some(at + minutes);
+    }
     // The minutes and then the seconds, and no more than that, so the fourth field of
     // `'+05:30:15:20'` is left over and the whole thing is a format failure.
     for _ in 0..2 {
@@ -3550,6 +3559,8 @@ mod tests {
             "+05 ",
             "-05:30",
             "+05:30:15",
+            "+0530",
+            "-0800",
             "+99:00",
             "+05:70",
             " +05",
@@ -3589,9 +3600,19 @@ mod tests {
         }
         // Everything else on the end is a format failure, including a second word after the zone
         // name, a second space in front of it, and an offset with something left over after it.
-        for zone in
-            ["x", "z", "Zx", "+123", "+05x", "+05 zzz", "  zzz", " UTC junk", "+05:30:15:20"]
-        {
+        for zone in [
+            "x",
+            "z",
+            "Zx",
+            "+123",
+            "+05x",
+            "+05 zzz",
+            "  zzz",
+            " UTC junk",
+            "+05:30:15:20",
+            "+05300",
+            "+0530:15",
+        ] {
             let text = format!("2020-01-01 10:00:00{zone}");
             let error = cast_to(Value::Varchar(text.clone()), &LogicalType::Timestamp)
                 .expect_err("this is not a zone");
