@@ -42,6 +42,10 @@ impl Files {
             ("sc.json", b"1\n\"s\"\n"),
             ("un.json", b"{\"a\":1}{\"a\":2}\n  {\"a\":\n3}\n"),
             ("va.json", b"[1,2,3]"),
+            ("u1.json", b"{\"a\":1,\"b\":true}\n{\"a\":2,\"b\":false}\n"),
+            ("u2.json", b"{\"c\":\"x\",\"a\":1.5,\"b\":7}\n"),
+            ("u3.json", b"{\"a\":\"2020-01-01\",\"s\":{\"x\":1}}\n"),
+            ("u4.json", b"{\"s\":{\"y\":\"q\"},\"A\":3}\n"),
             ("rows.json.gz", include_bytes!("../../rudb-compress/tests/data/rows.gz")),
         ];
         for (name, bytes) in files {
@@ -277,5 +281,46 @@ fn read_single_json_file_reads_one_file_named_as_it_is() {
         files.refused("SELECT * FROM read_single_json_file('D/m1.json', auto_detect=false)"),
         "Binder Error: When auto_detect=false, read_json requires columns to be specified through \
          the \"columns\" parameter."
+    );
+}
+
+#[test]
+fn union_by_name_samples_every_file_and_merges_the_columns_by_name() {
+    let files = Files::new();
+    files.check(&[
+        (
+            "SELECT * FROM read_json(['D/u1.json', 'D/u2.json'], union_by_name=true) ORDER BY ALL",
+            "1.0|true|NULL\n1.5|7|x\n2.0|false|NULL",
+        ),
+        (
+            "SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_json(['D/u1.json', \
+             'D/u2.json'], union_by_name=true, maximum_sample_files=1))",
+            "a|DOUBLE\nb|JSON\nc|VARCHAR",
+        ),
+        (
+            "SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_json(['D/u3.json', \
+             'D/u4.json'], union_by_name=true))",
+            "a|DATE\ns|STRUCT(x BIGINT, y VARCHAR)\nA_1|BIGINT",
+        ),
+        (
+            "SELECT * FROM read_json(['D/u3.json', 'D/u4.json'], union_by_name=true)",
+            "2020-01-01|{'x': 1, 'y': NULL}|NULL\nNULL|{'x': NULL, 'y': q}|3",
+        ),
+        (
+            "SELECT * FROM read_json(['D/u1.json', 'D/va.json'], union_by_name=true) LIMIT 1",
+            "{\"a\":1,\"b\":true}",
+        ),
+        (
+            "SELECT * FROM read_json(['D/u2.json', 'D/u1.json'], union_by_name=1)",
+            "x|1.5|7\nNULL|1.0|true\nNULL|2.0|false",
+        ),
+        (
+            "SELECT * FROM read_json_objects(['D/u2.json', 'D/u1.json'], union_by_name=true)",
+            "{\"c\":\"x\",\"a\":1.5,\"b\":7}\n{\"a\":1,\"b\":true}\n{\"a\":2,\"b\":false}",
+        ),
+    ]);
+    assert_eq!(
+        files.refused("SELECT * FROM read_json(['D/u2.json', 'D/u1.json'], union_by_name='x')"),
+        "Invalid Input Error: Failed to cast value: Could not convert string 'x' to BOOL"
     );
 }
