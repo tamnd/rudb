@@ -741,6 +741,7 @@ fn a_two_key_top_count_is_counted_over_the_rows_of_the_listed_values() {
     let found = pair.listing(query);
     let wanted = [(1, "h1", 900), (2, "h2", 850), (0, "h3", 800), (1, "h4", 750), (2, "h5", 700)];
     assert_eq!(found.len(), wanted.len(), "the limit is the answer's length");
+    // row at a time: a test comparing five answer rows with the five it wants.
     for (row, (key, value, count)) in found.iter().zip(wanted) {
         assert_eq!(
             row[1],

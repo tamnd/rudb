@@ -627,6 +627,7 @@ impl MemoryTable {
         } else {
             1
         };
+        // flatten: an `Option` of an `Option`, the one run asked for, and no column is copied.
         let laid = lay_runs(&self.types, &[self.open.as_slice()], threads).pop().flatten();
         let run = self.take_open();
         self.settle(run, laid);

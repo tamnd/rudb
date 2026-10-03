@@ -432,6 +432,8 @@ fn parts(args: &[&Vector], returns: &LogicalType, zone: SessionTimeZone) -> Resu
             let wall = on_wall("date_part", args, returns, zone)?;
             let instant = crate::scalar::call("date_part", args, returns, None)?;
             let mut answers = Vec::with_capacity(when.len());
+            // row at a time: a struct of date parts per row, mixing the wall clock and the instant
+            // by part, which only a `date_part` over a list of parts in a time zone asks for.
             for row in 0..when.len() {
                 let (Value::Struct(mut fields), Value::Struct(instants)) =
                     (wall.try_value_at(row)?, instant.try_value_at(row)?)

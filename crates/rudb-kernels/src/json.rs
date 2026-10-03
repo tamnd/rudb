@@ -1890,6 +1890,7 @@ pub fn build(
         }
         "json_object" => {
             out.push('{');
+            // row at a time: not rows at all, the key and value pairs of one call's arguments.
             for (index, pair) in args.chunks(2).zip(types.chunks(2)).enumerate() {
                 let ([key, value], [_, ty]) = pair else { continue };
                 let Value::Varchar(key) = key else {

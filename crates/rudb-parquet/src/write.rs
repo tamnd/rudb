@@ -211,6 +211,8 @@ impl<W: Write> Writer<W> {
         let mut defined = Vec::with_capacity(vector.len());
         let mut values = Vec::new();
         let mut bits = Vec::new();
+        // row at a time: the Parquet writer encodes plain pages value by value; a writer that
+        // takes a vector's flat data whole is not built yet.
         for row in 0..vector.len() {
             let value = vector.try_value_at(row)?;
             if value.is_null() {
