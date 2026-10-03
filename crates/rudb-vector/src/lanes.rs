@@ -165,10 +165,9 @@ mod tests {
                 }
             }
             for (low, span) in [(0, top), (0, 0), (top, 0), (top / 3, top / 2), (1, top - 1)] {
-                let expected = codes
-                    .iter()
-                    .enumerate()
-                    .fold(0, |word, (i, &code)| word | u64::from(code.wrapping_sub(low) <= span) << i);
+                let expected = codes.iter().enumerate().fold(0, |word, (i, &code)| {
+                    word | u64::from(code.wrapping_sub(low) <= span) << i
+                });
                 #[expect(clippy::cast_possible_truncation, reason = "under 2^25")]
                 let got = within(&bytes, width, low as u32, span as u32);
                 assert_eq!(got, expected, "width {width} low {low} span {span}");

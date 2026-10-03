@@ -4466,9 +4466,10 @@ impl Packed<'_> {
         }
         let mut codes = [0_u64; 64];
         self.unpack(from, &mut codes);
-        codes.iter().enumerate().fold(0, |word, (bit, &code)| {
-            word | u64::from(code.wrapping_sub(low) <= span) << bit
-        })
+        codes
+            .iter()
+            .enumerate()
+            .fold(0, |word, (bit, &code)| word | u64::from(code.wrapping_sub(low) <= span) << bit)
     }
 }
 
@@ -8040,7 +8041,10 @@ mod tests {
                             word | u64::from(held) << bit
                         });
                         let got = packed.within(from, low, span);
-                        assert_eq!(got, want, "width {width} cut {at} rows {from} range {low}+{span}");
+                        assert_eq!(
+                            got, want,
+                            "width {width} cut {at} rows {from} range {low}+{span}"
+                        );
                     }
                 }
             }
