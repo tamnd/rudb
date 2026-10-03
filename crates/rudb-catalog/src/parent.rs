@@ -1211,7 +1211,9 @@ mod tests {
     /// the ones after it.
     #[test]
     fn a_chunk_over_most_of_the_parts_goes_by_part_when_the_column_does_not_fit() {
-        let values: Vec<i32> = (0..1024).collect();
+        // Spread over the whole of an `i32`, so that the whole column does not pack smaller than
+        // the parts it is gathered from.
+        let values: Vec<i32> = (0..1024_i32).map(|row| row.wrapping_mul(2_000_006_014)).collect();
         let whole = Parent::new(table(&values, 128), 64 * 1024 * 1024);
         whole.column(0, &LogicalType::Integer).expect("read").expect("fits");
         let parent = Parent::new(table(&values, 128), whole.footprint() - 1);
@@ -1221,7 +1223,7 @@ mod tests {
             let column =
                 parent.gather(0, &LogicalType::Integer, &placed).expect("read").expect("fits");
             for (row, &id) in ids.iter().enumerate() {
-                assert_eq!(column.value_at(row), Value::Integer(id as i32), "row {row}");
+                assert_eq!(column.value_at(row), Value::Integer(values[id as usize]), "row {row}");
             }
         }
         assert!(
