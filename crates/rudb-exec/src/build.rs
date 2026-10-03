@@ -49,7 +49,6 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, CodedRows, Parent, QualifiedName, Table};
 use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Rule, Session, Value};
 use rudb_functions::TableFunction;
-use rudb_graph::Link;
 use rudb_kernels::Accumulator;
 use rudb_metrics::{Counters, Driver, Report};
 use rudb_parquet::{Bound, Op};
@@ -61,7 +60,7 @@ use rudb_plan::{
     PipelineRef, Plan, ROOT, Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
-use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, Data, NO_ROW, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
 use crate::consistent::{Answer, Collect, Reduction};
@@ -85,7 +84,7 @@ use crate::jsonwalk::LateralJson;
 use crate::key::{Digest, Key, RowMap};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
-use crate::linkjoin::LinkJoin;
+use crate::linkjoin::{LinkJoin, Resolve};
 use crate::links::links;
 use crate::percent::{LimitPercent, Portion};
 use crate::prepared::{Prepared, Scratch};
@@ -2149,7 +2148,7 @@ struct Building<'a, 'b> {
 
 /// What a link join reads out of the catalog, gathered before either input is built.
 struct Linked {
-    link: Arc<Link>,
+    by: Resolve,
     parent: Arc<Parent>,
     /// The stored position and the type of each parent column the join projects, in output order.
     projected: Vec<(usize, LogicalType)>,
@@ -2981,6 +2980,7 @@ impl<'a> Building<'a, '_> {
         child: NodeRef,
         parent: NodeRef,
         conditions: Slice,
+        keyed: bool,
     ) -> Result<Linked> {
         let (plan, catalog) = (self.plan, self.catalog);
         let refuse =
@@ -3011,6 +3011,88 @@ impl<'a> Building<'a, '_> {
         if oriented.iter().any(|(key, _)| key.table != child_key.table) {
             return Err(refuse("a key whose child columns come from two tables"));
         }
+        let by = if keyed {
+            self.by_key(parent_table, parent_index, parent_columns, &oriented)?
+        } else {
+            self.by_link(child, parent_table, parent_index, parent_columns, &oriented)?
+        };
+        // A semi or an anti join reads no column of the parent, which is not a special case here so
+        // much as the reason those two are nearly free: the list below is empty, so the operator
+        // holds nothing, reads nothing, and its output is the child's columns as they arrived.
+        let reads = !matches!(
+            *plan.node(reference),
+            Node::LinkJoin { kind: JoinKind::Semi | JoinKind::Anti, .. }
+        );
+        let fields = if reads { plan.field_list(parent_columns).to_vec() } else { Vec::new() };
+        let mut projected = Vec::with_capacity(fields.len());
+        for field in &fields {
+            let at = parent_table
+                .column_index(&field.name)
+                .ok_or_else(|| refuse("a parent column the stored table does not have"))?;
+            projected.push((at, field.ty.clone()));
+        }
+        // What is left of the query's budget, since the columns are held for as long as anything
+        // above can still read through them. A parent that will not fit in it is reported by the
+        // operator rather than here, as the parts it needs are read.
+        let budget = self.memory.limit().map_or(usize::MAX, |limit| {
+            usize::try_from(limit.saturating_sub(self.memory.used())).unwrap_or(usize::MAX)
+        });
+        Ok(Linked {
+            by,
+            parent: Arc::new(Parent::new(parent_table.rows().clone(), budget)),
+            projected,
+            parent_schema: Schema::numbered(fields, parent_index),
+            keys: oriented,
+        })
+    }
+
+    /// The identity key map of the parent over the one column the join is on, as the smallest key
+    /// and the number of keys after it, for a link join that finds the parent by the child's key.
+    fn by_key(
+        &self,
+        parent_table: &Table,
+        parent_index: u32,
+        parent_columns: Slice,
+        oriented: &[(ColumnBinding, ColumnBinding)],
+    ) -> Result<Resolve> {
+        let refuse = |why: &str| {
+            Error::internal(format!("a link join by key over {why}, which cannot be read"))
+        };
+        let &[(_, parent_key)] = oriented else {
+            return Err(refuse("a key of more than one column"));
+        };
+        let column =
+            stored_column(self.plan, parent_table, parent_index, parent_columns, parent_key)
+                .ok_or_else(|| refuse("a parent key that is not a stored column"))?;
+        let rows = parent_table.rows().stored().ok_or_else(|| refuse("a parent not in one file"))?;
+        let map = rudb_native::graph::shared_key_map(rows, column)
+            .ok_or_else(|| refuse("a parent with no key map"))?;
+        let (base, count) = (map.form() == rudb_graph::keymap::Form::Identity)
+            .then(|| map.span())
+            .flatten()
+            .ok_or_else(|| refuse("a parent whose key map is not the identity"))?;
+        let base = i64::try_from(base).map_err(|_| refuse("a smallest key past a BIGINT"))?;
+        if count >= u64::from(NO_ROW) {
+            return Err(refuse("a parent with more rows than a gather holds"));
+        }
+        Ok(Resolve::Key { base, count })
+    }
+
+    /// The child's forward link to the parent, for a link join that finds the parent by row id.
+    fn by_link(
+        &self,
+        child: NodeRef,
+        parent_table: &Table,
+        parent_index: u32,
+        parent_columns: Slice,
+        oriented: &[(ColumnBinding, ColumnBinding)],
+    ) -> Result<Resolve> {
+        let (plan, catalog) = (self.plan, self.catalog);
+        let refuse =
+            |why: &str| Error::internal(format!("a link join over {why}, which cannot be read"));
+        let Some(&(child_key, _)) = oriented.first() else {
+            return Err(refuse("no equality at all"));
+        };
         let Some((child_table, child_columns)) = scanned(plan, catalog, child, child_key.table)?
         else {
             return Err(refuse("a child that is not a stored table"));
@@ -3054,34 +3136,7 @@ impl<'a> Building<'a, '_> {
             .flatten()
             .find_map(|edge| rudb_native::graph::shared_link(child_rows, parent_rows, &edge))
             .ok_or_else(|| refuse("a relationship the child's file has no link for"))?;
-        // A semi or an anti join reads no column of the parent, which is not a special case here so
-        // much as the reason those two are nearly free: the list below is empty, so the operator
-        // holds nothing, reads nothing, and its output is the child's columns as they arrived.
-        let reads = !matches!(
-            *plan.node(reference),
-            Node::LinkJoin { kind: JoinKind::Semi | JoinKind::Anti, .. }
-        );
-        let fields = if reads { plan.field_list(parent_columns).to_vec() } else { Vec::new() };
-        let mut projected = Vec::with_capacity(fields.len());
-        for field in &fields {
-            let at = parent_table
-                .column_index(&field.name)
-                .ok_or_else(|| refuse("a parent column the stored table does not have"))?;
-            projected.push((at, field.ty.clone()));
-        }
-        // What is left of the query's budget, since the columns are held for as long as anything
-        // above can still read through them. A parent that will not fit in it is reported by the
-        // operator rather than here, as the parts it needs are read.
-        let budget = self.memory.limit().map_or(usize::MAX, |limit| {
-            usize::try_from(limit.saturating_sub(self.memory.used())).unwrap_or(usize::MAX)
-        });
-        Ok(Linked {
-            link,
-            parent: Arc::new(Parent::new(parent_table.rows().clone(), budget)),
-            projected,
-            parent_schema: Schema::numbered(fields, parent_index),
-            keys: oriented,
-        })
+        Ok(Resolve::Link(link))
     }
 
     /// The segment a node produces, closing any pipeline that ends underneath it.
@@ -3436,8 +3491,8 @@ impl<'a> Building<'a, '_> {
             // One pipeline rather than two, which is the whole of what this node buys. The parent
             // is not walked into at all: it is read column by column out of the catalog, and what
             // the child's rows carry away from it is a row id per row and a pointer per column.
-            Node::LinkJoin { child, parent, kind, conditions, rid } => {
-                let found = self.linked(reference, child, parent, conditions)?;
+            Node::LinkJoin { child, parent, kind, conditions, rid, keyed } => {
+                let found = self.linked(reference, child, parent, conditions, keyed)?;
                 let below = self.node(child)?;
                 // A parent key column is the child's key column over the rows an inner join keeps,
                 // when both are the same type, so it is taken from the child rather than gathered.
@@ -3455,7 +3510,7 @@ impl<'a> Building<'a, '_> {
                 let operator = LinkJoin::new(
                     plan,
                     kind,
-                    found.link,
+                    found.by,
                     found.parent,
                     found.projected,
                     rid,

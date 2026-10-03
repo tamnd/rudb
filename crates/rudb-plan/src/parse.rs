@@ -334,7 +334,10 @@ impl Reader<'_> {
                 c.expect_word("on")?;
                 c.expect("=")?;
                 let conditions = read_expr_list(plan, c)?;
-                c.expect_word("rid")?;
+                let keyed = c.eat_word("key");
+                if !keyed {
+                    c.expect_word("rid")?;
+                }
                 c.expect("=")?;
                 let rid = read_expr(plan, c)?;
                 Ok(Built {
@@ -345,6 +348,7 @@ impl Reader<'_> {
                         kind,
                         conditions,
                         rid,
+                        keyed,
                     }),
                 })
             }

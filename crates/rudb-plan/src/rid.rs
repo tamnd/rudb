@@ -614,7 +614,7 @@ mod tests {
             let parent = scan(&mut plan, 5);
             let conditions = plan.add_expr_list(&[]);
             let rid = column(&mut plan, 4, 0);
-            let node = plan.add_node(Node::LinkJoin { child, parent, kind, conditions, rid });
+            let node = plan.add_node(Node::LinkJoin { child, parent, kind, conditions, rid, keyed: false });
             plan.set_root(node);
             assert_eq!(carried(&plan), vec![4], "{kind:?} keeps the child and only the child");
             assert!(!root(&plan).has(5), "{kind:?} gathered the parent");

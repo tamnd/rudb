@@ -481,7 +481,17 @@ pub enum Node {
         /// its ordinal. The rule that writes this node is the one thing that has proved the row id
         /// survives to here, by way of [`crate::rids_of`], and a builder that went looking for the
         /// column by name afterwards would be trusting a name where the rule trusted an analysis.
+        ///
+        /// When `keyed` is set this is the child's key instead, cast to `BIGINT`, and it may be null.
         rid: ExprRef,
+        /// Whether the parent row is found from the child's key through the parent's key map
+        /// rather than from the child's row id through a link.
+        ///
+        /// Only for a parent whose key map is the identity form, where the parent row of a key is
+        /// the key less the smallest one. That needs no section in the child's file and no row id
+        /// in the child's rows, so it answers a join over a relationship whose link was over its
+        /// budget, and a join whose child rows stopped being rows of a stored table two joins ago.
+        keyed: bool,
     },
     /// A join whose right input can refer to columns produced by its left input.
     ///
