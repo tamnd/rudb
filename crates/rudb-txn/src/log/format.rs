@@ -257,11 +257,79 @@ impl Commit {
     }
 }
 
+/// One stripe a checkpoint round covered, as a Checkpoint record names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checkpointed {
+    /// The table.
+    pub table: u32,
+    /// The stripe of the table.
+    pub stripe: u32,
+    /// The commit timestamp the stripe holds everything up to.
+    pub c_s: u64,
+    /// Where the stripe's root is in the file, 0 for a table written whole.
+    pub root: u64,
+    /// The generation of the catalog the round wrote.
+    pub generation: u64,
+}
+
+impl Checkpointed {
+    /// How many bytes one entry is.
+    pub const LEN: usize = 32;
+
+    /// The payload of a Checkpoint record naming `entries`: their count, padding, and each entry.
+    /// Advisory: recovery takes what a checkpoint covered from the file, and the record is there
+    /// for a tool that reads only the log, and for replay to check the two agree.
+    ///
+    /// # Panics
+    ///
+    /// If there are more than `u32::MAX` entries.
+    #[must_use]
+    pub fn encode(entries: &[Self]) -> Vec<u8> {
+        let count = u32::try_from(entries.len()).expect("fewer than 4 billion stripes");
+        let mut out = Vec::with_capacity(8 + entries.len() * Self::LEN);
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        for entry in entries {
+            out.extend_from_slice(&entry.table.to_le_bytes());
+            out.extend_from_slice(&entry.stripe.to_le_bytes());
+            out.extend_from_slice(&entry.c_s.to_le_bytes());
+            out.extend_from_slice(&entry.root.to_le_bytes());
+            out.extend_from_slice(&entry.generation.to_le_bytes());
+        }
+        out
+    }
+
+    /// The entries of a Checkpoint record's payload, or `None` if its length does not match its
+    /// count.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Vec<Self>> {
+        if bytes.len() < 8 {
+            return None;
+        }
+        let count = half_at(bytes, 0) as usize;
+        if bytes.len() - 8 != count.checked_mul(Self::LEN)? {
+            return None;
+        }
+        Some(
+            bytes[8..]
+                .chunks_exact(Self::LEN)
+                .map(|entry| Self {
+                    table: half_at(entry, 0),
+                    stripe: half_at(entry, 4),
+                    c_s: word_at(entry, 8),
+                    root: word_at(entry, 16),
+                    generation: word_at(entry, 24),
+                })
+                .collect(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Commit, Kind, RECORD_HEADER, RecordHeader, SEGMENT_HEADER, SegmentHeader, decode_record,
-        encode_record, record_bytes, seed,
+        Checkpointed, Commit, Kind, RECORD_HEADER, RecordHeader, SEGMENT_HEADER, SegmentHeader,
+        decode_record, encode_record, record_bytes, seed,
     };
 
     #[test]
@@ -315,6 +383,20 @@ mod tests {
         assert_eq!(Commit::decode(&commit.encode()), Some(commit));
         assert_eq!(record_bytes(Commit::LEN), 56);
         assert_eq!(Commit::decode(&[0; 35]), None);
+    }
+
+    #[test]
+    fn a_checkpoint_record_reads_back_and_a_cut_one_does_not() {
+        let entries = [
+            Checkpointed { table: 7, stripe: 0, c_s: 41, root: 0, generation: 9 },
+            Checkpointed { table: 8, stripe: 3, c_s: 42, root: 1 << 40, generation: 9 },
+        ];
+        let bytes = Checkpointed::encode(&entries);
+        assert_eq!(bytes.len(), 8 + 2 * Checkpointed::LEN);
+        assert_eq!(Checkpointed::decode(&bytes), Some(entries.to_vec()));
+        assert_eq!(Checkpointed::decode(&Checkpointed::encode(&[])), Some(Vec::new()));
+        assert_eq!(Checkpointed::decode(&bytes[..bytes.len() - 1]), None);
+        assert_eq!(Checkpointed::decode(&bytes[..4]), None);
     }
 
     #[test]

@@ -2161,7 +2161,12 @@ fn persist_main(
     };
     let anchor = journal.anchor();
     persist_anchored(path, catalog, pages, DEFAULT_CATALOG, Some(&anchor))?;
-    if closing { journal.close() } else { journal.checkpointed() }
+    if closing {
+        return journal.close();
+    }
+    let tables =
+        catalog.stored_tables_in(DEFAULT_CATALOG).map(rudb_catalog::Table::oid).collect::<Vec<_>>();
+    journal.checkpointed(&tables, catalog.generation())
 }
 
 /// [`persist`], writing `anchor` into the file when there is one, and carrying the file's own

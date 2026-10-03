@@ -14,9 +14,9 @@ mod lane;
 mod replay;
 
 pub use format::{
-    Commit, Kind, LZ4, RANGE, RECORD_ALIGN, RECORD_HEADER, RecordHeader, SEGMENT_BYTES,
-    SEGMENT_HEADER, SEGMENT_MAGIC, SEGMENT_VERSION, SPILLED, SegmentHeader, decode_record,
-    encode_record, record_bytes, seed,
+    Checkpointed, Commit, Kind, LZ4, RANGE, RECORD_ALIGN, RECORD_HEADER, RecordHeader,
+    SEGMENT_BYTES, SEGMENT_HEADER, SEGMENT_MAGIC, SEGMENT_VERSION, SPILLED, SegmentHeader,
+    decode_record, encode_record, record_bytes, seed,
 };
 pub use lane::{
     Block, CommitSync, Lane, Options, Stats, parse_segment_name, segment_name, segments, spares,
