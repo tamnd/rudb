@@ -281,6 +281,17 @@ impl TableFunction {
         matches!(self, Self::PragmaTableInfo | Self::PragmaShow)
     }
 
+    /// Whether a name in the arguments that is no column is the string it spells, the pin's
+    /// deprecated reading of `read_csv(data)`. The functions that can read a lateral column are
+    /// the ones that do not, because a missing column is an error there.
+    #[must_use]
+    pub const fn takes_identifiers(self) -> bool {
+        !matches!(
+            self,
+            Self::Range | Self::GenerateSeries | Self::Unnest | Self::JsonEach | Self::JsonTree
+        )
+    }
+
     /// Whether the last value is produced.
     ///
     /// Only the two series functions differ here. The file readers answer false and nothing asks

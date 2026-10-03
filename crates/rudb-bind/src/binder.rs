@@ -419,6 +419,9 @@ pub(crate) struct Binder<'a> {
     pub(crate) exporting: bool,
     /// Where we are, for an error message that says which clause the writer should look at.
     pub(crate) clause: &'static str,
+    /// Whether a name that is no column is read as the string it spells, which is what the pin
+    /// does in the arguments of most table functions. See [`TableFunction::takes_identifiers`].
+    pub(crate) identifiers_as_strings: bool,
     /// Whether a Parquet file that could be read through a native mirror is bound from its outline
     /// alone, which is the columns and the row count and none of the row groups.
     ///
@@ -489,6 +492,7 @@ impl<'a> Binder<'a> {
             trying: false,
             exporting: false,
             clause: "SELECT clause",
+            identifiers_as_strings: false,
             outlined: false,
             expanding: Vec::new(),
             materialized: Vec::new(),
@@ -605,8 +609,12 @@ impl<'a> Binder<'a> {
     ) -> Result<(NodeRef, Scope)> {
         let span = ast.query_span(query);
         let outer = std::mem::replace(&mut self.current_span, span);
+        // A subquery in the arguments of a table function is bound the way any query is, so a name
+        // there that is no column is still a missing column.
+        let identifiers = std::mem::replace(&mut self.identifiers_as_strings, false);
         let result =
             self.bind_query_inner(ast, query).map_err(|error| error.with_fallback_span(span));
+        self.identifiers_as_strings = identifiers;
         self.current_span = outer;
         result
     }
@@ -2476,7 +2484,11 @@ impl<'a> Binder<'a> {
         let mut bound = Vec::new();
         let mut written_options = Vec::new();
         for argument in written {
-            let expr = self.bind_expr(ast, argument.expr, &empty)?;
+            let identifiers =
+                std::mem::replace(&mut self.identifiers_as_strings, called.takes_identifiers());
+            let expr = self.bind_expr(ast, argument.expr, &empty);
+            self.identifiers_as_strings = identifiers;
+            let expr = expr?;
             if argument.alias == NONE {
                 bound.push(expr);
             } else {

@@ -559,6 +559,11 @@ impl Binder<'_> {
             if let Some(field) = self.struct_path(parts, scope)? {
                 return Ok(field);
             }
+            // The pin reads `read_csv(data)` as `read_csv('data')`, dots and all, and warns that
+            // it will stop doing so. It is the deprecated behaviour, but it is still the answer.
+            if self.identifiers_as_strings {
+                return Ok(self.add_constant(Value::Varchar(parts.join("."))));
+            }
             // The pin's own words for a name that is neither a column nor an alias in these two.
             if let ([word], Some(_)) = (parts, ast) {
                 if clause == Some(AliasClause::Qualify) && !self.in_aggregate {
