@@ -101,6 +101,12 @@ pub(crate) fn write_csv(
 
 /// Appends one value, quoted if it has to be or was asked to be.
 fn field(line: &mut String, text: &str, forced: bool, copy: &CopyTo) {
+    // An empty quote writes every value as it is, with nothing escaped either, whatever the escape
+    // is. The pin does, and the corpus writes JSON lines that way through `quote ''`.
+    if copy.quote.is_empty() {
+        line.push_str(text);
+        return;
+    }
     let quoted = forced
         || text == copy.null
         || text.contains(copy.delimiter.as_str())

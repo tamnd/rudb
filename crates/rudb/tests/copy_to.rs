@@ -64,6 +64,19 @@ fn the_options_change_the_delimiter_the_quote_the_null_and_the_header() {
 }
 
 #[test]
+fn an_empty_quote_writes_every_value_bare_and_escapes_nothing() {
+    let db = table();
+    let want = "i,s,d,dt,n,ts,q,l,st,b,dec,e,nl\n\
+                1,a,b,1.5,2026-01-02,,2026-01-02 03:04:05.5,say \"hi\",[1, 2],{'k': 1},true,12.30,,line\ntwo\n\
+                2,plain,0.0,,x,,q's,[],,false,, pad ,end\n";
+    assert_eq!(written(&db, "bare-quote", "COPY t TO 'FILE' (QUOTE '')"), want);
+    assert_eq!(
+        written(&db, "bare-forced", "COPY t TO 'FILE' (QUOTE '', FORCE_QUOTE (i), ESCAPE '\\')"),
+        want
+    );
+}
+
+#[test]
 fn a_table_with_a_column_list_is_the_query_over_those_columns() {
     let db = table();
     let want = "i,s\n1,\"a,b\"\n2,plain\n";
