@@ -15093,7 +15093,13 @@ fn decode(
     if codec == 5 {
         // The cascade holds the whole tail of the page and says how long it is itself.
         let data = cascade(ty, &bytes[cur.at..], rows)?;
-        return Ok(Vector::flat(ty.clone(), data)?.with_validity(validity));
+        // Packed again over the range the values span, when that is at least half the size. A page
+        // is decoded once and then held for the statements after it, so what it is held as is what
+        // every later scan reads. `l_quantity` is a stride of 100 over six bit codes, and held flat
+        // it was eight bytes a row, 48 MB at SF1, which q06 read from memory on every run and
+        // filtered a row at a time. Packed it is thirteen bits a row and the packed kernels take it.
+        let flat = Vector::flat(ty.clone(), data)?;
+        return Ok(flat.bit_packed()?.with_validity(validity));
     }
     if codec == 2 {
         let width = u32::from(cur.u8()?);
@@ -20638,6 +20644,31 @@ mod tests {
         let read = reader.read(3, &[0]).expect("the last part back");
         assert_eq!(read.value_at(0, 0), Value::Varchar(String::new()));
         assert_eq!(read.value_at(1023, 0), Value::Varchar(String::new()));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A column the cascade stores as a stride, the way `l_quantity` is stored, comes back packed
+    /// over the range of its values rather than flat, since it is held in that form afterwards.
+    #[test]
+    fn a_strided_cascade_page_is_read_back_packed() {
+        let path = path("strided-codes");
+        let ty = LogicalType::Decimal { width: 15, scale: 2 };
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("quantity", ty.clone())]).expect("new file");
+        let values: Vec<i64> = (0..2048).map(|row| (row * 7 % 50 + 1) * 100).collect();
+        let column = Vector::flat(ty, Data::Int64(values.clone().into())).expect("decimals");
+        writer.append(&Chunk::new(vec![column]).expect("one column")).expect("a part");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let read = reader.read(0, &[0]).expect("the part back");
+        let column = read.column(0).expect("the column");
+        let packed = column.packed_parts().expect("held packed rather than flat");
+        assert_eq!(packed.base(), 100);
+        assert_eq!(packed.width(), 13, "4,900 between the ends");
+        for (row, &value) in values.iter().enumerate() {
+            assert_eq!(packed.code(row), u64::try_from(value - 100).expect("above the base"));
+        }
         fs::remove_file(path).expect("remove scratch file");
     }
 
