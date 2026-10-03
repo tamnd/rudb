@@ -419,7 +419,9 @@ fn chosen(plan: &Plan, node: NodeRef, context: &Context) -> String {
     // because the rule would have chosen one is the plan output lying about the plan.
     let taken = matches!(plan.node(node), Node::LinkJoin { .. });
     match (taken, why.chosen()) {
-        (true, _) if why == crate::link::Why::Keyed => format!(" [reads the key map, because {why}]"),
+        (true, _) if why == crate::link::Why::Keyed => {
+            format!(" [reads the key map, because {why}]")
+        }
         (true, _) => format!(" [reads the link, because {why}]"),
         (false, false) => format!(" [builds a hash table, because {why}]"),
         (false, true) => " [builds a hash table, because the link_join rewrite is off]".to_owned(),

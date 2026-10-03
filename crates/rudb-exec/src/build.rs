@@ -3064,7 +3064,8 @@ impl<'a> Building<'a, '_> {
         let column =
             stored_column(self.plan, parent_table, parent_index, parent_columns, parent_key)
                 .ok_or_else(|| refuse("a parent key that is not a stored column"))?;
-        let rows = parent_table.rows().stored().ok_or_else(|| refuse("a parent not in one file"))?;
+        let rows =
+            parent_table.rows().stored().ok_or_else(|| refuse("a parent not in one file"))?;
         let map = rudb_native::graph::shared_key_map(rows, column)
             .ok_or_else(|| refuse("a parent with no key map"))?;
         let (base, count) = (map.form() == rudb_graph::keymap::Form::Identity)

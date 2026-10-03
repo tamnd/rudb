@@ -71,8 +71,7 @@
 use rudb_common::{Field, LogicalType, Result};
 use rudb_functions::FILE_ROW_NUMBER;
 use rudb_plan::{
-    Carried, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice,
-    rids_of,
+    Carried, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice, rids_of,
 };
 
 use crate::estimate;
@@ -564,9 +563,9 @@ fn child_key(plan: &mut Plan, parent: NodeRef, conditions: Slice) -> Option<Expr
     let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
         return None;
     };
-    let side = [left, right].into_iter().find(|&side| {
-        matches!(*plan.expr(side), Expr::Column(binding) if binding.table != index)
-    })?;
+    let side = [left, right].into_iter().find(
+        |&side| matches!(*plan.expr(side), Expr::Column(binding) if binding.table != index),
+    )?;
     let Expr::Column(key) = *plan.expr(side) else { return None };
     let ty = plan.expr_type(side).clone();
     let column = plan.add_expr(Expr::Column(key), ty.clone());
@@ -577,9 +576,9 @@ fn child_key(plan: &mut Plan, parent: NodeRef, conditions: Slice) -> Option<Expr
         | LogicalType::Integer
         | LogicalType::UTinyInt
         | LogicalType::USmallInt
-        | LogicalType::UInteger => Some(
-            plan.add_expr(Expr::Cast { input: column, try_cast: false }, LogicalType::BigInt),
-        ),
+        | LogicalType::UInteger => {
+            Some(plan.add_expr(Expr::Cast { input: column, try_cast: false }, LogicalType::BigInt))
+        }
         _ => None,
     }
 }
@@ -768,7 +767,8 @@ fn matched(
     // parent by key can name the child's column from the scan it came out of wherever that is.
     // Reading a link needs more, a row of the stored table, which is what `scan_under` finds.
     let stored = scan_under(plan, child, child_index);
-    let named = stored.or_else(|| get_under(plan, child, child_index)).ok_or(Why::ChildNotStored)?;
+    let named =
+        stored.or_else(|| get_under(plan, child, child_index)).ok_or(Why::ChildNotStored)?;
     let Node::Get { table: child_name, columns: child_columns, .. } = *plan.node(named) else {
         return Err(Why::ChildNotStored);
     };

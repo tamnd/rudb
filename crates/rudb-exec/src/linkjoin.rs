@@ -273,9 +273,11 @@ impl LinkJoin {
         rids.clear();
         let validity = ids.validity();
         if validity.has_nulls(rows) {
-            rids.extend(keys.iter().enumerate().map(|(row, &key)| {
-                if validity.is_valid(row) { find(key) } else { NO_ROW }
-            }));
+            rids.extend(
+                keys.iter()
+                    .enumerate()
+                    .map(|(row, &key)| if validity.is_valid(row) { find(key) } else { NO_ROW }),
+            );
         } else {
             rids.extend(keys.iter().map(|&key| find(key)));
         }
