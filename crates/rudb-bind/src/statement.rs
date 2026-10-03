@@ -88,7 +88,29 @@ pub enum Bound {
     Explain { plan: Plan, analyze: bool, statistics: bool, codegen: bool },
     /// `COPY ... TO`, a query and how to write what it answers.
     CopyTo(CopyTo),
+    /// A table function called for what it does rather than for rows, which is `enable_logging`
+    /// and `disable_logging`. They answer no rows and change settings, so they are run where a
+    /// `SET` is run and not planned.
+    Call(Call),
 }
+
+/// A call to a table function that changes settings, with its arguments folded to constants.
+///
+/// The binder only recognises the call and folds what was passed. What the arguments mean, and
+/// which of them the function refuses, is decided where the settings are, because that is the
+/// layer that knows what a log level or a log storage is.
+#[derive(Debug)]
+pub struct Call {
+    /// The function name, in lower case.
+    pub name: String,
+    /// The positional arguments, in order.
+    pub positional: Vec<Value>,
+    /// The named arguments, in order, by the name as written.
+    pub named: Vec<(String, Value)>,
+}
+
+/// The table functions that are run as a [`Call`] when they are the whole statement.
+const CALLS: [&str; 2] = ["enable_logging", "disable_logging"];
 
 /// A bound `COPY ... TO` a CSV or a JSON file, with every option read and defaulted.
 ///
@@ -480,6 +502,9 @@ fn bind_one(
     };
     match statement {
         ast::Statement::Query(query) => {
+            if let Some(call) = call(ast, catalog, parameters, session, query)? {
+                return Ok(Bound::Call(call));
+            }
             let mut binder = Binder::with(catalog, parameters, session);
             binder.outlined = outlined;
             let (root, _) = binder.bind_query(ast, query)?;
@@ -1939,6 +1964,70 @@ fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<
         }
     }
     Ok(Bound::DropTable(DropTable { names, kind }))
+}
+
+/// Recognises `CALL enable_logging(...)` and the other spellings of the same thing, which are a
+/// `SELECT *` over the call with nothing else in the query, and folds the arguments.
+///
+/// A bare word is text here, the way it is in a `SET`, so `storage=file` names the file storage.
+/// The pin warns that it took the word that way and takes it, and rudb takes it without the warning.
+///
+/// # Errors
+///
+/// For an argument that does not fold to a constant.
+fn call(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    query: ast::QueryRef,
+) -> Result<Option<Call>> {
+    let written = ast.query(query);
+    let ast::QueryBody::Select(select) = written.body else { return Ok(None) };
+    let select = ast.select(select);
+    let bare = written.ctes.len == 0
+        && written.order_by.len == 0
+        && written.limit == NONE
+        && written.offset == NONE
+        && select.distinct == ast::Distinct::No
+        && select.filter == NONE
+        && select.group_by.len == 0
+        && select.having == NONE
+        && select.qualify == NONE
+        && select.from.len == 1;
+    let [target] = ast.target_list(select.targets) else { return Ok(None) };
+    if !bare || !matches!(ast.expr(target.expr), ast::Expr::Star { .. }) {
+        return Ok(None);
+    }
+    let ast::Source::Function { name, args, .. } = ast.source(ast.source_list(select.from)[0])
+    else {
+        return Ok(None);
+    };
+    let parts: Vec<&str> = ast.name(name).collect();
+    let [function] = parts.as_slice() else { return Ok(None) };
+    let Some(&function) = CALLS.iter().find(|known| known.eq_ignore_ascii_case(function)) else {
+        return Ok(None);
+    };
+    let mut out = Call { name: function.to_string(), positional: Vec::new(), named: Vec::new() };
+    for argument in ast.target_list(args) {
+        let mut binder = Binder::with(catalog, parameters, session);
+        let bound = binder.bind_setting_value(ast, argument.expr)?;
+        let value = if let Expr::Constant(value) = *binder.plan().expr(bound) {
+            binder.plan().value(value).clone()
+        } else if let Some(value) = crate::fold::value_with_lambdas(binder.plan(), bound)? {
+            value
+        } else {
+            return Err(Error::not_implemented(format!(
+                "an argument to {function} that is not a constant"
+            )));
+        };
+        if argument.alias == NONE {
+            out.positional.push(value);
+        } else {
+            out.named.push((ast.string(argument.alias).to_string(), value));
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Binds a `SET` or a `RESET`, which is resolving its value and nothing else.

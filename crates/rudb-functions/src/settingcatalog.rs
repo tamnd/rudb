@@ -1702,15 +1702,17 @@ pub fn unknown_setting(name: &str) -> String {
 /// What the engine says when a setting that takes one of a fixed set of words is handed another.
 ///
 /// The pin raises this out of its enum conversion and lists the nearest values after it, scored by
-/// Jaro-Winkler without folding case, best first and the shorter of two equal scores first. The
-/// best one is always printed and the rest only while they score at least a half, at most five of
-/// them. That is why a lowercase word that is nothing like any value is offered `DEFAULT`, which is
-/// merely the shortest of the values that all scored nothing.
+/// Jaro-Winkler without folding case, best first, with two equal scores left in alphabetical order.
+/// The best one is always printed and the rest only while they score at least a half, at most five
+/// of them. That is why a lowercase word that is nothing like any value is offered `DEBUG` for a log
+/// level and `DISABLE_SELECTED` for a log mode, which are merely first in the alphabet among values
+/// that all scored nothing. Neither is the shortest of its set nor the first the pin declares.
 #[must_use]
 pub fn unknown_enum_value(written: &str, enum_name: &str, values: &[&str]) -> String {
     let mut scored: Vec<(f64, &str)> =
         values.iter().map(|value| (rudb_kernels::jaro_winkler(value, written), *value)).collect();
-    scored.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.len().cmp(&right.1.len())));
+    scored.sort_by(|left, right| left.1.cmp(right.1));
+    scored.sort_by(|left, right| right.0.total_cmp(&left.0));
     let near: Vec<String> = scored
         .iter()
         .enumerate()
