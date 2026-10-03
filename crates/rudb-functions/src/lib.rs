@@ -29,8 +29,8 @@ pub use entrycatalog::{
     show_table_fields, table_fields, view_fields,
 };
 pub use file::{
-    Footers, TYPES_SET, csv_fields, csv_given, files, is_file, is_pattern, json_text, open_csv,
-    open_parquet, parquet_footers, parquet_outline,
+    Footers, TYPES_SET, content_files, csv_fields, csv_given, files, is_file, is_pattern,
+    json_text, open_csv, open_parquet, parquet_footers, parquet_outline,
 };
 pub use functioncatalog::{
     CONSISTENT, FUNCTION_CATALOG, FUNCTION_SCHEMA, FunctionEntry, function_entries, function_fields,
@@ -47,7 +47,7 @@ pub use signature::{
 };
 pub use table::{
     Columns, FILE_ROW_NUMBER, ResolvedTable, TableFunction, codec_metric_fields,
-    database_size_fields, device_card_fields, dialect_fields, extension_fields,
+    content_fields, database_size_fields, device_card_fields, dialect_fields, extension_fields,
     grammar_extension_fields, json_walk_fields, keyword_categories, keyword_fields, link_fields,
     optimizer_fields, platform_fields, resolve_pragma, resolve_table, series, series_length,
     statement_metric_fields, strategy_fields, user_agent_fields, variable_fields, version_fields,

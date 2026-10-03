@@ -55,7 +55,12 @@ pub fn expand(filesystem: &dyn Filesystem, pattern: &str) -> Result<Vec<String>>
         };
         return Ok(found);
     }
-    let (root, rest) = split_root(pattern);
+    let (root, mut rest) = split_root(pattern);
+    // A pattern that ends in `**` names every file at any depth under it, which is DuckDB's reading,
+    // where the walk alone would end on the directories and keep none of them.
+    if rest.last() == Some(&"**") {
+        rest.push("*");
+    }
     let mut here = vec![root];
     for segment in rest {
         here = step(filesystem, &here, segment)?;
@@ -323,6 +328,16 @@ mod tests {
         assert_eq!(
             expand(&filesystem, "/data/**/*.parquet").expect("walks"),
             ["/data/one/a.parquet", "/data/top.parquet", "/data/two/deep/c.parquet"]
+        );
+    }
+
+    #[test]
+    fn a_double_star_at_the_end_is_every_file_below() {
+        let filesystem =
+            holding(&["/data/top.parquet", "/data/one/a.csv", "/data/two/deep/c.parquet"]);
+        assert_eq!(
+            expand(&filesystem, "/data/**").expect("walks"),
+            ["/data/one/a.csv", "/data/top.parquet", "/data/two/deep/c.parquet"]
         );
     }
 
