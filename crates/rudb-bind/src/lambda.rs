@@ -95,6 +95,33 @@ fn any_lambda(ast: &Ast, arg: ast::ExprRef) -> bool {
 }
 
 impl Binder<'_> {
+    /// Whether the argument in a lambda's place is one.
+    ///
+    /// Once `lambda_syntax` allows the arrow, every arrow in that place is a lambda, whatever is on
+    /// its left, and a left side that is not names is refused as parameters rather than bound as
+    /// the JSON operator.
+    fn lambda_argument(&self, ast: &Ast, arg: ast::ExprRef) -> bool {
+        any_lambda(ast, arg)
+            || (self.semantics.single_arrow_lambdas()
+                && matches!(ast.expr(arg), ast::Expr::Binary { op: BinaryOp::Arrow, .. }))
+    }
+
+    /// Refuses a lambda written with the arrow unless `lambda_syntax` allows it.
+    ///
+    /// This runs once the body has bound, because that is the order on the pin: under the default
+    /// `x -> y + 1` is refused for the missing `y` and only `x -> x + 1` gets the deprecation.
+    fn arrow_allowed(&self, arrow: bool) -> Result<()> {
+        if arrow && !self.semantics.single_arrow_lambdas() {
+            return Err(Error::binder(
+                "Deprecated lambda arrow (->) detected. Please transition to the new lambda \
+                 syntax, i.e.., lambda x, i: x + i, before DuckDB's next release.\nUse SET \
+                 lambda_syntax='ENABLE_SINGLE_ARROW' to revert to the deprecated behavior.\nFor \
+                 more information, see https://duckdb.org/docs/current/sql/functions/lambda.html.",
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether a lambda's body is being bound.
     pub(crate) fn in_lambda(&self) -> bool {
         !self.lambda_frames.is_empty()
@@ -135,12 +162,12 @@ impl Binder<'_> {
             _ => return Err(self.no_lambda_match(ast, recorded, arguments, scope)),
         };
         if any_lambda(ast, list)
-            || !any_lambda(ast, lambda)
+            || !self.lambda_argument(ast, lambda)
             || initial.is_some_and(|initial| any_lambda(ast, initial))
         {
             return Err(self.no_lambda_match(ast, recorded, arguments, scope));
         }
-        let (names, body) = lambda_parts(ast, lambda)?;
+        let (names, body, arrow) = lambda_parts(ast, lambda)?;
         if names.len() > 3 || (names.len() > 2 && !reduce) {
             return Err(Error::binder(format!(
                 "This lambda function only supports up to {} lambda parameters!",
@@ -169,10 +196,13 @@ impl Binder<'_> {
         let interned: Vec<_> = names.iter().map(|name| self.plan_mut().intern(name)).collect();
         let params = self.plan_mut().add_name_list(&interned);
         let (body, returns, initial) = if reduce {
-            self.bind_reduce(ast, body, scope, table, &names, element, initial)?
+            let reduced = self.bind_reduce(ast, body, scope, table, &names, element, initial)?;
+            self.arrow_allowed(arrow)?;
+            reduced
         } else {
             let types = [element, LogicalType::BigInt][..names.len()].to_vec();
             let mut body = self.bind_lambda_body(ast, body, scope, table, &names, types)?;
+            self.arrow_allowed(arrow)?;
             // A filter's body is a condition, and one that is not a boolean is cast to one the way
             // a `WHERE` would be. `lambda x: x % 2` keeps the odd elements and a null drops one.
             if recorded == FILTER && self.plan().expr_type(body) != &LogicalType::Boolean {
@@ -212,7 +242,7 @@ impl Binder<'_> {
         let Some((&lambda, rest)) = arguments.split_first() else {
             return Err(self.no_lambda_match(ast, INVOKE, arguments, scope));
         };
-        if !any_lambda(ast, lambda) {
+        if !self.lambda_argument(ast, lambda) {
             if rest.iter().any(|&arg| any_lambda(ast, arg)) {
                 return Err(Error::binder("This scalar function requires a lambda expression!"));
             }
@@ -228,7 +258,7 @@ impl Binder<'_> {
             }
             return Err(self.no_lambda_match(ast, INVOKE, arguments, scope));
         }
-        let (names, body) = lambda_parts(ast, lambda)?;
+        let (names, body, arrow) = lambda_parts(ast, lambda)?;
         let mut args = Vec::with_capacity(rest.len());
         for &arg in rest {
             args.push(self.bind_expr(ast, arg, scope)?);
@@ -251,6 +281,7 @@ impl Binder<'_> {
         let interned: Vec<_> = names.iter().map(|name| self.plan_mut().intern(name)).collect();
         let params = self.plan_mut().add_name_list(&interned);
         let body = self.bind_lambda_body(ast, body, scope, table, &names, types)?;
+        self.arrow_allowed(arrow)?;
         let returns = self.plan().expr_type(body).clone();
         let lambda = self.add_expr(Expr::Lambda { table, params, body }, returns.clone());
         args.insert(0, lambda);
@@ -383,21 +414,38 @@ impl Binder<'_> {
     }
 }
 
-/// A lambda's parameters as written and its body.
+/// A lambda's parameters as written, its body, and whether it was written with the arrow.
 ///
-/// The arrow spelling is refused here, with the pin's sentence, and so is a parameter named twice.
-/// The pin binds the parameters as a table it names after them, and a repeated name is the error
-/// that table raises, in its words.
-fn lambda_parts(ast: &Ast, lambda: ast::ExprRef) -> Result<(Vec<String>, ast::ExprRef)> {
-    let ast::Expr::Lambda { params, body } = ast.expr(lambda) else {
-        return Err(Error::binder(
-            "Deprecated lambda arrow (->) detected. Please transition to the new lambda syntax, \
-             i.e.., lambda x, i: x + i, before DuckDB's next release.\nUse SET \
-             lambda_syntax='ENABLE_SINGLE_ARROW' to revert to the deprecated behavior.\nFor more \
-             information, see https://duckdb.org/docs/current/sql/functions/lambda.html.",
-        ));
+/// An arrow whose left side is not a name or a row of names is refused here in the pin's words, and
+/// so is a parameter named twice. The pin binds the parameters as a table it names after them, and
+/// a repeated name is the error that table raises, in its words. Whether the arrow is allowed at
+/// all is the caller's to say, once the body has bound.
+fn lambda_parts(ast: &Ast, lambda: ast::ExprRef) -> Result<(Vec<String>, ast::ExprRef, bool)> {
+    let (names, body, arrow) = match ast.expr(lambda) {
+        ast::Expr::Lambda { params, body } => {
+            (ast.name(params).map(str::to_string).collect::<Vec<_>>(), body, false)
+        }
+        ast::Expr::Binary { op: BinaryOp::Arrow, left, right } if arrow_lambda(ast, lambda) => {
+            let items = match ast.expr(left) {
+                ast::Expr::Row { items } => ast.expr_list(items).to_vec(),
+                _ => vec![left],
+            };
+            let names = items
+                .iter()
+                .filter_map(|&item| match ast.expr(item) {
+                    ast::Expr::Column { name } => ast.name(name).next().map(str::to_string),
+                    _ => None,
+                })
+                .collect();
+            (names, right, true)
+        }
+        _ => {
+            return Err(Error::binder(
+                "Invalid lambda parameters! Parameters must be unqualified comma-separated names \
+                 like x or (x, y).",
+            ));
+        }
     };
-    let names: Vec<String> = ast.name(params).map(str::to_string).collect();
     for (at, name) in names.iter().enumerate() {
         if names[..at].iter().any(|earlier| rudb_catalog::same_name(earlier, name)) {
             return Err(Error::binder(format!(
@@ -406,7 +454,7 @@ fn lambda_parts(ast: &Ast, lambda: ast::ExprRef) -> Result<(Vec<String>, ast::Ex
             )));
         }
     }
-    Ok((names, body))
+    Ok((names, body, arrow))
 }
 
 /// The type two types meet at, which is the pin's `TryGetMaxLogicalType` for what a lambda body

@@ -39,7 +39,7 @@ pub use pragmacatalog::{PRAGMAS, PragmaEntry, pragma_named};
 pub use rudb_csv::Given;
 pub use settingcatalog::{
     Behaviour, GLOBAL, LOCAL, SETTINGS, SettingEntry, UNSET, setting_fields, setting_named,
-    unknown_setting,
+    unknown_enum_value, unknown_setting,
 };
 pub use signature::{
     FunctionKind, FunctionRow, Resolved, function_rows, json_text_at, kind_of, named_mismatch,

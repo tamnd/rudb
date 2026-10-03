@@ -111,13 +111,28 @@ pub(crate) fn jaro_winkler_similarity(
     b: &Value,
     cutoff: Option<&Value>,
 ) -> Result<Value> {
-    let (a, b) = (bytes(a)?, bytes(b)?);
+    let similarity = winkler(bytes(a)?, bytes(b)?);
+    Ok(Value::Double(kept(similarity, cutoff)?))
+}
+
+/// The Jaro-Winkler similarity of two strings, the score the pin ranks its suggestions by when it
+/// is handed a word that is not one of an enum's values.
+///
+/// It compares bytes and does not fold case, which is why `SET lambda_syntax = 'enable'` is not
+/// told about `ENABLE_SINGLE_ARROW` there.
+#[must_use]
+pub fn jaro_winkler(a: &str, b: &str) -> f64 {
+    winkler(a.as_bytes(), b.as_bytes())
+}
+
+/// [`jaro`] raised by the shared prefix, which is what both spellings above compute.
+fn winkler(a: &[u8], b: &[u8]) -> f64 {
     let mut similarity = jaro(a, b);
     if similarity > 0.7 {
         let prefix = a.iter().zip(b).take(4).take_while(|(left, right)| left == right).count();
         similarity += prefix as f64 * 0.1 * (1.0 - similarity);
     }
-    Ok(Value::Double(kept(similarity, cutoff)?))
+    similarity
 }
 
 /// `starts_with`, `prefix` and `^@` when `suffix` is false, and `ends_with` and `suffix` when it is

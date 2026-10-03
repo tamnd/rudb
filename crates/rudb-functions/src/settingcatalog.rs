@@ -1085,7 +1085,7 @@ pub static SETTINGS: &[SettingEntry] = &[
         input_type: "VARCHAR",
         scope: GLOBAL,
         aliases: &[],
-        behaviour: Behaviour::DefaultOnly("DEFAULT"),
+        behaviour: Behaviour::Honoured,
     },
     SettingEntry {
         name: "late_materialization_max_rows",
@@ -1694,6 +1694,31 @@ pub fn unknown_setting(name: &str) -> String {
     format!("{message}\n\nDid you mean: {}", near.join(", "))
 }
 
+/// What the engine says when a setting that takes one of a fixed set of words is handed another.
+///
+/// The pin raises this out of its enum conversion and lists the nearest values after it, scored by
+/// Jaro-Winkler without folding case, best first and the shorter of two equal scores first. The
+/// best one is always printed and the rest only while they score at least a half, at most five of
+/// them. That is why a lowercase word that is nothing like any value is offered `DEFAULT`, which is
+/// merely the shortest of the values that all scored nothing.
+#[must_use]
+pub fn unknown_enum_value(written: &str, enum_name: &str, values: &[&str]) -> String {
+    let mut scored: Vec<(f64, &str)> =
+        values.iter().map(|value| (rudb_kernels::jaro_winkler(value, written), *value)).collect();
+    scored.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.len().cmp(&right.1.len())));
+    let near: Vec<String> = scored
+        .iter()
+        .enumerate()
+        .take(SUGGESTIONS)
+        .take_while(|(at, (score, _))| *at == 0 || *score >= 0.5)
+        .map(|(_, (_, value))| format!("\"{value}\""))
+        .collect();
+    format!(
+        "Enum value: unrecognized value \"{written}\" for enum \"{enum_name}\"\n\nCandidates: {}",
+        near.join(", ")
+    )
+}
+
 /// How many names the suggestion list holds at most, which is what the pin prints.
 const SUGGESTIONS: usize = 5;
 
@@ -1790,7 +1815,7 @@ mod tests {
         assert_eq!(setting_named("nothing_called_this"), None);
     }
 
-    /// Twenty three names are read by the engine and the rest are taken and kept, or taken at one
+    /// Twenty four names are read by the engine and the rest are taken and kept, or taken at one
     /// value and refused at the others. The counts are here so that moving a setting from one case
     /// to another is a line in a diff rather than something nobody notices.
     #[test]
@@ -1798,9 +1823,9 @@ mod tests {
         let count = |wanted: fn(&Behaviour) -> bool| {
             SETTINGS.iter().filter(|entry| wanted(&entry.behaviour)).count()
         };
-        assert_eq!(count(|b| matches!(b, Behaviour::Honoured)), 23);
+        assert_eq!(count(|b| matches!(b, Behaviour::Honoured)), 24);
         assert_eq!(count(|b| matches!(b, Behaviour::Knob(_))), 133);
-        assert_eq!(count(|b| matches!(b, Behaviour::DefaultOnly(_))), 36);
+        assert_eq!(count(|b| matches!(b, Behaviour::DefaultOnly(_))), 35);
         assert_eq!(
             setting_named("memory_limit").expect("a setting").behaviour,
             Behaviour::Honoured
