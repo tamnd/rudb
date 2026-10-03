@@ -9098,8 +9098,14 @@ mod tests {
                 Vector::from_values(ty, &values).expect("one type a column")
             };
             Chunk::new(vec![
-                column(rows.iter().map(|row| Value::Integer(row.0)).collect(), LogicalType::Integer),
-                column(rows.iter().map(|row| Value::Integer(row.1)).collect(), LogicalType::Integer),
+                column(
+                    rows.iter().map(|row| Value::Integer(row.0)).collect(),
+                    LogicalType::Integer,
+                ),
+                column(
+                    rows.iter().map(|row| Value::Integer(row.1)).collect(),
+                    LogicalType::Integer,
+                ),
                 column(
                     rows.iter().map(|row| Value::Varchar(row.2.to_string())).collect(),
                     LogicalType::Varchar,
