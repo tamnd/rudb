@@ -287,6 +287,9 @@ pub fn select_prepared(
             if let Some(kept) = packed_kept(op, left, right, None) {
                 return Ok(kept);
             }
+            if let Some(kept) = packed_literal(op, left, right, held) {
+                return Ok(kept);
+            }
         }
         if let Some(answers) =
             specialized(op, left, right, &left_valid, &right_valid, len, identity, held)
@@ -454,6 +457,28 @@ fn flat_where<T: Copy>(
 /// `None` for anything but two straight packed runs of the same type, for codes too wide to leave
 /// room for the difference, and for two ranges that do not meet, which the general path answers
 /// without reading a code.
+/// A packed column against a literal, answered a word of 64 rows at a time in code space and
+/// turned into rows once, rather than as a flag a row that is then read back into rows.
+///
+/// The same pass [`mask_within`] makes for one column of a conjunction, so it takes what that takes:
+/// the column on the left, an integer literal of its type on the right, and the five comparisons
+/// that are a range. `None` for anything else, which goes on to the general path.
+fn packed_literal(
+    op: Comparison,
+    left: &Vector,
+    right: &Vector,
+    held: Option<&Held>,
+) -> Option<Selection> {
+    if left.packed_parts().is_none() || right.form() != Form::Constant {
+        return None;
+    }
+    let value = right.try_value_at(0).ok()?;
+    let bound = Bound { op, value: &value, held };
+    let mut words = vec![0_u64; left.len().div_ceil(64)];
+    let kept = mask_within(left, &[bound], &mut words, true)?;
+    Some(mask_selection(&words, kept))
+}
+
 fn packed_kept(
     op: Comparison,
     left: &Vector,
@@ -757,17 +782,11 @@ pub fn mask_within(
         )]
         let (from, span) = ((low - packed.base()) as u64, (high - low) as u64);
         let within = |code: u64| code.wrapping_sub(from) <= span;
-        return Some(masked_blocks(
+        return Some(masked_words(
             len,
             words,
             fresh,
-            |base, flags| {
-                let mut codes = [0_u64; 64];
-                packed.unpack(base, &mut codes);
-                for (flag, &code) in flags.iter_mut().zip(&codes) {
-                    *flag = u8::from(within(code));
-                }
-            },
+            |base| packed.within(base, from, span),
             |row| within(packed.code(row)),
         ));
     }
@@ -869,6 +888,33 @@ fn masked_blocks(
             let mut flags = [0_u8; 64];
             fill(base, &mut flags);
             flag_mask(&flags)
+        } else {
+            (base..len).fold(0, |mask, row| mask | u64::from(held(row)) << (row - base))
+        };
+        *word = if fresh { mask } else { *word & mask };
+        kept += word.count_ones() as usize;
+    }
+    kept
+}
+
+/// [`masked_blocks`] for a column that answers a whole block as a word, which a packed column does
+/// without unpacking it, see [`rudb_vector::vector::Packed::within`].
+fn masked_words(
+    len: usize,
+    words: &mut [u64],
+    fresh: bool,
+    block: impl Fn(usize) -> u64,
+    held: impl Fn(usize) -> bool,
+) -> usize {
+    let whole = len / 64;
+    let mut kept = 0;
+    for (at, word) in words.iter_mut().enumerate() {
+        if !fresh && *word == 0 {
+            continue;
+        }
+        let base = at * 64;
+        let mask = if at < whole {
+            block(base)
         } else {
             (base..len).fold(0, |mask, row| mask | u64::from(held(row)) << (row - base))
         };
