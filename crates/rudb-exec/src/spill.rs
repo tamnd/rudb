@@ -255,6 +255,8 @@ mod tag {
     pub(super) const TIMESTAMP_MS: u8 = 27;
     pub(super) const TIMESTAMP_NS: u8 = 28;
     pub(super) const UUID: u8 = 29;
+    pub(super) const MAP: u8 = 30;
+    pub(super) const UNION: u8 = 31;
 }
 
 /// Writes one value.
@@ -322,6 +324,28 @@ fn put(out: &mut Sink<'_>, value: &Value, ty: &LogicalType) -> Result<()> {
                 put(out, inner, &field.ty)?;
             }
             Ok(())
+        }
+        Value::Map { entries, .. } => {
+            let LogicalType::Map(key, value_type) = ty else {
+                return Err(mismatch(value, ty));
+            };
+            out.put(&[tag::MAP])?;
+            out.put(&count_of(entries.len())?.to_le_bytes())?;
+            for (k, v) in entries {
+                put(out, k, key)?;
+                put(out, v, value_type)?;
+            }
+            Ok(())
+        }
+        Value::Union { tag, value: inner, .. } => {
+            let LogicalType::Union(members) = ty else {
+                return Err(mismatch(value, ty));
+            };
+            let Some(member) = members.get(usize::from(*tag)) else {
+                return Err(mismatch(value, ty));
+            };
+            out.put(&[tag::UNION, *tag])?;
+            put(out, inner, &member.ty)
         }
         other => Err(Error::not_implemented(format!("spilling a {other:?}"))),
     }
@@ -437,6 +461,29 @@ fn get(reader: &mut BufReader<File>, ty: &LogicalType, reuse: Option<Value>) -> 
             }
             Value::Struct(held)
         }
+        tag::MAP => {
+            let LogicalType::Map(key, value) = ty else {
+                return Err(unexpected(tag, ty));
+            };
+            let count = length(reader)?;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                let k = get(reader, key, None)?;
+                entries.push((k, get(reader, value, None)?));
+            }
+            Value::map((**key).clone(), (**value).clone(), entries)
+        }
+        tag::UNION => {
+            let LogicalType::Union(members) = ty else {
+                return Err(unexpected(tag, ty));
+            };
+            let held = one(reader)?;
+            let Some(member) = members.get(usize::from(held)) else {
+                return Err(Error::internal(format!("a spilled union with tag {held}")));
+            };
+            let value = Box::new(get(reader, &member.ty, None)?);
+            Value::Union { members: members.clone(), tag: held, value }
+        }
         other => {
             return Err(Error::internal(format!("a spill file holds an unknown tag {other}")));
         }
@@ -551,7 +598,30 @@ mod tests {
                     ("b".to_owned(), Value::Varchar("x".into())),
                 ])],
             ),
+            (
+                LogicalType::Map(Box::new(LogicalType::Varchar), Box::new(LogicalType::Integer)),
+                vec![Value::map(
+                    LogicalType::Varchar,
+                    LogicalType::Integer,
+                    vec![(Value::Varchar("k".into()), Value::Integer(1))],
+                )],
+            ),
+            (
+                LogicalType::Union(union_members()),
+                vec![
+                    Value::Union {
+                        members: union_members(),
+                        tag: 1,
+                        value: Box::new(Value::Varchar("x".into())),
+                    },
+                    Value::Union { members: union_members(), tag: 0, value: Box::new(Value::Null) },
+                ],
+            ),
         ]
+    }
+
+    fn union_members() -> Vec<Field> {
+        vec![Field::new("a", LogicalType::Integer), Field::new("b", LogicalType::Varchar)]
     }
 
     /// Every value this can hold comes back as the value that went in.

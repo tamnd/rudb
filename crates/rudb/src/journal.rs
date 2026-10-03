@@ -1074,6 +1074,7 @@ fn carried(ty: &LogicalType) -> bool {
         LogicalType::List(element) => carried(element),
         LogicalType::Struct(fields) => fields.iter().all(|field| carried(&field.ty)),
         LogicalType::Map(key, value) => carried(key) && carried(value),
+        LogicalType::Union(members) => members.iter().all(|member| carried(&member.ty)),
         _ => false,
     }
 }
@@ -1110,6 +1111,7 @@ mod tag {
     pub(super) const TIMESTAMP_MS: u8 = 27;
     pub(super) const TIMESTAMP_NS: u8 = 28;
     pub(super) const UUID: u8 = 29;
+    pub(super) const UNION: u8 = 30;
 }
 
 /// Writes one value of a column of `ty`, or says it cannot.
@@ -1257,6 +1259,13 @@ fn put(out: &mut Vec<u8>, value: &Value, ty: &LogicalType) -> Option<()> {
                 put(out, v, value)?;
             }
         }
+        Value::Union { tag, value, .. } => {
+            let LogicalType::Union(members) = ty else { return None };
+            let member = members.get(usize::from(*tag))?;
+            out.push(tag::UNION);
+            out.push(*tag);
+            put(out, value, &member.ty)?;
+        }
         _ => return None,
     }
     Some(())
@@ -1357,6 +1366,15 @@ fn get(bytes: &[u8], at: &mut usize, ty: &LogicalType) -> Result<Value> {
             }
             Value::map((**key).clone(), (**value).clone(), entries)
         }
+        tag::UNION => {
+            let LogicalType::Union(members) = ty else { return Err(mismatch(tag, ty)) };
+            let held = take(bytes, at, 1)?[0];
+            let member = members
+                .get(usize::from(held))
+                .ok_or_else(|| corrupt(&format!("a logged union with tag {held}")))?;
+            let value = Box::new(get(bytes, at, &member.ty)?);
+            Value::Union { members: members.clone(), tag: held, value }
+        }
         other => return Err(corrupt(&format!("a logged value with tag {other}"))),
     };
     Ok(value)
@@ -1412,6 +1430,8 @@ mod tests {
     fn rows_of_every_carried_type_come_back_as_themselves() {
         let decimal = LogicalType::Decimal { width: 18, scale: 3 };
         let list = LogicalType::List(Box::new(LogicalType::Varchar));
+        let members =
+            vec![Field::new("a", LogicalType::Integer), Field::new("b", LogicalType::Varchar)];
         let pieces = vec![
             column(LogicalType::Boolean, vec![Value::Boolean(true), Value::Null]),
             column(LogicalType::Integer, vec![Value::Integer(-7), Value::Integer(i32::MAX)]),
@@ -1435,6 +1455,17 @@ mod tests {
                         values: vec![Value::Varchar("a".into()), Value::Null],
                     },
                     Value::Null,
+                ],
+            ),
+            column(
+                LogicalType::Union(members.clone()),
+                vec![
+                    Value::Union {
+                        members: members.clone(),
+                        tag: 1,
+                        value: Box::new(Value::Varchar("x".into())),
+                    },
+                    Value::Union { members: members.clone(), tag: 0, value: Box::new(Value::Null) },
                 ],
             ),
         ];
