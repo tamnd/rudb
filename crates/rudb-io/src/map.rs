@@ -140,6 +140,9 @@ mod sys {
 
     #[cfg(target_os = "linux")]
     pub(super) fn release(at: *const u8, start: usize, end: usize) {
+        if std::env::var_os("RUDB_KEEP_MAPPED").is_some() {
+            return;
+        }
         // The mapping itself starts on a page, so rounding the address down stays inside it as
         // long as it does not go below the start.
         let base = at as usize;
