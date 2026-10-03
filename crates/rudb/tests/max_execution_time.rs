@@ -11,7 +11,9 @@ fn a_statement_over_the_limit_is_stopped_in_the_pins_words() {
     database.execute("SET max_execution_time = 1").expect("the setting");
     let error = database.query(SLOW).expect_err("too slow for a millisecond");
     assert_eq!(error.to_string(), "INTERRUPT Error: Query exceeded maximum execution time");
-    // The limit is on each statement, so a quick one after it still runs.
+    // The limit is on each statement and not on the session, so a generous one after it lets a
+    // quick query run however long the session has been open.
+    database.execute("SET max_execution_time = 60000").expect("the setting");
     assert_eq!(database.value("SELECT 42").expect("a quick query").to_string(), "42");
 }
 
