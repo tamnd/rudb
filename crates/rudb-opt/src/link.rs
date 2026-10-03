@@ -633,8 +633,10 @@ fn decided(
         // Asked after the rest of it on purpose. What is above a join is the same whichever way
         // round its sides are read, so asking first would report a shape complaint for a join that
         // has no relationship at all and bury the reason that was actually in the way.
-        let shows = found.scan.is_some() && !absorbed(plan, consumers, at);
-        let why = if why.chosen() && shows { Why::ColumnWouldShow } else { why };
+        // A join found by key adds no row id, and still puts the child's columns first where a
+        // hash join may have put the parent's, which only an operator that names its columns hides.
+        let why =
+            if why.chosen() && !absorbed(plan, consumers, at) { Why::ColumnWouldShow } else { why };
         worst = worst.or(why);
         if why.chosen() {
             return (why, Some(Taken { child, parent, scan: found.scan }));
@@ -1297,6 +1299,37 @@ mod tests {
             about(&plan, &context).to_string(),
             "the relationship is declared and its link is not in the file"
         );
+    }
+
+    #[test]
+    fn a_parent_whose_key_map_is_the_identity_is_found_by_key_without_a_link() {
+        // Declared and never built, which on its own is a hash join. The identity map is enough:
+        // the parent row is the key less the smallest key, so nothing is read off the child but
+        // the key, and the parent's size does not come into it.
+        for parent_rows in [1_500_000, 1_000] {
+            let mut plan = joined("INNER");
+            let mut context = context(parent_rows);
+            let linked = Linked::declared("lineitem", "l_orderkey", "orders", "o_orderkey");
+            context.relate(Arc::new(vec![linked.identity()]));
+            let text = rewritten(&mut plan, &context);
+            assert!(text.contains("LinkJoin INNER"), "the join was not rewritten:\n{text}");
+            assert!(text.contains("key=#0.0::BIGINT"), "the key is not what is read:\n{text}");
+            assert!(!text.contains("file_row_number"), "a row id was asked for:\n{text}");
+            assert_eq!(about(&plan, &context), Why::Keyed);
+        }
+    }
+
+    #[test]
+    fn a_child_gathered_into_another_join_s_hash_table_is_still_found_by_key() {
+        // The rows reaching the join are no longer rows of `lineitem`, which rules out its link
+        // and not its key.
+        let mut plan = under_a_join("right");
+        let mut context = context(1_500_000);
+        let linked = Linked::declared("lineitem", "l_orderkey", "orders", "o_orderkey");
+        context.relate(Arc::new(vec![linked.identity()]));
+        let text = rewritten(&mut plan, &context);
+        assert!(text.contains("LinkJoin INNER"), "the join was not rewritten:\n{text}");
+        assert!(text.contains("key=#0.0::BIGINT"), "the key is not what is read:\n{text}");
     }
 
     #[test]
