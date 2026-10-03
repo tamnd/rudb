@@ -80,6 +80,14 @@ fn a_cast_from_json_reads_the_document_into_the_type() {
             r#"SELECT '883406386745030.3'::JSON::DECIMAL(16,1), '9007199254740993.0'::JSON::DECIMAL(17,1), '{"a":883406386745030.3}'::JSON::STRUCT(a DECIMAL(16,1)), '1.2345678901234567e2'::JSON::DECIMAL(20,16)"#,
             "883406386745030.3|9007199254740993.0|{'a': 883406386745030.3}|123.4567890123456700",
         ),
+        (
+            r#"SELECT row(1, 'a')::JSON, (1, [2])::JSON, to_json(row(1, 'a')), [row(1, 'a')]::JSON, json_object('a', row(1, 2))"#,
+            r#"[1,"a"]|[1,[2]]|[1,"a"]|[[1,"a"]]|{"a":[1,2]}"#,
+        ),
+        (
+            r#"SELECT '[1,"a"]'::JSON::TUPLE(INTEGER, VARCHAR), '[1,"a",3]'::JSON::TUPLE(INTEGER, VARCHAR), '[1]'::JSON::TUPLE(INTEGER, VARCHAR), row(1, 'a')::JSON::TUPLE(INTEGER, VARCHAR), TRY_CAST('{"a":1}'::JSON AS TUPLE(INTEGER, VARCHAR))"#,
+            "(1, a)|(1, a)|(1, NULL)|(1, a)|NULL",
+        ),
     ]);
     let cases = [
         (r#"SELECT '"x"'::JSON::INTEGER"#, r#"Failed to cast value to numerical: "x""#),
@@ -91,6 +99,10 @@ fn a_cast_from_json_reads_the_document_into_the_type() {
         ),
         ("SELECT '1'::JSON::INTEGER[]", "Expected ARRAY, but got UBIGINT: 1"),
         ("SELECT '[1]'::JSON::STRUCT(a INTEGER)", "Expected OBJECT, but got ARRAY: [1]"),
+        (
+            r#"SELECT '{"a":1}'::JSON::TUPLE(INTEGER, VARCHAR)"#,
+            r#"Expected ARRAY, but got OBJECT: {"a":1}"#,
+        ),
         (r#"SELECT '{"a":1}'::JSON::STRUCT(b INTEGER)"#, r#"Object {"a":1} has unknown key "a""#),
         (
             r#"SELECT '{"a":1,"c":2}'::JSON::STRUCT(a INTEGER)"#,

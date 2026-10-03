@@ -856,18 +856,22 @@ fn value_text(
                     }
                 };
             }
-            out.push('{');
+            // An unnamed struct, which the pin calls a TUPLE, is an array of its fields.
+            let unnamed = !fields.is_empty() && fields.iter().all(|(name, _)| name.is_empty());
+            out.push(if unnamed { '[' } else { '{' });
             for (index, (name, item)) in fields.iter().enumerate() {
                 if index > 0 {
                     out.push(',');
                 }
-                string_text(name, out);
-                out.push(':');
+                if !unnamed {
+                    string_text(name, out);
+                    out.push(':');
+                }
                 let field = types.and_then(|types| types.get(index)).map(|field| &field.ty);
                 let held = item.logical_type();
                 value_text(item, field.unwrap_or(&held), zone, out)?;
             }
-            out.push('}');
+            out.push(if unnamed { ']' } else { '}' });
         }
         (Value::Map { key, value: held, entries }, _) => {
             out.push('{');
@@ -1109,7 +1113,9 @@ impl Document {
             return outcome;
         }
         if lenient && outcome.is_err() {
-            if let LogicalType::Struct(fields) = target {
+            if let LogicalType::Struct(fields) = target
+                && !Field::unnamed(fields)
+            {
                 let nulls = fields.iter().map(|field| (field.name.clone(), Value::Null)).collect();
                 return Ok(Value::Struct(nulls));
             }
@@ -1150,6 +1156,20 @@ impl Document {
                     .map(|&child| self.convert(child, element, reading))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Value::List { element: element.as_ref().clone(), values })
+            }
+            // A TUPLE is read from an array by position, where a missing element is a null and
+            // one past the last field is passed over, as the pin's is.
+            LogicalType::Struct(fields) if Field::unnamed(fields) => {
+                let Node::Array(children) = node else { return Err(expected("ARRAY")) };
+                let mut values = Vec::with_capacity(fields.len());
+                for (index, field) in fields.iter().enumerate() {
+                    let value = match children.get(index) {
+                        Some(&child) => self.convert(child, &field.ty, reading)?,
+                        None => Value::Null,
+                    };
+                    values.push((field.name.clone(), value));
+                }
+                Ok(Value::Struct(values))
             }
             LogicalType::Struct(fields) => {
                 let Node::Object(children) = node else { return Err(expected("OBJECT")) };
