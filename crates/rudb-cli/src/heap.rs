@@ -27,6 +27,18 @@
 //! A block of 256 KiB or more does not go to mimalloc at all on Linux. It is mapped from the system
 //! on its own, and kept for the next such block when it is freed, up to [`KEPT_BYTES`];
 //! [`MAPPED_FROM`] and [`Kept`] say why.
+//!
+//! Freed memory goes back to the system after mimalloc's own delay of ten milliseconds. #1429 turned
+//! the purge off for the loads, which free and take gigabytes over and over inside one statement,
+//! and #1636 set it to 100 milliseconds when off held too much on a 32 core load. Since then the
+//! big blocks stopped going through mimalloc at all, and what is left is the small and middle
+//! sized churn of a query. On the eight core server3 the 43 ClickBench queries on the native 10m
+//! table summed 1,526 MB of peak resident memory and 11.38 seconds of user time at 100
+//! milliseconds, and 1,490 MB and 11.04 seconds at ten. Over the 10m Parquet file it was 1,612 MB
+//! and 11.51 seconds against 1,559 MB and 11.32. Loading that file into a native table, three
+//! interleaved runs each, peaked at 1,301 to 1,335 MB at ten against 1,374 to 1,508 MB, for about
+//! 6 percent more system time, 88 seconds against 83, and the same user time.
+//! `MIMALLOC_PURGE_DELAY` in the environment still decides, for a user who wants another trade.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::{c_int, c_long};
@@ -40,9 +52,6 @@ use libmimalloc_sys::{
 /// `mi_option_purge_delay` in mimalloc 2's `mimalloc.h`, the sixteenth entry of `mi_option_e`.
 const PURGE_DELAY: c_int = 15;
 
-/// How long freed memory is held before it goes back to the system, see [`keep_freed_memory`].
-const HELD_FOR_MS: c_long = 100;
-
 // The two calls of mimalloc's option interface this needs. `libmimalloc-sys` declares them only
 // behind a feature that also pulls in a dependency, and they are in the library it links either
 // way, so they are declared here as they are in the header.
@@ -51,37 +60,6 @@ unsafe extern "C" {
     fn mi_option_set(option: c_int, value: c_long);
     #[cfg(test)]
     fn mi_option_get(option: c_int) -> c_long;
-}
-
-/// Tells mimalloc to hold freed memory for a tenth of a second before it gives it back.
-///
-/// By default mimalloc returns freed memory ten milliseconds after it is freed. A load frees and
-/// takes gigabytes over and over inside one statement: the sorted SF1 `lineitem` CTAS peaks at
-/// 2.3GB and mimalloc's own statistics show it purging 4.7GiB along the way, every byte of which
-/// is faulted back in when it is taken again. So #1429 turned the purge off, which over 21
-/// interleaved runs took about 7 percent off that statement's median.
-///
-/// Off was too far for a bigger load. One that builds and drops a stripe's worth of buffers on
-/// thirty two threads at once keeps most of what it dropped, and the ClickBench 100m load on the 32
-/// core gamingpc peaked at 20 to 21 GB on a 31 GB machine with the purge off. At 100 milliseconds
-/// it peaked at 14.4 to 15.1 GB, and the 10m load at 4.7 to 5.5 GB against 7.5, in the same wall
-/// time, 5.81 to 5.88 seconds against 5.83 to 5.92, and about 8 seconds of system time against 5 to
-/// 8. The 43 ClickBench queries on the 10m file summed to 0.294 to 0.299 seconds either way, and
-/// the `lineitem` CTAS had the same median, 2.66 seconds into a file and 0.53 in memory. The
-/// default of ten milliseconds held less again, 4.1 GB on the 10m load, but took nearly twice the
-/// system time on gamingpc and three times on the eight core server3, where 100 milliseconds took
-/// twice. `MIMALLOC_PURGE_DELAY` in the environment still decides, for a user who wants a different
-/// trade.
-pub(crate) fn keep_freed_memory() {
-    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_some() {
-        return;
-    }
-    // SAFETY: an option is an integer mimalloc reads when it next decides whether to purge, and
-    // setting one is allowed at any time, including after the first allocation.
-    #[allow(unsafe_code)]
-    unsafe {
-        mi_option_set(PURGE_DELAY, HELD_FOR_MS);
-    }
 }
 
 /// Tells mimalloc not to give anything back from here on, which is for the moment before the
@@ -94,7 +72,8 @@ pub(crate) fn keep_freed_memory() {
 /// the answer was already written. A purge delay below zero is mimalloc's way of saying never
 /// purge, and the collect at exit reads it.
 pub(crate) fn keep_everything_at_exit() {
-    // SAFETY: as in [`keep_freed_memory`].
+    // SAFETY: an option is an integer mimalloc reads when it next decides whether to purge, and
+    // setting one is allowed at any time, including after the first allocation.
     #[allow(unsafe_code)]
     unsafe {
         mi_option_set(PURGE_DELAY, -1);
@@ -597,23 +576,18 @@ mod tests {
 
     use super::{
         GIVEN, KEPT_BLOCKS, KEPT_BYTES, Kept, MAPPED_FROM, MAPS, MiMalloc, PAGE, ROUNDED_FROM,
-        ROUNDED_UPTO, binned, given, keep_everything_at_exit, keep_freed_memory, mapped,
-        purge_delay,
+        ROUNDED_UPTO, binned, given, keep_everything_at_exit, mapped, purge_delay,
     };
 
-    /// The option set is the purge delay, which mimalloc 2 starts at ten milliseconds, and not some
-    /// other entry of the enum the constant could have drifted to, and the one set at exit turns
-    /// purging off.
+    /// The option read and set is the purge delay, which mimalloc 2 starts at ten milliseconds, and
+    /// not some other entry of the enum the constant could have drifted to, and the one set at exit
+    /// turns purging off.
     #[test]
-    fn keeping_freed_memory_sets_the_purge_delay() {
+    fn keeping_everything_at_exit_sets_the_purge_delay() {
         if std::env::var_os("MIMALLOC_PURGE_DELAY").is_some() {
             return;
         }
         assert_eq!(purge_delay(), 10, "mimalloc's own default");
-        keep_freed_memory();
-        assert_eq!(purge_delay(), 100);
-        // In the same test rather than one of its own, because the option is process wide and the
-        // tests run at once.
         keep_everything_at_exit();
         assert_eq!(purge_delay(), -1);
     }
