@@ -2730,12 +2730,11 @@ impl StableLike {
             let upto =
                 at + codes[at..].partition_point(|&code| (code as usize) < first + LIKE_GROUP);
             let last = (first + LIKE_GROUP).min(self.dictionary.len());
-            if once && (upto - at) * CROWDED >= LIKE_GROUP {
-                // A group a chunk asks about this many values of is searched where it lies, the
-                // way a scan's group is, rather than copied out a value at a time.
+            if once && ((upto - at) * CROWDED >= LIKE_GROUP || self.touched(first, last)) {
+                // A group a chunk asks about this many values of, or one an earlier chunk read
+                // already, is searched where it lies, the way a scan's group is, rather than
+                // copied out a value at a time.
                 self.decide_group(first, like, characters)?;
-            } else if once && self.touched(first, last) {
-                wanted.extend(first..last);
             } else if !self.ruled_out(first, last, like)? {
                 wanted.extend(codes[at..upto].iter().map(|&code| code as usize));
             }
@@ -2814,6 +2813,10 @@ impl StableLike {
     /// the same block again for every chunk that landed in it, and the source kept the block to
     /// make that cheap: on ClickBench q23 that was 86 MB of `Title` and `URL` held for a filter
     /// whose answers are two bits a value.
+    ///
+    /// The whole group is searched in its block rather than copied out first. Copying it cost JOB
+    /// 14b 934 thousand titles a run to decide the 99 thousand its year and kind leave, since its
+    /// chunks come back to the same groups, and the copy was most of the query.
     fn touched(&self, first: usize, last: usize) -> bool {
         self.state[first / MEMO_VALUES..last.div_ceil(MEMO_VALUES)]
             .iter()
