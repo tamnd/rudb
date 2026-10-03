@@ -591,7 +591,9 @@ fn bind_one(
             let copy = &ast.copies[index as usize];
             let mut binder = Binder::with(catalog, parameters, session);
             let (root, _) = binder.bind_query(ast, copy.query)?;
-            copy_to(copy, finish(binder, root)?).map(Bound::CopyTo)
+            let plan = finish(binder, root)?;
+            let typed = copy_values(ast, copy, catalog, parameters, session);
+            copy_to(copy, &typed, plan).map(Bound::CopyTo)
         }
         // The connection holds prepared statements, so the database runs these three itself and
         // only a caller that hands one straight to the binder gets here.
@@ -603,12 +605,138 @@ fn bind_one(
     }
 }
 
+/// The type and the value one `COPY ... TO` option was written as.
+struct Written {
+    ty: LogicalType,
+    value: Option<Value>,
+}
+
+impl Written {
+    /// Whether the option was written as a NULL of any type.
+    fn null(&self) -> bool {
+        self.value.as_ref().is_some_and(Value::is_null)
+    }
+}
+
+/// What each option of a `COPY ... TO` was written as, for the checks the pin makes of an option's
+/// type before it reads the value. One written bare, as a word, or as anything that does not bind
+/// over no rows has none and is read from its text.
+fn copy_values(
+    ast: &Ast,
+    copy: &ast::CopyTo,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+) -> Vec<Option<Written>> {
+    let written = |expr: ast::ExprRef| {
+        if expr == NONE {
+            return None;
+        }
+        let mut binder = Binder::with(catalog, parameters, session);
+        let bound = binder.bind_expr(ast, expr, &crate::scope::Scope::empty()).ok()?;
+        let ty = binder.plan().expr_type(bound).clone();
+        let value = crate::fold::value_of(binder.plan(), bound).ok().flatten();
+        Some(Written { ty, value })
+    };
+    copy.values.iter().map(|&expr| written(expr)).collect()
+}
+
+/// The options of a JSON `COPY ... TO`, the ones the pin takes whether or not this does.
+const JSON_OPTIONS: [&str; 19] = [
+    "format",
+    "array",
+    "dateformat",
+    "date_format",
+    "timestampformat",
+    "timestamp_format",
+    "compression",
+    "encoding",
+    "per_thread_output",
+    "file_size_bytes",
+    "partition_by",
+    "overwrite",
+    "overwrite_or_ignore",
+    "filename_pattern",
+    "file_extension",
+    "use_tmp_file",
+    "return_files",
+    "write_partition_columns",
+    "preserve_order",
+];
+
+/// Refuses an option written as NULL, or as a value of a type other than the string an option
+/// that names something takes, in the pin's words and in the pin's order.
+///
+/// A JSON `COPY` looks at a bare `NULL` first, for every option it knows, and says so in its own
+/// words. A NULL of a written type, and a NULL for the other formats, is refused before the format
+/// sees it. A file name pattern and a compression are cast to a string before the format sees them,
+/// and the pin calls any other type one that could not be cast.
+fn refuse_written(copy: &ast::CopyTo, typed: &[Option<Written>], format: &str) -> Result<()> {
+    let options = || copy.options.iter().map(|(name, _)| name.as_str()).zip(typed);
+    let json = format == "json";
+    let bare = |written: &Written| written.null() && written.ty == LogicalType::Null;
+    if json {
+        for (name, written) in options() {
+            if written.as_ref().is_some_and(bare) && JSON_OPTIONS.contains(&name) {
+                return Err(Error::binder(format!(
+                    "COPY (FORMAT JSON) parameter \"{name}\" cannot be NULL."
+                )));
+            }
+        }
+    }
+    for (name, written) in options() {
+        let Some(written) = written else { continue };
+        // A bare NULL for `HEADER` is refused here for every format, before JSON says it does
+        // not know the option.
+        if written.null() && (!json || !bare(written) || name == "header") {
+            return Err(Error::binder(format!(
+                "NULL is not supported as a valid option for COPY option \"{name}\""
+            )));
+        }
+    }
+    for (name, written) in options() {
+        let Some(written) = written else { continue };
+        if !written.null()
+            && written.ty != LogicalType::Varchar
+            && matches!(name, "filename_pattern" | "compression")
+        {
+            let value = written.value.as_ref().map(Value::to_string).unwrap_or_default();
+            return Err(Error::invalid_input(format!(
+                "Copy option \"{name}\" expected an argument of type VARCHAR - the argument \
+                 \"{value}\" of type {} could not be cast as this type",
+                written.ty
+            )));
+        }
+    }
+    if json {
+        for (name, written) in options() {
+            let Some(written) = written else { continue };
+            let named = matches!(
+                name,
+                "dateformat"
+                    | "date_format"
+                    | "timestampformat"
+                    | "timestamp_format"
+                    | "file_extension"
+            );
+            if named && !written.null() && written.ty != LogicalType::Varchar {
+                return Err(Error::binder(format!(
+                    "COPY (FORMAT JSON) parameter \"{name}\" expects a VARCHAR argument, but got \
+                     {}.",
+                    written.ty
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reads the options of a `COPY ... TO` against the format they are for.
 ///
 /// CSV, JSON and Parquet are written, the format picked by the file's extension unless `FORMAT`
 /// names one. An option the pin takes and this does not is
 /// refused by name, and one the pin does not take either gets the first line of its refusal.
-fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
+fn copy_to(copy: &ast::CopyTo, typed: &[Option<Written>], plan: Plan) -> Result<CopyTo> {
     let lowered = copy.path.to_ascii_lowercase();
     let mut format = if lowered.ends_with(".parquet") {
         "parquet"
@@ -621,15 +749,14 @@ fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     if let Some((_, Some(written))) = copy.options.iter().rev().find(|(name, _)| name == "format") {
         format = written.trim_matches('\'').to_ascii_lowercase();
     }
+    if !matches!(format.as_str(), "csv" | "json" | "parquet") {
+        return Err(Error::catalog(format!("Copy Function with name {format} does not exist!")));
+    }
+    refuse_written(copy, typed, &format)?;
     match format.as_str() {
-        "csv" => {}
         "json" => return json_to(copy, plan),
         "parquet" => return parquet_to(copy, plan),
-        _ => {
-            return Err(Error::catalog(format!(
-                "Copy Function with name {format} does not exist!"
-            )));
-        }
+        _ => {}
     }
     let mut out = CopyTo {
         plan,
@@ -769,6 +896,11 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             "timestampformat" | "timestamp_format" => {
                 out.timestamp_format = Some(json_format(name, value)?);
             }
+            "encoding" => {
+                return Err(Error::invalid_input(
+                    "Option \"encoding\" is not supported for writing - only for reading",
+                ));
+            }
             "compression"
             | "per_thread_output"
             | "file_size_bytes"
@@ -785,9 +917,16 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                     "COPY TO with the option {name} is not supported yet"
                 )));
             }
-            _ => {
+            // The pin quotes the names of the options that have a spelling of their own in the
+            // grammar, and only those.
+            "header" | "delimiter" | "quote" | "escape" => {
                 return Err(Error::binder(format!(
                     "Unknown option for COPY ... TO ... (FORMAT JSON): \"{name}\"."
+                )));
+            }
+            _ => {
+                return Err(Error::binder(format!(
+                    "Unknown option for COPY ... TO ... (FORMAT JSON): {name}."
                 )));
             }
         }
