@@ -248,8 +248,8 @@ pub(crate) enum Clash {
 struct Claims {
     /// The revision its snapshot was taken at.
     at: u64,
-    /// By table and by whether the rows were deleted rather than updated.
-    tables: HashMap<(i64, bool), Marks>,
+    /// By table, updated and deleted rows together.
+    tables: HashMap<i64, Marks>,
     /// The tables it created, whose names nobody else may create until it is done.
     creating: Vec<QualifiedName>,
 }
@@ -283,7 +283,6 @@ impl Marks {
 #[derive(Debug)]
 struct Done {
     oid: i64,
-    delete: bool,
     /// The revision the commit drew.
     at: u64,
     marks: Marks,
@@ -300,19 +299,20 @@ impl Registry {
     /// Whether a write of `marks` in the table `oid` meets a row another open transaction wrote, or
     /// a row committed after revision `since`. `me` is the transaction writing, if it is one.
     ///
-    /// An update only meets updates and a delete only meets deletes, which is what the pin does:
-    /// one transaction may delete a row another has updated, both commit, and the delete wins when
-    /// it commits last.
+    /// An update also meets a delete of the same row, and the other way round. The pin lets both
+    /// commit and the update is lost when the delete commits last, so rudb diverges on purpose
+    /// here (`18-compat.md` section 18.8, question 2).
     pub(crate) fn clashes(
         &self,
         me: Option<u64>,
-        (oid, delete): (i64, bool),
+        oid: i64,
         marks: &Marks,
         since: u64,
     ) -> Option<Clash> {
-        let done = self.done.iter().any(|done| {
-            done.oid == oid && done.delete == delete && done.at > since && done.marks.meets(marks)
-        });
+        let done = self
+            .done
+            .iter()
+            .any(|done| done.oid == oid && done.at > since && done.marks.meets(marks));
         if done {
             return Some(Clash::Done);
         }
@@ -320,9 +320,7 @@ impl Registry {
         self.open
             .iter()
             .filter(|(id, _)| Some(**id) != me)
-            .filter(|(_, claims)| {
-                claims.tables.get(&(oid, delete)).is_some_and(|held| held.meets(marks))
-            })
+            .filter(|(_, claims)| claims.tables.get(&oid).is_some_and(|held| held.meets(marks)))
             .map(|(id, _)| *id)
             .min()
             .map(Clash::Open)
@@ -340,26 +338,26 @@ impl Registry {
     }
 
     /// Records that transaction `me` wrote `marks` in the table `oid`.
-    pub(crate) fn mark(&mut self, me: u64, key: (i64, bool), marks: Marks) {
+    pub(crate) fn mark(&mut self, me: u64, oid: i64, marks: Marks) {
         let Some(claims) = self.open.get_mut(&me) else { return };
-        match claims.tables.get_mut(&key) {
+        match claims.tables.get_mut(&oid) {
             Some(held) if held.frame == marks.frame => {
                 held.all |= marks.all;
                 held.rows.extend(marks.rows);
             }
             Some(held) => held.all = true,
             None => {
-                claims.tables.insert(key, marks);
+                claims.tables.insert(oid, marks);
             }
         }
     }
 
     /// Records rows a statement outside any transaction changed, for the open transactions whose
     /// snapshots are older than it.
-    pub(crate) fn committed(&mut self, (oid, delete): (i64, bool), marks: Marks) {
+    pub(crate) fn committed(&mut self, oid: i64, marks: Marks) {
         if !self.open.is_empty() {
             let at = rudb_catalog::next_revision();
-            self.done.push(Done { oid, delete, at, marks });
+            self.done.push(Done { oid, at, marks });
         }
     }
 
@@ -389,8 +387,8 @@ impl Registry {
         let Some(claims) = self.open.remove(&me) else { return };
         if committed && !self.open.is_empty() {
             let at = rudb_catalog::next_revision();
-            for ((oid, delete), marks) in claims.tables {
-                self.done.push(Done { oid, delete, at, marks });
+            for (oid, marks) in claims.tables {
+                self.done.push(Done { oid, at, marks });
             }
         }
         match self.open.values().map(|claims| claims.at).min() {
