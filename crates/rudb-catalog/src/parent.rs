@@ -675,6 +675,7 @@ impl Parent {
         let Some(whole) = concat_on(ty, &pieces, spread)? else {
             return Ok(None);
         };
+        let whole = packed(whole)?;
         // Measured again on the result, because laying the pieces end to end is where a string
         // column's arena is sized and the answer is not the sum of the pieces.
         if whole.footprint() > room {
@@ -720,6 +721,29 @@ impl Parent {
         // decoded. See the module doc for why this is a decode the hash join pays as well.
         Ok(Some(piece.flatten()?))
     }
+}
+
+/// A whole integer column bit packed over its own range, when that is smaller and the gather can
+/// read it packed.
+///
+/// A link join gathers from the whole column at row ids in no order, and on TPC-H q09 that is a
+/// few hundred thousand lineitem rows reaching into `ps_supplycost` and `o_orderdate`, which flat
+/// are 6.4 MB and 6 MB. Each gathered row is a load from somewhere in those, and together they are
+/// more than the last level cache of a small machine, so the loads go to memory. Packed over the
+/// column's range they are 1.7 MB and 2.3 MB, and a row is a shift and a mask more than a load,
+/// which is cheap next to a miss. The parts were packed in the file already; this packs the column
+/// once more over the whole range instead of each part over its own, since a part's base and width
+/// are not the column's.
+///
+/// Only a column with no nulls and a 16, 32 or 64 bit layout, because that is the packed form the
+/// gather reads without unpacking it first. Anything else stays as it was.
+fn packed(whole: Vector) -> Result<Vector> {
+    use rudb_common::PhysicalType as P;
+    let fits = matches!(whole.logical_type().physical(), P::Int16 | P::Int32 | P::Int64);
+    if !fits || whole.form() != Form::Flat || whole.validity().has_nulls(whole.len()) {
+        return Ok(whole);
+    }
+    whole.bit_packed()
 }
 
 /// The parts a chunk of rising row ids reaches, each with the offsets of its rows in it, or `None`
@@ -945,6 +969,23 @@ mod tests {
         assert_eq!(column.value_at(500), Value::Integer(500), "part boundaries do not renumber");
     }
 
+    /// A whole integer column comes back packed over its range, and a gather out of it at row ids
+    /// in no order reads the same values the flat column held.
+    #[test]
+    fn a_whole_integer_column_is_packed_and_gathers_the_same_values() {
+        let values: Vec<i32> = (0..4096).map(|row| 100_000 + (row * 7919) % 3000).collect();
+        let parent = Parent::new(table(&values, 512), 64 * 1024 * 1024);
+        let column = parent.column(0, &LogicalType::Integer).expect("read").expect("it fits");
+        assert_eq!(column.form(), Form::BitPacked);
+        assert!(column.footprint() < 4096 * 4 / 2, "packed is smaller than flat");
+        let rids: Vec<u32> =
+            (0..4096u32).map(|row| row.wrapping_mul(2_654_435_761) % 4096).collect();
+        let gathered = column.gather(&rids).expect("gathered");
+        for (at, &rid) in rids.iter().enumerate() {
+            assert_eq!(gathered.value_at(at), Value::Integer(values[rid as usize]));
+        }
+    }
+
     /// Asked twice, read once, and the same allocation both times. A link join asks per chunk of
     /// the child, so a column that were read per ask would be read a thousand times.
     #[test]
@@ -978,7 +1019,10 @@ mod tests {
         // its own. A column of one part comes back as a share of the table's page, and since #1491
         // a share of a page the table is holding anyway is charged as the share it is.
         for part in 0..2 {
-            let held: Vec<Value> = (part * 1000..part * 1000 + 1000).map(Value::Integer).collect();
+            // Spread over the whole of an `i32`, so that the column is not packed smaller.
+            let held: Vec<Value> = (part * 1000..part * 1000 + 1000)
+                .map(|row| Value::Integer(row.wrapping_mul(2_000_006_014)))
+                .collect();
             let first = Vector::from_values(LogicalType::Integer, &held).expect("a column");
             let second = Vector::from_values(LogicalType::Integer, &held).expect("a column");
             rows.append(Chunk::new(vec![first, second]).expect("a chunk")).expect("appended");
@@ -1229,9 +1273,9 @@ mod tests {
         let placed = parent.place(&[3, 5]).expect("placed");
         parent.gather(0, &LogicalType::Integer, &placed).expect("read").expect("fits");
         let one = parent.footprint();
-        let whole = Parent::new(table(&values, 128), 64 * 1024 * 1024);
-        whole.column(0, &LogicalType::Integer).expect("read").expect("fits");
-        assert!(one * 4 < whole.footprint(), "{one} bytes read for one part of eight");
+        // Against the column flat, since the column read whole comes back packed.
+        let flat = values.len() * size_of::<i32>();
+        assert!(one * 4 < flat, "{one} bytes read for one part of eight");
     }
 
     /// A chunk with no parent at all is nulls, and a string column over several parts comes back
