@@ -8019,6 +8019,34 @@ mod tests {
         }
     }
 
+    /// Which rows of a block hold a code in a range, for cuts that do and do not start a word, at
+    /// widths the lanes take and widths they do not, up to the last block of the words.
+    #[test]
+    fn a_packed_block_says_which_rows_are_in_a_range_as_each_row_does() {
+        let words: Vec<u64> =
+            (0..400_u64).map(|word| word.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        for width in [1, 4, 7, 13, 25, 26, 33] {
+            let rows = 400 * 64 / width as usize;
+            let whole = Vector::packed(LogicalType::BigInt, words.clone(), width, 0, rows)
+                .expect("the codes the words hold");
+            let top = (1_u64 << width) - 1;
+            for at in [0, 1, 64, 130] {
+                let cut = whole.slice(at, rows - at).expect("a cut inside the column");
+                let packed = cut.packed_parts().expect("a cut stays packed");
+                for (low, span) in [(0, top), (top / 3, top / 4), (top, 0), (top + 1, 5)] {
+                    for from in (0..=rows - at - 64).step_by(64).chain([rows - at - 64]) {
+                        let want = (0..64).fold(0, |word, bit| {
+                            let held = packed.code(from + bit).wrapping_sub(low) <= span;
+                            word | u64::from(held) << bit
+                        });
+                        let got = packed.within(from, low, span);
+                        assert_eq!(got, want, "width {width} cut {at} rows {from} range {low}+{span}");
+                    }
+                }
+            }
+        }
+    }
+
     /// A packed column flattened whole, cut at rows that do and do not start a word, answers what
     /// a row at a time answers, and a column with nulls in it keeps them.
     #[test]
