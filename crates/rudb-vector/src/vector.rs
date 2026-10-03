@@ -969,6 +969,7 @@ impl Vector {
                 return Ok(list);
             }
             LogicalType::Struct(fields) => return Self::struct_from_values(fields, values),
+            LogicalType::Union(members) => return Self::union_from_values(members, values),
             LogicalType::Map(key, value) => {
                 return Self::map_from_values(key.as_ref().clone(), value.as_ref().clone(), values);
             }
@@ -1121,6 +1122,50 @@ impl Vector {
         let validity = Validity::from_iter(values.len(), |index| !values[index].is_null());
         Ok(Self {
             ty: LogicalType::Struct(fields.to_vec()),
+            len: values.len(),
+            validity,
+            body: Body::Fields { children },
+        })
+    }
+
+    /// A union vector of `members`, built from one [`Value::Union`] per row.
+    ///
+    /// Laid out as the pin lays one out, as a struct whose first child is the tag, a `UTINYINT`
+    /// holding the position of the member each row holds, and whose other children are the
+    /// members, each a null on every row that holds another one. A null row is a null tag as well
+    /// as a false bit in the mask, so that a null union and a union holding a null member stay
+    /// apart.
+    fn union_from_values(members: &[Field], values: &[Value]) -> Result<Self> {
+        let mut tags = Vec::with_capacity(values.len());
+        let mut columns = vec![Vec::with_capacity(values.len()); members.len()];
+        for value in values {
+            match value {
+                Value::Null => {
+                    tags.push(Value::Null);
+                    columns.iter_mut().for_each(|column| column.push(Value::Null));
+                }
+                Value::Union { tag, value, .. } if usize::from(*tag) < members.len() => {
+                    tags.push(Value::UTinyInt(*tag));
+                    for (at, column) in columns.iter_mut().enumerate() {
+                        let held = at == usize::from(*tag);
+                        column.push(if held { value.as_ref().clone() } else { Value::Null });
+                    }
+                }
+                other => {
+                    return Err(Error::internal(format!(
+                        "{other:?} does not belong in a union vector"
+                    )));
+                }
+            }
+        }
+        let mut children = Vec::with_capacity(members.len() + 1);
+        children.push(Arc::new(Self::from_values(LogicalType::UTinyInt, &tags)?));
+        for (member, column) in members.iter().zip(&columns) {
+            children.push(Arc::new(Self::from_values(member.ty.clone(), column)?));
+        }
+        let validity = Validity::from_iter(values.len(), |index| !values[index].is_null());
+        Ok(Self {
+            ty: LogicalType::Union(members.to_vec()),
             len: values.len(),
             validity,
             body: Body::Fields { children },
@@ -2369,6 +2414,10 @@ impl Vector {
             // function is and is why a kernel over a struct column reads `struct_parts` instead. The
             // names come from this vector's type rather than from the children, because a child is a
             // vector and a vector has no name, and the type is where the field order is written down.
+            Body::Fields { children } if matches!(self.ty, LogicalType::Union(_)) => {
+                union_row(&self.ty, children, index, |child, at| Ok(child.value_at(at)))
+                    .unwrap_or(Value::Null)
+            }
             Body::Fields { children } => Value::Struct(
                 fields_of(&self.ty)
                     .iter()
@@ -2428,6 +2477,9 @@ impl Vector {
                 }
                 (None, _) => Ok(Value::Null),
             },
+            Body::Fields { children } if matches!(self.ty, LogicalType::Union(_)) => {
+                union_row(&self.ty, children, index, |child, at| child.try_value_at(at))
+            }
             Body::Fields { children } => {
                 let mut values = Vec::with_capacity(children.len());
                 for (field, child) in fields_of(&self.ty).iter().zip(children) {
@@ -3876,6 +3928,7 @@ impl Vector {
                         | LogicalType::Array(..)
                         | LogicalType::Struct(_)
                         | LogicalType::Map(_, _)
+                        | LogicalType::Union(_)
                 ) =>
             {
                 if forms_stay && matches!(validity, Validity::AllValid) {
@@ -5212,6 +5265,21 @@ fn fields_of(ty: &LogicalType) -> &[Field] {
     }
 }
 
+/// Row `index` of a union vector's children, the tag first and then the members, read with
+/// `read`. A row whose tag is a null or names no member is a null.
+fn union_row(
+    ty: &LogicalType,
+    children: &[Arc<Vector>],
+    index: usize,
+    read: impl Fn(&Vector, usize) -> Result<Value>,
+) -> Result<Value> {
+    let LogicalType::Union(members) = ty else { return Ok(Value::Null) };
+    let Some(tags) = children.first() else { return Ok(Value::Null) };
+    let Value::UTinyInt(tag) = read(tags, index)? else { return Ok(Value::Null) };
+    let Some(member) = children.get(usize::from(tag) + 1) else { return Ok(Value::Null) };
+    Ok(Value::Union { members: members.clone(), tag, value: Box::new(read(member, index)?) })
+}
+
 /// One row of a string column as a value, given what its bytes are meant to be read as.
 ///
 /// Both forms that hold strings come through here, so a row that is a `BLOB` in a flat column is a
@@ -5271,7 +5339,8 @@ impl Builder {
             LogicalType::List(_)
             | LogicalType::Array(..)
             | LogicalType::Struct(_)
-            | LogicalType::Map(..) => Held::Values(Vec::with_capacity(room)),
+            | LogicalType::Map(..)
+            | LogicalType::Union(_) => Held::Values(Vec::with_capacity(room)),
             _ => data_for(ty, room).map_or_else(|_| Held::Values(Vec::new()), Held::Flat),
         }
     }
