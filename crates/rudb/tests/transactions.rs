@@ -96,16 +96,40 @@ fn a_second_create_of_one_name_fails_at_once() {
 }
 
 #[test]
-fn an_update_and_a_delete_of_one_row_both_commit_and_the_last_wins() {
+fn a_delete_of_a_row_another_transaction_updated_fails_at_once() {
+    // The pin lets both commit and loses the update. rudb refuses the second write instead.
     let (_database, one, two) = two();
     one.execute("INSERT INTO t VALUES (3, 30)").expect("inserts");
     one.execute("BEGIN").expect("begins");
     two.execute("BEGIN").expect("begins");
     one.execute("UPDATE t SET v = 100 WHERE id = 1").expect("updates");
-    two.execute("DELETE FROM t WHERE id = 1").expect("deletes");
+    fails(&two, "DELETE FROM t WHERE id = 1", "Conflict on tuple deletion!");
     one.execute("COMMIT").expect("commits");
-    two.execute("COMMIT").expect("commits");
-    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(2, 20), (3, 30)]));
+    two.execute("ROLLBACK").expect("rolls back");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 100), (2, 20), (3, 30)]));
+}
+
+#[test]
+fn an_update_of_a_row_another_transaction_deleted_fails_at_once() {
+    let (_database, one, two) = two();
+    one.execute("BEGIN").expect("begins");
+    two.execute("BEGIN").expect("begins");
+    one.execute("DELETE FROM t WHERE id = 1").expect("deletes");
+    fails(&two, "UPDATE t SET v = 100 WHERE id = 1", "Conflict on update!");
+    one.execute("COMMIT").expect("commits");
+    two.execute("ROLLBACK").expect("rolls back");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(2, 20)]));
+}
+
+#[test]
+fn an_update_of_a_row_deleted_after_the_snapshot_fails() {
+    let (_database, one, two) = two();
+    two.execute("BEGIN").expect("begins");
+    assert_eq!(two.value("SELECT count(*) FROM t").expect("reads"), Value::BigInt(2));
+    one.execute("DELETE FROM t WHERE id = 1").expect("deletes");
+    fails(&two, "UPDATE t SET v = 100 WHERE id = 1", "Conflict on update!");
+    two.execute("ROLLBACK").expect("rolls back");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(2, 20)]));
 }
 
 #[test]

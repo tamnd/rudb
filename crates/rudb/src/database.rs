@@ -4017,7 +4017,7 @@ impl Shared {
         flagged: &[u64],
         scanned: usize,
     ) -> Result<Option<txn::Marks>> {
-        let key = (table.oid(), delete);
+        let oid = table.oid();
         let whole = scanned != table.rows().len();
         let open = self.open();
         let registry = self.registry();
@@ -4031,14 +4031,14 @@ impl Shared {
                     None => flagged.iter().copied().filter(|&row| row < base).collect(),
                 };
                 let marks = txn::Marks { frame, rows, all: whole };
-                let clash = registry.clashes(Some(snapshot.id), key, &marks, snapshot.at);
+                let clash = registry.clashes(Some(snapshot.id), oid, &marks, snapshot.at);
                 self.clashed(&registry, Some(snapshot.id), clash, delete)?;
                 marks
             }
             None if registry.watched() => {
                 let rows = if whole { BTreeSet::new() } else { flagged.iter().copied().collect() };
                 let marks = txn::Marks { frame: table.frame(), rows, all: whole };
-                let clash = registry.clashes(None, key, &marks, u64::MAX);
+                let clash = registry.clashes(None, oid, &marks, u64::MAX);
                 self.clashed(&registry, None, clash, delete)?;
                 marks
             }
@@ -4072,12 +4072,12 @@ impl Shared {
 
     /// Keeps the rows an update or a delete changed as claimed, by this connection's transaction
     /// until it ends, or as committed for the transactions open now.
-    fn claimed(&self, oid: i64, delete: bool, marks: txn::Marks) {
+    fn claimed(&self, oid: i64, marks: txn::Marks) {
         let id = self.open().as_ref().and_then(|open| open.snapshot.as_ref()).map(|held| held.id);
         let mut registry = self.registry();
         match id {
-            Some(id) => registry.mark(id, (oid, delete), marks),
-            None => registry.committed((oid, delete), marks),
+            Some(id) => registry.mark(id, oid, marks),
+            None => registry.committed(oid, marks),
         }
     }
 
@@ -5372,7 +5372,7 @@ impl Shared {
                         });
                         catalog.table_mut(name)?.patch_rows(&flagged, &targets, &changed)?;
                         if let Some(marks) = claim {
-                            self.claimed(oid, false, marks);
+                            self.claimed(oid, marks);
                         }
                         self.wrote(oid, |written, _| written.updated(&flagged, &changed));
                         if let Some(record) = staged
@@ -5456,7 +5456,7 @@ impl Shared {
                             table.update_all(kept, workers)?;
                         }
                         if let Some(marks) = claim {
-                            self.claimed(oid, delete, marks);
+                            self.claimed(oid, marks);
                         }
                         self.wrote(oid, |written, base| {
                             if scanned != len {
