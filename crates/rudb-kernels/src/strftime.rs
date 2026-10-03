@@ -8,7 +8,9 @@
 //! The four locale ones are not locales at all upstream. `%c` is the ISO timestamp, `%x` the ISO
 //! date and `%X` and `%T` the ISO time, and they are spliced in as the specifiers they stand for.
 
-use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
+use rudb_common::{
+    Error, LogicalType, Result, SessionTimeZone, Value, civil_from_days, days_from_civil,
+};
 
 use rudb_vector::{Form, Vector};
 
@@ -233,6 +235,17 @@ impl Format {
     /// If the value is not one of those, which the binder does not let through.
     pub fn write(&self, when: &Value) -> Result<Value> {
         self.write_in(when, None)
+    }
+
+    /// Writes a `TIMESTAMPTZ` instant out as the wall clock it shows in `zone`, which is what
+    /// `strftime` answers for one under the session's time zone.
+    ///
+    /// # Errors
+    ///
+    /// The ones of [`Format::write`], and a wall clock past the range of a timestamp.
+    pub fn write_zoned(&self, micros: i64, zone: SessionTimeZone) -> Result<Value> {
+        let wall = Value::TimestampTz(crate::zoned::wall_of(micros, zone)?);
+        self.write_in(&wall, Some((zone.offset_seconds_at(micros), zone.name())))
     }
 
     /// Writes a moment out the way [`Format::write`] does, with `zone` the offset and the zone

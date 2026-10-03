@@ -168,6 +168,61 @@ fn json_doubles_nesting_and_escapes_are_the_pins() {
 }
 
 #[test]
+fn a_json_date_or_timestamp_is_written_through_the_format_given() {
+    let db = Database::new();
+    db.execute("SET TimeZone = 'Europe/Berlin'").expect("sets");
+    assert_eq!(
+        written(
+            &db,
+            "formats",
+            "COPY (SELECT DATE '1996-03-27' AS d, TIMESTAMP '1996-03-27 07:42:33' AS t, \
+             [DATE '2000-01-02'] AS l, {'x': TIMESTAMP '2001-02-03 04:05:06'} AS s, \
+             TIMESTAMPTZ '2001-02-03 04:05:06+00' AS tz, TIME '01:02:03' AS tm, NULL::DATE AS n, \
+             '2001-02-03 04:05:06.5'::TIMESTAMP_MS AS ms, '2001-02-03 04:05:06'::TIMESTAMP_S AS sec, \
+             '2001-02-03 04:05:06.123456789'::TIMESTAMP_NS AS ns, 'infinity'::DATE AS inf, \
+             MAP {DATE '2000-01-02': 1} AS m) TO 'FILE' \
+             (FORMAT json, dateformat '%d/%m/%Y', timestampformat '%Y %H %n')"
+        ),
+        "{\"d\":\"27/03/1996\",\"t\":\"1996 07 000000000\",\"l\":[\"02/01/2000\"],\
+         \"s\":{\"x\":\"2001 04 000000000\"},\"tz\":\"2001 05 000000000\",\"tm\":\"01:02:03\",\
+         \"n\":null,\"ms\":\"2001 04 500000000\",\"sec\":\"2001 04 000000000\",\
+         \"ns\":\"2001 04 123456789\",\"inf\":\"infinity\",\"m\":{\"02/01/2000\":1}}\n"
+    );
+    let pair = "SELECT DATE '1996-03-27' AS d, TIMESTAMP '1996-03-27 07:42:33' AS t";
+    assert_eq!(
+        written(&db, "date", &format!("COPY ({pair}) TO 'FILE' (FORMAT json, dateformat '%d')")),
+        "{\"d\":\"27\",\"t\":\"1996-03-27 07:42:33\"}\n"
+    );
+    assert_eq!(
+        written(
+            &db,
+            "stamp",
+            &format!("COPY ({pair}) TO 'FILE' (FORMAT json, timestampformat '%H', array true)")
+        ),
+        "[\n\t{\"d\":\"1996-03-27\",\"t\":\"07\"}\n]\n"
+    );
+    for (option, message) in [
+        (
+            "dateformat",
+            "Binder Error: COPY (FORMAT JSON) parameter \"dateformat\" expects a single argument.",
+        ),
+        (
+            "timestampformat NULL",
+            "Binder Error: COPY (FORMAT JSON) parameter \"timestampformat\" cannot be NULL.",
+        ),
+        (
+            "dateformat '%Q'",
+            "Invalid Input Error: Failed to parse format specifier %Q: Unrecognized format for \
+             strftime/strptime: %Q",
+        ),
+    ] {
+        let sql = format!("COPY (SELECT 1 AS x) TO 'o.json' (FORMAT json, {option})");
+        let error = db.execute(&sql).expect_err(&sql).to_string();
+        assert_eq!(error, message, "{sql}");
+    }
+}
+
+#[test]
 fn json_options_are_the_pins() {
     let db = Database::new();
     for (sql, message) in [

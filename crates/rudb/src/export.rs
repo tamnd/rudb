@@ -23,6 +23,7 @@ use rudb_bind::CopyTo;
 use rudb_common::{Error, Field, LogicalType, Result, SessionTimeZone, Value};
 use rudb_compress::Codec;
 use rudb_kernels::cast::{cast_in_time_zone, cast_value};
+use rudb_kernels::strftime::Format;
 use rudb_vector::{Chunk, Vector};
 
 use crate::QueryResult;
@@ -141,6 +142,11 @@ pub(crate) fn write_json(
     let written = |error: std::io::Error| {
         Error::io(format!("Could not write file \"{}\": {error}", copy.path))
     };
+    let moments = Moments {
+        zone,
+        date: copy.date_format.as_deref().map(Format::parse).transpose()?,
+        timestamp: copy.timestamp_format.as_deref().map(Format::parse).transpose()?,
+    };
     let names = result.names();
     let types = result.types();
     if copy.array {
@@ -152,7 +158,7 @@ pub(crate) fn write_json(
         let mut columns = Vec::with_capacity(chunk.width());
         for (column, ty) in types.iter().enumerate() {
             let vector = chunk.column(column)?;
-            columns.push(if quoted(ty) {
+            columns.push(if quoted(ty) && !moments.formats(ty) {
                 cast_in_time_zone(vector, &LogicalType::Varchar, false, Some(zone))?
             } else {
                 vector.clone()
@@ -170,7 +176,7 @@ pub(crate) fn write_json(
                 }
                 string(&mut line, &names[column]);
                 line.push(':');
-                json(&mut line, &vector.try_value_at(row)?, &types[column], zone)?;
+                json(&mut line, &vector.try_value_at(row)?, &types[column], &moments)?;
             }
             line.push('}');
             if !copy.array {
@@ -260,7 +266,7 @@ fn quoted(ty: &LogicalType) -> bool {
 
 /// Appends one value of type `ty`. A whole column of a quoted type arrives already cast to VARCHAR,
 /// and what is nested in a list, a struct or a map is cast here, one value at a time.
-fn json(line: &mut String, value: &Value, ty: &LogicalType, zone: SessionTimeZone) -> Result<()> {
+fn json(line: &mut String, value: &Value, ty: &LogicalType, moments: &Moments) -> Result<()> {
     match value {
         Value::Null => line.push_str("null"),
         Value::Boolean(value) => line.push_str(if *value { "true" } else { "false" }),
@@ -291,7 +297,7 @@ fn json(line: &mut String, value: &Value, ty: &LogicalType, zone: SessionTimeZon
                 if at > 0 {
                     line.push(',');
                 }
-                json(line, value, element, zone)?;
+                json(line, value, element, moments)?;
             }
             line.push(']');
         }
@@ -308,7 +314,7 @@ fn json(line: &mut String, value: &Value, ty: &LogicalType, zone: SessionTimeZon
                 string(line, name);
                 line.push(':');
                 let ty = types.get(at).map_or(&LogicalType::Null, |field| &field.ty);
-                json(line, value, ty, zone)?;
+                json(line, value, ty, moments)?;
             }
             line.push('}');
         }
@@ -318,12 +324,12 @@ fn json(line: &mut String, value: &Value, ty: &LogicalType, zone: SessionTimeZon
                 if at > 0 {
                     line.push(',');
                 }
-                match text(name, key, zone)? {
+                match moments.text(name, key)? {
                     Some(name) => string(line, &name),
                     None => line.push_str("null"),
                 }
                 line.push(':');
-                json(line, value, value_type, zone)?;
+                json(line, value, value_type, moments)?;
             }
             line.push('}');
         }
@@ -337,17 +343,74 @@ fn json(line: &mut String, value: &Value, ty: &LogicalType, zone: SessionTimeZon
             match held {
                 Some((at, (_, value))) => {
                     let ty = members.get(at - 1).map_or(&LogicalType::Null, |field| &field.ty);
-                    json(line, value, ty, zone)?;
+                    json(line, value, ty, moments)?;
                 }
                 None => line.push_str("null"),
             }
         }
-        other => match text(other, ty, zone)? {
+        other => match moments.text(other, ty)? {
             Some(text) => string(line, &text),
             None => line.push_str("null"),
         },
     }
     Ok(())
+}
+
+/// What the JSON writer needs to write a moment: the session's time zone, and the `dateformat`
+/// and the `timestampformat` the `COPY` was given, if it was.
+struct Moments {
+    zone: SessionTimeZone,
+    date: Option<Format>,
+    timestamp: Option<Format>,
+}
+
+impl Moments {
+    /// The text a value that is not a JSON number, a list or an object is written as: a moment
+    /// through its format, and anything else as its cast to VARCHAR under the session's zone.
+    fn text(&self, value: &Value, ty: &LogicalType) -> Result<Option<String>> {
+        match self.formatted(value)? {
+            Some(text) => Ok(Some(text)),
+            None => text(value, ty, self.zone),
+        }
+    }
+
+    /// Whether a value of `ty` is written through one of the formats rather than its cast.
+    fn formats(&self, ty: &LogicalType) -> bool {
+        match ty {
+            LogicalType::Date => self.date.is_some(),
+            LogicalType::Timestamp
+            | LogicalType::TimestampS
+            | LogicalType::TimestampMs
+            | LogicalType::TimestampNs
+            | LogicalType::TimestampTz => self.timestamp.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The text of a date or a timestamp written through its format, or `None` for any other
+    /// value and for a moment there is no format for. A timestamp in seconds or milliseconds is
+    /// written as a timestamp in microseconds, and one with a time zone as the wall clock it shows
+    /// in the session's zone, which are the pin's answers.
+    fn formatted(&self, value: &Value) -> Result<Option<String>> {
+        let written = match (value, &self.date, &self.timestamp) {
+            (Value::Date(_), Some(format), _) => format.write(value)?,
+            (Value::Timestamp(_) | Value::TimestampNs(_), _, Some(format)) => {
+                format.write(value)?
+            }
+            (Value::TimestampS(_) | Value::TimestampMs(_), _, Some(format)) => {
+                format.write(&cast_value(value, &LogicalType::Timestamp, false)?)?
+            }
+            (Value::TimestampTz(micros), _, Some(format)) => {
+                format.write_zoned(*micros, self.zone)?
+            }
+            _ => return Ok(None),
+        };
+        Ok(match written {
+            Value::Null => None,
+            Value::Varchar(text) => Some(text),
+            other => Some(other.to_string()),
+        })
+    }
 }
 
 /// A value's cast to VARCHAR under the session's time zone, or `None` for a null.

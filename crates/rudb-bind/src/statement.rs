@@ -125,6 +125,11 @@ pub struct CopyTo {
     pub compression: String,
     /// For Parquet, how many rows go in a row group.
     pub row_group_size: u64,
+    /// For JSON, the `strftime` format a date is written with, where `None` writes its cast to
+    /// VARCHAR.
+    pub date_format: Option<String>,
+    /// For JSON, the `strftime` format a timestamp of any precision or zone is written with.
+    pub timestamp_format: Option<String>,
 }
 
 /// A bound `SET` or `RESET`.
@@ -634,6 +639,8 @@ fn copy_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         parquet: false,
         compression: String::new(),
         row_group_size: 0,
+        date_format: None,
+        timestamp_format: None,
     };
     for (name, value) in &copy.options {
         let text = || {
@@ -733,6 +740,8 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         parquet: false,
         compression: String::new(),
         row_group_size: 0,
+        date_format: None,
+        timestamp_format: None,
     };
     for (name, value) in &copy.options {
         match name.as_str() {
@@ -749,11 +758,11 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                     }
                 };
             }
+            "dateformat" | "date_format" => out.date_format = Some(json_format(name, value)?),
+            "timestampformat" | "timestamp_format" => {
+                out.timestamp_format = Some(json_format(name, value)?);
+            }
             "compression"
-            | "dateformat"
-            | "date_format"
-            | "timestampformat"
-            | "timestamp_format"
             | "per_thread_output"
             | "file_size_bytes"
             | "partition_by"
@@ -779,6 +788,23 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     Ok(out)
 }
 
+/// The format a `DATEFORMAT` or a `TIMESTAMPFORMAT` of a JSON `COPY` names, checked the way the
+/// pin checks it before a row is written.
+fn json_format(name: &str, value: &Option<String>) -> Result<String> {
+    let Some(format) = value else {
+        return Err(Error::binder(format!(
+            "COPY (FORMAT JSON) parameter \"{name}\" expects a single argument."
+        )));
+    };
+    if format.eq_ignore_ascii_case("null") {
+        return Err(Error::binder(format!(
+            "COPY (FORMAT JSON) parameter \"{name}\" cannot be NULL."
+        )));
+    }
+    rudb_kernels::strftime::Format::parse(format)?;
+    Ok(format.clone())
+}
+
 /// Reads the options of a `COPY ... TO` a Parquet file, which are the codec and the row group size.
 fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     let mut out = CopyTo {
@@ -796,6 +822,8 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         parquet: true,
         compression: "snappy".to_string(),
         row_group_size: 122_880,
+        date_format: None,
+        timestamp_format: None,
     };
     for (name, value) in &copy.options {
         let written = value.as_deref().unwrap_or_default().trim_matches('\'');
