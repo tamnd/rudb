@@ -72,6 +72,11 @@ use rudb_txn::log::CommitSync;
 /// suggestions break ties in.
 const LAMBDA_SYNTAXES: [&str; 3] = ["DEFAULT", "ENABLE_SINGLE_ARROW", "DISABLE_SINGLE_ARROW"];
 
+/// The knobs whose value is one of a fixed set of words, each with the enum the pin names when it
+/// refuses another word and the words in the order the pin declares them.
+const KNOB_WORDS: &[(&str, &str, &[&str])] =
+    &[("explain_output", "ExplainOutputType", &["ALL", "OPTIMIZED_ONLY", "PHYSICAL_ONLY"])];
+
 /// When the rows a commit wrote are seen by the other connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Visibility {
@@ -879,6 +884,12 @@ impl Settings {
             return Ok(());
         };
         let mut written = typed(entry, value)?;
+        if let Some((_, enum_name, words)) =
+            KNOB_WORDS.iter().find(|(name, ..)| *name == entry.name)
+            && !words.iter().any(|word| word.eq_ignore_ascii_case(&written))
+        {
+            return Err(Error::not_implemented(unknown_enum_value(&written, enum_name, words)));
+        }
         // The one knob a commit reads, so it is a size or it is refused, and it reads back the way
         // the pin prints it. Both spellings land here as wal_autocheckpoint.
         if entry.name == "wal_autocheckpoint" {
@@ -1951,9 +1962,9 @@ mod tests {
                 &memory,
                 &pool,
                 &mut Catalog::new(),
-                "preserve_insertion_order",
+                "binary_as_string",
                 Scope::Global,
-                Some(&Value::Boolean(true)),
+                Some(&Value::Boolean(false)),
             )
             .expect("the value it already behaves as");
         let error = settings
@@ -1961,23 +1972,16 @@ mod tests {
                 &memory,
                 &pool,
                 &mut Catalog::new(),
-                "preserve_insertion_order",
+                "binary_as_string",
                 Scope::Global,
-                Some(&Value::Boolean(false)),
+                Some(&Value::Boolean(true)),
             )
-            .expect_err("rudb cannot stop preserving it");
+            .expect_err("rudb cannot read a BLOB as a string");
         assert_eq!(error.code().duckdb_name(), "Not implemented Error");
         assert!(error.message().contains("rudb behaves as if"), "{error}");
         // A reset is always fine, since it is asking for what it already is.
         settings
-            .apply(
-                &memory,
-                &pool,
-                &mut Catalog::new(),
-                "preserve_insertion_order",
-                Scope::Global,
-                None,
-            )
+            .apply(&memory, &pool, &mut Catalog::new(), "binary_as_string", Scope::Global, None)
             .expect("a reset asks for the default");
     }
 
