@@ -133,13 +133,25 @@ impl Rank {
     /// The word holding the one of rank `nth`, counting from zero, and how many ones of that word
     /// come before it, searching from word `from` on. `None` when the bitmap has `nth` ones or
     /// fewer, or when word `from` already starts past it.
+    ///
+    /// The search gallops out from `from` before it halves, because the caller walks ranks that
+    /// rise and the word it wants is nearly always a word or two past the last one. Halving the
+    /// whole rest of the bitmap from there was seventeen dependent loads a row on the orders of
+    /// TPC-H, and a tenth of q10.
     pub(crate) fn word_holding(&self, nth: u64, from: usize) -> Option<(usize, u32)> {
         let words = self.fine.len().checked_sub(1)?;
         if from >= words || u64::from(self.fine[from]) > nth || u64::from(self.fine[words]) <= nth {
             return None;
         }
-        let word =
-            from + self.fine[from..words].partition_point(|&ones| u64::from(ones) <= nth) - 1;
+        // `fine[low]` is at most `nth` and `fine[high]` is past it, or `high` is the end.
+        let (mut low, mut step) = (from, 1);
+        let mut high = from + 1;
+        while high < words && u64::from(self.fine[high]) <= nth {
+            low = high;
+            step *= 2;
+            high = (low + step).min(words);
+        }
+        let word = low + self.fine[low..high].partition_point(|&ones| u64::from(ones) <= nth) - 1;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "the rank is inside the word, which holds at most sixty four ones"
@@ -472,14 +484,24 @@ fn bits(at: usize) -> u64 {
 
 /// Where the `nth` set bit of a word is, counting from zero.
 ///
-/// The obvious loop, clearing the lowest set bit `nth` times. `pdep` does this in one instruction
-/// on x86 and there is no portable way to say so yet, so this is the version that is correct
-/// everywhere and the place to put the intrinsic when a measurement asks for it.
-pub(crate) fn nth_set(mut word: u64, nth: u32) -> u32 {
-    for _ in 0..nth {
-        word &= word - 1;
+/// A byte at a time to the byte that holds it and then the lowest set bit cleared until it is
+/// reached, which is at most eight steps and seven, where clearing bits across the whole word was
+/// up to sixty three. `pdep` does this in one instruction on x86 and there is no portable way to
+/// say so yet. A word with `nth` ones or fewer answers 64, as the loop over the word did.
+pub(crate) fn nth_set(word: u64, nth: u32) -> u32 {
+    let mut left = nth;
+    for (at, byte) in (0_u32..).zip(word.to_le_bytes()) {
+        let ones = byte.count_ones();
+        if left < ones {
+            let mut byte = byte;
+            for _ in 0..left {
+                byte &= byte - 1;
+            }
+            return at * 8 + byte.trailing_zeros();
+        }
+        left -= ones;
     }
-    word.trailing_zeros()
+    64
 }
 
 fn malformed(message: impl Into<String>) -> Error {
@@ -489,6 +511,21 @@ fn malformed(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_nth_set_bit_is_where_clearing_the_lower_ones_puts_it() {
+        let mut word = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..200 {
+            word = word.rotate_left(7) ^ word.wrapping_mul(0x2545_f491_4f6c_dd1d);
+            for nth in 0..=64 {
+                let mut cleared = word;
+                for _ in 0..nth {
+                    cleared &= cleared.wrapping_sub(1);
+                }
+                assert_eq!(nth_set(word, nth), cleared.trailing_zeros(), "{word:#x} {nth}");
+            }
+        }
+    }
 
     /// Builds a vector from a list of bits, the slow and obviously correct way.
     fn vector(bits: &[bool]) -> BitVector {
