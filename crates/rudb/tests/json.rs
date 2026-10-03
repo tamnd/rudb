@@ -697,3 +697,22 @@ fn a_whole_number_written_in_the_query_is_not_a_document() {
          'json_array_length(INTEGER_LITERAL, STRING_LITERAL)'."
     ));
 }
+
+#[test]
+fn a_field_or_a_subscript_on_a_document_reads_the_key_or_the_element() {
+    check(&[
+        ("SELECT json('{\"a\":{\"b\":[1,2]}}').a.b[1], typeof(json('{\"a\":1}').a)", "2|JSON"),
+        (
+            "SELECT json('[1,2,3]')[-1], json('[1,2,3]')['1'], json('{\"a b\":1}').\"a b\", \
+             json('{\"A\":1}').a",
+            "3|2|1|NULL",
+        ),
+        ("SELECT json('{\"x.y\":1}').\"x.y\", json('{\"$.a\":5}')['$.a']", "1|5"),
+        (
+            "SELECT json('[1,2,3]').\"1\", json('{\"1\":9}').\"1\", json('{\"1\":9}')[1]",
+            "NULL|9|NULL",
+        ),
+        ("SELECT json('{\"foo\": null}').foo, json('{\"foo\": null}').foo.bar", "null|NULL"),
+        ("SELECT x.a, t.x.a FROM (SELECT json('{\"a\":3}') x) t", "3|3"),
+    ]);
+}

@@ -107,6 +107,46 @@ impl Binder<'_> {
         Ok(Some(self.add_expr(Expr::Function { name: recorded, args }, fields[at].ty.clone())))
     }
 
+    /// `j.a` and `j[1]` on a JSON value, which the pin binds as `json_extract` with the key made
+    /// into a path, or `None` when the call is not one of those two.
+    ///
+    /// A constant field name becomes `$."a"`, so a name is only ever a key and never reads as a path
+    /// of its own. A constant subscript that casts to a UINTEGER becomes `$[1]`, and any other string
+    /// is a key the same way a field name is. Anything else, a negative index or a key that is not a
+    /// constant, is passed as it was written, which is how `j[-1]` counts from the end.
+    pub(crate) fn json_field(
+        &mut self,
+        written: &str,
+        bound: &[ExprRef],
+    ) -> Result<Option<ExprRef>> {
+        let &[input, key] = bound else {
+            return Ok(None);
+        };
+        if *self.plan().expr_type(input) != LogicalType::Json {
+            return Ok(None);
+        }
+        let element = rudb_catalog::same_name(written, "array_extract");
+        if !element && !rudb_catalog::same_name(written, STRUCT_EXTRACT) {
+            return Ok(None);
+        }
+        let mut key = key;
+        if let Expr::Constant(held) = *self.plan().expr(key) {
+            let value = self.plan().value(held).clone();
+            let index = rudb_kernels::cast::cast_value(&value, &LogicalType::UInteger, true);
+            let path = match (&value, index) {
+                (Value::Null, _) => None,
+                (_, Ok(Value::UInteger(index))) if element => Some(format!("$[{index}]")),
+                (Value::Varchar(text), _) => Some(format!("$.\"{text}\"")),
+                (value, _) if !element => Some(format!("$.\"{value}\"")),
+                _ => None,
+            };
+            if let Some(path) = path {
+                key = self.add_constant(Value::Varchar(path));
+            }
+        }
+        self.call("json_extract", vec![input, key]).map(Some)
+    }
+
     /// `struct_extract_at(s, i)`, the field at place `i` counted from one, in a named struct as well
     /// as an unnamed one.
     ///
