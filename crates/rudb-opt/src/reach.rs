@@ -183,6 +183,7 @@ fn reached(plan: &Plan, at: NodeRef, key: ColumnBinding) -> bool {
                 (JoinKind::Inner | JoinKind::Semi, BuildSide::Right) => at = left,
                 _ => return false,
             },
+            Node::LinkJoin { child, kind: JoinKind::Inner | JoinKind::Semi, .. } => at = child,
             _ => return false,
         }
     }

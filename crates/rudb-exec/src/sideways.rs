@@ -1033,7 +1033,7 @@ pub(crate) fn beneath(plan: &Plan, node: NodeRef, binding: ColumnBinding) -> Opt
                 }
                 at = input;
             }
-            ref node @ Node::Join { .. } => at = through(node)?,
+            ref node @ (Node::Join { .. } | Node::LinkJoin { .. }) => at = through(node)?,
             _ => return None,
         }
     }
@@ -1056,11 +1056,18 @@ pub(crate) fn beneath(plan: &Plan, node: NodeRef, binding: ColumnBinding) -> Opt
 /// order key is the one nearest the scan, and without this the filter from the supplier join
 /// above it stopped there, so nine hundred thousand rows paid for the probe of orders to find
 /// out that all but seven thousand had the wrong supplier.
+///
+/// A link join streams its child and finds each row's parent, so an inner or a semi one passes the
+/// child's rows on unchanged and the child is its driving side. On TPC-H q18 that is the orders
+/// scan under the join to customer, which the semi join on the 57 big orders cuts to 57 rows.
 pub(crate) fn through(node: &Node) -> Option<NodeRef> {
-    let Node::Join { left, right, kind, build, .. } = *node else { return None };
-    match (kind, build) {
-        (JoinKind::Inner, BuildSide::Left) => Some(right),
-        (JoinKind::Inner | JoinKind::Semi, BuildSide::Right) => Some(left),
+    match *node {
+        Node::Join { left, right, kind, build, .. } => match (kind, build) {
+            (JoinKind::Inner, BuildSide::Left) => Some(right),
+            (JoinKind::Inner | JoinKind::Semi, BuildSide::Right) => Some(left),
+            _ => None,
+        },
+        Node::LinkJoin { child, kind: JoinKind::Inner | JoinKind::Semi, .. } => Some(child),
         _ => None,
     }
 }
@@ -2414,6 +2421,33 @@ mod tests {
             Some(ColumnBinding::new(0, 1)),
             "the scan's own name for the projection's column"
         );
+    }
+
+    /// A link join streams its child, so an inner or a semi one hands a filter about the child's
+    /// column down to the child's scan, and one that answers for a row with no parent does not.
+    #[test]
+    fn a_link_join_passes_a_filter_down_to_its_child_unless_it_keeps_rows_without_a_parent() {
+        let text = |kind: &str| {
+            format!(
+                "LinkJoin {kind} on=[(#0.1::BIGINT = #1.0::BIGINT)::BOOLEAN] key=#0.1::BIGINT\n  \
+                 TableFunction read_parquet args=['o'::VARCHAR] #0 [o_orderkey::BIGINT, \
+                 o_custkey::BIGINT]\n  \
+                 TableFunction read_parquet args=['c'::VARCHAR] #1 [c_custkey::BIGINT]"
+            )
+        };
+        for kind in ["INNER", "SEMI"] {
+            let plan = driving(&text(kind));
+            assert_eq!(
+                beneath(&plan, plan.root(), ColumnBinding::new(0, 0)),
+                Some(ColumnBinding::new(0, 0)),
+                "{kind}"
+            );
+            assert_eq!(beneath(&plan, plan.root(), ColumnBinding::new(1, 0)), None, "{kind}");
+        }
+        for kind in ["LEFT", "ANTI"] {
+            let plan = driving(&text(kind));
+            assert_eq!(beneath(&plan, plan.root(), ColumnBinding::new(0, 0)), None, "{kind}");
+        }
     }
 
     /// A filter keeps rows and renames nothing, so the binding goes through it as it stands, and
