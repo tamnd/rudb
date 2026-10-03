@@ -117,6 +117,13 @@ pub struct Prepared {
     time_zone: SessionTimeZone,
 }
 
+/// How few rows the masks of [`Prepared::masked`] go on to read after, as one in this many.
+///
+/// Sixteen, because a mask reads a block of 64 rows whole if any row of it is left, and at one row
+/// in sixteen that is a block in every one or two, where the threaded walk reads four rows a block
+/// at a few times the cost a row.
+const MASK_FLOOR: usize = 16;
+
 /// One node of a flattened expression.
 ///
 /// A step refers to its operands by their index in [`Prepared::steps`], which is always smaller than
@@ -795,8 +802,16 @@ impl Prepared {
             .take()
             .unwrap_or_else(|| Ordering::new(op, self.weights(operands, begin)));
         let mut carried: Option<Selection> = live.cloned();
-        // The operands already answered as the other end of a range, see [`Self::range`].
+        // The operands already answered as the other end of a range, see [`Self::range`], or as a
+        // mask, see [`Self::masked`].
         let mut ranged: u128 = 0;
+        if matches!(op, Connective::And)
+            && live.is_none()
+            && let Some((kept, answered)) = self.masked(operands, settled, &mut order, chunk)?
+        {
+            ranged = answered;
+            carried = Some(kept);
+        }
         for slot in 0..len {
             if carried.as_ref().is_some_and(Selection::is_empty) {
                 break;
@@ -900,6 +915,100 @@ impl Prepared {
         let values = self.operand(left, chunk, &scratch.slots)?;
         let live = live.map(Selection::indices);
         Ok(rudb_kernels::select_range(values, lower, upper, live).map(|kept| (other, kept)))
+    }
+
+    /// The operands of an `AND` that compare an integer column with a literal, answered together a
+    /// mask word for each 64 rows, as the rows they keep and which operands those were.
+    ///
+    /// The operands are grouped by column, so `l_discount >= 0.05 AND l_discount <= 0.07` is one
+    /// pass over the column, and the columns go in the order the connective has learned, so the one
+    /// that keeps the fewest rows goes first and the ones after it skip the blocks it left empty.
+    /// See [`rudb_kernels::mask_within`] for why a mask rather than a list of rows. Once the rows
+    /// left are fewer than one in [`MASK_FLOOR`] the rest are left to the threaded walk, because a
+    /// block with one row in it is read whole here and a list reads only that row.
+    ///
+    /// `None` when fewer than two columns are compared this way, since one column is a single pass
+    /// already, and for steps built to be shared, whose slots a later operand may read.
+    fn masked(
+        &self,
+        operands: &[usize],
+        settled: &[bool],
+        order: &mut Ordering,
+        chunk: &Chunk,
+    ) -> Result<Option<(Selection, u128)>> {
+        if self.share || chunk.is_empty() {
+            return Ok(None);
+        }
+        // Each column compared, by its place in the chunk, with the operands that compare it.
+        let mut columns: Vec<(usize, Vec<usize>)> = Vec::new();
+        for slot in 0..operands.len().min(128) {
+            let which = order.at(slot);
+            if which >= 128 || settled.get(which) == Some(&true) {
+                continue;
+            }
+            let Some(column) = self.masking(operands[which]) else { continue };
+            match columns.iter_mut().find(|(at, _)| *at == column) {
+                Some((_, those)) => those.push(which),
+                None => columns.push((column, vec![which])),
+            }
+        }
+        if columns.len() < 2 {
+            return Ok(None);
+        }
+        let rows = chunk.len();
+        let mut words = vec![0_u64; rows.div_ceil(64)];
+        let mut kept = rows;
+        let mut fresh = true;
+        let mut answered: u128 = 0;
+        for (column, those) in &columns {
+            if kept.saturating_mul(MASK_FLOOR) < rows {
+                break;
+            }
+            let bounds: Vec<rudb_kernels::Bound<'_>> = those
+                .iter()
+                .filter_map(|&which| self.end(operands[which]).map(|(_, bound)| bound))
+                .collect();
+            if bounds.len() != those.len() {
+                continue;
+            }
+            let values = chunk.column(*column)?;
+            let Some(left) = rudb_kernels::mask_within(values, &bounds, &mut words, fresh) else {
+                continue;
+            };
+            for &which in those {
+                order.observed(which, kept, left);
+                answered |= 1 << which;
+            }
+            kept = left;
+            fresh = false;
+        }
+        if fresh {
+            return Ok(None);
+        }
+        Ok(Some((rudb_kernels::mask_selection(&words, kept), answered)))
+    }
+
+    /// The place in the chunk of the column an operand compares with a literal, when the comparison
+    /// is one [`rudb_kernels::mask_within`] takes.
+    fn masking(&self, operand: usize) -> Option<usize> {
+        let Step::Compare { op, left, right, .. } = &self.steps[operand] else { return None };
+        let (Step::Column(column), Step::Constant(value)) =
+            (&self.steps[*left], &self.steps[*right])
+        else {
+            return None;
+        };
+        if value.is_null() || self.types[*left] != self.types[*right] {
+            return None;
+        }
+        matches!(
+            op,
+            Comparison::Equal
+                | Comparison::Less
+                | Comparison::LessOrEqual
+                | Comparison::Greater
+                | Comparison::GreaterOrEqual
+        )
+        .then_some(*column)
     }
 
     /// The column a comparison of a column with a literal reads, and whether the literal is where
@@ -2368,6 +2477,64 @@ mod tests {
                     let threaded =
                         prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs");
                     assert_eq!(threaded, expected, "`{predicate}`");
+                }
+            }
+        }
+    }
+
+    /// Comparisons of two or more integer columns with literals are answered as masks, and the rows
+    /// have to be the ones the tree walk keeps, flat and bit packed, beside a string conjunct, with
+    /// a first column that leaves too few rows for the masks to go on, and over a chunk whose last
+    /// block is not whole.
+    #[test]
+    fn comparisons_of_several_columns_keep_the_rows_the_tree_walk_keeps() {
+        let schema = Schema::numbered(
+            vec![
+                Field::new("x", LogicalType::Integer),
+                Field::new("y", LogicalType::BigInt),
+                Field::new("s", LogicalType::Varchar),
+            ],
+            0,
+        );
+        let rows = 1000;
+        let x: Vec<i32> = (0..rows).map(|row| 700 + (row * 37) % 600).collect();
+        let y: Vec<i64> = (0..rows).map(|row| i64::from((row * 11) % 50)).collect();
+        let x = Vector::flat(LogicalType::Integer, rudb_vector::Data::Int32(x.into()))
+            .expect("integers are an i32 layout");
+        let y = Vector::flat(LogicalType::BigInt, rudb_vector::Data::Int64(y.into()))
+            .expect("bigints are an i64 layout");
+        let words = Vector::from_values(
+            LogicalType::Varchar,
+            &(0..rows).map(|row| Value::Varchar(["a", "b"][row % 2].into())).collect::<Vec<_>>(),
+        )
+        .expect("strings");
+        let predicates = [
+            "((#0.0::INTEGER >= 800::INTEGER)::BOOLEAN AND (#0.1::BIGINT < 24::BIGINT)::BOOLEAN \
+             AND (#0.0::INTEGER < 1100::INTEGER)::BOOLEAN)",
+            "((#0.1::BIGINT = 7::BIGINT)::BOOLEAN AND (#0.0::INTEGER > 750::INTEGER)::BOOLEAN)",
+            "((#0.2::VARCHAR = 'a'::VARCHAR)::BOOLEAN AND (#0.1::BIGINT >= 10::BIGINT)::BOOLEAN \
+             AND (#0.0::INTEGER <= 1000::INTEGER)::BOOLEAN)",
+            "((#0.0::INTEGER = 1299::INTEGER)::BOOLEAN AND (#0.1::BIGINT <= 49::BIGINT)::BOOLEAN)",
+            "((#0.0::INTEGER > 900::INTEGER)::BOOLEAN AND (#0.1::BIGINT > 60::BIGINT)::BOOLEAN)",
+            "((#0.1::BIGINT >= 5::BIGINT)::BOOLEAN AND (#0.1::BIGINT <= 7::BIGINT)::BOOLEAN AND \
+             (#0.0::INTEGER < 900::INTEGER)::BOOLEAN AND (#0.0::INTEGER >= 700::INTEGER)::BOOLEAN)",
+        ];
+        let packed = (x.bit_packed().expect("packs"), y.bit_packed().expect("packs"));
+        for (x, y) in [(x.clone(), y.clone()), packed.clone(), (x, packed.1)] {
+            let chunk = Chunk::new(vec![x, y, words.clone()]).expect("three columns");
+            for predicate in predicates {
+                let (plan, list) = projection(&format!("{predicate}::BOOLEAN AS p"));
+                let prepared =
+                    Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+                let mut scratch = prepared.scratch();
+                let flags = evaluate(&plan, list[0], &schema, &chunk).expect("the tree walk runs");
+                let expected =
+                    Selection::from_predicate(chunk.len(), |row| is_true(&flags.value_at(row)));
+                // Enough chunks for the order to learn and move.
+                for _ in 0..40 {
+                    let masked =
+                        prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs");
+                    assert_eq!(masked, expected, "`{predicate}`");
                 }
             }
         }
