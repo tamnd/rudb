@@ -114,9 +114,9 @@ checksum = "ac0790c83cfdab95709c5d0105fd888221e3af9049a7d7ec376ec901ab4e4dba"
 
 [[package]]
 name = "cranelift-codegen"
-version = "0.125.0"
+version = "0.125.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a8048ed4ed0679bf202ab5446a7f1481f5a0f4cfcbf5317869515e91322e3a5"
+checksum = "9a98aed2d262eda69310e84bae8e053ee4f17dbdd3347b8d9156aa618ba2de0a"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -188,9 +188,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-isle"
-version = "0.125.0"
+version = "0.125.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc7944c7d0f3f238ee536ba8676337890b3c3863fa767fe41d8014f69150b3ab"
+checksum = "a0422686b22ed6a1f33cc40e3c43eb84b67155788568d1a5cac8439d3dca1783"
 
 [[package]]
 name = "cranelift-srcgen"
@@ -607,6 +607,7 @@ name = "rudb-functions"
 version = "0.8.22"
 dependencies = [
  "rudb-common",
+ "rudb-compress",
  "rudb-csv",
  "rudb-io",
  "rudb-kernels",
@@ -1037,9 +1038,9 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-math"
-version = "38.0.0"
+version = "38.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a93f87aa69abd1da8ab2e1895aa57438fdb69be3c461b83bf6b2c80b7701b17"
+checksum = "3c1f0674f38cd7d014eb1a49ea1d1766cca1a64459e8856ee118a10005302e16"
 dependencies = [
  "libm",
 ]

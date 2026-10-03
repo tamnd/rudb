@@ -39,7 +39,7 @@ readme = "README.md"
 # The codegen crate without its defaults, which would build every target: `host-arch` is the one
 # target the code runs on. cranelift-frontend asks for the default features back, so unwind and
 # gimli come in regardless.
-cranelift-codegen = { version = "=0.125.0", default-features = false, features = ["std", "host-arch"] }
+cranelift-codegen = { version = "=0.125.4", default-features = false, features = ["std", "host-arch"] }
 cranelift-frontend = { version = "=0.125.0", default-features = false, features = ["std"] }
 chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 chrono-tz = "0.10.4"
