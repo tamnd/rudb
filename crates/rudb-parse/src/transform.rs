@@ -2236,6 +2236,7 @@ impl<'a> Transform<'a> {
     fn copy_to(&mut self, node: u32, query: QueryRef) -> Result<Statement> {
         let path = self.copy_file_name(node)?;
         let mut options = Vec::new();
+        let mut values = Vec::new();
         let list = self.find(node, "CopyOptions");
         if list != NONE {
             let mut generic = Vec::new();
@@ -2247,8 +2248,19 @@ impl<'a> Transform<'a> {
                 }
                 let name = self.text(self.find(inner, "CopyOptionName")).to_ascii_lowercase();
                 let value = self.find(inner, "GenericCopyOptionValue");
-                let value = if value == NONE { None } else { Some(self.copy_option_text(value)?) };
-                options.push((name, value));
+                let written =
+                    if value == NONE { None } else { Some(self.copy_option_text(value)?) };
+                options.push((name, written));
+                // The text is what most options need. The expression is for the ones the pin
+                // checks the type of, and one that does not transform is left for the text to
+                // answer.
+                let inner = if value == NONE { NONE } else { self.first(value) };
+                let expression = inner != NONE && self.name(inner) == "GenericCopyOptionExpression";
+                values.push(if expression {
+                    self.expr(self.first(inner)).unwrap_or(NONE)
+                } else {
+                    NONE
+                });
             }
             let mut specialized = Vec::new();
             self.named_nodes(list, "SpecializedOption", &mut specialized);
@@ -2282,7 +2294,8 @@ impl<'a> Transform<'a> {
             }
         }
         let index = self.ast.copies.len() as u32;
-        self.ast.copies.push(CopyTo { query, path, options });
+        values.resize(options.len(), NONE);
+        self.ast.copies.push(CopyTo { query, path, options, values });
         Ok(Statement::CopyTo(index))
     }
 

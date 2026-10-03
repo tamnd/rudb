@@ -178,6 +178,9 @@ pub struct CopyTo {
     pub path: String,
     /// Each option, lowercased, with the text of its value or `None` when it was written bare.
     pub options: Vec<(String, Option<String>)>,
+    /// The expression each option's value was written as, one for each option, or `NONE` when it
+    /// was written bare, as a list of columns, or in the older spelling.
+    pub values: Vec<ExprRef>,
 }
 
 /// `SET name = value` and `RESET name`.

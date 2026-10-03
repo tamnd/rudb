@@ -244,6 +244,117 @@ fn json_options_are_the_pins() {
     }
 }
 
+#[test]
+fn an_option_written_as_null_or_as_the_wrong_type_is_refused_in_the_pins_words() {
+    let db = Database::new();
+    for (format, option, message) in [
+        (
+            "json",
+            "dateformat NULL",
+            "Binder Error: COPY (FORMAT JSON) parameter \"dateformat\" cannot be NULL.",
+        ),
+        (
+            "json",
+            "array NULL",
+            "Binder Error: COPY (FORMAT JSON) parameter \"array\" cannot be NULL.",
+        ),
+        (
+            "json",
+            "use_tmp_file NULL",
+            "Binder Error: COPY (FORMAT JSON) parameter \"use_tmp_file\" cannot be NULL.",
+        ),
+        (
+            "json",
+            "dateformat 1, timestampformat NULL",
+            "Binder Error: COPY (FORMAT JSON) parameter \"timestampformat\" cannot be NULL.",
+        ),
+        (
+            "json",
+            "nosuch NULL",
+            "Binder Error: Unknown option for COPY ... TO ... (FORMAT JSON): nosuch.",
+        ),
+        (
+            "json",
+            "header NULL",
+            "Binder Error: NULL is not supported as a valid option for COPY option \"header\"",
+        ),
+        (
+            "json",
+            "dateformat NULL::VARCHAR",
+            "Binder Error: NULL is not supported as a valid option for COPY option \"dateformat\"",
+        ),
+        (
+            "csv",
+            "use_tmp_file NULL",
+            "Binder Error: NULL is not supported as a valid option for COPY option \"use_tmp_file\"",
+        ),
+        (
+            "csv",
+            "delimiter NULL",
+            "Binder Error: NULL is not supported as a valid option for COPY option \"delimiter\"",
+        ),
+        (
+            "parquet",
+            "use_tmp_file NULL",
+            "Binder Error: NULL is not supported as a valid option for COPY option \"use_tmp_file\"",
+        ),
+        (
+            "json",
+            "dateformat TRUE",
+            "Binder Error: COPY (FORMAT JSON) parameter \"dateformat\" expects a VARCHAR argument, but got BOOLEAN.",
+        ),
+        (
+            "json",
+            "timestampformat 1.5",
+            "Binder Error: COPY (FORMAT JSON) parameter \"timestampformat\" expects a VARCHAR argument, but got DECIMAL(2,1).",
+        ),
+        (
+            "json",
+            "file_extension 42",
+            "Binder Error: COPY (FORMAT JSON) parameter \"file_extension\" expects a VARCHAR argument, but got INTEGER.",
+        ),
+        (
+            "json",
+            "dateformat [1, 2, 3]",
+            "Binder Error: COPY (FORMAT JSON) parameter \"dateformat\" expects a VARCHAR argument, but got INTEGER[].",
+        ),
+        (
+            "json",
+            "file_extension {'a': 1}",
+            "Binder Error: COPY (FORMAT JSON) parameter \"file_extension\" expects a VARCHAR argument, but got STRUCT(a INTEGER).",
+        ),
+        (
+            "json",
+            "filename_pattern FALSE",
+            "Invalid Input Error: Copy option \"filename_pattern\" expected an argument of type VARCHAR - the argument \"false\" of type BOOLEAN could not be cast as this type",
+        ),
+        (
+            "json",
+            "filename_pattern [1]",
+            "Invalid Input Error: Copy option \"filename_pattern\" expected an argument of type VARCHAR - the argument \"[1]\" of type INTEGER[] could not be cast as this type",
+        ),
+        (
+            "json",
+            "compression 1",
+            "Invalid Input Error: Copy option \"compression\" expected an argument of type VARCHAR - the argument \"1\" of type INTEGER could not be cast as this type",
+        ),
+        (
+            "json",
+            "encoding 'utf8'",
+            "Invalid Input Error: Option \"encoding\" is not supported for writing - only for reading",
+        ),
+        (
+            "json",
+            "nosuch 1",
+            "Binder Error: Unknown option for COPY ... TO ... (FORMAT JSON): nosuch.",
+        ),
+    ] {
+        let sql = format!("COPY (SELECT 1 AS a) TO 'o.{format}' (FORMAT {format}, {option})");
+        let error = db.execute(&sql).expect_err(&sql).to_string();
+        assert_eq!(error, message, "{sql}");
+    }
+}
+
 fn values(db: &Database, sql: &str) -> Vec<Vec<rudb_common::Value>> {
     let result = db.query(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
     (0..result.len())
