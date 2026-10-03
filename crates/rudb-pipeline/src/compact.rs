@@ -148,8 +148,8 @@ impl Gauge {
 ///
 /// # Errors
 ///
-/// If the selection points past the end of the chunk, or if the seam asked for a copy of a column of a
-/// type there is no vector for, which today means `ARRAY` and `UNION` and which
+/// If the selection points past the end of the chunk, or if the seam asked for a copy of a column
+/// of a type there is no vector for, which today means `ARRAY` and which
 /// [`Strategy::applicable`](rudb_seam::Strategy::applicable) already keeps the compacting
 /// implementations away from.
 pub fn narrow(

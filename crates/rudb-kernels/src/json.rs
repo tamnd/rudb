@@ -838,24 +838,22 @@ fn value_text(
             }
             out.push(']');
         }
+        // A union is an object of the one member it holds, under the member's name.
+        (Value::Union { members, tag, value }, _) => {
+            let member = members
+                .get(usize::from(*tag))
+                .ok_or_else(|| Error::internal("a union tag names no member"))?;
+            out.push('{');
+            string_text(&member.name, out);
+            out.push(':');
+            value_text(value, &member.ty, zone, out)?;
+            out.push('}');
+        }
         (Value::Struct(fields), _) => {
             let types = match ty {
-                LogicalType::Struct(types) | LogicalType::Union(types) => Some(types),
+                LogicalType::Struct(types) => Some(types),
                 _ => None,
             };
-            if let (LogicalType::Union(_), Some(types)) = (ty, types) {
-                // A union is the one member it holds, which is the first that is not null after
-                // the tag.
-                let member =
-                    fields.iter().skip(1).zip(types).find(|((_, value), _)| !value.is_null());
-                return match member {
-                    Some(((_, value), field)) => value_text(value, &field.ty, zone, out),
-                    None => {
-                        out.push_str("null");
-                        Ok(())
-                    }
-                };
-            }
             // An unnamed struct, which the pin calls a TUPLE, is an array of its fields.
             let unnamed = !fields.is_empty() && fields.iter().all(|(name, _)| name.is_empty());
             out.push(if unnamed { '[' } else { '{' });
@@ -1209,6 +1207,45 @@ impl Document {
                     values.push((field.name.clone(), self.convert(*child, &field.ty, reading)?));
                 }
                 Ok(Value::Struct(values))
+            }
+            // A union is read from an object of one key, the member's name, as the pin writes it.
+            LogicalType::Union(members) => {
+                let Node::Object(children) = node else {
+                    // The pin names the kind the way its parser does, a boolean by its value.
+                    let got = match node {
+                        Node::Bool(true) => "true",
+                        Node::Bool(false) => "false",
+                        Node::Unsigned(_) => "uint",
+                        Node::Signed(_) => "sint",
+                        Node::Real(..) | Node::Raw(_) => "real",
+                        Node::Str(_) => "string",
+                        Node::Array(_) => "array",
+                        Node::Null | Node::Object(_) => "null",
+                    };
+                    return Err(Error::conversion(format!(
+                        "Expected an object representing a union, got {got}"
+                    )));
+                };
+                let (key, child) = match &children[..] {
+                    [] => return Err(Error::conversion("Found empty object, instead of union")),
+                    [(key, child)] => (key, *child),
+                    _ => {
+                        return Err(Error::conversion(
+                            "Found object containing more than one key, instead of union",
+                        ));
+                    }
+                };
+                let Some(at) = members.iter().position(|member| member.name == *key) else {
+                    return Err(Error::conversion(format!(
+                        "Found object containing unknown key, instead of union: {key}"
+                    )));
+                };
+                Ok(Value::Union {
+                    members: members.clone(),
+                    tag: u8::try_from(at)
+                        .map_err(|_| Error::internal("a union has too many members"))?,
+                    value: Box::new(self.convert(child, &members[at].ty, reading)?),
+                })
             }
             LogicalType::Map(key, value) => {
                 let Node::Object(children) = node else { return Err(expected("OBJECT")) };

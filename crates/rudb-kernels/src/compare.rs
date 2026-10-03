@@ -2221,6 +2221,15 @@ pub fn compare_values(op: Comparison, left: &Value, right: &Value) -> Result<Val
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
     }
+    // Two unions holding the same member compare as the members do, so a null member makes the
+    // answer null, while two different members are simply not equal. That is the pin's, and it is
+    // not how a struct with a null field compares.
+    if let (Value::Union { tag: a, value: one, .. }, Value::Union { tag: b, value: other, .. }) =
+        (left, right)
+        && a == b
+    {
+        return compare_values(op, one, other);
+    }
     let ordering = order(left, right)?;
     let held = match op {
         Comparison::Equal => ordering == Ordering::Equal,
@@ -2282,6 +2291,14 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
                 }
             }
             Ok(a.len().cmp(&b.len()))
+        }
+        // A union orders by its tag first, the place of the member in the type, and then by the
+        // member, which is the pin's struct of a tag and the members ordered field by field.
+        (Value::Union { tag: a, value: one, .. }, Value::Union { tag: b, value: other, .. }) => {
+            if a != b {
+                return Ok(a.cmp(b));
+            }
+            order_with_nulls(one, other, false)
         }
         // A map is a list of key and value structs underneath on the pin and orders as one, entry
         // by entry and key before value, with the shorter one first when one runs out.

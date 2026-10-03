@@ -110,6 +110,10 @@ fn evaluate(plan: &Plan, expr: ExprRef, lambdas: &mut Lambdas) -> Result<Option<
             }
             let Some(inner) = evaluate(plan, input, lambdas)? else { return Ok(None) };
             let (from, target) = (plan.expr_type(input), plan.expr_type(expr));
+            // A union cast needs the type a null came from, which the value alone cannot say.
+            if matches!(target, LogicalType::Union(_)) {
+                return rudb_kernels::cast::cast_to_union(&inner, from, target, try_cast).map(Some);
+            }
             match rudb_kernels::json::cast_typed(&inner, from, target, try_cast, None) {
                 Some(cast) => cast?,
                 None => cast_value(&inner, target, try_cast)?,

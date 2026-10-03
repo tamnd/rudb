@@ -55,6 +55,29 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Result
             }))
         }
         ("list_zip", _) => Ok(Some(zipped(args, returns)?)),
+        // A union holding a null is still a union, so `union_value(a := NULL)` is not null.
+        ("union_value", [value]) => {
+            let LogicalType::Union(members) = returns else {
+                return Err(Error::internal(format!("union_value returning {returns}")));
+            };
+            Ok(Some(Value::Union {
+                members: members.clone(),
+                tag: 0,
+                value: Box::new(value.clone()),
+            }))
+        }
+        ("union_tag", [input]) => Ok(Some(match input {
+            Value::Union { members, tag, .. } => members
+                .get(usize::from(*tag))
+                .map_or(Value::Null, |member| Value::Varchar(member.name.clone())),
+            _ => Value::Null,
+        })),
+        ("union_extract", [input, key]) => Ok(Some(match (input, place(key)) {
+            (Value::Union { tag, value, .. }, Some(at)) if usize::from(*tag) == at => {
+                value.as_ref().clone()
+            }
+            _ => Value::Null,
+        })),
         ("struct_extract", [input, key]) => Ok(Some(match (input, place(key)) {
             (Value::Struct(fields), Some(at)) => {
                 fields.get(at).map_or(Value::Null, |(_, value)| value.clone())

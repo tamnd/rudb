@@ -621,6 +621,26 @@ impl LogicalType {
                 }
                 Some(Self::Struct(fields))
             }
+            // Two unions meet at the one whose members name all of the other's, and at the left
+            // one when neither does, which then fails its cast for the member it lacks, as the
+            // pin's does.
+            (Self::Union(left), Self::Union(right)) => {
+                let covers = |wide: &[Field], narrow: &[Field]| {
+                    narrow.iter().all(|member| {
+                        wide.iter().any(|other| other.name.eq_ignore_ascii_case(&member.name))
+                    })
+                };
+                Some(if !covers(left, right) && covers(right, left) {
+                    other.clone()
+                } else {
+                    self.clone()
+                })
+            }
+            // A value meets a union as the union when it casts to one of the members.
+            (Self::Union(_), value) | (value, Self::Union(_)) => {
+                let union = if matches!(self, Self::Union(_)) { self } else { other };
+                crate::implicit::cost(value, union).map(|_| union.clone())
+            }
             _ if self.is_numeric() && other.is_numeric() => {
                 Some(promote_numeric(self.clone(), other.clone()))
             }
@@ -1179,7 +1199,25 @@ impl TypeParser<'_> {
 
         match upper.as_str() {
             "STRUCT" | "ROW" => return self.parse_fields().map(LogicalType::Struct),
-            "UNION" => return self.parse_fields().map(LogicalType::Union),
+            "UNION" => {
+                // A tag is one byte, so the pin's grammar takes one to 256 members and no more.
+                let members = self.parse_fields()?;
+                if members.is_empty() || members.len() > 256 {
+                    return Err(Error::parser("syntax error at or near \")\"".to_string()));
+                }
+                for (at, member) in members.iter().enumerate() {
+                    if members[..at]
+                        .iter()
+                        .any(|other| other.name.eq_ignore_ascii_case(&member.name))
+                    {
+                        return Err(Error::binder(format!(
+                            "Duplicate UNION type member name \"{}\"",
+                            member.name
+                        )));
+                    }
+                }
+                return Ok(LogicalType::Union(members));
+            }
             "ENUM" if self.peek() == Some(&Token::LeftParen) => return self.parse_labels(),
             "ENUM" => {
                 return Err(Error::binder("ENUM type requires at least one argument".to_string()));

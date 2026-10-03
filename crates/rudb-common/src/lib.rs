@@ -31,6 +31,7 @@ pub mod clustering;
 pub mod error;
 pub mod generated;
 pub mod heap;
+pub mod implicit;
 pub mod memory;
 pub mod rules;
 pub mod sequence;

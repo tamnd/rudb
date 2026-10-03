@@ -150,6 +150,32 @@ impl Binder<'_> {
                     None => self.bind_call(ast, name, args, distinct, filter, &[], scope),
                 }
             }
+            ast::Expr::Function { name, args, distinct, filter }
+                if name.len == 1
+                    && !distinct
+                    && filter == NONE
+                    && rudb_catalog::same_name(
+                        ast.name(name).last().unwrap_or_default(),
+                        crate::structs::UNION_VALUE,
+                    ) =>
+            {
+                let mut names = Vec::new();
+                let mut bound = Vec::new();
+                for &arg in ast.expr_list(args) {
+                    names.push(String::new());
+                    bound.push(self.bind_expr(ast, arg, scope)?);
+                }
+                for target in ast.named_args(expr).to_vec() {
+                    names.push(ast.string(target.alias).to_string());
+                    bound.push(self.bind_expr(ast, target.expr, scope)?);
+                }
+                if names.len() == 1 && names[0].is_empty() {
+                    return Err(Error::binder(
+                        "Need named argument for union tag, e.g. UNION_VALUE(a := b)",
+                    ));
+                }
+                self.union_value(&names, &bound)
+            }
             ast::Expr::Function { name, args, .. } if !ast.named_args(expr).is_empty() => {
                 let written = ast.name(name).last().unwrap_or_default().to_string();
                 let sorted = ast.aggregate_order(expr);
@@ -659,16 +685,22 @@ impl Binder<'_> {
             };
             if !matches!(
                 self.plan().expr_type(expr),
-                LogicalType::Struct(_) | LogicalType::Map(..) | LogicalType::Json
+                LogicalType::Struct(_)
+                    | LogicalType::Union(_)
+                    | LogicalType::Map(..)
+                    | LogicalType::Json
             ) {
                 continue;
             }
             // A name after a map is a key, as `m['a']` would be, and a key missing from the map is
-            // null. A name after a JSON value is a key of the object it holds.
+            // null. A name after a JSON value is a key of the object it holds, and a name after a
+            // union is a member, null in a row holding another one.
             for field in &parts[split..] {
                 let key = self.add_constant(Value::Varchar((*field).to_string()));
                 let picked = if matches!(self.plan().expr_type(expr), LogicalType::Map(..)) {
                     self.map_call("map_extract_value", &[expr, key])?
+                } else if matches!(self.plan().expr_type(expr), LogicalType::Union(_)) {
+                    self.union_call("union_extract", &[expr, key])?
                 } else if *self.plan().expr_type(expr) == LogicalType::Json {
                     self.json_field("struct_extract", &[expr, key])?
                 } else {
@@ -980,6 +1012,9 @@ impl Binder<'_> {
             return Ok(call);
         }
         if let Some(call) = self.state_call(&written, &bound)? {
+            return Ok(call);
+        }
+        if let Some(call) = self.union_call(&written, &bound)? {
             return Ok(call);
         }
         if let Some(field) = self.struct_field(&written, &bound)? {

@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use crate::types::LogicalType;
+use crate::types::{Field, LogicalType};
 
 /// A single SQL value.
 ///
@@ -146,6 +146,19 @@ pub enum Value {
         /// The entries, in order.
         entries: Vec<(Value, Value)>,
     },
+    /// A union, which holds one of its members and is tagged with which.
+    ///
+    /// The members are carried so that a value knows its type, as a list knows its element type.
+    /// The value may be a null while the union is not, which is what `union_value(a := NULL)` is,
+    /// and it is told apart from a null union by being this arm rather than [`Value::Null`].
+    Union {
+        /// The members, by name and type, in order.
+        members: Vec<Field>,
+        /// The position of the member held.
+        tag: u8,
+        /// The value of that member.
+        value: Box<Value>,
+    },
 }
 
 impl Value {
@@ -197,6 +210,12 @@ impl Value {
                     + entries.capacity() * size_of::<(Self, Self)>()
                     + entries.iter().map(|(key, value)| key.heap() + value.heap()).sum::<usize>()
             }
+            Self::Union { members, value, .. } => {
+                members.capacity() * size_of::<Field>()
+                    + members.iter().map(|member| member.name.capacity()).sum::<usize>()
+                    + size_of::<Self>()
+                    + value.heap()
+            }
             _ => 0,
         }
     }
@@ -243,12 +262,10 @@ impl Value {
             Self::Interval { .. } => LogicalType::Interval,
             Self::List { element, .. } => LogicalType::list(element.clone()),
             Self::Struct(fields) => LogicalType::Struct(
-                fields
-                    .iter()
-                    .map(|(name, value)| crate::types::Field::new(name, value.logical_type()))
-                    .collect(),
+                fields.iter().map(|(name, value)| Field::new(name, value.logical_type())).collect(),
             ),
             Self::Map { key, value, .. } => LogicalType::Map(key.clone(), value.clone()),
+            Self::Union { members, .. } => LogicalType::Union(members.clone()),
         }
     }
 
@@ -261,7 +278,7 @@ impl Value {
     pub fn is_of(&self, ty: &LogicalType) -> bool {
         use LogicalType as T;
         match (self, ty) {
-            (Self::List { .. } | Self::Struct(_) | Self::Map { .. }, _) => {
+            (Self::List { .. } | Self::Struct(_) | Self::Map { .. } | Self::Union { .. }, _) => {
                 &self.logical_type() == ty
             }
             (Self::Decimal { width, scale, .. }, T::Decimal { width: to, scale: at }) => {
@@ -433,6 +450,8 @@ impl fmt::Display for Value {
                 }
                 f.write_str("}")
             }
+            // A union prints as the member it holds, with nothing to say which one that is.
+            Self::Union { value, .. } => write!(f, "{value}"),
         }
     }
 }
@@ -641,6 +660,7 @@ fn write_element(f: &mut fmt::Formatter<'_>, value: &Value) -> fmt::Result {
         Value::Null | Value::List { .. } | Value::Struct(_) | Value::Map { .. } => {
             return write!(f, "{value}");
         }
+        Value::Union { value, .. } => return write_element(f, value),
         _ => {
             printed = value.to_string();
             &printed

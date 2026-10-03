@@ -21,6 +21,15 @@ pub(crate) const STRUCT_PACK: &str = "struct_pack";
 /// The name the plan records for picking one field out of a struct.
 pub(crate) const STRUCT_EXTRACT: &str = "struct_extract";
 
+/// The name the plan records for a union of one member.
+pub(crate) const UNION_VALUE: &str = "union_value";
+
+/// The name the plan records for the member a union row holds.
+const UNION_TAG: &str = "union_tag";
+
+/// The name the plan records for picking one member out of a union.
+const UNION_EXTRACT: &str = "union_extract";
+
 /// The call that picks a field out of any struct by its place, named or not.
 const STRUCT_EXTRACT_AT: &str = "struct_extract_at";
 
@@ -183,6 +192,81 @@ impl Binder<'_> {
         let args = self.plan_mut().add_expr_list(&[bound[0], key]);
         let recorded = self.plan_mut().intern(STRUCT_EXTRACT);
         let returns = fields[index as usize - 1].ty.clone();
+        Ok(self.add_expr(Expr::Function { name: recorded, args }, returns))
+    }
+
+    /// `union_tag(u)`, `union_extract(u, 'k')` and `u.k`, or `None` when the call is not one of
+    /// those on a union.
+    ///
+    /// The tag answers an enum of the member names, and a member answers its own type, so both are
+    /// typed here. The member is found without case and recorded by its place counted from one, the
+    /// way a struct field is, and a row holding another member answers null for it.
+    pub(crate) fn union_call(
+        &mut self,
+        written: &str,
+        bound: &[ExprRef],
+    ) -> Result<Option<ExprRef>> {
+        let tag = rudb_catalog::same_name(written, UNION_TAG);
+        let extract = rudb_catalog::same_name(written, UNION_EXTRACT);
+        if !tag && !extract && !rudb_catalog::same_name(written, STRUCT_EXTRACT) {
+            return Ok(None);
+        }
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+        let members = match types.first() {
+            Some(LogicalType::Union(members)) => members.clone(),
+            _ if tag || extract => return Err(mismatch(&written.to_ascii_lowercase(), &types)),
+            _ => return Ok(None),
+        };
+        if tag {
+            let [input] = bound[..] else {
+                return Err(mismatch(UNION_TAG, &types));
+            };
+            let labels: Vec<String> = members.iter().map(|member| member.name.clone()).collect();
+            let args = self.plan_mut().add_expr_list(&[input]);
+            let recorded = self.plan_mut().intern(UNION_TAG);
+            let returns = LogicalType::Enum(labels.into());
+            return Ok(Some(self.add_expr(Expr::Function { name: recorded, args }, returns)));
+        }
+        let (&[input, key], Some(LogicalType::Varchar | LogicalType::Null)) = (bound, types.get(1))
+        else {
+            return Err(mismatch(UNION_EXTRACT, &types));
+        };
+        let at = match fold::value_of(self.plan(), key) {
+            Ok(Some(Value::Null)) => return Ok(Some(self.add_constant(Value::Null))),
+            Ok(Some(Value::Varchar(name))) => members
+                .iter()
+                .position(|member| member.name.eq_ignore_ascii_case(&name))
+                .ok_or_else(|| {
+                    let entries: Vec<String> =
+                        members.iter().map(|member| format!("\"{}\"", member.name)).collect();
+                    Error::binder(format!(
+                        "Could not find key \"{name}\" in union\nCandidate Entries: {}",
+                        entries.join(", ")
+                    ))
+                })?,
+            _ => {
+                return Err(Error::binder(
+                    "Key name for union_extract needs to be a constant string",
+                ));
+            }
+        };
+        let key = self.add_constant(Value::BigInt(at as i64 + 1));
+        let args = self.plan_mut().add_expr_list(&[input, key]);
+        let recorded = self.plan_mut().intern(UNION_EXTRACT);
+        Ok(Some(self.add_expr(Expr::Function { name: recorded, args }, members[at].ty.clone())))
+    }
+
+    /// `union_value(k := v)`, a union of the one member it names, holding the value even when the
+    /// value is a null.
+    pub(crate) fn union_value(&mut self, names: &[String], values: &[ExprRef]) -> Result<ExprRef> {
+        let ([name], &[value]) = (names, values) else {
+            return Err(Error::binder("union_value takes exactly one argument"));
+        };
+        let ty = self.plan().expr_type(value).clone();
+        let args = self.plan_mut().add_expr_list(&[value]);
+        let recorded = self.plan_mut().intern(UNION_VALUE);
+        let returns = LogicalType::Union(vec![Field::new(name.clone(), ty)]);
         Ok(self.add_expr(Expr::Function { name: recorded, args }, returns))
     }
 

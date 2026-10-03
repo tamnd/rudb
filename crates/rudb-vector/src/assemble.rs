@@ -81,7 +81,7 @@ impl Assembly {
     ///
     /// # Errors
     ///
-    /// If the type is one there is no flat layout for yet, which today means `UNION`.
+    /// Never today, since every type has a layout to assemble into.
     pub fn new(ty: LogicalType, rows: usize) -> Result<Self> {
         let ty = ty.storage().clone();
         let nested = matches!(
@@ -90,6 +90,7 @@ impl Assembly {
                 | LogicalType::Array(..)
                 | LogicalType::Struct(_)
                 | LogicalType::Map(_, _)
+                | LogicalType::Union(_)
         );
         let values = if nested { Some(vec![Value::Null; rows]) } else { None };
         let data = if nested { Data::Empty } else { empty_data_for(&ty)? };
@@ -744,6 +745,7 @@ pub fn interleave_placed(
             | LogicalType::Array(..)
             | LogicalType::Struct(_)
             | LogicalType::Map(_, _)
+            | LogicalType::Union(_)
     ) {
         // row at a time: the nested types, for the reason `Assembly::values` gives. They have no run
         // of data to lay end to end and no typed copy to gather with.
