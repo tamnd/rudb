@@ -157,6 +157,9 @@ pub struct Options {
     field_appearance_threshold: f64,
     map_inference_threshold: u64,
     maximum_sample_files: u64,
+    /// Whether every file is sampled and the columns of all of them merged, rather than the first
+    /// `maximum_sample_files`.
+    union_by_name: bool,
     convert_strings_to_integers: bool,
     date_format: Option<String>,
     timestamp_format: Option<String>,
@@ -355,6 +358,7 @@ impl Options {
             field_appearance_threshold: 0.1,
             map_inference_threshold: 200,
             maximum_sample_files: 32,
+            union_by_name: false,
             convert_strings_to_integers: false,
             date_format: None,
             timestamp_format: None,
@@ -571,12 +575,12 @@ impl Options {
                     },
                 };
             }
+            "union_by_name" => self.union_by_name = flag(),
             "allow_empty"
             | "geojson"
             | "hive_partitioning"
             | "hive_types"
-            | "hive_types_autocast"
-            | "union_by_name" => {
+            | "hive_types_autocast" => {
                 return Err(Error::not_implemented(format!(
                     "read_json does not take \"{name}\" yet"
                 )));
@@ -1832,7 +1836,9 @@ fn bind_one(options: &Options, file: &str, text: Arc<str>) -> Result<Bound> {
 
 /// Works out the columns of a read and how it is settled, the way the pin's bind does: one file
 /// alone, and several by binding each of the first `maximum_sample_files` alone and merging what
-/// was detected in them.
+/// was detected in them. With `union_by_name` every file is bound, which is all the option does
+/// here: the pin merges what each file's sample found the same way either way, so a key one file
+/// lacks is a null in that file's rows and a key two files disagree on gets the merged type.
 ///
 /// # Errors
 ///
@@ -1858,8 +1864,11 @@ fn bind_columns(
     files: &[String],
     load: Load<'_>,
 ) -> Result<(Vec<Field>, Settled)> {
-    let sampled =
-        files.len().min(usize::try_from(options.maximum_sample_files).unwrap_or(usize::MAX));
+    let sampled = if options.union_by_name {
+        files.len()
+    } else {
+        files.len().min(usize::try_from(options.maximum_sample_files).unwrap_or(usize::MAX))
+    };
     let mut bounds = Vec::with_capacity(sampled);
     for file in &files[..sampled.max(1).min(files.len())] {
         let text = Arc::from(load(file)?);
