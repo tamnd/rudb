@@ -324,3 +324,41 @@ fn union_by_name_samples_every_file_and_merges_the_columns_by_name() {
         "Invalid Input Error: Failed to cast value: Could not convert string 'x' to BOOL"
     );
 }
+
+#[test]
+fn allow_empty_reads_a_missing_file_as_one_empty_boolean_column() {
+    let files = Files::new();
+    files.check(&[
+        ("SELECT count(*) FROM read_json('D/nope.json', allow_empty=true)", "0"),
+        (
+            "SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_json('D/nope*.json', \
+             allow_empty=true, columns={a: 'INT'}, filename=true))",
+            "empty|BOOLEAN",
+        ),
+        (
+            "SELECT column_name FROM (DESCRIBE SELECT * FROM read_json_objects('D/nope.json', \
+             allow_empty=true))",
+            "empty",
+        ),
+        (
+            "SELECT * FROM read_json(['D/nope*.json', 'D/u1.json'], allow_empty=true)",
+            "1|true\n2|false",
+        ),
+    ]);
+    for (sql, expected) in [
+        (
+            "SELECT * FROM read_json('D/nope.json', allow_empty=false)",
+            "IO Error: No files found that match the pattern \"D/nope.json\"",
+        ),
+        (
+            "SELECT * FROM read_json('D/nope.json', allow_empty='x')",
+            "Invalid Input Error: Failed to cast value: Could not convert string 'x' to BOOL",
+        ),
+        (
+            "SELECT * FROM read_json(['D/nope.json', 'D/u1.json'])",
+            "IO Error: No files found that match the pattern \"D/nope.json\"",
+        ),
+    ] {
+        assert_eq!(files.refused(sql), expected, "{sql}");
+    }
+}

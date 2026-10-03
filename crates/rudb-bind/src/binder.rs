@@ -2562,8 +2562,17 @@ impl<'a> Binder<'a> {
                 // matched. The executor is handed names rather than a pattern, so it never walks a
                 // directory and the answer cannot change between binding a prepared statement and
                 // running it, which is the same reason the schema is settled here.
+                let empty_allowed = resolved.function.json().is_some() && {
+                    let named: Vec<(&str, Value)> = written_options
+                        .iter()
+                        .map(|(parameter, value, _)| (*parameter, value.clone()))
+                        .collect();
+                    scan::allows_empty(&named)?
+                };
                 let paths = if resolved.function == TableFunction::ReadSingleJsonFile {
                     self.single_path(cast[0], resolved.function.name())?
+                } else if empty_allowed {
+                    self.paths_or_none(cast[0], resolved.function.name())?
                 } else {
                     self.file_paths(cast[0], resolved.function.name())?
                 };
@@ -3270,6 +3279,16 @@ impl<'a> Binder<'a> {
         let mut paths = Vec::new();
         for pattern in self.file_patterns(expr, name)? {
             paths.extend(files(&pattern)?);
+        }
+        Ok(paths)
+    }
+
+    /// The files a JSON read with `allow_empty` names, where a pattern that matches nothing adds
+    /// nothing rather than failing, so the call can come to no files at all.
+    fn paths_or_none(&self, expr: ExprRef, name: &str) -> Result<Vec<String>> {
+        let mut paths = Vec::new();
+        for pattern in self.file_patterns(expr, name)? {
+            paths.extend(content_files(&pattern)?);
         }
         Ok(paths)
     }
