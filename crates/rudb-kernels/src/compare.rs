@@ -3511,8 +3511,8 @@ mod tests {
     /// over rows that do not fill the last block.
     #[test]
     fn a_mask_keeps_the_rows_its_bounds_keep() {
-        let rows = 1000;
-        let values: Vec<i32> = (0..rows).map(|row| 700 + (row * 37) % 600).collect();
+        let rows: usize = 1000;
+        let values: Vec<i32> = (0..1000).map(|row| 700 + (row * 37) % 600).collect();
         let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.clone().into()))
             .expect("integers are an i32 layout");
         let packed = flat.bit_packed().expect("packs");

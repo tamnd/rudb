@@ -2496,16 +2496,15 @@ mod tests {
             ],
             0,
         );
-        let rows = 1000;
-        let x: Vec<i32> = (0..rows).map(|row| 700 + (row * 37) % 600).collect();
-        let y: Vec<i64> = (0..rows).map(|row| i64::from((row * 11) % 50)).collect();
+        let x: Vec<i32> = (0..1000).map(|row| 700 + (row * 37) % 600).collect();
+        let y: Vec<i64> = (0..1000).map(|row| (row * 11) % 50).collect();
         let x = Vector::flat(LogicalType::Integer, rudb_vector::Data::Int32(x.into()))
             .expect("integers are an i32 layout");
         let y = Vector::flat(LogicalType::BigInt, rudb_vector::Data::Int64(y.into()))
             .expect("bigints are an i64 layout");
         let words = Vector::from_values(
             LogicalType::Varchar,
-            &(0..rows).map(|row| Value::Varchar(["a", "b"][row % 2].into())).collect::<Vec<_>>(),
+            &(0..1000).map(|row| Value::Varchar(["a", "b"][row % 2].into())).collect::<Vec<_>>(),
         )
         .expect("strings");
         let predicates = [
