@@ -28,13 +28,17 @@
 //! and it is where a compressor belongs, since a compressor that nothing writes with is a
 //! compressor nothing tests.
 //!
+//! Gzip in [`gzip`], for whole files rather than Parquet pages. A JSON or CSV file ending in `.gz`
+//! is the common case, and it is a stream with members and a trailer rather than a block.
+//!
 //! # What is not here yet
 //!
-//! gzip, LZ4 and brotli. `spec/engine/05-scan.md` defers them by name at 2d. A file in one of them
-//! should say so clearly rather than be read slowly by an untested decoder.
+//! LZ4 and brotli, and gzip as a Parquet codec. `spec/engine/05-scan.md` defers them by name at 2d.
+//! A file in one of them should say so clearly rather than be read slowly by an untested decoder.
 
 #![deny(unsafe_code)]
 
+pub mod gzip;
 pub mod snappy;
 pub mod zstd;
 

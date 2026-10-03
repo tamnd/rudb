@@ -110,7 +110,7 @@ impl Format {
         })
     }
 
-    fn parsed(format: &str) -> std::result::Result<Self, String> {
+    pub(crate) fn parsed(format: &str) -> std::result::Result<Self, String> {
         if format.is_empty() {
             return Err("Empty format string".to_string());
         }

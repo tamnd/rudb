@@ -19,9 +19,11 @@ use rudb_common::{Error, Field, LogicalType, Result, Session, SessionTimeZone, V
 use rudb_csv::{Part, Reader as CsvReader, Split};
 use rudb_encoding::sequence::Sequence;
 use rudb_functions::{
-    FILE_ROW_NUMBER, Given, TableFunction, csv_given, open_csv, open_parquet, series_length,
+    FILE_ROW_NUMBER, Given, TableFunction, csv_given, json_text, open_csv, open_parquet,
+    series_length,
 };
 use rudb_graph::{NO_PARENT, Rid, Rids};
+use rudb_kernels::json::scan;
 use rudb_kernels::{Stepping, cast, moment_steps, zoned_steps};
 use rudb_metrics::Counters;
 use rudb_native::{Reader as NativeReader, RunProjectionPart, RunProjectionScan};
@@ -3377,6 +3379,8 @@ pub(crate) struct FileScan<'a> {
     function: TableFunction,
     paths: Vec<String>,
     given: Given,
+    /// What a JSON read's parameters say and how its bind settled, and `None` for any other read.
+    json: Option<Arc<(scan::Options, scan::Settled)>>,
     wanted: Vec<Field>,
     /// Whether the last column the scan produces is the row's ordinal inside its own file.
     ///
@@ -3717,6 +3721,10 @@ impl<'a> FileScan<'a> {
     ) -> Result<Self> {
         let paths = file_arguments(plan, args, function)?;
         let given = csv_options(plan, options, settings)?;
+        let json = match function.json() {
+            Some(kind) => Some(Arc::new(json_options(plan, kind, options, settings)?)),
+            None => None,
+        };
         let produced = plan.field_list(columns).to_vec();
         // The binder puts the counted column last and nothing between here and there reorders a
         // scan's columns, so the flag is whether the last one is it. Pruning can drop it, in which
@@ -3729,6 +3737,7 @@ impl<'a> FileScan<'a> {
             function,
             paths,
             given,
+            json,
             wanted,
             numbered,
             schema: Schema::numbered(produced, index),
@@ -3840,7 +3849,8 @@ impl<'a> FileScan<'a> {
         cutting.pieces = 1;
         cutting.skipping = Vec::new();
         let Some(path) = self.paths.get(cutting.at) else { return Ok(()) };
-        let mut reader = FileReader::open(self.function, path, self.given.clone())?;
+        let mut reader =
+            FileReader::open(self.function, path, self.given.clone(), self.json.as_ref())?;
         let first = if cutting.at == 0 { None } else { self.paths.first().map(String::as_str) };
         let held = positions(self.function, &self.wanted, &reader.fields(), path, first)?;
         reader.project(&held)?;
@@ -3979,7 +3989,7 @@ impl<'a> FileScan<'a> {
                     .saturating_add(i64::try_from(piece.end - piece.start).unwrap_or(i64::MAX));
                 Piece { file, reader: Some(FileReader::Parquet(split)), failure: None, row }
             }
-            Some(FileReader::Csv(_)) => {
+            Some(FileReader::Csv(_) | FileReader::Json(_)) => {
                 Piece { file, reader: cutting.reader.take(), failure: None, row: 0 }
             }
             // Either the row groups of the file being cut have all been handed out, or there is no
@@ -4167,12 +4177,21 @@ impl Source for FileScan<'_> {
 enum FileReader {
     Parquet(Reader),
     Csv(CsvReader),
+    Json(JsonReader),
     Part(Part),
 }
 
 impl FileReader {
     /// Opens `path` with the reader `function` names.
-    fn open(function: TableFunction, path: &str, given: Given) -> Result<Self> {
+    fn open(
+        function: TableFunction,
+        path: &str,
+        given: Given,
+        json: Option<&Arc<(scan::Options, scan::Settled)>>,
+    ) -> Result<Self> {
+        if let Some(json) = json {
+            return Ok(Self::Json(JsonReader::open(path, Arc::clone(json))?));
+        }
         match function {
             TableFunction::ReadCsv => Ok(Self::Csv(open_csv(path, given)?)),
             _ => Ok(Self::Parquet(open_parquet(path)?)),
@@ -4184,6 +4203,7 @@ impl FileReader {
         match self {
             Self::Parquet(reader) => reader.fields(),
             Self::Csv(reader) => reader.fields(),
+            Self::Json(reader) => reader.fields(),
             Self::Part(_) => Vec::new(),
         }
     }
@@ -4193,6 +4213,7 @@ impl FileReader {
         match self {
             Self::Parquet(reader) => reader.project(columns),
             Self::Csv(reader) => reader.project(columns),
+            Self::Json(_) => Ok(()),
             Self::Part(_) => Err(cut_already()),
         }
     }
@@ -4218,6 +4239,7 @@ impl FileReader {
                 let types: Vec<LogicalType> = wanted.iter().map(|field| field.ty.clone()).collect();
                 reader.retype(&types)
             }
+            Self::Json(reader) => reader.settle(wanted),
             Self::Part(_) => Err(cut_already()),
         }
     }
@@ -4227,6 +4249,7 @@ impl FileReader {
         match self {
             Self::Parquet(reader) => reader.next_chunk(),
             Self::Csv(reader) => reader.next_chunk(),
+            Self::Json(reader) => reader.next_chunk(),
             Self::Part(part) => part.next_chunk(),
         }
     }
@@ -4237,7 +4260,7 @@ impl FileReader {
     fn row_groups(&self) -> usize {
         match self {
             Self::Parquet(reader) => reader.metadata().row_groups.len(),
-            Self::Csv(_) | Self::Part(_) => 0,
+            Self::Csv(_) | Self::Json(_) | Self::Part(_) => 0,
         }
     }
 
@@ -4246,9 +4269,84 @@ impl FileReader {
         match self {
             Self::Parquet(reader) => reader.bytes_read(),
             Self::Csv(reader) => reader.bytes_read(),
+            Self::Json(reader) => reader.bytes,
             Self::Part(part) => part.bytes_read(),
         }
     }
+}
+
+/// One JSON file being read.
+///
+/// The file is read whole when it is opened, which is what the pin's reader does with any file
+/// that fits its buffer, and taken apart a chunk of documents at a time. Its columns are the ones
+/// the bind settled on rather than anything in the file, so a later file of a set is read into the
+/// first one's columns, and a document that does not fit them is the pin's transform error.
+#[derive(Debug)]
+struct JsonReader {
+    path: String,
+    text: Arc<str>,
+    json: Arc<(scan::Options, scan::Settled)>,
+    reading: Option<scan::Reading>,
+    bytes: u64,
+}
+
+impl JsonReader {
+    fn open(path: &str, json: Arc<(scan::Options, scan::Settled)>) -> Result<Self> {
+        let text: Arc<str> = Arc::from(json_text(path, json.0.compression)?);
+        let bytes = text.len() as u64;
+        Ok(Self { path: path.to_string(), text, json, reading: None, bytes })
+    }
+
+    /// The columns the bind settled on, by name, and the file's name when the call asked for it.
+    /// Their types are the plan's to say.
+    fn fields(&self) -> Vec<Field> {
+        let (options, settled) = &*self.json;
+        settled
+            .names
+            .iter()
+            .chain(&options.filename)
+            .map(|name| Field::new(name.clone(), LogicalType::Json))
+            .collect()
+    }
+
+    fn settle(&mut self, wanted: &[Field]) -> Result<()> {
+        let (options, settled) = &*self.json;
+        let text = Arc::clone(&self.text);
+        self.reading = Some(scan::Reading::new(&self.path, text, options, settled, wanted)?);
+        Ok(())
+    }
+
+    fn next_chunk(&mut self) -> Result<Option<Chunk>> {
+        match &mut self.reading {
+            Some(reading) => reading.next_chunk(),
+            None => Err(Error::internal("a JSON file was read before its columns were settled")),
+        }
+    }
+}
+
+/// What a JSON read's named parameters say, and how the bind settled it, from the plan.
+fn json_options(
+    plan: &Plan,
+    kind: scan::Function,
+    options: Slice,
+    settings: Slice,
+) -> Result<(scan::Options, scan::Settled)> {
+    let exprs: Vec<ExprRef> = plan.expr_list(settings).to_vec();
+    let source = Schema::empty();
+    let one = Chunk::with_rows(Vec::new(), 1)?;
+    let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
+    let names: Vec<&str> = plan.name_list(options).iter().map(|name| plan.string(*name)).collect();
+    let written: Vec<(&str, Value)> =
+        names.into_iter().zip(evaluated.iter().map(|vector| vector.value_at(0))).collect();
+    let settled = written
+        .iter()
+        .find_map(|(name, value)| match value {
+            Value::Varchar(text) if *name == scan::SETTLED => Some(text.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| Error::internal("a JSON read planned without its settlement"))?;
+    let settled = scan::Settled::from_written(settled)?;
+    Ok((scan::Options::parse(kind, &written, None)?, settled))
 }
 
 /// What asking a range of a CSV file to be something other than read comes to, which is a scan
