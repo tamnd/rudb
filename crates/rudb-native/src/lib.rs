@@ -20653,8 +20653,8 @@ mod tests {
     fn a_strided_cascade_page_is_read_back_packed() {
         let path = path("strided-codes");
         let ty = LogicalType::Decimal { width: 15, scale: 2 };
-        let mut writer =
-            Writer::create(&path, "items", vec![Field::new("quantity", ty.clone())]).expect("new file");
+        let mut writer = Writer::create(&path, "items", vec![Field::new("quantity", ty.clone())])
+            .expect("new file");
         let values: Vec<i64> = (0..2048).map(|row| (row * 7 % 50 + 1) * 100).collect();
         let column = Vector::flat(ty, Data::Int64(values.clone().into())).expect("decimals");
         writer.append(&Chunk::new(vec![column]).expect("one column")).expect("a part");
