@@ -698,7 +698,9 @@ impl KeyMap {
     /// knows which parent each of its rows has can take its key column from here rather than decode
     /// it. Only the identity and dense forms answer, since a row's key there is its place among the
     /// keys present, and the rows a link hands over usually rise, so each search starts at the word
-    /// the last one ended in. `None` for the other forms, or for a row past the last.
+    /// the last one ended in. They also come in runs, one parent row for each of its children, and
+    /// a row the same as the last one is the key the last one had. `None` for the other forms, or
+    /// for a row past the last.
     #[must_use]
     pub fn keys_at(&self, rids: &[Rid]) -> Option<Vec<i128>> {
         match &self.body {
@@ -708,12 +710,21 @@ impl KeyMap {
             Body::Dense { base, bits, rank, .. } => {
                 let mut out = Vec::with_capacity(rids.len());
                 let mut last = (0, 0);
+                let mut held = None;
                 for &rid in rids {
+                    if let Some((was, key)) = held
+                        && was == rid
+                    {
+                        out.push(key);
+                        continue;
+                    }
                     let from = if rid >= last.0 { last.1 } else { 0 };
                     let (word, within) = rank.word_holding(rid, from)?;
                     let offset = word as u64 * 64 + u64::from(nth_set(bits[word], within));
-                    out.push(base + i128::from(offset));
+                    let key = base + i128::from(offset);
+                    out.push(key);
                     last = (rid, word);
+                    held = Some((rid, key));
                 }
                 Some(out)
             }
