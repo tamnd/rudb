@@ -1231,7 +1231,7 @@ impl Tree {
             Node::Signed(_) => {
                 self.description(Kind::BigInt);
             }
-            Node::Real(_) | Node::Raw(_) => {
+            Node::Real(..) | Node::Raw(_) => {
                 self.description(Kind::Double);
             }
             Node::Str(_) => {
