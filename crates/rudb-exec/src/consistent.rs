@@ -87,7 +87,7 @@
 //! answers the first chunk it is given with [`Progress::Done`], which stops its scan.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_catalog::Table;
@@ -280,6 +280,10 @@ pub(crate) struct Reduction {
     /// What the held rows are charged, for as long as they are held.
     charged: Mutex<Vec<Reservation>>,
     memory: Memory,
+    /// How many relations have finished their first sweep.
+    finished: AtomicUsize,
+    /// The answer of the second sweep, when the last relation to finish ran it.
+    answered: Mutex<Option<Option<Vec<Accumulator>>>>,
 }
 
 impl Reduction {
@@ -391,6 +395,8 @@ impl Reduction {
             empty: AtomicBool::new(false),
             charged: Mutex::new(Vec::new()),
             memory: memory.clone(),
+            finished: AtomicUsize::new(0),
+            answered: Mutex::new(None),
         })
     }
 
@@ -415,12 +421,26 @@ pub(crate) struct Collect<'a> {
     /// Where the keys this relation kept go for other scans, one edge per reader in the order of
     /// [`Reduction::readers`].
     feeds: Vec<Arc<Sideways<'a>>>,
+    /// Per extreme, the table and column it is read from when it is read late, for the second
+    /// sweep when this relation is the last to finish.
+    fetches: Vec<Option<(&'a Table, usize)>>,
 }
 
 impl<'a> Collect<'a> {
     /// The sink for relation `at` of the tree, handing what it keeps to `feeds` as well.
-    pub(crate) fn new(shared: Arc<Reduction>, at: usize, feeds: Vec<Arc<Sideways<'a>>>) -> Self {
-        Self { shared, at, feeds }
+    pub(crate) fn new(
+        shared: Arc<Reduction>,
+        at: usize,
+        feeds: Vec<Arc<Sideways<'a>>>,
+        fetches: Vec<Option<(&'a Table, usize)>>,
+    ) -> Self {
+        Self { shared, at, feeds, fetches }
+    }
+
+    /// Whether this relation is the last of its tree to finish, which is known once every other
+    /// relation's pipeline has run, because they all run before this one's lease is taken.
+    fn last(&self) -> bool {
+        self.shared.finished.load(Ordering::Acquire) + 1 == self.shared.roles.len()
     }
 }
 
@@ -558,7 +578,7 @@ impl Sink for Collect<'_> {
         Ok(())
     }
 
-    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
+    fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
         let shared = &self.shared;
         let role = &shared.roles[self.at];
         if *shared.kept[self.at].lock().map_err(poisoned)? == 0 {
@@ -579,14 +599,25 @@ impl Sink for Collect<'_> {
             }
         }
         let _ = shared.up[self.at].set(up);
-        if !role.trailing.is_empty() {
-            return Ok(());
+        if role.trailing.is_empty() {
+            for &(child, _) in &role.down {
+                let allowed =
+                    std::mem::take(&mut *shared.allowing[child].lock().map_err(poisoned)?);
+                let _ = shared.allowed[child].set(allowed);
+            }
         }
-        for &(child, _) in &role.down {
-            let allowed = std::mem::take(&mut *shared.allowing[child].lock().map_err(poisoned)?);
-            let _ = shared.allowed[child].set(allowed);
+        // The last relation to finish runs the second sweep on the threads its pipeline leased,
+        // which `finalize_degree` asked to be all of them, rather than leave it to the source of the
+        // one row, whose pipeline runs on one.
+        if shared.finished.fetch_add(1, Ordering::AcqRel) + 1 == shared.roles.len() {
+            let answer = sweep(shared, &self.fetches, Some(threads))?;
+            *shared.answered.lock().map_err(poisoned)? = Some(answer);
         }
         Ok(())
+    }
+
+    fn finalize_degree(&self, ceiling: usize) -> usize {
+        if self.last() { ceiling } else { 1 }
     }
 }
 
@@ -665,13 +696,16 @@ fn fold(
 /// rows a chunk may hold.
 const FETCHED: usize = rudb_vector::VECTOR_SIZE;
 
-/// Reads the column `column` of `table` at the rows `places` names and folds it into `extreme`.
+/// Reads the column `column` of `table` at the rows `places` names and folds it into `extreme`,
+/// a batch at a time over the threads of `lease`. `fresh` is an empty accumulator of the same kind.
 fn fetch(
     extreme: &mut Accumulator,
+    fresh: &Accumulator,
     table: &Table,
     column: usize,
     ty: &LogicalType,
     mut places: Vec<i64>,
+    lease: Option<&Lease<'_>>,
 ) -> Result<()> {
     places.sort_unstable();
     places.dedup();
@@ -680,9 +714,14 @@ fn fetch(
         .map(|place| u64::try_from(place).map_err(|_| Error::internal("a negative row place")))
         .collect::<Result<Vec<u64>>>()?;
     let types = std::slice::from_ref(ty);
-    for batch in places.chunks(FETCHED) {
-        let read = table.rows().rows_at(types, &[column], batch)?;
-        extreme.update_run(std::slice::from_ref(read.column(0)?), read.len())?;
+    let batches: Vec<&[u64]> = places.chunks(FETCHED).collect();
+    let widest = lease.map_or(1, Lease::degree).min(batches.len());
+    let built = spread(lease, widest, batches.len(), &|| fresh.clone(), &|folded, at| {
+        let read = table.rows().rows_at(types, &[column], batches[at])?;
+        folded.update_run(std::slice::from_ref(read.column(0)?), read.len())
+    })?;
+    for folded in &built {
+        extreme.combine(folded)?;
     }
     Ok(())
 }
@@ -714,103 +753,243 @@ impl<'a> Answer<'a> {
     }
 
     /// The extremes, or nothing when the join turned out to be empty.
+    ///
+    /// The last relation to finish has usually run the second sweep already, on its own lease, and
+    /// left the answer here. See [`Collect::finalize`].
     fn answer(&self) -> Result<Option<Vec<Accumulator>>> {
-        let shared = &self.shared;
-        if shared.empty.load(Ordering::Relaxed) {
+        if let Some(answered) = self.shared.answered.lock().map_err(poisoned)?.take() {
+            return Ok(answered);
+        }
+        sweep(&self.shared, &self.fetches, None)
+    }
+}
+
+/// How many held rows the second sweep gives each thread at the least.
+///
+/// Splitting a relation's held rows costs a wake and a merge of the key sets per thread, which is
+/// about what sweeping this many rows costs.
+const SWEPT: usize = 32_768;
+
+/// What one thread of the second sweep builds over the held rows of one relation.
+#[derive(Debug)]
+struct Sweeping {
+    down: Vec<Keys>,
+    extremes: Vec<Accumulator>,
+    places: Vec<Vec<i64>>,
+    survived: usize,
+    values: Vec<i64>,
+    nulls: Vec<bool>,
+    others: Vec<Vec<i64>>,
+}
+
+impl Sweeping {
+    fn new(shared: &Reduction, role: &Role) -> Self {
+        Self {
+            down: role.down.iter().map(|_| Keys::default()).collect(),
+            extremes: shared.fresh.clone(),
+            places: role.extremes.iter().map(|_| Vec::new()).collect(),
+            survived: 0,
+            values: Vec::new(),
+            nulls: Vec::new(),
+            others: role.down.iter().map(|_| Vec::new()).collect(),
+        }
+    }
+
+    /// Keeps the rows of `chunk` whose keys are allowed, and folds them in.
+    fn chunk(
+        &mut self,
+        role: &Role,
+        chunk: &Chunk,
+        permitted: Option<&Keys>,
+        trailed: &[&Keys],
+        fetches: &[Option<(&Table, usize)>],
+    ) -> Result<()> {
+        let rows = chunk.len();
+        let mut kept: Vec<u32> =
+            (0..u32::try_from(rows).map_err(|_| Error::internal("a huge chunk"))?).collect();
+        let first = usize::from(role.parent.is_some());
+        // The parent key is the first held column and the keys of the relations that trail it
+        // come next, which `Reduction::new` put there.
+        if let Some(permitted) = permitted {
+            read(chunk.column(0)?, rows, &mut self.values, &mut self.nulls)?;
+            permitted.filter(&self.values, &mut kept);
+        }
+        for (slot, keys) in trailed.iter().enumerate() {
+            if kept.is_empty() {
+                break;
+            }
+            read(chunk.column(first + slot)?, rows, &mut self.values, &mut self.nulls)?;
+            keys.filter(&self.values, &mut kept);
+        }
+        if kept.is_empty() {
+            return Ok(());
+        }
+        self.survived += kept.len();
+        let after = first + trailed.len();
+        for (slot, other) in self.others.iter_mut().enumerate() {
+            read(chunk.column(after + slot)?, rows, other, &mut self.nulls)?;
+            self.down[slot].insert_rows(other, &kept);
+        }
+        let after = after + role.down.len();
+        let mut direct = Vec::with_capacity(role.extremes.len());
+        for (slot, &(output, _)) in role.extremes.iter().enumerate() {
+            if fetches[output].is_some() {
+                read(chunk.column(after + slot)?, rows, &mut self.values, &mut self.nulls)?;
+                let values = &self.values;
+                self.places[slot].extend(kept.iter().map(|&row| values[row as usize]));
+            } else {
+                direct.push((output, after + slot));
+            }
+        }
+        let selection = Selection::from_indices(kept);
+        fold(&mut self.extremes, &direct, chunk, &selection)
+    }
+
+    /// Takes in what another thread built over other chunks of the same relation.
+    fn merge(&mut self, role: &Role, other: Self) -> Result<()> {
+        for (keys, more) in self.down.iter_mut().zip(other.down) {
+            keys.merge(more);
+        }
+        for &(output, _) in &role.extremes {
+            self.extremes[output].combine(&other.extremes[output])?;
+        }
+        for (places, more) in self.places.iter_mut().zip(other.places) {
+            places.extend(more);
+        }
+        self.survived += other.survived;
+        Ok(())
+    }
+}
+
+/// Runs `work` over the indices below `count` on up to `widest` threads of `lease`, each with a
+/// state from `start`, and hands back the states.
+///
+/// The indices are taken one at a time off a counter, so a thread that drew short pieces takes more
+/// of them. The first error any thread met is the one returned.
+fn spread<T: Send>(
+    lease: Option<&Lease<'_>>,
+    widest: usize,
+    count: usize,
+    start: &(dyn Fn() -> T + Sync),
+    work: &(dyn Fn(&mut T, usize) -> Result<()> + Sync),
+) -> Result<Vec<T>> {
+    let next = AtomicUsize::new(0);
+    let done: Mutex<Vec<T>> = Mutex::new(Vec::new());
+    let failed: Mutex<Option<Error>> = Mutex::new(None);
+    let run = || {
+        let mut state = start();
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            if at >= count {
+                break;
+            }
+            if let Err(error) = work(&mut state, at) {
+                if let Ok(mut failed) = failed.lock() {
+                    failed.get_or_insert(error);
+                }
+                next.store(count, Ordering::Relaxed);
+                break;
+            }
+        }
+        if let Ok(mut done) = done.lock() {
+            done.push(state);
+        }
+    };
+    let panicked = match lease {
+        Some(lease) if widest > 1 => lease.scatter_at_most(widest, &run, run).1,
+        _ => {
+            run();
+            false
+        }
+    };
+    if panicked {
+        return Err(Error::internal("a thread panicked in the second sweep"));
+    }
+    if let Some(error) = failed.into_inner().map_err(poisoned)? {
+        return Err(error);
+    }
+    done.into_inner().map_err(poisoned)
+}
+
+/// The second sweep, from the roots down, over the rows the relations held.
+///
+/// Each relation's held chunks are split over the threads of `lease` when there are enough rows to
+/// pay for it. On JOB 8c this is four million held rows of `aka_name`, `cast_info`, `title` and
+/// `movie_companies`, and on one thread it was 75 of the query's 130 milliseconds with the rest of
+/// the machine parked.
+fn sweep(
+    shared: &Reduction,
+    fetches: &[Option<(&Table, usize)>],
+    lease: Option<&Lease<'_>>,
+) -> Result<Option<Vec<Accumulator>>> {
+    if shared.empty.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let mut extremes = shared.accumulators()?;
+    let count = shared.roles.len();
+    let mut allowed: Vec<Option<Keys>> = (0..count).map(|_| None).collect();
+    let threads = lease.map_or(1, Lease::degree);
+    for &at in &shared.sweep {
+        let role = &shared.roles[at];
+        let Some(columns) = &role.held else { continue };
+        // A child of a root was allowed its keys by the root's sink, and every other held
+        // relation by its parent a step earlier in this loop. A root that relations trail is
+        // allowed what they kept instead.
+        let owned = allowed[at].take();
+        let permitted: Option<&Keys> = match &owned {
+            Some(keys) => Some(keys),
+            None if role.parent.is_none() => None,
+            None => Some(
+                shared.allowed[at]
+                    .get()
+                    .ok_or_else(|| Error::internal("a held relation with no allowed keys"))?,
+            ),
+        };
+        let mut trailed = Vec::with_capacity(role.trailing.len());
+        for &(child, _) in &role.trailing {
+            trailed.push(shared.up[child].get().ok_or_else(|| {
+                Error::internal("a root was swept before a relation that trails it finished")
+            })?);
+        }
+        let first = usize::from(role.parent.is_some());
+        let chunks = std::mem::take(&mut *shared.held[at].lock().map_err(poisoned)?);
+        let rows: usize = chunks.iter().map(Chunk::len).sum();
+        let widest = threads.min(chunks.len()).min(rows / SWEPT + 1);
+        let built = spread(
+            lease,
+            widest,
+            chunks.len(),
+            &|| Sweeping::new(shared, role),
+            &|state, index| state.chunk(role, &chunks[index], permitted, &trailed, fetches),
+        )?;
+        drop(chunks);
+        let mut built = built.into_iter();
+        let mut swept = built.next().unwrap_or_else(|| Sweeping::new(shared, role));
+        for other in built {
+            swept.merge(role, other)?;
+        }
+        for &(output, _) in &role.extremes {
+            extremes[output].combine(&swept.extremes[output])?;
+        }
+        for (&(output, _), places) in role.extremes.iter().zip(swept.places) {
+            if let Some((table, column)) = fetches[output] {
+                let fresh = &shared.fresh[output];
+                let ty = &shared.types[output];
+                fetch(&mut extremes[output], fresh, table, column, ty, places, lease)?;
+            }
+        }
+        debug_assert_eq!(
+            columns.len(),
+            first + trailed.len() + role.down.len() + role.extremes.len()
+        );
+        if swept.survived == 0 {
             return Ok(None);
         }
-        let mut extremes = shared.accumulators()?;
-        let count = shared.roles.len();
-        let mut allowed: Vec<Option<Keys>> = (0..count).map(|_| None).collect();
-        for &at in &shared.sweep {
-            let role = &shared.roles[at];
-            let Some(columns) = &role.held else { continue };
-            // A child of a root was allowed its keys by the root's sink, and every other held
-            // relation by its parent a step earlier in this loop. A root that relations trail is
-            // allowed what they kept instead.
-            let owned = allowed[at].take();
-            let permitted: Option<&Keys> = match &owned {
-                Some(keys) => Some(keys),
-                None if role.parent.is_none() => None,
-                None => Some(
-                    shared.allowed[at]
-                        .get()
-                        .ok_or_else(|| Error::internal("a held relation with no allowed keys"))?,
-                ),
-            };
-            let mut trailed = Vec::with_capacity(role.trailing.len());
-            for &(child, _) in &role.trailing {
-                trailed.push(shared.up[child].get().ok_or_else(|| {
-                    Error::internal("a root was swept before a relation that trails it finished")
-                })?);
-            }
-            let first = usize::from(role.parent.is_some());
-            let mut down: Vec<Keys> = role.down.iter().map(|_| Keys::default()).collect();
-            let chunks = std::mem::take(&mut *shared.held[at].lock().map_err(poisoned)?);
-            let mut survived = 0usize;
-            let mut values = Vec::new();
-            let mut nulls = Vec::new();
-            let mut others: Vec<Vec<i64>> = role.down.iter().map(|_| Vec::new()).collect();
-            let mut places: Vec<Vec<i64>> = role.extremes.iter().map(|_| Vec::new()).collect();
-            for chunk in &chunks {
-                let rows = chunk.len();
-                let mut kept: Vec<u32> = (0..u32::try_from(rows)
-                    .map_err(|_| Error::internal("a huge chunk"))?)
-                    .collect();
-                // The parent key is the first held column and the keys of the relations that
-                // trail it come next, which `Reduction::new` put there.
-                if let Some(permitted) = permitted {
-                    read(chunk.column(0)?, rows, &mut values, &mut nulls)?;
-                    permitted.filter(&values, &mut kept);
-                }
-                for (slot, keys) in trailed.iter().enumerate() {
-                    if kept.is_empty() {
-                        break;
-                    }
-                    read(chunk.column(first + slot)?, rows, &mut values, &mut nulls)?;
-                    keys.filter(&values, &mut kept);
-                }
-                if kept.is_empty() {
-                    continue;
-                }
-                survived += kept.len();
-                let after = first + trailed.len();
-                for (slot, other) in others.iter_mut().enumerate() {
-                    read(chunk.column(after + slot)?, rows, other, &mut nulls)?;
-                    down[slot].insert_rows(other, &kept);
-                }
-                let after = after + role.down.len();
-                let mut direct = Vec::with_capacity(role.extremes.len());
-                for (slot, &(output, _)) in role.extremes.iter().enumerate() {
-                    if self.fetches[output].is_some() {
-                        read(chunk.column(after + slot)?, rows, &mut values, &mut nulls)?;
-                        places[slot].extend(kept.iter().map(|&row| values[row as usize]));
-                    } else {
-                        direct.push((output, after + slot));
-                    }
-                }
-                let selection = Selection::from_indices(kept);
-                fold(&mut extremes, &direct, chunk, &selection)?;
-            }
-            drop(chunks);
-            for (&(output, _), places) in role.extremes.iter().zip(places) {
-                if let Some((table, column)) = self.fetches[output] {
-                    fetch(&mut extremes[output], table, column, &shared.types[output], places)?;
-                }
-            }
-            debug_assert_eq!(
-                columns.len(),
-                first + trailed.len() + role.down.len() + role.extremes.len()
-            );
-            if survived == 0 {
-                return Ok(None);
-            }
-            for (&(child, _), keys) in role.down.iter().zip(down) {
-                allowed[child] = Some(keys);
-            }
+        for (&(child, _), keys) in role.down.iter().zip(swept.down) {
+            allowed[child] = Some(keys);
         }
-        Ok(Some(extremes))
     }
+    Ok(Some(extremes))
 }
 
 impl Source for Answer<'_> {
