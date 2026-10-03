@@ -17,12 +17,17 @@
 //! it did before. That is every platform that is not unix, and an empty file.
 
 use std::fs::File;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A read only mapping of a file's first `len` bytes.
 #[derive(Debug)]
 pub struct Mapped {
     at: *const u8,
     len: usize,
+    /// Set once no statement after the running one reads through the mapping, and until then
+    /// [`Mapped::release`] keeps the pages. `None` releases them whenever asked.
+    until: Option<Arc<AtomicBool>>,
 }
 
 // SAFETY: the mapping is read only and does not belong to a thread, so it can be unmapped on any.
@@ -38,7 +43,21 @@ impl Mapped {
     #[must_use]
     pub fn open(file: &File, len: u64) -> Option<Self> {
         let len = usize::try_from(len).ok().filter(|&len| len > 0)?;
-        sys::map(file, len).map(|at| Self { at, len })
+        sys::map(file, len).map(|at| Self { at, len, until: None })
+    }
+
+    /// The same, keeping its pages mapped through [`Mapped::release`] until `last` is set.
+    ///
+    /// A session that asks again reads the same pages again, and letting them go after each read
+    /// had every statement fault them back in and drop them once more. On a warm JOB run that was
+    /// about a third of the kernel time, 3a faulting four thousand pages a run inside the FSST
+    /// decoder. Once the shell says the statement running is its last, a release goes through as
+    /// it always did, so a process that runs one query holds no more than it did.
+    #[must_use]
+    pub fn open_until(file: &File, len: u64, last: Arc<AtomicBool>) -> Option<Self> {
+        let mut mapped = Self::open(file, len)?;
+        mapped.until = Some(last);
+        Some(mapped)
     }
 
     /// The `len` bytes at `offset`, or `None` when they run past the end of the mapping.
@@ -69,6 +88,9 @@ impl Mapped {
     /// next part pays one fault to bring it back. That is always safe, since the mapping is read
     /// only and the file under it never changes.
     pub fn release(&self, offset: u64, len: usize) {
+        if self.until.as_ref().is_some_and(|last| !last.load(Ordering::Relaxed)) {
+            return;
+        }
         let Ok(start) = usize::try_from(offset) else { return };
         let end = start.saturating_add(len).min(self.len);
         if start >= end {

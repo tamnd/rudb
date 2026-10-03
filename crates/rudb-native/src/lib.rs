@@ -7207,7 +7207,7 @@ impl Catalog {
         let (file, size, _, bytes, opening) = slot_bytes(path)?;
         let (entries, views, card, anchor) = decode_catalog(&bytes, size)?;
         remember_card(path, card.as_ref());
-        let map = Mapped::open(&file, size).map(Arc::new);
+        let map = Mapped::open_until(&file, size, Arc::clone(&pool.told)).map(Arc::new);
         Ok(Self {
             anchor: anchor.map(Arc::new),
             file: Arc::new(file),
