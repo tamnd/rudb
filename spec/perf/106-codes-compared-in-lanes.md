@@ -22,4 +22,13 @@ The other half of q06's filter was `l_quantity`, which the cascade stores as a s
 
 ## Results
 
-Pending the release build, posted on the pull request.
+Measured on server2 at SF10 on one thread, user cycles and instructions in millions, against main with #2421. All 22 queries give the same answers as before.
+
+| Query | Before cycles | After cycles | Before instructions | After instructions | DuckDB cycles |
+| --- | --- | --- | --- | --- | --- |
+| q06 | 115 | 81 | 123 | 77 | 184 |
+| l_discount between, alone | 87 | 61 | 126 | 80 | |
+| q01 | 317 | 285 | 489 | 476 | 791 |
+| q19 | 96 | 104 | 99 | 98 | 475 |
+
+q19 moves within the noise of a machine running at a load of 35, with the same instruction count. On q06 the mask now costs about as much as reading the codes, and what is left is the quantity column held flat, the gather of the kept rows and the sum itself.
