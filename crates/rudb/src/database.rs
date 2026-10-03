@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use rudb_bind::{Bound, Parameters, Write};
@@ -19,6 +19,7 @@ use rudb_native::graph::Edge;
 use rudb_parse::ast::{self, Ast};
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_plan::{Expr, Node, NodeRef, Plan};
+use rudb_storage::{ReadGuard, ReadMostly, WriteGuard};
 use rudb_vector::{Chunk, Data, Form, Selection, Vector};
 
 use crate::config::Config;
@@ -608,7 +609,7 @@ struct Conn {
     /// The transaction a `BEGIN` opened, until a `COMMIT` or a `ROLLBACK` closes it.
     open: Mutex<Option<Open>>,
     /// The transaction's own catalog once it has touched the database, and an empty one otherwise.
-    catalog: RwLock<Catalog>,
+    catalog: ReadMostly<Catalog>,
     /// Whether the statements read and write [`Conn::catalog`] rather than the committed catalog.
     private: AtomicBool,
     /// The log records the transaction staged for its commit, when the database has a log.
@@ -637,7 +638,7 @@ impl Conn {
     fn new(registry: Arc<Board>) -> Self {
         Self {
             open: Mutex::default(),
-            catalog: RwLock::new(Catalog::bare()),
+            catalog: ReadMostly::new(Catalog::bare()),
             private: AtomicBool::new(false),
             staged: Mutex::default(),
             registry,
@@ -660,7 +661,9 @@ impl Drop for Conn {
 
 #[derive(Debug)]
 struct Inner {
-    catalog: RwLock<Catalog>,
+    /// What every statement reads, under a lock whose readers write no line another thread does,
+    /// see [`ReadMostly`].
+    catalog: ReadMostly<Catalog>,
     /// Held by whatever might write the file or change the catalog, for as long as it does, and
     /// always taken before the catalog lock.
     ///
@@ -750,7 +753,7 @@ impl Drop for Inner {
     fn drop(&mut self) {
         // What the transactions still open changed is in their own catalogs, so this one is only
         // what was committed.
-        let catalog = self.catalog.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let catalog = self.catalog.get_mut();
         if let Some(path) = self.path.as_ref().filter(|_| self.writable) {
             let journal = self.journal.get_mut().unwrap_or_else(PoisonError::into_inner);
             let _ = persist_main(path, catalog, &self.pages, journal, true);
@@ -1296,7 +1299,7 @@ impl Database {
         let writable = !config.read_only();
         let settings = Settings::new(config);
         let inner = Inner {
-            catalog: RwLock::new(Catalog::new()),
+            catalog: ReadMostly::new(Catalog::new()),
             writer: Mutex::default(),
             registry: Arc::default(),
             journal: Mutex::default(),
@@ -1476,7 +1479,7 @@ impl Database {
         let pool = runtime(&config);
         let settings = Settings::new(config);
         let inner = Inner {
-            catalog: RwLock::new(catalog),
+            catalog: ReadMostly::new(catalog),
             writer: Mutex::default(),
             registry: Arc::default(),
             journal: Mutex::new(journal),
@@ -3581,25 +3584,25 @@ impl Shared {
 
     /// The catalog, for reading.
     ///
-    /// A poisoned lock is taken rather than reported. Poisoning says some thread panicked while it
-    /// held the lock, and the catalog is a `Vec` of chunks rather than an invariant somebody was
-    /// halfway through breaking, so refusing every later query would turn one panicked query into a
-    /// dead database.
+    /// The lock is a [`ReadMostly`], so a read writes only the reader's own slot, and nothing is
+    /// poisoned. A panic while the catalog was held leaves it as it was, and the catalog is a `Vec`
+    /// of chunks rather than an invariant somebody was halfway through breaking, so refusing every
+    /// later query would turn one panicked query into a dead database.
     ///
     /// Inside a transaction that is the transaction's own catalog, taken here the first time it is
     /// asked for.
-    fn read(&self) -> RwLockReadGuard<'_, Catalog> {
-        self.catalog().read().unwrap_or_else(PoisonError::into_inner)
+    fn read(&self) -> ReadGuard<'_, Catalog> {
+        self.catalog().read()
     }
 
     /// The catalog, for writing. The transaction's own inside one, as [`Shared::read`] says.
-    fn write(&self) -> RwLockWriteGuard<'_, Catalog> {
-        self.catalog().write().unwrap_or_else(PoisonError::into_inner)
+    fn write(&self) -> WriteGuard<'_, Catalog> {
+        self.catalog().write()
     }
 
     /// The committed catalog, whatever transaction is open, for what writes the file.
-    fn committed(&self) -> RwLockWriteGuard<'_, Catalog> {
-        self.inner.catalog.write().unwrap_or_else(PoisonError::into_inner)
+    fn committed(&self) -> WriteGuard<'_, Catalog> {
+        self.inner.catalog.write()
     }
 
     /// The log of the committed catalog, whatever transaction is open.
@@ -3609,7 +3612,7 @@ impl Shared {
 
     /// The catalog this connection's statements run against, taking the transaction's snapshot
     /// when one is open and has not taken it yet.
-    fn catalog(&self) -> &RwLock<Catalog> {
+    fn catalog(&self) -> &ReadMostly<Catalog> {
         if !self.conn.private.load(Ordering::Acquire) {
             self.snapshot();
         }
@@ -3632,14 +3635,14 @@ impl Shared {
             return;
         }
         let (base, at) = {
-            let committed = self.inner.catalog.read().unwrap_or_else(PoisonError::into_inner);
+            let committed = self.inner.catalog.read();
             (committed.clone(), rudb_catalog::revision_now())
         };
         let shadow = self.committed_journal().as_ref().map(Journal::shadow);
         let mut open = self.open();
         let Some(open) = open.as_mut().filter(|open| open.snapshot.is_none()) else { return };
         let id = self.registry().begin(at);
-        *self.conn.catalog.write().unwrap_or_else(PoisonError::into_inner) = base.clone();
+        *self.conn.catalog.write() = base.clone();
         *self.conn.staged.lock().unwrap_or_else(PoisonError::into_inner) = shadow;
         open.snapshot =
             Some(txn::Snapshot { id, base, at, written: std::collections::HashMap::new() });
@@ -3651,7 +3654,7 @@ impl Shared {
     }
 
     /// The right to write the file and change the catalog, taken before the catalog lock. See
-    /// `Inner::writer`. Poisoning is ignored for the reason [`Shared::read`] gives.
+    /// `Inner::writer`. Poisoning is ignored for the reason [`Shared::read`] gives for the catalog.
     fn writing(&self) -> MutexGuard<'_, ()> {
         self.inner.writer.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -3958,8 +3961,11 @@ impl Shared {
                 rudb_catalog::Point::Found(chunk) => vec![chunk],
             };
             let reservation = Memory::unlimited().reservation();
-            Ok(QueryResult::new(target.names.clone(), target.types.clone(), chunks, reservation)
-                .in_session(self.session()))
+            let result =
+                QueryResult::new(target.names.clone(), target.types.clone(), chunks, reservation);
+            // The session is built under a lock every statement shares, and only a zoned value
+            // reads it.
+            Ok(if target.zoned { result.in_session(self.session()) } else { result })
         });
         (!unanswered).then_some(result)
     }
@@ -4089,10 +4095,7 @@ impl Shared {
     /// A commit that conflicts with one made since the snapshot, which then rolls back.
     fn close_transaction(&self, closed: Open, commit: bool) -> Result<()> {
         let Some(mut snapshot) = closed.snapshot else { return Ok(()) };
-        let mine = std::mem::replace(
-            &mut *self.conn.catalog.write().unwrap_or_else(PoisonError::into_inner),
-            Catalog::bare(),
-        );
+        let mine = std::mem::replace(&mut *self.conn.catalog.write(), Catalog::bare());
         let staged = self.conn.staged.lock().unwrap_or_else(PoisonError::into_inner).take();
         self.conn.private.store(false, Ordering::Release);
         let mut committed = self.committed();
@@ -6327,8 +6330,9 @@ fn lookup_target(
         }
     }
     let key = lookup.equal.iter().map(|(written, _)| column(written)).collect::<Option<_>>()?;
-    let types = columns.iter().map(|&at| fields[at].ty.clone()).collect();
-    Some(crate::prepared::Target { name, key, columns, names, types })
+    let types: Vec<LogicalType> = columns.iter().map(|&at| fields[at].ty.clone()).collect();
+    let zoned = types.iter().any(|ty| !unzoned(ty));
+    Some(crate::prepared::Target { name, key, columns, names, types, zoned })
 }
 
 /// Whether a value of type `from` goes into a column of type `to` by one of the casts
@@ -6338,6 +6342,40 @@ fn lookup_target(
 fn widens(from: &LogicalType, to: &LogicalType) -> bool {
     (from.is_integer() && (to.is_integer() || matches!(to, LogicalType::Double)))
         || (matches!(from, LogicalType::Float) && matches!(to, LogicalType::Double))
+}
+
+/// Whether a column of type `ty` never holds a `TIMESTAMPTZ`, and so writes the same in every
+/// session. Only the flat types are said to, which leaves a nested type to the session whatever it
+/// holds.
+fn unzoned(ty: &LogicalType) -> bool {
+    use LogicalType as T;
+    matches!(
+        ty,
+        T::Null
+            | T::Boolean
+            | T::TinyInt
+            | T::SmallInt
+            | T::Integer
+            | T::BigInt
+            | T::HugeInt
+            | T::UTinyInt
+            | T::USmallInt
+            | T::UInteger
+            | T::UBigInt
+            | T::UHugeInt
+            | T::Float
+            | T::Double
+            | T::Varchar
+            | T::Blob
+            | T::Uuid
+            | T::Date
+            | T::Time
+            | T::TimeTz
+            | T::Timestamp
+            | T::TimestampS
+            | T::TimestampMs
+            | T::TimestampNs
+    )
 }
 
 /// Run a statement and make sure it left a row for `rudb_statement_metrics()`.

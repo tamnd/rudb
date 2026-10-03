@@ -66,6 +66,7 @@ use rudb_functions::{Behaviour, LOCAL, SettingEntry, UNSET, every_setting, unkno
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
+use rudb_storage::ReadMostly;
 use rudb_txn::log::CommitSync;
 
 /// The values `lambda_syntax` takes, in the order the pin declares them.
@@ -178,7 +179,8 @@ use crate::config::{Config, parse_size};
 pub(crate) struct Settings {
     /// What the database was opened with, which is what `RESET` restores.
     defaults: Config,
-    current: RwLock<Config>,
+    /// Read by every statement, so under a lock whose readers write only their own slot.
+    current: ReadMostly<Config>,
     /// The passes turned off, as written, empty for none.
     ///
     /// Kept as the text rather than as an `rudb_opt::Context`, because the text is what `RESET`
@@ -348,7 +350,7 @@ impl Settings {
             .unwrap_or_else(|| "UTC".to_string());
         Self {
             defaults: config,
-            current: RwLock::new(config),
+            current: ReadMostly::new(config),
             disabled: RwLock::new(String::new()),
             time_zone: RwLock::new(default_time_zone.clone()),
             default_time_zone,
@@ -519,7 +521,7 @@ impl Settings {
 
     /// The configuration as the statements have left it.
     pub(crate) fn config(&self) -> Config {
-        *self.current.read().unwrap_or_else(|held| held.into_inner())
+        *self.current.read()
     }
 
     /// What the database was opened with, which is what `RESET` restores.
@@ -1475,7 +1477,7 @@ impl Settings {
     }
 
     fn replace(&self, config: Config) {
-        *self.current.write().unwrap_or_else(|held| held.into_inner()) = config;
+        *self.current.write() = config;
     }
 }
 

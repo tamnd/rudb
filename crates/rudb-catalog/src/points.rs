@@ -9,7 +9,8 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::Chunk;
@@ -115,6 +116,13 @@ impl Located {
         Ok(located)
     }
 
+    /// Whether this was built for `key` of `rows` at `revision`.
+    fn fits(&self, rows: &Rows, revision: u64, key: &[usize]) -> bool {
+        self.revision == revision
+            && self.columns == key
+            && self.starts.last() == Some(&(rows.len() as u64))
+    }
+
     /// The part and the place in it of the row holding `key`, if one does.
     fn find(&self, key: Encoded, scratch: &[u8]) -> Option<(usize, u32)> {
         let number = match key {
@@ -130,16 +138,42 @@ impl Located {
     }
 }
 
-/// What a table keeps of [`Located`], shared by the copies of the table a transaction takes and
-/// built under its lock so two lookups at once build it once.
+/// How many of a table's keys and unique indexes a lookup finds without a lock, by their place
+/// among them. A key past these goes through the lock every time.
+const HELD: usize = 4;
+
+/// What a table keeps of [`Located`], one for each key a lookup asked for, shared by the copies of
+/// the table a transaction takes.
+///
+/// A lookup reads `built` with a load and writes nothing, so readers on many cores do not pass a
+/// cache line between them, `engine-v4/13-the-point-path.md` section 13.5. Each is set once for the
+/// rows the table has, and the table drops them all with a new [`Points`] whenever it is about to
+/// change its rows. Should one turn out wrong all the same, for rows that changed some way that
+/// did not drop it, `stale` says so and the lookups after build into `again` under its lock, which
+/// is slower and still right.
 #[derive(Debug, Default)]
-pub(crate) struct Points(Mutex<Option<Arc<Located>>>);
+pub(crate) struct Points {
+    built: [OnceLock<Arc<Located>>; HELD],
+    stale: AtomicBool,
+    again: Mutex<Vec<Arc<Located>>>,
+}
 
 impl Clone for Points {
     /// A copy shares what is built. It is for one revision of the rows and a copy that changes
     /// them draws another one.
     fn clone(&self) -> Self {
-        Self(Mutex::new(self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()))
+        let built = std::array::from_fn(|at| {
+            let built = OnceLock::new();
+            if let Some(located) = self.built[at].get() {
+                let _ = built.set(Arc::clone(located));
+            }
+            built
+        });
+        Self {
+            built,
+            stale: AtomicBool::new(self.stale.load(Ordering::Relaxed)),
+            again: Mutex::default(),
+        }
     }
 }
 
@@ -190,10 +224,12 @@ fn encoded(values: &[Value], out: &mut Vec<u8>) -> Encoded {
 impl Points {
     /// The row of `rows` whose key over `key` is `values`, with the columns `columns`.
     ///
-    /// The caller has made sure `key` is a key of the table and that every value passes
-    /// [`looks_up`] against its column. `revision` is the table's.
+    /// The caller has made sure `key` is a key of the table, the one at `which` among its keys and
+    /// unique indexes, and that every value passes [`looks_up`] against its column. `revision` is
+    /// the table's.
     pub(crate) fn find(
         &self,
+        which: usize,
         rows: &Rows,
         revision: u64,
         key: &[usize],
@@ -204,7 +240,21 @@ impl Points {
         let wanted = encoded(values, &mut scratch);
         let mut fresh = false;
         loop {
-            let located = self.located(rows, revision, key, fresh)?;
+            let again;
+            let built = self.built.get(which).and_then(OnceLock::get);
+            let located = match built {
+                Some(built)
+                    if !fresh
+                        && !self.stale.load(Ordering::Relaxed)
+                        && built.fits(rows, revision, key) =>
+                {
+                    built.as_ref()
+                }
+                _ => {
+                    again = self.again(which, rows, revision, key, fresh)?;
+                    again.as_ref()
+                }
+            };
             let Some((part, place)) = located.find(wanted, &scratch) else {
                 return Ok(Point::Absent);
             };
@@ -237,26 +287,35 @@ impl Points {
         }
     }
 
-    /// The rows' keys over `key` at `revision`, built here when what is held is for anything else
-    /// or when `again` says it was wrong.
-    fn located(
+    /// The rows' keys over `key` at `revision` when `built` cannot answer: built into `built` the
+    /// first time, and otherwise into `again` when what that holds is for anything else or when
+    /// `fresh` says what was used was wrong.
+    fn again(
         &self,
+        which: usize,
         rows: &Rows,
         revision: u64,
         key: &[usize],
-        again: bool,
+        fresh: bool,
     ) -> Result<Arc<Located>> {
-        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if !again
-            && let Some(located) = held.as_ref()
-            && located.revision == revision
-            && located.columns == key
-            && located.starts.last() == Some(&(rows.len() as u64))
+        let mut held = self.again.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = self.built.get(which);
+        if fresh {
+            if slot.and_then(OnceLock::get).is_some() {
+                self.stale.store(true, Ordering::Relaxed);
+            }
+        } else if let Some(slot) = slot
+            && slot.get().is_none()
         {
+            // Under the lock, so two lookups building at once build once.
+            let located = Arc::new(Located::build(rows, key, revision)?);
+            return Ok(Arc::clone(slot.get_or_init(|| located)));
+        } else if let Some(located) = held.iter().find(|held| held.fits(rows, revision, key)) {
             return Ok(Arc::clone(located));
         }
         let located = Arc::new(Located::build(rows, key, revision)?);
-        *held = Some(Arc::clone(&located));
+        held.retain(|held| held.columns != key);
+        held.push(Arc::clone(&located));
         Ok(located)
     }
 }
