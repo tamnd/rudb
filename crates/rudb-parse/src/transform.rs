@@ -2075,13 +2075,37 @@ impl<'a> Transform<'a> {
             return self.copy_to(table, query);
         }
         let path = self.copy_file_name(table)?;
-        let (format, options) = self.copy_options(self.find(table, "CopyOptions"))?;
+        let (format, written) = self.copy_options(self.find(table, "CopyOptions"))?;
         let format = format.unwrap_or_else(|| {
             let lowered = path.to_ascii_lowercase();
-            if lowered.ends_with(".parquet") { "parquet".to_string() } else { "csv".to_string() }
+            let format = if lowered.ends_with(".parquet") {
+                "parquet"
+            } else if [".json", ".ndjson", ".jsonl"].iter().any(|end| lowered.ends_with(end)) {
+                "json"
+            } else {
+                "csv"
+            };
+            format.to_string()
         });
+        let json = matches!(format.as_str(), "json" | "ndjson" | "jsonl");
+        let mut options = CopyOptions::new();
+        for (name, value) in written {
+            let parameter = if json {
+                match copy_json_parameter(&name, value.is_some())? {
+                    Some(parameter) => parameter,
+                    None => continue,
+                }
+            } else {
+                copy_parameter(&name)?
+            };
+            let value = value.unwrap_or_else(|| {
+                self.push(Expr::Literal { kind: LiteralKind::True, text: NONE })
+            });
+            options.push((parameter, value));
+        }
         let reader = match format.as_str() {
             "csv" => "read_csv",
+            "json" | "ndjson" | "jsonl" => "read_json",
             "parquet" if options.is_empty() => "read_parquet",
             "parquet" => {
                 return Err(Error::not_implemented(
@@ -2205,7 +2229,7 @@ impl<'a> Transform<'a> {
     }
 
     /// `CopyOptions <- 'WITH'? CopyOptionList`, as the format it named, if it named one, and the
-    /// rest as `read_csv` parameters with their values.
+    /// rest as they were written, each name in lower case with its value if it was given one.
     ///
     /// Both spellings are read. The generic list, `(FORMAT csv, HEADER false, NULL '')`, is the one
     /// DuckDB documents and the one the Join Order Benchmark loads with. The specialized one,
@@ -2216,7 +2240,7 @@ impl<'a> Transform<'a> {
     /// An option DuckDB takes and this does not is refused by name rather than dropped, because
     /// every one of them changes which rows come out. A name DuckDB does not take either gets the
     /// first line of DuckDB's own refusal.
-    fn copy_options(&mut self, node: u32) -> Result<(Option<String>, CopyOptions)> {
+    fn copy_options(&mut self, node: u32) -> Result<(Option<String>, WrittenOptions)> {
         let mut format = None;
         let mut options = Vec::new();
         if node == NONE {
@@ -2245,13 +2269,12 @@ impl<'a> Transform<'a> {
                 format = Some(written);
                 continue;
             }
-            let parameter = copy_parameter(&name)?;
             let expr = if value == NONE {
-                self.push(Expr::Literal { kind: LiteralKind::True, text: NONE })
+                None
             } else {
-                self.expr(self.descendant(value, "Expression"))?
+                Some(self.expr(self.descendant(value, "Expression"))?)
             };
-            options.push((parameter, expr));
+            options.push((name, expr));
         }
         let mut specialized = Vec::new();
         self.named_nodes(node, "SpecializedOption", &mut specialized);
@@ -2266,18 +2289,17 @@ impl<'a> Transform<'a> {
                     continue;
                 }
                 "HeaderOption" => {
-                    let yes = self.push(Expr::Literal { kind: LiteralKind::True, text: NONE });
-                    options.push(("header", yes));
+                    options.push(("header".to_string(), None));
                     continue;
                 }
-                "NullAsOption" => "nullstr",
-                "DelimiterAsOption" => "delim",
+                "NullAsOption" => "null",
+                "DelimiterAsOption" => "delimiter",
                 "QuoteAsOption" => "quote",
                 "EscapeAsOption" => "escape",
                 _ => return self.unsupported(inner),
             };
             let expr = self.string_literal(self.find(inner, "StringLiteral"))?;
-            options.push((parameter, expr));
+            options.push((parameter.to_string(), Some(expr)));
         }
         Ok((format, options))
     }
@@ -5394,6 +5416,51 @@ impl<'a> Transform<'a> {
 /// The options of a `COPY` as the `read_csv` parameters they become, each with its value.
 type CopyOptions = Vec<(&'static str, ExprRef)>;
 
+/// The options of a `COPY` as they were written, each name in lower case with its value if it had
+/// one.
+type WrittenOptions = Vec<(String, Option<ExprRef>)>;
+
+/// The `read_json` parameter a `COPY FROM` a JSON file passes an option on as, or `None` for one
+/// that is taken and does nothing.
+///
+/// `columns` is the one that does nothing, since the columns are the table's whatever it says.
+/// The options that are about a set of files rather than about reading one are refused, and so is
+/// a format option written with no format after it. Every line was measured against the pin.
+fn copy_json_parameter(name: &str, valued: bool) -> Result<Option<&'static str>> {
+    const PASSED: &[&str] = &[
+        "array",
+        "auto_detect",
+        "compression",
+        "convert_strings_to_integers",
+        "date_format",
+        "dateformat",
+        "field_appearance_threshold",
+        "format",
+        "geojson",
+        "ignore_errors",
+        "map_inference_threshold",
+        "maximum_depth",
+        "maximum_object_size",
+        "maximum_sample_files",
+        "records",
+        "sample_size",
+        "timestamp_format",
+        "timestampformat",
+    ];
+    if name == "columns" {
+        return Ok(None);
+    }
+    let Some(parameter) = PASSED.iter().find(|passed| **passed == name) else {
+        return Err(Error::not_implemented(format!(
+            "Unsupported option for COPY FROM: \"{name}\""
+        )));
+    };
+    if !valued && parameter.contains("format") && *parameter != "format" {
+        return Err(Error::binder(format!("COPY parameter \"{name}\" expects a single argument")));
+    }
+    Ok(Some(parameter))
+}
+
 /// The `read_csv` parameter a `COPY` option is, by the name it was written with in lower case.
 ///
 /// `DELIMITER` and `NULL` are the `COPY` names for what `read_csv` calls `delim` and `nullstr`, and
@@ -6678,6 +6745,16 @@ mod tests {
             round_statement("COPY t FROM 'x.parquet'"),
             "INSERT INTO t SELECT * FROM read_parquet('x.parquet')"
         );
+        assert_eq!(
+            round_statement("COPY t FROM 'x.ndjson' (DATEFORMAT '%d', IGNORE_ERRORS, COLUMNS 1)"),
+            "INSERT INTO t SELECT * FROM read_json('x.ndjson', dateformat := '%d', \
+             ignore_errors := TRUE)"
+        );
+        let error = parse_ast("COPY t FROM 'x.json' (timestampformat)").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Binder Error: COPY parameter \"timestampformat\" expects a single argument"
+        );
         assert!(!{
             let ast = parse_ast("INSERT INTO t VALUES (1)").unwrap();
             let Statement::Insert(index) = ast.statements[0] else { panic!("not an insert") };
@@ -6690,7 +6767,11 @@ mod tests {
         for (query, message) in [
             ("COPY t FROM 'in.csv' (FOO 1)", "Unrecognized option \"foo\" for csv"),
             ("COPY t FROM 'in.csv' (SKIP 1)", "the option skip is not supported yet"),
-            ("COPY t FROM 'in.json' (FORMAT json)", "FORMAT json is not supported yet"),
+            ("COPY t FROM 'in.json' (FORMAT xml)", "FORMAT xml is not supported yet"),
+            (
+                "COPY t FROM 'in.json' (FILENAME true)",
+                "Unsupported option for COPY FROM: \"filename\"",
+            ),
         ] {
             let error = parse_ast(query).unwrap_err().to_string();
             assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");

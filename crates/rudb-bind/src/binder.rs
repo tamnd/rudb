@@ -2543,7 +2543,7 @@ impl<'a> Binder<'a> {
                     mirrorable = Some(path);
                 }
                 let copy_into = match columns {
-                    Columns::Csv => self.copy_into.take(),
+                    Columns::Csv | Columns::Json => self.copy_into.take(),
                     _ => None,
                 };
                 let mut fields = match columns {
@@ -2555,6 +2555,9 @@ impl<'a> Binder<'a> {
                     // them, which is not a choice made here. See `csv_fields`.
                     Columns::Csv => csv_fields(&paths, options.given.clone())?,
                     Columns::Json => {
+                        if let Some(into) = copy_into {
+                            self.copy_json_columns(&into, &mut written_options);
+                        }
                         self.json_fields(resolved.function, &paths, &mut written_options)?
                     }
                     _ => {
@@ -2693,6 +2696,28 @@ impl<'a> Binder<'a> {
         let expr = self.plan.add_expr(Expr::Constant(reference), LogicalType::Varchar);
         written.push((scan::SETTLED, value, expr));
         Ok(fields)
+    }
+
+    /// The columns of the `read_json` a `COPY t FROM` became, which are the table's, given to it
+    /// as a `columns` parameter in place of any the statement wrote. A key the table has no column
+    /// for is skipped and a column the object has no key for is null, which is the pin's answer.
+    fn copy_json_columns(
+        &mut self,
+        into: &[Field],
+        written: &mut Vec<(&'static str, Value, ExprRef)>,
+    ) {
+        written.retain(|(parameter, _, _)| *parameter != "columns");
+        let value = Value::Struct(
+            into.iter()
+                .map(|field| (field.name.clone(), Value::Varchar(field.ty.to_string())))
+                .collect(),
+        );
+        let ty = LogicalType::Struct(
+            into.iter().map(|field| Field::new(field.name.clone(), LogicalType::Varchar)).collect(),
+        );
+        let reference = self.plan.add_value(value.clone());
+        let expr = self.plan.add_expr(Expr::Constant(reference), ty);
+        written.push(("columns", value, expr));
     }
 
     /// The columns of the `read_csv` a `COPY t FROM` became, which are the table's.
