@@ -2440,6 +2440,9 @@ fn like_of(
                 return Ok(None);
             };
             if column.len() >= rows {
+                if let Some(hits) = like_laid(column, like, &base, rows) {
+                    return like_answered(&hits, |index| index, like, &base, rows, returns);
+                }
                 let text = |index: usize| Ok(column.bytes(index).unwrap_or_default());
                 if let Some(done) = like_joined(text, like, &base, rows, returns)? {
                     return Ok(Some(done));
@@ -2461,6 +2464,10 @@ fn like_of(
             // way in, so the gather indexes without a bound of its own.
             if column.len() < rows {
                 return like_over(column, &codes, like, base, rows, returns);
+            }
+            if let Some(hits) = like_laid(column, like, &base, rows) {
+                let at = |index: usize| codes[index] as usize;
+                return like_answered(&hits, at, like, &base, rows, returns);
             }
             let text = |index: usize| Ok(column.bytes(codes[index] as usize).unwrap_or_default());
             if let Some(done) = like_joined(text, like, &base, rows, returns)? {
@@ -3053,6 +3060,52 @@ fn like_joined<'a>(
         *slot =
             (*slot != like.negated) && !matches!(base, Validity::Mask(mask) if !mask.get(index));
     }
+    finish(returns, Data::Bool(out.into()), base.clone().normalize(rows))
+}
+
+/// [`like_joined`] for every value of a column whose strings already sit end to end in its arena,
+/// which is a page as a scan lays it out, so the search runs over the page and nothing is copied.
+///
+/// The copy was most of what JOB 27a spent on `company_name.name LIKE '%Film%'`, a `memcpy` a name
+/// for 235 thousand names a pattern, where the search itself stops only at the names that match.
+/// The answer is a value of the column a row, for the caller to read at its rows, and it is only
+/// worth it where the rows read most of the column, as a filter that kept most of a chunk does.
+/// `None` for a pattern [`like_joined`] does not speed up, for a column laid out any other way and
+/// for one whose rows are a few of its values.
+fn like_laid(
+    column: &StringColumn,
+    like: &Like,
+    base: &Validity,
+    rows: usize,
+) -> Option<Vec<bool>> {
+    if matches!(base, Validity::AllInvalid) || rows * 2 < column.len() {
+        return None;
+    }
+    let joined = Joined::of(like)?;
+    let mut ends = Vec::new();
+    let run = column.laid_end_to_end(&mut ends)?;
+    let mut hits = vec![false; ends.len()];
+    joined.search(run, &ends, &mut hits);
+    Some(hits)
+}
+
+/// The answer of [`like_laid`] at each of `rows` rows, row `index` reading value `at(index)`.
+///
+/// A null row answers false underneath its null, as [`like_joined`] leaves it.
+fn like_answered(
+    hits: &[bool],
+    at: impl Fn(usize) -> usize,
+    like: &Like,
+    base: &Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let out: Vec<bool> = (0..rows)
+        .map(|index| {
+            (hits[at(index)] != like.negated)
+                && !matches!(base, Validity::Mask(mask) if !mask.get(index))
+        })
+        .collect();
     finish(returns, Data::Bool(out.into()), base.clone().normalize(rows))
 }
 
@@ -5351,6 +5404,43 @@ mod tests {
                 let expected = called(
                     name,
                     &[value.clone(), Value::Varchar(spelling.into())],
+                    &LogicalType::Boolean,
+                );
+                assert_eq!(answer.value_at(row), expected, "{spelling} {value:?}");
+            }
+        }
+    }
+
+    /// A column read off a page is searched where its strings lie, and a needle that spans the end
+    /// of one string and the start of the next still matches neither.
+    #[test]
+    fn a_page_of_strings_is_searched_in_place_with_the_same_answers() {
+        let texts = ["ab", "cd", "a string well past the inline limit, Film", "", "Warner Bros"];
+        let page: Vec<u8> = texts.concat().into_bytes();
+        let mut ends = Vec::new();
+        let mut at = 0;
+        for text in texts {
+            at += text.len();
+            ends.push(at);
+        }
+        let mut column = StringColumn::over(rudb_vector::Buffer::from_vec(page));
+        column.push_run_in_place(0, &ends).expect("text");
+        let rows = texts.len();
+        let text = Vector::flat(LogicalType::Varchar, Data::Varlen(column)).expect("builds");
+        for (spelling, negated) in
+            [("%bc%", false), ("%Film%", false), ("%Warner%", true), ("%bcd%", false)]
+        {
+            let pattern =
+                Vector::constant(LogicalType::Varchar, Value::Varchar(spelling.into()), rows);
+            let name = if negated { "!~~" } else { "~~" };
+            let answer =
+                binary(name, &Hoisted::Nothing, &text, &pattern, &LogicalType::Boolean, rows, None)
+                    .expect("the call is written")
+                    .expect("a flat text has a loop of its own");
+            for (row, value) in texts.iter().enumerate() {
+                let expected = called(
+                    name,
+                    &[Value::Varchar((*value).into()), Value::Varchar(spelling.into())],
                     &LogicalType::Boolean,
                 );
                 assert_eq!(answer.value_at(row), expected, "{spelling} {value:?}");

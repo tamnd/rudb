@@ -448,6 +448,38 @@ impl StringColumn {
         &self.views
     }
 
+    /// Every string of the column as one run of bytes, with where each one ends in it written to
+    /// `ends`, when the arena holds them end to end in order. `None` when it does not, or when no
+    /// string is long enough to say where the run starts.
+    ///
+    /// That is how a scan lays out a page of strings, see [`Self::push_run_in_place`], and it lets
+    /// a search over all of them run over the page as it is rather than over a copy. A short string
+    /// is checked against the arena where the run puts it, since its view holds the bytes and not
+    /// where they came from.
+    pub fn laid_end_to_end(&self, ends: &mut Vec<usize>) -> Option<&[u8]> {
+        let views: &[StringView] = &self.views;
+        let arena: &[u8] = &self.arena;
+        let first = views.iter().position(|view| !view.is_inline())?;
+        let before: usize = views[..first].iter().map(StringView::len).sum();
+        let start = views[first].offset().checked_sub(before)?;
+        ends.clear();
+        ends.reserve(views.len());
+        let mut at = start;
+        for view in views {
+            let end = at + view.len();
+            let held = match view.inline_bytes() {
+                Some(inline) => arena.get(at..end)? == inline,
+                None => view.offset() == at,
+            };
+            if !held {
+                return None;
+            }
+            ends.push(end - start);
+            at = end;
+        }
+        arena.get(start..at)
+    }
+
     /// Appends a string and returns its index.
     pub fn push(&mut self, text: &str) -> usize {
         let view = if text.len() <= INLINE_LIMIT {
@@ -1066,6 +1098,29 @@ mod tests {
         assert!(back.push_run_in_place(0, &[5, 4, page.len()]).is_err(), "an end before its start");
         let mut past = StringColumn::over(Buffer::from_vec(page));
         assert!(past.push_run_in_place(0, &[4, 400]).is_err(), "an end past the page");
+    }
+
+    /// A page laid out as a scan lays it is one run with its ends, starting wherever its first
+    /// string does, and a column whose arena holds only its long strings is not, since a short one
+    /// is in its view and nowhere in the arena.
+    #[test]
+    fn a_page_of_strings_is_one_run_and_a_column_pushed_a_string_at_a_time_is_not() {
+        let page = b"skipped:ab and a string well past the inline limit, then cd".to_vec();
+        let mut column = StringColumn::over(Buffer::from_vec(page.clone()));
+        column.push_run_in_place(8, &[10, 51, 51, page.len()]).expect("text");
+        let mut ends = Vec::new();
+        let run = column.laid_end_to_end(&mut ends).expect("laid end to end");
+        assert_eq!(run, &page[8..]);
+        assert_eq!(ends, [2, 43, 43, page.len() - 8]);
+
+        let mut pushed = StringColumn::new();
+        pushed.push("ab");
+        pushed.push(" and a string well past the inline limit");
+        pushed.push("cd");
+        assert!(pushed.laid_end_to_end(&mut ends).is_none());
+        let mut short = StringColumn::over(Buffer::from_vec(b"abcd".to_vec()));
+        short.push_run_in_place(0, &[2, 4]).expect("text");
+        assert!(short.laid_end_to_end(&mut ends).is_none(), "no string says where the run starts");
     }
 
     /// Copying between two columns, which is what a gather and a slice over a string column are.
