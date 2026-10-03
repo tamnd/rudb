@@ -307,7 +307,7 @@ fn json(line: &mut String, value: &Value, ty: &LogicalType, moments: &Moments) -
             }
             line.push(']');
         }
-        Value::Struct(fields) if !matches!(ty, LogicalType::Union(_)) => {
+        Value::Struct(fields) => {
             let types = match ty {
                 LogicalType::Struct(types) => types.as_slice(),
                 _ => &[],
@@ -339,20 +339,16 @@ fn json(line: &mut String, value: &Value, ty: &LogicalType, moments: &Moments) -
             }
             line.push('}');
         }
-        Value::Struct(fields) => {
-            // A union is written as whichever member it holds.
-            let members = match ty {
-                LogicalType::Union(members) => members.as_slice(),
-                _ => &[],
+        // A union is an object of the one member it holds, under the member's name.
+        Value::Union { members, tag, value } => {
+            let Some(member) = members.get(usize::from(*tag)) else {
+                return Err(Error::internal("a union tag names no member"));
             };
-            let held = fields.iter().enumerate().skip(1).find(|(_, (_, value))| !value.is_null());
-            match held {
-                Some((at, (_, value))) => {
-                    let ty = members.get(at - 1).map_or(&LogicalType::Null, |field| &field.ty);
-                    json(line, value, ty, moments)?;
-                }
-                None => line.push_str("null"),
-            }
+            line.push('{');
+            string(line, &member.name);
+            line.push(':');
+            json(line, value, &member.ty, moments)?;
+            line.push('}');
         }
         other => match moments.text(other, ty)? {
             Some(text) => string(line, &text),

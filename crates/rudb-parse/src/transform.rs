@@ -4476,7 +4476,7 @@ impl<'a> Transform<'a> {
             let names = self.part_slice(names);
             let values = self.expr_slice(args.split_off(1));
             args.push(self.push(Expr::Struct { names, values }));
-        } else if matches!(called.as_str(), "unnest" | "make_type")
+        } else if matches!(called.as_str(), "unnest" | "make_type" | "union_value")
             && over == NONE
             && !names.is_empty()
         {

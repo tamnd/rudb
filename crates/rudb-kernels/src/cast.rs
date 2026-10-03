@@ -39,7 +39,7 @@ use std::str::FromStr;
 
 use rudb_common::{
     Error, ErrorCode, Field, LogicalType, PhysicalType, Result, SessionTimeZone, Value, bit,
-    civil_from_days, days_from_civil, time_tz, uuid,
+    civil_from_days, days_from_civil, implicit, time_tz, uuid,
 };
 use rudb_vector::{Data, Form, Vector};
 
@@ -145,6 +145,25 @@ pub fn cast_in_time_zone(
                 )));
             }
         }
+    }
+    // The member is picked once from the column's type, which is what the pin does, rather than
+    // from each value, whose own type may say less: a struct with a null field reads as a struct
+    // of a null.
+    if let LogicalType::Union(members) = target
+        && !matches!(input.logical_type(), LogicalType::Union(_) | LogicalType::Null)
+    {
+        let at = union_member(&input.logical_type(), target, members)?;
+        let tag = u8::try_from(at).map_err(|_| Error::internal("a union has too many members"))?;
+        let inner = cast_in_time_zone(input, &members[at].ty, try_cast, time_zone)?;
+        let mut values = Vec::with_capacity(inner.len());
+        // row at a time: building a union vector goes through its values, the way a struct's does.
+        for index in 0..inner.len() {
+            values.push(match inner.try_value_at(index)? {
+                Value::Null if input.is_null_at(index) => Value::Null,
+                value => Value::Union { members: members.clone(), tag, value: Box::new(value) },
+            });
+        }
+        return Vector::from_values(target.clone(), &values);
     }
     // A cast reads one vector, so its form goes in both halves of the report rather than leaving a
     // column of zeros next to every row of it.
@@ -903,6 +922,9 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
             _ => {}
         }
     }
+    if let LogicalType::Union(members) = target {
+        return to_union(value, target, members, try_cast);
+    }
     if let Value::Varchar(text) = value
         && let Some(answer) = from_text(text, target, try_cast)
     {
@@ -913,6 +935,88 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
         Err(error) if try_cast && recoverable(&error) => Ok(Value::Null),
         Err(error) => Err(error),
     }
+}
+
+/// A value cast to a union, which goes into the member [`union_member`] picks for its type, or for
+/// a union, into the member of the same name.
+fn to_union(value: &Value, target: &LogicalType, members: &[Field], try_cast: bool) -> Result<Value> {
+    let at = match value {
+        Value::Union { members: from, tag, .. } => renamed(from, target, members)?
+            .get(usize::from(*tag))
+            .copied()
+            .ok_or_else(|| Error::internal("a union tag names no member"))?,
+        _ => union_member(&value.logical_type(), target, members)?,
+    };
+    let inner = match value {
+        Value::Union { value, .. } => value.as_ref(),
+        _ => value,
+    };
+    Ok(Value::Union {
+        members: members.to_vec(),
+        tag: u8::try_from(at).map_err(|_| Error::internal("a union has too many members"))?,
+        value: Box::new(cast_value(inner, &members[at].ty, try_cast)?),
+    })
+}
+
+/// The member of a union a value of `source` goes into, which is the pin's choice: the member of
+/// exactly the source type, and otherwise the one the source casts to most cheaply.
+///
+/// Two members that tie make the cast ambiguous and no member at all makes it impossible. Both are
+/// refused even under `TRY_CAST`, because the pin picks the member before it reads a row.
+///
+/// # Errors
+///
+/// If no member or more than one member is the cheapest.
+pub fn union_member(source: &LogicalType, target: &LogicalType, members: &[Field]) -> Result<usize> {
+    let mut picked: Vec<usize> = (0..members.len()).filter(|at| &members[*at].ty == source).collect();
+    if picked.is_empty() {
+        let costs: Vec<Option<i64>> =
+            members.iter().map(|member| implicit::cost(source, &member.ty)).collect();
+        let Some(least) = costs.iter().flatten().min().copied() else {
+            let types = members.iter().map(|member| member.ty.to_string()).collect::<Vec<_>>();
+            return Err(Error::conversion(format!(
+                "Type {source} can't be cast as {target}. {source} can't be implicitly cast to any \
+                 of the union member types: {}",
+                types.join(", ")
+            )));
+        };
+        picked = (0..members.len()).filter(|at| costs[*at] == Some(least)).collect();
+    }
+    if let [at] = picked[..] {
+        return Ok(at);
+    }
+    let named = picked
+        .iter()
+        .map(|at| format!("'{} ({})'", members[*at].name, members[*at].ty))
+        .collect::<Vec<_>>();
+    Err(Error::conversion(format!(
+        "Type {source} can't be cast as {target}. The cast is ambiguous, multiple possible members \
+         in target: {}. Disambiguate the target type by using the 'union_value(<tag> := <arg>)' \
+         function to promote the source value to a single member union before casting.",
+        named.join(", ")
+    )))
+}
+
+/// Where each member of a union goes in another union, which is the member of the same name.
+///
+/// # Errors
+///
+/// If a member has no namesake in the target, which the pin refuses whichever member a row holds.
+pub fn renamed(from: &[Field], target: &LogicalType, members: &[Field]) -> Result<Vec<usize>> {
+    from.iter()
+        .map(|member| {
+            members.iter().position(|other| other.name.eq_ignore_ascii_case(&member.name)).ok_or_else(
+                || {
+                    Error::conversion(format!(
+                        "Type {} can't be cast as {target}. The member '\"{}\"' is not present in \
+                         target union",
+                        LogicalType::Union(from.to_vec()),
+                        member.name
+                    ))
+                },
+            )
+        })
+        .collect()
 }
 
 /// The number of rows a value written as a `LIMIT` or an `OFFSET` asks for.
@@ -1119,6 +1223,11 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
     }
     if let Value::Uuid(held) = value {
         return from_uuid(*held, target);
+    }
+    // A union becomes text as the member it holds, and nothing else, which is the pin's only cast
+    // out of a union besides one to another union.
+    if matches!(value, Value::Union { .. }) && !matches!(target, LogicalType::Varchar) {
+        return Err(no_cast(value, target));
     }
     match target {
         LogicalType::Boolean => to_boolean(value),

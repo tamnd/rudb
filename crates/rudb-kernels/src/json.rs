@@ -838,24 +838,22 @@ fn value_text(
             }
             out.push(']');
         }
+        // A union is an object of the one member it holds, under the member's name.
+        (Value::Union { members, tag, value }, _) => {
+            let member = members
+                .get(usize::from(*tag))
+                .ok_or_else(|| Error::internal("a union tag names no member"))?;
+            out.push('{');
+            string_text(&member.name, out);
+            out.push(':');
+            value_text(value, &member.ty, zone, out)?;
+            out.push('}');
+        }
         (Value::Struct(fields), _) => {
             let types = match ty {
-                LogicalType::Struct(types) | LogicalType::Union(types) => Some(types),
+                LogicalType::Struct(types) => Some(types),
                 _ => None,
             };
-            if let (LogicalType::Union(_), Some(types)) = (ty, types) {
-                // A union is the one member it holds, which is the first that is not null after
-                // the tag.
-                let member =
-                    fields.iter().skip(1).zip(types).find(|((_, value), _)| !value.is_null());
-                return match member {
-                    Some(((_, value), field)) => value_text(value, &field.ty, zone, out),
-                    None => {
-                        out.push_str("null");
-                        Ok(())
-                    }
-                };
-            }
             // An unnamed struct, which the pin calls a TUPLE, is an array of its fields.
             let unnamed = !fields.is_empty() && fields.iter().all(|(name, _)| name.is_empty());
             out.push(if unnamed { '[' } else { '{' });

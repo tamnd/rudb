@@ -6,7 +6,7 @@
 //! to `DOUBLE`, which is cheaper than casting to `VARCHAR`, so that an overload that needs the
 //! cheaper cast wins.
 
-use rudb_common::types::{Field, LogicalType};
+use crate::types::{Field, LogicalType};
 
 /// What casting a value to `target` costs, by the type it lands in, so that the overload with the
 /// cheaper cast wins a tie.
