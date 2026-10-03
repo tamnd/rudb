@@ -2635,7 +2635,7 @@ fn the_session_context_answers_for_the_clock_the_catalog_and_the_user() {
     // not a keyword on the pin, and `current_timestamp` is a keyword and not a function.
     assert_eq!(
         failure(&db, "SELECT current_database"),
-        "Referenced column \"current_database\" not found in FROM clause!"
+        "Referenced column \"current_database\" was not found because the FROM clause is missing"
     );
     assert_eq!(
         failure(&db, "SELECT current_timestamp()"),

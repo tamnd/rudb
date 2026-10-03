@@ -188,3 +188,169 @@ fn a_statement_that_does_not_parse_is_an_error_at_prepare_time() {
     let statement = db.prepare("SELECT * FROM nosuchtable WHERE a = ?").expect("parses");
     assert!(statement.execute(&[Value::Integer(1)]).is_err());
 }
+
+/// The value `EXECUTE` answers with, after the statements before it have run.
+fn executed(db: &Database, sql: &str) -> Value {
+    db.execute(sql).unwrap_or_else(|error| panic!("{sql}: {error}")).value_at(0, 0)
+}
+
+/// The message `sql` fails with.
+fn refused(db: &Database, sql: &str) -> String {
+    db.execute(sql).map(|_| ()).expect_err(sql).to_string()
+}
+
+#[test]
+fn prepare_and_execute_in_sql_take_values_by_position_or_by_name() {
+    let db = Database::new();
+    db.execute("PREPARE s AS SELECT $1 + 1").expect("prepares");
+    assert_eq!(executed(&db, "EXECUTE s(41)"), Value::Integer(42));
+    assert_eq!(executed(&db, "EXECUTE s(1 + 2)"), Value::Integer(4));
+    db.execute("PREPARE s AS SELECT ?::INT * 2, ?").expect("prepares over the first");
+    let pair = db.execute("EXECUTE s(21, 'x')").expect("runs");
+    assert_eq!(pair.value_at(0, 0), Value::Integer(42));
+    assert_eq!(pair.value_at(0, 1), Value::Varchar("x".into()));
+    db.execute("PREPARE named AS SELECT $a || $b").expect("prepares");
+    assert_eq!(executed(&db, "EXECUTE named(b := 'y', a := 'x')"), Value::Varchar("xy".into()));
+    db.execute("PREPARE plain AS SELECT 42").expect("prepares");
+    assert_eq!(executed(&db, "EXECUTE plain"), Value::Integer(42));
+    assert_eq!(executed(&db, "EXECUTE plain()"), Value::Integer(42));
+    // The name is found whatever case it was written in, quoted or not.
+    db.execute("PREPARE \"Upper\" AS SELECT 1").expect("prepares");
+    assert_eq!(executed(&db, "EXECUTE UPPER"), Value::Integer(1));
+    db.execute("PREPARE nothing AS SELECT $1").expect("prepares");
+    assert_eq!(executed(&db, "EXECUTE nothing(NULL)"), Value::Null);
+}
+
+#[test]
+fn an_executed_insert_writes_each_time() {
+    let db = Database::new();
+    db.execute("CREATE TABLE t (a INTEGER)").expect("creates");
+    db.execute("PREPARE s AS INSERT INTO t VALUES ($1)").expect("prepares");
+    db.execute("EXECUTE s(1)").expect("inserts");
+    db.execute("EXECUTE s(2)").expect("inserts");
+    assert_eq!(executed(&db, "SELECT count(*) FROM t WHERE a < 3"), Value::BigInt(2));
+}
+
+#[test]
+fn deallocate_forgets_the_statement() {
+    let db = Database::new();
+    db.execute("PREPARE s AS SELECT 42").expect("prepares");
+    db.execute("DEALLOCATE s").expect("forgets");
+    assert_eq!(refused(&db, "EXECUTE s"), "Binder Error: Prepared statement \"s\" does not exist");
+    db.execute("PREPARE s AS SELECT 42").expect("prepares");
+    db.execute("DEALLOCATE PREPARE s").expect("forgets");
+    assert_eq!(
+        refused(&db, "EXECUTE s(1)"),
+        "Binder Error: Prepared statement \"s\" does not exist"
+    );
+    // A name that was never prepared is no error to forget.
+    db.execute("DEALLOCATE nope").expect("says nothing");
+}
+
+#[test]
+fn execute_refuses_what_the_pin_refuses_in_its_words() {
+    let db = Database::new();
+    db.execute("PREPARE one AS SELECT $1").expect("prepares");
+    db.execute("PREPARE two AS SELECT ?, ?").expect("prepares");
+    db.execute("PREPARE named AS SELECT $a").expect("prepares");
+    db.execute("PREPARE typed AS SELECT $1::INT").expect("prepares");
+    for (sql, message) in [
+        (
+            "EXECUTE one",
+            "Invalid Input Error: Values were not provided for the following parameters: 1",
+        ),
+        (
+            "EXECUTE two(1)",
+            "Invalid Input Error: Values were not provided for the following parameters: 2",
+        ),
+        (
+            "EXECUTE one(1, 2)",
+            "Invalid Input Error: Parameter argument/count mismatch, identifiers of the excess \
+             parameters: 2",
+        ),
+        (
+            "EXECUTE named(1)",
+            "Invalid Input Error: Parameter argument/count mismatch, identifiers of the excess \
+             parameters: 1",
+        ),
+        (
+            "EXECUTE one(a := 1)",
+            "Invalid Input Error: Parameter argument/count mismatch, identifiers of the excess \
+             parameters: a",
+        ),
+        (
+            "EXECUTE one((SELECT 5))",
+            "Invalid Input Error: Only scalar parameters, named parameters or NULL supported for \
+             EXECUTE",
+        ),
+        (
+            "EXECUTE one(a)",
+            "Invalid Input Error: Only scalar parameters, named parameters or NULL supported for \
+             EXECUTE",
+        ),
+        (
+            "EXECUTE two(1, b := 2)",
+            "Not implemented Error: Mixing named parameters and positional parameters is not \
+             supported yet",
+        ),
+        ("EXECUTE nope(1)", "Binder Error: Prepared statement \"nope\" does not exist"),
+        ("EXECUTE typed('abc')", "Conversion Error: Could not convert string 'abc' to INT32"),
+    ] {
+        assert_eq!(refused(&db, sql), message, "{sql}");
+    }
+}
+
+#[test]
+fn prepare_refuses_what_the_pin_refuses_when_it_prepares() {
+    let db = Database::new();
+    for (sql, start) in [
+        (
+            "PREPARE s AS SELECT * FROM nosuch",
+            "Catalog Error: Table with name nosuch does not exist!",
+        ),
+        (
+            "PREPARE s AS SELECT nosuch",
+            "Binder Error: Referenced column \"nosuch\" was not found because the FROM clause is \
+             missing",
+        ),
+        (
+            "PREPARE s(INTEGER) AS SELECT $1",
+            "Not implemented Error: TypeList for prepared statement has not been implemented.",
+        ),
+        (
+            "PREPARE s AS PREPARE t AS SELECT 1",
+            "Parser Error: PREPARE_STATEMENT is not a preparable statement",
+        ),
+        ("PREPARE s AS EXECUTE t", "Parser Error: EXECUTE_STATEMENT is not a preparable statement"),
+    ] {
+        let message = refused(&db, sql);
+        assert!(message.starts_with(start), "{sql}: {message}");
+    }
+    // A table dropped after the statement was prepared is missing when it runs.
+    db.execute("CREATE TABLE t (a INTEGER)").expect("creates");
+    db.execute("PREPARE s AS SELECT * FROM t").expect("prepares");
+    db.execute("DROP TABLE t").expect("drops");
+    assert!(
+        refused(&db, "EXECUTE s").starts_with("Catalog Error: Table with name t does not exist!")
+    );
+}
+
+#[test]
+fn a_name_with_no_from_clause_to_look_in_says_the_clause_is_missing() {
+    let db = Database::new();
+    for (sql, message) in [
+        (
+            "SELECT nosuch + 1",
+            "Binder Error: Referenced column \"nosuch\" was not found because the FROM clause is \
+             missing",
+        ),
+        ("SELECT a.b.c", "Binder Error: Referenced table \"a.b\" not found!"),
+    ] {
+        assert_eq!(refused(&db, sql), message, "{sql}");
+    }
+    // A subquery with no clause of its own still sees the columns around it.
+    assert!(
+        refused(&db, "SELECT 1 FROM range(0) t(x) WHERE (SELECT nosuch)")
+            .starts_with("Binder Error: Referenced column \"nosuch\" not found in FROM clause!"),
+    );
+}

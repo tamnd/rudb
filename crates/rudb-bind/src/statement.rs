@@ -593,6 +593,13 @@ fn bind_one(
             let (root, _) = binder.bind_query(ast, copy.query)?;
             copy_to(copy, finish(binder, root)?).map(Bound::CopyTo)
         }
+        // The connection holds prepared statements, so the database runs these three itself and
+        // only a caller that hands one straight to the binder gets here.
+        ast::Statement::Prepare { .. }
+        | ast::Statement::Execute { .. }
+        | ast::Statement::Deallocate(_) => {
+            Err(Error::not_implemented("PREPARE, EXECUTE and DEALLOCATE outside of a connection"))
+        }
     }
 }
 

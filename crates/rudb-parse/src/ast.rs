@@ -152,6 +152,17 @@ pub enum Statement {
     Explain { query: QueryRef, analyze: bool, statistics: bool, codegen: bool },
     /// `COPY t TO 'file'` or `COPY (query) TO 'file'`, as an index into [`Ast::copies`].
     CopyTo(CopyToRef),
+    /// `PREPARE name AS statement`, with the text of the statement.
+    ///
+    /// The text rather than the statement, because a prepared statement outlives the script it was
+    /// written in and is parsed again into an AST of its own when it is prepared.
+    Prepare { name: StrRef, text: StrRef },
+    /// `EXECUTE name(values)`, with the values as a query of one row whose aliases are the names
+    /// they were given, `NONE` for a value given by position. The query is `NONE` when no values
+    /// were written.
+    Execute { name: StrRef, values: QueryRef },
+    /// `DEALLOCATE name` or `DEALLOCATE PREPARE name`.
+    Deallocate(StrRef),
 }
 
 /// `COPY ... TO`, which writes what a query answers to a file.
