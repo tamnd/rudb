@@ -62,7 +62,7 @@ use rudb_common::{
     Rules, Session, ShowBehavior, Value, Variable, human, looks_like_rule, parse_clustering,
     rule_names,
 };
-use rudb_functions::{Behaviour, LOCAL, SETTINGS, SettingEntry, unknown_enum_value};
+use rudb_functions::{Behaviour, LOCAL, SettingEntry, UNSET, every_setting, unknown_enum_value};
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
@@ -79,6 +79,11 @@ const INVALIDATION_POLICIES: [&str; 2] =
 /// refuses another word and the words in the order the pin declares them.
 const KNOB_WORDS: &[(&str, &str, &[&str])] = &[
     ("explain_output", "ExplainOutputType", &["ALL", "OPTIMIZED_ONLY", "PHYSICAL_ONLY"]),
+    (
+        "force_bitpacking_mode",
+        "BitpackingMode",
+        &["AUTO", "CONSTANT", "CONSTANT_DELTA", "DELTA_FOR", "FOR"],
+    ),
     ("logging_level", "LogLevel", &LOG_LEVELS),
     ("logging_mode", "LogMode", &["LEVEL_ONLY", "DISABLE_SELECTED", "ENABLE_SELECTED"]),
 ];
@@ -86,6 +91,9 @@ const KNOB_WORDS: &[(&str, &str, &[&str])] = &[
 /// The knobs that read back as the word the enum spells rather than as it was written, so
 /// `SET logging_level = 'debug'` reads back as `DEBUG`. `explain_output` is not one of them.
 const SPELLED_KNOBS: [&str; 2] = ["logging_level", "logging_mode"];
+
+/// The words `profiling_mode` takes, in the order the pin lists them when it refuses another.
+const PROFILING_MODES: [&str; 3] = ["standard", "detailed", "all"];
 
 /// The log levels, most verbose first, which is the order a level compares in.
 const LOG_LEVELS: [&str; 6] = ["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "FATAL"];
@@ -998,6 +1006,23 @@ impl Settings {
                 )));
             }
         }
+        // Deprecated on the pin, which still checks the word and then reads back `standard` whatever
+        // was written, because every mode collects the same detail now. Setting it turns profiling
+        // on in the pin's default format when profiling is off, and leaves a format already chosen.
+        if entry.name == "profiling_mode" {
+            if !PROFILING_MODES.iter().any(|mode| mode.eq_ignore_ascii_case(&written)) {
+                return Err(Error::parser(format!(
+                    "Unrecognized profiling mode \"{written}\", supported formats: [{}]",
+                    PROFILING_MODES.join(", ")
+                )));
+            }
+            written = "standard".to_string();
+            let mut carried = self.carried.write().unwrap_or_else(|held| held.into_inner());
+            let profiling = carried.entry("enable_profiling").or_insert_with(|| UNSET.to_string());
+            if profiling == UNSET {
+                *profiling = "query_tree".to_string();
+            }
+        }
         // The one knob a commit reads, so it is a size or it is refused, and it reads back the way
         // the pin prints it. Both spellings land here as wal_autocheckpoint.
         if entry.name == "wal_autocheckpoint" {
@@ -1344,7 +1369,7 @@ impl Settings {
         session.set_seams(self.seams().written());
         session
             .set_variables(self.variables.read().unwrap_or_else(PoisonError::into_inner).clone());
-        for entry in SETTINGS {
+        for entry in every_setting() {
             if entry.behaviour != Behaviour::Honoured {
                 session.set(entry.name, self.carried(entry));
                 continue;
