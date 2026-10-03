@@ -406,6 +406,23 @@ impl Domain {
         {
             let shift = frame.wrapping_sub(base) as u64;
             let mut codes = [0_u64; 64];
+            // A width of six bits or less has at most 64 codes, so the answer for every one of them
+            // fits a word worked out once a chunk, and a row is a shift of that word rather than a
+            // clamp and a load from the domain. Those are the links to the small tables, such as
+            // `kind_id` on `title`, which JOB 33a tests on two and a half million rows.
+            if packed.width() <= 6 {
+                let lut = (0..1_u64 << packed.width()).fold(0_u64, |lut, code| {
+                    lut | u64::from(self.bit(code.wrapping_add(shift))) << code
+                });
+                return Some(marked(rows, |from, to| {
+                    let block = &mut codes[..to - from];
+                    packed.unpack(from, block);
+                    block
+                        .iter()
+                        .enumerate()
+                        .fold(0, |word, (bit, &code)| word | (lut >> code & 1) << bit)
+                }));
+            }
             return Some(marked(rows, |from, to| {
                 let block = &mut codes[..to - from];
                 packed.unpack(from, block);
@@ -2001,6 +2018,14 @@ mod tests {
         assert_eq!(held(&under), [100, 163]);
         let over = packed_keys(&rows.iter().map(|row| row + 150).collect::<Vec<_>>(), 9, 150);
         assert_eq!(held(&over), [13, 100], "a hundred and sixty three and two hundred and fifty");
+        let narrow = |base: i64| {
+            let values: Vec<i64> = rows.iter().map(|row| row % 64 + base).collect();
+            packed_keys(&values, 6, i128::from(base))
+        };
+        assert_eq!(held(&narrow(90)), [10, 74, 138], "a hundred, six bits over ninety");
+        assert_eq!(held(&narrow(150)), [13, 77, 141], "a hundred and sixty three, over 150");
+        assert_eq!(held(&narrow(230)), [20, 84, 148], "codes running past the domain's end");
+        assert_eq!(held(&narrow(0)), Vec::<u32>::new(), "codes all under the domain's base");
         let mut nulls: Vec<Option<i32>> = rows.iter().map(|&row| Some(row as i32)).collect();
         nulls[163] = None;
         let flat = column(&nulls);
