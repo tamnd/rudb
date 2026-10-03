@@ -3920,6 +3920,50 @@ impl Shared {
         Some(result.and_then(|result| settled.map(|()| result)))
     }
 
+    /// Runs a prepared point read without binding it, or says it cannot and leaves it to
+    /// [`Shared::execute_ast`], see [`crate::prepared::Lookup`].
+    ///
+    /// Outside a transaction only. Inside one the statement reads the transaction's own catalog and
+    /// can be refused for the transaction's sake, which the path through the plan sees to. A read
+    /// takes the catalog's read lock and nothing else, as [`Shared::query`] does.
+    pub(crate) fn lookup(
+        &self,
+        lookup: &crate::prepared::Lookup,
+        given: crate::prepared::Given<'_>,
+        sql: &str,
+    ) -> Option<Result<QueryResult>> {
+        if self.transacting() {
+            return None;
+        }
+        let values =
+            lookup.equal.iter().map(|(_, item)| given.value(item)).collect::<Option<Vec<_>>>()?;
+        let catalog = self.read();
+        let target = match lookup.found.get(catalog.naming()) {
+            Some(target) => target,
+            None => {
+                let target = Arc::new(lookup_target(&catalog, lookup)?);
+                lookup.found.keep(catalog.naming(), Arc::clone(&target));
+                target
+            }
+        };
+        let table = catalog.table(&target.name).ok()?;
+        let mut unanswered = false;
+        let result = kept(sql, 0, |_| {
+            let Some(point) = table.point(&target.key, &values, &target.columns)? else {
+                unanswered = true;
+                return Err(Error::internal("a point read the table cannot answer by its key"));
+            };
+            let chunks = match point {
+                rudb_catalog::Point::Absent => Vec::new(),
+                rudb_catalog::Point::Found(chunk) => vec![chunk],
+            };
+            let reservation = Memory::unlimited().reservation();
+            Ok(QueryResult::new(target.names.clone(), target.types.clone(), chunks, reservation)
+                .in_session(self.session()))
+        });
+        (!unanswered).then_some(result)
+    }
+
     /// Marks the commit of what is being written to checkpoint rather than log.
     fn unlogged(&self) {
         if let Some(journal) = self.journal().as_mut() {
@@ -6231,6 +6275,60 @@ fn direct_targets(
         return None;
     }
     Some((name, targets))
+}
+
+/// The table a [`crate::prepared::Lookup`] reads, the key its `WHERE` names and the columns its
+/// select list does, or `None` when a name does not resolve the simple way or the plan has to say
+/// what it means: not a table, a qualifier that is not the table's, or a column the table does not
+/// have once.
+fn lookup_target(
+    catalog: &Catalog,
+    lookup: &crate::prepared::Lookup,
+) -> Option<crate::prepared::Target> {
+    use crate::prepared::Pick;
+    let parts: Vec<&str> = lookup.name.iter().map(String::as_str).collect();
+    let name = catalog.resolve(&parts).ok()?;
+    if catalog.entry(&name).ok()? != Entry::Table {
+        return None;
+    }
+    let fields = catalog.table(&name).ok()?.columns();
+    // A column is qualified by the alias when the table has one, and by its bare name otherwise.
+    let qualifies = |qualifier: &[String]| match qualifier {
+        [] => true,
+        [one] => one.eq_ignore_ascii_case(lookup.alias.as_deref().unwrap_or(&name.table)),
+        _ => false,
+    };
+    let column = |written: &[String]| {
+        let (column, qualifier) = written.split_last()?;
+        let mut found = fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name.eq_ignore_ascii_case(column))
+            .map(|(at, _)| at);
+        let at = found.next()?;
+        (qualifies(qualifier) && found.next().is_none()).then_some(at)
+    };
+    let mut columns = Vec::new();
+    let mut names = Vec::new();
+    for pick in &lookup.picks {
+        match pick {
+            Pick::All(qualifier) => {
+                if !qualifies(qualifier) {
+                    return None;
+                }
+                columns.extend(0..fields.len());
+                names.extend(fields.iter().map(|field| field.name.clone()));
+            }
+            Pick::Column(written, alias) => {
+                let at = column(written)?;
+                columns.push(at);
+                names.push(alias.clone().unwrap_or_else(|| fields[at].name.clone()));
+            }
+        }
+    }
+    let key = lookup.equal.iter().map(|(written, _)| column(written)).collect::<Option<_>>()?;
+    let types = columns.iter().map(|&at| fields[at].ty.clone()).collect();
+    Some(crate::prepared::Target { name, key, columns, names, types })
 }
 
 /// Whether a value of type `from` goes into a column of type `to` by one of the casts

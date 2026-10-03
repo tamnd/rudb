@@ -1,6 +1,6 @@
 //! A statement parsed once and run many times, with values for its parameters.
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rudb_bind::Parameters;
 use rudb_catalog::QualifiedName;
@@ -44,6 +44,7 @@ pub struct Prepared {
     ast: Ast,
     names: Vec<String>,
     direct: Option<Direct>,
+    lookup: Option<Lookup>,
     /// Whether the parameters are `1` to `n` and nothing else, so that `n` values by position are
     /// exactly the values the statement wants, with nothing missing and nothing left over.
     numbered: bool,
@@ -97,6 +98,77 @@ impl Found {
 
 impl Clone for Found {
     /// A copy starts over, since nothing it would keep is worth sharing.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// A `SELECT` of columns of one table whose `WHERE` sets every column of one of its keys equal to
+/// a parameter, and nothing else: no join, no grouping, no order, no limit.
+///
+/// That is the point read of `13-the-point-path.md`, and the plan for it binds the statement,
+/// optimizes it and builds a pipeline sized for thousands of rows to read one. So the shape is
+/// read once here, and an execution whose names still resolve the way they did finds the row by
+/// its key. What the shape cannot settle by itself goes the long way: a name that is not a table
+/// of the table's columns, columns that are not a key, or a value that is not already its
+/// column's type.
+#[derive(Debug, Clone)]
+pub(crate) struct Lookup {
+    /// The table's name, as it was written.
+    pub(crate) name: Vec<String>,
+    /// The alias the table was given, if any, which is then the only qualifier a column takes.
+    pub(crate) alias: Option<String>,
+    /// What the select list asks for, in order.
+    pub(crate) picks: Vec<Pick>,
+    /// Each column the `WHERE` names, as written, with the item it is set equal to.
+    pub(crate) equal: Vec<(Vec<String>, Item)>,
+    /// What the last execution worked out from the names, kept while they resolve the same.
+    pub(crate) found: Resolved,
+}
+
+/// One entry of a [`Lookup`] select list.
+#[derive(Debug, Clone)]
+pub(crate) enum Pick {
+    /// `*`, or `t.*` with the qualifier.
+    All(Vec<String>),
+    /// A column as written, with the alias it was given.
+    Column(Vec<String>, Option<String>),
+}
+
+/// What a [`Lookup`] resolves to: the table, the key's columns in the order of the `WHERE`, the
+/// columns to read, and the names and types of the result.
+#[derive(Debug)]
+pub(crate) struct Target {
+    pub(crate) name: QualifiedName,
+    pub(crate) key: Vec<usize>,
+    pub(crate) columns: Vec<usize>,
+    pub(crate) names: Vec<String>,
+    pub(crate) types: Vec<rudb_common::LogicalType>,
+}
+
+/// The [`Target`] a [`Lookup`] resolved to, with the catalog's [`naming`] it was resolved at.
+///
+/// [`naming`]: rudb_catalog::Catalog::naming
+#[derive(Debug, Default)]
+pub(crate) struct Resolved(Mutex<Option<(u64, Arc<Target>)>>);
+
+impl Resolved {
+    /// The target resolved at `naming`, if that is what is held.
+    pub(crate) fn get(&self, naming: u64) -> Option<Arc<Target>> {
+        match &*self.0.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some((at, target)) if *at == naming => Some(Arc::clone(target)),
+            _ => None,
+        }
+    }
+
+    /// Keeps `target` as what the names resolve to at `naming`.
+    pub(crate) fn keep(&self, naming: u64, target: Arc<Target>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((naming, target));
+    }
+}
+
+impl Clone for Resolved {
+    /// A copy starts over, like [`Found`].
     fn clone(&self) -> Self {
         Self::default()
     }
@@ -192,6 +264,74 @@ impl Direct {
     }
 }
 
+impl Lookup {
+    /// The shape of `ast`, if it is one statement of it.
+    fn of(ast: &Ast) -> Option<Self> {
+        let [ast::Statement::Query(at)] = ast.statements.as_slice() else { return None };
+        let query = ast.query(*at);
+        let ast::QueryBody::Select(select) = query.body else { return None };
+        if query != ast::Query::bare(query.body) {
+            return None;
+        }
+        let select = ast.select(select);
+        if select.distinct != ast::Distinct::No
+            || select.group_by.len != 0
+            || select.group_by_all
+            || select.having != rudb_parse::NONE
+            || select.qualify != rudb_parse::NONE
+            || select.filter == rudb_parse::NONE
+        {
+            return None;
+        }
+        let [source] = ast.source_list(select.from) else { return None };
+        let ast::Source::Table { name, alias, columns } = ast.source(*source) else { return None };
+        if columns.len != 0 {
+            return None;
+        }
+        let words = |slice| ast.name(slice).map(str::to_owned).collect::<Vec<_>>();
+        let alias = (alias != rudb_parse::NONE).then(|| ast.string(alias).to_owned());
+        let mut picks = Vec::new();
+        for target in ast.target_list(select.targets) {
+            let named = (target.alias != rudb_parse::NONE).then(|| ast.string(target.alias));
+            picks.push(match ast.expr(target.expr) {
+                ast::Expr::Star { qualifier, replacements }
+                    if replacements.len == 0
+                        && named.is_none()
+                        && ast.star_lists(target.expr) == ast::StarLists::default() =>
+                {
+                    Pick::All(words(qualifier))
+                }
+                ast::Expr::Column { name } => Pick::Column(words(name), named.map(str::to_owned)),
+                _ => return None,
+            });
+        }
+        let mut equal = Vec::new();
+        let mut pending = vec![select.filter];
+        while let Some(expr) = pending.pop() {
+            let ast::Expr::Binary { op, left, right } = ast.expr(expr) else { return None };
+            match op {
+                ast::BinaryOp::And => pending.extend([right, left]),
+                ast::BinaryOp::Eq => {
+                    let (column, parameter) = match (ast.expr(left), ast.expr(right)) {
+                        (ast::Expr::Column { name }, ast::Expr::Parameter { name: parameter })
+                        | (ast::Expr::Parameter { name: parameter }, ast::Expr::Column { name }) => {
+                            (name, parameter)
+                        }
+                        _ => return None,
+                    };
+                    let parameter = ast.string(parameter);
+                    equal.push((
+                        words(column),
+                        Item::Parameter(parameter.to_owned(), numbered(parameter)),
+                    ));
+                }
+                _ => return None,
+            }
+        }
+        Some(Self { name: words(name), alias, picks, equal, found: Resolved::default() })
+    }
+}
+
 impl Prepared {
     /// Parses `sql` and reads the parameters out of it.
     pub(crate) fn new(shared: Shared, sql: &str) -> Result<Self> {
@@ -199,8 +339,9 @@ impl Prepared {
         let ast = parse_ast_with_case(sql, session.semantics().identifier_case())?;
         let names: Vec<String> = ast.parameters().into_iter().map(str::to_string).collect();
         let direct = Direct::of(&ast);
+        let lookup = Lookup::of(&ast);
         let numbered = numbered_one_to_n(&names);
-        Ok(Self { shared, sql: sql.to_string(), ast, names, direct, numbered })
+        Ok(Self { shared, sql: sql.to_string(), ast, names, direct, lookup, numbered })
     }
 
     /// The statement as it was written.
@@ -232,6 +373,14 @@ impl Prepared {
             && let Some(direct) = &self.direct
             && let Some(done) =
                 self.shared.insert_direct(direct, Given::Positional(values), &self.sql)
+        {
+            return done.map_err(|error| self.shared.process_error(error));
+        }
+        // The point read, likewise.
+        if self.numbered
+            && values.len() == self.names.len()
+            && let Some(lookup) = &self.lookup
+            && let Some(done) = self.shared.lookup(lookup, Given::Positional(values), &self.sql)
         {
             return done.map_err(|error| self.shared.process_error(error));
         }
@@ -271,6 +420,11 @@ impl Prepared {
             if let Some(direct) = &self.direct
                 && let Some(done) =
                     self.shared.insert_direct(direct, Given::Named(&parameters), &self.sql)
+            {
+                return done;
+            }
+            if let Some(lookup) = &self.lookup
+                && let Some(done) = self.shared.lookup(lookup, Given::Named(&parameters), &self.sql)
             {
                 return done;
             }
@@ -348,5 +502,38 @@ mod tests {
             assert!(db.prepare(sql).expect("prepares").direct.is_none(), "{sql}");
         }
         assert!(Direct::of(&rudb_parse::parse_ast("SELECT ?").expect("parses")).is_none());
+    }
+
+    #[test]
+    fn a_read_by_key_takes_the_short_way() {
+        let db = Database::new();
+        db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR)").expect("creates");
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").expect("inserts");
+        let prepared = db.prepare("SELECT name FROM t WHERE id = ?").expect("prepares");
+        let lookup = prepared.lookup.as_ref().expect("the shape is recognised");
+        let values = vec![Value::BigInt(2)];
+        let taken = prepared.shared.lookup(lookup, Given::Positional(&values), prepared.sql());
+        let result = taken.expect("taken").expect("runs");
+        assert_eq!(result.value_at(0, 0), Value::Varchar("b".into()));
+        let values = vec![Value::Varchar("2".into())];
+        let taken = prepared.shared.lookup(lookup, Given::Positional(&values), prepared.sql());
+        assert!(taken.is_none(), "a value the plan would cast goes to the plan");
+        let prepared = db.prepare("SELECT name FROM t WHERE name = ?").expect("prepares");
+        let lookup = prepared.lookup.as_ref().expect("the shape is recognised");
+        let values = vec![Value::Varchar("b".into())];
+        let taken = prepared.shared.lookup(lookup, Given::Positional(&values), prepared.sql());
+        assert!(taken.is_none(), "name is no key");
+
+        for sql in [
+            "SELECT name FROM t WHERE id = ? LIMIT 1",
+            "SELECT name FROM t WHERE id = ? OR id = ?",
+            "SELECT name FROM t WHERE id = 1 + ?",
+            "SELECT DISTINCT name FROM t WHERE id = ?",
+            "SELECT upper(name) FROM t WHERE id = ?",
+            "SELECT t.name FROM t, t AS u WHERE t.id = ?",
+            "SELECT name FROM t",
+        ] {
+            assert!(db.prepare(sql).expect("prepares").lookup.is_none(), "{sql}");
+        }
     }
 }

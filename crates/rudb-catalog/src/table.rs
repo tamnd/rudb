@@ -19,6 +19,7 @@ use crate::gone::Gone;
 use crate::held::Held;
 use crate::keys::{ForeignKey, Key, Seen};
 use crate::name::{QualifiedName, same_name};
+use crate::points::{Point, Points, looks_up};
 
 /// Where table revisions are counted from, one counter for the process.
 ///
@@ -1609,6 +1610,8 @@ pub struct Table {
     /// it was, and anything else draws a new one, so two tables with the same frame agree on what
     /// row number `n` means for every row both of them have.
     frame: u64,
+    /// Where the row of each key is, built the first time a lookup by key asks.
+    points: Points,
 }
 
 impl Table {
@@ -1641,6 +1644,7 @@ impl Table {
             sequences: Vec::new(),
             revision: next_revision(),
             frame: next_revision(),
+            points: Points::default(),
         })
     }
 
@@ -1683,6 +1687,7 @@ impl Table {
             sequences: Vec::new(),
             revision: next_revision(),
             frame: next_revision(),
+            points: Points::default(),
         })
     }
 
@@ -1969,6 +1974,37 @@ impl Table {
     #[must_use]
     pub fn frame(&self) -> u64 {
         self.frame
+    }
+
+    /// The row whose key over the columns `key` is `values`, with the columns `columns`, found
+    /// where the table noted the key rather than by reading the table, `13-the-point-path.md`.
+    ///
+    /// `None` when that would not answer what the plan does: `key` is not the columns of one of the
+    /// table's keys, or a value is not one [`looks_up`] takes for its column as it is.
+    ///
+    /// # Errors
+    ///
+    /// If the rows cannot be read.
+    pub fn point(
+        &self,
+        key: &[usize],
+        values: &[Value],
+        columns: &[usize],
+    ) -> Result<Option<Point>> {
+        let fits = key.len() == values.len()
+            && key.iter().zip(values).all(|(&column, value)| {
+                self.columns.get(column).is_some_and(|field| looks_up(value, &field.ty))
+            });
+        // The same columns in any order, which with as many of them as the key has is each once.
+        let same = |held: &[usize]| {
+            held.len() == key.len() && held.iter().all(|column| key.contains(column))
+        };
+        let keyed = self.keys.iter().any(|held| same(&held.columns))
+            || self.indexes.iter().any(|index| index.unique && index.plain && same(&index.columns));
+        if !fits || !keyed || columns.iter().any(|&column| column >= self.columns.len()) {
+            return Ok(None);
+        }
+        self.points.find(&self.rows, self.revision, key, values, columns).map(Some)
     }
 
     /// Draws a new revision, for a table about to be changed.
