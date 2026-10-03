@@ -2168,12 +2168,20 @@ impl<'a> Transform<'a> {
         });
         let json = matches!(format.as_str(), "json" | "ndjson" | "jsonl");
         let mut options = CopyOptions::new();
-        for (name, value) in written {
+        for (name, value, listed) in written {
             let parameter = if json {
-                match copy_json_parameter(&name, value.is_some())? {
+                let parameter = copy_json_parameter(&name, value.is_some() || listed.is_some())?;
+                if listed.is_some() {
+                    return Err(Error::binder(format!(
+                        "COPY parameter \"{name}\" expects a single argument"
+                    )));
+                }
+                match parameter {
                     Some(parameter) => parameter,
                     None => continue,
                 }
+            } else if let Some(list) = listed {
+                return self.unsupported(list);
             } else {
                 copy_parameter(&name)?
             };
@@ -2347,8 +2355,24 @@ impl<'a> Transform<'a> {
             }
             let name = self.text(self.find(inner, "CopyOptionName")).to_ascii_lowercase();
             let value = self.find(inner, "GenericCopyOptionValue");
-            if value != NONE && self.name(self.first(value)) != "GenericCopyOptionExpression" {
+            let parenthesized =
+                value != NONE && self.name(self.first(value)) != "GenericCopyOptionExpression";
+            if parenthesized && name == "format" {
                 return self.unsupported(value);
+            }
+            if parenthesized {
+                // `dateformat ('%d')` is the one string it holds, and a list of any other length
+                // is kept as the node, for the caller to refuse once it knows the format.
+                let list = self.descendant(value, "OrderByExpressionList");
+                let items: Vec<u32> =
+                    if list == NONE { Vec::new() } else { self.kids(list).collect() };
+                if let [item] = items[..] {
+                    let expr = self.expr(self.first(item))?;
+                    options.push((name, Some(expr), None));
+                } else {
+                    options.push((name, None, Some(value)));
+                }
+                continue;
             }
             if name == "format" {
                 // `FORMAT csv` writes the format as a bare word, which would read as a column,
@@ -2366,7 +2390,7 @@ impl<'a> Transform<'a> {
             } else {
                 Some(self.expr(self.descendant(value, "Expression"))?)
             };
-            options.push((name, expr));
+            options.push((name, expr, None));
         }
         let mut specialized = Vec::new();
         self.named_nodes(node, "SpecializedOption", &mut specialized);
@@ -2381,7 +2405,7 @@ impl<'a> Transform<'a> {
                     continue;
                 }
                 "HeaderOption" => {
-                    options.push(("header".to_string(), None));
+                    options.push(("header".to_string(), None, None));
                     continue;
                 }
                 "NullAsOption" => "null",
@@ -2391,7 +2415,7 @@ impl<'a> Transform<'a> {
                 _ => return self.unsupported(inner),
             };
             let expr = self.string_literal(self.find(inner, "StringLiteral"))?;
-            options.push((parameter.to_string(), Some(expr)));
+            options.push((parameter.to_string(), Some(expr), None));
         }
         Ok((format, options))
     }
@@ -5509,8 +5533,8 @@ impl<'a> Transform<'a> {
 type CopyOptions = Vec<(&'static str, ExprRef)>;
 
 /// The options of a `COPY` as they were written, each name in lower case with its value if it had
-/// one.
-type WrittenOptions = Vec<(String, Option<ExprRef>)>;
+/// one, and the node of a parenthesized list that did not hold exactly one value.
+type WrittenOptions = Vec<(String, Option<ExprRef>, Option<u32>)>;
 
 /// The `read_json` parameter a `COPY FROM` a JSON file passes an option on as, or `None` for one
 /// that is taken and does nothing.
@@ -6857,6 +6881,23 @@ mod tests {
             error,
             "Binder Error: COPY parameter \"timestampformat\" expects a single argument"
         );
+        assert_eq!(
+            round_statement("COPY t FROM 'x.json' (DATEFORMAT ('%d'))"),
+            "INSERT INTO t SELECT * FROM read_json('x.json', dateformat := '%d')"
+        );
+        for (options, message) in [
+            ("(dateformat ('a', 'b'))", "COPY parameter \"dateformat\" expects a single argument"),
+            ("(columns ('a', 'b'))", "COPY parameter \"columns\" expects a single argument"),
+            (
+                "(ignore_errors (1, 2))",
+                "COPY parameter \"ignore_errors\" expects a single argument",
+            ),
+            ("(bogus ('a', 'b'))", "Unsupported option for COPY FROM: \"bogus\""),
+        ] {
+            let query = format!("COPY t FROM 'x.json' {options}");
+            let error = parse_ast(&query).unwrap_err().to_string();
+            assert!(error.ends_with(message), "{query}: {error}");
+        }
         assert!(!{
             let ast = parse_ast("INSERT INTO t VALUES (1)").unwrap();
             let Statement::Insert(index) = ast.statements[0] else { panic!("not an insert") };
