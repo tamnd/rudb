@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Thirty eight passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
+//! Thirty nine passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
 //! is the start of it. Column pruning came first, because it is the pass whose absence is measured
 //! in gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -42,6 +42,7 @@ pub mod order;
 pub mod pass;
 pub mod pregroup;
 pub mod presize;
+pub mod reach;
 pub mod reorder;
 pub mod semi;
 pub mod shared;
@@ -217,6 +218,9 @@ pub const RANK: u8 = 11;
 /// sum of the same column and after pre grouping, so that it sees the sums and counts those two
 /// leave and so that a grouping either of them made is one it leaves alone.
 ///
+/// Giving a scan the keys of a join whose runtime filter cannot reach it goes right after the build
+/// sides are chosen, because which scans a runtime filter reaches is a question about them.
+///
 /// Reading a link instead of building a hash table is last of all, after the build side has been
 /// chosen. It replaces a join outright, so a pass that ran after it would have to know about a
 /// second kind of join to say anything about one, and there is nothing any of them want to say:
@@ -226,7 +230,7 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 38] = [
+pub static PASSES: [&(dyn Pass + Sync); 39] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -260,6 +264,7 @@ pub static PASSES: [&(dyn Pass + Sync); 38] = [
     &unique::JoinedRowsAreGroups,
     &toplink::TopNThroughLinks,
     &sides::BuildSideProbeSide,
+    &reach::JoinKeyReach,
     &presize::AggregatePresize,
     &dense::AggregateDense,
     &cluster::AggregateCluster,
