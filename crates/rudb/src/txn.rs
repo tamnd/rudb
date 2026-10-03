@@ -101,6 +101,13 @@ pub(crate) struct Written {
 }
 
 impl Written {
+    /// Whether everything done to the table was adding rows.
+    fn appends(&self) -> bool {
+        self.changes
+            .as_ref()
+            .is_some_and(|changes| changes.iter().all(|change| matches!(change, Change::Insert(_))))
+    }
+
     pub(crate) fn new() -> Self {
         Self { origin: None, changes: Some(Vec::new()) }
     }
@@ -437,6 +444,29 @@ pub(crate) fn merge(
         return Ok(());
     }
     if mine.shape() == base.shape() {
+        // One table changed, which is what an autocommit write is, lands on the committed catalog
+        // where it is: the table itself when nobody else changed it since, and the rows added to
+        // it otherwise. Every check comes before the first row goes in, so there is no second
+        // table for a failure to leave half done and no copy of the catalog to take.
+        let mut changed = mine.tables().filter(|table| {
+            by_oid(base, table.oid()).is_none_or(|before| table.revision() != before.revision())
+        });
+        if let (Some(table), None) = (changed.next(), changed.next())
+            && let Some(before) = by_oid(base, table.oid())
+            && let Some(now) = by_oid(committed, table.oid())
+            && let Some(written) = snapshot.written.get(&table.oid())
+        {
+            let name = now.name().clone();
+            if now.revision() == before.revision() {
+                *committed.table_mut(&name)? = table.clone();
+                return Ok(());
+            }
+            if written.appends() {
+                let written = snapshot.written.remove(&table.oid()).expect("asked just above");
+                let changes = written.changes.ok_or_else(commit_conflict)?;
+                return rebase(committed, &name, before, changes, workers);
+            }
+        }
         // Only rows changed here, so the committed catalog keeps its shape and takes this
         // transaction's tables. Worked on a copy, so a conflict in the second table leaves the
         // first one as it was.

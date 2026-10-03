@@ -4142,6 +4142,18 @@ impl Shared {
             })
     }
 
+    /// Whether `ast` is a statement outside a transaction that runs as a transaction of its own,
+    /// so it finds and changes its rows without the writer lock: an update or a delete, which can
+    /// scan a whole table and would keep every other writer waiting for that long.
+    fn implicit_statement(&self, ast: &Ast) -> bool {
+        // An insert stays on the writer lock: appends under it are cheaper than a snapshot each,
+        // and they never hold the lock long enough to keep a reader waiting.
+        let [statement] = ast.statements.as_slice() else { return false };
+        matches!(statement, ast::Statement::Update(_) | ast::Statement::Delete(_))
+            && self.inner.writable
+            && !self.transacting()
+    }
+
     /// Reuse a simple native aggregate plan while the table and settings are unchanged.
     /// Execution still runs for every call, producing a fresh answer and metrics document.
     fn cached_native_aggregate(&self, sql: &str, cancel: &Cancel) -> Result<Option<QueryResult>> {
@@ -4703,6 +4715,25 @@ impl Shared {
             return kept(sql, parse_ns, |noted| {
                 self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
             });
+        }
+        if self.implicit_statement(ast) {
+            // A transaction of its own, so the rows are found and changed on a copy of the
+            // catalog without the writer lock, and only the commit waits for it.
+            *self.open() = Some(Open::new(false));
+            let result = kept(sql, parse_ns, |noted| {
+                self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
+            });
+            let closed = self.open().take();
+            let writing = self.writing();
+            let closed = match closed {
+                Some(closed) => self.close_transaction(closed, result.is_ok()),
+                None => Ok(()),
+            };
+            let settled = self.settle(writing);
+            let result = result?;
+            closed?;
+            settled?;
+            return Ok(result);
         }
         let writing = self.writing();
         let result = kept(sql, parse_ns, |noted| {
@@ -6614,6 +6645,57 @@ mod tests {
         worker.join().expect("the worker");
         let sum = database.query("SELECT sum(id) FROM t").expect("reads").value_at(0, 0);
         assert_eq!(sum, Value::HugeInt(13));
+    }
+
+    /// An insert, update or delete outside a transaction runs as one of its own, so it finds its
+    /// rows while another connection holds the writer lock and waits only to commit.
+    #[test]
+    fn an_autocommit_write_waits_for_the_writer_lock_only_to_commit() {
+        let path = std::env::temp_dir().join(format!("rudb-autocommit-{}.rdb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let database = Database::open(path.to_str().expect("a path")).expect("opens");
+        database.execute("CREATE TABLE t (id INTEGER)").expect("creates");
+        database.execute("INSERT INTO t VALUES (1), (2)").expect("inserts");
+        let connection = database.connect();
+        let writing = database.shared.writing();
+        let (done, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            connection.execute("UPDATE t SET id = id + 10 WHERE id = 2").expect("updates");
+            done.send(()).expect("sends");
+        });
+        assert!(finished.recv_timeout(Duration::from_millis(200)).is_err(), "waits to commit");
+        drop(writing);
+        worker.join().expect("the worker");
+        let sum = database.query("SELECT sum(id) FROM t").expect("reads").value_at(0, 0);
+        assert_eq!(sum, Value::HugeInt(13));
+        drop(database);
+        let database = Database::open(path.to_str().expect("a path")).expect("opens again");
+        let sum = database.query("SELECT sum(id) FROM t").expect("reads").value_at(0, 0);
+        assert_eq!(sum, Value::HugeInt(13), "the update reached the log");
+        drop(database);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Autocommit inserts from several connections into one table all land, each commit putting
+    /// its rows after the ones committed while it ran.
+    #[test]
+    fn autocommit_inserts_from_several_connections_into_one_table_all_land() {
+        let database = Database::new();
+        database.execute("CREATE TABLE t (id BIGINT)").expect("creates");
+        std::thread::scope(|scope| {
+            for k in 0..4 {
+                let connection = database.connect();
+                scope.spawn(move || {
+                    for i in 0..100 {
+                        let sql = format!("INSERT INTO t VALUES ({})", k * 1000 + i);
+                        connection.execute(&sql).expect("inserts");
+                    }
+                });
+            }
+        });
+        let result = database.query("SELECT count(*), sum(id) FROM t").expect("reads");
+        assert_eq!(result.value_at(0, 0), Value::BigInt(400));
+        assert_eq!(result.value_at(0, 1), Value::HugeInt(4 * 4950 + 100 * 6000));
     }
 
     #[test]
