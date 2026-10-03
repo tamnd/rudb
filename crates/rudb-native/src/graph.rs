@@ -271,11 +271,14 @@ pub const BUDGET_SHARE: u64 = 10;
 /// Section 3.7. Apart from `BUDGET_SHARE`, because an adjacency is a different kind of thing from
 /// a link or a key map. Those are about the size of the key column they answer for, and a tenth of
 /// the table holds several of them. An adjacency lists every child row once under its parent, so
-/// it costs a row id per child whatever the parent is: on SF1 `lineitem` that is 6 million ids of
-/// 23 bits, about 18 MB, which is more than the whole of the 10 percent share on its own. Out of the
-/// same share it can never be kept. A quarter holds two of them on `lineitem`, which is what the
-/// queries that filter `part` and `supplier` hard read, and the ranking below decides which two.
-pub const ADJACENCY_SHARE: u64 = 25;
+/// it costs a row id per child whatever the parent is, and what it is measured against is how well
+/// the rest of the table compressed. A quarter held two of them on SF1 `lineitem`, whose columns
+/// are wide, and none on JOB `cast_info`, whose seven columns of small integers pack into 280 MB.
+/// Its adjacencies over `movie_id` and `person_id` are 123 MB each, and without them a query that
+/// starts from a dozen movies tests all 36 million rows: 6a spent 116 ms of its 184 there to keep
+/// 1,224. So the share is the table's own size, which holds the two a fact table between two
+/// dimensions needs, and still says no to a third.
+pub const ADJACENCY_SHARE: u64 = 100;
 
 /// The share of a table's stored column bytes its key maps are allowed to cost together.
 ///
