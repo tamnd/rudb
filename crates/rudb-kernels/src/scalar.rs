@@ -2547,6 +2547,12 @@ struct StableLike {
 /// sorts and looks each one up, so the walk gets some room.
 const SPARSE_LIKE: usize = 8;
 
+/// How few of a group's values a sparse chunk can ask about before a pattern that is one run of
+/// bytes decides the whole group in place. On JOB 14b the titles `kind_id` and the year leave are
+/// about a hundred to a group, and copying each out to search them cost more than searching the
+/// group's block where it lies.
+const CROWDED: usize = 16;
+
 /// How many dictionary values one word of the memo holds, at two bits each.
 const MEMO_VALUES: usize = 32;
 
@@ -2690,7 +2696,11 @@ impl StableLike {
             let upto =
                 at + codes[at..].partition_point(|&code| (code as usize) < first + LIKE_GROUP);
             let last = (first + LIKE_GROUP).min(self.dictionary.len());
-            if once && self.touched(first, last) {
+            if once && (upto - at) * CROWDED >= LIKE_GROUP {
+                // A group a chunk asks about this many values of is searched where it lies, the
+                // way a scan's group is, rather than copied out a value at a time.
+                self.decide_group(first, like, characters)?;
+            } else if once && self.touched(first, last) {
                 wanted.extend(first..last);
             } else if !self.ruled_out(first, last, like)? {
                 wanted.extend(codes[at..upto].iter().map(|&code| code as usize));
