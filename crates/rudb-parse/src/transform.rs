@@ -6632,11 +6632,11 @@ mod tests {
     }
 
     #[test]
-    fn a_session_variable_is_refused_rather_than_read_as_a_setting() {
+    fn a_session_variable_is_not_read_as_a_setting() {
         // `SET VARIABLE x = 1` declares a session variable, which is not a knob on the engine, and
         // reading it as one would change an answer quietly.
-        let error = parse_ast("SET VARIABLE x = 1").expect_err("a variable");
-        assert_eq!(error.code().duckdb_name(), "Not implemented Error");
+        assert_eq!(round_statement("SET VARIABLE x = 1"), "SET VARIABLE x = 1");
+        assert_ne!(round_statement("SET VARIABLE x = 1"), round_statement("SET x = 1"));
     }
 
     #[test]
