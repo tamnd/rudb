@@ -89,6 +89,7 @@ pub struct Semantics {
     regex_match_full: bool,
     scalar_subquery_error_on_multiple_rows: bool,
     show_behavior: ShowBehavior,
+    single_arrow_lambdas: bool,
     warnings_as_errors: bool,
 }
 
@@ -107,6 +108,7 @@ impl Default for Semantics {
             regex_match_full: false,
             scalar_subquery_error_on_multiple_rows: true,
             show_behavior: ShowBehavior::Auto,
+            single_arrow_lambdas: false,
             warnings_as_errors: false,
         }
     }
@@ -174,6 +176,13 @@ impl Semantics {
     #[must_use]
     pub fn regex_match_full(self) -> bool {
         self.regex_match_full
+    }
+
+    /// Whether a lambda may be written with the deprecated arrow, `x -> x + 1`, which is what
+    /// `lambda_syntax = 'ENABLE_SINGLE_ARROW'` turns on.
+    #[must_use]
+    pub fn single_arrow_lambdas(self) -> bool {
+        self.single_arrow_lambdas
     }
 
     /// Whether a scalar query producing several rows raises an error.
@@ -466,6 +475,11 @@ impl Session {
     /// Sets whether regex match operators require the entire string to match.
     pub fn set_regex_match_full(&mut self, enabled: bool) {
         self.semantics.regex_match_full = enabled;
+    }
+
+    /// Sets whether a lambda may be written with the deprecated arrow.
+    pub fn set_single_arrow_lambdas(&mut self, enabled: bool) {
+        self.semantics.single_arrow_lambdas = enabled;
     }
 
     /// Sets whether scalar queries may choose one row from several.

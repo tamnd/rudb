@@ -62,11 +62,15 @@ use rudb_common::{
     Rules, Session, ShowBehavior, Value, Variable, human, looks_like_rule, parse_clustering,
     rule_names,
 };
-use rudb_functions::{Behaviour, LOCAL, SETTINGS, SettingEntry};
+use rudb_functions::{Behaviour, LOCAL, SETTINGS, SettingEntry, unknown_enum_value};
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
 use rudb_txn::log::CommitSync;
+
+/// The values `lambda_syntax` takes, in the order the pin declares them, which is the order its
+/// suggestions break ties in.
+const LAMBDA_SYNTAXES: [&str; 3] = ["DEFAULT", "ENABLE_SINGLE_ARROW", "DISABLE_SINGLE_ARROW"];
 
 /// When the rows a commit wrote are seen by the other connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +128,8 @@ pub(crate) struct Settings {
     order_by_non_integer_literal: RwLock<bool>,
     /// Whether regex match operators require the entire string to match.
     regex_match_operator_semantics: RwLock<String>,
+    /// Whether a lambda may be written with the deprecated arrow, kept as it was written.
+    lambda_syntax: RwLock<String>,
     /// Whether a scalar query producing several rows raises an error.
     scalar_subquery_error_on_multiple_rows: RwLock<bool>,
     /// How a bare name following `SHOW` is resolved.
@@ -267,6 +273,7 @@ impl Settings {
             null_on_division_by_zero: RwLock::new(false),
             order_by_non_integer_literal: RwLock::new(false),
             regex_match_operator_semantics: RwLock::new("partial".to_string()),
+            lambda_syntax: RwLock::new("DEFAULT".to_string()),
             scalar_subquery_error_on_multiple_rows: RwLock::new(true),
             show_behavior: RwLock::new("AUTO".to_string()),
             warnings_as_errors: RwLock::new(false),
@@ -775,6 +782,17 @@ impl Settings {
                 *self.preserve_identifier_case.write().unwrap_or_else(|held| held.into_inner()) =
                     normalized.to_string();
             }
+            "lambda_syntax" => {
+                let written = value.map_or("DEFAULT".to_string(), text_of);
+                if !LAMBDA_SYNTAXES.iter().any(|syntax| syntax.eq_ignore_ascii_case(&written)) {
+                    return Err(Error::not_implemented(unknown_enum_value(
+                        &written,
+                        "LambdaSyntax",
+                        &LAMBDA_SYNTAXES,
+                    )));
+                }
+                *self.lambda_syntax.write().unwrap_or_else(|held| held.into_inner()) = written;
+            }
             "regex_match_operator_semantics" => {
                 let written = value.map_or("partial".to_string(), text_of);
                 if !written.eq_ignore_ascii_case("partial") && !written.eq_ignore_ascii_case("full")
@@ -1040,6 +1058,9 @@ impl Settings {
                 .read()
                 .unwrap_or_else(|held| held.into_inner())
                 .clone()),
+            "lambda_syntax" => {
+                Ok(self.lambda_syntax.read().unwrap_or_else(|held| held.into_inner()).clone())
+            }
             "regex_match_operator_semantics" => Ok(self
                 .regex_match_operator_semantics
                 .read()
@@ -1124,6 +1145,8 @@ impl Settings {
             .read()
             .unwrap_or_else(|held| held.into_inner())
             .clone();
+        let lambda_syntax =
+            self.lambda_syntax.read().unwrap_or_else(|held| held.into_inner()).clone();
         let scalar_subquery_error_on_multiple_rows = *self
             .scalar_subquery_error_on_multiple_rows
             .read()
@@ -1153,6 +1176,7 @@ impl Settings {
             _ => IdentifierCase::Preserve,
         });
         session.set_regex_match_full(regex_match_operator_semantics.eq_ignore_ascii_case("full"));
+        session.set_single_arrow_lambdas(lambda_syntax.eq_ignore_ascii_case("ENABLE_SINGLE_ARROW"));
         session.set_scalar_subquery_error_on_multiple_rows(scalar_subquery_error_on_multiple_rows);
         session.set_show_behavior(match show_behavior.to_ascii_uppercase().as_str() {
             "SETTING" => ShowBehavior::Setting,
@@ -1189,6 +1213,7 @@ impl Settings {
                     "memory_limit" => memory.clone(),
                     "order_by_non_integer_literal" => order_by_non_integer_literal.to_string(),
                     "preserve_identifier_case" => preserve_identifier_case.clone(),
+                    "lambda_syntax" => lambda_syntax.clone(),
                     "regex_match_operator_semantics" => regex_match_operator_semantics.clone(),
                     "scalar_subquery_error_on_multiple_rows" => {
                         scalar_subquery_error_on_multiple_rows.to_string()
