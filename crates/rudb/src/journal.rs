@@ -163,6 +163,8 @@ impl Change {
                         let mut values = (0..chunk.len())
                             .map(|row| chunk.value_at(row, column))
                             .collect::<Vec<_>>();
+                        // row at a time: only the rows an update record names, on a replay of a
+                        // table held in memory; a file table's update replays beside the file.
                         for (at, &row) in hits.iter().enumerate() {
                             let (chunk, place) = places[next + at];
                             values[row] = new[chunk].value_at(place, column);
@@ -693,6 +695,8 @@ fn put_rows(out: &mut Vec<u8>, fields: &[Field], chunks: &[Chunk], most: usize) 
         } else {
             out.push(mode::VALUES);
             for (vector, chunk) in vectors.iter().zip(chunks) {
+                // row at a time: the fallback for a type with no fixed layout, which an insert
+                // record rarely holds; text and fixed width columns are written a run at a time.
                 for row in 0..chunk.len() {
                     put(out, &vector.value_at(row), &field.ty)?;
                 }

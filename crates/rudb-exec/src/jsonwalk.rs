@@ -110,9 +110,9 @@ impl LateralJson {
     fn calls(&self, chunk: &Chunk, scratch: &mut Scratch) -> Result<Vec<Option<Call>>> {
         let mut evaluated = Vec::new();
         self.args.evaluate(chunk, scratch, &mut evaluated)?;
+        let mut calls = Vec::with_capacity(chunk.len());
         // row at a time: each row is one document that is parsed and walked as a whole, which costs
         // far more than reading its two arguments as values.
-        let mut calls = Vec::with_capacity(chunk.len());
         for row in 0..chunk.len() {
             let document = match evaluated.first().map(|vector| vector.value_at(row)) {
                 Some(Value::Varchar(text)) => text,

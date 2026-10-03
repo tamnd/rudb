@@ -2075,6 +2075,8 @@ impl Transform<'_> {
         let kind = if matches!(ty, LogicalType::Decimal { .. }) { "decimal" } else { "numerical" };
         let mut success = true;
         let mut values = Vec::with_capacity(items.len());
+        // row at a time: each row is a parsed JSON node whose text is cast on its own, which costs
+        // more than building the value it casts to.
         for (row, item) in items.iter().enumerate() {
             let Some(node) = self.node(*item) else {
                 values.push(Value::Null);
