@@ -49,8 +49,10 @@ pub enum CommitSync {
     /// The block is on stable storage: `F_FULLFSYNC` on macOS and `fdatasync` elsewhere.
     #[default]
     Full,
-    /// Meant to be `F_BARRIERFSYNC` on macOS, which orders the writes without flushing the drive's
-    /// cache. `rudb-io` has one sync today, so this is [`Self::Full`] until it has two.
+    /// The block is ordered on the device: `F_BARRIERFSYNC` on macOS, which keeps every write
+    /// before it ahead of every write after it without waiting for the drive to empty its cache.
+    /// A power loss can lose the last commits and never one commit while keeping a later one.
+    /// Elsewhere there is no such call and this is [`Self::Full`].
     Barrier,
     /// The block is written to the operating system. It survives the process and not the machine.
     Os,
@@ -288,6 +290,8 @@ struct State {
     reserved: u64,
     written: u64,
     durable: u64,
+    /// Every block ordered behind a barrier, or synced, which is more.
+    ordered: u64,
     flushing: bool,
     /// Why the lane stopped. A write or sync that fails leaves the disk in a state nobody can
     /// say, so the lane refuses everything after it and the database goes read only.
@@ -315,11 +319,23 @@ impl State {
     }
 }
 
+/// How far a waiter needs its blocks to have got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Handed to the operating system.
+    Written,
+    /// Ordered on the device behind a barrier.
+    Ordered,
+    /// On stable storage.
+    Durable,
+}
+
 /// What one leader's turn at the disk did.
 #[derive(Debug, Default)]
 struct Led {
     written: u64,
     durable: Option<u64>,
+    ordered: Option<u64>,
     writes: u64,
     syncs: u64,
     segments: u64,
@@ -394,6 +410,7 @@ impl Lane {
                 reserved: 0,
                 written: 0,
                 durable: 0,
+                ordered: 0,
                 flushing: false,
                 failed: None,
                 stats: Stats::default(),
@@ -468,8 +485,9 @@ impl Lane {
     /// If the lane failed, now or earlier.
     pub fn settle(&self, end: u64, sync: CommitSync) -> Result<u64> {
         match sync {
-            CommitSync::Full | CommitSync::Barrier => self.wait(self.lock(), end, true),
-            CommitSync::Os => self.wait(self.lock(), end, false),
+            CommitSync::Full => self.wait(self.lock(), end, Reach::Durable),
+            CommitSync::Barrier => self.wait(self.lock(), end, Reach::Ordered),
+            CommitSync::Os => self.wait(self.lock(), end, Reach::Written),
             CommitSync::None => Ok(end),
         }
     }
@@ -495,7 +513,7 @@ impl Lane {
     pub fn write_out(&self) -> Result<()> {
         let state = self.lock();
         let end = state.reserved;
-        self.wait(state, end, false).map(|_| ())
+        self.wait(state, end, Reach::Written).map(|_| ())
     }
 
     /// Writes and syncs every block committed so far.
@@ -506,7 +524,7 @@ impl Lane {
     pub fn flush(&self) -> Result<()> {
         let state = self.lock();
         let end = state.reserved;
-        self.wait(state, end, true).map(|_| ())
+        self.wait(state, end, Reach::Durable).map(|_| ())
     }
 
     /// The lane position every block before which is on stable storage.
@@ -627,17 +645,16 @@ impl Lane {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Waits until lane position `end` is written, or synced when `durable`, leading a flush
-    /// whenever nobody else is.
-    fn wait<'a>(
-        &'a self,
-        mut state: MutexGuard<'a, State>,
-        end: u64,
-        durable: bool,
-    ) -> Result<u64> {
+    /// Waits until lane position `end` is as far as `reach`, leading a flush whenever nobody else
+    /// is.
+    fn wait<'a>(&'a self, mut state: MutexGuard<'a, State>, end: u64, reach: Reach) -> Result<u64> {
         loop {
             state.check()?;
-            let reached = if durable { state.durable } else { state.written };
+            let reached = match reach {
+                Reach::Written => state.written,
+                Reach::Ordered => state.ordered.max(state.durable),
+                Reach::Durable => state.durable,
+            };
             if reached >= end {
                 return Ok(end);
             }
@@ -654,7 +671,7 @@ impl Lane {
             let pieces = mem::take(&mut state.pending);
             let written = state.written;
             drop(state);
-            let outcome = self.lead(&mut open, &pieces, written, durable);
+            let outcome = self.lead(&mut open, &pieces, written, reach);
             drop(pieces);
             state = self.lock();
             state.flushing = false;
@@ -664,6 +681,9 @@ impl Lane {
                     state.written = state.written.max(led.written);
                     if let Some(synced) = led.durable {
                         state.durable = state.durable.max(synced);
+                    }
+                    if let Some(ordered) = led.ordered {
+                        state.ordered = state.ordered.max(ordered);
                     }
                     state.stats.writes += led.writes;
                     state.stats.syncs += led.syncs;
@@ -681,8 +701,14 @@ impl Lane {
     }
 
     /// Writes `pieces`, which start at lane position `written`, a segment's run at a time, and
-    /// syncs at the end when `sync`.
-    fn lead(&self, open: &mut Open, pieces: &[Piece], mut written: u64, sync: bool) -> Result<Led> {
+    /// syncs or puts a barrier behind them at the end when `reach` asks for it.
+    fn lead(
+        &self,
+        open: &mut Open,
+        pieces: &[Piece],
+        mut written: u64,
+        reach: Reach,
+    ) -> Result<Led> {
         let mut led = Led::default();
         let mut start = 0;
         while start < pieces.len() {
@@ -710,13 +736,25 @@ impl Lane {
             written = pieces[stop - 1].end;
             start = stop;
         }
-        if sync {
-            if open.dirty {
-                open.file.sync_data()?;
-                open.dirty = false;
-                led.syncs += 1;
+        match reach {
+            Reach::Written => {}
+            // A barrier leaves the segment dirty, because what is behind it is ordered and not yet
+            // durable, and the next sync still has to be made.
+            Reach::Ordered => {
+                if open.dirty {
+                    open.file.sync_barrier()?;
+                    led.syncs += 1;
+                }
+                led.ordered = Some(written);
             }
-            led.durable = Some(written);
+            Reach::Durable => {
+                if open.dirty {
+                    open.file.sync_data()?;
+                    open.dirty = false;
+                    led.syncs += 1;
+                }
+                led.durable = Some(written);
+            }
         }
         led.written = written;
         Ok(led)

@@ -94,6 +94,28 @@ fn blocks_queued_before_a_wait_share_its_one_sync() {
     assert_eq!(txns(&sim), (0..5).collect::<Vec<_>>());
 }
 
+/// A barrier orders the blocks without making them durable, so a commit under `barrier` does not
+/// count for one under `full`, and the next full sync still goes to the disk.
+#[test]
+fn a_barrier_settles_a_barrier_commit_and_not_a_full_one() {
+    let sim = SimFilesystem::new();
+    let lane = open(&sim, Options { segment_bytes: 1 << 16, ..options(CommitSync::Barrier) });
+    let before = lane.stats().syncs;
+    let first = lane.enqueue(&block(1)).expect("queued");
+    let second = lane.enqueue(&block(2)).expect("queued");
+    lane.settle(second, CommitSync::Barrier).expect("settles");
+    assert_eq!(lane.stats().syncs - before, 1, "one barrier covers both blocks");
+    assert_eq!(lane.durable(), 0, "a barrier is not a sync");
+    assert_eq!(lane.settle(first, CommitSync::Barrier).expect("ordered"), first);
+    assert_eq!(lane.stats().syncs - before, 1, "a block already ordered waits for nothing");
+    lane.settle(second, CommitSync::Full).expect("syncs");
+    assert_eq!(lane.stats().syncs - before, 2, "a full commit still syncs behind a barrier");
+    assert_eq!(lane.durable(), second);
+    assert_eq!(lane.settle(first, CommitSync::Barrier).expect("durable"), first);
+    assert_eq!(lane.stats().syncs - before, 2, "a durable block is ordered too");
+    assert_eq!(txns(&sim), vec![1, 2]);
+}
+
 #[test]
 fn a_full_segment_is_synced_before_the_next_one_gets_a_record() {
     let sim = SimFilesystem::new();
@@ -145,6 +167,36 @@ fn a_reopened_lane_writes_a_new_segment_and_replay_reads_both() {
     }
     assert_eq!(txns(&sim), (0..6).collect::<Vec<_>>());
     assert!(sim.exists(&dir().join(segment_name(0, 2))));
+}
+
+/// The one lane log is the first lane of a log with several, `09-the-log.md` section 9.2: two
+/// lanes in one directory keep apart by name, header and record, each replays only its own
+/// blocks, and the blocks of both put together by commit timestamp are every commit in order.
+/// That is what lets the lanes of W5 read a log this build wrote without a migration.
+#[test]
+fn two_lanes_share_a_directory_and_replay_apart() {
+    let sim = SimFilesystem::new();
+    let first = open(&sim, options(CommitSync::Full));
+    let second = open(&sim, Options { lane: 1, ..options(CommitSync::Full) });
+    for n in 0..20 {
+        let lane = if n % 2 == 0 { &first } else { &second };
+        lane.commit(&block(n)).expect("commit");
+    }
+    assert!(sim.exists(&dir().join(segment_name(1, 1))), "lane 1 has segments of its own");
+    let mut merged = Vec::new();
+    for (lane, parity) in [(0, 0), (1, 1)] {
+        let replayed = replay(&sim, &dir(), lane, DATABASE).expect("replay");
+        let txns: Vec<u64> = replayed.blocks.iter().map(|read| read.commit.txn).collect();
+        assert_eq!(txns, (0..20).filter(|n| n % 2 == parity).collect::<Vec<_>>());
+        for read in &replayed.blocks {
+            assert!(matches(read, read.commit.txn), "block {} reads back", read.commit.txn);
+            assert!(read.records.iter().all(|record| record.header.lane == lane));
+        }
+        merged.extend(replayed.blocks);
+    }
+    merged.sort_by_key(|read| read.commit.commit_ts);
+    let order: Vec<u64> = merged.iter().map(|read| read.commit.txn).collect();
+    assert_eq!(order, (0..20).collect::<Vec<_>>(), "commit timestamps order the lanes");
 }
 
 #[test]

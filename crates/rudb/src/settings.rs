@@ -1314,8 +1314,8 @@ fn is_visibility(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("visibility")
 }
 
-/// The commit setting a word names. `barrier` is taken and is `full` until the log has a second
-/// kind of sync, and `off` is `none`, the word SQLite's `synchronous` uses for it.
+/// The commit setting a word names. `barrier` orders the log behind `F_BARRIERFSYNC` on macOS and
+/// is `full` elsewhere, and `off` is `none`, the word SQLite's `synchronous` uses for it.
 fn sync_named(word: &str) -> Option<CommitSync> {
     match word.trim().to_ascii_lowercase().as_str() {
         "full" | "on" => Some(CommitSync::Full),

@@ -515,6 +515,10 @@ impl File for Pooled {
         self.file.sync_data()
     }
 
+    fn sync_barrier(&self) -> Result<()> {
+        self.file.sync_barrier()
+    }
+
     fn truncate(&self, len: u64) -> Result<()> {
         self.file.truncate(len)
     }
