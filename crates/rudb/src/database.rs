@@ -4549,6 +4549,9 @@ impl Shared {
             };
             found.push(match second {
                 Some((child, parent)) => linked.and(child, parent),
+                None if parent_identity(catalog, &link.parent.table, parent_keys) => {
+                    linked.identity()
+                }
                 None if parent_keyed(catalog, &link.parent.table, parent_keys) => linked.keyed(),
                 None => linked,
             });
@@ -5973,6 +5976,15 @@ fn parent_keyed(catalog: &Catalog, table: &str, columns: &[String]) -> bool {
     let Some(table) = table_named(catalog, table) else { return false };
     let rudb_catalog::table::Rows::Native(rows) = table.rows() else { return false };
     key_in(table, columns).is_some_and(|column| rudb_native::graph::holds_key_map(rows, column))
+}
+
+/// Whether the parent holds a key map over these columns in the identity form, which a join can
+/// find a parent row through from the child's key alone.
+fn parent_identity(catalog: &Catalog, table: &str, columns: &[String]) -> bool {
+    let Some(table) = table_named(catalog, table) else { return false };
+    let rudb_catalog::table::Rows::Native(rows) = table.rows() else { return false };
+    key_in(table, columns)
+        .is_some_and(|column| rudb_native::graph::holds_identity_key_map(rows, column))
 }
 
 /// The first table of that name in any schema of any database.

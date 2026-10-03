@@ -271,10 +271,12 @@ fn a_three_way_join_survives_the_round_trip() {
 /// A link join prints no build side, because it has no build. That is the one thing here that is
 /// not just a second spelling of the join above it, so the test asserts on its absence rather than
 /// trusting the round trip alone: a reader that quietly accepted `build=` would read back a plan
-/// that prints the same and means something the operator cannot do.
+/// that prints the same and means something the operator cannot do. Each kind goes through twice,
+/// once reading a link by row id and once reading the parent's key map by the child's key.
 #[test]
 fn every_kind_a_link_join_answers_survives_the_round_trip() {
-    for kind in [JoinKind::Inner, JoinKind::Left, JoinKind::Semi, JoinKind::Anti] {
+    let kinds = [JoinKind::Inner, JoinKind::Left, JoinKind::Semi, JoinKind::Anti];
+    for (kind, keyed) in kinds.into_iter().flat_map(|kind| [(kind, false), (kind, true)]) {
         let mut plan = Plan::new();
         let lineitem = get(
             &mut plan,
@@ -307,6 +309,7 @@ fn every_kind_a_link_join_answers_survives_the_round_trip() {
             kind,
             conditions,
             rid,
+            keyed,
         });
         plan.set_root(join);
 
@@ -316,7 +319,8 @@ fn every_kind_a_link_join_answers_survives_the_round_trip() {
             "the kind is not in\n{dump}"
         );
         assert!(!dump.contains("build="), "a link join has no build side\n{dump}");
-        assert!(dump.contains(" rid=#0.2::BIGINT"), "the row id is not named\n{dump}");
+        let named = if keyed { " key=#0.2::BIGINT" } else { " rid=#0.2::BIGINT" };
+        assert!(dump.contains(named), "the row id or the key is not named\n{dump}");
         // The child is the first input, which is the side the operator streams.
         assert!(
             dump.contains("  Get memory.main.lineitem"),

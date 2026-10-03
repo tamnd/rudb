@@ -377,7 +377,7 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Keys]) -> Keys {
         // rewrite that produced this node is only allowed to produce it where a hash join over
         // these two inputs would have answered the same rows. A link join's kinds are the four
         // section 5.2 names, and `Left` is the only one of them that pads.
-        Node::LinkJoin { child, parent, kind, conditions, rid: _ } => match kind {
+        Node::LinkJoin { child, parent, kind, conditions, .. } => match kind {
             JoinKind::Inner => {
                 let (child, parent) = (below(child), below(parent));
                 let mut keys = child.product(&parent);

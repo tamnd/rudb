@@ -1382,6 +1382,21 @@ pub fn holds_key_map(reader: &Reader, column: usize) -> bool {
     })
 }
 
+/// Whether the key map this table holds over this column is the identity form, where the row of a
+/// key is the key less the smallest one. Read off the section's flags, so nothing is decoded.
+#[must_use]
+pub fn holds_identity_key_map(reader: &Reader, column: usize) -> bool {
+    let table = reader.table();
+    let Ok(id) = u64::try_from(column) else { return false };
+    table.sections().iter().any(|section| {
+        section.kind == *section::KEY_MAP
+            && section.id == id
+            && section.usable(table.generation())
+            && section.refused().is_none()
+            && section.flags == u32::from(Form::Identity.tag())
+    })
+}
+
 /// What a key map over this column would have cost, when a build measured one and did not keep it.
 ///
 /// This and [`key_map`] are exclusive: an entry either holds a map or records the absence of one,

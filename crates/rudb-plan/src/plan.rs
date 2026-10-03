@@ -1937,7 +1937,14 @@ mod tests {
             let rid = plan.add_expr(Expr::Column(ColumnBinding::new(0, 1)), LogicalType::BigInt);
             let child = plan.add_node(Node::Dummy);
             let parent = plan.add_node(Node::Dummy);
-            let join = plan.add_node(Node::LinkJoin { child, parent, kind, conditions, rid });
+            let join = plan.add_node(Node::LinkJoin {
+                child,
+                parent,
+                kind,
+                conditions,
+                rid,
+                keyed: false,
+            });
             plan.set_root(join);
             plan.validate().map(|()| String::new()).unwrap_or_else(|error| error.to_string())
         };

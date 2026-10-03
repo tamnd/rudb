@@ -436,7 +436,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         // the rule of section 6.4 that makes a link join runs after it, so nothing reaches here
         // today. Were that order ever to change, a predicate stopping above the join is slow rather
         // than wrong, which is the shape every rule in this file is written in.
-        Node::LinkJoin { child, parent, kind, conditions, rid } => {
+        Node::LinkJoin { child, parent, kind, conditions, rid, keyed } => {
             let rebuilt_child = node(plan, child, Vec::new(), tables);
             let rebuilt_parent = node(plan, parent, Vec::new(), tables);
             let above = if rebuilt_child == child && rebuilt_parent == parent {
@@ -448,6 +448,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
                     kind,
                     conditions,
                     rid,
+                    keyed,
                 })
             };
             filter(plan, above, pending)

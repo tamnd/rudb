@@ -59,13 +59,29 @@ use crate::prepared::{Prepared, Scratch};
 use crate::register::compaction;
 use crate::schema::Schema;
 
+/// How a link join finds the parent row of a child row.
+#[derive(Debug)]
+pub(crate) enum Resolve {
+    /// Through the forward link, read out of the child table's file once when the operator was
+    /// built, by the child's row id.
+    Link(Arc<Link>),
+    /// Through the parent's key map in the identity form, by the child's key: the parent row of
+    /// a key is the key less `base`, when that is under `count`. Nothing is read to find it.
+    Key {
+        /// The smallest key of the parent.
+        base: i64,
+        /// How many rows the parent has, which is how many keys follow `base`.
+        count: u64,
+    },
+}
+
 /// A join answered by one forward link rather than by a hash table.
 #[derive(Debug)]
 pub(crate) struct LinkJoin {
     /// Inner, left, semi or anti. Nothing else reaches here.
     kind: JoinKind,
-    /// The forward link, read out of the child table's file once when the operator was built.
-    link: Arc<Link>,
+    /// How the parent row of a child row is found.
+    by: Resolve,
     /// The parent's columns, held whole and read at most once each.
     ///
     /// Shared with nothing, but behind an `Arc` because every gathered vector this operator hands
@@ -124,7 +140,7 @@ impl LinkJoin {
     pub(crate) fn new(
         plan: &Plan,
         kind: JoinKind,
-        link: Arc<Link>,
+        by: Resolve,
         parent: Arc<Parent>,
         projected: Vec<(usize, LogicalType)>,
         rid: ExprRef,
@@ -143,7 +159,7 @@ impl LinkJoin {
         let rid = Prepared::one(plan, rid, child)?;
         Ok(Self {
             kind,
-            link,
+            by,
             parent,
             keys: vec![None; projected.len()],
             projected,
@@ -195,6 +211,9 @@ impl LinkJoin {
         // there is nothing here that a compact form would let the operator skip, and the cost of
         // leaving it compact would be a dispatch per row on the way out of it.
         let ids = self.rid.evaluate_one(chunk, &mut local.scratch)?.flatten()?;
+        if let Resolve::Key { base, count } = self.by {
+            return Self::by_key(&ids, rows, base, count, &mut local.rids);
+        }
         let held: &[i64] = match ids.data() {
             Some(Data::Int64(values)) if !ids.validity().has_nulls(rows) => values.as_slice(),
             // A row id is produced by a scan as a sequence over the part's first row, so a null one
@@ -217,7 +236,10 @@ impl LinkJoin {
         // not cover a row is no section, and no section says nothing about that row. A child past
         // the end can only be a row appended since the link was built, and `Rows::stored` already
         // refused a table that has any.
-        self.link.forward_each(&local.children, &mut local.parents);
+        let Resolve::Link(link) = &self.by else {
+            return Err(Error::internal("a link join by key reached the link"));
+        };
+        link.forward_each(&local.children, &mut local.parents);
         local.rids.clear();
         local.rids.reserve(rows);
         for &parent in &local.parents {
@@ -228,6 +250,36 @@ impl LinkJoin {
                     Error::internal("a link answered a parent row id a gather cannot hold")
                 })?
             });
+        }
+        Ok(())
+    }
+
+    /// Fills `rids` with the parent row of each key, which in the identity form is the key less
+    /// the smallest key, and [`NO_ROW`] for a null key or one outside the parent's keys.
+    ///
+    /// The subtraction wraps and the result is read unsigned, so a key below `base` comes out as a
+    /// number far past `count` and is turned away by the same comparison as one above it.
+    fn by_key(ids: &Vector, rows: usize, base: i64, count: u64, rids: &mut Vec<u32>) -> Result<()> {
+        let Some(Data::Int64(values)) = ids.data() else {
+            return Err(Error::internal("a link join by key was handed a key that is not BIGINT"));
+        };
+        let keys = values.get(..rows).ok_or_else(|| {
+            Error::internal("a link join was handed fewer keys than the chunk has rows")
+        })?;
+        let find = |key: i64| {
+            let offset = key.wrapping_sub(base).cast_unsigned();
+            if offset < count { u32::try_from(offset).unwrap_or(NO_ROW) } else { NO_ROW }
+        };
+        rids.clear();
+        let validity = ids.validity();
+        if validity.has_nulls(rows) {
+            rids.extend(
+                keys.iter()
+                    .enumerate()
+                    .map(|(row, &key)| if validity.is_valid(row) { find(key) } else { NO_ROW }),
+            );
+        } else {
+            rids.extend(keys.iter().map(|&key| find(key)));
         }
         Ok(())
     }
@@ -390,7 +442,7 @@ mod tests {
     use rudb_storage::MemoryTable;
     use rudb_vector::{Chunk, Vector};
 
-    use super::LinkJoin;
+    use super::{LinkJoin, Resolve};
     use crate::schema::Schema;
 
     /// A parent of `rows` rows whose one column is its own row number, so that a gathered value
@@ -445,6 +497,12 @@ mod tests {
     /// Builds the operator for one kind over one link, gathering the parent's only column for the
     /// kinds that gather anything.
     fn operator(kind: JoinKind, parents: &[Option<u64>], rows: i32) -> LinkJoin {
+        operator_by(kind, Resolve::Link(link(parents)), rows)
+    }
+
+    /// The same over a parent of `rows` rows found either way, with the child's second column as
+    /// the row id or as the key.
+    fn operator_by(kind: JoinKind, by: Resolve, rows: i32) -> LinkJoin {
         let mut plan = Plan::new();
         let rid = plan.add_expr(Expr::Column(ColumnBinding::new(0, 1)), LogicalType::BigInt);
         let gathers = !matches!(kind, JoinKind::Semi | JoinKind::Anti);
@@ -452,7 +510,7 @@ mod tests {
         LinkJoin::new(
             &plan,
             kind,
-            link(parents),
+            by,
             parent(rows),
             projected,
             rid,
@@ -489,6 +547,32 @@ mod tests {
                 vec![Value::Integer(103), Value::BigInt(3), Value::Integer(1)],
             ]
         );
+    }
+
+    /// By key, the parent row is the key less the parent's smallest key. A key below that, one past
+    /// the parent's last and a null one have no parent, so inner drops them and anti keeps them.
+    #[test]
+    fn a_link_join_by_key_finds_the_parent_row_from_the_key() {
+        let chunk = || {
+            let prices: Vec<Value> = (100..106).map(Value::Integer).collect();
+            let prices = Vector::from_values(LogicalType::Integer, &prices).expect("prices");
+            let keys = [11, 9, 12, 13, -1, 10]
+                .map(|key| if key < 0 { Value::Null } else { Value::BigInt(key) });
+            let keys = Vector::from_values(LogicalType::BigInt, &keys).expect("keys");
+            Chunk::new(vec![prices, keys]).expect("a child chunk")
+        };
+        let by_key = |kind| operator_by(kind, Resolve::Key { base: 10, count: 3 }, 3);
+        assert_eq!(
+            run(&by_key(JoinKind::Inner), chunk()),
+            vec![
+                vec![Value::Integer(100), Value::BigInt(11), Value::Integer(1)],
+                vec![Value::Integer(102), Value::BigInt(12), Value::Integer(2)],
+                vec![Value::Integer(105), Value::BigInt(10), Value::Integer(0)],
+            ]
+        );
+        let anti = run(&by_key(JoinKind::Anti), chunk());
+        let kept: Vec<Value> = anti.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(kept, vec![Value::Integer(101), Value::Integer(103), Value::Integer(104)]);
     }
 
     /// Inner drops the sentinel rows, and the ids move with the rows rather than staying where

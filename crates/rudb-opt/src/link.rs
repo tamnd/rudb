@@ -71,7 +71,7 @@
 use rudb_common::{Field, LogicalType, Result};
 use rudb_functions::FILE_ROW_NUMBER;
 use rudb_plan::{
-    Carried, ColumnBinding, CompareOp, Expr, JoinKind, Node, NodeRef, Plan, Slice, rids_of,
+    Carried, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice, rids_of,
 };
 
 use crate::estimate;
@@ -161,6 +161,9 @@ pub struct Linked {
     /// link did not fit its budget: nothing can be followed, but the parent is still known to have
     /// one row per key, which is what an aggregate over that key needs to hear.
     pub unique: bool,
+    /// Whether the parent's key map is the identity form, so the parent row of a child is the
+    /// child's key less the smallest key and a join finds it without a link. See [`Why::Keyed`].
+    pub identity: bool,
     /// The second key column of each side, child then parent, for a key over two columns.
     ///
     /// `partsupp(ps_partkey, ps_suppkey)` is the one TPC-H has. A link over one is stored the same
@@ -245,6 +248,7 @@ impl Linked {
             built: false,
             total: false,
             unique: false,
+            identity: false,
             second: None,
             monotone: false,
             spans: Vec::new(),
@@ -255,6 +259,13 @@ impl Linked {
     #[must_use]
     pub fn keyed(self) -> Self {
         Self { unique: true, ..self }
+    }
+
+    /// The same relationship with the parent's key map in the identity form, which certifies the
+    /// parent's key distinct as any key map does.
+    #[must_use]
+    pub fn identity(self) -> Self {
+        Self { identity: true, unique: true, ..self }
     }
 
     /// The same relationship with the spans its build measured.
@@ -374,13 +385,16 @@ pub enum Why {
     },
     /// Chosen: a semi or an anti join is a sentinel test and never reads the parent at all.
     NeverRead,
+    /// Chosen: the parent's key map is the identity form, so the child's key less the smallest key
+    /// is the parent's row, and nothing is built, stored or carried to find it.
+    Keyed,
 }
 
 impl Why {
     /// Whether this is a reason to read the link rather than a reason not to.
     #[must_use]
     pub const fn chosen(self) -> bool {
-        matches!(self, Self::Narrow { .. } | Self::NeverRead)
+        matches!(self, Self::Narrow { .. } | Self::NeverRead | Self::Keyed)
     }
 
     /// How far the pass got before this was the answer.
@@ -397,7 +411,7 @@ impl Why {
             Self::RowIdGone => 3,
             Self::ColumnWouldShow => 4,
             Self::Fits { .. } | Self::Wide { .. } => 5,
-            Self::Narrow { .. } | Self::NeverRead => 6,
+            Self::Narrow { .. } | Self::NeverRead | Self::Keyed => 6,
         }
     }
 
@@ -442,6 +456,9 @@ impl std::fmt::Display for Why {
                  which is under {narrow}"
             ),
             Self::NeverRead => write!(out, "a semi or an anti join never reads the parent"),
+            Self::Keyed => {
+                write!(out, "the parent's key map is the identity, so the child's key is its row")
+            }
         }
     }
 }
@@ -463,6 +480,7 @@ pub fn why(plan: &Plan, at: NodeRef, context: &Context) -> Option<Why> {
         }
         // Already taken, so the question is which bullet of section 6.4 took it. A semi or an anti
         // is the bullet that does not size anything, and everything else got here through the width.
+        Node::LinkJoin { keyed: true, .. } => Some(Why::Keyed),
         Node::LinkJoin { parent, kind, .. } => Some(match kind {
             JoinKind::Semi | JoinKind::Anti => Why::NeverRead,
             _ => match *plan.node(parent) {
@@ -518,13 +536,51 @@ fn rewrite(
         return;
     }
     let Some(taken) = taken else { return };
-    let Some(binding) = number(plan, taken.scan) else {
-        return;
-    };
-    let rid = plan.add_expr(Expr::Column(binding), LogicalType::BigInt);
     let Node::Join { kind, conditions, .. } = *plan.node(at) else { return };
+    let (rid, keyed) = match taken.scan {
+        Some(scan) => {
+            let Some(binding) = number(plan, scan) else {
+                return;
+            };
+            (plan.add_expr(Expr::Column(binding), LogicalType::BigInt), false)
+        }
+        None => {
+            let Some(key) = child_key(plan, taken.parent, conditions) else {
+                return;
+            };
+            (key, true)
+        }
+    };
     *plan.node_mut(at) =
-        Node::LinkJoin { child: taken.child, parent: taken.parent, kind, conditions, rid };
+        Node::LinkJoin { child: taken.child, parent: taken.parent, kind, conditions, rid, keyed };
+}
+
+/// The child's side of a join's one equality as a `BIGINT`, for a join that finds its parent by
+/// key. A key of a type that does not fit one is not a key an identity map can hold.
+fn child_key(plan: &mut Plan, parent: NodeRef, conditions: Slice) -> Option<ExprRef> {
+    let Node::Get { index, .. } = *plan.node(parent) else { return None };
+    let &[condition] = plan.expr_list(conditions) else { return None };
+    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
+        return None;
+    };
+    let side = [left, right].into_iter().find(
+        |&side| matches!(*plan.expr(side), Expr::Column(binding) if binding.table != index),
+    )?;
+    let Expr::Column(key) = *plan.expr(side) else { return None };
+    let ty = plan.expr_type(side).clone();
+    let column = plan.add_expr(Expr::Column(key), ty.clone());
+    match ty {
+        LogicalType::BigInt => Some(column),
+        LogicalType::TinyInt
+        | LogicalType::SmallInt
+        | LogicalType::Integer
+        | LogicalType::UTinyInt
+        | LogicalType::USmallInt
+        | LogicalType::UInteger => {
+            Some(plan.add_expr(Expr::Cast { input: column, try_cast: false }, LogicalType::BigInt))
+        }
+        _ => None,
+    }
 }
 
 /// Which two inputs a link would be read between, once it is worth reading one.
@@ -532,8 +588,9 @@ fn rewrite(
 struct Taken {
     child: NodeRef,
     parent: NodeRef,
-    /// The child's scan, which is the node the row id column is added to.
-    scan: NodeRef,
+    /// The child's scan, which is the node the row id column is added to, or `None` for a join
+    /// that finds its parent by key and carries no row id.
+    scan: Option<NodeRef>,
 }
 
 /// Section 6.4 over one join, without changing anything.
@@ -576,6 +633,8 @@ fn decided(
         // Asked after the rest of it on purpose. What is above a join is the same whichever way
         // round its sides are read, so asking first would report a shape complaint for a join that
         // has no relationship at all and bury the reason that was actually in the way.
+        // A join found by key adds no row id, and still puts the child's columns first where a
+        // hash join may have put the parent's, which only an operator that names its columns hides.
         let why =
             if why.chosen() && !absorbed(plan, consumers, at) { Why::ColumnWouldShow } else { why };
         worst = worst.or(why);
@@ -664,8 +723,9 @@ pub(crate) fn absorbed(plan: &Plan, consumers: &[Option<NodeRef>], at: NodeRef) 
 
 /// What a join has to be for a link to answer it.
 struct Match {
-    /// The child's scan, which is the node the row id column is added to.
-    scan: NodeRef,
+    /// The child's scan, which is the node the row id column is added to, or `None` when the parent
+    /// is found by the child's key and no row id is read.
+    scan: Option<NodeRef>,
     /// The parent's projected columns, which is what the gather costs per row.
     projected: Slice,
 }
@@ -705,8 +765,13 @@ fn matched(
     if oriented.iter().any(|(child_key, _)| child_key.table != child_index) {
         return Err(Why::None);
     }
-    let scan = scan_under(plan, child, child_index).ok_or(Why::ChildNotStored)?;
-    let Node::Get { table: child_name, columns: child_columns, .. } = *plan.node(scan) else {
+    // A key keeps its value through anything that keeps its binding, so a join that finds its
+    // parent by key can name the child's column from the scan it came out of wherever that is.
+    // Reading a link needs more, a row of the stored table, which is what `scan_under` finds.
+    let stored = scan_under(plan, child, child_index);
+    let named =
+        stored.or_else(|| get_under(plan, child, child_index)).ok_or(Why::ChildNotStored)?;
+    let Node::Get { table: child_name, columns: child_columns, .. } = *plan.node(named) else {
         return Err(Why::ChildNotStored);
     };
     let (child_fields, parent_fields) =
@@ -720,6 +785,12 @@ fn matched(
     let tables = (plan.string(child_name), plan.string(parent_name));
     let declared =
         context.links().iter().find(|link| link.over(tables, &pairs)).ok_or(Why::None)?;
+    // A parent whose key map is the identity is found from the key alone, which is cheaper than
+    // reading a link even where there is one, and needs nothing of the rows but the key.
+    if declared.identity && declared.second.is_none() {
+        return Ok(Match { scan: None, projected });
+    }
+    let scan = stored.ok_or(Why::ChildNotStored)?;
     if !declared.built {
         return Err(Why::NotBuilt);
     }
@@ -729,11 +800,29 @@ fn matched(
     if !carried.get(child as usize).is_some_and(|rids| rids.has(child_index)) {
         return Err(Why::RowIdGone);
     }
-    Ok(Match { scan, projected })
+    Ok(Match { scan: Some(scan), projected })
+}
+
+/// The scan that binds `index` anywhere under `at`, whatever is between them.
+fn get_under(plan: &Plan, at: NodeRef, index: u32) -> Option<NodeRef> {
+    let mut stack = vec![at];
+    while let Some(node) = stack.pop() {
+        match *plan.node(node) {
+            Node::Get { index: found, .. } if found == index => return Some(node),
+            _ => stack.extend(plan.node(node).children().into_iter().flatten()),
+        }
+    }
+    None
 }
 
 /// Section 6.4, which is the whole of the choice.
 fn worth_it(plan: &Plan, parent: NodeRef, kind: JoinKind, found: &Match, context: &Context) -> Why {
+    // Nothing is built and nothing is read but the key, so there is no size this loses at. A hash
+    // join over the same parent reads its whole key column to build a table that answers the same
+    // subtraction.
+    if found.scan.is_none() {
+        return Why::Keyed;
+    }
     // Never touches the parent, so none of the rest of it applies. A semi join over a relationship
     // the file has verified is a sentinel test per child row, and there is no size at which a hash
     // table beats that.
@@ -1210,6 +1299,37 @@ mod tests {
             about(&plan, &context).to_string(),
             "the relationship is declared and its link is not in the file"
         );
+    }
+
+    #[test]
+    fn a_parent_whose_key_map_is_the_identity_is_found_by_key_without_a_link() {
+        // Declared and never built, which on its own is a hash join. The identity map is enough:
+        // the parent row is the key less the smallest key, so nothing is read off the child but
+        // the key, and the parent's size does not come into it.
+        for parent_rows in [1_500_000, 1_000] {
+            let mut plan = joined("INNER");
+            let mut context = context(parent_rows);
+            let linked = Linked::declared("lineitem", "l_orderkey", "orders", "o_orderkey");
+            context.relate(Arc::new(vec![linked.identity()]));
+            let text = rewritten(&mut plan, &context);
+            assert!(text.contains("LinkJoin INNER"), "the join was not rewritten:\n{text}");
+            assert!(text.contains("key=#0.0::BIGINT"), "the key is not what is read:\n{text}");
+            assert!(!text.contains("file_row_number"), "a row id was asked for:\n{text}");
+            assert_eq!(about(&plan, &context), Why::Keyed);
+        }
+    }
+
+    #[test]
+    fn a_child_gathered_into_another_join_s_hash_table_is_still_found_by_key() {
+        // The rows reaching the join are no longer rows of `lineitem`, which rules out its link
+        // and not its key.
+        let mut plan = under_a_join("right");
+        let mut context = context(1_500_000);
+        let linked = Linked::declared("lineitem", "l_orderkey", "orders", "o_orderkey");
+        context.relate(Arc::new(vec![linked.identity()]));
+        let text = rewritten(&mut plan, &context);
+        assert!(text.contains("LinkJoin INNER"), "the join was not rewritten:\n{text}");
+        assert!(text.contains("key=#0.0::BIGINT"), "the key is not what is read:\n{text}");
     }
 
     #[test]

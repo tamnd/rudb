@@ -219,10 +219,10 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             }
             Ok(())
         }
-        Node::LinkJoin { kind, conditions, rid, .. } => {
+        Node::LinkJoin { kind, conditions, rid, keyed, .. } => {
             write!(out, " {} on=", kind.keyword())?;
             write_expr_list(plan, out, conditions)?;
-            write!(out, " rid=")?;
+            write!(out, " {}=", if keyed { "key" } else { "rid" })?;
             write_expr(plan, out, rid)
         }
         Node::DependentJoin { kind, conditions, .. } => {
