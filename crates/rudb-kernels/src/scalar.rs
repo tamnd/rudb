@@ -51,8 +51,9 @@
 use memchr::memmem;
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 use rudb_vector::{Data, Form, NO_ROW, StringColumn, Validity, Vector, picked};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::aggregate::{Accumulator, divide_mean, exactly};
 use crate::bitstring;
@@ -2547,6 +2548,45 @@ struct StableLike {
 /// sorts and looks each one up, so the walk gets some room.
 const SPARSE_LIKE: usize = 8;
 
+/// How few of a group's values a sparse chunk can ask about before a pattern that is one run of
+/// bytes decides the whole group in place. On JOB 14b the titles `kind_id` and the year leave are
+/// about a hundred to a group, and copying each out to search them cost more than searching the
+/// group's block where it lies.
+const CROWDED: usize = 16;
+
+/// The values the last sparse chunk on this thread copied out of a dictionary, laid end to end.
+///
+/// `title LIKE '%murder%' OR title LIKE '%Murder%' OR title LIKE '%Mord%'` on JOB 14b asks each
+/// arm about the same few titles of a chunk, and every arm copied them out again, which was a third
+/// of the query. An arm asked about values the last one copied searches that copy instead, and
+/// decides all of them, which is more than it was asked but never wrong.
+struct Gathered {
+    dictionary: Weak<Vector>,
+    once: bool,
+    /// The values the copy was made for, in ascending order, where `visited` is in the order the
+    /// source handed them over.
+    asked: Vec<usize>,
+    visited: Vec<usize>,
+    joined: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+thread_local! {
+    static GATHERED: RefCell<Option<Gathered>> = const { RefCell::new(None) };
+}
+
+/// Whether every value of `wanted` is in `asked`, both in ascending order.
+fn covers(asked: &[usize], wanted: &[usize]) -> bool {
+    if wanted.len() > asked.len() {
+        return false;
+    }
+    let mut at = 0;
+    wanted.iter().all(|&code| {
+        at += asked[at..].partition_point(|&seen| seen < code);
+        asked.get(at) == Some(&code)
+    })
+}
+
 /// How many dictionary values one word of the memo holds, at two bits each.
 const MEMO_VALUES: usize = 32;
 
@@ -2690,7 +2730,11 @@ impl StableLike {
             let upto =
                 at + codes[at..].partition_point(|&code| (code as usize) < first + LIKE_GROUP);
             let last = (first + LIKE_GROUP).min(self.dictionary.len());
-            if once && self.touched(first, last) {
+            if once && (upto - at) * CROWDED >= LIKE_GROUP {
+                // A group a chunk asks about this many values of is searched where it lies, the
+                // way a scan's group is, rather than copied out a value at a time.
+                self.decide_group(first, like, characters)?;
+            } else if once && self.touched(first, last) {
                 wanted.extend(first..last);
             } else if !self.ruled_out(first, last, like)? {
                 wanted.extend(codes[at..upto].iter().map(|&code| code as usize));
@@ -2701,28 +2745,52 @@ impl StableLike {
         // Asking a value at a time started a search per title on JOB 14b, and starting them was a
         // third of the query.
         if let Some(joined_like) = Joined::of(like) {
-            let (mut joined, mut ends) = (Vec::new(), Vec::with_capacity(wanted.len()));
-            let mut visited = Vec::with_capacity(wanted.len());
-            let mut gather = |at: usize, text: &[u8]| {
-                joined.extend_from_slice(text);
-                ends.push(joined.len());
-                visited.push(wanted[at]);
+            if wanted.is_empty() {
+                return Ok(());
+            }
+            return GATHERED.with(|gathered| {
+                let mut gathered = gathered.borrow_mut();
+                let reused = gathered.as_ref().is_some_and(|gathered| {
+                    Weak::ptr_eq(&gathered.dictionary, &Arc::downgrade(&self.dictionary))
+                        && gathered.once == once
+                        && covers(&gathered.asked, &wanted)
+                });
+                if !reused {
+                    let (mut joined, mut ends) = (Vec::new(), Vec::with_capacity(wanted.len()));
+                    let mut visited = Vec::with_capacity(wanted.len());
+                    let mut gather = |at: usize, text: &[u8]| {
+                        joined.extend_from_slice(text);
+                        ends.push(joined.len());
+                        visited.push(wanted[at]);
+                        Ok(())
+                    };
+                    if once {
+                        self.dictionary.visit_text_once(&wanted, &mut gather)?;
+                    } else {
+                        let codes = wanted.iter().map(|&code| code as u32).collect::<Vec<_>>();
+                        self.dictionary.visit_text(&codes, &mut gather)?;
+                    }
+                    *gathered = Some(Gathered {
+                        dictionary: Arc::downgrade(&self.dictionary),
+                        once,
+                        asked: wanted.clone(),
+                        visited,
+                        joined,
+                        ends,
+                    });
+                }
+                let Some(gathered) = gathered.as_ref() else {
+                    return Err(Error::internal("the gathered values are missing"));
+                };
+                let mut held = vec![false; gathered.ends.len()];
+                joined_like.search(&gathered.joined, &gathered.ends, &mut held);
+                for (&code, held) in gathered.visited.iter().zip(held) {
+                    let (index, shift) = Self::slot(code);
+                    let pair = (1 | u64::from(held != like.negated) << 1) << shift;
+                    self.word(index)?.fetch_or(pair, Ordering::Release);
+                }
                 Ok(())
-            };
-            if once {
-                self.dictionary.visit_text_once(&wanted, &mut gather)?;
-            } else {
-                let codes = wanted.iter().map(|&code| code as u32).collect::<Vec<_>>();
-                self.dictionary.visit_text(&codes, &mut gather)?;
-            }
-            let mut held = vec![false; ends.len()];
-            joined_like.search(&joined, &ends, &mut held);
-            for (code, held) in visited.into_iter().zip(held) {
-                let (index, shift) = Self::slot(code);
-                let pair = (1 | u64::from(held != like.negated) << 1) << shift;
-                self.word(index)?.fetch_or(pair, Ordering::Release);
-            }
-            return Ok(());
+            });
         }
         let mut decide = |at: usize, text: &[u8]| {
             let held = like.holds_loan(text, characters)?;
