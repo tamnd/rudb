@@ -586,53 +586,19 @@ pub fn select_range(
         return None;
     }
     // Asked before the literals are built, since building one is an allocation.
-    let integral = column.packed_parts().is_some()
-        || matches!(
-            column.data(),
-            Some(
-                Data::Int8(_)
-                    | Data::Int16(_)
-                    | Data::Int32(_)
-                    | Data::Int64(_)
-                    | Data::UInt8(_)
-                    | Data::UInt16(_)
-                    | Data::UInt32(_)
-                    | Data::UInt64(_)
-            )
-        );
-    if !integral {
+    if !integral_column(column) {
         return None;
     }
     let ty = column.logical_type();
-    let literal = |bound: Bound<'_>| -> Option<i128> {
-        if bound.value.is_null() {
-            return None;
-        }
-        let single = readied(bound.held, ty, bound.value)?;
-        if single.logical_type() != ty {
-            return None;
-        }
-        Some(match single.data()? {
-            Data::Int8(values) => i128::from(*values.first()?),
-            Data::Int16(values) => i128::from(*values.first()?),
-            Data::Int32(values) => i128::from(*values.first()?),
-            Data::Int64(values) => i128::from(*values.first()?),
-            Data::UInt8(values) => i128::from(*values.first()?),
-            Data::UInt16(values) => i128::from(*values.first()?),
-            Data::UInt32(values) => i128::from(*values.first()?),
-            Data::UInt64(values) => i128::from(*values.first()?),
-            _ => return None,
-        })
-    };
     // Both ends inclusive from here on.
     let low = match low.op {
-        Comparison::GreaterOrEqual => literal(low)?,
-        Comparison::Greater => literal(low)? + 1,
+        Comparison::GreaterOrEqual => integral_literal(ty, low)?,
+        Comparison::Greater => integral_literal(ty, low)? + 1,
         _ => return None,
     };
     let high = match high.op {
-        Comparison::LessOrEqual => literal(high)?,
-        Comparison::Less => literal(high)? - 1,
+        Comparison::LessOrEqual => integral_literal(ty, high)?,
+        Comparison::Less => integral_literal(ty, high)? - 1,
         _ => return None,
     };
     if let Some(packed) = column.packed_parts() {
@@ -689,6 +655,239 @@ pub fn select_range(
         UInt32: u32 => u32,
         UInt64: u64 => u64,
     )
+}
+
+/// Whether `column` holds its values as integers [`select_range`] and [`mask_within`] read where
+/// they lie, flat or bit packed.
+fn integral_column(column: &Vector) -> bool {
+    column.packed_parts().is_some()
+        || matches!(
+            column.data(),
+            Some(
+                Data::Int8(_)
+                    | Data::Int16(_)
+                    | Data::Int32(_)
+                    | Data::Int64(_)
+                    | Data::UInt8(_)
+                    | Data::UInt16(_)
+                    | Data::UInt32(_)
+                    | Data::UInt64(_)
+            )
+        )
+}
+
+/// The literal of `bound` as the integer a column of type `ty` stores it as, or `None` for a null
+/// or a literal that is not one.
+fn integral_literal(ty: &LogicalType, bound: Bound<'_>) -> Option<i128> {
+    if bound.value.is_null() {
+        return None;
+    }
+    let single = readied(bound.held, ty, bound.value)?;
+    if single.logical_type() != ty {
+        return None;
+    }
+    Some(match single.data()? {
+        Data::Int8(values) => i128::from(*values.first()?),
+        Data::Int16(values) => i128::from(*values.first()?),
+        Data::Int32(values) => i128::from(*values.first()?),
+        Data::Int64(values) => i128::from(*values.first()?),
+        Data::UInt8(values) => i128::from(*values.first()?),
+        Data::UInt16(values) => i128::from(*values.first()?),
+        Data::UInt32(values) => i128::from(*values.first()?),
+        Data::UInt64(values) => i128::from(*values.first()?),
+        _ => return None,
+    })
+}
+
+/// Narrows `words`, a bit a row of `column`, to the rows that every one of `bounds` holds for, and
+/// says how many rows are left.
+///
+/// This is the `AND` of several comparisons of integer columns with literals done the way the
+/// hardware wants it. Each column is read once, in order, a block of 64 rows at a time, and what a
+/// block keeps is a word. The word is the only thing that goes from one column to the next.
+/// Threaded through a list of rows instead, as [`refine`] does, each column after the first is read
+/// a row at a time at the rows the ones before it kept. On TPC-H q06 every block of 64 rows has
+/// some of them, so the list saves no unpacking and turns a sequential read of the codes into a
+/// random one, and building the list is a write a row for every comparison. See
+/// spec/perf/102-filtering-in-masks.md.
+///
+/// `fresh` writes every word. Otherwise each word is anded with what the block keeps, and a word
+/// that is already zero is skipped without reading its rows, which is what an earlier column that
+/// keeps few rows buys the later ones.
+///
+/// The bounds are `=`, `<`, `<=`, `>` and `>=` against a literal of the column's own type, all on
+/// the same column, which together are one range. `None` for a column with nulls, one that is not
+/// integers, a bound of another kind, or `words` of the wrong length, and then nothing was written.
+pub fn mask_within(
+    column: &Vector,
+    bounds: &[Bound<'_>],
+    words: &mut [u64],
+    fresh: bool,
+) -> Option<usize> {
+    let len = column.len();
+    if words.len() != len.div_ceil(64)
+        || nulls_of(column) != Validity::AllValid
+        || !integral_column(column)
+    {
+        return None;
+    }
+    let ty = column.logical_type();
+    let (mut low, mut high) = (i128::MIN, i128::MAX);
+    for &bound in bounds {
+        let value = integral_literal(ty, bound)?;
+        match bound.op {
+            Comparison::Equal => (low, high) = (low.max(value), high.min(value)),
+            Comparison::Greater => low = low.max(value + 1),
+            Comparison::GreaterOrEqual => low = low.max(value),
+            Comparison::Less => high = high.min(value - 1),
+            Comparison::LessOrEqual => high = high.min(value),
+            _ => return None,
+        }
+    }
+    if let Some(packed) = column.packed_parts() {
+        let (low, high) = (low.max(packed.base()), high.min(ceiling_of(&packed)?));
+        if low > high {
+            words.fill(0);
+            return Some(0);
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "both ends are inside the codes the width holds, so both differences fit a u64"
+        )]
+        let (from, span) = ((low - packed.base()) as u64, (high - low) as u64);
+        let within = |code: u64| code.wrapping_sub(from) <= span;
+        return Some(masked_blocks(
+            len,
+            words,
+            fresh,
+            |base, flags| {
+                let mut codes = [0_u64; 64];
+                packed.unpack(base, &mut codes);
+                for (flag, &code) in flags.iter_mut().zip(&codes) {
+                    *flag = u8::from(within(code));
+                }
+            },
+            |row| within(packed.code(row)),
+        ));
+    }
+    macro_rules! flat {
+        ($($variant:ident: $signed:ty => $unsigned:ty),+ $(,)?) => {
+            match column.data()? {
+                $(
+                    Data::$variant(values) => {
+                        let values = values.get(..len)?;
+                        let low = low.max(i128::from(<$signed>::MIN));
+                        let high = high.min(i128::from(<$signed>::MAX));
+                        if low > high {
+                            words.fill(0);
+                            return Some(0);
+                        }
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "both ends were clamped to the type, and the distance is read \
+                                      unsigned on purpose"
+                        )]
+                        let (low, span) = (low as $signed, (high - low) as $unsigned);
+                        #[allow(clippy::cast_sign_loss, reason = "the distance is read unsigned")]
+                        let within = |value: $signed| value.wrapping_sub(low) as $unsigned <= span;
+                        Some(masked_blocks(
+                            len,
+                            words,
+                            fresh,
+                            |base, flags| {
+                                for (flag, &value) in flags.iter_mut().zip(&values[base..base + 64])
+                                {
+                                    *flag = u8::from(within(value));
+                                }
+                            },
+                            |row| within(values[row]),
+                        ))
+                    }
+                )+
+                _ => None,
+            }
+        };
+    }
+    flat!(
+        Int8: i8 => u8,
+        Int16: i16 => u16,
+        Int32: i32 => u32,
+        Int64: i64 => u64,
+        UInt8: u8 => u8,
+        UInt16: u16 => u16,
+        UInt32: u32 => u32,
+        UInt64: u64 => u64,
+    )
+}
+
+/// The rows a mask [`mask_within`] filled keeps, in order.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a mask is over a chunk, whose rows fit in a u32"
+)]
+pub fn mask_selection(words: &[u64], kept: usize) -> Selection {
+    let mut out = Vec::with_capacity(kept);
+    for (block, &word) in words.iter().enumerate() {
+        let base = (block * 64) as u32;
+        if word == u64::MAX {
+            out.extend(base..base + 64);
+            continue;
+        }
+        let mut word = word;
+        while word != 0 {
+            out.push(base + word.trailing_zeros());
+            word &= word - 1;
+        }
+    }
+    Selection::from_indices(out)
+}
+
+/// Each word of `words` set or narrowed to the rows of its block that `fill` flags, the way
+/// [`mask_within`] describes, and how many rows are set after.
+///
+/// `fill` writes the flags of the 64 rows from the one it is given, and `held` answers for the rows
+/// past the last whole block, whose word has no bits past the end.
+#[inline]
+fn masked_blocks(
+    len: usize,
+    words: &mut [u64],
+    fresh: bool,
+    fill: impl Fn(usize, &mut [u8; 64]),
+    held: impl Fn(usize) -> bool,
+) -> usize {
+    let whole = len / 64;
+    let mut kept = 0;
+    for (block, word) in words.iter_mut().enumerate() {
+        if !fresh && *word == 0 {
+            continue;
+        }
+        let base = block * 64;
+        let mask = if block < whole {
+            let mut flags = [0_u8; 64];
+            fill(base, &mut flags);
+            flag_mask(&flags)
+        } else {
+            (base..len).fold(0, |mask, row| mask | u64::from(held(row)) << (row - base))
+        };
+        *word = if fresh { mask } else { *word & mask };
+        kept += word.count_ones() as usize;
+    }
+    kept
+}
+
+/// The 64 flags of a block, each 0 or 1, as a word with flag `i` in bit `i`.
+#[inline]
+fn flag_mask(flags: &[u8; 64]) -> u64 {
+    let mut mask = 0_u64;
+    for (lane, eight) in flags.chunks_exact(8).enumerate() {
+        let bytes = u64::from_le_bytes(eight.try_into().unwrap_or_default());
+        // Each byte is 0 or 1, and the multiply gathers byte i into bit 56 + i.
+        mask |= (bytes.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (lane * 8);
+    }
+    mask
 }
 
 /// [`select_range`] on a bit packed column, in code space, where the range moves down by the base
@@ -795,12 +994,7 @@ pub(crate) fn kept_in_blocks(
     while base + 64 <= len {
         let mut flags = [0_u8; 64];
         fill(base, &mut flags);
-        let mut mask = 0_u64;
-        for (lane, eight) in flags.chunks_exact(8).enumerate() {
-            let bytes = u64::from_le_bytes(eight.try_into().unwrap_or_default());
-            // Each byte is 0 or 1, and the multiply gathers byte i into bit 56 + i.
-            mask |= (bytes.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (lane * 8);
-        }
+        let mut mask = flag_mask(&flags);
         if mask == u64::MAX {
             out.extend(base as u32..(base + 64) as u32);
         } else {
@@ -3310,6 +3504,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A mask keeps the rows its bounds keep, flat and bit packed, written fresh and anded into one
+    /// that already has rows out, for every kind of bound it takes and for ends past the values,
+    /// over rows that do not fill the last block.
+    #[test]
+    fn a_mask_keeps_the_rows_its_bounds_keep() {
+        let rows: usize = 1000;
+        let values: Vec<i32> = (0..1000).map(|row| 700 + (row * 37) % 600).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.clone().into()))
+            .expect("integers are an i32 layout");
+        let packed = flat.bit_packed().expect("packs");
+        let before: Vec<u64> = (0..rows.div_ceil(64))
+            .map(|block| if block % 3 == 0 { 0 } else { 0x5555_5555_5555_5555 })
+            .collect();
+        let ops = [
+            Comparison::Equal,
+            Comparison::Less,
+            Comparison::LessOrEqual,
+            Comparison::Greater,
+            Comparison::GreaterOrEqual,
+        ];
+        let ends = [i32::MIN, 699, 700, 900, 1299, 1300, i32::MAX];
+        let holds = |op: Comparison, value: i32, end: i32| match op {
+            Comparison::Equal => value == end,
+            Comparison::Less => value < end,
+            Comparison::LessOrEqual => value <= end,
+            Comparison::Greater => value > end,
+            _ => value >= end,
+        };
+        for column in [&flat, &packed] {
+            for one in ops {
+                for other in ops {
+                    for low in ends {
+                        for high in ends {
+                            let (first, second) = (Value::Integer(low), Value::Integer(high));
+                            let bounds = [
+                                Bound { op: one, value: &first, held: None },
+                                Bound { op: other, value: &second, held: None },
+                            ];
+                            let kept = |row: usize| {
+                                holds(one, values[row], low) && holds(other, values[row], high)
+                            };
+                            let mut words = vec![u64::MAX; rows.div_ceil(64)];
+                            let count = mask_within(column, &bounds, &mut words, true)
+                                .expect("integers with no nulls");
+                            let expected = Selection::from_predicate(rows, kept);
+                            assert_eq!(count, expected.len(), "{one:?} {low}, {other:?} {high}");
+                            assert_eq!(mask_selection(&words, count), expected);
+                            let mut words = before.clone();
+                            let count = mask_within(column, &bounds, &mut words, false)
+                                .expect("integers with no nulls");
+                            let was = |row: usize| before[row / 64] >> (row % 64) & 1 == 1;
+                            let expected =
+                                Selection::from_predicate(rows, |row| was(row) && kept(row));
+                            assert_eq!(count, expected.len(), "{one:?} {low}, {other:?} {high}");
+                            assert_eq!(mask_selection(&words, count), expected);
+                        }
+                    }
+                }
+            }
+        }
+        let nulls = Vector::from_values(LogicalType::Integer, &[Value::Integer(2), Value::Null])
+            .expect("integers");
+        let two = Value::Integer(2);
+        let bound = [Bound { op: Comparison::Equal, value: &two, held: None }];
+        let mut words = vec![7];
+        assert!(mask_within(&nulls, &bound, &mut words, true).is_none());
+        assert_eq!(words, [7], "a column it refuses leaves the mask alone");
+        let not = [Bound { op: Comparison::NotEqual, value: &two, held: None }];
+        assert!(mask_within(&flat, &not, &mut vec![0; 16], true).is_none());
     }
 
     /// Nulls, a literal of another type and a string column are left to the two comparisons.
