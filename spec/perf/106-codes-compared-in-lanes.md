@@ -22,7 +22,7 @@ The other half of q06's filter was `l_quantity`, which the cascade stores as a s
 
 ## Results
 
-Measured on server2 at SF10 on one thread, user cycles and instructions in millions, against main with #2421. All 22 queries give the same answers as before.
+Measured on server2 at SF1 on one thread, user cycles and instructions in millions, against main with #2421. All 22 queries give the same answers as before.
 
 | Query | Before cycles | After cycles | Before instructions | After instructions | DuckDB cycles |
 | --- | --- | --- | --- | --- | --- |
