@@ -141,6 +141,9 @@ pub(crate) struct Settings {
     show_behavior: RwLock<String>,
     /// Whether warnings are promoted to errors.
     warnings_as_errors: RwLock<bool>,
+    /// How many milliseconds a statement may run before it is stopped, where zero or less is no
+    /// limit.
+    max_execution_time: RwLock<i64>,
     /// The settings rudb takes and does not act on, as the statements have left them.
     ///
     /// Every setting above has a field of its own, because the engine reads it and a field is where
@@ -282,6 +285,7 @@ impl Settings {
             scalar_subquery_error_on_multiple_rows: RwLock::new(true),
             show_behavior: RwLock::new("AUTO".to_string()),
             warnings_as_errors: RwLock::new(false),
+            max_execution_time: RwLock::new(0),
             carried: RwLock::new(BTreeMap::new()),
             seams: RwLock::new(rudb_seam::Settings::new()),
             rules: RwLock::new(Rules::new()),
@@ -404,6 +408,12 @@ impl Settings {
     /// The techniques `SET qc_ablate` left out, none unless it was set.
     pub(crate) fn ablate(&self) -> rudb_qc::Ablate {
         *self.ablate.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// The `max_execution_time` a statement starts under, in milliseconds, where zero or less is
+    /// no limit.
+    pub(crate) fn max_execution_time(&self) -> i64 {
+        *self.max_execution_time.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The configuration as the statements have left it.
@@ -851,6 +861,13 @@ impl Settings {
                 // that nothing obeys.
                 pool.resize(threads);
             }
+            "max_execution_time" => {
+                let millis = match value {
+                    Some(value) => typed(entry, value)?.parse().unwrap_or(0),
+                    None => 0,
+                };
+                *self.max_execution_time.write().unwrap_or_else(|held| held.into_inner()) = millis;
+            }
             "warnings_as_errors" => {
                 let enabled = value.map_or(Ok(false), boolean_of)?;
                 if enabled {
@@ -1086,6 +1103,7 @@ impl Settings {
                 Ok(self.show_behavior.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
             "threads" => Ok(config.threads().to_string()),
+            "max_execution_time" => Ok(self.max_execution_time().to_string()),
             "warnings_as_errors" => Ok(self
                 .warnings_as_errors
                 .read()
@@ -1232,6 +1250,7 @@ impl Settings {
                     "show_behavior" => show_behavior.clone(),
                     "threads" => threads.clone(),
                     "warnings_as_errors" => warnings_as_errors.to_string(),
+                    "max_execution_time" => self.max_execution_time().to_string(),
                     other => unreachable!("{other} is not an honoured setting"),
                 },
             );

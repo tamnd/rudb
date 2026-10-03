@@ -683,7 +683,7 @@ fn a_cancelled_token_stops_the_query_before_it_produces_a_chunk() {
         .expect("the query builds");
     cancel.cancel();
     let error = query.run(&cancel, &Pool::default()).expect_err("it was cancelled");
-    assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+    assert_eq!(error.code().duckdb_name(), "INTERRUPT Error");
 }
 
 #[test]

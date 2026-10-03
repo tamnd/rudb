@@ -6402,7 +6402,7 @@ fn a_query_that_runs_too_long_is_stopped_by_the_limit_it_was_opened_with() {
     let db = Database::with_config(Config::new().with_query_timeout(Duration::from_millis(50)));
     let started = std::time::Instant::now();
     let error = db.query(FOREVER).expect_err("that does not finish");
-    assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+    assert_eq!(error.code().duckdb_name(), "INTERRUPT Error");
     assert!(error.message().contains("50 millisecond"), "{error}");
     // The limit is on the statement rather than a suggestion, so this has to be over in about the
     // time it was given rather than in the time the query would have taken, which is hours.
@@ -6439,7 +6439,7 @@ fn a_join_that_runs_too_long_is_stopped_partway_through_its_own_loop() {
     let started = std::time::Instant::now();
     let error =
         db.query("SELECT count(*) FROM l JOIN r ON l.k < r.k").expect_err("that does not finish");
-    assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+    assert_eq!(error.code().duckdb_name(), "INTERRUPT Error");
     // One left row's pass over the right side is what it may overshoot by, which is milliseconds.
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
 }
@@ -6455,7 +6455,7 @@ fn another_thread_can_interrupt_a_running_query() {
     });
     let error = connection.query(FOREVER).expect_err("the other thread stopped it");
     watchdog.join().expect("the watchdog ran");
-    assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+    assert_eq!(error.code().duckdb_name(), "INTERRUPT Error");
     assert_eq!(error.message(), "Interrupted!");
 }
 
@@ -6476,7 +6476,7 @@ fn a_statement_that_writes_is_stoppable_too_and_leaves_nothing_behind() {
     let error = db
         .execute("INSERT INTO big SELECT x FROM range(100000000000) t(x)")
         .expect_err("that does not finish");
-    assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+    assert_eq!(error.code().duckdb_name(), "INTERRUPT Error");
     // Nothing was appended, because the source runs to completion before anything is. That is not
     // a rollback, it is the absence of a partial write, and it stops being enough the day the
     // writes stream.

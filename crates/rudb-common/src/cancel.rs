@@ -34,6 +34,8 @@ pub struct Cancel {
     stopped: Arc<AtomicBool>,
     started: Instant,
     limit: Option<Duration>,
+    /// Whether the limit is the session's `max_execution_time`, which the pin words its own way.
+    setting: bool,
 }
 
 impl Default for Cancel {
@@ -46,7 +48,12 @@ impl Cancel {
     /// A token nothing stops on its own, for a query with no time limit on it.
     #[must_use]
     pub fn new() -> Self {
-        Self { stopped: Arc::new(AtomicBool::new(false)), started: Instant::now(), limit: None }
+        Self {
+            stopped: Arc::new(AtomicBool::new(false)),
+            started: Instant::now(),
+            limit: None,
+            setting: false,
+        }
     }
 
     /// A token that stops itself after this long.
@@ -56,6 +63,7 @@ impl Cancel {
             stopped: Arc::new(AtomicBool::new(false)),
             started: Instant::now(),
             limit: Some(timeout),
+            setting: false,
         }
     }
 
@@ -72,7 +80,22 @@ impl Cancel {
     #[must_use]
     pub fn restart(&self, timeout: Option<Duration>) -> Self {
         self.stopped.store(false, Ordering::Relaxed);
-        Self { stopped: Arc::clone(&self.stopped), started: Instant::now(), limit: timeout }
+        Self {
+            stopped: Arc::clone(&self.stopped),
+            started: Instant::now(),
+            limit: timeout,
+            setting: false,
+        }
+    }
+
+    /// The same token with its limit said to be the session's `max_execution_time`.
+    ///
+    /// Only the sentence changes. A query stopped by that setting is told what the pin tells it,
+    /// "Query exceeded maximum execution time", and one stopped by the limit the database was
+    /// opened with is still told how many milliseconds that limit was.
+    #[must_use]
+    pub fn from_setting(self) -> Self {
+        Self { setting: true, ..self }
     }
 
     /// Stop whatever is running on this token.
@@ -115,6 +138,9 @@ impl Cancel {
         if self.stopped.load(Ordering::Relaxed) {
             return Err(Error::interrupt("Interrupted!"));
         }
+        if self.expired() && self.setting {
+            return Err(Error::interrupt("Query exceeded maximum execution time"));
+        }
         if self.expired() {
             let limit = self.limit.unwrap_or_default();
             return Err(Error::interrupt(format!(
@@ -156,7 +182,7 @@ mod tests {
         other.cancel();
         assert!(cancel.is_cancelled());
         let error = cancel.check().expect_err("it was cancelled");
-        assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+        assert_eq!(error.code().duckdb_name(), "INTERRUPT Error");
         assert_eq!(error.message(), "Interrupted!");
     }
 
@@ -176,8 +202,15 @@ mod tests {
         thread::sleep(Duration::from_millis(5));
         assert!(cancel.is_cancelled());
         let error = cancel.check().expect_err("the time is up");
-        assert_eq!(error.code().duckdb_name(), "Interrupt Error");
+        assert_eq!(error.code().duckdb_name(), "INTERRUPT Error");
         assert!(error.message().contains("longer than the 1 millisecond limit"), "{error}");
+    }
+
+    #[test]
+    fn a_limit_from_the_setting_is_worded_the_way_the_pin_words_it() {
+        let cancel = Cancel::new().restart(Some(Duration::from_millis(0))).from_setting();
+        let error = cancel.check().expect_err("the time is up");
+        assert_eq!(error.to_string(), "INTERRUPT Error: Query exceeded maximum execution time");
     }
 
     #[test]
