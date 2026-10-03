@@ -483,7 +483,19 @@ unsafe impl GlobalAlloc for MiMalloc {
             let will = mapped(size, layout.align());
             if was && will {
                 let (old, new) = (span(layout.size()), span(size));
-                return if old == new { ptr } else { system::remap(ptr, old, new) };
+                if old == new {
+                    return ptr;
+                }
+                // A held block of the new length is taken over growing this one, since a
+                // mapping grows into fresh pages and a vector that doubles into a held block
+                // copies what it has into pages that are already in.
+                let held = held::take(new);
+                if held.is_null() {
+                    return system::remap(ptr, old, new);
+                }
+                std::ptr::copy_nonoverlapping(ptr, held, layout.size().min(size));
+                unmap(ptr, layout.size());
+                return held;
             }
             if was || will {
                 // Across the bound the block changes hands, so it is copied into one the other
