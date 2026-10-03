@@ -51,8 +51,8 @@
 use memchr::memmem;
 use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
 use rudb_vector::{Data, Form, NO_ROW, StringColumn, Validity, Vector, picked};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::aggregate::{Accumulator, divide_mean, exactly};
