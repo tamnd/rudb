@@ -9591,7 +9591,7 @@ impl Reader {
             }
             let vector = vector.into_pages();
             if keeping {
-                let vector = self.keep(at, column, vector, positions.is_some());
+                let vector = self.keep(at, column, vector, positions.map(<[u32]>::len));
                 picked.push(match positions {
                     None => Arc::unwrap_or_clone(vector),
                     Some(positions) => vector.gather(positions)?,
@@ -9685,25 +9685,33 @@ impl Reader {
     /// Holds `vector` as part `at` of `column` and counts it against the pool, and answers what the
     /// read goes on with, which is the one already held if another worker got there first.
     ///
-    /// A part kept by a read of some of its rows is held flat. It is one a join or a filter gathers
+    /// A part kept by a read of many of its rows is held flat. It is one a join or a filter gathers
     /// from, and a gather out of a packed part unpacks the rows it wants every time. A part kept by a
     /// read of all of it stays packed, since the kernels that read whole parts work on the codes and
     /// the packed part is a fraction of the memory. The slot is asked first, so a part another worker
     /// already holds is not written out flat for nothing.
     ///
+    /// A part kept by a read of fewer than one row in [`SPARSE_RENT`] stays packed too. Such a read
+    /// lands a row or two in each line of a flat part, so what it pays is the memory the part spans
+    /// and not the unpacking, and a flat part spans eight bytes a row against the few bits a packed
+    /// one does. On TPC-H q09 the green parts keep one `lineitem` row in twenty, the flat parts of
+    /// the five columns read there came to 240 MB, and the gathers out of them were a fifth of the
+    /// query, waiting on memory. That is a cost an instruction count does not see.
+    ///
     /// In the last statement a part is kept packed either way. What it is gathered from after this
     /// read is at most the statement's own second read, and writing out a whole part to save a few
     /// unpacks there cost more than it saved: TPC-H q17 reads three rows a part of `lineitem`, and
     /// writing its held parts out flat was a third of the query, most of it page faults.
-    fn keep(&self, at: usize, column: usize, vector: Vector, gathered: bool) -> Arc<Vector> {
+    fn keep(&self, at: usize, column: usize, vector: Vector, wanted: Option<usize>) -> Arc<Vector> {
         let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else {
             return Arc::new(vector);
         };
         if let PartSlot::Held { vector, .. } = &*held {
             return Arc::clone(vector);
         }
+        let dense = wanted.is_some_and(|wanted| wanted.saturating_mul(SPARSE_RENT) > vector.len());
         let vector =
-            if gathered && !self.pool.is_final() { vector.unpacked_to_hold() } else { vector };
+            if dense && !self.pool.is_final() { vector.unpacked_to_hold() } else { vector };
         let bytes = vector.footprint();
         let vector = Arc::new(vector);
         let used = Arc::new(AtomicBool::new(false));
