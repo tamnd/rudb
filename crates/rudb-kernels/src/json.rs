@@ -28,7 +28,9 @@ enum Node {
     Unsigned(u64),
     /// A negative whole number that fits in 64 bits, and `-0`.
     Signed(i64),
-    Real(f64),
+    /// A number with a fraction or an exponent, and the digits as written when there are more than
+    /// fifteen of them, since a double does not hold that many and a cast to a decimal reads them.
+    Real(f64, Option<Box<str>>),
     /// A number held as it was written, which is one too big for 64 bits, `NaN` and `Infinity`.
     Raw(String),
     Str(String),
@@ -226,7 +228,7 @@ impl Reader<'_> {
         let raw = || Node::Raw(text.to_string());
         if real {
             return Ok(match text.parse::<f64>() {
-                Ok(value) if value.is_finite() => Node::Real(value),
+                Ok(value) if value.is_finite() => Node::Real(value, precise(text)),
                 _ => raw(),
             });
         }
@@ -672,13 +674,21 @@ fn indent(out: &mut String, depth: usize) {
     }
 }
 
+/// The digits of a real number as written when a double may not hold them all, which is when
+/// there are more than fifteen of them.
+fn precise(text: &str) -> Option<Box<str>> {
+    let mantissa = text.split(['e', 'E']).next().unwrap_or(text);
+    let digits = mantissa.bytes().filter(u8::is_ascii_digit).skip_while(|&digit| digit == b'0');
+    (digits.count() > 15).then(|| text.into())
+}
+
 fn scalar_text(node: &Node, out: &mut String) {
     match node {
         Node::Null => out.push_str("null"),
         Node::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
         Node::Unsigned(number) => out.push_str(&number.to_string()),
         Node::Signed(number) => out.push_str(&number.to_string()),
-        Node::Real(number) => real_text(*number, out),
+        Node::Real(number, _) => real_text(*number, out),
         Node::Raw(text) => out.push_str(text),
         Node::Str(text) => string_text(text, out),
         Node::Array(_) | Node::Object(_) => {}
@@ -999,7 +1009,7 @@ fn type_name(node: &Node) -> &'static str {
         Node::Bool(_) => "BOOLEAN",
         Node::Unsigned(_) => "UBIGINT",
         Node::Signed(_) => "BIGINT",
-        Node::Real(_) | Node::Raw(_) => "DOUBLE",
+        Node::Real(..) | Node::Raw(_) => "DOUBLE",
         Node::Str(_) => "VARCHAR",
         Node::Array(_) => "ARRAY",
         Node::Object(_) => "OBJECT",
@@ -1202,13 +1212,20 @@ impl Document {
                 } else {
                     "numerical"
                 };
-                let failed = || {
-                    Error::conversion(format!(
-                        "Failed to cast value to {kind}: {}",
-                        self.written(at)
-                    ))
+                // The pin reads a decimal from the digits as written, which a double may have
+                // rounded, and names those digits when they do not fit.
+                let digits = match node {
+                    Node::Real(_, Some(text)) if kind == "decimal" => Some(text.to_string()),
+                    _ => None,
                 };
-                let scalar = self.scalar_value(node).ok_or_else(failed)?;
+                let failed = || {
+                    let shown = digits.clone().unwrap_or_else(|| self.written(at));
+                    Error::conversion(format!("Failed to cast value to {kind}: {shown}"))
+                };
+                let scalar = match &digits {
+                    Some(text) => Value::Varchar(text.clone()),
+                    None => self.scalar_value(node).ok_or_else(failed)?,
+                };
                 if let Value::Varchar(text) = &scalar
                     && reading != Reading::Lenient
                     && !strict_text(text, target)
@@ -1272,7 +1289,7 @@ impl Document {
             Node::Bool(flag) => Value::Boolean(*flag),
             Node::Unsigned(number) => Value::UBigInt(*number),
             Node::Signed(number) => Value::BigInt(*number),
-            Node::Real(number) => Value::Double(*number),
+            Node::Real(number, _) => Value::Double(*number),
             Node::Raw(text) | Node::Str(text) => Value::Varchar(text.clone()),
             Node::Array(_) | Node::Object(_) => return None,
         })
@@ -2520,7 +2537,7 @@ impl Document {
                 (Node::Unsigned(a), Node::Signed(b)) | (Node::Signed(b), Node::Unsigned(a)) => {
                     u64::try_from(*b).is_ok_and(|b| b == *a)
                 }
-                (Node::Real(a), Node::Real(b)) => a.to_bits() == b.to_bits(),
+                (Node::Real(a, _), Node::Real(b, _)) => a.to_bits() == b.to_bits(),
                 (Node::Raw(a), Node::Raw(b)) | (Node::Str(a), Node::Str(b)) => a == b,
                 (Node::Array(a), Node::Array(b)) => {
                     pending.extend(a.iter().copied().zip(b.iter().copied()));
@@ -2647,7 +2664,7 @@ impl Shape {
             Node::Bool(_) => Self::Boolean,
             Node::Unsigned(_) => Self::UBigInt,
             Node::Signed(_) => Self::BigInt,
-            Node::Real(_) | Node::Raw(_) => Self::Double,
+            Node::Real(..) | Node::Raw(_) => Self::Double,
             Node::Str(_) => Self::Varchar,
             Node::Array(_) => Self::List,
             Node::Object(_) => Self::Struct,
