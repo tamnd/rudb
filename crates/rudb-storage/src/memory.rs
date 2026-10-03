@@ -121,6 +121,9 @@ enum Slot {
 /// The largest chunk the tail takes. Anything bigger is already a chunk worth its own slot.
 const TAIL_TAKES: usize = 64;
 
+/// How many chunks the tail holds before it lays them into one.
+const TAIL_CHUNKS: usize = 32;
+
 /// How many values an append counts statistics for on each thread it starts, at least.
 const VALUES_PER_THREAD: usize = 1 << 16;
 
@@ -286,7 +289,16 @@ impl MemoryTable {
             // shared.
             self.close_rows()?;
             self.tail.push(chunk.into_pages());
-            return self.trail(zone, len);
+            self.trail(zone, len)?;
+            if self.tail.len() >= TAIL_CHUNKS && self.built == 0 {
+                // Laid into one chunk now and then, so the tail is a few chunks however small the
+                // ones it took, and a copy of the table copies a few.
+                let columns: Vec<usize> = (0..self.types.len()).collect();
+                let laid = self.tail_read(&columns)?.into_pages();
+                self.tail.clear();
+                self.tail.push(laid);
+            }
+            return Ok(());
         }
         self.place(chunk, zone)
     }
@@ -433,6 +445,16 @@ impl MemoryTable {
     pub fn append_all(&mut self, chunks: Vec<Chunk>, workers: usize) -> Result<()> {
         for chunk in &chunks {
             self.check(chunk)?;
+        }
+        // An append of a few rows, which an `INSERT ... VALUES` of one row is, goes on the tail as
+        // a prepared insert's row does. As an open chunk of its own each was a slot and a zone, and
+        // a table written a statement at a time was thousands of one-row chunks to scan and to copy
+        // with every snapshot a transaction took.
+        if chunks.iter().map(Chunk::len).sum::<usize>() <= TAIL_TAKES {
+            for chunk in chunks {
+                self.append(chunk)?;
+            }
+            return Ok(());
         }
         self.forget_grams();
         let chunks: Vec<Chunk> = chunks.into_iter().filter(|chunk| !chunk.is_empty()).collect();
@@ -2090,6 +2112,38 @@ mod tests {
         assert_eq!(table.chunk_len(2), Some(100));
         let got = every_row(&table);
         assert_eq!(got, (0..rows + 100).map(Value::Integer).collect::<Vec<_>>());
+    }
+
+    /// Appends of a row a statement go on the tail, which stays a few chunks, rather than each
+    /// becoming a chunk of its own.
+    #[test]
+    fn small_appends_share_the_tail_and_it_stays_a_few_chunks() {
+        let types = vec![LogicalType::BigInt, LogicalType::Varchar];
+        let mut table = MemoryTable::new(types);
+        let rows = VECTOR_SIZE + 300;
+        for id in 0..rows {
+            let id = i64::try_from(id).expect("small");
+            let columns = vec![
+                Vector::from_values(LogicalType::BigInt, &[Value::BigInt(id)]).expect("ids"),
+                Vector::from_values(LogicalType::Varchar, &[Value::Varchar(format!("n{id}"))])
+                    .expect("names"),
+            ];
+            table.append_all(vec![Chunk::with_rows(columns, 1).expect("a chunk")], 4).expect("in");
+            assert!(table.tail.len() < TAIL_CHUNKS, "{} chunks in the tail", table.tail.len());
+        }
+        assert_eq!(table.chunk_count(), 2);
+        assert_eq!(table.chunk_len(0), Some(VECTOR_SIZE));
+        assert_eq!(table.chunk_len(1), Some(300));
+        let mut seen = 0;
+        for chunk in 0..table.chunk_count() {
+            let read = table.read(chunk, &[0, 1]).expect("read");
+            for row in 0..read.len() {
+                assert_eq!(read.value_at(row, 0), Value::BigInt(seen));
+                assert_eq!(read.value_at(row, 1), Value::Varchar(format!("n{seen}")));
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, i64::try_from(rows).expect("small"));
     }
 
     #[test]
