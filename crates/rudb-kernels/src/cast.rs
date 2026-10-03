@@ -156,21 +156,21 @@ pub fn cast_in_time_zone(
     // from each value, whose own type may say less: a struct with a null field reads as a struct
     // of a null, and a null says nothing at all.
     if let LogicalType::Union(members) = target
-        && struct_fits(&input.logical_type(), members)
+        && struct_fits(input.logical_type(), members)
     {
         let from = input.logical_type();
         let mut values = Vec::with_capacity(input.len());
         // row at a time: each row is checked for its tag and the one member it holds, which the
         // pin does over the whole vector after casting the fields, with the same answers.
         for index in 0..input.len() {
-            values.push(cast_to_union(&input.try_value_at(index)?, &from, target, try_cast)?);
+            values.push(cast_to_union(&input.try_value_at(index)?, from, target, try_cast)?);
         }
         return Vector::from_values(target.clone(), &values);
     }
     if let LogicalType::Union(members) = target
         && !matches!(input.logical_type(), LogicalType::Union(_) | LogicalType::Null)
     {
-        let at = union_member(&input.logical_type(), target, members)?;
+        let at = union_member(input.logical_type(), target, members)?;
         let tag = u8::try_from(at).map_err(|_| Error::internal("a union has too many members"))?;
         let inner = cast_in_time_zone(input, &members[at].ty, try_cast, time_zone)?;
         let mut values = Vec::with_capacity(inner.len());
@@ -3294,14 +3294,14 @@ mod tests {
     }
 
     #[test]
-    fn a_try_cast_that_does_not_fit_is_null_and_one_that_is_unimplemented_still_raises() {
+    fn a_try_cast_that_does_not_fit_is_null_and_a_union_with_no_member_for_it_still_raises() {
         let fitted = cast_value(&Value::BigInt(40_000), &LogicalType::SmallInt, true)
             .expect("try_cast swallows the range failure");
         assert_eq!(fitted, Value::Null);
-        let union = LogicalType::Union(vec![Field::new("a", LogicalType::Integer)]);
-        let error = cast_value(&Value::Integer(1), &union, true)
-            .expect_err("try_cast does not invent a union");
-        assert_eq!(error.code(), ErrorCode::NotImplemented);
+        let union = LogicalType::Union(vec![Field::new("a", LogicalType::Date)]);
+        let error = cast_value(&Value::Varchar("x".into()), &union, true)
+            .expect_err("the member is picked before any row is read");
+        assert_eq!(error.code(), ErrorCode::Conversion);
     }
 
     #[test]
@@ -3528,17 +3528,17 @@ mod tests {
     }
 
     /// A pair with no cast between it is a conversion failure here because it is one upstream, and
-    /// upstream answers null for it under `TRY_CAST`. A target nobody has built is still the other
-    /// kind, which is the distinction the module documentation is about.
+    /// upstream answers null for it under `TRY_CAST`. A union, the last target to be built, now
+    /// takes a value the way the pin does.
     #[test]
-    fn a_pair_with_no_cast_is_null_under_try_cast_and_a_missing_target_is_not() {
+    fn a_pair_with_no_cast_is_null_under_try_cast_and_a_union_takes_a_value() {
         let refused = cast_value(&Value::Date(0), &LogicalType::Integer, true)
             .expect("try_cast swallows a pair duckdb has no cast for");
         assert_eq!(refused, Value::Null);
-        let union = LogicalType::Union(vec![Field::new("a", LogicalType::Integer)]);
-        let error = cast_value(&Value::Integer(1), &union, true)
-            .expect_err("try_cast does not invent a union");
-        assert_eq!(error.code(), ErrorCode::NotImplemented);
+        let members = vec![Field::new("a", LogicalType::Integer)];
+        let union = LogicalType::Union(members.clone());
+        let held = cast_value(&Value::Integer(1), &union, true).expect("a union with a member");
+        assert_eq!(held, Value::Union { members, tag: 0, value: Box::new(Value::Integer(1)) });
     }
 
     /// The number that does not fit a float is an infinity when it was written down and a failure
