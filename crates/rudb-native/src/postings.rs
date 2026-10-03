@@ -17,11 +17,12 @@
 //! does not use the section. Deleting the section changes no answer, only how many rows a scan reads.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rudb_common::{LogicalType, Result};
 use rudb_graph::Rids;
 
-use crate::graph::BUDGET_FLOOR;
+use crate::graph::{BUDGET_FLOOR, by_part};
 use crate::section::{self, Attachment};
 use crate::{Catalog, Reader, invalid};
 
@@ -167,31 +168,38 @@ fn encode(reader: &Reader, column: usize) -> Result<Option<(usize, Vec<u8>)>> {
     // One code per row, with `u32::MAX` for a null or an uncoded row, then a counting sort into
     // code order. Twice the column's rows in memory, which a checkpoint can afford and a list per
     // value would not, at 700 thousand values.
+    //
+    // The codes are read a part at a time on every worker, and a part with no stable codes is
+    // marked here and made into the uncoded ranges in part order afterwards.
     let mut codes = vec![u32::MAX; rows];
-    let mut whole: Vec<(u64, u64)> = Vec::new();
-    let mut first = 0_usize;
-    for part in 0..reader.parts() {
-        let len = reader.part_rows(part);
+    let uncoded = (0..reader.parts()).map(|_| AtomicBool::new(false)).collect::<Vec<_>>();
+    by_part(reader, &mut codes, 1, &|part, run| {
         match reader.stable_codes(part, column)? {
-            Some(read) if read.len() == len => {
-                for (at, code) in read.into_iter().enumerate() {
+            Some(read) if read.len() == run.len() => {
+                for (row, code) in run.iter_mut().zip(read) {
                     if let Some(code) = code {
                         if code as usize >= values {
                             return Err(invalid("a code past the end of its dictionary"));
                         }
-                        codes[first + at] = code;
+                        *row = code;
                     }
                 }
             }
-            _ => match whole.last_mut() {
+            _ => uncoded[part].store(true, Ordering::Relaxed),
+        }
+        Ok(())
+    })?;
+    let mut whole: Vec<(u64, u64)> = Vec::new();
+    let mut first = 0_usize;
+    for (part, uncoded) in uncoded.iter().enumerate() {
+        let len = reader.part_rows(part);
+        if uncoded.load(Ordering::Relaxed) {
+            match whole.last_mut() {
                 Some((start, count)) if *start + *count == first as u64 => *count += len as u64,
                 _ => whole.push((first as u64, len as u64)),
-            },
+            }
         }
         first += len;
-    }
-    if first != rows {
-        return Err(invalid("value rows found a row count that differs from the table"));
     }
     let mut counts = vec![0_u32; values];
     for &code in &codes {
