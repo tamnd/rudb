@@ -1968,12 +1968,20 @@ fn setting(
     } else {
         let mut binder = Binder::with(catalog, parameters, session);
         let bound = binder.bind_setting_value(ast, written.value)?;
-        let Expr::Constant(value) = *binder.plan().expr(bound) else {
+        if !binder.scalar_subqueries.is_empty() {
+            return Err(Error::binder("SET value cannot contain subqueries"));
+        }
+        // The pin evaluates the value when it binds, so `MAP {'operator_casing': 'upper'}` and
+        // `1 + 1` are as good as a literal.
+        if let Expr::Constant(value) = *binder.plan().expr(bound) {
+            Some(binder.plan().value(value).clone())
+        } else if let Some(value) = crate::fold::value_with_lambdas(binder.plan(), bound)? {
+            Some(value)
+        } else {
             return Err(Error::not_implemented(format!(
                 "a value for {name} that is not a constant"
             )));
-        };
-        Some(binder.plan().value(value).clone())
+        }
     };
     Ok(Bound::Setting(Setting { name, scope: written.scope, value, pragma: written.pragma }))
 }
