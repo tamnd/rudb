@@ -3108,7 +3108,7 @@ impl<'a> Building<'a, '_> {
         // the declared one, so the pair is tried both ways round before it is refused.
         let mut child_at = Vec::with_capacity(oriented.len());
         let mut parent_at = Vec::with_capacity(oriented.len());
-        for &(child_key, parent_key) in &oriented {
+        for &(child_key, parent_key) in oriented {
             child_at.push(
                 stored_column(plan, child_table, child_key.table, child_columns, child_key)
                     .ok_or_else(|| refuse("a child key that is not a stored column"))?,
