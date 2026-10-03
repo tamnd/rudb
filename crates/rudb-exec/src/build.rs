@@ -65,6 +65,7 @@ use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
 use crate::consistent::{Answer, Collect, Reduction};
+use crate::contents::contents;
 use crate::cutoff::{self, Cutoff};
 use crate::devicecard::device_card;
 use crate::enginenames::{
@@ -2400,6 +2401,12 @@ impl<'a> Building<'a, '_> {
                     "Metadata",
                     Some(TableFunction::PragmaStorageInfo.name()),
                 );
+                Segment::new(Arc::new(Watched::new(table, counters)), schema)
+            }
+            Some(function @ (TableFunction::ReadText | TableFunction::ReadBlob)) => {
+                let table = contents(function, plan, args, index, columns)?;
+                let schema = table.schema().clone();
+                let counters = self.watch(reference, id, pipeline, "Metadata", Some(name));
                 Segment::new(Arc::new(Watched::new(table, counters)), schema)
             }
             Some(TableFunction::RudbDeviceCard) => {

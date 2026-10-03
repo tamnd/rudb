@@ -22,8 +22,8 @@ use rudb_common::{
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
-    csv_fields, csv_given, files, is_file, is_pattern, json_text, kind_of, parquet_footers,
-    parquet_outline, resolve, resolve_pragma, resolve_table,
+    content_files, csv_fields, csv_given, files, is_file, is_pattern, json_text, kind_of,
+    parquet_footers, parquet_outline, resolve, resolve_pragma, resolve_table,
 };
 use rudb_kernels::json::scan;
 use rudb_kernels::{percentage, row_count};
@@ -2518,6 +2518,13 @@ impl<'a> Binder<'a> {
         let mut counted: Vec<(String, Stat<u64>)> = Vec::new();
         let mut bounded: Option<Arc<dyn Zones>> = None;
         let fields = match resolved.columns {
+            // The whole file readers take their patterns the way the file readers do, and like
+            // them hand the executor one name per file, though their columns never change.
+            Columns::Fixed(fields) if resolved.function.reads_contents() => {
+                let paths = self.content_paths(cast[0], resolved.function.name())?;
+                cast = paths.iter().map(|path| self.path_constant(path)).collect();
+                fields
+            }
             Columns::Fixed(fields) => fields,
             columns => {
                 // The one argument is a pattern, and what replaces it is one constant per file it
@@ -2942,9 +2949,13 @@ impl<'a> Binder<'a> {
                 "the named parameter {parameter} with a value that is not a constant"
             )));
         };
-        if value == Value::Null && function.json().is_some() && *parameter == "filename" {
-            // The one the shared file options refuse rather than the JSON reader's own list.
-            return Err(Error::invalid_input("Cannot use NULL as argument for \"filename\""));
+        let shared =
+            (function.json().is_some() && *parameter == "filename") || function.reads_contents();
+        if value == Value::Null && shared {
+            // The ones the shared file options refuse rather than the reader's own list.
+            return Err(Error::invalid_input(format!(
+                "Cannot use NULL as argument for \"{parameter}\""
+            )));
         }
         if value == Value::Null {
             return Err(Error::binder(null_parameter(function, parameter)));
@@ -3251,6 +3262,51 @@ impl<'a> Binder<'a> {
                 Err(Error::internal(format!("a file name bound as VARCHAR arrived as {other}")))
             }
         }
+    }
+
+    /// The files a `read_text` or a `read_blob` reads, each pattern expanded in the order the list
+    /// gives them, so a file named twice is read twice.
+    ///
+    /// Nothing to read is no rows rather than an error, whether the path is missing, the pattern
+    /// matches nothing or the list is empty, which are the pin's answers. A null and a list that is
+    /// not of strings are turned away in the pin's words.
+    fn content_paths(&self, expr: ExprRef, name: &str) -> Result<Vec<String>> {
+        let Some(value) = fold::value_of(&self.plan, expr)? else {
+            return Err(Error::not_implemented(
+                "a table function file name that is not a constant",
+            ));
+        };
+        let patterns = match value {
+            Value::Varchar(path) => vec![path],
+            Value::Null => {
+                return Err(Error::parser(format!(
+                    "\"{name}\" cannot take NULL list as parameter"
+                )));
+            }
+            Value::List { values, .. } => values
+                .into_iter()
+                .map(|value| match value {
+                    Value::Varchar(path) => Ok(path),
+                    Value::Null => Err(Error::parser(format!(
+                        "\"{name}\" reader cannot take NULL input as parameter"
+                    ))),
+                    _ => Err(Error::parser(format!(
+                        "\"{name}\" reader can only take a list of strings, structs or variants \
+                         as a parameter"
+                    ))),
+                })
+                .collect::<Result<_>>()?,
+            other => {
+                return Err(Error::internal(format!(
+                    "a file name bound as VARCHAR arrived as {other}"
+                )));
+            }
+        };
+        let mut paths = Vec::new();
+        for pattern in patterns {
+            paths.extend(content_files(&pattern)?);
+        }
+        Ok(paths)
     }
 
     /// Which input of a join a query written in its `ON` has to be joined into.

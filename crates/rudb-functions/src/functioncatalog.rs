@@ -213,6 +213,18 @@ fn tables() -> Vec<FunctionEntry> {
                 }
                 continue;
             }
+            // The two whole file readers take the same three kinds of path the JSON readers do.
+            if function.reads_contents() {
+                for first in ["VARCHAR", "ANY[]", "VARIANT"] {
+                    parameter_types[0] = first.to_string();
+                    entries.push(table_entry(
+                        *function,
+                        parameters.clone(),
+                        parameter_types.clone(),
+                    ));
+                }
+                continue;
+            }
             // The two document walks take a `JSON` document as well as a `VARCHAR` one, and the
             // pin lists the two as separate rows.
             if matches!(function, TableFunction::JsonEach | TableFunction::JsonTree) {
@@ -272,6 +284,8 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::ReadNdjson,
     TableFunction::ReadJsonObjects,
     TableFunction::ReadNdjsonObjects,
+    TableFunction::ReadText,
+    TableFunction::ReadBlob,
     TableFunction::RudbStrategies,
     TableFunction::RudbLinks,
     TableFunction::RudbDeviceCard,
@@ -327,6 +341,8 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::ReadNdjson
         | TableFunction::ReadJsonObjects
         | TableFunction::ReadNdjsonObjects
+        | TableFunction::ReadText
+        | TableFunction::ReadBlob
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo => vec![1],
@@ -373,6 +389,8 @@ const fn positional_type(function: TableFunction, at: usize) -> &'static str {
         | TableFunction::ReadNdjson
         | TableFunction::ReadJsonObjects
         | TableFunction::ReadNdjsonObjects
+        | TableFunction::ReadText
+        | TableFunction::ReadBlob
         | TableFunction::JsonEach
         | TableFunction::JsonTree
         | TableFunction::PragmaTableInfo

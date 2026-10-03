@@ -192,6 +192,21 @@ pub fn files(pattern: &str) -> Result<Vec<String>> {
     Ok(found)
 }
 
+/// The files a `read_text` or a `read_blob` pattern names, which unlike [`files`] can be none.
+///
+/// A missing path and a pattern that matches nothing read as no rows there, which is the pin's
+/// answer, and a directory named on its own is not a file to read.
+///
+/// # Errors
+///
+/// A directory on the way that cannot be read.
+pub fn content_files(pattern: &str) -> Result<Vec<String>> {
+    let filesystem = RealFilesystem::new();
+    let mut found = expand(&filesystem, pattern)?;
+    found.retain(|path| !filesystem.is_dir(Path::new(path)));
+    Ok(found)
+}
+
 /// The file at `path`, open for reading.
 fn open_file(path: &str) -> Result<Box<dyn File>> {
     let filesystem = RealFilesystem::new();

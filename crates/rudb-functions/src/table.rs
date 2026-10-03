@@ -106,6 +106,10 @@ pub enum TableFunction {
     ReadJsonObjects,
     /// `read_ndjson_objects(path)`, the same with one document a line.
     ReadNdjsonObjects,
+    /// `read_text(path)`, one row per file with its whole content as text.
+    ReadText,
+    /// `read_blob(path)`, the same with the content as bytes.
+    ReadBlob,
     /// `rudb_strategies()`, every seam and every implementation registered against it.
     RudbStrategies,
     /// `rudb_links()`, every relationship declared and what is stored for it.
@@ -198,6 +202,8 @@ impl TableFunction {
             Self::ReadNdjson => "read_ndjson",
             Self::ReadJsonObjects => "read_json_objects",
             Self::ReadNdjsonObjects => "read_ndjson_objects",
+            Self::ReadText => "read_text",
+            Self::ReadBlob => "read_blob",
             Self::RudbStrategies => "rudb_strategies",
             Self::RudbLinks => "rudb_links",
             Self::RudbDeviceCard => "rudb_device_card",
@@ -320,14 +326,22 @@ impl TableFunction {
                     ("sep", LogicalType::Varchar),
                 ]
             });
+        static READ_CONTENTS: &[(&str, LogicalType)] = &[("allow_empty", LogicalType::Boolean)];
         match self {
             Self::ReadParquet => READ_PARQUET,
             Self::ReadCsv => READ_CSV.as_slice(),
+            Self::ReadText | Self::ReadBlob => READ_CONTENTS,
             _ => match self.json() {
                 Some(function) => scan::parameters(function),
                 None => &[],
             },
         }
+    }
+
+    /// Whether the call reads whole files into a row each, which `read_text` and `read_blob` do.
+    #[must_use]
+    pub const fn reads_contents(self) -> bool {
+        matches!(self, Self::ReadText | Self::ReadBlob)
     }
 
     /// Which of the JSON readers this is, and `None` for a function that is not one.
@@ -378,6 +392,8 @@ impl TableFunction {
             ("read_json_objects", Self::ReadJsonObjects),
             ("read_json_objects_auto", Self::ReadJsonObjects),
             ("read_ndjson_objects", Self::ReadNdjsonObjects),
+            ("read_text", Self::ReadText),
+            ("read_blob", Self::ReadBlob),
         ] {
             if name.eq_ignore_ascii_case(spelled) {
                 return Some(function);
@@ -556,6 +572,9 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
 /// Split out of [`resolve_table`] because a pragma only name has to get here without going past the
 /// check that turns it down in a `FROM` clause.
 fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<ResolvedTable> {
+    if function.reads_contents() {
+        return contents(function, arguments);
+    }
     if let Some(columns) = file_columns(function) {
         // Two overloads, one path and a list of them, which is DuckDB's pair. The list is where
         // `read_parquet(['a.parquet', 'b.parquet'])` binds. An empty list is a list of the untyped
@@ -807,7 +826,9 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::ReadNdjson
         | TableFunction::ReadJsonObjects
         | TableFunction::ReadNdjsonObjects => Some(Columns::Json),
-        TableFunction::Range
+        TableFunction::ReadText
+        | TableFunction::ReadBlob
+        | TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::Unnest
         | TableFunction::JsonEach
@@ -892,11 +913,52 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         | TableFunction::ReadNdjson
         | TableFunction::ReadJsonObjects
         | TableFunction::ReadNdjsonObjects
+        | TableFunction::ReadText
+        | TableFunction::ReadBlob
         | TableFunction::RudbDeviceCard
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo => None,
     }
+}
+
+/// `read_text` and `read_blob`, which take a path or a list of them and answer four fixed columns.
+///
+/// Any list resolves, and what is in it is checked once it is folded, because the pin turns a list
+/// of numbers away as a parser error about the reader rather than as an overload that did not
+/// match. A bare null resolves too, for the same reason it does for the file readers.
+fn contents(function: TableFunction, arguments: &[LogicalType]) -> Result<ResolvedTable> {
+    let path =
+        matches!(arguments, [LogicalType::Varchar | LogicalType::Null | LogicalType::List(_)]);
+    if !path {
+        let name = function.name();
+        let mut candidates = String::new();
+        for first in ["VARCHAR", "ANY[]", "VARIANT"] {
+            candidates.push_str(&format!("\t\"{name}\"({first}, allow_empty : BOOLEAN)\n"));
+        }
+        return Err(Error::binder(format!(
+            "No function matches the given name and argument types '{name}({})'. You might need \
+             to add explicit type casts.\n\tCandidate functions:\n{candidates}",
+            arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        )));
+    }
+    Ok(ResolvedTable {
+        function,
+        arguments: arguments.to_vec(),
+        columns: Columns::Fixed(content_fields(function == TableFunction::ReadBlob)),
+    })
+}
+
+/// The columns of `read_text`, or of `read_blob` when `blob` is set, which differ only in what
+/// the content is.
+#[must_use]
+pub fn content_fields(blob: bool) -> Vec<Field> {
+    vec![
+        Field::new("filename", LogicalType::Varchar),
+        Field::new("content", if blob { LogicalType::Blob } else { LogicalType::Varchar }),
+        Field::new("size", LogicalType::BigInt),
+        Field::new("last_modified", LogicalType::TimestampTz),
+    ]
 }
 
 /// `rudb_device_card(path)` and `rudb_device_card(path, iterations)`.
