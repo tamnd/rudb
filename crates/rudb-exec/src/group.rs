@@ -5910,6 +5910,16 @@ impl BigIntDistinct {
         }
     }
 
+    /// How many values the set holds.
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Few(few) => few.len,
+            Self::Many(values) => values.len(),
+        }
+    }
+
     fn into_each(self, mut accept: impl FnMut(i64) -> Result<()>) -> Result<()> {
         match self {
             Self::Empty => Ok(()),
@@ -8052,7 +8062,27 @@ fn merge_slot(
             DistinctSet::Row(RowSet::default()),
         );
         let state = &mut into.states[target * calls + at];
+        let counted = &from.taken[slot * calls + at];
+        // A `COUNT(DISTINCT ...)` group this table has only just made has an empty set and a count
+        // of nothing, so the arriving set and its count are the merged ones as they stand. Taken
+        // whole, a group costs a move rather than a probe of the set and an update of the count for
+        // every value in it. At six threads TPC-H q16 hands most of its 118,274 rows over this way
+        // in the tables each instance gives up at the split, and the value at a time merge of them
+        // was a twelfth of the query.
+        let whole = state.counted() == Some(0) && counted.counted().is_some();
         match (&mut into.seen[target * calls + at], arriving) {
+            (DistinctSet::BigInt(kept), DistinctSet::BigInt(arriving))
+                if whole && matches!(kept, BigIntDistinct::Empty) =>
+            {
+                aside += width_of(size_of::<i64>() * 2).saturating_mul(width_of(arriving.len()));
+                *kept = arriving;
+                state.combine(counted)?;
+            }
+            (DistinctSet::Row(kept), DistinctSet::Row(arriving)) if whole && kept.is_empty() => {
+                aside += arriving.iter().map(|key| rows::footprint(&key.0)).sum::<u64>();
+                *kept = arriving;
+                state.combine(counted)?;
+            }
             (DistinctSet::BigInt(kept), DistinctSet::BigInt(arriving)) => {
                 arriving.into_each(|value| {
                     if kept.insert(value) {
@@ -9036,6 +9066,53 @@ mod tests {
         assert_eq!(
             rows,
             [vec![Value::Integer(3), Value::BigInt(1)], vec![Value::Integer(4), Value::BigInt(1)]]
+        );
+    }
+
+    /// Sets of every size, of integers and of strings, merged into a group the kept instance has
+    /// not seen and into one it has, count the values of both instances once.
+    #[test]
+    fn a_distinct_set_taken_whole_into_a_new_group_counts_what_merging_it_would() {
+        let plan = parsed(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count(DISTINCT #0.1::INTEGER)::BIGINT, \
+             count(DISTINCT #0.2::VARCHAR)::BIGINT]",
+        );
+        let (aggregate, out) = aggregate(&plan);
+        let rows = |rows: &[(i32, i32, &str)]| {
+            let column = |values: Vec<Value>, ty: LogicalType| {
+                Vector::from_values(ty, &values).expect("one type a column")
+            };
+            Chunk::new(vec![
+                column(rows.iter().map(|row| Value::Integer(row.0)).collect(), LogicalType::Integer),
+                column(rows.iter().map(|row| Value::Integer(row.1)).collect(), LogicalType::Integer),
+                column(
+                    rows.iter().map(|row| Value::Varchar(row.2.to_string())).collect(),
+                    LogicalType::Varchar,
+                ),
+            ])
+            .expect("three aligned columns")
+        };
+        let mut first: Vec<(i32, i32, &str)> = (0..40).map(|v| (1, v, "a")).collect();
+        first.extend([(1, 3, "b"), (2, 5, "x"), (2, 5, "x"), (2, 6, "x")]);
+        let mut second: Vec<(i32, i32, &str)> = (30..50).map(|v| (1, v, "b")).collect();
+        second.extend([(1, 1, "c"), (2, 6, "x"), (2, 7, "w"), (3, 7, "y")]);
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        aggregate.sink(&rows(&first), &mut left).expect("the first instance's rows");
+        aggregate.sink(&rows(&second), &mut right).expect("the second instance's rows");
+        aggregate.combine(left).expect("the first instance");
+        aggregate.combine(right).expect("the second instance");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
+
+        let mut rows = answer(&out);
+        rows.sort_by_key(|row| format!("{:?}", row[0]));
+        assert_eq!(
+            rows,
+            [
+                vec![Value::Integer(1), Value::BigInt(50), Value::BigInt(3)],
+                vec![Value::Integer(2), Value::BigInt(3), Value::BigInt(2)],
+                vec![Value::Integer(3), Value::BigInt(1), Value::BigInt(1)],
+            ]
         );
     }
 
