@@ -10,7 +10,7 @@
 //! Refusing them costs 7079 records over 584 files, more files than any other single cause in the run, because a test file sets a knob in its preamble and everything after the refusal goes down with it.
 //! So the answer is not one rule but three, and [`Behaviour`] is which of the three a setting gets.
 //! A knob cannot change what a query returns, so rudb takes it, keeps it and hands it back, and the query underneath it runs the same either way.
-//! Everything else can change an answer, so rudb takes it only at the value it already behaves as and refuses the rest, which keeps `SET preserve_insertion_order = false` an error rather than a promise rudb does not keep.
+//! Everything else can change an answer, so rudb takes it only at the value it already behaves as and refuses the rest, which keeps `SET binary_as_string = true` an error rather than a promise rudb does not keep.
 //!
 //! # The alias direction is the opposite way round from the obvious one
 //!
@@ -75,9 +75,14 @@ pub enum Behaviour {
     Knob(&'static str),
     /// Something rudb does not do, with the one value it already behaves as.
     ///
-    /// Setting it to anything else is refused. `SET preserve_insertion_order = false` is this: it is
-    /// a real change to what a query returns, rudb cannot make it, and taking the value and not
-    /// acting on it would turn one clear error into a wrong answer a statement later.
+    /// Setting it to anything else is refused. `SET binary_as_string = true` is this: it turns a
+    /// Parquet BLOB column into a VARCHAR one, which is a real change to what a query returns, rudb
+    /// cannot make it, and taking the value and not acting on it would turn one clear error into a
+    /// wrong answer a statement later.
+    ///
+    /// `preserve_insertion_order` looks like one of these and is not. Turning it off lets the pin
+    /// return rows in any order, and the order rudb returns them in is one of those, so it is a
+    /// knob.
     DefaultOnly(&'static str),
 }
 
@@ -445,7 +450,7 @@ pub static SETTINGS: &[SettingEntry] = &[
         input_type: "BOOLEAN",
         scope: GLOBAL,
         aliases: &[],
-        behaviour: Behaviour::DefaultOnly("false"),
+        behaviour: Behaviour::Knob("false"),
     },
     SettingEntry {
         name: "debug_eviction_queue_sleep_micro_seconds",
@@ -893,7 +898,7 @@ pub static SETTINGS: &[SettingEntry] = &[
         input_type: "VARCHAR",
         scope: GLOBAL,
         aliases: &[],
-        behaviour: Behaviour::DefaultOnly("PHYSICAL_ONLY"),
+        behaviour: Behaviour::Knob("PHYSICAL_ONLY"),
     },
     SettingEntry {
         name: "extension_directories",
@@ -1365,7 +1370,7 @@ pub static SETTINGS: &[SettingEntry] = &[
         input_type: "BOOLEAN",
         scope: GLOBAL,
         aliases: &[],
-        behaviour: Behaviour::DefaultOnly("true"),
+        behaviour: Behaviour::Knob("true"),
     },
     SettingEntry {
         name: "profile_output",
@@ -1824,8 +1829,8 @@ mod tests {
             SETTINGS.iter().filter(|entry| wanted(&entry.behaviour)).count()
         };
         assert_eq!(count(|b| matches!(b, Behaviour::Honoured)), 24);
-        assert_eq!(count(|b| matches!(b, Behaviour::Knob(_))), 133);
-        assert_eq!(count(|b| matches!(b, Behaviour::DefaultOnly(_))), 35);
+        assert_eq!(count(|b| matches!(b, Behaviour::Knob(_))), 136);
+        assert_eq!(count(|b| matches!(b, Behaviour::DefaultOnly(_))), 32);
         assert_eq!(
             setting_named("memory_limit").expect("a setting").behaviour,
             Behaviour::Honoured
@@ -1836,7 +1841,11 @@ mod tests {
         );
         assert_eq!(
             setting_named("preserve_insertion_order").expect("a setting").behaviour,
-            Behaviour::DefaultOnly("true")
+            Behaviour::Knob("true")
+        );
+        assert_eq!(
+            setting_named("binary_as_string").expect("a setting").behaviour,
+            Behaviour::DefaultOnly("false")
         );
     }
 

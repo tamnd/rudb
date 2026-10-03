@@ -4091,9 +4091,11 @@ fn a_setting_the_engine_does_not_read_still_answers_every_way_of_asking() {
         vec![vec![Value::UBigInt(42)]]
     );
     // And a setting that would change what a query returns is the other half of the rule.
-    let error = db.execute("SET preserve_insertion_order = false").unwrap_err();
+    let error = db.execute("SET binary_as_string = true").unwrap_err();
     assert_eq!(error.code().duckdb_name(), "Not implemented Error");
-    db.execute("SET preserve_insertion_order = true").expect("the value it already behaves as");
+    db.execute("SET binary_as_string = false").expect("the value it already behaves as");
+    // Rows in any order is what turning this off allows, and rudb's order is one of them.
+    db.execute("SET preserve_insertion_order = false").expect("a knob");
 }
 
 /// A pragma that is a statement writes the setting it stands for, and the name carries the value.
