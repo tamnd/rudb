@@ -8,6 +8,16 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.21
+
+For W3, writes that run beside each other. #2365 runs an UPDATE or a DELETE outside a transaction as a transaction of its own, which finds and changes its rows on a snapshot and takes the writer lock only to commit, so a query beside a stream of wide updates has a p99 of 3.3 ms instead of 171 ms. Small appends share the open tail chunk, and a commit that changed one table goes onto the committed catalog in place. #2366 makes an update and a delete of the same row from two transactions a conflict. The pin lets both commit and loses the update, and rudb diverges from it here on purpose. #2358 prepares the next log segment on a thread of its own, so a commit no longer waits for one to be made, and #2355 decodes a replayed log straight into chunks, so a 1.1 GiB log opens in 1.6 to 2.0 s instead of 2.3 to 3.2 s.
+
+For J7, #2352 takes a scan's link key column from the parent's key map, #2353 answers a semi or anti join over a bare child scan from whether the parent has a child, #2359 reads the rows a join to a table's own unique key keeps off that key's map, #2360 holds parts in the last statement only as far as its own reads pay for it, with the reasoning in spec/perf/95 (#2361), and #2363 lets a table's adjacencies cost as much as its columns.
+
+On compatibility, #2350 adds `json_transform` and `from_json` with their strict forms, #2351 adds the `json_group` macros and lets a macro take a window, #2354 adds `json_set`, `json_insert`, `json_replace` and `json_remove`, #2356 adds `json_each` and `json_tree`, #2357 adds `json_normalize` and refuses an integer literal as a document, and #2364 adds `read_json` and its family of JSON file readers.
+
+The file format does not change. The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.20
 
 For J7, the join order. #2340 tests the bitmap that drops the most rows for its cost first, timing each test as the scan runs, and skips the bitmap lookup for keys that repeat the one before them. #2341 lets the search over join orders take a relation that has no filter of its own, which brings JOB 33c and 11c down. #2348 prices the parts of a key column that span nearly every value apart from the rest when it asks how many parts a set of keys opens, so `cast_info` read at the people `name` keeps is priced at the half of its parts it reads. JOB 17b and 17c take half the work they did, 33a a third, and the suite runs at 8.0 times DuckDB's warm cycles, up from 7.6.
