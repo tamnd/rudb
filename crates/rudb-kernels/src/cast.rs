@@ -114,7 +114,13 @@ pub fn cast_in_time_zone(
         return Ok(vector);
     }
     if input.form() == Form::Constant {
-        let single = cast_value_in_time_zone(&input.try_value_at(0)?, target, try_cast, time_zone)?;
+        let value = input.try_value_at(0)?;
+        // A union is picked from the column's type, which the one value cannot always say.
+        let single = if matches!(target, LogicalType::Union(_)) {
+            cast_to_union(&value, input.logical_type(), target, try_cast)?
+        } else {
+            cast_value_in_time_zone(&value, target, try_cast, time_zone)?
+        };
         return Ok(Vector::constant(target.clone(), single, input.len()));
     }
     // A widening that changes nothing about how the values are stored, before the sweep, because
@@ -148,7 +154,19 @@ pub fn cast_in_time_zone(
     }
     // The member is picked once from the column's type, which is what the pin does, rather than
     // from each value, whose own type may say less: a struct with a null field reads as a struct
-    // of a null.
+    // of a null, and a null says nothing at all.
+    if let LogicalType::Union(members) = target
+        && struct_fits(&input.logical_type(), members)
+    {
+        let from = input.logical_type();
+        let mut values = Vec::with_capacity(input.len());
+        // row at a time: each row is checked for its tag and the one member it holds, which the
+        // pin does over the whole vector after casting the fields, with the same answers.
+        for index in 0..input.len() {
+            values.push(cast_to_union(&input.try_value_at(index)?, &from, target, try_cast)?);
+        }
+        return Vector::from_values(target.clone(), &values);
+    }
     if let LogicalType::Union(members) = target
         && !matches!(input.logical_type(), LogicalType::Union(_) | LogicalType::Null)
     {
@@ -157,11 +175,11 @@ pub fn cast_in_time_zone(
         let inner = cast_in_time_zone(input, &members[at].ty, try_cast, time_zone)?;
         let mut values = Vec::with_capacity(inner.len());
         // row at a time: building a union vector goes through its values, the way a struct's does.
+        // A null of a typed column is a union holding a null, so it keeps its tag, which is the
+        // pin's: only the untyped null casts to a null union.
         for index in 0..inner.len() {
-            values.push(match inner.try_value_at(index)? {
-                Value::Null if input.is_null_at(index) => Value::Null,
-                value => Value::Union { members: members.clone(), tag, value: Box::new(value) },
-            });
+            let value = Box::new(inner.try_value_at(index)?);
+            values.push(Value::Union { members: members.clone(), tag, value });
         }
         return Vector::from_values(target.clone(), &values);
     }
@@ -922,8 +940,8 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
             _ => {}
         }
     }
-    if let LogicalType::Union(members) = target {
-        return to_union(value, target, members, try_cast);
+    if matches!(target, LogicalType::Union(_)) {
+        return cast_to_union(value, &value.logical_type(), target, try_cast);
     }
     if let Value::Varchar(text) = value
         && let Some(answer) = from_text(text, target, try_cast)
@@ -937,15 +955,39 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
     }
 }
 
-/// A value cast to a union, which goes into the member [`union_member`] picks for its type, or for
-/// a union, into the member of the same name.
-fn to_union(value: &Value, target: &LogicalType, members: &[Field], try_cast: bool) -> Result<Value> {
+/// A value of type `from` cast to a union, which goes into the member [`union_member`] picks for
+/// its type, or for a union, into the member of the same name.
+///
+/// The type comes separately because a value cannot always say it: a null of a typed column goes
+/// into the member its type picks and stays there, a union holding a null, and only the untyped
+/// null is a null union. A struct laid out the way the union is, see [`struct_fits`], is read as
+/// the union it spells out rather than put into a member.
+///
+/// # Errors
+///
+/// If no member fits, more than one does, a member cast fails, or a struct's tag and members do
+/// not agree.
+pub fn cast_to_union(
+    value: &Value,
+    from: &LogicalType,
+    target: &LogicalType,
+    try_cast: bool,
+) -> Result<Value> {
+    let LogicalType::Union(members) = target else {
+        return Err(Error::internal("a union cast to a type that is not a union"));
+    };
+    if struct_fits(from, members) {
+        return from_struct(value, members, try_cast);
+    }
+    if value.is_null() && matches!(from, LogicalType::Union(_) | LogicalType::Null) {
+        return Ok(Value::Null);
+    }
     let at = match value {
         Value::Union { members: from, tag, .. } => renamed(from, target, members)?
             .get(usize::from(*tag))
             .copied()
             .ok_or_else(|| Error::internal("a union tag names no member"))?,
-        _ => union_member(&value.logical_type(), target, members)?,
+        _ => union_member(from, target, members)?,
     };
     let inner = match value {
         Value::Union { value, .. } => value.as_ref(),
@@ -958,6 +1000,74 @@ fn to_union(value: &Value, target: &LogicalType, members: &[Field], try_cast: bo
     })
 }
 
+/// Whether a struct is a union written out field by field, which the pin casts as one: a
+/// `UTINYINT` tag first under any name, then a field for each member in order with its name, in
+/// any case, and its type or `VARCHAR`.
+fn struct_fits(from: &LogicalType, members: &[Field]) -> bool {
+    let LogicalType::Struct(fields) = from else {
+        return false;
+    };
+    let Some((tag, fields)) = fields.split_first() else {
+        return false;
+    };
+    tag.ty == LogicalType::UTinyInt
+        && fields.len() == members.len()
+        && fields.iter().zip(members).all(|(field, member)| {
+            field.name.eq_ignore_ascii_case(&member.name)
+                && (field.ty == member.ty || field.ty == LogicalType::Varchar)
+        })
+}
+
+/// A struct that [`struct_fits`] read as the union it spells out, checked the way
+/// `CheckUnionValidity` checks it.
+///
+/// A null struct or a null tag is a null union. Otherwise the tag has to name a member, and of the
+/// members only the one it names may hold a value, though it may hold a null. The members are
+/// walked in order, so a second member with a value is an overlap even when the first one was the
+/// tagged one, and a first one that is not tagged is a mismatch.
+fn from_struct(value: &Value, members: &[Field], try_cast: bool) -> Result<Value> {
+    let Value::Struct(fields) = value else {
+        return Ok(Value::Null);
+    };
+    let Some(((_, tag), fields)) = fields.split_first() else {
+        return Err(Error::internal("a struct read as a union has no tag"));
+    };
+    let mut values = Vec::with_capacity(members.len());
+    for ((_, field), member) in fields.iter().zip(members) {
+        values.push(cast_value(field, &member.ty, try_cast)?);
+    }
+    let tag = match tag {
+        Value::Null => return Ok(Value::Null),
+        Value::UTinyInt(tag) => *tag,
+        _ => return Err(Error::internal("a union tag that is not a UTINYINT")),
+    };
+    if usize::from(tag) >= members.len() {
+        return Err(Error::conversion(
+            "One or more of the tags do not point to a valid union member",
+        ));
+    }
+    let mut found = false;
+    for (at, held) in values.iter().enumerate() {
+        if held.is_null() {
+            continue;
+        }
+        if found {
+            return Err(Error::conversion(
+                "One or more rows in the produced UNION have validity set for more than 1 member",
+            ));
+        }
+        found = true;
+        if at != usize::from(tag) {
+            return Err(Error::conversion(
+                "One or more rows in the produced UNION have tags that don't point to the valid \
+                 member",
+            ));
+        }
+    }
+    let value = Box::new(values.swap_remove(usize::from(tag)));
+    Ok(Value::Union { members: members.to_vec(), tag, value })
+}
+
 /// The member of a union a value of `source` goes into, which is the pin's choice: the member of
 /// exactly the source type, and otherwise the one the source casts to most cheaply.
 ///
@@ -967,8 +1077,13 @@ fn to_union(value: &Value, target: &LogicalType, members: &[Field], try_cast: bo
 /// # Errors
 ///
 /// If no member or more than one member is the cheapest.
-pub fn union_member(source: &LogicalType, target: &LogicalType, members: &[Field]) -> Result<usize> {
-    let mut picked: Vec<usize> = (0..members.len()).filter(|at| &members[*at].ty == source).collect();
+pub fn union_member(
+    source: &LogicalType,
+    target: &LogicalType,
+    members: &[Field],
+) -> Result<usize> {
+    let mut picked: Vec<usize> =
+        (0..members.len()).filter(|at| &members[*at].ty == source).collect();
     if picked.is_empty() {
         let costs: Vec<Option<i64>> =
             members.iter().map(|member| implicit::cost(source, &member.ty)).collect();
@@ -1005,16 +1120,17 @@ pub fn union_member(source: &LogicalType, target: &LogicalType, members: &[Field
 pub fn renamed(from: &[Field], target: &LogicalType, members: &[Field]) -> Result<Vec<usize>> {
     from.iter()
         .map(|member| {
-            members.iter().position(|other| other.name.eq_ignore_ascii_case(&member.name)).ok_or_else(
-                || {
+            members
+                .iter()
+                .position(|other| other.name.eq_ignore_ascii_case(&member.name))
+                .ok_or_else(|| {
                     Error::conversion(format!(
                         "Type {} can't be cast as {target}. The member '\"{}\"' is not present in \
                          target union",
                         LogicalType::Union(from.to_vec()),
                         member.name
                     ))
-                },
-            )
+                })
         })
         .collect()
 }

@@ -262,10 +262,7 @@ impl Value {
             Self::Interval { .. } => LogicalType::Interval,
             Self::List { element, .. } => LogicalType::list(element.clone()),
             Self::Struct(fields) => LogicalType::Struct(
-                fields
-                    .iter()
-                    .map(|(name, value)| crate::types::Field::new(name, value.logical_type()))
-                    .collect(),
+                fields.iter().map(|(name, value)| Field::new(name, value.logical_type())).collect(),
             ),
             Self::Map { key, value, .. } => LogicalType::Map(key.clone(), value.clone()),
             Self::Union { members, .. } => LogicalType::Union(members.clone()),

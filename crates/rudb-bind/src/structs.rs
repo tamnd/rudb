@@ -228,26 +228,28 @@ impl Binder<'_> {
             let returns = LogicalType::Enum(labels.into());
             return Ok(Some(self.add_expr(Expr::Function { name: recorded, args }, returns)));
         }
-        let (&[input, key], Some(LogicalType::Varchar | LogicalType::Null)) =
-            (bound, types.get(1))
+        let (&[input, key], Some(LogicalType::Varchar | LogicalType::Null)) = (bound, types.get(1))
         else {
             return Err(mismatch(UNION_EXTRACT, &types));
         };
         let at = match fold::value_of(self.plan(), key) {
             Ok(Some(Value::Null)) => return Ok(Some(self.add_constant(Value::Null))),
-            Ok(Some(Value::Varchar(name))) => {
-                members.iter().position(|member| member.name.eq_ignore_ascii_case(&name)).ok_or_else(
-                    || {
-                        let entries: Vec<String> =
-                            members.iter().map(|member| format!("\"{}\"", member.name)).collect();
-                        Error::binder(format!(
-                            "Could not find key \"{name}\" in union\nCandidate Entries: {}",
-                            entries.join(", ")
-                        ))
-                    },
-                )?
+            Ok(Some(Value::Varchar(name))) => members
+                .iter()
+                .position(|member| member.name.eq_ignore_ascii_case(&name))
+                .ok_or_else(|| {
+                    let entries: Vec<String> =
+                        members.iter().map(|member| format!("\"{}\"", member.name)).collect();
+                    Error::binder(format!(
+                        "Could not find key \"{name}\" in union\nCandidate Entries: {}",
+                        entries.join(", ")
+                    ))
+                })?,
+            _ => {
+                return Err(Error::binder(
+                    "Key name for union_extract needs to be a constant string",
+                ));
             }
-            _ => return Err(Error::binder("Key name for union_extract needs to be a constant string")),
         };
         let key = self.add_constant(Value::BigInt(at as i64 + 1));
         let args = self.plan_mut().add_expr_list(&[input, key]);

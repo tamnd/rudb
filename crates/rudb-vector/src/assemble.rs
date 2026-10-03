@@ -81,7 +81,7 @@ impl Assembly {
     ///
     /// # Errors
     ///
-    /// If the type is one there is no flat layout for yet, which today means `UNION`.
+    /// Never today, since every type has a layout to assemble into.
     pub fn new(ty: LogicalType, rows: usize) -> Result<Self> {
         let ty = ty.storage().clone();
         let nested = matches!(

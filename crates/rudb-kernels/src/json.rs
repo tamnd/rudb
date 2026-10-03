@@ -1208,6 +1208,45 @@ impl Document {
                 }
                 Ok(Value::Struct(values))
             }
+            // A union is read from an object of one key, the member's name, as the pin writes it.
+            LogicalType::Union(members) => {
+                let Node::Object(children) = node else {
+                    // The pin names the kind the way its parser does, a boolean by its value.
+                    let got = match node {
+                        Node::Bool(true) => "true",
+                        Node::Bool(false) => "false",
+                        Node::Unsigned(_) => "uint",
+                        Node::Signed(_) => "sint",
+                        Node::Real(..) | Node::Raw(_) => "real",
+                        Node::Str(_) => "string",
+                        Node::Array(_) => "array",
+                        Node::Null | Node::Object(_) => "null",
+                    };
+                    return Err(Error::conversion(format!(
+                        "Expected an object representing a union, got {got}"
+                    )));
+                };
+                let (key, child) = match &children[..] {
+                    [] => return Err(Error::conversion("Found empty object, instead of union")),
+                    [(key, child)] => (key, *child),
+                    _ => {
+                        return Err(Error::conversion(
+                            "Found object containing more than one key, instead of union",
+                        ));
+                    }
+                };
+                let Some(at) = members.iter().position(|member| member.name == *key) else {
+                    return Err(Error::conversion(format!(
+                        "Found object containing unknown key, instead of union: {key}"
+                    )));
+                };
+                Ok(Value::Union {
+                    members: members.clone(),
+                    tag: u8::try_from(at)
+                        .map_err(|_| Error::internal("a union has too many members"))?,
+                    value: Box::new(self.convert(child, &members[at].ty, reading)?),
+                })
+            }
             LogicalType::Map(key, value) => {
                 let Node::Object(children) = node else { return Err(expected("OBJECT")) };
                 let entries = children
