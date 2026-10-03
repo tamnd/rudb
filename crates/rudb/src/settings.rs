@@ -74,6 +74,10 @@ const LAMBDA_SYNTAXES: [&str; 3] = ["DEFAULT", "ENABLE_SINGLE_ARROW", "DISABLE_S
 
 /// The knobs whose value is one of a fixed set of words, each with the enum the pin names when it
 /// refuses another word and the words in the order the pin declares them.
+/// The values `default_transaction_invalidation_policy` takes, in the order the pin declares them.
+const INVALIDATION_POLICIES: [&str; 2] =
+    ["ALL_ERRORS_INVALIDATE_TRANSACTION", "SYNTACTIC_ERRORS_DO_NOT_INVALIDATE"];
+
 const KNOB_WORDS: &[(&str, &str, &[&str])] =
     &[("explain_output", "ExplainOutputType", &["ALL", "OPTIMIZED_ONLY", "PHYSICAL_ONLY"])];
 
@@ -144,6 +148,8 @@ pub(crate) struct Settings {
     /// How many milliseconds a statement may run before it is stopped, where zero or less is no
     /// limit.
     max_execution_time: RwLock<i64>,
+    /// Which errors abort the transaction they happen in, kept as it was written.
+    default_transaction_invalidation_policy: RwLock<String>,
     /// The settings rudb takes and does not act on, as the statements have left them.
     ///
     /// Every setting above has a field of its own, because the engine reads it and a field is where
@@ -286,6 +292,9 @@ impl Settings {
             show_behavior: RwLock::new("AUTO".to_string()),
             warnings_as_errors: RwLock::new(false),
             max_execution_time: RwLock::new(0),
+            default_transaction_invalidation_policy: RwLock::new(
+                INVALIDATION_POLICIES[0].to_string(),
+            ),
             carried: RwLock::new(BTreeMap::new()),
             seams: RwLock::new(rudb_seam::Settings::new()),
             rules: RwLock::new(Rules::new()),
@@ -414,6 +423,20 @@ impl Settings {
     /// no limit.
     pub(crate) fn max_execution_time(&self) -> i64 {
         *self.max_execution_time.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// `default_transaction_invalidation_policy` as it was written.
+    fn invalidation_policy(&self) -> String {
+        self.default_transaction_invalidation_policy
+            .read()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone()
+    }
+
+    /// Whether an error raised while parsing or binding leaves the transaction it happened in
+    /// usable, which is what `SYNTACTIC_ERRORS_DO_NOT_INVALIDATE` asks for.
+    pub(crate) fn syntactic_errors_keep_transaction(&self) -> bool {
+        self.invalidation_policy().eq_ignore_ascii_case(INVALIDATION_POLICIES[1])
     }
 
     /// The configuration as the statements have left it.
@@ -861,6 +884,21 @@ impl Settings {
                 // that nothing obeys.
                 pool.resize(threads);
             }
+            "default_transaction_invalidation_policy" => {
+                let written = value.map_or(INVALIDATION_POLICIES[0].to_string(), text_of);
+                if !INVALIDATION_POLICIES.iter().any(|policy| policy.eq_ignore_ascii_case(&written))
+                {
+                    return Err(Error::not_implemented(unknown_enum_value(
+                        &written,
+                        "TransactionInvalidationPolicy",
+                        &INVALIDATION_POLICIES,
+                    )));
+                }
+                *self
+                    .default_transaction_invalidation_policy
+                    .write()
+                    .unwrap_or_else(|held| held.into_inner()) = written;
+            }
             "max_execution_time" => {
                 let millis = match value {
                     Some(value) => typed(entry, value)?.parse().unwrap_or(0),
@@ -1104,6 +1142,7 @@ impl Settings {
             }
             "threads" => Ok(config.threads().to_string()),
             "max_execution_time" => Ok(self.max_execution_time().to_string()),
+            "default_transaction_invalidation_policy" => Ok(self.invalidation_policy()),
             "warnings_as_errors" => Ok(self
                 .warnings_as_errors
                 .read()
@@ -1251,6 +1290,7 @@ impl Settings {
                     "threads" => threads.clone(),
                     "warnings_as_errors" => warnings_as_errors.to_string(),
                     "max_execution_time" => self.max_execution_time().to_string(),
+                    "default_transaction_invalidation_policy" => self.invalidation_policy(),
                     other => unreachable!("{other} is not an honoured setting"),
                 },
             );
