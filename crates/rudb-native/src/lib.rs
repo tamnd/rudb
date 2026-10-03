@@ -18006,11 +18006,10 @@ mod tests {
         let pool = PagePool::new(usize::MAX);
         let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
         let a = catalog.table("a").expect("a");
-        let held = |part: usize| {
-            match &*a.cache.slot(0, part).expect("made").lock().expect("the slot") {
-                PartSlot::Held { vector, .. } => Some(vector.form()),
-                _ => None,
-            }
+        // No slot until the first read of the column makes them.
+        let held = |part: usize| match &*a.cache.slot(0, part)?.lock().expect("the slot") {
+            PartSlot::Held { vector, .. } => Some(vector.form()),
+            _ => None,
         };
         let sparse: Vec<u32> = (0..4096).step_by(64).collect();
         let dense: Vec<u32> = (0..4096).step_by(2).collect();
