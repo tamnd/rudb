@@ -4226,6 +4226,30 @@ impl Packed<'_> {
         code_at(self.words, (self.offset + row) * self.width as usize, self.width)
     }
 
+    /// Asks for the cache line that holds the start of `row`'s code, without waiting for it.
+    ///
+    /// A gather of rows far apart, which is what a join hands back, reads one word a row and each
+    /// of them misses the cache, and a code at a time the core waits out every miss in turn. Asked
+    /// for some rows ahead, the misses overlap. On TPC-H the wait on that one load was most of the
+    /// gather and the gather was the largest cost over all 22 queries.
+    #[inline]
+    fn prefetch(&self, row: usize) {
+        let word = (self.offset + row) * self.width as usize / u64::BITS as usize;
+        if let Some(word) = self.words.get(word) {
+            #[cfg(target_arch = "x86_64")]
+            #[allow(unsafe_code)]
+            // SAFETY: a prefetch is a hint. It reads nothing into the program and does not fault
+            // whatever the address, and this one is of a word the slice holds.
+            unsafe {
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                    std::ptr::from_ref(word).cast::<i8>(),
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = word;
+        }
+    }
+
     /// Which code a value would have, and `None` for a value this vector cannot be holding.
     ///
     /// The translation a comparison does once per vector so that it does not have to unpack once per
@@ -4383,6 +4407,9 @@ impl Packed<'_> {
         }
         if high - low >= rows.saturating_mul(4) {
             for (index, code) in out[..rows].iter_mut().enumerate() {
+                if index + PREFETCH_AHEAD < rows {
+                    self.prefetch(at(index + PREFETCH_AHEAD));
+                }
                 *code = self.code(at(index));
             }
             return;
@@ -4418,7 +4445,14 @@ impl Packed<'_> {
         let Some((low, high)) = extent(at) else { return Vec::new() };
         let (low, high) = (low as usize, high as usize);
         if high - low >= at.len().saturating_mul(4) {
-            return at.iter().map(|&row| value(self.code(row as usize))).collect();
+            let mut out = Vec::with_capacity(at.len());
+            for (index, &row) in at.iter().enumerate() {
+                if let Some(&ahead) = at.get(index + PREFETCH_AHEAD) {
+                    self.prefetch(ahead as usize);
+                }
+                out.push(value(self.code(row as usize)));
+            }
+            return out;
         }
         let span = high - low + 1;
         let gathered = |run: &mut Vec<u64>| {
@@ -4841,6 +4875,10 @@ fn unpack(
     crate::for_each_layout!(exact, unpacking);
     Ok(out)
 }
+
+/// How many rows ahead a sparse gather asks for the cache line of. A miss is a few hundred cycles
+/// and a row's read is a handful, so the line has to be asked for well before it is wanted.
+const PREFETCH_AHEAD: usize = 16;
 
 /// The `width` bits starting at `bit`, low end first.
 ///
