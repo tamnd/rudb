@@ -10354,9 +10354,8 @@ mod tests {
     /// With a `HAVING` on the total, only the closed runs that reach it are answered, keys and all.
     #[test]
     fn a_having_total_answers_only_the_closed_runs_that_pass_it() {
-        let plan = parsed(
-            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[sum(#0.0::INTEGER)::BIGINT]",
-        );
+        let plan =
+            parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[sum(#0.0::INTEGER)::BIGINT]");
         let (aggregate, _out) = aggregate(&plan);
         let aggregate = aggregate.clustered().having_total(0, 6);
         assert!(aggregate.closes_by_run());
