@@ -236,13 +236,23 @@ fn counts(plan: &Plan, call: ExprRef) -> bool {
 /// either of those answered wrongly, so they keep it. A sort, a limit and a top N keep it too,
 /// because late materialisation puts exactly this projection under a top N on purpose, and taking
 /// it out again on the next round is a plan that never settles.
+///
+/// A projection with more than one parent, or one whose index another projection in the plan also
+/// has, stays too. Decorrelation reads the outer side twice, once for the rows and once for the
+/// domain, and a rewrite of one of the two copies leaves two nodes with the same index. The column
+/// is rebound everywhere it is read, so taking out the copy under the domain's grouping rebound the
+/// reads of the other copy too, and those then named a table that was not under them.
 pub fn forward(plan: &mut Plan) {
     let order = top_down(plan);
     let untouched = untouched(plan, &order);
-    let mut above: HashMap<NodeRef, NodeRef> = HashMap::new();
+    let mut above: HashMap<NodeRef, Vec<NodeRef>> = HashMap::new();
+    let mut copies: HashMap<u32, usize> = HashMap::new();
     for &node in &order {
         for child in plan.node(node).children().into_iter().flatten() {
-            above.insert(child, node);
+            above.entry(child).or_default().push(node);
+        }
+        if let Node::Project { index, .. } = *plan.node(node) {
+            *copies.entry(index).or_default() += 1;
         }
     }
     let mut forwarded: HashMap<u32, Vec<ColumnBinding>> = HashMap::new();
@@ -252,14 +262,16 @@ pub fn forward(plan: &mut Plan) {
     for &node in order.iter().rev() {
         let Node::Project { input, index, exprs, .. } = *plan.node(node) else { continue };
         let under = gone.get(&input).copied().unwrap_or(input);
-        if untouched.contains(&node) || !scanned(plan, under) {
+        if untouched.contains(&node) || !scanned(plan, under) || copies[&index] > 1 {
             continue;
         }
-        let Some(&parent) = above.get(&node) else { continue };
-        if !matches!(
-            plan.node(parent),
-            Node::Aggregate { .. } | Node::Filter { .. } | Node::Project { .. }
-        ) {
+        let Some(parents) = above.get(&node) else { continue };
+        if !parents.iter().all(|&parent| {
+            matches!(
+                plan.node(parent),
+                Node::Aggregate { .. } | Node::Filter { .. } | Node::Project { .. }
+            )
+        }) {
             continue;
         }
         let bindings: Option<Vec<ColumnBinding>> = plan

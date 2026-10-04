@@ -182,7 +182,18 @@ pub(crate) fn lower(
     let outer = produced(plan, left);
     let keys = read_keys(plan, right, &outer);
     if keys.is_empty() {
-        return None;
+        // The right side reads nothing of the left one, so it is the same rows for every left row
+        // and this is an ordinary join. It was bound as a dependent one because it reads a column
+        // from further out, which is what a query in the condition of a left join that reads only
+        // the left side looks like once that join is planned as a lateral, and the dependent join
+        // further out is the one that answers for that column.
+        return Some(plan.add_node(Node::Join {
+            left,
+            right,
+            kind,
+            conditions,
+            build: BuildSide::default(),
+        }));
     }
 
     let group_exprs: Vec<ExprRef> = keys.iter().map(|key| key.expr).collect();
