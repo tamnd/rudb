@@ -1439,8 +1439,8 @@ mod tests {
         let mut answer_of = std::collections::HashMap::new();
         for (row, &code) in codes.iter().enumerate() {
             let Value::Varchar(text) = &values[rows - 1 - row] else { panic!("a string") };
-            let want = Value::Varchar(host(text).to_owned());
-            assert_eq!(got.value_at(row), want, "row {row}");
+            let want = host(text).to_owned();
+            assert_eq!(got.value_at(row), Value::Varchar(want.clone()), "row {row}");
             assert_eq!(code, *code_of.entry(want.clone()).or_insert(code), "row {row}");
             assert_eq!(want, *answer_of.entry(code).or_insert(want.clone()), "row {row}");
         }
