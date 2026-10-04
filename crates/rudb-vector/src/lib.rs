@@ -31,7 +31,7 @@
 //! # Unsafe
 //!
 //! This crate is on the list in `spec/16-testing.md` section 16.7 that is allowed `unsafe`, and the
-//! places it uses any are [`bytes`], for SSE2's `movemask`, [`members`], for AVX2's gather, and `lanes`, for AVX2's shuffle of packed codes into lanes. The safe version is the baseline every unsafe version has to beat on a
+//! places it uses any are [`bytes`], for SSE2's `movemask`, [`members`], for AVX2's gather, `lanes`, for AVX2's shuffle of packed codes into lanes, and [`runs`], for AVX2's compare of 64 bit neighbours. The safe version is the baseline every unsafe version has to beat on a
 //! benchmark before it lands, so writing it first is not a detour.
 //!
 //! The lint below is `deny` rather than `forbid` for exactly that reason. Denied means an unsafe
@@ -49,6 +49,7 @@ pub mod fsst;
 mod lanes;
 mod layout;
 pub mod members;
+pub mod runs;
 pub mod selection;
 pub mod string;
 pub mod validity;
