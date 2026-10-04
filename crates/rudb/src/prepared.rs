@@ -653,41 +653,18 @@ impl Prepared {
     /// If a parameter was given no value, if a value was given for a parameter the statement does
     /// not use, or anything binding and running the statement reports.
     pub fn execute(&self, values: &[Value]) -> Result<QueryResult> {
-        // The trickle insert, which has the values it wants and nothing else, reads them where they
-        // are rather than copying them into parameters to look them up by name again.
-        if self.numbered
-            && values.len() == self.names.len()
-            && let Some(direct) = &self.direct
-            && let Some(done) =
-                self.shared.insert_direct(direct, Given::Positional(values), &self.sql)
-        {
-            return done.map_err(|error| self.shared.process_error(error));
-        }
-        // The point read, likewise.
-        if self.numbered
-            && values.len() == self.names.len()
-            && let Some(lookup) = &self.lookup
-            && let Some(done) = self.shared.lookup(lookup, Given::Positional(values), &self.sql)
-        {
-            return done.map_err(|error| self.shared.process_error(error));
-        }
-        // The write by key, likewise.
-        if self.numbered
-            && values.len() == self.names.len()
-            && let Some(write) = &self.write
-            && let Some(done) = self.shared.write_point(write, Given::Positional(values), &self.sql)
-        {
-            return done.map_err(|error| self.shared.process_error(error));
-        }
-        // The short range read, likewise.
-        if self.numbered
-            && values.len() == self.names.len()
-            && let Some(range) = &self.range
-            && let Some(done) = self.shared.range_read(range, Given::Positional(values), &self.sql)
-        {
-            return done.map_err(|error| self.shared.process_error(error));
-        }
-        self.run(Parameters::positional(values.to_vec()))
+        let result = self.shared.in_transaction(&self.sql, || {
+            // The short ways, which have the values they want and nothing else, read them where
+            // they are rather than copying them into parameters to look them up by name again.
+            if self.numbered
+                && values.len() == self.names.len()
+                && let Some(done) = self.short(Given::Positional(values))
+            {
+                return done;
+            }
+            self.run(&Parameters::positional(values.to_vec()))
+        });
+        result.map_err(|error| self.shared.process_error(error))
     }
 
     /// Runs the statement with values by name, which is what `$name` wants.
@@ -704,7 +681,8 @@ impl Prepared {
         for (name, value) in values {
             parameters.set(*name, value.clone());
         }
-        self.run(parameters)
+        let result = self.shared.in_transaction(&self.sql, || self.run(&parameters));
+        result.map_err(|error| self.shared.process_error(error))
     }
 
     /// Runs the statement with values by position and returns the single value it produced.
@@ -717,37 +695,43 @@ impl Prepared {
         single(&self.execute(values)?)
     }
 
+    /// The statement run one of the ways that skip binding and planning, where one of them takes
+    /// it: a one row insert, a read by key, a write by key or a short range.
+    fn short(&self, given: Given<'_>) -> Option<Result<QueryResult>> {
+        let shared = &self.shared;
+        let sql = self.sql.as_str();
+        if let Some(direct) = &self.direct
+            && let Some(done) = shared.insert_direct(direct, given, sql)
+        {
+            return Some(done);
+        }
+        if let Some(lookup) = &self.lookup
+            && let Some(done) = shared.lookup(lookup, given, sql)
+        {
+            return Some(done);
+        }
+        if let Some(write) = &self.write
+            && let Some(done) = shared.write_point(write, given, sql)
+        {
+            return Some(done);
+        }
+        if let Some(range) = &self.range
+            && let Some(done) = shared.range_read(range, given, sql)
+        {
+            return Some(done);
+        }
+        None
+    }
+
     /// Checks the values against the statement and runs it.
-    fn run(&self, parameters: Parameters) -> Result<QueryResult> {
-        let result = self.check(&parameters).and_then(|()| {
-            if let Some(direct) = &self.direct
-                && let Some(done) =
-                    self.shared.insert_direct(direct, Given::Named(&parameters), &self.sql)
-            {
-                return done;
-            }
-            if let Some(lookup) = &self.lookup
-                && let Some(done) = self.shared.lookup(lookup, Given::Named(&parameters), &self.sql)
-            {
-                return done;
-            }
-            if let Some(write) = &self.write
-                && let Some(done) =
-                    self.shared.write_point(write, Given::Named(&parameters), &self.sql)
-            {
-                return done;
-            }
-            if let Some(range) = &self.range
-                && let Some(done) =
-                    self.shared.range_read(range, Given::Named(&parameters), &self.sql)
-            {
-                return done;
-            }
-            // Zero for the parse, because this statement was parsed once at `PREPARE` and the
-            // whole point of it is that this execution did not parse anything.
-            self.shared.execute_ast(&self.ast, &self.sql, &parameters, &self.shared.token(), 0)
-        });
-        result.map_err(|error| self.shared.process_error(error))
+    fn run(&self, parameters: &Parameters) -> Result<QueryResult> {
+        self.check(parameters)?;
+        if let Some(done) = self.short(Given::Named(parameters)) {
+            return done;
+        }
+        // Zero for the parse, because this statement was parsed once at `PREPARE` and the whole
+        // point of it is that this execution did not parse anything.
+        self.shared.execute_ast(&self.ast, &self.sql, parameters, &self.shared.token(), 0)
     }
 
     /// Both halves of the mismatch, in DuckDB's words.

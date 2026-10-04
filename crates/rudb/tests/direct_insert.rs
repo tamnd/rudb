@@ -216,3 +216,176 @@ fn rows_put_in_the_short_way_survive_a_crash() {
     db.close().expect("closes");
     let _ = std::fs::remove_file(&path);
 }
+
+/// One database written the short way and one through the plan, each with a second connection.
+struct Pair {
+    dbs: [Database; 2],
+    others: [rudb::Connection; 2],
+}
+
+impl Pair {
+    fn new() -> Self {
+        let dbs = [Database::new(), Database::new()];
+        for db in &dbs {
+            db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR)").expect("creates");
+        }
+        let others = [dbs[0].connect(), dbs[1].connect()];
+        Self { dbs, others }
+    }
+
+    /// Runs `sql` on both and checks they agree.
+    fn both(&self, sql: &str) -> Result<(), String> {
+        let [short, planned] = &self.dbs;
+        let left = short.execute(sql).map(|_| ()).map_err(|error| error.to_string());
+        assert_eq!(
+            left,
+            planned.execute(sql).map(|_| ()).map_err(|error| error.to_string()),
+            "{sql}"
+        );
+        left
+    }
+
+    /// The same on the second connections.
+    fn others(&self, sql: &str) -> Result<(), String> {
+        let [short, planned] = &self.others;
+        let left = short.execute(sql).map(|_| ()).map_err(|error| error.to_string());
+        assert_eq!(
+            left,
+            planned.execute(sql).map(|_| ()).map_err(|error| error.to_string()),
+            "{sql}"
+        );
+        left
+    }
+
+    /// Puts in a row of `id`, the short way on one and through the plan on the other.
+    fn put(&self, other: bool, id: i64) -> Result<(), String> {
+        let values = [Value::BigInt(id), Value::Varchar(format!("n{id}"))];
+        let outcome = |result: rudb::Result<rudb::QueryResult>| {
+            result
+                .map(|done| assert_eq!(done.value_at(0, 0), Value::BigInt(1)))
+                .map_err(|error| error.to_string())
+        };
+        let (short, planned) = if other {
+            let [short, planned] = &self.others;
+            (
+                short.prepare("INSERT INTO t VALUES (?, ?)"),
+                planned.prepare("INSERT INTO t SELECT ?, ?"),
+            )
+        } else {
+            let [short, planned] = &self.dbs;
+            (
+                short.prepare("INSERT INTO t VALUES (?, ?)"),
+                planned.prepare("INSERT INTO t SELECT ?, ?"),
+            )
+        };
+        let left = outcome(short.expect("prepares").execute(&values));
+        assert_eq!(left, outcome(planned.expect("prepares").execute(&values)), "{id}");
+        left
+    }
+
+    fn same(&self) -> i64 {
+        let [short, planned] = &self.dbs;
+        let all = rows(short, "SELECT * FROM t ORDER BY id");
+        assert_eq!(all, rows(planned, "SELECT * FROM t ORDER BY id"));
+        all.len() as i64
+    }
+}
+
+#[test]
+fn rows_put_in_inside_a_transaction_commit_and_abort_as_the_plan_does() {
+    let pair = Pair::new();
+    // Committed: every row, read back inside and after, and the key finds each.
+    pair.both("BEGIN").expect("begins");
+    for id in 0..3000 {
+        pair.put(false, id).expect("inserts");
+    }
+    assert_eq!(rows(&pair.dbs[0], "SELECT count(*) FROM t"), vec![vec![Value::BigInt(3000)]]);
+    pair.both("COMMIT").expect("commits");
+    assert_eq!(pair.same(), 3000);
+    let lookup = pair.dbs[0].prepare("SELECT name FROM t WHERE id = ?").expect("prepares");
+    for id in [0, 1, 2047, 2048, 2999] {
+        let found = lookup.execute(&[Value::BigInt(id)]).expect("reads");
+        assert_eq!(found.rows().collect::<Vec<_>>(), vec![vec![Value::Varchar(format!("n{id}"))]]);
+    }
+
+    // A key already there, and one put in earlier in the same transaction, abort it.
+    for taken in [5, 3001] {
+        pair.both("BEGIN").expect("begins");
+        pair.put(false, 3000).expect("inserts");
+        pair.put(false, 3001).expect("inserts");
+        assert!(pair.put(false, taken).is_err(), "{taken}");
+        let after = pair.put(false, 3002).expect_err("aborted");
+        assert!(after.contains("aborted"), "{after}");
+        for db in &pair.dbs {
+            let read = db.prepare("SELECT count(*) FROM t").expect("prepares");
+            let refused = read.execute(&[]).expect_err("aborted").to_string();
+            assert!(refused.contains("aborted"), "{refused}");
+        }
+        let _ = pair.both("COMMIT");
+        let _ = pair.both("ROLLBACK");
+        assert_eq!(pair.same(), 3000);
+    }
+
+    // Two connections putting in the same key: the plan's answer, whichever it is, both ways.
+    pair.both("BEGIN").expect("begins");
+    pair.others("BEGIN").expect("begins");
+    pair.put(false, 4000).expect("inserts");
+    pair.put(false, 4001).expect("inserts");
+    let _ = pair.put(true, 4000);
+    let _ = pair.put(true, 4002);
+    pair.both("COMMIT").expect("commits");
+    let _ = pair.others("COMMIT");
+    let _ = pair.others("ROLLBACK");
+    assert!(pair.same() >= 3002);
+    let found = rows(&pair.dbs[0], "SELECT count(*) FROM t WHERE id = 4000");
+    assert_eq!(found, vec![vec![Value::BigInt(1)]]);
+
+    // Rows a transaction puts in while another commits land beside the other's.
+    let before = pair.same();
+    pair.both("BEGIN").expect("begins");
+    for id in 5000..5100 {
+        pair.put(false, id).expect("inserts");
+    }
+    pair.put(true, 6000).expect("inserts");
+    pair.both("COMMIT").expect("commits");
+    assert_eq!(pair.same(), before + 101);
+    pair.put(false, 6000).expect_err("taken");
+}
+
+#[test]
+fn rows_put_in_inside_a_transaction_are_logged_once_it_commits() {
+    let path = path("transaction");
+    let open = || Database::open(path.to_str().expect("a UTF-8 path")).expect("opens");
+    let db = open();
+    db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR)").expect("creates");
+    let insert = db.prepare("INSERT INTO t VALUES (?, ?)").expect("prepares");
+    for round in 0..5_i64 {
+        db.execute("BEGIN").expect("begins");
+        for id in round * 1000..round * 1000 + 1000 {
+            insert
+                .execute(&[Value::BigInt(id), Value::Varchar(format!("n{id}"))])
+                .expect("inserts");
+        }
+        db.execute(if round == 3 { "ROLLBACK" } else { "COMMIT" }).expect("ends");
+    }
+    drop(insert);
+    std::mem::forget(db);
+
+    let db = open();
+    let got = rows(&db, "SELECT count(*), min(id), max(id), count(DISTINCT name) FROM t");
+    assert_eq!(
+        got,
+        vec![vec![Value::BigInt(4000), Value::BigInt(0), Value::BigInt(4999), Value::BigInt(4000)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM t WHERE id BETWEEN 3000 AND 3999"),
+        vec![vec![Value::BigInt(0)]]
+    );
+    let lookup = db.prepare("SELECT name FROM t WHERE id = ?").expect("prepares");
+    let found = lookup.execute(&[Value::BigInt(4321)]).expect("reads");
+    assert_eq!(found.rows().collect::<Vec<_>>(), vec![vec![Value::Varchar("n4321".into())]]);
+    let insert = db.prepare("INSERT INTO t VALUES (?, ?)").expect("prepares");
+    assert!(insert.execute(&[Value::BigInt(10), Value::Null]).is_err());
+    db.close().expect("closes");
+    let _ = std::fs::remove_file(&path);
+}
