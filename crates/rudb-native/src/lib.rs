@@ -238,6 +238,12 @@ const SECTIONS: &[u8; 8] = b"RUDBSE1\0";
 /// with `directory extension magic differs`. That is the right answer, because a build that dropped
 /// the keys would take a row that repeats one.
 const KEYS: &[u8; 8] = b"RUDBKY1\0";
+/// The table's column defaults, `CHECK` constraints, the order its constraints were written in and
+/// its indexes, written only when it has any.
+///
+/// Same convention as [`KEYS`], and the same reason to refuse it in a build that predates it: a
+/// build that dropped a `CHECK` or a unique index would take a row it refused before.
+const DECLARED: &[u8; 8] = b"RUDBDE1\0";
 /// How many bytes of each column's global dictionary live outside its page, written only when any do.
 ///
 /// From format 27 a dictionary's payload blocks are written into the file while the load runs, so
@@ -1285,24 +1291,63 @@ pub struct Table {
     constraints: Constraints,
 }
 
-/// A table's primary, unique and foreign keys, as the file stores them.
+/// A table's keys and the rest of what it was declared with, as the file stores them.
 ///
 /// Columns are places in the table, and a foreign key names the table it points at by name alone,
-/// because every table in one file is in one schema.
+/// because every table in one file is in one schema. Defaults and checks are kept as the SQL they
+/// were written as, which is what the catalog binds them from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Constraints {
     /// Each key's columns, and whether it is the primary key rather than a unique one.
     pub keys: Vec<(Vec<u16>, bool)>,
     /// Each foreign key.
     pub foreign: Vec<StoredForeign>,
+    /// Each column's `DEFAULT`, one per column, or empty when no column has one.
+    pub defaults: Vec<Option<String>>,
+    /// Each `CHECK` constraint, in the order written.
+    pub checks: Vec<String>,
+    /// The order the constraints were written in, each a kind and a place among its kind.
+    pub order: Vec<(u8, u16)>,
+    /// Each index, in the order created.
+    pub indexes: Vec<StoredIndex>,
 }
 
 impl Constraints {
     /// Whether there is nothing here, which is what writes no block.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty() && self.foreign.is_empty()
+        !self.keyed() && !self.declared()
     }
+
+    /// Whether there is a key or a foreign key, which is what writes the key block.
+    fn keyed(&self) -> bool {
+        !self.keys.is_empty() || !self.foreign.is_empty()
+    }
+
+    /// Whether there is anything for the [`DECLARED`] block.
+    fn declared(&self) -> bool {
+        self.defaults.iter().any(Option::is_some)
+            || !self.checks.is_empty()
+            || !self.order.is_empty()
+            || !self.indexes.is_empty()
+    }
+}
+
+/// One `CREATE INDEX`, as the file stores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredIndex {
+    /// The name.
+    pub name: String,
+    /// Whether it is a `UNIQUE` index.
+    pub unique: bool,
+    /// Whether every element is a bare column.
+    pub plain: bool,
+    /// The columns it reads.
+    pub columns: Vec<u16>,
+    /// What `duckdb_indexes()` reports as `expressions`.
+    pub expressions: String,
+    /// The statement written back out.
+    pub sql: String,
 }
 
 /// One `FOREIGN KEY`, as the file stores it.
@@ -3253,6 +3298,8 @@ impl Writer {
             || !constraints.foreign.iter().all(|foreign| {
                 fits(&foreign.columns) && foreign.referenced.len() == foreign.columns.len()
             })
+            || !constraints.indexes.iter().all(|index| fits(&index.columns))
+            || !(constraints.defaults.is_empty() || constraints.defaults.len() == width)
         {
             return Err(invalid("a constraint names a column the table does not have"));
         }
@@ -5004,6 +5051,95 @@ pub fn attach(
     file.write_at(slot_offset(generation), &committed.bytes())?;
     file.sync()?;
     Ok(held)
+}
+
+/// Writes what a table committed in a file is declared with, its keys, defaults, checks, indexes
+/// and which columns refuse nulls, without rewriting a page, the way [`attach`] writes a section.
+///
+/// A `CREATE INDEX`, a new default or a `SET NOT NULL` changes no row, so the stripes stay where
+/// they are and the commit is a new directory for the table and a new catalog naming it. Returns false, having
+/// written nothing, for a file this build writes no directory into, which is one older than
+/// format 30, and the caller writes the table again instead.
+///
+/// # Errors
+///
+/// If the file has no valid committed directory, holds no table of that name, or a declaration
+/// names a column the table does not have, or `not_null` is not one flag per column.
+pub fn restate(
+    path: impl AsRef<Path>,
+    table: &str,
+    constraints: Constraints,
+    not_null: &[bool],
+) -> Result<bool> {
+    let file = RealFilesystem::new().open(path.as_ref(), OpenMode::ReadWrite)?;
+    let file = &*file;
+    let size = file.len()?;
+    let mut version = [0; 4];
+    read_at(file, 8, &mut version)?;
+    let version = u32::from_le_bytes(version);
+    if version != FORMAT && version != 30 {
+        return Ok(false);
+    }
+    let (slot, bytes, _) = committed_slot(file, size)?;
+    let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
+    let card = card_for(path.as_ref(), card);
+    let at = entries
+        .iter()
+        .position(|entry| entry.name == table)
+        .ok_or_else(|| invalid(&format!("the file holds no table called {table}")))?;
+    let mut directory = vec![0; entries[at].directory.length as usize];
+    read_at(file, entries[at].directory.offset, &mut directory)?;
+    if checksum(&directory) != entries[at].directory.hash {
+        return Err(invalid(&format!("the directory of table {table} does not checksum")));
+    }
+    let mut held = decode_directory(&directory, size)?;
+    let width = held.fields.len();
+    let fits = |columns: &[u16]| {
+        !columns.is_empty() && columns.iter().all(|&column| usize::from(column) < width)
+    };
+    if !constraints.keys.iter().all(|(columns, _)| fits(columns))
+        || !constraints.foreign.iter().all(|foreign| fits(&foreign.columns))
+        || !constraints.indexes.iter().all(|index| fits(&index.columns))
+        || !(constraints.defaults.is_empty() || constraints.defaults.len() == width)
+        || not_null.len() != width
+    {
+        return Err(invalid("a constraint names a column the table does not have"));
+    }
+    held.constraints = constraints;
+    for (field, &refused) in held.fields.iter_mut().zip(not_null) {
+        field.not_null = refused;
+    }
+    for (field, &refused) in entries[at].fields.iter_mut().zip(not_null) {
+        field.not_null = refused;
+    }
+    let encoded = encode_directory(&held)?;
+    if encoded.len() > MAX_DIRECTORY {
+        return Err(invalid("directory exceeds the configured bound"));
+    }
+    let mut cursor = size;
+    let offset = append(file, &mut cursor, &encoded)?;
+    entries[at].directory = Page {
+        offset,
+        length: u32::try_from(encoded.len()).map_err(|_| invalid("directory length overflow"))?,
+        hash: checksum(&encoded),
+    };
+    let catalog = encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref())?;
+    if catalog.len() > MAX_DIRECTORY {
+        return Err(invalid("catalog exceeds the configured bound"));
+    }
+    let offset = append(file, &mut cursor, &catalog)?;
+    file.sync()?;
+    let generation =
+        slot.generation.checked_add(1).ok_or_else(|| invalid("native file generation overflow"))?;
+    let committed = Slot {
+        offset,
+        length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
+        generation,
+        hash: checksum(&catalog),
+    };
+    file.write_at(slot_offset(generation), &committed.bytes())?;
+    file.sync()?;
+    Ok(true)
 }
 
 /// One column's frequency synopsis as values with their row counts, shared by every clone of a
@@ -10642,7 +10778,7 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             );
         }
     }
-    if !table.constraints.is_empty() {
+    if table.constraints.keyed() {
         out.extend_from_slice(KEYS);
         put_count(&mut out, table.constraints.keys.len())?;
         for (columns, primary) in &table.constraints.keys {
@@ -10660,6 +10796,9 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             );
             out.extend_from_slice(foreign.table.as_bytes());
         }
+    }
+    if table.constraints.declared() {
+        put_declared(&mut out, &table.constraints)?;
     }
     // The section table, last, behind its own magic, for the same reason the frequency block is
     // behind its own: a reader that stops before it gets a table with no sections, and a table with
@@ -12768,8 +12907,13 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                 }
                 dictionary_payloads.push(bytes);
             }
+        } else if &tag == DECLARED {
+            if constraints.declared() {
+                return Err(invalid("directory names two declaration blocks"));
+            }
+            declared_of(&mut cur, width, &mut constraints)?;
         } else if &tag == KEYS {
-            if !constraints.is_empty() {
+            if constraints.keyed() {
                 return Err(invalid("directory names two key blocks"));
             }
             let fits = |columns: &[u16]| {
@@ -12797,7 +12941,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                 }
                 constraints.foreign.push(StoredForeign { columns, table, referenced });
             }
-            if constraints.is_empty() {
+            if !constraints.keyed() {
                 return Err(invalid("a key block holds no key"));
             }
         } else {
@@ -12851,6 +12995,86 @@ fn put_columns(out: &mut Vec<u8>, columns: &[u16]) -> Result<()> {
     put_count(out, columns.len())?;
     for &column in columns {
         put_u16(out, column);
+    }
+    Ok(())
+}
+
+/// The [`DECLARED`] block.
+fn put_declared(out: &mut Vec<u8>, constraints: &Constraints) -> Result<()> {
+    out.extend_from_slice(DECLARED);
+    put_count(out, constraints.defaults.len())?;
+    for default in &constraints.defaults {
+        match default {
+            None => out.push(0),
+            Some(sql) => {
+                out.push(1);
+                put_long_text(out, sql, "column default")?;
+            }
+        }
+    }
+    put_count(out, constraints.checks.len())?;
+    for check in &constraints.checks {
+        put_long_text(out, check, "check constraint")?;
+    }
+    put_count(out, constraints.order.len())?;
+    for &(kind, at) in &constraints.order {
+        out.push(kind);
+        put_u16(out, at);
+    }
+    put_count(out, constraints.indexes.len())?;
+    for index in &constraints.indexes {
+        put_long_text(out, &index.name, "index name")?;
+        out.push(u8::from(index.unique) | (u8::from(index.plain) << 1));
+        put_columns(out, &index.columns)?;
+        put_long_text(out, &index.expressions, "index expressions")?;
+        put_long_text(out, &index.sql, "index statement")?;
+    }
+    Ok(())
+}
+
+/// What [`put_declared`] wrote, after its magic, into `constraints`, checked against a table of
+/// `width` columns.
+fn declared_of(cur: &mut Cursor<'_>, width: usize, constraints: &mut Constraints) -> Result<()> {
+    let count = cur.u16()? as usize;
+    if count != 0 && count != width {
+        return Err(invalid("the defaults do not match the table's columns"));
+    }
+    for _ in 0..count {
+        let default = match cur.u8()? {
+            0 => None,
+            1 => Some(cur.long_text()?),
+            _ => return Err(invalid("a default is neither there nor missing")),
+        };
+        constraints.defaults.push(default);
+    }
+    let count = cur.u16()? as usize;
+    for _ in 0..count {
+        constraints.checks.push(cur.long_text()?);
+    }
+    let count = cur.u16()? as usize;
+    for _ in 0..count {
+        let kind = cur.u8()?;
+        constraints.order.push((kind, cur.u16()?));
+    }
+    let count = cur.u16()? as usize;
+    for _ in 0..count {
+        let name = cur.long_text()?;
+        let flags = cur.u8()?;
+        let columns = columns_of(cur)?;
+        if flags > 3 || columns.iter().any(|&column| usize::from(column) >= width) {
+            return Err(invalid("a stored index does not match its table"));
+        }
+        constraints.indexes.push(StoredIndex {
+            name,
+            unique: flags & 1 != 0,
+            plain: flags & 2 != 0,
+            columns,
+            expressions: cur.long_text()?,
+            sql: cur.long_text()?,
+        });
+    }
+    if !constraints.declared() {
+        return Err(invalid("a declaration block holds nothing"));
     }
     Ok(())
 }

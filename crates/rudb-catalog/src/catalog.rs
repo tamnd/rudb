@@ -829,6 +829,7 @@ impl Catalog {
         let name = QualifiedName::new(database, DEFAULT_SCHEMA, reader.table().name());
         let mut table = Table::native(name.clone(), reader)?;
         table.stamp(self.stamp());
+        table.stamp_indexes(|| self.stamp());
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
         if let Some(found) = schema.kind(&name.table) {
             return Err(taken(found, &name.table));
