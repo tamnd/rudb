@@ -390,6 +390,8 @@ struct Pending {
     index: u16,
     /// Whether the answer is that value unchanged.
     itself: bool,
+    /// Whether no other value can give the same answer, so it never goes in the shared table.
+    unique: bool,
 }
 
 impl Memo {
@@ -435,6 +437,25 @@ impl Memo {
                     text,
                     &mut buffer,
                 )?;
+                // An answer only this value can give is its own code, with nothing to look up and
+                // nothing to put in the shared table. It still goes in the group as a value that
+                // is its own answer, so reading the answer back finds it.
+                if self.unique(text, answer) {
+                    let (Ok(at), Ok(index)) = (u32::try_from(mine.len()), u16::try_from(index))
+                    else {
+                        return Err(Error::internal("a replaced group too large"));
+                    };
+                    pending.push(Pending {
+                        hash: 0,
+                        start: at,
+                        end: at,
+                        index,
+                        itself: true,
+                        unique: true,
+                    });
+                    firsts.push(own);
+                    return Ok(());
+                }
                 // Neighbouring values often give the same answer, the pages of one host, and the
                 // one before is still at hand, so a repeat skips the table and its lock.
                 //
@@ -469,7 +490,14 @@ impl Memo {
                                         // An empty answer costs nothing to copy, and the value
                                         // under it may be a null the dictionary gives no bytes for.
                                         let itself = !answer.is_empty() && answer == text;
-                                        pending.push(Pending { hash, start, end, index, itself });
+                                        pending.push(Pending {
+                                            hash,
+                                            start,
+                                            end,
+                                            index,
+                                            itself,
+                                            unique: false,
+                                        });
                                         own
                                     }
                                 };
@@ -534,7 +562,7 @@ impl Memo {
         }
         let mut moved: HashMap<u32, u32> = HashMap::new();
         let mut added = 0;
-        for waiting in &pending {
+        for waiting in pending.iter().filter(|waiting| !waiting.unique) {
             let own = (first + usize::from(waiting.index)) as u32;
             let answer = &mine[waiting.start as usize..waiting.end as usize];
             let found = self.register(waiting.hash, answer, own, &mut added)?;
@@ -558,6 +586,19 @@ impl Memo {
         slot.get()
             .map(|done| &**done)
             .ok_or_else(|| Error::internal("a replaced group was set and is not there"))
+    }
+
+    /// Whether `answer`, which `text` gave, is one no other value of the dictionary can give.
+    ///
+    /// Only the host pattern can say so. The host it picks out ends before the first slash after
+    /// the scheme, and it is always shorter than the value it came from, so an answer as long as
+    /// its value is that value left alone, and one with a slash in it cannot be any value's host.
+    /// No other value is the same text either, because a stable dictionary holds each value once,
+    /// which grouping on its codes already relies on. On ClickBench 29 that is 169 thousand of the
+    /// 404 thousand distinct answers, and every one of them was a lookup in the shared table that
+    /// found nothing, a second one under the lock to put it in, and a slot it then held.
+    fn unique(&self, text: &[u8], answer: &[u8]) -> bool {
+        self.host && answer.len() == text.len() && memchr::memchr(b'/', answer).is_some()
     }
 
     /// The code the shared table holds for `answer`, if it holds one.
@@ -1355,6 +1396,53 @@ mod tests {
                 );
                 assert_eq!(code, *code_of.entry(want).or_insert(code), "group {group} row {row}");
             }
+        }
+    }
+
+    /// A value the host pattern leaves alone that has a slash in it skips the shared table, and it
+    /// still answers with itself, under a code of its own that no host and no other value shares.
+    #[test]
+    fn values_left_alone_with_a_slash_keep_codes_of_their_own() {
+        let texts: Vec<String> = (0..3_000)
+            .map(|index| match index % 5 {
+                0 => format!("http://h{}.ru", index % 7),
+                1 => format!("ftp://h{}.ru/{index}", index % 7),
+                2 => format!("http://h{}.ru/{index}", index % 7),
+                3 => format!("h{}.ru", index % 7),
+                _ => format!("https://h{}.ru/\n{index}", index % 7),
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let values: Vec<Value> = texts
+            .iter()
+            .filter(|text| seen.insert((*text).clone()))
+            .map(|text| Value::Varchar(text.clone()))
+            .collect();
+        let dictionary =
+            Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("builds"));
+        let constants = [
+            Value::Varchar("^https?://(?:www\\.)?([^/]+)/.*$".into()),
+            Value::Varchar("\\1".into()),
+        ];
+        let call = Call::read("regexp_replace", &constants.iter().collect::<Vec<_>>())
+            .expect("compiles")
+            .expect("a shape this file handles");
+        let rows = values.len();
+        let codes: Vec<u32> = (0..rows).rev().map(|row| row as u32).collect();
+        let column = Vector::stable_dictionary(codes, Arc::clone(&dictionary)).expect("in range");
+        let got =
+            vectorized("regexp_replace", Some(&call), &[&column], &LogicalType::Varchar, rows)
+                .expect("the call is written")
+                .expect("text in this form has a loop");
+        let (codes, _) = got.stable_dictionary_parts().expect("answered as codes");
+        let mut code_of = std::collections::HashMap::new();
+        let mut answer_of = std::collections::HashMap::new();
+        for (row, &code) in codes.iter().enumerate() {
+            let Value::Varchar(text) = &values[rows - 1 - row] else { panic!("a string") };
+            let want = host(text).to_owned();
+            assert_eq!(got.value_at(row), Value::Varchar(want.clone()), "row {row}");
+            assert_eq!(code, *code_of.entry(want.clone()).or_insert(code), "row {row}");
+            assert_eq!(want, *answer_of.entry(code).or_insert(want.clone()), "row {row}");
         }
     }
 
