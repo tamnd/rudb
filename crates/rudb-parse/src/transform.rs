@@ -1670,6 +1670,10 @@ impl<'a> Transform<'a> {
     /// The body is transformed here as well as kept as text. Transforming it is what makes a view
     /// whose body does not parse a parse error at creation, which is where it belongs, and the text
     /// is what the catalog keeps so that the body can be bound again at every reference.
+    ///
+    /// A `RECURSIVE` view is a view over a recursive definition of the same name, which is what the
+    /// pin turns it into and what its `duckdb_views()` shows: `CREATE RECURSIVE VIEW v (n) AS q` is
+    /// kept as `WITH RECURSIVE v (n) AS (q) SELECT n FROM v`. See [`Transform::recursive_view`].
     fn create_view_statement(
         &mut self,
         inner: u32,
@@ -1677,13 +1681,13 @@ impl<'a> Transform<'a> {
         temporary: bool,
     ) -> Result<Statement> {
         for kid in self.kids(inner) {
-            // `SECURE` is a column and row policy, `RECURSIVE` is a different shape of view
-            // entirely, and `WITH` carries options. Dropping any of the three silently would make a
-            // view that is not the view that was asked for.
-            if matches!(self.name(kid), "CreateSecure" | "CreateRecursive" | "WithList") {
+            // `SECURE` is a column and row policy and `WITH` carries options. Dropping either
+            // silently would make a view that is not the view that was asked for.
+            if matches!(self.name(kid), "CreateSecure" | "WithList") {
                 return self.unsupported(kid);
             }
         }
+        let recursive = self.find(inner, "CreateRecursive") != NONE;
         let name = self.name_parts(self.find(inner, "QualifiedName"));
         let if_not_exists = self.find(inner, "IfNotExists") != NONE;
         let list = self.find(inner, "InsertColumnList");
@@ -1697,9 +1701,13 @@ impl<'a> Transform<'a> {
             self.part_slice(parts)
         };
         let body = self.find(inner, "SelectStatementInternal");
-        let sql = self.text(body).to_string();
+        let (sql, query) = if recursive {
+            let view = self.ast.name(name).last().unwrap_or_default().to_owned();
+            self.recursive_view(&view, columns, body)?
+        } else {
+            (self.text(body).to_string(), self.query(body)?)
+        };
         let sql = self.intern(&sql);
-        let query = self.query(body)?;
         let index = self.ast.create_views.len() as u32;
         self.ast.create_views.push(CreateView {
             name,
@@ -1711,6 +1719,59 @@ impl<'a> Transform<'a> {
             temporary,
         });
         Ok(Statement::CreateView(index))
+    }
+
+    /// The query a `RECURSIVE` view stands for, as text and transformed, given its name, its
+    /// column list and its body.
+    ///
+    /// The query is written out as text and parsed again rather than put together node by node,
+    /// because the text is what the catalog keeps and binds at every reference, and a definition
+    /// read through its own name is only right if the transform saw that name in scope while it
+    /// read the body, which is what parsing the text does. The second parse adds to this one's
+    /// arena, so what it makes is part of the statement like anything else.
+    fn recursive_view(
+        &mut self,
+        view: &str,
+        columns: Slice,
+        body: u32,
+    ) -> Result<(String, QueryRef)> {
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        let names: Vec<String> = self.ast.name(columns).map(quote).collect();
+        let list =
+            if names.is_empty() { String::new() } else { format!(" ({})", names.join(", ")) };
+        let read = if names.is_empty() { "*".to_owned() } else { names.join(", ") };
+        let view = quote(view);
+        let sql = format!(
+            "WITH RECURSIVE {view}{list} AS ({}) SELECT {read} FROM {view}",
+            self.text(body)
+        );
+        let tokens = tokenize(&sql)?;
+        let tree = parse_tokens(&sql, &tokens, PROGRAM, true)?;
+        let mut nested = Transform {
+            query: &sql,
+            tokens: &tokens,
+            tree: &tree,
+            ast: std::mem::take(&mut self.ast),
+            interned: std::mem::take(&mut self.interned),
+            anonymous: self.anonymous,
+            identifier_case: self.identifier_case,
+            current_span: self.current_span,
+            ctes: Vec::new(),
+            named_windows: Vec::new(),
+            query_depth: self.query_depth,
+            recursing: Vec::new(),
+            self_reads: Vec::new(),
+        };
+        let mut found = Vec::new();
+        nested.named_nodes(tree.root(), "SelectStatementInternal", &mut found);
+        let query = match found.first() {
+            Some(&select) => nested.query(select),
+            None => Err(Error::internal("a recursive view did not parse back as a query")),
+        };
+        self.ast = nested.ast;
+        self.interned = nested.interned;
+        self.anonymous = nested.anonymous;
+        Ok((sql, query?))
     }
 
     /// `CreateColumnList <- Parens(CreateTableColumnList?) PartitionSortedOptions? WithList?`.
