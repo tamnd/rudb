@@ -593,6 +593,16 @@ pub enum Node {
         /// `all` set the next round reads every row this one made, and without it only the rows
         /// that changed what the table holds for their key.
         key: Slice,
+        /// The aggregates `USING KEY` names, into the field pool, each named by the aggregate it
+        /// runs and typed by what it answers, empty without any.
+        ///
+        /// An aggregate keeps a running answer per key in the column it lands in, in place of the
+        /// last row's value. Its arguments are computed by both sides as columns after the
+        /// produced ones, in the order the aggregates come, so the sides are wider than `columns`.
+        aggregates: Slice,
+        /// Two positions per aggregate, into the position pool: the column its answer lands in and
+        /// how many argument columns it reads.
+        folds: Slice,
     },
     /// A MIN or MAX over an acyclic chain of inner equi-joins, answered without running the join.
     ///

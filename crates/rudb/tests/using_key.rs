@@ -3,7 +3,8 @@
 //! Every answer and every error asserted here was read off the pinned duckdb on server2 first,
 //! which is v2.0.0-dev84237 at cc7e7bac7f. With a key the rows a recursion produces are a table
 //! keyed on the key columns, where a later row for a key replaces the earlier one, and a
-//! `recurring.` read sees that table as it stood when the round began.
+//! `recurring.` read sees that table as it stood when the round began. An aggregate in the key
+//! keeps a running answer per key in a column of the table instead.
 
 use rudb::Database;
 
@@ -375,4 +376,246 @@ fn what_the_pin_refuses_is_refused_in_its_words() {
         rows(&database, "WITH t(k, v) USING KEY (k) AS (VALUES (1, 1), (1, 2)) SELECT * FROM t"),
         ["1|1", "1|2"]
     );
+}
+
+#[test]
+fn an_aggregate_keeps_a_running_answer_per_key() {
+    let database = Database::new();
+    for word in ["UNION", "UNION ALL"] {
+        assert_eq!(
+            rows(
+                &database,
+                &format!(
+                    "WITH RECURSIVE t(a, b) USING KEY (a, max(b)) AS (SELECT 1, 5 {word} \
+                     SELECT a, b - 1 FROM t WHERE b > 0) SELECT * FROM t"
+                )
+            ),
+            ["1|5"],
+            "{word}"
+        );
+        assert_eq!(
+            rows(
+                &database,
+                &format!(
+                    "WITH RECURSIVE t(k, v, n) USING KEY (k, sum(v)) AS (SELECT 1, 1, 0 {word} \
+                     SELECT k, 1, n + 1 FROM t WHERE n < 4) SELECT * FROM t"
+                )
+            ),
+            ["1|5|4"],
+            "{word}"
+        );
+    }
+    for (key, expected) in [
+        ("k, avg(v)", "1|1.0"),
+        ("k, list(v)", "1|[0, 1, 2, 3]"),
+        ("sum(v), k", "1|6"),
+        ("k, sum(t.v)", "1|6"),
+        ("k, sum(V)", "1|6"),
+        ("k, sum(v) AS V", "1|6"),
+        ("k, max(v)", "1|3"),
+    ] {
+        let anchor = if key.contains("avg") { "SELECT 1, 2" } else { "SELECT 1, 0" };
+        let step = if key.contains("avg") {
+            "v - 1 FROM t WHERE v > 0"
+        } else {
+            "v + 1 FROM t WHERE v < 3"
+        };
+        assert_eq!(
+            rows(
+                &database,
+                &format!(
+                    "WITH RECURSIVE t(k, v) USING KEY ({key}) AS ({anchor} UNION ALL \
+                     SELECT k, {step}) SELECT * FROM t"
+                )
+            ),
+            [expected],
+            "{key}"
+        );
+    }
+    // The other columns take the last row's values, and an aggregate can land in any column.
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v, w) USING KEY (k, arg_min(w, v)) AS (SELECT 1, 0, 5 \
+             UNION ALL SELECT k, v + 1, w - 1 FROM t WHERE v < 3) SELECT * FROM t"
+        ),
+        ["1|3|5"]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v, c) USING KEY (k, sum(v) AS v, count(v) AS c) AS \
+             (SELECT 1, 0, 0 UNION ALL SELECT k, v + 1, 0 FROM t WHERE v < 3) SELECT * FROM t"
+        ),
+        ["1|6|4"]
+    );
+    // A key named after an aggregate already landed in its column is a key like any other.
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v) USING KEY (k, max(v), v) AS (SELECT 1, 0 UNION ALL \
+             SELECT k, v + 1 FROM t WHERE v < 3) SELECT * FROM t"
+        ),
+        ["1|0", "1|1", "1|2", "1|3"]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v) USING KEY (k, min(v)) AS (SELECT k, 10 FROM range(3) r(k) \
+             UNION SELECT k, v - k - 1 FROM t WHERE v > 5) SELECT * FROM t ORDER BY k"
+        ),
+        ["0|5", "1|4", "2|4"]
+    );
+    for (aggregate, expected) in [("count", "1|0"), ("sum", "1|NULL")] {
+        assert_eq!(
+            rows(
+                &database,
+                &format!(
+                    "WITH RECURSIVE t(k, v) USING KEY (k, {aggregate}(v)) AS (SELECT 1, \
+                     NULL::INT UNION ALL SELECT k, 1 FROM t WHERE false) SELECT * FROM t"
+                )
+            ),
+            [expected]
+        );
+    }
+}
+
+#[test]
+fn a_round_reads_the_rows_made_with_all_and_the_finished_rows_without_it() {
+    let database = Database::new();
+    // The table holds the answer's type, which a round reads only without `ALL`.
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v) USING KEY (k, sum(v)) AS (SELECT 1, 0 UNION ALL SELECT k, \
+             v + 1 FROM t WHERE v < 3) SELECT typeof(v), v FROM t"
+        ),
+        ["HUGEINT|6"]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v) USING KEY (k, sum(v)) AS (SELECT 1, 0 UNION ALL SELECT k, \
+             v + 1 FROM t WHERE v < 3 AND typeof(v) = 'INTEGER') SELECT v FROM t"
+        ),
+        ["6"]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v) USING KEY (k, sum(v)) AS (SELECT 1, 0 UNION SELECT k, v + 1 \
+             FROM t WHERE v < 3 AND typeof(v) = 'HUGEINT') SELECT v FROM t"
+        ),
+        ["3"]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v) USING KEY (k, max(v)) AS (SELECT 1, 0 UNION SELECT r.k, \
+             r.v + 1 FROM recurring.t r WHERE r.v < 3) SELECT * FROM t"
+        ),
+        ["1|3"]
+    );
+    // Without a read of itself the right side runs once.
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v) USING KEY (k, sum(v)) AS (SELECT 1, 1 UNION ALL SELECT 1, 2) \
+             SELECT typeof(v), v FROM t"
+        ),
+        ["HUGEINT|3"]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v) USING KEY (k, sum(v)) AS (SELECT 1, 0 UNION ALL SELECT k, \
+             v + 1 FROM t WHERE v < 3), u AS (SELECT * FROM t) SELECT typeof(v), v FROM u"
+        ),
+        ["HUGEINT|6"]
+    );
+}
+
+#[test]
+fn an_aggregate_the_pin_refuses_is_refused_in_its_words() {
+    let database = Database::new();
+    for (key, expected) in [
+        (
+            "k, max(v + 1)",
+            "In USING KEY, an aggregate must either have a column reference or an alias.",
+        ),
+        (
+            "k, count(*)",
+            "In USING KEY, an aggregate must either have a column reference or an alias.",
+        ),
+        (
+            "k, arg_min(1, v)",
+            "In USING KEY, an aggregate must either have a column reference or an alias.",
+        ),
+        ("k, sum(v) AS w", "Could not find column with name '\"w\"' to bind aggregate to."),
+        (
+            "k, sum(k)",
+            "Column '\"k\"' cannot be used as both key and aggregate in USING KEY clause. Try \
+             using an alias for the aggregation.",
+        ),
+        (
+            "k, sum(v) AS k",
+            "Column '\"k\"' cannot be used as both key and aggregate in USING KEY clause. Try \
+             using an alias for the aggregation.",
+        ),
+        ("sum(v)", "USING KEY clause requires at least one key column."),
+        (
+            "k, sum(v), max(v)",
+            "Column '\"v\"' referenced multiple times in USING KEY clause. Try using an alias for \
+             one of the aggregates.",
+        ),
+        (
+            "k, sum(v) FILTER (WHERE v > 1)",
+            "FILTER clause is not yet supported for aggregates in USING KEY",
+        ),
+        (
+            "k, sum(v) FILTER (WHERE zz)",
+            "FILTER clause is not yet supported for aggregates in USING KEY",
+        ),
+        ("k, sum(DISTINCT v)", "DISTINCT is not yet supported for aggregates in USING KEY"),
+        (
+            "k, list(v ORDER BY v DESC)",
+            "ORDER BY clause is not yet supported for aggregates in USING KEY",
+        ),
+        ("k, sum(sum(v))", "Aggregate functions are not supported here"),
+        (
+            "k, abs(v)",
+            "'abs(v)' can't be used in the USING KEY clause. It has to be either a column name as \
+             a key or a direct call to an aggregate function.",
+        ),
+        (
+            "k, zzagg(v)",
+            "'zzagg(v)' can't be used in the USING KEY clause. It has to be either a column name \
+             as a key or a direct call to an aggregate function.",
+        ),
+    ] {
+        assert_eq!(
+            refused(
+                &database,
+                &format!(
+                    "WITH RECURSIVE t(k, v) USING KEY ({key}) AS (SELECT 1, 0 UNION ALL \
+                     SELECT k, v + 1 FROM t WHERE v < 3) SELECT * FROM t"
+                )
+            ),
+            format!("Binder Error: {expected}"),
+            "{key}"
+        );
+    }
+    for key in ["k, max(zz) AS v", "k, max(v + zz)", "k, sum(zz) AS v, max(v)"] {
+        assert!(
+            refused(
+                &database,
+                &format!(
+                    "WITH RECURSIVE t(k, v) USING KEY ({key}) AS (SELECT 1, 0 UNION ALL \
+                     SELECT k, v + 1 FROM t WHERE v < 3) SELECT * FROM t"
+                )
+            )
+            .starts_with("Binder Error: Referenced column \"zz\" not found in FROM clause!"),
+            "{key}"
+        );
+    }
 }

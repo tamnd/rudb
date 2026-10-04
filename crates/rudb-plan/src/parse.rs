@@ -421,6 +421,23 @@ impl Reader<'_> {
                     c.expect(")")?;
                 }
                 let key = plan.add_positions(&positions);
+                let mut calls = Vec::new();
+                let mut into = Vec::new();
+                if c.eat_word("FOLD") {
+                    c.expect("(")?;
+                    loop {
+                        into.push(read_number(c)?);
+                        let name = read_identifier(c)?;
+                        into.push(read_number(c)?);
+                        calls.push(Field::new(name, read_type(c)?));
+                        if !c.eat_space_then(",") {
+                            break;
+                        }
+                    }
+                    c.expect(")")?;
+                }
+                let aggregates = plan.add_fields(&calls);
+                let folds = plan.add_positions(&into);
                 let index = read_table_index(c)?;
                 let columns = read_schema(plan, c)?;
                 Ok(Built {
@@ -435,6 +452,8 @@ impl Reader<'_> {
                         columns,
                         recurring,
                         key,
+                        aggregates,
+                        folds,
                     }),
                 })
             }
