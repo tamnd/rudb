@@ -2029,14 +2029,7 @@ impl Table {
             Value::Varchar(value) if field.ty == LogicalType::Varchar => Edge::Text(value),
             _ => return Ok(None),
         };
-        let unique = self.indexes.iter().filter(|index| index.unique && index.plain);
-        let which = self
-            .keys
-            .iter()
-            .map(|held| held.columns.as_slice())
-            .chain(unique.map(|index| index.columns.as_slice()))
-            .position(|held| held == [key]);
-        let Some(which) = which else { return Ok(None) };
+        let Some((which, _)) = self.held(&[key]) else { return Ok(None) };
         if columns.iter().any(|&column| column >= self.columns.len()) {
             return Ok(None);
         }
@@ -2044,6 +2037,38 @@ impl Table {
         self.points
             .range(which, &self.rows, self.placed, key, reach, descending, limit, columns)
             .map(Some)
+    }
+
+    /// Which of the keys and plain unique indexes, in the order of [`Self::guards`], is over the
+    /// columns `key` in any order, and its columns in its own order.
+    fn held(&self, key: &[usize]) -> Option<(usize, &[usize])> {
+        // The same columns in any order, which with as many of them as the key has is each once.
+        let same = |held: &[usize]| {
+            held.len() == key.len() && held.iter().all(|column| key.contains(column))
+        };
+        let unique = self.indexes.iter().filter(|index| index.unique && index.plain);
+        self.keys
+            .iter()
+            .map(|held| held.columns.as_slice())
+            .chain(unique.map(|index| index.columns.as_slice()))
+            .enumerate()
+            .find(|(_, held)| same(held))
+    }
+
+    /// Whether [`Self::point`] can find a row by the columns `key`, given values of their types.
+    #[must_use]
+    pub fn finds_by(&self, key: &[usize]) -> bool {
+        self.held(key).is_some()
+    }
+
+    /// Whether [`Self::range`] can read the rows in the order of the one column `key`, given a
+    /// bound of its type.
+    #[must_use]
+    pub fn ranges_by(&self, key: usize) -> bool {
+        let ranged = self.columns.get(key).is_some_and(|field| {
+            matches!(field.ty, LogicalType::Integer | LogicalType::BigInt | LogicalType::Varchar)
+        });
+        ranged && self.held(&[key]).is_some_and(|(_, held)| held == [key])
     }
 
     /// [`Self::point`], with where the row is beside it, for a write to the row there.
@@ -2061,19 +2086,7 @@ impl Table {
             && key.iter().zip(values).all(|(&column, value)| {
                 self.columns.get(column).is_some_and(|field| looks_up(value, &field.ty))
             });
-        // The same columns in any order, which with as many of them as the key has is each once.
-        let same = |held: &[usize]| {
-            held.len() == key.len() && held.iter().all(|column| key.contains(column))
-        };
-        let unique = self.indexes.iter().filter(|index| index.unique && index.plain);
-        let held = self
-            .keys
-            .iter()
-            .map(|held| held.columns.as_slice())
-            .chain(unique.map(|index| index.columns.as_slice()))
-            .enumerate()
-            .find(|(_, held)| same(held));
-        let Some((which, held)) = held else { return Ok(None) };
+        let Some((which, held)) = self.held(key) else { return Ok(None) };
         if !fits || columns.iter().any(|&column| column >= self.columns.len()) {
             return Ok(None);
         }
