@@ -144,6 +144,9 @@ pub(crate) struct Target {
     pub(crate) columns: Vec<usize>,
     pub(crate) names: Vec<String>,
     pub(crate) types: Vec<rudb_common::LogicalType>,
+    /// Whether a column may hold a `TIMESTAMPTZ`, which is the one kind of value a result needs
+    /// the session to write.
+    pub(crate) zoned: bool,
 }
 
 /// The [`Target`] a [`Lookup`] resolved to, with the catalog's [`naming`] it was resolved at.

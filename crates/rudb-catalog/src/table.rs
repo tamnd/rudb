@@ -1999,17 +1999,37 @@ impl Table {
         let same = |held: &[usize]| {
             held.len() == key.len() && held.iter().all(|column| key.contains(column))
         };
-        let keyed = self.keys.iter().any(|held| same(&held.columns))
-            || self.indexes.iter().any(|index| index.unique && index.plain && same(&index.columns));
-        if !fits || !keyed || columns.iter().any(|&column| column >= self.columns.len()) {
+        let unique = self.indexes.iter().filter(|index| index.unique && index.plain);
+        let held = self
+            .keys
+            .iter()
+            .map(|held| held.columns.as_slice())
+            .chain(unique.map(|index| index.columns.as_slice()))
+            .enumerate()
+            .find(|(_, held)| same(held));
+        let Some((which, held)) = held else { return Ok(None) };
+        if !fits || columns.iter().any(|&column| column >= self.columns.len()) {
             return Ok(None);
         }
-        self.points.find(&self.rows, self.revision, key, values, columns).map(Some)
+        // In the key's own order, so one key is always looked up by the same columns.
+        let ordered: Vec<Value>;
+        let values = if held == key {
+            values
+        } else {
+            ordered = held
+                .iter()
+                .filter_map(|column| key.iter().position(|at| at == column))
+                .map(|at| values[at].clone())
+                .collect();
+            &ordered
+        };
+        self.points.find(which, &self.rows, self.revision, held, values, columns).map(Some)
     }
 
     /// Draws a new revision, for a table about to be changed.
     pub(crate) fn touch(&mut self) {
         self.revision = next_revision();
+        self.points = Points::default();
     }
 
     /// Replaces an empty mutable table with its committed native snapshot.
