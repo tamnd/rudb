@@ -1,6 +1,10 @@
 //! `arg_min` and `arg_max`, with their `_null` and `_nulls_last` spellings, and the forms with a
 //! third argument that answer the `n` best rows as a list.
 //!
+//! `min(x, n)` and `max(x, n)` are here too, as `arg_min(x, x, n)` and `arg_max(x, x, n)` under the
+//! names `min_top` and `max_top` the binder gives them. They differ from those only in what they
+//! call themselves when `n` is bad.
+//!
 //! The two argument form keeps one row: the `arg` of the row whose `by` is the least, or the
 //! greatest, with the row that arrived first kept on a tie. The three spellings differ only in
 //! which nulls they look at, and each rule below is the pin's, read off its answers:
@@ -50,6 +54,8 @@ pub(crate) enum ArgExtreme {
         by: Option<Value>,
         least: bool,
         nulls: Nulls,
+        /// What the pin calls the call when its `n` is bad.
+        called: &'static str,
     },
     /// The form with `n`, as the pin's heap of `(by, arg)` pairs.
     Many { heap: Vec<(Value, Value)>, capacity: usize, least: bool, nulls: Nulls },
@@ -58,16 +64,17 @@ pub(crate) enum ArgExtreme {
 impl ArgExtreme {
     /// A fresh state for `name`, or `None` when the name is not one of these.
     pub(crate) fn named(name: &str) -> Option<Self> {
+        let called = if name.ends_with("_top") { "MIN/MAX" } else { "arg_min/arg_max" };
         let (least, nulls) = match name {
-            "arg_min" => (true, Nulls::Skip),
-            "arg_max" => (false, Nulls::Skip),
+            "arg_min" | "min_top" => (true, Nulls::Skip),
+            "arg_max" | "max_top" => (false, Nulls::Skip),
             "arg_min_null" => (true, Nulls::Arg),
             "arg_max_null" => (false, Nulls::Arg),
             "arg_min_nulls_last" => (true, Nulls::Last),
             "arg_max_nulls_last" => (false, Nulls::Last),
             _ => return None,
         };
-        Some(Self::One { set: false, arg: Value::Null, by: None, least, nulls })
+        Some(Self::One { set: false, arg: Value::Null, by: None, least, nulls, called })
     }
 
     /// Whether a row whose `by` is `key` is sure to leave this state as it is, which lets a column
@@ -94,16 +101,16 @@ impl ArgExtreme {
         let (Some(arg), Some(by)) = (args.first(), args.get(1)) else {
             return Err(Error::internal("arg_min over fewer than 2 arguments"));
         };
-        if let (Self::One { least, nulls, .. }, Some(n)) = (&*self, args.get(2)) {
+        if let (Self::One { least, nulls, called, .. }, Some(n)) = (&*self, args.get(2)) {
             let (least, nulls) = (*least, *nulls);
             if skipped(nulls, arg, by) {
                 return Ok(());
             }
-            let capacity = capacity(n)?;
+            let capacity = capacity(n, called)?;
             *self = Self::Many { heap: Vec::new(), capacity, least, nulls };
         }
         match self {
-            Self::One { set, arg: held, by: kept, least, nulls } => {
+            Self::One { set, arg: held, by: kept, least, nulls, .. } => {
                 if skipped(*nulls, arg, by) {
                     return Ok(());
                 }
@@ -216,9 +223,8 @@ fn skipped(nulls: Nulls, arg: &Value, by: &Value) -> bool {
 }
 
 /// The `n` of the list form, checked the way the pin checks it.
-fn capacity(n: &Value) -> Result<usize> {
-    let invalid =
-        |why: &str| Error::invalid_input(format!("Invalid input for arg_min/arg_max: {why}"));
+fn capacity(n: &Value, called: &str) -> Result<usize> {
+    let invalid = |why: &str| Error::invalid_input(format!("Invalid input for {called}: {why}"));
     if n.is_null() {
         return Err(invalid("n value cannot be NULL"));
     }

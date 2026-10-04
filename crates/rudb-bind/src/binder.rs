@@ -4209,9 +4209,9 @@ impl<'a> Binder<'a> {
         if resolved.name == "lttb" {
             self.lttb_points(cast[2])?;
         }
+        let called = top_values(resolved.name, &mut cast);
         let given = cast.len();
-        let (mut name, order) =
-            self.ordered_aggregate(resolved.name, sorted, &keys, &mut cast, exporting);
+        let (mut name, order) = self.ordered_aggregate(called, sorted, &keys, &mut cast, exporting);
         let mut ty = resolved.returns;
         // An exported state is typed with the call it came from, so that `finalize` and `combine`
         // know what to read it back into, and the name says so, which keeps the executor's paths
@@ -4435,8 +4435,22 @@ impl<'a> Binder<'a> {
         args: &mut Vec<ExprRef>,
         exporting: bool,
     ) -> (String, Vec<StateKey>) {
-        const DEPENDS_ON_ORDER: &[&str] =
-            &["list", "first", "last", "any_value", "string_agg", "lttb"];
+        // The `arg_min` family keeps the row that came first of two that tie, so the order the rows
+        // come in decides which one it answers.
+        const DEPENDS_ON_ORDER: &[&str] = &[
+            "list",
+            "first",
+            "last",
+            "any_value",
+            "string_agg",
+            "lttb",
+            "arg_min",
+            "arg_max",
+            "arg_min_null",
+            "arg_max_null",
+            "arg_min_nulls_last",
+            "arg_max_nulls_last",
+        ];
         if !exporting && !DEPENDS_ON_ORDER.contains(&name) {
             return (name.to_string(), Vec::new());
         }
@@ -4626,9 +4640,10 @@ impl<'a> Binder<'a> {
         if resolved.name == "lttb" {
             self.lttb_points(cast[2])?;
         }
+        let name = top_values(resolved.name, &mut cast);
         let args = self.plan.add_expr_list(&cast);
         let order = self.plan.add_sort_keys(&parts.inner);
-        let name = self.plan.intern(resolved.name);
+        let name = self.plan.intern(name);
         let ty = resolved.returns;
         let call = self.plan.add_expr(
             Expr::Window { name, args, distinct, filter, ignore_nulls, order },
@@ -5194,6 +5209,23 @@ fn window_signature(name: &str, types: &[LogicalType]) -> Result<Resolved> {
         }
         None => Err(Error::catalog(format!("Aggregate Function with name {name} does not exist!"))),
     }
+}
+
+/// The name the executor knows a call by, which is the name it was resolved to except for
+/// `min(x, n)` and `max(x, n)`.
+///
+/// Those two are the pin's `arg_min(x, x, n)` and `arg_max(x, x, n)` with their own words for a bad
+/// `n`, so the value goes in twice and the call goes to the executor under a name of its own,
+/// because every path there that knows `max` knows it as one value over one argument.
+fn top_values<'a>(name: &'a str, args: &mut Vec<ExprRef>) -> &'a str {
+    let top = match name {
+        "min" => "min_top",
+        "max" => "max_top",
+        _ => return name,
+    };
+    let &[value, n] = &args[..] else { return name };
+    *args = vec![value, value, n];
+    top
 }
 
 /// Structural equality over two expressions of one plan.
