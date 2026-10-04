@@ -10,7 +10,7 @@ Holding every cascade page packed was tried with note 106 and left out. It made 
 
 ## The change
 
-`integer::strided` says whether a chunk is a stride, from its tag. The native reader asks it of a codec 5 page after the cascade decodes it, and holds a stride packed over the range of its values and anything else flat as before. `l_quantity` is held in 13 bits a row, under 10 MB at SF1, and the packed filter kernels of notes 102 and 106 take it. `l_orderkey` and the other delta pages stay flat.
+`integer::is_strided` says whether a chunk is a stride, from its tag. The native reader asks it of a codec 5 page after the cascade decodes it, and holds a stride packed over the range of its values and anything else flat as before. `l_quantity` is held in 13 bits a row, under 10 MB at SF1, and the packed filter kernels of notes 102 and 106 take it. `l_orderkey` and the other delta pages stay flat.
 
 The rule is about the shape of the values rather than about a query. A stride is a narrow range of codes that decodes to a wide range of values, so flat costs it the most against packed. A delta is a sorted column, which is a key, which is grouped and joined on, and those paths are fastest flat.
 

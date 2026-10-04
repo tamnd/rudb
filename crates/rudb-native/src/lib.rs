@@ -15101,7 +15101,7 @@ fn decode(
         // bits a row and the packed filter kernels take it. Anything else stays flat, because
         // `l_orderkey` is a delta and the grouping by runs over it was four times slower on q18
         // packed. See spec/perf/107-a-stride-held-packed.md.
-        let held = if integer::strided(tail) { flat.bit_packed()? } else { flat };
+        let held = if integer::is_strided(tail) { flat.bit_packed()? } else { flat };
         return Ok(held.with_validity(validity));
     }
     if codec == 2 {
