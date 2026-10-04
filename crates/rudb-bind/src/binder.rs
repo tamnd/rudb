@@ -467,6 +467,27 @@ pub(crate) struct Binder<'a> {
     next_cte: u32,
     /// When this statement started, read once and kept, which is what `now()` folds to.
     started: Option<i64>,
+    /// The join sides being held so they run once, as their definitions, innermost last.
+    ///
+    /// See [`Binder::bind_held_side`]. Each is wrapped around the join that held it once the join is
+    /// bound.
+    held: Vec<HeldSide>,
+    /// The written sources that are held, with what a read of one is, so binding the same source
+    /// again reads what was held rather than running the source a second time.
+    held_sources: Vec<(ast::SourceRef, HeldSide, Scope)>,
+}
+
+/// One side of a join that is materialised so it runs once.
+#[derive(Debug, Clone, Copy)]
+struct HeldSide {
+    /// The side, projected onto the columns its scope has.
+    definition: NodeRef,
+    /// The number its reads are paired with.
+    cte: u32,
+    /// The name the printer shows.
+    name: rudb_plan::StrRef,
+    /// The held columns, into the field pool.
+    columns: rudb_plan::Slice,
 }
 
 impl<'a> Binder<'a> {
@@ -523,6 +544,8 @@ impl<'a> Binder<'a> {
             materialized: Vec::new(),
             next_cte: 0,
             started: None,
+            held: Vec::new(),
+            held_sources: Vec::new(),
         }
     }
 
@@ -3839,10 +3862,12 @@ impl<'a> Binder<'a> {
     ///
     /// That rewrite is only the same query for an inner join. An inner join keeps the pairs its
     /// condition holds and drops the rest, which is what a product and a filter do. Every other kind
-    /// does something with the pairs it dropped, a left join pads them, a semi join counts them, and
-    /// a filter above a product has already thrown away which left row a dropped pair came from, so
-    /// those are refused by name. Upstream plans them as a pair dependent join and rudb does not
-    /// have one yet, which is what tamnd/rudb#913 stays open for.
+    /// does something with the pairs it dropped, a left join pads them and a semi join asks whether
+    /// there were any, and a filter above a product has already thrown away which left row a
+    /// dropped pair came from. So those kinds become a lateral instead: each row of the side that
+    /// is kept is an outer row, and the other side filtered by the condition is what is evaluated
+    /// for it. A full join keeps both sides and is built from two of these, in
+    /// [`Binder::bind_full_pair_join`].
     ///
     /// The product is not the plan that runs. The condition goes back into the join as a condition
     /// when filter pushdown looks at it, which is the pass that already turns a filter over an inner
@@ -3854,16 +3879,17 @@ impl<'a> Binder<'a> {
         &mut self,
         kind: ast::JoinKind,
         independent: bool,
+        split: usize,
         left: NodeRef,
         right: NodeRef,
         pair: Vec<PendingSubquery>,
         conditions: Vec<ExprRef>,
         scope: Scope,
     ) -> Result<(NodeRef, Scope)> {
-        if kind != ast::JoinKind::Inner {
+        if kind == ast::JoinKind::Full {
             return Err(Error::not_implemented(
-                "a subquery that reads both sides of that join, written in the condition of a join \
-                 that is not an inner join"
+                "a subquery that reads both sides of that join, written in the condition of a full \
+                 join"
                     .to_string(),
             ));
         }
@@ -3876,10 +3902,6 @@ impl<'a> Binder<'a> {
                     .to_string(),
             ));
         }
-        let mut node = self.add_node(Node::CrossProduct { left, right });
-        for pending in pair {
-            node = self.attach_subquery(node, pending);
-        }
         // `ON` and `USING` cannot both be written, and this is only reached from the `ON` path, so
         // the list is the one bound condition. The fold is here so that it stays right if that stops
         // being true rather than for a case that exists today.
@@ -3890,10 +3912,119 @@ impl<'a> Binder<'a> {
             let conjunction = Expr::Conjunction { op: ConjunctionOp::And, children };
             predicate = self.plan.add_expr(conjunction, LogicalType::Boolean);
         }
+        if kind != ast::JoinKind::Inner {
+            // The rows of the side a left join keeps whole are the outer rows of a lateral, and the
+            // other side filtered by the condition is what is evaluated for each of them, which is
+            // how the pin plans it too. A right join is the same with the sides the other way
+            // round, and the order the two come out in does not matter because every column is
+            // read through its binding. A semi or an anti join asks whether that filtered side has
+            // a row at all.
+            let (kept, other) =
+                if kind == ast::JoinKind::Right { (right, left) } else { (left, right) };
+            let mut node = other;
+            for pending in pair {
+                node = self.attach_subquery(node, pending);
+            }
+            let node = self.add_node(Node::Filter { input: node, predicate });
+            // The filtered side is a relation of its own under a projection, the way a lateral
+            // subquery would be written, and its columns are read from there. A semi or an anti
+            // join reads none of them, so it keeps one constant.
+            let index = self.fresh_index();
+            let mut scope = scope;
+            let others = match kind {
+                ast::JoinKind::Right => 0..split,
+                ast::JoinKind::Left => split..scope.len(),
+                _ => 0..0,
+            };
+            let mut exprs = Vec::with_capacity(others.len().max(1));
+            let mut names = Vec::with_capacity(others.len().max(1));
+            for (at, column) in scope.columns[others].iter_mut().enumerate() {
+                exprs.push(self.plan.add_expr(Expr::Column(column.binding), column.ty.clone()));
+                names.push(self.plan.intern(&column.name));
+                column.binding = ColumnBinding::new(index, at as u32);
+            }
+            if exprs.is_empty() {
+                let yes = self.plan.add_value(Value::Boolean(true));
+                exprs.push(self.plan.add_expr(Expr::Constant(yes), LogicalType::Boolean));
+                names.push(self.plan.intern("exists"));
+            }
+            let exprs = self.plan.add_expr_list(&exprs);
+            let names = self.plan.add_name_list(&names);
+            let node = self.add_node(Node::Project { input: node, index, exprs, names });
+            let kind = match kind {
+                ast::JoinKind::Semi => JoinKind::Semi,
+                ast::JoinKind::Anti => JoinKind::Anti,
+                _ => JoinKind::Left,
+            };
+            let conditions = self.plan.add_expr_list(&[]);
+            let node =
+                self.add_node(Node::DependentJoin { left: kept, right: node, kind, conditions });
+            return Ok((node, scope));
+        }
+        let mut node = self.add_node(Node::CrossProduct { left, right });
+        for pending in pair {
+            node = self.attach_subquery(node, pending);
+        }
         let node = self.add_node(Node::Filter { input: node, predicate });
         Ok((node, scope))
     }
 
+    /// A full join whose condition holds a query that reads rows from both of its inputs.
+    ///
+    /// A full join is the left join with the same condition and then the rows of the right side
+    /// that no left row matched, padded with nulls on the left, and that is how this builds it.
+    /// Each half is bound again from what was written, the first as a left join and the second as
+    /// an anti join with the two sides the other way round, so both take the lateral plan in
+    /// [`Binder::bind_pair_dependent_join`], and a `UNION ALL` puts them together. The scope is the
+    /// one the full join was bound with, read from the union.
+    fn bind_full_pair_join(
+        &mut self,
+        ast: &Ast,
+        left: ast::SourceRef,
+        right: ast::SourceRef,
+        on: ast::ExprRef,
+        scope: Scope,
+    ) -> Result<(NodeRef, Scope)> {
+        let none = ast::Slice::default();
+        let (matched, matched_scope) =
+            self.bind_join(ast, left, right, ast::JoinKind::Left, false, on, none)?;
+        let (lone, lone_scope) =
+            self.bind_join(ast, right, left, ast::JoinKind::Anti, false, on, none)?;
+        let split = matched_scope.len() - lone_scope.len();
+        let mut kept = Vec::with_capacity(matched_scope.len());
+        let mut padded = Vec::with_capacity(matched_scope.len());
+        let mut names = Vec::with_capacity(matched_scope.len());
+        for (at, column) in matched_scope.columns.iter().enumerate() {
+            kept.push(self.plan.add_expr(Expr::Column(column.binding), column.ty.clone()));
+            padded.push(if at < split {
+                let null = self.plan.add_value(Value::Null);
+                self.plan.add_expr(Expr::Constant(null), column.ty.clone())
+            } else {
+                let column = &lone_scope.columns[at - split];
+                self.plan.add_expr(Expr::Column(column.binding), column.ty.clone())
+            });
+            names.push(self.plan.intern(&column.name));
+        }
+        let names = self.plan.add_name_list(&names);
+        let mut sides = [matched, lone];
+        for (side, exprs) in sides.iter_mut().zip([kept, padded]) {
+            let index = self.fresh_index();
+            let exprs = self.plan.add_expr_list(&exprs);
+            *side = self.add_node(Node::Project { input: *side, index, exprs, names });
+        }
+        let index = self.fresh_index();
+        let [left, right] = sides;
+        let node =
+            self.add_node(Node::SetOp { left, right, kind: SetOpKind::Union, all: true, index });
+        let mut scope = scope;
+        for (at, column) in scope.columns.iter_mut().enumerate() {
+            column.binding = ColumnBinding::new(index, at as u32);
+            column.not_null = false;
+        }
+        Ok((node, scope))
+    }
+
+    /// A join, with any side it held wrapped around it, see [`Binder::bind_held_side`].
     #[allow(clippy::too_many_arguments)]
     fn bind_join(
         &mut self,
@@ -3905,8 +4036,111 @@ impl<'a> Binder<'a> {
         on: ast::ExprRef,
         using: ast::Slice,
     ) -> Result<(NodeRef, Scope)> {
-        let (left_node, left_scope) = self.bind_source(ast, left)?;
-        let (right_node, right_scope, correlated) = self.bind_lateral(ast, right, &left_scope)?;
+        let held = self.held.len();
+        let sources = self.held_sources.len();
+        let result = self.bind_join_inner(ast, left, right, kind, natural, on, using);
+        self.held_sources.truncate(sources);
+        let definitions = self.held.split_off(held);
+        let (mut node, scope) = result?;
+        for side in definitions.into_iter().rev() {
+            let HeldSide { definition, cte, name, columns } = side;
+            node =
+                self.add_node(Node::MaterializedCte { definition, body: node, name, cte, columns });
+        }
+        Ok((node, scope))
+    }
+
+    /// One side of a join whose condition has a subquery in it, held when it has to run once.
+    ///
+    /// A subquery that reads both sides of a join that is not inner is lowered into a plan that
+    /// reads a side more than once: the rows it keeps and the values the subquery is asked about
+    /// come from two reads of it, and a full join reads both sides twice more. That is the same
+    /// answer as one read only while the side gives the same rows every time, and a side with
+    /// `nextval` or `random()` in it does not. The pin holds such a side in a CTE, so `nextval` is
+    /// called once per row and the rows the subquery sees are the rows that come out. This does
+    /// the same, and a full join, which binds its sides again for each half, reads the one that
+    /// was held here rather than binding a second one.
+    fn bind_held_side(
+        &mut self,
+        source: ast::SourceRef,
+        bound: Option<(NodeRef, Scope)>,
+    ) -> Option<(NodeRef, Scope)> {
+        let (side, scope) = match bound {
+            Some((node, scope)) => {
+                if !volatile_node(&self.plan, node) {
+                    return Some((node, scope));
+                }
+                let mut exprs = Vec::with_capacity(scope.len());
+                let mut names = Vec::with_capacity(scope.len());
+                for column in &scope.columns {
+                    exprs.push(self.plan.add_expr(Expr::Column(column.binding), column.ty.clone()));
+                    names.push(self.plan.intern(&column.name));
+                }
+                let index = self.fresh_index();
+                let exprs = self.plan.add_expr_list(&exprs);
+                let names = self.plan.add_name_list(&names);
+                let definition = self.add_node(Node::Project { input: node, index, exprs, names });
+                let cte = self.next_cte;
+                self.next_cte += 1;
+                let name = self.plan.intern("pair_side");
+                let columns = self.plan.add_fields(&scope.fields());
+                let side = HeldSide { definition, cte, name, columns };
+                self.held.push(side);
+                self.held_sources.push((source, side, scope.clone()));
+                (side, scope)
+            }
+            None => {
+                let (_, side, scope) =
+                    self.held_sources.iter().find(|(held, ..)| *held == source)?.clone();
+                (side, scope)
+            }
+        };
+        let index = self.fresh_index();
+        let HeldSide { cte, name, columns, .. } = side;
+        let node = self.add_node(Node::CteScan { index, cte, name, columns });
+        let mut scope = scope;
+        for (at, column) in scope.columns.iter_mut().enumerate() {
+            column.binding = ColumnBinding::new(index, at as u32);
+        }
+        Some((node, scope))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_join_inner(
+        &mut self,
+        ast: &Ast,
+        left: ast::SourceRef,
+        right: ast::SourceRef,
+        kind: ast::JoinKind,
+        natural: bool,
+        on: ast::ExprRef,
+        using: ast::Slice,
+    ) -> Result<(NodeRef, Scope)> {
+        let hold = !matches!(kind, ast::JoinKind::Inner | ast::JoinKind::Cross)
+            && on != NONE
+            && crate::columns::has_subquery(ast, on);
+        let (left_node, left_scope) = match hold.then(|| self.bind_held_side(left, None)).flatten()
+        {
+            Some(held) => held,
+            None => {
+                let bound = self.bind_source(ast, left)?;
+                if hold { self.bind_held_side(left, Some(bound)).expect("bound") } else { bound }
+            }
+        };
+        let (right_node, right_scope, correlated) =
+            match hold.then(|| self.bind_held_side(right, None)).flatten() {
+                Some((node, scope)) => (node, scope, Vec::new()),
+                None => {
+                    let (node, scope, correlated) = self.bind_lateral(ast, right, &left_scope)?;
+                    if hold && correlated.is_empty() {
+                        let (node, scope) =
+                            self.bind_held_side(right, Some((node, scope))).expect("bound");
+                        (node, scope, correlated)
+                    } else {
+                        (node, scope, correlated)
+                    }
+                }
+            };
         // A row of the right side exists only for the left row it was evaluated against, so a kind
         // that has to produce right rows with no left row has nothing to produce them from. The
         // pinned build says this and names only the two kinds that work.
@@ -4046,10 +4280,25 @@ impl<'a> Binder<'a> {
         if kind == ast::JoinKind::Cross && !conditions.is_empty() {
             return Err(Error::binder("a CROSS JOIN cannot have a condition"));
         }
+        // A semi join and an anti join ask a question about the right side rather than producing
+        // any of it, so what is in scope after one is the left side alone. The condition is bound
+        // above and is the last thing that can name the right side. Without this, `SELECT *` over
+        // one expanded to both sides and the projection asked a join whose output is the left side
+        // for columns it does not have, which came out as an internal error about a column not
+        // being in the schema. That is tamnd/rudb#847. The reference binary refuses `b.w` here with
+        // a binder error naming `a` as the only candidate table, which is the same rule said from
+        // the other end.
+        if matches!(kind, ast::JoinKind::Semi | ast::JoinKind::Anti) {
+            scope.truncate(split);
+        }
+        if !pair.is_empty() && kind == ast::JoinKind::Full && correlated.is_empty() {
+            return self.bind_full_pair_join(ast, left, right, on, scope);
+        }
         if !pair.is_empty() {
             return self.bind_pair_dependent_join(
                 kind,
                 correlated.is_empty(),
+                split,
                 left_node,
                 right_node,
                 pair,
@@ -4066,17 +4315,6 @@ impl<'a> Binder<'a> {
         {
             let node = self.add_node(Node::CrossProduct { left: left_node, right: right_node });
             return Ok((node, scope));
-        }
-        // A semi join and an anti join ask a question about the right side rather than producing
-        // any of it, so what is in scope after one is the left side alone. The condition is bound
-        // above and is the last thing that can name the right side. Without this, `SELECT *` over
-        // one expanded to both sides and the projection asked a join whose output is the left side
-        // for columns it does not have, which came out as an internal error about a column not
-        // being in the schema. That is tamnd/rudb#847. The reference binary refuses `b.w` here with
-        // a binder error naming `a` as the only candidate table, which is the same rule said from
-        // the other end.
-        if matches!(kind, ast::JoinKind::Semi | ast::JoinKind::Anti) {
-            scope.truncate(split);
         }
         let kind = match kind {
             ast::JoinKind::Inner | ast::JoinKind::Cross => JoinKind::Inner,
@@ -5554,4 +5792,23 @@ fn groups_everything(ast: &Ast, select: &ast::Select) -> Result<bool> {
         return Err(Error::binder("STAR expression is not supported here"));
     }
     Ok(select.group_by_all || alone)
+}
+
+/// Whether anything under `node` calls a function that answers differently each time.
+///
+/// It looks at the expressions a side of a join is written with, which is a projection, a filter,
+/// a grouping, a list of rows, a table function's arguments or a join's condition, and at
+/// everything under those. See [`Binder::bind_held_side`].
+fn volatile_node(plan: &Plan, node: NodeRef) -> bool {
+    let any = |slice| plan.expr_list(slice).iter().any(|&expr| crate::expr::volatile(plan, expr));
+    let here = match *plan.node(node) {
+        Node::Project { exprs, .. } => any(exprs),
+        Node::Filter { predicate, .. } => crate::expr::volatile(plan, predicate),
+        Node::Aggregate { groups, aggregates, .. } => any(groups) || any(aggregates),
+        Node::Values { rows, .. } => plan.row_list(rows).iter().any(|&row| any(row)),
+        Node::TableFunction { args, .. } => any(args),
+        Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => any(conditions),
+        _ => false,
+    };
+    here || plan.node(node).children().into_iter().flatten().any(|child| volatile_node(plan, child))
 }

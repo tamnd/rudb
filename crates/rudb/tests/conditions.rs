@@ -189,35 +189,31 @@ fn an_equality_beside_a_query_that_reads_both_sides_is_still_a_join_condition() 
     assert!(!plan.contains("CrossProduct"), "{plan}");
 }
 
-/// A query that reads both sides is still refused over a join that is not an inner one.
+/// A query that reads both sides of a join that is not an inner one.
 ///
 /// A left join pads the pairs its condition dropped, and a filter above a product has already
 /// thrown away which left row a dropped pair came from, so the rewrite the inner join gets is not
-/// this query. Upstream plans it as a pair dependent join, which rudb does not have, and #913 stays
-/// open for it.
+/// this query. It is planned per left row instead, with the query and the right side under it,
+/// which is tamnd/rudb#913.
 #[test]
-fn a_query_that_reads_both_sides_of_an_outer_join_is_refused_by_name() {
+fn a_query_that_reads_both_sides_of_an_outer_join_answers() {
     let database = tables();
-    let error = database
-        .query(
-            "SELECT l.a, r.b FROM pair_l l LEFT JOIN pair_r r \
-             ON EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b)",
-        )
-        .expect_err("the pair dependent shape has no plan");
-    let text = error.to_string();
-    assert!(text.contains("Not implemented"), "{text}");
-    assert!(text.contains("reads both sides of that join"), "{text}");
+    let answer = rows(
+        &database,
+        "SELECT l.a, r.b FROM pair_l l LEFT JOIN pair_r r \
+         ON EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b)",
+    );
+    assert_eq!(answer, ["1|10", "1|10", "1|20", "1|20", "2|20", "3|NULL"]);
 }
 
-/// The same refusal through an `IN`, where it is the comparison and not the body that reads a side.
+/// The same through an `IN`, where it is the comparison and not the body that reads a side.
 #[test]
-fn an_in_query_split_across_both_sides_of_an_outer_join_is_refused_by_name() {
+fn an_in_query_split_across_both_sides_of_an_outer_join_answers() {
     let database = tables();
-    let error = database
-        .query(
-            "SELECT l.a, r.b FROM pair_l l LEFT JOIN pair_r r \
-             ON l.a IN (SELECT s.a FROM pair_s s WHERE s.b = r.b)",
-        )
-        .expect_err("the pair dependent shape has no plan");
-    assert!(error.to_string().contains("reads both sides of that join"), "{error}");
+    let answer = rows(
+        &database,
+        "SELECT l.a, r.b FROM pair_l l LEFT JOIN pair_r r \
+         ON l.a IN (SELECT s.a FROM pair_s s WHERE s.b = r.b)",
+    );
+    assert_eq!(answer, ["1|10", "1|10", "1|20", "1|20", "2|20", "3|NULL"]);
 }
