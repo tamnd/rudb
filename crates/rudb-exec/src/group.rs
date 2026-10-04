@@ -8527,8 +8527,8 @@ mod tests {
         Distinct, EncodedCountRecord, EncodedCountRun, EncodedCountRuns, EncodedValid,
         FixedPartition, FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS,
         RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
-        bigint_distinct_partition, cut_runs, drop_unkept, encoded_count_partition, first_kept,
-        closed_runs, fixed_partition, interior, packed_run_totals, run_total, slot_runs_of,
+        bigint_distinct_partition, closed_runs, cut_runs, drop_unkept, encoded_count_partition,
+        first_kept, fixed_partition, interior, packed_run_totals, run_total, slot_runs_of,
         spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
