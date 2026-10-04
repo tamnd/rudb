@@ -3185,9 +3185,9 @@ impl Vector {
     /// not.
     ///
     /// `false`, with `out` left empty, for a vector this cannot hand over as a block: `HUGEINT` and
-    /// the wide decimals, whose values do not fit an `i64`, the string and nested forms, the
-    /// compressed form, and the run form. A caller that gets `false` reads the vector the way it
-    /// read it before, with [`Self::signed_at`].
+    /// the wide decimals, whose values do not fit an `i64`, the string and nested forms, and the
+    /// compressed form. A caller that gets `false` reads the vector the way it read it before, with
+    /// [`Self::signed_at`].
     ///
     /// A dictionary is read as its entries widened once and then a gather through the codes. That
     /// is the form a Parquet integer column arrives in, because DuckDB writes most of them with a
@@ -3263,13 +3263,21 @@ impl Vector {
                     );
                     return true;
                 }
-                let mut entries = Vec::new();
-                if !values.none_null() || !values.signed_block(&mut entries) {
-                    return false;
-                }
                 let Some(codes) = codes.get(..self.len) else {
                     return false;
                 };
+                if !values.none_null() {
+                    return false;
+                }
+                // A filter's selection over a part is a dictionary over the whole part, so widening
+                // every entry first was a pass over the part per chunk where the codes are a chunk.
+                if let Body::Flat(data) = &values.body {
+                    return data.signed_gather(values.len, codes, out);
+                }
+                let mut entries = Vec::new();
+                if !values.signed_block(&mut entries) {
+                    return false;
+                }
                 out.reserve(codes.len());
                 for &code in codes {
                     match entries.get(code as usize) {
@@ -3282,9 +3290,32 @@ impl Vector {
                 }
                 true
             }
-            Body::Runs { .. }
-            | Body::Gathered { .. }
-            | Body::Coded { .. }
+            // A run's value once per run, laid out as many times as the run is long. A cut has
+            // only the runs it touches, so the values are few and widening them all is cheap.
+            Body::Runs { ends, values } => {
+                let mut entries = Vec::new();
+                if !values.none_null() || !values.signed_block(&mut entries) {
+                    return false;
+                }
+                out.reserve(self.len);
+                for (&stop, &entry) in ends.iter().zip(&entries) {
+                    out.resize((stop as usize).min(self.len).max(out.len()), entry);
+                }
+                if out.len() < self.len {
+                    out.clear();
+                    return false;
+                }
+                true
+            }
+            // The ids of a link join over a flat column, read through. An id with no row behind it
+            // is past the end of any column, so a gather with one in it says `false` here.
+            Body::Gathered { source, rids, offset } => match (&source.body, rids.get(*offset..)) {
+                (Body::Flat(data), Some(rids)) if source.none_null() && rids.len() >= self.len => {
+                    data.signed_gather(source.len, &rids[..self.len], out)
+                }
+                _ => false,
+            },
+            Body::Coded { .. }
             | Body::Views { .. }
             | Body::ExternalText { .. }
             | Body::Nested { .. }
@@ -7406,6 +7437,28 @@ mod tests {
         assert_eq!(out, [100, 115, 115, 100 + 5 * 8191]);
     }
 
+    /// A run is laid out as many times as it is long, a cut of runs starts at its own row zero, and
+    /// the ids of a link join read through to the column under them.
+    #[test]
+    fn a_block_lays_out_runs_and_reads_through_a_gather() {
+        let mut out = Vec::new();
+        let runs = Vector::runs(vec![2, 5], integers(&[4, 9])).unwrap();
+        assert!(runs.signed_block(&mut out));
+        assert_eq!(out, [4, 4, 9, 9, 9]);
+        assert!(runs.slice(1, 3).unwrap().signed_block(&mut out));
+        assert_eq!(out, [4, 9, 9]);
+        let source = Arc::new(integers(&[7, 8, 9]));
+        let gathered = Vector::gathered(Arc::clone(&source), Arc::new(vec![2, 0, 2])).unwrap();
+        assert!(gathered.signed_block(&mut out));
+        assert_eq!(out, [9, 7, 9]);
+        let missing = Vector::gathered(source, Arc::new(vec![1, NO_ROW])).unwrap();
+        assert!(!missing.signed_block(&mut out), "a row with nothing behind it is a null");
+        assert!(out.is_empty());
+        let picked = Vector::dictionary(vec![2, 2, 0], integers(&[5, 6, 7])).unwrap();
+        assert!(picked.signed_block(&mut out));
+        assert_eq!(out, [7, 7, 5]);
+    }
+
     /// What the block form will not answer for, where the caller reads the vector a row at a time
     /// instead. A null is not one of them: it writes whatever sits under it and the caller reads the
     /// null from the column.
@@ -7418,7 +7471,6 @@ mod tests {
             !Vector::dictionary(vec![1, 0], nulled).unwrap().signed_block(&mut out),
             "a dictionary with a null entry would hand its row over as a number"
         );
-        assert!(!Vector::runs(vec![2, 5], integers(&[4, 9])).unwrap().signed_block(&mut out));
         let wide = Vector::flat(LogicalType::HugeInt, Data::Int128(vec![1, 2].into())).unwrap();
         assert!(!wide.signed_block(&mut out), "a hugeint does not fit sixty four bits");
         let double = Vector::flat(LogicalType::Double, Data::Float64(vec![1.5].into())).unwrap();
