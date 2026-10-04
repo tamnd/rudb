@@ -326,6 +326,13 @@ impl Binder<'_> {
             }
             picked.push(Picked { column: column.clone(), replacement, name });
         }
+        // The copy of a `USING` column a bare star leaves out can still be named in its list, and
+        // on the pin `* EXCLUDE (b.k)` over `a JOIN b USING (k)` is no error and keeps `k`.
+        for (at, parts) in excluded.iter().enumerate() {
+            if input.columns.iter().any(|column| column.hidden && names_column(parts, column)) {
+                excluded_used[at] = true;
+            }
+        }
         if let Some(at) = excluded_used.iter().position(|used| !used) {
             let place = match &table {
                 Some(table) => table.clone(),
