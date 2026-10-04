@@ -4006,6 +4006,22 @@ enum Contribution {
 
 /// Reads a vector once, whichever form it is in.
 fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<Contribution> {
+    // A string extreme is decided on the bytes, which the loops below have no arm for, and the row
+    // at a time path built a value per row. JOB 16b folds `MIN(name)` over the rows a join kept, a
+    // selection over a column of strings in memory, and that was a fifth of the query.
+    if let Want::Extreme(least) = want
+        && matches!(input.logical_type(), LogicalType::Varchar | LogicalType::Blob)
+        && matches!(input.form(), Form::Flat | Form::Dictionary)
+    {
+        let won = match input.dictionary_parts() {
+            Some((codes, values)) => extreme_bytes(values, codes.get(..rows)?, nulls, least),
+            None => {
+                let at: Vec<u32> = (0..u32::try_from(rows).ok()?).collect();
+                extreme_bytes(input, &at, nulls, least)
+            }
+        };
+        return won.map(Contribution::Extreme);
+    }
     match input.form() {
         Form::Flat => {
             let data = input.data()?;
@@ -4649,6 +4665,37 @@ pub use export::{EXPORTED, finalize_name, ordered_layout, state_constants, state
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `MIN` or a `MAX` over strings in memory, flat or picked out by a selection, is decided on
+    /// the bytes and never takes the row at a time path.
+    #[test]
+    fn a_string_extreme_over_a_selection_is_decided_on_the_bytes() {
+        let words = Vector::from_values(
+            LogicalType::Varchar,
+            &[
+                Value::Varchar("pear".into()),
+                Value::Varchar("apple".into()),
+                Value::Null,
+                Value::Varchar("zebra".into()),
+            ],
+        )
+        .expect("a column of strings");
+        let picked = Vector::dictionary(vec![0, 3, 2, 0], words.clone()).expect("a selection");
+        for (name, column, rows, answer) in [
+            ("min", &words, 4, "apple"),
+            ("max", &words, 4, "zebra"),
+            ("min", &picked, 4, "pear"),
+            ("max", &picked, 3, "zebra"),
+            ("min", &picked, 1, "pear"),
+        ] {
+            fallback::reset();
+            let mut state = Accumulator::new(name, &LogicalType::Varchar).expect("known");
+            state.update_run(std::slice::from_ref(column), rows).expect("folds them in");
+            assert_eq!(state.finish().expect("finishes"), Value::Varchar(answer.into()));
+            let form = column.form();
+            assert_eq!(fallback::count(Kernel::Aggregate, form, form), 0, "{name} went row by row");
+        }
+    }
 
     #[test]
     fn a_grouped_accumulator_does_not_carry_a_full_logical_type() {
