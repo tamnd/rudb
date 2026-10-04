@@ -5529,32 +5529,46 @@ fn integers(flat: &Vector, rows: usize) -> Option<Cow<'_, [i64]>> {
 ///
 /// It is one pass over the key for both. [`interior`] read the key to check its order and find the
 /// ends, and then the starts were found in a second pass between them, and on TPC-H q18 the two were
-/// a sixth of the query once its runs were added up from codes. Here [`rudb_vector::runs`] finds the
-/// starts and checks the order in the same pass, four rows at a time for a 64 bit key.
+/// about a tenth of the query once its runs were added up from codes. Here the rows are compared
+/// sixty four at a time into a word with a bit for each row whose key differs from the row before
+/// it, the order is checked in the same loop, and the starts are read out of the set bits, which
+/// needs no branch a row on a run of four.
 ///
 /// A packed key is unpacked once into a buffer the thread keeps and read like a flat one, because
 /// a code is the value less the frame's base and so codes are in the order the values are.
 fn closed_runs(key: &Vector, rows: usize, grouped: bool) -> Option<(Vec<u32>, usize)> {
-    /// Every start but the first run's, and the last of them is where the last run starts.
-    fn closed(rows: usize, walk: impl FnOnce(&mut Vec<u32>) -> bool) -> Option<(Vec<u32>, usize)> {
-        let mut starts = Vec::with_capacity(rows / 2 + 1);
-        if !walk(&mut starts) {
-            return None;
+    fn starts<T: PartialOrd>(values: &[T], grouped: bool) -> Option<(Vec<u32>, usize)> {
+        let mut starts = Vec::with_capacity(values.len() / 2 + 1);
+        let mut row = 1;
+        while row < values.len() {
+            let end = (row + 64).min(values.len());
+            let (before, after) = (&values[row - 1..end - 1], &values[row..end]);
+            let (mut mask, mut down) = (0_u64, false);
+            for (at, (a, b)) in before.iter().zip(after).enumerate() {
+                mask |= u64::from(a != b) << at;
+                down |= b < a;
+            }
+            if down && !grouped {
+                return None;
+            }
+            while mask != 0 {
+                starts.push((row + mask.trailing_zeros() as usize) as u32);
+                mask &= mask - 1;
+            }
+            row = end;
         }
+        // Every start but the first run's, and the last of them is where the last run starts.
         let to = starts.pop()? as usize;
         (!starts.is_empty()).then_some((starts, to))
     }
     macro_rules! flat {
-        ($values:expr, $walk:path) => {{
+        ($values:expr) => {{
             let values = $values.as_slice();
             if values.len() < rows {
                 return None;
             }
-            closed(rows, |starts| $walk(&values[..rows], !grouped, starts))
+            starts(&values[..rows], grouped)
         }};
-        ($values:expr) => {
-            flat!($values, rudb_vector::runs::run_starts)
-        };
     }
     thread_local! {
         static CODES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -5567,14 +5581,14 @@ fn closed_runs(key: &Vector, rows: usize, grouped: bool) -> Option<(Vec<u32>, us
             codes.clear();
             codes.resize(rows, 0);
             packed.unpack(0, codes);
-            closed(rows, |starts| rudb_vector::runs::run_starts(codes, !grouped, starts))
+            starts(codes, grouped)
         });
     }
     match key.data()? {
         Data::Int8(values) => flat!(values),
         Data::Int16(values) => flat!(values),
         Data::Int32(values) => flat!(values),
-        Data::Int64(values) => flat!(values, rudb_vector::runs::run_starts_i64),
+        Data::Int64(values) => flat!(values),
         Data::UInt8(values) => flat!(values),
         Data::UInt16(values) => flat!(values),
         Data::UInt32(values) => flat!(values),
