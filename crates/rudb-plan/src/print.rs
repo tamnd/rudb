@@ -241,6 +241,13 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             write!(out, " @{cte} #{index} ")?;
             write_schema(plan, out, columns)
         }
+        Node::RecursiveCte { index, cte, name, all, columns, .. } => {
+            out.write_char(' ')?;
+            write_identifier(out, plan.string(name))?;
+            let quantifier = if all { "ALL" } else { "DISTINCT" };
+            write!(out, " @{cte} {quantifier} #{index} ")?;
+            write_schema(plan, out, columns)
+        }
         Node::SetOp { kind, all, index, .. } => {
             let quantifier = if all { "ALL" } else { "DISTINCT" };
             write!(out, " {} {quantifier} #{index}", kind.keyword())

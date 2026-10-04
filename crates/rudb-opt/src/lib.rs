@@ -471,6 +471,7 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         | Node::Fetch { columns, .. }
         | Node::TableFetch { columns, .. }
         | Node::CteScan { columns, .. }
+        | Node::RecursiveCte { columns, .. }
         | Node::Consistent { columns, .. } => plan.field_list(columns).len(),
         Node::Project { exprs, .. } => plan.expr_list(exprs).len(),
         Node::Aggregate { groups, aggregates, .. } => {

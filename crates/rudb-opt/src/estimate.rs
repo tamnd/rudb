@@ -591,6 +591,8 @@ pub fn rows_stat_into(
         // a real answer takes the count being recorded when the definition is walked, which is
         // worth doing when something asks a question this would change the answer to.
         Node::CteScan { .. } => Stat::Unknown,
+        // How many rounds a recursion runs is a property of the data, so nothing here can count it.
+        Node::RecursiveCte { .. } => Stat::Unknown,
         // One row, always, the same as an aggregate with no groups, which is what it stands for.
         Node::Consistent { .. } => Stat::exact(1, Provenance::RowCount),
         Node::SetOp { left, right, kind, all, .. } => {

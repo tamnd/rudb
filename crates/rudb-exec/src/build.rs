@@ -89,6 +89,7 @@ use crate::links::links;
 use crate::percent::{LimitPercent, Portion};
 use crate::prepared::{Prepared, Scratch};
 use crate::query::Query;
+use crate::recursive::Fixpoint;
 use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
@@ -470,8 +471,65 @@ fn build_measured_with_sink<'a>(
     pruning_only: Option<NodeRef>,
     handoffs: Vec<Arc<Sideways<'a>>>,
 ) -> Result<Query<'a>> {
+    build_from(plan, catalog, under, sink, pruning_only, handoffs, plan.root(), Vec::new())
+}
+
+/// One round of a recursive definition: the part of `plan` under `root`, built as a query of its
+/// own whose rows go into `sink`.
+///
+/// `held` is every materialisation the part can read, already filled, with the rows the round
+/// before made last so that a read of the definition's own number finds them first.
+pub(crate) fn build_round<'a>(
+    round: &Round<'a>,
+    report: &Report,
+    held: Vec<(u32, Buffered)>,
+    sink: Arc<dyn DynSink + 'a>,
+) -> Result<Query<'a>> {
+    let under = BuildUnder {
+        cancel: &round.cancel,
+        memory: &round.memory,
+        seams: &round.seams,
+        session: &round.session,
+        report,
+        cutoff: None,
+    };
+    let held = held.into_iter().map(|(cte, chunks)| Held { cte, chunks, filling: None }).collect();
+    let (plan, catalog, top) = (round.plan, round.catalog, round.recursive);
+    build_from(plan, catalog, under, Some(sink), None, Vec::new(), top, held)
+}
+
+/// What a recursive definition needs to build its rounds with, taken from the build of the query
+/// it is in.
+#[derive(Debug)]
+pub(crate) struct Round<'a> {
+    pub(crate) plan: &'a Plan,
+    pub(crate) catalog: &'a Catalog,
+    /// The side that runs once per round.
+    pub(crate) recursive: NodeRef,
+    /// The number its reads of the round before go by.
+    pub(crate) cte: u32,
+    pub(crate) cancel: Cancel,
+    pub(crate) memory: Memory,
+    pub(crate) seams: Settings,
+    pub(crate) session: Session,
+    /// The materialisations outside the definition that it can read, which are filled before it
+    /// starts.
+    pub(crate) outer: Vec<(u32, Buffered)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_from<'a>(
+    plan: &'a Plan,
+    catalog: &'a Catalog,
+    under: BuildUnder<'_>,
+    sink: Option<Arc<dyn DynSink + 'a>>,
+    pruning_only: Option<NodeRef>,
+    handoffs: Vec<Arc<Sideways<'a>>>,
+    top: NodeRef,
+    held: Vec<Held>,
+) -> Result<Query<'a>> {
     let BuildUnder { cancel, memory, seams, session, report, cutoff } = under;
-    let shape = Shape::of(plan);
+    let shape = Shape::under(plan, top);
     for pipeline in shape.all() {
         report.pipeline(pipeline);
         for waits_for in shape.waits_for(pipeline) {
@@ -501,9 +559,9 @@ fn build_measured_with_sink<'a>(
         top_counts: Vec::new(),
         marking: None,
         pruning_only,
-        held: Vec::new(),
+        held,
     };
-    let segment = building.node(plan.root())?;
+    let segment = building.node(top)?;
     let schema = segment.schema.clone();
     // A query whose rows come out of a sort or a top n is already in the order somebody asked for,
     // and holding chunks back to restore the source order would only add latency to an order nobody
@@ -514,7 +572,7 @@ fn build_measured_with_sink<'a>(
         building.close(segment, ROOT, sink);
         None
     } else {
-        let (sink, reader) = if ordered(plan, plan.root()) {
+        let (sink, reader) = if ordered(plan, top) {
             root(BufferId(0), None)
         } else {
             root_in_order(BufferId(0), None)
@@ -2164,8 +2222,9 @@ struct Held {
     cte: u32,
     /// What the definition filled, which every read takes a reader of its own on.
     chunks: Buffered,
-    /// The pipeline that fills it, which every pipeline a read is in has to wait for.
-    filling: PipelineRef,
+    /// The pipeline that fills it, which every pipeline a read is in has to wait for, or none for
+    /// rows that were filled before the query was built.
+    filling: Option<PipelineRef>,
 }
 
 /// Whether this statement asked for a CPU column on every operator's row.
@@ -3596,10 +3655,35 @@ impl<'a> Building<'a, '_> {
                 let (keep, chunks) = Keep::new(memory);
                 let counters = self.watch(reference, id, pipeline, "MaterializedCTE", None);
                 self.close(held, pipeline, Arc::new(Watched::new(keep, counters)));
-                self.held.push(Held { cte, chunks, filling: pipeline });
+                self.held.push(Held { cte, chunks, filling: Some(pipeline) });
                 let segment = self.node(body);
                 self.held.pop();
                 segment?
+            }
+            Node::RecursiveCte { anchor, recursive, index, cte, all, columns, .. } => {
+                // The anchor ends here, and the rounds run in this node's finish, each one a query
+                // of its own built over the rows the round before made. See `crate::recursive`.
+                // The materialisations the rounds can read are filled before the anchor starts,
+                // which is the only waiting the rounds need, since they run inside this pipeline.
+                let mut below = self.node(anchor)?;
+                below.after.extend(self.held.iter().filter_map(|held| held.filling));
+                let schema = Schema::numbered(plan.field_list(columns).to_vec(), index);
+                let round = Round {
+                    plan,
+                    catalog: self.catalog,
+                    recursive,
+                    cte,
+                    cancel: self.cancel.clone(),
+                    memory: memory.clone(),
+                    seams: self.seams.clone(),
+                    session: self.session.clone(),
+                    outer: self.held.iter().map(|held| (held.cte, held.chunks.clone())).collect(),
+                };
+                let (fixpoint, out) = Fixpoint::new(round, schema.clone(), all);
+                let counters = self.watch(reference, id, pipeline, "RecursiveCTE", None);
+                let reading = Arc::clone(&counters);
+                self.close(below, pipeline, Arc::new(Watched::new(fixpoint, counters)));
+                Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
             Node::Consistent { index, columns, reducer } => {
                 // One pipeline per relation, children of the join tree first, each ending in the
@@ -3717,7 +3801,10 @@ impl<'a> Building<'a, '_> {
                 let source = source.chunks.reader();
                 let schema = Schema::numbered(plan.field_list(columns).to_vec(), index);
                 let counters = self.watch(reference, id, pipeline, "CteScan", None);
-                Segment::reading(Arc::new(Watched::new(source, counters)), schema, filling)
+                let mut segment =
+                    Segment::reading(Arc::new(Watched::new(source, counters)), schema, pipeline);
+                segment.after = filling.into_iter().collect();
+                segment
             }
         };
         Ok(segment)

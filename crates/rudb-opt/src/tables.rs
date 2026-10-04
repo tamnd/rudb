@@ -191,6 +191,7 @@ fn collect(plan: &Plan, at: NodeRef, set: &mut TableSet) {
         | Node::TableFetch { index, .. }
         | Node::Aggregate { index, .. }
         | Node::SetOp { index, .. }
+        | Node::RecursiveCte { index, .. }
         | Node::CteScan { index, .. }
         | Node::Consistent { index, .. } => set.insert(index),
         // What a materialisation makes visible is what the body makes visible. The definition's

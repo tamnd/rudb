@@ -169,6 +169,9 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Carried]) -> Carried {
         // that came from the right.
         Node::SetOp { .. } => Carried::none(),
 
+        // Rows of several rounds, each of them a query of its own.
+        Node::RecursiveCte { .. } => Carried::none(),
+
         // A cross product pairs every row with every row, so one side's rows repeat and the other
         // side's do too. The streaming side's identity does survive, and this says nothing anyway,
         // because a cross product has no side to stream written down the way a join does.

@@ -118,6 +118,7 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
         | Node::SetOp { .. }
         | Node::CrossProduct { .. }
         | Node::MaterializedCte { .. }
+        | Node::RecursiveCte { .. }
         | Node::CteScan { .. }
         | Node::Consistent { .. } => {}
         Node::Values { rows, .. } => {

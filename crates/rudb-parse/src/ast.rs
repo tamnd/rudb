@@ -583,6 +583,13 @@ pub struct Cte {
     pub query: QueryRef,
     /// The column names from `AS name(a, b)`, as a run of [`StrRef`], empty when there were none.
     pub columns: Slice,
+    /// Whether it names itself, which only a definition under `WITH RECURSIVE` may do.
+    ///
+    /// The query is then a `UNION` or a `UNION ALL` whose left side is the anchor and whose right
+    /// side reads the name. A read of the name there is a read of the rows the previous round added
+    /// rather than of the finished definition, and a definition like that is always held, because
+    /// there is no query to put in its place.
+    pub recursive: bool,
 }
 
 /// A query: a body, plus the modifiers that apply to whatever the body produced.

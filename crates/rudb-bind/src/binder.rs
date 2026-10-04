@@ -670,6 +670,9 @@ impl<'a> Binder<'a> {
     /// which is the pinned build's rule and is written out on [`Scope::rename_prefix`].
     fn bind_definition(&mut self, ast: &Ast, index: u32) -> Result<NodeRef> {
         let held = ast.cte(index);
+        if held.recursive {
+            return self.bind_recursive(ast, index);
+        }
         let name = ast.string(held.name).to_string();
         let (node, mut scope) = self.bind_query(ast, held.query)?;
         if !held.columns.is_empty() {
@@ -690,6 +693,78 @@ impl<'a> Binder<'a> {
         self.next_cte += 1;
         self.materialized.push(Materialized { written: index, cte, name, fields: scope.fields() });
         Ok(node)
+    }
+
+    /// Binds a definition that reads itself, which the parser has already checked is a `UNION` or
+    /// `UNION ALL` whose right side holds every read of it.
+    ///
+    /// The left side is bound first and on its own, because it is what fixes the columns: their
+    /// names, under the declared list when there is one, and their types, which the right side is
+    /// cast to rather than met halfway as an ordinary union would. Only then is the name made
+    /// readable, so the reads in the right side bind as scans of the rows the round before made.
+    fn bind_recursive(&mut self, ast: &Ast, index: u32) -> Result<NodeRef> {
+        let held = ast.cte(index);
+        let name = ast.string(held.name).to_string();
+        let written = ast.query(held.query);
+        let ast::QueryBody::SetOp { quantifier, left, right, .. } = written.body else {
+            unreachable!("the parser only marks a union as recursive")
+        };
+        if !written.ctes.is_empty() {
+            return Err(Error::not_implemented(
+                "a WITH clause inside a recursive definition is not supported yet",
+            ));
+        }
+        let (anchor, mut scope) = self.bind_query(ast, left)?;
+        if !held.columns.is_empty() {
+            let names: Vec<&str> = ast.name(held.columns).collect();
+            scope.rename_prefix(&names);
+        }
+        let fields = scope.fields();
+        let anchor = self.project_onto(anchor, &scope, &fields)?;
+        let cte = self.next_cte;
+        self.next_cte += 1;
+        self.materialized.push(Materialized {
+            written: index,
+            cte,
+            name: name.clone(),
+            fields: fields.clone(),
+        });
+        let (recursive, other) = self.bind_query(ast, right)?;
+        if other.len() != scope.len() {
+            return Err(Error::binder(
+                "Set operations can only apply to expressions with the same number of result columns",
+            ));
+        }
+        let recursive = self.project_onto(recursive, &other, &fields)?;
+        let table = self.fresh_index();
+        let name = self.plan.intern(&name);
+        let columns = self.plan.add_fields(&fields);
+        let all = quantifier == Quantifier::All;
+        Ok(self.add_node(Node::RecursiveCte {
+            anchor,
+            recursive,
+            index: table,
+            cte,
+            name,
+            all,
+            columns,
+        }))
+    }
+
+    /// Projects a side of a recursive definition onto the definition's columns by position, casting
+    /// each to the type the left side gave it.
+    fn project_onto(&mut self, node: NodeRef, scope: &Scope, fields: &[Field]) -> Result<NodeRef> {
+        let table = self.fresh_index();
+        let mut exprs = Vec::with_capacity(fields.len());
+        let mut names = Vec::with_capacity(fields.len());
+        for (column, field) in scope.columns.iter().zip(fields) {
+            let expr = self.plan.add_expr(Expr::Column(column.binding), column.ty.clone());
+            exprs.push(self.checked_cast_to(expr, &field.ty, false)?);
+            names.push(self.plan.intern(&field.name));
+        }
+        let exprs = self.plan.add_expr_list(&exprs);
+        let names = self.plan.add_name_list(&names);
+        Ok(self.add_node(Node::Project { input: node, index: table, exprs, names }))
     }
 
     fn bind_body(&mut self, ast: &Ast, written: &ast::Query) -> Result<(NodeRef, Scope)> {

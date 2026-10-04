@@ -142,6 +142,12 @@ fn reachable(plan: &Plan, at: NodeRef, held: bool, found: &mut Vec<NodeRef>) {
         reachable(plan, body, false, found);
         return;
     }
+    // Both sides of a recursion run where the held rows are made, not where they are read.
+    if let Node::RecursiveCte { anchor, recursive, .. } = *node {
+        reachable(plan, anchor, true, found);
+        reachable(plan, recursive, true, found);
+        return;
+    }
     for child in node.children().into_iter().flatten() {
         reachable(plan, child, false, found);
     }
@@ -370,8 +376,9 @@ fn rewrite(plan: &mut Plan, found: &Found) {
 fn next_cte(plan: &Plan) -> u32 {
     let mut next = 0;
     for at in 0..plan.node_count() {
-        if let Node::MaterializedCte { cte, .. } | Node::CteScan { cte, .. } =
-            *plan.node(u32::try_from(at).unwrap_or(u32::MAX))
+        if let Node::MaterializedCte { cte, .. }
+        | Node::RecursiveCte { cte, .. }
+        | Node::CteScan { cte, .. } = *plan.node(u32::try_from(at).unwrap_or(u32::MAX))
         {
             next = next.max(cte + 1);
         }

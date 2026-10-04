@@ -118,6 +118,7 @@ mod percent;
 mod places;
 mod prepared;
 mod query;
+mod recursive;
 mod register;
 mod rows;
 mod runs;

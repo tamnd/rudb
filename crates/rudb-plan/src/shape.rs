@@ -99,6 +99,15 @@ impl Shape {
     /// Works out the shape of a plan.
     #[must_use]
     pub fn of(plan: &Plan) -> Self {
+        Self::under(plan, plan.root())
+    }
+
+    /// The shape of the part of a plan under `root`, as if it were the whole of it.
+    ///
+    /// What a recursive definition runs once per round is that part, built as a query of its own
+    /// each time.
+    #[must_use]
+    pub fn under(plan: &Plan, root: NodeRef) -> Self {
         let mut shape = Self {
             of: vec![None; plan.node_count()],
             waits: vec![Vec::new()],
@@ -106,7 +115,7 @@ impl Shape {
             consumes: Vec::new(),
             holding: Vec::new(),
         };
-        shape.walk(plan, plan.root(), ROOT, None);
+        shape.walk(plan, root, ROOT, None);
         shape
     }
 
@@ -308,6 +317,18 @@ impl Shape {
                 // sees those rows, so what consumes them is whatever consumes this node.
                 self.walk(plan, body, pipeline, into);
                 self.holding.pop();
+            }
+            // The anchor fills the node the way an input fills a sort. The recursive side runs once
+            // per round as a query of its own, built from `Shape::under` each time, so nothing here
+            // waits for the pipeline it is walked into. It is walked at all so that every node in
+            // the plan has an operator to print.
+            Node::RecursiveCte { anchor, recursive, .. } => {
+                let below = self.fresh();
+                self.waits_on(pipeline, below);
+                self.of[node as usize] = Some(Placed { operator, gathered: None, pipeline: below });
+                self.walk(plan, anchor, below, Some(operator));
+                let rounds = self.fresh();
+                self.walk(plan, recursive, rounds, Some(operator));
             }
             Node::CteScan { cte, .. } => {
                 self.of[node as usize] = Some(Placed { operator, gathered: None, pipeline });

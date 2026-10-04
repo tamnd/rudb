@@ -74,6 +74,8 @@ pub fn transform_with_case(
         ctes: Vec::new(),
         named_windows: Vec::new(),
         query_depth: 0,
+        recursing: Vec::new(),
+        self_reads: Vec::new(),
     };
     transform.program(tree.root())?;
     Ok(transform.ast)
@@ -146,6 +148,16 @@ struct Transform<'a> {
     /// reads it, to tell a definition with nothing outside it from one that may name a column of
     /// the query it sits in.
     query_depth: usize,
+    /// The definitions under `WITH RECURSIVE` whose own query is being transformed, which are the
+    /// ones whose name is in scope inside themselves.
+    recursing: Vec<u32>,
+    /// Every read of one of those names, with where it was written and how many queries had been
+    /// finished when it was.
+    ///
+    /// The count is what tells the anchor from the recursive side. A query is pushed once
+    /// everything in it is, so a read inside the left side of the union was made before the left
+    /// query existed and a read inside the right side was made after.
+    self_reads: Vec<(u32, Span, u32)>,
 }
 
 /// What a `WITH` name stands for.
@@ -2824,9 +2836,7 @@ impl<'a> Transform<'a> {
         if with == NONE {
             return Ok(once);
         }
-        if self.find(with, "Recursive") != NONE {
-            return self.unsupported(self.find(with, "Recursive"));
-        }
+        let recursive = self.find(with, "Recursive") != NONE;
         let written: Vec<u32> =
             self.kids(with).filter(|&kid| self.name(kid) == "WithStatement").collect();
         for (at, &statement) in written.iter().enumerate() {
@@ -2861,15 +2871,32 @@ impl<'a> Transform<'a> {
                 }
                 self.part_slice(names)
             };
+            // A key changes what a round keeps, so reading past it would answer a different
+            // query from the one written.
+            let key = self.find(statement, "UsingKey");
+            if key != NONE {
+                return self.unsupported(key);
+            }
             let body = self.find(statement, "CTEBody");
             let select = self.first(body);
             if self.name(select) != "CTESelectBody" {
                 return self.unsupported(body);
             }
+            if recursive {
+                let index = self.recursive_definition(self.first(select), name, columns)?;
+                let held = self.ast.ctes[index as usize];
+                if held.recursive || materialized {
+                    once.push(index);
+                    self.ctes.push((name, Held::Once(index), columns));
+                } else {
+                    self.ctes.push((name, Held::Inline(held.query), columns));
+                }
+                continue;
+            }
             let query = self.query(self.first(select))?;
             if materialized {
                 let index = self.ast.ctes.len() as u32;
-                self.ast.ctes.push(Cte { name, query, columns });
+                self.ast.ctes.push(Cte { name, query, columns, recursive: false });
                 once.push(index);
                 self.ctes.push((name, Held::Once(index), columns));
             } else {
@@ -2877,6 +2904,61 @@ impl<'a> Transform<'a> {
             }
         }
         Ok(once)
+    }
+
+    /// A definition under `WITH RECURSIVE`, transformed with its own name in scope, and its index
+    /// in `Ast::ctes`.
+    ///
+    /// The slot is taken before the query is read, because a read of the name inside it has to
+    /// point somewhere. Whether it turned out to read itself is the `recursive` flag. One that did
+    /// not is an ordinary definition, and the caller inlines it or holds it as it would any other.
+    ///
+    /// What the pin refuses is refused in its words. A body that is a union may not sort or limit
+    /// itself, which is checked whether or not it reads its name. And a read of the name anywhere
+    /// but the right side of a top level `UNION` or `UNION ALL` is a circular reference, pointed at
+    /// the read.
+    fn recursive_definition(&mut self, select: u32, name: StrRef, columns: Slice) -> Result<u32> {
+        let index = self.ast.ctes.len() as u32;
+        self.ast.ctes.push(Cte { name, query: 0, columns, recursive: false });
+        let scope = self.ctes.len();
+        self.ctes.push((name, Held::Once(index), columns));
+        let reads = self.self_reads.len();
+        self.recursing.push(index);
+        let query = self.query(select);
+        self.recursing.pop();
+        self.ctes.truncate(scope);
+        let query = query?;
+        let found: Vec<(Span, u32)> = self
+            .self_reads
+            .drain(reads..)
+            .filter(|&(read, ..)| read == index)
+            .map(|(_, span, made)| (span, made))
+            .collect();
+        let written = self.ast.queries[query as usize];
+        let anchor = match written.body {
+            QueryBody::SetOp { op: SetOp::Union, by_name: false, left, .. } => Some(left),
+            _ => None,
+        };
+        if anchor.is_some() {
+            if !written.order_by.is_empty() || written.order_by_all {
+                return Err(Error::parser("ORDER BY in a recursive query is not allowed"));
+            }
+            if written.limit != NONE || written.offset != NONE {
+                return Err(Error::parser("LIMIT or OFFSET in a recursive query is not allowed"));
+            }
+        }
+        for &(span, made) in &found {
+            if anchor.is_none_or(|anchor| made <= anchor) {
+                return Err(Error::binder(format!(
+                    "Circular reference to CTE \"{}\", use WITH RECURSIVE to use recursive CTEs.",
+                    self.ast.string(name)
+                ))
+                .with_span(span));
+            }
+        }
+        let recursive = !found.is_empty();
+        self.ast.ctes[index as usize] = Cte { name, query, columns, recursive };
+        Ok(index)
     }
 
     /// Whether a plain `WITH` definition is one to hold the rows of rather than to inline.
@@ -3531,6 +3613,11 @@ impl<'a> Transform<'a> {
                             // nothing at all, because the definition already has the name and a
                             // reference that invented one would print itself as `c AS c`.
                             Held::Once(cte) => {
+                                if self.recursing.contains(&cte) {
+                                    let span = self.span(self.find(inner, "BaseTableName"));
+                                    let made = self.ast.queries.len() as u32;
+                                    self.self_reads.push((cte, span, made));
+                                }
                                 return Ok(self.push_source(Source::Cte { cte, alias, columns }));
                             }
                         }
@@ -6119,8 +6206,9 @@ mod tests {
             let cte = ast.cte(index);
             let columns = ast.name(cte.columns).collect::<Vec<_>>().join(", ");
             let columns = if columns.is_empty() { columns } else { format!("({columns})") };
+            let recursive = if cte.recursive { "RECURSIVE " } else { "" };
             out += &format!(
-                "WITH {}{columns} AS MATERIALIZED ({}) ",
+                "WITH {recursive}{}{columns} AS MATERIALIZED ({}) ",
                 ast.string(cte.name),
                 show_query(ast, cte.query)
             );
@@ -7031,9 +7119,22 @@ mod tests {
             round("WITH t(x) AS NOT MATERIALIZED (SELECT 1) SELECT x FROM t"),
             "SELECT x FROM (SELECT 1) AS t"
         );
-        let query = "WITH RECURSIVE t(x) AS (SELECT 1) SELECT x FROM t";
-        let error = parse_ast(query).expect_err("the unsupported CTE shape is refused");
+        let query = "WITH RECURSIVE t(x) USING KEY (x) AS (SELECT 1) SELECT x FROM t";
+        let error = parse_ast(query).expect_err("a key is not read past");
         assert!(error.to_string().starts_with("Not implemented Error"), "{query}: {error}");
+        // A definition under RECURSIVE that never names itself is a plain one.
+        assert_eq!(
+            round("WITH RECURSIVE t(x) AS (SELECT 1) SELECT x FROM t"),
+            "SELECT x FROM (SELECT 1) AS t"
+        );
+        assert_eq!(
+            round(
+                "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+                 SELECT * FROM t"
+            ),
+            "WITH RECURSIVE t(n) AS MATERIALIZED ((SELECT 1 Union All SELECT (n Add 1) FROM t \
+             WHERE (n Lt 3))) SELECT * FROM t"
+        );
     }
 
     /// A plain definition named twice is held, and the same one named once is not.

@@ -198,7 +198,8 @@ fn reads(node: &Node) -> u32 {
         | Node::Window { .. }
         | Node::Distinct { .. }
         | Node::LimitPercent { .. }
-        | Node::SetOp { .. } => 2,
+        | Node::SetOp { .. }
+        | Node::RecursiveCte { .. } => 2,
         Node::TopN { .. } | Node::CrossProduct { .. } => 2,
         Node::Join { .. } | Node::DependentJoin { .. } => 3,
         // Once, which is the whole claim of section 5.2. There is no build side to write and read
