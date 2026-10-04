@@ -36,7 +36,7 @@ mod typed;
 mod unnest;
 
 pub use binder::{bind, bind_sql, bind_sql_with, bind_with};
-pub use parameters::Parameters;
+pub use parameters::{Parameters, Written};
 pub use statement::{
     Attach, Bound, Call, Checks, Conflict, ConflictAction, CopyTo, CreateTable, CreateView, DropTable,
     Insert, SchemaChange, SequenceChange, TypeChange, Write, bind_checks, bind_statement,

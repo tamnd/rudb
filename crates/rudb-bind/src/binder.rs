@@ -722,7 +722,11 @@ impl<'a> Binder<'a> {
             return self.bind_recursive(ast, index);
         }
         let name = ast.string(held.name).to_string();
-        let (node, mut scope) = self.bind_query(ast, held.query)?;
+        let (node, mut scope) = if held.dml.is_some() {
+            self.bind_written(index, &name)?
+        } else {
+            self.bind_query(ast, held.query)?
+        };
         if !held.columns.is_empty() {
             let names: Vec<&str> = ast.name(held.columns).collect();
             scope.rename_prefix(&names);
@@ -750,6 +754,66 @@ impl<'a> Binder<'a> {
             finished,
         });
         Ok(node)
+    }
+
+    /// The rows a data changing definition produced, as literal rows.
+    ///
+    /// The statement runs before anything reading it is bound, so its rows are known by now and are
+    /// handed in with the parameters. A plan wanted without running it, which is what `EXPLAIN`
+    /// asks for, has no rows to read.
+    fn bind_written(&mut self, index: u32, name: &str) -> Result<(NodeRef, Scope)> {
+        let Some(written) = self.parameters.written(index) else {
+            return Err(Error::not_implemented(
+                "a data-modifying WITH definition in a statement that does not run it",
+            ));
+        };
+        let written = written.clone();
+        // A definition with no `RETURNING` has a row for each row it changed and no columns, and
+        // the rows are kept by a column of their own that nothing can name.
+        let blank = written.names.is_empty();
+        let mut rows = Vec::with_capacity(written.rows.len());
+        for row in &written.rows {
+            let mut items = Vec::with_capacity(row.len().max(1));
+            for (value, ty) in row.iter().zip(&written.types) {
+                let item = self.plan.add_constant(value.clone());
+                items.push(self.cast_to(item, ty));
+            }
+            if blank {
+                items.push(self.plan.add_constant(Value::Boolean(true)));
+            }
+            rows.push(self.plan.add_expr_list(&items));
+        }
+        let rows = self.plan.add_rows(&rows);
+        let fields: Vec<Field> = written
+            .names
+            .iter()
+            .zip(&written.types)
+            .map(|(name, ty)| Field::new(name.clone(), ty.clone()))
+            .collect();
+        let mut columns = fields.clone();
+        if blank {
+            columns.push(Field::new("changed", LogicalType::Boolean));
+        }
+        let held = self.plan.add_fields(&columns);
+        let table = self.fresh_index();
+        let node = self.add_node(Node::Values { index: table, columns: held, rows });
+        let mut scope = Scope::empty();
+        for (at, field) in fields.iter().enumerate() {
+            scope.push(Visible {
+                table: name.to_string(),
+                name: field.name.clone(),
+                binding: ColumnBinding::new(table, at as u32),
+                ty: field.ty.clone(),
+                not_null: false,
+                key: None,
+                default: None,
+                qualified: false,
+                also: None,
+                hidden: false,
+                using: None,
+            });
+        }
+        Ok((node, scope))
     }
 
     /// Binds a definition that reads itself, which the parser has already checked is a `UNION` or

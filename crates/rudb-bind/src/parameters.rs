@@ -1,6 +1,6 @@
 //! The values a statement's parameters were given.
 
-use rudb_common::Value;
+use rudb_common::{LogicalType, Value};
 
 /// What a prepared statement was handed, by identifier.
 ///
@@ -15,13 +15,26 @@ use rudb_common::Value;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Parameters {
     values: Vec<(String, Value)>,
+    written: Vec<(u32, Written)>,
+}
+
+/// The rows a data changing `WITH` definition produced, which it produced before the statement it
+/// belongs to was bound.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Written {
+    /// The names of its columns.
+    pub names: Vec<String>,
+    /// The types of its columns.
+    pub types: Vec<LogicalType>,
+    /// Its rows, each as wide as `names`, so with no `RETURNING` each row is empty.
+    pub rows: Vec<Vec<Value>>,
 }
 
 impl Parameters {
     /// No values, which is what an ordinary statement binds with.
     #[must_use]
     pub const fn new() -> Self {
-        Self { values: Vec::new() }
+        Self { values: Vec::new(), written: Vec::new() }
     }
 
     /// Values by position, numbered from one, which is what `?` and `$1` want.
@@ -32,7 +45,7 @@ impl Parameters {
             .enumerate()
             .map(|(at, value)| ((at + 1).to_string(), value))
             .collect();
-        Self { values }
+        Self { values, written: Vec::new() }
     }
 
     /// Gives one parameter a value, replacing whatever it had.
@@ -50,10 +63,25 @@ impl Parameters {
         self.values.iter().find(|(held, _)| same(held, name)).map(|(_, value)| value)
     }
 
+    /// Gives the data changing definition at `cte` in the statement the rows it produced.
+    pub fn write(&mut self, cte: u32, rows: Written) {
+        self.written.retain(|(held, _)| *held != cte);
+        self.written.push((cte, rows));
+    }
+
+    /// The rows the data changing definition at `cte` produced, if it has run.
+    #[must_use]
+    pub fn written(&self, cte: u32) -> Option<&Written> {
+        self.written.iter().find(|(held, _)| *held == cte).map(|(_, rows)| rows)
+    }
+
     /// Whether nothing was provided.
+    ///
+    /// Rows a definition wrote count, since a statement bound with them answers for that run alone
+    /// and must not be kept or replayed as if it were its text.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.values.is_empty() && self.written.is_empty()
     }
 
     /// How many were provided.

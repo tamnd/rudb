@@ -606,6 +606,13 @@ pub struct Cte {
     /// Kept only for a definition that reads itself. On any other the pin reads past the clause
     /// without looking at it, so a key naming a column that is not there is no error.
     pub key: Slice,
+    /// The `INSERT`, `UPDATE` or `DELETE` the definition is, when it is one.
+    ///
+    /// Such a definition runs once, ahead of the statement it belongs to and after the ones written
+    /// before it, and its rows are what its `RETURNING` produced, or one row with no columns for
+    /// each row it changed when it has none. `query` is then the statement's source, which is there
+    /// only so a walk over every definition has a query to look at.
+    pub dml: Option<Statement>,
 }
 
 /// A query: a body, plus the modifiers that apply to whatever the body produced.
