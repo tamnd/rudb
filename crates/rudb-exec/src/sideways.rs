@@ -2049,7 +2049,8 @@ mod tests {
     /// lies, a packed column read on its codes with the frame's base folded in, either of those
     /// with nulls in its mask, and the widening form a dictionary takes. Two hundred rows so that
     /// the run past the last whole word of sixty four is one of the cases, and a frame base each
-    /// side of the domain's so that the folded shift is tested both ways round.
+    /// side of the domain's so that the folded shift is tested both ways round. Asked through
+    /// [`super::Domain::retain`], each answers the same rows out of those it is given.
     #[test]
     fn a_bitmap_reads_flat_keys_packed_keys_and_widened_keys_alike() {
         let mut plan = Plan::new();
@@ -2061,7 +2062,19 @@ mod tests {
 
         let domain = found.domain.expect("a bitmap over a hundred and fifty one values");
         let rows: Vec<i64> = (0..200).collect();
-        let held = |keys: &Vector| domain.kept(keys, 200, &mut Vec::new()).indices();
+        // Each form asked through `retain` as well, about every row and about every third one,
+        // which is how the scan asks it about the rows a filter before it kept.
+        let held = |keys: &Vector| {
+            let kept = domain.kept(keys, 200, &mut Vec::new()).indices();
+            let mut every: Vec<u32> = (0..200).collect();
+            domain.retain(keys, &mut every);
+            assert_eq!(every, kept, "retain asked about every row");
+            let mut thirds: Vec<u32> = (0..200).step_by(3).collect();
+            domain.retain(keys, &mut thirds);
+            let third: Vec<u32> = kept.iter().copied().filter(|row| row % 3 == 0).collect();
+            assert_eq!(thirds, third, "retain asked about every third row");
+            kept
+        };
         let integers = column(&rows.iter().map(|&row| Some(row as i32)).collect::<Vec<_>>());
         assert!(integers.none_null() && integers.data().is_some(), "the flat form");
         assert_eq!(held(&integers), [100, 163]);
