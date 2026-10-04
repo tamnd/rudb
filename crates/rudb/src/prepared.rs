@@ -47,6 +47,7 @@ pub struct Prepared {
     lookup: Option<Lookup>,
     write: Option<PointWrite>,
     range: Option<RangeRead>,
+    upsert: Option<Upsert>,
     /// Whether the parameters are `1` to `n` and nothing else, so that `n` values by position are
     /// exactly the values the statement wants, with nothing missing and nothing left over.
     numbered: bool,
@@ -183,6 +184,54 @@ pub(crate) enum Set {
     Add(Item, bool),
 }
 
+/// An `INSERT` of one row of a [`Direct`]'s shape that says what becomes of a row whose key the
+/// table holds: `ON CONFLICT [(key)] DO NOTHING`, `ON CONFLICT [(key)] DO UPDATE SET` with no
+/// `WHERE`, `INSERT OR IGNORE` or `INSERT OR REPLACE`.
+///
+/// That is the upsert of `13-the-point-path.md` section 13.4, and the plan for it reads every row
+/// of the table to find the one the key names and writes the whole table back. An execution that
+/// finds a plain table with the one key looks the key up: a row that is not there goes in as a
+/// [`Direct`] row does, and one that is takes its new values where it is, as a [`PointWrite`] row
+/// does. Anything else goes the long way.
+#[derive(Debug, Clone)]
+pub(crate) struct Upsert {
+    /// The row, as an insert of its own.
+    pub(crate) insert: Direct,
+    /// The columns of the key the statement named, empty when it named none.
+    pub(crate) key: Vec<String>,
+    /// What becomes of a row whose key the table holds.
+    pub(crate) action: Action,
+}
+
+/// What an [`Upsert`] does with a row whose key the table holds.
+#[derive(Debug, Clone)]
+pub(crate) enum Action {
+    /// Nothing: the row is dropped.
+    Nothing,
+    /// The held row takes the new row's values in the columns the statement wrote.
+    Replace,
+    /// The held row takes these values, each column as written with what it is set to.
+    Update(Vec<(String, Change)>),
+}
+
+/// What one column of an [`Action::Update`] is set to.
+#[derive(Debug, Clone)]
+pub(crate) enum Change {
+    /// A value as it is.
+    To(Source),
+    /// The column as it was plus the value, or minus it when this says so.
+    Add(Source, bool),
+}
+
+/// Where a value of an [`Action::Update`] comes from.
+#[derive(Debug, Clone)]
+pub(crate) enum Source {
+    /// A parameter or a `NULL`.
+    Given(Item),
+    /// `excluded.column`, the new row's value, by the column as written.
+    Excluded(String),
+}
+
 /// One entry of a [`Lookup`] select list.
 #[derive(Debug, Clone)]
 pub(crate) enum Pick {
@@ -292,11 +341,15 @@ impl Direct {
     fn of(ast: &Ast) -> Option<Self> {
         let [ast::Statement::Insert(at)] = ast.statements.as_slice() else { return None };
         let insert = ast.insert(*at);
-        if insert.returning.is_some()
-            || insert.conflict.is_some()
-            || insert.copy
-            || insert.source == rudb_parse::NONE
-        {
+        if insert.conflict.is_some() {
+            return None;
+        }
+        Self::reading(ast, insert)
+    }
+
+    /// The rows of `insert` with what it says about a key it finds held left aside.
+    fn reading(ast: &Ast, insert: ast::Insert) -> Option<Self> {
+        if insert.returning.is_some() || insert.copy || insert.source == rudb_parse::NONE {
             return None;
         }
         let query = ast.query(insert.source);
@@ -329,6 +382,112 @@ impl Direct {
             rows,
             found: Found::default(),
         })
+    }
+}
+
+impl Upsert {
+    /// The shape of `ast`, if it is one statement of it.
+    fn of(ast: &Ast) -> Option<Self> {
+        let [ast::Statement::Insert(at)] = ast.statements.as_slice() else { return None };
+        let insert = ast.insert(*at);
+        let conflict = insert.conflict?;
+        let direct = Direct::reading(ast, insert)?;
+        if direct.rows.len() != 1 {
+            return None;
+        }
+        let key = ast.name(conflict.target).map(str::to_owned).collect();
+        let action = match conflict.action {
+            ast::ConflictAction::Nothing => Action::Nothing,
+            ast::ConflictAction::Replace => Action::Replace,
+            ast::ConflictAction::Update { columns, query } => {
+                Action::Update(Self::changes(ast, columns, query)?)
+            }
+        };
+        Some(Self { insert: direct, key, action })
+    }
+
+    /// The `SET` of a `DO UPDATE`, held as `SELECT values..., condition FROM table [AS alias]
+    /// POSITIONAL JOIN table AS excluded`, when there is no `WHERE` and each value is a parameter,
+    /// a `NULL`, `excluded.column`, or the column itself plus or minus one of those.
+    fn changes(
+        ast: &Ast,
+        columns: ast::Slice,
+        query: ast::QueryRef,
+    ) -> Option<Vec<(String, Change)>> {
+        let query = ast.query(query);
+        let ast::QueryBody::Select(select) = query.body else { return None };
+        let select = ast.select(select);
+        let [source] = ast.source_list(select.from) else { return None };
+        let ast::Source::Join { left, .. } = ast.source(*source) else { return None };
+        let ast::Source::Table { name, alias, .. } = ast.source(left) else { return None };
+        // What the held row's columns are qualified by.
+        let label = if alias == rudb_parse::NONE {
+            ast.name(name).last()?.to_owned()
+        } else {
+            ast.string(alias).to_owned()
+        };
+        if label.eq_ignore_ascii_case("excluded") {
+            return None;
+        }
+        let [values @ .., condition] = ast.target_list(select.targets) else { return None };
+        if !matches!(
+            ast.expr(condition.expr),
+            ast::Expr::Literal { kind: ast::LiteralKind::True, .. }
+        ) {
+            return None;
+        }
+        let columns: Vec<String> = ast.name(columns).map(str::to_owned).collect();
+        if columns.is_empty() || columns.len() != values.len() {
+            return None;
+        }
+        let source = |expr| match ast.expr(expr) {
+            ast::Expr::Parameter { name } => {
+                let name = ast.string(name);
+                Some(Source::Given(Item::Parameter(name.to_owned(), numbered(name))))
+            }
+            ast::Expr::Literal { kind: ast::LiteralKind::Null, .. } => {
+                Some(Source::Given(Item::Null))
+            }
+            ast::Expr::Column { name } => match ast.name(name).collect::<Vec<_>>().as_slice() {
+                [table, column] if table.eq_ignore_ascii_case("excluded") => {
+                    Some(Source::Excluded((*column).to_owned()))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut changes = Vec::with_capacity(columns.len());
+        for (column, value) in columns.into_iter().zip(values) {
+            if changes.iter().any(|(held, _): &(String, Change)| held.eq_ignore_ascii_case(&column))
+            {
+                return None;
+            }
+            // The held row's column itself, bare or by the table's label.
+            let itself = |expr| match ast.expr(expr) {
+                ast::Expr::Column { name } => match ast.name(name).collect::<Vec<_>>().as_slice() {
+                    [bare] => bare.eq_ignore_ascii_case(&column),
+                    [table, bare] => {
+                        table.eq_ignore_ascii_case(&label) && bare.eq_ignore_ascii_case(&column)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            let change = match ast.expr(value.expr) {
+                ast::Expr::Binary { op: ast::BinaryOp::Add, left, right } if itself(left) => {
+                    Change::Add(source(right)?, false)
+                }
+                ast::Expr::Binary { op: ast::BinaryOp::Add, left, right } if itself(right) => {
+                    Change::Add(source(left)?, false)
+                }
+                ast::Expr::Binary { op: ast::BinaryOp::Subtract, left, right } if itself(left) => {
+                    Change::Add(source(right)?, true)
+                }
+                _ => Change::To(source(value.expr)?),
+            };
+            changes.push((column, change));
+        }
+        Some(changes)
     }
 }
 
@@ -417,6 +576,7 @@ pub(crate) enum Shape<'a> {
     Lookup(&'a Lookup),
     Write(&'a PointWrite),
     Range(&'a RangeRead),
+    Upsert(&'a Upsert),
 }
 
 /// The `LIMIT` of a [`RangeRead`].
@@ -611,9 +771,10 @@ impl Prepared {
         let lookup = Lookup::of(&ast);
         let write = PointWrite::of(&ast);
         let range = RangeRead::of(&ast);
+        let upsert = Upsert::of(&ast);
         let numbered = numbered_one_to_n(&names);
         let sql = sql.to_string();
-        Ok(Self { shared, sql, ast, names, direct, lookup, write, range, numbered })
+        Ok(Self { shared, sql, ast, names, direct, lookup, write, range, upsert, numbered })
     }
 
     /// The statement as it was written.
@@ -637,11 +798,11 @@ impl Prepared {
     /// time.
     ///
     /// The point plans are `InsertOne t`, `InsertRows t`, `POINT Lookup t(key)`,
-    /// `UpdateOne t(key) SET column`, `DeltaOne t(key) SET column` and `Range t(key)`. They hold
-    /// for values of the key's and the columns' types, and outside a transaction, but for an
-    /// insert, which takes the short way inside one too until it aborts. A benchmark checks this
-    /// before it measures, so a statement that would fall back to the pipeline is found out by
-    /// name rather than by a slow number.
+    /// `UpdateOne t(key) SET column`, `DeltaOne t(key) SET column`, `Range t(key)` and
+    /// `Upsert t(key)`. They hold for values of the key's and the columns' types, and outside a
+    /// transaction, but for an insert, which takes the short way inside one too until it aborts.
+    /// A benchmark checks this before it measures, so a statement that would fall back to the
+    /// pipeline is found out by name rather than by a slow number.
     #[must_use]
     pub fn explain(&self) -> String {
         let shapes = [
@@ -649,6 +810,7 @@ impl Prepared {
             self.lookup.as_ref().map(Shape::Lookup),
             self.write.as_ref().map(Shape::Write),
             self.range.as_ref().map(Shape::Range),
+            self.upsert.as_ref().map(Shape::Upsert),
         ];
         let plan = shapes.into_iter().flatten().find_map(|shape| self.shared.point_plan(shape));
         plan.unwrap_or_else(|| "PIPELINE".to_owned())
@@ -704,7 +866,7 @@ impl Prepared {
     }
 
     /// The statement run one of the ways that skip binding and planning, where one of them takes
-    /// it: a one row insert, a read by key, a write by key or a short range.
+    /// it: an insert of a row or a few, a read by key, a write by key, a short range or an upsert.
     fn short(&self, given: Given<'_>) -> Option<Result<QueryResult>> {
         let shared = &self.shared;
         let sql = self.sql.as_str();
@@ -725,6 +887,11 @@ impl Prepared {
         }
         if let Some(range) = &self.range
             && let Some(done) = shared.range_read(range, given, sql)
+        {
+            return Some(done);
+        }
+        if let Some(upsert) = &self.upsert
+            && let Some(done) = shared.upsert_point(upsert, given, sql)
         {
             return Some(done);
         }
