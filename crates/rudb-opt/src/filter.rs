@@ -543,7 +543,17 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
 
         // Nothing crosses a recursion in either direction. A predicate above it is written against
         // every round's rows together, and one inside a side already sits where it belongs.
-        Node::RecursiveCte { anchor, recursive, index, cte, name, all, columns } => {
+        Node::RecursiveCte {
+            anchor,
+            recursive,
+            index,
+            cte,
+            name,
+            all,
+            columns,
+            recurring,
+            key,
+        } => {
             let rebuilt_anchor = node(plan, anchor, Vec::new(), tables);
             let rebuilt_recursive = node(plan, recursive, Vec::new(), tables);
             let above = if rebuilt_anchor == anchor && rebuilt_recursive == recursive {
@@ -557,6 +567,8 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
                     name,
                     all,
                     columns,
+                    recurring,
+                    key,
                 })
             };
             filter(plan, above, pending)

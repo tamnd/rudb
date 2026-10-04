@@ -590,6 +590,11 @@ pub struct Cte {
     /// rather than of the finished definition, and a definition like that is always held, because
     /// there is no query to put in its place.
     pub recursive: bool,
+    /// What `USING KEY (...)` named, as a run of [`Target`], empty when it named nothing.
+    ///
+    /// Kept only for a definition that reads itself. On any other the pin reads past the clause
+    /// without looking at it, so a key naming a column that is not there is no error.
+    pub key: Slice,
 }
 
 /// A query: a body, plus the modifiers that apply to whatever the body produced.
@@ -914,6 +919,9 @@ pub enum Source {
         alias: StrRef,
         /// Column aliases from `AS c(a, b)`, as a run of [`StrRef`].
         columns: Slice,
+        /// Whether it was written `recurring.name`, which inside the recursive side of a definition
+        /// reads every row produced so far rather than the rows the round before added.
+        recurring: bool,
     },
     /// A parenthesised query in the `FROM` clause.
     Subquery {

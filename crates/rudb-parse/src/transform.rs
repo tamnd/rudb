@@ -156,8 +156,9 @@ struct Transform<'a> {
     ///
     /// The count is what tells the anchor from the recursive side. A query is pushed once
     /// everything in it is, so a read inside the left side of the union was made before the left
-    /// query existed and a read inside the right side was made after.
-    self_reads: Vec<(u32, Span, u32)>,
+    /// query existed and a read inside the right side was made after. The flag says the read was
+    /// written `recurring.name`.
+    self_reads: Vec<(u32, Span, u32, bool)>,
 }
 
 /// What a `WITH` name stands for.
@@ -2871,19 +2872,23 @@ impl<'a> Transform<'a> {
                 }
                 self.part_slice(names)
             };
-            // A key changes what a round keeps, so reading past it would answer a different
-            // query from the one written.
-            let key = self.find(statement, "UsingKey");
-            if key != NONE {
-                return self.unsupported(key);
-            }
+            let using = self.find(statement, "UsingKey");
+            let key = if using == NONE {
+                Slice::default()
+            } else {
+                let mut targets = Vec::new();
+                for kid in self.kids(self.find(using, "TargetList")).collect::<Vec<_>>() {
+                    targets.push(self.target(kid)?);
+                }
+                self.target_slice(targets)
+            };
             let body = self.find(statement, "CTEBody");
             let select = self.first(body);
             if self.name(select) != "CTESelectBody" {
                 return self.unsupported(body);
             }
             if recursive {
-                let index = self.recursive_definition(self.first(select), name, columns)?;
+                let index = self.recursive_definition(self.first(select), name, columns, key)?;
                 let held = self.ast.ctes[index as usize];
                 if held.recursive || materialized {
                     once.push(index);
@@ -2896,7 +2901,8 @@ impl<'a> Transform<'a> {
             let query = self.query(self.first(select))?;
             if materialized {
                 let index = self.ast.ctes.len() as u32;
-                self.ast.ctes.push(Cte { name, query, columns, recursive: false });
+                let key = Slice::default();
+                self.ast.ctes.push(Cte { name, query, columns, recursive: false, key });
                 once.push(index);
                 self.ctes.push((name, Held::Once(index), columns));
             } else {
@@ -2917,9 +2923,16 @@ impl<'a> Transform<'a> {
     /// itself, which is checked whether or not it reads its name. And a read of the name anywhere
     /// but the right side of a top level `UNION` or `UNION ALL` is a circular reference, pointed at
     /// the read.
-    fn recursive_definition(&mut self, select: u32, name: StrRef, columns: Slice) -> Result<u32> {
+    fn recursive_definition(
+        &mut self,
+        select: u32,
+        name: StrRef,
+        columns: Slice,
+        key: Slice,
+    ) -> Result<u32> {
         let index = self.ast.ctes.len() as u32;
-        self.ast.ctes.push(Cte { name, query: 0, columns, recursive: false });
+        let none = Slice::default();
+        self.ast.ctes.push(Cte { name, query: 0, columns, recursive: false, key: none });
         let scope = self.ctes.len();
         self.ctes.push((name, Held::Once(index), columns));
         let reads = self.self_reads.len();
@@ -2928,11 +2941,11 @@ impl<'a> Transform<'a> {
         self.recursing.pop();
         self.ctes.truncate(scope);
         let query = query?;
-        let found: Vec<(Span, u32)> = self
+        let found: Vec<(Span, u32, bool)> = self
             .self_reads
             .drain(reads..)
             .filter(|&(read, ..)| read == index)
-            .map(|(_, span, made)| (span, made))
+            .map(|(_, span, made, recurring)| (span, made, recurring))
             .collect();
         let written = self.ast.queries[query as usize];
         let anchor = match written.body {
@@ -2947,8 +2960,17 @@ impl<'a> Transform<'a> {
                 return Err(Error::parser("LIMIT or OFFSET in a recursive query is not allowed"));
             }
         }
-        for &(span, made) in &found {
+        for &(span, made, recurring) in &found {
             if anchor.is_none_or(|anchor| made <= anchor) {
+                // The pin only knows `recurring.` on the recursive side, and anywhere else it is a
+                // schema that is not there.
+                if recurring {
+                    let name = self.ast.string(name);
+                    return Err(Error::catalog(format!(
+                        "Table with name \"recurring.{name}\" does not exist because schema \"recurring\" does not exist."
+                    ))
+                    .with_span(span));
+                }
                 return Err(Error::binder(format!(
                     "Circular reference to CTE \"{}\", use WITH RECURSIVE to use recursive CTEs.",
                     self.ast.string(name)
@@ -2956,8 +2978,11 @@ impl<'a> Transform<'a> {
                 .with_span(span));
             }
         }
-        let recursive = !found.is_empty();
-        self.ast.ctes[index as usize] = Cte { name, query, columns, recursive };
+        // A union under a key is recursive whether or not it reads itself, which is how the pin
+        // comes to take the last row per key over both sides of one that does not.
+        let recursive = !found.is_empty() || (anchor.is_some() && key.len > 0);
+        let key = if recursive { key } else { none };
+        self.ast.ctes[index as usize] = Cte { name, query, columns, recursive, key };
         Ok(index)
     }
 
@@ -3265,6 +3290,15 @@ impl<'a> Transform<'a> {
         alias: StrRef,
         columns: Slice,
     ) -> Result<SourceRef> {
+        if name.len == 2
+            && let Some(cte) = self.recurring(name)
+        {
+            let span = self.span(base);
+            let made = self.ast.queries.len() as u32;
+            self.self_reads.push((cte, span, made, true));
+            let recurring = true;
+            return Ok(self.push_source(Source::Cte { cte, alias, columns, recurring }));
+        }
         if name.len == 1 {
             let part = self.ast.parts[name.start as usize];
             if let Some(&(_, held, declared)) = self.ctes.iter().rev().find(|&&(cte, _, _)| {
@@ -3283,14 +3317,38 @@ impl<'a> Transform<'a> {
                         if self.recursing.contains(&cte) {
                             let span = self.span(base);
                             let made = self.ast.queries.len() as u32;
-                            self.self_reads.push((cte, span, made));
+                            self.self_reads.push((cte, span, made, false));
                         }
-                        return Ok(self.push_source(Source::Cte { cte, alias, columns }));
+                        let recurring = false;
+                        return Ok(self.push_source(Source::Cte {
+                            cte,
+                            alias,
+                            columns,
+                            recurring,
+                        }));
                     }
                 }
             }
         }
         Ok(self.push_source(Source::Table { name, alias, columns }))
+    }
+
+    /// The definition `recurring.name` reads, which is one whose own query is being transformed.
+    fn recurring(&self, name: Slice) -> Option<u32> {
+        let parts = &self.ast.parts[name.start as usize..][..2];
+        if !self.ast.string(parts[0]).eq_ignore_ascii_case("recurring") {
+            return None;
+        }
+        let wanted = self.ast.string(parts[1]);
+        let &(_, held, _) = self
+            .ctes
+            .iter()
+            .rev()
+            .find(|&&(cte, _, _)| self.ast.string(cte).eq_ignore_ascii_case(wanted))?;
+        match held {
+            Held::Once(cte) if self.recursing.contains(&cte) => Some(cte),
+            _ => None,
+        }
     }
 
     /// `SELECT * FROM <source>`, which is what `DESCRIBE t` means.
@@ -6160,8 +6218,9 @@ mod tests {
             Source::Subquery { query, alias: query_alias, .. } => {
                 format!("({}){}", show_query(ast, query), alias(query_alias))
             }
-            Source::Cte { cte, alias: cte_alias, .. } => {
-                format!("{}{}", ast.string(ast.cte(cte).name), alias(cte_alias))
+            Source::Cte { cte, alias: cte_alias, recurring, .. } => {
+                let prefix = if recurring { "recurring." } else { "" };
+                format!("{prefix}{}{}", ast.string(ast.cte(cte).name), alias(cte_alias))
             }
             Source::Values { rows, alias: values_alias, .. } => {
                 format!("{}{}", show_rows(ast, rows), alias(values_alias))
@@ -7134,9 +7193,12 @@ mod tests {
             round("WITH t(x) AS NOT MATERIALIZED (SELECT 1) SELECT x FROM t"),
             "SELECT x FROM (SELECT 1) AS t"
         );
-        let query = "WITH RECURSIVE t(x) USING KEY (x) AS (SELECT 1) SELECT x FROM t";
-        let error = parse_ast(query).expect_err("a key is not read past");
-        assert!(error.to_string().starts_with("Not implemented Error"), "{query}: {error}");
+        // A key on a definition that never names itself is read past without a look, as the pin
+        // reads past it, so a key naming no column is no error either.
+        assert_eq!(
+            round("WITH RECURSIVE t(x) USING KEY (zz) AS (SELECT 1) SELECT x FROM t"),
+            "SELECT x FROM (SELECT 1) AS t"
+        );
         // A definition under RECURSIVE that never names itself is a plain one.
         assert_eq!(
             round("WITH RECURSIVE t(x) AS (SELECT 1) SELECT x FROM t"),
