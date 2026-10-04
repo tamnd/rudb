@@ -570,6 +570,32 @@ impl StringColumn {
         self.views.len() - 1
     }
 
+    /// Writes `bytes` over the string at `index`, and says whether there was one there.
+    ///
+    /// A long string goes on the end of the arena, and the bytes of the one it replaces stay where
+    /// they were, read by nothing, until the column is built again. The views and the arena are
+    /// copied out first only when somebody else holds them, which is [`Buffer::to_mut`], and a
+    /// view or an arena that was a page is one again after.
+    pub fn put_bytes(&mut self, index: usize, bytes: &[u8]) -> bool {
+        if index >= self.views.len() {
+            return false;
+        }
+        let offset = self.arena.len() as u64;
+        if bytes.len() > INLINE_LIMIT {
+            let paged = self.arena.is_shared();
+            self.arena.extend_from_slice(bytes);
+            if paged {
+                self.arena = std::mem::replace(&mut self.arena, Buffer::new()).into_page();
+            }
+        }
+        let paged = self.views.is_shared();
+        self.views.to_mut()[index] = StringView::over(bytes, offset);
+        if paged {
+            self.views = std::mem::replace(&mut self.views, Buffer::new()).into_page();
+        }
+        true
+    }
+
     /// Records a string that is already in the arena, and returns its index.
     ///
     /// The half of the seam that does the work. [`Self::over`] puts the page in, this says where in

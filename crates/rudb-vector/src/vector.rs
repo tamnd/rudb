@@ -317,6 +317,35 @@ impl Data {
         crate::for_each_layout!(all, paged)
     }
 
+    /// Writes the first value of `new` over the value at `index` when `new` has the same layout,
+    /// and says whether it did. The values are copied out first only when somebody else holds
+    /// them, and values that were a page are one again after.
+    pub fn put(&mut self, index: usize, new: &Self) -> bool {
+        macro_rules! put {
+            ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+                match (self, new) {
+                    $((Self::$variant(values), Self::$variant(new)) => {
+                        let Some(&value) = new.first() else { return false };
+                        if index >= values.len() {
+                            return false;
+                        }
+                        let paged = values.is_shared();
+                        values.to_mut()[index] = value;
+                        if paged {
+                            *values = std::mem::replace(values, Buffer::new()).into_page();
+                        }
+                        true
+                    })+
+                    (Self::Varlen(values), Self::Varlen(new)) => {
+                        new.bytes(0).is_some_and(|bytes| values.put_bytes(index, bytes))
+                    }
+                    _ => false,
+                }
+            };
+        }
+        crate::for_each_layout!(fixed, put)
+    }
+
     /// An integer at `index`, widened, for any of the signed integer layouts.
     ///
     /// Used by the decimal path, which needs the unscaled value out of whichever width the width
@@ -1447,6 +1476,43 @@ impl Vector {
             *stable = false;
         }
         self
+    }
+
+    /// Writes `value` over row `index`, which is how an `UPDATE` of one row reaches a stored column.
+    ///
+    /// A flat column takes it in place, see [`Data::put`]. Any other form is built again around
+    /// the new row, which reads every row of it and is what a dictionary, a packed run or a
+    /// constant costs to write one row of.
+    ///
+    /// # Errors
+    ///
+    /// If `index` is past the end, or `value` is not one the column's type can hold.
+    pub fn put(&mut self, index: usize, value: &Value) -> Result<()> {
+        if index >= self.len {
+            return Err(Error::internal("a row written past the end of its column"));
+        }
+        let one = Self::from_values(self.ty.clone(), std::slice::from_ref(value))?;
+        let valid = one.validity.is_valid(0);
+        let placed = match (&mut self.body, &one.body) {
+            (Body::Flat(data), Body::Flat(new)) => data.put(index, new),
+            // What a flat column holds under a null is never read.
+            (Body::Flat(_), _) => !valid,
+            _ => false,
+        };
+        if placed {
+            let validity = std::mem::replace(&mut self.validity, Validity::AllValid);
+            self.validity = if valid {
+                validity.with_value(index, self.len)
+            } else {
+                validity.with_null(index, self.len)
+            };
+            return Ok(());
+        }
+        let order = (0..self.len).map(|row| if row == index { self.len } else { row });
+        let order = order.collect::<Vec<_>>();
+        let built = crate::assemble::interleave(&self.ty, &[self.clone(), one], &order)?;
+        *self = built.into_pages();
+        Ok(())
     }
 
     /// A stable dictionary whose caller already found the largest code while decoding it.

@@ -396,6 +396,24 @@ impl Zone {
         }
     }
 
+    /// Opens column `column` to cover `value` written over a row that was null when `was_null`
+    /// says so, which is what an `UPDATE` of one row does to the zone of its chunk.
+    ///
+    /// The ends stop being exact and the total is gone, because the value written over is still
+    /// inside the ends and no longer in the rows. The null count follows the row.
+    pub fn rewrite(&mut self, column: usize, was_null: bool, value: &Value, ty: &LogicalType) {
+        let Some(range) = self.columns.get_mut(column) else { return };
+        let nulls = range.nulls - usize::from(was_null && range.nulls > 0);
+        match One::of(value, ty) {
+            Some(one) if !value.is_null() => range.widen_one(one),
+            Some(_) => {}
+            None => *range = Range::default(),
+        }
+        range.nulls = nulls + usize::from(value.is_null());
+        range.exact = false;
+        range.sum = None;
+    }
+
     /// Builds a zone from persisted ranges.
     #[must_use]
     pub fn from_ranges(columns: Vec<Range>) -> Self {

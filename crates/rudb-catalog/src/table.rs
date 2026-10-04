@@ -19,7 +19,7 @@ use crate::gone::Gone;
 use crate::held::Held;
 use crate::keys::{ForeignKey, Key, Seen};
 use crate::name::{QualifiedName, same_name};
-use crate::points::{Point, Points, looks_up};
+use crate::points::{Point, Points, Spot, looks_up};
 
 /// Where table revisions are counted from, one counter for the process.
 ///
@@ -1610,6 +1610,10 @@ pub struct Table {
     /// it was, and anything else draws a new one, so two tables with the same frame agree on what
     /// row number `n` means for every row both of them have.
     frame: u64,
+    /// Which placing of the keys this is. A write that leaves every key in the row it was in, an
+    /// update of other columns where the rows are, keeps it, and anything else draws a new one,
+    /// which is what tells `points` to look again.
+    placed: u64,
     /// Where the row of each key is, built the first time a lookup by key asks.
     points: Points,
 }
@@ -1644,6 +1648,7 @@ impl Table {
             sequences: Vec::new(),
             revision: next_revision(),
             frame: next_revision(),
+            placed: next_revision(),
             points: Points::default(),
         })
     }
@@ -1687,6 +1692,7 @@ impl Table {
             sequences: Vec::new(),
             revision: next_revision(),
             frame: next_revision(),
+            placed: next_revision(),
             points: Points::default(),
         })
     }
@@ -1991,6 +1997,23 @@ impl Table {
         values: &[Value],
         columns: &[usize],
     ) -> Result<Option<Point>> {
+        Ok(self.spot(key, values, columns)?.map(|found| match found {
+            Some((_, chunk)) => Point::Found(chunk),
+            None => Point::Absent,
+        }))
+    }
+
+    /// [`Self::point`], with where the row is beside it, for a write to the row there.
+    ///
+    /// # Errors
+    ///
+    /// If the rows cannot be read.
+    pub fn spot(
+        &self,
+        key: &[usize],
+        values: &[Value],
+        columns: &[usize],
+    ) -> Result<Option<Option<(Spot, Chunk)>>> {
         let fits = key.len() == values.len()
             && key.iter().zip(values).all(|(&column, value)| {
                 self.columns.get(column).is_some_and(|field| looks_up(value, &field.ty))
@@ -2023,13 +2046,53 @@ impl Table {
                 .collect();
             &ordered
         };
-        self.points.find(which, &self.rows, self.revision, held, values, columns).map(Some)
+        self.points.seek(which, &self.rows, self.placed, held, values, columns).map(Some)
     }
 
-    /// Draws a new revision, for a table about to be changed.
+    /// Draws a new revision and a new placing, for a table about to be changed.
     pub(crate) fn touch(&mut self) {
         self.revision = next_revision();
+        self.placed = next_revision();
         self.points = Points::default();
+    }
+
+    /// Draws a new revision and keeps the placing, for a table about to have columns of a row that
+    /// are in no key written where the row is, see [`Self::put_row`].
+    pub(crate) fn touch_rows(&mut self) {
+        self.revision = next_revision();
+    }
+
+    /// Writes `values` over the columns `targets` of the row at `spot`, which [`Self::spot`]
+    /// found, `row` being every column of the row as it reads afterwards. Says whether it could,
+    /// and when it could not the table is as it was and the caller takes the long way.
+    ///
+    /// What an `UPDATE` of one row by its key does, `13-the-point-path.md` section 13.4. Every row
+    /// keeps its number and every key its row, so the frame and the placing stay. A column in a
+    /// key is not written here, because the keys held for the next write would be wrong.
+    ///
+    /// # Errors
+    ///
+    /// If a column that refuses nulls would hold one, or the spot is not a row of the table.
+    pub fn put_row(
+        &mut self,
+        spot: Spot,
+        targets: &[usize],
+        values: &[Value],
+        row: &Chunk,
+    ) -> Result<bool> {
+        if self.guards().iter().any(|key| key.columns.iter().any(|column| targets.contains(column)))
+        {
+            return Ok(false);
+        }
+        self.refuse_nulls(row)?;
+        if let Rows::Memory(rows) = &mut self.rows {
+            return rows.put_row(spot.part, spot.place as usize, targets, values);
+        }
+        if matches!(self.rows, Rows::Grown(..)) {
+            return Ok(false);
+        }
+        self.patch_kept(&[spot.number], targets, std::slice::from_ref(row))?;
+        Ok(true)
     }
 
     /// Replaces an empty mutable table with its committed native snapshot.
@@ -2328,6 +2391,12 @@ impl Table {
         for chunk in rows {
             self.refuse_nulls(chunk)?;
         }
+        self.patch_kept(numbers, targets, rows)
+    }
+
+    /// [`Self::patch_rows`] once the rows are checked, for a file table whatever keys it has. The
+    /// keys held for the next write stay right only when `targets` is in none of them.
+    fn patch_kept(&mut self, numbers: &[u64], targets: &[usize], rows: &[Chunk]) -> Result<()> {
         let places = self.places(numbers)?;
         let (reader, mut gone) = match &self.rows {
             Rows::Native(reader) => (reader.clone(), Gone::none(reader.parts())),
