@@ -113,6 +113,25 @@ impl Pool {
         self.threads.load(Ordering::Relaxed)
     }
 
+    /// How many threads a pipeline about to start should plan for.
+    ///
+    /// [`Pool::threads`] for a pool that lends whatever it has. A yielding pool says no more than
+    /// the caller and the cores sitting idle, which is what its lease would lend anyway. The
+    /// number matters before the lease, because a scan is asked it first, cuts its morsels by it
+    /// and spreads its own set-up over that many threads of its own, such as asking a dictionary
+    /// which of its values a `LIKE` keeps. On the JOB bench machine at a load of about 36, 5a
+    /// spent 26.5 ms of wall on 7.3 ms of CPU at six threads against 10.3 ms at one, much of it
+    /// waiting for threads it had spread that set-up over to be scheduled.
+    #[must_use]
+    pub fn ceiling(&self) -> usize {
+        let threads = self.threads();
+        if self.yielding && threads > 1 {
+            threads.min(idle_cores().saturating_add(1))
+        } else {
+            threads
+        }
+    }
+
     /// Change it, which is what `SET threads` does.
     ///
     /// Queries already running keep the threads they were lent. Nothing is taken back mid query,
