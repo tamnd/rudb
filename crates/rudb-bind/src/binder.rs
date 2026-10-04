@@ -285,6 +285,24 @@ struct Materialized {
     /// The number a `recurring.` read of it is paired with, which is `cte` for a definition that
     /// does not read itself and so has no such read.
     recurring: u32,
+    /// What a `recurring.` read of it sees, which is `fields` except while the recursive side of
+    /// a definition with `USING KEY` aggregates is bound, when the rows a round reads are not yet
+    /// the rows of the table.
+    finished: Vec<Field>,
+}
+
+/// An aggregate `USING KEY` names, bound against one side of a recursive definition.
+struct Fold {
+    /// The column its answer lands in.
+    into: u32,
+    /// The call as written, which is bound again for the other side.
+    call: ast::ExprRef,
+    /// The aggregate it runs, as the executor knows it.
+    name: String,
+    /// What it answers.
+    ty: LogicalType,
+    /// Its arguments, over the side it was bound against.
+    args: Vec<ExprRef>,
 }
 
 #[derive(Debug)]
@@ -358,6 +376,9 @@ pub(crate) struct Binder<'a> {
     pub(crate) default_as_null: bool,
     /// Set while an aggregate's own arguments are being bound, so nesting is caught.
     pub(crate) in_aggregate: bool,
+    /// Whether an aggregate of `USING KEY` is being bound, where one inside another is refused in
+    /// other words.
+    folding: bool,
     /// Set while an aggregate's `FILTER` is being bound, which is refused its own aggregate.
     pub(crate) in_filter: bool,
     /// The window runs this select block has collected, in the order they were first written.
@@ -470,6 +491,7 @@ impl<'a> Binder<'a> {
             copy_into: None,
             default_as_null: false,
             in_aggregate: false,
+            folding: false,
             in_filter: false,
             windows: Vec::new(),
             aliases: None,
@@ -695,7 +717,15 @@ impl<'a> Binder<'a> {
         let cte = self.next_cte;
         self.next_cte += 1;
         let fields = scope.fields();
-        self.materialized.push(Materialized { written: index, cte, name, fields, recurring: cte });
+        let finished = fields.clone();
+        self.materialized.push(Materialized {
+            written: index,
+            cte,
+            name,
+            fields,
+            recurring: cte,
+            finished,
+        });
         Ok(node)
     }
 
@@ -724,8 +754,19 @@ impl<'a> Binder<'a> {
             scope.rename_prefix(&names);
         }
         let fields = scope.fields();
-        let anchor = self.project_onto(anchor, &scope, &fields)?;
-        let key = self.recursive_key(ast, held.key, &fields)?;
+        let (anchor, over) = self.project_onto(anchor, &scope, &fields, &name)?;
+        let (key, folds) = self.recursive_key(ast, held.key, &over, &fields)?;
+        let args: Vec<ExprRef> = folds.iter().flat_map(|fold| fold.args.iter().copied()).collect();
+        let anchor = self.with_arguments(anchor, &over, &args);
+        // The table holds each aggregate's answer where its column was, typed as the answer. With
+        // `UNION ALL` a round reads the rows the round before made, which are the anchor's types,
+        // and with `UNION` it reads rows of the table.
+        let mut table = fields.clone();
+        for fold in &folds {
+            table[fold.into as usize].ty = fold.ty.clone();
+        }
+        let all = quantifier == Quantifier::All;
+        let working = if all { fields.clone() } else { table.clone() };
         let cte = self.next_cte;
         let recurring = cte + 1;
         self.next_cte += 2;
@@ -733,8 +774,9 @@ impl<'a> Binder<'a> {
             written: index,
             cte,
             name: name.clone(),
-            fields: fields.clone(),
+            fields: working,
             recurring,
+            finished: table.clone(),
         });
         let (recursive, other) = self.bind_query(ast, right)?;
         if other.len() != scope.len() {
@@ -742,32 +784,58 @@ impl<'a> Binder<'a> {
                 "Set operations can only apply to expressions with the same number of result columns",
             ));
         }
-        let recursive = self.project_onto(recursive, &other, &fields)?;
-        let table = self.fresh_index();
+        let (recursive, over) = self.project_onto(recursive, &other, &fields, &name)?;
+        let mut args = Vec::with_capacity(args.len());
+        for fold in &folds {
+            args.extend(self.fold_call(ast, fold.call, &over)?.args);
+        }
+        let recursive = self.with_arguments(recursive, &over, &args);
+        // What reads the name from here on reads the finished table.
+        if let Some(held) = self.materialized.iter_mut().rev().find(|held| held.written == index) {
+            held.fields = table.clone();
+        }
+        let node_index = self.fresh_index();
         let name = self.plan.intern(&name);
-        let columns = self.plan.add_fields(&fields);
-        let all = quantifier == Quantifier::All;
+        let columns = self.plan.add_fields(&table);
         let key = self.plan.add_positions(&key);
+        let calls: Vec<Field> =
+            folds.iter().map(|fold| Field::new(fold.name.clone(), fold.ty.clone())).collect();
+        let aggregates = self.plan.add_fields(&calls);
+        let into: Vec<u32> =
+            folds.iter().flat_map(|fold| [fold.into, fold.args.len() as u32]).collect();
+        let folds = self.plan.add_positions(&into);
         Ok(self.add_node(Node::RecursiveCte {
             anchor,
             recursive,
-            index: table,
+            index: node_index,
             cte,
             name,
             all,
             columns,
             recurring,
             key,
+            aggregates,
+            folds,
         }))
     }
 
-    /// The positions of the columns `USING KEY (...)` names, in the order it names them.
+    /// The positions of the columns `USING KEY (...)` names, in the order it names them, and the
+    /// aggregates it names, bound against `over`, the left side's columns.
     ///
     /// A key is a column of the definition, by name, the case not mattering and a qualifier not
-    /// looked at. The pin also takes an aggregate call there, which keeps a running aggregate per
-    /// key in the column it names instead of the last row's value, and that is not done yet.
-    fn recursive_key(&mut self, ast: &Ast, key: ast::Slice, fields: &[Field]) -> Result<Vec<u32>> {
+    /// looked at. An aggregate lands in the column its alias names, or failing an alias in the one
+    /// its first argument is, when that argument is a bare column. The list is read in order and
+    /// the pin's checks go with it, so a column named as a key after an aggregate already landed
+    /// in it is taken, where the other order is refused.
+    fn recursive_key(
+        &mut self,
+        ast: &Ast,
+        key: ast::Slice,
+        over: &Scope,
+        fields: &[Field],
+    ) -> Result<(Vec<u32>, Vec<Fold>)> {
         let mut positions = Vec::new();
+        let mut folds: Vec<Fold> = Vec::new();
         for target in ast.target_list(key) {
             let span = ast.expr_span(target.expr);
             match ast.expr(target.expr) {
@@ -788,13 +856,57 @@ impl<'a> Binder<'a> {
                         positions.push(at);
                     }
                 }
-                ast::Expr::Function { name, .. }
+                ast::Expr::Function { name, args, distinct, filter }
                     if kind_of(ast.name(name).last().unwrap_or_default())
                         == Some(FunctionKind::Aggregate) =>
                 {
-                    return Err(Error::not_implemented(
-                        "an aggregate in USING KEY is not supported yet",
-                    ));
+                    let refused = if filter != NONE {
+                        Some("FILTER clause is not yet supported for aggregates in USING KEY")
+                    } else if distinct {
+                        Some("DISTINCT is not yet supported for aggregates in USING KEY")
+                    } else if !ast.aggregate_order(target.expr).is_empty() {
+                        Some("ORDER BY clause is not yet supported for aggregates in USING KEY")
+                    } else {
+                        None
+                    };
+                    if let Some(refused) = refused {
+                        return Err(Error::binder(refused).with_span(span));
+                    }
+                    let mut fold = self.fold_call(ast, target.expr, over)?;
+                    let first = ast.expr_list(args).first().map(|&arg| ast.expr(arg));
+                    let written = if target.alias != NONE {
+                        ast.string(target.alias)
+                    } else if let Some(ast::Expr::Column { name }) = first {
+                        ast.name(name).last().unwrap_or_default()
+                    } else {
+                        return Err(Error::binder(
+                            "In USING KEY, an aggregate must either have a column reference or an alias.",
+                        )
+                        .with_span(span));
+                    };
+                    let Some(into) =
+                        fields.iter().position(|field| same_name(&field.name, written))
+                    else {
+                        return Err(Error::binder(format!(
+                            "Could not find column with name '\"{written}\"' to bind aggregate to."
+                        ))
+                        .with_span(span));
+                    };
+                    let into = into as u32;
+                    if positions.contains(&into) {
+                        return Err(Error::binder(format!(
+                            "Column '\"{written}\"' cannot be used as both key and aggregate in USING KEY clause. Try using an alias for the aggregation."
+                        ))
+                        .with_span(span));
+                    }
+                    if folds.iter().any(|fold| fold.into == into) {
+                        return Err(Error::binder(format!(
+                            "Column '\"{written}\"' referenced multiple times in USING KEY clause. Try using an alias for one of the aggregates."
+                        ))
+                        .with_span(span));
+                    }
+                    fold.into = into;
+                    folds.push(fold);
                 }
                 _ => {
                     return Err(Error::binder(format!(
@@ -805,23 +917,101 @@ impl<'a> Binder<'a> {
                 }
             }
         }
-        Ok(positions)
+        if positions.is_empty() && !folds.is_empty() {
+            return Err(Error::binder("USING KEY clause requires at least one key column."));
+        }
+        Ok((positions, folds))
+    }
+
+    /// An aggregate call of `USING KEY`, bound against one side's columns the way a call in a
+    /// select list is, so it is resolved and checked by the same rules.
+    ///
+    /// It is bound into an aggregation of its own that is thrown away after, since what is kept is
+    /// the call's name, its answer's type and its arguments, which the side computes as columns.
+    fn fold_call(&mut self, ast: &Ast, call: ast::ExprRef, over: &Scope) -> Result<Fold> {
+        let index = self.fresh_index();
+        let aggregation = Aggregation { index, groups: Vec::new(), aggregates: Vec::new() };
+        let outer = self.aggregation.replace(aggregation);
+        self.folding = true;
+        let bound = self.bind_expr(ast, call, over);
+        self.folding = false;
+        let aggregation = std::mem::replace(&mut self.aggregation, outer);
+        let bound = bound?;
+        let aggregates = aggregation.map(|held| held.aggregates).unwrap_or_default();
+        let at = match self.plan.expr(bound) {
+            Expr::Column(binding) if binding.table == index => binding.column as usize,
+            _ => return Err(Error::internal("a USING KEY aggregate bound to something else")),
+        };
+        let Some(&found) = aggregates.get(at) else {
+            return Err(Error::internal("a USING KEY aggregate that was not recorded"));
+        };
+        let Expr::Aggregate { name, args, .. } = *self.plan.expr(found) else {
+            return Err(Error::internal("a USING KEY aggregate that is not an aggregate"));
+        };
+        Ok(Fold {
+            into: 0,
+            call,
+            name: self.plan.string(name).to_string(),
+            ty: self.plan.expr_type(found).clone(),
+            args: self.plan.expr_list(args).to_vec(),
+        })
     }
 
     /// Projects a side of a recursive definition onto the definition's columns by position, casting
-    /// each to the type the left side gave it.
-    fn project_onto(&mut self, node: NodeRef, scope: &Scope, fields: &[Field]) -> Result<NodeRef> {
+    /// each to the type the left side gave it, and answers the scope of what it produces.
+    fn project_onto(
+        &mut self,
+        node: NodeRef,
+        scope: &Scope,
+        fields: &[Field],
+        name: &str,
+    ) -> Result<(NodeRef, Scope)> {
         let table = self.fresh_index();
         let mut exprs = Vec::with_capacity(fields.len());
         let mut names = Vec::with_capacity(fields.len());
-        for (column, field) in scope.columns.iter().zip(fields) {
+        let mut over = Scope::empty();
+        for (at, (column, field)) in scope.columns.iter().zip(fields).enumerate() {
             let expr = self.plan.add_expr(Expr::Column(column.binding), column.ty.clone());
             exprs.push(self.checked_cast_to(expr, &field.ty, false)?);
             names.push(self.plan.intern(&field.name));
+            over.push(Visible {
+                table: name.to_string(),
+                name: field.name.clone(),
+                binding: ColumnBinding::new(table, at as u32),
+                ty: field.ty.clone(),
+                not_null: false,
+                key: None,
+                default: None,
+                qualified: false,
+                also: None,
+            });
         }
         let exprs = self.plan.add_expr_list(&exprs);
         let names = self.plan.add_name_list(&names);
-        Ok(self.add_node(Node::Project { input: node, index: table, exprs, names }))
+        let node = self.add_node(Node::Project { input: node, index: table, exprs, names });
+        Ok((node, over))
+    }
+
+    /// A side of a recursive definition with the arguments of its `USING KEY` aggregates computed
+    /// as columns after its own, or the side as it was when there are none.
+    fn with_arguments(&mut self, node: NodeRef, over: &Scope, args: &[ExprRef]) -> NodeRef {
+        if args.is_empty() {
+            return node;
+        }
+        let table = self.fresh_index();
+        let mut exprs = Vec::with_capacity(over.len() + args.len());
+        let mut names = Vec::with_capacity(over.len() + args.len());
+        for column in &over.columns {
+            exprs.push(self.plan.add_expr(Expr::Column(column.binding), column.ty.clone()));
+            names.push(self.plan.intern(&column.name));
+        }
+        for (at, &arg) in args.iter().enumerate() {
+            exprs.push(arg);
+            names.push(self.plan.intern(&format!("#{at}")));
+        }
+        let exprs = self.plan.add_expr_list(&exprs);
+        let names = self.plan.add_name_list(&names);
+        self.add_node(Node::Project { input: node, index: table, exprs, names })
     }
 
     fn bind_body(&mut self, ast: &Ast, written: &ast::Query) -> Result<(NodeRef, Scope)> {
@@ -2371,7 +2561,7 @@ impl<'a> Binder<'a> {
             return Err(Error::binder(format!("Table with name {name} does not exist!")));
         };
         let cte = if recurring { held.recurring } else { held.cte };
-        let fields = held.fields.clone();
+        let fields = if recurring { held.finished.clone() } else { held.fields.clone() };
         let text = held.name.clone();
         let label = if alias == NONE { text.clone() } else { ast.string(alias).to_string() };
         let name = self.plan.intern(&text);
@@ -3882,6 +4072,9 @@ impl<'a> Binder<'a> {
         let exporting = std::mem::take(&mut self.exporting);
         if self.in_filter {
             return Err(Error::binder("aggregate functions are not allowed in FILTER"));
+        }
+        if self.in_aggregate && self.folding {
+            return Err(Error::binder("Aggregate functions are not supported here"));
         }
         if self.in_aggregate {
             return Err(Error::binder("aggregate function calls cannot be nested"));

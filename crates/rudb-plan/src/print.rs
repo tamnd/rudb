@@ -241,7 +241,18 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             write!(out, " @{cte} #{index} ")?;
             write_schema(plan, out, columns)
         }
-        Node::RecursiveCte { index, cte, name, all, columns, recurring, key, .. } => {
+        Node::RecursiveCte {
+            index,
+            cte,
+            name,
+            all,
+            columns,
+            recurring,
+            key,
+            aggregates,
+            folds,
+            ..
+        } => {
             out.write_char(' ')?;
             write_identifier(out, plan.string(name))?;
             let quantifier = if all { "ALL" } else { "DISTINCT" };
@@ -250,6 +261,21 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
                 let positions: Vec<String> =
                     plan.position_list(key).iter().map(u32::to_string).collect();
                 write!(out, "KEY ({}) ", positions.join(", "))?;
+            }
+            if !aggregates.is_empty() {
+                out.write_str("FOLD (")?;
+                let calls = plan.field_list(aggregates);
+                for (at, (call, fold)) in
+                    calls.iter().zip(plan.position_list(folds).chunks(2)).enumerate()
+                {
+                    if at > 0 {
+                        out.write_str(", ")?;
+                    }
+                    write!(out, "{} ", fold[0])?;
+                    write_identifier(out, &call.name)?;
+                    write!(out, " {} {}", fold[1], call.ty)?;
+                }
+                out.write_str(") ")?;
             }
             write!(out, "#{index} ")?;
             write_schema(plan, out, columns)

@@ -20,10 +20,18 @@
 //! without it only one row per key whose value this round changed, a key that came back with the
 //! value it had being no work at all. A `recurring.` read sees the table as it stood when the round
 //! began, and without a key it sees every row produced so far.
+//!
+//! An aggregate in `USING KEY` keeps a running state per key over every row any round made for it,
+//! and the key's row holds what that state answers in the aggregate's column. The sides compute the
+//! aggregates' arguments as columns after their own, which are read here and never kept. With `ALL`
+//! a round reads the rows the round before made as they came, and without it the rows of the table,
+//! one per key whose answer changed, so a state that moved and came back to the same answer is no
+//! work.
 
 use std::sync::{Arc, Mutex};
 
-use rudb_common::{Error, Reservation, Result, Value};
+use rudb_common::{Error, LogicalType, Reservation, Result, Value};
+use rudb_kernels::Accumulator;
 use rudb_metrics::Report;
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_vector::Chunk;
@@ -43,6 +51,11 @@ pub(crate) struct Fixpoint<'a> {
     all: bool,
     /// The positions of the `USING KEY` columns, empty without one.
     key: Vec<usize>,
+    /// The aggregates in `USING KEY`, empty without any.
+    folds: Vec<Fold>,
+    /// The types of the rows a round reads, which are the anchor's with `ALL` and aggregates, and
+    /// the table's otherwise.
+    working: Vec<LogicalType>,
     /// The anchor's rows, as every instance gathered them.
     anchor: Mutex<Vec<Vec<Value>>>,
     /// What the anchor's rows are charged, given back once the finished chunks are charged instead.
@@ -59,6 +72,8 @@ impl<'a> Fixpoint<'a> {
         schema: Schema,
         all: bool,
         key: Vec<usize>,
+        folds: Vec<Fold>,
+        working: Vec<LogicalType>,
     ) -> (Self, Buffered) {
         let out = Buffered::new();
         let held = Mutex::new(round.memory.reservation());
@@ -67,6 +82,8 @@ impl<'a> Fixpoint<'a> {
             schema,
             all,
             key,
+            folds,
+            working,
             anchor: Mutex::new(Vec::new()),
             charged: Mutex::new(Vec::new()),
             held,
@@ -83,15 +100,14 @@ impl<'a> Fixpoint<'a> {
         so_far: &[Vec<Value>],
         lease: &Lease<'_>,
     ) -> Result<Vec<Vec<Value>>> {
-        let types = self.schema.types();
         let mut charged = self.round.memory.reservation();
         let table = Buffered::new();
-        table.fill(rows::chunks(&types, working, &mut charged)?)?;
+        table.fill(rows::chunks(&self.working, working, &mut charged)?)?;
         let mut held = self.round.outer.clone();
         held.push((self.round.cte, table));
         if let Some(recurring) = self.round.recurring {
             let snapshot = Buffered::new();
-            snapshot.fill(rows::chunks(&types, so_far, &mut charged)?)?;
+            snapshot.fill(rows::chunks(&self.schema.types(), so_far, &mut charged)?)?;
             held.push((recurring, snapshot));
         }
         let (gather, made) = Gather::new(&self.round.memory);
@@ -164,27 +180,30 @@ impl Fixpoint<'_> {
     /// The last row each key was given, keys in the order they first came, with a key.
     fn keyed(&self, anchor: Vec<Vec<Value>>, threads: &Lease<'_>) -> Result<Vec<Vec<Value>>> {
         let mut table = Keyed::default();
-        let mut working = self.apply(&mut table, anchor);
+        let mut working = self.apply(&mut table, anchor)?;
         if self.round.once {
             let made = self.round(&working, &table.rows, threads)?;
-            self.apply(&mut table, made);
+            self.apply(&mut table, made)?;
             return Ok(table.rows);
         }
         while !working.is_empty() {
             self.round.cancel.check()?;
             let made = self.round(&working, &table.rows, threads)?;
-            working = self.apply(&mut table, made);
+            working = self.apply(&mut table, made)?;
         }
         Ok(table.rows)
     }
 
     /// Puts what a round made into the table and answers what the next round reads.
-    fn apply(&self, table: &mut Keyed, made: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    fn apply(&self, table: &mut Keyed, made: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
+        if !self.folds.is_empty() {
+            return self.fold(table, made);
+        }
         if self.all {
             for row in &made {
                 table.put(self.key_of(row), row.clone());
             }
-            return made;
+            return Ok(made);
         }
         // What each key this round touched held before it, in the order the keys came.
         let mut touched: Vec<(usize, Option<Vec<Value>>)> = Vec::new();
@@ -206,7 +225,7 @@ impl Fixpoint<'_> {
                 }
             }
         }
-        touched
+        Ok(touched
             .into_iter()
             .filter(|(slot, before)| {
                 before.as_ref().is_none_or(|before| {
@@ -214,7 +233,73 @@ impl Fixpoint<'_> {
                 })
             })
             .map(|(slot, _)| table.rows[slot].clone())
-            .collect()
+            .collect())
+    }
+
+    /// [`Self::apply`] with aggregates, where every row made goes into its key's states and the
+    /// key's row takes what they answer once the round's rows are all in.
+    fn fold(&self, table: &mut Keyed, made: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
+        let width = self.working.len();
+        let mut touched: Vec<(usize, Option<Vec<Value>>)> = Vec::new();
+        let mut first = vec![false; table.rows.len()];
+        for row in &made {
+            let key = self.key_of(row);
+            let slot = match table.at.get(&key) {
+                Some(&slot) => {
+                    if slot < first.len() && !first[slot] {
+                        first[slot] = true;
+                        touched.push((slot, Some(table.rows[slot].clone())));
+                    }
+                    slot
+                }
+                None => {
+                    let states = self
+                        .folds
+                        .iter()
+                        .map(|fold| Accumulator::new(&fold.name, &fold.returns))
+                        .collect::<Result<Vec<_>>>()?;
+                    let slot = table.rows.len();
+                    touched.push((slot, None));
+                    table.put(key, row[..width].to_vec());
+                    table.states.push(states);
+                    slot
+                }
+            };
+            let mut at = width;
+            for (fold, state) in self.folds.iter().zip(&mut table.states[slot]) {
+                state.update(&row[at..at + fold.args])?;
+                at += fold.args;
+            }
+            let kept = &mut table.rows[slot];
+            for (column, value) in row[..width].iter().enumerate() {
+                if !self.folds.iter().any(|fold| fold.into == column) {
+                    kept[column] = value.clone();
+                }
+            }
+        }
+        for &(slot, _) in &touched {
+            for (fold, state) in self.folds.iter().zip(&table.states[slot]) {
+                table.rows[slot][fold.into] = state.finish()?;
+            }
+        }
+        if self.all {
+            return Ok(made
+                .into_iter()
+                .map(|mut row| {
+                    row.truncate(width);
+                    row
+                })
+                .collect());
+        }
+        Ok(touched
+            .into_iter()
+            .filter(|(slot, before)| {
+                before.as_ref().is_none_or(|before| {
+                    !before.iter().zip(&table.rows[*slot]).all(|(was, now)| same(was, now))
+                })
+            })
+            .map(|(slot, _)| table.rows[slot].clone())
+            .collect())
     }
 
     /// The values of a row's key columns, as one key.
@@ -223,11 +308,27 @@ impl Fixpoint<'_> {
     }
 }
 
+/// An aggregate in `USING KEY`.
+#[derive(Debug)]
+pub(crate) struct Fold {
+    /// The column its answer lands in.
+    pub(crate) into: usize,
+    /// The aggregate it runs.
+    pub(crate) name: String,
+    /// What it answers.
+    pub(crate) returns: LogicalType,
+    /// How many of the columns after the definition's it reads, which come after those every
+    /// aggregate before it reads.
+    pub(crate) args: usize,
+}
+
 /// The rows of a keyed recursion, one per key, and where each key's row is.
 #[derive(Default)]
 struct Keyed {
     rows: Vec<Vec<Value>>,
     at: RowMap<usize>,
+    /// Each row's aggregate states, in the order of the rows, empty without aggregates.
+    states: Vec<Vec<Accumulator>>,
 }
 
 impl Keyed {

@@ -1510,16 +1510,26 @@ impl Plan {
                 }
                 self.checked_field_list(columns, reference)?;
             }
-            Node::RecursiveCte { name, columns, key, .. } => {
+            Node::RecursiveCte { name, columns, key, aggregates, folds, .. } => {
                 if name as usize >= self.strings.len() {
                     return fail("names a string that is not in the table");
                 }
                 let width = self.checked_field_list(columns, reference)?.len();
-                if key.start as usize + key.len as usize > self.positions.len() {
-                    return fail("names a position run that is not in the pool");
+                let calls = self.checked_field_list(aggregates, reference)?.len();
+                for run in [key, folds] {
+                    if run.start as usize + run.len as usize > self.positions.len() {
+                        return fail("names a position run that is not in the pool");
+                    }
                 }
                 if self.position_list(key).iter().any(|&at| at as usize >= width) {
                     return fail("keys on a column it does not have");
+                }
+                let folds = self.position_list(folds);
+                if folds.len() != 2 * calls {
+                    return fail("has a different number of aggregates than folds");
+                }
+                if folds.chunks(2).any(|fold| fold[0] as usize >= width) {
+                    return fail("folds into a column it does not have");
                 }
             }
             Node::SetOp { .. } => {}

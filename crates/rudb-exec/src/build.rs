@@ -89,7 +89,7 @@ use crate::links::links;
 use crate::percent::{LimitPercent, Portion};
 use crate::prepared::{Prepared, Scratch};
 use crate::query::Query;
-use crate::recursive::Fixpoint;
+use crate::recursive::{Fixpoint, Fold};
 use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
@@ -3681,6 +3681,8 @@ impl<'a> Building<'a, '_> {
                 columns,
                 recurring,
                 key,
+                aggregates,
+                folds,
                 ..
             } => {
                 // The anchor ends here, and the rounds run in this node's finish, each one a query
@@ -3705,7 +3707,26 @@ impl<'a> Building<'a, '_> {
                     outer: self.held.iter().map(|held| (held.cte, held.chunks.clone())).collect(),
                 };
                 let key = plan.position_list(key).iter().map(|&at| at as usize).collect();
-                let (fixpoint, out) = Fixpoint::new(round, schema.clone(), all, key);
+                let folds: Vec<Fold> = plan
+                    .field_list(aggregates)
+                    .iter()
+                    .zip(plan.position_list(folds).chunks(2))
+                    .map(|(call, into)| Fold {
+                        into: into[0] as usize,
+                        name: call.name.clone(),
+                        returns: call.ty.clone(),
+                        args: into[1] as usize,
+                    })
+                    .collect();
+                // With `ALL` a round reads the rows made as they came, which are the anchor's
+                // types where an aggregate's answer is typed otherwise.
+                let mut working = schema.types();
+                if all {
+                    let width = working.len();
+                    working.clone_from_slice(&below.schema.types()[..width]);
+                }
+                let (fixpoint, out) =
+                    Fixpoint::new(round, schema.clone(), all, key, folds, working);
                 let counters = self.watch(reference, id, pipeline, "RecursiveCTE", None);
                 let reading = Arc::clone(&counters);
                 self.close(below, pipeline, Arc::new(Watched::new(fixpoint, counters)));
