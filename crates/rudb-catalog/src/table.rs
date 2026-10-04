@@ -2505,6 +2505,40 @@ impl Table {
         Ok(sets)
     }
 
+    /// Refuses rows a transaction is adding when a key of theirs is one somebody committed since
+    /// its snapshot, `self` being the committed table and `before` the table as the snapshot has
+    /// it. The pin fails the statement there, ahead of the commit, which would fail too.
+    ///
+    /// A key the snapshot held as well is left alone: the transaction's own copy refuses it, unless
+    /// the transaction deleted it, and then adding it again is the transaction's to do.
+    ///
+    /// # Errors
+    ///
+    /// The pin's duplicate key error, or if the rows cannot be read.
+    pub fn refuse_keys_since(&mut self, before: &Table, chunks: &[Chunk]) -> Result<()> {
+        let guards = self.guards();
+        if self.revision == before.revision || guards.is_empty() || guards != before.guards() {
+            return Ok(());
+        }
+        if self.seen.len() != guards.len() {
+            self.seen = vec![None; guards.len()];
+        }
+        for (at, key) in guards.iter().enumerate() {
+            let held = match self.seen[at].take() {
+                Some(held) => held,
+                None => self.stored_keys(key)?,
+            };
+            let then = || match before.seen.get(at) {
+                Some(Some(then)) => Ok(then.clone()),
+                _ => before.stored_keys(key),
+            };
+            let refused = held.refuse_added(then, chunks, key, &self.columns);
+            self.seen[at] = Some(held);
+            refused?;
+        }
+        Ok(())
+    }
+
     /// The keys of every row the table holds for `key`, read a part at a time and only from the
     /// key's own columns, so building them holds one part beside the set rather than every column
     /// of every row.

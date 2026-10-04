@@ -4069,6 +4069,33 @@ impl Shared {
         merged
     }
 
+    /// Refuses rows the open transaction is adding to `name` when a key of theirs was committed
+    /// by somebody else since its snapshot, which the pin finds at the statement rather than at
+    /// the commit. `mine` is the transaction's catalog.
+    fn refuse_keys_since(
+        &self,
+        mine: &Catalog,
+        name: &QualifiedName,
+        chunks: &[Chunk],
+    ) -> Result<()> {
+        let table = mine.table(name)?;
+        if table.keys().is_empty() && table.indexes().iter().all(|index| !index.unique) {
+            return Ok(());
+        }
+        let oid = table.oid();
+        let open = self.open();
+        let Some(snapshot) = open.as_ref().and_then(|open| open.snapshot.as_ref()) else {
+            return Ok(());
+        };
+        let Some(before) = snapshot.base.tables().find(|table| table.oid() == oid) else {
+            return Ok(());
+        };
+        let mut committed = self.committed();
+        let Some(now) = committed.tables().find(|table| table.oid() == oid) else { return Ok(()) };
+        let now = now.name().clone();
+        committed.table_mut(&now)?.refuse_keys_since(before, chunks)
+    }
+
     /// Checks the rows at `flagged` of the table `oid`, which an update or a delete is about to
     /// change, against the rows the other transactions have claimed and the rows committed since
     /// this one's snapshot, and hands back what to claim once the change is in. `None` when no
@@ -5510,6 +5537,7 @@ impl Shared {
                             self.check(sql, &mut catalog, place, &insert.name, checks, &chunks)?;
                         }
                         foreign::missing(&catalog, &insert.name, &chunks)?;
+                        self.refuse_keys_since(&catalog, &insert.name, &chunks)?;
                         let added = chunks.iter().map(Chunk::len).sum();
                         let written = if wanted { chunks.clone() } else { Vec::new() };
                         let name = &insert.name;
