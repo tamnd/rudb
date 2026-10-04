@@ -4758,22 +4758,37 @@ impl<'a> Aggregate<'a> {
         // million orders do, the keys and the answers are made for those and nothing else. Every
         // closed group used to be answered and held to the end of the scan, 36 MB at SF1 written
         // into fresh pages, for the filter above to throw nearly all of it away.
+        // The answers are only read here and are all written before that, so the buffer the thread
+        // keeps is grown and never zeroed. Zeroing a fresh one every chunk was memset's share of q18.
         if let Some((call, minimum)) = self.having_total {
-            let mut answers = vec![0_i128; starts.len()];
-            let mut valid = vec![true; starts.len()];
-            if !self.run_answers(rows, call, &starts, &ends, &mut answers, &mut valid)? {
+            thread_local! {
+                static PASSING: std::cell::RefCell<(Vec<i128>, Vec<bool>)> =
+                    const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+            }
+            let groups = starts.len();
+            let answered = PASSING.with_borrow_mut(|(answers, valid)| -> Result<bool> {
+                answers.resize(groups.max(answers.len()), 0);
+                valid.clear();
+                valid.resize(groups, true);
+                let answers = &mut answers[..groups];
+                if !self.run_answers(rows, call, &starts, &ends, answers, valid)? {
+                    return Ok(false);
+                }
+                let mut kept = 0;
+                for group in 0..groups {
+                    if valid[group] && answers[group] >= minimum {
+                        starts[kept] = starts[group];
+                        ends[kept] = ends[group];
+                        kept += 1;
+                    }
+                }
+                starts.truncate(kept);
+                ends.truncate(kept);
+                Ok(true)
+            })?;
+            if !answered {
                 return Ok(None);
             }
-            let mut kept = 0;
-            for group in 0..starts.len() {
-                if valid[group] && answers[group] >= minimum {
-                    starts[kept] = starts[group];
-                    ends[kept] = ends[group];
-                    kept += 1;
-                }
-            }
-            starts.truncate(kept);
-            ends.truncate(kept);
         }
         let groups = starts.len();
         let types = self.schema.types();
@@ -5595,11 +5610,12 @@ fn packed_run_totals(
     }
     let base = packed.base();
     RUNNING.with_borrow_mut(|running| {
-        running.clear();
-        running.resize(rows + 1, 0);
-        packed.unpack(from, &mut running[1..]);
+        // Only grown, since the unpack writes every word it reads after the first.
+        running.resize(running.len().max(rows + 1), 0);
+        running[0] = 0;
+        packed.unpack(from, &mut running[1..=rows]);
         let mut total = 0;
-        for at in &mut running[1..] {
+        for at in &mut running[1..=rows] {
             total += *at;
             *at = total;
         }
