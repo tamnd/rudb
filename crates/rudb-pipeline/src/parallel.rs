@@ -27,6 +27,7 @@ use std::time::Instant;
 use rudb_common::{Cancel, Error, Result};
 use rudb_metrics::Span;
 
+use crate::dynamic::LocalState;
 use crate::pipeline::Pipeline;
 use crate::pool::Lease;
 use crate::serial::{Stop, drain, instance, run_serial};
@@ -175,7 +176,7 @@ pub fn run_parallel(
     let task = || {
         began();
         let measured = Span::start();
-        let ran = one(pipeline, cancel, &stop, &failed);
+        let ran = one(pipeline, cancel, &stop, &failed).map(|_| ());
         let (wall, cpu) = measured.stop();
         spent.fetch_add(cpu, Ordering::Relaxed);
         record(wall, cpu);
@@ -190,6 +191,12 @@ pub fn run_parallel(
         ran
     };
     let (mine, panicked) = lease.scatter_at_most(instances, &task, caller);
+    // A pipeline that cannot run twice ran as this one instance, so the drain carries on with its
+    // state. See `drain`.
+    let (mine, alone) = match mine {
+        Ok(streams) => (Ok(()), streams.filter(|_| !pipeline.parallel())),
+        Err(error) => (Err(error), None),
+    };
     keep(&failure, mine);
     if panicked {
         keep(&failure, Err(panicked_thread()));
@@ -201,7 +208,7 @@ pub fn run_parallel(
 
     // After every instance and before the finish. What an operator owes at the end is a fact about
     // all of them put together, which is why no instance could have said it on its way out.
-    drain(pipeline, cancel)?;
+    drain(pipeline, cancel, alone)?;
 
     let measured = Span::start();
     let finalized = pipeline.sink().finalize_state(lease);
@@ -259,10 +266,18 @@ fn keep(failure: &Mutex<Option<Error>>, ran: Result<()>) {
 /// already and that is fine, because the query answers with the error and nothing reads what they
 /// built. `finalize` is what turns a sink's state into an answer and it is not called at all when
 /// anything failed.
-fn one(pipeline: &Pipeline<'_>, cancel: &Cancel, stop: &Stop, failed: &AtomicBool) -> Result<()> {
+///
+/// What it hands back is the operators' state once the instance is done with it, which the drain
+/// carries on with when this was the only instance. `None` when it did not get as far as combining.
+fn one(
+    pipeline: &Pipeline<'_>,
+    cancel: &Cancel,
+    stop: &Stop,
+    failed: &AtomicBool,
+) -> Result<Option<Vec<LocalState>>> {
     let mut locals = pipeline.locals();
     let ran = match instance(pipeline, cancel, stop, &mut locals) {
-        Ok(()) if failed.load(Ordering::Relaxed) => return Ok(()),
+        Ok(()) if failed.load(Ordering::Relaxed) => return Ok(None),
         Ok(()) => pipeline.sink().combine_state(locals.sink),
         Err(error) => Err(error),
     };
@@ -271,7 +286,7 @@ fn one(pipeline: &Pipeline<'_>, cancel: &Cancel, stop: &Stop, failed: &AtomicBoo
         stop.ask();
         return Err(error);
     }
-    Ok(())
+    Ok(Some(locals.streams))
 }
 
 /// What a thread that panicked is reported as.

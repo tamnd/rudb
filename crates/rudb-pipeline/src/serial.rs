@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rudb_common::{Cancel, Error, Result};
 use rudb_vector::Chunk;
 
+use crate::dynamic::LocalState;
 use crate::hold::Held;
 use crate::morsel::Morsel;
 use crate::pipeline::{Locals, Pipeline};
@@ -58,7 +59,7 @@ pub fn run_serial(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
     let mut locals = pipeline.locals();
     instance(pipeline, cancel, &stop, &mut locals)?;
     pipeline.sink().combine_state(locals.sink)?;
-    drain(pipeline, cancel)?;
+    drain(pipeline, cancel, Some(locals.streams))?;
     pipeline.sink().finalize_state(&alone)
 }
 
@@ -278,11 +279,23 @@ fn forget(locals: &mut Locals, at: usize) {
 ///
 /// Top down, because an operator's drain goes to whatever is below it and an operator below may
 /// owe chunks of its own once it has seen them.
-pub(crate) fn drain(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
+///
+/// `alone` is the operators' state from the one instance that ran, when only one did. The drain
+/// then carries on with it rather than with fresh state, because an operator that cannot run twice
+/// counts across everything it is given. A `LIMIT 2` over a `RIGHT JOIN` is the case: it had
+/// already let two pairs through, and with fresh state it let two padded rows through as well.
+pub(crate) fn drain(
+    pipeline: &Pipeline<'_>,
+    cancel: &Cancel,
+    alone: Option<Vec<LocalState>>,
+) -> Result<()> {
     if !pipeline.streams().iter().any(|stream| stream.drains_once()) {
         return Ok(());
     }
     let mut locals = pipeline.locals();
+    if let Some(streams) = alone {
+        locals.streams = streams;
+    }
     // A drained chunk came from no morsel, and a root putting chunks back into the order the
     // morsels were cut in needs somewhere to put it. After the last of them is where it goes, and
     // that is not a choice: these are the rows an operator could only produce once every morsel
