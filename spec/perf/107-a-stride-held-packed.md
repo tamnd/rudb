@@ -17,3 +17,14 @@ The rule is about the shape of the values rather than about a query. A stride is
 ## Results
 
 Measured on server2 at SF1 on one thread, user cycles in millions, against main with #2431. All 22 queries give the same answers as before.
+
+| Query | Before | After |
+| --- | --- | --- |
+| q06 | 84 | 63 |
+| q09 | 410 | 356 |
+| q01 | 253 | 273 |
+| q20 | 173 | 182 |
+
+q06 is a quarter faster, and the second run gave 82 against 61. q09 reads `l_quantity` for the rows its joins keep, which is a sparse gather that is cheaper out of 10 MB than out of 48. q01 is about 8% slower in every run. It sums `l_quantity` over 98% of the rows, so it now unpacks the codes it used to read flat, and `unpack_block` went from 9% to 12% of the query. q20 moved by less than the noise. The other queries didn't move beyond the noise, and the total over all 22 is about the same.
+
+What this leaves is the cost of unpacking, which every packed column pays in an aggregate. The lanes of note 106 read eight codes with one shuffle, and the same shuffle can unpack them, which is the next change.
