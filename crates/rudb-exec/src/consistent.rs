@@ -267,7 +267,7 @@ pub(crate) struct Reduction {
     /// The same, once the root has finished.
     allowed: Vec<OnceLock<Keys>>,
     /// Per relation, the rows it kept for the second sweep.
-    held: Vec<Mutex<Vec<Chunk>>>,
+    held: Vec<Mutex<Vec<Held>>>,
     /// Per relation, how many rows it kept.
     kept: Vec<Mutex<u64>>,
     /// One accumulator per extreme that has seen nothing, which every instance of a root's sink
@@ -442,6 +442,38 @@ impl<'a> Collect<'a> {
     fn last(&self) -> bool {
         self.shared.finished.load(Ordering::Acquire) + 1 == self.shared.roles.len()
     }
+
+    /// The rows of `chunk` that `selection` keeps, as the second sweep reads them. The keys are
+    /// the ones `sink` read into `local.values` for this chunk.
+    fn hold(&self, chunk: &Chunk, selection: &Selection, local: &mut Collecting) -> Result<Held> {
+        let role = &self.shared.roles[self.at];
+        let kept = selection.indices();
+        let gather =
+            |values: &[i64]| -> Vec<i64> { kept.iter().map(|&row| values[row as usize]).collect() };
+        let keys = role
+            .parent
+            .iter()
+            .copied()
+            .chain(role.trailing.iter().map(|&(_, key)| key))
+            .chain(role.down.iter().map(|&(_, key)| key));
+        let mut numbers: Vec<Vec<i64>> = keys.map(|key| gather(&local.values[key])).collect();
+        let mut values = Vec::new();
+        for &(output, column) in &role.extremes {
+            let vector = chunk.column(column)?;
+            if self.fetches[output].is_some() {
+                read(vector, chunk.len(), &mut local.places, &mut local.nulls)?;
+                numbers.push(gather(&local.places));
+            } else {
+                values.push(vector.clone());
+            }
+        }
+        let values = if values.is_empty() {
+            None
+        } else {
+            Some(Chunk::with_rows(values, chunk.len())?.compact(selection)?)
+        };
+        Ok(Held { numbers, values, rows: kept.len() })
+    }
 }
 
 /// What one instance of a relation's sink builds.
@@ -458,12 +490,31 @@ pub(crate) struct Collecting {
     /// The extremes, for a root, and nothing otherwise.
     extremes: Option<Vec<Accumulator>>,
     /// The rows held for the second sweep.
-    held: Vec<Chunk>,
+    held: Vec<Held>,
     charged: Reservation,
     kept: u64,
     /// One column of keys at a time, reused from chunk to chunk.
     values: Vec<Vec<i64>>,
     nulls: Vec<bool>,
+    /// The row places of an extreme read late, reused the same way.
+    places: Vec<i64>,
+}
+
+/// The rows of one chunk that a relation kept for the second sweep.
+///
+/// The keys are held as the integers the sink already read them as, gathered down to the kept rows,
+/// and so are the row places of the extremes read late. Holding them as the vectors they came in
+/// was a gather of each one through whatever form it was in, a run or a dictionary or the ids of a
+/// link join, and then a second read of the same keys in the second sweep. On JOB 8c that gather
+/// was a quarter of the query.
+#[derive(Debug)]
+struct Held {
+    /// The parent's key, the keys of the relations that trail it, the keys of `down` and the row
+    /// places of the extremes read late, in that order, one value per kept row.
+    numbers: Vec<Vec<i64>>,
+    /// The columns of the extremes read here rather than late, for the kept rows.
+    values: Option<Chunk>,
+    rows: usize,
 }
 
 impl Sink for Collect<'_> {
@@ -488,6 +539,7 @@ impl Sink for Collect<'_> {
             kept: 0,
             values: role.keys.iter().map(|_| Vec::new()).collect(),
             nulls: Vec::new(),
+            places: Vec::new(),
         }
     }
 
@@ -542,11 +594,11 @@ impl Sink for Collect<'_> {
         if let Some(extremes) = local.extremes.as_mut() {
             fold(extremes, &role.extremes, chunk, &selection)?;
         }
-        if let Some(columns) = &role.held {
-            let taken: Vec<Vector> =
-                columns.iter().map(|&column| chunk.columns()[column].clone()).collect();
-            let taken = Chunk::with_rows(taken, rows)?.compact(&selection)?;
-            local.charged.grow(u64::try_from(taken.footprint()).unwrap_or(u64::MAX))?;
+        if role.held.is_some() {
+            let taken = self.hold(chunk, &selection, local)?;
+            let footprint = taken.numbers.len() * taken.rows * size_of::<i64>()
+                + taken.values.as_ref().map_or(0, Chunk::footprint);
+            local.charged.grow(u64::try_from(footprint).unwrap_or(u64::MAX))?;
             local.held.push(taken);
         }
         Ok(Progress::More)
@@ -777,9 +829,6 @@ struct Sweeping {
     extremes: Vec<Accumulator>,
     places: Vec<Vec<i64>>,
     survived: usize,
-    values: Vec<i64>,
-    nulls: Vec<bool>,
-    others: Vec<Vec<i64>>,
 }
 
 impl Sweeping {
@@ -789,60 +838,57 @@ impl Sweeping {
             extremes: shared.fresh.clone(),
             places: role.extremes.iter().map(|_| Vec::new()).collect(),
             survived: 0,
-            values: Vec::new(),
-            nulls: Vec::new(),
-            others: role.down.iter().map(|_| Vec::new()).collect(),
         }
     }
 
-    /// Keeps the rows of `chunk` whose keys are allowed, and folds them in.
+    /// Keeps the rows of `held` whose keys are allowed, and folds them in.
     fn chunk(
         &mut self,
         role: &Role,
-        chunk: &Chunk,
+        held: &Held,
         permitted: Option<&Keys>,
         trailed: &[&Keys],
         fetches: &[Option<(&Table, usize)>],
     ) -> Result<()> {
-        let rows = chunk.len();
-        let mut kept: Vec<u32> =
-            (0..u32::try_from(rows).map_err(|_| Error::internal("a huge chunk"))?).collect();
+        let rows = u32::try_from(held.rows).map_err(|_| Error::internal("a huge chunk"))?;
+        let mut kept: Vec<u32> = (0..rows).collect();
         let first = usize::from(role.parent.is_some());
         // The parent key is the first held column and the keys of the relations that trail it
-        // come next, which `Reduction::new` put there.
+        // come next, which `Collect::hold` put there.
         if let Some(permitted) = permitted {
-            read(chunk.column(0)?, rows, &mut self.values, &mut self.nulls)?;
-            permitted.filter(&self.values, &mut kept);
+            permitted.filter(&held.numbers[0], &mut kept);
         }
         for (slot, keys) in trailed.iter().enumerate() {
             if kept.is_empty() {
                 break;
             }
-            read(chunk.column(first + slot)?, rows, &mut self.values, &mut self.nulls)?;
-            keys.filter(&self.values, &mut kept);
+            keys.filter(&held.numbers[first + slot], &mut kept);
         }
         if kept.is_empty() {
             return Ok(());
         }
         self.survived += kept.len();
         let after = first + trailed.len();
-        for (slot, other) in self.others.iter_mut().enumerate() {
-            read(chunk.column(after + slot)?, rows, other, &mut self.nulls)?;
-            self.down[slot].insert_rows(other, &kept);
+        for (slot, keys) in self.down.iter_mut().enumerate() {
+            keys.insert_rows(&held.numbers[after + slot], &kept);
         }
-        let after = after + role.down.len();
+        let mut late = after + role.down.len();
         let mut direct = Vec::with_capacity(role.extremes.len());
         for (slot, &(output, _)) in role.extremes.iter().enumerate() {
             if fetches[output].is_some() {
-                read(chunk.column(after + slot)?, rows, &mut self.values, &mut self.nulls)?;
-                let values = &self.values;
-                self.places[slot].extend(kept.iter().map(|&row| values[row as usize]));
+                let places = &held.numbers[late];
+                self.places[slot].extend(kept.iter().map(|&row| places[row as usize]));
+                late += 1;
             } else {
-                direct.push((output, after + slot));
+                direct.push((output, direct.len()));
             }
         }
-        let selection = Selection::from_indices(kept);
-        fold(&mut self.extremes, &direct, chunk, &selection)
+        match &held.values {
+            Some(values) => {
+                fold(&mut self.extremes, &direct, values, &Selection::from_indices(kept))
+            }
+            None => Ok(()),
+        }
     }
 
     /// Takes in what another thread built over other chunks of the same relation.
@@ -953,7 +999,7 @@ fn sweep(
         }
         let first = usize::from(role.parent.is_some());
         let chunks = std::mem::take(&mut *shared.held[at].lock().map_err(poisoned)?);
-        let rows: usize = chunks.iter().map(Chunk::len).sum();
+        let rows: usize = chunks.iter().map(|held| held.rows).sum();
         let widest = threads.min(chunks.len()).min(rows / SWEPT + 1);
         let built = spread(
             lease,
