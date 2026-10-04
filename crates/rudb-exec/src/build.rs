@@ -461,6 +461,9 @@ struct AggregateBound {
     /// How many groups a count descending TopN above can observe, and which call it ranks them by.
     top_counts: Option<(usize, usize)>,
     having_count: Option<(usize, i64)>,
+    /// A call and the least raw answer a group needs to pass a `HAVING` above, see
+    /// [`total_having_aggregate`].
+    having_total: Option<(usize, i128)>,
 }
 
 fn build_measured_with_sink<'a>(
@@ -696,6 +699,45 @@ fn count_having_aggregate(
     let minimum = match op {
         CompareOp::Greater => value.checked_add(1)?,
         CompareOp::GreaterOrEqual => value,
+        _ => return None,
+    };
+    Some((input, call, minimum))
+}
+
+/// A direct aggregate under `input`, and the call and least raw answer a group needs to pass
+/// `predicate`, when that is a call compared with a constant from above.
+///
+/// The raw answer is the integer the call's answer is made of, so the constant has to be in the
+/// same terms: an integer for an integer answer and a decimal at the answer's scale for a decimal
+/// one. A strict bound is one more than the constant. Anything else is not recognized, and the
+/// Filter stays in the pipeline either way, so this only decides how many groups are made.
+fn total_having_aggregate(
+    plan: &Plan,
+    input: NodeRef,
+    predicate: ExprRef,
+) -> Option<(NodeRef, usize, i128)> {
+    let Node::Aggregate { index, groups, aggregates, .. } = *plan.node(input) else { return None };
+    let Expr::Compare { op, left, right } = *plan.expr(predicate) else { return None };
+    let Expr::Column(column) = *plan.expr(left) else { return None };
+    let Expr::Constant(value) = *plan.expr(right) else { return None };
+    if column.table != index {
+        return None;
+    }
+    let call = (column.column as usize).checked_sub(plan.expr_list(groups).len())?;
+    let aggregate = *plan.expr_list(aggregates).get(call)?;
+    let raw = match (plan.expr_type(aggregate), plan.value(value)) {
+        (LogicalType::Decimal { scale, .. }, Value::Decimal { unscaled, scale: at, .. })
+            if scale == at =>
+        {
+            *unscaled
+        }
+        (LogicalType::BigInt | LogicalType::HugeInt, Value::BigInt(value)) => i128::from(*value),
+        (LogicalType::BigInt | LogicalType::HugeInt, Value::HugeInt(value)) => *value,
+        _ => return None,
+    };
+    let minimum = match op {
+        CompareOp::Greater => raw.checked_add(1)?,
+        CompareOp::GreaterOrEqual => raw,
         _ => return None,
     };
     Some((input, call, minimum))
@@ -2942,6 +2984,10 @@ impl<'a> Building<'a, '_> {
             Some((call, minimum)) => aggregate.having_count(call, minimum),
             None => aggregate,
         };
+        let aggregate = match bound.having_total {
+            Some((call, minimum)) => aggregate.having_total(call, minimum),
+            None => aggregate,
+        };
         let schema = aggregate.schema().clone();
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
@@ -3413,10 +3459,33 @@ impl<'a> Building<'a, '_> {
                                 max_groups: None,
                                 top_counts: None,
                                 having_count: Some((call, minimum)),
+                                having_total: None,
                             },
                         )?
                     }
-                    None => self.node(input)?,
+                    None => match total_having_aggregate(plan, input, predicate) {
+                        Some((aggregate, call, minimum)) => {
+                            let Node::Aggregate { input: under, index, groups, aggregates } =
+                                *plan.node(aggregate)
+                            else {
+                                unreachable!("total_having_aggregate returned another node")
+                            };
+                            self.aggregate(
+                                aggregate,
+                                under,
+                                index,
+                                groups,
+                                aggregates,
+                                AggregateBound {
+                                    max_groups: None,
+                                    top_counts: None,
+                                    having_count: None,
+                                    having_total: Some((call, minimum)),
+                                },
+                            )?
+                        }
+                        None => self.node(input)?,
+                    },
                 };
                 // Cleared whether or not the scan arm took them, because a filter over anything
                 // else leaves them sitting there for whatever scan the walk reaches next.
@@ -3456,7 +3525,12 @@ impl<'a> Building<'a, '_> {
                     index,
                     groups,
                     aggregates,
-                    AggregateBound { max_groups: None, top_counts, having_count: None },
+                    AggregateBound {
+                        max_groups: None,
+                        top_counts,
+                        having_count: None,
+                        having_total: None,
+                    },
                 )?
             }
             Node::Sort { input, keys } => {
@@ -3492,6 +3566,7 @@ impl<'a> Building<'a, '_> {
                             max_groups: Some(max_groups),
                             top_counts: None,
                             having_count: None,
+                            having_total: None,
                         },
                     )?,
                     _ => self.node(input)?,

@@ -347,6 +347,13 @@ pub(crate) struct Aggregate<'a> {
     /// materializing groups that cannot pass it, so a missed shape is slow and never changes an
     /// answer.
     having_count: Option<(usize, i64)>,
+    /// Close by run only the groups whose call at this index answers at least this, in the raw
+    /// integers the call's answer is made of.
+    ///
+    /// As with [`Self::having_count`] the Filter stays above and checks the predicate again, and
+    /// the groups that go through the table are all answered, so this only saves making the groups
+    /// that close inside a chunk and cannot pass.
+    having_total: Option<(usize, i128)>,
     /// The most groups an unordered limit above this operator can observe.
     max_groups: Option<usize>,
     /// How many groups to take room for before the first row arrives, where the planner said.
@@ -1615,6 +1622,7 @@ impl<'a> Aggregate<'a> {
             radix_distinct_count,
             top_counts: None,
             having_count: None,
+            having_total: None,
             max_groups: None,
             presize: None,
             reserve: false,
@@ -1863,6 +1871,16 @@ impl<'a> Aggregate<'a> {
             // The state kept rather than the call named, for the reason [`Aggregate::top_counts`]
             // gives above.
             self.having_count = Some((self.calls[call].state_of(call), minimum));
+        }
+        self
+    }
+
+    /// Answers only the closed groups whose call `call` comes to at least `minimum`, see
+    /// [`Self::having_total`]. A call past the end is ignored.
+    #[must_use]
+    pub(crate) fn having_total(mut self, call: usize, minimum: i128) -> Self {
+        if call < self.calls.len() {
+            self.having_total = Some((call, minimum));
         }
         self
     }
@@ -4737,7 +4755,7 @@ impl<'a> Aggregate<'a> {
             [key] => run_starts(key, from, to),
             _ => None,
         };
-        let starts = match starts {
+        let mut starts = match starts {
             Some(starts) => starts,
             None => {
                 let mut same = Vec::new();
@@ -4751,8 +4769,30 @@ impl<'a> Aggregate<'a> {
                 starts
             }
         };
+        let mut ends: Vec<u32> = starts[1..].to_vec();
+        ends.push(to as u32);
+        // Only the runs that pass a `HAVING` on one of the calls go on, so on q18, where 57 of 1.5
+        // million orders do, the keys and the answers are made for those and nothing else. Every
+        // closed group used to be answered and held to the end of the scan, 36 MB at SF1 written
+        // into fresh pages, for the filter above to throw nearly all of it away.
+        if let Some((call, minimum)) = self.having_total {
+            let mut answers = vec![0_i128; starts.len()];
+            let mut valid = vec![true; starts.len()];
+            if !self.run_answers(rows, call, &starts, &ends, &mut answers, &mut valid)? {
+                return Ok(None);
+            }
+            let mut kept = 0;
+            for group in 0..starts.len() {
+                if valid[group] && answers[group] >= minimum {
+                    starts[kept] = starts[group];
+                    ends[kept] = ends[group];
+                    kept += 1;
+                }
+            }
+            starts.truncate(kept);
+            ends.truncate(kept);
+        }
         let groups = starts.len();
-        let end = |group: usize| starts.get(group + 1).map_or(to, |&start| start as usize);
         let types = self.schema.types();
         let width = self.groups.len();
         let mut columns = Vec::with_capacity(types.len());
@@ -4769,77 +4809,106 @@ impl<'a> Aggregate<'a> {
         let mut valid = vec![true; groups];
         for (at, ty) in types.iter().skip(width).enumerate() {
             valid.fill(true);
-            if self.calls[at].name == "count_star" {
-                for (group, &start) in starts.iter().enumerate() {
-                    answers[group] = (end(group) - start as usize) as i128;
-                }
-            } else {
-                // A flat argument is read where it lies. Cloning it first copied the whole chunk's
-                // values once per call on q18, before a single run was added up.
-                let flattened;
-                let argument = match rows.arguments[at][0].data() {
-                    Some(_) => &rows.arguments[at][0],
-                    None => {
-                        flattened = rows.arguments[at][0].clone().into_flat()?;
-                        &flattened
-                    }
-                };
-                let nulls = argument.validity().has_nulls(rows.rows).then(|| argument.validity());
-                let counting = self.calls[at].name == "count";
-                let least = match self.calls[at].name.as_str() {
-                    "min" => Some(true),
-                    "max" => Some(false),
-                    _ => None,
-                };
-                let values = match counting {
-                    true => None,
-                    false => match integers(argument, rows.rows) {
-                        Some(values) => Some(values),
-                        None => return Ok(None),
-                    },
-                };
-                // Its own loop, so the loop a total takes is the same code it was before extremes
-                // came through here.
-                if let (Some(values), None, Some(least)) = (&values, nulls, least) {
-                    for (group, &start) in starts.iter().enumerate() {
-                        answers[group] = run_extreme(&values[start as usize..end(group)], least);
-                    }
-                    columns.push(whole_answers(&answers, &valid, ty)?);
-                    continue;
-                }
-                for (group, &start) in starts.iter().enumerate() {
-                    let run = start as usize..end(group);
-                    let (total, seen) = match (&values, nulls) {
-                        (None, None) => (run.len() as i128, true),
-                        (None, Some(nulls)) => {
-                            (run.filter(|&row| nulls.is_valid(row)).count() as i128, true)
-                        }
-                        (Some(values), None) => (run_total(&values[run]), true),
-                        (Some(values), Some(nulls)) => {
-                            let mut total = 0_i128;
-                            let mut seen = false;
-                            for row in run {
-                                if nulls.is_valid(row) {
-                                    let value = i128::from(values[row]);
-                                    total = match least {
-                                        None => total + value,
-                                        Some(_) if !seen => value,
-                                        Some(true) => total.min(value),
-                                        Some(false) => total.max(value),
-                                    };
-                                    seen = true;
-                                }
-                            }
-                            (total, seen)
-                        }
-                    };
-                    answers[group] = total;
-                    valid[group] = seen;
-                }
+            if !self.run_answers(rows, at, &starts, &ends, &mut answers, &mut valid)? {
+                return Ok(None);
             }
             columns.push(whole_answers(&answers, &valid, ty)?);
         }
         Chunk::with_rows(columns, groups).map(Some)
+    }
+
+    /// The answer of call `at` for each run from `starts[group]` up to `ends[group]`, written into
+    /// `answers` and `valid`, which come in with every group valid. False, before anything is
+    /// written, when the argument is in a layout this does not read.
+    fn run_answers(
+        &self,
+        rows: &Rows,
+        at: usize,
+        starts: &[u32],
+        ends: &[u32],
+        answers: &mut [i128],
+        valid: &mut [bool],
+    ) -> Result<bool> {
+        let runs = || starts.iter().zip(ends).map(|(&start, &end)| start as usize..end as usize);
+        if self.calls[at].name == "count_star" {
+            for (answer, run) in answers.iter_mut().zip(runs()) {
+                *answer = run.len() as i128;
+            }
+            return Ok(true);
+        }
+        let counting = self.calls[at].name == "count";
+        let least = match self.calls[at].name.as_str() {
+            "min" => Some(true),
+            "max" => Some(false),
+            _ => None,
+        };
+        // A packed argument with no null is added up from its codes, see [`packed_run_totals`].
+        // Flattened first, as below, it was a vector a chunk to read once, and `l_quantity` has
+        // been held packed since note 107.
+        let argument = &rows.arguments[at][0];
+        if !counting
+            && least.is_none()
+            && let Some(packed) = argument.packed_parts()
+            && !argument.validity().has_nulls(rows.rows)
+            && packed_run_totals(&packed, starts, ends, answers)
+        {
+            return Ok(true);
+        }
+        // A flat argument is read where it lies. Cloning it first copied the whole chunk's values
+        // once per call on q18, before a single run was added up.
+        let flattened;
+        let argument = match argument.data() {
+            Some(_) => argument,
+            None => {
+                flattened = argument.clone().into_flat()?;
+                &flattened
+            }
+        };
+        let nulls = argument.validity().has_nulls(rows.rows).then(|| argument.validity());
+        let values = match counting {
+            true => None,
+            false => match integers(argument, rows.rows) {
+                Some(values) => Some(values),
+                None => return Ok(false),
+            },
+        };
+        // Its own loop, so the loop a total takes is the same code it was before extremes came
+        // through here.
+        if let (Some(values), None, Some(least)) = (&values, nulls, least) {
+            for (answer, run) in answers.iter_mut().zip(runs()) {
+                *answer = run_extreme(&values[run], least);
+            }
+            return Ok(true);
+        }
+        for ((answer, valid), run) in answers.iter_mut().zip(valid.iter_mut()).zip(runs()) {
+            let (total, seen) = match (&values, nulls) {
+                (None, None) => (run.len() as i128, true),
+                (None, Some(nulls)) => {
+                    (run.filter(|&row| nulls.is_valid(row)).count() as i128, true)
+                }
+                (Some(values), None) => (run_total(&values[run]), true),
+                (Some(values), Some(nulls)) => {
+                    let mut total = 0_i128;
+                    let mut seen = false;
+                    for row in run {
+                        if nulls.is_valid(row) {
+                            let value = i128::from(values[row]);
+                            total = match least {
+                                None => total + value,
+                                Some(_) if !seen => value,
+                                Some(true) => total.min(value),
+                                Some(false) => total.max(value),
+                            };
+                            seen = true;
+                        }
+                    }
+                    (total, seen)
+                }
+            };
+            *answer = total;
+            *valid = seen;
+        }
+        Ok(true)
     }
 
     /// The columns a spilled row is made of, in the order [`put_away`] writes them.
@@ -5522,6 +5591,50 @@ fn run_starts(key: &Vector, from: usize, to: usize) -> Option<Vec<u32>> {
         Data::UInt64(values) => flat!(values),
         _ => None,
     }
+}
+
+/// The total of every run of a packed argument, where run `group` is `starts[group]` up to
+/// `ends[group]`, written into `answers`. The runs go up and do not overlap, and need not touch.
+/// False, with nothing written, when a total might not fit.
+///
+/// A run of `l_orderkey` is four rows, so adding each run up on its own was a loop entered and left
+/// every four values, and before that the codes were turned into a vector of values. Here the codes
+/// are unpacked once into a buffer the thread keeps and summed into a running total in place, so a
+/// run's total is the running total at its end less the one at its start. A value is the base plus
+/// its code, so the run adds the base once for each of its rows. The running total is of codes,
+/// which are at most `width` bits, so it fits in 64 bits while the rows times the largest code do.
+fn packed_run_totals(
+    packed: &rudb_vector::Packed<'_>,
+    starts: &[u32],
+    ends: &[u32],
+    answers: &mut [i128],
+) -> bool {
+    thread_local! {
+        static RUNNING: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let (Some(&first), Some(&last)) = (starts.first(), ends.last()) else { return true };
+    let from = first as usize;
+    let rows = last as usize - from;
+    if packed.width() + (usize::BITS - rows.leading_zeros()) > 63 {
+        return false;
+    }
+    let base = packed.base();
+    RUNNING.with_borrow_mut(|running| {
+        running.clear();
+        running.resize(rows + 1, 0);
+        packed.unpack(from, &mut running[1..]);
+        let mut total = 0;
+        for at in &mut running[1..] {
+            total += *at;
+            *at = total;
+        }
+        for ((answer, &start), &end) in answers.iter_mut().zip(starts).zip(ends) {
+            let (start, end) = (start as usize - from, end as usize - from);
+            let codes = running[end] - running[start];
+            *answer = base * (end - start) as i128 + i128::from(codes);
+        }
+    });
+    true
 }
 
 /// The total of a run, in sixty four bits while it fits and in a hundred and twenty eight when it
@@ -8415,7 +8528,8 @@ mod tests {
         FixedPartition, FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS,
         RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
         bigint_distinct_partition, cut_runs, drop_unkept, encoded_count_partition, first_kept,
-        fixed_partition, interior, run_starts, run_total, slot_runs_of, spread_runs, spread_slots,
+        fixed_partition, interior, packed_run_totals, run_starts, run_total, slot_runs_of,
+        spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -10235,6 +10349,65 @@ mod tests {
         assert_eq!(column(2).collect::<Vec<_>>(), ints(&[2, 3, 4, 5]));
         let counts = column(3).collect::<Vec<_>>();
         assert_eq!(counts, [2, 2, 1, 1].map(Value::BigInt).to_vec());
+    }
+
+    /// With a `HAVING` on the total, only the closed runs that reach it are answered, keys and all.
+    #[test]
+    fn a_having_total_answers_only_the_closed_runs_that_pass_it() {
+        let plan =
+            parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[sum(#0.0::INTEGER)::BIGINT]");
+        let (aggregate, _out) = aggregate(&plan);
+        let aggregate = aggregate.clustered().having_total(0, 6);
+        assert!(aggregate.closes_by_run());
+        let values = [1, 1, 2, 2, 2, 3, 3, 4, 5, 5, 6];
+        let mut local = aggregate.local();
+        let rows = aggregate.read(&chunk(&values), &mut local.expressions).expect("a chunk");
+        let (from, to) = interior(&rows.keys[0], rows.rows, false).expect("sorted runs");
+        let answered = &aggregate.close_runs(&rows, from, to).expect("closed").expect("answered");
+        let column = |at: usize| (0..answered.len()).map(move |row| answered.value_at(row, at));
+        let keys = column(0).collect::<Vec<_>>();
+        assert_eq!(keys, [2, 3, 5].map(Value::Integer).to_vec(), "4 totals 4 and is left out");
+        assert_eq!(column(1).collect::<Vec<_>>(), [6, 6, 10].map(Value::BigInt).to_vec());
+    }
+
+    /// Runs of a packed argument added up from the codes come to what adding up the values does,
+    /// with a base that is not zero and runs of one row and of many.
+    #[test]
+    fn packed_runs_total_what_the_values_do() {
+        let values: Vec<i64> = (0..3_000).map(|row| 100 + (row * 37 % 50) * 100).collect();
+        let flat = Vector::from_values(
+            LogicalType::BigInt,
+            &values.iter().map(|&v| Value::BigInt(v)).collect::<Vec<_>>(),
+        )
+        .expect("values");
+        let packed = flat.bit_packed().expect("packed");
+        let parts = packed.packed_parts().expect("packed parts");
+        let (from, to) = (5, 2_990);
+        let mut starts = vec![from as u32];
+        let mut row = from;
+        while row < to {
+            row += 1 + row % 7;
+            if row < to {
+                starts.push(row as u32);
+            }
+        }
+        let mut ends: Vec<u32> = starts[1..].to_vec();
+        ends.push(to as u32);
+        let mut answers = vec![0_i128; starts.len()];
+        assert!(packed_run_totals(&parts, &starts, &ends, &mut answers));
+        for (group, (&start, &end)) in starts.iter().zip(&ends).enumerate() {
+            let run = start as usize..end as usize;
+            assert_eq!(answers[group], run_total(&values[run]), "run {group}");
+        }
+        // Every third run, which is what is left of them after a `HAVING`.
+        let (starts, ends): (Vec<u32>, Vec<u32>) =
+            starts.iter().zip(&ends).step_by(3).map(|(&start, &end)| (start, end)).unzip();
+        let mut answers = vec![0_i128; starts.len()];
+        assert!(packed_run_totals(&parts, &starts, &ends, &mut answers));
+        for (group, (&start, &end)) in starts.iter().zip(&ends).enumerate() {
+            let run = start as usize..end as usize;
+            assert_eq!(answers[group], run_total(&values[run]), "kept run {group}");
+        }
     }
 
     #[test]
