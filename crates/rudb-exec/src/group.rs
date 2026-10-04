@@ -4745,30 +4745,13 @@ impl<'a> Aggregate<'a> {
     /// group, that was most of the instructions of the grouping. Here the key is gathered once at
     /// the first row of every run, and each call is one pass that adds a run up where it lies.
     ///
-    /// `None` when an argument is in a layout this does not read, before anything is built, so the
-    /// caller can hand the chunk to the table instead.
-    fn close_runs(&self, rows: &Rows, from: usize, to: usize) -> Result<Option<Chunk>> {
+    /// `starts` is the first row of every closed run and `to` the row after the last of them, as
+    /// [`closed_runs`] finds them. `None` when an argument is in a layout this does not read, before
+    /// anything is built, so the caller can hand the chunk to the table instead.
+    fn close_runs(&self, rows: &Rows, mut starts: Vec<u32>, to: usize) -> Result<Option<Chunk>> {
         if u32::try_from(to).is_err() {
             return Err(Error::internal("a chunk too long"));
         }
-        let starts = match rows.keys.as_slice() {
-            [key] => run_starts(key, from, to),
-            _ => None,
-        };
-        let mut starts = match starts {
-            Some(starts) => starts,
-            None => {
-                let mut same = Vec::new();
-                crate::table::repeats(&rows.keys, rows.rows, 0, &mut same);
-                let mut starts = Vec::new();
-                for (row, &repeat) in same.iter().enumerate().take(to).skip(from) {
-                    if row == from || !repeat {
-                        starts.push(row as u32);
-                    }
-                }
-                starts
-            }
-        };
         let mut ends: Vec<u32> = starts[1..].to_vec();
         ends.push(to as u32);
         // Only the runs that pass a `HAVING` on one of the calls go on, so on q18, where 57 of 1.5
@@ -5525,60 +5508,66 @@ fn integers(flat: &Vector, rows: usize) -> Option<Cow<'_, [i64]>> {
     })
 }
 
-/// The first row of every run of `key` between `from` and `to`, when the key is one column in a
-/// form [`interior`] reads, which is the case that has already been found to have closed runs.
+/// The first row of every closed run of `key`, and the row after the last of them, which is the
+/// first row of the chunk's last run. The closed runs are the ones [`interior`] finds, every run but
+/// the first and the last, and `None` is where it gives `None`.
 ///
-/// A run of `l_orderkey` is four rows, so a branch per row on whether a run starts there guesses
-/// wrong a quarter of the time. The rows are compared sixty four at a time into a word and the
-/// starts are read out of its set bits, which is the same answer without the branch. Asking [`crate::table::repeats`]
-/// for a flag per row and then reading the flags back was two passes for it, and on TPC-H q18 the
-/// two were half of the grouping of `lineitem` by order.
+/// It is one pass over the key for both. [`interior`] read the key to check its order and find the
+/// ends, and then the starts were found in a second pass between them, and on TPC-H q18 the two were
+/// about a tenth of the query once its runs were added up from codes. Here the rows are compared
+/// sixty four at a time into a word with a bit for each row whose key differs from the row before
+/// it, the order is checked in the same loop, and the starts are read out of the set bits, which
+/// needs no branch a row on a run of four.
 ///
-/// Nulls are not looked at, because [`interior`] refuses a key with any, and packed codes compare
-/// the way the values do because a code is the value less the frame's base.
-fn run_starts(key: &Vector, from: usize, to: usize) -> Option<Vec<u32>> {
-    /// Sixty four rows at a time: a word with a bit for each row whose key differs from the row
-    /// before it, then a push for each bit that is set.
-    fn starts(from: usize, to: usize, differs: impl Fn(usize, usize) -> u64) -> Vec<u32> {
-        let mut starts = Vec::with_capacity((to - from) / 2 + 1);
-        starts.push(from as u32);
-        let mut row = from + 1;
-        while row < to {
-            let end = (row + 64).min(to);
-            let mut mask = differs(row, end);
+/// A packed key is unpacked once into a buffer the thread keeps and read like a flat one, because
+/// a code is the value less the frame's base and so codes are in the order the values are.
+fn closed_runs(key: &Vector, rows: usize, grouped: bool) -> Option<(Vec<u32>, usize)> {
+    fn starts<T: PartialOrd>(values: &[T], grouped: bool) -> Option<(Vec<u32>, usize)> {
+        let mut starts = Vec::with_capacity(values.len() / 2 + 1);
+        let mut row = 1;
+        while row < values.len() {
+            let end = (row + 64).min(values.len());
+            let (before, after) = (&values[row - 1..end - 1], &values[row..end]);
+            let (mut mask, mut down) = (0_u64, false);
+            for (at, (a, b)) in before.iter().zip(after).enumerate() {
+                mask |= u64::from(a != b) << at;
+                down |= b < a;
+            }
+            if down && !grouped {
+                return None;
+            }
             while mask != 0 {
                 starts.push((row + mask.trailing_zeros() as usize) as u32);
                 mask &= mask - 1;
             }
             row = end;
         }
-        starts
+        // Every start but the first run's, and the last of them is where the last run starts.
+        let to = starts.pop()? as usize;
+        (!starts.is_empty()).then_some((starts, to))
     }
     macro_rules! flat {
         ($values:expr) => {{
             let values = $values.as_slice();
-            if values.len() < to {
+            if values.len() < rows {
                 return None;
             }
-            Some(starts(from, to, |row, end| {
-                let (before, after) = (&values[row - 1..end - 1], &values[row..end]);
-                before
-                    .iter()
-                    .zip(after)
-                    .enumerate()
-                    .fold(0, |mask, (at, (a, b))| mask | u64::from(a != b) << at)
-            }))
+            starts(&values[..rows], grouped)
         }};
     }
-    if from >= to || key.validity().has_nulls(to) {
+    thread_local! {
+        static CODES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if rows < 3 || u32::try_from(rows).is_err() || key.validity().has_nulls(rows) {
         return None;
     }
     if let Some(packed) = key.packed_parts() {
-        return Some(starts(from, to, |row, end| {
-            (row..end).fold(0, |mask, at| {
-                mask | u64::from(packed.code(at) != packed.code(at - 1)) << (at - row)
-            })
-        }));
+        return CODES.with_borrow_mut(|codes| {
+            codes.clear();
+            codes.resize(rows, 0);
+            packed.unpack(0, codes);
+            starts(codes, grouped)
+        });
     }
     match key.data()? {
         Data::Int8(values) => flat!(values),
@@ -6582,13 +6571,24 @@ impl Sink for Aggregate<'_> {
         // and the last run go the ordinary way, since either of them can carry on into a chunk some
         // other instance holds. The two ends are cut before anything is folded, so a vector that
         // cannot be cut leaves the whole chunk to the ordinary path.
-        if self.closes()
-            && let Some((from, to)) = interior(&rows.keys[0], rows.rows, self.grouped)
+        // Closing by run needs every run's start, and finding them is the same pass over the key
+        // that finds the ends, so the two are one.
+        let (bounds, runs) = if !self.closes() {
+            (None, None)
+        } else if self.closes_by_run() {
+            match closed_runs(&rows.keys[0], rows.rows, self.grouped) {
+                Some((starts, to)) => (Some((starts[0] as usize, to)), Some(starts)),
+                None => (None, None),
+            }
+        } else {
+            (interior(&rows.keys[0], rows.rows, self.grouped), None)
+        };
+        if let Some((from, to)) = bounds
             && let (Ok(head), Ok(tail)) = (rows.slice(0, from), rows.slice(to, rows.rows - to))
         {
-            if self.closes_by_run() {
+            if let Some(starts) = runs {
                 let timing = stage::Timing::start(Stage::Fold);
-                let answered = self.close_runs(&rows, from, to);
+                let answered = self.close_runs(&rows, starts, to);
                 timing.stop(0);
                 if let Some(answered) = answered? {
                     ran_memory.grow(width_of(answered.footprint()))?;
@@ -8528,7 +8528,7 @@ mod tests {
         FixedPartition, FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS,
         RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
         bigint_distinct_partition, cut_runs, drop_unkept, encoded_count_partition, first_kept,
-        fixed_partition, interior, packed_run_totals, run_starts, run_total, slot_runs_of,
+        closed_runs, fixed_partition, interior, packed_run_totals, run_total, slot_runs_of,
         spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
@@ -8552,20 +8552,29 @@ mod tests {
         (0..chunk.len()).map(|row| chunk.value_at(row, 0)).collect()
     }
 
-    /// The starts read out of words agree with a plain walk, across word boundaries and with runs
-    /// longer than a word, and a total that would overflow sixty four bits comes out whole.
+    /// The closed runs read out of words agree with a plain walk and with [`interior`], across word
+    /// boundaries and with runs longer than a word, flat and packed, and a total that would overflow
+    /// sixty four bits comes out whole.
     #[test]
-    fn run_starts_match_a_walk_and_run_totals_do_not_overflow() {
+    fn closed_runs_match_a_walk_and_run_totals_do_not_overflow() {
         let keys = (0..300_i64).map(|row| row / 3 + row / 70 * 40).collect::<Vec<_>>();
         let values = keys.iter().map(|&key| Value::BigInt(key)).collect::<Vec<_>>();
-        let vector = Vector::from_values(LogicalType::BigInt, &values).expect("keys");
-        for (from, to) in [(1, 300), (5, 64), (63, 130), (7, 8)] {
-            let walked = (from..to)
-                .filter(|&row| row == from || keys[row] != keys[row - 1])
+        let flat = Vector::from_values(LogicalType::BigInt, &values).expect("keys");
+        let packed = flat.bit_packed().expect("packed");
+        assert!(packed.packed_parts().is_some());
+        for rows in [300, 64, 130, 65, 7] {
+            let mut walked = (1..rows)
+                .filter(|&row| keys[row] != keys[row - 1])
                 .map(|row| row as u32)
                 .collect::<Vec<_>>();
-            assert_eq!(run_starts(&vector, from, to), Some(walked), "{from}..{to}");
+            let to = walked.pop().expect("runs") as usize;
+            let (from, end) = interior(&flat, rows, false).expect("closed runs");
+            assert_eq!((walked[0] as usize, to), (from, end), "{rows} rows");
+            for vector in [&flat, &packed] {
+                assert_eq!(closed_runs(vector, rows, false), Some((walked.clone(), to)), "{rows}");
+            }
         }
+        assert_eq!(closed_runs(&flat, 3, false), None, "one run of three");
         assert_eq!(run_total(&[1, 2, 3]), 6);
         assert_eq!(run_total(&[i64::MAX, i64::MAX, 1]), i128::from(i64::MAX) * 2 + 1);
     }
@@ -10338,9 +10347,9 @@ mod tests {
         let mut local = aggregate.local();
         let rows = aggregate.read(&marked, &mut local.expressions).expect("a chunk");
         assert!(rows.keys[0].data().is_some(), "the key is read flat");
-        let (from, to) = interior(&rows.keys[0], rows.rows, false).expect("sorted runs");
-        assert_eq!((from, to), (2, 8));
-        let answered = &aggregate.close_runs(&rows, from, to).expect("closed").expect("answered");
+        let (starts, to) = closed_runs(&rows.keys[0], rows.rows, false).expect("sorted runs");
+        assert_eq!((starts[0], to), (2, 8));
+        let answered = &aggregate.close_runs(&rows, starts, to).expect("closed").expect("answered");
         let column = |at: usize| (0..answered.len()).map(move |row| answered.value_at(row, at));
         let ints =
             |values: &[i32]| -> Vec<Value> { values.iter().map(|&v| Value::Integer(v)).collect() };
@@ -10362,8 +10371,8 @@ mod tests {
         let values = [1, 1, 2, 2, 2, 3, 3, 4, 5, 5, 6];
         let mut local = aggregate.local();
         let rows = aggregate.read(&chunk(&values), &mut local.expressions).expect("a chunk");
-        let (from, to) = interior(&rows.keys[0], rows.rows, false).expect("sorted runs");
-        let answered = &aggregate.close_runs(&rows, from, to).expect("closed").expect("answered");
+        let (starts, to) = closed_runs(&rows.keys[0], rows.rows, false).expect("sorted runs");
+        let answered = &aggregate.close_runs(&rows, starts, to).expect("closed").expect("answered");
         let column = |at: usize| (0..answered.len()).map(move |row| answered.value_at(row, at));
         let keys = column(0).collect::<Vec<_>>();
         assert_eq!(keys, [2, 3, 5].map(Value::Integer).to_vec(), "4 totals 4 and is left out");
@@ -10421,7 +10430,10 @@ mod tests {
             Some((2, 8)),
             "grouped closes 4, 7 and 2, and leaves 9 and 5 to the table"
         );
+        assert_eq!(closed_runs(&key, values.len(), false), None);
+        assert_eq!(closed_runs(&key, values.len(), true), Some((vec![2, 5, 6], 8)));
         let two = Vector::from_values(LogicalType::BigInt, &values[..5]).expect("keys");
         assert_eq!(interior(&two, 5, true), None, "two runs have nothing strictly inside");
+        assert_eq!(closed_runs(&two, 5, true), None);
     }
 }
