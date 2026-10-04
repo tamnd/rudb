@@ -2871,6 +2871,12 @@ impl<'a> Transform<'a> {
                 }
                 self.part_slice(names)
             };
+            // A key changes what a round keeps, so reading past it would answer a different
+            // query from the one written.
+            let key = self.find(statement, "UsingKey");
+            if key != NONE {
+                return self.unsupported(key);
+            }
             let body = self.find(statement, "CTEBody");
             let select = self.first(body);
             if self.name(select) != "CTESelectBody" {
@@ -7113,6 +7119,9 @@ mod tests {
             round("WITH t(x) AS NOT MATERIALIZED (SELECT 1) SELECT x FROM t"),
             "SELECT x FROM (SELECT 1) AS t"
         );
+        let query = "WITH RECURSIVE t(x) USING KEY (x) AS (SELECT 1) SELECT x FROM t";
+        let error = parse_ast(query).expect_err("a key is not read past");
+        assert!(error.to_string().starts_with("Not implemented Error"), "{query}: {error}");
         // A definition under RECURSIVE that never names itself is a plain one.
         assert_eq!(
             round("WITH RECURSIVE t(x) AS (SELECT 1) SELECT x FROM t"),
