@@ -225,13 +225,94 @@ fn a_key_repeated_at_the_commit_takes_the_updates_back_too() {
 }
 
 #[test]
-fn a_delete_does_not_commit_beside_rows_appended_since() {
+fn a_delete_commits_beside_rows_appended_since() {
+    let (_database, one, two) = two();
+    one.execute("INSERT INTO t VALUES (3, 30), (4, 40)").expect("inserts");
+    one.execute("BEGIN").expect("begins");
+    one.execute("INSERT INTO t VALUES (9, 90)").expect("inserts");
+    one.execute("UPDATE t SET v = 21 WHERE id = 2").expect("updates");
+    one.execute("DELETE FROM t WHERE id = 1 OR id = 3").expect("deletes");
+    // Row 2 and row 4 have new numbers in the copy now, and the update has to find them.
+    one.execute("UPDATE t SET v = v + 1 WHERE id = 2 OR id = 4").expect("updates");
+    one.execute("INSERT INTO t VALUES (1, 11)").expect("inserts");
+    two.execute("INSERT INTO t VALUES (5, 50), (6, 60)").expect("inserts");
+    one.execute("COMMIT").expect("commits");
+    let all = ints(&[(1, 11), (2, 22), (4, 41), (5, 50), (6, 60), (9, 90)]);
+    assert_eq!(rows(&two, "SELECT id, v FROM t ORDER BY id"), all);
+    let lookup = two.prepare("SELECT v FROM t WHERE id = ?").expect("prepares");
+    for (id, v) in [(1, 11), (2, 22), (4, 41), (5, 50), (9, 90)] {
+        let found = lookup.execute(&[Value::Integer(id)]).expect("reads");
+        assert_eq!(found.rows().collect::<Vec<_>>(), vec![vec![Value::Integer(v)]], "{id}");
+    }
+    assert!(lookup.execute(&[Value::Integer(3)]).expect("reads").rows().next().is_none());
+    fails(&two, "INSERT INTO t VALUES (6, 0)", "Duplicate key \"id: 6\"");
+    two.execute("INSERT INTO t VALUES (3, 33)").expect("inserts");
+}
+
+#[test]
+fn a_delete_of_a_row_the_transaction_added_does_not_commit_beside_rows_appended_since() {
     let (_database, one, two) = two();
     one.execute("BEGIN").expect("begins");
-    one.execute("DELETE FROM t WHERE id = 1").expect("deletes");
+    one.execute("INSERT INTO t VALUES (5, 50), (6, 60)").expect("inserts");
+    one.execute("DELETE FROM t WHERE id = 5").expect("deletes");
     two.execute("INSERT INTO t VALUES (3, 30)").expect("inserts");
     fails(&one, "COMMIT", "Failed to commit");
     assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 10), (2, 20), (3, 30)]));
+}
+
+#[test]
+fn a_delete_does_not_commit_beside_another_delete() {
+    let (_database, one, two) = two();
+    one.execute("BEGIN").expect("begins");
+    one.execute("DELETE FROM t WHERE id = 2").expect("deletes");
+    two.execute("DELETE FROM t WHERE id = 1").expect("deletes");
+    fails(&one, "COMMIT", "Failed to commit");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(2, 20)]));
+}
+
+#[test]
+fn transactions_on_threads_that_delete_update_and_append_all_land() {
+    let database = Database::new();
+    database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").expect("creates");
+    database.execute("INSERT INTO t SELECT i, 0 FROM range(1, 9) r(i)").expect("inserts");
+    let rounds = 60;
+    thread::scope(|scope| {
+        for me in 1..=8 {
+            let connection = database.connect();
+            scope.spawn(move || {
+                // A delete moves rows, so a transaction that began before another one's delete
+                // committed fails its commit and goes again.
+                for round in 0..rounds {
+                    loop {
+                        connection.execute("BEGIN").expect("begins");
+                        let sql = format!("UPDATE t SET v = v + 1 WHERE id = {me}");
+                        connection.execute(&sql).expect("updates");
+                        if round > 0 {
+                            let gone = 1000 * me + round - 1;
+                            let sql = format!("DELETE FROM t WHERE id = {gone}");
+                            connection.execute(&sql).expect("deletes");
+                        }
+                        let id = 1000 * me + round;
+                        let sql = format!("INSERT INTO t VALUES ({id}, {round})");
+                        connection.execute(&sql).expect("inserts");
+                        if connection.execute("COMMIT").is_ok() {
+                            break;
+                        }
+                        let _ = connection.execute("ROLLBACK");
+                    }
+                }
+            });
+        }
+    });
+    let connection = database.connect();
+    assert_eq!(
+        rows(&connection, "SELECT count(*), sum(v) FROM t WHERE id <= 8"),
+        vec![vec![Value::BigInt(8), Value::HugeInt(8 * i128::from(rounds))]]
+    );
+    assert_eq!(
+        rows(&connection, "SELECT count(*), sum(v) FROM t WHERE id > 8"),
+        vec![vec![Value::BigInt(8), Value::HugeInt(8 * i128::from(rounds - 1))]]
+    );
 }
 
 #[test]
@@ -405,6 +486,45 @@ fn an_update_committed_beside_rows_appended_since_survives_a_crash() {
     drop(connection);
     drop(database);
     remove(&path);
+}
+
+#[test]
+fn a_delete_committed_beside_rows_appended_since_survives_a_crash() {
+    for checkpoint in [false, true] {
+        let path = file(if checkpoint { "taken-file" } else { "taken" });
+        let database = Database::open(path.to_str().expect("UTF-8")).expect("opens");
+        let one = database.connect();
+        let two = database.connect();
+        one.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").expect("creates");
+        one.execute("INSERT INTO t SELECT i, i * 10 FROM range(1, 5) r(i)").expect("inserts");
+        if checkpoint {
+            one.execute("CHECKPOINT").expect("checkpoints");
+        }
+        one.execute("BEGIN").expect("begins");
+        one.execute("DELETE FROM t WHERE id = 2").expect("deletes");
+        if !checkpoint {
+            one.execute("UPDATE t SET v = 33 WHERE id = 3").expect("updates");
+        }
+        one.execute("INSERT INTO t VALUES (8, 80)").expect("inserts");
+        two.execute("INSERT INTO t VALUES (5, 50)").expect("inserts");
+        one.execute("COMMIT").expect("commits");
+        two.execute("INSERT INTO t VALUES (6, 60)").expect("inserts");
+        two.execute("DELETE FROM t WHERE id = 1").expect("deletes");
+        drop((one, two));
+        std::mem::forget(database);
+
+        let database = Database::open(path.to_str().expect("UTF-8")).expect("reopens");
+        let connection = database.connect();
+        let three = if checkpoint { 30 } else { 33 };
+        assert_eq!(
+            rows(&connection, "SELECT id, v FROM t ORDER BY id"),
+            ints(&[(3, three), (4, 40), (5, 50), (6, 60), (8, 80)]),
+            "{checkpoint}"
+        );
+        drop(connection);
+        drop(database);
+        remove(&path);
+    }
 }
 
 #[test]

@@ -145,8 +145,8 @@ fn many_transactions_reading_and_writing_agree_with_the_plan() {
         let id = (round * 37) % 4100;
         read(&db, id);
         db.execute(&format!("UPDATE t SET n = n + 1 WHERE id = {id}")).expect("updates");
-        // Another connection's insert after the snapshot, which the update commits beside, and
-        // the delete does not.
+        // Another connection's insert after the snapshot, which the update and the delete commit
+        // beside.
         if round % 4 == 0 {
             others
                 .execute(&format!("INSERT INTO t VALUES ({}, 'o{round}', 0)", 10_000 + round))
@@ -160,8 +160,6 @@ fn many_transactions_reading_and_writing_agree_with_the_plan() {
         read(&db, 10_000 + round);
         if round % 3 == 0 {
             db.execute("ROLLBACK").expect("rolls back");
-        } else if round % 20 == 0 {
-            db.execute("COMMIT").expect_err("a delete beside rows appended since");
         } else {
             db.execute("COMMIT").expect("commits");
         }
