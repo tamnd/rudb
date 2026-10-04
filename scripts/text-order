@@ -31,13 +31,15 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 
 def executed(binary, command, scratch):
     """The mangled names of the functions in BINARY that one run executed."""
+    os.makedirs(scratch)
     out = os.path.join(scratch, 'callgrind.out')
     argv = ['valgrind', '--tool=callgrind', '--demangle=no', '--dump-line=no',
-            f'--callgrind-out-file={out}', binary] + command[1:]
+            f'--callgrind-out-file={out}', os.path.abspath(binary)] + command[1:]
     subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     report = subprocess.run(['callgrind_annotate', '--threshold=100', out],
                             capture_output=True, text=True, check=True).stdout
@@ -54,6 +56,24 @@ def executed(binary, command, scratch):
     return names
 
 
+def aliases(binary):
+    """The names each function in BINARY answers to, keyed by every one of them.
+
+    Rust merges functions that compile to the same machine code into one body with an alias per
+    name, and callgrind reports a run of that body under whichever name it picks. The body's section
+    carries one name, not always that one, so a pattern written from callgrind's name alone can leave
+    the body where it was.
+    """
+    at = {}
+    listing = subprocess.run(['nm', '--defined-only', binary],
+                             capture_output=True, text=True, check=True).stdout
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[1] in 'tTwW':
+            at.setdefault(fields[0], []).append(fields[2])
+    return {name: names for names in at.values() for name in names}
+
+
 def pattern(name):
     """NAME with its crate hashes, back references and LLVM suffix left open."""
     name = re.sub(r'\.llvm\.[0-9]+$', '.llvm.*', name)
@@ -68,10 +88,15 @@ def main():
     binary, runs, out = sys.argv[1:]
     commands = [shlex.split(line) for line in open(runs) if line.strip()]
     used = {}
-    with tempfile.TemporaryDirectory() as scratch:
-        for at, command in enumerate(commands):
-            for name in executed(binary, command, scratch):
-                used.setdefault(name, set()).add(at)
+    same = aliases(binary)
+    # Callgrind runs a program tens of times slower on one core, so the runs go side by side.
+    with tempfile.TemporaryDirectory() as scratch, ThreadPoolExecutor(os.cpu_count()) as pool:
+        runs = [pool.submit(executed, binary, command, os.path.join(scratch, str(at)))
+                for at, command in enumerate(commands)]
+        for at, run in enumerate(runs):
+            for name in run.result():
+                for each in same.get(name, [name]):
+                    used.setdefault(each, set()).add(at)
             print(f'{at + 1}/{len(commands)} runs, {len(used)} functions', file=sys.stderr)
     order = sorted(used, key=lambda name: (-len(used[name]), sorted(used[name]), name))
     patterns = list(dict.fromkeys(pattern(name) for name in order))
