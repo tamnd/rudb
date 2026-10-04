@@ -3972,6 +3972,65 @@ impl Shared {
         (!unanswered).then_some(result)
     }
 
+    /// Runs a prepared short range read without binding it, or says it cannot and leaves it to
+    /// [`Shared::execute_ast`], see [`crate::prepared::RangeRead`]. Outside a transaction only, as
+    /// for [`Shared::lookup`].
+    pub(crate) fn range_read(
+        &self,
+        range: &crate::prepared::RangeRead,
+        given: crate::prepared::Given<'_>,
+        sql: &str,
+    ) -> Option<Result<QueryResult>> {
+        use crate::prepared::Limit;
+        if self.transacting() {
+            return None;
+        }
+        let [(_, bound)] = range.lookup.equal.as_slice() else { return None };
+        let bound = given.value(bound)?;
+        let limit = match &range.limit {
+            Limit::Rows(rows) => *rows,
+            Limit::Given(item) => match given.value(item)? {
+                Value::Integer(rows) => usize::try_from(rows).ok()?,
+                Value::BigInt(rows) => usize::try_from(rows).ok()?,
+                // A driver that binds every parameter as text, which the plan casts. Only plain
+                // digits here, so a text the cast reads some other way still goes to the plan.
+                Value::Varchar(text) if text.bytes().all(|byte| byte.is_ascii_digit()) => {
+                    text.parse().ok()?
+                }
+                _ => return None,
+            },
+        };
+        if limit > crate::prepared::RANGE_ROWS {
+            return None;
+        }
+        let descending =
+            range.descending.unwrap_or_else(|| self.inner.settings.default_descending());
+        let catalog = self.read();
+        let target = match range.lookup.found.get(catalog.naming()) {
+            Some(target) => target,
+            None => {
+                let target = Arc::new(lookup_target(&catalog, &range.lookup)?);
+                range.lookup.found.keep(catalog.naming(), Arc::clone(&target));
+                target
+            }
+        };
+        let table = catalog.table(&target.name).ok()?;
+        let [key] = target.key.as_slice() else { return None };
+        let mut unanswered = false;
+        let result = kept(sql, 0, |_| {
+            let reach = (range.reach, &bound);
+            let Some(chunks) = table.range(*key, reach, descending, limit, &target.columns)? else {
+                unanswered = true;
+                return Err(Error::internal("a range read the table cannot answer by its key"));
+            };
+            let reservation = Memory::unlimited().reservation();
+            let result =
+                QueryResult::new(target.names.clone(), target.types.clone(), chunks, reservation);
+            Ok(if target.zoned { result.in_session(self.session()) } else { result })
+        });
+        (!unanswered).then_some(result)
+    }
+
     /// Runs a prepared write by key without binding it, or says it cannot and leaves everything as
     /// it was, for [`Shared::execute_ast`] to run, see [`crate::prepared::PointWrite`].
     ///

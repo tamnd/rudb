@@ -81,6 +81,40 @@ pub(crate) struct Located {
     bytes: Map<Box<[u8]>>,
     /// The number of the first row of each part, and after them the number of rows.
     starts: Vec<u64>,
+    /// The keys in order, each with its row's number, built the first time a read of a range of
+    /// keys asks.
+    sorted: OnceLock<Sorted>,
+}
+
+/// The keys of one column in order, each with its row's number.
+#[derive(Debug)]
+enum Sorted {
+    /// The keys of an `INTEGER` or `BIGINT` column.
+    Ints(Vec<(i64, u64)>),
+    /// The keys of a `VARCHAR` column as their bytes, which is the order the plan compares text in.
+    Text(Vec<(Box<[u8]>, u64)>),
+}
+
+/// The bytes of a text key from its encoding: a tag and a length of eight bytes, then the bytes.
+fn text_of(encoded: &[u8]) -> Option<&[u8]> {
+    match encoded.split_first() {
+        Some((b's', rest)) => rest.get(8..),
+        _ => None,
+    }
+}
+
+/// The bound of a read of a range of keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Edge<'a> {
+    Int(i64),
+    Text(&'a str),
+}
+
+/// The key a row read by a range has to hold, to make sure it is the row the key was noted at.
+#[derive(Debug, Clone, Copy)]
+enum Wanted<'a> {
+    Int(i64),
+    Text(&'a [u8]),
 }
 
 impl Located {
@@ -94,6 +128,7 @@ impl Located {
             ints: Map::default(),
             bytes: Map::default(),
             starts: Vec::with_capacity(parts + 1),
+            sorted: OnceLock::new(),
         };
         let mut scratch = Vec::new();
         let mut number = 0_u64;
@@ -136,18 +171,62 @@ impl Located {
         if number != before + keys.len() as u64 || number != rows.len() as u64 {
             return Ok(false);
         }
+        // The keys in order stay in order for keys that come after every key there is, which is
+        // how a table keyed by a counter grows, and are dropped for anything else.
+        let mut sorted = self.sorted.get_mut();
         for (key, number) in keys.into_iter().zip(before..) {
             match key {
                 Noted::Null => {}
                 Noted::Int(key) => {
                     self.ints.insert(key, number);
+                    match sorted.as_deref_mut() {
+                        Some(Sorted::Ints(held))
+                            if held.last().is_none_or(|&(last, _)| last < key) =>
+                        {
+                            held.push((key, number));
+                        }
+                        Some(_) => sorted = None,
+                        None => {}
+                    }
                 }
                 Noted::Bytes(key) => {
+                    match (sorted.as_deref_mut(), text_of(&key)) {
+                        (Some(Sorted::Text(held)), Some(text))
+                            if held.last().is_none_or(|(last, _)| **last < *text) =>
+                        {
+                            held.push((text.into(), number));
+                        }
+                        (Some(_), _) => sorted = None,
+                        (None, _) => {}
+                    }
                     self.bytes.insert(key, number);
                 }
             }
         }
+        if sorted.is_none() {
+            self.sorted = OnceLock::new();
+        }
         Ok(true)
+    }
+
+    /// The keys in order with their rows' numbers: the integer ones when there are any, and
+    /// otherwise the text ones. A key of one column holds keys of only one of the two.
+    fn sorted(&self) -> &Sorted {
+        self.sorted.get_or_init(|| {
+            if self.bytes.is_empty() {
+                let mut sorted: Vec<(i64, u64)> =
+                    self.ints.iter().map(|(&key, &number)| (key, number)).collect();
+                sorted.sort_unstable();
+                return Sorted::Ints(sorted);
+            }
+            let mut sorted: Vec<(Box<[u8]>, u64)> = self
+                .bytes
+                .iter()
+                .filter_map(|(key, &number)| Some((text_of(key)?.into(), number)))
+                .collect();
+            sorted.sort_unstable();
+            Sorted::Text(sorted)
+        })
     }
 
     /// Whether this was built for `key` of `rows` at `placed`.
@@ -164,11 +243,17 @@ impl Located {
             Encoded::Int(key) => *self.ints.get(&key)?,
             Encoded::Bytes => *self.bytes.get(scratch)?,
         };
+        let (part, place) = self.place(number)?;
+        Some((part, place, number))
+    }
+
+    /// The part and the place in it of the row numbered `number`.
+    fn place(&self, number: u64) -> Option<(usize, u32)> {
         // The last part starting at or before the row. A part can be empty, and then the next one
         // starts where it does, so it is the last such part and not the first that holds the row.
         let part = self.starts.partition_point(|&start| start <= number).checked_sub(1)?;
         let place = u32::try_from(number - self.starts[part]).ok()?;
-        Some((part, place, number))
+        Some((part, place))
     }
 }
 
@@ -219,10 +304,53 @@ enum Noted {
     Bytes(Box<[u8]>),
 }
 
+/// The entries of `sorted` on the `reach` side of the bound `order` compares each with.
+fn window<T>(sorted: &[T], reach: Reach, order: impl Fn(&T) -> std::cmp::Ordering) -> &[T] {
+    let low = match reach {
+        Reach::AtLeast => sorted.partition_point(|at| order(at).is_lt()),
+        Reach::Above => sorted.partition_point(|at| order(at).is_le()),
+        Reach::AtMost | Reach::Below => 0,
+    };
+    let high = match reach {
+        Reach::AtMost => sorted.partition_point(|at| order(at).is_le()),
+        Reach::Below => sorted.partition_point(|at| order(at).is_lt()),
+        Reach::AtLeast | Reach::Above => sorted.len(),
+    };
+    sorted.get(low..high).unwrap_or(&[])
+}
+
+/// The first `limit` entries of `within`, from the end when `descending`.
+fn pick<'a, T, P>(
+    within: &'a [T],
+    descending: bool,
+    limit: usize,
+    f: impl Fn(&'a T) -> P,
+) -> Vec<P> {
+    if descending {
+        within.iter().rev().take(limit).map(f).collect()
+    } else {
+        within.iter().take(limit).map(f).collect()
+    }
+}
+
 /// The keys of rows about to be appended, for each key a lookup has built where the rows are, which
 /// [`Points::appended`] notes once the rows are in.
 #[derive(Debug, Default)]
 pub(crate) struct Appending(Vec<(usize, Vec<Noted>)>);
+
+/// Which side of a value a read of a range of keys takes, as the key column stands on the left of
+/// the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// `key >= value`.
+    AtLeast,
+    /// `key > value`.
+    Above,
+    /// `key <= value`.
+    AtMost,
+    /// `key < value`.
+    Below,
+}
 
 /// Where a lookup by key found its row: the part and the place in it, and its number in the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,6 +526,90 @@ impl Points {
         // Whatever a lookup found wrong is gone with what it was found in.
         if self.built.iter().all(|slot| slot.get().is_none()) {
             *self.stale.get_mut() = false;
+        }
+    }
+
+    /// The first `limit` rows of `rows` in the order of the key over the one column `key` whose key
+    /// is on the `reach` side of `bound`, the highest first when `descending`, with the columns
+    /// `columns`, one row to a chunk.
+    ///
+    /// The caller has made sure `key` is the key at `which`, as for [`Self::seek`], and that its
+    /// column is an `INTEGER` or a `BIGINT` for an integer bound and a `VARCHAR` for a text one. A
+    /// null key is on no side of any value.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn range(
+        &self,
+        which: usize,
+        rows: &Rows,
+        placed: u64,
+        key: usize,
+        (reach, bound): (Reach, Edge<'_>),
+        descending: bool,
+        limit: usize,
+        columns: &[usize],
+    ) -> Result<Vec<Chunk>> {
+        let held = [key];
+        let mut read = columns.to_vec();
+        read.push(key);
+        let mut fresh = false;
+        'again: loop {
+            let again;
+            let built = self.built.get(which).and_then(OnceLock::get);
+            let located = match built {
+                Some(built)
+                    if !fresh
+                        && !self.stale.load(Ordering::Relaxed)
+                        && built.fits(rows, placed, &held) =>
+                {
+                    built.as_ref()
+                }
+                _ => {
+                    again = self.again(which, rows, placed, &held, fresh)?;
+                    again.as_ref()
+                }
+            };
+            let picked: Vec<(Wanted<'_>, u64)> = match (located.sorted(), bound) {
+                (Sorted::Ints(sorted), Edge::Int(bound)) => {
+                    let within = window(sorted, reach, |(at, _)| at.cmp(&bound));
+                    pick(within, descending, limit, |&(at, number)| (Wanted::Int(at), number))
+                }
+                (Sorted::Text(sorted), Edge::Text(bound)) => {
+                    let within = window(sorted, reach, |(at, _)| (**at).cmp(bound.as_bytes()));
+                    pick(within, descending, limit, |(at, number)| (Wanted::Text(at), *number))
+                }
+                // Keys of the other kind, so none the bound reaches, which happens only for a
+                // table with no rows.
+                _ => Vec::new(),
+            };
+            let mut chunks = Vec::with_capacity(picked.len());
+            for (wanted, number) in picked {
+                let found = match located.place(number) {
+                    Some((part, place)) if (place as usize) < rows.chunk_len(part)? => {
+                        let chunk = rows.read_selected(part, &read, &[place])?;
+                        let same = match (chunk.column(columns.len())?.value_at(0), wanted) {
+                            (Value::Integer(at), Wanted::Int(wanted)) => i64::from(at) == wanted,
+                            (Value::BigInt(at), Wanted::Int(wanted)) => at == wanted,
+                            (Value::Varchar(at), Wanted::Text(wanted)) => at.as_bytes() == wanted,
+                            _ => false,
+                        };
+                        same.then_some(chunk)
+                    }
+                    _ => None,
+                };
+                let Some(chunk) = found else {
+                    if fresh {
+                        return Err(Error::internal(
+                            "a key found where it was just noted is not there",
+                        ));
+                    }
+                    fresh = true;
+                    continue 'again;
+                };
+                let mut kept = chunk.into_columns();
+                kept.truncate(columns.len());
+                chunks.push(Chunk::with_rows(kept, 1)?);
+            }
+            return Ok(chunks);
         }
     }
 

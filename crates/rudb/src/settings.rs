@@ -1330,6 +1330,11 @@ impl Settings {
         }
     }
 
+    /// Whether an `ORDER BY` that says no direction sorts the highest first.
+    pub(crate) fn default_descending(&self) -> bool {
+        *self.default_order.read().unwrap_or_else(|held| held.into_inner()) == "DESC"
+    }
+
     /// Every setting and its value, for the table that lists them and the function that reads one.
     ///
     /// Built again only after a `SET`, `RESET` or pragma has been through, and otherwise the copy

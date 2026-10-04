@@ -46,6 +46,7 @@ pub struct Prepared {
     direct: Option<Direct>,
     lookup: Option<Lookup>,
     write: Option<PointWrite>,
+    range: Option<RangeRead>,
     /// Whether the parameters are `1` to `n` and nothing else, so that `n` values by position are
     /// exactly the values the statement wants, with nothing missing and nothing left over.
     numbered: bool,
@@ -335,6 +336,14 @@ impl Lookup {
             return None;
         }
         let select = ast.select(select);
+        let mut lookup = Self::reading(ast, select)?;
+        lookup.equal = equalities(ast, select.filter)?;
+        Some(lookup)
+    }
+
+    /// The table and the select list of `select`, with no columns set equal yet, if it reads one
+    /// table by name with a `WHERE` and nothing else.
+    fn reading(ast: &Ast, select: ast::Select) -> Option<Self> {
         if select.distinct != ast::Distinct::No
             || select.group_by.len != 0
             || select.group_by_all
@@ -366,8 +375,114 @@ impl Lookup {
                 _ => return None,
             });
         }
-        let equal = equalities(ast, select.filter)?;
-        Some(Self { name: words(name), alias, picks, equal, found: Resolved::default() })
+        Some(Self {
+            name: words(name),
+            alias,
+            picks,
+            equal: Vec::new(),
+            found: Resolved::default(),
+        })
+    }
+}
+
+/// A `SELECT ... FROM t WHERE key >= ? ORDER BY key LIMIT n`, or with `>`, `<=` or `<`, either
+/// order and the limit a parameter, where the select list is a [`Lookup`]'s.
+///
+/// That is the short range read of YCSB workload E, and the plan for it reads every row of the
+/// table and sorts the ones that pass to keep a few. An execution that finds the key's column to be
+/// an integer key of the table reads the rows in key order from where the key is held.
+#[derive(Debug, Clone)]
+pub(crate) struct RangeRead {
+    /// The table and the select list, with the key's column set equal to the bound.
+    pub(crate) lookup: Lookup,
+    /// The side of the bound the rows' keys are on.
+    pub(crate) reach: rudb_catalog::Reach,
+    /// The order the `ORDER BY` wrote, and `None` when it wrote none and the session's applies.
+    pub(crate) descending: Option<bool>,
+    /// How many rows at most.
+    pub(crate) limit: Limit,
+}
+
+/// The `LIMIT` of a [`RangeRead`].
+#[derive(Debug, Clone)]
+pub(crate) enum Limit {
+    /// A number written into the statement.
+    Rows(usize),
+    /// A parameter.
+    Given(Item),
+}
+
+/// The most rows a [`RangeRead`] reads one at a time. Past this the plan's scan is the better way.
+pub(crate) const RANGE_ROWS: usize = 1_000;
+
+impl RangeRead {
+    /// The shape of `ast`, if it is one statement of it.
+    fn of(ast: &Ast) -> Option<Self> {
+        use rudb_catalog::Reach;
+        let [ast::Statement::Query(at)] = ast.statements.as_slice() else { return None };
+        let query = ast.query(*at);
+        let ast::QueryBody::Select(select) = query.body else { return None };
+        let [order] = ast.order_list(query.order_by) else { return None };
+        if query.ctes.len != 0
+            || query.order_by_all
+            || query.limit == rudb_parse::NONE
+            || query.limit_percent
+            || query.offset != rudb_parse::NONE
+        {
+            return None;
+        }
+        let select = ast.select(select);
+        let mut lookup = Lookup::reading(ast, select)?;
+        let words = |slice| ast.name(slice).map(str::to_owned).collect::<Vec<_>>();
+        let ast::Expr::Binary { op, left, right } = ast.expr(select.filter) else { return None };
+        let (column, parameter, flipped) = match (ast.expr(left), ast.expr(right)) {
+            (ast::Expr::Column { name }, ast::Expr::Parameter { name: parameter }) => {
+                (words(name), parameter, false)
+            }
+            (ast::Expr::Parameter { name: parameter }, ast::Expr::Column { name }) => {
+                (words(name), parameter, true)
+            }
+            _ => return None,
+        };
+        let reach = match (op, flipped) {
+            (ast::BinaryOp::GtEq, false) | (ast::BinaryOp::LtEq, true) => Reach::AtLeast,
+            (ast::BinaryOp::Gt, false) | (ast::BinaryOp::Lt, true) => Reach::Above,
+            (ast::BinaryOp::LtEq, false) | (ast::BinaryOp::GtEq, true) => Reach::AtMost,
+            (ast::BinaryOp::Lt, false) | (ast::BinaryOp::Gt, true) => Reach::Below,
+            _ => return None,
+        };
+        // The order is by the same column written the same way, and by nothing the select list
+        // names, since an `ORDER BY` takes an output name before a column of the table.
+        let ast::Expr::Column { name } = ast.expr(order.expr) else { return None };
+        let ordered = words(name);
+        let last = ordered.last()?;
+        let renamed = lookup.picks.iter().any(|pick| match pick {
+            Pick::Column(_, Some(alias)) => alias.eq_ignore_ascii_case(last),
+            _ => false,
+        });
+        let same = ordered.len() == column.len()
+            && ordered.iter().zip(&column).all(|(a, b)| a.eq_ignore_ascii_case(b));
+        if renamed || !same {
+            return None;
+        }
+        let descending = match order.order {
+            ast::Order::Unstated => None,
+            ast::Order::Ascending => Some(false),
+            ast::Order::Descending => Some(true),
+        };
+        let limit = match ast.expr(query.limit) {
+            ast::Expr::Literal { kind: ast::LiteralKind::Number, text } => {
+                Limit::Rows(ast.string(text).parse().ok().filter(|&rows| rows <= RANGE_ROWS)?)
+            }
+            ast::Expr::Parameter { name } => {
+                let name = ast.string(name);
+                Limit::Given(Item::Parameter(name.to_owned(), numbered(name)))
+            }
+            _ => return None,
+        };
+        let parameter = ast.string(parameter);
+        lookup.equal = vec![(column, Item::Parameter(parameter.to_owned(), numbered(parameter)))];
+        Some(Self { lookup, reach, descending, limit })
     }
 }
 
@@ -479,8 +594,10 @@ impl Prepared {
         let direct = Direct::of(&ast);
         let lookup = Lookup::of(&ast);
         let write = PointWrite::of(&ast);
+        let range = RangeRead::of(&ast);
         let numbered = numbered_one_to_n(&names);
-        Ok(Self { shared, sql: sql.to_string(), ast, names, direct, lookup, write, numbered })
+        let sql = sql.to_string();
+        Ok(Self { shared, sql, ast, names, direct, lookup, write, range, numbered })
     }
 
     /// The statement as it was written.
@@ -531,6 +648,14 @@ impl Prepared {
         {
             return done.map_err(|error| self.shared.process_error(error));
         }
+        // The short range read, likewise.
+        if self.numbered
+            && values.len() == self.names.len()
+            && let Some(range) = &self.range
+            && let Some(done) = self.shared.range_read(range, Given::Positional(values), &self.sql)
+        {
+            return done.map_err(|error| self.shared.process_error(error));
+        }
         self.run(Parameters::positional(values.to_vec()))
     }
 
@@ -578,6 +703,12 @@ impl Prepared {
             if let Some(write) = &self.write
                 && let Some(done) =
                     self.shared.write_point(write, Given::Named(&parameters), &self.sql)
+            {
+                return done;
+            }
+            if let Some(range) = &self.range
+                && let Some(done) =
+                    self.shared.range_read(range, Given::Named(&parameters), &self.sql)
             {
                 return done;
             }
@@ -687,6 +818,39 @@ mod tests {
             "SELECT name FROM t",
         ] {
             assert!(db.prepare(sql).expect("prepares").lookup.is_none(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_short_range_by_key_takes_the_short_way() {
+        let db = Database::new();
+        db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR)").expect("creates");
+        db.execute("INSERT INTO t VALUES (3, 'c'), (1, 'a'), (2, 'b')").expect("inserts");
+        let prepared =
+            db.prepare("SELECT name FROM t WHERE id >= ? ORDER BY id LIMIT ?").expect("prepares");
+        let range = prepared.range.as_ref().expect("the shape is recognised");
+        let values = vec![Value::BigInt(2), Value::BigInt(5)];
+        let taken = prepared.shared.range_read(range, Given::Positional(&values), prepared.sql());
+        let result = taken.expect("taken").expect("runs");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.value_at(0, 0), Value::Varchar("b".into()));
+        assert_eq!(result.value_at(1, 0), Value::Varchar("c".into()));
+        let values = vec![Value::BigInt(2), Value::BigInt(5000)];
+        let taken = prepared.shared.range_read(range, Given::Positional(&values), prepared.sql());
+        assert!(taken.is_none(), "a long range goes to the plan");
+
+        for sql in [
+            "SELECT name FROM t WHERE id >= ? ORDER BY name LIMIT 1",
+            "SELECT name FROM t WHERE id >= ? ORDER BY id",
+            "SELECT name FROM t WHERE id >= ? ORDER BY id LIMIT 1 OFFSET 1",
+            "SELECT name FROM t WHERE id >= ? ORDER BY id, name LIMIT 1",
+            "SELECT name FROM t WHERE id >= ? AND id < ? ORDER BY id LIMIT 1",
+            "SELECT name AS id FROM t WHERE id >= ? ORDER BY id LIMIT 1",
+            "SELECT name FROM t WHERE id >= ? ORDER BY 1 LIMIT 1",
+            "SELECT name FROM t WHERE id <> ? ORDER BY id LIMIT 1",
+            "SELECT name FROM t WHERE id >= ? ORDER BY id LIMIT 5000",
+        ] {
+            assert!(db.prepare(sql).expect("prepares").range.is_none(), "{sql}");
         }
     }
 
