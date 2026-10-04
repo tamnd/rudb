@@ -1022,6 +1022,7 @@ impl<'a> Binder<'a> {
                 default: None,
                 qualified: false,
                 also: None,
+                hidden: false,
             });
         }
         let exprs = self.plan.add_expr_list(&exprs);
@@ -1118,6 +1119,7 @@ impl<'a> Binder<'a> {
             default: None,
             qualified: false,
             also: None,
+            hidden: false,
         });
         Ok((node, scope))
     }
@@ -1193,6 +1195,7 @@ impl<'a> Binder<'a> {
                 default: None,
                 qualified: false,
                 also: None,
+                hidden: false,
             });
         }
         let keys = self.sort_keys(ast, query, &scope, &[])?;
@@ -1360,6 +1363,7 @@ impl<'a> Binder<'a> {
                 default: None,
                 qualified: false,
                 also: None,
+                hidden: false,
             });
         }
         let keys = self.sort_keys(ast, query, &scope, &[])?;
@@ -1413,6 +1417,7 @@ impl<'a> Binder<'a> {
                 default: None,
                 qualified: false,
                 also: None,
+                hidden: false,
             });
         }
         // Above a set operation there is nothing but the output columns, so an ORDER BY term is
@@ -1671,6 +1676,7 @@ impl<'a> Binder<'a> {
                 default: self.through(*expr, &input).and_then(|column| column.default.clone()),
                 qualified: false,
                 also: None,
+                hidden: false,
             });
         }
 
@@ -1788,6 +1794,7 @@ impl<'a> Binder<'a> {
                 default: output.columns[at].default.clone(),
                 qualified: false,
                 also: None,
+                hidden: false,
             });
         }
         let exprs = self.plan.add_expr_list(&kept);
@@ -2616,6 +2623,7 @@ impl<'a> Binder<'a> {
                 default: None,
                 qualified: false,
                 also: None,
+                hidden: false,
             });
         }
         if !columns.is_empty() {
@@ -2690,6 +2698,7 @@ impl<'a> Binder<'a> {
                 default: table.default(at).map(str::to_owned),
                 qualified: excluded,
                 also: None,
+                hidden: false,
             });
         }
         if !columns.is_empty() {
@@ -3233,6 +3242,7 @@ impl<'a> Binder<'a> {
                 default: None,
                 qualified: false,
                 also: None,
+                hidden: false,
             });
         }
         if !columns.is_empty() {
@@ -3597,6 +3607,7 @@ impl<'a> Binder<'a> {
                 default: None,
                 qualified: false,
                 also: None,
+                hidden: false,
             });
         }
         if !names.is_empty() {
@@ -3912,7 +3923,10 @@ impl<'a> Binder<'a> {
         let merged: Vec<String> = if natural {
             let mut names = Vec::new();
             for (at, column) in scope.columns.iter().enumerate().take(split) {
-                if scope.columns[split..].iter().any(|right| same_name(&right.name, &column.name))
+                if !column.hidden
+                    && scope.columns[split..]
+                        .iter()
+                        .any(|right| !right.hidden && same_name(&right.name, &column.name))
                     && !names.iter().any(|held: &String| same_name(held, &column.name))
                 {
                     let _ = at;
@@ -3936,11 +3950,11 @@ impl<'a> Binder<'a> {
         };
 
         let mut conditions = Vec::new();
-        let mut dropped = Vec::new();
+        let mut pairs = Vec::new();
         for name in &merged {
             let left_at = scope.columns[..split]
                 .iter()
-                .position(|column| same_name(&column.name, name))
+                .position(|column| !column.hidden && same_name(&column.name, name))
                 .ok_or_else(|| {
                     Error::binder(format!(
                         "column \"{name}\" specified in USING clause does not exist in left table"
@@ -3948,7 +3962,7 @@ impl<'a> Binder<'a> {
                 })?;
             let right_at = scope.columns[split..]
                 .iter()
-                .position(|column| same_name(&column.name, name))
+                .position(|column| !column.hidden && same_name(&column.name, name))
                 .map(|at| at + split)
                 .ok_or_else(|| {
                     Error::binder(format!(
@@ -3962,13 +3976,19 @@ impl<'a> Binder<'a> {
             let left_expr = self.plan.add_expr(Expr::Column(left_binding), left_type);
             let right_expr = self.plan.add_expr(Expr::Column(right_binding), right_type);
             conditions.push(self.compare(rudb_plan::CompareOp::Equal, left_expr, right_expr)?);
-            dropped.push(right_at);
+            pairs.push((left_at, right_at));
         }
-        // A joined-on column appears once, so the right side's copy goes. Dropping from the back
-        // keeps the positions of the ones still to drop correct.
-        dropped.sort_unstable();
-        for at in dropped.into_iter().rev() {
-            scope.remove(at);
+        // A joined-on column appears once in `SELECT *` and for a bare name, so the right side's
+        // copy is hidden there. It stays for `b.k` and `b.*`, which still read the right side's own
+        // value on the pin. A `RIGHT` or `FULL` join hides the left copy as well, because there the
+        // bare name is not the left value, and puts the column it does read in its place once the
+        // join is built. See `Binder::merged`.
+        let outer = matches!(kind, ast::JoinKind::Right | ast::JoinKind::Full);
+        for &(left_at, right_at) in &pairs {
+            scope.columns[right_at].hidden = true;
+            if outer {
+                scope.columns[left_at].hidden = true;
+            }
         }
 
         let mut left_node = left_node;
@@ -4052,7 +4072,87 @@ impl<'a> Binder<'a> {
                 conditions,
             })
         };
+        if outer && !pairs.is_empty() {
+            let node = self.merged(node, &mut scope, kind == JoinKind::Full, &pairs)?;
+            return Ok((node, scope));
+        }
         Ok((node, scope))
+    }
+
+    /// The column a bare name reads after a `RIGHT` or `FULL` join `USING` it, put where the left
+    /// copy was.
+    ///
+    /// After a `RIGHT` join it is the right side's value, which is there on every row, and its
+    /// type is the right side's. After a `FULL` join it is `COALESCE(a.k, b.k)` at the type the two
+    /// meet at, so a row from either side has its key, and that needs a projection above the join
+    /// to compute it in. `SELECT typeof(k)` over an `INTEGER` and a `BIGINT` key is `BIGINT` on the
+    /// pin for both kinds and `INTEGER` for an inner or a left join, which reads the left copy.
+    ///
+    /// The column has no table name, so `a.k` and `b.k` still find each side's hidden copy.
+    fn merged(
+        &mut self,
+        node: NodeRef,
+        scope: &mut Scope,
+        full: bool,
+        pairs: &[(usize, usize)],
+    ) -> Result<NodeRef> {
+        let mut node = node;
+        let mut made = Vec::with_capacity(pairs.len());
+        if full {
+            let mut values = Vec::with_capacity(pairs.len());
+            for &(left_at, right_at) in pairs {
+                let (left, right) = (&scope.columns[left_at], &scope.columns[right_at]);
+                let left = self.plan.add_expr(Expr::Column(left.binding), left.ty.clone());
+                let right = self.plan.add_expr(Expr::Column(right.binding), right.ty.clone());
+                values.push(self.call("coalesce", vec![left, right])?);
+            }
+            let index = self.fresh_index();
+            let mut exprs = Vec::with_capacity(scope.columns.len() + values.len());
+            let mut names = Vec::with_capacity(scope.columns.len() + values.len());
+            for column in &scope.columns {
+                exprs.push(self.plan.add_expr(Expr::Column(column.binding), column.ty.clone()));
+                names.push(self.plan.intern(&column.name));
+            }
+            let width = scope.columns.len();
+            for (at, column) in scope.columns.iter_mut().enumerate() {
+                column.binding = ColumnBinding::new(index, at as u32);
+            }
+            for (at, (&value, &(left_at, _))) in values.iter().zip(pairs).enumerate() {
+                exprs.push(value);
+                names.push(self.plan.intern(&scope.columns[left_at].name));
+                let ty = self.plan.expr_type(value).clone();
+                made.push((left_at, ColumnBinding::new(index, (width + at) as u32), ty));
+            }
+            let exprs = self.plan.add_expr_list(&exprs);
+            let names = self.plan.add_name_list(&names);
+            node = self.add_node(Node::Project { input: node, index, exprs, names });
+        } else {
+            for &(left_at, right_at) in pairs {
+                let right = &scope.columns[right_at];
+                made.push((left_at, right.binding, right.ty.clone()));
+            }
+        }
+        // From the back, so the positions of the ones still to place are where they were.
+        made.sort_by_key(|&(left_at, ..)| left_at);
+        for (left_at, binding, ty) in made.into_iter().rev() {
+            let name = scope.columns[left_at].name.clone();
+            scope.columns.insert(
+                left_at,
+                Visible {
+                    table: String::new(),
+                    name,
+                    binding,
+                    ty,
+                    not_null: false,
+                    key: None,
+                    default: None,
+                    qualified: false,
+                    also: None,
+                    hidden: false,
+                },
+            );
+        }
+        Ok(node)
     }
 
     // -------------------------------------------------------------- aggregates

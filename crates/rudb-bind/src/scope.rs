@@ -49,6 +49,14 @@ pub(crate) struct Visible {
     /// way PostgreSQL names a set returning function's column after its alias, and on the pin the
     /// column still answers to `range` as well, until a subquery or a column list renames it.
     pub(crate) also: Option<String>,
+    /// Whether this is a copy of a joined-on column that a `USING` or `NATURAL` join keeps only for
+    /// its own table's name.
+    ///
+    /// `a JOIN b USING (k)` has one `k` in `SELECT *` and for a bare `k`, and on the pin `a.k` and
+    /// `b.k` still read each side's own value and `b.*` still has `k` in it. So the copy stays where
+    /// it was, reachable with its table in front, and is left out of everything that reads a bare
+    /// name or a bare star.
+    pub(crate) hidden: bool,
 }
 
 /// The columns a name can resolve against.
@@ -123,7 +131,7 @@ impl Scope {
             .iter()
             .filter(|held| {
                 same_name(&held.name, column)
-                    && (table.is_some() || !held.qualified)
+                    && (table.is_some() || !(held.qualified || held.hidden))
                     && table.is_none_or(|table| same_name(&held.table, table))
             })
             .collect();
@@ -132,6 +140,7 @@ impl Scope {
                 .iter()
                 .filter(|held| {
                     held.also.as_deref().is_some_and(|also| same_name(also, column))
+                        && (table.is_some() || !held.hidden)
                         && table.is_none_or(|table| same_name(&held.table, table))
                 })
                 .collect()
@@ -163,7 +172,7 @@ impl Scope {
     /// `SELECT *` with no `FROM` clause and is an error rather than zero columns.
     pub(crate) fn star(&self, qualifier: Option<&str>) -> Result<Vec<&Visible>> {
         let matched: Vec<&Visible> = match qualifier {
-            None => self.columns.iter().collect(),
+            None => self.columns.iter().filter(|held| !held.hidden).collect(),
             Some(table) => {
                 self.columns.iter().filter(|held| same_name(&held.table, table)).collect()
             }
@@ -224,13 +233,9 @@ impl Scope {
     pub(crate) fn fields(&self) -> Vec<Field> {
         self.columns
             .iter()
+            .filter(|column| !column.hidden)
             .map(|column| Field::new(column.name.clone(), column.ty.clone()))
             .collect()
-    }
-
-    /// Drops the column at `position`, which is what `USING` does to the right side's copy.
-    pub(crate) fn remove(&mut self, position: usize) {
-        self.columns.remove(position);
     }
 
     /// Drops everything from `position` on, which is what a semi or an anti join does to the right
@@ -244,6 +249,7 @@ impl Scope {
         let mut found = None;
         for (at, held) in self.columns.iter().enumerate() {
             if same_name(&held.name, name)
+                && (table.is_some() || !held.hidden)
                 && table.is_none_or(|table| same_name(&held.table, table))
             {
                 if found.is_some() {
@@ -263,7 +269,7 @@ impl Scope {
     /// That was measured: `SELECT current_date FROM t, u` with the name in both is
     /// `Ambiguous reference to column name "current_date"` on the pin.
     pub(crate) fn names(&self, column: &str) -> bool {
-        self.columns.iter().any(|held| same_name(&held.name, column))
+        self.columns.iter().any(|held| !held.hidden && same_name(&held.name, column))
     }
 
     fn not_found(&self, table: Option<&str>, column: &str) -> Error {
@@ -287,7 +293,12 @@ impl Scope {
     /// On its own line in the binary and on the same line here, because an error is one line here
     /// and the sentence before it is the part anybody matches on.
     pub(crate) fn candidates(&self) -> String {
-        let candidates: Vec<&str> = self.columns.iter().map(|held| held.name.as_str()).collect();
+        let candidates: Vec<&str> = self
+            .columns
+            .iter()
+            .filter(|held| !held.hidden)
+            .map(|held| held.name.as_str())
+            .collect();
         if candidates.is_empty() {
             String::new()
         } else {
@@ -312,6 +323,7 @@ mod tests {
             default: None,
             qualified: false,
             also: None,
+            hidden: false,
         });
         scope.push(Visible {
             table: "hits".into(),
@@ -323,6 +335,7 @@ mod tests {
             default: None,
             qualified: false,
             also: None,
+            hidden: false,
         });
         scope.push(Visible {
             table: "visits".into(),
@@ -334,6 +347,7 @@ mod tests {
             default: None,
             qualified: false,
             also: None,
+            hidden: false,
         });
         scope
     }
