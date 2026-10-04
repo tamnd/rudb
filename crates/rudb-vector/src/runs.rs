@@ -105,7 +105,10 @@ mod tests {
 
     #[expect(clippy::cast_possible_truncation, reason = "a thousand rows")]
     fn walked(values: &[i64]) -> Vec<u32> {
-        (1..values.len()).filter(|&row| values[row] != values[row - 1]).map(|row| row as u32).collect()
+        (1..values.len())
+            .filter(|&row| values[row] != values[row - 1])
+            .map(|row| row as u32)
+            .collect()
     }
 
     /// Both walks find the starts a plain loop does, across blocks and with runs longer than a block,
