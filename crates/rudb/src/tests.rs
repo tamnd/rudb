@@ -4905,6 +4905,41 @@ fn a_not_null_column_says_so_in_both_tables() {
 }
 
 #[test]
+fn a_table_sql_writes_its_keys_checks_and_defaults_the_way_the_pin_does() {
+    let db = Database::new();
+    let text = |value: &str| Value::Varchar(value.to_string());
+    for sql in [
+        "CREATE TABLE p(id INT PRIMARY KEY, x VARCHAR DEFAULT 'a' NOT NULL, y INT CHECK (y > 0) \
+         UNIQUE)",
+        "CREATE TABLE c(pid INT REFERENCES p(id), q INT DEFAULT 42, z DOUBLE NOT NULL, \
+         CHECK (q < z), UNIQUE (q, z), FOREIGN KEY (q) REFERENCES p(id), PRIMARY KEY (z, q))",
+        "CREATE TABLE \"Odd Name\"(\"a b\" INT PRIMARY KEY)",
+        "CREATE TABLE t(id INT, g INT)",
+        "ALTER TABLE t ADD PRIMARY KEY (id)",
+        "ALTER TABLE t ADD UNIQUE (g, id)",
+    ] {
+        db.execute(sql).expect(sql);
+    }
+    // Each is what DuckDB v2.0 answers for the same statements.
+    assert_eq!(
+        rows(&db, "SELECT sql FROM duckdb_tables() ORDER BY table_name"),
+        vec![
+            vec![text("CREATE TABLE \"Odd Name\"(\"a b\" INTEGER PRIMARY KEY);")],
+            vec![text(
+                "CREATE TABLE c(pid INTEGER, q INTEGER DEFAULT(42), z DOUBLE, FOREIGN KEY (pid) \
+                 REFERENCES p(id), CHECK((q < z)), UNIQUE(q, z), FOREIGN KEY (q) REFERENCES \
+                 p(id), PRIMARY KEY(z, q));"
+            )],
+            vec![text(
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, x VARCHAR DEFAULT('a') NOT NULL, y \
+                 INTEGER UNIQUE, CHECK((y > 0)));"
+            )],
+            vec![text("CREATE TABLE t(id INTEGER, g INTEGER, PRIMARY KEY(id), UNIQUE(g, id));")],
+        ]
+    );
+}
+
+#[test]
 fn a_view_lists_its_columns_the_way_a_table_does() {
     let db = database();
     let text = |value: &str| Value::Varchar(value.to_string());

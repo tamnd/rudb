@@ -221,6 +221,8 @@ pub struct CreateTable {
     pub foreign: Vec<rudb_catalog::ForeignKey>,
     /// Every constraint, in the order written.
     pub order: Vec<rudb_catalog::Constraint>,
+    /// The keys written as constraints of the table rather than on a column, by place in `keys`.
+    pub apart: Vec<usize>,
 }
 
 /// A bound `CREATE VIEW`.
@@ -1223,13 +1225,23 @@ fn create_table(
         foreign,
         sequences,
         order: ast.constraint_list(written.order).iter().map(|&held| constraint(held)).collect(),
+        apart: ast
+            .constraint_list(written.order)
+            .iter()
+            .filter_map(|&held| match held {
+                ast::Constraint::TableKey(at) => Some(at as usize),
+                _ => None,
+            })
+            .collect(),
     }))
 }
 
 /// A constraint the parser kept the place of, as the catalog keeps it.
 fn constraint(held: ast::Constraint) -> rudb_catalog::Constraint {
     match held {
-        ast::Constraint::Key(at) => rudb_catalog::Constraint::Key(at as usize),
+        ast::Constraint::Key(at) | ast::Constraint::TableKey(at) => {
+            rudb_catalog::Constraint::Key(at as usize)
+        }
         ast::Constraint::Check(at) => rudb_catalog::Constraint::Check(at as usize),
         ast::Constraint::Foreign(at) => rudb_catalog::Constraint::Foreign(at as usize),
         ast::Constraint::NotNull(at) => rudb_catalog::Constraint::NotNull(at as usize),

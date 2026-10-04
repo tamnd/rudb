@@ -1793,7 +1793,7 @@ impl<'a> Transform<'a> {
                 names.push(self.intern(&text));
             }
             let names = self.part_slice(names);
-            order.push(Constraint::Key(keys.len() as u32));
+            order.push(Constraint::TableKey(keys.len() as u32));
             self.add_key(table, names, is_primary, keys, primary)?;
         }
         Ok(self.column_def_slice(defs))
