@@ -4061,13 +4061,13 @@ impl Shared {
     /// that would not fit its column, goes through the plan whatever this says.
     pub(crate) fn point_plan(&self, shape: crate::prepared::Shape<'_>) -> Option<String> {
         use crate::prepared::Shape;
-        // Inside a transaction a read and an insert skip the plan, and an insert not in one that
-        // is read only. Nothing does in one that is aborted.
+        // Inside a transaction everything but an upsert skips the plan, and a write not in one
+        // that is read only. Nothing does in one that is aborted.
         let refused = match self.open().as_ref() {
             Some(open) => match shape {
                 Shape::Lookup(_) | Shape::Range(_) => open.aborted,
-                Shape::Insert(_) => open.aborted || open.read_only,
-                Shape::Write(_) | Shape::Upsert(_) => true,
+                Shape::Insert(_) | Shape::Write(_) => open.aborted || open.read_only,
+                Shape::Upsert(_) => true,
             },
             None => false,
         };
@@ -4136,10 +4136,10 @@ impl Shared {
     /// Runs a prepared upsert of one row without binding it, or says it cannot and leaves
     /// everything as it was, for [`Shared::execute_ast`] to run, see [`crate::prepared::Upsert`].
     ///
-    /// Outside a transaction only, and only while no transaction is open on the database, as for
-    /// [`Shared::write_point`]. The table has to be one a [`crate::prepared::Direct`] row goes
-    /// straight into, with one key and no unique index beside it, which is the key the statement
-    /// names if it names one, and no foreign key pointing at it. The row is worked out as an
+    /// Outside a transaction only, and only while no transaction is open on the database. The
+    /// table has to be one a [`crate::prepared::Direct`] row goes straight into, with one key and
+    /// no unique index beside it, which is the key the statement names if it names one, and no
+    /// foreign key pointing at it. The row is worked out as an
     /// insert's is and its key looked up. A row the table does not hold goes in as
     /// [`Shared::insert_direct`] puts it in. A held row is left alone for `DO NOTHING` and
     /// `OR IGNORE`, and otherwise takes its new values where it is, as [`Shared::write_point`]
@@ -4293,13 +4293,20 @@ impl Shared {
     /// Runs a prepared write by key without binding it, or says it cannot and leaves everything as
     /// it was, for [`Shared::execute_ast`] to run, see [`crate::prepared::PointWrite`].
     ///
-    /// Outside a transaction only, and only while no transaction is open on the database, since
-    /// then nobody holds a claim on the row or a snapshot that has to be kept from it. Everything
-    /// that could make the plan's answer differ is checked before anything is touched: a table
-    /// with checks, a declared order or a foreign key either way, a column the `SET` names in a key
-    /// or a unique index, a value that is not already its column's type or a widening of it, a sum
-    /// that does not fit its column, and a null for a `NOT NULL` column. The row is read by its
-    /// key, written where it is, logged the way the plan's update of it would be, and committed.
+    /// Everything that could make the plan's answer differ is checked before anything is touched:
+    /// a table with checks, a declared order or a foreign key either way, a column the `SET` names
+    /// in a key or a unique index, a value that is not already its column's type or a widening of
+    /// it, a sum that does not fit its column, and a null for a `NOT NULL` column. The row is read
+    /// by its key, written where it is, logged the way the plan's update of it would be, and
+    /// committed.
+    ///
+    /// Inside a transaction the row is the one in the transaction's own catalog, written without
+    /// the writer lock and noted for the commit, as the plan's update does there. Whenever a
+    /// transaction is open anywhere the row is claimed first, against what the other transactions
+    /// claimed and what was committed since this one's snapshot. A row somebody else holds goes
+    /// the long way, which fails it in the pin's words or waits for the holder under
+    /// `lock_timeout`. A page a snapshot still shares is copied before it is written, so nobody
+    /// else sees the write before it commits.
     pub(crate) fn write_point(
         &self,
         write: &crate::prepared::PointWrite,
@@ -4316,10 +4323,12 @@ impl Shared {
             .iter()
             .map(|(_, item)| given.value(item))
             .collect::<Option<Vec<_>>>()?;
-        let writing = self.writing();
-        if self.transacting() || self.registry().watched() {
-            return None;
-        }
+        // An aborted or read only transaction is refused by the plan, in its words.
+        let transacting = match self.open().as_ref() {
+            Some(open) if open.aborted || open.read_only => return None,
+            open => open.is_some(),
+        };
+        let writing = (!transacting).then(|| self.writing());
         let mut catalog = self.write();
         let target = match write.lookup.found.get(catalog.naming()) {
             Some(target) => target,
@@ -4341,6 +4350,13 @@ impl Shared {
             drop(writing);
             return Some(kept(sql, 0, |_| QueryResult::changed(0)));
         };
+        let watched = transacting || self.registry().watched();
+        let claim = if watched {
+            self.claim(table, false, &[spot.number], table.rows().len()).ok()?
+        } else {
+            None
+        };
+        let oid = table.oid();
         let fields = table.columns();
         let mut values = Vec::with_capacity(sets.len());
         for ((_, set), &column) in write.sets.iter().zip(sets) {
@@ -4390,6 +4406,12 @@ impl Shared {
                 unanswered = true;
                 return Err(Error::internal("a write by key the row cannot take where it is"));
             }
+            if let Some(marks) = claim {
+                self.claimed(oid, marks);
+            }
+            self.wrote(oid, |written, _| {
+                written.updated(&[spot.number], std::slice::from_ref(&row));
+            });
             if let Some(record) = staged
                 && let Some(journal) = self.journal().as_mut()
             {
@@ -4401,7 +4423,7 @@ impl Shared {
             return None;
         }
         drop(catalog);
-        let settled = self.settle(writing);
+        let settled = writing.map_or(Ok(()), |writing| self.settle(writing));
         Some(result.and_then(|result| settled.map(|()| result)))
     }
 
