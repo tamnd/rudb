@@ -115,7 +115,7 @@ pub enum Rows {
     /// costs the rows it adds rather than a read of the whole table into memory. While the tail is
     /// empty this is the file and its gone rows and nothing else, and says what it always said.
     /// Once it holds rows, the statistics go quiet the way a grown table's do, and a checkpoint
-    /// writes the table again.
+    /// extends the file with them and marks the gone rows again, see [`Rows::grown_from`].
     Masked(NativeReader, Arc<Gone>, MemoryTable),
 }
 
@@ -1015,10 +1015,21 @@ impl Rows {
     #[must_use]
     pub fn markable(&self) -> bool {
         matches!(self, Self::Masked(reader, gone, rows)
-            if rows.is_empty()
-                && !self.is_stored()
-                && gone.total() * 2 <= reader.table().rows()
-                && gone.patched_rows() * PATCHED_SHARE <= reader.table().rows())
+            if rows.is_empty() && !self.is_stored() && Self::few_gone(reader, gone))
+    }
+
+    /// Whether few enough of the file's rows are gone or written over for a checkpoint to write
+    /// down which, rather than write the rest of the table again. See [`Self::marks`].
+    fn few_gone(reader: &NativeReader, gone: &Gone) -> bool {
+        gone.total() * 2 <= reader.table().rows()
+            && gone.patched_rows() * PATCHED_SHARE <= reader.table().rows()
+    }
+
+    /// Whether these are a file's rows with some gone and rows appended since, which a checkpoint
+    /// writes by extending the file and marking the gone rows again.
+    fn extends_marked(&self) -> bool {
+        matches!(self, Self::Masked(reader, gone, rows)
+            if !rows.is_empty() && Self::few_gone(reader, gone))
     }
 
     /// For a table whose file is still the one it was read from and some of whose rows a delete
@@ -1026,6 +1037,9 @@ impl Rows {
     /// beside the file rather than write the rest of the table again.
     ///
     /// The rows an update wrote over go with it, see [`PATCHED_SHARE`].
+    ///
+    /// A table with rows appended since has a record too, for the checkpoint that extends it, see
+    /// [`Self::grown_from`].
     ///
     /// `None` once half the file's rows are gone. The gone rows still take their space in the
     /// file, and past that point writing the rest of the table again is what gives it back, at a
@@ -1039,7 +1053,7 @@ impl Rows {
     /// If a part the new rows went from does not read back.
     pub fn marks(&self) -> Result<Option<rudb_native::GoneRows>> {
         match self {
-            Self::Masked(reader, gone, _) if self.markable() => {
+            Self::Masked(reader, gone, _) if self.markable() || self.extends_marked() => {
                 let mut marks = gone.marks();
                 marks.sums = reader.gone_sums(&marks, reader.gone())?;
                 Ok(Some(marks))
@@ -1051,10 +1065,16 @@ impl Rows {
     /// For rows appended to a committed native snapshot, how many rows and parts the snapshot
     /// holds. The parts after those are the appended rows, which is all a checkpoint that keeps
     /// the snapshot's stripes has to write.
+    ///
+    /// The same for a file some rows are gone from, while [`Self::marks`] says which, so the
+    /// checkpoint writes the rows appended and the record and not the rest of the table.
     #[must_use]
     pub fn grown_from(&self) -> Option<(usize, usize)> {
         match self {
             Self::Grown(reader, _) => Some((reader.table().rows(), reader.parts())),
+            Self::Masked(reader, ..) if self.extends_marked() => {
+                Some((reader.table().rows(), reader.parts()))
+            }
             Self::Memory(_) | Self::Native(_) | Self::Masked(..) => None,
         }
     }

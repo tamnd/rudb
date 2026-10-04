@@ -465,11 +465,28 @@ fn writes_by_key_after_rows_were_appended_leave_the_table_in_its_file() {
     assert_eq!(keyed(&file), keyed(&memory), "after a commit beside an insert");
     assert!(shape(&file).starts_with("masked"), "{}", shape(&file));
 
+    // The checkpoint keeps the file's stripes, writes the rows appended after them and marks the
+    // rows written over again, rather than write the table whole.
     file.execute("CHECKPOINT").expect("checkpoints");
+    assert_eq!(shape(&file), "masked 0");
     assert_eq!(keyed(&file), keyed(&memory), "after the checkpoint");
+
+    // And again, from a file that already says which rows are gone.
+    both(&file, &memory, "INSERT INTO k SELECT range + 90000, 'more', range FROM range(500)");
+    for db in [&file, &memory] {
+        let prepared = db.prepare(update).expect("prepares");
+        for id in [10, 60002, 90001, 10] {
+            prepared.execute(&[BigInt(1), Varchar("again".into()), BigInt(id)]).expect("updates");
+        }
+    }
+    assert_eq!(shape(&file), "masked 500");
+    file.execute("CHECKPOINT").expect("checkpoints");
+    assert_eq!(shape(&file), "masked 0");
+    assert_eq!(keyed(&file), keyed(&memory), "after the second checkpoint");
     drop((mine, other));
     drop(file);
     let file = open(&path);
+    assert_eq!(shape(&file), "masked 0");
     assert_eq!(keyed(&file), keyed(&memory), "after the reopen");
     drop(file);
     remove(&path);

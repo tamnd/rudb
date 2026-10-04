@@ -2862,19 +2862,25 @@ fn appended(
     names: &[QualifiedName],
     views: &[rudb_native::ViewEntry],
     anchor: Option<&LogAnchor>,
-    marks: Vec<(String, rudb_native::GoneRows)>,
+    mut marks: Vec<(String, rudb_native::GoneRows)>,
 ) -> Result<bool> {
     let Some(held) = held_rows(path)? else { return Ok(false) };
     if held.is_empty() {
         return Ok(false);
     }
     // A table some rows were deleted from is carried forward too, with the rows gone written down
-    // beside it, see [`marks`].
+    // beside it, see [`marks`]. One that rows were appended to as well is extended below.
+    let growing = |name: &str| {
+        names.iter().any(|held| {
+            held.table == name
+                && catalog.table(held).is_ok_and(|table| table.rows().grown_from().is_some())
+        })
+    };
     let native = names
         .iter()
         .filter(|name| catalog.table(name).is_ok_and(|table| table.rows().is_stored()))
         .map(|name| name.table.clone())
-        .chain(marks.iter().map(|(name, _)| name.clone()))
+        .chain(marks.iter().filter(|(name, _)| !growing(name)).map(|(name, _)| name.clone()))
         .collect::<BTreeSet<_>>();
     let dirty =
         names.iter().filter(|name| !native.contains(&name.table)).cloned().collect::<Vec<_>>();
@@ -2885,12 +2891,16 @@ fn appended(
     for name in &dirty {
         let table = catalog.table(name)?;
         let Some((rows, parts)) = table.rows().grown_from() else { continue };
+        let marked = marks.iter().any(|(marked, _)| *marked == name.table);
         if held.get(&name.table) == Some(&rows)
-            && rudb_native::extendable(path, &name.table, table.columns(), rows)?
+            && rudb_native::extendable(path, &name.table, table.columns(), rows, marked)?
         {
             extended.insert(name.table.clone(), parts);
         }
     }
+    // The rows gone from a table written again whole are not in what is written, so the record
+    // goes only with the tables carried forward or extended.
+    marks.retain(|(name, _)| native.contains(name) || extended.contains_key(name));
     // Every table the file holds is carried forward as it is, extended, or written again by this
     // generation, which drops the old entry of the same name when it starts the table. A table
     // written again with rows in it leaves its old stripes in the file as space nothing names, and
@@ -2983,8 +2993,11 @@ fn mostly_live(
     for name in names {
         let reader = match catalog.table(name)?.rows() {
             rudb_catalog::Rows::Native(reader) => reader,
-            // Rows appended after the file's gone rows are written again with the rest of it.
-            rudb_catalog::Rows::Masked(reader, _, tail) if tail.is_empty() => reader,
+            rudb_catalog::Rows::Masked(reader, _, tail)
+                if tail.is_empty() || extended.contains_key(&name.table) =>
+            {
+                reader
+            }
             rudb_catalog::Rows::Grown(reader, _) if extended.contains_key(&name.table) => reader,
             _ => continue,
         };
