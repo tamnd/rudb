@@ -5529,10 +5529,12 @@ fn integers(flat: &Vector, rows: usize) -> Option<Cow<'_, [i64]>> {
 ///
 /// It is one pass over the key for both. [`interior`] read the key to check its order and find the
 /// ends, and then the starts were found in a second pass between them, and on TPC-H q18 the two were
-/// about a tenth of the query once its runs were added up from codes. Here the rows are compared
+/// a sixth of the query once its runs were added up from codes. Here the rows are compared
 /// sixty four at a time into a word with a bit for each row whose key differs from the row before
 /// it, the order is checked in the same loop, and the starts are read out of the set bits, which
-/// needs no branch a row on a run of four.
+/// needs no branch a row on a run of four. This is the first pass to read the key after the scan,
+/// so it waits on memory more than on the compares, and four rows at a time in AVX2 was tried and
+/// was no faster.
 ///
 /// A packed key is unpacked once into a buffer the thread keeps and read like a flat one, because
 /// a code is the value less the frame's base and so codes are in the order the values are.
