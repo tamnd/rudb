@@ -1367,6 +1367,8 @@ fn check_text(
             default: None,
             qualified: false,
             also: None,
+            hidden: false,
+            using: None,
         });
     }
     match binder.bind_expr(ast, expr, &scope) {

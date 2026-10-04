@@ -19,7 +19,7 @@ use rudb_regex::Regex;
 
 use crate::binder::Binder;
 use crate::fold;
-use crate::scope::{Scope, Visible};
+use crate::scope::{Joined, Scope, Visible};
 use rudb_catalog::same_name;
 
 /// One column a star or a `COLUMNS` stands for.
@@ -299,9 +299,38 @@ impl Binder<'_> {
         let mut excluded_used = vec![false; excluded.len()];
         let mut replaced = vec![false; replacements.len()];
         let mut picked = Vec::new();
-        for column in input.star(table.as_deref())? {
-            if let Some(at) = excluded.iter().position(|parts| names_column(parts, column)) {
+        let starred = input.star(table.as_deref())?;
+        // A bare star walks the hidden copies of a joined-on column too. On the pin the column goes
+        // where the first copy `EXCLUDE` does not name is, and a `RENAME` reaches it through that
+        // copy's name, so `* EXCLUDE (a.k)` over `a JOIN b USING (k)` has `k` after `x`, and a bare
+        // `k` in the list takes it out wherever it is.
+        let walked = if table.is_none() { input.columns.iter().collect() } else { starred };
+        let mut placed = Vec::new();
+        for copy in walked {
+            let group = match copy.using {
+                Some(Joined::Merged(_)) if table.is_none() => continue,
+                Some(Joined::Copy(group)) if table.is_none() => Some(group),
+                _ => None,
+            };
+            if let Some(at) = excluded.iter().position(|parts| names_column(parts, copy)) {
                 excluded_used[at] = true;
+                if excluded[at].len() == 1 {
+                    placed.extend(group);
+                }
+                continue;
+            }
+            let mut column = copy;
+            if let Some(group) = group {
+                if placed.contains(&group) {
+                    continue;
+                }
+                placed.push(group);
+                let shown = input
+                    .columns
+                    .iter()
+                    .find(|held| !held.hidden && held.using.map(Joined::group) == Some(group));
+                column = shown.ok_or_else(|| Error::internal("a joined-on column with no copy"))?;
+            } else if table.is_none() && copy.hidden {
                 continue;
             }
             let mut name = column.name.clone();
@@ -319,7 +348,7 @@ impl Binder<'_> {
             for rename in renames {
                 if let ast::Expr::Column { name: from } = ast.expr(rename.expr) {
                     let parts: Vec<&str> = ast.name(from).collect();
-                    if names_column(&parts, column) {
+                    if names_column(&parts, copy) {
                         name = ast.string(rename.alias).to_string();
                     }
                 }
