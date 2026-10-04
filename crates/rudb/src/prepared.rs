@@ -403,6 +403,16 @@ pub(crate) struct RangeRead {
     pub(crate) limit: Limit,
 }
 
+/// One of the shapes a prepared statement can take the short way with, for
+/// [`Prepared::explain`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Shape<'a> {
+    Insert(&'a Direct),
+    Lookup(&'a Lookup),
+    Write(&'a PointWrite),
+    Range(&'a RangeRead),
+}
+
 /// The `LIMIT` of a [`RangeRead`].
 #[derive(Debug, Clone)]
 pub(crate) enum Limit {
@@ -613,6 +623,27 @@ impl Prepared {
     #[must_use]
     pub fn parameters(&self) -> &[String] {
         &self.names
+    }
+
+    /// What the statement runs as, as it stands against the database now: a point plan for one of
+    /// the shapes that skip binding and planning, named the way `engine-v4/13-the-point-path.md`
+    /// section 13.4 does, and `PIPELINE` for anything bound, planned and run as a pipeline each
+    /// time.
+    ///
+    /// The point plans are `InsertOne t`, `POINT Lookup t(key)`, `UpdateOne t(key) SET column`
+    /// and `Range t(key)`. They hold for values of the key's and the columns' types, and outside
+    /// a transaction. A benchmark checks this before it measures, so a statement that would fall
+    /// back to the pipeline is found out by name rather than by a slow number.
+    #[must_use]
+    pub fn explain(&self) -> String {
+        let shapes = [
+            self.direct.as_ref().map(Shape::Insert),
+            self.lookup.as_ref().map(Shape::Lookup),
+            self.write.as_ref().map(Shape::Write),
+            self.range.as_ref().map(Shape::Range),
+        ];
+        let plan = shapes.into_iter().flatten().find_map(|shape| self.shared.point_plan(shape));
+        plan.unwrap_or_else(|| "PIPELINE".to_owned())
     }
 
     /// Runs the statement with values by position, numbered from one.

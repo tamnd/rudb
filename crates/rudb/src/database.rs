@@ -4031,6 +4031,68 @@ impl Shared {
         (!unanswered).then_some(result)
     }
 
+    /// The point plan a prepared statement of one of the shapes [`crate::prepared`] takes the short
+    /// way with runs as against the catalog as it is now, for [`crate::Prepared::explain`], or
+    /// `None` when it would go through the plan.
+    ///
+    /// What depends on the values is left out: a value that is not of its column's type, or a write
+    /// that would not fit its column, goes through the plan whatever this says.
+    pub(crate) fn point_plan(&self, shape: crate::prepared::Shape<'_>) -> Option<String> {
+        use crate::prepared::Shape;
+        if self.transacting() {
+            return None;
+        }
+        let catalog = self.read();
+        let named = |name: &QualifiedName, key: &[usize]| {
+            let fields = catalog.table(name).ok()?.columns();
+            let key: Vec<&str> = key.iter().map(|&at| fields[at].name.as_str()).collect();
+            Some(format!("{}({})", name.table, key.join(", ")))
+        };
+        match shape {
+            Shape::Insert(direct) => {
+                if !self.inner.writable {
+                    return None;
+                }
+                let (name, _) = direct_targets(&catalog, direct)?;
+                Some(format!("InsertOne {}", name.table))
+            }
+            Shape::Lookup(lookup) => {
+                let target = lookup_target(&catalog, lookup)?;
+                if !catalog.table(&target.name).ok()?.finds_by(&target.key) {
+                    return None;
+                }
+                Some(format!("POINT Lookup {}", named(&target.name, &target.key)?))
+            }
+            Shape::Write(write) => {
+                let target = point_write_target(&catalog, write)?;
+                let table = catalog.table(&target.name).ok()?;
+                if !self.inner.writable
+                    || !table.finds_by(&target.key)
+                    || !writes_in_place(&catalog, &target)
+                {
+                    return None;
+                }
+                let fields = table.columns();
+                let sets: Vec<&str> =
+                    target.sets.iter().map(|&at| fields[at].name.as_str()).collect();
+                let key = named(&target.name, &target.key)?;
+                // Every value added to what the column held, section 13.4's additive update.
+                let delta =
+                    write.sets.iter().all(|(_, set)| matches!(set, crate::prepared::Set::Add(..)));
+                let plan = if delta { "DeltaOne" } else { "UpdateOne" };
+                Some(format!("{plan} {key} SET {}", sets.join(", ")))
+            }
+            Shape::Range(range) => {
+                let target = lookup_target(&catalog, &range.lookup)?;
+                let [key] = target.key.as_slice() else { return None };
+                if !catalog.table(&target.name).ok()?.ranges_by(*key) {
+                    return None;
+                }
+                Some(format!("Range {}", named(&target.name, &target.key)?))
+            }
+        }
+    }
+
     /// Runs a prepared write by key without binding it, or says it cannot and leaves everything as
     /// it was, for [`Shared::execute_ast`] to run, see [`crate::prepared::PointWrite`].
     ///
@@ -4073,14 +4135,7 @@ impl Shared {
         let name = &target.name;
         let sets = target.sets.as_slice();
         let table = catalog.table(name).ok()?;
-        let touches = |columns: &[usize]| columns.iter().any(|column| sets.contains(column));
-        if table.guards().iter().any(|key| touches(&key.columns))
-            || table.indexes().iter().any(|index| index.unique && touches(&index.columns))
-            || !table.checks().is_empty()
-            || !table.foreign().is_empty()
-            || table.clustering().is_some()
-            || catalog.tables().any(|held| held.foreign().iter().any(|key| &key.table == name))
-        {
+        if !writes_in_place(&catalog, &target) {
             return None;
         }
         let Some((spot, row)) = table.spot(&target.key, &keys, &target.columns).ok()?? else {
@@ -6538,6 +6593,21 @@ fn point_write_target(
         target.sets.push(at);
     }
     Some(target)
+}
+
+/// Whether a write by key to `target` can be made where the row is: the `SET` names no column of
+/// a key or a unique index, and the table has no checks, no declared order and no foreign key
+/// either way, each of which the plan has something to say about.
+fn writes_in_place(catalog: &Catalog, target: &crate::prepared::Target) -> bool {
+    let name = &target.name;
+    let Ok(table) = catalog.table(name) else { return false };
+    let touches = |columns: &[usize]| columns.iter().any(|column| target.sets.contains(column));
+    !(table.guards().iter().any(|key| touches(&key.columns))
+        || table.indexes().iter().any(|index| index.unique && touches(&index.columns))
+        || !table.checks().is_empty()
+        || !table.foreign().is_empty()
+        || table.clustering().is_some()
+        || catalog.tables().any(|held| held.foreign().iter().any(|key| &key.table == name)))
 }
 
 /// The integer `was` of a column of type `ty` plus `by`, or minus it, for an `UPDATE` that sets a
