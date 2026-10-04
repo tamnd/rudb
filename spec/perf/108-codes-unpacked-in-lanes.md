@@ -8,7 +8,7 @@ Note 106 reads eight codes of a block with one shuffle, one variable shift and o
 
 ## The change
 
-`lanes::unpack` does that for a block of 64 codes: for each group of eight, the two sixteen byte loads, the shuffle, the shift and the mask of `lanes::within`, then `vpmovzxdq` on each half and two stores of four words. `unpack_block_at` takes the lanes when the width is 25 or less and the sixteen bytes past the block are there, which is every block of a column but the last, and `unpack_block` otherwise. `Packed::unpack` and `Packed::unpack_mapped` both go through it, so every caller that unpacks a run of whole blocks gets it, which is the aggregates, the gathers of a dense selection and the range filter on a live row list.
+`lanes::unpack` does that for a block of 64 codes: for each group of eight, the two sixteen byte loads, the shuffle, the shift and the mask of `lanes::within`, then `vpmovzxdq` on each half and two stores of four words. `unpack_block_at` takes the lanes when the width is 25 or less and the sixteen bytes past the block are there, which is every block of a column but the last, and `unpack_block` otherwise. `Packed::unpack` and `Packed::unpack_mapped` both go through it, so every caller that unpacks a run of whole blocks gets it, which is the aggregates and the gathers of a dense selection.
 
 ## Results
 
