@@ -1,5 +1,6 @@
 //! A table: a name, some columns, and the rows.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -108,7 +109,14 @@ pub enum Rows {
     /// it replaces, and a read lays them over the part. The bounds of a column an update wrote no
     /// longer hold for the parts it wrote into, and nothing is said about those, while the bounds
     /// of every other column still do.
-    Masked(NativeReader, Arc<Gone>),
+    ///
+    /// Rows appended since go into the table in memory at the end, the way they do for a grown
+    /// table, and are numbered after the file's parts. An insert after a delete or an update then
+    /// costs the rows it adds rather than a read of the whole table into memory. While the tail is
+    /// empty this is the file and its gone rows and nothing else, and says what it always said.
+    /// Once it holds rows, the statistics go quiet the way a grown table's do, and a checkpoint
+    /// writes the table again.
+    Masked(NativeReader, Arc<Gone>, MemoryTable),
 }
 
 /// Two columns fetched at sparse native row ordinals without materializing their string values.
@@ -144,51 +152,40 @@ impl Rows {
     /// Never in practice. The branch that would report one is the committed file that was replaced
     /// on the line above, which the compiler cannot see is gone.
     pub fn to_append(&mut self) -> Result<&mut MemoryTable> {
-        // Rows appended after a delete join what the delete left in memory. Keeping the file and
-        // its gone rows with a third part beside them is the better shape, and not one any query
-        // has needed yet.
-        if let Self::Masked(..) = self {
-            *self = Self::Memory(self.materialized()?);
-        }
+        // Rows appended after a delete or an update go after the file and its gone rows, in the
+        // table in memory a masked file keeps for them.
         if let Self::Native(reader) = self {
-            let types = reader.table().fields().iter().map(|field| field.ty.clone()).collect();
-            *self = Self::Grown(reader.clone(), MemoryTable::new(types));
+            *self = Self::Grown(reader.clone(), Self::tail_of(reader));
         }
         match self {
-            Self::Memory(rows) | Self::Grown(_, rows) => Ok(rows),
-            Self::Native(_) | Self::Masked(..) => {
-                Err(Error::internal("a committed table took no append buffer"))
-            }
+            Self::Memory(rows) | Self::Grown(_, rows) | Self::Masked(_, _, rows) => Ok(rows),
+            Self::Native(_) => Err(Error::internal("a committed table took no append buffer")),
         }
     }
 
-    /// Every row read into a table in memory.
-    fn materialized(&self) -> Result<MemoryTable> {
-        let types = self.types();
-        let columns = (0..types.len()).collect::<Vec<_>>();
-        let mut chunks = Vec::with_capacity(self.chunk_count());
-        for at in 0..self.chunk_count() {
-            // Loosened for the reason a grown table's file parts are: the rows appended after
-            // these have no codes in the file's dictionary.
-            let chunk = self.read(at, &columns)?.loosened();
-            if !chunk.is_empty() {
-                chunks.push(chunk);
-            }
-        }
-        let mut rows = MemoryTable::new(types);
-        rows.append_all(chunks, 1)?;
-        Ok(rows)
+    /// A file with `gone` rows gone and nothing appended yet.
+    #[must_use]
+    pub fn masked(reader: NativeReader, gone: Arc<Gone>) -> Self {
+        let tail = Self::tail_of(&reader);
+        Self::Masked(reader, gone, tail)
+    }
+
+    /// An empty table in memory with the columns of the file `reader` reads.
+    fn tail_of(reader: &NativeReader) -> MemoryTable {
+        MemoryTable::new(reader.table().fields().iter().map(|field| field.ty.clone()).collect())
     }
 
     /// Part `at` of a file read as `part`, holding `columns`, with the rows an update wrote into
     /// it laid over the rows they replace, and every column an update wrote anywhere without the
-    /// file's string codes.
+    /// file's string codes. `slots` names the rows of the part that were read, by the file's
+    /// count, when not all of them were.
     fn patched(
         reader: &NativeReader,
         gone: &Gone,
         at: usize,
         columns: &[usize],
         part: Chunk,
+        slots: Option<&[u32]>,
     ) -> Result<Chunk> {
         if !columns.iter().any(|&column| gone.touched(column)) {
             return Ok(part);
@@ -203,7 +200,10 @@ impl Rows {
                     let field = fields
                         .get(column)
                         .ok_or_else(|| Error::internal("a read names a column past the table"))?;
-                    patch.over(&field.ty, &read, column)?
+                    match slots {
+                        Some(slots) => patch.over_rows(&field.ty, &read, column, slots)?,
+                        None => patch.over(&field.ty, &read, column)?,
+                    }
                 }
                 // A part the update left alone still loses the file's string codes, because the
                 // parts it wrote into have none and a group that took codes from one part and
@@ -264,7 +264,7 @@ impl Rows {
     fn stripes_in_file(&self) -> usize {
         match self {
             Self::Memory(_) => 0,
-            Self::Native(reader) | Self::Grown(reader, _) | Self::Masked(reader, _) => {
+            Self::Native(reader) | Self::Grown(reader, _) | Self::Masked(reader, ..) => {
                 reader.stripe_parts().len()
             }
         }
@@ -426,8 +426,10 @@ impl Rows {
             Self::Memory(rows) => rows.exact_sum(column),
             Self::Native(reader) => reader.exact_sum(column),
             // The file's sum less what the rows it records as gone held, while those are all the
-            // rows gone. A delete since then has taken rows nobody counted.
-            Self::Masked(reader, gone) => {
+            // rows gone. A delete since then has taken rows nobody counted, and rows appended since
+            // are rows nobody counted either.
+            Self::Masked(_, _, tail) if !tail.is_empty() => Ok(None),
+            Self::Masked(reader, gone, _) => {
                 let Some(stored) = reader.gone().filter(|stored| stored.total == gone.total())
                 else {
                     return Ok(None);
@@ -739,20 +741,13 @@ impl Rows {
                 }
                 reader.part_rows(at)
             }
-            Self::Masked(reader, gone) => {
-                if at >= reader.parts() {
-                    return Err(Error::internal("row ordinal names a missing part"));
-                }
+            Self::Masked(reader, gone, _) if at < reader.parts() => {
                 reader.part_rows(at) - gone.lost(at)
             }
-            Self::Grown(reader, rows) => {
-                if at < reader.parts() {
-                    reader.part_rows(at)
-                } else {
-                    rows.chunk_len(at - reader.parts())
-                        .ok_or_else(|| Error::internal("row ordinal names a missing chunk"))?
-                }
-            }
+            Self::Grown(reader, _) if at < reader.parts() => reader.part_rows(at),
+            Self::Grown(reader, rows) | Self::Masked(reader, _, rows) => rows
+                .chunk_len(at - reader.parts())
+                .ok_or_else(|| Error::internal("row ordinal names a missing chunk"))?,
         })
     }
 
@@ -953,7 +948,7 @@ impl Rows {
     pub fn types(&self) -> Vec<LogicalType> {
         match self {
             Self::Memory(rows) => rows.types().to_vec(),
-            Self::Native(reader) | Self::Grown(reader, _) | Self::Masked(reader, _) => {
+            Self::Native(reader) | Self::Grown(reader, _) | Self::Masked(reader, ..) => {
                 reader.table().fields().iter().map(|field| field.ty.clone()).collect()
             }
         }
@@ -966,7 +961,9 @@ impl Rows {
             Self::Memory(rows) => rows.len(),
             Self::Native(reader) => reader.table().rows(),
             Self::Grown(reader, rows) => reader.table().rows().saturating_add(rows.len()),
-            Self::Masked(reader, gone) => reader.table().rows().saturating_sub(gone.total()),
+            Self::Masked(reader, gone, rows) => {
+                reader.table().rows().saturating_sub(gone.total()).saturating_add(rows.len())
+            }
         }
     }
 
@@ -993,7 +990,7 @@ impl Rows {
     pub fn of_file(reader: NativeReader) -> Result<Self> {
         let Some(stored) = reader.gone() else { return Ok(Self::Native(reader)) };
         let gone = Gone::stored(reader.parts(), stored)?;
-        Ok(Self::Masked(reader, Arc::new(gone)))
+        Ok(Self::masked(reader, Arc::new(gone)))
     }
 
     /// Whether the file behind these rows already says everything about them, so a checkpoint
@@ -1004,9 +1001,11 @@ impl Rows {
         match self {
             Self::Native(_) => true,
             // The rows gone only ever grow from what the file recorded, so the same count is the
-            // same rows.
-            Self::Masked(reader, gone) => {
-                !gone.is_fresh() && reader.gone().map_or(0, |stored| stored.total) == gone.total()
+            // same rows. Rows appended since are not in the file at all.
+            Self::Masked(reader, gone, rows) => {
+                rows.is_empty()
+                    && !gone.is_fresh()
+                    && reader.gone().map_or(0, |stored| stored.total) == gone.total()
             }
             Self::Memory(_) | Self::Grown(..) => false,
         }
@@ -1015,8 +1014,9 @@ impl Rows {
     /// Whether [`Self::marks`] has a record to hand back, without reading anything for it.
     #[must_use]
     pub fn markable(&self) -> bool {
-        matches!(self, Self::Masked(reader, gone)
-            if !self.is_stored()
+        matches!(self, Self::Masked(reader, gone, rows)
+            if rows.is_empty()
+                && !self.is_stored()
                 && gone.total() * 2 <= reader.table().rows()
                 && gone.patched_rows() * PATCHED_SHARE <= reader.table().rows())
     }
@@ -1039,7 +1039,7 @@ impl Rows {
     /// If a part the new rows went from does not read back.
     pub fn marks(&self) -> Result<Option<rudb_native::GoneRows>> {
         match self {
-            Self::Masked(reader, gone) if self.markable() => {
+            Self::Masked(reader, gone, _) if self.markable() => {
                 let mut marks = gone.marks();
                 marks.sums = reader.gone_sums(&marks, reader.gone())?;
                 Ok(Some(marks))
@@ -1063,7 +1063,7 @@ impl Rows {
     #[must_use]
     pub fn gone(&self) -> Option<&Gone> {
         match self {
-            Self::Masked(_, gone) => Some(gone),
+            Self::Masked(_, gone, _) => Some(gone),
             Self::Memory(_) | Self::Native(_) | Self::Grown(..) => None,
         }
     }
@@ -1073,8 +1073,10 @@ impl Rows {
     pub fn chunk_count(&self) -> usize {
         match self {
             Self::Memory(rows) => rows.chunk_count(),
-            Self::Native(reader) | Self::Masked(reader, _) => reader.parts(),
-            Self::Grown(reader, rows) => reader.parts().saturating_add(rows.chunk_count()),
+            Self::Native(reader) => reader.parts(),
+            Self::Grown(reader, rows) | Self::Masked(reader, _, rows) => {
+                reader.parts().saturating_add(rows.chunk_count())
+            }
         }
     }
 
@@ -1088,10 +1090,10 @@ impl Rows {
     pub fn stripe_parts(&self) -> Vec<std::ops::Range<usize>> {
         match self {
             Self::Memory(rows) => rows.group_parts(),
-            Self::Native(reader) | Self::Masked(reader, _) => reader.stripe_parts(),
+            Self::Native(reader) => reader.stripe_parts(),
             // The file's stripes and then the row groups of what arrived since, moved up by the
             // parts in front of them so that a range here still names parts [`Self::read`] takes.
-            Self::Grown(reader, rows) => {
+            Self::Grown(reader, rows) | Self::Masked(reader, _, rows) => {
                 let parts = reader.parts();
                 let mut stripes = reader.stripe_parts();
                 stripes.extend(
@@ -1113,7 +1115,11 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.group_rows(stripe),
             Self::Native(reader) => reader.stripe_rows(stripe),
-            Self::Masked(reader, gone) => {
+            Self::Masked(reader, gone, rows) => {
+                let held = self.stripes_in_file();
+                if stripe >= held {
+                    return rows.group_rows(stripe - held);
+                }
                 let lost = reader
                     .stripe_parts()
                     .get(stripe)
@@ -1137,7 +1143,7 @@ impl Rows {
     pub fn keep_stripes(&self, stripes: usize) {
         match self {
             Self::Memory(_) => {}
-            Self::Native(reader) | Self::Grown(reader, _) | Self::Masked(reader, _) => {
+            Self::Native(reader) | Self::Grown(reader, _) | Self::Masked(reader, ..) => {
                 reader.keep_stripes(stripes);
             }
         }
@@ -1148,9 +1154,13 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.read(at, columns),
             Self::Native(reader) => reader.read(at, columns),
-            Self::Masked(reader, gone) => {
-                let part = Self::patched(reader, gone, at, columns, reader.read(at, columns)?)?;
-                match Self::live(reader, gone, at) {
+            Self::Masked(reader, _, rows) if at >= reader.parts() => {
+                rows.read(at - reader.parts(), columns)
+            }
+            Self::Masked(reader, gone, rows) => {
+                let read = reader.read(at, columns)?;
+                let part = Self::patched(reader, gone, at, columns, read, None)?;
+                let part = match Self::live(reader, gone, at) {
                     // Gathered rather than selected, so what a checkpoint writes from it is a plain
                     // column and not a window onto the rows it is leaving behind.
                     Some(live) => {
@@ -1158,10 +1168,13 @@ impl Rows {
                         for column in 0..part.width() {
                             columns.push(part.column(column)?.gather(&live)?);
                         }
-                        Chunk::with_rows(columns, live.len())
+                        Chunk::with_rows(columns, live.len())?
                     }
-                    None => Ok(part),
-                }
+                    None => part,
+                };
+                // Without the file's codes once rows arrived since, for the reason a grown
+                // table's parts are.
+                Ok(if rows.is_empty() { part } else { part.loosened() })
             }
             // A part of the file keeps the file's string codes, and they are not the codes of the
             // rows that arrived since, which have none. A caller told the codes were stable would
@@ -1204,8 +1217,8 @@ impl Rows {
     ) -> Result<Chunk> {
         match self {
             Self::Native(reader) => reader.read_rows(at, columns, positions, whole),
-            // A part an update wrote into is read whole for the update's rows to be laid over it.
-            Self::Masked(_, gone) if gone.changes(at, columns.iter().copied()) => {
+            // A part of the rows appended since is read the way a table in memory reads one.
+            Self::Masked(reader, ..) if at >= reader.parts() => {
                 let part = self.read(at, columns)?;
                 let mut selected = Vec::with_capacity(part.width());
                 for column in 0..part.width() {
@@ -1214,8 +1227,9 @@ impl Rows {
                 Chunk::with_rows(selected, positions.len())
             }
             // The positions count the rows left, and the file counts every row it wrote.
-            Self::Masked(reader, gone) => {
-                let part = match Self::live(reader, gone, at) {
+            // The rows an update wrote are laid over only the rows read.
+            Self::Masked(reader, gone, rows) => {
+                let held = match Self::live(reader, gone, at) {
                     Some(live) => {
                         let mut held = Vec::with_capacity(positions.len());
                         for &position in positions {
@@ -1223,11 +1237,13 @@ impl Rows {
                                 Error::internal("a selection keeps a row past its part")
                             })?);
                         }
-                        reader.read_rows(at, columns, &held, whole)?
+                        Cow::Owned(held)
                     }
-                    None => reader.read_rows(at, columns, positions, whole)?,
+                    None => Cow::Borrowed(positions),
                 };
-                Self::patched(reader, gone, at, columns, part)
+                let part = reader.read_rows(at, columns, &held, whole)?;
+                let part = Self::patched(reader, gone, at, columns, part, Some(&held))?;
+                Ok(if rows.is_empty() { part } else { part.loosened() })
             }
             Self::Grown(reader, _) if at < reader.parts() => {
                 reader.read_rows(at, columns, positions, whole).map(Chunk::loosened)
@@ -1295,7 +1311,10 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.skips(at, probes),
             Self::Native(reader) => reader.skips(at, probes),
-            Self::Masked(reader, gone) => {
+            Self::Masked(reader, _, rows) if at >= reader.parts() => {
+                rows.skips(at - reader.parts(), probes)
+            }
+            Self::Masked(reader, gone, _) => {
                 !gone.changes(at, probes.iter().map(|probe| probe.column))
                     && reader.skips(at, probes)
             }
@@ -1317,8 +1336,8 @@ impl Rows {
     pub fn lacks(&self, at: usize, needles: &[(usize, Vec<u8>)], workers: usize) -> bool {
         match self {
             Self::Memory(rows) => rows.lacks(at, needles, workers),
-            Self::Native(_) | Self::Masked(..) => false,
-            Self::Grown(reader, rows) => {
+            Self::Native(_) => false,
+            Self::Grown(reader, rows) | Self::Masked(reader, _, rows) => {
                 at >= reader.parts() && rows.lacks(at - reader.parts(), needles, workers)
             }
         }
@@ -1331,7 +1350,10 @@ impl Rows {
         match self {
             Self::Memory(rows) => memory(rows, at),
             Self::Native(reader) => reader.part_range(at, column),
-            Self::Masked(reader, gone) => {
+            Self::Masked(reader, _, rows) if at >= reader.parts() => {
+                memory(rows, at - reader.parts())
+            }
+            Self::Masked(reader, gone, _) => {
                 (!gone.changes(at, [column])).then(|| reader.part_range(at, column)).flatten()
             }
             Self::Grown(reader, rows) => {
@@ -1356,7 +1378,10 @@ impl Rows {
         match self {
             Self::Memory(rows) => memory(rows, at),
             Self::Native(reader) => reader.ruled_by(at, column, rule),
-            Self::Masked(reader, gone) => {
+            Self::Masked(reader, _, rows) if at >= reader.parts() => {
+                memory(rows, at - reader.parts())
+            }
+            Self::Masked(reader, gone, _) => {
                 !gone.changes(at, [column]) && reader.ruled_by(at, column, rule)
             }
             Self::Grown(reader, rows) => {
@@ -1383,7 +1408,10 @@ impl Rows {
         match self {
             Self::Memory(rows) => memory(rows, stripe),
             Self::Native(reader) => reader.stripe_ruled_by(stripe, column, rule),
-            Self::Masked(reader, gone) => {
+            Self::Masked(_, _, rows) if stripe >= self.stripes_in_file() => {
+                memory(rows, stripe - self.stripes_in_file())
+            }
+            Self::Masked(reader, gone, _) => {
                 !Self::stripe_changed(reader, gone, stripe, std::iter::once(column))
                     && reader.stripe_ruled_by(stripe, column, rule)
             }
@@ -1407,7 +1435,10 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.certain(at, probes),
             Self::Native(reader) => reader.certain(at, probes),
-            Self::Masked(reader, gone) => {
+            Self::Masked(reader, _, rows) if at >= reader.parts() => {
+                rows.certain(at - reader.parts(), probes)
+            }
+            Self::Masked(reader, gone, _) => {
                 !gone.changes(at, probes.iter().map(|probe| probe.column))
                     && reader.certain(at, probes)
             }
@@ -1432,7 +1463,10 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.group_skips(stripe, probes),
             Self::Native(reader) => reader.stripe_skips(stripe, probes),
-            Self::Masked(reader, gone) => {
+            Self::Masked(_, _, rows) if stripe >= self.stripes_in_file() => {
+                rows.group_skips(stripe - self.stripes_in_file(), probes)
+            }
+            Self::Masked(reader, gone, _) => {
                 !Self::stripe_changed(reader, gone, stripe, probes.iter().map(|probe| probe.column))
                     && reader.stripe_skips(stripe, probes)
             }
@@ -1515,10 +1549,11 @@ impl Rows {
     pub fn ascending(&self) -> Vec<String> {
         match self {
             Self::Memory(_) | Self::Grown(_, _) => Vec::new(),
+            Self::Masked(_, _, rows) if !rows.is_empty() => Vec::new(),
             Self::Native(reader) => rudb_native::ascending(reader),
             // Rows that never went down still do not once some of them are gone, and a column an
             // update wrote may well have.
-            Self::Masked(reader, gone) => {
+            Self::Masked(reader, gone, _) => {
                 let fields = reader.table().fields();
                 rudb_native::ascending(reader)
                     .into_iter()
@@ -1541,7 +1576,8 @@ impl Rows {
     pub fn widths(&self) -> Vec<(String, u64)> {
         match self {
             Self::Memory(_) | Self::Grown(_, _) => Vec::new(),
-            Self::Native(reader) | Self::Masked(reader, _) => rudb_native::widths(reader),
+            Self::Masked(_, _, rows) if !rows.is_empty() => Vec::new(),
+            Self::Native(reader) | Self::Masked(reader, ..) => rudb_native::widths(reader),
         }
     }
 
@@ -1555,8 +1591,8 @@ impl Rows {
     pub fn chunk(&self, at: usize) -> Option<Chunk> {
         match self {
             Self::Memory(rows) => rows.chunk(at),
-            Self::Native(_) | Self::Masked(..) => None,
-            Self::Grown(reader, rows) => {
+            Self::Native(_) => None,
+            Self::Grown(reader, rows) | Self::Masked(reader, _, rows) => {
                 at.checked_sub(reader.parts()).and_then(|at| rows.chunk(at))
             }
         }
@@ -1798,7 +1834,7 @@ impl Table {
     pub fn declared_is_stored(&self) -> Result<bool> {
         match &self.rows {
             Rows::Memory(_) => Ok(true),
-            Rows::Native(reader) | Rows::Grown(reader, _) | Rows::Masked(reader, _) => {
+            Rows::Native(reader) | Rows::Grown(reader, _) | Rows::Masked(reader, ..) => {
                 let stored = reader.table().fields().iter().map(|field| field.not_null);
                 Ok(stored.eq(self.columns.iter().map(|column| column.not_null))
                     && reader.table().constraints() == &self.stored_constraints()?)
@@ -1850,7 +1886,7 @@ impl Table {
     pub fn stored(&self, column: usize) -> Result<Vec<StoredPart>> {
         match &self.rows {
             Rows::Memory(_) => Ok(Vec::new()),
-            Rows::Native(reader) | Rows::Grown(reader, _) | Rows::Masked(reader, _) => {
+            Rows::Native(reader) | Rows::Grown(reader, _) | Rows::Masked(reader, ..) => {
                 reader.stored(column)
             }
         }
@@ -1910,12 +1946,13 @@ impl Table {
             // A table with rows in memory has rows the file does not, so the file is going to be
             // written again whatever the declaration says, and answering false here says so once.
             Rows::Memory(_) | Rows::Grown(_, _) => false,
+            Rows::Masked(_, _, rows) if !rows.is_empty() => false,
             // Rows taken out of an order leave the rest in it, so a table with rows gone keeps the
             // declaration its file was written under. Rows an update wrote need not.
-            Rows::Masked(reader, gone) if gone.is_patched() => {
+            Rows::Masked(reader, gone, _) if gone.is_patched() => {
                 reader.table().clustering().is_none() && self.clustering.is_none()
             }
-            Rows::Native(reader) | Rows::Masked(reader, _) => {
+            Rows::Native(reader) | Rows::Masked(reader, ..) => {
                 reader.table().clustering() == self.clustering.as_ref()
             }
         }
@@ -2141,11 +2178,18 @@ impl Table {
             return Ok(false);
         }
         self.refuse_nulls(row)?;
-        if let Rows::Memory(rows) = &mut self.rows {
-            return rows.put_row(spot.part, spot.place as usize, targets, values);
-        }
-        if matches!(self.rows, Rows::Grown(..)) {
-            return Ok(false);
+        match &mut self.rows {
+            Rows::Memory(rows) => {
+                return rows.put_row(spot.part, spot.place as usize, targets, values);
+            }
+            // A row appended since the file is written where it is in memory.
+            Rows::Grown(reader, rows) | Rows::Masked(reader, _, rows)
+                if spot.part >= reader.parts() =>
+            {
+                let part = spot.part - reader.parts();
+                return rows.put_row(part, spot.place as usize, targets, values);
+            }
+            Rows::Native(_) | Rows::Grown(..) | Rows::Masked(..) => {}
         }
         self.patch_kept(&[spot.number], targets, std::slice::from_ref(row))?;
         Ok(true)
@@ -2171,9 +2215,6 @@ impl Table {
         }
         if numbers.is_empty() {
             return Ok(true);
-        }
-        if matches!(self.rows, Rows::Grown(..)) {
-            return Ok(false);
         }
         for chunk in rows {
             self.refuse_nulls(chunk)?;
@@ -2209,19 +2250,33 @@ impl Table {
             }
             places.push((chunk, place));
         }
-        if let Rows::Memory(memory) = &mut self.rows {
-            for (&(chunk, place), (new, row)) in places.iter().zip(given()) {
+        // The rows of a file come first and the rows in memory after them, so the numbers that
+        // land in the file are the ones in front. Those are kept beside the file and the others
+        // are written where they are.
+        let parts = match &self.rows {
+            Rows::Memory(_) => 0,
+            Rows::Native(reader) | Rows::Grown(reader, _) | Rows::Masked(reader, ..) => {
+                reader.parts()
+            }
+        };
+        let filed = places.iter().take_while(|&&(chunk, _)| chunk < parts).count();
+        if let Rows::Memory(memory) | Rows::Grown(_, memory) | Rows::Masked(_, _, memory) =
+            &mut self.rows
+        {
+            for (&(chunk, place), (new, row)) in places.iter().zip(given()).skip(filed) {
                 let values = targets
                     .iter()
                     .map(|&column| new.try_value_at(row, column))
                     .collect::<Result<Vec<_>>>()?;
-                if !memory.put_row(chunk, place, &targets, &values)? {
+                if !memory.put_row(chunk - parts, place, &targets, &values)? {
                     return Ok(false);
                 }
             }
-            return Ok(true);
         }
-        self.patch_kept(numbers, &targets, rows)?;
+        if filed > 0 {
+            // The rows are laid end to end and only the first `filed` of them are read.
+            self.patch_kept(&numbers[..filed], &targets, rows)?;
+        }
         Ok(true)
     }
 
@@ -2343,12 +2398,8 @@ impl Table {
         let seen = self.appended_keys(&chunks, committing)?;
         let appending = self.points.appending(&chunks)?;
         let before = self.rows.len() as u64;
-        // Rows appended after a delete are laid out again with the rest, see `Rows::to_append`,
-        // which can move where any part starts. Otherwise only the last part can change.
-        let from = match self.rows {
-            Rows::Masked(..) => 0,
-            _ => self.rows.chunk_count().saturating_sub(1),
-        };
+        // Only the last part can change, a file's rows and its gone rows staying where they are.
+        let from = self.rows.chunk_count().saturating_sub(1);
         if let Err(error) = self.rows.to_append().and_then(|rows| rows.append_all(chunks, workers))
         {
             self.points = Points::default();
@@ -2412,7 +2463,12 @@ impl Table {
     /// every row this is here to save.
     #[must_use]
     pub fn takes_rows(&self) -> bool {
-        matches!(self.rows, Rows::Native(_) | Rows::Masked(..)) && self.guards().is_empty()
+        let filed = match &self.rows {
+            Rows::Native(_) => true,
+            Rows::Masked(_, _, tail) => tail.is_empty(),
+            Rows::Memory(_) | Rows::Grown(..) => false,
+        };
+        filed && self.guards().is_empty()
     }
 
     /// Takes rows out by their number in the table, which rise, without reading the others.
@@ -2430,7 +2486,7 @@ impl Table {
         }
         let (reader, mut gone) = match &self.rows {
             Rows::Native(reader) => (reader.clone(), Gone::none(reader.parts())),
-            Rows::Masked(reader, gone) => (reader.clone(), Gone::clone(gone)),
+            Rows::Masked(reader, gone, _) => (reader.clone(), Gone::clone(gone)),
             _ => return Err(Error::internal("rows taken out of a table that is not a file")),
         };
         let mut numbers = numbers.iter().copied().peekable();
@@ -2462,7 +2518,7 @@ impl Table {
         } else if gone.is_empty() && !gone.is_patched() {
             Rows::Native(reader)
         } else {
-            Rows::Masked(reader, Arc::new(gone))
+            Rows::masked(reader, Arc::new(gone))
         };
         self.frame = next_revision();
         Ok(())
@@ -2587,9 +2643,13 @@ impl Table {
     fn patch_kept(&mut self, numbers: &[u64], targets: &[usize], rows: &[Chunk]) -> Result<()> {
         let places = self.places(numbers)?;
         let (reader, mut gone) = match &self.rows {
-            Rows::Native(reader) => (reader.clone(), Gone::none(reader.parts())),
-            Rows::Masked(reader, gone) => (reader.clone(), Gone::clone(gone)),
-            _ => return Err(Error::internal("rows written over in a table that is not a file")),
+            Rows::Native(reader) | Rows::Grown(reader, _) => {
+                (reader.clone(), Gone::none(reader.parts()))
+            }
+            Rows::Masked(reader, gone, _) => (reader.clone(), Gone::clone(gone)),
+            Rows::Memory(_) => {
+                return Err(Error::internal("rows written over in a table that is not a file"));
+            }
         };
         let laid = self
             .columns
@@ -2603,7 +2663,13 @@ impl Table {
                 laid.iter().map(|column| column.gather(&picks)).collect::<Result<Vec<_>>>()?;
             gone.put(place.part, place.slots, Chunk::with_rows(columns, picks.len())?, targets)?;
         }
-        self.rows = Rows::Masked(reader, Arc::new(gone));
+        // The rows appended since stay where they are, after the file.
+        let empty = Rows::Memory(MemoryTable::new(Vec::new()));
+        let tail = match std::mem::replace(&mut self.rows, empty) {
+            Rows::Grown(_, tail) | Rows::Masked(_, _, tail) => tail,
+            Rows::Native(_) | Rows::Memory(_) => Rows::tail_of(&reader),
+        };
+        self.rows = Rows::Masked(reader, Arc::new(gone), tail);
         Ok(())
     }
 
@@ -2611,9 +2677,11 @@ impl Table {
     /// parts that hold any of them.
     fn places(&self, numbers: &[u64]) -> Result<Vec<Place>> {
         let (reader, gone) = match &self.rows {
-            Rows::Native(reader) => (reader, None),
-            Rows::Masked(reader, gone) => (reader, Some(&**gone)),
-            _ => return Err(Error::internal("rows named in a table that is not a file")),
+            Rows::Native(reader) | Rows::Grown(reader, _) => (reader, None),
+            Rows::Masked(reader, gone, _) => (reader, Some(&**gone)),
+            Rows::Memory(_) => {
+                return Err(Error::internal("rows named in a table that is not a file"));
+            }
         };
         let mut places = Vec::new();
         let mut at = 0;

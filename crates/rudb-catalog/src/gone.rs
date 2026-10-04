@@ -54,6 +54,36 @@ impl Patch {
         let new = self.rows.column(column)?.clone();
         Ok(assemble::interleave(ty, &[read.clone(), new], &order)?.loosened())
     }
+
+    /// [`Self::over`] for a read of only some rows of the part, `slots` being those rows, rising,
+    /// counted the way the file counts them. A read of one row by its key reads that row and lays
+    /// at most one new row over it rather than read and lay the whole part.
+    ///
+    /// # Errors
+    ///
+    /// If the column is not one of the patch's or there is not a slot for each row read.
+    pub fn over_rows(
+        &self,
+        ty: &LogicalType,
+        read: &Vector,
+        column: usize,
+        slots: &[u32],
+    ) -> Result<Vector> {
+        let rows = read.len();
+        if slots.len() != rows {
+            return Err(Error::internal(
+                "a read of some rows of a part names a row it did not read",
+            ));
+        }
+        let mut order = (0..rows).collect::<Vec<_>>();
+        for (at, slot) in slots.iter().enumerate() {
+            if let Ok(found) = self.slots.binary_search(slot) {
+                order[at] = rows + found;
+            }
+        }
+        let new = self.rows.column(column)?.clone();
+        Ok(assemble::interleave(ty, &[read.clone(), new], &order)?.loosened())
+    }
 }
 
 /// The deleted rows of a file, by part, and the rows an update wrote over.

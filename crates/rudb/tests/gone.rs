@@ -382,3 +382,95 @@ fn an_update_beside_a_file_keeps_to_the_table_constraints() {
     drop(file);
     remove(&path);
 }
+
+/// What holds table `k`: `"file"`, `"grown"` or `"masked"` with how many rows came since, or
+/// `"memory"`.
+fn shape(db: &Database) -> String {
+    db.with_catalog(|catalog| {
+        let name = catalog.resolve(&["k"]).expect("resolves");
+        match catalog.table(&name).expect("the table is there").rows() {
+            Rows::Memory(_) => "memory".to_owned(),
+            Rows::Native(_) => "file".to_owned(),
+            Rows::Grown(_, tail) => format!("grown {}", tail.len()),
+            Rows::Masked(_, _, tail) => format!("masked {}", tail.len()),
+        }
+    })
+}
+
+fn keyed(db: &Database) -> Vec<String> {
+    ["SELECT * FROM k ORDER BY id", "SELECT count(*), sum(n), count(DISTINCT s) FROM k"]
+        .iter()
+        .flat_map(|sql| {
+            db.query(sql).expect(sql).rows().map(|row| format!("{row:?}")).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn writes_by_key_after_rows_were_appended_leave_the_table_in_its_file() {
+    use rudb::Value::{BigInt, Varchar};
+    let path = path("tail");
+    let file = open(&path);
+    let memory = Database::new();
+    both(&file, &memory, "CREATE TABLE k (id BIGINT PRIMARY KEY, s VARCHAR, n BIGINT)");
+    both(
+        &file,
+        &memory,
+        "INSERT INTO k SELECT range, 's' || (range % 50), range FROM range(20000)",
+    );
+    file.execute("CHECKPOINT").expect("checkpoints");
+    assert_eq!(shape(&file), "file");
+    both(&file, &memory, "INSERT INTO k VALUES (50000, 'late', 1), (50001, 'later', 2)");
+    assert_eq!(shape(&file), "grown 2");
+
+    // An update by key of a row in the file and of a row that came since, in either order.
+    let update = "UPDATE k SET n = n + ?, s = ? WHERE id = ?";
+    assert_eq!(file.prepare(update).expect("prepares").explain(), "UpdateOne k(id) SET n, s");
+    for db in [&file, &memory] {
+        let prepared = db.prepare(update).expect("prepares");
+        for id in [50000, 7, 19999, 50001, 7, 12345, 50000] {
+            let row = [BigInt(1), Varchar(format!("u{id}")), BigInt(id)];
+            prepared.execute(&row).expect("updates");
+        }
+    }
+    assert_eq!(shape(&file), "masked 2");
+    assert_eq!(keyed(&file), keyed(&memory), "after updates by key");
+
+    // Rows appended now go after the file's written rows rather than read it into memory.
+    both(&file, &memory, "INSERT INTO k SELECT range + 60000, 'many', range FROM range(3000)");
+    assert_eq!(shape(&file), "masked 3002");
+    let upsert = "INSERT INTO k VALUES (?, ?, ?) ON CONFLICT (id) DO UPDATE SET n = n + excluded.n";
+    for db in [&file, &memory] {
+        let prepared = db.prepare(upsert).expect("prepares");
+        for id in [8, 61000, 70000, 50001, 8, 70000, 19998] {
+            prepared.execute(&[BigInt(id), Varchar("up".into()), BigInt(5)]).expect("upserts");
+        }
+    }
+    assert_eq!(shape(&file), "masked 3003");
+    assert_eq!(keyed(&file), keyed(&memory), "after upserts");
+
+    // A transaction's updates land beside another connection's insert at the commit.
+    let (mine, other) = (file.connect(), file.connect());
+    let (theirs, others) = (memory.connect(), memory.connect());
+    for (db, mine, other) in [(&file, &mine, &other), (&memory, &theirs, &others)] {
+        mine.execute("BEGIN").expect("begins");
+        let prepared = mine.prepare(update).expect("prepares");
+        for id in [9, 60001, 50000] {
+            prepared.execute(&[BigInt(2), Varchar("tx".into()), BigInt(id)]).expect("updates");
+        }
+        other.execute("INSERT INTO k VALUES (80000, 'other', 0)").expect("inserts");
+        mine.execute("COMMIT").expect("commits");
+        assert_eq!(db.value("SELECT n FROM k WHERE id = 9").expect("reads").to_string(), "11");
+    }
+    assert_eq!(keyed(&file), keyed(&memory), "after a commit beside an insert");
+    assert!(shape(&file).starts_with("masked"), "{}", shape(&file));
+
+    file.execute("CHECKPOINT").expect("checkpoints");
+    assert_eq!(keyed(&file), keyed(&memory), "after the checkpoint");
+    drop((mine, other));
+    drop(file);
+    let file = open(&path);
+    assert_eq!(keyed(&file), keyed(&memory), "after the reopen");
+    drop(file);
+    remove(&path);
+}
