@@ -3120,6 +3120,14 @@ impl<'a> Transform<'a> {
                         Ok(self.push_query(Query::bare(QueryBody::Values(rows))))
                     }
                     "DescribeStatement" => self.describe_statement(kind),
+                    // `TableStatement <- 'TABLE' BaseTableName` is `SELECT * FROM` the name, and
+                    // the pin writes a view over it back in that longer form.
+                    "TableStatement" => {
+                        let base = self.find(kind, "BaseTableName");
+                        let name = self.name_parts(base);
+                        let source = self.named_source(base, name, NONE, Slice::default())?;
+                        Ok(self.star_over(source))
+                    }
                     _ => self.unsupported(kind),
                 }
             }
@@ -3246,6 +3254,43 @@ impl<'a> Transform<'a> {
             _ => return self.unsupported(inner),
         };
         Ok(self.push_source(Source::Table { name, alias: NONE, columns: Slice::default() }))
+    }
+
+    /// A `BaseTableName` read as a source: a definition from an enclosing `WITH` when a bare name
+    /// matches one, innermost first, and a table or view otherwise.
+    fn named_source(
+        &mut self,
+        base: u32,
+        name: Slice,
+        alias: StrRef,
+        columns: Slice,
+    ) -> Result<SourceRef> {
+        if name.len == 1 {
+            let part = self.ast.parts[name.start as usize];
+            if let Some(&(_, held, declared)) = self.ctes.iter().rev().find(|&&(cte, _, _)| {
+                self.ast.string(cte).eq_ignore_ascii_case(self.ast.string(part))
+            }) {
+                match held {
+                    Held::Inline(query) => {
+                        let alias = if alias == NONE { part } else { alias };
+                        let columns = if columns.is_empty() { declared } else { columns };
+                        return Ok(self.push_source(Source::Subquery { query, alias, columns }));
+                    }
+                    // The alias is left as it was written, which for a bare name is
+                    // nothing at all, because the definition already has the name and a
+                    // reference that invented one would print itself as `c AS c`.
+                    Held::Once(cte) => {
+                        if self.recursing.contains(&cte) {
+                            let span = self.span(base);
+                            let made = self.ast.queries.len() as u32;
+                            self.self_reads.push((cte, span, made));
+                        }
+                        return Ok(self.push_source(Source::Cte { cte, alias, columns }));
+                    }
+                }
+            }
+        }
+        Ok(self.push_source(Source::Table { name, alias, columns }))
     }
 
     /// `SELECT * FROM <source>`, which is what `DESCRIBE t` means.
@@ -3590,40 +3635,10 @@ impl<'a> Transform<'a> {
                         return self.unsupported(clause);
                     }
                 }
-                let name = self.name_parts(self.find(inner, "BaseTableName"));
+                let base = self.find(inner, "BaseTableName");
+                let name = self.name_parts(base);
                 let (alias, columns) = self.table_alias(self.find(inner, "TableAlias"));
-                if name.len == 1 {
-                    let part = self.ast.parts[name.start as usize];
-                    if let Some(&(_, held, declared)) =
-                        self.ctes.iter().rev().find(|&&(cte, _, _)| {
-                            self.ast.string(cte).eq_ignore_ascii_case(self.ast.string(part))
-                        })
-                    {
-                        match held {
-                            Held::Inline(query) => {
-                                let alias = if alias == NONE { part } else { alias };
-                                let columns = if columns.is_empty() { declared } else { columns };
-                                return Ok(self.push_source(Source::Subquery {
-                                    query,
-                                    alias,
-                                    columns,
-                                }));
-                            }
-                            // The alias is left as it was written, which for a bare name is
-                            // nothing at all, because the definition already has the name and a
-                            // reference that invented one would print itself as `c AS c`.
-                            Held::Once(cte) => {
-                                if self.recursing.contains(&cte) {
-                                    let span = self.span(self.find(inner, "BaseTableName"));
-                                    let made = self.ast.queries.len() as u32;
-                                    self.self_reads.push((cte, span, made));
-                                }
-                                return Ok(self.push_source(Source::Cte { cte, alias, columns }));
-                            }
-                        }
-                    }
-                }
-                Ok(self.push_source(Source::Table { name, alias, columns }))
+                self.named_source(base, name, alias, columns)
             }
             // `LATERAL` is read and dropped. A FROM entry here already sees the entries written to
             // its left, which is what the word asks for, so writing it changes nothing and the
