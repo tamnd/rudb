@@ -332,6 +332,8 @@ struct Inner {
     /// The index in the log at which one operation is made to fail.
     fail_at: Option<usize>,
     reads: ReadFaults,
+    /// How long a sync of a file takes, slept outside the lock.
+    sync_delay: std::time::Duration,
 }
 
 impl Inner {
@@ -489,6 +491,12 @@ impl SimFilesystem {
         self.lock().fail_at = Some(index);
     }
 
+    /// Makes every sync of a file take `delay`, for a test of a caller that waits differently on a
+    /// slow device than on a fast one.
+    pub fn slow_syncs(&self, delay: std::time::Duration) {
+        self.lock().sync_delay = delay;
+    }
+
     /// Cancels an injected failure that has not fired.
     pub fn clear_failure(&self) {
         self.lock().fail_at = None;
@@ -603,6 +611,7 @@ impl SimFilesystem {
                 next_seq: 0,
                 fail_at: None,
                 reads: ReadFaults::default(),
+                sync_delay: inner.sync_delay,
             })),
         }
     }
@@ -814,6 +823,10 @@ impl File for SimHandle {
     }
 
     fn sync(&self) -> Result<()> {
+        let delay = self.fs.lock().sync_delay;
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         let mut inner = self.fs.lock();
         inner.record(Op::Sync { path: self.path.clone() })?;
         let file = self.file(&mut inner)?;
