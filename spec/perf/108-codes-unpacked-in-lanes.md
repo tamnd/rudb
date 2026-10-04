@@ -13,3 +13,13 @@ Note 106 reads eight codes of a block with one shuffle, one variable shift and o
 ## Results
 
 Measured on server2 at SF1 on one thread, user cycles in millions, against main with #2436. All 22 queries give the same answers as before.
+
+| Query | Before cycles | After cycles | Before instructions | After instructions |
+| --- | --- | --- | --- | --- |
+| q01, three runs | 294, 283, 311 | 288, 277, 303 | 500 | 486 |
+
+That is 2 to 3% on q01, in every run, and nothing outside the noise on the other queries. It is less than the 12% `unpack_block` was, because the profile after the change has `Packed::unpack` and `Packed::unpack_mapped` at 14% between them, against 14.7% before. The scalar unpack was not what the time went on. Each code still becomes an eight byte word on the stack, is copied into a vector of `i64` with the base added, and is read back by the aggregate, so the cost is in the stores and the memory they touch, not in the shifts.
+
+## What this leaves
+
+An aggregate over a packed column does not need the values, only the codes and how many rows went into each group, since the sum of the values is the sum of the codes plus the base times the count. Codes of 25 bits or less fit 32 bit lanes, so folding them as they are is half the memory of `i64` values and no add of the base per row. That is the next change.
