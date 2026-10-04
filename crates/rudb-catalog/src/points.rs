@@ -3,8 +3,8 @@
 //! A table builds this for a key the first time a lookup asks for it, from the key's columns
 //! alone, and keeps it for the placing of the rows it was built from. Anything that moves a row or
 //! a key draws a new placing, and the next lookup builds it again. An update that writes other
-//! columns of a row where it is keeps the placing, so a table written by key is not indexed again
-//! for every write. An entry is a hint all the same: the row it names is read with the key's
+//! columns of a row where it is keeps the placing, and so does an append, which notes the keys of
+//! the rows it adds, so a table written by key is not indexed again for every write. An entry is a hint all the same: the row it names is read with the key's
 //! columns and its key compared with the one asked for, so an entry that went stale some way the
 //! placing did not catch costs a build and never answers with the wrong row.
 
@@ -117,6 +117,39 @@ impl Located {
         Ok(located)
     }
 
+    /// Notes `keys`, the keys of the rows just appended after the first `before`, and works out
+    /// again where the parts from `from` on start. An append changes no part before the last one
+    /// it found, and keeps every row's number, which is its place among the rows.
+    ///
+    /// Says whether the rows came out as many as this now counts. When they do not, the caller
+    /// drops this and the next lookup builds it again.
+    fn extend(&mut self, rows: &Rows, before: u64, from: usize, keys: Vec<Noted>) -> Result<bool> {
+        if self.starts.last() != Some(&before) || from >= self.starts.len() {
+            return Ok(false);
+        }
+        self.starts.truncate(from + 1);
+        let mut number = self.starts[from];
+        for part in from..rows.chunk_count() {
+            number += rows.chunk_len(part)? as u64;
+            self.starts.push(number);
+        }
+        if number != before + keys.len() as u64 || number != rows.len() as u64 {
+            return Ok(false);
+        }
+        for (key, number) in keys.into_iter().zip(before..) {
+            match key {
+                Noted::Null => {}
+                Noted::Int(key) => {
+                    self.ints.insert(key, number);
+                }
+                Noted::Bytes(key) => {
+                    self.bytes.insert(key, number);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Whether this was built for `key` of `rows` at `placed`.
     fn fits(&self, rows: &Rows, placed: u64, key: &[usize]) -> bool {
         self.placed == placed
@@ -177,6 +210,19 @@ impl Clone for Points {
         }
     }
 }
+
+/// The key of one row about to be appended, the way [`Located`] holds it.
+#[derive(Debug)]
+enum Noted {
+    Null,
+    Int(i64),
+    Bytes(Box<[u8]>),
+}
+
+/// The keys of rows about to be appended, for each key a lookup has built where the rows are, which
+/// [`Points::appended`] notes once the rows are in.
+#[derive(Debug, Default)]
+pub(crate) struct Appending(Vec<(usize, Vec<Noted>)>);
 
 /// Where a lookup by key found its row: the part and the place in it, and its number in the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +344,60 @@ impl Points {
                 return Err(Error::internal("a key found where it was just noted is not there"));
             }
             fresh = true;
+        }
+    }
+
+    /// The keys of the rows of `chunks`, for each key whose rows are built, ahead of appending
+    /// them. Nothing when nothing is built, which is a table nobody has looked a row up in since it
+    /// last changed some other way.
+    pub(crate) fn appending(&mut self, chunks: &[Chunk]) -> Result<Appending> {
+        if *self.stale.get_mut() {
+            return Ok(Appending::default());
+        }
+        let mut appending = Vec::new();
+        let mut scratch = Vec::new();
+        for (which, slot) in self.built.iter_mut().enumerate() {
+            let Some(located) = slot.get_mut() else { continue };
+            let key = Key { columns: located.columns.clone(), primary: false };
+            let mut keys = Vec::with_capacity(chunks.iter().map(Chunk::len).sum());
+            for chunk in chunks {
+                for row in 0..chunk.len() {
+                    keys.push(match encode(chunk, &key, row, &mut scratch)? {
+                        Encoded::Null => Noted::Null,
+                        Encoded::Int(key) => Noted::Int(key),
+                        Encoded::Bytes => Noted::Bytes(scratch.as_slice().into()),
+                    });
+                }
+            }
+            appending.push((which, keys));
+        }
+        Ok(Appending(appending))
+    }
+
+    /// Notes the keys of the rows just appended, which [`Self::appending`] read before the append,
+    /// into what is built, for a table that keeps its placing across the append. `before` is how
+    /// many rows there were and `from` the first part the append can have changed.
+    ///
+    /// What is built for a key that copies of the table share, because a transaction holds one, is
+    /// dropped rather than written, and so is anything that does not come out right.
+    pub(crate) fn appended(&mut self, appending: Appending, rows: &Rows, before: u64, from: usize) {
+        self.again.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
+        let mut appending = appending.0.into_iter().peekable();
+        for (which, slot) in self.built.iter_mut().enumerate() {
+            let keys = appending.next_if(|(at, _)| *at == which).map(|(_, keys)| keys);
+            let kept = match (slot.get_mut().and_then(Arc::get_mut), keys) {
+                (Some(located), Some(keys)) => {
+                    located.extend(rows, before, from, keys).unwrap_or(false)
+                }
+                _ => false,
+            };
+            if !kept {
+                *slot = OnceLock::new();
+            }
+        }
+        // Whatever a lookup found wrong is gone with what it was found in.
+        if self.built.iter().all(|slot| slot.get().is_none()) {
+            *self.stale.get_mut() = false;
         }
     }
 

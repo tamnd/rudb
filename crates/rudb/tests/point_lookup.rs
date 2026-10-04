@@ -217,3 +217,82 @@ fn a_lookup_inside_a_transaction_sees_what_the_transaction_does() {
     assert_eq!(seen_outside(3), vec![vec![Value::Varchar("c".into())]]);
     assert!(seen_outside(1).is_empty());
 }
+
+#[test]
+fn a_lookup_finds_rows_appended_since_it_last_looked() {
+    let path = path("append");
+    let open = || Database::open(path.to_str().expect("a UTF-8 path")).expect("opens");
+    let db = open();
+    db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR UNIQUE, n BIGINT)")
+        .expect("creates");
+    db.execute("CREATE TABLE o (w INTEGER, d INTEGER, v VARCHAR, PRIMARY KEY (w, d))")
+        .expect("creates");
+    let insert = db.prepare("INSERT INTO t VALUES (?, ?, ?)").expect("prepares");
+    let insert_o = db.prepare("INSERT INTO o VALUES (?, ?, ?)").expect("prepares");
+    let by_id = "SELECT name, n FROM t WHERE id = ?";
+    let by_name = "SELECT id FROM t WHERE name = ?";
+    let by_wd = "SELECT v FROM o WHERE w = ? AND d = ?";
+    let check = |ids: &[i64]| {
+        for &id in ids {
+            agree(&db, by_id, &[Value::BigInt(id)]);
+            agree(&db, by_name, &[Value::Varchar(format!("n{id}"))]);
+            agree(&db, by_wd, &[Value::Integer((id % 7) as i32), Value::Integer(id as i32)]);
+        }
+    };
+    let add = |id: i64| {
+        let name = if id % 11 == 0 { Value::Null } else { Value::Varchar(format!("n{id}")) };
+        insert.execute(&[Value::BigInt(id), name, Value::BigInt(id * 2)]).expect("inserts");
+        insert_o
+            .execute(&[
+                Value::Integer((id % 7) as i32),
+                Value::Integer(id as i32),
+                Value::Varchar(format!("o{id}")),
+            ])
+            .expect("inserts");
+    };
+    for id in 0..3000_i64 {
+        add(id);
+        if id % 97 == 0 {
+            check(&[id, id - 1, id + 1, id / 2, 0]);
+        }
+    }
+    check(&[0, 11, 2047, 2048, 2999, 3000]);
+    // A key already there is refused the same way by the row and by the plan, and leaves the
+    // table as it was.
+    let again = insert.execute(&[Value::BigInt(5), Value::Varchar("x".into()), Value::BigInt(0)]);
+    let planned = db.execute("INSERT INTO t VALUES (5, 'x', 0)");
+    assert_eq!(again.expect_err("refused").to_string(), planned.expect_err("refused").to_string());
+    let again = insert.execute(&[Value::BigInt(-5), Value::Varchar("n6".into()), Value::BigInt(0)]);
+    let planned = db.execute("INSERT INTO t VALUES (-5, 'n6', 0)");
+    assert_eq!(again.expect_err("refused").to_string(), planned.expect_err("refused").to_string());
+    check(&[5, -5, 6]);
+    // Many rows at once through the plan, then a file, rows beside the file, rows taken out of
+    // the file, and rows after those.
+    db.execute("INSERT INTO t SELECT i, 'n' || i, i FROM range(3000, 9000) r(i)").expect("loads");
+    check(&[2999, 3000, 5000, 8999, 9000]);
+    db.execute("CHECKPOINT").expect("checkpoints");
+    check(&[0, 8999]);
+    for id in 9000..9100 {
+        add(id);
+    }
+    check(&[0, 8999, 9000, 9050, 9099, 9100]);
+    db.execute("DELETE FROM t WHERE id BETWEEN 100 AND 200").expect("deletes");
+    db.execute("DELETE FROM o WHERE d BETWEEN 100 AND 200").expect("deletes");
+    check(&[99, 150, 201, 9099]);
+    db.execute("CHECKPOINT").expect("checkpoints");
+    db.execute("DELETE FROM t WHERE id % 13 = 0").expect("deletes");
+    check(&[13, 14, 9099]);
+    for id in 9100..9200 {
+        add(id);
+        if id % 9 == 0 {
+            check(&[id, 26, 27, 150, 9099]);
+        }
+    }
+    add(150);
+    check(&[150, 9199, 9200]);
+    drop(db);
+    let db = open();
+    let select = db.prepare(by_id).expect("prepares");
+    let found = select.execute(&[Value::BigInt(9199)]).expect("runs");
+    assert_eq!(rows(&found), vec![vec![Value::Varchar("n9199".into()), Value::BigInt(18398)]]);
+}

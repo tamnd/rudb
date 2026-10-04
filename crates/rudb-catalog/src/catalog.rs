@@ -1558,6 +1558,27 @@ impl Catalog {
         Ok(table)
     }
 
+    /// Table `name` to append rows to and change nothing else of, see [`Self::table_mut`].
+    ///
+    /// The table draws a new revision and keeps where its keys are, and an append through
+    /// [`Table::append_all`] or the others like it notes the keys of the rows it adds, so a table
+    /// that takes one row at a time between lookups by key is not looked through again for each.
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist.
+    pub fn table_appending(&mut self, name: &QualifiedName) -> Result<&mut Table> {
+        self.generation = crate::table::next_revision();
+        let schema = self.schema_mut(&name.catalog, &name.schema)?;
+        let table = schema
+            .tables
+            .iter_mut()
+            .find(|held| same_name(&held.name().table, &name.table))
+            .ok_or_else(|| missing_table(&name.table))?;
+        table.touch_rows();
+        Ok(table)
+    }
+
     /// Writes `values` over the columns `targets` of the row of table `name` at `spot`, `row`
     /// being every column of it afterwards, and says whether it could, see [`Table::put_row`].
     ///

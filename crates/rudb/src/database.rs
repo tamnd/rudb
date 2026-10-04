@@ -3847,12 +3847,14 @@ impl Shared {
     /// as it was, for [`Shared::execute_ast`] to run.
     ///
     /// Everything that could make the plan's answer differ from putting the row in is checked
-    /// before anything is touched: a table with constraints, keys or a declared order, a column the
-    /// row leaves out that has a default, a null for a `NOT NULL` column, a value that is not
+    /// before anything is touched: a table with checks, foreign keys or a declared order, a column
+    /// the row leaves out that has a default, a null for a `NOT NULL` column, a value that is not
     /// already its column's type or a widening of it, a transaction that is read only or aborted,
     /// and a database that is read only. Mirroring is left alone, because a row of parameters
     /// reads no Parquet file to mirror. The rest is what [`Database::append`] does with a row,
-    /// then the commit.
+    /// then the commit. A key or a unique index is the table's own to check, which it does in the
+    /// same words for this row as for the plan's, and it notes where the row's keys are as it
+    /// goes, so a lookup by key after it finds the row without looking through the table again.
     pub(crate) fn insert_direct(
         &self,
         direct: &crate::prepared::Direct,
@@ -3876,7 +3878,7 @@ impl Shared {
         // Found once and changed in place. A row that turns back after this has marked the catalog
         // changed for nothing, which costs a plan made against it being made again and nothing more.
         let journals = self.journals(&name);
-        let table = catalog.table_mut(&name).ok()?;
+        let table = catalog.table_appending(&name).ok()?;
         let fields = table.columns();
         // The values as they were given are the row when there is one for each column, in order,
         // and each is already its column's type, and then the table reads them where they are.
@@ -5719,7 +5721,7 @@ impl Shared {
                                 journal.encode(&name.schema, &name.table, fields, &chunks)
                             });
                         let noted = self.transacting().then(|| chunks.clone());
-                        let table = catalog.table_mut(name)?;
+                        let table = catalog.table_appending(name)?;
                         table.append_all(chunks, workers)?;
                         if let Some(noted) = noted {
                             self.wrote(table.oid(), |written, _| written.appended(&noted));
@@ -6372,12 +6374,7 @@ fn direct_targets(
         return None;
     }
     let table = catalog.table(&name).ok()?;
-    if !table.checks().is_empty()
-        || !table.foreign().is_empty()
-        || !table.keys().is_empty()
-        || !table.guards().is_empty()
-        || table.clustering().is_some()
-    {
+    if !table.checks().is_empty() || !table.foreign().is_empty() || table.clustering().is_some() {
         return None;
     }
     let fields = table.columns();
