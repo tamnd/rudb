@@ -218,6 +218,126 @@ fn a_table_with_two_keys_or_a_text_key_is_found_the_right_way() {
     );
 }
 
+const ADD: &str = "INSERT INTO t VALUES (?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET \
+                   name = excluded.name, n = n + excluded.n";
+
+#[test]
+fn an_upsert_inside_a_transaction_does_what_the_plan_does() {
+    let pair = seeded();
+    let one = Some(Value::BigInt(1));
+    let others = [pair.short.connect(), pair.planned.connect()];
+    let both = |sql: &str| {
+        pair.short.execute(sql).unwrap_or_else(|error| panic!("short: {sql}: {error}"));
+        pair.planned.execute(sql).unwrap_or_else(|error| panic!("planned: {sql}: {error}"));
+    };
+    let seen = |id: i64| {
+        let sql = format!("SELECT * FROM t WHERE id = {id}");
+        let seen: Vec<_> = others.iter().map(|db| db.execute(&sql).expect("reads")).collect();
+        let [short, planned] = [&seen[0], &seen[1]].map(|seen| seen.rows().collect::<Vec<_>>());
+        assert_eq!(short, planned, "{id}");
+        short
+    };
+    for commit in [false, true] {
+        both("BEGIN");
+        assert_eq!(pair.explain(ADD), "Upsert t(id)");
+        for id in [1, 2, 3100, 1, 3100] {
+            assert_eq!(pair.run(ADD, &row(id, Some("u"), Some(10), None)), one, "{id}");
+        }
+        // A row the transaction took out and puts back, and one it put in and changed.
+        both("DELETE FROM t WHERE id = 5");
+        assert_eq!(pair.run(ADD, &row(5, Some("back"), Some(1), None)), one);
+        both("INSERT INTO t VALUES (3200, 'x', 1, 1)");
+        assert_eq!(pair.run(ADD, &row(3200, Some("y"), Some(1), None)), one);
+        both("UPDATE t SET n = n * 2 WHERE id = 2");
+        assert_eq!(pair.run(ADD, &row(2, Some("z"), Some(1), None)), one);
+        assert_eq!(seen(1), vec![row(1, Some("v1"), Some(1), Some(0.5))]);
+        assert!(seen(3100).is_empty());
+        both(if commit { "COMMIT" } else { "ROLLBACK" });
+        pair.same();
+    }
+    assert_eq!(seen(1), vec![row(1, Some("u"), Some(21), Some(0.5))]);
+    assert_eq!(seen(2), vec![row(2, Some("z"), Some(25), Some(1.0))]);
+    assert_eq!(seen(5), vec![row(5, Some("back"), Some(1), None)]);
+    assert_eq!(seen(3100), vec![row(3100, Some("u"), Some(20), None)]);
+    assert_eq!(seen(3200), vec![row(3200, Some("y"), Some(2), Some(1.0))]);
+
+    // An aborted transaction refuses the upsert in the plan's words.
+    both("BEGIN");
+    both("SELECT 1");
+    for db in [&pair.short, &pair.planned] {
+        db.execute("INSERT INTO t VALUES (1, 'dup', 0, 0)").expect_err("a duplicate");
+    }
+    assert_eq!(pair.short.prepare(ADD).expect("prepares").explain(), "PIPELINE");
+    let refused = |db: &Database| {
+        let upsert = db.prepare(ADD).expect("prepares");
+        upsert.execute(&row(1, Some("no"), Some(1), None)).expect_err("aborted").to_string()
+    };
+    assert_eq!(refused(&pair.short), refused(&pair.planned));
+    both("ROLLBACK");
+    pair.same();
+}
+
+/// What a transaction upserts commits beside rows another connection added in the meantime, and a
+/// key that connection added is the plan's to refuse at the commit.
+fn upserts_beside_others(db: &Database) {
+    let other = db.connect();
+    let read = |id: i64| {
+        let sql = format!("SELECT name, n FROM t WHERE id = {id}");
+        other.execute(&sql).expect("reads").rows().collect::<Vec<_>>()
+    };
+    let upsert = db.prepare(ADD).expect("prepares");
+    db.execute("BEGIN").expect("begins");
+    assert_eq!(upsert.explain(), "Upsert t(id)");
+    for id in [1, 2, 4000, 2] {
+        upsert.execute(&row(id, Some("tx"), Some(5), None)).expect("upserts");
+    }
+    other.execute("INSERT INTO t VALUES (4001, 'o', 1, 1)").expect("inserts");
+    other.execute("UPDATE t SET n = 0 WHERE id = 3").expect("updates");
+    // Nobody else holds the rows the transaction claimed.
+    other.execute("SET lock_timeout = '0'").expect("sets");
+    other.execute("UPDATE t SET n = 0 WHERE id = 2").expect_err("held");
+    assert_eq!(read(1), vec![vec![Value::Varchar("v1".into()), Value::BigInt(1)]]);
+    db.execute("COMMIT").expect("commits");
+    assert_eq!(read(1), vec![vec![Value::Varchar("tx".into()), Value::BigInt(6)]]);
+    assert_eq!(read(2), vec![vec![Value::Varchar("tx".into()), Value::BigInt(12)]]);
+    assert_eq!(read(3), vec![vec![Value::Varchar("v3".into()), Value::BigInt(0)]]);
+    assert_eq!(read(4000), vec![vec![Value::Varchar("tx".into()), Value::BigInt(5)]]);
+    assert_eq!(read(4001), vec![vec![Value::Varchar("o".into()), Value::BigInt(1)]]);
+
+    // A key somebody committed after the snapshot, which the transaction does not see.
+    db.execute("BEGIN").expect("begins");
+    upsert.execute(&row(10, Some("tx"), Some(5), None)).expect("upserts");
+    other.execute("INSERT INTO t VALUES (4002, 'o', 1, 1)").expect("inserts");
+    upsert.execute(&row(4002, Some("tx"), Some(5), None)).expect("upserts");
+    db.execute("COMMIT").expect_err("a conflict");
+    assert_eq!(read(10), vec![vec![Value::Varchar("v10".into()), Value::BigInt(10)]]);
+    assert_eq!(read(4002), vec![vec![Value::Varchar("o".into()), Value::BigInt(1)]]);
+}
+
+#[test]
+fn an_upsert_inside_a_transaction_commits_beside_other_writes() {
+    let pair = seeded();
+    upserts_beside_others(&pair.short);
+}
+
+#[test]
+fn an_upsert_inside_a_transaction_survives_a_crash() {
+    let file = path("transaction");
+    let open = || Database::open(file.to_str().expect("a UTF-8 path")).expect("opens");
+    let db = open();
+    db.execute(&format!("CREATE TABLE t ({COLUMNS})")).expect("creates");
+    db.execute("INSERT INTO t SELECT i, 'v' || i, i, i / 2 FROM range(3000) r(i)").expect("loads");
+    db.execute("CHECKPOINT").expect("checkpoints");
+    upserts_beside_others(&db);
+    let all = "SELECT * FROM t ORDER BY id";
+    let before = rows(&db, all);
+    std::mem::forget(db);
+    let db = open();
+    assert_eq!(rows(&db, all), before);
+    drop(db);
+    let _ = std::fs::remove_file(&file);
+}
+
 fn path(tag: &str) -> PathBuf {
     let path =
         std::env::temp_dir().join(format!("rudb-upsert-point-{tag}-{}.rudb", std::process::id()));
