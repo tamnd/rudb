@@ -79,7 +79,7 @@ struct Held {
 /// What one row's key is: none for a key with a null in it, an integer, or the encoding written
 /// into the caller's scratch buffer.
 #[derive(Clone, Copy)]
-enum Encoded {
+pub(crate) enum Encoded {
     Null,
     Int(i64),
     Bytes,
@@ -87,7 +87,7 @@ enum Encoded {
 
 /// The key of one row. The two integer types are the ones [`push`] writes as an `i64` behind the
 /// same tag, so a key of one of them is the same key whichever set it lands in.
-fn encode(chunk: &Chunk, key: &Key, row: usize, out: &mut Vec<u8>) -> Result<Encoded> {
+pub(crate) fn encode(chunk: &Chunk, key: &Key, row: usize, out: &mut Vec<u8>) -> Result<Encoded> {
     out.clear();
     if let &[column] = key.columns.as_slice() {
         let value = chunk.column(column)?.value_at(row);
@@ -126,7 +126,7 @@ impl Held {
 }
 
 /// One column of a key onto the end of its encoding, or false for a null.
-fn push(value: &Value, out: &mut Vec<u8>) -> bool {
+pub(crate) fn push(value: &Value, out: &mut Vec<u8>) -> bool {
     match value {
         Value::Null => return false,
         Value::Varchar(text) => {

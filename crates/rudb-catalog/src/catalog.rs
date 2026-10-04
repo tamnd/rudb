@@ -295,6 +295,8 @@ pub struct Catalog {
     generation: u64,
     /// Which version of everything but the rows this is. See [`Catalog::shape`].
     shape: u64,
+    /// Which version of what a name resolves to this is. See [`Catalog::naming`].
+    naming: u64,
     /// The next oid to hand out.
     ///
     /// A counter rather than a position, because a position changes when the thing before it is
@@ -352,6 +354,7 @@ impl Catalog {
             next,
             generation: 1,
             shape: crate::table::next_revision(),
+            naming: crate::table::next_revision(),
             mirrors: Vec::new(),
         }
     }
@@ -369,6 +372,7 @@ impl Catalog {
             next: 1,
             generation: 1,
             shape: 0,
+            naming: 0,
             mirrors: Vec::new(),
         }
     }
@@ -390,6 +394,15 @@ impl Catalog {
     fn changed(&mut self) {
         self.generation = crate::table::next_revision();
         self.shape = crate::table::next_revision();
+        self.naming = self.shape;
+    }
+
+    /// Which version of what a name resolves to this is: the shape, moved on as well by a change
+    /// of the search path, which leaves the shape alone. Something worked out from a name is good
+    /// for as long as this stays the same.
+    #[must_use]
+    pub fn naming(&self) -> u64 {
+        self.naming
     }
 
     /// Which version of everything but the rows of the tables this is: the schemas, the tables and
@@ -540,12 +553,14 @@ impl Catalog {
             )));
         }
         self.search = entries;
+        self.naming = crate::table::next_revision();
         Ok(())
     }
 
     /// Clears the search path, which is what `RESET schema` and `RESET search_path` both do.
     pub fn reset_search_path(&mut self) {
         self.search.clear();
+        self.naming = crate::table::next_revision();
     }
 
     /// Where a search path entry points, with the default database filled in.
@@ -628,6 +643,7 @@ impl Catalog {
         }
         let gone = self.databases.remove(at);
         self.search.retain(|entry| !same_name(&entry.catalog, &gone.name));
+        self.naming = crate::table::next_revision();
         Ok(gone)
     }
 
@@ -783,6 +799,7 @@ impl Catalog {
             let catalog =
                 if same_name(&held, &self.default_catalog) { String::new() } else { held };
             self.search = vec![crate::SearchEntry { catalog, schema: DEFAULT_SCHEMA.to_string() }];
+            self.naming = crate::table::next_revision();
         }
         Ok(())
     }
