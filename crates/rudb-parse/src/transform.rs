@@ -1400,6 +1400,7 @@ impl<'a> Transform<'a> {
                 }
             }
             "AddColumn" => self.add_column(option)?,
+            "AddConstraint" => self.add_constraint(option)?,
             "DropColumn" if !nested(self, option) => AlterAction::DropColumn {
                 column: column(self, option),
                 quiet: self.find(option, "IfExists") != NONE,
@@ -1441,6 +1442,45 @@ impl<'a> Transform<'a> {
             action,
         };
         Ok(self.alter_entry(alter))
+    }
+
+    /// `AddConstraint <- 'ADD' TopLevelConstraint`, which the pin takes for a primary key and a
+    /// unique one and refuses for the other two.
+    fn add_constraint(&mut self, option: u32) -> Result<AlterAction> {
+        let mut found = Vec::new();
+        self.named_nodes(option, "TopCheckConstraint", &mut found);
+        if !found.is_empty() {
+            return Err(Error::not_implemented(
+                "No support for adding CHECK constraints with ALTER TABLE",
+            ));
+        }
+        self.named_nodes(option, "TopForeignKeyConstraint", &mut found);
+        if !found.is_empty() {
+            return Err(Error::not_implemented(
+                "No support for adding FOREIGN_KEY constraints with ALTER TABLE",
+            ));
+        }
+        self.named_nodes(option, "TopPrimaryKeyConstraint", &mut found);
+        let primary = !found.is_empty();
+        if !primary {
+            self.named_nodes(option, "TopUniqueConstraint", &mut found);
+        }
+        let Some(&constraint) = found.first() else {
+            return self.unsupported(option);
+        };
+        let mut ids = Vec::new();
+        self.named_nodes(self.find(constraint, "ColumnIdList"), "ColId", &mut ids);
+        let mut names: Vec<StrRef> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let text = self.fold_identifier(self.text(id));
+            if names.iter().any(|&held| self.ast.string(held).eq_ignore_ascii_case(&text)) {
+                return Err(Error::parser(format!(
+                    "column \"\"{text}\"\" appears twice in primary key constraint"
+                )));
+            }
+            names.push(self.intern(&text));
+        }
+        Ok(AlterAction::AddKey { columns: self.part_slice(names), primary })
     }
 
     /// `AddColumn <- 'ADD' 'COLUMN'? IfNotExists? AddColumnEntry`.
@@ -6512,6 +6552,10 @@ mod tests {
                     }
                     AlterAction::Default { column, default } => {
                         format!("ALTER COLUMN {} SET DEFAULT {}", ast.string(column), expr(default))
+                    }
+                    AlterAction::AddKey { columns, primary } => {
+                        let kind = if primary { "PRIMARY KEY" } else { "UNIQUE" };
+                        format!("ADD {kind} ({})", ast.name(columns).collect::<Vec<_>>().join(", "))
                     }
                     AlterAction::NotNull { column, set } => {
                         let which = if set { "SET" } else { "DROP" };

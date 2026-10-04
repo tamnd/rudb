@@ -2731,6 +2731,10 @@ impl Table {
                 self.columns[column].ty = ty;
                 self.clustering = None;
             }
+            Alteration::AddKey { columns, primary } => {
+                self.add_key(columns, primary)?;
+                moved = false;
+            }
         }
         let rows = match rows {
             Some(rows) => rows,
@@ -2746,6 +2750,68 @@ impl Table {
         };
         self.seen = vec![None; self.guards().len()];
         self.replace_all(rows, workers)
+    }
+
+    /// Adds a key to a table that already has rows, refusing it the way the pin does when the rows
+    /// already break it. No row moves: a checkpoint writes the key and the `NOT NULL` a primary
+    /// key brings into the table's directory, beside the rows it already has.
+    fn add_key(&mut self, columns: Vec<usize>, primary: bool) -> Result<()> {
+        let names = |columns: &[usize]| {
+            columns.iter().map(|&at| self.columns[at].name.as_str()).collect::<Vec<_>>()
+        };
+        // The pin looks at the rows before the keys the table has, so a second primary key over
+        // rows that repeat fails on the rows.
+        if primary {
+            for chunk in 0..self.rows.chunk_count() {
+                let chunk = self.rows.read(chunk, &columns)?;
+                for at in 0..columns.len() {
+                    let vector = chunk.column(at)?;
+                    if !vector.never_null() && (0..vector.len()).any(|row| vector.is_null_at(row)) {
+                        return Err(Error::constraint(format!(
+                            "NOT NULL constraint failed: \"PRIMARY_{}_{}\"",
+                            self.name.table,
+                            names(&columns).join("_")
+                        )));
+                    }
+                }
+            }
+        }
+        let key = Key { columns, primary };
+        if self.stored_keys(&key).is_err() {
+            return Err(Error::constraint("Data contains duplicates on indexed column(s)"));
+        }
+        if primary {
+            if let Some(held) = self.keys.iter().find(|key| key.primary) {
+                return Err(Error::catalog(format!(
+                    "table \"{}\" can have only one primary key: PRIMARY KEY({})",
+                    self.name.table,
+                    names(&held.columns).join(", ")
+                )));
+            }
+        } else if self.keys.iter().any(|held| !held.primary && held.columns == key.columns) {
+            // The pin names the index behind a key after its columns, so a second one over the
+            // same columns is a second index of the same name.
+            return Err(Error::catalog(format!(
+                "an index with that name already exists for this table: UNIQUE_{}_{}",
+                self.name.table,
+                names(&key.columns).join("_")
+            )));
+        }
+        // The pin lists a key added later after every constraint the table had, and the `NOT
+        // NULL` a primary key brings straight after the key.
+        self.order = self.constraints();
+        self.order.push(crate::Constraint::Key(self.keys.len()));
+        if primary {
+            for &column in &key.columns {
+                if !self.columns[column].not_null {
+                    self.columns[column].not_null = true;
+                    self.order.push(crate::Constraint::NotNull(column));
+                }
+            }
+        }
+        self.keys.push(key);
+        self.seen = vec![None; self.guards().len()];
+        Ok(())
     }
 
     /// Adds sequences a default now uses to the ones the table depends on.

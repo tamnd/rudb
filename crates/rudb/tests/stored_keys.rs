@@ -107,3 +107,41 @@ fn a_table_with_no_keys_still_takes_anything() {
     let count = db.query("SELECT count(*) FROM t").expect("count").rows().next().expect("a row");
     assert_eq!(count[0], rudb_common::Value::BigInt(4));
 }
+
+#[test]
+fn a_key_added_by_alter_holds_and_comes_back() {
+    let file = File::new("added");
+    {
+        let db = file.open();
+        db.execute(
+            "CREATE TABLE t AS SELECT range::INT AS id, (range % 3)::INT AS g FROM range(10)",
+        )
+        .expect("create");
+        db.execute("CHECKPOINT").expect("the rows go to the file");
+        let refused = |sql: &str, text: &str| {
+            let error = db.execute(sql).expect_err(sql);
+            assert!(error.to_string().contains(text), "{sql}: {error}");
+        };
+        refused(
+            "ALTER TABLE t ADD PRIMARY KEY (g)",
+            "Data contains duplicates on indexed column(s)",
+        );
+        refused("ALTER TABLE t ADD CHECK (id > 0)", "No support for adding CHECK constraints");
+        db.execute("ALTER TABLE t ADD PRIMARY KEY (id)").expect("the ids are distinct");
+        refused("ALTER TABLE t ADD PRIMARY KEY (id)", "can have only one primary key");
+        db.execute("ALTER TABLE t ADD UNIQUE (g, id)").expect("so are the pairs");
+        refused("ALTER TABLE t ALTER COLUMN id DROP NOT NULL", "column \"id\" is in a primary key");
+        db.execute("CHECKPOINT").expect("the keys go to the file");
+    }
+    let db = file.open();
+    let refused = |sql: &str, text: &str| {
+        let error = db.execute(sql).expect_err(sql);
+        assert!(error.to_string().contains(text), "{sql}: {error}");
+    };
+    refused("INSERT INTO t VALUES (1, 1)", "Duplicate key \"id: 1\" violates primary key");
+    refused("INSERT INTO t VALUES (NULL, 1)", "NOT NULL constraint failed: t.id");
+    db.execute("INSERT INTO t VALUES (10, 1)").expect("a new key");
+    let count = db.query("SELECT count(*) FROM duckdb_constraints() WHERE table_name = 't'");
+    let count = count.expect("count").rows().next().expect("a row");
+    assert_eq!(count[0], rudb_common::Value::BigInt(3));
+}
