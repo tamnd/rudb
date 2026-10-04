@@ -959,17 +959,20 @@ fn packed_range(
     let within = |code: u64| code.wrapping_sub(from) <= span;
     Some(match live {
         Some(rows) => kept_where(Some(rows), len, |row| within(packed.code(row))),
-        None => kept_in_blocks(
-            len,
-            |base, flags| {
-                let mut codes = [0_u64; 64];
-                packed.unpack(base, &mut codes);
-                for (flag, &code) in flags.iter_mut().zip(&codes) {
-                    *flag = u8::from(within(code));
-                }
-            },
-            |row| within(packed.code(row)),
-        ),
+        // A word a block from the lanes and the rows made from the words once, the way the mask
+        // filter does it. Unpacking every block into codes and a flag a row was a fifth of TPC-H
+        // q14, whose one range on `l_shipdate` comes here rather than to the mask filter.
+        None => {
+            let mut words = vec![0_u64; len.div_ceil(64)];
+            let kept = masked_words(
+                len,
+                &mut words,
+                true,
+                |base| packed.within(base, from, span),
+                |row| within(packed.code(row)),
+            );
+            mask_selection(&words, kept)
+        }
     })
 }
 
