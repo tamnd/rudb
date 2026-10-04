@@ -52,11 +52,11 @@ pub struct Prepared {
     numbered: bool,
 }
 
-/// An `INSERT INTO t [(columns)] VALUES (row)` whose items are parameters or `NULL`, with nothing
-/// after the row: no `RETURNING`, no `ON CONFLICT`.
+/// An `INSERT INTO t [(columns)] VALUES (row), ...` whose items are parameters or `NULL`, with
+/// nothing after the rows: no `RETURNING`, no `ON CONFLICT`.
 ///
-/// This is the trickle insert, one row per statement, and binding it builds a plan of a projection
-/// over a one row `VALUES` only for the executor to walk it back down to the row. So the shape is
+/// This is the trickle insert, one row or a few per statement, and binding it builds a plan of a
+/// projection over a `VALUES` only for the executor to walk it back down to the rows. So the shape is
 /// read once here, and an execution that finds a plain table under the name puts the row straight
 /// in. Anything the shape does not settle by itself, a constraint, a default or a value that needs
 /// more than a widening to fit its column, goes the long way, so the errors and the answers are
@@ -67,8 +67,8 @@ pub(crate) struct Direct {
     pub(crate) name: Vec<String>,
     /// The column list, empty when the statement did not write one.
     pub(crate) columns: Vec<String>,
-    /// The row, one item for each column it names.
-    pub(crate) items: Vec<Item>,
+    /// The rows, each one item for each column the statement names.
+    pub(crate) rows: Vec<Vec<Item>>,
     /// What the last execution worked out about the table, kept while the catalog stays as it was.
     pub(crate) found: Found,
 }
@@ -304,23 +304,29 @@ impl Direct {
         if query != ast::Query::bare(query.body) {
             return None;
         }
-        let [row] = ast.rows(rows) else { return None };
-        let items = ast
-            .expr_list(*row)
-            .iter()
-            .map(|&expr| match ast.expr(expr) {
-                ast::Expr::Parameter { name } => {
-                    let name = ast.string(name);
-                    Some(Item::Parameter(name.to_owned(), numbered(name)))
-                }
-                ast::Expr::Literal { kind: ast::LiteralKind::Null, .. } => Some(Item::Null),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
+        let row = |row| {
+            ast.expr_list(row)
+                .iter()
+                .map(|&expr| match ast.expr(expr) {
+                    ast::Expr::Parameter { name } => {
+                        let name = ast.string(name);
+                        Some(Item::Parameter(name.to_owned(), numbered(name)))
+                    }
+                    ast::Expr::Literal { kind: ast::LiteralKind::Null, .. } => Some(Item::Null),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+        };
+        let rows = ast.rows(rows).iter().map(|&at| row(at)).collect::<Option<Vec<_>>>()?;
+        // Rows of different widths are the plan's to refuse.
+        let width = rows.first()?.len();
+        if rows.iter().any(|row| row.len() != width) {
+            return None;
+        }
         Some(Self {
             name: ast.name(insert.name).map(str::to_owned).collect(),
             columns: ast.name(insert.columns).map(str::to_owned).collect(),
-            items,
+            rows,
             found: Found::default(),
         })
     }
@@ -630,10 +636,12 @@ impl Prepared {
     /// section 13.4 does, and `PIPELINE` for anything bound, planned and run as a pipeline each
     /// time.
     ///
-    /// The point plans are `InsertOne t`, `POINT Lookup t(key)`, `UpdateOne t(key) SET column`
-    /// and `Range t(key)`. They hold for values of the key's and the columns' types, and outside
-    /// a transaction. A benchmark checks this before it measures, so a statement that would fall
-    /// back to the pipeline is found out by name rather than by a slow number.
+    /// The point plans are `InsertOne t`, `InsertRows t`, `POINT Lookup t(key)`,
+    /// `UpdateOne t(key) SET column`, `DeltaOne t(key) SET column` and `Range t(key)`. They hold
+    /// for values of the key's and the columns' types, and outside a transaction, but for an
+    /// insert, which takes the short way inside one too until it aborts. A benchmark checks this
+    /// before it measures, so a statement that would fall back to the pipeline is found out by
+    /// name rather than by a slow number.
     #[must_use]
     pub fn explain(&self) -> String {
         let shapes = [
