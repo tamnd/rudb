@@ -4262,12 +4262,12 @@ impl Packed<'_> {
         }
         let mut row = first;
         while row + 64 <= end {
-            let word = row / 64 * width;
-            let Some(words) = self.words.get(word..word + width) else { break };
             let Some(Ok(block)) = out.get_mut(at..at + 64).map(<&mut [u64; 64]>::try_from) else {
                 break;
             };
-            unpack_block(words, self.width, block);
+            if !unpack_block_at(self.words, row / 64 * width, self.width, block) {
+                break;
+            }
             row += 64;
             at += 64;
         }
@@ -4306,9 +4306,9 @@ impl Packed<'_> {
         let mut row = first;
         let mut block = [0_u64; 64];
         while row + 64 <= end {
-            let word = row / 64 * width;
-            let Some(words) = self.words.get(word..word + width) else { break };
-            unpack_block(words, self.width, &mut block);
+            if !unpack_block_at(self.words, row / 64 * width, self.width, &mut block) {
+                break;
+            }
             out.extend(block.iter().map(|&code| value(code)));
             row += 64;
         }
@@ -4471,6 +4471,31 @@ impl Packed<'_> {
             .enumerate()
             .fold(0, |word, (bit, &code)| word | u64::from(code.wrapping_sub(low) <= span) << bit)
     }
+}
+
+/// The block of 64 codes whose `width` words start at `words[word]`, unpacked into `out`, and false
+/// when `words` does not hold them all.
+///
+/// In AVX2 lanes when the width is one the lanes take and the sixteen bytes their loads read past
+/// the block are there, which is every block of a column but the last, and by [`unpack_block`]
+/// otherwise. On TPC-H q01 the scalar unpack was a tenth of the query.
+#[inline]
+fn unpack_block_at(words: &[u64], word: usize, width: u32, out: &mut [u64; 64]) -> bool {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        let wide = width as usize;
+        if (1..=crate::lanes::LANE_WIDTH_MAX).contains(&wide) {
+            let start = word * size_of::<u64>();
+            let bytes = crate::lanes::bytes_of(words);
+            if let Some(block) = bytes.get(start..start + crate::lanes::readable(wide)) {
+                crate::lanes::unpack(block, wide, out);
+                return true;
+            }
+        }
+    }
+    let Some(words) = words.get(word..word + width as usize) else { return false };
+    unpack_block(words, width, out);
+    true
 }
 
 /// Sixty four codes of `width` bits out of the `width` words that hold them, with the width made a

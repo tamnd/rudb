@@ -121,6 +121,52 @@ pub(crate) fn within(bytes: &[u8], width: usize, low: u32, span: u32) -> u64 {
     word
 }
 
+/// The 64 codes at `bytes`, each widened to a word, into `out`.
+///
+/// The same shuffle, shift and mask as [`within`], with each group's eight lanes widened to two
+/// stores of four words rather than compared. An aggregate reads every code of a packed column it
+/// sums, and unpacking a code at a time in scalar registers was what that cost, see
+/// `spec/perf/108-codes-unpacked-in-lanes.md`. `bytes` is as [`within`] takes it.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+pub(crate) fn unpack(bytes: &[u8], width: usize, out: &mut [u64; 64]) {
+    use std::arch::x86_64::{
+        _mm_loadu_si128, _mm256_and_si256, _mm256_castsi256_si128, _mm256_cvtepu32_epi64,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_set_m128i, _mm256_set1_epi32,
+        _mm256_shuffle_epi8, _mm256_srlv_epi32, _mm256_storeu_si256,
+    };
+    assert!((1..=LANE_WIDTH_MAX).contains(&width) && bytes.len() >= readable(width));
+    let (shuffle, shifts) = &LANES[width];
+    let half = 4 * width / 8;
+    // SAFETY: the loads are the ones [`within`] makes, which the assert keeps inside `bytes`. Group
+    // `g` stores eight words at `8 * g`, so the last store ends at word 64, the end of `out`.
+    // Neither `loadu` nor `storeu` has an alignment requirement.
+    unsafe {
+        let shuffle = _mm256_loadu_si256(shuffle.as_ptr().cast());
+        let shifts = _mm256_loadu_si256(shifts.as_ptr().cast());
+        #[expect(clippy::cast_possible_wrap, reason = "the lanes are read unsigned")]
+        let mask = _mm256_set1_epi32(((1_u32 << width) - 1) as i32);
+        let at = bytes.as_ptr();
+        let to = out.as_mut_ptr();
+        for group in 0..8 {
+            let first = at.add(group * width);
+            let lanes = _mm256_set_m128i(
+                _mm_loadu_si128(first.add(half).cast()),
+                _mm_loadu_si128(first.cast()),
+            );
+            let codes = _mm256_and_si256(
+                _mm256_srlv_epi32(_mm256_shuffle_epi8(lanes, shuffle), shifts),
+                mask,
+            );
+            let low = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(codes));
+            let high = _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(codes));
+            _mm256_storeu_si256(to.add(group * 8).cast(), low);
+            _mm256_storeu_si256(to.add(group * 8 + 4).cast(), high);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +194,26 @@ mod tests {
                 let read = u32::from_le_bytes(four.try_into().expect("four bytes")) >> shifts[lane];
                 assert_eq!(u64::from(read) & ((1 << width) - 1), code, "width {width} code {i}");
             }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn codes_unpacked_in_lanes_are_the_codes_packed() {
+        for width in 1..=LANE_WIDTH_MAX {
+            let top = (1_u64 << width) - 1;
+            let codes: Vec<u64> = (0..64_u64).map(|i| (i * 2_654_435_761) & top).collect();
+            let mut bytes = vec![0xff_u8; readable(width)];
+            bytes[..8 * width].fill(0);
+            for (i, &code) in codes.iter().enumerate() {
+                for b in 0..width {
+                    let bit = i * width + b;
+                    bytes[bit / 8] |= u8::from(code >> b & 1 == 1) << (bit % 8);
+                }
+            }
+            let mut out = [u64::MAX; 64];
+            unpack(&bytes, width, &mut out);
+            assert_eq!(out.as_slice(), codes.as_slice(), "width {width}");
         }
     }
 
