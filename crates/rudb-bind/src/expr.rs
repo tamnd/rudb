@@ -113,6 +113,7 @@ impl Binder<'_> {
             }
             ast::Expr::Star { .. } => match self.star_names(ast, expr)? {
                 Some(names) => Ok(names),
+                None if self.folding => Err(Error::binder("STAR expression is not supported here")),
                 None => Err(Error::binder(format!("* is not allowed in the {}", self.clause))),
             },
             ast::Expr::Columns { unpacked: true, .. } => {

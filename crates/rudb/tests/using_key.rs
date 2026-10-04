@@ -588,6 +588,21 @@ fn an_aggregate_the_pin_refuses_is_refused_in_its_words() {
              a key or a direct call to an aggregate function.",
         ),
         (
+            "k AS v, max(v)",
+            "In USING KEY, only direct calls to an aggregate function can have an alias.",
+        ),
+        (
+            "k, avg(*)",
+            "In USING KEY, an aggregate must either have a column reference or an alias.",
+        ),
+        ("k, avg(*) AS v", "No matching aggregate function"),
+        ("k, avg(* :: INT) AS v", "STAR expression is not supported here"),
+        (
+            "k, memory.main.max(v)",
+            "'memory.main.max(v)' can't be used in the USING KEY clause. It has to be either a \
+             column name as a key or a direct call to an aggregate function.",
+        ),
+        (
             "k, zzagg(v)",
             "'zzagg(v)' can't be used in the USING KEY clause. It has to be either a column name \
              as a key or a direct call to an aggregate function.",
@@ -605,6 +620,29 @@ fn an_aggregate_the_pin_refuses_is_refused_in_its_words() {
             "{key}"
         );
     }
+    // A schema in front of the name is not looked at, and neither is the catalog when it is
+    // `system`.
+    for key in ["k, system.main.max(v)", "k, zz.max(v)", "k, system.zz.max(v)"] {
+        assert_eq!(
+            rows(
+                &database,
+                &format!(
+                    "WITH RECURSIVE r(k, v) USING KEY ({key}) AS (VALUES (1, 10) UNION ALL \
+                     SELECT k + 1, v + 1 FROM r WHERE k < 3) SELECT * FROM r ORDER BY k"
+                )
+            ),
+            ["1|10", "2|11", "3|12"],
+            "{key}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(a, b) USING KEY (a, count(*) AS b) AS (SELECT 1, 1 UNION ALL \
+             SELECT a, b + 1 FROM t WHERE b < 5) TABLE t"
+        ),
+        ["1|5"]
+    );
     for key in ["k, max(zz) AS v", "k, max(v + zz)", "k, sum(zz) AS v, max(v)"] {
         assert!(
             refused(
@@ -617,5 +655,44 @@ fn an_aggregate_the_pin_refuses_is_refused_in_its_words() {
             .starts_with("Binder Error: Referenced column \"zz\" not found in FROM clause!"),
             "{key}"
         );
+    }
+}
+
+#[test]
+fn a_key_keeps_the_value_it_was_first_stored_with() {
+    let database = Database::new();
+    for (word, key) in [("UNION ALL", "k"), ("UNION", "k"), ("UNION ALL", "k, max(v)")] {
+        assert_eq!(
+            rows(
+                &database,
+                &format!(
+                    "WITH RECURSIVE t(k, v) USING KEY ({key}) AS (VALUES ('-0'::DOUBLE, 0) \
+                     {word} SELECT '0'::DOUBLE, v + 1 FROM t WHERE v < 2) \
+                     SELECT signbit(k), v FROM t"
+                )
+            ),
+            ["true|2"],
+            "{word} {key}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(k, v) USING KEY (k) AS (VALUES ('-0'::DOUBLE, 0), ('0'::DOUBLE, 5) \
+             UNION ALL SELECT k, v FROM t WHERE false) SELECT signbit(k), v FROM t"
+        ),
+        ["true|5"]
+    );
+}
+
+#[test]
+fn a_definition_nothing_reads_is_never_bound() {
+    let database = Database::new();
+    for sql in [
+        "WITH RECURSIVE t AS (SELECT zz UNION ALL SELECT * FROM t) SELECT 1",
+        "WITH RECURSIVE t(k, v) USING KEY (k, sum(zz)) AS (SELECT 1, 0 UNION ALL SELECT k, v \
+         FROM t) SELECT 1",
+    ] {
+        assert_eq!(rows(&database, sql), ["1"], "{sql}");
     }
 }
