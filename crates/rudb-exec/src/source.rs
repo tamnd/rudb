@@ -1876,7 +1876,7 @@ impl<'a> Scan<'a> {
         let (first, timed) = self.order.next();
         let (rows, start) = (out.len(), timed.then(std::time::Instant::now));
         if first {
-            self.filter_first(at, out, tests)?;
+            self.pushed_first(at, out, tests)?;
         } else {
             self.bitmaps_first(at, out, mark, tests)?;
         }
@@ -1893,7 +1893,7 @@ impl<'a> Scan<'a> {
     /// The other order narrows the chunk to what the bitmaps keep and then runs the filter over
     /// that, which in TPC-H q20 is a bitmap test on every one of the six million rows of lineitem
     /// to save a date compare that costs a fraction of one. The Bloom filters still go last.
-    fn filter_first(&self, at: usize, out: &mut Chunk, tests: Bitmaps<'_>) -> Result<()> {
+    fn pushed_first(&self, at: usize, out: &mut Chunk, tests: Bitmaps<'_>) -> Result<()> {
         let Some(pushed) = self.pushed.as_ref() else {
             self.sift_tests(out, tests)?;
             return self.sift_hashed(out);
@@ -2200,7 +2200,7 @@ impl<'a> Scan<'a> {
         *out = Chunk::with_rows(held, len)?;
         if early && ahead {
             let tests = self.exact_tests(out, None);
-            self.filter_first(at, out, tests)?;
+            self.pushed_first(at, out, tests)?;
         } else if early {
             self.sift(out)?;
         } else {
