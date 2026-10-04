@@ -408,3 +408,31 @@ fn a_share_read_while_the_query_runs_does_not_become_a_top_n() {
     assert!(plan.contains("Sort"), "{sql} planned as {plan}");
     assert!(!plan.contains("TopN"), "{sql} planned as {plan}");
 }
+
+/// A limit over an outer join counts the padded rows with the pairs, not apart from them.
+///
+/// The padded rows of a `RIGHT` or `FULL` join come out once the driving side is finished, after
+/// the pairs, and the limit above them is the same limit. It used to start counting again for
+/// them, so `LIMIT 2` over a `RIGHT JOIN` answered four rows. The full join here is two pairs,
+/// three left rows and four right rows, nine in all, and every count is the pin's.
+#[test]
+fn a_limit_over_an_outer_join_counts_the_padded_rows_too() {
+    let database = Database::new();
+    let join = "range(5) a(k) FULL JOIN range(3, 9) b(k) ON a.k = b.k";
+    for (sql, rows) in [
+        (format!("SELECT a.k FROM {join} LIMIT 3"), 3),
+        (format!("SELECT a.k FROM {join} LIMIT 7"), 7),
+        (format!("SELECT a.k FROM {join} LIMIT 9"), 9),
+        (format!("SELECT a.k FROM {join} LIMIT 0"), 0),
+        (format!("SELECT a.k FROM {join} LIMIT 2 OFFSET 6"), 2),
+        (format!("SELECT a.k FROM {join} LIMIT 10 OFFSET 4"), 5),
+        (
+            "SELECT b.k FROM range(5) a(k) RIGHT JOIN range(3, 9) b(k) ON a.k = b.k LIMIT 2".into(),
+            2,
+        ),
+        ("SELECT a.k FROM (SELECT 1 k) a FULL JOIN (SELECT 2 k) b ON a.k = b.k LIMIT 1".into(), 1),
+    ] {
+        let result = database.query(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+        assert_eq!(result.rows().count(), rows, "{sql}");
+    }
+}
