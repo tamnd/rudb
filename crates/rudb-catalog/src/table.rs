@@ -19,7 +19,7 @@ use crate::gone::Gone;
 use crate::held::Held;
 use crate::keys::{ForeignKey, Key, Seen};
 use crate::name::{QualifiedName, same_name};
-use crate::points::{Point, Points, Spot, looks_up};
+use crate::points::{Edge, Point, Points, Reach, Spot, looks_up};
 
 /// Where table revisions are counted from, one counter for the process.
 ///
@@ -2001,6 +2001,49 @@ impl Table {
             Some((_, chunk)) => Point::Found(chunk),
             None => Point::Absent,
         }))
+    }
+
+    /// The first `limit` rows in the order of the key over the one column `key` whose key is on
+    /// the `reach` side of `value`, the highest key first when `descending`, with the columns
+    /// `columns`, read where the table noted the keys rather than by reading the table.
+    ///
+    /// `None` when that would not answer what the plan does: `key` is not one of the table's keys
+    /// on its own, or its column and `value` are not both of the integer types or both `VARCHAR`.
+    ///
+    /// # Errors
+    ///
+    /// If the rows cannot be read.
+    pub fn range(
+        &self,
+        key: usize,
+        (reach, value): (Reach, &Value),
+        descending: bool,
+        limit: usize,
+        columns: &[usize],
+    ) -> Result<Option<Vec<Chunk>>> {
+        let Some(field) = self.columns.get(key) else { return Ok(None) };
+        let int = matches!(field.ty, LogicalType::Integer | LogicalType::BigInt);
+        let bound = match value {
+            Value::Integer(value) if int => Edge::Int(i64::from(*value)),
+            Value::BigInt(value) if int => Edge::Int(*value),
+            Value::Varchar(value) if field.ty == LogicalType::Varchar => Edge::Text(value),
+            _ => return Ok(None),
+        };
+        let unique = self.indexes.iter().filter(|index| index.unique && index.plain);
+        let which = self
+            .keys
+            .iter()
+            .map(|held| held.columns.as_slice())
+            .chain(unique.map(|index| index.columns.as_slice()))
+            .position(|held| held == [key]);
+        let Some(which) = which else { return Ok(None) };
+        if columns.iter().any(|&column| column >= self.columns.len()) {
+            return Ok(None);
+        }
+        let reach = (reach, bound);
+        self.points
+            .range(which, &self.rows, self.placed, key, reach, descending, limit, columns)
+            .map(Some)
     }
 
     /// [`Self::point`], with where the row is beside it, for a write to the row there.
