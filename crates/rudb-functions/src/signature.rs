@@ -299,6 +299,9 @@ enum Shape {
     /// `mad(x)`, the median distance from the median, which is an INTERVAL for anything that is a
     /// time and the continuous type for anything that is a number.
     Deviation,
+    /// `min(x)`, which is [`Shape::Promoted`] over one argument, and `min(x, n)`, which answers the
+    /// `n` least values as a list with `n` taken as a BIGINT.
+    Extreme,
     /// `arg_min(arg, by)`, which answers one of its `arg` values in the type it was given, and
     /// `arg_min(arg, by, n)`, which answers a list of them with `n` taken as a BIGINT.
     Picked,
@@ -1709,8 +1712,8 @@ const TABLE: &[Entry] = &[
     aggregate("count", Arity::exactly(1), Shape::AnyTo(Fixed::BigInt), false),
     aggregate("sum", Arity::exactly(1), Shape::Accumulated, true),
     aggregate("avg", Arity::exactly(1), Shape::PromotedTo(Fixed::Double), true),
-    aggregate("min", Arity::exactly(1), Shape::Promoted, false),
-    aggregate("max", Arity::exactly(1), Shape::Promoted, false),
+    aggregate("min", Arity::between(1, 2), Shape::Extreme, false),
+    aggregate("max", Arity::between(1, 2), Shape::Extreme, false),
     aggregate("list", Arity::exactly(1), Shape::Listed, false),
     aggregate("first", Arity::exactly(1), Shape::AsGiven, false),
     aggregate("last", Arity::exactly(1), Shape::AsGiven, false),
@@ -2286,9 +2289,19 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         ),
         Shape::Plotted => plotted(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
         Shape::Topped => return Err(no_match(entry.name, arguments)),
+        Shape::Extreme => match arguments {
+            [_] => {
+                let common = promote_all(name, arguments)?;
+                (vec![common.clone()], common)
+            }
+            [value, n] if counted(n) => {
+                (vec![value.clone(), LogicalType::BigInt], LogicalType::list(value.clone()))
+            }
+            _ => return Err(no_match(entry.name, arguments)),
+        },
         Shape::Picked => match arguments {
             [arg, by] => (vec![arg.clone(), by.clone()], arg.clone()),
-            [arg, by, _] => {
+            [arg, by, n] if counted(n) => {
                 (vec![arg.clone(), by.clone(), LogicalType::BigInt], LogicalType::list(arg.clone()))
             }
             _ => return Err(no_match(entry.name, arguments)),
@@ -3043,8 +3056,8 @@ fn sampled(arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)>
     Some((wanted, fractioned(&fraction, held)))
 }
 
-/// Whether a count of `approx_top_k` or `lttb` casts to the BIGINT the pin wants without a
-/// DECIMAL, a DOUBLE or a wider integer in the way.
+/// Whether a count of `approx_top_k`, `lttb`, `max` or `arg_max` casts to the BIGINT the pin wants
+/// without a DECIMAL, a DOUBLE or a wider integer in the way.
 fn counted(ty: &LogicalType) -> bool {
     matches!(
         ty,
@@ -5413,6 +5426,8 @@ impl Shape {
             Self::Plotted => (vec!["DOUBLE", "DOUBLE", "BIGINT"], ANY_LIST),
             Self::Median | Self::Deviation => (all(ANY), ANY),
             Self::Picked => (leading(2, ANY, "BIGINT"), ANY),
+            Self::Extreme if count == 2 => (vec![ANY, "BIGINT"], ANY_LIST),
+            Self::Extreme => (all(SAME), SAME),
             Self::Histogram => (leading(1, ANY, ANY_LIST), "MAP"),
             Self::Bits => (all(ANY), "BIT"),
         }
