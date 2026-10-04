@@ -4774,6 +4774,25 @@ impl<'a> Aggregate<'a> {
                     answers[group] = (end(group) - start as usize) as i128;
                 }
             } else {
+                let counting = self.calls[at].name == "count";
+                let least = match self.calls[at].name.as_str() {
+                    "min" => Some(true),
+                    "max" => Some(false),
+                    _ => None,
+                };
+                // A packed argument with no null is added up from its codes, see
+                // [`packed_run_totals`]. Flattened first, as below, it was a vector a chunk to read
+                // once, and `l_quantity` has been held packed since note 107.
+                let argument = &rows.arguments[at][0];
+                if !counting
+                    && least.is_none()
+                    && let Some(packed) = argument.packed_parts()
+                    && !argument.validity().has_nulls(rows.rows)
+                    && packed_run_totals(&packed, &starts, to, &mut answers)
+                {
+                    columns.push(whole_answers(&answers, &valid, ty)?);
+                    continue;
+                }
                 // A flat argument is read where it lies. Cloning it first copied the whole chunk's
                 // values once per call on q18, before a single run was added up.
                 let flattened;
@@ -4785,12 +4804,6 @@ impl<'a> Aggregate<'a> {
                     }
                 };
                 let nulls = argument.validity().has_nulls(rows.rows).then(|| argument.validity());
-                let counting = self.calls[at].name == "count";
-                let least = match self.calls[at].name.as_str() {
-                    "min" => Some(true),
-                    "max" => Some(false),
-                    _ => None,
-                };
                 let values = match counting {
                     true => None,
                     false => match integers(argument, rows.rows) {
@@ -5522,6 +5535,50 @@ fn run_starts(key: &Vector, from: usize, to: usize) -> Option<Vec<u32>> {
         Data::UInt64(values) => flat!(values),
         _ => None,
     }
+}
+
+/// The total of every run of a packed argument, where run `group` is `starts[group]` up to the next
+/// start or `to`, written into `answers`. False, with nothing written, when a total might not fit.
+///
+/// A run of `l_orderkey` is four rows, so adding each run up on its own was a loop entered and left
+/// every four values, and before that the codes were turned into a vector of values. Here the codes
+/// are unpacked once into a buffer the thread keeps and summed into a running total in place, so a
+/// run's total is the running total at its end less the one at its start. A value is the base plus
+/// its code, so the run adds the base once for each of its rows. The running total is of codes,
+/// which are at most `width` bits, so it fits in 64 bits while the rows times the largest code do.
+fn packed_run_totals(
+    packed: &rudb_vector::Packed<'_>,
+    starts: &[u32],
+    to: usize,
+    answers: &mut [i128],
+) -> bool {
+    thread_local! {
+        static RUNNING: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let Some(&first) = starts.first() else { return true };
+    let from = first as usize;
+    let rows = to - from;
+    if packed.width() + (usize::BITS - rows.leading_zeros()) > 63 {
+        return false;
+    }
+    let base = packed.base();
+    RUNNING.with_borrow_mut(|running| {
+        running.clear();
+        running.resize(rows + 1, 0);
+        packed.unpack(from, &mut running[1..]);
+        let mut total = 0;
+        for at in &mut running[1..] {
+            total += *at;
+            *at = total;
+        }
+        let ends = starts[1..].iter().map(|&start| start as usize - from).chain([rows]);
+        for ((answer, &start), end) in answers.iter_mut().zip(starts).zip(ends) {
+            let start = start as usize - from;
+            let codes = running[end] - running[start];
+            *answer = base * (end - start) as i128 + i128::from(codes);
+        }
+    });
+    true
 }
 
 /// The total of a run, in sixty four bits while it fits and in a hundred and twenty eight when it
@@ -8415,7 +8472,8 @@ mod tests {
         FixedPartition, FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS,
         RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
         bigint_distinct_partition, cut_runs, drop_unkept, encoded_count_partition, first_kept,
-        fixed_partition, interior, run_starts, run_total, slot_runs_of, spread_runs, spread_slots,
+        fixed_partition, interior, packed_run_totals, run_starts, run_total, slot_runs_of,
+        spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -10235,6 +10293,35 @@ mod tests {
         assert_eq!(column(2).collect::<Vec<_>>(), ints(&[2, 3, 4, 5]));
         let counts = column(3).collect::<Vec<_>>();
         assert_eq!(counts, [2, 2, 1, 1].map(Value::BigInt).to_vec());
+    }
+
+    /// Runs of a packed argument added up from the codes come to what adding up the values does,
+    /// with a base that is not zero and runs of one row and of many.
+    #[test]
+    fn packed_runs_total_what_the_values_do() {
+        let values: Vec<i64> = (0..3_000).map(|row| 100 + (row * 37 % 50) * 100).collect();
+        let flat = Vector::from_values(
+            LogicalType::BigInt,
+            &values.iter().map(|&v| Value::BigInt(v)).collect::<Vec<_>>(),
+        )
+        .expect("values");
+        let packed = flat.bit_packed().expect("packed");
+        let parts = packed.packed_parts().expect("packed parts");
+        let (from, to) = (5, 2_990);
+        let mut starts = vec![from as u32];
+        let mut row = from;
+        while row < to {
+            row += 1 + row % 7;
+            if row < to {
+                starts.push(row as u32);
+            }
+        }
+        let mut answers = vec![0_i128; starts.len()];
+        assert!(packed_run_totals(&parts, &starts, to, &mut answers));
+        for (group, &start) in starts.iter().enumerate() {
+            let end = starts.get(group + 1).map_or(to, |&next| next as usize);
+            assert_eq!(answers[group], run_total(&values[start as usize..end]), "run {group}");
+        }
     }
 
     #[test]
