@@ -16,7 +16,8 @@
 //!
 //! With `USING KEY` the rows produced are a table keyed on the key columns rather than a list. A
 //! row whose key is there already replaces the row that had it, in the order the rows came, so the
-//! last one wins within a round. With `ALL` the next round reads every row this round made, and
+//! last one wins within a round, except that the key columns keep what was first stored for the
+//! key, since keys that compare equal can be written differently. With `ALL` the next round reads every row this round made, and
 //! without it only one row per key whose value this round changed, a key that came back with the
 //! value it had being no work at all. A `recurring.` read sees the table as it stood when the round
 //! began, and without a key it sees every row produced so far.
@@ -201,7 +202,7 @@ impl Fixpoint<'_> {
         }
         if self.all {
             for row in &made {
-                table.put(self.key_of(row), row.clone());
+                table.put(self.key_of(row), row.clone(), &self.key);
             }
             return Ok(made);
         }
@@ -214,14 +215,13 @@ impl Fixpoint<'_> {
                 Some(&slot) => {
                     if slot < first.len() && !first[slot] {
                         first[slot] = true;
-                        touched.push((slot, Some(std::mem::replace(&mut table.rows[slot], row))));
-                    } else {
-                        table.rows[slot] = row;
+                        touched.push((slot, Some(table.rows[slot].clone())));
                     }
+                    replace(&mut table.rows[slot], row, &self.key);
                 }
                 None => {
                     touched.push((table.rows.len(), None));
-                    table.put(key, row);
+                    table.put(key, row, &self.key);
                 }
             }
         }
@@ -260,7 +260,7 @@ impl Fixpoint<'_> {
                         .collect::<Result<Vec<_>>>()?;
                     let slot = table.rows.len();
                     touched.push((slot, None));
-                    table.put(key, row[..width].to_vec());
+                    table.put(key, row[..width].to_vec(), &self.key);
                     table.states.push(states);
                     slot
                 }
@@ -272,7 +272,8 @@ impl Fixpoint<'_> {
             }
             let kept = &mut table.rows[slot];
             for (column, value) in row[..width].iter().enumerate() {
-                if !self.folds.iter().any(|fold| fold.into == column) {
+                let folded = self.folds.iter().any(|fold| fold.into == column);
+                if !folded && !self.key.contains(&column) {
                     kept[column] = value.clone();
                 }
             }
@@ -333,13 +334,23 @@ struct Keyed {
 
 impl Keyed {
     /// Gives `key` the row, replacing the one it had or adding it after every other.
-    fn put(&mut self, key: Key, row: Vec<Value>) {
+    fn put(&mut self, key: Key, row: Vec<Value>, columns: &[usize]) {
         match self.at.get(&key) {
-            Some(&slot) => self.rows[slot] = row,
+            Some(&slot) => replace(&mut self.rows[slot], row, columns),
             None => {
                 self.at.insert(key, self.rows.len());
                 self.rows.push(row);
             }
+        }
+    }
+}
+
+/// Replaces a key's row with a later one, keeping the key columns as they were first stored,
+/// because a key equal to the stored one can be written differently, as `-0.0` and `0.0` are.
+fn replace(kept: &mut [Value], row: Vec<Value>, columns: &[usize]) {
+    for (column, value) in row.into_iter().enumerate() {
+        if !columns.contains(&column) {
+            kept[column] = value;
         }
     }
 }

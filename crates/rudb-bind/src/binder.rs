@@ -378,7 +378,7 @@ pub(crate) struct Binder<'a> {
     pub(crate) in_aggregate: bool,
     /// Whether an aggregate of `USING KEY` is being bound, where one inside another is refused in
     /// other words.
-    folding: bool,
+    pub(crate) folding: bool,
     /// Set while an aggregate's `FILTER` is being bound, which is refused its own aggregate.
     pub(crate) in_filter: bool,
     /// The window runs this select block has collected, in the order they were first written.
@@ -839,6 +839,12 @@ impl<'a> Binder<'a> {
         for target in ast.target_list(key) {
             let span = ast.expr_span(target.expr);
             match ast.expr(target.expr) {
+                ast::Expr::Column { .. } if target.alias != NONE => {
+                    return Err(Error::binder(
+                        "In USING KEY, only direct calls to an aggregate function can have an alias.",
+                    )
+                    .with_span(span));
+                }
                 ast::Expr::Column { name } => {
                     let written = ast.name(name).last().unwrap_or_default();
                     let Some(at) = fields.iter().position(|field| same_name(&field.name, written))
@@ -857,8 +863,7 @@ impl<'a> Binder<'a> {
                     }
                 }
                 ast::Expr::Function { name, args, distinct, filter }
-                    if kind_of(ast.name(name).last().unwrap_or_default())
-                        == Some(FunctionKind::Aggregate) =>
+                    if Self::folded(&ast.name(name).collect::<Vec<_>>()) =>
                 {
                     let refused = if filter != NONE {
                         Some("FILTER clause is not yet supported for aggregates in USING KEY")
@@ -871,6 +876,30 @@ impl<'a> Binder<'a> {
                     };
                     if let Some(refused) = refused {
                         return Err(Error::binder(refused).with_span(span));
+                    }
+                    // A lone star is no argument at all to the pin, which finds the column before
+                    // it looks for the function, so `count(*)` needs an alias and `avg(*)` with one
+                    // is `avg()`.
+                    let starred = matches!(ast.expr_list(args), [arg] if matches!(
+                        ast.expr(*arg),
+                        ast::Expr::Star { qualifier, replacements }
+                            if qualifier.is_empty() && replacements.is_empty()
+                    ));
+                    if starred && target.alias == NONE {
+                        return Err(Error::binder(
+                            "In USING KEY, an aggregate must either have a column reference or an alias.",
+                        )
+                        .with_span(span));
+                    }
+                    let written = ast.name(name).last().unwrap_or_default();
+                    if starred && !same_name(written, "count") {
+                        let error = resolve(written, &[]).err().unwrap_or_else(|| {
+                            Error::internal("an aggregate that takes no arguments")
+                        });
+                        return Err(Error::binder(format!(
+                            "No matching aggregate function\n{error}"
+                        ))
+                        .with_span(span));
                     }
                     let mut fold = self.fold_call(ast, target.expr, over)?;
                     let first = ast.expr_list(args).first().map(|&arg| ast.expr(arg));
@@ -921,6 +950,15 @@ impl<'a> Binder<'a> {
             return Err(Error::binder("USING KEY clause requires at least one key column."));
         }
         Ok((positions, folds))
+    }
+
+    /// Whether a call in `USING KEY` names an aggregate. A catalog in front of the name has to be
+    /// `system`, where the aggregates are, and a schema is not looked at, which is what the pin
+    /// does.
+    fn folded(name: &[&str]) -> bool {
+        let catalog = name.len() < 3 || same_name(name[0], "system");
+        catalog
+            && kind_of(name.last().copied().unwrap_or_default()) == Some(FunctionKind::Aggregate)
     }
 
     /// An aggregate call of `USING KEY`, bound against one side's columns the way a call in a
@@ -5174,7 +5212,9 @@ fn same_expr(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
     };
     match (plan.expr(left), plan.expr(right)) {
         (Expr::Column(left), Expr::Column(right)) => left == right,
-        (Expr::Constant(left), Expr::Constant(right)) => plan.value(*left) == plan.value(*right),
+        (Expr::Constant(left), Expr::Constant(right)) => {
+            plan.value(*left).identical(plan.value(*right))
+        }
         (
             Expr::Cast { input: left, try_cast: left_try },
             Expr::Cast { input: right, try_cast: right_try },

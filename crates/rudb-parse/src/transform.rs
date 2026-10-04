@@ -2930,7 +2930,11 @@ impl<'a> Transform<'a> {
             if recursive {
                 let index = self.recursive_definition(self.first(select), name, columns, key)?;
                 let held = self.ast.ctes[index as usize];
-                if held.recursive || materialized {
+                // The pin binds a definition only where it is read, so one that nothing after it
+                // reads is never bound and a column it names that is not there is no error.
+                let mut reads = 0;
+                self.counts_reads(node, self.ast.string(name), &written[..=at], &mut reads);
+                if (held.recursive && reads > 0) || materialized {
                     once.push(index);
                     self.ctes.push((name, Held::Once(index), columns));
                 } else {

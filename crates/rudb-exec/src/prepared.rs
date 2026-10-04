@@ -1771,7 +1771,9 @@ fn same(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
     }
     match (plan.expr(left), plan.expr(right)) {
         (Expr::Column(one), Expr::Column(other)) => one == other,
-        (Expr::Constant(one), Expr::Constant(other)) => plan.value(*one) == plan.value(*other),
+        (Expr::Constant(one), Expr::Constant(other)) => {
+            plan.value(*one).identical(plan.value(*other))
+        }
         (
             Expr::Cast { input: one, try_cast: first },
             Expr::Cast { input: other, try_cast: second },

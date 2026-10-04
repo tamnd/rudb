@@ -172,6 +172,50 @@ impl Value {
         Self::Map { key: Box::new(key), value: Box::new(value), entries }
     }
 
+    /// Whether the two are one value written one way, which `==` does not ask.
+    ///
+    /// `-0.0` and `0.0` are equal and are not the same constant, because `signbit` and the printed
+    /// form tell them apart, so a plan that keeps one copy of equal constants asks this instead.
+    #[must_use]
+    pub fn identical(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Float(one), Self::Float(other)) => one.to_bits() == other.to_bits(),
+            (Self::Double(one), Self::Double(other)) => one.to_bits() == other.to_bits(),
+            (
+                Self::List { element: one, values: these },
+                Self::List { element: other, values: those },
+            ) => {
+                one == other
+                    && these.len() == those.len()
+                    && these.iter().zip(those).all(|(one, other)| one.identical(other))
+            }
+            (Self::Struct(these), Self::Struct(those)) => {
+                these.len() == those.len()
+                    && these.iter().zip(those).all(|((one_name, one), (other_name, other))| {
+                        one_name == other_name && one.identical(other)
+                    })
+            }
+            (
+                Self::Map { key: one_key, value: one_value, entries: these },
+                Self::Map { key: other_key, value: other_value, entries: those },
+            ) => {
+                one_key == other_key
+                    && one_value == other_value
+                    && these.len() == those.len()
+                    && these.iter().zip(those).all(
+                        |((one_key, one_value), (other_key, other_value))| {
+                            one_key.identical(other_key) && one_value.identical(other_value)
+                        },
+                    )
+            }
+            (
+                Self::Union { members: these, tag: one, value: this },
+                Self::Union { members: those, tag: other, value: that },
+            ) => these == those && one == other && this.identical(that),
+            _ => self == other,
+        }
+    }
+
     /// How many bytes this value takes, counting what it owns on the heap.
     ///
     /// What the memory limit charges for a value held in a buffer. It is the enum itself plus the

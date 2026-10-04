@@ -652,7 +652,9 @@ fn alike(plan: &Plan, one: ExprRef, other: ExprRef, map: Map<'_>) -> bool {
             None => left == right,
             Some(map) => map(*right) == Some(*left),
         },
-        (Expr::Constant(left), Expr::Constant(right)) => plan.value(*left) == plan.value(*right),
+        (Expr::Constant(left), Expr::Constant(right)) => {
+            plan.value(*left).identical(plan.value(*right))
+        }
         (
             Expr::Cast { input: left, try_cast: left_try },
             Expr::Cast { input: right, try_cast: right_try },
