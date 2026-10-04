@@ -119,6 +119,42 @@ struct Key {
     expr: ExprRef,
 }
 
+/// What counts as reading the outer row while the domain is pushed down.
+///
+/// A column of an outer table is the plain case. The other is a read of a held definition that the
+/// domain was already pushed into: its rows say which outer row they belong to in the domain
+/// columns they carry, so a subtree that reads it is about one outer row as much as one that reads
+/// the outer column, and it is where that subtree's domain comes from rather than a relation to
+/// cross with one.
+struct Outer<'a> {
+    /// The tables of the outer side.
+    tables: &'a TableSet,
+    /// The materialisations whose rows carry the domain columns behind their own.
+    ctes: Vec<u32>,
+}
+
+impl Outer<'_> {
+    /// Whether anything in the subtree reads an outer column or a definition that carries the
+    /// domain.
+    fn reads(&self, plan: &Plan, at: NodeRef) -> bool {
+        if let Node::CteScan { cte, .. } = *plan.node(at)
+            && self.ctes.contains(&cte)
+        {
+            return true;
+        }
+        let mut yes = false;
+        walk::node_columns(plan, at, &mut |_, binding| yes |= self.tables.contains(binding.table));
+        yes || plan.node(at).children().into_iter().flatten().any(|child| self.reads(plan, child))
+    }
+
+    /// The same outer side with more definitions that carry the domain.
+    fn carrying(&self, ctes: &[u32]) -> Self {
+        let mut all = self.ctes.clone();
+        all.extend_from_slice(ctes);
+        Outer { tables: self.tables, ctes: all }
+    }
+}
+
 /// A rewritten subtree, as the operator above it needs to see it.
 struct Pushed {
     /// The subtree, with the domain crossed in underneath and the correlation rewritten away.
@@ -157,7 +193,8 @@ pub(crate) fn lower(
     let input = narrow(plan, left, &bindings);
     let domain = plan.add_node(Node::Aggregate { input, index, groups, aggregates });
 
-    let pushed = push(plan, right, domain, index, &keys, &outer)?;
+    let pushed =
+        push(plan, right, domain, index, &keys, &Outer { tables: &outer, ctes: Vec::new() })?;
 
     let held = plan.expr_list(conditions).to_vec();
     let mut all: Vec<ExprRef> =
@@ -240,7 +277,13 @@ pub(crate) fn unsupported(plan: &Plan, at: NodeRef, outer: &TableSet) -> Option<
         | Node::SetOp { .. }
         | Node::Values { .. }
         | Node::TableFunction { .. }
-        | Node::CrossProduct { .. } => None,
+        | Node::CrossProduct { .. }
+        | Node::MaterializedCte { .. }
+        | Node::CteScan { .. } => None,
+        Node::RecursiveCte { key, aggregates, .. } if key.is_empty() && !aggregates.is_empty() => {
+            Some("a recursive definition with aggregates and no key".to_owned())
+        }
+        Node::RecursiveCte { .. } => None,
         Node::Limit { count, offset, .. } => match (count, offset) {
             (Bound::All | Bound::Rows(_), Bound::Rows(_)) => None,
             _ => Some("a LIMIT holding a value that is not known until the query runs".to_owned()),
@@ -266,9 +309,9 @@ fn push(
     domain: NodeRef,
     index: u32,
     keys: &[Key],
-    outer: &TableSet,
+    outer: &Outer<'_>,
 ) -> Option<Pushed> {
-    if !correlated(plan, at, outer) {
+    if !outer.reads(plan, at) {
         // The bottom of the walk, and the whole point of it. This subtree asks nothing about the
         // outer row, so one evaluation of it beside every domain value is the same relation the
         // dependent join was asking for one value at a time.
@@ -392,8 +435,8 @@ fn push(
             if width != walk::outputs(plan, right)?.len() {
                 return None;
             }
-            let one = branch(plan, left, domain, index, keys, outer)?;
-            let other = branch(plan, right, domain, index, keys, outer)?;
+            let one = branch(plan, left, domain, index, keys, outer, None)?;
+            let other = branch(plan, right, domain, index, keys, outer, None)?;
             let node =
                 plan.add_node(Node::SetOp { left: one, right: other, kind, all, index: at_index });
             let carried = (0..keys.len())
@@ -408,6 +451,9 @@ fn push(
         }
         Node::Values { index: at_index, columns, rows } => {
             values(plan, at_index, columns, rows, domain, index, keys)
+        }
+        Node::MaterializedCte { .. } | Node::CteScan { .. } | Node::RecursiveCte { .. } => {
+            held(plan, at, domain, index, keys, outer)
         }
         Node::TableFunction { index: at_index, function, args, options, settings, columns } => {
             lateral(plan, at_index, function, args, options, settings, columns, domain, index, keys)
@@ -439,6 +485,122 @@ fn push(
         // of the other, and crossing either side with the domain changes what the nth row is. The
         // reference binary refuses this as well rather than answering it, so a query written this
         // way is refused by both and there is nothing here to be compatible with.
+        _ => None,
+    }
+}
+
+/// A `WITH` inside the correlated side, a read of one, or a recursive definition.
+///
+/// Apart from [`push`] so its frame stays the size it was, since `push` recurses once per operator
+/// and a deep plan in a debug build already uses most of a test thread's stack.
+#[inline(never)]
+fn held(
+    plan: &mut Plan,
+    at: NodeRef,
+    domain: NodeRef,
+    index: u32,
+    keys: &[Key],
+    outer: &Outer<'_>,
+) -> Option<Pushed> {
+    match *plan.node(at) {
+        Node::MaterializedCte { definition, body, name, cte, columns } => {
+            if !outer.reads(plan, definition) {
+                // The definition is the same rows for every outer row, so it is held once as it
+                // is and only the body is about the outer row.
+                let below = push(plan, body, domain, index, keys, outer)?;
+                let node = plan.add_node(Node::MaterializedCte {
+                    definition,
+                    body: below.node,
+                    name,
+                    cte,
+                    columns,
+                });
+                return Some(Pushed { node, keys: below.keys, moved: below.moved });
+            }
+            // A recursive definition puts the domain behind its own columns itself, and it has to
+            // stay the definition rather than move under a projection, because the executor runs
+            // the rounds from the node it finds there.
+            let definition = if matches!(plan.node(definition), Node::RecursiveCte { .. }) {
+                push(plan, definition, domain, index, keys, outer)?.node
+            } else {
+                branch(plan, definition, domain, index, keys, outer, None)?
+            };
+            let columns = carried_fields(plan, columns, keys);
+            let below = push(plan, body, domain, index, keys, &outer.carrying(&[cte]))?;
+            let node = plan.add_node(Node::MaterializedCte {
+                definition,
+                body: below.node,
+                name,
+                cte,
+                columns,
+            });
+            Some(Pushed { node, keys: below.keys, moved: below.moved })
+        }
+        Node::CteScan { index: at_index, cte, name, columns } => {
+            // Only a read of a definition the domain was pushed into gets here, since a read of any
+            // other one reads no outer column and was crossed with the domain above. The rows it
+            // reads already carry the domain columns behind their own, so it says so and is where
+            // the domain comes from for everything above it.
+            let width = plan.field_list(columns).len();
+            let columns = carried_fields(plan, columns, keys);
+            let node = plan.add_node(Node::CteScan { index: at_index, cte, name, columns });
+            let carried =
+                (0..keys.len()).map(|position| self::at(at_index, width + position)).collect();
+            Some(Pushed { node, keys: carried, moved: HashMap::new() })
+        }
+        Node::RecursiveCte {
+            anchor,
+            recursive,
+            index: at_index,
+            cte,
+            name,
+            all,
+            columns,
+            recurring,
+            key,
+            aggregates,
+            folds,
+        } => {
+            // The rounds run once for every outer row at the same time. The anchor gives each of
+            // its rows the outer row it belongs to, every round reads the rows the one before made
+            // with that outer row still on them, and so whatever a round makes is about the outer
+            // row it read. A row is told apart from another by the domain columns as well as its
+            // own, which keeps a `UNION` from merging two outer rows' answers, and for the same
+            // reason a key gains the domain columns, so each outer row has a table of its own.
+            if key.is_empty() && !aggregates.is_empty() {
+                return None;
+            }
+            let width = plan.field_list(columns).len();
+            let anchor = branch(plan, anchor, domain, index, keys, outer, Some(width))?;
+            let inside = outer.carrying(&[cte, recurring]);
+            let recursive = branch(plan, recursive, domain, index, keys, &inside, Some(width))?;
+            let columns = carried_fields(plan, columns, keys);
+            let key = if key.is_empty() {
+                key
+            } else {
+                let mut positions = plan.position_list(key).to_vec();
+                positions.extend((0..keys.len()).map(|position| {
+                    u32::try_from(width + position).expect("a column count fits in a u32")
+                }));
+                plan.add_positions(&positions)
+            };
+            let node = plan.add_node(Node::RecursiveCte {
+                anchor,
+                recursive,
+                index: at_index,
+                cte,
+                name,
+                all,
+                columns,
+                recurring,
+                key,
+                aggregates,
+                folds,
+            });
+            let carried =
+                (0..keys.len()).map(|position| self::at(at_index, width + position)).collect();
+            Some(Pushed { node, keys: carried, moved: HashMap::new() })
+        }
         _ => None,
     }
 }
@@ -532,32 +694,51 @@ fn window(
 /// rows that came from different outer rows are two rows, which is what makes `UNION` deduplicate
 /// inside one outer row rather than across all of them, and the same for what `EXCEPT` subtracts
 /// and what `INTERSECT` keeps.
+///
+/// A side of a recursive definition is matched by position the same way, and it can be wider than
+/// what the definition produces, since the arguments of the aggregates `USING KEY` names come after
+/// the produced columns. `split` is how many columns go in front of the domain columns for that,
+/// and `None` is all of them.
+#[allow(clippy::too_many_arguments)]
 fn branch(
     plan: &mut Plan,
     at: NodeRef,
     domain: NodeRef,
     index: u32,
     keys: &[Key],
-    outer: &TableSet,
+    outer: &Outer<'_>,
+    split: Option<usize>,
 ) -> Option<NodeRef> {
     let before = walk::outputs(plan, at)?;
     let below = push(plan, at, domain, index, keys, outer)?;
     let span = plan.expr_span(keys.first()?.expr);
 
+    let split = split.unwrap_or(before.len()).min(before.len());
     let mut projected = Vec::new();
     let mut named = Vec::new();
+    let mut behind = Vec::new();
     for (position, (binding, ty)) in before.into_iter().enumerate() {
         // An aggregate below is the one that moves a column, because adding the domain to its
         // grouping shifts its aggregates along its output. Everything else leaves a binding where
         // it was, so the map is empty and the lookup costs nothing.
         let moved = below.moved.get(&binding).copied().unwrap_or(binding);
-        projected.push(plan.add_expr_at(Expr::Column(moved), ty, span));
-        named.push(plan.intern(&format!("__branch_{position}")));
+        let column = plan.add_expr_at(Expr::Column(moved), ty, span);
+        let name = plan.intern(&format!("__branch_{position}"));
+        if position < split {
+            projected.push(column);
+            named.push(name);
+        } else {
+            behind.push((column, name));
+        }
     }
     for (position, (key, &binding)) in keys.iter().zip(&below.keys).enumerate() {
         let ty = plan.expr_type(key.expr).clone();
         projected.push(plan.add_expr_at(Expr::Column(binding), ty, span));
         named.push(plan.intern(&format!("__domain_{position}")));
+    }
+    for (column, name) in behind {
+        projected.push(column);
+        named.push(name);
     }
 
     let exprs = plan.add_expr_list(&projected);
@@ -1072,10 +1253,10 @@ fn sides(
     domain: NodeRef,
     index: u32,
     keys: &[Key],
-    outer: &TableSet,
+    outer: &Outer<'_>,
 ) -> Option<Pushed> {
-    let left_reads = correlated(plan, left, outer);
-    let right_reads = correlated(plan, right, outer);
+    let left_reads = outer.reads(plan, left);
+    let right_reads = outer.reads(plan, right);
     // A single join preserves its left side the same way a left join does. It is a left join that
     // also insists the right side hand back at most one row, and that insistence is about the rows
     // rather than about which of them survive, so it belongs here with the left join.
@@ -1186,10 +1367,10 @@ fn filtering(
     domain: NodeRef,
     index: u32,
     keys: &[Key],
-    outer: &TableSet,
+    outer: &Outer<'_>,
 ) -> Option<Pushed> {
     let first = push(plan, left, domain, index, keys, outer)?;
-    let second = if correlated(plan, right, outer) {
+    let second = if outer.reads(plan, right) {
         let (other_domain, other_index) = twin(plan, domain)?;
         Some(push(plan, right, other_domain, other_index, keys, outer)?)
     } else {
@@ -1337,6 +1518,17 @@ fn either(
     let names = plan.add_name_list(&names);
     let node = plan.add_node(Node::Project { input: node, index: at_index, exprs, names });
     Some(Pushed { node, keys: carried, moved: told })
+}
+
+/// A held definition's columns with the domain columns behind them, which is what a definition the
+/// domain was pushed into produces and what every read of it sees.
+fn carried_fields(plan: &mut Plan, columns: Slice, keys: &[Key]) -> Slice {
+    let mut fields = plan.field_list(columns).to_vec();
+    for (position, key) in keys.iter().enumerate() {
+        let ty = plan.expr_type(key.expr).clone();
+        fields.push(Field::new(format!("__domain_{position}"), ty));
+    }
+    plan.add_fields(&fields)
 }
 
 /// A binding at a position that came from counting columns rather than from the plan.
