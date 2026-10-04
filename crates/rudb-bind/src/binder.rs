@@ -282,6 +282,9 @@ struct Materialized {
     name: String,
     /// What it produces, in order, under the declared names when a column list was written.
     fields: Vec<Field>,
+    /// The number a `recurring.` read of it is paired with, which is `cte` for a definition that
+    /// does not read itself and so has no such read.
+    recurring: u32,
 }
 
 #[derive(Debug)]
@@ -691,7 +694,8 @@ impl<'a> Binder<'a> {
         let node = self.add_node(Node::Project { input: node, index: table, exprs, names });
         let cte = self.next_cte;
         self.next_cte += 1;
-        self.materialized.push(Materialized { written: index, cte, name, fields: scope.fields() });
+        let fields = scope.fields();
+        self.materialized.push(Materialized { written: index, cte, name, fields, recurring: cte });
         Ok(node)
     }
 
@@ -721,13 +725,16 @@ impl<'a> Binder<'a> {
         }
         let fields = scope.fields();
         let anchor = self.project_onto(anchor, &scope, &fields)?;
+        let key = self.recursive_key(ast, held.key, &fields)?;
         let cte = self.next_cte;
-        self.next_cte += 1;
+        let recurring = cte + 1;
+        self.next_cte += 2;
         self.materialized.push(Materialized {
             written: index,
             cte,
             name: name.clone(),
             fields: fields.clone(),
+            recurring,
         });
         let (recursive, other) = self.bind_query(ast, right)?;
         if other.len() != scope.len() {
@@ -740,6 +747,7 @@ impl<'a> Binder<'a> {
         let name = self.plan.intern(&name);
         let columns = self.plan.add_fields(&fields);
         let all = quantifier == Quantifier::All;
+        let key = self.plan.add_positions(&key);
         Ok(self.add_node(Node::RecursiveCte {
             anchor,
             recursive,
@@ -748,7 +756,56 @@ impl<'a> Binder<'a> {
             name,
             all,
             columns,
+            recurring,
+            key,
         }))
+    }
+
+    /// The positions of the columns `USING KEY (...)` names, in the order it names them.
+    ///
+    /// A key is a column of the definition, by name, the case not mattering and a qualifier not
+    /// looked at. The pin also takes an aggregate call there, which keeps a running aggregate per
+    /// key in the column it names instead of the last row's value, and that is not done yet.
+    fn recursive_key(&mut self, ast: &Ast, key: ast::Slice, fields: &[Field]) -> Result<Vec<u32>> {
+        let mut positions = Vec::new();
+        for target in ast.target_list(key) {
+            let span = ast.expr_span(target.expr);
+            match ast.expr(target.expr) {
+                ast::Expr::Column { name } => {
+                    let written = ast.name(name).last().unwrap_or_default();
+                    let Some(at) = fields.iter().position(|field| same_name(&field.name, written))
+                    else {
+                        let names: Vec<&str> =
+                            fields.iter().map(|field| field.name.as_str()).collect();
+                        return Err(Error::binder(format!(
+                            "Referenced column \"{written}\" not found in FROM clause! Candidate bindings: \"{}\"",
+                            names.join("\", \"")
+                        ))
+                        .with_span(span));
+                    };
+                    let at = at as u32;
+                    if !positions.contains(&at) {
+                        positions.push(at);
+                    }
+                }
+                ast::Expr::Function { name, .. }
+                    if kind_of(ast.name(name).last().unwrap_or_default())
+                        == Some(FunctionKind::Aggregate) =>
+                {
+                    return Err(Error::not_implemented(
+                        "an aggregate in USING KEY is not supported yet",
+                    ));
+                }
+                _ => {
+                    return Err(Error::binder(format!(
+                        "'{}' can't be used in the USING KEY clause. It has to be either a column name as a key or a direct call to an aggregate function.",
+                        rudb_parse::deparse::expression(ast, target.expr)
+                    ))
+                    .with_span(span));
+                }
+            }
+        }
+        Ok(positions)
     }
 
     /// Projects a side of a recursive definition onto the definition's columns by position, casting
@@ -2286,8 +2343,8 @@ impl<'a> Binder<'a> {
                 }
                 Ok((node, scope))
             }
-            ast::Source::Cte { cte, alias, columns } => {
-                self.bind_cte_scan(ast, cte, alias, columns)
+            ast::Source::Cte { cte, alias, columns, recurring } => {
+                self.bind_cte_scan(ast, cte, alias, columns, recurring)
             }
             ast::Source::Join { left, right, kind, natural, on, using } => {
                 self.bind_join(ast, left, right, kind, natural, on, using)
@@ -2307,12 +2364,13 @@ impl<'a> Binder<'a> {
         written: u32,
         alias: ast::StrRef,
         columns: ast::Slice,
+        recurring: bool,
     ) -> Result<(NodeRef, Scope)> {
         let Some(held) = self.materialized.iter().rev().find(|held| held.written == written) else {
             let name = ast.string(ast.cte(written).name);
             return Err(Error::binder(format!("Table with name {name} does not exist!")));
         };
-        let cte = held.cte;
+        let cte = if recurring { held.recurring } else { held.cte };
         let fields = held.fields.clone();
         let text = held.name.clone();
         let label = if alias == NONE { text.clone() } else { ast.string(alias).to_string() };

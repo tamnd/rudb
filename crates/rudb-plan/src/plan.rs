@@ -46,6 +46,8 @@ pub struct Plan {
     sort_keys: Vec<SortKey>,
     arms: Vec<Arm>,
     rows: Vec<Slice>,
+    /// Column positions, which is what a recursive definition's key is.
+    positions: Vec<u32>,
     root: NodeRef,
     /// How many rows the binder measured behind a table index, where it measured anything.
     ///
@@ -182,6 +184,7 @@ impl Plan {
             sort_keys: Vec::new(),
             arms: Vec::new(),
             rows: Vec::new(),
+            positions: Vec::new(),
             root: 0,
             measured: BTreeMap::new(),
             distincts: BTreeMap::new(),
@@ -670,6 +673,11 @@ impl Plan {
         extend(&mut self.rows, rows.iter().copied())
     }
 
+    /// Appends a run to the column position pool.
+    pub fn add_positions(&mut self, positions: &[u32]) -> Slice {
+        extend(&mut self.positions, positions.iter().copied())
+    }
+
     // Accessors. Every one panics on an out of range index rather than returning an option,
     // because a reference that does not resolve is a bug in whoever built the plan and the useful
     // thing to do with it is to stop at the place that would otherwise silently do nothing.
@@ -794,6 +802,16 @@ impl Plan {
     #[must_use]
     pub fn row_list(&self, slice: Slice) -> &[Slice] {
         &self.rows[slice.range()]
+    }
+
+    /// The column position run at `slice`.
+    ///
+    /// # Panics
+    ///
+    /// If the run is not in the pool.
+    #[must_use]
+    pub fn position_list(&self, slice: Slice) -> &[u32] {
+        &self.positions[slice.range()]
     }
 
     // Rewriters. Two of them, both narrow on purpose. A pass that wants to change what an
@@ -1486,11 +1504,23 @@ impl Plan {
                 }
                 self.checked_field_list(columns, reference)?;
             }
-            Node::CteScan { name, columns, .. } | Node::RecursiveCte { name, columns, .. } => {
+            Node::CteScan { name, columns, .. } => {
                 if name as usize >= self.strings.len() {
                     return fail("names a string that is not in the table");
                 }
                 self.checked_field_list(columns, reference)?;
+            }
+            Node::RecursiveCte { name, columns, key, .. } => {
+                if name as usize >= self.strings.len() {
+                    return fail("names a string that is not in the table");
+                }
+                let width = self.checked_field_list(columns, reference)?.len();
+                if key.start as usize + key.len as usize > self.positions.len() {
+                    return fail("names a position run that is not in the pool");
+                }
+                if self.position_list(key).iter().any(|&at| at as usize >= width) {
+                    return fail("keys on a column it does not have");
+                }
             }
             Node::SetOp { .. } => {}
             Node::Consistent { columns, reducer, .. } => {

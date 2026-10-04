@@ -498,6 +498,13 @@ pub(crate) fn build_round<'a>(
     build_from(plan, catalog, under, Some(sink), None, Vec::new(), top, held)
 }
 
+/// Whether anything under `at` reads the materialisation numbered `cte`.
+fn reads_cte(plan: &Plan, at: NodeRef, cte: u32) -> bool {
+    let node = plan.node(at);
+    matches!(*node, Node::CteScan { cte: read, .. } if read == cte)
+        || node.children().into_iter().flatten().any(|child| reads_cte(plan, child, cte))
+}
+
 /// What a recursive definition needs to build its rounds with, taken from the build of the query
 /// it is in.
 #[derive(Debug)]
@@ -508,6 +515,11 @@ pub(crate) struct Round<'a> {
     pub(crate) recursive: NodeRef,
     /// The number its reads of the round before go by.
     pub(crate) cte: u32,
+    /// The number its `recurring.` reads go by, when it has any.
+    pub(crate) recurring: Option<u32>,
+    /// Whether the side reads neither the round before nor `recurring.`, so that it makes the
+    /// same rows every time and one round is all it runs.
+    pub(crate) once: bool,
     pub(crate) cancel: Cancel,
     pub(crate) memory: Memory,
     pub(crate) seams: Settings,
@@ -3660,7 +3672,17 @@ impl<'a> Building<'a, '_> {
                 self.held.pop();
                 segment?
             }
-            Node::RecursiveCte { anchor, recursive, index, cte, all, columns, .. } => {
+            Node::RecursiveCte {
+                anchor,
+                recursive,
+                index,
+                cte,
+                all,
+                columns,
+                recurring,
+                key,
+                ..
+            } => {
                 // The anchor ends here, and the rounds run in this node's finish, each one a query
                 // of its own built over the rows the round before made. See `crate::recursive`.
                 // The materialisations the rounds can read are filled before the anchor starts,
@@ -3668,18 +3690,22 @@ impl<'a> Building<'a, '_> {
                 let mut below = self.node(anchor)?;
                 below.after.extend(self.held.iter().filter_map(|held| held.filling));
                 let schema = Schema::numbered(plan.field_list(columns).to_vec(), index);
+                let recurring = reads_cte(plan, recursive, recurring).then_some(recurring);
                 let round = Round {
                     plan,
                     catalog: self.catalog,
                     recursive,
                     cte,
+                    recurring,
+                    once: recurring.is_none() && !reads_cte(plan, recursive, cte),
                     cancel: self.cancel.clone(),
                     memory: memory.clone(),
                     seams: self.seams.clone(),
                     session: self.session.clone(),
                     outer: self.held.iter().map(|held| (held.cte, held.chunks.clone())).collect(),
                 };
-                let (fixpoint, out) = Fixpoint::new(round, schema.clone(), all);
+                let key = plan.position_list(key).iter().map(|&at| at as usize).collect();
+                let (fixpoint, out) = Fixpoint::new(round, schema.clone(), all, key);
                 let counters = self.watch(reference, id, pipeline, "RecursiveCTE", None);
                 let reading = Arc::clone(&counters);
                 self.close(below, pipeline, Arc::new(Watched::new(fixpoint, counters)));

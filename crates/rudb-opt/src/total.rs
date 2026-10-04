@@ -376,11 +376,12 @@ fn rewrite(plan: &mut Plan, found: &Found) {
 fn next_cte(plan: &Plan) -> u32 {
     let mut next = 0;
     for at in 0..plan.node_count() {
-        if let Node::MaterializedCte { cte, .. }
-        | Node::RecursiveCte { cte, .. }
-        | Node::CteScan { cte, .. } = *plan.node(u32::try_from(at).unwrap_or(u32::MAX))
-        {
-            next = next.max(cte + 1);
+        match *plan.node(u32::try_from(at).unwrap_or(u32::MAX)) {
+            Node::MaterializedCte { cte, .. } | Node::CteScan { cte, .. } => {
+                next = next.max(cte + 1);
+            }
+            Node::RecursiveCte { cte, recurring, .. } => next = next.max(cte.max(recurring) + 1),
+            _ => {}
         }
     }
     next

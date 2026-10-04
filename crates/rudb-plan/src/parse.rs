@@ -401,6 +401,7 @@ impl Reader<'_> {
             "RecursiveCte" => {
                 let name = read_name(plan, c)?;
                 let cte = read_cte_index(c)?;
+                let recurring = read_cte_index(c)?;
                 let all = if c.eat_word("ALL") {
                     true
                 } else if c.eat_word("DISTINCT") {
@@ -408,6 +409,18 @@ impl Reader<'_> {
                 } else {
                     return Err(c.error("expected ALL or DISTINCT"));
                 };
+                let mut positions = Vec::new();
+                if c.eat_word("KEY") {
+                    c.expect("(")?;
+                    loop {
+                        positions.push(read_number(c)?);
+                        if !c.eat_space_then(",") {
+                            break;
+                        }
+                    }
+                    c.expect(")")?;
+                }
+                let key = plan.add_positions(&positions);
                 let index = read_table_index(c)?;
                 let columns = read_schema(plan, c)?;
                 Ok(Built {
@@ -420,6 +433,8 @@ impl Reader<'_> {
                         name,
                         all,
                         columns,
+                        recurring,
+                        key,
                     }),
                 })
             }

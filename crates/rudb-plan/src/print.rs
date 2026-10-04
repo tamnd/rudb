@@ -241,11 +241,17 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             write!(out, " @{cte} #{index} ")?;
             write_schema(plan, out, columns)
         }
-        Node::RecursiveCte { index, cte, name, all, columns, .. } => {
+        Node::RecursiveCte { index, cte, name, all, columns, recurring, key, .. } => {
             out.write_char(' ')?;
             write_identifier(out, plan.string(name))?;
             let quantifier = if all { "ALL" } else { "DISTINCT" };
-            write!(out, " @{cte} {quantifier} #{index} ")?;
+            write!(out, " @{cte} @{recurring} {quantifier} ")?;
+            if !key.is_empty() {
+                let positions: Vec<String> =
+                    plan.position_list(key).iter().map(u32::to_string).collect();
+                write!(out, "KEY ({}) ", positions.join(", "))?;
+            }
+            write!(out, "#{index} ")?;
             write_schema(plan, out, columns)
         }
         Node::SetOp { kind, all, index, .. } => {

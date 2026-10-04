@@ -583,6 +583,16 @@ pub enum Node {
         all: bool,
         /// The produced columns with their types, into the field pool.
         columns: Slice,
+        /// Which materialisation a `recurring.` read inside `recursive` names, which is every row
+        /// produced so far, as it stood when the round began.
+        recurring: u32,
+        /// The positions of the `USING KEY` columns, into the position pool, empty without one.
+        ///
+        /// With a key the produced rows are a table keyed on those columns. A row whose key is
+        /// already there replaces the row that had it, the last one winning within a round. With
+        /// `all` set the next round reads every row this one made, and without it only the rows
+        /// that changed what the table holds for their key.
+        key: Slice,
     },
     /// A MIN or MAX over an acyclic chain of inner equi-joins, answered without running the join.
     ///

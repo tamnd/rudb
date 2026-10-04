@@ -149,8 +149,16 @@ fn with(ast: &Ast, ctes: Slice) -> String {
                 format!(" ({})", names(ast, held.columns))
             };
             if held.recursive {
+                // A key is followed by two spaces, which is the pin's spacing. Measured.
+                let key = if held.key.is_empty() {
+                    String::new()
+                } else {
+                    let written: Vec<String> =
+                        ast.target_list(held.key).iter().map(|key| aliased(ast, key)).collect();
+                    format!(" USING KEY ({}) ", written.join(", "))
+                };
                 return format!(
-                    "{}{columns} AS ({})",
+                    "{}{columns}{key} AS ({})",
                     quoted(ast.string(held.name)),
                     recursive(ast, held.query)
                 );
@@ -276,8 +284,10 @@ fn source(ast: &Ast, index: SourceRef) -> String {
         Source::Table { name, alias, columns } => label(ast, parts(ast, name), alias, columns),
         // The name it was written with, since the definition is somewhere else in the tree and a
         // reference to it is a name where a table goes.
-        Source::Cte { cte, alias, columns } => {
-            label(ast, quoted(ast.string(ast.cte(cte).name)), alias, columns)
+        Source::Cte { cte, alias, columns, recurring } => {
+            let name = quoted(ast.string(ast.cte(cte).name));
+            let name = if recurring { format!("recurring.{name}") } else { name };
+            label(ast, name, alias, columns)
         }
         Source::Subquery { query: inner, alias, columns } => {
             label(ast, format!("({})", query(ast, inner)), alias, columns)
@@ -1126,6 +1136,18 @@ mod tests {
         assert_eq!(
             body("WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n FROM t) SELECT * FROM t"),
             "WITH RECURSIVE t (n) AS ((SELECT 1) UNION (SELECT n FROM t))SELECT * FROM t"
+        );
+        assert_eq!(
+            body(
+                "WITH RECURSIVE t(k, v) USING KEY (k) AS (SELECT 1, 0 UNION SELECT k, v + 1 FROM recurring.t WHERE v < 2) SELECT * FROM t"
+            ),
+            "WITH RECURSIVE t (k, v) USING KEY (k)  AS ((SELECT 1, 0) UNION (SELECT k, (v + 1) FROM recurring.t WHERE (v < 2)))SELECT * FROM t"
+        );
+        assert_eq!(
+            body(
+                "WITH RECURSIVE t(k, v) USING KEY (k, v) AS (SELECT 1, 0 UNION SELECT r.k + 1, r.v FROM t, recurring.t AS r WHERE t.k < 2) SELECT * FROM t"
+            ),
+            "WITH RECURSIVE t (k, v) USING KEY (k, v)  AS ((SELECT 1, 0) UNION (SELECT (r.k + 1), r.v FROM t , recurring.t AS r WHERE (t.k < 2)))SELECT * FROM t"
         );
     }
 
