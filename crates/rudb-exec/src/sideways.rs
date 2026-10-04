@@ -394,6 +394,60 @@ impl Domain {
         })
     }
 
+    /// Drops from `rows` every row whose key the build side does not hold, for rows a filter before
+    /// this one kept. `rows` are in order and inside `keys`.
+    ///
+    /// [`Self::kept`] reads every row of a chunk a block at a time, and this reads only the rows it
+    /// is given, a code at a time for a packed key. A row costs more this way, so it pays only when
+    /// the filter before it threw most of the chunk away, which the scan times rather than guesses,
+    /// see `Order` in `source.rs`. The rows are moved down in place without a branch on the answer,
+    /// since a bitmap that keeps a row in a hundred and one that keeps half of them both run here.
+    pub(crate) fn retain(&self, keys: &Vector, rows: &mut Vec<u32>) {
+        fn compact(rows: &mut Vec<u32>, mut held: impl FnMut(usize) -> bool) {
+            let mut kept = 0;
+            for at in 0..rows.len() {
+                let row = rows[at];
+                rows[kept] = row;
+                kept += usize::from(held(row as usize));
+            }
+            rows.truncate(kept);
+        }
+        let armed = i64::try_from(self.base).ok().filter(|_| self.range < 1 << 62);
+        let none_null = keys.none_null();
+        let valid = |row: usize| none_null || !keys.is_null_at(row);
+        if let Some(base) = armed {
+            if let Some(packed) = keys.packed_parts()
+                && let Ok(frame) = i64::try_from(packed.base())
+            {
+                let shift = frame.wrapping_sub(base) as u64;
+                return compact(rows, |row| {
+                    self.bit(packed.code(row).wrapping_add(shift)) && valid(row)
+                });
+            }
+            macro_rules! flat {
+                ($values:expr) => {{
+                    let values = $values.as_slice();
+                    return compact(rows, |row| {
+                        values.get(row).is_some_and(|&key| {
+                            self.bit(i64::from(key).wrapping_sub(base) as u64)
+                        }) && valid(row)
+                    });
+                }};
+            }
+            match keys.data() {
+                Some(Data::Int8(values)) => flat!(values),
+                Some(Data::Int16(values)) => flat!(values),
+                Some(Data::Int32(values)) => flat!(values),
+                Some(Data::Int64(values)) => flat!(values),
+                _ => {}
+            }
+        }
+        compact(rows, |row| {
+            let key = keys.signed_at(row).and_then(|key| i64::try_from(key).ok());
+            key.is_some_and(|key| self.holds(key))
+        });
+    }
+
     /// The two faster forms of [`Self::kept`], which read every row as if it held a key, and `None`
     /// on a column in neither form.
     fn unmasked(&self, keys: &Vector, rows: usize, base: i64) -> Option<Kept> {
