@@ -83,10 +83,21 @@ fn what_goes_through_the_plan_is_named_a_pipeline() {
     let later = db.prepare("SELECT * FROM later WHERE id = ?").expect("prepares");
     db.execute("CREATE TABLE later (id INTEGER PRIMARY KEY, v VARCHAR)").expect("creates");
     assert_eq!(later.explain(), "POINT Lookup later(id)");
-    // Inside a transaction everything goes through the plan.
+    // Inside a transaction everything but an insert goes through the plan, and an insert too once
+    // the transaction is read only or aborted.
     let read = db.prepare("SELECT * FROM usertable WHERE ycsb_key = ?").expect("prepares");
+    let insert = db.prepare("INSERT INTO usertable VALUES (?, ?, ?, ?)").expect("prepares");
     db.execute("BEGIN").expect("begins");
     assert_eq!(read.explain(), "PIPELINE");
+    assert_eq!(insert.explain(), "InsertOne usertable");
+    let row = |key: &str| [key, "a", "b", "c"].map(|text| Value::Varchar(text.into()));
+    insert.execute(&row("k")).expect("inserts");
+    insert.execute(&row("k")).expect_err("a duplicate");
+    assert_eq!(insert.explain(), "PIPELINE");
+    db.execute("ROLLBACK").expect("rolls back");
+    db.execute("BEGIN TRANSACTION READ ONLY").expect("begins");
+    assert_eq!(insert.explain(), "PIPELINE");
     db.execute("COMMIT").expect("commits");
     assert_eq!(read.explain(), "POINT Lookup usertable(ycsb_key)");
+    assert_eq!(insert.explain(), "InsertOne usertable");
 }

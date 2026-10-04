@@ -131,8 +131,14 @@ impl Written {
         if let Some(origin) = self.origin.as_mut() {
             origin.extend(std::iter::repeat_n(u64::MAX, added));
         }
+        // Onto the insert before it when there is one, so a load of one row at a time keeps one
+        // list of rows rather than a change for each.
         if let Some(changes) = self.changes.as_mut() {
-            changes.extend(chunks.iter().map(|chunk| Change::Insert(vec![chunk.clone()])));
+            if let Some(Change::Insert(last)) = changes.last_mut() {
+                last.extend(chunks.iter().cloned());
+            } else {
+                changes.push(Change::Insert(chunks.to_vec()));
+            }
         }
     }
 

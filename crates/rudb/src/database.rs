@@ -3736,12 +3736,13 @@ impl Shared {
         })
     }
 
-    /// Runs a statement under whatever transaction is open.
+    /// Runs a statement under whatever transaction is open, a prepared one as much as one given as
+    /// text.
     ///
     /// A transaction a statement failed in is aborted, and until it is closed every statement but
     /// the one closing it is refused with the pin's sentence. A statement that did not parse leaves
     /// the transaction as it was, because on the pin it never reached one.
-    fn in_transaction(
+    pub(crate) fn in_transaction(
         &self,
         sql: &str,
         run: impl FnOnce() -> Result<QueryResult>,
@@ -3770,21 +3771,27 @@ impl Shared {
             return Err(Error::transaction("Current transaction is aborted (please ROLLBACK)"));
         }
         let result = run();
-        // A statement rudb does not run yet leaves the transaction open. The pin would have run it,
-        // so aborting here would turn one gap into a refusal of everything after it. Under
-        // `SYNTACTIC_ERRORS_DO_NOT_INVALIDATE` a binder or catalog error leaves it open too, and
-        // on the pin that goes by the kind of error rather than by where it was raised, so a
-        // `CREATE TABLE` of a name that is taken leaves it open and a failed cast does not.
-        let keeps = self.inner.settings.syntactic_errors_keep_transaction();
-        let aborts = result.as_ref().err().is_some_and(|error| match error.code() {
-            rudb_common::ErrorCode::Parser | rudb_common::ErrorCode::NotImplemented => false,
-            rudb_common::ErrorCode::Binder | rudb_common::ErrorCode::Catalog => !keeps,
-            _ => true,
-        });
+        let aborts = result.as_ref().err().is_some_and(|error| self.aborts(error));
         if aborts && let Some(open) = self.open().as_mut() {
             open.aborted = true;
         }
         result
+    }
+
+    /// Whether `error` from a statement aborts the transaction it ran in.
+    ///
+    /// A statement rudb does not run yet leaves the transaction open. The pin would have run it,
+    /// so aborting here would turn one gap into a refusal of everything after it. Under
+    /// `SYNTACTIC_ERRORS_DO_NOT_INVALIDATE` a binder or catalog error leaves it open too, and on
+    /// the pin that goes by the kind of error rather than by where it was raised, so a `CREATE
+    /// TABLE` of a name that is taken leaves it open and a failed cast does not.
+    fn aborts(&self, error: &Error) -> bool {
+        let keeps = self.inner.settings.syntactic_errors_keep_transaction();
+        match error.code() {
+            rudb_common::ErrorCode::Parser | rudb_common::ErrorCode::NotImplemented => false,
+            rudb_common::ErrorCode::Binder | rudb_common::ErrorCode::Catalog => !keeps,
+            _ => true,
+        }
     }
 
     /// The open transaction, if there is one.
@@ -3855,6 +3862,11 @@ impl Shared {
     /// then the commit. A key or a unique index is the table's own to check, which it does in the
     /// same words for this row as for the plan's, and it notes where the row's keys are as it
     /// goes, so a lookup by key after it finds the row without looking through the table again.
+    ///
+    /// Inside a transaction the row goes into the transaction's own catalog and log without the
+    /// writer lock, as the plan's insert does there: a key some other transaction committed since
+    /// the snapshot is refused, the row is noted for the commit, and a failure aborts the
+    /// transaction. That is how a load in batches inside `BEGIN` and `COMMIT` arrives.
     pub(crate) fn insert_direct(
         &self,
         direct: &crate::prepared::Direct,
@@ -3864,22 +3876,19 @@ impl Shared {
         if !self.inner.writable {
             return None;
         }
-        let writing = self.writing();
-        // Inside a transaction the row would have to be noted for the commit, which the path
-        // through the plan does.
-        if self.transacting() {
-            return None;
-        }
+        // An aborted or read only transaction is refused by the plan, in its words.
+        let transacting = match self.open().as_ref() {
+            Some(open) if open.aborted || open.read_only => return None,
+            open => open.is_some(),
+        };
+        let writing = (!transacting).then(|| self.writing());
         let mut catalog = self.write();
         let (name, targets) = match direct.found.take(catalog.generation()) {
             Some(found) => found,
             None => direct_targets(&catalog, direct)?,
         };
-        // Found once and changed in place. A row that turns back after this has marked the catalog
-        // changed for nothing, which costs a plan made against it being made again and nothing more.
         let journals = self.journals(&name);
-        let table = catalog.table_appending(&name).ok()?;
-        let fields = table.columns();
+        let fields = catalog.table(&name).ok()?.columns();
         // The values as they were given are the row when there is one for each column, in order,
         // and each is already its column's type, and then the table reads them where they are.
         // Anything else is gathered into a row of its own, which copies every value.
@@ -3910,18 +3919,41 @@ impl Shared {
             }
         };
         let staged = journals.then(|| [row.to_vec()]);
+        // The row as a chunk, for what a transaction checks it against and notes it as.
+        let noted = if transacting {
+            let columns = fields
+                .iter()
+                .zip(row)
+                .map(|(field, value)| {
+                    Vector::from_values(field.ty.clone(), std::slice::from_ref(value))
+                })
+                .collect::<Result<Vec<_>>>()
+                .and_then(Chunk::new);
+            Some(columns.ok()?)
+        } else {
+            None
+        };
         let result = kept(sql, 0, |_| {
+            if let Some(chunk) = &noted {
+                self.refuse_keys_since(&catalog, &name, std::slice::from_ref(chunk))?;
+            }
+            let table = catalog.table_appending(&name)?;
             table.append_row(row)?;
+            if let Some(chunk) = noted {
+                self.wrote(table.oid(), |written, _| written.appended(&[chunk]));
+            }
             if let Some(rows) = &staged {
                 self.stage_rows(&name, table.columns(), rows);
             }
             QueryResult::changed(1)
         });
+        // A failure aborts an open transaction in `in_transaction`, which every prepared statement
+        // runs under.
         if result.is_ok() {
             direct.found.keep(catalog.generation(), name, targets);
         }
         drop(catalog);
-        let settled = self.settle(writing);
+        let settled = writing.map_or(Ok(()), |writing| self.settle(writing));
         Some(result.and_then(|result| settled.map(|()| result)))
     }
 
@@ -4039,7 +4071,13 @@ impl Shared {
     /// that would not fit its column, goes through the plan whatever this says.
     pub(crate) fn point_plan(&self, shape: crate::prepared::Shape<'_>) -> Option<String> {
         use crate::prepared::Shape;
-        if self.transacting() {
+        // Inside a transaction only an insert skips the plan, and not in one that is aborted or
+        // read only.
+        let refused = match self.open().as_ref() {
+            Some(open) => open.aborted || open.read_only || !matches!(shape, Shape::Insert(_)),
+            None => false,
+        };
+        if refused {
             return None;
         }
         let catalog = self.read();
