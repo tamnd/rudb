@@ -1368,6 +1368,7 @@ fn check_text(
             qualified: false,
             also: None,
             hidden: false,
+            using: None,
         });
     }
     match binder.bind_expr(ast, expr, &scope) {

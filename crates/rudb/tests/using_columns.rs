@@ -91,6 +91,41 @@ fn a_right_or_full_join_reads_the_key_from_whichever_side_has_it() {
     }
 }
 
+/// The names and the one row of a query, in the form the pin's `-list` mode prints them.
+fn named(database: &Database, sql: &str) -> [String; 2] {
+    let result = database.query(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    [result.names().join("|"), answered(database, sql).join(" ")]
+}
+
+#[test]
+fn a_bare_star_puts_the_key_at_the_first_copy_it_keeps() {
+    let database = Database::new();
+    let two = "FROM (SELECT 1 k, 2 x) a JOIN (SELECT 1 k, 3 y) b USING (k)";
+    let three = "FROM (SELECT 1 k, 2 x) a JOIN (SELECT 1 k, 3 y) b USING (k) JOIN (SELECT 1 k, 4 z) \
+                 c USING (k)";
+    let full = "FROM (SELECT 1 k, 2 x) a FULL JOIN (SELECT 5 k, 3 y) b USING (k)";
+    for (sql, expected) in [
+        (format!("SELECT * EXCLUDE (a.k) {two}"), ["x|k|y", "2|1|3"]),
+        (format!("SELECT * EXCLUDE (k) {two}"), ["x|y", "2|3"]),
+        (format!("SELECT COLUMNS(* EXCLUDE (a.k)) {two}"), ["x|k|y", "2|1|3"]),
+        (format!("SELECT * EXCLUDE (a.k) {three}"), ["x|k|y|z", "2|1|3|4"]),
+        (format!("SELECT * EXCLUDE (a.k, b.k) {three}"), ["x|y|k|z", "2|3|1|4"]),
+        (format!("SELECT * EXCLUDE (a.k) {full} ORDER BY ALL"), ["x|k|y", "2|1|NULL NULL|5|3"]),
+        (format!("SELECT * EXCLUDE (a.k, b.k) {full} ORDER BY ALL"), ["x|y", "2|NULL NULL|3"]),
+        (format!("SELECT * RENAME (a.k AS n) {two}"), ["n|x|y", "1|2|3"]),
+        (format!("SELECT * RENAME (b.k AS n) {two}"), ["k|x|y", "1|2|3"]),
+        (format!("SELECT * RENAME (b.k AS n, a.k AS m) {two}"), ["m|x|y", "1|2|3"]),
+        (format!("SELECT * EXCLUDE (a.k) RENAME (b.k AS n) {two}"), ["x|n|y", "2|1|3"]),
+        (format!("SELECT * RENAME (a.k AS n) {full} ORDER BY ALL"), ["n|x|y", "1|2|NULL 5|NULL|3"]),
+        (
+            format!("SELECT * REPLACE (k + 10 AS k) {full} ORDER BY ALL"),
+            ["k|x|y", "11|2|NULL 15|NULL|3"],
+        ),
+    ] {
+        assert_eq!(named(&database, &sql), expected, "{sql}");
+    }
+}
+
 #[test]
 fn a_recursive_side_can_name_the_key_of_the_state_it_joined_to() {
     let database = Database::new();

@@ -37,7 +37,7 @@ use rudb_plan::{
 use crate::expr::{describe, has_aggregate};
 use crate::fold;
 use crate::parameters::Parameters;
-use crate::scope::{Scope, Visible};
+use crate::scope::{Joined, Scope, Visible};
 
 /// Binds a parsed statement against a catalog.
 ///
@@ -1023,6 +1023,7 @@ impl<'a> Binder<'a> {
                 qualified: false,
                 also: None,
                 hidden: false,
+                using: None,
             });
         }
         let exprs = self.plan.add_expr_list(&exprs);
@@ -1120,6 +1121,7 @@ impl<'a> Binder<'a> {
             qualified: false,
             also: None,
             hidden: false,
+            using: None,
         });
         Ok((node, scope))
     }
@@ -1196,6 +1198,7 @@ impl<'a> Binder<'a> {
                 qualified: false,
                 also: None,
                 hidden: false,
+                using: None,
             });
         }
         let keys = self.sort_keys(ast, query, &scope, &[])?;
@@ -1364,6 +1367,7 @@ impl<'a> Binder<'a> {
                 qualified: false,
                 also: None,
                 hidden: false,
+                using: None,
             });
         }
         let keys = self.sort_keys(ast, query, &scope, &[])?;
@@ -1418,6 +1422,7 @@ impl<'a> Binder<'a> {
                 qualified: false,
                 also: None,
                 hidden: false,
+                using: None,
             });
         }
         // Above a set operation there is nothing but the output columns, so an ORDER BY term is
@@ -1677,6 +1682,7 @@ impl<'a> Binder<'a> {
                 qualified: false,
                 also: None,
                 hidden: false,
+                using: None,
             });
         }
 
@@ -1795,6 +1801,7 @@ impl<'a> Binder<'a> {
                 qualified: false,
                 also: None,
                 hidden: false,
+                using: None,
             });
         }
         let exprs = self.plan.add_expr_list(&kept);
@@ -2624,6 +2631,7 @@ impl<'a> Binder<'a> {
                 qualified: false,
                 also: None,
                 hidden: false,
+                using: None,
             });
         }
         if !columns.is_empty() {
@@ -2699,6 +2707,7 @@ impl<'a> Binder<'a> {
                 qualified: excluded,
                 also: None,
                 hidden: false,
+                using: None,
             });
         }
         if !columns.is_empty() {
@@ -3243,6 +3252,7 @@ impl<'a> Binder<'a> {
                 qualified: false,
                 also: None,
                 hidden: false,
+                using: None,
             });
         }
         if !columns.is_empty() {
@@ -3608,6 +3618,7 @@ impl<'a> Binder<'a> {
                 qualified: false,
                 also: None,
                 hidden: false,
+                using: None,
             });
         }
         if !names.is_empty() {
@@ -3985,6 +3996,27 @@ impl<'a> Binder<'a> {
         // join is built. See `Binder::merged`.
         let outer = matches!(kind, ast::JoinKind::Right | ast::JoinKind::Full);
         for &(left_at, right_at) in &pairs {
+            // The two copies join one group, and so does anything already in a group with either,
+            // which is a column joined on again in a chain of joins.
+            let group =
+                scope.columns[left_at].using.map_or(scope.columns[left_at].binding, Joined::group);
+            let before = [&scope.columns[left_at], &scope.columns[right_at]]
+                .map(|column| column.using.map(Joined::group));
+            for column in &mut scope.columns {
+                if let Some(joined) = column.using
+                    && before.contains(&Some(joined.group()))
+                {
+                    column.using = Some(match joined {
+                        Joined::Copy(_) => Joined::Copy(group),
+                        Joined::Merged(_) => Joined::Merged(group),
+                    });
+                }
+            }
+            for at in [left_at, right_at] {
+                if scope.columns[at].using.is_none() {
+                    scope.columns[at].using = Some(Joined::Copy(group));
+                }
+            }
             scope.columns[right_at].hidden = true;
             if outer {
                 scope.columns[left_at].hidden = true;
@@ -4136,6 +4168,7 @@ impl<'a> Binder<'a> {
         made.sort_by_key(|&(left_at, ..)| left_at);
         for (left_at, binding, ty) in made.into_iter().rev() {
             let name = scope.columns[left_at].name.clone();
+            let using = scope.columns[left_at].using.map(|joined| Joined::Merged(joined.group()));
             scope.columns.insert(
                 left_at,
                 Visible {
@@ -4149,6 +4182,7 @@ impl<'a> Binder<'a> {
                     qualified: false,
                     also: None,
                     hidden: false,
+                    using,
                 },
             );
         }

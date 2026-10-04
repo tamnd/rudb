@@ -57,6 +57,32 @@ pub(crate) struct Visible {
     /// it was, reachable with its table in front, and is left out of everything that reads a bare
     /// name or a bare star.
     pub(crate) hidden: bool,
+    /// Which joined-on column this is a copy of, or the column a bare name reads for, when it is
+    /// either. See `Joined`.
+    pub(crate) using: Option<Joined>,
+}
+
+/// The place a column has among the copies of one column a `USING` or `NATURAL` join joined on.
+///
+/// Each copy and the column a bare name reads for them carry the same group, which is the binding
+/// the first left copy had when the join was bound. A bare star needs it: on the pin it walks the
+/// copies in order and puts the column where the first one `EXCLUDE` does not name is, so `*
+/// EXCLUDE (a.k)` over `a JOIN b USING (k)` has `k` where `b.k` was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Joined {
+    /// One side's own copy, which `a.k` reads.
+    Copy(ColumnBinding),
+    /// The column a `RIGHT` or `FULL` join puts in front of the left copy for a bare name to read.
+    Merged(ColumnBinding),
+}
+
+impl Joined {
+    /// The group the column is in.
+    pub(crate) fn group(self) -> ColumnBinding {
+        match self {
+            Joined::Copy(group) | Joined::Merged(group) => group,
+        }
+    }
 }
 
 /// The columns a name can resolve against.
@@ -324,6 +350,7 @@ mod tests {
             qualified: false,
             also: None,
             hidden: false,
+            using: None,
         });
         scope.push(Visible {
             table: "hits".into(),
@@ -336,6 +363,7 @@ mod tests {
             qualified: false,
             also: None,
             hidden: false,
+            using: None,
         });
         scope.push(Visible {
             table: "visits".into(),
@@ -348,6 +376,7 @@ mod tests {
             qualified: false,
             also: None,
             hidden: false,
+            using: None,
         });
         scope
     }
