@@ -428,9 +428,10 @@ impl Domain {
                 ($values:expr) => {{
                     let values = $values.as_slice();
                     return compact(rows, |row| {
-                        values.get(row).is_some_and(|&key| {
-                            self.bit(i64::from(key).wrapping_sub(base) as u64)
-                        }) && valid(row)
+                        values
+                            .get(row)
+                            .is_some_and(|&key| self.bit(i64::from(key).wrapping_sub(base) as u64))
+                            && valid(row)
                     });
                 }};
             }

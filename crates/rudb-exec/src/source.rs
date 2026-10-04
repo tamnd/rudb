@@ -2287,11 +2287,7 @@ impl<'a> Scan<'a> {
 
     /// The bitmaps [`Self::sift_exact_but`] runs over `chunk`, in the order it runs them, each with
     /// its rank, its count, the column it reads and the bitmap.
-    fn exact_tests<'s>(
-        &'s self,
-        chunk: &Chunk,
-        done: Option<&Arc<Sideways<'a>>>,
-    ) -> Bitmaps<'s> {
+    fn exact_tests<'s>(&'s self, chunk: &Chunk, done: Option<&Arc<Sideways<'a>>>) -> Bitmaps<'s> {
         let handoffs = || {
             let own = self.sideways.iter().map(|sideways| (sideways, &self.paying));
             own.chain(self.also.iter().map(|(sideways, paying)| (sideways, paying)))
