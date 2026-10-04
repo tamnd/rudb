@@ -469,6 +469,18 @@ pub fn decode_prefix(bytes: &[u8]) -> Result<(Vec<i64>, usize)> {
     Ok((values, reader.used()))
 }
 
+/// Whether the chunk at the front of `bytes` is a stride, values that are a base and a multiple of
+/// one step apart, the way a decimal quantity of whole units is.
+///
+/// A reader that holds what it decodes asks this to choose the form it holds it in. A stride is a
+/// narrow range of codes that decodes to a wide range of values, so held flat it is eight bytes a
+/// row where packed over the range it is a few bits, while a delta chunk, the way a sorted key is
+/// written, is read by runs that are faster over flat values.
+#[must_use]
+pub fn is_strided(bytes: &[u8]) -> bool {
+    bytes.first().and_then(|&tag| Kind::from_tag(tag).ok()) == Some(Kind::Strided)
+}
+
 /// [`describe`] over a chunk at the front of a longer buffer, and how many bytes it took.
 ///
 /// # Errors
@@ -1930,6 +1942,7 @@ mod tests {
         let bytes = round_trip(&values);
         assert_eq!(kind_of(&bytes), Kind::Strided);
         assert!(describe(&bytes).unwrap().starts_with("STRIDE[1000000]"), "{:?}", describe(&bytes));
+        assert!(is_strided(&bytes), "a reader asks this to hold the column packed");
         // 17 bits a value for the range of seconds, against the 36 the microseconds need.
         let strided = 100_000 * 17 / 8;
         assert!(bytes.len() < strided + 2000, "{} bytes for {strided} of payload", bytes.len());
@@ -2009,6 +2022,7 @@ mod tests {
         let bytes = round_trip(&values);
         assert_eq!(kind_of(&bytes), Kind::Delta);
         assert_eq!(describe(&bytes).unwrap(), "DELTA(CONSTANT)");
+        assert!(!is_strided(&bytes), "a delta is held flat");
         assert!(bytes.len() < 40, "{} bytes for a counter", bytes.len());
     }
 
