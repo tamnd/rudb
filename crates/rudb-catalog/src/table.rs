@@ -1611,8 +1611,8 @@ pub struct Table {
     /// row number `n` means for every row both of them have.
     frame: u64,
     /// Which placing of the keys this is. A write that leaves every key in the row it was in, an
-    /// update of other columns where the rows are, keeps it, and anything else draws a new one,
-    /// which is what tells `points` to look again.
+    /// update of other columns where the rows are or an append, keeps it, and anything else draws
+    /// a new one, which is what tells `points` to look again.
     placed: u64,
     /// Where the row of each key is, built the first time a lookup by key asks.
     points: Points,
@@ -2211,7 +2211,20 @@ impl Table {
         committing: bool,
     ) -> Result<()> {
         let seen = self.appended_keys(&chunks, committing)?;
-        self.rows.to_append()?.append_all(chunks, workers)?;
+        let appending = self.points.appending(&chunks)?;
+        let before = self.rows.len() as u64;
+        // Rows appended after a delete are laid out again with the rest, see `Rows::to_append`,
+        // which can move where any part starts. Otherwise only the last part can change.
+        let from = match self.rows {
+            Rows::Masked(..) => 0,
+            _ => self.rows.chunk_count().saturating_sub(1),
+        };
+        if let Err(error) = self.rows.to_append().and_then(|rows| rows.append_all(chunks, workers))
+        {
+            self.points = Points::default();
+            return Err(error);
+        }
+        self.points.appended(appending, &self.rows, before, from);
         self.hold_keys(seen);
         Ok(())
     }
