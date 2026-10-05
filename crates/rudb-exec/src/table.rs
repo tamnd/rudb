@@ -1102,18 +1102,14 @@ impl CodedColumn<'_> {
             match self.places {
                 Places::Codes { codes, .. } => {
                     for (row, place) in into.iter_mut().enumerate() {
-                        let code =
-                            if column.is_null_at(row) { nothing } else { codes[row] };
+                        let code = if column.is_null_at(row) { nothing } else { codes[row] };
                         *place += code * stride;
                     }
                 }
                 Places::Bits { packed } => {
                     for (row, place) in into.iter_mut().enumerate() {
-                        let code = if column.is_null_at(row) {
-                            nothing
-                        } else {
-                            packed.code(row) as u32
-                        };
+                        let code =
+                            if column.is_null_at(row) { nothing } else { packed.code(row) as u32 };
                         *place += code * stride;
                     }
                 }
