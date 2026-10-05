@@ -122,7 +122,7 @@ rudb-cli = 18
 # The PostgreSQL server: listeners, sessions, TLS, authentication and cancel. Rank 18 beside the
 # shell, because it depends on rudb and may load extensions, and neither of the two depends on the
 # other. It is the only crate that knows a socket exists.
-# rudb-server = 18, which goes in with the crate.
+rudb-server = 18
 # A command line tool over the native format that builds a file's optional sorted projections. It is
 # a surface like the shell, so it sits with them rather than beside the format it writes.
 rudb-projection = 18

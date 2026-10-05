@@ -3969,6 +3969,16 @@ impl Shared {
         }
     }
 
+    /// Where the connection is in a transaction block.
+    pub(crate) fn block(&self) -> crate::connection::Transaction {
+        use crate::connection::Transaction;
+        match self.open().as_ref() {
+            None => Transaction::Idle,
+            Some(open) if open.aborted => Transaction::Aborted,
+            Some(_) => Transaction::Open,
+        }
+    }
+
     /// The open transaction, if there is one.
     fn open(&self) -> MutexGuard<'_, Option<Open>> {
         self.conn.open.lock().unwrap_or_else(PoisonError::into_inner)

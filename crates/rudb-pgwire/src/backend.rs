@@ -71,6 +71,12 @@ impl OutBuf {
         &self.bytes
     }
 
+    /// The bytes, for a writer that adds whole messages itself, such as the `DataRow` encoder of
+    /// `rudb-pgtypes`.
+    pub fn bytes_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
+
     pub fn len(&self) -> usize {
         self.bytes.len()
     }

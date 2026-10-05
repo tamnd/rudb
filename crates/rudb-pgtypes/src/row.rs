@@ -26,10 +26,11 @@ use crate::error::TypeError;
 use crate::float::{float4_out, float8_out};
 use crate::generated::oids;
 use crate::number::{int_out, u64_out};
-use crate::numeric::{decimal_out, decimal_send};
+use crate::numeric::{decimal_out, decimal_send, numeric_in, numeric_send};
 use crate::reg::RegKind;
 use crate::scalar::{ByteaOutput, bool_out, bytea_out, char_out, uuid_out};
-use crate::types::{Oid, format_type};
+use crate::types::{Oid, PgType, format_type};
+use crate::typmod::numeric_typmod;
 
 /// The settings of the session that the text output reads.
 #[derive(Clone, Copy)]
@@ -78,6 +79,47 @@ enum Kind {
     TimestampTz,
     Interval,
     Uuid,
+    /// A column of the type of an untyped `NULL`. Every value is NULL.
+    Null,
+    /// A rudb type with no PostgreSQL type of its own, sent as the text of each value. When
+    /// `numeric` is true the column is sent as `numeric`, and the binary format is the binary
+    /// format of that text.
+    Display {
+        numeric: bool,
+    },
+}
+
+/// The PostgreSQL type that a column of a rudb type is sent as, with its typmod.
+///
+/// Each rudb type with a PostgreSQL type of the same values gets that type. The unsigned integer
+/// types get the next signed type that holds all their values, and the integers of 64 bits or more
+/// without a sign or of 128 bits get `numeric`. The other rudb types, such as the lists, the
+/// structs and the enums, get `text` until their PostgreSQL types come.
+pub fn pg_type(logical: &LogicalType) -> PgType {
+    use LogicalType as L;
+    let (oid, typmod) = match logical {
+        L::Boolean => (oids::BOOL, -1),
+        L::TinyInt | L::SmallInt | L::UTinyInt => (oids::INT2, -1),
+        L::Integer | L::USmallInt => (oids::INT4, -1),
+        L::BigInt | L::UInteger => (oids::INT8, -1),
+        L::UBigInt | L::HugeInt | L::UHugeInt => (oids::NUMERIC, -1),
+        L::Float => (oids::FLOAT4, -1),
+        L::Double => (oids::FLOAT8, -1),
+        L::Decimal { width, scale } => {
+            (oids::NUMERIC, numeric_typmod(i32::from(*width), i32::from(*scale)))
+        }
+        L::Blob => (oids::BYTEA, -1),
+        L::Uuid => (oids::UUID, -1),
+        L::Date => (oids::DATE, -1),
+        L::Time => (oids::TIME, -1),
+        L::TimeTz => (oids::TIMETZ, -1),
+        L::Timestamp => (oids::TIMESTAMP, -1),
+        L::TimestampTz => (oids::TIMESTAMPTZ, -1),
+        L::Interval => (oids::INTERVAL, -1),
+        L::Json => (oids::JSON, -1),
+        _ => (oids::TEXT, -1),
+    };
+    PgType { oid, typmod }
 }
 
 impl Kind {
@@ -87,6 +129,9 @@ impl Kind {
     fn of(logical: &LogicalType, oid: Oid) -> Option<Kind> {
         use LogicalType as L;
         let int = |widths: &[&LogicalType]| widths.contains(&logical);
+        if *logical == L::Null {
+            return Some(Kind::Null);
+        }
         let kind = match oid {
             oids::BOOL if *logical == L::Boolean => Kind::Bool,
             oids::CHAR if *logical == L::UTinyInt => Kind::Char,
@@ -115,6 +160,7 @@ impl Kind {
             oids::FLOAT8 if *logical == L::Double => Kind::Float8,
             oids::NUMERIC => match *logical {
                 L::Decimal { scale, .. } => Kind::Decimal(u32::from(scale)),
+                L::UBigInt | L::HugeInt | L::UHugeInt => Kind::Display { numeric: true },
                 _ => return None,
             },
             oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::NAME | oids::UNKNOWN
@@ -131,6 +177,7 @@ impl Kind {
             oids::TIMESTAMPTZ if *logical == L::TimestampTz => Kind::TimestampTz,
             oids::INTERVAL if *logical == L::Interval => Kind::Interval,
             oids::UUID if *logical == L::Uuid => Kind::Uuid,
+            oids::TEXT if pg_type(logical).oid == oids::TEXT => Kind::Display { numeric: false },
             _ => return None,
         };
         Some(kind)
@@ -145,7 +192,9 @@ impl Kind {
             Kind::Int8 | Kind::Float8 | Kind::Time | Kind::Timestamp | Kind::TimestampTz => 8,
             Kind::TimeTz => 12,
             Kind::Interval | Kind::Uuid => 16,
-            Kind::Decimal(_) | Kind::Text | Kind::Bytea => return None,
+            Kind::Decimal(_) | Kind::Text | Kind::Bytea | Kind::Null | Kind::Display { .. } => {
+                return None;
+            }
         })
     }
 }
@@ -371,6 +420,25 @@ fn lengths(
     staged: &mut Vec<u8>,
 ) -> Result<(), TypeError> {
     let live = vector.validity().live();
+    match plan.kind {
+        Kind::Null => return Ok(()),
+        Kind::Display { numeric } => {
+            let start = rows.start;
+            for i in (0..lens.len()).filter(|&i| live.at(start + i)) {
+                let text = vector.value_at(start + i).to_string();
+                try_stage(lens, staged, i, |out| {
+                    if numeric && plan.binary {
+                        numeric_send(&numeric_in(&text, -1)?, out);
+                    } else {
+                        out.extend_from_slice(text.as_bytes());
+                    }
+                    Ok(())
+                })?;
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
     let data = vector.data().ok_or_else(|| wrong_data(plan))?;
     if matches!(data, Data::Empty) {
         return Ok(());
@@ -545,7 +613,7 @@ fn stage_column(
                 stage(lens, staged, i, |out| uuid_out(&bytes, out))?;
             }
         }
-        (Kind::Text, _) => return Err(wrong_data(plan)),
+        (Kind::Text | Kind::Null | Kind::Display { .. }, _) => return Err(wrong_data(plan)),
     }
     Ok(())
 }
@@ -591,7 +659,6 @@ fn put(
     cursor: &mut [usize],
     out: &mut [u8],
 ) -> Result<(), TypeError> {
-    let data = vector.data().ok_or_else(|| wrong_data(plan))?;
     match plan.path {
         Path::Staged => {
             let mut from = 0;
@@ -601,7 +668,7 @@ fn put(
             });
         }
         Path::Bytes => {
-            let Data::Varlen(strings) = data else { return Err(wrong_data(plan)) };
+            let Some(Data::Varlen(strings)) = vector.data() else { return Err(wrong_data(plan)) };
             each(lens, cursor, out, |i, value| {
                 // The first pass found every value, so this cannot fail.
                 if let Some(bytes) = strings.bytes(start + i) {
@@ -609,7 +676,10 @@ fn put(
                 }
             });
         }
-        Path::Fixed(_) => fixed(plan, data, start, lens, cursor, out)?,
+        Path::Fixed(_) => {
+            let data = vector.data().ok_or_else(|| wrong_data(plan))?;
+            fixed(plan, data, start, lens, cursor, out)?;
+        }
     }
     Ok(())
 }
@@ -731,7 +801,9 @@ fn fixed(
                 value.copy_from_slice(&uuid::to_bytes(values[start + i]))
             });
         }
-        Kind::Decimal(_) | Kind::Text | Kind::Bytea => return Err(wrong_data(plan)),
+        Kind::Decimal(_) | Kind::Text | Kind::Bytea | Kind::Null | Kind::Display { .. } => {
+            return Err(wrong_data(plan));
+        }
     }
     Ok(())
 }
@@ -1069,6 +1141,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The types with no PostgreSQL type of their own are sent as the text of each value.
+    #[test]
+    fn other_types_are_sent_as_text() {
+        let zone = FixedZone::utc();
+        let settings = settings(&zone);
+        let big = Vector::from_values(
+            LogicalType::HugeInt,
+            &[Value::HugeInt(-(10i128.pow(30))), Value::Null, Value::HugeInt(7)],
+        )
+        .unwrap();
+        let none = Vector::from_values(LogicalType::Null, &[Value::Null, Value::Null, Value::Null])
+            .unwrap();
+        let list_type = LogicalType::List(Box::new(LogicalType::Integer));
+        let list = Vector::from_values(
+            list_type.clone(),
+            &[
+                Value::List {
+                    element: LogicalType::Integer,
+                    values: vec![Value::Integer(1), Value::Integer(2)],
+                },
+                Value::Null,
+                Value::List { element: LogicalType::Integer, values: Vec::new() },
+            ],
+        )
+        .unwrap();
+        let columns = [big, none, list];
+        let types = [LogicalType::HugeInt, LogicalType::Null, list_type];
+        let oids: Vec<_> = types.iter().map(|t| pg_type(t).oid).collect();
+        assert_eq!(oids, [oids::NUMERIC, oids::TEXT, oids::TEXT]);
+        for binary in [false, true] {
+            let spec: Vec<_> =
+                types.iter().zip(&oids).map(|(t, oid)| (t.clone(), *oid, binary)).collect();
+            let mut encoder = RowEncoder::new(&spec).unwrap();
+            let mut out = Vec::new();
+            encoder.encode(&columns, 0..3, &settings, &mut out).unwrap();
+            let rows = decode(&out);
+            let numeric = |text: &str| {
+                let mut out = Vec::new();
+                match binary {
+                    true => numeric_send(&numeric_in(text, -1).unwrap(), &mut out),
+                    false => out.extend_from_slice(text.as_bytes()),
+                }
+                Some(out)
+            };
+            assert_eq!(rows[0][0], numeric("-1000000000000000000000000000000"));
+            assert_eq!(rows[2][0], numeric("7"));
+            assert_eq!(rows[1][0], None);
+            assert!(rows.iter().all(|row| row[1].is_none()));
+            assert_eq!(
+                rows[0][2].as_deref(),
+                Some(
+                    Value::List {
+                        element: LogicalType::Integer,
+                        values: vec![Value::Integer(1), Value::Integer(2)]
+                    }
+                    .to_string()
+                    .as_bytes()
+                )
+            );
+            assert_eq!(rows[1][2], None);
+        }
+        let decimal = pg_type(&LogicalType::Decimal { width: 10, scale: 2 });
+        assert_eq!((decimal.oid, decimal.typmod), (oids::NUMERIC, numeric_typmod(10, 2)));
     }
 
     #[test]

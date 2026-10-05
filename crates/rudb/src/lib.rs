@@ -127,7 +127,7 @@ mod tests;
 
 pub use appender::Appender;
 pub use config::{Config, parse_size};
-pub use connection::Connection;
+pub use connection::{Connection, Transaction};
 pub use database::{Database, NativeExtremaValues};
 pub use prepared::Prepared;
 pub use result::QueryResult;

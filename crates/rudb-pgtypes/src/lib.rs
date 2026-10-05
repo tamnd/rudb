@@ -134,7 +134,7 @@ pub use numeric::{
 pub use reg::{
     RegInput, RegKind, qualified_name_list, reg_in, reg_out_oid, split_identifier_string,
 };
-pub use row::{OutputSettings, RowEncoder};
+pub use row::{OutputSettings, RowEncoder, pg_type};
 pub use scalar::{
     ByteaOutput, NAME_MAX_BYTES, bool_in, bool_out, bytea_in, bytea_out, char_in, char_out,
     name_in, uuid_in, uuid_out,

@@ -865,6 +865,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-server"
+version = "0.8.26"
+dependencies = [
+ "libc",
+ "rudb",
+ "rudb-common",
+ "rudb-pgtypes",
+ "rudb-pgwire",
+]
+
+[[package]]
 name = "rudb-stats"
 version = "0.8.26"
 dependencies = [
