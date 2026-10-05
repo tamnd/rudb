@@ -31,7 +31,7 @@ use rudb_common::{
     stage,
 };
 use rudb_kernels::{
-    Accumulator, NOWHERE, coded_run, finish_run, group_tally, holds_codes, is_true,
+    Accumulator, NOWHERE, PlaceSums, coded_run, finish_run, group_tally, holds_codes, is_true,
     settle_extremes, update_general, update_runs, update_shared_runs, update_shared_slots,
     update_tallied, whole_answers,
 };
@@ -2637,6 +2637,7 @@ impl<'a> Aggregate<'a> {
             // group, which is the whole point of holding them here.
             coded_on: Vec::new(),
             coded_places: Vec::new(),
+            place_sums: PlaceSums::default(),
             coded_values: crate::table::Widened::default(),
             slot_runs: Vec::new(),
             coded_spent: 0,
@@ -2706,6 +2707,7 @@ impl<'a> Aggregate<'a> {
             walk,
             coded_on,
             coded_places,
+            place_sums,
             coded_values,
             slot_runs,
             coded_spent,
@@ -2815,6 +2817,30 @@ impl<'a> Aggregate<'a> {
             uncut = None;
         }
         let mut runs_found = false;
+        // Totals added up through the map, for a chunk where every call that folds is a total or a
+        // count and nothing needs a row's slot. On q01 finding every row's slot, taking the dropped
+        // rows back out and looking for runs in what was left was half of the fold. Not under a
+        // group limit, because a row the limit turns away has no group for the pass to go on with,
+        // and not past a few groups, since every group's totals are cleared and read once a chunk.
+        let offered = self
+            .calls
+            .iter()
+            .enumerate()
+            .filter(|&(at, call)| !self.by_vector[at] && call.folds())
+            .fold(0_u64, |offered, (at, _)| offered | one_call(at));
+        let by_place = !self.count_only
+            && !self.compact_numeric
+            && !self.sets
+            && offered != 0
+            && calls <= u64::BITS as usize
+            && self.calls.iter().enumerate().all(|(at, call)| {
+                self.by_vector[at] || !call.folds() || (!call.distinct && filters[at].is_none())
+            })
+            && self.max_groups.is_none()
+            && table.len() <= FEW_SLOTS
+            && table.len().saturating_mul(4) <= *length
+            && direct.is_some();
+        let mut placed = false;
         if let Some(codes) = &direct {
             if !codes.same_as(coded_on) {
                 if codes.reads_values() {
@@ -2830,6 +2856,15 @@ impl<'a> Aggregate<'a> {
                     None => coded_map.reset(codes.combos()),
                 }
             }
+            // Asked before `resolve` below takes the states for itself.
+            let in_runs = codes.place_runs(*length, *length / RUN_ROWS, slot_runs);
+            let inputs: Vec<Option<&Vector>> = if by_place {
+                arguments.iter().map(|argument| argument.first()).collect()
+            } else {
+                Vec::new()
+            };
+            let summed =
+                !in_runs && by_place && place_sums.ready(states, calls, &inputs, offered, *length);
             // A row the map has nothing for goes through the probe and the insert every row used to
             // go through, there and then, and what comes back is written into the map before the
             // next row is looked at. A key sorted the way `CounterID` is brings each value in as a
@@ -2882,7 +2917,7 @@ impl<'a> Aggregate<'a> {
             // into are the ones the aggregates fold by below. On ClickBench 28 the pass that wrote
             // every row's place, the one that read the map with it and the one that found the runs
             // again in the slots were two fifths of the fold.
-            if codes.place_runs(*length, *length / RUN_ROWS, slot_runs) {
+            if in_runs {
                 let mut start = 0;
                 for run in slot_runs.iter_mut() {
                     let (place, end) = *run;
@@ -2902,6 +2937,23 @@ impl<'a> Aggregate<'a> {
                     start = end;
                 }
                 runs_found = true;
+            } else if summed {
+                // Every call is a total or a count, so each row's totals go straight into the group
+                // the map holds for it, and no row's slot is written down. A row whose combination
+                // has no group yet stops the pass, and it goes on from that row once one is open.
+                codes.places(*length, coded_places);
+                let kept = uncut.map(|kept| kept.indices());
+                let mut row = 0;
+                loop {
+                    row = place_sums.add(coded_map, &coded_places[..*length], kept, row)?;
+                    if row == *length {
+                        break;
+                    }
+                    let slot = resolve(row)?;
+                    coded_map.set(coded_places[row], held_at(slot));
+                }
+                place_sums.fold(states, calls)?;
+                placed = true;
             } else if codes.look_up(coded_map, *length, slots) != Some(false) {
                 // One pass that finds every row's slot straight out of the map when the key is one
                 // or two dictionary columns, which is the whole chunk once a row group's first rows
@@ -2937,6 +2989,12 @@ impl<'a> Aggregate<'a> {
             }
         } else {
             coded_on.clear();
+        }
+        if placed {
+            rows::capacity(table.owned(), charged_keys, scratch)?;
+            let now = tables(table, states, counts, compact, overflow, seen);
+            rows::capacity(now, charged, containers)?;
+            return self.spill_if_crowded(over, alone, closed, *groups);
         }
         // Runs found above leave the slots empty. See `fill_now` below.
         if !runs_found && slots.len() != *length {
@@ -3311,15 +3369,27 @@ impl<'a> Aggregate<'a> {
         containers.grow(aside)?;
         let now = tables(table, states, counts, compact, overflow, seen);
         rows::capacity(now, charged, containers)?;
-        // Asked after the chunk has been folded in and not before, so that a pass always takes at
-        // least one chunk of groups whatever the budget says. That is what makes the loop in
-        // `combine` finish: a pass that could spill from its first row would spill every row and
-        // hand back a file the same size as what it was given.
+        self.spill_if_crowded(over, alone, closed, *groups)
+    }
+
+    /// Opens the spill file once memory is short, the last thing [`Self::fold`] does with a chunk.
+    ///
+    /// Asked after the chunk has been folded in and not before, so that a pass always takes at
+    /// least one chunk of groups whatever the budget says. That is what makes the loop in
+    /// `combine` finish: a pass that could spill from its first row would spill every row and
+    /// hand back a file the same size as what it was given.
+    fn spill_if_crowded(
+        &self,
+        over: &mut Option<Spill>,
+        alone: bool,
+        closed: Option<(usize, usize)>,
+        groups: usize,
+    ) -> Result<()> {
         match over.as_ref() {
             None if !alone && closed.is_none() && crowded(&self.memory) => {
                 *over = Some(Spill::new("aggregate", self.spilled_types())?);
             }
-            Some(file) => hopeless(file, *groups)?,
+            Some(file) => hopeless(file, groups)?,
             None => {}
         }
         Ok(())
@@ -5773,6 +5843,9 @@ pub(crate) struct Building {
     coded_map: Places,
     /// Which combination each row of the last chunk is, worked out one key column at a time.
     coded_places: Vec<usize>,
+    /// The last chunk's totals per group, when every call is a total or a count and the chunk was
+    /// added up through the coded map with no slot found per row. See [`PlaceSums`].
+    place_sums: PlaceSums,
     /// The values of each integer key column the map reads by value, widened, and their runs.
     coded_values: crate::table::Widened,
     /// The last chunk's slots cut into runs of one slot, each its slot and the row it ends before,
