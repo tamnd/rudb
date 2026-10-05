@@ -394,6 +394,61 @@ impl Domain {
         })
     }
 
+    /// Drops from `rows` every row whose key the build side does not hold, for rows a filter before
+    /// this one kept. `rows` are in order and inside `keys`.
+    ///
+    /// [`Self::kept`] reads every row of a chunk a block at a time, and this reads only the rows it
+    /// is given, a code at a time for a packed key. A row costs more this way, so it pays only when
+    /// the filter before it threw most of the chunk away, which the scan times rather than guesses,
+    /// see `Order` in `source.rs`. The rows are moved down in place without a branch on the answer,
+    /// since a bitmap that keeps a row in a hundred and one that keeps half of them both run here.
+    pub(crate) fn retain(&self, keys: &Vector, rows: &mut Vec<u32>) {
+        fn compact(rows: &mut Vec<u32>, mut held: impl FnMut(usize) -> bool) {
+            let mut kept = 0;
+            for at in 0..rows.len() {
+                let row = rows[at];
+                rows[kept] = row;
+                kept += usize::from(held(row as usize));
+            }
+            rows.truncate(kept);
+        }
+        let armed = i64::try_from(self.base).ok().filter(|_| self.range < 1 << 62);
+        let none_null = keys.none_null();
+        let valid = |row: usize| none_null || !keys.is_null_at(row);
+        if let Some(base) = armed {
+            if let Some(packed) = keys.packed_parts()
+                && let Ok(frame) = i64::try_from(packed.base())
+            {
+                let shift = frame.wrapping_sub(base) as u64;
+                return compact(rows, |row| {
+                    self.bit(packed.code(row).wrapping_add(shift)) && valid(row)
+                });
+            }
+            macro_rules! flat {
+                ($values:expr) => {{
+                    let values = $values.as_slice();
+                    return compact(rows, |row| {
+                        values
+                            .get(row)
+                            .is_some_and(|&key| self.bit(i64::from(key).wrapping_sub(base) as u64))
+                            && valid(row)
+                    });
+                }};
+            }
+            match keys.data() {
+                Some(Data::Int8(values)) => flat!(values),
+                Some(Data::Int16(values)) => flat!(values),
+                Some(Data::Int32(values)) => flat!(values),
+                Some(Data::Int64(values)) => flat!(values),
+                _ => {}
+            }
+        }
+        compact(rows, |row| {
+            let key = keys.signed_at(row).and_then(|key| i64::try_from(key).ok());
+            key.is_some_and(|key| self.holds(key))
+        });
+    }
+
     /// The two faster forms of [`Self::kept`], which read every row as if it held a key, and `None`
     /// on a column in neither form.
     fn unmasked(&self, keys: &Vector, rows: usize, base: i64) -> Option<Kept> {
@@ -1994,7 +2049,8 @@ mod tests {
     /// lies, a packed column read on its codes with the frame's base folded in, either of those
     /// with nulls in its mask, and the widening form a dictionary takes. Two hundred rows so that
     /// the run past the last whole word of sixty four is one of the cases, and a frame base each
-    /// side of the domain's so that the folded shift is tested both ways round.
+    /// side of the domain's so that the folded shift is tested both ways round. Asked through
+    /// [`super::Domain::retain`], each answers the same rows out of those it is given.
     #[test]
     fn a_bitmap_reads_flat_keys_packed_keys_and_widened_keys_alike() {
         let mut plan = Plan::new();
@@ -2006,7 +2062,19 @@ mod tests {
 
         let domain = found.domain.expect("a bitmap over a hundred and fifty one values");
         let rows: Vec<i64> = (0..200).collect();
-        let held = |keys: &Vector| domain.kept(keys, 200, &mut Vec::new()).indices();
+        // Each form asked through `retain` as well, about every row and about every third one,
+        // which is how the scan asks it about the rows a filter before it kept.
+        let held = |keys: &Vector| {
+            let kept = domain.kept(keys, 200, &mut Vec::new()).indices();
+            let mut every: Vec<u32> = (0..200).collect();
+            domain.retain(keys, &mut every);
+            assert_eq!(every, kept, "retain asked about every row");
+            let mut thirds: Vec<u32> = (0..200).step_by(3).collect();
+            domain.retain(keys, &mut thirds);
+            let third: Vec<u32> = kept.iter().copied().filter(|row| row % 3 == 0).collect();
+            assert_eq!(thirds, third, "retain asked about every third row");
+            kept
+        };
         let integers = column(&rows.iter().map(|&row| Some(row as i32)).collect::<Vec<_>>());
         assert!(integers.none_null() && integers.data().is_some(), "the flat form");
         assert_eq!(held(&integers), [100, 163]);

@@ -29,4 +29,4 @@ Comparing four rows at a time with AVX2 was tried as well, with the walk moved i
 
 ## What this leaves
 
-The walk reads eight bytes a row of a key whose runs are four rows long and whose values within a page span about seventeen bits. The way to make it cheaper is to read fewer bytes, which means holding a sorted key packed. Note 107 held delta pages flat because grouping by runs was four times slower over packed codes, but that was with a code read a row at a time and an argument flattened every chunk, and neither is true now. That is the next thing to measure, across every query that joins on `l_orderkey` as well as q18.
+The walk reads eight bytes a row of a key whose runs are four rows long and whose values within a page span about seventeen bits. The way to make it cheaper is to read fewer bytes, which means holding a sorted key packed. Note 107 held delta pages flat because grouping by runs was four times slower over packed codes, but that was with a code read a row at a time and an argument flattened every chunk, and neither is true now. That was measured afterwards and did not pay, see note 111.

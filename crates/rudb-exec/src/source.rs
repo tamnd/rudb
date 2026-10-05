@@ -502,6 +502,8 @@ pub(crate) struct Scan<'a> {
     paying: Paying,
     /// What the pushed filter keeps, which decides whether a Bloom filter runs ahead of it.
     passed: Paying,
+    /// Whether the pushed filter goes ahead of the joins' bitmaps, timed over the first parts.
+    order: Order,
     /// The operator row this scan reports its part counts to, when it is being measured.
     ///
     /// The scan has counted its own skips since the walk was written and nobody outside could see
@@ -593,6 +595,57 @@ impl Paying {
     fn saw(&self, rows: usize, kept: usize) {
         self.seen.fetch_add(rows, Ordering::Relaxed);
         self.kept.fetch_add(kept, Ordering::Relaxed);
+    }
+}
+
+/// The bitmaps a scan runs, each with its rank, its count, the column it reads and the bitmap.
+type Bitmaps<'s> = Vec<(f64, &'s Paying, usize, &'s Domain)>;
+
+/// How many parts each order is timed over before a scan keeps the faster one.
+const TRIALS: usize = 9;
+
+/// Which goes first in a scan with both, the pushed filter or the bitmaps of the joins above.
+///
+/// A bitmap costs a few cycles a row and a packed range compare a fraction of one, so which order
+/// is cheaper depends on what each keeps and on what it costs, and neither is known before the rows
+/// go past. In TPC-H q03 the date keeps half of lineitem and the orders bitmap one row in a hundred,
+/// and the bitmap over every row first is cheaper. In q20 the date keeps one row in seven and
+/// testing the parts bitmap over all six million rows was a sixth of the query. Working the costs
+/// out from counts does not work, because the pushed filter is only ever timed on the rows a bitmap
+/// left, where it costs what the chunk around it costs rather than what a row does. So the first parts take turns between the two orders, each part is timed whole,
+/// and after [`TRIALS`] parts each the scan keeps the order with the lower median for the rest.
+#[derive(Debug, Default)]
+struct Order {
+    turns: AtomicUsize,
+    timed: Mutex<[Vec<u64>; 2]>,
+    settled: OnceLock<bool>,
+}
+
+impl Order {
+    /// Whether the next part goes filter first, and whether it is one of the parts being timed.
+    fn next(&self) -> (bool, bool) {
+        if let Some(&first) = self.settled.get() {
+            return (first, false);
+        }
+        (self.turns.fetch_add(1, Ordering::Relaxed) % 2 == 1, true)
+    }
+
+    /// Records that a part of `rows` rows took `nanos` going filter first or not.
+    fn took(&self, first: bool, rows: usize, nanos: u64) {
+        let Ok(rows) = u64::try_from(rows) else { return };
+        if rows == 0 || self.settled.get().is_some() {
+            return;
+        }
+        let Ok(mut timed) = self.timed.lock() else { return };
+        timed[usize::from(first)].push(nanos.saturating_mul(1024) / rows);
+        if timed.iter().all(|times| times.len() >= TRIALS) {
+            let mut median = |order: usize| {
+                timed[order].sort_unstable();
+                timed[order][timed[order].len() / 2]
+            };
+            let (after, before) = (median(0), median(1));
+            let _ = self.settled.set(before < after);
+        }
     }
 }
 
@@ -1420,6 +1473,7 @@ impl<'a> Scan<'a> {
             unread,
             paying: Paying::default(),
             passed: Paying::default(),
+            order: Order::default(),
         })
     }
 
@@ -1807,13 +1861,82 @@ impl<'a> Scan<'a> {
     /// `mark` is whether the caller hands the chunk straight on, which is what lets the pushed
     /// filter mark the rows it keeps rather than cut them. A caller that reads the rows afterwards
     /// passes false.
+    ///
+    /// With a pushed filter and a bitmap both, which goes first is timed, see [`Order`].
     fn narrow_read(&self, at: usize, out: &mut Chunk, mark: bool) -> Result<()> {
         let placed = self.reduced(at).is_some_and(|(rows, _)| !rows.is_full());
         if placed {
             self.apply(at, out, false)?;
             return self.sift(out);
         }
-        self.sift_exact(out)?;
+        let tests = self.exact_tests(out, None);
+        if tests.is_empty() || self.pushed.is_none() {
+            return self.bitmaps_first(at, out, mark, tests);
+        }
+        let (first, timed) = self.order.next();
+        let (rows, start) = (out.len(), timed.then(std::time::Instant::now));
+        if first {
+            self.pushed_first(at, out, tests)?;
+        } else {
+            self.bitmaps_first(at, out, mark, tests)?;
+        }
+        if let Some(start) = start {
+            let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.order.took(first, rows, nanos);
+        }
+        Ok(())
+    }
+
+    /// The pushed filter over the whole chunk, then each bitmap asked only about the rows the
+    /// filter kept, and the chunk narrowed once to the rows all of them kept.
+    ///
+    /// The other order narrows the chunk to what the bitmaps keep and then runs the filter over
+    /// that, which in TPC-H q20 is a bitmap test on every one of the six million rows of lineitem
+    /// to save a date compare that costs a fraction of one. The Bloom filters still go last.
+    fn pushed_first(&self, at: usize, out: &mut Chunk, tests: Bitmaps<'_>) -> Result<()> {
+        let Some(pushed) = self.pushed.as_ref() else {
+            self.sift_tests(out, tests)?;
+            return self.sift_hashed(out);
+        };
+        if pushed.probes.as_deref().is_some_and(|probes| self.table.rows().certain(at, probes)) {
+            self.waved.fetch_add(1, Ordering::Relaxed);
+            self.sift_tests(out, tests)?;
+            return self.sift_hashed(out);
+        }
+        let slot = reader();
+        let mut working = pushed.take(slot);
+        let rows = out.len();
+        let mut kept = self.passing(pushed, at, out, &mut working)?.indices().to_vec();
+        for (_, paying, column, domain) in tests {
+            if kept.is_empty() {
+                break;
+            }
+            let Ok(keys) = out.column(column) else { continue };
+            let before = kept.len();
+            domain.retain(keys, &mut kept);
+            paying.saw(before, kept.len());
+        }
+        if kept.len() != rows {
+            let kept = Selection::from_indices(kept);
+            self.narrow_read_columns(pushed.compaction, out, &kept, &mut working.gauge)?;
+        }
+        pushed.give(slot, working);
+        if out.is_empty() {
+            return Ok(());
+        }
+        self.sift_hashed(out)
+    }
+
+    /// [`Self::narrow_read`] with the bitmaps `tests` first, and the pushed filter and the Bloom
+    /// filters after them in whichever order what the pushed filter keeps says.
+    fn bitmaps_first(
+        &self,
+        at: usize,
+        out: &mut Chunk,
+        mark: bool,
+        tests: Bitmaps<'_>,
+    ) -> Result<()> {
+        self.sift_tests(out, tests)?;
         if out.is_empty() {
             return Ok(());
         }
@@ -2027,8 +2150,11 @@ impl<'a> Scan<'a> {
             && (0..self.columns.len()).any(|at| {
                 self.columns[at].is_some() && !keys.contains(&at) && !self.deferrable.contains(&at)
             });
+        // A tight join can still keep more than the scan's own filter does, and then the filter goes
+        // first after all, on its columns read whole, see [`Order`].
+        let (ahead, timed) = if early { self.order.next() } else { (false, false) };
         let every: Vec<usize>;
-        let wide = if early {
+        let wide = if early && !ahead {
             every = (0..self.columns.len()).filter(|&at| self.columns[at].is_some()).collect();
             &every
         } else if tight {
@@ -2054,6 +2180,7 @@ impl<'a> Scan<'a> {
         if deferred.is_empty() || first.is_empty() {
             return Ok(false);
         }
+        let start = timed.then(std::time::Instant::now);
         let read = self.table.rows().read(at, &first)?;
         let len = read.len();
         let types = self.schema.types();
@@ -2071,10 +2198,17 @@ impl<'a> Scan<'a> {
         }
         held.push(Vector::sequence(0, 1, len));
         *out = Chunk::with_rows(held, len)?;
-        if early {
+        if early && ahead {
+            let tests = self.exact_tests(out, None);
+            self.pushed_first(at, out, tests)?;
+        } else if early {
             self.sift(out)?;
         } else {
             self.narrow_read(at, out, false)?;
+        }
+        if let Some(start) = start {
+            let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.order.took(ahead, len, nanos);
         }
         let kept = out.len();
         self.deferring.saw(len, kept);
@@ -2107,7 +2241,8 @@ impl<'a> Scan<'a> {
             }
         }
         *out = Chunk::with_rows(columns, kept)?;
-        if early && kept > 0 {
+        // A filter that went first has been applied already, and the columns only it read are gone.
+        if early && !ahead && kept > 0 {
             self.apply(at, out, false)?;
         }
         Ok(true)
@@ -2147,6 +2282,13 @@ impl<'a> Scan<'a> {
     /// [`Self::sift_exact`] with the bitmap of `done` left out, for a chunk it was already tested
     /// against as it was read. See [`Self::read_reduced`].
     fn sift_exact_but(&self, chunk: &mut Chunk, done: Option<&Arc<Sideways<'a>>>) -> Result<()> {
+        let tests = self.exact_tests(chunk, done);
+        self.sift_tests(chunk, tests)
+    }
+
+    /// The bitmaps [`Self::sift_exact_but`] runs over `chunk`, in the order it runs them, each with
+    /// its rank, its count, the column it reads and the bitmap.
+    fn exact_tests<'s>(&'s self, chunk: &Chunk, done: Option<&Arc<Sideways<'a>>>) -> Bitmaps<'s> {
         let handoffs = || {
             let own = self.sideways.iter().map(|sideways| (sideways, &self.paying));
             own.chain(self.also.iter().map(|(sideways, paying)| (sideways, paying)))
@@ -2156,7 +2298,6 @@ impl<'a> Scan<'a> {
         // is cheap but not free, so it answers to the same count as the filter and a bitmap that
         // keeps nearly every row stops being asked. It takes the place of the filter rather than
         // going in front of it, see `Found::domain`.
-        let mut block = Vec::new();
         let mut tests = Vec::new();
         for (sideways, paying) in handoffs() {
             if done.is_some_and(|done| Arc::ptr_eq(done, sideways)) {
@@ -2190,6 +2331,12 @@ impl<'a> Scan<'a> {
         if tests.len() > 1 {
             tests.sort_by(|one, other| one.0.total_cmp(&other.0));
         }
+        tests
+    }
+
+    /// Runs `tests` over `chunk` in order, narrowing it to the rows each keeps.
+    fn sift_tests(&self, chunk: &mut Chunk, tests: Bitmaps<'_>) -> Result<()> {
+        let mut block = Vec::new();
         let timing = tests.len() > 1;
         for (_, paying, at, domain) in tests {
             if chunk.is_empty() {
@@ -4484,10 +4631,10 @@ mod tests {
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Across, Bound, Cutoff, FileScan, Filters, Handout, Live, OnceLock, Op, Paying, Probe,
-        Pushdown, RUN, Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE, WARMUP,
-        best_first, cut_rows, gather_target, gathered, hash, instances_for, morsels_of, next_piece,
-        parts, runs_of, worth_sifting,
+        Across, Bound, Cutoff, FileScan, Filters, Handout, Live, OnceLock, Op, Order, Paying,
+        Probe, Pushdown, RUN, Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE,
+        WARMUP, best_first, cut_rows, gather_target, gathered, hash, instances_for, morsels_of,
+        next_piece, parts, runs_of, worth_sifting,
     };
     use crate::sideways::Found;
 
@@ -5038,6 +5185,7 @@ mod tests {
             unread: Vec::new(),
             paying: Paying::default(),
             passed: Paying::default(),
+            order: Order::default(),
         }
     }
 
