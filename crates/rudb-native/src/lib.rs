@@ -15407,6 +15407,19 @@ fn decode(
         if !coded_type(ty) {
             return Err(invalid("compressed text codec belongs to a non-string page"));
         }
+        // A part that is a dictionary of its own goes out as one, with no promise across parts,
+        // so that a filter decides once per value. Flattened, every row was a copy of its value,
+        // and `movie_info.info` on JOB is 667 parts of these after its table dictionary stopped.
+        if let Some((dictionary, codes)) = string::decode_coded(&bytes[cur.at..])? {
+            if codes.len() != rows {
+                return Err(invalid("compressed text page holds the wrong number of rows"));
+            }
+            let (payload, ends) = dictionary.into_parts();
+            let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
+            push_values(&mut values, ty, &ends)?;
+            let values = Arc::new(Vector::flat(ty.clone(), Data::Varlen(values))?);
+            return Ok(Vector::dictionary_over(codes, values)?.with_validity(validity));
+        }
         // As codec 5, the layer holds the whole tail of the page and says how long it is itself.
         // It comes back as one buffer with the values laid end to end and where each one ends, which
         // is the raw form's layout, so what is left to do here is what codec 0 does.
@@ -19512,6 +19525,58 @@ mod tests {
         let raw = (0..rows).map(|row| unique(row).len()).sum::<usize>();
         let size = fs::metadata(&path).expect("the file is there").len() as usize;
         assert!(size < raw, "a column without a dictionary is still encoded: {size} against {raw}");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A part that the writer coded as a dictionary of its own is read back as one.
+    ///
+    /// The column is nearly all different, so the table keeps no dictionary for it, and then its
+    /// last parts come round to a handful of values, which each part writes as its own dictionary.
+    /// Those parts come back as codes over their values, with the nulls where they were, and the
+    /// parts of all different values come back flat.
+    #[test]
+    fn a_part_coded_as_its_own_dictionary_is_read_as_codes() {
+        let path = path("part-dictionary");
+        let parts = 40;
+        let repeated = 37;
+        let value = |row: usize| {
+            if row / 1_000 < repeated {
+                Value::Varchar(format!("{row:09} a value that appears exactly once in the table"))
+            } else if row % 97 == 0 {
+                Value::Null
+            } else {
+                Value::Varchar(format!("one of five values, this is number {}", row % 5))
+            }
+        };
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in 0..parts {
+            let values = (part * 1_000..(part + 1) * 1_000).map(value).collect::<Vec<_>>();
+            let column = Vector::from_values(LogicalType::Varchar, &values).expect("strings");
+            writer.append(&Chunk::new(vec![column]).expect("one column")).expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        assert!(reader.table.dictionaries[0].is_none(), "the table keeps no dictionary");
+        let mut first = 0;
+        let mut coded = 0;
+        for part in 0..reader.parts() {
+            let chunk = reader.read(part, &[0]).expect("a part");
+            let column = chunk.column(0).expect("the column");
+            if let Some((codes, values)) = column.positions() {
+                // Five values, and the empty one the nulls are stored as.
+                assert!(values.len() <= 6 && codes.len() == chunk.len(), "codes over six values");
+                coded += 1;
+            }
+            for row in 0..chunk.len() {
+                assert_eq!(chunk.value_at(row, 0), value(first + row), "row {}", first + row);
+            }
+            first += chunk.len();
+        }
+        assert_eq!(first, parts * 1_000, "every row was read back");
+        assert!(coded >= parts - repeated - 1, "the parts of five values are codes: {coded}");
         fs::remove_file(path).expect("remove scratch file");
     }
 
