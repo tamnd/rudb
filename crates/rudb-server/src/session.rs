@@ -7,9 +7,10 @@
 //! connection, and when it is larger than [`FLUSH_AT`], as PostgreSQL does.
 //!
 //! This version has the simple and the extended query flows, and the settings of PostgreSQL with
-//! `SET`, `RESET`, `SHOW` and `ParameterStatus`. Authentication other than `trust` comes in the
-//! next steps of milestone PG1.
+//! `SET`, `RESET`, `SHOW` and `ParameterStatus`, and the authentication methods of `pg_hba.conf`
+//! in [`auth`].
 
+mod auth;
 mod extended;
 mod role;
 mod setting;
@@ -177,8 +178,18 @@ impl Wire {
         Ok(())
     }
 
-    /// Writes an error of the server with the severity `FATAL` and sends all the output.
-    fn fatal(&mut self, (sqlstate, message): Refusal) -> io::Result<()> {
+    /// Writes an error of the server with the severity `FATAL` to the log and to the client, and
+    /// sends all the output.
+    fn fatal(&mut self, refusal: Refusal) -> io::Result<()> {
+        self.fatal_with(refusal, None)
+    }
+
+    /// [`Wire::fatal`] with a `DETAIL` for the log only, as `errdetail_log` of PostgreSQL.
+    fn fatal_with(&mut self, (sqlstate, message): Refusal, detail: Option<&str>) -> io::Result<()> {
+        match detail {
+            Some(detail) => log("FATAL", &format!("{message}\nDETAIL:  {detail}")),
+            None => log("FATAL", &message),
+        }
         self.out.error_response(&[
             (b'S', b"FATAL"),
             (b'V', b"FATAL"),
@@ -456,6 +467,9 @@ fn serve(
         Ok(key) => key,
         Err(refusal) => return wire.fatal(refusal),
     };
+    let Some(notices) = auth::authenticate(shared, &start, wire, input)? else {
+        return Ok(());
+    };
     wire.out.authentication_ok();
     let role = match shared.login(pid, &start.user) {
         Ok(role) => role,
@@ -471,6 +485,17 @@ fn serve(
     };
     let connection = database.connect();
     shared.attach(pid, connection.clone());
+    // `EmitConnectionWarnings`, after the settings of the startup packet.
+    let md5_warnings = guc.get("md5_password_warnings").is_none_or(|on| on == "on");
+    for notice in notices.iter().filter(|notice| md5_warnings || !notice.md5) {
+        wire.out.notice_response(&[
+            (b'S', b"WARNING"),
+            (b'V', b"WARNING"),
+            (b'C', b"01000"),
+            (b'M', notice.message.as_bytes()),
+            (b'D', notice.detail.as_bytes()),
+        ]);
+    }
     for (name, value) in guc.startup_reports() {
         wire.out.parameter_status(name.as_bytes(), value.as_bytes());
     }

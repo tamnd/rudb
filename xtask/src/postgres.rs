@@ -9,7 +9,8 @@
 //! The plan is `16-crate-layout.md` section 16.5 of the PostgreSQL compatibility notes. Today
 //! `errcodes.txt` gives the SQLSTATE list of `rudb-common`, `guc_parameters.dat` and
 //! `guc_tables.c` give the configuration parameters of `rudb-common`, `cmdtaglist.h` gives the
-//! command tags of `rudb-pgwire`, and `pg_type.dat` gives the type OIDs of `rudb-pgtypes`.
+//! command tags of `rudb-pgwire`, `pg_type.dat` gives the type OIDs of `rudb-pgtypes`, and the
+//! samples of `pg_hba.conf` and `pg_ident.conf` are the files that `rudb-server init` writes.
 
 mod guc;
 
@@ -27,7 +28,7 @@ struct Vendor {
     files: &'static [(&'static str, &'static str)],
 }
 
-const VENDORS: [Vendor; 3] = [
+const VENDORS: [Vendor; 4] = [
     Vendor {
         dir: "crates/rudb-common/vendor",
         files: &[
@@ -49,6 +50,14 @@ const VENDORS: [Vendor; 3] = [
         files: &[
             ("src/include/catalog/pg_type.dat", "pg_type.dat"),
             ("src/timezone/tznames/Default", "tznames-Default"),
+            ("COPYRIGHT", "LICENSE.postgres"),
+        ],
+    },
+    Vendor {
+        dir: "crates/rudb-server/vendor",
+        files: &[
+            ("src/backend/libpq/pg_hba.conf.sample", "pg_hba.conf.sample"),
+            ("src/backend/libpq/pg_ident.conf.sample", "pg_ident.conf.sample"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },

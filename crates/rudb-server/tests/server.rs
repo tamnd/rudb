@@ -11,7 +11,7 @@ use rudb_pgwire::{
     Backend, Bind, Cancel, Frontend, Oids, PROTOCOL_3_0, PROTOCOL_3_2, Packet, Startup, Target,
     encode_oids, encode_options,
 };
-use rudb_server::{Config, Server, init};
+use rudb_server::{Config, Init, Server, init};
 
 /// A data directory and a socket directory of their own for each test, removed at the end.
 struct Dirs {
@@ -23,7 +23,7 @@ impl Dirs {
         let root = std::env::temp_dir().join(format!("rudb-server-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sock")).unwrap();
-        init(&root.join("data"), "rpg", None).unwrap();
+        init(&root.join("data"), &Init::new("rpg")).unwrap();
         Dirs { root }
     }
 

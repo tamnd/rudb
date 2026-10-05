@@ -1,11 +1,11 @@
-//! The `rudb-server` binary: `rudb-server init [-U NAME] [--pwfile FILE] DIR` makes a data
+//! The `rudb-server` binary: `rudb-server init [-U NAME] [--pwfile FILE] [-A METHOD] DIR` makes a data
 //! directory, and `rudb-server -D DIR` with the options of `postgres` runs the server until
 //! `SIGINT`, `SIGTERM` or `SIGQUIT`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use rudb_server::{Config, Server, init};
+use rudb_server::{Config, Init, Server, init};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -15,8 +15,16 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("init") => match init_args(&args[1..]) {
-            Ok((data, superuser, password)) => match init(&data, &superuser, password.as_deref()) {
+            Ok((data, options)) => match init(&data, &options) {
                 Ok(()) => {
+                    if options.trust_warning() {
+                        eprintln!(
+                            "\nrudb-server: warning: enabling \"trust\" authentication for local \
+                             connections\nrudb-server: hint: You can change this by editing \
+                             pg_hba.conf or using the option -A, or --auth-local and --auth-host, \
+                             the next time you run rudb-server init."
+                        );
+                    }
                     println!(
                         "Success. You can now start the database server using:\n\n    rudb-server -D {}\n",
                         data.display()
@@ -39,11 +47,13 @@ fn main() -> ExitCode {
 
 /// The options of `init`, which are the options of `initdb` that it knows: `-D` or `--pgdata` or
 /// the last argument for the data directory, `-U` or `--username` for the name of the superuser,
-/// and `--pwfile` for a file with the password of the superuser on its first line.
-fn init_args(args: &[String]) -> Result<(PathBuf, String, Option<String>), String> {
+/// `--pwfile` for a file with the password of the superuser on its first line, and `-A` or
+/// `--auth`, `--auth-local` and `--auth-host` for the methods in `pg_hba.conf`.
+fn init_args(args: &[String]) -> Result<(PathBuf, Init), String> {
     let mut data = None;
     let mut superuser = None;
     let mut pwfile = None;
+    let mut options = Init::default();
     let mut at = 0;
     while let Some(arg) = args.get(at) {
         at += 1;
@@ -63,6 +73,9 @@ fn init_args(args: &[String]) -> Result<(PathBuf, String, Option<String>), Strin
             "-D" | "--pgdata" => data = Some(PathBuf::from(value().ok_or_else(missing)?)),
             "-U" | "--username" => superuser = Some(value().ok_or_else(missing)?),
             "--pwfile" => pwfile = Some(value().ok_or_else(missing)?),
+            "-A" | "--auth" => options.auth(&value().ok_or_else(missing)?),
+            "--auth-local" => options.auth_local = Some(value().ok_or_else(missing)?),
+            "--auth-host" => options.auth_host = Some(value().ok_or_else(missing)?),
             _ if name.starts_with('-') => return Err(format!("unrecognized option: {name}")),
             _ => data = Some(PathBuf::from(arg)),
         }
@@ -70,11 +83,11 @@ fn init_args(args: &[String]) -> Result<(PathBuf, String, Option<String>), Strin
     let data = data
         .or_else(|| std::env::var_os("PGDATA").map(PathBuf::from))
         .ok_or_else(|| "no data directory specified".to_owned())?;
-    let superuser = superuser.unwrap_or_else(rudb_server::os_user);
-    if superuser.is_empty() {
+    options.superuser = superuser.unwrap_or_else(rudb_server::os_user);
+    if options.superuser.is_empty() {
         return Err("superuser name must not be empty".to_owned());
     }
-    let password = match pwfile {
+    options.password = match pwfile {
         Some(file) => {
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| format!("could not open file \"{file}\" for reading: {e}"))?;
@@ -86,7 +99,7 @@ fn init_args(args: &[String]) -> Result<(PathBuf, String, Option<String>), Strin
         }
         None => None,
     };
-    Ok((data, superuser, password))
+    Ok((data, options))
 }
 
 fn run(args: &[String]) -> ExitCode {
