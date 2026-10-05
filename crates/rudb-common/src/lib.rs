@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bignum;
 pub mod bit;
 pub mod bounds;
 pub mod cancel;

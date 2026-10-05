@@ -1,16 +1,16 @@
 //! What `duckdb_types()` says about each type name this engine knows.
 //!
-//! One entry per name, and one row per entry per modifier signature, which is why 74 names produce 94
+//! One entry per name, and one row per entry per modifier signature, which is why 76 names produce 96
 //! rows. The list, the oids, the modifier signatures and the row order were all read off the pinned
 //! binary rather than worked out from first principles, because every one of them turned out to have
 //! something in it that reading the type system would not have told you.
 //!
 //! # The table lists the types this engine has
 //!
-//! The pinned binary returns 104 rows in the `memory` schema and this returns 94. The ten that are
-//! not here are nine names for types rudb does not have at all, `array`, `bignum`, `geometry`,
-//! `timestamptz_ns`, `time_ns`, `tuple`, `type`, `variant` and `varint`, plus `geometry` a second
-//! time for its `crs` modifier. A catalog table that listed a type you cannot make a value
+//! The pinned binary returns 104 rows in the `memory` schema and this returns 96. The eight that are
+//! not here are seven names for types rudb does not have at all, `array`, `geometry`,
+//! `timestamptz_ns`, `time_ns`, `tuple`, `type` and `variant`, plus `geometry` a second time for its
+//! `crs` modifier. A catalog table that listed a type you cannot make a value
 //! of would be a table that lies, and the point of this one is that a client can read it to find out
 //! what the engine supports. The names come back when the types do.
 //!
@@ -88,6 +88,7 @@ const PRECISION: &[Signature] = &[&[], &[("precision", "UTINYINT")]];
 /// pin's, and why the oid is on the name it is on.
 pub static TYPE_NAMES: &[TypeEntry] = &[
     entry("bigint", "BIGINT", Some(14)),
+    entry("bignum", "BIGNUM", Some(39)),
     entry("binary", "BLOB", Some(26)),
     TypeEntry { signatures: LENGTH, oid: Some(36), ..entry("bit", "BIT", None) },
     TypeEntry { signatures: LENGTH, ..entry("bitstring", "BIT", None) },
@@ -169,6 +170,7 @@ pub static TYPE_NAMES: &[TypeEntry] = &[
     entry("uuid", "UUID", None),
     entry("varbinary", "BLOB", None),
     TypeEntry { signatures: STRING, ..entry("varchar", "VARCHAR", None) },
+    entry("varint", "BIGNUM", None),
 ];
 
 /// One bare name, which is the shape most of the table is, so the rest can be written as a change to
@@ -229,6 +231,7 @@ pub fn representative(logical_type: &str) -> Option<LogicalType> {
         "VARCHAR" => LogicalType::Varchar,
         "BLOB" => LogicalType::Blob,
         "BIT" => LogicalType::Bit,
+        "BIGNUM" => LogicalType::BigNum,
         "UUID" => LogicalType::Uuid,
         "DATE" => LogicalType::Date,
         "TIME" => LogicalType::Time,
@@ -277,9 +280,9 @@ pub fn type_size(logical_type: &str) -> Option<i64> {
 
 /// Which of DuckDB's categories a type is in, and `None` for the ones it puts in none.
 ///
-/// Six categories and a gap. `BIT`, `BLOB`, `UUID` and the null type are in no category at all,
-/// which is not an oversight anybody can fix from here, it is what the pin reports and this table is
-/// checked against the pin.
+/// Six categories and a gap. `BIT`, `BIGNUM`, `BLOB`, `UUID` and the null type are in no category
+/// at all, which is not an oversight anybody can fix from here, it is what the pin reports and this
+/// table is checked against the pin.
 #[must_use]
 pub fn type_category(logical_type: &str) -> Option<&'static str> {
     let ty = representative(logical_type)?;
@@ -336,8 +339,8 @@ mod tests {
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
         let rows: usize = TYPE_NAMES.iter().map(|entry| entry.signatures.len()).sum();
-        assert_eq!(TYPE_NAMES.len(), 74, "names");
-        assert_eq!(rows, 94, "rows, which is the pin's 104 less the ten for types we lack");
+        assert_eq!(TYPE_NAMES.len(), 76, "names");
+        assert_eq!(rows, 96, "rows, which is the pin's 104 less the eight for types we lack");
         assert_eq!(type_fields().len(), 17);
     }
 
@@ -367,7 +370,7 @@ mod tests {
         let total = oids.len();
         oids.dedup();
         assert_eq!(oids.len(), total, "two names claim the same oid");
-        assert_eq!(total, 33, "one oid per type this engine has");
+        assert_eq!(total, 34, "one oid per type this engine has");
     }
 
     #[test]
@@ -437,7 +440,7 @@ mod tests {
         assert_eq!(type_category("BOOLEAN"), Some("BOOLEAN"));
         assert_eq!(type_category("INTERVAL"), Some("DATETIME"));
         assert_eq!(type_category("MAP"), Some("COMPOSITE"));
-        for uncategorised in ["NULL", "BIT", "BLOB", "UUID"] {
+        for uncategorised in ["NULL", "BIT", "BIGNUM", "BLOB", "UUID"] {
             assert_eq!(type_category(uncategorised), None, "{uncategorised}");
         }
     }

@@ -2491,7 +2491,7 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
         }
         (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
         (Value::Varchar(a), Value::Varchar(b)) => Ok(a.as_bytes().cmp(b.as_bytes())),
-        (Value::Blob(a), Value::Blob(b)) => Ok(a.cmp(b)),
+        (Value::Blob(a), Value::Blob(b)) | (Value::BigNum(a), Value::BigNum(b)) => Ok(a.cmp(b)),
         (Value::Bit(a), Value::Bit(b)) => Ok(rudb_common::bit::cmp(a, b)),
         // The stored form of a UUID is flipped so that this is the order of its text.
         (Value::Uuid(a), Value::Uuid(b)) => Ok(a.cmp(b)),

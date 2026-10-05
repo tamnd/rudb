@@ -64,6 +64,8 @@ pub enum Value {
     Blob(Vec<u8>),
     /// `BIT`, in the layout [`crate::bit`] describes.
     Bit(Vec<u8>),
+    /// `BIGNUM`, in the layout [`crate::bignum`] describes, whose bytes order as the numbers do.
+    BigNum(Vec<u8>),
     /// `UUID`, in the stored form [`crate::uuid`] describes, which is the pin's and orders the way
     /// the text does.
     Uuid(i128),
@@ -235,7 +237,7 @@ impl Value {
     fn heap(&self) -> usize {
         match self {
             Self::Varchar(text) => text.capacity(),
-            Self::Blob(bytes) | Self::Bit(bytes) => bytes.capacity(),
+            Self::Blob(bytes) | Self::Bit(bytes) | Self::BigNum(bytes) => bytes.capacity(),
             Self::List { values, .. } => {
                 values.capacity() * size_of::<Self>() + values.iter().map(Self::heap).sum::<usize>()
             }
@@ -294,6 +296,7 @@ impl Value {
             Self::Varchar(_) => LogicalType::Varchar,
             Self::Blob(_) => LogicalType::Blob,
             Self::Bit(_) => LogicalType::Bit,
+            Self::BigNum(_) => LogicalType::BigNum,
             Self::Uuid(_) => LogicalType::Uuid,
             Self::Date(_) => LogicalType::Date,
             Self::Time(_) => LogicalType::Time,
@@ -345,6 +348,7 @@ impl Value {
             | (Self::Varchar(_), T::Varchar)
             | (Self::Blob(_), T::Blob)
             | (Self::Bit(_), T::Bit)
+            | (Self::BigNum(_), T::BigNum)
             | (Self::Uuid(_), T::Uuid)
             | (Self::Date(_), T::Date)
             | (Self::Time(_), T::Time)
@@ -421,6 +425,7 @@ impl fmt::Display for Value {
             Self::Varchar(v) => f.write_str(v),
             Self::Blob(v) => write_blob(f, v),
             Self::Bit(v) => f.write_str(&crate::bit::to_text(v)),
+            Self::BigNum(v) => f.write_str(&crate::bignum::to_text(v)),
             Self::Uuid(v) => crate::uuid::write(f, *v),
             Self::Date(v) => write_date(f, *v),
             Self::Time(v) => write_time(f, *v),

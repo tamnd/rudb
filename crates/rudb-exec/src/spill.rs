@@ -257,6 +257,7 @@ mod tag {
     pub(super) const UUID: u8 = 29;
     pub(super) const MAP: u8 = 30;
     pub(super) const UNION: u8 = 31;
+    pub(super) const BIGNUM: u8 = 32;
 }
 
 /// Writes one value.
@@ -287,6 +288,7 @@ fn put(out: &mut Sink<'_>, value: &Value, ty: &LogicalType) -> Result<()> {
         Value::Varchar(text) => bytes(out, tag::VARCHAR, text.as_bytes()),
         Value::Blob(held) => bytes(out, tag::BLOB, held),
         Value::Bit(held) => bytes(out, tag::BIT, held),
+        Value::BigNum(held) => bytes(out, tag::BIGNUM, held),
         Value::Date(held) => fixed(out, tag::DATE, &held.to_le_bytes()),
         Value::Time(held) => fixed(out, tag::TIME, &held.to_le_bytes()),
         Value::TimeTz(held) => fixed(out, tag::TIME_TZ, &held.to_le_bytes()),
@@ -426,6 +428,11 @@ fn get(reader: &mut BufReader<File>, ty: &LogicalType, reuse: Option<Value>) -> 
             let mut held = vec![0; length(reader)?];
             fill(reader, &mut held)?;
             Value::Bit(held)
+        }
+        tag::BIGNUM => {
+            let mut held = vec![0; length(reader)?];
+            fill(reader, &mut held)?;
+            Value::BigNum(held)
         }
         tag::DATE => Value::Date(i32::from_le_bytes(take(reader)?)),
         tag::TIME => Value::Time(i64::from_le_bytes(take(reader)?)),

@@ -113,10 +113,15 @@ fn structs(from: &[Field], to: &[Field]) -> Option<i64> {
 /// the same and not nested.
 fn widens(source: &LogicalType, target: &LogicalType) -> bool {
     use LogicalType::{
-        BigInt, Date, Decimal, Double, Enum, Float, HugeInt, Integer, SmallInt, Timestamp,
+        BigInt, BigNum, Date, Decimal, Double, Enum, Float, HugeInt, Integer, SmallInt, Timestamp,
         TimestampMs, TimestampNs, TimestampS, TimestampTz, TinyInt, UBigInt, UHugeInt, UInteger,
         USmallInt, UTinyInt, Varchar,
     };
+    // Every integer and a `FLOAT` go into a number of any size, and that goes into a double, which
+    // is how the pin multiplies one.
+    if (source.is_integer() || *source == Float) && *target == BigNum {
+        return true;
+    }
     match source {
         TinyInt => matches!(
             target,
@@ -160,6 +165,7 @@ fn widens(source: &LogicalType, target: &LogicalType) -> bool {
         Float | Decimal { .. } => matches!(target, Float | Double),
         Date => matches!(target, Timestamp | TimestampTz | TimestampMs | TimestampNs | TimestampS),
         Enum(_) => matches!(target, Varchar),
+        BigNum => matches!(target, Double),
         TimestampS => matches!(target, Timestamp | TimestampMs | TimestampNs),
         TimestampMs => matches!(target, Timestamp | TimestampNs),
         TimestampNs => matches!(target, Timestamp),

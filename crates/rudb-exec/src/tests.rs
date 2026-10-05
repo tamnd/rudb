@@ -992,14 +992,14 @@ fn the_types_table_is_one_row_per_name_and_modifier_signature() {
     // in here, and what this holds is that the operator produces a row per signature rather than a
     // row per name.
     let rows = run("TableFunction duckdb_types args=[] #0 [type_name::VARCHAR, type_oid::BIGINT]");
-    assert_eq!(rows.len(), 94);
+    assert_eq!(rows.len(), 96);
     let mut names: Vec<&Value> = rows.iter().map(|row| &row[0]).collect();
     names.dedup();
-    assert_eq!(names.len(), 74);
-    // 33 oids over 94 rows, because a type has one oid and several names and the pin puts it on the
+    assert_eq!(names.len(), 76);
+    // 34 oids over 96 rows, because a type has one oid and several names and the pin puts it on the
     // alphabetically first name's bare row.
     let carried = rows.iter().filter(|row| row[1] != Value::Null).count();
-    assert_eq!(carried, 33);
+    assert_eq!(carried, 34);
 }
 
 #[test]
@@ -1017,8 +1017,8 @@ fn the_types_table_says_what_this_engine_stores_rather_than_what_the_pin_does() 
     assert_eq!(size("varchar"), Value::BigInt(16));
     assert_eq!(size("decimal"), Value::Null);
     assert_eq!(size("row"), Value::BigInt(0));
-    // Five types are in no category at all, which is not an oversight here, it is what the pin
-    // says, and the ten names they go by are these.
+    // Six types are in no category at all, which is not an oversight here, it is what the pin
+    // says, and the twelve names they go by are these.
     let mut uncategorised: Vec<String> = rows
         .iter()
         .filter(|row| row[2] == Value::Null)
@@ -1031,6 +1031,7 @@ fn the_types_table_says_what_this_engine_stores_rather_than_what_the_pin_does() 
     assert_eq!(
         uncategorised,
         [
+            "bignum",
             "binary",
             "bit",
             "bitstring",
@@ -1040,7 +1041,8 @@ fn the_types_table_says_what_this_engine_stores_rather_than_what_the_pin_does() 
             "guid",
             "null",
             "uuid",
-            "varbinary"
+            "varbinary",
+            "varint"
         ]
     );
 }

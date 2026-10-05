@@ -813,7 +813,8 @@ fn value_text(
             | Value::USmallInt(_)
             | Value::UInteger(_)
             | Value::UBigInt(_)
-            | Value::UHugeInt(_),
+            | Value::UHugeInt(_)
+            | Value::BigNum(_),
             _,
         ) => out.push_str(&value.to_string()),
         (Value::Float(number), _) => real_text(f64::from(*number), out),
@@ -1027,6 +1028,12 @@ fn type_name(node: &Node) -> &'static str {
 pub fn cast_from_json(text: &str, target: &LogicalType, try_cast: bool) -> Result<Value> {
     if matches!(target, LogicalType::Varchar | LogicalType::Json) {
         return Ok(Value::Varchar(text.to_string()));
+    }
+    // The pin reads a document the way it reads a JSON file, and that has no reader for this one.
+    if *target == LogicalType::BigNum {
+        return Err(Error::not_implemented(format!(
+            "Cannot read a value of type {target} from a json file"
+        )));
     }
     let document = match read(text) {
         Ok(document) => document,

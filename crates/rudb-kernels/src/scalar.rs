@@ -49,7 +49,7 @@
 //! a `Vec<char>` on every row.
 
 use memchr::memmem;
-use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil};
+use rudb_common::{Error, LogicalType, Result, Value, bignum, civil_from_days, days_from_civil};
 use rudb_vector::{Data, Form, NO_ROW, StringColumn, Validity, Vector, picked};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4682,6 +4682,15 @@ fn arithmetic(
             decimal_arithmetic(op, left, right, *width, *scale, written)
         }
         other if other.is_integer() => integer_arithmetic(op, left, right, ty, written),
+        // A number of any size only adds and subtracts as itself, and the binder sends everything
+        // else through a double, as the pin does.
+        LogicalType::BigNum => match (op, left, right) {
+            (Op::Add, Value::BigNum(a), Value::BigNum(b)) => Ok(Value::BigNum(bignum::add(a, b))),
+            (Op::Subtract, Value::BigNum(a), Value::BigNum(b)) => {
+                Ok(Value::BigNum(bignum::subtract(a, b)))
+            }
+            _ => Err(Error::not_implemented(format!("{} on BIGNUM", op.word()))),
+        },
         other => Err(Error::not_implemented(format!("{} on {other}", op.word()))),
     }
 }
@@ -4879,6 +4888,7 @@ fn divide(left: &Value, right: &Value, returns: &LogicalType) -> Result<Value> {
 
 fn negate(value: &Value, ty: &LogicalType) -> Result<Value> {
     match value {
+        Value::BigNum(held) => Ok(Value::BigNum(bignum::negate(held))),
         Value::Float(v) => Ok(Value::Float(-v)),
         Value::Double(v) => Ok(Value::Double(-v)),
         Value::Decimal { unscaled, width, scale } => {
