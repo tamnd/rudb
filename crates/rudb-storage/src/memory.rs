@@ -167,7 +167,12 @@ pub struct MemoryTable {
     /// They are the end of the tail. A small chunk that comes after them closes them into a chunk
     /// of their own first, so the order the rows arrived in is the order they are read in. Empty
     /// until the first row comes.
-    building: Vec<Builder>,
+    ///
+    /// Shared between copies of the table, as `counts` is, because a transaction takes a copy of
+    /// every table when it starts, and copying a tail of a couple of thousand rows of text there
+    /// was a twentieth of a keyed load in batches of a thousand rows. The copy is made by the
+    /// first row written to it instead, and only by a transaction that writes one.
+    building: Arc<Vec<Builder>>,
     /// How many rows are in `building`.
     built: usize,
     /// How many rows are in `tail` and `building` together.
@@ -180,7 +185,7 @@ pub struct MemoryTable {
     /// sketch a chunk is a sketch of a thousandth of the column that would have to be unioned with
     /// every other one to say anything. The sketch is fixed size, so one that sees every row costs
     /// the same as one that sees a chunk.
-    counts: Counts,
+    counts: Arc<Counts>,
     /// The grams of every chunk of each string column, built the first time a `LIKE` asks about
     /// the column and dropped whenever a row is added. See [`crate::grams`].
     ///
@@ -208,7 +213,7 @@ impl MemoryTable {
     /// An empty table of the given column types.
     #[must_use]
     pub fn new(types: Vec<LogicalType>) -> Self {
-        let counts = Counts::new(types.len());
+        let counts = Arc::new(Counts::new(types.len()));
         let grams = types.iter().map(|_| OnceLock::new()).collect();
         let lists = types.iter().map(|_| OnceLock::new()).collect();
         let extremes = types.iter().map(|_| OnceLock::new()).collect();
@@ -221,7 +226,7 @@ impl MemoryTable {
             open_rows: 0,
             open_zone: None,
             tail: Vec::new(),
-            building: Vec::new(),
+            building: Arc::default(),
             built: 0,
             tail_rows: 0,
             zones: Vec::new(),
@@ -327,7 +332,7 @@ impl MemoryTable {
         let started = Instant::now();
         let zone = Zone::of(chunk);
         let zoned = Instant::now();
-        self.counts.add(chunk);
+        Arc::make_mut(&mut self.counts).add(chunk);
         self.counts_ns += zoned.elapsed().as_nanos() as u64;
         self.stats_ns += started.elapsed().as_nanos() as u64;
         zone
@@ -366,7 +371,10 @@ impl MemoryTable {
         if self.built == 0 {
             return Ok(());
         }
-        let columns = self.building.iter_mut().map(Builder::finish).collect::<Result<Vec<_>>>()?;
+        let columns = Arc::make_mut(&mut self.building)
+            .iter_mut()
+            .map(Builder::finish)
+            .collect::<Result<Vec<_>>>()?;
         self.tail.push(Chunk::with_rows(columns, self.built)?.into_pages());
         self.built = 0;
         Ok(())
@@ -499,8 +507,11 @@ impl MemoryTable {
         let tasks: Vec<(usize, usize)> =
             columns.iter().flat_map(|&column| (0..parts).map(move |part| (column, part))).collect();
         // Each part turns away what the column's sketch would drop anyway, see [`Partial::under`].
-        let ceilings: Vec<Option<u64>> =
-            self.counts.columns_mut().iter().map(|counting| counting.ceiling()).collect();
+        let ceilings: Vec<Option<u64>> = Arc::make_mut(&mut self.counts)
+            .columns_mut()
+            .iter()
+            .map(|counting| counting.ceiling())
+            .collect();
         let done: Vec<Mutex<Option<Counted>>> =
             (0..self.types.len() * parts).map(|_| Mutex::new(None)).collect();
         let next = AtomicUsize::new(0);
@@ -546,7 +557,7 @@ impl MemoryTable {
         }
         let mut done = done.into_iter();
         let mut ranges = Vec::with_capacity(self.types.len());
-        for mut counting in self.counts.columns_mut() {
+        for mut counting in Arc::make_mut(&mut self.counts).columns_mut() {
             let mut taken = Vec::with_capacity(chunks.len());
             for slot in done.by_ref().take(parts) {
                 let (partial, run) = slot
@@ -1226,7 +1237,7 @@ impl MemoryTable {
         // Past the tail's first row the tail's zone is widened in place from the values.
         if self.tail_rows > 0 && Zone::takes_row(row, &self.types) {
             self.build(row)?;
-            self.counts.add_row(row);
+            Arc::make_mut(&mut self.counts).add_row(row);
             if let Some(last) = self.zones.last_mut() {
                 last.widen_row(row, &self.types);
             }
@@ -1234,7 +1245,7 @@ impl MemoryTable {
         }
         if let Some(zone) = Zone::of_row(row, &self.types) {
             self.build(row)?;
-            self.counts.add_row(row);
+            Arc::make_mut(&mut self.counts).add_row(row);
             return self.trail(zone, 1);
         }
         let mut columns = Vec::with_capacity(self.types.len());
@@ -1265,7 +1276,7 @@ impl MemoryTable {
                 .map(|column| chunk.try_value_at(row, column))
                 .collect::<Result<Vec<_>>>();
             if values.and_then(|values| self.build(&values)).is_err() {
-                for builder in &mut self.building {
+                for builder in Arc::make_mut(&mut self.building) {
                     builder.truncate(start);
                 }
                 self.built = start;
@@ -1277,13 +1288,13 @@ impl MemoryTable {
 
     /// Pushes one row into the columns being built, all of it or none of it.
     fn build(&mut self, row: &[Value]) -> Result<()> {
-        if self.building.is_empty() {
-            self.building =
-                self.types.iter().map(|ty| Builder::new(ty.clone(), VECTOR_SIZE)).collect();
+        let building = Arc::make_mut(&mut self.building);
+        if building.is_empty() {
+            *building = self.types.iter().map(|ty| Builder::new(ty.clone(), VECTOR_SIZE)).collect();
         }
         for (at, value) in row.iter().enumerate() {
-            if let Err(error) = self.building[at].push(value) {
-                for builder in &mut self.building[..at] {
+            if let Err(error) = building[at].push(value) {
+                for builder in &mut building[..at] {
                     builder.truncate(self.built);
                 }
                 return Err(error);
@@ -1597,7 +1608,7 @@ impl MemoryTable {
             if let Some(zone) = self.zones.get_mut(chunk) {
                 zone.rewrite(column, was_null, value, &self.types[column]);
             }
-            self.counts.rewrite(column, value);
+            Arc::make_mut(&mut self.counts).rewrite(column, value);
         }
         Ok(true)
     }
@@ -1669,6 +1680,37 @@ fn lay_runs(types: &[LogicalType], runs: &[&[Chunk]], threads: usize) -> Vec<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copy_of_a_table_writes_its_rows_being_built_and_counts_apart_from_the_original() {
+        let types = vec![LogicalType::BigInt, LogicalType::Varchar];
+        let row = |at: i64| vec![Value::BigInt(at), Value::Varchar(format!("value {at}"))];
+        let mut table = MemoryTable::new(types);
+        for at in 0..10 {
+            table.append_row(&row(at)).expect("a row of the table's type");
+        }
+        let mut copy = table.clone();
+        assert!(Arc::ptr_eq(&copy.building, &table.building), "the copy shares the rows");
+        assert!(Arc::ptr_eq(&copy.counts, &table.counts), "the copy shares the counts");
+        for at in 10..15 {
+            copy.append_row(&row(at)).expect("a row of the table's type");
+        }
+        table.append_row(&row(99)).expect("a row of the table's type");
+        let read = |table: &MemoryTable| {
+            (0..table.chunk_count())
+                .flat_map(|chunk| {
+                    let chunk = table.read(chunk, &[0, 1]).expect("a chunk");
+                    (0..chunk.len()).map(move |at| chunk.value_at(at, 0)).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(read(&copy), (0..15).map(Value::BigInt).collect::<Vec<_>>());
+        let mut kept = (0..10).map(Value::BigInt).collect::<Vec<_>>();
+        kept.push(Value::BigInt(99));
+        assert_eq!(read(&table), kept);
+        assert_eq!(copy.distinct_values(0), Some(15));
+        assert_eq!(table.distinct_values(0), Some(11));
+    }
 
     #[test]
     fn a_chunk_whose_grams_lack_a_word_is_ruled_out_until_rows_arrive() {
