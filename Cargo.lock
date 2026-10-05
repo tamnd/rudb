@@ -503,6 +503,7 @@ dependencies = [
  "rudb-encoding",
  "rudb-functions",
  "rudb-native",
+ "rudb-parse",
  "rudb-storage",
  "rudb-txn",
  "rudb-vector",

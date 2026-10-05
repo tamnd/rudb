@@ -31,6 +31,7 @@ mod layers;
 mod linkjoin;
 mod native;
 mod parquet;
+mod postgres;
 mod profile;
 mod refusals;
 mod rids;
@@ -68,6 +69,8 @@ fn main() -> ExitCode {
             let source = rest.iter().find(|arg| *arg != "--check").map(String::as_str);
             unicode::generate(source, rest.iter().any(|arg| arg == "--check"))
         }
+        Some("pg-vendor") => postgres::vendor(std::env::args().nth(2).as_deref()),
+        Some("pg-check") => postgres::check(),
         Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
         Some("version") => version::set(&root(), std::env::args().nth(2).as_deref()),
         // With a suite name it is the whole comparison against every engine on the machine, which
@@ -179,6 +182,10 @@ fn usage() {
     println!(
         "  gen-grammar [--check]  regenerate the parser's and rudb-common's tables from that grammar"
     );
+    println!("  pg-vendor <checkout>  copy the PostgreSQL files from a checkout at the pin and");
+    println!("           regenerate the SQLSTATE list from them");
+    println!("  pg-check the vendored PostgreSQL files match VENDOR and the generated files match");
+    println!("           what their generators write today");
     println!("  gen-unicode <utf8proc_data.cpp> [--check]  regenerate the grapheme break and");
     println!("           normalization tables from the pin's copy of utf8proc, out of a duckdb");
     println!("           checkout at the pin");
@@ -363,6 +370,7 @@ fn ci(full: bool) -> Result<(), String> {
         step("grammar", vendor::verify)?;
         step("grammar codegen", || codegen::generate(true))?;
     }
+    step("postgres files", postgres::check)?;
     step("fmt", || fmt(&focus))?;
 
     if focus.no_code() {
