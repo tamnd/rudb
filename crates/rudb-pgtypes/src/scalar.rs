@@ -3,8 +3,8 @@
 //! Each function is a port of the input or output function of the type in
 //! `src/backend/utils/adt`: `boolin` and `parse_bool_with_len` in `bool.c`, `charin` and `charout`
 //! in `char.c`, `namein` in `name.c`, `byteain` and `byteaout` in `bytea.c` with `hex_decode` in
-//! `encode.c`, and `string_to_uuid` and `uuid_out` in `uuid.c`. `text`, `varchar` and `json` need
-//! no function here: their text form is the string.
+//! `encode.c`, and `string_to_uuid` and `uuid_out` in `uuid.c`. The string types with a length
+//! and `json` are in their own modules.
 
 use rudb_common::SqlState;
 

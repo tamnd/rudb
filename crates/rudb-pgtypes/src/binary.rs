@@ -60,6 +60,34 @@ impl<'a> Recv<'a> {
         rest
     }
 
+    /// The rest of the value as a string in the server encoding, as `pq_getmsgtext` reads it for
+    /// `textrecv`, `varcharrecv`, `json_recv` and the other string types. The client encoding is
+    /// UTF-8, so the check is the check of `pg_verify_mbstr`: a zero byte or a byte sequence that
+    /// is not UTF-8 is an error that shows the bytes of the bad character.
+    pub fn text(&mut self) -> Result<&'a str, TypeError> {
+        let rest = self.rest();
+        let valid = match std::str::from_utf8(rest) {
+            Ok(text) if !text.contains('\0') => return Ok(text),
+            Ok(text) => text.len(),
+            Err(error) => error.valid_up_to(),
+        };
+        let bad = rest[..valid].iter().position(|&b| b == 0).unwrap_or(valid);
+        // pg_encoding_mblen_or_incomplete gives the length from the first byte.
+        let len = match rest[bad] {
+            b if b & 0x80 == 0 => 1,
+            b if b & 0xe0 == 0xc0 => 2,
+            b if b & 0xf0 == 0xe0 => 3,
+            b if b & 0xf8 == 0xf0 => 4,
+            _ => 1,
+        };
+        let bytes: Vec<String> =
+            rest[bad..].iter().take(len).map(|b| format!("0x{b:02x}")).collect();
+        Err(TypeError::new(
+            SqlState::CHARACTER_NOT_IN_REPERTOIRE,
+            format!("invalid byte sequence for encoding \"UTF8\": {}", bytes.join(" ")),
+        ))
+    }
+
     /// `boolrecv`: any byte other than 0 is true.
     pub fn bool(&mut self) -> Result<bool, TypeError> {
         Ok(self.byte()? != 0)
@@ -149,6 +177,17 @@ mod tests {
         assert_eq!(Recv::new(&[0xff; 4]).u32(), Ok(u32::MAX));
         let mut recv = Recv::new(b"abc");
         assert_eq!((recv.rest(), recv.finish(1)), (&b"abc"[..], Ok(())));
+    }
+
+    #[test]
+    fn a_string_must_be_utf8_with_no_zero_byte() {
+        assert_eq!(Recv::new("aé".as_bytes()).text(), Ok("aé"));
+        let message = |bytes: &[u8]| Recv::new(bytes).text().unwrap_err().message;
+        assert_eq!(message(b"a\0b"), "invalid byte sequence for encoding \"UTF8\": 0x00");
+        assert_eq!(message(b"a\xc3("), "invalid byte sequence for encoding \"UTF8\": 0xc3 0x28");
+        assert_eq!(message(b"\xe2\x82"), "invalid byte sequence for encoding \"UTF8\": 0xe2 0x82");
+        assert_eq!(message(b"\xff"), "invalid byte sequence for encoding \"UTF8\": 0xff");
+        assert_eq!(Recv::new(b"\xed\xa0\x80").text().unwrap_err().sqlstate.as_str(), "22021");
     }
 
     #[test]

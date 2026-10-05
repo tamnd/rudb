@@ -5,7 +5,10 @@
 //! with `send` has the hex of the binary output. For the output of the date and time types the
 //! input is the hex of the binary form. A type that starts with `in` is the text input of a date or
 //! time type with a typmod, and the output is the hex of the binary form. Its setting is the
-//! `DateStyle` and the `TimeZone` after a `|`, or the `IntervalStyle`.
+//! `DateStyle` and the `TimeZone` after a `|`, or the `IntervalStyle`. A string type or `json`
+//! after `in` has no setting, and `inhex` is the same with the hex of the input, for an input with
+//! a control character. A type that starts with `coerce` is the length cast of `varchar` or
+//! `bpchar` with the typmod and `true` for an explicit cast.
 
 use rudb_pgtypes::*;
 
@@ -145,6 +148,22 @@ fn datetime_in(
     Ok(hex(&out))
 }
 
+/// The text input of a string type or `json`, as the hex of the binary form. The binary form of
+/// each is the bytes of the string, so the receive function is the same after the encoding check.
+fn string_in(type_name: &str, typmod: i32, input: &str) -> Option<Result<String, TypeError>> {
+    let result = match type_name {
+        "text" => Ok(input.to_string()),
+        "varchar" => varchar_in(input, typmod).map(str::to_string),
+        "bpchar" => bpchar_in(input, typmod).map(|v| v.into_owned()),
+        "json" => json_in(input).map(str::to_string),
+        _ => return None,
+    };
+    Some(result.map(|v| {
+        assert_eq!(Recv::new(v.as_bytes()).text(), Ok(&v[..]));
+        hex(v.as_bytes())
+    }))
+}
+
 /// The typmod of `numeric` or `numeric(p,s)`.
 fn numeric_typmod(type_name: &str) -> Option<i32> {
     let args = type_name.strip_prefix("numeric")?;
@@ -183,9 +202,29 @@ fn run(type_name: &str, setting: &str, input: &str) -> String {
         Some(base) => (true, base),
         None => (false, type_name),
     };
+    if let Some(rest) = type_name.strip_prefix("inhex ") {
+        let input = String::from_utf8(unhex(input)).unwrap();
+        return run(&format!("in {rest}"), setting, &input);
+    }
     if let Some(rest) = type_name.strip_prefix("in ") {
         let (base, typmod) = rest.split_once(' ').unwrap();
-        return error_text(datetime_in(base, typmod.parse().unwrap(), setting, input));
+        let typmod = typmod.parse().unwrap();
+        if let Some(result) = string_in(base, typmod, input) {
+            return error_text(result);
+        }
+        return error_text(datetime_in(base, typmod, setting, input));
+    }
+    if let Some(rest) = type_name.strip_prefix("coerce ") {
+        let [base, typmod, explicit] = rest.split(' ').collect::<Vec<_>>()[..] else {
+            panic!("a coerce line needs a type, a typmod and t or f: {type_name}");
+        };
+        let (typmod, explicit) = (typmod.parse().unwrap(), explicit == "true");
+        let result = match base {
+            "varchar" => varchar_coerce(input, typmod, explicit).map(|v| hex(v.as_bytes())),
+            "bpchar" => bpchar_coerce(input, typmod, explicit).map(|v| hex(v.as_bytes())),
+            _ => panic!("the fixture has a type that the test does not know: {type_name}"),
+        };
+        return error_text(result);
     }
     if let Some(typmod) = numeric_typmod(base) {
         return error_text(numeric(typmod, send, input));

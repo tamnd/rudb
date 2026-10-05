@@ -334,3 +334,88 @@ begin
 end
 $$;
 select * from pg_temp.dtins();
+-- The string types and json. The type is "in", the name in pg_type and the typmod, and the output
+-- is the hex of the binary output. "inhex" has the hex of the input, for an input with a control
+-- character. "coerce" is the length cast with the typmod and t for an explicit cast.
+create temp table strins (n serial, i text);
+insert into strins (i) values (''), (' '), ('    '), ('a'), ('ab'), ('abc'), ('abcd'), ('abc '),
+  ('abc  '), ('ab  '), ('a   b'), ('abc d'), ('ééé'), ('éééé'), ('ééé  '), ('éé'), ('é é'),
+  (E'abc\t'), (E'ab\n'), ('日本語'), ('日本語x'), ('日本 ');
+create temp table jsonins (n serial, i text);
+insert into jsonins (i) values ('1'), ('-0'), ('0'), ('1.5e10'), ('-1.5E-10'), ('1e+5'), ('0.5'),
+  ('true'), ('false'), ('null'), ('"abc"'), ('""'), ('"é"'), ('"😀"'), ('"\u0000"'),
+  ('"\ud800"'), ('"\uDC00x"'), ('[]'), ('{}'), ('[1,2,3]'), ('{"a":1,"b":[true,null,{"c":"d"}]}'),
+  (' [ 1 , 2 ] '), ('{"a":1,"a":2}'), ('"é"'), ('"\/"'), ('"\b\f\n\r\t\"\\"'), (E'[1,\n2]'),
+  (E'\t{}\r\n'), ('"a b"'), ('[[[[[]]]]]'), ('{"":{"":{}}}'), ('-0.0e-0'), ('"ኯ"'), (''),
+  (' '), ('01'), ('-'), ('-a'), ('1.'), ('.5'), ('1.e5'), ('1e'), ('1e+'), ('+1'), ('tru'),
+  ('True'), ('nul'), ('falsey'), ('undefined'), ('NaN'), ('Infinity'), ('-Infinity'), ('['),
+  (']'), ('[1'), ('[1,'), ('[1,]'), ('[,1]'), ('[1 2]'), ('{'), ('{"a"'), ('{"a":'), ('{"a":1'),
+  ('{"a":1,'), ('{"a" 1}'), ('{a:1}'), ('{1:2}'), ('{"a":1,}'), ('{"a":1 "b":2}'), ('{,}'),
+  ('"abc'), ('"abc\'), ('"\x"'), ('"\u12"'), ('"\u12g4"'), ('"\uzzzz"'), (E'"a\tb"'), (E'"\n"'),
+  (E'"\x01"'), ('"\é"'), ('1 2'), ('[] []'), ('{}}'), ('[]]'), ('é'), ('1é'), ('"a"b'),
+  ('[1]x'), ('1.5.3'), ('#'), ('[#]'), ('"\'), ('/'), ('{"a":1}garbage'), ('nullx'), (' null '),
+  ('[-]'), ('[1,-]'), ('{"a":tru}'), ('"\u"'), ('"\u00"'), ('"abc\"'), ('123abc'), ('[1e5x]'),
+  ('"\q"'), ('{"a":[1,2}'), ('[{"a":1]'), ('1e5_'), ('{"a":}'), ('{"a"::1}'), ('[:]'), ('{]'),
+  ('[}'), ('"日本"'), ('"\日"'), ('日本'), ('{"a":1}}'), ('1-2'), ('-01'), ('00'), ('1E5'),
+  ('[1,2,]'), ('{"a"}'), ('"a""b"'), ('[true false]'), ('{"a":1 , "b" : [ ] }'), ('\'), ('"'),
+  ('[,]'), (','), (':'), ('{"a":1,"b"}'), ('{"a",}');
+create function pg_temp.strin(t text, i text) returns text language plpgsql as $$
+declare
+  valid boolean;
+  r text;
+  ty pg_type := (select p from pg_type p where oid = to_regtype(t));
+begin
+  -- A plain call keeps the type of the first call in its plan, so the checks use execute.
+  execute format('select pg_input_is_valid(%L, %L)', i, t) into valid;
+  if not valid then
+    execute format('select ''ERROR '' || sql_error_code || '' '' || message || coalesce('' DETAIL '' || detail, '''') || coalesce('' HINT '' || hint, '''') from pg_input_error_info(%L, %L)', i, t)
+      into r;
+    return r;
+  end if;
+  if ty.typinput::text in ('json_in', 'textin') then
+    execute format('select encode(%s(%s(%L::cstring)), ''hex'')', ty.typsend, ty.typinput, i) into r;
+  else
+    execute format('select encode(%s(%s(%L::cstring, %s, %s)), ''hex'')', ty.typsend, ty.typinput,
+      i, ty.oid, to_regtypemod(t)) into r;
+  end if;
+  return r;
+end
+$$;
+create function pg_temp.coerce(t text, i text, explicit boolean) returns text language plpgsql as $$
+declare
+  r text;
+  name text := (select typname from pg_type where oid = to_regtype(t));
+begin
+  execute format('select encode(%s(%I(%L::%s, %s, %L)), ''hex'')', name || 'send', name, i, name,
+    to_regtypemod(t), explicit) into r;
+  return r;
+exception when others then
+  return 'ERROR ' || sqlstate || ' ' || sqlerrm;
+end
+$$;
+create function pg_temp.strins() returns table (t text, s text, i text, o text)
+language plpgsql as $$
+declare
+  ty text;
+  ex boolean;
+begin
+  foreach ty in array array['text', 'varchar', 'varchar(1)', 'varchar(3)', 'bpchar', 'character(1)',
+    'character(3)'] loop
+    return query select case when x.i ~ '[\x01-\x1f]' then 'inhex ' else 'in ' end
+      || (select typname from pg_type where oid = to_regtype(ty)) || ' ' || to_regtypemod(ty), '',
+      case when x.i ~ '[\x01-\x1f]' then encode(convert_to(x.i, 'UTF8'), 'hex') else x.i end,
+      pg_temp.strin(ty, x.i) from strins x order by n;
+  end loop;
+  foreach ty in array array['varchar(1)', 'varchar(3)', 'character(1)', 'character(3)'] loop
+    foreach ex in array array[true, false] loop
+      return query select 'coerce ' || (select typname from pg_type where oid = to_regtype(ty)) || ' '
+        || to_regtypemod(ty) || ' ' || ex, '', x.i, pg_temp.coerce(ty, x.i, ex)
+        from strins x where x.i !~ '[\x01-\x1f]' order by n;
+    end loop;
+  end loop;
+  return query select case when x.i ~ '[\x01-\x1f]' then 'inhex ' else 'in ' end || 'json -1', '',
+    case when x.i ~ '[\x01-\x1f]' then encode(convert_to(x.i, 'UTF8'), 'hex') else x.i end,
+    pg_temp.strin('json', x.i) from jsonins x order by n;
+end
+$$;
+select * from pg_temp.strins();
