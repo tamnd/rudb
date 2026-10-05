@@ -44,6 +44,7 @@ const VENDORS: [Vendor; 3] = [
         dir: "crates/rudb-pgtypes/vendor",
         files: &[
             ("src/include/catalog/pg_type.dat", "pg_type.dat"),
+            ("src/timezone/tznames/Default", "tznames-Default"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },

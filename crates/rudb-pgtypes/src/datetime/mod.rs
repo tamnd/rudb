@@ -13,7 +13,14 @@
 //! the functions in `date.c` and `timestamp.c`, with the same range checks and the same rounding
 //! to the typmod.
 
+mod decode;
+
 use rudb_common::SqlState;
+
+pub use decode::{
+    Abbrev, DateTimeInput, NoZones, ZoneAbbrevs, ZoneLookup, date_in, interval_in, time_in,
+    timestamp_in, timestamptz_in, timetz_in,
+};
 
 use crate::binary::Recv;
 use crate::error::TypeError;
@@ -99,6 +106,38 @@ pub enum IntervalStyle {
 /// in seconds since 1970-01-01 UTC, as `pg_localtime` gives them.
 pub trait TimeZone {
     fn at(&self, unix_seconds: i64) -> (i32, &str);
+
+    /// The offset east of UTC before the first change of the rules after an instant, and the
+    /// instant and the offset of that change, as `pg_next_dst_boundary` gives them.
+    fn next_change(&self, unix_seconds: i64) -> (i32, Option<(i64, i32)>) {
+        (self.at(unix_seconds).0, None)
+    }
+
+    /// The meaning of an abbreviation in upper case in this zone over all of its history, as
+    /// `pg_interpret_timezone_abbrev` gives it.
+    fn abbrev_meaning(&self, _abbrev: &str) -> Option<AbbrevMeaning> {
+        None
+    }
+
+    /// The offset east of UTC and the daylight saving flag of an abbreviation in upper case at an
+    /// instant, as `pg_timezone_abbrev_is_known` gives them.
+    fn abbrev_at(&self, _abbrev: &str, _unix_seconds: i64) -> Option<(i32, bool)> {
+        None
+    }
+
+    /// The offset east of UTC if the zone has one offset at all instants.
+    fn fixed_offset(&self) -> Option<i32> {
+        None
+    }
+}
+
+/// The meaning of a time zone abbreviation in the zone that uses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbbrevMeaning {
+    /// One offset east of UTC at all instants, and whether it is daylight saving time.
+    Fixed { offset: i32, dst: bool },
+    /// The offset changed over the history of the zone.
+    Varies,
 }
 
 /// A zone with one offset at all instants, such as `UTC`.
@@ -118,6 +157,19 @@ impl FixedZone {
 impl TimeZone for FixedZone {
     fn at(&self, _: i64) -> (i32, &str) {
         (self.offset, &self.abbrev)
+    }
+
+    fn abbrev_meaning(&self, abbrev: &str) -> Option<AbbrevMeaning> {
+        (!self.abbrev.is_empty() && abbrev == self.abbrev)
+            .then_some(AbbrevMeaning::Fixed { offset: self.offset, dst: false })
+    }
+
+    fn abbrev_at(&self, abbrev: &str, _: i64) -> Option<(i32, bool)> {
+        (!self.abbrev.is_empty() && abbrev == self.abbrev).then_some((self.offset, false))
+    }
+
+    fn fixed_offset(&self) -> Option<i32> {
+        Some(self.offset)
     }
 }
 
@@ -140,13 +192,19 @@ fn out_of_range(what: &str) -> TypeError {
 }
 
 /// `date2j`: the Julian day of a date in the proleptic Gregorian calendar. The year before 1 is 0.
+///
+/// The arithmetic wraps as the C code does on a value far out of range. The callers check the range
+/// before they use the result.
 pub fn date2j(year: i32, month: i32, day: i32) -> i32 {
-    let (month, year) =
-        if month > 2 { (month + 1, year + 4800) } else { (month + 13, year + 4799) };
+    let (month, year) = if month > 2 {
+        (month.wrapping_add(1), year.wrapping_add(4800))
+    } else {
+        (month.wrapping_add(13), year.wrapping_add(4799))
+    };
     let century = year / 100;
-    let mut julian = year * 365 - 32167;
-    julian += year / 4 - century + century / 4;
-    julian + 7834 * month / 256 + day
+    let julian = year.wrapping_mul(365).wrapping_sub(32167);
+    let julian = julian.wrapping_add(year / 4 - century + century / 4);
+    julian.wrapping_add(7834i32.wrapping_mul(month) / 256).wrapping_add(day)
 }
 
 /// `j2date`: the year, the month and the day of a Julian day.
@@ -154,7 +212,7 @@ pub fn j2date(jd: i32) -> (i32, u32, u32) {
     let mut julian = (jd as u32).wrapping_add(32044);
     let mut quad = julian / 146097;
     let extra = (julian - quad * 146097) * 4 + 3;
-    julian += 60 + quad * 3 + extra / 146097;
+    julian = julian.wrapping_add(60 + quad * 3 + extra / 146097);
     quad = julian / 1461;
     julian -= quad * 1461;
     let mut y = julian * 4 / 1461;
@@ -467,7 +525,16 @@ pub fn timestamp_recv(recv: &mut Recv<'_>, typmod: i32) -> Result<i64, TypeError
     if Fields::of_timestamp(ts).is_none() || !(MIN_TIMESTAMP..END_TIMESTAMP).contains(&ts) {
         return Err(out_of_range("timestamp"));
     }
-    if typmod == -1 || typmod == MAX_TIME_PRECISION {
+    adjust_timestamp(ts, typmod)
+}
+
+/// `AdjustTimestampForTypmod`.
+fn adjust_timestamp(ts: i64, typmod: i32) -> Result<i64, TypeError> {
+    if ts == TIMESTAMP_NEGATIVE_INFINITY
+        || ts == TIMESTAMP_INFINITY
+        || typmod == -1
+        || typmod == MAX_TIME_PRECISION
+    {
         return Ok(ts);
     }
     if !(0..=MAX_TIME_PRECISION).contains(&typmod) {
@@ -666,10 +733,15 @@ pub fn interval_out(iv: &Interval, style: IntervalStyle, out: &mut Vec<u8>) {
     }
 }
 
-/// `interval_recv` with `AdjustIntervalForTypmod`: the fields after the last field of the typmod
-/// are cleared, and the microseconds are rounded to the precision.
+/// `interval_recv`: the fields after the last field of the typmod are cleared, and the
+/// microseconds are rounded to the precision.
 pub fn interval_recv(recv: &mut Recv<'_>, typmod: i32) -> Result<Interval, TypeError> {
-    let mut iv = Interval { time: recv.i64()?, day: recv.i32()?, month: recv.i32()? };
+    let iv = Interval { time: recv.i64()?, day: recv.i32()?, month: recv.i32()? };
+    adjust_interval(iv, typmod)
+}
+
+/// `AdjustIntervalForTypmod`.
+fn adjust_interval(mut iv: Interval, typmod: i32) -> Result<Interval, TypeError> {
     if typmod < 0 || iv == Interval::INFINITY || iv == Interval::NEGATIVE_INFINITY {
         return Ok(iv);
     }

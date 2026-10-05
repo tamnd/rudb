@@ -36,6 +36,12 @@
 //! gives the offset and the abbreviation at an instant. The receive functions check the range and
 //! round to the typmod. [`date2j`] and [`j2date`] convert between a calendar date and a Julian day.
 //!
+//! The text input of the same types, [`date_in`], [`time_in`], [`timetz_in`], [`timestamp_in`],
+//! [`timestamptz_in`] and [`interval_in`], is a port of the decoder in `datetime.c`. It reads the
+//! session state from a [`DateTimeInput`]: the field order, the time zone, the zone names, the
+//! time zone abbreviations and the time of the transaction start. [`ZoneAbbrevs`] reads a file of
+//! `src/timezone/tznames`, and [`ZoneAbbrevs::postgres_default`] is the `Default` set.
+//!
 //! [`Recv`], the binary input of a `Bind` parameter, with the errors of PostgreSQL when the value
 //! is too short or too long. The binary output of the other types is the value in big-endian bytes.
 //!
@@ -44,8 +50,10 @@
 //! The input functions take a string in the server encoding, which is UTF-8. The caller converts
 //! from the client encoding first.
 //!
-//! The text input of the date and time types is not here yet. Only [`FixedZone`] implements
-//! [`TimeZone`], so a zone with daylight saving time needs the tz database, which comes later.
+//! Only [`FixedZone`] implements [`TimeZone`], and only [`NoZones`] implements [`ZoneLookup`]. So
+//! a zone with daylight saving time, a zone name in the input such as `Europe/Paris`, and an
+//! abbreviation whose offset changed over time such as `MSK` need the tz database, which comes
+//! later. Until then the input refuses a zone name with the error of an unknown zone.
 
 mod binary;
 mod datetime;
@@ -60,11 +68,13 @@ pub mod typmod;
 
 pub use binary::{Recv, name_recv};
 pub use datetime::{
-    DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateFormat, DateOrder, DateStyle, FixedZone, Interval,
-    IntervalStyle, POSTGRES_EPOCH_JDATE, TIMESTAMP_INFINITY, TIMESTAMP_NEGATIVE_INFINITY, TimeZone,
-    UNIX_EPOCH_JDATE, UNIX_TO_POSTGRES_DAYS, UNIX_TO_POSTGRES_USECS, USECS_PER_DAY, USECS_PER_SEC,
-    date_out, date_recv, date2j, interval_out, interval_recv, interval_send, j2date, time_out,
-    time_recv, timestamp_out, timestamp_recv, timestamptz_out, timetz_out, timetz_recv,
+    Abbrev, AbbrevMeaning, DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateFormat, DateOrder, DateStyle,
+    DateTimeInput, FixedZone, Interval, IntervalStyle, NoZones, POSTGRES_EPOCH_JDATE,
+    TIMESTAMP_INFINITY, TIMESTAMP_NEGATIVE_INFINITY, TimeZone, UNIX_EPOCH_JDATE,
+    UNIX_TO_POSTGRES_DAYS, UNIX_TO_POSTGRES_USECS, USECS_PER_DAY, USECS_PER_SEC, ZoneAbbrevs,
+    ZoneLookup, date_in, date_out, date_recv, date2j, interval_in, interval_out, interval_recv,
+    interval_send, j2date, time_in, time_out, time_recv, timestamp_in, timestamp_out,
+    timestamp_recv, timestamptz_in, timestamptz_out, timetz_in, timetz_out, timetz_recv,
 };
 pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};

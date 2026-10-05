@@ -174,7 +174,7 @@ pub fn float4_out(v: f32, extra_float_digits: i32, out: &mut Vec<u8>) {
 
 /// The two float types for the input, with the facts of the IEEE format that a hexadecimal
 /// number needs.
-trait Float: Copy + std::str::FromStr {
+pub(crate) trait Float: Copy + std::str::FromStr {
     /// The significant bits, with the hidden bit.
     const BITS: u32;
     /// The exponent of the last bit of the smallest subnormal value.
@@ -268,7 +268,7 @@ fn from_binary<F: Float>(mantissa: u64, sticky: bool, exp: i64) -> F {
 /// Reads a number as `strtod` does. Returns the value, the end of the number, and whether a
 /// mantissa that is not zero gave zero or a finite number gave infinity, which is `ERANGE` with a
 /// value that PostgreSQL refuses. Returns `None` when there is no number at the start.
-fn strtod<F: Float>(b: &[u8]) -> Option<(F, usize, bool)> {
+pub(crate) fn strtod<F: Float>(b: &[u8]) -> Option<(F, usize, bool)> {
     let at = |i: usize| b.get(i).copied().unwrap_or(0);
     let starts = |i: usize, word: &[u8]| {
         b.get(i..i + word.len()).is_some_and(|s| s.eq_ignore_ascii_case(word))
