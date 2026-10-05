@@ -77,7 +77,21 @@ impl<'a> Frontend<'a> {
     /// [`Level::Error`](crate::Level::Error), except a type byte that `split` would not give,
     /// which is [`Level::Fatal`](crate::Level::Fatal).
     pub fn parse(frame: Frame<'a>) -> Result<Frontend<'a>, ProtocolError> {
-        let mut r = Reader::new(frame.body);
+        Frontend::read(frame, Reader::new(frame.body))
+    }
+
+    /// [`Frontend::parse`] for a session whose client encoding is `UTF8` or `SQL_ASCII`. It also
+    /// checks each string of the message with [`verify_utf8`](crate::verify_utf8), at the place
+    /// where PostgreSQL checks it, so a message with two faults gets the same error as there.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Frontend::parse`], and SQLSTATE `22021` for a string that is not UTF-8.
+    pub fn parse_utf8(frame: Frame<'a>) -> Result<Frontend<'a>, ProtocolError> {
+        Frontend::read(frame, Reader::utf8(frame.body))
+    }
+
+    fn read(frame: Frame<'a>, mut r: Reader<'a>) -> Result<Frontend<'a>, ProtocolError> {
         let message = match frame.tag {
             b'Q' => {
                 let sql = r.string()?;
