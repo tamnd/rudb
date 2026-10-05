@@ -44,7 +44,7 @@ use rudb_common::{LogicalType, Result, Value};
 use rudb_functions::{
     DUCKDB, canonical, column_fields, constraint_fields, database_fields, index_fields,
     numeric_facts, schema_fields, sequence_fields, show_database_fields, show_expanded_fields,
-    show_table_fields, table_fields, type_oid, view_fields,
+    show_table_fields, table_fields, trigger_fields, type_oid, view_fields,
 };
 use rudb_parse::{Kind, quoted, tokenize};
 use rudb_plan::{Plan, Slice};
@@ -210,6 +210,46 @@ pub(crate) fn viewnames(
         }
     }
     Metadata::new("duckdb_views", &view_fields(), &rows, plan, index, columns)
+}
+
+/// Every trigger, in the columns the plan asked for, in the order they were made within each
+/// schema.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn triggernames(
+    catalog: &Catalog,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let mut rows = Vec::new();
+    for database in catalog.databases() {
+        for schema in database.schemas() {
+            for trigger in schema.triggers() {
+                let named = names_of(trigger.columns.iter().cloned());
+                rows.push(vec![
+                    text(database.name()),
+                    Value::BigInt(database.oid()),
+                    text(schema.name()),
+                    Value::BigInt(schema.oid()),
+                    text(&trigger.name),
+                    Value::BigInt(trigger.oid),
+                    text(&trigger.table.table),
+                    text(if trigger.before { "BEFORE" } else { "AFTER" }),
+                    text(trigger.event.word()),
+                    named,
+                    text(if trigger.row { "ROW" } else { "STATEMENT" }),
+                    Value::Null,
+                    empty(),
+                    Value::Boolean(database.internal()),
+                    text(&trigger.sql()),
+                ]);
+            }
+        }
+    }
+    Metadata::new("duckdb_triggers", &trigger_fields(), &rows, plan, index, columns)
 }
 
 /// Every index `CREATE INDEX` made, in the columns the plan asked for.

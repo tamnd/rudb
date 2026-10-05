@@ -11,6 +11,7 @@ use crate::system::{
     INFORMATION_SCHEMA, INTERNAL_VIEWS, PG_CATALOG, SYSTEM_CATALOG, TEMP_CATALOG, statement,
 };
 use crate::table::Table;
+use crate::trigger::Trigger;
 use crate::view::View;
 use rudb_native::Reader as NativeReader;
 
@@ -203,6 +204,7 @@ pub struct Schema {
     views: Vec<View>,
     sequences: Vec<Sequence>,
     types: Vec<UserType>,
+    triggers: Vec<Trigger>,
     oid: i64,
 }
 
@@ -215,8 +217,15 @@ impl Schema {
             views: Vec::new(),
             sequences: Vec::new(),
             types: Vec::new(),
+            triggers: Vec::new(),
             oid,
         }
+    }
+
+    /// The triggers in it, on whichever of its tables, in the order they were made.
+    #[must_use]
+    pub fn triggers(&self) -> &[Trigger] {
+        &self.triggers
     }
 
     /// The sequences in it.
@@ -971,6 +980,7 @@ impl Catalog {
             }
             Some(Entry::Table) => {
                 schema.tables.retain(|held| !same_name(&held.name().table, &name.table));
+                schema.triggers.retain(|held| !same_name(&held.table.table, &name.table));
             }
             Some(Entry::View) => {
                 schema.views.retain(|held| !same_name(&held.name().table, &name.table));
@@ -1188,6 +1198,137 @@ impl Catalog {
         Err(Error::dependency(message))
     }
 
+    /// Keeps a trigger, with the pin's refusal of a name the table already has a trigger under
+    /// unless `replace` or `if_not_exists` says what to do about it.
+    ///
+    /// # Errors
+    ///
+    /// If the schema is missing or the name is taken on that table.
+    pub fn create_trigger(
+        &mut self,
+        mut trigger: Trigger,
+        replace: bool,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let table = trigger.table.clone();
+        let held = self.trigger(&table, &trigger.name).is_some();
+        if held && if_not_exists {
+            return Ok(());
+        }
+        if held && !replace {
+            return Err(Error::catalog(format!(
+                "Trigger with name \"{}\" already exists!",
+                trigger.name
+            )));
+        }
+        self.changed();
+        trigger.oid = self.stamp();
+        let schema = self.schema_mut(&table.catalog, &table.schema)?;
+        schema.triggers.retain(|held| {
+            !(same_name(&held.table.table, &table.table) && same_name(&held.name, &trigger.name))
+        });
+        schema.triggers.push(trigger);
+        Ok(())
+    }
+
+    /// Drops the trigger of that name on a table.
+    ///
+    /// # Errors
+    ///
+    /// If the table has no trigger of that name and `if_exists` was not asked for.
+    pub fn drop_trigger(
+        &mut self,
+        table: &QualifiedName,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<()> {
+        if self.trigger(table, name).is_none() {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(Error::catalog(format!(
+                "Trigger with name \"{name}\" does not exist on table \"{}\"",
+                table.table
+            )));
+        }
+        self.changed();
+        self.schema_mut(&table.catalog, &table.schema)?.triggers.retain(|held| {
+            !(same_name(&held.table.table, &table.table) && same_name(&held.name, name))
+        });
+        Ok(())
+    }
+
+    /// The trigger of that name on a table, if it has one.
+    #[must_use]
+    pub fn trigger(&self, table: &QualifiedName, name: &str) -> Option<&Trigger> {
+        self.triggers_on(table).find(|held| same_name(&held.name, name))
+    }
+
+    /// The triggers on one table, in the order they were made.
+    pub fn triggers_on<'a>(
+        &'a self,
+        table: &QualifiedName,
+    ) -> impl Iterator<Item = &'a Trigger> + use<'a> {
+        let schema = self.schema(&table.catalog, &table.schema).ok();
+        let held = schema.map_or(&[][..], |schema| &schema.triggers[..]);
+        let table = table.table.clone();
+        held.iter().filter(move |held| same_name(&held.table.table, &table))
+    }
+
+    /// Every trigger in every database, in the order they were made within each schema.
+    pub fn triggers(&self) -> impl Iterator<Item = &Trigger> {
+        self.databases
+            .iter()
+            .flat_map(|database| database.schemas.iter())
+            .flat_map(|schema| schema.triggers.iter())
+    }
+
+    /// Refuses to drop a table or a view a trigger on another table reads, in the pin's sentence,
+    /// or with `cascade` drops those triggers first.
+    ///
+    /// # Errors
+    ///
+    /// If a trigger reads it and `cascade` was not asked for.
+    pub fn trigger_dependents(&mut self, name: &QualifiedName, cascade: bool) -> Result<()> {
+        let kind = match self.entry(name) {
+            Ok(Entry::View) => "view",
+            Ok(Entry::Table) => "table",
+            Err(_) => return Ok(()),
+        };
+        let reads = |held: &Trigger| {
+            !same_entry(&held.table, name) && held.reads.iter().any(|read| same_entry(read, name))
+        };
+        let dependents: Vec<(String, QualifiedName)> = self
+            .triggers()
+            .filter(|held| reads(held))
+            .map(|held| (held.name.clone(), held.table.clone()))
+            .collect();
+        if dependents.is_empty() {
+            return Ok(());
+        }
+        if !cascade {
+            let mut message = format!(
+                "Cannot drop entry \"{}\" because there are entries that depend on it.\n",
+                name.table
+            );
+            for (trigger, table) in dependents.iter().rev() {
+                message += &format!(
+                    "trigger \"{trigger}\" on table \"{}\" depends on {kind} \"{}\".\n",
+                    table.table, name.table
+                );
+            }
+            message += "Use DROP...CASCADE to drop all dependents.";
+            return Err(Error::dependency(message));
+        }
+        self.changed();
+        for database in &mut self.databases {
+            for schema in &mut database.schemas {
+                schema.triggers.retain(|held| !reads(held));
+            }
+        }
+        Ok(())
+    }
+
     /// Every made type in every database, in the order they were made within each schema.
     pub fn types(&self) -> impl Iterator<Item = &UserType> {
         self.databases
@@ -1303,6 +1444,20 @@ impl Catalog {
             crate::Alteration::Rename(to) => Some(to.clone()),
             _ => None,
         };
+        // A trigger is on its own table and reads every table its body names. The pin lets its own
+        // table change in any way but its name, and a table the body names, its own included, only
+        // in the ways that leave what the body read where it was.
+        let watched = self.triggers().any(|held| {
+            let own = same_entry(&held.table, name);
+            let read = held.reads.iter().any(|read| same_entry(read, name));
+            (own && renamed.is_some()) || (read && !alteration.keeps_dependents())
+        });
+        if watched {
+            return Err(Error::dependency(format!(
+                "Cannot alter entry \"{}\" because there are entries that depend on it.",
+                name.table
+            )));
+        }
         if self.entry(name)? == Entry::View {
             let Some(to) = renamed else {
                 return Err(Error::catalog("Can only modify view with ALTER VIEW statement"));
@@ -1361,6 +1516,13 @@ impl Catalog {
                 name.table
             )));
         }
+        // `UPDATE OF` names columns, and those follow a rename.
+        let moved_column = match &alteration {
+            crate::Alteration::RenameColumn { column, to, .. } => {
+                original.columns().get(*column).map(|field| (field.name.clone(), to.clone()))
+            }
+            _ => None,
+        };
         let mut table = original.clone();
         table.alter(alteration, rows, workers)?;
         if let Some(to) = &renamed {
@@ -1374,6 +1536,18 @@ impl Catalog {
             return Err(missing_table(&name.table));
         };
         *held = table;
+        if let Some((from, to)) = moved_column {
+            for trigger in &mut schema.triggers {
+                if !same_name(&trigger.table.table, &name.table) {
+                    continue;
+                }
+                for column in &mut trigger.columns {
+                    if same_name(column, &from) {
+                        column.clone_from(&to);
+                    }
+                }
+            }
+        }
         let Some(to) = renamed else { return Ok(()) };
         let moved = QualifiedName::new(name.catalog.clone(), name.schema.clone(), to);
         // What points at the table by name points at the new one: its own foreign keys into
@@ -2068,6 +2242,13 @@ fn system(mut oid: i64) -> (Database, i64) {
 /// same sentence.
 fn in_the_system_catalog() -> Error {
     Error::binder("Cannot create entry in system catalog")
+}
+
+/// Whether two names are the same entry, part by part without regard to case.
+fn same_entry(left: &QualifiedName, right: &QualifiedName) -> bool {
+    same_name(&left.catalog, &right.catalog)
+        && same_name(&left.schema, &right.schema)
+        && same_name(&left.table, &right.table)
 }
 
 fn missing_table(name: &str) -> Error {

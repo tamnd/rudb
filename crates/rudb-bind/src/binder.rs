@@ -36,7 +36,7 @@ use rudb_plan::{
 
 use crate::expr::{describe, has_aggregate};
 use crate::fold;
-use crate::parameters::Parameters;
+use crate::parameters::{Parameters, Written};
 use crate::scope::{Joined, Scope, Visible};
 
 /// Binds a parsed statement against a catalog.
@@ -768,6 +768,11 @@ impl<'a> Binder<'a> {
             ));
         };
         let written = written.clone();
+        self.bind_rows(&written, name)
+    }
+
+    /// Rows known before the statement was bound, as literal rows under `name`.
+    fn bind_rows(&mut self, written: &Written, name: &str) -> Result<(NodeRef, Scope)> {
         // A definition with no `RETURNING` has a row for each row it changed and no columns, and
         // the rows are kept by a column of their own that nothing can name.
         let blank = written.names.is_empty();
@@ -2738,6 +2743,15 @@ impl<'a> Binder<'a> {
         columns: ast::Slice,
     ) -> Result<(NodeRef, Scope)> {
         let parts: Vec<&str> = ast.name(name).collect();
+        // Rows the statement was handed under a name, which a trigger's body reads the rows that
+        // fired it through, and which hide a table of the same name the way a `WITH` does.
+        if let [single] = parts[..]
+            && let Some(rows) = self.parameters.relation(single)
+        {
+            let rows = rows.clone();
+            let label = if alias == NONE { single.to_string() } else { ast.string(alias).to_string() };
+            return self.bind_rows(&rows, &label);
+        }
         let catalog = self.catalog;
         // The catalog is asked first and the file is the fallback, which is the order DuckDB uses:
         // a table really called `mixed.parquet` wins over a file of that name sitting next to it.

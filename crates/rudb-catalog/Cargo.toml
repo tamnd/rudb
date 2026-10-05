@@ -20,6 +20,7 @@ rudb-storage.workspace = true
 rudb-txn.workspace = true
 rudb-functions.workspace = true
 rudb-native.workspace = true
+rudb-parse.workspace = true
 
 [lints]
 workspace = true

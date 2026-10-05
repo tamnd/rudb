@@ -762,6 +762,10 @@ struct Inner {
     /// How many times the compiled engine's queries moved between its tiers, for
     /// [`Database::tier_switches`].
     switches: Mutex<rudb_qc::Switches>,
+    /// Whether a trigger was ever made here, which is what every `INSERT`, `UPDATE` and `DELETE`
+    /// asks before it looks for one. Never set back, since a trigger in a transaction that rolled
+    /// back costs a look and nothing more.
+    triggered: AtomicBool,
 }
 
 /// How many refusals the log keeps.
@@ -1354,6 +1358,7 @@ impl Database {
             native_aggregate_plan: Mutex::default(),
             refusals: Mutex::default(),
             switches: Mutex::default(),
+            triggered: AtomicBool::new(false),
         };
         Self { shared: Shared::first(inner) }
     }
@@ -1534,6 +1539,7 @@ impl Database {
             native_aggregate_plan: Mutex::default(),
             refusals: Mutex::default(),
             switches: Mutex::default(),
+            triggered: AtomicBool::new(false),
         };
         Ok(Self { shared: Shared::first(inner) })
     }
@@ -3112,6 +3118,26 @@ fn joined(held: &[Chunk], fields: &[Field], rows: usize) -> Result<Chunk> {
         columns.push(Vector::from_values(field.ty.clone(), &values)?);
     }
     Chunk::with_rows(columns, rows)
+}
+
+/// The rows of a table at the given numbers, which are in order, with every column of each.
+fn numbered_rows(table: &rudb_catalog::Table, numbers: &[u64]) -> Result<Vec<Vec<Value>>> {
+    let rows = table.rows();
+    let columns: Vec<usize> = (0..table.columns().len()).collect();
+    let mut found = Vec::with_capacity(numbers.len());
+    let mut wanted = numbers.iter().copied().peekable();
+    let mut base = 0;
+    for at in 0..rows.chunk_count() {
+        let end = base + rows.chunk_len(at)? as u64;
+        if wanted.peek().is_some_and(|&number| number < end) {
+            let chunk = rows.read(at, &columns)?;
+            while let Some(number) = wanted.next_if(|&number| number < end) {
+                found.push(chunk.row((number - base) as usize).collect());
+            }
+        }
+        base = end;
+    }
+    Ok(found)
 }
 
 /// The rows an `UPDATE` or a `DELETE` source produced, split by the flag column after the table's.
@@ -4786,6 +4812,24 @@ impl Shared {
         Ok(())
     }
 
+    /// Refuses an alter of `name`, or a trigger on it, when another open transaction altered it or
+    /// made a trigger on it, in the pin's words.
+    fn altering(&self, name: &QualifiedName) -> Result<()> {
+        let id = self.open().as_ref().and_then(|open| open.snapshot.as_ref()).map(|held| held.id);
+        if self.registry().holding(id, name) {
+            return Err(txn::alter_conflict(name));
+        }
+        Ok(())
+    }
+
+    /// Notes that this connection's transaction altered the table `name` or made a trigger on it.
+    fn held(&self, name: QualifiedName) {
+        let id = self.open().as_ref().and_then(|open| open.snapshot.as_ref()).map(|held| held.id);
+        if let Some(id) = id {
+            self.registry().hold(id, name);
+        }
+    }
+
     /// Notes that this connection's transaction created a table named `name`.
     fn created(&self, name: QualifiedName) {
         let id = self.open().as_ref().and_then(|open| open.snapshot.as_ref()).map(|held| held.id);
@@ -5506,6 +5550,24 @@ impl Shared {
         if !unwritten.is_empty() {
             return self.execute_written(ast, sql, parameters, cancel, parse_ns, &unwritten);
         }
+        if self.inner.triggered.load(Ordering::Acquire)
+            && let Some(fired) = self.fired(ast)?
+        {
+            return self
+                .atomically(|| self.run_triggered(ast, sql, parameters, cancel, parse_ns, fired));
+        }
+        self.execute_unfired(ast, sql, parameters, cancel, parse_ns)
+    }
+
+    /// [`Shared::execute_ast`] for a statement no trigger fires on, or the one a trigger fired on.
+    fn execute_unfired(
+        &self,
+        ast: &Ast,
+        sql: &str,
+        parameters: &Parameters,
+        cancel: &Cancel,
+        parse_ns: u64,
+    ) -> Result<QueryResult> {
         let mut deadline = None;
         loop {
             self.conn.blocked.store(0, Ordering::Release);
@@ -5542,11 +5604,17 @@ impl Shared {
         parse_ns: u64,
         unwritten: &[u32],
     ) -> Result<QueryResult> {
+        self.atomically(|| self.run_written(ast, sql, parameters, cancel, parse_ns, unwritten))
+    }
+
+    /// Runs `run` in the open transaction, or in one of its own when none is open, so a failure
+    /// anywhere in it undoes all of it.
+    fn atomically(&self, run: impl FnOnce() -> Result<QueryResult>) -> Result<QueryResult> {
         let own = !self.transacting();
         if own {
             *self.open() = Some(Open::new(false));
         }
-        let result = self.run_written(ast, sql, parameters, cancel, parse_ns, unwritten);
+        let result = run();
         if !own {
             return result;
         }
@@ -5561,6 +5629,134 @@ impl Shared {
         closed?;
         settled?;
         Ok(result)
+    }
+
+    /// The triggers an `INSERT`, an `UPDATE` or a `DELETE` fires, in the order they run, or `None`
+    /// for any other statement and for one that fires none.
+    ///
+    /// The refusals the pin makes of the statement because of a trigger on its table are made here,
+    /// before anything runs, so they hold for a statement that would change no rows as well.
+    fn fired(&self, ast: &Ast) -> Result<Option<Vec<rudb_catalog::Trigger>>> {
+        use rudb_catalog::Event;
+        let (at, event) = match ast.statements.as_slice() {
+            [ast::Statement::Insert(at)] => (*at, Event::Insert),
+            [ast::Statement::Update(at)] => (*at, Event::Update),
+            [ast::Statement::Delete(at)] => (*at, Event::Delete),
+            _ => return Ok(None),
+        };
+        let written = &ast.inserts[at as usize];
+        let parts: Vec<&str> = ast.name(written.name).collect();
+        let catalog = self.read();
+        // A table that is not there is the statement's own error to make.
+        let Ok(table) = catalog.resolve(&parts) else { return Ok(None) };
+        let set: Vec<&str> = ast.name(written.columns).collect();
+        let mut fired: Vec<rudb_catalog::Trigger> = catalog
+            .triggers_on(&table)
+            .filter(|held| held.event == event)
+            .filter(|held| {
+                held.columns.is_empty()
+                    || held.columns.iter().any(|column| {
+                        set.iter().any(|named| rudb_catalog::same_name(named, column))
+                    })
+            })
+            .cloned()
+            .collect();
+        if fired.is_empty() {
+            return Ok(None);
+        }
+        let rows = fired.iter().any(|held| held.row);
+        if rows && written.returning.is_some() {
+            return Err(Error::not_implemented(
+                "RETURNING is not yet supported on tables with FOR EACH ROW triggers",
+            ));
+        }
+        if let Some(conflict) = written.conflict {
+            if rows {
+                return Err(Error::not_implemented(
+                    "ON CONFLICT is not yet supported on tables with FOR EACH ROW triggers",
+                ));
+            }
+            let update = matches!(conflict.action, ast::ConflictAction::Update { .. });
+            if update && fired.iter().any(|held| held.new_table.is_some()) {
+                return Err(Error::not_implemented(
+                    "ON CONFLICT DO UPDATE is not yet supported with REFERENCING NEW TABLE AS \
+                     triggers",
+                ));
+            }
+        }
+        for held in fired.iter().filter(|held| held.row) {
+            if catalog.triggers_on(&held.writes).any(|next| next.row && next.event == held.does) {
+                return Err(rudb_bind::cascading(held));
+            }
+        }
+        // Each side in the order of the names, which is the order the pin runs them in.
+        fired.sort_by(|left, right| (!left.before, &left.name).cmp(&(!right.before, &right.name)));
+        Ok(Some(fired))
+    }
+
+    /// Runs a statement and the triggers it fires, inside the transaction: the `BEFORE` ones, then
+    /// the statement, catching the rows it changed, then the `AFTER` ones with those rows.
+    fn run_triggered(
+        &self,
+        ast: &Ast,
+        sql: &str,
+        parameters: &Parameters,
+        cancel: &Cancel,
+        parse_ns: u64,
+        fired: Vec<rudb_catalog::Trigger>,
+    ) -> Result<QueryResult> {
+        let (before, after): (Vec<_>, Vec<_>) = fired.into_iter().partition(|held| held.before);
+        let mut caught = rudb_bind::Caught::default();
+        for trigger in &before {
+            self.fire(trigger, &caught, cancel)?;
+        }
+        let capture = rudb_bind::Capture::default();
+        let mut catching = parameters.clone();
+        catching.catch_into(capture.clone());
+        let answer = self.execute_unfired(ast, sql, &catching, cancel, parse_ns)?;
+        caught = capture.take();
+        for trigger in &after {
+            self.fire(trigger, &caught, cancel)?;
+        }
+        Ok(answer)
+    }
+
+    /// Runs one trigger's body, with the rows the statement changed under the names it reads them
+    /// by.
+    fn fire(
+        &self,
+        trigger: &rudb_catalog::Trigger,
+        caught: &rudb_bind::Caught,
+        cancel: &Cancel,
+    ) -> Result<()> {
+        let fields = self.read().table(&trigger.table)?.columns().to_vec();
+        let rows = |values: &[Vec<Value>]| rudb_bind::Written {
+            names: fields.iter().map(|field| field.name.clone()).collect(),
+            types: fields.iter().map(|field| field.ty.clone()).collect(),
+            rows: values.to_vec(),
+        };
+        let mut given = Parameters::new();
+        if trigger.row {
+            let changed = if trigger.event == rudb_catalog::Event::Delete {
+                &caught.old
+            } else {
+                &caught.new
+            };
+            let mut changed = rows(changed);
+            changed.names =
+                changed.names.iter().map(|name| rudb_parse::trigger_column(name)).collect();
+            given.relate(rudb_parse::TRIGGER_ROWS, changed);
+        }
+        if let Some(name) = &trigger.new_table {
+            given.relate(name.clone(), rows(&caught.new));
+        }
+        if let Some(name) = &trigger.old_table {
+            given.relate(name.clone(), rows(&caught.old));
+        }
+        let case = self.session().semantics().identifier_case();
+        let body = rudb_parse::parse_ast_with_case(&trigger.fired, case)?;
+        self.execute_ast(&body, &trigger.fired, &given, cancel, 0)?;
+        Ok(())
     }
 
     /// The part of [`Shared::execute_written`] that runs inside the transaction.
@@ -5686,6 +5882,7 @@ impl Shared {
                 | Bound::Schema(_)
                 | Bound::Sequence(_)
                 | Bound::Type(_)
+                | Bound::Trigger(_)
                 | Bound::Alter(_)
                 | Bound::Index(_)
                 | Bound::Insert(_)
@@ -5982,6 +6179,9 @@ impl Shared {
             }
             Bound::DropTable(drop) => {
                 for name in &drop.names {
+                    if catalog.entry(name).is_ok_and(|found| found == drop.kind) {
+                        catalog.trigger_dependents(name, drop.cascade)?;
+                    }
                     match drop.kind {
                         Entry::Table => catalog.drop_table(name)?,
                         Entry::View => catalog.drop_view(name)?,
@@ -6057,10 +6257,32 @@ impl Shared {
                 )?;
                 Ok(QueryResult::empty())
             }
+            Bound::Trigger(change) => {
+                // The file has nowhere to keep one yet, and a trigger that went away on the next
+                // open would be worse than none.
+                let file = holds_a_file(&self.inner, &catalog, &change.table.catalog);
+                match change.trigger {
+                    Some(_) if file => {
+                        return Err(Error::not_implemented(
+                            "CREATE TRIGGER in a database file, which cannot keep one yet",
+                        ));
+                    }
+                    Some(trigger) => {
+                        self.altering(&change.table)?;
+                        catalog.create_trigger(trigger, change.or_replace, change.quiet)?;
+                        self.inner.triggered.store(true, Ordering::Release);
+                        self.held(change.table.clone());
+                    }
+                    None => catalog.drop_trigger(&change.table, &change.name, change.quiet)?,
+                }
+                Ok(QueryResult::empty())
+            }
             Bound::Alter(alter) => {
                 let (Some(name), Some(alteration)) = (alter.name, alter.alteration) else {
                     return Ok(QueryResult::empty());
                 };
+                self.altering(&name)?;
+                self.held(name.clone());
                 let rows = match alter.rewrite {
                     Some(mut plan) => {
                         let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
@@ -6188,7 +6410,11 @@ impl Shared {
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let workers = self.inner.pool.threads();
                 let chunks = result.into_chunks();
-                let wanted = insert.returning.is_some();
+                // A statement that fires a trigger hands it the rows it wrote, and an update the
+                // rows it changed as they were, which only the table holds by the time it writes.
+                let capture = parameters.capture().cloned();
+                let mut before = Vec::new();
+                let wanted = insert.returning.is_some() || capture.is_some();
                 let place = (cancel, &seams, &session);
                 let mut checks = insert.checks.take();
                 let (count, written) = match insert.write {
@@ -6349,6 +6575,9 @@ impl Shared {
                                 )
                             }
                         });
+                        if capture.is_some() && !delete && scanned == len {
+                            before = numbered_rows(catalog.table(name)?, &flagged)?;
+                        }
                         // An update keeps every row where it was, which is what lets another
                         // transaction's claim on a row still name it afterwards.
                         let table = catalog.table_mut(name)?;
@@ -6379,6 +6608,20 @@ impl Shared {
                         (count, changed)
                     }
                 };
+                if let Some(capture) = &capture {
+                    let width = catalog.table(&insert.name)?.columns().len();
+                    let rows = written
+                        .iter()
+                        .flat_map(|chunk| {
+                            (0..chunk.len()).map(move |row| chunk.row(row).take(width).collect())
+                        })
+                        .collect();
+                    if insert.write == Write::Delete {
+                        capture.catch(Vec::new(), rows);
+                    } else {
+                        capture.catch(rows, before);
+                    }
+                }
                 let Some(mut returning) = insert.returning else {
                     return QueryResult::changed(count);
                 };

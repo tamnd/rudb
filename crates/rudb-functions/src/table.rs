@@ -71,7 +71,7 @@ use rudb_kernels::json::scan;
 use crate::entrycatalog::{
     column_fields, constraint_fields, database_fields, index_fields, schema_fields,
     sequence_fields, show_database_fields, show_expanded_fields, show_table_fields, table_fields,
-    view_fields,
+    trigger_fields, view_fields,
 };
 use crate::functioncatalog::function_fields;
 use crate::settingcatalog::setting_fields;
@@ -141,6 +141,8 @@ pub enum TableFunction {
     DuckdbTables,
     /// `duckdb_views()`, every view somebody created.
     DuckdbViews,
+    /// `duckdb_triggers()`, every trigger somebody created.
+    DuckdbTriggers,
     /// `duckdb_sequences()`, every sequence somebody created and where each one has got to.
     DuckdbSequences,
     /// `duckdb_indexes()`, every index somebody created with `CREATE INDEX`.
@@ -222,6 +224,7 @@ impl TableFunction {
             Self::DuckdbSchemas => "duckdb_schemas",
             Self::DuckdbTables => "duckdb_tables",
             Self::DuckdbViews => "duckdb_views",
+            Self::DuckdbTriggers => "duckdb_triggers",
             Self::DuckdbSequences => "duckdb_sequences",
             Self::DuckdbIndexes => "duckdb_indexes",
             Self::DuckdbConstraints => "duckdb_constraints",
@@ -457,6 +460,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("duckdb_views") {
             return Some(Self::DuckdbViews);
+        }
+        if name.eq_ignore_ascii_case("duckdb_triggers") {
+            return Some(Self::DuckdbTriggers);
         }
         if name.eq_ignore_ascii_case("duckdb_sequences") {
             return Some(Self::DuckdbSequences);
@@ -867,6 +873,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbSchemas
         | TableFunction::DuckdbTables
         | TableFunction::DuckdbViews
+        | TableFunction::DuckdbTriggers
         | TableFunction::DuckdbSequences
         | TableFunction::DuckdbIndexes
         | TableFunction::DuckdbConstraints
@@ -906,6 +913,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::DuckdbSchemas => Some(schema_fields()),
         TableFunction::DuckdbTables => Some(table_fields()),
         TableFunction::DuckdbViews => Some(view_fields()),
+        TableFunction::DuckdbTriggers => Some(trigger_fields()),
         TableFunction::DuckdbSequences => Some(sequence_fields()),
         TableFunction::DuckdbIndexes => Some(index_fields()),
         TableFunction::DuckdbConstraints => Some(constraint_fields()),
