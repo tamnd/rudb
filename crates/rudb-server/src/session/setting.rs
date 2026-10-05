@@ -8,7 +8,7 @@
 
 use rudb_common::guc::{self, Arg};
 
-use super::role;
+use super::{database, role};
 
 /// A statement that the server runs on the settings of the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,8 @@ pub(super) enum Command {
     Role(String),
     /// `CREATE ROLE`, `ALTER ROLE` and `DROP ROLE`, and their forms with `USER` and `GROUP`.
     Roles(role::Parsed),
+    /// A statement on the databases.
+    Databases(database::Parsed),
 }
 
 /// A token of the statement.
@@ -286,7 +288,9 @@ pub(super) fn parse(sql: &str) -> Option<Command> {
         head.get(..word.len()).is_some_and(|h| h.eq_ignore_ascii_case(word.as_bytes()))
     };
     if starts("create") || starts("alter") || starts("drop") {
-        return role::parse(sql).map(Command::Roles);
+        return database::parse(sql)
+            .map(Command::Databases)
+            .or_else(|| role::parse(sql).map(Command::Roles));
     }
     if !["set", "reset", "show"].iter().any(|w| starts(w)) {
         return None;

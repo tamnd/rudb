@@ -14,7 +14,9 @@
 mod conf;
 mod config;
 mod crypto;
+mod databases;
 mod hba;
+mod locale;
 mod poll;
 mod roles;
 mod server;

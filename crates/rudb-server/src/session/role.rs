@@ -213,10 +213,10 @@ pub(in crate::session) enum Statement {
 /// An error of the grammar, with the place in the statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::session) struct Invalid {
-    sqlstate: &'static str,
-    message: String,
-    hint: Option<&'static str>,
-    at: usize,
+    pub(in crate::session) sqlstate: &'static str,
+    pub(in crate::session) message: String,
+    pub(in crate::session) hint: Option<&'static str>,
+    pub(in crate::session) at: usize,
 }
 
 /// A statement as the reader gives it: the notices of the scanner, and the statement or the
@@ -259,8 +259,22 @@ pub(in crate::session) fn parse(sql: &str) -> Option<Parsed> {
     if kind == Kind::User && tokens.get(2).is_some_and(|t| t.is("mapping")) {
         return None;
     }
+    let notices = truncate(&mut tokens);
+    let mut p = Parser { sql, tokens, starts, at: 2 };
+    let statement = match verb {
+        Verb::Create => p.create(kind),
+        Verb::Alter => p.alter(kind),
+        Verb::Drop => p.drop(),
+    }
+    .and_then(|statement| if p.done() { Ok(statement) } else { Err(p.syntax()) });
+    Some(Parsed { notices, statement })
+}
+
+/// Cuts each name to `NAMEDATALEN - 1` bytes, as the scanner does, and gives the text of the
+/// `NOTICE` for each name that it cuts.
+pub(in crate::session) fn truncate(tokens: &mut [Token]) -> Vec<String> {
     let mut notices = Vec::new();
-    for token in &mut tokens {
+    for token in tokens {
         if let Token::Word { text, .. } = token
             && text.len() > NAME_LIMIT
         {
@@ -273,14 +287,7 @@ pub(in crate::session) fn parse(sql: &str) -> Option<Parsed> {
             text.truncate(end);
         }
     }
-    let mut p = Parser { sql, tokens, starts, at: 2 };
-    let statement = match verb {
-        Verb::Create => p.create(kind),
-        Verb::Alter => p.alter(kind),
-        Verb::Drop => p.drop(),
-    }
-    .and_then(|statement| if p.done() { Ok(statement) } else { Err(p.syntax()) });
-    Some(Parsed { notices, statement })
+    notices
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,28 +304,28 @@ enum Kind {
     Group,
 }
 
-struct Parser<'a> {
-    sql: &'a str,
-    tokens: Vec<Token>,
-    starts: Vec<usize>,
-    at: usize,
+pub(in crate::session) struct Parser<'a> {
+    pub(in crate::session) sql: &'a str,
+    pub(in crate::session) tokens: Vec<Token>,
+    pub(in crate::session) starts: Vec<usize>,
+    pub(in crate::session) at: usize,
 }
 
 impl Parser<'_> {
-    fn peek(&self, ahead: usize) -> Option<&Token> {
+    pub(in crate::session) fn peek(&self, ahead: usize) -> Option<&Token> {
         self.tokens.get(self.at + ahead)
     }
 
-    fn done(&self) -> bool {
+    pub(in crate::session) fn done(&self) -> bool {
         self.at >= self.tokens.len()
     }
 
     /// The place of the next token, or the end of the statement.
-    fn here(&self) -> usize {
+    pub(in crate::session) fn here(&self) -> usize {
         self.starts.get(self.at).copied().unwrap_or(self.sql.trim_end().len())
     }
 
-    fn eat(&mut self, word: &str) -> bool {
+    pub(in crate::session) fn eat(&mut self, word: &str) -> bool {
         let next = self.peek(0).is_some_and(|t| t.is(word));
         if next {
             self.at += 1;
@@ -326,12 +333,12 @@ impl Parser<'_> {
         next
     }
 
-    fn expect(&mut self, word: &str) -> Result<(), Invalid> {
+    pub(in crate::session) fn expect(&mut self, word: &str) -> Result<(), Invalid> {
         if self.eat(word) { Ok(()) } else { Err(self.syntax()) }
     }
 
     /// The error of the grammar at the next token.
-    fn syntax(&self) -> Invalid {
+    pub(in crate::session) fn syntax(&self) -> Invalid {
         let at = self.here();
         let message = match self.starts.get(self.at) {
             None => "syntax error at end of input".to_owned(),
@@ -344,7 +351,7 @@ impl Parser<'_> {
         Invalid { sqlstate: "42601", message, hint: None, at }
     }
 
-    fn string(&mut self) -> Result<String, Invalid> {
+    pub(in crate::session) fn string(&mut self) -> Result<String, Invalid> {
         match self.peek(0) {
             Some(Token::String(text)) => {
                 let text = text.clone();
@@ -356,7 +363,7 @@ impl Parser<'_> {
     }
 
     /// `RoleSpec`.
-    fn spec(&mut self) -> Result<Spec, Invalid> {
+    pub(in crate::session) fn spec(&mut self) -> Result<Spec, Invalid> {
         let at = self.here();
         let spec = match self.peek(0) {
             Some(Token::Word { text, quoted }) => {
@@ -591,20 +598,28 @@ pub(in crate::session) struct Context<'a> {
     pub(in crate::session) session: u32,
     pub(in crate::session) guc: &'a Settings,
     pub(in crate::session) datetime: DateTimeInput<'a>,
+    /// The databases, for the owners that `DROP ROLE` checks.
+    pub(in crate::session) databases: &'a crate::databases::Catalog,
 }
 
-fn failure(sqlstate: &str, message: impl Into<String>) -> Failure {
+pub(in crate::session) fn failure(sqlstate: &str, message: impl Into<String>) -> Failure {
     Failure { sqlstate: sqlstate.to_owned(), message: message.into(), fields: None, position: None }
 }
 
-fn with_detail(sqlstate: &str, message: &str, detail: String) -> Failure {
+pub(in crate::session) fn with_detail(sqlstate: &str, message: &str, detail: String) -> Failure {
     let mut fields = Fields::default();
     fields.detail = Some(detail);
     Failure { fields: Some(Box::new(fields)), ..failure(sqlstate, message) }
 }
 
 /// A `NOTICE` or a `WARNING` to the client.
-fn notice(out: &mut OutBuf, severity: &str, sqlstate: &str, message: &str, more: &[(u8, &str)]) {
+pub(in crate::session) fn notice(
+    out: &mut OutBuf,
+    severity: &str,
+    sqlstate: &str,
+    message: &str,
+    more: &[(u8, &str)],
+) {
     let mut fields: Vec<(u8, &[u8])> = vec![
         (b'S', severity.as_bytes()),
         (b'V', severity.as_bytes()),
@@ -1102,6 +1117,7 @@ fn drop(
                 .to_owned(),
         ));
     }
+    let mut dropped: Vec<Role> = Vec::new();
     for spec in specs {
         let Spec::Name(name) = spec else {
             return Err(failure("22023", "cannot use special role specifier in DROP ROLE"));
@@ -1142,14 +1158,34 @@ fn drop(
                 ),
             ));
         }
+        catalog.members.retain(|m| m.role != role.oid && m.member != role.oid);
+        dropped.push(role);
+    }
+    // The second pass of `DropRole`: `checkSharedDependencies` on each role, after the grants of
+    // all the roles are gone.
+    for role in dropped {
+        let name = &role.name;
         if role.oid == BOOTSTRAP_SUPERUSER {
             return Err(failure(
                 "2BP01",
                 format!("cannot drop role {name} because it is required by the database system"),
             ));
         }
+        let owned: Vec<String> = cx
+            .databases
+            .rows
+            .iter()
+            .filter(|database| database.owner == role.oid)
+            .map(|database| format!("owner of database {}", database.name))
+            .collect();
+        if !owned.is_empty() {
+            return Err(with_detail(
+                "2BP01",
+                &format!("role \"{name}\" cannot be dropped because some objects depend on it"),
+                owned.join("\n"),
+            ));
+        }
         catalog.roles.retain(|r| r.oid != role.oid);
-        catalog.members.retain(|m| m.role != role.oid && m.member != role.oid);
     }
     Ok(CommandTag::DropRole)
 }

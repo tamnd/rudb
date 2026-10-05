@@ -5,7 +5,7 @@
 //! stop uses to wake every session. Each database is open once and stays open until the server
 //! stops, so two sessions on one database share one `rudb::Database`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::os::fd::{AsRawFd, RawFd};
@@ -26,6 +26,7 @@ use rudb_common::guc;
 
 use crate::conf;
 use crate::config::Config;
+use crate::databases::{self, Catalog, Databases, Row};
 use crate::hba::{self, Hba, Ident, ParseSettings};
 use crate::poll;
 use crate::roles::{self, Role, Roles};
@@ -93,6 +94,10 @@ pub(crate) struct Entry {
     stream: Option<Stream>,
     /// The role that logged in, for the connection limit of the role.
     role: Option<u32>,
+    /// The OID of the database of the session, from the check of its connection limit.
+    database: Option<u32>,
+    /// True after `DROP DATABASE ... WITH (FORCE)` ended the session.
+    terminate: bool,
 }
 
 /// The sessions by process ID.
@@ -100,6 +105,9 @@ pub(crate) struct Entry {
 pub(crate) struct Sessions {
     next: i32,
     map: HashMap<i32, Entry>,
+    /// The databases that a statement copies, renames or drops. A new session on one of them
+    /// waits until the statement ends, as the lock on the database makes it wait in PostgreSQL.
+    held: HashSet<u32>,
 }
 
 /// The values of the configuration files and of the command line that a session starts with.
@@ -131,7 +139,13 @@ pub(crate) struct Shared {
     ident: Mutex<Arc<Ident>>,
     /// The roles of the cluster.
     pub(crate) roles: Arc<Roles>,
-    databases: Mutex<HashMap<String, Arc<Database>>>,
+    /// The databases of the cluster.
+    pub(crate) databases: Databases,
+    /// The open databases by OID. The lock goes after the lock of the sessions and after the lock
+    /// of the databases.
+    open: Mutex<HashMap<u32, Arc<Database>>>,
+    /// Lets one statement on the databases run at a time.
+    ddl: Mutex<()>,
     sessions: Mutex<Sessions>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     stopping: AtomicBool,
@@ -233,7 +247,18 @@ impl Shared {
             pid = if pid == i32::MAX { 1001 } else { pid + 1 };
         }
         sessions.next = if pid == i32::MAX { 1001 } else { pid + 1 };
-        sessions.map.insert(pid, Entry { key: None, connection: None, wake, stream, role: None });
+        sessions.map.insert(
+            pid,
+            Entry {
+                key: None,
+                connection: None,
+                wake,
+                stream,
+                role: None,
+                database: None,
+                terminate: false,
+            },
+        );
         pid
     }
 
@@ -302,42 +327,238 @@ impl Shared {
         }
     }
 
-    /// The database with this name, opened once for the whole server.
-    pub(crate) fn database(&self, name: &str) -> Result<Arc<Database>, Refusal> {
+    /// The checks of `InitializeSessionUserId` and `CheckMyDatabase` on the database of a new
+    /// session: the database exists, it takes connections, and it has fewer sessions than its
+    /// connection limit. A superuser has no limit. Gives the OID of the database and the database,
+    /// which is open once for the whole server.
+    pub(crate) fn connect(
+        &self,
+        pid: i32,
+        name: &str,
+        role: &Role,
+    ) -> Result<(u32, Arc<Database>), Refusal> {
         let missing = || ("3D000", format!("database \"{name}\" does not exist"));
-        // The name is a file name too, so a name that is not a plain file name cannot exist.
-        if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\', '\0']) {
-            return Err(missing());
+        let oid = loop {
+            let Some(row) = self.databases.snapshot().find(name).cloned() else {
+                if !self.config().auto_create_database {
+                    return Err(missing());
+                }
+                self.create_empty(name, role.oid)?;
+                continue;
+            };
+            let mut sessions = lock(&self.sessions);
+            if sessions.held.contains(&row.oid) {
+                drop(sessions);
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            // The database can change before the lock of the sessions.
+            let Some(row) =
+                self.databases.snapshot().find(name).cloned().filter(|now| now.oid == row.oid)
+            else {
+                continue;
+            };
+            if !row.allow_connections {
+                return Err((
+                    "55000",
+                    format!("database \"{name}\" is not currently accepting connections"),
+                ));
+            }
+            if let Some(entry) = sessions.map.get_mut(&pid) {
+                entry.database = Some(row.oid);
+            }
+            if !role.superuser && row.connlimit >= 0 {
+                let count =
+                    sessions.map.values().filter(|entry| entry.database == Some(row.oid)).count();
+                if count > usize::try_from(row.connlimit).unwrap_or(0) {
+                    return Err(("53300", format!("too many connections for database \"{name}\"")));
+                }
+            }
+            break row.oid;
+        };
+        let database = self
+            .handle(oid)
+            .map_err(|error| ("XX000", format!("could not open database \"{name}\": {error}")))?;
+        Ok((oid, database))
+    }
+
+    /// Makes a database for `auto_create_database`: a copy of `template1` with its settings, or an
+    /// empty database when `template1` does not exist.
+    fn create_empty(&self, name: &str, owner: u32) -> Result<(), Refusal> {
+        let _ddl = self.ddl();
+        let failed =
+            |error: String| ("XX000", format!("could not create database \"{name}\": {error}"));
+        let catalog = self.databases.snapshot();
+        if catalog.find(name).is_some() {
+            return Ok(());
         }
-        let config = self.config();
-        let path = database_path(&config.data, name);
-        let mut databases = lock(&self.databases);
-        if let Some(database) = databases.get(name) {
+        let mut oid = catalog.next_oid();
+        while self.file_conflict(oid) {
+            oid += 1;
+        }
+        let row = match catalog.find("template1") {
+            Some(source) => {
+                self.copy_database(source.oid, oid).map_err(failed)?;
+                Row {
+                    oid,
+                    name: name.to_owned(),
+                    owner,
+                    template: false,
+                    allow_connections: true,
+                    connlimit: -1,
+                    ..source.clone()
+                }
+            }
+            None => {
+                self.handle(oid).map_err(failed)?;
+                Row::new(oid, name, owner)
+            }
+        };
+        self.databases.change(
+            |catalog| {
+                catalog.rows.push(row);
+                Ok(())
+            },
+            failed,
+        )
+    }
+
+    /// The open database with this OID. The first call opens it, and makes an empty database when
+    /// the file does not exist.
+    fn handle(&self, oid: u32) -> Result<Arc<Database>, String> {
+        let mut open = lock(&self.open);
+        if let Some(database) = open.get(&oid) {
             return Ok(database.clone());
         }
-        let exists = path.exists();
-        if !exists && !config.auto_create_database {
-            return Err(missing());
-        }
-        if exists && name == "template0" {
-            return Err((
-                "55000",
-                "database \"template0\" is not currently accepting connections".to_owned(),
-            ));
-        }
-        let text = path.to_str().ok_or_else(missing)?;
-        let database = Database::open(text).map_err(|error| {
-            ("XX000", format!("could not open database \"{name}\": {}", error.message()))
-        })?;
-        let database = Arc::new(database);
-        databases.insert(name.to_owned(), database.clone());
+        let path = databases::path(&self.config().data, oid);
+        let text = path.to_str().ok_or("the path is not valid UTF-8")?;
+        let database = Arc::new(Database::open(text).map_err(|error| error.message().to_owned())?);
+        open.insert(oid, database.clone());
         Ok(database)
+    }
+
+    /// Lets one statement on the databases run at a time.
+    pub(crate) fn ddl(&self) -> MutexGuard<'_, ()> {
+        lock(&self.ddl)
+    }
+
+    /// Stops new sessions on the database until the guard goes.
+    pub(crate) fn hold(&self, oid: u32) -> Hold<'_> {
+        lock(&self.sessions).held.insert(oid);
+        Hold { shared: self, oid }
+    }
+
+    /// The roles of the other sessions on the database.
+    pub(crate) fn others(&self, oid: u32, me: i32) -> Vec<u32> {
+        let sessions = lock(&self.sessions);
+        sessions
+            .map
+            .iter()
+            .filter(|(pid, entry)| **pid != me && entry.database == Some(oid))
+            .filter_map(|(_, entry)| entry.role)
+            .collect()
+    }
+
+    /// The number of other sessions on the database. When there are some, it waits up to five
+    /// seconds for them to end, as `CountOtherDBBackends` does.
+    pub(crate) fn wait_others(&self, oid: u32, me: i32) -> usize {
+        let count = || {
+            let sessions = lock(&self.sessions);
+            sessions
+                .map
+                .iter()
+                .filter(|(pid, entry)| **pid != me && entry.database == Some(oid))
+                .count()
+        };
+        for _ in 0..50 {
+            let others = count();
+            if others == 0 {
+                return 0;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        count()
+    }
+
+    /// Ends the other sessions on the database, as `TerminateOtherDBBackends` does.
+    pub(crate) fn terminate(&self, oid: u32, me: i32) {
+        let mut sessions = lock(&self.sessions);
+        for (_, entry) in sessions
+            .map
+            .iter_mut()
+            .filter(|(pid, entry)| **pid != me && entry.database == Some(oid))
+        {
+            entry.terminate = true;
+            if let Some(connection) = &entry.connection {
+                connection.interrupt();
+            }
+            let _ = entry.wake.write_all(b"x");
+        }
+    }
+
+    /// True after another session ended this session.
+    pub(crate) fn terminating(&self, pid: i32) -> bool {
+        lock(&self.sessions).map.get(&pid).is_some_and(|entry| entry.terminate)
+    }
+
+    /// True when a file of a database with this OID exists, which a new database cannot take.
+    pub(crate) fn file_conflict(&self, oid: u32) -> bool {
+        let path = databases::path(&self.config().data, oid);
+        path.exists() || databases::journal(&path).exists()
+    }
+
+    /// Copies the database `from` to a new file for the database `to`. The copy has all the
+    /// changes up to now, because the copy writes the open database to its file first.
+    pub(crate) fn copy_database(&self, from: u32, to: u32) -> Result<(), String> {
+        let data = self.config().data.clone();
+        let source = databases::path(&data, from);
+        let target = databases::path(&data, to);
+        let database = self.handle(from)?;
+        Database::clone(&database).close().map_err(|error| {
+            format!("could not write database file \"{}\": {}", source.display(), error.message())
+        })?;
+        let temp = target.with_extension("rudb.tmp");
+        let copied = std::fs::copy(&source, &temp)
+            .and_then(|_| std::fs::File::open(&temp)?.sync_all())
+            .and_then(|()| std::fs::rename(&temp, &target));
+        copied.map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            format!(
+                "could not copy file \"{}\" to \"{}\": {error}",
+                source.display(),
+                target.display()
+            )
+        })
+    }
+
+    /// Removes the files of a database that is no more in the catalog.
+    pub(crate) fn remove_database(&self, oid: u32) -> Result<(), String> {
+        let database = lock(&self.open).remove(&oid);
+        drop(database);
+        let file = databases::path(&self.config().data, oid);
+        let journal = databases::journal(&file);
+        let ignore = |result: io::Result<()>| match result {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+        ignore(std::fs::remove_file(&file))
+            .and_then(|()| ignore(std::fs::remove_dir_all(&journal)))
+            .map_err(|error| {
+                format!("could not remove database file \"{}\": {error}", file.display())
+            })
     }
 }
 
-/// The file of a database in the data directory.
-fn database_path(data: &Path, name: &str) -> PathBuf {
-    data.join("base").join(format!("{name}.rudb"))
+/// A database that new sessions wait for, from [`Shared::hold`].
+pub(crate) struct Hold<'a> {
+    shared: &'a Shared,
+    oid: u32,
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        lock(&self.shared.sessions).held.remove(&self.oid);
+    }
 }
 
 /// The settings of the server that the files can set.
@@ -555,12 +776,13 @@ pub fn init(data: &Path, options: &Init) -> Result<(), String> {
         .map_err(|e| format!("could not create directory \"{}\": {e}", base.display()))?;
     std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("could not change permissions of \"{}\": {e}", data.display()))?;
-    for name in ["template1", "template0", "postgres"] {
-        let path = database_path(data, name);
+    let catalog = Catalog::bootstrap();
+    for row in &catalog.rows {
+        let path = databases::path(data, row.oid);
         let text = path.to_str().ok_or_else(|| format!("bad path \"{}\"", path.display()))?;
         Database::open(text)
             .and_then(Database::close)
-            .map_err(|e| format!("could not create database \"{name}\": {}", e.message()))?;
+            .map_err(|e| format!("could not create database \"{}\": {}", row.name, e.message()))?;
     }
     write_mock_nonce(data)?;
     let postgresql = conf::sample(local, host);
@@ -582,7 +804,8 @@ pub fn init(data: &Path, options: &Init) -> Result<(), String> {
     }
     let password =
         options.password.as_deref().map(|password| roles::scram(password, SCRAM_ITERATIONS));
-    roles::write(data, &roles::Catalog::bootstrap(superuser, password))
+    roles::write(data, &roles::Catalog::bootstrap(superuser, password))?;
+    databases::write(data, &catalog)
 }
 
 /// A listening socket.
@@ -695,6 +918,7 @@ impl Server {
         let tls = tls::load(&config)?;
         let mock_nonce = mock_nonce(&config.data)?;
         let roles = Arc::new(Roles::open(&config.data)?);
+        let databases = Databases::open(&config.data)?;
         let mut owned = Vec::new();
         let pid_file = config.data.join(PID_FILE);
         let me = std::process::id();
@@ -727,10 +951,13 @@ impl Server {
             hba: Mutex::new(Arc::new(hba)),
             ident: Mutex::new(Arc::new(ident)),
             roles,
-            databases: Mutex::new(HashMap::new()),
+            databases,
+            open: Mutex::new(HashMap::new()),
+            ddl: Mutex::new(()),
             sessions: Mutex::new(Sessions {
                 next: 1001 + i32::from(poll::random::<2>()[0]) * 64,
                 map: HashMap::new(),
+                held: HashSet::new(),
             }),
             threads: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
@@ -910,12 +1137,15 @@ impl Server {
             let _ = thread.join();
         }
         let mut errors = Vec::new();
-        let databases = std::mem::take(&mut *lock(&self.shared.databases));
-        for (name, database) in databases {
+        let open = std::mem::take(&mut *lock(&self.shared.open));
+        let catalog = self.shared.databases.snapshot();
+        for (oid, database) in open {
             // Each session is gone, so this is the last handle and the close writes the file.
             if let Ok(database) = Arc::try_unwrap(database)
                 && let Err(error) = database.close()
             {
+                let name =
+                    catalog.by_oid(oid).map_or_else(|| oid.to_string(), |row| row.name.clone());
                 errors.push(format!("could not write database \"{name}\": {}", error.message()));
             }
         }

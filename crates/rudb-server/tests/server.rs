@@ -776,6 +776,93 @@ fn the_roles_of_postgres() {
 }
 
 #[test]
+fn the_databases_of_postgres() {
+    let dirs = Dirs::new("databases");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut admin = Client::unix(&server);
+    connect(&mut admin, PROTOCOL_3_0);
+    let error = |messages: &[Message]| {
+        let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+        (error.field(b'C').unwrap(), error.field(b'M').unwrap())
+    };
+    let pair = |sqlstate: &str, message: &str| (sqlstate.to_owned(), message.to_owned());
+    assert_eq!(tags(&admin.query("create database src")), "CZ");
+    assert_eq!(
+        error(&admin.query("create database src")),
+        pair("42P04", "database \"src\" already exists")
+    );
+    assert_eq!(
+        error(&admin.query("select 1; create database d1")),
+        pair("25001", "CREATE DATABASE cannot run inside a transaction block")
+    );
+
+    // A new database is a copy of its template, with the changes up to now.
+    let mut client = Client::unix(&server);
+    client.startup(PROTOCOL_3_0, "src");
+    client.until_ready();
+    client.query("create table t (a int)");
+    client.query("insert into t values (42)");
+    client.send(&Frontend::Terminate);
+    assert!(client.rest().is_empty());
+    let messages = loop {
+        let messages = admin.query("create database copy template src");
+        // The session that ended can still be in the registry for a moment.
+        if messages.iter().all(|m| m.tag != b'E') || error(&messages).0 != "55006" {
+            break messages;
+        }
+    };
+    assert_eq!(tags(&messages), "CZ");
+    let mut copy = Client::unix(&server);
+    copy.startup(PROTOCOL_3_0, "copy");
+    copy.until_ready();
+    assert_eq!(scalar(&mut copy, "select a from t"), "42");
+
+    // DROP DATABASE ... WITH (FORCE) ends the other sessions on the database.
+    assert_eq!(tags(&admin.query("drop database copy with (force)")), "CZ");
+    let messages = copy.rest();
+    assert_eq!(tags(&messages), "E");
+    assert_eq!(messages[0].field(b'S').as_deref(), Some("FATAL"));
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("57P01"));
+
+    // A database that does not take connections, and the catalog after a restart.
+    assert_eq!(tags(&admin.query("alter database src allow_connections false")), "CZ");
+    server.stop().unwrap();
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    client.startup(PROTOCOL_3_0, "src");
+    let messages = client.rest();
+    assert_eq!(tags(&messages), "RE");
+    assert_eq!(
+        error(&messages),
+        pair("55000", "database \"src\" is not currently accepting connections")
+    );
+    let mut client = Client::unix(&server);
+    client.startup(PROTOCOL_3_0, "copy");
+    assert_eq!(error(&client.rest()), pair("3D000", "database \"copy\" does not exist"));
+    server.stop().unwrap();
+
+    // With `auto_create_database`, a missing database is a new copy of `template1`.
+    let mut config = dirs.config();
+    config.set("auto_create_database", "on").unwrap();
+    let server = Server::start(config).unwrap();
+    let mut client = Client::unix(&server);
+    client.startup(PROTOCOL_3_0, "auto");
+    assert_eq!(tags(&client.until_ready()).chars().last(), Some('Z'));
+    client.send(&Frontend::Terminate);
+    assert!(client.rest().is_empty());
+    let mut admin = Client::unix(&server);
+    connect(&mut admin, PROTOCOL_3_0);
+    let messages = loop {
+        let messages = admin.query("drop database auto");
+        if messages.iter().all(|m| m.tag != b'E') || error(&messages).0 != "55006" {
+            break messages;
+        }
+    };
+    assert_eq!(tags(&messages), "CZ");
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_configuration_files_and_a_reload() {
     let dirs = Dirs::new("conf");
     let file = dirs.root.join("data/postgresql.conf");
