@@ -70,6 +70,12 @@ impl Connection {
         self.shared.block()
     }
 
+    /// Marks the open transaction block as aborted, for a statement that failed outside of the
+    /// engine, such as a `SET ROLE` that a server runs itself. Does nothing with no block open.
+    pub fn abort_transaction(&self) {
+        self.shared.abort_block();
+    }
+
     /// Records the PostgreSQL session that speaks through this connection. From the next statement
     /// on, `current_setting()` reads its parameters and `version()` and the user functions answer
     /// for it. A server calls this again each time the parameters change.

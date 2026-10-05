@@ -51,7 +51,7 @@ const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
 /// from the engine rudb is compatible with.
 const USER: &str = "duckdb";
 
-/// One of the eight answers the session context has.
+/// One of the nine answers the session context has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Context {
     /// The instant the statement started, as `TIMESTAMP WITH TIME ZONE`.
@@ -68,8 +68,10 @@ pub(crate) enum Context {
     Database,
     /// The schema an unqualified name resolves in.
     Schema,
-    /// Who is connected.
+    /// The current user, which `SET ROLE` changes.
     User,
+    /// The session user, which `SET SESSION AUTHORIZATION` changes.
+    SessionUser,
 }
 
 /// The spellings that stand on their own with no parentheses, and what each one answers.
@@ -87,7 +89,7 @@ const KEYWORDS: &[(&str, Context)] = &[
     ("current_user", Context::User),
     ("localtime", Context::LocalTime),
     ("localtimestamp", Context::LocalInstant),
-    ("session_user", Context::User),
+    ("session_user", Context::SessionUser),
     ("user", Context::User),
 ];
 
@@ -107,7 +109,7 @@ const CALLS: &[(&str, Context)] = &[
     ("get_current_time", Context::ZonedTime),
     ("get_current_timestamp", Context::Instant),
     ("now", Context::Instant),
-    ("session_user", Context::User),
+    ("session_user", Context::SessionUser),
     ("today", Context::Date),
     ("transaction_timestamp", Context::Instant),
     ("user", Context::User),
@@ -146,12 +148,15 @@ impl Binder<'_> {
             Context::Database => Value::Varchar(self.catalog().default_catalog().to_string()),
             Context::Schema => Value::Varchar(self.catalog().default_schema().to_string()),
             // A PostgreSQL session has a user, and the database alone has the user of DuckDB.
-            Context::User => Value::Varchar(
-                self.session
-                    .postgres()
-                    .and_then(|postgres| postgres.settings.get("session_authorization"))
-                    .unwrap_or_else(|| USER.to_string()),
-            ),
+            Context::User | Context::SessionUser => {
+                let settings = self.session.postgres().map(|postgres| &postgres.settings);
+                let role = settings
+                    .and_then(|settings| settings.get("role"))
+                    .filter(|role| what == Context::User && !role.is_empty() && role != "none");
+                let session =
+                    || settings.and_then(|settings| settings.get("session_authorization"));
+                Value::Varchar(role.or_else(session).unwrap_or_else(|| USER.to_string()))
+            }
         };
         self.plan_mut().add_constant(value)
     }
@@ -259,7 +264,7 @@ mod tests {
         );
     }
 
-    /// Every one of the eight answers is reachable by writing something, which is what says the enum
+    /// Every one of the nine answers is reachable by writing something, which is what says the enum
     /// has no arm nothing produces.
     #[test]
     fn every_answer_has_a_name_that_asks_for_it() {
@@ -272,6 +277,7 @@ mod tests {
             Context::Database,
             Context::Schema,
             Context::User,
+            Context::SessionUser,
         ];
         for what in wanted {
             assert!(
