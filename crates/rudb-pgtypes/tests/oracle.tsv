@@ -8024,3 +8024,444 @@ in json -1		,	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSO
 in json -1		:	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found ":".
 in json -1		{"a":1,"b"}	ERROR 22P02 invalid input syntax for type json DETAIL Expected ":", but found "}".
 in json -1		{"a",}	ERROR 22P02 invalid input syntax for type json DETAIL Expected ":", but found ",".
+array int4 -1	on	{}	000000000000000000000017 {}
+array int4 -1	on	{ }	000000000000000000000017 {}
+array int4 -1	on	  {}  	000000000000000000000017 {}
+array int4 -1	on	{{}}	000000000000000000000017 {}
+array int4 -1	on	{{},{}}	000000000000000000000017 {}
+array int4 -1	on	{1,2,3}	0000000100000000000000170000000300000001000000040000000100000004000000020000000400000003 {1,2,3}
+array int4 -1	on	{ 1 , 2 , 3 }	0000000100000000000000170000000300000001000000040000000100000004000000020000000400000003 {1,2,3}
+array int4 -1	on	{1,NULL,3}	00000001000000010000001700000003000000010000000400000001ffffffff0000000400000003 {1,NULL,3}
+array int4 -1	on	{1,null,3}	00000001000000010000001700000003000000010000000400000001ffffffff0000000400000003 {1,NULL,3}
+array int4 -1	on	{NULL}	0000000100000001000000170000000100000001ffffffff {NULL}
+array int4 -1	on	{"NULL"}	ERROR 22P02 invalid input syntax for type integer: "NULL"
+array int4 -1	on	{"1"}	00000001000000000000001700000001000000010000000400000001 {1}
+array int4 -1	on	{ "1" , "2" }	000000010000000000000017000000020000000100000004000000010000000400000002 {1,2}
+array int4 -1	on	{{1,2},{3,4}}	000000020000000000000017000000020000000100000002000000010000000400000001000000040000000200000004000000030000000400000004 {{1,2},{3,4}}
+array int4 -1	on	{{1,2},{3}}	ERROR 22P02 malformed array literal: "{{1,2},{3}}" DETAIL Multidimensional arrays must have sub-arrays with matching dimensions.
+array int4 -1	on	{{1},2}	ERROR 22P02 malformed array literal: "{{1},2}" DETAIL Multidimensional arrays must have sub-arrays with matching dimensions.
+array int4 -1	on	{1,{2}}	ERROR 22P02 malformed array literal: "{1,{2}}" DETAIL Multidimensional arrays must have sub-arrays with matching dimensions.
+array int4 -1	on	{{1}{2}}	ERROR 22P02 malformed array literal: "{{1}{2}}" DETAIL Unexpected "{" character.
+array int4 -1	on	{{1},{2},{3}}	00000002000000000000001700000003000000010000000100000001000000040000000100000004000000020000000400000003 {{1},{2},{3}}
+array int4 -1	on	[0:2]={1,2,3}	0000000100000000000000170000000300000000000000040000000100000004000000020000000400000003 [0:2]={1,2,3}
+array int4 -1	on	[1:3]={1,2,3}	0000000100000000000000170000000300000001000000040000000100000004000000020000000400000003 {1,2,3}
+array int4 -1	on	[-2:-1][3:4]={{1,2},{3,4}}	00000002000000000000001700000002fffffffe00000002000000030000000400000001000000040000000200000004000000030000000400000004 [-2:-1][3:4]={{1,2},{3,4}}
+array int4 -1	on	[1:2]={1}	ERROR 22P02 malformed array literal: "[1:2]={1}" DETAIL Specified array dimensions do not match array contents.
+array int4 -1	on	[1:2]={{1},{2}}	ERROR 22P02 malformed array literal: "[1:2]={{1},{2}}" DETAIL Specified array dimensions do not match array contents.
+array int4 -1	on	[1:1][1:1]={1}	ERROR 22P02 malformed array literal: "[1:1][1:1]={1}" DETAIL Specified array dimensions do not match array contents.
+array int4 -1	on	[2:1]={}	ERROR 2202E upper bound cannot be less than lower bound
+array int4 -1	on	[1:2147483647]={1}	ERROR 54000 array upper bound is too large: 2147483647
+array int4 -1	on	[-2147483648:2147483646]={1}	ERROR 54000 array size exceeds the maximum allowed (134217727)
+array int4 -1	on	[1:99999999999]={1}	ERROR 54000 array bound is out of integer range
+array int4 -1	on	[+1:+2]={1,2}	000000010000000000000017000000020000000100000004000000010000000400000002 {1,2}
+array int4 -1	on	[ 1]={1}	ERROR 22P02 malformed array literal: "[ 1]={1}" DETAIL "[" must introduce explicitly-specified array dimensions.
+array int4 -1	on	[1 ]={1}	ERROR 22P02 malformed array literal: "[1 ]={1}" DETAIL Missing "]" after array dimensions.
+array int4 -1	on	[1]={1}	00000001000000000000001700000001000000010000000400000001 {1}
+array int4 -1	on	[1] = {1}	00000001000000000000001700000001000000010000000400000001 {1}
+array int4 -1	on	 [1] [1] = {{1}}	000000020000000000000017000000010000000100000001000000010000000400000001 {{1}}
+array int4 -1	on	[1]{1}	ERROR 22P02 malformed array literal: "[1]{1}" DETAIL Missing "=" after array dimensions.
+array int4 -1	on	[1]= 1	ERROR 22P02 malformed array literal: "[1]= 1" DETAIL Array contents must start with "{".
+array int4 -1	on	[x]={1}	ERROR 22P02 malformed array literal: "[x]={1}" DETAIL "[" must introduce explicitly-specified array dimensions.
+array int4 -1	on	[1:]={1}	ERROR 22P02 malformed array literal: "[1:]={1}" DETAIL Missing array dimension value.
+array int4 -1	on	[:1]={1}	ERROR 22P02 malformed array literal: "[:1]={1}" DETAIL "[" must introduce explicitly-specified array dimensions.
+array int4 -1	on	[1:2	ERROR 22P02 malformed array literal: "[1:2" DETAIL Missing "]" after array dimensions.
+array int4 -1	on	[1:2]	ERROR 22P02 malformed array literal: "[1:2]" DETAIL Missing "=" after array dimensions.
+array int4 -1	on	[1][1][1][1][1][1][1]={{{{{{{1}}}}}}}	ERROR 54000 number of array dimensions exceeds the maximum allowed (6)
+array int4 -1	on	{{{{{{1}}}}}}	0000000600000000000000170000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000400000001 {{{{{{1}}}}}}
+array int4 -1	on	{{{{{{{1}}}}}}}	ERROR 54000 number of array dimensions exceeds the maximum allowed (6)
+array int4 -1	on	{1	ERROR 22P02 malformed array literal: "{1" DETAIL Unexpected end of input.
+array int4 -1	on	{1,	ERROR 22P02 malformed array literal: "{1," DETAIL Unexpected end of input.
+array int4 -1	on	{"1	ERROR 22P02 malformed array literal: "{"1" DETAIL Unexpected end of input.
+array int4 -1	on	{"1\	ERROR 22P02 malformed array literal: "{"1\" DETAIL Unexpected end of input.
+array int4 -1	on	{1\	ERROR 22P02 malformed array literal: "{1\" DETAIL Unexpected end of input.
+array int4 -1	on	{1,}	ERROR 22P02 malformed array literal: "{1,}" DETAIL Unexpected "}" character.
+array int4 -1	on	{,1}	ERROR 22P02 malformed array literal: "{,1}" DETAIL Unexpected "," character.
+array int4 -1	on	{1,,2}	ERROR 22P02 malformed array literal: "{1,,2}" DETAIL Unexpected "," character.
+array int4 -1	on	{1 2}	ERROR 22P02 invalid input syntax for type integer: "1 2"
+array int4 -1	on	{"1" 2}	ERROR 22P02 malformed array literal: "{"1" 2}" DETAIL Incorrectly quoted array element.
+array int4 -1	on	{"1""2"}	ERROR 22P02 malformed array literal: "{"1""2"}" DETAIL Incorrectly quoted array element.
+array int4 -1	on	{1"2"}	ERROR 22P02 malformed array literal: "{1"2"}" DETAIL Incorrectly quoted array element.
+array int4 -1	on	{"1"x}	ERROR 22P02 malformed array literal: "{"1"x}" DETAIL Incorrectly quoted array element.
+array int4 -1	on	{"1" }	00000001000000000000001700000001000000010000000400000001 {1}
+array int4 -1	on	{1} x	ERROR 22P02 malformed array literal: "{1} x" DETAIL Junk after closing right brace.
+array int4 -1	on	{1}  	00000001000000000000001700000001000000010000000400000001 {1}
+array int4 -1	on	1	ERROR 22P02 malformed array literal: "1" DETAIL Array value must start with "{" or dimension information.
+array int4 -1	on		ERROR 22P02 malformed array literal: "" DETAIL Array value must start with "{" or dimension information.
+array int4 -1	on	 	ERROR 22P02 malformed array literal: " " DETAIL Array value must start with "{" or dimension information.
+array int4 -1	on	x{1}	ERROR 22P02 malformed array literal: "x{1}" DETAIL Array value must start with "{" or dimension information.
+array int4 -1	on	{\1}	00000001000000000000001700000001000000010000000400000001 {1}
+array int4 -1	on	{NULL,"a b"}	ERROR 22P02 invalid input syntax for type integer: "a b"
+array int4 -1	on	{"",x}	ERROR 22P02 invalid input syntax for type integer: ""
+array int4 -1	on	{"a\"b"}	ERROR 22P02 invalid input syntax for type integer: "a"b"
+array int4 -1	on	{a\,b}	ERROR 22P02 invalid input syntax for type integer: "a,b"
+array int4 -1	on	{a\\b}	ERROR 22P02 invalid input syntax for type integer: "a\b"
+array int4 -1	on	{ a b }	ERROR 22P02 invalid input syntax for type integer: "a b"
+array int4 -1	on	{"a}	ERROR 22P02 malformed array literal: "{"a}" DETAIL Unexpected end of input.
+array int4 -1	on	{a}b}	ERROR 22P02 invalid input syntax for type integer: "a"
+array int4 -1	on	{a{b}	ERROR 22P02 malformed array literal: "{a{b}" DETAIL Unexpected "{" character.
+array int4 -1	on	{\NULL}	ERROR 22P02 invalid input syntax for type integer: "NULL"
+array int4 -1	on	{"\NULL"}	ERROR 22P02 invalid input syntax for type integer: "NULL"
+array int4 -1	on	{NULL }	0000000100000001000000170000000100000001ffffffff {NULL}
+array int4 -1	on	{ NULL}	0000000100000001000000170000000100000001ffffffff {NULL}
+array int4 -1	on	{nul}	ERROR 22P02 invalid input syntax for type integer: "nul"
+array int4 -1	on	{NULLx}	ERROR 22P02 invalid input syntax for type integer: "NULLx"
+arrayhex int4 -1	on	7b312c09327d	303030303030303130303030303030303030303030303137303030303030303230303030303030313030303030303034303030303030303130303030303030343030303030303032207b312c327d
+arrayhex int4 -1	on	7b6109627d	4552524f5220323250303220696e76616c696420696e7075742073796e74617820666f72207479706520696e74656765723a202261096222
+arrayhex int4 -1	on	7b22610a62227d	4552524f5220323250303220696e76616c696420696e7075742073796e74617820666f72207479706520696e74656765723a2022610a6222
+arrayhex int4 -1	on	0a7b317d0a	3030303030303031303030303030303030303030303031373030303030303031303030303030303130303030303030343030303030303031207b317d
+arrayhex int4 -1	on	7b310b7d	3030303030303031303030303030303030303030303031373030303030303031303030303030303130303030303030343030303030303031207b317d
+arrayhex int4 -1	on	5b315d3d0c7b317d	3030303030303031303030303030303030303030303031373030303030303031303030303030303130303030303030343030303030303031207b317d
+array int4 -1	on	{é,"日本",a é}	ERROR 22P02 invalid input syntax for type integer: "é"
+array text -1	on	{}	000000000000000000000019 {}
+array text -1	on	{ }	000000000000000000000019 {}
+array text -1	on	  {}  	000000000000000000000019 {}
+array text -1	on	{{}}	000000000000000000000019 {}
+array text -1	on	{{},{}}	000000000000000000000019 {}
+array text -1	on	{1,2,3}	0000000100000000000000190000000300000001000000013100000001320000000133 {1,2,3}
+array text -1	on	{ 1 , 2 , 3 }	0000000100000000000000190000000300000001000000013100000001320000000133 {1,2,3}
+array text -1	on	{1,NULL,3}	00000001000000010000001900000003000000010000000131ffffffff0000000133 {1,NULL,3}
+array text -1	on	{1,null,3}	00000001000000010000001900000003000000010000000131ffffffff0000000133 {1,NULL,3}
+array text -1	on	{NULL}	0000000100000001000000190000000100000001ffffffff {NULL}
+array text -1	on	{"NULL"}	0000000100000000000000190000000100000001000000044e554c4c {"NULL"}
+array text -1	on	{"1"}	00000001000000000000001900000001000000010000000131 {1}
+array text -1	on	{ "1" , "2" }	000000010000000000000019000000020000000100000001310000000132 {1,2}
+array text -1	on	{{1,2},{3,4}}	000000020000000000000019000000020000000100000002000000010000000131000000013200000001330000000134 {{1,2},{3,4}}
+array text -1	on	{{1,2},{3}}	ERROR 22P02 malformed array literal: "{{1,2},{3}}" DETAIL Multidimensional arrays must have sub-arrays with matching dimensions.
+array text -1	on	{{1},2}	ERROR 22P02 malformed array literal: "{{1},2}" DETAIL Multidimensional arrays must have sub-arrays with matching dimensions.
+array text -1	on	{1,{2}}	ERROR 22P02 malformed array literal: "{1,{2}}" DETAIL Multidimensional arrays must have sub-arrays with matching dimensions.
+array text -1	on	{{1}{2}}	ERROR 22P02 malformed array literal: "{{1}{2}}" DETAIL Unexpected "{" character.
+array text -1	on	{{1},{2},{3}}	00000002000000000000001900000003000000010000000100000001000000013100000001320000000133 {{1},{2},{3}}
+array text -1	on	[0:2]={1,2,3}	0000000100000000000000190000000300000000000000013100000001320000000133 [0:2]={1,2,3}
+array text -1	on	[1:3]={1,2,3}	0000000100000000000000190000000300000001000000013100000001320000000133 {1,2,3}
+array text -1	on	[-2:-1][3:4]={{1,2},{3,4}}	00000002000000000000001900000002fffffffe00000002000000030000000131000000013200000001330000000134 [-2:-1][3:4]={{1,2},{3,4}}
+array text -1	on	[1:2]={1}	ERROR 22P02 malformed array literal: "[1:2]={1}" DETAIL Specified array dimensions do not match array contents.
+array text -1	on	[1:2]={{1},{2}}	ERROR 22P02 malformed array literal: "[1:2]={{1},{2}}" DETAIL Specified array dimensions do not match array contents.
+array text -1	on	[1:1][1:1]={1}	ERROR 22P02 malformed array literal: "[1:1][1:1]={1}" DETAIL Specified array dimensions do not match array contents.
+array text -1	on	[2:1]={}	ERROR 2202E upper bound cannot be less than lower bound
+array text -1	on	[1:2147483647]={1}	ERROR 54000 array upper bound is too large: 2147483647
+array text -1	on	[-2147483648:2147483646]={1}	ERROR 54000 array size exceeds the maximum allowed (134217727)
+array text -1	on	[1:99999999999]={1}	ERROR 54000 array bound is out of integer range
+array text -1	on	[+1:+2]={1,2}	000000010000000000000019000000020000000100000001310000000132 {1,2}
+array text -1	on	[ 1]={1}	ERROR 22P02 malformed array literal: "[ 1]={1}" DETAIL "[" must introduce explicitly-specified array dimensions.
+array text -1	on	[1 ]={1}	ERROR 22P02 malformed array literal: "[1 ]={1}" DETAIL Missing "]" after array dimensions.
+array text -1	on	[1]={1}	00000001000000000000001900000001000000010000000131 {1}
+array text -1	on	[1] = {1}	00000001000000000000001900000001000000010000000131 {1}
+array text -1	on	 [1] [1] = {{1}}	000000020000000000000019000000010000000100000001000000010000000131 {{1}}
+array text -1	on	[1]{1}	ERROR 22P02 malformed array literal: "[1]{1}" DETAIL Missing "=" after array dimensions.
+array text -1	on	[1]= 1	ERROR 22P02 malformed array literal: "[1]= 1" DETAIL Array contents must start with "{".
+array text -1	on	[x]={1}	ERROR 22P02 malformed array literal: "[x]={1}" DETAIL "[" must introduce explicitly-specified array dimensions.
+array text -1	on	[1:]={1}	ERROR 22P02 malformed array literal: "[1:]={1}" DETAIL Missing array dimension value.
+array text -1	on	[:1]={1}	ERROR 22P02 malformed array literal: "[:1]={1}" DETAIL "[" must introduce explicitly-specified array dimensions.
+array text -1	on	[1:2	ERROR 22P02 malformed array literal: "[1:2" DETAIL Missing "]" after array dimensions.
+array text -1	on	[1:2]	ERROR 22P02 malformed array literal: "[1:2]" DETAIL Missing "=" after array dimensions.
+array text -1	on	[1][1][1][1][1][1][1]={{{{{{{1}}}}}}}	ERROR 54000 number of array dimensions exceeds the maximum allowed (6)
+array text -1	on	{{{{{{1}}}}}}	0000000600000000000000190000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000131 {{{{{{1}}}}}}
+array text -1	on	{{{{{{{1}}}}}}}	ERROR 54000 number of array dimensions exceeds the maximum allowed (6)
+array text -1	on	{1	ERROR 22P02 malformed array literal: "{1" DETAIL Unexpected end of input.
+array text -1	on	{1,	ERROR 22P02 malformed array literal: "{1," DETAIL Unexpected end of input.
+array text -1	on	{"1	ERROR 22P02 malformed array literal: "{"1" DETAIL Unexpected end of input.
+array text -1	on	{"1\	ERROR 22P02 malformed array literal: "{"1\" DETAIL Unexpected end of input.
+array text -1	on	{1\	ERROR 22P02 malformed array literal: "{1\" DETAIL Unexpected end of input.
+array text -1	on	{1,}	ERROR 22P02 malformed array literal: "{1,}" DETAIL Unexpected "}" character.
+array text -1	on	{,1}	ERROR 22P02 malformed array literal: "{,1}" DETAIL Unexpected "," character.
+array text -1	on	{1,,2}	ERROR 22P02 malformed array literal: "{1,,2}" DETAIL Unexpected "," character.
+array text -1	on	{1 2}	000000010000000000000019000000010000000100000003312032 {"1 2"}
+array text -1	on	{"1" 2}	ERROR 22P02 malformed array literal: "{"1" 2}" DETAIL Incorrectly quoted array element.
+array text -1	on	{"1""2"}	ERROR 22P02 malformed array literal: "{"1""2"}" DETAIL Incorrectly quoted array element.
+array text -1	on	{1"2"}	ERROR 22P02 malformed array literal: "{1"2"}" DETAIL Incorrectly quoted array element.
+array text -1	on	{"1"x}	ERROR 22P02 malformed array literal: "{"1"x}" DETAIL Incorrectly quoted array element.
+array text -1	on	{"1" }	00000001000000000000001900000001000000010000000131 {1}
+array text -1	on	{1} x	ERROR 22P02 malformed array literal: "{1} x" DETAIL Junk after closing right brace.
+array text -1	on	{1}  	00000001000000000000001900000001000000010000000131 {1}
+array text -1	on	1	ERROR 22P02 malformed array literal: "1" DETAIL Array value must start with "{" or dimension information.
+array text -1	on		ERROR 22P02 malformed array literal: "" DETAIL Array value must start with "{" or dimension information.
+array text -1	on	 	ERROR 22P02 malformed array literal: " " DETAIL Array value must start with "{" or dimension information.
+array text -1	on	x{1}	ERROR 22P02 malformed array literal: "x{1}" DETAIL Array value must start with "{" or dimension information.
+array text -1	on	{\1}	00000001000000000000001900000001000000010000000131 {1}
+array text -1	on	{NULL,"a b"}	0000000100000001000000190000000200000001ffffffff00000003612062 {NULL,"a b"}
+array text -1	on	{"",x}	0000000100000000000000190000000200000001000000000000000178 {"",x}
+array text -1	on	{"a\"b"}	000000010000000000000019000000010000000100000003612262 {"a\"b"}
+array text -1	on	{a\,b}	000000010000000000000019000000010000000100000003612c62 {"a,b"}
+array text -1	on	{a\\b}	000000010000000000000019000000010000000100000003615c62 {"a\\b"}
+array text -1	on	{ a b }	000000010000000000000019000000010000000100000003612062 {"a b"}
+array text -1	on	{"a}	ERROR 22P02 malformed array literal: "{"a}" DETAIL Unexpected end of input.
+array text -1	on	{a}b}	ERROR 22P02 malformed array literal: "{a}b}" DETAIL Junk after closing right brace.
+array text -1	on	{a{b}	ERROR 22P02 malformed array literal: "{a{b}" DETAIL Unexpected "{" character.
+array text -1	on	{\NULL}	0000000100000000000000190000000100000001000000044e554c4c {"NULL"}
+array text -1	on	{"\NULL"}	0000000100000000000000190000000100000001000000044e554c4c {"NULL"}
+array text -1	on	{NULL }	0000000100000001000000190000000100000001ffffffff {NULL}
+array text -1	on	{ NULL}	0000000100000001000000190000000100000001ffffffff {NULL}
+array text -1	on	{nul}	0000000100000000000000190000000100000001000000036e756c {nul}
+array text -1	on	{NULLx}	0000000100000000000000190000000100000001000000054e554c4c78 {NULLx}
+arrayhex text -1	on	7b312c09327d	303030303030303130303030303030303030303030303139303030303030303230303030303030313030303030303031333130303030303030313332207b312c327d
+arrayhex text -1	on	7b6109627d	303030303030303130303030303030303030303030303139303030303030303130303030303030313030303030303033363130393632207b22610962227d
+arrayhex text -1	on	7b22610a62227d	303030303030303130303030303030303030303030303139303030303030303130303030303030313030303030303033363130613632207b22610a62227d
+arrayhex text -1	on	0a7b317d0a	3030303030303031303030303030303030303030303031393030303030303031303030303030303130303030303030313331207b317d
+arrayhex text -1	on	7b310b7d	3030303030303031303030303030303030303030303031393030303030303031303030303030303130303030303030313331207b317d
+arrayhex text -1	on	5b315d3d0c7b317d	3030303030303031303030303030303030303030303031393030303030303031303030303030303130303030303030313331207b317d
+array text -1	on	{é,"日本",a é}	000000010000000000000019000000030000000100000002c3a900000006e697a5e69cac000000046120c3a9 {é,日本,"a é"}
+array text -1	off	{NULL}	0000000100000000000000190000000100000001000000044e554c4c {"NULL"}
+array text -1	off	{null, NuLl ,"NULL",\NULL}	0000000100000000000000190000000400000001000000046e756c6c000000044e754c6c000000044e554c4c000000044e554c4c {"null","NuLl","NULL","NULL"}
+array text -1	off	{NULL,a}	0000000100000000000000190000000200000001000000044e554c4c0000000161 {"NULL",a}
+array text -1	off	{}	000000000000000000000019 {}
+array int2 -1	on	{1,-32768,32767}	0000000100000000000000150000000300000001000000020001000000028000000000027fff {1,-32768,32767}
+array int2 -1	on	{32768}	ERROR 22003 value "32768" is out of range for type smallint
+array int2 -1	on	{ 1 , x }	ERROR 22P02 invalid input syntax for type smallint: "x"
+array int8 -1	on	{9223372036854775807,-9223372036854775808}	0000000100000000000000140000000200000001000000087fffffffffffffff000000088000000000000000 {9223372036854775807,-9223372036854775808}
+array int8 -1	on	{0x10,1_000}	00000001000000000000001400000002000000010000000800000000000000100000000800000000000003e8 {16,1000}
+array oid -1	on	{1,4294967295,-1}	00000001000000000000001a0000000300000001000000040000000100000004ffffffff00000004ffffffff {1,4294967295,4294967295}
+array oid -1	on	{4294967296}	ERROR 22003 value "4294967296" is out of range for type oid
+array float8 -1	on	{1.5,-0,Infinity,-inf,NaN,1e308,0.1,4.9e-324}	0000000100000000000002bd0000000800000001000000083ff8000000000000000000088000000000000000000000087ff000000000000000000008fff0000000000000000000087ff8000000000000000000087fe1ccf385ebc8a0000000083fb999999999999a000000080000000000000001 {1.5,-0,Infinity,-Infinity,NaN,1e+308,0.1,5e-324}
+array float8 -1	on	{1e400}	ERROR 22003 "1e400" is out of range for type double precision
+array bool -1	on	{t,f,true,FALSE,yes,0, on }	00000001000000000000001000000007000000010000000101000000010000000001010000000100000000010100000001000000000101 {t,f,t,f,t,f,t}
+array bool -1	on	{maybe}	ERROR 22P02 invalid input syntax for type boolean: "maybe"
+array numeric 327686	on	{1.234,999.994,NaN,-0}	0000000100000000000006a400000004000000010000000c0002000000000002000108fc0000000c000200000000000203e726ac0000000800000000c0000000000000080000000000000002 {1.23,999.99,NaN,0.00}
+array numeric 327686	on	{999.995}	ERROR 22003 numeric field overflow DETAIL A field with precision 5, scale 2 must round to an absolute value less than 10^3.
+array numeric -1	on	{1e-20,-0.00,Infinity}	0000000100000000000006a400000003000000010000000a0001fffb0000001400010000000800000000000000020000000800000000d0000020 {0.00000000000000000001,0.00,Infinity}
+array varchar 7	on	{a,abc,"abc  ",abc   }	00000001000000000000041300000004000000010000000161000000036162630000000361626300000003616263 {a,abc,abc,abc}
+array varchar 7	on	{a,abcd}	ERROR 22001 value too long for type character varying(3)
+array varchar -1	on	{abcdef}	000000010000000000000413000000010000000100000006616263646566 {abcdef}
+array bpchar 7	on	{a,"",abc}	0000000100000000000004120000000300000001000000036120200000000320202000000003616263 {"a  ","   ",abc}
+array bpchar 7	on	{abcd}	ERROR 22001 value too long for type character(3)
+array bpchar -1	on	{"a  ",""}	00000001000000000000041200000002000000010000000361202000000000 {"a  ",""}
+array char -1	on	{a,ab,"",\\,"\""}	0000000100000000000000120000000500000001000000016100000001610000000100000000015c0000000122 {a,a,"","\\","\""}
+array name -1	on	{abc,"a b",""}	0000000100000000000000130000000300000001000000036162630000000361206200000000 {abc,"a b",""}
+array bytea -1	on	{"\\x0102",abc,""}	00000001000000000000001100000003000000010000000201020000000361626300000000 {"\\x0102","\\x616263","\\x"}
+array bytea -1	on	{"\\x0"}	ERROR 22023 invalid hexadecimal data: odd number of digits
+array uuid -1	on	{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11,{a0eebc999c0b4ef8bb6d6bb9bd380a11}}	ERROR 22P02 malformed array literal: "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11,{a0eebc999c0b4ef8bb6d6bb9bd380a11}}" DETAIL Multidimensional arrays must have sub-arrays with matching dimensions.
+array uuid -1	on	{"{a0eebc999c0b4ef8bb6d6bb9bd380a11}"}	000000010000000000000b86000000010000000100000010a0eebc999c0b4ef8bb6d6bb9bd380a11 {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}
+array uuid -1	on	{x}	ERROR 22P02 invalid input syntax for type uuid: "x"
+array json -1	on	{"{\"a\": 1}","[1, 2]",null,"null","\"s\""}	0000000100000001000000720000000500000001000000087b2261223a20317d000000065b312c20325dffffffff000000046e756c6c00000003227322 {"{\"a\": 1}","[1, 2]",NULL,"null","\"s\""}
+array json -1	on	{"{"}	ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+vector int2vector	on		0000000100000000000000150000000000000000 
+vector int2vector	on	 	0000000100000000000000150000000000000000 
+vector int2vector	on	1	0000000100000000000000150000000100000000000000020001 1
+vector int2vector	on	1 2 3	0000000100000000000000150000000300000000000000020001000000020002000000020003 1 2 3
+vector int2vector	on	 1  2 	0000000100000000000000150000000200000000000000020001000000020002 1 2
+vector int2vector	on	-32768 32767	0000000100000000000000150000000200000000000000028000000000027fff -32768 32767
+vector int2vector	on	32768	ERROR 22003 value "32768" is out of range for type smallint
+vector int2vector	on	1,2	ERROR 22P02 invalid input syntax for type smallint: "1,2"
+vector int2vector	on	1 x	ERROR 22P02 invalid input syntax for type smallint: "x"
+vector int2vector	on	x	ERROR 22P02 invalid input syntax for type smallint: "x"
+vector int2vector	on	+5 -0	0000000100000000000000150000000200000000000000020005000000020000 5 0
+vectorhex int2vector	on	310932	4552524f5220323250303220696e76616c696420696e7075742073796e74617820666f72207479706520736d616c6c696e743a202231093222
+vectorhex int2vector	on	09310a	4552524f5220323250303220696e76616c696420696e7075742073796e74617820666f72207479706520736d616c6c696e743a2022310a22
+vector int2vector	on	0x10	ERROR 22P02 invalid input syntax for type smallint: "0x10"
+vector int2vector	on	99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type smallint
+vector int2vector	on	1 99999999999999999999 x	ERROR 22003 value "99999999999999999999 x" is out of range for type smallint
+vector oidvector	on		00000001000000000000001a0000000000000000 
+vector oidvector	on	1 2	00000001000000000000001a000000020000000000000004000000010000000400000002 1 2
+vector oidvector	on	1-2	00000001000000000000001a0000000200000000000000040000000100000004fffffffe 1 4294967294
+vector oidvector	on	0x10 010	00000001000000000000001a000000020000000000000004000000100000000400000008 16 8
+vector oidvector	on	4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+vector oidvector	on	-2147483649	ERROR 22003 value "-2147483649" is out of range for type oid
+vector oidvector	on	1 x	ERROR 22P02 invalid input syntax for type oid: "x"
+vector oidvector	on	 3 	00000001000000000000001a00000001000000000000000400000003 3
+vector oidvector	on	1,2	ERROR 22P02 invalid input syntax for type oid: ",2"
+vector oidvector	on	18446744073709551616 1	ERROR 22003 value "18446744073709551616 1" is out of range for type oid
+format		0	-
+format		1000	boolean[]
+format		1001	bytea[]
+format		1002	"char"[]
+format		1003	name[]
+format		1005	smallint[]
+format		1006	int2vector[]
+format		1007	integer[]
+format		1008	regproc[]
+format		1009	text[]
+format		1010	tid[]
+format		1011	xid[]
+format		1012	cid[]
+format		1013	oidvector[]
+format		1014	character[]
+format		1015	character varying[]
+format		1016	bigint[]
+format		1017	point[]
+format		1018	lseg[]
+format		1019	path[]
+format		1020	box[]
+format		1021	real[]
+format		1022	double precision[]
+format		1027	polygon[]
+format		1028	oid[]
+format		1033	aclitem
+format		1034	aclitem[]
+format		1040	macaddr[]
+format		1041	inet[]
+format		1042	character
+format		1043	character varying
+format		1082	date
+format		1083	time without time zone
+format		1114	timestamp without time zone
+format		1115	timestamp without time zone[]
+format		114	json
+format		1182	date[]
+format		1183	time without time zone[]
+format		1184	timestamp with time zone
+format		1185	timestamp with time zone[]
+format		1186	interval
+format		1187	interval[]
+format		1231	numeric[]
+format		1248	pg_database
+format		1263	cstring[]
+format		1266	time with time zone
+format		1270	time with time zone[]
+format		142	xml
+format		143	xml[]
+format		1560	bit
+format		1561	bit[]
+format		1562	bit varying
+format		1563	bit varying[]
+format		16	boolean
+format		17	bytea
+format		1700	numeric
+format		1790	refcursor
+format		18	"char"
+format		19	name
+format		194	pg_node_tree
+format		199	json[]
+format		2	???
+format		20	bigint
+format		21	smallint
+format		210	pg_type[]
+format		2173	pg_parameter_acl
+format		22	int2vector
+format		2201	refcursor[]
+format		2202	regprocedure
+format		2203	regoper
+format		2204	regoperator
+format		2205	regclass
+format		2206	regtype
+format		2207	regprocedure[]
+format		2208	regoper[]
+format		2209	regoperator[]
+format		2210	regclass[]
+format		2211	regtype[]
+format		2249	record
+format		2275	cstring
+format		2276	"any"
+format		2277	anyarray
+format		2278	void
+format		2279	trigger
+format		2280	language_handler
+format		2281	internal
+format		2283	anyelement
+format		2287	record[]
+format		23	integer
+format		24	regproc
+format		25	text
+format		26	oid
+format		269	table_am_handler
+format		27	tid
+format		270	pg_attribute[]
+format		271	xid8[]
+format		272	pg_proc[]
+format		273	pg_class[]
+format		2776	anynonarray
+format		28	xid
+format		2842	pg_authid
+format		2843	pg_auth_members
+format		29	cid
+format		2949	txid_snapshot[]
+format		2950	uuid
+format		2951	uuid[]
+format		2970	txid_snapshot
+format		30	oidvector
+format		3115	fdw_handler
+format		32	pg_ddl_command
+format		3220	pg_lsn
+format		3221	pg_lsn[]
+format		325	index_am_handler
+format		3310	tsm_handler
+format		3361	pg_ndistinct
+format		3402	pg_dependencies
+format		3500	anyenum
+format		3614	tsvector
+format		3615	tsquery
+format		3642	gtsvector
+format		3643	tsvector[]
+format		3644	gtsvector[]
+format		3645	tsquery[]
+format		3734	regconfig
+format		3735	regconfig[]
+format		3769	regdictionary
+format		3770	regdictionary[]
+format		3802	jsonb
+format		3807	jsonb[]
+format		3831	anyrange
+format		3838	event_trigger
+format		3904	int4range
+format		3905	int4range[]
+format		3906	numrange
+format		3907	numrange[]
+format		3908	tsrange
+format		3909	tsrange[]
+format		3910	tstzrange
+format		3911	tstzrange[]
+format		3912	daterange
+format		3913	daterange[]
+format		3926	int8range
+format		3927	int8range[]
+format		4066	pg_shseclabel
+format		4072	jsonpath
+format		4073	jsonpath[]
+format		4089	regnamespace
+format		4090	regnamespace[]
+format		4096	regrole
+format		4097	regrole[]
+format		4191	regcollation
+format		4192	regcollation[]
+format		4451	int4multirange
+format		4532	nummultirange
+format		4533	tsmultirange
+format		4534	tstzmultirange
+format		4535	datemultirange
+format		4536	int8multirange
+format		4537	anymultirange
+format		4538	anycompatiblemultirange
+format		4600	pg_brin_bloom_summary
+format		4601	pg_brin_minmax_multi_summary
+format		5017	pg_mcv_list
+format		5038	pg_snapshot
+format		5039	pg_snapshot[]
+format		5069	xid8
+format		5077	anycompatible
+format		5078	anycompatiblearray
+format		5079	anycompatiblenonarray
+format		5080	anycompatiblerange
+format		600	point
+format		601	lseg
+format		602	path
+format		603	box
+format		604	polygon
+format		6101	pg_subscription
+format		6150	int4multirange[]
+format		6151	nummultirange[]
+format		6152	tsmultirange[]
+format		6153	tstzmultirange[]
+format		6155	datemultirange[]
+format		6157	int8multirange[]
+format		628	line
+format		629	line[]
+format		6437	oid8
+format		6442	oid8[]
+format		6490	regdatabase
+format		6491	regdatabase[]
+format		650	cidr
+format		651	cidr[]
+format		700	real
+format		701	double precision
+format		705	unknown
+format		71	pg_type
+format		718	circle
+format		719	circle[]
+format		75	pg_attribute
+format		774	macaddr8
+format		775	macaddr8[]
+format		790	money
+format		791	money[]
+format		81	pg_proc
+format		829	macaddr
+format		83	pg_class
+format		869	inet
+format		9999	???

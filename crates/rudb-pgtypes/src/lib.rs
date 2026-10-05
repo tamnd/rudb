@@ -49,6 +49,13 @@
 //! time zone abbreviations and the time of the transaction start. [`ZoneAbbrevs`] reads a file of
 //! `src/timezone/tznames`, and [`ZoneAbbrevs::postgres_default`] is the `Default` set.
 //!
+//! [`Array`], an array of any element type with up to [`MAXDIM`] dimensions and any lower bounds.
+//! [`array_in`], [`array_out`], [`array_recv`] and [`array_send`] take the function of the element
+//! type as a closure and give the errors of PostgreSQL, also the error of the element. The binary
+//! input refuses an element type that is not the expected type, and [`format_type`] gives the
+//! names in that error. `int2vector` and `oidvector` are arrays with the lower bound 0 and a text
+//! form with spaces, in [`int2vector_in`], [`oidvector_in`] and the functions beside them.
+//!
 //! [`Recv`], the binary input of a `Bind` parameter, with the errors of PostgreSQL when the value
 //! is too short or too long. The binary output of the other types is the value in big-endian bytes.
 //!
@@ -66,6 +73,7 @@
 //! when it reaches `max_stack_depth`. [`json_in`] uses no recursion and takes a value at any
 //! depth.
 
+mod array;
 mod binary;
 mod datetime;
 mod error;
@@ -79,6 +87,11 @@ mod string;
 mod types;
 pub mod typmod;
 
+pub use array::{
+    Array, ArrayDim, MAX_ARRAY_SIZE, MAXDIM, array_in, array_out, array_recv, array_send,
+    int2vector_in, int2vector_out, int2vector_recv, int2vector_send, oidvector_in, oidvector_out,
+    oidvector_recv, oidvector_send,
+};
 pub use binary::{Recv, name_recv};
 pub use datetime::{
     Abbrev, AbbrevMeaning, DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateFormat, DateOrder, DateStyle,
@@ -103,4 +116,4 @@ pub use scalar::{
     name_in, uuid_in, uuid_out,
 };
 pub use string::{bpchar_coerce, bpchar_in, varchar_coerce, varchar_in};
-pub use types::{Oid, PgType, TypeInfo};
+pub use types::{Oid, PgType, TypeInfo, format_type};

@@ -41,6 +41,11 @@ impl<'a> Recv<'a> {
         Ok(out)
     }
 
+    /// The number of bytes that are not read.
+    pub fn remaining(&self) -> usize {
+        self.data.len() - self.at
+    }
+
     /// `pq_getmsgbyte`, which has its own text for an empty value.
     pub fn byte(&mut self) -> Result<u8, TypeError> {
         let Some(&byte) = self.data.get(self.at) else {
