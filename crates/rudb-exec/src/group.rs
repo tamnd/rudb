@@ -2949,7 +2949,7 @@ impl<'a> Aggregate<'a> {
                     // the order their first rows come in, the same order as the pass below.
                     let combos = coded_map.len();
                     place_sums.add_places(&mut coded_places[..*length], kept, combos)?;
-                    if place_sums.unseen(coded_map) {
+                    if place_sums.touched(coded_map)? {
                         for row in 0..*length {
                             let place = coded_places[row];
                             if place < combos && coded_map[place] == crate::table::UNSEEN {
