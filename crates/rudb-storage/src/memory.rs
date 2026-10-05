@@ -285,6 +285,11 @@ impl MemoryTable {
         let zone = self.take_stats(&chunk);
         let len = chunk.len();
         if len <= TAIL_TAKES {
+            // A tail laid into one chunk has to fit in a vector, so a chunk that would take it past
+            // one starts the next tail.
+            if self.tail_rows + len > VECTOR_SIZE {
+                self.close_tail()?;
+            }
             // As pages, so that a read of a tail of one chunk shares it the way an open chunk is
             // shared.
             self.close_rows()?;
@@ -380,6 +385,19 @@ impl MemoryTable {
         self.tail.clear();
         self.tail_rows = 0;
         Ok(())
+    }
+
+    /// Which chunk of the tail holds row `place` of it, and where in that chunk, once the rows
+    /// being built are closed into one. `None` for a chunk that keeps only some of its rows.
+    fn tail_place(&self, place: usize) -> Option<(usize, usize)> {
+        let mut at = place;
+        for (index, chunk) in self.tail.iter().enumerate() {
+            if at < chunk.len() {
+                return chunk.kept().is_none().then_some((index, at));
+            }
+            at -= chunk.len();
+        }
+        None
     }
 
     /// The named columns of the tail, laid end to end.
@@ -1337,9 +1355,11 @@ impl MemoryTable {
     /// Writes `values` over the columns `targets` of row `place` of chunk `chunk`, which is how an
     /// `UPDATE` of one row lands without the table being built again, and says whether it could.
     ///
-    /// A row of the tail is not written here, because the tail is laid out again whenever it is
-    /// read, and the caller takes the long way for it. A column of a sealed group is written where
-    /// it is, see [`Vector::put`], so the cost is the row unless somebody still holds the page.
+    /// A row of the tail is written in the small chunk it went in with, since the tail is laid out
+    /// again from those whenever it is read. The rows still being built are closed into a chunk
+    /// first, so a row the table took a moment ago can be written too. A column of a sealed group
+    /// is written where it is, see [`Vector::put`], so the cost is the row unless somebody still
+    /// holds the page.
     ///
     /// The zones of the chunk and of the run it is in take the new values and stop saying their
     /// ends and totals are exact, the counts take them as [`Counts::rewrite`] says, and what was
@@ -1381,9 +1401,16 @@ impl MemoryTable {
             Slot::Open { at } if self.open.get(at).is_none_or(|held| held.kept().is_some()) => {
                 return Ok(false);
             }
-            Slot::Tail => return Ok(false),
             _ => {}
         }
+        let tail = match slot {
+            Slot::Tail => {
+                self.close_rows()?;
+                let Some(found) = self.tail_place(place) else { return Ok(false) };
+                Some(found)
+            }
+            _ => None,
+        };
         self.forget_grams();
         for (&column, value) in targets.iter().zip(values) {
             let was_null = match slot {
@@ -1408,7 +1435,17 @@ impl MemoryTable {
                     }
                     was_null
                 }
-                Slot::Tail => return Ok(false),
+                Slot::Tail => {
+                    let (index, at) = tail.expect("found above for a row of the tail");
+                    let held = std::mem::replace(&mut self.tail[index], Chunk::empty(&[]));
+                    let rows = held.len();
+                    let mut columns = held.into_columns();
+                    let was_null = columns[column].try_value_at(at)?.is_null();
+                    let put = columns[column].put(at, value);
+                    self.tail[index] = Chunk::with_rows(columns, rows)?;
+                    put?;
+                    was_null
+                }
             };
             if let Some(zone) = self.zones.get_mut(chunk) {
                 zone.rewrite(column, was_null, value, &self.types[column]);
@@ -2308,6 +2345,59 @@ mod tests {
             assert_eq!(mixed.exact_extremes(column).ok(), whole.exact_extremes(column).ok());
             assert_eq!(mixed.exact_sum(column).ok(), whole.exact_sum(column).ok());
         }
+    }
+
+    #[test]
+    fn a_row_of_the_tail_is_written_where_it_is() {
+        let types = vec![LogicalType::BigInt, LogicalType::Varchar];
+        let mut table = MemoryTable::new(types.clone());
+        let mut model: Vec<Vec<Value>> = Vec::new();
+        let row = |id: i64| vec![Value::BigInt(id), Value::Varchar(format!("n{id}"))];
+        let mut next = 0_i64;
+        // Rows one at a time and in small chunks, past a vector so the tail closes once, with a
+        // write after every few of them to a row of the tail, being built or already a chunk.
+        while model.len() < VECTOR_SIZE + 400 {
+            if next % 7 == 0 {
+                let rows: Vec<Vec<Value>> = (next..next + 5).map(row).collect();
+                table.append_rows(&rows).expect("rows");
+                model.extend(rows);
+                next += 5;
+            } else {
+                table.append_row(&row(next)).expect("a row");
+                model.push(row(next));
+                next += 1;
+            }
+            if next % 3 == 0 {
+                let last = table.chunk_count() - 1;
+                let rows = table.chunk_len(last).expect("a chunk");
+                let start = model.len() - rows;
+                let place = usize::try_from(next).expect("small") * 13 % rows;
+                let name =
+                    if next % 2 == 0 { Value::Null } else { Value::Varchar(format!("w{next}")) };
+                let id = Value::BigInt(-next);
+                let put = table.put_row(last, place, &[1, 0], &[name.clone(), id.clone()]);
+                assert!(put.expect("written"), "row {place} of {rows} in the tail");
+                model[start + place] = vec![id, name];
+            }
+        }
+        assert_eq!(table.len(), model.len());
+        assert_eq!(table.chunk_count(), 2);
+        let mut seen = Vec::new();
+        for chunk in 0..table.chunk_count() {
+            let read = table.read(chunk, &[0, 1]).expect("read");
+            seen.extend(
+                (0..read.len()).map(|row| vec![read.value_at(row, 0), read.value_at(row, 1)]),
+            );
+        }
+        assert_eq!(seen, model);
+        let mut whole = MemoryTable::new(types);
+        whole.append_rows(&model).expect("rows");
+        for column in 0..2 {
+            assert_eq!(table.null_count(column).ok(), whole.null_count(column).ok(), "{column}");
+        }
+        // And the first chunk, which is a chunk of its own now, is written too.
+        assert!(table.put_row(0, 5, &[0], &[Value::BigInt(7)]).expect("written"));
+        assert_eq!(table.read(0, &[0]).expect("read").value_at(5, 0), Value::BigInt(7));
     }
 
     #[test]
