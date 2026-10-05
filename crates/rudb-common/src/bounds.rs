@@ -508,8 +508,8 @@ pub trait Zones: std::fmt::Debug + Send + Sync {
     }
 
     /// The share of the column's rows `function` keeps, one of the `LIKE` family by its resolved
-    /// name or `=`, called with the column and the constant `pattern`, measured on a sample of the
-    /// rows.
+    /// name, `=` or one of `<`, `<=`, `>` and `>=`, called with the column and the constant
+    /// `pattern`, measured on a sample of the rows.
     ///
     /// A pattern is the condition nothing else here can read, and the fifth a plan charges instead
     /// is wrong by orders of magnitude on JOB in both directions. `None` where the store cannot

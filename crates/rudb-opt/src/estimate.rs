@@ -799,8 +799,8 @@ fn counted_by(
         .or_else(|| sampled(plan, input, conjunct).map(|share| (share, Provenance::Sample)))
 }
 
-/// What fraction of a scan's rows a `LIKE` or an equality of one of its columns against a constant
-/// keeps, run by the store over a sample of the rows. See [`Zones::matching`].
+/// What fraction of a scan's rows a `LIKE`, an equality or an ordering of one of its columns
+/// against a constant keeps, run by the store over a sample of the rows. See [`Zones::matching`].
 ///
 /// Asked last, because it is the one answer here that reads the file, and only for the conditions
 /// on a string column none of the others could read. In JOB 6d the fifth charged for
@@ -809,6 +809,10 @@ fn counted_by(
 /// no synopsis and no distinct count, which is every string column whose values are nearly all
 /// different: `k.keyword = 'marvel-cinematic-universe'` keeps one row of 134,170 and was charged
 /// 26,834, which in 6e made the movies it leads to look like a hundred thousand.
+///
+/// An ordering is here because the bounds read no range over strings, which have no distance
+/// between two values to interpolate along. JOB has 22 queries with one, `mi_idx.info > '5.0'` the
+/// most common, and every one of them was charged the fifth.
 ///
 /// A disjunction over one column is the sum of its branches, capped at every row. Branches that are
 /// equalities cannot overlap, and branches that are patterns can, which makes the sum a ceiling.
@@ -839,8 +843,8 @@ fn sampled_one(plan: &Plan, input: NodeRef, conjunct: ExprRef) -> Option<(usize,
     Some((column, zones.matching(column, function, constant)?))
 }
 
-/// A `LIKE` or an equality of a string column of the scan against a constant, as the store names
-/// the column, with the store.
+/// A `LIKE`, an equality or an ordering of a string column of the scan against a constant, as the
+/// store names the column, with the store.
 fn condition(
     plan: &Plan,
     input: NodeRef,
@@ -855,10 +859,19 @@ fn condition(
             let [column, pattern] = plan.expr_list(args) else { return None };
             (function, *column, *pattern)
         }
-        Expr::Compare { op: CompareOp::Equal, left, right } => match plan.expr(left) {
-            Expr::Column(_) => ("=", left, right),
-            _ => ("=", right, left),
-        },
+        Expr::Compare { op, left, right } => {
+            // The column on the left, so a constant written first turns its ordering round.
+            let flipped = !matches!(plan.expr(left), Expr::Column(_));
+            let function = match (op, flipped) {
+                (CompareOp::Equal, _) => "=",
+                (CompareOp::Less, false) | (CompareOp::Greater, true) => "<",
+                (CompareOp::LessOrEqual, false) | (CompareOp::GreaterOrEqual, true) => "<=",
+                (CompareOp::Greater, false) | (CompareOp::Less, true) => ">",
+                (CompareOp::GreaterOrEqual, false) | (CompareOp::LessOrEqual, true) => ">=",
+                _ => return None,
+            };
+            if flipped { (function, right, left) } else { (function, left, right) }
+        }
         _ => return None,
     };
     let (Expr::Column(binding), Expr::Constant(constant)) =
@@ -2849,6 +2862,8 @@ mod tests {
         asked: Mutex<Vec<Test>>,
         /// What [`Zones::nulls`] answers, whatever column it is asked about.
         nulls: Stat<u64>,
+        /// Every condition [`Zones::matching`] was asked to sample, which it answers with a tenth.
+        sampled: Mutex<Vec<(usize, String, String)>>,
     }
 
     impl Stub {
@@ -2859,6 +2874,7 @@ mod tests {
                 spread: None,
                 asked: Mutex::new(Vec::new()),
                 nulls: Stat::Unknown,
+                sampled: Mutex::new(Vec::new()),
             })
         }
 
@@ -2869,6 +2885,7 @@ mod tests {
                 spread: Some(spread),
                 asked: Mutex::new(Vec::new()),
                 nulls: Stat::Unknown,
+                sampled: Mutex::new(Vec::new()),
             })
         }
 
@@ -2879,6 +2896,7 @@ mod tests {
                 spread: None,
                 asked: Mutex::new(Vec::new()),
                 nulls: Stat::exact(nulls, Provenance::NullCount),
+                sampled: Mutex::new(Vec::new()),
             })
         }
     }
@@ -2909,6 +2927,41 @@ mod tests {
         fn nulls(&self, _column: usize) -> Stat<u64> {
             self.nulls
         }
+
+        fn matching(&self, column: usize, function: &str, pattern: &str) -> Option<f64> {
+            let asked = (column, function.to_owned(), pattern.to_owned());
+            self.sampled.lock().expect("no test panics while holding this").push(asked);
+            Some(0.1)
+        }
+    }
+
+    #[test]
+    fn a_range_over_strings_is_sampled_with_the_column_on_the_left() {
+        // Two strings have no distance between them, so the bounds read no range over them and
+        // `mi_idx.info > '5.0'` was the constant fifth. The store counts it on a sample instead,
+        // and a constant written first asks the store the same question turned round.
+        let scan = "Get memory.main.t AS t #0 [a::VARCHAR, b::VARCHAR]\n";
+        for (condition, function) in [
+            ("#0.0::VARCHAR > '5.0'::VARCHAR", ">"),
+            ("'5.0'::VARCHAR > #0.0::VARCHAR", "<"),
+            ("'A'::VARCHAR <= #0.0::VARCHAR", ">="),
+            ("#0.0::VARCHAR <= 'F'::VARCHAR", "<="),
+        ] {
+            let text = format!("Filter ({condition})::BOOLEAN\n  {scan}");
+            let zones = Stub::new(None);
+            assert_eq!(
+                zoned(&text, 1_000_000, &zones),
+                Stat::estimated(100_000, Provenance::Sample),
+                "{condition}"
+            );
+            let sampled = zones.sampled.lock().expect("no test panicked").clone();
+            assert_eq!(sampled, [(1, function.to_owned(), condition_constant(condition))]);
+        }
+    }
+
+    /// The string constant of a condition, without its quotes.
+    fn condition_constant(condition: &str) -> String {
+        condition.split('\'').nth(1).expect("a quoted constant").to_owned()
     }
 
     /// A two column scan, whose columns the stub above numbers the other way round.
