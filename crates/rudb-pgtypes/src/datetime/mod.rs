@@ -187,6 +187,37 @@ impl Interval {
     pub const INFINITY: Interval = Interval { time: i64::MAX, day: i32::MAX, month: i32::MAX };
 }
 
+/// A date of the engine as PostgreSQL holds it. The engine counts days from 1970-01-01 and has
+/// `i32::MAX` and `-i32::MAX` for the infinities. PostgreSQL counts days from 2000-01-01 and has
+/// [`DATE_INFINITY`] and [`DATE_NEGATIVE_INFINITY`]. A date that PostgreSQL cannot hold is an
+/// error.
+pub fn date_from_unix(days: i32) -> Result<i32, TypeError> {
+    match days {
+        i32::MAX => Ok(DATE_INFINITY),
+        days if days == -i32::MAX => Ok(DATE_NEGATIVE_INFINITY),
+        days => {
+            let date = i64::from(days) + i64::from(UNIX_TO_POSTGRES_DAYS);
+            let valid =
+                i64::from(-POSTGRES_EPOCH_JDATE)..i64::from(DATE_END_JULIAN - POSTGRES_EPOCH_JDATE);
+            if valid.contains(&date) { Ok(date as i32) } else { Err(out_of_range("date")) }
+        }
+    }
+}
+
+/// A `timestamp` or a `timestamptz` of the engine as PostgreSQL holds it. The engine counts
+/// microseconds from 1970-01-01 and has `i64::MAX` and `-i64::MAX` for the infinities. A value
+/// that PostgreSQL cannot hold is an error.
+pub fn timestamp_from_unix(micros: i64) -> Result<i64, TypeError> {
+    match micros {
+        i64::MAX => Ok(TIMESTAMP_INFINITY),
+        micros if micros == -i64::MAX => Ok(TIMESTAMP_NEGATIVE_INFINITY),
+        micros => micros
+            .checked_add(UNIX_TO_POSTGRES_USECS)
+            .filter(|ts| (MIN_TIMESTAMP..END_TIMESTAMP).contains(ts))
+            .ok_or_else(|| out_of_range("timestamp")),
+    }
+}
+
 fn out_of_range(what: &str) -> TypeError {
     TypeError::new(SqlState::DATETIME_VALUE_OUT_OF_RANGE, format!("{what} out of range"))
 }
@@ -491,7 +522,7 @@ pub fn timestamp_out(ts: i64, format: DateFormat, out: &mut Vec<u8>) -> Result<(
 pub fn timestamptz_out(
     ts: i64,
     format: DateFormat,
-    zone: &impl TimeZone,
+    zone: &(impl TimeZone + ?Sized),
     out: &mut Vec<u8>,
 ) -> Result<(), TypeError> {
     let infinity: &[u8] = match ts {
