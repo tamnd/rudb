@@ -14709,8 +14709,12 @@ fn encode_waiting(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
 /// tables `FRONT` then `LZ` won `title` and `char_name` that way by one percent over `LZ` then
 /// `FSST`, and encoded them at 6 MB/s against 55. Every shape that fitted its sample ran at 40 MB/s
 /// or more. `PLAIN` fits everything, so something always wins.
+///
+/// A shape with `LZ` in it also has to come to no more than [`LZ_KEEPS`] of the smallest shape
+/// without it, because the matcher is most of what a payload costs to write. See [`LZ_KEEPS`].
 fn settle_shape(sample: &[Vec<&[u8]>]) -> Result<chooser::Settled> {
     let mut best: Option<(chooser::Settled, usize)> = None;
+    let mut best_without: Option<(chooser::Settled, usize)> = None;
     for shape in payload_shapes() {
         let watched = chooser::Watched::new(&shape);
         let mut size = 0;
@@ -14720,12 +14724,47 @@ fn settle_shape(sample: &[Vec<&[u8]>]) -> Result<chooser::Settled> {
         if !watched.fitted() {
             continue;
         }
-        if best.as_ref().is_none_or(|(_, smallest)| size < *smallest) {
-            best = Some((shape, size));
+        let slot =
+            if shape.strings().contains(&string::Kind::Lz) { &mut best } else { &mut best_without };
+        if slot.as_ref().is_none_or(|(_, smallest)| size < *smallest) {
+            *slot = Some((shape, size));
         }
     }
-    best.map(|(shape, _)| shape)
-        .ok_or_else(|| invalid("no shape applies to a global dictionary payload"))
+    match (best, best_without) {
+        (Some((with, size)), Some((_, smallest))) if lz_pays(size, smallest) => Ok(with),
+        (_, Some((without, _))) | (Some((without, _)), None) => Ok(without),
+        (None, None) => Err(invalid("no shape applies to a global dictionary payload")),
+    }
+}
+
+/// The share of the smallest payload shape without `LZ` that a shape with it has to come under to
+/// be taken, as a fraction.
+///
+/// The matcher runs at a third of the speed of `FSST` on the same text, so a shape with it in has
+/// to save enough to be worth the time. Measured on 400,000 first seen values of each JOB column,
+/// with the smallest shape that has `LZ` in it against `FSST` alone:
+///
+/// | column | with `LZ` | `FSST` | share |
+/// |---|---|---|---|
+/// | `movie_info.info` | 3,982,572 | 5,923,508 | 0.67 |
+/// | `movie_companies.note` | 854,788 | 1,277,701 | 0.67 |
+/// | `aka_name.name` | 3,361,451 | 4,824,856 | 0.70 |
+/// | `cast_info.note` | 4,668,196 | 6,259,685 | 0.75 |
+/// | `name.name` | 3,428,580 | 4,502,259 | 0.76 |
+/// | `person_info.info` | 20,792,677 | 25,266,323 | 0.82 |
+/// | `person_info.note` | 6,471,707 | 7,217,427 | 0.90 |
+/// | `title.title` | 5,638,231 | 5,703,351 | 0.99 |
+/// | `char_name.name` | 4,160,465 | 4,173,431 | 1.00 |
+///
+/// The matcher on `person_info.info` was 16 of the 41 seconds of processor time it took to load
+/// `person_info`, to save 18 percent of its payload. A column read as rarely as that one is better
+/// off written three times as fast, and the columns where `LZ` takes a fifth or more off keep it.
+const LZ_KEEPS: (u8, u8) = (4, 5);
+
+/// Whether a payload shape with `LZ` in it that came to `with` bytes is worth taking over the
+/// smallest one without it, which came to `without`.
+fn lz_pays(with: usize, without: usize) -> bool {
+    (with as u128) * u128::from(LZ_KEEPS.1) <= (without as u128) * u128::from(LZ_KEEPS.0)
 }
 
 /// The sorted order laid out the way a reader reads it, in blocks of [`TEXT_RANK_BLOCK`] entries.
@@ -15625,6 +15664,38 @@ mod tests {
     use rudb_common::stat::Provenance;
 
     use super::*;
+
+    #[test]
+    fn lz_is_kept_only_where_it_takes_a_fifth_off() {
+        // movie_info.info, name.name, person_info.info and title.title from the table on LZ_KEEPS.
+        assert!(lz_pays(3_982_572, 5_923_508));
+        assert!(lz_pays(3_428_580, 4_502_259));
+        assert!(!lz_pays(20_792_677, 25_266_323));
+        assert!(!lz_pays(5_638_231, 5_703_351));
+        assert!(lz_pays(4, 5));
+        assert!(!lz_pays(5, 6));
+    }
+
+    #[test]
+    fn a_payload_settles_on_lz_only_where_text_comes_back() {
+        let word = |at: u64| format!("{:016x}", at.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        // Long random phrases that come back within a block, which only the matcher sees.
+        let phrases: Vec<String> = (0..300)
+            .map(|at| format!("{}{}{}", word(at), word(at + 1000), word(at + 2000)))
+            .collect();
+        let repeated: Vec<String> = (0..8192)
+            .map(|at| format!("{} {}", phrases[at * 7 % 300], phrases[at * 13 % 300]))
+            .collect();
+        let fresh: Vec<String> = (0..8192).map(|at| word(at + 5000)).collect();
+        for (values, lz) in [(&repeated, true), (&fresh, false)] {
+            let blocks: Vec<Vec<&[u8]>> = values
+                .chunks(TEXT_PAYLOAD_VALUES)
+                .map(|chunk| chunk.iter().map(String::as_bytes).collect())
+                .collect();
+            let shape = settle_shape(&blocks).unwrap();
+            assert_eq!(shape.strings().contains(&string::Kind::Lz), lz, "{:?}", shape.strings());
+        }
+    }
 
     #[test]
     fn head_is_the_value_padded_to_eight_bytes() {
