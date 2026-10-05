@@ -63,6 +63,7 @@ mod distinct;
 pub mod grams;
 pub mod graph;
 pub mod host;
+mod nested;
 pub mod postings;
 mod prepare;
 mod projection;
@@ -10308,20 +10309,26 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::TimestampS => Ok(25),
         LogicalType::TimestampMs => Ok(26),
         LogicalType::TimestampNs => Ok(27),
+        LogicalType::List(element) => type_tag(element).map(|_| 29),
         _ => Err(Error::not_implemented(format!("native storage for {ty}"))),
     }
 }
 
 /// The tag of a column type, and the parameters of the ones that have any.
 ///
-/// Only `DECIMAL` has parameters today. Width and scale go after the tag rather than into it
+/// `DECIMAL` and `LIST` have parameters. Width and scale go after the tag rather than into it
 /// because they are what says how wide a value is on disk, and a reader that guessed would read the
-/// wrong number of bytes per row rather than the wrong number of digits.
+/// wrong number of bytes per row rather than the wrong number of digits. A list puts the type of its
+/// elements after its tag, with the parameters of that type.
 fn put_type(out: &mut Vec<u8>, ty: &LogicalType) -> Result<()> {
     out.push(type_tag(ty)?);
-    if let LogicalType::Decimal { width, scale } = ty {
-        out.push(*width);
-        out.push(*scale);
+    match ty {
+        LogicalType::Decimal { width, scale } => {
+            out.push(*width);
+            out.push(*scale);
+        }
+        LogicalType::List(element) => put_type(out, element)?,
+        _ => {}
     }
     Ok(())
 }
@@ -10334,6 +10341,9 @@ fn read_type(cur: &mut Cursor<'_>) -> Result<LogicalType> {
         let scale = cur.u8()?;
         return LogicalType::decimal(width, scale)
             .map_err(|_| invalid("decimal column width and scale are not a decimal"));
+    }
+    if tag == 29 {
+        return Ok(LogicalType::List(Box::new(read_type(cur)?)));
     }
     tag_type(tag)
 }
@@ -13663,6 +13673,9 @@ fn coded_page(codes: &[u32], validity: &[u8]) -> Result<Vec<u8>> {
 /// dictionary. Those are built by [`coded_page`] from codes [`prepare`] handed out.
 fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
     let ty = vector.logical_type();
+    if let LogicalType::List(_) = ty {
+        return encode(&nested::to_bytes(vector)?, settling);
+    }
     // flatten: the file writer needs a uniform scalar page and does it once per loaded chunk.
     let flat = vector.flatten()?;
     let mut out = Vec::new();
@@ -15217,6 +15230,9 @@ fn decode_at(
     if positions.last().is_some_and(|&last| last as usize >= rows) {
         return Err(invalid("a position is past the end of the part"));
     }
+    if let LogicalType::List(_) = ty {
+        return decode(ty, rows, bytes, global)?.gather(positions);
+    }
     // Past about one row in eight, unpacking the whole part and picking the rows out is the cheaper
     // of the two, since a unit unpacks at a fraction of what a row unpacked on its own costs.
     if positions.len().saturating_mul(SPARSE_RENT) <= rows
@@ -15381,6 +15397,9 @@ fn decode(
     bytes: &[u8],
     global: Option<Arc<Vector>>,
 ) -> Result<Vector> {
+    if let LogicalType::List(_) = ty {
+        return nested::from_bytes(ty, &decode(&LogicalType::Blob, rows, bytes, None)?);
+    }
     let mut cur = Cursor::new(bytes);
     let codec = cur.u8()?;
     let flag = cur.u8()?;
@@ -18878,6 +18897,71 @@ mod tests {
         };
         for row in 0..expected.len() {
             assert_eq!(back.bytes(row), expected.bytes(row), "row {row} of the bit column");
+        }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A list column, with null rows, empty lists, null elements and a list of lists, comes back
+    /// as it went in, and the directory keeps the element type with its parameters.
+    #[test]
+    fn a_list_column_comes_back_as_the_lists_that_went_in() {
+        let path = path("list");
+        let list = |element: &LogicalType, values: Vec<Value>| Value::List {
+            element: element.clone(),
+            values,
+        };
+        let small = LogicalType::SmallInt;
+        let text = LogicalType::Varchar;
+        let money = LogicalType::decimal(10, 2).expect("a decimal");
+        let texts = LogicalType::List(Box::new(text.clone()));
+        let ints = vec![
+            list(&small, vec![Value::SmallInt(1), Value::Null, Value::SmallInt(-3)]),
+            list(&small, Vec::new()),
+            Value::Null,
+        ];
+        let strings = vec![
+            Value::Null,
+            list(&text, vec![Value::Varchar("a b".into()), Value::Varchar(String::new())]),
+            list(&text, vec![Value::Null]),
+        ];
+        let decimals = vec![
+            list(&money, vec![Value::Decimal { unscaled: 12345, width: 10, scale: 2 }]),
+            list(&money, Vec::new()),
+            list(&money, vec![Value::Null, Value::Decimal { unscaled: -1, width: 10, scale: 2 }]),
+        ];
+        let nested = vec![
+            list(&texts, vec![list(&text, vec![Value::Varchar("x".into())]), Value::Null]),
+            list(&texts, vec![list(&text, Vec::new())]),
+            Value::Null,
+        ];
+        let columns = [
+            (LogicalType::List(Box::new(small.clone())), ints),
+            (texts.clone(), strings),
+            (LogicalType::List(Box::new(money.clone())), decimals),
+            (LogicalType::List(Box::new(texts.clone())), nested),
+        ];
+        let fields = columns
+            .iter()
+            .enumerate()
+            .map(|(at, (ty, _))| Field::new(format!("c{at}"), ty.clone()))
+            .collect::<Vec<_>>();
+        let vectors = columns
+            .iter()
+            .map(|(ty, values)| Vector::from_values(ty.clone(), values).expect("a list column"))
+            .collect::<Vec<_>>();
+        let mut writer = Writer::create(&path, "lists", fields.clone()).expect("new file");
+        writer.append(&Chunk::new(vectors).expect("matching rows")).expect("one stripe");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let types =
+            reader.table().fields().iter().map(|field| field.ty.clone()).collect::<Vec<_>>();
+        assert_eq!(types, columns.iter().map(|(ty, _)| ty.clone()).collect::<Vec<_>>());
+        let read = reader.read(0, &[0, 1, 2, 3]).expect("all columns");
+        for (column, (_, values)) in columns.iter().enumerate() {
+            for (row, value) in values.iter().enumerate() {
+                assert_eq!(&read.value_at(row, column), value, "row {row} of column {column}");
+            }
         }
         fs::remove_file(path).expect("remove scratch file");
     }
