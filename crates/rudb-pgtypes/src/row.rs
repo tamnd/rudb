@@ -18,6 +18,7 @@ use std::ops::Range;
 use rudb_common::{LogicalType, SqlState, time_tz, uuid};
 use rudb_vector::{Data, Form, Live, Vector};
 
+use crate::array::{Array, array_out, array_send};
 use crate::datetime::{
     DateFormat, Interval, IntervalStyle, TimeZone, date_from_unix, date_out, interval_out,
     interval_send, time_out, timestamp_from_unix, timestamp_out, timestamptz_out, timetz_out,
@@ -29,7 +30,7 @@ use crate::number::{int_out, u64_out};
 use crate::numeric::{decimal_out, decimal_send, numeric_in, numeric_send};
 use crate::reg::RegKind;
 use crate::scalar::{ByteaOutput, bool_out, bytea_out, char_out, uuid_out};
-use crate::types::{Oid, PgType, format_type};
+use crate::types::{Oid, PgType, TypeInfo, format_type};
 use crate::typmod::numeric_typmod;
 
 /// The settings of the session that the text output reads.
@@ -79,6 +80,8 @@ enum Kind {
     TimestampTz,
     Interval,
     Uuid,
+    /// A one-dimensional array. The plan of the column has the kind of the elements.
+    Array,
     /// A column of the type of an untyped `NULL`. Every value is NULL.
     Null,
     /// A rudb type with no PostgreSQL type of its own, sent as the text of each value. When
@@ -93,11 +96,20 @@ enum Kind {
 ///
 /// Each rudb type with a PostgreSQL type of the same values gets that type. The unsigned integer
 /// types get the next signed type that holds all their values, and the integers of 64 bits or more
-/// without a sign or of 128 bits get `numeric`. The other rudb types, such as the lists, the
-/// structs and the enums, get `text` until their PostgreSQL types come.
+/// without a sign or of 128 bits get `numeric`. A list gets the array type of its element type,
+/// with the typmod of the element as PostgreSQL does, when the element type has an array type and
+/// is not itself a list. The other rudb types, such as the nested lists, the structs and the
+/// enums, get `text` until their PostgreSQL types come.
 pub fn pg_type(logical: &LogicalType) -> PgType {
     use LogicalType as L;
     let (oid, typmod) = match logical {
+        L::List(element) | L::Array(element, _) => {
+            let element = pg_type(element);
+            match TypeInfo::get(element.oid).map(|info| info.array) {
+                Some(array) if array != 0 => (array, element.typmod),
+                _ => (oids::TEXT, -1),
+            }
+        }
         L::Boolean => (oids::BOOL, -1),
         L::TinyInt | L::SmallInt | L::UTinyInt => (oids::INT2, -1),
         L::Integer | L::USmallInt => (oids::INT4, -1),
@@ -183,10 +195,22 @@ impl Kind {
             oids::TIMESTAMPTZ if *logical == L::TimestampTz => Kind::TimestampTz,
             oids::INTERVAL if *logical == L::Interval => Kind::Interval,
             oids::UUID if *logical == L::Uuid => Kind::Uuid,
+            oid if element_of(logical, oid).is_some() => Kind::Array,
             oids::TEXT if pg_type(logical).oid == oids::TEXT => Kind::Display { numeric: false },
             _ => return None,
         };
         Some(kind)
+    }
+
+    /// The plan of a column of this kind, with the path of its values in the first and the third
+    /// pass.
+    fn plan(self, binary: bool, element: Option<Element>) -> Plan {
+        let path = match (self, binary) {
+            (Kind::Text, _) | (Kind::Bytea, true) => Path::Bytes,
+            (kind, true) => kind.binary_width().map_or(Path::Staged, Path::Fixed),
+            (_, false) => Path::Staged,
+        };
+        Plan { kind: self, binary, path, element }
     }
 
     /// The length of a value in the binary format when it is the same for every value.
@@ -198,7 +222,12 @@ impl Kind {
             Kind::Int8 | Kind::Float8 | Kind::Time | Kind::Timestamp | Kind::TimestampTz => 8,
             Kind::TimeTz => 12,
             Kind::Interval | Kind::Uuid => 16,
-            Kind::Decimal(_) | Kind::Text | Kind::Bytea | Kind::Null | Kind::Display { .. } => {
+            Kind::Decimal(_)
+            | Kind::Text
+            | Kind::Bytea
+            | Kind::Array
+            | Kind::Null
+            | Kind::Display { .. } => {
                 return None;
             }
         })
@@ -221,6 +250,35 @@ struct Plan {
     kind: Kind,
     binary: bool,
     path: Path,
+    /// The elements of an array column.
+    element: Option<Element>,
+}
+
+/// The elements of an array column: their kind and path, their type and the delimiter of the
+/// text format.
+#[derive(Debug, Clone, Copy)]
+struct Element {
+    kind: Kind,
+    path: Path,
+    oid: Oid,
+    delim: u8,
+}
+
+impl Element {
+    fn plan(self, binary: bool) -> Plan {
+        Plan { kind: self.kind, binary, path: self.path, element: None }
+    }
+}
+
+/// The element type and the element kind of a list sent as the array type `oid`. An element
+/// that is itself an array is not one of these, as PostgreSQL has no arrays of arrays.
+fn element_of(logical: &LogicalType, oid: Oid) -> Option<(Oid, Kind)> {
+    let (LogicalType::List(element) | LogicalType::Array(element, _)) = logical else {
+        return None;
+    };
+    let info = TypeInfo::get(oid).filter(|info| info.is_array())?;
+    let kind = Kind::of(element, info.elem)?;
+    (kind != Kind::Array).then_some((info.elem, kind))
 }
 
 /// The `DataRow` encoder of one result. It keeps its buffers between calls, so the rows of a
@@ -253,12 +311,12 @@ impl RowEncoder {
                         ),
                     )
                 })?;
-                let path = match (kind, binary) {
-                    (Kind::Text, _) | (Kind::Bytea, true) => Path::Bytes,
-                    (kind, true) => kind.binary_width().map_or(Path::Staged, Path::Fixed),
-                    (_, false) => Path::Staged,
-                };
-                Ok(Plan { kind, binary: *binary, path })
+                let element = element_of(logical, *oid).map(|(oid, kind)| {
+                    let path = kind.plan(*binary, None).path;
+                    let delim = TypeInfo::get(oid).map_or(b',', |info| info.delim);
+                    Element { kind, path, oid, delim }
+                });
+                Ok(kind.plan(*binary, element))
             })
             .collect::<Result<Vec<_>, TypeError>>()?;
         let staged = vec![Vec::new(); plans.len()];
@@ -301,7 +359,8 @@ impl RowEncoder {
                     )));
                 }
                 match vector.form() {
-                    Form::Flat => Ok(Cow::Borrowed(vector)),
+                    // A list has no other form, and its elements are flattened in the first pass.
+                    Form::Flat | Form::List => Ok(Cow::Borrowed(vector)),
                     _ => vector.flatten().map(Cow::Owned).map_err(|e| internal(e.to_string())),
                 }
             })
@@ -443,6 +502,7 @@ fn lengths(
             }
             return Ok(());
         }
+        Kind::Array => return array_lengths(plan, vector, rows, settings, lens, staged),
         _ => {}
     }
     let data = vector.data().ok_or_else(|| wrong_data(plan))?;
@@ -619,7 +679,71 @@ fn stage_column(
                 stage(lens, staged, i, |out| uuid_out(&bytes, out))?;
             }
         }
-        (Kind::Text | Kind::Null | Kind::Display { .. }, _) => return Err(wrong_data(plan)),
+        (Kind::Text | Kind::Array | Kind::Null | Kind::Display { .. }, _) => {
+            return Err(wrong_data(plan));
+        }
+    }
+    Ok(())
+}
+
+/// The first pass for an array column. The elements of all the rows go through the first and the
+/// third pass of their own kind at once, which writes each element after its length as the binary
+/// format of an array has it. Then each row is the text or the binary format of its part of them.
+fn array_lengths(
+    plan: Plan,
+    vector: &Vector,
+    rows: Range<usize>,
+    settings: &OutputSettings<'_>,
+    lens: &mut [i32],
+    staged: &mut Vec<u8>,
+) -> Result<(), TypeError> {
+    let element = plan.element.ok_or_else(|| wrong_data(plan))?;
+    let (entries, child) = vector.list_parts().ok_or_else(|| wrong_data(plan))?;
+    let live = vector.validity().live();
+    let start = rows.start;
+    let parts = |i: usize| {
+        let (at, len) = entries[start + i];
+        at as usize..at as usize + len as usize
+    };
+    let (low, high) = (0..lens.len())
+        .filter(|&i| live.at(start + i))
+        .map(parts)
+        .fold((usize::MAX, 0), |(low, high), part| (low.min(part.start), high.max(part.end)));
+    let low = low.min(high);
+    let child = match child.form() {
+        Form::Flat | Form::List => Cow::Borrowed(child),
+        _ => child.flatten().map(Cow::Owned).map_err(|e| internal(e.to_string()))?,
+    };
+    if child.len() < high {
+        return Err(wrong_data(plan));
+    }
+    // The elements, each after its length.
+    let inner = element.plan(plan.binary);
+    let n = high - low;
+    let mut element_lens = vec![-1; n];
+    let mut element_staged = Vec::new();
+    lengths(inner, &child, low..high, settings, &mut element_lens, &mut element_staged)?;
+    let mut cursor = Vec::with_capacity(n);
+    let mut size = 0;
+    for &len in &element_lens {
+        cursor.push(size);
+        size += 4 + len.max(0) as usize;
+    }
+    let mut elements = vec![0; size];
+    let mut at = cursor.clone();
+    put(inner, &child, low, &element_lens, &element_staged, &mut at, &mut elements)?;
+    let value = |j: usize| {
+        let len = element_lens[j];
+        (len >= 0).then(|| &elements[cursor[j] + 4..cursor[j] + 4 + len as usize])
+    };
+    for i in (0..lens.len()).filter(|&i| live.at(start + i)) {
+        let array = Array::one(parts(i).map(|j| value(j - low)).collect());
+        stage(lens, staged, i, |out| match plan.binary {
+            true => array_send(&array, element.oid, out, |bytes, out| out.extend_from_slice(bytes)),
+            false => {
+                array_out(&array, element.delim, out, |bytes, out| out.extend_from_slice(bytes));
+            }
+        })?;
     }
     Ok(())
 }
@@ -807,7 +931,12 @@ fn fixed(
                 value.copy_from_slice(&uuid::to_bytes(values[start + i]))
             });
         }
-        Kind::Decimal(_) | Kind::Text | Kind::Bytea | Kind::Null | Kind::Display { .. } => {
+        Kind::Decimal(_)
+        | Kind::Text
+        | Kind::Bytea
+        | Kind::Array
+        | Kind::Null
+        | Kind::Display { .. } => {
             return Err(wrong_data(plan));
         }
     }
@@ -1161,17 +1290,19 @@ mod tests {
         .unwrap();
         let none = Vector::from_values(LogicalType::Null, &[Value::Null, Value::Null, Value::Null])
             .unwrap();
-        let list_type = LogicalType::List(Box::new(LogicalType::Integer));
+        // PostgreSQL has no arrays of arrays, so a list of lists is text.
+        let ints = LogicalType::List(Box::new(LogicalType::Integer));
+        let pair = Value::List {
+            element: ints.clone(),
+            values: vec![Value::List {
+                element: LogicalType::Integer,
+                values: vec![Value::Integer(1), Value::Integer(2)],
+            }],
+        };
+        let list_type = LogicalType::List(Box::new(ints.clone()));
         let list = Vector::from_values(
             list_type.clone(),
-            &[
-                Value::List {
-                    element: LogicalType::Integer,
-                    values: vec![Value::Integer(1), Value::Integer(2)],
-                },
-                Value::Null,
-                Value::List { element: LogicalType::Integer, values: Vec::new() },
-            ],
+            &[pair.clone(), Value::Null, Value::List { element: ints, values: Vec::new() }],
         )
         .unwrap();
         let columns = [big, none, list];
@@ -1197,21 +1328,72 @@ mod tests {
             assert_eq!(rows[2][0], numeric("7"));
             assert_eq!(rows[1][0], None);
             assert!(rows.iter().all(|row| row[1].is_none()));
-            assert_eq!(
-                rows[0][2].as_deref(),
-                Some(
-                    Value::List {
-                        element: LogicalType::Integer,
-                        values: vec![Value::Integer(1), Value::Integer(2)]
-                    }
-                    .to_string()
-                    .as_bytes()
-                )
-            );
+            assert_eq!(rows[0][2].as_deref(), Some(pair.to_string().as_bytes()));
             assert_eq!(rows[1][2], None);
         }
         let decimal = pg_type(&LogicalType::Decimal { width: 10, scale: 2 });
         assert_eq!((decimal.oid, decimal.typmod), (oids::NUMERIC, numeric_typmod(10, 2)));
+    }
+
+    /// A list is an array of its element type, in the text and the binary format of
+    /// `array_out` and `array_send`.
+    #[test]
+    fn a_list_is_an_array() {
+        let zone = FixedZone::utc();
+        let settings = settings(&zone);
+        let list = |element: LogicalType, values: Vec<Value>| Value::List { element, values };
+        let ints = LogicalType::List(Box::new(LogicalType::Integer));
+        let texts = LogicalType::List(Box::new(LogicalType::Varchar));
+        let numbers = Vector::from_values(
+            ints.clone(),
+            &[
+                list(LogicalType::Integer, vec![Value::Integer(1), Value::Null, Value::Integer(3)]),
+                Value::Null,
+                list(LogicalType::Integer, Vec::new()),
+            ],
+        )
+        .unwrap();
+        let words = Vector::from_values(
+            texts.clone(),
+            &[
+                list(LogicalType::Varchar, vec![Value::Varchar("a b".into())]),
+                list(LogicalType::Varchar, vec![Value::Varchar("NULL".into()), Value::Null]),
+                list(LogicalType::Varchar, vec![Value::Varchar(String::new())]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(pg_type(&ints).oid, oids::INT4_ARRAY);
+        assert_eq!(pg_type(&texts).oid, oids::TEXT_ARRAY);
+        let columns = [numbers, words];
+        let text = |binary| {
+            let spec = [
+                (ints.clone(), oids::INT4_ARRAY, binary),
+                (texts.clone(), oids::TEXT_ARRAY, binary),
+            ];
+            let mut out = Vec::new();
+            RowEncoder::new(&spec).unwrap().encode(&columns, 0..3, &settings, &mut out).unwrap();
+            decode(&out)
+        };
+        let rows = text(false);
+        let cell = |row: usize, column: usize| {
+            rows[row][column].clone().map(|v| String::from_utf8(v).unwrap())
+        };
+        assert_eq!(cell(0, 0).as_deref(), Some("{1,NULL,3}"));
+        assert_eq!(cell(1, 0), None);
+        assert_eq!(cell(2, 0).as_deref(), Some("{}"));
+        assert_eq!(cell(0, 1).as_deref(), Some(r#"{"a b"}"#));
+        assert_eq!(cell(1, 1).as_deref(), Some(r#"{"NULL",NULL}"#));
+        assert_eq!(cell(2, 1).as_deref(), Some(r#"{""}"#));
+        let rows = text(true);
+        let words: Vec<u8> =
+            [1i32, 1, 23, 3, 1, 4, 1, -1, 4, 3].iter().flat_map(|w| w.to_be_bytes()).collect();
+        assert_eq!(rows[0][0].as_deref(), Some(&words[..]));
+        assert_eq!(rows[2][0].as_deref(), Some(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23][..]));
+        let mut empty = Vec::new();
+        for w in [1i32, 0, 25, 1, 1, 0] {
+            empty.extend_from_slice(&w.to_be_bytes());
+        }
+        assert_eq!(rows[2][1].as_deref(), Some(&empty[..]));
     }
 
     #[test]
