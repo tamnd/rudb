@@ -19566,7 +19566,8 @@ mod tests {
             let chunk = reader.read(part, &[0]).expect("a part");
             let column = chunk.column(0).expect("the column");
             if let Some((codes, values)) = column.positions() {
-                assert!(values.len() <= 5 && codes.len() == chunk.len(), "codes over five values");
+                // Five values, and the empty one the nulls are stored as.
+                assert!(values.len() <= 6 && codes.len() == chunk.len(), "codes over six values");
                 coded += 1;
             }
             for row in 0..chunk.len() {
