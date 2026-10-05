@@ -27,6 +27,7 @@ pub mod points;
 pub mod search;
 pub mod system;
 pub mod table;
+pub mod trigger;
 pub mod view;
 
 pub use alter::Alteration;
@@ -45,4 +46,5 @@ pub use rudb_native::StoredPart;
 pub use search::SearchEntry;
 pub use system::{INFORMATION_SCHEMA, PG_CATALOG, SYSTEM_CATALOG, TEMP_CATALOG};
 pub use table::{CodedRows, Rows, Table, duplicate_check, next_revision, revision_now};
+pub use trigger::{Event, Trigger};
 pub use view::View;

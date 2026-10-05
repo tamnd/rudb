@@ -24,6 +24,18 @@ pub mod tokenize;
 pub mod transform;
 
 pub use ast::Ast;
+
+/// The name a row trigger's body reads the rows that fired it under. It is quoted where the parser
+/// writes it into the body, and the space in it keeps it apart from the names people give tables.
+pub const TRIGGER_ROWS: &str = "rudb trigger rows";
+
+/// The name a column of [`TRIGGER_ROWS`] goes by. A body reads it only through `NEW.` or `OLD.`,
+/// which the parser rewrites to this, so a name the body leaves unqualified still finds the table
+/// the body writes rather than the rows that fired it.
+#[must_use]
+pub fn trigger_column(name: &str) -> String {
+    format!("rudb row {name}")
+}
 pub use generate::{Catalog, Generator, Table};
 pub use generated::keywords::{
     COLUMN_NAME, FUNC_NAME, KEYWORDS, LONGEST, RESERVED, TYPE_NAME, UNRESERVED,

@@ -1,5 +1,7 @@
 //! The values a statement's parameters were given.
 
+use std::sync::{Arc, Mutex};
+
 use rudb_common::{LogicalType, Value};
 
 /// What a prepared statement was handed, by identifier.
@@ -16,6 +18,44 @@ use rudb_common::{LogicalType, Value};
 pub struct Parameters {
     values: Vec<(String, Value)>,
     written: Vec<(u32, Written)>,
+    relations: Vec<(String, Written)>,
+    capture: Option<Capture>,
+}
+
+/// Where a data changing statement leaves the rows it wrote and the rows it removed or changed,
+/// which is how a trigger on its table gets them. Shared, so the caller keeps one end and the
+/// statement fills the other.
+#[derive(Debug, Clone, Default)]
+pub struct Capture(Arc<Mutex<Caught>>);
+
+/// What a [`Capture`] caught: the rows as they are now and the rows as they were.
+#[derive(Debug, Clone, Default)]
+pub struct Caught {
+    /// The rows an `INSERT` added or an `UPDATE` wrote.
+    pub new: Vec<Vec<Value>>,
+    /// The rows a `DELETE` took out or an `UPDATE` changed, as they were before it.
+    pub old: Vec<Vec<Value>>,
+}
+
+impl Capture {
+    /// Adds rows to what was caught.
+    pub fn catch(&self, new: Vec<Vec<Value>>, old: Vec<Vec<Value>>) {
+        let mut caught = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        caught.new.extend(new);
+        caught.old.extend(old);
+    }
+
+    /// The rows caught so far, which leaves it empty.
+    #[must_use]
+    pub fn take(&self) -> Caught {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+}
+
+impl PartialEq for Capture {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// The rows a data changing `WITH` definition produced, which it produced before the statement it
@@ -34,7 +74,7 @@ impl Parameters {
     /// No values, which is what an ordinary statement binds with.
     #[must_use]
     pub const fn new() -> Self {
-        Self { values: Vec::new(), written: Vec::new() }
+        Self { values: Vec::new(), written: Vec::new(), relations: Vec::new(), capture: None }
     }
 
     /// Values by position, numbered from one, which is what `?` and `$1` want.
@@ -45,7 +85,7 @@ impl Parameters {
             .enumerate()
             .map(|(at, value)| ((at + 1).to_string(), value))
             .collect();
-        Self { values, written: Vec::new() }
+        Self { values, ..Self::new() }
     }
 
     /// Gives one parameter a value, replacing whatever it had.
@@ -75,13 +115,47 @@ impl Parameters {
         self.written.iter().find(|(held, _)| *held == cte).map(|(_, rows)| rows)
     }
 
+    /// Gives the statement a table of rows under a name, which a single part name in it reads ahead
+    /// of the catalog. That is how a trigger's body reads the rows that fired it.
+    pub fn relate(&mut self, name: impl Into<String>, rows: Written) {
+        let name = name.into();
+        self.relations.retain(|(held, _)| !held.eq_ignore_ascii_case(&name));
+        self.relations.push((name, rows));
+    }
+
+    /// The rows handed in under a name, if any were.
+    #[must_use]
+    pub fn relation(&self, name: &str) -> Option<&Written> {
+        self.relations.iter().find(|(held, _)| held.eq_ignore_ascii_case(name)).map(|(_, rows)| rows)
+    }
+
+    /// Asks the statement to leave the rows it writes in `capture`.
+    pub fn catch_into(&mut self, capture: Capture) {
+        self.capture = Some(capture);
+    }
+
+    /// Where the statement leaves the rows it writes, when it was asked to.
+    #[must_use]
+    pub fn capture(&self) -> Option<&Capture> {
+        self.capture.as_ref()
+    }
+
+    /// The same values with no capture, which is what a statement run on behalf of this one gets.
+    #[must_use]
+    pub fn uncaught(&self) -> Self {
+        Self { capture: None, ..self.clone() }
+    }
+
     /// Whether nothing was provided.
     ///
     /// Rows a definition wrote count, since a statement bound with them answers for that run alone
     /// and must not be kept or replayed as if it were its text.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty() && self.written.is_empty()
+        self.values.is_empty()
+            && self.written.is_empty()
+            && self.relations.is_empty()
+            && self.capture.is_none()
     }
 
     /// How many were provided.

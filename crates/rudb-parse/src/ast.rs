@@ -67,6 +67,8 @@ pub type SchemaRef = u32;
 pub type SequenceRef = u32;
 /// Index into [`Ast::types`].
 pub type TypeRef = u32;
+/// Index into [`Ast::triggers`].
+pub type TriggerRef = u32;
 /// Index into [`Ast::alters`].
 pub type AlterRef = u32;
 /// Index into [`Ast::indexes`].
@@ -103,6 +105,8 @@ pub enum Statement {
     Sequence(SequenceRef),
     /// `CREATE TYPE` or `DROP TYPE`.
     Type(TypeRef),
+    /// `CREATE TRIGGER` or `DROP TRIGGER`.
+    Trigger(TriggerRef),
     /// `ALTER TABLE` or `ALTER VIEW`.
     Alter(AlterRef),
     /// `CREATE INDEX` or `DROP INDEX`.
@@ -366,6 +370,9 @@ pub struct DropTable {
     /// Whether `VIEW` was written where `TABLE` could have been. Dropping one as the other is an
     /// error rather than a synonym, so which word was written has to survive the transform.
     pub view: bool,
+    /// Whether `CASCADE` was written, which drops the triggers that read what is dropped rather
+    /// than refusing.
+    pub cascade: bool,
 }
 
 /// `CREATE SCHEMA name` or `DROP SCHEMA name`.
@@ -427,6 +434,70 @@ pub struct TypeDef {
     pub cascade: bool,
     /// The type the name stands for, as it was written, and `NONE` on a drop.
     pub ty: StrRef,
+}
+
+/// `CREATE TRIGGER name timing event ON table [REFERENCING ...] [FOR EACH ...] body` or `DROP
+/// TRIGGER name ON table`.
+///
+/// The body is held three ways. [`Trigger::body`] is the statement as it was transformed, which is
+/// how the parser read what it writes and which names it reads. [`Trigger::fired`] is the text that
+/// runs when the trigger fires, which is the body as it was written for a statement trigger and
+/// the body rewritten to read the changed rows for a row trigger. [`Trigger::written`] is the body
+/// the way the pin prints it back in `duckdb_triggers()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Trigger {
+    /// The trigger's name, which is one part, since the grammar allows no more.
+    pub name: StrRef,
+    /// The table it is on, as a run of parts, as it was written.
+    pub table: Slice,
+    /// Whether this is a `DROP` rather than a `CREATE`.
+    pub drop: bool,
+    /// Whether `IF NOT EXISTS` was written on a create or `IF EXISTS` on a drop.
+    pub quiet: bool,
+    /// Whether `OR REPLACE` was written, which only a create can have.
+    pub or_replace: bool,
+    /// When it fires.
+    pub timing: TriggerTiming,
+    /// Which statement fires it.
+    pub event: TriggerEvent,
+    /// The columns of `UPDATE OF`, and none for any other event.
+    pub columns: Slice,
+    /// The name `REFERENCING NEW TABLE AS` gives the new rows, or `NONE`.
+    pub new_table: StrRef,
+    /// The name `REFERENCING OLD TABLE AS` gives the old rows, or `NONE`.
+    pub old_table: StrRef,
+    /// Whether `FOR EACH ROW` was written. `FOR EACH STATEMENT` is the default.
+    pub row: bool,
+    /// The body as it was transformed.
+    pub body: Statement,
+    /// The text that runs when it fires.
+    pub fired: StrRef,
+    /// The body as the pin prints it.
+    pub written: StrRef,
+    /// Whether the body reads a column of `NEW` or `OLD`, which a row trigger has to.
+    pub reads_row: bool,
+}
+
+/// When a trigger fires, against the statement that fires it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    /// `BEFORE`.
+    Before,
+    /// `AFTER`.
+    After,
+    /// `INSTEAD OF`, which the pin parses and refuses.
+    InsteadOf,
+}
+
+/// The statement a trigger fires on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    /// `INSERT`.
+    Insert,
+    /// `UPDATE` or `UPDATE OF columns`.
+    Update,
+    /// `DELETE`.
+    Delete,
 }
 
 /// `CREATE [UNIQUE] INDEX name ON table (elements)` or `DROP INDEX name`.
@@ -1455,6 +1526,8 @@ pub struct Ast {
     pub sequences: Vec<Sequence>,
     /// The `CREATE TYPE` and `DROP TYPE` arena.
     pub types: Vec<TypeDef>,
+    /// The `CREATE TRIGGER` and `DROP TRIGGER` arena.
+    pub triggers: Vec<Trigger>,
     /// The `ALTER TABLE` and `ALTER VIEW` arena.
     pub alters: Vec<Alter>,
     /// The `CREATE INDEX` and `DROP INDEX` arena.
@@ -1693,6 +1766,12 @@ impl Ast {
     #[must_use]
     pub fn type_def(&self, index: TypeRef) -> TypeDef {
         self.types[index as usize]
+    }
+
+    /// One `CREATE TRIGGER` or `DROP TRIGGER`.
+    #[must_use]
+    pub fn trigger(&self, index: TriggerRef) -> Trigger {
+        self.triggers[index as usize]
     }
 
     /// The `CREATE INDEX` or `DROP INDEX` at an index.

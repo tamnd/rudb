@@ -258,6 +258,9 @@ struct Claims {
     tables: HashMap<i64, Marks>,
     /// The tables it created, whose names nobody else may create until it is done.
     creating: Vec<QualifiedName>,
+    /// The tables it altered or made a trigger on, which nobody else may do either to until it is
+    /// done.
+    holding: Vec<QualifiedName>,
 }
 
 /// Rows of one table, numbered in one frame.
@@ -380,6 +383,21 @@ impl Registry {
             .any(|(_, claims)| claims.creating.iter().any(|held| same(held, name)))
     }
 
+    /// Whether another open transaction altered this table or made a trigger on it.
+    pub(crate) fn holding(&self, me: Option<u64>, name: &QualifiedName) -> bool {
+        self.open
+            .iter()
+            .filter(|(id, _)| Some(**id) != me)
+            .any(|(_, claims)| claims.holding.iter().any(|held| same(held, name)))
+    }
+
+    /// Records that transaction `me` altered this table or made a trigger on it.
+    pub(crate) fn hold(&mut self, me: u64, name: QualifiedName) {
+        if let Some(claims) = self.open.get_mut(&me) {
+            claims.holding.push(name);
+        }
+    }
+
     /// Records that transaction `me` created a table of this name.
     pub(crate) fn create(&mut self, me: u64, name: QualifiedName) {
         if let Some(claims) = self.open.get_mut(&me) {
@@ -418,6 +436,11 @@ pub(crate) fn conflict(delete: bool) -> Error {
 /// The pin's text for a table two transactions both created.
 pub(crate) fn create_conflict(name: &QualifiedName) -> Error {
     Error::transaction(format!("Catalog write-write conflict on create with \"{}\"", name.table))
+}
+
+/// The pin's text for an alter of a table another open transaction changed in the catalog.
+pub(crate) fn alter_conflict(name: &QualifiedName) -> Error {
+    Error::transaction(format!("Catalog write-write conflict on alter with \"{}\"", name.table))
 }
 
 /// A commit that met a change committed since its snapshot that it cannot be put together with.

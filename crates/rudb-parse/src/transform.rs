@@ -26,13 +26,14 @@ use crate::ast::{
     CopyTo, CreateTable, CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert,
     JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope,
     Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, StarLists, Statement, StrRef,
-    Target, Transaction, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
+    Target, Transaction, Trigger, TriggerEvent, TriggerTiming, UnaryOp, WindowBound, WindowExclude,
+    WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
 use crate::parameters::{self, Arranged, Refilled, Slot};
 use crate::token::{Kind, Token};
-use crate::tokenize::tokenize;
+use crate::tokenize::{quoted, tokenize};
 
 /// Parse a script and transform it into the AST.
 ///
@@ -801,11 +802,11 @@ impl<'a> Transform<'a> {
             }
             for rule in ["CatalogName", "ReservedSchemaName"] {
                 let part = self.identifier(self.find(target, rule));
-                parts.push(crate::quoted(self.ast.string(part)));
+                parts.push(quoted(self.ast.string(part)));
             }
         } else {
             let part = self.identifier(target);
-            parts.push(crate::quoted(self.ast.string(part)));
+            parts.push(quoted(self.ast.string(part)));
         }
         Ok(self.set_schema(&parts.join(".")))
     }
@@ -1039,6 +1040,7 @@ impl<'a> Transform<'a> {
                 Ok(self.type_statement(made))
             }
             "CreateIndexStmt" => self.create_index_statement(inner, or_replace, temporary),
+            "CreateTriggerStmt" => self.create_trigger_statement(inner, or_replace, temporary),
             _ => self.unsupported(inner),
         }
     }
@@ -2132,6 +2134,26 @@ impl<'a> Transform<'a> {
             };
             return Ok(self.index_statement(index));
         }
+        if self.name(inner) == "DropTrigger" {
+            let trigger = Trigger {
+                name: self.identifier(self.find(inner, "TriggerName")),
+                table: self.name_parts(self.find(inner, "BaseTableName")),
+                drop: true,
+                quiet: self.find(inner, "IfExists") != NONE,
+                or_replace: false,
+                timing: TriggerTiming::After,
+                event: TriggerEvent::Insert,
+                columns: Slice::default(),
+                new_table: NONE,
+                old_table: NONE,
+                row: false,
+                body: Statement::Checkpoint(NONE),
+                fired: NONE,
+                written: NONE,
+                reads_row: false,
+            };
+            return Ok(self.trigger_statement(trigger));
+        }
         if self.name(inner) != "DropTable" {
             return self.unsupported(inner);
         }
@@ -2150,8 +2172,315 @@ impl<'a> Transform<'a> {
         }
         let names = self.name_list_slice(names);
         let index = self.ast.drop_tables.len() as u32;
-        self.ast.drop_tables.push(DropTable { names, if_exists, view });
+        self.ast.drop_tables.push(DropTable { names, if_exists, view, cascade });
         Ok(Statement::DropTable(index))
+    }
+
+    fn trigger_statement(&mut self, trigger: Trigger) -> Statement {
+        let index = self.ast.triggers.len() as u32;
+        self.ast.triggers.push(trigger);
+        Statement::Trigger(index)
+    }
+
+    /// `CreateTriggerStmt <- 'TRIGGER' IfNotExists? TriggerName TriggerTiming TriggerEvent 'ON'
+    /// BaseTableName ReferencingClause? ForEachClause? TriggerBody`.
+    ///
+    /// The refusals here are the ones the pin gives in its parser. Everything that needs the
+    /// catalog, which is most of them, is the binder's.
+    fn create_trigger_statement(
+        &mut self,
+        inner: u32,
+        or_replace: bool,
+        temporary: bool,
+    ) -> Result<Statement> {
+        if temporary {
+            return Err(Error::parser("Temporary triggers are not supported"));
+        }
+        let (mut new_table, mut old_table) = (NONE, NONE);
+        let referencing = self.find(inner, "ReferencingClause");
+        let items = if referencing == NONE { Vec::new() } else { self.kids(referencing).collect() };
+        for item in items {
+            if self.name(item) != "ReferencingItem" {
+                continue;
+            }
+            let item = self.first(item);
+            let alias = self.identifier(self.find(item, "ColId"));
+            let (slot, word) = if self.name(item) == "ReferencingNewTableAs" {
+                (&mut new_table, "NEW")
+            } else {
+                (&mut old_table, "OLD")
+            };
+            if *slot != NONE {
+                return Err(Error::parser(format!(
+                    "{word} TABLE cannot be specified multiple times in REFERENCING clause"
+                )));
+            }
+            *slot = alias;
+        }
+        if new_table != NONE
+            && old_table != NONE
+            && self.ast.string(new_table).eq_ignore_ascii_case(self.ast.string(old_table))
+        {
+            return Err(Error::parser("REFERENCING aliases must be distinct"));
+        }
+        let timing = match self.name(self.first(self.find(inner, "TriggerTiming"))) {
+            "TriggerBefore" => TriggerTiming::Before,
+            "TriggerAfter" => TriggerTiming::After,
+            _ => TriggerTiming::InsteadOf,
+        };
+        let event = self.first(self.find(inner, "TriggerEvent"));
+        let mut columns = Vec::new();
+        let event = match self.name(event) {
+            "TriggerEventInsert" => TriggerEvent::Insert,
+            "TriggerEventDelete" => TriggerEvent::Delete,
+            "TriggerEventUpdate" => TriggerEvent::Update,
+            _ => {
+                for kid in self.kids(self.find(event, "TriggerColumnList")).collect::<Vec<_>>() {
+                    columns.push(self.identifier(kid));
+                }
+                TriggerEvent::Update
+            }
+        };
+        let columns = self.part_slice(columns);
+        let row = self.descendant(inner, "ForEachRow") != NONE;
+        let node = self.first(self.find(inner, "TriggerBody"));
+        if self.name(node) == "MergeIntoStatement" {
+            return self.unsupported(node);
+        }
+        let from = self.ast.exprs.len();
+        let body = self.write_statement(node)?;
+        let reads_row = self.ast.exprs[from..].iter().any(|expr| match *expr {
+            Expr::Column { name } if name.len > 1 => {
+                let first = self.ast.string(self.ast.parts[name.start as usize]);
+                first.eq_ignore_ascii_case("new") || first.eq_ignore_ascii_case("old")
+            }
+            _ => false,
+        });
+        let written = self.trigger_written(node, body)?;
+        let fired = if row && reads_row {
+            self.trigger_fired(node, event)
+        } else {
+            self.text(node).trim().to_string()
+        };
+        let trigger = Trigger {
+            name: self.identifier(self.find(inner, "TriggerName")),
+            table: self.name_parts(self.find(inner, "BaseTableName")),
+            drop: false,
+            quiet: self.find(inner, "IfNotExists") != NONE,
+            or_replace,
+            timing,
+            event,
+            columns,
+            new_table,
+            old_table,
+            row,
+            body,
+            fired: self.intern(&fired),
+            written: self.intern(&written),
+            reads_row,
+        };
+        Ok(self.trigger_statement(trigger))
+    }
+
+    /// The text a row trigger's body runs as, which reads the changed rows under the name `NEW`
+    /// for an insert and `OLD` for a delete.
+    ///
+    /// The rows come from a relation named [`crate::TRIGGER_ROWS`] that the database hands the
+    /// statement when it fires. The values of an `INSERT` are run once for each of those rows,
+    /// through a lateral join, and the condition of a `DELETE` holds for a row it reaches when it
+    /// holds for any of them. The pin runs a row trigger over the whole batch at once in the same
+    /// way, which is why each firing sees every row the statement changed.
+    fn trigger_fired(&self, node: u32, event: TriggerEvent) -> String {
+        let alias = if event == TriggerEvent::Delete { "old" } else { "new" };
+        let rows = format!("\"{}\" AS \"{alias}\"", crate::TRIGGER_ROWS);
+        let (piece, before, after) = match self.name(node) {
+            "InsertStatement" => (
+                self.find(node, "InsertValues"),
+                format!("SELECT \"rudb row\".* FROM {rows}, LATERAL ("),
+                ") AS \"rudb row\"".to_string(),
+            ),
+            _ => (
+                self.find(node, "WhereClause"),
+                format!("WHERE EXISTS (SELECT 1 FROM {rows} "),
+                ")".to_string(),
+            ),
+        };
+        let mut edits = Vec::new();
+        self.row_columns(node, &mut edits);
+        if piece != NONE {
+            let part = self.span(piece);
+            let (cut, resume) = (part.start as usize, part.end as usize);
+            edits.push((cut, cut, before));
+            edits.push((resume, resume, after));
+        }
+        edits.sort_by_key(|&(start, end, _)| (start, end));
+        let whole = self.span(node);
+        let (mut at, end) = (whole.start as usize, whole.end as usize);
+        let mut out = String::new();
+        for (start, stop, text) in edits {
+            out += &self.query[at..start];
+            out += &text;
+            at = stop;
+        }
+        out += &self.query[at..end];
+        out.trim().to_string()
+    }
+
+    /// Every `NEW.x` and `OLD.x` under `node`, each with the text it becomes, which names the
+    /// column of the trigger's rows by [`crate::trigger_column`].
+    fn row_columns(&self, node: u32, edits: &mut Vec<(usize, usize, String)>) {
+        if self.name(node) == "ColumnReference" {
+            let mut leaves = Vec::new();
+            self.leaves(node, &mut leaves);
+            let parts = leaves
+                .into_iter()
+                .map(|leaf| self.text(leaf))
+                .filter(|text| !text.is_empty() && *text != "*")
+                .map(|text| self.fold_identifier(text.strip_suffix('.').unwrap_or(text)))
+                .collect::<Vec<_>>();
+            if let [first, column] = &parts[..]
+                && (first.eq_ignore_ascii_case("new") || first.eq_ignore_ascii_case("old"))
+            {
+                let span = self.span(node);
+                let column = crate::trigger_column(column).replace('"', "\"\"");
+                let text = format!("{}.\"{column}\"", quoted(first));
+                edits.push((span.start as usize, span.end as usize, text));
+            }
+            return;
+        }
+        for kid in self.kids(node).collect::<Vec<_>>() {
+            self.row_columns(kid, edits);
+        }
+    }
+
+    /// A trigger's body the way the pin prints it in `duckdb_triggers()`, which is its own
+    /// statement printed back with each expression in the pin's form.
+    ///
+    /// The clauses the pin prints from a statement this does not hold, the `WITH` of the body and
+    /// the sources of a `FROM` or a `USING`, are printed as they were written.
+    fn trigger_written(&mut self, node: u32, body: Statement) -> Result<String> {
+        let mut out = String::new();
+        let with = self.find(node, "WithClause");
+        if with != NONE {
+            out += self.text(with).trim();
+        }
+        let (Statement::Insert(index) | Statement::Update(index) | Statement::Delete(index)) = body
+        else {
+            return self.unsupported(node);
+        };
+        let insert = self.ast.inserts[index as usize];
+        let table = self.ast.name(insert.name).map(quoted).collect::<Vec<_>>().join(".");
+        match body {
+            Statement::Insert(_) => {
+                out += "INSERT ";
+                let action = self.find(node, "OrAction");
+                if action != NONE {
+                    out += match self.name(self.first(action)) {
+                        "InsertOrReplace" => "OR REPLACE ",
+                        _ => "OR IGNORE ",
+                    };
+                }
+                out += &format!("INTO {table}");
+                if insert.columns.len > 0 {
+                    let columns = self.ast.name(insert.columns).map(quoted).collect::<Vec<_>>();
+                    out += &format!(" ({})", columns.join(", "));
+                }
+                if insert.source == NONE {
+                    out += " DEFAULT VALUES";
+                } else {
+                    let query = crate::deparse::query(&self.ast, insert.source);
+                    match query
+                        .strip_prefix("SELECT * FROM (VALUES ")
+                        .and_then(|rest| rest.strip_suffix(") AS valueslist"))
+                    {
+                        Some(rows) => out += &format!(" (VALUES {rows})"),
+                        None => out += &format!(" {query}"),
+                    }
+                }
+                let clause = self.find(node, "OnConflictClause");
+                if clause != NONE {
+                    out += " ON CONFLICT ";
+                    let target = self.find(clause, "OnConflictTarget");
+                    let list = self.descendant(target, "ColumnIdList");
+                    if list != NONE {
+                        let mut names = Vec::new();
+                        self.named_nodes(list, "ColId", &mut names);
+                        let names = names.iter().map(|&name| self.text(name).trim());
+                        out += &format!("({} )", names.collect::<Vec<_>>().join(", "));
+                    }
+                    let action = self.first(self.find(clause, "OnConflictAction"));
+                    if self.name(action) == "OnConflictNothing" {
+                        out += " DO NOTHING";
+                    } else {
+                        let sets = self.set_clause(self.find(action, "UpdateSetClause"))?;
+                        out += &format!(" DO UPDATE SET {}", self.written_sets(&sets));
+                        out += &self.written_filter(action)?;
+                    }
+                }
+            }
+            Statement::Update(_) => {
+                out += &format!("UPDATE {table}");
+                let target = self.first(self.find(node, "UpdateTarget"));
+                let alias = self.find(target, "UpdateAlias");
+                if alias != NONE {
+                    let alias = self.identifier(alias);
+                    out += &format!(" AS {}", quoted(self.ast.string(alias)));
+                }
+                let sets = self.set_clause(self.find(node, "UpdateSetClause"))?;
+                out += &format!(" SET {}", self.written_sets(&sets));
+                let from = self.find(node, "FromClause");
+                if from != NONE {
+                    out += &format!(" {}", self.text(from).trim());
+                }
+                out += &self.written_filter(node)?;
+            }
+            _ => {
+                out += &format!("DELETE FROM {table}");
+                let alias = self.find(self.find(node, "TargetOptAlias"), "ColId");
+                if alias != NONE {
+                    let alias = self.identifier(alias);
+                    out += &format!(" AS {}", quoted(self.ast.string(alias)));
+                }
+                let using = self.find(node, "DeleteUsingClause");
+                if using != NONE {
+                    out += &format!(" {}", self.text(using).trim());
+                }
+                out += &self.written_filter(node)?;
+            }
+        }
+        let clause = self.find(node, "ReturningClause");
+        if clause != NONE {
+            let mut targets = Vec::new();
+            for kid in self.kids(self.find(clause, "TargetList")).collect::<Vec<_>>() {
+                let target = self.target(kid)?;
+                let mut written = crate::deparse::expression(&self.ast, target.expr);
+                if target.alias != NONE {
+                    written += &format!(" AS {}", quoted(self.ast.string(target.alias)));
+                }
+                targets.push(written);
+            }
+            out += &format!(" RETURNING {}", targets.join(", "));
+        }
+        Ok(out)
+    }
+
+    /// The `SET` of an `UPDATE` the way the pin prints it.
+    fn written_sets(&self, sets: &[(StrRef, ExprRef)]) -> String {
+        let sets = sets.iter().map(|&(column, value)| {
+            let value = crate::deparse::expression(&self.ast, value);
+            format!("{} = {value}", quoted(self.ast.string(column)))
+        });
+        sets.collect::<Vec<_>>().join(", ")
+    }
+
+    /// The `WHERE` of `node` the way the pin prints it, with a space in front, or nothing.
+    fn written_filter(&mut self, node: u32) -> Result<String> {
+        let filter = self.find(node, "WhereClause");
+        if filter == NONE {
+            return Ok(String::new());
+        }
+        let condition = self.expr(self.first(filter))?;
+        Ok(format!(" WHERE {}", crate::deparse::expression(&self.ast, condition)))
     }
 
     fn schema_statement(&mut self, schema: crate::ast::Schema) -> Statement {
@@ -6739,6 +7068,22 @@ mod tests {
                     out += " CASCADE";
                 }
                 out
+            }
+            Statement::Trigger(index) => {
+                let trigger = ast.trigger(index);
+                if trigger.drop {
+                    return format!(
+                        "DROP TRIGGER {} ON {}",
+                        ast.string(trigger.name),
+                        ast.name_text(trigger.table)
+                    );
+                }
+                format!(
+                    "CREATE TRIGGER {} ON {} {}",
+                    ast.string(trigger.name),
+                    ast.name_text(trigger.table),
+                    ast.string(trigger.written)
+                )
             }
             Statement::Sequence(index) => {
                 let sequence = ast.sequence(index);

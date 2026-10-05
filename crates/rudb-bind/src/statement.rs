@@ -47,6 +47,8 @@ pub enum Bound {
     Sequence(SequenceChange),
     /// `CREATE TYPE` or `DROP TYPE`.
     Type(TypeChange),
+    /// `CREATE TRIGGER` or `DROP TRIGGER`.
+    Trigger(TriggerChange),
     /// `ALTER TABLE` or `ALTER VIEW`.
     Alter(Alter),
     /// `CREATE INDEX` or `DROP INDEX`.
@@ -339,6 +341,21 @@ pub struct IndexChange {
     pub quiet: bool,
 }
 
+/// A bound `CREATE TRIGGER` or `DROP TRIGGER`.
+#[derive(Debug)]
+pub struct TriggerChange {
+    /// The table the trigger is on, resolved.
+    pub table: QualifiedName,
+    /// The trigger's name.
+    pub name: String,
+    /// The trigger a create makes, checked against the catalog, and `None` on a drop.
+    pub trigger: Option<rudb_catalog::Trigger>,
+    /// Whether `IF NOT EXISTS` or `IF EXISTS` was written.
+    pub quiet: bool,
+    /// Whether `OR REPLACE` was written.
+    pub or_replace: bool,
+}
+
 /// A bound `DROP TABLE` or `DROP VIEW`.
 #[derive(Debug)]
 pub struct DropTable {
@@ -349,6 +366,8 @@ pub struct DropTable {
     pub names: Vec<QualifiedName>,
     /// Which of the two the statement said it was dropping.
     pub kind: Entry,
+    /// Whether `CASCADE` was written, which takes the triggers that read one of them along.
+    pub cascade: bool,
 }
 
 /// A bound `INSERT`.
@@ -593,6 +612,7 @@ fn bind_one(
                 cascade: written.cascade,
             }))
         }
+        ast::Statement::Trigger(index) => trigger(ast, catalog, parameters, session, index),
         ast::Statement::Alter(index) => alter(ast, catalog, parameters, session, index),
         ast::Statement::Index(index) => create_index(ast, catalog, parameters, session, index),
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, session, index),
@@ -1982,6 +2002,240 @@ fn create_view(
     }))
 }
 
+/// Binds `CREATE TRIGGER`, which makes every check the pin makes before it keeps one, in the order
+/// it makes them, and binds the body against the table's columns so a body that would fail when it
+/// fires fails now instead.
+fn trigger(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    index: ast::TriggerRef,
+) -> Result<Bound> {
+    use rudb_catalog::Event;
+    let written = ast.trigger(index);
+    let parts: Vec<&str> = ast.name(written.table).collect();
+    let name = ast.string(written.name).to_string();
+    let (quiet, or_replace) = (written.quiet, written.or_replace);
+    if written.drop {
+        let table = catalog.resolve(&parts)?;
+        return Ok(Bound::Trigger(TriggerChange { table, name, trigger: None, quiet, or_replace }));
+    }
+    let table = catalog.resolve_as(&parts, Entry::Table)?;
+    if catalog.entry(&table).is_ok_and(|found| found == Entry::View) {
+        return Err(Error::binder("CREATE TRIGGER requires a base table, not a view or subquery"));
+    }
+    if written.timing == ast::TriggerTiming::InsteadOf {
+        return Err(Error::not_implemented("INSTEAD OF triggers are not yet supported"));
+    }
+    let before = written.timing == ast::TriggerTiming::Before;
+    let event = match written.event {
+        ast::TriggerEvent::Insert => Event::Insert,
+        ast::TriggerEvent::Update => Event::Update,
+        ast::TriggerEvent::Delete => Event::Delete,
+    };
+    let new_table = (written.new_table != NONE).then(|| ast.string(written.new_table).to_string());
+    let old_table = (written.old_table != NONE).then(|| ast.string(written.old_table).to_string());
+    let transition = new_table.is_some() || old_table.is_some();
+    if written.row {
+        if transition {
+            return Err(Error::binder("REFERENCING is not valid for FOR EACH ROW triggers"));
+        }
+        if before {
+            return Err(Error::not_implemented(
+                "BEFORE FOR EACH ROW triggers are not yet supported",
+            ));
+        }
+        if event == Event::Update {
+            return Err(Error::not_implemented(
+                "UPDATE FOR EACH ROW triggers are not yet supported",
+            ));
+        }
+    }
+    if transition {
+        if before {
+            return Err(Error::binder(
+                "Transition tables can only be specified for AFTER triggers",
+            ));
+        }
+        if old_table.is_some() && event == Event::Insert {
+            return Err(Error::binder(
+                "REFERENCING OLD TABLE AS is not valid for AFTER INSERT triggers",
+            ));
+        }
+        if new_table.is_some() && event == Event::Delete {
+            return Err(Error::binder(
+                "REFERENCING NEW TABLE AS is not valid for AFTER DELETE triggers",
+            ));
+        }
+        if !written.columns.is_empty() {
+            return Err(Error::binder("UPDATE OF is not valid with transition tables"));
+        }
+    }
+    let held = catalog.table(&table)?;
+    let fields = held.columns().to_vec();
+    let mut columns = Vec::new();
+    for column in ast.name(written.columns) {
+        let Some(field) = fields.iter().find(|field| same_name(&field.name, column)) else {
+            return Err(Error::binder(format!(
+                "Column \"\"{column}\"\" does not exist in table \"\"{}\"\"",
+                table.table
+            )));
+        };
+        columns.push(field.name.clone());
+    }
+    // The pin keeps the triggers on one table all of one kind for now, and a replaced trigger is
+    // not one of them any more.
+    let mixed = catalog
+        .triggers_on(&table)
+        .any(|held| held.row != written.row && !(or_replace && same_name(&held.name, &name)));
+    if mixed {
+        return Err(Error::not_implemented(
+            "Mixing FOR EACH STATEMENT and FOR EACH ROW triggers on the same table is not yet \
+             supported",
+        ));
+    }
+    let fired = ast.string(written.fired).to_string();
+    let body = rudb_parse::parse_ast_with_case(&fired, session.semantics().identifier_case())?;
+    let (writes, does) = match body.statements.as_slice() {
+        [ast::Statement::Insert(at)] => (body.inserts[*at as usize].name, Event::Insert),
+        [ast::Statement::Update(at)] => (body.inserts[*at as usize].name, Event::Update),
+        [ast::Statement::Delete(at)] => (body.inserts[*at as usize].name, Event::Delete),
+        _ => {
+            return Err(Error::not_implemented(
+                "a trigger body that is not an INSERT, an UPDATE or a DELETE",
+            ));
+        }
+    };
+    if written.row && does == Event::Update {
+        return Err(Error::not_implemented(
+            "UPDATE trigger bodies in FOR EACH ROW triggers are not yet supported",
+        ));
+    }
+    // The body binds against the rows that fire it, which are rows of the table, under the names
+    // it reads them by. None of them are there yet, so this checks it and nothing more.
+    let rows = crate::Written {
+        names: fields.iter().map(|field| field.name.clone()).collect(),
+        types: fields.iter().map(|field| field.ty.clone()).collect(),
+        rows: Vec::new(),
+    };
+    let mut given = parameters.uncaught();
+    if written.row {
+        let names = rows.names.iter().map(|name| rudb_parse::trigger_column(name)).collect();
+        given.relate(rudb_parse::TRIGGER_ROWS, crate::Written { names, ..rows.clone() });
+    }
+    for alias in new_table.iter().chain(&old_table) {
+        given.relate(alias.clone(), rows.clone());
+    }
+    bind_one(&body, catalog, &given, session, false)?;
+    if written.row && !written.reads_row {
+        return Err(Error::binder(format!(
+            "FOR EACH ROW trigger \"{name}\" on table \"{}\" must reference at least one NEW or OLD \
+             column in the trigger body (use FOR EACH STATEMENT if row data is not needed)",
+            table.table
+        )));
+    }
+    let target: Vec<&str> = body.name(writes).collect();
+    let writes = catalog.resolve(&target)?;
+    // What it reads is every table and view the body names, which the catalog keeps from being
+    // dropped or renamed under it. A name that is not in the catalog is one of the names above.
+    let mut reads = vec![writes.clone()];
+    for source in &body.sources {
+        let ast::Source::Table { name: read, .. } = *source else { continue };
+        let read: Vec<&str> = body.name(read).collect();
+        if let Ok(read) = catalog
+            .resolve_as(&read, Entry::Table)
+            .or_else(|_| catalog.resolve_as(&read, Entry::View))
+            && !reads.contains(&read)
+        {
+            reads.push(read);
+        }
+    }
+    if let Some(other) =
+        reads.iter().find(|read| !read.catalog.eq_ignore_ascii_case(&table.catalog))
+    {
+        return Err(Error::binder(format!(
+            "Trigger \"\"{name}\"\" cannot reference \"\"{}\"\" from a different catalog \
+             (\"\"{}\"\")",
+            other.table, other.catalog
+        )));
+    }
+    let trigger = rudb_catalog::Trigger {
+        name: name.clone(),
+        table: table.clone(),
+        written_table: ast
+            .name(written.table)
+            .map(rudb_parse::quoted)
+            .collect::<Vec<_>>()
+            .join("."),
+        before,
+        event,
+        columns,
+        new_table,
+        old_table,
+        row: written.row,
+        fired,
+        written: ast.string(written.written).to_string(),
+        reads,
+        writes,
+        does,
+        oid: 0,
+    };
+    refuse_chains(catalog, &trigger)?;
+    Ok(Bound::Trigger(TriggerChange { table, name, trigger: Some(trigger), quiet, or_replace }))
+}
+
+/// Refuses a trigger that would set off itself, through any run of the triggers already there,
+/// and a row trigger that writes rows a row trigger would then fire on, which the pin does not
+/// support yet either, in its words for each.
+fn refuse_chains(catalog: &Catalog, made: &rudb_catalog::Trigger) -> Result<()> {
+    let others = |held: &&rudb_catalog::Trigger| {
+        !(same_name(&held.name, &made.name) && held.table == made.table)
+    };
+    if made.row {
+        let cascades = catalog
+            .triggers_on(&made.writes)
+            .filter(others)
+            .any(|held| held.row && held.event == made.does);
+        if cascades {
+            return Err(cascading(made));
+        }
+    }
+    // The statement in a body fires the triggers on the table it writes for what it does, and the
+    // chain is a loop when it comes back to the table the new one is on, whatever it does there.
+    let mut pending = vec![(made.writes.clone(), made.does)];
+    let mut seen: Vec<(QualifiedName, rudb_catalog::Event)> = Vec::new();
+    while let Some((table, does)) = pending.pop() {
+        if table == made.table {
+            return Err(Error::not_implemented(format!(
+                "Recursive trigger chains are not yet supported (trigger cycle detected through \
+                 trigger \"{}\" on table \"{}\")",
+                made.name, made.table.table
+            )));
+        }
+        if seen.contains(&(table.clone(), does)) {
+            continue;
+        }
+        for held in catalog.triggers_on(&table).filter(others) {
+            if held.event == does {
+                pending.push((held.writes.clone(), held.does));
+            }
+        }
+        seen.push((table, does));
+    }
+    Ok(())
+}
+
+/// The pin's refusal of a row trigger whose rows a row trigger on the table it writes would fire on.
+#[must_use]
+pub fn cascading(trigger: &rudb_catalog::Trigger) -> Error {
+    Error::not_implemented(format!(
+        "FOR EACH ROW trigger \"\"{}\"\" on table \"\"{}\"\" writes to a table that has its own FOR \
+         EACH ROW trigger (cascading row triggers are not yet supported)",
+        trigger.name, trigger.table.table
+    ))
+}
+
 fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<Bound> {
     let written = ast.drop_table(index);
     let kind = if written.view { Entry::View } else { Entry::Table };
@@ -1996,7 +2250,7 @@ fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<
             Err(error) => return Err(error),
         }
     }
-    Ok(Bound::DropTable(DropTable { names, kind }))
+    Ok(Bound::DropTable(DropTable { names, kind, cascade: written.cascade }))
 }
 
 /// Recognises `CALL enable_logging(...)` and the other spellings of the same thing, which are a
@@ -2599,7 +2853,8 @@ fn change(
     let returning = returning(ast, catalog, parameters, session, written.returning)?;
     // A delete that marks its rows gone needs only which rows those are, so the source reads the
     // columns of the condition and not the rest. See [`Catalog::takes_rows`].
-    let narrow = returning.is_none() && catalog.takes_rows(&name);
+    // A trigger reads every column of the rows it changed, so a statement that fires one keeps them.
+    let narrow = returning.is_none() && parameters.capture().is_none() && catalog.takes_rows(&name);
     // An update that writes its rows beside the file reads the new values and not the old ones,
     // so a column it does not set is not read at all.
     let patched = (narrow && !delete).then(|| targets.clone());
