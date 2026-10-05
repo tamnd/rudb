@@ -3850,10 +3850,10 @@ impl Shared {
         }
     }
 
-    /// Runs a prepared one row `INSERT` without binding it, or says it cannot and leaves everything
-    /// as it was, for [`Shared::execute_ast`] to run.
+    /// Runs a prepared `INSERT` of a row or a few without binding it, or says it cannot and leaves
+    /// everything as it was, for [`Shared::execute_ast`] to run.
     ///
-    /// Everything that could make the plan's answer differ from putting the row in is checked
+    /// Everything that could make the plan's answer differ from putting the rows in is checked
     /// before anything is touched: a table with checks, foreign keys or a declared order, a column
     /// the row leaves out that has a default, a null for a `NOT NULL` column, a value that is not
     /// already its column's type or a widening of it, a transaction that is read only or aborted,
@@ -3889,43 +3889,31 @@ impl Shared {
         };
         let journals = self.journals(&name);
         let fields = catalog.table(&name).ok()?.columns();
-        // The values as they were given are the row when there is one for each column, in order,
-        // and each is already its column's type, and then the table reads them where they are.
-        // Anything else is gathered into a row of its own, which copies every value.
-        let built;
-        let row = match as_given(direct, given, &targets, fields) {
-            Some(values) => values,
+        // The values as they were given are the row when there is one row with one for each
+        // column, in order, and each is already its column's type, and then the table reads them
+        // where they are. Anything else is gathered into rows of their own, which copies every
+        // value.
+        let built: Vec<Vec<Value>>;
+        let rows: Vec<&[Value]> = match as_given(direct, given, &targets, fields) {
+            Some(values) => vec![values],
             None => {
-                let mut row = vec![Value::Null; fields.len()];
-                for (item, &at) in direct.items.iter().zip(&targets) {
-                    let value = given.value(item)?;
-                    let ty = &fields[at].ty;
-                    let value = if value.is_null() {
-                        Value::Null
-                    } else if value.is_of(ty) {
-                        value
-                    } else if widens(&value.logical_type(), ty) {
-                        rudb_kernels::cast::cast_value(&value, ty, false).ok()?
-                    } else {
-                        return None;
-                    };
-                    if value.is_null() && fields[at].not_null {
-                        return None;
-                    }
-                    row[at] = value;
-                }
-                built = row;
-                built.as_slice()
+                built = direct
+                    .rows
+                    .iter()
+                    .map(|items| typed_row(items, given, &targets, fields))
+                    .collect::<Option<_>>()?;
+                built.iter().map(Vec::as_slice).collect()
             }
         };
-        let staged = journals.then(|| [row.to_vec()]);
-        // The row as a chunk, for what a transaction checks it against and notes it as.
+        let staged = journals.then(|| rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>());
+        // The rows as a chunk, for what a transaction checks them against and notes them as.
         let noted = if transacting {
             let columns = fields
                 .iter()
-                .zip(row)
-                .map(|(field, value)| {
-                    Vector::from_values(field.ty.clone(), std::slice::from_ref(value))
+                .enumerate()
+                .map(|(at, field)| {
+                    let values: Vec<Value> = rows.iter().map(|row| row[at].clone()).collect();
+                    Vector::from_values(field.ty.clone(), &values)
                 })
                 .collect::<Result<Vec<_>>>()
                 .and_then(Chunk::new);
@@ -3938,14 +3926,20 @@ impl Shared {
                 self.refuse_keys_since(&catalog, &name, std::slice::from_ref(chunk))?;
             }
             let table = catalog.table_appending(&name)?;
-            table.append_row(row)?;
+            // Several rows go in together, so a key the last one repeats leaves out the first.
+            match rows.as_slice() {
+                [row] => table.append_row(row)?,
+                many => {
+                    table.append_rows(&many.iter().map(|row| row.to_vec()).collect::<Vec<_>>())?
+                }
+            }
             if let Some(chunk) = noted {
                 self.wrote(table.oid(), |written, _| written.appended(&[chunk]));
             }
             if let Some(rows) = &staged {
                 self.stage_rows(&name, table.columns(), rows);
             }
-            QueryResult::changed(1)
+            QueryResult::changed(rows.len())
         });
         // A failure aborts an open transaction in `in_transaction`, which every prepared statement
         // runs under.
@@ -4092,7 +4086,8 @@ impl Shared {
                     return None;
                 }
                 let (name, _) = direct_targets(&catalog, direct)?;
-                Some(format!("InsertOne {}", name.table))
+                let plan = if direct.rows.len() == 1 { "InsertOne" } else { "InsertRows" };
+                Some(format!("{plan} {}", name.table))
             }
             Shape::Lookup(lookup) => {
                 let target = lookup_target(&catalog, lookup)?;
@@ -6495,6 +6490,35 @@ struct Noted {
 /// The values a [`Shared::insert_direct`] was given, when they are its row as they are: given by
 /// position, one for each column of `fields` in order, each landing on its own column, and each a
 /// null its column takes or a value of its column's type.
+/// A row of `items` in the table's order, each value already its column's type, or `None` when a
+/// value is missing, would need more than a widening, or is a null a column refuses.
+fn typed_row(
+    items: &[crate::prepared::Item],
+    given: crate::prepared::Given<'_>,
+    targets: &[usize],
+    fields: &[Field],
+) -> Option<Vec<Value>> {
+    let mut row = vec![Value::Null; fields.len()];
+    for (item, &at) in items.iter().zip(targets) {
+        let value = given.value(item)?;
+        let ty = &fields[at].ty;
+        let value = if value.is_null() {
+            Value::Null
+        } else if value.is_of(ty) {
+            value
+        } else if widens(&value.logical_type(), ty) {
+            rudb_kernels::cast::cast_value(&value, ty, false).ok()?
+        } else {
+            return None;
+        };
+        if value.is_null() && fields[at].not_null {
+            return None;
+        }
+        row[at] = value;
+    }
+    Some(row)
+}
+
 fn as_given<'a>(
     direct: &crate::prepared::Direct,
     given: crate::prepared::Given<'a>,
@@ -6503,9 +6527,10 @@ fn as_given<'a>(
 ) -> Option<&'a [Value]> {
     use crate::prepared::{Given, Item};
     let Given::Positional(values) = given else { return None };
+    let [items] = direct.rows.as_slice() else { return None };
     let fits = values.len() == fields.len()
-        && direct.items.len() == fields.len()
-        && direct.items.iter().zip(targets).enumerate().all(|(column, (item, &at))| {
+        && items.len() == fields.len()
+        && items.iter().zip(targets).enumerate().all(|(column, (item, &at))| {
             at == column && matches!(item, Item::Parameter(_, Some(place)) if *place == column)
         })
         && values.iter().zip(fields).all(|(value, field)| {
@@ -6543,7 +6568,7 @@ fn direct_targets(
         }
         targets
     };
-    if targets.len() != direct.items.len()
+    if direct.rows.first().is_none_or(|row| targets.len() != row.len())
         || (0..fields.len()).any(|at| !targets.contains(&at) && table.default(at).is_some())
     {
         return None;
