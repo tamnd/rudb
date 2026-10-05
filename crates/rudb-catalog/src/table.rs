@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
-use rudb_common::{Clustering, ColumnFacts, Error, Field, LogicalType, Result, Value};
+use rudb_common::{
+    Clustering, ColumnFacts, DeclaredType, Error, Field, LogicalType, Result, Value,
+};
 use rudb_encoding::sequence::Sequence;
 use rudb_native::{
     Common, FrequencyCodes, FrequencyOccurrences, FrequencyPrefix, PairFrequencyCounts,
@@ -1644,6 +1646,8 @@ pub struct Table {
     seen: Vec<Option<Seen>>,
     /// The `DEFAULT` of each column as the SQL of its expression, or empty when no column has one.
     defaults: Vec<Option<String>>,
+    /// The PostgreSQL type each column was declared with, or empty when no column has one.
+    types: Vec<Option<DeclaredType>>,
     /// The SQL of each `CHECK` constraint, in the order written.
     checks: Vec<String>,
     /// The foreign keys this table's rows have to meet, in the order written.
@@ -1697,6 +1701,7 @@ impl Table {
             seen: Vec::new(),
             indexes: Vec::new(),
             defaults: Vec::new(),
+            types: Vec::new(),
             checks: Vec::new(),
             foreign: Vec::new(),
             order: Vec::new(),
@@ -1721,6 +1726,7 @@ impl Table {
         let stored = reader.table().constraints();
         let (keys, foreign) = restored(&name, stored);
         let defaults = stored.defaults.clone();
+        let types = stored.types.clone();
         let checks = stored.checks.clone();
         let order = restored_order(stored);
         let apart = restored_apart(stored);
@@ -1741,6 +1747,7 @@ impl Table {
             keys,
             indexes,
             defaults,
+            types,
             checks,
             foreign,
             order,
@@ -1796,6 +1803,10 @@ impl Table {
         if self.defaults.iter().any(Option::is_some) {
             stored.defaults.clone_from(&self.defaults);
             stored.defaults.resize(self.columns.len(), None);
+        }
+        if self.types.iter().any(Option::is_some) {
+            stored.types.clone_from(&self.types);
+            stored.types.resize(self.columns.len(), None);
         }
         stored.checks.clone_from(&self.checks);
         // A key is 0, or 4 when it was written apart from its columns, a check 1, a foreign key 2
@@ -2796,6 +2807,18 @@ impl Table {
         self.defaults = defaults;
     }
 
+    /// The PostgreSQL type a column was declared with, or `None` when its declaration named no
+    /// PostgreSQL type or the table was made from a query.
+    #[must_use]
+    pub fn declared_type(&self, column: usize) -> Option<DeclaredType> {
+        self.types.get(column).copied().flatten()
+    }
+
+    /// Declares the columns' PostgreSQL types, one per column.
+    pub fn set_types(&mut self, types: Vec<Option<DeclaredType>>) {
+        self.types = types;
+    }
+
     /// The SQL of each `CHECK` constraint, in the order written.
     #[must_use]
     pub fn checks(&self) -> &[String] {
@@ -3094,6 +3117,7 @@ impl Table {
             Ok(())
         };
         self.defaults.resize(self.columns.len(), None);
+        self.types.resize(self.columns.len(), None);
         let mut moved = true;
         match alteration {
             Alteration::Rename(to) => self.name.table = to,
@@ -3102,10 +3126,11 @@ impl Table {
                 self.columns[column].name = to;
                 self.checks = checks;
             }
-            Alteration::AddColumn { field, default, sequences } => {
+            Alteration::AddColumn { field, default, sequences, declared } => {
                 taken(&self.columns, &field.name)?;
                 self.columns.push(field);
                 self.defaults.push(default);
+                self.types.push(declared);
                 self.depend_on(sequences);
             }
             Alteration::DropColumn { column, checks } => {
@@ -3162,6 +3187,7 @@ impl Table {
                 }
                 self.columns.remove(column);
                 self.defaults.remove(column);
+                self.types.remove(column);
                 self.checks = checks;
                 self.clustering = None;
             }
@@ -3188,8 +3214,9 @@ impl Table {
                 }
                 moved = false;
             }
-            Alteration::Type { column, ty } => {
+            Alteration::Type { column, ty, declared } => {
                 self.columns[column].ty = ty;
+                self.types[column] = declared;
                 self.clustering = None;
             }
             Alteration::AddKey { columns, primary } => {

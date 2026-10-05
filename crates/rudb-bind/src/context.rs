@@ -37,6 +37,7 @@
 //! question about what rudb should call itself that is worth answering on its own.
 
 use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_parse::ast::{self, Ast};
 use rudb_plan::{Expr, ExprRef};
 
 use crate::binder::Binder;
@@ -114,6 +115,27 @@ const CALLS: &[(&str, Context)] = &[
     ("transaction_timestamp", Context::Instant),
     ("user", Context::User),
 ];
+
+/// Whether a target is one of the spellings above that PostgreSQL types as `name`, such as
+/// `current_user` or `current_database()`. The caller checks that a bare word did not bind to a
+/// column of that name first.
+pub(crate) fn gives_name(ast: &Ast, expr: ast::ExprRef) -> bool {
+    let (name, table) = match ast.expr(expr) {
+        ast::Expr::Column { name } if name.len == 1 => (name, KEYWORDS),
+        ast::Expr::Function { name, args, .. } if name.len == 1 && args.len == 0 => (name, CALLS),
+        _ => return false,
+    };
+    let Some(word) = ast.name(name).last() else {
+        return false;
+    };
+    table.iter().any(|(held, what)| {
+        held.eq_ignore_ascii_case(word)
+            && matches!(
+                what,
+                Context::Database | Context::Schema | Context::User | Context::SessionUser
+            )
+    })
+}
 
 impl Binder<'_> {
     /// The constant a bare `current_date` folds to, and `None` for a word that is not one of these.

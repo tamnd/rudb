@@ -63,7 +63,9 @@ pub use spread::{Spread, serially};
 pub use sqlstate::SqlState;
 pub use stage::{Spent, Stage};
 pub use stat::{Class, Classes, ColumnFacts, Direction, Provenance, Stat, Use};
-pub use types::{Field, LogicalType, MAX_DECIMAL_WIDTH, Origin, PhysicalType, StateKey, StateType};
+pub use types::{
+    DeclaredType, Field, LogicalType, MAX_DECIMAL_WIDTH, Origin, PhysicalType, StateKey, StateType,
+};
 pub use value::{
     Value, civil_from_days, days_from_civil, format_double, interval_micros, offset_text,
 };

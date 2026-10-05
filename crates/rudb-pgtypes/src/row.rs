@@ -122,6 +122,12 @@ pub fn pg_type(logical: &LogicalType) -> PgType {
     PgType { oid, typmod }
 }
 
+/// Whether the encoder can send the values of a rudb type as the PostgreSQL type `oid`, which is
+/// what a type that a declaration or a cast wrote has to meet before `RowDescription` names it.
+pub fn encodable(logical: &LogicalType, oid: Oid) -> bool {
+    Kind::of(logical, oid).is_some()
+}
+
 impl Kind {
     /// The kind for a rudb type sent as a PostgreSQL type, or `None` when the encoder cannot send
     /// it. The binder casts a rudb type with no PostgreSQL type to the nearest one, so this takes

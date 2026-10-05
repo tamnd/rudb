@@ -1364,7 +1364,12 @@ impl Runner {
         out: &mut OutBuf,
         flush: &mut impl FnMut(&mut OutBuf) -> io::Result<()>,
     ) -> io::Result<Result<u64, Failure>> {
-        let types: Vec<_> = result.types().iter().map(pg_type).collect();
+        let types: Vec<_> = result
+            .types()
+            .iter()
+            .enumerate()
+            .map(|(at, ty)| column_type(ty, result.origin(at)))
+            .collect();
         let fields: Vec<Field<'_>> = result
             .names()
             .iter()
@@ -1455,6 +1460,27 @@ fn command_tag(sql: &str, result: &QueryResult, before: Transaction) -> CommandT
     }
 }
 
+/// The PostgreSQL type of a result column: the type that its declaration or a cast wrote when the
+/// encoder can send the values as that type, and else the type of its logical type. Only a table
+/// column keeps a typmod that it did not write, as `exprTypmod` does in PostgreSQL, so
+/// `SELECT 1.5` is `numeric` with no typmod.
+pub(super) fn column_type(
+    logical: &rudb_common::LogicalType,
+    origin: Option<rudb_common::Origin>,
+) -> rudb_pgtypes::PgType {
+    if let Some(ty) = origin.and_then(|origin| origin.ty)
+        && rudb_pgtypes::encodable(logical, ty.oid)
+    {
+        return rudb_pgtypes::PgType::with_typmod(ty.oid, ty.typmod);
+    }
+    let ty = pg_type(logical);
+    if origin.is_some_and(|origin| origin.has_table()) {
+        ty
+    } else {
+        rudb_pgtypes::PgType::new(ty.oid)
+    }
+}
+
 /// The `RowDescription` field of a column of a name, a type, a source column and a format.
 pub(super) fn field<'a>(
     name: &'a str,
@@ -1462,9 +1488,9 @@ pub(super) fn field<'a>(
     origin: Option<rudb_common::Origin>,
     format: i16,
 ) -> Field<'a> {
-    let ty = pg_type(logical);
+    let ty = column_type(logical, origin);
     // PostgreSQL numbers the columns of a table from one.
-    let source = origin.and_then(|origin| {
+    let source = origin.filter(rudb_common::Origin::has_table).and_then(|origin| {
         let column = origin.column.checked_add(1)?;
         Some((u32::try_from(origin.table).ok()?, i16::try_from(column).ok()?))
     });

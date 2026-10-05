@@ -16,14 +16,50 @@ use crate::error::{Error, Result};
 use crate::generated::keywords::{KEYWORDS, LONGEST};
 use crate::value::Value;
 
-/// The table column that a result column reads with no change, which a PostgreSQL client finds
-/// in the table OID and the column number of `RowDescription`.
+/// Where a result column comes from, which a PostgreSQL client finds in `RowDescription`: the
+/// table column that it reads with no change, and the PostgreSQL type that a declaration or a cast
+/// wrote for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Origin {
-    /// The OID of the table or the view.
+    /// The OID of the table or the view, or zero when no table column gives the result column.
     pub table: i64,
     /// The position of the column in the table, from zero.
     pub column: u32,
+    /// The PostgreSQL type of the column, when the column declaration or a cast wrote one.
+    pub ty: Option<DeclaredType>,
+}
+
+impl Origin {
+    /// The column at `column` of the table or the view with the OID `table`.
+    #[must_use]
+    pub const fn column(table: i64, column: u32, ty: Option<DeclaredType>) -> Self {
+        Self { table, column, ty }
+    }
+
+    /// A result column that no table column gives, of a type that a cast or a function wrote.
+    #[must_use]
+    pub const fn typed(ty: DeclaredType) -> Self {
+        Self { table: 0, column: 0, ty: Some(ty) }
+    }
+
+    /// Whether a table column gives the result column.
+    #[must_use]
+    pub const fn has_table(&self) -> bool {
+        self.table > 0
+    }
+}
+
+/// A PostgreSQL type as a declaration wrote it, such as `varchar(10)` or `timestamp(3)`: the OID
+/// of the type and the typmod, which is -1 when the declaration gave no modifier.
+///
+/// The logical type says how the values are kept. This says what a PostgreSQL client is told, and
+/// two declarations with the same logical type, such as `text` and `varchar(10)`, can differ here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeclaredType {
+    /// The OID of the type in `pg_type`.
+    pub oid: u32,
+    /// The typmod, or -1.
+    pub typmod: i32,
 }
 
 /// A named field of a `STRUCT` or a `UNION`, and a named column of a table.
@@ -1281,12 +1317,32 @@ impl TypeParser<'_> {
                 self.eat_word("PRECISION");
                 return Ok(LogicalType::Double);
             }
-            "CHARACTER" => {
+            "CHARACTER" | "CHAR" => {
                 self.eat_word("VARYING");
                 self.eat_length_modifier()?;
                 return Ok(LogicalType::Varchar);
             }
+            // PostgreSQL's `bit varying(n)`. The length is not kept, as for a string.
+            "BIT" if self.eat_word("VARYING") => {
+                self.eat_length_modifier()?;
+                return Ok(LogicalType::Bit);
+            }
+            // PostgreSQL's fields and precision, `interval day to second(3)`. The values keep
+            // every field and every digit, as the type with no modifier does.
+            "INTERVAL" => {
+                self.eat_length_modifier()?;
+                if self.eat_interval_field() {
+                    if self.eat_word("TO") && !self.eat_interval_field() {
+                        return Err(Error::parser("syntax error at or near \"TO\"".to_string()));
+                    }
+                    self.eat_length_modifier()?;
+                }
+                return Ok(LogicalType::Interval);
+            }
             "TIME" | "TIMESTAMP" => {
+                // The precision of PostgreSQL's `timestamp(3)` parses and is discarded, because a
+                // value keeps microseconds whatever the column says.
+                self.eat_length_modifier()?;
                 let with_zone = self.eat_time_zone_suffix();
                 return Ok(match (upper.as_str(), with_zone) {
                     ("TIME", false) => LogicalType::Time,
@@ -1390,6 +1446,11 @@ impl TypeParser<'_> {
         }
     }
 
+    /// One field of an interval qualifier, such as the `DAY` of `DAY TO SECOND`.
+    fn eat_interval_field(&mut self) -> bool {
+        ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"].iter().any(|word| self.eat_word(word))
+    }
+
     fn eat_length_modifier(&mut self) -> Result<()> {
         if self.eat(&Token::LeftParen) {
             self.parse_number()?;
@@ -1473,8 +1534,11 @@ fn alias(upper: &str) -> Option<LogicalType> {
         "FLOAT" | "FLOAT4" | "REAL" => LogicalType::Float,
         "FLOAT8" => LogicalType::Double,
         "VARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING" | "NVARCHAR" => LogicalType::Varchar,
+        // PostgreSQL's `name`, which its catalogs use for every identifier. It is a string here,
+        // and the declared type tells a PostgreSQL client that it is a `name`.
+        "NAME" => LogicalType::Varchar,
         "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => LogicalType::Blob,
-        "BIT" | "BITSTRING" => LogicalType::Bit,
+        "BIT" | "BITSTRING" | "VARBIT" => LogicalType::Bit,
         "BIGNUM" | "VARINT" => LogicalType::BigNum,
         "UUID" | "GUID" => LogicalType::Uuid,
         "TYPE" => LogicalType::Type,

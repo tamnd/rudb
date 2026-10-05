@@ -8158,6 +8158,9 @@ fn create_table(
     if create.defaults.iter().any(Option::is_some) {
         catalog.table_mut(&create.name)?.set_defaults(create.defaults);
     }
+    if create.types.iter().any(Option::is_some) {
+        catalog.table_mut(&create.name)?.set_types(create.types);
+    }
     if !create.sequences.is_empty() {
         catalog.table_mut(&create.name)?.set_sequences(create.sequences);
     }
