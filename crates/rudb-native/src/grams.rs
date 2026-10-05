@@ -12,12 +12,14 @@
 //! Deleting the section changes no answer, only how many strings a `LIKE` walks.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rudb_common::{LogicalType, Result};
 use rudb_encoding::sequence::grams;
+use rudb_vector::{Validity, Vector};
 
-use crate::graph::{BUDGET_FLOOR, by_part};
+use crate::graph::{BUDGET_FLOOR, by_part, each_part};
 use crate::section::{self, Attachment};
 use crate::{Catalog, Reader, invalid};
 
@@ -109,27 +111,23 @@ pub fn build_text_grams_within(path: &Path, table: &str, share: u64) -> Result<V
     let allowance = (reader.layout().columns_total().saturating_mul(share) / 100).max(BUDGET_FLOOR);
     let mut report = Vec::with_capacity(columns.len());
     let mut payloads = Vec::with_capacity(columns.len());
+    // A column coded against a table wide dictionary is measured first and sketched only once it is
+    // kept. The length of a row is the length of the value its code points at, which costs the ends
+    // of the dictionary and not its text, and most text columns are short: on JOB `cast_info.note`
+    // is 36 million rows at seven bytes a row, and sketching it to throw the sketch away was the
+    // largest piece of the checkpoint after the links.
+    let mut coded = Vec::with_capacity(columns.len());
     for &column in &columns {
-        let mut words = vec![0_u8; rows * 8];
-        let text_bytes = AtomicU64::new(0);
-        by_part(&reader, &mut words, 8, &|part, run| {
-            let chunk = reader.read(part, &[column])?;
-            let values = chunk.column(0)?;
-            if chunk.len() * 8 != run.len() {
-                return Err(invalid("a text sketch's row count differs from its table"));
-            }
-            let mut bytes = 0_u64;
-            for (row, word) in run.chunks_exact_mut(8).enumerate() {
-                let text = values.bytes_at(row).unwrap_or_default();
-                bytes += text.len() as u64;
-                word.copy_from_slice(&grams(text).to_le_bytes());
-            }
-            text_bytes.fetch_add(bytes, Ordering::Relaxed);
-            Ok(())
-        })?;
-        let text_bytes = text_bytes.into_inner();
-        report.push(Built { column, rows, text_bytes, bytes: words.len(), built: false });
+        let dictionary = reader
+            .global_dictionary(column)?
+            .filter(|values| matches!(values.validity(), Validity::AllValid));
+        let (text_bytes, words) = match &dictionary {
+            Some(values) => (coded_bytes(&reader, column, values)?, Vec::new()),
+            None => sketch_rows(&reader, column, rows)?,
+        };
+        report.push(Built { column, rows, text_bytes, bytes: rows * 8, built: false });
         payloads.push(words);
+        coded.push(dictionary);
     }
     let mut order = (0..report.len()).collect::<Vec<_>>();
     order.sort_by_key(|&at| std::cmp::Reverse(report[at].text_bytes));
@@ -140,6 +138,11 @@ pub fn build_text_grams_within(path: &Path, table: &str, share: u64) -> Result<V
         if long && rows > 0 && spent.saturating_add(cost) <= allowance {
             spent += cost;
             report[at].built = true;
+        }
+    }
+    for (at, dictionary) in coded.iter().enumerate() {
+        if let (true, Some(values)) = (report[at].built, dictionary) {
+            payloads[at] = sketch_codes(&reader, report[at].column, values, rows)?;
         }
     }
     drop(reader);
@@ -189,6 +192,126 @@ pub fn text_grams(reader: &Reader, column: usize) -> Option<Vec<u64>> {
     // with every bit set, which rules nothing out and sends them to be walked.
     words.resize(table.rows(), u64::MAX);
     Some(words)
+}
+
+/// Sketches a column a part at a time, and answers the bytes its values came to with the words.
+fn sketch_rows(reader: &Reader, column: usize, rows: usize) -> Result<(u64, Vec<u8>)> {
+    let mut words = vec![0_u8; rows * 8];
+    let text_bytes = AtomicU64::new(0);
+    by_part(reader, &mut words, 8, &|part, run| {
+        let chunk = reader.read(part, &[column])?;
+        let values = chunk.column(0)?;
+        if chunk.len() * 8 != run.len() {
+            return Err(invalid("a text sketch's row count differs from its table"));
+        }
+        text_bytes.fetch_add(sketch_part(values, run), Ordering::Relaxed);
+        Ok(())
+    })?;
+    Ok((text_bytes.into_inner(), words))
+}
+
+/// Sketches a part a row at a time into `run`, and answers the bytes its values came to.
+fn sketch_part(values: &Vector, run: &mut [u8]) -> u64 {
+    let mut bytes = 0_u64;
+    for (row, word) in run.chunks_exact_mut(8).enumerate() {
+        let text = values.bytes_at(row).unwrap_or_default();
+        bytes += text.len() as u64;
+        word.copy_from_slice(&grams(text).to_le_bytes());
+    }
+    bytes
+}
+
+/// The codes of `vector` when they point into `values`, cut to its rows.
+///
+/// `None` for a part that holds its text some other way, which is read a row at a time.
+fn codes_into<'a>(vector: &'a Vector, values: &Arc<Vector>) -> Option<&'a [u32]> {
+    match vector.shared_dictionary_parts() {
+        Some((codes, held)) if Arc::ptr_eq(held, values) => codes.get(..vector.len()),
+        _ => None,
+    }
+}
+
+/// The bytes a dictionary coded column's values come to, nulls counting none, out of the lengths
+/// of the dictionary values its codes point at.
+fn coded_bytes(reader: &Reader, column: usize, values: &Arc<Vector>) -> Result<u64> {
+    let mut lens = Vec::with_capacity(values.len());
+    if !values.try_bytes_lens(&mut lens)? {
+        lens.clear();
+        for at in 0..values.len() {
+            let len = values.try_bytes_len_at(at)?.unwrap_or(0);
+            lens.push(i64::try_from(len).unwrap_or(i64::MAX));
+        }
+    }
+    let total = AtomicU64::new(0);
+    each_part(reader, &|part| {
+        let chunk = reader.read(part, &[column])?;
+        let vector = chunk.column(0)?;
+        let every = matches!(vector.validity(), Validity::AllValid);
+        let mut bytes = 0_u64;
+        match codes_into(vector, values) {
+            Some(codes) => {
+                for (row, &code) in codes.iter().enumerate() {
+                    if every || vector.validity().is_valid(row) {
+                        let len = lens.get(code as usize).copied().unwrap_or(0);
+                        bytes += u64::try_from(len).unwrap_or(0);
+                    }
+                }
+            }
+            None => {
+                for row in 0..vector.len() {
+                    bytes += vector.bytes_at(row).map_or(0, |text| text.len() as u64);
+                }
+            }
+        }
+        total.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    })?;
+    Ok(total.into_inner())
+}
+
+/// Sketches a dictionary coded column by sketching each dictionary value once and handing every
+/// row the sketch of the value its code points at.
+fn sketch_codes(
+    reader: &Reader,
+    column: usize,
+    values: &Arc<Vector>,
+    rows: usize,
+) -> Result<Vec<u8>> {
+    let mut sketches = vec![0_u64; values.len()];
+    let walked = values.try_visit_text(&mut |at, text| {
+        if let Some(sketch) = sketches.get_mut(at) {
+            *sketch = grams(text);
+        }
+        Ok(())
+    })?;
+    if !walked {
+        for (at, sketch) in sketches.iter_mut().enumerate() {
+            *sketch = grams(values.bytes_at(at).unwrap_or_default());
+        }
+    }
+    let mut words = vec![0_u8; rows * 8];
+    by_part(reader, &mut words, 8, &|part, run| {
+        let chunk = reader.read(part, &[column])?;
+        let vector = chunk.column(0)?;
+        if chunk.len() * 8 != run.len() {
+            return Err(invalid("a text sketch's row count differs from its table"));
+        }
+        let Some(codes) = codes_into(vector, values) else {
+            sketch_part(vector, run);
+            return Ok(());
+        };
+        let every = matches!(vector.validity(), Validity::AllValid);
+        for (row, (word, &code)) in run.chunks_exact_mut(8).zip(codes).enumerate() {
+            let sketch = if every || vector.validity().is_valid(row) {
+                sketches.get(code as usize).copied().unwrap_or(u64::MAX)
+            } else {
+                0
+            };
+            word.copy_from_slice(&sketch.to_le_bytes());
+        }
+        Ok(())
+    })?;
+    Ok(words)
 }
 
 fn text_columns(reader: &Reader) -> impl Iterator<Item = usize> + '_ {
@@ -294,6 +417,67 @@ mod tests {
         for (word, comment) in sketch.iter().zip(&comments) {
             assert_eq!(*word, grams(comment.as_bytes()));
         }
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_column_coded_against_its_dictionary_is_sketched_value_by_value_the_same() {
+        let path = path("coded");
+        let phrases = (0..40)
+            .map(|at| format!("phrase number {at} of the forty that repeat"))
+            .collect::<Vec<_>>();
+        let mut writer = Writer::create(
+            &path,
+            "notes",
+            vec![
+                Field::new("note", LogicalType::Varchar),
+                Field::new("short", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        let mut seed = 7_u64;
+        let mut expected = Vec::new();
+        let mut total = 0_u64;
+        for _ in 0..5 {
+            let mut notes = Vec::new();
+            let mut shorts = Vec::new();
+            for _ in 0..1000 {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let pick = (seed >> 33) as usize % 50;
+                if pick < 40 {
+                    notes.push(Value::Varchar(phrases[pick].clone()));
+                    expected.push(grams(phrases[pick].as_bytes()));
+                    total += phrases[pick].len() as u64;
+                } else {
+                    notes.push(Value::Null);
+                    expected.push(0);
+                }
+                shorts.push(Value::Varchar(format!("{}", pick % 3)));
+            }
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Varchar, &notes).expect("notes"),
+                Vector::from_values(LogicalType::Varchar, &shorts).expect("shorts"),
+            ])
+            .expect("two columns");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+        let reader = Catalog::open(&path).expect("open").table("notes").expect("the table");
+        assert!(reader.global_dictionary(0).expect("read").is_some(), "the notes are coded");
+        assert!(reader.global_dictionary(1).expect("read").is_some(), "the digits are coded");
+        drop(reader);
+
+        let built = build_text_grams(&path, "notes").expect("build");
+        assert_eq!(built[0].text_bytes, total, "a null counts no bytes");
+        assert!(built[0].built);
+        assert!(!built[1].built, "one digit a row is too short to sketch");
+        assert_eq!(built[1].text_bytes, 5000);
+        let reader = Catalog::open(&path).expect("reopen").table("notes").expect("the table");
+        assert!(current(&reader));
+        assert_eq!(text_grams(&reader, 0).expect("the sketch is in the file"), expected);
+        assert!(text_grams(&reader, 1).is_none());
         fs::remove_file(&path).expect("clean up");
     }
 

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use rudb_common::{LogicalType, Result, Value};
 use rudb_graph::{Adjacency, Degrees, Form, KeyMap, Keys, NO_PARENT, Rid, Span, link, span, wire};
-use rudb_vector::Chunk;
+use rudb_vector::{Chunk, Validity};
 
 use crate::section::{self, Attachment};
 use crate::{Catalog, Reader, invalid, type_tag};
@@ -96,6 +96,33 @@ impl KeyColumn<'_> {
     }
 }
 
+impl KeyColumn<'_> {
+    /// The parent of every row of one part through `map`, the keys read as one block, or `false`
+    /// having written nothing for a key that is not one column of signed integers, which the
+    /// caller reads a row at a time.
+    fn parents_in_part(&self, part: usize, map: &KeyMap, out: &mut [Rid]) -> Result<bool> {
+        if self.columns.len() != 1 {
+            return Ok(false);
+        }
+        let chunk = self.reader.read(part, &self.columns)?;
+        let values = chunk.column(0)?;
+        let mut keys = Vec::with_capacity(values.len());
+        if values.len() != out.len() || !values.signed_block(&mut keys) || keys.len() != out.len() {
+            return Ok(false);
+        }
+        map.lookup_block(&keys, out)?;
+        let validity = values.validity();
+        if !matches!(validity, Validity::AllValid) {
+            for (row, parent) in out.iter_mut().enumerate() {
+                if !validity.is_valid(row) {
+                    *parent = NO_PARENT;
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
 impl Keys for KeyColumn<'_> {
     fn scan(&self, each: &mut dyn FnMut(Option<i128>) -> Result<()>) -> Result<()> {
         for part in 0..self.reader.parts() {
@@ -157,6 +184,19 @@ pub(crate) fn by_part<T: Send>(
                 handle.join().map_err(|_| rudb_common::Error::internal("a part worker panicked"))?
             })
     })
+}
+
+/// Runs `work` once for every part of a table on every worker the machine has, for a pass whose
+/// answer is not one value per row, such as a total.
+///
+/// # Errors
+///
+/// If `work` fails on any part.
+pub(crate) fn each_part(
+    reader: &Reader,
+    work: &(dyn Fn(usize) -> Result<()> + Sync),
+) -> Result<()> {
+    by_part(reader, &mut [] as &mut [()], 0, &|part, _| work(part))
 }
 
 /// Where a key over two columns sits among the column numbers.
@@ -963,6 +1003,9 @@ fn one_link(
     let keys = KeyColumn::new(child, edge.child_column).map_err(|error| error.to_string())?;
     let mut parents_of = vec![NO_PARENT; child.table().rows()];
     by_part(child, &mut parents_of, 1, &|part, run| {
+        if keys.parents_in_part(part, &map, run)? {
+            return Ok(());
+        }
         let mut rows = run.iter_mut();
         keys.scan_part(part, &mut |key| {
             let row =
@@ -978,28 +1021,51 @@ fn one_link(
         }
     })
     .map_err(|error| error.to_string())?;
-    let link = link::Link::build(&parents_of, map.len()).map_err(|error| error.to_string())?;
+    // The link, its degrees, its spans and its adjacency each read the same slice and nothing
+    // else, so they are built side by side. One after another on one thread, with the adjacency's
+    // counting sort the longest of them, they were most of the 52 seconds the IMDb checkpoint took.
+    //
     // The parent key is unique, because the check above refused the relationship otherwise. So the
     // certificate is recorded here rather than discovered: a link only exists over a key map whose
     // parent side was counted and found distinct.
     //
-    // Its own pass over the same slice rather than a loop fused into the one above. The cost of
-    // measuring degrees is the scattered increment into a counter per parent and not the sequential
-    // read of the child column, which the build makes twice already, so fusing would save the cheap
-    // half and put a histogram inside a function whose job is to choose a form.
-    let degrees = Degrees::of(&parents_of, map.len(), true);
-    let spans = spans_of(child, &parent, &parents_of).map_err(|error| error.to_string())?;
-    let bytes = encode_link(&link, &parent, edge).map_err(|error| error.to_string())?;
+    // The degrees are their own pass over the same slice rather than a loop fused into the scan
+    // above. The cost of measuring them is the scattered increment into a counter per parent and
+    // not the sequential read of the child column, so fusing would save the cheap half.
+    //
     // A monotone link answers the backward direction itself, so the adjacency is only for the
-    // packed form. It is built from the same slice the link was, a counting sort over it.
+    // packed form, which is any slice with an unmatched child or a child before its predecessor.
+    let parents = map.len();
+    let packed = parents == 0 || parents_of.contains(&NO_PARENT) || !parents_of.is_sorted();
+    let (built, degrees, spans, adjacency) = std::thread::scope(|scope| {
+        let built = scope.spawn(|| {
+            let link = link::Link::build(&parents_of, parents)?;
+            let bytes = encode_link(&link, &parent, edge)?;
+            Ok::<_, rudb_common::Error>((link, bytes))
+        });
+        let degrees = scope.spawn(|| Degrees::of(&parents_of, parents, true));
+        let spans = scope.spawn(|| spans_of(child, &parent, &parents_of));
+        let adjacency = packed
+            .then(|| {
+                Adjacency::build(&parents_of, parents)
+                    .and_then(|adjacency| encode_adjacency(&adjacency, &parent, edge))
+            })
+            .transpose();
+        let joined = "a link build worker panicked";
+        (
+            built.join().map_err(|_| joined.to_string()),
+            degrees.join().map_err(|_| joined.to_string()),
+            spans.join().map_err(|_| joined.to_string()),
+            adjacency,
+        )
+    });
+    let (link, bytes) = built?.map_err(|error| error.to_string())?;
+    let degrees = degrees?;
+    let spans = spans?.map_err(|error| error.to_string())?;
+    let adjacency = adjacency.map_err(|error| error.to_string())?;
     let adjacency = match link.form() {
         link::Form::Monotone => None,
-        link::Form::Packed => {
-            let adjacency = Adjacency::build(&parents_of, map.len())
-                .and_then(|adjacency| encode_adjacency(&adjacency, &parent, edge))
-                .map_err(|error| error.to_string())?;
-            Some(adjacency)
-        }
+        link::Form::Packed => adjacency,
     };
     Ok((
         BuiltLink {
