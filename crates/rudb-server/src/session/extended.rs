@@ -22,15 +22,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rudb::{Description, Prepared, QueryResult, Transaction};
 use rudb_common::{Fields, LogicalType, Value};
 use rudb_pgtypes::{
-    DateTimeInput, InputSettings, NoZones, Oid, RowEncoder, TypeError, TypeInfo,
-    UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, logical_type, param_value, pg_type,
+    DateTimeInput, InputSettings, NoZones, Oid, RowEncoder, TypeError, UNIX_TO_POSTGRES_USECS,
+    ZoneAbbrevs, logical_type, param_value, pg_type,
 };
-use rudb_pgwire::{
-    Bind, CommandTag, Field, Level, OutBuf, Portals, ProtocolError, Statements, Target,
-};
+use rudb_pgwire::{Bind, CommandTag, Level, OutBuf, Portals, ProtocolError, Statements, Target};
 
 use super::setting::{self, Command};
-use super::{Control, FLUSH_AT, Failure, Outcome, Runner, command_tag, leading_words};
+use super::{Control, FLUSH_AT, Failure, Outcome, Runner, command_tag, field, leading_words};
 
 /// The type that PostgreSQL reports for a parameter of no known type.
 const TEXT: Oid = 25;
@@ -347,13 +345,17 @@ impl Extended {
                 }
                 let description = statement.describe()?;
                 out.parameter_description(&statement.parameter_types(description.as_ref()));
-                match description.and_then(|d| d.fields) {
-                    Some(fields) => {
-                        let columns: Vec<_> =
-                            fields.iter().map(|f| (f.name.as_str(), &f.ty, 0)).collect();
-                        row_description(&columns, out);
+                match description {
+                    Some(Description { fields: Some(fields), origins, .. }) => {
+                        let origin = |at: usize| origins.get(at).copied().flatten();
+                        let columns: Vec<_> = fields
+                            .iter()
+                            .enumerate()
+                            .map(|(at, f)| field(&f.name, &f.ty, origin(at), 0))
+                            .collect();
+                        out.row_description(&columns);
                     }
-                    None => out.no_data(),
+                    _ => out.no_data(),
                 }
             }
             Target::Portal => {
@@ -377,9 +379,9 @@ impl Extended {
                             .iter()
                             .zip(result.types())
                             .enumerate()
-                            .map(|(i, (name, ty))| (name.as_str(), ty, format(i)))
+                            .map(|(i, (name, ty))| field(name, ty, result.origin(i), format(i)))
                             .collect();
-                        row_description(&columns, out);
+                        out.row_description(&columns);
                     }
                     _ => out.no_data(),
                 }
@@ -603,34 +605,15 @@ fn describe_command(runner: &Runner, command: &Command, out: &mut OutBuf) {
     match command {
         Command::Show(name) => {
             let column = runner.guc.show(name).map_or_else(|_| name.clone(), |(column, _)| column);
-            row_description(&[(column.as_str(), &text, 0)], out);
+            out.row_description(&[field(&column, &text, None, 0)]);
         }
         Command::ShowAll => {
-            let columns = ["name", "setting", "description"].map(|name| (name, &text, 0));
-            row_description(&columns, out);
+            let columns =
+                ["name", "setting", "description"].map(|name| field(name, &text, None, 0));
+            out.row_description(&columns);
         }
         _ => out.no_data(),
     }
-}
-
-/// Writes a `RowDescription` for columns of a name, a type and a format.
-fn row_description(columns: &[(&str, &LogicalType, i16)], out: &mut OutBuf) {
-    let fields: Vec<Field<'_>> = columns
-        .iter()
-        .map(|(name, logical, format)| {
-            let ty = pg_type(logical);
-            Field {
-                name: name.as_bytes(),
-                table: 0,
-                column: 0,
-                type_oid: ty.oid,
-                type_size: TypeInfo::get(ty.oid).map_or(-1, |info| info.len),
-                type_modifier: ty.typmod,
-                format: *format,
-            }
-        })
-        .collect();
-    out.row_description(&fields);
 }
 
 #[cfg(test)]

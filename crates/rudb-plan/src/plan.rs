@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rudb_common::bounds::{Frequencies, Zones};
-use rudb_common::{ColumnFacts, Error, Field, LogicalType, Result, Span, Stat, Value};
+use rudb_common::{ColumnFacts, Error, Field, LogicalType, Origin, Result, Span, Stat, Value};
 
 use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
 use crate::node::{Bound, JoinKind, Node, WindowBound};
@@ -147,6 +147,11 @@ pub struct Plan {
     /// over a join that ran the join may have missed the rewrite by a single predicate, and which
     /// predicate is not something the plan itself can say. `EXPLAIN` prints these under the tree.
     declined: Vec<String>,
+    /// The table column that each column of the result reads with no change, where there is one.
+    ///
+    /// Beside the pools for the reason `measured` is. Only the binder still knows which result
+    /// column is a plain table column, and only a PostgreSQL client asks, after the plan has run.
+    origins: Vec<Option<Origin>>,
 }
 
 impl Default for Plan {
@@ -201,6 +206,7 @@ impl Plan {
             mirrors: Vec::new(),
             reducers: Vec::new(),
             declined: Vec::new(),
+            origins: Vec::new(),
         }
     }
 
@@ -213,6 +219,18 @@ impl Plan {
     /// Roots the plan at `node`.
     pub fn set_root(&mut self, node: NodeRef) {
         self.root = node;
+    }
+
+    /// The table column that each column of the result reads with no change, where there is one.
+    /// Empty when the binder did not record them.
+    #[must_use]
+    pub fn origins(&self) -> &[Option<Origin>] {
+        &self.origins
+    }
+
+    /// Records the table column of each column of the result.
+    pub fn set_origins(&mut self, origins: Vec<Option<Origin>>) {
+        self.origins = origins;
     }
 
     /// Records what the binder found out about the table bound at `index`.

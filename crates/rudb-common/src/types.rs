@@ -16,6 +16,16 @@ use crate::error::{Error, Result};
 use crate::generated::keywords::{KEYWORDS, LONGEST};
 use crate::value::Value;
 
+/// The table column that a result column reads with no change, which a PostgreSQL client finds
+/// in the table OID and the column number of `RowDescription`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Origin {
+    /// The OID of the table or the view.
+    pub table: i64,
+    /// The position of the column in the table, from zero.
+    pub column: u32,
+}
+
 /// A named field of a `STRUCT` or a `UNION`, and a named column of a table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Field {
