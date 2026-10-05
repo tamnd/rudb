@@ -641,7 +641,7 @@ fn the_transaction_rules_of_postgres() {
 fn the_startup_refusals() {
     let dirs = Dirs::new("refusals");
     let mut config = dirs.config();
-    config.max_connections = 1;
+    config.set("max_connections", "1").unwrap();
     let server = Server::start(config).unwrap();
 
     // There is no TLS, so an SSLRequest gets N and the startup goes on in clear text.
@@ -772,6 +772,49 @@ fn the_roles_of_postgres() {
     assert_eq!(tags(&admin.query("drop role rd, rc")), "CZ");
     assert_eq!(error(&admin.query("drop role rd")), pair("42704", "role \"rd\" does not exist"));
     assert_eq!(tags(&admin.query("drop role if exists rd")), "NCZ");
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_configuration_files_and_a_reload() {
+    let dirs = Dirs::new("conf");
+    let file = dirs.root.join("data/postgresql.conf");
+    let sample = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        sample.contains("\nmax_connections = 100                   # (change requires restart)\n")
+    );
+    let write = |lines: &str| std::fs::write(&file, format!("{sample}{lines}")).unwrap();
+    write("work_mem = 8MB\nmy.custom = 'x'\nmax_connections = 50\n");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    assert_eq!(scalar(&mut client, "show work_mem"), "8MB");
+    assert_eq!(scalar(&mut client, "show my.custom"), "x");
+    assert_eq!(scalar(&mut client, "show max_connections"), "50");
+    assert_eq!(tags(&client.query("set lock_timeout = '1s'")), "CZ");
+
+    // A value that the session set stays, and the others take the new values of the files.
+    // A parameter that leaves the files goes back to its default.
+    write("work_mem = 16MB\nlock_timeout = 5s\nmax_connections = 60\n");
+    server.reload();
+    assert_eq!(scalar(&mut client, "show work_mem"), "16MB");
+    assert_eq!(scalar(&mut client, "show lock_timeout"), "1s");
+    assert_eq!(scalar(&mut client, "show max_connections"), "50");
+    assert_eq!(scalar(&mut client, "show my.custom"), "");
+    assert_eq!(tags(&client.query("reset lock_timeout")), "CZ");
+    assert_eq!(scalar(&mut client, "show lock_timeout"), "5s");
+
+    // A file with an error changes nothing.
+    write("work_mem = 32MB\nnosuch = 1\n");
+    server.reload();
+    assert_eq!(scalar(&mut client, "show work_mem"), "16MB");
+    write("");
+    server.reload();
+    assert_eq!(scalar(&mut client, "show work_mem"), "4MB");
+    let mut other = Client::unix(&server);
+    connect(&mut other, PROTOCOL_3_0);
+    assert_eq!(scalar(&mut other, "show lock_timeout"), "0");
+    assert_eq!(scalar(&mut other, "show config_file"), file.display().to_string());
     server.stop().unwrap();
 }
 

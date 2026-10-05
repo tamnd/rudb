@@ -84,7 +84,7 @@ pub(super) fn authenticate(
         return Ok(None);
     };
     if line.clientcert != ClientCert::Off {
-        if shared.config.ssl_ca_file.as_os_str().is_empty() {
+        if !wire.tls.as_ref().is_some_and(|tls| tls.ca) {
             let message = "client certificates can only be checked if a root certificate store \
                            is available";
             wire.fatal(("F0000", message.to_owned()))?;
@@ -315,7 +315,8 @@ impl Run<'_> {
             &self.shared.mock_nonce,
             SCRAM_ITERATIONS,
         );
-        let hash = self.shared.certificate_hash.as_deref().filter(|_| ssl);
+        let tls = self.wire.tls.clone();
+        let hash = tls.as_ref().map(|tls| tls.hash.as_slice()).filter(|_| ssl);
         let nonce = poll::random::<SCRAM_NONCE_LEN>();
         let (mut scram, mut exchange) =
             match Scram::start(&Provider, &body, hash, secret, nonce, &mut self.wire.out) {

@@ -2,10 +2,15 @@
 //!
 //! The names, the defaults and the syntax of the values are those of PostgreSQL, so a script that
 //! starts `postgres` with `-D`, `-p`, `-h`, `-k`, `-N` and `-c name=value` starts `rudb-server`
-//! the same way. `postgresql.conf` comes later. Until then the built-in defaults and the command
-//! line are the only sources.
+//! the same way. The values of `postgresql.conf` and `postgresql.auto.conf` come between the
+//! built-in defaults and the command line, and the server applies them at start and at each
+//! reload.
 
 use std::path::PathBuf;
+
+use rudb_common::guc::{self, Context, Settings};
+
+use crate::conf;
 
 /// The settings that the server reads at start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +49,9 @@ pub struct Config {
     pub hba_file: PathBuf,
     /// `ident_file`, `pg_ident.conf` in the data directory when it is empty.
     pub ident_file: PathBuf,
+    /// The command line in its order: each name and value that [`Config::set`] took. These come
+    /// after the files, and the sessions start with them.
+    pub(crate) args: Vec<(String, String)>,
 }
 
 /// A value of `ssl_min_protocol_version` and `ssl_max_protocol_version`. `rustls` has no TLS 1.0
@@ -86,15 +94,38 @@ impl Config {
             ssl_max_protocol_version: TlsVersion::Any,
             hba_file: PathBuf::new(),
             ident_file: PathBuf::new(),
+            args: Vec::new(),
         }
     }
 
-    /// Sets one setting by name, with no regard to case, from the text of its value.
+    /// Sets one setting by name, with no regard to case, from the text of its value, as the
+    /// command line does. The name can be any parameter of PostgreSQL or a custom name with a
+    /// dot, and the value stays over the value of the configuration files.
     ///
     /// # Errors
     ///
-    /// The text of PostgreSQL for a name that it does not know or a value that is not correct.
+    /// The text of PostgreSQL for a name that it does not know, a parameter that cannot be
+    /// changed, or a value that is not correct.
     pub fn set(&mut self, name: &str, value: &str) -> Result<(), String> {
+        if !self.assign(name, value)? {
+            if let Some(parameter) = guc::find(name)
+                && parameter.context == Context::Internal
+            {
+                return Err(format!("parameter \"{}\" cannot be changed", parameter.name));
+            }
+            Settings::new(true).set_argument(name, value).map_err(|e| conf::error_text(&e))?;
+        }
+        self.args.push((name.to_owned(), value.to_owned()));
+        Ok(())
+    }
+
+    /// True when the command line set the parameter.
+    pub(crate) fn in_args(&self, name: &str) -> bool {
+        self.args.iter().any(|(held, _)| held.eq_ignore_ascii_case(name))
+    }
+
+    /// Sets a setting of the server. False for a name that the server itself does not read.
+    pub(crate) fn assign(&mut self, name: &str, value: &str) -> Result<bool, String> {
         let invalid = || format!("invalid value for parameter \"{name}\": \"{value}\"");
         match name.to_ascii_lowercase().as_str() {
             "listen_addresses" => self.listen_addresses = value.to_owned(),
@@ -128,9 +159,9 @@ impl Config {
             "ssl_max_protocol_version" => self.ssl_max_protocol_version = tls_version(name, value)?,
             "hba_file" => self.hba_file = PathBuf::from(value),
             "ident_file" => self.ident_file = PathBuf::from(value),
-            _ => return Err(format!("unrecognized configuration parameter \"{name}\"")),
+            _ => return Ok(false),
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Reads the command line of `postgres`: `-D dir`, `-p port`, `-h addresses`, `-k dirs`,

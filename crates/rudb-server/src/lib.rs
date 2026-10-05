@@ -11,6 +11,7 @@
 //!
 //! Document 05 of the PostgreSQL compatibility notes is the plan for this crate.
 
+mod conf;
 mod config;
 mod crypto;
 mod hba;

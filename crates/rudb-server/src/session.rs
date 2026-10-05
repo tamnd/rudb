@@ -38,11 +38,12 @@ use extended::Extended;
 use setting::Command;
 use zone::Zone;
 
+use crate::conf;
 use crate::poll;
 use crate::roles::{Catalog, Roles};
-use crate::server::{Refusal, Shared, log};
+use crate::server::{Defaults, Refusal, Shared, log};
 use crate::stream::Stream;
-use crate::tls;
+use crate::tls::{self, Tls};
 
 /// The size of the output at which the session writes it to the socket before the end of the
 /// result, the size of the send buffer of PostgreSQL.
@@ -101,6 +102,9 @@ struct Wire {
     stream: Stream,
     wake: UnixStream,
     out: OutBuf,
+    /// The TLS configuration of the server when the connection came, when `ssl` was on. A
+    /// reload does not change it for a connection that is open.
+    tls: Option<Arc<Tls>>,
 }
 
 impl Wire {
@@ -235,7 +239,7 @@ pub(crate) fn run(shared: &Arc<Shared>, stream: Stream) {
     };
     let pid = shared.register(waker, stream.try_clone().ok());
     let _registered = Registered { shared, pid };
-    let mut wire = Wire { stream, wake, out: OutBuf::new() };
+    let mut wire = Wire { stream, wake, out: OutBuf::new(), tls: shared.tls() };
     let mut input = Input::default();
     // An error of the socket ends the session. The client is gone or broke the connection, and
     // PostgreSQL logs nothing for most of these.
@@ -260,12 +264,12 @@ fn startup(shared: &Shared, wire: &mut Wire, input: &mut Input) -> io::Result<Op
     // server closes the connection with no answer.
     let direct = input.pending()[0] == tls::HANDSHAKE_BYTE;
     if direct {
-        let Some(config) = shared.tls.as_ref().filter(|_| tcp) else {
+        let Some(tls) = wire.tls.clone().filter(|_| tcp) else {
             return Ok(None);
         };
         let early = input.pending().to_vec();
         input.consume(early.len());
-        if !wire.start_tls(config, &early)? {
+        if !wire.start_tls(&tls.config, &early)? {
             return Ok(None);
         }
         let Stream::Tls(stream) = &wire.stream else {
@@ -281,7 +285,7 @@ fn startup(shared: &Shared, wire: &mut Wire, input: &mut Input) -> io::Result<Op
         }
     }
     // After direct TLS an `SSLRequest` gets `N`, as in PostgreSQL.
-    let mut handshake = Handshake::new(!direct && tcp && shared.tls.is_some());
+    let mut handshake = Handshake::new(!direct && tcp && wire.tls.is_some());
     loop {
         let (step, used) = match split_startup(input.pending()) {
             Err(error) => {
@@ -314,8 +318,8 @@ fn startup(shared: &Shared, wire: &mut Wire, input: &mut Input) -> io::Result<Op
                 input.consume(used);
                 // The bytes that came before the handshake stay in `input`, and the check below
                 // refuses them over TLS, as PostgreSQL does.
-                if let Some(config) = shared.tls.as_ref().filter(|_| tls)
-                    && !wire.start_tls(config, &[])?
+                if let Some(config) = wire.tls.clone().filter(|_| tls)
+                    && !wire.start_tls(&config.config, &[])?
                 {
                     return Ok(None);
                 }
@@ -392,9 +396,15 @@ fn split_options(options: &str) -> Result<Vec<(String, String)>, String> {
     Ok(settings)
 }
 
-/// The settings of a new session: the values that the server owns, then the `options` of the
-/// startup packet, then its other parameters, as `process_startup_options` applies them.
-fn session_settings(start: &Start, ssl: bool, superuser: bool) -> Result<Settings, Refusal> {
+/// The settings of a new session: the values that the server owns, the values of the
+/// configuration files, the command line, then the `options` of the startup packet and its
+/// other parameters, as `process_startup_options` applies them.
+fn session_settings(
+    start: &Start,
+    defaults: &Defaults,
+    ssl: bool,
+    superuser: bool,
+) -> Result<Settings, Refusal> {
     let mut settings = Settings::new(superuser);
     let internal = [
         ("server_version", SERVER_VERSION),
@@ -423,6 +433,14 @@ fn session_settings(start: &Start, ssl: bool, superuser: bool) -> Result<Setting
     ];
     for (name, value) in internal {
         settings.set_internal(name, value).map_err(|e| refusal(&e))?;
+    }
+    conf::start_session(&mut settings, &defaults.file);
+    // The server checked the values of the command line when it started.
+    for (name, value) in &defaults.args {
+        let _ = settings.set_argument(name, value);
+    }
+    for (name, value) in &defaults.paths {
+        let _ = settings.set_argument(name, value);
     }
     let options = match &start.options {
         Some(options) => split_options(options).map_err(|message| ("42601", message))?,
@@ -479,7 +497,8 @@ fn serve(
         Ok(database) => database,
         Err(refusal) => return wire.fatal(refusal),
     };
-    let mut guc = match session_settings(&start, shared.tls.is_some(), role.superuser) {
+    let mut defaults = shared.defaults();
+    let mut guc = match session_settings(&start, &defaults, wire.tls.is_some(), role.superuser) {
         Ok(guc) => guc,
         Err(refusal) => return wire.fatal(refusal),
     };
@@ -544,6 +563,16 @@ fn serve(
         }
         let read = session.read(input.pending());
         let used = read.used;
+        // A backend takes a reload after it reads a message and before it handles it.
+        if read.message.is_some() {
+            let now = shared.defaults();
+            if !Arc::ptr_eq(&now, &defaults) {
+                conf::reload_session(&mut runner.guc, &defaults.file, &now.file);
+                defaults = now;
+                runner.refresh();
+                session.set_utf8(runner.utf8);
+            }
+        }
         let failed = match read.message {
             None => {
                 input.consume(used);

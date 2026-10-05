@@ -21,6 +21,10 @@ use crate::sqlstate::SqlState;
 pub enum Source {
     /// The boot value or a value that the server set.
     Default,
+    /// A value of `postgresql.conf`, which a reload of the file can change.
+    File,
+    /// A value of the command line of the server.
+    Argument,
     /// A value of the startup packet.
     Client,
     /// A value that a statement set.
@@ -226,6 +230,102 @@ impl Settings {
         Ok(())
     }
 
+    /// A value of the configuration file, as `set_config_option` sets it with `PGC_S_FILE`. The
+    /// value becomes the reset value and the current value, unless the command line, the client
+    /// or a statement set them. `None` is the boot value, for a parameter that left the file. A
+    /// name with a dot that is not a parameter is a placeholder. There is no check of the
+    /// context. The result is true when the current value took the value, which is when
+    /// PostgreSQL logs the change.
+    ///
+    /// # Errors
+    ///
+    /// A name that is not a parameter and not a valid placeholder name, or a value that the
+    /// parameter does not take.
+    pub fn set_file(&mut self, name: &str, text: Option<&str>) -> Result<bool, Error> {
+        let (key, parameter, setting) = match find(name) {
+            Some(parameter) => {
+                let setting = match text {
+                    Some(text) => self.parse(parameter, text)?,
+                    None => parameter.boot(),
+                };
+                (parameter.name.to_ascii_lowercase(), Some(parameter), setting)
+            }
+            None => {
+                placeholder_name(name)?;
+                (name.to_ascii_lowercase(), None, Setting::String(text.unwrap_or("").to_owned()))
+            }
+        };
+        let source = if text.is_some() { Source::File } else { Source::Default };
+        let value = Value { setting, source };
+        let slot = self.slot(&key, parameter, parameter.map_or(name, |parameter| parameter.name));
+        let from_file = |value: &Value| matches!(value.source, Source::Default | Source::File);
+        if from_file(&slot.reset) {
+            slot.reset = value.clone();
+        }
+        if let Some(save) = &mut slot.save {
+            // In a transaction block, the value goes under the value of the transaction.
+            if from_file(&save.prior) {
+                save.prior = value;
+            }
+            return Ok(false);
+        }
+        if !from_file(&slot.current) {
+            return Ok(false);
+        }
+        if slot.current != value {
+            slot.current = value;
+            self.changed(parameter);
+        }
+        Ok(true)
+    }
+
+    /// A value of the command line of the server, as the current value and the reset value. It
+    /// comes before the values of the client and after the values of the file. There is no
+    /// check of the context.
+    ///
+    /// # Errors
+    ///
+    /// A name that is not a parameter and not a valid placeholder name, or a value that the
+    /// parameter does not take.
+    pub fn set_argument(&mut self, name: &str, text: &str) -> Result<(), Error> {
+        let Some(parameter) = find(name) else {
+            placeholder_name(name)?;
+            let key = name.to_ascii_lowercase();
+            let value =
+                Value { setting: Setting::String(text.to_owned()), source: Source::Argument };
+            let slot = self.slot(&key, None, name);
+            slot.current = value.clone();
+            slot.reset = value;
+            return Ok(());
+        };
+        let setting = self.parse(parameter, text)?;
+        self.store_reset(parameter, Value { setting, source: Source::Argument });
+        Ok(())
+    }
+
+    /// Reads a value of a parameter with the rules of `set`, and does not keep it.
+    ///
+    /// # Errors
+    ///
+    /// A value that the parameter does not take.
+    pub fn check(&self, parameter: &'static Parameter, text: &str) -> Result<Setting, Error> {
+        self.parse(parameter, text)
+    }
+
+    /// The names of the parameters and placeholders whose reset value came from the configuration
+    /// file, in the order in which they first changed.
+    #[must_use]
+    pub fn file_names(&self) -> Vec<String> {
+        let mut names: Vec<(usize, String)> = self
+            .slots
+            .values()
+            .filter(|slot| slot.reset.source == Source::File)
+            .map(|slot| (slot.order, slot.name.clone()))
+            .collect();
+        names.sort();
+        names.into_iter().map(|(_, name)| name).collect()
+    }
+
     /// `SET name TO text`, `SET name TO DEFAULT` and `RESET name`, where `text` is `None` for the
     /// last two.
     ///
@@ -281,28 +381,7 @@ impl Settings {
         action: Action,
         origin: Origin,
     ) -> Result<(), Error> {
-        if !name.contains('.') {
-            return Err(unrecognized(name));
-        }
-        if !valid_custom_name(name) {
-            return Err(Error::new(
-                ErrorCode::Settings,
-                format!("invalid configuration parameter name \"{name}\""),
-            )
-            .state(SqlState::INVALID_NAME)
-            .detail(
-                "Custom parameter names must be two or more simple identifiers separated by dots.",
-            ));
-        }
-        let prefix = name.split('.').next().unwrap_or("");
-        if prefix.eq_ignore_ascii_case(RESERVED_PREFIX) {
-            return Err(Error::new(
-                ErrorCode::Settings,
-                format!("invalid configuration parameter name \"{name}\""),
-            )
-            .state(SqlState::INVALID_NAME)
-            .detail(format!("\"{RESERVED_PREFIX}\" is a reserved prefix.")));
-        }
+        placeholder_name(name)?;
         let key = name.to_ascii_lowercase();
         let source = match (text, origin) {
             (None, _) => Source::Default,
@@ -310,10 +389,9 @@ impl Settings {
             (Some(_), Origin::Statement) => Source::Session,
         };
         let value = Value { setting: Setting::String(text.unwrap_or("").to_owned()), source };
-        self.slot(&key, None, name);
+        let slot = self.slot(&key, None, name);
         match origin {
             Origin::Startup => {
-                let slot = self.slots.get_mut(&key).expect("the slot was just made");
                 slot.current = value.clone();
                 slot.reset = value;
             }
@@ -365,27 +443,26 @@ impl Settings {
     }
 
     /// Makes the slot of a parameter if the session did not change it before.
-    fn slot(&mut self, key: &str, parameter: Option<&'static Parameter>, name: &str) {
-        if !self.slots.contains_key(key) {
+    fn slot(&mut self, key: &str, parameter: Option<&'static Parameter>, name: &str) -> &mut Slot {
+        let order = self.slots.len();
+        self.slots.entry(key.to_owned()).or_insert_with(|| {
             let setting = parameter.map_or_else(|| Setting::String(String::new()), Parameter::boot);
             let value = Value { setting, source: Source::Default };
-            let slot = Slot {
+            Slot {
                 parameter,
                 name: name.to_owned(),
                 current: value.clone(),
                 reset: value,
                 save: None,
-                order: self.slots.len(),
-            };
-            self.slots.insert(key.to_owned(), slot);
-        }
+                order,
+            }
+        })
     }
 
     /// Sets the current value and the reset value, outside of a transaction.
     fn store_reset(&mut self, parameter: &'static Parameter, value: Value) {
         let key = parameter.name.to_ascii_lowercase();
-        self.slot(&key, Some(parameter), parameter.name);
-        let slot = self.slots.get_mut(&key).expect("the slot was just made");
+        let slot = self.slot(&key, Some(parameter), parameter.name);
         slot.reset = value.clone();
         if slot.current != value {
             slot.current = value;
@@ -559,6 +636,34 @@ impl Settings {
     }
 }
 
+/// The check of a name that is not a parameter of PostgreSQL, for a placeholder: it needs a dot,
+/// the form of a custom name, and a prefix that is not reserved.
+fn placeholder_name(name: &str) -> Result<(), Error> {
+    if !name.contains('.') {
+        return Err(unrecognized(name));
+    }
+    if !valid_custom_name(name) {
+        return Err(Error::new(
+            ErrorCode::Settings,
+            format!("invalid configuration parameter name \"{name}\""),
+        )
+        .state(SqlState::INVALID_NAME)
+        .detail(
+            "Custom parameter names must be two or more simple identifiers separated by dots.",
+        ));
+    }
+    let prefix = name.split('.').next().unwrap_or("");
+    if prefix.eq_ignore_ascii_case(RESERVED_PREFIX) {
+        return Err(Error::new(
+            ErrorCode::Settings,
+            format!("invalid configuration parameter name \"{name}\""),
+        )
+        .state(SqlState::INVALID_NAME)
+        .detail(format!("\"{RESERVED_PREFIX}\" is a reserved prefix.")));
+    }
+    Ok(())
+}
+
 /// The error for a name that is not a parameter.
 fn unrecognized(name: &str) -> Error {
     Error::new(ErrorCode::Settings, format!("unrecognized configuration parameter \"{name}\""))
@@ -686,5 +791,46 @@ mod tests {
             all.iter().any(|(name, value, _)| *name == "archive_command" && value == "(disabled)")
         );
         assert!(all.windows(2).all(|w| w[0].0.to_ascii_lowercase() < w[1].0.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn file_values_go_under_arguments_and_clients() {
+        let mut s = Settings::new(true);
+        assert!(s.set_file("work_mem", Some("8MB")).unwrap());
+        assert_eq!(s.get("work_mem").unwrap(), "8MB");
+        s.set_argument("work_mem", "16MB").unwrap();
+        assert!(!s.set_file("work_mem", Some("32MB")).unwrap(), "the command line wins");
+        assert_eq!(s.get("work_mem").unwrap(), "16MB");
+
+        assert!(s.set_file("DateStyle", Some("sql, dmy")).unwrap());
+        s.set("datestyle", Some("German"), Action::Set, Origin::Startup).unwrap();
+        assert!(!s.set_file("datestyle", Some("iso, ymd")).unwrap());
+        assert_eq!(s.get("DateStyle").unwrap(), "German, DMY");
+
+        set(&mut s, "statement_timeout", "5s").unwrap();
+        s.end(true);
+        assert!(!s.set_file("statement_timeout", Some("7s")).unwrap());
+        assert_eq!(s.get("statement_timeout").unwrap(), "5s");
+        s.set("statement_timeout", None, Action::Set, Origin::Statement).unwrap();
+        assert_eq!(s.get("statement_timeout").unwrap(), "7s", "RESET goes to the file value");
+    }
+
+    #[test]
+    fn file_values_leave_and_go_under_transactions() {
+        let mut s = Settings::new(true);
+        s.set_file("lock_timeout", Some("3s")).unwrap();
+        assert!(s.set_file("lock_timeout", None).unwrap());
+        assert_eq!(s.get("lock_timeout").unwrap(), "0");
+
+        local(&mut s, "lock_timeout", "1s");
+        assert!(!s.set_file("lock_timeout", Some("2s")).unwrap());
+        s.end(false);
+        assert_eq!(s.get("lock_timeout").unwrap(), "2s");
+
+        assert!(s.set_file("my.option", Some("x")).unwrap());
+        assert_eq!(s.get("my.option").unwrap(), "x");
+        assert!(s.set_file("nodot", Some("x")).is_err());
+        assert!(s.set_file("rudb.option", Some("x")).is_err());
+        assert!(s.set_file("work_mem", Some("1kB")).is_err());
     }
 }

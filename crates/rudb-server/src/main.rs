@@ -1,6 +1,6 @@
 //! The `rudb-server` binary: `rudb-server init [-U NAME] [--pwfile FILE] [-A METHOD] DIR` makes a data
 //! directory, and `rudb-server -D DIR` with the options of `postgres` runs the server until
-//! `SIGINT`, `SIGTERM` or `SIGQUIT`.
+//! `SIGINT`, `SIGTERM` or `SIGQUIT`. `SIGHUP` reloads the configuration files.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -117,14 +117,26 @@ fn run(args: &[String]) -> ExitCode {
     unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, std::ptr::null_mut()) };
     let server = match Server::start(config) {
         Ok(server) => server,
+        // PostgreSQL checks the configuration file before its log starts, so that error has the
+        // name of the program and not a level.
+        Err(error) if error.starts_with("could not access the server configuration file") => {
+            eprintln!("rudb-server: {error}");
+            return ExitCode::FAILURE;
+        }
         Err(error) => {
             eprintln!("FATAL:  {error}");
             return ExitCode::FAILURE;
         }
     };
-    let mut signal: libc::c_int = 0;
-    // SAFETY: `signals` and `signal` are valid for the whole call.
-    unsafe { libc::sigwait(&raw const signals, &raw mut signal) };
+    loop {
+        let mut signal: libc::c_int = 0;
+        // SAFETY: `signals` and `signal` are valid for the whole call.
+        unsafe { libc::sigwait(&raw const signals, &raw mut signal) };
+        if signal != libc::SIGHUP {
+            break;
+        }
+        server.reload();
+    }
     match server.stop() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -139,7 +151,7 @@ fn signal_set() -> libc::sigset_t {
     unsafe {
         let mut set = std::mem::zeroed::<libc::sigset_t>();
         libc::sigemptyset(&raw mut set);
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
+        for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
             libc::sigaddset(&raw mut set, signal);
         }
         set

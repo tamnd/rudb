@@ -10,7 +10,8 @@
 //! `errcodes.txt` gives the SQLSTATE list of `rudb-common`, `guc_parameters.dat` and
 //! `guc_tables.c` give the configuration parameters of `rudb-common`, `cmdtaglist.h` gives the
 //! command tags of `rudb-pgwire`, `pg_type.dat` gives the type OIDs of `rudb-pgtypes`, and the
-//! samples of `pg_hba.conf` and `pg_ident.conf` are the files that `rudb-server init` writes.
+//! samples of `pg_hba.conf`, `pg_ident.conf` and `postgresql.conf` are the files that
+//! `rudb-server init` writes.
 
 mod guc;
 
@@ -58,6 +59,7 @@ const VENDORS: [Vendor; 4] = [
         files: &[
             ("src/backend/libpq/pg_hba.conf.sample", "pg_hba.conf.sample"),
             ("src/backend/libpq/pg_ident.conf.sample", "pg_ident.conf.sample"),
+            ("src/backend/utils/misc/postgresql.conf.sample", "postgresql.conf.sample"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },
