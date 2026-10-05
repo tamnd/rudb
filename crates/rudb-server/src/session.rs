@@ -14,6 +14,7 @@ mod auth;
 mod database;
 mod extended;
 mod keywords;
+mod literal;
 mod role;
 mod setting;
 mod zone;
@@ -1002,7 +1003,16 @@ impl Runner {
             self.zone = Zone::of(&zone_name);
             self.zone_name = zone_name;
         }
-        let postgres = Postgres { settings: self.guc.clone(), version: VERSION.to_owned() };
+        let input = literal::Literals {
+            order: self.format.date_format.order,
+            zone: self.zone_name.clone(),
+            interval_style: self.format.interval_style,
+        };
+        let postgres = Postgres {
+            settings: self.guc.clone(),
+            version: VERSION.to_owned(),
+            input: Some(Arc::new(input)),
+        };
         self.connection.set_postgres(Arc::new(postgres));
     }
 

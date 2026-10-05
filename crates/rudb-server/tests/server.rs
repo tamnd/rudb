@@ -338,6 +338,30 @@ fn an_error_stops_the_query_and_the_session_goes_on() {
     server.stop().unwrap();
 }
 
+#[test]
+fn a_string_literal_in_a_cast_uses_the_input_function_of_the_type() {
+    let dirs = Dirs::new("literal");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+
+    assert_eq!(scalar(&mut client, "select '\\x0102ff'::bytea"), "\\x0102ff");
+    assert_eq!(scalar(&mut client, "select 'infinity'::date"), "infinity");
+    assert_eq!(scalar(&mut client, "select '4713-01-01 BC'::date"), "4713-01-01 BC");
+    assert_eq!(scalar(&mut client, "select '-infinity'::timestamp"), "-infinity");
+    assert_eq!(scalar(&mut client, "select '1 day 2 hours'::interval"), "1 day 02:00:00");
+    assert_eq!(scalar(&mut client, "select ' 12 '::int4"), "12");
+
+    let messages = client.query("select '2020-02-30'::date");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("22008"));
+    let message = messages[0].field(b'M');
+    assert_eq!(message.as_deref(), Some("date/time field value out of range: \"2020-02-30\""));
+    let messages = client.query("select '99999'::int2");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("22003"));
+    server.stop().unwrap();
+}
+
 /// The row description of a message.
 fn row_shape(message: &Message) -> Vec<(String, u32, i16)> {
     let bytes = message.decoded();

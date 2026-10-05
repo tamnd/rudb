@@ -257,8 +257,18 @@ impl Binder<'_> {
                 }
             }
             ast::Expr::Cast { operand, ty, try_cast } => {
-                let input = self.bind_expr(ast, operand, scope)?;
                 let target = crate::statement::read_type(self.catalog(), ast.string(ty))?;
+                // A PostgreSQL session reads a string literal with the input function of the type.
+                let session = self.session;
+                if !try_cast
+                    && let ast::Expr::Literal { kind: LiteralKind::String, text } =
+                        ast.expr(operand)
+                    && let Some(input) = session.postgres().and_then(|pg| pg.input.as_ref())
+                    && let Some(value) = input.read(&target, ast.string(text))
+                {
+                    return Ok(self.add_constant(value?));
+                }
+                let input = self.bind_expr(ast, operand, scope)?;
                 self.checked_cast_to(input, &target, try_cast)
             }
             ast::Expr::Case { operand, arms, otherwise } => {

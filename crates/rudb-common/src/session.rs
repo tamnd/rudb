@@ -53,6 +53,15 @@ pub struct Postgres {
     pub settings: crate::guc::Settings,
     /// What `version()` returns.
     pub version: String,
+    /// The input functions of the types, which read the text of a string literal in a cast.
+    pub input: Option<Arc<dyn LiteralInput>>,
+}
+
+/// Reads the text of a literal such as `'infinity'::date` with the input function of the type, as
+/// PostgreSQL does, and not with the cast of the engine.
+pub trait LiteralInput: Send + Sync + std::fmt::Debug {
+    /// The value of `text` as `ty`, or `None` when `ty` has no input function here.
+    fn read(&self, ty: &LogicalType, text: &str) -> Option<crate::Result<Value>>;
 }
 
 /// The PostgreSQL session, if there is one, compared by identity. A new copy is a new value, so a
