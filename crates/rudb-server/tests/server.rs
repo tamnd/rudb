@@ -746,3 +746,136 @@ fn a_stop_ends_each_session_and_removes_the_files() {
     assert_eq!(tags(&messages), "TDCZ");
     server.stop().unwrap();
 }
+
+/// The crypto provider of the build, as in the server.
+#[cfg(feature = "tls-aws-lc")]
+fn provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
+}
+
+#[cfg(all(feature = "tls-ring", not(feature = "tls-aws-lc")))]
+fn provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+impl Socket for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {}
+
+/// A TLS client that trusts the test CA, with the ALPN protocols `alpn`.
+fn tls_client(alpn: &[&[u8]]) -> std::sync::Arc<rustls::ClientConfig> {
+    use rustls_pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    let ca = include_bytes!("tls/ca.crt");
+    roots.add(rustls_pki_types::CertificateDer::from_pem_slice(ca).unwrap()).unwrap();
+    let mut config = rustls::ClientConfig::builder_with_provider(provider().into())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    std::sync::Arc::new(config)
+}
+
+/// Runs the TLS handshake of the client on `socket`. An error is the end of the connection.
+fn tls_handshake(
+    socket: TcpStream,
+    alpn: &[&[u8]],
+) -> std::io::Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(tls_client(alpn), name).unwrap();
+    let mut stream = rustls::StreamOwned::new(conn, socket);
+    while stream.conn.is_handshaking() {
+        stream.conn.complete_io(&mut stream.sock)?;
+    }
+    Ok(stream)
+}
+
+#[test]
+fn tls_with_an_ssl_request_and_with_direct_tls() {
+    use std::os::unix::fs::PermissionsExt;
+    let dirs = Dirs::new("tls");
+    let data = dirs.root.join("data");
+    std::fs::write(data.join("server.crt"), include_bytes!("tls/server.crt")).unwrap();
+    std::fs::write(data.join("server.key"), include_bytes!("tls/server.key")).unwrap();
+    let mut config = dirs.config();
+    config.ssl = true;
+    // A key that other users can read stops the start, as in PostgreSQL.
+    let key = data.join("server.key");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let error = Server::start(config.clone()).unwrap_err();
+    assert!(error.starts_with("private key file \"server.key\" has group or world access"));
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let server = Server::start(config).unwrap();
+
+    // SSLRequest, `S`, the handshake, and then the startup over TLS. A client that sends no ALPN
+    // is fine on this path.
+    let mut socket = TcpStream::connect(server.addresses()[0]).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut bytes = Vec::new();
+    Packet::SslRequest.encode(&mut bytes);
+    socket.write_all(&bytes).unwrap();
+    let mut answer = [0u8; 1];
+    socket.read_exact(&mut answer).unwrap();
+    assert_eq!(&answer, b"S");
+    let stream = tls_handshake(socket, &[]).unwrap();
+    let mut client = Client { socket: Box::new(stream), input: Vec::new() };
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query("show ssl");
+    assert_eq!(tags(&messages), "TDCZ");
+    assert_eq!(data_row(&messages[1]), vec![Some(b"on".to_vec())]);
+    // A result larger than the TLS records and the flush size comes through whole.
+    let messages = client.query("select repeat('x', 300000)");
+    assert_eq!(data_row(&messages[1])[0].as_ref().map(Vec::len), Some(300_000));
+    client.send(&Frontend::Terminate);
+    assert!(client.rest().is_empty());
+
+    // Direct TLS with ALPN. A later SSLRequest gets `N`.
+    let socket = TcpStream::connect(server.addresses()[0]).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let stream = tls_handshake(socket, &[b"postgresql"]).unwrap();
+    assert_eq!(stream.conn.alpn_protocol(), Some(&b"postgresql"[..]));
+    let mut client = Client { socket: Box::new(stream), input: Vec::new() };
+    client.packet(&Packet::SslRequest);
+    let mut answer = [0u8; 1];
+    client.socket.read_exact(&mut answer).unwrap();
+    assert_eq!(&answer, b"N");
+    connect(&mut client, PROTOCOL_3_2);
+    let messages = client.query("select 1");
+    assert_eq!(tags(&messages), "TDCZ");
+
+    // Direct TLS without ALPN: the handshake ends, and then the server closes the connection.
+    let socket = TcpStream::connect(server.addresses()[0]).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let stream = tls_handshake(socket, &[]).unwrap();
+    let mut client = Client { socket: Box::new(stream), input: Vec::new() };
+    client.startup(PROTOCOL_3_0, "postgres");
+    assert!(client.rest().is_empty());
+
+    // Clear text that comes with the SSLRequest is an error over TLS.
+    let mut socket = TcpStream::connect(server.addresses()[0]).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut bytes = Vec::new();
+    Packet::SslRequest.encode(&mut bytes);
+    bytes.extend_from_slice(b"junk");
+    socket.write_all(&bytes).unwrap();
+    socket.read_exact(&mut answer).unwrap();
+    assert_eq!(&answer, b"S");
+    let stream = tls_handshake(socket, &[]).unwrap();
+    let mut client = Client { socket: Box::new(stream), input: Vec::new() };
+    let messages = client.rest();
+    assert_eq!(tags(&messages), "E");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("08P01"));
+    assert_eq!(
+        messages[0].field(b'M').as_deref(),
+        Some("received unencrypted data after SSL request")
+    );
+
+    // There is no TLS on a Unix socket.
+    let mut client = Client::unix(&server);
+    client.packet(&Packet::SslRequest);
+    client.socket.read_exact(&mut answer).unwrap();
+    assert_eq!(&answer, b"N");
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query("show ssl_library");
+    assert_eq!(data_row(&messages[1]), vec![Some(b"rustls".to_vec())]);
+    server.stop().unwrap();
+}

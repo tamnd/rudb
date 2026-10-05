@@ -24,6 +24,7 @@ use crate::config::Config;
 use crate::poll;
 use crate::session;
 use crate::stream::Stream;
+use crate::tls;
 
 /// The name of the lock file in the data directory, which holds the process ID of the server.
 const PID_FILE: &str = "rudb-server.pid";
@@ -80,6 +81,8 @@ pub(crate) struct Sessions {
 #[derive(Debug)]
 pub(crate) struct Shared {
     pub(crate) config: Config,
+    /// The TLS configuration, when `ssl` is on.
+    pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
     databases: Mutex<HashMap<String, Arc<Database>>>,
     sessions: Mutex<Sessions>,
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -247,6 +250,7 @@ impl Listener {
                 match &stream {
                     Stream::Tcp(s) => s.set_nonblocking(false)?,
                     Stream::Unix(s) => s.set_nonblocking(false)?,
+                    Stream::Tls(s) => s.sock.set_nonblocking(false)?,
                 }
                 Ok(Some(stream))
             }
@@ -311,6 +315,7 @@ impl Server {
                 config.data.display()
             ));
         }
+        let tls = tls::load(&config)?;
         let mut owned = Vec::new();
         let pid_file = config.data.join(PID_FILE);
         let me = std::process::id();
@@ -333,6 +338,7 @@ impl Server {
         let (stop_read, stop) = UnixStream::pair().map_err(|e| e.to_string())?;
         let shared = Arc::new(Shared {
             config,
+            tls,
             databases: Mutex::new(HashMap::new()),
             sessions: Mutex::new(Sessions {
                 next: 1001 + i32::from(poll::random::<2>()[0]) * 64,

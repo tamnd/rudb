@@ -20,6 +20,15 @@ path = "src/lib.rs"
 name = "rudb-server"
 path = "src/main.rs"
 
+# `rustls` and `rustls-pki-types` are for TLS, with `aws-lc-rs` as the crypto provider by default
+# and `ring` with the feature `tls-ring`, as document 05 section 5.6 of the PostgreSQL notes says.
+# Only this crate may depend on them. The FIPS build of `aws-lc-rs` needs Go, and comes as its own
+# feature later.
+[features]
+default = ["tls-aws-lc"]
+tls-aws-lc = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+tls-ring = ["rustls/ring"]
+
 # `libc` is for `poll(2)`, the socket options and the random bytes of the cancel keys, which the
 # standard library does not have. Only this crate may depend on it, as document 16 section 16.4 of
 # the PostgreSQL notes says.
@@ -31,6 +40,8 @@ rudb.workspace = true
 rudb-common.workspace = true
 rudb-pgtypes.workspace = true
 rudb-pgwire.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 
 [lints]
 workspace = true

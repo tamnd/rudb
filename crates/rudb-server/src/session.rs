@@ -38,6 +38,7 @@ use zone::Zone;
 use crate::poll;
 use crate::server::{Refusal, Shared, log};
 use crate::stream::Stream;
+use crate::tls;
 
 /// The size of the output at which the session writes it to the socket before the end of the
 /// result, the size of the send buffer of PostgreSQL.
@@ -105,7 +106,11 @@ impl Wire {
             input.buf.drain(..input.head);
             input.head = 0;
         }
-        let [socket, wake] = poll::readable([self.stream.as_raw_fd(), self.wake.as_raw_fd()])?;
+        let [socket, wake] = if self.stream.buffered() {
+            [true, false]
+        } else {
+            poll::readable([self.stream.as_raw_fd(), self.wake.as_raw_fd()])?
+        };
         if wake {
             let mut drop = [0u8; 64];
             let _ = self.wake.read(&mut drop)?;
@@ -125,8 +130,37 @@ impl Wire {
         match read {
             Ok(0) => Ok(Filled::Closed),
             Ok(_) => Ok(Filled::Data),
-            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Ok(Filled::Closed),
+            // TLS gives `UnexpectedEof` when the client closes the socket without a
+            // `close_notify`, which libpq does.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                Ok(Filled::Closed)
+            }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Starts TLS on the TCP socket. `early` holds the bytes of the handshake that the session
+    /// already read, for direct TLS. False means that the handshake failed and the connection
+    /// ends, as the log says.
+    fn start_tls(&mut self, config: &Arc<rustls::ServerConfig>, early: &[u8]) -> io::Result<bool> {
+        let Stream::Tcp(socket) = &self.stream else {
+            return Ok(false);
+        };
+        let socket = socket.try_clone()?;
+        match tls::accept(config, socket, early) {
+            Ok(stream) => {
+                self.stream = Stream::Tls(Box::new(stream));
+                Ok(true)
+            }
+            Err(message) => {
+                log("LOG", &message);
+                Ok(false)
+            }
         }
     }
 
@@ -134,6 +168,7 @@ impl Wire {
     fn flush(&mut self) -> io::Result<()> {
         if !self.out.is_empty() {
             self.stream.write_all(self.out.as_bytes())?;
+            self.stream.flush()?;
             self.out.consume(self.out.len());
         }
         Ok(())
@@ -198,7 +233,41 @@ pub(crate) fn run(shared: &Arc<Shared>, stream: Stream) {
 
 /// Reads packets until a `StartupMessage`. `None` means that the connection ends.
 fn startup(shared: &Shared, wire: &mut Wire, input: &mut Input) -> io::Result<Option<Start>> {
-    let mut handshake = Handshake::new(false);
+    let tcp = matches!(wire.stream, Stream::Tcp(_));
+    while input.pending().is_empty() {
+        match wire.fill(input)? {
+            Filled::Data => {}
+            Filled::Closed => return Ok(None),
+            Filled::Woken if shared.stopping() => return Ok(None),
+            Filled::Woken => {}
+        }
+    }
+    // Direct TLS, `ProcessSSLStartup` of PostgreSQL. Without TLS, and on a Unix socket, the
+    // server closes the connection with no answer.
+    let direct = input.pending()[0] == tls::HANDSHAKE_BYTE;
+    if direct {
+        let Some(config) = shared.tls.as_ref().filter(|_| tcp) else {
+            return Ok(None);
+        };
+        let early = input.pending().to_vec();
+        input.consume(early.len());
+        if !wire.start_tls(config, &early)? {
+            return Ok(None);
+        }
+        let Stream::Tls(stream) = &wire.stream else {
+            return Ok(None);
+        };
+        if stream.conn.alpn_protocol() != Some(tls::ALPN) {
+            log(
+                "LOG",
+                "received direct SSL connection request without ALPN protocol negotiation \
+                 extension",
+            );
+            return Ok(None);
+        }
+    }
+    // After direct TLS an `SSLRequest` gets `N`, as in PostgreSQL.
+    let mut handshake = Handshake::new(!direct && tcp && shared.tls.is_some());
     loop {
         let (step, used) = match split_startup(input.pending()) {
             Err(error) => {
@@ -226,9 +295,16 @@ fn startup(shared: &Shared, wire: &mut Wire, input: &mut Input) -> io::Result<Op
                 shared.cancel(&cancel);
                 return Ok(None);
             }
-            Ok(Step::Answer { request, .. }) => {
+            Ok(Step::Answer { request, tls }) => {
                 wire.flush()?;
                 input.consume(used);
+                // The bytes that came before the handshake stay in `input`, and the check below
+                // refuses them over TLS, as PostgreSQL does.
+                if let Some(config) = shared.tls.as_ref().filter(|_| tls)
+                    && !wire.start_tls(config, &[])?
+                {
+                    return Ok(None);
+                }
                 if let Err(error) = request.check_buffered(input.pending().len()) {
                     wire.out.protocol_error(&error, handshake.protocol());
                     wire.flush()?;
@@ -304,7 +380,7 @@ fn split_options(options: &str) -> Result<Vec<(String, String)>, String> {
 
 /// The settings of a new session: the values that the server owns, then the `options` of the
 /// startup packet, then its other parameters, as `process_startup_options` applies them.
-fn session_settings(start: &Start) -> Result<Settings, Refusal> {
+fn session_settings(start: &Start, ssl: bool) -> Result<Settings, Refusal> {
     let mut settings = Settings::new(true);
     let internal = [
         ("server_version", SERVER_VERSION),
@@ -328,6 +404,8 @@ fn session_settings(start: &Start) -> Result<Settings, Refusal> {
         ("commit_timestamp_buffers", "256kB"),
         ("subtransaction_buffers", "256kB"),
         ("transaction_buffers", "256kB"),
+        ("ssl", if ssl { "on" } else { "off" }),
+        ("ssl_library", "rustls"),
     ];
     for (name, value) in internal {
         settings.set_internal(name, value).map_err(|e| refusal(&e))?;
@@ -380,7 +458,7 @@ fn serve(
         Ok(database) => database,
         Err(refusal) => return wire.fatal(refusal),
     };
-    let mut guc = match session_settings(&start) {
+    let mut guc = match session_settings(&start, shared.tls.is_some()) {
         Ok(guc) => guc,
         Err(refusal) => return wire.fatal(refusal),
     };
@@ -549,6 +627,7 @@ fn terminated(wire: &mut Wire) -> io::Result<()> {
 fn wire_flush(stream: &mut Stream) -> impl FnMut(&mut OutBuf) -> io::Result<()> + '_ {
     move |out: &mut OutBuf| {
         stream.write_all(out.as_bytes())?;
+        stream.flush()?;
         out.consume(out.len());
         Ok(())
     }
