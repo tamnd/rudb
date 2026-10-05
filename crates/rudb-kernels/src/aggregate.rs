@@ -2653,9 +2653,12 @@ pub struct PlaceSums {
     /// Per place of the map and one more for the rows the filter dropped, the same cells as
     /// [`Self::cells`], for [`Self::add_places`]. Every cell is back to nothing between chunks.
     by_place: Vec<i64>,
-    /// The places of [`Self::by_place`] with rows in the chunk, as [`Self::touched`] found them,
-    /// kept for the next chunk to ask first.
+    /// The places of [`Self::by_place`] with rows in the chunk, as [`Self::touched`] found them.
     touched: Vec<usize>,
+    /// Every place that has had rows, for [`Self::touched`] to ask first, and by place whether it
+    /// is on that list.
+    seen: Vec<usize>,
+    marked: Vec<bool>,
     /// The rows the last [`Self::add_places`] added, the ones the filter dropped among them.
     added: usize,
 }
@@ -2851,10 +2854,12 @@ impl PlaceSums {
     /// has a place for every two or three rows of a chunk and about 400 of them have rows, so the
     /// fold goes through the list rather than through the map again.
     ///
-    /// The places with rows in the chunk before are asked first. Every row adds one to the count of
-    /// its place, so when their counts add up to the rows the chunk put in the map no other place
-    /// can have any, and the other three thousand places of q01's map are not looked at. A chunk
-    /// whose rows went somewhere else is a pass over the count of every place, as it always was.
+    /// The places that have had rows in any chunk before are asked first. Every row adds one to the
+    /// count of its place, so when their counts add up to the rows the chunk put in the map no other
+    /// place can have any, and the other three thousand places of q01's map are not looked at. A
+    /// chunk with a row in a place no chunk had before is a pass over the count of every place, as
+    /// it always was. Asking only the places of the chunk before was tried first, and q01 has groups
+    /// of a row in every few chunks, so nearly every chunk fell back to the pass.
     ///
     /// # Errors
     ///
@@ -2867,18 +2872,28 @@ impl PlaceSums {
         let dropped = counts.get(map.len() * span).copied().unwrap_or(0);
         let rows = i64::try_from(self.added).unwrap_or(i64::MAX) - dropped;
         let mut found = 0;
-        self.touched.retain(|&place| {
+        self.touched.clear();
+        for &place in &self.seen {
             let count = if place < map.len() { counts[place * span] } else { 0 };
             found += count;
-            count != 0
-        });
+            if count != 0 {
+                self.touched.push(place);
+            }
+        }
         if found != rows {
             // Only the count of each place is read, as every `span`th cell, since asking each
             // place's cells whether it had rows was ten instructions a place.
             self.touched.clear();
+            if self.marked.len() < map.len() {
+                self.marked.resize(map.len(), false);
+            }
             for (place, &count) in counts.iter().step_by(span).take(map.len()).enumerate() {
                 if count != 0 {
                     self.touched.push(place);
+                    if !self.marked[place] {
+                        self.marked[place] = true;
+                        self.seen.push(place);
+                    }
                 }
             }
         }
@@ -6455,7 +6470,10 @@ mod tests {
             // finds its places among the first's, and the third is left one of them to ask first,
             // so its rows add up short and it looks at every place again.
             if chunk == 2 {
-                sums.touched.truncate(1);
+                let first = sums.seen[0];
+                sums.seen.truncate(1);
+                sums.marked.fill(false);
+                sums.marked[first] = true;
             }
             assert_eq!(sums.touched(&map).expect("looks"), chunk == 0, "chunk {chunk}");
             map[2] = 2;
