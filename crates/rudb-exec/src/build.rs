@@ -3896,9 +3896,10 @@ impl<'a> Building<'a, '_> {
                     self.close(below, own, Arc::new(collect));
                     filled.push(own);
                 }
-                let answer = Answer::new(shared, Schema::numbered(fields, index), fetches);
-                let schema = answer.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Consistent", None);
+                let answer = Answer::new(shared, Schema::numbered(fields, index), fetches)
+                    .watched(Arc::clone(&counters));
+                let schema = answer.schema().clone();
                 Segment {
                     source: Arc::new(Watched::new(answer, counters)),
                     streams: Vec::new(),

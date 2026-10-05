@@ -250,3 +250,29 @@ fn an_aggregate_over_one_table_is_left_alone_without_a_word() {
     let plan = explain(&database, "SELECT min(score), max(name) FROM a WHERE id > 10");
     assert!(!plan.contains("Consistent"), "{plan}");
 }
+
+#[test]
+fn analyze_says_whether_every_key_set_stayed_a_bitmap() {
+    // The JOB gate asserts every class is dense, which is every key set a bitmap with nothing in
+    // the hash set beside it. Keys from zero up all fit, and a negative key is the one that does
+    // not, on either side of the join whichever is read first.
+    let database = database();
+    let analyzed = |sql: &str| explain(&database, &format!("ANALYZE {sql}"));
+    let dense = "SELECT min(a.score), max(b.note) FROM a JOIN b ON b.a_id = a.id";
+    assert!(fires(&database, dense), "{}", explain(&database, dense));
+    let plan = analyzed(dense);
+    assert!(plan.contains("key sets all dense"), "{plan}");
+    for statement in [
+        "CREATE TABLE below (id INTEGER, v INTEGER)",
+        "CREATE TABLE under (id INTEGER, w INTEGER)",
+        "INSERT INTO below SELECT -r::INTEGER, r::INTEGER FROM range(1, 50) AS s(r)",
+        "INSERT INTO under SELECT -r::INTEGER, r::INTEGER FROM range(1, 90) AS s(r)",
+    ] {
+        database.execute(statement).unwrap_or_else(|error| panic!("{statement} failed: {error}"));
+    }
+    let spread = "SELECT min(below.v), max(under.w) FROM below JOIN under ON under.id = below.id";
+    assert!(fires(&database, spread), "{}", explain(&database, spread));
+    let plan = analyzed(spread);
+    assert!(plan.contains("keys hashed"), "{plan}");
+    assert_eq!(both(&database, spread), [[Value::Integer(1), Value::Integer(49)]]);
+}

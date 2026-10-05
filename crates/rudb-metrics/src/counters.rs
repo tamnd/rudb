@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rudb_common::{Cause, Spent, Stage, Tally};
 
-use crate::document::{Implementation, Joined, Memory, Operator, Reduced};
+use crate::document::{Implementation, Joined, KeySets, Memory, Operator, Reduced};
 
 /// The counters for one operator.
 #[derive(Debug)]
@@ -64,6 +64,8 @@ pub struct Counters {
     /// What a join's exact reduction left a scan, written once by whichever instance settles its
     /// tests first, for the reason `joined` is written once.
     reduced: OnceLock<Reduced>,
+    /// What a consistent reduction's key sets came to, written once by the source of its one row.
+    classes: OnceLock<KeySets>,
     /// One clock and one byte count per [`Stage`], in the order [`Stage::ALL`] lists them.
     ///
     /// Only a scan fills these in. Everything else reports a row of zeroes, which costs nothing to
@@ -98,6 +100,7 @@ impl Counters {
             high_water: AtomicU64::new(0),
             joined: OnceLock::new(),
             reduced: OnceLock::new(),
+            classes: OnceLock::new(),
             fallbacks: [const { AtomicU64::new(0) }; Cause::ALL.len()],
             stages: [const { AtomicU64::new(0) }; Stage::ALL.len()],
             stage_bytes: [const { AtomicU64::new(0) }; Stage::ALL.len()],
@@ -263,6 +266,12 @@ impl Counters {
         let _ = self.reduced.set(reduced);
     }
 
+    /// Records what a consistent reduction's key sets came to. The first call wins, as in
+    /// [`Counters::joining`].
+    pub fn classing(&self, classes: KeySets) {
+        let _ = self.classes.set(classes);
+    }
+
     /// What this operator holds now, which also moves the high water mark when it is a new most.
     ///
     /// Reported rather than added, because memory is a level and not a total. An operator that
@@ -306,6 +315,7 @@ impl Counters {
         };
         operator.joined = self.joined.get().cloned();
         operator.reduced = self.reduced.get().copied();
+        operator.classes = self.classes.get().copied();
         operator
     }
 }

@@ -480,6 +480,15 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
         }
         Some(reduced) => format!(", link kept {} of {} rows", reduced.kept, reduced.rows),
     };
+    // Which shape a reduction's key sets took, because a set that is not all bitmap is a class
+    // that lost its density and runs a hash probe a row where it ran a mask.
+    let classes = match &operator.classes {
+        None => String::new(),
+        Some(classes) if classes.hashed == 0 => format!(", {} key sets all dense", classes.sets),
+        Some(classes) => {
+            format!(", {} key sets with {} keys hashed", classes.sets, classes.hashed)
+        }
+    };
     // Both clocks, named, because one number here was read as the other three times. The wall
     // figure is the operator's elapsed time summed over its instances, so on a plan that runs eight
     // ways it can exceed the whole statement's CPU and is not a share of anything. The CPU figure is
@@ -492,7 +501,7 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
         format!("{} wall, {} cpu", duration(operator.wall_ns), duration(operator.cpu_ns))
     };
     format!(
-        "  [{} rows{after}, {spent}{joined}{skipped}{reduced}{memory}{slow}]",
+        "  [{} rows{after}, {spent}{joined}{skipped}{reduced}{classes}{memory}{slow}]",
         operator.rows_out
     )
 }
