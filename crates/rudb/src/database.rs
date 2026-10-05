@@ -2982,7 +2982,9 @@ fn mostly_live(
     let mut live = 0u64;
     for name in names {
         let reader = match catalog.table(name)?.rows() {
-            rudb_catalog::Rows::Native(reader) | rudb_catalog::Rows::Masked(reader, _) => reader,
+            rudb_catalog::Rows::Native(reader) => reader,
+            // Rows appended after the file's gone rows are written again with the rest of it.
+            rudb_catalog::Rows::Masked(reader, _, tail) if tail.is_empty() => reader,
             rudb_catalog::Rows::Grown(reader, _) if extended.contains_key(&name.table) => reader,
             _ => continue,
         };
