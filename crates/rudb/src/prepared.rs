@@ -800,7 +800,7 @@ impl Prepared {
     /// The point plans are `InsertOne t`, `InsertRows t`, `POINT Lookup t(key)`,
     /// `UpdateOne t(key) SET column`, `DeltaOne t(key) SET column`, `Range t(key)` and
     /// `Upsert t(key)`. They hold for values of the key's and the columns' types. Inside a
-    /// transaction all of them but an upsert take the short way, until the transaction aborts.
+    /// transaction all of them take the short way too, until the transaction aborts.
     /// A benchmark checks this before it measures, so a statement that would fall back to the
     /// pipeline is found out by name rather than by a slow number.
     #[must_use]

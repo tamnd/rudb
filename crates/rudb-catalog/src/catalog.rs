@@ -288,7 +288,9 @@ pub struct Catalog {
     /// caller that asked for a table that way is about to append to it or replace it. Handing out
     /// one number for two different states is the failure this has to avoid, so a method that might
     /// not change anything moves it anyway. Counting a change that did not happen costs a rebuild
-    /// nobody needed. Missing one serves a plan facts about a table that is no longer there.
+    /// nobody needed. Missing one serves a plan facts about a table that is no longer there. The
+    /// one exception is [`Catalog::table_noting`], which hands out a table only to keep what it
+    /// worked out about rows it already had.
     ///
     /// Never zero, so that zero can mean no catalog was ever read, which is what a set of facts
     /// assembled by hand in a test carries.
@@ -1577,6 +1579,22 @@ impl Catalog {
             .ok_or_else(|| missing_table(&name.table))?;
         table.touch_rows();
         Ok(table)
+    }
+
+    /// Table `name` to keep something it worked out about its own rows in, which changes nothing a
+    /// read of it answers. So neither the generation nor the table's revision moves, and a commit
+    /// does not take it for a write somebody else made, see [`Table::refuse_keys_since`].
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist.
+    pub fn table_noting(&mut self, name: &QualifiedName) -> Result<&mut Table> {
+        let schema = self.schema_mut(&name.catalog, &name.schema)?;
+        schema
+            .tables
+            .iter_mut()
+            .find(|held| same_name(&held.name().table, &name.table))
+            .ok_or_else(|| missing_table(&name.table))
     }
 
     /// Writes `values` over the columns `targets` of the row of table `name` at `spot`, `row`

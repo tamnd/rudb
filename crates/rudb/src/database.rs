@@ -4061,13 +4061,14 @@ impl Shared {
     /// that would not fit its column, goes through the plan whatever this says.
     pub(crate) fn point_plan(&self, shape: crate::prepared::Shape<'_>) -> Option<String> {
         use crate::prepared::Shape;
-        // Inside a transaction everything but an upsert skips the plan, and a write not in one
-        // that is read only. Nothing does in one that is aborted.
+        // Inside a transaction everything skips the plan, but a write not in one that is read
+        // only. Nothing does in one that is aborted.
         let refused = match self.open().as_ref() {
             Some(open) => match shape {
                 Shape::Lookup(_) | Shape::Range(_) => open.aborted,
-                Shape::Insert(_) | Shape::Write(_) => open.aborted || open.read_only,
-                Shape::Upsert(_) => true,
+                Shape::Insert(_) | Shape::Write(_) | Shape::Upsert(_) => {
+                    open.aborted || open.read_only
+                }
             },
             None => false,
         };
@@ -4136,16 +4137,20 @@ impl Shared {
     /// Runs a prepared upsert of one row without binding it, or says it cannot and leaves
     /// everything as it was, for [`Shared::execute_ast`] to run, see [`crate::prepared::Upsert`].
     ///
-    /// Outside a transaction only, and only while no transaction is open on the database. The
-    /// table has to be one a [`crate::prepared::Direct`] row goes straight into, with one key and
-    /// no unique index beside it, which is the key the statement names if it names one, and no
-    /// foreign key pointing at it. The row is worked out as an
-    /// insert's is and its key looked up. A row the table does not hold goes in as
-    /// [`Shared::insert_direct`] puts it in. A held row is left alone for `DO NOTHING` and
-    /// `OR IGNORE`, and otherwise takes its new values where it is, as [`Shared::write_point`]
-    /// writes it, as long as none of them is in the key. A value that is not already its column's
-    /// type or a widening of it, a sum that does not fit, or a null anywhere the table refuses one
-    /// goes the long way, so the plan says what it says about them.
+    /// The table has to be one a [`crate::prepared::Direct`] row goes straight into, with one key
+    /// and no unique index beside it, which is the key the statement names if it names one, and no
+    /// foreign key pointing at it. The row is worked out as an insert's is and its key looked up.
+    /// A row the table does not hold goes in as [`Shared::insert_direct`] puts it in. A held row is
+    /// left alone for `DO NOTHING` and `OR IGNORE`, and otherwise takes its new values where it is,
+    /// as [`Shared::write_point`] writes it, as long as none of them is in the key. A value that is
+    /// not already its column's type or a widening of it, a sum that does not fit, or a null
+    /// anywhere the table refuses one goes the long way, so the plan says what it says about them.
+    ///
+    /// Inside a transaction the row is the transaction's own, as for [`Shared::write_point`], and
+    /// noted as an insert or an update for the commit to rebase. A held row is claimed first
+    /// whenever a transaction is open anywhere, and one somebody else holds goes the long way. So
+    /// does a new key another transaction committed since the snapshot, which the plan's upsert
+    /// does not see and its commit refuses.
     pub(crate) fn upsert_point(
         &self,
         upsert: &crate::prepared::Upsert,
@@ -4156,10 +4161,12 @@ impl Shared {
         if !self.inner.writable {
             return None;
         }
-        let writing = self.writing();
-        if self.transacting() || self.registry().watched() {
-            return None;
-        }
+        // An aborted or read only transaction is refused by the plan, in its words.
+        let transacting = match self.open().as_ref() {
+            Some(open) if open.aborted || open.read_only => return None,
+            open => open.is_some(),
+        };
+        let writing = (!transacting).then(|| self.writing());
         let mut catalog = self.write();
         let (name, targets, key) = upsert_target(&catalog, upsert)?;
         let table = catalog.table(&name).ok()?;
@@ -4174,16 +4181,33 @@ impl Shared {
         let Some((spot, held)) = table.spot(&key, &values, &all).ok()?? else {
             // Nobody holds the key, so the row goes in.
             let staged = self.journals(&name).then(|| vec![row.clone()]);
+            let noted = if transacting {
+                let columns = fields
+                    .iter()
+                    .zip(&row)
+                    .map(|(field, value)| {
+                        Vector::from_values(field.ty.clone(), std::slice::from_ref(value))
+                    })
+                    .collect::<Result<Vec<_>>>();
+                let chunk = Chunk::new(columns.ok()?).ok()?;
+                self.refuse_keys_since(&catalog, &name, std::slice::from_ref(&chunk)).ok()?;
+                Some(chunk)
+            } else {
+                None
+            };
             let result = kept(sql, 0, |_| {
                 let table = catalog.table_appending(&name)?;
                 table.append_row(&row)?;
+                if let Some(chunk) = noted {
+                    self.wrote(table.oid(), |written, _| written.appended(&[chunk]));
+                }
                 if let Some(rows) = &staged {
                     self.stage_rows(&name, table.columns(), rows);
                 }
                 QueryResult::changed(1)
             });
             drop(catalog);
-            let settled = self.settle(writing);
+            let settled = writing.map_or(Ok(()), |writing| self.settle(writing));
             return Some(result.and_then(|result| settled.map(|()| result)));
         };
         let column = |written: &str| {
@@ -4252,6 +4276,13 @@ impl Shared {
         {
             return None;
         }
+        let watched = transacting || self.registry().watched();
+        let claim = if watched {
+            self.claim(table, false, &[spot.number], table.rows().len()).ok()?
+        } else {
+            None
+        };
+        let oid = table.oid();
         let mut columns = held.loosened().into_columns();
         for (&at, value) in sets.iter().zip(&written) {
             let ty = fields[at].ty.clone();
@@ -4275,6 +4306,12 @@ impl Shared {
                 unanswered = true;
                 return Err(Error::internal("an upsert the row cannot take where it is"));
             }
+            if let Some(marks) = claim {
+                self.claimed(oid, marks);
+            }
+            self.wrote(oid, |written, _| {
+                written.updated(&[spot.number], std::slice::from_ref(&image));
+            });
             if let Some(record) = staged
                 && let Some(journal) = self.journal().as_mut()
             {
@@ -4286,7 +4323,7 @@ impl Shared {
             return None;
         }
         drop(catalog);
-        let settled = self.settle(writing);
+        let settled = writing.map_or(Ok(()), |writing| self.settle(writing));
         Some(result.and_then(|result| settled.map(|()| result)))
     }
 
@@ -4597,7 +4634,7 @@ impl Shared {
         let mut committed = self.committed();
         let Some(now) = committed.tables().find(|table| table.oid() == oid) else { return Ok(()) };
         let now = now.name().clone();
-        committed.table_mut(&now)?.refuse_keys_since(before, chunks)
+        committed.table_noting(&now)?.refuse_keys_since(before, chunks)
     }
 
     /// Checks the rows at `flagged` of the table `oid`, which an update or a delete is about to
