@@ -371,7 +371,7 @@ pub(crate) fn retain_set(
     assert!(bytes.len() < 1 << 28 && range < 1 << 31 && (range as usize) < bits.len() * 64);
     assert!(first < 1 << 31 && shift.unsigned_abs() < 1 << 30);
     let Some(limit) = bytes.len().checked_sub(4) else { return (0, 0) };
-    let (mut kept, mut at) = (0, 0);
+    let (mut kept, mut at, start) = (0, 0, first as usize);
     // SAFETY: the build enables AVX2, which the `cfg` on this function checks. A group's rows are
     // read and its kept rows written inside `rows`, at `at` and at `kept`, which is never past it.
     // A code's gather is at a byte clamped to `limit`, so its four bytes are inside `bytes`, and a
@@ -388,7 +388,7 @@ pub(crate) fn retain_set(
         let top = _mm256_set1_epi32(limit as i32);
         while at + 8 <= rows.len() {
             let last = rows[at + 7] as usize;
-            if (first_bit(first) + last * width as usize) / 8 > limit {
+            if (start + last * width as usize) / 8 > limit {
                 break;
             }
             let row = _mm256_loadu_si256(rows.as_ptr().add(at).cast());
