@@ -87,12 +87,13 @@
 //! answers the first chunk it is given with [`Progress::Done`], which stops its scan.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_catalog::Table;
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Value};
 use rudb_kernels::aggregate::Accumulator;
+use rudb_metrics::{Counters, KeySets};
 use rudb_pipeline::{Lease, Morsel, Progress, Sink, Source};
 use rudb_plan::Reducer;
 use rudb_vector::{Chunk, Selection, Vector};
@@ -284,6 +285,10 @@ pub(crate) struct Reduction {
     finished: AtomicUsize,
     /// The answer of the second sweep, when the last relation to finish ran it.
     answered: Mutex<Option<Option<Vec<Accumulator>>>>,
+    /// How many key sets the two sweeps finished, and how many keys of them were outside the
+    /// bitmap, for `EXPLAIN ANALYZE`. See [`KeySets`].
+    sets: AtomicU64,
+    hashed: AtomicU64,
 }
 
 impl Reduction {
@@ -397,6 +402,8 @@ impl Reduction {
             memory: memory.clone(),
             finished: AtomicUsize::new(0),
             answered: Mutex::new(None),
+            sets: AtomicU64::new(0),
+            hashed: AtomicU64::new(0),
         })
     }
 
@@ -407,6 +414,13 @@ impl Reduction {
     }
 
     /// What the roots have folded in so far, which is where the second sweep starts from.
+    /// Counts a finished key set, and the keys of it the bitmap did not take.
+    fn tally(&self, keys: &Keys) {
+        self.sets.fetch_add(1, Ordering::Relaxed);
+        let hashed = u64::try_from(keys.spread.len()).unwrap_or(u64::MAX);
+        self.hashed.fetch_add(hashed, Ordering::Relaxed);
+    }
+
     fn accumulators(&self) -> Result<Vec<Accumulator>> {
         let held = self.extremes.lock().map_err(poisoned)?;
         Ok(held.clone())
@@ -638,6 +652,14 @@ impl Sink for Collect<'_> {
         }
         let up = std::mem::take(&mut *shared.gathering[self.at].lock().map_err(poisoned)?);
         let published = std::mem::take(&mut *shared.publishing[self.at].lock().map_err(poisoned)?);
+        if role.parent.is_some() {
+            shared.tally(&up);
+        }
+        for (&(key, _), keys) in role.published.iter().zip(&published) {
+            if Some(key) != role.parent {
+                shared.tally(keys);
+            }
+        }
         let mut feeds = self.feeds.iter();
         for ((key, readers), keys) in role.published.iter().zip(&published) {
             let keys = if Some(*key) == role.parent { &up } else { keys };
@@ -655,6 +677,7 @@ impl Sink for Collect<'_> {
             for &(child, _) in &role.down {
                 let allowed =
                     std::mem::take(&mut *shared.allowing[child].lock().map_err(poisoned)?);
+                shared.tally(&allowed);
                 let _ = shared.allowed[child].set(allowed);
             }
         }
@@ -786,6 +809,8 @@ pub(crate) struct Answer<'a> {
     one: Handout,
     /// Per extreme, the table and column it is read from when it is read late.
     fetches: Vec<Option<(&'a Table, usize)>>,
+    /// Where the shape of the key sets is reported, when the plan is watched.
+    counters: Option<Arc<Counters>>,
 }
 
 impl<'a> Answer<'a> {
@@ -796,7 +821,14 @@ impl<'a> Answer<'a> {
         schema: Schema,
         fetches: Vec<Option<(&'a Table, usize)>>,
     ) -> Self {
-        Self { shared, schema, one: Handout::new(1), fetches }
+        Self { shared, schema, one: Handout::new(1), fetches, counters: None }
+    }
+
+    /// Reports the shape of the key sets. See [`KeySets`].
+    #[must_use]
+    pub(crate) fn watched(mut self, counters: Arc<Counters>) -> Self {
+        self.counters = Some(counters);
+        self
     }
 
     /// What this produces, which is one column per extreme.
@@ -1032,6 +1064,7 @@ fn sweep(
             return Ok(None);
         }
         for (&(child, _), keys) in role.down.iter().zip(swept.down) {
+            shared.tally(&keys);
             allowed[child] = Some(keys);
         }
     }
@@ -1049,6 +1082,12 @@ impl Source for Answer<'_> {
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let answered = self.answer()?;
+        if let Some(counters) = &self.counters {
+            counters.classing(KeySets {
+                sets: self.shared.sets.load(Ordering::Relaxed),
+                hashed: self.shared.hashed.load(Ordering::Relaxed),
+            });
+        }
         let mut columns = Vec::with_capacity(self.shared.types.len());
         for (at, ty) in self.shared.types.iter().enumerate() {
             let value = match &answered {

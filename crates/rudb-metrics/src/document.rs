@@ -317,6 +317,13 @@ impl Document {
                             out.flag("by_key", reduced.by_key);
                         });
                     }
+                    if let Some(classes) = &operator.classes {
+                        out.key("classes");
+                        out.object(|out| {
+                            out.count("sets", classes.sets);
+                            out.count("hashed", classes.hashed);
+                        });
+                    }
                 });
             }
         });
@@ -821,6 +828,24 @@ pub struct Operator {
     /// Nothing for every other operator, and nothing for a scan whose join had no stored link to
     /// reduce it with. See [`Reduced`].
     pub reduced: Option<Reduced>,
+    /// The key sets a consistent reduction built, and how many keys of them fell outside the
+    /// bitmap. Nothing for every other operator. See [`KeySets`].
+    pub classes: Option<KeySets>,
+}
+
+/// The key sets a consistent reduction built for its classes, and what shape they took.
+///
+/// A set is a bitmap over the keys from zero up to a limit, and a key past the limit or below zero
+/// goes in a hash set beside it. A set whose keys all fit is dense, its test is a shift, a load and
+/// a mask, and its set can be handed to a scan to skip rows with. A key that did not fit means the
+/// class lost that, which on JOB would be an identifier column that is no longer the run of
+/// numbers from one up, so the JOB gate asserts `hashed` is zero on every query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeySets {
+    /// How many key sets the two sweeps built.
+    pub sets: u64,
+    /// How many keys, over all of them, went in a hash set rather than the bitmap.
+    pub hashed: u64,
 }
 
 /// What pushing a join's build side through a stored link left the scan under it.
@@ -959,6 +984,7 @@ impl Operator {
             reference_impl: false,
             joined: None,
             reduced: None,
+            classes: None,
         }
     }
 
