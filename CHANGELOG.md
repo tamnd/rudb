@@ -8,6 +8,16 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.25
+
+For J7, the load. #2522 settles a dictionary payload only on a shape that fits its sample, #2536 keeps LZ on a dictionary payload only where it takes a third off the bytes, #2537 looks a block of keys up in a permuted key map without a call a key, and #2538 measures a link too big for what its table has left without building it. On server2 the JOB load goes from 202 s down to 172 to 175 s, its processor time from 165 to 153 s, `person_info` from 24 to 16 s and the last checkpoint from 37 to 23 to 26 s. #2523 looks up the held keys of a chunk whose keys are in order, #2530 compares a chunk's packed blocks with a range in one call, and #2521 adds up q01's totals straight into each row's slot.
+
+On compatibility, #2524 runs CREATE MACRO and DROP MACRO the way the pin does, #2526 keeps macros in a database file, #2534 picks typed macro overloads the way the pin does, and #2515 adds SQLSTATE codes and the ErrorResponse fields to the error type.
+
+The PostgreSQL wire protocol starts here. #2517 ranks the PostgreSQL crates and allows the TLS licenses for rudb-server, #2525 adds rudb-pgwire with the frames and the message set of the protocol, #2527 answers the startup packets the way PostgreSQL does, #2528 adds password, md5 and SCRAM-SHA-256 authentication, #2529 keeps the session state of the main loop with the skip to Sync, #2531 takes the command tags from the vendored cmdtaglist.h, #2532 keeps statements and portals by name and binds values one by one, #2533 adds the cancel key and the check of CancelRequest, and #2535 adds two fuzz targets for its codec. #2485 fixes the clippy errors that blocked the release gate.
+
+The native directory format number stays at 31 and the storage format version at 9. #2526 keeps a macro in a file's list of views, under a name no view can have.
+
 ## 0.8.24
 
 For J7, the load. #2486 measures a coded text column from its codes, sketches each dictionary value once and builds the pieces of a graph link side by side, and #2514 looks a block of keys up in a dense key map, looks keys behind runs or a dictionary with a null up a distinct value at a time, reads a packed link's degrees off its adjacency and packs linear bit runs a word at a time. #2516 holds an integer column's primary keys as a bitmap over their range rather than a hash set, #2518 counts every caller feeding a load as busy so stripes stop starting threads on top of the parsers, and #2519 builds a checkpoint's text sections beside its links rather than after them. On server2 the JOB load goes from 266 to 285 s down to 188 s and its last checkpoint from 60 to 71 s down to 27 s.
