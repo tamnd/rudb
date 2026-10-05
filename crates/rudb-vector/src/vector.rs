@@ -4657,6 +4657,20 @@ impl Packed<'_> {
         kept
     }
 
+    /// The bytes from this vector's first block on, and how many whole blocks of them the lanes
+    /// can read with the slack [`crate::lanes::readable`] asks for after the last one.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn lane_bytes(&self) -> (&[u8], usize) {
+        let width = self.width as usize;
+        let start = self.offset / 64 * width * size_of::<u64>();
+        let bytes = crate::lanes::bytes_of(self.words).get(start..).unwrap_or_default();
+        let blocks = bytes
+            .len()
+            .checked_sub(crate::lanes::readable(width))
+            .map_or(0, |room| room / (8 * width) + 1);
+        (bytes, blocks)
+    }
+
     /// Each word of `words` set or narrowed to the rows of its block where this vector's code
     /// stands in `test` to `other`'s code plus `shift`, word `b` answering rows `64 * b` on.
     ///
@@ -4690,16 +4704,7 @@ impl Packed<'_> {
                 && lanes.contains(&one)
                 && lanes.contains(&two)
             {
-                let bytes = |packed: &Self, width: usize| {
-                    let start = packed.offset / 64 * width * size_of::<u64>();
-                    let bytes = crate::lanes::bytes_of(packed.words).get(start..).unwrap_or_default();
-                    let blocks = bytes
-                        .len()
-                        .checked_sub(crate::lanes::readable(width))
-                        .map_or(0, |room| room / (8 * width) + 1);
-                    (bytes, blocks)
-                };
-                let ((left, first), (right, second)) = (bytes(self, one), bytes(other, two));
+                let ((left, first), (right, second)) = (self.lane_bytes(), other.lane_bytes());
                 done = first.min(second).min(words.len());
                 let (left, right, words) = ((left, one), (right, two), &mut words[..done]);
                 match test {
