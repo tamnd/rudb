@@ -129,7 +129,7 @@ pub use appender::Appender;
 pub use config::{Config, parse_size};
 pub use connection::{Connection, Transaction};
 pub use database::{Database, NativeExtremaValues};
-pub use prepared::Prepared;
+pub use prepared::{Description, Prepared};
 pub use result::QueryResult;
 pub use statements::{Statement, is_complete, statements};
 pub use syntax::{

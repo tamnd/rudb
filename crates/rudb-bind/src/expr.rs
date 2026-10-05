@@ -17,7 +17,7 @@ use rudb_common::{
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
 use rudb_parse::{Ast, NONE};
-use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
+use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan};
 
 use crate::binder::{AliasClause, Binder, PendingSubquery, WindowCall};
 use crate::fold;
@@ -531,6 +531,22 @@ impl Binder<'_> {
     /// the optimizer gets to fold and prune with the values in hand.
     fn bind_parameter(&mut self, ast: &Ast, name: ast::StrRef) -> Result<ExprRef> {
         let name = ast.string(name);
+        if self.parameters.get(name).is_none()
+            && let Some(placeholders) = self.parameters.placeholders()
+            && let Some(declared) = placeholders.declared(name)
+        {
+            let null = self.add_constant(Value::Null);
+            return Ok(match declared {
+                Some(ty) => {
+                    placeholders.resolve(name, &ty);
+                    self.cast_to(null, &ty)
+                }
+                None => {
+                    self.placeholders.push((null, name.to_string()));
+                    null
+                }
+            });
+        }
         let Some(value) = self.parameters.get(name) else {
             return Err(Error::invalid_input(
                 "Prepared statement parameters cannot be used directly\nTo use prepared statement \
@@ -2411,6 +2427,7 @@ impl Binder<'_> {
         if self.plan().expr_type(expr) == ty {
             return expr;
         }
+        self.resolve_placeholder(expr, ty);
         self.add_expr(Expr::Cast { input: expr, try_cast: false }, ty.clone())
     }
 
@@ -2434,7 +2451,44 @@ impl Binder<'_> {
             return Ok(expr);
         }
         struct_members_meet(from, ty)?;
+        self.resolve_placeholder(expr, ty);
         Ok(self.add_expr(Expr::Cast { input: expr, try_cast }, ty.clone()))
+    }
+
+    /// Gives the parameter `expr` stands for the type `ty`, when `expr` is the null of a parameter
+    /// of no known type and the statement is being described.
+    ///
+    /// A column is followed back to the projection or the `VALUES` that makes it, since that is
+    /// how a parameter in a `SET`, in an `INSERT ... SELECT` or in a `VALUES` of several rows gets
+    /// to the cast to the type of the column it is written to.
+    fn resolve_placeholder(&self, expr: ExprRef, ty: &LogicalType) {
+        let Some(placeholders) = self.parameters.placeholders() else { return };
+        if self.placeholders.is_empty() {
+            return;
+        }
+        let mut pending = vec![expr];
+        while let Some(expr) = pending.pop() {
+            if let Some((_, name)) = self.placeholders.iter().find(|(held, _)| *held == expr) {
+                placeholders.resolve(name, ty);
+                continue;
+            }
+            let Expr::Column(binding) = self.plan().expr(expr) else { continue };
+            let plan = self.plan();
+            let column = binding.column as usize;
+            for node in 0..plan.node_count() {
+                match plan.node(node as NodeRef) {
+                    Node::Project { index, exprs, .. } if *index == binding.table => {
+                        pending.extend(plan.expr_list(*exprs).get(column));
+                    }
+                    Node::Values { index, rows, .. } if *index == binding.table => {
+                        for &row in plan.row_list(*rows) {
+                            pending.extend(plan.expr_list(row).get(column));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// A comparison, with both sides brought to the type they meet at.
