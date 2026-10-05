@@ -412,6 +412,28 @@ fn a_string_type_with_a_length_cuts_on_a_cast_and_refuses_a_long_value_on_a_stor
     server.stop().unwrap();
 }
 
+#[test]
+fn an_oid_alias_type_and_a_vector_type_read_and_print_as_in_postgresql() {
+    let dirs = Dirs::new("regtype");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+
+    assert_eq!(scalar(&mut client, "select 'int4'::regtype"), "integer");
+    assert_eq!(scalar(&mut client, "select '_text'::regtype"), "text[]");
+    assert_eq!(scalar(&mut client, "select 23::regtype"), "integer");
+    assert_eq!(scalar(&mut client, "select '-'::regclass"), "-");
+    assert_eq!(scalar(&mut client, "select ' 1  2 3'::int2vector"), "1 2 3");
+    assert_eq!(scalar(&mut client, "select '23 25'::oidvector"), "23 25");
+    let messages = client.query("select 'int4'::regtype, '1'::int2vector, '1'::oidvector");
+    assert_eq!(row_shape(&messages[0]).iter().map(|c| c.1).collect::<Vec<_>>(), [2206, 22, 30]);
+    let messages = client.query("select 'nope'::regtype");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("42704"));
+    assert_eq!(messages[0].field(b'M').as_deref(), Some("type \"nope\" does not exist"));
+    server.stop().unwrap();
+}
+
 /// The row description of a message.
 fn row_shape(message: &Message) -> Vec<(String, u32, i16)> {
     let bytes = message.decoded();
