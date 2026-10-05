@@ -7100,7 +7100,10 @@ fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_sa
     // Four thousand customers fit in any cache there is, so the rule declines them, which is the
     // rule working rather than the pass failing. The setting is what a test uses to ask about the
     // other side of the crossover without writing a parent that really does not fit.
-    let sql = "SELECT count(*), sum(o_orderkey) FROM orders JOIN customer ON o_custkey = c_custkey";
+    // The query reads a column of the parent, because a join that reads none of it finds the
+    // parent by its key map whatever its size, which is `rudb_opt::link::Why::Keyed`.
+    let sql = "SELECT count(*), sum(o_orderkey), max(c_name) FROM orders JOIN customer \
+               ON o_custkey = c_custkey";
     let explained = |db: &Database, sql: &str| match db
         .query(&format!("EXPLAIN {sql}"))
         .expect("the explain ran")
@@ -7114,10 +7117,8 @@ fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_sa
     // Section 6.7. The reason is on the line, with the two numbers the rule read, so a reader who
     // expected a link join finds out it was the size of the parent and not a missing link.
     assert!(
-        plan.contains(
-            "[builds a hash table, because the parent is 4000 rows and 16000 bytes \
-             projected, which fits in cache]"
-        ),
+        plan.contains("[builds a hash table, because the parent is 4000 rows and ")
+            && plan.contains(" bytes projected, which fits in cache]"),
         "the plan does not say why it built a hash table:\n{plan}"
     );
 
@@ -7154,7 +7155,7 @@ fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_sa
     std::fs::remove_file(&path).ok();
 }
 
-/// The query above joins to the parent and reads no column of it, so the gather never runs.
+/// A join to the parent that reads no column of it never runs the gather.
 ///
 /// That is not a contrived shape, it is the shape a foreign key join takes when the parent is only
 /// there to filter, and it is worth having a test of. It is also the reason the link join shipped
@@ -7922,7 +7923,7 @@ fn related_integer_sums_keep_null_and_empty_rules() {
 /// to shuffle the order of anything that depends on it and small enough not to matter on a busy
 /// machine.
 fn threaded(threads: usize) -> Database {
-    Database::with_config(Config::new().with_threads(threads).unwrap())
+    Database::with_config(Config::new().with_threads(threads).unwrap().with_yielding(false))
 }
 
 #[test]

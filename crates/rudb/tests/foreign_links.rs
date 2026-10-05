@@ -20,6 +20,12 @@ const TABLES: [&str; 4] = [
 const QUERY: &str = "SELECT extract(year FROM o_orderdate) AS y, sum(l_quantity), count(*) FROM \
                      lineitem, orders WHERE l_orderkey = o_orderkey GROUP BY y ORDER BY y";
 
+/// Whether a plan joins by the link, read through the link itself or, for a parent whose keys
+/// are its row numbers, through the key map.
+fn linked(plan: &str) -> bool {
+    plan.contains("reads the link") || plan.contains("reads the key map")
+}
+
 struct File(std::path::PathBuf);
 
 impl Drop for File {
@@ -63,12 +69,12 @@ fn a_foreign_key_is_a_link_the_plan_reads() {
     // Off: the same file, a hash join and the answer to hold the link to.
     db.execute("SET graph_sections = false").expect("off");
     let wanted = rows(&db, QUERY);
-    assert!(!plan(&db).contains("reads the link"), "{}", plan(&db));
+    assert!(!linked(&plan(&db)), "{}", plan(&db));
 
     // On, with a cache small enough that a table of forty thousand orders does not fit in it.
     db.execute("SET graph_sections = true").expect("on");
     db.execute("SET graph_cache_bytes = 1024").expect("a small cache");
-    assert!(plan(&db).contains("reads the link"), "{}", plan(&db));
+    assert!(linked(&plan(&db)), "{}", plan(&db));
     for threads in [1, 4] {
         db.execute(&format!("SET threads = {threads}")).expect("threads");
         assert_eq!(rows(&db, QUERY), wanted, "{threads} threads");
@@ -109,11 +115,11 @@ fn a_link_declared_for_one_session_is_known_to_every_later_one() {
 
     db.execute("SET graph_sections = false").expect("off");
     let wanted = rows(&db, QUERY);
-    assert!(!plan(&db).contains("reads the link"), "{}", plan(&db));
+    assert!(!linked(&plan(&db)), "{}", plan(&db));
 
     db.execute("SET graph_sections = true").expect("on");
     db.execute("SET graph_cache_bytes = 1024").expect("a small cache");
-    assert!(plan(&db).contains("reads the link"), "{}", plan(&db));
+    assert!(linked(&plan(&db)), "{}", plan(&db));
     for threads in [1, 4] {
         db.execute(&format!("SET threads = {threads}")).expect("threads");
         assert_eq!(rows(&db, QUERY), wanted, "{threads} threads");

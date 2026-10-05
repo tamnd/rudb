@@ -39,6 +39,7 @@ pub struct Config {
     read_only: bool,
     parquet_mirror: bool,
     mirror_rows: u64,
+    yielding: bool,
 }
 
 impl Default for Config {
@@ -56,6 +57,7 @@ impl Default for Config {
                 .ok()
                 .and_then(|rows| rows.parse().ok())
                 .unwrap_or(MIRROR_ROWS),
+            yielding: true,
         }
     }
 }
@@ -159,6 +161,21 @@ impl Config {
     #[must_use]
     pub fn with_mirror_rows(mut self, rows: u64) -> Self {
         self.mirror_rows = rows;
+        self
+    }
+
+    /// Whether a query borrows only the cores sitting idle, rather than as many threads as the
+    /// setting allows. On unless turned off. See `rudb_pipeline::Pool::yielding` for why.
+    #[must_use]
+    pub fn yielding(&self) -> bool {
+        self.yielding
+    }
+
+    /// The same settings, borrowing only idle cores or not. A test that counts the workers a query
+    /// ran on turns it off, so it counts the same on a small machine or a busy one.
+    #[must_use]
+    pub fn with_yielding(mut self, on: bool) -> Self {
+        self.yielding = on;
         self
     }
 
