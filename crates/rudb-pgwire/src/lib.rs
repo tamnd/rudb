@@ -44,21 +44,19 @@
 //! [`CommandTag`], the tags of `cmdtaglist.h` at the pin, and [`OutBuf::command_tag`], which
 //! writes `CommandComplete` with the row count where PostgreSQL shows one.
 //!
+//! [`Statements`] and [`Portals`], the prepared statements and the portals of a session by name,
+//! with the errors of PostgreSQL. [`Bind::params`] and [`FunctionCall::args`] give the values one
+//! by one, so the server can convert each value before it reads the next, as PostgreSQL does.
+//!
 //! # What is not here yet
 //!
-//! The state of statements and portals in the extended flow, and the cancel
-//! key. They come in the next steps of milestone PG1, in this order.
+//! The cancel key. It comes in the next step of milestone PG1.
 //!
 //! # Known differences
 //!
 //! [`verify_password`] does not apply SASLprep to a clear text password before it checks a SCRAM
 //! secret. Only a password that is valid UTF-8 with characters outside ASCII can pass in
 //! PostgreSQL and fail in rudb.
-//!
-//! [`Bind::body`] checks the length of every value before the server converts any of them.
-//! PostgreSQL reads and converts the values one by one, so a `Bind` with a bad value in its first
-//! parameter and a length past the end in its second gets the conversion error from PostgreSQL
-//! and `08P01` from rudb. A client that follows the protocol cannot send such a message.
 
 mod auth;
 mod backend;
@@ -69,6 +67,7 @@ mod error;
 mod frame;
 mod frontend;
 mod generated;
+mod names;
 mod reader;
 mod session;
 mod startup;
@@ -89,9 +88,10 @@ pub use frame::{
     split_startup,
 };
 pub use frontend::{
-    Bind, BindBody, Formats, Frontend, FunctionCall, FunctionCallBody, Oids, Target, ValueIter,
-    Values, encode_oids,
+    Bind, BindBody, BindParams, CallArgs, Formats, Frontend, FunctionCall, FunctionCallBody, Oids,
+    Target, ValueIter, Values, encode_oids,
 };
+pub use names::{Portals, Statements};
 pub use reader::verify_utf8;
 pub use session::{Read, Session};
 pub use startup::{Encryption, Handshake, NAME_LIMIT, Replication, StartupRequest, Step};

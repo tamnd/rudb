@@ -311,7 +311,7 @@ impl<'a> Iterator for ValueIter<'a> {
             return None;
         }
         self.left -= 1;
-        // `Values` exists only after `read_values` checked these reads, so they do not fail.
+        // `Values` exists only after `ValueReader::all` checked these reads, so they do not fail.
         match self.reader.i32() {
             Ok(-1) => Some(None),
             Ok(len) => self.reader.bytes(len).ok().map(Some),
@@ -326,31 +326,60 @@ impl<'a> Iterator for ValueIter<'a> {
 
 impl ExactSizeIterator for ValueIter<'_> {}
 
-/// Reads `count` values and checks each length. A `Bind` reads a length below -1 as a length
-/// that is too long, and a `FunctionCall` has its own text for it.
-fn read_values<'a>(
-    r: &mut Reader<'a>,
-    count: usize,
+/// Reads values one by one, as `exec_bind_message` and `parse_fcall_arguments` do. A `Bind`
+/// reads a length below -1 as a length that is too long, and a `FunctionCall` has its own text
+/// for it. After an error the reader gives no more values.
+#[derive(Debug, Clone)]
+struct ValueReader<'a> {
+    reader: Reader<'a>,
+    left: usize,
     function_call: bool,
-) -> Result<Values<'a>, ProtocolError> {
-    let start = r.clone().rest();
-    let before = r.remaining();
-    for _ in 0..count {
-        let len = r.i32()?;
-        if len == -1 {
-            continue;
+}
+
+impl<'a> ValueReader<'a> {
+    fn next(&mut self) -> Option<Result<Option<&'a [u8]>, ProtocolError>> {
+        if self.left == 0 {
+            return None;
         }
-        if function_call && len < -1 {
+        self.left -= 1;
+        let value = self.read();
+        if value.is_err() {
+            self.left = 0;
+        }
+        Some(value)
+    }
+
+    fn read(&mut self) -> Result<Option<&'a [u8]>, ProtocolError> {
+        let len = self.reader.i32()?;
+        if len == -1 {
+            return Ok(None);
+        }
+        if self.function_call && len < -1 {
             return Err(ProtocolError::error(format!(
                 "invalid argument size {len} in function call message"
             )));
         }
-        r.bytes(len)?;
+        self.reader.bytes(len).map(Some)
     }
-    Ok(Values { bytes: &start[..before - r.remaining()], count })
+
+    /// Reads the values that the caller did not read, and gives the reader after them.
+    fn finish(mut self) -> Result<Reader<'a>, ProtocolError> {
+        while let Some(value) = self.next() {
+            value?;
+        }
+        Ok(self.reader)
+    }
+
+    /// Reads all the values and gives them as [`Values`].
+    fn all(self) -> Result<(Values<'a>, Reader<'a>), ProtocolError> {
+        let (start, count) = (self.reader.clone().rest(), self.left);
+        let reader = self.finish()?;
+        let bytes = &start[..start.len() - reader.remaining()];
+        Ok((Values { bytes, count }, reader))
+    }
 }
 
-/// A `Bind`, with the names read and the rest kept for [`Bind::body`].
+/// A `Bind`, with the names read and the rest kept for [`Bind::params`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bind<'a> {
     pub portal: &'a [u8],
@@ -358,7 +387,7 @@ pub struct Bind<'a> {
     rest: &'a [u8],
 }
 
-/// The rest of a `Bind`.
+/// The rest of a `Bind`, read at one time by [`Bind::body`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BindBody<'a> {
     pub formats: Formats<'a>,
@@ -366,17 +395,61 @@ pub struct BindBody<'a> {
     pub result_formats: Formats<'a>,
 }
 
-impl<'a> Bind<'a> {
-    /// Reads the formats, the values and the result formats.
+/// The parameters of a `Bind` after the counts are checked. It gives the values one by one, and
+/// [`BindParams::finish`] reads the result formats and the end of the message.
+#[derive(Debug, Clone)]
+pub struct BindParams<'a> {
+    pub formats: Formats<'a>,
+    values: ValueReader<'a>,
+}
+
+impl<'a> Iterator for BindParams<'a> {
+    type Item = Result<Option<&'a [u8]>, ProtocolError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.values.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.values.left, Some(self.values.left))
+    }
+}
+
+impl ExactSizeIterator for BindParams<'_> {}
+
+impl<'a> BindParams<'a> {
+    /// Reads the values that are left, the result formats and the end of the message.
     ///
-    /// `params` is the number of parameters of the statement. PostgreSQL checks the counts after
-    /// it reads the formats and before it reads the values, so this does the same.
+    /// # Errors
+    ///
+    /// The read errors of [`Frontend::parse`].
+    pub fn finish(self) -> Result<Formats<'a>, ProtocolError> {
+        let mut r = self.values.finish()?;
+        result_formats(&mut r)
+    }
+}
+
+fn result_formats<'a>(r: &mut Reader<'a>) -> Result<Formats<'a>, ProtocolError> {
+    let count = r.u16()?;
+    let formats = Formats(r.bytes(i32::from(count) * 2)?);
+    r.end()?;
+    Ok(formats)
+}
+
+impl<'a> Bind<'a> {
+    /// Reads the parameter formats and the number of values, and checks them.
+    ///
+    /// `params` is the number of parameters of the statement. PostgreSQL checks the counts
+    /// after it reads the formats, then it checks for an aborted transaction and makes the
+    /// portal, and only then it reads the values, and it converts each value before it reads the
+    /// next. The server does the same steps with the [`BindParams`] that this gives, so a `Bind`
+    /// gets the same first error from rudb as from PostgreSQL.
     ///
     /// # Errors
     ///
     /// The text of `exec_bind_message` for counts that do not agree, and the read errors of
     /// [`Frontend::parse`].
-    pub fn body(&self, params: usize) -> Result<BindBody<'a>, ProtocolError> {
+    pub fn params(&self, params: usize) -> Result<BindParams<'a>, ProtocolError> {
         let mut r = Reader::new(self.rest);
         let count = r.u16()?;
         let formats = Formats(r.bytes(i32::from(count) * 2)?);
@@ -393,10 +466,22 @@ impl<'a> Bind<'a> {
                 String::from_utf8_lossy(self.statement)
             )));
         }
-        let values = read_values(&mut r, values, false)?;
-        let count = r.u16()?;
-        let result_formats = Formats(r.bytes(i32::from(count) * 2)?);
-        r.end()?;
+        let values = ValueReader { reader: r, left: values, function_call: false };
+        Ok(BindParams { formats, values })
+    }
+
+    /// Reads the formats, the values and the result formats at one time, with the checks of
+    /// [`Bind::params`]. It checks the length of every value before the server converts any of
+    /// them, so a `Bind` with two bad values can get a different first error than from
+    /// PostgreSQL. A client that follows the protocol cannot send such a message.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Bind::params`] and [`BindParams::finish`].
+    pub fn body(&self, params: usize) -> Result<BindBody<'a>, ProtocolError> {
+        let BindParams { formats, values } = self.params(params)?;
+        let (values, mut r) = values.all()?;
+        let result_formats = result_formats(&mut r)?;
         Ok(BindBody { formats, values, result_formats })
     }
 
@@ -417,14 +502,14 @@ impl<'a> Bind<'a> {
     }
 }
 
-/// A `FunctionCall`, with the OID read and the rest kept for [`FunctionCall::body`].
+/// A `FunctionCall`, with the OID read and the rest kept for [`FunctionCall::args`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FunctionCall<'a> {
     pub oid: u32,
     rest: &'a [u8],
 }
 
-/// The rest of a `FunctionCall`.
+/// The rest of a `FunctionCall`, read at one time by [`FunctionCall::body`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FunctionCallBody<'a> {
     pub formats: Formats<'a>,
@@ -432,16 +517,53 @@ pub struct FunctionCallBody<'a> {
     pub result_format: i16,
 }
 
-impl<'a> FunctionCall<'a> {
-    /// Reads the formats, the arguments and the result format.
-    ///
-    /// `args` is the number of arguments of the function, which `parse_fcall_arguments` in
-    /// `src/backend/tcop/fastpath.c` checks before it reads them.
+/// The arguments of a `FunctionCall` after the counts are checked. It gives the arguments one
+/// by one, and [`CallArgs::finish`] reads the result format and the end of the message.
+#[derive(Debug, Clone)]
+pub struct CallArgs<'a> {
+    pub formats: Formats<'a>,
+    args: ValueReader<'a>,
+}
+
+impl<'a> Iterator for CallArgs<'a> {
+    type Item = Result<Option<&'a [u8]>, ProtocolError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.args.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.args.left, Some(self.args.left))
+    }
+}
+
+impl ExactSizeIterator for CallArgs<'_> {}
+
+impl CallArgs<'_> {
+    /// Reads the arguments that are left, the result format and the end of the message.
     ///
     /// # Errors
     ///
     /// The texts of `parse_fcall_arguments`, and the read errors of [`Frontend::parse`].
-    pub fn body(&self, args: usize) -> Result<FunctionCallBody<'a>, ProtocolError> {
+    pub fn finish(self) -> Result<i16, ProtocolError> {
+        let mut r = self.args.finish()?;
+        let format = r.i16()?;
+        r.end()?;
+        Ok(format)
+    }
+}
+
+impl<'a> FunctionCall<'a> {
+    /// Reads the argument formats and the number of arguments, and checks them.
+    ///
+    /// `args` is the number of arguments of the function. `parse_fcall_arguments` in
+    /// `src/backend/tcop/fastpath.c` checks the counts after the lookup of the function and the
+    /// permission checks, and it converts each argument before it reads the next.
+    ///
+    /// # Errors
+    ///
+    /// The texts of `parse_fcall_arguments`, and the read errors of [`Frontend::parse`].
+    pub fn args(&self, args: usize) -> Result<CallArgs<'a>, ProtocolError> {
         let mut r = Reader::new(self.rest);
         let count = r.u16()?;
         let formats = Formats(r.bytes(i32::from(count) * 2)?);
@@ -457,7 +579,19 @@ impl<'a> FunctionCall<'a> {
                 formats.len()
             )));
         }
-        let args = read_values(&mut r, given, true)?;
+        let args = ValueReader { reader: r, left: given, function_call: true };
+        Ok(CallArgs { formats, args })
+    }
+
+    /// Reads the formats, the arguments and the result format at one time, with the checks of
+    /// [`FunctionCall::args`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`FunctionCall::args`] and [`CallArgs::finish`].
+    pub fn body(&self, args: usize) -> Result<FunctionCallBody<'a>, ProtocolError> {
+        let CallArgs { formats, args } = self.args(args)?;
+        let (args, mut r) = args.all()?;
         let result_format = r.i16()?;
         r.end()?;
         Ok(FunctionCallBody { formats, args, result_format })
@@ -617,6 +751,61 @@ mod tests {
         rest.extend_from_slice(&[0, 0, 9]);
         let bind = Bind { portal: b"", statement: b"", rest: &rest };
         assert_eq!(bind.body(1).unwrap_err().message, "invalid message format");
+    }
+
+    #[test]
+    fn bind_params_give_the_values_one_by_one() {
+        // A text value that the server cannot convert, then a length past the end. PostgreSQL
+        // converts the first value before it reads the second, so the server must see the first
+        // value before the read error.
+        let mut rest = vec![0, 0, 0, 2];
+        rest.extend_from_slice(&2i32.to_be_bytes());
+        rest.extend_from_slice(b"xy");
+        rest.extend_from_slice(&50i32.to_be_bytes());
+        let bind = Bind { portal: b"", statement: b"", rest: &rest };
+        let mut params = bind.params(2).unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params.next(), Some(Ok(Some(&b"xy"[..]))));
+        let error = params.next().unwrap().unwrap_err();
+        assert_eq!(error.message, "insufficient data left in message");
+        assert_eq!(params.next(), None);
+        assert_eq!(bind.body(2).unwrap_err(), error);
+
+        // `finish` reads the values that the server did not take.
+        let mut bytes = Vec::new();
+        Bind::encode(&mut bytes, b"", b"", &[], &[Some(b"1"), None], &[1]);
+        let Ok(Frontend::Bind(bind)) =
+            Frontend::parse(split(&bytes, Mode::Query).unwrap().unwrap())
+        else {
+            panic!()
+        };
+        let mut params = bind.params(2).unwrap();
+        assert_eq!(params.next(), Some(Ok(Some(&b"1"[..]))));
+        assert_eq!(params.finish().unwrap().iter().collect::<Vec<_>>(), [1]);
+        assert_eq!(bind.params(2).unwrap().finish().unwrap().of(0), 1);
+        let body = bind.body(2).unwrap();
+        assert_eq!(body.values.iter().collect::<Vec<_>>(), [Some(&b"1"[..]), None]);
+    }
+
+    #[test]
+    fn call_args_give_the_arguments_one_by_one() {
+        let mut bytes = Vec::new();
+        FunctionCall::encode(&mut bytes, 1598, &[], &[Some(b"ab"), None], 1);
+        let Ok(Frontend::FunctionCall(call)) =
+            Frontend::parse(split(&bytes, Mode::Query).unwrap().unwrap())
+        else {
+            panic!()
+        };
+        let mut args = call.args(2).unwrap();
+        assert_eq!(args.next(), Some(Ok(Some(&b"ab"[..]))));
+        assert_eq!(args.finish(), Ok(1));
+        let mut rest = vec![0, 0, 0, 2, 0, 0, 0, 0];
+        rest.extend_from_slice(&(-3i32).to_be_bytes());
+        let call = FunctionCall { oid: 1, rest: &rest };
+        let mut args = call.args(2).unwrap();
+        assert_eq!(args.next(), Some(Ok(Some(&b""[..]))));
+        let error = args.next().unwrap().unwrap_err().message;
+        assert_eq!(error, "invalid argument size -3 in function call message");
     }
 
     #[test]
