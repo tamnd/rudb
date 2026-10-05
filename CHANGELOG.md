@@ -8,6 +8,16 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.29
+
+This release is all PostgreSQL work in rudb-server, inside PG1.
+
+#2571 adds `current_setting`, `version()` and the user of a PostgreSQL session. #2572 names the columns of unaliased targets the way PostgreSQL does, such as `?column?`, `int4`, `count` and `column1`. #2574 puts the table OID and the column number of each plain column in `RowDescription`, through subqueries, joins, views and `RETURNING`, as `markTargetListOrigins` does. #2573 fixes a clippy error and two graph tests that failed the release gate.
+
+#2575 adds TLS with rustls. The server takes an `SSLRequest` and direct TLS with the ALPN protocol `postgresql`, and reads `ssl`, `ssl_cert_file`, `ssl_key_file`, `ssl_ca_file`, `ssl_min_protocol_version` and `ssl_max_protocol_version` with the defaults and error texts of PostgreSQL. The crypto provider is aws-lc-rs by default, or ring with the feature `tls-ring`.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.28
 
 For ClickBench, #2568 lets a LIKE on compressed text step aside to the decoded part once that part is held, so warm runs on a column with no gram sketch stop walking the FSST codes each time. For TPC-H, #2566 reads only the count cell of each place to find the places with rows in the add by place.
