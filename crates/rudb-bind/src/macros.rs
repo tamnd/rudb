@@ -269,49 +269,9 @@ impl Binder<'_> {
         let Some(chosen) = chosen(call.name, call.args.len())? else {
             return Ok(None);
         };
-        let body = chosen.body;
-        let tokens = tokenize(body)?;
-        let calls: Vec<usize> = (0..tokens.len())
-            .filter(|&at| {
-                let word = tokens[at].text(body);
-                let word =
-                    word.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(word);
-                tokens.get(at + 1).is_some_and(|next| next.text(body) == "(")
-                    && kind_of(word) == Some(FunctionKind::Aggregate)
-            })
-            .collect();
-        let [aggregate] = calls[..] else {
-            return Err(Error::binder(
-                "Window function macro bodies must contain exactly one aggregate function",
-            ));
-        };
-        let open = tokens[aggregate + 1].end as usize;
-        let mut depth = 0usize;
-        let close = tokens[aggregate + 1..]
-            .iter()
-            .find(|token| {
-                match token.text(body) {
-                    "(" => depth += 1,
-                    ")" => depth -= 1,
-                    _ => {}
-                }
-                depth == 0
-            })
-            .map(|token| token.start as usize)
-            .ok_or_else(|| Error::internal(format!("the body of {}", chosen.name)))?;
         let texts: Vec<String> =
             call.args.iter().map(|&argument| deparse::expression(ast, argument)).collect();
-        let parameters = chosen.parameters;
-        let text = format!(
-            "{}{}{}{}){} {}{}",
-            substitute(&body[..open], parameters, &texts)?,
-            if call.distinct { "DISTINCT " } else { "" },
-            substitute(&body[open..close], parameters, &texts)?,
-            if call.ignore_nulls { " IGNORE NULLS" } else { "" },
-            deparse::filtered(ast, call.filter),
-            deparse::over(ast, call.spec),
-            substitute(&body[close + 1..], parameters, &texts)?,
-        );
+        let text = windowed(ast, call, chosen.name, chosen.body, chosen.parameters, &texts)?;
         self.bind_macro_body(chosen.name, &text, scope).map(Some)
     }
 
@@ -336,6 +296,119 @@ impl Binder<'_> {
         self.pinned_span = outer;
         bound
     }
+}
+
+/// A macro's body with the window of a call to it pushed down onto the one aggregate in it, and
+/// the arguments put in.
+///
+/// The aggregate is found in the body as it was written, before the arguments go in, so an
+/// argument that is itself an aggregate is not counted, and one inside a subquery or inside another
+/// aggregate is not counted either. The call's `DISTINCT` and `IGNORE NULLS` go into the aggregate's brackets, unless it
+/// says `DISTINCT` already, and a `FILTER` the body gives the aggregate is kept and joined to the
+/// call's with `AND`. An `ORDER BY` inside the call's brackets is dropped, the way the pin drops
+/// it, and one inside the aggregate's is kept.
+fn windowed(
+    ast: &Ast,
+    call: &WindowCall<'_>,
+    name: &str,
+    body: &str,
+    parameters: &[&str],
+    texts: &[String],
+) -> Result<String> {
+    let tokens = tokenize(body)?;
+    let word = |at: usize| tokens.get(at).map_or("", |token| token.text(body));
+    let closing = |open: usize| {
+        let mut depth = 0usize;
+        (open..tokens.len()).find(|&at| {
+            match word(at) {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        })
+    };
+    // What each open bracket is in: a subquery, where the pin counts no aggregate, or the brackets
+    // of an aggregate, where it counts one as nested in the other.
+    let mut inside: Vec<(bool, bool)> = Vec::new();
+    let mut calls = Vec::new();
+    let mut nested = false;
+    for at in 0..tokens.len() {
+        let (subquery, aggregate) = inside.last().copied().unwrap_or_default();
+        match word(at) {
+            "(" => {
+                let next = word(at + 1);
+                let starts = ["SELECT", "WITH", "FROM", "VALUES", "TABLE"]
+                    .iter()
+                    .any(|keyword| next.eq_ignore_ascii_case(keyword));
+                let called = at > 0 && calls.last() == Some(&(at - 1));
+                inside.push((subquery || starts, aggregate || called));
+            }
+            ")" => {
+                inside.pop();
+            }
+            written => {
+                let unquoted = written
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .unwrap_or(written);
+                if word(at + 1) == "("
+                    && !subquery
+                    && kind_of(unquoted) == Some(FunctionKind::Aggregate)
+                {
+                    if aggregate {
+                        nested = true;
+                    } else {
+                        calls.push(at);
+                    }
+                }
+            }
+        }
+    }
+    let [aggregate] = calls[..] else {
+        return Err(Error::binder(
+            "Window function macro bodies must contain exactly one aggregate function",
+        ));
+    };
+    if nested {
+        return Err(Error::binder("aggregate function calls cannot be nested"));
+    }
+    let missing = || Error::internal(format!("the body of {name}"));
+    let close = closing(aggregate + 1).ok_or_else(missing)?;
+    let open = tokens[aggregate + 1].end as usize;
+    let inner = &body[open..tokens[close].start as usize];
+    let mut rest = tokens[close].end as usize;
+    let mut filters = Vec::new();
+    if word(close + 1).eq_ignore_ascii_case("FILTER") && word(close + 2) == "(" {
+        let end = closing(close + 2).ok_or_else(missing)?;
+        let from = tokens[close + 2].end as usize;
+        let mut condition = body[from..tokens[end].start as usize].trim();
+        if word(close + 3).eq_ignore_ascii_case("WHERE") {
+            condition = body[tokens[close + 3].end as usize..tokens[end].start as usize].trim();
+        }
+        filters.push(format!("({})", substitute(condition, parameters, texts)?));
+        rest = tokens[end].end as usize;
+    }
+    if call.filter != NONE {
+        filters.push(format!("({})", deparse::expression(ast, call.filter)));
+    }
+    let filter = if filters.is_empty() {
+        String::new()
+    } else {
+        format!(" FILTER (WHERE {})", filters.join(" AND "))
+    };
+    let distinct = call.distinct
+        && !inner.trim_start().get(..8).is_some_and(|said| said.eq_ignore_ascii_case("DISTINCT"));
+    Ok(format!(
+        "{}{}{}{}){} {}{}",
+        substitute(&body[..open], parameters, texts)?,
+        if distinct { "DISTINCT " } else { "" },
+        substitute(inner, parameters, texts)?,
+        if call.ignore_nulls { " IGNORE NULLS" } else { "" },
+        filter,
+        deparse::over(ast, call.spec),
+        substitute(&body[rest..], parameters, texts)?,
+    ))
 }
 
 thread_local! {
@@ -410,6 +483,41 @@ impl Binder<'_> {
         }
         let (positional, named) = ast.written_args(call, args);
         let text = self.expanded(ast, &called, &overloads, positional, named, scope)?;
+        let depth = deeper()?;
+        let bound = self.bind_macro_body(&called, &text, scope);
+        DEPTH.set(depth);
+        bound.map(Some)
+    }
+
+    /// The expansion of a call to a scalar macro a user made written with a window, or `None` if
+    /// the name is not one.
+    ///
+    /// The overload is chosen the way it is for a call with no window, and the window is then
+    /// pushed down onto the one aggregate in its body the way it is for a built-in macro.
+    pub(crate) fn user_window_macro(
+        &mut self,
+        ast: &Ast,
+        expr: ast::ExprRef,
+        name: ast::Slice,
+        args: ast::Slice,
+        call: &WindowCall<'_>,
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        let parts: Vec<&str> = ast.name(name).collect();
+        let Some(found) = self.catalog().resolve_macro(&parts, Some(false)) else {
+            return Ok(None);
+        };
+        let called = found.name.table.clone();
+        if let Some((_, said)) = ast.misnamed(expr) {
+            let written = parts.last().copied().unwrap_or_default();
+            return Err(Error::binder(format!("Macro \"{written}\"() {said}")));
+        }
+        let overloads = found.overloads.clone();
+        let (positional, named) = ast.written_args(expr, args);
+        let (body, names, texts) =
+            self.overload_for(ast, &called, &overloads, positional, named, scope)?;
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let text = windowed(ast, call, &called, &body, &names, &texts)?;
         let depth = deeper()?;
         let bound = self.bind_macro_body(&called, &text, scope);
         DEPTH.set(depth);
@@ -491,6 +599,23 @@ impl Binder<'_> {
         named: &[ast::Target],
         scope: &Scope,
     ) -> Result<String> {
+        let (body, names, texts) =
+            self.overload_for(ast, called, overloads, positional, named, scope)?;
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        substitute(&body, &names, &texts)
+    }
+
+    /// The body of the overload the arguments fit best, the names of its parameters and the text
+    /// each one gets, or the refusal `expanded` gives.
+    fn overload_for(
+        &mut self,
+        ast: &Ast,
+        called: &str,
+        overloads: &[Overload],
+        positional: &[ast::ExprRef],
+        named: &[ast::Target],
+        scope: &Scope,
+    ) -> Result<(String, Vec<String>, Vec<String>)> {
         let starred =
             positional.iter().any(|&argument| matches!(ast.expr(argument), ast::Expr::Star { .. }));
         if !starred {
@@ -503,9 +628,9 @@ impl Binder<'_> {
             let best = fitting.iter().map(|(_, fit)| (fit.untyped, fit.cost)).min();
             fitting.retain(|(_, fit)| Some((fit.untyped, fit.cost)) == best);
             if let [(overload, fit)] = fitting.as_slice() {
-                let names: Vec<&str> =
-                    overload.parameters.iter().map(|parameter| parameter.name.as_str()).collect();
-                return substitute(&overload.body, &names, &fit.texts);
+                let names =
+                    overload.parameters.iter().map(|parameter| parameter.name.clone()).collect();
+                return Ok((overload.body.clone(), names, fit.texts.clone()));
             }
             if !fitting.is_empty() {
                 let candidates: Vec<String> = fitting

@@ -279,3 +279,47 @@ fn the_pin_refuses_what_it_refuses_in_its_words() {
         refused(&database, sql, expected);
     }
 }
+
+#[test]
+fn a_window_on_a_call_to_a_macro_goes_onto_the_one_aggregate_in_its_body() {
+    let database = Database::new();
+    for sql in [
+        "CREATE MACRO plus_one(x) AS sum(x) + 1",
+        "CREATE MACRO positive(x) AS 1 + sum(x) FILTER (WHERE x > 0)",
+        "CREATE MACRO counted(x) AS count(x)",
+        "CREATE MACRO scaled(x, y := 2) AS sum(x) * y",
+        "CREATE MACRO nested(x) AS sum(sum(x))",
+        "CREATE MACRO two(x) AS sum(x) * avg(x)",
+        "CREATE MACRO plain(x) AS x + 1",
+        "CREATE MACRO inner_query(x) AS (SELECT sum(x))",
+    ] {
+        database.execute(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    let sql = "SELECT plus_one(i) OVER () FROM range(3) t(i)";
+    assert_eq!(answered(&database, sql), ["4", "4", "4"]);
+    let result = database.execute(sql).expect("the window");
+    assert_eq!(result.names(), ["plus_one(i) OVER ()"]);
+    let sql = "SELECT positive(i) FILTER (WHERE i < 2) OVER () FROM range(3) t(i) LIMIT 1";
+    assert_eq!(answered(&database, sql), ["2"]);
+    let sql = "SELECT counted(DISTINCT i % 3) OVER () FROM range(10) t(i) LIMIT 1";
+    assert_eq!(answered(&database, sql), ["3"]);
+    let sql = "SELECT scaled(i, y := 3) OVER (ORDER BY i) FROM range(3) t(i)";
+    assert_eq!(answered(&database, sql), ["0", "3", "9"]);
+    let sql = "SELECT plus_one(sum(i)) OVER () FROM range(3) t(i)";
+    assert_eq!(answered(&database, sql), ["4"]);
+    let exactly_one =
+        "Binder Error: Window function macro bodies must contain exactly one aggregate function";
+    for sql in [
+        "SELECT two(i) OVER () FROM range(3) t(i)",
+        "SELECT plain(i) OVER () FROM range(3) t(i)",
+        "SELECT plain(sum(i)) OVER () FROM range(3) t(i)",
+        "SELECT inner_query(i) OVER () FROM range(3) t(i)",
+    ] {
+        refused(&database, sql, exactly_one);
+    }
+    refused(
+        &database,
+        "SELECT nested(i) OVER () FROM range(3) t(i)",
+        "Binder Error: aggregate function calls cannot be nested",
+    );
+}
