@@ -2417,10 +2417,10 @@ fn like_of(
         }
     };
     let base = nulls_of(text).and(&nulls_of(pattern), rows);
-    if let Some((codes, dictionary)) = text.shared_dictionary_parts() {
-        if let Some(span) = like.ranked(dictionary)? {
-            return like_ranked(dictionary, codes, span, like.negated, base, rows, returns);
-        }
+    if let Some((codes, dictionary)) = text.shared_dictionary_parts()
+        && let Some(span) = like.ranked(dictionary)?
+    {
+        return like_ranked(dictionary, codes, span, like.negated, base, rows, returns);
     }
     if let Some((codes, dictionary)) = text.stable_dictionary_parts() {
         return like_stable(dictionary, codes, like, base, rows, returns);
@@ -2429,10 +2429,11 @@ fn like_of(
     // the memo is kept against that one dictionary, so a demoted column whose parts all point into
     // the file's dictionary is answered once per value for the query like a stable one. Without
     // this `movie_info.info` copied every row's string to search it, a third of JOB 19a and 24a.
-    if let Some((codes, dictionary)) = text.shared_dictionary_parts() {
-        if dictionary.form() == Form::StringView && codes.len() >= rows {
-            return like_stable(dictionary, codes, like, base, rows, returns);
-        }
+    if let Some((codes, dictionary)) = text.shared_dictionary_parts()
+        && dictionary.form() == Form::StringView
+        && codes.len() >= rows
+    {
+        return like_stable(dictionary, codes, like, base, rows, returns);
     }
     match text.form() {
         Form::Flat => {
@@ -2928,10 +2929,10 @@ impl Like {
         }
         let mut held =
             self.ranked.lock().map_err(|_| Error::internal("a LIKE memo was poisoned"))?;
-        if let Some((known, first, past)) = &*held {
-            if Arc::ptr_eq(known, dictionary) {
-                return Ok(Some((*first, *past)));
-            }
+        if let Some((known, first, past)) = &*held
+            && Arc::ptr_eq(known, dictionary)
+        {
+            return Ok(Some((*first, *past)));
         }
         let (first, _) = crate::peel::below(dictionary, ranks, prefix.as_bytes())?;
         let past = match successor(prefix.as_bytes()) {

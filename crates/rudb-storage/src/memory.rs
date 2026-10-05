@@ -81,6 +81,10 @@ use crate::zone::{Probe, Range, Zone};
 /// One column's statistics over one run of the chunks of an append: its count and a range a chunk.
 type Counted = (Partial, Vec<Range>);
 
+/// One column's [`MemoryTable::frequency_list`]: each value and how many rows hold it, or `None`
+/// for a column with no list.
+type Listed = Option<Arc<[(Value, u64)]>>;
+
 /// How many rows one row group holds.
 ///
 /// DuckDB's number, and what `spec/storage-v2/` is designed around, so a table in memory and a table
@@ -183,7 +187,7 @@ pub struct MemoryTable {
     /// Each column's [`MemoryTable::frequencies`], built the first time the planner asks and dropped
     /// whenever a row is added, like `grams`. The planner asks for every column on every query, and
     /// building a list sorts it and copies each value out of the tally.
-    lists: Vec<OnceLock<Option<Arc<[(Value, u64)]>>>>,
+    lists: Vec<OnceLock<Listed>>,
     /// Each column's [`MemoryTable::exact_extremes`], worked out the first time they are asked for
     /// and dropped whenever a row is added, like `grams`. The compiler asks for them on every query
     /// and working them out walks the zone of every chunk.
@@ -861,7 +865,7 @@ impl MemoryTable {
     /// # Errors
     ///
     /// If the column is outside the table.
-    pub fn frequency_list(&self, column: usize) -> Result<Option<Arc<[(Value, u64)]>>> {
+    pub fn frequency_list(&self, column: usize) -> Result<Listed> {
         let Some(list) = self.lists.get(column) else {
             return Err(Error::internal(format!(
                 "column {column} of a table that has {}",
@@ -871,7 +875,7 @@ impl MemoryTable {
         if let Some(held) = list.get() {
             return Ok(held.clone());
         }
-        let held: Option<Arc<[(Value, u64)]>> = self.frequencies(column)?.map(Arc::from);
+        let held: Listed = self.frequencies(column)?.map(Arc::from);
         Ok(list.get_or_init(|| held).clone())
     }
 
@@ -1368,6 +1372,10 @@ impl MemoryTable {
     /// # Errors
     ///
     /// If there is no such row or column, or a value is not one its column holds.
+    ///
+    /// # Panics
+    ///
+    /// Never: a row found in the tail has its place in the tail.
     pub fn put_row(
         &mut self,
         chunk: usize,

@@ -123,7 +123,7 @@ fn compose(buffer: &mut Vec<u32>) {
             }
             let syllable = lead.wrapping_sub(S_BASE);
             let trail = current.wrapping_sub(T_BASE);
-            if syllable < S_COUNT && syllable % T_COUNT == 0 && trail < T_COUNT {
+            if syllable < S_COUNT && syllable.is_multiple_of(T_COUNT) && trail < T_COUNT {
                 buffer[at] += trail;
                 continue;
             }
