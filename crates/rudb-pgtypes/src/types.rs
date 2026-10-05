@@ -1,6 +1,9 @@
 //! The type of a PostgreSQL value as a client sees it, and the facts of each built-in type.
 
+use std::borrow::Cow;
+
 use crate::generated::oids::TYPES;
+use crate::oid;
 
 /// The object ID of a type, as in `pg_type.oid`.
 pub type Oid = u32;
@@ -81,9 +84,59 @@ impl TypeInfo {
         &TYPES
     }
 
+    /// Whether the type is an array in the sense of SQL, which `format_type` writes as the
+    /// element type and `[]`. This is `IsTrueArrayType` with a storage that is not plain. So
+    /// `int2vector` and `oidvector` are not arrays, but `_record`, which is a pseudo-type, is.
     pub fn is_array(&self) -> bool {
-        self.category == b'A' && self.elem != 0
+        match self.oid {
+            oid::INT2VECTOR | oid::OIDVECTOR => false,
+            oid::RECORD_ARRAY => true,
+            _ => self.category == b'A' && self.elem != 0,
+        }
     }
+}
+
+/// The name of a type as `format_type(oid, NULL)` gives it: the SQL name of a type that has
+/// one, such as `integer` for `int4`, the element type and `[]` for an array, `-` for OID 0 and
+/// `???` for an OID that is not a type. The row types of the catalogs that have a fixed OID are
+/// not in [`TypeInfo::all`], but they have their name here.
+pub fn format_type(oid: Oid) -> Cow<'static, str> {
+    let name = match oid {
+        0 => "-",
+        oid::BOOL => "boolean",
+        oid::CHAR => "\"char\"",
+        oid::INT8 => "bigint",
+        oid::INT2 => "smallint",
+        oid::INT4 => "integer",
+        oid::FLOAT4 => "real",
+        oid::FLOAT8 => "double precision",
+        oid::BPCHAR => "character",
+        oid::VARCHAR => "character varying",
+        oid::TIME => "time without time zone",
+        oid::TIMESTAMP => "timestamp without time zone",
+        oid::TIMESTAMPTZ => "timestamp with time zone",
+        oid::TIMETZ => "time with time zone",
+        oid::VARBIT => "bit varying",
+        oid::ANY => "\"any\"",
+        71 => "pg_type",
+        75 => "pg_attribute",
+        81 => "pg_proc",
+        83 => "pg_class",
+        1248 => "pg_database",
+        2173 => "pg_parameter_acl",
+        2842 => "pg_authid",
+        2843 => "pg_auth_members",
+        4066 => "pg_shseclabel",
+        6101 => "pg_subscription",
+        _ => match TypeInfo::get(oid) {
+            Some(info) if info.is_array() => {
+                return Cow::Owned(format!("{}[]", format_type(info.elem)));
+            }
+            Some(info) => info.name,
+            None => "???",
+        },
+    };
+    Cow::Borrowed(name)
 }
 
 #[cfg(test)]
@@ -138,5 +191,18 @@ mod tests {
         assert!(!TypeInfo::get(oid::NAME).unwrap().is_array());
         assert!(TypeInfo::all().windows(2).all(|w| w[0].oid < w[1].oid));
         assert_eq!(TypeInfo::get(0), None);
+        let int2vector = TypeInfo::get(oid::INT2VECTOR).unwrap();
+        assert!(int2vector.category == b'A' && !int2vector.is_array());
+        assert!(TypeInfo::get(oid::RECORD_ARRAY).unwrap().is_array());
+    }
+
+    #[test]
+    fn format_type_gives_the_sql_name() {
+        assert_eq!(format_type(oid::INT4), "integer");
+        assert_eq!(format_type(oid::INT4_ARRAY), "integer[]");
+        assert_eq!(format_type(oid::INT2VECTOR), "int2vector");
+        assert_eq!(format_type(oid::RECORD_ARRAY), "record[]");
+        assert_eq!(format_type(oid::TEXT), "text");
+        assert_eq!((format_type(0), format_type(9999)), ("-".into(), "???".into()));
     }
 }

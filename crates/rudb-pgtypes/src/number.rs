@@ -187,6 +187,20 @@ pub fn oid_in(s: &str) -> Result<u32, TypeError> {
     Ok(result)
 }
 
+/// `uint32in_subr` with an end pointer: a number as `oid_in` reads it, at the start of `s`, and
+/// the length of its text. The caller reads what comes after it. An error shows all of `s`.
+pub(crate) fn uint32_in_subr(s: &str, type_name: &str) -> Result<(u32, usize), TypeError> {
+    let (value, end, overflow) = strtoul(s.as_bytes());
+    if end == 0 {
+        return Err(TypeError::syntax(type_name, s));
+    }
+    let result = value as u32;
+    if overflow || (value != u64::from(result) && value != i64::from(result as i32) as u64) {
+        return Err(TypeError::range(s, type_name));
+    }
+    Ok((result, end))
+}
+
 const PAIRS: &[u8; 200] = b"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
 
 /// Writes the decimal digits of `n`.

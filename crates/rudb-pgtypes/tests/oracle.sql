@@ -419,3 +419,76 @@ begin
 end
 $$;
 select * from pg_temp.strins();
+-- Arrays, int2vector and oidvector. The output is the hex of the binary form, a space and the
+-- text form. An input or an output with a control character is in hex, and the type starts with
+-- arrayhex or vectorhex.
+create temp table arrins (n serial, ty text, i text, nulls text default 'on');
+insert into arrins (ty, i) select ty, i from unnest(array['int4[]', 'text[]']) ty,
+  unnest(array['{}', '{ }', '  {}  ', '{{}}', '{{},{}}', '{1,2,3}', '{ 1 , 2 , 3 }', '{1,NULL,3}',
+  '{1,null,3}', '{NULL}', '{"NULL"}', '{"1"}', '{ "1" , "2" }', '{{1,2},{3,4}}', '{{1,2},{3}}',
+  '{{1},2}', '{1,{2}}', '{{1}{2}}', '{{1},{2},{3}}', '[0:2]={1,2,3}', '[1:3]={1,2,3}',
+  '[-2:-1][3:4]={{1,2},{3,4}}', '[1:2]={1}', '[1:2]={{1},{2}}', '[1:1][1:1]={1}', '[2:1]={}',
+  '[1:2147483647]={1}', '[-2147483648:2147483646]={1}', '[1:99999999999]={1}', '[+1:+2]={1,2}',
+  '[ 1]={1}', '[1 ]={1}', '[1]={1}', '[1] = {1}', ' [1] [1] = {{1}}', '[1]{1}', '[1]= 1', '[x]={1}',
+  '[1:]={1}', '[:1]={1}', '[1:2', '[1:2]', '[1][1][1][1][1][1][1]={{{{{{{1}}}}}}}',
+  '{{{{{{1}}}}}}', '{{{{{{{1}}}}}}}', '{1', '{1,', '{"1', '{"1\', '{1\', '{1,}', '{,1}', '{1,,2}',
+  '{1 2}', '{"1" 2}', '{"1""2"}', '{1"2"}', '{"1"x}', '{"1" }', '{1} x', '{1}  ', '1', '', ' ',
+  'x{1}', '{\1}', '{NULL,"a b"}', '{"",x}', '{"a\"b"}', '{a\,b}', '{a\\b}', '{ a b }', '{"a}',
+  '{a}b}', '{a{b}', '{\NULL}', '{"\NULL"}', '{NULL }', '{ NULL}', '{nul}', '{NULLx}',
+  E'{1,\t2}', E'{a\tb}', E'{"a\nb"}', E'\n{1}\n', E'{1\x0b}', E'[1]=\f{1}', '{é,"日本",a é}']) i;
+insert into arrins (ty, i, nulls) select 'text[]', i, 'off' from unnest(array['{NULL}',
+  '{null, NuLl ,"NULL",\NULL}', '{NULL,a}', '{}']) i;
+insert into arrins (ty, i) values ('int2[]', '{1,-32768,32767}'), ('int2[]', '{32768}'),
+  ('int2[]', '{ 1 , x }'), ('int8[]', '{9223372036854775807,-9223372036854775808}'),
+  ('int8[]', '{0x10,1_000}'), ('oid[]', '{1,4294967295,-1}'), ('oid[]', '{4294967296}'),
+  ('float8[]', '{1.5,-0,Infinity,-inf,NaN,1e308,0.1,4.9e-324}'), ('float8[]', '{1e400}'),
+  ('bool[]', '{t,f,true,FALSE,yes,0, on }'), ('bool[]', '{maybe}'),
+  ('numeric(5,2)[]', '{1.234,999.994,NaN,-0}'), ('numeric(5,2)[]', '{999.995}'),
+  ('numeric[]', '{1e-20,-0.00,Infinity}'), ('varchar(3)[]', '{a,abc,"abc  ",abc   }'),
+  ('varchar(3)[]', '{a,abcd}'), ('varchar[]', '{abcdef}'), ('character(3)[]', '{a,"",abc}'),
+  ('character(3)[]', '{abcd}'), ('bpchar[]', '{"a  ",""}'), ('"char"[]', '{a,ab,"",\\,"\""}'),
+  ('name[]', '{abc,"a b",""}'), ('bytea[]', '{"\\x0102",abc,""}'), ('bytea[]', '{"\\x0"}'),
+  ('uuid[]', '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11,{a0eebc999c0b4ef8bb6d6bb9bd380a11}}'),
+  ('uuid[]', '{"{a0eebc999c0b4ef8bb6d6bb9bd380a11}"}'), ('uuid[]', '{x}'),
+  ('json[]', '{"{\"a\": 1}","[1, 2]",null,"null","\"s\""}'), ('json[]', '{"{"}'),
+  ('int2vector', ''), ('int2vector', ' '), ('int2vector', '1'), ('int2vector', '1 2 3'),
+  ('int2vector', ' 1  2 '), ('int2vector', '-32768 32767'), ('int2vector', '32768'),
+  ('int2vector', '1,2'), ('int2vector', '1 x'), ('int2vector', 'x'), ('int2vector', '+5 -0'),
+  ('int2vector', E'1\t2'), ('int2vector', E'\t1\n'), ('int2vector', '0x10'),
+  ('int2vector', '99999999999999999999'), ('int2vector', '1 99999999999999999999 x'),
+  ('oidvector', ''), ('oidvector', '1 2'), ('oidvector', '1-2'), ('oidvector', '0x10 010'),
+  ('oidvector', '4294967296'), ('oidvector', '-2147483649'), ('oidvector', '1 x'),
+  ('oidvector', ' 3 '), ('oidvector', '1,2'), ('oidvector', '18446744073709551616 1');
+create function pg_temp.arr(t text, i text, nulls text) returns text language plpgsql as $$
+declare
+  valid boolean;
+  r text;
+begin
+  perform set_config('array_nulls', nulls, true);
+  perform set_config('extra_float_digits', '1', true);
+  execute format('select pg_input_is_valid(%L, %L)', i, t) into valid;
+  if not valid then
+    execute format('select ''ERROR '' || sql_error_code || '' '' || message || coalesce('' DETAIL '' || detail, '''') || coalesce('' HINT '' || hint, '''') from pg_input_error_info(%L, %L)', i, t)
+      into r;
+    return r;
+  end if;
+  execute format('select encode(%s(%L::%s), ''hex'') || '' '' || %L::%s::text',
+    (select typsend from pg_type where oid = to_regtype(t)), i, t, i, t) into r;
+  return r;
+end
+$$;
+select case when v.vector then 'vector' else 'array' end || case when h.hex then 'hex ' else ' ' end
+    || case when v.vector then t.typname else e.typname || ' ' || to_regtypemod(a.ty) end,
+  a.nulls,
+  case when h.hex then encode(convert_to(a.i, 'UTF8'), 'hex') else a.i end,
+  case when h.hex then encode(convert_to(o.r, 'UTF8'), 'hex') else o.r end
+from arrins a
+join pg_type t on t.oid = to_regtype(a.ty)
+join pg_type e on e.oid = t.typelem
+cross join lateral (select t.typname in ('int2vector', 'oidvector') as vector) v
+cross join lateral (select pg_temp.arr(a.ty, a.i, a.nulls) as r) o
+cross join lateral (select a.i ~ '[\x01-\x1f]' or o.r ~ '[\x01-\x1f]' as hex) h
+order by a.n;
+-- The names in the error of array_recv when the element type is not the expected type.
+select 'format', '', x::text, format_type(x, null) from (select oid from pg_type where oid < 10000
+  union all values (0::oid), (2), (9999)) s(x) order by x;

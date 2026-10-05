@@ -9,6 +9,12 @@
 //! after `in` has no setting, and `inhex` is the same with the hex of the input, for an input with
 //! a control character. A type that starts with `coerce` is the length cast of `varchar` or
 //! `bpchar` with the typmod and `true` for an explicit cast.
+//!
+//! A type that starts with `array` is the text input of an array, with the element type and the
+//! typmod, and the setting is `array_nulls`. A type that starts with `vector` is `int2vector` or
+//! `oidvector`. The output of both is the hex of the binary form, a space and the text form.
+//! `arrayhex` and `vectorhex` have the hex of the input and the hex of the output. A `format` line
+//! has an OID and the name that `format_type` gives it.
 
 use rudb_pgtypes::*;
 
@@ -164,6 +170,126 @@ fn string_in(type_name: &str, typmod: i32, input: &str) -> Option<Result<String,
     }))
 }
 
+/// One element of an array: its text output and its binary output.
+type Item = (Vec<u8>, Vec<u8>);
+
+/// The input of an array element of a type in the fixture, with the typmod of the array.
+fn item(type_name: &str, typmod: i32, input: &str) -> Result<Item, TypeError> {
+    let (mut text, mut bytes) = (Vec::new(), Vec::new());
+    match type_name {
+        "int2" => {
+            let v = int2_in(input)?;
+            int_out(v.into(), &mut text);
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        "int4" => {
+            let v = int4_in(input)?;
+            int_out(v.into(), &mut text);
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        "int8" => {
+            let v = int8_in(input)?;
+            int_out(v, &mut text);
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        "oid" => {
+            let v = oid_in(input)?;
+            oid_out(v, &mut text);
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        "float8" => {
+            let v = float8_in(input)?;
+            float8_out(v, 1, &mut text);
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        "bool" => {
+            let v = bool_in(input)?;
+            bool_out(v, &mut text);
+            bytes.push(u8::from(v));
+        }
+        "numeric" => {
+            let v = numeric_in(input, typmod)?;
+            numeric_out(&v, &mut text);
+            numeric_send(&v, &mut bytes);
+        }
+        "char" => {
+            let v = char_in(input);
+            char_out(v, &mut text);
+            bytes.push(v);
+        }
+        "bytea" => {
+            let v = bytea_in(input)?;
+            bytea_out(&v, ByteaOutput::Hex, &mut text);
+            bytes = v;
+        }
+        "uuid" => {
+            let v = uuid_in(input)?;
+            uuid_out(&v, &mut text);
+            bytes.extend_from_slice(&v);
+        }
+        "name" => {
+            text.extend_from_slice(name_in(input).as_bytes());
+            bytes.clone_from(&text);
+        }
+        _ => match string_in(type_name, typmod, input) {
+            Some(result) => {
+                text = result.map(|v| unhex(&v))?;
+                bytes.clone_from(&text);
+            }
+            None => {
+                panic!("the fixture has an array type that the test does not know: {type_name}")
+            }
+        },
+    }
+    Ok((text, bytes))
+}
+
+/// The hex of the binary form and the text form of an array. The binary form must read back to
+/// the same dimensions and elements.
+fn array(
+    type_name: &str,
+    typmod: i32,
+    array_nulls: bool,
+    input: &str,
+) -> Result<String, TypeError> {
+    let info = TypeInfo::by_name(type_name).unwrap();
+    let array = array_in(input, info.delim, array_nulls, |s| item(type_name, typmod, s))?;
+    let mut bytes = Vec::new();
+    array_send(&array, info.oid, &mut bytes, |v, out| out.extend_from_slice(&v.1));
+    let mut text = Vec::new();
+    array_out(&array, info.delim, &mut text, |v, out| out.extend_from_slice(&v.0));
+    let back = array_recv(&mut Recv::new(&bytes), info.oid, |r| Ok(r.rest().to_vec())).unwrap();
+    assert_eq!(back.dims, array.dims, "{input:?} does not read back from its binary form");
+    let sent = array.values.iter().map(|v| v.as_ref().map(|v| &v.1));
+    assert!(back.values.iter().map(Option::as_ref).eq(sent), "{input:?} in binary");
+    Ok(format!("{} {}", hex(&bytes), String::from_utf8(text).unwrap()))
+}
+
+/// The hex of the binary form and the text form of `int2vector` or `oidvector`.
+fn vector(type_name: &str, input: &str) -> Result<String, TypeError> {
+    let (mut bytes, mut text) = (Vec::new(), Vec::new());
+    match type_name {
+        "int2vector" => {
+            let v = int2vector_in(input)?;
+            int2vector_send(&v, &mut bytes);
+            int2vector_out(&v, &mut text);
+            if !v.is_empty() {
+                assert_eq!(int2vector_recv(&mut Recv::new(&bytes)), Ok(v));
+            }
+        }
+        "oidvector" => {
+            let v = oidvector_in(input)?;
+            oidvector_send(&v, &mut bytes);
+            oidvector_out(&v, &mut text);
+            if !v.is_empty() {
+                assert_eq!(oidvector_recv(&mut Recv::new(&bytes)), Ok(v));
+            }
+        }
+        _ => panic!("the fixture has a type that the test does not know: {type_name}"),
+    }
+    Ok(format!("{} {}", hex(&bytes), String::from_utf8(text).unwrap()))
+}
+
 /// The typmod of `numeric` or `numeric(p,s)`.
 fn numeric_typmod(type_name: &str) -> Option<i32> {
     let args = type_name.strip_prefix("numeric")?;
@@ -205,6 +331,22 @@ fn run(type_name: &str, setting: &str, input: &str) -> String {
     if let Some(rest) = type_name.strip_prefix("inhex ") {
         let input = String::from_utf8(unhex(input)).unwrap();
         return run(&format!("in {rest}"), setting, &input);
+    }
+    for kind in ["array", "vector"] {
+        if let Some(rest) = type_name.strip_prefix(&format!("{kind}hex ")) {
+            let input = String::from_utf8(unhex(input)).unwrap();
+            return hex(run(&format!("{kind} {rest}"), setting, &input).as_bytes());
+        }
+    }
+    if let Some(rest) = type_name.strip_prefix("array ") {
+        let (base, typmod) = rest.split_once(' ').unwrap();
+        return error_text(array(base, typmod.parse().unwrap(), setting == "on", input));
+    }
+    if let Some(rest) = type_name.strip_prefix("vector ") {
+        return error_text(vector(rest, input));
+    }
+    if type_name == "format" {
+        return format_type(input.parse().unwrap()).into_owned();
     }
     if let Some(rest) = type_name.strip_prefix("in ") {
         let (base, typmod) = rest.split_once(' ').unwrap();
