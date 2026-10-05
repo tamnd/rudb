@@ -534,22 +534,55 @@ impl Rids {
             }
             Body::Dense { words, .. } => {
                 // Counted first, because pushing onto an empty vector grew it several times a part,
-                // and a reduced scan of `cast_info` in JOB asks this of four thousand parts.
+                // and a reduced scan of `cast_info` in JOB asks this of four thousand parts. The
+                // walk is over the words of the range with each word's offset from `first` worked
+                // out once, which is what keeps a member to a shift, an add and a push.
+                let Some((words, skip, last)) = Self::words_in(words, first, end) else {
+                    return Vec::new();
+                };
                 let mut out = Vec::with_capacity(self.count_in(first, len));
-                let mut at = first;
-                while at < end {
-                    let word = words.get(index(at / 64)).copied().unwrap_or(0) >> (at % 64);
-                    let span = (64 - at % 64).min(end - at);
-                    let mut bits = if span == 64 { word } else { word & ((1 << span) - 1) };
+                let top = words.len() - 1;
+                for (at, &word) in words.iter().enumerate() {
+                    let mut bits = word;
+                    if at == 0 {
+                        bits &= u64::MAX << skip;
+                    }
+                    if at == top {
+                        bits &= last;
+                    }
+                    let from = (at as u32).wrapping_mul(64).wrapping_sub(skip);
                     while bits != 0 {
-                        out.push(offset(at + u64::from(bits.trailing_zeros())));
+                        out.push(from.wrapping_add(bits.trailing_zeros()));
                         bits &= bits - 1;
                     }
-                    at += span;
                 }
                 out
             }
         }
+    }
+
+    /// The words of a dense set that hold rows `first` up to `end`, how many rows of the first of
+    /// them come before `first`, and the mask of the rows of the last that come before `end`.
+    ///
+    /// `None` for an empty range. Words past the end of the set are not there, which is the same
+    /// as there being no member in them.
+    fn words_in(words: &[u64], first: Rid, end: Rid) -> Option<(&[u64], u32, u64)> {
+        if first >= end {
+            return None;
+        }
+        let (low, high) = (index(first / 64), index((end - 1) / 64));
+        let words = words.get(low..)?;
+        let words = &words[..words.len().min(high - low + 1)];
+        if words.is_empty() {
+            return None;
+        }
+        // A last word short of `high` is past the end of the set, and has no rows to mask off.
+        let last = if low + words.len() - 1 == high {
+            u64::MAX >> (63 - (end - 1) % 64)
+        } else {
+            u64::MAX
+        };
+        Some((words, (first % 64) as u32, last))
     }
 
     /// How many members there are from `first` for `len` rows, which is the length
@@ -567,19 +600,15 @@ impl Rids {
                     - members.partition_point(|&member| member < first)
             }
             Body::Dense { words, .. } => {
-                let (low, high) = (first / 64, (end - 1) / 64);
-                let mut held = 0;
-                for at in low..=high {
-                    let mut word = words.get(index(at)).copied().unwrap_or(0);
-                    if at == low {
-                        word &= u64::MAX << (first % 64);
-                    }
-                    if at == high {
-                        word &= u64::MAX >> (63 - (end - 1) % 64);
-                    }
-                    held += word.count_ones() as usize;
-                }
-                held
+                // Every word counted whole, which the compiler turns into a loop of counts with no
+                // branch in it, less the bits of the two end words that fall outside the range.
+                let Some((words, skip, last)) = Self::words_in(words, first, end) else {
+                    return 0;
+                };
+                let whole: usize = words.iter().map(|word| word.count_ones() as usize).sum();
+                let before = words[0] & !(u64::MAX << skip);
+                let after = words[words.len() - 1] & !last;
+                whole - before.count_ones() as usize - after.count_ones() as usize
             }
         }
     }
@@ -795,8 +824,9 @@ mod tests {
         let members: Vec<Rid> = (0..rows).filter(|rid| rid % 3 == 0 || rid % 64 == 63).collect();
         let set = Rids::from_sorted(rows, members.clone()).expect("sorted");
         assert_eq!(set.form(), Form::Dense);
-        for (first, len) in [(0, 64), (1, 63), (63, 2), (100, 1000), (4990, 64), (0, 5000), (7, 0)]
-        {
+        let ranges = [(0, 64), (1, 63), (63, 2), (100, 1000), (4990, 64), (0, 5000), (7, 0)];
+        let edges = [(64, 128), (65, 4935), (4999, 1), (4930, 200), (127, 1), (128, 64), (5000, 9)];
+        for (first, len) in ranges.into_iter().chain(edges) {
             let slow = members
                 .iter()
                 .filter(|&&rid| rid >= first && rid < first + len)

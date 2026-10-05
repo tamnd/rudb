@@ -511,12 +511,15 @@ impl Domain {
             // The common key, tested eight at a time, and once a run where it comes in runs. See
             // [`Members::word_after`]. Keys in order with few of them held are looked up instead.
             Data::Int32(values) => {
-                if let Some(kept) = self.over_sorted(values.as_slice().get(..rows)?, base) {
+                let values = values.as_slice().get(..rows)?;
+                if let Some(kept) = self.over_run(values, base) {
+                    return Some(kept);
+                }
+                if let Some(kept) = self.over_sorted(values, base) {
                     return Some(kept);
                 }
                 match Members::new(&self.words, base) {
                     Some(members) => {
-                        let values = values.as_slice().get(..rows)?;
                         let mut before = None;
                         Some(marked(rows, |from, to| {
                             members.word_after(&values[from..to], &mut before)
@@ -527,6 +530,9 @@ impl Domain {
             }
             Data::Int64(values) => {
                 let values = values.as_slice().get(..rows)?;
+                if let Some(kept) = self.over_run(values, base) {
+                    return Some(kept);
+                }
                 if let Some(kept) = self.over_sorted(values, base) {
                     return Some(kept);
                 }
@@ -538,6 +544,67 @@ impl Domain {
             }
             _ => None,
         }
+    }
+
+    /// [`Self::over_flat`] for a chunk whose keys are one run of consecutive values, by taking the
+    /// bitmap's bits for that run a word at a time rather than testing a bit a row, and `None` for
+    /// any other chunk.
+    ///
+    /// That is a table's own key column where the keys were handed out in the order the rows were
+    /// loaded, which is every identifier column of the IMDb load. Row `n` of the chunk holds key
+    /// `first + n`, so the rows kept are the bits from `first` on, as they lie. In JOB 6d the
+    /// people `cast_info` leaves are tested against every row of `name`, and testing them eight at
+    /// a time with a gather into the bitmap was a twentieth of the query.
+    ///
+    /// The check is one pass of compares with no branch until the end of a block, and a chunk that
+    /// is not a run fails it in its first block.
+    fn over_run<T: Copy + Into<i64>>(&self, values: &[T], base: i64) -> Option<Kept> {
+        let rows = values.len();
+        if rows < SORTED_LEAST {
+            return None;
+        }
+        let first: i64 = (*values.first()?).into();
+        first.checked_add(i64::try_from(rows - 1).ok()?)?;
+        let run = values.chunks(256).enumerate().all(|(block, values)| {
+            let from = first + (block * 256) as i64;
+            values
+                .iter()
+                .enumerate()
+                .fold(true, |run, (at, &key)| run & (key.into() == from + at as i64))
+        });
+        if !run {
+            return None;
+        }
+        // A run that starts under the base is rare enough to leave to the bit a row.
+        let start = u64::try_from(first.checked_sub(base)?).ok()?;
+        let mut bits = Vec::with_capacity(rows.div_ceil(64));
+        let mut count = 0;
+        let mut row = 0;
+        while row < rows {
+            let len = (rows - row).min(64);
+            let word = self.window(start + row as u64, len);
+            count += word.count_ones() as usize;
+            bits.push(word);
+            row += len;
+        }
+        Some(Kept { bits, count })
+    }
+
+    /// The `len` bits of the bitmap from offset `at` on, the first of them lowest, with every bit
+    /// from the range on clear.
+    fn window(&self, at: u64, len: usize) -> u64 {
+        let Some(left) = self.range.checked_sub(at).filter(|&left| left > 0) else {
+            return 0;
+        };
+        let len = len.min(usize::try_from(left).unwrap_or(usize::MAX));
+        let word = |index: u64| {
+            usize::try_from(index).ok().and_then(|index| self.words.get(index)).copied()
+        };
+        let shift = at % 64;
+        let low = word(at / 64).unwrap_or(0) >> shift;
+        let high = if shift == 0 { 0 } else { word(at / 64 + 1).unwrap_or(0) << (64 - shift) };
+        let bits = low | high;
+        if len >= 64 { bits } else { bits & ((1 << len) - 1) }
     }
 
     /// [`Self::over_flat`] for a chunk whose keys never go down, by looking each key the bitmap
@@ -2282,6 +2349,60 @@ mod tests {
             by_bit(&wide),
             "flat integers in order"
         );
+    }
+
+    /// A chunk of consecutive keys, as a table's own identifier column holds them, takes its bits
+    /// straight out of the bitmap and keeps what a bit a row keeps, wherever the run starts and
+    /// ends against the bitmap's range, and a chunk that is not one run is tested as before.
+    #[test]
+    fn a_run_of_consecutive_keys_keeps_what_a_bit_a_row_keeps() {
+        let held: Vec<i64> = (0..10_000).filter(|key| key % 7 == 3 || key % 61 == 0).collect();
+        let mut words = vec![0_u64; 10_000_usize.div_ceil(64)];
+        for &key in &held {
+            words[key as usize / 64] |= 1 << (key % 64);
+        }
+        let domain = super::Domain::from_words(words);
+        let by_bit = |values: &[i64]| -> Vec<u32> {
+            (0..values.len())
+                .filter(|&row| domain.holds(values[row]))
+                .map(|row| row as u32)
+                .collect()
+        };
+        let check = |values: Vec<i64>, note: &str| {
+            let rows = values.len();
+            let keys = Vector::from_values(
+                LogicalType::BigInt,
+                &values.iter().map(|&key| Value::BigInt(key)).collect::<Vec<_>>(),
+            )
+            .expect("a column of big ints");
+            let kept = domain.kept(&keys, rows, &mut Vec::new());
+            assert_eq!(kept.indices(), by_bit(&values), "{note}");
+            assert_eq!(kept.count(), by_bit(&values).len(), "{note}, counted");
+            let narrow: Vec<Option<i32>> =
+                values.iter().map(|&key| i32::try_from(key).ok()).collect();
+            if narrow.iter().all(Option::is_some) {
+                let kept = domain.kept(&column(&narrow), rows, &mut Vec::new());
+                assert_eq!(kept.indices(), by_bit(&values), "{note}, as int");
+            }
+        };
+        let runs = [(0, 2_048), (37, 3_000), (64, 1_024), (8_999, 1_100), (9_500, 2_000)];
+        for (first, rows) in runs {
+            let run: Vec<i64> = (first..first + rows).collect();
+            assert!(domain.over_run(&run, 0).is_some(), "a run from {first}");
+            check(run, &format!("a run of {rows} from {first}"));
+        }
+        let past: Vec<i64> = (20_000..22_000).collect();
+        check(past, "a run wholly past the range");
+        let under: Vec<i64> = (-500..1_500).collect();
+        assert!(domain.over_run(&under, 0).is_none(), "a run from under the base");
+        check(under, "a run from under the base");
+        let mut broken: Vec<i64> = (100..2_100).collect();
+        broken[1_500] = 7;
+        assert!(domain.over_run(&broken, 0).is_none(), "one key out of the run");
+        check(broken, "one key out of the run");
+        let short: Vec<i64> = (100..600).collect();
+        assert!(domain.over_run(&short, 0).is_none(), "too short a chunk");
+        check(short, "too short a chunk");
     }
 
     /// A column of those values packed at that width over that base, which is the form the native
