@@ -212,11 +212,14 @@ impl OutBuf {
         self.finish(mark);
     }
 
-    /// `NegotiateProtocolVersion`: the newest minor version the server speaks for the major
-    /// version that the client asked for, and the `_pq_.` options it does not know.
-    pub fn negotiate_protocol_version(&mut self, minor: u32, options: &[&[u8]]) {
+    /// `NegotiateProtocolVersion`: the version of the session and the `_pq_.` options the server
+    /// does not know. The version is the whole 32-bit code, for example [`PROTOCOL_3_2`], and not
+    /// only the minor part. PostgreSQL sends the lower of the version of the client and 3.2.
+    ///
+    /// [`PROTOCOL_3_2`]: crate::PROTOCOL_3_2
+    pub fn negotiate_protocol_version(&mut self, version: u32, options: &[&[u8]]) {
         let mark = self.begin(b'v');
-        self.put_u32(minor);
+        self.put_u32(version);
         self.put_u32(options.len() as u32);
         for option in options {
             self.put_string(option);
@@ -395,7 +398,7 @@ pub enum Backend<'a> {
     EmptyQueryResponse,
     ErrorResponse(Vec<(u8, &'a [u8])>),
     FunctionCallResponse(Option<&'a [u8]>),
-    NegotiateProtocolVersion { minor: u32, options: Vec<&'a [u8]> },
+    NegotiateProtocolVersion { version: u32, options: Vec<&'a [u8]> },
     NoData,
     NoticeResponse(Vec<(u8, &'a [u8])>),
     NotificationResponse { pid: i32, channel: &'a [u8], payload: &'a [u8] },
@@ -508,10 +511,10 @@ impl<'a> Backend<'a> {
                 len => Some(r.bytes(len)?),
             }),
             b'v' => {
-                let minor = r.u32()?;
+                let version = r.u32()?;
                 let count = r.u32()?;
                 let options = (0..count).map(|_| r.string()).collect::<Result<_, _>>()?;
-                Backend::NegotiateProtocolVersion { minor, options }
+                Backend::NegotiateProtocolVersion { version, options }
             }
             b'n' => Backend::NoData,
             b'A' => Backend::NotificationResponse {
@@ -591,8 +594,8 @@ impl<'a> Backend<'a> {
             Backend::EmptyQueryResponse => out.empty_query_response(),
             Backend::ErrorResponse(fields) => out.error_response(fields),
             Backend::FunctionCallResponse(result) => out.function_call_response(*result),
-            Backend::NegotiateProtocolVersion { minor, options } => {
-                out.negotiate_protocol_version(*minor, options);
+            Backend::NegotiateProtocolVersion { version, options } => {
+                out.negotiate_protocol_version(*version, options);
             }
             Backend::NoData => out.no_data(),
             Backend::NoticeResponse(fields) => out.notice_response(fields),
@@ -650,7 +653,10 @@ mod tests {
             Backend::ErrorResponse(vec![(b'S', b"ERROR"), (b'C', b"42601"), (b'M', b"syntax")]),
             Backend::FunctionCallResponse(Some(b"\0\0\0\x01")),
             Backend::FunctionCallResponse(None),
-            Backend::NegotiateProtocolVersion { minor: 2, options: vec![b"_pq_.x"] },
+            Backend::NegotiateProtocolVersion {
+                version: crate::PROTOCOL_3_2,
+                options: vec![b"_pq_.x"],
+            },
             Backend::NoData,
             Backend::NoticeResponse(vec![(b'S', b"NOTICE"), (b'M', b"hello")]),
             Backend::NotificationResponse { pid: 5, channel: b"c", payload: b"" },
