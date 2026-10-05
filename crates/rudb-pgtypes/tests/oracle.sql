@@ -492,3 +492,41 @@ order by a.n;
 -- The names in the error of array_recv when the element type is not the expected type.
 select 'format', '', x::text, format_type(x, null) from (select oid from pg_type where oid < 10000
   union all values (0::oid), (2), (9999)) s(x) order by x;
+-- The OID alias types. A number or a dash needs no lookup, and the output of an OID with no object
+-- is the number. A name needs the catalog, so a line has ERROR NAME for the error of a name.
+create function pg_temp.reg(t text, i text) returns text language plpgsql as $$
+declare
+  r text;
+  c text;
+  m text;
+begin
+  execute format('select %L::%s::text', i, t) into r;
+  return r;
+exception when others then
+  get stacked diagnostics c = returned_sqlstate, m = message_text;
+  return 'ERROR ' || c || ' ' || m;
+end
+$$;
+select 'reg ' || t, '', i, case when r like 'ERROR %' and r not like '%type oid%' then 'ERROR NAME' else r end
+from unnest(array['regproc', 'regprocedure', 'regoper', 'regoperator', 'regclass', 'regtype',
+  'regrole', 'regnamespace', 'regcollation', 'regconfig', 'regdictionary', 'regdatabase']) t,
+  unnest(array['-', '0', '8', '010', '0x10', '09', '4294967295', '4294967296', '3000000000',
+  '99999999999999999999', '00000000000000000008', '', ' ', ' 8', '8 ', '+8', '-8', '1e3', '--',
+  '٣', '0b1']) i,
+  lateral (select pg_temp.reg(t, i) as r) o
+order by t, i;
+-- The name lists of regclass. The error of a name that is not found has the parts with a dot
+-- between them. One or two parts give rel, three parts give db, and more parts give many.
+select 'names', '', i, case c
+    when '42P01' then 'rel ' || substring(m from '^relation "(.*)" does not exist$')
+    when '0A000' then 'db ' || substring(m from '^cross-database references are not implemented: "(.*)"$')
+    when '42601' then 'many ' || substring(m from '^improper relation name \(too many dotted names\): (.*)$')
+    else 'ERROR ' || c || ' ' || m end
+from unnest(array['zq', 'Zq', 'zq . "Q""d"', '"Zq"."x y"', 'zq.b.c', 'zq.b.c.d', 'zq.b.c.d.e',
+  '""', '"".zq', 'zq.', '.zq', 'zq..b', 'zq b', '"zq', '"zq"b', 'zq"b', 'ÉZQ.b', '  zq  .  b  ',
+  '', ' ', repeat('X', 70), '"' || repeat('Y', 70) || '"', repeat('q', 62) || 'é', 'zq,b',
+  'zq."b.c"', '"zq"""', '"zq"".b"', 'pg_catalog.zq', 'zq.pg_class', '"zq" . "b" . "c"', 'zq. ',
+  'ÉÀ', '"日本"', '日本.Zq']) with ordinality u(i, n),
+  lateral (select pg_temp.reg('regclass', i) as r) o,
+  lateral (select substring(o.r from '^ERROR (\S+) ') as c, substring(o.r from '^ERROR \S+ (.*)$') as m) e
+order by n;
