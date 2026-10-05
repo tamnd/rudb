@@ -2241,7 +2241,8 @@ impl<'a> Scan<'a> {
             }
         }
         *out = Chunk::with_rows(columns, kept)?;
-        if early && kept > 0 {
+        // A filter that went first has been applied already, and the columns only it read are gone.
+        if early && !ahead && kept > 0 {
             self.apply(at, out, false)?;
         }
         Ok(true)
