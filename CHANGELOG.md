@@ -8,6 +8,14 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.24
+
+For J7, the load. #2486 measures a coded text column from its codes, sketches each dictionary value once and builds the pieces of a graph link side by side, and #2514 looks a block of keys up in a dense key map, looks keys behind runs or a dictionary with a null up a distinct value at a time, reads a packed link's degrees off its adjacency and packs linear bit runs a word at a time. #2516 holds an integer column's primary keys as a bitmap over their range rather than a hash set, #2518 counts every caller feeding a load as busy so stripes stop starting threads on top of the parsers, and #2519 builds a checkpoint's text sections beside its links rather than after them. On server2 the JOB load goes from 266 to 285 s down to 188 s and its last checkpoint from 60 to 71 s down to 27 s.
+
+On compatibility, #2487 runs CREATE TRIGGER and DROP TRIGGER the way the pin does.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.23
 
 For W4, the point path. #2446 answers a prepared read by key without the plan, #2449 writes a row by its key where it is, #2450 keeps where the keys are across an append and inserts into a keyed table the short way, #2451 reads a short range by key in key order, and #2452 names the point plan a prepared statement runs as. #2468 puts several prepared rows in together and #2469 upserts a row by its key. Inside a transaction, #2453 inserts, #2470 reads, #2471 writes and #2475 upserts the short way too, and #2473 and #2474 commit a transaction's updates and deletes beside rows others appended since its snapshot instead of failing. On a file table, #2472 writes a row of the tail where it is, #2476 keeps rows appended after a delete or an update beside the file, and #2477 has a checkpoint extend the file and mark its gone rows again rather than write the table whole. #2447 reads the catalog without writing a shared line and #2448 spins through a short commit wait and parks for a long one. #2475 also fixes a commit that failed with nothing to conflict with after an insert inside a transaction.
