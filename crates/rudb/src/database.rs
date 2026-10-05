@@ -8054,8 +8054,21 @@ fn create_table(
     seams: &rudb_seam::Settings,
     session: &Session,
 ) -> Result<()> {
-    if create.if_not_exists && catalog.table(&create.name).is_ok() {
+    if create.if_not_exists && catalog.entry(&create.name).is_ok() {
         return Ok(());
+    }
+    // A name something already has is refused before the query runs, as the pin does, so a `CREATE
+    // TABLE t AS` over a `t` that is there does not read a billion rows to say so.
+    if let Ok(found) = catalog.entry(&create.name) {
+        let name = &create.name.table;
+        if !create.or_replace {
+            return Err(Error::catalog(format!("{found} with name \"{name}\" already exists!")));
+        }
+        if catalog.table(&create.name).is_err() {
+            return Err(Error::catalog(format!(
+                "Existing object \"{name}\" is of type {found}, trying to replace with type Table"
+            )));
+        }
     }
     // The query runs before the old table is dropped, so `CREATE OR REPLACE TABLE t AS SELECT * FROM
     // t` reads the table it is about to replace rather than the empty new one.

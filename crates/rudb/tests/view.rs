@@ -95,6 +95,24 @@ fn a_view_and_a_table_are_one_namespace_and_the_message_names_what_is_already_th
 }
 
 #[test]
+fn a_table_made_from_a_query_over_a_name_in_use_is_refused_before_the_query_runs() {
+    // The range is far too long to run, so an answer at all says the name was looked at first.
+    let long = "SELECT i FROM range(10000000000000000) r(i)";
+    assert_eq!(
+        refused(&["CREATE TABLE t (i INTEGER)"], &format!("CREATE TABLE t AS {long}")),
+        "Catalog Error: Table with name \"t\" already exists!"
+    );
+    assert_eq!(
+        refused(&["CREATE VIEW v AS SELECT 1"], &format!("CREATE OR REPLACE TABLE v AS {long}")),
+        "Catalog Error: Existing object \"v\" is of type View, trying to replace with type Table"
+    );
+    let database = ran(&["CREATE VIEW v AS SELECT 1 AS x"]);
+    database.execute(&format!("CREATE TABLE IF NOT EXISTS v AS {long}")).expect("nothing to do");
+    let result = database.query("SELECT x FROM v").expect("the view is still there");
+    assert_eq!(result.value_at(0, 0), Value::Integer(1));
+}
+
+#[test]
 fn dropping_one_as_the_other_says_which_is_which_even_under_if_exists() {
     assert_eq!(
         refused(&["CREATE VIEW v AS SELECT 1"], "DROP TABLE v"),
