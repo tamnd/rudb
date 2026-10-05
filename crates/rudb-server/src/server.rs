@@ -22,13 +22,16 @@ use rudb_pgwire::{
     CANCEL_KEY_LEN, Cancel, CancelKey, MOCK_NONCE_LEN, SCRAM_ITERATIONS, cancel_target,
 };
 
+use rudb_common::guc;
+
+use crate::conf;
 use crate::config::Config;
 use crate::hba::{self, Hba, Ident, ParseSettings};
 use crate::poll;
 use crate::roles::{self, Role, Roles};
 use crate::session;
 use crate::stream::Stream;
-use crate::tls;
+use crate::tls::{self, Tls};
 
 /// The name of the lock file in the data directory, which holds the process ID of the server.
 const PID_FILE: &str = "rudb-server.pid";
@@ -99,14 +102,29 @@ pub(crate) struct Sessions {
     map: HashMap<i32, Entry>,
 }
 
+/// The values of the configuration files and of the command line that a session starts with.
+#[derive(Debug, Default)]
+pub(crate) struct Defaults {
+    /// The items of the files that the server took, in the order of the files.
+    pub(crate) file: Vec<(String, String)>,
+    /// The parameters of the command line.
+    pub(crate) args: Vec<(String, String)>,
+    /// `data_directory`, `config_file`, `hba_file` and `ident_file`.
+    pub(crate) paths: Vec<(&'static str, String)>,
+}
+
 /// The state that the acceptor and all sessions share.
 #[derive(Debug)]
 pub(crate) struct Shared {
-    pub(crate) config: Config,
+    /// The configuration that the caller gave, under the values of the files.
+    base: Config,
+    /// The configuration with the values of the files, which a reload changes.
+    config: Mutex<Arc<Config>>,
+    /// The values of the command line and of the files, with the rules of the postmaster.
+    state: Mutex<conf::State>,
+    defaults: Mutex<Arc<Defaults>>,
     /// The TLS configuration, when `ssl` is on.
-    pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
-    /// The hash of the server certificate for SCRAM with channel binding, when `ssl` is on.
-    pub(crate) certificate_hash: Option<Vec<u8>>,
+    tls: Mutex<Option<Arc<Tls>>>,
     /// The nonce of the cluster that makes the mock SCRAM secret of a role with no secret.
     pub(crate) mock_nonce: [u8; MOCK_NONCE_LEN],
     hba: Mutex<Arc<Hba>>,
@@ -127,6 +145,70 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Shared {
+    /// The configuration of the server now.
+    pub(crate) fn config(&self) -> Arc<Config> {
+        lock(&self.config).clone()
+    }
+
+    /// The TLS configuration that new connections use.
+    pub(crate) fn tls(&self) -> Option<Arc<Tls>> {
+        lock(&self.tls).clone()
+    }
+
+    /// The values that new sessions start with, and that sessions take after a reload.
+    pub(crate) fn defaults(&self) -> Arc<Defaults> {
+        lock(&self.defaults).clone()
+    }
+
+    /// The reload after `SIGHUP`, `process_pm_reload_request`: the configuration files, then
+    /// `pg_hba.conf` and `pg_ident.conf`, then TLS. A file that does not load leaves the old one
+    /// in use.
+    fn reload(&self) {
+        log("LOG", "received SIGHUP, reloading configuration files");
+        let mut lines = Vec::new();
+        let config = {
+            let mut state = lock(&self.state);
+            state.reload(&mut lines);
+            for line in lines.drain(..) {
+                log("LOG", &line);
+            }
+            let config = match configure(&self.base, &state) {
+                Ok(config) => Arc::new(config),
+                Err(error) => {
+                    log("LOG", &error);
+                    self.config()
+                }
+            };
+            *lock(&self.defaults) = Arc::new(defaults(&config, &state));
+            config
+        };
+        *lock(&self.config) = config.clone();
+        let (hba_path, ident_path) = auth_paths(&config);
+        let hba = Hba::load(&hba_path, ParseSettings { ssl: config.ssl }, &mut lines);
+        for line in lines.drain(..) {
+            log("LOG", &line);
+        }
+        match hba {
+            Some(hba) => *lock(&self.hba) = Arc::new(hba),
+            None => log("LOG", &format!("{hba_path} was not reloaded")),
+        }
+        let ident = Ident::load(&ident_path, &mut lines);
+        for line in lines.drain(..) {
+            log("LOG", &line);
+        }
+        match ident {
+            Some(ident) => *lock(&self.ident) = Arc::new(ident),
+            None => log("LOG", &format!("{ident_path} was not reloaded")),
+        }
+        match tls::load(&config) {
+            Ok(tls) => *lock(&self.tls) = tls,
+            Err(error) => {
+                log("LOG", &error);
+                log("LOG", "SSL configuration was not reloaded");
+            }
+        }
+    }
+
     /// The `pg_hba.conf` that new connections use.
     pub(crate) fn hba(&self) -> Arc<Hba> {
         lock(&self.hba).clone()
@@ -160,7 +242,7 @@ impl Shared {
     pub(crate) fn admit(&self, pid: i32, protocol: u32) -> Result<CancelKey, Refusal> {
         let mut sessions = lock(&self.sessions);
         let started = sessions.map.values().filter(|entry| entry.key.is_some()).count();
-        if started >= self.config.max_connections {
+        if started >= self.config().max_connections {
             return Err(("53300", "sorry, too many clients already".to_owned()));
         }
         let key = CancelKey::new(pid, protocol, poll::random::<CANCEL_KEY_LEN>());
@@ -227,13 +309,14 @@ impl Shared {
         if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\', '\0']) {
             return Err(missing());
         }
-        let path = database_path(&self.config.data, name);
+        let config = self.config();
+        let path = database_path(&config.data, name);
         let mut databases = lock(&self.databases);
         if let Some(database) = databases.get(name) {
             return Ok(database.clone());
         }
         let exists = path.exists();
-        if !exists && !self.config.auto_create_database {
+        if !exists && !config.auto_create_database {
             return Err(missing());
         }
         if exists && name == "template0" {
@@ -255,6 +338,58 @@ impl Shared {
 /// The file of a database in the data directory.
 fn database_path(data: &Path, name: &str) -> PathBuf {
     data.join("base").join(format!("{name}.rudb"))
+}
+
+/// The settings of the server that the files can set.
+const SERVER_PARAMETERS: [&str; 13] = [
+    "listen_addresses",
+    "port",
+    "unix_socket_directories",
+    "unix_socket_permissions",
+    "max_connections",
+    "ssl",
+    "ssl_cert_file",
+    "ssl_key_file",
+    "ssl_ca_file",
+    "ssl_min_protocol_version",
+    "ssl_max_protocol_version",
+    "hba_file",
+    "ident_file",
+];
+
+/// The configuration of the server: the configuration that the caller gave, with the values of
+/// the files for the settings that the command line did not set.
+fn configure(base: &Config, state: &conf::State) -> Result<Config, String> {
+    let mut config = base.clone();
+    for name in SERVER_PARAMETERS {
+        if !base.in_args(name)
+            && let Some(value) = state.file_value(name)
+        {
+            config.assign(name, &value)?;
+        }
+    }
+    Ok(config)
+}
+
+/// The values that a session starts with.
+fn defaults(config: &Config, state: &conf::State) -> Defaults {
+    let (hba, ident) = auth_paths(config);
+    let args = config
+        .args
+        .iter()
+        .filter(|(name, _)| guc::find(name).is_some() || name.contains('.'))
+        .cloned()
+        .collect();
+    Defaults {
+        file: state.applied().to_vec(),
+        args,
+        paths: vec![
+            ("data_directory", state.data().to_owned()),
+            ("config_file", state.config_file().to_owned()),
+            ("hba_file", hba),
+            ("ident_file", ident),
+        ],
+    }
 }
 
 /// The paths of `pg_hba.conf` and `pg_ident.conf`, absolute, as PostgreSQL logs them.
@@ -396,7 +531,8 @@ impl Init {
 }
 
 /// Makes a data directory with the databases `postgres`, `template1` and `template0`, the role
-/// file, `pg_hba.conf` and `pg_ident.conf`, as `initdb` does.
+/// file, `postgresql.conf`, `postgresql.auto.conf`, `pg_hba.conf` and `pg_ident.conf`, as
+/// `initdb` does.
 ///
 /// # Errors
 ///
@@ -427,12 +563,18 @@ pub fn init(data: &Path, options: &Init) -> Result<(), String> {
             .map_err(|e| format!("could not create database \"{name}\": {}", e.message()))?;
     }
     write_mock_nonce(data)?;
+    let postgresql = conf::sample(local, host);
     let comment = if local == "trust" || host == "trust" { TRUST_COMMENT } else { "" };
     let hba = hba::fill_sample(
         HBA_SAMPLE,
         &[("@authmethodhost@", host), ("@authmethodlocal@", local), ("@authcomment@", comment)],
     );
-    for (name, text) in [("pg_hba.conf", hba.as_str()), ("pg_ident.conf", IDENT_SAMPLE)] {
+    for (name, text) in [
+        ("postgresql.conf", postgresql.as_str()),
+        (conf::AUTO_FILE, conf::AUTO_TEXT),
+        ("pg_hba.conf", hba.as_str()),
+        ("pg_ident.conf", IDENT_SAMPLE),
+    ] {
         let path = data.join(name);
         std::fs::write(&path, text)
             .and_then(|()| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)))
@@ -525,13 +667,24 @@ fn lock_file(path: &Path, lines: &str, what: &str) -> Result<(), String> {
 }
 
 impl Server {
-    /// Opens the listeners and starts to accept connections.
+    /// Reads the configuration files, opens the listeners and starts to accept connections.
+    /// The values of `postgresql.conf` and `postgresql.auto.conf` change the settings of
+    /// `config` that its command line, [`Config::set`], did not set.
     ///
     /// # Errors
     ///
-    /// A data directory that is not there or that another server uses, an address or a socket
-    /// that the server cannot bind, or no listener at all.
-    pub fn start(config: Config) -> Result<Server, String> {
+    /// A configuration file that is missing or has errors, a data directory that is not there or
+    /// that another server uses, an address or a socket that the server cannot bind, or no
+    /// listener at all.
+    pub fn start(base: Config) -> Result<Server, String> {
+        let mut state = conf::State::new(&base.data, &base.args);
+        let mut lines = Vec::new();
+        let started = state.start(&mut lines);
+        for line in lines {
+            log("LOG", &line);
+        }
+        started?;
+        let config = configure(&base, &state)?;
         if !config.data.join("base").is_dir() {
             return Err(format!(
                 "\"{}\" is not a valid data directory\nDETAIL:  The directory \"base\" is \
@@ -539,10 +692,7 @@ impl Server {
                 config.data.display()
             ));
         }
-        let (tls, certificate_hash) = match tls::load(&config)? {
-            Some((tls, hash)) => (Some(tls), Some(hash)),
-            None => (None, None),
-        };
+        let tls = tls::load(&config)?;
         let mock_nonce = mock_nonce(&config.data)?;
         let roles = Arc::new(Roles::open(&config.data)?);
         let mut owned = Vec::new();
@@ -566,10 +716,13 @@ impl Server {
             }
         };
         let (stop_read, stop) = UnixStream::pair().map_err(|e| e.to_string())?;
+        let defaults = defaults(&config, &state);
         let shared = Arc::new(Shared {
-            config,
-            tls,
-            certificate_hash,
+            base,
+            config: Mutex::new(Arc::new(config)),
+            state: Mutex::new(state),
+            defaults: Mutex::new(Arc::new(defaults)),
+            tls: Mutex::new(tls),
             mock_nonce,
             hba: Mutex::new(Arc::new(hba)),
             ident: Mutex::new(Arc::new(ident)),
@@ -700,7 +853,14 @@ impl Server {
     /// The port: the port of the first TCP address, or the port of the configuration when there
     /// is no TCP address.
     pub fn port(&self) -> u16 {
-        self.addresses.first().map_or(self.shared.config.port, SocketAddr::port)
+        self.addresses.first().map_or(self.shared.config().port, SocketAddr::port)
+    }
+
+    /// Reads the configuration files, `pg_hba.conf`, `pg_ident.conf` and the TLS files again,
+    /// as PostgreSQL does after `SIGHUP`. Each change and each error goes to the log. The
+    /// sessions take the new values before the next message that they handle.
+    pub fn reload(&self) {
+        self.shared.reload();
     }
 
     /// The number of sessions that finished their startup and did not end yet.

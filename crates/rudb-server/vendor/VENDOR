@@ -10,4 +10,5 @@ version: 19beta4
 # sha256 of every vendored file, relative to this directory.
 c75439fff77d80ae5c616903359b8d2ab3f43028f4edeb562effe22a19c7804f  pg_hba.conf.sample
 bf8f1664dc42eeb78a71a3746afb6b6c93805bda55ff4504f796dbe339d1fa50  pg_ident.conf.sample
+17f22d8f91f4c9d5c98dfb2b143ae57ee1495205ea9974d6757349ebdc400836  postgresql.conf.sample
 3d6af92ff8a4c2cdf69afb1cf44edea727922f5cd0cf8b5f72b11cdecac8fdfd  LICENSE.postgres

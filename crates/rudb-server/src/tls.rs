@@ -1,8 +1,9 @@
 //! TLS with `rustls`: the configuration that the server loads at start, and the handshake of one
 //! connection.
 //!
-//! The server loads the certificate and the key once, as `be_tls_init` of PostgreSQL does, and
-//! does not start when they do not load. A connection starts TLS in one of two ways: with an
+//! The server loads the certificate and the key at start, as `be_tls_init` of PostgreSQL does,
+//! and does not start when they do not load. A reload loads them again, and keeps the old ones
+//! when the new ones do not load. A connection keeps the configuration that it started with. A connection starts TLS in one of two ways: with an
 //! `SSLRequest` and the answer `S`, or with a TLS handshake as its first bytes, which is direct
 //! TLS. Direct TLS needs the ALPN protocol `postgresql`, as in PostgreSQL 17 and later.
 
@@ -50,17 +51,24 @@ fn in_data(config: &Config, file: &Path) -> PathBuf {
     if file.is_absolute() { file.to_owned() } else { config.data.join(file) }
 }
 
-/// The TLS configuration of the server and the hash of its certificate for SCRAM with channel
-/// binding.
-pub(crate) type Loaded = (Arc<ServerConfig>, Vec<u8>);
+/// The TLS configuration of the server.
+#[derive(Debug)]
+pub(crate) struct Tls {
+    pub(crate) config: Arc<ServerConfig>,
+    /// The hash of the certificate for SCRAM with channel binding.
+    pub(crate) hash: Vec<u8>,
+    /// True when `ssl_ca_file` gave root certificates, so that the server can check a client
+    /// certificate.
+    pub(crate) ca: bool,
+}
 
-/// The TLS configuration and the certificate hash, or `None` when `ssl` is off.
+/// The TLS configuration, or `None` when `ssl` is off.
 ///
 /// # Errors
 ///
 /// The text of PostgreSQL for a certificate or a key that does not load, a key that other users
 /// can read, a key that is not the key of the certificate, or a version range that is empty.
-pub(crate) fn load(config: &Config) -> Result<Option<Loaded>, String> {
+pub(crate) fn load(config: &Config) -> Result<Option<Arc<Tls>>, String> {
     if !config.ssl {
         return Ok(None);
     }
@@ -137,7 +145,8 @@ pub(crate) fn load(config: &Config) -> Result<Option<Loaded>, String> {
     // PostgreSQL turns off session resumption, both the cache and the tickets.
     tls.session_storage = Arc::new(NoServerSessionStorage {});
     tls.send_tls13_tickets = 0;
-    Ok(Some((Arc::new(tls), hash)))
+    let ca = !config.ssl_ca_file.as_os_str().is_empty();
+    Ok(Some(Arc::new(Tls { config: Arc::new(tls), hash, ca })))
 }
 
 /// The hash of the certificate for `tls-server-end-point`, as `be_tls_get_certificate_hash`

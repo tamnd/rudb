@@ -312,43 +312,53 @@ impl Tokenizer<'_> {
         if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
     }
 
-    /// `GetConfFilesInDir`.
+    /// `GetConfFilesInDir`, with its error in the log of the tokenizer.
     fn conf_files(&mut self, outer: &str, name: &str) -> Result<Vec<String>, String> {
-        if name.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
-            self.error(&format!("empty configuration directory name: \"{name}\""));
-            return Err("empty configuration directory name".to_owned());
-        }
-        let dir = absolute_location(name, Some(outer));
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                self.error(&format!(
-                    "could not open configuration directory \"{dir}\": {}",
-                    os_text(&e)
-                ));
-                return Err(format!("could not open directory \"{dir}\""));
-            }
-        };
-        let mut files = Vec::new();
-        for entry in entries.flatten() {
-            let file = entry.file_name();
-            let file = file.to_string_lossy();
-            if file.len() < 6 || file.starts_with('.') || !file.ends_with(".conf") {
-                continue;
-            }
-            let path = canonical(&Path::new(&dir).join(&*file));
-            match std::fs::metadata(&path) {
-                Ok(meta) if meta.is_dir() => {}
-                Ok(_) => files.push(path),
-                Err(e) => {
-                    self.error(&format!("could not stat file \"{path}\": {}", os_text(&e)));
-                    return Err(format!("could not stat file \"{path}\""));
-                }
-            }
-        }
-        files.sort();
-        Ok(files)
+        conf_files(outer, name).map_err(|(text, error)| {
+            self.error(&text);
+            error
+        })
     }
+}
+
+/// `GetConfFilesInDir`: the files of the directory `name` that end in `.conf`, in the order of
+/// their names. `name` is relative to the directory of the file `outer`. An error is the text of
+/// the log line and the short text of the error.
+pub(crate) fn conf_files(outer: &str, name: &str) -> Result<Vec<String>, (String, String)> {
+    if name.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
+        return Err((
+            format!("empty configuration directory name: \"{name}\""),
+            "empty configuration directory name".to_owned(),
+        ));
+    }
+    let dir = absolute_location(name, Some(outer));
+    let entries = std::fs::read_dir(&dir).map_err(|e| {
+        (
+            format!("could not open configuration directory \"{dir}\": {}", os_text(&e)),
+            format!("could not open directory \"{dir}\""),
+        )
+    })?;
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let file = file.to_string_lossy();
+        if file.len() < 6 || file.starts_with('.') || !file.ends_with(".conf") {
+            continue;
+        }
+        let path = canonical(&Path::new(&dir).join(&*file));
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => files.push(path),
+            Err(e) => {
+                return Err((
+                    format!("could not stat file \"{path}\": {}", os_text(&e)),
+                    format!("could not stat file \"{path}\""),
+                ));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// `next_token`: the next token of `line` from `at`, whether it started with a quote, and
@@ -390,7 +400,7 @@ fn next_token(line: &[u8], at: &mut usize) -> Option<(String, bool, bool)> {
 }
 
 /// `AbsoluteConfigLocation`: a path relative to the directory of the file that names it.
-fn absolute_location(location: &str, calling: Option<&str>) -> String {
+pub(crate) fn absolute_location(location: &str, calling: Option<&str>) -> String {
     let path = Path::new(location);
     if path.is_absolute() {
         return location.to_owned();
