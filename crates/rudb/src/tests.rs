@@ -13023,3 +13023,32 @@ fn a_postgres_session_answers_current_setting_version_and_the_user() {
     // Another connection of the same database is not a PostgreSQL session.
     assert_eq!(rows(&db, "SELECT current_user"), vec![vec![Value::Varchar("duckdb".to_owned())]]);
 }
+
+#[test]
+fn a_postgres_session_names_columns_the_way_postgres_does() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+
+    let db = Database::new();
+    let connection = db.connect();
+    let names = |sql: &str| connection.query(sql).expect("runs").names().to_vec();
+    assert_eq!(names("SELECT 1, lower('A')"), ["1", "lower('A')"]);
+    let postgres = Postgres { settings: Settings::new(true), version: String::new() };
+    connection.set_postgres(Arc::new(postgres));
+    assert_eq!(
+        names("SELECT 1, 'x', version(), count(*)"),
+        ["?column?", "?column?", "version", "count"]
+    );
+    assert_eq!(
+        names("SELECT '1'::int, CAST(1 AS bigint), 'a'::varchar(3), '1'::double precision"),
+        ["int4", "int8", "varchar", "float8"]
+    );
+    assert_eq!(
+        names(
+            "SELECT CASE WHEN true THEN 1 END, coalesce(1, 2), EXISTS (SELECT 1), (SELECT 1 AS q)"
+        ),
+        ["case", "coalesce", "exists", "q"]
+    );
+    assert_eq!(names("SELECT * FROM (VALUES (1, 2)) v"), ["column1", "column2"]);
+    assert_eq!(names("SELECT x::text FROM (SELECT 1 AS x) t"), ["x"]);
+}
