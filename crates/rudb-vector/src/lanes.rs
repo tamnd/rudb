@@ -75,22 +75,50 @@ pub(crate) fn bytes_of(words: &[u64]) -> &[u8] {
 /// between one and [`LANE_WIDTH_MAX`], and `low` and `span` are at most the largest code.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn within(bytes: &[u8], width: usize, low: u32, span: u32) -> u64 {
+    let mut word = u64::MAX;
+    within_words(bytes, width, low, span, std::slice::from_mut(&mut word), true);
+    word
+}
+
+/// [`within`] for each block of `words`, block `b` starting `b * width` words into `bytes`, and how
+/// many rows are set after.
+///
+/// With `fresh` each word is set to what its block holds, and without it each word is narrowed to
+/// that and a word already empty is not read at all, which is how a filter's second column skips
+/// the blocks its first one emptied. One call for the blocks of a chunk rather than one a block,
+/// because the tables, the mask and the range go into registers once here, and a call a block
+/// put that setup and a function's way in and out around 64 rows. On TPC-H q06 that was as much
+/// again as the compares themselves.
+///
+/// `bytes` holds the blocks and the sixteen bytes [`readable`] asks for after the last one.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+pub(crate) fn within_words(
+    bytes: &[u8],
+    width: usize,
+    low: u32,
+    span: u32,
+    words: &mut [u64],
+    fresh: bool,
+) -> usize {
     use std::arch::x86_64::{
         _mm_loadu_si128, _mm256_and_si256, _mm256_castsi256_ps, _mm256_cmpeq_epi32,
         _mm256_loadu_si256, _mm256_min_epu32, _mm256_movemask_ps, _mm256_set_m128i,
         _mm256_set1_epi32, _mm256_shuffle_epi8, _mm256_srlv_epi32, _mm256_sub_epi32,
     };
-    assert!((1..=LANE_WIDTH_MAX).contains(&width) && bytes.len() >= readable(width));
+    assert!((1..=LANE_WIDTH_MAX).contains(&width));
+    let Some(last) = words.len().checked_sub(1) else { return 0 };
+    assert!(bytes.len() >= last * 8 * width + readable(width));
     let (shuffle, shifts) = &LANES[width];
     let half = 4 * width / 8;
-    let mut word = 0_u64;
+    let mut kept = 0;
     // SAFETY: the build enables AVX2, which the `cfg` on this function checks. The table loads read
-    // the 32 bytes of one entry. Group `g` loads sixteen bytes at `g * width` and at
-    // `g * width + half`, and for the last group the second ends at `7 * width + half + 16`, which
-    // is under `readable(width)`, so the assert above keeps every load inside `bytes`. `loadu` has
-    // no alignment requirement.
+    // the 32 bytes of one entry. Block `b` starts at `8 * b * width`, and its group `g` loads
+    // sixteen bytes at `g * width` and at `g * width + half` from there, so for the last group of
+    // the last block the second load ends at `8 * last * width + 7 * width + half + 16`, which is
+    // under the length the assert above checks. `loadu` has no alignment requirement.
     unsafe {
         let shuffle = _mm256_loadu_si256(shuffle.as_ptr().cast());
         let shifts = _mm256_loadu_si256(shifts.as_ptr().cast());
@@ -100,25 +128,33 @@ pub(crate) fn within(bytes: &[u8], width: usize, low: u32, span: u32) -> u64 {
             _mm256_set1_epi32(low as i32),
             _mm256_set1_epi32(span as i32),
         );
-        let at = bytes.as_ptr();
-        for group in 0..8 {
-            let first = at.add(group * width);
-            let lanes = _mm256_set_m128i(
-                _mm_loadu_si128(first.add(half).cast()),
-                _mm_loadu_si128(first.cast()),
-            );
-            let codes = _mm256_and_si256(
-                _mm256_srlv_epi32(_mm256_shuffle_epi8(lanes, shuffle), shifts),
-                mask,
-            );
-            let offset = _mm256_sub_epi32(codes, low);
-            let kept = _mm256_cmpeq_epi32(_mm256_min_epu32(offset, span), offset);
-            #[expect(clippy::cast_sign_loss, reason = "eight bits of a movemask")]
-            let bits = _mm256_movemask_ps(_mm256_castsi256_ps(kept)) as u64;
-            word |= bits << (group * 8);
+        for (block, word) in words.iter_mut().enumerate() {
+            if !fresh && *word == 0 {
+                continue;
+            }
+            let at = bytes.as_ptr().add(8 * block * width);
+            let mut found = 0_u64;
+            for group in 0..8 {
+                let first = at.add(group * width);
+                let lanes = _mm256_set_m128i(
+                    _mm_loadu_si128(first.add(half).cast()),
+                    _mm_loadu_si128(first.cast()),
+                );
+                let codes = _mm256_and_si256(
+                    _mm256_srlv_epi32(_mm256_shuffle_epi8(lanes, shuffle), shifts),
+                    mask,
+                );
+                let offset = _mm256_sub_epi32(codes, low);
+                let kept = _mm256_cmpeq_epi32(_mm256_min_epu32(offset, span), offset);
+                #[expect(clippy::cast_sign_loss, reason = "eight bits of a movemask")]
+                let bits = _mm256_movemask_ps(_mm256_castsi256_ps(kept)) as u64;
+                found |= bits << (group * 8);
+            }
+            *word = if fresh { found } else { *word & found };
+            kept += word.count_ones() as usize;
         }
     }
-    word
+    kept
 }
 
 /// The 64 codes at `bytes`, each widened to a word, into `out`.
@@ -214,6 +250,34 @@ mod tests {
             let mut out = [u64::MAX; 64];
             unpack(&bytes, width, &mut out);
             assert_eq!(out.as_slice(), codes.as_slice(), "width {width}");
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn blocks_in_one_call_agree_with_a_block_at_a_time() {
+        for width in 1..=LANE_WIDTH_MAX {
+            let top = (1_u64 << width) - 1;
+            let blocks = 5;
+            let mut bytes = vec![0_u8; (blocks - 1) * 8 * width + readable(width)];
+            let bits = 8 * bytes.len();
+            for bit in 0..bits {
+                bytes[bit / 8] |= u8::from((bit * 2_654_435_761) % 7 < 3) << (bit % 8);
+            }
+            let (low, span) = (top / 5, top / 3);
+            #[expect(clippy::cast_possible_truncation, reason = "under 2^25")]
+            let (low, span) = (low as u32, span as u32);
+            let each: Vec<u64> = (0..blocks)
+                .map(|block| within(&bytes[8 * block * width..], width, low, span))
+                .collect();
+            let mut words = vec![0_u64; blocks];
+            let kept = within_words(&bytes, width, low, span, &mut words, true);
+            assert_eq!(words, each, "width {width}");
+            assert_eq!(kept, each.iter().map(|word| word.count_ones() as usize).sum::<usize>());
+            let mut words = vec![u64::MAX, 0, 0x5555_5555_5555_5555, u64::MAX, 1];
+            let narrowed: Vec<u64> = words.iter().zip(&each).map(|(word, held)| word & held).collect();
+            within_words(&bytes, width, low, span, &mut words, false);
+            assert_eq!(words, narrowed, "width {width} narrowed");
         }
     }
 

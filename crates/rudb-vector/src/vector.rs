@@ -4602,6 +4602,59 @@ impl Packed<'_> {
             .enumerate()
             .fold(0, |word, (bit, &code)| word | u64::from(code.wrapping_sub(low) <= span) << bit)
     }
+
+    /// [`Self::within`] for the 64 rows of each word of `words`, word `b` answering rows `64 * b`
+    /// on, and how many rows are set after.
+    ///
+    /// With `fresh` each word is set to what its rows hold, and without it each word is narrowed to
+    /// that and an empty word is skipped. The caller has `64 * words.len()` rows. The blocks the
+    /// lanes take are done in one call into them rather than one each, see
+    /// [`crate::lanes::within_words`] for why, and the rest a block at a time as before.
+    #[must_use]
+    pub fn within_words(&self, words: &mut [u64], fresh: bool, low: u64, span: u64) -> usize {
+        if low > self.mask() {
+            words.fill(0);
+            return 0;
+        }
+        let span = span.min(self.mask());
+        let mut done = 0;
+        let mut kept = 0;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            let width = self.width as usize;
+            if self.offset % 64 == 0 && width <= crate::lanes::LANE_WIDTH_MAX {
+                let start = self.offset / 64 * width * size_of::<u64>();
+                let bytes = crate::lanes::bytes_of(self.words).get(start..).unwrap_or_default();
+                // The last block the bytes hold with the sixteen the loads read past it, and
+                // the blocks after it, if any, go the long way below.
+                done = bytes
+                    .len()
+                    .checked_sub(crate::lanes::readable(width))
+                    .map_or(0, |room| room / (8 * width) + 1)
+                    .min(words.len());
+                #[expect(clippy::cast_possible_truncation, reason = "both are under 2^25")]
+                {
+                    kept = crate::lanes::within_words(
+                        bytes,
+                        width,
+                        low as u32,
+                        span as u32,
+                        &mut words[..done],
+                        fresh,
+                    );
+                }
+            }
+        }
+        for (block, word) in words.iter_mut().enumerate().skip(done) {
+            if !fresh && *word == 0 {
+                continue;
+            }
+            let found = self.within(64 * block, low, span);
+            *word = if fresh { found } else { *word & found };
+            kept += word.count_ones() as usize;
+        }
+        kept
+    }
 }
 
 /// The block of 64 codes whose `width` words start at `words[word]`, unpacked into `out`, and false
@@ -8227,6 +8280,18 @@ mod tests {
                             "width {width} cut {at} rows {from} range {low}+{span}"
                         );
                     }
+                    let blocks = (rows - at) / 64;
+                    let each: Vec<u64> =
+                        (0..blocks).map(|block| packed.within(64 * block, low, span)).collect();
+                    let mut words = vec![0_u64; blocks];
+                    let kept = packed.within_words(&mut words, true, low, span);
+                    assert_eq!(words, each, "width {width} cut {at} range {low}+{span}");
+                    assert_eq!(kept, each.iter().map(|word| word.count_ones() as usize).sum());
+                    let mut words: Vec<u64> =
+                        (0..blocks as u64).map(|block| block.wrapping_mul(0x5851_F42D)).collect();
+                    let want: Vec<u64> = words.iter().zip(&each).map(|(a, b)| a & b).collect();
+                    let _ = packed.within_words(&mut words, false, low, span);
+                    assert_eq!(words, want, "width {width} cut {at} range {low}+{span} narrowed");
                 }
             }
         }

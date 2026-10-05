@@ -781,14 +781,7 @@ pub fn mask_within(
             reason = "both ends are inside the codes the width holds, so both differences fit a u64"
         )]
         let (from, span) = ((low - packed.base()) as u64, (high - low) as u64);
-        let within = |code: u64| code.wrapping_sub(from) <= span;
-        return Some(masked_words(
-            len,
-            words,
-            fresh,
-            |base| packed.within(base, from, span),
-            |row| within(packed.code(row)),
-        ));
+        return Some(packed_words(&packed, len, words, fresh, from, span));
     }
     macro_rules! flat {
         ($($variant:ident: $signed:ty => $unsigned:ty),+ $(,)?) => {
@@ -897,28 +890,27 @@ fn masked_blocks(
     kept
 }
 
-/// [`masked_blocks`] for a column that answers a whole block as a word, which a packed column does
-/// without unpacking it, see [`rudb_vector::vector::Packed::within`].
-fn masked_words(
+/// [`masked_blocks`] for a packed column and a range of codes, with the whole blocks answered in
+/// one call, see [`Packed::within_words`], and the rows past the last of them a code at a time.
+fn packed_words(
+    packed: &Packed<'_>,
     len: usize,
     words: &mut [u64],
     fresh: bool,
-    block: impl Fn(usize) -> u64,
-    held: impl Fn(usize) -> bool,
+    from: u64,
+    span: u64,
 ) -> usize {
     let whole = len / 64;
-    let mut kept = 0;
-    for (at, word) in words.iter_mut().enumerate() {
-        if !fresh && *word == 0 {
-            continue;
-        }
-        let base = at * 64;
-        let mask = if at < whole {
-            block(base)
-        } else {
-            (base..len).fold(0, |mask, row| mask | u64::from(held(row)) << (row - base))
-        };
-        *word = if fresh { mask } else { *word & mask };
+    let (blocks, tail) = words.split_at_mut(whole);
+    let mut kept = packed.within_words(blocks, fresh, from, span);
+    if let Some(word) = tail.first_mut()
+        && (fresh || *word != 0)
+    {
+        let base = whole * 64;
+        let held = (base..len).fold(0, |mask, row| {
+            mask | u64::from(packed.code(row).wrapping_sub(from) <= span) << (row - base)
+        });
+        *word = if fresh { held } else { *word & held };
         kept += word.count_ones() as usize;
     }
     kept
@@ -964,13 +956,7 @@ fn packed_range(
         // q14, whose one range on `l_shipdate` comes here rather than to the mask filter.
         None => {
             let mut words = vec![0_u64; len.div_ceil(64)];
-            let kept = masked_words(
-                len,
-                &mut words,
-                true,
-                |base| packed.within(base, from, span),
-                |row| within(packed.code(row)),
-            );
+            let kept = packed_words(packed, len, &mut words, true, from, span);
             mask_selection(&words, kept)
         }
     })
