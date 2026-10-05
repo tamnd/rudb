@@ -20,7 +20,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use rudb_common::bounds::{Bound, Frequencies, Remainder};
+use rudb_common::bounds::{Bound, Frequencies, Op, Remainder};
 use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{Field, Value};
 use rudb_storage::MemoryTable;
@@ -96,6 +96,16 @@ impl Frequencies for Held {
         // where something in the list would at least compare: a constant of another type would come
         // back as zero rows for a reason that is about the types rather than about the column.
         if comparable { Stat::exact(0, Provenance::FrequencySynopsis) } else { Stat::Unknown }
+    }
+
+    fn rows_passing(&self, column: usize, tests: &[(Op, Bound)]) -> Stat<u64> {
+        let Some((_, Some(held))) = self.columns.get(column) else {
+            return Stat::Unknown;
+        };
+        match rudb_common::bounds::passing(held.iter(), tests) {
+            Some(rows) => Stat::exact(rows, Provenance::FrequencySynopsis),
+            None => Stat::Unknown,
+        }
     }
 
     fn remainder(&self, _column: usize) -> Option<Remainder> {

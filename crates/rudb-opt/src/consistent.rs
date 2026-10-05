@@ -1049,7 +1049,16 @@ impl Weight {
                 Some(reach.touched(share * reach.values as f64))
             })
             .fold(1.0, f64::min);
-        let scanned = self.rows as f64 * touched * (1.0 + self.width as f64 * fed);
+        // The rest of the columns at the rows the keys keep, and those are read out of every part
+        // one of the rows is in, at the share of a scan of it [`DECODE`] says, and at the rows on
+        // top. Priced at the rows alone, the names of the 285,237 people `cast_info` left in JOB 6d
+        // cost a fifteenth of reading every name. Those people are in every part of `name`, and
+        // reading them took nine tenths of the time of the whole scan.
+        let rows = self.rows as f64;
+        let parts = (rows / PART).ceil().max(1.0);
+        let spread = (1.0 - (1.0 - 1.0 / parts).powf(rows * touched * fed)).min(touched);
+        let wide = (spread * DECODE + touched * fed * (1.0 - DECODE)).min(touched);
+        let scanned = rows * (touched + self.width as f64 * wide);
         // Read at the rows the narrowed classes' values are in, which the executor does when each
         // is under one row in `GATHERED`, see `listed_keys` in `rudb-exec`, and at the rows all of
         // them hand down together. A row found that way is found in its part, and the part is
@@ -1068,9 +1077,7 @@ impl Weight {
         else {
             return scanned;
         };
-        let rows = self.rows as f64;
         let found = rows * backoff(shares.map(|(share, _)| share));
-        let parts = (rows / PART).ceil().max(1.0);
         // No more parts than the kept values' own reach puts them in, where the table is laid out
         // by the key and the rows of a value sit together.
         let decoded = (1.0 - (1.0 - 1.0 / parts).powf(found))
@@ -1168,6 +1175,14 @@ impl Weight {
         (named > 0.0).then(|| parts * (share / named).min(1.0))
     }
 
+    /// How many values of `class` it holds, where the store counted.
+    fn own(&self, class: u32) -> Option<u64> {
+        let counted =
+            self.skew.iter().find(|(held, ..)| *held == class).map(|&(.., values)| values);
+        let reach = self.reach.iter().find(|(held, _)| *held == class);
+        counted.or_else(|| reach.map(|(_, reach)| reach.values)).filter(|&own| own > 0)
+    }
+
     /// The share of its own values of `class` that `share` of the class's values keeps.
     ///
     /// The same share when the values kept are spread over the class. Not when a query names them:
@@ -1183,11 +1198,7 @@ impl Weight {
         let Some(&(_, domain)) = self.domain.iter().find(|(held, _)| *held == class) else {
             return share;
         };
-        let counted =
-            self.skew.iter().find(|(held, ..)| *held == class).map(|&(.., values)| values);
-        let reach = self.reach.iter().find(|(held, _)| *held == class);
-        let own = counted.or_else(|| reach.map(|(_, reach)| reach.values));
-        let Some(own) = own.filter(|&own| own > 0 && own < domain) else {
+        let Some(own) = self.own(class).filter(|&own| own < domain) else {
             return share;
         };
         let kept = share * domain as f64;
@@ -1742,21 +1753,45 @@ fn ears(
 
 /// What is left standing of each of its classes once `ear` is taken.
 ///
-/// The share of its rows it keeps, and no more than the rows it keeps can hold of the class's
-/// values. In JOB 21a `link_type` keeps two kinds of link out of eighteen, and the two are the
-/// common ones, so `movie_link` keeps more than half its rows. Those are 16,000 rows, which name at
-/// most 16,000 of the 2.5 million movies. Taken as half the movies, reading `movie_link` early
-/// narrowed nothing, the order put it after `movie_info`, and 21a went from 23 ms to 330.
+/// The values its kept rows hold. Of the values still standing it holds some, each in as many of
+/// its rows as the rows they reach over those values, and a value is left when any one of its rows
+/// is kept, which for rows kept at random is one less the chance that none of them is. That is
+/// Cardenas' formula with the rows a value has in place of drawing with replacement. A table with
+/// one row a value keeps its share of the values, and a table kept whole keeps every value it has.
+///
+/// The share of the rows was taken for every class before, and for a class the relation did not
+/// narrow that is far too few. In JOB 6d `cast_info` keeps the rows of eleven thousand movies, a
+/// thousandth of its rows, and those name 285,237 people, seven hundredths of them. Taken as a
+/// thousandth, `name` read at the people left looked five times cheaper than it is, and the order
+/// read it last at twice the time of reading it first.
+///
+/// Only the values the relation holds, too. In JOB 21a `link_type` keeps two kinds of link out of
+/// eighteen, and the two are the common ones, so `movie_link` keeps more than half its rows. Those
+/// are 16,000 rows over the few thousand movies it has links for, out of 2.5 million. Taken as half
+/// the movies, reading `movie_link` early narrowed nothing, the order put it after `movie_info`, and
+/// 21a went from 23 ms to 330.
 #[expect(clippy::cast_precision_loss, reason = "counts of rows and values are weights here")]
 fn take(edges: &[BTreeSet<u32>], weights: &[Weight], standing: &mut Standing, ear: usize) {
-    let share = weights[ear].fed(standing, &edges[ear]) * weights[ear].kept;
-    let rows = share * weights[ear].rows as f64;
+    let weight = &weights[ear];
+    let share = weight.fed(standing, &edges[ear]) * weight.kept;
+    let rows = share * weight.rows as f64;
     for &class in &edges[ear] {
-        let values =
-            weights[ear].domain.iter().find(|(held, _)| *held == class).map(|&(_, values)| values);
-        let named = values.map_or(1.0, |values| (rows / values as f64).min(1.0));
+        let values = weight.domain.iter().find(|(held, _)| *held == class);
+        let Some(&(_, values)) = values.filter(|&&(_, values)| values > 0) else {
+            let held = standing.held(class);
+            *held = held.min(share);
+            continue;
+        };
+        let values = values as f64;
+        let before = standing.get(&class).copied().unwrap_or(1.0);
+        let own = weight.own(class).map_or(values, |own| own as f64);
+        let holds = own.min(before * values).max(1.0);
+        let reached = (weight.rows as f64 * weight.reached(class, before)).max(1.0);
+        let each = (reached / holds).max(1.0);
+        let picked = (rows / reached).min(1.0);
+        let left = holds * (1.0 - (1.0 - picked).powf(each)) / values;
         let held = standing.held(class);
-        *held = held.min(share).min(named);
+        *held = held.min(left).min(rows / values);
     }
 }
 
@@ -2218,6 +2253,47 @@ mod tests {
         assert!((movies - 30_000.0 * 10.0 / 18.0 / 2_500_000.0).abs() < 1e-12, "{movies}");
     }
 
+    /// JOB 6d: `cast_info` kept at the movies `title` left keeps a thousandth of its rows, and a
+    /// person has nine rows of it, so those rows name seven hundredths of the people and not a
+    /// thousandth. The movies stay the ones that were standing, since every row kept is one of them.
+    #[test]
+    fn a_relation_leaves_standing_the_values_its_kept_rows_hold_and_not_its_share_of_rows() {
+        let mut cast_info = weight(36_244_344, 0, 1.0);
+        cast_info.skew = vec![(1, 11.5, 4_051_810)];
+        cast_info.reach = vec![(
+            0,
+            Reach {
+                parts: 4_425,
+                values: 2_525_975,
+                per_value: 4_421.0,
+                wide: 0,
+                wide_per_value: 0.0,
+            },
+        )];
+        cast_info.domain = vec![(0, 2_528_312), (1, 4_167_491)];
+        let edges = edges(&[&[0, 1]]);
+        let movies = 0.008;
+        let mut standing = Standing::from([(0, movies)]);
+        take(&edges, &[cast_info], &mut standing, 0);
+        let people = standing[&1];
+        assert!((0.06..0.075).contains(&people), "{people}");
+        assert!((standing[&0] - movies).abs() < 1e-9, "{}", standing[&0]);
+    }
+
+    /// JOB 6d: `name` read at the people `cast_info` left. They are seven hundredths of the names
+    /// and in every part, so every part of the names is read, and that costs most of a scan.
+    #[test]
+    fn a_wide_column_read_at_rows_in_every_part_costs_the_parts_and_not_only_the_rows() {
+        let mut name = weight(4_167_491, 4, 1.0);
+        name.domain = vec![(1, 4_167_491)];
+        let classes = BTreeSet::from([1]);
+        let whole = name.cost(&Standing::new(), &classes);
+        let people = name.cost(&Standing::from([(1, 0.068)]), &classes);
+        assert!(people > whole * 0.4, "{people} {whole}");
+        let few = name.cost(&Standing::from([(1, 10.0 / 4_167_491.0)]), &classes);
+        assert!(few < whole / 4.0, "{few} {whole}");
+    }
+
     /// JOB 13a: `info_type` keeps one type of 113, and `movie_info_idx` holds five of them. The one
     /// a query names is one of the five, so it reaches a fifth of them and not one percent.
     #[test]
@@ -2264,8 +2340,11 @@ mod tests {
         let average = movie_info.cost(&standing, &classes);
         movie_info.named = vec![(0, 1, 0.085, Some(390.0 / 1_812.0))];
         let counted = movie_info.cost(&standing, &classes);
-        let parts = 390.0 / 1_812.0 * 14_835_720.0;
-        assert!((counted - parts * (1.0 + 4.0 * 0.085)).abs() < 1.0, "{counted}");
+        // The rows the keys keep are in every part the named value is in, so the rest of the
+        // columns are read in all of those parts, at the share of a scan a gather decodes them at.
+        let touched = 390.0 / 1_812.0;
+        let wide = touched * (DECODE + 0.085 * (1.0 - DECODE));
+        assert!((counted - 14_835_720.0 * (touched + 4.0 * wide)).abs() < 1.0, "{counted}");
         assert!(counted > average * 4.0, "{average} {counted}");
     }
 

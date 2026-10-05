@@ -48,7 +48,9 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use rudb_common::Result;
-use rudb_common::bounds::{Bound, End, Frequencies, Reach, Remainder, Spread, Test, Zones, kept};
+use rudb_common::bounds::{
+    Bound, End, Frequencies, Op, Reach, Remainder, Spread, Test, Zones, kept,
+};
 use rudb_common::stat::{Direction, Provenance};
 use rudb_common::{ColumnFacts, LogicalType, Stat, Value};
 use rudb_storage::Probe;
@@ -456,6 +458,18 @@ impl Frequencies for Common {
         // report a tail larger than the column.
         let rows = Frequencies::rows(self).saturating_sub(held);
         Some(Remainder { rows, listed, most: omitted_max })
+    }
+
+    fn rows_passing(&self, column: usize, tests: &[(Op, Bound)]) -> Stat<u64> {
+        // Only a list that left nothing out. A prefix holds the leading values and a range takes
+        // the tail as well, which the prefix cannot count.
+        let Ok(Some((entries, 0))) = self.reader.held_prefix(column) else {
+            return Stat::Unknown;
+        };
+        match rudb_common::bounds::passing(entries.iter(), tests) {
+            Some(rows) => Stat::exact(rows, Provenance::FrequencySynopsis),
+            None => Stat::Unknown,
+        }
     }
 
     #[expect(clippy::cast_precision_loss, reason = "counts are weights here and not identities")]

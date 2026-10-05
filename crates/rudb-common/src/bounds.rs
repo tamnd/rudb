@@ -724,6 +724,50 @@ pub trait Frequencies: std::fmt::Debug + Send + Sync {
         let _ = column;
         None
     }
+
+    /// How many rows hold a value that passes every one of `tests`, where the synopsis lists every
+    /// value the column holds.
+    ///
+    /// The bounds answer a range by taking the values of a part to be spread evenly between its two
+    /// ends, and a column of years is nothing like that. In JOB `title.production_year` runs from
+    /// 1880 to 2019 in every part, so `> 2000` came out as a seventh of the titles where it keeps
+    /// more than half, and in 6d that put the movies left after `title` at a quarter of what they
+    /// were. A complete list has every value with its rows, so the answer is a sum and not a guess.
+    ///
+    /// [`Stat::Unknown`] where the list left something out, where there is no list, and where a
+    /// value in it does not compare against a constant. See [`passing`].
+    fn rows_passing(&self, column: usize, tests: &[(Op, Bound)]) -> Stat<u64> {
+        let _ = (column, tests);
+        Stat::Unknown
+    }
+}
+
+/// The rows of a complete synopsis whose value passes every one of `tests`.
+///
+/// A null passes no comparison, so its entry counts for nothing. `None` where a value of the list
+/// has no bound or does not compare against a constant, which is a constant of another domain, and
+/// an answer of no rows would then be about the types and not about the column.
+#[must_use]
+pub fn passing<'a>(
+    entries: impl IntoIterator<Item = &'a (Value, u64)>,
+    tests: &[(Op, Bound)],
+) -> Option<u64> {
+    let mut rows: u64 = 0;
+    for (value, count) in entries {
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        let value = Bound::of_value(value)?;
+        let mut kept = true;
+        for (op, constant) in tests {
+            value.order(constant)?;
+            kept &= certain(*op, constant, Some(&value), Some(&value));
+        }
+        if kept {
+            rows = rows.saturating_add(*count);
+        }
+    }
+    Some(rows)
 }
 
 /// What a frequency synopsis left out of one column, for the caller that has to guess at it.
@@ -1098,7 +1142,7 @@ fn torn(what: impl Into<String>) -> Error {
 mod tests {
     use std::cmp::Ordering;
 
-    use super::{Bound, MICROS, Op, Reach, Test, certain, excluded, kept};
+    use super::{Bound, MICROS, Op, Reach, Test, certain, excluded, kept, passing};
     use crate::{LogicalType, Value};
 
     /// A column written in order but for a few parts that span it all leaves most parts closed to a
@@ -1364,6 +1408,23 @@ mod tests {
         assert_eq!(at(Op::LessOrEqual), Some(0.25));
         assert_eq!(at(Op::Greater), Some(0.75));
         assert_eq!(at(Op::GreaterOrEqual), Some(0.75));
+    }
+
+    #[test]
+    fn a_complete_list_counts_the_rows_of_the_values_every_test_passes() {
+        let list = [
+            (Value::Null, 72_094),
+            (Value::Integer(1999), 60_000),
+            (Value::Integer(2000), 70_000),
+            (Value::Integer(2001), 80_000),
+            (Value::Integer(2010), 90_000),
+        ];
+        let after = [(Op::Greater, Bound::Int(2000))];
+        assert_eq!(passing(&list, &after), Some(170_000));
+        let between = [(Op::GreaterOrEqual, Bound::Int(2000)), (Op::Less, Bound::Int(2010))];
+        assert_eq!(passing(&list, &between), Some(150_000));
+        // A constant of another domain is no count of the column at all.
+        assert_eq!(passing(&list, &[(Op::Less, Bound::Bytes(b"x".to_vec()))]), None);
     }
 
     #[test]
