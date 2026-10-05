@@ -795,6 +795,19 @@ impl Prepared {
         &self.sql
     }
 
+    /// Whether the statement is a query, an `INSERT`, an `UPDATE` or a `DELETE`. PostgreSQL binds
+    /// these when it parses them, and binds every other statement only when it runs.
+    #[must_use]
+    pub fn binds_at_parse(&self) -> bool {
+        matches!(
+            self.ast.statements.as_slice(),
+            [ast::Statement::Query(_)
+                | ast::Statement::Insert(_)
+                | ast::Statement::Update(_)
+                | ast::Statement::Delete(_)]
+        )
+    }
+
     /// The parameters the statement uses, once each, in the order they were written.
     ///
     /// The identifier of a positional parameter is its number as a string, so a statement written

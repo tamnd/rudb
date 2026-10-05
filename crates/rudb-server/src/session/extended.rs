@@ -244,6 +244,11 @@ impl Extended {
             });
         let control = Control::of(&sql);
         let statement = Statement { sql, control, command, prepared, types, slots, positional };
+        // PostgreSQL binds a query and a change to the data at `Parse`, so a name that is not
+        // there is an error of `Parse` and not of `Execute`.
+        if statement.prepared.as_ref().is_some_and(Prepared::binds_at_parse) {
+            statement.describe()?;
+        }
         self.statements.insert(name, Arc::new(statement))?;
         out.parse_complete();
         Ok(())
