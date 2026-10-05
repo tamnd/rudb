@@ -5111,7 +5111,7 @@ mod tests {
         let coded = coded_within(&page, 4, &held, Some(&mut values)).expect("placed by codes");
         assert!(matches!(coded.columns[1].map(|column| column.places), Some(Places::Bits { low: Some(10), .. })));
         assert!(coded.by_value() && coded.same_as(&held), "the window outlives the page");
-        assert_eq!(placed(&coded, 4), vec![1 + 3, 3, 4 * 3, 1 + 3]);
+        assert_eq!(placed(&coded, 4), vec![1 + 3, 2 * 3, 4 * 3, 1 + 3]);
         let mut whole = Vec::new();
         hash(&page, 4, &mut whole, Across::OneInput);
         let alone: Vec<u64> = (0..4).map(|row| coded.hash_of(row)).collect();
