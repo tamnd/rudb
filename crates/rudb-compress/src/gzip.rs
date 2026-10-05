@@ -5,7 +5,7 @@
 //! decompressed to. `cat a.gz b.gz` is a legal gzip file, so a reader that stops at the first
 //! member reads a fraction of it.
 //!
-//! The Huffman decode is a table indexed by the next [`FAST`] bits of the stream, which answers
+//! The Huffman decode is a table indexed by the next `FAST` bits of the stream, which answers
 //! almost every symbol in one look, with a walk of the canonical code one bit at a time for the
 //! few codes longer than that. Every literal and length code in a typical stream is shorter than
 //! ten bits, so the walk is the rare path and it is kept simple rather than fast.

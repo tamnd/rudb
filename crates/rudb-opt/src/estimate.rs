@@ -841,11 +841,11 @@ fn sampled_one(plan: &Plan, input: NodeRef, conjunct: ExprRef) -> Option<(usize,
 
 /// A `LIKE` or an equality of a string column of the scan against a constant, as the store names
 /// the column, with the store.
-fn condition<'a>(
-    plan: &'a Plan,
+fn condition(
+    plan: &Plan,
     input: NodeRef,
     conjunct: ExprRef,
-) -> Option<(&'a Arc<dyn Zones>, &'a str, usize, &'a str)> {
+) -> Option<(&Arc<dyn Zones>, &str, usize, &str)> {
     let (function, column, constant) = match *plan.expr(conjunct) {
         Expr::Function { name, args } => {
             let function = plan.string(name);

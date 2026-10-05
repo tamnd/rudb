@@ -85,7 +85,7 @@ pub struct Options {
     /// What a commit waits for.
     pub commit_sync: CommitSync,
     /// Whether the lane fills spares with zeros on a thread of its own whenever it has fewer than
-    /// [`SPARES`], so a commit that starts a segment renames one rather than writes the whole
+    /// `SPARES`, so a commit that starts a segment renames one rather than writes the whole
     /// segment while every committer behind it waits. Off for a test that counts the operations
     /// the lane does, which a thread of its own would make vary from run to run.
     pub spare_ahead: bool,
@@ -571,7 +571,7 @@ impl Lane {
     }
 
     /// Retires every segment before `below` that is not being written, once a checkpoint has made
-    /// them redundant: up to [`SPARES`] of them are kept under a spare name to be recycled as the
+    /// them redundant: up to `SPARES` of them are kept under a spare name to be recycled as the
     /// lane's next segments, and the rest are removed.
     ///
     /// The directory is synced before this returns, so a spare's header is never rewritten while

@@ -346,7 +346,7 @@ impl Adjacency {
     ///
     /// The bits are not set as the lists are read. A child table in another order than its parent
     /// puts each child of a list anywhere in a bitmap of megabytes, and setting its bit there is a
-    /// trip to memory. So the children are first dealt into one bucket per [`BUCKET_ROWS`] of
+    /// trip to memory. So the children are first dealt into one bucket per `BUCKET_ROWS` of
     /// them, which writes to the ends of a few hundred lists that stay in the cache, and then each
     /// bucket sets its bits in a stretch of the bitmap small enough to stay in the cache while it
     /// does.
@@ -719,7 +719,7 @@ mod tests {
         let (parents_of, parents) = scattered();
         let adjacency = Adjacency::build(&parents_of, parents).expect("build");
         let members: Vec<Rid> = (0..parents).step_by(3).collect();
-        assert!(members.len() > AHEAD && members.len() % AHEAD != 0);
+        assert!(members.len() > AHEAD && !members.len().is_multiple_of(AHEAD));
         let held = Rids::from_sorted(parents, members.clone()).expect("held");
         let mut expected = Vec::new();
         for &member in &members {

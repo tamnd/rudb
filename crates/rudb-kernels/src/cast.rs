@@ -960,7 +960,7 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
 ///
 /// The type comes separately because a value cannot always say it: a null of a typed column goes
 /// into the member its type picks and stays there, a union holding a null, and only the untyped
-/// null is a null union. A struct laid out the way the union is, see [`struct_fits`], is read as
+/// null is a null union. A struct laid out the way the union is, see `struct_fits`, is read as
 /// the union it spells out rather than put into a member.
 ///
 /// # Errors

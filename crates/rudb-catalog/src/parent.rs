@@ -90,6 +90,9 @@ const SPARSE: usize = 16;
 /// One slot per part of one column, each empty until a gather reads that part whole.
 type Slots = Arc<[Mutex<Option<Arc<Vector>>>]>;
 
+/// One part a chunk of rising row ids reaches, and the offsets of its rows in that part.
+type Run = (usize, Vec<u32>);
+
 /// The projected columns of one table, each held whole, each read at most once.
 ///
 /// One of these per parent table per query. It is shared rather than cloned, because the point of
@@ -260,18 +263,17 @@ impl Parent {
             }
             return Ok(Placement { rows: rids.len(), shape: Shape::Whole(parts, rids.to_vec()) });
         }
-        if let Some(shape) = rising(directory, rids)? {
-            if !(shape.len() > 1
+        if let Some(shape) = rising(directory, rids)?
+            && !(shape.len() > 1
                 && shape.len() * 2 > parts
                 && !self.refused.load(Ordering::Relaxed))
-            {
-                let shape = match <[_; 1]>::try_from(shape) {
-                    Ok([(part, offsets)]) => Shape::One(part, Arc::new(offsets)),
-                    Err(shape) if shape.is_empty() => Shape::Nowhere,
-                    Err(shape) => Shape::Rising(shape),
-                };
-                return Ok(Placement { rows: rids.len(), shape });
-            }
+        {
+            let shape = match <[_; 1]>::try_from(shape) {
+                Ok([(part, offsets)]) => Shape::One(part, Arc::new(offsets)),
+                Err(shape) if shape.is_empty() => Shape::Nowhere,
+                Err(shape) => Shape::Rising(shape),
+            };
+            return Ok(Placement { rows: rids.len(), shape });
         }
         // For each part, its place among the parts this chunk reached, in the order reached.
         let mut numbered = vec![NO_ROW; parts];
@@ -754,7 +756,7 @@ fn packed(whole: Vector) -> Result<Vector> {
 /// search, and an offset is a subtraction, where the general placement looked up the part of every
 /// row twice and the gather then picked the rows back into order one at a time. On TPC-H q09 the
 /// two were a tenth of the query for the dates of `orders`.
-fn rising(directory: &Directory, rids: &[u32]) -> Result<Option<Vec<(usize, Vec<u32>)>>> {
+fn rising(directory: &Directory, rids: &[u32]) -> Result<Option<Vec<Run>>> {
     if !rids.windows(2).all(|pair| pair[0] <= pair[1]) {
         return Ok(None);
     }

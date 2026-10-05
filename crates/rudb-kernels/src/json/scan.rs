@@ -808,7 +808,7 @@ pub struct Units {
     begun: bool,
 }
 
-/// Up to [`CHUNK`] units read out of a file.
+/// Up to `CHUNK` units read out of a file.
 #[derive(Debug)]
 pub struct Batch {
     document: Document,

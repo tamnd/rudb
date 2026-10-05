@@ -485,7 +485,7 @@ fn made(lane: &Lane, count: u64) {
     let start = std::time::Instant::now();
     while lane.stats().made < count {
         assert!(start.elapsed().as_secs() < 20, "the lane made {} spares", lane.stats().made);
-        thread::sleep(std::time::Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -538,6 +538,6 @@ fn a_stopped_lane_creates_nothing_more() {
     let lane = open(&sim, Options { spare_ahead: true, ..options(CommitSync::Full) });
     lane.stop();
     let files = sim.read_dir(&dir()).expect("the directory");
-    thread::sleep(std::time::Duration::from_millis(20));
+    thread::sleep(Duration::from_millis(20));
     assert_eq!(sim.read_dir(&dir()).expect("the directory"), files);
 }

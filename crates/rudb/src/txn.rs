@@ -79,7 +79,7 @@ impl Snapshot {
     /// snapshot, none for a table the transaction created.
     pub(crate) fn written(&mut self, oid: i64) -> (&mut Written, u64) {
         let base = by_oid(&self.base, oid).map_or(0, |table| table.rows().len() as u64);
-        (self.written.entry(oid).or_insert_with(Written::new), base)
+        (self.written.entry(oid).or_default(), base)
     }
 
     /// The frame and the row count of the table `oid` in the snapshot, if it was there.
@@ -89,7 +89,7 @@ impl Snapshot {
 }
 
 /// What a transaction did to the rows of one table.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Written {
     /// For each row of the transaction's copy of the table, the snapshot's number for it, or
     /// `u64::MAX` for a row the transaction added. `None` until the transaction deletes a row, and
@@ -100,16 +100,20 @@ pub(crate) struct Written {
     changes: Option<Vec<Change>>,
 }
 
+/// A table the transaction has not written yet: no row deleted, and no change that the commit
+/// cannot do again.
+impl Default for Written {
+    fn default() -> Self {
+        Self { origin: None, changes: Some(Vec::new()) }
+    }
+}
+
 impl Written {
     /// Whether everything done to the table was adding rows.
     fn appends(&self) -> bool {
         self.changes
             .as_ref()
             .is_some_and(|changes| changes.iter().all(|change| matches!(change, Change::Insert(_))))
-    }
-
-    pub(crate) fn new() -> Self {
-        Self { origin: None, changes: Some(Vec::new()) }
     }
 
     /// The snapshot's numbers for the rows at `rows` in the transaction's copy, leaving out the
