@@ -126,6 +126,15 @@ pub struct Prepared {
 /// about one row in forty, and sixty four leaves it the blocks where most rows are gone.
 const MASK_FLOOR: usize = 64;
 
+/// What one pass of [`Prepared::masked`] narrows the mask by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Masking {
+    /// The column at this place in the chunk against the literals of the operands that compare it.
+    Within(usize),
+    /// The column at the first place standing in the comparison to the column at the second.
+    Against(Comparison, usize, usize),
+}
+
 /// One node of a flattened expression.
 ///
 /// A step refers to its operands by their index in [`Prepared::steps`], which is always smaller than
@@ -929,8 +938,12 @@ impl Prepared {
     /// left are fewer than one in [`MASK_FLOOR`] the rest are left to the threaded walk, because a
     /// block with one row in it is read whole here and a list reads only that row.
     ///
-    /// `None` when fewer than two columns are compared this way, since one column is a single pass
-    /// already, and for steps built to be shared, whose slots a later operand may read.
+    /// A comparison of two columns of the chunk, `l_commitdate < l_receiptdate` in q12, narrows the
+    /// same mask through [`rudb_kernels::mask_against`] as a pass of its own, so q12's range and its
+    /// two date comparisons come out as rows once rather than three times.
+    ///
+    /// `None` when fewer than two passes would be made, since one is a single pass already, and for
+    /// steps built to be shared, whose slots a later operand may read.
     fn masked(
         &self,
         operands: &[usize],
@@ -941,17 +954,23 @@ impl Prepared {
         if self.share || chunk.is_empty() {
             return Ok(None);
         }
-        // Each column compared, by its place in the chunk, with the operands that compare it.
-        let mut columns: Vec<(usize, Vec<usize>)> = Vec::new();
+        // Each column compared with literals, by its place in the chunk, with the operands that
+        // compare it, and each comparison of two columns on its own.
+        let mut columns: Vec<(Masking, Vec<usize>)> = Vec::new();
         for slot in 0..operands.len().min(128) {
             let which = order.at(slot);
             if which >= 128 || settled.get(which) == Some(&true) {
                 continue;
             }
+            if let Some(pair) = self.pairing(operands[which]) {
+                columns.push((pair, vec![which]));
+                continue;
+            }
             let Some(column) = self.masking(operands[which]) else { continue };
-            match columns.iter_mut().find(|(at, _)| *at == column) {
+            let within = Masking::Within(column);
+            match columns.iter_mut().find(|(at, _)| *at == within) {
                 Some((_, those)) => those.push(which),
-                None => columns.push((column, vec![which])),
+                None => columns.push((within, vec![which])),
             }
         }
         if columns.len() < 2 {
@@ -966,17 +985,24 @@ impl Prepared {
             if kept.saturating_mul(MASK_FLOOR) < rows {
                 break;
             }
-            let bounds: Vec<rudb_kernels::Bound<'_>> = those
-                .iter()
-                .filter_map(|&which| self.end(operands[which]).map(|(_, bound)| bound))
-                .collect();
-            if bounds.len() != those.len() {
-                continue;
-            }
-            let values = chunk.column(*column)?;
-            let Some(left) = rudb_kernels::mask_within(values, &bounds, &mut words, fresh) else {
-                continue;
+            let left = match *column {
+                Masking::Within(column) => {
+                    let bounds: Vec<rudb_kernels::Bound<'_>> = those
+                        .iter()
+                        .filter_map(|&which| self.end(operands[which]).map(|(_, bound)| bound))
+                        .collect();
+                    if bounds.len() != those.len() {
+                        continue;
+                    }
+                    let values = chunk.column(column)?;
+                    rudb_kernels::mask_within(values, &bounds, &mut words, fresh)
+                }
+                Masking::Against(op, left, right) => {
+                    let (left, right) = (chunk.column(left)?, chunk.column(right)?);
+                    rudb_kernels::mask_against(op, left, right, &mut words, fresh)
+                }
             };
+            let Some(left) = left else { continue };
             for &which in those {
                 order.observed(which, kept, left);
                 answered |= 1 << which;
@@ -988,6 +1014,20 @@ impl Prepared {
             return Ok(None);
         }
         Ok(Some((rudb_kernels::mask_selection(&words, kept), answered)))
+    }
+
+    /// The comparison and the places in the chunk of the two columns an operand compares with each
+    /// other, which [`rudb_kernels::mask_against`] may take.
+    fn pairing(&self, operand: usize) -> Option<Masking> {
+        let Step::Compare { op, left, right, .. } = &self.steps[operand] else { return None };
+        let (Step::Column(one), Step::Column(other)) = (&self.steps[*left], &self.steps[*right])
+        else {
+            return None;
+        };
+        if self.types[*left] != self.types[*right] || op.is_total() {
+            return None;
+        }
+        Some(Masking::Against(*op, *one, *other))
     }
 
     /// The place in the chunk of the column an operand compares with a literal, when the comparison
@@ -2534,6 +2574,52 @@ mod tests {
                 let expected =
                     Selection::from_predicate(chunk.len(), |row| is_true(&flags.value_at(row)));
                 // Enough chunks for the order to learn and move.
+                for _ in 0..40 {
+                    let masked =
+                        prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs");
+                    assert_eq!(masked, expected, "`{predicate}`");
+                }
+            }
+        }
+    }
+
+    /// Comparisons of two columns with each other, in the masks beside comparisons with literals,
+    /// keep the rows the tree walk keeps, flat and bit packed with different bases, and over a
+    /// chunk whose last block is not whole.
+    #[test]
+    fn comparisons_of_two_columns_keep_the_rows_the_tree_walk_keeps() {
+        let schema = Schema::numbered(
+            vec![Field::new("x", LogicalType::Integer), Field::new("z", LogicalType::Integer)],
+            0,
+        );
+        let x: Vec<i32> = (0..1000).map(|row| 700 + (row * 37) % 600).collect();
+        let z: Vec<i32> = (0..1000).map(|row| 650 + (row * 53) % 700).collect();
+        let x = Vector::flat(LogicalType::Integer, rudb_vector::Data::Int32(x.into()))
+            .expect("integers are an i32 layout");
+        let z = Vector::flat(LogicalType::Integer, rudb_vector::Data::Int32(z.into()))
+            .expect("integers are an i32 layout");
+        let predicates = [
+            "((#0.0::INTEGER >= 800::INTEGER)::BOOLEAN AND (#0.0::INTEGER < #0.1::INTEGER)::BOOLEAN \
+             AND (#0.0::INTEGER < 1100::INTEGER)::BOOLEAN)",
+            "((#0.1::INTEGER >= #0.0::INTEGER)::BOOLEAN AND (#0.0::INTEGER <> #0.1::INTEGER)\
+             ::BOOLEAN AND (#0.1::INTEGER > 700::INTEGER)::BOOLEAN)",
+            "((#0.0::INTEGER = #0.1::INTEGER)::BOOLEAN AND (#0.0::INTEGER > 750::INTEGER)::BOOLEAN)",
+            "((#0.0::INTEGER < #0.1::INTEGER)::BOOLEAN AND (#0.1::INTEGER < #0.0::INTEGER)::BOOLEAN)",
+            "((#0.0::INTEGER <= #0.1::INTEGER)::BOOLEAN AND (#0.0::INTEGER >= #0.1::INTEGER)\
+             ::BOOLEAN AND (#0.0::INTEGER > 600::INTEGER)::BOOLEAN)",
+            "((#0.0::INTEGER > #0.1::INTEGER)::BOOLEAN AND (#0.1::INTEGER <= 900::INTEGER)::BOOLEAN)",
+        ];
+        let packed = (x.bit_packed().expect("packs"), z.bit_packed().expect("packs"));
+        for (x, z) in [(x.clone(), z.clone()), packed.clone(), (x, packed.1)] {
+            let chunk = Chunk::new(vec![x, z]).expect("two columns");
+            for predicate in predicates {
+                let (plan, list) = projection(&format!("{predicate}::BOOLEAN AS p"));
+                let prepared =
+                    Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+                let mut scratch = prepared.scratch();
+                let flags = evaluate(&plan, list[0], &schema, &chunk).expect("the tree walk runs");
+                let expected =
+                    Selection::from_predicate(chunk.len(), |row| is_true(&flags.value_at(row)));
                 for _ in 0..40 {
                     let masked =
                         prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs");
