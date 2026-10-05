@@ -764,6 +764,7 @@ dependencies = [
  "memchr",
  "rudb-common",
  "rudb-encoding",
+ "rudb-pgtypes",
  "rudb-regex",
  "rudb-vector",
 ]

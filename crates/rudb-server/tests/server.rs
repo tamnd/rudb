@@ -380,6 +380,38 @@ fn a_string_literal_in_a_cast_uses_the_input_function_of_the_type() {
     server.stop().unwrap();
 }
 
+#[test]
+fn a_string_type_with_a_length_cuts_on_a_cast_and_refuses_a_long_value_on_a_store() {
+    let dirs = Dirs::new("length");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+
+    // An explicit cast cuts characters and not bytes, and a `name` holds 63 bytes.
+    assert_eq!(scalar(&mut client, "select 'abcdef'::varchar(3)"), "abc");
+    assert_eq!(scalar(&mut client, "select 'ééé'::varchar(2)"), "éé");
+    assert_eq!(scalar(&mut client, "select 'abc'::char"), "a");
+    assert_eq!(scalar(&mut client, "select length(repeat('x', 70)::name)"), "63");
+
+    // A store refuses a long value, unless the extra characters are spaces.
+    client.query("create table sized (a varchar(3), b char(2), c name)");
+    let messages = client.query("insert into sized values ('ab  ', 'x  ', repeat('y', 70))");
+    assert_eq!(tags(&messages), "CZ");
+    assert_eq!(scalar(&mut client, "select a || '|' || length(c) from sized"), "ab |63");
+    for (sql, message) in [
+        ("insert into sized (a) values ('abcd')", "value too long for type character varying(3)"),
+        ("insert into sized (a) select 'abcd'", "value too long for type character varying(3)"),
+        ("update sized set a = 'wxyz'", "value too long for type character varying(3)"),
+        ("update sized set b = 'abc'", "value too long for type character(2)"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("22001"), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 /// The row description of a message.
 fn row_shape(message: &Message) -> Vec<(String, u32, i16)> {
     let bytes = message.decoded();

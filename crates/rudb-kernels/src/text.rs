@@ -218,6 +218,32 @@ pub(crate) fn chr(code: &Value) -> Result<Value> {
     }
 }
 
+/// The length rules of the PostgreSQL string types, which the binder of a PostgreSQL session adds
+/// to a cast and to a store into a column. `__rudb_pg_name` cuts text to the 63 bytes of a `name`.
+/// `__rudb_pg_varchar` and `__rudb_pg_bpchar` take the typmod of the column and refuse a value
+/// that is too long with `22001`, unless the extra characters are spaces, which they remove. The
+/// padding of `char(n)` comes with PG2, so `__rudb_pg_bpchar` does not pad yet.
+pub(crate) fn postgres(name: &str, args: &[Value]) -> Result<Option<Value>> {
+    let text = match args.first() {
+        Some(Value::Null) => return Ok(Some(Value::Null)),
+        Some(text) => text,
+        None => return Ok(None),
+    };
+    let kept = match (name, args) {
+        ("__rudb_pg_name", [_]) => rudb_pgtypes::name_in(string(text)?),
+        ("__rudb_pg_varchar" | "__rudb_pg_bpchar", [_, typmod]) => {
+            let text = string(text)?;
+            let typmod = whole(typmod)? as i32;
+            if name == "__rudb_pg_bpchar" {
+                rudb_pgtypes::bpchar_coerce(text, typmod, false)?;
+            }
+            rudb_pgtypes::varchar_coerce(text, typmod, name == "__rudb_pg_bpchar")?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(Value::Varchar(kept.to_owned())))
+}
+
 /// The string an argument is, which the binder has already cast to a VARCHAR.
 fn string(value: &Value) -> Result<&str> {
     match value {

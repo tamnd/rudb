@@ -2726,7 +2726,8 @@ fn insert(
                 let column = &scope.columns[from];
                 let expr =
                     binder.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
-                binder.checked_cast_to(expr, &field.ty, false)?
+                let expr = binder.checked_cast_to(expr, &field.ty, false)?;
+                binder.stored(expr, target.declared_type(at))?
             }
             // The column's default, or a null of the column's own type when it has none.
             None => binder.bind_default(defaults[at].1.as_deref(), &field.ty)?,
@@ -2945,7 +2946,8 @@ fn change(
             binder.bind_default(table.default(at), &field.ty)?
         } else {
             let new = column(&mut binder, width + 1 + from);
-            binder.checked_cast_to(new, &field.ty, false)?
+            let new = binder.checked_cast_to(new, &field.ty, false)?;
+            binder.stored(new, table.declared_type(at))?
         };
         let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then }]);
         let null = binder.add_constant(Value::Null);
@@ -2962,7 +2964,8 @@ fn change(
                     binder.bind_default(table.default(at), &field.ty)?
                 } else {
                     let new = column(&mut binder, width + 1 + from);
-                    binder.checked_cast_to(new, &field.ty, false)?
+                    let new = binder.checked_cast_to(new, &field.ty, false)?;
+                    binder.stored(new, table.declared_type(at))?
                 };
                 let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then }]);
                 binder

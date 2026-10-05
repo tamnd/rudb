@@ -16,6 +16,7 @@ readme.workspace = true
 libm.workspace = true
 memchr.workspace = true
 rudb-common.workspace = true
+rudb-pgtypes.workspace = true
 rudb-vector.workspace = true
 rudb-encoding.workspace = true
 rudb-regex.workspace = true

@@ -41,3 +41,16 @@ impl std::fmt::Display for TypeError {
 }
 
 impl std::error::Error for TypeError {}
+
+impl From<TypeError> for rudb_common::Error {
+    fn from(error: TypeError) -> rudb_common::Error {
+        let mut out = rudb_common::Error::conversion(error.message).state(error.sqlstate);
+        if let Some(detail) = error.detail {
+            out = out.detail(detail);
+        }
+        if let Some(hint) = error.hint {
+            out = out.hint(hint);
+        }
+        out
+    }
+}
