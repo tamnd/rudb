@@ -95,6 +95,9 @@ struct Whole {
 /// The longest list compared entry by entry rather than hashed.
 const SHORT: usize = 8;
 
+/// The longest list of strings compared entry by entry rather than hashed. See [`Text`].
+const SHORT_TEXT: usize = 64;
+
 impl Whole {
     fn of(set: HashSet<i128>) -> Self {
         if set.len() <= SHORT {
@@ -125,14 +128,28 @@ impl Whole {
 /// length, so a row is a load and a compare per entry with no call to compare bytes. The two bytes
 /// of a q22 country code went through `memcmp` seven times a row otherwise, and that was a third of
 /// what was left of the query after the hash went.
+///
+/// A list of strings stays a list for longer than one of numbers, up to [`SHORT_TEXT`] entries,
+/// with each entry's length and first eight bytes kept beside it as a word. A row is then told
+/// apart from nearly every entry by one compare, and only an entry that starts the same way and is
+/// as long has the rest of its bytes compared. JOB 3c asks whether `movie_info.info` is one of ten
+/// countries and languages, and the keyed hash of every row it read was a fifth of the query.
 #[derive(Debug)]
 struct Text {
     words: Vec<(u64, usize)>,
     short: Vec<Box<[u8]>>,
+    /// Each entry of `short` as its first eight bytes and its length, in the same order.
+    heads: Vec<(u64, usize)>,
     set: HashSet<Box<[u8]>>,
     /// The bytes of a row that are looked up, when the list was over the first that many
     /// characters of it and every entry is that many ASCII characters. See [`Members::prefixed`].
     prefix: Option<usize>,
+}
+
+/// The first eight bytes of `value`, or all of it when it is shorter.
+#[inline]
+fn head(value: &[u8]) -> &[u8] {
+    &value[..value.len().min(8)]
 }
 
 /// The bytes of a value of at most eight bytes as one word, the first byte lowest.
@@ -150,20 +167,21 @@ fn word(value: &[u8]) -> u64 {
 impl Text {
     fn of(set: HashSet<String>) -> Self {
         let held = set.into_iter().map(|text| text.into_bytes().into_boxed_slice());
-        if held.len() > SHORT {
+        if held.len() > SHORT_TEXT {
             return Self {
                 words: Vec::new(),
                 short: Vec::new(),
+                heads: Vec::new(),
                 set: held.collect(),
                 prefix: None,
             };
         }
         let short: Vec<Box<[u8]>> = held.collect();
-        if short.iter().all(|text| text.len() <= 8) {
-            let words = short.iter().map(|text| (word(text), text.len())).collect();
-            return Self { words, short, set: HashSet::new(), prefix: None };
-        }
-        Self { words: Vec::new(), short, set: HashSet::new(), prefix: None }
+        let heads: Vec<(u64, usize)> =
+            short.iter().map(|text| (word(head(text)), text.len())).collect();
+        let short_words = short.iter().all(|text| text.len() <= 8);
+        let words = if short_words { heads.clone() } else { Vec::new() };
+        Self { words, short, heads, set: HashSet::new(), prefix: None }
     }
 
     #[inline]
@@ -179,11 +197,15 @@ impl Text {
             let value = (word(value), value.len());
             return self.words.contains(&value);
         }
-        if self.set.is_empty() {
-            self.short.iter().any(|held| **held == *value)
-        } else {
-            self.set.contains(value)
+        if !self.set.is_empty() {
+            return self.set.contains(value);
         }
+        let first = (word(head(value)), value.len());
+        let rest = head(value).len();
+        self.heads
+            .iter()
+            .zip(&self.short)
+            .any(|(&held, text)| held == first && text[rest..] == value[rest..])
     }
 
     /// The prefix length and the mask over a view's first four bytes that keeps it, when the list
@@ -893,6 +915,35 @@ mod tests {
             over(&numbers(), &long, false),
             [Value::Boolean(true), Value::Boolean(false), Value::Null, Value::Boolean(true)]
         );
+    }
+
+    /// A list of strings answers the same compared entry by entry, past the length a list of
+    /// numbers is hashed at, and hashed, where its entries start with the same eight bytes.
+    #[test]
+    fn a_text_list_answers_the_same_kept_as_a_list_or_hashed() {
+        let texts: Vec<&str> = "Germany|German|Sweden|Swedish|Denmark|Norway||USA|same8888\
+            |same8888a|same8888b|same8888ab|same888|Germany |germany"
+            .split('|')
+            .collect();
+        let input = Vector::from_values(
+            LogicalType::Varchar,
+            &texts.iter().map(|text| Value::Varchar((*text).into())).collect::<Vec<_>>(),
+        )
+        .expect("strings");
+        for extra in [0, 60] {
+            let mut list: Vec<String> = ["Germany", "Sweden", "same8888a", "", "same888"]
+                .iter()
+                .map(|text| (*text).to_owned())
+                .collect();
+            list.extend(["Denmark", "Norway", "same8888ab", "Swedish"].map(str::to_owned));
+            list.extend((0..extra).map(|at| format!("same8888{at}")));
+            let values: Vec<Value> = list.iter().map(|text| Value::Varchar(text.clone())).collect();
+            let expected: Vec<Value> = texts
+                .iter()
+                .map(|text| Value::Boolean(list.iter().any(|held| held == text)))
+                .collect();
+            assert_eq!(over(&input, &values, false), expected, "{} entries", list.len());
+        }
     }
 
     /// The rule that separates a set lookup from an `IN`. `7 IN (1, NULL)` is null rather than
