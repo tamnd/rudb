@@ -4631,10 +4631,10 @@ mod tests {
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Across, Bound, Cutoff, FileScan, Filters, Handout, Live, OnceLock, Op, Order, Paying, Probe,
-        Pushdown, RUN, Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE, WARMUP,
-        best_first, cut_rows, gather_target, gathered, hash, instances_for, morsels_of, next_piece,
-        parts, runs_of, worth_sifting,
+        Across, Bound, Cutoff, FileScan, Filters, Handout, Live, OnceLock, Op, Order, Paying,
+        Probe, Pushdown, RUN, Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE,
+        WARMUP, best_first, cut_rows, gather_target, gathered, hash, instances_for, morsels_of,
+        next_piece, parts, runs_of, worth_sifting,
     };
     use crate::sideways::Found;
 
