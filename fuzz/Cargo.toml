@@ -12,7 +12,7 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-arbitrary = "1"
+arbitrary = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
 rudb-bind = { path = "../crates/rudb-bind", optional = true }
 rudb-catalog = { path = "../crates/rudb-catalog", optional = true }
