@@ -1703,6 +1703,9 @@ const LOOKAHEAD: usize = 4;
 /// An ear, with what it costs, its place in `left` and its parent.
 type Ear = (f64, usize, Option<usize>);
 
+/// The ears [`ears`] prices, and the first one that waits, as a relation and its parent.
+type Ears = (Vec<Ear>, Option<(usize, Option<usize>)>);
+
 /// The ears of what is `left`, each priced by the one step, and the first ear that waits.
 ///
 /// An ear with no filter of its own and no class a relation already taken holds waits until no
@@ -1714,7 +1717,7 @@ fn ears(
     left: &[usize],
     standing: &Standing,
     prices: &mut Prices<'_>,
-) -> std::result::Result<(Vec<Ear>, Option<(usize, Option<usize>)>), String> {
+) -> std::result::Result<Ears, String> {
     let slot = |ear: usize| left.iter().position(|&relation| relation == ear).unwrap_or_default();
     let taken = !left.iter().fold(0, |mask, &relation| mask | 1 << relation);
     let Some((steps, waiting)) = steps(left, weights, holders, taken) else {

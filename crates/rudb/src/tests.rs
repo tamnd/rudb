@@ -7084,8 +7084,12 @@ fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_sa
     let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
     db.execute("CREATE TABLE customer (c_custkey INTEGER, c_name VARCHAR)").unwrap();
     db.execute("CREATE TABLE orders (o_orderkey INTEGER, o_custkey INTEGER)").unwrap();
-    db.execute("INSERT INTO customer SELECT i, 'c' || i FROM range(1, 4001) AS r(i)").unwrap();
-    db.execute("INSERT INTO orders SELECT i, 1 + i % 4000 FROM range(1, 10001) AS r(i)").unwrap();
+    // Every other key, so the key of a customer is not its row and the join has to choose between
+    // the link and a hash table rather than find the customer by its key, which it does whatever
+    // the size of the parent.
+    db.execute("INSERT INTO customer SELECT i * 2, 'c' || i FROM range(1, 4001) AS r(i)").unwrap();
+    db.execute("INSERT INTO orders SELECT i, 2 + 2 * (i % 4000) FROM range(1, 10001) AS r(i)")
+        .unwrap();
     db.execute("SET graph_links = 'orders(o_custkey) -> customer(c_custkey)'").unwrap();
     db.execute("CHECKPOINT").unwrap();
     // The layer is opt in, per `spec/graph/09-measurement.md` section 9.2 and the default in

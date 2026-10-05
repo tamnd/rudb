@@ -6,7 +6,7 @@
 
 use rudb::{Database, Value};
 
-/// Twenty thousand orders with up to four lines each, some lines with no order and some with no
+/// Twelve thousand orders with up to four lines each, some lines with no order and some with no
 /// receipt date, the relationship declared and built and the graph layer on.
 fn database() -> (Database, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!(
@@ -26,11 +26,13 @@ fn database() -> (Database, std::path::PathBuf) {
         .execute("CREATE TABLE lineitem (l_orderkey INTEGER, l_shipdate DATE, l_receiptdate DATE)")
         .expect("creates");
     // Every other key, so the key of an order is not its row and the join reads the link rather
-    // than finding the order by its key, which leaves no build side to carry a test onto.
+    // than finding the order by its key, which leaves no build side to carry a test onto. Twelve
+    // thousand of them, so the link stays under the 64 KiB a table's graph sections always get and
+    // is kept, since a link the build measures and drops carries no span.
     database
         .execute(
             "INSERT INTO orders SELECT i * 2, DATE '1992-01-01' + ((i * 7) % 2400)::INTEGER FROM \
-             range(0, 20000) AS r(i)",
+             range(0, 12000) AS r(i)",
         )
         .expect("loads");
     database
