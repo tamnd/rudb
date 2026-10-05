@@ -2734,7 +2734,7 @@ impl PlaceSums {
         kept: Option<&[u32]>,
         from: usize,
     ) -> Result<usize> {
-        let mut read: [Option<Read<'_>>; SUMMED_MOST] = [None; SUMMED_MOST];
+        let mut read = [Read::Narrow(&[]); SUMMED_MOST];
         for ((at, &(offset, _, _)), &column) in read.iter_mut().zip(&self.calls).zip(&self.columns)
         {
             let input = inputs.get(offset).copied().flatten();
@@ -2745,10 +2745,8 @@ impl PlaceSums {
                     _ => None,
                 },
                 _ => None,
-            };
-            if at.is_none() {
-                return Err(Error::internal("a summed column changed its form".to_string()));
             }
+            .ok_or_else(|| Error::internal("a summed column changed its form".to_string()))?;
         }
         let read = &read[..self.calls.len()];
         macro_rules! widths {
