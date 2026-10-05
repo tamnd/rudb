@@ -3388,7 +3388,7 @@ impl NativeSink {
                 log.record(&chunk, key)?;
             }
         }
-        place.start();
+        self.begin(place);
         place.rows = place.rows.saturating_add(chunk.len() as u64);
         let footprint = chunk.footprint() as u64;
         place.bytes = place.bytes.saturating_add(footprint);
@@ -3480,6 +3480,15 @@ impl NativeSink {
         )
     }
 
+    /// Starts the instance's clock and counts it among the callers sharing the encode, the first
+    /// time it is handed anything.
+    fn begin(&self, place: &mut NativePlace) {
+        if place.started.is_none() {
+            self.preparer.join();
+        }
+        place.start();
+    }
+
     /// Encodes the chunks this instance is holding into the stripe it is building, and lets them go.
     fn feed(&self, place: &mut NativePlace) -> Result<()> {
         if place.held.is_empty() {
@@ -3560,7 +3569,7 @@ impl Sink for NativeSink {
     }
 
     fn at(&self, morsel: &Morsel, place: &mut Self::Local) -> Result<()> {
-        place.start();
+        self.begin(place);
         // A stripe never spans two morsels, so that its parts are a run of the source with nothing
         // from another instance in the middle of them. The cost is a short stripe at the end of
         // each morsel, and a morsel on ClickBench is a whole row group of about a million rows, or
@@ -3593,6 +3602,11 @@ impl Sink for NativeSink {
             for (log, theirs) in logged.iter_mut().zip(std::mem::take(&mut local.logs)) {
                 log.merge(theirs);
             }
+        }
+        // Counted out before its last stripe, which is when the others may have finished already
+        // and there are cores for it to spread over.
+        if local.started.is_some() {
+            self.preparer.leave();
         }
         let handed = self.hand_over(&mut local);
         if let Some(started) = local.started.take() {
