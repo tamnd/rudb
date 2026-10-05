@@ -75,6 +75,10 @@ fn unwritten_definitions(ast: &Ast, parameters: &Parameters) -> Vec<u32> {
         }
         _ => return Vec::new(),
     };
+    // `INSERT ... DEFAULT VALUES` has no source.
+    if query == rudb_parse::NONE {
+        return Vec::new();
+    }
     ast.cte_list(ast.query(query).ctes)
         .iter()
         .copied()
