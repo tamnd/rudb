@@ -2950,8 +2950,7 @@ impl<'a> Aggregate<'a> {
                     let combos = coded_map.len();
                     place_sums.add_places(&mut coded_places[..*length], kept, combos)?;
                     if place_sums.touched(coded_map)? {
-                        for row in 0..*length {
-                            let place = coded_places[row];
+                        for (row, &place) in coded_places[..*length].iter().enumerate() {
                             if place < combos && coded_map[place] == crate::table::UNSEEN {
                                 let slot = resolve(row)?;
                                 coded_map.set(place, held_at(slot));
