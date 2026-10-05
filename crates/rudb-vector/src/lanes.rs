@@ -380,7 +380,8 @@ pub(crate) fn retain_set(
     unsafe {
         let codes = bytes.as_ptr().cast::<i32>();
         let words = bits.as_ptr().cast::<i32>();
-        let (first, width_lanes) = (_mm256_set1_epi32(first as i32), _mm256_set1_epi32(width as i32));
+        let (first, width_lanes) =
+            (_mm256_set1_epi32(first as i32), _mm256_set1_epi32(width as i32));
         let mask = _mm256_set1_epi32(((1_u32 << width) - 1) as i32);
         let (shift, range) = (_mm256_set1_epi32(shift), _mm256_set1_epi32(range as i32));
         let (seven, last_bit) = (_mm256_set1_epi32(7), _mm256_set1_epi32(31));
@@ -394,10 +395,14 @@ pub(crate) fn retain_set(
             let bit = _mm256_add_epi32(first, _mm256_mullo_epi32(row, width_lanes));
             let byte = _mm256_min_epu32(_mm256_srli_epi32::<3>(bit), top);
             let code = _mm256_i32gather_epi32::<1>(codes, byte);
-            let code = _mm256_and_si256(_mm256_srlv_epi32(code, _mm256_and_si256(bit, seven)), mask);
+            let code =
+                _mm256_and_si256(_mm256_srlv_epi32(code, _mm256_and_si256(bit, seven)), mask);
             let offset = _mm256_min_epu32(_mm256_add_epi32(code, shift), range);
             let word = _mm256_i32gather_epi32::<4>(words, _mm256_srli_epi32::<5>(offset));
-            let held = _mm256_sllv_epi32(word, _mm256_sub_epi32(last_bit, _mm256_and_si256(offset, last_bit)));
+            let held = _mm256_sllv_epi32(
+                word,
+                _mm256_sub_epi32(last_bit, _mm256_and_si256(offset, last_bit)),
+            );
             #[expect(clippy::cast_sign_loss, reason = "eight bits of a movemask")]
             let found = _mm256_movemask_ps(_mm256_castsi256_ps(held)) as usize;
             let order = _mm256_loadu_si256(KEPT_FIRST[found].as_ptr().cast());
@@ -539,7 +544,11 @@ mod tests {
                     );
                     assert_eq!(read, rows.len() / 8 * 8, "width {width} skip {skip}");
                     let wanted: Vec<u32> = rows[..read].iter().copied().filter(held).collect();
-                    assert_eq!(kept_rows[..kept], wanted, "width {width} skip {skip} shift {shift}");
+                    assert_eq!(
+                        kept_rows[..kept],
+                        wanted,
+                        "width {width} skip {skip} shift {shift}"
+                    );
                 }
             }
         }
