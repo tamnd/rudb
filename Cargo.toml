@@ -86,6 +86,7 @@ rudb-parquet = { version = "=0.8.25", path = "crates/rudb-parquet" }
 rudb-parse = { version = "=0.8.25", path = "crates/rudb-parse" }
 rudb-pipeline = { version = "=0.8.25", path = "crates/rudb-pipeline" }
 rudb-pgwire = { version = "=0.8.25", path = "crates/rudb-pgwire" }
+rudb-pgtypes = { version = "=0.8.25", path = "crates/rudb-pgtypes" }
 rudb-plan = { version = "=0.8.25", path = "crates/rudb-plan" }
 rudb-qc-ir = { version = "=0.8.25", path = "crates/rudb-qc-ir" }
 rudb-qc-interp = { version = "=0.8.25", path = "crates/rudb-qc-interp" }
