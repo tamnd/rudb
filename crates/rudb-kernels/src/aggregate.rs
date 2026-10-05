@@ -2650,6 +2650,11 @@ pub struct PlaceSums {
     values: Vec<Vec<u64>>,
     /// The calls that want the row count and no value.
     counting: Vec<usize>,
+    /// Per place of the map and one more for the rows the filter dropped, the same cells as
+    /// [`Self::cells`], for [`Self::add_places`]. Every cell is back to nothing between chunks.
+    by_place: Vec<i64>,
+    /// The places of [`Self::by_place`] with rows in the chunk, as [`Self::touched`] found them.
+    touched: Vec<usize>,
 }
 
 impl PlaceSums {
@@ -2765,22 +2770,250 @@ impl PlaceSums {
     ///
     /// The overflow a total raises, and an internal error for a group with no state for a call.
     pub fn fold(&self, states: &mut [Accumulator], stride: usize) -> Result<()> {
-        let (width, span) = (self.calls.len(), cell_span(self.calls.len()));
-        for (slot, cells) in self.cells.chunks_exact(span).enumerate() {
-            let count = cells[width];
-            if count == 0 {
-                continue;
-            }
-            for (&total, &(offset, feed, base)) in cells.iter().zip(&self.calls) {
-                let number = i128::from(total) + i128::from(base) * i128::from(count);
-                fold_wide(states, slot * stride + offset, feed, number, count)?;
-            }
-            for &offset in &self.counting {
-                fold_wide(states, slot * stride + offset, Feed::Counted, 0, count)?;
-            }
+        for (slot, cells) in self.cells.chunks_exact(cell_span(self.calls.len())).enumerate() {
+            fold_cells(&self.calls, &self.counting, cells, states, slot * stride)?;
         }
         Ok(())
     }
+
+    /// Whether a chunk of `rows` rows over a map of `combos` places is added up by place with
+    /// [`Self::add_places`] rather than through the map with [`Self::add`].
+    ///
+    /// Each place's cells are read once a chunk to fold them, so the map has to be well short of
+    /// the rows, and they have to stay small enough to sit in the cache beside the columns.
+    pub fn adds_by_place(&self, combos: usize, rows: usize) -> bool {
+        combos < rows / 2 && (combos + 1) * cell_span(self.calls.len()) <= PLACE_CELLS
+    }
+
+    /// Adds every row of the chunk into the cells of its place, without the map, for a map of
+    /// `combos` places [`Self::adds_by_place`] said yes to.
+    ///
+    /// [`Self::add`] costs about 27 instructions a row on q01, which groups by flag, status,
+    /// discount and tax into about 400 groups over 3468 places. Most of that is around the adds:
+    /// the index of each kept row, the place, the map, a check for a place with no group, a check
+    /// for a slot past the cells, and a bounds check on each of those loads. Here the rows the
+    /// filter dropped are given the place past the map, so the loop goes over every row in order
+    /// with no list of rows, and a row adds into its place's cells with no map and nothing to stop
+    /// at. What it costs is a pass over the places a chunk to find the ones with rows, which is why
+    /// the map has to be well short of the rows. The caller then opens a group for any place
+    /// [`Self::touched`] says has none and folds with [`Self::fold_places`].
+    ///
+    /// See `spec/perf/115-totals-by-place.md`.
+    ///
+    /// # Errors
+    ///
+    /// An internal error for a place past the map or a chunk of other rows than the one read, which
+    /// are bugs in the caller.
+    pub fn add_places(
+        &mut self,
+        places: &mut [usize],
+        kept: Option<&[u32]>,
+        combos: usize,
+    ) -> Result<()> {
+        let needed = (combos + 1) * cell_span(self.calls.len());
+        if self.by_place.len() < needed {
+            self.by_place.resize(needed, 0);
+        }
+        if let Some(kept) = kept.filter(|kept| kept.len() < places.len()) {
+            let (first, next) = match (kept.first(), kept.last()) {
+                (Some(&first), Some(&last)) => (first as usize, last as usize + 1),
+                _ => (0, 0),
+            };
+            if let Some(dropped) = places.get_mut(..first) {
+                dropped.fill(combos);
+            }
+            if let Some(dropped) = places.get_mut(next..) {
+                dropped.fill(combos);
+            }
+            fill_dropped(kept, places, combos);
+        }
+        let values = &self.values[..self.calls.len()];
+        let cells = &mut self.by_place[..needed];
+        macro_rules! widths {
+            ($($width:literal $span:literal),+ $(,)?) => {
+                match self.calls.len() {
+                    $($width => by_place::<$width, $span>(cells, values, places),)+
+                    _ => Err(Error::internal("too many summed calls".to_string())),
+                }
+            };
+        }
+        widths!(0 1, 1 2, 2 4, 3 4, 4 8, 5 8, 6 8, 7 8, 8 16)
+    }
+
+    /// Writes down the places [`Self::add_places`] added rows into, and says whether `map` has no
+    /// group yet for any of them, in one pass over the places.
+    ///
+    /// The caller opens a group for each such place before [`Self::fold_places`]. On q01 the map
+    /// has a place for every two or three rows of a chunk and about 400 of them have rows, so the
+    /// fold goes through the list rather than through the map again.
+    ///
+    /// # Errors
+    ///
+    /// An internal error for a place past the map with rows, which is a bug in the caller.
+    pub fn touched(&mut self, map: &[u32]) -> Result<bool> {
+        let (width, span) = (self.calls.len(), cell_span(self.calls.len()));
+        let used = self.by_place.len().min((map.len() + 1) * span);
+        self.touched.clear();
+        let mut unseen = false;
+        for (place, cells) in self.by_place[..used].chunks_exact_mut(span).enumerate() {
+            if cells[width] == 0 {
+                continue;
+            }
+            match map.get(place) {
+                Some(&held) => {
+                    unseen |= held == UNSEEN;
+                    self.touched.push(place);
+                }
+                // The rows the filter dropped.
+                None => cells.fill(0),
+            }
+        }
+        if self.by_place[used..].iter().any(|&cell| cell != 0) {
+            return Err(Error::internal("a place past the map has rows".to_string()));
+        }
+        Ok(unseen)
+    }
+
+    /// Folds the totals of each place [`Self::touched`] wrote down into the group `map` holds for
+    /// it, and leaves every cell at nothing for the next chunk.
+    ///
+    /// # Errors
+    ///
+    /// The overflow a total raises, and an internal error for a place with rows and no group, or a
+    /// group with no state for a call.
+    pub fn fold_places(
+        &mut self,
+        map: &[u32],
+        states: &mut [Accumulator],
+        stride: usize,
+    ) -> Result<()> {
+        let span = cell_span(self.calls.len());
+        for &place in &self.touched {
+            let held = map.get(place).copied().unwrap_or(UNSEEN);
+            if held == UNSEEN {
+                return Err(Error::internal(format!("place {place} has rows and no group")));
+            }
+            let cells = &mut self.by_place[place * span..][..span];
+            fold_cells(&self.calls, &self.counting, cells, states, held as usize * stride)?;
+            cells.fill(0);
+        }
+        self.touched.clear();
+        Ok(())
+    }
+}
+
+/// Folds one group's cells of a [`PlaceSums`] into its accumulators, which start at `at`.
+fn fold_cells(
+    calls: &[(usize, Feed, i64)],
+    counting: &[usize],
+    cells: &[i64],
+    states: &mut [Accumulator],
+    at: usize,
+) -> Result<()> {
+    let count = cells[calls.len()];
+    if count == 0 {
+        return Ok(());
+    }
+    for (&total, &(offset, feed, base)) in cells.iter().zip(calls) {
+        let number = i128::from(total) + i128::from(base) * i128::from(count);
+        fold_wide(states, at + offset, feed, number, count)?;
+    }
+    for &offset in counting {
+        fold_wide(states, at + offset, Feed::Counted, 0, count)?;
+    }
+    Ok(())
+}
+
+/// Gives every row between the first and the last of `kept` that `kept` skips the place `combos`.
+///
+/// A list of rows with no gap in it ends as many rows after its first as it is long, so the list
+/// is cut in two only while a half has a gap, and the rows are never visited one by one. On q01
+/// about one row in seventy is dropped, and a walk of the kept rows to find the gaps was about seven
+/// instructions a row.
+fn fill_dropped(kept: &[u32], places: &mut [usize], combos: usize) {
+    let (Some(&first), Some(&last)) = (kept.first(), kept.last()) else { return };
+    let (first, last) = (first as usize, last as usize);
+    if last - first < kept.len() {
+        return;
+    }
+    if kept.len() == 2 {
+        if let Some(dropped) = places.get_mut(first + 1..last) {
+            dropped.fill(combos);
+        }
+        return;
+    }
+    let middle = kept.len() / 2;
+    fill_dropped(&kept[..=middle], places, combos);
+    fill_dropped(&kept[middle..], places, combos);
+}
+
+/// The most cells [`PlaceSums::add_places`] keeps, 512 KiB of them.
+const PLACE_CELLS: usize = 1 << 16;
+
+/// [`PlaceSums::add_places`]'s pass over every row of a chunk, for a number of value calls the
+/// compiler knows and the [`cell_span`] of it as `S`.
+fn by_place<const W: usize, const S: usize>(
+    cells: &mut [i64],
+    values: &[Vec<u64>],
+    places: &[usize],
+) -> Result<()> {
+    const NONE: [u64; 8] = [0; 8];
+    let mut columns: [&[u64]; W] = [&[]; W];
+    for (column, values) in columns.iter_mut().zip(values) {
+        *column = values.get(..places.len()).ok_or_else(|| {
+            Error::internal("a summed chunk of other rows than it read".to_string())
+        })?;
+    }
+    let cells = cells.as_chunks_mut::<S>().0;
+    // Eight rows at a time, so that each column is checked against the rows once a block rather
+    // than once a row.
+    let (blocks, tail) = places.as_chunks::<8>();
+    for (block, places) in blocks.iter().enumerate() {
+        let mut lanes: [&[u64; 8]; W] = [&NONE; W];
+        for (lanes, column) in lanes.iter_mut().zip(&columns) {
+            *lanes =
+                column.get(block * 8..).and_then(|values| values.first_chunk::<8>()).ok_or_else(
+                    || Error::internal("a summed column shorter than its rows".to_string()),
+                )?;
+        }
+        for (at, &place) in places.iter().enumerate() {
+            let mut row = [0_u64; W];
+            for (value, lanes) in row.iter_mut().zip(&lanes) {
+                *value = lanes[at];
+            }
+            add_row::<W, S>(cells, place, &row)?;
+        }
+    }
+    let done = blocks.len() * 8;
+    for (at, &place) in tail.iter().enumerate() {
+        let mut row = [0_u64; W];
+        for (value, column) in row.iter_mut().zip(&columns) {
+            *value = column[done + at];
+        }
+        add_row::<W, S>(cells, place, &row)?;
+    }
+    Ok(())
+}
+
+/// Adds one row's values and a one for its count into the cells of its place.
+#[inline(always)]
+fn add_row<const W: usize, const S: usize>(
+    cells: &mut [[i64; S]],
+    place: usize,
+    row: &[u64; W],
+) -> Result<()> {
+    let Some(cells) = cells.get_mut(place) else {
+        return Err(Error::internal(format!("place {place} is past the map")));
+    };
+    let mut adds = [0_i64; S];
+    for (add, &value) in adds.iter_mut().zip(row) {
+        *add = value as i64;
+    }
+    adds[W] = 1;
+    for (total, add) in cells.iter_mut().zip(adds) {
+        *total = total.wrapping_add(add);
+    }
+    Ok(())
 }
 
 /// The most value calls a [`PlaceSums`] pass takes.
@@ -6184,6 +6417,33 @@ mod tests {
             update_scattered(&mut by_place, &slots, stride, at, inputs[at], rows)
                 .expect("folds it");
         }
+        // Added up by place with the map left out of the pass, the group it has no slot for is
+        // found after the pass, and the answers are the same again. A second chunk goes through
+        // the same cells to show the fold left them at nothing.
+        let mut each_place = fresh();
+        assert!(sums.adds_by_place(groups, rows), "a map of four places over {rows} rows");
+        assert!(!sums.adds_by_place(rows / 2, rows), "a map of half the rows");
+        let mut map: Vec<u32> = (0..groups as u32).collect();
+        map[2] = u32::MAX;
+        for chunk in 0..2 {
+            assert!(sums.ready(&each_place, stride, &inputs, wanted, rows));
+            let mut cut = places.clone();
+            sums.add_places(&mut cut, Some(&kept), groups).expect("adds them up");
+            assert_eq!(sums.touched(&map).expect("looks"), chunk == 0, "chunk {chunk}");
+            map[2] = 2;
+            sums.fold_places(&map, &mut each_place, stride).expect("folds them in");
+            for at in elsewhere {
+                update_scattered(&mut each_place, &slots, stride, at, inputs[at], rows)
+                    .expect("folds it");
+            }
+        }
+        let mut twice = fresh();
+        for _ in 0..2 {
+            for (at, &input) in inputs.iter().enumerate() {
+                update_scattered(&mut twice, &slots, stride, at, input, rows)
+                    .expect("folds them in");
+            }
+        }
         for group in 0..groups {
             for (at, &(name, _, _)) in calls.iter().enumerate() {
                 let index = group * stride + at;
@@ -6192,6 +6452,35 @@ mod tests {
                 assert_eq!(together[index].finish().expect("finishes"), answer, "{note}");
                 assert_eq!(by_slot[index].finish().expect("finishes"), answer, "{note}, by slot");
                 assert_eq!(by_place[index].finish().expect("finishes"), answer, "{note}, by place");
+                let doubled = twice[index].finish().expect("finishes");
+                assert_eq!(
+                    each_place[index].finish().expect("finishes"),
+                    doubled,
+                    "{note}, each place"
+                );
+            }
+        }
+    }
+
+    /// The rows a filter dropped are found by cutting the kept rows in two wherever a half has a gap,
+    /// and that finds the same rows as walking them, at the ends and in runs of one and of several.
+    #[test]
+    fn the_dropped_rows_found_by_halves_are_the_ones_a_walk_finds() {
+        let mut rng = Rng(0x5eed_0115_d40b);
+        for rows in [1, 2, 7, 64, 300] {
+            for every in [2, 3, 70, 1000] {
+                let kept: Vec<u32> = (0..rows as u32).filter(|_| rng.next() % every != 0).collect();
+                let mut found: Vec<usize> = (0..rows).collect();
+                fill_dropped(&kept, &mut found, usize::MAX);
+                let mut walked: Vec<usize> = (0..rows).collect();
+                if let (Some(&first), Some(&last)) = (kept.first(), kept.last()) {
+                    for row in first as usize..=last as usize {
+                        if kept.binary_search(&(row as u32)).is_err() {
+                            walked[row] = usize::MAX;
+                        }
+                    }
+                }
+                assert_eq!(found, walked, "{rows} rows, one in {every} dropped");
             }
         }
     }
