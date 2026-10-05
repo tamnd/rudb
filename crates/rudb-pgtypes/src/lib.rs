@@ -61,6 +61,14 @@
 //! and an OID with no object. The catalog finds the names: it splits a name such as
 //! `schema.table` with [`qualified_name_list`] and writes the names of the objects.
 //!
+//! [`RowEncoder`], the `DataRow` encoder. It takes a batch of engine vectors and writes one
+//! `DataRow` message for each row in a range, in the text or binary format of each column. It
+//! computes the length of each value first, then grows the buffer once and writes each value in
+//! place, so a row has no allocation for each value. [`OutputSettings`] holds the session state
+//! that the output depends on, such as `DateStyle`, `IntervalStyle`, `extra_float_digits`,
+//! `bytea_output` and the time zone. [`date_from_unix`] and [`timestamp_from_unix`] convert the
+//! engine values, which count from 1970, to the values of PostgreSQL, which count from 2000.
+//!
 //! [`Recv`], the binary input of a `Bind` parameter, with the errors of PostgreSQL when the value
 //! is too short or too long. The binary output of the other types is the value in big-endian bytes.
 //!
@@ -73,6 +81,10 @@
 //! a zone with daylight saving time, a zone name in the input such as `Europe/Paris`, and an
 //! abbreviation whose offset changed over time such as `MSK` need the tz database, which comes
 //! later. Until then the input refuses a zone name with the error of an unknown zone.
+//!
+//! [`RowEncoder`] writes text in UTF-8 and does not convert to the client encoding. It flattens a
+//! constant or dictionary vector before it writes the rows, so it does not yet use the shape of
+//! the vector to write a repeated value once.
 //!
 //! PostgreSQL parses `json` by recursion and stops a deep value with `stack depth limit exceeded`
 //! when it reaches `max_stack_depth`. [`json_in`] uses no recursion and takes a value at any
@@ -88,6 +100,7 @@ mod json;
 mod number;
 mod numeric;
 mod reg;
+mod row;
 mod scalar;
 mod string;
 mod types;
@@ -104,9 +117,10 @@ pub use datetime::{
     DateTimeInput, FixedZone, Interval, IntervalStyle, NoZones, POSTGRES_EPOCH_JDATE,
     TIMESTAMP_INFINITY, TIMESTAMP_NEGATIVE_INFINITY, TimeZone, UNIX_EPOCH_JDATE,
     UNIX_TO_POSTGRES_DAYS, UNIX_TO_POSTGRES_USECS, USECS_PER_DAY, USECS_PER_SEC, ZoneAbbrevs,
-    ZoneLookup, date_in, date_out, date_recv, date2j, interval_in, interval_out, interval_recv,
-    interval_send, j2date, time_in, time_out, time_recv, timestamp_in, timestamp_out,
-    timestamp_recv, timestamptz_in, timestamptz_out, timetz_in, timetz_out, timetz_recv,
+    ZoneLookup, date_from_unix, date_in, date_out, date_recv, date2j, interval_in, interval_out,
+    interval_recv, interval_send, j2date, time_in, time_out, time_recv, timestamp_from_unix,
+    timestamp_in, timestamp_out, timestamp_recv, timestamptz_in, timestamptz_out, timetz_in,
+    timetz_out, timetz_recv,
 };
 pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};
@@ -120,6 +134,7 @@ pub use numeric::{
 pub use reg::{
     RegInput, RegKind, qualified_name_list, reg_in, reg_out_oid, split_identifier_string,
 };
+pub use row::{OutputSettings, RowEncoder};
 pub use scalar::{
     ByteaOutput, NAME_MAX_BYTES, bool_in, bool_out, bytea_in, bytea_out, char_in, char_out,
     name_in, uuid_in, uuid_out,
