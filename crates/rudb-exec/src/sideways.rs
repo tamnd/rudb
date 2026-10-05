@@ -420,9 +420,11 @@ impl Domain {
                 && let Ok(frame) = i64::try_from(packed.base())
             {
                 let shift = frame.wrapping_sub(base) as u64;
-                return compact(rows, |row| {
-                    self.bit(packed.code(row).wrapping_add(shift)) && valid(row)
-                });
+                packed.retain_set(rows, &self.words, shift, self.range);
+                if !none_null {
+                    rows.retain(|&row| !keys.is_null_at(row as usize));
+                }
+                return;
             }
             macro_rules! flat {
                 ($values:expr) => {{

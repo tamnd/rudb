@@ -4657,6 +4657,48 @@ impl Packed<'_> {
         kept
     }
 
+    /// Keeps of `rows` the ones whose code plus `shift`, wrapping and then taken no higher than
+    /// `range`, is a set bit of `bits`, moved down in place and still in order.
+    ///
+    /// This is a join's bitmap of build keys asked about the rows a filter before it kept, as in
+    /// TPC-H q20, where lineitem's part and supplier keys are tested on the seventh of its rows the
+    /// date range keeps. A code at a time was a word to find, a load, a shift and a mask to read the
+    /// code and another load to test its bit, and those tests were a seventh of the query. In lanes
+    /// both reads are gathers for eight rows at once, see [`crate::lanes::retain_set`], and only the
+    /// last few rows go a code at a time. `rows` are in order and inside the vector, and `bits`
+    /// holds bit `range`.
+    pub fn retain_set(&self, rows: &mut Vec<u32>, bits: &[u64], shift: u64, range: u64) {
+        let (mut kept, mut at) = (0, 0);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            let bytes = crate::lanes::bytes_of(self.words);
+            #[expect(clippy::cast_possible_wrap, reason = "the shift is a wrapped difference")]
+            let fits = (
+                u32::try_from(self.offset * self.width as usize),
+                u32::try_from(range),
+                i32::try_from(shift as i64),
+            );
+            if let (Ok(first), Ok(top), Ok(by)) = fits
+                && (1..=crate::lanes::LANE_WIDTH_MAX).contains(&(self.width as usize))
+                && first < 1 << 31
+                && top < 1 << 31
+                && by.unsigned_abs() < 1 << 30
+                && bytes.len() < 1 << 28
+                && (top as usize) < bits.len() * 64
+            {
+                (kept, at) =
+                    crate::lanes::retain_set((bytes, first, self.width), rows, bits, by, top);
+            }
+        }
+        for at in at..rows.len() {
+            let row = rows[at];
+            rows[kept] = row;
+            let offset = self.code(row as usize).wrapping_add(shift).min(range);
+            kept += usize::from(bits[(offset / 64) as usize] >> (offset % 64) & 1 == 1);
+        }
+        rows.truncate(kept);
+    }
+
     /// The bytes from this vector's first block on, and how many whole blocks of them the lanes
     /// can read with the slack [`crate::lanes::readable`] asks for after the last one.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
