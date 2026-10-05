@@ -60,10 +60,17 @@ impl Key {
 
 /// The encoded keys of every row a table holds, for one [`Key`].
 ///
-/// Behind an [`Arc`] so that the copy of the catalog a transaction keeps to roll back to shares it,
-/// and the first write after the copy is the one that pays for a set of its own.
+/// Held in runs, each behind an [`Arc`], so that the copy of the catalog a transaction keeps to
+/// roll back to shares them. A write adds to the last run when nothing else holds it and starts a
+/// run of its own when something does, so a transaction that adds a thousand keys to a table of ten
+/// million copies none of the ten million. It used to be one set behind one `Arc`, and the first
+/// write of every transaction copied the whole of it: a YCSB load of ten million rows in
+/// transactions of a thousand copied the keys ten thousand times and was still loading after ten
+/// minutes. [`Seen::settle`] puts the runs back into one once nothing else holds the first, and a
+/// run is folded into the one before it whenever it grows to half that one's size, so there are
+/// never more runs than the logarithm of the keys for a lookup to look through.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Seen(Arc<Held>);
+pub(crate) struct Seen(Vec<Arc<Held>>);
 
 /// The keys themselves. A key of one integer column is kept as the integer, which is about a fifth
 /// of the memory of its encoding in a box of its own. Built over the 36 million rows of the JOB
@@ -169,6 +176,29 @@ impl Ints {
                 .map(move |left| (first + i128::from(left.trailing_zeros())) as i64)
         });
         set.chain(self.rest.iter().copied())
+    }
+
+    /// Adds every key `other` holds, taking it whole when this holds none.
+    fn take(&mut self, other: Self) {
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
+        self.add(&other);
+    }
+
+    /// Adds every key `other` holds.
+    fn add(&mut self, other: &Self) {
+        if other.is_empty() {
+            return;
+        }
+        let (low, high) = other
+            .keys()
+            .fold((i64::MAX, i64::MIN), |(low, high), key| (low.min(key), high.max(key)));
+        self.reach(low, high, other.len());
+        for key in other.keys() {
+            self.insert(key);
+        }
     }
 
     /// Stretches the bitmap over `low..=high`, about to take `adding` more keys, when that keeps it
@@ -280,6 +310,24 @@ impl Held {
             Encoded::Bytes => self.bytes.insert(scratch.into()),
         }
     }
+
+    fn len(&self) -> usize {
+        self.ints.len() + self.bytes.len()
+    }
+
+    /// Takes in the keys of `run`, moving them when nothing else holds it.
+    fn take(&mut self, run: Arc<Held>) {
+        match Arc::try_unwrap(run) {
+            Ok(run) => {
+                self.ints.take(run.ints);
+                self.bytes.extend(run.bytes);
+            }
+            Err(run) => {
+                self.ints.add(&run.ints);
+                self.bytes.extend(run.bytes.iter().cloned());
+            }
+        }
+    }
 }
 
 /// One column of a key onto the end of its encoding, or false for a null.
@@ -347,6 +395,71 @@ fn bare(chunk: &Chunk, key: &Key, row: usize) -> Result<String> {
 }
 
 impl Seen {
+    fn contains(&self, encoded: Encoded, scratch: &[u8]) -> bool {
+        self.0.iter().any(|run| run.contains(encoded, scratch))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|run| run.len() == 0)
+    }
+
+    /// Makes the last run one nothing else holds, starting a new one when it is shared.
+    fn open(&mut self) {
+        if !self.0.last_mut().is_some_and(|run| Arc::get_mut(run).is_some()) {
+            self.0.push(Arc::default());
+        }
+    }
+
+    /// Adds a key to the last run, which [`Self::open`] has made this set's own, and says whether
+    /// it was new. A null key always is.
+    fn insert(&mut self, encoded: Encoded, scratch: &[u8]) -> bool {
+        let (last, rest) = self.0.split_last_mut().expect("opened");
+        !rest.iter().any(|run| run.contains(encoded, scratch))
+            && Arc::get_mut(last).expect("opened").insert(encoded, scratch)
+    }
+
+    /// Adds a block of integer keys to the last run, which [`Self::open`] has made this set's own,
+    /// stopping at the first one already held, here or in an earlier run, and says where it was.
+    /// The keys before it are added and the rest are not.
+    fn insert_all(&mut self, keys: &[i64]) -> Option<usize> {
+        let (last, rest) = self.0.split_last_mut().expect("opened");
+        let held = rest.iter().filter_map(|run| run.ints.first_held(keys)).min();
+        let upto = held.unwrap_or(keys.len());
+        Arc::get_mut(last).expect("opened").ints.insert_all(&keys[..upto]).or(held)
+    }
+
+    /// Where the first of a block of integer keys that any run holds is.
+    fn first_held(&self, keys: &[i64]) -> Option<usize> {
+        self.0.iter().filter_map(|run| run.ints.first_held(keys)).min()
+    }
+
+    /// Folds the last run into the one before it while it holds at least half as many keys, which
+    /// keeps each run at least twice the size of the one after it.
+    fn fold(&mut self) {
+        while let [.., before, last] = self.0.as_slice()
+            && before.len() <= 2 * last.len()
+        {
+            let last = self.0.pop().expect("two runs");
+            Arc::make_mut(self.0.last_mut().expect("two runs")).take(last);
+        }
+    }
+
+    /// Puts every run into the first, when nothing else holds the first, which is when the copy of
+    /// the catalog that shared it is gone. A transaction's keys then go back into the table's one
+    /// set at its commit, and the next transaction shares one set rather than a run for each one
+    /// before it.
+    pub(crate) fn settle(&mut self) {
+        let Some((first, rest)) = self.0.split_first_mut() else { return };
+        if rest.is_empty() || Arc::get_mut(first).is_none() {
+            return;
+        }
+        let rest = self.0.split_off(1);
+        let first = Arc::get_mut(&mut self.0[0]).expect("asked just above");
+        for run in rest {
+            first.take(run);
+        }
+    }
+
     /// The keys of these rows, refused if one repeats. `fresh` says the rows are all of the table,
     /// which is how an `UPDATE` or a `DELETE` lands, and a repeat there is reported the way the pin
     /// reports a key that was already there.
@@ -367,16 +480,16 @@ impl Seen {
         columns: &[Field],
         fresh: bool,
     ) -> Result<()> {
-        let held = Arc::make_mut(&mut self.0);
+        self.open();
         let mut scratch = Vec::new();
         let mut block = Vec::new();
         let repeated = if int_block(chunk, key, &mut block)? {
-            held.ints.insert_all(&block)
+            self.insert_all(&block)
         } else {
             let mut repeated = None;
             for row in 0..chunk.len() {
                 let encoded = encode(chunk, key, row, &mut scratch)?;
-                if !held.insert(encoded, &scratch) {
+                if !self.insert(encoded, &scratch) {
                     repeated = Some(row);
                     break;
                 }
@@ -397,6 +510,7 @@ impl Seen {
                 ))
             });
         }
+        self.fold();
         Ok(())
     }
 
@@ -420,12 +534,12 @@ impl Seen {
         let mut block = Vec::new();
         for chunk in chunks {
             let held = if int_block(chunk, key, &mut block)? {
-                self.0.ints.first_held(&block)
+                self.first_held(&block)
             } else {
                 let mut held = None;
                 for row in 0..chunk.len() {
                     let encoded = encode(chunk, key, row, &mut scratch)?;
-                    if self.0.contains(encoded, &scratch) {
+                    if self.contains(encoded, &scratch) {
                         held = Some(row);
                         break;
                     }
@@ -466,13 +580,13 @@ impl Seen {
         for chunk in chunks {
             for row in 0..chunk.len() {
                 let encoded = encode(chunk, key, row, &mut scratch)?;
-                if !self.0.contains(encoded, &scratch) {
+                if !self.contains(encoded, &scratch) {
                     continue;
                 }
                 if then.is_none() {
                     then = Some(before.take().expect("built once")()?);
                 }
-                if then.as_ref().is_some_and(|then| then.0.contains(encoded, &scratch)) {
+                if then.as_ref().is_some_and(|then| then.contains(encoded, &scratch)) {
                     continue;
                 }
                 return Err(Error::constraint(format!(
@@ -485,27 +599,22 @@ impl Seen {
         Ok(())
     }
 
-    /// Adds the keys [`Self::check`] passed. The set is copied only when a transaction's copy of
-    /// the catalog still shares it.
+    /// Adds the keys [`Self::check`] passed: into the last run when nothing else holds it, and as
+    /// a run of their own after it when something does.
     pub(crate) fn extend(&mut self, added: Self) {
         // The first load into a table, where copying the keys into an empty set would hold them
         // twice at the peak.
-        if self.0.ints.is_empty() && self.0.bytes.is_empty() {
+        if self.is_empty() {
             *self = added;
             return;
         }
-        let held = Arc::make_mut(&mut self.0);
-        let ints = &added.0.ints;
-        let (low, high) = ints
-            .keys()
-            .fold((i64::MAX, i64::MIN), |(low, high), key| (low.min(key), high.max(key)));
-        if !ints.is_empty() {
-            held.ints.reach(low, high, ints.len());
+        for run in added.0 {
+            match self.0.last_mut().and_then(Arc::get_mut) {
+                Some(last) => last.take(run),
+                None => self.0.push(run),
+            }
+            self.fold();
         }
-        for key in ints.keys() {
-            held.ints.insert(key);
-        }
-        held.bytes.extend(added.0.bytes.iter().cloned());
     }
 }
 
@@ -563,7 +672,10 @@ impl KeyLog {
 mod tests {
     use std::collections::HashSet;
 
-    use super::Ints;
+    use rudb_common::{Field, LogicalType, Value};
+    use rudb_vector::{Chunk, Vector};
+
+    use super::{Ints, Key, Seen};
 
     /// A small generator so the sequences below are the same on every run.
     fn next(state: &mut u64) -> u64 {
@@ -643,5 +755,91 @@ mod tests {
         assert_eq!(ints.rest.len(), 1);
         assert!(ints.bits.len() <= 1_000_000 / 64 + 2);
         assert!(!ints.insert(1 << 40) && !ints.insert(500_000));
+    }
+
+    fn chunk(ty: LogicalType, values: impl IntoIterator<Item = Value>) -> Chunk {
+        let values = values.into_iter().collect::<Vec<_>>();
+        Chunk::new(vec![Vector::from_values(ty, &values).expect("a column")]).expect("a chunk")
+    }
+
+    fn ints(from: i64, to: i64) -> Chunk {
+        chunk(LogicalType::BigInt, (from..to).map(Value::BigInt))
+    }
+
+    fn texts(from: i64, to: i64) -> Chunk {
+        chunk(LogicalType::Varchar, (from..to).map(|at| Value::Varchar(format!("user{at}").into())))
+    }
+
+    fn add(seen: &mut Seen, chunk: &Chunk, field: &Field) -> bool {
+        let key = Key { columns: vec![0], primary: true };
+        match seen.check(std::slice::from_ref(chunk), &key, std::slice::from_ref(field), false) {
+            Ok(added) => {
+                seen.extend(added);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// A copy shares the runs, the keys the copy adds go into a run of its own and are not the
+    /// original's, a repeat is found in any run, and the runs settle into one once the copy is gone.
+    #[test]
+    fn a_copy_adds_keys_in_runs_of_its_own() {
+        for (ty, rows) in
+            [(LogicalType::BigInt, ints as fn(i64, i64) -> Chunk), (LogicalType::Varchar, texts)]
+        {
+            let field = Field::new("k", ty);
+            let mut table = Seen::default();
+            assert!(add(&mut table, &rows(0, 10_000), &field));
+            assert_eq!(table.0.len(), 1);
+            for round in 0..50 {
+                let base = table.clone();
+                let mut mine = table.clone();
+                let from = 10_000 + round * 100;
+                assert!(add(&mut mine, &rows(from, from + 50), &field));
+                assert!(add(&mut mine, &rows(from + 50, from + 100), &field));
+                assert!(std::sync::Arc::ptr_eq(&mine.0[0], &table.0[0]), "the big run is shared");
+                assert!(!add(&mut mine, &rows(5, 6), &field), "a key the shared run holds");
+                assert!(!add(&mut mine, &rows(from + 70, from + 71), &field), "one of its own");
+                assert!(add(&mut table, &rows(from, from + 1), &field), "not the original's");
+                // The commit: the copy is the table from now on, and the snapshot goes.
+                table = mine;
+                assert!(table.0.len() > 1);
+                drop(base);
+                table.settle();
+                assert_eq!(table.0.len(), 1);
+            }
+            assert_eq!(table.0[0].len(), 15_000);
+            assert!(!add(&mut table, &rows(14_999, 15_000), &field));
+        }
+    }
+
+    /// While something keeps holding the first run, the runs after it fold together so a lookup
+    /// never looks through more of them than the logarithm of the keys.
+    #[test]
+    fn runs_fold_while_the_first_is_shared() {
+        let field = Field::new("k", LogicalType::BigInt);
+        let mut table = Seen::default();
+        assert!(add(&mut table, &ints(0, 100_000), &field));
+        let held = table.clone();
+        let mut at = 100_000;
+        for _ in 0..2_000 {
+            let snapshot = table.clone();
+            assert!(add(&mut table, &ints(at, at + 10), &field));
+            at += 10;
+            drop(snapshot);
+            assert!(table.0.len() <= 20, "{} runs", table.0.len());
+            for pair in table.0.windows(2) {
+                assert!(pair[0].len() > 2 * pair[1].len());
+            }
+        }
+        assert!(std::sync::Arc::ptr_eq(&held.0[0], &table.0[0]));
+        assert_eq!(table.0.iter().map(|run| run.len()).sum::<usize>(), 120_000);
+        assert!(!add(&mut table, &ints(119_999, 120_000), &field));
+        assert!(!add(&mut table, &ints(0, 1), &field));
+        drop(held);
+        table.settle();
+        assert_eq!(table.0.len(), 1);
+        assert_eq!(table.0[0].len(), 120_000);
     }
 }

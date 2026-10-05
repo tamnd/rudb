@@ -3007,6 +3007,14 @@ impl Table {
         Ok(seen)
     }
 
+    /// Puts the keys added in runs of their own while a copy of the table shared its key sets back
+    /// into one set each, which is for once that copy is gone. Changes nothing a read answers.
+    pub fn settle_keys(&mut self) {
+        for seen in self.seen.iter_mut().flatten() {
+            seen.settle();
+        }
+    }
+
     fn hold_keys(&mut self, seen: Vec<Seen>) {
         if !seen.is_empty() {
             self.seen = seen.into_iter().map(Some).collect();
