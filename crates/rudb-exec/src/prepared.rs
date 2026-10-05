@@ -119,10 +119,12 @@ pub struct Prepared {
 
 /// How few rows the masks of [`Prepared::masked`] go on to read after, as one in this many.
 ///
-/// Sixteen, because a mask reads a block of 64 rows whole if any row of it is left, and at one row
-/// in sixteen that is a block in every one or two, where the threaded walk reads four rows a block
-/// at a few times the cost a row.
-const MASK_FLOOR: usize = 16;
+/// A mask reads a block of 64 rows whole if any row of it is left, and a packed block compared in
+/// lanes is about a hundred instructions, under two a row. The threaded walk reads only the rows
+/// left, and on a packed column that is a gather, a compare and a list, which was near seventy
+/// instructions a row on TPC-H q06's `l_quantity`. So the mask is the cheaper of the two down to
+/// about one row in forty, and sixty four leaves it the blocks where most rows are gone.
+const MASK_FLOOR: usize = 64;
 
 /// One node of a flattened expression.
 ///
