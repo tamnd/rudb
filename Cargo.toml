@@ -105,6 +105,8 @@ rudb-stats = { version = "=0.8.28", path = "crates/rudb-stats" }
 rudb-storage = { version = "=0.8.28", path = "crates/rudb-storage" }
 rudb-txn = { version = "=0.8.28", path = "crates/rudb-txn" }
 rudb-vector = { version = "=0.8.28", path = "crates/rudb-vector" }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

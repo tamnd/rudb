@@ -16,6 +16,7 @@ mod poll;
 mod server;
 mod session;
 mod stream;
+mod tls;
 
 pub use config::Config;
 pub use server::{Server, init};

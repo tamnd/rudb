@@ -23,7 +23,11 @@ allow = [
   # rustls, aws-lc-rs and ring, which rudb-server uses for TLS and for SCRAM. aws-lc-rs carries
   # the OpenSSL license for its C part. Only rudb-server may depend on them, per
   # notes/Spec/2140/compat/postgres/16-crate-layout.md section 16.4. No engine crate does.
+  # aws-lc-sys also carries BSD-3-Clause and MIT-0 for parts of its C code, and `subtle`, which
+  # rustls uses for comparisons in constant time, is BSD-3-Clause.
+  "BSD-3-Clause",
   "ISC",
+  "MIT-0",
   "OpenSSL",
 ]
 confidence-threshold = 0.93

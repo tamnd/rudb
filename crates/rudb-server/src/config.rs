@@ -27,6 +27,40 @@ pub struct Config {
     /// `auto_create_database`: create a missing database at connect time. Off by default, as the
     /// behavior of PostgreSQL.
     pub auto_create_database: bool,
+    /// `ssl`: accept TLS on TCP connections. Off by default, as in PostgreSQL.
+    pub ssl: bool,
+    /// `ssl_cert_file`, relative to the data directory when it is not absolute.
+    pub ssl_cert_file: PathBuf,
+    /// `ssl_key_file`, relative to the data directory when it is not absolute.
+    pub ssl_key_file: PathBuf,
+    /// `ssl_ca_file`: the certificates that a client certificate must chain to. Empty for none,
+    /// and then the server does not ask for a client certificate.
+    pub ssl_ca_file: PathBuf,
+    /// `ssl_min_protocol_version`.
+    pub ssl_min_protocol_version: TlsVersion,
+    /// `ssl_max_protocol_version`. [`TlsVersion::Any`] is no limit.
+    pub ssl_max_protocol_version: TlsVersion,
+}
+
+/// A value of `ssl_min_protocol_version` and `ssl_max_protocol_version`. `rustls` has no TLS 1.0
+/// and no TLS 1.1, so the values `TLSv1` and `TLSv1.1` of PostgreSQL are not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TlsVersion {
+    /// The empty value: no limit.
+    Any,
+    Tls12,
+    Tls13,
+}
+
+impl TlsVersion {
+    /// The name that PostgreSQL gives the value.
+    pub fn name(self) -> &'static str {
+        match self {
+            TlsVersion::Any => "",
+            TlsVersion::Tls12 => "TLSv1.2",
+            TlsVersion::Tls13 => "TLSv1.3",
+        }
+    }
 }
 
 impl Config {
@@ -40,6 +74,12 @@ impl Config {
             unix_socket_permissions: 0o777,
             max_connections: 100,
             auto_create_database: false,
+            ssl: false,
+            ssl_cert_file: PathBuf::from("server.crt"),
+            ssl_key_file: PathBuf::from("server.key"),
+            ssl_ca_file: PathBuf::new(),
+            ssl_min_protocol_version: TlsVersion::Tls12,
+            ssl_max_protocol_version: TlsVersion::Any,
         }
     }
 
@@ -71,6 +111,15 @@ impl Config {
                 self.auto_create_database = parse_bool(value)
                     .ok_or_else(|| format!("parameter \"{name}\" requires a Boolean value"))?;
             }
+            "ssl" => {
+                self.ssl = parse_bool(value)
+                    .ok_or_else(|| format!("parameter \"{name}\" requires a Boolean value"))?;
+            }
+            "ssl_cert_file" => self.ssl_cert_file = PathBuf::from(value),
+            "ssl_key_file" => self.ssl_key_file = PathBuf::from(value),
+            "ssl_ca_file" => self.ssl_ca_file = PathBuf::from(value),
+            "ssl_min_protocol_version" => self.ssl_min_protocol_version = tls_version(name, value)?,
+            "ssl_max_protocol_version" => self.ssl_max_protocol_version = tls_version(name, value)?,
             _ => return Err(format!("unrecognized configuration parameter \"{name}\"")),
         }
         Ok(())
@@ -115,6 +164,20 @@ impl Config {
             config.set(&name, &value)?;
         }
         Ok(config)
+    }
+}
+
+/// A value of `ssl_min_protocol_version` or `ssl_max_protocol_version`, in any case.
+fn tls_version(name: &str, value: &str) -> Result<TlsVersion, String> {
+    let invalid = format!("invalid value for parameter \"{name}\": \"{value}\"");
+    match value.to_ascii_lowercase().as_str() {
+        "" => Ok(TlsVersion::Any),
+        "tlsv1.2" => Ok(TlsVersion::Tls12),
+        "tlsv1.3" => Ok(TlsVersion::Tls13),
+        "tlsv1" | "tlsv1.1" => {
+            Err(format!("{invalid}\nDETAIL:  rudb-server supports only TLSv1.2 and TLSv1.3."))
+        }
+        _ => Err(format!("{invalid}\nHINT:  Available values: , TLSv1.2, TLSv1.3.")),
     }
 }
 
@@ -184,6 +247,23 @@ mod tests {
         let error = Config::from_args(&args("-D /d -p 70000")).unwrap_err();
         assert_eq!(error, "invalid value for parameter \"port\": \"70000\"");
         assert!(Config::from_args(&args("-D")).is_err());
+    }
+
+    #[test]
+    fn the_tls_settings() {
+        let config = Config::from_args(&args(
+            "-D /d -c ssl=on -c ssl_cert_file=a.crt --ssl-min-protocol-version=tlsv1.3",
+        ))
+        .unwrap();
+        assert!(config.ssl);
+        assert_eq!(config.ssl_cert_file, PathBuf::from("a.crt"));
+        assert_eq!(config.ssl_key_file, PathBuf::from("server.key"));
+        assert_eq!(config.ssl_min_protocol_version, TlsVersion::Tls13);
+        assert_eq!(config.ssl_max_protocol_version, TlsVersion::Any);
+        let error = Config::from_args(&args("-D /d -c ssl_min_protocol_version=TLSv1.1"));
+        assert!(error.unwrap_err().starts_with(
+            "invalid value for parameter \"ssl_min_protocol_version\": \"TLSv1.1\"\nDETAIL:"
+        ));
     }
 
     #[test]
