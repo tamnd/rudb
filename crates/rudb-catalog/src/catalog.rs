@@ -43,6 +43,9 @@ pub struct Database {
     path: Option<String>,
     /// Whether it was attached `READ_ONLY`.
     read_only: bool,
+    /// Whether it was attached with a `STORAGE_VERSION` older than `v1.4.0`, which is the first
+    /// one the pin keeps a typed macro parameter in.
+    untyped_macros: bool,
 }
 
 impl Database {
@@ -89,6 +92,13 @@ impl Database {
     #[must_use]
     pub fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Whether a macro kept in it may not have a typed parameter, which is so when it was attached
+    /// with a `STORAGE_VERSION` older than `v1.4.0`.
+    #[must_use]
+    pub fn untyped_macros(&self) -> bool {
+        self.untyped_macros
     }
 }
 
@@ -357,6 +367,7 @@ impl Catalog {
                     internal: false,
                     path: None,
                     read_only: false,
+                    untyped_macros: false,
                 },
                 system,
                 Database {
@@ -366,6 +377,7 @@ impl Catalog {
                     internal: true,
                     path: None,
                     read_only: false,
+                    untyped_macros: false,
                 },
             ],
             default_catalog: DEFAULT_CATALOG.to_string(),
@@ -636,8 +648,17 @@ impl Catalog {
             internal: false,
             path,
             read_only,
+            untyped_macros: false,
         });
         Ok(())
+    }
+
+    /// Says that the attached database of this name was attached with a `STORAGE_VERSION` older
+    /// than `v1.4.0`, so that a macro made in it may not have a typed parameter.
+    pub fn keep_untyped_macros(&mut self, name: &str) {
+        if let Some(held) = self.databases.iter_mut().find(|held| same_name(&held.name, name)) {
+            held.untyped_macros = true;
+        }
     }
 
     /// Takes an attached database out of the catalog, with everything in it, and hands it back so
@@ -2330,6 +2351,7 @@ fn system(mut oid: i64) -> (Database, i64) {
         internal: true,
         path: None,
         read_only: false,
+        untyped_macros: false,
     };
     (database, oid)
 }

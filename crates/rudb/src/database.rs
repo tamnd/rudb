@@ -2533,6 +2533,7 @@ fn attach_database(
     // Whether the statement asked for a mode, which the pin holds a second attach of the same
     // name to, and otherwise leaves automatic.
     let mut access = None;
+    let mut untyped_macros = false;
     for (name, value) in &attach.options {
         let name = name.to_ascii_lowercase();
         match name.as_str() {
@@ -2557,10 +2558,20 @@ fn attach_database(
                     )));
                 }
             }
+            // A native file keeps what any version of the pin's would, except that the pin keeps
+            // a typed macro parameter only from v1.4.0 on and refuses one before that.
+            "storage_version" => {
+                let version = value.as_ref().map(Value::to_string).unwrap_or_default();
+                let numbers: Option<Vec<u32>> = version
+                    .trim_start_matches(['v', 'V'])
+                    .split('.')
+                    .map(|part| part.parse().ok())
+                    .collect();
+                untyped_macros = numbers.is_some_and(|numbers| numbers < vec![1, 4]);
+            }
             // How the pin lays out, reads and recovers its own file, which a native file has no
             // use for, and whether the name is listed, which nothing here hides yet.
-            "storage_version"
-            | "row_group_size"
+            "row_group_size"
             | "compress"
             | "io_mode"
             | "mmap_reserve_size"
@@ -2647,6 +2658,9 @@ fn attach_database(
     }
     let native = rudb_native::Catalog::open_in(&path, pages)?;
     catalog.attach_file(&name, Some(attach.path.clone()), read_only)?;
+    if untyped_macros {
+        catalog.keep_untyped_macros(&name);
+    }
     let tables = native.names().map(str::to_string).collect::<Vec<_>>();
     for table in tables {
         catalog.create_native_table_in(&name, native.table(&table)?)?;
