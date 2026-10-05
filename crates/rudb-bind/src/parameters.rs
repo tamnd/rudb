@@ -126,7 +126,10 @@ impl Parameters {
     /// The rows handed in under a name, if any were.
     #[must_use]
     pub fn relation(&self, name: &str) -> Option<&Written> {
-        self.relations.iter().find(|(held, _)| held.eq_ignore_ascii_case(name)).map(|(_, rows)| rows)
+        self.relations
+            .iter()
+            .find(|(held, _)| held.eq_ignore_ascii_case(name))
+            .map(|(_, rows)| rows)
     }
 
     /// Asks the statement to leave the rows it writes in `capture`.

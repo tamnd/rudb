@@ -5009,7 +5009,7 @@ pub fn attach(
     let size = file.len()?;
     let (slot, bytes, _) = committed_slot(file, size)?;
     let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
-    let card = card_for(path, card);
+    let card = card_for(path.as_ref(), card);
     let at = entries
         .iter()
         .position(|entry| entry.name == table)
@@ -5108,7 +5108,7 @@ pub fn restate(
     }
     let (slot, bytes, _) = committed_slot(file, size)?;
     let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
-    let card = card_for(path, card);
+    let card = card_for(path.as_ref(), card);
     let at = entries
         .iter()
         .position(|entry| entry.name == table)

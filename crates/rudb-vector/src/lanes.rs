@@ -199,7 +199,7 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn codes_unpacked_in_lanes_are_the_codes_packed() {
-        for (width, (shuffle, shifts)) in LANES.iter().enumerate().skip(1) {
+        for width in 1..=LANE_WIDTH_MAX {
             let top = (1_u64 << width) - 1;
             let codes: Vec<u64> = (0..64_u64).map(|i| (i * 2_654_435_761) & top).collect();
             let mut bytes = vec![0xff_u8; readable(width)];
@@ -219,7 +219,7 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn eight_lanes_agree_with_a_code_at_a_time() {
-        for (width, (shuffle, shifts)) in LANES.iter().enumerate().skip(1) {
+        for width in 1..=LANE_WIDTH_MAX {
             let top = (1_u64 << width) - 1;
             let codes: Vec<u64> = (0..64_u64).map(|i| (i * 2_654_435_761) & top).collect();
             let mut bytes = vec![0_u8; readable(width)];
