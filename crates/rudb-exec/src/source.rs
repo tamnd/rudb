@@ -34,7 +34,7 @@ use rudb_seam::{Context, SeamId, Settings};
 use rudb_storage::Probe;
 use rudb_vector::{Chunk, Data, Form, Selection, VECTOR_SIZE, Vector};
 
-use crate::cutoff::Cutoff;
+use crate::cutoff::{Cutoff, Through};
 use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
 use crate::prepared::{Prepared, Scratch};
 use crate::register::compaction;
@@ -2439,6 +2439,13 @@ impl<'a> Scan<'a> {
         onto(&self.columns, vec![test])
     }
 
+    /// The cutoff of a top N above that orders by an expression over one of this scan's columns,
+    /// with the table column it reads. See [`crate::cutoff::Through`].
+    fn cut_through(&self) -> Option<(usize, Op, Bound, &Through)> {
+        let (column, op, worst, through) = self.cutoff.as_ref()?.through(self.index)?;
+        Some(((*self.columns.get(column)?)?, op, worst, through))
+    }
+
     /// The table column a top N above this scan orders by first, and whether it runs descending.
     fn ordered(&self) -> Option<(usize, bool)> {
         let (column, op) = self.cutoff.as_ref()?.ordered(self.index)?;
@@ -2451,10 +2458,19 @@ impl<'a> Scan<'a> {
     /// The two sets of tests are asked separately rather than joined into one, so that a scan with no
     /// top N above it does what it always did and a scan with one pays an allocation per part it
     /// hands back and nothing per part it walks past.
-    fn ruled(&self, at: usize, probes: &[Probe], cutoff: &[Probe]) -> bool {
+    fn ruled(
+        &self,
+        at: usize,
+        probes: &[Probe],
+        cutoff: &[Probe],
+        through: Option<&(usize, Op, Bound, &Through)>,
+    ) -> bool {
         let rows = self.table.rows();
         (!probes.is_empty() && rows.skips(at, probes))
             || (!cutoff.is_empty() && rows.skips(at, cutoff))
+            || through.is_some_and(|(column, op, worst, through)| {
+                rows.ruled_by(at, *column, &|range| through.beaten(*op, worst, range))
+            })
             || self.reduced_away(at)
             || self.keyed_away(at)
             || self.lacking(at)
@@ -3001,6 +3017,7 @@ impl Source for Scan<'_> {
         // rather than once per call, since a call that walks a long run of ruled out parts is a call
         // during which the other workers are still reading and improving it. See [`crate::cutoff`].
         let cutoff = self.cutoff();
+        let through = self.cut_through();
         let at = loop {
             let at = position(morsel);
             if at >= self.table.rows().chunk_count() || morsel.is_drained() {
@@ -3008,7 +3025,7 @@ impl Source for Scan<'_> {
                 return Ok(Progress::Done);
             }
             morsel.advance(1);
-            if !self.ruled(at, probes, &cutoff) {
+            if !self.ruled(at, probes, &cutoff, through.as_ref()) {
                 break at;
             }
             self.skipped.fetch_add(1, Ordering::Relaxed);
