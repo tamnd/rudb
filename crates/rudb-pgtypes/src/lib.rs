@@ -124,7 +124,7 @@ pub use datetime::{
     timestamp_in, timestamp_out, timestamp_recv, timestamptz_in, timestamptz_out, timetz_in,
     timetz_out, timetz_recv,
 };
-pub use declared::declared_type;
+pub use declared::{declared_type, session_type};
 pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};
 pub use generated::oids as oid;

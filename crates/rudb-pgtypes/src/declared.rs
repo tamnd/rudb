@@ -7,7 +7,7 @@
 //! type that only rudb has, gives `None`, and the caller then uses the type that the logical type
 //! maps to.
 
-use rudb_common::DeclaredType;
+use rudb_common::{DeclaredType, LogicalType};
 
 use crate::generated::oids as oid;
 use crate::types::{Oid, TypeInfo};
@@ -206,6 +206,22 @@ impl Parser {
         };
         Some(Some(interval_range(fields)))
     }
+}
+
+/// The rudb type of a PostgreSQL type that DuckDB reads as a different type. DuckDB reads `oid` as
+/// `BIGINT` and `"char"` as `VARCHAR`. A PostgreSQL session keeps them as `UINTEGER` and
+/// `UTINYINT`, which have the values and the width of the PostgreSQL types. The same is true for
+/// an array of them.
+pub fn session_type(declared: DeclaredType) -> Option<LogicalType> {
+    let of = |oid| match oid {
+        oid::OID => Some(LogicalType::UInteger),
+        oid::CHAR => Some(LogicalType::UTinyInt),
+        _ => None,
+    };
+    of(declared.oid).or_else(|| {
+        let info = TypeInfo::get(declared.oid).filter(|info| info.is_array())?;
+        Some(LogicalType::List(Box::new(of(info.elem)?)))
+    })
 }
 
 /// The OID and the typmod of a written type, or `None` when the text is not a built-in PostgreSQL

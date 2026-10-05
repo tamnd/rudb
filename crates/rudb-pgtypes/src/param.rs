@@ -19,9 +19,9 @@ use crate::datetime::{
 };
 use crate::error::TypeError;
 use crate::generated::oids;
-use crate::number::{int2_in, int4_in, int8_in};
+use crate::number::{int2_in, int4_in, int8_in, oid_in};
 use crate::numeric::{Numeric, NumericSign, numeric_in, numeric_out, numeric_recv};
-use crate::scalar::{bool_in, bytea_in, uuid_in};
+use crate::scalar::{bool_in, bytea_in, char_in, name_in, uuid_in};
 use crate::types::{Oid, TypeInfo};
 use crate::{float4_in, float8_in};
 
@@ -44,6 +44,8 @@ pub fn logical_type(oid: Oid) -> Option<LogicalType> {
         oids::INT2 => LogicalType::SmallInt,
         oids::INT4 => LogicalType::Integer,
         oids::INT8 => LogicalType::BigInt,
+        oids::OID => LogicalType::UInteger,
+        oids::CHAR => LogicalType::UTinyInt,
         oids::FLOAT4 => LogicalType::Float,
         oids::FLOAT8 => LogicalType::Double,
         oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::NAME => LogicalType::Varchar,
@@ -116,6 +118,9 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
         oids::INT2 => Value::SmallInt(int2_in(text)?),
         oids::INT4 => Value::Integer(int4_in(text)?),
         oids::INT8 => Value::BigInt(int8_in(text)?),
+        oids::OID => Value::UInteger(oid_in(text)?),
+        oids::CHAR => Value::UTinyInt(char_in(text)),
+        oids::NAME => Value::Varchar(name_in(text).to_owned()),
         oids::FLOAT4 => Value::Float(float4_in(text)?),
         oids::FLOAT8 => Value::Double(float8_in(text)?),
         oids::NUMERIC => numeric(&numeric_in(text, -1)?),
@@ -140,6 +145,8 @@ fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
         oids::INT2 => Value::SmallInt(recv.i16()?),
         oids::INT4 => Value::Integer(recv.i32()?),
         oids::INT8 => Value::BigInt(recv.i64()?),
+        oids::OID => Value::UInteger(recv.u32()?),
+        oids::CHAR => Value::UTinyInt(recv.byte()?),
         oids::FLOAT4 => Value::Float(recv.f32()?),
         oids::FLOAT8 => Value::Double(recv.f64()?),
         oids::NUMERIC => numeric(&numeric_recv(recv, -1)?),
@@ -242,6 +249,13 @@ mod tests {
     fn the_text_format_uses_the_input_function_of_the_type() {
         assert_eq!(read(oids::BOOL, false, b"yes").unwrap(), Value::Boolean(true));
         assert_eq!(read(oids::INT4, false, b" 42 ").unwrap(), Value::Integer(42));
+        assert_eq!(read(oids::OID, false, b"4294967295").unwrap(), Value::UInteger(u32::MAX));
+        assert_eq!(read(oids::CHAR, false, b"ab").unwrap(), Value::UTinyInt(b'a'));
+        let long = "x".repeat(70);
+        assert_eq!(
+            read(oids::NAME, false, long.as_bytes()).unwrap(),
+            Value::Varchar(long[..63].into())
+        );
         assert_eq!(read(oids::DATE, false, b"1/2/1970").unwrap(), Value::Date(1));
         assert_eq!(read(oids::DATE, false, b"infinity").unwrap(), Value::Date(i32::MAX));
         assert_eq!(
@@ -279,6 +293,8 @@ mod tests {
     #[test]
     fn the_binary_format_uses_the_receive_function_of_the_type() {
         assert_eq!(read(oids::INT8, true, &7i64.to_be_bytes()).unwrap(), Value::BigInt(7));
+        assert_eq!(read(oids::OID, true, &7u32.to_be_bytes()).unwrap(), Value::UInteger(7));
+        assert_eq!(read(oids::CHAR, true, b"a").unwrap(), Value::UTinyInt(b'a'));
         assert_eq!(read(oids::DATE, true, &(-10_957i32).to_be_bytes()).unwrap(), Value::Date(0));
         assert_eq!(read(oids::JSONB, true, b"\x01{}").unwrap(), Value::Varchar("{}".into()));
         let error = read(oids::INT4, true, &7i64.to_be_bytes()).unwrap_err();

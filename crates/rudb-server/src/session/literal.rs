@@ -4,12 +4,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rudb_common::session::LiteralInput;
-use rudb_common::types::LogicalType;
 use rudb_common::value::Value;
 use rudb_common::{Error, Result};
 use rudb_pgtypes::{
-    DateOrder, DateTimeInput, InputSettings, IntervalStyle, NoZones, UNIX_TO_POSTGRES_USECS,
-    ZoneAbbrevs, oid, param_value,
+    DateOrder, DateTimeInput, InputSettings, IntervalStyle, NoZones, TypeInfo,
+    UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, oid, param_value,
 };
 
 use super::zone::Zone;
@@ -23,23 +22,32 @@ pub(super) struct Literals {
 }
 
 impl LiteralInput for Literals {
-    fn read(&self, ty: &LogicalType, text: &str) -> Option<Result<Value>> {
-        let oid = match ty {
-            LogicalType::Boolean => oid::BOOL,
-            LogicalType::SmallInt => oid::INT2,
-            LogicalType::Integer => oid::INT4,
-            LogicalType::BigInt => oid::INT8,
-            LogicalType::Float => oid::FLOAT4,
-            LogicalType::Double => oid::FLOAT8,
-            LogicalType::Blob => oid::BYTEA,
-            LogicalType::Uuid => oid::UUID,
-            LogicalType::Date => oid::DATE,
-            LogicalType::Time => oid::TIME,
-            LogicalType::Timestamp => oid::TIMESTAMP,
-            LogicalType::TimestampTz => oid::TIMESTAMPTZ,
-            LogicalType::Interval => oid::INTERVAL,
-            _ => return None,
-        };
+    fn read(&self, oid: u32, text: &str) -> Option<Result<Value>> {
+        let known = [
+            oid::BOOL,
+            oid::CHAR,
+            oid::NAME,
+            oid::INT2,
+            oid::INT4,
+            oid::INT8,
+            oid::OID,
+            oid::FLOAT4,
+            oid::FLOAT8,
+            oid::BYTEA,
+            oid::UUID,
+            oid::DATE,
+            oid::TIME,
+            oid::TIMESTAMP,
+            oid::TIMESTAMPTZ,
+            oid::INTERVAL,
+        ];
+        // An array of a known type, such as `'{1,2}'::int4[]`, is read by the array input.
+        let element = TypeInfo::get(oid).filter(|info| info.is_array()).map(|info| info.elem);
+        let strings = [oid::TEXT, oid::VARCHAR];
+        let known_element = |element| known.contains(&element) || strings.contains(&element);
+        if !known.contains(&oid) && !element.is_some_and(known_element) {
+            return None;
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| i64::try_from(since.as_micros()).unwrap_or(0));
