@@ -736,10 +736,6 @@ const RUN_BLOCK: usize = 64;
 /// the pass that finds them.
 const RUN_ROWS: usize = 8;
 
-/// The most totals a chunk is added up into per combination of its key, a call's total and a row
-/// count for each, which is 128 kilobytes and inside the second level cache.
-const PLACE_CELLS: usize = 16_384;
-
 /// A bucket for a group at this slot with this hash, or an error when the partition is too large.
 fn bucket_for(slot: usize, hash: u64, what: &'static str) -> Result<u32> {
     let slot = u32::try_from(slot).ok().filter(|&slot| slot < SLOT_MASK);
@@ -2821,10 +2817,11 @@ impl<'a> Aggregate<'a> {
             uncut = None;
         }
         let mut runs_found = false;
-        // Totals per combination rather than per group, for a chunk where every call that folds is
-        // a total or a count and nothing needs a row's slot. On q01 finding every row's slot, taking
-        // the dropped rows back out and looking for runs in what was left was half of the fold.
-        // A map wider than the chunk is not, since its every place is read once a chunk.
+        // Totals added up through the map, for a chunk where every call that folds is a total or a
+        // count and nothing needs a row's slot. On q01 finding every row's slot, taking the dropped
+        // rows back out and looking for runs in what was left was half of the fold. Not under a
+        // group limit, because a row the limit turns away has no group for the pass to go on with,
+        // and not past a few groups, since every group's totals are cleared and read once a chunk.
         let offered = self
             .calls
             .iter()
@@ -2839,9 +2836,10 @@ impl<'a> Aggregate<'a> {
             && self.calls.iter().enumerate().all(|(at, call)| {
                 self.by_vector[at] || !call.folds() || (!call.distinct && filters[at].is_none())
             })
-            && direct.as_ref().is_some_and(|codes| {
-                codes.combos() <= *length && codes.combos().saturating_mul(calls + 1) <= PLACE_CELLS
-            });
+            && self.max_groups.is_none()
+            && table.len() <= FEW_SLOTS
+            && table.len().saturating_mul(4) <= *length
+            && direct.is_some();
         let mut placed = false;
         if let Some(codes) = &direct {
             if !codes.same_as(coded_on) {
@@ -2858,6 +2856,15 @@ impl<'a> Aggregate<'a> {
                     None => coded_map.reset(codes.combos()),
                 }
             }
+            // Asked before `resolve` below takes the states for itself.
+            let in_runs = codes.place_runs(*length, *length / RUN_ROWS, slot_runs);
+            let inputs: Vec<Option<&Vector>> = if by_place {
+                arguments.iter().map(|argument| argument.first()).collect()
+            } else {
+                Vec::new()
+            };
+            let summed =
+                !in_runs && by_place && place_sums.ready(states, calls, &inputs, offered, *length);
             // A row the map has nothing for goes through the probe and the insert every row used to
             // go through, there and then, and what comes back is written into the map before the
             // next row is looked at. A key sorted the way `CounterID` is brings each value in as a
@@ -2869,24 +2876,6 @@ impl<'a> Aggregate<'a> {
             // ordinary case once the first rows of a row group have been through. A key read by
             // value is not hashed as a chunk at all, since the rows that miss are a few dozen and
             // are hashed one at a time. `NOWHERE` is a row the group limit turned away.
-            // Asked before `resolve` below takes the states for itself.
-            let in_runs = codes.place_runs(*length, *length / RUN_ROWS, slot_runs);
-            let summed = !in_runs
-                && by_place
-                && {
-                    codes.places(*length, coded_places);
-                    let inputs: Vec<Option<&Vector>> =
-                        arguments.iter().map(|argument| argument.first()).collect();
-                    place_sums.add(
-                        states,
-                        calls,
-                        &inputs,
-                        offered,
-                        &coded_places[..*length],
-                        codes.combos(),
-                        uncut.map(|kept| kept.indices()),
-                    )
-                };
             let one_at_a_time = prehashed.is_none() && codes.by_value();
             let mut hashed = false;
             let mut resolve = |row: usize| -> Result<usize> {
@@ -2950,27 +2939,27 @@ impl<'a> Aggregate<'a> {
                 runs_found = true;
             } else if summed
             {
-                // Every call is a total or a count, so the chunk was added up per combination
-                // without a slot found for any row, and each combination is a group from here on.
-                // The rows that open one are only the first of each new combination.
+                // Every call is a total or a count, so each row's totals go straight into the group
+                // the map holds for it, and no row's slot is written down. A row whose combination
+                // has no group yet stops the pass, and it goes on from that row once one is open.
+                codes.places(*length, coded_places);
                 let kept = uncut.map(|kept| kept.indices());
-                for place in place_sums.touched() {
-                    if coded_map[place] != crate::table::UNSEEN {
-                        continue;
+                let mut row = 0;
+                loop {
+                    row = place_sums.add(
+                        &inputs,
+                        coded_map,
+                        &coded_places[..*length],
+                        kept,
+                        row,
+                    )?;
+                    if row == *length {
+                        break;
                     }
-                    let first = match kept {
-                        Some(kept) => kept
-                            .iter()
-                            .map(|&row| row as usize)
-                            .find(|&row| coded_places[row] == place),
-                        None => coded_places[..*length].iter().position(|&at| at == place),
-                    };
-                    if let Some(row) = first {
-                        let slot = resolve(row)?;
-                        coded_map.set(place, held_at(slot));
-                    }
+                    let slot = resolve(row)?;
+                    coded_map.set(coded_places[row], held_at(slot));
                 }
-                place_sums.fold(states, calls, |place| slot_at(coded_map[place]))?;
+                place_sums.fold(states, calls)?;
                 placed = true;
             } else if codes.look_up(coded_map, *length, slots) != Some(false) {
                 // One pass that finds every row's slot straight out of the map when the key is one
@@ -5861,8 +5850,8 @@ pub(crate) struct Building {
     coded_map: Places,
     /// Which combination each row of the last chunk is, worked out one key column at a time.
     coded_places: Vec<usize>,
-    /// The last chunk's totals per combination, when every call is a total or a count and the
-    /// chunk was folded by combination with no slot found per row. See [`PlaceSums`].
+    /// The last chunk's totals per group, when every call is a total or a count and the chunk was
+    /// added up through the coded map with no slot found per row. See [`PlaceSums`].
     place_sums: PlaceSums,
     /// The values of each integer key column the map reads by value, widened, and their runs.
     coded_values: crate::table::Widened,

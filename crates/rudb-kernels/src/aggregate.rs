@@ -2620,90 +2620,69 @@ fn walk_slots<const W: usize, const C: usize, T: Copy + TryInto<i64>>(
 /// place in its block says which copy it adds into.
 const SLOT_BLOCK: usize = 8;
 
-/// Several calls' totals per place of a coded map, for a chunk whose key is a few small codes.
+/// Several calls' totals per group, for a chunk whose rows find their group through a coded map.
 ///
-/// [`update_shared_slots`] wants each row's slot, and on q01 finding them was three passes over the
+/// [`update_shared_slots`] wants each row's slot, and on q01 getting there was three passes over the
 /// chunk before a value was read: the map read at every row's place into a vector of slots, the rows
 /// the filter dropped taken back out of it, and the slots read again to see whether they came in
 /// runs. Each packed argument was then read out into a vector of `i64` of its own. A total needs none
-/// of that. A place names one combination of key codes as surely as a slot names a group, so the
-/// totals are kept per place, read straight off the caller's places, and each place is turned into
-/// its group once a chunk rather than once a row.
+/// of that. Here the map is read at a row's place and the slot it holds is used there and then, for
+/// every call at once, and a dropped row adds into a group nothing reads.
 ///
-/// A packed argument is added up as its codes, and its base is added once per place at the end as
-/// many times as the place has rows, so no code is widened into its value one row at a time. The
+/// A packed argument is added up as its codes, and its base is added once per group at the end as
+/// many times as the group has rows, so no code is widened into its value one row at a time. The
 /// codes are unpacked 64 at a time into the stack, which is what [`rudb_vector::Packed::unpack`] is
-/// for. See `spec/perf/112-totals-by-place.md`.
+/// for. Only codes of 32 bits or fewer and flat integers of 32 bits or fewer are taken, so that over
+/// fewer than 2^31 rows no total can leave its `i64` and the adds need no check.
+///
+/// See `spec/perf/112-totals-by-group-through-the-map.md`.
 #[derive(Debug, Default)]
 pub struct PlaceSums {
-    /// Per place, a total for each call in [`Self::calls`] and then the place's row count. One place
-    /// past the last is where the rows the filter dropped go, and nothing reads it.
+    /// Per group, a total for each call in [`Self::calls`] and then the group's row count. The first
+    /// group of them is where the rows the filter dropped go, and group `s` is the one after it.
     cells: Vec<i64>,
     /// The calls that read a value, as where each one's accumulator sits in a group, how it is fed,
-    /// and its column with what a code of it is short of its value.
+    /// and what a code of it is short of its value.
     calls: Vec<(usize, Feed, i64)>,
+    /// The columns those calls read, in the same order.
+    columns: Vec<Summed>,
     /// The calls that want the row count and no value.
     counting: Vec<usize>,
-    /// How many places the cells hold, not counting the one for dropped rows.
-    places: usize,
 }
 
 /// A column a [`PlaceSums`] pass reads, as codes of a packed run or as small flat integers.
-#[derive(Clone, Copy)]
-enum Summed<'v> {
-    Packed(rudb_vector::Packed<'v>),
-    Wide(&'v [i64]),
-    Narrow(&'v [i32]),
-}
-
-impl Summed<'_> {
-    /// The codes or values of rows `from` to `from + out.len()`, as words.
-    #[inline]
-    fn read(self, from: usize, out: &mut [u64]) {
-        match self {
-            Self::Packed(packed) => packed.unpack(from, out),
-            Self::Wide(values) => {
-                for (out, &value) in out.iter_mut().zip(&values[from..]) {
-                    *out = value as u64;
-                }
-            }
-            Self::Narrow(values) => {
-                for (out, &value) in out.iter_mut().zip(&values[from..]) {
-                    *out = i64::from(value) as u64;
-                }
-            }
-        }
-    }
+///
+/// Held as the vector it came from, so that the sums can be kept between chunks with no borrow of
+/// one, and read as its packed parts or its data when a block is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Summed {
+    Packed,
+    Narrow,
 }
 
 impl PlaceSums {
-    /// Adds up the `wanted` calls of a chunk per place, and says whether it took every one of them.
+    /// Readies the sums for the `wanted` calls of a chunk of `rows` rows, and says whether it can
+    /// take every one of them.
     ///
-    /// `places` is each row's place, every one of them under `combos`, and `kept` the rows the
-    /// filter kept, in order, when it dropped any. `false` is a chunk this does not read, with
-    /// nothing in `states` touched, so the caller folds it the way it would have: a call that is not
-    /// a total or a count, a column that is not a packed run of at most 32 bits or flat integers, a
-    /// table with no group yet to ask what each call holds, and a total that leaves an `i64`.
-    #[expect(clippy::too_many_arguments, reason = "a chunk, its calls and its places")]
-    pub fn add(
+    /// `false` is a chunk this does not read, so the caller folds it the way it would have: a call
+    /// that is not a total or a count, a column that is not a packed run of at most 32 bits or flat
+    /// integers of at most 32, and a table with no group yet to ask what each call holds.
+    pub fn ready(
         &mut self,
         states: &[Accumulator],
         stride: usize,
         inputs: &[Option<&Vector>],
         wanted: u64,
-        places: &[usize],
-        combos: usize,
-        kept: Option<&[u32]>,
+        rows: usize,
     ) -> bool {
-        let rows = places.len();
         self.calls.clear();
+        self.columns.clear();
         self.counting.clear();
-        self.places = 0;
+        self.cells.clear();
         if rows >= 1 << 31 {
             return false;
         }
         let groups = states.len().checked_div(stride).unwrap_or(0);
-        let mut columns = Vec::new();
         let mut took = 0_u64;
         for (offset, input) in inputs.iter().enumerate().take(u64::BITS as usize) {
             if wanted >> offset & 1 == 0 {
@@ -2717,81 +2696,82 @@ impl PlaceSums {
                     continue;
                 }
                 Some(Share::Folded(call)) => match call.data {
-                    Data::Int64(values) => (call.feed, 0, Summed::Wide(values.as_slice())),
-                    Data::Int32(values) => (call.feed, 0, Summed::Narrow(values.as_slice())),
+                    Data::Int32(_) => (call.feed, 0, Summed::Narrow),
                     _ => return false,
                 },
                 Some(Share::Coded(_, feed, input)) => {
                     let Some(packed) = input.packed_parts() else { return false };
                     let Some(base) = packed_base(&packed) else { return false };
-                    // Codes of 32 bits or fewer over fewer than 2^31 rows add up to under 2^63,
-                    // so no total of them can leave its `i64`.
                     if packed.width() > 32 {
                         return false;
                     }
-                    (feed, base, Summed::Packed(packed))
+                    (feed, base, Summed::Packed)
                 }
                 None => return false,
             };
             self.calls.push((offset, feed, base));
-            columns.push(column);
+            self.columns.push(column);
             took |= 1 << offset;
         }
-        if took != wanted {
-            return false;
+        took == wanted && self.calls.len() <= SUMMED_MOST
+    }
+
+    /// Adds the rows from `from` on into the group the map holds at each row's place, and gives the
+    /// first kept row whose place holds no group yet, or the end.
+    ///
+    /// `inputs` are the ones [`Self::ready`] was given, `places` each row's place in `map`, and `kept`
+    /// the rows the filter kept, in order, when it dropped any. The caller opens a group for the row
+    /// handed back, writes it into the map, and asks again from that row.
+    ///
+    /// # Errors
+    ///
+    /// An internal error for a place past the map, which is a bug in the caller.
+    pub fn add(
+        &mut self,
+        inputs: &[Option<&Vector>],
+        map: &[u32],
+        places: &[usize],
+        kept: Option<&[u32]>,
+        from: usize,
+    ) -> Result<usize> {
+        let mut read: [Option<Read<'_>>; SUMMED_MOST] = [None; SUMMED_MOST];
+        for ((at, &(offset, _, _)), &column) in read.iter_mut().zip(&self.calls).zip(&self.columns)
+        {
+            let input = inputs.get(offset).copied().flatten();
+            *at = match (column, input) {
+                (Summed::Packed, Some(input)) => input.packed_parts().map(Read::Packed),
+                (Summed::Narrow, Some(input)) => match input.data() {
+                    Some(Data::Int32(values)) => Some(Read::Narrow(values.as_slice())),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if at.is_none() {
+                return Err(Error::internal("a summed column changed its form".to_string()));
+            }
         }
-        let span = columns.len() + 1;
-        let Some(cells) = combos.checked_add(1).and_then(|places| places.checked_mul(span)) else {
-            return false;
-        };
-        self.cells.clear();
-        self.cells.resize(cells, 0);
+        let read = &read[..self.calls.len()];
         macro_rules! widths {
             ($($width:literal),+ $(,)?) => {
-                match columns.len() {
-                    $($width => by_place::<$width>(&mut self.cells, places, combos, kept, &columns),)+
-                    _ => false,
+                match self.calls.len() {
+                    $($width => by_slot::<$width>(&mut self.cells, read, map, places, kept, from),)+
+                    _ => Err(Error::internal("too many summed calls".to_string())),
                 }
             };
         }
-        if !widths!(0, 1, 2, 3, 4, 5, 6, 7, 8) {
-            return false;
-        }
-        self.places = combos;
-        true
+        widths!(0, 1, 2, 3, 4, 5, 6, 7, 8)
     }
 
-    /// The places at least one kept row went to, in order.
-    pub fn touched(&self) -> impl Iterator<Item = usize> + '_ {
-        let span = self.calls.len() + 1;
-        self.cells
-            .chunks_exact(span)
-            .take(self.places)
-            .enumerate()
-            .filter(move |(_, cells)| cells[span - 1] != 0)
-            .map(|(place, _)| place)
-    }
-
-    /// Folds each place's totals into the group `slot_of` says the place is, skipping a place it
-    /// says is in none.
+    /// Folds each group's totals into its accumulators.
     ///
     /// # Errors
     ///
     /// The overflow a total raises, and an internal error for a group with no state for a call.
-    pub fn fold(
-        &self,
-        states: &mut [Accumulator],
-        stride: usize,
-        slot_of: impl Fn(usize) -> usize,
-    ) -> Result<()> {
+    pub fn fold(&self, states: &mut [Accumulator], stride: usize) -> Result<()> {
         let span = self.calls.len() + 1;
-        for (place, cells) in self.cells.chunks_exact(span).take(self.places).enumerate() {
+        for (slot, cells) in self.cells.chunks_exact(span).skip(1).enumerate() {
             let count = cells[span - 1];
             if count == 0 {
-                continue;
-            }
-            let slot = slot_of(place);
-            if slot == NOWHERE {
                 continue;
             }
             for (&total, &(offset, feed, base)) in cells.iter().zip(&self.calls) {
@@ -2806,58 +2786,101 @@ impl PlaceSums {
     }
 }
 
+/// The most value calls a [`PlaceSums`] pass takes.
+const SUMMED_MOST: usize = 8;
+
+/// A column a [`PlaceSums`] pass is reading, borrowed for the pass.
+#[derive(Clone, Copy)]
+enum Read<'v> {
+    Packed(rudb_vector::Packed<'v>),
+    Narrow(&'v [i32]),
+}
+
+impl Read<'_> {
+    /// The codes or values of rows `from` to `from + out.len()`, as words.
+    #[inline]
+    fn read(self, from: usize, out: &mut [u64]) {
+        match self {
+            Self::Packed(packed) => packed.unpack(from, out),
+            Self::Narrow(values) => {
+                for (out, &value) in out.iter_mut().zip(&values[from..]) {
+                    *out = i64::from(value) as u64;
+                }
+            }
+        }
+    }
+}
+
 /// [`PlaceSums::add`]'s pass over the rows, for a number of value calls the compiler knows.
 ///
-/// A block of 64 rows at a time: each column's codes for the block unpacked into the stack, the
-/// rows the filter kept in the block made a word of bits, and then each row's totals added into its
-/// place, or into the place past the last for a dropped row, so the row loop has no branch for
-/// those. `false` for a total that leaves an `i64` or a place past `combos`.
-fn by_place<const W: usize>(
-    cells: &mut [i64],
+/// A block of 64 rows at a time, starting on a multiple of 64 so that a packed column unpacks whole
+/// words: each column's codes for the block unpacked into the stack, the rows the filter kept in it
+/// made a word of bits, and each row's totals added into its group, or into the group for dropped
+/// rows when it was dropped or comes before `from`. The adds wrap because [`PlaceSums::ready`] only
+/// took columns whose totals cannot leave an `i64`.
+fn by_slot<const W: usize>(
+    cells: &mut Vec<i64>,
+    read: &[Read<'_>],
+    map: &[u32],
     places: &[usize],
-    combos: usize,
     kept: Option<&[u32]>,
-    columns: &[Summed<'_>],
-) -> bool {
+    from: usize,
+) -> Result<usize> {
     let span = W + 1;
-    let Ok(columns): std::result::Result<&[Summed<'_>; W], _> = columns.try_into() else {
-        return false;
+    let Ok(read): std::result::Result<&[Read<'_>; W], _> = read.try_into() else {
+        return Err(Error::internal("summed calls of another width".to_string()));
     };
+    let start = from / 64 * 64;
     let mut block = [[0_u64; 64]; W];
-    let mut next = 0;
-    for (at, places) in places.chunks(64).enumerate() {
-        let from = at * 64;
+    let mut next = kept.map_or(0, |kept| kept.partition_point(|&row| (row as usize) < start));
+    for (at, places) in places.get(start..).unwrap_or_default().chunks(64).enumerate() {
+        let first = start + at * 64;
         let rows = places.len();
-        for (codes, column) in block.iter_mut().zip(columns) {
-            column.read(from, &mut codes[..rows]);
+        for (codes, column) in block.iter_mut().zip(read) {
+            column.read(first, &mut codes[..rows]);
         }
-        let keep = match kept {
+        let mut keep = match kept {
             None => u64::MAX,
             Some(kept) => {
                 let mut word = 0_u64;
                 while let Some(&row) = kept.get(next)
-                    && (row as usize) < from + rows
+                    && (row as usize) < first + rows
                 {
-                    word |= 1 << (row as usize - from);
+                    word |= 1 << (row as usize - first);
                     next += 1;
                 }
                 word
             }
         };
+        if first < from {
+            keep &= u64::MAX << (from - first);
+        }
         for (row, &place) in places.iter().enumerate() {
-            let place = if keep >> row & 1 == 1 { place } else { combos };
-            let Some(cells) = cells.get_mut(place * span..place * span + span) else {
-                return false;
+            let Some(&held) = map.get(place) else {
+                return Err(Error::internal(format!("place {place} is past the map")));
             };
-            for (cell, codes) in cells.iter_mut().zip(&block) {
-                let Some(sum) = cell.checked_add(codes[row] as i64) else { return false };
-                *cell = sum;
+            let kept = keep >> row & 1 == 1;
+            if kept && held == UNSEEN {
+                return Ok(first + row);
             }
-            cells[W] += 1;
+            let group = if kept { held as usize + 1 } else { 0 };
+            let at = group * span;
+            if at + span > cells.len() {
+                cells.resize((group + 1).next_power_of_two() * span, 0);
+            }
+            let totals = &mut cells[at..at + span];
+            for (total, codes) in totals.iter_mut().zip(&block) {
+                *total = total.wrapping_add(codes[row] as i64);
+            }
+            totals[W] += 1;
         }
     }
-    true
+    Ok(places.len())
 }
+
+/// What a place of a coded map holds where no group has been opened for it, as
+/// `rudb_exec::table::UNSEEN` says it.
+const UNSEEN: u32 = u32::MAX;
 
 /// [`walk_runs`] for a pass wider than any width it is written for, reading its calls out of the list.
 ///
@@ -6168,19 +6191,37 @@ mod tests {
         let took = update_shared_slots(&mut by_slot, &slots, stride, &inputs, offered, rows)
             .expect("folds them in");
         assert_eq!(took, 0b111_1111, "the wrong calls shared a walk by slot");
-        // Added up per place with the rows in no group dropped, every call but the one that points
-        // somewhere else, which goes the old way, reaches the same answers again.
+        // Added up through a map with the rows in no group dropped, every call but the one that points
+        // somewhere else and the flat `i64` ones, which go the old way, reaches the same answers.
         let mut by_place = fresh();
         let places: Vec<usize> =
             slots.iter().map(|&slot| if slot == NOWHERE { 0 } else { slot }).collect();
         let kept: Vec<u32> =
             (0..rows).filter(|&row| slots[row] != NOWHERE).map(|row| row as u32).collect();
         let mut sums = PlaceSums::default();
-        let wanted = offered & !0b100;
-        assert!(sums.add(&by_place, stride, &inputs, wanted, &places, groups, Some(&kept)));
-        assert_eq!(sums.touched().collect::<Vec<_>>(), (0..groups).collect::<Vec<_>>());
-        sums.fold(&mut by_place, stride, |place| place).expect("folds them in");
-        update_scattered(&mut by_place, &slots, stride, 2, inputs[2], rows).expect("folds it in");
+        let elsewhere = [2, 3, 4];
+        let wanted = elsewhere.iter().fold(offered, |wanted, &at| wanted & !(1 << at));
+        assert!(!sums.ready(&by_place, stride, &inputs, offered, rows), "took what it cannot read");
+        assert!(sums.ready(&by_place, stride, &inputs, wanted, rows));
+        // The map opens group 2 only once it is asked for, the way the caller opens one.
+        let mut map: Vec<u32> = (0..groups as u32).collect();
+        map[2] = u32::MAX;
+        let mut row = 0;
+        let mut asked = 0;
+        loop {
+            row = sums.add(&inputs, &map, &places, Some(&kept), row).expect("adds them up");
+            if row == rows {
+                break;
+            }
+            assert_eq!(places[row], 2, "stopped at a row whose group was open");
+            map[2] = 2;
+            asked += 1;
+        }
+        assert_eq!(asked, 1);
+        sums.fold(&mut by_place, stride).expect("folds them in");
+        for at in elsewhere {
+            update_scattered(&mut by_place, &slots, stride, at, inputs[at], rows).expect("folds it");
+        }
         for group in 0..groups {
             for (at, &(name, _, _)) in calls.iter().enumerate() {
                 let index = group * stride + at;
