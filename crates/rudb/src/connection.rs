@@ -6,6 +6,18 @@ use crate::database::Shared;
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
 
+/// Where a connection is in a transaction block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transaction {
+    /// No `BEGIN` is open. Each statement is its own transaction.
+    Idle,
+    /// A `BEGIN` is open.
+    Open,
+    /// A statement failed in the open transaction, and only `COMMIT` or `ROLLBACK` runs until it
+    /// ends.
+    Aborted,
+}
+
 /// A connection to a database.
 ///
 /// Many of these share one [`crate::Database`], which is the model DuckDB has and the reason this
@@ -47,6 +59,12 @@ impl Connection {
     /// The token for one statement: this connection's flag, and the configured time limit.
     fn token(&self) -> Cancel {
         self.shared.restart(&self.cancel)
+    }
+
+    /// Where the connection is in a transaction block. A PostgreSQL server sends this in each
+    /// `ReadyForQuery`.
+    pub fn transaction(&self) -> Transaction {
+        self.shared.block()
     }
 
     /// Runs one query and returns every row it produced.

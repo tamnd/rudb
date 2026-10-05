@@ -1,0 +1,583 @@
+//! The listeners, the acceptor thread, and the state that all sessions share.
+//!
+//! One thread accepts the connections of every listener and starts one thread for each session.
+//! The sessions find each other through the registry, which a cancel request reads and which a
+//! stop uses to wake every session. Each database is open once and stays open until the server
+//! stops, so two sessions on one database share one `rudb::Database`.
+
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use rudb::{Connection, Database};
+use rudb_pgwire::{CANCEL_KEY_LEN, Cancel, CancelKey, cancel_target};
+
+use crate::config::Config;
+use crate::poll;
+use crate::session;
+use crate::stream::Stream;
+
+/// The name of the lock file in the data directory, which holds the process ID of the server.
+const PID_FILE: &str = "rudb-server.pid";
+
+/// The time that a stop gives the sessions to end by themselves before it closes their sockets.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// The stack of a session thread, the same as the main thread of a process on Linux, because a
+/// deep expression recurses in the parser and the binder.
+const SESSION_STACK: usize = 8 << 20;
+
+/// Writes one line to the log, which is the standard error, in the format of PostgreSQL.
+pub(crate) fn log(level: &str, message: &str) {
+    eprintln!("{level}:  {message}");
+}
+
+/// A running server.
+#[derive(Debug)]
+pub struct Server {
+    shared: Arc<Shared>,
+    acceptor: Option<JoinHandle<()>>,
+    /// The write end of the pipe that stops the acceptor.
+    stop: UnixStream,
+    addresses: Vec<SocketAddr>,
+    sockets: Vec<PathBuf>,
+    /// The files that the server removes when it stops: the sockets, their lock files and the
+    /// lock file of the data directory.
+    owned: Vec<PathBuf>,
+}
+
+/// One session in the registry.
+#[derive(Debug)]
+pub(crate) struct Entry {
+    /// The key, from the end of the startup. A session that has no key yet does not count against
+    /// `max_connections` and cannot be canceled.
+    pub(crate) key: Option<CancelKey>,
+    /// The connection to the database, which a cancel request interrupts.
+    pub(crate) connection: Option<Connection>,
+    /// The write end of the wake pipe of the session.
+    wake: UnixStream,
+    /// A second handle on the socket of the client, which a stop shuts down when the session does
+    /// not end in time.
+    stream: Option<Stream>,
+}
+
+/// The sessions by process ID.
+#[derive(Debug)]
+pub(crate) struct Sessions {
+    next: i32,
+    map: HashMap<i32, Entry>,
+}
+
+/// The state that the acceptor and all sessions share.
+#[derive(Debug)]
+pub(crate) struct Shared {
+    pub(crate) config: Config,
+    databases: Mutex<HashMap<String, Arc<Database>>>,
+    sessions: Mutex<Sessions>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    stopping: AtomicBool,
+}
+
+/// A reason why a session cannot start, with the SQLSTATE and the text of PostgreSQL.
+pub(crate) type Refusal = (&'static str, String);
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Shared {
+    /// True after the server started to stop.
+    pub(crate) fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    /// Adds a session that has just connected, and gives its process ID. `wake` is the write end
+    /// of its wake pipe.
+    pub(crate) fn register(&self, wake: UnixStream, stream: Option<Stream>) -> i32 {
+        let mut sessions = lock(&self.sessions);
+        let mut pid = sessions.next;
+        while sessions.map.contains_key(&pid) {
+            pid = if pid == i32::MAX { 1001 } else { pid + 1 };
+        }
+        sessions.next = if pid == i32::MAX { 1001 } else { pid + 1 };
+        sessions.map.insert(pid, Entry { key: None, connection: None, wake, stream });
+        pid
+    }
+
+    /// Gives the session its cancel key at the end of the startup, unless `max_connections`
+    /// sessions already have one.
+    pub(crate) fn admit(&self, pid: i32, protocol: u32) -> Result<CancelKey, Refusal> {
+        let mut sessions = lock(&self.sessions);
+        let started = sessions.map.values().filter(|entry| entry.key.is_some()).count();
+        if started >= self.config.max_connections {
+            return Err(("53300", "sorry, too many clients already".to_owned()));
+        }
+        let key = CancelKey::new(pid, protocol, poll::random::<CANCEL_KEY_LEN>());
+        if let Some(entry) = sessions.map.get_mut(&pid) {
+            entry.key = Some(key);
+        }
+        Ok(key)
+    }
+
+    /// Keeps a handle on the connection of a session, for cancel requests.
+    pub(crate) fn attach(&self, pid: i32, connection: Connection) {
+        if let Some(entry) = lock(&self.sessions).map.get_mut(&pid) {
+            entry.connection = Some(connection);
+        }
+    }
+
+    /// Removes a session that ended.
+    pub(crate) fn unregister(&self, pid: i32) {
+        lock(&self.sessions).map.remove(&pid);
+    }
+
+    /// Acts on a `CancelRequest`. The client gets no answer in any case, so a request that cancels
+    /// nothing only writes a line to the log.
+    pub(crate) fn cancel(&self, cancel: &Cancel<'_>) {
+        let sessions = lock(&self.sessions);
+        match cancel_target(cancel, |pid| sessions.map.get(&pid).and_then(|entry| entry.key)) {
+            Ok(pid) => {
+                if let Some(connection) = sessions.map.get(&pid).and_then(|e| e.connection.as_ref())
+                {
+                    connection.interrupt();
+                }
+            }
+            Err(line) => log("LOG", &line),
+        }
+    }
+
+    /// The database with this name, opened once for the whole server.
+    pub(crate) fn database(&self, name: &str) -> Result<Arc<Database>, Refusal> {
+        let missing = || ("3D000", format!("database \"{name}\" does not exist"));
+        // The name is a file name too, so a name that is not a plain file name cannot exist.
+        if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\', '\0']) {
+            return Err(missing());
+        }
+        let path = database_path(&self.config.data, name);
+        let mut databases = lock(&self.databases);
+        if let Some(database) = databases.get(name) {
+            return Ok(database.clone());
+        }
+        let exists = path.exists();
+        if !exists && !self.config.auto_create_database {
+            return Err(missing());
+        }
+        if exists && name == "template0" {
+            return Err((
+                "55000",
+                "database \"template0\" is not currently accepting connections".to_owned(),
+            ));
+        }
+        let text = path.to_str().ok_or_else(missing)?;
+        let database = Database::open(text).map_err(|error| {
+            ("XX000", format!("could not open database \"{name}\": {}", error.message()))
+        })?;
+        let database = Arc::new(database);
+        databases.insert(name.to_owned(), database.clone());
+        Ok(database)
+    }
+}
+
+/// The file of a database in the data directory.
+fn database_path(data: &Path, name: &str) -> PathBuf {
+    data.join("base").join(format!("{name}.rudb"))
+}
+
+/// Makes a data directory with the databases `postgres`, `template1` and `template0`, as `initdb`
+/// does.
+///
+/// # Errors
+///
+/// A data directory that exists and is not empty, or a file that the server cannot write.
+pub fn init(data: &Path) -> Result<(), String> {
+    if data.exists() && data.read_dir().map_err(|e| e.to_string())?.next().is_some() {
+        return Err(format!("directory \"{}\" exists but is not empty", data.display()));
+    }
+    let base = data.join("base");
+    std::fs::create_dir_all(&base)
+        .map_err(|e| format!("could not create directory \"{}\": {e}", base.display()))?;
+    std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("could not change permissions of \"{}\": {e}", data.display()))?;
+    for name in ["template1", "template0", "postgres"] {
+        let path = database_path(data, name);
+        let text = path.to_str().ok_or_else(|| format!("bad path \"{}\"", path.display()))?;
+        Database::open(text)
+            .and_then(Database::close)
+            .map_err(|e| format!("could not create database \"{name}\": {}", e.message()))?;
+    }
+    Ok(())
+}
+
+/// A listening socket.
+enum Listener {
+    Tcp(TcpListener),
+    Unix(UnixListener),
+}
+
+impl Listener {
+    fn fd(&self) -> RawFd {
+        match self {
+            Listener::Tcp(l) => l.as_raw_fd(),
+            Listener::Unix(l) => l.as_raw_fd(),
+        }
+    }
+
+    /// The next connection, or `None` when there is none now.
+    fn accept(&self) -> io::Result<Option<Stream>> {
+        let accepted = match self {
+            Listener::Tcp(l) => l.accept().map(|(s, _)| {
+                // A failure here leaves a slower connection that still works.
+                let _ = s.set_nodelay(true);
+                let _ = set_keepalive(s.as_raw_fd());
+                Stream::Tcp(s)
+            }),
+            Listener::Unix(l) => l.accept().map(|(s, _)| Stream::Unix(s)),
+        };
+        match accepted {
+            Ok(stream) => {
+                // On macOS a socket keeps the non-blocking flag of its listener.
+                match &stream {
+                    Stream::Tcp(s) => s.set_nonblocking(false)?,
+                    Stream::Unix(s) => s.set_nonblocking(false)?,
+                }
+                Ok(Some(stream))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// `SO_KEEPALIVE`, which PostgreSQL sets on each TCP connection.
+fn set_keepalive(fd: RawFd) -> io::Result<()> {
+    let on: libc::c_int = 1;
+    // SAFETY: `on` is a valid `c_int` for the whole call, and its size is the length given.
+    let done = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            (&raw const on).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if done == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+/// True when a process with this ID runs.
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists and sends nothing.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+/// Makes a lock file that holds `lines`, after it checks that no live process owns the file.
+fn lock_file(path: &Path, lines: &str, what: &str) -> Result<(), String> {
+    if let Ok(old) = std::fs::read_to_string(path) {
+        let pid = old.lines().next().and_then(|line| line.trim().parse::<i32>().ok());
+        if let Some(pid) = pid.filter(|&pid| alive(pid)) {
+            return Err(format!(
+                "lock file \"{}\" already exists\nHINT:  Is another rudb-server (PID {pid}) \
+                 using {what}?",
+                path.display()
+            ));
+        }
+    }
+    std::fs::write(path, lines)
+        .map_err(|e| format!("could not create lock file \"{}\": {e}", path.display()))
+}
+
+impl Server {
+    /// Opens the listeners and starts to accept connections.
+    ///
+    /// # Errors
+    ///
+    /// A data directory that is not there or that another server uses, an address or a socket
+    /// that the server cannot bind, or no listener at all.
+    pub fn start(config: Config) -> Result<Server, String> {
+        if !config.data.join("base").is_dir() {
+            return Err(format!(
+                "\"{}\" is not a valid data directory\nDETAIL:  The directory \"base\" is \
+                 missing. Run rudb-server init first.",
+                config.data.display()
+            ));
+        }
+        let mut owned = Vec::new();
+        let pid_file = config.data.join(PID_FILE);
+        let me = std::process::id();
+        lock_file(
+            &pid_file,
+            &format!("{me}\n{}\n", config.data.display()),
+            &format!("data directory \"{}\"", config.data.display()),
+        )?;
+        owned.push(pid_file);
+        let opened = Server::listen(&config, &mut owned);
+        let (listeners, addresses, sockets) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                for path in &owned {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(error);
+            }
+        };
+        let (stop_read, stop) = UnixStream::pair().map_err(|e| e.to_string())?;
+        let shared = Arc::new(Shared {
+            config,
+            databases: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Sessions {
+                next: 1001 + i32::from(poll::random::<2>()[0]) * 64,
+                map: HashMap::new(),
+            }),
+            threads: Mutex::new(Vec::new()),
+            stopping: AtomicBool::new(false),
+        });
+        let acceptor = {
+            let shared = shared.clone();
+            std::thread::Builder::new()
+                .name("rudb-acceptor".to_owned())
+                .spawn(move || accept(&shared, &listeners, &stop_read))
+                .map_err(|e| e.to_string())?
+        };
+        log("LOG", "database system is ready to accept connections");
+        Ok(Server { shared, acceptor: Some(acceptor), stop, addresses, sockets, owned })
+    }
+
+    /// Binds the TCP addresses and the Unix sockets of the configuration.
+    #[allow(clippy::type_complexity)]
+    fn listen(
+        config: &Config,
+        owned: &mut Vec<PathBuf>,
+    ) -> Result<(Vec<Listener>, Vec<SocketAddr>, Vec<PathBuf>), String> {
+        let mut listeners = Vec::new();
+        let mut addresses = Vec::new();
+        let mut port = config.port;
+        let hosts: Vec<&str> =
+            config.listen_addresses.split(',').map(str::trim).filter(|h| !h.is_empty()).collect();
+        for host in &hosts {
+            // `*` is every address. IPv6 goes first, because on Linux a socket on `::` also takes
+            // IPv4 and then `0.0.0.0` is in use, which is no error.
+            let candidates: Vec<SocketAddr> = if *host == "*" {
+                vec![SocketAddr::from(([0u16; 8], port)), SocketAddr::from(([0u8; 4], port))]
+            } else {
+                match (*host, port).to_socket_addrs() {
+                    Ok(found) => found.collect(),
+                    Err(e) => {
+                        log("WARNING", &format!("could not translate host name \"{host}\": {e}"));
+                        continue;
+                    }
+                }
+            };
+            for mut address in candidates {
+                address.set_port(port);
+                if addresses.contains(&address) {
+                    continue;
+                }
+                let family = if address.is_ipv4() { "IPv4" } else { "IPv6" };
+                match TcpListener::bind(address) {
+                    Ok(listener) => {
+                        let bound = listener.local_addr().map_err(|e| e.to_string())?;
+                        // With port 0 the first bind chooses the port for all the others.
+                        port = bound.port();
+                        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+                        log(
+                            "LOG",
+                            &format!(
+                                "listening on {family} address \"{}\", port {port}",
+                                bound.ip()
+                            ),
+                        );
+                        addresses.push(bound);
+                        listeners.push(Listener::Tcp(listener));
+                    }
+                    Err(e) if *host == "*" && e.kind() == io::ErrorKind::AddrInUse => {}
+                    Err(e) => log(
+                        "WARNING",
+                        &format!("could not bind {family} address \"{}\": {e}", address.ip()),
+                    ),
+                }
+            }
+        }
+        if !hosts.is_empty() && addresses.is_empty() {
+            return Err("could not create any TCP/IP sockets".to_owned());
+        }
+        let mut sockets = Vec::new();
+        for dir in config.unix_socket_directories.split(',').map(str::trim) {
+            if dir.is_empty() {
+                continue;
+            }
+            let path = Path::new(dir).join(format!(".s.PGSQL.{port}"));
+            let lock = Path::new(dir).join(format!(".s.PGSQL.{port}.lock"));
+            lock_file(
+                &lock,
+                &format!("{}\n{}\n", std::process::id(), config.data.display()),
+                &format!("socket \"{}\"", path.display()),
+            )?;
+            owned.push(lock);
+            // A socket file that is left from a server that died is in the way of the bind.
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path)
+                .map_err(|e| format!("could not bind Unix address \"{}\": {e}", path.display()))?;
+            owned.push(path.clone());
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(config.unix_socket_permissions),
+            )
+            .map_err(|e| {
+                format!("could not set permissions of file \"{}\": {e}", path.display())
+            })?;
+            listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+            log("LOG", &format!("listening on Unix socket \"{}\"", path.display()));
+            sockets.push(path);
+            listeners.push(Listener::Unix(listener));
+        }
+        if listeners.is_empty() {
+            return Err("no socket created for listening".to_owned());
+        }
+        Ok((listeners, addresses, sockets))
+    }
+
+    /// The TCP addresses that the server listens on, with the port that it uses.
+    pub fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
+    }
+
+    /// The Unix sockets that the server listens on.
+    pub fn sockets(&self) -> &[PathBuf] {
+        &self.sockets
+    }
+
+    /// The port: the port of the first TCP address, or the port of the configuration when there
+    /// is no TCP address.
+    pub fn port(&self) -> u16 {
+        self.addresses.first().map_or(self.shared.config.port, SocketAddr::port)
+    }
+
+    /// The number of sessions that finished their startup and did not end yet.
+    pub fn sessions(&self) -> usize {
+        lock(&self.shared.sessions).map.values().filter(|entry| entry.key.is_some()).count()
+    }
+
+    /// Stops the server as the fast shutdown of PostgreSQL does. The server accepts no more
+    /// connections, stops the statement of each session, ends each session with `57P01`, writes
+    /// each database to its file, and removes its sockets and lock files.
+    ///
+    /// # Errors
+    ///
+    /// The databases that the server could not write, one line for each.
+    pub fn stop(mut self) -> Result<(), String> {
+        self.shutdown()
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        let Some(acceptor) = self.acceptor.take() else {
+            return Ok(());
+        };
+        log("LOG", "received fast shutdown request");
+        self.shared.stopping.store(true, Ordering::Release);
+        let _ = self.stop.write_all(b"x");
+        let _ = acceptor.join();
+        {
+            let mut sessions = lock(&self.shared.sessions);
+            for entry in sessions.map.values_mut() {
+                if let Some(connection) = &entry.connection {
+                    connection.interrupt();
+                }
+                let _ = entry.wake.write_all(b"x");
+            }
+        }
+        let deadline = Instant::now() + STOP_GRACE;
+        while !lock(&self.shared.sessions).map.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for entry in lock(&self.shared.sessions).map.values() {
+            if let Some(stream) = &entry.stream {
+                stream.shutdown();
+            }
+        }
+        let threads = std::mem::take(&mut *lock(&self.shared.threads));
+        for thread in threads {
+            let _ = thread.join();
+        }
+        let mut errors = Vec::new();
+        let databases = std::mem::take(&mut *lock(&self.shared.databases));
+        for (name, database) in databases {
+            // Each session is gone, so this is the last handle and the close writes the file.
+            if let Ok(database) = Arc::try_unwrap(database)
+                && let Err(error) = database.close()
+            {
+                errors.push(format!("could not write database \"{name}\": {}", error.message()));
+            }
+        }
+        for path in self.owned.iter().rev() {
+            let _ = std::fs::remove_file(path);
+        }
+        log("LOG", "database system is shut down");
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() {
+            log("LOG", &error);
+        }
+    }
+}
+
+/// The acceptor: waits on every listener and on the stop pipe, and starts a thread for each
+/// connection.
+fn accept(shared: &Arc<Shared>, listeners: &[Listener], stop: &UnixStream) {
+    let mut fds: Vec<RawFd> = listeners.iter().map(Listener::fd).collect();
+    fds.push(stop.as_raw_fd());
+    loop {
+        let ready = match poll::readable_any(&fds) {
+            Ok(ready) => ready,
+            Err(e) => {
+                log("LOG", &format!("poll() failed in the acceptor: {e}"));
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        if ready[listeners.len()] || shared.stopping() {
+            return;
+        }
+        for (listener, _) in listeners.iter().zip(&ready).filter(|(_, ready)| **ready) {
+            loop {
+                match listener.accept() {
+                    Ok(Some(stream)) => spawn(shared, stream),
+                    Ok(None) => break,
+                    Err(e) => {
+                        // Too many open files and the like. PostgreSQL logs it and goes on.
+                        log("LOG", &format!("could not accept new connection: {e}"));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Starts the thread of one session.
+fn spawn(shared: &Arc<Shared>, stream: Stream) {
+    let mut threads = lock(&shared.threads);
+    threads.retain(|thread| !thread.is_finished());
+    let session = shared.clone();
+    let started = std::thread::Builder::new()
+        .name("rudb-session".to_owned())
+        .stack_size(SESSION_STACK)
+        .spawn(move || session::run(&session, stream));
+    match started {
+        Ok(thread) => threads.push(thread),
+        Err(e) => log("LOG", &format!("could not start a session thread: {e}")),
+    }
+}
