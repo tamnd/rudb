@@ -11,8 +11,8 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    Error, Field, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Session, StateKey, Value,
-    is_clustering_setting, looks_like_rule, rule_names,
+    Error, Field, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Session, SqlState, StateKey,
+    Value, is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
@@ -1115,10 +1115,24 @@ impl Binder<'_> {
         // too, which an `EXPLAIN` of a query that calls it shows. A call this cannot fold falls
         // through to the table, which refuses it in upstream's words.
         if rudb_catalog::same_name(&written, "current_setting")
+            && self.session.postgres().is_some()
+            && let Some(folded) = self.postgres_setting(&bound)?
+        {
+            return Ok(folded);
+        }
+        if rudb_catalog::same_name(&written, "current_setting")
             && bound.len() == 1
             && let Some(folded) = self.setting(bound[0])?
         {
             return Ok(folded);
+        }
+        // `version()` of a PostgreSQL session is the text of PostgreSQL, which clients parse for
+        // the major version.
+        if bound.is_empty()
+            && rudb_catalog::same_name(&written, "version")
+            && let Some(postgres) = self.session.postgres()
+        {
+            return Ok(self.add_constant(Value::Varchar(postgres.version.clone())));
         }
         // `getvariable` is folded for the reason `current_setting` is: it is declared to return
         // ANY and the type is the variable's, which is only known once the name is read.
@@ -1903,6 +1917,42 @@ impl Binder<'_> {
     ///
     /// A name the catalog does not know goes to [`Binder::beyond`], because rudb has settings that
     /// are not DuckDB's and the catalog is a list of DuckDB's.
+    /// `current_setting(name)` and `current_setting(name, missing_ok)` in a PostgreSQL session,
+    /// folded to the text of the parameter, as PostgreSQL returns it. A name that is not a
+    /// PostgreSQL parameter and has no dot can still be a rudb setting, so it goes on to
+    /// [`Binder::setting`]. Only a name that neither of them knows is the error of PostgreSQL, or
+    /// a null when `missing_ok` is true.
+    fn postgres_setting(&mut self, bound: &[ExprRef]) -> Result<Option<ExprRef>> {
+        let (argument, missing_ok) = match *bound {
+            [argument] => (argument, false),
+            [argument, missing] => {
+                let Expr::Constant(held) = *self.plan().expr(missing) else { return Ok(None) };
+                let Value::Boolean(missing_ok) = *self.plan().value(held) else { return Ok(None) };
+                (argument, missing_ok)
+            }
+            _ => return Ok(None),
+        };
+        let Expr::Constant(held) = *self.plan().expr(argument) else { return Ok(None) };
+        let Value::Varchar(name) = self.plan().value(held) else { return Ok(None) };
+        let name = name.clone();
+        let session = self.session;
+        let Some(postgres) = session.postgres() else { return Ok(None) };
+        if let Some(value) = postgres.settings.get(&name) {
+            return Ok(Some(self.add_constant(Value::Varchar(value))));
+        }
+        if !name.contains('.')
+            && (rudb_functions::setting_named(&name).is_some() || self.beyond(&name)?.is_some())
+        {
+            return self.setting(argument);
+        }
+        if missing_ok {
+            let null = self.add_constant(Value::Null);
+            return Ok(Some(self.cast_to(null, &LogicalType::Varchar)));
+        }
+        Err(Error::catalog(format!("unrecognized configuration parameter \"{name}\""))
+            .state(SqlState::UNDEFINED_OBJECT))
+    }
+
     fn setting(&mut self, argument: ExprRef) -> Result<Option<ExprRef>> {
         let Expr::Constant(held) = *self.plan().expr(argument) else { return Ok(None) };
         let Value::Varchar(name) = self.plan().value(held) else { return Ok(None) };

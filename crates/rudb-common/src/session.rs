@@ -40,7 +40,37 @@ pub struct Session {
     links: String,
     seams: String,
     variables: Variables,
+    postgres: Postgreses,
 }
+
+/// What a PostgreSQL session gives the engine to read: its parameters and the text of `version()`.
+///
+/// The server owns the parameters and changes them. The engine gets a new copy each time they
+/// change, which is cheap because the parameters hold only what the session touched.
+#[derive(Debug, Clone)]
+pub struct Postgres {
+    /// The parameters of the session.
+    pub settings: crate::guc::Settings,
+    /// What `version()` returns.
+    pub version: String,
+}
+
+/// The PostgreSQL session, if there is one, compared by identity. A new copy is a new value, so a
+/// cached plan that read the old copy is not used again.
+#[derive(Debug, Clone, Default)]
+struct Postgreses(Option<Arc<Postgres>>);
+
+impl PartialEq for Postgreses {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(one), Some(other)) => Arc::ptr_eq(one, other),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Postgreses {}
 
 /// One value `SET VARIABLE` left behind, with the type it was computed at.
 ///
@@ -394,6 +424,7 @@ impl Default for Session {
             links: String::new(),
             seams: String::new(),
             variables: Variables::default(),
+            postgres: Postgreses::default(),
         }
     }
 }
@@ -568,6 +599,18 @@ impl Session {
     /// Every variable, in the order they were first set.
     pub fn variables(&self) -> impl Iterator<Item = &Variable> {
         self.variables.0.iter()
+    }
+
+    /// Records the PostgreSQL session that runs the statements, or none.
+    pub fn set_postgres(&mut self, postgres: Option<Arc<Postgres>>) {
+        self.postgres = Postgreses(postgres);
+    }
+
+    /// The PostgreSQL session that runs the statements. `current_setting()`, `version()` and the
+    /// user functions read it when it is there.
+    #[must_use]
+    pub fn postgres(&self) -> Option<&Postgres> {
+        self.postgres.0.as_deref()
     }
 
     /// Whether this name is the one the relationship declarations are written under.

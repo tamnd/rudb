@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use rudb::{Connection, ErrorCode, QueryResult, Transaction};
 use rudb_common::guc::{self, Action, Origin, Settings};
+use rudb_common::session::Postgres;
 use rudb_pgtypes::{
     ByteaOutput, DateFormat, DateOrder, DateStyle, IntervalStyle, OutputSettings, RowEncoder,
     TypeInfo, pg_type,
@@ -48,6 +49,19 @@ const READ_SIZE: usize = 16 << 10;
 /// The version that `server_version` gives. `libpq` and the drivers read the number before the
 /// space, so they see version 19.0.
 const SERVER_VERSION: &str = concat!("19.0 (rudb ", env!("CARGO_PKG_VERSION"), ")");
+
+/// The text of `version()`, in the shape of `PG_VERSION_STR`. SQLAlchemy and DBeaver parse it.
+const VERSION: &str = concat!(
+    "PostgreSQL 19.0 (rudb ",
+    env!("CARGO_PKG_VERSION"),
+    ") on ",
+    env!("RUDB_TARGET"),
+    ", compiled by rustc ",
+    env!("RUDB_RUSTC"),
+    ", ",
+    env!("RUDB_POINTER_WIDTH"),
+    "-bit"
+);
 
 /// The bytes from the client that the session did not use yet.
 #[derive(Default)]
@@ -762,12 +776,15 @@ impl Runner {
             self.zone = Zone::of(&zone_name);
             self.zone_name = zone_name;
         }
+        let postgres = Postgres { settings: self.guc.clone(), version: VERSION.to_owned() };
+        self.connection.set_postgres(Arc::new(postgres));
     }
 
     /// The end of a transaction for the settings, when no transaction is open after a statement.
     fn settle(&mut self, commit: bool) {
         if self.connection.transaction() == Transaction::Idle && !self.implicit {
             self.guc.end(commit);
+            self.refresh();
         }
     }
 
@@ -933,7 +950,10 @@ impl Runner {
             _ => {}
         }
         if let Some(command) = command {
-            return self.setting(command, state, out);
+            let done = self.setting(command, state, out);
+            // The next statement can read the parameters, and it can be in the same message.
+            self.refresh();
+            return done;
         }
         run(&self.connection).map(Outcome::Result).map_err(|e| Failure::engine(&e, offset))
     }

@@ -6,6 +6,7 @@
 //! a name a query writes has to be the name the binder resolves and the name the executor reads,
 //! and a type the binder decided has to be the type the operator produces.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use rudb_common::{Field, LogicalType, Span, Value, days_from_civil};
@@ -12989,4 +12990,36 @@ fn make_type_and_get_type_answer_a_type_that_names_a_state_signature() {
         let error = db.execute(sql).unwrap_err().to_string();
         assert!(error.contains(wanted), "{sql}: {error}");
     }
+}
+
+#[test]
+fn a_postgres_session_answers_current_setting_version_and_the_user() {
+    use rudb_common::guc::{Action, Origin, Settings};
+    use rudb_common::session::Postgres;
+
+    let db = Database::new();
+    let connection = db.connect();
+    let text =
+        |sql: &str| connection.query(sql).expect("runs").rows().next().expect("a row")[0].clone();
+    assert_eq!(text("SELECT current_user"), Value::Varchar("duckdb".to_owned()));
+    let mut settings = Settings::new(true);
+    settings.set_internal("session_authorization", "alice").expect("a user");
+    settings.set("my.v", Some("42"), Action::Set, Origin::Statement).expect("a placeholder");
+    settings.set("work_mem", Some("64MB"), Action::Set, Origin::Statement).expect("a parameter");
+    let version = "PostgreSQL 19.0 (rudb test)".to_owned();
+    connection.set_postgres(Arc::new(Postgres { settings, version }));
+    assert_eq!(text("SELECT current_setting('my.v')"), Value::Varchar("42".to_owned()));
+    assert_eq!(text("SELECT current_setting('work_mem')"), Value::Varchar("64MB".to_owned()));
+    assert_eq!(
+        text("SELECT current_setting('server_version_num')"),
+        Value::Varchar("190000".to_owned())
+    );
+    assert_eq!(text("SELECT current_setting('no.such', true)"), Value::Null);
+    assert_eq!(text("SELECT version()"), Value::Varchar("PostgreSQL 19.0 (rudb test)".to_owned()));
+    assert_eq!(text("SELECT current_user"), Value::Varchar("alice".to_owned()));
+    let error = connection.query("SELECT current_setting('nodots')").expect_err("not a parameter");
+    assert_eq!(error.message(), "unrecognized configuration parameter \"nodots\"");
+    assert_eq!(error.reported_state().as_str(), "42704");
+    // Another connection of the same database is not a PostgreSQL session.
+    assert_eq!(rows(&db, "SELECT current_user"), vec![vec![Value::Varchar("duckdb".to_owned())]]);
 }

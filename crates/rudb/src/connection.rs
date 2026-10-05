@@ -1,5 +1,8 @@
 //! One caller's handle on a database.
 
+use std::sync::Arc;
+
+use rudb_common::session::Postgres;
 use rudb_common::{Cancel, Error, Result, Value};
 
 use crate::database::Shared;
@@ -65,6 +68,13 @@ impl Connection {
     /// `ReadyForQuery`.
     pub fn transaction(&self) -> Transaction {
         self.shared.block()
+    }
+
+    /// Records the PostgreSQL session that speaks through this connection. From the next statement
+    /// on, `current_setting()` reads its parameters and `version()` and the user functions answer
+    /// for it. A server calls this again each time the parameters change.
+    pub fn set_postgres(&self, postgres: Arc<Postgres>) {
+        self.shared.set_postgres(postgres);
     }
 
     /// Runs one query and returns every row it produced.
