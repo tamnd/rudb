@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "rudb"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "iana-time-zone",
  "rudb-arrow",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-arrow"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-vector",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-bind"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-catalog",
  "rudb-common",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-c-api"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb",
  "rudb-common",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-catalog"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-cli"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "libmimalloc-sys",
  "rudb",
@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-common"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -526,14 +526,14 @@ dependencies = [
 
 [[package]]
 name = "rudb-compress"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-csv"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-io",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-delta"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-io",
@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-duckdb-format"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-encoding"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-vector",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-exec"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-catalog",
  "rudb-common",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-extension"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb",
  "rudb-common",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-functions"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-compress",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-graph"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-iceberg"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-io",
@@ -636,14 +636,14 @@ dependencies = [
 
 [[package]]
 name = "rudb-io"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-json"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-io",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-kernels"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "libm",
  "memchr",
@@ -664,14 +664,14 @@ dependencies = [
 
 [[package]]
 name = "rudb-metrics"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-native"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-opt"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "libm",
  "rudb-bind",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-parquet"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-compress",
@@ -712,14 +712,14 @@ dependencies = [
 
 [[package]]
 name = "rudb-parse"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-pipeline"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-metrics",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-plan"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-seam",
@@ -737,14 +737,14 @@ dependencies = [
 
 [[package]]
 name = "rudb-projection"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-native",
 ]
 
 [[package]]
 name = "rudb-qc"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-catalog",
  "rudb-common",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc-clif"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc-direct"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "iced-x86",
  "rudb-qc-ir",
@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc-gen"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-kernels",
@@ -798,18 +798,18 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc-interp"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-qc-ir",
 ]
 
 [[package]]
 name = "rudb-qc-ir"
-version = "0.8.23"
+version = "0.8.24"
 
 [[package]]
 name = "rudb-qc-pipe"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-plan",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc-plan"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-plan",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc-rt"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "memchr",
  "rudb-common",
@@ -839,21 +839,21 @@ dependencies = [
 
 [[package]]
 name = "rudb-regex"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-seam"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-stats"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-storage"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "libm",
  "rudb-common",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-txn"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
  "rudb-io",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "rudb-vector"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb-common",
 ]
@@ -1106,7 +1106,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "rudb",
  "rudb-common",
