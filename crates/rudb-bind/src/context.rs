@@ -145,7 +145,13 @@ impl Binder<'_> {
             Context::LocalTime => Value::Time(midnight()),
             Context::Database => Value::Varchar(self.catalog().default_catalog().to_string()),
             Context::Schema => Value::Varchar(self.catalog().default_schema().to_string()),
-            Context::User => Value::Varchar(USER.to_string()),
+            // A PostgreSQL session has a user, and the database alone has the user of DuckDB.
+            Context::User => Value::Varchar(
+                self.session
+                    .postgres()
+                    .and_then(|postgres| postgres.settings.get("session_authorization"))
+                    .unwrap_or_else(|| USER.to_string()),
+            ),
         };
         self.plan_mut().add_constant(value)
     }

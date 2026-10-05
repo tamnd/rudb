@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use rudb_bind::{Bound, Described, Parameters, Placeholders, Write};
 use rudb_catalog::{Catalog, DEFAULT_CATALOG, Entry, Key, KeyLog, QualifiedName, View};
+use rudb_common::session::Postgres;
 use rudb_common::stat::Provenance;
 use rudb_common::{
     Cancel, Clustering, Error, Field, LogicalType, Memory, Result, Rule, Session, Value,
@@ -659,6 +660,9 @@ struct Conn {
     /// The statements `PREPARE` named, by the name in lower case, since the pin finds `"S"` under
     /// `s`.
     prepared: Mutex<BTreeMap<String, Arc<Named>>>,
+    /// The PostgreSQL session that speaks through this connection, from
+    /// [`crate::Connection::set_postgres`].
+    postgres: Mutex<Option<Arc<Postgres>>>,
 }
 
 /// A statement `PREPARE` gave a name to, parsed, with its parameters in the order they were
@@ -680,6 +684,7 @@ impl Conn {
             registry,
             blocked: AtomicU64::new(0),
             prepared: Mutex::default(),
+            postgres: Mutex::default(),
         }
     }
 }
@@ -3885,7 +3890,17 @@ impl Shared {
     /// tree that costs about what reading them costs. So it is read once per statement and the
     /// special case is gone. [`crate::settings::Settings::session`] takes two locks for it.
     pub(crate) fn session(&self) -> Session {
-        self.inner.settings.session()
+        let mut session = self.inner.settings.session();
+        let postgres = self.conn.postgres.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if postgres.is_some() {
+            session.set_postgres(postgres);
+        }
+        session
+    }
+
+    /// Records the PostgreSQL session that speaks through this connection.
+    pub(crate) fn set_postgres(&self, postgres: Arc<Postgres>) {
+        *self.conn.postgres.lock().unwrap_or_else(PoisonError::into_inner) = Some(postgres);
     }
 
     /// Runs one query and returns every row it produced.
