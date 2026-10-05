@@ -19,6 +19,7 @@ rudb-catalog = { path = "../crates/rudb-catalog" }
 rudb-common = { path = "../crates/rudb-common" }
 rudb-opt = { path = "../crates/rudb-opt" }
 rudb-parse = { path = "../crates/rudb-parse" }
+rudb-pgwire = { path = "../crates/rudb-pgwire" }
 
 [[bin]]
 name = "tokenize"
@@ -30,6 +31,20 @@ bench = false
 [[bin]]
 name = "bind"
 path = "fuzz_targets/bind.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgwire"
+path = "fuzz_targets/pgwire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgwire_sequence"
+path = "fuzz_targets/pgwire_sequence.rs"
 test = false
 doc = false
 bench = false
