@@ -2943,16 +2943,34 @@ impl<'a> Aggregate<'a> {
                 // has no group yet stops the pass, and it goes on from that row once one is open.
                 codes.places(*length, coded_places);
                 let kept = uncut.map(|kept| kept.indices());
-                let mut row = 0;
-                loop {
-                    row = place_sums.add(coded_map, &coded_places[..*length], kept, row)?;
-                    if row == *length {
-                        break;
+                if place_sums.adds_by_place(coded_map.len(), *length) {
+                    // A map well short of the rows is added up by place, with no slot looked up
+                    // per row, and the groups a place has none for yet are opened afterwards in
+                    // the order their first rows come in, the same order as the pass below.
+                    let combos = coded_map.len();
+                    place_sums.add_places(&mut coded_places[..*length], kept, combos)?;
+                    if place_sums.unseen(coded_map) {
+                        for row in 0..*length {
+                            let place = coded_places[row];
+                            if place < combos && coded_map[place] == crate::table::UNSEEN {
+                                let slot = resolve(row)?;
+                                coded_map.set(place, held_at(slot));
+                            }
+                        }
                     }
-                    let slot = resolve(row)?;
-                    coded_map.set(coded_places[row], held_at(slot));
+                    place_sums.fold_places(coded_map, states, calls)?;
+                } else {
+                    let mut row = 0;
+                    loop {
+                        row = place_sums.add(coded_map, &coded_places[..*length], kept, row)?;
+                        if row == *length {
+                            break;
+                        }
+                        let slot = resolve(row)?;
+                        coded_map.set(coded_places[row], held_at(slot));
+                    }
+                    place_sums.fold(states, calls)?;
                 }
-                place_sums.fold(states, calls)?;
                 placed = true;
             } else if codes.look_up(coded_map, *length, slots) != Some(false) {
                 // One pass that finds every row's slot straight out of the map when the key is one
