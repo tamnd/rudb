@@ -41,9 +41,12 @@
 //! server gets from it only the messages that PostgreSQL acts on. [`verify_utf8`] checks a
 //! string from the client with the error of PostgreSQL.
 //!
+//! [`CommandTag`], the tags of `cmdtaglist.h` at the pin, and [`OutBuf::command_tag`], which
+//! writes `CommandComplete` with the row count where PostgreSQL shows one.
+//!
 //! # What is not here yet
 //!
-//! The command tags, the state of statements and portals in the extended flow, and the cancel
+//! The state of statements and portals in the extended flow, and the cancel
 //! key. They come in the next steps of milestone PG1, in this order.
 //!
 //! # Known differences
@@ -60,10 +63,12 @@
 mod auth;
 mod backend;
 mod base64;
+mod cmdtag;
 mod crypto;
 mod error;
 mod frame;
 mod frontend;
+mod generated;
 mod reader;
 mod session;
 mod startup;
@@ -74,6 +79,7 @@ pub use auth::{
     md5_encrypt, password_failed, password_message, verify_md5, verify_password,
 };
 pub use backend::{Authentication, Backend, Field, Mark, OutBuf, TransactionStatus};
+pub use cmdtag::CommandTag;
 pub use crypto::Crypto;
 pub use error::{Level, PROTOCOL_VIOLATION, ProtocolError};
 pub use frame::{
