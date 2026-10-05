@@ -6,11 +6,13 @@
 //! one buffer, which goes to the socket at `ReadyForQuery`, at `Flush`, at the end of the
 //! connection, and when it is larger than [`FLUSH_AT`], as PostgreSQL does.
 //!
-//! This version has the simple and the extended query flows. The settings of the startup message
-//! other than `application_name` and `client_encoding`, and authentication other than `trust`
-//! come in the next steps of milestone PG1.
+//! This version has the simple and the extended query flows, and the settings of PostgreSQL with
+//! `SET`, `RESET`, `SHOW` and `ParameterStatus`. Authentication other than `trust` comes in the
+//! next steps of milestone PG1.
 
 mod extended;
+mod setting;
+mod zone;
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -18,9 +20,10 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use rudb::{Connection, ErrorCode, QueryResult, Transaction};
+use rudb_common::guc::{self, Action, Origin, Settings};
 use rudb_pgtypes::{
-    ByteaOutput, DateFormat, FixedZone, IntervalStyle, OutputSettings, RowEncoder, TypeInfo,
-    pg_type,
+    ByteaOutput, DateFormat, DateOrder, DateStyle, IntervalStyle, OutputSettings, RowEncoder,
+    TypeInfo, pg_type,
 };
 use rudb_pgwire::{
     CommandTag, Field, Frontend, Handshake, Level, OutBuf, QUERY_CANCELED, Replication, Session,
@@ -28,6 +31,8 @@ use rudb_pgwire::{
 };
 
 use extended::Extended;
+use setting::Command;
+use zone::Zone;
 
 use crate::poll;
 use crate::server::{Refusal, Shared, log};
@@ -150,8 +155,10 @@ struct Start {
     user: String,
     database: String,
     replication: Replication,
-    application_name: String,
-    client_encoding: Option<String>,
+    /// The `options` parameter.
+    options: Option<String>,
+    /// The other parameters, which are settings, in the order of the packet.
+    settings: Vec<(String, String)>,
 }
 
 /// Runs one session to its end.
@@ -217,16 +224,13 @@ fn startup(shared: &Shared, wire: &mut Wire, input: &mut Input) -> io::Result<Op
             }
             Ok(Step::Start(request)) => {
                 let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
-                let setting = |name: &[u8]| {
-                    request.settings.iter().rev().find(|(n, _)| *n == name).map(|(_, v)| text(v))
-                };
                 Start {
                     protocol: request.protocol,
                     user: text(request.user),
                     database: text(request.database),
                     replication: request.replication,
-                    application_name: setting(b"application_name").unwrap_or_default(),
-                    client_encoding: setting(b"client_encoding"),
+                    options: request.options.map(text),
+                    settings: request.settings.iter().map(|(n, v)| (text(n), text(v))).collect(),
                 }
             }
         };
@@ -235,15 +239,108 @@ fn startup(shared: &Shared, wire: &mut Wire, input: &mut Input) -> io::Result<Op
     }
 }
 
-/// The name of a client encoding that the session can serve, as PostgreSQL reports it.
-fn client_encoding(name: &str) -> Option<&'static str> {
-    let key: String =
-        name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect();
-    match key.as_str() {
-        "utf8" | "unicode" => Some("UTF8"),
-        "sqlascii" => Some("SQL_ASCII"),
-        _ => None,
+/// `pg_split_opts` and the switches of `process_postgres_switches` that set a parameter: the
+/// names and values of `-c name=value` and `--name=value` in the `options` of the startup packet.
+/// A backslash takes the next character as it is, also a space.
+fn split_options(options: &str) -> Result<Vec<(String, String)>, String> {
+    let mut words = Vec::new();
+    let mut chars = options.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut word = String::new();
+        while let Some(c) = chars.next_if(|c| !c.is_ascii_whitespace()) {
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            } else {
+                word.push(c);
+            }
+        }
+        words.push(word);
     }
+    let mut settings = Vec::new();
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        let (switch, pair) = if word == "-c" {
+            ("-c", words.next().ok_or_else(|| "option requires an argument -- 'c'".to_owned())?)
+        } else if let Some(pair) = word.strip_prefix("--") {
+            ("--", pair.to_owned())
+        } else if let Some(pair) = word.strip_prefix("-c") {
+            ("-c", pair.to_owned())
+        } else {
+            return Err(format!("invalid command-line argument for server process: {word}"));
+        };
+        let Some((name, value)) = pair.split_once('=') else {
+            return Err(if switch == "--" {
+                format!("--{pair} requires a value")
+            } else {
+                format!("-c {pair} requires a value")
+            });
+        };
+        settings.push((name.replace('-', "_"), value.to_owned()));
+    }
+    Ok(settings)
+}
+
+/// The settings of a new session: the values that the server owns, then the `options` of the
+/// startup packet, then its other parameters, as `process_startup_options` applies them.
+fn session_settings(start: &Start) -> Result<Settings, Refusal> {
+    let mut settings = Settings::new(true);
+    let internal = [
+        ("server_version", SERVER_VERSION),
+        ("server_encoding", "UTF8"),
+        ("client_encoding", "UTF8"),
+        ("is_superuser", "on"),
+        ("session_authorization", &start.user),
+        ("TimeZone", "UTC"),
+        ("log_timezone", "UTC"),
+        ("lc_messages", "C"),
+        ("lc_monetary", "C"),
+        ("lc_numeric", "C"),
+        ("lc_time", "C"),
+        // The values that PostgreSQL works out at startup or that initdb writes.
+        ("max_stack_depth", "2MB"),
+        ("timezone_abbreviations", "Default"),
+        ("default_text_search_config", "pg_catalog.english"),
+        ("huge_pages_status", "off"),
+        ("io_max_concurrency", "64"),
+        ("wal_buffers", "4MB"),
+        ("commit_timestamp_buffers", "256kB"),
+        ("subtransaction_buffers", "256kB"),
+        ("transaction_buffers", "256kB"),
+    ];
+    for (name, value) in internal {
+        settings.set_internal(name, value).map_err(|e| refusal(&e))?;
+    }
+    let options = match &start.options {
+        Some(options) => split_options(options).map_err(|message| ("42601", message))?,
+        None => Vec::new(),
+    };
+    for (name, value) in options.iter().chain(&start.settings) {
+        settings.set(name, Some(value), Action::Set, Origin::Startup).map_err(|e| refusal(&e))?;
+    }
+    Ok(settings)
+}
+
+/// The `FATAL` error for an error of a setting at startup.
+fn refusal(error: &rudb::Error) -> Refusal {
+    let state = error.reported_state();
+    let state = match state.as_str() {
+        "0A000" => "0A000",
+        "22023" => "22023",
+        "42501" => "42501",
+        "42602" => "42602",
+        "42704" => "42704",
+        "55P02" => "55P02",
+        _ => "XX000",
+    };
+    (state, error.message().to_owned())
 }
 
 /// The checks after the startup message, the end of the startup, and the main loop.
@@ -260,18 +357,6 @@ fn serve(
     if start.replication != Replication::Off {
         return wire.fatal(("0A000", "replication connections are not supported".to_owned()));
     }
-    let encoding = match &start.client_encoding {
-        None => "UTF8",
-        Some(name) => match client_encoding(name) {
-            Some(encoding) => encoding,
-            None => {
-                return wire.fatal((
-                    "22023",
-                    format!("invalid value for parameter \"client_encoding\": \"{name}\""),
-                ));
-            }
-        },
-    };
     let key = match shared.admit(pid, start.protocol) {
         Ok(key) => key,
         Err(refusal) => return wire.fatal(refusal),
@@ -281,43 +366,31 @@ fn serve(
         Ok(database) => database,
         Err(refusal) => return wire.fatal(refusal),
     };
+    let mut guc = match session_settings(&start) {
+        Ok(guc) => guc,
+        Err(refusal) => return wire.fatal(refusal),
+    };
     let connection = database.connect();
     shared.attach(pid, connection.clone());
-    // The order of the hash table of PostgreSQL 19, which sends the reported settings in the
-    // order of its buckets.
-    let reported: [(&str, &str); 15] = [
-        ("IntervalStyle", "postgres"),
-        ("search_path", "\"$user\", public"),
-        ("is_superuser", "on"),
-        ("standard_conforming_strings", "on"),
-        ("session_authorization", &start.user),
-        ("client_encoding", encoding),
-        ("server_version", SERVER_VERSION),
-        ("server_encoding", "UTF8"),
-        ("in_hot_standby", "off"),
-        ("integer_datetimes", "on"),
-        ("TimeZone", "UTC"),
-        ("application_name", &start.application_name),
-        ("default_transaction_read_only", "off"),
-        ("scram_iterations", "4096"),
-        ("DateStyle", "ISO, MDY"),
-    ];
-    for (name, value) in reported {
+    for (name, value) in guc.startup_reports() {
         wire.out.parameter_status(name.as_bytes(), value.as_bytes());
     }
     key.write(&mut wire.out);
     let mut session = Session::new();
-    session.set_utf8(encoding == "UTF8");
-    let zone = FixedZone::utc();
-    let settings = OutputSettings {
-        date_format: DateFormat::ISO_MDY,
-        interval_style: IntervalStyle::Postgres,
-        extra_float_digits: 1,
-        bytea_output: ByteaOutput::Hex,
-        time_zone: &zone,
+    let mut runner = Runner {
+        connection,
+        guc,
+        user: start.user.clone(),
+        format: Format::default(),
+        zone: Zone::of("UTC"),
+        zone_name: "UTC".to_owned(),
+        utf8: true,
+        seen: u64::MAX,
+        encoder: RowEncoder::default(),
+        implicit: false,
     };
-    let mut runner =
-        Runner { connection, settings, encoder: RowEncoder::default(), implicit: false };
+    runner.refresh();
+    session.set_utf8(runner.utf8);
     let mut extended = Extended::default();
     loop {
         if session.wants_ready() {
@@ -326,6 +399,11 @@ fn serve(
                 Transaction::Open => TransactionStatus::Block,
                 Transaction::Aborted => TransactionStatus::Failed,
             };
+            runner.refresh();
+            session.set_utf8(runner.utf8);
+            for (name, value) in runner.guc.reports() {
+                wire.out.parameter_status(name.as_bytes(), value.as_bytes());
+            }
             session.ready_for_query(status, &mut wire.out);
             wire.flush()?;
         }
@@ -462,10 +540,51 @@ fn wire_flush(stream: &mut Stream) -> impl FnMut(&mut OutBuf) -> io::Result<()> 
     }
 }
 
+/// The settings of the text output that come from the parameters of the session.
+#[derive(Debug, Clone, Copy)]
+struct Format {
+    date_format: DateFormat,
+    interval_style: IntervalStyle,
+    extra_float_digits: i32,
+    bytea_output: ByteaOutput,
+}
+
+impl Default for Format {
+    fn default() -> Format {
+        Format {
+            date_format: DateFormat::ISO_MDY,
+            interval_style: IntervalStyle::Postgres,
+            extra_float_digits: 1,
+            bytea_output: ByteaOutput::Hex,
+        }
+    }
+}
+
+/// The settings of the text output for the encoder.
+fn output<'a>(format: &Format, zone: &'a Zone) -> OutputSettings<'a> {
+    OutputSettings {
+        date_format: format.date_format,
+        interval_style: format.interval_style,
+        extra_float_digits: format.extra_float_digits,
+        bytea_output: format.bytea_output,
+        time_zone: zone,
+    }
+}
+
 /// What runs the statements of a session.
-struct Runner<'a> {
+struct Runner {
     connection: Connection,
-    settings: OutputSettings<'a>,
+    /// The values of the parameters of PostgreSQL in the session.
+    guc: Settings,
+    /// The session user.
+    user: String,
+    /// What the output takes from `guc`, made again when [`Settings::generation`] changes.
+    format: Format,
+    zone: Zone,
+    zone_name: String,
+    utf8: bool,
+    /// The generation of `guc` that `format` and `zone` come from.
+    seen: u64,
     encoder: RowEncoder,
     /// The server opened the transaction for a `Query` of more than one statement or for the
     /// extended flow, and it ends the transaction at the end of the `Query` or at `Sync`. This is
@@ -546,13 +665,22 @@ struct Failure {
 
 impl Failure {
     fn engine(error: &rudb::Error, offset: usize) -> Failure {
+        let mut sqlstate = error.reported_state().as_str().to_owned();
         let message = if error.code() == ErrorCode::Interrupt && error.message() == "Interrupted!" {
             QUERY_CANCELED.1.to_owned()
+        } else if let Some(name) = error
+            .message()
+            .strip_prefix("Setting with name \"")
+            .and_then(|rest| rest.strip_suffix("\" does not exist"))
+        {
+            // The engine answers `SHOW` of an unknown name in the words of DuckDB.
+            sqlstate = "42704".to_owned();
+            format!("unrecognized configuration parameter \"{name}\"")
         } else {
             error.message().to_owned()
         };
         Failure {
-            sqlstate: error.reported_state().as_str().to_owned(),
+            sqlstate,
             message,
             fields: error.fields().cloned().map(Box::new),
             position: error.span().map(|span| offset + span.start as usize),
@@ -591,7 +719,133 @@ impl Failure {
     }
 }
 
-impl Runner<'_> {
+impl Runner {
+    /// The settings of the text output.
+    fn output(&self) -> OutputSettings<'_> {
+        output(&self.format, &self.zone)
+    }
+
+    /// Makes the output settings again from the parameters if one of them changed.
+    fn refresh(&mut self) {
+        if self.guc.generation() == self.seen {
+            return;
+        }
+        self.seen = self.guc.generation();
+        let text = |name: &str| self.guc.get(name).unwrap_or_default();
+        let datestyle = text("DateStyle");
+        let (style, order) = datestyle.split_once(", ").unwrap_or(("ISO", "MDY"));
+        self.format.date_format = DateFormat {
+            style: match style {
+                "SQL" => DateStyle::Sql,
+                "Postgres" => DateStyle::Postgres,
+                "German" => DateStyle::German,
+                _ => DateStyle::Iso,
+            },
+            order: match order {
+                "DMY" => DateOrder::Dmy,
+                "YMD" => DateOrder::Ymd,
+                _ => DateOrder::Mdy,
+            },
+        };
+        self.format.interval_style = match text("IntervalStyle").as_str() {
+            "postgres_verbose" => IntervalStyle::PostgresVerbose,
+            "sql_standard" => IntervalStyle::SqlStandard,
+            "iso_8601" => IntervalStyle::Iso8601,
+            _ => IntervalStyle::Postgres,
+        };
+        self.format.extra_float_digits = text("extra_float_digits").parse().unwrap_or(1);
+        self.format.bytea_output =
+            if text("bytea_output") == "escape" { ByteaOutput::Escape } else { ByteaOutput::Hex };
+        self.utf8 = text("client_encoding") != "SQL_ASCII";
+        let zone_name = text("TimeZone");
+        if zone_name != self.zone_name {
+            self.zone = Zone::of(&zone_name);
+            self.zone_name = zone_name;
+        }
+    }
+
+    /// The end of a transaction for the settings, when no transaction is open after a statement.
+    fn settle(&mut self, commit: bool) {
+        if self.connection.transaction() == Transaction::Idle && !self.implicit {
+            self.guc.end(commit);
+        }
+    }
+
+    /// Runs a statement on the settings of the session.
+    fn setting(
+        &mut self,
+        command: &Command,
+        state: Transaction,
+        out: &mut OutBuf,
+    ) -> Result<Outcome, Failure> {
+        let failure = |e: rudb::Error| Failure::engine(&e, 0);
+        let tag = match command {
+            Command::Set { name, value, local, reset } => {
+                let text = match value {
+                    Some(args) => Some(guc::flatten(name, args).map_err(failure)?),
+                    None => None,
+                };
+                if *local && state == Transaction::Idle && !self.implicit {
+                    warning(out, "25P01", "SET LOCAL can only be used in transaction blocks");
+                }
+                let action = if *local { Action::Local } else { Action::Set };
+                self.guc.set(name, text.as_deref(), action, Origin::Statement).map_err(failure)?;
+                if *reset { CommandTag::Reset } else { CommandTag::Set }
+            }
+            Command::ResetAll => {
+                self.guc.reset_all();
+                CommandTag::Reset
+            }
+            Command::Authorization { user, reset } => {
+                // rudb has one role for each session, so the session user is the only one that
+                // the session can become.
+                if let Some(user) = user
+                    && *user != self.user
+                {
+                    return Err(Failure {
+                        sqlstate: "42704".to_owned(),
+                        message: format!("role \"{user}\" does not exist"),
+                        fields: None,
+                        position: None,
+                    });
+                }
+                if *reset { CommandTag::Reset } else { CommandTag::Set }
+            }
+            Command::Role(role) => {
+                if role != "none" && *role != self.user {
+                    return Err(Failure {
+                        sqlstate: "42704".to_owned(),
+                        message: format!("role \"{role}\" does not exist"),
+                        fields: None,
+                        position: None,
+                    });
+                }
+                self.guc
+                    .set("role", Some(role), Action::Set, Origin::Statement)
+                    .map_err(failure)?;
+                CommandTag::Set
+            }
+            Command::Show(name) => {
+                let (column, value) = self.guc.show(name).map_err(failure)?;
+                let result = QueryResult::text(vec![column], &[vec![value]]).map_err(failure)?;
+                return Ok(Outcome::Result(result));
+            }
+            Command::ShowAll => {
+                let rows: Vec<Vec<String>> = self
+                    .guc
+                    .show_all()
+                    .map(|(name, value, description)| {
+                        vec![name.to_owned(), value, description.to_owned()]
+                    })
+                    .collect();
+                let names = ["name", "setting", "description"].map(str::to_owned).to_vec();
+                let result = QueryResult::text(names, &rows).map_err(failure)?;
+                return Ok(Outcome::Result(result));
+            }
+        };
+        Ok(Outcome::Done(tag))
+    }
+
     /// Opens the implicit transaction when no transaction is open.
     fn begin_implicit(&mut self) -> Result<(), Failure> {
         if self.connection.transaction() == Transaction::Idle {
@@ -605,7 +859,9 @@ impl Runner<'_> {
     fn end_implicit(&mut self) -> Result<(), Failure> {
         if std::mem::take(&mut self.implicit) && self.connection.transaction() != Transaction::Idle
         {
-            self.connection.execute("COMMIT").map_err(|e| Failure::engine(&e, 0))?;
+            let committed = self.connection.execute("COMMIT");
+            self.settle(committed.is_ok());
+            committed.map_err(|e| Failure::engine(&e, 0))?;
         }
         Ok(())
     }
@@ -617,6 +873,7 @@ impl Runner<'_> {
         {
             let _ = self.connection.execute("ROLLBACK");
         }
+        self.settle(false);
     }
 
     /// Runs one statement with the transaction rules of PostgreSQL. `run` runs it in the engine,
@@ -624,6 +881,25 @@ impl Runner<'_> {
     fn run(
         &mut self,
         control: Option<Control>,
+        command: Option<&Command>,
+        offset: usize,
+        out: &mut OutBuf,
+        run: impl FnOnce(&Connection) -> rudb::Result<QueryResult>,
+    ) -> Result<Outcome, Failure> {
+        let state = self.connection.transaction();
+        let outcome = self.dispatch(control, command, offset, out, run);
+        // A statement that ends the transaction, or a statement outside of a transaction, ends
+        // the transaction of the settings too.
+        let commit =
+            outcome.is_ok() && control != Some(Control::Rollback) && state != Transaction::Aborted;
+        self.settle(commit);
+        outcome
+    }
+
+    fn dispatch(
+        &mut self,
+        control: Option<Control>,
+        command: Option<&Command>,
         offset: usize,
         out: &mut OutBuf,
         run: impl FnOnce(&Connection) -> rudb::Result<QueryResult>,
@@ -655,6 +931,9 @@ impl Runner<'_> {
                 return Ok(Outcome::Done(end.tag()));
             }
             _ => {}
+        }
+        if let Some(command) = command {
+            return self.setting(command, state, out);
         }
         run(&self.connection).map(Outcome::Result).map_err(|e| Failure::engine(&e, offset))
     }
@@ -692,9 +971,11 @@ impl Runner<'_> {
         for statement in statements {
             let before = self.connection.transaction();
             let control = Control::of(statement.sql());
+            let command = setting::parse(statement.sql());
             let started = if implicit { self.begin_implicit() } else { Ok(()) };
             let ran = started.and_then(|()| {
-                self.run(control, statement.offset(), out, |c| c.execute(statement.sql()))
+                let offset = statement.offset();
+                self.run(control, command.as_ref(), offset, out, |c| c.execute(statement.sql()))
             });
             let result = match ran {
                 Ok(Outcome::Result(result)) => result,
@@ -777,8 +1058,9 @@ impl Runner<'_> {
                 Err(error) => return Ok(Err(Failure::engine(&error, 0))),
             };
             let n = chunk.len();
+            let settings = output(&self.format, &self.zone);
             if let Err(error) =
-                self.encoder.encode(chunk.columns(), 0..n, &self.settings, out.bytes_mut())
+                self.encoder.encode(chunk.columns(), 0..n, &settings, out.bytes_mut())
             {
                 return Ok(Err(type_failure(error)));
             }
@@ -861,10 +1143,13 @@ mod tests {
     }
 
     #[test]
-    fn client_encodings_by_any_spelling() {
-        assert_eq!(client_encoding("utf-8"), Some("UTF8"));
-        assert_eq!(client_encoding("Unicode"), Some("UTF8"));
-        assert_eq!(client_encoding("sql_ascii"), Some("SQL_ASCII"));
-        assert_eq!(client_encoding("LATIN1"), None);
+    fn options_of_the_startup_packet() {
+        let pair = |n: &str, v: &str| (n.to_owned(), v.to_owned());
+        assert_eq!(
+            split_options("-c work_mem=64MB --search-path=a\\ b -cjit=off").unwrap(),
+            [pair("work_mem", "64MB"), pair("search_path", "a b"), pair("jit", "off")]
+        );
+        assert_eq!(split_options("-c work_mem").unwrap_err(), "-c work_mem requires a value");
+        assert!(split_options("-x").is_err());
     }
 }

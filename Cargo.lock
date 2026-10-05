@@ -868,6 +868,8 @@ dependencies = [
 name = "rudb-server"
 version = "0.8.27"
 dependencies = [
+ "chrono",
+ "chrono-tz",
  "libc",
  "rudb",
  "rudb-common",

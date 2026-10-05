@@ -22,13 +22,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rudb::{Description, Prepared, QueryResult, Transaction};
 use rudb_common::{Fields, LogicalType, Value};
 use rudb_pgtypes::{
-    DateOrder, DateTimeInput, FixedZone, InputSettings, IntervalStyle, NoZones, Oid, RowEncoder,
-    TypeError, TypeInfo, UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, logical_type, param_value, pg_type,
+    DateTimeInput, InputSettings, NoZones, Oid, RowEncoder, TypeError, TypeInfo,
+    UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, logical_type, param_value, pg_type,
 };
 use rudb_pgwire::{
     Bind, CommandTag, Field, Level, OutBuf, Portals, ProtocolError, Statements, Target,
 };
 
+use super::setting::{self, Command};
 use super::{Control, FLUSH_AT, Failure, Outcome, Runner, command_tag, leading_words};
 
 /// The type that PostgreSQL reports for a parameter of no known type.
@@ -93,7 +94,9 @@ pub(super) struct Statement {
     sql: Arc<str>,
     /// The transaction control that the server runs itself, from [`Control::of`].
     control: Option<Control>,
-    /// `None` for an empty query.
+    /// The statement on the settings that the server runs itself, from [`setting::parse`].
+    command: Option<Command>,
+    /// `None` for an empty query and for a statement on the settings.
     prepared: Option<Prepared>,
     /// The declared type of each parameter, with 0 for no type.
     types: Vec<Oid>,
@@ -196,7 +199,7 @@ impl Extended {
 
     pub(super) fn parse(
         &mut self,
-        runner: &Runner<'_>,
+        runner: &Runner,
         name: &[u8],
         sql: &[u8],
         types: impl Iterator<Item = Oid>,
@@ -207,8 +210,10 @@ impl Extended {
             .map_err(|_| error("22021", "invalid byte sequence for encoding \"UTF8\"".to_owned()))?
             .into();
         let engine = |e: rudb::Error| Problem::failure(Failure::engine(&e, 0), &sql);
+        let command = setting::parse(&sql);
         let prepared = match rudb::statements(&sql).map_err(engine)?.len() {
             0 => None,
+            1 if command.is_some() => None,
             1 => Some(runner.connection.prepare(&sql).map_err(engine)?),
             _ => {
                 return Err(error(
@@ -217,7 +222,7 @@ impl Extended {
                 ));
             }
         };
-        if prepared.is_some()
+        if (prepared.is_some() || command.is_some())
             && runner.connection.transaction() == Transaction::Aborted
             && !exits_transaction(&sql)
         {
@@ -238,7 +243,7 @@ impl Extended {
                 *s < count && !slots[..i].contains(s)
             });
         let control = Control::of(&sql);
-        let statement = Statement { sql, control, prepared, types, slots, positional };
+        let statement = Statement { sql, control, command, prepared, types, slots, positional };
         self.statements.insert(name, Arc::new(statement))?;
         out.parse_complete();
         Ok(())
@@ -246,7 +251,7 @@ impl Extended {
 
     pub(super) fn bind(
         &mut self,
-        runner: &Runner<'_>,
+        runner: &Runner,
         bind: &Bind<'_>,
         out: &mut OutBuf,
     ) -> Result<(), Problem> {
@@ -258,19 +263,18 @@ impl Extended {
             return Err(aborted());
         }
         self.portals.make_room(bind.portal)?;
-        let zone = FixedZone::utc();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| i64::try_from(since.as_micros()).unwrap_or(0));
         let settings = InputSettings {
             datetime: DateTimeInput {
-                order: DateOrder::Mdy,
-                zone: &zone,
+                order: runner.format.date_format.order,
+                zone: &runner.zone,
                 zones: &NoZones,
                 abbrevs: ZoneAbbrevs::postgres_default(),
                 now: now + UNIX_TO_POSTGRES_USECS,
             },
-            interval_style: IntervalStyle::Postgres,
+            interval_style: runner.format.interval_style,
         };
         let formats = params.formats;
         let mut found: Option<Vec<Oid>> = None;
@@ -327,7 +331,7 @@ impl Extended {
 
     pub(super) fn describe(
         &mut self,
-        runner: &mut Runner<'_>,
+        runner: &mut Runner,
         target: Target,
         name: &[u8],
         rest: &[u8],
@@ -336,6 +340,11 @@ impl Extended {
         match target {
             Target::Statement => {
                 let statement = self.statements.get(name)?;
+                if let Some(command) = &statement.command {
+                    out.parameter_description(&[]);
+                    describe_command(runner, command, out);
+                    return Ok(());
+                }
                 let description = statement.describe()?;
                 out.parameter_description(&statement.parameter_types(description.as_ref()));
                 match description.and_then(|d| d.fields) {
@@ -381,7 +390,7 @@ impl Extended {
 
     pub(super) fn execute(
         &mut self,
-        runner: &mut Runner<'_>,
+        runner: &mut Runner,
         name: &[u8],
         max_rows: i32,
         rest: &[u8],
@@ -447,7 +456,7 @@ impl Extended {
             let n = chunk.len();
             let take = (n - ran.row).min(usize::try_from(limit - sent).unwrap_or(usize::MAX));
             let rows = ran.row..ran.row + take;
-            if let Err(e) = encoder.encode(chunk.columns(), rows, &runner.settings, out.bytes_mut())
+            if let Err(e) = encoder.encode(chunk.columns(), rows, &runner.output(), out.bytes_mut())
             {
                 return Ok(Err(Problem::failure(type_failure(e, None), &sql)));
             }
@@ -486,13 +495,13 @@ impl Portal {
     /// its own transaction, which gives the same result for less work.
     fn run(
         &mut self,
-        runner: &mut Runner<'_>,
+        runner: &mut Runner,
         alone: bool,
         out: &mut OutBuf,
     ) -> Result<Option<&mut Ran>, Problem> {
-        let Some(prepared) = &self.statement.prepared else {
+        if self.statement.prepared.is_none() && self.statement.command.is_none() {
             return Ok(None);
-        };
+        }
         if self.ran.is_none() {
             let statement = &self.statement;
             let sql = &statement.sql;
@@ -503,8 +512,12 @@ impl Portal {
             }
             let before = runner.connection.transaction();
             let values = &self.values;
+            let command = statement.command.as_ref();
             let outcome = runner
-                .run(statement.control, 0, out, |_| statement.execute(prepared, values))
+                .run(statement.control, command, 0, out, |_| match &statement.prepared {
+                    Some(prepared) => statement.execute(prepared, values),
+                    None => unreachable!("a statement without a plan is a command"),
+                })
                 .map_err(problem)?;
             let ran = match outcome {
                 Outcome::Result(result) => {
@@ -581,6 +594,23 @@ fn check_formats(formats: &[i16], columns: usize) -> Result<(), Problem> {
 fn exits_transaction(sql: &str) -> bool {
     let words = leading_words(sql);
     matches!(words.first().map(String::as_str), Some("COMMIT" | "END" | "ROLLBACK" | "ABORT"))
+}
+
+/// Writes the description of a statement on the settings: the column of `SHOW`, the three columns
+/// of `SHOW ALL`, or `NoData`.
+fn describe_command(runner: &Runner, command: &Command, out: &mut OutBuf) {
+    let text = LogicalType::Varchar;
+    match command {
+        Command::Show(name) => {
+            let column = runner.guc.show(name).map_or_else(|_| name.clone(), |(column, _)| column);
+            row_description(&[(column.as_str(), &text, 0)], out);
+        }
+        Command::ShowAll => {
+            let columns = ["name", "setting", "description"].map(|name| (name, &text, 0));
+            row_description(&columns, out);
+        }
+        _ => out.no_data(),
+    }
 }
 
 /// Writes a `RowDescription` for columns of a name, a type and a format.
