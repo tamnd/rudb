@@ -69,12 +69,13 @@ impl ProtocolError {
         self
     }
 
-    /// The error for the next read after [`split`](crate::split) gave a [`Level::Error`] for a
-    /// type byte in [`Mode::CopyIn`](crate::Mode::CopyIn).
+    /// The error that follows a [`Level::Error`] from [`split`](crate::split) for a type byte in
+    /// [`Mode::CopyIn`](crate::Mode::CopyIn).
     ///
     /// PostgreSQL reads the type byte, rejects it and recovers from the error without the rest
-    /// of the frame. It then sends `ReadyForQuery`, and the next read finds that the last message
-    /// was never finished. The server must give this error at that point.
+    /// of the message. The error handler then finds that a message was not read to its end, and
+    /// it sends this error before `ReadyForQuery`. [`Session::recover`](crate::Session::recover)
+    /// gives it.
     pub fn lost_sync() -> ProtocolError {
         ProtocolError::fatal("terminating connection because protocol synchronization was lost")
     }

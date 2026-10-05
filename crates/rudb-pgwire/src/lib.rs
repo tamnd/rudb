@@ -36,10 +36,15 @@
 //! SCRAM-SHA-256-PLUS. The hash functions come from the server through the [`Crypto`] trait, so
 //! this crate has no hash code of its own and no dependencies.
 //!
+//! [`Session`], the state of the main loop of a session: when the server sends `ReadyForQuery`,
+//! which messages it drops until `Sync` after an error, and which messages it ignores. The
+//! server gets from it only the messages that PostgreSQL acts on. [`verify_utf8`] checks a
+//! string from the client with the error of PostgreSQL.
+//!
 //! # What is not here yet
 //!
-//! The simple and extended flows with the skip to `Sync` after an error, and the cancel key.
-//! They come in the next steps of milestone PG1, in this order.
+//! The command tags, the state of statements and portals in the extended flow, and the cancel
+//! key. They come in the next steps of milestone PG1, in this order.
 //!
 //! # Known differences
 //!
@@ -60,6 +65,7 @@ mod error;
 mod frame;
 mod frontend;
 mod reader;
+mod session;
 mod startup;
 
 pub use auth::{
@@ -80,4 +86,6 @@ pub use frontend::{
     Bind, BindBody, Formats, Frontend, FunctionCall, FunctionCallBody, Oids, Target, ValueIter,
     Values, encode_oids,
 };
+pub use reader::verify_utf8;
+pub use session::{Read, Session};
 pub use startup::{Encryption, Handshake, NAME_LIMIT, Replication, StartupRequest, Step};
