@@ -9,6 +9,7 @@
 
 use rudb_common::{LogicalType, SqlState, Value, uuid};
 
+use crate::array::{Array, array_in, array_recv};
 use crate::binary::Recv;
 use crate::datetime::{
     DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateTimeInput, Interval, IntervalStyle,
@@ -54,7 +55,32 @@ pub fn logical_type(oid: Oid) -> Option<LogicalType> {
         oids::TIMESTAMPTZ => LogicalType::TimestampTz,
         oids::INTERVAL => LogicalType::Interval,
         oids::JSON => LogicalType::Json,
-        _ => return None,
+        oid => {
+            let (element, _) = element(oid)?;
+            LogicalType::List(Box::new(logical_type(element)?))
+        }
+    })
+}
+
+/// The element type and the delimiter of an array type whose elements are not arrays.
+fn element(oid: Oid) -> Option<(Oid, u8)> {
+    let info = TypeInfo::get(oid).filter(|info| info.is_array())?;
+    let element = TypeInfo::get(info.elem).filter(|element| !element.is_array())?;
+    Some((element.oid, element.delim))
+}
+
+/// An array as a rudb list. A list has one dimension and no bounds, so an array with more than one
+/// dimension is an error until rudb has them, and the lower bound is not kept.
+fn list<T>(element: Oid, array: Array<T>, value: impl Fn(T) -> Value) -> Result<Value, TypeError> {
+    if array.dims.len() > 1 {
+        return Err(TypeError::new(
+            SqlState::FEATURE_NOT_SUPPORTED,
+            "arrays of more than one dimension are not supported".to_owned(),
+        ));
+    }
+    Ok(Value::List {
+        element: logical_type(element).unwrap_or(LogicalType::Varchar),
+        values: array.values.into_iter().map(|v| v.map_or(Value::Null, &value)).collect(),
     })
 }
 
@@ -100,6 +126,10 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
         oids::TIMESTAMP => Value::Timestamp(timestamp(timestamp_in(text, -1, cx)?)),
         oids::TIMESTAMPTZ => Value::TimestampTz(timestamp(timestamptz_in(text, -1, cx)?)),
         oids::INTERVAL => interval(interval_in(text, -1, settings.interval_style)?),
+        oid if let Some((element, delim)) = element(oid) => {
+            let array = array_in(text, delim, true, |text| text_value(element, text, settings))?;
+            list(element, array, |value| value)?
+        }
         _ => Value::Varchar(text.to_owned()),
     })
 }
@@ -133,6 +163,10 @@ fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
         oids::TIMESTAMP => Value::Timestamp(timestamp(timestamp_recv(recv, -1)?)),
         oids::TIMESTAMPTZ => Value::TimestampTz(timestamp(timestamp_recv(recv, -1)?)),
         oids::INTERVAL => interval(interval_recv(recv, -1)?),
+        oid if let Some((element, _)) = element(oid) => {
+            let array = array_recv(recv, element, |recv| binary_value(element, recv))?;
+            list(element, array, |value| value)?
+        }
         _ => {
             let name = TypeInfo::get(oid).map_or_else(|| oid.to_string(), |info| info.name.into());
             return Err(TypeError::new(
@@ -222,6 +256,19 @@ mod tests {
             matches!(read(oids::NUMERIC, false, b"NaN").unwrap(), Value::Double(v) if v.is_nan())
         );
         assert_eq!(read(0, false, b"abc").unwrap(), Value::Varchar("abc".into()));
+        assert_eq!(
+            read(oids::TEXT_ARRAY, false, br#"{a,"b c",NULL}"#).unwrap(),
+            Value::List {
+                element: LogicalType::Varchar,
+                values: vec![Value::Varchar("a".into()), Value::Varchar("b c".into()), Value::Null],
+            }
+        );
+        assert_eq!(
+            logical_type(oids::INT8_ARRAY),
+            Some(LogicalType::List(Box::new(LogicalType::BigInt)))
+        );
+        let error = read(oids::INT4_ARRAY, false, b"{{1},{2}}").unwrap_err();
+        assert_eq!(error.sqlstate, SqlState::FEATURE_NOT_SUPPORTED);
         let error = read(oids::INT4, false, b"4x").unwrap_err();
         assert_eq!(error.sqlstate, SqlState::INVALID_TEXT_REPRESENTATION);
         assert_eq!(error.message, "invalid input syntax for type integer: \"4x\"");
@@ -237,6 +284,15 @@ mod tests {
         let error = read(oids::INT4, true, &7i64.to_be_bytes()).unwrap_err();
         assert_eq!(error.sqlstate, SqlState::INVALID_BINARY_REPRESENTATION);
         assert_eq!(error.message, "incorrect binary data format in bind parameter 1");
+        let mut array = Vec::new();
+        for word in [1, 0, 23, 2, 1, 4, 7, -1] {
+            array.extend_from_slice(&i32::to_be_bytes(word));
+        }
+        let list = Value::List {
+            element: LogicalType::Integer,
+            values: vec![Value::Integer(7), Value::Null],
+        };
+        assert_eq!(read(oids::INT4_ARRAY, true, &array).unwrap(), list);
         let error = read(oids::POINT, true, &[0; 16]).unwrap_err();
         assert_eq!(error.message, "no binary input function available for type point");
     }
