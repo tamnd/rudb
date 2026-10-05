@@ -216,14 +216,15 @@ unsafe fn group_codes(
     mask: std::arch::x86_64::__m256i,
 ) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::{
-        _mm_loadu_si128, _mm256_and_si256, _mm256_set_m128i, _mm256_shuffle_epi8,
-        _mm256_srlv_epi32,
+        _mm_loadu_si128, _mm256_and_si256, _mm256_set_m128i, _mm256_shuffle_epi8, _mm256_srlv_epi32,
     };
     // SAFETY: the caller has the sixteen bytes at `first` and at `first + half` to read, and
     // `loadu` has no alignment requirement.
     unsafe {
-        let lanes =
-            _mm256_set_m128i(_mm_loadu_si128(first.add(half).cast()), _mm_loadu_si128(first.cast()));
+        let lanes = _mm256_set_m128i(
+            _mm_loadu_si128(first.add(half).cast()),
+            _mm_loadu_si128(first.cast()),
+        );
         _mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(lanes, shuffle), shifts), mask)
     }
 }
@@ -277,7 +278,8 @@ pub(crate) fn against_words<const SWAP: bool, const EQUAL: bool, const NOT: bool
             if !fresh && *word == 0 {
                 continue;
             }
-            let (at, to) = (left.as_ptr().add(8 * block * one), right.as_ptr().add(8 * block * other));
+            let (at, to) =
+                (left.as_ptr().add(8 * block * one), right.as_ptr().add(8 * block * other));
             let mut found = 0_u64;
             for group in 0..8 {
                 let a = group_codes(
@@ -392,7 +394,8 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     fn packed_blocks(width: usize, blocks: usize, seed: usize) -> (Vec<u8>, Vec<i64>) {
         let top = (1_usize << width) - 1;
-        let codes: Vec<usize> = (0..64 * blocks).map(|i| (i * 2_654_435_761 + seed) % 97 % (top + 1)).collect();
+        let codes: Vec<usize> =
+            (0..64 * blocks).map(|i| (i * 2_654_435_761 + seed) % 97 % (top + 1)).collect();
         let mut bytes = vec![0_u8; (blocks - 1) * 8 * width + readable(width)];
         for (i, &code) in codes.iter().enumerate() {
             for b in 0..width {
@@ -429,7 +432,10 @@ mod tests {
                     f((&left, one), (&right, other), shift, &mut narrowed, false);
                     (words, narrowed)
                 };
-                let cases: [(fn((&[u8], usize), (&[u8], usize), i32, &mut [u64], bool), fn(i64, i64) -> bool); 6] = [
+                let cases: [(
+                    fn((&[u8], usize), (&[u8], usize), i32, &mut [u64], bool),
+                    fn(i64, i64) -> bool,
+                ); 6] = [
                     (against_words::<true, false, false>, |x, y| x < y),
                     (against_words::<false, false, false>, |x, y| x > y),
                     (against_words::<false, false, true>, |x, y| x <= y),

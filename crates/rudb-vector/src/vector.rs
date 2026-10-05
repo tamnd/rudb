@@ -4709,22 +4709,34 @@ impl Packed<'_> {
                 let (left, right, words) = ((left, one), (right, two), &mut words[..done]);
                 match test {
                     Against::Less => {
-                        crate::lanes::against_words::<true, false, false>(left, right, shift, words, fresh);
+                        crate::lanes::against_words::<true, false, false>(
+                            left, right, shift, words, fresh,
+                        );
                     }
                     Against::Greater => {
-                        crate::lanes::against_words::<false, false, false>(left, right, shift, words, fresh);
+                        crate::lanes::against_words::<false, false, false>(
+                            left, right, shift, words, fresh,
+                        );
                     }
                     Against::LessOrEqual => {
-                        crate::lanes::against_words::<false, false, true>(left, right, shift, words, fresh);
+                        crate::lanes::against_words::<false, false, true>(
+                            left, right, shift, words, fresh,
+                        );
                     }
                     Against::GreaterOrEqual => {
-                        crate::lanes::against_words::<true, false, true>(left, right, shift, words, fresh);
+                        crate::lanes::against_words::<true, false, true>(
+                            left, right, shift, words, fresh,
+                        );
                     }
                     Against::Equal => {
-                        crate::lanes::against_words::<false, true, false>(left, right, shift, words, fresh);
+                        crate::lanes::against_words::<false, true, false>(
+                            left, right, shift, words, fresh,
+                        );
                     }
                     Against::NotEqual => {
-                        crate::lanes::against_words::<false, true, true>(left, right, shift, words, fresh);
+                        crate::lanes::against_words::<false, true, true>(
+                            left, right, shift, words, fresh,
+                        );
                     }
                 }
             }
