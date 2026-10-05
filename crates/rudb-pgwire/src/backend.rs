@@ -9,7 +9,7 @@
 //! it to read back what `OutBuf` wrote, and a client in `rudb-postgres` or a fuzz target can use
 //! it to read a server.
 
-use crate::error::ProtocolError;
+use crate::error::{Level, ProtocolError};
 use crate::reader::Reader;
 
 /// The transaction status in `ReadyForQuery`.
@@ -305,6 +305,43 @@ impl OutBuf {
     /// value.
     pub fn error_response(&mut self, fields: &[(u8, &[u8])]) {
         self.notice_fields(b'E', fields);
+    }
+
+    /// The answer to a [`ProtocolError`], in the format of `protocol`, the version of the session.
+    /// A [`Level::Log`] error writes nothing.
+    ///
+    /// The format is the one of `send_message_to_frontend` in PostgreSQL. A session of major
+    /// version 3, and a connection that has not sent a version yet, get an `ErrorResponse`. A
+    /// client that asked for an older major version gets the old format: the type byte, the text
+    /// with a zero byte at the end, and no length. That client only ever sees the error that
+    /// rejects its version.
+    pub fn protocol_error(&mut self, error: &ProtocolError, protocol: u32) {
+        let severity: &[u8] = match error.level {
+            Level::Error => b"ERROR",
+            Level::Fatal => b"FATAL",
+            Level::Log => return,
+        };
+        if protocol >> 16 < 3 && protocol != 0 {
+            self.bytes.push(b'E');
+            self.bytes.extend_from_slice(severity);
+            self.bytes.extend_from_slice(b":  ");
+            self.bytes.extend_from_slice(error.message.as_bytes());
+            self.bytes.extend_from_slice(b"\n\0");
+            return;
+        }
+        let mut fields = vec![
+            (b'S', severity),
+            (b'V', severity),
+            (b'C', error.sqlstate.as_bytes()),
+            (b'M', error.message.as_bytes()),
+        ];
+        if let Some(detail) = error.detail {
+            fields.push((b'D', detail.as_bytes()));
+        }
+        if let Some(hint) = error.hint {
+            fields.push((b'H', hint.as_bytes()));
+        }
+        self.error_response(&fields);
     }
 
     /// `NoticeResponse`, with the fields of [`OutBuf::error_response`].

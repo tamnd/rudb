@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-/// SQLSTATE `08P01`, `protocol_violation`. Every error of this crate has it.
+/// SQLSTATE `08P01`, `protocol_violation`. Most errors of this crate have it. The checks of the
+/// startup packet use three more codes, as PostgreSQL does.
 pub const PROTOCOL_VIOLATION: &str = "08P01";
 
 /// What the server does after a [`ProtocolError`].
@@ -31,19 +32,41 @@ pub struct ProtocolError {
     pub level: Level,
     pub sqlstate: &'static str,
     pub message: String,
+    /// The `D` field of the error, if PostgreSQL sends one for the same bytes.
+    pub detail: Option<&'static str>,
+    /// The `H` field of the error, if PostgreSQL sends one for the same bytes.
+    pub hint: Option<&'static str>,
 }
 
 impl ProtocolError {
+    pub(crate) fn new(
+        level: Level,
+        sqlstate: &'static str,
+        message: impl Into<String>,
+    ) -> ProtocolError {
+        ProtocolError { level, sqlstate, message: message.into(), detail: None, hint: None }
+    }
+
     pub(crate) fn error(message: impl Into<String>) -> ProtocolError {
-        ProtocolError { level: Level::Error, sqlstate: PROTOCOL_VIOLATION, message: message.into() }
+        ProtocolError::new(Level::Error, PROTOCOL_VIOLATION, message)
     }
 
     pub(crate) fn fatal(message: impl Into<String>) -> ProtocolError {
-        ProtocolError { level: Level::Fatal, sqlstate: PROTOCOL_VIOLATION, message: message.into() }
+        ProtocolError::new(Level::Fatal, PROTOCOL_VIOLATION, message)
     }
 
     pub(crate) fn log(message: impl Into<String>) -> ProtocolError {
-        ProtocolError { level: Level::Log, sqlstate: PROTOCOL_VIOLATION, message: message.into() }
+        ProtocolError::new(Level::Log, PROTOCOL_VIOLATION, message)
+    }
+
+    pub(crate) fn with_detail(mut self, detail: &'static str) -> ProtocolError {
+        self.detail = Some(detail);
+        self
+    }
+
+    pub(crate) fn with_hint(mut self, hint: &'static str) -> ProtocolError {
+        self.hint = Some(hint);
+        self
     }
 
     /// The error for the next read after [`split`](crate::split) gave a [`Level::Error`] for a
