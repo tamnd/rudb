@@ -13,7 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,14 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// The stack of a session thread, the same as the main thread of a process on Linux, because a
 /// deep expression recurses in the parser and the binder.
 const SESSION_STACK: usize = 8 << 20;
+
+/// How many session threads can wait for a new connection after their session ends. A new
+/// connection takes a waiting thread before the server starts a new one, because to start and
+/// end a thread costs more than the rest of a short session.
+const WAITING_THREADS: usize = 32;
+
+/// How long a session thread waits for a new connection before it ends.
+const THREAD_WAIT: Duration = Duration::from_secs(30);
 
 /// Writes one message to the log, which is the standard error, in the format of PostgreSQL. The
 /// message can hold `DETAIL`, `HINT` and `CONTEXT` lines, and each other line after the first
@@ -111,14 +119,18 @@ pub(crate) struct Sessions {
 }
 
 /// The values of the configuration files and of the command line that a session starts with.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Defaults {
     /// The items of the files that the server took, in the order of the files.
     pub(crate) file: Vec<(String, String)>,
-    /// The parameters of the command line.
-    pub(crate) args: Vec<(String, String)>,
-    /// `data_directory`, `config_file`, `hba_file` and `ident_file`.
-    pub(crate) paths: Vec<(&'static str, String)>,
+    /// The values that the server owns, the values of the files, the parameters of the command
+    /// line, and `data_directory`, `config_file`, `hba_file` and `ident_file`, as one set of
+    /// values. Each session starts from a copy of it, so a new session does not read the files
+    /// and the parameters again.
+    pub(crate) base: guc::Settings,
+    /// True when the files or the command line give `ssl`. Then the session keeps that value and
+    /// does not show whether its own connection uses TLS.
+    pub(crate) ssl_given: bool,
 }
 
 /// The state that the acceptor and all sessions share.
@@ -148,6 +160,9 @@ pub(crate) struct Shared {
     ddl: Mutex<()>,
     sessions: Mutex<Sessions>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// The session threads that wait for a new connection, each with a number and the sender of
+    /// its connection. The newest one is last.
+    waiting: Mutex<Waiting>,
     /// The shutdown in progress, as a [`Shutdown`] number, or 0 when the server runs.
     shutdown: AtomicU8,
 }
@@ -646,22 +661,22 @@ fn configure(base: &Config, state: &conf::State) -> Result<Config, String> {
 /// The values that a session starts with.
 fn defaults(config: &Config, state: &conf::State) -> Defaults {
     let (hba, ident) = auth_paths(config);
-    let args = config
+    let args: Vec<(String, String)> = config
         .args
         .iter()
         .filter(|(name, _)| guc::find(name).is_some() || name.contains('.'))
         .cloned()
         .collect();
-    Defaults {
-        file: state.applied().to_vec(),
-        args,
-        paths: vec![
-            ("data_directory", state.data().to_owned()),
-            ("config_file", state.config_file().to_owned()),
-            ("hba_file", hba),
-            ("ident_file", ident),
-        ],
-    }
+    let file = state.applied().to_vec();
+    let paths = vec![
+        ("data_directory", state.data().to_owned()),
+        ("config_file", state.config_file().to_owned()),
+        ("hba_file", hba),
+        ("ident_file", ident),
+    ];
+    let base = session::base_settings(&file, &args, &paths);
+    let ssl_given = file.iter().chain(&args).any(|(name, _)| name.eq_ignore_ascii_case("ssl"));
+    Defaults { file, base, ssl_given }
 }
 
 /// The paths of `pg_hba.conf` and `pg_ident.conf`, absolute, as PostgreSQL logs them.
@@ -1011,6 +1026,7 @@ impl Server {
                 held: HashSet::new(),
             }),
             threads: Mutex::new(Vec::new()),
+            waiting: Mutex::new(Waiting::default()),
             shutdown: AtomicU8::new(0),
         });
         let acceptor = {
@@ -1194,6 +1210,9 @@ impl Server {
                 stream.shutdown();
             }
         }
+        // A thread that waits for a connection ends when its sender goes. A thread that ends its
+        // session after this does not wait, because the shutdown is in progress.
+        lock(&self.shared.waiting).threads.clear();
         let threads = std::mem::take(&mut *lock(&self.shared.threads));
         for thread in threads {
             let _ = thread.join();
@@ -1267,17 +1286,72 @@ fn accept(shared: &Arc<Shared>, listeners: &[Listener], stop: &UnixStream) {
     }
 }
 
-/// Starts the thread of one session.
+/// The session threads that wait for a new connection.
+#[derive(Debug, Default)]
+struct Waiting {
+    next: u64,
+    threads: Vec<(u64, mpsc::SyncSender<Stream>)>,
+}
+
+/// Gives a connection to a thread that waits for one, or starts a thread for it.
 fn spawn(shared: &Arc<Shared>, stream: Stream) {
+    let mut stream = stream;
+    loop {
+        let Some((_, waiting)) = lock(&shared.waiting).threads.pop() else { break };
+        match waiting.send(stream) {
+            Ok(()) => return,
+            // The thread ended at the same time.
+            Err(mpsc::SendError(back)) => stream = back,
+        }
+    }
     let mut threads = lock(&shared.threads);
     threads.retain(|thread| !thread.is_finished());
     let session = shared.clone();
     let started = std::thread::Builder::new()
         .name("rudb-session".to_owned())
         .stack_size(SESSION_STACK)
-        .spawn(move || session::run(&session, stream));
+        .spawn(move || serve(&session, stream));
     match started {
         Ok(thread) => threads.push(thread),
         Err(e) => log("LOG", &format!("could not start a session thread: {e}")),
+    }
+}
+
+/// The body of a session thread: runs one session, then waits for the next connection, until
+/// no connection comes in `THREAD_WAIT`, enough threads already wait, or the server stops.
+fn serve(shared: &Arc<Shared>, stream: Stream) {
+    let mut stream = stream;
+    loop {
+        session::run(shared, stream);
+        let (give, take) = mpsc::sync_channel(1);
+        let number = {
+            let mut waiting = lock(&shared.waiting);
+            // Under the lock, so that a shutdown that empties the list sees this thread in it or
+            // this thread sees the shutdown.
+            if shared.refusing() || waiting.threads.len() >= WAITING_THREADS {
+                return;
+            }
+            waiting.next += 1;
+            let number = waiting.next;
+            waiting.threads.push((number, give));
+            number
+        };
+        stream = match take.recv_timeout(THREAD_WAIT) {
+            Ok(stream) => stream,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let mut waiting = lock(&shared.waiting);
+                if let Some(at) = waiting.threads.iter().position(|(held, _)| *held == number) {
+                    waiting.threads.remove(at);
+                    return;
+                }
+                drop(waiting);
+                // The acceptor took this thread from the list, so its connection comes now.
+                match take.recv() {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                }
+            }
+        };
     }
 }
