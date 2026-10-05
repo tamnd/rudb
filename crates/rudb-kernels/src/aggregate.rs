@@ -2938,9 +2938,14 @@ impl PlaceSums {
         states: &mut [Accumulator],
         stride: usize,
     ) -> Result<()> {
-        let alike = self.owed_feeds.len() == stride
-            && self.calls.iter().all(|&(offset, feed, _)| self.owed_feeds[offset].is_none_or(|owed| owed == feed))
-            && self.counting.iter().all(|&offset| self.owed_feeds[offset].is_none_or(|owed| owed == Feed::Counted));
+        let alike =
+            self.owed_feeds.len() == stride
+                && self.calls.iter().all(|&(offset, feed, _)| {
+                    self.owed_feeds[offset].is_none_or(|owed| owed == feed)
+                })
+                && self.counting.iter().all(|&offset| {
+                    self.owed_feeds[offset].is_none_or(|owed| owed == Feed::Counted)
+                });
         if !alike {
             self.settle(states)?;
             self.owed_feeds.clear();
