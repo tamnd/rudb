@@ -2002,8 +2002,9 @@ mod tests {
         let distinct = urls(300);
         let values: Vec<Vec<u8>> =
             (0..8192).map(|index| distinct[index * 7 % distinct.len()].clone()).collect();
-        let bytes = round_trip(&values);
-        assert_eq!(kind_of(&bytes), Kind::Dict);
+        let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        let bytes = encode_only(Kind::Dict, &refs).unwrap().expect("a dictionary is offered");
+        assert_eq!(decode(&bytes).unwrap(), values, "the chunk decodes the usual way too");
         let (dictionary, codes) = decode_coded(&bytes).unwrap().expect("a dictionary");
         assert_eq!(dictionary.len(), distinct.len(), "one value per distinct string");
         let looked_up: Vec<Vec<u8>> =
