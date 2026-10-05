@@ -1414,6 +1414,28 @@ impl<'a> Transform<'a> {
                 let entry = self.first(self.find(option, "AlterColumnEntry"));
                 self.alter_column(at, entry)?
             }
+            // A dotted name is a field of a struct column, which cannot be changed on its own. The
+            // pin binary makes the change to the whole column instead, which is tamnd/duckdb#36,
+            // and the test file it ships refuses it in these words, which is what is followed here.
+            "AlterColumn" => {
+                let entry = self.first(self.find(option, "AlterColumnEntry"));
+                let refused = match self.name(entry) {
+                    "AddOrDropDefault" if self.name(self.first(entry)) == "AddDefault" => {
+                        "Setting a default value on a nested field is not yet supported"
+                    }
+                    "ChangeNullability" => {
+                        let which = self.first(self.find(entry, "DropOrSet"));
+                        if self.name(which) == "SetNullability" {
+                            "Setting a NOT NULL constraint on a nested field is not yet supported"
+                        } else {
+                            "Dropping a NOT NULL constraint on a nested field is not yet supported"
+                        }
+                    }
+                    "AlterType" => "Changing the type of a nested field is not yet supported",
+                    _ => return self.unsupported(option),
+                };
+                return Err(Error::not_implemented(refused));
+            }
             "DropConstraint" => {
                 return Err(Error::not_implemented("No support for that ALTER TABLE option yet!"));
             }
