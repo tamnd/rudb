@@ -145,9 +145,9 @@ pub(crate) fn within_words(
                     mask,
                 );
                 let offset = _mm256_sub_epi32(codes, low);
-                let kept = _mm256_cmpeq_epi32(_mm256_min_epu32(offset, span), offset);
+                let inside = _mm256_cmpeq_epi32(_mm256_min_epu32(offset, span), offset);
                 #[expect(clippy::cast_sign_loss, reason = "eight bits of a movemask")]
-                let bits = _mm256_movemask_ps(_mm256_castsi256_ps(kept)) as u64;
+                let bits = _mm256_movemask_ps(_mm256_castsi256_ps(inside)) as u64;
                 found |= bits << (group * 8);
             }
             *word = if fresh { found } else { *word & found };
@@ -275,7 +275,8 @@ mod tests {
             assert_eq!(words, each, "width {width}");
             assert_eq!(kept, each.iter().map(|word| word.count_ones() as usize).sum::<usize>());
             let mut words = vec![u64::MAX, 0, 0x5555_5555_5555_5555, u64::MAX, 1];
-            let narrowed: Vec<u64> = words.iter().zip(&each).map(|(word, held)| word & held).collect();
+            let narrowed: Vec<u64> =
+                words.iter().zip(&each).map(|(word, held)| word & held).collect();
             within_words(&bytes, width, low, span, &mut words, false);
             assert_eq!(words, narrowed, "width {width} narrowed");
         }
