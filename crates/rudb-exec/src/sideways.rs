@@ -510,8 +510,8 @@ impl Domain {
             Data::Int16(values) => flat!(values),
             // The common key, tested eight at a time, and once a run where it comes in runs. See
             // [`Members::word_after`]. Keys in order with few of them held are looked up instead.
-            Data::Int32(values) => {
-                let values = values.as_slice().get(..rows)?;
+            Data::Int32(column) => {
+                let values = column.as_slice().get(..rows)?;
                 if let Some(kept) = self.over_run(values, base) {
                     return Some(kept);
                 }
@@ -525,7 +525,7 @@ impl Domain {
                             members.word_after(&values[from..to], &mut before)
                         }))
                     }
-                    None => flat!(values),
+                    None => flat!(column),
                 }
             }
             Data::Int64(values) => {
