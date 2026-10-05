@@ -8,6 +8,16 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.28
+
+For ClickBench, #2568 lets a LIKE on compressed text step aside to the decoded part once that part is held, so warm runs on a column with no gram sketch stop walking the FSST codes each time. For TPC-H, #2566 reads only the count cell of each place to find the places with rows in the add by place.
+
+On compatibility, #2565 forces the columns of a set operation to one type the way the pin does, instead of refusing two types with nothing in common.
+
+For PostgreSQL, #2567 adds the table of the 393 configuration parameters of PostgreSQL 19 to rudb-common, with their types, units, ranges, contexts and flags. #2569 uses it in rudb-server. Each session now keeps its own settings, and SET, SET LOCAL, RESET, RESET ALL, SHOW and SHOW ALL run in the server in the simple and the extended flow. The values follow the transaction, `ParameterStatus` goes out in the order of PostgreSQL, the startup packet and its `options` set the session values, and TimeZone, DateStyle, IntervalStyle, extra_float_digits and bytea_output now control the text of the rows.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.27
 
 For J7, #2559 counts a range over a string column on a sample, so no JOB estimate comes from the constant fifth of the rows, #2560 says in EXPLAIN ANALYZE whether the key sets of a consistent reduction stayed bitmaps, and #2561 lets a load use every free thread of a yielding pool. For TPC-H, #2556 adds the totals of a small map by place, with no map in the loop.
