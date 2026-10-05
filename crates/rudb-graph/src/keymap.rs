@@ -768,6 +768,26 @@ impl KeyMap {
             }
             return Ok(());
         }
+        // A permuted map is the dense test and rank and then one read of the packed `rid` at that
+        // rank. The IMDb files list their rows in no order of their keys, so every key map of the
+        // JOB load is this form, and a key at a time through `lookup` was a tenth of the links.
+        if let Body::Permuted { base, range, bits, rank, rid_width, perm } = &self.body {
+            for (key, out) in keys.iter().zip(out) {
+                let offset = u64::try_from(i128::from(*key) - base).ok();
+                *out = match offset.filter(|offset| offset < range) {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "the build checked the range fits a usize, and a rank is below it"
+                    )]
+                    Some(at) if bits[at as usize / 64] >> (at % 64) & 1 == 1 => {
+                        let place = rank.rank(bits, at as usize) as usize;
+                        bitpack::tail_at(perm, *rid_width, place)?
+                    }
+                    _ => NO_PARENT,
+                };
+            }
+            return Ok(());
+        }
         for (key, out) in keys.iter().zip(out) {
             *out = self.lookup(i128::from(*key))?.unwrap_or(NO_PARENT);
         }
