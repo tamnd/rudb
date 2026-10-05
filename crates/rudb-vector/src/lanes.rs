@@ -311,6 +311,112 @@ pub(crate) fn against_words<const SWAP: bool, const EQUAL: bool, const NOT: bool
     }
 }
 
+/// For each way eight answers can fall, the lanes of the ones that are set, lowest first, which is
+/// the permute that moves the kept rows of a group to the front of it.
+const KEPT_FIRST: [[u32; 8]; 256] = kept_first();
+
+const fn kept_first() -> [[u32; 8]; 256] {
+    let mut table = [[0_u32; 8]; 256];
+    let mut found = 0;
+    while found < 256 {
+        let (mut lane, mut kept) = (0, 0);
+        while lane < 8 {
+            if found >> lane & 1 == 1 {
+                #[expect(clippy::cast_possible_truncation, reason = "a lane under eight")]
+                {
+                    table[found][kept] = lane as u32;
+                }
+                kept += 1;
+            }
+            lane += 1;
+        }
+        found += 1;
+    }
+    table
+}
+
+/// Keeps of `rows` the ones whose code plus `shift`, taken no higher than `range`, is a set bit of
+/// `bits`, eight rows at a time, moved down in place and still in order. Returns how many it kept
+/// and how many it read, which is every row but the last few, for the caller to finish one at a
+/// time.
+///
+/// Row `r`'s code starts at bit `first + r * width` of `bytes`. Its four bytes and the word of
+/// `bits` its offset falls in are each one gather for the group, the code and its bit come out of
+/// lanes with a shift and a mask each, and the rows kept are moved to the front of the group with
+/// one permute from [`KEPT_FIRST`] and stored where the kept rows end. That store is never past
+/// the group it was read from, so the rows still to read are left alone.
+///
+/// `rows` are in order, so the last row of a group says whether its loads are inside `bytes`. Each
+/// position is clamped to the bytes and each offset to `range` all the same, so rows out of order
+/// read a wrong code rather than outside the slice. The caller keeps `width` between one and
+/// [`LANE_WIDTH_MAX`], `bytes` under 2^28 so a position fits a lane, `range` under 2^31 and inside
+/// `bits`, and `shift` under 2^30 either way, so that an offset below zero is above `range` as a
+/// `u32` and clamps to it the way the wrapping `u64` does.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+pub(crate) fn retain_set(
+    (bytes, first, width): (&[u8], u32, u32),
+    rows: &mut [u32],
+    bits: &[u64],
+    shift: i32,
+    range: u32,
+) -> (usize, usize) {
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_and_si256, _mm256_castsi256_ps, _mm256_i32gather_epi32,
+        _mm256_loadu_si256, _mm256_min_epu32, _mm256_movemask_ps, _mm256_mullo_epi32,
+        _mm256_permutevar8x32_epi32, _mm256_set1_epi32, _mm256_sllv_epi32, _mm256_srli_epi32,
+        _mm256_srlv_epi32, _mm256_storeu_si256, _mm256_sub_epi32,
+    };
+    assert!((1..=LANE_WIDTH_MAX).contains(&(width as usize)));
+    assert!(bytes.len() < 1 << 28 && range < 1 << 31 && (range as usize) < bits.len() * 64);
+    assert!(first < 1 << 31 && shift.unsigned_abs() < 1 << 30);
+    let Some(limit) = bytes.len().checked_sub(4) else { return (0, 0) };
+    let (mut kept, mut at, start) = (0, 0, first as usize);
+    // SAFETY: the build enables AVX2, which the `cfg` on this function checks. A group's rows are
+    // read and its kept rows written inside `rows`, at `at` and at `kept`, which is never past it.
+    // A code's gather is at a byte clamped to `limit`, so its four bytes are inside `bytes`, and a
+    // bit's is at a 32 bit word clamped to `range / 32`, which the assert keeps inside `bits`.
+    #[expect(clippy::cast_possible_wrap, reason = "every lane is under 2^31")]
+    unsafe {
+        let codes = bytes.as_ptr().cast::<i32>();
+        let words = bits.as_ptr().cast::<i32>();
+        let (first, width_lanes) =
+            (_mm256_set1_epi32(first as i32), _mm256_set1_epi32(width as i32));
+        let mask = _mm256_set1_epi32(((1_u32 << width) - 1) as i32);
+        let (shift, range) = (_mm256_set1_epi32(shift), _mm256_set1_epi32(range as i32));
+        let (seven, last_bit) = (_mm256_set1_epi32(7), _mm256_set1_epi32(31));
+        let top = _mm256_set1_epi32(limit as i32);
+        while at + 8 <= rows.len() {
+            let last = rows[at + 7] as usize;
+            if (start + last * width as usize) / 8 > limit {
+                break;
+            }
+            let row = _mm256_loadu_si256(rows.as_ptr().add(at).cast());
+            let bit = _mm256_add_epi32(first, _mm256_mullo_epi32(row, width_lanes));
+            let byte = _mm256_min_epu32(_mm256_srli_epi32::<3>(bit), top);
+            let code = _mm256_i32gather_epi32::<1>(codes, byte);
+            let code =
+                _mm256_and_si256(_mm256_srlv_epi32(code, _mm256_and_si256(bit, seven)), mask);
+            let offset = _mm256_min_epu32(_mm256_add_epi32(code, shift), range);
+            let word = _mm256_i32gather_epi32::<4>(words, _mm256_srli_epi32::<5>(offset));
+            let held = _mm256_sllv_epi32(
+                word,
+                _mm256_sub_epi32(last_bit, _mm256_and_si256(offset, last_bit)),
+            );
+            #[expect(clippy::cast_sign_loss, reason = "eight bits of a movemask")]
+            let found = _mm256_movemask_ps(_mm256_castsi256_ps(held)) as usize;
+            let order = _mm256_loadu_si256(KEPT_FIRST[found].as_ptr().cast());
+            _mm256_storeu_si256(
+                rows.as_mut_ptr().add(kept).cast(),
+                _mm256_permutevar8x32_epi32(row, order),
+            );
+            kept += found.count_ones() as usize;
+            at += 8;
+        }
+    }
+    (kept, at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +511,47 @@ mod tests {
         }
         #[expect(clippy::cast_possible_wrap, reason = "under 2^25")]
         (bytes, codes.into_iter().map(|code| code as i64).collect())
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn rows_kept_in_lanes_are_the_rows_whose_bit_is_set() {
+        for width in [1, 4, 9, 13, 17, 25] {
+            let (bytes, codes) = packed_blocks(width, 4, 3);
+            for (skip, every) in [(0, 1), (3, 2), (5, 7), (64, 3)] {
+                let rows: Vec<u32> = (0..codes.len() - skip)
+                    .filter(|row| row % every == 0)
+                    .map(|row| u32::try_from(row).unwrap())
+                    .collect();
+                for (shift, range) in [(0, 96), (-40, 60), (7, 200), (-1, 1), (300, 500)] {
+                    let bits: Vec<u64> = (0..=u64::from(range) / 64)
+                        .map(|at| (at + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                        .collect();
+                    #[expect(clippy::cast_sign_loss, reason = "the wrapping add the domain makes")]
+                    let held = |row: &u32| {
+                        let code = codes[skip + *row as usize] as u64;
+                        let offset = code.wrapping_add(i64::from(shift) as u64).min(range.into());
+                        bits[(offset / 64) as usize] >> (offset % 64) & 1 == 1
+                    };
+                    let first = u32::try_from(skip * width).unwrap();
+                    let mut kept_rows = rows.clone();
+                    let (kept, read) = retain_set(
+                        (&bytes, first, u32::try_from(width).unwrap()),
+                        &mut kept_rows,
+                        &bits,
+                        shift,
+                        range,
+                    );
+                    assert_eq!(read, rows.len() / 8 * 8, "width {width} skip {skip}");
+                    let wanted: Vec<u32> = rows[..read].iter().copied().filter(held).collect();
+                    assert_eq!(
+                        kept_rows[..kept],
+                        wanted,
+                        "width {width} skip {skip} shift {shift}"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
