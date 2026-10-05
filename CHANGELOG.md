@@ -8,6 +8,16 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.26
+
+For ClickBench, #2541 lets the top N cutoff work through an expression over the first sort key, so `ORDER BY EventTime LIMIT 10` over the view that turns stored seconds into a timestamp no longer reads and sorts every row that its filter keeps. This changes q25 and q27.
+
+On compatibility, #2544 reads `#1` positional references the way the pin does, and #2545 refuses `ALTER` on a field of a struct column with the messages of the test files.
+
+For PostgreSQL, rudb-pgtypes is new. #2540 adds the type OIDs from the vendored `pg_type.dat`, the typmods, and the text and binary forms of `bool`, `"char"`, `name`, the integers, `oid`, the floats, `bytea` and `uuid`. #2542 adds `numeric` in the layout of PostgreSQL, with a fast path for the scaled decimal of the engine. #2543 adds the binary forms and the text output of `date`, `time`, `timetz`, `timestamp`, `timestamptz` and `interval` in every `DateStyle` and `IntervalStyle`. #2546 adds their text input, as a port of the decoder in `datetime.c`, with the vendored `Default` time zone abbreviations. Each type is checked against a fixture recorded from the server at the pin, and all 7579 rows match.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.25
 
 For J7, the load. #2522 settles a dictionary payload only on a shape that fits its sample, #2536 keeps LZ on a dictionary payload only where it takes a third off the bytes, #2537 looks a block of keys up in a permuted key map without a call a key, and #2538 measures a link too big for what its table has left without building it. On server2 the JOB load goes from 202 s down to 172 to 175 s, its processor time from 165 to 153 s, `person_info` from 24 to 16 s and the last checkpoint from 37 to 23 to 26 s. #2523 looks up the held keys of a chunk whose keys are in order, #2530 compares a chunk's packed blocks with a range in one call, and #2521 adds up q01's totals straight into each row's slot.
