@@ -28,7 +28,7 @@ Single thread at SF1 on server2, the warm instructions of a query as the differe
 | q12 | 187 | 176 | 139 | 134 |
 | q01 | 446 | 435 | 232 | 244 |
 
-q03, q04, q05, q10 and q20 run two to four million fewer instructions, and the rest the same as before within one million.
+q03, q04, q05, q10 and q20 run two to four million fewer instructions, and the rest the same as before within one million, apart from q02, which moves between 30 and 37 million from one measurement to the next on either side.
 
 ## What this leaves
 
