@@ -5,12 +5,14 @@
 //! log, with the reason and the line of `pg_hba.conf` in its `DETAIL`. The client never sees the
 //! reason, so it cannot tell a bad password from a role that does not exist.
 //!
-//! `cert`, the `clientcert=verify-full` option and `ident` on TCP come in a later version. A line
-//! with one of them loads, but a connection that it matches fails and the log tells why.
+//! `cert` and `clientcert=verify-full` compare the common name or the distinguished name of the
+//! client certificate with the user, through the map of the line. `ident` on TCP asks the Ident
+//! server of the client, RFC 1413, which user owns the connection.
 
-use std::io;
-use std::os::fd::{AsRawFd, RawFd};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rudb_pgtypes::UNIX_TO_POSTGRES_USECS;
 use rudb_pgwire::{
@@ -20,12 +22,21 @@ use rudb_pgwire::{
 
 use super::{Filled, Input, Start, Wire, terminated};
 use crate::crypto::Provider;
-use crate::hba::{Client, ClientCert, HbaLine, Method, system_user_name};
+use crate::hba::{Client, ClientCert, ClientName, HbaLine, Method, system_user_name};
 use crate::poll;
 use crate::roles::Catalog;
 use crate::server::{Shared, log};
 use crate::stream::Stream;
 use crate::tls::os_text;
+
+/// The port of the Ident server, RFC 1413.
+const IDENT_PORT: u16 = 113;
+
+/// The longest user name that an Ident server can give.
+const IDENT_USERNAME_MAX: usize = 512;
+
+/// How long the server waits for the Ident server, the default of `authentication_timeout`.
+const IDENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The default of `password_expiration_warning_threshold`, in seconds.
 const EXPIRATION_WARNING_THRESHOLD: u64 = 7 * 24 * 60 * 60;
@@ -90,11 +101,7 @@ pub(super) fn authenticate(
             wire.fatal(("F0000", message.to_owned()))?;
             return Ok(None);
         }
-        let certified = match &wire.stream {
-            Stream::Tls(stream) => stream.conn.peer_certificates().is_some_and(|c| !c.is_empty()),
-            _ => false,
-        };
-        if !certified {
+        if wire.peer.is_none() {
             let message = "connection requires a valid client certificate";
             wire.fatal(("28000", message.to_owned()))?;
             return Ok(None);
@@ -114,11 +121,13 @@ pub(super) fn authenticate(
     let mut notices = Vec::new();
     let mut run = Run { shared, start, wire, input, catalog: &catalog };
     let step = match line.method {
-        Method::Trust => Step::Ok,
+        // `cert` is `trust` with the check of the certificate below.
+        Method::Trust | Method::Cert => Step::Ok,
         Method::Peer => run.peer(line),
+        Method::Ident => run.ident(line),
         Method::Password => run.password(&mut notices)?,
         Method::Md5 | Method::Scram => run.challenge(line.method, ssl, &mut notices)?,
-        Method::Ident | Method::Cert | Method::OAuth => {
+        Method::OAuth => {
             log(
                 "LOG",
                 &format!(
@@ -132,13 +141,8 @@ pub(super) fn authenticate(
         Method::Reject => unreachable!("handled above"),
     };
     let step = match step {
-        Step::Ok if line.clientcert == ClientCert::VerifyFull => {
-            log(
-                "LOG",
-                "certificate validation (clientcert=verify-full) is not supported by this \
-                 version of rudb-server",
-            );
-            Step::Failed(None)
+        Step::Ok if line.clientcert == ClientCert::VerifyFull || line.method == Method::Cert => {
+            run.cert(line)
         }
         step => step,
     };
@@ -346,6 +350,81 @@ impl Run<'_> {
         }
     }
 
+    /// `CheckCertAuth`: the common name or the distinguished name of the client certificate,
+    /// through the map of the line.
+    fn cert(&mut self, line: &HbaLine) -> Step {
+        let user = &self.start.user;
+        let name = self.wire.peer.as_ref().and_then(|peer| match line.clientname {
+            ClientName::Cn => peer.cn.as_deref(),
+            ClientName::Dn => Some(peer.dn.as_str()),
+        });
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            log(
+                "LOG",
+                &format!(
+                    "certificate authentication failed for user \"{user}\": client certificate \
+                     contains no user name"
+                ),
+            );
+            return Step::Failed(None);
+        };
+        let ident = self.shared.ident();
+        if ident.check(line.map.as_deref(), user, name, self.catalog) {
+            return Step::Ok;
+        }
+        if line.clientcert == ClientCert::VerifyFull && line.method != Method::Cert {
+            let field = match line.clientname {
+                ClientName::Cn => "CN",
+                ClientName::Dn => "DN",
+            };
+            log(
+                "LOG",
+                &format!(
+                    "certificate validation (clientcert=verify-full) failed for user \"{user}\": \
+                     {field} mismatch"
+                ),
+            );
+        }
+        Step::Failed(None)
+    }
+
+    /// `ident_inet`: the user that the Ident server of the client gives for the connection,
+    /// through the map of the line.
+    fn ident(&mut self, line: &HbaLine) -> Step {
+        let addresses = match &self.wire.stream {
+            Stream::Tcp(socket) => socket.local_addr().and_then(|l| Ok((l, socket.peer_addr()?))),
+            Stream::Tls(stream) => {
+                stream.sock.local_addr().and_then(|l| Ok((l, stream.sock.peer_addr()?)))
+            }
+            Stream::Unix(_) => return Step::Failed(None),
+        };
+        let Ok((local, remote)) = addresses else {
+            return Step::Failed(None);
+        };
+        let name = ident_query(local, remote, IDENT_PORT).and_then(|response| {
+            ident_user(&response).ok_or_else(|| {
+                let response = response.split(|&byte| byte == 0).next().unwrap_or_default();
+                format!(
+                    "invalidly formatted response from Ident server: \"{}\"",
+                    String::from_utf8_lossy(response)
+                )
+            })
+        });
+        let name = match name {
+            Ok(name) => name,
+            Err(message) => {
+                log("LOG", &message);
+                return Step::Failed(None);
+            }
+        };
+        let ident = self.shared.ident();
+        if ident.check(line.map.as_deref(), &self.start.user, &name, self.catalog) {
+            Step::Ok
+        } else {
+            Step::Failed(None)
+        }
+    }
+
     /// `auth_peer`: the system user of the other end of the Unix socket, through the map of the
     /// line.
     fn peer(&mut self, line: &HbaLine) -> Step {
@@ -370,6 +449,140 @@ impl Run<'_> {
             Step::Failed(None)
         }
     }
+}
+
+/// Asks the Ident server at `port` of the client which user owns the connection from `remote` to
+/// `local`, and gives the answer. The socket is bound to the local address of the connection, so
+/// that the Ident server finds the connection when the server has more than one address. An
+/// error is the text of the log line of PostgreSQL.
+fn ident_query(local: SocketAddr, remote: SocketAddr, port: u16) -> Result<Vec<u8>, String> {
+    let (remote_host, local_host) = (remote.ip().to_string(), local.ip().to_string());
+    let failed = |what: &str, e: &io::Error| {
+        format!(
+            "could not {what} Ident server at address \"{remote_host}\", port {port}: {}",
+            os_text(e)
+        )
+    };
+    let family = match remote {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: `socket` takes no pointers.
+    let fd = unsafe { libc::socket(family, kind, 0) };
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        return Err(format!("could not create socket for Ident connection: {}", os_text(&e)));
+    }
+    // SAFETY: `fd` is a new socket that nothing else owns.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    let (address, len) = sockaddr(SocketAddr::new(local.ip(), 0));
+    // SAFETY: `address` is a valid socket address of `len` bytes.
+    if unsafe { libc::bind(socket.as_raw_fd(), (&raw const address).cast(), len) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(format!("could not bind to local address \"{local_host}\": {}", os_text(&e)));
+    }
+    let (address, len) = sockaddr(SocketAddr::new(remote.ip(), port));
+    // SAFETY: `address` is a valid socket address of `len` bytes.
+    if unsafe { libc::connect(socket.as_raw_fd(), (&raw const address).cast(), len) } != 0 {
+        return Err(failed("connect to", &io::Error::last_os_error()));
+    }
+    let mut stream = TcpStream::from(socket);
+    let _ = stream.set_read_timeout(Some(IDENT_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IDENT_TIMEOUT));
+    let query = format!("{},{}\r\n", remote.port(), local.port());
+    stream.write_all(query.as_bytes()).map_err(|e| failed("send query to", &e))?;
+    let mut response = vec![0; 80 + IDENT_USERNAME_MAX - 1];
+    let n = loop {
+        match stream.read(&mut response) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            read => break read.map_err(|e| failed("receive response from", &e))?,
+        }
+    };
+    response.truncate(n);
+    Ok(response)
+}
+
+/// `interpret_ident_response`: the user name of a `USERID` answer of an Ident server, which ends
+/// with a carriage return and a line feed. Space and tab are the white space of RFC 1413.
+fn ident_user(response: &[u8]) -> Option<String> {
+    // The answer is a C string in PostgreSQL, so it ends at a zero byte.
+    let response = response.split(|&byte| byte == 0).next().unwrap_or_default();
+    if response.len() < 2 || response[response.len() - 2] != b'\r' {
+        return None;
+    }
+    // Each scan below stops at the carriage return, so it stays in the answer.
+    let blank = |byte: u8| byte == b' ' || byte == b'\t';
+    let mut at = 0;
+    let skip_to_colon = |mut at: usize| {
+        while response[at] != b':' && response[at] != b'\r' {
+            at += 1;
+        }
+        (response[at] == b':').then_some(at + 1)
+    };
+    // The port field.
+    at = skip_to_colon(at)?;
+    while blank(response[at]) {
+        at += 1;
+    }
+    let start = at;
+    while response[at] != b':' && response[at] != b'\r' && !blank(response[at]) && at - start < 79 {
+        at += 1;
+    }
+    let kind = &response[start..at];
+    while blank(response[at]) {
+        at += 1;
+    }
+    if kind != b"USERID" || response[at] != b':' {
+        return None;
+    }
+    // The operating system field.
+    at = skip_to_colon(at + 1)?;
+    while blank(response[at]) {
+        at += 1;
+    }
+    let start = at;
+    while response[at] != b'\r' && at - start < IDENT_USERNAME_MAX {
+        at += 1;
+    }
+    Some(String::from_utf8_lossy(&response[start..at]).into_owned())
+}
+
+/// The socket address of `address` for `bind` and `connect`.
+fn sockaddr(address: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: a socket address of zero bytes is valid, and the fields are set below.
+    let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+    let len = match address {
+        SocketAddr::V4(v4) => {
+            // SAFETY: `sockaddr_storage` is large enough and aligned for every socket address.
+            let sin = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in>() };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            {
+                sin.sin_len = size_of::<libc::sockaddr_in>() as u8;
+            }
+            size_of::<libc::sockaddr_in>()
+        }
+        SocketAddr::V6(v6) => {
+            // SAFETY: `sockaddr_storage` is large enough and aligned for every socket address.
+            let sin6 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in6>() };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_addr.s6_addr = v6.ip().octets();
+            sin6.sin6_scope_id = v6.scope_id();
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            {
+                sin6.sin6_len = size_of::<libc::sockaddr_in6>() as u8;
+            }
+            size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (storage, len as libc::socklen_t)
 }
 
 /// `get_role_password`: the secret of the role, or the reason for the log why there is none. A
@@ -466,6 +679,42 @@ fn peer_uid(fd: RawFd) -> io::Result<libc::uid_t> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_answers_of_an_ident_server() {
+        let user = |text: &str| ident_user(text.as_bytes());
+        assert_eq!(user("6191, 23 : USERID : UNIX : stjohns\r\n").as_deref(), Some("stjohns"));
+        assert_eq!(user("6191,23:USERID:OTHER:a b \r\n").as_deref(), Some("a b "));
+        assert_eq!(user("6191, 23 : ERROR : NO-USER\r\n"), None);
+        assert_eq!(user("6191, 23 : USERID : UNIX : x\n"), None);
+        assert_eq!(user("6191, 23 : USERID\r\n"), None);
+        assert_eq!(user("\r\n"), None);
+        assert_eq!(user("1,2:USERID:UNIX:\r\n").as_deref(), Some(""));
+        assert_eq!(user("1,2:USERID:UNIX:a\0b\r\n"), None);
+    }
+
+    #[test]
+    fn a_query_to_an_ident_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut query = [0u8; 64];
+            let n = socket.read(&mut query).unwrap();
+            socket.write_all(b"5432 , 40000 : USERID : UNIX : alice\r\n").unwrap();
+            String::from_utf8(query[..n].to_vec()).unwrap()
+        });
+        let local: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:5432".parse().unwrap();
+        let response = ident_query(local, remote, port).unwrap();
+        assert_eq!(ident_user(&response).as_deref(), Some("alice"));
+        assert_eq!(server.join().unwrap(), "5432,40000\r\n");
+        let error = ident_query(local, remote, 1).unwrap_err();
+        assert_eq!(
+            error,
+            "could not connect to Ident server at address \"127.0.0.1\", port 1: Connection refused"
+        );
+    }
 
     #[test]
     fn the_detail_of_an_expiry() {

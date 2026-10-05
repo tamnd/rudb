@@ -44,6 +44,7 @@ use crate::roles::{Catalog, Roles};
 use crate::server::{Defaults, Refusal, Shared, log};
 use crate::stream::Stream;
 use crate::tls::{self, Tls};
+use crate::x509;
 
 /// The size of the output at which the session writes it to the socket before the end of the
 /// result, the size of the send buffer of PostgreSQL.
@@ -105,6 +106,8 @@ struct Wire {
     /// The TLS configuration of the server when the connection came, when `ssl` was on. A
     /// reload does not change it for a connection that is open.
     tls: Option<Arc<Tls>>,
+    /// The subject of the certificate of the client, when it sent one over TLS.
+    peer: Option<x509::Subject>,
 }
 
 impl Wire {
@@ -162,6 +165,18 @@ impl Wire {
         let socket = socket.try_clone()?;
         match tls::accept(config, socket, early) {
             Ok(stream) => {
+                // The TLS library checked the certificate against the root certificates.
+                if let Some(certificate) = stream.conn.peer_certificates().and_then(<[_]>::first) {
+                    match x509::subject(certificate) {
+                        Ok(subject) => self.peer = Some(subject),
+                        Err(message) => {
+                            if let Some(message) = message {
+                                log("LOG", message);
+                            }
+                            return Ok(false);
+                        }
+                    }
+                }
                 self.stream = Stream::Tls(Box::new(stream));
                 Ok(true)
             }
@@ -239,7 +254,7 @@ pub(crate) fn run(shared: &Arc<Shared>, stream: Stream) {
     };
     let pid = shared.register(waker, stream.try_clone().ok());
     let _registered = Registered { shared, pid };
-    let mut wire = Wire { stream, wake, out: OutBuf::new(), tls: shared.tls() };
+    let mut wire = Wire { stream, wake, out: OutBuf::new(), tls: shared.tls(), peer: None };
     let mut input = Input::default();
     // An error of the socket ends the session. The client is gone or broke the connection, and
     // PostgreSQL logs nothing for most of these.
