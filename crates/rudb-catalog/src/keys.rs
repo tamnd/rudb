@@ -757,22 +757,24 @@ mod tests {
         assert!(!ints.insert(1 << 40) && !ints.insert(500_000));
     }
 
-    fn chunk(ty: LogicalType, values: impl IntoIterator<Item = Value>) -> Chunk {
+    /// The values as chunks of at most 2048 rows, the size a load hands the keys in.
+    fn chunks(ty: LogicalType, values: impl IntoIterator<Item = Value>) -> Vec<Chunk> {
         let values = values.into_iter().collect::<Vec<_>>();
-        Chunk::new(vec![Vector::from_values(ty, &values).expect("a column")]).expect("a chunk")
+        let column = |part: &[Value]| Vector::from_values(ty.clone(), part).expect("a column");
+        values.chunks(2048).map(|part| Chunk::new(vec![column(part)]).expect("a chunk")).collect()
     }
 
-    fn ints(from: i64, to: i64) -> Chunk {
-        chunk(LogicalType::BigInt, (from..to).map(Value::BigInt))
+    fn ints(from: i64, to: i64) -> Vec<Chunk> {
+        chunks(LogicalType::BigInt, (from..to).map(Value::BigInt))
     }
 
-    fn texts(from: i64, to: i64) -> Chunk {
-        chunk(LogicalType::Varchar, (from..to).map(|at| Value::Varchar(format!("user{at}"))))
+    fn texts(from: i64, to: i64) -> Vec<Chunk> {
+        chunks(LogicalType::Varchar, (from..to).map(|at| Value::Varchar(format!("user{at}"))))
     }
 
-    fn add(seen: &mut Seen, chunk: &Chunk, field: &Field) -> bool {
+    fn add(seen: &mut Seen, chunks: &[Chunk], field: &Field) -> bool {
         let key = Key { columns: vec![0], primary: true };
-        match seen.check(std::slice::from_ref(chunk), &key, std::slice::from_ref(field), false) {
+        match seen.check(chunks, &key, std::slice::from_ref(field), false) {
             Ok(added) => {
                 seen.extend(added);
                 true
@@ -785,9 +787,10 @@ mod tests {
     /// original's, a repeat is found in any run, and the runs settle into one once the copy is gone.
     #[test]
     fn a_copy_adds_keys_in_runs_of_its_own() {
-        for (ty, rows) in
-            [(LogicalType::BigInt, ints as fn(i64, i64) -> Chunk), (LogicalType::Varchar, texts)]
-        {
+        for (ty, rows) in [
+            (LogicalType::BigInt, ints as fn(i64, i64) -> Vec<Chunk>),
+            (LogicalType::Varchar, texts),
+        ] {
             let field = Field::new("k", ty);
             let mut table = Seen::default();
             assert!(add(&mut table, &rows(0, 10_000), &field));
