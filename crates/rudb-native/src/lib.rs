@@ -7254,6 +7254,40 @@ fn read_index_span<F: Positional + ?Sized>(
     Ok(spans)
 }
 
+/// Which rows of a string column `function` keeps against the constant `pattern`, for
+/// [`Reader::matched`] and [`Reader::picked`].
+///
+/// An equality and the four orderings are compared here a value at a time, byte by byte the way
+/// the comparison in a query orders two strings, and the `LIKE` family goes to the kernel. A null
+/// is kept by none of them. The orderings are here because a range over a string is the condition
+/// the bounds cannot read: two strings have no distance between them, so `mi_idx.info > '5.0'` in
+/// JOB was charged the constant fifth until something counted it.
+fn passing(values: &Vector, function: &str, pattern: &str) -> Option<Vec<bool>> {
+    let wanted = |order: Ordering| match function {
+        "=" => Some(order == Ordering::Equal),
+        "<" => Some(order == Ordering::Less),
+        "<=" => Some(order != Ordering::Greater),
+        ">" => Some(order == Ordering::Greater),
+        ">=" => Some(order != Ordering::Less),
+        _ => None,
+    };
+    if wanted(Ordering::Equal).is_some() {
+        return Some(
+            (0..values.len())
+                .map(|row| match values.value_at(row) {
+                    Value::Varchar(value) => wanted(value.as_str().cmp(pattern)).unwrap_or(false),
+                    _ => false,
+                })
+                .collect(),
+        );
+    }
+    let pattern =
+        Vector::constant(LogicalType::Varchar, Value::Varchar(pattern.into()), values.len());
+    let passed =
+        rudb_kernels::call(function, &[values, &pattern], &LogicalType::Boolean, None).ok()?;
+    Some((0..passed.len()).map(|row| passed.value_at(row) == Value::Boolean(true)).collect())
+}
+
 /// One part's bytes out of a whole column page.
 fn part_bytes(page: &[u8], span: PartSpan) -> Result<&[u8]> {
     let end = span.start.checked_add(span.length).ok_or_else(|| invalid("part range overflow"))?;
@@ -7960,7 +7994,7 @@ impl Reader {
     }
 
     /// The share of a sample of a string column's rows that `function` keeps, one of the `LIKE`
-    /// family or `=`, called with the column and `pattern`.
+    /// family, `=` or one of the four orderings, called with the column and `pattern`.
     ///
     /// A pattern says nothing a bound or a frequency count can read, so a plan used to charge it a
     /// fifth of the rows. That is wrong both ways and JOB shows both: `'%Downey%Robert%'` keeps a
@@ -7986,25 +8020,9 @@ impl Reader {
         for at in 0..taken {
             let part = (at * parts + parts / 2) / taken;
             let chunk = self.read_sparse(part, &[column]).ok()?;
-            let values = chunk.column(0).ok()?;
-            if function == "=" {
-                let wanted = Value::Varchar(pattern.into());
-                rows += values.len();
-                kept += (0..values.len()).filter(|&row| values.value_at(row) == wanted).count();
-                continue;
-            }
-            let pattern = Vector::constant(
-                LogicalType::Varchar,
-                Value::Varchar(pattern.into()),
-                values.len(),
-            );
-            let passed =
-                rudb_kernels::call(function, &[values, &pattern], &LogicalType::Boolean, None)
-                    .ok()?;
+            let passed = passing(chunk.column(0).ok()?, function, pattern)?;
             rows += passed.len();
-            kept += (0..passed.len())
-                .filter(|&row| passed.value_at(row) == Value::Boolean(true))
-                .count();
+            kept += passed.iter().filter(|&&passed| passed).count();
         }
         if rows == 0 {
             return None;
@@ -8050,20 +8068,7 @@ impl Reader {
             let chunk = self.read_sparse(part, &[column, key]).ok()?;
             let values = chunk.column(0).ok()?;
             let keys = chunk.column(1).ok()?;
-            let passed: Vec<bool> = if function == "=" {
-                let wanted = Value::Varchar(pattern.into());
-                (0..values.len()).map(|row| values.value_at(row) == wanted).collect()
-            } else {
-                let pattern = Vector::constant(
-                    LogicalType::Varchar,
-                    Value::Varchar(pattern.into()),
-                    values.len(),
-                );
-                let passed =
-                    rudb_kernels::call(function, &[values, &pattern], &LogicalType::Boolean, None)
-                        .ok()?;
-                (0..passed.len()).map(|row| passed.value_at(row) == Value::Boolean(true)).collect()
-            };
+            let passed = passing(values, function, pattern)?;
             kept.extend(
                 passed
                     .iter()
@@ -16124,7 +16129,7 @@ mod tests {
     }
 
     #[test]
-    fn the_planner_gets_the_share_a_pattern_or_an_equality_keeps_off_a_sample() {
+    fn the_planner_gets_the_share_a_pattern_an_equality_or_a_range_keeps_off_a_sample() {
         // Every value different, so there is no synopsis and no count of values to divide by, which
         // is `keyword` in JOB. One row in four starts with `a`, and one row holds `k7`.
         let path = path("matched_for_the_planner");
@@ -16151,6 +16156,13 @@ mod tests {
         // Nothing matched is half a row of the sample, never nothing.
         let share = stripes.matching(column, "=", "zz").expect("a miss is still a share");
         assert!((share - 0.5 / 400.0).abs() < 1e-9, "{share}");
+        // A range over strings is counted the same way, which is `mi_idx.info > '5.0'` in JOB.
+        for (function, constant, wanted) in
+            [(">=", "b", 0.75), ("<", "b", 0.25), (">", "c", 0.5), ("<=", "a", 0.5 / 400.0)]
+        {
+            let share = stripes.matching(column, function, constant).expect("a range is sampled");
+            assert!((share - wanted).abs() < 1e-9, "{function} {constant}: {share}");
+        }
         fs::remove_file(&path).expect("clean up");
     }
 
