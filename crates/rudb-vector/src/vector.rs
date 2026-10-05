@@ -5983,6 +5983,31 @@ impl Builder {
         }
     }
 
+    /// The values at `rows` as a column of their own, leaving the column where it is.
+    ///
+    /// What [`Self::vector`] and a gather would give, without the column so far being copied
+    /// first, which for a lookup of one row of a column being built was every row of it.
+    ///
+    /// # Errors
+    ///
+    /// If a row is past the end, or as [`Self::vector`].
+    pub fn gather(&self, rows: &[u32]) -> Result<Vector> {
+        let mut values = Vec::with_capacity(rows.len());
+        for &row in rows {
+            let row = row as usize;
+            if row >= self.len {
+                return Err(Error::internal(format!("row {row} of a column of {}", self.len)));
+            }
+            let null = self.nulls.get(row / 64).is_some_and(|bits| bits & (1 << (row % 64)) != 0);
+            values.push(match &self.held {
+                _ if null => Value::Null,
+                Held::Flat(data) => value_from(&self.ty, data, row),
+                Held::Values(held) => held[row].clone(),
+            });
+        }
+        Vector::from_values(self.ty.clone(), &values)
+    }
+
     /// The column so far, and a fresh empty one in its place.
     ///
     /// # Errors

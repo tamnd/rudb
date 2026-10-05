@@ -1367,6 +1367,108 @@ impl MemoryTable {
         }
     }
 
+    /// The named columns of chunk `chunk` at the rows `positions` names, which rise.
+    ///
+    /// What [`Self::read`] and a gather would give, without the chunk being cut or laid first. A
+    /// window of a group is a cut that copies a string column's views, and the tail is laid end to
+    /// end before it is read, so a lookup of one row by its key copied every row of its chunk in
+    /// every column it read, which on a table of ten text columns was most of what a lookup cost.
+    /// Here the rows are gathered straight out of the page, the chunk or the columns being built
+    /// they are in, and a tail read whose rows are not all in one of its pieces is read whole.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`], and if a position is past the end of the chunk.
+    pub fn read_rows(&self, chunk: usize, columns: &[usize], positions: &[u32]) -> Result<Chunk> {
+        let slot = *self.slots.get(chunk).ok_or_else(|| {
+            Error::internal(format!(
+                "chunk {chunk} of a table that has {} chunks",
+                self.slots.len()
+            ))
+        })?;
+        let len = self.rows_of(slot);
+        if positions.last().is_some_and(|&last| last as usize >= len) {
+            return Err(Error::internal(format!("a row past the end of chunk {chunk}")));
+        }
+        fn gathered<'v>(
+            pick: &dyn Fn(usize) -> Result<Cow<'v, Vector>>,
+            columns: &[usize],
+            at: &[u32],
+        ) -> Result<Chunk> {
+            let mut picked = Vec::with_capacity(columns.len());
+            for &column in columns {
+                picked.push(pick(column)?.gather(at)?);
+            }
+            Chunk::with_rows(picked, at.len())
+        }
+        fn column_of(chunk: &Chunk, column: usize) -> Result<Cow<'_, Vector>> {
+            chunk.column(column).map(Cow::Borrowed)
+        }
+        match slot {
+            Slot::Window { group, at, .. } => {
+                let held = self
+                    .groups
+                    .get(group)
+                    .ok_or_else(|| Error::internal("a chunk names a group that is not there"))?;
+                let shifted: Vec<u32> =
+                    positions.iter().map(|&position| position + at as u32).collect();
+                let page = |column: usize| {
+                    held.columns.get(column).map(Cow::Borrowed).ok_or_else(|| {
+                        Error::internal(format!(
+                            "column {column} of a table that has {}",
+                            self.types.len()
+                        ))
+                    })
+                };
+                gathered(&page, columns, &shifted)
+            }
+            Slot::Open { at } => {
+                let held = self
+                    .open
+                    .get(at)
+                    .ok_or_else(|| Error::internal("a chunk names an open chunk that is gone"))?;
+                gathered(&|column| column_of(held, column), columns, positions)
+            }
+            Slot::Tail => {
+                if let (Some(&first), Some(&last)) = (positions.first(), positions.last()) {
+                    let (first, last) = (first as usize, last as usize);
+                    let mut start = 0;
+                    let mut pieces = self.tail.iter();
+                    let piece = loop {
+                        match pieces.next() {
+                            Some(piece) if first >= start + piece.len() => start += piece.len(),
+                            other => break other,
+                        }
+                    };
+                    let local: Vec<u32> =
+                        positions.iter().map(|&position| position - start as u32).collect();
+                    match piece {
+                        Some(piece) if last < start + piece.len() && piece.kept().is_none() => {
+                            return gathered(&|column| column_of(piece, column), columns, &local);
+                        }
+                        None if self.built > 0 => {
+                            let mut picked = Vec::with_capacity(columns.len());
+                            for &column in columns {
+                                let builder = self.building.get(column).ok_or_else(|| {
+                                    Error::internal("a column past the end of the table")
+                                })?;
+                                picked.push(builder.gather(&local)?);
+                            }
+                            return Chunk::with_rows(picked, positions.len());
+                        }
+                        _ => {}
+                    }
+                }
+                let whole = self.tail_read(columns)?;
+                let mut picked = Vec::with_capacity(columns.len());
+                for column in 0..whole.width() {
+                    picked.push(whole.column(column)?.gather(positions)?);
+                }
+                Chunk::with_rows(picked, positions.len())
+            }
+        }
+    }
+
     /// How many rows chunk `index` has, or `None` past the end.
     ///
     /// Answered out of the directory, which is why it is here rather than left to a caller that
@@ -2389,6 +2491,64 @@ mod tests {
             assert_eq!(mixed.null_count(column).ok(), whole.null_count(column).ok());
             assert_eq!(mixed.exact_extremes(column).ok(), whole.exact_extremes(column).ok());
             assert_eq!(mixed.exact_sum(column).ok(), whole.exact_sum(column).ok());
+        }
+    }
+
+    #[test]
+    fn rows_read_where_they_are_are_the_rows_of_the_chunk_read_whole() {
+        let types = vec![LogicalType::BigInt, LogicalType::Varchar];
+        let row = |id: usize| {
+            let name = if id % 7 == 0 { Value::Null } else { Value::Varchar(format!("name {id}")) };
+            vec![Value::BigInt(i64::try_from(id).expect("small")), name]
+        };
+        let mut table = MemoryTable::new(types);
+        // A sealed group, a chunk of the next one, small chunks in the tail and rows being built.
+        let big: Vec<Vec<Value>> = (0..ROWS_PER_GROUP + VECTOR_SIZE).map(row).collect();
+        table.append_rows(&big).expect("rows");
+        let mut id = big.len();
+        for take in [20, 1, 30, 3, 1] {
+            let rows: Vec<Vec<Value>> = (id..id + take).map(row).collect();
+            if take > TAIL_BUILDS {
+                let columns = (0..2)
+                    .map(|column| {
+                        let values: Vec<Value> =
+                            rows.iter().map(|row| row[column].clone()).collect();
+                        Vector::from_values(table.types[column].clone(), &values).expect("column")
+                    })
+                    .collect();
+                let chunk = Chunk::with_rows(columns, take).expect("a chunk");
+                table.append_all(vec![chunk], 1).expect("a chunk");
+            } else {
+                table.append_rows(&rows).expect("rows");
+            }
+            id += take;
+        }
+        assert!(table.group_count() == 1 && !table.tail.is_empty() && table.built > 0);
+        for chunk in 0..table.chunk_count() {
+            let len = table.chunk_len(chunk).expect("a chunk");
+            let whole = table.read(chunk, &[1, 0]).expect("read");
+            let picks: Vec<Vec<u32>> = vec![
+                vec![0],
+                vec![u32::try_from(len - 1).expect("small")],
+                (0..u32::try_from(len).expect("small")).step_by(3).collect(),
+                (19..u32::try_from(len.min(24)).expect("small")).collect(),
+                (51..u32::try_from(len.min(54)).expect("small")).collect(),
+                Vec::new(),
+            ];
+            for positions in picks {
+                let read = table.read_rows(chunk, &[1, 0], &positions).expect("read rows");
+                assert_eq!(read.len(), positions.len());
+                for (at, &position) in positions.iter().enumerate() {
+                    for column in 0..2 {
+                        assert_eq!(
+                            read.value_at(at, column),
+                            whole.value_at(position as usize, column),
+                            "chunk {chunk} row {position} column {column}"
+                        );
+                    }
+                }
+            }
+            assert!(table.read_rows(chunk, &[0], &[u32::try_from(len).expect("small")]).is_err());
         }
     }
 

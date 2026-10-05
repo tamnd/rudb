@@ -1240,13 +1240,8 @@ impl Rows {
         match self {
             Self::Native(reader) => reader.read_rows(at, columns, positions, whole),
             // A part of the rows appended since is read the way a table in memory reads one.
-            Self::Masked(reader, ..) if at >= reader.parts() => {
-                let part = self.read(at, columns)?;
-                let mut selected = Vec::with_capacity(part.width());
-                for column in 0..part.width() {
-                    selected.push(part.column(column)?.gather(positions)?);
-                }
-                Chunk::with_rows(selected, positions.len())
+            Self::Masked(reader, _, rows) if at >= reader.parts() => {
+                rows.read_rows(at - reader.parts(), columns, positions)
             }
             // The positions count the rows left, and the file counts every row it wrote.
             // The rows an update wrote are laid over only the rows read.
@@ -1270,14 +1265,9 @@ impl Rows {
             Self::Grown(reader, _) if at < reader.parts() => {
                 reader.read_rows(at, columns, positions, whole).map(Chunk::loosened)
             }
-            Self::Memory(_) | Self::Grown(_, _) => {
-                let part = self.read(at, columns)?;
-                let mut selected = Vec::with_capacity(part.width());
-                for column in 0..part.width() {
-                    selected.push(part.column(column)?.gather(positions)?);
-                }
-                Chunk::with_rows(selected, positions.len())
-            }
+            // Gathered where the rows are rather than out of the chunk read whole.
+            Self::Memory(rows) => rows.read_rows(at, columns, positions),
+            Self::Grown(reader, rows) => rows.read_rows(at - reader.parts(), columns, positions),
         }
     }
 
