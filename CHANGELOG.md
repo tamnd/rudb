@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.30
+
+This release has PostgreSQL work in rudb-server inside PG1, and engine speed work.
+
+#2577 adds roles in `global/roles`, `CREATE`, `ALTER` and `DROP ROLE`, `SET ROLE` and `SET SESSION AUTHORIZATION`. #2579 reads `pg_hba.conf` and `pg_ident.conf` with `trust`, `reject`, `scram-sha-256`, `md5`, `password` and `peer`, and #2581 adds `cert`, `ident` and `clientcert=verify-full`. #2580 reads `postgresql.conf` and `postgresql.auto.conf` and reloads them on SIGHUP. #2583 keeps the databases in a catalog and runs `CREATE`, `ALTER` and `DROP DATABASE`. #2585 adds the smart, fast and immediate shutdown. #2587 reuses session threads and starts each session from one copy of the settings.
+
+#2586 adds `BIGNUM` and `VARINT`. #2590 gives a column its declared PostgreSQL type and typmod in `RowDescription`. #2591 sends a list as a PostgreSQL array and reads array parameters. #2592 reads a string literal in a cast with the PostgreSQL input function of the type. #2595 gives `oid` and `"char"` their PostgreSQL types and reads `INSERT` literals by the column type. #2596 reports a bind error of the extended flow at Parse. #2598 cuts `varchar(n)`, `char(n)` and `name` on a cast and refuses a long value on a store. #2600 reads and writes `regtype`, the other OID alias types, `int2vector` and `oidvector`.
+
+#2578, #2582, #2584, #2588, #2589, #2593, #2594, #2597, #2599 and #2601 make the engine faster: a part coded as its own dictionary reads as codes, repeated counts and place totals are done once, the coded map holds a row place as a u32, key runs and join bitmaps are tested a word or eight rows at a time, packed columns and two column comparisons run in lanes, each memo group is decided on one thread, and a keyed insert builds its rows into the columns of the tail.
+
+#2602 keeps a list column in a native file. Before it, a checkpoint of a table with a list column failed. The directory gives a list column the new type tag 29, so a file with a list column does not open in an older build. Every file that an older build wrote opens as before. The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.29
 
 This release is all PostgreSQL work in rudb-server, inside PG1.
