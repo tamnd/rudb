@@ -8,6 +8,16 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.27
+
+For J7, #2559 counts a range over a string column on a sample, so no JOB estimate comes from the constant fifth of the rows, #2560 says in EXPLAIN ANALYZE whether the key sets of a consistent reduction stayed bitmaps, and #2561 lets a load use every free thread of a yielding pool. For TPC-H, #2556 adds the totals of a small map by place, with no map in the loop.
+
+On compatibility, #2550 runs a window call of a user macro the way the pin does, and #2555 adds the `query` and `query_table` table functions.
+
+For PostgreSQL, rudb-pgtypes gets more types. #2549 adds `varchar(n)`, `character(n)` and the `json` input, #2551 adds the arrays, `int2vector` and `oidvector`, #2552 adds the OID alias types and the name lists, and #2553 adds the `DataRow` encoder. rudb-server is new. #2554 adds the listeners, a thread for each session and the simple query flow, #2557 lets rudb describe a prepared statement without running it, #2558 adds the extended query flow, and #2562 adds the implicit transaction and the transaction control of PostgreSQL, with its warnings and `25P02`.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.26
 
 For ClickBench, #2541 lets the top N cutoff work through an expression over the first sort key, so `ORDER BY EventTime LIMIT 10` over the view that turns stored seconds into a timestamp no longer reads and sorts every row that its filter keeps. This changes q25 and q27.
