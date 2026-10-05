@@ -59,6 +59,7 @@ fn the_ycsb_statements_name_their_point_plans() {
 fn what_goes_through_the_plan_is_named_a_pipeline() {
     let db = Database::new();
     db.execute(SCHEMA).expect("creates");
+    let scan_sql = "SELECT * FROM usertable WHERE ycsb_key >= ? ORDER BY ycsb_key LIMIT 10";
     db.execute("CREATE TABLE checked (id BIGINT PRIMARY KEY, n BIGINT CHECK (n >= 0))")
         .expect("creates");
     db.execute("CREATE TABLE floats (x DOUBLE PRIMARY KEY, n BIGINT)").expect("creates");
@@ -83,20 +84,27 @@ fn what_goes_through_the_plan_is_named_a_pipeline() {
     let later = db.prepare("SELECT * FROM later WHERE id = ?").expect("prepares");
     db.execute("CREATE TABLE later (id INTEGER PRIMARY KEY, v VARCHAR)").expect("creates");
     assert_eq!(later.explain(), "POINT Lookup later(id)");
-    // Inside a transaction everything but an insert goes through the plan, and an insert too once
-    // the transaction is read only or aborted.
+    // Inside a transaction a read and an insert skip the plan and a write does not. Nothing does
+    // once the transaction aborts, and an insert does not in one that is read only.
     let read = db.prepare("SELECT * FROM usertable WHERE ycsb_key = ?").expect("prepares");
+    let scan = db.prepare(scan_sql).expect("prepares");
     let insert = db.prepare("INSERT INTO usertable VALUES (?, ?, ?, ?)").expect("prepares");
+    let write = db.prepare("UPDATE usertable SET field0 = ? WHERE ycsb_key = ?").expect("prepares");
     db.execute("BEGIN").expect("begins");
-    assert_eq!(read.explain(), "PIPELINE");
+    assert_eq!(read.explain(), "POINT Lookup usertable(ycsb_key)");
+    assert_eq!(scan.explain(), "Range usertable(ycsb_key)");
     assert_eq!(insert.explain(), "InsertOne usertable");
+    assert_eq!(write.explain(), "PIPELINE");
     let row = |key: &str| [key, "a", "b", "c"].map(|text| Value::Varchar(text.into()));
     insert.execute(&row("k")).expect("inserts");
     insert.execute(&row("k")).expect_err("a duplicate");
     assert_eq!(insert.explain(), "PIPELINE");
+    assert_eq!(read.explain(), "PIPELINE");
+    assert_eq!(scan.explain(), "PIPELINE");
     db.execute("ROLLBACK").expect("rolls back");
     db.execute("BEGIN TRANSACTION READ ONLY").expect("begins");
     assert_eq!(insert.explain(), "PIPELINE");
+    assert_eq!(read.explain(), "POINT Lookup usertable(ycsb_key)");
     db.execute("COMMIT").expect("commits");
     assert_eq!(read.explain(), "POINT Lookup usertable(ycsb_key)");
     assert_eq!(insert.explain(), "InsertOne usertable");

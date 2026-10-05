@@ -3954,18 +3954,17 @@ impl Shared {
     /// Runs a prepared point read without binding it, or says it cannot and leaves it to
     /// [`Shared::execute_ast`], see [`crate::prepared::Lookup`].
     ///
-    /// Outside a transaction only. Inside one the statement reads the transaction's own catalog and
-    /// can be refused for the transaction's sake, which the path through the plan sees to. A read
-    /// takes the catalog's read lock and nothing else, as [`Shared::query`] does.
+    /// Inside a transaction it reads the transaction's own catalog, taking the snapshot if the
+    /// transaction has not yet, so it sees what the transaction wrote and nothing committed since,
+    /// as the plan does there. A read claims no row, so there is nothing else to note, and an
+    /// aborted transaction never gets here, see [`Shared::in_transaction`]. A read takes the
+    /// catalog's read lock and nothing else, as [`Shared::query`] does.
     pub(crate) fn lookup(
         &self,
         lookup: &crate::prepared::Lookup,
         given: crate::prepared::Given<'_>,
         sql: &str,
     ) -> Option<Result<QueryResult>> {
-        if self.transacting() {
-            return None;
-        }
         let values =
             lookup.equal.iter().map(|(_, item)| given.value(item)).collect::<Option<Vec<_>>>()?;
         let catalog = self.read();
@@ -3999,7 +3998,7 @@ impl Shared {
     }
 
     /// Runs a prepared short range read without binding it, or says it cannot and leaves it to
-    /// [`Shared::execute_ast`], see [`crate::prepared::RangeRead`]. Outside a transaction only, as
+    /// [`Shared::execute_ast`], see [`crate::prepared::RangeRead`]. Inside a transaction too, as
     /// for [`Shared::lookup`].
     pub(crate) fn range_read(
         &self,
@@ -4008,9 +4007,6 @@ impl Shared {
         sql: &str,
     ) -> Option<Result<QueryResult>> {
         use crate::prepared::Limit;
-        if self.transacting() {
-            return None;
-        }
         let [(_, bound)] = range.lookup.equal.as_slice() else { return None };
         let bound = given.value(bound)?;
         let limit = match &range.limit {
@@ -4065,10 +4061,14 @@ impl Shared {
     /// that would not fit its column, goes through the plan whatever this says.
     pub(crate) fn point_plan(&self, shape: crate::prepared::Shape<'_>) -> Option<String> {
         use crate::prepared::Shape;
-        // Inside a transaction only an insert skips the plan, and not in one that is aborted or
-        // read only.
+        // Inside a transaction a read and an insert skip the plan, and an insert not in one that
+        // is read only. Nothing does in one that is aborted.
         let refused = match self.open().as_ref() {
-            Some(open) => open.aborted || open.read_only || !matches!(shape, Shape::Insert(_)),
+            Some(open) => match shape {
+                Shape::Lookup(_) | Shape::Range(_) => open.aborted,
+                Shape::Insert(_) => open.aborted || open.read_only,
+                Shape::Write(_) | Shape::Upsert(_) => true,
+            },
             None => false,
         };
         if refused {
