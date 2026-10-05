@@ -9200,6 +9200,12 @@ impl Reader {
     /// strings at all. In TPC-H q13 that is `o_comment NOT LIKE '%special%requests%'`, and
     /// decompressing the comments and searching them was most of the orders scan.
     ///
+    /// Without a sketch to pass over most rows this walks every code of the part, which beats
+    /// decoding the part once and loses to a part decoded and held. So it pays the rent of a whole
+    /// read and steps aside once the part is held, the way [`Reader::rows_equal`] does. On JOB a
+    /// warm `count(*)` of `name` with `LIKE '%Downey%Robert%'` walked the codes in 100 to 130 ms
+    /// where the held names took 40 to 48 ms.
+    ///
     /// # Errors
     ///
     /// If a part, column, page, or checksum is invalid.
@@ -9217,9 +9223,29 @@ impl Reader {
             return Ok(None);
         }
         let rows = place.rows as usize;
+        // A row whose sketch lacks a bit the pieces need cannot hold them, so only the rest are
+        // walked, for each pattern. See `grams`.
+        let first = self.firsts.get(part).copied().unwrap_or_default();
+        let sketch = self
+            .text_grams
+            .get(column)
+            .and_then(|slot| slot.get_or_init(|| grams::text_grams(self, column)).as_deref())
+            .and_then(|words| words.get(first..first + rows));
+        if sketch.is_none()
+            && let Some(Ok(slot)) = self.cache.made(column, part).map(Mutex::lock)
+        {
+            match *slot {
+                PartSlot::Held { .. } => return Ok(None),
+                PartSlot::Seen(before) if before >= rows => return Ok(None),
+                PartSlot::Seen(_) | PartSlot::Unseen => {}
+            }
+        }
         self.with_part(part, column, |bytes| {
             if bytes.first() != Some(&6) {
                 return Ok(None);
+            }
+            if sketch.is_none() {
+                self.pay(part, column, rows);
             }
             let mut cur = Cursor::new(bytes);
             cur.u8()?;
@@ -9233,14 +9259,6 @@ impl Reader {
                 }
                 _ => return Err(invalid("page validity tag differs")),
             };
-            // A row whose sketch lacks a bit the pieces need cannot hold them, so only the rest
-            // are walked, for each pattern. See `grams`.
-            let first = self.firsts.get(part).copied().unwrap_or_default();
-            let sketch = self
-                .text_grams
-                .get(column)
-                .and_then(|slot| slot.get_or_init(|| grams::text_grams(self, column)).as_deref())
-                .and_then(|words| words.get(first..first + rows));
             let mut held = vec![false; rows];
             for sequence in sequences {
                 let needs = sequence.needs();
@@ -20956,6 +20974,46 @@ mod tests {
         a.read(0, &[0]).expect("a part");
         assert!(matches!(*slot(), PartSlot::Held { .. }), "to a read that holds the part");
         assert_eq!(a.rows_equal(0, 0, &literals).expect("answered"), None, "and stays out");
+        drop((a, catalog));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A `LIKE` on compressed text with no sketch pays toward holding the part the way a whole read
+    /// does, and leaves the part to the usual read once that read would hold it, and after.
+    #[test]
+    fn a_like_on_the_compressed_text_gives_way_to_the_held_part() {
+        let path = path("like-held");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        let words = ["carefully", "final", "deposits", "sleep", "furiously", "quickly", "among"];
+        // All of them new, so the column drops its dictionary and the part is compressed text, and
+        // short, so no sketch is kept for them and every code is walked.
+        let text: Vec<Value> = (0..5_000_usize)
+            .map(|row| Value::Varchar(format!("{} {row}", words[row % words.len()])))
+            .collect();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::Varchar, &text).expect("text")])
+                .expect("one column");
+        writer.append(&chunk).expect("one part");
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("items").expect("items");
+        let sequence = Sequence::new(&[b"sleep 3".as_slice()]).expect("a sequence");
+        let like = || a.rows_holding(0, 0, slice::from_ref(&sequence), false).expect("answered");
+        let rows = a.part_rows(0);
+        let wanted: Vec<u32> = (0..u32::try_from(rows).expect("a part"))
+            .filter(|&row| row % 7 == 3 && row.to_string().starts_with('3'))
+            .collect();
+        assert_eq!(like(), Some(wanted), "a first LIKE walks the codes");
+        let slot = || a.cache.slot(0, 0).expect("made").lock().expect("the slot");
+        assert!(matches!(*slot(), PartSlot::Seen(paid) if paid >= rows), "and pays a whole read");
+        assert_eq!(like(), None, "then gives way");
+        a.read(0, &[0]).expect("a part");
+        assert!(matches!(*slot(), PartSlot::Held { .. }), "to a read that holds the part");
+        assert_eq!(like(), None, "and stays out");
         drop((a, catalog));
         fs::remove_file(path).expect("remove scratch file");
     }
