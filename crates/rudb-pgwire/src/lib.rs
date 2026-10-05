@@ -24,12 +24,18 @@
 //!
 //! [`ProtocolError`], which has the SQLSTATE, the text of PostgreSQL for the same bytes, and the
 //! [`Level`] that tells the server whether to go on, to send `FATAL`, or to close without a word.
+//! [`OutBuf::protocol_error`] writes it in the format the client expects.
+//!
+//! [`Handshake`], the start of a connection up to authentication: the answers to `SSLRequest` and
+//! `GSSENCRequest`, the check for unencrypted bytes after them, the version check, the
+//! parameters of the `StartupMessage` and `NegotiateProtocolVersion`. It gives a
+//! [`StartupRequest`] with the user, the database and the settings.
 //!
 //! # What is not here yet
 //!
-//! The state machine of a session (startup, negotiation of 3.0 and 3.2, the simple and extended
-//! flows, the skip to `Sync` after an error), the SCRAM arithmetic and the cancel key. They come
-//! in the next steps of milestone PG1, in this order.
+//! Authentication and the SCRAM arithmetic, the simple and extended flows with the skip to `Sync`
+//! after an error, and the cancel key. They come in the next steps of milestone PG1, in this
+//! order.
 //!
 //! # A known difference
 //!
@@ -43,6 +49,7 @@ mod error;
 mod frame;
 mod frontend;
 mod reader;
+mod startup;
 
 pub use backend::{Authentication, Backend, Field, Mark, OutBuf, TransactionStatus};
 pub use error::{Level, PROTOCOL_VIOLATION, ProtocolError};
@@ -56,3 +63,4 @@ pub use frontend::{
     Bind, BindBody, Formats, Frontend, FunctionCall, FunctionCallBody, Oids, Target, ValueIter,
     Values, encode_oids,
 };
+pub use startup::{Encryption, Handshake, NAME_LIMIT, Replication, StartupRequest, Step};

@@ -172,8 +172,21 @@ impl<'a> Startup<'a> {
     /// A packet that does not end with the zero byte right after the last pair. This is the
     /// check of `ProcessStartupPacket`, which also finds a name without a value this way.
     pub fn params(&self) -> Result<Vec<Param<'a>>, ProtocolError> {
-        let options = self.options;
         let mut params = Vec::new();
+        self.scan(|name, value| {
+            params.push((name, value));
+            Ok(())
+        })?;
+        Ok(params)
+    }
+
+    /// Gives each parameter to `each` as it reads it, and checks the layout at the end. An error
+    /// from `each` stops the scan, so it comes before an error in the layout, as in PostgreSQL.
+    pub(crate) fn scan(
+        &self,
+        mut each: impl FnMut(&'a [u8], &'a [u8]) -> Result<(), ProtocolError>,
+    ) -> Result<(), ProtocolError> {
+        let options = self.options;
         let mut at = 0;
         // PostgreSQL reads the packet into a buffer with one more zero byte at the end, so a
         // string that runs to the end of the packet still ends.
@@ -191,7 +204,7 @@ impl<'a> Startup<'a> {
                 break;
             }
             let value = string(value_at);
-            params.push((name, value));
+            each(name, value)?;
             at = value_at + value.len() + 1;
         }
         if at + 1 != options.len() {
@@ -199,7 +212,7 @@ impl<'a> Startup<'a> {
                 "invalid startup packet layout: expected terminator as last byte",
             ));
         }
-        Ok(params)
+        Ok(())
     }
 }
 
