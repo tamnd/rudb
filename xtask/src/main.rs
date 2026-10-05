@@ -183,7 +183,7 @@ fn usage() {
         "  gen-grammar [--check]  regenerate the parser's and rudb-common's tables from that grammar"
     );
     println!("  pg-vendor <checkout>  copy the PostgreSQL files from a checkout at the pin and");
-    println!("           regenerate the SQLSTATE list from them");
+    println!("           regenerate the SQLSTATE list and the command tags from them");
     println!("  pg-check the vendored PostgreSQL files match VENDOR and the generated files match");
     println!("           what their generators write today");
     println!("  gen-unicode <utf8proc_data.cpp> [--check]  regenerate the grapheme break and");

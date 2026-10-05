@@ -6,8 +6,9 @@
 //! same step. `cargo xtask pg-check` checks that every vendored file matches its hash and that
 //! every generated file matches what its generator writes today. The gate runs the check.
 //!
-//! The plan is `16-crate-layout.md` section 16.5 of the PostgreSQL compatibility notes. Today the
-//! only vendored file is `errcodes.txt`, which gives the SQLSTATE list of `rudb-common`.
+//! The plan is `16-crate-layout.md` section 16.5 of the PostgreSQL compatibility notes. Today
+//! there are two vendored files: `errcodes.txt` gives the SQLSTATE list of `rudb-common`, and
+//! `cmdtaglist.h` gives the command tags of `rudb-pgwire`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -16,13 +17,50 @@ use std::process::Command;
 
 use crate::sha256;
 
-/// Where the files that `rudb-common` needs live, relative to the workspace root.
-const COMMON: &str = "crates/rudb-common/vendor";
-/// The generated SQLSTATE list, relative to the workspace root.
-const SQLSTATE: &str = "crates/rudb-common/src/generated/sqlstate.rs";
-/// The files copied into [`COMMON`], as the path in the checkout and the name in the tree.
-const FILES: [(&str, &str); 2] =
-    [("src/backend/utils/errcodes.txt", "errcodes.txt"), ("COPYRIGHT", "LICENSE.postgres")];
+/// One vendor directory, relative to the workspace root, and the files copied into it as the path
+/// in the checkout and the name in the tree.
+struct Vendor {
+    dir: &'static str,
+    files: &'static [(&'static str, &'static str)],
+}
+
+const VENDORS: [Vendor; 2] = [
+    Vendor {
+        dir: "crates/rudb-common/vendor",
+        files: &[
+            ("src/backend/utils/errcodes.txt", "errcodes.txt"),
+            ("COPYRIGHT", "LICENSE.postgres"),
+        ],
+    },
+    Vendor {
+        dir: "crates/rudb-pgwire/vendor",
+        files: &[
+            ("src/include/tcop/cmdtaglist.h", "cmdtaglist.h"),
+            ("COPYRIGHT", "LICENSE.postgres"),
+        ],
+    },
+];
+
+/// One generated file: where it goes, the vendored file it comes from, both relative to the
+/// workspace root, and the generator.
+struct Generated {
+    output: &'static str,
+    input: &'static str,
+    generate: fn(&str) -> Result<String, String>,
+}
+
+const GENERATED: [Generated; 2] = [
+    Generated {
+        output: "crates/rudb-common/src/generated/sqlstate.rs",
+        input: "crates/rudb-common/vendor/errcodes.txt",
+        generate: sqlstate,
+    },
+    Generated {
+        output: "crates/rudb-pgwire/src/generated/cmdtag.rs",
+        input: "crates/rudb-pgwire/vendor/cmdtaglist.h",
+        generate: cmdtag,
+    },
+];
 
 /// Copies the files from a PostgreSQL checkout and regenerates the Rust made from them.
 pub(crate) fn vendor(checkout: Option<&str>) -> Result<(), String> {
@@ -33,75 +71,87 @@ pub(crate) fn vendor(checkout: Option<&str>) -> Result<(), String> {
     let commit = git(checkout, &["rev-parse", "HEAD"])?;
     let version = version(&read(&checkout.join("meson.build"))?)?;
     let root = crate::root();
-    let dest = root.join(COMMON);
-    std::fs::create_dir_all(&dest).map_err(|e| format!("could not make {COMMON}: {e}"))?;
 
-    let mut sums = String::new();
-    for (from, name) in FILES {
-        let data = std::fs::read(checkout.join(from))
-            .map_err(|e| format!("could not read {from} in {}: {e}", checkout.display()))?;
-        std::fs::write(dest.join(name), &data)
-            .map_err(|e| format!("could not write {COMMON}/{name}: {e}"))?;
-        let _ = writeln!(sums, "{}  {name}", sha256::hex(&data));
+    let mut copied = 0;
+    for vendor in &VENDORS {
+        let dir = vendor.dir;
+        let dest = root.join(dir);
+        std::fs::create_dir_all(&dest).map_err(|e| format!("could not make {dir}: {e}"))?;
+        let mut sums = String::new();
+        for (from, name) in vendor.files {
+            let data = std::fs::read(checkout.join(from))
+                .map_err(|e| format!("could not read {from} in {}: {e}", checkout.display()))?;
+            std::fs::write(dest.join(name), &data)
+                .map_err(|e| format!("could not write {dir}/{name}: {e}"))?;
+            let _ = writeln!(sums, "{}  {name}", sha256::hex(&data));
+            copied += 1;
+        }
+        let manifest = format!(
+            "# PostgreSQL files, copied from the pin without changes. `cargo xtask pg-vendor` is the\n\
+             # only thing that writes here and `cargo xtask pg-check` checks that nothing else did.\n\
+             #\n\
+             # License: the PostgreSQL License, see LICENSE.postgres.\n\
+             \n\
+             upstream: https://git.postgresql.org/git/postgresql.git\n\
+             commit: {commit}\n\
+             version: {version}\n\
+             \n\
+             # sha256 of every vendored file, relative to this directory.\n\
+             {sums}"
+        );
+        std::fs::write(dest.join("VENDOR"), manifest)
+            .map_err(|e| format!("could not write {dir}/VENDOR: {e}"))?;
     }
-    let manifest = format!(
-        "# PostgreSQL files, copied from the pin without changes. `cargo xtask pg-vendor` is the\n\
-         # only thing that writes here and `cargo xtask pg-check` checks that nothing else did.\n\
-         #\n\
-         # License: the PostgreSQL License, see LICENSE.postgres.\n\
-         \n\
-         upstream: https://git.postgresql.org/git/postgresql.git\n\
-         commit: {commit}\n\
-         version: {version}\n\
-         \n\
-         # sha256 of every vendored file, relative to this directory.\n\
-         {sums}"
-    );
-    std::fs::write(dest.join("VENDOR"), manifest)
-        .map_err(|e| format!("could not write {COMMON}/VENDOR: {e}"))?;
 
-    let errcodes = read(&root.join(COMMON).join("errcodes.txt"))?;
-    let generated = sqlstate(&errcodes)?;
-    std::fs::write(root.join(SQLSTATE), generated)
-        .map_err(|e| format!("could not write {SQLSTATE}: {e}"))?;
-    println!("vendored {} files at {version} ({commit}) and wrote {SQLSTATE}", FILES.len());
+    for generated in &GENERATED {
+        let text = (generated.generate)(&read(&root.join(generated.input))?)?;
+        std::fs::write(root.join(generated.output), text)
+            .map_err(|e| format!("could not write {}: {e}", generated.output))?;
+        println!("wrote {}", generated.output);
+    }
+    println!("vendored {copied} files at {version} ({commit})");
     Ok(())
 }
 
 /// Checks the vendored files against `VENDOR` and the generated files against their generators.
 pub(crate) fn check() -> Result<(), String> {
     let root = crate::root();
-    let dest = root.join(COMMON);
-    let recorded = manifest(&read(&dest.join("VENDOR"))?);
-    if recorded.is_empty() {
-        return Err(format!("{COMMON}/VENDOR records no checksums"));
-    }
-
     let mut problems = Vec::new();
-    for (name, sum) in &recorded {
-        match std::fs::read(dest.join(name)) {
-            Err(_) => problems.push(format!("{COMMON}/{name} is in VENDOR and is not there")),
-            Ok(data) if sha256::hex(&data) != *sum => {
-                problems.push(format!("{COMMON}/{name} is not the file VENDOR records"));
-            }
-            Ok(_) => {}
+    for vendor in &VENDORS {
+        let dir = vendor.dir;
+        let dest = root.join(dir);
+        let recorded = manifest(&read(&dest.join("VENDOR"))?);
+        if recorded.is_empty() {
+            return Err(format!("{dir}/VENDOR records no checksums"));
         }
-    }
-    let present = std::fs::read_dir(&dest).map_err(|e| format!("could not list {COMMON}: {e}"))?;
-    for entry in present.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name != "VENDOR" && !recorded.contains_key(&name) {
-            problems.push(format!("{COMMON}/{name} is in the tree and not in VENDOR"));
+        for (name, sum) in &recorded {
+            match std::fs::read(dest.join(name)) {
+                Err(_) => problems.push(format!("{dir}/{name} is in VENDOR and is not there")),
+                Ok(data) if sha256::hex(&data) != *sum => {
+                    problems.push(format!("{dir}/{name} is not the file VENDOR records"));
+                }
+                Ok(_) => {}
+            }
+        }
+        let present = std::fs::read_dir(&dest).map_err(|e| format!("could not list {dir}: {e}"))?;
+        for entry in present.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name != "VENDOR" && !recorded.contains_key(&name) {
+                problems.push(format!("{dir}/{name} is in the tree and not in VENDOR"));
+            }
         }
     }
 
-    let errcodes = read(&dest.join("errcodes.txt"))?;
-    if read(&root.join(SQLSTATE))?.replace("\r\n", "\n") != sqlstate(&errcodes)? {
-        problems.push(format!("{SQLSTATE} is not what errcodes.txt generates"));
+    for generated in &GENERATED {
+        let expected = (generated.generate)(&read(&root.join(generated.input))?)?;
+        if read(&root.join(generated.output))?.replace("\r\n", "\n") != expected {
+            problems
+                .push(format!("{} is not what {} generates", generated.output, generated.input));
+        }
     }
 
     if problems.is_empty() {
-        println!("the PostgreSQL files match VENDOR and the generated SQLSTATE list matches them");
+        println!("the PostgreSQL files match VENDOR and the generated files match them");
         return Ok(());
     }
     for problem in &problems {
@@ -239,6 +289,88 @@ fn sqlstate(text: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// Renders the command tag list from the text of `cmdtaglist.h`.
+///
+/// Each line that is not a comment is `PG_CMDTAG(symbol, "name", event_trigger_ok,
+/// table_rewrite_ok, rowcount)`. The file keeps the lines sorted by name, so that PostgreSQL can
+/// search it, and the generator refuses a file that is not sorted. The name of a variant is the
+/// symbol without `CMDTAG_`, in camel case.
+fn cmdtag(text: &str) -> Result<String, String> {
+    let mut tags: Vec<(String, &str, [&str; 3])> = Vec::new();
+    let mut comment = false;
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if comment || line.starts_with("/*") {
+            comment = !line.ends_with("*/");
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let bad = || format!("cmdtaglist.h line {}: not a PG_CMDTAG line: {line}", number + 1);
+        let Some(args) = line.strip_prefix("PG_CMDTAG(").and_then(|l| l.strip_suffix(')')) else {
+            return Err(bad());
+        };
+        let Some((symbol, rest)) = args.split_once(", \"") else { return Err(bad()) };
+        let Some((name, flags)) = rest.split_once("\", ") else { return Err(bad()) };
+        let flags: Vec<&str> = flags.split(", ").collect();
+        let Some(symbol) = symbol.strip_prefix("CMDTAG_") else { return Err(bad()) };
+        if flags.len() != 3
+            || flags.iter().any(|f| !matches!(*f, "true" | "false"))
+            || !name.bytes().all(|b| b.is_ascii_uppercase() || b == b' ' || b == b'?')
+        {
+            return Err(bad());
+        }
+        if let Some(last) = tags.last()
+            && last.1 >= name
+        {
+            return Err(format!("cmdtaglist.h line {}: {name} is out of order", number + 1));
+        }
+        let variant: String = symbol
+            .split('_')
+            .map(|word| word[..1].to_string() + &word[1..].to_ascii_lowercase())
+            .collect();
+        tags.push((variant, name, [flags[0], flags[1], flags[2]]));
+    }
+
+    let mut out = String::from(
+        "//! The command tags of PostgreSQL, one for each line of `cmdtaglist.h`.\n\
+         //!\n\
+         //! @generated by `cargo xtask pg-vendor` from `crates/rudb-pgwire/vendor/cmdtaglist.h`.\n\
+         //! Do not edit. `cargo xtask pg-check` runs in the gate and fails if this file and the\n\
+         //! vendored file disagree.\n\
+         \n\
+         /// The tag of a statement, which `CommandComplete` sends. The variants are in the order of\n\
+         /// `cmdtaglist.h`, which is the order of the names.\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]\n\
+         pub enum CommandTag {\n",
+    );
+    for (variant, name, _) in &tags {
+        let _ = writeln!(out, "    /// `{name}`.\n    {variant},");
+    }
+    out.push_str("}\n\n");
+    let _ = writeln!(
+        out,
+        "/// Every tag in the order of the enum: the tag, the name, and the flags `event_trigger_ok`,\n\
+         /// `table_rewrite_ok` and `rowcount`.\n\
+         pub(crate) static TAGS: [(CommandTag, &str, bool, bool, bool); {}] = [",
+        tags.len()
+    );
+    for (variant, name, [event, rewrite, rows]) in &tags {
+        let line = format!("    (CommandTag::{variant}, \"{name}\", {event}, {rewrite}, {rows}),");
+        if line.len() <= 100 {
+            let _ = writeln!(out, "{line}");
+        } else {
+            let _ = writeln!(
+                out,
+                "    (\n        CommandTag::{variant},\n        \"{name}\",\n        {event},\n        {rewrite},\n        {rows},\n    ),"
+            );
+        }
+    }
+    out.push_str("];\n");
+    Ok(out)
+}
+
 /// The version in the `project()` call of the top `meson.build`, for example `19beta4`.
 fn version(meson: &str) -> Result<String, String> {
     meson
@@ -287,7 +419,7 @@ fn git(checkout: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{manifest, sqlstate, version};
+    use super::{cmdtag, manifest, sqlstate, version};
 
     const SAMPLE: &str = "\
 # A comment.
@@ -334,5 +466,26 @@ Section: Class 3D - Invalid Catalog Name
         let found = manifest("# c\ncommit: abc\n\nffff  errcodes.txt\n");
         assert_eq!(found.len(), 1);
         assert_eq!(found.get("errcodes.txt").map(String::as_str), Some("ffff"));
+    }
+
+    #[test]
+    fn the_command_tags_become_variants_and_rows() {
+        let text = "/*\n * a comment\n */\n\n\
+                    PG_CMDTAG(CMDTAG_UNKNOWN, \"???\", false, false, false)\n\
+                    PG_CMDTAG(CMDTAG_ALTER_ACCESS_METHOD, \"ALTER ACCESS METHOD\", true, false, false)\n\
+                    PG_CMDTAG(CMDTAG_INSERT, \"INSERT\", false, false, true)\n";
+        let out = cmdtag(text).expect("the sample parses");
+        assert!(out.contains("    /// `???`.\n    Unknown,\n"));
+        assert!(out.contains("    AlterAccessMethod,\n"));
+        assert!(out.contains("TAGS: [(CommandTag, &str, bool, bool, bool); 3]"));
+        assert!(out.contains("    (CommandTag::Insert, \"INSERT\", false, false, true),\n"));
+    }
+
+    #[test]
+    fn a_command_tag_out_of_order_is_refused() {
+        let text = "PG_CMDTAG(CMDTAG_INSERT, \"INSERT\", false, false, true)\n\
+                    PG_CMDTAG(CMDTAG_DELETE, \"DELETE\", false, false, true)\n";
+        assert!(cmdtag(text).is_err());
+        assert!(cmdtag("PG_CMDTAG(CMDTAG_X, \"X\", maybe, false, true)\n").is_err());
     }
 }
