@@ -21,6 +21,7 @@ mod server;
 mod session;
 mod stream;
 mod tls;
+mod x509;
 
 pub use config::Config;
 pub use roles::os_user;
