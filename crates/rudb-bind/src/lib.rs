@@ -37,6 +37,7 @@ mod unnest;
 
 pub use binder::{bind, bind_sql, bind_sql_with, bind_with};
 pub use parameters::{Capture, Caught, Parameters, Written};
+pub use macros::kept_macro;
 pub use statement::{
     Attach, Bound, Call, Checks, Conflict, ConflictAction, CopyTo, CreateTable, CreateView,
     DropTable, Insert, MacroChange, SchemaChange, SequenceChange, TriggerChange, TypeChange, Write, bind_checks,

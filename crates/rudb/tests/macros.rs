@@ -1,6 +1,8 @@
 //! `CREATE MACRO`, `DROP MACRO` and the calls that expand them. Every expected answer here was
 //! taken from the pinned duckdb binary, v2.0.0-dev84237.
 
+use std::path::{Path, PathBuf};
+
 use rudb::Database;
 
 fn answered(database: &Database, sql: &str) -> Vec<String> {
@@ -50,6 +52,49 @@ fn a_table_macro_is_read_in_a_from_clause() {
     assert_eq!(answered(&database, "SELECT * FROM numbers(3)"), ["0", "1", "2"]);
     assert_eq!(answered(&database, "SELECT q.v FROM numbers(2) AS q"), ["0", "1"]);
     assert_eq!(answered(&database, "SELECT w FROM numbers(1) AS q(w)"), ["0"]);
+}
+
+fn path(tag: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("rudb-macros-{tag}-{}.rudb", std::process::id()));
+    remove(&path);
+    path
+}
+
+fn remove(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let mut wal = path.as_os_str().to_owned();
+    wal.push(".wal");
+    let _ = std::fs::remove_dir_all(PathBuf::from(wal));
+}
+
+fn open(path: &Path) -> Database {
+    Database::open(path.to_str().expect("a UTF-8 path")).expect("the database opens")
+}
+
+#[test]
+fn a_database_file_keeps_its_macros() {
+    let path = path("kept");
+    {
+        let database = open(&path);
+        database.execute("CREATE TABLE t (x INTEGER)").expect("the table");
+        database.execute("INSERT INTO t VALUES (1), (2)").expect("rows");
+        database.execute("CREATE MACRO total(x) AS sum(x) + 1").expect("the aggregating macro");
+        database
+            .execute(
+                "CREATE MACRO m(\"select\" INTEGER, b := 10) AS \"select\" + b, (s VARCHAR) AS s",
+            )
+            .expect("the overloaded macro");
+        database.execute("CREATE MACRO m() AS TABLE SELECT x FROM t").expect("the table macro");
+        database.execute("CREATE MACRO gone(x) AS x").expect("a macro to drop");
+        database.execute("DROP MACRO gone").expect("dropped");
+    }
+    let database = open(&path);
+    assert_eq!(answered(&database, "SELECT total(x) FROM t"), ["4"]);
+    assert_eq!(answered(&database, "SELECT m(1), m(1, b := 2), m('s')"), ["11|3|s"]);
+    assert_eq!(answered(&database, "SELECT * FROM m()"), ["1", "2"]);
+    refused(&database, "SELECT gone(1)", "Catalog Error: Scalar Function with name gone");
+    drop(database);
+    remove(&path);
 }
 
 #[test]
