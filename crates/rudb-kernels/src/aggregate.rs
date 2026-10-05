@@ -2854,18 +2854,23 @@ impl PlaceSums {
         let (width, span) = (self.calls.len(), cell_span(self.calls.len()));
         let used = self.by_place.len().min((map.len() + 1) * span);
         self.touched.clear();
-        let mut unseen = false;
-        for (place, cells) in self.by_place[..used].chunks_exact_mut(span).enumerate() {
-            if cells[width] == 0 {
-                continue;
+        // Only the count of each place is read, as every `span`th cell, since asking each place's
+        // cells whether it had rows was ten instructions a place and q01 has 3468 of them a chunk.
+        let counts = self.by_place[..used].get(width..).unwrap_or_default();
+        for (place, &count) in counts.iter().step_by(span).enumerate() {
+            if count != 0 {
+                self.touched.push(place);
             }
-            match map.get(place) {
-                Some(&held) => {
-                    unseen |= held == UNSEEN;
-                    self.touched.push(place);
-                }
-                // The rows the filter dropped.
-                None => cells.fill(0),
+        }
+        let mut unseen = false;
+        for &place in &self.touched {
+            unseen |= map.get(place).is_some_and(|&held| held == UNSEEN);
+        }
+        // The rows the filter dropped.
+        if self.touched.last() == Some(&map.len()) {
+            self.touched.pop();
+            if let Some(cells) = self.by_place.get_mut(map.len() * span..used) {
+                cells.fill(0);
             }
         }
         if self.by_place[used..].iter().any(|&cell| cell != 0) {
@@ -2926,25 +2931,27 @@ fn fold_cells(
 
 /// Gives every row between the first and the last of `kept` that `kept` skips the place `combos`.
 ///
-/// A list of rows with no gap in it ends as many rows after its first as it is long, so the list
-/// is cut in two only while a half has a gap, and the rows are never visited one by one. On q01
-/// about one row in seventy is dropped, and a walk of the kept rows to find the gaps was about seven
-/// instructions a row.
+/// A list of rows with no gap in it ends as many rows after its first as it is long, so the rows
+/// are looked at nine at a time, eight steps of the list, and only a window with a gap in it is
+/// looked at a row at a time. On q01 about one row in seventy is dropped. A walk of the kept rows
+/// to find the gaps was about seven instructions a row, and cutting the list in two while a half
+/// had a gap was about 13 steps a gap.
 fn fill_dropped(kept: &[u32], places: &mut [usize], combos: usize) {
-    let (Some(&first), Some(&last)) = (kept.first(), kept.last()) else { return };
-    let (first, last) = (first as usize, last as usize);
-    if last - first < kept.len() {
-        return;
-    }
-    if kept.len() == 2 {
-        if let Some(dropped) = places.get_mut(first + 1..last) {
-            dropped.fill(combos);
+    let mut start = 0;
+    while start + 1 < kept.len() {
+        let end = (start + 8).min(kept.len() - 1);
+        if (kept[end] - kept[start]) as usize != end - start {
+            for pair in kept[start..=end].windows(2) {
+                let (row, next) = (pair[0] as usize, pair[1] as usize);
+                if next != row + 1
+                    && let Some(dropped) = places.get_mut(row + 1..next)
+                {
+                    dropped.fill(combos);
+                }
+            }
         }
-        return;
+        start = end;
     }
-    let middle = kept.len() / 2;
-    fill_dropped(&kept[..=middle], places, combos);
-    fill_dropped(&kept[middle..], places, combos);
 }
 
 /// The most cells [`PlaceSums::add_places`] keeps, 512 KiB of them.
@@ -6462,10 +6469,10 @@ mod tests {
         }
     }
 
-    /// The rows a filter dropped are found by cutting the kept rows in two wherever a half has a gap,
-    /// and that finds the same rows as walking them, at the ends and in runs of one and of several.
+    /// The rows a filter dropped are found by looking at the kept rows nine at a time, and that finds
+    /// the same rows as walking them, at the ends and in runs of one and of several.
     #[test]
-    fn the_dropped_rows_found_by_halves_are_the_ones_a_walk_finds() {
+    fn the_dropped_rows_found_a_window_at_a_time_are_the_ones_a_walk_finds() {
         let mut rng = Rng(0x5eed_0115_d40b);
         for rows in [1, 2, 7, 64, 300] {
             for every in [2, 3, 70, 1000] {
