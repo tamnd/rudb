@@ -276,8 +276,8 @@ pub(crate) struct Target {
     pub(crate) name: QualifiedName,
     pub(crate) key: Vec<usize>,
     pub(crate) columns: Vec<usize>,
-    pub(crate) names: Vec<String>,
-    pub(crate) types: Vec<LogicalType>,
+    pub(crate) names: Arc<[String]>,
+    pub(crate) types: Arc<[LogicalType]>,
     /// Whether a column may hold a `TIMESTAMPTZ`, which is the one kind of value a result needs
     /// the session to write.
     pub(crate) zoned: bool,
