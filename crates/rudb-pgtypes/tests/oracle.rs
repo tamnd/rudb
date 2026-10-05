@@ -15,6 +15,12 @@
 //! `oidvector`. The output of both is the hex of the binary form, a space and the text form.
 //! `arrayhex` and `vectorhex` have the hex of the input and the hex of the output. A `format` line
 //! has an OID and the name that `format_type` gives it.
+//!
+//! A type that starts with `reg` is the text input and output of an OID alias type, and the
+//! output is `ERROR NAME` when the input is a name for the catalog to find. A `names` line has a
+//! name list as `regclass` reads it and the parts with a dot between them. The output starts with
+//! `rel` for one or two parts, `db` for three parts and `many` for more, as the errors of
+//! `regclass` for a name that is not found give them.
 
 use rudb_pgtypes::*;
 
@@ -344,6 +350,23 @@ fn run(type_name: &str, setting: &str, input: &str) -> String {
     }
     if let Some(rest) = type_name.strip_prefix("vector ") {
         return error_text(vector(rest, input));
+    }
+    if let Some(rest) = type_name.strip_prefix("reg ") {
+        let kind = RegKind::ALL.into_iter().find(|kind| kind.type_name() == rest).unwrap();
+        return error_text(reg_in(kind, input).map(|value| match value {
+            RegInput::Oid(oid) => text(|out| reg_out_oid(kind, oid, out)),
+            RegInput::Name(_) => "ERROR NAME".to_owned(),
+        }));
+    }
+    if type_name == "names" {
+        return error_text(qualified_name_list(input).map(|names| {
+            let class = match names.len() {
+                1 | 2 => "rel",
+                3 => "db",
+                _ => "many",
+            };
+            format!("{class} {}", names.join("."))
+        }));
     }
     if type_name == "format" {
         return format_type(input.parse().unwrap()).into_owned();

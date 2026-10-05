@@ -56,6 +56,11 @@
 //! names in that error. `int2vector` and `oidvector` are arrays with the lower bound 0 and a text
 //! form with spaces, in [`int2vector_in`], [`oidvector_in`] and the functions beside them.
 //!
+//! [`RegKind`], the OID alias types such as `regclass` and `regtype`. [`reg_in`] reads a number or
+//! `-` as PostgreSQL does and gives any other string as a name, and [`reg_out_oid`] writes OID 0
+//! and an OID with no object. The catalog finds the names: it splits a name such as
+//! `schema.table` with [`qualified_name_list`] and writes the names of the objects.
+//!
 //! [`Recv`], the binary input of a `Bind` parameter, with the errors of PostgreSQL when the value
 //! is too short or too long. The binary output of the other types is the value in big-endian bytes.
 //!
@@ -82,6 +87,7 @@ mod generated;
 mod json;
 mod number;
 mod numeric;
+mod reg;
 mod scalar;
 mod string;
 mod types;
@@ -110,6 +116,9 @@ pub use number::{int_out, int2_in, int4_in, int8_in, oid_in, oid_out, u64_out};
 pub use numeric::{
     Numeric, NumericSign, decimal_out, decimal_send, numeric_in, numeric_out, numeric_recv,
     numeric_send,
+};
+pub use reg::{
+    RegInput, RegKind, qualified_name_list, reg_in, reg_out_oid, split_identifier_string,
 };
 pub use scalar::{
     ByteaOutput, NAME_MAX_BYTES, bool_in, bool_out, bytea_in, bytea_out, char_in, char_out,

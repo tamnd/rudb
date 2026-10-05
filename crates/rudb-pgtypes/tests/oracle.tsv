@@ -8465,3 +8465,289 @@ format		829	macaddr
 format		83	pg_class
 format		869	inet
 format		9999	???
+reg regclass			ERROR NAME
+reg regclass		 	ERROR NAME
+reg regclass		 8	ERROR NAME
+reg regclass		+8	ERROR NAME
+reg regclass		-	-
+reg regclass		--	ERROR NAME
+reg regclass		-8	ERROR NAME
+reg regclass		0	-
+reg regclass		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regclass		010	8
+reg regclass		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regclass		0b1	ERROR NAME
+reg regclass		0x10	ERROR NAME
+reg regclass		1e3	ERROR NAME
+reg regclass		3000000000	3000000000
+reg regclass		4294967295	4294967295
+reg regclass		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regclass		8	8
+reg regclass		8 	ERROR NAME
+reg regclass		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regclass		٣	ERROR NAME
+reg regcollation			ERROR NAME
+reg regcollation		 	ERROR NAME
+reg regcollation		 8	ERROR NAME
+reg regcollation		+8	ERROR NAME
+reg regcollation		-	-
+reg regcollation		--	ERROR NAME
+reg regcollation		-8	ERROR NAME
+reg regcollation		0	-
+reg regcollation		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regcollation		010	8
+reg regcollation		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regcollation		0b1	ERROR NAME
+reg regcollation		0x10	ERROR NAME
+reg regcollation		1e3	ERROR NAME
+reg regcollation		3000000000	3000000000
+reg regcollation		4294967295	4294967295
+reg regcollation		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regcollation		8	8
+reg regcollation		8 	ERROR NAME
+reg regcollation		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regcollation		٣	ERROR NAME
+reg regconfig			ERROR NAME
+reg regconfig		 	ERROR NAME
+reg regconfig		 8	ERROR NAME
+reg regconfig		+8	ERROR NAME
+reg regconfig		-	-
+reg regconfig		--	ERROR NAME
+reg regconfig		-8	ERROR NAME
+reg regconfig		0	-
+reg regconfig		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regconfig		010	8
+reg regconfig		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regconfig		0b1	ERROR NAME
+reg regconfig		0x10	ERROR NAME
+reg regconfig		1e3	ERROR NAME
+reg regconfig		3000000000	3000000000
+reg regconfig		4294967295	4294967295
+reg regconfig		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regconfig		8	8
+reg regconfig		8 	ERROR NAME
+reg regconfig		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regconfig		٣	ERROR NAME
+reg regdatabase			ERROR NAME
+reg regdatabase		 	ERROR NAME
+reg regdatabase		 8	ERROR NAME
+reg regdatabase		+8	ERROR NAME
+reg regdatabase		-	-
+reg regdatabase		--	ERROR NAME
+reg regdatabase		-8	ERROR NAME
+reg regdatabase		0	-
+reg regdatabase		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regdatabase		010	8
+reg regdatabase		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regdatabase		0b1	ERROR NAME
+reg regdatabase		0x10	ERROR NAME
+reg regdatabase		1e3	ERROR NAME
+reg regdatabase		3000000000	3000000000
+reg regdatabase		4294967295	4294967295
+reg regdatabase		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regdatabase		8	8
+reg regdatabase		8 	ERROR NAME
+reg regdatabase		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regdatabase		٣	ERROR NAME
+reg regdictionary			ERROR NAME
+reg regdictionary		 	ERROR NAME
+reg regdictionary		 8	ERROR NAME
+reg regdictionary		+8	ERROR NAME
+reg regdictionary		-	-
+reg regdictionary		--	ERROR NAME
+reg regdictionary		-8	ERROR NAME
+reg regdictionary		0	-
+reg regdictionary		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regdictionary		010	8
+reg regdictionary		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regdictionary		0b1	ERROR NAME
+reg regdictionary		0x10	ERROR NAME
+reg regdictionary		1e3	ERROR NAME
+reg regdictionary		3000000000	3000000000
+reg regdictionary		4294967295	4294967295
+reg regdictionary		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regdictionary		8	8
+reg regdictionary		8 	ERROR NAME
+reg regdictionary		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regdictionary		٣	ERROR NAME
+reg regnamespace			ERROR NAME
+reg regnamespace		 	ERROR NAME
+reg regnamespace		 8	ERROR NAME
+reg regnamespace		+8	ERROR NAME
+reg regnamespace		-	-
+reg regnamespace		--	ERROR NAME
+reg regnamespace		-8	ERROR NAME
+reg regnamespace		0	-
+reg regnamespace		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regnamespace		010	8
+reg regnamespace		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regnamespace		0b1	ERROR NAME
+reg regnamespace		0x10	ERROR NAME
+reg regnamespace		1e3	ERROR NAME
+reg regnamespace		3000000000	3000000000
+reg regnamespace		4294967295	4294967295
+reg regnamespace		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regnamespace		8	8
+reg regnamespace		8 	ERROR NAME
+reg regnamespace		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regnamespace		٣	ERROR NAME
+reg regoper			ERROR NAME
+reg regoper		 	ERROR NAME
+reg regoper		 8	ERROR NAME
+reg regoper		+8	ERROR NAME
+reg regoper		-	ERROR NAME
+reg regoper		--	ERROR NAME
+reg regoper		-8	ERROR NAME
+reg regoper		0	0
+reg regoper		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regoper		010	8
+reg regoper		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regoper		0b1	ERROR NAME
+reg regoper		0x10	ERROR NAME
+reg regoper		1e3	ERROR NAME
+reg regoper		3000000000	3000000000
+reg regoper		4294967295	4294967295
+reg regoper		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regoper		8	8
+reg regoper		8 	ERROR NAME
+reg regoper		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regoper		٣	ERROR NAME
+reg regoperator			ERROR NAME
+reg regoperator		 	ERROR NAME
+reg regoperator		 8	ERROR NAME
+reg regoperator		+8	ERROR NAME
+reg regoperator		-	ERROR NAME
+reg regoperator		--	ERROR NAME
+reg regoperator		-8	ERROR NAME
+reg regoperator		0	0
+reg regoperator		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regoperator		010	8
+reg regoperator		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regoperator		0b1	ERROR NAME
+reg regoperator		0x10	ERROR NAME
+reg regoperator		1e3	ERROR NAME
+reg regoperator		3000000000	3000000000
+reg regoperator		4294967295	4294967295
+reg regoperator		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regoperator		8	8
+reg regoperator		8 	ERROR NAME
+reg regoperator		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regoperator		٣	ERROR NAME
+reg regproc			ERROR NAME
+reg regproc		 	ERROR NAME
+reg regproc		 8	ERROR NAME
+reg regproc		+8	ERROR NAME
+reg regproc		-	-
+reg regproc		--	ERROR NAME
+reg regproc		-8	ERROR NAME
+reg regproc		0	-
+reg regproc		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regproc		010	8
+reg regproc		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regproc		0b1	ERROR NAME
+reg regproc		0x10	ERROR NAME
+reg regproc		1e3	ERROR NAME
+reg regproc		3000000000	3000000000
+reg regproc		4294967295	4294967295
+reg regproc		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regproc		8	8
+reg regproc		8 	ERROR NAME
+reg regproc		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regproc		٣	ERROR NAME
+reg regprocedure			ERROR NAME
+reg regprocedure		 	ERROR NAME
+reg regprocedure		 8	ERROR NAME
+reg regprocedure		+8	ERROR NAME
+reg regprocedure		-	-
+reg regprocedure		--	ERROR NAME
+reg regprocedure		-8	ERROR NAME
+reg regprocedure		0	-
+reg regprocedure		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regprocedure		010	8
+reg regprocedure		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regprocedure		0b1	ERROR NAME
+reg regprocedure		0x10	ERROR NAME
+reg regprocedure		1e3	ERROR NAME
+reg regprocedure		3000000000	3000000000
+reg regprocedure		4294967295	4294967295
+reg regprocedure		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regprocedure		8	8
+reg regprocedure		8 	ERROR NAME
+reg regprocedure		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regprocedure		٣	ERROR NAME
+reg regrole			ERROR NAME
+reg regrole		 	ERROR NAME
+reg regrole		 8	ERROR NAME
+reg regrole		+8	ERROR NAME
+reg regrole		-	-
+reg regrole		--	ERROR NAME
+reg regrole		-8	ERROR NAME
+reg regrole		0	-
+reg regrole		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regrole		010	8
+reg regrole		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regrole		0b1	ERROR NAME
+reg regrole		0x10	ERROR NAME
+reg regrole		1e3	ERROR NAME
+reg regrole		3000000000	3000000000
+reg regrole		4294967295	4294967295
+reg regrole		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regrole		8	8
+reg regrole		8 	ERROR NAME
+reg regrole		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regrole		٣	ERROR NAME
+reg regtype			ERROR NAME
+reg regtype		 	ERROR NAME
+reg regtype		 8	ERROR NAME
+reg regtype		+8	ERROR NAME
+reg regtype		-	-
+reg regtype		--	ERROR NAME
+reg regtype		-8	ERROR NAME
+reg regtype		0	-
+reg regtype		00000000000000000008	ERROR 22P02 invalid input syntax for type oid: "00000000000000000008"
+reg regtype		010	8
+reg regtype		09	ERROR 22P02 invalid input syntax for type oid: "09"
+reg regtype		0b1	ERROR NAME
+reg regtype		0x10	ERROR NAME
+reg regtype		1e3	ERROR NAME
+reg regtype		3000000000	3000000000
+reg regtype		4294967295	4294967295
+reg regtype		4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+reg regtype		8	8
+reg regtype		8 	ERROR NAME
+reg regtype		99999999999999999999	ERROR 22003 value "99999999999999999999" is out of range for type oid
+reg regtype		٣	ERROR NAME
+names		zq	rel zq
+names		Zq	rel zq
+names		zq . "Q""d"	rel zq.Q"d
+names		"Zq"."x y"	rel Zq.x y
+names		zq.b.c	db zq.b.c
+names		zq.b.c.d	many zq.b.c.d
+names		zq.b.c.d.e	many zq.b.c.d.e
+names		""	rel 
+names		"".zq	rel .zq
+names		zq.	ERROR 42602 invalid name syntax
+names		.zq	ERROR 42602 invalid name syntax
+names		zq..b	ERROR 42602 invalid name syntax
+names		zq b	ERROR 42602 invalid name syntax
+names		"zq	ERROR 42602 invalid name syntax
+names		"zq"b	ERROR 42602 invalid name syntax
+names		zq"b	rel zq"b
+names		ÉZQ.b	rel Ézq.b
+names		  zq  .  b  	rel zq.b
+names			ERROR 42602 invalid name syntax
+names		 	ERROR 42602 invalid name syntax
+names		XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX	rel xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+names		"YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"	rel YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY
+names		qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqé	rel qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq
+names		zq,b	rel zq,b
+names		zq."b.c"	rel zq.b.c
+names		"zq"""	rel zq"
+names		"zq"".b"	rel zq".b
+names		pg_catalog.zq	rel pg_catalog.zq
+names		zq.pg_class	rel zq.pg_class
+names		"zq" . "b" . "c"	db zq.b.c
+names		zq. 	ERROR 42602 invalid name syntax
+names		ÉÀ	rel ÉÀ
+names		"日本"	rel 日本
+names		日本.Zq	rel 日本.zq
