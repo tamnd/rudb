@@ -1442,10 +1442,13 @@ impl<'a> Binder<'a> {
             slices.push(self.plan.add_expr_list(&items));
         }
         let rows = self.plan.add_rows(&slices);
+        // PostgreSQL counts the columns of `VALUES` from one, and DuckDB counts them from zero.
+        let (prefix, first) =
+            if self.session.postgres().is_some() { ("column", 1) } else { ("col", 0) };
         let fields: Vec<Field> = types
             .iter()
             .enumerate()
-            .map(|(at, ty)| Field::new(format!("col{at}"), ty.clone()))
+            .map(|(at, ty)| Field::new(format!("{prefix}{}", at + first), ty.clone()))
             .collect();
         let columns = self.plan.add_fields(&fields);
         let index = self.fresh_index();
@@ -2070,7 +2073,7 @@ impl<'a> Binder<'a> {
                     self.lift_over_aggregate(before, above, input)?;
                     exprs.push(self.over_aggregate(expr, input)?);
                     names.push(if target.alias == NONE {
-                        self.output_name(&copy, target.expr, input)
+                        self.target_name(&copy, target.expr, input)
                     } else {
                         ast.string(target.alias).to_string()
                     });
@@ -2092,7 +2095,7 @@ impl<'a> Binder<'a> {
             }
             exprs.push(self.over_aggregate(expr, input)?);
             names.push(if target.alias == NONE {
-                self.output_name(ast, target.expr, input)
+                self.target_name(ast, target.expr, input)
             } else {
                 ast.string(target.alias).to_string()
             });

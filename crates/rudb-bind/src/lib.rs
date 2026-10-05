@@ -22,6 +22,7 @@ mod binder;
 mod columns;
 mod context;
 mod expr;
+mod figure;
 pub mod fold;
 mod lambda;
 mod listaggr;
