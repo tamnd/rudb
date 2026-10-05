@@ -648,8 +648,11 @@ pub fn pack_linear(values: &[u64], width: usize, output: &mut Vec<u8>) -> Result
         return check_all_zero(values);
     }
     let mask = low_mask(width);
-    // 128 bits, because the accumulator holds up to 7 bits left over from the previous value plus a
-    // whole 64 bit one.
+    output.reserve((values.len() * width).div_ceil(8));
+    // 128 bits, because the accumulator holds up to 63 bits left over from the values before plus a
+    // whole 64 bit one. The bits leave a word at a time, which is the same little endian stream a
+    // byte at a time made: a byte each was a push and a capacity check, and the adjacency lists of
+    // a JOB checkpoint, 36 million rows of `cast_info` among them, went through here.
     let mut accumulator: u128 = 0;
     let mut filled = 0usize;
     for value in values {
@@ -658,11 +661,16 @@ pub fn pack_linear(values: &[u64], width: usize, output: &mut Vec<u8>) -> Result
         }
         accumulator |= u128::from(*value) << filled;
         filled += width;
-        while filled >= 8 {
-            output.push((accumulator & 0xff) as u8);
-            accumulator >>= 8;
-            filled -= 8;
+        if filled >= 64 {
+            output.extend_from_slice(&(accumulator as u64).to_le_bytes());
+            accumulator >>= 64;
+            filled -= 64;
         }
+    }
+    while filled >= 8 {
+        output.push((accumulator & 0xff) as u8);
+        accumulator >>= 8;
+        filled -= 8;
     }
     if filled > 0 {
         output.push((accumulator & 0xff) as u8);

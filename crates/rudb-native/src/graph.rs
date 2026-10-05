@@ -107,8 +107,11 @@ impl KeyColumn<'_> {
         let chunk = self.reader.read(part, &self.columns)?;
         let values = chunk.column(0)?;
         let mut keys = Vec::with_capacity(values.len());
-        if values.len() != out.len() || !values.signed_block(&mut keys) || keys.len() != out.len() {
+        if values.len() != out.len() {
             return Ok(false);
+        }
+        if !values.signed_block(&mut keys) || keys.len() != out.len() {
+            return parents_by_value(values, map, out);
         }
         map.lookup_block(&keys, out)?;
         let validity = values.validity();
@@ -121,6 +124,42 @@ impl KeyColumn<'_> {
         }
         Ok(true)
     }
+}
+
+/// The parent of every row of a part whose keys sit behind runs or a dictionary with a null among
+/// their values, which [`rudb_vector::Vector::signed_block`] refuses, or `false` having written
+/// nothing for any other part.
+///
+/// Each value is looked up once and every row takes the parent of the value it points at. A key
+/// column with nulls in it, such as `cast_info.person_role_id`, can come here as runs with a null
+/// run among them, and it went a row at a time through [`key_at`], which for a null row builds the
+/// value to find it is null. A dictionary with more values than the part has rows is left to the
+/// row path, since looking all of them up would be more work than the rows.
+fn parents_by_value(values: &rudb_vector::Vector, map: &KeyMap, out: &mut [Rid]) -> Result<bool> {
+    let Some((positions, inner)) = values.positions() else { return Ok(false) };
+    if positions.len() < out.len() || inner.len() > out.len() {
+        return Ok(false);
+    }
+    let mut entries = Vec::with_capacity(inner.len());
+    if !inner.signed_block(&mut entries) || entries.len() != inner.len() {
+        return Ok(false);
+    }
+    let mut found = vec![NO_PARENT; entries.len()];
+    map.lookup_block(&entries, &mut found)?;
+    for (at, parent) in found.iter_mut().enumerate() {
+        if inner.is_null_at(at) {
+            *parent = NO_PARENT;
+        }
+    }
+    let validity = values.validity();
+    for (row, (parent, &at)) in out.iter_mut().zip(positions.iter()).enumerate() {
+        *parent = if validity.is_valid(row) {
+            found.get(at as usize).copied().unwrap_or(NO_PARENT)
+        } else {
+            NO_PARENT
+        };
+    }
+    Ok(true)
 }
 
 impl Keys for KeyColumn<'_> {
@@ -1031,7 +1070,9 @@ fn one_link(
     //
     // The degrees are their own pass over the same slice rather than a loop fused into the scan
     // above. The cost of measuring them is the scattered increment into a counter per parent and
-    // not the sequential read of the child column, so fusing would save the cheap half.
+    // not the sequential read of the child column, so fusing would save the cheap half. A link
+    // that needs an adjacency has that increment done for it, a cache sized range at a time, so
+    // its degrees are read off the adjacency's lists instead.
     //
     // A monotone link answers the backward direction itself, so the adjacency is only for the
     // packed form, which is any slice with an unmatched child or a child before its predecessor.
@@ -1043,26 +1084,31 @@ fn one_link(
             let bytes = encode_link(&link, &parent, edge)?;
             Ok::<_, rudb_common::Error>((link, bytes))
         });
-        let degrees = scope.spawn(|| Degrees::of(&parents_of, parents, true));
+        let degrees = (!packed).then(|| scope.spawn(|| Degrees::of(&parents_of, parents, true)));
         let spans = scope.spawn(|| spans_of(child, &parent, &parents_of));
         let adjacency = packed
             .then(|| {
-                Adjacency::build(&parents_of, parents)
-                    .and_then(|adjacency| encode_adjacency(&adjacency, &parent, edge))
+                let adjacency = Adjacency::build(&parents_of, parents)?;
+                let degrees = Degrees::with_counts(&parents_of, &adjacency.degrees(), true);
+                Ok::<_, rudb_common::Error>((encode_adjacency(&adjacency, &parent, edge)?, degrees))
             })
             .transpose();
         let joined = "a link build worker panicked";
         (
             built.join().map_err(|_| joined.to_string()),
-            degrees.join().map_err(|_| joined.to_string()),
+            degrees.map(|degrees| degrees.join().map_err(|_| joined.to_string())).transpose(),
             spans.join().map_err(|_| joined.to_string()),
             adjacency,
         )
     });
     let (link, bytes) = built?.map_err(|error| error.to_string())?;
-    let degrees = degrees?;
     let spans = spans?.map_err(|error| error.to_string())?;
     let adjacency = adjacency.map_err(|error| error.to_string())?;
+    let (adjacency, degrees) = match (adjacency, degrees?) {
+        (Some((adjacency, degrees)), _) => (Some(adjacency), degrees),
+        (None, Some(degrees)) => (None, degrees),
+        (None, None) => (None, Degrees::of(&parents_of, parents, true)),
+    };
     let adjacency = match link.form() {
         link::Form::Monotone => None,
         link::Form::Packed => adjacency,
@@ -2355,5 +2401,27 @@ mod tests {
         assert_eq!(report[0].note.as_deref(), Some("the key of parent is not unique"));
 
         fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn keys_behind_runs_or_a_dictionary_with_a_null_find_the_parents_a_key_at_a_time_finds() {
+        let parents = (0..400).filter(|key| key % 5 != 2).map(Some).collect::<Vec<Option<i128>>>();
+        let map = KeyMap::build(&parents).expect("map");
+        let values = [Some(7), None, Some(2), Some(399), Some(-3), Some(10)]
+            .map(|key: Option<i32>| key.map_or(Value::Null, Value::Integer));
+        let inner = Vector::from_values(LogicalType::Integer, &values).expect("values");
+        let runs = Vector::runs(vec![3, 5, 9, 10, 14, 20], inner.clone()).expect("runs");
+        let coded = Vector::dictionary(vec![0, 1, 1, 5, 2, 3, 4, 0, 1, 5], inner).expect("codes");
+        for keys in [runs, coded] {
+            let mut out = vec![0; keys.len()];
+            assert!(parents_by_value(&keys, &map, &mut out).expect("by value"));
+            for (row, parent) in out.iter().enumerate() {
+                let one = match keys.value_at(row) {
+                    Value::Integer(key) => map.lookup(i128::from(key)).expect("lookup"),
+                    _ => None,
+                };
+                assert_eq!(*parent, one.unwrap_or(NO_PARENT), "row {row}");
+            }
+        }
     }
 }

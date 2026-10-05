@@ -749,6 +749,25 @@ impl KeyMap {
             }
             return Ok(());
         }
+        // A dense map is the same subtraction and a test of the key's bit, and the row is the ones
+        // before it, two loads and a `popcount`. A key at a time through `lookup` was the largest
+        // single function of the links of a JOB checkpoint once the identity maps took this way.
+        if let Body::Dense { base, range, bits, rank } = &self.body {
+            for (key, out) in keys.iter().zip(out) {
+                let offset = u64::try_from(i128::from(*key) - base).ok();
+                *out = match offset.filter(|offset| offset < range) {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "the build checked the range fits a usize"
+                    )]
+                    Some(at) if bits[at as usize / 64] >> (at % 64) & 1 == 1 => {
+                        rank.rank(bits, at as usize)
+                    }
+                    _ => NO_PARENT,
+                };
+            }
+            return Ok(());
+        }
         for (key, out) in keys.iter().zip(out) {
             *out = self.lookup(i128::from(*key))?.unwrap_or(NO_PARENT);
         }
