@@ -6,9 +6,11 @@
 //! one buffer, which goes to the socket at `ReadyForQuery`, at `Flush`, at the end of the
 //! connection, and when it is larger than [`FLUSH_AT`], as PostgreSQL does.
 //!
-//! This version has the simple query flow. The extended query flow, the settings of the startup
-//! message other than `application_name` and `client_encoding`, and authentication other than
-//! `trust` come in the next steps of milestone PG1.
+//! This version has the simple and the extended query flows. The settings of the startup message
+//! other than `application_name` and `client_encoding`, and authentication other than `trust`
+//! come in the next steps of milestone PG1.
+
+mod extended;
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -21,9 +23,11 @@ use rudb_pgtypes::{
     pg_type,
 };
 use rudb_pgwire::{
-    CommandTag, Field, Frontend, Handshake, Level, OutBuf, ProtocolError, QUERY_CANCELED,
-    Replication, Session, Step, TransactionStatus, split_startup,
+    CommandTag, Field, Frontend, Handshake, Level, OutBuf, QUERY_CANCELED, Replication, Session,
+    Step, TransactionStatus, split_startup,
 };
+
+use extended::Extended;
 
 use crate::poll;
 use crate::server::{Refusal, Shared, log};
@@ -313,6 +317,7 @@ fn serve(
         time_zone: &zone,
     };
     let mut runner = Runner { connection, settings, encoder: RowEncoder::default() };
+    let mut extended = Extended::default();
     loop {
         if session.wants_ready() {
             let status = match runner.connection.transaction() {
@@ -346,25 +351,55 @@ fn serve(
                 true
             }
             Some(Ok(Frontend::Query(sql))) => {
-                runner.query(sql, &mut wire.out, wire_flush(&mut wire.stream))?
+                extended.simple_query();
+                let failed = runner.query(sql, &mut wire.out, wire_flush(&mut wire.stream))?;
+                extended.end_of_transaction(runner.connection.transaction());
+                failed
             }
-            Some(Ok(Frontend::Sync)) => false,
+            Some(Ok(Frontend::Parse { name, sql, types })) => {
+                let done = extended.parse(&runner, name, sql, types.iter(), &mut wire.out);
+                failure(done, &mut wire.out, start.protocol)
+            }
+            Some(Ok(Frontend::Bind(bind))) => {
+                let done = extended.bind(&runner, &bind, &mut wire.out);
+                failure(done, &mut wire.out, start.protocol)
+            }
+            Some(Ok(Frontend::Describe { target, name })) => {
+                let done = extended.describe(&runner, target, name, &mut wire.out);
+                failure(done, &mut wire.out, start.protocol)
+            }
+            Some(Ok(Frontend::Execute { portal, max_rows })) => {
+                let mut flush = wire_flush(&mut wire.stream);
+                let done =
+                    extended.execute(&runner, portal, max_rows, &mut wire.out, &mut flush)?;
+                failure(done, &mut wire.out, start.protocol)
+            }
+            Some(Ok(Frontend::Close { target, name })) => {
+                extended.close(target, name, &mut wire.out);
+                false
+            }
+            Some(Ok(Frontend::Sync)) => {
+                extended.end_of_transaction(runner.connection.transaction());
+                false
+            }
             Some(Ok(Frontend::Flush)) => {
                 wire.flush()?;
                 false
             }
             Some(Ok(Frontend::Terminate)) => return Ok(()),
-            Some(Ok(_)) => {
-                wire.out.protocol_error(
-                    &ProtocolError {
-                        level: Level::Error,
-                        sqlstate: "0A000",
-                        message: "the extended query protocol is not supported yet".to_owned(),
-                        detail: None,
-                        hint: None,
-                    },
-                    start.protocol,
-                );
+            Some(Ok(other)) => {
+                let message = match other {
+                    Frontend::FunctionCall(_) => "the function call protocol is not supported yet",
+                    _ => "this message is not supported yet",
+                };
+                let error = rudb_pgwire::ProtocolError {
+                    level: Level::Error,
+                    sqlstate: "0A000",
+                    message: message.to_owned(),
+                    detail: None,
+                    hint: None,
+                };
+                wire.out.protocol_error(&error, start.protocol);
                 true
             }
         };
@@ -380,6 +415,17 @@ fn serve(
         }
         if wire.out.len() >= FLUSH_AT {
             wire.flush()?;
+        }
+    }
+}
+
+/// Writes the error of a message of the extended flow, and gives true when there was one.
+fn failure(done: Result<(), extended::Problem>, out: &mut OutBuf, protocol: u32) -> bool {
+    match done {
+        Ok(()) => false,
+        Err(problem) => {
+            problem.write(out, protocol);
+            true
         }
     }
 }

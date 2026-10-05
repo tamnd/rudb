@@ -58,19 +58,15 @@ impl Binder<'_> {
     /// A bare word is text here too, which is how the pin reads `SET VARIABLE a = x`. A query
     /// inside the value is joined in under the projection the way one in a `SELECT` with no `FROM`
     /// is, so a value that is a query that finds several rows is refused in the same words.
-    pub(crate) fn bind_variable_value(
-        &mut self,
-        ast: &Ast,
-        expr: ast::ExprRef,
-    ) -> Result<rudb_plan::NodeRef> {
+    pub(crate) fn bind_variable_value(&mut self, ast: &Ast, expr: ast::ExprRef) -> Result<NodeRef> {
         let value = self.bind_setting_value(ast, expr)?;
-        let dummy = self.add_node(rudb_plan::Node::Dummy);
+        let dummy = self.add_node(Node::Dummy);
         let input = self.attach_scalar_subqueries(dummy);
         let index = self.fresh_index();
         let exprs = self.plan_mut().add_expr_list(&[value]);
         let name = self.plan_mut().intern("value");
         let names = self.plan_mut().add_name_list(&[name]);
-        Ok(self.add_node(rudb_plan::Node::Project { input, index, exprs, names }))
+        Ok(self.add_node(Node::Project { input, index, exprs, names }))
     }
 
     /// Binds one written expression against `scope`.
@@ -379,12 +375,7 @@ impl Binder<'_> {
             let aggregates = self.plan_mut().add_expr_list(&[gathered]);
             let groups = self.plan_mut().add_expr_list(&[]);
             let index = self.fresh_index();
-            node = self.add_node(rudb_plan::Node::Aggregate {
-                input: node,
-                index,
-                groups,
-                aggregates,
-            });
+            node = self.add_node(Node::Aggregate { input: node, index, groups, aggregates });
             binding = rudb_plan::ColumnBinding::new(index, 0);
         }
         let expr = self.add_expr(Expr::Column(binding), ty.clone());
@@ -410,14 +401,11 @@ impl Binder<'_> {
 
     /// The input of the sort at the top of a query, the expression the query's one column is over
     /// that input when a projection sits on the sort, and the sort's keys.
-    fn sorted_top(
-        &self,
-        node: rudb_plan::NodeRef,
-    ) -> Option<(rudb_plan::NodeRef, Option<ExprRef>, rudb_plan::Slice)> {
+    fn sorted_top(&self, node: NodeRef) -> Option<(NodeRef, Option<ExprRef>, rudb_plan::Slice)> {
         match *self.plan().node(node) {
-            rudb_plan::Node::Sort { input, keys } => Some((input, None, keys)),
-            rudb_plan::Node::Project { input, exprs, .. } => {
-                let rudb_plan::Node::Sort { input, keys } = *self.plan().node(input) else {
+            Node::Sort { input, keys } => Some((input, None, keys)),
+            Node::Project { input, exprs, .. } => {
+                let Node::Sort { input, keys } = *self.plan().node(input) else {
                     return None;
                 };
                 let &[first] = self.plan().expr_list(exprs) else {
@@ -438,7 +426,7 @@ impl Binder<'_> {
         outer: &Scope,
     ) -> Result<ExprRef> {
         let (node, _, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
-        let node = self.add_node(rudb_plan::Node::Limit {
+        let node = self.add_node(Node::Limit {
             input: node,
             count: rudb_plan::Bound::Rows(1),
             offset: rudb_plan::Bound::Rows(0),
@@ -448,7 +436,7 @@ impl Binder<'_> {
         let exprs = self.plan_mut().add_expr_list(&[marker]);
         let name = self.plan_mut().intern("exists");
         let names = self.plan_mut().add_name_list(&[name]);
-        let node = self.add_node(rudb_plan::Node::Project { input: node, index, exprs, names });
+        let node = self.add_node(Node::Project { input: node, index, exprs, names });
         let marker = self
             .plan_mut()
             .add_expr(Expr::Column(rudb_plan::ColumnBinding::new(index, 0)), LogicalType::Boolean);
@@ -485,7 +473,7 @@ impl Binder<'_> {
         ast: &Ast,
         query: ast::QueryRef,
         outer_scope: &Scope,
-    ) -> Result<(rudb_plan::NodeRef, Scope, Vec<rudb_plan::ColumnBinding>)> {
+    ) -> Result<(NodeRef, Scope, Vec<rudb_plan::ColumnBinding>)> {
         let outer_aggregation = self.aggregation.take();
         let outer_in_aggregate = std::mem::replace(&mut self.in_aggregate, false);
         let outer_in_filter = std::mem::replace(&mut self.in_filter, false);
@@ -1473,8 +1461,7 @@ impl Binder<'_> {
         let candidate_name = self.plan_mut().intern(&candidate_name);
         let marker_name = self.plan_mut().intern("mark");
         let names = self.plan_mut().add_name_list(&[candidate_name, marker_name]);
-        let node =
-            self.add_node(rudb_plan::Node::Project { input: node, index: projected, exprs, names });
+        let node = self.add_node(Node::Project { input: node, index: projected, exprs, names });
         let candidate = self
             .plan_mut()
             .add_expr(Expr::Column(rudb_plan::ColumnBinding::new(projected, 0)), candidate_type);
