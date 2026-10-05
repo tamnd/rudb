@@ -69,6 +69,8 @@ pub type SequenceRef = u32;
 pub type TypeRef = u32;
 /// Index into [`Ast::triggers`].
 pub type TriggerRef = u32;
+/// Index into [`Ast::macros`].
+pub type MacroRef = u32;
 /// Index into [`Ast::alters`].
 pub type AlterRef = u32;
 /// Index into [`Ast::indexes`].
@@ -107,6 +109,8 @@ pub enum Statement {
     Type(TypeRef),
     /// `CREATE TRIGGER` or `DROP TRIGGER`.
     Trigger(TriggerRef),
+    /// `CREATE MACRO`, `CREATE FUNCTION`, `DROP MACRO`, `DROP MACRO TABLE` or `DROP FUNCTION`.
+    Macro(MacroRef),
     /// `ALTER TABLE` or `ALTER VIEW`.
     Alter(AlterRef),
     /// `CREATE INDEX` or `DROP INDEX`.
@@ -476,6 +480,41 @@ pub struct Trigger {
     pub written: StrRef,
     /// Whether the body reads a column of `NEW` or `OLD`, which a row trigger has to.
     pub reads_row: bool,
+}
+
+/// `CREATE MACRO name (parameters) AS body, ...` or `DROP MACRO [TABLE] name`.
+///
+/// The bodies are held as text, the way a view's is, and a call parses its body again with the
+/// arguments written in where the parameters are. A body is checked against the catalog when it
+/// is made and read again on every call, so it sees the catalog as it is then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroDef {
+    /// The name, as a run of parts, as it was written.
+    pub name: Slice,
+    /// Whether this is a `DROP` rather than a `CREATE`.
+    pub drop: bool,
+    /// Which kind a drop takes: `Some(true)` for `DROP MACRO TABLE`, and `None` for a `DROP MACRO`
+    /// or a `DROP FUNCTION`, which take either.
+    pub table: Option<bool>,
+    /// Whether `IF NOT EXISTS` was written on a create or `IF EXISTS` on a drop.
+    pub quiet: bool,
+    /// Whether `OR REPLACE` was written.
+    pub or_replace: bool,
+    /// Whether `TEMPORARY` was written.
+    pub temporary: bool,
+    /// The ways of calling it, one for each definition after the name. A drop has none.
+    pub overloads: Vec<MacroOverload>,
+}
+
+/// One definition of a macro, which is its parameters and its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroOverload {
+    /// The parameters, each its name, the type it was written with, and the text of its default.
+    pub parameters: Vec<(String, Option<String>, Option<String>)>,
+    /// Whether the body was written `AS TABLE`, which makes it a table macro.
+    pub table: bool,
+    /// The body as the pin prints it back.
+    pub body: String,
 }
 
 /// When a trigger fires, against the statement that fires it.
@@ -1528,6 +1567,8 @@ pub struct Ast {
     pub types: Vec<TypeDef>,
     /// The `CREATE TRIGGER` and `DROP TRIGGER` arena.
     pub triggers: Vec<Trigger>,
+    /// The `CREATE MACRO` and `DROP MACRO` arena.
+    pub macros: Vec<MacroDef>,
     /// The `ALTER TABLE` and `ALTER VIEW` arena.
     pub alters: Vec<Alter>,
     /// The `CREATE INDEX` and `DROP INDEX` arena.
@@ -1562,6 +1603,10 @@ pub struct Ast {
     /// call carries its arguments in the function's order, and this is kept so that the call is
     /// named and printed the way it was written.
     pub named_written: Vec<(ExprRef, u32, Slice)>,
+    /// The calls written with a positional argument after a name or with a name twice, each with
+    /// the sentence the pin turns it down with and the end of the one it uses when the call is to
+    /// a macro. Only the binder knows which it is.
+    pub misnamed: Vec<(ExprRef, String, String)>,
     /// The lists written `ARRAY[...]` rather than `[...]`. They are the same list, and only the
     /// name of a column holding one tells them apart.
     pub array_lists: Vec<ExprRef>,
@@ -1701,6 +1746,15 @@ impl Ast {
         }
     }
 
+    /// The sentence a call written with a misplaced or repeated name is turned down with, and the
+    /// end of the one for a call to a macro, or `None` for any other call.
+    pub fn misnamed(&self, call: ExprRef) -> Option<(&str, &str)> {
+        self.misnamed
+            .iter()
+            .find(|(held, _, _)| *held == call)
+            .map(|(_, message, said)| (message.as_str(), said.as_str()))
+    }
+
     /// Whether a call was written with `EXPORT_STATE` after it.
     pub fn exports_state(&self, call: ExprRef) -> bool {
         self.exported.contains(&call)
@@ -1772,6 +1826,12 @@ impl Ast {
     #[must_use]
     pub fn trigger(&self, index: TriggerRef) -> Trigger {
         self.triggers[index as usize]
+    }
+
+    /// One `CREATE MACRO` or `DROP MACRO`.
+    #[must_use]
+    pub fn macro_def(&self, index: MacroRef) -> &MacroDef {
+        &self.macros[index as usize]
     }
 
     /// The `CREATE INDEX` or `DROP INDEX` at an index.

@@ -49,6 +49,8 @@ pub enum Bound {
     Type(TypeChange),
     /// `CREATE TRIGGER` or `DROP TRIGGER`.
     Trigger(TriggerChange),
+    /// `CREATE MACRO` or `DROP MACRO`.
+    Macro(MacroChange),
     /// `ALTER TABLE` or `ALTER VIEW`.
     Alter(Alter),
     /// `CREATE INDEX` or `DROP INDEX`.
@@ -300,6 +302,21 @@ pub struct SequenceChange {
     pub owner: Option<QualifiedName>,
 }
 
+/// A bound `CREATE MACRO` or `DROP MACRO`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroChange {
+    /// The full name. `None` for a `DROP MACRO IF EXISTS` of one that is not there.
+    pub name: Option<QualifiedName>,
+    /// Whether it is a table macro, which for a drop is the kind that was found.
+    pub table: bool,
+    /// What a create makes, and `None` for a drop.
+    pub made: Option<rudb_catalog::Macro>,
+    /// Whether a create replaces a macro of that name and kind.
+    pub or_replace: bool,
+    /// Whether a create over a macro of that name and kind does nothing.
+    pub if_not_exists: bool,
+}
+
 /// A bound `CREATE TYPE` or `DROP TYPE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeChange {
@@ -509,7 +526,7 @@ pub fn bind_statement_outlined(
     bind_one(ast, catalog, parameters, session, true)
 }
 
-fn bind_one(
+pub(crate) fn bind_one(
     ast: &Ast,
     catalog: &Catalog,
     parameters: &Parameters,
@@ -613,6 +630,9 @@ fn bind_one(
             }))
         }
         ast::Statement::Trigger(index) => trigger(ast, catalog, parameters, session, index),
+        ast::Statement::Macro(index) => {
+            crate::macros::statement(ast, catalog, parameters, session, index)
+        }
         ast::Statement::Alter(index) => alter(ast, catalog, parameters, session, index),
         ast::Statement::Index(index) => create_index(ast, catalog, parameters, session, index),
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, session, index),

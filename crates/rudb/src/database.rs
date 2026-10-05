@@ -5929,6 +5929,7 @@ impl Shared {
                 | Bound::Sequence(_)
                 | Bound::Type(_)
                 | Bound::Trigger(_)
+                | Bound::Macro(_)
                 | Bound::Alter(_)
                 | Bound::Index(_)
                 | Bound::Insert(_)
@@ -6303,6 +6304,21 @@ impl Shared {
                     change.or_replace,
                     change.if_not_exists,
                 )?;
+                Ok(QueryResult::empty())
+            }
+            Bound::Macro(change) => {
+                let Some(name) = change.name else { return Ok(QueryResult::empty()) };
+                let Some(made) = change.made else {
+                    catalog.drop_macro(&name, Some(change.table))?;
+                    return Ok(QueryResult::empty());
+                };
+                // The file has nowhere to keep one yet, the same as a sequence.
+                if holds_a_file(&self.inner, &catalog, &name.catalog) {
+                    return Err(Error::not_implemented(
+                        "CREATE MACRO in a database file, which cannot hold one so far",
+                    ));
+                }
+                catalog.create_macro(made, change.or_replace, change.if_not_exists)?;
                 Ok(QueryResult::empty())
             }
             Bound::Trigger(change) => {

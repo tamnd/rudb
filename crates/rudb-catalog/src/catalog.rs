@@ -6,6 +6,7 @@ use std::sync::Arc;
 use rudb_common::sequence::Counter;
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 
+use crate::macros::Macro;
 use crate::name::{QualifiedName, same_name};
 use crate::system::{
     INFORMATION_SCHEMA, INTERNAL_VIEWS, PG_CATALOG, SYSTEM_CATALOG, TEMP_CATALOG, statement,
@@ -205,6 +206,7 @@ pub struct Schema {
     sequences: Vec<Sequence>,
     types: Vec<UserType>,
     triggers: Vec<Trigger>,
+    macros: Vec<Macro>,
     oid: i64,
 }
 
@@ -218,6 +220,7 @@ impl Schema {
             sequences: Vec::new(),
             types: Vec::new(),
             triggers: Vec::new(),
+            macros: Vec::new(),
             oid,
         }
     }
@@ -226,6 +229,12 @@ impl Schema {
     #[must_use]
     pub fn triggers(&self) -> &[Trigger] {
         &self.triggers
+    }
+
+    /// The macros in it, in the order they were made.
+    #[must_use]
+    pub fn macros(&self) -> &[Macro] {
+        &self.macros
     }
 
     /// The sequences in it.
@@ -748,7 +757,8 @@ impl Catalog {
             && (!schema.tables.is_empty()
                 || !schema.views.is_empty()
                 || !schema.sequences.is_empty()
-                || !schema.types.is_empty())
+                || !schema.types.is_empty()
+                || !schema.macros.is_empty())
         {
             let mut message = format!(
                 "Cannot drop entry \"{}\" because there are entries that depend on it.\n",
@@ -1281,6 +1291,95 @@ impl Catalog {
             .iter()
             .flat_map(|database| database.schemas.iter())
             .flat_map(|schema| schema.triggers.iter())
+    }
+
+    /// Makes a macro, or adds nothing and says nothing with `if_not_exists` when the schema has
+    /// one of that name and kind already, or puts it in place of that one with `replace`.
+    ///
+    /// # Errors
+    ///
+    /// If the schema is missing, or if the name is taken and neither flag says what to do.
+    pub fn create_macro(
+        &mut self,
+        mut made: Macro,
+        replace: bool,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let name = made.name.clone();
+        let same =
+            |held: &Macro| same_name(&held.name.table, &name.table) && held.table == made.table;
+        let held = self.schema(&name.catalog, &name.schema)?.macros.iter().any(same);
+        if held && if_not_exists {
+            return Ok(());
+        }
+        if held && !replace {
+            return Err(Error::catalog(format!(
+                "{} with name \"{}\" already exists!",
+                made.kind(),
+                name.table
+            )));
+        }
+        self.changed();
+        made.oid = self.stamp();
+        let schema = self.schema_mut(&name.catalog, &name.schema)?;
+        schema.macros.retain(|held| !same(held));
+        schema.macros.push(made);
+        Ok(())
+    }
+
+    /// Drops a macro by its full name. `table` says which kind, and `None` drops whichever there
+    /// is, the scalar one first, which is what `DROP MACRO` does.
+    ///
+    /// # Errors
+    ///
+    /// If the schema is missing.
+    pub fn drop_macro(&mut self, name: &QualifiedName, table: Option<bool>) -> Result<()> {
+        let kind = self.find_macro(name, table).map(|held| held.table);
+        self.changed();
+        let schema = self.schema_mut(&name.catalog, &name.schema)?;
+        schema
+            .macros
+            .retain(|held| !(same_name(&held.name.table, &name.table) && Some(held.table) == kind));
+        Ok(())
+    }
+
+    /// The macro a written name calls, read the way a table name is read with the temporary schema
+    /// first. `table` says which kind, and `None` takes either, the scalar one first.
+    #[must_use]
+    pub fn resolve_macro(&self, parts: &[&str], table: Option<bool>) -> Option<&Macro> {
+        let candidates = self.candidates(parts).ok()?;
+        candidates.iter().find_map(|candidate| self.find_macro(candidate, table))
+    }
+
+    fn find_macro(&self, name: &QualifiedName, table: Option<bool>) -> Option<&Macro> {
+        let schema = self.schema(&name.catalog, &name.schema).ok()?;
+        let named = |held: &&Macro| same_name(&held.name.table, &name.table);
+        let scalar = schema.macros.iter().filter(named).find(|held| !held.table);
+        let tabled = schema.macros.iter().filter(named).find(|held| held.table);
+        match table {
+            Some(true) => tabled,
+            Some(false) => scalar,
+            None => scalar.or(tabled),
+        }
+    }
+
+    /// Every macro in every database, in the order they were made within each schema.
+    pub fn macros(&self) -> impl Iterator<Item = &Macro> {
+        self.databases
+            .iter()
+            .flat_map(|database| database.schemas.iter())
+            .flat_map(|schema| schema.macros.iter())
+    }
+
+    /// Whether a scalar macro of that name, in any schema, has an aggregate in its body. A query
+    /// that calls one groups, which has to be known before the call is expanded.
+    #[must_use]
+    pub fn aggregating_macro(&self, name: &str) -> bool {
+        self.macros().any(|held| {
+            !held.table
+                && same_name(&held.name.table, name)
+                && held.overloads.iter().any(|overload| overload.aggregating)
+        })
     }
 
     /// Refuses to drop a table or a view a trigger on another table reads, in the pin's sentence,

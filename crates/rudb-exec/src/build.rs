@@ -2575,7 +2575,9 @@ impl<'a> Building<'a, '_> {
                     TableFunction::RudbStatementMetrics => statement_metrics(plan, index, columns)?,
                     TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
                     TableFunction::DuckdbTypes => typenames(self.catalog, plan, index, columns)?,
-                    TableFunction::DuckdbFunctions => functionnames(plan, index, columns)?,
+                    TableFunction::DuckdbFunctions => {
+                        functionnames(self.catalog, plan, index, columns)?
+                    }
                     TableFunction::DuckdbSettings => {
                         settingnames(self.session, plan, index, columns)?
                     }

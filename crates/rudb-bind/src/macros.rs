@@ -19,14 +19,20 @@
 //! since their bodies are queries of a table whose columns would capture an argument written as
 //! `view_oid`, where the pin reads the caller's column.
 
-use rudb_common::{Error, Result};
-use rudb_parse::{Ast, Kind, ast, deparse, parse_ast_with_case, tokenize};
-use rudb_plan::ExprRef;
+use std::cell::Cell;
+
+use rudb_catalog::{Catalog, Overload, Parameter, QualifiedName};
+use rudb_common::{Error, Result, Session};
+use rudb_parse::NONE;
+use rudb_parse::{Ast, Kind, ast, deparse, parse_ast_with_case, quoted, tokenize};
+use rudb_plan::{ExprRef, NodeRef};
 
 use rudb_functions::{FunctionKind, kind_of};
 
 use crate::binder::{Binder, WindowCall};
+use crate::parameters::Parameters;
 use crate::scope::Scope;
+use crate::statement::{Bound, MacroChange};
 
 /// One overload of a built-in macro, as `duckdb_functions()` lists it.
 struct Macro {
@@ -332,6 +338,467 @@ impl Binder<'_> {
     }
 }
 
+thread_local! {
+    /// How many calls to a user's macro deep the binder is on this thread.
+    static DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How deep calls to a user's macro can go. A macro that calls itself, which a macro named after
+/// the function it wraps does, would otherwise go on until the stack ran out. The pin stops it with
+/// its limit on how deep an expression goes, and this stops it sooner, since every level here is a
+/// parse and a bind, but with the pin's sentence.
+const MAX_DEPTH: usize = 100;
+
+/// One level deeper into calls to a user's macro, giving back the depth to put back after, or the
+/// pin's refusal when that is too deep.
+fn deeper() -> Result<usize> {
+    let depth = DEPTH.get();
+    if depth >= MAX_DEPTH {
+        return Err(Error::binder(
+            "Max expression depth limit of 1000 exceeded. Use \"SET max_expression_depth TO x\" \
+             to increase the maximum expression depth.",
+        ));
+    }
+    DEPTH.set(depth + 1);
+    Ok(depth)
+}
+
+impl Binder<'_> {
+    /// Whether an expression has an aggregate in it, counting a call to a user's macro whose body
+    /// has one.
+    pub(crate) fn aggregates(&self, ast: &Ast, expr: ast::ExprRef) -> bool {
+        let catalog = self.catalog();
+        crate::expr::aggregating(ast, expr, &|name| catalog.aggregating_macro(name))
+    }
+
+    /// The expansion of a call to a scalar macro a user made, or `None` if the name is not one.
+    ///
+    /// The overload is the first whose parameters the arguments fit: positional ones in order,
+    /// named ones by name, and a default for every parameter neither gave. A typed parameter takes
+    /// an argument of that type and no other. The body is then expanded the way a built-in macro's
+    /// is, with the text of each argument in place of its parameter.
+    pub(crate) fn user_macro(
+        &mut self,
+        ast: &Ast,
+        call: ast::ExprRef,
+        name: ast::Slice,
+        args: ast::Slice,
+        modified: bool,
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        let parts: Vec<&str> = ast.name(name).collect();
+        let Some(found) = self.catalog().resolve_macro(&parts, None) else {
+            return Ok(None);
+        };
+        let called = found.name.table.clone();
+        if found.table {
+            return Err(Error::binder(format!(
+                "Function \"{called}\" is a table function but it was used as a scalar function. \
+                 This function has to be called in a FROM clause (similar to a table)."
+            )));
+        }
+        if let Some((_, said)) = ast.misnamed(call) {
+            let written = parts.last().copied().unwrap_or_default();
+            return Err(Error::binder(format!("Macro \"{written}\"() {said}")));
+        }
+        let overloads = found.overloads.clone();
+        if modified {
+            return Err(Error::invalid_input(format!(
+                "Function \"{called}\" is a Macro Function. \"DISTINCT\", \"FILTER\", and \
+                 \"ORDER BY\" are only applicable to window and aggregate functions."
+            )));
+        }
+        let (positional, named) = ast.written_args(call, args);
+        let text = self.expanded(ast, &called, &overloads, positional, named, scope)?;
+        let depth = deeper()?;
+        let bound = self.bind_macro_body(&called, &text, scope);
+        DEPTH.set(depth);
+        bound.map(Some)
+    }
+
+    /// The rows of a call to a table macro a user made, or `None` if the name is not one.
+    ///
+    /// The body, with the arguments in it, is bound the way a subquery written there would be, and
+    /// its rows are named after the macro unless the call has an alias.
+    pub(crate) fn table_macro(
+        &mut self,
+        ast: &Ast,
+        name: ast::Slice,
+        args: ast::Slice,
+        alias: ast::StrRef,
+        columns: ast::Slice,
+    ) -> Result<Option<(NodeRef, Scope)>> {
+        let parts: Vec<&str> = ast.name(name).collect();
+        let Some(found) = self.catalog().resolve_macro(&parts, Some(true)) else {
+            return Ok(None);
+        };
+        let called = found.name.table.clone();
+        let overloads = found.overloads.clone();
+        let written = ast.target_list(args);
+        let positional: Vec<ast::ExprRef> = written
+            .iter()
+            .filter(|target| target.alias == NONE)
+            .map(|target| target.expr)
+            .collect();
+        let named: Vec<ast::Target> =
+            written.iter().filter(|target| target.alias != NONE).copied().collect();
+        let first_named = written.iter().position(|target| target.alias != NONE);
+        if first_named.is_some_and(|first| written[first..].iter().any(|t| t.alias == NONE)) {
+            return Err(Error::binder(format!(
+                "Macro \"{}\"() has positional argument following named argument",
+                parts.last().copied().unwrap_or_default()
+            )));
+        }
+        for (index, target) in named.iter().enumerate() {
+            let text = ast.string(target.alias);
+            if named[..index]
+                .iter()
+                .any(|before| ast.string(before.alias).eq_ignore_ascii_case(text))
+            {
+                return Err(Error::binder(format!(
+                    "Macro \"{}\"() has named argument repeated '\"{text}\"'",
+                    parts.last().copied().unwrap_or_default()
+                )));
+            }
+        }
+        let empty = Scope::empty();
+        let text = self.expanded(ast, &called, &overloads, &positional, &named, &empty)?;
+        let parsed = parse_ast_with_case(&text, self.semantics.identifier_case())?;
+        let Some(&ast::Statement::Query(query)) = parsed.statements.first() else {
+            return Err(Error::internal(format!("the body of {called}")));
+        };
+        let depth = deeper()?;
+        let bound = self.bind_query(&parsed, query);
+        DEPTH.set(depth);
+        let (node, mut scope) = bound?;
+        let label = if alias == NONE { called } else { ast.string(alias).to_string() };
+        scope.relabel(&label);
+        if !columns.is_empty() {
+            let names: Vec<&str> = ast.name(columns).collect();
+            scope.rename(&names, &label)?;
+        }
+        Ok(Some((node, scope)))
+    }
+
+    /// The body of the first overload the arguments fit with the arguments in it, or the pin's
+    /// refusal naming every overload if they fit none.
+    fn expanded(
+        &mut self,
+        ast: &Ast,
+        called: &str,
+        overloads: &[Overload],
+        positional: &[ast::ExprRef],
+        named: &[ast::Target],
+        scope: &Scope,
+    ) -> Result<String> {
+        let starred =
+            positional.iter().any(|&argument| matches!(ast.expr(argument), ast::Expr::Star { .. }));
+        if !starred {
+            for overload in overloads {
+                if let Some(texts) = self.fits(ast, overload, positional, named, scope)? {
+                    let names: Vec<&str> = overload
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.name.as_str())
+                        .collect();
+                    return substitute(&overload.body, &names, &texts);
+                }
+            }
+        }
+        let candidates: Vec<String> =
+            overloads.iter().map(|overload| format!("\t{}", overload.signature(called))).collect();
+        Err(Error::binder(format!(
+            "Macro {called}() does not support the supplied arguments. You might need to add \
+             explicit type casts.\nCandidate macros:\n{}",
+            candidates.join("\n")
+        )))
+    }
+
+    /// The text of the argument each parameter of an overload gets, or `None` if the call does not
+    /// fit it.
+    fn fits(
+        &mut self,
+        ast: &Ast,
+        overload: &Overload,
+        positional: &[ast::ExprRef],
+        named: &[ast::Target],
+        scope: &Scope,
+    ) -> Result<Option<Vec<String>>> {
+        let parameters = &overload.parameters;
+        if positional.len() > parameters.len() {
+            return Ok(None);
+        }
+        let mut given: Vec<Option<ast::ExprRef>> = vec![None; parameters.len()];
+        for (slot, &argument) in positional.iter().enumerate() {
+            given[slot] = Some(argument);
+        }
+        for target in named {
+            let written = ast.string(target.alias);
+            let Some(slot) = parameters
+                .iter()
+                .position(|parameter| rudb_catalog::same_name(&parameter.name, written))
+            else {
+                return Ok(None);
+            };
+            if given[slot].is_some() {
+                return Ok(None);
+            }
+            given[slot] = Some(target.expr);
+        }
+        let mut texts = Vec::with_capacity(parameters.len());
+        for (parameter, argument) in parameters.iter().zip(given) {
+            let Some(argument) = argument else {
+                match &parameter.default {
+                    Some(default) => texts.push(default.clone()),
+                    None => return Ok(None),
+                }
+                continue;
+            };
+            if let Some(ty) = &parameter.ty {
+                let wanted = rudb_common::LogicalType::parse(ty)?;
+                let bound = self.bind_expr(ast, argument, scope)?;
+                if *self.plan().expr_type(bound) != wanted {
+                    return Ok(None);
+                }
+            }
+            texts.push(deparse::expression(ast, argument));
+        }
+        Ok(Some(texts))
+    }
+}
+
+/// Binds `CREATE MACRO` or `DROP MACRO`.
+///
+/// A body is checked here the way the pin checks it: bound with every parameter standing for a
+/// null of its type, so that a column it names which is not a parameter, a function that is not
+/// there, or a star is refused now rather than at the first call. Anything else that goes wrong is
+/// left for the call, since a null is not what a call will put there and an error about what it
+/// can do is not an error about the macro.
+pub(crate) fn statement(
+    ast: &Ast,
+    catalog: &Catalog,
+    given: &Parameters,
+    session: &Session,
+    index: ast::MacroRef,
+) -> Result<Bound> {
+    let written = ast.macro_def(index);
+    let parts: Vec<&str> = ast.name(written.name).collect();
+    if written.drop {
+        let found = catalog.resolve_macro(&parts, written.table);
+        if found.is_none() && !written.quiet {
+            return Err(Error::catalog(format!(
+                "{} with name {} does not exist!",
+                rudb_catalog::macros::kind(written.table == Some(true)),
+                parts.last().copied().unwrap_or_default()
+            )));
+        }
+        return Ok(Bound::Macro(MacroChange {
+            name: found.map(|held| held.name.clone()),
+            table: found.is_some_and(|held| held.table),
+            made: None,
+            or_replace: false,
+            if_not_exists: false,
+        }));
+    }
+    let name = if written.temporary {
+        catalog.resolve_for_create_temporary(&parts)?
+    } else {
+        catalog.resolve_for_create(&parts)?
+    };
+    let table = written.overloads.first().is_some_and(|overload| overload.table);
+    let case = session.semantics().identifier_case();
+    let mut overloads = Vec::with_capacity(written.overloads.len());
+    for overload in &written.overloads {
+        let parameters: Vec<Parameter> = overload
+            .parameters
+            .iter()
+            .map(|(name, ty, default)| Parameter {
+                name: name.clone(),
+                ty: ty.clone(),
+                default: default.clone(),
+            })
+            .collect();
+        for parameter in &parameters {
+            let Some(default) = &parameter.default else {
+                continue;
+            };
+            let checked =
+                parse_ast_with_case(&format!("SELECT {default}"), case).and_then(|default| {
+                    crate::statement::bind_one(&default, catalog, &given.uncaught(), session, false)
+                });
+            if let Err(error) = checked
+                && error.to_string().contains("Referenced column")
+            {
+                return Err(Error::binder(format!(
+                    "Default value for parameter \"{}\" cannot contain column names",
+                    parameter.name
+                )));
+            }
+        }
+        let aggregating = if overload.table {
+            read_tables(catalog, given, session, &overload.body, &parameters)?;
+            false
+        } else {
+            checked(catalog, given, session, &overload.body, &parameters)?
+        };
+        overloads.push(Overload { parameters, body: overload.body.clone(), aggregating });
+    }
+    if written.or_replace {
+        let mut seen = Vec::new();
+        let calls_itself =
+            overloads.iter().any(|overload| depends(catalog, &overload.body, &name, &mut seen));
+        if calls_itself {
+            return Err(Error::catalog("CREATE OR REPLACE is not allowed to depend on itself"));
+        }
+    }
+    Ok(Bound::Macro(MacroChange {
+        name: Some(name.clone()),
+        table,
+        made: Some(rudb_catalog::Macro { name, table, overloads, oid: 0 }),
+        or_replace: written.or_replace,
+        if_not_exists: written.quiet,
+    }))
+}
+
+/// Binds a table macro's body with a null in place of each parameter, which the pin does too, so
+/// that a body reading a table that is not there is refused when it is made.
+fn read_tables(
+    catalog: &Catalog,
+    given: &Parameters,
+    session: &Session,
+    body: &str,
+    parameters: &[Parameter],
+) -> Result<()> {
+    let names: Vec<&str> = parameters.iter().map(|parameter| parameter.name.as_str()).collect();
+    let nulls = vec!["NULL".to_string(); names.len()];
+    let text = substitute(body, &names, &nulls)?;
+    let Ok(parsed) = parse_ast_with_case(&text, session.semantics().identifier_case()) else {
+        return Ok(());
+    };
+    let Err(error) =
+        crate::statement::bind_one(&parsed, catalog, &given.uncaught(), session, false)
+    else {
+        return Ok(());
+    };
+    let message = error.to_string();
+    let missing = message
+        .strip_prefix("Catalog Error: Table with name ")
+        .and_then(|rest| rest.split_once(" does not exist"))
+        .map(|(name, _)| name.to_ascii_lowercase());
+    if missing.is_some_and(|name| body.to_ascii_lowercase().contains(&name)) {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Binds a scalar macro's body with a null in place of each parameter, and answers whether it has
+/// an aggregate in it.
+fn checked(
+    catalog: &Catalog,
+    given: &Parameters,
+    session: &Session,
+    body: &str,
+    parameters: &[Parameter],
+) -> Result<bool> {
+    let names: Vec<&str> = parameters.iter().map(|parameter| parameter.name.as_str()).collect();
+    let nulls: Vec<String> = parameters
+        .iter()
+        .map(|parameter| match &parameter.ty {
+            Some(ty) => format!("NULL::{ty}"),
+            None => "NULL".to_string(),
+        })
+        .collect();
+    let text = substitute(body, &names, &nulls)?;
+    let parsed =
+        parse_ast_with_case(&format!("SELECT {text}"), session.semantics().identifier_case())?;
+    let expr = match parsed.statements.first() {
+        Some(&ast::Statement::Query(query)) => match parsed.query(query).body {
+            ast::QueryBody::Select(select) => {
+                parsed.target_list(parsed.select(select).targets).first().map(|target| target.expr)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(expr) = expr else {
+        return Ok(false);
+    };
+    if matches!(parsed.expr(expr), ast::Expr::Star { .. }) {
+        return Err(Error::binder("STAR expression is not supported here"));
+    }
+    if let Err(error) =
+        crate::statement::bind_one(&parsed, catalog, &given.uncaught(), session, false)
+    {
+        // A missing function counts only when the body names it, since `x.a.b` binds to
+        // `struct_extract` over a `NULL`, which has no field to take.
+        let message = error.to_string();
+        let missing = message
+            .split_once("with name ")
+            .and_then(|(_, rest)| rest.split_once(" does not exist"))
+            .map(|(name, _)| name.trim_matches('"').to_ascii_lowercase());
+        let written = missing.is_none_or(|name| body.to_ascii_lowercase().contains(&name));
+        if message.contains("Referenced column")
+            || (message.starts_with("Catalog Error") && written)
+            || message.contains("Conflicting column names")
+            || message.contains("Window functions are not supported here")
+        {
+            return Err(error);
+        }
+    }
+    // A parameter is a column to the pin while the body is bound, so a query in the body that
+    // reads a table with a column of that name finds it twice. Left as a name, a parameter that
+    // binds at all has been found in the body's own tables.
+    if body.to_ascii_lowercase().contains("select") {
+        for (index, name) in names.iter().enumerate() {
+            let mut values = nulls.clone();
+            values[index] = quoted(name);
+            let text = substitute(body, &names, &values)?;
+            if text == substitute(body, &names, &nulls)? {
+                continue;
+            }
+            let parsed = parse_ast_with_case(
+                &format!("SELECT {text}"),
+                session.semantics().identifier_case(),
+            )?;
+            let bound =
+                crate::statement::bind_one(&parsed, catalog, &given.uncaught(), session, false);
+            if bound.is_ok() {
+                return Err(Error::binder(format!("Conflicting column names for column {name}!")));
+            }
+        }
+    }
+    Ok(crate::expr::aggregating(&parsed, expr, &|name| catalog.aggregating_macro(name)))
+}
+
+/// Whether a body calls the macro of that name, itself or through the macros it calls.
+fn depends(catalog: &Catalog, body: &str, name: &QualifiedName, seen: &mut Vec<String>) -> bool {
+    let Ok(tokens) = tokenize(body) else {
+        return false;
+    };
+    for (at, token) in tokens.iter().enumerate() {
+        if !tokens.get(at + 1).is_some_and(|next| next.text(body) == "(") {
+            continue;
+        }
+        let text = token.text(body);
+        let word = text.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(text);
+        let Some(found) = catalog.resolve_macro(&[word], None) else {
+            continue;
+        };
+        if found.name == *name {
+            return true;
+        }
+        let key = found.name.to_string();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        if found.overloads.iter().any(|overload| depends(catalog, &overload.body, name, seen)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The body with every mention of a parameter replaced by its argument, in brackets.
 ///
 /// A mention is a bare or quoted word that spells the parameter and is not a function's name or a
@@ -353,6 +820,12 @@ fn substitute(body: &str, parameters: &[&str], arguments: &[String]) -> Result<S
         };
         let next = tokens.get(at + 1).map(|next| next.text(body));
         if matches!(next, Some("(" | ":=")) {
+            continue;
+        }
+        // The `a` in `t.a` is a column of `t` and the one in `x AS a` is a new name, and neither
+        // is the parameter.
+        let previous = at.checked_sub(1).map(|before| tokens[before].text(body));
+        if previous.is_some_and(|before| before == "." || before.eq_ignore_ascii_case("AS")) {
             continue;
         }
         out.push_str(&body[copied..token.start as usize]);
