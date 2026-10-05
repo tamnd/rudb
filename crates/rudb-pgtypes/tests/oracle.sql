@@ -122,3 +122,66 @@ set extra_float_digits = -3;
 select t, -3, i, pg_temp.out(t, i) from floats order by n;
 set extra_float_digits = -15;
 select t, -15, i, pg_temp.out(t, i) from floats order by n;
+-- The date and time types. Each value is read once in ISO and UTC, and the line has the hex of
+-- the binary output as the input, so that the test checks the receive function and the output
+-- function together. The second field is DateStyle, DateStyle and TimeZone, or IntervalStyle.
+reset datestyle;
+set timezone = 'UTC';
+create temp table dates (n serial, v date);
+insert into dates (v) values ('2026-10-05'), ('2000-01-01'), ('1999-12-31'), ('1970-01-01'),
+  ('2000-02-29'), ('1900-03-01'), ('0001-01-01'), ('0001-12-31 BC'), ('0044-03-15 BC'),
+  ('4714-11-24 BC'), ('9999-12-31'), ('10000-01-01'), ('5874897-12-31'), ('infinity'),
+  ('-infinity');
+create temp table times (n serial, v time);
+insert into times (v) values ('00:00'), ('24:00'), ('12:34:56.789'), ('23:59:59.999999'),
+  ('00:00:00.000001'), ('01:02:03.1'), ('10:00:00.120');
+create temp table timetzs (n serial, v timetz);
+insert into timetzs (v) values ('12:34:56+05:30'), ('00:00-15:59'), ('24:00+15:59:59'), ('12:00+00'),
+  ('12:00-05:21:10'), ('23:59:59.5+01'), ('06:00:00.000001-00:00:01');
+create temp table stamps (n serial, v timestamp);
+insert into stamps (v) values ('2026-10-04 12:34:56.789'), ('2026-10-05 00:00'), ('2026-10-06 01:00'),
+  ('2026-10-07 23:59:59.999999'), ('2026-10-08 00:00:00.000001'), ('2026-10-09 10:00:00.5'),
+  ('2026-10-10 12:00'), ('2000-01-01 00:00'), ('1999-12-31 23:59:59.5'), ('4714-11-24 00:00 BC'),
+  ('0044-03-15 12:00 BC'), ('0001-01-01 00:00'), ('1900-01-01 00:00'), ('10000-01-01 00:00'),
+  ('294276-12-31 23:59:59.999999'), ('infinity'), ('-infinity');
+create temp table stamptzs as select n, v::timestamptz as v from stamps;
+create temp table intervals (n serial, v interval);
+insert into intervals (v) values ('0'), ('1 year 2 months 3 days 4:05:06'),
+  ('-1 year -2 months +3 days -4:05:06'), ('1 day'), ('-1 day'), ('1 sec'), ('-1 sec'), ('1.5 sec'),
+  ('-0.5 sec'), ('0.000001 sec'), ('1 mon'), ('-1 mon'), ('1 year'), ('2 years'), ('-1 year'),
+  ('25 hours'), ('-25:00:00.000001'), ('1 min'), ('-1 min'), ('1 hour 1 min'), ('3 days 0:00:01'),
+  ('1 day -1 sec'), ('-1 day +1 sec'), ('1 year -1 day'), ('-1 year 1 day'), ('1 mon 1 day 00:00:00.5'),
+  ('-1 mon -1 day -00:00:00.5'), ('178956970 years 7 months'), ('-178956970 years -8 months'),
+  ('2147483647 days'), ('-2147483648 days'), ('2562047788 hours'), ('-2562047788 hours'),
+  ('1 year 1 sec'), ('-1 sec 1 year'), ('1 day 1 sec'), ('-1 day -1 sec'), ('10 days -10 sec'),
+  ('infinity'), ('-infinity');
+create function pg_temp.datetimes() returns table (t text, s text, i text, o text)
+language plpgsql as $$
+declare
+  ds text;
+  tz text;
+  st text;
+begin
+  foreach ds in array array['ISO, MDY', 'ISO, DMY', 'SQL, MDY', 'SQL, DMY', 'SQL, YMD',
+    'Postgres, MDY', 'Postgres, DMY', 'Postgres, YMD', 'German, DMY'] loop
+    perform set_config('datestyle', ds, false);
+    return query select 'date', ds, encode(date_send(v), 'hex'), v::text from dates order by n;
+    return query select 'timestamp', ds, encode(timestamp_send(v), 'hex'), v::text from stamps order by n;
+    foreach tz in array array['UTC', '<+05:30>-05:30', '+05:30'] loop
+      perform set_config('timezone', tz, false);
+      return query select 'timestamptz', ds || '|' || tz, encode(timestamptz_send(v), 'hex'), v::text
+        from stamptzs order by n;
+    end loop;
+    perform set_config('timezone', 'UTC', false);
+  end loop;
+  perform set_config('datestyle', 'ISO, MDY', false);
+  return query select 'time', 'ISO, MDY', encode(time_send(v), 'hex'), v::text from times order by n;
+  return query select 'timetz', 'ISO, MDY', encode(timetz_send(v), 'hex'), v::text from timetzs order by n;
+  foreach st in array array['postgres', 'postgres_verbose', 'sql_standard', 'iso_8601'] loop
+    perform set_config('intervalstyle', st, false);
+    return query select 'interval', st, encode(interval_send(v), 'hex'), v::text from intervals order by n;
+  end loop;
+  perform set_config('intervalstyle', 'postgres', false);
+end
+$$;
+select * from pg_temp.datetimes();
