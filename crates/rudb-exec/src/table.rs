@@ -1506,19 +1506,19 @@ pub(crate) fn coded_within<'a>(
     };
     {
         static SHOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        if std::env::var_os("RUDB_DBG").is_some() && SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+        if std::env::var_os("RUDB_DBG").is_some() && SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100_000_000 {
             let forms: Vec<String> = keys.iter().enumerate().map(|(at, key)| {
                 let kind = match (&found[at], &windows[at]) {
                     (Some((Places::Bits { packed }, _, _)), _) => format!("bits w{} b{}", packed.width(), packed.base()),
                     (Some((Places::CodedBits { packed, .. }, _, _)), _) => format!("codedbits w{} b{}", packed.width(), packed.base()),
                     (Some((Places::Codes { .. }, _, _)), _) => "codes".to_string(),
                     (Some((Places::Values { .. }, _, _)), _) => "values?".to_string(),
-                    (None, Some(w)) => format!("window {:?} fallback {} held {:?} packed {:?}", w, fallback[at].is_some(), held.get(at).map(|h| format!("{h:?}")), key.packed_parts().map(|p| (p.width(), p.base()))),
+                    (None, Some(w)) => format!("window {:?} fb {} held {:?} packed {:?}", w, fallback[at].is_some(), held.get(at).map(|h| format!("{h:?}")), key.packed_parts().map(|p| (p.width(), p.base()))),
                     (None, None) => "none".to_string(),
                 };
                 format!("{}:{kind}", key.logical_type())
             }).collect();
-            eprintln!("coded rows {rows}: {}", forms.join(" | "));
+            eprintln!("coded full {}: {}", rows == 8192, forms.join(" | "));
         }
     }
     let mut columns = [None; KEYS];
