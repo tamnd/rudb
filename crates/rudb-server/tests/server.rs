@@ -546,6 +546,93 @@ fn the_errors_of_the_extended_query_flow() {
 }
 
 #[test]
+fn the_transaction_rules_of_postgres() {
+    let dirs = Dirs::new("implicit");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create table t (i integer)");
+    let count = |client: &mut Client| {
+        let messages = client.query("select count(*) from t");
+        String::from_utf8(data_row(&messages[1])[0].clone().unwrap()).unwrap()
+    };
+    let warning = |message: &Message| {
+        assert_eq!(message.field(b'S').as_deref(), Some("WARNING"));
+        (message.field(b'C').unwrap(), message.field(b'M').unwrap())
+    };
+    let no_transaction = ("25P01".to_owned(), "there is no transaction in progress".to_owned());
+
+    // A query of more than one statement runs in one transaction, and an error rolls it back.
+    let messages = client.query("insert into t values (1); select nope");
+    assert_eq!((tags(&messages).as_str(), messages[2].body.as_slice()), ("CEZ", &b"I"[..]));
+    assert_eq!(count(&mut client), "0");
+
+    // A COMMIT in it commits with a warning, and the next statements run in a new transaction.
+    let messages =
+        client.query("insert into t values (1); commit; insert into t values (2); select nope");
+    assert_eq!(tags(&messages), "CNCCEZ");
+    assert_eq!(warning(&messages[1]), no_transaction);
+    assert_eq!(count(&mut client), "1");
+
+    // A BEGIN in it makes the transaction a block, without a warning.
+    let messages = client.query("select 1; begin; select 2");
+    assert_eq!((tags(&messages).as_str(), messages[7].body.as_slice()), ("TDCCTDCZ", &b"T"[..]));
+    let messages = client.query("begin");
+    assert_eq!(tags(&messages), "NCZ");
+    assert_eq!(
+        warning(&messages[0]),
+        ("25001".to_owned(), "there is already a transaction in progress".to_owned())
+    );
+    client.query("rollback");
+
+    // COMMIT and ROLLBACK without a transaction give a warning and their tag.
+    for sql in ["commit", "rollback"] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "NCZ");
+        assert_eq!(warning(&messages[0]), no_transaction);
+        assert_eq!(text(&messages[1]), sql.to_uppercase());
+    }
+
+    // In a failed block each statement gives 25P02 until the block ends.
+    client.query("begin");
+    client.query("select nope");
+    let messages = client.query("select 1");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("25P02"));
+    assert_eq!(
+        messages[0].field(b'M').as_deref(),
+        Some("current transaction is aborted, commands ignored until end of transaction block")
+    );
+    assert_eq!(text(&client.query("commit")[0]), "ROLLBACK");
+
+    // In the extended flow the transaction ends at Sync, and an error rolls back all the
+    // statements after the last Sync.
+    client.parse("", "insert into t values (3)", &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 0);
+    client.parse("", "select nope from", &[]);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12CEZ");
+    assert_eq!(count(&mut client), "1");
+    client.parse("", "insert into t values (3)", &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 0);
+    client.parse("c", "commit", &[]);
+    client.bind("", "c", &[], &[]);
+    client.execute("", 0);
+    client.parse("", "select nope from", &[]);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12C12NCEZ");
+    assert_eq!(count(&mut client), "2");
+    client.parse("", "insert into t values (4)", &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 0);
+    assert_eq!(tags(&client.sync()), "12CZ");
+    assert_eq!(count(&mut client), "3");
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_startup_refusals() {
     let dirs = Dirs::new("refusals");
     let mut config = dirs.config();
