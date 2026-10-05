@@ -103,7 +103,9 @@ fuzz_target!(|input: Input| {
         Frontend::Terminate.encode(&mut bytes);
     }
     let mut server = Server::new();
-    assert_eq!(server.feed(&bytes), bytes.len());
+    // A message other than the copy messages in a copy is fatal, so the server can stop early.
+    let used = server.feed(&bytes);
+    assert!(used == bytes.len() || server.closed());
     server.check_ready();
 });
 
