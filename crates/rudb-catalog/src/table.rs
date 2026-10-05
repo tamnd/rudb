@@ -2151,6 +2151,80 @@ impl Table {
         Ok(true)
     }
 
+    /// Writes `rows`, every column of the table and a row for each of `numbers`, which rise, over
+    /// the rows those numbers name, where they are, and says whether it could. When it could not,
+    /// some of the rows may be written already, so the caller works on a copy.
+    ///
+    /// What a commit does with the rows its transaction updated when somebody else committed rows
+    /// of the same table since, rather than read every row of the table to write them again. Every
+    /// row keeps its number and every key its row, so the frame and the placing stay, and a row
+    /// whose key is not the key already there is refused for the same reason [`Self::put_row`]
+    /// does not write a column of a key.
+    ///
+    /// # Errors
+    ///
+    /// If a column that refuses nulls would hold one, a number is past the table, or there are not
+    /// as many rows as numbers.
+    pub fn put_rows(&mut self, numbers: &[u64], rows: &[Chunk]) -> Result<bool> {
+        if rows.iter().map(Chunk::len).sum::<usize>() != numbers.len() {
+            return Err(Error::internal("rows written over with a row short or over"));
+        }
+        if numbers.is_empty() {
+            return Ok(true);
+        }
+        if matches!(self.rows, Rows::Grown(..)) {
+            return Ok(false);
+        }
+        for chunk in rows {
+            self.refuse_nulls(chunk)?;
+        }
+        let keyed: Vec<usize> =
+            self.guards().iter().flat_map(|key| key.columns.iter().copied()).collect();
+        let targets: Vec<usize> =
+            (0..self.columns.len()).filter(|column| !keyed.contains(column)).collect();
+        let given = || rows.iter().flat_map(|chunk| (0..chunk.len()).map(move |row| (chunk, row)));
+        // Where each row is, as a chunk and a place in it, with its key checked against the key
+        // there. The key columns of a chunk are read once for all of its rows.
+        let mut places = Vec::with_capacity(numbers.len());
+        let (mut chunk, mut start) = (0, 0_u64);
+        let mut len = self.rows.chunk_len(0)? as u64;
+        let mut keys: Option<(usize, Chunk)> = None;
+        for (&number, (new, row)) in numbers.iter().zip(given()) {
+            while number >= start + len {
+                start += len;
+                chunk += 1;
+                len = self.rows.chunk_len(chunk)? as u64;
+            }
+            let place = (number - start) as usize;
+            if !keyed.is_empty() {
+                if keys.as_ref().is_none_or(|(at, _)| *at != chunk) {
+                    keys = Some((chunk, self.rows.read(chunk, &keyed)?.settled()?));
+                }
+                let (_, held) = keys.as_ref().expect("read just above");
+                for (at, &column) in keyed.iter().enumerate() {
+                    if held.try_value_at(place, at)? != new.try_value_at(row, column)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            places.push((chunk, place));
+        }
+        if let Rows::Memory(memory) = &mut self.rows {
+            for (&(chunk, place), (new, row)) in places.iter().zip(given()) {
+                let values = targets
+                    .iter()
+                    .map(|&column| new.try_value_at(row, column))
+                    .collect::<Result<Vec<_>>>()?;
+                if !memory.put_row(chunk, place, &targets, &values)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        self.patch_kept(numbers, &targets, rows)?;
+        Ok(true)
+    }
+
     /// Replaces an empty mutable table with its committed native snapshot.
     ///
     /// # Errors

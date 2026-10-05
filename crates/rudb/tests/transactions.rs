@@ -183,6 +183,97 @@ fn updates_of_different_rows_of_one_table_both_commit() {
 }
 
 #[test]
+fn an_update_commits_beside_rows_appended_since() {
+    let (_database, one, two) = two();
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 11 WHERE id = 1").expect("updates");
+    one.execute("INSERT INTO t VALUES (5, 50)").expect("inserts");
+    two.execute("INSERT INTO t VALUES (3, 30), (4, 40)").expect("inserts");
+    two.execute("UPDATE t SET v = 22 WHERE id = 2").expect("updates");
+    one.execute("COMMIT").expect("commits");
+    let all = ints(&[(1, 11), (2, 22), (3, 30), (4, 40), (5, 50)]);
+    assert_eq!(rows(&two, "SELECT id, v FROM t ORDER BY id"), all);
+    // The keys are found where the rows went, the ones the commit put on the end too.
+    let lookup = two.prepare("SELECT v FROM t WHERE id = ?").expect("prepares");
+    for (id, v) in [(1, 11), (4, 40), (5, 50)] {
+        let found = lookup.execute(&[Value::Integer(id)]).expect("reads");
+        assert_eq!(found.value_at(0, 0), Value::Integer(v), "{id}");
+    }
+    fails(&two, "INSERT INTO t VALUES (5, 0)", "Duplicate key \"id: 5\"");
+}
+
+#[test]
+fn an_update_of_a_row_the_transaction_added_does_not_commit_beside_rows_appended_since() {
+    let (_database, one, two) = two();
+    one.execute("BEGIN").expect("begins");
+    one.execute("INSERT INTO t VALUES (5, 50)").expect("inserts");
+    one.execute("UPDATE t SET v = 51 WHERE id = 5").expect("updates");
+    two.execute("INSERT INTO t VALUES (3, 30)").expect("inserts");
+    fails(&one, "COMMIT", "Failed to commit");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 10), (2, 20), (3, 30)]));
+}
+
+#[test]
+fn a_key_repeated_at_the_commit_takes_the_updates_back_too() {
+    let (_database, one, two) = two();
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 11 WHERE id = 1").expect("updates");
+    one.execute("INSERT INTO t VALUES (3, 31)").expect("inserts");
+    two.execute("INSERT INTO t VALUES (3, 30)").expect("inserts");
+    fails(&one, "COMMIT", "Failed to commit: PRIMARY KEY or UNIQUE constraint violation");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 10), (2, 20), (3, 30)]));
+}
+
+#[test]
+fn a_delete_does_not_commit_beside_rows_appended_since() {
+    let (_database, one, two) = two();
+    one.execute("BEGIN").expect("begins");
+    one.execute("DELETE FROM t WHERE id = 1").expect("deletes");
+    two.execute("INSERT INTO t VALUES (3, 30)").expect("inserts");
+    fails(&one, "COMMIT", "Failed to commit");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 10), (2, 20), (3, 30)]));
+}
+
+#[test]
+fn transactions_on_threads_that_update_and_append_all_commit() {
+    let database = Database::new();
+    database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").expect("creates");
+    database.execute("INSERT INTO t SELECT i, 0 FROM range(1, 9) r(i)").expect("inserts");
+    let rounds = 100;
+    thread::scope(|scope| {
+        for me in 1..=8 {
+            let connection = database.connect();
+            scope.spawn(move || {
+                let update = connection.prepare("UPDATE t SET v = v + 1 WHERE id = ?").expect("ok");
+                for round in 0..rounds {
+                    connection.execute("BEGIN").expect("begins");
+                    if round % 2 == 0 {
+                        update.execute(&[Value::Integer(me)]).expect("updates");
+                    } else {
+                        let sql = format!("UPDATE t SET v = v + 1 WHERE id = {me}");
+                        connection.execute(&sql).expect("updates");
+                    }
+                    let id = 1000 * me + round;
+                    connection
+                        .execute(&format!("INSERT INTO t VALUES ({id}, {round})"))
+                        .expect("in");
+                    connection.execute("COMMIT").expect("commits");
+                }
+            });
+        }
+    });
+    let connection = database.connect();
+    assert_eq!(
+        rows(&connection, "SELECT count(*), sum(v) FROM t WHERE id <= 8"),
+        vec![vec![Value::BigInt(8), Value::HugeInt(8 * i128::from(rounds))]]
+    );
+    assert_eq!(
+        rows(&connection, "SELECT count(*), sum(v) FROM t WHERE id > 8"),
+        vec![vec![Value::BigInt(8 * i64::from(rounds)), Value::HugeInt(8 * 4950)]]
+    );
+}
+
+#[test]
 fn appends_to_one_table_from_two_transactions_both_commit() {
     let (_database, one, two) = two();
     one.execute("BEGIN").expect("begins");
@@ -282,6 +373,35 @@ fn two_transactions_that_committed_survive_a_crash() {
     let database = Database::open(path.to_str().expect("UTF-8")).expect("reopens");
     let connection = database.connect();
     assert_eq!(rows(&connection, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 11), (3, 30)]));
+    drop(connection);
+    drop(database);
+    remove(&path);
+}
+
+#[test]
+fn an_update_committed_beside_rows_appended_since_survives_a_crash() {
+    let path = file("beside");
+    let database = Database::open(path.to_str().expect("UTF-8")).expect("opens");
+    let one = database.connect();
+    let two = database.connect();
+    one.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").expect("creates");
+    one.execute("INSERT INTO t VALUES (1, 10), (2, 20)").expect("inserts");
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 11 WHERE id = 1").expect("updates");
+    one.execute("INSERT INTO t VALUES (5, 50)").expect("inserts");
+    two.execute("INSERT INTO t VALUES (3, 30)").expect("inserts");
+    two.execute("UPDATE t SET v = 22 WHERE id = 2").expect("updates");
+    one.execute("COMMIT").expect("commits");
+    two.execute("INSERT INTO t VALUES (4, 40)").expect("inserts");
+    drop((one, two));
+    std::mem::forget(database);
+
+    let database = Database::open(path.to_str().expect("UTF-8")).expect("reopens");
+    let connection = database.connect();
+    assert_eq!(
+        rows(&connection, "SELECT id, v FROM t ORDER BY id"),
+        ints(&[(1, 11), (2, 22), (3, 30), (4, 40), (5, 50)])
+    );
     drop(connection);
     drop(database);
     remove(&path);

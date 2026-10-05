@@ -38,7 +38,7 @@ use std::time::Instant;
 
 use rudb_catalog::{Catalog, QualifiedName, Table};
 use rudb_common::{Error, Result};
-use rudb_vector::Chunk;
+use rudb_vector::{Chunk, Selection};
 
 use crate::journal::Change;
 
@@ -468,7 +468,7 @@ pub(crate) fn merge(
             if written.appends() {
                 let written = snapshot.written.remove(&table.oid()).expect("asked just above");
                 let changes = written.changes.ok_or_else(commit_conflict)?;
-                return rebase(committed, &name, before, changes, workers);
+                return rebase(committed, &name, before, table, changes, workers);
             }
         }
         // Only rows changed here, so the committed catalog keeps its shape and takes this
@@ -490,7 +490,7 @@ pub(crate) fn merge(
                 continue;
             }
             let changes = written.changes.ok_or_else(commit_conflict)?;
-            rebase(&mut next, &name, before, changes, workers)?;
+            rebase(&mut next, &name, before, table, changes, workers)?;
         }
         *committed = next;
         return Ok(());
@@ -518,11 +518,23 @@ pub(crate) fn merge(
 }
 
 /// Does what a transaction did to one table again, on the committed table `name`, which others
-/// changed since the snapshot's `before`.
+/// changed since the snapshot's `before`. `mine` is the transaction's copy of the table.
+///
+/// Appends go on the end. When the transaction took no row out and nobody moved one since, the
+/// snapshot's rows have the same numbers in the committed table and in the copy, so the rows the
+/// transaction updated are written over where they are, and the rows it added, which are the rows
+/// of the copy past the snapshot's, go on the end after whatever others added. Neither reads a row
+/// the transaction did not write, and the second is what lets a transaction that updates a table
+/// commit while others append to it, as long as it did not update a row it added itself, since
+/// the log numbers that row as the copy did.
+///
+/// Anything else is done again on every row of the table read into memory, as long as the table
+/// still has the snapshot's rows and no more.
 fn rebase(
     committed: &mut Catalog,
     name: &QualifiedName,
     before: &Table,
+    mine: &Table,
     changes: Vec<Change>,
     workers: usize,
 ) -> Result<()> {
@@ -536,17 +548,44 @@ fn rebase(
             })
             .flatten()
             .collect::<Vec<_>>();
-        return committed.table_mut(name)?.append_committing(chunks, workers).map_err(|error| {
-            if error.code() == rudb_common::ErrorCode::Constraint {
-                Error::transaction(format!("Failed to commit: {}", error.message()))
-            } else {
-                error
-            }
-        });
+        let table = committed.table_appending(name)?;
+        return table.append_committing(chunks, workers).map_err(failed_commit);
+    }
+    let base = before.rows().len() as u64;
+    let now = committed.table(name)?;
+    let moves = changes.iter().any(|change| matches!(change, Change::Delete(_)));
+    let updated = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Update(runs, _) => Some(runs),
+            _ => None,
+        })
+        .flatten()
+        .flat_map(|&(first, len)| first..first + len)
+        .collect::<BTreeSet<_>>();
+    // The log has the transaction's update of a row it added under the copy's number for it,
+    // which names somebody else's row once others added rows before it.
+    let renumbered = now.rows().len() as u64 != base && updated.last() >= Some(&base);
+    if !moves
+        && !renumbered
+        && now.frame() == before.frame()
+        && now.rows().len() as u64 >= base
+        && mine.rows().len() as u64 >= base
+    {
+        let numbers = updated.into_iter().filter(|&row| row < base).collect::<Vec<_>>();
+        let rows = picked(mine, &numbers)?;
+        let own = picked(mine, &(base..mine.rows().len() as u64).collect::<Vec<_>>())?;
+        let table = committed.table_appending(name)?;
+        if !table.put_rows(&numbers, &rows)? {
+            return Err(commit_conflict());
+        }
+        if !own.is_empty() {
+            table.append_committing(own, workers).map_err(failed_commit)?;
+        }
+        return Ok(());
     }
     // Row numbers only mean the same rows while nothing committed since moved a row or added one,
     // since the transaction's own appends were numbered from the snapshot's end.
-    let now = committed.table(name)?;
     if now.frame() != before.frame() || now.rows().len() != before.rows().len() {
         return Err(commit_conflict());
     }
@@ -562,4 +601,42 @@ fn rebase(
     }
     let table = committed.table_mut(name)?;
     if moves { table.replace_all(chunks, workers) } else { table.update_all(chunks, workers) }
+}
+
+/// A key the rows a commit adds repeat, in the words the pin fails a commit with.
+fn failed_commit(error: Error) -> Error {
+    if error.code() == rudb_common::ErrorCode::Constraint {
+        Error::transaction(format!("Failed to commit: {}", error.message()))
+    } else {
+        error
+    }
+}
+
+/// Every column of the rows of `table` at `numbers`, which rise, a chunk for each chunk of the
+/// table they are in.
+fn picked(table: &Table, numbers: &[u64]) -> Result<Vec<Chunk>> {
+    let rows = table.rows();
+    let all = (0..table.columns().len()).collect::<Vec<_>>();
+    let mut out = Vec::new();
+    let (mut at, mut start) = (0, 0_u64);
+    for chunk in 0..rows.chunk_count() {
+        if at == numbers.len() {
+            break;
+        }
+        let end = start + rows.chunk_len(chunk)? as u64;
+        let first = at;
+        while numbers.get(at).is_some_and(|&number| number < end) {
+            at += 1;
+        }
+        if at > first {
+            let picks = numbers[first..at].iter().map(|&number| (number - start) as u32).collect();
+            let read = rows.read(chunk, &all)?.settled()?;
+            out.push(read.compact(&Selection::from_indices(picks))?);
+        }
+        start = end;
+    }
+    if at != numbers.len() {
+        return Err(Error::internal("a row a transaction wrote is past its table"));
+    }
+    Ok(out)
 }
