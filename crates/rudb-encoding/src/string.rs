@@ -293,6 +293,51 @@ pub fn decode_flat(bytes: &[u8]) -> Result<Flat> {
     Ok(flat)
 }
 
+/// The values and the codes of a chunk written by [`encode`] whose outer level is a dictionary, or
+/// `None` for a chunk of any other kind.
+///
+/// [`decode_flat`] looks every code up and copies its value out once a row. A reader that can carry
+/// codes beside a dictionary can have the two halves instead, and then a filter decides once per
+/// value rather than once per row. On JOB the writer stops growing the table dictionary of
+/// `movie_info.info` partway through the load, and the 667 parts after that are dictionaries of
+/// their own, which every query that filters the column read as plain strings.
+///
+/// # Errors
+///
+/// As [`decode`], and if a code is past the end of the dictionary.
+pub fn decode_coded(bytes: &[u8]) -> Result<Option<(Flat, Vec<u32>)>> {
+    if bytes.first() != Some(&Kind::Dict.tag()) {
+        return Ok(None);
+    }
+    let mut reader = Reader::new(bytes);
+    reader.u8()?;
+    let count = reader.u32()? as usize;
+    let dictionary = decode_chunk(&mut reader)?;
+    let codes = decode_integers(&mut reader)?;
+    if codes.len() != count {
+        return Err(Error::internal(format!(
+            "a dictionary chunk says it holds {count} values and has {} codes",
+            codes.len()
+        )));
+    }
+    if reader.remaining() != 0 {
+        return Err(Error::internal(format!(
+            "{} bytes left over after decoding a string chunk",
+            reader.remaining()
+        )));
+    }
+    let codes = codes
+        .into_iter()
+        .map(|code| {
+            u32::try_from(code)
+                .ok()
+                .filter(|&code| (code as usize) < dictionary.len())
+                .ok_or_else(|| Error::internal(format!("code {code} is not in the dictionary")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some((dictionary, codes)))
+}
+
 /// Whether each value of a chunk written by [`encode`] holds `sequence`'s pieces in order, answered
 /// without decompressing it, or `None` for a chunk that is not compressed.
 ///
@@ -1950,6 +1995,29 @@ mod tests {
         bytes.extend_from_slice(&integer::encode(&[9]).unwrap());
         let error = decode(&bytes).unwrap_err();
         assert!(error.message().contains("not in the dictionary"), "{error}");
+    }
+
+    #[test]
+    fn a_dictionary_chunk_hands_back_its_values_and_codes() {
+        let distinct = urls(300);
+        let values: Vec<Vec<u8>> =
+            (0..8192).map(|index| distinct[index * 7 % distinct.len()].clone()).collect();
+        let bytes = round_trip(&values);
+        assert_eq!(kind_of(&bytes), Kind::Dict);
+        let (dictionary, codes) = decode_coded(&bytes).unwrap().expect("a dictionary");
+        assert_eq!(dictionary.len(), distinct.len(), "one value per distinct string");
+        let looked_up: Vec<Vec<u8>> =
+            codes.iter().map(|&code| dictionary.get(code as usize).unwrap().to_vec()).collect();
+        assert_eq!(looked_up, values, "the codes name the rows' values");
+
+        let fsst = encode_only(Kind::Fsst, &[b"one".as_slice(), b"two"]).unwrap().unwrap();
+        assert!(decode_coded(&fsst).unwrap().is_none(), "any other kind is declined");
+
+        let mut wrong = vec![Kind::Dict.tag()];
+        put_u32(&mut wrong, 1);
+        wrong.extend_from_slice(&encode(&[b"one".as_slice()]).unwrap());
+        wrong.extend_from_slice(&integer::encode(&[9]).unwrap());
+        assert!(decode_coded(&wrong).unwrap_err().message().contains("not in the dictionary"));
     }
 
     #[test]
