@@ -676,6 +676,18 @@ fn the_transaction_rules_of_postgres() {
     client.execute("", 0);
     assert_eq!(tags(&client.sync()), "12CZ");
     assert_eq!(count(&mut client), "3");
+
+    // A query or a change to the data that names a column or a table that is not there fails at
+    // Parse, so Bind and Execute are skipped until Sync. A statement of another kind is bound
+    // only when it runs, so its Parse succeeds.
+    for sql in ["select nope from t", "insert into nope values (1)", "delete from t where nope"] {
+        client.parse("", sql, &[]);
+        client.bind("", "", &[], &[]);
+        client.execute("", 0);
+        assert_eq!(tags(&client.sync()), "EZ", "{sql}");
+    }
+    client.parse("", "create view v as select nope from t", &[]);
+    assert_eq!(tags(&client.sync()), "1Z");
     server.stop().unwrap();
 }
 
