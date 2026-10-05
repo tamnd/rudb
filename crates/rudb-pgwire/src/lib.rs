@@ -48,9 +48,9 @@
 //! with the errors of PostgreSQL. [`Bind::params`] and [`FunctionCall::args`] give the values one
 //! by one, so the server can convert each value before it reads the next, as PostgreSQL does.
 //!
-//! # What is not here yet
-//!
-//! The cancel key. It comes in the next step of milestone PG1.
+//! [`CancelKey`], the key of `BackendKeyData` with the length of the protocol version, and
+//! [`cancel_target`], which checks a `CancelRequest` in constant time and gives the log line of
+//! PostgreSQL when it cancels nothing.
 //!
 //! # Known differences
 //!
@@ -61,6 +61,7 @@
 mod auth;
 mod backend;
 mod base64;
+mod cancel;
 mod cmdtag;
 mod crypto;
 mod error;
@@ -78,6 +79,7 @@ pub use auth::{
     md5_encrypt, password_failed, password_message, verify_md5, verify_password,
 };
 pub use backend::{Authentication, Backend, Field, Mark, OutBuf, TransactionStatus};
+pub use cancel::{CANCEL_KEY_LEN, CancelKey, QUERY_CANCELED, cancel_target};
 pub use cmdtag::CommandTag;
 pub use crypto::Crypto;
 pub use error::{Level, PROTOCOL_VIOLATION, ProtocolError};
