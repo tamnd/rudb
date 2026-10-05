@@ -574,7 +574,7 @@ pub(crate) fn sample<T: Copy>(values: &[T], window: usize, regions: usize) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use super::{Chooser, EXHAUSTIVE, Replay, Sampled, Settled, sample};
+    use super::{Chooser, EXHAUSTIVE, Replay, Sampled, Settled, Watched, sample};
     use crate::{integer, string};
 
     /// A settled shape that tests for every kind, which is what [`Settled`] did before it said
@@ -782,5 +782,29 @@ mod tests {
         let values: Vec<&[u8]> = vec![empty.as_slice(); 40_000];
         let offered = [string::Kind::Plain, string::Kind::Fsst, string::Kind::Dict];
         assert_eq!(sampled.narrow_strings(&values, &offered, 0), offered);
+    }
+
+    #[test]
+    fn a_watched_shape_says_whether_it_left_a_chunk_to_a_search() {
+        let shape =
+            Settled::new(vec![string::Kind::Front, string::Kind::Lz], vec![integer::Kind::Packed]);
+        let tail = |at: u32| at.wrapping_mul(2_654_435_761);
+        // Each URL shares its host and path with the one before it, which is what `FRONT` is for.
+        let near: Vec<Vec<u8>> = (0..1024)
+            .map(|at| {
+                format!("http://www.example.com/item/{at:06}?s={:08x}", tail(at)).into_bytes()
+            })
+            .collect();
+        let near: Vec<&[u8]> = near.iter().map(Vec::as_slice).collect();
+        let watched = Watched::new(&shape);
+        string::encode_with(&near, &watched).expect("encodes");
+        assert!(watched.fitted());
+        // These start with a hash, so neighbours share nothing and `FRONT` is not offered.
+        let apart: Vec<Vec<u8>> = (0..1024)
+            .map(|at| format!("{:08x} and the rest of it", tail(at)).into_bytes())
+            .collect();
+        let apart: Vec<&[u8]> = apart.iter().map(Vec::as_slice).collect();
+        string::encode_with(&apart, &watched).expect("encodes");
+        assert!(!watched.fitted());
     }
 }
