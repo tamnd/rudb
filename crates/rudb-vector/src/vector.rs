@@ -4656,6 +4656,138 @@ impl Packed<'_> {
         }
         kept
     }
+
+    /// The bytes from this vector's first block on, and how many whole blocks of them the lanes
+    /// can read with the slack [`crate::lanes::readable`] asks for after the last one.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn lane_bytes(&self) -> (&[u8], usize) {
+        let width = self.width as usize;
+        let start = self.offset / 64 * width * size_of::<u64>();
+        let bytes = crate::lanes::bytes_of(self.words).get(start..).unwrap_or_default();
+        let blocks = bytes
+            .len()
+            .checked_sub(crate::lanes::readable(width))
+            .map_or(0, |room| room / (8 * width) + 1);
+        (bytes, blocks)
+    }
+
+    /// Each word of `words` set or narrowed to the rows of its block where this vector's code
+    /// stands in `test` to `other`'s code plus `shift`, word `b` answering rows `64 * b` on.
+    ///
+    /// This is `l_commitdate < l_receiptdate` in q4, q12 and q21, two packed columns of one chunk
+    /// compared row by row, where the two bases are already folded into `shift`. Unpacking both
+    /// columns into vectors and comparing those wrote and read every code of the chunk twice over,
+    /// and a quarter of q12 went on it. Here eight codes of each side go into lanes, are compared
+    /// there and come out as eight bits of the answer, so nothing is stored but the answer. `fresh`
+    /// is as [`Self::within_words`] takes it, and a word already empty is not read at all, which is
+    /// what the conjuncts in front of this one leave behind.
+    ///
+    /// The bits of rows past the end of the vector say nothing and the caller clears them. `shift`
+    /// is at most 2^61 either way and both widths at most 61 bits, so `code + shift` is an `i64`.
+    pub fn against_words(
+        &self,
+        other: &Packed<'_>,
+        shift: i64,
+        test: Against,
+        words: &mut [u64],
+        fresh: bool,
+    ) {
+        let mut done = 0;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            let (one, two) = (self.width as usize, other.width as usize);
+            let lanes = 1..=crate::lanes::LANE_WIDTH_MAX;
+            let fits = i32::try_from(shift).ok().filter(|shift| shift.unsigned_abs() < 1 << 30);
+            if let Some(shift) = fits
+                && self.offset % 64 == 0
+                && other.offset % 64 == 0
+                && lanes.contains(&one)
+                && lanes.contains(&two)
+            {
+                let ((left, first), (right, second)) = (self.lane_bytes(), other.lane_bytes());
+                done = first.min(second).min(words.len());
+                let (left, right, words) = ((left, one), (right, two), &mut words[..done]);
+                match test {
+                    Against::Less => {
+                        crate::lanes::against_words::<true, false, false>(
+                            left, right, shift, words, fresh,
+                        );
+                    }
+                    Against::Greater => {
+                        crate::lanes::against_words::<false, false, false>(
+                            left, right, shift, words, fresh,
+                        );
+                    }
+                    Against::LessOrEqual => {
+                        crate::lanes::against_words::<false, false, true>(
+                            left, right, shift, words, fresh,
+                        );
+                    }
+                    Against::GreaterOrEqual => {
+                        crate::lanes::against_words::<true, false, true>(
+                            left, right, shift, words, fresh,
+                        );
+                    }
+                    Against::Equal => {
+                        crate::lanes::against_words::<false, true, false>(
+                            left, right, shift, words, fresh,
+                        );
+                    }
+                    Against::NotEqual => {
+                        crate::lanes::against_words::<false, true, true>(
+                            left, right, shift, words, fresh,
+                        );
+                    }
+                }
+            }
+        }
+        let (mut a, mut b) = ([0_u64; 64], [0_u64; 64]);
+        for (block, word) in words.iter_mut().enumerate().skip(done) {
+            if !fresh && *word == 0 {
+                continue;
+            }
+            self.unpack(64 * block, &mut a);
+            other.unpack(64 * block, &mut b);
+            #[expect(clippy::cast_possible_wrap, reason = "both widths are at most 61 bits")]
+            let found = a.iter().zip(&b).enumerate().fold(0, |found, (bit, (&a, &b))| {
+                found | u64::from(test.holds(a as i64, b as i64 + shift)) << bit
+            });
+            *word = if fresh { found } else { *word & found };
+        }
+    }
+}
+
+/// How [`Packed::against_words`] compares the code of a row on one side with the code on the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Against {
+    /// `<`.
+    Less,
+    /// `<=`.
+    LessOrEqual,
+    /// `>`.
+    Greater,
+    /// `>=`.
+    GreaterOrEqual,
+    /// `=`.
+    Equal,
+    /// `<>`.
+    NotEqual,
+}
+
+impl Against {
+    /// Whether `left` stands to `right` this way.
+    #[must_use]
+    #[inline]
+    pub fn holds(self, left: i64, right: i64) -> bool {
+        match self {
+            Self::Less => left < right,
+            Self::LessOrEqual => left <= right,
+            Self::Greater => left > right,
+            Self::GreaterOrEqual => left >= right,
+            Self::Equal => left == right,
+            Self::NotEqual => left != right,
+        }
+    }
 }
 
 /// The block of 64 codes whose `width` words start at `words[word]`, unpacked into `out`, and false
