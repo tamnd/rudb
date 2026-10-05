@@ -422,13 +422,42 @@ fn session_settings(
     ssl: bool,
     superuser: bool,
 ) -> Result<Settings, Refusal> {
-    let mut settings = Settings::new(superuser);
+    let mut settings = defaults.base.clone();
+    settings.set_superuser(superuser);
+    let mut own = vec![
+        ("is_superuser", if superuser { "on" } else { "off" }),
+        ("session_authorization", start.user.as_str()),
+    ];
+    if !defaults.ssl_given {
+        own.push(("ssl", if ssl { "on" } else { "off" }));
+    }
+    for (name, value) in own {
+        settings.set_internal(name, value).map_err(|e| refusal(&e))?;
+    }
+    let options = match &start.options {
+        Some(options) => split_options(options).map_err(|message| ("42601", message))?,
+        None => Vec::new(),
+    };
+    for (name, value) in options.iter().chain(&start.settings) {
+        settings.set(name, Some(value), Action::Set, Origin::Startup).map_err(|e| refusal(&e))?;
+    }
+    Ok(settings)
+}
+
+/// The values that every session starts with: the values that the server owns, then the values
+/// of the files, then the values of the command line. The values that depend on the session,
+/// which are the user and whether it is a superuser and uses TLS, come later in
+/// `session_settings`.
+pub(crate) fn base_settings(
+    file: &[(String, String)],
+    args: &[(String, String)],
+    paths: &[(&'static str, String)],
+) -> Settings {
+    let mut settings = Settings::new(false);
     let internal = [
         ("server_version", SERVER_VERSION),
         ("server_encoding", "UTF8"),
         ("client_encoding", "UTF8"),
-        ("is_superuser", if superuser { "on" } else { "off" }),
-        ("session_authorization", &start.user),
         ("TimeZone", "UTC"),
         ("log_timezone", "UTC"),
         ("lc_messages", "C"),
@@ -445,28 +474,20 @@ fn session_settings(
         ("commit_timestamp_buffers", "256kB"),
         ("subtransaction_buffers", "256kB"),
         ("transaction_buffers", "256kB"),
-        ("ssl", if ssl { "on" } else { "off" }),
         ("ssl_library", "rustls"),
     ];
     for (name, value) in internal {
-        settings.set_internal(name, value).map_err(|e| refusal(&e))?;
+        settings.set_internal(name, value).expect("a value that the server owns is valid");
     }
-    conf::start_session(&mut settings, &defaults.file);
+    conf::start_session(&mut settings, file);
     // The server checked the values of the command line when it started.
-    for (name, value) in &defaults.args {
+    for (name, value) in args {
         let _ = settings.set_argument(name, value);
     }
-    for (name, value) in &defaults.paths {
+    for (name, value) in paths {
         let _ = settings.set_argument(name, value);
     }
-    let options = match &start.options {
-        Some(options) => split_options(options).map_err(|message| ("42601", message))?,
-        None => Vec::new(),
-    };
-    for (name, value) in options.iter().chain(&start.settings) {
-        settings.set(name, Some(value), Action::Set, Origin::Startup).map_err(|e| refusal(&e))?;
-    }
-    Ok(settings)
+    settings
 }
 
 /// The `FATAL` error for an error of a setting at startup.
