@@ -7,7 +7,10 @@
 //! `crates/rudb-parse/grammar` in the same run as the parser's own tables, and `cargo xtask
 //! gen-grammar --check` fails the gate if the two have drifted apart. The keyword table lives here
 //! rather than in the parser because printing a type quotes a field name that is a keyword, and
-//! the type printer is in this crate.
+//! the type printer is in this crate. The table of configuration parameters comes from the
+//! PostgreSQL `guc_parameters.dat` and `guc_tables.c`, through the same two `pg-` commands as the
+//! SQLSTATE list.
 
+pub mod guc;
 pub mod keywords;
 pub mod sqlstate;
