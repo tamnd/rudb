@@ -175,7 +175,7 @@ mod tests {
     /// lanes take, so the table is right whatever the hardware the tests run on.
     #[test]
     fn the_table_reads_every_code_of_every_width() {
-        for width in 1..=LANE_WIDTH_MAX {
+        for (width, (shuffle, shifts)) in LANES.iter().enumerate().skip(1) {
             let codes: Vec<u64> = (0..64_u64).map(|i| (i * 2_654_435_761) % (1 << width)).collect();
             let mut bytes = vec![0_u8; readable(width)];
             for (i, &code) in codes.iter().enumerate() {
@@ -184,7 +184,6 @@ mod tests {
                     bytes[bit / 8] |= u8::from(code >> b & 1 == 1) << (bit % 8);
                 }
             }
-            let (shuffle, shifts) = &LANES[width];
             let half = 4 * width / 8;
             for (i, &code) in codes.iter().enumerate() {
                 let (group, lane) = (i / 8, i % 8);

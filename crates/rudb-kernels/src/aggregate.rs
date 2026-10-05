@@ -3149,13 +3149,13 @@ pub fn coded_run(
 
 /// The dictionary every one of the groups at `slots` ranks in, handing `each` the code a group holds
 /// or none for a group that saw no value, and `None` when they do not all rank in one dictionary.
-fn ranked_codes<'s>(
-    states: &'s [Accumulator],
+fn ranked_codes(
+    states: &[Accumulator],
     slots: impl Iterator<Item = usize>,
     stride: usize,
     offset: usize,
     mut each: impl FnMut(Option<u32>),
-) -> Result<Option<&'s Arc<Vector>>> {
+) -> Result<Option<&Arc<Vector>>> {
     let mut found: Option<&Arc<Vector>> = None;
     for slot in slots {
         let Some(state) = states.get(slot * stride + offset) else {

@@ -25,9 +25,11 @@ fn database() -> (Database, std::path::PathBuf) {
     database
         .execute("CREATE TABLE lineitem (l_orderkey INTEGER, l_shipdate DATE, l_receiptdate DATE)")
         .expect("creates");
+    // Every other key, so the key of an order is not its row and the join reads the link rather
+    // than finding the order by its key, which leaves no build side to carry a test onto.
     database
         .execute(
-            "INSERT INTO orders SELECT i, DATE '1992-01-01' + ((i * 7) % 2400)::INTEGER FROM \
+            "INSERT INTO orders SELECT i * 2, DATE '1992-01-01' + ((i * 7) % 2400)::INTEGER FROM \
              range(0, 20000) AS r(i)",
         )
         .expect("loads");

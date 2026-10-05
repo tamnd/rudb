@@ -24,7 +24,7 @@
 //!
 //! # When it is worth it
 //!
-//! C is a string, the file counted its distinct values, and there are at least [`SHRINK`] rows before
+//! C is a string, the file counted its distinct values, and there are at least `SHRINK` rows before
 //! the filters for each of them, so the grouping by C is a small fraction of the work below it. At
 //! least one aggregate also reads C, which is what makes each row pay for more than its key. A
 //! grouping by `left(URL, 5)` with only a `count(*)` has one cheap lookup a row, and a grouping by

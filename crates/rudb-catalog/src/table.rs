@@ -1036,7 +1036,7 @@ impl Rows {
     /// took out since the file last said, every row gone from it, for a checkpoint to write down
     /// beside the file rather than write the rest of the table again.
     ///
-    /// The rows an update wrote over go with it, see [`PATCHED_SHARE`].
+    /// The rows an update wrote over go with it, see `PATCHED_SHARE`.
     ///
     /// A table with rows appended since has a record too, for the checkpoint that extends it, see
     /// [`Self::grown_from`].
@@ -2229,6 +2229,10 @@ impl Table {
     ///
     /// If a column that refuses nulls would hold one, a number is past the table, or there are not
     /// as many rows as numbers.
+    ///
+    /// # Panics
+    ///
+    /// Never: the keys it reads back are the ones it read just before.
     pub fn put_rows(&mut self, numbers: &[u64], rows: &[Chunk]) -> Result<bool> {
         if rows.iter().map(Chunk::len).sum::<usize>() != numbers.len() {
             return Err(Error::internal("rows written over with a row short or over"));

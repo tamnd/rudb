@@ -30,3 +30,11 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 # that CI runs.
 [env]
 SOURCE_DATE_EPOCH = "1"
+
+# A thread the standard library starts has 2 MiB of stack unless this says otherwise, and the test
+# harness runs every test on one. A query nested three subqueries deep plans through frames that an
+# unoptimized build makes several times the size of a release build's, and three of the tests in
+# `crates/rudb/tests` ran out of those 2 MiB in a debug build and aborted the whole binary with them.
+# 8 MiB is what Linux gives the main thread, so a test sees the stack a program calling the engine
+# from `main` would.
+RUST_MIN_STACK = "8388608"

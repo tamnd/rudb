@@ -808,7 +808,7 @@ pub struct Units {
     begun: bool,
 }
 
-/// Up to [`CHUNK`] units read out of a file.
+/// Up to `CHUNK` units read out of a file.
 #[derive(Debug)]
 pub struct Batch {
     document: Document,
@@ -2166,7 +2166,7 @@ impl Transform<'_> {
             | LogicalType::TimestampMs
             | LogicalType::TimestampNs
             | LogicalType::TimestampTz
-            | LogicalType::Uuid => Ok(self.from_string(items, ty)),
+            | LogicalType::Uuid => Ok(self.string_column(items, ty)),
             _ if ty.is_numeric() || *ty == LogicalType::Boolean => Ok(self.numerical(items, ty)),
             _ => Err(Error::not_implemented(format!(
                 "Cannot read a value of type {ty} from a json file"
@@ -2252,7 +2252,7 @@ impl Transform<'_> {
         strings
     }
 
-    fn from_string(&mut self, items: &[Option<usize>], ty: &LogicalType) -> Column {
+    fn string_column(&mut self, items: &[Option<usize>], ty: &LogicalType) -> Column {
         let mut success = true;
         let strings = self.string_items(items, ty, &mut success);
         let mut failed = false;

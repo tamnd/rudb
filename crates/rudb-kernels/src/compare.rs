@@ -3623,7 +3623,7 @@ mod tests {
         assert!(mask_within(&nulls, &bound, &mut words, true).is_none());
         assert_eq!(words, [7], "a column it refuses leaves the mask alone");
         let not = [Bound { op: Comparison::NotEqual, value: &two, held: None }];
-        assert!(mask_within(&flat, &not, &mut vec![0; 16], true).is_none());
+        assert!(mask_within(&flat, &not, &mut [0; 16], true).is_none());
     }
 
     /// Nulls, a literal of another type and a string column are left to the two comparisons.

@@ -198,10 +198,10 @@ impl Validity {
             held[..eight.len()].copy_from_slice(eight);
             *word = u64::from_le_bytes(held);
         }
-        if len % 64 != 0 {
-            if let Some(last) = words.last_mut() {
-                *last |= u64::MAX << (len % 64);
-            }
+        if !len.is_multiple_of(64)
+            && let Some(last) = words.last_mut()
+        {
+            *last |= u64::MAX << (len % 64);
         }
         Self::Mask(Bitmap { words }).normalize(len)
     }

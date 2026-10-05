@@ -149,6 +149,10 @@ struct Relation {
 /// A column of one relation, as a position in the list of relations and a position in its scan.
 type Place = (usize, u32);
 
+/// An order of the relations, each with its place in the list of relations and the relation it
+/// hangs from, if any.
+type Order = Vec<(usize, Option<usize>)>;
+
 /// The node that stands in for the aggregate at `at`, or why there is none.
 fn rewrite(
     plan: &mut Plan,
@@ -1343,10 +1347,7 @@ const GATHER: f64 = 16.0;
 ///
 /// Each relation has to share exactly one class with its parent. Two would be a composite key, and
 /// the executor keys a set by one integer.
-fn gyo(
-    edges: &[BTreeSet<u32>],
-    weights: &[Weight],
-) -> std::result::Result<Vec<(usize, Option<usize>)>, String> {
+fn gyo(edges: &[BTreeSet<u32>], weights: &[Weight]) -> std::result::Result<Order, String> {
     let mut order = Vec::with_capacity(edges.len());
     let mut left: Vec<usize> = (0..edges.len()).collect();
     let whole = |relation: usize| weights[relation].cost(&Standing::new(), &edges[relation]);
@@ -1434,8 +1435,8 @@ fn search(
     holders: &[Vec<u64>],
     ranked: &[usize],
     prices: &mut Prices<'_>,
-) -> Option<(f64, Vec<(usize, Option<usize>)>, bool)> {
-    type Reached = (f64, Standing, Vec<(usize, Option<usize>)>);
+) -> Option<(f64, Order, bool)> {
+    type Reached = (f64, Standing, Order);
     let mut place = vec![0; edges.len()];
     for (at, &relation) in ranked.iter().enumerate() {
         place[relation] = at;
@@ -1560,7 +1561,7 @@ fn steps(
     weights: &[Weight],
     holders: &[Vec<u64>],
     taken: u64,
-) -> Option<(Vec<(usize, Option<usize>)>, Vec<(usize, Option<usize>)>)> {
+) -> Option<(Order, Order)> {
     let mut found = Vec::new();
     let mut waiting = Vec::new();
     let left = ranked.iter().fold(0, |mask, &relation| mask | 1 << relation) & !taken;
@@ -1613,11 +1614,7 @@ fn steps(
 /// The root then holds the rows it keeps until the second sweep, which is charged at [`HOLD`] a
 /// row.
 #[expect(clippy::cast_precision_loss, reason = "a count of rows is a weight here")]
-fn trail(
-    edges: &[BTreeSet<u32>],
-    weights: &[Weight],
-    order: Vec<(usize, Option<usize>)>,
-) -> Vec<(usize, Option<usize>)> {
+fn trail(edges: &[BTreeSet<u32>], weights: &[Weight], order: Order) -> Order {
     let Some(&(last, None)) = order.last() else { return order };
     let children = |order: &[(usize, Option<usize>)], of: usize| {
         order.iter().filter(|&&(_, parent)| parent == Some(of)).count()
@@ -1658,7 +1655,7 @@ fn trail(
     let mut moved = false;
     loop {
         let at = tried.iter().position(|&(relation, _)| relation == root).unwrap_or_default();
-        let mut cheapest: Option<(f64, Vec<(usize, Option<usize>)>)> = None;
+        let mut cheapest: Option<(f64, Order)> = None;
         for (slot, &(leaf, parent)) in tried[..at].iter().enumerate() {
             if parent != Some(root) || edges[leaf].len() != 1 || children(&tried, leaf) > 0 {
                 continue;

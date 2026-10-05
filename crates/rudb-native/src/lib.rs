@@ -54,7 +54,7 @@ use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
-use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below};
+use rudb_vector::{Buffer, Chunk, Data, Packed, Runs, TextSource, Vector, search_below};
 
 mod anchor;
 mod distinct;
@@ -2829,7 +2829,7 @@ impl Writer {
         let size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
         let (mut closed, views, card, anchor) = decode_catalog(&bytes, size)?;
-        let card = card_for(path.as_ref(), card);
+        let card = card_for(path, card);
         let mut version = [0; 4];
         read_at(&*file, 8, &mut version)?;
         let wide = u32::from_le_bytes(version) >= 31;
@@ -5172,6 +5172,14 @@ pub fn restate(
 /// reader.
 type Synopsis = Arc<Vec<(Value, u64)>>;
 
+/// The share of the sampled rows each pattern kept, by column, function and pattern. See
+/// [`Reader::matched`].
+type Matched = HashMap<(usize, String, String), f64>;
+
+/// The key values of the rows each condition kept, by column, function, pattern and key column. See
+/// [`Reader::picked`].
+type Picked = HashMap<(usize, String, String, usize), Option<Vec<Value>>>;
+
 /// Reads committed native column pages without holding the table in memory.
 #[derive(Debug, Clone)]
 pub struct Reader {
@@ -5207,10 +5215,10 @@ pub struct Reader {
     facts: Arc<OnceLock<Arc<rudb_common::ColumnFacts>>>,
     /// What share of the sampled rows each pattern a plan asked about kept, by column, function and
     /// pattern. See [`Reader::matched`].
-    matched: Arc<Mutex<HashMap<(usize, String, String), f64>>>,
+    matched: Arc<Mutex<Matched>>,
     /// The key values of the rows each condition a plan asked about kept, by column, function,
     /// pattern and key column. See [`Reader::picked`].
-    picked: Arc<Mutex<HashMap<(usize, String, String, usize), Option<Vec<Value>>>>>,
+    picked: Arc<Mutex<Picked>>,
     /// How many global dictionaries have been opened. A scan of a dictionary column should open its
     /// dictionary once however many workers it has, and the test that says so is the only thing
     /// keeping it that way.
@@ -6899,12 +6907,7 @@ impl TextSource for NativeText {
 
     /// The rest of the block holding `first`, handed over where it lies with the ends of its values
     /// counted from the start of the run.
-    fn sweep_runs(
-        &self,
-        first: usize,
-        limit: usize,
-        body: &mut dyn FnMut(usize, &[u8], &[usize]) -> Result<()>,
-    ) -> Result<Option<usize>> {
+    fn sweep_runs(&self, first: usize, limit: usize, body: &mut Runs<'_>) -> Result<Option<usize>> {
         let limit = limit.min(self.values);
         if first >= limit {
             return Ok(Some(first));
@@ -7963,7 +7966,7 @@ impl Reader {
     /// fifth of the rows. That is wrong both ways and JOB shows both: `'%Downey%Robert%'` keeps a
     /// handful of the four million names and `'%(co-production)%'` keeps a tenth of the companies,
     /// and in 6d the fifth made `name` look dearer than `cast_info` and put it after. So the pattern
-    /// is run over [`SAMPLED_PARTS`] parts spread across the table, read the way a sparse scan reads
+    /// is run over `SAMPLED_PARTS` parts spread across the table, read the way a sparse scan reads
     /// them so no page is kept for it, and a pattern nothing in the sample matched is charged half a
     /// row of the sample rather than none. The answer is kept for as long as the reader is, so a
     /// statement run again asks the file nothing.
@@ -8013,7 +8016,7 @@ impl Reader {
     }
 
     /// The values of `key` in every row of the table `function` keeps, run as [`Self::matched`]
-    /// runs it, when the table has no more than [`PICKED_PARTS`] parts and the rows kept are no more
+    /// runs it, when the table has no more than `PICKED_PARTS` parts and the rows kept are no more
     /// than `most`.
     ///
     /// The whole table rather than a sample, because the answer is which rows and not how many. A
@@ -16052,7 +16055,7 @@ mod tests {
             Writer::create(&path, "words", vec![Field::new("w", LogicalType::Varchar)])
                 .expect("new file");
         let values: Vec<Value> = (0..400)
-            .map(|row| Value::Varchar(format!("{}{row}", ["a", "b", "c", "k"][row % 4]).into()))
+            .map(|row| Value::Varchar(format!("{}{row}", ["a", "b", "c", "k"][row % 4])))
             .collect();
         let rows =
             Chunk::new(vec![Vector::from_values(LogicalType::Varchar, &values).expect("text")])

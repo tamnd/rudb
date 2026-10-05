@@ -219,10 +219,11 @@ fn trimmed<'t>(name: &str, text: &'t str, separators: &[u8], trim: bool) -> &'t 
         _ => {
             let begin = last_of(bytes, separators).map_or(0, |at| at + 1);
             let mut end = bytes.len();
-            if trim && let Some(dot) = bytes.iter().rposition(|&byte| byte == b'.') {
-                if begin <= dot {
-                    end = dot;
-                }
+            if trim
+                && let Some(dot) = bytes.iter().rposition(|&byte| byte == b'.')
+                && begin <= dot
+            {
+                end = dot;
             }
             &text[begin..end]
         }

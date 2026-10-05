@@ -8411,10 +8411,9 @@ mod tests {
     /// Per #313.
     #[test]
     fn a_keyword_is_not_stepped_through_on_the_way_to_its_one_argument() {
-        for (sql, rule) in [("SELECT unpack([1])", "UnpackExpression")] {
-            let error = parse_ast(sql).expect_err(sql);
-            assert!(error.message().ends_with(rule), "{sql}: {error}");
-        }
+        let (sql, rule) = ("SELECT unpack([1])", "UnpackExpression");
+        let error = parse_ast(sql).expect_err(sql);
+        assert!(error.message().ends_with(rule), "{sql}: {error}");
         // Grouping brackets really do say nothing, and that is the one rule of this shape that is
         // stepped through rather than refused.
         assert_eq!(round("SELECT (1 + 2) * 3"), "SELECT ((1 Add 2) Multiply 3)");

@@ -126,6 +126,10 @@ pub const MAP_VALUE: &str = "value";
 /// word.
 pub type MapParts<'a> = (&'a [(u32, u32)], &'a Vector, &'a Vector);
 
+/// What a run of text values is handed to: the index of the first value, the values laid end to
+/// end, and where each of them ends. A name for the same reason as [`MapParts`].
+pub type Runs<'a> = dyn FnMut(usize, &[u8], &[usize]) -> Result<()> + 'a;
+
 /// Which physical form a vector is in.
 ///
 /// An operator asks this once per vector and then takes the path it wants, which is the one branch
@@ -332,7 +336,7 @@ impl Data {
                         let paged = values.is_shared();
                         values.to_mut()[index] = value;
                         if paged {
-                            *values = std::mem::replace(values, Buffer::new()).into_page();
+                            *values = std::mem::take(values).into_page();
                         }
                         true
                     })+
@@ -751,12 +755,7 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
     /// # Errors
     ///
     /// Whatever reading the values raises, and whatever `body` raises.
-    fn sweep_runs(
-        &self,
-        first: usize,
-        limit: usize,
-        body: &mut dyn FnMut(usize, &[u8], &[usize]) -> Result<()>,
-    ) -> Result<Option<usize>> {
+    fn sweep_runs(&self, first: usize, limit: usize, body: &mut Runs<'_>) -> Result<Option<usize>> {
         let _ = (first, limit, body);
         Ok(None)
     }
@@ -2709,7 +2708,7 @@ impl Vector {
         &self,
         first: usize,
         limit: usize,
-        body: &mut dyn FnMut(usize, &[u8], &[usize]) -> Result<()>,
+        body: &mut Runs<'_>,
     ) -> Result<Option<usize>> {
         match &self.body {
             Body::ExternalText { source } if matches!(self.validity, Validity::AllValid) => {

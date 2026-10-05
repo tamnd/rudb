@@ -418,7 +418,7 @@ pub fn summarized(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Optio
 }
 
 /// The cutoff of a top N that runs outside the first engine, over the rows of a scan the first
-/// engine builds with [`build_cut_into`]. See [`crate::cutoff`] for why a scan may skip the parts
+/// engine builds with [`build_cut_into`]. See `crate::cutoff` for why a scan may skip the parts
 /// it rules out.
 #[derive(Debug)]
 pub struct TopCut(Arc<Cutoff>);

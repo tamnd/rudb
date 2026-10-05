@@ -13,7 +13,7 @@
 //! of `SELECT URL, COUNT(*) FROM hits GROUP BY URL` showing up as wall time with nothing to account
 //! for it, which is the sort of hole that sends somebody optimising the wrong thing for a week.
 
-use rudb::Database;
+use rudb::{Config, Database};
 use rudb_metrics::Document;
 
 /// Runs a grouped aggregate over `rows` rows and `keys` groups on `threads` threads.
@@ -22,7 +22,9 @@ use rudb_metrics::Document;
 /// because a merge of partitioned tables is the thing being measured and an aggregate small enough
 /// to stay in one table never does one.
 fn measured(rows: i64, keys: i64, threads: usize) -> Document {
-    let database = Database::new();
+    // Every core the setting allows rather than the ones sitting idle, so a busy machine starts as
+    // many workers as an idle one.
+    let database = Database::with_config(Config::new().with_yielding(false));
     let connection = database.connect();
     connection.execute(&format!("SET threads = {threads}")).expect("sets the thread count");
     connection

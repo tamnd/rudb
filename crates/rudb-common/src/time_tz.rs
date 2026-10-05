@@ -81,10 +81,10 @@ mod tests {
 
     #[test]
     fn a_key_gives_back_its_time_and_its_offset() {
-        for offset in [-MAX_OFFSET, -19_800, 0, 3_600, MAX_OFFSET] {
+        for shift in [-MAX_OFFSET, -19_800, 0, 3_600, MAX_OFFSET] {
             for time in [0, 12 * HOUR + 1, MICROS_PER_DAY] {
-                let key = pack(time, offset);
-                assert_eq!((micros(key), offset(key)), (time, offset));
+                let key = pack(time, shift);
+                assert_eq!((micros(key), offset(key)), (time, shift));
                 assert_eq!(from_bits(bits(key)), key);
             }
         }

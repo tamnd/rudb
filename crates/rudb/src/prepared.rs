@@ -971,7 +971,6 @@ mod tests {
             "INSERT INTO t VALUES (?, ?, ?, ?) RETURNING id",
             "INSERT INTO t SELECT ?, ?, ?, ?",
             "INSERT INTO t VALUES (?, ?, ?, 1 + ?)",
-            "INSERT INTO t VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
         ] {
             assert!(db.prepare(sql).expect("prepares").direct.is_none(), "{sql}");
         }

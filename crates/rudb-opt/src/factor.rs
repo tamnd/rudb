@@ -33,8 +33,8 @@
 //!
 //! # When it is worth it
 //!
-//! Every small column has at most [`SMALL`] values, as the file says, and the keys and the small
-//! columns together have at most one group for each [`SHRINK`] rows under the aggregate. A decimal
+//! Every small column has at most `SMALL` values, as the file says, and the keys and the small
+//! columns together have at most one group for each `SHRINK` rows under the aggregate. A decimal
 //! column's count is the span between its two ends, which the native file states for every column
 //! it wrote exact ends for. At least one `sum` has a small factor beside a factor that is not, since
 //! that is the product the rows stop paying for, and the grouping below adds up fewer sums per row
