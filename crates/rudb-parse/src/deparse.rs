@@ -380,6 +380,7 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
             format!("{}COLUMNS({})", if unpacked { "*" } else { "" }, expr(ast, inner))
         }
         Expr::Column { name } => parts(ast, name),
+        Expr::Positional { index } => format!("#{index}"),
         Expr::Literal { kind, text } => literal(ast, kind, text),
         Expr::Unary { op, operand } => unary(ast, op, operand),
         Expr::Binary { op, left, right } => binary(ast, op, left, right),

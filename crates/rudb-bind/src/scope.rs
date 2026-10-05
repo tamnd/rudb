@@ -111,6 +111,21 @@ impl Scope {
         self.columns.len()
     }
 
+    /// The column `#index` stands for, or how many there are to count when there are fewer.
+    ///
+    /// The pin counts every column of every table in the `FROM` clause in order, so both copies of
+    /// a column a `USING` join joined on count, and the one a `RIGHT` or `FULL` join puts in front
+    /// for a bare name does not, since that one is not any table's.
+    pub(crate) fn positional(&self, index: u32) -> std::result::Result<&Visible, usize> {
+        let counted: Vec<&Visible> = self
+            .columns
+            .iter()
+            .filter(|column| !matches!(column.using, Some(Joined::Merged(_))))
+            .collect();
+        let at = usize::try_from(index).unwrap_or(usize::MAX).saturating_sub(1);
+        counted.get(at).copied().ok_or(counted.len())
+    }
+
     /// Resolves a written name to one column.
     ///
     /// One part is a column name and it has to be unique across every table in scope. Two parts are

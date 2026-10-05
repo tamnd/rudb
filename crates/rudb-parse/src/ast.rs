@@ -1165,6 +1165,12 @@ pub enum Expr {
         /// The name, as a run of [`StrRef`], outermost first, so `s.t.a` is three parts.
         name: Slice,
     },
+    /// `#2`, the second column of everything the `FROM` clause brings in, counted the way `SELECT
+    /// *` would count it with every table's columns in.
+    Positional {
+        /// The number written, which is at least one.
+        index: u32,
+    },
     /// A literal, kept as the text that was written.
     Literal {
         /// Which kind.

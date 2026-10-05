@@ -121,6 +121,19 @@ impl Binder<'_> {
             }
             ast::Expr::Columns { .. } => self.bind_picked(ast, scope),
             ast::Expr::Column { name } => self.bind_column(ast, name, scope),
+            ast::Expr::Positional { index } => {
+                let found = scope.positional(index).map_err(|total| {
+                    Error::binder(format!(
+                        "Positional reference {index} out of range (total {total} columns)"
+                    ))
+                })?;
+                let (table, column) = (found.table.clone(), found.name.clone());
+                if table.is_empty() {
+                    self.bind_column_parts(Some(ast), &[&column], scope)
+                } else {
+                    self.bind_column_parts(Some(ast), &[&table, &column], scope)
+                }
+            }
             ast::Expr::Literal { kind, text } => self.bind_literal(ast, kind, text),
             ast::Expr::Unary { op, operand } => self.bind_unary(ast, op, operand, scope),
             ast::Expr::Binary { op, left, right } => self.bind_binary(ast, op, left, right, scope),
@@ -2540,6 +2553,7 @@ pub(crate) fn aggregating(ast: &Ast, expr: ast::ExprRef, user: &dyn Fn(&str) -> 
         ast::Expr::Star { .. }
         | ast::Expr::Columns { .. }
         | ast::Expr::Column { .. }
+        | ast::Expr::Positional { .. }
         | ast::Expr::Literal { .. }
         | ast::Expr::Parameter { .. }
         | ast::Expr::Default => false,
@@ -2687,7 +2701,9 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         // named `(a.i + 1)`. A column on its own is named by its last part, which the caller sees
         // to before it gets here.
         ast::Expr::Column { name } => ast.name(name).map(quoted).collect::<Vec<_>>().join("."),
-        ast::Expr::Columns { .. } => rudb_parse::deparse::expression(ast, expr),
+        ast::Expr::Columns { .. } | ast::Expr::Positional { .. } => {
+            rudb_parse::deparse::expression(ast, expr)
+        }
         // The deparser is the answer for a window and not an approximation of one. Every other
         // shape here is written out again because the name DuckDB gives it is not quite what its
         // own deparser would write, and a window is the one where the two agree.

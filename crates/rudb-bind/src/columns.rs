@@ -214,6 +214,7 @@ fn children(ast: &Ast, expr: ast::ExprRef) -> Vec<ast::ExprRef> {
     let mut out = match ast.expr(expr) {
         ast::Expr::Star { .. }
         | ast::Expr::Column { .. }
+        | ast::Expr::Positional { .. }
         | ast::Expr::Literal { .. }
         | ast::Expr::Parameter { .. }
         | ast::Expr::Default
