@@ -2546,6 +2546,10 @@ pub struct Writer {
     /// The rows deleted since from tables this generation carries forward, which
     /// [`Writer::with_marks`] sets and [`Writer::finish`] writes down beside them.
     marks: Vec<(String, GoneRows)>,
+    /// The tables this generation extends that had rows gone from them. Their old record names
+    /// rows of stripes the new directory still holds, and only a mark says it again, so
+    /// [`Writer::finish`] refuses a commit that has none for one of them.
+    owed: Vec<String>,
 }
 
 /// The parts of an extended table's old directory that [`Writer::close`] would otherwise work out
@@ -2776,6 +2780,9 @@ impl Writer {
     /// query works the way it does for a column that never had them. The graph sections go too,
     /// since the rows they describe are not all the rows any more. Call [`extendable`] first.
     ///
+    /// A table some rows are gone from keeps its stripes the same way, and the commit has to say
+    /// again which rows are gone, through [`Writer::with_marks`], or [`Writer::finish`] refuses it.
+    ///
     /// # Errors
     ///
     /// The same as [`Writer::open`], except that a table of this name with rows is the point, and
@@ -2842,13 +2849,10 @@ impl Writer {
                 return Err(invalid("two tables in one native file have the same name"));
             }
             let entry = closed.remove(at);
-            if taking == Same::Extend && entry.gone.is_some() {
-                return Err(invalid(
-                    "a table with rows gone from it is written again, not extended",
-                ));
-            }
             held = (taking == Same::Extend).then_some(entry);
         }
+        let owed = held.iter().filter(|entry| entry.gone.is_some()).map(|entry| entry.name.clone());
+        let owed = owed.collect();
         // The generation of the slot whose bytes checksummed, and not the highest number in the
         // header. A slot torn across a write can hold any number at all, and taking that one would
         // be choosing which slot to overwrite from a value nothing has vouched for, which is how a
@@ -2902,6 +2906,7 @@ impl Writer {
             anchor,
             profile: None,
             marks: Vec::new(),
+            owed,
         };
         if let Some(entry) = held.filter(|entry| entry.rows > 0) {
             writer.seed(&entry, size)?;
@@ -2988,6 +2993,7 @@ impl Writer {
             anchor: None,
             profile: None,
             marks: Vec::new(),
+            owed: Vec::new(),
         })
     }
 
@@ -3094,7 +3100,9 @@ impl Writer {
             let entry = self.closed.remove(at);
             held = (taking == Same::Extend).then_some(entry);
         }
-        let Self { file, at, wide, generation, mut closed, views, card, anchor, .. } = self;
+        let Self { file, at, wide, generation, mut closed, views, card, anchor, mut owed, .. } =
+            self;
+        owed.extend(held.iter().filter(|entry| entry.gone.is_some()).map(|e| e.name.clone()));
         closed.push(entry);
         let mut writer = Self {
             file,
@@ -3108,6 +3116,7 @@ impl Writer {
             anchor,
             profile: None,
             marks: Vec::new(),
+            owed,
             dictionaries: fields
                 .iter()
                 .map(|field| coded_type(&field.ty).then(GlobalDictionary::new))
@@ -4664,13 +4673,21 @@ impl Writer {
         let profile = self.profile.take();
         let _timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let mut tables = std::mem::take(&mut self.closed);
+        tables.push(entry);
+        // A table this generation extended is marked too, because its old stripes are still its
+        // first and the rows gone from them are still gone.
         for (name, gone) in std::mem::take(&mut self.marks) {
             let held = tables.iter_mut().find(|held| held.name == name).ok_or_else(|| {
                 invalid(&format!("rows gone from {name}, which this generation does not carry"))
             })?;
             mark_gone(&*self.file, &mut self.at, held, &gone)?;
+            self.owed.retain(|owed| *owed != name);
         }
-        tables.push(entry);
+        if let Some(name) = self.owed.first() {
+            return Err(invalid(&format!(
+                "table {name} had rows gone from it and is extended without saying which"
+            )));
+        }
         let catalog =
             encode_catalog(&tables, &self.views, self.card.as_ref(), self.anchor.as_ref())?;
         if catalog.len() > MAX_DIRECTORY {
@@ -4922,6 +4939,9 @@ fn write_section(
 /// A file of an older format is written again whole instead, which is also what moves it to this
 /// one.
 ///
+/// A table with rows gone from it is only `marked` extendable, by a caller that hands the
+/// writer every row gone from it again through [`Writer::with_marks`].
+///
 /// # Errors
 ///
 /// If the file has no valid committed catalog.
@@ -4930,6 +4950,7 @@ pub fn extendable(
     table: &str,
     fields: &[Field],
     rows: usize,
+    marked: bool,
 ) -> Result<bool> {
     let file = RealFilesystem::new().open(path.as_ref(), OpenMode::Read)?;
     let file = &*file;
@@ -4946,7 +4967,7 @@ pub fn extendable(
             && entry.rows == rows
             && rows > 0
             && entry.fields == fields
-            && entry.gone.is_none()
+            && (marked || entry.gone.is_none())
     }))
 }
 
@@ -16988,7 +17009,7 @@ mod tests {
         writer.append(&sample_ids()).expect("rows");
         writer.finish().expect("commit");
         let fields = [Field::required("id", LogicalType::Integer)];
-        assert!(extendable(&path, "items", &fields, 3).expect("reads"));
+        assert!(extendable(&path, "items", &fields, 3, false).expect("reads"));
         let gone = GoneRows {
             parts: vec![(0, vec![0b101].into_boxed_slice())],
             total: 2,
@@ -17006,7 +17027,7 @@ mod tests {
         // it, which would keep the stripes and lose the record.
         assert!(catalog.table_fields("items").is_none());
         assert_eq!(catalog.distinct_count("items", 0).expect("reads"), None);
-        assert!(!extendable(&path, "items", &fields, 3).expect("reads"));
+        assert!(!extendable(&path, "items", &fields, 3, false).expect("reads"));
         // A restate after that carries the record forward, and a mark naming a table the file
         // does not hold is refused.
         Writer::restate(&path, &[], None).expect("restates");
@@ -17030,6 +17051,41 @@ mod tests {
             .is_err()
         );
         fs::remove_file(&path).expect("clean up");
+    }
+
+    /// A table some rows are gone from is extended when the commit says which rows are gone, and
+    /// refused when it does not.
+    #[test]
+    fn a_table_with_rows_gone_is_extended_with_them_marked_again() {
+        let path = path("gone-extended");
+        let fields = vec![Field::required("id", LogicalType::Integer)];
+        let mut writer = Writer::create(&path, "items", fields.clone()).expect("new file");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+        let gone = GoneRows {
+            parts: vec![(0, vec![0b010].into_boxed_slice())],
+            total: 1,
+            sums: Vec::new(),
+            patches: Vec::new(),
+            touched: Vec::new(),
+        };
+        let marks = vec![("items".to_string(), gone.clone())];
+        Writer::restate_marking(&path, &[], None, &marks).expect("marks");
+        assert!(!extendable(&path, "items", &fields, 3, false).expect("reads"));
+        assert!(extendable(&path, "items", &fields, 3, true).expect("reads"));
+
+        let mut writer = Writer::extend(&path, "items", fields.clone()).expect("extends");
+        writer.append(&sample_ids()).expect("rows");
+        assert!(writer.finish().is_err(), "the rows gone are not said again");
+        let reader = Catalog::open(&path).expect("reopen").table("items").expect("the table");
+        assert_eq!((reader.table().rows, reader.gone()), (3, Some(&gone)));
+
+        let mut writer = Writer::extend(&path, "items", fields).expect("extends");
+        writer.append(&sample_ids()).expect("rows");
+        writer.with_marks(marks).finish().expect("commits");
+        let reader = Catalog::open(&path).expect("reopen").table("items").expect("the table");
+        assert_eq!((reader.table().rows, reader.gone()), (6, Some(&gone)));
+        assert_eq!(reader.parts(), 2);
     }
 
     /// The values the gone rows held are counted once, and a second record counts only the rows
