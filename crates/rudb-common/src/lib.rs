@@ -38,6 +38,7 @@ pub mod sequence;
 pub mod session;
 pub mod slow;
 pub mod spread;
+pub mod sqlstate;
 pub mod stage;
 pub mod stat;
 pub mod time_tz;
@@ -49,7 +50,7 @@ pub mod value;
 pub use bounds::{Bound, Op, excluded};
 pub use cancel::Cancel;
 pub use clustering::{Clustering, Declared, Width, is_clustering_setting, parse_clustering};
-pub use error::{Error, ErrorCode, Result, Span};
+pub use error::{Error, ErrorCode, Fields, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human};
 pub use rules::{Rule, Rules, looks_like_rule, rule_names};
 pub use session::{
@@ -57,6 +58,7 @@ pub use session::{
 };
 pub use slow::{Cause, Tally};
 pub use spread::{Spread, serially};
+pub use sqlstate::SqlState;
 pub use stage::{Spent, Stage};
 pub use stat::{Class, Classes, ColumnFacts, Direction, Provenance, Stat, Use};
 pub use types::{Field, LogicalType, MAX_DECIMAL_WIDTH, PhysicalType, StateKey, StateType};
