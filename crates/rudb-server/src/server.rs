@@ -12,7 +12,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -148,7 +148,22 @@ pub(crate) struct Shared {
     ddl: Mutex<()>,
     sessions: Mutex<Sessions>,
     threads: Mutex<Vec<JoinHandle<()>>>,
-    stopping: AtomicBool,
+    /// The shutdown in progress, as a [`Shutdown`] number, or 0 when the server runs.
+    shutdown: AtomicU8,
+}
+
+/// The shutdown modes of PostgreSQL, in the order in which a later request takes over an earlier
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Shutdown {
+    /// `SIGTERM`: no new sessions. The server stops when the last session ends.
+    Smart = 1,
+    /// `SIGINT`: the server ends each session with `57P01`, writes each database to its file
+    /// and stops.
+    Fast = 2,
+    /// `SIGQUIT`: the server ends each session with a warning and stops without writing the
+    /// databases to their files. The next start reads the journals.
+    Immediate = 3,
 }
 
 /// A reason why a session cannot start, with the SQLSTATE and the text of PostgreSQL.
@@ -233,9 +248,45 @@ impl Shared {
         lock(&self.ident).clone()
     }
 
-    /// True after the server started to stop.
+    /// True after a fast or an immediate shutdown started, which ends each session.
     pub(crate) fn stopping(&self) -> bool {
-        self.stopping.load(Ordering::Acquire)
+        self.shutdown.load(Ordering::Acquire) >= Shutdown::Fast as u8
+    }
+
+    /// True after a shutdown of any mode started, which refuses new sessions.
+    pub(crate) fn refusing(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire) >= Shutdown::Smart as u8
+    }
+
+    /// True after an immediate shutdown started.
+    pub(crate) fn immediate(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire) == Shutdown::Immediate as u8
+    }
+
+    /// Starts a shutdown, `pmdie` of PostgreSQL. A request for a mode that is not stronger than
+    /// the mode in progress does nothing. Gives true when the mode changed.
+    fn request(&self, mode: Shutdown) -> bool {
+        if self.shutdown.fetch_max(mode as u8, Ordering::AcqRel) >= mode as u8 {
+            return false;
+        }
+        match mode {
+            Shutdown::Smart => log("LOG", "received smart shutdown request"),
+            Shutdown::Fast => {
+                log("LOG", "received fast shutdown request");
+                log("LOG", "aborting any active transactions");
+            }
+            Shutdown::Immediate => log("LOG", "received immediate shutdown request"),
+        }
+        if mode >= Shutdown::Fast {
+            let mut sessions = lock(&self.sessions);
+            for entry in sessions.map.values_mut() {
+                if let Some(connection) = &entry.connection {
+                    connection.interrupt();
+                }
+                let _ = entry.wake.write_all(b"x");
+            }
+        }
+        true
     }
 
     /// Adds a session that has just connected, and gives its process ID. `wake` is the write end
@@ -960,7 +1011,7 @@ impl Server {
                 held: HashSet::new(),
             }),
             threads: Mutex::new(Vec::new()),
-            stopping: AtomicBool::new(false),
+            shutdown: AtomicU8::new(0),
         });
         let acceptor = {
             let shared = shared.clone();
@@ -1095,9 +1146,25 @@ impl Server {
         lock(&self.shared.sessions).map.values().filter(|entry| entry.key.is_some()).count()
     }
 
-    /// Stops the server as the fast shutdown of PostgreSQL does. The server accepts no more
-    /// connections, stops the statement of each session, ends each session with `57P01`, writes
-    /// each database to its file, and removes its sockets and lock files.
+    /// Starts a shutdown in `mode` and gives at once. A smart shutdown refuses new sessions and
+    /// lets the sessions run, and [`Server::finished`] tells when the last one ended. A fast or
+    /// an immediate shutdown ends the sessions, and [`Server::stop`] then finishes it. A later
+    /// request for a stronger mode takes over, as in PostgreSQL.
+    pub fn request(&self, mode: Shutdown) {
+        self.shared.request(mode);
+    }
+
+    /// True when a smart shutdown is in progress and no session is left, so that
+    /// [`Server::stop`] can finish it.
+    pub fn finished(&self) -> bool {
+        self.shared.refusing() && lock(&self.shared.sessions).map.is_empty()
+    }
+
+    /// Stops the server. With no shutdown in progress, this is the fast shutdown of PostgreSQL:
+    /// the server accepts no more connections, stops the statement of each session, ends each
+    /// session with `57P01`, writes each database to its file, and removes its sockets and lock
+    /// files. After [`Server::request`] with [`Shutdown::Immediate`], the server does not write
+    /// the databases.
     ///
     /// # Errors
     ///
@@ -1110,19 +1177,14 @@ impl Server {
         let Some(acceptor) = self.acceptor.take() else {
             return Ok(());
         };
-        log("LOG", "received fast shutdown request");
-        self.shared.stopping.store(true, Ordering::Release);
+        if !self.shared.refusing() {
+            self.shared.request(Shutdown::Fast);
+        }
+        // The rest of a smart shutdown runs as a fast one, with no session left to end.
+        self.shared.shutdown.fetch_max(Shutdown::Fast as u8, Ordering::AcqRel);
+        let immediate = self.shared.immediate();
         let _ = self.stop.write_all(b"x");
         let _ = acceptor.join();
-        {
-            let mut sessions = lock(&self.shared.sessions);
-            for entry in sessions.map.values_mut() {
-                if let Some(connection) = &entry.connection {
-                    connection.interrupt();
-                }
-                let _ = entry.wake.write_all(b"x");
-            }
-        }
         let deadline = Instant::now() + STOP_GRACE;
         while !lock(&self.shared.sessions).map.is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
@@ -1137,7 +1199,14 @@ impl Server {
             let _ = thread.join();
         }
         let mut errors = Vec::new();
-        let open = std::mem::take(&mut *lock(&self.shared.open));
+        let mut open = std::mem::take(&mut *lock(&self.shared.open));
+        if immediate {
+            // The last handle writes the file when it goes, so the handles stay, as the memory
+            // of a PostgreSQL server that stops with no checkpoint.
+            std::mem::forget(std::mem::take(&mut open));
+        } else {
+            log("LOG", "shutting down");
+        }
         let catalog = self.shared.databases.snapshot();
         for (oid, database) in open {
             // Each session is gone, so this is the last handle and the close writes the file.

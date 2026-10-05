@@ -1,11 +1,14 @@
 //! The `rudb-server` binary: `rudb-server init [-U NAME] [--pwfile FILE] [-A METHOD] DIR` makes a data
-//! directory, and `rudb-server -D DIR` with the options of `postgres` runs the server until
-//! `SIGINT`, `SIGTERM` or `SIGQUIT`. `SIGHUP` reloads the configuration files.
+//! directory, and `rudb-server -D DIR` with the options of `postgres` runs the server. As in
+//! PostgreSQL, `SIGTERM` starts a smart shutdown, `SIGINT` a fast one and `SIGQUIT` an immediate
+//! one. `SIGHUP` reloads the configuration files.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
-use rudb_server::{Config, Init, Server, init};
+use rudb_server::{Config, Init, Server, Shutdown, init};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -115,6 +118,13 @@ fn run(args: &[String]) -> ExitCode {
     let signals = signal_set();
     // SAFETY: `signals` is a valid set, and a null old set is allowed.
     unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, std::ptr::null_mut()) };
+    // A shell starts a background job with `SIGINT` and `SIGQUIT` ignored, and the system drops
+    // an ignored signal before `sigwait` can get it. PostgreSQL sets its own handlers, so it gets
+    // them all the same.
+    for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
+        // SAFETY: the default action is valid for each of these signals, and they are blocked.
+        unsafe { libc::signal(signal, libc::SIG_DFL) };
+    }
     let server = match Server::start(config) {
         Ok(server) => server,
         // PostgreSQL checks the configuration file before its log starts, so that error has the
@@ -128,14 +138,36 @@ fn run(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    loop {
-        let mut signal: libc::c_int = 0;
-        // SAFETY: `signals` and `signal` are valid for the whole call.
-        unsafe { libc::sigwait(&raw const signals, &raw mut signal) };
-        if signal != libc::SIGHUP {
-            break;
+    // A thread waits for the signals, so that this thread can also see the end of a smart
+    // shutdown.
+    let (send, signaled) = mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            let mut signal: libc::c_int = 0;
+            // SAFETY: `signals` and `signal` are valid for the whole call.
+            unsafe { libc::sigwait(&raw const signals, &raw mut signal) };
+            if send.send(signal).is_err() {
+                break;
+            }
         }
-        server.reload();
+    });
+    loop {
+        match signaled.recv_timeout(Duration::from_millis(100)) {
+            Ok(libc::SIGHUP) => server.reload(),
+            Ok(libc::SIGTERM) => server.request(Shutdown::Smart),
+            Ok(libc::SIGINT) => {
+                server.request(Shutdown::Fast);
+                break;
+            }
+            Ok(libc::SIGQUIT) => {
+                server.request(Shutdown::Immediate);
+                break;
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) if server.finished() => break,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
     match server.stop() {
         Ok(()) => ExitCode::SUCCESS,

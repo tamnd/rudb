@@ -27,4 +27,4 @@ mod x509;
 
 pub use config::Config;
 pub use roles::os_user;
-pub use server::{Init, Server, init};
+pub use server::{Init, Server, Shutdown, init};

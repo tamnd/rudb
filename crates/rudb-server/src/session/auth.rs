@@ -210,7 +210,7 @@ impl Run<'_> {
                     Filled::Data => {}
                     Filled::Closed => return Ok(None),
                     Filled::Woken if self.shared.stopping() => {
-                        terminated(self.wire)?;
+                        terminated(self.shared, self.wire)?;
                         return Ok(None);
                     }
                     Filled::Woken => {}

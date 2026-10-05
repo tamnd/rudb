@@ -492,7 +492,7 @@ fn serve(
     wire: &mut Wire,
     input: &mut Input,
 ) -> io::Result<()> {
-    if shared.stopping() {
+    if shared.refusing() {
         return wire.fatal(("57P03", "the database system is shutting down".to_owned()));
     }
     if start.replication != Replication::Off {
@@ -600,7 +600,7 @@ fn serve(
                     Filled::Data => continue,
                     Filled::Closed => return Ok(()),
                     Filled::Woken if shared.stopping() || shared.terminating(pid) => {
-                        return terminated(wire);
+                        return terminated(shared, wire);
                     }
                     Filled::Woken => continue,
                 }
@@ -645,7 +645,11 @@ fn serve(
                     &mut wire.out,
                     &mut flush,
                 )?;
-                failure(done, &mut wire.out, start.protocol)
+                if done.is_err() && runner.ending() {
+                    true
+                } else {
+                    failure(done, &mut wire.out, start.protocol)
+                }
             }
             Some(Ok(Frontend::Close { target, name })) => {
                 extended.close(target, name, &mut wire.out);
@@ -688,7 +692,7 @@ fn serve(
             runner.abort_implicit();
             extended.end_of_transaction(runner.connection.transaction());
             if shared.stopping() || shared.terminating(pid) {
-                return terminated(wire);
+                return terminated(shared, wire);
             }
             if let Some(fatal) = session.recover() {
                 wire.out.protocol_error(&fatal, start.protocol);
@@ -714,7 +718,19 @@ fn failure(done: Result<(), extended::Problem>, out: &mut OutBuf, protocol: u32)
 
 /// The end of a session when the server stops, or when `DROP DATABASE ... WITH (FORCE)` ends
 /// it.
-fn terminated(wire: &mut Wire) -> io::Result<()> {
+fn terminated(shared: &Shared, wire: &mut Wire) -> io::Result<()> {
+    if shared.immediate() {
+        // As `quickdie` of PostgreSQL: the output that waits is lost, and the warning goes to the
+        // client only.
+        wire.out.consume(wire.out.len());
+        wire.out.notice_response(&[
+            (b'S', b"WARNING"),
+            (b'V', b"WARNING"),
+            (b'C', b"57P01"),
+            (b'M', b"terminating connection due to immediate shutdown command"),
+        ]);
+        return wire.flush();
+    }
     wire.fatal(("57P01", "terminating connection due to administrator command".to_owned()))
 }
 
@@ -1234,6 +1250,11 @@ impl Runner {
         run(&self.connection).map(Outcome::Result).map_err(|e| Failure::engine(&e, offset))
     }
 
+    /// True when the server stops or `DROP DATABASE ... WITH (FORCE)` ends the session.
+    fn ending(&self) -> bool {
+        self.shared.stopping() || self.shared.terminating(self.pid)
+    }
+
     /// Runs a `Query` message: each statement in it, in order, until the first error. Gives true
     /// when there was an error.
     fn query(
@@ -1282,7 +1303,10 @@ impl Runner {
                     continue;
                 }
                 Err(failure) => {
-                    failure.write(sql, out);
+                    // A session that the server ends sends only the FATAL, as in PostgreSQL.
+                    if !self.ending() {
+                        failure.write(sql, out);
+                    }
                     return Ok(true);
                 }
             };
@@ -1293,7 +1317,9 @@ impl Runner {
                 match self.rows(&result, out, &mut flush)? {
                     Ok(rows) => rows,
                     Err(failure) => {
-                        failure.write(sql, out);
+                        if !self.ending() {
+                            failure.write(sql, out);
+                        }
                         return Ok(true);
                     }
                 }

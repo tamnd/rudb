@@ -11,7 +11,7 @@ use rudb_pgwire::{
     Backend, Bind, Cancel, Frontend, Oids, PROTOCOL_3_0, PROTOCOL_3_2, Packet, Startup, Target,
     encode_oids, encode_options,
 };
-use rudb_server::{Config, Init, Server, init};
+use rudb_server::{Config, Init, Server, Shutdown, init};
 
 /// A data directory and a socket directory of their own for each test, removed at the end.
 struct Dirs {
@@ -955,9 +955,11 @@ fn a_stop_ends_each_session_and_removes_the_files() {
     busy.send(&Frontend::Query(b"select sum(i * i) from range(100000000000) r(i)"));
     std::thread::sleep(Duration::from_millis(200));
     server.stop().unwrap();
+    // The statement that the stop ends sends no cancel error, only the FATAL, as in PostgreSQL.
     for client in [&mut idle, &mut busy] {
         let messages = client.rest();
-        let error = messages.last().unwrap();
+        assert_eq!(tags(&messages), "E");
+        let error = &messages[0];
         assert_eq!(error.field(b'S').as_deref(), Some("FATAL"));
         assert_eq!(error.field(b'C').as_deref(), Some("57P01"));
     }
@@ -970,6 +972,84 @@ fn a_stop_ends_each_session_and_removes_the_files() {
     connect(&mut client, PROTOCOL_3_0);
     let messages = client.query("select i from kept");
     assert_eq!(tags(&messages), "TDCZ");
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_smart_shutdown_waits_for_the_sessions() {
+    let dirs = Dirs::new("smart");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    assert_eq!(tags(&client.query("begin; create table t (i integer)")), "CCZ");
+    server.request(Shutdown::Smart);
+    // A new session gets the refusal, and the session that runs goes on.
+    let mut late = Client::unix(&server);
+    late.startup(PROTOCOL_3_0, "postgres");
+    let messages = late.rest();
+    assert_eq!(tags(&messages), "E");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("57P03"));
+    assert_eq!(messages[0].field(b'M').as_deref(), Some("the database system is shutting down"));
+    assert!(!server.finished());
+    assert_eq!(tags(&client.query("insert into t values (1); commit")), "CCZ");
+    assert_eq!(scalar(&mut client, "select count(*) from t"), "1");
+    // A second smart request does nothing.
+    server.request(Shutdown::Smart);
+    assert!(!server.finished());
+    client.send(&Frontend::Terminate);
+    assert!(client.rest().is_empty());
+    for _ in 0..100 {
+        if server.finished() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(server.finished());
+    server.stop().unwrap();
+
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    assert_eq!(scalar(&mut client, "select count(*) from t"), "1");
+    server.stop().unwrap();
+}
+
+#[test]
+fn an_immediate_shutdown_warns_and_keeps_the_commits() {
+    let dirs = Dirs::new("immediate");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut idle = Client::unix(&server);
+    connect(&mut idle, PROTOCOL_3_0);
+    assert_eq!(
+        tags(&idle.query("create table kept (i integer); insert into kept values (7)")),
+        "CCZ"
+    );
+    assert_eq!(tags(&idle.query("begin; insert into kept values (8)")), "CCZ");
+    let mut busy = Client::unix(&server);
+    connect(&mut busy, PROTOCOL_3_0);
+    busy.send(&Frontend::Query(b"select sum(i * i) from range(100000000000) r(i)"));
+    std::thread::sleep(Duration::from_millis(200));
+    server.request(Shutdown::Immediate);
+    // A weaker request does not take over.
+    server.request(Shutdown::Fast);
+    server.stop().unwrap();
+    for client in [&mut idle, &mut busy] {
+        let messages = client.rest();
+        assert_eq!(tags(&messages), "N");
+        assert_eq!(messages[0].field(b'S').as_deref(), Some("WARNING"));
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("57P01"));
+        assert_eq!(
+            messages[0].field(b'M').as_deref(),
+            Some("terminating connection due to immediate shutdown command")
+        );
+    }
+    assert!(!dirs.root.join("data/rudb-server.pid").exists());
+
+    // The server did not write the file, and the next start reads the journal.
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    assert_eq!(scalar(&mut client, "select string_agg(i::text, ',') from kept"), "7");
     server.stop().unwrap();
 }
 
