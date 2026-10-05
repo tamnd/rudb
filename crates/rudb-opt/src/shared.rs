@@ -89,20 +89,28 @@ pub fn share(plan: &mut Plan) {
     }
 }
 
-/// Answers every call the aggregate at `at` asks more than once from one copy of it, and says
-/// whether there was any.
+/// Answers every call an aggregate in `plan` asks more than once from one copy of it.
+pub(crate) fn once(plan: &mut Plan) {
+    let mut moved = false;
+    let root = walk::restack(plan, plan.root(), &mut moved, &mut asked_once);
+    if moved {
+        plan.set_root(root);
+    }
+}
+
+/// The aggregate at `at` asking each call once, when it asks one more than once.
 ///
 /// TPC-H q01 has `count(*)` and a count of each of three columns once the averages are split and the
 /// sums factored, and with no nulls in the three columns [`crate::nonulls`] turns each into a
 /// `count(*)`. Four counts of the same rows were four totals folded into four states for every group
-/// of every chunk, which was a fifth of the fold on q01. The node at `at` becomes a projection that
+/// of every chunk, which was a fifth of the fold on q01. The aggregate becomes a projection that
 /// keeps its index and its output order over an aggregate that asks each call once, so nothing above
 /// it moves.
 ///
 /// Only calls that read columns or nothing and have no `FILTER`, since two calls of a function of a
 /// row, `random()` say, are two different answers.
-pub(crate) fn once(plan: &mut Plan, at: NodeRef) -> bool {
-    let Node::Aggregate { input, index, groups, aggregates } = *plan.node(at) else { return false };
+fn asked_once(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
+    let Node::Aggregate { input, index, groups, aggregates } = *plan.node(at) else { return None };
     let calls = plan.expr_list(aggregates).to_vec();
     let mut kept: Vec<ExprRef> = Vec::with_capacity(calls.len());
     let mut placed = Vec::with_capacity(calls.len());
@@ -117,7 +125,7 @@ pub(crate) fn once(plan: &mut Plan, at: NodeRef) -> bool {
         }
     }
     if kept.len() == calls.len() {
-        return false;
+        return None;
     }
     let staged = walk::fresh_index(plan);
     let keys = plan.expr_list(groups).to_vec();
@@ -140,8 +148,7 @@ pub(crate) fn once(plan: &mut Plan, at: NodeRef) -> bool {
         (0..projected.len()).map(|position| plan.intern(&format!("column{position}"))).collect();
     let exprs = plan.add_expr_list(&projected);
     let names = plan.add_name_list(&names);
-    *plan.node_mut(at) = Node::Project { input: inner, index, exprs, names };
-    true
+    Some(plan.add_node(Node::Project { input: inner, index, exprs, names }))
 }
 
 /// Whether `call` is an aggregate with no `FILTER` whose arguments are all columns.
