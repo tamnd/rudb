@@ -54,7 +54,7 @@ use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
-use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below};
+use rudb_vector::{Buffer, Chunk, Data, Packed, Runs, TextSource, Vector, search_below};
 
 mod anchor;
 mod distinct;
@@ -6899,12 +6899,7 @@ impl TextSource for NativeText {
 
     /// The rest of the block holding `first`, handed over where it lies with the ends of its values
     /// counted from the start of the run.
-    fn sweep_runs(
-        &self,
-        first: usize,
-        limit: usize,
-        body: &mut dyn FnMut(usize, &[u8], &[usize]) -> Result<()>,
-    ) -> Result<Option<usize>> {
+    fn sweep_runs(&self, first: usize, limit: usize, body: &mut Runs<'_>) -> Result<Option<usize>> {
         let limit = limit.min(self.values);
         if first >= limit {
             return Ok(Some(first));
