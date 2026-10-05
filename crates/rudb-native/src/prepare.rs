@@ -65,6 +65,10 @@ use super::{
 /// one caller needs, because that caller is the only one encoding. Thirty two callers each doing
 /// that at once would be a thousand threads on a machine with thirty two cores. So each one takes
 /// its share of the machine: the cores over however many stripes are being worked on right now.
+///
+/// A caller that is one of several feeding the same load at once says so with [`Preparer::join`].
+/// The others are using cores too while they parse the rows that come next, and are just not
+/// counted here until they start encoding, so they count from the moment they join.
 static BUSY: AtomicUsize = AtomicUsize::new(0);
 
 /// What all of a table's global dictionaries may hold at once before the fastest growing one is
@@ -154,8 +158,8 @@ impl Deref for Coding {
 struct Share(usize);
 
 impl Share {
-    fn take(columns: usize, parts: usize) -> Self {
-        let busy = BUSY.fetch_add(1, Atomic::Relaxed) + 1;
+    fn take(columns: usize, parts: usize, alongside: usize) -> Self {
+        let busy = (BUSY.fetch_add(1, Atomic::Relaxed) + 1).max(alongside);
         let cores =
             std::thread::available_parallelism().map_or(1, usize::from).min(MAX_ENCODE_WORKERS);
         // A stripe of one part is one small page a column, which is less than a thread is worth.
@@ -180,6 +184,8 @@ pub struct Preparer {
     types: Vec<LogicalType>,
     coded: Arc<Coding>,
     profile: Option<Arc<LoadProfile>>,
+    /// How many callers are feeding the load right now. See [`Preparer::join`].
+    alongside: Arc<AtomicUsize>,
 }
 
 /// A stripe that has been through [`Preparer::prepare`] and is waiting for [`Writer::merge`].
@@ -190,6 +196,7 @@ pub struct Prepared {
     columns: Vec<Column>,
     gathers: Vec<Option<stats::Gather>>,
     profile: Option<Arc<LoadProfile>>,
+    alongside: Arc<AtomicUsize>,
 }
 
 /// A stripe that has been through [`Writer::merge`] and is waiting for [`Merged::pages`].
@@ -199,6 +206,7 @@ pub struct Merged {
     columns: Vec<Merge>,
     blocks: Vec<Unencoded>,
     profile: Option<Arc<LoadProfile>>,
+    alongside: Arc<AtomicUsize>,
     /// Whether the rows are counted into the table yet. [`Writer::merge`] counts them, and a
     /// [`Merger`] leaves them for [`Writer::write`], since it has no table to count them into.
     counted: bool,
@@ -609,6 +617,25 @@ fn fan_out<T: Send>(
 }
 
 impl Preparer {
+    /// Counts one more caller feeding the load through this preparer or a clone of it, until it
+    /// calls [`Preparer::leave`].
+    ///
+    /// Each stripe is then spread over its share of the cores among the callers, rather than over
+    /// all of them whenever it happens to be the only one encoding. The others are parsing the rows
+    /// they encode next, so the cores are not idle. On the JOB load at six threads on server2 the
+    /// threads started for stripes that way were about 8,100, against 29 for the whole of
+    /// DuckDB's load, and the kernel spent about 2 ms of CPU starting each one.
+    pub fn join(&self) {
+        self.alongside.fetch_add(1, Atomic::Relaxed);
+    }
+
+    /// Counts a caller that [`Preparer::join`] counted out again.
+    pub fn leave(&self) {
+        let _ = self
+            .alongside
+            .fetch_update(Atomic::Relaxed, Atomic::Relaxed, |now| Some(now.saturating_sub(1)));
+    }
+
     /// Encodes a run of chunks as one stripe, as far as it can be without the writer.
     ///
     /// The run is what [`Writer::append_stripe`] takes, and the rules are the same: it is a stripe
@@ -717,7 +744,7 @@ impl Preparer {
         // The stripe's key is its first part's order, and its statistics open with it.
         let opening = building.parts.is_empty();
         let key = held.first().map_or((0, 0), |pending| pending.order);
-        let share = Share::take(width, held.len());
+        let share = Share::take(width, held.len(), self.alongside.load(Atomic::Relaxed));
         let mut jobs = (0..width).collect::<Vec<_>>();
         jobs.sort_by_key(|&index| weight(&self.types[index]));
         let columns = &building.columns;
@@ -799,6 +826,7 @@ impl Preparer {
             columns,
             gathers,
             profile: self.profile.clone(),
+            alongside: Arc::clone(&self.alongside),
         })
     }
 }
@@ -1035,7 +1063,7 @@ fn merge_column(
 /// The answer is the same in any order, because a column's merge only depends on the stripes
 /// merged into that column before it.
 fn merge_columns(prepared: Prepared, slots: Vec<Slot<'_>>, coded: &Coding) -> Result<Merged> {
-    let Prepared { parts, columns, gathers, profile, .. } = prepared;
+    let Prepared { parts, columns, gathers, profile, alongside, .. } = prepared;
     let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
     let rows: usize = parts.iter().map(|part| part.rows).sum();
     let width = columns.len();
@@ -1052,11 +1080,9 @@ fn merge_columns(prepared: Prepared, slots: Vec<Slot<'_>>, coded: &Coding) -> Re
     // Taken from the back, so the biggest merges start first and the last one to finish is
     // small, the same reason `fan_out` hands its jobs over cheapest first.
     steps.sort_by_key(|step| step.cost(coded));
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(MAX_ENCODE_WORKERS)
-        .min(steps.iter().filter(|step| step.cost(coded) > 0).count())
-        .max(1);
+    let costly = steps.iter().filter(|step| step.cost(coded) > 0).count();
+    let share = Share::take(costly, parts.len(), alongside.load(Atomic::Relaxed));
+    let workers = share.0;
     let done = if workers <= 1 {
         steps
             .into_iter()
@@ -1101,7 +1127,8 @@ fn merge_columns(prepared: Prepared, slots: Vec<Slot<'_>>, coded: &Coding) -> Re
         blocks.extend(handed);
     }
     drop(timing);
-    Ok(Merged { parts, columns: merged, blocks, profile, counted: false })
+    drop(share);
+    Ok(Merged { parts, columns: merged, blocks, profile, alongside, counted: false })
 }
 
 /// The dictionaries and statistics of a table while a [`Merger`] has them, one lock a column.
@@ -1204,7 +1231,7 @@ impl Merged {
     ///
     /// If a column or a block cannot be encoded or a page comes out larger than a page may be.
     pub fn pages(self) -> Result<Paged> {
-        let Self { parts, columns, blocks, profile, counted } = self;
+        let Self { parts, columns, blocks, profile, alongside, counted } = self;
         let width = columns.len();
         // The blocks go first so that they are taken last. One block is a thousand values, which is
         // less than any column of a stripe, and small jobs at the end are what keeps the last
@@ -1214,7 +1241,7 @@ impl Merged {
             .collect::<Vec<_>>();
         // A column encoded again from its rows costs more than one whose codes only need building.
         jobs.sort_by_key(|&index| index < width && matches!(columns[index], Merge::Plain(_)));
-        let share = Share::take(jobs.len(), parts.len());
+        let share = Share::take(jobs.len(), parts.len(), alongside.load(Atomic::Relaxed));
         let built = fan_out(jobs, share.0, profile.as_deref(), |index| {
             let Some(column) = columns.get(index) else {
                 return Ok(Built::Block(blocks[index - width].encode()?));
@@ -1296,6 +1323,7 @@ impl Writer {
             types: self.table.fields.iter().map(|field| field.ty.clone()).collect(),
             coded: Arc::clone(&self.coded),
             profile: self.profile.clone(),
+            alongside: Arc::default(),
         }
     }
 
@@ -1728,6 +1756,11 @@ mod tests {
         let fed = path("fed");
         let mut writer = Writer::create(&fed, "t", fields()).expect("a file");
         let preparer = writer.preparer();
+        // As one of more callers than there are cores, so each stripe is encoded on the thread that
+        // feeds it, where the whole one above was spread over threads. The bytes cannot tell.
+        for _ in 0..64 {
+            preparer.join();
+        }
         let merger = writer.merger().expect("a merger");
         let nothing = Chunk::new(
             fields()
