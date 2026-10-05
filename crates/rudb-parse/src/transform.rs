@@ -575,6 +575,7 @@ impl<'a> Transform<'a> {
                 Expr::Star { .. }
                     | Expr::Columns { .. }
                     | Expr::Column { .. }
+                    | Expr::Positional { .. }
                     | Expr::Subquery { .. }
                     | Expr::InSubquery { .. }
                     | Expr::QuantifiedSubquery { .. }
@@ -4502,6 +4503,15 @@ impl<'a> Transform<'a> {
                 }
                 "StarExpression" => return self.star(node),
                 "ColumnsExpression" => return self.columns(node),
+                "PositionalExpression" => {
+                    let written = self.text(node).trim_start_matches('#').trim();
+                    let index = written.parse::<u64>().unwrap_or(u64::MAX);
+                    if index == 0 {
+                        return Err(Error::parser("Positional reference node needs to be >= 1"));
+                    }
+                    let index = u32::try_from(index).unwrap_or(u32::MAX);
+                    return Ok(self.push(Expr::Positional { index }));
+                }
                 "NumberLiteral" => {
                     let text = self.text(node).to_string();
                     let text = self.intern(&text);
@@ -6798,6 +6808,7 @@ mod tests {
             }
             Expr::Parameter { name } => format!("${}", ast.string(name)),
             Expr::Default => "DEFAULT".to_string(),
+            Expr::Positional { index } => format!("#{index}"),
             Expr::Row { items } => format!("ROW({})", list(items)),
             Expr::Struct { names, values } => {
                 let fields: Vec<String> = ast

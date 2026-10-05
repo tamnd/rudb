@@ -2121,6 +2121,11 @@ impl<'a> Binder<'a> {
             }
             return rudb_parse::quoted(parts.last().copied().unwrap_or_default());
         }
+        if let ast::Expr::Positional { index } = ast.expr(target)
+            && let Ok(found) = input.positional(index)
+        {
+            return found.name.clone();
+        }
         describe(ast, target, self.semantics)
     }
 
