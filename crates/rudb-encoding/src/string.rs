@@ -2041,4 +2041,60 @@ mod tests {
         let ratio = raw_size(&values) as f64 / bytes.len() as f64;
         assert!(ratio > 4.0, "{ratio:.2}x");
     }
+
+    /// Every payload shape a global dictionary is settled between, on files of real values.
+    ///
+    /// `SHAPE_DATA` names the files, separated by colons, one value a line in the order the values
+    /// were first seen, which is the order a dictionary holds them in. Each is cut into blocks of
+    /// 1,024 values, settled on eight blocks spread over it the way a load settles, and then every
+    /// block is encoded and decoded, timed, with each shape.
+    #[test]
+    #[ignore = "a measurement over real text, run by hand in release with SHAPE_DATA set"]
+    fn measure_shapes_on_real_text() {
+        use std::time::Duration;
+        let Ok(files) = std::env::var("SHAPE_DATA") else { return };
+        let shapes = [
+            vec![Kind::Front, Kind::Lz],
+            vec![Kind::Lz, Kind::Fsst],
+            vec![Kind::Lz, Kind::Plain],
+            vec![Kind::Fsst],
+            vec![Kind::Front, Kind::Fsst],
+            vec![Kind::Plain],
+        ];
+        for file in files.split(':') {
+            let text = std::fs::read(file).expect("a data file");
+            let values: Vec<&[u8]> = text.split(|byte| *byte == b'\n').collect();
+            let blocks: Vec<&[&[u8]]> = values.chunks(1024).collect();
+            let stride = (blocks.len() / 8).max(1);
+            let sample: Vec<Vec<&[u8]>> =
+                blocks.iter().step_by(stride).take(8).map(|block| block.to_vec()).collect();
+            let raw: usize = values.iter().map(|value| value.len()).sum();
+            println!("{file}: {} values, {raw} bytes, {} blocks", values.len(), blocks.len());
+            for kinds in &shapes {
+                let started = Instant::now();
+                let shape =
+                    with_symbols(Settled::new(kinds.clone(), vec![integer::Kind::Packed]), &sample);
+                let settled = started.elapsed();
+                let (mut size, mut encoding, mut decoding) = (0, Duration::ZERO, Duration::ZERO);
+                for block in &blocks {
+                    let started = Instant::now();
+                    let bytes = encode_with(block, &shape).expect("encodes");
+                    encoding += started.elapsed();
+                    let started = Instant::now();
+                    let flat = decode_flat(&bytes).expect("decodes");
+                    decoding += started.elapsed();
+                    assert_eq!(flat.ends.len(), block.len());
+                    size += bytes.len();
+                }
+                println!(
+                    "  {kinds:?}: {size} bytes ({:.3}x), settle {:.0} ms, encode {:.1} MB/s, \
+                     decode {:.0} MB/s",
+                    raw as f64 / size as f64,
+                    settled.as_secs_f64() * 1e3,
+                    raw as f64 / encoding.as_secs_f64() / 1e6,
+                    raw as f64 / decoding.as_secs_f64() / 1e6,
+                );
+            }
+        }
+    }
 }
