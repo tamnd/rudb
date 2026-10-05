@@ -209,6 +209,27 @@ impl Binder<'_> {
                 let sorted = ast.aggregate_order(expr);
                 self.refuse_named(ast, expr, &written, ast.expr_list(args), sorted, scope)
             }
+            ast::Expr::Window { name, args, distinct, filter, ignore_nulls, order, spec }
+                if self.catalog().macros().next().is_some()
+                    && self
+                        .catalog()
+                        .resolve_macro(&ast.name(name).collect::<Vec<_>>(), Some(false))
+                        .is_some() =>
+            {
+                let written = ast.name(name).last().unwrap_or_default().to_string();
+                let listed = ast.expr_list(args).to_vec();
+                let call = WindowCall {
+                    name: &written,
+                    args: &listed,
+                    distinct,
+                    filter,
+                    ignore_nulls,
+                    order,
+                    spec,
+                };
+                let expanded = self.user_window_macro(ast, expr, name, args, &call, scope)?;
+                expanded.ok_or_else(|| Error::internal("a macro that went away while it was bound"))
+            }
             ast::Expr::Window { name, args, .. } if !ast.named_args(expr).is_empty() => {
                 let written = ast.name(name).last().unwrap_or_default().to_string();
                 self.refuse_named(ast, expr, &written, ast.expr_list(args), &[], scope)
