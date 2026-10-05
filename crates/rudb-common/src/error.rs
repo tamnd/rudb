@@ -9,6 +9,8 @@
 
 use std::fmt;
 
+use crate::sqlstate::{self, SqlState};
+
 /// The result type used everywhere in the workspace.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -139,6 +141,28 @@ impl ErrorCode {
         }
     }
 
+    /// The SQLSTATE that a PostgreSQL session sends for an error that has no code of its own.
+    ///
+    /// Each variant covers many codes, so this is right for few errors. It exists so that a
+    /// client always gets a code in a sensible class. The place that raises an error knows the
+    /// exact code and sets it with [`Error::state`]. `11-errors-and-notices.md` section 11.2 of
+    /// the PostgreSQL compatibility notes has the table.
+    #[must_use]
+    pub const fn fallback_state(self) -> SqlState {
+        match self {
+            Self::Parser => SqlState::SYNTAX_ERROR,
+            Self::Binder => SqlState::SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION,
+            Self::Catalog => SqlState::UNDEFINED_OBJECT,
+            Self::Conversion => SqlState::DATA_EXCEPTION,
+            Self::Constraint => SqlState::INTEGRITY_CONSTRAINT_VIOLATION,
+            Self::Transaction => SqlState::INVALID_TRANSACTION_STATE,
+            Self::NotImplemented => SqlState::FEATURE_NOT_SUPPORTED,
+            Self::Interrupt => SqlState::QUERY_CANCELED,
+            Self::OutOfMemory => SqlState::OUT_OF_MEMORY,
+            _ => SqlState::INTERNAL_ERROR,
+        }
+    }
+
     /// Whether an error with this code says something about the query rather than about us.
     ///
     /// Used by the fuzzing harness in `spec/16-testing.md` section 16.4, which treats a rejected
@@ -187,12 +211,51 @@ struct Payload {
     message: String,
     span: Option<Span>,
     message_only: bool,
+    sqlstate: Option<SqlState>,
+    fields: Option<Box<Fields>>,
+}
+
+/// The optional fields of a PostgreSQL `ErrorResponse`, after the code, the message and the
+/// position.
+///
+/// Most errors have none of them, so the error keeps them behind one more box and pays for them
+/// only when one is set. A PostgreSQL session sends each field that is set with its one byte
+/// field type. The DuckDB dialect does not send them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Fields {
+    /// `D`: more facts about the error. Can have several lines.
+    pub detail: Option<String>,
+    /// `H`: advice on what to do.
+    pub hint: Option<String>,
+    /// `W`: the context, one line for each level, innermost first.
+    pub context: Option<String>,
+    /// `s`: the schema of the object.
+    pub schema: Option<String>,
+    /// `t`: the table.
+    pub table: Option<String>,
+    /// `c`: the column.
+    pub column: Option<String>,
+    /// `d`: the data type.
+    pub data_type: Option<String>,
+    /// `n`: the constraint. Ecto maps an error to a field by this name.
+    pub constraint: Option<String>,
+    /// `R`: the PostgreSQL routine that raises this error. rudb sets it only where a known client
+    /// reads it, for example Rails on a stale cached plan.
+    pub routine: Option<String>,
 }
 
 impl Error {
     /// An error with a code and a message and no span.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self(Box::new(Payload { code, message: message.into(), span: None, message_only: false }))
+        Self(Box::new(Payload {
+            code,
+            message: message.into(),
+            span: None,
+            message_only: false,
+            sqlstate: None,
+            fields: None,
+        }))
     }
 
     /// The same error, with the part of the query it is about.
@@ -209,6 +272,98 @@ impl Error {
             self.0.span = Some(span);
         }
         self
+    }
+
+    /// The same error, with the SQLSTATE that a PostgreSQL session sends for it.
+    #[must_use]
+    pub fn state(mut self, state: SqlState) -> Self {
+        self.0.sqlstate = Some(state);
+        self
+    }
+
+    /// The same error, with the `D` field.
+    #[must_use]
+    pub fn detail(self, detail: impl Into<String>) -> Self {
+        self.field(|fields| fields.detail = Some(detail.into()))
+    }
+
+    /// The same error, with the `H` field.
+    #[must_use]
+    pub fn hint(self, hint: impl Into<String>) -> Self {
+        self.field(|fields| fields.hint = Some(hint.into()))
+    }
+
+    /// The same error, with the `W` field.
+    #[must_use]
+    pub fn context(self, context: impl Into<String>) -> Self {
+        self.field(|fields| fields.context = Some(context.into()))
+    }
+
+    /// The same error, with the `s` and `t` fields.
+    #[must_use]
+    pub fn table(self, schema: impl Into<String>, table: impl Into<String>) -> Self {
+        self.field(|fields| {
+            fields.schema = Some(schema.into());
+            fields.table = Some(table.into());
+        })
+    }
+
+    /// The same error, with the `c` field. Set the table too, because a client reads the two
+    /// together.
+    #[must_use]
+    pub fn column(self, column: impl Into<String>) -> Self {
+        self.field(|fields| fields.column = Some(column.into()))
+    }
+
+    /// The same error, with the `d` field.
+    #[must_use]
+    pub fn data_type(self, data_type: impl Into<String>) -> Self {
+        self.field(|fields| fields.data_type = Some(data_type.into()))
+    }
+
+    /// The same error, with the `n` field.
+    #[must_use]
+    pub fn constraint_name(self, constraint: impl Into<String>) -> Self {
+        self.field(|fields| fields.constraint = Some(constraint.into()))
+    }
+
+    /// The same error, with the `R` field.
+    #[must_use]
+    pub fn routine(self, routine: impl Into<String>) -> Self {
+        self.field(|fields| fields.routine = Some(routine.into()))
+    }
+
+    fn field(mut self, set: impl FnOnce(&mut Fields)) -> Self {
+        set(self.0.fields.get_or_insert_with(Box::default));
+        self
+    }
+
+    /// The SQLSTATE that the place that raised this error set, if it set one.
+    #[must_use]
+    pub fn sqlstate(&self) -> Option<SqlState> {
+        self.0.sqlstate
+    }
+
+    /// The SQLSTATE to send to a PostgreSQL client.
+    ///
+    /// This is the code that the raising place set. Without one, it is the fallback of the
+    /// [`ErrorCode`], and the fallback is counted in [`sqlstate::fallbacks`]. An internal error is
+    /// `XX000` by definition, so it is not counted.
+    #[must_use]
+    pub fn reported_state(&self) -> SqlState {
+        if let Some(state) = self.0.sqlstate {
+            return state;
+        }
+        if self.0.code != ErrorCode::Internal {
+            sqlstate::count_fallback();
+        }
+        self.0.code.fallback_state()
+    }
+
+    /// The optional `ErrorResponse` fields, if any is set.
+    #[must_use]
+    pub fn fields(&self) -> Option<&Fields> {
+        self.0.fields.as_deref()
     }
 
     /// What kind of thing went wrong.
@@ -446,6 +601,63 @@ impl From<std::io::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::{Error, ErrorCode, Span};
+    use crate::sqlstate::{self, SqlState};
+
+    #[test]
+    fn a_state_set_at_the_raising_place_is_the_one_reported() {
+        let error =
+            Error::catalog("Table with name t does not exist!").state(SqlState::UNDEFINED_TABLE);
+        assert_eq!(error.sqlstate(), Some(SqlState::UNDEFINED_TABLE));
+        assert_eq!(error.reported_state().as_str(), "42P01");
+    }
+
+    #[test]
+    fn an_error_without_a_state_gets_the_fallback_of_its_code() {
+        assert_eq!(Error::parser("x").sqlstate(), None);
+        let cases = [
+            (Error::parser("x"), "42601"),
+            (Error::binder("x"), "42000"),
+            (Error::catalog("x"), "42704"),
+            (Error::conversion("x"), "22000"),
+            (Error::constraint("x"), "23000"),
+            (Error::transaction("x"), "25000"),
+            (Error::not_implemented("x"), "0A000"),
+            (Error::interrupt("x"), "57014"),
+            (Error::out_of_memory("x"), "53200"),
+            (Error::io("x"), "XX000"),
+            (Error::internal("x"), "XX000"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.reported_state().as_str(), expected, "{error}");
+        }
+    }
+
+    #[test]
+    fn a_fallback_is_counted() {
+        let before = sqlstate::fallbacks();
+        let _ = Error::binder("x").reported_state();
+        assert!(sqlstate::fallbacks() > before);
+    }
+
+    #[test]
+    fn the_response_fields_are_kept_and_do_not_change_the_text() {
+        let error = Error::constraint("Duplicate key \"id: 1\" violates primary key constraint.")
+            .state(SqlState::UNIQUE_VIOLATION)
+            .detail("Key (id)=(1) already exists.")
+            .table("public", "t")
+            .constraint_name("t_pkey");
+        let fields = error.fields().expect("fields were set");
+        assert_eq!(fields.detail.as_deref(), Some("Key (id)=(1) already exists."));
+        assert_eq!(fields.schema.as_deref(), Some("public"));
+        assert_eq!(fields.table.as_deref(), Some("t"));
+        assert_eq!(fields.constraint.as_deref(), Some("t_pkey"));
+        assert_eq!(fields.hint, None);
+        assert_eq!(
+            error.to_string(),
+            "Constraint Error: Duplicate key \"id: 1\" violates primary key constraint."
+        );
+        assert_eq!(Error::binder("x").fields(), None);
+    }
 
     #[test]
     fn an_error_prints_the_way_duckdb_prints_it() {
