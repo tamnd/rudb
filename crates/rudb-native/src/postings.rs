@@ -102,7 +102,22 @@ pub fn build_value_rows(path: &Path, table: &str) -> Result<Vec<Built>> {
 /// If the file cannot be opened, a column cannot be read, or the attach fails.
 pub fn build_value_rows_within(path: &Path, table: &str, share: u64) -> Result<Vec<Built>> {
     let reader = Catalog::open(path)?.table(table)?;
-    let columns = coded_columns(&reader).collect::<Vec<_>>();
+    within(path, &reader, share)
+}
+
+/// The same for a table the caller already has open, which a checkpoint has from deciding which
+/// tables need the work. The file at `path` has to hold the rows `reader` does, which it does when
+/// all that was written since the reader was opened is sections.
+///
+/// # Errors
+///
+/// If a column cannot be read or the attach fails.
+pub fn build_value_rows_of(path: &Path, reader: &Reader) -> Result<Vec<Built>> {
+    within(path, reader, VALUE_ROWS_SHARE)
+}
+
+fn within(path: &Path, reader: &Reader, share: u64) -> Result<Vec<Built>> {
+    let columns = coded_columns(reader).collect::<Vec<_>>();
     if columns.is_empty() {
         return Ok(Vec::new());
     }
@@ -111,7 +126,7 @@ pub fn build_value_rows_within(path: &Path, table: &str, share: u64) -> Result<V
     let mut report = Vec::with_capacity(columns.len());
     let mut payloads = Vec::with_capacity(columns.len());
     for &column in &columns {
-        let payload = if rows >= FEWEST_ROWS { encode(&reader, column)? } else { None };
+        let payload = if rows >= FEWEST_ROWS { encode(reader, column)? } else { None };
         let (coded, bytes) =
             payload.as_ref().map_or((0, 0), |(coded, bytes)| (*coded, bytes.len()));
         report.push(Built { column, coded, bytes, built: false });
@@ -127,7 +142,6 @@ pub fn build_value_rows_within(path: &Path, table: &str, share: u64) -> Result<V
             report[at].built = true;
         }
     }
-    drop(reader);
     let attachments = report
         .iter()
         .zip(&payloads)
@@ -145,7 +159,7 @@ pub fn build_value_rows_within(path: &Path, table: &str, share: u64) -> Result<V
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    crate::attach(path, table, &attachments)?;
+    crate::attach(path, reader.table().name(), &attachments)?;
     Ok(report)
 }
 
