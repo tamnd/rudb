@@ -476,8 +476,11 @@ fn returning(
     let (root, scope) = binder.bind_query(ast, query)?;
     if let Some(placeholders) = parameters.placeholders() {
         placeholders.answer(scope.fields());
+        placeholders.answer_origins(scope.origins());
     }
-    Ok(Some(Box::new(finish(binder, root)?)))
+    let mut plan = finish(binder, root)?;
+    plan.set_origins(scope.origins());
+    Ok(Some(Box::new(plan)))
 }
 
 /// Binds one parsed statement against a catalog.
@@ -551,8 +554,11 @@ pub(crate) fn bind_one(
             let (root, scope) = binder.bind_query(ast, query)?;
             if let Some(placeholders) = parameters.placeholders() {
                 placeholders.answer(scope.fields());
+                placeholders.answer_origins(scope.origins());
             }
-            Ok(Bound::Query(finish(binder, root)?))
+            let mut plan = finish(binder, root)?;
+            plan.set_origins(scope.origins());
+            Ok(Bound::Query(plan))
         }
         ast::Statement::CreateTable(index) => {
             create_table(ast, catalog, parameters, session, index)
@@ -1411,6 +1417,7 @@ fn check_text(
             not_null: false,
             key: None,
             default: None,
+            origin: None,
             qualified: false,
             also: None,
             hidden: false,

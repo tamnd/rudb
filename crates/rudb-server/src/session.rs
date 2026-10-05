@@ -1043,16 +1043,9 @@ impl Runner {
         let fields: Vec<Field<'_>> = result
             .names()
             .iter()
-            .zip(&types)
-            .map(|(name, ty)| Field {
-                name: name.as_bytes(),
-                table: 0,
-                column: 0,
-                type_oid: ty.oid,
-                type_size: TypeInfo::get(ty.oid).map_or(-1, |info| info.len),
-                type_modifier: ty.typmod,
-                format: 0,
-            })
+            .zip(result.types())
+            .enumerate()
+            .map(|(at, (name, ty))| field(name, ty, result.origin(at), 0))
             .collect();
         out.row_description(&fields);
         let columns: Vec<_> = result
@@ -1134,6 +1127,31 @@ fn command_tag(sql: &str, result: &QueryResult, before: Transaction) -> CommandT
             } else {
                 CommandTag::Unknown
             }),
+    }
+}
+
+/// The `RowDescription` field of a column of a name, a type, a source column and a format.
+pub(super) fn field<'a>(
+    name: &'a str,
+    logical: &rudb_common::LogicalType,
+    origin: Option<rudb_common::Origin>,
+    format: i16,
+) -> Field<'a> {
+    let ty = pg_type(logical);
+    // PostgreSQL numbers the columns of a table from one.
+    let source = origin.and_then(|origin| {
+        let column = origin.column.checked_add(1)?;
+        Some((u32::try_from(origin.table).ok()?, i16::try_from(column).ok()?))
+    });
+    let (table, column) = source.unwrap_or((0, 0));
+    Field {
+        name: name.as_bytes(),
+        table,
+        column,
+        type_oid: ty.oid,
+        type_size: TypeInfo::get(ty.oid).map_or(-1, |info| info.len),
+        type_modifier: ty.typmod,
+        format,
     }
 }
 

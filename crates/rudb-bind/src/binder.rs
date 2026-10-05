@@ -14,11 +14,11 @@
 
 use std::sync::Arc;
 
-use rudb_catalog::{Catalog, Entry, FileStamp, QualifiedName, same_name};
+use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Stat, StateKey,
-    Value,
+    Error, Field, LogicalType, Origin, Result, Semantics, Session, ShowBehavior, Span, Stat,
+    StateKey, Value,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -338,6 +338,9 @@ enum Side {
     Left,
     Right,
 }
+
+/// The expressions of a select list, the name of each and the table column of each.
+type Targets = (Vec<ExprRef>, Vec<String>, Vec<Option<Origin>>);
 
 /// The state one binding run carries.
 #[derive(Debug)]
@@ -816,6 +819,7 @@ impl<'a> Binder<'a> {
                 not_null: false,
                 key: None,
                 default: None,
+                origin: None,
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -1116,6 +1120,7 @@ impl<'a> Binder<'a> {
                 not_null: false,
                 key: None,
                 default: None,
+                origin: None,
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -1214,6 +1219,7 @@ impl<'a> Binder<'a> {
             not_null: false,
             key: None,
             default: None,
+            origin: None,
             qualified: false,
             also: None,
             hidden: false,
@@ -1291,6 +1297,7 @@ impl<'a> Binder<'a> {
                 not_null: false,
                 key: None,
                 default: None,
+                origin: None,
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -1463,6 +1470,7 @@ impl<'a> Binder<'a> {
                 not_null: false,
                 key: None,
                 default: None,
+                origin: None,
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -1518,6 +1526,7 @@ impl<'a> Binder<'a> {
                 not_null: false,
                 key: None,
                 default: None,
+                origin: None,
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -1748,7 +1757,8 @@ impl<'a> Binder<'a> {
         self.clause = "SELECT clause";
         self.unnest_here = true;
         self.alias_clause(AliasClause::Select);
-        let (mut exprs, mut names) = self.bind_targets(ast, &targets, &input, &mut above)?;
+        let (mut exprs, mut names, origins) =
+            self.bind_targets(ast, &targets, &input, &mut above)?;
         self.unnest_here = false;
         let visible = exprs.len();
         self.aliases = outer_aliases;
@@ -1778,6 +1788,7 @@ impl<'a> Binder<'a> {
                 not_null: self.passes_through(*expr, &input),
                 key: self.key_through(*expr, &input),
                 default: self.through(*expr, &input).and_then(|column| column.default.clone()),
+                origin: origins[at],
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -1897,6 +1908,7 @@ impl<'a> Binder<'a> {
                 not_null: output.columns[at].not_null,
                 key: output.columns[at].key,
                 default: output.columns[at].default.clone(),
+                origin: output.columns[at].origin,
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -2009,10 +2021,14 @@ impl<'a> Binder<'a> {
         targets: &[ast::Target],
         input: &Scope,
         above: &mut Vec<PendingSubquery>,
-    ) -> Result<(Vec<ExprRef>, Vec<String>)> {
+    ) -> Result<Targets> {
         let mut exprs = Vec::with_capacity(targets.len());
         let mut names = Vec::with_capacity(targets.len());
+        // The table column of each target that is a plain column, taken before the target is moved
+        // over an aggregate, so a column of `GROUP BY` keeps it the way PostgreSQL keeps it.
+        let mut origins = Vec::with_capacity(targets.len());
         for (at, target) in targets.iter().enumerate() {
+            origins.resize(exprs.len(), None);
             if let Some(aliases) = &mut self.aliases {
                 aliases.defined = at;
             }
@@ -2022,7 +2038,9 @@ impl<'a> Binder<'a> {
                     self.star_entry = Some(picked.clone());
                     let expr = self.bind_picked(ast, input);
                     self.star_entry = None;
-                    exprs.push(self.over_aggregate(expr?, input)?);
+                    let expr = expr?;
+                    origins.push(self.through(expr, input).and_then(|column| column.origin));
+                    exprs.push(self.over_aggregate(expr, input)?);
                     names.push(picks.name(picked, alias)?);
                 }
                 continue;
@@ -2033,6 +2051,7 @@ impl<'a> Binder<'a> {
                     for picked in self.star_columns(ast, target.expr, input)? {
                         // A replacement takes the column's place and its position.
                         let before = self.scalar_subqueries.len();
+                        origins.push(picked.column.origin.filter(|_| picked.replacement == NONE));
                         let expr = if picked.replacement == NONE {
                             self.plan
                                 .add_expr(Expr::Column(picked.column.binding), picked.column.ty)
@@ -2055,6 +2074,7 @@ impl<'a> Binder<'a> {
                         self.star_entry = None;
                         let expr = expr?;
                         self.lift_over_aggregate(before, above, input)?;
+                        origins.push(self.through(expr, input).and_then(|column| column.origin));
                         exprs.push(self.over_aggregate(expr, input)?);
                         names.push(picks.name(picked, alias)?);
                     }
@@ -2093,6 +2113,14 @@ impl<'a> Binder<'a> {
                 self.unnest_fields(expr, taking, None, &mut exprs, &mut names)?;
                 continue;
             }
+            // A cast that changes nothing, such as `b::text` of a `VARCHAR`, binds to the column
+            // itself, and PostgreSQL gives it no table column, so the written target decides.
+            let plain = matches!(
+                ast.expr(target.expr),
+                ast::Expr::Column { .. } | ast::Expr::Positional { .. }
+            );
+            origins
+                .push(self.through(expr, input).and_then(|column| column.origin).filter(|_| plain));
             exprs.push(self.over_aggregate(expr, input)?);
             names.push(if target.alias == NONE {
                 self.target_name(ast, target.expr, input)
@@ -2103,7 +2131,8 @@ impl<'a> Binder<'a> {
         if exprs.is_empty() {
             return Err(Error::binder("SELECT list is empty after resolving * expressions!"));
         }
-        Ok((exprs, names))
+        origins.resize(exprs.len(), None);
+        Ok((exprs, names, origins))
     }
 
     /// The name an unaliased target gets.
@@ -2732,6 +2761,7 @@ impl<'a> Binder<'a> {
                 not_null: field.not_null,
                 key: None,
                 default: None,
+                origin: None,
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -2807,6 +2837,11 @@ impl<'a> Binder<'a> {
                 }
             }
         }
+        // A table of no catalog, such as the held rows of `excluded`, is no table to a client.
+        let origin = |at: usize| {
+            let table = table.oid();
+            (table != DETACHED && !excluded).then_some(Origin { table, column: at as u32 })
+        };
         let index = self.fresh_index();
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {
@@ -2818,6 +2853,7 @@ impl<'a> Binder<'a> {
                 not_null: field.not_null,
                 key: marks[at],
                 default: table.default(at).map(str::to_owned),
+                origin: origin(at),
                 qualified: excluded,
                 also: None,
                 hidden: false,
@@ -2925,6 +2961,12 @@ impl<'a> Binder<'a> {
         // It is written before the label and before the `AS t(a, b)` list below, because those two
         // rename the view for one query and not for everyone.
         view.remember(scope.fields());
+        // PostgreSQL gives the column of a view as the origin, not the table column under it.
+        let shown = scope.columns.iter_mut().filter(|column| !column.hidden);
+        for (at, column) in shown.enumerate() {
+            column.origin =
+                (view.oid() != DETACHED).then_some(Origin { table: view.oid(), column: at as u32 });
+        }
         let label = if alias == NONE { name.table.clone() } else { ast.string(alias).to_string() };
         scope.relabel(&label);
         if !columns.is_empty() {
@@ -3371,6 +3413,7 @@ impl<'a> Binder<'a> {
                 not_null: false,
                 key: None,
                 default: None,
+                origin: None,
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -3737,6 +3780,7 @@ impl<'a> Binder<'a> {
                 not_null: false,
                 key: None,
                 default: None,
+                origin: None,
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -4516,6 +4560,7 @@ impl<'a> Binder<'a> {
                     not_null: false,
                     key: None,
                     default: None,
+                    origin: None,
                     qualified: false,
                     also: None,
                     hidden: false,

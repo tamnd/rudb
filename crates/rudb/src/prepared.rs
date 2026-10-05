@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rudb_bind::Parameters;
 use rudb_catalog::QualifiedName;
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Origin, Result, Value};
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::parse_ast_with_case;
 
@@ -20,6 +20,8 @@ pub struct Description {
     pub parameters: Vec<Option<LogicalType>>,
     /// The columns the statement answers, or `None` for a statement that answers no rows.
     pub fields: Option<Vec<Field>>,
+    /// The table column that each of `fields` reads with no change, where there is one.
+    pub origins: Vec<Option<Origin>>,
 }
 
 /// A prepared statement.
@@ -826,7 +828,7 @@ impl Prepared {
                     .map(|(_, ty)| ty.clone())
             })
             .collect();
-        Ok(Description { parameters, fields: described.fields })
+        Ok(Description { parameters, fields: described.fields, origins: described.origins })
     }
 
     /// What the statement runs as, as it stands against the database now: a point plan for one of

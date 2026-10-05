@@ -10,7 +10,7 @@
 //! no `hits` to refer to, which is SQL's rule and not ours.
 
 use rudb_catalog::same_name;
-use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_common::{Error, Field, LogicalType, Origin, Result};
 use rudb_plan::ColumnBinding;
 
 /// One visible column.
@@ -40,6 +40,9 @@ pub(crate) struct Visible {
     pub(crate) key: Option<&'static str>,
     /// The SQL of the `DEFAULT` of the column it came from, carried the same way as `key`.
     pub(crate) default: Option<String>,
+    /// The table column that the column reads with no change, carried the same way as `key`. A
+    /// PostgreSQL session sends it in `RowDescription`.
+    pub(crate) origin: Option<Origin>,
     /// Whether only a name with the table in front of it reaches the column, which is what the
     /// `excluded` of an `ON CONFLICT DO UPDATE` is: a bare name there means the held row's column.
     pub(crate) qualified: bool,
@@ -279,6 +282,11 @@ impl Scope {
             .collect()
     }
 
+    /// The table column of each column that `Self::fields` gives, where there is one.
+    pub(crate) fn origins(&self) -> Vec<Option<Origin>> {
+        self.columns.iter().filter(|column| !column.hidden).map(|column| column.origin).collect()
+    }
+
     /// Drops everything from `position` on, which is what a semi or an anti join does to the right
     /// side once its condition has been bound.
     pub(crate) fn truncate(&mut self, position: usize) {
@@ -362,6 +370,7 @@ mod tests {
             not_null: false,
             key: None,
             default: None,
+            origin: None,
             qualified: false,
             also: None,
             hidden: false,
@@ -375,6 +384,7 @@ mod tests {
             not_null: false,
             key: None,
             default: None,
+            origin: None,
             qualified: false,
             also: None,
             hidden: false,
@@ -388,6 +398,7 @@ mod tests {
             not_null: false,
             key: None,
             default: None,
+            origin: None,
             qualified: false,
             also: None,
             hidden: false,

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rudb_common::{Field, LogicalType, Span, Value, days_from_civil};
+use rudb_common::{Field, LogicalType, Origin, Span, Value, days_from_civil};
 
 use crate::{Config, Database, VECTOR_SIZE, arrow};
 
@@ -13055,4 +13055,33 @@ fn a_postgres_session_names_columns_the_way_postgres_does() {
     );
     assert_eq!(names("SELECT * FROM (VALUES (1, 2)) v"), ["column1", "column2"]);
     assert_eq!(names("SELECT x::text FROM (SELECT 1 AS x) t"), ["x"]);
+}
+
+#[test]
+fn a_result_knows_the_table_column_of_each_plain_column() {
+    let db = Database::new();
+    let connection = db.connect();
+    connection.execute("CREATE TABLE t (a INTEGER, b VARCHAR, c INTEGER)").expect("creates");
+    connection.execute("CREATE VIEW v AS SELECT c, a FROM t").expect("creates");
+    connection.execute("INSERT INTO t VALUES (1, 'x', 2)").expect("inserts");
+    let origins = |sql: &str| {
+        let result = connection.query(sql).expect("runs");
+        (0..result.width()).map(|at| result.origin(at)).collect::<Vec<_>>()
+    };
+    let table = origins("SELECT a FROM t")[0].expect("a column of t").table;
+    let of = |column| Some(Origin { table, column });
+    assert_eq!(origins("SELECT * FROM t"), [of(0), of(1), of(2)]);
+    assert_eq!(origins("SELECT c, a + 1, b::VARCHAR, a AS z FROM t"), [of(2), None, None, of(0)]);
+    assert_eq!(origins("SELECT * FROM (SELECT b FROM t) s"), [of(1)]);
+    assert_eq!(origins("SELECT b, count(*) FROM t GROUP BY b"), [of(1), None]);
+    assert_eq!(origins("SELECT a FROM t UNION SELECT a FROM t"), [None]);
+    let view = origins("SELECT * FROM v");
+    assert_ne!(view[0].expect("a column of v").table, table);
+    assert_eq!(
+        view.iter().map(|origin| origin.map(|o| o.column)).collect::<Vec<_>>(),
+        [Some(0), Some(1)]
+    );
+    let returned =
+        connection.execute("INSERT INTO t VALUES (2, 'y', 3) RETURNING c, a * 2").expect("runs");
+    assert_eq!([returned.origin(0), returned.origin(1)], [of(2), None]);
 }

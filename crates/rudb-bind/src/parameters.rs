@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rudb_common::{Field, LogicalType, Value};
+use rudb_common::{Field, LogicalType, Origin, Value};
 
 /// What a prepared statement was handed, by identifier.
 ///
@@ -43,6 +43,8 @@ pub struct Described {
     /// The columns the statement answers: those of a query or of a `RETURNING` list. `None` for a
     /// statement that answers no rows.
     pub fields: Option<Vec<Field>>,
+    /// The table column that each of `fields` reads with no change, where there is one.
+    pub origins: Vec<Option<Origin>>,
 }
 
 impl Placeholders {
@@ -71,6 +73,11 @@ impl Placeholders {
     /// Keeps the columns the statement answers.
     pub fn answer(&self, fields: Vec<Field>) {
         self.lock().fields = Some(fields);
+    }
+
+    /// Keeps the table column of each column the statement answers.
+    pub fn answer_origins(&self, origins: Vec<Option<Origin>>) {
+        self.lock().origins = origins;
     }
 
     /// What was found so far.

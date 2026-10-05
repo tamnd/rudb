@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use rudb_arrow::{DataType, Field, RecordBatch, Schema};
-use rudb_common::{LogicalType, Memory, Reservation, Result, Session, Value};
+use rudb_common::{LogicalType, Memory, Origin, Reservation, Result, Session, Value};
 use rudb_metrics::Document;
 use rudb_vector::{Chunk, Vector};
 
@@ -36,6 +36,9 @@ pub struct QueryResult {
     /// How many rows the statement wrote, when this is the count a writing statement answers with
     /// rather than rows a query produced.
     changes: Option<usize>,
+    /// The table column that each column reads with no change, where there is one, or empty when
+    /// nothing recorded them.
+    origins: Vec<Option<Origin>>,
 }
 
 /// The part of a [`QueryResult`] its clones share.
@@ -81,7 +84,15 @@ impl QueryResult {
             rows,
             metrics: None,
             changes: None,
+            origins: Vec::new(),
         }
+    }
+
+    /// The same result, carrying the table column of each column.
+    #[must_use]
+    pub(crate) fn with_origins(mut self, origins: &[Option<Origin>]) -> Self {
+        self.origins = origins.to_vec();
+        self
     }
 
     /// The same result, carrying the document the execution that produced it filled in.
@@ -253,6 +264,12 @@ impl QueryResult {
     #[must_use]
     pub fn types(&self) -> &[LogicalType] {
         &self.body.types
+    }
+
+    /// The table column that the column at `column` reads with no change, where there is one.
+    #[must_use]
+    pub fn origin(&self, column: usize) -> Option<Origin> {
+        self.origins.get(column).copied().flatten()
     }
 
     /// How many bytes this result is charged against the database's memory limit.

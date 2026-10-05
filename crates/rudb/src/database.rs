@@ -5139,7 +5139,8 @@ impl Shared {
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
-                self.answer(sql, &plan, &catalog, cancel, under)
+                let result = self.answer(sql, &plan, &catalog, cancel, under)?;
+                Ok(result.with_origins(plan.origins()))
             }
             Bound::Explain { mut plan, analyze, statistics, codegen } => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
@@ -6081,10 +6082,12 @@ impl Shared {
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 // A plan with parameters in it is left to the first engine, which the compiled one
                 // has never been asked to take.
-                if !parameters.is_empty() {
-                    return run(sql, &plan, &catalog, cancel, under);
-                }
-                self.answer(sql, &plan, &catalog, cancel, under)
+                let result = if parameters.is_empty() {
+                    self.answer(sql, &plan, &catalog, cancel, under)?
+                } else {
+                    run(sql, &plan, &catalog, cancel, under)?
+                };
+                Ok(result.with_origins(plan.origins()))
             }
             Bound::Explain { mut plan, analyze, statistics, codegen } => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
@@ -6806,7 +6809,8 @@ impl Shared {
                         &session,
                         Rows::ForACaller,
                     );
-                    run(sql, &returning, &catalog, cancel, under)
+                    let result = run(sql, &returning, &catalog, cancel, under)?;
+                    Ok(result.with_origins(returning.origins()))
                 })();
                 catalog.table_mut(&insert.name)?.put_back(held);
                 answer
