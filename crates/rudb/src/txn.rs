@@ -520,13 +520,15 @@ pub(crate) fn merge(
 /// Does what a transaction did to one table again, on the committed table `name`, which others
 /// changed since the snapshot's `before`. `mine` is the transaction's copy of the table.
 ///
-/// Appends go on the end. When the transaction took no row out and nobody moved one since, the
-/// snapshot's rows have the same numbers in the committed table and in the copy, so the rows the
-/// transaction updated are written over where they are, and the rows it added, which are the rows
-/// of the copy past the snapshot's, go on the end after whatever others added. Neither reads a row
-/// the transaction did not write, and the second is what lets a transaction that updates a table
-/// commit while others append to it, as long as it did not update a row it added itself, since
-/// the log numbers that row as the copy did.
+/// Appends go on the end. When nobody moved a row since, the snapshot's rows have the same numbers
+/// in the committed table as in the snapshot, and the copy's numbers for them follow from the rows
+/// the transaction took out. So the rows the transaction updated are written over where they are,
+/// the rows it took out are taken out, and the rows it added, which are the rows of the copy past
+/// the snapshot's, go on the end after whatever others added. None of it reads a row the
+/// transaction did not write, unless the table keeps its rows in memory and the transaction took
+/// one out. This is what lets a transaction commit while others append to the table, as long as
+/// it did not write or take out a row it added itself, since the log numbers that row as the copy
+/// did.
 ///
 /// Anything else is done again on every row of the table read into memory, as long as the table
 /// still has the snapshot's rows and no more.
@@ -553,32 +555,28 @@ fn rebase(
     }
     let base = before.rows().len() as u64;
     let now = committed.table(name)?;
-    let moves = changes.iter().any(|change| matches!(change, Change::Delete(_)));
-    let updated = changes
-        .iter()
-        .filter_map(|change| match change {
-            Change::Update(runs, _) => Some(runs),
-            _ => None,
-        })
-        .flatten()
-        .flat_map(|&(first, len)| first..first + len)
-        .collect::<BTreeSet<_>>();
-    // The log has the transaction's update of a row it added under the copy's number for it,
-    // which names somebody else's row once others added rows before it.
-    let renumbered = now.rows().len() as u64 != base && updated.last() >= Some(&base);
-    if !moves
-        && !renumbered
-        && now.frame() == before.frame()
+    let others = now.rows().len() as u64 != base;
+    if now.frame() == before.frame()
         && now.rows().len() as u64 >= base
-        && mine.rows().len() as u64 >= base
+        && let Some(done) = Redone::of(&changes, base)
+        // The log has the transaction's update or delete of a row it added under the copy's
+        // number for it, which names somebody else's row once others added rows before it.
+        && !(others && done.own)
+        && mine.rows().len() as u64 >= base - done.deleted.len() as u64
     {
-        let numbers = updated.into_iter().filter(|&row| row < base).collect::<Vec<_>>();
-        let rows = picked(mine, &numbers)?;
-        let own = picked(mine, &(base..mine.rows().len() as u64).collect::<Vec<_>>())?;
-        let table = committed.table_appending(name)?;
+        let kept = base - done.deleted.len() as u64;
+        let numbers = done.updated.into_iter().collect::<Vec<_>>();
+        let rows = picked(mine, &copied(&numbers, &done.deleted))?;
+        let own = picked(mine, &(kept..mine.rows().len() as u64).collect::<Vec<_>>())?;
+        let table = if done.deleted.is_empty() {
+            committed.table_appending(name)?
+        } else {
+            committed.table_mut(name)?
+        };
         if !table.put_rows(&numbers, &rows)? {
             return Err(commit_conflict());
         }
+        table.remove_rows(&done.deleted, workers)?;
         if !own.is_empty() {
             table.append_committing(own, workers).map_err(failed_commit)?;
         }
@@ -601,6 +599,85 @@ fn rebase(
     }
     let table = committed.table_mut(name)?;
     if moves { table.replace_all(chunks, workers) } else { table.update_all(chunks, workers) }
+}
+
+/// What a transaction's changes to one table did to the snapshot's rows, by the snapshot's numbers
+/// for them.
+#[derive(Debug, Default)]
+struct Redone {
+    /// The rows it took out, in order.
+    deleted: Vec<u64>,
+    /// The rows it wrote and did not take out afterwards.
+    updated: BTreeSet<u64>,
+    /// Whether it wrote or took out a row it added itself.
+    own: bool,
+}
+
+impl Redone {
+    /// Follows `changes` from a table of `base` rows, or `None` when they do not fit it.
+    fn of(changes: &[Change], base: u64) -> Option<Self> {
+        let mut done = Self::default();
+        // The copy's rows from the snapshot come first, so a row of the copy is one of them while
+        // its number is below how many of them are left.
+        for change in changes {
+            let (runs, deletes) = match change {
+                Change::Insert(_) => continue,
+                Change::Update(runs, _) => (runs, false),
+                Change::Delete(runs) => (runs, true),
+            };
+            let left = base - done.deleted.len() as u64;
+            let rows = runs.iter().flat_map(|&(first, len)| first..first + len);
+            let (theirs, mine): (Vec<u64>, Vec<u64>) = rows.partition(|&row| row < left);
+            done.own |= !mine.is_empty();
+            let based = based(&theirs, &done.deleted)?;
+            if deletes {
+                for row in &based {
+                    done.updated.remove(row);
+                }
+                done.deleted.extend(based);
+                done.deleted.sort_unstable();
+            } else {
+                done.updated.extend(based);
+            }
+        }
+        Some(done)
+    }
+}
+
+/// The snapshot's numbers for the copy's rows `rows`, which rise and are all rows of the snapshot,
+/// when the snapshot's rows `deleted`, which rise, are taken out of the copy. `None` if `rows` do
+/// not rise.
+fn based(rows: &[u64], deleted: &[u64]) -> Option<Vec<u64>> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut skipped = 0;
+    let mut last = None;
+    for &row in rows {
+        if last.is_some_and(|last| row <= last) {
+            return None;
+        }
+        last = Some(row);
+        let mut number = row + skipped as u64;
+        while deleted.get(skipped).is_some_and(|&gone| gone <= number) {
+            skipped += 1;
+            number += 1;
+        }
+        out.push(number);
+    }
+    Some(out)
+}
+
+/// The copy's numbers for the snapshot's rows `numbers`, none of them in `deleted`, both rising.
+fn copied(numbers: &[u64], deleted: &[u64]) -> Vec<u64> {
+    let mut skipped = 0;
+    numbers
+        .iter()
+        .map(|&number| {
+            while deleted.get(skipped).is_some_and(|&gone| gone < number) {
+                skipped += 1;
+            }
+            number - skipped as u64
+        })
+        .collect()
 }
 
 /// A key the rows a commit adds repeat, in the words the pin fails a commit with.

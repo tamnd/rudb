@@ -12,7 +12,7 @@ use rudb_native::{
     Reader as NativeReader, StoredPart, Stripes,
 };
 use rudb_storage::{MemoryTable, Probe, Range};
-use rudb_vector::{Chunk, VECTOR_SIZE, Vector, concat};
+use rudb_vector::{Chunk, Selection, VECTOR_SIZE, Vector, concat};
 
 use crate::catalog::DETACHED;
 use crate::gone::Gone;
@@ -2466,6 +2466,51 @@ impl Table {
         };
         self.frame = next_revision();
         Ok(())
+    }
+
+    /// Takes the rows `numbers` names out, which rise, whatever holds the table: marked gone
+    /// beside a file that [`Self::takes_rows`], and otherwise every row read and the ones that stay
+    /// put back with [`Self::replace_all`]. Every row after the first one taken moves down, so the
+    /// frame is new.
+    ///
+    /// # Errors
+    ///
+    /// If a number is past the table or the numbers do not rise.
+    pub fn remove_rows(&mut self, numbers: &[u64], workers: usize) -> Result<()> {
+        if numbers.is_empty() {
+            return Ok(());
+        }
+        if self.takes_rows() {
+            return self.take_rows(numbers);
+        }
+        let all = (0..self.columns.len()).collect::<Vec<_>>();
+        let mut kept = Vec::with_capacity(self.rows.chunk_count());
+        let mut numbers = numbers.iter().copied().peekable();
+        let mut start = 0_u64;
+        for at in 0..self.rows.chunk_count() {
+            let chunk = self.rows.read(at, &all)?.settled()?;
+            let end = start + chunk.len() as u64;
+            let mut gone = Vec::new();
+            while let Some(number) = numbers.next_if(|&number| number < end) {
+                let place = number
+                    .checked_sub(start)
+                    .ok_or_else(|| Error::internal("the rows a delete took out do not rise"))?;
+                gone.push(place as u32);
+            }
+            start = end;
+            if gone.is_empty() {
+                kept.push(chunk);
+                continue;
+            }
+            let rest = Selection::from_indices(gone).complement(chunk.len());
+            if !rest.is_empty() {
+                kept.push(chunk.compact(&rest)?);
+            }
+        }
+        if numbers.next().is_some() {
+            return Err(Error::internal("a delete took out a row past the table"));
+        }
+        self.replace_all(kept, workers)
     }
 
     /// The rows `numbers` names, which rise, as they are now with `values` in the columns
