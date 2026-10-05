@@ -29,6 +29,13 @@
 //! with p up to 38 as a scaled `i128`, and [`decimal_out`] and [`decimal_send`] write that integer
 //! with no allocation.
 //!
+//! `date`, `time`, `timetz`, `timestamp`, `timestamptz` and `interval` in the layout of
+//! PostgreSQL: days or microseconds since 2000-01-01, with the infinities at the ends of the
+//! integer range. The output functions take the `DateStyle` as a [`DateFormat`] and the
+//! `IntervalStyle` as an [`IntervalStyle`], and [`timestamptz_out`] takes a [`TimeZone`] that
+//! gives the offset and the abbreviation at an instant. The receive functions check the range and
+//! round to the typmod. [`date2j`] and [`j2date`] convert between a calendar date and a Julian day.
+//!
 //! [`Recv`], the binary input of a `Bind` parameter, with the errors of PostgreSQL when the value
 //! is too short or too long. The binary output of the other types is the value in big-endian bytes.
 //!
@@ -36,8 +43,12 @@
 //!
 //! The input functions take a string in the server encoding, which is UTF-8. The caller converts
 //! from the client encoding first.
+//!
+//! The text input of the date and time types is not here yet. Only [`FixedZone`] implements
+//! [`TimeZone`], so a zone with daylight saving time needs the tz database, which comes later.
 
 mod binary;
+mod datetime;
 mod error;
 mod float;
 mod generated;
@@ -48,6 +59,13 @@ mod types;
 pub mod typmod;
 
 pub use binary::{Recv, name_recv};
+pub use datetime::{
+    DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateFormat, DateOrder, DateStyle, FixedZone, Interval,
+    IntervalStyle, POSTGRES_EPOCH_JDATE, TIMESTAMP_INFINITY, TIMESTAMP_NEGATIVE_INFINITY, TimeZone,
+    UNIX_EPOCH_JDATE, UNIX_TO_POSTGRES_DAYS, UNIX_TO_POSTGRES_USECS, USECS_PER_DAY, USECS_PER_SEC,
+    date_out, date_recv, date2j, interval_out, interval_recv, interval_send, j2date, time_out,
+    time_recv, timestamp_out, timestamp_recv, timestamptz_out, timetz_out, timetz_recv,
+};
 pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};
 pub use generated::oids as oid;

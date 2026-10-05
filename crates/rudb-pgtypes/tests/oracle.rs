@@ -1,6 +1,9 @@
 //! Checks the text forms against `oracle.tsv`, which `oracle.sql` records from the server at the
-//! pin. Each line is the type, `extra_float_digits`, the input, and the output or the error. A
-//! type that starts with `send` has the hex of the binary output.
+//! pin. Each line is the type, a setting, the input, and the output or the error. The setting is
+//! `extra_float_digits` for the floats, `DateStyle` for the date and time types with the
+//! `TimeZone` after a `|` for `timestamptz`, and `IntervalStyle` for `interval`. A type that starts
+//! with `send` has the hex of the binary output. The input of the date and time types is the hex
+//! of the binary form, because the text input is not here yet.
 
 use rudb_pgtypes::*;
 
@@ -12,6 +15,95 @@ fn text(f: impl FnOnce(&mut Vec<u8>)) -> String {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap()).collect()
+}
+
+fn date_format(setting: &str) -> DateFormat {
+    let (style, order) = setting.split_once(", ").unwrap();
+    let style = match style {
+        "ISO" => DateStyle::Iso,
+        "SQL" => DateStyle::Sql,
+        "Postgres" => DateStyle::Postgres,
+        "German" => DateStyle::German,
+        _ => panic!("unknown DateStyle {setting:?}"),
+    };
+    let order = match order {
+        "MDY" => DateOrder::Mdy,
+        "DMY" => DateOrder::Dmy,
+        "YMD" => DateOrder::Ymd,
+        _ => panic!("unknown DateStyle {setting:?}"),
+    };
+    DateFormat { style, order }
+}
+
+/// The fixed zones of the fixture. A POSIX zone such as `+05:30` is west of UTC and has no
+/// abbreviation.
+fn zone(name: &str) -> FixedZone {
+    match name {
+        "UTC" => FixedZone::utc(),
+        "<+05:30>-05:30" => FixedZone { offset: 19800, abbrev: "+05:30".to_string() },
+        "+05:30" => FixedZone { offset: -19800, abbrev: String::new() },
+        _ => panic!("unknown TimeZone {name:?}"),
+    }
+}
+
+fn interval_style(setting: &str) -> IntervalStyle {
+    match setting {
+        "postgres" => IntervalStyle::Postgres,
+        "postgres_verbose" => IntervalStyle::PostgresVerbose,
+        "sql_standard" => IntervalStyle::SqlStandard,
+        "iso_8601" => IntervalStyle::Iso8601,
+        _ => panic!("unknown IntervalStyle {setting:?}"),
+    }
+}
+
+/// The text output of a date or time type from its binary form. The value must also go back to
+/// the same bytes.
+fn datetime(type_name: &str, setting: &str, input: &str) -> Result<String, TypeError> {
+    let bytes = unhex(input);
+    let recv = &mut Recv::new(&bytes);
+    let mut out = Vec::new();
+    let mut back = Vec::new();
+    match type_name {
+        "date" => {
+            let v = date_recv(recv)?;
+            date_out(v, date_format(setting), &mut out);
+            back.extend_from_slice(&v.to_be_bytes());
+        }
+        "time" => {
+            let v = time_recv(recv, -1)?;
+            time_out(v, &mut out);
+            back.extend_from_slice(&v.to_be_bytes());
+        }
+        "timetz" => {
+            let (time, zone) = timetz_recv(recv, -1)?;
+            timetz_out(time, zone, &mut out);
+            back.extend_from_slice(&time.to_be_bytes());
+            back.extend_from_slice(&zone.to_be_bytes());
+        }
+        "timestamp" => {
+            let v = timestamp_recv(recv, -1)?;
+            timestamp_out(v, date_format(setting), &mut out)?;
+            back.extend_from_slice(&v.to_be_bytes());
+        }
+        "timestamptz" => {
+            let (style, name) = setting.split_once('|').unwrap();
+            let v = timestamp_recv(recv, -1)?;
+            timestamptz_out(v, date_format(style), &zone(name), &mut out)?;
+            back.extend_from_slice(&v.to_be_bytes());
+        }
+        "interval" => {
+            let v = interval_recv(recv, -1)?;
+            interval_out(&v, interval_style(setting), &mut out);
+            interval_send(&v, &mut back);
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(back, bytes, "{type_name} {input} does not go back to the same bytes");
+    Ok(String::from_utf8(out).unwrap())
 }
 
 /// The typmod of `numeric` or `numeric(p,s)`.
@@ -47,7 +139,7 @@ fn numeric(typmod: i32, send: bool, input: &str) -> Result<String, TypeError> {
     Ok(if send { hex(&out) } else { String::from_utf8(out).unwrap() })
 }
 
-fn run(type_name: &str, extra_float_digits: i32, input: &str) -> String {
+fn run(type_name: &str, setting: &str, input: &str) -> String {
     let (send, base) = match type_name.strip_prefix("send ") {
         Some(base) => (true, base),
         None => (false, type_name),
@@ -55,6 +147,10 @@ fn run(type_name: &str, extra_float_digits: i32, input: &str) -> String {
     if let Some(typmod) = numeric_typmod(base) {
         return error_text(numeric(typmod, send, input));
     }
+    if ["date", "time", "timetz", "timestamp", "timestamptz", "interval"].contains(&type_name) {
+        return error_text(datetime(type_name, setting, input));
+    }
+    let extra_float_digits = || setting.parse::<i32>().unwrap();
     let result = match type_name {
         "int2" => int2_in(input).map(|v| text(|out| int_out(v.into(), out))),
         "int4" => int4_in(input).map(|v| text(|out| int_out(v.into(), out))),
@@ -65,8 +161,8 @@ fn run(type_name: &str, extra_float_digits: i32, input: &str) -> String {
         "name" => Ok(name_in(input).to_string()),
         "bytea" => bytea_in(input).map(|v| text(|out| bytea_out(&v, ByteaOutput::Hex, out))),
         "uuid" => uuid_in(input).map(|v| text(|out| uuid_out(&v, out))),
-        "float8" => float8_in(input).map(|v| text(|out| float8_out(v, extra_float_digits, out))),
-        "float4" => float4_in(input).map(|v| text(|out| float4_out(v, extra_float_digits, out))),
+        "float8" => float8_in(input).map(|v| text(|out| float8_out(v, extra_float_digits(), out))),
+        "float4" => float4_in(input).map(|v| text(|out| float4_out(v, extra_float_digits(), out))),
         _ => panic!("the fixture has a type that the test does not know: {type_name}"),
     };
     error_text(result)
@@ -84,14 +180,12 @@ fn the_text_forms_match_the_server_at_the_pin() {
     let mut failures = Vec::new();
     for line in include_str!("oracle.tsv").lines() {
         let fields: Vec<&str> = line.split('\t').collect();
-        let [type_name, extra_float_digits, input, expected] = fields[..] else {
+        let [type_name, setting, input, expected] = fields[..] else {
             panic!("a line of the fixture does not have four fields: {line:?}");
         };
-        let got = run(type_name, extra_float_digits.parse().unwrap(), input);
+        let got = run(type_name, setting, input);
         if got != expected {
-            failures.push(format!(
-                "{type_name} {extra_float_digits} {input:?}: {got:?}, not {expected:?}"
-            ));
+            failures.push(format!("{type_name} {setting} {input:?}: {got:?}, not {expected:?}"));
         }
     }
     assert!(failures.is_empty(), "{} lines differ:\n{}", failures.len(), failures.join("\n"));
