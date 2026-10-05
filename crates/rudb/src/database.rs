@@ -4148,6 +4148,20 @@ impl Shared {
         if !name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) {
             return;
         }
+        // Rows whose values are their columns' types already are written as they are. A value
+        // that is not is cast on the way into a chunk, as the table took it.
+        let typed = rows.iter().all(|row| {
+            row.len() == fields.len()
+                && row
+                    .iter()
+                    .zip(fields)
+                    .all(|(value, field)| value.is_null() || value.is_of(&field.ty))
+        });
+        if typed {
+            let payload = journal.encode_values(&name.schema, &name.table, fields, rows);
+            journal.stage(payload);
+            return;
+        }
         let columns = fields
             .iter()
             .enumerate()

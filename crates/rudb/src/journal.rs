@@ -367,6 +367,25 @@ impl Journal {
         Some(Record { kind: Kind::Insert, payload: out, inserted })
     }
 
+    /// [`Self::encode`] for rows handed over as values, each already its column's type or null,
+    /// written straight from them rather than first built into a chunk. The record is the one
+    /// `encode` would write but for the columns that are not text, which go a value at a time.
+    pub(crate) fn encode_values(
+        &self,
+        schema: &str,
+        table: &str,
+        fields: &[Field],
+        rows: &[Vec<Value>],
+    ) -> Option<Record> {
+        let staged = self.staged.iter().map(|record| record.inserted).sum::<usize>();
+        if self.dirty || staged + rows.len() >= BULK_ROWS {
+            return None;
+        }
+        let mut out = header(schema, table)?;
+        put_value_rows(&mut out, fields, rows, MOST_STAGED - self.staged_bytes)?;
+        Some(Record { kind: Kind::Insert, payload: out, inserted: rows.len() })
+    }
+
     /// The Delete record for the rows at `rows` of `schema.table`, the row numbers ascending.
     pub(crate) fn encode_delete(&self, schema: &str, table: &str, rows: &[u64]) -> Option<Record> {
         if self.dirty {
@@ -703,6 +722,80 @@ fn put_rows(out: &mut Vec<u8>, fields: &[Field], chunks: &[Chunk], most: usize) 
                 if out.len() > most {
                     return None;
                 }
+            }
+        }
+        if out.len() > most {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// [`put_rows`] for rows as values, every one of them null or of its column's type.
+/// The bytes of a text or blob value, `Some(None)` for a null, and `None` for anything else.
+fn text_of(value: &Value) -> Option<Option<&[u8]>> {
+    match value {
+        Value::Varchar(text) => Some(Some(text.as_bytes())),
+        Value::Blob(bytes) => Some(Some(bytes.as_slice())),
+        Value::Null => Some(None),
+        _ => None,
+    }
+}
+
+fn put_value_rows(
+    out: &mut Vec<u8>,
+    fields: &[Field],
+    rows: &[Vec<Value>],
+    most: usize,
+) -> Option<()> {
+    if !fields.iter().all(|field| carried(&field.ty)) {
+        return None;
+    }
+    if rows.iter().any(|row| row.len() != fields.len()) {
+        return None;
+    }
+    out.extend_from_slice(&u16::try_from(fields.len()).ok()?.to_le_bytes());
+    out.extend_from_slice(&u32::try_from(rows.len()).ok()?.to_le_bytes());
+    for (column, field) in fields.iter().enumerate() {
+        if matches!(field.ty, LogicalType::Varchar | LogicalType::Blob) {
+            let mut bytes = 0;
+            let mut nulls = false;
+            for row in rows {
+                match text_of(&row[column])? {
+                    Some(text) => bytes += text.len(),
+                    None => nulls = true,
+                }
+            }
+            if out.len() + bytes > most {
+                return None;
+            }
+            out.push(mode::TEXT);
+            if nulls {
+                out.push(1);
+                let start = out.len();
+                out.resize(start + rows.len().div_ceil(8), 0);
+                for (at, row) in rows.iter().enumerate() {
+                    if !row[column].is_null() {
+                        out[start + at / 8] |= 1 << (at % 8);
+                    }
+                }
+            } else {
+                out.push(0);
+            }
+            out.reserve(4 * rows.len() + bytes);
+            for row in rows {
+                let len = text_of(&row[column])?.map_or(0, <[u8]>::len);
+                out.extend_from_slice(&u32::try_from(len).ok()?.to_le_bytes());
+            }
+            for row in rows {
+                if let Some(text) = text_of(&row[column])? {
+                    out.extend_from_slice(text);
+                }
+            }
+        } else {
+            out.push(mode::VALUES);
+            for row in rows {
+                put(out, &row[column], &field.ty)?;
             }
         }
         if out.len() > most {
@@ -1425,7 +1518,9 @@ mod tests {
     use rudb_txn::log::Kind;
     use rudb_vector::{Chunk, Vector};
 
-    use super::{Change, decode_rows, header, put, put_rows, put_runs, put_text, read_record};
+    use super::{
+        Change, decode_rows, header, put, put_rows, put_runs, put_text, put_value_rows, read_record,
+    };
 
     fn insert(fields: &[Field], chunks: &[Chunk]) -> Option<Vec<u8>> {
         let mut out = header("main", "items")?;
@@ -1505,6 +1600,65 @@ mod tests {
             panic!("an insert")
         };
         <[Chunk; 1]>::try_from(back).expect("one chunk").into_iter().next().expect("one")
+    }
+
+    #[test]
+    fn rows_written_from_their_values_replay_as_the_rows_of_a_chunk_do() {
+        let decimal = LogicalType::Decimal { width: 18, scale: 3 };
+        let fields = [
+            Field::new("k", LogicalType::Varchar),
+            Field::new("n", LogicalType::BigInt),
+            Field::new("b", LogicalType::Blob),
+            Field::new("d", decimal.clone()),
+            Field::new("t", LogicalType::Varchar),
+        ];
+        let rows = (0..11_i64)
+            .map(|at| {
+                vec![
+                    Value::Varchar(format!("user{at}")),
+                    if at % 3 == 0 { Value::Null } else { Value::BigInt(at << 33) },
+                    Value::Blob(vec![at as u8; at as usize]),
+                    Value::Decimal { unscaled: i128::from(at) * 1_001, width: 18, scale: 3 },
+                    if at % 4 == 1 {
+                        Value::Null
+                    } else {
+                        Value::Varchar("é".repeat(at as usize))
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let vectors = fields
+            .iter()
+            .enumerate()
+            .map(|(at, field)| {
+                let values = rows.iter().map(|row| row[at].clone()).collect::<Vec<_>>();
+                Vector::from_values(field.ty.clone(), &values).expect("a vector")
+            })
+            .collect::<Vec<_>>();
+        let chunk = Chunk::new(vectors).expect("a chunk");
+        let mut payload = header("main", "items").expect("a header");
+        put_value_rows(&mut payload, &fields, &rows, usize::MAX).expect("carried");
+        let back = replayed_insert(&fields, payload);
+        let whole = replayed_insert(&fields, insert(&fields, &[chunk]).expect("carried"));
+        assert_eq!(back.len(), rows.len());
+        for (at, row) in rows.iter().enumerate() {
+            for (column, value) in row.iter().enumerate() {
+                assert_eq!(&back.value_at(at, column), value, "{at} {column}");
+                assert_eq!(back.value_at(at, column), whole.value_at(at, column));
+            }
+        }
+        let mut out = Vec::new();
+        let mut wrong = rows.clone();
+        wrong[4][1] = Value::Integer(1);
+        assert!(put_value_rows(&mut out, &fields, &wrong, usize::MAX).is_none(), "not its type");
+        wrong[4][1] = Value::BigInt(1);
+        wrong[2][4] = Value::Integer(1);
+        assert!(put_value_rows(&mut out, &fields, &wrong, usize::MAX).is_none(), "not text");
+        wrong[2][4] = Value::Null;
+        wrong[3].pop();
+        assert!(put_value_rows(&mut out, &fields, &wrong, usize::MAX).is_none(), "too short");
+        let mut out = Vec::new();
+        assert!(put_value_rows(&mut out, &fields, &rows, 40).is_none(), "too big");
     }
 
     #[test]
