@@ -5620,6 +5620,17 @@ impl PartSlot {
     }
 }
 
+/// What [`Reader::decoded`] says a read of a part it does not hold should do.
+#[derive(Debug)]
+enum Undecoded {
+    /// Read the part's pages, at the positions when there are some.
+    Read,
+    /// Decode the part whole and hold it.
+    Keep,
+    /// Read the rows at the positions through the part's kept runs, which the read has paid for.
+    Through(Arc<string::Runs>),
+}
+
 /// One page a reader holds, and whether anyone has read it since the pool last looked.
 #[derive(Debug, Clone)]
 struct Resident {
@@ -9719,6 +9730,8 @@ impl Reader {
         for &column in columns {
             // Whether this read decodes the part whole and keeps it, when it is not held already.
             let mut keeping = false;
+            // The part's kept runs, when this read goes through them and has paid already.
+            let mut through = None;
             if keeps {
                 match self.decoded(at, column, positions, rows) {
                     Ok(vector) => {
@@ -9728,7 +9741,9 @@ impl Reader {
                         });
                         continue;
                     }
-                    Err(whole) => keeping = whole,
+                    Err(Undecoded::Keep) => keeping = true,
+                    Err(Undecoded::Read) => {}
+                    Err(Undecoded::Through(runs)) => through = Some(runs),
                 }
             }
             let field = self
@@ -9796,6 +9811,10 @@ impl Reader {
             // rows it wants.
             let mut indexed = false;
             let mut vector = match positions {
+                Some(positions) if through.is_some() => {
+                    indexed = true;
+                    decode_at(&field.ty, rows, bytes, dictionary, positions, through.as_deref())?
+                }
                 Some(positions) if !keeping => {
                     let paid = paid_at(rows, bytes, positions, self.pool.is_final());
                     let runs = if keeps { self.runs(at, column, rows, bytes)? } else { None };
@@ -9862,18 +9881,29 @@ impl Reader {
         Chunk::with_rows(picked, positions.map_or(rows, <[u32]>::len))
     }
 
-    /// Part `at` of `column` as it was decoded before, or, when it is not held, whether this read
-    /// should decode it whole and keep it. See [`PartSlot`].
+    /// Part `at` of `column` as it was decoded before, or, when it is not held, how this read
+    /// should go about it. See [`PartSlot`].
     fn decoded(
         &self,
         at: usize,
         column: usize,
         positions: Option<&[u32]>,
         rows: usize,
-    ) -> std::result::Result<Arc<Vector>, bool> {
+    ) -> std::result::Result<Arc<Vector>, Undecoded> {
         let Some(Ok(mut held)) = self.cache.made(column, at).map(Mutex::lock) else {
-            return Err(false);
+            return Err(Undecoded::Read);
         };
+        // A read at positions of a part whose runs are kept pays what it costs here, which is its
+        // rows, so that it takes the slot's lock once rather than three times. See [`Self::runs`].
+        if let (PartSlot::Indexed { runs, seen, used }, Some(positions)) = (&mut *held, positions) {
+            let paid = positions.len();
+            if !self.pool.is_last_for(&self.table.name) && seen.saturating_add(paid) >= rows {
+                return Err(Undecoded::Keep);
+            }
+            *seen = seen.saturating_add(paid);
+            used.store(true, Atomic::Relaxed);
+            return Err(Undecoded::Through(Arc::clone(runs)));
+        }
         match &*held {
             PartSlot::Held { vector, used } => {
                 used.store(true, Atomic::Relaxed);
@@ -9889,7 +9919,7 @@ impl Reader {
                 if before >= rows
                     || (positions.is_none() && !self.pool.is_last_for(&self.table.name))
                 {
-                    return Err(true);
+                    return Err(Undecoded::Keep);
                 }
                 // With no statement after this one, a whole read only counts its rows, and a
                 // second read of the part in this statement is the one that holds it.
@@ -9898,7 +9928,7 @@ impl Reader {
                 }
                 // A read at positions counts what it cost once it knows how the part is coded.
                 // See [`Self::pay`].
-                Err(false)
+                Err(Undecoded::Read)
             }
         }
     }
