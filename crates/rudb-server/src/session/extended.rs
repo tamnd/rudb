@@ -28,7 +28,9 @@ use rudb_pgtypes::{
 use rudb_pgwire::{Bind, CommandTag, Level, OutBuf, Portals, ProtocolError, Statements, Target};
 
 use super::setting::{self, Command};
-use super::{Control, FLUSH_AT, Failure, Outcome, Runner, command_tag, field, leading_words};
+use super::{
+    Control, FLUSH_AT, Failure, Outcome, Runner, column_type, command_tag, field, leading_words,
+};
 
 /// The type that PostgreSQL reports for a parameter of no known type.
 const TEXT: Oid = 25;
@@ -437,7 +439,8 @@ impl Extended {
                     let message = format!("unsupported format code: {format}");
                     return Ok(Err(error("22023", message)));
                 }
-                columns.push((logical.clone(), pg_type(logical).oid, format == 1));
+                let oid = column_type(logical, result.origin(i)).oid;
+                columns.push((logical.clone(), oid, format == 1));
             }
             match RowEncoder::new(&columns) {
                 Ok(encoder) => ran.encoder = Some(encoder),

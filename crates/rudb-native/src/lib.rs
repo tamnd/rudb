@@ -45,7 +45,9 @@ use std::sync::atomic::{
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
-use rudb_common::{Clustering, Error, Field, LogicalType, PhysicalType, Result, Value, Width};
+use rudb_common::{
+    Clustering, DeclaredType, Error, Field, LogicalType, PhysicalType, Result, Value, Width,
+};
 use rudb_encoding::sequence::Sequence;
 use rudb_encoding::{bitpack, chooser, integer, string};
 use rudb_io::{Filesystem, Mapped, OpenMode, RealFilesystem};
@@ -244,6 +246,13 @@ const KEYS: &[u8; 8] = b"RUDBKY1\0";
 /// Same convention as [`KEYS`], and the same reason to refuse it in a build that predates it: a
 /// build that dropped a `CHECK` or a unique index would take a row it refused before.
 const DECLARED: &[u8; 8] = b"RUDBDE1\0";
+/// The PostgreSQL type that each column was declared with, as an OID and a typmod, written only
+/// when a column has one.
+///
+/// Same convention as [`KEYS`]. A build that predates it refuses the file, and that is the safe
+/// answer, because a build that dropped the declared types would tell a client that a `varchar(10)`
+/// column is `text`.
+const PG_TYPES: &[u8; 8] = b"RUDBPT1\0";
 /// How many bytes of each column's global dictionary live outside its page, written only when any do.
 ///
 /// From format 27 a dictionary's payload blocks are written into the file while the load runs, so
@@ -1310,13 +1319,20 @@ pub struct Constraints {
     pub order: Vec<(u8, u16)>,
     /// Each index, in the order created.
     pub indexes: Vec<StoredIndex>,
+    /// Each column's declared PostgreSQL type, one per column, or empty when no column has one.
+    pub types: Vec<Option<DeclaredType>>,
 }
 
 impl Constraints {
     /// Whether there is nothing here, which is what writes no block.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.keyed() && !self.declared()
+        !self.keyed() && !self.declared() && !self.typed()
+    }
+
+    /// Whether a column has a declared type, which is what writes the [`PG_TYPES`] block.
+    fn typed(&self) -> bool {
+        self.types.iter().any(Option::is_some)
     }
 
     /// Whether there is a key or a foreign key, which is what writes the key block.
@@ -10854,6 +10870,20 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
     if table.constraints.declared() {
         put_declared(&mut out, &table.constraints)?;
     }
+    if table.constraints.typed() {
+        out.extend_from_slice(PG_TYPES);
+        put_count(&mut out, table.constraints.types.len())?;
+        for ty in &table.constraints.types {
+            match ty {
+                None => out.push(0),
+                Some(ty) => {
+                    out.push(1);
+                    put_u32(&mut out, ty.oid);
+                    put_u32(&mut out, ty.typmod.cast_unsigned());
+                }
+            }
+        }
+    }
     // The section table, last, behind its own magic, for the same reason the frequency block is
     // behind its own: a reader that stops before it gets a table with no sections, and a table with
     // no sections is a correct table. The one difference from the blocks before it is that this one
@@ -12966,6 +12996,25 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                 return Err(invalid("directory names two declaration blocks"));
             }
             declared_of(&mut cur, width, &mut constraints)?;
+        } else if &tag == PG_TYPES {
+            if constraints.typed() {
+                return Err(invalid("directory names two type blocks"));
+            }
+            let count = cur.u16()? as usize;
+            if count != width {
+                return Err(invalid("the declared types do not match the table's columns"));
+            }
+            for _ in 0..count {
+                let ty = match cur.u8()? {
+                    0 => None,
+                    1 => Some(DeclaredType { oid: cur.u32()?, typmod: cur.u32()?.cast_signed() }),
+                    _ => return Err(invalid("a declared type is neither there nor missing")),
+                };
+                constraints.types.push(ty);
+            }
+            if !constraints.typed() {
+                return Err(invalid("a type block holds no type"));
+            }
         } else if &tag == KEYS {
             if constraints.keyed() {
                 return Err(invalid("directory names two key blocks"));

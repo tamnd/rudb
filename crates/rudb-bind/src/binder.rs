@@ -17,8 +17,8 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    Error, Field, LogicalType, Origin, Result, Semantics, Session, ShowBehavior, Span, Stat,
-    StateKey, Value,
+    DeclaredType, Error, Field, LogicalType, Origin, Result, Semantics, Session, ShowBehavior,
+    Span, Stat, StateKey, Value,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -38,6 +38,9 @@ use crate::expr::describe;
 use crate::fold;
 use crate::parameters::{Parameters, Written};
 use crate::scope::{Joined, Scope, Visible};
+
+/// The PostgreSQL type `name`, which `current_user` and the other session names have.
+const NAME: DeclaredType = DeclaredType { oid: rudb_pgtypes::oid::NAME, typmod: -1 };
 
 /// Binds a parsed statement against a catalog.
 ///
@@ -2119,8 +2122,19 @@ impl<'a> Binder<'a> {
                 ast.expr(target.expr),
                 ast::Expr::Column { .. } | ast::Expr::Positional { .. }
             );
-            origins
-                .push(self.through(expr, input).and_then(|column| column.origin).filter(|_| plain));
+            let origin = self.through(expr, input).and_then(|column| column.origin);
+            origins.push(match ast.expr(target.expr) {
+                // A bare `current_user` is a one-part column to the parser, so this comes first.
+                _ if origin.is_none() && crate::context::gives_name(ast, target.expr) => {
+                    Some(Origin::typed(NAME))
+                }
+                _ if plain => origin,
+                // A cast keeps the type it wrote, with the typmod, and is no table column.
+                ast::Expr::Cast { ty, .. } => {
+                    rudb_pgtypes::declared_type(ast.string(ty)).map(Origin::typed)
+                }
+                _ => None,
+            });
             exprs.push(self.over_aggregate(expr, input)?);
             names.push(if target.alias == NONE {
                 self.target_name(ast, target.expr, input)
@@ -2839,8 +2853,9 @@ impl<'a> Binder<'a> {
         }
         // A table of no catalog, such as the held rows of `excluded`, is no table to a client.
         let origin = |at: usize| {
-            let table = table.oid();
-            (table != DETACHED && !excluded).then_some(Origin { table, column: at as u32 })
+            let oid = table.oid();
+            (oid != DETACHED && !excluded)
+                .then(|| Origin::column(oid, at as u32, table.declared_type(at)))
         };
         let index = self.fresh_index();
         let mut scope = Scope::empty();
@@ -2964,8 +2979,9 @@ impl<'a> Binder<'a> {
         // PostgreSQL gives the column of a view as the origin, not the table column under it.
         let shown = scope.columns.iter_mut().filter(|column| !column.hidden);
         for (at, column) in shown.enumerate() {
+            let ty = column.origin.and_then(|origin| origin.ty);
             column.origin =
-                (view.oid() != DETACHED).then_some(Origin { table: view.oid(), column: at as u32 });
+                (view.oid() != DETACHED).then(|| Origin::column(view.oid(), at as u32, ty));
         }
         let label = if alias == NONE { name.table.clone() } else { ast.string(alias).to_string() };
         scope.relabel(&label);

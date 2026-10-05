@@ -93,6 +93,7 @@
 mod array;
 mod binary;
 mod datetime;
+mod declared;
 mod error;
 mod float;
 mod generated;
@@ -123,6 +124,7 @@ pub use datetime::{
     timestamp_in, timestamp_out, timestamp_recv, timestamptz_in, timestamptz_out, timetz_in,
     timetz_out, timetz_recv,
 };
+pub use declared::declared_type;
 pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};
 pub use generated::oids as oid;
@@ -136,7 +138,7 @@ pub use param::{InputSettings, logical_type, param_value};
 pub use reg::{
     RegInput, RegKind, qualified_name_list, reg_in, reg_out_oid, split_identifier_string,
 };
-pub use row::{OutputSettings, RowEncoder, pg_type};
+pub use row::{OutputSettings, RowEncoder, encodable, pg_type};
 pub use scalar::{
     ByteaOutput, NAME_MAX_BYTES, bool_in, bool_out, bytea_in, bytea_out, char_in, char_out,
     name_in, uuid_in, uuid_out,

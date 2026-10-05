@@ -401,7 +401,7 @@ fn the_extended_query_flow() {
     let messages = client.sync();
     assert_eq!(tags(&messages), "1tT2DDsDCZ");
     assert_eq!(parameter_types(&messages[1]), [23]);
-    assert_eq!(row_shape(&messages[2]), [("i".to_owned(), 23, 0), ("s".to_owned(), 25, 0)]);
+    assert_eq!(row_shape(&messages[2]), [("i".to_owned(), 23, 0), ("s".to_owned(), 1043, 0)]);
     assert_eq!(data_row(&messages[4]), [Some(1i32.to_be_bytes().to_vec()), Some(b"a".to_vec())]);
     assert_eq!(data_row(&messages[7]), [Some(3i32.to_be_bytes().to_vec()), None]);
     assert_eq!(text(&messages[8]), "SELECT 1");
@@ -414,7 +414,7 @@ fn the_extended_query_flow() {
     client.execute("", 0);
     let messages = client.sync();
     assert_eq!(tags(&messages), "2TDDsCZ");
-    assert_eq!(row_shape(&messages[1]), [("i".to_owned(), 23, 1), ("s".to_owned(), 25, 1)]);
+    assert_eq!(row_shape(&messages[1]), [("i".to_owned(), 23, 1), ("s".to_owned(), 1043, 1)]);
     assert_eq!(text(&messages[5]), "SELECT 0");
 
     // A parameter of no known type is text.

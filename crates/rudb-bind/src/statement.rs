@@ -17,8 +17,8 @@
 use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
-    Bound as ColumnBound, Clustering, Error, Field, LogicalType, Result, Session, Stat, Value,
-    Width,
+    Bound as ColumnBound, Clustering, DeclaredType, Error, Field, LogicalType, Result, Session,
+    Stat, Value, Width,
 };
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
@@ -217,6 +217,9 @@ pub struct CreateTable {
     pub keys: Vec<rudb_catalog::Key>,
     /// Each column's `DEFAULT` as the SQL of its expression, or `None` for a column with none.
     pub defaults: Vec<Option<String>>,
+    /// Each column's PostgreSQL type, where the declaration wrote one that the logical type does
+    /// not give.
+    pub types: Vec<Option<DeclaredType>>,
     /// The sequences the defaults use, which the table depends on.
     pub sequences: Vec<QualifiedName>,
     /// The SQL of each `CHECK`, in the order written.
@@ -1155,6 +1158,14 @@ fn finish(binder: Binder<'_>, root: rudb_plan::NodeRef) -> Result<Plan> {
     Ok(plan)
 }
 
+/// The PostgreSQL type a column declaration wrote, kept only when it tells a client more than the
+/// logical type does, so that a table of plain types writes no type block into its file.
+fn pg_declared(text: &str, ty: &LogicalType) -> Option<DeclaredType> {
+    let declared = rudb_pgtypes::declared_type(text)?;
+    let plain = rudb_pgtypes::pg_type(ty);
+    (declared.oid != plain.oid || declared.typmod != plain.typmod).then_some(declared)
+}
+
 fn create_table(
     ast: &Ast,
     catalog: &Catalog,
@@ -1170,6 +1181,7 @@ fn create_table(
         catalog.resolve_for_create(&parts)?
     };
     let defs = ast.column_defs(written.columns);
+    let mut types = Vec::with_capacity(defs.len());
     let (mut columns, source) = if written.query == NONE {
         let mut columns = Vec::with_capacity(defs.len());
         for def in defs {
@@ -1184,6 +1196,7 @@ fn create_table(
             if ty == LogicalType::Type {
                 return Err(Error::invalid_input("A table cannot be created with a 'TYPE' column"));
             }
+            types.push(pg_declared(text, &ty));
             let column = ast.string(def.name);
             columns.push(if def.not_null {
                 Field::required(column, ty)
@@ -1207,6 +1220,8 @@ fn create_table(
                 None => column.name.clone(),
             };
             columns.push(Field::new(named, column.ty.clone()));
+            // A column that a table column or a cast gives keeps its type, as in PostgreSQL.
+            types.push(column.origin.and_then(|origin| origin.ty));
         }
         if defs.is_empty() {
             deduplicate(&mut columns);
@@ -1273,6 +1288,7 @@ fn create_table(
         or_replace: written.or_replace,
         keys,
         defaults,
+        types,
         checks,
         foreign,
         sequences,
@@ -1599,6 +1615,7 @@ fn alter(
                 return nothing(Some(name));
             }
             let ty = read_type(catalog, ast.string(column.ty))?;
+            let declared = pg_declared(ast.string(column.ty), &ty);
             let field = Field {
                 not_null: column.not_null,
                 ..Field::new(ast.string(column.name), ty.clone())
@@ -1626,7 +1643,7 @@ fn alter(
                     Ok(())
                 },
             )?);
-            rudb_catalog::Alteration::AddColumn { field, default, sequences }
+            rudb_catalog::Alteration::AddColumn { field, default, sequences, declared }
         }
         ast::AlterAction::DropColumn { column, quiet } => {
             let Some(at) = place(column) else {
@@ -1718,8 +1735,10 @@ fn alter(
                     Ok(())
                 },
             )?);
+            let written = (ty != NONE).then(|| ast.string(ty));
             let ty = target.ok_or_else(|| Error::internal("an ALTER TYPE that settled no type"))?;
-            rudb_catalog::Alteration::Type { column: at, ty }
+            let declared = written.and_then(|text| pg_declared(text, &ty));
+            rudb_catalog::Alteration::Type { column: at, ty, declared }
         }
     };
     Ok(Bound::Alter(Alter { name: Some(name), alteration: Some(alteration), rewrite }))

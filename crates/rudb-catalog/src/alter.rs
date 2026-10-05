@@ -7,7 +7,7 @@
 //! move data, which are adding a column, dropping one and changing a type, and the catalog only
 //! checks them.
 
-use rudb_common::{Field, LogicalType};
+use rudb_common::{DeclaredType, Field, LogicalType};
 
 use crate::name::QualifiedName;
 
@@ -33,6 +33,8 @@ pub enum Alteration {
         default: Option<String>,
         /// The sequences that default calls `nextval` on.
         sequences: Vec<QualifiedName>,
+        /// The PostgreSQL type it was declared with, if the declaration names one.
+        declared: Option<DeclaredType>,
     },
     /// `DROP COLUMN`, with the `CHECK` constraints that are left once the ones over only this
     /// column are gone.
@@ -71,6 +73,8 @@ pub enum Alteration {
         column: usize,
         /// The new type.
         ty: LogicalType,
+        /// The PostgreSQL type the statement wrote, if it names one.
+        declared: Option<DeclaredType>,
     },
 }
 

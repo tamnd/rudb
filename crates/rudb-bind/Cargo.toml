@@ -22,6 +22,7 @@ rudb-plan.workspace = true
 rudb-catalog.workspace = true
 rudb-functions.workspace = true
 rudb-seam.workspace = true
+rudb-pgtypes.workspace = true
 
 [lints]
 workspace = true

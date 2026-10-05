@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rudb_common::{Field, LogicalType, Origin, Span, Value, days_from_civil};
+use rudb_common::{DeclaredType, Field, LogicalType, Origin, Span, Value, days_from_civil};
 
 use crate::{Config, Database, VECTOR_SIZE, arrow};
 
@@ -13069,9 +13069,14 @@ fn a_result_knows_the_table_column_of_each_plain_column() {
         (0..result.width()).map(|at| result.origin(at)).collect::<Vec<_>>()
     };
     let table = origins("SELECT a FROM t")[0].expect("a column of t").table;
-    let of = |column| Some(Origin { table, column });
+    // `b` was written `VARCHAR`, which a PostgreSQL client sees as `varchar` and not `text`.
+    let varchar = Some(DeclaredType { oid: 1043, typmod: -1 });
+    let of = |column| Some(Origin::column(table, column, if column == 1 { varchar } else { None }));
     assert_eq!(origins("SELECT * FROM t"), [of(0), of(1), of(2)]);
-    assert_eq!(origins("SELECT c, a + 1, b::VARCHAR, a AS z FROM t"), [of(2), None, None, of(0)]);
+    assert_eq!(
+        origins("SELECT c, a + 1, b::VARCHAR, a AS z FROM t"),
+        [of(2), None, varchar.map(Origin::typed), of(0)]
+    );
     assert_eq!(origins("SELECT * FROM (SELECT b FROM t) s"), [of(1)]);
     assert_eq!(origins("SELECT b, count(*) FROM t GROUP BY b"), [of(1), None]);
     assert_eq!(origins("SELECT a FROM t UNION SELECT a FROM t"), [None]);
