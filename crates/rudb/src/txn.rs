@@ -37,8 +37,9 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use rudb_catalog::{Catalog, QualifiedName, Table};
-use rudb_common::{Error, Result};
-use rudb_vector::{Chunk, Selection};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_vector::vector::VECTOR_SIZE;
+use rudb_vector::{Chunk, Selection, Vector};
 
 use crate::journal::Change;
 
@@ -98,13 +99,23 @@ pub(crate) struct Written {
     /// Every change in order, or `None` once the transaction did something to the table that is not
     /// an append or a change of rows it can name, after which the commit cannot do it again.
     changes: Option<Vec<Change>>,
+    /// Rows appended as values since the last change in `changes`, which come after it.
+    ///
+    /// A prepared insert hands its rows over as values, and building them into a chunk for each
+    /// statement cost a vector for every column of every row, for a list the commit reads only
+    /// when somebody else committed to the table since the snapshot. So they are kept as they are
+    /// and built into chunks, a vector's worth of rows at a time, when a change of another kind
+    /// comes after them or when the commit asks.
+    pending: Vec<Vec<Value>>,
+    /// The types of the columns of the rows in `pending`.
+    types: Vec<LogicalType>,
 }
 
 /// A table the transaction has not written yet: no row deleted, and no change that the commit
 /// cannot do again.
 impl Default for Written {
     fn default() -> Self {
-        Self { origin: None, changes: Some(Vec::new()) }
+        Self { origin: None, changes: Some(Vec::new()), pending: Vec::new(), types: Vec::new() }
     }
 }
 
@@ -132,12 +143,32 @@ impl Written {
     /// Notes rows appended, keeping the chunks themselves rather than a copy, since a copy of a
     /// chunk is a copy of every value in it and the caller has no more use for them.
     pub(crate) fn appended(&mut self, chunks: Vec<Chunk>) {
+        self.build_pending();
         let added = chunks.iter().map(Chunk::len).sum::<usize>();
         if let Some(origin) = self.origin.as_mut() {
             origin.extend(std::iter::repeat_n(u64::MAX, added));
         }
-        // Onto the insert before it when there is one, so a load of one row at a time keeps one
-        // list of rows rather than a change for each.
+        self.inserted(chunks);
+    }
+
+    /// Notes rows appended as values, each one value for each of `fields`, of its field's type or
+    /// one that widens to it.
+    pub(crate) fn appended_values(&mut self, fields: &[Field], rows: Vec<Vec<Value>>) {
+        if let Some(origin) = self.origin.as_mut() {
+            origin.extend(std::iter::repeat_n(u64::MAX, rows.len()));
+        }
+        if self.changes.is_none() {
+            return;
+        }
+        if self.pending.is_empty() {
+            self.types = fields.iter().map(|field| field.ty.clone()).collect();
+        }
+        self.pending.extend(rows);
+    }
+
+    /// Onto the insert before it when there is one, so a load of one row at a time keeps one list
+    /// of rows rather than a change for each.
+    fn inserted(&mut self, chunks: Vec<Chunk>) {
         if let Some(changes) = self.changes.as_mut() {
             if let Some(Change::Insert(last)) = changes.last_mut() {
                 last.extend(chunks);
@@ -147,9 +178,30 @@ impl Written {
         }
     }
 
+    /// Builds the rows in `pending` into chunks and notes them as an insert. Rows that will not
+    /// build, which a value of a type its column does not take would be, leave the commit unable
+    /// to do the transaction again, and it fails as a conflict rather than writing anything else.
+    fn build_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        match chunks_of(&self.types, pending) {
+            Ok(chunks) => self.inserted(chunks),
+            Err(_) => self.changes = None,
+        }
+    }
+
+    /// Every change in order, or `None` when the commit cannot do them again, for the commit.
+    pub(crate) fn into_changes(mut self) -> Option<Vec<Change>> {
+        self.build_pending();
+        self.changes
+    }
+
     /// Notes the rows at `rows` of the transaction's copy given new values, which are the rows of
     /// `new` in the same order.
     pub(crate) fn updated(&mut self, rows: &[u64], new: &[Chunk]) {
+        self.build_pending();
         let Some(changes) = self.changes.as_mut() else { return };
         if new.iter().map(Chunk::len).sum::<usize>() != rows.len() {
             self.changes = None;
@@ -165,6 +217,7 @@ impl Written {
 
     /// Notes the rows at `rows` of the transaction's copy, which had `len` rows, taken out.
     pub(crate) fn deleted(&mut self, rows: &[u64], len: usize, base: u64) {
+        self.build_pending();
         let origin = self.origin.get_or_insert_with(|| {
             (0..len as u64).map(|row| if row < base { row } else { u64::MAX }).collect()
         });
@@ -182,8 +235,37 @@ impl Written {
 
     /// Notes a change the commit could not do again from rows.
     pub(crate) fn opaque(&mut self) {
+        self.pending = Vec::new();
         self.changes = None;
     }
+}
+
+/// Rows of values as chunks of up to a vector's worth of rows each, the columns of the types
+/// `types`.
+fn chunks_of(types: &[LogicalType], rows: Vec<Vec<Value>>) -> Result<Vec<Chunk>> {
+    let mut chunks = Vec::with_capacity(rows.len().div_ceil(VECTOR_SIZE));
+    let mut rows = rows.into_iter().peekable();
+    while rows.peek().is_some() {
+        let mut columns: Vec<Vec<Value>> =
+            types.iter().map(|_| Vec::with_capacity(VECTOR_SIZE)).collect();
+        for row in rows.by_ref().take(VECTOR_SIZE) {
+            if row.len() != types.len() {
+                return Err(Error::internal(
+                    "a row appended as values is not as wide as its table",
+                ));
+            }
+            for (column, value) in columns.iter_mut().zip(row) {
+                column.push(value);
+            }
+        }
+        let vectors = types
+            .iter()
+            .zip(&columns)
+            .map(|(ty, values)| Vector::from_values(ty.clone(), values))
+            .collect::<Result<Vec<_>>>()?;
+        chunks.push(Chunk::new(vectors)?);
+    }
+    Ok(chunks)
 }
 
 /// Sorted row numbers as runs of first row and length.
@@ -495,7 +577,7 @@ pub(crate) fn merge(
             }
             if written.appends() {
                 let written = snapshot.written.remove(&table.oid()).expect("asked just above");
-                let changes = written.changes.ok_or_else(commit_conflict)?;
+                let changes = written.into_changes().ok_or_else(commit_conflict)?;
                 return rebase(committed, &name, before, table, changes, workers);
             }
         }
@@ -517,7 +599,7 @@ pub(crate) fn merge(
                 *next.table_mut(&name)? = table.clone();
                 continue;
             }
-            let changes = written.changes.ok_or_else(commit_conflict)?;
+            let changes = written.into_changes().ok_or_else(commit_conflict)?;
             rebase(&mut next, &name, before, table, changes, workers)?;
         }
         *committed = next;
