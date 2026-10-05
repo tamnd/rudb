@@ -362,6 +362,74 @@ impl Chooser for Settled {
     }
 }
 
+/// A [`Settled`] shape that remembers whether it left any chunk to a search.
+///
+/// A level the shape names that does not apply to a chunk is searched, which is right for the
+/// chunk and wrong for the choice of shape. `FRONT` is only offered when a chunk's values share a
+/// twentieth of their bytes with the value before them, and the titles of `title` in the order
+/// they were first seen mostly do not. Settled on eight blocks, `FRONT` then `LZ` came out one
+/// percent smaller than `LZ` then `FSST`, because the blocks it did not fit were searched and a
+/// search finds the smallest answer there is. Over the column it then searched most blocks and
+/// encoded at 4.4 MB/s where `LZ` then `FSST` runs at 51. Settling through this is how a shape
+/// that only won by searching is told apart from one that won by fitting.
+#[derive(Debug)]
+pub struct Watched<'a> {
+    shape: &'a Settled,
+    searched: AtomicBool,
+}
+
+impl<'a> Watched<'a> {
+    /// `shape`, watched from now on.
+    #[must_use]
+    pub fn new(shape: &'a Settled) -> Self {
+        Self { shape, searched: AtomicBool::new(false) }
+    }
+
+    /// Whether every level the shape names applied to every chunk encoded through this so far.
+    #[must_use]
+    pub fn fitted(&self) -> bool {
+        !self.searched.load(Ordering::Relaxed)
+    }
+}
+
+impl Chooser for Watched<'_> {
+    fn name(&self) -> &'static str {
+        "watched"
+    }
+
+    fn narrow_strings(
+        &self,
+        values: &[&[u8]],
+        offered: &[string::Kind],
+        depth: u8,
+    ) -> Vec<string::Kind> {
+        let narrowed = self.shape.narrow_strings(values, offered, depth);
+        // Below the shape every level is searched on purpose, and a level that offers one kind has
+        // nothing to search.
+        if (depth as usize) < self.shape.strings.len() && narrowed.len() > 1 {
+            self.searched.store(true, Ordering::Relaxed);
+        }
+        narrowed
+    }
+
+    fn narrow_integers(
+        &self,
+        values: &[i64],
+        offered: &[integer::Kind],
+        depth: u8,
+    ) -> Vec<integer::Kind> {
+        self.shape.narrow_integers(values, offered, depth)
+    }
+
+    fn considers_integer(&self, kind: integer::Kind, depth: u8) -> bool {
+        self.shape.considers_integer(kind, depth)
+    }
+
+    fn symbols(&self, depth: u8) -> Option<&SymbolTable> {
+        self.shape.symbols(depth)
+    }
+}
+
 /// Encode an integer chunk the way an earlier one came out, and search only where it stops fitting.
 ///
 /// [`Settled`] holds one kind per level, which is too coarse for a cascade that branches: an `RLE`

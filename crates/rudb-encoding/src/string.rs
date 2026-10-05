@@ -2075,10 +2075,15 @@ mod tests {
                 let shape =
                     with_symbols(Settled::new(kinds.clone(), vec![integer::Kind::Packed]), &sample);
                 let settled = started.elapsed();
+                let watched = crate::chooser::Watched::new(&shape);
+                for block in &sample {
+                    encode_with(block, &watched).expect("encodes");
+                }
                 let (mut size, mut encoding, mut decoding) = (0, Duration::ZERO, Duration::ZERO);
+                let column = crate::chooser::Watched::new(&shape);
                 for block in &blocks {
                     let started = Instant::now();
-                    let bytes = encode_with(block, &shape).expect("encodes");
+                    let bytes = encode_with(block, &column).expect("encodes");
                     encoding += started.elapsed();
                     let started = Instant::now();
                     let flat = decode_flat(&bytes).expect("decodes");
@@ -2088,11 +2093,13 @@ mod tests {
                 }
                 println!(
                     "  {kinds:?}: {size} bytes ({:.3}x), settle {:.0} ms, encode {:.1} MB/s, \
-                     decode {:.0} MB/s",
+                     decode {:.0} MB/s, fits the sample {}, fits every block {}",
                     raw as f64 / size as f64,
                     settled.as_secs_f64() * 1e3,
                     raw as f64 / encoding.as_secs_f64() / 1e6,
                     raw as f64 / decoding.as_secs_f64() / 1e6,
+                    watched.fitted(),
+                    column.fitted(),
                 );
             }
         }
