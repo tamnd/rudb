@@ -30,6 +30,7 @@ pub mod cancel;
 pub mod clustering;
 pub mod error;
 pub mod generated;
+pub mod guc;
 pub mod heap;
 pub mod implicit;
 pub mod memory;

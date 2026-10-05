@@ -9,4 +9,6 @@ version: 19beta4
 
 # sha256 of every vendored file, relative to this directory.
 cadb9e83cde9a8699a7e74448891ca623af8579ccc8e11c7e533fb47cbc42f89  errcodes.txt
+65550b70132e05204bfe8e42c46d185f41fdbbb18d3c6ce60660dad5370d37ef  guc_parameters.dat
+965bcc9a6276783fdb4156a89f885d26f7b8e52ab39569d4d09eea3546f86c6e  guc_tables.c
 3d6af92ff8a4c2cdf69afb1cf44edea727922f5cd0cf8b5f72b11cdecac8fdfd  LICENSE.postgres

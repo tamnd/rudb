@@ -7,9 +7,11 @@
 //! every generated file matches what its generator writes today. The gate runs the check.
 //!
 //! The plan is `16-crate-layout.md` section 16.5 of the PostgreSQL compatibility notes. Today
-//! there are three vendored files: `errcodes.txt` gives the SQLSTATE list of `rudb-common`,
-//! `cmdtaglist.h` gives the command tags of `rudb-pgwire`, and `pg_type.dat` gives the type OIDs
-//! of `rudb-pgtypes`.
+//! `errcodes.txt` gives the SQLSTATE list of `rudb-common`, `guc_parameters.dat` and
+//! `guc_tables.c` give the configuration parameters of `rudb-common`, `cmdtaglist.h` gives the
+//! command tags of `rudb-pgwire`, and `pg_type.dat` gives the type OIDs of `rudb-pgtypes`.
+
+mod guc;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -30,6 +32,8 @@ const VENDORS: [Vendor; 3] = [
         dir: "crates/rudb-common/vendor",
         files: &[
             ("src/backend/utils/errcodes.txt", "errcodes.txt"),
+            ("src/backend/utils/misc/guc_parameters.dat", "guc_parameters.dat"),
+            ("src/backend/utils/misc/guc_tables.c", "guc_tables.c"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },
@@ -50,31 +54,44 @@ const VENDORS: [Vendor; 3] = [
     },
 ];
 
-/// One generated file: where it goes, the vendored file it comes from, both relative to the
-/// workspace root, and the generator.
+/// One generated file: where it goes, the vendored files it comes from, all relative to the
+/// workspace root, and the generator, which gets the text of the files in the same order.
 struct Generated {
     output: &'static str,
-    input: &'static str,
-    generate: fn(&str) -> Result<String, String>,
+    inputs: &'static [&'static str],
+    generate: fn(&[String]) -> Result<String, String>,
 }
 
-const GENERATED: [Generated; 3] = [
+const GENERATED: [Generated; 4] = [
     Generated {
         output: "crates/rudb-common/src/generated/sqlstate.rs",
-        input: "crates/rudb-common/vendor/errcodes.txt",
-        generate: sqlstate,
+        inputs: &["crates/rudb-common/vendor/errcodes.txt"],
+        generate: |texts| sqlstate(&texts[0]),
+    },
+    Generated {
+        output: "crates/rudb-common/src/generated/guc.rs",
+        inputs: &[
+            "crates/rudb-common/vendor/guc_parameters.dat",
+            "crates/rudb-common/vendor/guc_tables.c",
+        ],
+        generate: guc::guc,
     },
     Generated {
         output: "crates/rudb-pgwire/src/generated/cmdtag.rs",
-        input: "crates/rudb-pgwire/vendor/cmdtaglist.h",
-        generate: cmdtag,
+        inputs: &["crates/rudb-pgwire/vendor/cmdtaglist.h"],
+        generate: |texts| cmdtag(&texts[0]),
     },
     Generated {
         output: "crates/rudb-pgtypes/src/generated/oids.rs",
-        input: "crates/rudb-pgtypes/vendor/pg_type.dat",
-        generate: pgtype,
+        inputs: &["crates/rudb-pgtypes/vendor/pg_type.dat"],
+        generate: |texts| pgtype(&texts[0]),
     },
 ];
+
+/// The text of the inputs of a generated file.
+fn inputs(root: &Path, generated: &Generated) -> Result<Vec<String>, String> {
+    generated.inputs.iter().map(|input| read(&root.join(input))).collect()
+}
 
 /// Copies the files from a PostgreSQL checkout and regenerates the Rust made from them.
 pub(crate) fn vendor(checkout: Option<&str>) -> Result<(), String> {
@@ -118,7 +135,7 @@ pub(crate) fn vendor(checkout: Option<&str>) -> Result<(), String> {
     }
 
     for generated in &GENERATED {
-        let text = (generated.generate)(&read(&root.join(generated.input))?)?;
+        let text = (generated.generate)(&inputs(&root, generated)?)?;
         std::fs::write(root.join(generated.output), text)
             .map_err(|e| format!("could not write {}: {e}", generated.output))?;
         println!("wrote {}", generated.output);
@@ -157,10 +174,10 @@ pub(crate) fn check() -> Result<(), String> {
     }
 
     for generated in &GENERATED {
-        let expected = (generated.generate)(&read(&root.join(generated.input))?)?;
+        let expected = (generated.generate)(&inputs(&root, generated)?)?;
         if read(&root.join(generated.output))?.replace("\r\n", "\n") != expected {
-            problems
-                .push(format!("{} is not what {} generates", generated.output, generated.input));
+            let from = generated.inputs.join(" and ");
+            problems.push(format!("{} is not what {from} generates", generated.output));
         }
     }
 
@@ -400,9 +417,9 @@ struct TypeRow {
 }
 
 /// Reads the entries of a catalog `.dat` file. The file is a Perl array of hashes: each entry is
-/// `{ key => 'value', ... }`, a value is in single quotes with `\'` and `\\` as escapes, and a line
-/// that starts with `#` is a comment.
-fn dat_entries(text: &str) -> Result<Vec<BTreeMap<String, String>>, String> {
+/// `{ key => 'value', ... }`, a value is in single quotes with `\'` and `\\` as escapes as in Perl,
+/// and a `#` outside a value starts a comment to the end of the line.
+fn dat_entries(file: &str, text: &str) -> Result<Vec<BTreeMap<String, String>>, String> {
     let text: String = text
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
@@ -411,7 +428,11 @@ fn dat_entries(text: &str) -> Result<Vec<BTreeMap<String, String>>, String> {
     let mut chars = text.chars().peekable();
     let mut entries = Vec::new();
     let skip = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        while let Some(c) = chars.next_if(|c| c.is_whitespace() || *c == '#') {
+            if c == '#' {
+                while chars.next_if(|c| *c != '\n').is_some() {}
+            }
+        }
     };
     while let Some(c) = chars.next() {
         if c != '{' {
@@ -429,23 +450,28 @@ fn dat_entries(text: &str) -> Result<Vec<BTreeMap<String, String>>, String> {
             }
             skip(&mut chars);
             if key.is_empty() || chars.next() != Some('=') || chars.next() != Some('>') {
-                return Err(format!("pg_type.dat: a field with no `=>` after `{key}`"));
+                return Err(format!("{file}: a field with no `=>` after `{key}`"));
             }
             skip(&mut chars);
             if chars.next() != Some('\'') {
-                return Err(format!("pg_type.dat: the value of `{key}` is not in quotes"));
+                return Err(format!("{file}: the value of `{key}` is not in quotes"));
             }
             let mut value = String::new();
             loop {
                 match chars.next() {
-                    None => return Err(format!("pg_type.dat: the value of `{key}` has no end")),
-                    Some('\\') => value.extend(chars.next()),
+                    None => return Err(format!("{file}: the value of `{key}` has no end")),
+                    // Perl reads `\\` and `\'` as escapes and keeps any other backslash.
+                    Some('\\') => match chars.next() {
+                        Some(c @ ('\\' | '\'')) => value.push(c),
+                        Some(c) => value.extend(['\\', c]),
+                        None => value.push('\\'),
+                    },
                     Some('\'') => break,
                     Some(c) => value.push(c),
                 }
             }
             if entry.insert(key.clone(), value).is_some() {
-                return Err(format!("pg_type.dat: `{key}` is two times in one entry"));
+                return Err(format!("{file}: `{key}` is two times in one entry"));
             }
             skip(&mut chars);
             let _ = chars.next_if_eq(&',');
@@ -464,7 +490,7 @@ fn dat_entries(text: &str) -> Result<Vec<BTreeMap<String, String>>, String> {
 /// of an array is the name of its element with `_ARRAY` after it.
 fn pgtype(text: &str) -> Result<String, String> {
     let mut rows = Vec::new();
-    for entry in dat_entries(text)? {
+    for entry in dat_entries("pg_type.dat", text)? {
         let field = |key: &str| entry.get(key).map(String::as_str);
         let name = field("typname").ok_or("pg_type.dat: an entry with no typname")?;
         let bad = |what: &str| format!("pg_type.dat: {name} has a bad {what}");
