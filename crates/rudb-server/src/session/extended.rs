@@ -516,7 +516,7 @@ impl Portal {
             let values = &self.values;
             let command = statement.command.as_ref();
             let outcome = runner
-                .run(statement.control, command, 0, out, |_| match &statement.prepared {
+                .run(statement.control, command, sql, 0, out, |_| match &statement.prepared {
                     Some(prepared) => statement.execute(prepared, values),
                     None => unreachable!("a statement without a plan is a command"),
                 })

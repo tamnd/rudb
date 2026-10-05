@@ -11,7 +11,9 @@
 //! in [`auth`].
 
 mod auth;
+mod database;
 mod extended;
+mod keywords;
 mod role;
 mod setting;
 mod zone;
@@ -484,7 +486,7 @@ fn refusal(error: &rudb::Error) -> Refusal {
 
 /// The checks after the startup message, the end of the startup, and the main loop.
 fn serve(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     pid: i32,
     start: Start,
     wire: &mut Wire,
@@ -508,8 +510,8 @@ fn serve(
         Ok(role) => role,
         Err(refusal) => return wire.fatal(refusal),
     };
-    let database = match shared.database(&start.database) {
-        Ok(database) => database,
+    let (oid, database) = match shared.connect(pid, &start.database, &role) {
+        Ok(found) => found,
         Err(refusal) => return wire.fatal(refusal),
     };
     let mut defaults = shared.defaults();
@@ -539,6 +541,9 @@ fn serve(
         connection,
         guc,
         roles: shared.roles.clone(),
+        shared: shared.clone(),
+        pid,
+        database: oid,
         login: role.oid,
         format: Format::default(),
         zone: Zone::of("UTC"),
@@ -594,7 +599,9 @@ fn serve(
                 match wire.fill(input)? {
                     Filled::Data => continue,
                     Filled::Closed => return Ok(()),
-                    Filled::Woken if shared.stopping() => return terminated(wire),
+                    Filled::Woken if shared.stopping() || shared.terminating(pid) => {
+                        return terminated(wire);
+                    }
                     Filled::Woken => continue,
                 }
             }
@@ -680,7 +687,7 @@ fn serve(
         if failed {
             runner.abort_implicit();
             extended.end_of_transaction(runner.connection.transaction());
-            if shared.stopping() {
+            if shared.stopping() || shared.terminating(pid) {
                 return terminated(wire);
             }
             if let Some(fatal) = session.recover() {
@@ -705,7 +712,8 @@ fn failure(done: Result<(), extended::Problem>, out: &mut OutBuf, protocol: u32)
     }
 }
 
-/// The end of a session when the server stops.
+/// The end of a session when the server stops, or when `DROP DATABASE ... WITH (FORCE)` ends
+/// it.
 fn terminated(wire: &mut Wire) -> io::Result<()> {
     wire.fatal(("57P01", "terminating connection due to administrator command".to_owned()))
 }
@@ -758,6 +766,11 @@ struct Runner {
     guc: Settings,
     /// The roles of the cluster.
     roles: Arc<Roles>,
+    shared: Arc<Shared>,
+    /// The process ID of the session.
+    pid: i32,
+    /// The OID of the database of the session.
+    database: u32,
     /// The role that logged in, `GetAuthenticatedUserId`.
     login: u32,
     /// What the output takes from `guc`, made again when [`Settings::generation`] changes.
@@ -874,13 +887,7 @@ impl Failure {
     }
 
     fn write(&self, sql: &str, out: &mut OutBuf) {
-        let position = self.position.map(|at| {
-            let mut at = at.min(sql.len());
-            while !sql.is_char_boundary(at) {
-                at -= 1;
-            }
-            (sql[..at].chars().count() + 1).to_string()
-        });
+        let position = self.position.map(|at| position(sql, at));
         let mut fields: Vec<(u8, &[u8])> = vec![
             (b'S', b"ERROR"),
             (b'V', b"ERROR"),
@@ -903,6 +910,15 @@ impl Failure {
         fields.extend(optional.iter().filter_map(|(code, v)| v.map(|v| (*code, v.as_bytes()))));
         out.error_response(&fields);
     }
+}
+
+/// The `P` field for the byte offset `at` in `sql`: the place of the character, from 1.
+fn position(sql: &str, at: usize) -> String {
+    let mut at = at.min(sql.len());
+    while !sql.is_char_boundary(at) {
+        at -= 1;
+    }
+    (sql[..at].chars().count() + 1).to_string()
 }
 
 impl Runner {
@@ -992,6 +1008,7 @@ impl Runner {
         &mut self,
         command: &Command,
         state: Transaction,
+        sql: &str,
         offset: usize,
         out: &mut OutBuf,
     ) -> Result<Outcome, Failure> {
@@ -1065,6 +1082,7 @@ impl Runner {
                     current: self.current_oid(&catalog),
                     session: self.session_oid(&catalog),
                     guc: &self.guc,
+                    databases: &self.shared.databases.snapshot(),
                     datetime: DateTimeInput {
                         order: self.format.date_format.order,
                         zone: &self.zone,
@@ -1076,6 +1094,19 @@ impl Runner {
                 let tag = role::execute(parsed, offset, &cx, out)?;
                 self.sync_superuser();
                 tag
+            }
+            Command::Databases(parsed) => {
+                let catalog = self.roles.snapshot();
+                let cx = database::Context {
+                    shared: &self.shared,
+                    pid: self.pid,
+                    database: self.database,
+                    current: self.current_oid(&catalog),
+                    session: self.session_oid(&catalog),
+                    block: state != Transaction::Idle,
+                    sql,
+                };
+                database::execute(parsed, offset, &cx, out)?
             }
             Command::Show(name) => {
                 let (column, value) = self.guc.show(name).map_err(failure)?;
@@ -1134,12 +1165,13 @@ impl Runner {
         &mut self,
         control: Option<Control>,
         command: Option<&Command>,
+        sql: &str,
         offset: usize,
         out: &mut OutBuf,
         run: impl FnOnce(&Connection) -> rudb::Result<QueryResult>,
     ) -> Result<Outcome, Failure> {
         let state = self.connection.transaction();
-        let outcome = self.dispatch(control, command, offset, out, run);
+        let outcome = self.dispatch(control, command, sql, offset, out, run);
         // A statement that ends the transaction, or a statement outside of a transaction, ends
         // the transaction of the settings too.
         let commit =
@@ -1157,6 +1189,7 @@ impl Runner {
         &mut self,
         control: Option<Control>,
         command: Option<&Command>,
+        sql: &str,
         offset: usize,
         out: &mut OutBuf,
         run: impl FnOnce(&Connection) -> rudb::Result<QueryResult>,
@@ -1190,7 +1223,7 @@ impl Runner {
             _ => {}
         }
         if let Some(command) = command {
-            let done = self.setting(command, state, offset, out);
+            let done = self.setting(command, state, sql, offset, out);
             if done.is_err() {
                 self.connection.abort_transaction();
             }
@@ -1238,7 +1271,9 @@ impl Runner {
             let started = if implicit { self.begin_implicit() } else { Ok(()) };
             let ran = started.and_then(|()| {
                 let offset = statement.offset();
-                self.run(control, command.as_ref(), offset, out, |c| c.execute(statement.sql()))
+                self.run(control, command.as_ref(), sql, offset, out, |c| {
+                    c.execute(statement.sql())
+                })
             });
             let result = match ran {
                 Ok(Outcome::Result(result)) => result,

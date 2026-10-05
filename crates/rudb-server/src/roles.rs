@@ -23,7 +23,7 @@ use crate::crypto::Provider;
 pub(crate) const BOOTSTRAP_SUPERUSER: u32 = 10;
 
 /// The first OID of a role that is not made by `init`, `FirstNormalObjectId`.
-const FIRST_NORMAL_OID: u32 = 16384;
+pub(crate) const FIRST_NORMAL_OID: u32 = 16384;
 
 /// The file of the roles, relative to the data directory.
 pub(crate) const FILE: &str = "global/roles";
@@ -180,6 +180,29 @@ impl Catalog {
         false
     }
 
+    /// `has_privs_of_role`: a superuser has the privileges of every role, and another role has
+    /// its own and those of the roles that it is a member of with the INHERIT option at each step.
+    /// The owner checks of PostgreSQL use this.
+    pub(crate) fn has_privs(&self, member: u32, role: u32) -> bool {
+        if self.superuser(member) || member == role {
+            return true;
+        }
+        let mut seen = vec![member];
+        let mut at = 0;
+        while let Some(&now) = seen.get(at) {
+            at += 1;
+            for grant in self.members.iter().filter(|grant| grant.member == now && grant.inherit) {
+                if grant.role == role {
+                    return true;
+                }
+                if !seen.contains(&grant.role) {
+                    seen.push(grant.role);
+                }
+            }
+        }
+        false
+    }
+
     /// `is_member_of_role_nosuper`: `member` is `role`, or a member of it through any chain of
     /// grants. The INHERIT and SET options do not count, and a superuser is not a member of every
     /// role.
@@ -293,7 +316,7 @@ impl Catalog {
 }
 
 /// A value in the text format of `COPY`.
-fn escape(value: &str) -> String {
+pub(crate) fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
@@ -308,7 +331,7 @@ fn escape(value: &str) -> String {
 }
 
 /// The value of a field in the text format of `COPY`, `None` for `\N`.
-fn unescape(field: &str) -> Option<String> {
+pub(crate) fn unescape(field: &str) -> Option<String> {
     if field == "\\N" {
         return None;
     }
@@ -336,14 +359,24 @@ fn unescape(field: &str) -> Option<String> {
 ///
 /// The text of the error of the system, as PostgreSQL gives it for a file that it cannot write.
 pub(crate) fn write(data: &Path, catalog: &Catalog) -> Result<(), String> {
-    let path = data.join(FILE);
+    save(data, FILE, &catalog.text())
+}
+
+/// Writes `text` to the file `file` of the data directory through a temporary file and a rename,
+/// so that a crash leaves the old file or the new file and never a part of one.
+///
+/// # Errors
+///
+/// The text of the error of the system, as PostgreSQL gives it for a file that it cannot write.
+pub(crate) fn save(data: &Path, file: &str, text: &str) -> Result<(), String> {
+    let path = data.join(file);
     let dir = path.parent().unwrap_or(data);
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("could not create directory \"{}\": {e}", dir.display()))?;
     let temp = path.with_extension("tmp");
     let failed = |e: std::io::Error| format!("could not write file \"{}\": {e}", temp.display());
     let mut file = std::fs::File::create(&temp).map_err(failed)?;
-    file.write_all(catalog.text().as_bytes()).map_err(failed)?;
+    file.write_all(text.as_bytes()).map_err(failed)?;
     file.sync_all().map_err(failed)?;
     drop(file);
     std::fs::rename(&temp, &path).map_err(|e| {
