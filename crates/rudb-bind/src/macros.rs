@@ -22,7 +22,7 @@
 use std::cell::Cell;
 
 use rudb_catalog::{Catalog, Overload, Parameter, QualifiedName};
-use rudb_common::{Error, Result, Session};
+use rudb_common::{Error, LogicalType, Result, Session, Value};
 use rudb_parse::NONE;
 use rudb_parse::{Ast, Kind, ast, deparse, parse_ast_with_case, quoted, tokenize};
 use rudb_plan::{ExprRef, NodeRef};
@@ -373,9 +373,9 @@ impl Binder<'_> {
 
     /// The expansion of a call to a scalar macro a user made, or `None` if the name is not one.
     ///
-    /// The overload is the first whose parameters the arguments fit: positional ones in order,
-    /// named ones by name, and a default for every parameter neither gave. A typed parameter takes
-    /// an argument of that type and no other. The body is then expanded the way a built-in macro's
+    /// The overload is the one whose parameters the arguments fit best: positional ones in order,
+    /// named ones by name, and a default for every parameter neither gave. Two that fit equally
+    /// well are refused in the pin's words. The body is then expanded the way a built-in macro's
     /// is, with the text of each argument in place of its parameter.
     pub(crate) fn user_macro(
         &mut self,
@@ -480,8 +480,8 @@ impl Binder<'_> {
         Ok(Some((node, scope)))
     }
 
-    /// The body of the first overload the arguments fit with the arguments in it, or the pin's
-    /// refusal naming every overload if they fit none.
+    /// The body of the overload the arguments fit best with the arguments in it, or the pin's
+    /// refusal naming every overload if they fit none, or the ones that tie if several fit best.
     fn expanded(
         &mut self,
         ast: &Ast,
@@ -494,15 +494,30 @@ impl Binder<'_> {
         let starred =
             positional.iter().any(|&argument| matches!(ast.expr(argument), ast::Expr::Star { .. }));
         if !starred {
+            let mut fitting = Vec::new();
             for overload in overloads {
-                if let Some(texts) = self.fits(ast, overload, positional, named, scope)? {
-                    let names: Vec<&str> = overload
-                        .parameters
-                        .iter()
-                        .map(|parameter| parameter.name.as_str())
-                        .collect();
-                    return substitute(&overload.body, &names, &texts);
+                if let Some(fit) = self.fits(ast, overload, positional, named, scope)? {
+                    fitting.push((overload, fit));
                 }
+            }
+            let best = fitting.iter().map(|(_, fit)| (fit.untyped, fit.cost)).min();
+            fitting.retain(|(_, fit)| Some((fit.untyped, fit.cost)) == best);
+            if let [(overload, fit)] = fitting.as_slice() {
+                let names: Vec<&str> =
+                    overload.parameters.iter().map(|parameter| parameter.name.as_str()).collect();
+                return substitute(&overload.body, &names, &fit.texts);
+            }
+            if !fitting.is_empty() {
+                let candidates: Vec<String> = fitting
+                    .iter()
+                    .map(|(overload, _)| format!("\t{}", overload.signature(called)))
+                    .collect();
+                return Err(Error::binder(format!(
+                    "Macro {called}() has multiple overloads that match the supplied arguments. \
+                     In order to select one, please supply all arguments by name, and/or add \
+                     explicit type casts.\nCandidate macros:\n{}",
+                    candidates.join("\n")
+                )));
             }
         }
         let candidates: Vec<String> =
@@ -514,8 +529,12 @@ impl Binder<'_> {
         )))
     }
 
-    /// The text of the argument each parameter of an overload gets, or `None` if the call does not
-    /// fit it.
+    /// How a call fits an overload, or `None` if it does not.
+    ///
+    /// An argument fits a typed parameter when it is of that type or becomes it without being
+    /// asked to, at the pin's cost for that cast, and it is cast to the type in the body. An
+    /// argument for an untyped parameter fits for more than any cast costs, so that an overload
+    /// with a type the argument becomes beats one with no type at all.
     fn fits(
         &mut self,
         ast: &Ast,
@@ -523,7 +542,7 @@ impl Binder<'_> {
         positional: &[ast::ExprRef],
         named: &[ast::Target],
         scope: &Scope,
-    ) -> Result<Option<Vec<String>>> {
+    ) -> Result<Option<Fit>> {
         let parameters = &overload.parameters;
         if positional.len() > parameters.len() {
             return Ok(None);
@@ -545,26 +564,51 @@ impl Binder<'_> {
             }
             given[slot] = Some(target.expr);
         }
-        let mut texts = Vec::with_capacity(parameters.len());
+        let mut fit = Fit { untyped: 0, cost: 0, texts: Vec::with_capacity(parameters.len()) };
         for (parameter, argument) in parameters.iter().zip(given) {
+            let wanted = match &parameter.ty {
+                Some(ty) => Some(crate::statement::read_type(self.catalog(), ty)?),
+                None => None,
+            };
             let Some(argument) = argument else {
-                match &parameter.default {
-                    Some(default) => texts.push(default.clone()),
-                    None => return Ok(None),
+                match (&parameter.default, wanted) {
+                    (Some(default), Some(wanted)) => {
+                        fit.texts.push(format!("CAST({default} AS {wanted})"));
+                    }
+                    (Some(default), None) => fit.texts.push(default.clone()),
+                    (None, _) => return Ok(None),
                 }
                 continue;
             };
-            if let Some(ty) = &parameter.ty {
-                let wanted = rudb_common::LogicalType::parse(ty)?;
-                let bound = self.bind_expr(ast, argument, scope)?;
-                if *self.plan().expr_type(bound) != wanted {
-                    return Ok(None);
-                }
+            let text = deparse::expression(ast, argument);
+            let Some(wanted) = wanted else {
+                fit.untyped += 1;
+                fit.texts.push(text);
+                continue;
+            };
+            let bound = self.bind_expr(ast, argument, scope)?;
+            let found = self.plan().expr_type(bound).clone();
+            if found == wanted {
+                fit.texts.push(text);
+                continue;
             }
-            texts.push(deparse::expression(ast, argument));
+            let Some(cost) = rudb_common::implicit::cost(&found, &wanted) else {
+                return Ok(None);
+            };
+            fit.cost += cost;
+            fit.texts.push(format!("CAST({text} AS {wanted})"));
         }
-        Ok(Some(texts))
+        Ok(Some(fit))
     }
+}
+
+/// How a call fits one overload: how many of its arguments went to a parameter with no type, what
+/// the casts to the typed ones cost, and the text each parameter gets. The overload with the
+/// fewest untyped arguments and then the cheapest casts is the one called.
+struct Fit {
+    untyped: usize,
+    cost: i64,
+    texts: Vec<String>,
 }
 
 /// Binds `CREATE MACRO` or `DROP MACRO`.
@@ -605,35 +649,32 @@ pub(crate) fn statement(
     } else {
         catalog.resolve_for_create(&parts)?
     };
+    let typed = written
+        .overloads
+        .iter()
+        .any(|overload| overload.parameters.iter().any(|(_, ty, _)| ty.is_some()));
+    if typed && catalog.attached(&name.catalog).is_some_and(|held| held.untyped_macros()) {
+        return Err(Error::binder(
+            "Typed macro parameters are only supported for storage versions v1.4.0 and higher.\n\
+             Use an in-memory database, ATTACH with (STORAGE_VERSION v1.4.0), or create a TEMP \
+             macro",
+        ));
+    }
     let table = written.overloads.first().is_some_and(|overload| overload.table);
-    let case = session.semantics().identifier_case();
     let mut overloads = Vec::with_capacity(written.overloads.len());
     for overload in &written.overloads {
-        let parameters: Vec<Parameter> = overload
-            .parameters
-            .iter()
-            .map(|(name, ty, default)| Parameter {
-                name: name.clone(),
-                ty: ty.clone(),
-                default: default.clone(),
-            })
-            .collect();
-        for parameter in &parameters {
-            let Some(default) = &parameter.default else {
-                continue;
-            };
-            let checked =
-                parse_ast_with_case(&format!("SELECT {default}"), case).and_then(|default| {
-                    crate::statement::bind_one(&default, catalog, &given.uncaught(), session, false)
-                });
-            if let Err(error) = checked
-                && error.to_string().contains("Referenced column")
-            {
-                return Err(Error::binder(format!(
-                    "Default value for parameter \"{}\" cannot contain column names",
-                    parameter.name
-                )));
+        let mut parameters = Vec::with_capacity(overload.parameters.len());
+        for (name, ty, default) in &overload.parameters {
+            let ty =
+                ty.as_deref().map(|ty| crate::statement::read_type(catalog, ty)).transpose()?;
+            if let Some(default) = default {
+                checked_default(catalog, given, session, name, ty.as_ref(), default)?;
             }
+            parameters.push(Parameter {
+                name: name.clone(),
+                ty: ty.map(|ty| ty.to_string()),
+                default: default.clone(),
+            });
         }
         let aggregating = if overload.table {
             read_tables(catalog, given, session, &overload.body, &parameters)?;
@@ -642,6 +683,19 @@ pub(crate) fn statement(
             checked(catalog, given, session, &overload.body, &parameters)?
         };
         overloads.push(Overload { parameters, body: overload.body.clone(), aggregating });
+    }
+    // Two overloads with as many parameters as each other, of the same types in the same places,
+    // could never be told apart, whatever their names or defaults.
+    let same = |one: &Overload, other: &Overload| {
+        one.parameters.len() == other.parameters.len()
+            && one.parameters.iter().zip(&other.parameters).all(|(a, b)| a.ty == b.ty)
+    };
+    if overloads.iter().enumerate().any(|(at, one)| overloads[..at].iter().any(|o| same(o, one))) {
+        return Err(Error::binder(format!(
+            "Ambiguity in macro overloads - macro {}() has multiple definitions with the same \
+             parameters",
+            parts.last().copied().unwrap_or_default()
+        )));
     }
     if written.or_replace {
         let mut seen = Vec::new();
@@ -698,6 +752,101 @@ pub fn kept_macro(sql: &str, database: &str, aggregating: &[bool]) -> Result<rud
     Ok(rudb_catalog::Macro { name, table, overloads, oid: 0 })
 }
 
+/// Checks a parameter's default the way the pin does when the macro is made. It names no column and
+/// has no query in it, it comes to a constant, and for a typed parameter that constant becomes the
+/// type without being asked to, or is a whole number written out that fits in it, so `1` is a
+/// good default for a `TINYINT` and `1::INTEGER` and `64 + 63` are not.
+fn checked_default(
+    catalog: &Catalog,
+    given: &Parameters,
+    session: &Session,
+    name: &str,
+    ty: Option<&LogicalType>,
+    default: &str,
+) -> Result<()> {
+    let parsed =
+        parse_ast_with_case(&format!("SELECT {default}"), session.semantics().identifier_case())?;
+    if let Err(error) =
+        crate::statement::bind_one(&parsed, catalog, &given.uncaught(), session, false)
+        && error.to_string().contains("Referenced column")
+    {
+        return Err(Error::binder(format!(
+            "Default value for parameter \"{name}\" cannot contain column names"
+        )));
+    }
+    let Some(expr) = first_target(&parsed) else {
+        return Ok(());
+    };
+    let uncaught = given.uncaught();
+    let mut binder = Binder::with(catalog, &uncaught, session);
+    let Ok(bound) = binder.bind_expr(&parsed, expr, &Scope::empty()) else {
+        return Ok(());
+    };
+    if !binder.scalar_subqueries.is_empty() {
+        return Err(Error::binder(format!(
+            "Default value for parameter \"{name}\" cannot contain subqueries"
+        )));
+    }
+    // The pin puts the name in double quotes here whether it needs them or not.
+    let shown_name = format!("\"{}\"", name.replace('"', "\"\""));
+    let Some(value) = crate::fold::value_of(binder.plan(), bound)? else {
+        return Err(Error::binder(format!(
+            "Default value '{default}' for parameter '{}' is not a constant expression.",
+            shown_name
+        )));
+    };
+    let Some(wanted) = ty else {
+        return Ok(());
+    };
+    let found = binder.plan().expr_type(bound).clone();
+    let fits = default.trim().parse::<i128>().is_ok_and(|whole| holds(wanted, whole));
+    if found == *wanted || fits || rudb_common::implicit::cost(&found, wanted).is_some() {
+        return Ok(());
+    }
+    let shown = match &value {
+        Value::Null => format!("NULL::{found}"),
+        Value::Varchar(text) => format!("'{}'", text.replace('\'', "''")),
+        value => value.to_string(),
+    };
+    Err(Error::binder(format!(
+        "Default value '{shown}' for parameter '{}' cannot be implicitly cast to '{wanted}'. \
+         Please add an explicit type cast.",
+        shown_name
+    )))
+}
+
+/// Whether a whole number fits in `ty`, for an integer type, which is when the pin narrows a
+/// default written as one.
+fn holds(ty: &LogicalType, whole: i128) -> bool {
+    let range = match ty {
+        LogicalType::TinyInt => i128::from(i8::MIN)..=i128::from(i8::MAX),
+        LogicalType::SmallInt => i128::from(i16::MIN)..=i128::from(i16::MAX),
+        LogicalType::Integer => i128::from(i32::MIN)..=i128::from(i32::MAX),
+        LogicalType::BigInt => i128::from(i64::MIN)..=i128::from(i64::MAX),
+        LogicalType::HugeInt => i128::MIN..=i128::MAX,
+        LogicalType::UTinyInt => 0..=i128::from(u8::MAX),
+        LogicalType::USmallInt => 0..=i128::from(u16::MAX),
+        LogicalType::UInteger => 0..=i128::from(u32::MAX),
+        LogicalType::UBigInt => 0..=i128::from(u64::MAX),
+        LogicalType::UHugeInt => 0..=i128::MAX,
+        _ => return false,
+    };
+    range.contains(&whole)
+}
+
+/// The expression of the one column of a `SELECT` with no `FROM`.
+fn first_target(parsed: &Ast) -> Option<ast::ExprRef> {
+    match parsed.statements.first() {
+        Some(&ast::Statement::Query(query)) => match parsed.query(query).body {
+            ast::QueryBody::Select(select) => {
+                parsed.target_list(parsed.select(select).targets).first().map(|target| target.expr)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Binds a table macro's body with a null in place of each parameter, which the pin does too, so
 /// that a body reading a table that is not there is refused when it is made.
 fn read_tables(
@@ -749,16 +898,7 @@ fn checked(
     let text = substitute(body, &names, &nulls)?;
     let parsed =
         parse_ast_with_case(&format!("SELECT {text}"), session.semantics().identifier_case())?;
-    let expr = match parsed.statements.first() {
-        Some(&ast::Statement::Query(query)) => match parsed.query(query).body {
-            ast::QueryBody::Select(select) => {
-                parsed.target_list(parsed.select(select).targets).first().map(|target| target.expr)
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-    let Some(expr) = expr else {
+    let Some(expr) = first_target(&parsed) else {
         return Ok(false);
     };
     if matches!(parsed.expr(expr), ast::Expr::Star { .. }) {

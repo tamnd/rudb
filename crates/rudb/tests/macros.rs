@@ -98,6 +98,30 @@ fn a_database_file_keeps_its_macros() {
 }
 
 #[test]
+fn a_file_attached_with_an_older_storage_version_takes_no_typed_parameter() {
+    let path = path("older");
+    let database = Database::new();
+    database
+        .execute(&format!(
+            "ATTACH '{}' AS older (STORAGE_VERSION 'v1.3.0')",
+            path.to_str().expect("a UTF-8 path")
+        ))
+        .expect("attached");
+    database.execute("USE older").expect("used");
+    refused(
+        &database,
+        "CREATE MACRO m(s VARCHAR) AS s || 'c'",
+        "Binder Error: Typed macro parameters are only supported for storage versions v1.4.0 and \
+         higher.",
+    );
+    database.execute("CREATE MACRO u(s) AS s || 'c'").expect("an untyped one");
+    database.execute("CREATE TEMPORARY MACRO m(s VARCHAR) AS s || 'c'").expect("a temporary one");
+    assert_eq!(answered(&database, "SELECT m('ab'), u('ab')"), ["abc|abc"]);
+    drop(database);
+    remove(&path);
+}
+
+#[test]
 fn a_typed_parameter_picks_between_overloads() {
     let database = Database::new();
     database
@@ -105,6 +129,80 @@ fn a_typed_parameter_picks_between_overloads() {
         .expect("the macro");
     assert_eq!(answered(&database, "SELECT m(41)"), ["42"]);
     assert_eq!(answered(&database, "SELECT m('hi')"), ["hi!"]);
+}
+
+#[test]
+fn the_overload_with_the_cheapest_casts_is_called_and_its_arguments_are_cast() {
+    let database = Database::new();
+    database
+        .execute(
+            "CREATE MACRO m (a tinyint) AS 1, (a smallint) AS 2, (a integer) AS 3, \
+             (a bigint) AS 4, (a hugeint) AS 5, (a) AS 10",
+        )
+        .expect("the macro");
+    assert_eq!(
+        answered(
+            &database,
+            "SELECT m(0::tinyint), m(0::utinyint), m(0::uinteger), m(0::ubigint), \
+             m(0::uhugeint), m(0::double)"
+        ),
+        ["1|4|4|5|10|10"]
+    );
+    database.execute("CREATE MACRO t(a bigint) AS typeof(a)").expect("the cast one");
+    assert_eq!(answered(&database, "SELECT t(42::integer), t(NULL)"), ["BIGINT|BIGINT"]);
+    database.execute("CREATE MACRO p(a varchar) AS 'v', (a) AS 'any'").expect("the untyped one");
+    assert_eq!(answered(&database, "SELECT p(1), p(NULL), p('x')"), ["any|v|v"]);
+    assert_eq!(
+        answered(
+            &database,
+            "SELECT parameter_types[1] FROM duckdb_functions() WHERE function_name = 'm'"
+        ),
+        ["BIGINT", "HUGEINT", "INTEGER", "NULL", "SMALLINT", "TINYINT"]
+    );
+}
+
+#[test]
+fn a_typed_default_is_checked_when_the_macro_is_made() {
+    let database = Database::new();
+    database
+        .execute(
+            "CREATE MACRO d(i tinyint := 1, u utinyint := 255, n tinyint := NULL) AS \
+             typeof(i) || typeof(u) || typeof(n)",
+        )
+        .expect("defaults that fit");
+    assert_eq!(answered(&database, "SELECT d()"), ["TINYINTUTINYINTTINYINT"]);
+    database.execute("CREATE MACRO w(i bigint := 42::integer) AS typeof(i)").expect("widened");
+    assert_eq!(answered(&database, "SELECT w()"), ["BIGINT"]);
+    for (sql, expected) in [
+        (
+            "CREATE MACRO b(i tinyint := 128) AS i",
+            "Binder Error: Default value '128' for parameter '\"i\"' cannot be implicitly cast to \
+             'TINYINT'. Please add an explicit type cast.",
+        ),
+        (
+            "CREATE MACRO b(i tinyint := 64 + 63) AS i",
+            "Binder Error: Default value '127' for parameter '\"i\"' cannot be implicitly cast",
+        ),
+        (
+            "CREATE MACRO b(s varchar := 'a' || 'b', i integer := 'x') AS i",
+            "Binder Error: Default value ''x'' for parameter '\"i\"' cannot be implicitly cast",
+        ),
+        (
+            "CREATE MACRO b(i tinyint := NULL::integer) AS i",
+            "Binder Error: Default value 'NULL::INTEGER' for parameter '\"i\"' cannot be",
+        ),
+        (
+            "CREATE MACRO b(i := random()) AS i",
+            "Binder Error: Default value 'random()' for parameter '\"i\"' is not a constant \
+             expression.",
+        ),
+        (
+            "CREATE MACRO b(i integer := (SELECT 1)) AS i",
+            "Binder Error: Default value for parameter \"i\" cannot contain subqueries",
+        ),
+    ] {
+        refused(&database, sql, expected);
+    }
 }
 
 #[test]
@@ -137,6 +235,7 @@ fn the_pin_refuses_what_it_refuses_in_its_words() {
     database.execute("CREATE TABLE integers (a INTEGER)").expect("the table");
     database.execute("CREATE MACRO m(a, b := 10) AS a + b").expect("the macro");
     database.execute("CREATE MACRO t() AS TABLE SELECT 1 AS x").expect("the table macro");
+    database.execute("CREATE MACRO tie(a, b := 1) AS 1, (a) AS 2").expect("overloads that tie");
     for (sql, expected) in [
         ("CREATE MACRO m(x) AS x", "Catalog Error: Macro Function with name \"m\" already exists!"),
         ("CREATE MACRO r(x) AS r(x)", "Catalog Error: Scalar Function with name r does not exist!"),
@@ -162,6 +261,15 @@ fn the_pin_refuses_what_it_refuses_in_its_words() {
         (
             "CREATE MACRO s() AS TABLE SELECT * FROM suits",
             "Catalog Error: Table with name suits does not exist!",
+        ),
+        (
+            "CREATE MACRO twice(a INTEGER, b) AS a, (c INTEGER, d := 1) AS c",
+            "Binder Error: Ambiguity in macro overloads - macro twice() has multiple definitions \
+             with the same parameters",
+        ),
+        (
+            "SELECT tie(1)",
+            "Binder Error: Macro tie() has multiple overloads that match the supplied arguments.",
         ),
         (
             "SELECT * FROM t(x := 1, 2)",
