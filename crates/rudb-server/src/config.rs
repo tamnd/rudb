@@ -40,6 +40,10 @@ pub struct Config {
     pub ssl_min_protocol_version: TlsVersion,
     /// `ssl_max_protocol_version`. [`TlsVersion::Any`] is no limit.
     pub ssl_max_protocol_version: TlsVersion,
+    /// `hba_file`, `pg_hba.conf` in the data directory when it is empty.
+    pub hba_file: PathBuf,
+    /// `ident_file`, `pg_ident.conf` in the data directory when it is empty.
+    pub ident_file: PathBuf,
 }
 
 /// A value of `ssl_min_protocol_version` and `ssl_max_protocol_version`. `rustls` has no TLS 1.0
@@ -80,6 +84,8 @@ impl Config {
             ssl_ca_file: PathBuf::new(),
             ssl_min_protocol_version: TlsVersion::Tls12,
             ssl_max_protocol_version: TlsVersion::Any,
+            hba_file: PathBuf::new(),
+            ident_file: PathBuf::new(),
         }
     }
 
@@ -120,6 +126,8 @@ impl Config {
             "ssl_ca_file" => self.ssl_ca_file = PathBuf::from(value),
             "ssl_min_protocol_version" => self.ssl_min_protocol_version = tls_version(name, value)?,
             "ssl_max_protocol_version" => self.ssl_max_protocol_version = tls_version(name, value)?,
+            "hba_file" => self.hba_file = PathBuf::from(value),
+            "ident_file" => self.ident_file = PathBuf::from(value),
             _ => return Err(format!("unrecognized configuration parameter \"{name}\"")),
         }
         Ok(())

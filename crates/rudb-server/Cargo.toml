@@ -42,6 +42,7 @@ rudb.workspace = true
 rudb-common.workspace = true
 rudb-pgtypes.workspace = true
 rudb-pgwire.workspace = true
+rudb-regex.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 

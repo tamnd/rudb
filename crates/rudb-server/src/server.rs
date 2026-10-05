@@ -18,9 +18,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rudb::{Connection, Database};
-use rudb_pgwire::{CANCEL_KEY_LEN, Cancel, CancelKey, SCRAM_ITERATIONS, cancel_target};
+use rudb_pgwire::{
+    CANCEL_KEY_LEN, Cancel, CancelKey, MOCK_NONCE_LEN, SCRAM_ITERATIONS, cancel_target,
+};
 
 use crate::config::Config;
+use crate::hba::{self, Hba, Ident, ParseSettings};
 use crate::poll;
 use crate::roles::{self, Role, Roles};
 use crate::session;
@@ -30,6 +33,10 @@ use crate::tls;
 /// The name of the lock file in the data directory, which holds the process ID of the server.
 const PID_FILE: &str = "rudb-server.pid";
 
+/// The file in the data directory with the mock nonce, in hexadecimal. PostgreSQL keeps the nonce
+/// in `pg_control`.
+const MOCK_NONCE_FILE: &str = "global/mock_auth_nonce";
+
 /// The time that a stop gives the sessions to end by themselves before it closes their sockets.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
@@ -37,9 +44,21 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// deep expression recurses in the parser and the binder.
 const SESSION_STACK: usize = 8 << 20;
 
-/// Writes one line to the log, which is the standard error, in the format of PostgreSQL.
+/// Writes one message to the log, which is the standard error, in the format of PostgreSQL. The
+/// message can hold `DETAIL`, `HINT` and `CONTEXT` lines, and each other line after the first
+/// starts with a tab, as PostgreSQL writes a message of more than one line.
 pub(crate) fn log(level: &str, message: &str) {
-    eprintln!("{level}:  {message}");
+    let mut out = format!("{level}:  ");
+    for (at, line) in message.split('\n').enumerate() {
+        if at > 0 {
+            out.push('\n');
+            if !["DETAIL:  ", "HINT:  ", "CONTEXT:  "].iter().any(|label| line.starts_with(label)) {
+                out.push('\t');
+            }
+        }
+        out.push_str(line);
+    }
+    eprintln!("{out}");
 }
 
 /// A running server.
@@ -86,6 +105,12 @@ pub(crate) struct Shared {
     pub(crate) config: Config,
     /// The TLS configuration, when `ssl` is on.
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
+    /// The hash of the server certificate for SCRAM with channel binding, when `ssl` is on.
+    pub(crate) certificate_hash: Option<Vec<u8>>,
+    /// The nonce of the cluster that makes the mock SCRAM secret of a role with no secret.
+    pub(crate) mock_nonce: [u8; MOCK_NONCE_LEN],
+    hba: Mutex<Arc<Hba>>,
+    ident: Mutex<Arc<Ident>>,
     /// The roles of the cluster.
     pub(crate) roles: Arc<Roles>,
     databases: Mutex<HashMap<String, Arc<Database>>>,
@@ -102,6 +127,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Shared {
+    /// The `pg_hba.conf` that new connections use.
+    pub(crate) fn hba(&self) -> Arc<Hba> {
+        lock(&self.hba).clone()
+    }
+
+    /// The `pg_ident.conf` that new connections use.
+    pub(crate) fn ident(&self) -> Arc<Ident> {
+        lock(&self.ident).clone()
+    }
+
     /// True after the server started to stop.
     pub(crate) fn stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)
@@ -222,20 +257,160 @@ fn database_path(data: &Path, name: &str) -> PathBuf {
     data.join("base").join(format!("{name}.rudb"))
 }
 
-/// Makes a data directory with the databases `postgres`, `template1` and `template0`, as `initdb`
-/// does. `superuser` is the name of the bootstrap superuser, and `password` its password in clear
-/// text, which the role file keeps as a SCRAM secret.
+/// The paths of `pg_hba.conf` and `pg_ident.conf`, absolute, as PostgreSQL logs them.
+fn auth_paths(config: &Config) -> (String, String) {
+    let path = |file: &Path, default: &str| {
+        let file = if file.as_os_str().is_empty() { Path::new(default) } else { file };
+        hba::config_path(&config.data, file).to_string_lossy().into_owned()
+    };
+    (path(&config.hba_file, "pg_hba.conf"), path(&config.ident_file, "pg_ident.conf"))
+}
+
+/// Loads `pg_hba.conf` and `pg_ident.conf` at start, as `PostmasterMain` does. The details of
+/// each error go to the log. A `pg_hba.conf` that does not load stops the start, and a
+/// `pg_ident.conf` that does not load leaves no maps.
+fn load_auth_files(config: &Config) -> Result<(Hba, Ident), String> {
+    let (hba_path, ident_path) = auth_paths(config);
+    let mut lines = Vec::new();
+    let hba = Hba::load(&hba_path, ParseSettings { ssl: config.ssl }, &mut lines);
+    for line in lines.drain(..) {
+        log("LOG", &line);
+    }
+    let hba = hba.ok_or_else(|| format!("could not load {hba_path}"))?;
+    let ident = Ident::load(&ident_path, &mut lines);
+    for line in lines {
+        log("LOG", &line);
+    }
+    Ok((hba, ident.unwrap_or_default()))
+}
+
+/// The mock nonce of the cluster, from its file, or a new one in the file of a data directory
+/// from an older version.
+fn mock_nonce(data: &Path) -> Result<[u8; MOCK_NONCE_LEN], String> {
+    let path = data.join(MOCK_NONCE_FILE);
+    let parse = |text: &str| -> Option<[u8; MOCK_NONCE_LEN]> {
+        let text = text.trim();
+        let mut nonce = [0; MOCK_NONCE_LEN];
+        if text.len() != 2 * MOCK_NONCE_LEN {
+            return None;
+        }
+        for (at, byte) in nonce.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(text.get(2 * at..2 * at + 2)?, 16).ok()?;
+        }
+        Some(nonce)
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse(&text)
+            .ok_or_else(|| format!("invalid mock authentication nonce in \"{}\"", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => write_mock_nonce(data),
+        Err(e) => Err(format!("could not open file \"{}\": {e}", path.display())),
+    }
+}
+
+/// Makes the mock nonce of a cluster and writes its file.
+fn write_mock_nonce(data: &Path) -> Result<[u8; MOCK_NONCE_LEN], String> {
+    let nonce = poll::random::<MOCK_NONCE_LEN>();
+    let path = data.join(MOCK_NONCE_FILE);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("could not create directory \"{}\": {e}", dir.display()))?;
+    }
+    let text: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(&path, text + "\n")
+        .map_err(|e| format!("could not write file \"{}\": {e}", path.display()))?;
+    Ok(nonce)
+}
+
+/// The sample files that `init` writes into the data directory.
+const HBA_SAMPLE: &str = include_str!("../vendor/pg_hba.conf.sample");
+const IDENT_SAMPLE: &str = include_str!("../vendor/pg_ident.conf.sample");
+
+/// The comment that `initdb` puts at the top of the entries when a method is `trust`.
+const TRUST_COMMENT: &str = "# CAUTION: Configuring the system for local \"trust\" authentication\n\
+                             # allows any local user to connect as any PostgreSQL user, including\n\
+                             # the database superuser.  If you do not trust all your local users,\n\
+                             # use another authentication method.\n";
+
+/// The methods that `initdb` accepts for `local` lines and for `host` lines.
+const LOCAL_METHODS: [&str; 6] = ["trust", "reject", "scram-sha-256", "md5", "password", "peer"];
+const HOST_METHODS: [&str; 6] = ["trust", "reject", "scram-sha-256", "md5", "password", "ident"];
+
+/// The options of `init`, the options of `initdb` that it knows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Init {
+    /// The name of the bootstrap superuser.
+    pub superuser: String,
+    /// The password of the superuser in clear text, which the role file keeps as a SCRAM secret.
+    pub password: Option<String>,
+    /// The method for `local` lines, `trust` when it is `None`.
+    pub auth_local: Option<String>,
+    /// The method for `host` lines, `trust` when it is `None`.
+    pub auth_host: Option<String>,
+}
+
+impl Init {
+    /// The options for the superuser `superuser` with the defaults of `initdb`.
+    pub fn new(superuser: &str) -> Init {
+        Init { superuser: superuser.to_owned(), ..Init::default() }
+    }
+
+    /// `-A`: sets the method of both kinds of lines. `ident` for `host` lines is `peer` for
+    /// `local` lines, and the reverse, as in `initdb`.
+    pub fn auth(&mut self, method: &str) {
+        self.auth_local = Some(method.to_owned());
+        self.auth_host = Some(method.to_owned());
+        if method == "ident" {
+            self.auth_local = Some("peer".to_owned());
+        } else if method == "peer" {
+            self.auth_host = Some("ident".to_owned());
+        }
+    }
+
+    /// True when a method was not given, so `initdb` uses `trust` and warns.
+    pub fn trust_warning(&self) -> bool {
+        self.auth_local.is_none() || self.auth_host.is_none()
+    }
+
+    /// The methods for `local` and `host` lines, after the checks of `initdb`.
+    fn methods(&self) -> Result<(&str, &str), String> {
+        let local = self.auth_local.as_deref().unwrap_or("trust");
+        let host = self.auth_host.as_deref().unwrap_or("trust");
+        for (method, valid, kind) in
+            [(local, &LOCAL_METHODS, "local"), (host, &HOST_METHODS, "host")]
+        {
+            if !valid.contains(&method) {
+                return Err(format!(
+                    "invalid authentication method \"{method}\" for \"{kind}\" connections"
+                ));
+            }
+        }
+        let password = |method| matches!(method, "md5" | "password" | "scram-sha-256");
+        if password(local) && password(host) && self.password.is_none() {
+            return Err(
+                "must specify a password for the superuser to enable password authentication"
+                    .to_owned(),
+            );
+        }
+        Ok((local, host))
+    }
+}
+
+/// Makes a data directory with the databases `postgres`, `template1` and `template0`, the role
+/// file, `pg_hba.conf` and `pg_ident.conf`, as `initdb` does.
 ///
 /// # Errors
 ///
-/// A superuser name that starts with `pg_`, a data directory that exists and is not empty, or a
-/// file that the server cannot write.
-pub fn init(data: &Path, superuser: &str, password: Option<&str>) -> Result<(), String> {
+/// A superuser name that starts with `pg_`, a method that `initdb` does not accept, a password
+/// method without a password, a data directory that exists and is not empty, or a file that the
+/// server cannot write.
+pub fn init(data: &Path, options: &Init) -> Result<(), String> {
+    let superuser = options.superuser.as_str();
     if superuser.starts_with("pg_") {
         return Err(format!(
             "superuser name \"{superuser}\" is disallowed; role names cannot begin with \"pg_\""
         ));
     }
+    let (local, host) = options.methods()?;
     if data.exists() && data.read_dir().map_err(|e| e.to_string())?.next().is_some() {
         return Err(format!("directory \"{}\" exists but is not empty", data.display()));
     }
@@ -251,7 +426,20 @@ pub fn init(data: &Path, superuser: &str, password: Option<&str>) -> Result<(), 
             .and_then(Database::close)
             .map_err(|e| format!("could not create database \"{name}\": {}", e.message()))?;
     }
-    let password = password.map(|password| roles::scram(password, SCRAM_ITERATIONS));
+    write_mock_nonce(data)?;
+    let comment = if local == "trust" || host == "trust" { TRUST_COMMENT } else { "" };
+    let hba = hba::fill_sample(
+        HBA_SAMPLE,
+        &[("@authmethodhost@", host), ("@authmethodlocal@", local), ("@authcomment@", comment)],
+    );
+    for (name, text) in [("pg_hba.conf", hba.as_str()), ("pg_ident.conf", IDENT_SAMPLE)] {
+        let path = data.join(name);
+        std::fs::write(&path, text)
+            .and_then(|()| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)))
+            .map_err(|e| format!("could not write file \"{}\": {e}", path.display()))?;
+    }
+    let password =
+        options.password.as_deref().map(|password| roles::scram(password, SCRAM_ITERATIONS));
     roles::write(data, &roles::Catalog::bootstrap(superuser, password))
 }
 
@@ -351,7 +539,11 @@ impl Server {
                 config.data.display()
             ));
         }
-        let tls = tls::load(&config)?;
+        let (tls, certificate_hash) = match tls::load(&config)? {
+            Some((tls, hash)) => (Some(tls), Some(hash)),
+            None => (None, None),
+        };
+        let mock_nonce = mock_nonce(&config.data)?;
         let roles = Arc::new(Roles::open(&config.data)?);
         let mut owned = Vec::new();
         let pid_file = config.data.join(PID_FILE);
@@ -363,7 +555,8 @@ impl Server {
         )?;
         owned.push(pid_file);
         let opened = Server::listen(&config, &mut owned);
-        let (listeners, addresses, sockets) = match opened {
+        let opened = opened.and_then(|opened| Ok((opened, load_auth_files(&config)?)));
+        let ((listeners, addresses, sockets), (hba, ident)) = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 for path in &owned {
@@ -376,6 +569,10 @@ impl Server {
         let shared = Arc::new(Shared {
             config,
             tls,
+            certificate_hash,
+            mock_nonce,
+            hba: Mutex::new(Arc::new(hba)),
+            ident: Mutex::new(Arc::new(ident)),
             roles,
             databases: Mutex::new(HashMap::new()),
             sessions: Mutex::new(Sessions {

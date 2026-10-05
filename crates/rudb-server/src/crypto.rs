@@ -10,6 +10,24 @@ use ring as lib;
 
 use rudb_pgwire::Crypto;
 
+/// A hash for the end point of a TLS channel binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Digest {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+/// The hash `digest` of `bytes`.
+pub(crate) fn digest(digest: Digest, bytes: &[u8]) -> Vec<u8> {
+    let algorithm = match digest {
+        Digest::Sha256 => &lib::digest::SHA256,
+        Digest::Sha384 => &lib::digest::SHA384,
+        Digest::Sha512 => &lib::digest::SHA512,
+    };
+    lib::digest::digest(algorithm, bytes).as_ref().to_vec()
+}
+
 /// The [`Crypto`] of the server.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Provider;

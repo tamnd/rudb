@@ -981,6 +981,7 @@ dependencies = [
  "rudb-common",
  "rudb-pgtypes",
  "rudb-pgwire",
+ "rudb-regex",
  "rustls",
  "rustls-pki-types",
 ]

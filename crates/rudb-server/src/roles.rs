@@ -180,6 +180,29 @@ impl Catalog {
         false
     }
 
+    /// `is_member_of_role_nosuper`: `member` is `role`, or a member of it through any chain of
+    /// grants. The INHERIT and SET options do not count, and a superuser is not a member of every
+    /// role.
+    pub(crate) fn member_of(&self, member: u32, role: u32) -> bool {
+        if member == role {
+            return true;
+        }
+        let mut seen = vec![member];
+        let mut at = 0;
+        while let Some(&now) = seen.get(at) {
+            at += 1;
+            for grant in self.members.iter().filter(|grant| grant.member == now) {
+                if grant.role == role {
+                    return true;
+                }
+                if !seen.contains(&grant.role) {
+                    seen.push(grant.role);
+                }
+            }
+        }
+        false
+    }
+
     /// The text of the file.
     fn text(&self) -> String {
         let mut out = String::new();
