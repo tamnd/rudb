@@ -3439,10 +3439,11 @@ impl<'a> Aggregate<'a> {
     /// [`Aggregate::finish`] with the clock taken off it, so that the clock wraps all of it.
     fn finishing(
         &self,
-        local: Building,
+        mut local: Building,
         chunks: &mut Vec<Chunk>,
         held: &mut Reservation,
     ) -> Result<Option<Spill>> {
+        local.settle()?;
         let Building {
             mut scratch,
             mut containers,
@@ -3746,7 +3747,7 @@ impl<'a> Aggregate<'a> {
     }
 
     /// [`Aggregate::merge`] with the clock taken off it, so that the clock wraps all of it.
-    fn merging(&self, from: Building, into: &mut Building) -> Result<()> {
+    fn merging(&self, mut from: Building, into: &mut Building) -> Result<()> {
         if from.over.is_some() || into.over.is_some() {
             return Err(Error::internal(
                 "two tables of an aggregate were merged with a spill file between them, where a \
@@ -3754,6 +3755,8 @@ impl<'a> Aggregate<'a> {
                  by partitioning instead",
             ));
         }
+        from.settle()?;
+        into.settle()?;
         let Building {
             scratch,
             containers,
@@ -3843,6 +3846,7 @@ impl<'a> Aggregate<'a> {
         slots: &[usize],
         into: &mut Building,
     ) -> Result<u64> {
+        into.settle()?;
         let mut aside = 0;
         // The groups are looked up a batch at a time, the way the fold looks up rows, so that the
         // misses of a batch are all outstanding at once and the match on the key's form is settled
@@ -3920,8 +3924,9 @@ impl<'a> Aggregate<'a> {
     }
 
     /// [`Aggregate::scatter`] with the clock taken off it, so that the clock wraps all of it.
-    fn scattering(&self, from: Building, spin: usize) -> Result<()> {
+    fn scattering(&self, mut from: Building, spin: usize) -> Result<()> {
         debug_assert!(from.over.is_none(), "a spill file is drained by hand_over, not scattered");
+        from.settle()?;
         let Building {
             scratch,
             containers,
@@ -4106,6 +4111,7 @@ impl<'a> Aggregate<'a> {
     /// A group that is already there stays where it is, because this instance has been counting into
     /// it and its slot is the order it was first seen in.
     fn install(&self, keys: &[Vector], into: &mut Building) -> Result<()> {
+        into.settle()?;
         let rows = keys.first().map_or(0, Vector::len);
         let Building { table, states, counts, compact, seen, groups, hashes, .. } = into;
         crate::table::hash(keys, rows, hashes, crate::table::Across::OneInput);
@@ -4559,8 +4565,9 @@ impl<'a> Aggregate<'a> {
     }
 
     /// [`Aggregate::scatter_own`] with the clock taken off it, so that the clock wraps all of it.
-    fn scattering_own(&self, from: Building, own: &mut [Option<Building>]) -> Result<()> {
+    fn scattering_own(&self, mut from: Building, own: &mut [Option<Building>]) -> Result<()> {
         debug_assert!(from.over.is_none(), "a spilled table is never scattered locally");
+        from.settle()?;
         let Building {
             scratch,
             containers,
@@ -5887,6 +5894,14 @@ pub(crate) struct Building {
     away: Vec<Value>,
     /// What went wrong before any row arrived, which there is nowhere else to report from.
     failure: Option<Error>,
+}
+
+impl Building {
+    /// Folds in the totals [`PlaceSums`] still owes the accumulators, which everything that reads
+    /// them or moves the groups asks for first.
+    fn settle(&mut self) -> Result<()> {
+        self.place_sums.settle(&mut self.states)
+    }
 }
 
 /// One group of COUNT(*), SUM(SMALLINT) and AVG(SMALLINT).
