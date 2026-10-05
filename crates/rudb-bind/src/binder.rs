@@ -34,7 +34,7 @@ use rudb_plan::{
     SetOpKind, Share, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
-use crate::expr::{describe, has_aggregate};
+use crate::expr::describe;
 use crate::fold;
 use crate::parameters::{Parameters, Written};
 use crate::scope::{Joined, Scope, Visible};
@@ -1661,8 +1661,8 @@ impl<'a> Binder<'a> {
         let group_items = self.group_items(ast, &written, &targets)?;
         let aggregating = !group_items.is_empty()
             || written.having != NONE
-            || has_aggregate(ast, written.qualify)
-            || targets.iter().any(|target| has_aggregate(ast, target.expr));
+            || self.aggregates(ast, written.qualify)
+            || targets.iter().any(|target| self.aggregates(ast, target.expr));
         if aggregating {
             self.clause = "GROUP BY clause";
             // An unnest in a grouping key runs under the grouping, over the rows of the `FROM`,
@@ -2136,7 +2136,7 @@ impl<'a> Binder<'a> {
             // that would otherwise have to be written out again by hand.
             return Ok(targets
                 .iter()
-                .filter(|target| !has_aggregate(ast, target.expr))
+                .filter(|target| !self.aggregates(ast, target.expr))
                 .map(|target| target.expr)
                 .collect());
         }
@@ -2749,7 +2749,8 @@ impl<'a> Binder<'a> {
             && let Some(rows) = self.parameters.relation(single)
         {
             let rows = rows.clone();
-            let label = if alias == NONE { single.to_string() } else { ast.string(alias).to_string() };
+            let label =
+                if alias == NONE { single.to_string() } else { ast.string(alias).to_string() };
             return self.bind_rows(&rows, &label);
         }
         let catalog = self.catalog;
@@ -2940,6 +2941,9 @@ impl<'a> Binder<'a> {
         // The column names written after the alias, kept under a name of their own because the
         // match on what the function's columns are below binds `columns` to something else.
         let renamed = columns;
+        if !pragma && let Some(bound) = self.table_macro(ast, name, args, alias, columns)? {
+            return Ok(bound);
+        }
         let parts: Vec<&str> = ast.name(name).collect();
         // A qualified call names a schema, and the two schemas that exist are the ones every
         // built-in lives in. Anything else is a name that has to fail rather than fall through to

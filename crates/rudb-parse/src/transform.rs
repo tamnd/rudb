@@ -24,10 +24,10 @@ use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 use crate::ast::{
     AlterAction, Ast, Attach, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, Constraint,
     CopyTo, CreateTable, CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert,
-    JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope,
-    Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, StarLists, Statement, StrRef,
-    Target, Transaction, Trigger, TriggerEvent, TriggerTiming, UnaryOp, WindowBound, WindowExclude,
-    WindowRef, WindowSpec, WindowUnit,
+    JoinKind, LiteralKind, MacroDef, MacroOverload, Nulls, Order, OrderItem, Quantifier, Query,
+    QueryBody, QueryRef, Scope, Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef,
+    StarLists, Statement, StrRef, Target, Transaction, Trigger, TriggerEvent, TriggerTiming,
+    UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -1041,6 +1041,7 @@ impl<'a> Transform<'a> {
             }
             "CreateIndexStmt" => self.create_index_statement(inner, or_replace, temporary),
             "CreateTriggerStmt" => self.create_trigger_statement(inner, or_replace, temporary),
+            "CreateMacroStmt" => self.create_macro_statement(inner, or_replace, temporary),
             _ => self.unsupported(inner),
         }
     }
@@ -2134,6 +2135,27 @@ impl<'a> Transform<'a> {
             };
             return Ok(self.index_statement(index));
         }
+        if matches!(self.name(inner), "DropFunction" | "DropTableFunction") {
+            let rule = if self.name(inner) == "DropFunction" {
+                "FunctionIdentifier"
+            } else {
+                "TableFunctionName"
+            };
+            let names: Vec<u32> = self.kids(inner).filter(|&kid| self.name(kid) == rule).collect();
+            let [name] = names[..] else {
+                return Err(Error::not_implemented("Can only drop one object at a time"));
+            };
+            let made = MacroDef {
+                name: self.name_parts(name),
+                drop: true,
+                table: (self.name(inner) == "DropTableFunction").then_some(true),
+                quiet: self.find(inner, "IfExists") != NONE,
+                or_replace: false,
+                temporary: false,
+                overloads: Vec::new(),
+            };
+            return Ok(self.macro_statement(made));
+        }
         if self.name(inner) == "DropTrigger" {
             let trigger = Trigger {
                 name: self.identifier(self.find(inner, "TriggerName")),
@@ -2174,6 +2196,76 @@ impl<'a> Transform<'a> {
         let index = self.ast.drop_tables.len() as u32;
         self.ast.drop_tables.push(DropTable { names, if_exists, view, cascade });
         Ok(Statement::DropTable(index))
+    }
+
+    /// `CreateMacroStmt <- MacroOrFunction IfNotExists? QualifiedName List(MacroDefinition)`, where
+    /// each definition is `Parens(MacroParameters?) 'AS' MacroDefinitionBody`.
+    ///
+    /// The two refusals here are the pin's parser's. What the body means is a question for the
+    /// binder, which reads it against the catalog.
+    fn create_macro_statement(
+        &mut self,
+        inner: u32,
+        or_replace: bool,
+        temporary: bool,
+    ) -> Result<Statement> {
+        let mut definitions = Vec::new();
+        self.named_nodes(inner, "MacroDefinition", &mut definitions);
+        let mut overloads = Vec::with_capacity(definitions.len());
+        for definition in definitions {
+            let mut written = Vec::new();
+            self.named_nodes(definition, "MacroParameter", &mut written);
+            let mut parameters: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+            for parameter in written {
+                let parameter = self.first(parameter);
+                let name = self.identifier(self.first(parameter));
+                let name = self.ast.string(name).to_string();
+                let ty = self.find(parameter, "Type");
+                let ty = (ty != NONE).then(|| crate::deparse::typename(self.text(ty)));
+                let default = if self.name(parameter) == "NamedParameter" {
+                    let value = self.expr(self.find(parameter, "Expression"))?;
+                    Some(crate::deparse::expression(&self.ast, value))
+                } else {
+                    None
+                };
+                if parameters.iter().any(|(held, _, _)| held.eq_ignore_ascii_case(&name)) {
+                    return Err(Error::parser(format!(
+                        "Duplicate parameter \"{name}\" in macro definition"
+                    )));
+                }
+                if default.is_none() && parameters.iter().any(|(_, _, held)| held.is_some()) {
+                    return Err(Error::parser(
+                        "Parameter without a default follows parameter with a default",
+                    ));
+                }
+                parameters.push((name, ty, default));
+            }
+            let body = self.first(self.find(definition, "MacroDefinitionBody"));
+            let (table, body) = if self.name(body) == "TableMacroDefinition" {
+                let query = self.query(self.find(body, "SelectStatementInternal"))?;
+                (true, crate::deparse::query(&self.ast, query))
+            } else {
+                let expr = self.expr(self.find(body, "Expression"))?;
+                (false, crate::deparse::expression(&self.ast, expr))
+            };
+            overloads.push(MacroOverload { parameters, table, body });
+        }
+        let made = MacroDef {
+            name: self.name_parts(self.find(inner, "QualifiedName")),
+            drop: false,
+            table: None,
+            quiet: self.find(inner, "IfNotExists") != NONE,
+            or_replace,
+            temporary,
+            overloads,
+        };
+        Ok(self.macro_statement(made))
+    }
+
+    fn macro_statement(&mut self, made: MacroDef) -> Statement {
+        let index = self.ast.macros.len() as u32;
+        self.ast.macros.push(made);
+        Statement::Macro(index)
     }
 
     fn trigger_statement(&mut self, trigger: Trigger) -> Statement {
@@ -5080,15 +5172,19 @@ impl<'a> Transform<'a> {
         let mut args = Vec::new();
         let mut names = Vec::new();
         let mut first_named = NONE;
+        let mut misordered = None;
         let arguments = self.find(list, "FunctionArgumentList");
         if arguments != NONE {
             for kid in self.kids(arguments) {
                 let (name, arg) = self.argument(kid)?;
                 if name == NONE && !names.is_empty() {
-                    return Err(Error::binder(format!(
-                        "Positional argument '{}' cannot follow named arguments in function call.",
-                        self.text(kid)
-                    )));
+                    misordered.get_or_insert_with(|| {
+                        format!(
+                            "Positional argument '{}' cannot follow named arguments in function \
+                             call.",
+                            self.text(kid)
+                        )
+                    });
                 }
                 if name != NONE {
                     if names.is_empty() {
@@ -5110,6 +5206,49 @@ impl<'a> Transform<'a> {
         } else {
             String::new()
         };
+        // A call to a function with no parameters known here may be a call to a macro, and the
+        // pin turns a misplaced or repeated name down there in other words, so the call is kept
+        // with the sentence for the binder, which knows which one it is.
+        let special = matches!(
+            called.as_str(),
+            "struct_pack"
+                | "struct_insert"
+                | "struct_update"
+                | "unnest"
+                | "make_type"
+                | "union_value"
+                | "ifnull"
+        );
+        let unknown = over == NONE
+            && filter == NONE
+            && !special
+            && parameters::lists(&called).is_empty()
+            && parameters::variadic(&called).is_none();
+        let texts: Vec<String> =
+            names.iter().map(|&alias| self.ast.string(alias).to_string()).collect();
+        let repeated = texts.iter().enumerate().find_map(|(index, text)| {
+            let twice = texts[..index].iter().any(|before| before.eq_ignore_ascii_case(text));
+            (twice && !special).then_some(text)
+        });
+        let refused = match (misordered, repeated) {
+            (Some(message), _) => {
+                Some((message, "has positional argument following named argument".to_string()))
+            }
+            (None, Some(text)) => Some((
+                format!("Duplicate named argument \"{text}\" in function call to '\"{called}\"'"),
+                format!("has named argument repeated '\"{text}\"'"),
+            )),
+            (None, None) => None,
+        };
+        if let Some((message, said)) = refused {
+            if !unknown {
+                return Err(Error::binder(message));
+            }
+            let args = self.expr_slice(args);
+            let call = self.push(Expr::Function { name, args, distinct, filter });
+            self.ast.misnamed.push((call, message, said));
+            return Ok(call);
+        }
         let within = self.find(node, "WithinGroupClause");
         if within != NONE {
             if over != NONE {
@@ -5167,15 +5306,6 @@ impl<'a> Transform<'a> {
             };
             let positional = args.len() - names.len();
             let values = args.split_off(positional);
-            let texts: Vec<String> =
-                names.iter().map(|&alias| self.ast.string(alias).to_string()).collect();
-            for (index, text) in texts.iter().enumerate() {
-                if texts[..index].iter().any(|before| before.eq_ignore_ascii_case(text)) {
-                    return Err(Error::binder(format!(
-                        "Duplicate named argument \"{text}\" in function call to '\"{function}\"'"
-                    )));
-                }
-            }
             let written: Vec<&str> = texts.iter().map(String::as_str).collect();
             let implicit = usize::from(within != NONE);
             let targets: Vec<Target> =
@@ -7068,6 +7198,22 @@ mod tests {
                     out += " CASCADE";
                 }
                 out
+            }
+            Statement::Macro(index) => {
+                let made = ast.macro_def(index);
+                if made.drop {
+                    return format!("DROP MACRO {}", ast.name_text(made.name));
+                }
+                let bodies: Vec<String> = made
+                    .overloads
+                    .iter()
+                    .map(|overload| {
+                        let names: Vec<&str> =
+                            overload.parameters.iter().map(|(name, _, _)| name.as_str()).collect();
+                        format!("({}) AS {}", names.join(", "), overload.body)
+                    })
+                    .collect();
+                format!("CREATE MACRO {} {}", ast.name_text(made.name), bodies.join(", "))
             }
             Statement::Trigger(index) => {
                 let trigger = ast.trigger(index);

@@ -177,6 +177,20 @@ impl Binder<'_> {
                 }
                 self.union_value(&names, &bound)
             }
+            ast::Expr::Function { name, args, distinct, filter }
+                if self.catalog().macros().next().is_some()
+                    && self
+                        .catalog()
+                        .resolve_macro(&ast.name(name).collect::<Vec<_>>(), None)
+                        .is_some() =>
+            {
+                let modified = distinct || filter != NONE || !ast.aggregate_order(expr).is_empty();
+                let expanded = self.user_macro(ast, expr, name, args, modified, scope)?;
+                expanded.ok_or_else(|| Error::internal("a macro that went away while it was bound"))
+            }
+            ast::Expr::Function { .. } if let Some((message, _)) = ast.misnamed(expr) => {
+                Err(Error::binder(message))
+            }
             ast::Expr::Function { name, args, .. } if !ast.named_args(expr).is_empty() => {
                 let written = ast.name(name).last().unwrap_or_default().to_string();
                 let sorted = ast.aggregate_order(expr);
@@ -2513,6 +2527,12 @@ fn meet(left: &LogicalType, right: &LogicalType) -> Result<LogicalType> {
 /// This decides whether a select block aggregates at all, which has to be known before the target
 /// list is bound because the answer changes what every column reference in it means.
 pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
+    aggregating(ast, expr, &|_| false)
+}
+
+/// Whether an expression has an aggregate in it, where `user` says which names are macros a user
+/// made whose bodies aggregate.
+pub(crate) fn aggregating(ast: &Ast, expr: ast::ExprRef, user: &dyn Fn(&str) -> bool) -> bool {
     if expr == NONE {
         return false;
     }
@@ -2523,50 +2543,53 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
         | ast::Expr::Literal { .. }
         | ast::Expr::Parameter { .. }
         | ast::Expr::Default => false,
-        ast::Expr::Unary { operand, .. } => has_aggregate(ast, operand),
+        ast::Expr::Unary { operand, .. } => aggregating(ast, operand, user),
         ast::Expr::Binary { left, right, .. } => {
-            has_aggregate(ast, left) || has_aggregate(ast, right)
+            aggregating(ast, left, user) || aggregating(ast, right, user)
         }
         ast::Expr::Function { name, args, .. } => {
             let written = ast.name(name).last().unwrap_or_default();
             kind_of(written) == Some(FunctionKind::Aggregate)
                 || crate::macros::aggregates(written)
-                || ast.expr_list(args).iter().any(|&arg| has_aggregate(ast, arg))
+                || user(written)
+                || ast.expr_list(args).iter().any(|&arg| aggregating(ast, arg, user))
         }
-        ast::Expr::Cast { operand, .. } => has_aggregate(ast, operand),
+        ast::Expr::Cast { operand, .. } => aggregating(ast, operand, user),
         ast::Expr::Case { operand, arms, otherwise } => {
-            has_aggregate(ast, operand)
-                || has_aggregate(ast, otherwise)
+            aggregating(ast, operand, user)
+                || aggregating(ast, otherwise, user)
                 || ast
                     .arm_list(arms)
                     .iter()
-                    .any(|arm| has_aggregate(ast, arm.when) || has_aggregate(ast, arm.then))
+                    .any(|arm| aggregating(ast, arm.when, user) || aggregating(ast, arm.then, user))
         }
         ast::Expr::Between { operand, low, high, .. } => {
-            has_aggregate(ast, operand) || has_aggregate(ast, low) || has_aggregate(ast, high)
+            aggregating(ast, operand, user)
+                || aggregating(ast, low, user)
+                || aggregating(ast, high, user)
         }
         ast::Expr::In { operand, list, .. } => {
-            has_aggregate(ast, operand)
-                || ast.expr_list(list).iter().any(|&item| has_aggregate(ast, item))
+            aggregating(ast, operand, user)
+                || ast.expr_list(list).iter().any(|&item| aggregating(ast, item, user))
         }
-        ast::Expr::InSubquery { operand, .. } => has_aggregate(ast, operand),
-        ast::Expr::QuantifiedSubquery { operand, .. } => has_aggregate(ast, operand),
-        ast::Expr::Lambda { body, .. } => has_aggregate(ast, body),
+        ast::Expr::InSubquery { operand, .. } => aggregating(ast, operand, user),
+        ast::Expr::QuantifiedSubquery { operand, .. } => aggregating(ast, operand, user),
+        ast::Expr::Lambda { body, .. } => aggregating(ast, body, user),
         ast::Expr::Row { items } => {
-            ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
+            ast.expr_list(items).iter().any(|&item| aggregating(ast, item, user))
         }
         ast::Expr::List { items } | ast::Expr::Struct { values: items, .. } => {
-            ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
+            ast.expr_list(items).iter().any(|&item| aggregating(ast, item, user))
         }
         // A window call is not an aggregate and is evaluated after the grouping rather than by it,
         // but what it is given to read can be one: `sum(count(x)) OVER ()` aggregates the block.
         // The partition and the order keys count for the same reason.
         ast::Expr::Window { args, spec, order, .. } => {
             let held = ast.window(spec);
-            ast.expr_list(args).iter().any(|&arg| has_aggregate(ast, arg))
-                || ast.order_list(order).iter().any(|item| has_aggregate(ast, item.expr))
-                || ast.expr_list(held.partition).iter().any(|&key| has_aggregate(ast, key))
-                || ast.order_list(held.order).iter().any(|item| has_aggregate(ast, item.expr))
+            ast.expr_list(args).iter().any(|&arg| aggregating(ast, arg, user))
+                || ast.order_list(order).iter().any(|item| aggregating(ast, item.expr, user))
+                || ast.expr_list(held.partition).iter().any(|&key| aggregating(ast, key, user))
+                || ast.order_list(held.order).iter().any(|item| aggregating(ast, item.expr, user))
         }
         // A subquery has its own aggregation and does not make the outer block aggregate.
         ast::Expr::Subquery { .. } | ast::Expr::Exists { .. } => false,
