@@ -2661,6 +2661,13 @@ pub struct PlaceSums {
     marked: Vec<bool>,
     /// The rows the last [`Self::add_places`] added, the ones the filter dropped among them.
     added: usize,
+    /// Per accumulator of every group, the total and the rows [`Self::fold_places`] has added up
+    /// for it and not folded in yet, and by where a call sits in a group, how it is fed.
+    owed: Vec<(i128, i64)>,
+    owed_feeds: Vec<Option<Feed>>,
+    /// The groups with something in [`Self::owed`], and by group whether it is on that list.
+    owing: Vec<usize>,
+    owes: Vec<bool>,
 }
 
 impl PlaceSums {
@@ -2910,8 +2917,16 @@ impl PlaceSums {
         Ok(unseen)
     }
 
-    /// Folds the totals of each place [`Self::touched`] wrote down into the group `map` holds for
-    /// it, and leaves every cell at nothing for the next chunk.
+    /// Adds the totals of each place [`Self::touched`] wrote down to what is owed the group `map`
+    /// holds for it, and leaves every cell at nothing for the next chunk.
+    ///
+    /// Folding them into the accumulators a chunk at a time was about an eighth of q01, a hundred
+    /// instructions a group a chunk to find each state, ask what it is and check its add. What is
+    /// owed is a plain total and count per call, so a chunk adds to it with no questions asked and
+    /// [`Self::settle`] folds it in once, before anything reads the accumulators. A chunk whose
+    /// calls are fed differently from what is owed settles first.
+    ///
+    /// See `spec/perf/117-totals-owed.md`.
     ///
     /// # Errors
     ///
@@ -2923,16 +2938,79 @@ impl PlaceSums {
         states: &mut [Accumulator],
         stride: usize,
     ) -> Result<()> {
+        let alike = self.owed_feeds.len() == stride
+            && self.calls.iter().all(|&(offset, feed, _)| self.owed_feeds[offset].is_none_or(|owed| owed == feed))
+            && self.counting.iter().all(|&offset| self.owed_feeds[offset].is_none_or(|owed| owed == Feed::Counted));
+        if !alike {
+            self.settle(states)?;
+            self.owed_feeds.clear();
+            self.owed_feeds.resize(stride, None);
+        }
+        for &(offset, feed, _) in &self.calls {
+            self.owed_feeds[offset] = Some(feed);
+        }
+        for &offset in &self.counting {
+            self.owed_feeds[offset] = Some(Feed::Counted);
+        }
         let span = cell_span(self.calls.len());
         for &place in &self.touched {
             let held = map.get(place).copied().unwrap_or(UNSEEN);
             if held == UNSEEN {
                 return Err(Error::internal(format!("place {place} has rows and no group")));
             }
+            let (group, at) = (held as usize, held as usize * stride);
             let cells = &mut self.by_place[place * span..][..span];
-            fold_cells(&self.calls, &self.counting, cells, states, held as usize * stride)?;
+            let count = cells[self.calls.len()];
+            if count != 0 {
+                if self.owed.len() < at + stride {
+                    self.owed.resize(at + stride, (0, 0));
+                }
+                let owed = &mut self.owed[at..at + stride];
+                for (&total, &(offset, feed, base)) in cells.iter().zip(&self.calls) {
+                    let number = i128::from(total) + i128::from(base) * i128::from(count);
+                    let (sum, rows) = &mut owed[offset];
+                    match sum.checked_add(number) {
+                        Some(added) => (*sum, *rows) = (added, *rows + count),
+                        None => fold_wide(states, at + offset, feed, number, count)?,
+                    }
+                }
+                for &offset in &self.counting {
+                    owed[offset].1 += count;
+                }
+                if self.owes.len() <= group {
+                    self.owes.resize(group + 1, false);
+                }
+                if !self.owes[group] {
+                    self.owes[group] = true;
+                    self.owing.push(group);
+                }
+            }
             cells.fill(0);
         }
+        Ok(())
+    }
+
+    /// Folds everything [`Self::fold_places`] still owes into the accumulators, which is asked
+    /// before anything reads them or moves the groups.
+    ///
+    /// # Errors
+    ///
+    /// The overflow a total raises, and an internal error for a group with no state for a call.
+    pub fn settle(&mut self, states: &mut [Accumulator]) -> Result<()> {
+        let stride = self.owed_feeds.len();
+        for &group in &self.owing {
+            self.owes[group] = false;
+            for (offset, feed) in self.owed_feeds.iter().enumerate() {
+                let at = group * stride + offset;
+                let (number, count) = mem::take(&mut self.owed[at]);
+                if let Some(feed) = *feed
+                    && count != 0
+                {
+                    fold_wide(states, at, feed, number, count)?;
+                }
+            }
+        }
+        self.owing.clear();
         Ok(())
     }
 }
@@ -3582,7 +3660,7 @@ impl Where<'_> {
 }
 
 /// What one run of values is read as on the way into many accumulators.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Feed {
     /// A count of the rows that are not null, which reads the mask and not the data.
     Counted,
@@ -6456,7 +6534,8 @@ mod tests {
         }
         // Added up by place with the map left out of the pass, the group it has no slot for is
         // found after the pass, and the answers are the same again. Two more chunks go through
-        // the same cells to show the fold left them at nothing.
+        // the same cells to show the fold left them at nothing, and what they owe is settled once
+        // between the second and the third and once at the end.
         let mut each_place = fresh();
         assert!(sums.adds_by_place(groups, rows), "a map of four places over {rows} rows");
         assert!(!sums.adds_by_place(rows / 2, rows), "a map of half the rows");
@@ -6478,11 +6557,17 @@ mod tests {
             assert_eq!(sums.touched(&map).expect("looks"), chunk == 0, "chunk {chunk}");
             map[2] = 2;
             sums.fold_places(&map, &mut each_place, stride).expect("folds them in");
+            assert!(!sums.owing.is_empty(), "chunk {chunk} owes nothing");
+            if chunk == 1 {
+                sums.settle(&mut each_place).expect("settles");
+            }
             for at in elsewhere {
                 update_scattered(&mut each_place, &slots, stride, at, inputs[at], rows)
                     .expect("folds it");
             }
         }
+        sums.settle(&mut each_place).expect("settles");
+        assert!(sums.owing.is_empty() && sums.owed.iter().all(|&owed| owed == (0, 0)));
         let mut thrice = fresh();
         for _ in 0..3 {
             for (at, &input) in inputs.iter().enumerate() {
