@@ -548,7 +548,7 @@ impl Domain {
     /// in one run, and a chunk of it covers a short stretch of keys. Only the keys the bitmap holds
     /// in that stretch can be kept, and each one's run is found by a binary search. In TPC-H q02
     /// the part filter keeps 747 of 200,000 parts, about seven keys in a chunk of eight thousand
-    /// rows, and testing every row of `partsupp` twice was the largest cost in the query.
+    /// rows, and testing every row of `partsupp` twice was a sixth of the instructions the query ran.
     ///
     /// The keys the bitmap holds in the stretch are counted first, out of a few words of it, and
     /// only a chunk with few of them is checked for its order, so a chunk of keys in no order
@@ -599,8 +599,10 @@ impl Domain {
             while set != 0 {
                 let key = i128::from(base) + (at * 64) as i128 + i128::from(set.trailing_zeros());
                 set &= set - 1;
-                let start = from + values[from..].partition_point(|&value| i128::from(value.into()) < key);
-                let end = start + values[start..].partition_point(|&value| i128::from(value.into()) == key);
+                let start =
+                    from + values[from..].partition_point(|&value| i128::from(value.into()) < key);
+                let end = start
+                    + values[start..].partition_point(|&value| i128::from(value.into()) == key);
                 for row in start..end {
                     bits[row / 64] |= 1 << (row % 64);
                 }
@@ -628,7 +630,10 @@ const SORTED_ROWS_A_KEY: usize = 32;
 fn ascending<T: Copy + Into<i64>>(values: &[T]) -> bool {
     let Some(pairs) = values.len().checked_sub(1) else { return true };
     values[..pairs].chunks(256).zip(values[1..].chunks(256)).all(|(before, after)| {
-        before.iter().zip(after).fold(true, |up, (&before, &after)| up & (before.into() <= after.into()))
+        before
+            .iter()
+            .zip(after)
+            .fold(true, |up, (&before, &after)| up & (before.into() <= after.into()))
     })
 }
 
@@ -2252,7 +2257,10 @@ mod tests {
         check(runs.clone(), "runs of four in order");
         let mut shuffled = runs.clone();
         shuffled.swap(10, 5_000);
-        assert!(domain.over_sorted(&shuffled, 0).is_none(), "out of order is tested a row at a time");
+        assert!(
+            domain.over_sorted(&shuffled, 0).is_none(),
+            "out of order is tested a row at a time"
+        );
         check(shuffled, "two keys swapped");
         let wide: Vec<i64> = (0..8_000).map(|row| row * 5 / 4).collect();
         check(wide, "a stretch past the words a chunk this long reads");
