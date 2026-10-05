@@ -38,8 +38,8 @@ use std::cmp::Ordering;
 use std::str::FromStr;
 
 use rudb_common::{
-    Error, ErrorCode, Field, LogicalType, PhysicalType, Result, SessionTimeZone, Value, bit,
-    civil_from_days, days_from_civil, implicit, time_tz, uuid,
+    Error, ErrorCode, Field, LogicalType, PhysicalType, Result, SessionTimeZone, Value, bignum,
+    bit, civil_from_days, days_from_civil, implicit, time_tz, uuid,
 };
 use rudb_vector::{Data, Form, Vector};
 
@@ -943,6 +943,12 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
     if matches!(target, LogicalType::Union(_)) {
         return cast_to_union(value, &value.logical_type(), target, try_cast);
     }
+    if matches!(target, LogicalType::BigNum) || matches!(value, Value::BigNum(_)) {
+        return match bignum_cast(value, target) {
+            Err(error) if try_cast && recoverable(&error) => Ok(Value::Null),
+            answer => answer,
+        };
+    }
     if let Value::Varchar(text) = value
         && let Some(answer) = from_text(text, target, try_cast)
     {
@@ -1493,6 +1499,20 @@ fn to_boolean(value: &Value) -> Result<Value> {
 /// says which whole it rounded to, and a number that was already a number says it is out of range.
 fn to_integer(value: &Value, target: &LogicalType) -> Result<Value> {
     if let Value::Varchar(text) = value {
+        if let Some(digits) =
+            unsigned(target).then(|| text.trim_start().strip_prefix('-')).flatten()
+        {
+            // A sign in front of an unsigned number is read upstream only when every digit after it
+            // is a zero, so `'-00'` is zero and `'-0.4'`, `'-0e3'` and `'-0 '` are not a number.
+            if digits.is_empty() || !digits.bytes().all(|digit| digit == b'0') {
+                return Err(not_convertible(text, target));
+            }
+            return fit(0, target).ok_or_else(|| not_convertible(text, target));
+        }
+        if *target == LogicalType::UHugeInt {
+            let whole = parse_magnitude(text).ok_or_else(|| not_convertible(text, target))?;
+            return Ok(Value::UHugeInt(whole));
+        }
         let whole = parse_integer(text).ok_or_else(|| not_convertible(text, target))?;
         return fit(whole, target).ok_or_else(|| not_convertible(text, target));
     }
@@ -1546,9 +1566,32 @@ fn rounded(value: &Value, target: &LogicalType) -> Result<i128> {
 /// would have rounded it to first.
 fn parse_integer(text: &str) -> Option<i128> {
     if let Some(whole) = parse_radix(text) {
-        return Some(whole);
+        return i128::try_from(whole).ok();
     }
     shifted(&written_number(text)?, 0)
+}
+
+/// A written number that is not negative, as wide as a `UHUGEINT`, which is the one target whose
+/// range goes past what `parse_integer` gives back.
+fn parse_magnitude(text: &str) -> Option<u128> {
+    if let Some(whole) = parse_radix(text) {
+        return Some(whole);
+    }
+    let written = written_number(text)?;
+    let whole = magnitude(&written, 0)?;
+    (!written.negative || whole == 0).then_some(whole)
+}
+
+/// Whether a target is one of the unsigned integers.
+fn unsigned(target: &LogicalType) -> bool {
+    matches!(
+        target,
+        LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt
+            | LogicalType::UHugeInt
+    )
 }
 
 /// `0x` and `0b`, which are whole number spellings only.
@@ -1558,7 +1601,7 @@ fn parse_integer(text: &str) -> Option<i128> {
 /// is trimmed of, so `' 0x10 '` is refused where `' 16 '` is not. There is no `0o` for octal, which
 /// reads like an oversight upstream and is reproduced rather than tidied up, because a spelling we
 /// accept and DuckDB refuses is as much of a difference as one we refuse and it accepts.
-fn parse_radix(text: &str) -> Option<i128> {
+fn parse_radix(text: &str) -> Option<u128> {
     let (radix, digits) = match text.get(..2)? {
         "0x" | "0X" => (16, &text[2..]),
         "0b" | "0B" => (2, &text[2..]),
@@ -1570,7 +1613,7 @@ fn parse_radix(text: &str) -> Option<i128> {
         // the second half of that is for.
         return None;
     }
-    i128::from_str_radix(&digits, radix).ok()
+    u128::from_str_radix(&digits, radix).ok()
 }
 
 /// A written number pulled apart into the pieces that decide what it is worth.
@@ -1640,12 +1683,18 @@ fn without_separators(text: &str, digit: fn(&u8) -> bool) -> Option<Cow<'_, str>
 /// decimal, which asks for the decimal's scale. They are the same question because an integer is a
 /// decimal whose scale is zero, which is the pivot this whole file is built around.
 fn shifted(written: &Written, places: i32) -> Option<i128> {
+    let whole = magnitude(written, places)?;
+    if written.negative { 0i128.checked_sub_unsigned(whole) } else { i128::try_from(whole).ok() }
+}
+
+/// What a written number is worth with its point moved `places` to the right, without its sign.
+fn magnitude(written: &Written, places: i32) -> Option<u128> {
     let digits = written.digits.trim_start_matches('0');
     let shift = written.exponent.checked_sub(written.scale)?.checked_add(places)?;
     let whole = if digits.is_empty() {
         0
     } else if let Ok(zeros) = usize::try_from(shift) {
-        // An `i128` holds thirty nine digits, so a number longer than that has already left the
+        // A `u128` holds thirty nine digits, so a number longer than that has already left the
         // range of every target, and checking it first keeps the string below from being enormous.
         if digits.len() + zeros > 39 {
             return None;
@@ -1654,22 +1703,22 @@ fn shifted(written: &Written, places: i32) -> Option<i128> {
     } else {
         cut(digits, usize::try_from(shift.checked_neg()?).ok()?)?
     };
-    Some(if written.negative { -whole } else { whole })
+    Some(whole)
 }
 
 /// The digits with the last `dropped` of them taken off, rounded half away from zero.
 ///
 /// Away from zero and not to even, so `'0.5'` is one and `'-0.5'` is minus one, which is the rule
 /// the decimal to integer cast in this file already follows and the rule DuckDB follows everywhere.
-fn cut(digits: &str, dropped: usize) -> Option<i128> {
+fn cut(digits: &str, dropped: usize) -> Option<u128> {
     let Some(kept) = digits.len().checked_sub(dropped) else {
         // Everything was dropped and the first digit that went is not the one that decides, so the
         // number is smaller than a half of whatever it was.
         return Some(0);
     };
-    let whole: i128 = if kept == 0 { 0 } else { digits[..kept].parse().ok()? };
+    let whole: u128 = if kept == 0 { 0 } else { digits[..kept].parse().ok()? };
     let rounds_up = digits.as_bytes().get(kept).is_some_and(|digit| *digit >= b'5');
-    whole.checked_add(i128::from(rounds_up))
+    whole.checked_add(u128::from(rounds_up))
 }
 
 /// A number too big for a float is an infinity when it was written as a string and a failure when
@@ -1764,6 +1813,69 @@ fn parse_decimal(text: &str, scale: u8) -> Option<i128> {
 
 /// A value as a bit string, which for a number is the bytes of it big end first, so a `TINYINT` is
 /// eight bits and a `DOUBLE` the sixty four of its IEEE layout, as the pin does it.
+/// A cast into or out of `BIGNUM`, which the pin has from and to the integers, the floats and text
+/// and from nothing else.
+///
+/// A string is read by [`bignum::from_text`], a float loses its fraction rather than being rounded,
+/// and the refusals are worded as the pin words them, which names `VARCHAR` where it means
+/// `BIGNUM` because the pin goes through text on the way.
+fn bignum_cast(value: &Value, target: &LogicalType) -> Result<Value> {
+    if let Value::BigNum(held) = value {
+        return match target {
+            LogicalType::Varchar => Ok(Value::Varchar(bignum::to_text(held))),
+            LogicalType::Double => bignum::to_f64(held).map(Value::Double).ok_or_else(|| {
+                Error::conversion(format!(
+                    "Could not convert bignum '{}' to Double",
+                    bignum::to_text(held)
+                ))
+            }),
+            _ if target.is_integer() => {
+                let (negative, magnitude) = bignum::to_u128(held).map_err(too_big_a_bignum)?;
+                let whole = if negative {
+                    0_i128.checked_sub_unsigned(magnitude)
+                } else {
+                    i128::try_from(magnitude).ok()
+                };
+                let fitted = match (target, whole) {
+                    (LogicalType::UHugeInt, _) if !negative => Some(Value::UHugeInt(magnitude)),
+                    (_, Some(whole)) => fit(whole, target),
+                    (_, None) => None,
+                };
+                fitted.ok_or_else(|| too_big_a_bignum(negative))
+            }
+            _ => Err(no_cast(value, target)),
+        };
+    }
+    let held = match value {
+        Value::Varchar(text) => bignum::parse(text)?,
+        Value::UHugeInt(whole) => bignum::from_u128(*whole),
+        Value::Float(_) | Value::Double(_) => {
+            let number = approximate(value).unwrap_or(f64::NAN);
+            bignum::from_f64(number).ok_or_else(|| {
+                Error::conversion(format!(
+                    "Type {} with value {value} can't be cast to the destination type VARCHAR",
+                    value.logical_type()
+                ))
+            })?
+        }
+        Value::Boolean(_) => return Err(no_cast(value, target)),
+        _ => match integral(value) {
+            Some(whole) => bignum::from_i128(whole),
+            None => return Err(no_cast(value, target)),
+        },
+    };
+    Ok(Value::BigNum(held))
+}
+
+/// The pin's refusal of a `BIGNUM` that does not fit an integer type, which does not name the type.
+fn too_big_a_bignum(negative: bool) -> Error {
+    Error::out_of_range(if negative {
+        "Negative bignum too small for type"
+    } else {
+        "Positive bignum too large for type"
+    })
+}
+
 fn to_bit(value: &Value) -> Result<Value> {
     let bytes = match value {
         Value::Varchar(text) => return Ok(Value::Bit(bit::from_text(text)?)),
@@ -3423,6 +3535,37 @@ mod tests {
         ] {
             cast_to(Value::Varchar(text.into()), &target).expect_err("this does not fit");
         }
+    }
+
+    /// A `UHUGEINT` is read as wide as it goes, in every spelling, and a sign in front of any
+    /// unsigned number is read only when the digits after it are all zeros.
+    #[test]
+    fn a_written_unsigned_number_reads_its_whole_range_and_a_sign_only_before_zeros() {
+        let max = u128::MAX;
+        for text in [
+            "340282366920938463463374607431768211455",
+            " 340282366920938463463374607431768211455 ",
+            "340282366920938463463374607431768211454.5",
+            "340_282366920938463463374607431768211455",
+            "0xffffffffffffffffffffffffffffffff",
+        ] {
+            let read = cast_to(Value::Varchar(text.into()), &LogicalType::UHugeInt);
+            assert_eq!(read.expect(text), Value::UHugeInt(max), "{text}");
+        }
+        let read = cast_to(Value::Varchar("3e38".into()), &LogicalType::UHugeInt).expect("3e38");
+        assert_eq!(read, Value::UHugeInt(3 * 10u128.pow(38)));
+        for (text, target) in [("-00", LogicalType::UTinyInt), (" -0", LogicalType::UHugeInt)] {
+            let read = cast_to(Value::Varchar(text.into()), &target).expect(text);
+            assert_eq!(read.to_string(), "0", "{text}");
+        }
+        for text in ["-0.4", "-0.0", "-0e3", "-0 ", "-0_0", "-.0", "-1"] {
+            cast_to(Value::Varchar(text.into()), &LogicalType::UTinyInt).expect_err(text);
+        }
+        let text = "340282366920938463463374607431768211456";
+        cast_to(Value::Varchar(text.into()), &LogicalType::UHugeInt).expect_err(text);
+        let text = "-170141183460469231731687303715884105728";
+        let read = cast_to(Value::Varchar(text.into()), &LogicalType::HugeInt).expect(text);
+        assert_eq!(read, Value::HugeInt(i128::MIN));
     }
 
     /// A double and a decimal take the point, the exponent and the separator that a whole number

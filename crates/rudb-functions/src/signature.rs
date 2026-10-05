@@ -1847,6 +1847,24 @@ const fn made(name: &'static str) -> Entry {
     }
 }
 
+/// The arguments and the answer of the calls the pin keeps a `BIGNUM` for, which are adding,
+/// subtracting, negating and summing, or `None` for any other call.
+///
+/// An integer, a `FLOAT` or a null next to one goes into a `BIGNUM` too. A `DOUBLE` or a decimal
+/// does not, and that call is left to go through a double.
+fn bignummed(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{BigNum, Float, Null};
+    if !arguments.contains(&BigNum) {
+        return None;
+    }
+    let fits = |ty: &LogicalType| ty.is_integer() || matches!(ty, BigNum | Float | Null);
+    match (name, arguments) {
+        ("+" | "-", [_, _]) if arguments.iter().all(fits) => Some((vec![BigNum, BigNum], BigNum)),
+        ("-" | "sum", [BigNum]) => Some((vec![BigNum], BigNum)),
+        _ => None,
+    }
+}
+
 /// A scalar over bit strings.
 const fn bits(name: &'static str, arity: Arity) -> Entry {
     Entry { name, kind: FunctionKind::Scalar, arity, shape: Shape::Bits, numeric_only: false }
@@ -2062,6 +2080,18 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             arguments: vec![LogicalType::Integer],
             returns: LogicalType::HugeInt,
         });
+    }
+    if let Some((cast_to, returns)) = bignummed(entry.name, arguments) {
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
+    // Anything else numeric over a number of any size goes through a double, which is the one
+    // implicit cast the pin has out of one, so `big * 2` and `abs(big)` answer a double.
+    if entry.numeric_only && arguments.contains(&LogicalType::BigNum) {
+        let doubles: Vec<LogicalType> = arguments
+            .iter()
+            .map(|ty| if *ty == LogicalType::BigNum { LogicalType::Double } else { ty.clone() })
+            .collect();
+        return resolved(name, &doubles).map_err(|_| no_match(entry.name, arguments));
     }
     if entry.numeric_only {
         for ty in arguments {

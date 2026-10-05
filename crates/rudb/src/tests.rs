@@ -2328,7 +2328,7 @@ fn a_null_map_is_a_value_now_rather_than_an_unwritten_vector() {
 #[test]
 fn the_types_table_answers_a_query_a_client_would_actually_write() {
     let db = database();
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_types()"), vec![vec![Value::BigInt(94)]]);
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_types()"), vec![vec![Value::BigInt(96)]]);
     // A client reading this table is asking whether the engine has a type, so the useful query is a
     // name lookup, and it has to work through the where clause rather than only over the whole
     // table.

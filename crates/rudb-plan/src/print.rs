@@ -822,6 +822,7 @@ mod tests {
             LogicalType::Varchar,
             LogicalType::Blob,
             LogicalType::Bit,
+            LogicalType::BigNum,
             LogicalType::Uuid,
             LogicalType::Date,
             LogicalType::Time,

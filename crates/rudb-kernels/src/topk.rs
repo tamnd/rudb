@@ -523,7 +523,7 @@ pub(crate) fn sort_key(value: &Value, out: &mut Vec<u8>) {
             out.extend(text.bytes().map(|byte| byte.wrapping_add(1)));
             out.push(0);
         }
-        Value::Blob(data) | Value::Bit(data) => {
+        Value::Blob(data) | Value::Bit(data) | Value::BigNum(data) => {
             for &byte in data {
                 if byte <= 1 {
                     out.push(1);

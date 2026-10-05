@@ -3176,6 +3176,7 @@ fn rank(ty: &LogicalType) -> u32 {
         Bit => 100,
         Blob => 101,
         Uuid => 102,
+        BigNum => 103,
         Struct(_) => 125,
         List(_) | Array(..) => 126,
         Map(..) => 127,
@@ -3488,12 +3489,12 @@ fn number(text: &str, negative: bool) -> Result<Value> {
         if let Ok(value) = written.parse::<i128>() {
             return Ok(Value::HugeInt(value));
         }
-        // Past a HUGEINT and inside a UHUGEINT the pin reads a UHUGEINT, and past that a BIGNUM,
-        // which is a double here.
+        // Past a HUGEINT and inside a UHUGEINT the pin reads a UHUGEINT, and past that, or below
+        // the smallest HUGEINT, a BIGNUM.
         if let Ok(value) = written.parse::<u128>() {
             return Ok(Value::UHugeInt(value));
         }
-        return Ok(Value::Double(written.parse::<f64>().map_err(|_| unreadable())?));
+        return rudb_common::bignum::from_text(&written).map(Value::BigNum).ok_or_else(unreadable);
     };
     // The last dot is the decimal point and every other one counts as a digit of the width, which
     // is upstream's arithmetic and the reason `1.2.3` asks for `DECIMAL(4,1)` off three digits.

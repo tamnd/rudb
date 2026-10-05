@@ -2648,7 +2648,7 @@ fn dictionary_tag(ty: &LogicalType) -> u8 {
 /// a column nobody else can help with.
 fn weight(ty: &LogicalType) -> usize {
     match ty {
-        LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit => 64,
+        LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit | LogicalType::BigNum => 64,
         LogicalType::HugeInt
         | LogicalType::UHugeInt
         | LogicalType::Uuid
@@ -10288,6 +10288,7 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::Uuid => Ok(22),
         LogicalType::Blob => Ok(23),
         LogicalType::Bit => Ok(24),
+        LogicalType::BigNum => Ok(28),
         LogicalType::TimestampS => Ok(25),
         LogicalType::TimestampMs => Ok(26),
         LogicalType::TimestampNs => Ok(27),
@@ -10346,6 +10347,7 @@ fn tag_type(tag: u8) -> Result<LogicalType> {
         22 => Ok(LogicalType::Uuid),
         23 => Ok(LogicalType::Blob),
         24 => Ok(LogicalType::Bit),
+        28 => Ok(LogicalType::BigNum),
         25 => Ok(LogicalType::TimestampS),
         26 => Ok(LogicalType::TimestampMs),
         27 => Ok(LogicalType::TimestampNs),
@@ -13784,7 +13786,10 @@ fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
         // one: an offset a value and then the bytes. What is not the same is that nothing here may
         // read the payload as text, which is why this arm asks the column for bytes rather than for
         // a string, and why the codecs above that do read text are all asked of a varchar by name.
-        (LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit, Data::Varlen(values)) => {
+        (
+            LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit | LogicalType::BigNum,
+            Data::Varlen(values),
+        ) => {
             let mut bytes = Vec::new();
             put_u32(&mut out, 0);
             for row in 0..vector.len() {
@@ -15660,7 +15665,7 @@ fn decode(
                 )
             }
         },
-        LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit => {
+        LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit | LogicalType::BigNum => {
             let offset_bytes = cur
                 .take((rows + 1).checked_mul(4).ok_or_else(|| invalid("offset count overflow"))?)?;
             let offsets = offset_bytes

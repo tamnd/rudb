@@ -16,7 +16,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use rudb_common::{Error, LogicalType, Result, StateKey, StateType, Value};
+use rudb_common::{Error, LogicalType, Result, StateKey, StateType, Value, bignum};
 
 use crate::aggregate::Accumulator;
 use crate::aggregate::export::Merge;
@@ -51,6 +51,9 @@ pub(crate) enum General {
     Bits { held: Option<i128>, op: BitOp, returns: LogicalType },
     /// `bit_and`, `bit_or` and `bit_xor` over bit strings, which all have to be one length.
     BitString { held: Option<Vec<u8>>, op: BitOp },
+    /// `sum` over `BIGNUM`, which has no total too wide to keep, in the layout of
+    /// [`rudb_common::bignum`].
+    BigSum { held: Option<Vec<u8>> },
     /// `bitstring_agg`, in [`crate::bitstring`].
     Gathered(Gathered),
     /// `approx_count_distinct`, in [`crate::hash`].
@@ -171,6 +174,9 @@ impl General {
                 Self::Bits { held: None, op, returns: returns.clone() }
             }
         };
+        if name == "sum" && *returns == LogicalType::BigNum {
+            return Some(Self::BigSum { held: None });
+        }
         if let Some(state) = ArgExtreme::named(name) {
             return Some(Self::Arg { state: Box::new(state), returns: returns.clone() });
         }
@@ -313,6 +319,12 @@ impl General {
                     (Some(so_far), BitOp::Xor) => so_far ^ bits,
                 });
             }
+            Self::BigSum { held } => match (value, held.as_mut()) {
+                (Value::Null, _) => {}
+                (Value::BigNum(number), None) => *held = Some(number.clone()),
+                (Value::BigNum(number), Some(so_far)) => *so_far = bignum::add(so_far, number),
+                _ => return Err(unexpected("sum", value)),
+            },
             Self::BitString { held, op } => {
                 let Value::Bit(bits) = value else { return Err(unexpected("bit_and", value)) };
                 match held {
@@ -614,6 +626,14 @@ impl General {
                     (here, there) => here.or(there),
                 };
             }
+            (Self::BigSum { held }, Self::BigSum { held: theirs }) => {
+                if let Some(there) = theirs {
+                    *held = Some(match held.as_ref() {
+                        Some(here) => bignum::add(here, there),
+                        None => there.clone(),
+                    });
+                }
+            }
             (Self::BitString { held, op }, Self::BitString { held: theirs, .. }) => {
                 match (held.as_mut(), theirs) {
                     (Some(here), Some(there)) => fold_bits(here, there, *op)?,
@@ -770,6 +790,7 @@ impl General {
             }
             Self::Binned(state) => state.finish(),
             Self::BitString { held, .. } => held.clone().map_or(Value::Null, Value::Bit),
+            Self::BigSum { held } => held.clone().map_or(Value::Null, Value::BigNum),
             Self::Gathered(state) => state.finish(),
             Self::Sketched(sketch) => Value::BigInt(sketch.count()),
             Self::Top { top, element } => top.finish(element),

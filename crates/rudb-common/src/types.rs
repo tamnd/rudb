@@ -112,6 +112,8 @@ pub enum LogicalType {
     Blob,
     /// `BIT`, a bit string.
     Bit,
+    /// `BIGNUM`, an integer of any size, kept in the pin's layout, which [`crate::bignum`] reads.
+    BigNum,
     /// `UUID`.
     Uuid,
     /// `DATE`, days since 1970-01-01.
@@ -391,7 +393,7 @@ impl LogicalType {
                 10..=18 => PhysicalType::Int64,
                 _ => PhysicalType::Int128,
             },
-            Self::Varchar | Self::Blob | Self::Bit | Self::Type | Self::Json => {
+            Self::Varchar | Self::Blob | Self::Bit | Self::BigNum | Self::Type | Self::Json => {
                 PhysicalType::Varlen
             }
             Self::Interval => PhysicalType::Interval,
@@ -651,6 +653,13 @@ impl LogicalType {
                 let union = if matches!(self, Self::Union(_)) { self } else { other };
                 crate::implicit::cost(value, union).map(|_| union.clone())
             }
+            // A number of any size meets an integer or a `FLOAT` as itself, the float losing its
+            // fraction, and a `DOUBLE` as the double, and meets a decimal at nothing, which is all
+            // the pin's.
+            (Self::BigNum, ty) | (ty, Self::BigNum) if ty.is_integer() || *ty == Self::Float => {
+                Some(Self::BigNum)
+            }
+            (Self::BigNum, Self::Double) | (Self::Double, Self::BigNum) => Some(Self::Double),
             _ if self.is_numeric() && other.is_numeric() => {
                 Some(promote_numeric(self.clone(), other.clone()))
             }
@@ -771,6 +780,7 @@ impl fmt::Display for LogicalType {
             Self::Varchar => f.write_str("VARCHAR"),
             Self::Blob => f.write_str("BLOB"),
             Self::Bit => f.write_str("BIT"),
+            Self::BigNum => f.write_str("BIGNUM"),
             Self::Uuid => f.write_str("UUID"),
             Self::Date => f.write_str("DATE"),
             Self::Time => f.write_str("TIME"),
@@ -1465,6 +1475,7 @@ fn alias(upper: &str) -> Option<LogicalType> {
         "VARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING" | "NVARCHAR" => LogicalType::Varchar,
         "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => LogicalType::Blob,
         "BIT" | "BITSTRING" => LogicalType::Bit,
+        "BIGNUM" | "VARINT" => LogicalType::BigNum,
         "UUID" | "GUID" => LogicalType::Uuid,
         "TYPE" => LogicalType::Type,
         "JSON" => LogicalType::Json,
@@ -1659,6 +1670,7 @@ mod tests {
             LogicalType::Varchar,
             LogicalType::Blob,
             LogicalType::Bit,
+            LogicalType::BigNum,
             LogicalType::Uuid,
             LogicalType::Type,
             LogicalType::Json,

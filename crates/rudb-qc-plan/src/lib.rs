@@ -400,6 +400,7 @@ pub fn supported(ty: &LogicalType) -> bool {
         | LogicalType::Uuid
         | LogicalType::TimeTz
         | LogicalType::Bit
+        | LogicalType::BigNum
         | LogicalType::Interval => false,
         other => matches!(
             other.physical(),

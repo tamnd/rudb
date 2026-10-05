@@ -191,7 +191,7 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
         Value::Float(x) => canonical(f64::from(*x)).hash(state),
         Value::Double(x) => canonical(*x).hash(state),
         Value::Varchar(x) => x.hash(state),
-        Value::Blob(x) | Value::Bit(x) => x.hash(state),
+        Value::Blob(x) | Value::Bit(x) | Value::BigNum(x) => x.hash(state),
         Value::Decimal { unscaled, width, scale } => {
             unscaled.hash(state);
             width.hash(state);
