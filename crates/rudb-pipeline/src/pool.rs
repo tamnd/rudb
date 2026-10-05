@@ -157,6 +157,23 @@ impl Pool {
         if self.yielding && wanted > 0 {
             wanted = wanted.min(idle_cores());
         }
+        self.lend(wanted)
+    }
+
+    /// Borrow up to `want` threads the same way, but as many as the pool has free however busy the
+    /// machine is, which is what a load asks for.
+    ///
+    /// A yielding pool gives up threads because a short pipeline ends at a barrier that waits for
+    /// its slowest worker. A load is not short. It reads a file in thousands of morsels, a worker
+    /// that was descheduled takes fewer of them, and the wait at the end is one morsel and not a
+    /// share of the pipeline. On the JOB bench machine at a load of about 25 the load took 174.7 s
+    /// without yielding and 200.6 and 209.8 s with it, `cast_info` 38.4 s against 52.0 and 58.3.
+    #[must_use]
+    pub fn lease_all(&self, want: usize) -> Lease<'_> {
+        self.lend(want.saturating_sub(1))
+    }
+
+    fn lend(&self, wanted: usize) -> Lease<'_> {
         let mut busy = self.busy.load(Ordering::Relaxed);
         loop {
             let spare = self.threads().saturating_sub(1).saturating_sub(busy);

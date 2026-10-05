@@ -6289,7 +6289,7 @@ impl Shared {
                             &session,
                             sink,
                         )?;
-                        query.run(cancel, &self.inner.pool)?;
+                        query.run_loading(cancel, &self.inner.pool)?;
                         drop(query);
                         drop(reading);
                         let reader = rudb_native::Catalog::open(path)?.table(&table)?;
@@ -6529,7 +6529,7 @@ impl Shared {
                             &session,
                             Arc::<NativeSink>::clone(&sink),
                         )?;
-                        let ran = query.run(cancel, &self.inner.pool);
+                        let ran = query.run_loading(cancel, &self.inner.pool);
                         drop(query);
                         let repeated = sink.repeated.load(Ordering::Relaxed);
                         drop(sink);

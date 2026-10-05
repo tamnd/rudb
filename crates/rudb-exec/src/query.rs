@@ -141,13 +141,28 @@ impl<'a> Query<'a> {
     /// if the token says to stop. The check is per chunk, in the driver, which is why no operator
     /// here holds a token of its own except the join, whose nested loop can outlive a chunk.
     pub fn run(&self, cancel: &Cancel, pool: &Pool) -> Result<()> {
+        self.drive(cancel, pool, true)
+    }
+
+    /// Runs every pipeline the same way, on every thread the pool has free however busy the
+    /// machine is, which is how a load into a table runs. See [`Pool::lease_all`].
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Query::run`].
+    pub fn run_loading(&self, cancel: &Cancel, pool: &Pool) -> Result<()> {
+        self.drive(cancel, pool, false)
+    }
+
+    fn drive(&self, cancel: &Cancel, pool: &Pool, yielding: bool) -> Result<()> {
         for (pipeline, driver) in self.pipelines.iter().zip(&self.drivers) {
             // Both numbers out of one call, because asking is what makes the source read its
             // statistics and cut its morsels. See [`Pipeline::widths`]. The ceiling and not the
             // setting, so a scan on a busy machine does not plan for threads it will not get. See
             // [`Pool::ceiling`].
-            let (wanted, width) = pipeline.widths(pool.ceiling());
-            let lease = pool.lease(width);
+            let ceiling = if yielding { pool.ceiling() } else { pool.threads() };
+            let (wanted, width) = pipeline.widths(ceiling);
+            let lease = if yielding { pool.lease(width) } else { pool.lease_all(width) };
             let degree = wanted.min(lease.degree());
             let spread = {
                 let _running = driver.running();

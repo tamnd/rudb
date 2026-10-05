@@ -1395,6 +1395,16 @@ fn a_yielding_pool_still_lends_the_caller_and_never_more_than_it_has() {
 }
 
 #[test]
+fn a_load_borrows_every_free_thread_of_a_yielding_pool_however_busy_the_machine_is() {
+    let pool = Pool::new(4).yielding();
+    let load = pool.lease_all(16);
+    assert_eq!(load.degree(), 4);
+    assert_eq!(pool.lease_all(16).degree(), 1);
+    drop(load);
+    assert_eq!(pool.lease_all(2).degree(), 2);
+}
+
+#[test]
 fn a_pool_that_does_not_yield_plans_for_every_thread_it_has_and_a_yielding_one_for_at_most_that() {
     assert_eq!(Pool::new(4).ceiling(), 4);
     assert!((1..=4).contains(&Pool::new(4).yielding().ceiling()));
