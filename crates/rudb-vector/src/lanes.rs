@@ -203,6 +203,112 @@ pub(crate) fn unpack(bytes: &[u8], width: usize, out: &mut [u64; 64]) {
     }
 }
 
+/// The codes of one group of eight at `first`, each in a 32 bit lane, for a side whose table,
+/// shift, mask and half are the ones [`within_words`] sets up for its width.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+#[allow(unsafe_code)]
+unsafe fn group_codes(
+    first: *const u8,
+    half: usize,
+    shuffle: std::arch::x86_64::__m256i,
+    shifts: std::arch::x86_64::__m256i,
+    mask: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::{
+        _mm_loadu_si128, _mm256_and_si256, _mm256_set_m128i, _mm256_shuffle_epi8,
+        _mm256_srlv_epi32,
+    };
+    // SAFETY: the caller has the sixteen bytes at `first` and at `first + half` to read, and
+    // `loadu` has no alignment requirement.
+    unsafe {
+        let lanes =
+            _mm256_set_m128i(_mm_loadu_si128(first.add(half).cast()), _mm_loadu_si128(first.cast()));
+        _mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(lanes, shuffle), shifts), mask)
+    }
+}
+
+/// Each word of `words` set or narrowed to the rows of its block where the code of `left` stands
+/// to the code of `right` plus `shift` as the three flags say, which is how two packed columns of
+/// one chunk are compared with each other without either being unpacked.
+///
+/// The test is `right + shift > left` with `SWAP`, `left > right + shift` without it, `==` in place
+/// of `>` with `EQUAL`, and the answer turned round with `NOT`, which between them make all six
+/// orders. A code is below 2^25 and the caller keeps `shift` below 2^30 either way, so both sides
+/// fit a signed lane and one signed compare answers eight rows. `fresh` is as [`within_words`]
+/// takes it, and each side is a `(bytes, width)` pair with the bytes it asks for there.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+#[allow(unsafe_code)]
+pub(crate) fn against_words<const SWAP: bool, const EQUAL: bool, const NOT: bool>(
+    left: (&[u8], usize),
+    right: (&[u8], usize),
+    shift: i32,
+    words: &mut [u64],
+    fresh: bool,
+) {
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32,
+        _mm256_loadu_si256, _mm256_movemask_ps, _mm256_set1_epi32,
+    };
+    let ((left, one), (right, other)) = (left, right);
+    assert!((1..=LANE_WIDTH_MAX).contains(&one) && (1..=LANE_WIDTH_MAX).contains(&other));
+    let Some(last) = words.len().checked_sub(1) else { return };
+    assert!(left.len() >= last * 8 * one + readable(one));
+    assert!(right.len() >= last * 8 * other + readable(other));
+    let (left_shuffle, left_shifts) = &LANES[one];
+    let (right_shuffle, right_shifts) = &LANES[other];
+    let (left_half, right_half) = (4 * one / 8, 4 * other / 8);
+    // SAFETY: the build enables AVX2, which the `cfg` on this function checks. Each side's loads
+    // are the ones [`within_words`] makes over its own bytes and width, which the asserts above
+    // keep inside them for the same reason they do there.
+    unsafe {
+        let left_shuffle = _mm256_loadu_si256(left_shuffle.as_ptr().cast());
+        let left_shifts = _mm256_loadu_si256(left_shifts.as_ptr().cast());
+        let right_shuffle = _mm256_loadu_si256(right_shuffle.as_ptr().cast());
+        let right_shifts = _mm256_loadu_si256(right_shifts.as_ptr().cast());
+        #[expect(clippy::cast_possible_wrap, reason = "the masks are read unsigned")]
+        let (left_mask, right_mask) = (
+            _mm256_set1_epi32(((1_u32 << one) - 1) as i32),
+            _mm256_set1_epi32(((1_u32 << other) - 1) as i32),
+        );
+        let shift = _mm256_set1_epi32(shift);
+        for (block, word) in words.iter_mut().enumerate() {
+            if !fresh && *word == 0 {
+                continue;
+            }
+            let (at, to) = (left.as_ptr().add(8 * block * one), right.as_ptr().add(8 * block * other));
+            let mut found = 0_u64;
+            for group in 0..8 {
+                let a = group_codes(
+                    at.add(group * one),
+                    left_half,
+                    left_shuffle,
+                    left_shifts,
+                    left_mask,
+                );
+                let b = group_codes(
+                    to.add(group * other),
+                    right_half,
+                    right_shuffle,
+                    right_shifts,
+                    right_mask,
+                );
+                let b = _mm256_add_epi32(b, shift);
+                let (x, y) = if SWAP { (b, a) } else { (a, b) };
+                let test = if EQUAL { _mm256_cmpeq_epi32(x, y) } else { _mm256_cmpgt_epi32(x, y) };
+                #[expect(clippy::cast_sign_loss, reason = "eight bits of a movemask")]
+                let mut bits = _mm256_movemask_ps(_mm256_castsi256_ps(test)) as u64;
+                if NOT {
+                    bits ^= 0xff;
+                }
+                found |= bits << (group * 8);
+            }
+            *word = if fresh { found } else { *word & found };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +384,68 @@ mod tests {
                 words.iter().zip(&each).map(|(word, held)| word & held).collect();
             within_words(&bytes, width, low, span, &mut words, false);
             assert_eq!(words, narrowed, "width {width} narrowed");
+        }
+    }
+
+    /// `bytes` holding `blocks` blocks of `width` bit codes and the slack the lanes read past them,
+    /// and the codes.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn packed_blocks(width: usize, blocks: usize, seed: usize) -> (Vec<u8>, Vec<i64>) {
+        let top = (1_usize << width) - 1;
+        let codes: Vec<usize> = (0..64 * blocks).map(|i| (i * 2_654_435_761 + seed) % 97 % (top + 1)).collect();
+        let mut bytes = vec![0_u8; (blocks - 1) * 8 * width + readable(width)];
+        for (i, &code) in codes.iter().enumerate() {
+            for b in 0..width {
+                let bit = i * width + b;
+                bytes[bit / 8] |= u8::from(code >> b & 1 == 1) << (bit % 8);
+            }
+        }
+        #[expect(clippy::cast_possible_wrap, reason = "under 2^25")]
+        (bytes, codes.into_iter().map(|code| code as i64).collect())
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn two_packed_sides_compare_as_their_codes_do() {
+        let blocks = 3;
+        for (one, other) in [(1, 1), (5, 7), (12, 12), (12, 13), (25, 3), (25, 25)] {
+            let (left, a) = packed_blocks(one, blocks, 1);
+            let (right, b) = packed_blocks(other, blocks, 5);
+            for shift in [-40_i32, -1, 0, 2, 30] {
+                let expect = |held: fn(i64, i64) -> bool| -> Vec<u64> {
+                    (0..blocks)
+                        .map(|block| {
+                            (0..64).fold(0, |word, i| {
+                                let row = 64 * block + i;
+                                word | u64::from(held(a[row], b[row] + i64::from(shift))) << i
+                            })
+                        })
+                        .collect()
+                };
+                let run = |f: fn((&[u8], usize), (&[u8], usize), i32, &mut [u64], bool)| {
+                    let mut words = vec![0_u64; blocks];
+                    f((&left, one), (&right, other), shift, &mut words, true);
+                    let mut narrowed = vec![u64::MAX, 0, 0x5555_5555_5555_5555];
+                    f((&left, one), (&right, other), shift, &mut narrowed, false);
+                    (words, narrowed)
+                };
+                let cases: [(fn((&[u8], usize), (&[u8], usize), i32, &mut [u64], bool), fn(i64, i64) -> bool); 6] = [
+                    (against_words::<true, false, false>, |x, y| x < y),
+                    (against_words::<false, false, false>, |x, y| x > y),
+                    (against_words::<false, false, true>, |x, y| x <= y),
+                    (against_words::<true, false, true>, |x, y| x >= y),
+                    (against_words::<false, true, false>, |x, y| x == y),
+                    (against_words::<false, true, true>, |x, y| x != y),
+                ];
+                for (case, (f, held)) in cases.into_iter().enumerate() {
+                    let wanted = expect(held);
+                    let (words, narrowed) = run(f);
+                    assert_eq!(words, wanted, "widths {one} {other} shift {shift} case {case}");
+                    let masks = [u64::MAX, 0, 0x5555_5555_5555_5555];
+                    let wanted: Vec<u64> = wanted.iter().zip(masks).map(|(w, m)| w & m).collect();
+                    assert_eq!(narrowed, wanted, "widths {one} {other} shift {shift} case {case}");
+                }
+            }
         }
     }
 

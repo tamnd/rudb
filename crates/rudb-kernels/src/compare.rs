@@ -75,7 +75,7 @@ use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, Result, Value, interval_micros};
 use rudb_vector::{
-    Coded, Data, Form, Packed, Selection, StringColumn, StringView, Validity, Vector,
+    Against, Coded, Data, Form, Packed, Selection, StringColumn, StringView, Validity, Vector,
 };
 
 use crate::fallback::{self, Kernel};
@@ -443,20 +443,6 @@ fn flat_where<T: Copy>(
     }
 }
 
-/// The rows where one bit packed column with no nulls holds against another, in one pass.
-///
-/// This is `l_commitdate < l_receiptdate` and `l_shipdate < l_commitdate` in q4, q12 and q21 as a
-/// stored table hands them up. [`packed_against_packed`] reads each code on its own, working out
-/// the word and the straddle every time, and writes a flag per row for a second pass to pick the
-/// rows out of. Here both sides are unpacked in blocks by [`Packed::unpack`], where the width is a
-/// constant, and the comparison writes the selection directly. The two bases are folded into one
-/// difference added to the right side, so the loop compares two `i64` rather than two `i128`. When
-/// the conjuncts before this one left only a few rows, the codes of just those rows are read one at
-/// a time instead, since unpacking the whole vector would read far more than it keeps.
-///
-/// `None` for anything but two straight packed runs of the same type, for codes too wide to leave
-/// room for the difference, and for two ranges that do not meet, which the general path answers
-/// without reading a code.
 /// A packed column against a literal, answered a word of 64 rows at a time in code space and
 /// turned into rows once, rather than as a flag a row that is then read back into rows.
 ///
@@ -479,6 +465,18 @@ fn packed_literal(
     Some(mask_selection(&words, kept))
 }
 
+/// The rows where one bit packed column with no nulls holds against another.
+///
+/// This is `l_commitdate < l_receiptdate` and `l_shipdate < l_commitdate` in q4, q12 and q21 as a
+/// stored table hands them up. The two bases are folded into one difference added to the right
+/// side, and the rows go through [`Packed::against_words`], which compares a block of 64 of each
+/// side in lanes and leaves a word of the answer, so neither column is unpacked anywhere. The rows
+/// the conjuncts in front left are a mask going in, and a block they emptied is not read. When they
+/// left only a row or two a block, the codes of just those rows are read one at a time instead.
+///
+/// `None` for anything but two straight packed runs of the same type, for codes too wide to leave
+/// room for the difference, and for two ranges that do not meet, which the general path answers
+/// without reading a code.
 fn packed_kept(
     op: Comparison,
     left: &Vector,
@@ -501,76 +499,44 @@ fn packed_kept(
         return None;
     }
     let len = left.len();
-    let dense = rows.is_none_or(|rows| rows.len() * 8 >= len);
-    macro_rules! ordered {
-        ($at:expr, $rows:expr) => {{
-            let at = $at;
-            match op {
-                Comparison::Equal => kept_where($rows, len, |row| {
-                    let (a, b) = at(row);
-                    a == b
-                }),
-                Comparison::NotEqual => kept_where($rows, len, |row| {
-                    let (a, b) = at(row);
-                    a != b
-                }),
-                Comparison::Less => kept_where($rows, len, |row| {
-                    let (a, b) = at(row);
-                    a < b
-                }),
-                Comparison::LessOrEqual => kept_where($rows, len, |row| {
-                    let (a, b) = at(row);
-                    a <= b
-                }),
-                Comparison::Greater => kept_where($rows, len, |row| {
-                    let (a, b) = at(row);
-                    a > b
-                }),
-                Comparison::GreaterOrEqual => kept_where($rows, len, |row| {
-                    let (a, b) = at(row);
-                    a >= b
-                }),
-                Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
-            }
-        }};
-    }
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "both widths are at most 61 bits, so a code is well inside an i64"
-    )]
-    let kept = if dense {
-        // Unpacked into two runs of `i64` with the difference already on the right, and then
-        // compared as two flat columns are, so that a block of 64 is a zip the compiler does in
-        // vector registers. Compared through a closure over the row, each row reloaded both
-        // vectors behind the flag it had just stored, which could have been either of them for
-        // all the compiler knew, and that was a fifth of q12.
-        // Codes of 30 bits or fewer, moved by less than 2^30, fit an `i32` on both sides, and a
-        // vector register holds twice as many of those and compares them signed in one step,
-        // where a signed compare of `i64` lanes is put together out of several on SSE2. Either
-        // way the codes go straight into their lanes a block at a time, rather than into a run of
-        // `u64` zeroed first and then walked again into a second run, which was 6% of q12.
-        if one.width() <= 30 && other.width() <= 30 && shift.unsigned_abs() < 1 << 30 {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "a code is below 2^30 and the shift is below 2^30 either way"
-            )]
-            let (a, b) = {
-                let (mut a, mut b) = (Vec::new(), Vec::new());
-                one.unpack_mapped(0, len, &mut a, |code| code as i32);
-                other.unpack_mapped(0, len, &mut b, |code| (code as i64 + shift) as i32);
-                (a, b)
-            };
-            flat_by(op, rows, &a, &b)?
-        } else {
-            let (mut a, mut b) = (Vec::new(), Vec::new());
-            one.unpack_mapped(0, len, &mut a, |code| code as i64);
-            other.unpack_mapped(0, len, &mut b, |code| code as i64 + shift);
-            flat_by(op, rows, &a, &b)?
-        }
-    } else {
-        ordered!(|row: usize| (one.code(row) as i64, other.code(row) as i64 + shift), rows)
+    let test = match op {
+        Comparison::Equal => Against::Equal,
+        Comparison::NotEqual => Against::NotEqual,
+        Comparison::Less => Against::Less,
+        Comparison::LessOrEqual => Against::LessOrEqual,
+        Comparison::Greater => Against::Greater,
+        Comparison::GreaterOrEqual => Against::GreaterOrEqual,
+        Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
     };
-    Some(kept)
+    // Two rows a block or fewer: a block in lanes is sixteen groups of eight codes, and two codes
+    // read one at a time are well under that.
+    if let Some(rows) = rows
+        && rows.len() * 32 < len
+    {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "both widths are at most 61 bits, so a code is well inside an i64"
+        )]
+        let at = |row: usize| (one.code(row) as i64, other.code(row) as i64 + shift);
+        return Some(kept_where(Some(rows), len, |row| {
+            let (a, b) = at(row);
+            test.holds(a, b)
+        }));
+    }
+    let mut words = vec![0_u64; len.div_ceil(64)];
+    if let Some(rows) = rows {
+        for &row in rows {
+            words[row as usize / 64] |= 1 << (row % 64);
+        }
+    }
+    one.against_words(&other, shift, test, &mut words, rows.is_none());
+    if len % 64 != 0
+        && let Some(last) = words.last_mut()
+    {
+        *last &= (1 << (len % 64)) - 1;
+    }
+    let kept = words.iter().map(|word| word.count_ones() as usize).sum();
+    Some(mask_selection(&words, kept))
 }
 
 /// One end of a range a filter asks for: the comparison that sets it, the literal it compares
@@ -959,26 +925,6 @@ fn packed_range(
             let kept = packed_words(packed, len, &mut words, true, from, span);
             mask_selection(&words, kept)
         }
-    })
-}
-
-/// The rows where `a` stands in `op` to `b`, row by row, or none for the two operators that are
-/// about nulls, which two flat runs of codes know nothing of.
-fn flat_by<T: Copy + PartialOrd>(
-    op: Comparison,
-    rows: Option<&[u32]>,
-    a: &[T],
-    b: &[T],
-) -> Option<Selection> {
-    let side = Side::Column(b);
-    Some(match op {
-        Comparison::Equal => flat_where(rows, a, side, |x, y| x == y),
-        Comparison::NotEqual => flat_where(rows, a, side, |x, y| x != y),
-        Comparison::Less => flat_where(rows, a, side, |x, y| x < y),
-        Comparison::LessOrEqual => flat_where(rows, a, side, |x, y| x <= y),
-        Comparison::Greater => flat_where(rows, a, side, |x, y| x > y),
-        Comparison::GreaterOrEqual => flat_where(rows, a, side, |x, y| x >= y),
-        Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
     })
 }
 
