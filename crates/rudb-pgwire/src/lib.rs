@@ -31,27 +31,44 @@
 //! parameters of the `StartupMessage` and `NegotiateProtocolVersion`. It gives a
 //! [`StartupRequest`] with the user, the database and the settings.
 //!
+//! The password methods: [`password_message`] for `password` and `md5`, [`verify_md5`] and
+//! [`verify_password`] for the checks, and [`Scram`] for the server side of SCRAM-SHA-256 and
+//! SCRAM-SHA-256-PLUS. The hash functions come from the server through the [`Crypto`] trait, so
+//! this crate has no hash code of its own and no dependencies.
+//!
 //! # What is not here yet
 //!
-//! Authentication and the SCRAM arithmetic, the simple and extended flows with the skip to `Sync`
-//! after an error, and the cancel key. They come in the next steps of milestone PG1, in this
-//! order.
+//! The simple and extended flows with the skip to `Sync` after an error, and the cancel key.
+//! They come in the next steps of milestone PG1, in this order.
 //!
-//! # A known difference
+//! # Known differences
+//!
+//! [`verify_password`] does not apply SASLprep to a clear text password before it checks a SCRAM
+//! secret. Only a password that is valid UTF-8 with characters outside ASCII can pass in
+//! PostgreSQL and fail in rudb.
 //!
 //! [`Bind::body`] checks the length of every value before the server converts any of them.
 //! PostgreSQL reads and converts the values one by one, so a `Bind` with a bad value in its first
 //! parameter and a length past the end in its second gets the conversion error from PostgreSQL
 //! and `08P01` from rudb. A client that follows the protocol cannot send such a message.
 
+mod auth;
 mod backend;
+mod base64;
+mod crypto;
 mod error;
 mod frame;
 mod frontend;
 mod reader;
 mod startup;
 
+pub use auth::{
+    Exchange, MD5_WARNING, MD5_WARNING_DETAIL, MOCK_NONCE_LEN, PasswordType, SCRAM_ITERATIONS,
+    SCRAM_NONCE_LEN, SCRAM_SALT_LEN, SCRAM_SHA_256, SCRAM_SHA_256_PLUS, Scram, ScramSecret,
+    md5_encrypt, password_failed, password_message, verify_md5, verify_password,
+};
 pub use backend::{Authentication, Backend, Field, Mark, OutBuf, TransactionStatus};
+pub use crypto::Crypto;
 pub use error::{Level, PROTOCOL_VIOLATION, ProtocolError};
 pub use frame::{
     AUTH_MESSAGE_LIMIT, CANCEL_KEY_LIMIT, CANCEL_REQUEST_CODE, Cancel, Frame, GSSENC_REQUEST_CODE,
