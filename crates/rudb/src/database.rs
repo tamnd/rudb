@@ -4123,7 +4123,171 @@ impl Shared {
                 }
                 Some(format!("Range {}", named(&target.name, &target.key)?))
             }
+            Shape::Upsert(upsert) => {
+                if !self.inner.writable {
+                    return None;
+                }
+                let (name, _, key) = upsert_target(&catalog, upsert)?;
+                Some(format!("Upsert {}", named(&name, &key)?))
+            }
         }
+    }
+
+    /// Runs a prepared upsert of one row without binding it, or says it cannot and leaves
+    /// everything as it was, for [`Shared::execute_ast`] to run, see [`crate::prepared::Upsert`].
+    ///
+    /// Outside a transaction only, and only while no transaction is open on the database, as for
+    /// [`Shared::write_point`]. The table has to be one a [`crate::prepared::Direct`] row goes
+    /// straight into, with one key and no unique index beside it, which is the key the statement
+    /// names if it names one, and no foreign key pointing at it. The row is worked out as an
+    /// insert's is and its key looked up. A row the table does not hold goes in as
+    /// [`Shared::insert_direct`] puts it in. A held row is left alone for `DO NOTHING` and
+    /// `OR IGNORE`, and otherwise takes its new values where it is, as [`Shared::write_point`]
+    /// writes it, as long as none of them is in the key. A value that is not already its column's
+    /// type or a widening of it, a sum that does not fit, or a null anywhere the table refuses one
+    /// goes the long way, so the plan says what it says about them.
+    pub(crate) fn upsert_point(
+        &self,
+        upsert: &crate::prepared::Upsert,
+        given: crate::prepared::Given<'_>,
+        sql: &str,
+    ) -> Option<Result<QueryResult>> {
+        use crate::prepared::{Action, Change, Source};
+        if !self.inner.writable {
+            return None;
+        }
+        let writing = self.writing();
+        if self.transacting() || self.registry().watched() {
+            return None;
+        }
+        let mut catalog = self.write();
+        let (name, targets, key) = upsert_target(&catalog, upsert)?;
+        let table = catalog.table(&name).ok()?;
+        let fields = table.columns();
+        let [items] = upsert.insert.rows.as_slice() else { return None };
+        let row = typed_row(items, given, &targets, fields)?;
+        if row.iter().zip(fields).any(|(value, field)| value.is_null() && field.not_null) {
+            return None;
+        }
+        let values: Vec<Value> = key.iter().map(|&at| row[at].clone()).collect();
+        let all: Vec<usize> = (0..fields.len()).collect();
+        let Some((spot, held)) = table.spot(&key, &values, &all).ok()?? else {
+            // Nobody holds the key, so the row goes in.
+            let staged = self.journals(&name).then(|| vec![row.clone()]);
+            let result = kept(sql, 0, |_| {
+                let table = catalog.table_appending(&name)?;
+                table.append_row(&row)?;
+                if let Some(rows) = &staged {
+                    self.stage_rows(&name, table.columns(), rows);
+                }
+                QueryResult::changed(1)
+            });
+            drop(catalog);
+            let settled = self.settle(writing);
+            return Some(result.and_then(|result| settled.map(|()| result)));
+        };
+        let column = |written: &str| {
+            let mut found = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| field.name.eq_ignore_ascii_case(written))
+                .map(|(at, _)| at);
+            let at = found.next()?;
+            found.next().is_none().then_some(at)
+        };
+        // A value of the column at `at`, as the plan's cast to it would leave it.
+        let typed = |value: Value, at: usize| {
+            let ty = &fields[at].ty;
+            if value.is_null() || value.is_of(ty) {
+                Some(value)
+            } else if widens(&value.logical_type(), ty) {
+                rudb_kernels::cast::cast_value(&value, ty, false).ok()
+            } else {
+                None
+            }
+        };
+        let mut sets = Vec::new();
+        let mut written = Vec::new();
+        match &upsert.action {
+            Action::Nothing => {
+                drop(catalog);
+                drop(writing);
+                return Some(kept(sql, 0, |_| QueryResult::changed(0)));
+            }
+            Action::Replace => {
+                for &at in &targets {
+                    if key.contains(&at) {
+                        // The key the row was found by, which the new row has to hold as it is.
+                        let was = held.column(at).ok()?.try_value_at(0).ok()?;
+                        if was != row[at] {
+                            return None;
+                        }
+                        continue;
+                    }
+                    sets.push(at);
+                    written.push(row[at].clone());
+                }
+            }
+            Action::Update(changes) => {
+                for (named, change) in changes {
+                    let at = column(named)?;
+                    let source = |source: &Source| match source {
+                        Source::Given(item) => given.value(item),
+                        Source::Excluded(named) => Some(row[column(named)?].clone()),
+                    };
+                    let value = match change {
+                        Change::To(from) => typed(source(from)?, at)?,
+                        Change::Add(by, minus) => {
+                            let was = held.column(at).ok()?.try_value_at(0).ok()?;
+                            shifted(&was, &source(by)?, *minus, &fields[at].ty)?
+                        }
+                    };
+                    sets.push(at);
+                    written.push(value);
+                }
+            }
+        }
+        if sets.iter().any(|at| key.contains(at))
+            || sets.iter().zip(&written).any(|(&at, value)| value.is_null() && fields[at].not_null)
+        {
+            return None;
+        }
+        let mut columns = held.loosened().into_columns();
+        for (&at, value) in sets.iter().zip(&written) {
+            let ty = fields[at].ty.clone();
+            columns[at] = Vector::from_values(ty, std::slice::from_ref(value)).ok()?;
+        }
+        let image = Chunk::with_rows(columns, 1).ok()?;
+        let logs = self.journal().as_ref().is_some_and(Journal::logs);
+        let staged = logs.then(|| {
+            let journal = self.journal();
+            journal.as_ref()?.encode_update(
+                &name.schema,
+                &name.table,
+                fields,
+                &[spot.number],
+                std::slice::from_ref(&image),
+            )
+        });
+        let mut unanswered = false;
+        let result = kept(sql, 0, |_| {
+            if !catalog.put_row(&name, spot, &sets, &written, &image)? {
+                unanswered = true;
+                return Err(Error::internal("an upsert the row cannot take where it is"));
+            }
+            if let Some(record) = staged
+                && let Some(journal) = self.journal().as_mut()
+            {
+                journal.stage(record);
+            }
+            QueryResult::changed(1)
+        });
+        if unanswered {
+            return None;
+        }
+        drop(catalog);
+        let settled = self.settle(writing);
+        Some(result.and_then(|result| settled.map(|()| result)))
     }
 
     /// Runs a prepared write by key without binding it, or says it cannot and leaves everything as
@@ -6490,6 +6654,48 @@ struct Noted {
 /// The values a [`Shared::insert_direct`] was given, when they are its row as they are: given by
 /// position, one for each column of `fields` in order, each landing on its own column, and each a
 /// null its column takes or a value of its column's type.
+/// The table a [`crate::prepared::Upsert`] writes, where its row's items land, and the columns of
+/// the one key the table has, or `None` when the table is not one a short upsert can write: not
+/// one a [`crate::prepared::Direct`] row goes into, more than one key or unique index, a key the
+/// statement names that is not that one, a key the table cannot find a row by, a `DO UPDATE` of
+/// a column of the key, or a foreign key of another table pointing at it.
+fn upsert_target(
+    catalog: &Catalog,
+    upsert: &crate::prepared::Upsert,
+) -> Option<(QualifiedName, Vec<usize>, Vec<usize>)> {
+    let (name, targets) = direct_targets(catalog, &upsert.insert)?;
+    let table = catalog.table(&name).ok()?;
+    let guards = table.guards();
+    let [guard] = guards.as_slice() else { return None };
+    if !upsert.key.is_empty() {
+        let fields = table.columns();
+        let mut named = upsert
+            .key
+            .iter()
+            .map(|column| fields.iter().position(|field| field.name.eq_ignore_ascii_case(column)))
+            .collect::<Option<Vec<_>>>()?;
+        named.sort_unstable();
+        named.dedup();
+        let mut held = guard.columns.clone();
+        held.sort_unstable();
+        if named != held {
+            return None;
+        }
+    }
+    let pointed = catalog.tables().any(|held| held.foreign().iter().any(|key| key.table == name));
+    // A `DO UPDATE` of a column of the key moves the row to another key, which is the plan's.
+    let rekeys = match &upsert.action {
+        crate::prepared::Action::Update(changes) => changes.iter().any(|(column, _)| {
+            guard.columns.iter().any(|&at| table.columns()[at].name.eq_ignore_ascii_case(column))
+        }),
+        _ => false,
+    };
+    if pointed || rekeys || !table.finds_by(&guard.columns) {
+        return None;
+    }
+    Some((name, targets, guard.columns.clone()))
+}
+
 /// A row of `items` in the table's order, each value already its column's type, or `None` when a
 /// value is missing, would need more than a widening, or is a null a column refuses.
 fn typed_row(
