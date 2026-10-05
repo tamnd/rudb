@@ -767,7 +767,7 @@ mod tests {
     }
 
     fn texts(from: i64, to: i64) -> Chunk {
-        chunk(LogicalType::Varchar, (from..to).map(|at| Value::Varchar(format!("user{at}").into())))
+        chunk(LogicalType::Varchar, (from..to).map(|at| Value::Varchar(format!("user{at}"))))
     }
 
     fn add(seen: &mut Seen, chunk: &Chunk, field: &Field) -> bool {
