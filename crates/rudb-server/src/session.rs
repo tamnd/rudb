@@ -316,7 +316,8 @@ fn serve(
         bytea_output: ByteaOutput::Hex,
         time_zone: &zone,
     };
-    let mut runner = Runner { connection, settings, encoder: RowEncoder::default() };
+    let mut runner =
+        Runner { connection, settings, encoder: RowEncoder::default(), implicit: false };
     let mut extended = Extended::default();
     loop {
         if session.wants_ready() {
@@ -365,13 +366,21 @@ fn serve(
                 failure(done, &mut wire.out, start.protocol)
             }
             Some(Ok(Frontend::Describe { target, name })) => {
-                let done = extended.describe(&runner, target, name, &mut wire.out);
+                let rest = &input.pending()[used..];
+                let done = extended.describe(&mut runner, target, name, rest, &mut wire.out);
                 failure(done, &mut wire.out, start.protocol)
             }
             Some(Ok(Frontend::Execute { portal, max_rows })) => {
+                let rest = &input.pending()[used..];
                 let mut flush = wire_flush(&mut wire.stream);
-                let done =
-                    extended.execute(&runner, portal, max_rows, &mut wire.out, &mut flush)?;
+                let done = extended.execute(
+                    &mut runner,
+                    portal,
+                    max_rows,
+                    rest,
+                    &mut wire.out,
+                    &mut flush,
+                )?;
                 failure(done, &mut wire.out, start.protocol)
             }
             Some(Ok(Frontend::Close { target, name })) => {
@@ -379,8 +388,15 @@ fn serve(
                 false
             }
             Some(Ok(Frontend::Sync)) => {
+                let ended = runner.end_implicit();
                 extended.end_of_transaction(runner.connection.transaction());
-                false
+                match ended {
+                    Ok(()) => false,
+                    Err(failure) => {
+                        failure.write("", &mut wire.out);
+                        true
+                    }
+                }
             }
             Some(Ok(Frontend::Flush)) => {
                 wire.flush()?;
@@ -405,6 +421,8 @@ fn serve(
         };
         input.consume(used);
         if failed {
+            runner.abort_implicit();
+            extended.end_of_transaction(runner.connection.transaction());
             if shared.stopping() {
                 return terminated(wire);
             }
@@ -449,13 +467,79 @@ struct Runner<'a> {
     connection: Connection,
     settings: OutputSettings<'a>,
     encoder: RowEncoder,
+    /// The server opened the transaction for a `Query` of more than one statement or for the
+    /// extended flow, and it ends the transaction at the end of the `Query` or at `Sync`. This is
+    /// the implicit transaction block of PostgreSQL.
+    implicit: bool,
+}
+
+/// A statement of transaction control that the server runs itself, because PostgreSQL gives a
+/// warning where the engine gives an error, and because the implicit transaction changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+impl Control {
+    /// `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK` and `ABORT`. `COMMIT AND CHAIN`,
+    /// `ROLLBACK TO` and the two-phase commands go to the engine.
+    fn of(sql: &str) -> Option<Control> {
+        let words = leading_words(sql);
+        let word = |i: usize| words.get(i).map_or("", String::as_str);
+        let plain = |i: usize| matches!(word(i), "" | "WORK" | "TRANSACTION");
+        match word(0) {
+            "BEGIN" => Some(Control::Begin),
+            "START" if word(1) == "TRANSACTION" => Some(Control::Begin),
+            "COMMIT" | "END" if plain(1) && word(2) != "AND" => Some(Control::Commit),
+            "ROLLBACK" | "ABORT" if plain(1) && word(2) != "AND" => Some(Control::Rollback),
+            _ => None,
+        }
+    }
+
+    fn tag(self) -> CommandTag {
+        match self {
+            Control::Begin => CommandTag::Begin,
+            Control::Commit => CommandTag::Commit,
+            Control::Rollback => CommandTag::Rollback,
+        }
+    }
+}
+
+/// What a statement gave: the result of the engine, or the tag of a statement that the server
+/// ran itself.
+enum Outcome {
+    Result(QueryResult),
+    Done(CommandTag),
+}
+
+/// Writes a `NoticeResponse` with the severity `WARNING`.
+fn warning(out: &mut OutBuf, sqlstate: &str, message: &str) {
+    out.notice_response(&[
+        (b'S', b"WARNING"),
+        (b'V', b"WARNING"),
+        (b'C', sqlstate.as_bytes()),
+        (b'M', message.as_bytes()),
+    ]);
+}
+
+/// The error for a statement in a failed transaction block.
+fn aborted_failure() -> Failure {
+    Failure {
+        sqlstate: "25P02".to_owned(),
+        message: "current transaction is aborted, commands ignored until end of transaction block"
+            .to_owned(),
+        fields: None,
+        position: None,
+    }
 }
 
 /// An error for an `ErrorResponse`, from the engine or from the encoder.
 struct Failure {
     sqlstate: String,
     message: String,
-    fields: Option<rudb_common::Fields>,
+    fields: Option<Box<rudb_common::Fields>>,
     /// The byte offset in the query string.
     position: Option<usize>,
 }
@@ -470,7 +554,7 @@ impl Failure {
         Failure {
             sqlstate: error.reported_state().as_str().to_owned(),
             message,
-            fields: error.fields().cloned(),
+            fields: error.fields().cloned().map(Box::new),
             position: error.span().map(|span| offset + span.start as usize),
         }
     }
@@ -508,6 +592,73 @@ impl Failure {
 }
 
 impl Runner<'_> {
+    /// Opens the implicit transaction when no transaction is open.
+    fn begin_implicit(&mut self) -> Result<(), Failure> {
+        if self.connection.transaction() == Transaction::Idle {
+            self.connection.execute("BEGIN").map_err(|e| Failure::engine(&e, 0))?;
+            self.implicit = true;
+        }
+        Ok(())
+    }
+
+    /// Commits the implicit transaction, at the end of a `Query` and at `Sync`.
+    fn end_implicit(&mut self) -> Result<(), Failure> {
+        if std::mem::take(&mut self.implicit) && self.connection.transaction() != Transaction::Idle
+        {
+            self.connection.execute("COMMIT").map_err(|e| Failure::engine(&e, 0))?;
+        }
+        Ok(())
+    }
+
+    /// Rolls back the implicit transaction after an error. A transaction block that the client
+    /// opened stays open, in the failed state.
+    fn abort_implicit(&mut self) {
+        if std::mem::take(&mut self.implicit) && self.connection.transaction() != Transaction::Idle
+        {
+            let _ = self.connection.execute("ROLLBACK");
+        }
+    }
+
+    /// Runs one statement with the transaction rules of PostgreSQL. `run` runs it in the engine,
+    /// and `offset` is the place of the statement in the query, for the position of an error.
+    fn run(
+        &mut self,
+        control: Option<Control>,
+        offset: usize,
+        out: &mut OutBuf,
+        run: impl FnOnce(&Connection) -> rudb::Result<QueryResult>,
+    ) -> Result<Outcome, Failure> {
+        let state = self.connection.transaction();
+        let ends = matches!(control, Some(Control::Commit | Control::Rollback));
+        if state == Transaction::Aborted && !ends {
+            return Err(aborted_failure());
+        }
+        match (control, state) {
+            (Some(Control::Begin), Transaction::Open) => {
+                // A BEGIN in the implicit transaction makes it a transaction block.
+                if !std::mem::take(&mut self.implicit) {
+                    warning(out, "25001", "there is already a transaction in progress");
+                }
+                return Ok(Outcome::Done(CommandTag::Begin));
+            }
+            (Some(end @ (Control::Commit | Control::Rollback)), Transaction::Idle) => {
+                warning(out, "25P01", "there is no transaction in progress");
+                return Ok(Outcome::Done(end.tag()));
+            }
+            (Some(end @ (Control::Commit | Control::Rollback)), Transaction::Open)
+                if self.implicit =>
+            {
+                self.implicit = false;
+                let sql = if end == Control::Commit { "COMMIT" } else { "ROLLBACK" };
+                self.connection.execute(sql).map_err(|e| Failure::engine(&e, 0))?;
+                warning(out, "25P01", "there is no transaction in progress");
+                return Ok(Outcome::Done(end.tag()));
+            }
+            _ => {}
+        }
+        run(&self.connection).map(Outcome::Result).map_err(|e| Failure::engine(&e, offset))
+    }
+
     /// Runs a `Query` message: each statement in it, in order, until the first error. Gives true
     /// when there was an error.
     fn query(
@@ -536,12 +687,23 @@ impl Runner<'_> {
             out.empty_query_response();
             return Ok(false);
         }
+        // A query of more than one statement runs in one transaction, as in PostgreSQL.
+        let implicit = statements.len() > 1;
         for statement in statements {
             let before = self.connection.transaction();
-            let result = match self.connection.execute(statement.sql()) {
-                Ok(result) => result,
-                Err(error) => {
-                    Failure::engine(&error, statement.offset()).write(sql, out);
+            let control = Control::of(statement.sql());
+            let started = if implicit { self.begin_implicit() } else { Ok(()) };
+            let ran = started.and_then(|()| {
+                self.run(control, statement.offset(), out, |c| c.execute(statement.sql()))
+            });
+            let result = match ran {
+                Ok(Outcome::Result(result)) => result,
+                Ok(Outcome::Done(tag)) => {
+                    out.command_tag(tag, 0);
+                    continue;
+                }
+                Err(failure) => {
+                    failure.write(sql, out);
                     return Ok(true);
                 }
             };
@@ -560,6 +722,10 @@ impl Runner<'_> {
                 0
             };
             out.command_tag(tag, rows);
+        }
+        if let Err(failure) = self.end_implicit() {
+            failure.write(sql, out);
+            return Ok(true);
         }
         Ok(false)
     }
@@ -678,6 +844,20 @@ mod tests {
         assert_eq!(leading_words("create or replace temp view v as"), ["CREATE", "VIEW", "V"]);
         assert_eq!(leading_words("  drop table if exists t"), ["DROP", "TABLE", "IF"]);
         assert_eq!(leading_words("begin"), ["BEGIN"]);
+    }
+
+    #[test]
+    fn the_transaction_control_that_the_server_runs() {
+        assert_eq!(Control::of("begin"), Some(Control::Begin));
+        assert_eq!(Control::of("START TRANSACTION READ ONLY"), Some(Control::Begin));
+        assert_eq!(Control::of("commit work"), Some(Control::Commit));
+        assert_eq!(Control::of("end"), Some(Control::Commit));
+        assert_eq!(Control::of("abort transaction"), Some(Control::Rollback));
+        assert_eq!(Control::of("commit and chain"), None);
+        assert_eq!(Control::of("rollback work and no chain"), None);
+        assert_eq!(Control::of("rollback to savepoint a"), None);
+        assert_eq!(Control::of("commit prepared 'x'"), None);
+        assert_eq!(Control::of("select 1"), None);
     }
 
     #[test]

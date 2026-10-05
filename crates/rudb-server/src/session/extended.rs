@@ -29,7 +29,7 @@ use rudb_pgwire::{
     Bind, CommandTag, Field, Level, OutBuf, Portals, ProtocolError, Statements, Target,
 };
 
-use super::{FLUSH_AT, Failure, Runner, command_tag, leading_words};
+use super::{Control, FLUSH_AT, Failure, Outcome, Runner, command_tag, leading_words};
 
 /// The type that PostgreSQL reports for a parameter of no known type.
 const TEXT: Oid = 25;
@@ -78,7 +78,7 @@ fn type_failure(error: TypeError, context: Option<String>) -> Failure {
     let fields = context.map(|context| {
         let mut fields = Fields::default();
         fields.context = Some(context);
-        fields
+        Box::new(fields)
     });
     Failure {
         sqlstate: error.sqlstate.as_str().to_owned(),
@@ -91,6 +91,8 @@ fn type_failure(error: TypeError, context: Option<String>) -> Failure {
 /// A statement of `Parse`.
 pub(super) struct Statement {
     sql: Arc<str>,
+    /// The transaction control that the server runs itself, from [`Control::of`].
+    control: Option<Control>,
     /// `None` for an empty query.
     prepared: Option<Prepared>,
     /// The declared type of each parameter, with 0 for no type.
@@ -159,7 +161,9 @@ pub(super) struct Portal {
 
 /// A portal that ran, with the place in its result.
 struct Ran {
-    result: QueryResult,
+    /// The result of the engine, or `None` for a statement that the server ran itself.
+    result: Option<QueryResult>,
+    changes: u64,
     tag: CommandTag,
     /// The statement gives rows, so `Execute` sends them.
     rows: bool,
@@ -233,7 +237,8 @@ impl Extended {
                 // The slots are distinct and below `count`, so they are a permutation of it.
                 *s < count && !slots[..i].contains(s)
             });
-        let statement = Statement { sql, prepared, types, slots, positional };
+        let control = Control::of(&sql);
+        let statement = Statement { sql, control, prepared, types, slots, positional };
         self.statements.insert(name, Arc::new(statement))?;
         out.parse_complete();
         Ok(())
@@ -322,9 +327,10 @@ impl Extended {
 
     pub(super) fn describe(
         &mut self,
-        runner: &Runner<'_>,
+        runner: &mut Runner<'_>,
         target: Target,
         name: &[u8],
+        rest: &[u8],
         out: &mut OutBuf,
     ) -> Result<(), Problem> {
         match target {
@@ -343,19 +349,24 @@ impl Extended {
             }
             Target::Portal => {
                 let portal = self.portals.get_mut(name)?;
+                if portal.statement.control.is_some() {
+                    out.no_data();
+                    return Ok(());
+                }
                 let formats = portal.formats.clone();
-                match portal.run(runner)? {
-                    Some(ran) if ran.rows => {
+                let alone = alone(rest, name, 1);
+                let ran = portal.run(runner, alone, out)?.filter(|ran| ran.rows);
+                match ran.and_then(|ran| ran.result.as_ref()) {
+                    Some(result) => {
                         let format = |i: usize| match formats.len() {
                             0 => 0,
                             1 => formats[0],
                             _ => formats[i],
                         };
-                        let columns: Vec<_> = ran
-                            .result
+                        let columns: Vec<_> = result
                             .names()
                             .iter()
-                            .zip(ran.result.types())
+                            .zip(result.types())
                             .enumerate()
                             .map(|(i, (name, ty))| (name.as_str(), ty, format(i)))
                             .collect();
@@ -370,9 +381,10 @@ impl Extended {
 
     pub(super) fn execute(
         &mut self,
-        runner: &Runner<'_>,
+        runner: &mut Runner<'_>,
         name: &[u8],
         max_rows: i32,
+        rest: &[u8],
         out: &mut OutBuf,
         flush: &mut impl FnMut(&mut OutBuf) -> io::Result<()>,
     ) -> io::Result<Result<(), Problem>> {
@@ -382,7 +394,7 @@ impl Extended {
         };
         let sql = portal.statement.sql.clone();
         let formats = portal.formats.clone();
-        let ran = match portal.run(runner) {
+        let ran = match portal.run(runner, alone(rest, name, 0), out) {
             Ok(Some(ran)) => ran,
             Ok(None) => {
                 out.empty_query_response();
@@ -396,12 +408,15 @@ impl Extended {
                 return Ok(Err(error("55000", format!("portal \"{name}\" cannot be run"))));
             }
             ran.reported = true;
-            out.command_tag(ran.tag, ran.result.changes().unwrap_or(0) as u64);
+            out.command_tag(ran.tag, ran.changes);
             return Ok(Ok(()));
         }
+        let Some(result) = &ran.result else {
+            return Ok(Ok(()));
+        };
         if ran.encoder.is_none() {
-            let mut columns = Vec::with_capacity(ran.result.width());
-            for (i, logical) in ran.result.types().iter().enumerate() {
+            let mut columns = Vec::with_capacity(result.width());
+            for (i, logical) in result.types().iter().enumerate() {
                 let format = match formats.len() {
                     0 => 0,
                     1 => formats[0],
@@ -422,7 +437,7 @@ impl Extended {
             return Ok(Ok(()));
         };
         let limit = if max_rows > 0 { max_rows as u64 } else { u64::MAX };
-        let chunks = ran.result.chunks();
+        let chunks = result.chunks();
         let mut sent = 0u64;
         while sent < limit && ran.chunk < chunks.len() {
             let chunk = match chunks[ran.chunk].clone().settled() {
@@ -466,29 +481,88 @@ impl Extended {
 }
 
 impl Portal {
-    /// Runs the portal if it did not run yet. `None` is an empty query.
-    fn run(&mut self, runner: &Runner<'_>) -> Result<Option<&mut Ran>, Problem> {
+    /// Runs the portal if it did not run yet. `None` is an empty query. The portal runs in the
+    /// implicit transaction that ends at `Sync`, but a portal that is `alone` up to `Sync` runs in
+    /// its own transaction, which gives the same result for less work.
+    fn run(
+        &mut self,
+        runner: &mut Runner<'_>,
+        alone: bool,
+        out: &mut OutBuf,
+    ) -> Result<Option<&mut Ran>, Problem> {
         let Some(prepared) = &self.statement.prepared else {
             return Ok(None);
         };
         if self.ran.is_none() {
-            let sql = &self.statement.sql;
-            let before = runner.connection.transaction();
-            let result = self
-                .statement
-                .execute(prepared, &self.values)
-                .map_err(|e| Problem::failure(Failure::engine(&e, 0), sql))?;
-            let tag = command_tag(sql, &result, before);
-            let rows =
-                result.changes().is_none() && (result.width() > 0 || tag == CommandTag::Select);
-            if rows {
-                check_formats(&self.formats, result.width())?;
+            let statement = &self.statement;
+            let sql = &statement.sql;
+            let problem = |failure| Problem::failure(failure, sql);
+            // A format that is not valid fails after the statement ran.
+            if !alone || self.formats.iter().any(|&format| format != 0 && format != 1) {
+                runner.begin_implicit().map_err(problem)?;
             }
-            self.ran =
-                Some(Ran { result, tag, rows, reported: false, chunk: 0, row: 0, encoder: None });
+            let before = runner.connection.transaction();
+            let values = &self.values;
+            let outcome = runner
+                .run(statement.control, 0, out, |_| statement.execute(prepared, values))
+                .map_err(problem)?;
+            let ran = match outcome {
+                Outcome::Result(result) => {
+                    let tag = command_tag(sql, &result, before);
+                    let changes = result.changes().map_or(0, |n| n as u64);
+                    let rows = result.changes().is_none()
+                        && (result.width() > 0 || tag == CommandTag::Select);
+                    if rows {
+                        check_formats(&self.formats, result.width())?;
+                    }
+                    Ran::new(Some(result), tag, changes, rows)
+                }
+                Outcome::Done(tag) => Ran::new(None, tag, 0, false),
+            };
+            self.ran = Some(ran);
         }
         Ok(self.ran.as_mut())
     }
+}
+
+impl Ran {
+    fn new(result: Option<QueryResult>, tag: CommandTag, changes: u64, rows: bool) -> Ran {
+        Ran { result, changes, tag, rows, reported: false, chunk: 0, row: 0, encoder: None }
+    }
+}
+
+/// True when nothing can fail or run between this message and the next `Sync` in `rest`, the
+/// messages that the client sent after it: only `Close`, `Flush`, a `Describe` of the same
+/// portal and up to `executes` more `Execute` of it. An error in a `Parse` or in a second
+/// `Execute` of a portal without rows must roll back the statement. False when the `Sync` did
+/// not arrive yet.
+fn alone(mut rest: &[u8], portal: &[u8], mut executes: usize) -> bool {
+    let same = |body: &[u8]| body.split(|&b| b == 0).next() == Some(portal);
+    while rest.len() >= 5 {
+        let len = i32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]);
+        let Some(end) = usize::try_from(len).ok().map(|len| len + 1).filter(|&end| end >= 5) else {
+            return false;
+        };
+        if end > rest.len() {
+            return false;
+        }
+        let body = &rest[5..end];
+        let next = match rest[0] {
+            b'S' => return true,
+            b'C' | b'H' => true,
+            b'D' => matches!(body.split_first(), Some((b'P', name)) if same(name)),
+            b'E' if same(body) && executes > 0 => {
+                executes -= 1;
+                true
+            }
+            _ => false,
+        };
+        if !next {
+            return false;
+        }
+        rest = &rest[end..];
+    }
+    false
 }
 
 /// The check of `PortalSetResultFormat`: one format for each column, or one or none for all.
@@ -527,4 +601,33 @@ fn row_description(columns: &[(&str, &LogicalType, i16)], out: &mut OutBuf) {
         })
         .collect();
     out.row_description(&fields);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut frame = vec![tag];
+        frame.extend_from_slice(&(body.len() as i32 + 4).to_be_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    #[test]
+    fn a_portal_is_alone_up_to_sync() {
+        let execute = frame(b'E', b"p\0\0\0\0\0");
+        let sync = frame(b'S', b"");
+        let rest = [frame(b'H', b""), frame(b'C', b"Sq\0"), sync.clone()].concat();
+        assert!(alone(&rest, b"p", 0));
+        assert!(alone(&[execute.clone(), sync.clone()].concat(), b"p", 1));
+        assert!(!alone(&[execute.clone(), sync.clone()].concat(), b"p", 0));
+        assert!(!alone(&[execute.clone(), sync.clone()].concat(), b"", 1));
+        assert!(!alone(&[frame(b'P', b"\0select 1\0\0\0"), sync.clone()].concat(), b"p", 0));
+        assert!(!alone(&[frame(b'D', b"Sq\0"), sync.clone()].concat(), b"p", 0));
+        assert!(alone(&[frame(b'D', b"Pp\0"), sync.clone()].concat(), b"p", 0));
+        // The Sync did not arrive yet.
+        assert!(!alone(&execute, b"p", 1));
+        assert!(!alone(&sync[..3], b"p", 0));
+    }
 }
