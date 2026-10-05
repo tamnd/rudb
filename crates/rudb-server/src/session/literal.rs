@@ -7,7 +7,7 @@ use rudb_common::session::LiteralInput;
 use rudb_common::value::Value;
 use rudb_common::{Error, Result};
 use rudb_pgtypes::{
-    DateOrder, DateTimeInput, InputSettings, IntervalStyle, NoZones, TypeInfo,
+    DateOrder, DateTimeInput, InputSettings, IntervalStyle, NoZones, RegKind, TypeInfo,
     UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, oid, param_value,
 };
 
@@ -40,12 +40,16 @@ impl LiteralInput for Literals {
             oid::TIMESTAMP,
             oid::TIMESTAMPTZ,
             oid::INTERVAL,
+            oid::INT2VECTOR,
+            oid::OIDVECTOR,
         ];
         // An array of a known type, such as `'{1,2}'::int4[]`, is read by the array input.
         let element = TypeInfo::get(oid).filter(|info| info.is_array()).map(|info| info.elem);
         let strings = [oid::TEXT, oid::VARCHAR];
-        let known_element = |element| known.contains(&element) || strings.contains(&element);
-        if !known.contains(&oid) && !element.is_some_and(known_element) {
+        let reg = |oid| RegKind::from_oid(oid).is_some();
+        let known_element =
+            |element| known.contains(&element) || strings.contains(&element) || reg(element);
+        if !known.contains(&oid) && !reg(oid) && !element.is_some_and(known_element) {
             return None;
         }
         let now = SystemTime::now()

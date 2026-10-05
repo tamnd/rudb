@@ -10,6 +10,7 @@
 use rudb_common::{DeclaredType, LogicalType};
 
 use crate::generated::oids as oid;
+use crate::reg::RegKind;
 use crate::types::{Oid, TypeInfo};
 use crate::typmod::{
     INTERVAL_FULL_PRECISION, INTERVAL_FULL_RANGE, IntervalField, MAX_TIME_PRECISION, char_typmod,
@@ -208,14 +209,18 @@ impl Parser {
     }
 }
 
-/// The rudb type of a PostgreSQL type that DuckDB reads as a different type. DuckDB reads `oid` as
-/// `BIGINT` and `"char"` as `VARCHAR`. A PostgreSQL session keeps them as `UINTEGER` and
-/// `UTINYINT`, which have the values and the width of the PostgreSQL types. The same is true for
-/// an array of them.
+/// The rudb type of a PostgreSQL type that DuckDB reads as a different type or does not know.
+/// DuckDB reads `oid` as `BIGINT` and `"char"` as `VARCHAR`. A PostgreSQL session keeps them as
+/// `UINTEGER` and `UTINYINT`, which have the values and the width of the PostgreSQL types. The OID
+/// alias types such as `regtype` are `UINTEGER` too, and `int2vector` and `oidvector` are lists of
+/// `SMALLINT` and of `UINTEGER`. The same is true for an array of them.
 pub fn session_type(declared: DeclaredType) -> Option<LogicalType> {
     let of = |oid| match oid {
         oid::OID => Some(LogicalType::UInteger),
         oid::CHAR => Some(LogicalType::UTinyInt),
+        oid::INT2VECTOR => Some(LogicalType::List(Box::new(LogicalType::SmallInt))),
+        oid::OIDVECTOR => Some(LogicalType::List(Box::new(LogicalType::UInteger))),
+        oid if RegKind::from_oid(oid).is_some() => Some(LogicalType::UInteger),
         _ => None,
     };
     of(declared.oid).or_else(|| {

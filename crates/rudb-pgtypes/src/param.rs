@@ -9,7 +9,9 @@
 
 use rudb_common::{LogicalType, SqlState, Value, uuid};
 
-use crate::array::{Array, array_in, array_recv};
+use crate::array::{
+    Array, array_in, array_recv, int2vector_in, int2vector_recv, oidvector_in, oidvector_recv,
+};
 use crate::binary::Recv;
 use crate::datetime::{
     DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateTimeInput, Interval, IntervalStyle,
@@ -17,12 +19,14 @@ use crate::datetime::{
     date_in, date_recv, interval_in, interval_recv, time_in, time_recv, timestamp_in,
     timestamp_recv, timestamptz_in,
 };
+use crate::declared::declared_type;
 use crate::error::TypeError;
 use crate::generated::oids;
 use crate::number::{int2_in, int4_in, int8_in, oid_in};
 use crate::numeric::{Numeric, NumericSign, numeric_in, numeric_out, numeric_recv};
+use crate::reg::{RegInput, RegKind, reg_in};
 use crate::scalar::{bool_in, bytea_in, char_in, name_in, uuid_in};
-use crate::types::{Oid, TypeInfo};
+use crate::types::{Oid, TypeInfo, format_type};
 use crate::{float4_in, float8_in};
 
 /// What the text input of a parameter depends on: `DateStyle`, `TimeZone` and `IntervalStyle`.
@@ -46,6 +50,9 @@ pub fn logical_type(oid: Oid) -> Option<LogicalType> {
         oids::INT8 => LogicalType::BigInt,
         oids::OID => LogicalType::UInteger,
         oids::CHAR => LogicalType::UTinyInt,
+        oids::INT2VECTOR => LogicalType::List(Box::new(LogicalType::SmallInt)),
+        oids::OIDVECTOR => LogicalType::List(Box::new(LogicalType::UInteger)),
+        oid if RegKind::from_oid(oid).is_some() => LogicalType::UInteger,
         oids::FLOAT4 => LogicalType::Float,
         oids::FLOAT8 => LogicalType::Double,
         oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::NAME => LogicalType::Varchar,
@@ -86,6 +93,11 @@ fn list<T>(element: Oid, array: Array<T>, value: impl Fn(T) -> Value) -> Result<
     })
 }
 
+/// An `int2vector` or an `oidvector` as a rudb list.
+fn vector(element: LogicalType, values: impl Iterator<Item = Value>) -> Value {
+    Value::List { element, values: values.collect() }
+}
+
 /// The value of parameter `number`, from 1, of the type `oid` from its bytes in the text format,
 /// or in the binary format when `binary` is set.
 ///
@@ -120,6 +132,15 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
         oids::INT8 => Value::BigInt(int8_in(text)?),
         oids::OID => Value::UInteger(oid_in(text)?),
         oids::CHAR => Value::UTinyInt(char_in(text)),
+        oids::INT2VECTOR => {
+            let values = int2vector_in(text)?;
+            vector(LogicalType::SmallInt, values.into_iter().map(Value::SmallInt))
+        }
+        oids::OIDVECTOR => {
+            let values = oidvector_in(text)?;
+            vector(LogicalType::UInteger, values.into_iter().map(Value::UInteger))
+        }
+        oid if let Some(kind) = RegKind::from_oid(oid) => Value::UInteger(reg_value(kind, text)?),
         oids::NAME => Value::Varchar(name_in(text).to_owned()),
         oids::FLOAT4 => Value::Float(float4_in(text)?),
         oids::FLOAT8 => Value::Double(float8_in(text)?),
@@ -139,6 +160,27 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
     })
 }
 
+/// The text input of an OID alias type. A number needs no lookup. A `regtype` name is read as a
+/// type name is read in a cast, which finds every built-in type. A name of another kind needs the
+/// catalog of PG3.
+fn reg_value(kind: RegKind, text: &str) -> Result<u32, TypeError> {
+    let name = match reg_in(kind, text)? {
+        RegInput::Oid(oid) => return Ok(oid),
+        RegInput::Name(name) => name,
+    };
+    if kind == RegKind::Type {
+        // The type grammar reads the SQL names, and `pg_type` has the names such as `_int4`.
+        let found = declared_type(name).map(|declared| declared.oid);
+        return found.or_else(|| TypeInfo::by_name(name).map(|info| info.oid)).ok_or_else(|| {
+            TypeError::new(SqlState::UNDEFINED_OBJECT, format!("type \"{name}\" does not exist"))
+        });
+    }
+    Err(TypeError::new(
+        SqlState::FEATURE_NOT_SUPPORTED,
+        format!("a name as the input of type {} is not supported yet", format_type(kind.oid())),
+    ))
+}
+
 fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
     Ok(match oid {
         oids::BOOL => Value::Boolean(recv.bool()?),
@@ -147,6 +189,15 @@ fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
         oids::INT8 => Value::BigInt(recv.i64()?),
         oids::OID => Value::UInteger(recv.u32()?),
         oids::CHAR => Value::UTinyInt(recv.byte()?),
+        oids::INT2VECTOR => {
+            let values = int2vector_recv(recv)?;
+            vector(LogicalType::SmallInt, values.into_iter().map(Value::SmallInt))
+        }
+        oids::OIDVECTOR => {
+            let values = oidvector_recv(recv)?;
+            vector(LogicalType::UInteger, values.into_iter().map(Value::UInteger))
+        }
+        oid if RegKind::from_oid(oid).is_some() => Value::UInteger(recv.u32()?),
         oids::FLOAT4 => Value::Float(recv.f32()?),
         oids::FLOAT8 => Value::Double(recv.f64()?),
         oids::NUMERIC => numeric(&numeric_recv(recv, -1)?),
@@ -243,6 +294,44 @@ mod tests {
             interval_style: IntervalStyle::Postgres,
         };
         param_value(oid, binary, data, 1, &settings)
+    }
+
+    #[test]
+    fn an_oid_alias_and_a_vector_read_as_postgresql_reads_them() {
+        let oid = |n| Value::UInteger(n);
+        assert_eq!(read(oids::REGTYPE, false, b"integer").unwrap(), oid(oids::INT4));
+        assert_eq!(read(oids::REGTYPE, false, b"_int4").unwrap(), oid(oids::INT4_ARRAY));
+        assert_eq!(read(oids::REGTYPE, false, b"varchar(10)").unwrap(), oid(oids::VARCHAR));
+        assert_eq!(read(oids::REGCLASS, false, b"1259").unwrap(), oid(1259));
+        assert_eq!(read(oids::REGPROC, false, b"-").unwrap(), oid(0));
+        assert_eq!(read(oids::REGTYPE, true, &23u32.to_be_bytes()).unwrap(), oid(23));
+        let error = read(oids::REGTYPE, false, b"nope").unwrap_err();
+        assert_eq!(error.sqlstate, SqlState::UNDEFINED_OBJECT);
+        assert_eq!(error.message, "type \"nope\" does not exist");
+        let error = read(oids::REGCLASS, false, b"pg_class").unwrap_err();
+        assert_eq!(error.sqlstate, SqlState::FEATURE_NOT_SUPPORTED);
+
+        let list = |element, values| Value::List { element, values };
+        let smallints = |values: &[i16]| values.iter().map(|&v| Value::SmallInt(v)).collect();
+        assert_eq!(
+            read(oids::INT2VECTOR, false, b" 1 2  3").unwrap(),
+            list(LogicalType::SmallInt, smallints(&[1, 2, 3]))
+        );
+        assert_eq!(
+            read(oids::OIDVECTOR, false, b"23 25").unwrap(),
+            list(LogicalType::UInteger, vec![oid(23), oid(25)])
+        );
+        let mut bytes = Vec::new();
+        crate::array::int2vector_send(&[4, 5], &mut bytes);
+        assert_eq!(
+            read(oids::INT2VECTOR, true, &bytes).unwrap(),
+            list(LogicalType::SmallInt, smallints(&[4, 5]))
+        );
+        assert_eq!(logical_type(oids::REGTYPE), Some(LogicalType::UInteger));
+        assert_eq!(
+            logical_type(oids::OIDVECTOR),
+            Some(LogicalType::List(Box::new(LogicalType::UInteger)))
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::ops::Range;
 use rudb_common::{LogicalType, SqlState, time_tz, uuid};
 use rudb_vector::{Data, Form, Live, Vector};
 
-use crate::array::{Array, array_out, array_send};
+use crate::array::{Array, ArrayDim, array_out, array_send};
 use crate::datetime::{
     DateFormat, Interval, IntervalStyle, TimeZone, date_from_unix, date_out, interval_out,
     interval_send, time_out, timestamp_from_unix, timestamp_out, timestamptz_out, timetz_out,
@@ -28,7 +28,7 @@ use crate::float::{float4_out, float8_out};
 use crate::generated::oids;
 use crate::number::{int_out, u64_out};
 use crate::numeric::{decimal_out, decimal_send, numeric_in, numeric_send};
-use crate::reg::RegKind;
+use crate::reg::{RegKind, reg_out_oid};
 use crate::scalar::{ByteaOutput, bool_out, bytea_out, char_out, uuid_out};
 use crate::types::{Oid, PgType, TypeInfo, format_type};
 use crate::typmod::numeric_typmod;
@@ -82,6 +82,12 @@ enum Kind {
     Uuid,
     /// A one-dimensional array. The plan of the column has the kind of the elements.
     Array,
+    /// An `int2vector` or an `oidvector`. The plan of the column has the kind of the elements.
+    /// The text has a space between the numbers and no braces, and the binary format is an array
+    /// with the lower bound 0.
+    Vector,
+    /// An OID alias type such as `regtype`. The binary format is the binary format of `oid`.
+    Reg(RegKind),
     /// A column of the type of an untyped `NULL`. Every value is NULL.
     Null,
     /// A rudb type with no PostgreSQL type of its own, sent as the text of each value. When
@@ -173,7 +179,11 @@ impl Kind {
                 Kind::Int8
             }
             oids::OID if *logical == L::UInteger => Kind::Oid,
-            oid if *logical == L::UInteger && RegKind::from_oid(oid).is_some() => Kind::Oid,
+            oid if *logical == L::UInteger
+                && let Some(kind) = RegKind::from_oid(oid) =>
+            {
+                Kind::Reg(kind)
+            }
             oids::FLOAT4 if *logical == L::Float => Kind::Float4,
             oids::FLOAT8 if *logical == L::Double => Kind::Float8,
             oids::NUMERIC => match *logical {
@@ -195,6 +205,9 @@ impl Kind {
             oids::TIMESTAMPTZ if *logical == L::TimestampTz => Kind::TimestampTz,
             oids::INTERVAL if *logical == L::Interval => Kind::Interval,
             oids::UUID if *logical == L::Uuid => Kind::Uuid,
+            oids::INT2VECTOR | oids::OIDVECTOR if element_of(logical, oid).is_some() => {
+                Kind::Vector
+            }
             oid if element_of(logical, oid).is_some() => Kind::Array,
             oids::TEXT if pg_type(logical).oid == oids::TEXT => Kind::Display { numeric: false },
             _ => return None,
@@ -218,7 +231,7 @@ impl Kind {
         Some(match self {
             Kind::Bool | Kind::Char => 1,
             Kind::Int2 => 2,
-            Kind::Int4 | Kind::Oid | Kind::Float4 | Kind::Date => 4,
+            Kind::Int4 | Kind::Oid | Kind::Reg(_) | Kind::Float4 | Kind::Date => 4,
             Kind::Int8 | Kind::Float8 | Kind::Time | Kind::Timestamp | Kind::TimestampTz => 8,
             Kind::TimeTz => 12,
             Kind::Interval | Kind::Uuid => 16,
@@ -226,6 +239,7 @@ impl Kind {
             | Kind::Text
             | Kind::Bytea
             | Kind::Array
+            | Kind::Vector
             | Kind::Null
             | Kind::Display { .. } => {
                 return None;
@@ -276,9 +290,13 @@ fn element_of(logical: &LogicalType, oid: Oid) -> Option<(Oid, Kind)> {
     let (LogicalType::List(element) | LogicalType::Array(element, _)) = logical else {
         return None;
     };
-    let info = TypeInfo::get(oid).filter(|info| info.is_array())?;
-    let kind = Kind::of(element, info.elem)?;
-    (kind != Kind::Array).then_some((info.elem, kind))
+    let elem = match oid {
+        oids::INT2VECTOR => oids::INT2,
+        oids::OIDVECTOR => oids::OID,
+        _ => TypeInfo::get(oid).filter(|info| info.is_array())?.elem,
+    };
+    let kind = Kind::of(element, elem)?;
+    (!matches!(kind, Kind::Array | Kind::Vector)).then_some((elem, kind))
 }
 
 /// The `DataRow` encoder of one result. It keeps its buffers between calls, so the rows of a
@@ -502,7 +520,9 @@ fn lengths(
             }
             return Ok(());
         }
-        Kind::Array => return array_lengths(plan, vector, rows, settings, lens, staged),
+        Kind::Array | Kind::Vector => {
+            return array_lengths(plan, vector, rows, settings, lens, staged);
+        }
         _ => {}
     }
     let data = vector.data().ok_or_else(|| wrong_data(plan))?;
@@ -593,6 +613,12 @@ fn stage_column(
                 stage(lens, staged, i, |out| u64_out(u64::from(values[start + i]), out))?;
             }
         }
+        (Kind::Reg(kind), _) => {
+            let Data::UInt32(values) = data else { return Err(wrong_data(plan)) };
+            for i in rows {
+                stage(lens, staged, i, |out| reg_out(kind, values[start + i], out))?;
+            }
+        }
         (Kind::Float4, _) => {
             let Data::Float32(values) = data else { return Err(wrong_data(plan)) };
             let digits = settings.extra_float_digits;
@@ -679,7 +705,7 @@ fn stage_column(
                 stage(lens, staged, i, |out| uuid_out(&bytes, out))?;
             }
         }
-        (Kind::Text | Kind::Array | Kind::Null | Kind::Display { .. }, _) => {
+        (Kind::Text | Kind::Array | Kind::Vector | Kind::Null | Kind::Display { .. }, _) => {
             return Err(wrong_data(plan));
         }
     }
@@ -737,7 +763,21 @@ fn array_lengths(
         (len >= 0).then(|| &elements[cursor[j] + 4..cursor[j] + 4 + len as usize])
     };
     for i in (0..lens.len()).filter(|&i| live.at(start + i)) {
-        let array = Array::one(parts(i).map(|j| value(j - low)).collect());
+        let mut array = Array::one(parts(i).map(|j| value(j - low)).collect());
+        if plan.kind == Kind::Vector {
+            vector_value(plan, &mut array)?;
+            if !plan.binary {
+                stage(lens, staged, i, |out| {
+                    for (at, value) in array.values.iter().flatten().enumerate() {
+                        if at > 0 {
+                            out.push(b' ');
+                        }
+                        out.extend_from_slice(value);
+                    }
+                })?;
+                continue;
+            }
+        }
         stage(lens, staged, i, |out| match plan.binary {
             true => array_send(&array, element.oid, out, |bytes, out| out.extend_from_slice(bytes)),
             false => {
@@ -746,6 +786,30 @@ fn array_lengths(
         })?;
     }
     Ok(())
+}
+
+/// An `int2vector` or an `oidvector` has one dimension with the lower bound 0, also when it is
+/// empty, and it has no null.
+fn vector_value(plan: Plan, array: &mut Array<&[u8]>) -> Result<(), TypeError> {
+    if array.values.iter().any(Option::is_none) {
+        return Err(TypeError::new(
+            SqlState::NULL_VALUE_NOT_ALLOWED,
+            "array must not contain nulls".to_owned(),
+        ));
+    }
+    let len = i32::try_from(array.values.len()).map_err(|_| wrong_data(plan))?;
+    array.dims = vec![ArrayDim { len, lower: 0 }];
+    Ok(())
+}
+
+/// The text output of an OID alias type. A `regtype` of a built-in type is its name, as
+/// `format_type` gives it. Every other value is the number until the catalog of PG3 has the names.
+fn reg_out(kind: RegKind, oid: Oid, out: &mut Vec<u8>) {
+    if kind == RegKind::Type && oid != 0 && TypeInfo::get(oid).is_some() {
+        out.extend_from_slice(format_type(oid).as_bytes());
+    } else {
+        reg_out_oid(kind, oid, out);
+    }
 }
 
 /// Writes one staged value and keeps its length.
@@ -868,7 +932,7 @@ fn fixed(
                 value.copy_from_slice(&(values[start + i] as i64).to_be_bytes());
             })
         }),
-        Kind::Oid => {
+        Kind::Oid | Kind::Reg(_) => {
             let Data::UInt32(values) = data else { return Err(wrong_data(plan)) };
             each(lens, cursor, out, |i, value| {
                 value.copy_from_slice(&values[start + i].to_be_bytes())
@@ -935,6 +999,7 @@ fn fixed(
         | Kind::Text
         | Kind::Bytea
         | Kind::Array
+        | Kind::Vector
         | Kind::Null
         | Kind::Display { .. } => {
             return Err(wrong_data(plan));
@@ -1394,6 +1459,71 @@ mod tests {
             empty.extend_from_slice(&w.to_be_bytes());
         }
         assert_eq!(rows[2][1].as_deref(), Some(&empty[..]));
+    }
+
+    #[test]
+    fn a_vector_has_no_braces_and_an_oid_alias_has_a_name() {
+        let zone = FixedZone::utc();
+        let settings = settings(&zone);
+        let list = |element: LogicalType, values: Vec<Value>| Value::List { element, values };
+        let int2s = LogicalType::List(Box::new(LogicalType::SmallInt));
+        let oids_type = LogicalType::List(Box::new(LogicalType::UInteger));
+        let vectors = Vector::from_values(
+            int2s.clone(),
+            &[
+                list(LogicalType::SmallInt, vec![Value::SmallInt(1), Value::SmallInt(-2)]),
+                list(LogicalType::SmallInt, Vec::new()),
+                Value::Null,
+            ],
+        )
+        .unwrap();
+        let oid_vectors = Vector::from_values(
+            oids_type.clone(),
+            &[
+                list(LogicalType::UInteger, vec![Value::UInteger(23), Value::UInteger(25)]),
+                list(LogicalType::UInteger, vec![Value::UInteger(0)]),
+                list(LogicalType::UInteger, Vec::new()),
+            ],
+        )
+        .unwrap();
+        let ids = [Value::UInteger(23), Value::UInteger(0), Value::UInteger(oids::INT4_ARRAY)];
+        let types = Vector::from_values(LogicalType::UInteger, &ids).unwrap();
+        let ids = [Value::UInteger(1259), Value::UInteger(0), Value::Null];
+        let classes = Vector::from_values(LogicalType::UInteger, &ids).unwrap();
+        let columns = [vectors, oid_vectors, types, classes];
+        let rows = |binary| {
+            let spec = [
+                (int2s.clone(), oids::INT2VECTOR, binary),
+                (oids_type.clone(), oids::OIDVECTOR, binary),
+                (LogicalType::UInteger, oids::REGTYPE, binary),
+                (LogicalType::UInteger, oids::REGCLASS, binary),
+            ];
+            let mut out = Vec::new();
+            RowEncoder::new(&spec).unwrap().encode(&columns, 0..3, &settings, &mut out).unwrap();
+            decode(&out)
+        };
+        let text = rows(false);
+        let cells: Vec<Vec<Option<String>>> = text
+            .iter()
+            .map(|row| {
+                row.iter().map(|v| v.clone().map(|v| String::from_utf8(v).unwrap())).collect()
+            })
+            .collect();
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(cells[0], [some("1 -2"), some("23 25"), some("integer"), some("1259")]);
+        assert_eq!(cells[1], [some(""), some("0"), some("-"), some("-")]);
+        assert_eq!(cells[2], [None, some(""), some("integer[]"), None]);
+        let binary = rows(true);
+        let mut expected = Vec::new();
+        crate::array::int2vector_send(&[1, -2], &mut expected);
+        assert_eq!(binary[0][0].as_deref(), Some(&expected[..]));
+        expected.clear();
+        crate::array::int2vector_send(&[], &mut expected);
+        assert_eq!(binary[1][0].as_deref(), Some(&expected[..]));
+        expected.clear();
+        crate::array::oidvector_send(&[23, 25], &mut expected);
+        assert_eq!(binary[0][1].as_deref(), Some(&expected[..]));
+        assert_eq!(binary[0][2].as_deref(), Some(&23u32.to_be_bytes()[..]));
     }
 
     #[test]
