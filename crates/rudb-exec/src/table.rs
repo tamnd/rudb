@@ -1054,7 +1054,8 @@ impl Places<'_> {
     /// value would have had, so the page is placed out of its codes and nothing is widened.
     fn lift(&self) -> u32 {
         match self {
-            Places::Bits { packed, low: Some(low) } | Places::CodedBits { packed, low: Some(low), .. } => {
+            Places::Bits { packed, low: Some(low) }
+            | Places::CodedBits { packed, low: Some(low), .. } => {
                 (packed.base() - i128::from(*low)) as u32
             }
             _ => 0,
@@ -1405,7 +1406,8 @@ impl<'a> Coded<'a> {
                 }
                 (
                     Some(Origin::Bits(base, width)),
-                    Places::Bits { packed, low: None } | Places::CodedBits { packed, low: None, .. },
+                    Places::Bits { packed, low: None }
+                    | Places::CodedBits { packed, low: None, .. },
                 ) => *base == packed.base() && *width == packed.width(),
                 (
                     Some(Origin::Window(bottom, span)),
@@ -1453,7 +1455,8 @@ impl<'a> Coded<'a> {
         for column in self.columns.iter().flatten() {
             into.push(match column.places {
                 Places::Codes { values, .. } => Origin::Dictionary(Arc::clone(values)),
-                Places::Bits { packed, low: None } | Places::CodedBits { packed, low: None, .. } => {
+                Places::Bits { packed, low: None }
+                | Places::CodedBits { packed, low: None, .. } => {
                     Origin::Bits(packed.base(), packed.width())
                 }
                 Places::Values { low, .. }
@@ -5099,7 +5102,10 @@ mod tests {
     /// built on is placed out of its codes against that window, and keeps the map.
     #[test]
     fn a_packed_page_inside_the_window_is_placed_out_of_its_codes() {
-        let first = [integers(&[Some(1), Some(2), Some(1), Some(2)]), integers(&[Some(10), Some(12), Some(14), Some(11)])];
+        let first = [
+            integers(&[Some(1), Some(2), Some(1), Some(2)]),
+            integers(&[Some(10), Some(12), Some(14), Some(11)]),
+        ];
         let mut values = Widened::default();
         let mut held = Vec::new();
         coded_within(&first, 4, &[], Some(&mut values)).expect("read by value").hold(&mut held);
@@ -5107,9 +5113,15 @@ mod tests {
             panic!("a window on the second column");
         };
         assert_eq!((low, span), (10, 6));
-        let page = [integers(&[Some(2), Some(1), Some(1), Some(2)]), packed_numbers(&[11, 12, 14, 11], 2, 11)];
+        let page = [
+            integers(&[Some(2), Some(1), Some(1), Some(2)]),
+            packed_numbers(&[11, 12, 14, 11], 2, 11),
+        ];
         let coded = coded_within(&page, 4, &held, Some(&mut values)).expect("placed by codes");
-        assert!(matches!(coded.columns[1].map(|column| column.places), Some(Places::Bits { low: Some(10), .. })));
+        assert!(matches!(
+            coded.columns[1].map(|column| column.places),
+            Some(Places::Bits { low: Some(10), .. })
+        ));
         assert!(coded.by_value() && coded.same_as(&held), "the window outlives the page");
         assert_eq!(placed(&coded, 4), vec![1 + 3, 2 * 3, 4 * 3, 1 + 3]);
         let mut whole = Vec::new();
@@ -5118,14 +5130,21 @@ mod tests {
         assert_eq!(alone, whole);
         let filtered = [
             integers(&[Some(1), Some(2)]),
-            Vector::dictionary(vec![3, 0], packed_numbers(&[11, 12, 13, 14], 2, 11)).expect("the rows a filter kept"),
+            Vector::dictionary(vec![3, 0], packed_numbers(&[11, 12, 13, 14], 2, 11))
+                .expect("the rows a filter kept"),
         ];
         let coded = coded_within(&filtered, 2, &held, Some(&mut values)).expect("placed by codes");
         assert!(coded.same_as(&held), "a filtered page lands in it too");
         assert_eq!(placed(&coded, 2), vec![4 * 3, 1 + 3]);
-        let past = [integers(&[Some(1), Some(2), Some(1), Some(2)]), packed_numbers(&[11, 12, 18, 11], 3, 11)];
+        let past = [
+            integers(&[Some(1), Some(2), Some(1), Some(2)]),
+            packed_numbers(&[11, 12, 18, 11], 3, 11),
+        ];
         let coded = coded_within(&past, 4, &held, Some(&mut values)).expect("read by value");
-        assert!(matches!(coded.columns[1].map(|column| column.places), Some(Places::Values { .. })));
+        assert!(matches!(
+            coded.columns[1].map(|column| column.places),
+            Some(Places::Values { .. })
+        ));
         assert!(!coded.same_as(&held), "a page that can reach past the window opens a new one");
     }
 
