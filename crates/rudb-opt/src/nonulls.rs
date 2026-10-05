@@ -68,7 +68,7 @@ use rudb_common::{Result, Value};
 use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 
 use crate::pass::{Context, Pass};
-use crate::{columns, eliminate, estimate, fold, link, walk};
+use crate::{columns, eliminate, estimate, fold, link, shared, walk};
 
 /// Takes the null branch out of a filter and out of a `count` where the store says there is none.
 #[derive(Debug, Clone, Copy)]
@@ -81,6 +81,9 @@ impl Pass for NoNulls {
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
         if context.allows(Rule::ValidityFree) && settle(plan) {
+            // Counts of different columns that are all `count(*)` now are one call asked more than
+            // once, so each is asked once.
+            shared::once(plan);
             // A `count` that stopped naming a column left that column read by nobody, and a parent
             // side of a join that nobody reads is a join that can go. Both of the passes that do
             // that work sit elsewhere in the sequence, one later and one earlier, so both are asked
@@ -315,6 +318,24 @@ mod tests {
         assert_eq!(
             settled(text, &empty()),
             "Aggregate #1 groups=[] aggregates=[count_star()::BIGINT]\n  \
+             Get memory.main.t AS t #0 [d::INTEGER]\n"
+        );
+    }
+
+    #[test]
+    fn a_count_that_becomes_a_count_of_the_rows_beside_one_is_asked_once() {
+        let text = "Aggregate #1 groups=[] aggregates=[count(#0.0::INTEGER)::BIGINT, \
+                    count_star()::BIGINT]\n  \
+                    Get memory.main.t AS t #0 [d::INTEGER]\n";
+        let mut plan = Plan::parse(text).expect("the plan parses");
+        plan.set_zones(0, empty() as Arc<dyn Zones>);
+        settle(&mut plan);
+        crate::shared::once(&mut plan);
+        plan.validate().expect("the plan stays valid");
+        assert_eq!(
+            plan.to_string(),
+            "Project #1 [#2.0::BIGINT AS column0, #2.0::BIGINT AS column1]\n  \
+             Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n    \
              Get memory.main.t AS t #0 [d::INTEGER]\n"
         );
     }

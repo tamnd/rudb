@@ -89,6 +89,74 @@ pub fn share(plan: &mut Plan) {
     }
 }
 
+/// Answers every call an aggregate in `plan` asks more than once from one copy of it.
+pub(crate) fn once(plan: &mut Plan) {
+    let mut moved = false;
+    let root = walk::restack(plan, plan.root(), &mut moved, &mut asked_once);
+    if moved {
+        plan.set_root(root);
+    }
+}
+
+/// The aggregate at `at` asking each call once, when it asks one more than once.
+///
+/// TPC-H q01 has `count(*)` and a count of each of three columns once the averages are split and the
+/// sums factored, and with no nulls in the three columns [`crate::nonulls`] turns each into a
+/// `count(*)`. Four counts of the same rows were four totals folded into four states for every group
+/// of every chunk, which was a fifth of the fold on q01. The aggregate becomes a projection that
+/// keeps its index and its output order over an aggregate that asks each call once, so nothing above
+/// it moves.
+///
+/// Only calls that read columns or nothing and have no `FILTER`, since two calls of a function of a
+/// row, `random()` say, are two different answers.
+fn asked_once(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
+    let Node::Aggregate { input, index, groups, aggregates } = *plan.node(at) else { return None };
+    let calls = plan.expr_list(aggregates).to_vec();
+    let mut kept: Vec<ExprRef> = Vec::with_capacity(calls.len());
+    let mut placed = Vec::with_capacity(calls.len());
+    for &call in &calls {
+        let held = kept.iter().position(|&held| walk::same(plan, held, call));
+        match held.filter(|_| columns_only(plan, call)) {
+            Some(position) => placed.push(position),
+            None => {
+                placed.push(kept.len());
+                kept.push(call);
+            }
+        }
+    }
+    if kept.len() == calls.len() {
+        return None;
+    }
+    let staged = walk::fresh_index(plan);
+    let keys = plan.expr_list(groups).to_vec();
+    let built = plan.add_expr_list(&kept);
+    let inner = plan.add_node(Node::Aggregate { input, index: staged, groups, aggregates: built });
+    let column = |plan: &mut Plan, at: usize, ty: LogicalType| {
+        let at = u32::try_from(at).expect("an aggregate with this many expressions cannot bind");
+        plan.add_expr(Expr::Column(ColumnBinding::new(staged, at)), ty)
+    };
+    let mut projected = Vec::with_capacity(keys.len() + calls.len());
+    for (position, &key) in keys.iter().enumerate() {
+        let ty = plan.expr_type(key).clone();
+        projected.push(column(plan, position, ty));
+    }
+    for (&call, &position) in calls.iter().zip(&placed) {
+        let ty = plan.expr_type(call).clone();
+        projected.push(column(plan, keys.len() + position, ty));
+    }
+    let names: Vec<_> =
+        (0..projected.len()).map(|position| plan.intern(&format!("column{position}"))).collect();
+    let exprs = plan.add_expr_list(&projected);
+    let names = plan.add_name_list(&names);
+    Some(plan.add_node(Node::Project { input: inner, index, exprs, names }))
+}
+
+/// Whether `call` is an aggregate with no `FILTER` whose arguments are all columns.
+fn columns_only(plan: &Plan, call: ExprRef) -> bool {
+    let Expr::Aggregate { args, filter: None, .. } = *plan.expr(call) else { return false };
+    plan.expr_list(args).iter().all(|&arg| matches!(plan.expr(arg), Expr::Column(_)))
+}
+
 /// What one of the aggregate's calls becomes.
 #[derive(Clone, Copy)]
 enum Answer {

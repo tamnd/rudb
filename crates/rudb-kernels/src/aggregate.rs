@@ -2655,6 +2655,12 @@ pub struct PlaceSums {
     by_place: Vec<i64>,
     /// The places of [`Self::by_place`] with rows in the chunk, as [`Self::touched`] found them.
     touched: Vec<usize>,
+    /// Every place that has had rows, for [`Self::touched`] to ask first, and by place whether it
+    /// is on that list.
+    seen: Vec<usize>,
+    marked: Vec<bool>,
+    /// The rows the last [`Self::add_places`] added, the ones the filter dropped among them.
+    added: usize,
 }
 
 impl PlaceSums {
@@ -2811,6 +2817,7 @@ impl PlaceSums {
         combos: usize,
     ) -> Result<()> {
         let needed = (combos + 1) * cell_span(self.calls.len());
+        self.added = places.len();
         if self.by_place.len() < needed {
             self.by_place.resize(needed, 0);
         }
@@ -2841,11 +2848,18 @@ impl PlaceSums {
     }
 
     /// Writes down the places [`Self::add_places`] added rows into, and says whether `map` has no
-    /// group yet for any of them, in one pass over the places.
+    /// group yet for any of them.
     ///
     /// The caller opens a group for each such place before [`Self::fold_places`]. On q01 the map
     /// has a place for every two or three rows of a chunk and about 400 of them have rows, so the
     /// fold goes through the list rather than through the map again.
+    ///
+    /// The places that have had rows in any chunk before are asked first. Every row adds one to the
+    /// count of its place, so when their counts add up to the rows the chunk put in the map no other
+    /// place can have any, and the other three thousand places of q01's map are not looked at. A
+    /// chunk with a row in a place no chunk had before is a pass over the count of every place, as
+    /// it always was. Asking only the places of the chunk before was tried first, and q01 has groups
+    /// of a row in every few chunks, so nearly every chunk fell back to the pass.
     ///
     /// # Errors
     ///
@@ -2853,28 +2867,45 @@ impl PlaceSums {
     pub fn touched(&mut self, map: &[u32]) -> Result<bool> {
         let (width, span) = (self.calls.len(), cell_span(self.calls.len()));
         let used = self.by_place.len().min((map.len() + 1) * span);
-        self.touched.clear();
-        // Only the count of each place is read, as every `span`th cell, since asking each place's
-        // cells whether it had rows was ten instructions a place and q01 has 3468 of them a chunk.
         let counts = self.by_place[..used].get(width..).unwrap_or_default();
-        for (place, &count) in counts.iter().step_by(span).enumerate() {
+        // The rows the filter dropped, which are all in the place past the map.
+        let dropped = counts.get(map.len() * span).copied().unwrap_or(0);
+        let rows = i64::try_from(self.added).unwrap_or(i64::MAX) - dropped;
+        let mut found = 0;
+        self.touched.clear();
+        for &place in &self.seen {
+            let count = if place < map.len() { counts[place * span] } else { 0 };
+            found += count;
             if count != 0 {
                 self.touched.push(place);
             }
         }
-        let mut unseen = false;
-        for &place in &self.touched {
-            unseen |= map.get(place).is_some_and(|&held| held == UNSEEN);
-        }
-        // The rows the filter dropped.
-        if self.touched.last() == Some(&map.len()) {
-            self.touched.pop();
-            if let Some(cells) = self.by_place.get_mut(map.len() * span..used) {
-                cells.fill(0);
+        if found != rows {
+            // Only the count of each place is read, as every `span`th cell, since asking each
+            // place's cells whether it had rows was ten instructions a place.
+            self.touched.clear();
+            if self.marked.len() < map.len() {
+                self.marked.resize(map.len(), false);
             }
+            for (place, &count) in counts.iter().step_by(span).take(map.len()).enumerate() {
+                if count != 0 {
+                    self.touched.push(place);
+                    if !self.marked[place] {
+                        self.marked[place] = true;
+                        self.seen.push(place);
+                    }
+                }
+            }
+        }
+        if let Some(cells) = self.by_place.get_mut(map.len() * span..used) {
+            cells.fill(0);
         }
         if self.by_place[used..].iter().any(|&cell| cell != 0) {
             return Err(Error::internal("a place past the map has rows".to_string()));
+        }
+        let mut unseen = false;
+        for &place in &self.touched {
+            unseen |= map.get(place).is_some_and(|&held| held == UNSEEN);
         }
         Ok(unseen)
     }
@@ -2902,7 +2933,6 @@ impl PlaceSums {
             fold_cells(&self.calls, &self.counting, cells, states, held as usize * stride)?;
             cells.fill(0);
         }
-        self.touched.clear();
         Ok(())
     }
 }
@@ -6425,17 +6455,26 @@ mod tests {
                 .expect("folds it");
         }
         // Added up by place with the map left out of the pass, the group it has no slot for is
-        // found after the pass, and the answers are the same again. A second chunk goes through
+        // found after the pass, and the answers are the same again. Two more chunks go through
         // the same cells to show the fold left them at nothing.
         let mut each_place = fresh();
         assert!(sums.adds_by_place(groups, rows), "a map of four places over {rows} rows");
         assert!(!sums.adds_by_place(rows / 2, rows), "a map of half the rows");
         let mut map: Vec<u32> = (0..groups as u32).collect();
         map[2] = u32::MAX;
-        for chunk in 0..2 {
+        for chunk in 0..3 {
             assert!(sums.ready(&each_place, stride, &inputs, wanted, rows));
             let mut cut = places.clone();
             sums.add_places(&mut cut, Some(&kept), groups).expect("adds them up");
+            // The first chunk has no places from before and looks at every place. The second
+            // finds its places among the first's, and the third is left one of them to ask first,
+            // so its rows add up short and it looks at every place again.
+            if chunk == 2 {
+                let first = sums.seen[0];
+                sums.seen.truncate(1);
+                sums.marked.fill(false);
+                sums.marked[first] = true;
+            }
             assert_eq!(sums.touched(&map).expect("looks"), chunk == 0, "chunk {chunk}");
             map[2] = 2;
             sums.fold_places(&map, &mut each_place, stride).expect("folds them in");
@@ -6444,10 +6483,10 @@ mod tests {
                     .expect("folds it");
             }
         }
-        let mut twice = fresh();
-        for _ in 0..2 {
+        let mut thrice = fresh();
+        for _ in 0..3 {
             for (at, &input) in inputs.iter().enumerate() {
-                update_scattered(&mut twice, &slots, stride, at, input, rows)
+                update_scattered(&mut thrice, &slots, stride, at, input, rows)
                     .expect("folds them in");
             }
         }
@@ -6459,10 +6498,10 @@ mod tests {
                 assert_eq!(together[index].finish().expect("finishes"), answer, "{note}");
                 assert_eq!(by_slot[index].finish().expect("finishes"), answer, "{note}, by slot");
                 assert_eq!(by_place[index].finish().expect("finishes"), answer, "{note}, by place");
-                let doubled = twice[index].finish().expect("finishes");
+                let tripled = thrice[index].finish().expect("finishes");
                 assert_eq!(
                     each_place[index].finish().expect("finishes"),
-                    doubled,
+                    tripled,
                     "{note}, each place"
                 );
             }
