@@ -362,6 +362,74 @@ impl Chooser for Settled {
     }
 }
 
+/// A [`Settled`] shape that remembers whether it left any chunk to a search.
+///
+/// A level the shape names that does not apply to a chunk is searched, which is right for the
+/// chunk and wrong for the choice of shape. `FRONT` is only offered when a chunk's values share a
+/// twentieth of their bytes with the value before them, and the titles of `title` in the order
+/// they were first seen mostly do not. Settled on eight blocks, `FRONT` then `LZ` came out one
+/// percent smaller than `LZ` then `FSST`, because the blocks it did not fit were searched and a
+/// search finds the smallest answer there is. Over the column it then searched most blocks and
+/// encoded at 4.4 MB/s where `LZ` then `FSST` runs at 51. Settling through this is how a shape
+/// that only won by searching is told apart from one that won by fitting.
+#[derive(Debug)]
+pub struct Watched<'a> {
+    shape: &'a Settled,
+    searched: AtomicBool,
+}
+
+impl<'a> Watched<'a> {
+    /// `shape`, watched from now on.
+    #[must_use]
+    pub fn new(shape: &'a Settled) -> Self {
+        Self { shape, searched: AtomicBool::new(false) }
+    }
+
+    /// Whether every level the shape names applied to every chunk encoded through this so far.
+    #[must_use]
+    pub fn fitted(&self) -> bool {
+        !self.searched.load(Ordering::Relaxed)
+    }
+}
+
+impl Chooser for Watched<'_> {
+    fn name(&self) -> &'static str {
+        "watched"
+    }
+
+    fn narrow_strings(
+        &self,
+        values: &[&[u8]],
+        offered: &[string::Kind],
+        depth: u8,
+    ) -> Vec<string::Kind> {
+        let narrowed = self.shape.narrow_strings(values, offered, depth);
+        // Below the shape every level is searched on purpose, and a level that offers one kind has
+        // nothing to search.
+        if (depth as usize) < self.shape.strings.len() && narrowed.len() > 1 {
+            self.searched.store(true, Ordering::Relaxed);
+        }
+        narrowed
+    }
+
+    fn narrow_integers(
+        &self,
+        values: &[i64],
+        offered: &[integer::Kind],
+        depth: u8,
+    ) -> Vec<integer::Kind> {
+        self.shape.narrow_integers(values, offered, depth)
+    }
+
+    fn considers_integer(&self, kind: integer::Kind, depth: u8) -> bool {
+        self.shape.considers_integer(kind, depth)
+    }
+
+    fn symbols(&self, depth: u8) -> Option<&SymbolTable> {
+        self.shape.symbols(depth)
+    }
+}
+
 /// Encode an integer chunk the way an earlier one came out, and search only where it stops fitting.
 ///
 /// [`Settled`] holds one kind per level, which is too coarse for a cascade that branches: an `RLE`
@@ -506,7 +574,7 @@ pub(crate) fn sample<T: Copy>(values: &[T], window: usize, regions: usize) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use super::{Chooser, EXHAUSTIVE, Replay, Sampled, Settled, sample};
+    use super::{Chooser, EXHAUSTIVE, Replay, Sampled, Settled, Watched, sample};
     use crate::{integer, string};
 
     /// A settled shape that tests for every kind, which is what [`Settled`] did before it said
@@ -714,5 +782,29 @@ mod tests {
         let values: Vec<&[u8]> = vec![empty.as_slice(); 40_000];
         let offered = [string::Kind::Plain, string::Kind::Fsst, string::Kind::Dict];
         assert_eq!(sampled.narrow_strings(&values, &offered, 0), offered);
+    }
+
+    #[test]
+    fn a_watched_shape_says_whether_it_left_a_chunk_to_a_search() {
+        let shape =
+            Settled::new(vec![string::Kind::Front, string::Kind::Lz], vec![integer::Kind::Packed]);
+        let tail = |at: u32| at.wrapping_mul(2_654_435_761);
+        // Each URL shares its host and path with the one before it, which is what `FRONT` is for.
+        let near: Vec<Vec<u8>> = (0..1024)
+            .map(|at| {
+                format!("http://www.example.com/item/{at:06}?s={:08x}", tail(at)).into_bytes()
+            })
+            .collect();
+        let near: Vec<&[u8]> = near.iter().map(Vec::as_slice).collect();
+        let watched = Watched::new(&shape);
+        string::encode_with(&near, &watched).expect("encodes");
+        assert!(watched.fitted());
+        // These start with a hash, so neighbours share nothing and `FRONT` is not offered.
+        let apart: Vec<Vec<u8>> = (0..1024)
+            .map(|at| format!("{:08x} and the rest of it", tail(at)).into_bytes())
+            .collect();
+        let apart: Vec<&[u8]> = apart.iter().map(Vec::as_slice).collect();
+        string::encode_with(&apart, &watched).expect("encodes");
+        assert!(!watched.fitted());
     }
 }

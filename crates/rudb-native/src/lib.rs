@@ -14702,12 +14702,23 @@ fn encode_waiting(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
 /// the back, and those do not compress alike. Which blocks those are is
 /// [`GlobalDictionary::seal`]'s to decide, because by the time this is called the rest of them have
 /// been encoded and the raw bytes are gone.
+///
+/// Only a shape that fits every block of the sample can win. One that does not leaves those blocks
+/// to a search, which finds them the smallest answer there is and so makes the shape look smaller
+/// than it is, and then searches the same share of the column at a tenth of the speed. On the JOB
+/// tables `FRONT` then `LZ` won `title` and `char_name` that way by one percent over `LZ` then
+/// `FSST`, and encoded them at 6 MB/s against 55. Every shape that fitted its sample ran at 40 MB/s
+/// or more. `PLAIN` fits everything, so something always wins.
 fn settle_shape(sample: &[Vec<&[u8]>]) -> Result<chooser::Settled> {
     let mut best: Option<(chooser::Settled, usize)> = None;
     for shape in payload_shapes() {
+        let watched = chooser::Watched::new(&shape);
         let mut size = 0;
         for block in sample {
-            size += string::encode_with(block, &shape)?.len();
+            size += string::encode_with(block, &watched)?.len();
+        }
+        if !watched.fitted() {
+            continue;
         }
         if best.as_ref().is_none_or(|(_, smallest)| size < *smallest) {
             best = Some((shape, size));
