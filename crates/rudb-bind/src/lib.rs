@@ -37,12 +37,13 @@ mod typed;
 mod unnest;
 
 pub use binder::{bind, bind_sql, bind_sql_with, bind_with};
-pub use parameters::{Capture, Caught, Described, Parameters, Placeholders, Written};
 pub use macros::kept_macro;
+pub use parameters::{Capture, Caught, Described, Parameters, Placeholders, Written};
 pub use statement::{
     Attach, Bound, Call, Checks, Conflict, ConflictAction, CopyTo, CreateTable, CreateView,
-    DropTable, Insert, MacroChange, SchemaChange, SequenceChange, TriggerChange, TypeChange, Write, bind_checks,
-    bind_statement, bind_statement_outlined, bind_statement_sql, bind_statement_with, cascading,
+    DropTable, Insert, MacroChange, SchemaChange, SequenceChange, TriggerChange, TypeChange, Write,
+    bind_checks, bind_statement, bind_statement_outlined, bind_statement_sql, bind_statement_with,
+    cascading,
 };
 
 #[cfg(test)]

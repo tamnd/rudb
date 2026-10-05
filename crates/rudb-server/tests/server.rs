@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use rudb_pgwire::{
-    Backend, Cancel, Frontend, PROTOCOL_3_0, PROTOCOL_3_2, Packet, Startup, encode_options,
+    Backend, Bind, Cancel, Frontend, Oids, PROTOCOL_3_0, PROTOCOL_3_2, Packet, Startup, Target,
+    encode_oids, encode_options,
 };
 use rudb_server::{Config, Server, init};
 
@@ -115,6 +116,43 @@ impl Client {
 
     fn query(&mut self, sql: &str) -> Vec<Message> {
         self.send(&Frontend::Query(sql.as_bytes()));
+        self.until_ready()
+    }
+
+    fn parse(&mut self, name: &str, sql: &str, types: &[u32]) {
+        let types = encode_oids(types);
+        let types = Oids::from_bytes(&types);
+        self.send(&Frontend::Parse { name: name.as_bytes(), sql: sql.as_bytes(), types });
+    }
+
+    fn bind(&mut self, portal: &str, statement: &str, formats: &[i16], values: &[Option<&[u8]>]) {
+        self.bind_with(portal, statement, formats, values, &[]);
+    }
+
+    fn bind_with(
+        &mut self,
+        portal: &str,
+        statement: &str,
+        formats: &[i16],
+        values: &[Option<&[u8]>],
+        result_formats: &[i16],
+    ) {
+        let mut bytes = Vec::new();
+        let (portal, statement) = (portal.as_bytes(), statement.as_bytes());
+        Bind::encode(&mut bytes, portal, statement, formats, values, result_formats);
+        self.socket.write_all(&bytes).unwrap();
+    }
+
+    fn describe(&mut self, target: Target, name: &str) {
+        self.send(&Frontend::Describe { target, name: name.as_bytes() });
+    }
+
+    fn execute(&mut self, portal: &str, max_rows: i32) {
+        self.send(&Frontend::Execute { portal: portal.as_bytes(), max_rows });
+    }
+
+    fn sync(&mut self) -> Vec<Message> {
+        self.send(&Frontend::Sync);
         self.until_ready()
     }
 
@@ -284,15 +322,226 @@ fn an_error_stops_the_query_and_the_session_goes_on() {
     let messages = client.query("commit");
     assert_eq!((text(&messages[0]).as_str(), messages[1].body.as_slice()), ("ROLLBACK", &b"I"[..]));
 
-    // A message of the extended protocol is an error until it comes, and the session skips to
-    // the next Sync.
-    // Parse of the unnamed statement `select 1` with no parameter types.
-    client.socket.write_all(b"P\0\0\0\x10\0select 1\0\0\0").unwrap();
-    client.send(&Frontend::Sync);
-    let messages = client.until_ready();
+    // An error in a message of the extended protocol skips the messages up to the next Sync.
+    client.parse("", "select nope from", &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 0);
+    let messages = client.sync();
     assert_eq!(tags(&messages), "EZ");
-    assert_eq!(messages[0].field(b'C').as_deref(), Some("0A000"));
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("42601"));
     assert_eq!(tags(&client.query("select 1")), "TDCZ");
+    server.stop().unwrap();
+}
+
+/// The row description of a message.
+fn row_shape(message: &Message) -> Vec<(String, u32, i16)> {
+    let bytes = message.decoded();
+    let Backend::RowDescription(fields) = Backend::decode(&bytes).unwrap().unwrap().0 else {
+        panic!("{message:?}");
+    };
+    fields
+        .iter()
+        .map(|f| (String::from_utf8_lossy(f.name).into_owned(), f.type_oid, f.format))
+        .collect()
+}
+
+fn parameter_types(message: &Message) -> Vec<u32> {
+    let bytes = message.decoded();
+    let Backend::ParameterDescription(types) = Backend::decode(&bytes).unwrap().unwrap().0 else {
+        panic!("{message:?}");
+    };
+    types
+}
+
+fn data_row(message: &Message) -> Vec<Option<Vec<u8>>> {
+    let bytes = message.decoded();
+    let Backend::DataRow(values) = Backend::decode(&bytes).unwrap().unwrap().0 else {
+        panic!("{message:?}");
+    };
+    values.iter().map(|v| v.map(<[u8]>::to_vec)).collect()
+}
+
+#[test]
+fn the_extended_query_flow() {
+    let dirs = Dirs::new("extended");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create table t (i integer, s varchar)");
+
+    // Describe of a statement gives the types that the binder finds for the parameters.
+    client.parse("", "insert into t values ($1, $2)", &[]);
+    client.describe(Target::Statement, "");
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "1tnZ");
+    assert_eq!(parameter_types(&messages[1]), [23, 25]);
+
+    // A text value and a binary value of the type that Describe gives.
+    client.bind("", "", &[], &[Some(b"1"), Some(b"a")]);
+    client.execute("", 0);
+    client.bind("", "", &[1, 0], &[Some(&2i32.to_be_bytes()), Some(b"b")]);
+    client.execute("", 0);
+    client.bind("", "", &[], &[Some(b"3"), None]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "2C2C2CZ");
+    assert_eq!(text(&messages[1]), "INSERT 0 1");
+
+    // A named statement with a declared type, and a portal that sends its rows in two parts.
+    client.parse("q", "select i, s from t where i >= $1 order by i", &[23]);
+    client.describe(Target::Statement, "q");
+    client.bind_with("p", "q", &[], &[Some(b"1")], &[1, 0]);
+    client.execute("p", 2);
+    client.execute("p", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "1tT2DDsDCZ");
+    assert_eq!(parameter_types(&messages[1]), [23]);
+    assert_eq!(row_shape(&messages[2]), [("i".to_owned(), 23, 0), ("s".to_owned(), 25, 0)]);
+    assert_eq!(data_row(&messages[4]), [Some(1i32.to_be_bytes().to_vec()), Some(b"a".to_vec())]);
+    assert_eq!(data_row(&messages[7]), [Some(3i32.to_be_bytes().to_vec()), None]);
+    assert_eq!(text(&messages[8]), "SELECT 1");
+
+    // Describe of a portal gives the formats of the Bind, and a limit that is the number of the
+    // rows left suspends the portal as in PostgreSQL.
+    client.bind_with("", "q", &[], &[Some(b"2")], &[1]);
+    client.describe(Target::Portal, "");
+    client.execute("", 2);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "2TDDsCZ");
+    assert_eq!(row_shape(&messages[1]), [("i".to_owned(), 23, 1), ("s".to_owned(), 25, 1)]);
+    assert_eq!(text(&messages[5]), "SELECT 0");
+
+    // A parameter of no known type is text.
+    client.parse("", "select $1", &[]);
+    client.describe(Target::Statement, "");
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "1tTZ");
+    assert_eq!(parameter_types(&messages[1]), [25]);
+
+    // An empty query.
+    client.parse("", "", &[]);
+    client.describe(Target::Statement, "");
+    client.bind("", "", &[], &[]);
+    client.describe(Target::Portal, "");
+    client.execute("", 0);
+    assert_eq!(tags(&client.sync()), "1tn2nIZ");
+
+    // Close, and the portals end with the transaction.
+    client.bind("p", "q", &[], &[Some(b"1")]);
+    client.send(&Frontend::Close { target: Target::Statement, name: b"q" });
+    client.execute("p", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "23DDDCZ");
+    client.execute("p", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("34000"));
+    assert_eq!(messages[0].field(b'M').as_deref(), Some("portal \"p\" does not exist"));
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_errors_of_the_extended_query_flow() {
+    let dirs = Dirs::new("extended-errors");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::tcp(&server);
+    connect(&mut client, PROTOCOL_3_2);
+    // The error after any ParseComplete.
+    let error = |client: &mut Client| {
+        let mut messages = client.sync();
+        messages.retain(|m| m.tag != b'1');
+        assert_eq!(tags(&messages), "EZ", "{messages:?}");
+        let error = &messages[0];
+        (error.field(b'C').unwrap(), error.field(b'M').unwrap(), error.field(b'W'))
+    };
+
+    client.bind("", "nope", &[], &[]);
+    let (code, message, _) = error(&mut client);
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("26000", "prepared statement \"nope\" does not exist")
+    );
+
+    client.parse("q", "select $1::integer + 1", &[]);
+    client.parse("q", "select 1", &[]);
+    client.describe(Target::Statement, "q");
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "1EZ");
+    assert_eq!(messages[1].field(b'C').as_deref(), Some("42P05"));
+
+    client.bind("", "q", &[], &[]);
+    let (code, message, _) = error(&mut client);
+    assert_eq!(code, "08P01");
+    assert_eq!(
+        message,
+        "bind message supplies 0 parameters, but prepared statement \"q\" requires 1"
+    );
+
+    client.parse("", "select $1::integer", &[23]);
+    client.bind("", "", &[], &[Some(b"4x")]);
+    let (code, message, context) = error(&mut client);
+    assert_eq!(code, "22P02");
+    assert_eq!(message, "invalid input syntax for type integer: \"4x\"");
+    assert_eq!(context.as_deref(), Some("unnamed portal parameter $1"));
+
+    client.parse("", "select $1::integer", &[23]);
+    client.bind("p", "", &[1], &[Some(&7i64.to_be_bytes())]);
+    let (code, message, context) = error(&mut client);
+    assert_eq!(code, "22P03");
+    assert_eq!(message, "incorrect binary data format in bind parameter 1");
+    assert_eq!(context.as_deref(), Some("portal \"p\" parameter $1"));
+
+    client.parse("", "select $1::integer", &[23]);
+    client.bind("", "", &[2], &[Some(b"1")]);
+    let (code, message, _) = error(&mut client);
+    assert_eq!((code.as_str(), message.as_str()), ("22023", "unsupported format code: 2"));
+
+    client.parse("", "select 1; select 2", &[]);
+    let (code, message, _) = error(&mut client);
+    assert_eq!(code, "42601");
+    assert_eq!(message, "cannot insert multiple commands into a prepared statement");
+
+    client.parse("", "select 1, 2", &[]);
+    client.bind_with("", "", &[], &[], &[0, 1, 0]);
+    client.execute("", 0);
+    let (code, message, _) = error(&mut client);
+    assert_eq!(code, "08P01");
+    assert_eq!(message, "bind message has 3 result formats but query has 2 columns");
+
+    client.parse("", "select 1", &[]);
+    client.bind_with("", "", &[], &[], &[2]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12EZ");
+    assert_eq!(messages[2].field(b'C').as_deref(), Some("22023"));
+
+    // A portal of a statement without rows runs one time.
+    client.query("create table t (i integer)");
+    client.parse("", "insert into t values (1)", &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 0);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12CEZ");
+    assert_eq!(messages[3].field(b'C').as_deref(), Some("55000"));
+    assert_eq!(messages[3].field(b'M').as_deref(), Some("portal \"\" cannot be run"));
+
+    // In a failed transaction a Parse gives 25P02, except for a statement that ends it.
+    client.query("begin");
+    client.query("select nope");
+    client.parse("", "select 1", &[]);
+    client.bind("", "", &[], &[]);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("25P02"));
+    assert_eq!(messages[1].body, b"E");
+    client.parse("", "rollback", &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12CZ");
+    assert_eq!(messages[3].body, b"I");
     server.stop().unwrap();
 }
 

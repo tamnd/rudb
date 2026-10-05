@@ -99,6 +99,7 @@ mod generated;
 mod json;
 mod number;
 mod numeric;
+mod param;
 mod reg;
 mod row;
 mod scalar;
@@ -131,6 +132,7 @@ pub use numeric::{
     Numeric, NumericSign, decimal_out, decimal_send, numeric_in, numeric_out, numeric_recv,
     numeric_send,
 };
+pub use param::{InputSettings, logical_type, param_value};
 pub use reg::{
     RegInput, RegKind, qualified_name_list, reg_in, reg_out_oid, split_identifier_string,
 };
