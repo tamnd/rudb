@@ -1701,12 +1701,18 @@ impl<'a> Transform<'a> {
             self.part_slice(parts)
         };
         let body = self.find(inner, "SelectStatementInternal");
+        let before = self.ast.ctes.len();
         let (sql, query) = if recursive {
             let view = self.ast.name(name).last().unwrap_or_default().to_owned();
             self.recursive_view(&view, columns, body)?
         } else {
             (self.text(body).to_string(), self.query(body)?)
         };
+        if self.ast.ctes[before..].iter().any(|cte| cte.dml.is_some()) {
+            return Err(Error::binder(
+                "DML statements (INSERT/UPDATE/DELETE) are not allowed as CTE bodies inside a VIEW",
+            ));
+        }
         let sql = self.intern(&sql);
         let index = self.ast.create_views.len() as u32;
         self.ast.create_views.push(CreateView {
@@ -2654,12 +2660,19 @@ impl<'a> Transform<'a> {
         };
         self.ctes.truncate(mark);
         let statement = statement?;
+        self.carry_definitions(statement, &once);
+        Ok(statement)
+    }
+
+    /// Puts the held definitions `once` ahead of the ones each query of a written statement already
+    /// carries, its source, its `RETURNING` and the values of an `ON CONFLICT DO UPDATE`.
+    fn carry_definitions(&mut self, statement: Statement, once: &[u32]) {
         if let (
             false,
             Statement::Insert(index) | Statement::Update(index) | Statement::Delete(index),
-        ) = (once.is_empty(), &statement)
+        ) = (once.is_empty(), statement)
         {
-            let insert = self.ast.inserts[*index as usize];
+            let insert = self.ast.inserts[index as usize];
             let update = match insert.conflict.map(|conflict| conflict.action) {
                 Some(ConflictAction::Update { query, .. }) => Some(query),
                 _ => None,
@@ -2667,13 +2680,12 @@ impl<'a> Transform<'a> {
             for query in std::iter::once(insert.source).chain(insert.returning).chain(update) {
                 // Outermost first, so the statement's own come ahead of any the query wrote.
                 let own = self.ast.queries[query as usize].ctes;
-                let mut all = once.clone();
+                let mut all = once.to_vec();
                 all.extend_from_slice(self.ast.cte_list(own));
                 let slice = self.cte_slice(all);
                 self.ast.queries[query as usize].ctes = slice;
             }
         }
-        Ok(statement)
     }
 
     /// `UpdateStatement <- WithClause? 'UPDATE' UpdateTarget UpdateSetClause FromClause?
@@ -2985,6 +2997,12 @@ impl<'a> Transform<'a> {
             };
             let body = self.find(statement, "CTEBody");
             let select = self.first(body);
+            if self.name(select) == "CTEDMLBody" {
+                let index = self.written_definition(select, name, columns, recursive)?;
+                once.push(index);
+                self.ctes.push((name, Held::Once(index), columns));
+                continue;
+            }
             if self.name(select) != "CTESelectBody" {
                 return self.unsupported(body);
             }
@@ -3007,7 +3025,7 @@ impl<'a> Transform<'a> {
             if materialized {
                 let index = self.ast.ctes.len() as u32;
                 let key = Slice::default();
-                self.ast.ctes.push(Cte { name, query, columns, recursive: false, key });
+                self.ast.ctes.push(Cte { name, query, columns, recursive: false, key, dml: None });
                 once.push(index);
                 self.ctes.push((name, Held::Once(index), columns));
             } else {
@@ -3015,6 +3033,55 @@ impl<'a> Transform<'a> {
             }
         }
         Ok(once)
+    }
+
+    /// A definition that is an `INSERT`, an `UPDATE` or a `DELETE`, and its index in `Ast::ctes`.
+    ///
+    /// It is always held, since it has to run once whether it is read or not, and the definitions
+    /// held before it in the same `WITH` are carried by its queries so that it can read them. The
+    /// pin only runs one in the `WITH` of the statement itself, which is a query one deep or a
+    /// written statement, and refuses any other body, and a recursive one, in its own words.
+    fn written_definition(
+        &mut self,
+        body: u32,
+        name: StrRef,
+        columns: Slice,
+        recursive: bool,
+    ) -> Result<u32> {
+        let inner = self.first(self.first(body));
+        if !matches!(self.name(inner), "InsertStatement" | "UpdateStatement" | "DeleteStatement") {
+            return Err(Error::parser(
+                "A CTE body must be a SELECT, INSERT, UPDATE, DELETE, or COPY TO statement",
+            ));
+        }
+        if recursive {
+            return Err(Error::parser("Recursive CTEs with DML statements are not supported"));
+        }
+        if self.query_depth > 1 {
+            return Err(Error::binder(
+                "WITH clause containing a data-modifying statement must be at the top level",
+            ));
+        }
+        let statement = self.write_statement(inner)?;
+        let earlier: Vec<u32> = self
+            .ctes
+            .iter()
+            .filter_map(|&(_, held, _)| match held {
+                Held::Once(index) => Some(index),
+                Held::Inline(_) => None,
+            })
+            .collect();
+        self.carry_definitions(statement, &earlier);
+        let (Statement::Insert(at) | Statement::Update(at) | Statement::Delete(at)) = statement
+        else {
+            unreachable!("a written statement is an insert, an update or a delete")
+        };
+        let query = self.ast.inserts[at as usize].source;
+        let index = self.ast.ctes.len() as u32;
+        let key = Slice::default();
+        let dml = Some(statement);
+        self.ast.ctes.push(Cte { name, query, columns, recursive: false, key, dml });
+        Ok(index)
     }
 
     /// A definition under `WITH RECURSIVE`, transformed with its own name in scope, and its index
@@ -3037,7 +3104,7 @@ impl<'a> Transform<'a> {
     ) -> Result<u32> {
         let index = self.ast.ctes.len() as u32;
         let none = Slice::default();
-        self.ast.ctes.push(Cte { name, query: 0, columns, recursive: false, key: none });
+        self.ast.ctes.push(Cte { name, query: 0, columns, recursive: false, key: none, dml: None });
         let scope = self.ctes.len();
         self.ctes.push((name, Held::Once(index), columns));
         let reads = self.self_reads.len();
@@ -3087,7 +3154,7 @@ impl<'a> Transform<'a> {
         // comes to take the last row per key over both sides of one that does not.
         let recursive = !found.is_empty() || (anchor.is_some() && key.len > 0);
         let key = if recursive { key } else { none };
-        self.ast.ctes[index as usize] = Cte { name, query, columns, recursive, key };
+        self.ast.ctes[index as usize] = Cte { name, query, columns, recursive, key, dml: None };
         Ok(index)
     }
 

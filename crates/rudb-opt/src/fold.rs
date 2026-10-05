@@ -72,7 +72,10 @@ impl Pass for ExpressionRewriter {
 /// same work twice.
 struct Done {
     rewritten: HashMap<ExprRef, ExprRef>,
-    canonical: Vec<ExprRef>,
+    /// The expressions kept so far, by [`shape`], so that finding the one an expression is the same
+    /// as looks only at those that could be. A `VALUES` of ten thousand rows is ten thousand
+    /// constants, and looking through every one kept for each one was the whole cost of it.
+    canonical: HashMap<u64, Vec<ExprRef>>,
 }
 
 /// Rewrites one expression, for a pass that built it after this one had already run.
@@ -90,13 +93,13 @@ struct Done {
 /// The sharing table is per call, which is the difference between this and [`rewrite`]. One
 /// expression is cheap to walk twice and the table only pays for itself over a whole plan.
 pub(crate) fn rewritten(plan: &mut Plan, expr: ExprRef) -> ExprRef {
-    let mut done = Done { rewritten: HashMap::new(), canonical: Vec::new() };
+    let mut done = Done { rewritten: HashMap::new(), canonical: HashMap::new() };
     expression(plan, expr, &mut done)
 }
 
 /// Rewrites every expression the plan reaches.
 fn rewrite(plan: &mut Plan) {
-    let mut done = Done { rewritten: HashMap::new(), canonical: Vec::new() };
+    let mut done = Done { rewritten: HashMap::new(), canonical: HashMap::new() };
     for node in top_down(plan) {
         node_expressions(plan, node, &mut done);
     }
@@ -281,17 +284,32 @@ fn expression(plan: &mut Plan, expr: ExprRef, done: &mut Done) -> ExprRef {
     let canonical = if walk::volatile(plan, simplified) {
         simplified
     } else {
-        done.canonical
-            .iter()
-            .copied()
-            .find(|&other| walk::same(plan, simplified, other))
-            .unwrap_or_else(|| {
-                done.canonical.push(simplified);
+        let kept = done.canonical.entry(shape(plan, simplified)).or_default();
+        kept.iter().copied().find(|&other| walk::same(plan, simplified, other)).unwrap_or_else(
+            || {
+                kept.push(simplified);
                 simplified
-            })
+            },
+        )
     };
     done.rewritten.insert(expr, canonical);
     canonical
+}
+
+/// A hash two expressions [`walk::same`] calls the same always share: the kind of expression, its
+/// type, and the value of a constant or the column of a column read.
+fn shape(plan: &Plan, expr: ExprRef) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let written = plan.expr(expr);
+    std::mem::discriminant(written).hash(&mut hasher);
+    plan.expr_type(expr).hash(&mut hasher);
+    match *written {
+        Expr::Constant(value) => format!("{:?}", plan.value(value)).hash(&mut hasher),
+        Expr::Column(binding) => binding.hash(&mut hasher),
+        _ => {}
+    }
+    hasher.finish()
 }
 
 /// Applies every rule to one expression whose operands are already rewritten.

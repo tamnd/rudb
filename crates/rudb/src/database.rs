@@ -50,6 +50,42 @@ fn names_prepared(sql: &str) -> bool {
     ["prepare", "execute", "deallocate"].iter().any(|keyword| word.eq_ignore_ascii_case(keyword))
 }
 
+/// Whether `sql` may hold a `WITH` definition that changes rows, which only the path that may
+/// write can run. A guess from the words alone, so a query that only names one of them takes that
+/// path too and answers the same there.
+fn writes_in_with(sql: &str) -> bool {
+    let word = sql.trim_start().split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+    word.eq_ignore_ascii_case("with")
+        && ["insert", "update", "delete"]
+            .iter()
+            .any(|keyword| sql.to_ascii_lowercase().contains(keyword))
+}
+
+/// The data changing `WITH` definitions of the statement in `ast` that have not run yet, in the
+/// order they were written, which is the order they run in.
+///
+/// A statement's own definitions are on its query, and on the source of a written statement, which
+/// carries every definition the statement's `WITH` holds.
+fn unwritten_definitions(ast: &Ast, parameters: &Parameters) -> Vec<u32> {
+    let [statement] = ast.statements.as_slice() else { return Vec::new() };
+    let query = match *statement {
+        ast::Statement::Query(query) => query,
+        ast::Statement::Insert(at) | ast::Statement::Update(at) | ast::Statement::Delete(at) => {
+            ast.inserts[at as usize].source
+        }
+        _ => return Vec::new(),
+    };
+    // `INSERT ... DEFAULT VALUES` has no source.
+    if query == rudb_parse::NONE {
+        return Vec::new();
+    }
+    ast.cte_list(ast.query(query).ctes)
+        .iter()
+        .copied()
+        .filter(|&cte| ast.cte(cte).dml.is_some() && parameters.written(cte).is_none())
+        .collect()
+}
+
 fn native_simple_identifier(text: &str) -> bool {
     let mut bytes = text.bytes();
     matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
@@ -3740,7 +3776,7 @@ impl Shared {
         }
         // These answer through the connection rather than the catalog, and `EXECUTE` answers with
         // whatever the statement it runs does, so they take the path that may write.
-        if names_prepared(sql) {
+        if names_prepared(sql) || writes_in_with(sql) {
             return self.execute(sql, cancel);
         }
         self.in_transaction(sql, || {
@@ -5466,6 +5502,10 @@ impl Shared {
         cancel: &Cancel,
         parse_ns: u64,
     ) -> Result<QueryResult> {
+        let unwritten = unwritten_definitions(ast, parameters);
+        if !unwritten.is_empty() {
+            return self.execute_written(ast, sql, parameters, cancel, parse_ns, &unwritten);
+        }
         let mut deadline = None;
         loop {
             self.conn.blocked.store(0, Ordering::Release);
@@ -5483,6 +5523,81 @@ impl Shared {
                 return result;
             }
         }
+    }
+
+    /// Runs a statement whose `WITH` holds definitions that change rows.
+    ///
+    /// Each one runs first, in the order it was written, as a statement of its own that can read
+    /// the rows the ones before it produced, and the statement is then bound with all of their rows
+    /// in hand. So each sees what the ones before it changed and the statement sees all of it, and a
+    /// definition nothing reads still runs, which is what the pin does. They run in one transaction,
+    /// the open one when there is one and one of their own otherwise, so a failure in any of them
+    /// undoes the rest.
+    fn execute_written(
+        &self,
+        ast: &Ast,
+        sql: &str,
+        parameters: &Parameters,
+        cancel: &Cancel,
+        parse_ns: u64,
+        unwritten: &[u32],
+    ) -> Result<QueryResult> {
+        let own = !self.transacting();
+        if own {
+            *self.open() = Some(Open::new(false));
+        }
+        let result = self.run_written(ast, sql, parameters, cancel, parse_ns, unwritten);
+        if !own {
+            return result;
+        }
+        let closed = self.open().take();
+        let writing = self.writing();
+        let closed = match closed {
+            Some(closed) => self.close_transaction(closed, result.is_ok()),
+            None => Ok(()),
+        };
+        let settled = self.settle(writing);
+        let result = result?;
+        closed?;
+        settled?;
+        Ok(result)
+    }
+
+    /// The part of [`Shared::execute_written`] that runs inside the transaction.
+    fn run_written(
+        &self,
+        ast: &Ast,
+        sql: &str,
+        parameters: &Parameters,
+        cancel: &Cancel,
+        parse_ns: u64,
+        unwritten: &[u32],
+    ) -> Result<QueryResult> {
+        let mut provided = parameters.clone();
+        for &cte in unwritten {
+            let Some(statement) = ast.cte(cte).dml else { continue };
+            let returning = match statement {
+                ast::Statement::Insert(at)
+                | ast::Statement::Update(at)
+                | ast::Statement::Delete(at) => ast.inserts[at as usize].returning.is_some(),
+                _ => false,
+            };
+            let mut step = ast.clone();
+            step.statements = vec![statement];
+            let answer = self.execute_ast(&step, sql, &provided, cancel, 0)?;
+            let written = if returning {
+                rudb_bind::Written {
+                    names: answer.names().to_vec(),
+                    types: answer.types().to_vec(),
+                    rows: answer.rows().collect(),
+                }
+            } else {
+                let changed = answer.changes().unwrap_or(0);
+                rudb_bind::Written { rows: vec![Vec::new(); changed], ..Default::default() }
+            };
+            provided.write(cte, written);
+        }
+        self.execute_ast(ast, sql, &provided, cancel, parse_ns)
     }
 
     /// [`Shared::execute_ast`] once, without waiting for a held row.
