@@ -585,13 +585,13 @@ impl StringColumn {
             let paged = self.arena.is_shared();
             self.arena.extend_from_slice(bytes);
             if paged {
-                self.arena = std::mem::replace(&mut self.arena, Buffer::new()).into_page();
+                self.arena = std::mem::take(&mut self.arena).into_page();
             }
         }
         let paged = self.views.is_shared();
         self.views.to_mut()[index] = StringView::over(bytes, offset);
         if paged {
-            self.views = std::mem::replace(&mut self.views, Buffer::new()).into_page();
+            self.views = std::mem::take(&mut self.views).into_page();
         }
         true
     }
