@@ -62,15 +62,6 @@ impl LiteralInput for Literals {
             },
             interval_style: self.interval_style,
         };
-        Some(param_value(oid, false, text.as_bytes(), 0, &settings).map_err(|error| {
-            let mut out = Error::conversion(error.message).state(error.sqlstate);
-            if let Some(detail) = error.detail {
-                out = out.detail(detail);
-            }
-            if let Some(hint) = error.hint {
-                out = out.hint(hint);
-            }
-            out
-        }))
+        Some(param_value(oid, false, text.as_bytes(), 0, &settings).map_err(Error::from))
     }
 }

@@ -11,8 +11,8 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    Error, Field, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Session, SqlState, StateKey,
-    Value, is_clustering_setting, looks_like_rule, rule_names,
+    DeclaredType, Error, Field, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Session,
+    SqlState, StateKey, Value, is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
@@ -260,14 +260,20 @@ impl Binder<'_> {
                 let session = self.session;
                 let written = ast.string(ty);
                 let target = crate::statement::session_type(self.catalog(), session, written)?;
+                let declared = session.postgres().and(rudb_pgtypes::declared_type(written));
                 if !try_cast
-                    && let Some(declared) = rudb_pgtypes::declared_type(written)
+                    && let Some(declared) = declared
                     && let Some(value) = self.read_literal(ast, operand, declared.oid)
                 {
-                    return self.checked_cast_to(value?, &target, false);
+                    let cast = self.checked_cast_to(value?, &target, false)?;
+                    return self.pg_length(cast, declared, true);
                 }
                 let input = self.bind_expr(ast, operand, scope)?;
-                self.checked_cast_to(input, &target, try_cast)
+                let cast = self.checked_cast_to(input, &target, try_cast)?;
+                match declared {
+                    Some(declared) => self.pg_length(cast, declared, true),
+                    None => Ok(cast),
+                }
             }
             ast::Expr::Case { operand, arms, otherwise } => {
                 self.bind_case(ast, operand, arms, otherwise, scope)
@@ -1545,6 +1551,49 @@ impl Binder<'_> {
         let args = self.plan_mut().add_expr_list(&[bound]);
         let name = self.plan_mut().intern("try");
         Ok(self.add_expr(Expr::Function { name, args }, ty))
+    }
+
+    /// The length rule of a PostgreSQL string type, for a value that a cast or a store into a
+    /// column already made text. A `name` holds at most 63 bytes, and a `varchar(n)` or a
+    /// `char(n)` at most n characters. An explicit cast cuts a longer value with no error. A store
+    /// refuses it with `22001`, unless the extra characters are spaces.
+    pub(crate) fn pg_length(
+        &mut self,
+        expr: ExprRef,
+        declared: DeclaredType,
+        explicit: bool,
+    ) -> Result<ExprRef> {
+        use rudb_pgtypes::oid;
+        if *self.plan().expr_type(expr) != LogicalType::Varchar {
+            return Ok(expr);
+        }
+        let stored = match declared.oid {
+            oid::NAME => return self.call_as("lower", "__rudb_pg_name", vec![expr]),
+            oid::VARCHAR if declared.typmod >= 4 => "__rudb_pg_varchar",
+            oid::BPCHAR if declared.typmod >= 4 => "__rudb_pg_bpchar",
+            _ => return Ok(expr),
+        };
+        if explicit {
+            let length = self.add_constant(Value::BigInt(i64::from(declared.typmod - 4)));
+            return self.call("left", vec![expr, length]);
+        }
+        let typmod = self.add_constant(Value::BigInt(i64::from(declared.typmod)));
+        self.call_as("left", stored, vec![expr, typmod])
+    }
+
+    /// A value stored into a column of a declared PostgreSQL type, with the length rule of the
+    /// type in a PostgreSQL session.
+    pub(crate) fn stored(
+        &mut self,
+        expr: ExprRef,
+        declared: Option<DeclaredType>,
+    ) -> Result<ExprRef> {
+        match declared {
+            Some(declared) if self.session.postgres().is_some() => {
+                self.pg_length(expr, declared, false)
+            }
+            _ => Ok(expr),
+        }
     }
 
     pub(crate) fn call(&mut self, name: &str, args: Vec<ExprRef>) -> Result<ExprRef> {
