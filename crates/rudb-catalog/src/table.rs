@@ -15,7 +15,7 @@ use rudb_native::{
     Reader as NativeReader, StoredPart, Stripes,
 };
 use rudb_storage::{MemoryTable, Probe, Range};
-use rudb_vector::{Chunk, Selection, VECTOR_SIZE, Vector, concat};
+use rudb_vector::{Builder, Chunk, Selection, VECTOR_SIZE, Vector, concat};
 
 use crate::catalog::DETACHED;
 use crate::gone::Gone;
@@ -2430,13 +2430,28 @@ impl Table {
         workers: usize,
         committing: bool,
     ) -> Result<()> {
+        self.append_checked_with(chunks, workers, committing, None)
+    }
+
+    /// [`Self::append_checked`], with the rows of `chunks` also given as `values` when the caller
+    /// has them that way, which the table then takes rather than the chunks.
+    fn append_checked_with(
+        &mut self,
+        chunks: Vec<Chunk>,
+        workers: usize,
+        committing: bool,
+        values: Option<&[Vec<Value>]>,
+    ) -> Result<()> {
         let seen = self.appended_keys(&chunks, committing)?;
         let appending = self.points.appending(&chunks)?;
         let before = self.rows.len() as u64;
         // Only the last part can change, a file's rows and its gone rows staying where they are.
         let from = self.rows.chunk_count().saturating_sub(1);
-        if let Err(error) = self.rows.to_append().and_then(|rows| rows.append_all(chunks, workers))
-        {
+        let appended = self.rows.to_append().and_then(|rows| match values {
+            Some(values) => rows.append_rows(values),
+            None => rows.append_all(chunks, workers),
+        });
+        if let Err(error) = appended {
             self.points = Points::default();
             return Err(error);
         }
@@ -3053,10 +3068,16 @@ impl Table {
     /// if a `NOT NULL` column is handed a null.
     pub fn append_rows(&mut self, rows: &[Vec<Value>]) -> Result<()> {
         if !self.guards().is_empty() {
-            let mut staged = MemoryTable::new(self.types());
-            staged.append_rows(rows)?;
-            let chunks = (0..staged.chunk_count()).filter_map(|at| staged.chunk(at)).collect();
-            return self.append_all(chunks, 1);
+            // The keys are checked on chunks, so the rows are built into columns for that, and the
+            // rows themselves go to the table the way a table with no key takes them. They used
+            // to be staged in a table of their own and read back out as chunks, and for one row
+            // that cost three times what checking its keys did, most of it the counts that table
+            // kept and the work of dropping it.
+            let chunks = self.columns_of(rows)?;
+            for chunk in &chunks {
+                self.refuse_nulls(chunk)?;
+            }
+            return self.append_checked_with(chunks, 1, false, Some(rows));
         }
         for row in rows {
             for (at, column) in self.columns.iter().enumerate() {
@@ -3066,6 +3087,34 @@ impl Table {
             }
         }
         self.rows.to_append()?.append_rows(rows)
+    }
+
+    /// Rows of single values as chunks of the table's columns, a vector's worth of rows each,
+    /// built the way the table builds rows it is handed one at a time.
+    fn columns_of(&self, rows: &[Vec<Value>]) -> Result<Vec<Chunk>> {
+        let types = self.types();
+        for (index, row) in rows.iter().enumerate() {
+            if row.len() != types.len() {
+                return Err(Error::internal(format!(
+                    "row {index} has {} values and the table has {} columns",
+                    row.len(),
+                    types.len()
+                )));
+            }
+        }
+        let mut chunks = Vec::with_capacity(rows.len().div_ceil(VECTOR_SIZE));
+        for batch in rows.chunks(VECTOR_SIZE) {
+            let mut columns = Vec::with_capacity(types.len());
+            for (at, ty) in types.iter().enumerate() {
+                let mut builder = Builder::new(ty.clone(), batch.len());
+                for row in batch {
+                    builder.push(&row[at])?;
+                }
+                columns.push(builder.finish()?);
+            }
+            chunks.push(Chunk::with_rows(columns, batch.len())?);
+        }
+        Ok(chunks)
     }
 
     /// Checks a chunk against the `NOT NULL` columns before any of it is kept.
