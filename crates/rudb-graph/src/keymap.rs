@@ -34,7 +34,7 @@ use rudb_common::{Error, Result};
 use rudb_encoding::bitpack;
 
 use crate::bits::{Rank, nth_set};
-use crate::rid::Rid;
+use crate::rid::{NO_PARENT, Rid};
 
 /// How dense a range has to be before the bitmap form beats the sorted form.
 ///
@@ -732,6 +732,29 @@ impl KeyMap {
         }
     }
 
+    /// [`Self::lookup`] for a block of keys, with [`NO_PARENT`] for a key that has no row.
+    ///
+    /// An identity map is a subtraction and a range check a key, which is every key column of the
+    /// IMDb load. Called a key at a time through `i128` and a `Result` it was about a sixth of the
+    /// CPU the links of a JOB checkpoint took.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::lookup`].
+    pub fn lookup_block(&self, keys: &[i64], out: &mut [Rid]) -> Result<()> {
+        if let Body::Identity { base, count } = &self.body {
+            for (key, out) in keys.iter().zip(out) {
+                let offset = u64::try_from(i128::from(*key) - base).ok();
+                *out = offset.filter(|rid| rid < count).unwrap_or(NO_PARENT);
+            }
+            return Ok(());
+        }
+        for (key, out) in keys.iter().zip(out) {
+            *out = self.lookup(i128::from(*key))?.unwrap_or(NO_PARENT);
+        }
+        Ok(())
+    }
+
     /// The `rid` of the row holding this key, or `None` when no row holds it.
     ///
     /// `None` is the ordinary answer and not an exceptional one: a child key with no matching
@@ -1232,6 +1255,28 @@ mod tests {
         assert_eq!(map.lookup(0).expect("lookup"), None, "below the base");
         assert_eq!(map.lookup(1001).expect("lookup"), None, "past the end");
         assert_eq!(map.span(), Some((1, 1000)));
+    }
+
+    #[test]
+    fn a_block_of_keys_finds_what_a_key_at_a_time_finds() {
+        let identity = keys(&(-5..995).collect::<Vec<i128>>());
+        let dense = keys(&(0..3000).filter(|value| value % 3 != 1).collect::<Vec<i128>>());
+        let mut shuffled = (0..3000).filter(|value| value % 3 != 1).collect::<Vec<i128>>();
+        shuffled.sort_by_key(|value| (value * 7919) % 3001);
+        let permuted = keys(&shuffled);
+        let asked = (-20..3020).chain([i64::MIN, i64::MAX, -6, 995]).collect::<Vec<i64>>();
+        for (column, form) in
+            [(identity, Form::Identity), (dense, Form::Dense), (permuted, Form::Permuted)]
+        {
+            let map = KeyMap::build(&column).expect("build");
+            assert_eq!(map.form(), form);
+            let mut found = vec![0; asked.len()];
+            map.lookup_block(&asked, &mut found).expect("block");
+            for (key, rid) in asked.iter().zip(&found) {
+                let one = map.lookup(i128::from(*key)).expect("lookup").unwrap_or(NO_PARENT);
+                assert_eq!(*rid, one, "key {key} of the {form:?} form");
+            }
+        }
     }
 
     #[test]

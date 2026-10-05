@@ -50,6 +50,10 @@ const BUCKET_ROWS: usize = 1 << 16;
 /// dozen nanoseconds a list.
 const AHEAD: usize = 16;
 
+/// How many bits of a parent `rid` [`Adjacency::build`] deals the children by, which is about a
+/// thousand ranges, each sorted on its own with eight kilobytes of counters on the IMDb `name`.
+const RANGE_BITS: u32 = 10;
+
 /// Bytes of fixed header at the front of a backward adjacency payload.
 ///
 /// `children`, `parents`, `edges`, then the width, the layout and padding to an eight byte boundary.
@@ -73,62 +77,134 @@ pub struct Adjacency {
 impl Adjacency {
     /// Builds the adjacency from one parent `rid` per child, with [`NO_PARENT`] for the unmatched.
     ///
-    /// Two passes over the slice, one to count each parent's children and one to place them, which
-    /// is a counting sort. The children arrive in row order, so each list comes out ascending.
+    /// A counting sort, a radix at a time. Counting every parent's children and then placing each
+    /// child at its parent's slot is two passes of writes to wherever the parent's counter lands,
+    /// and on the IMDb `cast_info`, 36 million children against 4 million people, every one of
+    /// them was a trip to memory: the adjacencies were 15 of the 91 seconds of CPU the checkpoint
+    /// took. So the children are first dealt into ranges of parents, about a thousand of them,
+    /// each of which is written in order, and then each range is sorted by parent on its own,
+    /// where its counters and its children both fit in cache. Dealing keeps row order within a
+    /// range, so each list still comes out ascending, and the ranges are dealt into the slice the
+    /// lists end up in, so the build holds no more than the direct sort did.
     ///
     /// # Errors
     ///
     /// If a parent `rid` is not [`NO_PARENT`] and is not below `parents`, for the reason
     /// [`crate::Link::build`] refuses the same thing.
     pub fn build(parents_of: &[Rid], parents: u64) -> Result<Self> {
-        Self::build_on(parents_of, parents, 1)
-    }
-
-    /// The same, on up to `workers` threads, with the same answer.
-    ///
-    /// Each worker owns a range of parents and reads every child for the ones in its range, so the
-    /// counts it keeps and the slots it fills are its own and nothing is shared. Reading the slice
-    /// once a worker costs little next to the scattered writes the sort is made of. On one thread
-    /// the builds of the fifteen JOB relationships took about 18 seconds of a 52 second checkpoint
-    /// of the IMDb load, with the other cores idle.
-    ///
-    /// # Errors
-    ///
-    /// As [`Adjacency::build`].
-    pub fn build_on(parents_of: &[Rid], parents: u64, workers: usize) -> Result<Self> {
         let parent_rows = usize::try_from(parents)
             .map_err(|_| malformed("a parent table larger than fits in memory"))?;
-        let workers = workers.clamp(1, parent_rows.max(1));
-        let bounds = (0..=workers).map(|at| parent_rows * at / workers).collect::<Vec<usize>>();
-        let mut starts = vec![0_usize; parent_rows + 1];
-        {
-            let mut pieces = Vec::with_capacity(workers);
-            let mut rest = &mut starts[1..];
-            for at in 0..workers {
-                let (piece, after) = rest.split_at_mut(bounds[at + 1] - bounds[at]);
-                pieces.push((bounds[at], piece));
-                rest = after;
+        let children = count(parents_of.len());
+        let width = width_for(children);
+        // A child is dealt with its parent's place within its range above its own row, so the two
+        // have to fit a word between them, which they do below four trillion child rows.
+        let shift = (usize::BITS - parent_rows.leading_zeros()).saturating_sub(RANGE_BITS);
+        if width + shift as usize >= 64 {
+            return Self::build_direct(parents_of, parents);
+        }
+        let ranges = (parent_rows >> shift) + 1;
+        let mut sizes = vec![0_usize; ranges + 1];
+        for &parent in parents_of {
+            if parent == NO_PARENT {
+                continue;
             }
-            on_threads(pieces, |(low, piece)| count_range(parents_of, parents, low, piece))?;
+            if parent >= parents {
+                return Err(malformed(format!(
+                    "a child points at parent {parent} of a table with {parents} rows"
+                )));
+            }
+            sizes[(parent >> shift) as usize + 1] += 1;
+        }
+        for at in 1..sizes.len() {
+            sizes[at] += sizes[at - 1];
+        }
+        let edges = sizes[ranges];
+        let within = (1_u64 << shift) - 1;
+        let mut grouped = vec![0_u64; edges];
+        let mut dealt = sizes[..ranges].to_vec();
+        for (child, &parent) in parents_of.iter().enumerate() {
+            if parent == NO_PARENT {
+                continue;
+            }
+            let slot = &mut dealt[(parent >> shift) as usize];
+            grouped[*slot] = (parent & within) << width | count(child);
+            *slot += 1;
+        }
+        drop(dealt);
+        let len = edges + parent_rows;
+        let mut words = vec![0_u64; len.div_ceil(64)];
+        let row = u64::MAX >> (64 - width);
+        let mut held = Vec::new();
+        let mut starts = vec![0_usize; (1 << shift) + 1];
+        for range in 0..ranges {
+            let (low, high) = (sizes[range], sizes[range + 1]);
+            let first = range << shift;
+            let span = (1_usize << shift).min(parent_rows.saturating_sub(first));
+            let starts = &mut starts[..=span];
+            starts.fill(0);
+            held.clear();
+            held.extend_from_slice(&grouped[low..high]);
+            for &pair in &held {
+                starts[(pair >> width) as usize + 1] += 1;
+            }
+            for at in 1..starts.len() {
+                starts[at] += starts[at - 1];
+            }
+            for (at, pair) in starts.windows(2).enumerate() {
+                // Parent `p`'s ones start after its predecessors' children and their `p` zeros.
+                let parent = first + at;
+                for one in low + pair[0] + parent..low + pair[1] + parent {
+                    words[one / 64] |= 1 << (one % 64);
+                }
+            }
+            for &pair in &held {
+                let slot = &mut starts[(pair >> width) as usize];
+                grouped[low + *slot] = pair & row;
+                *slot += 1;
+            }
+        }
+        let mut rows = Vec::with_capacity(bitpack::tail_len(edges, width));
+        bitpack::pack_linear(&grouped, width, &mut rows)?;
+        Ok(Self {
+            children,
+            parents,
+            edges: count(edges),
+            starts: BitVector::new(words, len)?,
+            rows: rows.into(),
+            width,
+        })
+    }
+
+    /// The same as [`Self::build`], one counter per parent and no ranges, for a child table too
+    /// large to deal a row and a place in a word.
+    fn build_direct(parents_of: &[Rid], parents: u64) -> Result<Self> {
+        let parent_rows = usize::try_from(parents)
+            .map_err(|_| malformed("a parent table larger than fits in memory"))?;
+        let mut starts = vec![0_usize; parent_rows + 1];
+        for &parent in parents_of {
+            if parent == NO_PARENT {
+                continue;
+            }
+            if parent >= parents {
+                return Err(malformed(format!(
+                    "a child points at parent {parent} of a table with {parents} rows"
+                )));
+            }
+            starts[parent as usize + 1] += 1;
         }
         for at in 1..starts.len() {
             starts[at] += starts[at - 1];
         }
         let edges = starts[parent_rows];
+        let mut placed = starts.clone();
         let mut grouped = vec![0_u64; edges];
-        {
-            let mut pieces = Vec::with_capacity(workers);
-            let mut rest = grouped.as_mut_slice();
-            for at in 0..workers {
-                let (low, high) = (bounds[at], bounds[at + 1]);
-                let (piece, after) = rest.split_at_mut(starts[high] - starts[low]);
-                pieces.push((low, &starts[low..high], piece));
-                rest = after;
+        for (child, &parent) in parents_of.iter().enumerate() {
+            if parent == NO_PARENT {
+                continue;
             }
-            on_threads(pieces, |(low, starts, piece)| {
-                place_range(parents_of, low, starts, piece);
-                Ok(())
-            })?;
+            let slot = &mut placed[parent as usize];
+            grouped[*slot] = count(child);
+            *slot += 1;
         }
         let len = edges + parent_rows;
         let mut words = vec![0_u64; len.div_ceil(64)];
@@ -140,7 +216,8 @@ impl Adjacency {
         }
         let children = count(parents_of.len());
         let width = width_for(children);
-        let rows = pack_on(&grouped, width, workers)?;
+        let mut rows = Vec::with_capacity(bitpack::tail_len(edges, width));
+        bitpack::pack_linear(&grouped, width, &mut rows)?;
         Ok(Self {
             children,
             parents,
@@ -417,76 +494,6 @@ impl Adjacency {
     }
 }
 
-/// Runs `work` over each of `pieces`, the first on this thread and the rest on threads of their
-/// own, and gives back the first error.
-fn on_threads<T: Send>(pieces: Vec<T>, work: impl Fn(T) -> Result<()> + Sync) -> Result<()> {
-    let mut pieces = pieces.into_iter();
-    let Some(first) = pieces.next() else { return Ok(()) };
-    std::thread::scope(|scope| {
-        let work = &work;
-        let handles = pieces.map(|piece| scope.spawn(move || work(piece))).collect::<Vec<_>>();
-        let mine = work(first);
-        let theirs = handles.into_iter().try_for_each(|handle| {
-            handle.join().map_err(|_| Error::internal("an adjacency build worker panicked"))?
-        });
-        mine.and(theirs)
-    })
-}
-
-/// Counts the children of the parents from `low` on, one slot of `counts` a parent. Only the
-/// worker whose range ends at the last parent says a child points past it, so it is said once.
-fn count_range(parents_of: &[Rid], parents: u64, low: usize, counts: &mut [usize]) -> Result<()> {
-    let last = low + counts.len() == usize::try_from(parents).unwrap_or(usize::MAX);
-    for &parent in parents_of {
-        if parent == NO_PARENT {
-            continue;
-        }
-        if parent >= parents {
-            if last {
-                return Err(malformed(format!(
-                    "a child points at parent {parent} of a table with {parents} rows"
-                )));
-            }
-            continue;
-        }
-        if let Some(held) = counts.get_mut((parent as usize).wrapping_sub(low)) {
-            *held += 1;
-        }
-    }
-    Ok(())
-}
-
-/// Places the children of the parents from `low` on into `out`, where `starts` says each of those
-/// parents' lists begins, counted from the whole table's first list.
-fn place_range(parents_of: &[Rid], low: usize, starts: &[usize], out: &mut [u64]) {
-    let base = starts.first().copied().unwrap_or(0);
-    let mut placed = starts.iter().map(|start| start - base).collect::<Vec<usize>>();
-    for (child, &parent) in parents_of.iter().enumerate() {
-        if let Some(slot) = placed.get_mut((parent as usize).wrapping_sub(low)) {
-            out[*slot] = count(child);
-            *slot += 1;
-        }
-    }
-}
-
-/// [`bitpack::pack_linear`] on up to `workers` threads. Eight values fill whole bytes at any
-/// width, so pieces cut at a multiple of eight pack on their own and laid end to end are what one
-/// pass writes.
-fn pack_on(values: &[u64], width: usize, workers: usize) -> Result<Vec<u8>> {
-    let piece = values.len().div_ceil(workers.max(1)).next_multiple_of(8).max(8);
-    let mut packed = (0..values.len().div_ceil(piece)).map(|_| Vec::new()).collect::<Vec<_>>();
-    let pieces = values.chunks(piece).zip(packed.iter_mut()).collect::<Vec<_>>();
-    on_threads(pieces, |(values, out)| {
-        out.reserve_exact(bitpack::tail_len(values.len(), width));
-        bitpack::pack_linear(values, width, out)
-    })?;
-    let mut rows = Vec::with_capacity(bitpack::tail_len(values.len(), width));
-    for piece in packed {
-        rows.extend_from_slice(&piece);
-    }
-    Ok(rows)
-}
-
 /// Bits a child row takes: enough for the last row of the child table.
 fn width_for(children: u64) -> usize {
     (u64::BITS - children.saturating_sub(1).leading_zeros()).max(1) as usize
@@ -546,6 +553,45 @@ mod tests {
             assert_eq!(listed, expected, "parent {parent}");
         }
         assert!(adjacency.children_of(parents, &mut Vec::new()).is_err(), "past the end");
+    }
+
+    #[test]
+    fn dealing_by_ranges_builds_the_bytes_the_direct_sort_builds() {
+        let (scattered, fifty) = scattered();
+        let mut seed = 5_u64;
+        let mut random = |parents: u64, rows: usize| {
+            (0..rows)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    if seed >> 60 == 0 { NO_PARENT } else { (seed >> 20) % parents }
+                })
+                .collect::<Vec<Rid>>()
+        };
+        let cases = vec![
+            (scattered, fifty),
+            (random(1, 500), 1),
+            (random(1023, 5_000), 1024),
+            (random(1024, 5_000), 1024),
+            (random(4096, 70_000), 4096),
+            (random(100_003, 300_000), 100_003),
+            ((0..20_000).map(|child| child / 3).collect(), 7_000),
+            (vec![NO_PARENT; 100], 0),
+            (vec![NO_PARENT; 100], 10),
+            (Vec::new(), 10),
+        ];
+        for (parents_of, parents) in cases {
+            let dealt = Adjacency::build(&parents_of, parents).expect("dealt");
+            let direct = Adjacency::build_direct(&parents_of, parents).expect("direct");
+            let (mut left, mut right) = (Vec::new(), Vec::new());
+            dealt.write(&mut left).expect("write");
+            direct.write(&mut right).expect("write");
+            assert_eq!(left, right, "{} children of {parents} parents", parents_of.len());
+        }
+        let mut past = random(1000, 2000);
+        past[1500] = 1000;
+        assert!(Adjacency::build(&past, 1000).is_err(), "a parent past the end");
     }
 
     #[test]
@@ -610,42 +656,6 @@ mod tests {
         expected.sort_unstable();
         let pushed = adjacency.push(&held).expect("push");
         assert_eq!(pushed.iter().collect::<Vec<_>>(), expected);
-    }
-
-    #[test]
-    fn any_number_of_workers_builds_the_same_bytes() {
-        let (parents_of, parents) = scattered();
-        let mut one = Vec::new();
-        Adjacency::build(&parents_of, parents).expect("build").write(&mut one).expect("write");
-        // More workers than parents too, and a child count that is not a multiple of eight, so
-        // the packed pieces end mid byte.
-        let short = &parents_of[..2_995];
-        let mut short_one = Vec::new();
-        Adjacency::build(short, parents).expect("build").write(&mut short_one).expect("write");
-        for workers in [2, 3, 6, 7, 64] {
-            let built = Adjacency::build_on(&parents_of, parents, workers).expect("build");
-            for parent in 0..parents {
-                let mut listed = Vec::new();
-                built.children_of(parent, &mut listed).expect("list");
-                let expected: Vec<Rid> = (0..count(parents_of.len()))
-                    .filter(|&child| parents_of[child as usize] == parent)
-                    .collect();
-                assert_eq!(listed, expected, "parent {parent} on {workers} workers");
-            }
-            let mut bytes = Vec::new();
-            built.write(&mut bytes).expect("write");
-            assert_eq!(bytes, one, "{workers} workers");
-            let mut bytes = Vec::new();
-            let built = Adjacency::build_on(short, parents, workers).expect("build");
-            built.write(&mut bytes).expect("write");
-            assert_eq!(bytes, short_one, "{workers} workers, short");
-            let mut past = parents_of.clone();
-            past[1_234] = parents;
-            assert!(Adjacency::build_on(&past, parents, workers).is_err(), "{workers} workers");
-        }
-        let none = vec![NO_PARENT; 9];
-        let built = Adjacency::build_on(&none, 0, 4).expect("no parents");
-        assert_eq!(built.edges(), 0);
     }
 
     #[test]

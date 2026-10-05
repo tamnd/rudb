@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use rudb_common::{LogicalType, Result, Value};
 use rudb_graph::{Adjacency, Degrees, Form, KeyMap, Keys, NO_PARENT, Rid, Span, link, span, wire};
-use rudb_vector::Chunk;
+use rudb_vector::{Chunk, Validity};
 
 use crate::section::{self, Attachment};
 use crate::{Catalog, Reader, invalid, type_tag};
@@ -93,6 +93,33 @@ impl KeyColumn<'_> {
             each(key)?;
         }
         Ok(())
+    }
+}
+
+impl KeyColumn<'_> {
+    /// The parent of every row of one part through `map`, the keys read as one block, or `false`
+    /// having written nothing for a key that is not one column of signed integers, which the
+    /// caller reads a row at a time.
+    fn parents_in_part(&self, part: usize, map: &KeyMap, out: &mut [Rid]) -> Result<bool> {
+        if self.columns.len() != 1 {
+            return Ok(false);
+        }
+        let chunk = self.reader.read(part, &self.columns)?;
+        let values = chunk.column(0)?;
+        let mut keys = Vec::with_capacity(values.len());
+        if values.len() != out.len() || !values.signed_block(&mut keys) || keys.len() != out.len() {
+            return Ok(false);
+        }
+        map.lookup_block(&keys, out)?;
+        let validity = values.validity();
+        if !matches!(validity, Validity::AllValid) {
+            for (row, parent) in out.iter_mut().enumerate() {
+                if !validity.is_valid(row) {
+                    *parent = NO_PARENT;
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -976,6 +1003,9 @@ fn one_link(
     let keys = KeyColumn::new(child, edge.child_column).map_err(|error| error.to_string())?;
     let mut parents_of = vec![NO_PARENT; child.table().rows()];
     by_part(child, &mut parents_of, 1, &|part, run| {
+        if keys.parents_in_part(part, &map, run)? {
+            return Ok(());
+        }
         let mut rows = run.iter_mut();
         keys.scan_part(part, &mut |key| {
             let row =
@@ -1017,7 +1047,7 @@ fn one_link(
         let spans = scope.spawn(|| spans_of(child, &parent, &parents_of));
         let adjacency = packed
             .then(|| {
-                Adjacency::build_on(&parents_of, parents, crate::close_workers())
+                Adjacency::build(&parents_of, parents)
                     .and_then(|adjacency| encode_adjacency(&adjacency, &parent, edge))
             })
             .transpose();
