@@ -1503,8 +1503,9 @@ impl Database {
             // the catalog is over both. Nothing binds here, so the order does not matter to the
             // body, but it matters to the sentence a clash produces.
             let views = native.views().cloned().collect::<Vec<_>>();
+            let database = catalog.default_catalog().to_string();
             for view in &views {
-                catalog.create_native_view(view)?;
+                create_native_entry(&mut catalog, &database, view)?;
             }
             anchor = native.log_anchor().cloned();
         }
@@ -2446,6 +2447,20 @@ fn wanted(names: &[QualifiedName]) -> BTreeSet<String> {
 /// The column list goes in as it stands, cache and all. See
 /// `rudb_catalog::Catalog::create_native_view` for why a file carries a cache at all.
 fn views(catalog: &Catalog, database: &str) -> Vec<rudb_native::ViewEntry> {
+    let macros = catalog
+        .macros()
+        .filter(|made| made.name.catalog.eq_ignore_ascii_case(database))
+        .map(|made| rudb_native::ViewEntry {
+            name: format!("{KEPT}{} {}", made.kind(), made.name.table),
+            sql: made
+                .overloads
+                .iter()
+                .map(|held| if held.aggregating { '1' } else { '0' })
+                .collect(),
+            statement: made.sql(),
+            aliases: Vec::new(),
+            columns: Vec::new(),
+        });
     catalog
         .stored_views_in(database)
         .map(|view| rudb_native::ViewEntry {
@@ -2455,7 +2470,29 @@ fn views(catalog: &Catalog, database: &str) -> Vec<rudb_native::ViewEntry> {
             aliases: view.aliases().to_vec(),
             columns: view.columns(),
         })
+        .chain(macros)
         .collect()
+}
+
+/// What the name of an entry in a file's list of views begins with when the entry is not a view
+/// but some other part of the catalog kept as the statement that makes it. A view made in SQL
+/// does not have one there. A macro is kept that way, with its statement in `statement` and a `1` or a `0` in
+/// `sql` for each overload, saying whether that body aggregates.
+const KEPT: char = '\0';
+
+/// Puts an entry of a file's list of views back into `database`: a view as a view, and a macro
+/// kept there under a [`KEPT`] name as the macro its statement makes.
+fn create_native_entry(
+    catalog: &mut Catalog,
+    database: &str,
+    view: &rudb_native::ViewEntry,
+) -> Result<()> {
+    if !view.name.starts_with(KEPT) {
+        return catalog.create_native_view_in(database, view);
+    }
+    let aggregating: Vec<bool> = view.sql.chars().map(|flag| flag == '1').collect();
+    let made = rudb_bind::kept_macro(&view.statement, database, &aggregating)?;
+    catalog.create_macro(made, false, false)
 }
 
 /// What kind of write a statement is and the database it writes, in the words the pin's read only
@@ -2614,7 +2651,7 @@ fn attach_database(
         catalog.create_native_table_in(&name, native.table(&table)?)?;
     }
     for view in native.views().cloned().collect::<Vec<_>>() {
-        catalog.create_native_view_in(&name, &view)?;
+        create_native_entry(catalog, &name, &view)?;
     }
     Ok(())
 }
@@ -6312,12 +6349,6 @@ impl Shared {
                     catalog.drop_macro(&name, Some(change.table))?;
                     return Ok(QueryResult::empty());
                 };
-                // The file has nowhere to keep one yet, the same as a sequence.
-                if holds_a_file(&self.inner, &catalog, &name.catalog) {
-                    return Err(Error::not_implemented(
-                        "CREATE MACRO in a database file, which cannot hold one so far",
-                    ));
-                }
                 catalog.create_macro(made, change.or_replace, change.if_not_exists)?;
                 Ok(QueryResult::empty())
             }

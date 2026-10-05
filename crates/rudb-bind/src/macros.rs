@@ -660,6 +660,44 @@ pub(crate) fn statement(
     }))
 }
 
+/// A macro read back out of a database file, made from the statement the file kept and put in
+/// `database` without the checks `CREATE MACRO` runs, which were run when it was made.
+/// `aggregating` says for each overload whether its body aggregates, which the file keeps beside
+/// the statement because the macros a body calls may be read back after it.
+///
+/// # Errors
+///
+/// If the statement is not one `CREATE MACRO`.
+pub fn kept_macro(sql: &str, database: &str, aggregating: &[bool]) -> Result<rudb_catalog::Macro> {
+    let parsed = rudb_parse::parse_ast(sql)?;
+    let Some(&ast::Statement::Macro(index)) = parsed.statements.first() else {
+        return Err(Error::internal(format!("a kept macro that is not one: {sql}")));
+    };
+    let written = parsed.macro_def(index);
+    let bare = parsed.name(written.name).last().unwrap_or_default().to_string();
+    let table = written.overloads.first().is_some_and(|overload| overload.table);
+    let overloads = written
+        .overloads
+        .iter()
+        .enumerate()
+        .map(|(at, overload)| Overload {
+            parameters: overload
+                .parameters
+                .iter()
+                .map(|(name, ty, default)| Parameter {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                    default: default.clone(),
+                })
+                .collect(),
+            body: overload.body.clone(),
+            aggregating: aggregating.get(at).copied().unwrap_or(false),
+        })
+        .collect();
+    let name = QualifiedName::new(database, rudb_catalog::DEFAULT_SCHEMA, bare);
+    Ok(rudb_catalog::Macro { name, table, overloads, oid: 0 })
+}
+
 /// Binds a table macro's body with a null in place of each parameter, which the pin does too, so
 /// that a body reading a table that is not there is refused when it is made.
 fn read_tables(

@@ -1,6 +1,8 @@
 //! A macro made with `CREATE MACRO` or `CREATE FUNCTION`, which is a body of text with names in it
 //! that a call puts its arguments in place of.
 
+use rudb_parse::quoted;
+
 use crate::QualifiedName;
 
 /// One parameter of a macro.
@@ -68,6 +70,35 @@ impl Macro {
     #[must_use]
     pub fn kind(&self) -> &'static str {
         kind(self.table)
+    }
+
+    /// The statement that would make it again under its bare name, which is what a database file
+    /// keeps of it.
+    #[must_use]
+    pub fn sql(&self) -> String {
+        let overloads: Vec<String> = self
+            .overloads
+            .iter()
+            .map(|overload| {
+                let parameters: Vec<String> = overload
+                    .parameters
+                    .iter()
+                    .map(|parameter| {
+                        let mut text = quoted(&parameter.name);
+                        if let Some(ty) = &parameter.ty {
+                            text += &format!(" {ty}");
+                        }
+                        if let Some(default) = &parameter.default {
+                            text += &format!(" := {default}");
+                        }
+                        text
+                    })
+                    .collect();
+                let table = if self.table { "TABLE " } else { "" };
+                format!("({}) AS {table}{}", parameters.join(", "), overload.body)
+            })
+            .collect();
+        format!("CREATE MACRO {}{}", quoted(&self.name.table), overloads.join(", "))
     }
 }
 
