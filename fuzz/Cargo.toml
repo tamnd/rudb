@@ -14,16 +14,24 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = "1"
 libfuzzer-sys = "0.4"
-rudb-bind = { path = "../crates/rudb-bind" }
-rudb-catalog = { path = "../crates/rudb-catalog" }
-rudb-common = { path = "../crates/rudb-common" }
-rudb-opt = { path = "../crates/rudb-opt" }
-rudb-parse = { path = "../crates/rudb-parse" }
+rudb-bind = { path = "../crates/rudb-bind", optional = true }
+rudb-catalog = { path = "../crates/rudb-catalog", optional = true }
+rudb-common = { path = "../crates/rudb-common", optional = true }
+rudb-opt = { path = "../crates/rudb-opt", optional = true }
+rudb-parse = { path = "../crates/rudb-parse", optional = true }
 rudb-pgwire = { path = "../crates/rudb-pgwire" }
+
+# The targets of the front end need the engine, and a build of the engine with the sanitizer
+# needs more memory than a small machine has. The targets of the wire codec need only the codec,
+# so they build with `--no-default-features`.
+[features]
+default = ["front-end"]
+front-end = ["dep:rudb-bind", "dep:rudb-catalog", "dep:rudb-common", "dep:rudb-opt", "dep:rudb-parse"]
 
 [[bin]]
 name = "tokenize"
 path = "fuzz_targets/tokenize.rs"
+required-features = ["front-end"]
 test = false
 doc = false
 bench = false
@@ -31,6 +39,7 @@ bench = false
 [[bin]]
 name = "bind"
 path = "fuzz_targets/bind.rs"
+required-features = ["front-end"]
 test = false
 doc = false
 bench = false

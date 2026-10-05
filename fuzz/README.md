@@ -21,10 +21,23 @@ A fuzzer is looking for a different thing than every other generator in `spec/sq
 
 It also checks the promise the tokenizer makes to everything above it, which is that spans are in order, do not overlap, stay inside the query and land on character boundaries. An offset that breaks one of those is a panic in whichever caller slices the query with it, so checking it in the target turns a crash somewhere else into a crash at the input that caused it.
 
+`pgwire` takes all the bytes that a client sends on one connection, after a first byte that chooses a chunk size, and gives them to a small server on the codec of `rudb-pgwire`: the handshake, the main loop of `Session`, the statements and portals by name and the values of `Bind` one by one. It runs the server two times, once with all the bytes at one time and once in chunks, and the two runs must write the same bytes. Each message that the session gives must also come back the same after an encode and a parse. The server is in `crates/rudb-pgwire/tests/support/server.rs`, and both targets include that file.
+
+`pgwire_sequence` builds a sequence of good messages from the input, so its budget goes to the order of the messages and not to bad lengths. It checks that the server sends one `ReadyForQuery` for each `Query`, `FunctionCall` and `Sync`, never two for one of them, and that it acts on nothing other than `Sync` and `Terminate` in the skip after an error in the extended protocol. The names in it include two long names that are the same in their first 63 bytes.
+
+They need only the codec, so they build with `--no-default-features` and do not build the engine with the sanitizer. Give both of them a limit for memory, so that an allocation past the limit of a message is a finding:
+
+```
+cargo +nightly fuzz run --no-default-features pgwire fuzz/seeds/pgwire -- -malloc_limit_mb=256
+cargo +nightly fuzz run --no-default-features pgwire_sequence -- -malloc_limit_mb=256
+```
+
 ## The seeds
 
 `seeds/tokenize` holds the 65 entries from `crates/rudb-parse/src/corpus.rs`, one file each in array order, plus sixteen shapes chosen by hand for the things a mutator is bad at finding on its own: deep nesting of parentheses, subqueries, list brackets and casts, the four unterminated forms, a dollar quote, a null byte, a number with 160 digits in it, and a few very wide statements. Real SQL matters here more than it does for most targets, because the input has to be valid UTF-8 and has to reach the end of the tokenizer before any of the interesting code runs, and a mutator starting from nothing spends a very long time before it gets there.
 
+`seeds/pgwire` holds 14 connections written by hand: a simple query, the extended flow, `SSLRequest` and `GSSENCRequest` before the startup, a `CancelRequest`, a copy that ends with `CopyDone` and one that ends with `CopyFail`, the skip to `Sync`, long names, a pipeline in a transaction block, `FunctionCall`, a bad version, a query that is not UTF-8, and a bad type byte in a copy. The first byte of each file is the chunk size. `crates/rudb-pgwire/tests/fuzz_inputs.rs` replays them in `cargo test`.
+
 ## Crashers
 
-Anything the fuzzer finds gets committed to `crates/rudb-parse/tests/crashers/` and replayed by an ordinary test in `crates/rudb-parse/tests/crashers.rs`, so the case stays checked on every machine with no nightly toolchain and no fuzzer installed. The artifact in `fuzz/artifacts` is a working file and is not committed.
+Anything the fuzzer finds gets committed to `crates/rudb-parse/tests/crashers/` or `crates/rudb-pgwire/tests/crashers/` and replayed by an ordinary test in `crates/rudb-parse/tests/crashers.rs` or `crates/rudb-pgwire/tests/fuzz_inputs.rs`, so the case stays checked on every machine with no nightly toolchain and no fuzzer installed. A finding of `pgwire_sequence` is not a stream of bytes but the shape of one, so it becomes a test in `fuzz_inputs.rs` that writes the same messages. The artifact in `fuzz/artifacts` is a working file and is not committed.
