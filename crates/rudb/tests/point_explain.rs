@@ -84,8 +84,8 @@ fn what_goes_through_the_plan_is_named_a_pipeline() {
     let later = db.prepare("SELECT * FROM later WHERE id = ?").expect("prepares");
     db.execute("CREATE TABLE later (id INTEGER PRIMARY KEY, v VARCHAR)").expect("creates");
     assert_eq!(later.explain(), "POINT Lookup later(id)");
-    // Inside a transaction a read and an insert skip the plan and a write does not. Nothing does
-    // once the transaction aborts, and an insert does not in one that is read only.
+    // Inside a transaction a read, an insert and a write skip the plan. Nothing does once the
+    // transaction aborts, and a write does not in one that is read only.
     let read = db.prepare("SELECT * FROM usertable WHERE ycsb_key = ?").expect("prepares");
     let scan = db.prepare(scan_sql).expect("prepares");
     let insert = db.prepare("INSERT INTO usertable VALUES (?, ?, ?, ?)").expect("prepares");
@@ -94,7 +94,7 @@ fn what_goes_through_the_plan_is_named_a_pipeline() {
     assert_eq!(read.explain(), "POINT Lookup usertable(ycsb_key)");
     assert_eq!(scan.explain(), "Range usertable(ycsb_key)");
     assert_eq!(insert.explain(), "InsertOne usertable");
-    assert_eq!(write.explain(), "PIPELINE");
+    assert_eq!(write.explain(), "UpdateOne usertable(ycsb_key) SET field0");
     let row = |key: &str| [key, "a", "b", "c"].map(|text| Value::Varchar(text.into()));
     insert.execute(&row("k")).expect("inserts");
     insert.execute(&row("k")).expect_err("a duplicate");
@@ -104,6 +104,7 @@ fn what_goes_through_the_plan_is_named_a_pipeline() {
     db.execute("ROLLBACK").expect("rolls back");
     db.execute("BEGIN TRANSACTION READ ONLY").expect("begins");
     assert_eq!(insert.explain(), "PIPELINE");
+    assert_eq!(write.explain(), "PIPELINE");
     assert_eq!(read.explain(), "POINT Lookup usertable(ycsb_key)");
     db.execute("COMMIT").expect("commits");
     assert_eq!(read.explain(), "POINT Lookup usertable(ycsb_key)");
