@@ -2,8 +2,10 @@
 //! pin. Each line is the type, a setting, the input, and the output or the error. The setting is
 //! `extra_float_digits` for the floats, `DateStyle` for the date and time types with the
 //! `TimeZone` after a `|` for `timestamptz`, and `IntervalStyle` for `interval`. A type that starts
-//! with `send` has the hex of the binary output. The input of the date and time types is the hex
-//! of the binary form, because the text input is not here yet.
+//! with `send` has the hex of the binary output. For the output of the date and time types the
+//! input is the hex of the binary form. A type that starts with `in` is the text input of a date or
+//! time type with a typmod, and the output is the hex of the binary form. Its setting is the
+//! `DateStyle` and the `TimeZone` after a `|`, or the `IntervalStyle`.
 
 use rudb_pgtypes::*;
 
@@ -106,6 +108,43 @@ fn datetime(type_name: &str, setting: &str, input: &str) -> Result<String, TypeE
     Ok(String::from_utf8(out).unwrap())
 }
 
+/// The text input of a date or time type, as the hex of the binary form.
+fn datetime_in(
+    type_name: &str,
+    typmod: i32,
+    setting: &str,
+    input: &str,
+) -> Result<String, TypeError> {
+    let mut out = Vec::new();
+    if type_name == "interval" {
+        let v = interval_in(input, typmod, interval_style(setting))?;
+        interval_send(&v, &mut out);
+        return Ok(hex(&out));
+    }
+    let (style, name) = setting.split_once('|').unwrap();
+    let zone = zone(name);
+    let cx = DateTimeInput {
+        order: date_format(style).order,
+        zone: &zone,
+        zones: &NoZones,
+        abbrevs: ZoneAbbrevs::postgres_default(),
+        now: 0,
+    };
+    match type_name {
+        "date" => out.extend_from_slice(&date_in(input, &cx)?.to_be_bytes()),
+        "time" => out.extend_from_slice(&time_in(input, typmod, &cx)?.to_be_bytes()),
+        "timetz" => {
+            let (time, zone) = timetz_in(input, typmod, &cx)?;
+            out.extend_from_slice(&time.to_be_bytes());
+            out.extend_from_slice(&zone.to_be_bytes());
+        }
+        "timestamp" => out.extend_from_slice(&timestamp_in(input, typmod, &cx)?.to_be_bytes()),
+        "timestamptz" => out.extend_from_slice(&timestamptz_in(input, typmod, &cx)?.to_be_bytes()),
+        _ => panic!("the fixture has a type that the test does not know: {type_name}"),
+    }
+    Ok(hex(&out))
+}
+
 /// The typmod of `numeric` or `numeric(p,s)`.
 fn numeric_typmod(type_name: &str) -> Option<i32> {
     let args = type_name.strip_prefix("numeric")?;
@@ -144,6 +183,10 @@ fn run(type_name: &str, setting: &str, input: &str) -> String {
         Some(base) => (true, base),
         None => (false, type_name),
     };
+    if let Some(rest) = type_name.strip_prefix("in ") {
+        let (base, typmod) = rest.split_once(' ').unwrap();
+        return error_text(datetime_in(base, typmod.parse().unwrap(), setting, input));
+    }
     if let Some(typmod) = numeric_typmod(base) {
         return error_text(numeric(typmod, send, input));
     }
@@ -171,7 +214,8 @@ fn run(type_name: &str, setting: &str, input: &str) -> String {
 fn error_text(result: Result<String, TypeError>) -> String {
     result.unwrap_or_else(|error| {
         let detail = error.detail.map(|d| format!(" DETAIL {d}")).unwrap_or_default();
-        format!("ERROR {} {}{detail}", error.sqlstate.as_str(), error.message)
+        let hint = error.hint.map(|h| format!(" HINT {h}")).unwrap_or_default();
+        format!("ERROR {} {}{detail}{hint}", error.sqlstate.as_str(), error.message)
     })
 }
 

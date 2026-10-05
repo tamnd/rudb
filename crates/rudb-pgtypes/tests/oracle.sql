@@ -89,7 +89,7 @@ declare
 begin
   execute format('select pg_input_is_valid(%L, %L)', i, t) into valid;
   if not valid then
-    execute format('select ''ERROR '' || sql_error_code || '' '' || message || coalesce('' DETAIL '' || detail, '''') from pg_input_error_info(%L, %L)', i, t)
+    execute format('select ''ERROR '' || sql_error_code || '' '' || message || coalesce('' DETAIL '' || detail, '''') || coalesce('' HINT '' || hint, '''') from pg_input_error_info(%L, %L)', i, t)
       into r;
     return r;
   end if;
@@ -185,3 +185,152 @@ begin
 end
 $$;
 select * from pg_temp.datetimes();
+-- The text input of the date and time types. The type field is "in", the type and the typmod.
+-- The output is the hex of the binary form or the error. The second field is DateStyle and
+-- TimeZone, or IntervalStyle. The inputs leave out now, today, zone names and the abbreviations
+-- whose offset changed over time, because they need the clock or the tz database.
+create temp table stampins (n serial, i text);
+insert into stampins (i) select unnest(array[
+  '2001-02-03', '2001-02-03 04:05:06', '2001-02-03 04:05:06.789', '2001-02-03T04:05:06Z',
+  '2001-02-03 04:05:06+05', '2001-02-03 04:05:06-08:00', '2001-02-03 04:05:06 PST',
+  '2001-02-03 04:05:06 PDT', '2001-02-03 04:05:06 PST DST', '2001-02-03 04:05:06 dst',
+  '2001-02-03 04:05:06 +0530', '2001-02-03 04:05:06 +05:30:15', '2001-02-03 04:05:06+16',
+  '2001-02-03 04:05:06 -1500', '2001-02-03 04:05:06 -15:59:59', '2001-02-03 04:05:06 xyz',
+  '2001-02-03 foo/bar', '2001-02-03 04:05:06 +05 PST', '2001-02-03 04:05:06 z',
+  '2001-02-03 04:05:06Z', '2001-02-03 04:05:06 zulu', '2001-02-03 allballs', 'Feb 3 2001',
+  'February 3, 2001', '3 Feb 2001', '2001 Feb 3', 'Feb 3', '01/02/03', '1/2/2003', '02/01/2003',
+  '2003/01/02', '1/2/3', '1-2-3', '12/31/99', '31/12/99', '99/12/31', '70-01-01', '69-01-01',
+  '2001-2-3', 'Feb-03-2001', '03-Feb-2001', '2001-Feb-03', '2001.02.03', '2001.034', '2001 034',
+  '20010203', '010203', '010203 040506', '20010203 0405', '20010203T040506', '2001-02-03T04:05:06',
+  '2001-02-03t040506', '2001-02-03 t 04:05', '2001-02-03 040506-08', '2001-02-03 04',
+  '2001-02-03 0405', 'J2451187', 'j2451187.25', 'j 2451187-08', 'julian 2451187', 'j -1',
+  'J2451187 04:05', '1999-01-08 04:05:06 BC', '0001-01-01 BC', '0001-01-01 AD', '0000-01-01',
+  '-2001-01-01', 'epoch', 'infinity', '-infinity', '+infinity', ' Infinity ', 'allballs',
+  '2001-02-30', '2001-02-29', '2000-02-29', '2001-13-01', '2001-00-10', '2001-02-00', '2001-02-32',
+  '13/13/2001', '2001-02-03 24:00', '2001-02-03 24:00:01', '2001-02-03 25:00', '2001-02-03 12:60',
+  '2001-02-03 23:59:60', '2001-02-03 23:59:60.5', '2001-02-03 4pm', '2001-02-03 4:05 PM',
+  '2001-02-03 12:00 AM', '2001-02-03 12:30 pm', '2001-02-03 13:00 PM', '2001-02-03 04:05:06.123456789',
+  '2001-02-03 04:05:06.9999995', '2001-02-03 4:5:6', '2001-02-03 04:05', '2001-02-03 at 04:05',
+  '2001-02-03 on 04:05', 'Saturday 2001-02-03', 'Sat, 03 Feb 2001 04:05:06 GMT',
+  'Sat Feb 03 04:05:06 2001 UTC', 'Sat Feb 03 04:05:06.7 2001 PST', 'Feb 03 04:05:06 2001',
+  '2001-02-03 04:05:06.5 +05:30 bc', '99999-01-01', '294276-12-31 23:59:59', '294277-01-01',
+  '5874897-12-31', '5874898-01-01', '4714-11-24 BC', '4714-11-23 BC', '2001-02-03 04:05:06 ago',
+  '', ' ', '3', 'garbage', '2001-02-03 garbage', '2001-02-03 é', '1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26',
+  '2001-02-03 04:05:06.' || repeat('1', 110), '2001-02-03 04:05:06.' || repeat('1', 140),
+  '2001-02-03 99999999999:00', '2001-02-03 04:05:99999999999', '2001-02-03 04:05:06 +99999999999',
+  '99999999999-01-01', '2001-02-03 04:05:06 dow', '2001-02-03 04:05:06 sun', 'monday feb 3 2001',
+  'jan 1 feb 2001', '1 jan feb', 'y2001m02d03', '2001-02-03 h 04', '2001-02-03 4:05:06.', '2001-02-03 4:05.5',
+  '2001 02 03', '02 03 2001', '03 02 2001', '1.2.3', '2001.02.03.04', '2001-02-03-04', '2001/02/03/04'
+]);
+create temp table timeins (n serial, i text);
+insert into timeins (i) select unnest(array[
+  '04:05', '04:05:06', '04:05:06.789', '04:05:06.7891234', '040506', '0405', '040506.5', '04:05 PM',
+  '12:00 AM', '12:00 PM', '13:00 PM', '24:00', '24:00:01', '23:59:60', '23:59:60.5', '04:05:06 PST',
+  '04:05:06-08', '04:05:06+05:30', '04:05:06 +0530', '04:05-0800', '04:05:06 PST DST', '04:05:06 dst',
+  '2001-02-03 04:05:06', '2001-02-03 04:05:06 PST', '04:05:06 2001-02-03', '04:05:06 PDT',
+  'allballs', 'z', '04:05 z', '04:05 zulu', 'epoch', '', 'abc', '25:00', '-01:00', '1:2:3',
+  '04:05:06 foo/bar', 'T04:05:06', 't040506', 'j2451187 04:05', '04:05:06.999999999',
+  '23:59:59.9999999', '04:05:06 BC', '4', '04', '1.5', '04:05:06 xyz', '040506-08', '2001.034 04:05',
+  '04:05:06 +16', '04:05:06 -15:59:59', '4 pm', '12 am', '99999999999:00', '04:05:06 jan',
+  '04:05:06 mon', 'yesterday', 'infinity', '04:05:06.', '0405.5', '04:05:06 2001-02-03 PST'
+]);
+create temp table intervalins (n serial, i text);
+insert into intervalins (i) select unnest(array[
+  '1 day', '1 day 2 hours', '@ 1 day 2 hours ago', '1 year 2 months 3 days 04:05:06', '1-2',
+  '1-2 3 4:05:06', '-1-2 3 4:05:06', '-1-2 +3 -4:05:06', '1-12', '-1 2:03:04', '+1 -2:03:04',
+  '1 day -2:03:04', '-1 day 2:03:04', '- 1 day', '1.5 years', '1.5 months', '1.5 weeks', '1.5 days',
+  '1.5 hours', '1.5 min', '0.5 sec', '1.0000005 sec', '1 millisecond', '1 microsecond', '1.5 ms',
+  '1.5 us', '1 decade', '1 century', '1 millennium', '1.5 centuries', '1 quarter', '2 qtr',
+  '1 year ago', 'ago', '1 day ago 2 hours', 'infinity', '-infinity', '1 day infinity',
+  'infinity 1 day', 'epoch', '', ' ', '1', '1.5', '-1', '1:2', '1:02:03.5', '1:2.5', '100:00:00',
+  '-100:00:00', '2147483647 days', '2147483648 days', '-2147483648 days', '178956970 years',
+  '178956971 years', '-178956970 years -8 months', '178956970 years 7 months 1 mon',
+  '9223372036854775807 microseconds', '9223372036854775808 us', '-9223372036854775808 us',
+  '2562047788 hours', '2562047789 hours', '153722867280 min', '1 day 1 day', '1 hour 1 hour',
+  '1 sec 1 ms', '1.5 sec 1 ms', '1 sec 1.5 ms', 'P1Y2M3DT4H5M6S', 'P1Y', 'PT1H', 'P1W', 'P0.5Y',
+  'P1.5M', 'P1.5W', 'P1.5D', 'PT1.5S', 'PT1.5H', 'P-1Y-2M', 'PT-1.5H', 'P1Y-2M',
+  'P0001-02-03T04:05:06', 'P0001-02-03', 'P0001-02', 'P0001', 'P0001-02-03T04', 'P0001-02-03T04:05',
+  'P0001-02T04:05:06', 'P0001T04:05:06', 'P00010203T040506', 'P00010203', 'PT040506', 'PT04:05:06',
+  'PT0405', 'PT04:05:06.5', 'P00010203T04:05:06', 'P0001-02-03T040506', 'P1Y2M3DT4H5M6.5S', 'P',
+  'PT', 'P1', 'P1X', 'p1y', 'P1e2Y', 'PT1e400S', 'P1.5e15Y', 'P1e15D', 'PT.5S', 'P1Y2Y', 'P1YT',
+  'P1DT1H1M1S1', 'P1Y1Y', 'PT1H1H', 'P0001-02-03-04', 'P1Y-', 'P--1Y', 'P1Y 2M', ' P1Y',
+  '1 week 2 days', '1 mon 2 mon', '3 4:05:06', '3 4:05', '4:05:06.789',
+  '1 year 2 mons -3 days +04:05:06.789', '1 day 25:00:00', '1 2', '1 hour 30', '1 2 3', '5 dow',
+  '1 day 2 h 3 m 4 s', '1 d', '1 y 2 m', '1 days days', 'day', '1 day 2:03:04 5', '1-2-3',
+  '1 timezone', '1:2:3:4', '1.5:00', '1 hour 2:03', '2:03 1 hour', '-2:03:04.5', '+2:03:04.5',
+  '1.' || repeat('9', 300), '0.1 microsecond', '0.5 microsecond', '-0.5 microsecond',
+  '1 century 1 decade 1 millennium', '1 years 1 decade', '7 days 1 week', '1 week 7 days',
+  '12 months 1 year', '1 @ day', '@ 1 @ day', '1 day @', '1 day ago ago', '1 day 2 hours ago'
+]);
+create function pg_temp.dtin(t text, i text) returns text language plpgsql as $$
+declare
+  valid boolean;
+  r text;
+  name text := (select typname from pg_type where oid = to_regtype(t));
+begin
+  execute format('select pg_input_is_valid(%L, %L)', i, t) into valid;
+  if not valid then
+    execute format('select ''ERROR '' || sql_error_code || '' '' || message || coalesce('' DETAIL '' || detail, '''') || coalesce('' HINT '' || hint, '''') from pg_input_error_info(%L, %L)', i, t)
+      into r;
+    return r;
+  end if;
+  if name = 'date' then
+    execute format('select encode(date_send(date_in(%L::cstring)), ''hex'')', i) into r;
+  else
+    execute format('select encode(%s_send(%s_in(%L::cstring, 0, %s)), ''hex'')', name, name, i,
+      to_regtypemod(t)) into r;
+  end if;
+  return r;
+end
+$$;
+create function pg_temp.dtins() returns table (t text, s text, i text, o text)
+language plpgsql as $$
+declare
+  ds text;
+  tz text;
+  ty text;
+  st text;
+begin
+  foreach ds in array array['ISO, MDY', 'ISO, DMY', 'ISO, YMD'] loop
+    perform set_config('datestyle', ds, false);
+    foreach tz in array array['UTC', '<+05:30>-05:30', '+05:30'] loop
+      perform set_config('timezone', tz, false);
+      foreach ty in array array['date', 'timestamp', 'timestamptz'] loop
+        return query select 'in ' || ty || ' -1', ds || '|' || tz, x.i, pg_temp.dtin(ty, x.i)
+          from stampins x order by n;
+      end loop;
+      foreach ty in array array['time', 'timetz'] loop
+        return query select 'in ' || ty || ' -1', ds || '|' || tz, x.i, pg_temp.dtin(ty, x.i)
+          from timeins x order by n;
+      end loop;
+    end loop;
+  end loop;
+  perform set_config('datestyle', 'ISO, MDY', false);
+  perform set_config('timezone', '<+05:30>-05:30', false);
+  foreach ty in array array['timestamp(0)', 'timestamp(2)', 'timestamptz(0)', 'timestamptz(5)',
+    'time(0)', 'time(3)', 'timetz(0)', 'timetz(1)'] loop
+    return query select 'in ' || (select typname from pg_type where oid = to_regtype(ty)) || ' '
+      || to_regtypemod(ty), 'ISO, MDY|<+05:30>-05:30', x.i, pg_temp.dtin(ty, x.i)
+      from unnest(array['2001-02-03 04:05:06.5', '2001-02-03 04:05:06.49', '2001-02-03 23:59:59.999999',
+        '2001-02-03 04:05:06.4999995', '04:05:06.123456', 'infinity', '294276-12-31 23:59:59.9']) x (i);
+  end loop;
+  perform set_config('timezone', 'UTC', false);
+  foreach st in array array['postgres', 'sql_standard'] loop
+    perform set_config('intervalstyle', st, false);
+    return query select 'in interval -1', st, x.i, pg_temp.dtin('interval', x.i)
+      from intervalins x order by n;
+  end loop;
+  perform set_config('intervalstyle', 'postgres', false);
+  foreach ty in array array['interval year', 'interval month', 'interval day', 'interval hour',
+    'interval minute', 'interval second', 'interval year to month', 'interval day to hour',
+    'interval day to minute', 'interval day to second', 'interval hour to minute',
+    'interval hour to second', 'interval minute to second', 'interval(2)', 'interval second(1)',
+    'interval day to second(0)'] loop
+    return query select 'in interval ' || to_regtypemod(ty), 'postgres', x.i, pg_temp.dtin(ty, x.i)
+      from unnest(array['5', '1.5', '1-2', '1 2', '1:2', '1:2:3', '1 2:3', '1 2:3:4.5678',
+        '1 year 2 months 3 days 4 hours 5 minutes 6.789 seconds', '-1 2:3:4.5', 'infinity',
+        'P1Y2M3DT4H5M6.789S', '1.2345 sec', '1 2 3']) x (i);
+  end loop;
+end
+$$;
+select * from pg_temp.dtins();

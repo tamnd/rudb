@@ -9,11 +9,12 @@ pub struct TypeError {
     pub sqlstate: SqlState,
     pub message: String,
     pub detail: Option<String>,
+    pub hint: Option<String>,
 }
 
 impl TypeError {
     pub(crate) fn new(sqlstate: SqlState, message: String) -> TypeError {
-        TypeError { sqlstate, message, detail: None }
+        TypeError { sqlstate, message, detail: None, hint: None }
     }
 
     /// `22P02`, `invalid input syntax for type integer: "1e3"`.
