@@ -7577,3 +7577,450 @@ in interval 470286336	postgres	infinity	7fffffffffffffff7fffffff7fffffff
 in interval 470286336	postgres	P1Y2M3DT4H5M6.789S	000000036c9b02c0000000030000000e
 in interval 470286336	postgres	1.2345 sec	00000000000f42400000000000000000
 in interval 470286336	postgres	1 2 3	ERROR 22007 invalid input syntax for type interval: "1 2 3"
+in text -1			
+in text -1		 	20
+in text -1		    	20202020
+in text -1		a	61
+in text -1		ab	6162
+in text -1		abc	616263
+in text -1		abcd	61626364
+in text -1		abc 	61626320
+in text -1		abc  	6162632020
+in text -1		ab  	61622020
+in text -1		a   b	6120202062
+in text -1		abc d	6162632064
+in text -1		ééé	c3a9c3a9c3a9
+in text -1		éééé	c3a9c3a9c3a9c3a9
+in text -1		ééé  	c3a9c3a9c3a92020
+in text -1		éé	c3a9c3a9
+in text -1		é é	c3a920c3a9
+inhex text -1		61626309	61626309
+inhex text -1		61620a	61620a
+in text -1		日本語	e697a5e69cace8aa9e
+in text -1		日本語x	e697a5e69cace8aa9e78
+in text -1		日本 	e697a5e69cac20
+in varchar -1			
+in varchar -1		 	20
+in varchar -1		    	20202020
+in varchar -1		a	61
+in varchar -1		ab	6162
+in varchar -1		abc	616263
+in varchar -1		abcd	61626364
+in varchar -1		abc 	61626320
+in varchar -1		abc  	6162632020
+in varchar -1		ab  	61622020
+in varchar -1		a   b	6120202062
+in varchar -1		abc d	6162632064
+in varchar -1		ééé	c3a9c3a9c3a9
+in varchar -1		éééé	c3a9c3a9c3a9c3a9
+in varchar -1		ééé  	c3a9c3a9c3a92020
+in varchar -1		éé	c3a9c3a9
+in varchar -1		é é	c3a920c3a9
+inhex varchar -1		61626309	61626309
+inhex varchar -1		61620a	61620a
+in varchar -1		日本語	e697a5e69cace8aa9e
+in varchar -1		日本語x	e697a5e69cace8aa9e78
+in varchar -1		日本 	e697a5e69cac20
+in varchar 5			
+in varchar 5		 	20
+in varchar 5		    	20
+in varchar 5		a	61
+in varchar 5		ab	ERROR 22001 value too long for type character varying(1)
+in varchar 5		abc	ERROR 22001 value too long for type character varying(1)
+in varchar 5		abcd	ERROR 22001 value too long for type character varying(1)
+in varchar 5		abc 	ERROR 22001 value too long for type character varying(1)
+in varchar 5		abc  	ERROR 22001 value too long for type character varying(1)
+in varchar 5		ab  	ERROR 22001 value too long for type character varying(1)
+in varchar 5		a   b	ERROR 22001 value too long for type character varying(1)
+in varchar 5		abc d	ERROR 22001 value too long for type character varying(1)
+in varchar 5		ééé	ERROR 22001 value too long for type character varying(1)
+in varchar 5		éééé	ERROR 22001 value too long for type character varying(1)
+in varchar 5		ééé  	ERROR 22001 value too long for type character varying(1)
+in varchar 5		éé	ERROR 22001 value too long for type character varying(1)
+in varchar 5		é é	ERROR 22001 value too long for type character varying(1)
+inhex varchar 5		61626309	ERROR 22001 value too long for type character varying(1)
+inhex varchar 5		61620a	ERROR 22001 value too long for type character varying(1)
+in varchar 5		日本語	ERROR 22001 value too long for type character varying(1)
+in varchar 5		日本語x	ERROR 22001 value too long for type character varying(1)
+in varchar 5		日本 	ERROR 22001 value too long for type character varying(1)
+in varchar 7			
+in varchar 7		 	20
+in varchar 7		    	202020
+in varchar 7		a	61
+in varchar 7		ab	6162
+in varchar 7		abc	616263
+in varchar 7		abcd	ERROR 22001 value too long for type character varying(3)
+in varchar 7		abc 	616263
+in varchar 7		abc  	616263
+in varchar 7		ab  	616220
+in varchar 7		a   b	ERROR 22001 value too long for type character varying(3)
+in varchar 7		abc d	ERROR 22001 value too long for type character varying(3)
+in varchar 7		ééé	c3a9c3a9c3a9
+in varchar 7		éééé	ERROR 22001 value too long for type character varying(3)
+in varchar 7		ééé  	c3a9c3a9c3a9
+in varchar 7		éé	c3a9c3a9
+in varchar 7		é é	c3a920c3a9
+inhex varchar 7		61626309	ERROR 22001 value too long for type character varying(3)
+inhex varchar 7		61620a	61620a
+in varchar 7		日本語	e697a5e69cace8aa9e
+in varchar 7		日本語x	ERROR 22001 value too long for type character varying(3)
+in varchar 7		日本 	e697a5e69cac20
+in bpchar -1			
+in bpchar -1		 	20
+in bpchar -1		    	20202020
+in bpchar -1		a	61
+in bpchar -1		ab	6162
+in bpchar -1		abc	616263
+in bpchar -1		abcd	61626364
+in bpchar -1		abc 	61626320
+in bpchar -1		abc  	6162632020
+in bpchar -1		ab  	61622020
+in bpchar -1		a   b	6120202062
+in bpchar -1		abc d	6162632064
+in bpchar -1		ééé	c3a9c3a9c3a9
+in bpchar -1		éééé	c3a9c3a9c3a9c3a9
+in bpchar -1		ééé  	c3a9c3a9c3a92020
+in bpchar -1		éé	c3a9c3a9
+in bpchar -1		é é	c3a920c3a9
+inhex bpchar -1		61626309	61626309
+inhex bpchar -1		61620a	61620a
+in bpchar -1		日本語	e697a5e69cace8aa9e
+in bpchar -1		日本語x	e697a5e69cace8aa9e78
+in bpchar -1		日本 	e697a5e69cac20
+in bpchar 5			20
+in bpchar 5		 	20
+in bpchar 5		    	20
+in bpchar 5		a	61
+in bpchar 5		ab	ERROR 22001 value too long for type character(1)
+in bpchar 5		abc	ERROR 22001 value too long for type character(1)
+in bpchar 5		abcd	ERROR 22001 value too long for type character(1)
+in bpchar 5		abc 	ERROR 22001 value too long for type character(1)
+in bpchar 5		abc  	ERROR 22001 value too long for type character(1)
+in bpchar 5		ab  	ERROR 22001 value too long for type character(1)
+in bpchar 5		a   b	ERROR 22001 value too long for type character(1)
+in bpchar 5		abc d	ERROR 22001 value too long for type character(1)
+in bpchar 5		ééé	ERROR 22001 value too long for type character(1)
+in bpchar 5		éééé	ERROR 22001 value too long for type character(1)
+in bpchar 5		ééé  	ERROR 22001 value too long for type character(1)
+in bpchar 5		éé	ERROR 22001 value too long for type character(1)
+in bpchar 5		é é	ERROR 22001 value too long for type character(1)
+inhex bpchar 5		61626309	ERROR 22001 value too long for type character(1)
+inhex bpchar 5		61620a	ERROR 22001 value too long for type character(1)
+in bpchar 5		日本語	ERROR 22001 value too long for type character(1)
+in bpchar 5		日本語x	ERROR 22001 value too long for type character(1)
+in bpchar 5		日本 	ERROR 22001 value too long for type character(1)
+in bpchar 7			202020
+in bpchar 7		 	202020
+in bpchar 7		    	202020
+in bpchar 7		a	612020
+in bpchar 7		ab	616220
+in bpchar 7		abc	616263
+in bpchar 7		abcd	ERROR 22001 value too long for type character(3)
+in bpchar 7		abc 	616263
+in bpchar 7		abc  	616263
+in bpchar 7		ab  	616220
+in bpchar 7		a   b	ERROR 22001 value too long for type character(3)
+in bpchar 7		abc d	ERROR 22001 value too long for type character(3)
+in bpchar 7		ééé	c3a9c3a9c3a9
+in bpchar 7		éééé	ERROR 22001 value too long for type character(3)
+in bpchar 7		ééé  	c3a9c3a9c3a9
+in bpchar 7		éé	c3a9c3a920
+in bpchar 7		é é	c3a920c3a9
+inhex bpchar 7		61626309	ERROR 22001 value too long for type character(3)
+inhex bpchar 7		61620a	61620a
+in bpchar 7		日本語	e697a5e69cace8aa9e
+in bpchar 7		日本語x	ERROR 22001 value too long for type character(3)
+in bpchar 7		日本 	e697a5e69cac20
+coerce varchar 5 true			
+coerce varchar 5 true		 	20
+coerce varchar 5 true		    	20
+coerce varchar 5 true		a	61
+coerce varchar 5 true		ab	61
+coerce varchar 5 true		abc	61
+coerce varchar 5 true		abcd	61
+coerce varchar 5 true		abc 	61
+coerce varchar 5 true		abc  	61
+coerce varchar 5 true		ab  	61
+coerce varchar 5 true		a   b	61
+coerce varchar 5 true		abc d	61
+coerce varchar 5 true		ééé	c3a9
+coerce varchar 5 true		éééé	c3a9
+coerce varchar 5 true		ééé  	c3a9
+coerce varchar 5 true		éé	c3a9
+coerce varchar 5 true		é é	c3a9
+coerce varchar 5 true		日本語	e697a5
+coerce varchar 5 true		日本語x	e697a5
+coerce varchar 5 true		日本 	e697a5
+coerce varchar 5 false			
+coerce varchar 5 false		 	20
+coerce varchar 5 false		    	20
+coerce varchar 5 false		a	61
+coerce varchar 5 false		ab	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		abc	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		abcd	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		abc 	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		abc  	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		ab  	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		a   b	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		abc d	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		ééé	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		éééé	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		ééé  	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		éé	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		é é	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		日本語	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		日本語x	ERROR 22001 value too long for type character varying(1)
+coerce varchar 5 false		日本 	ERROR 22001 value too long for type character varying(1)
+coerce varchar 7 true			
+coerce varchar 7 true		 	20
+coerce varchar 7 true		    	202020
+coerce varchar 7 true		a	61
+coerce varchar 7 true		ab	6162
+coerce varchar 7 true		abc	616263
+coerce varchar 7 true		abcd	616263
+coerce varchar 7 true		abc 	616263
+coerce varchar 7 true		abc  	616263
+coerce varchar 7 true		ab  	616220
+coerce varchar 7 true		a   b	612020
+coerce varchar 7 true		abc d	616263
+coerce varchar 7 true		ééé	c3a9c3a9c3a9
+coerce varchar 7 true		éééé	c3a9c3a9c3a9
+coerce varchar 7 true		ééé  	c3a9c3a9c3a9
+coerce varchar 7 true		éé	c3a9c3a9
+coerce varchar 7 true		é é	c3a920c3a9
+coerce varchar 7 true		日本語	e697a5e69cace8aa9e
+coerce varchar 7 true		日本語x	e697a5e69cace8aa9e
+coerce varchar 7 true		日本 	e697a5e69cac20
+coerce varchar 7 false			
+coerce varchar 7 false		 	20
+coerce varchar 7 false		    	202020
+coerce varchar 7 false		a	61
+coerce varchar 7 false		ab	6162
+coerce varchar 7 false		abc	616263
+coerce varchar 7 false		abcd	ERROR 22001 value too long for type character varying(3)
+coerce varchar 7 false		abc 	616263
+coerce varchar 7 false		abc  	616263
+coerce varchar 7 false		ab  	616220
+coerce varchar 7 false		a   b	ERROR 22001 value too long for type character varying(3)
+coerce varchar 7 false		abc d	ERROR 22001 value too long for type character varying(3)
+coerce varchar 7 false		ééé	c3a9c3a9c3a9
+coerce varchar 7 false		éééé	ERROR 22001 value too long for type character varying(3)
+coerce varchar 7 false		ééé  	c3a9c3a9c3a9
+coerce varchar 7 false		éé	c3a9c3a9
+coerce varchar 7 false		é é	c3a920c3a9
+coerce varchar 7 false		日本語	e697a5e69cace8aa9e
+coerce varchar 7 false		日本語x	ERROR 22001 value too long for type character varying(3)
+coerce varchar 7 false		日本 	e697a5e69cac20
+coerce bpchar 5 true			20
+coerce bpchar 5 true		 	20
+coerce bpchar 5 true		    	20
+coerce bpchar 5 true		a	61
+coerce bpchar 5 true		ab	61
+coerce bpchar 5 true		abc	61
+coerce bpchar 5 true		abcd	61
+coerce bpchar 5 true		abc 	61
+coerce bpchar 5 true		abc  	61
+coerce bpchar 5 true		ab  	61
+coerce bpchar 5 true		a   b	61
+coerce bpchar 5 true		abc d	61
+coerce bpchar 5 true		ééé	c3a9
+coerce bpchar 5 true		éééé	c3a9
+coerce bpchar 5 true		ééé  	c3a9
+coerce bpchar 5 true		éé	c3a9
+coerce bpchar 5 true		é é	c3a9
+coerce bpchar 5 true		日本語	e697a5
+coerce bpchar 5 true		日本語x	e697a5
+coerce bpchar 5 true		日本 	e697a5
+coerce bpchar 5 false			20
+coerce bpchar 5 false		 	20
+coerce bpchar 5 false		    	20
+coerce bpchar 5 false		a	61
+coerce bpchar 5 false		ab	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		abc	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		abcd	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		abc 	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		abc  	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		ab  	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		a   b	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		abc d	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		ééé	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		éééé	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		ééé  	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		éé	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		é é	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		日本語	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		日本語x	ERROR 22001 value too long for type character(1)
+coerce bpchar 5 false		日本 	ERROR 22001 value too long for type character(1)
+coerce bpchar 7 true			202020
+coerce bpchar 7 true		 	202020
+coerce bpchar 7 true		    	202020
+coerce bpchar 7 true		a	612020
+coerce bpchar 7 true		ab	616220
+coerce bpchar 7 true		abc	616263
+coerce bpchar 7 true		abcd	616263
+coerce bpchar 7 true		abc 	616263
+coerce bpchar 7 true		abc  	616263
+coerce bpchar 7 true		ab  	616220
+coerce bpchar 7 true		a   b	612020
+coerce bpchar 7 true		abc d	616263
+coerce bpchar 7 true		ééé	c3a9c3a9c3a9
+coerce bpchar 7 true		éééé	c3a9c3a9c3a9
+coerce bpchar 7 true		ééé  	c3a9c3a9c3a9
+coerce bpchar 7 true		éé	c3a9c3a920
+coerce bpchar 7 true		é é	c3a920c3a9
+coerce bpchar 7 true		日本語	e697a5e69cace8aa9e
+coerce bpchar 7 true		日本語x	e697a5e69cace8aa9e
+coerce bpchar 7 true		日本 	e697a5e69cac20
+coerce bpchar 7 false			202020
+coerce bpchar 7 false		 	202020
+coerce bpchar 7 false		    	202020
+coerce bpchar 7 false		a	612020
+coerce bpchar 7 false		ab	616220
+coerce bpchar 7 false		abc	616263
+coerce bpchar 7 false		abcd	ERROR 22001 value too long for type character(3)
+coerce bpchar 7 false		abc 	616263
+coerce bpchar 7 false		abc  	616263
+coerce bpchar 7 false		ab  	616220
+coerce bpchar 7 false		a   b	ERROR 22001 value too long for type character(3)
+coerce bpchar 7 false		abc d	ERROR 22001 value too long for type character(3)
+coerce bpchar 7 false		ééé	c3a9c3a9c3a9
+coerce bpchar 7 false		éééé	ERROR 22001 value too long for type character(3)
+coerce bpchar 7 false		ééé  	c3a9c3a9c3a9
+coerce bpchar 7 false		éé	c3a9c3a920
+coerce bpchar 7 false		é é	c3a920c3a9
+coerce bpchar 7 false		日本語	e697a5e69cace8aa9e
+coerce bpchar 7 false		日本語x	ERROR 22001 value too long for type character(3)
+coerce bpchar 7 false		日本 	e697a5e69cac20
+in json -1		1	31
+in json -1		-0	2d30
+in json -1		0	30
+in json -1		1.5e10	312e35653130
+in json -1		-1.5E-10	2d312e35452d3130
+in json -1		1e+5	31652b35
+in json -1		0.5	302e35
+in json -1		true	74727565
+in json -1		false	66616c7365
+in json -1		null	6e756c6c
+in json -1		"abc"	2261626322
+in json -1		""	2222
+in json -1		"é"	22c3a922
+in json -1		"😀"	22f09f988022
+in json -1		"\u0000"	225c753030303022
+in json -1		"\ud800"	225c756438303022
+in json -1		"\uDC00x"	225c75444330307822
+in json -1		[]	5b5d
+in json -1		{}	7b7d
+in json -1		[1,2,3]	5b312c322c335d
+in json -1		{"a":1,"b":[true,null,{"c":"d"}]}	7b2261223a312c2262223a5b747275652c6e756c6c2c7b2263223a2264227d5d7d
+in json -1		 [ 1 , 2 ] 	205b2031202c2032205d20
+in json -1		{"a":1,"a":2}	7b2261223a312c2261223a327d
+in json -1		"é"	22c3a922
+in json -1		"\/"	225c2f22
+in json -1		"\b\f\n\r\t\"\\"	225c625c665c6e5c725c745c225c5c22
+inhex json -1		5b312c0a325d	5b312c0a325d
+inhex json -1		097b7d0d0a	097b7d0d0a
+in json -1		"a b"	2261206222
+in json -1		[[[[[]]]]]	5b5b5b5b5b5d5d5d5d5d
+in json -1		{"":{"":{}}}	7b22223a7b22223a7b7d7d7d
+in json -1		-0.0e-0	2d302e30652d30
+in json -1		"ኯ"	22e18aaf22
+in json -1			ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+in json -1		 	ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+in json -1		01	ERROR 22P02 invalid input syntax for type json DETAIL Token "01" is invalid.
+in json -1		-	ERROR 22P02 invalid input syntax for type json DETAIL Token "-" is invalid.
+in json -1		-a	ERROR 22P02 invalid input syntax for type json DETAIL Token "-a" is invalid.
+in json -1		1.	ERROR 22P02 invalid input syntax for type json DETAIL Token "1." is invalid.
+in json -1		.5	ERROR 22P02 invalid input syntax for type json DETAIL Token "." is invalid.
+in json -1		1.e5	ERROR 22P02 invalid input syntax for type json DETAIL Token "1.e5" is invalid.
+in json -1		1e	ERROR 22P02 invalid input syntax for type json DETAIL Token "1e" is invalid.
+in json -1		1e+	ERROR 22P02 invalid input syntax for type json DETAIL Token "1e+" is invalid.
+in json -1		+1	ERROR 22P02 invalid input syntax for type json DETAIL Token "+" is invalid.
+in json -1		tru	ERROR 22P02 invalid input syntax for type json DETAIL Token "tru" is invalid.
+in json -1		True	ERROR 22P02 invalid input syntax for type json DETAIL Token "True" is invalid.
+in json -1		nul	ERROR 22P02 invalid input syntax for type json DETAIL Token "nul" is invalid.
+in json -1		falsey	ERROR 22P02 invalid input syntax for type json DETAIL Token "falsey" is invalid.
+in json -1		undefined	ERROR 22P02 invalid input syntax for type json DETAIL Token "undefined" is invalid.
+in json -1		NaN	ERROR 22P02 invalid input syntax for type json DETAIL Token "NaN" is invalid.
+in json -1		Infinity	ERROR 22P02 invalid input syntax for type json DETAIL Token "Infinity" is invalid.
+in json -1		-Infinity	ERROR 22P02 invalid input syntax for type json DETAIL Token "-Infinity" is invalid.
+in json -1		[	ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+in json -1		]	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found "]".
+in json -1		[1	ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+in json -1		[1,	ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+in json -1		[1,]	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found "]".
+in json -1		[,1]	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found ",".
+in json -1		[1 2]	ERROR 22P02 invalid input syntax for type json DETAIL Expected "," or "]", but found "2".
+in json -1		{	ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+in json -1		{"a"	ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+in json -1		{"a":	ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+in json -1		{"a":1	ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+in json -1		{"a":1,	ERROR 22P02 invalid input syntax for type json DETAIL The input string ended unexpectedly.
+in json -1		{"a" 1}	ERROR 22P02 invalid input syntax for type json DETAIL Expected ":", but found "1".
+in json -1		{a:1}	ERROR 22P02 invalid input syntax for type json DETAIL Token "a" is invalid.
+in json -1		{1:2}	ERROR 22P02 invalid input syntax for type json DETAIL Expected string or "}", but found "1".
+in json -1		{"a":1,}	ERROR 22P02 invalid input syntax for type json DETAIL Expected string, but found "}".
+in json -1		{"a":1 "b":2}	ERROR 22P02 invalid input syntax for type json DETAIL Expected "," or "}", but found ""b"".
+in json -1		{,}	ERROR 22P02 invalid input syntax for type json DETAIL Expected string or "}", but found ",".
+in json -1		"abc	ERROR 22P02 invalid input syntax for type json DETAIL Token ""abc" is invalid.
+in json -1		"abc\	ERROR 22P02 invalid input syntax for type json DETAIL Token ""abc\" is invalid.
+in json -1		"\x"	ERROR 22P02 invalid input syntax for type json DETAIL Escape sequence "\x" is invalid.
+in json -1		"\u12"	ERROR 22P02 invalid input syntax for type json DETAIL "\u" must be followed by four hexadecimal digits.
+in json -1		"\u12g4"	ERROR 22P02 invalid input syntax for type json DETAIL "\u" must be followed by four hexadecimal digits.
+in json -1		"\uzzzz"	ERROR 22P02 invalid input syntax for type json DETAIL "\u" must be followed by four hexadecimal digits.
+inhex json -1		2261096222	ERROR 22P02 invalid input syntax for type json DETAIL Character with value 0x09 must be escaped.
+inhex json -1		220a22	ERROR 22P02 invalid input syntax for type json DETAIL Character with value 0x0a must be escaped.
+inhex json -1		220122	ERROR 22P02 invalid input syntax for type json DETAIL Character with value 0x01 must be escaped.
+in json -1		"\é"	ERROR 22P02 invalid input syntax for type json DETAIL Escape sequence "\é" is invalid.
+in json -1		1 2	ERROR 22P02 invalid input syntax for type json DETAIL Expected end of input, but found "2".
+in json -1		[] []	ERROR 22P02 invalid input syntax for type json DETAIL Expected end of input, but found "[".
+in json -1		{}}	ERROR 22P02 invalid input syntax for type json DETAIL Expected end of input, but found "}".
+in json -1		[]]	ERROR 22P02 invalid input syntax for type json DETAIL Expected end of input, but found "]".
+in json -1		é	ERROR 22P02 invalid input syntax for type json DETAIL Token "é" is invalid.
+in json -1		1é	ERROR 22P02 invalid input syntax for type json DETAIL Token "1é" is invalid.
+in json -1		"a"b	ERROR 22P02 invalid input syntax for type json DETAIL Token "b" is invalid.
+in json -1		[1]x	ERROR 22P02 invalid input syntax for type json DETAIL Token "x" is invalid.
+in json -1		1.5.3	ERROR 22P02 invalid input syntax for type json DETAIL Token "." is invalid.
+in json -1		#	ERROR 22P02 invalid input syntax for type json DETAIL Token "#" is invalid.
+in json -1		[#]	ERROR 22P02 invalid input syntax for type json DETAIL Token "#" is invalid.
+in json -1		"\	ERROR 22P02 invalid input syntax for type json DETAIL Token ""\" is invalid.
+in json -1		/	ERROR 22P02 invalid input syntax for type json DETAIL Token "/" is invalid.
+in json -1		{"a":1}garbage	ERROR 22P02 invalid input syntax for type json DETAIL Token "garbage" is invalid.
+in json -1		nullx	ERROR 22P02 invalid input syntax for type json DETAIL Token "nullx" is invalid.
+in json -1		 null 	206e756c6c20
+in json -1		[-]	ERROR 22P02 invalid input syntax for type json DETAIL Token "-" is invalid.
+in json -1		[1,-]	ERROR 22P02 invalid input syntax for type json DETAIL Token "-" is invalid.
+in json -1		{"a":tru}	ERROR 22P02 invalid input syntax for type json DETAIL Token "tru" is invalid.
+in json -1		"\u"	ERROR 22P02 invalid input syntax for type json DETAIL "\u" must be followed by four hexadecimal digits.
+in json -1		"\u00"	ERROR 22P02 invalid input syntax for type json DETAIL "\u" must be followed by four hexadecimal digits.
+in json -1		"abc\"	ERROR 22P02 invalid input syntax for type json DETAIL Token ""abc\"" is invalid.
+in json -1		123abc	ERROR 22P02 invalid input syntax for type json DETAIL Token "123abc" is invalid.
+in json -1		[1e5x]	ERROR 22P02 invalid input syntax for type json DETAIL Token "1e5x" is invalid.
+in json -1		"\q"	ERROR 22P02 invalid input syntax for type json DETAIL Escape sequence "\q" is invalid.
+in json -1		{"a":[1,2}	ERROR 22P02 invalid input syntax for type json DETAIL Expected "," or "]", but found "}".
+in json -1		[{"a":1]	ERROR 22P02 invalid input syntax for type json DETAIL Expected "," or "}", but found "]".
+in json -1		1e5_	ERROR 22P02 invalid input syntax for type json DETAIL Token "1e5_" is invalid.
+in json -1		{"a":}	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found "}".
+in json -1		{"a"::1}	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found ":".
+in json -1		[:]	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found ":".
+in json -1		{]	ERROR 22P02 invalid input syntax for type json DETAIL Expected string or "}", but found "]".
+in json -1		[}	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found "}".
+in json -1		"日本"	22e697a5e69cac22
+in json -1		"\日"	ERROR 22P02 invalid input syntax for type json DETAIL Escape sequence "\日" is invalid.
+in json -1		日本	ERROR 22P02 invalid input syntax for type json DETAIL Token "日本" is invalid.
+in json -1		{"a":1}}	ERROR 22P02 invalid input syntax for type json DETAIL Expected end of input, but found "}".
+in json -1		1-2	ERROR 22P02 invalid input syntax for type json DETAIL Expected end of input, but found "-2".
+in json -1		-01	ERROR 22P02 invalid input syntax for type json DETAIL Token "-01" is invalid.
+in json -1		00	ERROR 22P02 invalid input syntax for type json DETAIL Token "00" is invalid.
+in json -1		1E5	314535
+in json -1		[1,2,]	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found "]".
+in json -1		{"a"}	ERROR 22P02 invalid input syntax for type json DETAIL Expected ":", but found "}".
+in json -1		"a""b"	ERROR 22P02 invalid input syntax for type json DETAIL Expected end of input, but found ""b"".
+in json -1		[true false]	ERROR 22P02 invalid input syntax for type json DETAIL Expected "," or "]", but found "false".
+in json -1		{"a":1 , "b" : [ ] }	7b2261223a31202c20226222203a205b205d207d
+in json -1		\	ERROR 22P02 invalid input syntax for type json DETAIL Token "\" is invalid.
+in json -1		"	ERROR 22P02 invalid input syntax for type json DETAIL Token """ is invalid.
+in json -1		[,]	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found ",".
+in json -1		,	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found ",".
+in json -1		:	ERROR 22P02 invalid input syntax for type json DETAIL Expected JSON value, but found ":".
+in json -1		{"a":1,"b"}	ERROR 22P02 invalid input syntax for type json DETAIL Expected ":", but found "}".
+in json -1		{"a",}	ERROR 22P02 invalid input syntax for type json DETAIL Expected ":", but found ",".

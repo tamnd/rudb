@@ -23,6 +23,13 @@
 //! `extra_float_digits`: above zero they give the shortest text that reads back to the same value,
 //! and at zero or below they give the `%g` text of old servers.
 //!
+//! `text`, `varchar(n)`, `character(n)` and `json`. The text form of `text` is the string.
+//! [`varchar_in`] and [`bpchar_in`] take the typmod, refuse a value that is too long, and remove
+//! the spaces after the length. [`bpchar_in`] also pads a short value with spaces.
+//! [`varchar_coerce`] and [`bpchar_coerce`] are the length casts, which cut with no error when the
+//! cast is explicit. [`json_in`] checks the syntax with the error details of PostgreSQL and gives
+//! the string. [`Recv::text`] is the encoding check of the receive function of each string type.
+//!
 //! [`Numeric`], a `numeric` value in the layout of PostgreSQL, with [`numeric_in`],
 //! [`numeric_out`], [`numeric_recv`] and [`numeric_send`]. The input and the receive function
 //! take the typmod and round to it as PostgreSQL does. The engine keeps a `numeric(p, s)` column
@@ -54,15 +61,21 @@
 //! a zone with daylight saving time, a zone name in the input such as `Europe/Paris`, and an
 //! abbreviation whose offset changed over time such as `MSK` need the tz database, which comes
 //! later. Until then the input refuses a zone name with the error of an unknown zone.
+//!
+//! PostgreSQL parses `json` by recursion and stops a deep value with `stack depth limit exceeded`
+//! when it reaches `max_stack_depth`. [`json_in`] uses no recursion and takes a value at any
+//! depth.
 
 mod binary;
 mod datetime;
 mod error;
 mod float;
 mod generated;
+mod json;
 mod number;
 mod numeric;
 mod scalar;
+mod string;
 mod types;
 pub mod typmod;
 
@@ -79,6 +92,7 @@ pub use datetime::{
 pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};
 pub use generated::oids as oid;
+pub use json::json_in;
 pub use number::{int_out, int2_in, int4_in, int8_in, oid_in, oid_out, u64_out};
 pub use numeric::{
     Numeric, NumericSign, decimal_out, decimal_send, numeric_in, numeric_out, numeric_recv,
@@ -88,4 +102,5 @@ pub use scalar::{
     ByteaOutput, NAME_MAX_BYTES, bool_in, bool_out, bytea_in, bytea_out, char_in, char_out,
     name_in, uuid_in, uuid_out,
 };
+pub use string::{bpchar_coerce, bpchar_in, varchar_coerce, varchar_in};
 pub use types::{Oid, PgType, TypeInfo};
