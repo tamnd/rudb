@@ -2971,9 +2971,10 @@ fn by_place<const W: usize, const S: usize>(
     for (block, places) in blocks.iter().enumerate() {
         let mut lanes: [&[u64; 8]; W] = [&NONE; W];
         for (lanes, column) in lanes.iter_mut().zip(&columns) {
-            *lanes = column.get(block * 8..).and_then(|values| values.first_chunk::<8>()).ok_or_else(
-                || Error::internal("a summed column shorter than its rows".to_string()),
-            )?;
+            *lanes =
+                column.get(block * 8..).and_then(|values| values.first_chunk::<8>()).ok_or_else(
+                    || Error::internal("a summed column shorter than its rows".to_string()),
+                )?;
         }
         for (at, &place) in places.iter().enumerate() {
             let mut row = [0_u64; W];
@@ -6439,7 +6440,8 @@ mod tests {
         let mut twice = fresh();
         for _ in 0..2 {
             for (at, &input) in inputs.iter().enumerate() {
-                update_scattered(&mut twice, &slots, stride, at, input, rows).expect("folds them in");
+                update_scattered(&mut twice, &slots, stride, at, input, rows)
+                    .expect("folds them in");
             }
         }
         for group in 0..groups {
@@ -6451,7 +6453,11 @@ mod tests {
                 assert_eq!(by_slot[index].finish().expect("finishes"), answer, "{note}, by slot");
                 assert_eq!(by_place[index].finish().expect("finishes"), answer, "{note}, by place");
                 let doubled = twice[index].finish().expect("finishes");
-                assert_eq!(each_place[index].finish().expect("finishes"), doubled, "{note}, each place");
+                assert_eq!(
+                    each_place[index].finish().expect("finishes"),
+                    doubled,
+                    "{note}, each place"
+                );
             }
         }
     }
@@ -6463,8 +6469,7 @@ mod tests {
         let mut rng = Rng(0x5eed_0115_d40b);
         for rows in [1, 2, 7, 64, 300] {
             for every in [2, 3, 70, 1000] {
-                let kept: Vec<u32> =
-                    (0..rows as u32).filter(|_| rng.next() % every != 0).collect();
+                let kept: Vec<u32> = (0..rows as u32).filter(|_| rng.next() % every != 0).collect();
                 let mut found: Vec<usize> = (0..rows).collect();
                 fill_dropped(&kept, &mut found, usize::MAX);
                 let mut walked: Vec<usize> = (0..rows).collect();
