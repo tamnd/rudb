@@ -277,6 +277,20 @@ impl Link {
         }
     }
 
+    /// What [`Self::write`] appends for the packed form over this many children and parents, the
+    /// header included, without building it.
+    ///
+    /// A packed link is a fixed width entry per child and a pair of bounds per part, so its size is
+    /// known from the two counts alone. A build that only needs to know whether a link fits its
+    /// budget asks this first. On JOB eight of the ten links are refused, and building the two of
+    /// `cast_info` to find that out held 290 MB of entries and packed 100 MB for each.
+    #[must_use]
+    pub fn packed_bytes(children: usize, parents: u64) -> usize {
+        HEADER_BYTES
+            + children.div_ceil(PART_ROWS) * 16
+            + bitpack::tail_len(children, width_for(parents))
+    }
+
     /// The parent of a child row, or `None` if it has none or the child is past the end.
     #[must_use]
     pub fn forward(&self, child: Rid) -> Option<Rid> {
@@ -914,6 +928,21 @@ mod tests {
         assert_eq!(link.part_bounds(0), Some(Some((1, PART_ROWS as u64))));
         assert_eq!(link.part_bounds(2), Some(Some((PART_ROWS as u64 - 4, PART_ROWS as u64))));
         assert_eq!(link.part_bounds(3), None, "there is no fourth part");
+    }
+
+    #[test]
+    fn the_size_of_a_packed_link_is_known_before_it_is_built() {
+        for (children, parents) in [(0, 0), (1, 1), (PART_ROWS, 3), (PART_ROWS * 3 + 7, 1 << 20)] {
+            let parents_of = (0..children as u64)
+                .map(|child| if child % 5 == 0 { NO_PARENT } else { child % parents.max(1) })
+                .collect::<Vec<Rid>>();
+            let link = Link::build(&parents_of, parents).expect("build");
+            let mut written = Vec::new();
+            link.write(&mut written).expect("write");
+            if link.form() == Form::Packed {
+                assert_eq!(written.len(), Link::packed_bytes(children, parents), "{children}");
+            }
+        }
     }
 
     #[test]

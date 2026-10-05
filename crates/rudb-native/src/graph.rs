@@ -780,9 +780,10 @@ fn links_of_one_table(
     let mut report = Vec::with_capacity(edges.len());
     let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(edges.len());
     let mut adjacencies: Vec<Option<Vec<u8>>> = Vec::with_capacity(edges.len());
+    let room = allowance.saturating_sub(spent);
     for edge in edges {
         let start = Instant::now();
-        match one_link(&catalog, &child, edge) {
+        match one_link(&catalog, &child, edge, room) {
             Ok((built, bytes, adjacency)) => {
                 report.push(BuiltLink {
                     build: start.elapsed(),
@@ -902,7 +903,7 @@ fn links_of_one_table(
                     u32::try_from(binding_bytes(&built.edge.parent))
                         .map_err(|_| invalid("a parent name longer than a section header"))?
                 } else {
-                    cost(bytes.len())
+                    cost(built.bytes)
                 },
                 bytes: if built.built { bytes } else { &[] },
             })
@@ -1024,6 +1025,10 @@ type OneLink = (BuiltLink, Vec<u8>, Option<Vec<u8>>);
 
 /// Builds one link, or says in one sentence why there is not one.
 ///
+/// A packed link bigger than `room`, which is what the table's allowance has left before any of its
+/// links, is never kept whatever else is, so it is only measured: its payload comes back empty and
+/// its size is the one [`link::Link::packed_bytes`] works out.
+///
 /// The error type is a `String` and not an [`rudb_common::Error`] on purpose. Every reason a link
 /// cannot be built here is a reason to not have one, which section 3.1 says is a slower query and
 /// not a failed one, so the caller's response is the same for all of them and a message is what it
@@ -1032,6 +1037,7 @@ fn one_link(
     catalog: &Catalog,
     child: &Reader,
     edge: &Edge,
+    room: u64,
 ) -> std::result::Result<OneLink, String> {
     let parent =
         catalog.table(&edge.parent).map_err(|_| format!("no table named {}", edge.parent))?;
@@ -1078,11 +1084,18 @@ fn one_link(
     // packed form, which is any slice with an unmatched child or a child before its predecessor.
     let parents = map.len();
     let packed = parents == 0 || parents_of.contains(&NO_PARENT) || !parents_of.is_sorted();
+    let size = binding_bytes(&edge.parent) + link::Link::packed_bytes(parents_of.len(), parents);
+    let measured = packed && size as u64 > room;
     let (built, degrees, spans, adjacency) = std::thread::scope(|scope| {
         let built = scope.spawn(|| {
+            if measured {
+                let linked = parents_of.iter().filter(|&&parent| parent != NO_PARENT).count();
+                return Ok((link::Form::Packed, linked as u64, Vec::new(), size));
+            }
             let link = link::Link::build(&parents_of, parents)?;
             let bytes = encode_link(&link, &parent, edge)?;
-            Ok::<_, rudb_common::Error>((link, bytes))
+            let size = bytes.len();
+            Ok::<_, rudb_common::Error>((link.form(), link.linked(), bytes, size))
         });
         let degrees = (!packed).then(|| scope.spawn(|| Degrees::of(&parents_of, parents, true)));
         let spans = scope.spawn(|| spans_of(child, &parent, &parents_of));
@@ -1101,7 +1114,7 @@ fn one_link(
             adjacency,
         )
     });
-    let (link, bytes) = built?.map_err(|error| error.to_string())?;
+    let (form, linked, bytes, size) = built?.map_err(|error| error.to_string())?;
     let spans = spans?.map_err(|error| error.to_string())?;
     let adjacency = adjacency.map_err(|error| error.to_string())?;
     let (adjacency, degrees) = match (adjacency, degrees?) {
@@ -1109,18 +1122,18 @@ fn one_link(
         (None, Some(degrees)) => (None, degrees),
         (None, None) => (None, Degrees::of(&parents_of, parents, true)),
     };
-    let adjacency = match link.form() {
+    let adjacency = match form {
         link::Form::Monotone => None,
         link::Form::Packed => adjacency,
     };
     Ok((
         BuiltLink {
             edge: edge.clone(),
-            form: Some(link.form()),
-            children: link.children(),
+            form: Some(form),
+            children: parents_of.len() as u64,
             parents: map.len(),
-            linked: link.linked(),
-            bytes: bytes.len(),
+            linked,
+            bytes: size,
             table_bytes: 0,
             degrees: Some(degrees),
             spans,
