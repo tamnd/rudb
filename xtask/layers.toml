@@ -26,6 +26,11 @@ rudb-regex = 1
 # with the instrumentation shim in `rudb-pipeline` at rank 4, and a crate that collects from the
 # whole engine has to sit under all of it rather than beside the part that reports first.
 rudb-metrics = 1
+# The PostgreSQL wire codec, per notes/Spec/2140/compat/postgres/16-crate-layout.md section 16.2.
+# Rank 1 because it needs only the error type. It takes bytes and returns messages and knows
+# nothing about a socket, so rudb-postgres can drive it without a server. SCRAM is generic over a
+# small hash trait, and rudb-server gives it the crypto provider.
+rudb-pgwire = 1
 
 # Data representation. The encoding layer sits above vectors and below everything that consumes
 # them, so a new encoding from a paper is a module here and nothing above changes.
@@ -37,6 +42,11 @@ rudb-qc-ir = 2
 # and no higher, because everything from the kernels upward has a seam in it and a registry that
 # sits above its own users is a registry nobody below can reach.
 rudb-seam = 2
+# The PostgreSQL types and the PostgreSQL grammar, per the same section. Rank 2 because the types
+# read vectors and write PostgreSQL bytes, and the grammar builds the AST of rudb-parse. Neither
+# reads the catalog. The deparser prints bound trees, so it is in rudb-pgcatalog and not here.
+rudb-pgtypes = 2
+rudb-pgparse = 2
 rudb-kernels = 3
 rudb-qc-interp = 3
 # The query compiler's second tier, which lowers QIR through Cranelift. Rank 3, beside the
@@ -88,6 +98,10 @@ rudb-catalog = 8
 rudb-plan = 9
 rudb-bind = 10
 rudb-opt = 11
+# The pg_catalog and information_schema tables, the catalog functions and the deparser. Rank 11
+# because it reads rudb-catalog, rudb-plan and rudb-bind. The binder does not depend on it. rudb at
+# rank 16 registers its tables when a database opens, the same way as the DuckDB system views.
+rudb-pgcatalog = 11
 rudb-exec = 12
 
 # The compiled engine above the planner, per spec/compiler/19-crate-layout.md. The physical plan
@@ -104,6 +118,10 @@ rudb = 16
 rudb-extension = 17
 rudb-c-api = 18
 rudb-cli = 18
+# The PostgreSQL server: listeners, sessions, TLS, authentication and cancel. Rank 18 beside the
+# shell, because it depends on rudb and may load extensions, and neither of the two depends on the
+# other. It is the only crate that knows a socket exists.
+rudb-server = 18
 # A command line tool over the native format that builds a file's optional sorted projections. It is
 # a surface like the shell, so it sits with them rather than beside the format it writes.
 rudb-projection = 18
