@@ -14756,10 +14756,14 @@ fn settle_shape(sample: &[Vec<&[u8]>]) -> Result<chooser::Settled> {
 /// | `title.title` | 5,638,231 | 5,703,351 | 0.99 |
 /// | `char_name.name` | 4,160,465 | 4,173,431 | 1.00 |
 ///
-/// The matcher on `person_info.info` was 16 of the 41 seconds of processor time it took to load
-/// `person_info`, to save 18 percent of its payload. A column read as rarely as that one is better
-/// off written three times as fast, and the columns where `LZ` takes a fifth or more off keep it.
-const LZ_KEEPS: (u8, u8) = (4, 5);
+/// The settle does not see those values, though. It sees eight blocks spread over the whole
+/// dictionary, and on the eight `person_info.info` blocks it sees, [Lz, Fsst] came to 0.77 and 0.79
+/// of [Fsst], encoding at 22 to 29 MB/s against 90 to 110 and decoding at 217 to 243 MB/s against
+/// 657 to 741. That column's payload is 300 MB, and the matcher over it was 16 of the 41 seconds of
+/// processor time it took to load `person_info`, to save a fifth of the bytes. At four fifths the
+/// rule still took it. A shape with `LZ` in it costs about four times the time to write and three
+/// to read, so it has to take a third off to be taken, and on JOB none of them do.
+const LZ_KEEPS: (u8, u8) = (2, 3);
 
 /// Whether a payload shape with `LZ` in it that came to `with` bytes is worth taking over the
 /// smallest one without it, which came to `without`.
@@ -15666,14 +15670,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lz_is_kept_only_where_it_takes_a_fifth_off() {
-        // movie_info.info, name.name, person_info.info and title.title from the table on LZ_KEEPS.
-        assert!(lz_pays(3_982_572, 5_923_508));
-        assert!(lz_pays(3_428_580, 4_502_259));
-        assert!(!lz_pays(20_792_677, 25_266_323));
+    fn lz_is_kept_only_where_it_takes_a_third_off() {
+        // movie_info.info and title.title from the table on LZ_KEEPS, then the two samples of
+        // person_info.info the settle sees.
+        assert!(!lz_pays(3_982_572, 5_923_508));
         assert!(!lz_pays(5_638_231, 5_703_351));
-        assert!(lz_pays(4, 5));
-        assert!(!lz_pays(5, 6));
+        assert!(!lz_pays(536_202, 679_893));
+        assert!(!lz_pays(617_673, 802_264));
+        assert!(lz_pays(1, 2));
+        assert!(lz_pays(2, 3));
+        assert!(!lz_pays(201, 300));
     }
 
     #[test]
