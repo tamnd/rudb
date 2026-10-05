@@ -113,6 +113,234 @@ uuid	1	{a0eebc999c0b4ef8bb6d6bb9bd380a11	ERROR 22P02 invalid input syntax for ty
 uuid	1	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1	ERROR 22P02 invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"
 uuid	1	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 	ERROR 22P02 invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 "
 uuid	1	-a0eebc999c0b4ef8bb6d6bb9bd380a11	ERROR 22P02 invalid input syntax for type uuid: "-a0eebc999c0b4ef8bb6d6bb9bd380a11"
+numeric	1	0	0
+numeric	1	-0	0
+numeric	1	0.000	0.000
+numeric	1	-0.000	0.000
+numeric	1	1	1
+numeric	1	-1	-1
+numeric	1	+1	1
+numeric	1	 12.5 	12.5
+numeric	1	12.50	12.50
+numeric	1	.5	0.5
+numeric	1	5.	5
+numeric	1	.	ERROR 22P02 invalid input syntax for type numeric: "."
+numeric	1		ERROR 22P02 invalid input syntax for type numeric: ""
+numeric	1	 	ERROR 22P02 invalid input syntax for type numeric: " "
+numeric	1	1e3	1000
+numeric	1	1E-3	0.001
+numeric	1	1.5e+2	150
+numeric	1	1e	ERROR 22P02 invalid input syntax for type numeric: "1e"
+numeric	1	1e+	ERROR 22P02 invalid input syntax for type numeric: "1e+"
+numeric	1	e5	ERROR 22P02 invalid input syntax for type numeric: "e5"
+numeric	1	1.2.3	ERROR 22P02 invalid input syntax for type numeric: "1.2.3"
+numeric	1	1_000.000_1	1000.0001
+numeric	1	1_	ERROR 22P02 invalid input syntax for type numeric: "1_"
+numeric	1	_1	ERROR 22P02 invalid input syntax for type numeric: "_1"
+numeric	1	1._5	ERROR 22P02 invalid input syntax for type numeric: "1._5"
+numeric	1	1_.5	ERROR 22P02 invalid input syntax for type numeric: "1_.5"
+numeric	1	1__0	ERROR 22P02 invalid input syntax for type numeric: "1__0"
+numeric	1	1e_1	ERROR 22P02 invalid input syntax for type numeric: "1e_1"
+numeric	1	1e1_0	10000000000
+numeric	1	1.e5	100000
+numeric	1	.e5	ERROR 22P02 invalid input syntax for type numeric: ".e5"
+numeric	1	0x1F	31
+numeric	1	-0x1f	-31
+numeric	1	+0o17	15
+numeric	1	0b101	5
+numeric	1	0x_1F	31
+numeric	1	0x	ERROR 22P02 invalid input syntax for type numeric: "0x"
+numeric	1	0b2	ERROR 22P02 invalid input syntax for type numeric: "0b2"
+numeric	1	0x1.5	ERROR 22P02 invalid input syntax for type numeric: "0x1.5"
+numeric	1	0x1_	ERROR 22P02 invalid input syntax for type numeric: "0x1_"
+numeric	1	0xFFFFFFFFFFFFFFFF	18446744073709551615
+numeric	1	0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF	340282366920938463463374607431768211455
+numeric	1	-0o777777777777777777777777	-4722366482869645213695
+numeric	1	0b1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111	1361129467683753853853498429727072845823
+numeric	1	NaN	NaN
+numeric	1	nan	NaN
+numeric	1	-NaN	ERROR 22P02 invalid input syntax for type numeric: "-NaN"
+numeric	1	+NaN	ERROR 22P02 invalid input syntax for type numeric: "+NaN"
+numeric	1	 NaN 	NaN
+numeric	1	Infinity	Infinity
+numeric	1	-Infinity	-Infinity
+numeric	1	inf	Infinity
+numeric	1	+INF	Infinity
+numeric	1	-inf	-Infinity
+numeric	1	infinit	ERROR 22P02 invalid input syntax for type numeric: "infinit"
+numeric	1	infinityx	ERROR 22P02 invalid input syntax for type numeric: "infinityx"
+numeric	1	NaNx	ERROR 22P02 invalid input syntax for type numeric: "NaNx"
+numeric	1	abc	ERROR 22P02 invalid input syntax for type numeric: "abc"
+numeric	1	1 2	ERROR 22P02 invalid input syntax for type numeric: "1 2"
+numeric	1	- 1	ERROR 22P02 invalid input syntax for type numeric: "- 1"
+numeric	1	+-1	ERROR 22P02 invalid input syntax for type numeric: "+-1"
+numeric	1	1.5x	ERROR 22P02 invalid input syntax for type numeric: "1.5x"
+numeric	1	123456789012345678901234567890.123456789012345678901234567890	123456789012345678901234567890.123456789012345678901234567890
+numeric	1	0.00000000000000000001	0.00000000000000000001
+numeric	1	1e-20	0.00000000000000000001
+numeric	1	1e-16384	ERROR 22003 value overflows numeric format
+numeric	1	1e131072	ERROR 22003 value overflows numeric format
+numeric	1	1e1073741823	ERROR 22003 value overflows numeric format
+numeric	1	1e1073741824	ERROR 22003 value overflows numeric format
+numeric	1	9999.99995	9999.99995
+numeric	1	0.0001	0.0001
+numeric	1	0.00012345	0.00012345
+numeric	1	100000000	100000000
+numeric	1	99999999.99999999	99999999.99999999
+numeric	1	1e100	10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+numeric	1	-1.5e-10	-0.00000000015
+numeric	1	00012.3400	12.3400
+numeric	1	12345678901234567890	12345678901234567890
+numeric	1	170141183460469231731687303715884105727	170141183460469231731687303715884105727
+numeric	1	-170141183460469231731687303715884105727	-170141183460469231731687303715884105727
+numeric	1	1.70141183460469231731687303715884105727	1.70141183460469231731687303715884105727
+numeric	1	0.12345678901234567890123456789012345678	0.12345678901234567890123456789012345678
+numeric	1	123456789.123456789	123456789.123456789
+numeric	1	1e38	100000000000000000000000000000000000000
+numeric	1	1e39	1000000000000000000000000000000000000000
+numeric	1	5e-38	0.00000000000000000000000000000000000005
+numeric	1	0.000000000000000000000000000000000000001	0.000000000000000000000000000000000000001
+numeric(5,2)	1	123.456	123.46
+numeric(5,2)	1	123.455	123.46
+numeric(5,2)	1	-123.455	-123.46
+numeric(5,2)	1	999.994	999.99
+numeric(5,2)	1	999.995	ERROR 22003 numeric field overflow DETAIL A field with precision 5, scale 2 must round to an absolute value less than 10^3.
+numeric(5,2)	1	0.001	0.00
+numeric(5,2)	1	0.005	0.01
+numeric(5,2)	1	-0.005	-0.01
+numeric(5,2)	1	-0.004	0.00
+numeric(5,2)	1	NaN	NaN
+numeric(5,2)	1	Infinity	ERROR 22003 numeric field overflow DETAIL A field with precision 5, scale 2 cannot hold an infinite value.
+numeric(5,2)	1	-inf	ERROR 22003 numeric field overflow DETAIL A field with precision 5, scale 2 cannot hold an infinite value.
+numeric(5,2)	1	1e2	100.00
+numeric(5,2)	1	12345	ERROR 22003 numeric field overflow DETAIL A field with precision 5, scale 2 must round to an absolute value less than 10^3.
+numeric(5,2)	1	abc	ERROR 22P02 invalid input syntax for type numeric: "abc"
+numeric(5,2)	1	1e1073741824	ERROR 22003 value overflows numeric format
+numeric(5,2)	1	1e-16384	0.00
+numeric(5,2)	1	1e131072	ERROR 22003 numeric field overflow DETAIL A field with precision 5, scale 2 must round to an absolute value less than 10^3.
+numeric(5,2)	1	0x10	16.00
+numeric(5,2)	1	0xFFFFFFFF	ERROR 22003 numeric field overflow DETAIL A field with precision 5, scale 2 must round to an absolute value less than 10^3.
+numeric(5,2)	1	infx	ERROR 22P02 invalid input syntax for type numeric: "infx"
+numeric(3,-1)	1	15	20
+numeric(3,-1)	1	14	10
+numeric(3,-1)	1	-15	-20
+numeric(3,-1)	1	9994	9990
+numeric(3,-1)	1	9995	ERROR 22003 numeric field overflow DETAIL A field with precision 3, scale -1 must round to an absolute value less than 10^4.
+numeric(3,-1)	1	0	0
+numeric(3,-1)	1	4.9	0
+numeric(2,5)	1	0.000123	0.00012
+numeric(2,5)	1	0.0001234	0.00012
+numeric(2,5)	1	0.001	ERROR 22003 numeric field overflow DETAIL A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+numeric(2,5)	1	0.000995	ERROR 22003 numeric field overflow DETAIL A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+numeric(2,5)	1	0.000994	0.00099
+numeric(1,0)	1	0.5	1
+numeric(1,0)	1	9.4	9
+numeric(1,0)	1	9.5	ERROR 22003 numeric field overflow DETAIL A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+numeric(1,0)	1	-9.5	ERROR 22003 numeric field overflow DETAIL A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+numeric(1,1)	1	0.95	ERROR 22003 numeric field overflow DETAIL A field with precision 1, scale 1 must round to an absolute value less than 1.
+numeric(1,1)	1	0.94	0.9
+numeric(1,1)	1	-0.04	0.0
+numeric(1,1)	1	-0.05	-0.1
+numeric(1000,1000)	1	0.5	0.5000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+numeric(10,4)	1	9999.99995	10000.0000
+numeric(8,4)	1	9999.99995	ERROR 22003 numeric field overflow DETAIL A field with precision 8, scale 4 must round to an absolute value less than 10^4.
+numeric(8,4)	1	0.00005	0.0001
+numeric(4,-3)	1	1234567	1235000
+numeric(4,-3)	1	12345678	ERROR 22003 numeric field overflow DETAIL A field with precision 4, scale -3 must round to an absolute value less than 10^7.
+numeric(4,-3)	1	9999499.9	9999000
+numeric(4,-3)	1	9999500	ERROR 22003 numeric field overflow DETAIL A field with precision 4, scale -3 must round to an absolute value less than 10^7.
+numeric(38,0)	1	99999999999999999999999999999999999999	99999999999999999999999999999999999999
+numeric(38,0)	1	1e38	ERROR 22003 numeric field overflow DETAIL A field with precision 38, scale 0 must round to an absolute value less than 10^38.
+numeric(38,38)	1	0.99999999999999999999999999999999999999	0.99999999999999999999999999999999999999
+numeric(38,38)	1	1	ERROR 22003 numeric field overflow DETAIL A field with precision 38, scale 38 must round to an absolute value less than 1.
+send numeric	1	0	0000000000000000
+send numeric	1	-0	0000000000000000
+send numeric	1	0.000	0000000000000003
+send numeric	1	-0.000	0000000000000003
+send numeric	1	1	00010000000000000001
+send numeric	1	-1	00010000400000000001
+send numeric	1	+1	00010000000000000001
+send numeric	1	 12.5 	0002000000000001000c1388
+send numeric	1	12.50	0002000000000002000c1388
+send numeric	1	.5	0001ffff000000011388
+send numeric	1	5.	00010000000000000005
+send numeric	1	1e3	000100000000000003e8
+send numeric	1	1E-3	0001ffff00000003000a
+send numeric	1	1.5e+2	00010000000000000096
+send numeric	1	1_000.000_1	000200000000000403e80001
+send numeric	1	1e1_0	00010002000000000064
+send numeric	1	1.e5	0001000100000000000a
+send numeric	1	0x1F	0001000000000000001f
+send numeric	1	-0x1f	0001000040000000001f
+send numeric	1	+0o17	0001000000000000000f
+send numeric	1	0b101	00010000000000000005
+send numeric	1	0x_1F	0001000000000000001f
+send numeric	1	0xFFFFFFFFFFFFFFFF	000500040000000007341a5802e103bb064f
+send numeric	1	0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF	000a00090000000001540b071a2403aa121a18c111ff10dd1aa505af
+send numeric	1	-0o777777777777777777777777	0006000540000000002f08bc195221f811a90e6f
+send numeric	1	0b1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111	000a0009000000000551050e1a700ea9215a14e520ed1c661c7416bf
+send numeric	1	NaN	00000000c0000000
+send numeric	1	nan	00000000c0000000
+send numeric	1	 NaN 	00000000c0000000
+send numeric	1	Infinity	00000000d0000020
+send numeric	1	-Infinity	00000000f0000020
+send numeric	1	inf	00000000d0000020
+send numeric	1	+INF	00000000d0000020
+send numeric	1	-inf	00000000f0000020
+send numeric	1	123456789012345678901234567890.123456789012345678901234567890	001000070000001e000c0d801ed204d2162e23340d801ed204d2162e23340d801ed204d2162e2328
+send numeric	1	0.00000000000000000001	0001fffb000000140001
+send numeric	1	1e-20	0001fffb000000140001
+send numeric	1	9999.99995	0003000000000005270f270f1388
+send numeric	1	0.0001	0001ffff000000040001
+send numeric	1	0.00012345	0002ffff0000000800010929
+send numeric	1	100000000	00010002000000000001
+send numeric	1	99999999.99999999	0004000100000008270f270f270f270f
+send numeric	1	1e100	00010019000000000001
+send numeric	1	-1.5e-10	0001fffd4000000b0096
+send numeric	1	00012.3400	0002000000000004000c0d48
+send numeric	1	12345678901234567890	000500040000000004d2162e23340d801ed2
+send numeric	1	170141183460469231731687303715884105727	000a00090000000000aa0583209a01d5090d0c601c871bf620da165f
+send numeric	1	-170141183460469231731687303715884105727	000a00094000000000aa0583209a01d5090d0c601c871bf620da165f
+send numeric	1	1.70141183460469231731687303715884105727	000b00000000002600011b66049f11fc1b0b06c31ad9017316fc04210a8c
+send numeric	1	0.12345678901234567890123456789012345678	000affff0000002604d2162e23340d801ed204d2162e23340d801e78
+send numeric	1	123456789.123456789	0006000200000009000109291a8504d2162e2328
+send numeric	1	1e38	00010009000000000064
+send numeric	1	1e39	000100090000000003e8
+send numeric	1	5e-38	0001fff60000002601f4
+send numeric	1	0.000000000000000000000000000000000000001	0001fff600000027000a
+send numeric(5,2)	1	123.456	0002000000000002007b11f8
+send numeric(5,2)	1	123.455	0002000000000002007b11f8
+send numeric(5,2)	1	-123.455	0002000040000002007b11f8
+send numeric(5,2)	1	999.994	000200000000000203e726ac
+send numeric(5,2)	1	0.001	0000000000000002
+send numeric(5,2)	1	0.005	0001ffff000000020064
+send numeric(5,2)	1	-0.005	0001ffff400000020064
+send numeric(5,2)	1	-0.004	0000000000000002
+send numeric(5,2)	1	NaN	00000000c0000000
+send numeric(5,2)	1	1e2	00010000000000020064
+send numeric(5,2)	1	1e-16384	0000000000000002
+send numeric(5,2)	1	0x10	00010000000000020010
+send numeric(3,-1)	1	15	00010000000000000014
+send numeric(3,-1)	1	14	0001000000000000000a
+send numeric(3,-1)	1	-15	00010000400000000014
+send numeric(3,-1)	1	9994	00010000000000002706
+send numeric(3,-1)	1	0	0000000000000000
+send numeric(3,-1)	1	4.9	0000000000000000
+send numeric(2,5)	1	0.000123	0002ffff00000005000107d0
+send numeric(2,5)	1	0.0001234	0002ffff00000005000107d0
+send numeric(2,5)	1	0.000994	0002ffff0000000500092328
+send numeric(1,0)	1	0.5	00010000000000000001
+send numeric(1,0)	1	9.4	00010000000000000009
+send numeric(1,1)	1	0.94	0001ffff000000012328
+send numeric(1,1)	1	-0.04	0000000000000001
+send numeric(1,1)	1	-0.05	0001ffff4000000103e8
+send numeric(1000,1000)	1	0.5	0001ffff000003e81388
+send numeric(10,4)	1	9999.99995	00010001000000040001
+send numeric(8,4)	1	0.00005	0001ffff000000040001
+send numeric(4,-3)	1	1234567	0002000100000000007b1388
+send numeric(4,-3)	1	9999499.9	000200010000000003e72328
+send numeric(38,0)	1	99999999999999999999999999999999999999	000a0009000000000063270f270f270f270f270f270f270f270f270f
+send numeric(38,38)	1	0.99999999999999999999999999999999999999	000affff00000026270f270f270f270f270f270f270f270f270f26ac
 float8	1	0	0
 float4	1	0	0
 float8	1	-0	-0

@@ -23,8 +23,14 @@
 //! `extra_float_digits`: above zero they give the shortest text that reads back to the same value,
 //! and at zero or below they give the `%g` text of old servers.
 //!
+//! [`Numeric`], a `numeric` value in the layout of PostgreSQL, with [`numeric_in`],
+//! [`numeric_out`], [`numeric_recv`] and [`numeric_send`]. The input and the receive function
+//! take the typmod and round to it as PostgreSQL does. The engine keeps a `numeric(p, s)` column
+//! with p up to 38 as a scaled `i128`, and [`decimal_out`] and [`decimal_send`] write that integer
+//! with no allocation.
+//!
 //! [`Recv`], the binary input of a `Bind` parameter, with the errors of PostgreSQL when the value
-//! is too short or too long. The binary output of these types is the value in big-endian bytes.
+//! is too short or too long. The binary output of the other types is the value in big-endian bytes.
 //!
 //! # Known differences
 //!
@@ -36,6 +42,7 @@ mod error;
 mod float;
 mod generated;
 mod number;
+mod numeric;
 mod scalar;
 mod types;
 pub mod typmod;
@@ -45,6 +52,10 @@ pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};
 pub use generated::oids as oid;
 pub use number::{int_out, int2_in, int4_in, int8_in, oid_in, oid_out, u64_out};
+pub use numeric::{
+    Numeric, NumericSign, decimal_out, decimal_send, numeric_in, numeric_out, numeric_recv,
+    numeric_send,
+};
 pub use scalar::{
     ByteaOutput, NAME_MAX_BYTES, bool_in, bool_out, bytea_in, bytea_out, char_in, char_out,
     name_in, uuid_in, uuid_out,
