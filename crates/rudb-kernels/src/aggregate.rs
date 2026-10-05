@@ -2815,19 +2815,17 @@ impl PlaceSums {
             self.by_place.resize(needed, 0);
         }
         if let Some(kept) = kept.filter(|kept| kept.len() < places.len()) {
-            let mut next = 0;
-            for &row in kept {
-                let row = row as usize;
-                if row != next
-                    && let Some(dropped) = places.get_mut(next..row)
-                {
-                    dropped.fill(combos);
-                }
-                next = row + 1;
+            let (first, next) = match (kept.first(), kept.last()) {
+                (Some(&first), Some(&last)) => (first as usize, last as usize + 1),
+                _ => (0, 0),
+            };
+            if let Some(dropped) = places.get_mut(..first) {
+                dropped.fill(combos);
             }
             if let Some(dropped) = places.get_mut(next..) {
                 dropped.fill(combos);
             }
+            fill_dropped(kept, places, combos);
         }
         let values = &self.values[..self.calls.len()];
         let cells = &mut self.by_place[..needed];
@@ -2926,6 +2924,29 @@ fn fold_cells(
     Ok(())
 }
 
+/// Gives every row between the first and the last of `kept` that `kept` skips the place `combos`.
+///
+/// A list of rows with no gap in it ends as many rows after its first as it is long, so the list
+/// is cut in two only while a half has a gap, and the rows are never visited one by one. On q01
+/// about one row in seventy is dropped, and a walk of the kept rows to find the gaps was about seven
+/// instructions a row.
+fn fill_dropped(kept: &[u32], places: &mut [usize], combos: usize) {
+    let (Some(&first), Some(&last)) = (kept.first(), kept.last()) else { return };
+    let (first, last) = (first as usize, last as usize);
+    if last - first < kept.len() {
+        return;
+    }
+    if kept.len() == 2 {
+        if let Some(dropped) = places.get_mut(first + 1..last) {
+            dropped.fill(combos);
+        }
+        return;
+    }
+    let middle = kept.len() / 2;
+    fill_dropped(&kept[..=middle], places, combos);
+    fill_dropped(&kept[middle..], places, combos);
+}
+
 /// The most cells [`PlaceSums::add_places`] keeps, 512 KiB of them.
 const PLACE_CELLS: usize = 1 << 16;
 
@@ -2936,6 +2957,7 @@ fn by_place<const W: usize, const S: usize>(
     values: &[Vec<u64>],
     places: &[usize],
 ) -> Result<()> {
+    const NONE: [u64; 8] = [0; 8];
     let mut columns: [&[u64]; W] = [&[]; W];
     for (column, values) in columns.iter_mut().zip(values) {
         *column = values.get(..places.len()).ok_or_else(|| {
@@ -2943,36 +2965,22 @@ fn by_place<const W: usize, const S: usize>(
         })?;
     }
     let cells = cells.as_chunks_mut::<S>().0;
-    let mut add = |place: usize, row: &[u64; W]| -> Result<()> {
-        let Some(cells) = cells.get_mut(place) else {
-            return Err(Error::internal(format!("place {place} is past the map")));
-        };
-        let mut adds = [0_i64; S];
-        for (add, &value) in adds.iter_mut().zip(row) {
-            *add = value as i64;
-        }
-        adds[W] = 1;
-        for (total, add) in cells.iter_mut().zip(adds) {
-            *total = total.wrapping_add(add);
-        }
-        Ok(())
-    };
     // Eight rows at a time, so that each column is checked against the rows once a block rather
     // than once a row.
     let (blocks, tail) = places.as_chunks::<8>();
     for (block, places) in blocks.iter().enumerate() {
-        let mut rows = [[0_u64; W]; 8];
-        for (at, column) in columns.iter().enumerate() {
-            let Some(values) = column.get(block * 8..).and_then(|values| values.first_chunk::<8>())
-            else {
-                return Err(Error::internal("a summed column shorter than its rows".to_string()));
-            };
-            for (row, &value) in rows.iter_mut().zip(values) {
-                row[at] = value;
-            }
+        let mut lanes: [&[u64; 8]; W] = [&NONE; W];
+        for (lanes, column) in lanes.iter_mut().zip(&columns) {
+            *lanes = column.get(block * 8..).and_then(|values| values.first_chunk::<8>()).ok_or_else(
+                || Error::internal("a summed column shorter than its rows".to_string()),
+            )?;
         }
-        for (&place, row) in places.iter().zip(&rows) {
-            add(place, row)?;
+        for (at, &place) in places.iter().enumerate() {
+            let mut row = [0_u64; W];
+            for (value, lanes) in row.iter_mut().zip(&lanes) {
+                *value = lanes[at];
+            }
+            add_row::<W, S>(cells, place, &row)?;
         }
     }
     let done = blocks.len() * 8;
@@ -2981,7 +2989,28 @@ fn by_place<const W: usize, const S: usize>(
         for (value, column) in row.iter_mut().zip(&columns) {
             *value = column[done + at];
         }
-        add(place, &row)?;
+        add_row::<W, S>(cells, place, &row)?;
+    }
+    Ok(())
+}
+
+/// Adds one row's values and a one for its count into the cells of its place.
+#[inline(always)]
+fn add_row<const W: usize, const S: usize>(
+    cells: &mut [[i64; S]],
+    place: usize,
+    row: &[u64; W],
+) -> Result<()> {
+    let Some(cells) = cells.get_mut(place) else {
+        return Err(Error::internal(format!("place {place} is past the map")));
+    };
+    let mut adds = [0_i64; S];
+    for (add, &value) in adds.iter_mut().zip(row) {
+        *add = value as i64;
+    }
+    adds[W] = 1;
+    for (total, add) in cells.iter_mut().zip(adds) {
+        *total = total.wrapping_add(add);
     }
     Ok(())
 }
@@ -6423,6 +6452,30 @@ mod tests {
                 assert_eq!(by_place[index].finish().expect("finishes"), answer, "{note}, by place");
                 let doubled = twice[index].finish().expect("finishes");
                 assert_eq!(each_place[index].finish().expect("finishes"), doubled, "{note}, each place");
+            }
+        }
+    }
+
+    /// The rows a filter dropped are found by cutting the kept rows in two wherever a half has a gap,
+    /// and that finds the same rows as walking them, at the ends and in runs of one and of several.
+    #[test]
+    fn the_dropped_rows_found_by_halves_are_the_ones_a_walk_finds() {
+        let mut rng = Rng(0x5eed_0115_d40b);
+        for rows in [1, 2, 7, 64, 300] {
+            for every in [2, 3, 70, 1000] {
+                let kept: Vec<u32> =
+                    (0..rows as u32).filter(|_| rng.next() % every != 0).collect();
+                let mut found: Vec<usize> = (0..rows).collect();
+                fill_dropped(&kept, &mut found, usize::MAX);
+                let mut walked: Vec<usize> = (0..rows).collect();
+                if let (Some(&first), Some(&last)) = (kept.first(), kept.last()) {
+                    for row in first as usize..=last as usize {
+                        if kept.binary_search(&(row as u32)).is_err() {
+                            walked[row] = usize::MAX;
+                        }
+                    }
+                }
+                assert_eq!(found, walked, "{rows} rows, one in {every} dropped");
             }
         }
     }
