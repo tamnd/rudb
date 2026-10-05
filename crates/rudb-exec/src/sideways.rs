@@ -509,19 +509,27 @@ impl Domain {
             Data::Int8(values) => flat!(values),
             Data::Int16(values) => flat!(values),
             // The common key, tested eight at a time, and once a run where it comes in runs. See
-            // [`Members::word_after`].
-            Data::Int32(values) => match Members::new(&self.words, base) {
-                Some(members) => {
-                    let values = values.as_slice().get(..rows)?;
-                    let mut before = None;
-                    Some(marked(rows, |from, to| {
-                        members.word_after(&values[from..to], &mut before)
-                    }))
+            // [`Members::word_after`]. Keys in order with few of them held are looked up instead.
+            Data::Int32(values) => {
+                if let Some(kept) = self.over_sorted(values.as_slice().get(..rows)?, base) {
+                    return Some(kept);
                 }
-                None => flat!(values),
-            },
+                match Members::new(&self.words, base) {
+                    Some(members) => {
+                        let values = values.as_slice().get(..rows)?;
+                        let mut before = None;
+                        Some(marked(rows, |from, to| {
+                            members.word_after(&values[from..to], &mut before)
+                        }))
+                    }
+                    None => flat!(values),
+                }
+            }
             Data::Int64(values) => {
                 let values = values.as_slice().get(..rows)?;
+                if let Some(kept) = self.over_sorted(values, base) {
+                    return Some(kept);
+                }
                 Some(marked(rows, |from, to| {
                     values[from..to].iter().enumerate().fold(0, |word, (bit, &key)| {
                         word | u64::from(self.bit(key.wrapping_sub(base) as u64)) << bit
@@ -531,6 +539,102 @@ impl Domain {
             _ => None,
         }
     }
+
+    /// [`Self::over_flat`] for a chunk whose keys never go down, by looking each key the bitmap
+    /// holds up in the chunk rather than testing a bit for every row, and `None` for a chunk whose
+    /// keys do go down or where the bitmap holds too many keys for that to pay.
+    ///
+    /// A child stored in its parent's key order, such as `partsupp` on `ps_partkey`, holds each key
+    /// in one run, and a chunk of it covers a short stretch of keys. Only the keys the bitmap holds
+    /// in that stretch can be kept, and each one's run is found by a binary search. In TPC-H q02
+    /// the part filter keeps 747 of 200,000 parts, about seven keys in a chunk of eight thousand
+    /// rows, and testing every row of `partsupp` twice was a sixth of the instructions the query ran.
+    ///
+    /// The keys the bitmap holds in the stretch are counted first, out of a few words of it, and
+    /// only a chunk with few of them is checked for its order, so a chunk of keys in no order
+    /// costs those words and one compare of its first and last key at most.
+    fn over_sorted<T: Copy + Into<i64>>(&self, values: &[T], base: i64) -> Option<Kept> {
+        let rows = values.len();
+        if rows < SORTED_LEAST {
+            return None;
+        }
+        let offset = |key: T| i128::from(key.into()) - i128::from(base);
+        let (first, last) = (offset(*values.first()?), offset(*values.last()?));
+        if first > last {
+            return None;
+        }
+        let (low, high) = (first.max(0), last.min(i128::from(self.range) - 1));
+        let held = if low > high {
+            None
+        } else {
+            let (Ok(low), Ok(high)) = (usize::try_from(low), usize::try_from(high)) else {
+                return None;
+            };
+            if high / 64 - low / 64 >= rows / 64 {
+                return None;
+            }
+            Some((low, high))
+        };
+        let words = |(low, high): (usize, usize)| {
+            (low / 64..=high / 64).map(move |at| {
+                let mut bits = self.words[at];
+                if at == low / 64 {
+                    bits &= u64::MAX << (low % 64);
+                }
+                if at == high / 64 {
+                    bits &= u64::MAX >> (63 - high % 64);
+                }
+                (at, bits)
+            })
+        };
+        let count: usize =
+            held.map_or(0, |held| words(held).map(|(_, bits)| bits.count_ones() as usize).sum());
+        if count * SORTED_ROWS_A_KEY > rows || !ascending(values) {
+            return None;
+        }
+        let mut bits = vec![0_u64; rows.div_ceil(64)];
+        let mut kept = 0;
+        let mut from = 0;
+        for (at, mut set) in held.into_iter().flat_map(words) {
+            while set != 0 {
+                let key = i128::from(base) + (at * 64) as i128 + i128::from(set.trailing_zeros());
+                set &= set - 1;
+                let start =
+                    from + values[from..].partition_point(|&value| i128::from(value.into()) < key);
+                let end = start
+                    + values[start..].partition_point(|&value| i128::from(value.into()) == key);
+                for row in start..end {
+                    bits[row / 64] |= 1 << (row % 64);
+                }
+                kept += end - start;
+                from = end;
+            }
+        }
+        Some(Kept { bits, count: kept })
+    }
+}
+
+/// The fewest rows a chunk needs for [`Domain::over_sorted`] to look its keys up rather than test
+/// them all.
+const SORTED_LEAST: usize = 1024;
+
+/// How many rows a key the bitmap holds has to stand for before [`Domain::over_sorted`] looks it up.
+///
+/// A lookup is two binary searches over the chunk, about thirteen steps each for a chunk of eight
+/// thousand rows, and a test is a bit read a row, so a key that stands for fewer rows than this is
+/// cheaper tested along with the rest.
+const SORTED_ROWS_A_KEY: usize = 32;
+
+/// Whether `values` never go down, read in blocks so that the compares of a block are one pass with
+/// no branch until its end.
+fn ascending<T: Copy + Into<i64>>(values: &[T]) -> bool {
+    let Some(pairs) = values.len().checked_sub(1) else { return true };
+    values[..pairs].chunks(256).zip(values[1..].chunks(256)).all(|(before, after)| {
+        before
+            .iter()
+            .zip(after)
+            .fold(true, |up, (&before, &after)| up & (before.into() <= after.into()))
+    })
 }
 
 /// Which rows a [`Domain`] kept, as a bit a row and how many of them are set.
@@ -2118,6 +2222,66 @@ mod tests {
         let nullable = repeated.with_validity(Validity::from_iter(200, |row| row != 1 && row != 7));
         let kept: Vec<u32> = both.into_iter().filter(|&row| row != 1 && row != 7).collect();
         assert_eq!(held(&nullable), kept, "a dictionary with nulls in its codes");
+    }
+
+    /// A chunk of keys in order, as a child stored in its parent's key order holds them, is looked up
+    /// a key at a time and keeps the same rows as a bit a row would, and a chunk out of order, one
+    /// whose stretch holds many keys and one wholly outside the bitmap all answer the same too.
+    #[test]
+    fn keys_in_order_are_looked_up_and_keep_what_a_bit_a_row_keeps() {
+        let held: Vec<i64> = (0..10_000).filter(|key| key % 97 == 5).collect();
+        let mut words = vec![0_u64; 10_000_usize.div_ceil(64)];
+        for &key in &held {
+            words[key as usize / 64] |= 1 << (key % 64);
+        }
+        let domain = super::Domain::from_words(words);
+        let by_bit = |values: &[i64]| -> Vec<u32> {
+            (0..values.len())
+                .filter(|&row| domain.holds(values[row]))
+                .map(|row| row as u32)
+                .collect()
+        };
+        let check = |values: Vec<i64>, note: &str| {
+            let rows = values.len();
+            let keys = Vector::from_values(
+                LogicalType::BigInt,
+                &values.iter().map(|&key| Value::BigInt(key)).collect::<Vec<_>>(),
+            )
+            .expect("a column of big ints");
+            let kept = domain.kept(&keys, rows, &mut Vec::new());
+            assert_eq!(kept.indices(), by_bit(&values), "{note}");
+            assert_eq!(kept.count(), by_bit(&values).len(), "{note}, counted");
+        };
+        let runs: Vec<i64> = (2_000..4_000).flat_map(|key| [key; 4]).collect();
+        assert!(domain.over_sorted(&runs, 0).is_some(), "runs of four in order are looked up");
+        check(runs.clone(), "runs of four in order");
+        let mut shuffled = runs.clone();
+        shuffled.swap(10, 5_000);
+        assert!(
+            domain.over_sorted(&shuffled, 0).is_none(),
+            "out of order is tested a row at a time"
+        );
+        check(shuffled, "two keys swapped");
+        let wide: Vec<i64> = (0..8_000).map(|row| row * 5 / 4).collect();
+        check(wide, "a stretch past the words a chunk this long reads");
+        let past: Vec<i64> = (0..4_000).map(|row| 20_000 + row).collect();
+        assert!(domain.over_sorted(&past, 0).is_some(), "a stretch outside the bitmap");
+        check(past, "every key past the bitmap");
+        let under: Vec<i64> = (0..4_000).map(|row| row - 3_000).collect();
+        check(under, "keys from under the base into it");
+        let dense: Vec<i64> = (0..4_000).map(|row| row / 2).collect();
+        let mut words = vec![u64::MAX; 10_000_usize.div_ceil(64)];
+        words[0] = 0b1010;
+        let every = super::Domain::from_words(words);
+        assert!(every.over_sorted(&dense, 0).is_none(), "a stretch where most keys are held");
+        let narrow: Vec<i32> = (0..2_000).map(|row| 4_000 + row / 4).collect();
+        let narrow_keys = column(&narrow.iter().map(|&key| Some(key)).collect::<Vec<_>>());
+        let wide: Vec<i64> = narrow.iter().map(|&key| i64::from(key)).collect();
+        assert_eq!(
+            domain.kept(&narrow_keys, narrow.len(), &mut Vec::new()).indices(),
+            by_bit(&wide),
+            "flat integers in order"
+        );
     }
 
     /// A column of those values packed at that width over that base, which is the form the native
