@@ -68,7 +68,7 @@ use rudb_common::{Result, Value};
 use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 
 use crate::pass::{Context, Pass};
-use crate::{columns, eliminate, estimate, fold, link, walk};
+use crate::{columns, eliminate, estimate, fold, link, shared, walk};
 
 /// Takes the null branch out of a filter and out of a `count` where the store says there is none.
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +129,9 @@ fn settle(plan: &mut Plan) -> bool {
                     Node::Aggregate { aggregates, .. } => *aggregates = rewritten,
                     _ => unreachable!("the node was an aggregate a moment ago"),
                 }
+                // Counts of different columns that are all `count(*)` now are one call asked more
+                // than once, so it is asked once.
+                shared::once(plan, at);
             }
             _ => {}
         }
@@ -315,6 +318,19 @@ mod tests {
         assert_eq!(
             settled(text, &empty()),
             "Aggregate #1 groups=[] aggregates=[count_star()::BIGINT]\n  \
+             Get memory.main.t AS t #0 [d::INTEGER]\n"
+        );
+    }
+
+    #[test]
+    fn a_count_that_becomes_a_count_of_the_rows_beside_one_is_asked_once() {
+        let text = "Aggregate #1 groups=[] aggregates=[count(#0.0::INTEGER)::BIGINT, \
+                    count_star()::BIGINT]\n  \
+                    Get memory.main.t AS t #0 [d::INTEGER]\n";
+        assert_eq!(
+            settled(text, &empty()),
+            "Project #1 [#2.0::BIGINT AS column0, #2.0::BIGINT AS column1]\n  \
+             Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n    \
              Get memory.main.t AS t #0 [d::INTEGER]\n"
         );
     }
