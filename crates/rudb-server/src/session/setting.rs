@@ -8,6 +8,8 @@
 
 use rudb_common::guc::{self, Arg};
 
+use super::role;
+
 /// A statement that the server runs on the settings of the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Command {
@@ -24,11 +26,13 @@ pub(super) enum Command {
     Authorization { user: Option<String>, reset: bool },
     /// `SET ROLE`.
     Role(String),
+    /// `CREATE ROLE`, `ALTER ROLE` and `DROP ROLE`, and their forms with `USER` and `GROUP`.
+    Roles(role::Parsed),
 }
 
 /// A token of the statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Token {
+pub(super) enum Token {
     /// A name or a key word. `quoted` is true for a name in double quotes, which keeps its case
     /// and is never a key word.
     Word { text: String, quoted: bool },
@@ -42,7 +46,7 @@ enum Token {
 
 impl Token {
     /// Whether the token is the key word `word`, in lower case.
-    fn is(&self, word: &str) -> bool {
+    pub(super) fn is(&self, word: &str) -> bool {
         matches!(self, Token::Word { text, quoted: false } if text == word)
     }
 }
@@ -50,11 +54,17 @@ impl Token {
 /// Splits the statement into tokens. `None` for a token that this reader does not know, such as
 /// a `U&` string, which leaves the statement to the engine.
 fn tokens(sql: &str) -> Option<Vec<Token>> {
+    spanned(sql).map(|(tokens, _)| tokens)
+}
+
+/// The tokens of the statement and the byte offset where each one starts.
+pub(super) fn spanned(sql: &str) -> Option<(Vec<Token>, Vec<usize>)> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
+    let mut starts = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        let c = bytes[i];
+        let (c, at, count) = (bytes[i], i, tokens.len());
         if c.is_ascii_whitespace() {
             i += 1;
         } else if sql[i..].starts_with("--") {
@@ -174,8 +184,11 @@ fn tokens(sql: &str) -> Option<Vec<Token>> {
         } else {
             return None;
         }
+        if tokens.len() > count {
+            starts.push(at);
+        }
     }
-    Some(tokens)
+    Some((tokens, starts))
 }
 
 /// A string in single quotes from `start`, after the quote, with a doubled quote for one. The
@@ -268,8 +281,14 @@ fn escaped_string(sql: &str, start: usize) -> Option<(String, usize)> {
 
 /// Reads a statement. `None` when it is not a statement that the server runs.
 pub(super) fn parse(sql: &str) -> Option<Command> {
-    let first = sql.trim_start().get(..5)?;
-    if !["set", "reset", "show"].iter().any(|w| first.to_ascii_lowercase().starts_with(w)) {
+    let head = sql.trim_start().as_bytes();
+    let starts = |word: &str| {
+        head.get(..word.len()).is_some_and(|h| h.eq_ignore_ascii_case(word.as_bytes()))
+    };
+    if starts("create") || starts("alter") || starts("drop") {
+        return role::parse(sql).map(Command::Roles);
+    }
+    if !["set", "reset", "show"].iter().any(|w| starts(w)) {
         return None;
     }
     let mut tokens = tokens(sql)?;

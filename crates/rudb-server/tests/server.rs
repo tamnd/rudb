@@ -23,7 +23,7 @@ impl Dirs {
         let root = std::env::temp_dir().join(format!("rudb-server-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sock")).unwrap();
-        init(&root.join("data")).unwrap();
+        init(&root.join("data"), "rpg", None).unwrap();
         Dirs { root }
     }
 
@@ -100,9 +100,14 @@ impl Client {
     }
 
     fn startup(&mut self, version: u32, database: &str) {
+        self.startup_as(version, "rpg", database);
+    }
+
+    fn startup_as(&mut self, version: u32, user: &str, database: &str) {
         let mut options = Vec::new();
+        let (user, database) = (user.as_bytes(), database.as_bytes());
         encode_options(
-            &[(b"user", b"rpg"), (b"database", database.as_bytes()), (b"application_name", b"t")],
+            &[(b"user", user), (b"database", database), (b"application_name", b"t")],
             &mut options,
         );
         self.packet(&Packet::Startup(Startup { version, options: &options }));
@@ -676,6 +681,97 @@ fn the_startup_refusals() {
         assert_eq!(messages[1].field(b'C').as_deref(), Some(sqlstate));
         assert_eq!(messages[1].field(b'M').as_deref(), Some(message));
     }
+    server.stop().unwrap();
+}
+
+/// The `ParameterStatus` messages of a list, as `name=value`.
+fn statuses(messages: &[Message]) -> Vec<String> {
+    let status = |m: &Message| text(m).replacen('\0', "=", 1);
+    messages.iter().filter(|m| m.tag == b'S').map(status).collect()
+}
+
+/// The value of the one row and the one column of a query.
+fn scalar(client: &mut Client, sql: &str) -> String {
+    let messages = client.query(sql);
+    let row = messages.iter().find(|m| m.tag == b'D').unwrap();
+    String::from_utf8(data_row(row)[0].clone().unwrap()).unwrap()
+}
+
+#[test]
+fn the_roles_of_postgres() {
+    let dirs = Dirs::new("roles");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut admin = Client::unix(&server);
+    connect(&mut admin, PROTOCOL_3_0);
+    for sql in [
+        "create role ra login connection limit 1",
+        "create role rb",
+        "create user rc createrole password 'pw'",
+        "alter role rb rename to rd",
+    ] {
+        assert_eq!(tags(&admin.query(sql)), "CZ", "{sql}");
+    }
+    let error = |messages: &[Message]| {
+        let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+        (error.field(b'C').unwrap(), error.field(b'M').unwrap())
+    };
+    let pair = |sqlstate: &str, message: &str| (sqlstate.to_owned(), message.to_owned());
+    assert_eq!(error(&admin.query("create role ra")), pair("42710", "role \"ra\" already exists"));
+    assert_eq!(
+        error(&admin.query("create role pg_x")),
+        pair("42939", "role name \"pg_x\" is reserved")
+    );
+
+    // The roles that cannot log in, and the limit of connections of a role.
+    let mut first = Client::unix(&server);
+    first.startup_as(PROTOCOL_3_0, "ra", "postgres");
+    assert_eq!(tags(&first.until_ready()).chars().last(), Some('Z'));
+    for (user, sqlstate, message) in [
+        ("nope", "28000", "role \"nope\" does not exist"),
+        ("rd", "28000", "role \"rd\" is not permitted to log in"),
+        ("ra", "53300", "too many connections for role \"ra\""),
+    ] {
+        let mut client = Client::unix(&server);
+        client.startup_as(PROTOCOL_3_0, user, "postgres");
+        let messages = client.rest();
+        assert_eq!(tags(&messages), "RE", "{user}");
+        assert_eq!(messages[1].field(b'S').as_deref(), Some("FATAL"));
+        assert_eq!(error(&messages), pair(sqlstate, message));
+    }
+
+    // SET ROLE changes the current user and `is_superuser`, and not the session user.
+    let messages = admin.query("set role ra");
+    assert_eq!(statuses(&messages), ["is_superuser=off"]);
+    assert_eq!(scalar(&mut admin, "select current_user"), "ra");
+    assert_eq!(scalar(&mut admin, "select session_user"), "rpg");
+    assert_eq!(statuses(&admin.query("reset role")), ["is_superuser=on"]);
+    assert_eq!(error(&admin.query("set role nope")), pair("22023", "role \"nope\" does not exist"));
+
+    // A role that is not a superuser cannot become another role, and the error aborts the block,
+    // which undoes the settings of the block at once.
+    assert_eq!(
+        error(&first.query("set role rpg")),
+        pair("42501", "permission denied to set role \"rpg\"")
+    );
+    first.query("begin");
+    first.query("set application_name = 'x'");
+    let messages = first.query("set session authorization rpg");
+    assert_eq!(
+        error(&messages),
+        pair("42501", "permission denied to set session authorization \"rpg\"")
+    );
+    assert_eq!(statuses(&messages), ["application_name=t"]);
+    assert_eq!(messages.last().unwrap().body, b"E");
+    first.query("rollback");
+
+    // SET SESSION AUTHORIZATION reports the user first and then `is_superuser`.
+    let messages = admin.query("set session authorization ra");
+    assert_eq!(statuses(&messages), ["session_authorization=ra", "is_superuser=off"]);
+    assert_eq!(scalar(&mut admin, "select session_user"), "ra");
+    admin.query("reset session authorization");
+    assert_eq!(tags(&admin.query("drop role rd, rc")), "CZ");
+    assert_eq!(error(&admin.query("drop role rd")), pair("42704", "role \"rd\" does not exist"));
+    assert_eq!(tags(&admin.query("drop role if exists rd")), "NCZ");
     server.stop().unwrap();
 }
 

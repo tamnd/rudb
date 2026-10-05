@@ -972,9 +972,11 @@ dependencies = [
 name = "rudb-server"
 version = "0.8.29"
 dependencies = [
+ "aws-lc-rs",
  "chrono",
  "chrono-tz",
  "libc",
+ "ring",
  "rudb",
  "rudb-common",
  "rudb-pgtypes",

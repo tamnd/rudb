@@ -199,6 +199,12 @@ impl Settings {
         }
     }
 
+    /// Changes whether the session counts as a superuser for the parameters that only a superuser
+    /// can set, after `SET ROLE` or `SET SESSION AUTHORIZATION` changes the current user.
+    pub fn set_superuser(&mut self, superuser: bool) {
+        self.superuser = superuser;
+    }
+
     /// A number that changes each time a value changes, so that a reader can keep what it made
     /// from the values until the next change.
     #[must_use]

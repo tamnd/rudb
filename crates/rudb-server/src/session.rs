@@ -11,6 +11,7 @@
 //! next steps of milestone PG1.
 
 mod extended;
+mod role;
 mod setting;
 mod zone;
 
@@ -18,13 +19,14 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rudb::{Connection, ErrorCode, QueryResult, Transaction};
 use rudb_common::guc::{self, Action, Origin, Settings};
 use rudb_common::session::Postgres;
 use rudb_pgtypes::{
-    ByteaOutput, DateFormat, DateOrder, DateStyle, IntervalStyle, OutputSettings, RowEncoder,
-    TypeInfo, pg_type,
+    ByteaOutput, DateFormat, DateOrder, DateStyle, DateTimeInput, IntervalStyle, NoZones,
+    OutputSettings, RowEncoder, TypeInfo, UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, pg_type,
 };
 use rudb_pgwire::{
     CommandTag, Field, Frontend, Handshake, Level, OutBuf, QUERY_CANCELED, Replication, Session,
@@ -36,6 +38,7 @@ use setting::Command;
 use zone::Zone;
 
 use crate::poll;
+use crate::roles::{Catalog, Roles};
 use crate::server::{Refusal, Shared, log};
 use crate::stream::Stream;
 use crate::tls;
@@ -380,13 +383,13 @@ fn split_options(options: &str) -> Result<Vec<(String, String)>, String> {
 
 /// The settings of a new session: the values that the server owns, then the `options` of the
 /// startup packet, then its other parameters, as `process_startup_options` applies them.
-fn session_settings(start: &Start, ssl: bool) -> Result<Settings, Refusal> {
-    let mut settings = Settings::new(true);
+fn session_settings(start: &Start, ssl: bool, superuser: bool) -> Result<Settings, Refusal> {
+    let mut settings = Settings::new(superuser);
     let internal = [
         ("server_version", SERVER_VERSION),
         ("server_encoding", "UTF8"),
         ("client_encoding", "UTF8"),
-        ("is_superuser", "on"),
+        ("is_superuser", if superuser { "on" } else { "off" }),
         ("session_authorization", &start.user),
         ("TimeZone", "UTC"),
         ("log_timezone", "UTC"),
@@ -454,11 +457,15 @@ fn serve(
         Err(refusal) => return wire.fatal(refusal),
     };
     wire.out.authentication_ok();
+    let role = match shared.login(pid, &start.user) {
+        Ok(role) => role,
+        Err(refusal) => return wire.fatal(refusal),
+    };
     let database = match shared.database(&start.database) {
         Ok(database) => database,
         Err(refusal) => return wire.fatal(refusal),
     };
-    let mut guc = match session_settings(&start, shared.tls.is_some()) {
+    let mut guc = match session_settings(&start, shared.tls.is_some(), role.superuser) {
         Ok(guc) => guc,
         Err(refusal) => return wire.fatal(refusal),
     };
@@ -472,7 +479,8 @@ fn serve(
     let mut runner = Runner {
         connection,
         guc,
-        user: start.user.clone(),
+        roles: shared.roles.clone(),
+        login: role.oid,
         format: Format::default(),
         zone: Zone::of("UTC"),
         zone_name: "UTC".to_owned(),
@@ -493,7 +501,17 @@ fn serve(
             };
             runner.refresh();
             session.set_utf8(runner.utf8);
-            for (name, value) in runner.guc.reports() {
+            let mut reports = runner.guc.reports();
+            // PostgreSQL changes `is_superuser` inside the change of `session_authorization`, so
+            // with the last change first it reports `session_authorization` first.
+            let at = |name| reports.iter().position(|(held, _)| *held == name);
+            if let (Some(user), Some(superuser)) = (at("session_authorization"), at("is_superuser"))
+                && superuser < user
+            {
+                let report = reports.remove(user);
+                reports.insert(superuser, report);
+            }
+            for (name, value) in reports {
                 wire.out.parameter_status(name.as_bytes(), value.as_bytes());
             }
             session.ready_for_query(status, &mut wire.out);
@@ -669,8 +687,10 @@ struct Runner {
     connection: Connection,
     /// The values of the parameters of PostgreSQL in the session.
     guc: Settings,
-    /// The session user.
-    user: String,
+    /// The roles of the cluster.
+    roles: Arc<Roles>,
+    /// The role that logged in, `GetAuthenticatedUserId`.
+    login: u32,
     /// What the output takes from `guc`, made again when [`Settings::generation`] changes.
     format: Format,
     zone: Zone,
@@ -757,6 +777,10 @@ struct Failure {
 }
 
 impl Failure {
+    fn new(sqlstate: &str, message: String) -> Failure {
+        Failure { sqlstate: sqlstate.to_owned(), message, fields: None, position: None }
+    }
+
     fn engine(error: &rudb::Error, offset: usize) -> Failure {
         let mut sqlstate = error.reported_state().as_str().to_owned();
         let message = if error.code() == ErrorCode::Interrupt && error.message() == "Interrupted!" {
@@ -823,6 +847,7 @@ impl Runner {
         if self.guc.generation() == self.seen {
             return;
         }
+        self.sync_superuser();
         self.seen = self.guc.generation();
         let text = |name: &str| self.guc.get(name).unwrap_or_default();
         let datestyle = text("DateStyle");
@@ -859,6 +884,32 @@ impl Runner {
         self.connection.set_postgres(Arc::new(postgres));
     }
 
+    /// The session user, from `session_authorization`.
+    fn session_oid(&self, catalog: &Catalog) -> u32 {
+        let name = self.guc.get("session_authorization").unwrap_or_default();
+        catalog.find(&name).map_or(self.login, |role| role.oid)
+    }
+
+    /// The current user: the role of `SET ROLE`, or the session user.
+    fn current_oid(&self, catalog: &Catalog) -> u32 {
+        let name = self.guc.get("role").unwrap_or_default();
+        match catalog.find(&name) {
+            Some(role) if name != "none" => role.oid,
+            _ => self.session_oid(catalog),
+        }
+    }
+
+    /// Makes `is_superuser` follow the current user.
+    fn sync_superuser(&mut self) {
+        let catalog = self.roles.snapshot();
+        let superuser = catalog.superuser(self.current_oid(&catalog));
+        let text = if superuser { "on" } else { "off" };
+        if self.guc.get("is_superuser").as_deref() != Some(text) {
+            let _ = self.guc.set_internal("is_superuser", text);
+        }
+        self.guc.set_superuser(superuser);
+    }
+
     /// The end of a transaction for the settings, when no transaction is open after a statement.
     fn settle(&mut self, commit: bool) {
         if self.connection.transaction() == Transaction::Idle && !self.implicit {
@@ -872,6 +923,7 @@ impl Runner {
         &mut self,
         command: &Command,
         state: Transaction,
+        offset: usize,
         out: &mut OutBuf,
     ) -> Result<Outcome, Failure> {
         let failure = |e: rudb::Error| Failure::engine(&e, 0);
@@ -893,33 +945,68 @@ impl Runner {
                 CommandTag::Reset
             }
             Command::Authorization { user, reset } => {
-                // rudb has one role for each session, so the session user is the only one that
-                // the session can become.
-                if let Some(user) = user
-                    && *user != self.user
-                {
-                    return Err(Failure {
-                        sqlstate: "42704".to_owned(),
-                        message: format!("role \"{user}\" does not exist"),
-                        fields: None,
-                        position: None,
-                    });
+                let catalog = self.roles.snapshot();
+                if let Some(user) = user {
+                    let Some(role) = catalog.find(user) else {
+                        return Err(Failure::new(
+                            "22023",
+                            format!("role \"{user}\" does not exist"),
+                        ));
+                    };
+                    if role.oid != self.login && !catalog.superuser(self.login) {
+                        return Err(Failure::new(
+                            "42501",
+                            format!("permission denied to set session authorization \"{user}\""),
+                        ));
+                    }
                 }
+                self.guc
+                    .set("session_authorization", user.as_deref(), Action::Set, Origin::Statement)
+                    .map_err(failure)?;
                 if *reset { CommandTag::Reset } else { CommandTag::Set }
             }
             Command::Role(role) => {
-                if role != "none" && *role != self.user {
-                    return Err(Failure {
-                        sqlstate: "42704".to_owned(),
-                        message: format!("role \"{role}\" does not exist"),
-                        fields: None,
-                        position: None,
-                    });
+                if role != "none" {
+                    let catalog = self.roles.snapshot();
+                    let Some(target) = catalog.find(role) else {
+                        return Err(Failure::new(
+                            "22023",
+                            format!("role \"{role}\" does not exist"),
+                        ));
+                    };
+                    if !catalog.can_set(self.session_oid(&catalog), target.oid) {
+                        return Err(Failure::new(
+                            "42501",
+                            format!("permission denied to set role \"{role}\""),
+                        ));
+                    }
                 }
                 self.guc
                     .set("role", Some(role), Action::Set, Origin::Statement)
                     .map_err(failure)?;
                 CommandTag::Set
+            }
+            Command::Roles(parsed) => {
+                let catalog = self.roles.snapshot();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |since| i64::try_from(since.as_micros()).unwrap_or(0));
+                let cx = role::Context {
+                    roles: &self.roles,
+                    current: self.current_oid(&catalog),
+                    session: self.session_oid(&catalog),
+                    guc: &self.guc,
+                    datetime: DateTimeInput {
+                        order: self.format.date_format.order,
+                        zone: &self.zone,
+                        zones: &NoZones,
+                        abbrevs: ZoneAbbrevs::postgres_default(),
+                        now: now + UNIX_TO_POSTGRES_USECS,
+                    },
+                };
+                let tag = role::execute(parsed, offset, &cx, out)?;
+                self.sync_superuser();
+                tag
             }
             Command::Show(name) => {
                 let (column, value) = self.guc.show(name).map_err(failure)?;
@@ -989,6 +1076,11 @@ impl Runner {
         let commit =
             outcome.is_ok() && control != Some(Control::Rollback) && state != Transaction::Aborted;
         self.settle(commit);
+        // PostgreSQL undoes the settings of a block when the block fails, not at its ROLLBACK.
+        if outcome.is_err() && self.connection.transaction() == Transaction::Aborted {
+            self.guc.end(false);
+            self.refresh();
+        }
         outcome
     }
 
@@ -1029,7 +1121,10 @@ impl Runner {
             _ => {}
         }
         if let Some(command) = command {
-            let done = self.setting(command, state, out);
+            let done = self.setting(command, state, offset, out);
+            if done.is_err() {
+                self.connection.abort_transaction();
+            }
             // The next statement can read the parameters, and it can be in the same message.
             self.refresh();
             return done;

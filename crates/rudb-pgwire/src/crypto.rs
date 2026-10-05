@@ -16,12 +16,58 @@ pub trait Crypto {
     fn md5(&self, parts: &[&[u8]]) -> [u8; 16];
 }
 
+/// MD5, which neither crypto provider of the server offers, for the stored secrets and the
+/// answers of the `md5` method. MD5 is not safe for new uses, and PostgreSQL keeps it only for old
+/// roles, so speed does not matter here.
+pub fn md5(parts: &[&[u8]]) -> [u8; 16] {
+    const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+    let mut h: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+    for block in pad(parts, false).chunks(64) {
+        let m: Vec<u32> =
+            block.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let [mut a, mut b, mut c, mut d] = h;
+        for i in 0..64 {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let k = (((i + 1) as f64).sin().abs() * 4_294_967_296.0) as u32;
+            let f = f.wrapping_add(a).wrapping_add(k).wrapping_add(m[g]);
+            (a, d, c) = (d, c, b);
+            b = b.wrapping_add(f.rotate_left(S[i / 16 * 4 + i % 4]));
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    let mut out = [0; 16];
+    for (i, word) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+/// The message of `parts` with the padding of MD5 and SHA-256, and its length in bits at the end in
+/// the byte order of the hash.
+fn pad(parts: &[&[u8]], big_endian: bool) -> Vec<u8> {
+    let mut msg = parts.concat();
+    let bits = (msg.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&if big_endian { bits.to_be_bytes() } else { bits.to_le_bytes() });
+    msg
+}
+
 #[cfg(test)]
 pub(crate) mod soft {
     //! A slow implementation of [`Crypto`] for the tests, checked against the vectors of
     //! FIPS 180-2, RFC 1321, RFC 4231 and RFC 7914.
 
-    use super::Crypto;
+    use super::{Crypto, pad};
 
     #[derive(Debug)]
     pub(crate) struct Soft;
@@ -38,17 +84,6 @@ pub(crate) mod soft {
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
         0xc67178f2,
     ];
-
-    fn pad(parts: &[&[u8]], big_endian: bool) -> Vec<u8> {
-        let mut msg = parts.concat();
-        let bits = (msg.len() as u64) * 8;
-        msg.push(0x80);
-        while msg.len() % 64 != 56 {
-            msg.push(0);
-        }
-        msg.extend_from_slice(&if big_endian { bits.to_be_bytes() } else { bits.to_le_bytes() });
-        msg
-    }
 
     impl Crypto for Soft {
         fn sha256(&self, parts: &[&[u8]]) -> [u8; 32] {
@@ -118,33 +153,7 @@ pub(crate) mod soft {
         }
 
         fn md5(&self, parts: &[&[u8]]) -> [u8; 16] {
-            const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
-            let mut h: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
-            for block in pad(parts, false).chunks(64) {
-                let m: Vec<u32> =
-                    block.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-                let [mut a, mut b, mut c, mut d] = h;
-                for i in 0..64 {
-                    let (f, g) = match i / 16 {
-                        0 => ((b & c) | (!b & d), i),
-                        1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-                        2 => (b ^ c ^ d, (3 * i + 5) % 16),
-                        _ => (c ^ (b | !d), (7 * i) % 16),
-                    };
-                    let k = (((i + 1) as f64).sin().abs() * 4_294_967_296.0) as u32;
-                    let f = f.wrapping_add(a).wrapping_add(k).wrapping_add(m[g]);
-                    (a, d, c) = (d, c, b);
-                    b = b.wrapping_add(f.rotate_left(S[i / 16 * 4 + i % 4]));
-                }
-                for (x, y) in h.iter_mut().zip([a, b, c, d]) {
-                    *x = x.wrapping_add(y);
-                }
-            }
-            let mut out = [0; 16];
-            for (i, word) in h.iter().enumerate() {
-                out[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
-            }
-            out
+            super::md5(parts)
         }
     }
 

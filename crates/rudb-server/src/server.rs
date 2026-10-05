@@ -18,10 +18,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rudb::{Connection, Database};
-use rudb_pgwire::{CANCEL_KEY_LEN, Cancel, CancelKey, cancel_target};
+use rudb_pgwire::{CANCEL_KEY_LEN, Cancel, CancelKey, SCRAM_ITERATIONS, cancel_target};
 
 use crate::config::Config;
 use crate::poll;
+use crate::roles::{self, Role, Roles};
 use crate::session;
 use crate::stream::Stream;
 use crate::tls;
@@ -68,6 +69,8 @@ pub(crate) struct Entry {
     /// A second handle on the socket of the client, which a stop shuts down when the session does
     /// not end in time.
     stream: Option<Stream>,
+    /// The role that logged in, for the connection limit of the role.
+    role: Option<u32>,
 }
 
 /// The sessions by process ID.
@@ -83,6 +86,8 @@ pub(crate) struct Shared {
     pub(crate) config: Config,
     /// The TLS configuration, when `ssl` is on.
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
+    /// The roles of the cluster.
+    pub(crate) roles: Arc<Roles>,
     databases: Mutex<HashMap<String, Arc<Database>>>,
     sessions: Mutex<Sessions>,
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -111,7 +116,7 @@ impl Shared {
             pid = if pid == i32::MAX { 1001 } else { pid + 1 };
         }
         sessions.next = if pid == i32::MAX { 1001 } else { pid + 1 };
-        sessions.map.insert(pid, Entry { key: None, connection: None, wake, stream });
+        sessions.map.insert(pid, Entry { key: None, connection: None, wake, stream, role: None });
         pid
     }
 
@@ -128,6 +133,29 @@ impl Shared {
             entry.key = Some(key);
         }
         Ok(key)
+    }
+
+    /// The checks of `InitializeSessionUserId` on the role of a new session: the role exists, it
+    /// can log in, and it has fewer sessions than its connection limit. A superuser has no limit.
+    pub(crate) fn login(&self, pid: i32, user: &str) -> Result<Role, Refusal> {
+        let catalog = self.roles.snapshot();
+        let Some(role) = catalog.find(user) else {
+            return Err(("28000", format!("role \"{user}\" does not exist")));
+        };
+        if !role.login {
+            return Err(("28000", format!("role \"{user}\" is not permitted to log in")));
+        }
+        let mut sessions = lock(&self.sessions);
+        if let Some(entry) = sessions.map.get_mut(&pid) {
+            entry.role = Some(role.oid);
+        }
+        if !role.superuser && role.connlimit >= 0 {
+            let count = sessions.map.values().filter(|entry| entry.role == Some(role.oid)).count();
+            if count > usize::try_from(role.connlimit).unwrap_or(0) {
+                return Err(("53300", format!("too many connections for role \"{user}\"")));
+            }
+        }
+        Ok(role.clone())
     }
 
     /// Keeps a handle on the connection of a session, for cancel requests.
@@ -195,12 +223,19 @@ fn database_path(data: &Path, name: &str) -> PathBuf {
 }
 
 /// Makes a data directory with the databases `postgres`, `template1` and `template0`, as `initdb`
-/// does.
+/// does. `superuser` is the name of the bootstrap superuser, and `password` its password in clear
+/// text, which the role file keeps as a SCRAM secret.
 ///
 /// # Errors
 ///
-/// A data directory that exists and is not empty, or a file that the server cannot write.
-pub fn init(data: &Path) -> Result<(), String> {
+/// A superuser name that starts with `pg_`, a data directory that exists and is not empty, or a
+/// file that the server cannot write.
+pub fn init(data: &Path, superuser: &str, password: Option<&str>) -> Result<(), String> {
+    if superuser.starts_with("pg_") {
+        return Err(format!(
+            "superuser name \"{superuser}\" is disallowed; role names cannot begin with \"pg_\""
+        ));
+    }
     if data.exists() && data.read_dir().map_err(|e| e.to_string())?.next().is_some() {
         return Err(format!("directory \"{}\" exists but is not empty", data.display()));
     }
@@ -216,7 +251,8 @@ pub fn init(data: &Path) -> Result<(), String> {
             .and_then(Database::close)
             .map_err(|e| format!("could not create database \"{name}\": {}", e.message()))?;
     }
-    Ok(())
+    let password = password.map(|password| roles::scram(password, SCRAM_ITERATIONS));
+    roles::write(data, &roles::Catalog::bootstrap(superuser, password))
 }
 
 /// A listening socket.
@@ -316,6 +352,7 @@ impl Server {
             ));
         }
         let tls = tls::load(&config)?;
+        let roles = Arc::new(Roles::open(&config.data)?);
         let mut owned = Vec::new();
         let pid_file = config.data.join(PID_FILE);
         let me = std::process::id();
@@ -339,6 +376,7 @@ impl Server {
         let shared = Arc::new(Shared {
             config,
             tls,
+            roles,
             databases: Mutex::new(HashMap::new()),
             sessions: Mutex::new(Sessions {
                 next: 1001 + i32::from(poll::random::<2>()[0]) * 64,

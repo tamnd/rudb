@@ -3984,6 +3984,13 @@ impl Shared {
         }
     }
 
+    /// Marks the open transaction as aborted.
+    pub(crate) fn abort_block(&self) {
+        if let Some(open) = self.open().as_mut() {
+            open.aborted = true;
+        }
+    }
+
     /// Where the connection is in a transaction block.
     pub(crate) fn block(&self) -> crate::connection::Transaction {
         use crate::connection::Transaction;
