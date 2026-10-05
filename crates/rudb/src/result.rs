@@ -197,6 +197,30 @@ impl QueryResult {
         Self::counted(rows)
     }
 
+    /// A result of text columns, for an answer that a front end makes without a query, such as
+    /// the rows of `SHOW` in the PostgreSQL server.
+    ///
+    /// # Errors
+    ///
+    /// A row with a number of values that is not the number of names.
+    pub fn text(names: Vec<String>, rows: &[Vec<String>]) -> Result<Self> {
+        let mut chunks = Vec::new();
+        for part in rows.chunks(rudb_vector::VECTOR_SIZE) {
+            let columns = (0..names.len())
+                .map(|column| {
+                    let values: Vec<Value> = part
+                        .iter()
+                        .map(|row| row.get(column).cloned().map_or(Value::Null, Value::Varchar))
+                        .collect();
+                    Vector::from_values(LogicalType::Varchar, &values)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            chunks.push(Chunk::new(columns)?);
+        }
+        let types = vec![LogicalType::Varchar; names.len()];
+        Ok(Self::new(names, types, chunks, Memory::unlimited().reservation()))
+    }
+
     /// The count result [`Self::changed`] hands out, built afresh.
     fn counted(rows: usize) -> Result<Self> {
         let count = i64::try_from(rows).unwrap_or(i64::MAX);

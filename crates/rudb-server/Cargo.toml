@@ -24,6 +24,8 @@ path = "src/main.rs"
 # standard library does not have. Only this crate may depend on it, as document 16 section 16.4 of
 # the PostgreSQL notes says.
 [dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
 libc.workspace = true
 rudb.workspace = true
 rudb-common.workspace = true
