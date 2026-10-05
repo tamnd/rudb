@@ -6,7 +6,8 @@ use rudb::Database;
 /// The logging settings as `name=value` pairs, in name order.
 fn logging(database: &Database) -> String {
     let mut out = Vec::new();
-    for name in ["enable_logging", "enabled_log_types", "logging_level", "logging_mode", "logging_storage"]
+    for name in
+        ["enable_logging", "enabled_log_types", "logging_level", "logging_mode", "logging_storage"]
     {
         let value = database
             .value(&format!("SELECT value FROM duckdb_settings() WHERE name = '{name}'"))
@@ -33,7 +34,9 @@ fn a_type_turns_on_that_type_at_its_own_level() {
          logging_mode=ENABLE_SELECTED logging_storage=shell_log_storage"
     );
     database
-        .execute("CALL enable_logging(['QueryLog', 'HTTP', 'AdaptiveFilter', 'Metrics', 'querylog'])")
+        .execute(
+            "CALL enable_logging(['QueryLog', 'HTTP', 'AdaptiveFilter', 'Metrics', 'querylog'])",
+        )
         .expect("the call");
     assert_eq!(
         logging(&database),

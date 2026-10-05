@@ -603,10 +603,7 @@ impl Options {
             // Read by the binder through [`allows_empty`] before it expands the patterns, which is
             // the only place it changes anything.
             "allow_empty" => {}
-            "geojson"
-            | "hive_partitioning"
-            | "hive_types"
-            | "hive_types_autocast" => {
+            "geojson" | "hive_partitioning" | "hive_types" | "hive_types_autocast" => {
                 return Err(Error::not_implemented(format!(
                     "read_json does not take \"{name}\" yet"
                 )));
