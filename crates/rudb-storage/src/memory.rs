@@ -128,6 +128,9 @@ const TAIL_TAKES: usize = 64;
 /// How many chunks the tail holds before it lays them into one.
 const TAIL_CHUNKS: usize = 32;
 
+/// The most rows a chunk can have and still go into the columns being built rather than the tail.
+const TAIL_BUILDS: usize = 8;
+
 /// How many values an append counts statistics for on each thread it starts, at least.
 const VALUES_PER_THREAD: usize = 1 << 16;
 
@@ -293,6 +296,13 @@ impl MemoryTable {
             // one starts the next tail.
             if self.tail_rows + len > VECTOR_SIZE {
                 self.close_tail()?;
+            }
+            // A row or a few go into the columns being built, the way a row handed over as values
+            // does. Kept as a chunk each, they were laid into one every 32 chunks, so a table
+            // written a row at a time through a key copied the whole tail every 32 rows, which was
+            // most of what a keyed load cost.
+            if len <= TAIL_BUILDS && chunk.kept().is_none() && self.build_chunk(&chunk) {
+                return self.trail(zone, len);
             }
             // As pages, so that a read of a tail of one chunk shares it the way an open chunk is
             // shared.
@@ -1236,6 +1246,26 @@ impl MemoryTable {
         self.build(row)?;
         let zone = self.take_stats(&chunk);
         self.trail(zone, 1)
+    }
+
+    /// Pushes every row of `chunk` into the columns being built, and says whether it did. A row
+    /// that will not go in takes the ones before it back out, and the chunk is left to be kept as
+    /// it is.
+    fn build_chunk(&mut self, chunk: &Chunk) -> bool {
+        let start = self.built;
+        for row in 0..chunk.len() {
+            let values = (0..chunk.width())
+                .map(|column| chunk.try_value_at(row, column))
+                .collect::<Result<Vec<_>>>();
+            if values.and_then(|values| self.build(&values)).is_err() {
+                for builder in &mut self.building {
+                    builder.truncate(start);
+                }
+                self.built = start;
+                return false;
+            }
+        }
+        true
     }
 
     /// Pushes one row into the columns being built, all of it or none of it.
