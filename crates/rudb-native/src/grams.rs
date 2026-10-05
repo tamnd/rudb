@@ -103,7 +103,22 @@ pub fn build_text_grams(path: &Path, table: &str) -> Result<Vec<Built>> {
 /// If the file cannot be opened, a column cannot be read, or the attach fails.
 pub fn build_text_grams_within(path: &Path, table: &str, share: u64) -> Result<Vec<Built>> {
     let reader = Catalog::open(path)?.table(table)?;
-    let columns = text_columns(&reader).collect::<Vec<_>>();
+    within(path, &reader, share)
+}
+
+/// The same for a table the caller already has open, which a checkpoint has from deciding which
+/// tables need the work. The file at `path` has to hold the rows `reader` does, which it does when
+/// all that was written since the reader was opened is sections.
+///
+/// # Errors
+///
+/// If a column cannot be read or the attach fails.
+pub fn build_text_grams_of(path: &Path, reader: &Reader) -> Result<Vec<Built>> {
+    within(path, reader, TEXT_GRAMS_SHARE)
+}
+
+fn within(path: &Path, reader: &Reader, share: u64) -> Result<Vec<Built>> {
+    let columns = text_columns(reader).collect::<Vec<_>>();
     if columns.is_empty() {
         return Ok(Vec::new());
     }
@@ -122,8 +137,8 @@ pub fn build_text_grams_within(path: &Path, table: &str, share: u64) -> Result<V
             .global_dictionary(column)?
             .filter(|values| matches!(values.validity(), Validity::AllValid));
         let (text_bytes, words) = match &dictionary {
-            Some(values) => (coded_bytes(&reader, column, values)?, Vec::new()),
-            None => sketch_rows(&reader, column, rows)?,
+            Some(values) => (coded_bytes(reader, column, values)?, Vec::new()),
+            None => sketch_rows(reader, column, rows)?,
         };
         report.push(Built { column, rows, text_bytes, bytes: rows * 8, built: false });
         payloads.push(words);
@@ -142,10 +157,9 @@ pub fn build_text_grams_within(path: &Path, table: &str, share: u64) -> Result<V
     }
     for (at, dictionary) in coded.iter().enumerate() {
         if let (true, Some(values)) = (report[at].built, dictionary) {
-            payloads[at] = sketch_codes(&reader, report[at].column, values, rows)?;
+            payloads[at] = sketch_codes(reader, report[at].column, values, rows)?;
         }
     }
-    drop(reader);
     let attachments = report
         .iter()
         .zip(&payloads)
@@ -163,7 +177,7 @@ pub fn build_text_grams_within(path: &Path, table: &str, share: u64) -> Result<V
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    crate::attach(path, table, &attachments)?;
+    crate::attach(path, reader.table().name(), &attachments)?;
     Ok(report)
 }
 

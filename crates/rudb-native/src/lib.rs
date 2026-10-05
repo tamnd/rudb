@@ -4999,6 +4999,11 @@ pub fn attach(
     table: &str,
     attachments: &[section::Attachment<'_>],
 ) -> Result<Table> {
+    // One attach at a time in the process. Each reads the committed catalog and writes the next one
+    // from it, so two side by side would each write a catalog missing what the other attached. A
+    // checkpoint builds the links and the text sections on two threads, which is where two meet.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _held = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let file = RealFilesystem::new().open(path.as_ref(), OpenMode::ReadWrite)?;
     let file = &*file;
     let size = file.len()?;
@@ -16609,6 +16614,36 @@ mod tests {
         // costs the query its shortcut and nothing else.
         assert_eq!(reader.read(0, &[0]).expect("the column is untouched").width(), 1);
 
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn attaches_from_two_threads_at_once_both_survive() {
+        // A checkpoint attaches links on one thread and text sections on another. Each attach reads
+        // the committed catalog and writes the next, so two that overlapped would each commit a
+        // catalog without the other's sections and the file would keep one of them.
+        let path = linked_file("attach_together", 64);
+        let payload = a_key_map_payload();
+        std::thread::scope(|scope| {
+            for kind in [*section::KEY_MAP, *b"RUDBZZ9\0"] {
+                let (path, payload) = (&path, &payload);
+                scope.spawn(move || {
+                    for id in 0..16 {
+                        let one = section::Attachment {
+                            kind,
+                            id,
+                            flags: 0,
+                            header_bytes: 0,
+                            bytes: payload,
+                        };
+                        attach(path, "items", &[one]).expect("attach");
+                    }
+                });
+            }
+        });
+
+        let reader = Reader::open(&path).expect("reopen");
+        assert_eq!(attached(reader.table()).len(), 32, "every attach from both threads is held");
         fs::remove_file(&path).expect("clean up");
     }
 

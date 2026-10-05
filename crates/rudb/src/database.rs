@@ -2782,7 +2782,17 @@ fn index(
 /// on the column it was built from and on nothing else, so the file is all it needs. A table whose
 /// sketches are current is passed over, which is what keeps a checkpoint that changed one table
 /// from reading the text of all of them. See `rudb_native::grams`.
-fn sketch(path: &Path, catalog: &mut Catalog, pages: &rudb_native::PagePool) -> Result<()> {
+///
+/// `beside` runs on this thread while the text is read on another, and a checkpoint passes the
+/// links. Neither reads what the other writes, and the two are paid at once rather than one after
+/// the other: on JOB the links held a core and a half for 20 seconds and the text sections took 18
+/// more after them. The file sees one attach at a time, which `rudb_native::attach` sees to.
+fn sketch(
+    path: &Path,
+    catalog: &mut Catalog,
+    pages: &rudb_native::PagePool,
+    beside: impl FnOnce(&mut Catalog) -> Result<()>,
+) -> Result<()> {
     let native = rudb_native::Catalog::open_in(path, pages)?;
     let mut stale = Vec::new();
     for name in native.names() {
@@ -2790,18 +2800,40 @@ fn sketch(path: &Path, catalog: &mut Catalog, pages: &rudb_native::PagePool) -> 
         let grams = !rudb_native::grams::current(&reader);
         let postings = !rudb_native::postings::current(&reader);
         if grams || postings {
-            stale.push((name.to_string(), grams, postings));
+            stale.push((reader, grams, postings));
         }
     }
     drop(native);
+    let tables =
+        stale.iter().map(|(reader, _, _)| reader.table().name().to_owned()).collect::<Vec<_>>();
+    // Each reader goes once its table is done, and the global dictionaries it opened with it.
+    let text = move || -> Result<()> {
+        for (reader, grams, postings) in stale {
+            if grams {
+                rudb_native::grams::build_text_grams_of(path, &reader)?;
+            }
+            if postings {
+                rudb_native::postings::build_value_rows_of(path, &reader)?;
+            }
+        }
+        Ok(())
+    };
+    let (sketched, linked) = if tables.is_empty() {
+        (Ok(()), beside(catalog))
+    } else {
+        std::thread::scope(|scope| {
+            let sketching = scope.spawn(text);
+            let linked = beside(catalog);
+            let sketched = sketching
+                .join()
+                .unwrap_or_else(|_| Err(Error::internal("the text sections' thread panicked")));
+            (sketched, linked)
+        })
+    };
+    linked?;
+    sketched?;
     let mut names = Vec::new();
-    for (table, grams, postings) in &stale {
-        if *grams {
-            rudb_native::grams::build_text_grams(path, table)?;
-        }
-        if *postings {
-            rudb_native::postings::build_value_rows(path, table)?;
-        }
+    for table in &tables {
         if let Some(name) = catalog
             .tables()
             .find(|held| held.name().table == *table)
@@ -6069,8 +6101,10 @@ impl Shared {
                         &mut self.committed_journal(),
                         false,
                     )?;
-                    index(path, &mut catalog, &self.inner.settings.links(), &self.inner.pages)?;
-                    sketch(path, &mut catalog, &self.inner.pages)?;
+                    let links = self.inner.settings.links();
+                    sketch(path, &mut catalog, &self.inner.pages, |catalog| {
+                        index(path, catalog, &links, &self.inner.pages)
+                    })?;
                 }
                 Ok(QueryResult::empty())
             }
