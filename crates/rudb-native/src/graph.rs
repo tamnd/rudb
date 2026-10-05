@@ -159,6 +159,19 @@ pub(crate) fn by_part<T: Send>(
     })
 }
 
+/// Runs `work` once for every part of a table on every worker the machine has, for a pass whose
+/// answer is not one value per row, such as a total.
+///
+/// # Errors
+///
+/// If `work` fails on any part.
+pub(crate) fn each_part(
+    reader: &Reader,
+    work: &(dyn Fn(usize) -> Result<()> + Sync),
+) -> Result<()> {
+    by_part(reader, &mut [] as &mut [()], 0, &|part, _| work(part))
+}
+
 /// Where a key over two columns sits among the column numbers.
 ///
 /// A relationship's key is named by a number everywhere it is stored: the id of a key map or a link
