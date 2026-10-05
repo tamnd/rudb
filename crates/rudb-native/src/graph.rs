@@ -991,28 +991,51 @@ fn one_link(
         }
     })
     .map_err(|error| error.to_string())?;
-    let link = link::Link::build(&parents_of, map.len()).map_err(|error| error.to_string())?;
+    // The link, its degrees, its spans and its adjacency each read the same slice and nothing
+    // else, so they are built side by side. One after another on one thread, with the adjacency's
+    // counting sort the longest of them, they were most of the 52 seconds the IMDb checkpoint took.
+    //
     // The parent key is unique, because the check above refused the relationship otherwise. So the
     // certificate is recorded here rather than discovered: a link only exists over a key map whose
     // parent side was counted and found distinct.
     //
-    // Its own pass over the same slice rather than a loop fused into the one above. The cost of
-    // measuring degrees is the scattered increment into a counter per parent and not the sequential
-    // read of the child column, which the build makes twice already, so fusing would save the cheap
-    // half and put a histogram inside a function whose job is to choose a form.
-    let degrees = Degrees::of(&parents_of, map.len(), true);
-    let spans = spans_of(child, &parent, &parents_of).map_err(|error| error.to_string())?;
-    let bytes = encode_link(&link, &parent, edge).map_err(|error| error.to_string())?;
+    // The degrees are their own pass over the same slice rather than a loop fused into the scan
+    // above. The cost of measuring them is the scattered increment into a counter per parent and
+    // not the sequential read of the child column, so fusing would save the cheap half.
+    //
     // A monotone link answers the backward direction itself, so the adjacency is only for the
-    // packed form. It is built from the same slice the link was, a counting sort over it.
+    // packed form, which is any slice with an unmatched child or a child before its predecessor.
+    let parents = map.len();
+    let packed = parents == 0 || parents_of.contains(&NO_PARENT) || !parents_of.is_sorted();
+    let (built, degrees, spans, adjacency) = std::thread::scope(|scope| {
+        let built = scope.spawn(|| {
+            let link = link::Link::build(&parents_of, parents)?;
+            let bytes = encode_link(&link, &parent, edge)?;
+            Ok::<_, rudb_common::Error>((link, bytes))
+        });
+        let degrees = scope.spawn(|| Degrees::of(&parents_of, parents, true));
+        let spans = scope.spawn(|| spans_of(child, &parent, &parents_of));
+        let adjacency = packed
+            .then(|| {
+                Adjacency::build_on(&parents_of, parents, crate::close_workers())
+                    .and_then(|adjacency| encode_adjacency(&adjacency, &parent, edge))
+            })
+            .transpose();
+        let joined = "a link build worker panicked";
+        (
+            built.join().map_err(|_| joined.to_string()),
+            degrees.join().map_err(|_| joined.to_string()),
+            spans.join().map_err(|_| joined.to_string()),
+            adjacency,
+        )
+    });
+    let (link, bytes) = built?.map_err(|error| error.to_string())?;
+    let degrees = degrees?;
+    let spans = spans?.map_err(|error| error.to_string())?;
+    let adjacency = adjacency.map_err(|error| error.to_string())?;
     let adjacency = match link.form() {
         link::Form::Monotone => None,
-        link::Form::Packed => {
-            let adjacency = Adjacency::build(&parents_of, map.len())
-                .and_then(|adjacency| encode_adjacency(&adjacency, &parent, edge))
-                .map_err(|error| error.to_string())?;
-            Some(adjacency)
-        }
+        link::Form::Packed => adjacency,
     };
     Ok((
         BuiltLink {
