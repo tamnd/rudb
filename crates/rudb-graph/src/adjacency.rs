@@ -279,6 +279,36 @@ impl Adjacency {
         Ok(())
     }
 
+    /// How many child rows point at each parent, in parent order, saturating at `u32::MAX`.
+    ///
+    /// One walk over the starts, where each parent is a run of ones followed by a zero, so a word
+    /// answers for every parent that ends in it with a `trailing_ones` each. This is what
+    /// [`crate::Degrees::with_counts`] wants, and it is a few milliseconds for the four million
+    /// people of the IMDb `cast_info` where counting the same thing from the children was a
+    /// scattered increment for each of 36 million of them.
+    #[must_use]
+    pub fn degrees(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(usize::try_from(self.parents).unwrap_or(0));
+        let len = self.starts.len();
+        let mut run = 0_usize;
+        for (index, &word) in self.starts.words().iter().enumerate() {
+            let mut word = word;
+            let mut left = len.saturating_sub(index * 64).min(64);
+            while left > 0 {
+                let ones = (word.trailing_ones() as usize).min(left);
+                run += ones;
+                if ones == left {
+                    break;
+                }
+                out.push(u32::try_from(run).unwrap_or(u32::MAX));
+                run = 0;
+                word = word.checked_shr(u32::try_from(ones + 1).unwrap_or(64)).unwrap_or(0);
+                left -= ones + 1;
+            }
+        }
+        out
+    }
+
     /// How many child rows point at `parent`, read off the starts without reading any of them.
     ///
     /// # Errors
@@ -528,6 +558,7 @@ fn malformed(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Degrees;
     use crate::link::Link;
 
     /// A child table in no order against its parents, with a parent that has no children and a
@@ -592,6 +623,47 @@ mod tests {
         let mut past = random(1000, 2000);
         past[1500] = 1000;
         assert!(Adjacency::build(&past, 1000).is_err(), "a parent past the end");
+    }
+
+    #[test]
+    fn the_degrees_read_off_the_lists_measure_what_counting_the_children_measures() {
+        let (scattered, fifty) = scattered();
+        let mut seed = 11_u64;
+        let mut random = |parents: u64, rows: usize| {
+            (0..rows)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    if seed >> 60 == 0 { NO_PARENT } else { (seed >> 20) % parents }
+                })
+                .collect::<Vec<Rid>>()
+        };
+        let cases = vec![
+            (scattered, fifty),
+            (random(1, 500), 1),
+            (random(1024, 5_000), 1024),
+            (random(100_003, 300_000), 100_003),
+            ((0..20_000).map(|child| child / 200).collect(), 130),
+            ((0..20_000).map(|child| u64::from(child % 7 == 0) * 3).collect(), 5),
+            (vec![NO_PARENT; 100], 10),
+            (Vec::new(), 10),
+        ];
+        for (parents_of, parents) in cases {
+            let adjacency = Adjacency::build(&parents_of, parents).expect("build");
+            let degrees = adjacency.degrees();
+            assert_eq!(degrees.len() as u64, parents, "one degree a parent");
+            for (parent, degree) in degrees.iter().enumerate() {
+                let listed = adjacency.degree(parent as u64).expect("degree");
+                assert_eq!(u64::from(*degree), listed, "parent {parent}");
+            }
+            assert_eq!(
+                Degrees::with_counts(&parents_of, &degrees, true),
+                Degrees::of(&parents_of, parents, true),
+                "{} children of {parents} parents",
+                parents_of.len()
+            );
+        }
     }
 
     #[test]

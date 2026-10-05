@@ -1070,7 +1070,9 @@ fn one_link(
     //
     // The degrees are their own pass over the same slice rather than a loop fused into the scan
     // above. The cost of measuring them is the scattered increment into a counter per parent and
-    // not the sequential read of the child column, so fusing would save the cheap half.
+    // not the sequential read of the child column, so fusing would save the cheap half. A link
+    // that needs an adjacency has that increment done for it, a cache sized range at a time, so
+    // its degrees are read off the adjacency's lists instead.
     //
     // A monotone link answers the backward direction itself, so the adjacency is only for the
     // packed form, which is any slice with an unmatched child or a child before its predecessor.
@@ -1082,26 +1084,31 @@ fn one_link(
             let bytes = encode_link(&link, &parent, edge)?;
             Ok::<_, rudb_common::Error>((link, bytes))
         });
-        let degrees = scope.spawn(|| Degrees::of(&parents_of, parents, true));
+        let degrees = (!packed).then(|| scope.spawn(|| Degrees::of(&parents_of, parents, true)));
         let spans = scope.spawn(|| spans_of(child, &parent, &parents_of));
         let adjacency = packed
             .then(|| {
-                Adjacency::build(&parents_of, parents)
-                    .and_then(|adjacency| encode_adjacency(&adjacency, &parent, edge))
+                let adjacency = Adjacency::build(&parents_of, parents)?;
+                let degrees = Degrees::with_counts(&parents_of, &adjacency.degrees(), true);
+                Ok::<_, rudb_common::Error>((encode_adjacency(&adjacency, &parent, edge)?, degrees))
             })
             .transpose();
         let joined = "a link build worker panicked";
         (
             built.join().map_err(|_| joined.to_string()),
-            degrees.join().map_err(|_| joined.to_string()),
+            degrees.map(|degrees| degrees.join().map_err(|_| joined.to_string())).transpose(),
             spans.join().map_err(|_| joined.to_string()),
             adjacency,
         )
     });
     let (link, bytes) = built?.map_err(|error| error.to_string())?;
-    let degrees = degrees?;
     let spans = spans?.map_err(|error| error.to_string())?;
     let adjacency = adjacency.map_err(|error| error.to_string())?;
+    let (adjacency, degrees) = match (adjacency, degrees?) {
+        (Some((adjacency, degrees)), _) => (Some(adjacency), degrees),
+        (None, Some(degrees)) => (None, degrees),
+        (None, None) => (None, Degrees::of(&parents_of, parents, true)),
+    };
     let adjacency = match link.form() {
         link::Form::Monotone => None,
         link::Form::Packed => adjacency,

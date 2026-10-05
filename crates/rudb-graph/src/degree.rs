@@ -143,6 +143,50 @@ impl Degrees {
         }
     }
 
+    /// [`Self::of`] with each parent's degree already counted, in parent order, which is what
+    /// [`crate::Adjacency::degrees`] reads off the lists it built.
+    ///
+    /// The count in [`Self::of`] is an increment to wherever the parent's counter lands, so on a
+    /// link whose children are in no parent order every child is a trip to memory, and on the IMDb
+    /// `cast_info` that is 36 million of them into 4 million counters. The adjacency of the same
+    /// link already sorted the children by parent a cache sized range at a time, so its degrees
+    /// cost a walk over its starts, and only the strides need the children, which is a pass in
+    /// order. The degrees saturate at `u32::MAX` the way [`Self::of`] has them.
+    #[must_use]
+    pub fn with_counts(parents_of: &[Rid], counts: &[u32], unique: bool) -> Self {
+        let mut linked = 0_u64;
+        let mut strides = 0_u64;
+        let mut stride = 0_u128;
+        let mut previous: Option<Rid> = None;
+        for parent in parents_of {
+            if *parent == NO_PARENT {
+                previous = None;
+                continue;
+            }
+            if let Some(before) = previous {
+                stride += u128::from(before.abs_diff(*parent));
+                strides += 1;
+            }
+            previous = Some(*parent);
+            linked += 1;
+        }
+        let mut buckets = [0_u64; BUCKETS];
+        let mut highest = 0_u64;
+        for count in counts {
+            buckets[bucket(u64::from(*count))] += 1;
+            highest = highest.max(u64::from(*count));
+        }
+        Self {
+            buckets,
+            children: parents_of.len() as u64,
+            linked,
+            highest,
+            strides,
+            stride,
+            unique,
+        }
+    }
+
     /// Rows in the child table.
     #[must_use]
     pub fn children(&self) -> u64 {
