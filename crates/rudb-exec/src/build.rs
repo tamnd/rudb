@@ -429,10 +429,8 @@ impl TopCut {
     #[must_use]
     pub fn of(plan: &Plan, top: NodeRef) -> Option<TopCut> {
         let Node::TopN { input, keys, .. } = *plan.node(top) else { return None };
-        let (binding, op) = cutoff::ordering(plan, keys)?;
-        let binding = sideways::beneath(plan, input, binding)?;
         let cutoff = Cutoff::new();
-        cutoff.about(binding, op);
+        cutoff::arm(&cutoff, plan, input, keys)?;
         Some(TopCut(cutoff))
     }
 
@@ -3618,11 +3616,7 @@ impl<'a> Building<'a, '_> {
                 // Armed afterwards, like the join's own filter and for the same reason: the binding
                 // the top N knows is the one the projection above the scan hands it, so it has to be
                 // walked down to the scan's own before the scan can be asked about it.
-                if let Some((binding, op)) = cutoff::ordering(plan, keys)
-                    && let Some(binding) = sideways::beneath(plan, input, binding)
-                {
-                    cutoff.about(binding, op);
-                }
+                let _ = cutoff::arm(&cutoff, plan, input, keys);
                 let schema = below.schema.clone();
                 let (top, out) = TopN::new(plan, &schema, keys, count, offset, memory)?;
                 let top = top.telling(cutoff).in_session(self.session);
