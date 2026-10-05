@@ -117,7 +117,7 @@ mod zoned;
 pub use aggregate::{
     Accumulator, EXPORTED, NOWHERE, coded_run, finalize_name, finish_run, group_tally, holds_codes,
     ordered_layout, ordered_name, settle_extremes, state_constants, state_layout, update_general,
-    update_runs, update_scattered, update_shared_runs, update_shared_slots, update_tallied,
+    PlaceSums, update_runs, update_scattered, update_shared_runs, update_shared_slots, update_tallied,
     whole_answers,
 };
 pub use cast::{cast, cast_in_time_zone, cast_value, percentage, row_count};

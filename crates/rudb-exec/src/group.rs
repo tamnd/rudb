@@ -32,8 +32,8 @@ use rudb_common::{
 };
 use rudb_kernels::{
     Accumulator, NOWHERE, coded_run, finish_run, group_tally, holds_codes, is_true,
-    settle_extremes, update_general, update_runs, update_shared_runs, update_shared_slots,
-    update_tallied, whole_answers,
+    PlaceSums, settle_extremes, update_general, update_runs, update_shared_runs,
+    update_shared_slots, update_tallied, whole_answers,
 };
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
@@ -735,6 +735,10 @@ const RUN_BLOCK: usize = 64;
 /// [`slot_runs_of`] to cut a chunk into runs, which is where folding a run at once costs less than
 /// the pass that finds them.
 const RUN_ROWS: usize = 8;
+
+/// The most totals a chunk is added up into per combination of its key, a call's total and a row
+/// count for each, which is 128 kilobytes and inside the second level cache.
+const PLACE_CELLS: usize = 16_384;
 
 /// A bucket for a group at this slot with this hash, or an error when the partition is too large.
 fn bucket_for(slot: usize, hash: u64, what: &'static str) -> Result<u32> {
@@ -2637,6 +2641,7 @@ impl<'a> Aggregate<'a> {
             // group, which is the whole point of holding them here.
             coded_on: Vec::new(),
             coded_places: Vec::new(),
+            place_sums: PlaceSums::default(),
             coded_values: crate::table::Widened::default(),
             slot_runs: Vec::new(),
             coded_spent: 0,
@@ -2706,6 +2711,7 @@ impl<'a> Aggregate<'a> {
             walk,
             coded_on,
             coded_places,
+            place_sums,
             coded_values,
             slot_runs,
             coded_spent,
@@ -2815,6 +2821,28 @@ impl<'a> Aggregate<'a> {
             uncut = None;
         }
         let mut runs_found = false;
+        // Totals per combination rather than per group, for a chunk where every call that folds is
+        // a total or a count and nothing needs a row's slot. On q01 finding every row's slot, taking
+        // the dropped rows back out and looking for runs in what was left was half of the fold.
+        // A map wider than the chunk is not, since its every place is read once a chunk.
+        let offered = self
+            .calls
+            .iter()
+            .enumerate()
+            .filter(|&(at, call)| !self.by_vector[at] && call.folds())
+            .fold(0_u64, |offered, (at, _)| offered | one_call(at));
+        let by_place = !self.count_only
+            && !self.compact_numeric
+            && !self.sets
+            && offered != 0
+            && calls <= u64::BITS as usize
+            && self.calls.iter().enumerate().all(|(at, call)| {
+                self.by_vector[at] || !call.folds() || (!call.distinct && filters[at].is_none())
+            })
+            && direct.as_ref().is_some_and(|codes| {
+                codes.combos() <= *length && codes.combos().saturating_mul(calls + 1) <= PLACE_CELLS
+            });
+        let mut placed = false;
         if let Some(codes) = &direct {
             if !codes.same_as(coded_on) {
                 if codes.reads_values() {
@@ -2841,6 +2869,24 @@ impl<'a> Aggregate<'a> {
             // ordinary case once the first rows of a row group have been through. A key read by
             // value is not hashed as a chunk at all, since the rows that miss are a few dozen and
             // are hashed one at a time. `NOWHERE` is a row the group limit turned away.
+            // Asked before `resolve` below takes the states for itself.
+            let in_runs = codes.place_runs(*length, *length / RUN_ROWS, slot_runs);
+            let summed = !in_runs
+                && by_place
+                && {
+                    codes.places(*length, coded_places);
+                    let inputs: Vec<Option<&Vector>> =
+                        arguments.iter().map(|argument| argument.first()).collect();
+                    place_sums.add(
+                        states,
+                        calls,
+                        &inputs,
+                        offered,
+                        &coded_places[..*length],
+                        codes.combos(),
+                        uncut.map(|kept| kept.indices()),
+                    )
+                };
             let one_at_a_time = prehashed.is_none() && codes.by_value();
             let mut hashed = false;
             let mut resolve = |row: usize| -> Result<usize> {
@@ -2882,7 +2928,7 @@ impl<'a> Aggregate<'a> {
             // into are the ones the aggregates fold by below. On ClickBench 28 the pass that wrote
             // every row's place, the one that read the map with it and the one that found the runs
             // again in the slots were two fifths of the fold.
-            if codes.place_runs(*length, *length / RUN_ROWS, slot_runs) {
+            if in_runs {
                 let mut start = 0;
                 for run in slot_runs.iter_mut() {
                     let (place, end) = *run;
@@ -2902,6 +2948,30 @@ impl<'a> Aggregate<'a> {
                     start = end;
                 }
                 runs_found = true;
+            } else if summed
+            {
+                // Every call is a total or a count, so the chunk was added up per combination
+                // without a slot found for any row, and each combination is a group from here on.
+                // The rows that open one are only the first of each new combination.
+                let kept = uncut.map(|kept| kept.indices());
+                for place in place_sums.touched() {
+                    if coded_map[place] != crate::table::UNSEEN {
+                        continue;
+                    }
+                    let first = match kept {
+                        Some(kept) => kept
+                            .iter()
+                            .map(|&row| row as usize)
+                            .find(|&row| coded_places[row] == place),
+                        None => coded_places[..*length].iter().position(|&at| at == place),
+                    };
+                    if let Some(row) = first {
+                        let slot = resolve(row)?;
+                        coded_map.set(place, held_at(slot));
+                    }
+                }
+                place_sums.fold(states, calls, |place| slot_at(coded_map[place]))?;
+                placed = true;
             } else if codes.look_up(coded_map, *length, slots) != Some(false) {
                 // One pass that finds every row's slot straight out of the map when the key is one
                 // or two dictionary columns, which is the whole chunk once a row group's first rows
@@ -2937,6 +3007,12 @@ impl<'a> Aggregate<'a> {
             }
         } else {
             coded_on.clear();
+        }
+        if placed {
+            rows::capacity(table.owned(), charged_keys, scratch)?;
+            let now = tables(table, states, counts, compact, overflow, seen);
+            rows::capacity(now, charged, containers)?;
+            return self.spill_if_crowded(over, alone, closed, *groups);
         }
         // Runs found above leave the slots empty. See `fill_now` below.
         if !runs_found && slots.len() != *length {
@@ -3311,15 +3387,27 @@ impl<'a> Aggregate<'a> {
         containers.grow(aside)?;
         let now = tables(table, states, counts, compact, overflow, seen);
         rows::capacity(now, charged, containers)?;
-        // Asked after the chunk has been folded in and not before, so that a pass always takes at
-        // least one chunk of groups whatever the budget says. That is what makes the loop in
-        // `combine` finish: a pass that could spill from its first row would spill every row and
-        // hand back a file the same size as what it was given.
+        self.spill_if_crowded(over, alone, closed, *groups)
+    }
+
+    /// Opens the spill file once memory is short, the last thing [`Self::fold`] does with a chunk.
+    ///
+    /// Asked after the chunk has been folded in and not before, so that a pass always takes at
+    /// least one chunk of groups whatever the budget says. That is what makes the loop in
+    /// `combine` finish: a pass that could spill from its first row would spill every row and
+    /// hand back a file the same size as what it was given.
+    fn spill_if_crowded(
+        &self,
+        over: &mut Option<Spill>,
+        alone: bool,
+        closed: Option<(usize, usize)>,
+        groups: usize,
+    ) -> Result<()> {
         match over.as_ref() {
             None if !alone && closed.is_none() && crowded(&self.memory) => {
                 *over = Some(Spill::new("aggregate", self.spilled_types())?);
             }
-            Some(file) => hopeless(file, *groups)?,
+            Some(file) => hopeless(file, groups)?,
             None => {}
         }
         Ok(())
@@ -5773,6 +5861,9 @@ pub(crate) struct Building {
     coded_map: Places,
     /// Which combination each row of the last chunk is, worked out one key column at a time.
     coded_places: Vec<usize>,
+    /// The last chunk's totals per combination, when every call is a total or a count and the
+    /// chunk was folded by combination with no slot found per row. See [`PlaceSums`].
+    place_sums: PlaceSums,
     /// The values of each integer key column the map reads by value, widened, and their runs.
     coded_values: crate::table::Widened,
     /// The last chunk's slots cut into runs of one slot, each its slot and the row it ends before,
