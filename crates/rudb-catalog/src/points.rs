@@ -69,21 +69,66 @@ impl Hasher for Fold {
 type Map<K> = HashMap<K, u64, BuildHasherDefault<Fold>>;
 
 /// The row number of every key of one key of a table, at one placing of its rows.
+///
+/// The keys are held in levels, each behind an [`Arc`], so that the copy of a table a transaction
+/// takes shares them. An append notes its keys in the last level when nothing else holds it and in
+/// a level of its own when something does. It used to be one map, and the first append of every
+/// transaction found it shared with the committed table and dropped it, so the next lookup read
+/// the key of every row again to build it: a YCSB load in transactions of a thousand rows built
+/// it ten thousand times over ten million rows. A level is folded into the one before it whenever
+/// it grows to half that one's size, so a lookup looks through no more levels than the logarithm
+/// of the keys, and [`Self::settle`] puts them back into one once nothing else holds the first.
 #[derive(Debug)]
 pub(crate) struct Located {
     /// The placing of the rows this was built from.
     placed: u64,
     /// The key's columns, by place, in the order its keys are encoded in.
     columns: Vec<usize>,
-    /// The keys of one `INTEGER` or `BIGINT` column.
-    ints: Map<i64>,
-    /// Every other key, encoded.
-    bytes: Map<Box<[u8]>>,
+    /// The keys, oldest first. Never empty.
+    levels: Vec<Arc<Level>>,
     /// The number of the first row of each part, and after them the number of rows.
     starts: Vec<u64>,
     /// The keys in order, each with its row's number, built the first time a read of a range of
     /// keys asks.
     sorted: OnceLock<Sorted>,
+}
+
+/// One level of the keys of [`Located`].
+#[derive(Debug, Clone, Default)]
+struct Level {
+    /// The keys of one `INTEGER` or `BIGINT` column.
+    ints: Map<i64>,
+    /// Every other key, encoded.
+    bytes: Map<Box<[u8]>>,
+}
+
+impl Level {
+    fn len(&self) -> usize {
+        self.ints.len() + self.bytes.len()
+    }
+
+    fn find(&self, key: Encoded, scratch: &[u8]) -> Option<u64> {
+        match key {
+            Encoded::Null => None,
+            Encoded::Int(key) => self.ints.get(&key).copied(),
+            Encoded::Bytes => self.bytes.get(scratch).copied(),
+        }
+    }
+
+    /// Takes in the keys of `newer`, moving them when nothing else holds it. A key both hold is
+    /// `newer`'s.
+    fn take(&mut self, newer: Arc<Self>) {
+        match Arc::try_unwrap(newer) {
+            Ok(newer) => {
+                self.ints.extend(newer.ints);
+                self.bytes.extend(newer.bytes);
+            }
+            Err(newer) => {
+                self.ints.extend(newer.ints.iter().map(|(&key, &number)| (key, number)));
+                self.bytes.extend(newer.bytes.iter().map(|(key, &number)| (key.clone(), number)));
+            }
+        }
+    }
 }
 
 /// The keys of one column in order, each with its row's number.
@@ -122,34 +167,75 @@ impl Located {
     fn build(rows: &Rows, columns: &[usize], placed: u64) -> Result<Self> {
         let projected = Key { columns: (0..columns.len()).collect(), primary: false };
         let parts = rows.chunk_count();
-        let mut located = Self {
-            placed,
-            columns: columns.to_vec(),
-            ints: Map::default(),
-            bytes: Map::default(),
-            starts: Vec::with_capacity(parts + 1),
-            sorted: OnceLock::new(),
-        };
+        let mut level = Level::default();
+        let mut starts = Vec::with_capacity(parts + 1);
         let mut scratch = Vec::new();
         let mut number = 0_u64;
         for part in 0..parts {
-            located.starts.push(number);
+            starts.push(number);
             let chunk = rows.read(part, columns)?;
             for row in 0..chunk.len() {
                 match encode(&chunk, &projected, row, &mut scratch)? {
                     Encoded::Null => {}
                     Encoded::Int(key) => {
-                        located.ints.insert(key, number);
+                        level.ints.insert(key, number);
                     }
                     Encoded::Bytes => {
-                        located.bytes.insert(scratch.as_slice().into(), number);
+                        level.bytes.insert(scratch.as_slice().into(), number);
                     }
                 }
                 number += 1;
             }
         }
-        located.starts.push(number);
-        Ok(located)
+        starts.push(number);
+        Ok(Self {
+            placed,
+            columns: columns.to_vec(),
+            levels: vec![Arc::new(level)],
+            starts,
+            sorted: OnceLock::new(),
+        })
+    }
+
+    /// A copy that shares this one's levels, for a table that is about to note keys of its own
+    /// while something else holds this. The keys in order are left behind, and built again the
+    /// next time a read of a range asks.
+    fn layered(&self) -> Self {
+        Self {
+            placed: self.placed,
+            columns: self.columns.clone(),
+            levels: self.levels.clone(),
+            starts: self.starts.clone(),
+            sorted: OnceLock::new(),
+        }
+    }
+
+    /// Folds the last level into the one before it while it holds at least half as many keys,
+    /// which keeps each level at least twice the size of the one after it.
+    fn fold(&mut self) {
+        while let [.., before, last] = self.levels.as_slice()
+            && before.len() <= 2 * last.len()
+        {
+            let last = self.levels.pop().expect("two levels");
+            Arc::make_mut(self.levels.last_mut().expect("two levels")).take(last);
+        }
+    }
+
+    /// Puts every level into the first, when nothing else holds the first, which is when the copy
+    /// of the table that shared it is gone.
+    fn settle(&mut self) {
+        if self.levels.len() < 2 || Arc::get_mut(&mut self.levels[0]).is_none() {
+            return;
+        }
+        let rest = self.levels.split_off(1);
+        let first = Arc::get_mut(&mut self.levels[0]).expect("asked just above");
+        for level in rest {
+            first.take(level);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.levels.iter().map(|level| level.len()).sum()
     }
 
     /// Notes `keys`, the keys of the rows just appended after the first `before`, and works out
@@ -174,11 +260,17 @@ impl Located {
         // The keys in order stay in order for keys that come after every key there is, which is
         // how a table keyed by a counter grows, and are dropped for anything else.
         let mut sorted = self.sorted.get_mut();
+        let level = {
+            if !self.levels.last_mut().is_some_and(|level| Arc::get_mut(level).is_some()) {
+                self.levels.push(Arc::default());
+            }
+            Arc::get_mut(self.levels.last_mut().expect("just made sure")).expect("just made sure")
+        };
         for (key, number) in keys.into_iter().zip(before..) {
             match key {
                 Noted::Null => {}
                 Noted::Int(key) => {
-                    self.ints.insert(key, number);
+                    level.ints.insert(key, number);
                     match sorted.as_deref_mut() {
                         Some(Sorted::Ints(held))
                             if held.last().is_none_or(|&(last, _)| last < key) =>
@@ -199,33 +291,50 @@ impl Located {
                         (Some(_), _) => sorted = None,
                         (None, _) => {}
                     }
-                    self.bytes.insert(key, number);
+                    level.bytes.insert(key, number);
                 }
             }
         }
         if sorted.is_none() {
             self.sorted = OnceLock::new();
         }
+        self.fold();
         Ok(true)
     }
 
     /// The keys in order with their rows' numbers: the integer ones when there are any, and
     /// otherwise the text ones. A key of one column holds keys of only one of the two.
+    ///
+    /// A key two levels hold is the newer one's, which an append after a placing that kept the
+    /// rows never makes and which is kept right all the same.
     fn sorted(&self) -> &Sorted {
         self.sorted.get_or_init(|| {
-            if self.bytes.is_empty() {
-                let mut sorted: Vec<(i64, u64)> =
-                    self.ints.iter().map(|(&key, &number)| (key, number)).collect();
+            // Each key with how new its level is, newest first among equal keys, so the first of
+            // a run of equal keys is the one kept.
+            let newest = |at: usize| usize::MAX - at;
+            if self.levels.iter().all(|level| level.bytes.is_empty()) {
+                let mut sorted: Vec<(i64, usize, u64)> = Vec::with_capacity(self.len());
+                for (at, level) in self.levels.iter().enumerate() {
+                    sorted
+                        .extend(level.ints.iter().map(|(&key, &number)| (key, newest(at), number)));
+                }
                 sorted.sort_unstable();
-                return Sorted::Ints(sorted);
+                sorted.dedup_by_key(|&mut (key, _, _)| key);
+                return Sorted::Ints(
+                    sorted.into_iter().map(|(key, _, number)| (key, number)).collect(),
+                );
             }
-            let mut sorted: Vec<(Box<[u8]>, u64)> = self
-                .bytes
-                .iter()
-                .filter_map(|(key, &number)| Some((text_of(key)?.into(), number)))
-                .collect();
+            let mut sorted: Vec<(Box<[u8]>, usize, u64)> = Vec::with_capacity(self.len());
+            for (at, level) in self.levels.iter().enumerate() {
+                sorted.extend(
+                    level.bytes.iter().filter_map(|(key, &number)| {
+                        Some((text_of(key)?.into(), newest(at), number))
+                    }),
+                );
+            }
             sorted.sort_unstable();
-            Sorted::Text(sorted)
+            sorted.dedup_by(|later, first| later.0 == first.0);
+            Sorted::Text(sorted.into_iter().map(|(key, _, number)| (key, number)).collect())
         })
     }
 
@@ -238,11 +347,7 @@ impl Located {
 
     /// The part and the place in it of the row holding `key`, and its number, if one does.
     fn find(&self, key: Encoded, scratch: &[u8]) -> Option<(usize, u32, u64)> {
-        let number = match key {
-            Encoded::Null => return None,
-            Encoded::Int(key) => *self.ints.get(&key)?,
-            Encoded::Bytes => *self.bytes.get(scratch)?,
-        };
+        let number = self.levels.iter().rev().find_map(|level| level.find(key, scratch))?;
         let (part, place) = self.place(number)?;
         Some((part, place, number))
     }
@@ -507,14 +612,22 @@ impl Points {
     /// many rows there were and `from` the first part the append can have changed.
     ///
     /// What is built for a key that copies of the table share, because a transaction holds one, is
-    /// dropped rather than written, and so is anything that does not come out right.
+    /// copied first, which shares its keys and adds a level of its own (see [`Located`]). Anything
+    /// that does not come out right is dropped.
     pub(crate) fn appended(&mut self, appending: Appending, rows: &Rows, before: u64, from: usize) {
         self.again.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
         let mut appending = appending.0.into_iter().peekable();
         for (which, slot) in self.built.iter_mut().enumerate() {
             let keys = appending.next_if(|(at, _)| *at == which).map(|(_, keys)| keys);
-            let kept = match (slot.get_mut().and_then(Arc::get_mut), keys) {
+            let kept = match (slot.get_mut(), keys) {
                 (Some(located), Some(keys)) => {
+                    let located = match Arc::get_mut(located) {
+                        Some(located) => located,
+                        None => {
+                            *located = Arc::new(located.layered());
+                            Arc::get_mut(located).expect("just made")
+                        }
+                    };
                     located.extend(rows, before, from, keys).unwrap_or(false)
                 }
                 _ => false,
@@ -526,6 +639,16 @@ impl Points {
         // Whatever a lookup found wrong is gone with what it was found in.
         if self.built.iter().all(|slot| slot.get().is_none()) {
             *self.stale.get_mut() = false;
+        }
+    }
+
+    /// Puts the levels of what is built back into one where nothing else holds the first, which is
+    /// after the transaction whose copy shared them is done.
+    pub(crate) fn settle(&mut self) {
+        for slot in &mut self.built {
+            if let Some(located) = slot.get_mut().and_then(Arc::get_mut) {
+                located.settle();
+            }
         }
     }
 
