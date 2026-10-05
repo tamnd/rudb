@@ -502,6 +502,142 @@ pub fn decode_flat_at(bytes: &[u8], positions: &[u32]) -> Result<Flat> {
     Ok(flat)
 }
 
+/// A compressed chunk read once for the reads of a few of its values that come after, with its
+/// symbol table parsed and where each of its runs starts.
+///
+/// [`decode_flat_at`] parses the table and decodes the whole length array on every call, which is
+/// what one value of the chunk costs as well. On a point read of a YCSB table that was nearly all
+/// of the read: 1.4 million instructions to fetch eleven values, most of them in the lengths of
+/// runs the read never looked at. Kept, a value is one run decompressed.
+///
+/// Where a run starts is kept as a mark every [`RUNS_PER_MARK`] runs and a byte for each run,
+/// when every run is shorter than 256 bytes, and as a start for each run when one is not. A value
+/// costs at most that many bytes added up, and the index costs a little over a byte a value.
+#[derive(Debug)]
+pub struct Runs {
+    table: SymbolTable,
+    /// Where the payload starts in the chunk, and how long it is.
+    payload: usize,
+    len: usize,
+    count: usize,
+    starts: Starts,
+}
+
+#[derive(Debug)]
+enum Starts {
+    /// Where every [`RUNS_PER_MARK`]th run starts in the payload, and every run's length.
+    Marked { marks: Vec<u32>, lengths: Vec<u8> },
+    /// Where every run starts in the payload, and where the last one ends.
+    Whole(Vec<u32>),
+}
+
+/// How many runs one mark of [`Runs`] covers.
+const RUNS_PER_MARK: usize = 32;
+
+impl Runs {
+    /// The index of a chunk written by [`encode`], or `None` when it is not compressed, which is
+    /// when [`pointed`] says no.
+    ///
+    /// # Errors
+    ///
+    /// If the chunk is compressed and does not read back.
+    pub fn of(bytes: &[u8]) -> Result<Option<Self>> {
+        if !pointed(bytes) {
+            return Ok(None);
+        }
+        let mut reader = Reader::new(bytes);
+        reader.u8()?;
+        let count = reader.u32()? as usize;
+        let runs = read_compressed(&mut reader, count)?;
+        if reader.remaining() != 0 {
+            return Err(Error::internal(format!(
+                "{} bytes left over after decoding a string chunk",
+                reader.remaining()
+            )));
+        }
+        let len = runs.payload.len();
+        let payload = bytes.len() - len;
+        u32::try_from(len).map_err(|_| Error::internal("a compressed chunk past 4 GB"))?;
+        let starts = if runs.lengths.iter().all(|&length| length < 256) {
+            let mut marks = Vec::with_capacity(count.div_ceil(RUNS_PER_MARK));
+            let mut at = 0;
+            for (run, &length) in runs.lengths.iter().enumerate() {
+                if run % RUNS_PER_MARK == 0 {
+                    marks.push(at as u32);
+                }
+                at += length;
+            }
+            Starts::Marked {
+                marks,
+                lengths: runs.lengths.iter().map(|&length| length as u8).collect(),
+            }
+        } else {
+            let mut starts = Vec::with_capacity(count + 1);
+            let mut at = 0;
+            for &length in &runs.lengths {
+                starts.push(at as u32);
+                at += length;
+            }
+            starts.push(at as u32);
+            Starts::Whole(starts)
+        };
+        Ok(Some(Self { table: runs.table, payload, len, count, starts }))
+    }
+
+    /// The values at `positions`, which rise, of the chunk this was read from.
+    ///
+    /// # Errors
+    ///
+    /// If the positions do not rise, if one is past the end of the chunk, if `bytes` is shorter
+    /// than the chunk was, or if a run does not decompress.
+    pub fn decode_at(&self, bytes: &[u8], positions: &[u32]) -> Result<Flat> {
+        if positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Error::internal("the positions to decode do not rise"));
+        }
+        let payload = bytes
+            .get(self.payload..self.payload + self.len)
+            .ok_or_else(|| Error::internal("a compressed chunk is shorter than its index"))?;
+        let mut flat = Flat::with_capacity(positions.len(), 0);
+        for &position in positions {
+            let position = position as usize;
+            if position >= self.count {
+                return Err(Error::internal(format!("value {position} is not in the chunk")));
+            }
+            let (start, end) = match &self.starts {
+                Starts::Marked { marks, lengths } => {
+                    let mark = position / RUNS_PER_MARK;
+                    let start = marks[mark] as usize
+                        + lengths[mark * RUNS_PER_MARK..position]
+                            .iter()
+                            .map(|&length| usize::from(length))
+                            .sum::<usize>();
+                    (start, start + usize::from(lengths[position]))
+                }
+                Starts::Whole(starts) => (starts[position] as usize, starts[position + 1] as usize),
+            };
+            let run = payload
+                .get(start..end)
+                .ok_or_else(|| Error::internal("a compressed run is past the end of its chunk"))?;
+            self.table.decompress(run, &mut flat.bytes)?;
+            flat.ends.push(flat.bytes.len());
+        }
+        Ok(flat)
+    }
+
+    /// The bytes this holds, which is what keeping it costs.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        // The symbols and the decode table, see [`SymbolTable`].
+        const TABLE: usize = 256 * 16 + 256 * 9;
+        std::mem::size_of::<Self>()
+            + TABLE
+            + match &self.starts {
+                Starts::Marked { marks, lengths } => marks.len() * 4 + lengths.len(),
+                Starts::Whole(starts) => starts.len() * 4,
+            }
+    }
+}
+
 /// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
 ///
 /// A column group holds one of these per column, and the decoder on that side cannot know where
@@ -1527,6 +1663,40 @@ mod tests {
         }
         let fsst = encode_only(Kind::Fsst, &refs).expect("encoded").expect("compressible");
         assert_eq!(decode_flat_at(&fsst, &positions).expect("decoded").into_values(), wanted);
+    }
+
+    /// A compressed chunk read into its runs once gives back at any positions what decoding it
+    /// there gives, with runs short enough for a byte each and with runs that are not, and a chunk
+    /// of any other kind has no runs to read.
+    #[test]
+    fn the_runs_of_a_chunk_read_once_give_the_values_a_decode_at_positions_does() {
+        let short = urls(1000);
+        let long: Vec<Vec<u8>> = short
+            .iter()
+            .enumerate()
+            .map(|(at, url)| if at % 7 == 3 { url.repeat(40) } else { url.clone() })
+            .collect();
+        for values in [short, long] {
+            let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+            let fsst = encode_only(Kind::Fsst, &refs).expect("encoded").expect("compressible");
+            let runs = Runs::of(&fsst).expect("read").expect("compressed");
+            assert!(runs.footprint() > values.len());
+            for positions in [vec![0_u32], vec![31, 32, 33], vec![3, 500, 998, 999], vec![]] {
+                assert_eq!(
+                    runs.decode_at(&fsst, &positions).expect("decoded").into_values(),
+                    decode_flat_at(&fsst, &positions).expect("decoded").into_values(),
+                );
+            }
+            let every: Vec<u32> = (0..1000).collect();
+            assert_eq!(runs.decode_at(&fsst, &every).expect("decoded").into_values(), values);
+            assert!(runs.decode_at(&fsst, &[4, 3]).is_err());
+            assert!(runs.decode_at(&fsst, &[1000]).is_err());
+            assert!(runs.decode_at(&fsst[..fsst.len() - 1], &[0]).is_err());
+            for kind in offered(&refs) {
+                let Some(encoded) = encode_only(kind, &refs).expect("encoded") else { continue };
+                assert_eq!(Runs::of(&encoded).expect("read").is_some(), kind == Kind::Fsst);
+            }
+        }
     }
 
     /// An equality on the codes picks out the values a compare of the strings would, through a
