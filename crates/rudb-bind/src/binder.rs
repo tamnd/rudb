@@ -5565,11 +5565,76 @@ fn named_once(scope: &Scope) -> Result<()> {
 
 /// The one type a column of a set operation comes out as, given what each side wrote.
 fn meet(left: &LogicalType, right: &LogicalType) -> Result<LogicalType> {
-    left.promote(right).ok_or_else(|| {
+    forced(left, right).ok_or_else(|| {
         Error::binder(format!(
             "Cannot combine a column of type {left} with a column of type {right} in a set operation"
         ))
     })
+}
+
+/// The type two columns of a set operation are brought to, which is the pin's `ForceMaxLogicalType`.
+///
+/// Two types with a type in common meet there. Two without one are forced to the one the pin ranks
+/// higher, or the left one when they rank the same, and a row of the other side then fails its
+/// cast. So `SELECT 1 UNION ALL SELECT 'a'` is a `VARCHAR`, `SELECT 1 UNION ALL SELECT DATE
+/// '2020-01-01'` is a `DATE` whose first row fails to cast, and a side with no rows or only nulls
+/// never notices. Lists, maps and structs are forced child by child, an enum is forced as the
+/// string it reads as and `JSON` is kept whatever the other side is, all of which was measured on
+/// every pair of types the pin has a value of.
+fn forced(left: &LogicalType, right: &LogicalType) -> Option<LogicalType> {
+    if let Some(met) = left.promote(right) {
+        return Some(met);
+    }
+    Some(match (left, right) {
+        (LogicalType::Json, _) | (_, LogicalType::Json) => LogicalType::Json,
+        (LogicalType::Enum(_), other) => return forced(&LogicalType::Varchar, other),
+        (other, LogicalType::Enum(_)) => return forced(other, &LogicalType::Varchar),
+        (LogicalType::List(one), LogicalType::List(other)) => {
+            LogicalType::list(forced(one, other)?)
+        }
+        (LogicalType::Array(one, size), LogicalType::Array(other, length)) => {
+            LogicalType::array(forced(one, other)?, *size.max(length))
+        }
+        (LogicalType::Map(key, value), LogicalType::Map(other_key, other_value)) => {
+            LogicalType::map(forced(key, other_key)?, forced(value, other_value)?)
+        }
+        (LogicalType::Struct(one), LogicalType::Struct(other)) => {
+            forced_struct(one, other).map_or_else(|| left.clone(), LogicalType::Struct)
+        }
+        (LogicalType::Union(_) | LogicalType::AggregateState(_) | LogicalType::Type, _)
+        | (_, LogicalType::Union(_) | LogicalType::AggregateState(_) | LogicalType::Type) => {
+            return None;
+        }
+        _ => crate::expr::forced_type(left, right),
+    })
+}
+
+/// Two structs forced to one, field by field, the way [`LogicalType::promote`] meets them.
+///
+/// Named structs are matched by name and keep every field either has. An unnamed struct is matched
+/// by position and takes the other side's names, and when the two are not the same size there is
+/// no answer, which leaves the left side's type for the right side to fail its cast to, in the
+/// pin's words.
+fn forced_struct(left: &[Field], right: &[Field]) -> Option<Vec<Field>> {
+    if Field::unnamed(left) || Field::unnamed(right) {
+        if left.len() != right.len() {
+            return None;
+        }
+        let named = if Field::unnamed(left) { right } else { left };
+        let mut fields = Vec::with_capacity(left.len());
+        for ((one, other), name) in left.iter().zip(right).zip(named) {
+            fields.push(Field::new(name.name.clone(), forced(&one.ty, &other.ty)?));
+        }
+        return Some(fields);
+    }
+    let mut fields = left.to_vec();
+    for field in right {
+        match fields.iter_mut().find(|one| one.name.eq_ignore_ascii_case(&field.name)) {
+            Some(one) => one.ty = forced(&one.ty, &field.ty)?,
+            None => fields.push(field.clone()),
+        }
+    }
+    Some(fields)
 }
 
 /// DuckDB's complaint about a named parameter that was given a null, which is a different sentence

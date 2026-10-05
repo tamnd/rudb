@@ -3091,7 +3091,7 @@ fn comparison_type(left: &LogicalType, right: &LogicalType) -> Option<LogicalTyp
 /// `1 = DATE '2020-01-01'` fails to cast the number to a date, and `TIME '12:00' = TIMETZ
 /// '12:00:00+00'` reads the zoned time as a time and is true, while the same two the other way
 /// round read the time in the session zone and are false in New York. All measured.
-fn forced_type(left: &LogicalType, right: &LogicalType) -> LogicalType {
+pub(crate) fn forced_type(left: &LogicalType, right: &LogicalType) -> LogicalType {
     if rank(left) < rank(right) { right.clone() } else { left.clone() }
 }
 
