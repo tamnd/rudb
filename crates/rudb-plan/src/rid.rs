@@ -251,6 +251,7 @@ mod tests {
     use rudb_common::{Field, LogicalType, Value};
 
     use super::{Carried, rids_of};
+    use crate::Slice;
     use crate::expr::{ColumnBinding, Expr};
     use crate::node::{
         Bound, BuildSide, JoinKind, Node, SetOpKind, Share, WindowBound, WindowExclude,
@@ -519,6 +520,32 @@ mod tests {
             plan.add_node(Node::SetOp { left, right, kind: SetOpKind::Union, all: true, index: 2 });
         plan.set_root(node);
         assert!(root(&plan).is_empty(), "two tables' rows under one schema are neither table's");
+    }
+
+    #[test]
+    fn a_recursive_definition_carries_nothing() {
+        // The rows are the anchor's and every round's together, and a round's rows can be made of
+        // the round before, so none of them is a row of either table it read.
+        let mut plan = Plan::new();
+        let anchor = scan(&mut plan, 0);
+        let recursive = scan(&mut plan, 1);
+        let name = plan.intern("x");
+        let columns = plan.add_fields(&[Field::new("a", LogicalType::Integer)]);
+        let node = plan.add_node(Node::RecursiveCte {
+            anchor,
+            recursive,
+            index: 2,
+            cte: 0,
+            name,
+            all: true,
+            columns,
+            recurring: 1,
+            key: Slice::EMPTY,
+            aggregates: Slice::EMPTY,
+            folds: Slice::EMPTY,
+        });
+        plan.set_root(node);
+        assert!(root(&plan).is_empty());
     }
 
     #[test]
