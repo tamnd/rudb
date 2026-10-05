@@ -2229,7 +2229,7 @@ mod tests {
         for &key in &held {
             words[key as usize / 64] |= 1 << (key % 64);
         }
-        let domain = Domain::from_words(words);
+        let domain = super::Domain::from_words(words);
         let by_bit = |values: &[i64]| -> Vec<u32> {
             (0..values.len())
                 .filter(|&row| domain.holds(values[row]))
@@ -2264,7 +2264,7 @@ mod tests {
         let dense: Vec<i64> = (0..4_000).map(|row| row / 2).collect();
         let mut words = vec![u64::MAX; 10_000_usize.div_ceil(64)];
         words[0] = 0b1010;
-        let every = Domain::from_words(words);
+        let every = super::Domain::from_words(words);
         assert!(every.over_sorted(&dense, 0).is_none(), "a stretch where most keys are held");
         let narrow: Vec<i32> = (0..2_000).map(|row| 4_000 + row / 4).collect();
         let narrow_keys = column(&narrow.iter().map(|&key| Some(key)).collect::<Vec<_>>());
