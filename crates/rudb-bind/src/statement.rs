@@ -1151,6 +1151,21 @@ pub(crate) fn read_type(catalog: &Catalog, text: &str) -> Result<LogicalType> {
     written_type(catalog, text).map(|(ty, _)| ty)
 }
 
+/// [`read_type`] in a session. A PostgreSQL session reads `oid` and `"char"` as PostgreSQL does,
+/// and not as DuckDB does.
+pub(crate) fn session_type(
+    catalog: &Catalog,
+    session: &Session,
+    text: &str,
+) -> Result<LogicalType> {
+    if session.postgres().is_some()
+        && let Some(ty) = rudb_pgtypes::declared_type(text).and_then(rudb_pgtypes::session_type)
+    {
+        return Ok(ty);
+    }
+    read_type(catalog, text)
+}
+
 fn finish(binder: Binder<'_>, root: rudb_plan::NodeRef) -> Result<Plan> {
     let mut plan = binder.into_plan();
     plan.set_root(root);
@@ -1192,7 +1207,7 @@ fn create_table(
                     ast.string(def.name)
                 )));
             }
-            let ty = read_type(catalog, text)?;
+            let ty = session_type(catalog, session, text)?;
             if ty == LogicalType::Type {
                 return Err(Error::invalid_input("A table cannot be created with a 'TYPE' column"));
             }
@@ -1614,7 +1629,7 @@ fn alter(
             if quiet && place(column.name).is_some() {
                 return nothing(Some(name));
             }
-            let ty = read_type(catalog, ast.string(column.ty))?;
+            let ty = session_type(catalog, session, ast.string(column.ty))?;
             let declared = pg_declared(ast.string(column.ty), &ty);
             let field = Field {
                 not_null: column.not_null,
@@ -1716,8 +1731,11 @@ fn alter(
                     "Cannot change the type of a column that has a FOREIGN KEY constraint specified",
                 ));
             }
-            let mut target =
-                if ty == NONE { None } else { Some(read_type(catalog, ast.string(ty))?) };
+            let mut target = if ty == NONE {
+                None
+            } else {
+                Some(session_type(catalog, session, ast.string(ty))?)
+            };
             rewrite = Some(table_rewrite(
                 ast,
                 (catalog, parameters, session),
@@ -2639,6 +2657,15 @@ fn insert(
         // this statement knows, so the `VALUES` right under it is told.
         if matches!(ast.query(written.source).body, ast::QueryBody::Values(_)) {
             binder.insert_defaults = Some(targets.iter().map(|&at| defaults[at].clone()).collect());
+            if session.postgres().is_some() {
+                let oid = |at: usize| {
+                    target.declared_type(at).map_or_else(
+                        || rudb_pgtypes::pg_type(&fields[at].ty).oid,
+                        |declared| declared.oid,
+                    )
+                };
+                binder.insert_inputs = Some(targets.iter().map(|&at| oid(at)).collect());
+            }
         }
         // A `COPY t FROM 'file'` reads the file as the columns it lands in, the way DuckDB does,
         // so a value that does not fit is the reader's conversion error on its line rather than a

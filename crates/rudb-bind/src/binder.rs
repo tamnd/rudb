@@ -373,6 +373,9 @@ pub(crate) struct Binder<'a> {
     /// The type and the default of each column an `INSERT` writes, handed to the `VALUES` right
     /// under it so that a `DEFAULT` item there can be the default of the column it lands in.
     pub(crate) insert_defaults: Option<Vec<(LogicalType, Option<String>)>>,
+    /// The PostgreSQL type of each column an `INSERT` writes, in a PostgreSQL session, so that a
+    /// string literal in the `VALUES` right under it is read by the input function of that type.
+    pub(crate) insert_inputs: Option<Vec<u32>>,
     /// The columns a `COPY t FROM` loads, in the order the file holds them, handed to the
     /// `read_csv` the statement was rewritten into so that the file is read as the table's types
     /// under the table's names rather than as whatever the sniffer guessed.
@@ -518,6 +521,7 @@ impl<'a> Binder<'a> {
             want_ascending: false,
             upsert: false,
             insert_defaults: None,
+            insert_inputs: None,
             copy_into: None,
             default_as_null: false,
             in_aggregate: false,
@@ -1393,6 +1397,7 @@ impl<'a> Binder<'a> {
         // A row of a `VALUES` cannot see a column, because there is nothing under it to see.
         let empty = Scope::empty();
         let defaults = self.insert_defaults.take();
+        let inputs = self.insert_inputs.take().unwrap_or_default();
         let previous = std::mem::replace(&mut self.clause, "VALUES clause");
         let mut bound: Vec<Vec<ExprRef>> = Vec::with_capacity(written.len());
         for row in &written {
@@ -1403,7 +1408,10 @@ impl<'a> Binder<'a> {
                     (ast::Expr::Default, Some((ty, default))) => {
                         self.bind_default(default.as_deref(), ty)?
                     }
-                    _ => self.bind_expr(ast, expr, &empty)?,
+                    _ => match inputs.get(at).and_then(|&oid| self.read_literal(ast, expr, oid)) {
+                        Some(value) => value?,
+                        None => self.bind_expr(ast, expr, &empty)?,
+                    },
                 });
             }
             bound.push(items);

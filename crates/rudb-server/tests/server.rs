@@ -359,6 +359,24 @@ fn a_string_literal_in_a_cast_uses_the_input_function_of_the_type() {
     assert_eq!(message.as_deref(), Some("date/time field value out of range: \"2020-02-30\""));
     let messages = client.query("select '99999'::int2");
     assert_eq!(messages[0].field(b'C').as_deref(), Some("22003"));
+
+    // `oid` and `"char"` are the PostgreSQL types, and not the DuckDB types of the same names.
+    let messages = client.query("select 4294967295::oid, '\\101'::\"char\"");
+    let shape = row_shape(&messages[0]);
+    assert_eq!((shape[0].1, shape[1].1), (26, 18));
+    assert_eq!(data_row(&messages[1]), [Some(b"4294967295".to_vec()), Some(b"A".to_vec())]);
+
+    // A string literal in the `VALUES` of an `INSERT` is read by the type of its column.
+    client.query("create table typed (a oid, b \"char\", d date, x bytea)");
+    let messages = client.query("insert into typed values ('8', 'z', 'infinity', '\\x01ff')");
+    assert_eq!(tags(&messages), "CZ");
+    let messages = client.query("select * from typed");
+    let row = data_row(&messages[1]);
+    let row: Vec<_> = row.iter().map(|v| String::from_utf8(v.clone().unwrap()).unwrap()).collect();
+    assert_eq!(row, ["8", "z", "infinity", "\\x01ff"]);
+    let messages = client.query("insert into typed (d) values ('2020-02-30')");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("22008"));
+    assert_eq!(messages[0].field(b'P').as_deref(), Some("31"));
     server.stop().unwrap();
 }
 

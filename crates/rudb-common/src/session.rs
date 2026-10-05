@@ -60,8 +60,9 @@ pub struct Postgres {
 /// Reads the text of a literal such as `'infinity'::date` with the input function of the type, as
 /// PostgreSQL does, and not with the cast of the engine.
 pub trait LiteralInput: Send + Sync + std::fmt::Debug {
-    /// The value of `text` as `ty`, or `None` when `ty` has no input function here.
-    fn read(&self, ty: &LogicalType, text: &str) -> Option<crate::Result<Value>>;
+    /// The value of `text` as the PostgreSQL type `oid`, or `None` when the type has no input
+    /// function here.
+    fn read(&self, oid: u32, text: &str) -> Option<crate::Result<Value>>;
 }
 
 /// The PostgreSQL session, if there is one, compared by identity. A new copy is a new value, so a

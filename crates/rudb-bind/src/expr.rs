@@ -257,16 +257,14 @@ impl Binder<'_> {
                 }
             }
             ast::Expr::Cast { operand, ty, try_cast } => {
-                let target = crate::statement::read_type(self.catalog(), ast.string(ty))?;
-                // A PostgreSQL session reads a string literal with the input function of the type.
                 let session = self.session;
+                let written = ast.string(ty);
+                let target = crate::statement::session_type(self.catalog(), session, written)?;
                 if !try_cast
-                    && let ast::Expr::Literal { kind: LiteralKind::String, text } =
-                        ast.expr(operand)
-                    && let Some(input) = session.postgres().and_then(|pg| pg.input.as_ref())
-                    && let Some(value) = input.read(&target, ast.string(text))
+                    && let Some(declared) = rudb_pgtypes::declared_type(written)
+                    && let Some(value) = self.read_literal(ast, operand, declared.oid)
                 {
-                    return Ok(self.add_constant(value?));
+                    return self.checked_cast_to(value?, &target, false);
                 }
                 let input = self.bind_expr(ast, operand, scope)?;
                 self.checked_cast_to(input, &target, try_cast)
@@ -693,6 +691,26 @@ impl Binder<'_> {
             correlations.push(binding);
         }
         Ok(self.add_expr(Expr::Column(binding), ty))
+    }
+
+    /// A string literal read by the input function of the PostgreSQL type `oid`, as a PostgreSQL
+    /// session reads it in a cast and in a `VALUES` row of an `INSERT`. `None` when `expr` is not
+    /// a string literal, when the session is not a PostgreSQL session, or when the type has no
+    /// input function here.
+    pub(crate) fn read_literal(
+        &mut self,
+        ast: &Ast,
+        expr: ast::ExprRef,
+        oid: u32,
+    ) -> Option<Result<ExprRef>> {
+        let ast::Expr::Literal { kind: LiteralKind::String, text } = ast.expr(expr) else {
+            return None;
+        };
+        let session = self.session;
+        let input = session.postgres()?.input.as_ref()?;
+        let value = input.read(oid, ast.string(text))?;
+        let span = ast.expr_span(expr);
+        Some(value.map(|value| self.add_constant(value)).map_err(|e| e.with_fallback_span(span)))
     }
 
     fn bind_literal(&mut self, ast: &Ast, kind: LiteralKind, text: ast::StrRef) -> Result<ExprRef> {
