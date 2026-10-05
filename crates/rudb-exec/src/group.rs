@@ -31,9 +31,9 @@ use rudb_common::{
     stage,
 };
 use rudb_kernels::{
-    Accumulator, NOWHERE, coded_run, finish_run, group_tally, holds_codes, is_true,
-    PlaceSums, settle_extremes, update_general, update_runs, update_shared_runs,
-    update_shared_slots, update_tallied, whole_answers,
+    Accumulator, NOWHERE, PlaceSums, coded_run, finish_run, group_tally, holds_codes, is_true,
+    settle_extremes, update_general, update_runs, update_shared_runs, update_shared_slots,
+    update_tallied, whole_answers,
 };
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
@@ -2937,8 +2937,7 @@ impl<'a> Aggregate<'a> {
                     start = end;
                 }
                 runs_found = true;
-            } else if summed
-            {
+            } else if summed {
                 // Every call is a total or a count, so each row's totals go straight into the group
                 // the map holds for it, and no row's slot is written down. A row whose combination
                 // has no group yet stops the pass, and it goes on from that row once one is open.

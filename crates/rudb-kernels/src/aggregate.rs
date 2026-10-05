@@ -6181,7 +6181,8 @@ mod tests {
         assert_eq!(asked, 1);
         sums.fold(&mut by_place, stride).expect("folds them in");
         for at in elsewhere {
-            update_scattered(&mut by_place, &slots, stride, at, inputs[at], rows).expect("folds it");
+            update_scattered(&mut by_place, &slots, stride, at, inputs[at], rows)
+                .expect("folds it");
         }
         for group in 0..groups {
             for (at, &(name, _, _)) in calls.iter().enumerate() {
