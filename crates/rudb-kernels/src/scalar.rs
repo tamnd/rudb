@@ -3047,7 +3047,10 @@ fn like_joined<'a>(
     if matches!(base, Validity::AllInvalid) {
         return Ok(None);
     }
-    let mut joined = Vec::new();
+    // Sized once, because growing it as it went copied what was already joined every time it
+    // doubled, and for the people a JOB 6d chunk names that was as much again as the join itself.
+    let total = (0..rows).map(|index| text(index).map(<[u8]>::len)).sum::<Result<usize>>()?;
+    let mut joined = Vec::with_capacity(total);
     let mut ends = Vec::with_capacity(rows);
     for index in 0..rows {
         joined.extend_from_slice(text(index)?);
