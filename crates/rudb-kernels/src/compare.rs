@@ -483,31 +483,8 @@ fn packed_kept(
     right: &Vector,
     rows: Option<&[u32]>,
 ) -> Option<Selection> {
-    if op.is_total() || left.logical_type() != right.logical_type() {
-        return None;
-    }
-    let (one, other) = (left.packed_parts()?, right.packed_parts()?);
-    if one.width() > 61 || other.width() > 61 {
-        return None;
-    }
-    if one.ceiling() < other.base() || other.ceiling() < one.base() {
-        return None;
-    }
-    // A row holds when `one.base() + a op other.base() + b`, which is `a op b + shift`.
-    let shift = i64::try_from(other.base() - one.base()).ok()?;
-    if shift.unsigned_abs() > 1 << 61 {
-        return None;
-    }
+    let (one, other, shift, test) = packed_pair(op, left, right)?;
     let len = left.len();
-    let test = match op {
-        Comparison::Equal => Against::Equal,
-        Comparison::NotEqual => Against::NotEqual,
-        Comparison::Less => Against::Less,
-        Comparison::LessOrEqual => Against::LessOrEqual,
-        Comparison::Greater => Against::Greater,
-        Comparison::GreaterOrEqual => Against::GreaterOrEqual,
-        Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
-    };
     // Two rows a block or fewer: a block in lanes is sixteen groups of eight codes, and two codes
     // read one at a time are well under that.
     if let Some(rows) = rows
@@ -529,14 +506,89 @@ fn packed_kept(
             words[row as usize / 64] |= 1 << (row % 64);
         }
     }
-    one.against_words(&other, shift, test, &mut words, rows.is_none());
+    let kept = against_kept(&one, &other, shift, test, len, &mut words, rows.is_none());
+    Some(mask_selection(&words, kept))
+}
+
+/// The two packed sides of a comparison [`packed_kept`] and [`mask_against`] answer, the difference
+/// of their bases to add to the right one, and the test, or `None` when they cannot.
+fn packed_pair<'a>(
+    op: Comparison,
+    left: &'a Vector,
+    right: &'a Vector,
+) -> Option<(Packed<'a>, Packed<'a>, i64, Against)> {
+    if op.is_total() || left.logical_type() != right.logical_type() {
+        return None;
+    }
+    let (one, other) = (left.packed_parts()?, right.packed_parts()?);
+    if one.width() > 61 || other.width() > 61 {
+        return None;
+    }
+    if one.ceiling() < other.base() || other.ceiling() < one.base() {
+        return None;
+    }
+    // A row holds when `one.base() + a op other.base() + b`, which is `a op b + shift`.
+    let shift = i64::try_from(other.base() - one.base()).ok()?;
+    if shift.unsigned_abs() > 1 << 61 {
+        return None;
+    }
+    let test = match op {
+        Comparison::Equal => Against::Equal,
+        Comparison::NotEqual => Against::NotEqual,
+        Comparison::Less => Against::Less,
+        Comparison::LessOrEqual => Against::LessOrEqual,
+        Comparison::Greater => Against::Greater,
+        Comparison::GreaterOrEqual => Against::GreaterOrEqual,
+        Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
+    };
+    Some((one, other, shift, test))
+}
+
+/// [`Packed::against_words`] over the words of a chunk of `len` rows, with the bits past the last
+/// row cleared, and how many rows are set after.
+fn against_kept(
+    one: &Packed<'_>,
+    other: &Packed<'_>,
+    shift: i64,
+    test: Against,
+    len: usize,
+    words: &mut [u64],
+    fresh: bool,
+) -> usize {
+    one.against_words(other, shift, test, words, fresh);
     if len % 64 != 0
         && let Some(last) = words.last_mut()
     {
         *last &= (1 << (len % 64)) - 1;
     }
-    let kept = words.iter().map(|word| word.count_ones() as usize).sum();
-    Some(mask_selection(&words, kept))
+    words.iter().map(|word| word.count_ones() as usize).sum()
+}
+
+/// Narrows `words`, a bit a row, to the rows where `left` stands in `op` to `right`, two columns of
+/// the same chunk, and says how many rows are left.
+///
+/// [`mask_within`] for a comparison of two columns rather than of one column with literals, so that
+/// `l_commitdate < l_receiptdate` and `l_shipdate < l_commitdate` in q12 narrow the mask the range
+/// on `l_receiptdate` wrote, and the rows come out of the mask once at the end rather than once
+/// after every conjunct. `fresh` is as there. `None` for either side with nulls, `words` of the
+/// wrong length, and anything [`packed_kept`] has no lanes for, and then nothing was written.
+pub fn mask_against(
+    op: Comparison,
+    left: &Vector,
+    right: &Vector,
+    words: &mut [u64],
+    fresh: bool,
+) -> Option<usize> {
+    let len = left.len();
+    if right.len() != len
+        || words.len() != len.div_ceil(64)
+        || nulls_of(left) != Validity::AllValid
+        || nulls_of(right) != Validity::AllValid
+    {
+        return None;
+    }
+    let (one, other, shift, test) = packed_pair(op, left, right)?;
+    Some(against_kept(&one, &other, shift, test, len, words, fresh))
 }
 
 /// One end of a range a filter asks for: the comparison that sets it, the literal it compares
