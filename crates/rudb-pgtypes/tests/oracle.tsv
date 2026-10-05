@@ -1,0 +1,931 @@
+int2	1	32767	32767
+int2	1	-32768	-32768
+int2	1	32768	ERROR 22003 value "32768" is out of range for type smallint
+int2	1	0x7FFF	32767
+int2	1	 1_2 	12
+int4	1	0	0
+int4	1	-0	0
+int4	1	 12 	12
+int4	1	+7	7
+int4	1	0x1F	31
+int4	1	-0X1f	-31
+int4	1	0o17	15
+int4	1	0b101	5
+int4	1	1_000	1000
+int4	1	0x_1F	31
+int4	1	2147483647	2147483647
+int4	1	-2147483648	-2147483648
+int4	1	-0x80000000	-2147483648
+int4	1		ERROR 22P02 invalid input syntax for type integer: ""
+int4	1	 	ERROR 22P02 invalid input syntax for type integer: " "
+int4	1	1e3	ERROR 22P02 invalid input syntax for type integer: "1e3"
+int4	1	1.5	ERROR 22P02 invalid input syntax for type integer: "1.5"
+int4	1	_1	ERROR 22P02 invalid input syntax for type integer: "_1"
+int4	1	1_	ERROR 22P02 invalid input syntax for type integer: "1_"
+int4	1	1__0	ERROR 22P02 invalid input syntax for type integer: "1__0"
+int4	1	0x	ERROR 22P02 invalid input syntax for type integer: "0x"
+int4	1	0b2	ERROR 22P02 invalid input syntax for type integer: "0b2"
+int4	1	- 1	ERROR 22P02 invalid input syntax for type integer: "- 1"
+int4	1	1 2	ERROR 22P02 invalid input syntax for type integer: "1 2"
+int4	1	0o8	ERROR 22P02 invalid input syntax for type integer: "0o8"
+int4	1	2147483648	ERROR 22003 value "2147483648" is out of range for type integer
+int4	1	-2147483649	ERROR 22003 value "-2147483649" is out of range for type integer
+int4	1	0x80000000	ERROR 22003 value "0x80000000" is out of range for type integer
+int4	1	 99999999999 	ERROR 22003 value " 99999999999 " is out of range for type integer
+int4	1	99999999999x	ERROR 22003 value "99999999999x" is out of range for type integer
+int4	1	00012	12
+int8	1	-9223372036854775808	-9223372036854775808
+int8	1	9223372036854775808	ERROR 22003 value "9223372036854775808" is out of range for type bigint
+int8	1	0x7FFF_FFFF_FFFF_FFFF	9223372036854775807
+int8	1	x	ERROR 22P02 invalid input syntax for type bigint: "x"
+int8	1	0b1111111111111111111111111111111111111111111111111111111111111111	ERROR 22003 value "0b1111111111111111111111111111111111111111111111111111111111111111" is out of range for type bigint
+oid	1	0	0
+oid	1	16384	16384
+oid	1	 010 	8
+oid	1	0x10	16
+oid	1	-1	4294967295
+oid	1	-2147483648	2147483648
+oid	1	4294967295	4294967295
+oid	1	+5	5
+oid	1		ERROR 22P02 invalid input syntax for type oid: ""
+oid	1	x	ERROR 22P02 invalid input syntax for type oid: "x"
+oid	1	0x	ERROR 22P02 invalid input syntax for type oid: "0x"
+oid	1	08	ERROR 22P02 invalid input syntax for type oid: "08"
+oid	1	1_0	ERROR 22P02 invalid input syntax for type oid: "1_0"
+oid	1	1.0	ERROR 22P02 invalid input syntax for type oid: "1.0"
+oid	1	-	ERROR 22P02 invalid input syntax for type oid: "-"
+oid	1	4294967296	ERROR 22003 value "4294967296" is out of range for type oid
+oid	1	-2147483649	ERROR 22003 value "-2147483649" is out of range for type oid
+oid	1	99999999999999999999999	ERROR 22003 value "99999999999999999999999" is out of range for type oid
+oid	1	0X	ERROR 22P02 invalid input syntax for type oid: "0X"
+oid	1	0xg	ERROR 22P02 invalid input syntax for type oid: "0xg"
+bool	1	t	t
+bool	1	true	t
+bool	1	TRUE	t
+bool	1	 yes 	t
+bool	1	y	t
+bool	1	on	t
+bool	1	o	ERROR 22P02 invalid input syntax for type boolean: "o"
+bool	1	of	f
+bool	1	off	f
+bool	1	1	t
+bool	1	0	f
+bool	1	f	f
+bool	1	fa	f
+bool	1	no	f
+bool	1	n	f
+bool	1		ERROR 22P02 invalid input syntax for type boolean: ""
+bool	1	2	ERROR 22P02 invalid input syntax for type boolean: "2"
+bool	1	tru e	ERROR 22P02 invalid input syntax for type boolean: "tru e"
+bool	1	offx	ERROR 22P02 invalid input syntax for type boolean: "offx"
+bool	1	truex	ERROR 22P02 invalid input syntax for type boolean: "truex"
+"char"	1	a	a
+"char"	1	abc	a
+"char"	1		
+"char"	1	\101	A
+"char"	1	\377	\377
+"char"	1	\	\
+"char"	1	\12	\
+"char"	1	é	\303
+name	1	abc	abc
+name	1	nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn	nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn
+name	1	nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn	nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn
+name	1	éééééééééééééééééééééééééééééééééééééééé	ééééééééééééééééééééééééééééééé
+bytea	1	\x	\x
+bytea	1	\x0a0B	\x0a0b
+bytea	1	\x 0a 0b 	\x0a0b
+bytea	1	\x0g	ERROR 22023 invalid hexadecimal digit: "g"
+bytea	1	\x123	ERROR 22023 invalid hexadecimal data: odd number of digits
+bytea	1	\X0a	ERROR 22P02 invalid input syntax for type bytea
+bytea	1	abc	\x616263
+bytea	1	a\\b	\x615c62
+bytea	1	\141\142	\x6162
+bytea	1	\q	ERROR 22P02 invalid input syntax for type bytea
+bytea	1	\1	ERROR 22P02 invalid input syntax for type bytea
+bytea	1	\400	ERROR 22P02 invalid input syntax for type bytea
+bytea	1	é	\xc3a9
+bytea	1	\x0 a	ERROR 22023 invalid hexadecimal digit: " "
+uuid	1	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+uuid	1	A0EEBC999C0B4EF8BB6D6BB9BD380A11	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+uuid	1	{a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11}	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+uuid	1	a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+uuid	1	{a0eebc999c0b4ef8bb6d6bb9bd380a11	ERROR 22P02 invalid input syntax for type uuid: "{a0eebc999c0b4ef8bb6d6bb9bd380a11"
+uuid	1	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1	ERROR 22P02 invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"
+uuid	1	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 	ERROR 22P02 invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 "
+uuid	1	-a0eebc999c0b4ef8bb6d6bb9bd380a11	ERROR 22P02 invalid input syntax for type uuid: "-a0eebc999c0b4ef8bb6d6bb9bd380a11"
+float8	1	0	0
+float4	1	0	0
+float8	1	-0	-0
+float4	1	-0	-0
+float8	1	1	1
+float4	1	1	1
+float8	1	-1.5	-1.5
+float4	1	-1.5	-1.5
+float8	1	0.1	0.1
+float4	1	0.1	0.1
+float8	1	2.5	2.5
+float4	1	2.5	2.5
+float8	1	100	100
+float4	1	100	100
+float8	1	123456	123456
+float4	1	123456	123456
+float8	1	1234567	1234567
+float4	1	1234567	1.234567e+06
+float8	1	1e6	1000000
+float4	1	1e6	1e+06
+float8	1	1e7	10000000
+float4	1	1e7	1e+07
+float8	1	1e14	100000000000000
+float4	1	1e14	1e+14
+float8	1	1e15	1e+15
+float4	1	1e15	1e+15
+float8	1	1e16	1e+16
+float4	1	1e16	1e+16
+float8	1	1e22	1e+22
+float4	1	1e22	1e+22
+float8	1	123456789012345678	1.2345678901234568e+17
+float4	1	123456789012345678	1.2345679e+17
+float8	1	0.0001	0.0001
+float4	1	0.0001	0.0001
+float8	1	0.00001	1e-05
+float4	1	0.00001	1e-05
+float8	1	1.5e-5	1.5e-05
+float4	1	1.5e-5	1.5e-05
+float8	1	0.000123	0.000123
+float4	1	0.000123	0.000123
+float8	1	3.141592653589793	3.141592653589793
+float4	1	3.141592653589793	3.1415927
+float8	1	2.718281828459045	2.718281828459045
+float4	1	2.718281828459045	2.7182817
+float8	1	1.7976931348623157e308	1.7976931348623157e+308
+float4	1	1.7976931348623157e308	ERROR 22003 "1.7976931348623157e308" is out of range for type real
+float8	1	2.2250738585072014e-308	2.2250738585072014e-308
+float4	1	2.2250738585072014e-308	ERROR 22003 "2.2250738585072014e-308" is out of range for type real
+float8	1	4.9e-324	5e-324
+float4	1	4.9e-324	ERROR 22003 "4.9e-324" is out of range for type real
+float8	1	5e-324	5e-324
+float4	1	5e-324	ERROR 22003 "5e-324" is out of range for type real
+float8	1	1e-320	1e-320
+float4	1	1e-320	ERROR 22003 "1e-320" is out of range for type real
+float8	1	3.4028235e38	3.4028235e+38
+float4	1	3.4028235e38	3.4028235e+38
+float8	1	3.5e38	3.5e+38
+float4	1	3.5e38	ERROR 22003 "3.5e38" is out of range for type real
+float8	1	1.17549435e-38	1.17549435e-38
+float4	1	1.17549435e-38	1.1754944e-38
+float8	1	1.4e-45	1.4e-45
+float4	1	1.4e-45	1e-45
+float8	1	1e-46	1e-46
+float4	1	1e-46	ERROR 22003 "1e-46" is out of range for type real
+float8	1	1e-50	1e-50
+float4	1	1e-50	ERROR 22003 "1e-50" is out of range for type real
+float8	1	1e39	1e+39
+float4	1	1e39	ERROR 22003 "1e39" is out of range for type real
+float8	1	1e309	ERROR 22003 "1e309" is out of range for type double precision
+float4	1	1e309	ERROR 22003 "1e309" is out of range for type real
+float8	1	-1e309	ERROR 22003 "-1e309" is out of range for type double precision
+float4	1	-1e309	ERROR 22003 "-1e309" is out of range for type real
+float8	1	1e-400	ERROR 22003 "1e-400" is out of range for type double precision
+float4	1	1e-400	ERROR 22003 "1e-400" is out of range for type real
+float8	1	0e-400	0
+float4	1	0e-400	0
+float8	1	0x1p-1074	5e-324
+float4	1	0x1p-1074	ERROR 22003 "0x1p-1074" is out of range for type real
+float8	1	0x1.8p1	3
+float4	1	0x1.8p1	3
+float8	1	0X10	16
+float4	1	0X10	16
+float8	1	0x	ERROR 22P02 invalid input syntax for type double precision: "0x"
+float4	1	0x	ERROR 22P02 invalid input syntax for type real: "0x"
+float8	1	NaN	NaN
+float4	1	NaN	NaN
+float8	1	nan	NaN
+float4	1	nan	NaN
+float8	1	Infinity	Infinity
+float4	1	Infinity	Infinity
+float8	1	-infinity	-Infinity
+float4	1	-infinity	-Infinity
+float8	1	inf	Infinity
+float4	1	inf	Infinity
+float8	1	+Inf	Infinity
+float4	1	+Inf	Infinity
+float8	1	-INF	-Infinity
+float4	1	-INF	-Infinity
+float8	1	infinit	ERROR 22P02 invalid input syntax for type double precision: "infinit"
+float4	1	infinit	ERROR 22P02 invalid input syntax for type real: "infinit"
+float8	1	 1.5 	1.5
+float4	1	 1.5 	1.5
+float8	1	1.5x	ERROR 22P02 invalid input syntax for type double precision: "1.5x"
+float4	1	1.5x	ERROR 22P02 invalid input syntax for type real: "1.5x"
+float8	1		ERROR 22P02 invalid input syntax for type double precision: ""
+float4	1		ERROR 22P02 invalid input syntax for type real: ""
+float8	1	 	ERROR 22P02 invalid input syntax for type double precision: " "
+float4	1	 	ERROR 22P02 invalid input syntax for type real: " "
+float8	1	.5	0.5
+float4	1	.5	0.5
+float8	1	5.	5
+float4	1	5.	5
+float8	1	.	ERROR 22P02 invalid input syntax for type double precision: "."
+float4	1	.	ERROR 22P02 invalid input syntax for type real: "."
+float8	1	1e	ERROR 22P02 invalid input syntax for type double precision: "1e"
+float4	1	1e	ERROR 22P02 invalid input syntax for type real: "1e"
+float8	1	1e+	ERROR 22P02 invalid input syntax for type double precision: "1e+"
+float4	1	1e+	ERROR 22P02 invalid input syntax for type real: "1e+"
+float8	1	e5	ERROR 22P02 invalid input syntax for type double precision: "e5"
+float4	1	e5	ERROR 22P02 invalid input syntax for type real: "e5"
+float8	1	+-1	ERROR 22P02 invalid input syntax for type double precision: "+-1"
+float4	1	+-1	ERROR 22P02 invalid input syntax for type real: "+-1"
+float8	1	1_000	ERROR 22P02 invalid input syntax for type double precision: "1_000"
+float4	1	1_000	ERROR 22P02 invalid input syntax for type real: "1_000"
+float8	1	9007199254740993	9.007199254740992e+15
+float4	1	9007199254740993	9.007199e+15
+float8	1	0.30000000000000004	0.30000000000000004
+float4	1	0.30000000000000004	0.3
+float8	1	1e-7	1e-07
+float4	1	1e-7	1e-07
+float8	1	123456.7	123456.7
+float4	1	123456.7	123456.7
+float8	1	16777217	16777217
+float4	1	16777217	1.6777216e+07
+float8	1	0.333333333333333333	0.3333333333333333
+float4	1	0.333333333333333333	0.33333334
+float8	3	0	0
+float4	3	0	0
+float8	3	-0	-0
+float4	3	-0	-0
+float8	3	1	1
+float4	3	1	1
+float8	3	-1.5	-1.5
+float4	3	-1.5	-1.5
+float8	3	0.1	0.1
+float4	3	0.1	0.1
+float8	3	2.5	2.5
+float4	3	2.5	2.5
+float8	3	100	100
+float4	3	100	100
+float8	3	123456	123456
+float4	3	123456	123456
+float8	3	1234567	1234567
+float4	3	1234567	1.234567e+06
+float8	3	1e6	1000000
+float4	3	1e6	1e+06
+float8	3	1e7	10000000
+float4	3	1e7	1e+07
+float8	3	1e14	100000000000000
+float4	3	1e14	1e+14
+float8	3	1e15	1e+15
+float4	3	1e15	1e+15
+float8	3	1e16	1e+16
+float4	3	1e16	1e+16
+float8	3	1e22	1e+22
+float4	3	1e22	1e+22
+float8	3	123456789012345678	1.2345678901234568e+17
+float4	3	123456789012345678	1.2345679e+17
+float8	3	0.0001	0.0001
+float4	3	0.0001	0.0001
+float8	3	0.00001	1e-05
+float4	3	0.00001	1e-05
+float8	3	1.5e-5	1.5e-05
+float4	3	1.5e-5	1.5e-05
+float8	3	0.000123	0.000123
+float4	3	0.000123	0.000123
+float8	3	3.141592653589793	3.141592653589793
+float4	3	3.141592653589793	3.1415927
+float8	3	2.718281828459045	2.718281828459045
+float4	3	2.718281828459045	2.7182817
+float8	3	1.7976931348623157e308	1.7976931348623157e+308
+float4	3	1.7976931348623157e308	ERROR 22003 "1.7976931348623157e308" is out of range for type real
+float8	3	2.2250738585072014e-308	2.2250738585072014e-308
+float4	3	2.2250738585072014e-308	ERROR 22003 "2.2250738585072014e-308" is out of range for type real
+float8	3	4.9e-324	5e-324
+float4	3	4.9e-324	ERROR 22003 "4.9e-324" is out of range for type real
+float8	3	5e-324	5e-324
+float4	3	5e-324	ERROR 22003 "5e-324" is out of range for type real
+float8	3	1e-320	1e-320
+float4	3	1e-320	ERROR 22003 "1e-320" is out of range for type real
+float8	3	3.4028235e38	3.4028235e+38
+float4	3	3.4028235e38	3.4028235e+38
+float8	3	3.5e38	3.5e+38
+float4	3	3.5e38	ERROR 22003 "3.5e38" is out of range for type real
+float8	3	1.17549435e-38	1.17549435e-38
+float4	3	1.17549435e-38	1.1754944e-38
+float8	3	1.4e-45	1.4e-45
+float4	3	1.4e-45	1e-45
+float8	3	1e-46	1e-46
+float4	3	1e-46	ERROR 22003 "1e-46" is out of range for type real
+float8	3	1e-50	1e-50
+float4	3	1e-50	ERROR 22003 "1e-50" is out of range for type real
+float8	3	1e39	1e+39
+float4	3	1e39	ERROR 22003 "1e39" is out of range for type real
+float8	3	1e309	ERROR 22003 "1e309" is out of range for type double precision
+float4	3	1e309	ERROR 22003 "1e309" is out of range for type real
+float8	3	-1e309	ERROR 22003 "-1e309" is out of range for type double precision
+float4	3	-1e309	ERROR 22003 "-1e309" is out of range for type real
+float8	3	1e-400	ERROR 22003 "1e-400" is out of range for type double precision
+float4	3	1e-400	ERROR 22003 "1e-400" is out of range for type real
+float8	3	0e-400	0
+float4	3	0e-400	0
+float8	3	0x1p-1074	5e-324
+float4	3	0x1p-1074	ERROR 22003 "0x1p-1074" is out of range for type real
+float8	3	0x1.8p1	3
+float4	3	0x1.8p1	3
+float8	3	0X10	16
+float4	3	0X10	16
+float8	3	0x	ERROR 22P02 invalid input syntax for type double precision: "0x"
+float4	3	0x	ERROR 22P02 invalid input syntax for type real: "0x"
+float8	3	NaN	NaN
+float4	3	NaN	NaN
+float8	3	nan	NaN
+float4	3	nan	NaN
+float8	3	Infinity	Infinity
+float4	3	Infinity	Infinity
+float8	3	-infinity	-Infinity
+float4	3	-infinity	-Infinity
+float8	3	inf	Infinity
+float4	3	inf	Infinity
+float8	3	+Inf	Infinity
+float4	3	+Inf	Infinity
+float8	3	-INF	-Infinity
+float4	3	-INF	-Infinity
+float8	3	infinit	ERROR 22P02 invalid input syntax for type double precision: "infinit"
+float4	3	infinit	ERROR 22P02 invalid input syntax for type real: "infinit"
+float8	3	 1.5 	1.5
+float4	3	 1.5 	1.5
+float8	3	1.5x	ERROR 22P02 invalid input syntax for type double precision: "1.5x"
+float4	3	1.5x	ERROR 22P02 invalid input syntax for type real: "1.5x"
+float8	3		ERROR 22P02 invalid input syntax for type double precision: ""
+float4	3		ERROR 22P02 invalid input syntax for type real: ""
+float8	3	 	ERROR 22P02 invalid input syntax for type double precision: " "
+float4	3	 	ERROR 22P02 invalid input syntax for type real: " "
+float8	3	.5	0.5
+float4	3	.5	0.5
+float8	3	5.	5
+float4	3	5.	5
+float8	3	.	ERROR 22P02 invalid input syntax for type double precision: "."
+float4	3	.	ERROR 22P02 invalid input syntax for type real: "."
+float8	3	1e	ERROR 22P02 invalid input syntax for type double precision: "1e"
+float4	3	1e	ERROR 22P02 invalid input syntax for type real: "1e"
+float8	3	1e+	ERROR 22P02 invalid input syntax for type double precision: "1e+"
+float4	3	1e+	ERROR 22P02 invalid input syntax for type real: "1e+"
+float8	3	e5	ERROR 22P02 invalid input syntax for type double precision: "e5"
+float4	3	e5	ERROR 22P02 invalid input syntax for type real: "e5"
+float8	3	+-1	ERROR 22P02 invalid input syntax for type double precision: "+-1"
+float4	3	+-1	ERROR 22P02 invalid input syntax for type real: "+-1"
+float8	3	1_000	ERROR 22P02 invalid input syntax for type double precision: "1_000"
+float4	3	1_000	ERROR 22P02 invalid input syntax for type real: "1_000"
+float8	3	9007199254740993	9.007199254740992e+15
+float4	3	9007199254740993	9.007199e+15
+float8	3	0.30000000000000004	0.30000000000000004
+float4	3	0.30000000000000004	0.3
+float8	3	1e-7	1e-07
+float4	3	1e-7	1e-07
+float8	3	123456.7	123456.7
+float4	3	123456.7	123456.7
+float8	3	16777217	16777217
+float4	3	16777217	1.6777216e+07
+float8	3	0.333333333333333333	0.3333333333333333
+float4	3	0.333333333333333333	0.33333334
+float8	0	0	0
+float4	0	0	0
+float8	0	-0	-0
+float4	0	-0	-0
+float8	0	1	1
+float4	0	1	1
+float8	0	-1.5	-1.5
+float4	0	-1.5	-1.5
+float8	0	0.1	0.1
+float4	0	0.1	0.1
+float8	0	2.5	2.5
+float4	0	2.5	2.5
+float8	0	100	100
+float4	0	100	100
+float8	0	123456	123456
+float4	0	123456	123456
+float8	0	1234567	1234567
+float4	0	1234567	1.23457e+06
+float8	0	1e6	1000000
+float4	0	1e6	1e+06
+float8	0	1e7	10000000
+float4	0	1e7	1e+07
+float8	0	1e14	100000000000000
+float4	0	1e14	1e+14
+float8	0	1e15	1e+15
+float4	0	1e15	1e+15
+float8	0	1e16	1e+16
+float4	0	1e16	1e+16
+float8	0	1e22	1e+22
+float4	0	1e22	1e+22
+float8	0	123456789012345678	1.23456789012346e+17
+float4	0	123456789012345678	1.23457e+17
+float8	0	0.0001	0.0001
+float4	0	0.0001	0.0001
+float8	0	0.00001	1e-05
+float4	0	0.00001	1e-05
+float8	0	1.5e-5	1.5e-05
+float4	0	1.5e-5	1.5e-05
+float8	0	0.000123	0.000123
+float4	0	0.000123	0.000123
+float8	0	3.141592653589793	3.14159265358979
+float4	0	3.141592653589793	3.14159
+float8	0	2.718281828459045	2.71828182845905
+float4	0	2.718281828459045	2.71828
+float8	0	1.7976931348623157e308	1.79769313486232e+308
+float4	0	1.7976931348623157e308	ERROR 22003 "1.7976931348623157e308" is out of range for type real
+float8	0	2.2250738585072014e-308	2.2250738585072e-308
+float4	0	2.2250738585072014e-308	ERROR 22003 "2.2250738585072014e-308" is out of range for type real
+float8	0	4.9e-324	4.94065645841247e-324
+float4	0	4.9e-324	ERROR 22003 "4.9e-324" is out of range for type real
+float8	0	5e-324	4.94065645841247e-324
+float4	0	5e-324	ERROR 22003 "5e-324" is out of range for type real
+float8	0	1e-320	9.99988867182683e-321
+float4	0	1e-320	ERROR 22003 "1e-320" is out of range for type real
+float8	0	3.4028235e38	3.4028235e+38
+float4	0	3.4028235e38	3.40282e+38
+float8	0	3.5e38	3.5e+38
+float4	0	3.5e38	ERROR 22003 "3.5e38" is out of range for type real
+float8	0	1.17549435e-38	1.17549435e-38
+float4	0	1.17549435e-38	1.17549e-38
+float8	0	1.4e-45	1.4e-45
+float4	0	1.4e-45	1.4013e-45
+float8	0	1e-46	1e-46
+float4	0	1e-46	ERROR 22003 "1e-46" is out of range for type real
+float8	0	1e-50	1e-50
+float4	0	1e-50	ERROR 22003 "1e-50" is out of range for type real
+float8	0	1e39	1e+39
+float4	0	1e39	ERROR 22003 "1e39" is out of range for type real
+float8	0	1e309	ERROR 22003 "1e309" is out of range for type double precision
+float4	0	1e309	ERROR 22003 "1e309" is out of range for type real
+float8	0	-1e309	ERROR 22003 "-1e309" is out of range for type double precision
+float4	0	-1e309	ERROR 22003 "-1e309" is out of range for type real
+float8	0	1e-400	ERROR 22003 "1e-400" is out of range for type double precision
+float4	0	1e-400	ERROR 22003 "1e-400" is out of range for type real
+float8	0	0e-400	0
+float4	0	0e-400	0
+float8	0	0x1p-1074	4.94065645841247e-324
+float4	0	0x1p-1074	ERROR 22003 "0x1p-1074" is out of range for type real
+float8	0	0x1.8p1	3
+float4	0	0x1.8p1	3
+float8	0	0X10	16
+float4	0	0X10	16
+float8	0	0x	ERROR 22P02 invalid input syntax for type double precision: "0x"
+float4	0	0x	ERROR 22P02 invalid input syntax for type real: "0x"
+float8	0	NaN	NaN
+float4	0	NaN	NaN
+float8	0	nan	NaN
+float4	0	nan	NaN
+float8	0	Infinity	Infinity
+float4	0	Infinity	Infinity
+float8	0	-infinity	-Infinity
+float4	0	-infinity	-Infinity
+float8	0	inf	Infinity
+float4	0	inf	Infinity
+float8	0	+Inf	Infinity
+float4	0	+Inf	Infinity
+float8	0	-INF	-Infinity
+float4	0	-INF	-Infinity
+float8	0	infinit	ERROR 22P02 invalid input syntax for type double precision: "infinit"
+float4	0	infinit	ERROR 22P02 invalid input syntax for type real: "infinit"
+float8	0	 1.5 	1.5
+float4	0	 1.5 	1.5
+float8	0	1.5x	ERROR 22P02 invalid input syntax for type double precision: "1.5x"
+float4	0	1.5x	ERROR 22P02 invalid input syntax for type real: "1.5x"
+float8	0		ERROR 22P02 invalid input syntax for type double precision: ""
+float4	0		ERROR 22P02 invalid input syntax for type real: ""
+float8	0	 	ERROR 22P02 invalid input syntax for type double precision: " "
+float4	0	 	ERROR 22P02 invalid input syntax for type real: " "
+float8	0	.5	0.5
+float4	0	.5	0.5
+float8	0	5.	5
+float4	0	5.	5
+float8	0	.	ERROR 22P02 invalid input syntax for type double precision: "."
+float4	0	.	ERROR 22P02 invalid input syntax for type real: "."
+float8	0	1e	ERROR 22P02 invalid input syntax for type double precision: "1e"
+float4	0	1e	ERROR 22P02 invalid input syntax for type real: "1e"
+float8	0	1e+	ERROR 22P02 invalid input syntax for type double precision: "1e+"
+float4	0	1e+	ERROR 22P02 invalid input syntax for type real: "1e+"
+float8	0	e5	ERROR 22P02 invalid input syntax for type double precision: "e5"
+float4	0	e5	ERROR 22P02 invalid input syntax for type real: "e5"
+float8	0	+-1	ERROR 22P02 invalid input syntax for type double precision: "+-1"
+float4	0	+-1	ERROR 22P02 invalid input syntax for type real: "+-1"
+float8	0	1_000	ERROR 22P02 invalid input syntax for type double precision: "1_000"
+float4	0	1_000	ERROR 22P02 invalid input syntax for type real: "1_000"
+float8	0	9007199254740993	9.00719925474099e+15
+float4	0	9007199254740993	9.0072e+15
+float8	0	0.30000000000000004	0.3
+float4	0	0.30000000000000004	0.3
+float8	0	1e-7	1e-07
+float4	0	1e-7	1e-07
+float8	0	123456.7	123456.7
+float4	0	123456.7	123457
+float8	0	16777217	16777217
+float4	0	16777217	1.67772e+07
+float8	0	0.333333333333333333	0.333333333333333
+float4	0	0.333333333333333333	0.333333
+float8	2	0	0
+float4	2	0	0
+float8	2	-0	-0
+float4	2	-0	-0
+float8	2	1	1
+float4	2	1	1
+float8	2	-1.5	-1.5
+float4	2	-1.5	-1.5
+float8	2	0.1	0.1
+float4	2	0.1	0.1
+float8	2	2.5	2.5
+float4	2	2.5	2.5
+float8	2	100	100
+float4	2	100	100
+float8	2	123456	123456
+float4	2	123456	123456
+float8	2	1234567	1234567
+float4	2	1234567	1.234567e+06
+float8	2	1e6	1000000
+float4	2	1e6	1e+06
+float8	2	1e7	10000000
+float4	2	1e7	1e+07
+float8	2	1e14	100000000000000
+float4	2	1e14	1e+14
+float8	2	1e15	1e+15
+float4	2	1e15	1e+15
+float8	2	1e16	1e+16
+float4	2	1e16	1e+16
+float8	2	1e22	1e+22
+float4	2	1e22	1e+22
+float8	2	123456789012345678	1.2345678901234568e+17
+float4	2	123456789012345678	1.2345679e+17
+float8	2	0.0001	0.0001
+float4	2	0.0001	0.0001
+float8	2	0.00001	1e-05
+float4	2	0.00001	1e-05
+float8	2	1.5e-5	1.5e-05
+float4	2	1.5e-5	1.5e-05
+float8	2	0.000123	0.000123
+float4	2	0.000123	0.000123
+float8	2	3.141592653589793	3.141592653589793
+float4	2	3.141592653589793	3.1415927
+float8	2	2.718281828459045	2.718281828459045
+float4	2	2.718281828459045	2.7182817
+float8	2	1.7976931348623157e308	1.7976931348623157e+308
+float4	2	1.7976931348623157e308	ERROR 22003 "1.7976931348623157e308" is out of range for type real
+float8	2	2.2250738585072014e-308	2.2250738585072014e-308
+float4	2	2.2250738585072014e-308	ERROR 22003 "2.2250738585072014e-308" is out of range for type real
+float8	2	4.9e-324	5e-324
+float4	2	4.9e-324	ERROR 22003 "4.9e-324" is out of range for type real
+float8	2	5e-324	5e-324
+float4	2	5e-324	ERROR 22003 "5e-324" is out of range for type real
+float8	2	1e-320	1e-320
+float4	2	1e-320	ERROR 22003 "1e-320" is out of range for type real
+float8	2	3.4028235e38	3.4028235e+38
+float4	2	3.4028235e38	3.4028235e+38
+float8	2	3.5e38	3.5e+38
+float4	2	3.5e38	ERROR 22003 "3.5e38" is out of range for type real
+float8	2	1.17549435e-38	1.17549435e-38
+float4	2	1.17549435e-38	1.1754944e-38
+float8	2	1.4e-45	1.4e-45
+float4	2	1.4e-45	1e-45
+float8	2	1e-46	1e-46
+float4	2	1e-46	ERROR 22003 "1e-46" is out of range for type real
+float8	2	1e-50	1e-50
+float4	2	1e-50	ERROR 22003 "1e-50" is out of range for type real
+float8	2	1e39	1e+39
+float4	2	1e39	ERROR 22003 "1e39" is out of range for type real
+float8	2	1e309	ERROR 22003 "1e309" is out of range for type double precision
+float4	2	1e309	ERROR 22003 "1e309" is out of range for type real
+float8	2	-1e309	ERROR 22003 "-1e309" is out of range for type double precision
+float4	2	-1e309	ERROR 22003 "-1e309" is out of range for type real
+float8	2	1e-400	ERROR 22003 "1e-400" is out of range for type double precision
+float4	2	1e-400	ERROR 22003 "1e-400" is out of range for type real
+float8	2	0e-400	0
+float4	2	0e-400	0
+float8	2	0x1p-1074	5e-324
+float4	2	0x1p-1074	ERROR 22003 "0x1p-1074" is out of range for type real
+float8	2	0x1.8p1	3
+float4	2	0x1.8p1	3
+float8	2	0X10	16
+float4	2	0X10	16
+float8	2	0x	ERROR 22P02 invalid input syntax for type double precision: "0x"
+float4	2	0x	ERROR 22P02 invalid input syntax for type real: "0x"
+float8	2	NaN	NaN
+float4	2	NaN	NaN
+float8	2	nan	NaN
+float4	2	nan	NaN
+float8	2	Infinity	Infinity
+float4	2	Infinity	Infinity
+float8	2	-infinity	-Infinity
+float4	2	-infinity	-Infinity
+float8	2	inf	Infinity
+float4	2	inf	Infinity
+float8	2	+Inf	Infinity
+float4	2	+Inf	Infinity
+float8	2	-INF	-Infinity
+float4	2	-INF	-Infinity
+float8	2	infinit	ERROR 22P02 invalid input syntax for type double precision: "infinit"
+float4	2	infinit	ERROR 22P02 invalid input syntax for type real: "infinit"
+float8	2	 1.5 	1.5
+float4	2	 1.5 	1.5
+float8	2	1.5x	ERROR 22P02 invalid input syntax for type double precision: "1.5x"
+float4	2	1.5x	ERROR 22P02 invalid input syntax for type real: "1.5x"
+float8	2		ERROR 22P02 invalid input syntax for type double precision: ""
+float4	2		ERROR 22P02 invalid input syntax for type real: ""
+float8	2	 	ERROR 22P02 invalid input syntax for type double precision: " "
+float4	2	 	ERROR 22P02 invalid input syntax for type real: " "
+float8	2	.5	0.5
+float4	2	.5	0.5
+float8	2	5.	5
+float4	2	5.	5
+float8	2	.	ERROR 22P02 invalid input syntax for type double precision: "."
+float4	2	.	ERROR 22P02 invalid input syntax for type real: "."
+float8	2	1e	ERROR 22P02 invalid input syntax for type double precision: "1e"
+float4	2	1e	ERROR 22P02 invalid input syntax for type real: "1e"
+float8	2	1e+	ERROR 22P02 invalid input syntax for type double precision: "1e+"
+float4	2	1e+	ERROR 22P02 invalid input syntax for type real: "1e+"
+float8	2	e5	ERROR 22P02 invalid input syntax for type double precision: "e5"
+float4	2	e5	ERROR 22P02 invalid input syntax for type real: "e5"
+float8	2	+-1	ERROR 22P02 invalid input syntax for type double precision: "+-1"
+float4	2	+-1	ERROR 22P02 invalid input syntax for type real: "+-1"
+float8	2	1_000	ERROR 22P02 invalid input syntax for type double precision: "1_000"
+float4	2	1_000	ERROR 22P02 invalid input syntax for type real: "1_000"
+float8	2	9007199254740993	9.007199254740992e+15
+float4	2	9007199254740993	9.007199e+15
+float8	2	0.30000000000000004	0.30000000000000004
+float4	2	0.30000000000000004	0.3
+float8	2	1e-7	1e-07
+float4	2	1e-7	1e-07
+float8	2	123456.7	123456.7
+float4	2	123456.7	123456.7
+float8	2	16777217	16777217
+float4	2	16777217	1.6777216e+07
+float8	2	0.333333333333333333	0.3333333333333333
+float4	2	0.333333333333333333	0.33333334
+float8	-3	0	0
+float4	-3	0	0
+float8	-3	-0	-0
+float4	-3	-0	-0
+float8	-3	1	1
+float4	-3	1	1
+float8	-3	-1.5	-1.5
+float4	-3	-1.5	-1.5
+float8	-3	0.1	0.1
+float4	-3	0.1	0.1
+float8	-3	2.5	2.5
+float4	-3	2.5	2.5
+float8	-3	100	100
+float4	-3	100	100
+float8	-3	123456	123456
+float4	-3	123456	1.23e+05
+float8	-3	1234567	1234567
+float4	-3	1234567	1.23e+06
+float8	-3	1e6	1000000
+float4	-3	1e6	1e+06
+float8	-3	1e7	10000000
+float4	-3	1e7	1e+07
+float8	-3	1e14	1e+14
+float4	-3	1e14	1e+14
+float8	-3	1e15	1e+15
+float4	-3	1e15	1e+15
+float8	-3	1e16	1e+16
+float4	-3	1e16	1e+16
+float8	-3	1e22	1e+22
+float4	-3	1e22	1e+22
+float8	-3	123456789012345678	1.23456789012e+17
+float4	-3	123456789012345678	1.23e+17
+float8	-3	0.0001	0.0001
+float4	-3	0.0001	0.0001
+float8	-3	0.00001	1e-05
+float4	-3	0.00001	1e-05
+float8	-3	1.5e-5	1.5e-05
+float4	-3	1.5e-5	1.5e-05
+float8	-3	0.000123	0.000123
+float4	-3	0.000123	0.000123
+float8	-3	3.141592653589793	3.14159265359
+float4	-3	3.141592653589793	3.14
+float8	-3	2.718281828459045	2.71828182846
+float4	-3	2.718281828459045	2.72
+float8	-3	1.7976931348623157e308	1.79769313486e+308
+float4	-3	1.7976931348623157e308	ERROR 22003 "1.7976931348623157e308" is out of range for type real
+float8	-3	2.2250738585072014e-308	2.22507385851e-308
+float4	-3	2.2250738585072014e-308	ERROR 22003 "2.2250738585072014e-308" is out of range for type real
+float8	-3	4.9e-324	4.94065645841e-324
+float4	-3	4.9e-324	ERROR 22003 "4.9e-324" is out of range for type real
+float8	-3	5e-324	4.94065645841e-324
+float4	-3	5e-324	ERROR 22003 "5e-324" is out of range for type real
+float8	-3	1e-320	9.99988867183e-321
+float4	-3	1e-320	ERROR 22003 "1e-320" is out of range for type real
+float8	-3	3.4028235e38	3.4028235e+38
+float4	-3	3.4028235e38	3.4e+38
+float8	-3	3.5e38	3.5e+38
+float4	-3	3.5e38	ERROR 22003 "3.5e38" is out of range for type real
+float8	-3	1.17549435e-38	1.17549435e-38
+float4	-3	1.17549435e-38	1.18e-38
+float8	-3	1.4e-45	1.4e-45
+float4	-3	1.4e-45	1.4e-45
+float8	-3	1e-46	1e-46
+float4	-3	1e-46	ERROR 22003 "1e-46" is out of range for type real
+float8	-3	1e-50	1e-50
+float4	-3	1e-50	ERROR 22003 "1e-50" is out of range for type real
+float8	-3	1e39	1e+39
+float4	-3	1e39	ERROR 22003 "1e39" is out of range for type real
+float8	-3	1e309	ERROR 22003 "1e309" is out of range for type double precision
+float4	-3	1e309	ERROR 22003 "1e309" is out of range for type real
+float8	-3	-1e309	ERROR 22003 "-1e309" is out of range for type double precision
+float4	-3	-1e309	ERROR 22003 "-1e309" is out of range for type real
+float8	-3	1e-400	ERROR 22003 "1e-400" is out of range for type double precision
+float4	-3	1e-400	ERROR 22003 "1e-400" is out of range for type real
+float8	-3	0e-400	0
+float4	-3	0e-400	0
+float8	-3	0x1p-1074	4.94065645841e-324
+float4	-3	0x1p-1074	ERROR 22003 "0x1p-1074" is out of range for type real
+float8	-3	0x1.8p1	3
+float4	-3	0x1.8p1	3
+float8	-3	0X10	16
+float4	-3	0X10	16
+float8	-3	0x	ERROR 22P02 invalid input syntax for type double precision: "0x"
+float4	-3	0x	ERROR 22P02 invalid input syntax for type real: "0x"
+float8	-3	NaN	NaN
+float4	-3	NaN	NaN
+float8	-3	nan	NaN
+float4	-3	nan	NaN
+float8	-3	Infinity	Infinity
+float4	-3	Infinity	Infinity
+float8	-3	-infinity	-Infinity
+float4	-3	-infinity	-Infinity
+float8	-3	inf	Infinity
+float4	-3	inf	Infinity
+float8	-3	+Inf	Infinity
+float4	-3	+Inf	Infinity
+float8	-3	-INF	-Infinity
+float4	-3	-INF	-Infinity
+float8	-3	infinit	ERROR 22P02 invalid input syntax for type double precision: "infinit"
+float4	-3	infinit	ERROR 22P02 invalid input syntax for type real: "infinit"
+float8	-3	 1.5 	1.5
+float4	-3	 1.5 	1.5
+float8	-3	1.5x	ERROR 22P02 invalid input syntax for type double precision: "1.5x"
+float4	-3	1.5x	ERROR 22P02 invalid input syntax for type real: "1.5x"
+float8	-3		ERROR 22P02 invalid input syntax for type double precision: ""
+float4	-3		ERROR 22P02 invalid input syntax for type real: ""
+float8	-3	 	ERROR 22P02 invalid input syntax for type double precision: " "
+float4	-3	 	ERROR 22P02 invalid input syntax for type real: " "
+float8	-3	.5	0.5
+float4	-3	.5	0.5
+float8	-3	5.	5
+float4	-3	5.	5
+float8	-3	.	ERROR 22P02 invalid input syntax for type double precision: "."
+float4	-3	.	ERROR 22P02 invalid input syntax for type real: "."
+float8	-3	1e	ERROR 22P02 invalid input syntax for type double precision: "1e"
+float4	-3	1e	ERROR 22P02 invalid input syntax for type real: "1e"
+float8	-3	1e+	ERROR 22P02 invalid input syntax for type double precision: "1e+"
+float4	-3	1e+	ERROR 22P02 invalid input syntax for type real: "1e+"
+float8	-3	e5	ERROR 22P02 invalid input syntax for type double precision: "e5"
+float4	-3	e5	ERROR 22P02 invalid input syntax for type real: "e5"
+float8	-3	+-1	ERROR 22P02 invalid input syntax for type double precision: "+-1"
+float4	-3	+-1	ERROR 22P02 invalid input syntax for type real: "+-1"
+float8	-3	1_000	ERROR 22P02 invalid input syntax for type double precision: "1_000"
+float4	-3	1_000	ERROR 22P02 invalid input syntax for type real: "1_000"
+float8	-3	9007199254740993	9.00719925474e+15
+float4	-3	9007199254740993	9.01e+15
+float8	-3	0.30000000000000004	0.3
+float4	-3	0.30000000000000004	0.3
+float8	-3	1e-7	1e-07
+float4	-3	1e-7	1e-07
+float8	-3	123456.7	123456.7
+float4	-3	123456.7	1.23e+05
+float8	-3	16777217	16777217
+float4	-3	16777217	1.68e+07
+float8	-3	0.333333333333333333	0.333333333333
+float4	-3	0.333333333333333333	0.333
+float8	-15	0	0
+float4	-15	0	0
+float8	-15	-0	-0
+float4	-15	-0	-0
+float8	-15	1	1
+float4	-15	1	1
+float8	-15	-1.5	-2
+float4	-15	-1.5	-2
+float8	-15	0.1	0.1
+float4	-15	0.1	0.1
+float8	-15	2.5	2
+float4	-15	2.5	2
+float8	-15	100	1e+02
+float4	-15	100	1e+02
+float8	-15	123456	1e+05
+float4	-15	123456	1e+05
+float8	-15	1234567	1e+06
+float4	-15	1234567	1e+06
+float8	-15	1e6	1e+06
+float4	-15	1e6	1e+06
+float8	-15	1e7	1e+07
+float4	-15	1e7	1e+07
+float8	-15	1e14	1e+14
+float4	-15	1e14	1e+14
+float8	-15	1e15	1e+15
+float4	-15	1e15	1e+15
+float8	-15	1e16	1e+16
+float4	-15	1e16	1e+16
+float8	-15	1e22	1e+22
+float4	-15	1e22	1e+22
+float8	-15	123456789012345678	1e+17
+float4	-15	123456789012345678	1e+17
+float8	-15	0.0001	0.0001
+float4	-15	0.0001	0.0001
+float8	-15	0.00001	1e-05
+float4	-15	0.00001	1e-05
+float8	-15	1.5e-5	2e-05
+float4	-15	1.5e-5	1e-05
+float8	-15	0.000123	0.0001
+float4	-15	0.000123	0.0001
+float8	-15	3.141592653589793	3
+float4	-15	3.141592653589793	3
+float8	-15	2.718281828459045	3
+float4	-15	2.718281828459045	3
+float8	-15	1.7976931348623157e308	2e+308
+float4	-15	1.7976931348623157e308	ERROR 22003 "1.7976931348623157e308" is out of range for type real
+float8	-15	2.2250738585072014e-308	2e-308
+float4	-15	2.2250738585072014e-308	ERROR 22003 "2.2250738585072014e-308" is out of range for type real
+float8	-15	4.9e-324	5e-324
+float4	-15	4.9e-324	ERROR 22003 "4.9e-324" is out of range for type real
+float8	-15	5e-324	5e-324
+float4	-15	5e-324	ERROR 22003 "5e-324" is out of range for type real
+float8	-15	1e-320	1e-320
+float4	-15	1e-320	ERROR 22003 "1e-320" is out of range for type real
+float8	-15	3.4028235e38	3e+38
+float4	-15	3.4028235e38	3e+38
+float8	-15	3.5e38	4e+38
+float4	-15	3.5e38	ERROR 22003 "3.5e38" is out of range for type real
+float8	-15	1.17549435e-38	1e-38
+float4	-15	1.17549435e-38	1e-38
+float8	-15	1.4e-45	1e-45
+float4	-15	1.4e-45	1e-45
+float8	-15	1e-46	1e-46
+float4	-15	1e-46	ERROR 22003 "1e-46" is out of range for type real
+float8	-15	1e-50	1e-50
+float4	-15	1e-50	ERROR 22003 "1e-50" is out of range for type real
+float8	-15	1e39	1e+39
+float4	-15	1e39	ERROR 22003 "1e39" is out of range for type real
+float8	-15	1e309	ERROR 22003 "1e309" is out of range for type double precision
+float4	-15	1e309	ERROR 22003 "1e309" is out of range for type real
+float8	-15	-1e309	ERROR 22003 "-1e309" is out of range for type double precision
+float4	-15	-1e309	ERROR 22003 "-1e309" is out of range for type real
+float8	-15	1e-400	ERROR 22003 "1e-400" is out of range for type double precision
+float4	-15	1e-400	ERROR 22003 "1e-400" is out of range for type real
+float8	-15	0e-400	0
+float4	-15	0e-400	0
+float8	-15	0x1p-1074	5e-324
+float4	-15	0x1p-1074	ERROR 22003 "0x1p-1074" is out of range for type real
+float8	-15	0x1.8p1	3
+float4	-15	0x1.8p1	3
+float8	-15	0X10	2e+01
+float4	-15	0X10	2e+01
+float8	-15	0x	ERROR 22P02 invalid input syntax for type double precision: "0x"
+float4	-15	0x	ERROR 22P02 invalid input syntax for type real: "0x"
+float8	-15	NaN	NaN
+float4	-15	NaN	NaN
+float8	-15	nan	NaN
+float4	-15	nan	NaN
+float8	-15	Infinity	Infinity
+float4	-15	Infinity	Infinity
+float8	-15	-infinity	-Infinity
+float4	-15	-infinity	-Infinity
+float8	-15	inf	Infinity
+float4	-15	inf	Infinity
+float8	-15	+Inf	Infinity
+float4	-15	+Inf	Infinity
+float8	-15	-INF	-Infinity
+float4	-15	-INF	-Infinity
+float8	-15	infinit	ERROR 22P02 invalid input syntax for type double precision: "infinit"
+float4	-15	infinit	ERROR 22P02 invalid input syntax for type real: "infinit"
+float8	-15	 1.5 	2
+float4	-15	 1.5 	2
+float8	-15	1.5x	ERROR 22P02 invalid input syntax for type double precision: "1.5x"
+float4	-15	1.5x	ERROR 22P02 invalid input syntax for type real: "1.5x"
+float8	-15		ERROR 22P02 invalid input syntax for type double precision: ""
+float4	-15		ERROR 22P02 invalid input syntax for type real: ""
+float8	-15	 	ERROR 22P02 invalid input syntax for type double precision: " "
+float4	-15	 	ERROR 22P02 invalid input syntax for type real: " "
+float8	-15	.5	0.5
+float4	-15	.5	0.5
+float8	-15	5.	5
+float4	-15	5.	5
+float8	-15	.	ERROR 22P02 invalid input syntax for type double precision: "."
+float4	-15	.	ERROR 22P02 invalid input syntax for type real: "."
+float8	-15	1e	ERROR 22P02 invalid input syntax for type double precision: "1e"
+float4	-15	1e	ERROR 22P02 invalid input syntax for type real: "1e"
+float8	-15	1e+	ERROR 22P02 invalid input syntax for type double precision: "1e+"
+float4	-15	1e+	ERROR 22P02 invalid input syntax for type real: "1e+"
+float8	-15	e5	ERROR 22P02 invalid input syntax for type double precision: "e5"
+float4	-15	e5	ERROR 22P02 invalid input syntax for type real: "e5"
+float8	-15	+-1	ERROR 22P02 invalid input syntax for type double precision: "+-1"
+float4	-15	+-1	ERROR 22P02 invalid input syntax for type real: "+-1"
+float8	-15	1_000	ERROR 22P02 invalid input syntax for type double precision: "1_000"
+float4	-15	1_000	ERROR 22P02 invalid input syntax for type real: "1_000"
+float8	-15	9007199254740993	9e+15
+float4	-15	9007199254740993	9e+15
+float8	-15	0.30000000000000004	0.3
+float4	-15	0.30000000000000004	0.3
+float8	-15	1e-7	1e-07
+float4	-15	1e-7	1e-07
+float8	-15	123456.7	1e+05
+float4	-15	123456.7	1e+05
+float8	-15	16777217	2e+07
+float4	-15	16777217	2e+07
+float8	-15	0.333333333333333333	0.3
+float4	-15	0.333333333333333333	0.3

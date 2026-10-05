@@ -7,8 +7,9 @@
 //! every generated file matches what its generator writes today. The gate runs the check.
 //!
 //! The plan is `16-crate-layout.md` section 16.5 of the PostgreSQL compatibility notes. Today
-//! there are two vendored files: `errcodes.txt` gives the SQLSTATE list of `rudb-common`, and
-//! `cmdtaglist.h` gives the command tags of `rudb-pgwire`.
+//! there are three vendored files: `errcodes.txt` gives the SQLSTATE list of `rudb-common`,
+//! `cmdtaglist.h` gives the command tags of `rudb-pgwire`, and `pg_type.dat` gives the type OIDs
+//! of `rudb-pgtypes`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -24,7 +25,7 @@ struct Vendor {
     files: &'static [(&'static str, &'static str)],
 }
 
-const VENDORS: [Vendor; 2] = [
+const VENDORS: [Vendor; 3] = [
     Vendor {
         dir: "crates/rudb-common/vendor",
         files: &[
@@ -39,6 +40,13 @@ const VENDORS: [Vendor; 2] = [
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },
+    Vendor {
+        dir: "crates/rudb-pgtypes/vendor",
+        files: &[
+            ("src/include/catalog/pg_type.dat", "pg_type.dat"),
+            ("COPYRIGHT", "LICENSE.postgres"),
+        ],
+    },
 ];
 
 /// One generated file: where it goes, the vendored file it comes from, both relative to the
@@ -49,7 +57,7 @@ struct Generated {
     generate: fn(&str) -> Result<String, String>,
 }
 
-const GENERATED: [Generated; 2] = [
+const GENERATED: [Generated; 3] = [
     Generated {
         output: "crates/rudb-common/src/generated/sqlstate.rs",
         input: "crates/rudb-common/vendor/errcodes.txt",
@@ -59,6 +67,11 @@ const GENERATED: [Generated; 2] = [
         output: "crates/rudb-pgwire/src/generated/cmdtag.rs",
         input: "crates/rudb-pgwire/vendor/cmdtaglist.h",
         generate: cmdtag,
+    },
+    Generated {
+        output: "crates/rudb-pgtypes/src/generated/oids.rs",
+        input: "crates/rudb-pgtypes/vendor/pg_type.dat",
+        generate: pgtype,
     },
 ];
 
@@ -371,6 +384,209 @@ fn cmdtag(text: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// One type of `pg_type.dat` with the fields that the generated table keeps. `elem` is a type
+/// name until all the entries are read, because the file refers to the element type by name.
+struct TypeRow {
+    oid: u32,
+    name: String,
+    descr: String,
+    kind: char,
+    category: char,
+    len: i16,
+    elem: String,
+    array: String,
+    delim: char,
+}
+
+/// Reads the entries of a catalog `.dat` file. The file is a Perl array of hashes: each entry is
+/// `{ key => 'value', ... }`, a value is in single quotes with `\'` and `\\` as escapes, and a line
+/// that starts with `#` is a comment.
+fn dat_entries(text: &str) -> Result<Vec<BTreeMap<String, String>>, String> {
+    let text: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let mut chars = text.chars().peekable();
+    let mut entries = Vec::new();
+    let skip = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+    };
+    while let Some(c) = chars.next() {
+        if c != '{' {
+            continue;
+        }
+        let mut entry = BTreeMap::new();
+        loop {
+            skip(&mut chars);
+            if chars.next_if_eq(&'}').is_some() {
+                break;
+            }
+            let mut key = String::new();
+            while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
+                key.push(c);
+            }
+            skip(&mut chars);
+            if key.is_empty() || chars.next() != Some('=') || chars.next() != Some('>') {
+                return Err(format!("pg_type.dat: a field with no `=>` after `{key}`"));
+            }
+            skip(&mut chars);
+            if chars.next() != Some('\'') {
+                return Err(format!("pg_type.dat: the value of `{key}` is not in quotes"));
+            }
+            let mut value = String::new();
+            loop {
+                match chars.next() {
+                    None => return Err(format!("pg_type.dat: the value of `{key}` has no end")),
+                    Some('\\') => value.extend(chars.next()),
+                    Some('\'') => break,
+                    Some(c) => value.push(c),
+                }
+            }
+            if entry.insert(key.clone(), value).is_some() {
+                return Err(format!("pg_type.dat: `{key}` is two times in one entry"));
+            }
+            skip(&mut chars);
+            let _ = chars.next_if_eq(&',');
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Renders the type OIDs from the text of `pg_type.dat`.
+///
+/// An entry with `array_type_oid` also gives an array type, as `genbki.pl` makes it: the name
+/// with `_` in front, `typtype` `b`, `typcategory` `A`, `typlen` -1, the entry as `typelem` and
+/// the `typdelim` of the entry. An entry can also name its array type with `typarray`, as
+/// `record` does. The constant of a type is its name in upper case, and the constant
+/// of an array is the name of its element with `_ARRAY` after it.
+fn pgtype(text: &str) -> Result<String, String> {
+    let mut rows = Vec::new();
+    for entry in dat_entries(text)? {
+        let field = |key: &str| entry.get(key).map(String::as_str);
+        let name = field("typname").ok_or("pg_type.dat: an entry with no typname")?;
+        let bad = |what: &str| format!("pg_type.dat: {name} has a bad {what}");
+        let char_of = |key: &str, default: char| match field(key) {
+            None => Ok(default),
+            Some(v) if v.chars().count() == 1 => Ok(v.chars().next().unwrap_or(default)),
+            Some(_) => Err(bad(key)),
+        };
+        let oid = field("oid").and_then(|v| v.parse().ok()).ok_or_else(|| bad("oid"))?;
+        let len = match field("typlen") {
+            // The server is 64-bit, and `pg_type.typlen` shows 8 there.
+            Some("NAMEDATALEN") => 64,
+            Some("SIZEOF_POINTER") => 8,
+            Some(v) => v.parse().map_err(|_| bad("typlen"))?,
+            None => return Err(bad("typlen")),
+        };
+        let row = TypeRow {
+            oid,
+            name: name.to_string(),
+            descr: field("descr").unwrap_or("").to_string(),
+            kind: char_of("typtype", 'b')?,
+            category: char_of("typcategory", ' ')?,
+            len,
+            elem: field("typelem").unwrap_or("").to_string(),
+            array: field("typarray").unwrap_or("").to_string(),
+            delim: char_of("typdelim", ',')?,
+        };
+        if row.category == ' ' {
+            return Err(bad("typcategory"));
+        }
+        let array = match field("array_type_oid") {
+            Some(v) => Some(v.parse().map_err(|_| bad("array_type_oid"))?),
+            None => None,
+        };
+        if let Some(array) = array {
+            rows.push(TypeRow {
+                oid: array,
+                name: format!("_{name}"),
+                descr: String::new(),
+                kind: 'b',
+                category: 'A',
+                len: -1,
+                elem: name.to_string(),
+                array: String::new(),
+                delim: row.delim,
+            });
+            rows.push(TypeRow { array: format!("_{name}"), ..row });
+        } else {
+            rows.push(row);
+        }
+    }
+
+    let oids: BTreeMap<&str, u32> = rows.iter().map(|r| (r.name.as_str(), r.oid)).collect();
+    if oids.len() != rows.len() {
+        return Err("pg_type.dat: two types have the same name".to_string());
+    }
+    let resolve = |name: &str| match name {
+        "" => Ok(0),
+        name => oids.get(name).copied().ok_or_else(|| format!("pg_type.dat: no type {name}")),
+    };
+    let mut links = Vec::new();
+    for row in &rows {
+        links.push((resolve(&row.elem)?, resolve(&row.array)?));
+    }
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by_key(|&i| rows[i].oid);
+    if order.windows(2).any(|w| rows[w[0]].oid == rows[w[1]].oid) {
+        return Err("pg_type.dat: two types have the same OID".to_string());
+    }
+
+    let mut out = String::from(
+        "//! The built-in types of PostgreSQL: one for each entry of `pg_type.dat`, and one for each\n\
+         //! array type that an entry asks for with `array_type_oid`, as `genbki.pl` makes them.\n\
+         //!\n\
+         //! @generated by `cargo xtask pg-vendor` from `crates/rudb-pgtypes/vendor/pg_type.dat`.\n\
+         //! Do not edit. `cargo xtask pg-check` runs in the gate and fails if this file and the\n\
+         //! vendored file disagree.\n\
+         \n\
+         use crate::types::{Oid, TypeInfo, t};\n\
+         \n",
+    );
+    for &i in &order {
+        let row = &rows[i];
+        let constant = match row.name.strip_prefix('_') {
+            Some(elem) => format!("{}_ARRAY", elem.to_ascii_uppercase()),
+            None => row.name.to_ascii_uppercase(),
+        };
+        if row.descr.is_empty() && row.category == 'A' && row.name.starts_with('_') {
+            let _ = writeln!(out, "/// `{}`, the array of `{}`.", row.name, &row.name[1..]);
+        } else if row.descr.is_empty() {
+            let _ = writeln!(out, "/// `{}`.", row.name);
+        } else {
+            // A description such as `format '[point1,point2]'` must not read as a link or a tag.
+            let mut descr = String::new();
+            for c in row.descr.chars() {
+                if "[]<>".contains(c) {
+                    descr.push('\\');
+                }
+                descr.push(c);
+            }
+            let _ = writeln!(out, "/// `{}`, {descr}.", row.name);
+        }
+        let _ = writeln!(out, "pub const {constant}: Oid = {};", row.oid);
+    }
+    let _ = writeln!(
+        out,
+        "\n/// Every type in the order of the OIDs: the OID, `typname`, `typtype`, `typcategory`,\n\
+         /// `typlen`, `typelem`, `typarray` and `typdelim`.\n\
+         pub(crate) static TYPES: [TypeInfo; {}] = [",
+        rows.len()
+    );
+    for &i in &order {
+        let row = &rows[i];
+        let _ = writeln!(
+            out,
+            "    t({}, \"{}\", b'{}', b'{}', {}, {}, {}, b'{}'),",
+            row.oid, row.name, row.kind, row.category, row.len, links[i].0, links[i].1, row.delim
+        );
+    }
+    out.push_str("];\n");
+    Ok(out)
+}
+
 /// The version in the `project()` call of the top `meson.build`, for example `19beta4`.
 fn version(meson: &str) -> Result<String, String> {
     meson
@@ -419,7 +635,7 @@ fn git(checkout: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cmdtag, manifest, sqlstate, version};
+    use super::{cmdtag, manifest, pgtype, sqlstate, version};
 
     const SAMPLE: &str = "\
 # A comment.
@@ -487,5 +703,39 @@ Section: Class 3D - Invalid Catalog Name
                     PG_CMDTAG(CMDTAG_DELETE, \"DELETE\", false, false, true)\n";
         assert!(cmdtag(text).is_err());
         assert!(cmdtag("PG_CMDTAG(CMDTAG_X, \"X\", maybe, false, true)\n").is_err());
+    }
+
+    #[test]
+    fn the_types_and_their_arrays_become_constants_and_rows() {
+        let text = "# a comment\n[\n\
+                    { oid => '16', array_type_oid => '1000',\n  descr => 'boolean, format \\'t\\'/\\'f\\'',\n  \
+                    typname => 'bool', typlen => '1', typcategory => 'B' },\n\
+                    { oid => '19', typname => 'name', typlen => 'NAMEDATALEN',\n  typcategory => 'S', typelem => 'char' },\n\
+                    { oid => '18', typname => 'char', typlen => '1', typcategory => 'Z' },\n\
+                    { oid => '603', array_type_oid => '1020', typname => 'box', typlen => '32',\n  \
+                    typcategory => 'G', typdelim => ';' },\n\
+                    ]\n";
+        let out = pgtype(text).expect("the sample parses");
+        assert!(out.contains("/// `bool`, boolean, format 't'/'f'.\npub const BOOL: Oid = 16;\n"));
+        assert!(
+            out.contains("/// `_bool`, the array of `bool`.\npub const BOOL_ARRAY: Oid = 1000;\n")
+        );
+        assert!(out.contains("TYPES: [TypeInfo; 6]"));
+        assert!(out.contains("    t(16, \"bool\", b'b', b'B', 1, 0, 1000, b','),\n"));
+        assert!(out.contains("    t(19, \"name\", b'b', b'S', 64, 18, 0, b','),\n"));
+        assert!(out.contains("    t(1020, \"_box\", b'b', b'A', -1, 603, 0, b';'),\n"));
+        // The rows are in the order of the OIDs.
+        assert!(out.find("t(18,") < out.find("t(19,"));
+    }
+
+    #[test]
+    fn a_type_with_an_unknown_element_or_a_second_oid_is_refused() {
+        let elem =
+            "{ oid => '1', typname => 'a', typlen => '1', typcategory => 'A', typelem => 'b' }";
+        assert!(pgtype(elem).is_err());
+        let twice = "{ oid => '1', typname => 'a', typlen => '1', typcategory => 'A' },\n\
+                     { oid => '1', typname => 'b', typlen => '1', typcategory => 'A' }";
+        assert!(pgtype(twice).is_err());
+        assert!(pgtype("{ oid => '1', typname => 'a', typlen => '1' }").is_err());
     }
 }

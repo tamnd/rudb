@@ -719,6 +719,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-pgtypes"
+version = "0.8.25"
+dependencies = [
+ "rudb-common",
+]
+
+[[package]]
 name = "rudb-pgwire"
 version = "0.8.25"
 
