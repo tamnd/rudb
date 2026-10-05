@@ -1094,16 +1094,16 @@ impl CodedColumn<'_> {
     /// neither question is asked six million times. Doing it the other way round cost seven
     /// instructions a row on `GROUP BY l_returnflag, l_linestatus` the moment there were two forms
     /// to tell apart, which is more than the whole probe it saves.
-    fn add_into(&self, into: &mut [usize]) {
-        let stride = self.stride;
+    fn add_into(&self, into: &mut [u32]) {
+        let stride = self.stride as u32;
         if self.nullable {
-            let nothing = self.nothing;
+            let nothing = self.nothing as u32;
             let column = self.column;
             match self.places {
                 Places::Codes { codes, .. } => {
                     for (row, place) in into.iter_mut().enumerate() {
                         let code =
-                            if column.is_null_at(row) { nothing } else { codes[row] as usize };
+                            if column.is_null_at(row) { nothing } else { codes[row] };
                         *place += code * stride;
                     }
                 }
@@ -1112,7 +1112,7 @@ impl CodedColumn<'_> {
                         let code = if column.is_null_at(row) {
                             nothing
                         } else {
-                            packed.code(row) as usize
+                            packed.code(row) as u32
                         };
                         *place += code * stride;
                     }
@@ -1122,7 +1122,7 @@ impl CodedColumn<'_> {
                         let code = if column.is_null_at(row) {
                             nothing
                         } else {
-                            packed.code(at[row] as usize) as usize
+                            packed.code(at[row] as usize) as u32
                         };
                         *place += code * stride;
                     }
@@ -1132,7 +1132,7 @@ impl CodedColumn<'_> {
                         let code = if column.is_null_at(row) {
                             nothing
                         } else {
-                            values[row].wrapping_sub(low) as u64 as usize
+                            values[row].wrapping_sub(low) as u32
                         };
                         *place += code * stride;
                     }
@@ -1143,7 +1143,7 @@ impl CodedColumn<'_> {
         match self.places {
             Places::Codes { codes, .. } => {
                 for (row, place) in into.iter_mut().enumerate() {
-                    *place += codes[row] as usize * stride;
+                    *place += codes[row] * stride;
                 }
             }
             // Sixty four codes at a time out of the words, since a code at a time works out its word,
@@ -1159,19 +1159,19 @@ impl CodedColumn<'_> {
                     let codes = &mut block[..places.len()];
                     packed.unpack(from, codes);
                     for (place, &code) in places.iter_mut().zip(codes.iter()) {
-                        *place += code as usize * stride;
+                        *place += code as u32 * stride;
                     }
                     from += places.len();
                 }
             }
             Places::CodedBits { at, packed } => {
                 for (row, place) in into.iter_mut().enumerate() {
-                    *place += packed.code(at[row] as usize) as usize * stride;
+                    *place += packed.code(at[row] as usize) as u32 * stride;
                 }
             }
             Places::Values { values, low, .. } => {
                 for (place, &value) in into.iter_mut().zip(values) {
-                    *place += value.wrapping_sub(low) as u64 as usize * stride;
+                    *place += value.wrapping_sub(low) as u32 * stride;
                 }
             }
         }
@@ -1245,7 +1245,12 @@ impl<'a> Coded<'a> {
     }
 
     /// Fills `places` with the index in the map of each row's key, one pass per key column.
-    pub(crate) fn places(&self, rows: usize, places: &mut Vec<usize>) {
+    ///
+    /// A place is a `u32`, which every map fits since none is longer than [`WIDE_COMBOS`]. As a
+    /// `usize` each multiply by a column's stride was three multiplies and two shifts on AVX2, which
+    /// has no 64 bit multiply, and q01's four key columns came to a sixth of the query. As a `u32` it
+    /// is one multiply of eight lanes, and half the bytes go back to memory.
+    pub(crate) fn places(&self, rows: usize, places: &mut Vec<u32>) {
         places.clear();
         places.resize(rows, 0);
         for column in self.columns.iter().flatten() {
@@ -1553,12 +1558,12 @@ pub(crate) fn slot_at(held: u32) -> usize {
 /// borrows the store into a slot could have changed any of them, so every row loaded the places,
 /// the map and both lengths again. That was a quarter of what the fold itself cost in q01 once it
 /// grouped by four keys (`spec/perf/90`).
-pub(crate) fn slots_from(map: &[u32], places: &[usize], slots: &mut [usize], from: usize) -> usize {
+pub(crate) fn slots_from(map: &[u32], places: &[u32], slots: &mut [usize], from: usize) -> usize {
     let (Some(places), Some(slots)) = (places.get(from..), slots.get_mut(from..)) else {
         return from;
     };
     for (at, (slot, &place)) in slots.iter_mut().zip(places).enumerate() {
-        let held = map[place];
+        let held = map[place as usize];
         if held == UNSEEN {
             return from + at;
         }
@@ -4507,7 +4512,7 @@ mod tests {
     fn placed(coded: &Coded<'_>, rows: usize) -> Vec<usize> {
         let mut places = Vec::new();
         coded.places(rows, &mut places);
-        places
+        places.into_iter().map(|place| place as usize).collect()
     }
 
     /// A packed column cut part way into a word and longer than a block places every row by its own
@@ -4819,7 +4824,7 @@ mod tests {
         let mut expected = Vec::new();
         for (row, &place) in places.iter().enumerate() {
             if row + 1 == rows || places[row + 1] != place {
-                expected.push((place, row + 1));
+                expected.push((place as usize, row + 1));
             }
         }
         let mut runs = Vec::new();

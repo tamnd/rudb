@@ -2753,7 +2753,7 @@ impl PlaceSums {
     pub fn add(
         &mut self,
         map: &[u32],
-        places: &[usize],
+        places: &[u32],
         kept: Option<&[u32]>,
         from: usize,
     ) -> Result<usize> {
@@ -2819,11 +2819,14 @@ impl PlaceSums {
     /// are bugs in the caller.
     pub fn add_places(
         &mut self,
-        places: &mut [usize],
+        places: &mut [u32],
         kept: Option<&[u32]>,
         combos: usize,
     ) -> Result<()> {
         let needed = (combos + 1) * cell_span(self.calls.len());
+        let Ok(past) = u32::try_from(combos) else {
+            return Err(Error::internal(format!("a map of {combos} places")));
+        };
         self.added = places.len();
         if self.by_place.len() < needed {
             self.by_place.resize(needed, 0);
@@ -2834,12 +2837,12 @@ impl PlaceSums {
                 _ => (0, 0),
             };
             if let Some(dropped) = places.get_mut(..first) {
-                dropped.fill(combos);
+                dropped.fill(past);
             }
             if let Some(dropped) = places.get_mut(next..) {
-                dropped.fill(combos);
+                dropped.fill(past);
             }
-            fill_dropped(kept, places, combos);
+            fill_dropped(kept, places, past);
         }
         let values = &self.values[..self.calls.len()];
         let cells = &mut self.by_place[..needed];
@@ -3049,7 +3052,7 @@ fn fold_cells(
 /// looked at a row at a time. On q01 about one row in seventy is dropped. A walk of the kept rows
 /// to find the gaps was about seven instructions a row, and cutting the list in two while a half
 /// had a gap was about 13 steps a gap.
-fn fill_dropped(kept: &[u32], places: &mut [usize], combos: usize) {
+fn fill_dropped(kept: &[u32], places: &mut [u32], combos: u32) {
     let mut start = 0;
     while start + 1 < kept.len() {
         let end = (start + 8).min(kept.len() - 1);
@@ -3075,7 +3078,7 @@ const PLACE_CELLS: usize = 1 << 16;
 fn by_place<const W: usize, const S: usize>(
     cells: &mut [i64],
     values: &[Vec<u64>],
-    places: &[usize],
+    places: &[u32],
 ) -> Result<()> {
     const NONE: [u64; 8] = [0; 8];
     let mut columns: [&[u64]; W] = [&[]; W];
@@ -3101,7 +3104,7 @@ fn by_place<const W: usize, const S: usize>(
             for (value, lanes) in row.iter_mut().zip(&lanes) {
                 *value = lanes[at];
             }
-            add_row::<W, S>(cells, place, &row)?;
+            add_row::<W, S>(cells, place as usize, &row)?;
         }
     }
     let done = blocks.len() * 8;
@@ -3110,7 +3113,7 @@ fn by_place<const W: usize, const S: usize>(
         for (value, column) in row.iter_mut().zip(&columns) {
             *value = column[done + at];
         }
-        add_row::<W, S>(cells, place, &row)?;
+        add_row::<W, S>(cells, place as usize, &row)?;
     }
     Ok(())
 }
@@ -3158,7 +3161,7 @@ fn by_slot<const W: usize, const S: usize>(
     cells: &mut Vec<i64>,
     values: &[Vec<u64>],
     map: &[u32],
-    places: &[usize],
+    places: &[u32],
     rows: impl Iterator<Item = usize>,
 ) -> Result<usize> {
     let mut columns: [&[u64]; W] = [&[]; W];
@@ -3169,7 +3172,7 @@ fn by_slot<const W: usize, const S: usize>(
     }
     let mut slots = cells.as_chunks_mut::<S>().0;
     for row in rows {
-        let Some(&held) = places.get(row).and_then(|&place| map.get(place)) else {
+        let Some(&held) = places.get(row).and_then(|&place| map.get(place as usize)) else {
             return Err(Error::internal(format!("row {row} has no place in the map")));
         };
         if held == UNSEEN {
@@ -6508,8 +6511,8 @@ mod tests {
         // Added up through a map with the rows in no group dropped, every call but the one that points
         // somewhere else and the flat `i64` ones, which go the old way, reaches the same answers.
         let mut by_place = fresh();
-        let places: Vec<usize> =
-            slots.iter().map(|&slot| if slot == NOWHERE { 0 } else { slot }).collect();
+        let places: Vec<u32> =
+            slots.iter().map(|&slot| if slot == NOWHERE { 0 } else { slot as u32 }).collect();
         let kept: Vec<u32> =
             (0..rows).filter(|&row| slots[row] != NOWHERE).map(|row| row as u32).collect();
         let mut sums = PlaceSums::default();
@@ -6606,13 +6609,13 @@ mod tests {
         for rows in [1, 2, 7, 64, 300] {
             for every in [2, 3, 70, 1000] {
                 let kept: Vec<u32> = (0..rows as u32).filter(|_| rng.next() % every != 0).collect();
-                let mut found: Vec<usize> = (0..rows).collect();
-                fill_dropped(&kept, &mut found, usize::MAX);
-                let mut walked: Vec<usize> = (0..rows).collect();
+                let mut found: Vec<u32> = (0..rows as u32).collect();
+                fill_dropped(&kept, &mut found, u32::MAX);
+                let mut walked: Vec<u32> = (0..rows as u32).collect();
                 if let (Some(&first), Some(&last)) = (kept.first(), kept.last()) {
                     for row in first as usize..=last as usize {
                         if kept.binary_search(&(row as u32)).is_err() {
-                            walked[row] = usize::MAX;
+                            walked[row] = u32::MAX;
                         }
                     }
                 }

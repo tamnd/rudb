@@ -2951,6 +2951,7 @@ impl<'a> Aggregate<'a> {
                     place_sums.add_places(&mut coded_places[..*length], kept, combos)?;
                     if place_sums.touched(coded_map)? {
                         for (row, &place) in coded_places[..*length].iter().enumerate() {
+                            let place = place as usize;
                             if place < combos && coded_map[place] == crate::table::UNSEEN {
                                 let slot = resolve(row)?;
                                 coded_map.set(place, held_at(slot));
@@ -2966,7 +2967,7 @@ impl<'a> Aggregate<'a> {
                             break;
                         }
                         let slot = resolve(row)?;
-                        coded_map.set(coded_places[row], held_at(slot));
+                        coded_map.set(coded_places[row] as usize, held_at(slot));
                     }
                     place_sums.fold(states, calls)?;
                 }
@@ -2997,7 +2998,7 @@ impl<'a> Aggregate<'a> {
                     {
                         let slot = resolve(row)?;
                         slots[row] = slot;
-                        coded_map.set(coded_places[row], held_at(slot));
+                        coded_map.set(coded_places[row] as usize, held_at(slot));
                     } else {
                         slots[row] = NOWHERE;
                     }
@@ -5866,7 +5867,7 @@ pub(crate) struct Building {
     /// combination has not been seen.
     coded_map: Places,
     /// Which combination each row of the last chunk is, worked out one key column at a time.
-    coded_places: Vec<usize>,
+    coded_places: Vec<u32>,
     /// The last chunk's totals per group, when every call is a total or a count and the chunk was
     /// added up through the coded map with no slot found per row. See [`PlaceSums`].
     place_sums: PlaceSums,
