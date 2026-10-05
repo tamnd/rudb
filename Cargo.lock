@@ -607,6 +607,7 @@ name = "rudb-functions"
 version = "0.8.23"
 dependencies = [
  "rudb-common",
+ "rudb-compress",
  "rudb-csv",
  "rudb-io",
  "rudb-kernels",
