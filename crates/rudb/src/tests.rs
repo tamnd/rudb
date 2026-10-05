@@ -13011,7 +13011,7 @@ fn a_postgres_session_answers_current_setting_version_and_the_user() {
     settings.set("my.v", Some("42"), Action::Set, Origin::Statement).expect("a placeholder");
     settings.set("work_mem", Some("64MB"), Action::Set, Origin::Statement).expect("a parameter");
     let version = "PostgreSQL 19.0 (rudb test)".to_owned();
-    connection.set_postgres(Arc::new(Postgres { settings, version }));
+    connection.set_postgres(Arc::new(Postgres { settings, version, input: None }));
     assert_eq!(text("SELECT current_setting('my.v')"), Value::Varchar("42".to_owned()));
     assert_eq!(text("SELECT current_setting('work_mem')"), Value::Varchar("64MB".to_owned()));
     assert_eq!(
@@ -13037,7 +13037,7 @@ fn a_postgres_session_names_columns_the_way_postgres_does() {
     let connection = db.connect();
     let names = |sql: &str| connection.query(sql).expect("runs").names().to_vec();
     assert_eq!(names("SELECT 1, lower('A')"), ["1", "lower('A')"]);
-    let postgres = Postgres { settings: Settings::new(true), version: String::new() };
+    let postgres = Postgres { settings: Settings::new(true), version: String::new(), input: None };
     connection.set_postgres(Arc::new(postgres));
     assert_eq!(
         names("SELECT 1, 'x', version(), count(*)"),
