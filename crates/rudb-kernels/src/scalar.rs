@@ -53,7 +53,7 @@ use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_
 use rudb_vector::{Data, Form, NO_ROW, StringColumn, Validity, Vector, picked};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use crate::aggregate::{Accumulator, divide_mean, exactly};
 use crate::bitstring;
@@ -2538,17 +2538,21 @@ const LIKE_GROUP: usize = 1024;
 /// groups they fall in, which is a guess about intent and not a fact about the query. Both ways
 /// read a block once for the call, so a wrong guess costs searches and never kept memory.
 ///
-/// Two threads can decide the same value or the same group at the same time. They walk the same
-/// values with the same pattern and reach the same answer, so the race is benign: the group write
-/// and the single value write agree wherever they overlap, and neither can clear a bit the other
-/// set. A decision is one `fetch_or` carrying both bits, released by the thread that made it and
-/// acquired by the thread that skips the walk because of it.
+/// Two threads can decide the same value at the same time, or one a value and the other its group.
+/// They walk the same values with the same pattern and reach the same answer, so the race is
+/// benign: the group write and the single value write agree wherever they overlap, and neither can
+/// clear a bit the other set. Two threads never decide the same group at once, since the second
+/// waits for the first and then finds the group decided. A decision is one `fetch_or` carrying
+/// both bits, released by the thread that made it and acquired by the thread that skips the walk
+/// because of it.
 #[derive(Debug)]
 struct StableLike {
     dictionary: Arc<Vector>,
     /// Two bits a value, the low one of the pair saying the value was decided and the high one
     /// saying it matched, packed thirty two values to the word.
     state: Vec<AtomicU64>,
+    /// Held by the thread deciding a group, one lock a group.
+    deciding: Vec<Mutex<()>>,
 }
 
 /// How much more than the values asked about a group walk may search before a sparse chunk decides
@@ -2598,6 +2602,9 @@ fn covers(asked: &[usize], wanted: &[usize]) -> bool {
 /// How many dictionary values one word of the memo holds, at two bits each.
 const MEMO_VALUES: usize = 32;
 
+/// The low bit of every pair in a word, which is set for each value decided.
+const DECIDED: u64 = 0x5555_5555_5555_5555;
+
 impl StableLike {
     /// The word `code` lives in and how far into it the pair of bits sits.
     fn slot(code: usize) -> (usize, usize) {
@@ -2630,11 +2637,10 @@ impl StableLike {
     /// bytes. Nothing reads a bit before it is written, since a thread that finds the value
     /// undecided walks it itself.
     ///
-    /// Two threads landing on the same group now decode the same block twice where one used to
-    /// decode it and the other wait on the lock behind it. That is the trade and it is a good one:
-    /// a scan hands each thread its own parts and the dictionary has seventeen thousand blocks, so
-    /// the collision is rare, and what it costs when it happens is one block decoded twice rather
-    /// than every block kept for the length of the query.
+    /// A thread landing on a group another is deciding waits for it rather than decoding the same
+    /// block again. The lock is the group's own and covers no block, so nothing is kept past the
+    /// call. Without it ClickBench q21 to q23 decoded six to twelve in a hundred blocks twice on
+    /// eight threads, since the threads scan neighbouring parts that ask about the same groups.
     ///
     /// A small chunk whose values crowd into few groups walks the group too. Small chunks used to
     /// read the one value they asked about a value at a time, and on a filter that leaves a few
@@ -2644,7 +2650,15 @@ impl StableLike {
     fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
         let first = code / LIKE_GROUP * LIKE_GROUP;
         let last = (first + LIKE_GROUP).min(self.dictionary.len());
-        if self.ruled_out(first, last, like)? {
+        // A thread that failed or panicked deciding the group left it undecided, so this one
+        // decides it.
+        let _deciding = self
+            .deciding
+            .get(first / LIKE_GROUP)
+            .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.decided(first, last) || self.ruled_out(first, last, like)? {
             return Ok(());
         }
         let mut bits = [0_u64; LIKE_GROUP / MEMO_VALUES];
@@ -2811,6 +2825,14 @@ impl StableLike {
             let codes = wanted.iter().map(|&code| code as u32).collect::<Vec<_>>();
             self.dictionary.visit_text(&codes, &mut decide)
         }
+    }
+
+    /// Whether every value from `first` to `last` is decided already.
+    fn decided(&self, first: usize, last: usize) -> bool {
+        (first..last).step_by(MEMO_VALUES).all(|at| {
+            let mask = DECIDED >> (64 - 2 * (last - at).min(MEMO_VALUES));
+            self.state[at / MEMO_VALUES].load(Ordering::Acquire) & mask == mask
+        })
     }
 
     /// Whether some value from `first` to `last` is decided already, which means an earlier chunk
@@ -3269,6 +3291,7 @@ fn like_stable(
         StableLike {
             dictionary: Arc::clone(dictionary),
             state: (0..words).map(|_| AtomicU64::new(0)).collect(),
+            deciding: (0..dictionary.len().div_ceil(LIKE_GROUP)).map(|_| Mutex::new(())).collect(),
         }
     });
     if !Arc::ptr_eq(&cache.dictionary, dictionary) {

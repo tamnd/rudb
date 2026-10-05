@@ -25,7 +25,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_regex::{Captures, Options, Regex, Rewrite};
@@ -304,8 +304,9 @@ struct StableReplace {
 
 /// The replaced values of a dictionary, decided a group at a time.
 ///
-/// Two threads can decide the same group at once. Both look every answer up in the same table, so
-/// they reach the same codes, the first to finish keeps its group and the other drops its own.
+/// A group is decided by one thread at a time. A second thread that wants it waits for the first
+/// rather than decoding the same block and running the pattern over the same values, which on
+/// ClickBench 29 was up to one group in twenty decided twice.
 #[derive(Debug)]
 struct Memo {
     dictionary: Arc<Vector>,
@@ -319,6 +320,8 @@ struct Memo {
     /// answers go in before any of its codes are put in `firsts`, so a code found there always has
     /// its answer here.
     answers: Vec<OnceLock<Replaced>>,
+    /// Held by the thread deciding a group, one lock a group.
+    deciding: Vec<Mutex<()>>,
     /// Each distinct answer seen so far and the first value that gave it.
     firsts: Vec<Mutex<Seen>>,
     /// Bytes held so far, across every group and every answer.
@@ -407,6 +410,13 @@ impl Memo {
             .groups
             .get(code / REPLACE_GROUP)
             .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?;
+        if let Some(done) = slot.get() {
+            return Ok(done);
+        }
+        // A thread that decided the group while this one waited leaves nothing to do. One that
+        // failed or panicked leaves the group undecided and this one decides it.
+        let _deciding =
+            self.deciding[code / REPLACE_GROUP].lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(done) = slot.get() {
             return Ok(done);
         }
@@ -869,6 +879,9 @@ fn replace_stable(
                 .collect(),
             answers: (0..dictionary.len().div_ceil(REPLACE_GROUP))
                 .map(|_| OnceLock::new())
+                .collect(),
+            deciding: (0..dictionary.len().div_ceil(REPLACE_GROUP))
+                .map(|_| Mutex::new(()))
                 .collect(),
             firsts: (0..REPLACE_SHARDS).map(|_| Mutex::new(Seen::default())).collect(),
             kept: AtomicUsize::new(0),
