@@ -14,7 +14,7 @@ pub(crate) fn is_space(b: u8) -> bool {
 }
 
 /// The value of a digit in `base`, if it is one.
-fn digit(b: u8, base: u64) -> Option<u64> {
+pub(crate) fn digit(b: u8, base: u64) -> Option<u64> {
     let value = match b {
         b'0'..=b'9' => b - b'0',
         b'a'..=b'f' => b - b'a' + 10,

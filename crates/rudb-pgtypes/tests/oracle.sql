@@ -1,6 +1,7 @@
 -- Makes oracle.tsv from the server at the pin:
 --   psql -X -At -F "$(printf '\t')" -f oracle.sql > oracle.tsv
--- Each line is the type, extra_float_digits, the input, and the output text or the error.
+-- Each line is the type, extra_float_digits, the input, and the output text or the error. A type
+-- that starts with "send" has the hex of the binary output.
 \set QUIET on
 create temp table inputs (n serial, t text, i text);
 insert into inputs (t, i) values
@@ -44,6 +45,41 @@ insert into floats (t, i) select t, i from
     (' 1.5 '), ('1.5x'), (''), (' '), ('.5'), ('5.'), ('.'), ('1e'), ('1e+'), ('e5'), ('+-1'),
     ('1_000'), ('9007199254740993'), ('0.30000000000000004'), ('1e-7'), ('123456.7'),
     ('16777217'), ('0.333333333333333333')) as inputs (i);
+create temp table numerics (n serial, t text, i text);
+insert into numerics (t, i) select 'numeric', i from unnest(array[
+  '0', '-0', '0.000', '-0.000', '1', '-1', '+1', ' 12.5 ', '12.50', '.5', '5.', '.', '', ' ', '1e3',
+  '1E-3', '1.5e+2', '1e', '1e+', 'e5', '1.2.3', '1_000.000_1', '1_', '_1', '1._5', '1_.5', '1__0',
+  '1e_1', '1e1_0', '1.e5', '.e5', '0x1F', '-0x1f', '+0o17', '0b101', '0x_1F', '0x', '0b2', '0x1.5',
+  '0x1_', '0xFFFFFFFFFFFFFFFF', '0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', '-0o777777777777777777777777',
+  '0b' || repeat('1', 130), 'NaN', 'nan', '-NaN', '+NaN', ' NaN ', 'Infinity', '-Infinity', 'inf',
+  '+INF', '-inf', 'infinit', 'infinityx', 'NaNx', 'abc', '1 2', '- 1', '+-1', '1.5x',
+  '123456789012345678901234567890.123456789012345678901234567890', '0.00000000000000000001',
+  '1e-20', '1e-16384', '1e131072', '1e1073741823', '1e1073741824', '9999.99995', '0.0001',
+  '0.00012345', '100000000', '99999999.99999999', '1e100', '-1.5e-10', '00012.3400',
+  '12345678901234567890', '170141183460469231731687303715884105727',
+  '-170141183460469231731687303715884105727', '1.70141183460469231731687303715884105727',
+  '0.12345678901234567890123456789012345678', '123456789.123456789', '1e38', '1e39', '5e-38',
+  '0.000000000000000000000000000000000000001'
+]) as i;
+insert into numerics (t, i) values
+  ('numeric(5,2)', '123.456'), ('numeric(5,2)', '123.455'), ('numeric(5,2)', '-123.455'),
+  ('numeric(5,2)', '999.994'), ('numeric(5,2)', '999.995'), ('numeric(5,2)', '0.001'),
+  ('numeric(5,2)', '0.005'), ('numeric(5,2)', '-0.005'), ('numeric(5,2)', '-0.004'),
+  ('numeric(5,2)', 'NaN'), ('numeric(5,2)', 'Infinity'), ('numeric(5,2)', '-inf'),
+  ('numeric(5,2)', '1e2'), ('numeric(5,2)', '12345'), ('numeric(5,2)', 'abc'),
+  ('numeric(5,2)', '1e1073741824'), ('numeric(5,2)', '1e-16384'), ('numeric(5,2)', '1e131072'),
+  ('numeric(5,2)', '0x10'), ('numeric(5,2)', '0xFFFFFFFF'), ('numeric(5,2)', 'infx'),
+  ('numeric(3,-1)', '15'), ('numeric(3,-1)', '14'), ('numeric(3,-1)', '-15'),
+  ('numeric(3,-1)', '9994'), ('numeric(3,-1)', '9995'), ('numeric(3,-1)', '0'),
+  ('numeric(3,-1)', '4.9'), ('numeric(2,5)', '0.000123'), ('numeric(2,5)', '0.0001234'),
+  ('numeric(2,5)', '0.001'), ('numeric(2,5)', '0.000995'), ('numeric(2,5)', '0.000994'),
+  ('numeric(1,0)', '0.5'), ('numeric(1,0)', '9.4'), ('numeric(1,0)', '9.5'), ('numeric(1,0)', '-9.5'),
+  ('numeric(1,1)', '0.95'), ('numeric(1,1)', '0.94'), ('numeric(1,1)', '-0.04'),
+  ('numeric(1,1)', '-0.05'), ('numeric(1000,1000)', '0.5'), ('numeric(10,4)', '9999.99995'),
+  ('numeric(8,4)', '9999.99995'), ('numeric(8,4)', '0.00005'), ('numeric(4,-3)', '1234567'),
+  ('numeric(4,-3)', '12345678'), ('numeric(4,-3)', '9999499.9'), ('numeric(4,-3)', '9999500'),
+  ('numeric(38,0)', '99999999999999999999999999999999999999'), ('numeric(38,0)', '1e38'),
+  ('numeric(38,38)', '0.99999999999999999999999999999999999999'), ('numeric(38,38)', '1');
 -- The check is in EXECUTE because pg_input_is_valid caches the type when its argument looks
 -- stable, and a parameter of a generic plan does.
 create function pg_temp.out(t text, i text) returns text language plpgsql as $$
@@ -53,9 +89,15 @@ declare
 begin
   execute format('select pg_input_is_valid(%L, %L)', i, t) into valid;
   if not valid then
-    execute format('select ''ERROR '' || sql_error_code || '' '' || message from pg_input_error_info(%L, %L)', i, t)
+    execute format('select ''ERROR '' || sql_error_code || '' '' || message || coalesce('' DETAIL '' || detail, '''') from pg_input_error_info(%L, %L)', i, t)
       into r;
     return r;
+  end if;
+  -- A cast of a literal to numeric(p,s) reads the literal with no typmod and then calls the
+  -- numeric function, which can fail where the input function with the typmod does not. So the
+  -- numeric types call the input function.
+  if t like 'numeric%' then
+    return numeric_out(numeric_in(i::cstring, 0, to_regtypemod(t)));
   end if;
   -- format calls the output function of the type. A cast to text does not for every type: bool
   -- gives true and not t.
@@ -63,7 +105,11 @@ begin
   return r;
 end
 $$;
+create function pg_temp.send(t text, i text) returns text language sql
+  return encode(numeric_send(numeric_in(i::cstring, 0, to_regtypemod(t))), 'hex');
 select t, 1, i, pg_temp.out(t, i) from inputs order by n;
+select t, 1, i, pg_temp.out(t, i) from numerics order by n;
+select 'send ' || t, 1, i, pg_temp.send(t, i) from numerics where pg_temp.out(t, i) not like 'ERROR %' order by n;
 set extra_float_digits = 1;
 select t, 1, i, pg_temp.out(t, i) from floats order by n;
 set extra_float_digits = 3;
