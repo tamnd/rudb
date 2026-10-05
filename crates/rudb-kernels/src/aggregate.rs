@@ -2631,8 +2631,10 @@ const SLOT_BLOCK: usize = 8;
 ///
 /// A packed argument is added up as its codes, and its base is added once per group at the end as
 /// many times as the group has rows, so no code is widened into its value one row at a time. The
-/// codes are unpacked 64 at a time into the stack, which is what [`rudb_vector::Packed::unpack`] is
-/// for. Only codes of 32 bits or fewer and flat integers of 32 bits or fewer are taken, so that over
+/// codes of the chunk are unpacked once into a list kept from chunk to chunk. Unpacking them 64 rows
+/// at a time as the pass went was tried, and a chunk of a page read as a window of values starts
+/// anywhere in its words, so every block of 64 fell across two of the unpack's blocks and went a code
+/// at a time. Only codes of 32 bits or fewer and flat integers of 32 bits or fewer are taken, so that over
 /// fewer than 2^31 rows no total can leave its `i64` and the adds need no check.
 ///
 /// See `spec/perf/112-totals-by-group-through-the-map.md`.
@@ -2644,20 +2646,10 @@ pub struct PlaceSums {
     /// The calls that read a value, as where each one's accumulator sits in a group, how it is fed,
     /// and what a code of it is short of its value.
     calls: Vec<(usize, Feed, i64)>,
-    /// The columns those calls read, in the same order.
-    columns: Vec<Summed>,
+    /// The codes or values of the chunk's rows for each of those calls, in the same order.
+    values: Vec<Vec<u64>>,
     /// The calls that want the row count and no value.
     counting: Vec<usize>,
-}
-
-/// A column a [`PlaceSums`] pass reads, as codes of a packed run or as small flat integers.
-///
-/// Held as the vector it came from, so that the sums can be kept between chunks with no borrow of
-/// one, and read as its packed parts or its data when a block is read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Summed {
-    Packed,
-    Narrow,
 }
 
 impl PlaceSums {
@@ -2666,7 +2658,8 @@ impl PlaceSums {
     ///
     /// `false` is a chunk this does not read, so the caller folds it the way it would have: a call
     /// that is not a total or a count, a column that is not a packed run of at most 32 bits or flat
-    /// integers of at most 32, and a table with no group yet to ask what each call holds.
+    /// integers of at most 32, and a table with no group yet to ask what each call holds. Each column
+    /// it takes is read out here, once for the chunk.
     pub fn ready(
         &mut self,
         states: &[Accumulator],
@@ -2676,7 +2669,6 @@ impl PlaceSums {
         rows: usize,
     ) -> bool {
         self.calls.clear();
-        self.columns.clear();
         self.counting.clear();
         self.cells.clear();
         if rows >= 1 << 31 {
@@ -2688,15 +2680,28 @@ impl PlaceSums {
             if wanted >> offset & 1 == 0 {
                 continue;
             }
-            let (feed, base, column) = match shareable(states, stride, offset, *input, rows, groups)
-            {
+            if self.calls.len() == SUMMED_MOST {
+                return false;
+            }
+            if self.values.len() == self.calls.len() {
+                self.values.push(Vec::new());
+            }
+            let values = &mut self.values[self.calls.len()];
+            values.resize(rows, 0);
+            let (feed, base) = match shareable(states, stride, offset, *input, rows, groups) {
                 Some(Share::Counted) => {
                     self.counting.push(offset);
                     took |= 1 << offset;
                     continue;
                 }
                 Some(Share::Folded(call)) => match call.data {
-                    Data::Int32(_) => (call.feed, 0, Summed::Narrow),
+                    Data::Int32(column) => {
+                        let Some(column) = column.as_slice().get(..rows) else { return false };
+                        for (value, &number) in values.iter_mut().zip(column) {
+                            *value = i64::from(number) as u64;
+                        }
+                        (call.feed, 0)
+                    }
                     _ => return false,
                 },
                 Some(Share::Coded(_, feed, input)) => {
@@ -2705,54 +2710,40 @@ impl PlaceSums {
                     if packed.width() > 32 {
                         return false;
                     }
-                    (feed, base, Summed::Packed)
+                    packed.unpack(0, values);
+                    (feed, base)
                 }
                 None => return false,
             };
             self.calls.push((offset, feed, base));
-            self.columns.push(column);
             took |= 1 << offset;
         }
-        took == wanted && self.calls.len() <= SUMMED_MOST
+        took == wanted
     }
 
     /// Adds the rows from `from` on into the group the map holds at each row's place, and gives the
     /// first kept row whose place holds no group yet, or the end.
     ///
-    /// `inputs` are the ones [`Self::ready`] was given, `places` each row's place in `map`, and `kept`
-    /// the rows the filter kept, in order, when it dropped any. The caller opens a group for the row
+    /// `places` is each row's place in `map`, one for every row [`Self::ready`] read, and `kept` the
+    /// rows the filter kept, in order, when it dropped any. The caller opens a group for the row
     /// handed back, writes it into the map, and asks again from that row.
     ///
     /// # Errors
     ///
-    /// An internal error for a place past the map, which is a bug in the caller.
+    /// An internal error for a place past the map or a chunk of other rows than the one read, which
+    /// are bugs in the caller.
     pub fn add(
         &mut self,
-        inputs: &[Option<&Vector>],
         map: &[u32],
         places: &[usize],
         kept: Option<&[u32]>,
         from: usize,
     ) -> Result<usize> {
-        let mut read = [Read::Narrow(&[]); SUMMED_MOST];
-        for ((at, &(offset, _, _)), &column) in read.iter_mut().zip(&self.calls).zip(&self.columns)
-        {
-            let input = inputs.get(offset).copied().flatten();
-            *at = match (column, input) {
-                (Summed::Packed, Some(input)) => input.packed_parts().map(Read::Packed),
-                (Summed::Narrow, Some(input)) => match input.data() {
-                    Some(Data::Int32(values)) => Some(Read::Narrow(values.as_slice())),
-                    _ => None,
-                },
-                _ => None,
-            }
-            .ok_or_else(|| Error::internal("a summed column changed its form".to_string()))?;
-        }
-        let read = &read[..self.calls.len()];
+        let values = &self.values[..self.calls.len()];
         macro_rules! widths {
             ($($width:literal),+ $(,)?) => {
                 match self.calls.len() {
-                    $($width => by_slot::<$width>(&mut self.cells, read, map, places, kept, from),)+
+                    $($width => by_slot::<$width>(&mut self.cells, values, map, places, kept, from),)+
                     _ => Err(Error::internal("too many summed calls".to_string())),
                 }
             };
@@ -2787,56 +2778,33 @@ impl PlaceSums {
 /// The most value calls a [`PlaceSums`] pass takes.
 const SUMMED_MOST: usize = 8;
 
-/// A column a [`PlaceSums`] pass is reading, borrowed for the pass.
-#[derive(Clone, Copy)]
-enum Read<'v> {
-    Packed(rudb_vector::Packed<'v>),
-    Narrow(&'v [i32]),
-}
-
-impl Read<'_> {
-    /// The codes or values of rows `from` to `from + out.len()`, as words.
-    #[inline]
-    fn read(self, from: usize, out: &mut [u64]) {
-        match self {
-            Self::Packed(packed) => packed.unpack(from, out),
-            Self::Narrow(values) => {
-                for (out, &value) in out.iter_mut().zip(&values[from..]) {
-                    *out = i64::from(value) as u64;
-                }
-            }
-        }
-    }
-}
-
 /// [`PlaceSums::add`]'s pass over the rows, for a number of value calls the compiler knows.
 ///
-/// A block of 64 rows at a time, starting on a multiple of 64 so that a packed column unpacks whole
-/// words: each column's codes for the block unpacked into the stack, the rows the filter kept in it
-/// made a word of bits, and each row's totals added into its group, or into the group for dropped
-/// rows when it was dropped or comes before `from`. The adds wrap because [`PlaceSums::ready`] only
+/// A block of 64 rows at a time: the rows the filter kept in it made a word of bits, and each row's
+/// totals added into its group, or into the group for dropped rows when it was dropped or comes
+/// before `from`. The adds wrap because [`PlaceSums::ready`] only
 /// took columns whose totals cannot leave an `i64`.
 fn by_slot<const W: usize>(
     cells: &mut Vec<i64>,
-    read: &[Read<'_>],
+    values: &[Vec<u64>],
     map: &[u32],
     places: &[usize],
     kept: Option<&[u32]>,
     from: usize,
 ) -> Result<usize> {
     let span = W + 1;
-    let Ok(read): std::result::Result<&[Read<'_>; W], _> = read.try_into() else {
-        return Err(Error::internal("summed calls of another width".to_string()));
-    };
+    let mut columns: [&[u64]; W] = [&[]; W];
+    for (column, values) in columns.iter_mut().zip(values) {
+        *column = values.get(..places.len()).ok_or_else(|| {
+            Error::internal("a summed chunk of other rows than it read".to_string())
+        })?;
+    }
     let start = from / 64 * 64;
-    let mut block = [[0_u64; 64]; W];
     let mut next = kept.map_or(0, |kept| kept.partition_point(|&row| (row as usize) < start));
     for (at, places) in places.get(start..).unwrap_or_default().chunks(64).enumerate() {
         let first = start + at * 64;
         let rows = places.len();
-        for (codes, column) in block.iter_mut().zip(read) {
-            column.read(first, &mut codes[..rows]);
-        }
+        let block = columns.map(|column| &column[first..first + rows]);
         let mut keep = match kept {
             None => u64::MAX,
             Some(kept) => {
@@ -6207,7 +6175,7 @@ mod tests {
         let mut row = 0;
         let mut asked = 0;
         loop {
-            row = sums.add(&inputs, &map, &places, Some(&kept), row).expect("adds them up");
+            row = sums.add(&map, &places, Some(&kept), row).expect("adds them up");
             if row == rows {
                 break;
             }

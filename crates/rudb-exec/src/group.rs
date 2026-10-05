@@ -2946,13 +2946,7 @@ impl<'a> Aggregate<'a> {
                 let kept = uncut.map(|kept| kept.indices());
                 let mut row = 0;
                 loop {
-                    row = place_sums.add(
-                        &inputs,
-                        coded_map,
-                        &coded_places[..*length],
-                        kept,
-                        row,
-                    )?;
+                    row = place_sums.add(coded_map, &coded_places[..*length], kept, row)?;
                     if row == *length {
                         break;
                     }
