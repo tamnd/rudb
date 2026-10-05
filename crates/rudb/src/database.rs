@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use rudb_bind::{Bound, Parameters, Write};
+use rudb_bind::{Bound, Described, Parameters, Placeholders, Write};
 use rudb_catalog::{Catalog, DEFAULT_CATALOG, Entry, Key, KeyLog, QualifiedName, View};
 use rudb_common::stat::Provenance;
 use rudb_common::{
@@ -5554,6 +5554,38 @@ impl Shared {
         let named = Arc::new(Named { sql: text.to_string(), ast, names });
         self.prepared().insert(name.to_lowercase(), named);
         Ok(QueryResult::empty())
+    }
+
+    /// What `ast` takes and gives, found by binding it with each parameter in `names` as a
+    /// placeholder of the type in `declared` at the same place, and never running it.
+    ///
+    /// Only a query, an `INSERT`, an `UPDATE` and a `DELETE` are bound. Any other statement takes no
+    /// parameters that a client can give a type to, and answers no rows that a client must know
+    /// about before it runs it.
+    pub(crate) fn describe(
+        &self,
+        ast: &Ast,
+        names: &[String],
+        declared: &[Option<LogicalType>],
+    ) -> Result<Described> {
+        let declared = names
+            .iter()
+            .enumerate()
+            .map(|(at, name)| (name.clone(), declared.get(at).cloned().flatten()))
+            .collect();
+        let placeholders = Placeholders::new(declared);
+        let bound = matches!(
+            ast.statements.as_slice(),
+            [ast::Statement::Query(_)
+                | ast::Statement::Insert(_)
+                | ast::Statement::Update(_)
+                | ast::Statement::Delete(_)]
+        );
+        if bound {
+            let parameters = Parameters::describing(placeholders.clone());
+            rudb_bind::bind_statement_with(ast, &self.read(), &parameters, &self.session())?;
+        }
+        Ok(placeholders.described())
     }
 
     /// Runs the statement held under `name` with the values the query `values` answers, by the

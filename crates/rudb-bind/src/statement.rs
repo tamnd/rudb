@@ -473,7 +473,10 @@ fn returning(
 ) -> Result<Option<Box<Plan>>> {
     let Some(query) = query else { return Ok(None) };
     let mut binder = Binder::with(catalog, parameters, session);
-    let (root, _) = binder.bind_query(ast, query)?;
+    let (root, scope) = binder.bind_query(ast, query)?;
+    if let Some(placeholders) = parameters.placeholders() {
+        placeholders.answer(scope.fields());
+    }
     Ok(Some(Box::new(finish(binder, root)?)))
 }
 
@@ -545,7 +548,10 @@ pub(crate) fn bind_one(
             }
             let mut binder = Binder::with(catalog, parameters, session);
             binder.outlined = outlined;
-            let (root, _) = binder.bind_query(ast, query)?;
+            let (root, scope) = binder.bind_query(ast, query)?;
+            if let Some(placeholders) = parameters.placeholders() {
+                placeholders.answer(scope.fields());
+            }
             Ok(Bound::Query(finish(binder, root)?))
         }
         ast::Statement::CreateTable(index) => {

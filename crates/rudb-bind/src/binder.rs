@@ -418,6 +418,9 @@ pub(crate) struct Binder<'a> {
     /// reach it, and the join that produces it goes on top of the `Aggregate` rather than under it.
     pub(crate) joined_above: Vec<u32>,
     pub(crate) outer_scopes: Vec<Scope>,
+    /// The nulls that stand for parameters of no known type while a statement is described, each
+    /// with the parameter's name, so a cast of one gives the parameter its type.
+    pub(crate) placeholders: Vec<(ExprRef, String)>,
     /// Which of the outer scopes are a FROM entry's left neighbours rather than an enclosing query.
     ///
     /// The two are resolved the same way and refused differently. An aggregate may read a column of
@@ -529,6 +532,7 @@ impl<'a> Binder<'a> {
             scalar_subqueries: Vec::new(),
             joined_above: Vec::new(),
             outer_scopes: Vec::new(),
+            placeholders: Vec::new(),
             lateral_scopes: Vec::new(),
             correlations: Vec::new(),
             star_entry: None,

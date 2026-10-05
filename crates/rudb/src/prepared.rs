@@ -4,13 +4,23 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rudb_bind::Parameters;
 use rudb_catalog::QualifiedName;
-use rudb_common::{Error, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::parse_ast_with_case;
 
 use crate::connection::single;
 use crate::database::Shared;
 use crate::result::QueryResult;
+
+/// What [`Prepared::describe`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Description {
+    /// The type of each parameter, in the order of [`Prepared::parameters`], or `None` where
+    /// nothing in the statement settles it.
+    pub parameters: Vec<Option<LogicalType>>,
+    /// The columns the statement answers, or `None` for a statement that answers no rows.
+    pub fields: Option<Vec<Field>>,
+}
 
 /// A prepared statement.
 ///
@@ -249,7 +259,7 @@ pub(crate) struct Target {
     pub(crate) key: Vec<usize>,
     pub(crate) columns: Vec<usize>,
     pub(crate) names: Vec<String>,
-    pub(crate) types: Vec<rudb_common::LogicalType>,
+    pub(crate) types: Vec<LogicalType>,
     /// Whether a column may hold a `TIMESTAMPTZ`, which is the one kind of value a result needs
     /// the session to write.
     pub(crate) zoned: bool,
@@ -790,6 +800,33 @@ impl Prepared {
     #[must_use]
     pub fn parameters(&self) -> &[String] {
         &self.names
+    }
+
+    /// What the statement takes and gives, found without running it: the type of each parameter,
+    /// in the order of [`Prepared::parameters`], and the columns it answers.
+    ///
+    /// `declared` has the types the caller knows, in the same order, with `None` for one it does
+    /// not know. A parameter of no known type takes the type of the first cast the binder puts on
+    /// it, which is the type of what it is compared with, what it is passed to or the column it is
+    /// written to. One that no cast reaches stays `None`, and a PostgreSQL client calls that `text`.
+    ///
+    /// # Errors
+    ///
+    /// Anything binding the statement reports, such as a table or a column that is not there.
+    pub fn describe(&self, declared: &[Option<LogicalType>]) -> Result<Description> {
+        let described = self.shared.describe(&self.ast, &self.names, declared)?;
+        let parameters = self
+            .names
+            .iter()
+            .map(|name| {
+                described
+                    .resolved
+                    .iter()
+                    .find(|(held, _)| held.eq_ignore_ascii_case(name))
+                    .map(|(_, ty)| ty.clone())
+            })
+            .collect();
+        Ok(Description { parameters, fields: described.fields })
     }
 
     /// What the statement runs as, as it stands against the database now: a point plan for one of

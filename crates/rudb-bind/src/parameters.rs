@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rudb_common::{LogicalType, Value};
+use rudb_common::{Field, LogicalType, Value};
 
 /// What a prepared statement was handed, by identifier.
 ///
@@ -20,6 +20,74 @@ pub struct Parameters {
     written: Vec<(u32, Written)>,
     relations: Vec<(String, Written)>,
     capture: Option<Capture>,
+    placeholders: Option<Placeholders>,
+}
+
+/// What a statement takes and gives, found by binding it with no values, which is what a client
+/// asks before it runs the statement.
+///
+/// Each parameter is bound as a null. One the caller gave a type is a null of that type. One it
+/// did not is a null of no type, which takes its type from the first cast the binder puts on it,
+/// the way an untyped parameter in PostgreSQL takes its type from where it is written. Shared, so
+/// the caller keeps one end and every binder of the statement fills the other.
+#[derive(Debug, Clone, Default)]
+pub struct Placeholders(Arc<Mutex<Described>>);
+
+/// What a [`Placeholders`] found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Described {
+    /// Each parameter with the type the caller gave it, or `None`.
+    pub declared: Vec<(String, Option<LogicalType>)>,
+    /// Each parameter that got a type, with that type, in the order they got it.
+    pub resolved: Vec<(String, LogicalType)>,
+    /// The columns the statement answers: those of a query or of a `RETURNING` list. `None` for a
+    /// statement that answers no rows.
+    pub fields: Option<Vec<Field>>,
+}
+
+impl Placeholders {
+    /// Parameters with these types, `None` where the type is not known.
+    #[must_use]
+    pub fn new(declared: Vec<(String, Option<LogicalType>)>) -> Self {
+        Self(Arc::new(Mutex::new(Described { declared, ..Described::default() })))
+    }
+
+    /// The type the caller gave the parameter `name`, `Some(None)` when it gave none and `None`
+    /// when `name` is not one of the parameters.
+    #[must_use]
+    pub fn declared(&self, name: &str) -> Option<Option<LogicalType>> {
+        let described = self.lock();
+        described.declared.iter().find(|(held, _)| same(held, name)).map(|(_, ty)| ty.clone())
+    }
+
+    /// Gives the parameter `name` the type `ty`, unless it has one already.
+    pub fn resolve(&self, name: &str, ty: &LogicalType) {
+        let mut described = self.lock();
+        if !described.resolved.iter().any(|(held, _)| same(held, name)) {
+            described.resolved.push((name.to_string(), ty.clone()));
+        }
+    }
+
+    /// Keeps the columns the statement answers.
+    pub fn answer(&self, fields: Vec<Field>) {
+        self.lock().fields = Some(fields);
+    }
+
+    /// What was found so far.
+    #[must_use]
+    pub fn described(&self) -> Described {
+        self.lock().clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Described> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl PartialEq for Placeholders {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// Where a data changing statement leaves the rows it wrote and the rows it removed or changed,
@@ -74,7 +142,25 @@ impl Parameters {
     /// No values, which is what an ordinary statement binds with.
     #[must_use]
     pub const fn new() -> Self {
-        Self { values: Vec::new(), written: Vec::new(), relations: Vec::new(), capture: None }
+        Self {
+            values: Vec::new(),
+            written: Vec::new(),
+            relations: Vec::new(),
+            capture: None,
+            placeholders: None,
+        }
+    }
+
+    /// No values, with each parameter bound as a placeholder that records what it is used as.
+    #[must_use]
+    pub fn describing(placeholders: Placeholders) -> Self {
+        Self { placeholders: Some(placeholders), ..Self::new() }
+    }
+
+    /// The placeholders, when the statement is bound to describe it rather than to run it.
+    #[must_use]
+    pub fn placeholders(&self) -> Option<&Placeholders> {
+        self.placeholders.as_ref()
     }
 
     /// Values by position, numbered from one, which is what `?` and `$1` want.
@@ -159,6 +245,7 @@ impl Parameters {
             && self.written.is_empty()
             && self.relations.is_empty()
             && self.capture.is_none()
+            && self.placeholders.is_none()
     }
 
     /// How many were provided.
