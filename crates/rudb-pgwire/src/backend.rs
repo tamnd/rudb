@@ -335,7 +335,7 @@ impl OutBuf {
             (b'C', error.sqlstate.as_bytes()),
             (b'M', error.message.as_bytes()),
         ];
-        if let Some(detail) = error.detail {
+        if let Some(detail) = &error.detail {
             fields.push((b'D', detail.as_bytes()));
         }
         if let Some(hint) = error.hint {

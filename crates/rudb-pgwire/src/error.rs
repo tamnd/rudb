@@ -33,7 +33,7 @@ pub struct ProtocolError {
     pub sqlstate: &'static str,
     pub message: String,
     /// The `D` field of the error, if PostgreSQL sends one for the same bytes.
-    pub detail: Option<&'static str>,
+    pub detail: Option<String>,
     /// The `H` field of the error, if PostgreSQL sends one for the same bytes.
     pub hint: Option<&'static str>,
 }
@@ -59,8 +59,8 @@ impl ProtocolError {
         ProtocolError::new(Level::Log, PROTOCOL_VIOLATION, message)
     }
 
-    pub(crate) fn with_detail(mut self, detail: &'static str) -> ProtocolError {
-        self.detail = Some(detail);
+    pub(crate) fn with_detail(mut self, detail: impl Into<String>) -> ProtocolError {
+        self.detail = Some(detail.into());
         self
     }
 
