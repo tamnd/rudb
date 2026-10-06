@@ -3008,11 +3008,13 @@ impl Table {
     }
 
     /// Puts the keys added in runs of their own while a copy of the table shared its key sets back
-    /// into one set each, which is for once that copy is gone. Changes nothing a read answers.
+    /// into one set each, and the same for the row numbers of its keys, which is for once that
+    /// copy is gone. Changes nothing a read answers.
     pub fn settle_keys(&mut self) {
         for seen in self.seen.iter_mut().flatten() {
             seen.settle();
         }
+        self.points.settle();
     }
 
     fn hold_keys(&mut self, seen: Vec<Seen>) {
@@ -3604,5 +3606,55 @@ mod tests {
         let error = table.append(bad).expect_err("a null in UserID through its code");
         assert_eq!(error.message(), "NOT NULL constraint failed: hits.UserID");
         assert_eq!(table.rows().len(), 3, "the bad chunk was kept anyway");
+    }
+
+    /// Whether the table finds a row by its key, after a lookup has built where its keys are.
+    fn finds(table: &Table, key: Value) -> bool {
+        match table.point(&[0], &[key], &[0, 1]).expect("readable rows") {
+            Some(Point::Found(_)) => true,
+            Some(Point::Absent) => false,
+            None => panic!("a table keyed on its first column looks rows up by it"),
+        }
+    }
+
+    /// A copy of a table that appends rows notes their keys in a level of its own and leaves the
+    /// original's alone: each finds its own rows and only its own, and the levels settle into one
+    /// once the original is gone.
+    #[test]
+    fn a_copy_notes_the_keys_it_appends_apart_from_the_original() {
+        let keys: [(LogicalType, fn(i64) -> Value); 2] = [
+            (LogicalType::BigInt, Value::BigInt),
+            (LogicalType::Varchar, |at| Value::Varchar(format!("user{at}"))),
+        ];
+        for (ty, key) in keys {
+            let mut table = Table::new(
+                QualifiedName::new("memory", "main", "t"),
+                vec![Field::new("k", ty), Field::new("v", LogicalType::Varchar)],
+            )
+            .expect("two columns");
+            table.set_keys(vec![Key { columns: vec![0], primary: true }]).expect("an empty table");
+            let rows = |from: i64, to: i64| {
+                (from..to)
+                    .map(|at| vec![key(at), Value::Varchar(format!("v{at}"))])
+                    .collect::<Vec<_>>()
+            };
+            table.append_rows(&rows(0, 5000)).expect("new keys");
+            assert!(finds(&table, key(10)));
+            let mut copy = table.clone();
+            for from in (5000..8000).step_by(500) {
+                copy.append_rows(&rows(from, from + 500)).expect("new keys");
+                assert!(finds(&copy, key(from + 499)) && finds(&copy, key(10)));
+            }
+            assert!(finds(&table, key(10)) && !finds(&table, key(5500)));
+            assert!(finds(&copy, key(5500)) && !finds(&copy, key(9000)));
+            drop(table);
+            copy.settle_keys();
+            for at in [0, 4999, 5000, 7999] {
+                assert!(finds(&copy, key(at)), "key {at} after settling");
+            }
+            assert!(!finds(&copy, key(8000)));
+            copy.append_rows(&rows(8000, 8100)).expect("new keys");
+            assert!(finds(&copy, key(8050)) && finds(&copy, key(3)));
+        }
     }
 }
