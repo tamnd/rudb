@@ -663,6 +663,26 @@ struct Conn {
     /// The PostgreSQL session that speaks through this connection, from
     /// [`crate::Connection::set_postgres`].
     postgres: Mutex<Option<Arc<Postgres>>>,
+    /// The plans of the last queries this connection ran as text, oldest first. See
+    /// [`Shared::cached_simple`].
+    simple: Mutex<Vec<Arc<Simple>>>,
+}
+
+/// How many plans a connection keeps by the text of their query.
+const SIMPLE_PLANS: usize = 32;
+
+/// The optimized plan of a query, kept by its exact text, with what it was bound against.
+///
+/// A plan is good again while the catalog, the database settings and the session are the same as
+/// when it was bound, `08-the-dialect.md` section 8.14. Only a query that reads nothing that
+/// changes between two statements is kept, see [`simple_cacheable`].
+#[derive(Debug)]
+struct Simple {
+    sql: String,
+    catalog_generation: u64,
+    settings_revision: u64,
+    session: Session,
+    plan: Arc<Plan>,
 }
 
 /// A statement `PREPARE` gave a name to, parsed, with its parameters in the order they were
@@ -684,6 +704,7 @@ impl Conn {
             registry,
             blocked: AtomicU64::new(0),
             prepared: Mutex::default(),
+            simple: Mutex::default(),
             postgres: Mutex::default(),
         }
     }
@@ -3919,6 +3940,9 @@ impl Shared {
             return self.execute(sql, cancel);
         }
         self.in_transaction(sql, || {
+            if let Some(answer) = self.cached_simple(sql, cancel)? {
+                return Ok(answer);
+            }
             if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
                 return Ok(answer);
             }
@@ -5099,6 +5123,63 @@ impl Shared {
             });
     }
 
+    /// Runs the plan this connection kept for the query `sql`, or answers `None` when it kept none
+    /// that is still good.
+    ///
+    /// A hit does not parse, bind or optimize. It runs the plan the same way a miss does, so the
+    /// rows, the metrics document and the errors at run time are the same.
+    fn cached_simple(&self, sql: &str, cancel: &Cancel) -> Result<Option<QueryResult>> {
+        let plan = {
+            let simple = self.conn.simple.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(held) = simple.iter().rev().find(|held| held.sql == sql) else {
+                return Ok(None);
+            };
+            Arc::clone(held)
+        };
+        let catalog = self.read();
+        let session = self.session();
+        if plan.catalog_generation != catalog.generation()
+            || plan.settings_revision != self.inner.settings_revision.load(Ordering::Relaxed)
+            || plan.session != session
+        {
+            return Ok(None);
+        }
+        let seams = self.seams(sql)?;
+        let context = self.optimizer(&catalog)?;
+        let under = Under::new(self.budget(), context.facts(), &seams, &session, Rows::ForACaller);
+        let result = self.answer(sql, &plan.plan, &catalog, cancel, under)?;
+        Ok(Some(result.with_origins(plan.plan.origins())))
+    }
+
+    /// Keeps the optimized plan of the query `sql` for [`Shared::cached_simple`], when the plan is
+    /// one that can run again.
+    fn remember_simple(
+        &self,
+        sql: &str,
+        ast: &Ast,
+        plan: &Plan,
+        catalog: &Catalog,
+        session: &Session,
+    ) {
+        if !simple_cacheable(ast, plan, catalog) {
+            return;
+        }
+
+        let held = Arc::new(Simple {
+            sql: sql.to_string(),
+            catalog_generation: catalog.generation(),
+            settings_revision: self.inner.settings_revision.load(Ordering::Relaxed),
+            session: session.clone(),
+            plan: Arc::new(plan.clone()),
+        });
+        let mut simple = self.conn.simple.lock().unwrap_or_else(PoisonError::into_inner);
+        simple.retain(|old| old.sql != sql);
+        if simple.len() == SIMPLE_PLANS {
+            simple.remove(0);
+        }
+        simple.push(held);
+    }
+
     /// [`Shared::query`], asking for the Parquet mirrors the statement wants when `mirror` is set.
     ///
     /// A statement that wanted one is bound again once the mirrors are in, and not a third time,
@@ -5143,6 +5224,7 @@ impl Shared {
             Bound::Query(mut plan) => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 self.remember_native_aggregate(sql, &ast, &plan, &catalog);
+                self.remember_simple(sql, &ast, &plan, &catalog, &session);
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
@@ -5509,6 +5591,9 @@ impl Shared {
             return self.run_script(&script, cancel, Self::execute);
         }
         self.in_transaction(sql, || {
+            if let Some(answer) = self.cached_simple(sql, cancel)? {
+                return Ok(answer);
+            }
             if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
                 return Ok(answer);
             }
@@ -6083,6 +6168,7 @@ impl Shared {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if parameters.is_empty() {
                     self.remember_native_aggregate(sql, ast, &plan, &catalog);
+                    self.remember_simple(sql, ast, &plan, &catalog, &session);
                 }
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
@@ -7703,6 +7789,52 @@ fn is_native_summary_aggregate(ast: &Ast, plan: &Plan, catalog: &Catalog) -> boo
     let source =
         QualifiedName::new(plan.string(source_catalog), plan.string(schema), plan.string(table));
     catalog.table(&source).is_ok_and(|table| table.rows().is_native())
+}
+
+/// Whether the optimized plan of `ast` gives the same answer when it runs again in a later
+/// statement, with the same catalog, settings and session.
+///
+/// The binder folds some things into constants: `now()` and the other session functions, the bare
+/// words such as `current_date`, `current_setting()`, and a string such as `'now'` read as a
+/// time. A view can hold any of them and a table function reads what it likes. So a plan is kept
+/// only when its query calls no function at all, names no session word, holds no such string, and
+/// reads only stored tables. This is narrower than it has to be, and it is correct without a list
+/// of which functions are stable.
+fn simple_cacheable(ast: &Ast, plan: &Plan, catalog: &Catalog) -> bool {
+    const MOVING: [&str; 4] = ["now", "today", "tomorrow", "yesterday"];
+    let [ast::Statement::Query(_)] = ast.statements.as_slice() else { return false };
+    if !ast.inserts.is_empty() {
+        return false;
+    }
+    let fixed = ast.exprs.iter().all(|expr| match *expr {
+        ast::Expr::Function { .. }
+        | ast::Expr::Window { .. }
+        | ast::Expr::Parameter { .. }
+        | ast::Expr::Lambda { .. }
+        | ast::Expr::Default => false,
+        ast::Expr::Column { name } => {
+            name.len != 1 || !ast.name(name).any(rudb_bind::is_session_word)
+        }
+        ast::Expr::Literal { kind: ast::LiteralKind::String, text } => {
+            let text = ast.string(text).trim();
+            !MOVING.iter().any(|word| word.eq_ignore_ascii_case(text))
+        }
+        _ => true,
+    });
+    let stored = ast.sources.iter().all(|source| match *source {
+        ast::Source::Table { name, .. } => {
+            let parts: Vec<&str> = ast.name(name).collect();
+            catalog.resolve(&parts).is_ok_and(|name| catalog.table(&name).is_ok())
+        }
+        ast::Source::Function { .. } => false,
+        _ => true,
+    });
+    fixed
+        && stored
+        && (0..plan.node_count()).all(|at| {
+            let at = NodeRef::try_from(at).unwrap_or(NodeRef::MAX);
+            !matches!(plan.node(at), Node::TableFunction { .. } | Node::LateralFunction { .. })
+        })
 }
 
 /// The filtered count case is intentionally narrower than all deterministic predicates. Checking

@@ -94,6 +94,14 @@ const KEYWORDS: &[(&str, Context)] = &[
     ("user", Context::User),
 ];
 
+/// Whether `word` written alone, with no parentheses, can be one of the session words above, such
+/// as `current_date` or `user`. The binder folds such a word into a constant when no column has
+/// that name, so a plan that holds one is good for one statement only.
+#[must_use]
+pub fn is_session_word(word: &str) -> bool {
+    KEYWORDS.iter().any(|(held, _)| held.eq_ignore_ascii_case(word))
+}
+
 /// The spellings that are called with an empty argument list, and what each one answers.
 ///
 /// Fourteen, and the four that are only keywords are not among them. `current_timestamp()`,
