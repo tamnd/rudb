@@ -2867,6 +2867,14 @@ impl<'a> Aggregate<'a> {
             };
             let summed =
                 !in_runs && by_place && place_sums.ready(states, calls, &inputs, offered, *length);
+            // Totals by place go on in the cells of the chunks before while the calls stay the
+            // same, and are folded in here, before `resolve` below takes the states, when not.
+            if summed
+                && place_sums.adds_by_place(coded_map.len(), *length)
+                && !place_sums.carries(*length)
+            {
+                place_sums.fold_places(coded_map, states)?;
+            }
             // A row the map has nothing for goes through the probe and the insert every row used to
             // go through, there and then, and what comes back is written into the map before the
             // next row is looked at. A key sorted the way `CounterID` is brings each value in as a
@@ -2950,9 +2958,6 @@ impl<'a> Aggregate<'a> {
                     // per row, and the groups a place has none for yet are opened afterwards in
                     // the order their first rows come in, the same order as the pass below.
                     let combos = coded_map.len();
-                    if !place_sums.carries(*length) {
-                        place_sums.fold_places(coded_map, states)?;
-                    }
                     place_sums.add_places(&mut coded_places[..*length], kept, combos, &inputs)?;
                     if place_sums.touched(coded_map)? {
                         for (row, &place) in coded_places[..*length].iter().enumerate() {
