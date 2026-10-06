@@ -631,8 +631,15 @@ impl Rt {
                 match x.checked_div(y) {
                     Some(q) => q as u128,
                     None => {
-                        let why = if y == 0 { "Division by zero" } else { "Decimal out of range" };
-                        return Err(self.fail(Error::new(ErrorCode::OutOfRange, why)));
+                        if y == 0 {
+                            let error = Error::new(ErrorCode::OutOfRange, "Division by zero")
+                                .state(rudb_common::SqlState::DIVISION_BY_ZERO)
+                                .pg("division by zero")
+                                .unplaced();
+                            return Err(self.fail(error));
+                        }
+                        let error = Error::new(ErrorCode::OutOfRange, "Decimal out of range");
+                        return Err(self.fail(error));
                     }
                 }
             }

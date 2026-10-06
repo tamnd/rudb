@@ -695,6 +695,26 @@ fn a_name_that_if_exists_lets_go_gives_a_notice() {
 }
 
 #[test]
+fn division_follows_the_rules_of_postgres() {
+    let dirs = Dirs::new("division");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query("select 7 / 2, -7 / 2, 7::float8 / 2");
+    let row: Vec<_> = data_row(&messages[1]).into_iter().map(Option::unwrap).collect();
+    assert_eq!(row, [b"3".to_vec(), b"-3".to_vec(), b"3.5".to_vec()]);
+    // A zero divisor is an error for every type, with no position, as it is in PostgreSQL.
+    for sql in ["select 0 / 0", "select 1 % 0", "select 1.0 / 0", "select 1::float8 / 0"] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("22012"), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some("division by zero"), "{sql}");
+        assert_eq!(messages[0].field(b'P'), None, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_transaction_rules_of_postgres() {
     let dirs = Dirs::new("implicit");
     let server = Server::start(dirs.config()).unwrap();

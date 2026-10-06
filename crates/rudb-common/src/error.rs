@@ -243,6 +243,12 @@ pub struct Fields {
     /// `R`: the PostgreSQL routine that raises this error. rudb sets it only where a known client
     /// reads it, for example Rails on a stale cached plan.
     pub routine: Option<String>,
+    /// The text that a PostgreSQL session sends in place of the message, when the two dialects
+    /// say it differently.
+    pub postgres: Option<String>,
+    /// Whether PostgreSQL sends no position for this error. An error from running a statement, as
+    /// opposed to reading it, has none there.
+    pub unplaced: bool,
 }
 
 impl Error {
@@ -331,6 +337,18 @@ impl Error {
     #[must_use]
     pub fn routine(self, routine: impl Into<String>) -> Self {
         self.field(|fields| fields.routine = Some(routine.into()))
+    }
+
+    /// The same error, with the text that a PostgreSQL session sends in place of the message.
+    #[must_use]
+    pub fn pg(self, message: impl Into<String>) -> Self {
+        self.field(|fields| fields.postgres = Some(message.into()))
+    }
+
+    /// The same error, which a PostgreSQL session sends with no position.
+    #[must_use]
+    pub fn unplaced(self) -> Self {
+        self.field(|fields| fields.unplaced = true)
     }
 
     fn field(mut self, set: impl FnOnce(&mut Fields)) -> Self {
