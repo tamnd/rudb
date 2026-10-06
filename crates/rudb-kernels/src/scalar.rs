@@ -1443,6 +1443,28 @@ fn opened_integer(side: &Vector) -> Result<Option<Vector>> {
     side.opened().map(Some)
 }
 
+/// [`stamp_seconds`] at every row as one pass with no branch in it, or `false` when some row is one
+/// it would answer another way, which is an infinity, a count too large to be exact or a sum out of
+/// range. Those rows are rare enough that the run is then done again the careful way.
+///
+/// The careful loop asks three questions of every row and can stop at each, so it never became
+/// vector code, and on ClickBench q19 over Parquet it was a twentieth of the query.
+fn stamp_seconds_quick(out: &mut [i64], row: impl Fn(usize) -> (i64, i64)) -> bool {
+    const EXACT: i64 = (1 << 53) / datetime::MICROS_PER_SECOND;
+    let held = datetime::OLDEST_TIMESTAMP..=datetime::NEWEST_TIMESTAMP;
+    let mut wild = false;
+    for (index, slot) in out.iter_mut().enumerate() {
+        let (stamp, count) = row(index);
+        let (moved, over) = stamp.overflowing_add(count.wrapping_mul(datetime::MICROS_PER_SECOND));
+        wild |= over
+            | !(-EXACT..=EXACT).contains(&count)
+            | !held.contains(&stamp)
+            | !held.contains(&moved);
+        *slot = moved;
+    }
+    !wild
+}
+
 /// The loop under [`stamp_seconds_of`], once each side's form has been turned into a mapping.
 fn stamp_seconds_runs<S, C>(
     stamps: &Data,
@@ -1465,11 +1487,19 @@ where
     let mut out = vec![0i64; rows];
     macro_rules! over {
         ($counts:expr) => {
-            over_valid(rows, base, |index| {
-                let seconds = i64::from($counts[at_count(index)]);
-                out[index] = stamp_seconds(stamps[at_stamp(index)], seconds)?;
-                Ok(())
-            })?
+            if matches!(base, Validity::AllValid)
+                && stamp_seconds_quick(&mut out, |index| {
+                    (stamps[at_stamp(index)], i64::from($counts[at_count(index)]))
+                })
+            {
+                Validity::AllValid
+            } else {
+                over_valid(rows, base, |index| {
+                    let seconds = i64::from($counts[at_count(index)]);
+                    out[index] = stamp_seconds(stamps[at_stamp(index)], seconds)?;
+                    Ok(())
+                })?
+            }
         };
     }
     let validity = match counts {
@@ -6561,6 +6591,27 @@ mod tests {
                 agrees("+", &[epoch, packed], &LogicalType::Date);
             }
             assert_eq!(fallback::count(Kernel::Scalar, Form::Constant, Form::BitPacked), before);
+        }
+    }
+
+    /// The one pass without a branch answers the run only when no row in it is one the careful way
+    /// would answer differently, so an infinity, a count past the exact doubles or a sum past either
+    /// end anywhere in a run still comes out the way the row at a time call has it.
+    #[test]
+    fn a_stamp_moved_by_seconds_agrees_at_the_edges() {
+        let exact = (1_i64 << 53) / 1_000_000;
+        let stamps = [0, 7, i64::MAX, -i64::MAX, i64::MAX - 2_000_000, -9_223_372_022_400_000_000];
+        let counts = [0, 1, -1, exact, exact + 1, -exact - 1, 3_600];
+        for stamp in stamps {
+            let stamp = Vector::constant(LogicalType::Timestamp, Value::Timestamp(stamp), 7);
+            let values: Vec<Value> = counts.iter().map(|&count| Value::BigInt(count)).collect();
+            let count = Vector::from_values(LogicalType::BigInt, &values).expect("counts");
+            agrees("__rudb_stamp_seconds", &[stamp.clone(), count], &LogicalType::Timestamp);
+            for &one in &counts {
+                let values: Vec<Value> = (0..7).map(|_| Value::BigInt(one)).collect();
+                let count = Vector::from_values(LogicalType::BigInt, &values).expect("counts");
+                agrees("__rudb_stamp_seconds", &[stamp.clone(), count], &LogicalType::Timestamp);
+            }
         }
     }
 
