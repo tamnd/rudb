@@ -337,12 +337,10 @@ impl General {
                     (Some(so_far), BitOp::Xor) => so_far ^ bits,
                 });
             }
-            Self::Placed { held, least, returns } => {
+            Self::Placed { least, returns, .. } => {
                 let place = crate::compare::enum_place(returns, value)
                     .ok_or_else(|| unexpected(if *least { "min" } else { "max" }, value))?;
-                *held = Some(held.map_or(place, |so_far| {
-                    if *least { so_far.min(place) } else { so_far.max(place) }
-                }));
+                self.push_place(place);
             }
             Self::BigSum { held } => match (value, held.as_mut()) {
                 (Value::Null, _) => {}
@@ -463,6 +461,22 @@ impl General {
             args.get(1).map(|given| given.try_value_at(row)).transpose()?
         };
         top.push_text(text, k.as_ref())
+    }
+
+    /// Whether this is a `min` or a `max` over an enum, which takes the place of each label
+    /// through [`Self::push_place`], so that a batch is read as its stored positions rather than
+    /// as labels searched for one at a time.
+    pub(crate) const fn takes_places(&self) -> bool {
+        matches!(self, Self::Placed { .. })
+    }
+
+    /// Adds the label declared at `place`, for a state [`Self::takes_places`] says yes to.
+    pub(crate) fn push_place(&mut self, place: usize) {
+        if let Self::Placed { held, least, .. } = self {
+            *held = Some(held.map_or(place, |so_far| {
+                if *least { so_far.min(place) } else { so_far.max(place) }
+            }));
+        }
     }
 
     /// Whether this state takes whole batches of points through [`Self::push_point`].
