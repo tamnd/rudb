@@ -33,7 +33,7 @@ pub use memory::MemoryTable;
 pub use mostly::{ReadGuard, ReadMostly, WriteGuard};
 pub use park::Wait;
 pub use sieve::{Blocked, Sieve};
-pub use stripes::{FrozenStripe, Inserter, Rid, Stripe, StripeDirectory};
+pub use stripes::{Freeze, FrozenStripe, Inserter, Rid, Stripe, StripeDirectory, to_freeze};
 pub use tally::{TALLY_VALUES, Tally};
 pub use undo::{Collected, Heads, Row, SpillLimits, Spilled, UndoBuffer, UndoSpace};
 pub use zone::{Probe, Range, Zone};

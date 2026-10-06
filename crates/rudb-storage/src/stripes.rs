@@ -8,12 +8,22 @@
 //!
 //! Stripe ids come from a per-table counter and are never reused, so the ids of the sequence are
 //! increasing and a rid finds its stripe by binary search.
+//!
+//! The freezer, `10-freezing-and-checkpoint.md` sections 10.2 and 10.3, turns a hot stripe into a
+//! frozen one in place in the sequence, under the same id. [`to_freeze`] picks the stripes,
+//! [`StripeDirectory::begin_freeze`] and [`StripeDirectory::settle`] stop writes in place and wait
+//! for the stripe's rows to be final, the caller encodes them, and [`StripeDirectory::publish`]
+//! swaps the frozen stripe in once no statement reading the table has a snapshot from before.
+//! A snapshot from before would meet a stripe with no `created` stamps to tell it which rows
+//! were not there yet. Freezing writes nothing to the log: it changes how the rows are held, not
+//! what they are.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::deletes::{DeleteVector, PART_ROWS, PART_WORDS, Refusal};
+use crate::horizon::Horizons;
 use crate::hot::{HotStripe, Lease, Width};
 use crate::park::Wait;
 use crate::undo::{Heads, UndoBuffer, UndoRef, UndoSpace};
@@ -66,14 +76,16 @@ pub struct FrozenStripe {
     id: u32,
     rows: u32,
     checkpoint: u64,
-    deletes: Mutex<DeleteVector>,
+    /// Shared with the hot stripe it was frozen from, which took deletes into it during the
+    /// freeze.
+    deletes: Arc<Mutex<DeleteVector>>,
 }
 
 impl FrozenStripe {
     /// Stripe `id` of `rows` rows, checkpointed at `checkpoint` with `deletes` over it.
     #[must_use]
     pub fn new(id: u32, rows: u32, checkpoint: u64, deletes: DeleteVector) -> Self {
-        Self { id, rows, checkpoint, deletes: Mutex::new(deletes) }
+        Self { id, rows, checkpoint, deletes: Arc::new(Mutex::new(deletes)) }
     }
 
     /// Its id.
@@ -290,29 +302,107 @@ impl StripeDirectory {
     /// old row and `txn` sees the new one. A hot row is updated in place with
     /// [`HotStripe::update`] instead.
     ///
+    /// A row of a hot stripe being frozen moves the same way, with its entry in the delete
+    /// vector the frozen stripe will keep, since [`HotStripe::update`] refuses it with
+    /// [`Refusal::Freezing`].
+    ///
     /// # Errors
     ///
     /// [`Refusal::Gone`] when `txn` does not see the row, which includes a rid of no frozen
-    /// stripe, and [`Refusal::Conflict`] when another transaction holds it or wrote it after
-    /// `snapshot`. `fill` is not called then, and no slot is taken.
+    /// stripe and of a hot stripe that is not being frozen, and [`Refusal::Conflict`] when
+    /// another transaction holds it or wrote it after `snapshot`. `fill` is not called then, and
+    /// no slot is taken.
     pub fn migrate(
         &self,
         rid: Rid,
         snapshot: u64,
         txn: u64,
         inserter: &mut Inserter,
-        fill: impl FnOnce(&mut Lease, u32),
+        mut fill: impl FnMut(&mut Lease, u32),
     ) -> Result<Rid, Refusal> {
         match self.find(rid.stripe()) {
             Some(Stripe::Frozen(stripe)) if rid.slot() < stripe.rows() => {
                 stripe.with_deletes(|deletes| deletes.delete(rid.slot(), snapshot, txn))?;
             }
+            Some(Stripe::Hot(stripe)) if stripe.is_freezing() && rid.slot() < stripe.reserved() => {
+                stripe.delete_pending(rid.slot(), snapshot, txn)?;
+            }
             _ => return Err(Refusal::Gone),
         }
-        let (lease, slots) = inserter.take(1);
-        fill(lease, slots.start);
-        lease.stripe().insert(slots.clone(), txn);
-        Ok(Rid::new(lease.stripe().id(), slots.start))
+        loop {
+            let (lease, slots) = inserter.take(1);
+            fill(lease, slots.start);
+            if lease.stripe().insert(slots.clone(), txn) {
+                return Ok(Rid::new(lease.stripe().id(), slots.start));
+            }
+        }
+    }
+
+    /// Bytes its hot stripes hold.
+    #[must_use]
+    pub fn hot_bytes(&self) -> usize {
+        self.stripes()
+            .iter()
+            .map(|stripe| match stripe {
+                Stripe::Hot(stripe) => stripe.bytes(),
+                Stripe::Frozen(_) => 0,
+            })
+            .sum()
+    }
+
+    /// Begins freezing hot stripe `id`, [`HotStripe::begin_freeze`], and returns it. `None` when
+    /// it is not a hot stripe or its freeze already began.
+    pub fn begin_freeze(&self, id: u32) -> Option<Arc<HotStripe>> {
+        match self.find(id) {
+            Some(Stripe::Hot(stripe)) if stripe.begin_freeze() => Some(stripe),
+            _ => None,
+        }
+    }
+
+    /// The freeze of `stripe` once its rows are final as of `clock`, [`HotStripe::settled`], with
+    /// the slots that were holes or deleted set as the base of the delete vector the frozen stripe
+    /// keeps. `None` while a write of it is in flight; the freezer asks again.
+    pub fn settle(&self, stripe: &Arc<HotStripe>, clock: &AtomicU64) -> Option<Freeze> {
+        let (at, rows, gone) = stripe.settled(clock)?;
+        stripe.pending().lock().unwrap_or_else(PoisonError::into_inner).set_base(&gone);
+        Some(Freeze { stripe: Arc::clone(stripe), at, rows })
+    }
+
+    /// Swaps the frozen stripe in for the hot one `freeze` settled, once no statement reading the
+    /// table has a snapshot before the freeze's F, and returns it. A statement that loaded the
+    /// stripes before keeps reading the hot stripe, which lives as long as it does. While an older
+    /// snapshot is held `freeze` comes back, and the freezer asks again.
+    ///
+    /// # Errors
+    ///
+    /// `freeze` itself when a statement reading the table holds a snapshot before its F.
+    pub fn publish(
+        &self,
+        freeze: Freeze,
+        horizons: &Horizons,
+        clock: &AtomicU64,
+    ) -> Result<Arc<FrozenStripe>, Freeze> {
+        if horizons.oldest(clock, self.table) < freeze.at {
+            return Err(freeze);
+        }
+        let frozen = Arc::new(FrozenStripe {
+            id: freeze.stripe.id(),
+            rows: freeze.rows,
+            checkpoint: freeze.at,
+            deletes: Arc::clone(freeze.stripe.pending()),
+        });
+        let mut guard = self.stripes.write().unwrap_or_else(PoisonError::into_inner);
+        let mut next = guard.to_vec();
+        let at = next
+            .iter()
+            .position(
+                |stripe| matches!(stripe, Stripe::Hot(hot) if Arc::ptr_eq(hot, &freeze.stripe)),
+            )
+            .expect("a stripe is frozen once");
+        next[at] = Stripe::Frozen(Arc::clone(&frozen));
+        *guard = next.into();
+        freeze.stripe.frozen();
+        Ok(frozen)
     }
 
     /// Stamps what `txn` did to the rows at `rids` with its commit timestamp `ts`: its updates
@@ -415,6 +505,90 @@ impl Heads for StripeDirectory {
     }
 }
 
+/// A hot stripe whose rows are final, on its way to frozen: [`StripeDirectory::settle`] made it
+/// and [`StripeDirectory::publish`] takes it.
+#[derive(Debug)]
+pub struct Freeze {
+    stripe: Arc<HotStripe>,
+    at: u64,
+    rows: u32,
+}
+
+impl Freeze {
+    /// The hot stripe, which the encoder reads the rows of as of [`Self::at`].
+    #[must_use]
+    pub fn stripe(&self) -> &Arc<HotStripe> {
+        &self.stripe
+    }
+
+    /// F, the timestamp its rows are final as of and the frozen stripe's checkpoint.
+    #[must_use]
+    pub fn at(&self) -> u64 {
+        self.at
+    }
+
+    /// The slots the frozen stripe has, holes and deleted rows among them.
+    #[must_use]
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+}
+
+/// The hot stripes to freeze across `tables`, as `(table, stripe id)` with `table` an index into
+/// `tables`, `10-freezing-and-checkpoint.md` section 10.2: every sealed one no commit touched
+/// for `quiet_ms` before `now_ms`, and then, while the hot set is over `limit` bytes, the coldest
+/// of the rest by their last commit. When nothing sealed is left and the hot set is still over,
+/// the coldest open stripe is sealed early and taken too, which leaves it short.
+#[must_use]
+pub fn to_freeze(
+    tables: &[Arc<StripeDirectory>],
+    now_ms: u64,
+    quiet_ms: u64,
+    limit: usize,
+) -> Vec<(usize, u32)> {
+    let mut hot: Vec<(u64, usize, Arc<HotStripe>)> = Vec::new();
+    let mut total = 0;
+    for (table, directory) in tables.iter().enumerate() {
+        for stripe in &*directory.stripes() {
+            if let Stripe::Hot(stripe) = stripe {
+                total += stripe.bytes();
+                if !stripe.is_freezing() {
+                    hot.push((stripe.touched(), table, Arc::clone(stripe)));
+                }
+            }
+        }
+    }
+    hot.sort_by_key(|&(touched, table, ref stripe)| (touched, table, stripe.id()));
+    let mut picked = Vec::new();
+    let mut take = |table: usize, stripe: &HotStripe, total: &mut usize| {
+        *total = total.saturating_sub(stripe.bytes());
+        picked.push((table, stripe.id()));
+    };
+    hot.retain(|(touched, table, stripe)| {
+        let quiet = stripe.is_full() && now_ms.saturating_sub(*touched) >= quiet_ms;
+        if quiet {
+            take(*table, stripe, &mut total);
+        }
+        !quiet
+    });
+    let (sealed, open): (Vec<_>, Vec<_>) = hot.iter().partition(|(_, _, stripe)| stripe.is_full());
+    for (_, table, stripe) in sealed {
+        if total <= limit {
+            break;
+        }
+        take(*table, stripe, &mut total);
+    }
+    for (_, table, stripe) in open {
+        if total <= limit {
+            break;
+        }
+        if stripe.seal() {
+            take(*table, stripe, &mut total);
+        }
+    }
+    picked
+}
+
 /// A worker's inserts into a table: slots leased from the open hot stripe, moving to the next one
 /// when a stripe fills.
 #[derive(Debug)]
@@ -459,14 +633,283 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use super::{Inserter, Rid, Stripe, StripeDirectory};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use super::{Inserter, Rid, Stripe, StripeDirectory, to_freeze};
     use crate::deletes::{Base, DeleteVector, Refusal, STRIPE_ROWS};
+    use crate::horizon::{Horizons, Reads};
     use crate::hot::{Lease, Width};
     use crate::park::Wait;
     use crate::undo::{UndoBuffer, UndoSpace};
 
     fn directory() -> Arc<StripeDirectory> {
         Arc::new(StripeDirectory::new(&[Width::Eight], Arc::new(UndoSpace::new())))
+    }
+
+    /// `n` rows inserted by `txn` and committed at `ts`, each holding its slot.
+    fn rows(inserter: &mut Inserter, n: u32, txn: u64, ts: u64) -> Vec<Rid> {
+        let mut rids = Vec::new();
+        while rids.len() < n as usize {
+            let (lease, slots) = inserter.take(n - rids.len() as u32);
+            for slot in slots.clone() {
+                lease.stripe().write(slot, 0, Some(u128::from(slot)));
+            }
+            assert!(lease.stripe().insert(slots.clone(), txn));
+            lease.stripe().commit_insert(slots.clone(), txn, ts);
+            rids.extend(inserter.rids(slots));
+        }
+        rids
+    }
+
+    #[test]
+    fn a_sealed_stripe_freezes_under_its_id_and_answers_the_same() {
+        let table = directory();
+        let clock = AtomicU64::new(10);
+        let horizons = Horizons::new(1);
+        let mut inserter = Inserter::new(Arc::clone(&table));
+        let rids = rows(&mut inserter, 3_000, 1, 2);
+        // An aborted insert leaves holes, and rows deleted before the freeze go in the base.
+        let (lease, slots) = inserter.take(10);
+        assert!(lease.stripe().insert(slots.clone(), 3));
+        lease.stripe().abort_insert(slots, 3);
+        let mut buffer = UndoBuffer::default();
+        for &rid in &rids[..100] {
+            table.delete(rid, 10, 4, Wait::NEVER, &mut buffer).expect("delete");
+        }
+        table.commit(&rids[..100], 4, 11);
+        clock.store(11, Ordering::SeqCst);
+        assert_eq!((table.count(10, 0), table.count(11, 0)), (3_000, 2_900));
+
+        let id = rids[0].stripe();
+        let hot = table.begin_freeze(id).expect("a hot stripe");
+        assert!(table.begin_freeze(id).is_none(), "a freeze begins once");
+        assert!(hot.is_full(), "and seals the stripe");
+        let freeze = table.settle(&hot, &clock).expect("nothing in flight");
+        assert_eq!((freeze.at(), freeze.rows()), (11, hot.reserved()));
+        let frozen = table.publish(freeze, &horizons, &clock).expect("no older snapshot");
+        assert_eq!((frozen.id(), frozen.checkpoint(), frozen.rows()), (id, 11, hot.reserved()));
+        assert!(matches!(table.find(id), Some(Stripe::Frozen(_))));
+        assert_eq!(table.count(11, 0), 2_900);
+        let base = frozen.with_deletes(|deletes| deletes.base().len());
+        assert_eq!(base, frozen.rows() as usize - 2_900, "holes and deleted rows");
+
+        let next = rows(&mut inserter, 10, 5, 12);
+        assert_ne!(next[0].stripe(), id, "inserts go to a new stripe");
+        assert_eq!(table.count(12, 0), 2_910);
+    }
+
+    #[test]
+    fn a_row_written_during_a_freeze_moves_and_its_delete_is_the_frozen_stripes() {
+        let table = directory();
+        let clock = AtomicU64::new(2);
+        let horizons = Horizons::new(1);
+        let mut inserter = Inserter::new(Arc::clone(&table));
+        let rids = rows(&mut inserter, 100, 1, 2);
+        let id = rids[0].stripe();
+        let hot = table.begin_freeze(id).expect("a hot stripe");
+        let mut buffer = UndoBuffer::default();
+        let fill = |value: u128| {
+            move |lease: &mut Lease, slot: u32| lease.stripe().write(slot, 0, Some(value))
+        };
+
+        let update = hot.update(rids[0].slot(), &[(0, Some(7))], 2, 8, Wait::NEVER, &mut buffer);
+        assert_eq!(update, Err(Refusal::Freezing));
+        let moved = table.migrate(rids[0], 2, 8, &mut inserter, fill(7)).expect("moves");
+        assert_ne!(moved.stripe(), id);
+        table.delete(rids[1], 2, 8, Wait::NEVER, &mut buffer).expect("into the delete vector");
+        assert_eq!(table.delete(rids[1], 2, 9, Wait::NEVER, &mut buffer), Err(Refusal::Conflict));
+        let again = table.migrate(rids[0], 2, 9, &mut inserter, fill(8)).map(|_| ());
+        assert_eq!(again, Err(Refusal::Conflict));
+        assert_eq!(table.delete(rids[1], 2, 8, Wait::NEVER, &mut buffer), Err(Refusal::Gone));
+        table.delete(rids[2], 2, 9, Wait::NEVER, &mut buffer).expect("to be taken back");
+        assert_eq!((table.count(2, 8), table.count(2, 9), table.count(2, 0)), (99, 99, 100));
+        assert!(!hot.visible(rids[1].slot(), 2, 8) && hot.visible(rids[1].slot(), 2, 0));
+
+        let freeze = table.settle(&hot, &clock).expect("the delete vector holds no row");
+        let frozen = table.publish(freeze, &horizons, &clock).expect("no older snapshot");
+        table.commit(&[rids[0], moved, rids[1]], 8, 3);
+        table.abort(&[rids[2]], 9);
+        clock.store(3, Ordering::SeqCst);
+        assert_eq!(table.count(2, 0), 100, "a snapshot at F reads the frozen stripe as of F");
+        assert_eq!(table.count(3, 0), 99);
+        assert_eq!(frozen.with_deletes(|deletes| deletes.recent()), 2);
+        table.delete(rids[2], 3, 10, Wait::NEVER, &mut buffer).expect("free again");
+        assert_eq!(table.delete(rids[0], 3, 10, Wait::NEVER, &mut buffer), Err(Refusal::Gone));
+    }
+
+    #[test]
+    fn a_freeze_waits_for_writes_in_flight_and_for_older_snapshots() {
+        let table = directory();
+        let clock = AtomicU64::new(2);
+        let horizons = Horizons::new(1);
+        let mut inserter = Inserter::new(Arc::clone(&table));
+        let rids = rows(&mut inserter, 100, 1, 2);
+        let id = rids[0].stripe();
+        let old = horizons.begin(0, &clock, Reads::Tables(vec![0]));
+        let hot = match table.find(id) {
+            Some(Stripe::Hot(hot)) => hot,
+            _ => panic!("a hot stripe"),
+        };
+        let mut buffer = UndoBuffer::default();
+        hot.update(rids[0].slot(), &[(0, Some(7))], 2, 8, Wait::NEVER, &mut buffer).expect("held");
+        let (lease, late) = inserter.take(5);
+        let leased = Arc::clone(lease.stripe());
+        assert_eq!(leased.id(), id);
+
+        assert!(table.begin_freeze(id).is_some());
+        assert!(table.settle(&hot, &clock).is_none(), "a row is held");
+        hot.commit_write(rids[0].slot(), 8, 3);
+        assert!(table.settle(&hot, &clock).is_none(), "the clock is behind a commit");
+        clock.store(3, Ordering::SeqCst);
+        assert!(!leased.insert(late.clone(), 9), "an insert leased before the freeze is refused");
+        assert!(!hot.visible(late.start, 3, 9), "and leaves holes");
+
+        let freeze = table.settle(&hot, &clock).expect("settled");
+        assert_eq!(freeze.at(), 3);
+        let seen = table.stripes();
+        let freeze = table.publish(freeze, &horizons, &clock).expect_err("a snapshot from before");
+        horizons.end(0);
+        horizons.resume(0, old);
+        let freeze = table.publish(freeze, &horizons, &clock).expect_err("its next statement");
+        horizons.end(0);
+        table.publish(freeze, &horizons, &clock).expect("nobody reads from before");
+        assert!(matches!(seen[0], Stripe::Hot(_)), "a scan keeps the stripes it loaded");
+        assert!(matches!(table.find(id), Some(Stripe::Frozen(_))));
+        assert_eq!(seen[0].visible(0, 2, 0, &mut [0; 128]), 100, "and reads them as before");
+        assert_eq!(table.count(3, 0), 100);
+    }
+
+    #[test]
+    fn the_freezer_takes_quiet_stripes_then_the_coldest_over_the_limit() {
+        let tables = [directory(), directory()];
+        // Each table has a sealed stripe and an open one after it.
+        let mut stripes = Vec::new();
+        for table in &tables {
+            let mut inserter = Inserter::new(Arc::clone(table));
+            for sealed in [true, false] {
+                let rid = rows(&mut inserter, 100, 1, 2)[0];
+                let Some(Stripe::Hot(hot)) = table.find(rid.stripe()) else { panic!("hot") };
+                if sealed {
+                    assert!(hot.seal());
+                    assert!(!hot.seal(), "once");
+                }
+                stripes.push(hot);
+            }
+        }
+        let [a0, a1, b0, b1] = [0, 1, 2, 3].map(|at| Arc::clone(&stripes[at]));
+        assert_ne!(a0.id(), a1.id());
+        for (stripe, ms) in [(&a0, 100), (&a1, 300), (&b0, 50), (&b1, 200)] {
+            stripe.touch(ms);
+        }
+        let total: usize = tables.iter().map(|table| table.hot_bytes()).sum();
+        let each = total / 4;
+
+        assert_eq!(to_freeze(&tables, 1_000, 10_000, usize::MAX), []);
+        assert_eq!(to_freeze(&tables, 1_000, 800, usize::MAX), [(1, b0.id()), (0, a0.id())]);
+        assert_eq!(to_freeze(&tables, 1_000, 10_000, total - 1), [(1, b0.id())]);
+        assert!(!a1.is_full() && !b1.is_full());
+        let all = to_freeze(&tables, 1_000, 10_000, each / 2);
+        assert_eq!(all, [(1, b0.id()), (0, a0.id()), (1, b1.id()), (0, a1.id())]);
+        assert!(a1.is_full() && b1.is_full(), "the open stripes were sealed early");
+    }
+
+    #[test]
+    fn deletes_and_moves_during_a_freeze_all_land() {
+        const ROWS: u32 = 20_000;
+        const WORKERS: u64 = 4;
+        let table = directory();
+        let clock = Arc::new(AtomicU64::new(2));
+        let horizons = Horizons::new(1);
+        let rids = Arc::new(rows(&mut Inserter::new(Arc::clone(&table)), ROWS, 1, 2));
+        let id = rids[0].stripe();
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|worker| {
+                let (table, clock, rids) =
+                    (Arc::clone(&table), Arc::clone(&clock), Arc::clone(&rids));
+                thread::spawn(move || {
+                    let mut inserter = Inserter::new(Arc::clone(&table));
+                    let mut buffer = UndoBuffer::default();
+                    for (i, &rid) in rids.iter().enumerate().skip(worker as usize) {
+                        if i as u64 % WORKERS != worker {
+                            continue;
+                        }
+                        let txn = 100 + i as u64;
+                        let mut written = vec![rid];
+                        if i % 2 == 0 {
+                            table.delete(rid, 2, txn, Wait::NEVER, &mut buffer).expect("delete");
+                        } else {
+                            let update = match table.find(rid.stripe()) {
+                                Some(Stripe::Hot(hot)) => hot.update(
+                                    rid.slot(),
+                                    &[(0, Some(7))],
+                                    2,
+                                    txn,
+                                    Wait::NEVER,
+                                    &mut buffer,
+                                ),
+                                _ => Err(Refusal::Freezing),
+                            };
+                            match update {
+                                Ok(()) => {}
+                                Err(Refusal::Freezing) => written.push(
+                                    table
+                                        .migrate(
+                                            rid,
+                                            2,
+                                            txn,
+                                            &mut inserter,
+                                            |lease: &mut Lease, slot| {
+                                                lease.stripe().write(slot, 0, Some(7));
+                                            },
+                                        )
+                                        .expect("moves"),
+                                ),
+                                Err(refusal) => panic!("{refusal:?}"),
+                            }
+                        }
+                        let ts = clock.fetch_add(1, Ordering::SeqCst) + 1;
+                        table.commit(&written, txn, ts);
+                    }
+                })
+            })
+            .collect();
+
+        thread::sleep(Duration::from_millis(5));
+        let hot = table.begin_freeze(id).expect("a hot stripe");
+        let freeze = loop {
+            if let Some(freeze) = table.settle(&hot, &clock) {
+                break freeze;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        table.publish(freeze, &horizons, &clock).expect("nobody reads");
+        for worker in workers {
+            worker.join().expect("writes");
+        }
+        let now = clock.load(Ordering::SeqCst);
+        assert_eq!(table.count(now, 0), u64::from(ROWS / 2), "every delete landed once");
+        let moved: u64 = table
+            .stripes()
+            .iter()
+            .filter(|stripe| stripe.id() != id)
+            .map(|stripe| {
+                (0..stripe.slots().div_ceil(8_192))
+                    .map(|part| stripe.visible(part, now, 0, &mut [0; 128]) as u64)
+                    .sum::<u64>()
+            })
+            .sum();
+        let frozen = match table.find(id) {
+            Some(Stripe::Frozen(frozen)) => frozen,
+            _ => panic!("frozen"),
+        };
+        let kept = frozen.rows() as u64
+            - frozen.with_deletes(|deletes| deletes.base().len() + deletes.recent()) as u64;
+        assert_eq!(
+            kept + moved,
+            u64::from(ROWS / 2),
+            "a row updated in place stays, a moved one moved"
+        );
     }
 
     #[test]
