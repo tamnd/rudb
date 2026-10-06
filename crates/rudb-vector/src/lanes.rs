@@ -203,6 +203,52 @@ pub(crate) fn unpack(bytes: &[u8], width: usize, out: &mut [u64; 64]) {
     }
 }
 
+/// Adds `(code + lift) * stride` for each of the codes from group `at` on into `into`, eight codes a
+/// group, for as many groups as `into` holds and `bytes` has to read, and returns how many codes
+/// that was.
+///
+/// Group `g` starts at byte `at + g * width`, which is where a group of eight codes starts once the
+/// first code is a multiple of eight into the run. The codes come out of the shuffle, shift and
+/// mask [`unpack`] uses and go straight into the 32 bit places, so nothing is widened to a word and
+/// read back. `width` is between one and [`LANE_WIDTH_MAX`].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+pub(crate) fn add_codes(
+    (bytes, at, width): (&[u8], usize, usize),
+    into: &mut [u32],
+    lift: u32,
+    stride: u32,
+) -> usize {
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_loadu_si256, _mm256_mullo_epi32, _mm256_set1_epi32,
+        _mm256_storeu_si256,
+    };
+    assert!((1..=LANE_WIDTH_MAX).contains(&width));
+    let (shuffle, shifts) = &LANES[width];
+    let half = 4 * width / 8;
+    // Group `g` reads sixteen bytes at `at + g * width` and sixteen at `half` past that.
+    let readable = bytes.len().checked_sub(at + half + 16).map_or(0, |room| room / width + 1);
+    let groups = (into.len() / 8).min(readable);
+    // SAFETY: the build enables AVX2, which the `cfg` on this function checks. The last group's
+    // second load ends at `at + (groups - 1) * width + half + 16`, which `readable` keeps inside
+    // `bytes`, and group `g` reads and writes the eight places at `8 * g`, inside `into`.
+    #[expect(clippy::cast_possible_wrap, reason = "the lanes are read unsigned")]
+    unsafe {
+        let shuffle = _mm256_loadu_si256(shuffle.as_ptr().cast());
+        let shifts = _mm256_loadu_si256(shifts.as_ptr().cast());
+        let mask = _mm256_set1_epi32(((1_u32 << width) - 1) as i32);
+        let (lift, stride) = (_mm256_set1_epi32(lift as i32), _mm256_set1_epi32(stride as i32));
+        let first = bytes.as_ptr().add(at);
+        for group in 0..groups {
+            let codes = group_codes(first.add(group * width), half, shuffle, shifts, mask);
+            let to = into.as_mut_ptr().add(8 * group).cast();
+            let places = _mm256_mullo_epi32(_mm256_add_epi32(codes, lift), stride);
+            _mm256_storeu_si256(to, _mm256_add_epi32(_mm256_loadu_si256(to), places));
+        }
+    }
+    groups * 8
+}
+
 /// The codes of one group of eight at `first`, each in a 32 bit lane, for a side whose table,
 /// shift, mask and half are the ones [`within_words`] sets up for its width.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -482,6 +528,39 @@ pub(crate) fn add_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codes added in lanes are the codes read a bit at a time, lifted and multiplied, for every
+    /// width the lanes take, and the pass stops where the bytes run out.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn codes_added_in_lanes_are_the_codes_read_one_at_a_time() {
+        for width in 1..=LANE_WIDTH_MAX {
+            let codes: Vec<u32> =
+                (0..200_u32).map(|i| i.wrapping_mul(2_654_435_761) % (1 << width)).collect();
+            let mut bytes = vec![0_u8; 200 * width / 8 + 1];
+            for (i, &code) in codes.iter().enumerate() {
+                for b in 0..width {
+                    if code >> b & 1 == 1 {
+                        bytes[(i * width + b) / 8] |= 1 << ((i * width + b) % 8);
+                    }
+                }
+            }
+            for skip in [0, 8, 64] {
+                let mut into: Vec<u32> = (0..136).collect();
+                let done = add_codes((&bytes, skip * width / 8, width), &mut into, 3, 5);
+                let room = (bytes.len() - skip * width / 8 - 4 * width / 8 - 16) / width + 1;
+                assert_eq!(done, 8 * (136 / 8).min(room), "{width} {skip}");
+                for (row, &place) in into.iter().enumerate() {
+                    let want = if row < done {
+                        row as u32 + (codes[skip + row] + 3) * 5
+                    } else {
+                        row as u32
+                    };
+                    assert_eq!(place, want, "{width} {skip} {row}");
+                }
+            }
+        }
+    }
 
     /// Pairs added in lanes come to the cells a row at a time would, for places that repeat and a
     /// place past the cells that stops the pass at its block.
