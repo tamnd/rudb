@@ -1705,7 +1705,7 @@ fn owned(exact: &Exact, keyed: &Keyed<'_>, chunks: &[Chunk]) -> Result<Option<Pu
             }
         }
     }
-    Ok(owned_keys(exact, rows, keys.into_iter()))
+    Ok(owned_keys(exact, rows, keys.into_iter(), None))
 }
 
 /// The rows of a table whose own unique column holds one of `count` key values, read off its key
