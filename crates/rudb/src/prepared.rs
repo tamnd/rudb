@@ -60,11 +60,7 @@ pub struct Prepared {
     sql: String,
     ast: Ast,
     names: Vec<String>,
-    direct: Option<Direct>,
-    lookup: Option<Lookup>,
-    write: Option<PointWrite>,
-    range: Option<RangeRead>,
-    upsert: Option<Upsert>,
+    short: Short,
     /// Whether the parameters are `1` to `n` and nothing else, so that `n` values by position are
     /// exactly the values the statement wants, with nothing missing and nothing left over.
     numbered: bool,
@@ -168,18 +164,16 @@ fn equalities(ast: &Ast, filter: ast::ExprRef) -> Option<Vec<(Vec<String>, Item)
         match op {
             ast::BinaryOp::And => pending.extend([right, left]),
             ast::BinaryOp::Eq => {
-                let (column, parameter) = match (ast.expr(left), ast.expr(right)) {
-                    (ast::Expr::Column { name }, ast::Expr::Parameter { name: parameter })
-                    | (ast::Expr::Parameter { name: parameter }, ast::Expr::Column { name }) => {
-                        (name, parameter)
-                    }
+                let (column, other) = match (ast.expr(left), ast.expr(right)) {
+                    (ast::Expr::Column { name }, _) => (name, right),
+                    (_, ast::Expr::Column { name }) => (name, left),
                     _ => return None,
                 };
-                let parameter = ast.string(parameter);
-                equal.push((
-                    words(column),
-                    Item::Parameter(parameter.to_owned(), numbered(parameter)),
-                ));
+                // A key is never equal to a `NULL`, which the plan answers with no rows.
+                match item(ast, other)? {
+                    Item::Null => return None,
+                    found => equal.push((words(column), found)),
+                }
             }
             _ => return None,
         }
@@ -283,6 +277,8 @@ pub(crate) struct Target {
     pub(crate) columns: Vec<usize>,
     pub(crate) names: Arc<[String]>,
     pub(crate) types: Arc<[LogicalType]>,
+    /// The table column of each column of the result, as the binder gives it to a client.
+    pub(crate) origins: Arc<[Option<Origin>]>,
     /// Whether a column may hold a `TIMESTAMPTZ`, which is the one kind of value a result needs
     /// the session to write.
     pub(crate) zoned: bool,
@@ -326,6 +322,49 @@ pub(crate) enum Item {
     Parameter(String, Option<usize>),
     /// A `NULL` written into the statement.
     Null,
+    /// A value written into the statement: an integer, a string or a boolean. A statement given as
+    /// text has these where a prepared one has parameters.
+    Value(Value),
+}
+
+/// The item that `expr` is, when it is a parameter or a value written as it is.
+///
+/// A number is only an integer of up to 64 bits, with a minus sign or not, which is the value the
+/// binder reads the same text as. A number with a point or an exponent is the plan's to type.
+fn item(ast: &Ast, expr: ast::ExprRef) -> Option<Item> {
+    let integer = |text: &str, negative: bool| {
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let written = if negative { format!("-{text}") } else { text.to_owned() };
+        match written.parse::<i32>() {
+            Ok(value) => Some(Item::Value(Value::Integer(value))),
+            Err(_) => written.parse::<i64>().ok().map(|value| Item::Value(Value::BigInt(value))),
+        }
+    };
+    match ast.expr(expr) {
+        ast::Expr::Parameter { name } => {
+            let name = ast.string(name);
+            Some(Item::Parameter(name.to_owned(), numbered(name)))
+        }
+        ast::Expr::Literal { kind, text } => match kind {
+            ast::LiteralKind::Null => Some(Item::Null),
+            ast::LiteralKind::True => Some(Item::Value(Value::Boolean(true))),
+            ast::LiteralKind::False => Some(Item::Value(Value::Boolean(false))),
+            ast::LiteralKind::String => {
+                Some(Item::Value(Value::Varchar(ast.string(text).to_owned())))
+            }
+            ast::LiteralKind::Number => integer(ast.string(text), false),
+            ast::LiteralKind::Blob => None,
+        },
+        ast::Expr::Unary { op: ast::UnaryOp::Negate, operand } => match ast.expr(operand) {
+            ast::Expr::Literal { kind: ast::LiteralKind::Number, text } => {
+                integer(ast.string(text), true)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The values an execution was given, as a [`Direct`] insert reads them.
@@ -342,6 +381,7 @@ impl Given<'_> {
     pub(crate) fn value(self, item: &Item) -> Option<Value> {
         match (item, self) {
             (Item::Null, _) => Some(Value::Null),
+            (Item::Value(value), _) => Some(value.clone()),
             (Item::Parameter(name, _), Given::Named(parameters)) => parameters.get(name).cloned(),
             (Item::Parameter(_, at), Given::Positional(values)) => values.get((*at)?).cloned(),
         }
@@ -391,17 +431,7 @@ impl Direct {
             return None;
         }
         let row = |row| {
-            ast.expr_list(row)
-                .iter()
-                .map(|&expr| match ast.expr(expr) {
-                    ast::Expr::Parameter { name } => {
-                        let name = ast.string(name);
-                        Some(Item::Parameter(name.to_owned(), numbered(name)))
-                    }
-                    ast::Expr::Literal { kind: ast::LiteralKind::Null, .. } => Some(Item::Null),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>()
+            ast.expr_list(row).iter().map(|&expr| item(ast, expr)).collect::<Option<Vec<_>>>()
         };
         let rows = ast.rows(rows).iter().map(|&at| row(at)).collect::<Option<Vec<_>>>()?;
         // Rows of different widths are the plan's to refuse.
@@ -474,20 +504,13 @@ impl Upsert {
             return None;
         }
         let source = |expr| match ast.expr(expr) {
-            ast::Expr::Parameter { name } => {
-                let name = ast.string(name);
-                Some(Source::Given(Item::Parameter(name.to_owned(), numbered(name))))
-            }
-            ast::Expr::Literal { kind: ast::LiteralKind::Null, .. } => {
-                Some(Source::Given(Item::Null))
-            }
             ast::Expr::Column { name } => match ast.name(name).collect::<Vec<_>>().as_slice() {
                 [table, column] if table.eq_ignore_ascii_case("excluded") => {
                     Some(Source::Excluded((*column).to_owned()))
                 }
                 _ => None,
             },
-            _ => None,
+            _ => item(ast, expr).map(Source::Given),
         };
         let mut changes = Vec::with_capacity(columns.len());
         for (column, value) in columns.into_iter().zip(values) {
@@ -644,15 +667,14 @@ impl RangeRead {
         let mut lookup = Lookup::reading(ast, select)?;
         let words = |slice| ast.name(slice).map(str::to_owned).collect::<Vec<_>>();
         let ast::Expr::Binary { op, left, right } = ast.expr(select.filter) else { return None };
-        let (column, parameter, flipped) = match (ast.expr(left), ast.expr(right)) {
-            (ast::Expr::Column { name }, ast::Expr::Parameter { name: parameter }) => {
-                (words(name), parameter, false)
-            }
-            (ast::Expr::Parameter { name: parameter }, ast::Expr::Column { name }) => {
-                (words(name), parameter, true)
-            }
+        let (column, bound, flipped) = match (ast.expr(left), ast.expr(right)) {
+            (ast::Expr::Column { name }, _) => (words(name), item(ast, right)?, false),
+            (_, ast::Expr::Column { name }) => (words(name), item(ast, left)?, true),
             _ => return None,
         };
+        if matches!(bound, Item::Null) {
+            return None;
+        }
         let reach = match (op, flipped) {
             (ast::BinaryOp::GtEq, false) | (ast::BinaryOp::LtEq, true) => Reach::AtLeast,
             (ast::BinaryOp::Gt, false) | (ast::BinaryOp::Lt, true) => Reach::Above,
@@ -689,8 +711,7 @@ impl RangeRead {
             }
             _ => return None,
         };
-        let parameter = ast.string(parameter);
-        lookup.equal = vec![(column, Item::Parameter(parameter.to_owned(), numbered(parameter)))];
+        lookup.equal = vec![(column, bound)];
         Some(Self { lookup, reach, descending, limit })
     }
 }
@@ -748,13 +769,7 @@ impl PointWrite {
         if columns.is_empty() != delete || columns.len() != values.len() {
             return None;
         }
-        let parameter = |expr| match ast.expr(expr) {
-            ast::Expr::Parameter { name } => {
-                let name = ast.string(name);
-                Some(Item::Parameter(name.to_owned(), numbered(name)))
-            }
-            _ => None,
-        };
+        let parameter = |expr| item(ast, expr).filter(|item| !matches!(item, Item::Null));
         let mut sets = Vec::with_capacity(columns.len());
         for (column, value) in columns.into_iter().zip(values) {
             if sets.iter().any(|(held, _): &(String, Set)| held.eq_ignore_ascii_case(&column)) {
@@ -770,8 +785,6 @@ impl PointWrite {
                 _ => false,
             };
             let set = match ast.expr(value.expr) {
-                ast::Expr::Parameter { .. } => Set::To(parameter(value.expr)?),
-                ast::Expr::Literal { kind: ast::LiteralKind::Null, .. } => Set::To(Item::Null),
                 ast::Expr::Binary { op: ast::BinaryOp::Add, left, right } if itself(left) => {
                     Set::Add(parameter(right)?, false)
                 }
@@ -781,7 +794,7 @@ impl PointWrite {
                 ast::Expr::Binary { op: ast::BinaryOp::Subtract, left, right } if itself(left) => {
                     Set::Add(parameter(right)?, true)
                 }
-                _ => return None,
+                _ => Set::To(item(ast, value.expr)?),
             };
             sets.push((column, set));
         }
@@ -798,33 +811,93 @@ impl PointWrite {
     }
 }
 
+/// The shapes of a statement that run without binding and planning, see [`Prepared::explain`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Short {
+    direct: Option<Direct>,
+    lookup: Option<Lookup>,
+    write: Option<PointWrite>,
+    range: Option<RangeRead>,
+    upsert: Option<Upsert>,
+}
+
+impl Short {
+    /// The shapes `ast` has.
+    pub(crate) fn of(ast: &Ast) -> Self {
+        Self {
+            direct: Direct::of(ast),
+            lookup: Lookup::of(ast),
+            write: PointWrite::of(ast),
+            range: RangeRead::of(ast),
+            upsert: Upsert::of(ast),
+        }
+    }
+
+    /// The shapes of `ast` when it has its values written in. An insert of more than one row is a
+    /// load, which the plan streams into the file of a database, so only an insert of one row
+    /// takes the short way.
+    pub(crate) fn written(ast: &Ast) -> Self {
+        let mut short = Self::of(ast);
+        short.direct = short.direct.filter(|direct| direct.rows.len() == 1);
+        short
+    }
+
+    /// Runs the statement `sql` one of the short ways, or gives `None` when none of them takes it
+    /// and the statement goes the long way.
+    pub(crate) fn run(
+        &self,
+        shared: &Shared,
+        given: Given<'_>,
+        sql: &str,
+    ) -> Option<Result<QueryResult>> {
+        if let Some(lookup) = &self.lookup
+            && let Some(done) = shared.lookup(lookup, given, sql)
+        {
+            return Some(done);
+        }
+        if let Some(range) = &self.range
+            && let Some(done) = shared.range_read(range, given, sql)
+        {
+            return Some(done);
+        }
+        // The short ways do not fire triggers, so a write goes the long way once there is one.
+        if shared.triggered() {
+            return None;
+        }
+        if let Some(direct) = &self.direct
+            && let Some(done) = shared.insert_direct(direct, given, sql)
+        {
+            return Some(done);
+        }
+        if let Some(write) = &self.write
+            && let Some(done) = if write.delete {
+                shared.delete_point(write, given, sql)
+            } else {
+                shared.write_point(write, given, sql)
+            }
+        {
+            return Some(done);
+        }
+        if let Some(upsert) = &self.upsert
+            && let Some(done) = shared.upsert_point(upsert, given, sql)
+        {
+            return Some(done);
+        }
+        None
+    }
+}
+
 impl Prepared {
     /// Parses `sql` and reads the parameters out of it.
     pub(crate) fn new(shared: Shared, sql: &str) -> Result<Self> {
         let session = shared.session();
         let ast = crate::database::parse(&session, sql)?;
         let names: Vec<String> = ast.parameters().into_iter().map(str::to_string).collect();
-        let direct = Direct::of(&ast);
-        let lookup = Lookup::of(&ast);
-        let write = PointWrite::of(&ast);
-        let range = RangeRead::of(&ast);
-        let upsert = Upsert::of(&ast);
+        let short = Short::of(&ast);
         let numbered = numbered_one_to_n(&names);
         let sql = sql.to_string();
         let described = Arc::default();
-        Ok(Self {
-            shared,
-            sql,
-            ast,
-            names,
-            direct,
-            lookup,
-            write,
-            range,
-            upsert,
-            numbered,
-            described,
-        })
+        Ok(Self { shared, sql, ast, names, short, numbered, described })
     }
 
     /// The statement as it was written.
@@ -923,12 +996,13 @@ impl Prepared {
     /// pipeline is found out by name rather than by a slow number.
     #[must_use]
     pub fn explain(&self) -> String {
+        let short = &self.short;
         let shapes = [
-            self.direct.as_ref().map(Shape::Insert),
-            self.lookup.as_ref().map(Shape::Lookup),
-            self.write.as_ref().map(Shape::Write),
-            self.range.as_ref().map(Shape::Range),
-            self.upsert.as_ref().map(Shape::Upsert),
+            short.direct.as_ref().map(Shape::Insert),
+            short.lookup.as_ref().map(Shape::Lookup),
+            short.write.as_ref().map(Shape::Write),
+            short.range.as_ref().map(Shape::Range),
+            short.upsert.as_ref().map(Shape::Upsert),
         ];
         let plan = shapes.into_iter().flatten().find_map(|shape| self.shared.point_plan(shape));
         plan.unwrap_or_else(|| "PIPELINE".to_owned())
@@ -986,38 +1060,7 @@ impl Prepared {
     /// The statement run one of the ways that skip binding and planning, where one of them takes
     /// it: an insert of a row or a few, a read by key, a write by key, a short range or an upsert.
     fn short(&self, given: Given<'_>) -> Option<Result<QueryResult>> {
-        let shared = &self.shared;
-        let sql = self.sql.as_str();
-        if let Some(direct) = &self.direct
-            && let Some(done) = shared.insert_direct(direct, given, sql)
-        {
-            return Some(done);
-        }
-        if let Some(lookup) = &self.lookup
-            && let Some(done) = shared.lookup(lookup, given, sql)
-        {
-            return Some(done);
-        }
-        if let Some(write) = &self.write
-            && let Some(done) = if write.delete {
-                shared.delete_point(write, given, sql)
-            } else {
-                shared.write_point(write, given, sql)
-            }
-        {
-            return Some(done);
-        }
-        if let Some(range) = &self.range
-            && let Some(done) = shared.range_read(range, given, sql)
-        {
-            return Some(done);
-        }
-        if let Some(upsert) = &self.upsert
-            && let Some(done) = shared.upsert_point(upsert, given, sql)
-        {
-            return Some(done);
-        }
-        None
+        self.short.run(&self.shared, given, &self.sql)
     }
 
     /// Checks the values against the statement and runs it.
@@ -1079,7 +1122,7 @@ mod tests {
         db.execute("CREATE TABLE t (id BIGINT, name VARCHAR, price DOUBLE, qty INTEGER)")
             .expect("creates");
         let prepared = db.prepare("INSERT INTO t VALUES (?, ?, ?, NULL)").expect("prepares");
-        let direct = prepared.direct.as_ref().expect("the shape is recognised");
+        let direct = prepared.short.direct.as_ref().expect("the shape is recognised");
         let values = vec![Value::BigInt(1), Value::Varchar("a".into()), Value::Integer(2)];
         let taken =
             prepared.shared.insert_direct(direct, Given::Positional(&values), prepared.sql());
@@ -1094,7 +1137,7 @@ mod tests {
             "INSERT INTO t SELECT ?, ?, ?, ?",
             "INSERT INTO t VALUES (?, ?, ?, 1 + ?)",
         ] {
-            assert!(db.prepare(sql).expect("prepares").direct.is_none(), "{sql}");
+            assert!(db.prepare(sql).expect("prepares").short.direct.is_none(), "{sql}");
         }
         assert!(Direct::of(&rudb_parse::parse_ast("SELECT ?").expect("parses")).is_none());
     }
@@ -1105,7 +1148,7 @@ mod tests {
         db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR)").expect("creates");
         db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").expect("inserts");
         let prepared = db.prepare("SELECT name FROM t WHERE id = ?").expect("prepares");
-        let lookup = prepared.lookup.as_ref().expect("the shape is recognised");
+        let lookup = prepared.short.lookup.as_ref().expect("the shape is recognised");
         let values = vec![Value::BigInt(2)];
         let taken = prepared.shared.lookup(lookup, Given::Positional(&values), prepared.sql());
         let result = taken.expect("taken").expect("runs");
@@ -1114,7 +1157,7 @@ mod tests {
         let taken = prepared.shared.lookup(lookup, Given::Positional(&values), prepared.sql());
         assert!(taken.is_none(), "a value the plan would cast goes to the plan");
         let prepared = db.prepare("SELECT name FROM t WHERE name = ?").expect("prepares");
-        let lookup = prepared.lookup.as_ref().expect("the shape is recognised");
+        let lookup = prepared.short.lookup.as_ref().expect("the shape is recognised");
         let values = vec![Value::Varchar("b".into())];
         let taken = prepared.shared.lookup(lookup, Given::Positional(&values), prepared.sql());
         assert!(taken.is_none(), "name is no key");
@@ -1128,7 +1171,7 @@ mod tests {
             "SELECT t.name FROM t, t AS u WHERE t.id = ?",
             "SELECT name FROM t",
         ] {
-            assert!(db.prepare(sql).expect("prepares").lookup.is_none(), "{sql}");
+            assert!(db.prepare(sql).expect("prepares").short.lookup.is_none(), "{sql}");
         }
     }
 
@@ -1139,7 +1182,7 @@ mod tests {
         db.execute("INSERT INTO t VALUES (3, 'c'), (1, 'a'), (2, 'b')").expect("inserts");
         let prepared =
             db.prepare("SELECT name FROM t WHERE id >= ? ORDER BY id LIMIT ?").expect("prepares");
-        let range = prepared.range.as_ref().expect("the shape is recognised");
+        let range = prepared.short.range.as_ref().expect("the shape is recognised");
         let values = vec![Value::BigInt(2), Value::BigInt(5)];
         let taken = prepared.shared.range_read(range, Given::Positional(&values), prepared.sql());
         let result = taken.expect("taken").expect("runs");
@@ -1161,7 +1204,7 @@ mod tests {
             "SELECT name FROM t WHERE id <> ? ORDER BY id LIMIT 1",
             "SELECT name FROM t WHERE id >= ? ORDER BY id LIMIT 5000",
         ] {
-            assert!(db.prepare(sql).expect("prepares").range.is_none(), "{sql}");
+            assert!(db.prepare(sql).expect("prepares").short.range.is_none(), "{sql}");
         }
     }
 
@@ -1173,7 +1216,7 @@ mod tests {
         db.execute("INSERT INTO t SELECT i, 'v' || i, i FROM range(3000) r(i)").expect("inserts");
         let prepared =
             db.prepare("UPDATE t SET name = ?, n = n + ? WHERE id = ?").expect("prepares");
-        let write = prepared.write.as_ref().expect("the shape is recognised");
+        let write = prepared.short.write.as_ref().expect("the shape is recognised");
         let values = vec![Value::Varchar("b".into()), Value::BigInt(5), Value::BigInt(2)];
         let taken = prepared.shared.write_point(write, Given::Positional(&values), prepared.sql());
         assert_eq!(taken.expect("taken").expect("runs").value_at(0, 0), Value::BigInt(1));
@@ -1187,7 +1230,7 @@ mod tests {
         let taken = prepared.shared.write_point(write, Given::Positional(&values), prepared.sql());
         assert!(taken.is_none(), "a sum that overflows goes to the plan");
         let prepared = db.prepare("UPDATE t SET id = ? WHERE id = ?").expect("prepares");
-        let write = prepared.write.as_ref().expect("the shape is recognised");
+        let write = prepared.short.write.as_ref().expect("the shape is recognised");
         let values = vec![Value::BigInt(-1), Value::BigInt(2)];
         let taken = prepared.shared.write_point(write, Given::Positional(&values), prepared.sql());
         assert!(taken.is_none(), "a key written goes to the plan");
@@ -1200,9 +1243,10 @@ mod tests {
             "UPDATE t SET n = id + ? WHERE id = ?",
             "UPDATE t SET name = ? FROM t AS u WHERE t.id = ?",
             "UPDATE t SET name = ?",
-            "DELETE FROM t WHERE id = ?",
         ] {
-            assert!(db.prepare(sql).expect("prepares").write.is_none(), "{sql}");
+            assert!(db.prepare(sql).expect("prepares").short.write.is_none(), "{sql}");
         }
+        let delete = db.prepare("DELETE FROM t WHERE id = ?").expect("prepares");
+        assert!(delete.short.write.as_ref().is_some_and(|write| write.delete));
     }
 }

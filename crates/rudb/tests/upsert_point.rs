@@ -158,7 +158,7 @@ fn a_do_update_sets_what_it_says() {
     // What goes the long way, and has to come out the same all the same.
     let long = [
         "INSERT INTO t VALUES (?, ?, ?, ?) ON CONFLICT DO UPDATE SET id = excluded.id",
-        "INSERT INTO t VALUES (?, ?, ?, ?) ON CONFLICT DO UPDATE SET n = 1",
+        "INSERT INTO t VALUES (?, ?, ?, ?) ON CONFLICT DO UPDATE SET n = abs(excluded.n)",
         "INSERT INTO t VALUES (?, ?, ?, ?) ON CONFLICT DO UPDATE SET n = excluded.n \
          WHERE t.n > 100",
         "INSERT INTO t VALUES (?, ?, ?, ?) ON CONFLICT DO UPDATE SET n = n * excluded.n",

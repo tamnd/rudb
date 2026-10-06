@@ -8,12 +8,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use rudb_bind::{Bound, Described, Parameters, Placeholders, Write};
-use rudb_catalog::{Catalog, DEFAULT_CATALOG, Entry, Key, KeyLog, QualifiedName, View, same_name};
+use rudb_catalog::{
+    Catalog, DEFAULT_CATALOG, DETACHED, Entry, Key, KeyLog, QualifiedName, View, same_name,
+};
 use rudb_common::session::Postgres;
 use rudb_common::stat::Provenance;
 use rudb_common::{
-    Cancel, Clustering, DeclaredType, Error, Field, LogicalType, Memory, Result, Rule, Session,
-    Value,
+    Cancel, Clustering, DeclaredType, Error, Field, LogicalType, Memory, Origin, Result, Rule,
+    Session, Value,
 };
 use rudb_io::{Filesystem, RealFilesystem};
 use rudb_metrics::{Document, LoadProfile, Report, Span, Stage};
@@ -4229,7 +4231,6 @@ impl Shared {
         };
         let journals = self.journals(&name);
         let table = catalog.table(&name).ok()?;
-        let fields = table.columns();
         // The values as they were given are the row when there is one row with one for each
         // column, in order, and each is already its column's type, and then the table reads them
         // where they are. Anything else is gathered into rows of their own, which copies every
@@ -4325,7 +4326,8 @@ impl Shared {
                 Arc::clone(&target.types),
                 chunks,
                 reservation,
-            );
+            )
+            .with_origins(&target.origins);
             // The session is built under a lock every statement shares, and only a zoned value
             // reads it.
             Ok(if target.zoned { result.in_session(self.session()) } else { result })
@@ -4387,7 +4389,8 @@ impl Shared {
                 Arc::clone(&target.types),
                 chunks,
                 reservation,
-            );
+            )
+            .with_origins(&target.origins);
             Ok(if target.zoned { result.in_session(self.session()) } else { result })
         });
         (!unanswered).then_some(result)
@@ -5252,6 +5255,12 @@ impl Shared {
             .is_some_and(|snapshot| mine.generation() != snapshot.base.generation())
     }
 
+    /// Whether a trigger was ever made here. A write that can fire one goes the long way, which
+    /// runs the triggers.
+    pub(crate) fn triggered(&self) -> bool {
+        self.inner.triggered.load(Ordering::Acquire)
+    }
+
     /// Whether a transaction is open, which is what keeps a load from writing the file directly,
     /// since a file that was written cannot be rolled back.
     fn transacting(&self) -> bool {
@@ -5851,6 +5860,17 @@ impl Shared {
             let session = self.session();
             let (ast, parse_ns) = timed(|| parse(&session, sql))?;
             if let Some(answer) = self.prepared_statement(&ast, sql, cancel) {
+                return answer;
+            }
+            // A statement with its values written in takes the short ways of a prepared one, so an
+            // update of one row by its key does not bind and plan a write of the whole table.
+            if ast.parameters().is_empty()
+                && let Some(answer) = crate::prepared::Short::written(&ast).run(
+                    self,
+                    crate::prepared::Given::Positional(&[]),
+                    sql,
+                )
+            {
                 return answer;
             }
             self.execute_ast(&ast, sql, &Parameters::new(), cancel, parse_ns)
@@ -7808,16 +7828,19 @@ fn as_given<'a>(
 /// most 63 bytes, and a `varchar(n)` or a `char(n)` at most n characters. A `char(n)` value is
 /// kept with no trailing spaces. A value that the length rule of its type cuts, refuses or changes
 /// is left to the plan, which applies the rule. A string of n bytes or less has n characters or
-/// less, so the check counts no characters.
+/// less, so the check counts no characters. A string for a column of another declared type is left
+/// to the plan too.
 fn fits_declared(value: &Value, declared: Option<DeclaredType>) -> bool {
     const NAME: u32 = 19;
     const BPCHAR: u32 = 1042;
     const VARCHAR: u32 = 1043;
+    const TEXT: u32 = 25;
     let (Value::Varchar(text), Some(declared)) = (value, declared) else { return true };
     let max = match declared.oid {
         NAME => 63,
         VARCHAR | BPCHAR if declared.typmod >= 4 => (declared.typmod - 4) as usize,
-        _ => return true,
+        TEXT | VARCHAR | BPCHAR => return true,
+        _ => return false,
     };
     text.len() <= max && !(declared.oid == BPCHAR && text.ends_with(' '))
 }
@@ -7879,7 +7902,8 @@ fn lookup_target(
     if catalog.entry(&name).ok()? != Entry::Table {
         return None;
     }
-    let fields = catalog.table(&name).ok()?.columns();
+    let table = catalog.table(&name).ok()?;
+    let fields = table.columns();
     // A column is qualified by the alias when the table has one, and by its bare name otherwise.
     let qualifies = |qualifier: &[String]| match qualifier {
         [] => true,
@@ -7917,12 +7941,20 @@ fn lookup_target(
     let key = lookup.equal.iter().map(|(written, _)| column(written)).collect::<Option<_>>()?;
     let types: Vec<LogicalType> = columns.iter().map(|&at| fields[at].ty.clone()).collect();
     let zoned = types.iter().any(|ty| !unzoned(ty));
+    let oid = table.oid();
+    let origins: Vec<Option<Origin>> = columns
+        .iter()
+        .map(|&at| {
+            (oid != DETACHED).then(|| Origin::column(oid, at as u32, table.declared_type(at)))
+        })
+        .collect();
     Some(crate::prepared::Target {
         name,
         key,
         columns,
         names: names.into(),
         types: types.into(),
+        origins: origins.into(),
         zoned,
         sets: Vec::new(),
     })
@@ -8369,7 +8401,7 @@ fn keep_before_error(
     query: &rudb_exec::Query<'_>,
     names: Vec<String>,
     types: Vec<LogicalType>,
-    origins: &[Option<rudb_common::Origin>],
+    origins: &[Option<Origin>],
     memory: &Memory,
     session: &Session,
 ) {
