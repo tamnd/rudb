@@ -2564,10 +2564,16 @@ impl Table {
         Ok(())
     }
 
-    /// Takes the rows `numbers` names out, which rise, whatever holds the table: marked gone
-    /// beside a file that [`Self::takes_rows`], and otherwise every row read and the ones that stay
-    /// put back with [`Self::replace_all`]. Every row after the first one taken moves down, so the
-    /// frame is new.
+    /// Takes the rows `numbers` names out, which rise, whatever holds the table. Every row after
+    /// the first one taken moves down, so the frame is new.
+    ///
+    /// A file's rows are marked gone beside it, see [`Rows::Masked`], and rows in memory are taken
+    /// out where they are, see [`MemoryTable::take`], so a delete of a few rows costs those rows and
+    /// not a read of the table. The keys of the rows taken come out of the key sets the same way,
+    /// see `Seen::forget`. That is a delete by key in a table of ten million rows, which used to
+    /// build all ten million again. A delete of more than a quarter of the rows reads the ones that
+    /// stay and puts them back with [`Self::replace_all`], which gives back what the others held,
+    /// and so does the table in memory once a quarter of the rows it holds are taken out.
     ///
     /// # Errors
     ///
@@ -2579,6 +2585,92 @@ impl Table {
         if self.takes_rows() {
             return self.take_rows(numbers);
         }
+        // Where the keys are moves with the rows.
+        self.points = Points::default();
+        if numbers.len().saturating_mul(4) > self.rows.len() {
+            return self.keep_rows(numbers, workers);
+        }
+        let picks = self.picks(numbers)?;
+        // The keys of the rows going, read while they are still there.
+        let guards = self.guards();
+        let mut going = Vec::new();
+        for (at, key) in guards.iter().enumerate() {
+            if !matches!(self.seen.get(at), Some(Some(_))) {
+                continue;
+            }
+            let mut chunks = Vec::with_capacity(picks.len());
+            for (part, positions) in &picks {
+                chunks.push(self.rows.read_selected(*part, &key.columns, positions)?);
+            }
+            going.push((at, key, chunks));
+        }
+        let filed = match &self.rows {
+            Rows::Memory(_) => 0,
+            Rows::Native(reader) | Rows::Grown(reader, _) | Rows::Masked(reader, ..) => {
+                reader.parts()
+            }
+        };
+        let split = picks.partition_point(|(part, _)| *part < filed);
+        if split > 0 {
+            let (reader, mut gone) = match &self.rows {
+                Rows::Native(reader) | Rows::Grown(reader, _) => {
+                    (reader.clone(), Gone::none(reader.parts()))
+                }
+                Rows::Masked(reader, gone, _) => (reader.clone(), Gone::clone(gone)),
+                Rows::Memory(_) => return Err(Error::internal("a file part of a table in memory")),
+            };
+            for (part, positions) in &picks[..split] {
+                let rows = reader.part_rows(*part);
+                let live = gone.live(*part, rows);
+                let slots = positions
+                    .iter()
+                    .map(|&at| live.as_ref().map_or(at, |live| live[at as usize]))
+                    .collect::<Vec<_>>();
+                gone.take(*part, rows, &slots)?;
+            }
+            let empty = Rows::Memory(MemoryTable::new(Vec::new()));
+            self.rows = match std::mem::replace(&mut self.rows, empty) {
+                Rows::Native(_) if gone.total() >= reader.table().rows() => {
+                    Rows::Memory(MemoryTable::new(self.types()))
+                }
+                Rows::Native(_) => Rows::masked(reader, Arc::new(gone)),
+                Rows::Grown(_, tail) | Rows::Masked(_, _, tail) => {
+                    Rows::Masked(reader, Arc::new(gone), tail)
+                }
+                memory @ Rows::Memory(_) => memory,
+            };
+        }
+        if split < picks.len() {
+            let tail = self.rows.to_append()?;
+            for (part, positions) in &picks[split..] {
+                tail.take(part - filed, positions)?;
+            }
+            if tail.taken().saturating_mul(4) > tail.len() + tail.taken() {
+                let all = (0..tail.width()).collect::<Vec<_>>();
+                let chunks = (0..tail.chunk_count())
+                    .map(|at| tail.read(at, &all).and_then(Chunk::settled))
+                    .filter(|chunk| !matches!(chunk, Ok(chunk) if chunk.is_empty()))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut rows = MemoryTable::new(tail.types().to_vec());
+                rows.append_all(chunks, workers)?;
+                *tail = rows;
+            }
+        }
+        self.frame = next_revision();
+        for (at, key, chunks) in going {
+            let projected = Key { columns: (0..key.columns.len()).collect(), primary: key.primary };
+            let Some(seen) = self.seen[at].as_mut() else { continue };
+            if let Err(error) = chunks.iter().try_for_each(|chunk| seen.forget(chunk, &projected)) {
+                // Built again from the rows by the next write that needs it.
+                self.seen[at] = None;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::remove_rows`] by reading every row and putting back the ones that stay.
+    fn keep_rows(&mut self, numbers: &[u64], workers: usize) -> Result<()> {
         let all = (0..self.columns.len()).collect::<Vec<_>>();
         let mut kept = Vec::with_capacity(self.rows.chunk_count());
         let mut numbers = numbers.iter().copied().peekable();
@@ -2607,6 +2699,35 @@ impl Table {
             return Err(Error::internal("a delete took out a row past the table"));
         }
         self.replace_all(kept, workers)
+    }
+
+    /// The rows `numbers` names, which rise, as the parts they are in, each with the places in the
+    /// part, as a read counts them.
+    fn picks(&self, numbers: &[u64]) -> Result<Vec<(usize, Vec<u32>)>> {
+        if numbers.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Error::internal("the rows a delete took out do not rise"));
+        }
+        let mut picks = Vec::new();
+        let mut numbers = numbers.iter().copied().peekable();
+        let mut start = 0_u64;
+        for part in 0..self.rows.chunk_count() {
+            if numbers.peek().is_none() {
+                break;
+            }
+            let end = start + self.rows.chunk_len(part)? as u64;
+            let mut places = Vec::new();
+            while let Some(number) = numbers.next_if(|&number| number < end) {
+                places.push((number - start) as u32);
+            }
+            if !places.is_empty() {
+                picks.push((part, places));
+            }
+            start = end;
+        }
+        if numbers.next().is_some() {
+            return Err(Error::internal("a delete took out a row past the table"));
+        }
+        Ok(picks)
     }
 
     /// The rows `numbers` names, which rise, as they are now with `values` in the columns
@@ -3614,6 +3735,78 @@ mod tests {
             Some(Point::Found(_)) => true,
             Some(Point::Absent) => false,
             None => panic!("a table keyed on its first column looks rows up by it"),
+        }
+    }
+
+    /// Rows taken out of a keyed table in memory by number leave every read and the keys, in a
+    /// copy that shares its keys with the original, whose rows and keys stay as they were. A key
+    /// taken out can be added again, and a delete of most of the rows builds the rest again.
+    #[test]
+    fn rows_taken_out_by_number_leave_the_reads_and_the_keys() {
+        let keys: [(LogicalType, fn(i64) -> Value); 2] = [
+            (LogicalType::BigInt, Value::BigInt),
+            (LogicalType::Varchar, |at| Value::Varchar(format!("user{at}"))),
+        ];
+        let read = |table: &Table| {
+            let rows = table.rows();
+            let mut keys = Vec::new();
+            for at in 0..rows.chunk_count() {
+                let chunk = rows.read(at, &[0]).expect("a part");
+                let column = chunk.column(0).expect("one column");
+                keys.extend((0..chunk.len()).map(|row| column.value_at(row)));
+            }
+            keys
+        };
+        for (ty, key) in keys {
+            let mut table = Table::new(
+                QualifiedName::new("memory", "main", "t"),
+                vec![Field::new("k", ty), Field::new("v", LogicalType::Varchar)],
+            )
+            .expect("two columns");
+            table.set_keys(vec![Key { columns: vec![0], primary: true }]).expect("an empty table");
+            let rows = |from: i64, to: i64| {
+                (from..to)
+                    .map(|at| vec![key(at), Value::Varchar(format!("v{at}"))])
+                    .collect::<Vec<_>>()
+            };
+            let keyed = |model: &[i64]| model.iter().map(|&at| key(at)).collect::<Vec<_>>();
+            table.append_rows(&rows(0, 5000)).expect("new keys");
+            assert!(finds(&table, key(10)));
+            let mut copy = table.clone();
+            let frame = copy.frame();
+            let numbers = [3, 10, 2047, 2048, 4999];
+            copy.remove_rows(&numbers, 1).expect("rows of the table");
+            assert_ne!(copy.frame(), frame);
+            let mut model =
+                (0..5000).filter(|at| !numbers.contains(&(*at as u64))).collect::<Vec<i64>>();
+            assert_eq!(read(&copy), keyed(&model));
+            assert!(!finds(&copy, key(10)) && finds(&copy, key(11)) && finds(&copy, key(4998)));
+            assert_eq!(read(&table).len(), 5000);
+            assert!(finds(&table, key(10)));
+            copy.append_rows(&rows(10, 11)).expect("a key taken out");
+            assert!(copy.append_rows(&rows(11, 12)).is_err());
+            assert!(table.append_rows(&rows(10, 11)).is_err());
+            model.push(10);
+            assert!(finds(&copy, key(10)));
+            // Out of the rows appended since as well.
+            let last = copy.rows().len() as u64 - 1;
+            copy.remove_rows(&[0, last], 1).expect("rows of the table");
+            model.remove(0);
+            model.pop();
+            assert_eq!(read(&copy), keyed(&model));
+            copy.append_rows(&rows(10, 11)).expect("taken out again");
+            model.push(10);
+            drop(table);
+            copy.settle_keys();
+            assert!(copy.append_rows(&rows(10, 11)).is_err());
+            // Most of the rows, which builds the ones that stay again.
+            let numbers = (0..model.len() as u64).filter(|at| at % 3 != 0).collect::<Vec<_>>();
+            copy.remove_rows(&numbers, 1).expect("rows of the table");
+            let model = model.iter().step_by(3).copied().collect::<Vec<_>>();
+            assert_eq!(read(&copy), keyed(&model));
+            assert!(copy.append_rows(&rows(model[1], model[1] + 1)).is_err());
+            let free = (0..5000).find(|at| !model.contains(at)).expect("a key taken out");
+            copy.append_rows(&rows(free, free + 1)).expect("a key taken out");
         }
     }
 
