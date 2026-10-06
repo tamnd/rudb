@@ -2903,7 +2903,8 @@ impl PlaceSums {
         if self.pending != 0b11 {
             return Ok(false);
         }
-        let packed = |offset: usize| inputs.get(offset).copied().flatten().and_then(Vector::packed_parts);
+        let packed =
+            |offset: usize| inputs.get(offset).copied().flatten().and_then(Vector::packed_parts);
         let (Some(first), Some(second)) = (packed(first), packed(second)) else {
             return Ok(false);
         };

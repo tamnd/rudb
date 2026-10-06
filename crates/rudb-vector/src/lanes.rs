@@ -272,7 +272,8 @@ pub(crate) fn add_pair_codes(
     for &(bytes, at, width) in &sides {
         assert!((1..=LANE_WIDTH_MAX).contains(&width));
         // Group `g` reads sixteen bytes at `at + g * width` and sixteen at `4 * width / 8` past that.
-        let room = bytes.len().checked_sub(at + 4 * width / 8 + 16).map_or(0, |room| room / width + 1);
+        let room =
+            bytes.len().checked_sub(at + 4 * width / 8 + 16).map_or(0, |room| room / width + 1);
         groups = groups.min(room);
     }
     let Some(Ok(last)) = cells.len().checked_sub(1).map(u32::try_from) else { return 0 };
@@ -322,7 +323,10 @@ pub(crate) fn add_pair_codes(
                 for (row, pair) in pairs.into_iter().enumerate() {
                     let place = *places.get_unchecked(done + 4 * half + row) as usize;
                     let cell = to.add(place).cast::<i64>();
-                    _mm_storeu_si128(cell.cast(), _mm_add_epi64(_mm_loadu_si128(cell.cast()), pair));
+                    _mm_storeu_si128(
+                        cell.cast(),
+                        _mm_add_epi64(_mm_loadu_si128(cell.cast()), pair),
+                    );
                     *cell.add(2) = (*cell.add(2)).wrapping_add(1);
                 }
             }
@@ -630,18 +634,24 @@ mod tests {
         };
         let rows = 300;
         for (one, two, skip) in [(6, 24, 0), (25, 1, 16), (3, 13, 64)] {
-            let ones: Vec<u32> = (0..rows as u32).map(|i| i.wrapping_mul(2_654_435_761) % (1 << one)).collect();
-            let twos: Vec<u32> = (0..rows as u32).map(|i| i.wrapping_mul(40_503) % (1 << two)).collect();
+            let ones: Vec<u32> =
+                (0..rows as u32).map(|i| i.wrapping_mul(2_654_435_761) % (1 << one)).collect();
+            let twos: Vec<u32> =
+                (0..rows as u32).map(|i| i.wrapping_mul(40_503) % (1 << two)).collect();
             let (first, second) = (pack(&ones, one), pack(&twos, two));
             for past in [None, Some(9), Some(150)] {
-                let mut places: Vec<u32> = (0..(rows - skip) as u32).map(|row| (row * 13) % 11).collect();
+                let mut places: Vec<u32> =
+                    (0..(rows - skip) as u32).map(|row| (row * 13) % 11).collect();
                 if let Some(past) = past {
                     places[past] = 11;
                 }
                 let mut cells = vec![[0_i64; 4]; 11];
                 let sides = [(&first[..], skip * one / 8, one), (&second[..], skip * two / 8, two)];
                 let done = add_pair_codes(&mut cells, sides, &places);
-                assert!(done % 8 == 0 && done <= past.unwrap_or(rows), "{one} {two} {skip} {past:?}");
+                assert!(
+                    done % 8 == 0 && done <= past.unwrap_or(rows),
+                    "{one} {two} {skip} {past:?}"
+                );
                 if past.is_none() {
                     // A group reads sixteen bytes past where it starts, so the narrower side
                     // stops the pass that many bytes of codes short of the end.

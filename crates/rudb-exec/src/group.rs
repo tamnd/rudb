@@ -2962,7 +2962,13 @@ impl<'a> Aggregate<'a> {
                 } else {
                     let mut row = 0;
                     loop {
-                        row = place_sums.add(coded_map, &coded_places[..*length], kept, row, &inputs)?;
+                        row = place_sums.add(
+                            coded_map,
+                            &coded_places[..*length],
+                            kept,
+                            row,
+                            &inputs,
+                        )?;
                         if row == *length {
                             break;
                         }
