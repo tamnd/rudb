@@ -5,10 +5,14 @@
 //! client sees it before the `Sync` in both cases.
 //!
 //! `Describe` of a statement binds it without running it, to get the types of the parameters and
-//! the columns. `Describe` of a portal runs the portal and keeps the result for the next
-//! `Execute`, so a `Bind`, `Describe`, `Execute` sequence runs the statement one time. An
-//! `Execute` with a row limit sends part of the result and `PortalSuspended`, and the next
-//! `Execute` continues from there.
+//! the columns. `Describe` of a portal of a query or of a change to the data does the same, and
+//! the portal runs at `Execute`, as in PostgreSQL. So an error or a notice of the run comes after
+//! the `RowDescription`. The statement keeps its description, so the bind at `Describe` is done
+//! one time and not for each portal. If the run gives columns of other types than the
+//! description, `Execute` fails with the error of PostgreSQL for a plan that changed its result
+//! type. `Describe` of a portal of another statement runs the portal and keeps the result for the
+//! next `Execute`. An `Execute` with a row limit sends part of the result and `PortalSuspended`,
+//! and the next `Execute` continues from there.
 //!
 //! A parameter in the text format of a declared type is read with the input function of that
 //! type. A parameter in the text format with no declared type is a `VARCHAR`, which the binder
@@ -20,7 +24,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rudb::{Description, Prepared, QueryResult, Transaction};
-use rudb_common::{Fields, LogicalType, Value};
+use rudb_common::{Fields, LogicalType, Origin, Value};
 use rudb_pgtypes::{
     DateTimeInput, InputSettings, NoZones, Oid, RowEncoder, TypeError, UNIX_TO_POSTGRES_USECS,
     ZoneAbbrevs, logical_type, param_value, pg_type,
@@ -160,6 +164,8 @@ pub(super) struct Portal {
     values: Vec<Value>,
     formats: Vec<i16>,
     ran: Option<Ran>,
+    /// The types and the origins of the columns that a `Describe` sent before the portal ran.
+    described: Option<(Vec<LogicalType>, Vec<Option<Origin>>)>,
 }
 
 /// A portal that ran, with the place in its result.
@@ -329,7 +335,8 @@ impl Extended {
         {
             check_formats(&formats, fields.len())?;
         }
-        self.portals.insert(bind.portal, Portal { statement, values, formats, ran: None });
+        self.portals
+            .insert(bind.portal, Portal { statement, values, formats, ran: None, described: None });
         out.bind_complete();
         Ok(())
     }
@@ -369,6 +376,32 @@ impl Extended {
                 let portal = self.portals.get_mut(name)?;
                 if portal.statement.control.is_some() {
                     out.no_data();
+                    return Ok(());
+                }
+                // PostgreSQL describes a portal from its plan and runs it at `Execute`, so an
+                // error of the run and a notice of it come after the `RowDescription`.
+                if portal.ran.is_none()
+                    && portal.statement.command.is_none()
+                    && portal.statement.prepared.as_ref().is_some_and(Prepared::binds_at_parse)
+                {
+                    let description = portal.statement.describe()?;
+                    match description.and_then(|description| {
+                        description.fields.map(|f| (f, description.origins))
+                    }) {
+                        Some((fields, origins)) => {
+                            check_formats(&portal.formats, fields.len())?;
+                            let origin = |at: usize| origins.get(at).copied().flatten();
+                            let columns: Vec<_> = fields
+                                .iter()
+                                .enumerate()
+                                .map(|(at, f)| field(&f.name, &f.ty, origin(at), portal.format(at)))
+                                .collect();
+                            out.row_description(&columns);
+                            let types = fields.into_iter().map(|f| f.ty).collect();
+                            portal.described = Some((types, origins));
+                        }
+                        None => out.no_data(),
+                    }
                     return Ok(());
                 }
                 let formats = portal.formats.clone();
@@ -412,6 +445,7 @@ impl Extended {
         };
         let sql = portal.statement.sql.clone();
         let formats = portal.formats.clone();
+        let described = portal.described.take();
         let ran = match portal.run(runner, alone(rest, name, 0), out) {
             Ok(Some(ran)) => ran,
             Ok(None) => {
@@ -432,6 +466,17 @@ impl Extended {
         let Some(result) = &ran.result else {
             return Ok(Ok(()));
         };
+        if let Some((types, origins)) = described {
+            let same = types == result.types()
+                && (0..types.len())
+                    .all(|at| origins.get(at).copied().flatten() == result.origin(at));
+            if !same {
+                return Ok(Err(error(
+                    "0A000",
+                    "cached plan must not change result type".to_owned(),
+                )));
+            }
+        }
         if ran.encoder.is_none() {
             let mut columns = Vec::with_capacity(result.width());
             for (i, logical) in result.types().iter().enumerate() {
@@ -500,6 +545,15 @@ impl Extended {
 }
 
 impl Portal {
+    /// The format of the column `at`, from the result formats of `Bind`.
+    fn format(&self, at: usize) -> i16 {
+        match self.formats.len() {
+            0 => 0,
+            1 => self.formats[0],
+            _ => self.formats[at],
+        }
+    }
+
     /// Runs the portal if it did not run yet. `None` is an empty query. The portal runs in the
     /// implicit transaction that ends at `Sync`, but a portal that is `alone` up to `Sync` runs in
     /// its own transaction, which gives the same result for less work.

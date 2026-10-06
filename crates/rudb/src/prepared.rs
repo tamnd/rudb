@@ -62,6 +62,17 @@ pub struct Prepared {
     /// Whether the parameters are `1` to `n` and nothing else, so that `n` values by position are
     /// exactly the values the statement wants, with nothing missing and nothing left over.
     numbered: bool,
+    /// The last description, with the stamp and the declared types it was found with. A client of
+    /// the extended protocol asks for one before each execution.
+    described: Arc<Mutex<Option<Described>>>,
+}
+
+/// A description that [`Prepared::describe`] keeps.
+#[derive(Debug)]
+struct Described {
+    stamp: (u64, u64, rudb_common::Session),
+    declared: Vec<Option<LogicalType>>,
+    description: Description,
 }
 
 /// An `INSERT INTO t [(columns)] VALUES (row), ...` whose items are parameters or `NULL`, with
@@ -785,7 +796,20 @@ impl Prepared {
         let upsert = Upsert::of(&ast);
         let numbered = numbered_one_to_n(&names);
         let sql = sql.to_string();
-        Ok(Self { shared, sql, ast, names, direct, lookup, write, range, upsert, numbered })
+        let described = Arc::default();
+        Ok(Self {
+            shared,
+            sql,
+            ast,
+            names,
+            direct,
+            lookup,
+            write,
+            range,
+            upsert,
+            numbered,
+            described,
+        })
     }
 
     /// The statement as it was written.
@@ -828,6 +852,14 @@ impl Prepared {
     ///
     /// Anything binding the statement reports, such as a table or a column that is not there.
     pub fn describe(&self, declared: &[Option<LogicalType>]) -> Result<Description> {
+        let stamp = self.shared.stamp();
+        let mut kept = self.described.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = kept.as_ref()
+            && held.stamp == stamp
+            && held.declared == declared
+        {
+            return Ok(held.description.clone());
+        }
         let described = self.shared.describe(&self.ast, &self.names, declared)?;
         let parameters = self
             .names
@@ -840,7 +872,11 @@ impl Prepared {
                     .map(|(_, ty)| ty.clone())
             })
             .collect();
-        Ok(Description { parameters, fields: described.fields, origins: described.origins })
+        let description =
+            Description { parameters, fields: described.fields, origins: described.origins };
+        let declared = declared.to_vec();
+        *kept = Some(Described { stamp, declared, description: description.clone() });
+        Ok(description)
     }
 
     /// What the statement runs as, as it stands against the database now: a point plan for one of

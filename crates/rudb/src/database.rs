@@ -5761,6 +5761,13 @@ impl Shared {
     /// Only a query, an `INSERT`, an `UPDATE` and a `DELETE` are bound. Any other statement takes no
     /// parameters that a client can give a type to, and answers no rows that a client must know
     /// about before it runs it.
+    /// What a description of a statement depends on: the catalog, the database settings and the
+    /// session. Two equal stamps describe a statement the same way.
+    pub(crate) fn stamp(&self) -> (u64, u64, Session) {
+        let generation = self.read().generation();
+        (generation, self.inner.settings_revision.load(Ordering::Relaxed), self.session())
+    }
+
     pub(crate) fn describe(
         &self,
         ast: &Ast,
