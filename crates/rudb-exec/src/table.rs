@@ -5009,7 +5009,7 @@ mod tests {
     }
 
     /// Values further apart than the map allows are hashed, and so is a pair of columns whose
-    /// windows multiply past the bound for several columns.
+    /// windows multiply past it.
     #[test]
     fn values_spread_wider_than_the_map_allows_are_refused() {
         let mut values = Widened::default();
@@ -5017,7 +5017,7 @@ mod tests {
         assert!(coded_within(&wide, 2, &[], Some(&mut values)).is_none());
         let fits = [integers(&[Some(0), Some(WIDE_COMBOS as i32 - 2)])];
         assert!(coded_within(&fits, 2, &[], Some(&mut values)).is_some());
-        let pair = [integers(&[Some(0), Some(200)]), integers(&[Some(0), Some(200)])];
+        let pair = [integers(&[Some(0), Some(600)]), integers(&[Some(0), Some(600)])];
         assert!(coded_within(&pair, 2, &[], Some(&mut values)).is_none());
         let small = [integers(&[Some(0), Some(10)]), integers(&[Some(0), Some(10)])];
         let coded = coded_within(&small, 2, &[], Some(&mut values)).expect("a product of 144");
