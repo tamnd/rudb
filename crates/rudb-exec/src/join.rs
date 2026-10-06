@@ -1529,7 +1529,7 @@ impl<'a> Probe<'a> {
     fn marked(
         &self,
         chunk: &mut Chunk,
-        left: &Chunk,
+        left: Chunk,
         built: &Built,
         local: &Probing,
     ) -> Result<Progress> {
@@ -1563,7 +1563,7 @@ impl<'a> Probe<'a> {
         }
         let marker = Vector::flat(LogicalType::Boolean, Data::Bool(marks.into()))?
             .with_validity(Validity::from_run(&known));
-        let mut columns: Vec<Vector> = left.columns().to_vec();
+        let mut columns: Vec<Vector> = left.into_columns();
         for logical in &self.right_types {
             columns.push(Vector::constant(logical.clone(), Value::Null, rows));
         }
@@ -1675,11 +1675,21 @@ impl Probe<'_> {
     /// The driving side's columns at the matched rows and, for a join that answers with both
     /// sides, the gathered side's beside them.
     fn matched(&self, left: &Chunk, built: &Built, local: &Probing) -> Result<Vec<Vector>> {
-        let mut columns: Vec<Vector> = left
+        let columns: Vec<Vector> = left
             .columns()
             .iter()
             .map(|column| column.gather(&local.left_at))
             .collect::<Result<Vec<_>>>()?;
+        self.beside(columns, built, local)
+    }
+
+    /// `columns`, the driving half of the answer, with the gathered half put beside them.
+    fn beside(
+        &self,
+        mut columns: Vec<Vector>,
+        built: &Built,
+        local: &Probing,
+    ) -> Result<Vec<Vector>> {
         // A semi or an anti join answers with the driving row alone, so there is no gathered half
         // to put beside it and no positions were written for one.
         if !matches!(self.kind, JoinKind::Semi | JoinKind::Anti) {
@@ -1743,7 +1753,10 @@ impl Stream for Probe<'_> {
                 // What a residual answered about the chunk before this one says nothing about this
                 // one, and the row numbers it is held under would be read as if it did.
                 local.cand.forget();
-                let left = chunk.clone();
+                // Taken rather than copied, since the answer is written over the chunk below. A copy
+                // was every owned column of every driving chunk, which on q09 is six columns of the
+                // 319 thousand lines of green parts.
+                let left = std::mem::replace(chunk, Chunk::empty(&[]));
                 // Once per driving chunk rather than once per driving row, which is what keeps the
                 // evaluator on its batch interface here as well. Nothing at all against an empty
                 // table, for the reason [`Probing::keys`] gives.
@@ -1779,7 +1792,7 @@ impl Stream for Probe<'_> {
         // driving chunk at once and the loop is written around a row producing some number of
         // output rows. It never asks again, so nothing of the chunk is held over.
         if self.kind == JoinKind::Mark {
-            return self.marked(chunk, &left, &built, local);
+            return self.marked(chunk, left, &built, local);
         }
         let residual = self.residual();
         {
@@ -1905,7 +1918,18 @@ impl Stream for Probe<'_> {
         // The columns put beside each match are copies by position, which is materializing rather
         // than probing, and a join whose matches are wide is a join whose time goes here.
         let materializing = stage::Timing::start(Stage::Materialize);
-        let columns = self.matched(&left, &built, local);
+        // Every driving row answered once and in order, which is an inner join to a key every row
+        // finds and a semi join every row passes. The driving half is then the chunk's own columns,
+        // moved rather than gathered at each of its rows. On q09 the join to `supplier` is that
+        // for each of its 319 thousand rows.
+        let whole = local.row >= left.len()
+            && local.left_at.len() == left.len()
+            && local.left_at.iter().enumerate().all(|(at, &row)| row as usize == at);
+        let (columns, left) = if whole {
+            (self.beside(left.into_columns(), &built, local), None)
+        } else {
+            (self.matched(&left, &built, local), Some(left))
+        };
         materializing.stop(0);
         let mut columns = columns?;
         if self.swapped {
@@ -1915,7 +1939,9 @@ impl Stream for Probe<'_> {
             columns.rotate_left(self.left_width);
         }
         *chunk = Chunk::with_rows(columns, local.left_at.len())?;
-        if local.row < left.len() {
+        if let Some(left) = left
+            && local.row < left.len()
+        {
             local.left = Some(left);
             return Ok(Progress::Again);
         }
