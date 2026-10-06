@@ -12,7 +12,7 @@ use crate::types::{Field, LogicalType};
 /// cheaper cast wins a tie.
 fn target_cost(target: &LogicalType) -> i64 {
     use LogicalType::{
-        Array, BigInt, Decimal, Double, HugeInt, Integer, List, Map, Struct, Timestamp,
+        Array, BigInt, BigNum, Decimal, Double, HugeInt, Integer, List, Map, Struct, Timestamp,
         TimestampMs, TimestampNs, TimestampS, TimestampTz, Union, Varchar,
     };
     match target {
@@ -21,6 +21,7 @@ fn target_cost(target: &LogicalType) -> i64 {
         HugeInt => 103,
         Double => 104,
         Decimal { .. } => 105,
+        BigNum => 106,
         TimestampNs => 119,
         Timestamp => 120,
         TimestampMs => 121,
@@ -68,6 +69,9 @@ pub fn cost(source: &LogicalType, target: &LogicalType) -> Option<i64> {
         (from, to) if std::mem::discriminant(from) == std::mem::discriminant(to) => Some(0),
         // A value becomes a union when it becomes one of the members, the cheapest one.
         (_, Union(members)) => member_cost(source, members),
+        // A variant becomes anything, at what landing in that type costs, which is how
+        // `1::VARIANT + 1` finds the integer addition.
+        (LogicalType::Variant, _) => Some(target_cost(target)),
         _ => widens(source, target).then(|| target_cost(target)),
     }
 }

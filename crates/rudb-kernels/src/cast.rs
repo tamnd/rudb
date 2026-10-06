@@ -113,6 +113,22 @@ pub fn cast_in_time_zone(
     if let Some(vector) = crate::json::cast_vector(input, target, try_cast, time_zone)? {
         return Ok(vector);
     }
+    if crate::variant::involved(input.logical_type(), target) {
+        let mut values = Vec::with_capacity(input.len());
+        // row at a time: a variant is read and written whole, one row's bytes at a time, and no
+        // two rows need hold the same kind.
+        for index in 0..input.len() {
+            let value = input.try_value_at(index)?;
+            values.push(crate::variant::cast(
+                &value,
+                input.logical_type(),
+                target,
+                try_cast,
+                time_zone,
+            )?);
+        }
+        return Vector::from_values(target.clone(), &values);
+    }
     if input.form() == Form::Constant {
         let value = input.try_value_at(0)?;
         // A union is picked from the column's type, which the one value cannot always say.
@@ -206,6 +222,9 @@ pub(crate) fn cast_value_in_time_zone(
     try_cast: bool,
     time_zone: Option<SessionTimeZone>,
 ) -> Result<Value> {
+    if crate::variant::involved(&value.logical_type(), target) {
+        return crate::variant::cast(value, &value.logical_type(), target, try_cast, time_zone);
+    }
     if matches!(target, LogicalType::Varchar)
         && let (Value::TimestampTz(micros), Some(time_zone)) = (value, time_zone)
     {
@@ -273,6 +292,8 @@ pub fn reads_time_zone(from: &LogicalType, to: &LogicalType) -> bool {
         (List(_) | Array(..) | Struct(_) | Map(..), Varchar) => holds_time_zone(from),
         // A time of day takes the zone's offset now, and so does text that has no offset in it.
         (Varchar | LogicalType::Time, LogicalType::TimeTz) => true,
+        // A variant may hold an instant, and the cast out of one writes it in the zone.
+        (LogicalType::Variant, to) => *to != LogicalType::Variant,
         _ => {
             (from == &LogicalType::TimestampTz) != (to == &LogicalType::TimestampTz)
                 && !matches!(from, LogicalType::Null)
@@ -900,6 +921,9 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
     }
     if &value.logical_type() == target {
         return Ok(value.clone());
+    }
+    if crate::variant::involved(&value.logical_type(), target) {
+        return crate::variant::cast(value, &value.logical_type(), target, try_cast, None);
     }
     if matches!(target, LogicalType::Json) {
         let from = value.logical_type();

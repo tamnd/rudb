@@ -1577,8 +1577,9 @@ where
         return None;
     }
     // A `numeric` keeps its display scale in its bytes, so `1.0` and `1.00` have different bytes
-    // and are equal. The fallback asks `order`, which compares the keys.
-    if *left.logical_type() == LogicalType::Numeric {
+    // and are equal, and a variant's bytes do not decide equality either, since `1` and `1.0` are
+    // one value. The fallback asks `order`, which compares the keys.
+    if matches!(left.logical_type(), LogicalType::Numeric | LogicalType::Variant) {
         return None;
     }
 
@@ -2495,6 +2496,10 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
         (Value::Varchar(a), Value::Varchar(b)) => Ok(a.as_bytes().cmp(b.as_bytes())),
         (Value::Blob(a), Value::Blob(b)) | (Value::BigNum(a), Value::BigNum(b)) => Ok(a.cmp(b)),
+        // A variant orders by the pin's `variant_comparator`, which its own bytes do not.
+        (Value::Variant(a), Value::Variant(b)) => {
+            Ok(rudb_common::variant::sort_key_of(a).cmp(&rudb_common::variant::sort_key_of(b)))
+        }
         (Value::Bit(a), Value::Bit(b)) => Ok(rudb_common::bit::cmp(a, b)),
         (Value::Numeric(a), Value::Numeric(b)) => {
             Ok(rudb_common::numeric::key(a).cmp(rudb_common::numeric::key(b)))

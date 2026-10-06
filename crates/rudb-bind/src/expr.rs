@@ -816,6 +816,7 @@ impl Binder<'_> {
                     | LogicalType::Union(_)
                     | LogicalType::Map(..)
                     | LogicalType::Json
+                    | LogicalType::Variant
             ) {
                 continue;
             }
@@ -830,6 +831,8 @@ impl Binder<'_> {
                     self.union_call("union_extract", &[expr, key])?
                 } else if *self.plan().expr_type(expr) == LogicalType::Json {
                     self.json_field("struct_extract", &[expr, key])?
+                } else if *self.plan().expr_type(expr) == LogicalType::Variant {
+                    self.variant_field("struct_extract", &[expr, key])?
                 } else {
                     self.struct_field("struct_extract", &[expr, key])?
                 };
@@ -1173,6 +1176,9 @@ impl Binder<'_> {
             }
             return self.pack_struct(&names, &bound);
         }
+        if let Some(field) = self.variant_field(&written, &bound)? {
+            return Ok(field);
+        }
         if let Some(call) = self.map_call(&written, &bound)? {
             return Ok(call);
         }
@@ -1392,11 +1398,98 @@ impl Binder<'_> {
             let name = written.to_ascii_lowercase();
             return Err(rudb_functions::named_mismatch(&name, &spelled, false));
         }
+        let bound = self.variant_arguments(ast, &written, &arguments, bound)?;
         let postgres = self.session.postgres().is_some();
         self.call(&written, bound).map_err(|error| match postgres {
             true => undefined_function(ast, error, &written, &arguments, &types),
             false => literals_spelled(ast, error, &arguments, &types),
         })
+    }
+
+    /// The arguments of a function over `VARIANT`, read the way the pin reads them.
+    ///
+    /// A string written in the query has an implicit cast to a variant and a string column does
+    /// not, so `variant_keys('a')` is a call on the variant `'a'` while `variant_keys(s)` over a
+    /// `VARCHAR` column is refused. The path of the functions that take one has to be a constant,
+    /// and a list of paths can have no null in it.
+    fn variant_arguments(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        mut bound: Vec<ExprRef>,
+    ) -> Result<Vec<ExprRef>> {
+        let name = written.to_ascii_lowercase();
+        let held = match name.as_str() {
+            "variant_contains" => 2,
+            "variant_typeof"
+            | "variant_comparator"
+            | "variant_extract"
+            | "variant_normalize"
+            | "variant_keys"
+            | "variant_type"
+            | "variant_exists"
+            | "variant_array_length"
+            | "variant_extract_string" => 1,
+            _ => return Ok(bound),
+        };
+        let fits = match name.as_str() {
+            "variant_keys" | "variant_type" | "variant_array_length" => {
+                matches!(bound.len(), 1 | 2)
+            }
+            "variant_contains"
+            | "variant_exists"
+            | "variant_extract_string"
+            | "variant_extract" => bound.len() == 2,
+            _ => bound.len() == 1,
+        };
+        // A call no overload takes is refused with the literals spelled as they were written.
+        if !fits {
+            return Ok(bound);
+        }
+        // A negative position written in the query is a whole number no unsigned position takes.
+        if name == "variant_extract"
+            && matches!(ast.expr(arguments[1]), ast::Expr::Unary { op: UnaryOp::Negate, .. })
+            && integer_literal(ast, arguments[1])
+        {
+            let spelled: Vec<String> = arguments
+                .iter()
+                .zip(&bound)
+                .map(|(&arg, &expr)| spelled_type(ast, arg, self.plan().expr_type(expr)))
+                .collect();
+            return Err(rudb_functions::named_mismatch(&name, &spelled, false));
+        }
+        for at in 0..held {
+            if matches!(
+                ast.expr(arguments[at]),
+                ast::Expr::Literal { kind: LiteralKind::String, .. }
+            ) {
+                bound[at] = self.cast_to(bound[at], &LogicalType::Variant);
+            }
+        }
+        let pathed = matches!(
+            name.as_str(),
+            "variant_keys"
+                | "variant_type"
+                | "variant_exists"
+                | "variant_array_length"
+                | "variant_extract_string"
+        );
+        if let (true, [_, path]) = (pathed, bound.as_slice()) {
+            match fold::value_of(self.plan(), *path) {
+                Ok(Some(Value::List { values, .. })) if values.iter().any(Value::is_null) => {
+                    return Err(Error::binder(format!("'{name}' does not accept NULL paths")));
+                }
+                Ok(Some(_)) => {}
+                _ => {
+                    return Err(Error::binder(format!(
+                        "The \"path\" argument in function \"{name}\" must be a constant \
+                         expression"
+                    )));
+                }
+            }
+        }
+        Ok(bound)
     }
 
     /// `list_append` and the five names like it, which are macros on the pin and are expanded the

@@ -188,6 +188,10 @@ impl QueryResult {
             {
                 return self.written_inside(value).to_string();
             }
+            // A variant is written as the value it holds, zone and all.
+            Value::Variant(held) => {
+                return self.value_text(&rudb_common::variant::unwrapped(held));
+            }
             other => return other.to_string(),
         };
         value.to_string_at_offset(self.body.session.offset_seconds_at(instant))

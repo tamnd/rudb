@@ -50,6 +50,7 @@ pub mod types;
 pub mod utf8;
 pub mod uuid;
 pub mod value;
+pub mod variant;
 
 pub use bounds::{Bound, Op, excluded};
 pub use cancel::Cancel;

@@ -992,14 +992,14 @@ fn the_types_table_is_one_row_per_name_and_modifier_signature() {
     // in here, and what this holds is that the operator produces a row per signature rather than a
     // row per name.
     let rows = run("TableFunction duckdb_types args=[] #0 [type_name::VARCHAR, type_oid::BIGINT]");
-    assert_eq!(rows.len(), 96);
+    assert_eq!(rows.len(), 97);
     let mut names: Vec<&Value> = rows.iter().map(|row| &row[0]).collect();
     names.dedup();
-    assert_eq!(names.len(), 76);
-    // 34 oids over 96 rows, because a type has one oid and several names and the pin puts it on the
+    assert_eq!(names.len(), 77);
+    // 35 oids over 97 rows, because a type has one oid and several names and the pin puts it on the
     // alphabetically first name's bare row.
     let carried = rows.iter().filter(|row| row[1] != Value::Null).count();
-    assert_eq!(carried, 34);
+    assert_eq!(carried, 35);
 }
 
 #[test]

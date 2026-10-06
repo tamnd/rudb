@@ -428,6 +428,8 @@ enum Fixed {
     Null,
     /// `VARCHAR[]`, which is what the splits answer.
     VarcharList,
+    Blob,
+    Variant,
 }
 
 impl Fixed {
@@ -452,6 +454,8 @@ impl Fixed {
             Self::Type => LogicalType::Type,
             Self::Null => LogicalType::Null,
             Self::VarcharList => LogicalType::list(LogicalType::Varchar),
+            Self::Blob => LogicalType::Blob,
+            Self::Variant => LogicalType::Variant,
         }
     }
 }
@@ -817,6 +821,34 @@ const TABLE: &[Entry] = &[
     text("translate", Arity::exactly(3), Fixed::Varchar),
     text("url_encode", Arity::exactly(1), Fixed::Varchar),
     text("url_decode", Arity::exactly(1), Fixed::Varchar),
+    Entry {
+        name: "variant_typeof",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Variant, Fixed::Varchar),
+        numeric_only: false,
+    },
+    Entry {
+        name: "variant_extract",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::LeadingFixedTo(1, Fixed::Variant, Fixed::Variant),
+        numeric_only: false,
+    },
+    Entry {
+        name: "variant_comparator",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Exact(Fixed::Variant, Fixed::Blob),
+        numeric_only: false,
+    },
+    variant("variant_keys", Arity::between(1, 2), Fixed::VarcharList),
+    variant("variant_type", Arity::between(1, 2), Fixed::Varchar),
+    variant("variant_exists", Arity::exactly(2), Fixed::Boolean),
+    variant("variant_array_length", Arity::between(1, 2), Fixed::UBigInt),
+    variant("variant_extract_string", Arity::exactly(2), Fixed::Varchar),
+    variant("variant_contains", Arity::exactly(2), Fixed::Boolean),
+    variant("variant_normalize", Arity::exactly(1), Fixed::Variant),
     text("bar", Arity::between(3, 4), Fixed::Varchar),
     text("to_base", Arity::between(2, 3), Fixed::Varchar),
     // The digests and the functions that write bytes or numbers as text and read them back. Each
@@ -1936,6 +1968,18 @@ fn bitstring(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>,
     })
 }
 
+/// A function over a variant, whose arguments [`rewritten`] reads, since a path can be one key or a
+/// list of them and the answer is a list when it is a list.
+const fn variant(name: &'static str, arity: Arity, returns: Fixed) -> Entry {
+    Entry {
+        name,
+        kind: FunctionKind::Scalar,
+        arity,
+        shape: Shape::LeadingFixedTo(1, Fixed::Variant, returns),
+        numeric_only: false,
+    }
+}
+
 /// A scalar that takes strings and returns `returns`.
 const fn text(name: &'static str, arity: Arity, returns: Fixed) -> Entry {
     Entry {
@@ -2038,6 +2082,9 @@ pub fn part_type(spelling: &str) -> LogicalType {
 /// number where the function needs one, or if the arguments have no type in common. The messages
 /// are DuckDB's, since a great deal of code in the wild asserts on them.
 pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
+    if let Some(answer) = unvaried(name, arguments) {
+        return answer;
+    }
     // An `ENUM` goes wherever a string does, which is how `upper(mood)` binds on the pin. It is
     // tried as itself first so that a function that takes anything keeps the enum, and the failure
     // that is reported is the one about the types that were written. A `JSON` is text the same way,
@@ -2053,6 +2100,75 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         }
         answer => answer,
     }
+}
+
+/// A scalar over numbers or text called with a `VARIANT`, which goes to the type of an argument
+/// beside it, or with none, to the first of the types the pin's casts out of a variant cost least
+/// to reach, `BIGINT` before `INTEGER`, `HUGEINT`, `DOUBLE` and then `VARCHAR`. A variant casts to
+/// anything at a cost on the pin, so the overload chosen is the cheapest one, and that is the one
+/// whose types sit beside it, or the widest integer.
+///
+/// `None` for a call with no variant in it, and for one that takes any type as it is, such as
+/// `typeof` or `=`, which keeps the variant.
+fn unvaried(name: &str, arguments: &[LogicalType]) -> Option<Result<Resolved>> {
+    if !arguments.contains(&LogicalType::Variant) {
+        return None;
+    }
+    let entry = find(name)?;
+    let computed = entry.kind == FunctionKind::Scalar
+        && matches!(
+            entry.shape,
+            Shape::Promoted
+                | Shape::Multiplied
+                | Shape::Divided
+                | Shape::Slashed
+                | Shape::PromotedWithCarry
+                | Shape::Floored
+                | Shape::Rounded
+                | Shape::Whole
+                | Shape::BitCounted
+                | Shape::Counted
+                | Shape::Extracted
+                | Shape::Exact(..)
+                | Shape::FixedTo(..)
+                | Shape::Widened(..)
+                | Shape::WidenedTogether(..)
+                | Shape::TextThenIndex(..)
+                | Shape::TextThenCutoff
+                | Shape::Bitwise
+        );
+    // An aggregate that reads a number reads a variant as one, so `sum` of variants is a `HUGEINT`.
+    let counted = entry.kind == FunctionKind::Aggregate
+        && matches!(entry.shape, Shape::Accumulated | Shape::PromotedTo(_));
+    // The ones that pick an argument rather than compute from it keep the variant, since the
+    // common type of a variant and anything else is a variant.
+    let picks = matches!(entry.name, "coalesce" | "greatest" | "least");
+    if picks || !(computed || counted) || entry.name.starts_with("variant_") {
+        return None;
+    }
+    let beside = arguments
+        .iter()
+        .find(|ty| !matches!(ty, LogicalType::Variant | LogicalType::Null))
+        .cloned();
+    let tried = beside.into_iter().chain([
+        LogicalType::BigInt,
+        LogicalType::Integer,
+        LogicalType::HugeInt,
+        LogicalType::Double,
+        LogicalType::Bit,
+        LogicalType::Blob,
+        LogicalType::Varchar,
+    ]);
+    for ty in tried {
+        let replaced: Vec<LogicalType> = arguments
+            .iter()
+            .map(|held| if *held == LogicalType::Variant { ty.clone() } else { held.clone() })
+            .collect();
+        if let Ok(answer) = resolve(name, &replaced) {
+            return Some(Ok(answer));
+        }
+    }
+    Some(Err(no_match(name, arguments)))
 }
 
 fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
@@ -3820,6 +3936,57 @@ fn rewritten(
         "lpad" | "rpad" => declared(vec![Varchar, Integer, Varchar], Varchar),
         "ascii" | "unicode" | "ord" => declared(vec![Varchar], Integer),
         "translate" => declared(vec![Varchar; 3], Varchar),
+        // A variant is only ever taken as one, so a call on anything else is refused rather than
+        // cast, and a path is a key or a position.
+        "variant_typeof" | "variant_comparator" => {
+            let returns = if name == "variant_typeof" { Varchar } else { Blob };
+            Some(match arguments {
+                [LogicalType::Variant | Null] => Ok((vec![LogicalType::Variant], returns)),
+                _ => Err(no_match(name, arguments)),
+            })
+        }
+        // A path is a key or a list of keys, and a list of keys answers a list.
+        "variant_keys"
+        | "variant_type"
+        | "variant_exists"
+        | "variant_array_length"
+        | "variant_extract_string" => {
+            let returns = match name {
+                "variant_keys" => List(Box::new(Varchar)),
+                "variant_type" | "variant_extract_string" => Varchar,
+                "variant_exists" => LogicalType::Boolean,
+                _ => UBigInt,
+            };
+            let held = LogicalType::Variant;
+            Some(match arguments {
+                [LogicalType::Variant | Null] => Ok((vec![held], returns)),
+                [LogicalType::Variant | Null, Varchar | Null] => Ok((vec![held, Varchar], returns)),
+                [LogicalType::Variant | Null, List(path)] if matches!(**path, Varchar | Null) => {
+                    Ok((vec![held, List(Box::new(Varchar))], List(Box::new(returns))))
+                }
+                _ => Err(no_match(name, arguments)),
+            })
+        }
+        "variant_contains" => Some(match arguments {
+            [LogicalType::Variant | Null, LogicalType::Variant | Null] => {
+                Ok((vec![LogicalType::Variant, LogicalType::Variant], LogicalType::Boolean))
+            }
+            _ => Err(no_match(name, arguments)),
+        }),
+        "variant_normalize" => Some(match arguments {
+            [LogicalType::Variant | Null] => Ok((vec![LogicalType::Variant], LogicalType::Variant)),
+            _ => Err(no_match(name, arguments)),
+        }),
+        "variant_extract" => Some(match arguments {
+            [LogicalType::Variant | Null, Varchar | Null] => {
+                Ok((vec![LogicalType::Variant, Varchar], LogicalType::Variant))
+            }
+            [
+                LogicalType::Variant | Null,
+                UTinyInt | USmallInt | UInteger | TinyInt | SmallInt | Integer,
+            ] => Ok((vec![LogicalType::Variant, UInteger], LogicalType::Variant)),
+            _ => Err(no_match(name, arguments)),
+        }),
         "url_encode" | "url_decode" => declared(vec![Varchar], Varchar),
         "bar" => declared(vec![Double; arguments.len()], Varchar),
         "to_base" => {
@@ -4837,6 +5004,55 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("unicode", &["unicode(col0 VARCHAR) -> INTEGER"]),
     ("ord", &["ord(col0 VARCHAR) -> INTEGER"]),
     ("translate", &["translate(col0 VARCHAR, col1 VARCHAR, col2 VARCHAR) -> VARCHAR"]),
+    ("variant_typeof", &["variant_typeof(col0 VARIANT) -> VARCHAR"]),
+    ("variant_comparator", &["variant_comparator(col0 VARIANT) -> BLOB"]),
+    (
+        "variant_keys",
+        &[
+            "variant_keys(input_variant VARIANT) -> VARCHAR[]",
+            "variant_keys(input_variant VARIANT, path VARCHAR) -> VARCHAR[]",
+            "variant_keys(input_variant VARIANT, path VARCHAR[]) -> VARCHAR[][]",
+        ],
+    ),
+    (
+        "variant_type",
+        &[
+            "variant_type(input_variant VARIANT) -> VARCHAR",
+            "variant_type(input_variant VARIANT, path VARCHAR) -> VARCHAR",
+            "variant_type(input_variant VARIANT, path VARCHAR[]) -> VARCHAR[]",
+        ],
+    ),
+    (
+        "variant_exists",
+        &[
+            "variant_exists(input_variant VARIANT, path VARCHAR) -> BOOLEAN",
+            "variant_exists(input_variant VARIANT, path VARCHAR[]) -> BOOLEAN[]",
+        ],
+    ),
+    (
+        "variant_array_length",
+        &[
+            "variant_array_length(input_variant VARIANT) -> UBIGINT",
+            "variant_array_length(input_variant VARIANT, path VARCHAR) -> UBIGINT",
+            "variant_array_length(input_variant VARIANT, path VARCHAR[]) -> UBIGINT[]",
+        ],
+    ),
+    (
+        "variant_extract_string",
+        &[
+            "variant_extract_string(input_variant VARIANT, path VARCHAR) -> VARCHAR",
+            "variant_extract_string(input_variant VARIANT, path VARCHAR[]) -> VARCHAR[]",
+        ],
+    ),
+    ("variant_contains", &["variant_contains(col0 VARIANT, col1 VARIANT) -> BOOLEAN"]),
+    ("variant_normalize", &["variant_normalize(col0 VARIANT) -> VARIANT"]),
+    (
+        "variant_extract",
+        &[
+            "variant_extract(input_variant VARIANT, path VARCHAR) -> VARIANT",
+            "variant_extract(input_variant VARIANT, path UINTEGER) -> VARIANT",
+        ],
+    ),
     ("url_encode", &["url_encode(col0 VARCHAR) -> VARCHAR"]),
     ("url_decode", &["url_decode(col0 VARCHAR) -> VARCHAR"]),
     (
@@ -5353,6 +5569,8 @@ impl Fixed {
             Self::Type => "TYPE",
             Self::Null => "\"NULL\"",
             Self::VarcharList => "VARCHAR[]",
+            Self::Blob => "BLOB",
+            Self::Variant => "VARIANT",
         }
     }
 }
@@ -6095,6 +6313,12 @@ mod tests {
                     }
                     _ if matches!(entry.name, "decode" | "base64" | "to_base64") => {
                         arguments[0] = LogicalType::Blob;
+                    }
+                    _ if entry.name.starts_with("variant_") => {
+                        arguments = vec![LogicalType::Variant; count];
+                        if count == 2 && entry.name != "variant_contains" {
+                            arguments[1] = LogicalType::Varchar;
+                        }
                     }
                     _ if entry.name == "bar" => arguments = vec![LogicalType::Double; count],
                     _ if entry.name == "to_base" => {

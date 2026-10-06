@@ -2604,7 +2604,8 @@ impl Vector {
                 Value::Blob(bytes)
                 | Value::Bit(bytes)
                 | Value::BigNum(bytes)
-                | Value::Numeric(bytes) => Some(bytes),
+                | Value::Numeric(bytes)
+                | Value::Variant(bytes) => Some(bytes),
                 _ => None,
             },
             Body::Dictionary { codes, values, .. } => {
@@ -2641,7 +2642,8 @@ impl Vector {
                 Value::Blob(bytes)
                 | Value::Bit(bytes)
                 | Value::BigNum(bytes)
-                | Value::Numeric(bytes) => Some(bytes.as_slice()),
+                | Value::Numeric(bytes)
+                | Value::Variant(bytes) => Some(bytes.as_slice()),
                 _ => None,
             }),
             Body::Dictionary { codes, values, .. } => match codes.get(index) {
@@ -5745,6 +5747,7 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
         | LogicalType::Bit
         | LogicalType::BigNum
         | LogicalType::Numeric
+        | LogicalType::Variant
         | LogicalType::Type
         | LogicalType::Json => data.bytes_at(index).map(|bytes| bytes_as(ty, bytes)),
         LogicalType::Enum(labels) => unsigned()
@@ -5824,6 +5827,7 @@ fn bytes_as(ty: &LogicalType, bytes: &[u8]) -> Value {
         LogicalType::Bit => Value::Bit(bytes.to_vec()),
         LogicalType::BigNum => Value::BigNum(bytes.to_vec()),
         LogicalType::Numeric => Value::Numeric(bytes.to_vec()),
+        LogicalType::Variant => Value::Variant(bytes.to_vec()),
         _ => Value::Null,
     }
 }
@@ -6177,7 +6181,8 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
             Value::Blob(bytes)
             | Value::Bit(bytes)
             | Value::BigNum(bytes)
-            | Value::Numeric(bytes) => {
+            | Value::Numeric(bytes)
+            | Value::Variant(bytes) => {
                 column.push_bytes(bytes);
             }
             other => return Err(Error::internal(format!("{other:?} is not a string"))),

@@ -159,6 +159,11 @@ pub(crate) fn same(left: &Value, right: &Value) -> bool {
         (Value::Numeric(a), Value::Numeric(b)) => {
             rudb_common::numeric::key(a) == rudb_common::numeric::key(b)
         }
+        // Two variants that hold one value in two types, `1` and `1.0`, are one group, as the pin
+        // groups them by `variant_comparator`.
+        (Value::Variant(a), Value::Variant(b)) => {
+            a == b || rudb_common::variant::sort_key_of(a) == rudb_common::variant::sort_key_of(b)
+        }
         _ => left == right,
     }
 }
@@ -197,6 +202,8 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
         Value::Varchar(x) => x.hash(state),
         Value::Blob(x) | Value::Bit(x) | Value::BigNum(x) => x.hash(state),
         Value::Numeric(x) => rudb_common::numeric::key(x).hash(state),
+        // A variant hashes as what it sorts by, since that is what `same` compares.
+        Value::Variant(x) => rudb_common::variant::sort_key_of(x).hash(state),
         Value::Decimal { unscaled, width, scale } => {
             unscaled.hash(state);
             width.hash(state);

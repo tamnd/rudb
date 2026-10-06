@@ -587,6 +587,38 @@ impl Document {
         out
     }
 
+    /// The value at a position as a `VARIANT`, which is the pin's: a whole number is a `UINT64`
+    /// when it is not negative and an `INT64` when it is, any other number is a `DOUBLE`, and of
+    /// two equal keys the last one is kept.
+    #[must_use]
+    pub fn variant(&self, at: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        match &self.nodes[at] {
+            Node::Null => out.push(rudb_common::variant::kind::NULL),
+            Node::Bool(flag) => rudb_common::variant::write(&Value::Boolean(*flag), &mut out),
+            Node::Unsigned(number) => {
+                rudb_common::variant::write(&Value::UBigInt(*number), &mut out);
+            }
+            Node::Signed(number) => rudb_common::variant::write(&Value::BigInt(*number), &mut out),
+            Node::Real(number, _) => rudb_common::variant::write(&Value::Double(*number), &mut out),
+            Node::Raw(text) => {
+                let number = text.parse::<f64>().unwrap_or(f64::NAN);
+                rudb_common::variant::write(&Value::Double(number), &mut out);
+            }
+            Node::Str(text) => rudb_common::variant::write(&Value::Varchar(text.clone()), &mut out),
+            Node::Array(items) => {
+                let children: Vec<Vec<u8>> = items.iter().map(|item| self.variant(*item)).collect();
+                out = rudb_common::variant::array(&children);
+            }
+            Node::Object(members) => {
+                let entries =
+                    members.iter().map(|(key, item)| (key.clone(), self.variant(*item))).collect();
+                out = rudb_common::variant::object(entries);
+            }
+        }
+        out
+    }
+
     /// Writes the value at a position, with a stack of its own for the containers.
     fn write(&self, root: usize, out: &mut String) {
         self.write_styled(root, Style::default(), out);
@@ -798,6 +830,8 @@ fn value_text(
 ) -> Result<()> {
     match (value, ty) {
         (Value::Null, _) => out.push_str("null"),
+        // A variant is written as what it holds, and an instant in it in UTC whatever the session.
+        (Value::Variant(held), _) => variant_text(&rudb_common::variant::unwrapped(held), out)?,
         (Value::Varchar(text), LogicalType::Json) => match read(text) {
             Ok(document) => document.write(0, out),
             Err(_) => string_text(text, out),
@@ -906,6 +940,59 @@ fn value_text(
     Ok(())
 }
 
+/// What a variant holds written as a document, which is [`value_text`] except that a decimal is
+/// written as its digits at its own scale, so `1.50` stays `1.50` the way the pin writes it.
+/// A variant written as a document, the way a cast of it to `JSON` writes it.
+///
+/// # Errors
+///
+/// What writing any value as a document reports.
+pub(crate) fn variant_document(held: &[u8]) -> Result<String> {
+    let mut out = String::new();
+    variant_text(&rudb_common::variant::unwrapped(held), &mut out)?;
+    Ok(out)
+}
+
+fn variant_text(value: &Value, out: &mut String) -> Result<()> {
+    match value {
+        // A decimal with no integer digits is shown as `.5` and written as `0.5`.
+        Value::Decimal { .. } => {
+            let digits = value.to_string();
+            let (sign, rest) =
+                digits.strip_prefix('-').map_or(("", digits.as_str()), |rest| ("-", rest));
+            out.push_str(sign);
+            if rest.starts_with('.') {
+                out.push('0');
+            }
+            out.push_str(rest);
+        }
+        Value::List { values, .. } => {
+            out.push('[');
+            for (index, item) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                variant_text(item, out)?;
+            }
+            out.push(']');
+        }
+        Value::Struct(fields) if !fields.iter().all(|(name, _)| name.is_empty()) => {
+            out.push('{');
+            for (index, (name, item)) in fields.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                string_text(name, out);
+                out.push(':');
+                variant_text(item, out)?;
+            }
+            out.push('}');
+        }
+        _ => value_text(value, &value.logical_type(), None, out)?,
+    }
+    Ok(())
+}
+
 /// A value a cast to `JSON` reads: a string has to parse and is kept as it is, and anything else is
 /// made into a document.
 ///
@@ -920,6 +1007,12 @@ pub fn cast_to_json(
 ) -> Result<Value> {
     match (value, from) {
         (Value::Null, _) => Ok(Value::Null),
+        // The null kind at the top is a null document, where inside one it is written `null`.
+        (Value::Variant(held), _)
+            if rudb_common::variant::kind_of(held) == rudb_common::variant::kind::NULL =>
+        {
+            Ok(Value::Null)
+        }
         (Value::Varchar(text), LogicalType::Varchar | LogicalType::Json | LogicalType::Null) => {
             if *from == LogicalType::Json {
                 Ok(value.clone())
@@ -937,6 +1030,7 @@ fn involved(from: &LogicalType, target: &LogicalType) -> bool {
     *target == LogicalType::Json
         || *from == LogicalType::Json
         || (listed && *target == LogicalType::Varchar)
+        || (*target == LogicalType::Variant && crate::variant::mentions_json(from))
 }
 
 /// One value cast into or out of `JSON`, and nothing for a cast that has nothing to do with it,
@@ -975,6 +1069,8 @@ pub fn cast_typed(
                 .collect();
             Ok(Value::Varchar(format!("[{}]", items.join(", "))))
         }
+        // A document inside a struct, a list or a map is read as one, which needs its type.
+        (_, LogicalType::Variant, _) => Ok(crate::variant::to_variant(value, from)),
         _ => cast_value(value, target, try_cast),
     })
 }
@@ -1028,6 +1124,15 @@ fn type_name(node: &Node) -> &'static str {
 pub fn cast_from_json(text: &str, target: &LogicalType, try_cast: bool) -> Result<Value> {
     if matches!(target, LogicalType::Varchar | LogicalType::Json) {
         return Ok(Value::Varchar(text.to_string()));
+    }
+    if *target == LogicalType::Variant {
+        return match read(text) {
+            // A document that is only `null` is a null, where a null inside one is the null kind.
+            Ok(document) if matches!(document.nodes[0], Node::Null) => Ok(Value::Null),
+            Ok(document) => Ok(Value::Variant(document.variant(0))),
+            Err(_) if try_cast => Ok(Value::Null),
+            Err(malformed) => Err(Error::conversion(malformed.describe(text))),
+        };
     }
     // The pin reads a document the way it reads a JSON file, and that has no reader for this one.
     if *target == LogicalType::BigNum {
