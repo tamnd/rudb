@@ -5304,7 +5304,7 @@ fn unpack(
 
 /// How many rows ahead a sparse gather asks for the cache line of. A miss is a few hundred cycles
 /// and a row's read is a handful, so the line has to be asked for well before it is wanted.
-const PREFETCH_AHEAD: usize = 16;
+const PREFETCH_AHEAD: usize = 48;
 
 /// The `width` bits starting at `bit`, low end first.
 ///
