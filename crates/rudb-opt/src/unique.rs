@@ -187,7 +187,7 @@ fn unique(plan: &Plan, at: NodeRef, binding: ColumnBinding, stats: &Facts) -> bo
 }
 
 /// Whether the scan `at` holds every value of `binding` once and no null, by exact counts.
-fn counted(plan: &Plan, at: NodeRef, binding: ColumnBinding, stats: &Facts) -> bool {
+pub(crate) fn counted(plan: &Plan, at: NodeRef, binding: ColumnBinding, stats: &Facts) -> bool {
     let Node::Get { catalog, schema, table, columns, .. } = *plan.node(at) else {
         return false;
     };
