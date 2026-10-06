@@ -1167,7 +1167,7 @@ impl Binder<'_> {
     }
 
     /// Turns a zero divisor into null before the ordinary arithmetic kernel sees it.
-    fn zero_to_null(&mut self, divisor: ExprRef) -> ExprRef {
+    pub(crate) fn zero_to_null(&mut self, divisor: ExprRef) -> ExprRef {
         let returns = self.plan().expr_type(divisor).clone();
         let args = self.plan_mut().add_expr_list(&[divisor]);
         let name = self.plan_mut().intern("__rudb_zero_to_null");
