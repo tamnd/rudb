@@ -10413,7 +10413,7 @@ pub fn stores(ty: &LogicalType) -> bool {
 /// had when it could store thirteen types, and 14 to 27 are the rest, in the order they were added
 /// rather than in an order that means anything. 28 is `BIGNUM`, 29 is a list, 30 is the `numeric`
 /// of PostgreSQL, 31 is `VARIANT`, 32 is `TIME_NS`, 33 is `TIMESTAMPTZ_NS`, 34 is `JSON`, 35 is an
-/// `ENUM` and 36 is `JSONB`.
+/// `ENUM` and 36 is `JSONB`. 37 is a struct, 38 a map, 39 a union and 40 an array.
 fn type_tag(ty: &LogicalType) -> Result<u8> {
     match ty {
         LogicalType::SmallInt => Ok(1),
@@ -10452,16 +10452,30 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::TimeNs => Ok(32),
         LogicalType::TimestampTzNs => Ok(33),
         LogicalType::Enum(_) => Ok(35),
+        LogicalType::Struct(fields) => fields_tag(fields, 37),
+        LogicalType::Map(key, value) => type_tag(key).and(type_tag(value)).map(|_| 38),
+        LogicalType::Union(members) => fields_tag(members, 39),
+        LogicalType::Array(element, _) => type_tag(element).map(|_| 40),
         _ => Err(Error::not_implemented(format!("native storage for {ty}"))),
     }
 }
 
+/// The tag of a struct or a union, once every one of its fields has a tag of its own.
+fn fields_tag(fields: &[Field], tag: u8) -> Result<u8> {
+    for field in fields {
+        type_tag(&field.ty)?;
+    }
+    Ok(tag)
+}
+
 /// The tag of a column type, and the parameters of the ones that have any.
 ///
-/// `DECIMAL`, `LIST` and `ENUM` have parameters. Width and scale go after the tag rather than into
-/// it because they are what says how wide a value is on disk, and a reader that guessed would read
-/// the wrong number of bytes per row rather than the wrong number of digits. A list puts the type
-/// of its elements after its tag, with the parameters of that type. An enum puts the number of its
+/// `DECIMAL`, `ENUM` and the nested types have parameters. Width and scale go after the tag rather
+/// than into it because they are what says how wide a value is on disk, and a reader that guessed
+/// would read the wrong number of bytes per row rather than the wrong number of digits. A list puts
+/// the type of its elements after its tag, with the parameters of that type, and an array puts its
+/// length after that. A map puts its key type and then its value type. A struct and a union put the
+/// number of their fields and then each field's name and type. An enum puts the number of its
 /// labels and then each label, since its pages hold only the positions and the labels are what
 /// gives them a meaning.
 fn put_type(out: &mut Vec<u8>, ty: &LogicalType) -> Result<()> {
@@ -10472,6 +10486,25 @@ fn put_type(out: &mut Vec<u8>, ty: &LogicalType) -> Result<()> {
             out.push(*scale);
         }
         LogicalType::List(element) => put_type(out, element)?,
+        LogicalType::Array(element, len) => {
+            put_type(out, element)?;
+            put_u32(out, *len);
+        }
+        LogicalType::Map(key, value) => {
+            put_type(out, key)?;
+            put_type(out, value)?;
+        }
+        LogicalType::Struct(fields) | LogicalType::Union(fields) => {
+            let count = u16::try_from(fields.len()).map_err(|_| invalid("too many fields"))?;
+            put_u16(out, count);
+            for field in fields {
+                let name = field.name.as_bytes();
+                let len = u16::try_from(name.len()).map_err(|_| invalid("field name too long"))?;
+                put_u16(out, len);
+                out.extend_from_slice(name);
+                put_type(out, &field.ty)?;
+            }
+        }
         LogicalType::Enum(labels) => {
             put_u32(out, u32::try_from(labels.len()).map_err(|_| invalid("too many enum labels"))?);
             for label in labels.iter() {
@@ -10497,6 +10530,27 @@ fn read_type(cur: &mut Cursor<'_>) -> Result<LogicalType> {
     }
     if tag == 29 {
         return Ok(LogicalType::List(Box::new(read_type(cur)?)));
+    }
+    if tag == 40 {
+        let element = read_type(cur)?;
+        return Ok(LogicalType::Array(Box::new(element), cur.u32()?));
+    }
+    if tag == 38 {
+        let key = read_type(cur)?;
+        return Ok(LogicalType::Map(Box::new(key), Box::new(read_type(cur)?)));
+    }
+    if tag == 37 || tag == 39 {
+        let count = usize::from(cur.u16()?);
+        let mut fields = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = cur.text()?;
+            fields.push(Field::new(name, read_type(cur)?));
+        }
+        return Ok(if tag == 37 {
+            LogicalType::Struct(fields)
+        } else {
+            LogicalType::Union(fields)
+        });
     }
     if tag == 35 {
         let count = cur.u32()? as usize;
@@ -13855,7 +13909,7 @@ fn coded_page(codes: &[u32], validity: &[u8]) -> Result<Vec<u8>> {
 /// dictionary. Those are built by [`coded_page`] from codes [`prepare`] handed out.
 fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
     let ty = vector.logical_type();
-    if let LogicalType::List(_) = ty {
+    if nested::holds(ty) {
         return encode(&nested::to_bytes(vector)?, settling);
     }
     // An enum's page is its positions, written the way the unsigned integer they are held in is, so
@@ -15427,7 +15481,7 @@ fn decode_at(
     if positions.last().is_some_and(|&last| last as usize >= rows) {
         return Err(invalid("a position is past the end of the part"));
     }
-    if let LogicalType::List(_) = ty {
+    if nested::holds(ty) {
         return decode(ty, rows, bytes, global)?.gather(positions);
     }
     if let LogicalType::Enum(_) = ty {
@@ -15625,7 +15679,7 @@ fn decode(
     bytes: &[u8],
     global: Option<Arc<Vector>>,
 ) -> Result<Vector> {
-    if let LogicalType::List(_) = ty {
+    if nested::holds(ty) {
         return nested::from_bytes(ty, &decode(&LogicalType::Blob, rows, bytes, None)?);
     }
     if let LogicalType::Enum(_) = ty {

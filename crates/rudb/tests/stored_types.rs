@@ -81,27 +81,21 @@ fn a_type_the_file_cannot_store_is_refused_and_the_writes_after_it_work() {
     let path = path("refused");
     let db = open(&path);
     db.execute("CREATE TABLE t (k INTEGER)").expect("creates");
+    // An exported aggregate state is the one type a table can get that the file cannot hold yet,
+    // and it has no name to write in a column list, so only a CREATE TABLE AS can ask for it.
     for sql in [
-        "CREATE TABLE s (k INTEGER, v STRUCT(a INTEGER))",
-        "CREATE TABLE m (k INTEGER, v MAP(INTEGER, INTEGER))",
-        "CREATE TABLE c AS SELECT {'a': 1} AS v",
+        "CREATE TABLE s AS SELECT sum(1) EXPORT_STATE AS v",
+        "CREATE TABLE c AS SELECT {'a': sum(1) EXPORT_STATE} AS v",
     ] {
         let error = db.execute(sql).expect_err(sql);
         assert_eq!(error.reported_state().as_str(), "0A000", "{sql}: {error}");
     }
     db.execute("INSERT INTO t VALUES (1)").expect("the write after the refusal works");
     assert!(db.execute("SELECT * FROM s").is_err(), "the refused table is not there");
-    for sql in [
-        "ALTER TABLE t ADD COLUMN v STRUCT(a INTEGER)",
-        "ALTER TABLE t ALTER COLUMN k TYPE STRUCT(a INTEGER) USING {'a': k}",
-    ] {
-        let error = db.execute(sql).expect_err(sql);
-        assert_eq!(error.reported_state().as_str(), "0A000", "{sql}: {error}");
-    }
-    db.execute("INSERT INTO t VALUES (2)").expect("the write after the refused change works");
+    db.execute("INSERT INTO t VALUES (2)").expect("the second write works");
     // A temporary table never goes into the file, so it can have any type.
-    db.execute("CREATE TEMP TABLE x (v STRUCT(a INTEGER))").expect("creates a temporary table");
-    db.execute("INSERT INTO x VALUES ({'a': 1})").expect("writes the temporary table");
+    db.execute("CREATE TEMP TABLE x AS SELECT sum(1) EXPORT_STATE AS v")
+        .expect("creates a temporary table");
     db.execute("CHECKPOINT").expect("commits");
     drop(db);
     let db = open(&path);
