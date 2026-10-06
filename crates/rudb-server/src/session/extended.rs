@@ -23,7 +23,7 @@ use std::io;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rudb::{Description, Prepared, QueryResult, Transaction};
+use rudb::{Chunk, Description, Prepared, QueryResult, Transaction};
 use rudb_common::{Fields, LogicalType, Origin, Value};
 use rudb_pgtypes::{
     DateTimeInput, InputSettings, NoZones, Oid, RowEncoder, TypeError, UNIX_TO_POSTGRES_USECS,
@@ -31,6 +31,7 @@ use rudb_pgtypes::{
 };
 use rudb_pgwire::{Bind, CommandTag, Level, OutBuf, Portals, ProtocolError, Statements, Target};
 
+use super::cursor::{self, ALL, Cursor, Declare, Direction, NoScroll, Place, Run};
 use super::setting::{self, Command};
 use super::{
     Control, FLUSH_AT, Failure, Outcome, Runner, column_type, command_tag, field, leading_words,
@@ -58,7 +59,7 @@ impl From<ProtocolError> for Problem {
 }
 
 impl Problem {
-    fn failure(failure: Failure, sql: &Arc<str>) -> Problem {
+    pub(super) fn failure(failure: Failure, sql: &Arc<str>) -> Problem {
         Problem(Box::new(Kind::Failure(failure, sql.clone())))
     }
 
@@ -68,9 +69,19 @@ impl Problem {
             Kind::Failure(failure, sql) => failure.write(sql, out),
         }
     }
+
+    /// The same error for a statement that starts at byte `offset` of `sql`, so the position
+    /// counts from the start of `sql`.
+    pub(super) fn within(mut self, sql: &Arc<str>, offset: usize) -> Problem {
+        if let Kind::Failure(failure, text) = &mut *self.0 {
+            failure.position = failure.position.map(|at| at + offset);
+            *text = sql.clone();
+        }
+        self
+    }
 }
 
-fn aborted() -> Problem {
+pub(super) fn aborted() -> Problem {
     let message = "current transaction is aborted, commands ignored until end of transaction block";
     error("25P02", message.to_owned())
 }
@@ -110,6 +121,10 @@ pub(super) struct Statement {
     positional: bool,
     /// The types of [`Statement::parameter_types`], found once as PostgreSQL finds them at `Parse`.
     found: OnceLock<Vec<Oid>>,
+    /// The statement on a cursor that the server runs itself, from [`cursor::parse`].
+    cursor: Option<Cursor>,
+    /// The query of a `DECLARE`, which has the parameters.
+    query: Option<Arc<Statement>>,
 }
 
 impl Statement {
@@ -146,6 +161,9 @@ impl Statement {
     }
 
     fn describe(&self) -> Result<Option<Description>, Problem> {
+        if let Some(query) = &self.query {
+            return query.describe();
+        }
         let Some(prepared) = &self.prepared else {
             return Ok(None);
         };
@@ -179,6 +197,21 @@ pub(super) struct Portal {
     ran: Option<Ran>,
     /// The types and the origins of the columns that a `Describe` sent before the portal ran.
     described: Option<(Vec<LogicalType>, Vec<Option<Origin>>)>,
+    /// The options of a portal of `DECLARE`, or `None` for a portal of `Bind`.
+    cursor: Option<Options>,
+}
+
+/// The options of a cursor of `DECLARE`.
+struct Options {
+    /// `BINARY`: `FETCH` on the simple flow sends the rows in the binary format.
+    binary: bool,
+    /// The cursor can move back. A cursor with no `SCROLL` and no `NO SCROLL` can move back when
+    /// its plan can run backward, see [`cursor::scrolls`].
+    scroll: bool,
+    /// `WITH HOLD`: the cursor stays after the transaction commits.
+    hold: bool,
+    /// The transaction that is open made the cursor, so the cursor ends when it rolls back.
+    pending: bool,
 }
 
 /// A portal that ran, with the place in its result.
@@ -191,8 +224,11 @@ struct Ran {
     rows: bool,
     /// The `CommandComplete` of a statement without rows went out.
     reported: bool,
-    chunk: usize,
-    row: usize,
+    /// The place of the portal in its rows.
+    place: Place,
+    /// The chunk of the last row sent, and the number of the rows before that chunk, from where
+    /// the next send finds its chunk.
+    walk: (usize, u64),
     encoder: Option<RowEncoder>,
     /// The error of a query that made rows before it failed. `Execute` sends it after the rows.
     failed: Option<Problem>,
@@ -211,11 +247,20 @@ impl Extended {
         self.statements.close(b"");
     }
 
-    /// The end of a transaction removes the portals.
-    pub(super) fn end_of_transaction(&mut self, transaction: Transaction) {
-        if transaction == Transaction::Idle && !self.portals.is_empty() {
-            self.portals.clear();
+    /// The end of a transaction removes the portals. A cursor `WITH HOLD` stays when the
+    /// transaction that made it committed, or when an earlier transaction made it.
+    pub(super) fn end_of_transaction(&mut self, runner: &Runner) {
+        if runner.connection.transaction() != Transaction::Idle || self.portals.is_empty() {
+            return;
         }
+        let committed = runner.committed;
+        self.portals.retain(|_, portal| match &mut portal.cursor {
+            Some(options) if options.hold && (committed || !options.pending) => {
+                options.pending = false;
+                true
+            }
+            _ => false,
+        });
     }
 
     pub(super) fn parse(
@@ -230,55 +275,42 @@ impl Extended {
         let sql: Arc<str> = std::str::from_utf8(sql)
             .map_err(|_| error("22021", "invalid byte sequence for encoding \"UTF8\"".to_owned()))?
             .into();
+        let types: Vec<Oid> = types.collect();
         let engine = |e: rudb::Error| Problem::failure(Failure::engine(&e, 0), &sql);
-        let command = setting::parse(&sql);
-        let prepared = match rudb::statements(&sql).map_err(engine)?.len() {
-            0 => None,
-            1 if command.is_some() => None,
-            1 => Some(runner.connection.prepare(&sql).map_err(engine)?),
-            _ => {
-                return Err(error(
-                    "42601",
-                    "cannot insert multiple commands into a prepared statement".to_owned(),
-                ));
+        let cursor = match rudb::statements(&sql).map_err(engine)?.len() {
+            1 => cursor::parse(&sql),
+            _ => None,
+        };
+        let statement = match cursor {
+            Some(cursor) => {
+                if runner.connection.transaction() == Transaction::Aborted {
+                    return Err(aborted());
+                }
+                let query = match &cursor {
+                    Cursor::Declare(declare) => {
+                        Some(Arc::new(statement(runner, sql[declare.query..].into(), types)?))
+                    }
+                    _ => None,
+                };
+                let empty = (Vec::new(), Vec::new(), true);
+                let (types, slots, positional) = query.as_ref().map_or(empty, |query| {
+                    (query.types.clone(), query.slots.clone(), query.positional)
+                });
+                Statement {
+                    sql,
+                    control: None,
+                    command: None,
+                    prepared: None,
+                    types,
+                    slots,
+                    positional,
+                    found: OnceLock::new(),
+                    cursor: Some(cursor),
+                    query,
+                }
             }
+            None => statement(runner, sql, types)?,
         };
-        if (prepared.is_some() || command.is_some())
-            && runner.connection.transaction() == Transaction::Aborted
-            && !exits_transaction(&sql)
-        {
-            return Err(aborted());
-        }
-        let mut types: Vec<Oid> = types.collect();
-        let names = prepared.as_ref().map_or(&[][..], Prepared::parameters);
-        let numbers: Option<Vec<usize>> = names
-            .iter()
-            .map(|name| name.parse::<usize>().ok().filter(|n| *n > 0).map(|n| n - 1))
-            .collect();
-        let slots = numbers.unwrap_or_else(|| (0..names.len()).collect());
-        let count = slots.iter().map(|slot| slot + 1).max().unwrap_or(0).max(types.len());
-        types.resize(count, 0);
-        let positional = count == slots.len()
-            && slots.iter().enumerate().all(|(i, s)| {
-                // The slots are distinct and below `count`, so they are a permutation of it.
-                *s < count && !slots[..i].contains(s)
-            });
-        let control = Control::of(&sql);
-        let statement = Statement {
-            sql,
-            control,
-            command,
-            prepared,
-            types,
-            slots,
-            positional,
-            found: OnceLock::new(),
-        };
-        // PostgreSQL binds a query and a change to the data at `Parse`, so a name that is not
-        // there is an error of `Parse` and not of `Execute`.
-        if statement.prepared.as_ref().is_some_and(Prepared::binds_at_parse) {
-            statement.describe()?;
-        }
         self.statements.insert(name, Arc::new(statement))?;
         out.parse_complete();
         Ok(())
@@ -366,8 +398,10 @@ impl Extended {
         {
             check_formats(&formats, fields.len())?;
         }
-        self.portals
-            .insert(bind.portal, Portal { statement, values, formats, ran: None, described: None });
+        self.portals.insert(
+            bind.portal,
+            Portal { statement, values, formats, ran: None, described: None, cursor: None },
+        );
         out.bind_complete();
         Ok(())
     }
@@ -383,6 +417,23 @@ impl Extended {
         match target {
             Target::Statement => {
                 let statement = self.statements.get(name)?;
+                if let Some(cursor) = &statement.cursor {
+                    // `DECLARE` takes the parameters of its query, and only `FETCH` has rows,
+                    // which are the columns of the cursor when it is there.
+                    let description = statement.describe()?;
+                    out.parameter_description(&statement.parameter_types(description.as_ref()));
+                    let target = match cursor {
+                        Cursor::Fetch { name, moves: false, .. } => {
+                            self.portals.find(name.as_bytes())
+                        }
+                        _ => None,
+                    };
+                    match target {
+                        Some(target) => target.describe_rows(&[], out)?,
+                        None => out.no_data(),
+                    }
+                    return Ok(());
+                }
                 if let Some(command) = &statement.command {
                     out.parameter_description(&[]);
                     describe_command(runner, command, out);
@@ -405,6 +456,21 @@ impl Extended {
             }
             Target::Portal => {
                 let portal = self.portals.get_mut(name)?;
+                if let Some(cursor) = &portal.statement.cursor {
+                    let formats = portal.formats.clone();
+                    let target = match cursor {
+                        Cursor::Fetch { name, moves: false, .. } => name.clone(),
+                        _ => {
+                            out.no_data();
+                            return Ok(());
+                        }
+                    };
+                    match self.portals.find(target.as_bytes()) {
+                        Some(target) => target.describe_rows(&formats, out)?,
+                        None => out.no_data(),
+                    }
+                    return Ok(());
+                }
                 if portal.statement.control.is_some() {
                     out.no_data();
                     return Ok(());
@@ -474,6 +540,32 @@ impl Extended {
             Ok(portal) => portal,
             Err(e) => return Ok(Err(e.into())),
         };
+        if let Some(cursor) = portal.statement.cursor.clone() {
+            if portal.ran.is_some() {
+                let name = String::from_utf8_lossy(name);
+                return Ok(Err(error("55000", format!("portal \"{name}\" cannot be run"))));
+            }
+            let mut ran = Ran::new(None, CommandTag::DeclareCursor, 0, false);
+            ran.reported = true;
+            portal.ran = Some(ran);
+            let statement = portal.statement.clone();
+            let values = portal.values.clone();
+            let formats = portal.formats.clone();
+            let block = runner.connection.transaction() != Transaction::Idle && !runner.implicit;
+            let query = statement.query.clone();
+            let sql = &statement.sql;
+            return self.cursor(
+                runner,
+                &cursor,
+                sql,
+                query,
+                values,
+                Some(&formats),
+                block,
+                out,
+                flush,
+            );
+        }
         let sql = portal.statement.sql.clone();
         let formats = portal.formats.clone();
         let described = portal.described.take();
@@ -508,64 +600,151 @@ impl Extended {
                 )));
             }
         }
-        if ran.encoder.is_none() {
-            let mut columns = Vec::with_capacity(result.width());
-            for (i, logical) in result.types().iter().enumerate() {
-                let format = match formats.len() {
-                    0 => 0,
-                    1 => formats[0],
-                    _ => formats[i],
-                };
-                if format != 0 && format != 1 {
-                    let message = format!("unsupported format code: {format}");
-                    return Ok(Err(error("22023", message)));
-                }
-                let oid = column_type(logical, result.origin(i)).oid;
-                columns.push((logical.clone(), oid, format == 1));
-            }
-            match RowEncoder::new(&columns) {
-                Ok(encoder) => ran.encoder = Some(encoder),
-                Err(e) => return Ok(Err(Problem::failure(type_failure(e, None), &sql))),
-            }
-        }
-        let Some(encoder) = ran.encoder.as_mut() else {
-            return Ok(Ok(()));
+        let mut encoder = match ran.encoder.take() {
+            Some(encoder) => encoder,
+            None => match encoder(result, &formats, &sql) {
+                Ok(encoder) => encoder,
+                Err(problem) => return Ok(Err(problem)),
+            },
         };
-        let limit = if max_rows > 0 { max_rows as u64 } else { u64::MAX };
-        let chunks = result.chunks();
-        let mut sent = 0u64;
-        while sent < limit && ran.chunk < chunks.len() {
-            let chunk = match chunks[ran.chunk].clone().settled() {
-                Ok(chunk) => chunk,
-                Err(e) => return Ok(Err(Problem::failure(Failure::engine(&e, 0), &sql))),
-            };
-            let n = chunk.len();
-            let take = (n - ran.row).min(usize::try_from(limit - sent).unwrap_or(usize::MAX));
-            let rows = ran.row..ran.row + take;
-            if let Err(e) = encoder.encode(chunk.columns(), rows, &runner.output(), out.bytes_mut())
-            {
-                return Ok(Err(Problem::failure(type_failure(e, None), &sql)));
-            }
-            sent += take as u64;
-            ran.row += take;
-            if ran.row == n {
-                ran.chunk += 1;
-                ran.row = 0;
-            }
-            if out.len() >= FLUSH_AT {
-                flush(out)?;
-            }
+        let limit = if max_rows > 0 { max_rows as u64 } else { ALL };
+        let run = ran.place.forward(result.len() as u64, limit);
+        let sent = send(result, &mut ran.walk, run, &mut encoder, runner, out, flush)?;
+        ran.encoder = Some(encoder);
+        if let Err(failure) = sent {
+            return Ok(Err(Problem::failure(failure, &sql)));
         }
         // PostgreSQL stops when it has the rows that the client asked for and does not look for
         // one more, so a limit that is the number of the rows left also suspends the portal.
-        if max_rows > 0 && sent == limit {
+        if max_rows > 0 && run.count == limit {
             out.portal_suspended();
         } else if let Some(failed) = ran.failed.take() {
             return Ok(Err(failed));
         } else {
-            out.command_tag(ran.tag, sent);
+            out.command_tag(ran.tag, run.count);
         }
         Ok(Ok(()))
+    }
+
+    /// Runs a statement on a cursor. `block` is true in a transaction block, where a `DECLARE`
+    /// without `WITH HOLD` can run. `formats` are the result formats of `Bind`, or `None` on the
+    /// simple flow, where `FETCH` sends a `RowDescription` and takes the format of the cursor.
+    /// An error marks an open transaction block as aborted.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn cursor(
+        &mut self,
+        runner: &mut Runner,
+        cursor: &Cursor,
+        sql: &Arc<str>,
+        query: Option<Arc<Statement>>,
+        values: Vec<Value>,
+        formats: Option<&[i16]>,
+        block: bool,
+        out: &mut OutBuf,
+        flush: &mut impl FnMut(&mut OutBuf) -> io::Result<()>,
+    ) -> io::Result<Result<(), Problem>> {
+        let missing = |name: &str| error("34000", format!("cursor \"{name}\" does not exist"));
+        let done = match cursor {
+            Cursor::Close(None) => {
+                self.portals.retain(|_, portal| portal.cursor.is_none());
+                out.command_tag(CommandTag::CloseCursorAll, 0);
+                Ok(())
+            }
+            Cursor::Close(Some(name)) => match self.portals.close(name.as_bytes()) {
+                Some(_) => {
+                    out.command_tag(CommandTag::CloseCursor, 0);
+                    Ok(())
+                }
+                None => Err(missing(name)),
+            },
+            Cursor::Fetch { name, direction, moves } => {
+                match self.portals.find_mut(name.as_bytes()) {
+                    Some(portal) => {
+                        portal.fetch(name, runner, *direction, *moves, formats, out, flush)?
+                    }
+                    None => Err(missing(name)),
+                }
+            }
+            Cursor::Declare(declare) => {
+                self.declare(runner, declare, sql, query, values, block, out)
+            }
+        };
+        if done.is_err() {
+            runner.connection.abort_transaction();
+        }
+        Ok(done)
+    }
+
+    /// `PerformCursorOpen`: makes the portal of a cursor. A cursor `WITH HOLD` runs now, so its
+    /// rows stay after the transaction ends, and another cursor runs at its first `FETCH`.
+    #[allow(clippy::too_many_arguments)]
+    fn declare(
+        &mut self,
+        runner: &mut Runner,
+        declare: &Declare,
+        sql: &Arc<str>,
+        query: Option<Arc<Statement>>,
+        values: Vec<Value>,
+        block: bool,
+        out: &mut OutBuf,
+    ) -> Result<(), Problem> {
+        let text = &sql[declare.query..];
+        if let Some(word) = cursor::not_a_query(text) {
+            let failure = Failure {
+                sqlstate: "42601".to_owned(),
+                message: format!("syntax error at or near \"{word}\""),
+                fields: None,
+                position: Some(declare.query + text.len() - text.trim_start().len()),
+            };
+            return Err(Problem::failure(failure, sql));
+        }
+        let statement = match query {
+            Some(query) => query,
+            None => Arc::new(
+                statement(runner, text.into(), Vec::new())
+                    .map_err(|problem| problem.within(sql, declare.query))?,
+            ),
+        };
+        if !declare.hold && !block {
+            let message = "DECLARE CURSOR can only be used in transaction blocks";
+            return Err(error("25P01", message.to_owned()));
+        }
+        if statement.prepared.as_ref().is_some_and(Prepared::binds_at_parse)
+            && let Some(error) = statement.describe()?.and_then(|d| d.planning)
+        {
+            let problem = Problem::failure(Failure::engine(&error, 0), &statement.sql);
+            return Err(problem.within(sql, declare.query));
+        }
+        let name = declare.name.as_bytes();
+        self.portals.make_room(name)?;
+        let options = Options {
+            binary: declare.binary,
+            scroll: declare.scroll.unwrap_or_else(|| cursor::scrolls(text)),
+            hold: declare.hold,
+            pending: true,
+        };
+        let mut portal = Portal {
+            statement,
+            values,
+            formats: Vec::new(),
+            ran: None,
+            described: None,
+            cursor: Some(options),
+        };
+        if declare.hold {
+            let ran = portal.run(runner, true, out).map_err(|p| p.within(sql, declare.query))?;
+            if let Some(failed) = ran.and_then(|ran| ran.failed.take()) {
+                return Err(failed.within(sql, declare.query));
+            }
+            if runner.connection.transaction() == Transaction::Idle
+                && let Some(options) = &mut portal.cursor
+            {
+                options.pending = false;
+            }
+        }
+        self.portals.insert(name, portal);
+        out.command_tag(CommandTag::DeclareCursor, 0);
+        Ok(())
     }
 
     pub(super) fn close(&mut self, target: Target, name: &[u8], out: &mut OutBuf) {
@@ -577,14 +756,172 @@ impl Extended {
     }
 }
 
+/// Prepares a statement of `Parse`, or the query of a `DECLARE`.
+fn statement(runner: &Runner, sql: Arc<str>, mut types: Vec<Oid>) -> Result<Statement, Problem> {
+    let engine = |e: rudb::Error| Problem::failure(Failure::engine(&e, 0), &sql);
+    let command = setting::parse(&sql);
+    let prepared = match rudb::statements(&sql).map_err(engine)?.len() {
+        0 => None,
+        1 if command.is_some() => None,
+        1 => Some(runner.connection.prepare(&sql).map_err(engine)?),
+        _ => {
+            return Err(error(
+                "42601",
+                "cannot insert multiple commands into a prepared statement".to_owned(),
+            ));
+        }
+    };
+    if (prepared.is_some() || command.is_some())
+        && runner.connection.transaction() == Transaction::Aborted
+        && !exits_transaction(&sql)
+    {
+        return Err(aborted());
+    }
+    let names = prepared.as_ref().map_or(&[][..], Prepared::parameters);
+    let numbers: Option<Vec<usize>> = names
+        .iter()
+        .map(|name| name.parse::<usize>().ok().filter(|n| *n > 0).map(|n| n - 1))
+        .collect();
+    let slots = numbers.unwrap_or_else(|| (0..names.len()).collect());
+    let count = slots.iter().map(|slot| slot + 1).max().unwrap_or(0).max(types.len());
+    types.resize(count, 0);
+    let positional = count == slots.len()
+        && slots.iter().enumerate().all(|(i, s)| {
+            // The slots are distinct and below `count`, so they are a permutation of it.
+            *s < count && !slots[..i].contains(s)
+        });
+    let control = Control::of(&sql);
+    let statement = Statement {
+        sql,
+        control,
+        command,
+        prepared,
+        types,
+        slots,
+        positional,
+        found: OnceLock::new(),
+        cursor: None,
+        query: None,
+    };
+    // PostgreSQL binds a query and a change to the data at `Parse`, so a name that is not there
+    // is an error of `Parse` and not of `Execute`.
+    if statement.prepared.as_ref().is_some_and(Prepared::binds_at_parse) {
+        statement.describe()?;
+    }
+    Ok(statement)
+}
+
 impl Portal {
     /// The format of the column `at`, from the result formats of `Bind`.
     fn format(&self, at: usize) -> i16 {
-        match self.formats.len() {
-            0 => 0,
-            1 => self.formats[0],
-            _ => self.formats[at],
+        format_of(&self.formats, at)
+    }
+
+    /// Writes the `RowDescription` of the rows of the portal in `formats`, or `NoData`.
+    fn describe_rows(&self, formats: &[i16], out: &mut OutBuf) -> Result<(), Problem> {
+        if let Some(Ran { result: Some(result), rows: true, .. }) = &self.ran {
+            let columns: Vec<_> = result
+                .names()
+                .iter()
+                .zip(result.types())
+                .enumerate()
+                .map(|(at, (name, ty))| field(name, ty, result.origin(at), format_of(formats, at)))
+                .collect();
+            out.row_description(&columns);
+            return Ok(());
         }
+        match self.statement.describe()? {
+            Some(Description { fields: Some(fields), origins, .. }) => {
+                let origin = |at: usize| origins.get(at).copied().flatten();
+                let columns: Vec<_> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(at, f)| field(&f.name, &f.ty, origin(at), format_of(formats, at)))
+                    .collect();
+                out.row_description(&columns);
+            }
+            _ => out.no_data(),
+        }
+        Ok(())
+    }
+
+    /// `FETCH` or `MOVE` on the portal, which runs at the first one. On the simple flow
+    /// `formats` is `None`, and the rows go out with a `RowDescription`, in the binary format
+    /// for a `BINARY` cursor.
+    #[allow(clippy::too_many_arguments)]
+    fn fetch(
+        &mut self,
+        name: &str,
+        runner: &mut Runner,
+        direction: Direction,
+        moves: bool,
+        formats: Option<&[i16]>,
+        out: &mut OutBuf,
+        flush: &mut impl FnMut(&mut OutBuf) -> io::Result<()>,
+    ) -> io::Result<Result<(), Problem>> {
+        let (binary, scroll) = match &self.cursor {
+            Some(options) => (options.binary, options.scroll),
+            None => (false, cursor::scrolls(&self.statement.sql)),
+        };
+        let sql = self.statement.sql.clone();
+        let ran = match self.run(runner, true, out) {
+            Ok(Some(ran)) if ran.rows => ran,
+            Ok(_) => return Ok(Err(error("55000", format!("portal \"{name}\" cannot be run")))),
+            Err(problem) => return Ok(Err(problem)),
+        };
+        let Some(result) = &ran.result else {
+            return Ok(Err(error("55000", format!("portal \"{name}\" cannot be run"))));
+        };
+        let len = result.len() as u64;
+        let (run, count) = match ran.place.fetch(len, scroll, direction, moves) {
+            Ok(done) => done,
+            Err(NoScroll) => {
+                let error = ProtocolError {
+                    level: Level::Error,
+                    sqlstate: "55000",
+                    message: "cursor can only scan forward".to_owned(),
+                    detail: None,
+                    hint: Some("Declare it with SCROLL option to enable backward scan."),
+                };
+                return Ok(Err(error.into()));
+            }
+        };
+        // PostgreSQL fills the rows of a `FETCH` before it sends one, so an error in them comes
+        // with no rows and no `RowDescription`.
+        if ran.place.at > len
+            && let Some(failed) = ran.failed.take()
+        {
+            return Ok(Err(failed));
+        }
+        if !moves {
+            let formats = match formats {
+                Some(formats) => formats.to_vec(),
+                None => {
+                    let formats = vec![i16::from(binary)];
+                    let columns: Vec<_> = result
+                        .names()
+                        .iter()
+                        .zip(result.types())
+                        .enumerate()
+                        .map(|(at, (name, ty))| field(name, ty, result.origin(at), formats[0]))
+                        .collect();
+                    out.row_description(&columns);
+                    formats
+                }
+            };
+            let mut encoder = match encoder(result, &formats, &sql) {
+                Ok(encoder) => encoder,
+                Err(problem) => return Ok(Err(problem)),
+            };
+            if let Err(failure) =
+                send(result, &mut ran.walk, run, &mut encoder, runner, out, flush)?
+            {
+                return Ok(Err(Problem::failure(failure, &sql)));
+            }
+        }
+        let tag = if moves { CommandTag::Move } else { CommandTag::Fetch };
+        out.command_tag(tag, count);
+        Ok(Ok(()))
     }
 
     /// Runs the portal if it did not run yet. `None` is an empty query. The portal runs in the
@@ -659,12 +996,93 @@ impl Ran {
             tag,
             rows,
             reported: false,
-            chunk: 0,
-            row: 0,
+            place: Place::default(),
+            walk: (0, 0),
             encoder: None,
             failed: None,
         }
     }
+}
+
+/// The format of the column `at` in the result formats of `Bind`: one for each column, or one or
+/// none for all.
+fn format_of(formats: &[i16], at: usize) -> i16 {
+    match formats.len() {
+        0 => 0,
+        1 => formats[0],
+        _ => formats[at],
+    }
+}
+
+/// The encoder of the rows of `result` in `formats`, one for each column, or one or none for all.
+fn encoder(result: &QueryResult, formats: &[i16], sql: &Arc<str>) -> Result<RowEncoder, Problem> {
+    let mut columns = Vec::with_capacity(result.width());
+    for (i, logical) in result.types().iter().enumerate() {
+        let format = format_of(formats, i);
+        if format != 0 && format != 1 {
+            return Err(error("22023", format!("unsupported format code: {format}")));
+        }
+        let oid = column_type(logical, result.origin(i)).oid;
+        columns.push((logical.clone(), oid, format == 1));
+    }
+    RowEncoder::new(&columns).map_err(|e| Problem::failure(type_failure(e, None), sql))
+}
+
+/// The chunk of row `row`, counted from 0, and the place of the row in it. `walk` is the chunk
+/// of the last row and the number of the rows before it, so a walk from row to row is short.
+fn locate(chunks: &[Chunk], walk: &mut (usize, u64), row: u64) -> (usize, usize) {
+    let (mut chunk, mut start) = *walk;
+    while row < start && chunk > 0 {
+        chunk -= 1;
+        start -= chunks[chunk].live() as u64;
+    }
+    while chunk + 1 < chunks.len() && row >= start + chunks[chunk].live() as u64 {
+        start += chunks[chunk].live() as u64;
+        chunk += 1;
+    }
+    *walk = (chunk, start);
+    (chunk, (row - start) as usize)
+}
+
+/// Writes a `DataRow` for each row of `run`.
+fn send(
+    result: &QueryResult,
+    walk: &mut (usize, u64),
+    run: Run,
+    encoder: &mut RowEncoder,
+    runner: &Runner,
+    out: &mut OutBuf,
+    flush: &mut impl FnMut(&mut OutBuf) -> io::Result<()>,
+) -> io::Result<Result<(), Failure>> {
+    let chunks = result.chunks();
+    let mut settled: Option<(usize, Chunk)> = None;
+    let mut row = run.first.saturating_sub(1);
+    let mut left = run.count;
+    while left > 0 {
+        let (at, offset) = locate(chunks, walk, row);
+        let chunk = match settled.take() {
+            Some((held, chunk)) if held == at => chunk,
+            _ => match chunks[at].clone().settled() {
+                Ok(chunk) => chunk,
+                Err(e) => return Ok(Err(Failure::engine(&e, 0))),
+            },
+        };
+        let take = match run.forward {
+            true => (chunk.len() - offset).min(usize::try_from(left).unwrap_or(usize::MAX)),
+            false => 1,
+        };
+        let rows = offset..offset + take;
+        if let Err(e) = encoder.encode(chunk.columns(), rows, &runner.output(), out.bytes_mut()) {
+            return Ok(Err(type_failure(e, None)));
+        }
+        settled = Some((at, chunk));
+        left -= take as u64;
+        row = if run.forward { row + take as u64 } else { row.saturating_sub(1) };
+        if out.len() >= FLUSH_AT {
+            flush(out)?;
+        }
+    }
+    Ok(Ok(()))
 }
 
 /// True when nothing can fail or run between this message and the next `Sync` in `rest`, the

@@ -1582,3 +1582,76 @@ fn advisory_locks_are_held_by_the_session_or_the_transaction() {
     assert_eq!(tags(&second.query("select pg_advisory_unlock_all()")), "TDCZ");
     server.stop().unwrap();
 }
+
+#[test]
+fn a_cursor_moves_and_ends_as_in_postgresql() {
+    let dirs = Dirs::new("cursors");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let rows = |messages: &[Message]| -> Vec<String> {
+        let rows = messages.iter().filter(|m| m.tag == b'D').map(data_row);
+        rows.map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap()).collect()
+    };
+    let code =
+        |messages: &[Message]| messages.iter().find(|m| m.tag == b'E').and_then(|e| e.field(b'C'));
+    client.query("create table t(a int)");
+    client.query("insert into t select g from generate_series(1, 5) g");
+
+    // Outside of a block only a cursor `WITH HOLD` can open.
+    assert_eq!(
+        code(&client.query("declare c cursor for select a from t")).as_deref(),
+        Some("25P01")
+    );
+    client.query("begin");
+    let messages = client.query("declare c cursor for select a from t order by a");
+    assert_eq!(text(&messages[0]), "DECLARE CURSOR");
+    let messages = client.query("fetch 2 c");
+    assert_eq!(tags(&messages), "TDDCZ");
+    assert_eq!(rows(&messages), ["1", "2"]);
+    assert_eq!(rows(&client.query("fetch last c")), ["5"]);
+    assert_eq!(rows(&client.query("fetch backward 2 c")), ["4", "3"]);
+    assert_eq!(text(&client.query("move forward all c")[0]), "MOVE 2");
+    assert_eq!(rows(&client.query("fetch absolute 2 c")), ["2"]);
+    assert_eq!(code(&client.query("declare c cursor for select 1")).as_deref(), Some("42P03"));
+    client.query("rollback");
+
+    // A cursor without `SCROLL` on a plan that cannot run backward only moves forward.
+    client.query("begin");
+    client.query("declare c cursor for select count(*) from t");
+    let messages = client.query("fetch prior c");
+    assert_eq!(code(&messages).as_deref(), Some("55000"));
+    let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+    assert_eq!(
+        error.field(b'H').as_deref(),
+        Some("Declare it with SCROLL option to enable backward scan.")
+    );
+    client.query("rollback");
+
+    // A cursor `WITH HOLD` stays after a commit, and goes after a rollback of its transaction.
+    client.query("begin");
+    client.query("declare h cursor with hold for select a from t order by a");
+    client.query("commit");
+    assert_eq!(rows(&client.query("fetch 2 h")), ["1", "2"]);
+    client.query("begin");
+    client.query("declare g cursor with hold for select a from t order by a");
+    client.query("rollback");
+    assert_eq!(code(&client.query("fetch g")).as_deref(), Some("34000"));
+    assert_eq!(rows(&client.query("fetch h")), ["3"]);
+    assert_eq!(text(&client.query("close all")[0]), "CLOSE CURSOR ALL");
+    assert_eq!(code(&client.query("close h")).as_deref(), Some("34000"));
+
+    // On the extended flow a `FETCH` takes the formats of its portal.
+    client.query("begin");
+    client.query("declare c cursor for select a from t order by a");
+    client.parse("f", "fetch 2 c", &[]);
+    client.bind_with("", "f", &[], &[], &[1]);
+    client.describe(Target::Portal, "");
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12TDDCZ");
+    assert_eq!(row_shape(&messages[2])[0].2, 1);
+    assert_eq!(data_row(&messages[3])[0].as_deref(), Some(&1i32.to_be_bytes()[..]));
+    client.query("rollback");
+    server.stop().unwrap();
+}

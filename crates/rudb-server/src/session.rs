@@ -11,6 +11,7 @@
 //! in [`auth`].
 
 mod auth;
+mod cursor;
 mod database;
 mod extended;
 mod keywords;
@@ -616,6 +617,7 @@ fn serve(
         seen: u64::MAX,
         encoder: RowEncoder::default(),
         implicit: false,
+        committed: false,
     };
     rudb_common::advisory::register(pid, runner.connection.cancel_flag());
     runner.refresh();
@@ -682,8 +684,9 @@ fn serve(
             }
             Some(Ok(Frontend::Query(sql))) => {
                 extended.simple_query();
-                let failed = runner.query(sql, &mut wire.out, wire_flush(&mut wire.stream))?;
-                extended.end_of_transaction(runner.connection.transaction());
+                let flush = wire_flush(&mut wire.stream);
+                let failed = runner.query(sql, &mut extended, &mut wire.out, flush)?;
+                extended.end_of_transaction(&runner);
                 failed
             }
             Some(Ok(Frontend::Parse { name, sql, types })) => {
@@ -713,7 +716,9 @@ fn serve(
                 if done.is_err() && runner.ending() {
                     true
                 } else {
-                    failure(done, &mut wire.out, start.protocol)
+                    // An error of the server, such as a portal that cannot run again, aborts the
+                    // block as an error of the engine does.
+                    aborting(failure(done, &mut wire.out, start.protocol), &runner)
                 }
             }
             Some(Ok(Frontend::Close { target, name })) => {
@@ -722,7 +727,7 @@ fn serve(
             }
             Some(Ok(Frontend::Sync)) => {
                 let ended = runner.end_implicit();
-                extended.end_of_transaction(runner.connection.transaction());
+                extended.end_of_transaction(&runner);
                 match ended {
                     Ok(()) => false,
                     Err(failure) => {
@@ -755,7 +760,7 @@ fn serve(
         input.consume(used);
         if failed {
             runner.abort_implicit();
-            extended.end_of_transaction(runner.connection.transaction());
+            extended.end_of_transaction(&runner);
             if shared.stopping() || shared.terminating(pid) {
                 return terminated(shared, wire);
             }
@@ -784,9 +789,7 @@ fn failure(done: Result<(), extended::Problem>, out: &mut OutBuf, protocol: u32)
     }
 }
 
-/// Marks an open transaction block as aborted after an error of `Parse`, `Bind` or `Describe`, as
-/// PostgreSQL does for an error of any message. The engine does it itself for an error of
-/// `Execute`.
+/// Marks an open transaction block as aborted after an error of a message, as PostgreSQL does.
 fn aborting(failed: bool, runner: &Runner) -> bool {
     if failed {
         runner.connection.abort_transaction();
@@ -881,6 +884,8 @@ struct Runner {
     /// extended flow, and it ends the transaction at the end of the `Query` or at `Sync`. This is
     /// the implicit transaction block of PostgreSQL.
     implicit: bool,
+    /// The last transaction that ended committed, for the cursors `WITH HOLD` that it made.
+    committed: bool,
 }
 
 /// A statement of transaction control that the server runs itself, because PostgreSQL gives a
@@ -1122,6 +1127,7 @@ impl Runner {
     /// The end of a transaction for the settings, when no transaction is open after a statement.
     fn settle(&mut self, commit: bool) {
         if self.connection.transaction() == Transaction::Idle && !self.implicit {
+            self.committed = commit;
             self.guc.end(commit);
             self.refresh();
             rudb_common::advisory::end_transaction(self.pid);
@@ -1406,6 +1412,7 @@ impl Runner {
     fn query(
         &mut self,
         sql: &[u8],
+        extended: &mut Extended,
         out: &mut OutBuf,
         mut flush: impl FnMut(&mut OutBuf) -> io::Result<()>,
     ) -> io::Result<bool> {
@@ -1432,6 +1439,42 @@ impl Runner {
         // A query of more than one statement runs in one transaction, as in PostgreSQL.
         let implicit = statements.len() > 1;
         for statement in statements {
+            if let Some(cursor) = cursor::parse(statement.sql()) {
+                // A statement on a cursor runs here, since a cursor is a portal of the session.
+                let text: Arc<str> = sql.into();
+                let started = if implicit { self.begin_implicit() } else { Ok(()) };
+                let state = self.connection.transaction();
+                let problem = match started {
+                    Err(failure) => extended::Problem::failure(failure, &text),
+                    Ok(()) if state == Transaction::Aborted => extended::aborted(),
+                    Ok(()) => {
+                        let one: Arc<str> = statement.sql().into();
+                        let block = state != Transaction::Idle;
+                        let done = extended.cursor(
+                            self,
+                            &cursor,
+                            &one,
+                            None,
+                            Vec::new(),
+                            None,
+                            block,
+                            out,
+                            &mut flush,
+                        )?;
+                        match done {
+                            Ok(()) => {
+                                extended.end_of_transaction(self);
+                                continue;
+                            }
+                            Err(problem) => problem.within(&text, statement.offset()),
+                        }
+                    }
+                };
+                if !self.ending() {
+                    problem.write(out, 0);
+                }
+                return Ok(true);
+            }
             let before = self.connection.transaction();
             let control = Control::of(statement.sql());
             let command = setting::parse(statement.sql());
