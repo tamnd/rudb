@@ -3851,22 +3851,33 @@ impl Vector {
     /// [`Self::gather_runs`] of a packed column with no nulls whose ends fit an `i64`, `None` for
     /// anything else. Every run is inside the column, which the caller checked.
     fn unpacked_runs(&self, runs: &[(u32, u32)], rows: usize) -> Option<Self> {
-        fn each<T>(
+        fn each<T: Copy + Default>(
             packed: &Packed<'_>,
             runs: &[(u32, u32)],
             rows: usize,
             value: impl Fn(u64) -> T,
         ) -> Vec<T> {
+            // Everything the loop reads held in locals and the answer written into room it already
+            // has. Through the closures of a range's map, the base, the words and the width were
+            // loaded again for every value and the vector asked whether it had room, about thirty
+            // instructions a value for what `code_at` does in ten.
+            let words = packed.words;
             let width = packed.width as usize;
-            let mut out = Vec::with_capacity(rows);
+            let mask = u64::MAX >> (u64::BITS - packed.width);
+            let mut out = vec![T::default(); rows];
+            let mut at = 0;
             for &(start, length) in runs {
-                let first = (packed.offset + start as usize) * width;
-                // A range of known length, so that the vector takes the run without asking at each
-                // value whether it has room. A step over the bits asked, and cost twice the read.
-                out.extend(
-                    (0..length as usize)
-                        .map(|row| value(code_at(packed.words, first + row * width, packed.width))),
-                );
+                let length = length as usize;
+                let mut bit = (packed.offset + start as usize) * width;
+                for slot in &mut out[at..at + length] {
+                    let word = bit / u64::BITS as usize;
+                    let low = words.get(word).copied().unwrap_or(0);
+                    let high = words.get(word + 1).copied().unwrap_or(0);
+                    let both = u128::from(high) << u64::BITS | u128::from(low);
+                    *slot = value((both >> (bit % u64::BITS as usize)) as u64 & mask);
+                    bit += width;
+                }
+                at += length;
             }
             out
         }
@@ -3889,10 +3900,10 @@ impl Vector {
                 Data::Int64(Buffer::from_vec(each(&packed, runs, rows, value)))
             }
             rudb_common::PhysicalType::Int32 => {
-                Data::Int32(Buffer::from_vec(each(&packed, runs, rows, |code| value(code) as i32)))
+                Data::Int32(Buffer::from_vec(each(&packed, runs, rows, move |code| value(code) as i32)))
             }
             rudb_common::PhysicalType::Int16 => {
-                Data::Int16(Buffer::from_vec(each(&packed, runs, rows, |code| value(code) as i16)))
+                Data::Int16(Buffer::from_vec(each(&packed, runs, rows, move |code| value(code) as i16)))
             }
             _ => return None,
         };
