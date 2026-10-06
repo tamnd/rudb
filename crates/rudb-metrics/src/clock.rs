@@ -12,8 +12,30 @@
 //! Linux and macOS, where both fields of `timespec` are sixty four bit signed integers. Everywhere
 //! else this reports nothing rather than guessing, and nothing is a number a reader can see through
 //! while a guess is not.
+//!
+//! The system call is not free, and a short statement reads the thread clock several times: once
+//! for the statement, once for the build, once for each pipeline and once for the driver. On macOS
+//! that came to about a third of the time of a `SELECT 1`. So a reading that comes less than twenty
+//! microseconds after the last real reading on the same thread does not make the call. It is the
+//! last real reading plus the wall time since then, which is what the thread used if it ran all
+//! that time. A thread that was off the processor for part of that time is charged for it, so a
+//! reading can be high by twenty microseconds at most, and is never low. The readings of one thread
+//! never go backwards.
 
+use std::cell::Cell;
 use std::time::Instant;
+
+/// How long, in nanoseconds, a real reading of the thread clock stands for the readings after it.
+///
+/// Twenty microseconds is longer than the whole of a short statement and shorter than the time
+/// slice of a scheduler, so a statement that is short pays for one system call, and a reading is
+/// never high by more than a small part of one time slice.
+const FRESH_NS: u64 = 20_000;
+
+thread_local! {
+    /// The last real reading on this thread, when it was taken, and the highest reading given out.
+    static LAST: Cell<Option<(Instant, u64, u64)>> = const { Cell::new(None) };
+}
 
 /// The clock id for the calling thread's CPU time.
 ///
@@ -48,8 +70,29 @@ mod system {
 /// Per thread and not per process. A pipeline instance runs on one thread, so the difference
 /// between two of these readings around a call is what that call cost, whatever the other
 /// thirty one threads were doing at the time.
+///
+/// A reading soon after a real one is an estimate, as the module documentation says.
 #[must_use]
 pub fn thread_cpu_ns() -> Option<u64> {
+    let now = Instant::now();
+    let last = LAST.get();
+    if let Some((read_at, real, highest)) = last {
+        let since =
+            u64::try_from(now.saturating_duration_since(read_at).as_nanos()).unwrap_or(u64::MAX);
+        if since < FRESH_NS {
+            let reading = real.saturating_add(since).max(highest);
+            LAST.set(Some((read_at, real, reading)));
+            return Some(reading);
+        }
+    }
+    let real = read_thread_clock()?;
+    let reading = last.map_or(real, |(_, _, highest)| real.max(highest));
+    LAST.set(Some((now, real, reading)));
+    Some(reading)
+}
+
+/// The thread clock itself, with the system call.
+fn read_thread_clock() -> Option<u64> {
     #[cfg(all(
         target_pointer_width = "64",
         any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")
@@ -146,13 +189,28 @@ impl Span {
 
 #[cfg(test)]
 mod tests {
-    use super::{Span, thread_cpu_ns};
+    use super::{FRESH_NS, Span, read_thread_clock, thread_cpu_ns};
 
     #[test]
     fn the_thread_clock_does_not_go_backwards() {
         let Some(first) = thread_cpu_ns() else { return };
         let second = thread_cpu_ns().expect("a clock that answered once answers twice");
         assert!(second >= first, "{second} is before {first}");
+    }
+
+    /// A reading soon after a real one is not below it and not more than the fresh time above the
+    /// thread clock itself.
+    #[test]
+    fn a_fresh_reading_stays_close_to_the_thread_clock() {
+        let Some(first) = thread_cpu_ns() else { return };
+        let mut last = first;
+        for _ in 0..1_000 {
+            let reading = thread_cpu_ns().expect("a clock that answered once answers again");
+            let real = read_thread_clock().expect("the thread clock answers");
+            assert!(reading >= last, "{reading} is before {last}");
+            assert!(reading <= real + FRESH_NS, "{reading} is too far above {real}");
+            last = reading;
+        }
     }
 
     #[test]
