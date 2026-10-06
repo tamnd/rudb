@@ -38,8 +38,8 @@ use std::cmp::Ordering;
 use std::str::FromStr;
 
 use rudb_common::{
-    Error, ErrorCode, Field, LogicalType, PhysicalType, Result, SessionTimeZone, Value, bignum,
-    bit, civil_from_days, days_from_civil, implicit, time_tz, uuid,
+    Error, ErrorCode, Field, LogicalType, PhysicalType, Result, SessionTimeZone, SqlState, Value,
+    bignum, bit, civil_from_days, days_from_civil, implicit, time_tz, uuid,
 };
 use rudb_vector::{Data, Form, Vector};
 
@@ -1518,18 +1518,33 @@ fn no_cast(value: &Value, target: &LogicalType) -> Error {
 /// decimal is the `Casting value` one, everything else is the `Could not cast value` one, and a
 /// float or a double is written with six digits after the point in it because the message is built
 /// with the C `%f` that does that.
+///
+/// PostgreSQL says `numeric field overflow` for all of them, with the limit in the detail as
+/// `apply_typmod` writes it, and with no position, since it raises the error when the statement
+/// runs.
 fn no_decimal(value: &Value, target: &LogicalType) -> Error {
-    let written = match value {
+    let message = match value {
         Value::Decimal { .. } => {
-            return Error::conversion(format!(
-                "Casting value \"{value}\" to type {target} failed: value is out of range!"
-            ));
+            format!("Casting value \"{value}\" to type {target} failed: value is out of range!")
         }
-        Value::Float(real) => format!("{real:.6}"),
-        Value::Double(real) => format!("{real:.6}"),
-        other => other.to_string(),
+        Value::Float(real) => format!("Could not cast value {real:.6} to {target}"),
+        Value::Double(real) => format!("Could not cast value {real:.6} to {target}"),
+        other => format!("Could not cast value {other} to {target}"),
     };
-    Error::conversion(format!("Could not cast value {written} to {target}"))
+    let error = Error::conversion(message);
+    let LogicalType::Decimal { width, scale } = target else { return error };
+    let limit = match width - scale {
+        0 => "1".to_string(),
+        digits => format!("10^{digits}"),
+    };
+    error
+        .state(SqlState::NUMERIC_VALUE_OUT_OF_RANGE)
+        .pg("numeric field overflow")
+        .detail(format!(
+            "A field with precision {width}, scale {scale} must round to an absolute value less \
+             than {limit}."
+        ))
+        .unplaced()
 }
 
 /// The failure DuckDB reports for a decimal that does not fit an integer, in the words DuckDB uses.
@@ -1948,7 +1963,9 @@ fn numeric_cast(value: &Value, target: &LogicalType) -> Result<Value> {
             LogicalType::Float => Ok(Value::Float(held.to_f64() as f32)),
             &LogicalType::Decimal { width, scale } => {
                 let typmod = ((i32::from(width) << 16) | i32::from(scale)) + 4;
-                let fitted = held.with_typmod(typmod)?;
+                // PostgreSQL raises the overflow when the statement runs, with no position.
+                let fitted =
+                    held.with_typmod(typmod).map_err(|error| Error::from(error).unplaced())?;
                 // The typmod has checked the digits, so the value fits the width.
                 let unscaled = fitted.to_decimal(u32::from(scale)).unwrap_or_default();
                 Ok(Value::Decimal { unscaled, width, scale })
@@ -1962,7 +1979,7 @@ fn numeric_cast(value: &Value, target: &LogicalType) -> Result<Value> {
                 let whole = held.to_integer(name).map_err(|error| Error::from(error).unplaced())?;
                 fit(whole, target).ok_or_else(|| {
                     Error::out_of_range(format!("{name} out of range"))
-                        .state(rudb_common::SqlState::NUMERIC_VALUE_OUT_OF_RANGE)
+                        .state(SqlState::NUMERIC_VALUE_OUT_OF_RANGE)
                         .unplaced()
                 })
             }

@@ -1,5 +1,6 @@
 //! The input functions of the types for a string literal in a cast, such as `'\x01ff'::bytea` or
 //! `'infinity'::date`. The engine casts text in the way of DuckDB, which does not read these forms.
+//! An error of an input function read here has the place of the literal, as in PostgreSQL.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,7 +9,7 @@ use rudb_common::value::Value;
 use rudb_common::{Error, Result};
 use rudb_pgtypes::{
     DateOrder, DateTimeInput, InputSettings, IntervalStyle, NoZones, RegKind, TypeInfo,
-    UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, oid, param_value,
+    UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, json_in, jsonb_in, numeric_in, oid, param_value,
 };
 
 use super::zone::Zone;
@@ -23,6 +24,21 @@ pub(super) struct Literals {
 
 impl LiteralInput for Literals {
     fn read(&self, oid: u32, text: &str) -> Option<Result<Value>> {
+        // A `numeric` keeps all its digits, where a parameter of `param_value` with more than 38
+        // digits is a double. A `json` is kept as it was written, and a `jsonb` in its normal form.
+        let read = match oid {
+            oid::NUMERIC => numeric_in(text, -1).map(|value| Value::Numeric(value.to_bytes())),
+            oid::JSON => json_in(text).map(|text| Value::Varchar(text.to_owned())),
+            oid::JSONB => jsonb_in(text).map(Value::Varchar),
+            _ => return self.read_known(oid, text),
+        };
+        Some(read.map_err(Error::from))
+    }
+}
+
+impl Literals {
+    /// The types whose input is read by [`param_value`].
+    fn read_known(&self, oid: u32, text: &str) -> Option<Result<Value>> {
         let known = [
             oid::BOOL,
             oid::CHAR,
