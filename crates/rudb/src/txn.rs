@@ -519,6 +519,16 @@ impl Registry {
             .collect()
     }
 
+    /// The rows of the table `oid` each commit after revision `since` updated or deleted, for a
+    /// transaction still open whose snapshot was taken at `since` or before.
+    pub(crate) fn changed_since(&self, oid: i64, since: u64) -> Vec<Marks> {
+        self.done
+            .iter()
+            .filter(|done| done.oid == oid && done.at > since)
+            .map(|done| done.marks.clone())
+            .collect()
+    }
+
     /// Whether any transaction is open, which is when a write has to say which rows it changed.
     pub(crate) fn watched(&self) -> bool {
         !self.open.is_empty()

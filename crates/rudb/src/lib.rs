@@ -117,6 +117,7 @@ mod mirror;
 mod prepared;
 mod recluster;
 mod result;
+mod serial;
 mod settings;
 mod statements;
 mod stream;
