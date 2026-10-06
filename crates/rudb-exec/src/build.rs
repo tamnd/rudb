@@ -1623,9 +1623,10 @@ pub fn walks_siblings(plan: &Plan, catalog: &Catalog) -> bool {
 /// the equalities has to hold that table's linked column equal to a column of the rows the join
 /// keeps or drops. That link has to reach every child, since a child with no parent is one the
 /// walk cannot find, and the parent has to have a key map over the column the link was built
-/// against. The rest of the conditions have to be more than that one equality, because a join of
-/// equalities alone is a link join already and costs less, with one exception: the one equality
-/// over the child table read whole, which only asks whether the row's parent has a child at all.
+/// against. The rest of the conditions and the filters over the child have to be more than that one
+/// equality, because a join of equalities alone is a link join already and costs less, with one
+/// exception: the one equality over the child table read whole, which only asks whether the row's
+/// parent has a child at all.
 /// See `crate::siblings`.
 ///
 /// `None` on anything else, including a catalog error, because the join it falls back to is the
@@ -1651,7 +1652,14 @@ fn walk(
     // at all, which the link or the adjacency answers without the child table being read. TPC-H q22
     // asks for customers with no orders this way, and the hash join read all of `orders` for it.
     let bare = conditions.len() == 1 && tests.is_empty();
-    if !bare && conditions.iter().all(|&condition| equated(plan, condition).is_some()) {
+    // A filter on the child is a test the link cannot answer, the same as a condition of the join's
+    // own. TPC-H q04 keeps an order when one of its lines came in after it was committed, and the
+    // hash join gathered the orders of a quarter, read their lines through the reduction, took each
+    // line's order key back from the link and the key map, and looked it up to mark the order.
+    if !bare
+        && tests.is_empty()
+        && conditions.iter().all(|&condition| equated(plan, condition).is_some())
+    {
         return None;
     }
     let (table, index, columns) = whole_table(plan, catalog, node).ok()??;
