@@ -26,7 +26,8 @@ use crate::number::{int2_in, int4_in, int8_in, oid_in};
 use crate::numeric::{Numeric, NumericSign, numeric_in, numeric_out, numeric_recv};
 use crate::reg::{RegInput, RegKind, reg_in};
 use crate::scalar::{bool_in, bytea_in, char_in, name_in, uuid_in};
-use crate::types::{Oid, TypeInfo, format_type};
+use crate::string::{bpchar_in, varchar_in};
+use crate::types::{Oid, PgType, TypeInfo, format_type};
 use crate::{float4_in, float8_in};
 
 /// What the text input of a parameter depends on: `DateStyle`, `TimeZone` and `IntervalStyle`.
@@ -121,6 +122,51 @@ pub fn param_value(
         let text = Recv::new(data).text()?;
         text_value(oid, text, settings)
     }
+}
+
+/// The value of a column of the type `ty` from one field of `COPY FROM`, in the text format, or in
+/// the binary format when `binary` is set. The typmod of the column applies as the input function
+/// applies it: a `numeric(p, s)` is rounded to its scale or is an error when it does not fit, and
+/// a `varchar(n)` or a `char(n)` that is too long is an error.
+///
+/// # Errors
+///
+/// The error of the input or the receive function of the type, with the SQLSTATE and the text of
+/// PostgreSQL. A binary value with bytes left over is `incorrect binary data format`.
+pub fn column_value(
+    ty: PgType,
+    binary: bool,
+    data: &[u8],
+    settings: &InputSettings<'_>,
+) -> Result<Value, TypeError> {
+    let PgType { oid, typmod } = ty;
+    if binary {
+        let mut recv = Recv::new(data);
+        let value = match oid {
+            oids::NUMERIC => numeric(&numeric_recv(&mut recv, typmod)?),
+            oids::VARCHAR if typmod >= 0 => {
+                Value::Varchar(varchar_in(recv.text()?, typmod)?.to_owned())
+            }
+            oids::BPCHAR if typmod >= 0 => {
+                Value::Varchar(bpchar_in(recv.text()?, typmod)?.into_owned())
+            }
+            _ => binary_value(oid, &mut recv)?,
+        };
+        if recv.remaining() > 0 {
+            return Err(TypeError::new(
+                SqlState::INVALID_BINARY_REPRESENTATION,
+                "incorrect binary data format".to_owned(),
+            ));
+        }
+        return Ok(value);
+    }
+    let text = Recv::new(data).text()?;
+    Ok(match oid {
+        oids::NUMERIC => numeric(&numeric_in(text, typmod)?),
+        oids::VARCHAR if typmod >= 0 => Value::Varchar(varchar_in(text, typmod)?.to_owned()),
+        oids::BPCHAR if typmod >= 0 => Value::Varchar(bpchar_in(text, typmod)?.into_owned()),
+        _ => text_value(oid, text, settings)?,
+    })
 }
 
 fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Value, TypeError> {

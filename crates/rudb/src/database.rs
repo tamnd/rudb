@@ -22,7 +22,7 @@ use rudb_parse::ast::{self, Ast};
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_plan::{Expr, Node, NodeRef, Plan};
 use rudb_storage::{ReadGuard, ReadMostly, WriteGuard};
-use rudb_vector::{Chunk, Data, Form, Selection, Vector};
+use rudb_vector::{Chunk, Data, Form, Selection, VECTOR_SIZE, Vector};
 
 use crate::config::Config;
 use crate::connection::{Connection, single};
@@ -4093,7 +4093,7 @@ impl Shared {
     /// `SYNTACTIC_ERRORS_DO_NOT_INVALIDATE` a binder or catalog error leaves it open too, and on
     /// the pin that goes by the kind of error rather than by where it was raised, so a `CREATE
     /// TABLE` of a name that is taken leaves it open and a failed cast does not.
-    fn aborts(&self, error: &Error) -> bool {
+    pub(crate) fn aborts(&self, error: &Error) -> bool {
         let keeps = self.inner.settings.syntactic_errors_keep_transaction();
         match error.code() {
             rudb_common::ErrorCode::Parser | rudb_common::ErrorCode::NotImplemented => false,
@@ -7025,7 +7025,56 @@ impl Shared {
 }
 
 impl Shared {
-    /// [`Database::append_chunks`] with the writer lock held, up to the commit.
+    /// The name, the columns and the defaults of the table `parts` names, for
+    /// [`Connection::load_target`].
+    pub(crate) fn load_target(
+        &self,
+        parts: &[&str],
+    ) -> Result<(QualifiedName, Vec<Field>, Vec<Option<String>>)> {
+        let catalog = self.read();
+        let name = catalog.resolve(parts)?;
+        let table = catalog.table(&name)?;
+        let fields = table.columns().to_vec();
+        let defaults = (0..fields.len()).map(|at| table.default(at).map(str::to_owned)).collect();
+        Ok((name, fields, defaults))
+    }
+
+    /// Writes the columns `values`, each `rows` long and of the type of its field, into `name`,
+    /// for [`Connection::load`]. Inside a transaction the rows go into its own catalog and log
+    /// without the writer lock. Outside of one they are committed here.
+    pub(crate) fn load(
+        &self,
+        name: &QualifiedName,
+        fields: &[Field],
+        values: &[Vec<Value>],
+        rows: usize,
+    ) -> Result<()> {
+        if self.open().as_ref().is_some_and(|open| open.read_only) {
+            return Err(Error::transaction(
+                "cannot execute COPY FROM in a read-only transaction".to_owned(),
+            ));
+        }
+        let mut chunks = Vec::with_capacity(rows.div_ceil(VECTOR_SIZE));
+        let mut start = 0;
+        while start < rows {
+            let end = (start + VECTOR_SIZE).min(rows);
+            let columns = fields
+                .iter()
+                .zip(values)
+                .map(|(field, values)| Vector::from_values(field.ty.clone(), &values[start..end]))
+                .collect::<Result<Vec<_>>>()?;
+            chunks.push(Chunk::new(columns)?);
+            start = end;
+        }
+        if self.transacting() {
+            return self.append_chunks(name, chunks);
+        }
+        let writing = self.writing();
+        let appended = self.append_chunks(name, chunks);
+        let settled = self.settle(writing);
+        appended.and(settled)
+    }
+
     fn append_chunks(&self, name: &QualifiedName, chunks: Vec<Chunk>) -> Result<()> {
         if chunks.iter().all(Chunk::is_empty) {
             return Ok(());

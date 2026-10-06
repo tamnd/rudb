@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
+use rudb_catalog::QualifiedName;
 use rudb_common::session::Postgres;
-use rudb_common::{Cancel, Error, Result, Value};
+use rudb_common::{Cancel, Error, Field, Result, Value};
 
 use crate::database::Shared;
 use crate::prepared::Prepared;
@@ -19,6 +20,35 @@ pub enum Transaction {
     /// A statement failed in the open transaction, and only `COMMIT` or `ROLLBACK` runs until it
     /// ends.
     Aborted,
+}
+
+/// The table that a load of rows writes into, from [`Connection::load_target`]: what
+/// `COPY FROM STDIN` of a PostgreSQL server needs to read its data before it has any rows.
+#[derive(Debug, Clone)]
+pub struct LoadTarget {
+    pub(crate) name: QualifiedName,
+    fields: Vec<Field>,
+    defaults: Vec<Option<String>>,
+}
+
+impl LoadTarget {
+    /// The columns of the table, in their order.
+    #[must_use]
+    pub fn columns(&self) -> &[Field] {
+        &self.fields
+    }
+
+    /// The name of the table, without its schema.
+    #[must_use]
+    pub fn table(&self) -> &str {
+        &self.name.table
+    }
+
+    /// The schema of the table.
+    #[must_use]
+    pub fn schema(&self) -> &str {
+        &self.name.schema
+    }
 }
 
 /// A connection to a database.
@@ -142,6 +172,71 @@ impl Connection {
     /// execution rather than here, because a parameter has no type until it has a value.
     pub fn prepare(&self, sql: &str) -> Result<Prepared> {
         Prepared::new(self.shared.clone(), sql).map_err(|error| self.shared.process_error(error))
+    }
+
+    /// The table `parts` names, for [`Connection::load`].
+    ///
+    /// # Errors
+    ///
+    /// If the name does not resolve to a table.
+    pub fn load_target(&self, parts: &[&str]) -> Result<LoadTarget> {
+        let (name, fields, defaults) =
+            self.shared.load_target(parts).map_err(|error| self.shared.process_error(error))?;
+        Ok(LoadTarget { name, fields, defaults })
+    }
+
+    /// Writes rows into the table of `target`, inside the open transaction when there is one.
+    ///
+    /// `columns` holds one list of values for each column in `given`, all `rows` long. A column
+    /// that is not in `given` gets its default, worked out for each row as an `INSERT` works it
+    /// out, or a null. A value that is not of its column's type is cast to it. The rows go in as
+    /// the rows of an `INSERT` go in: `CHECK`, `NOT NULL`, keys and foreign keys, then the log.
+    ///
+    /// # Errors
+    ///
+    /// A value that does not cast to its column's type, a constraint the rows break, a default
+    /// that fails, or a transaction that is read only.
+    pub fn load(
+        &self,
+        target: &LoadTarget,
+        given: &[usize],
+        columns: Vec<Vec<Value>>,
+        rows: usize,
+    ) -> Result<()> {
+        let mut full: Vec<Option<Vec<Value>>> = vec![None; target.fields.len()];
+        for (&at, values) in given.iter().zip(columns) {
+            let ty = &target.fields[at].ty;
+            let values = if values.iter().all(|v| v.is_null() || &v.logical_type() == ty) {
+                values
+            } else {
+                values
+                    .iter()
+                    .map(|value| rudb_kernels::cast::cast_value(value, ty, false))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            full[at] = Some(values);
+        }
+        let mut filled = Vec::with_capacity(full.len());
+        for (at, values) in full.into_iter().enumerate() {
+            let field = &target.fields[at];
+            let values = match (values, &target.defaults[at]) {
+                (Some(values), _) => values,
+                (None, None) => vec![Value::Null; rows],
+                (None, Some(default)) => {
+                    let sql = format!("SELECT CAST(({default}) AS {}) FROM range({rows})", field.ty);
+                    let result = self.query(&sql)?;
+                    (0..result.len()).map(|row| result.value_at(row, 0)).collect()
+                }
+            };
+            filled.push(values);
+        }
+        self.shared.load(&target.name, &target.fields, &filled, rows).map_err(|error| {
+            let error = self.shared.process_error(error);
+            if self.shared.aborts(&error) {
+                self.shared.abort_block();
+            }
+            error
+        })
     }
 
     /// Runs a query and returns the single value it produced.

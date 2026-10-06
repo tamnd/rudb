@@ -31,6 +31,7 @@ use rudb_pgtypes::{
 };
 use rudb_pgwire::{Bind, CommandTag, Level, OutBuf, Portals, ProtocolError, Statements, Target};
 
+use super::copy::{self, Copy};
 use super::cursor::{self, ALL, Cursor, Declare, Direction, NoScroll, Place, Run};
 use super::setting::{self, Command};
 use super::{
@@ -125,6 +126,8 @@ pub(super) struct Statement {
     cursor: Option<Cursor>,
     /// The query of a `DECLARE`, which has the parameters.
     query: Option<Arc<Statement>>,
+    /// The `COPY` with `STDIN` or `STDOUT` that the server runs itself, from [`copy::parse`].
+    copy: Option<Copy>,
 }
 
 impl Statement {
@@ -277,12 +280,30 @@ impl Extended {
             .into();
         let types: Vec<Oid> = types.collect();
         let engine = |e: rudb::Error| Problem::failure(Failure::engine(&e, 0), &sql);
-        let cursor = match rudb::statements(&sql).map_err(engine)?.len() {
-            1 => cursor::parse(&sql),
-            _ => None,
-        };
-        let statement = match cursor {
-            Some(cursor) => {
+        let one = rudb::statements(&sql).map_err(engine)?.len() == 1;
+        let cursor = if one { cursor::parse(&sql) } else { None };
+        let copied = if one { copy::parse(&sql) } else { None };
+        let statement = match (cursor, copied) {
+            (None, Some(copied)) => {
+                if runner.connection.transaction() == Transaction::Aborted {
+                    return Err(aborted());
+                }
+                let copy = copied.map_err(|failure| Problem::failure(failure, &sql))?;
+                Statement {
+                    sql,
+                    control: None,
+                    command: None,
+                    prepared: None,
+                    types: Vec::new(),
+                    slots: Vec::new(),
+                    positional: true,
+                    found: OnceLock::new(),
+                    cursor: None,
+                    query: None,
+                    copy: Some(copy),
+                }
+            }
+            (Some(cursor), _) => {
                 if runner.connection.transaction() == Transaction::Aborted {
                     return Err(aborted());
                 }
@@ -307,9 +328,10 @@ impl Extended {
                     found: OnceLock::new(),
                     cursor: Some(cursor),
                     query,
+                    copy: None,
                 }
             }
-            None => statement(runner, sql, types)?,
+            (None, None) => statement(runner, sql, types)?,
         };
         self.statements.insert(name, Arc::new(statement))?;
         out.parse_complete();
@@ -434,6 +456,11 @@ impl Extended {
                     }
                     return Ok(());
                 }
+                if statement.copy.is_some() {
+                    out.parameter_description(&[]);
+                    out.no_data();
+                    return Ok(());
+                }
                 if let Some(command) = &statement.command {
                     out.parameter_description(&[]);
                     describe_command(runner, command, out);
@@ -471,7 +498,7 @@ impl Extended {
                     }
                     return Ok(());
                 }
-                if portal.statement.control.is_some() {
+                if portal.statement.control.is_some() || portal.statement.copy.is_some() {
                     out.no_data();
                     return Ok(());
                 }
@@ -565,6 +592,18 @@ impl Extended {
                 out,
                 flush,
             );
+        }
+        if let Some(copied) = portal.statement.copy.clone() {
+            if portal.ran.is_some() {
+                let name = String::from_utf8_lossy(name);
+                return Ok(Err(error("55000", format!("portal \"{name}\" cannot be run"))));
+            }
+            let mut ran = Ran::new(None, CommandTag::Copy, 0, false);
+            ran.reported = true;
+            portal.ran = Some(ran);
+            let sql = portal.statement.sql.clone();
+            let done = runner.copy(copied, &sql, 0, None, out, flush)?;
+            return Ok(done.map_err(|failure| Problem::failure(failure, &sql)));
         }
         let sql = portal.statement.sql.clone();
         let formats = portal.formats.clone();
@@ -802,6 +841,7 @@ fn statement(runner: &Runner, sql: Arc<str>, mut types: Vec<Oid>) -> Result<Stat
         found: OnceLock::new(),
         cursor: None,
         query: None,
+        copy: None,
     };
     // PostgreSQL binds a query and a change to the data at `Parse`, so a name that is not there
     // is an error of `Parse` and not of `Execute`.

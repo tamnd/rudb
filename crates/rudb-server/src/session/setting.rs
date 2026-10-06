@@ -70,6 +70,11 @@ pub(super) fn loose(sql: &str) -> Option<Vec<Token>> {
     scan(sql, true).map(|(tokens, _)| tokens)
 }
 
+/// The tokens of [`loose`] and the byte offset where each one starts.
+pub(super) fn loose_spanned(sql: &str) -> Option<(Vec<Token>, Vec<usize>)> {
+    scan(sql, true)
+}
+
 fn scan(sql: &str, loose: bool) -> Option<(Vec<Token>, Vec<usize>)> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
