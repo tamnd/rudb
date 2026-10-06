@@ -6168,6 +6168,10 @@ struct HeldDistinct {
 impl HeldDistinct {
     fn hold(&mut self, set: usize, value: i64) -> Result<()> {
         let set = u32::try_from(set).map_err(|_| Error::internal("too many distinct sets"))?;
+        if self.values.capacity() == 0 {
+            // A chunk's worth past the point they are given out, which is where they are given.
+            self.values.reserve(HELD_DISTINCT + VECTOR_SIZE);
+        }
         self.values.push((set, value));
         Ok(())
     }
@@ -6220,7 +6224,7 @@ fn by_set(values: &mut Vec<(u32, i64)>, spare: &mut Vec<(u32, i64)>, sets: usize
             *start = next;
             next += count;
         }
-        spare.clear();
+        // Every place is written below, so what the spare held from the pass before stays.
         spare.resize(values.len(), (0, 0));
         for &held in values.iter() {
             let digit = (held.0 >> shift) as usize & 0xff;
