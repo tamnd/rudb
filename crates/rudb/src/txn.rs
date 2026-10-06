@@ -27,7 +27,9 @@
 //! older transaction waits for a younger one, and anything else fails at once. Every wait then goes
 //! from older to younger or from a writer nobody can be waiting on, so no cycle forms. When the
 //! holder rolls back the write goes ahead, and when it commits the write meets a row committed
-//! after its snapshot and fails the way it would have without waiting.
+//! after its snapshot and fails the way it would have without waiting. Unless it is the first
+//! statement of its transaction, which gives up the snapshot it took and runs again with a new one,
+//! section 8.7: the client has seen nothing under the old one yet.
 //!
 //! This is the step before `engine-v4/08-concurrency.md`'s design, which keeps one copy of each row
 //! with an undo chain and a lock word in it, and the conflicts it reports are the same ones.

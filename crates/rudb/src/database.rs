@@ -680,6 +680,10 @@ struct Conn {
     /// The number of the transaction the statement runs in, which `txid_current()` answers with.
     /// See [`Shared::in_transaction`].
     transaction: AtomicU64,
+    /// Whether the last statement failed because it met a row another transaction holds or
+    /// committed since the snapshot, set by [`Shared::clashed`] whether or not it may wait. See
+    /// [`Shared::in_transaction`], which runs the first statement of a transaction again then.
+    met: AtomicBool,
     /// The statements `PREPARE` named, by the name in lower case, since the pin finds `"S"` under
     /// `s`.
     prepared: Mutex<BTreeMap<String, Arc<Named>>>,
@@ -760,6 +764,7 @@ impl Conn {
             registry,
             blocked: AtomicU64::new(0),
             transaction: AtomicU64::new(0),
+            met: AtomicBool::new(false),
             prepared: Mutex::default(),
             listed: Mutex::default(),
             simple: Mutex::default(),
@@ -4357,7 +4362,7 @@ impl Shared {
     pub(crate) fn in_transaction(
         &self,
         sql: &str,
-        run: impl FnOnce() -> Result<QueryResult>,
+        run: impl Fn() -> Result<QueryResult>,
     ) -> Result<QueryResult> {
         // A statement outside a block is a transaction of its own, and one that opens a block
         // begins the transaction the statements in it run in, so each takes the next number.
@@ -4390,12 +4395,44 @@ impl Shared {
             }
             return Err(Error::transaction("Current transaction is aborted (please ROLLBACK)"));
         }
-        let result = run();
+        // The first statement of a transaction that meets a row another one holds or committed
+        // since the snapshot gives the snapshot up and runs again with a new one, once the other
+        // is done, since the client has seen nothing under the old one. That is the transaction
+        // begun a little later, which snapshot isolation allows, section 8.7 of the concurrency
+        // spec. Without waiting there is no retry, as on the pin.
+        let lock_timeout = self.inner.settings.lock_timeout();
+        let first = !lock_timeout.is_zero()
+            && self.open().as_ref().is_some_and(|open| open.snapshot.is_none());
+        let deadline = first.then(|| Instant::now() + lock_timeout);
+        let result = loop {
+            self.conn.met.store(false, Ordering::Release);
+            let result = run();
+            let met = self.conn.met.swap(false, Ordering::AcqRel);
+            match deadline {
+                Some(deadline) if result.is_err() && met && Instant::now() < deadline => {
+                    self.give_up_snapshot()?;
+                }
+                _ => break result,
+            }
+        };
         let aborts = result.as_ref().err().is_some_and(|error| self.aborts(error));
         if aborts && let Some(open) = self.open().as_mut() {
             open.aborted = true;
         }
         result
+    }
+
+    /// Rolls back what the open transaction did and lets go of its snapshot, leaving it open as
+    /// `BEGIN` left it, for its first statement to run again.
+    fn give_up_snapshot(&self) -> Result<()> {
+        let taken = self.open().as_mut().and_then(|open| open.snapshot.take());
+        match taken {
+            Some(snapshot) => {
+                let closed = Open { aborted: false, read_only: false, snapshot: Some(snapshot) };
+                self.close_transaction(closed, false)
+            }
+            None => Ok(()),
+        }
     }
 
     /// Whether `error` from a statement aborts the transaction it ran in.
@@ -5663,6 +5700,9 @@ impl Shared {
         clash: Option<txn::Clash>,
         delete: bool,
     ) -> Result<()> {
+        if clash.is_some() {
+            self.conn.met.store(true, Ordering::Release);
+        }
         match clash {
             None => Ok(()),
             Some(txn::Clash::Open(holder))

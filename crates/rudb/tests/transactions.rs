@@ -640,6 +640,54 @@ fn a_transaction_that_waited_for_a_holder_that_commits_conflicts() {
 }
 
 #[test]
+fn the_first_statement_of_a_transaction_runs_again_after_the_holder_commits() {
+    let (_database, one, two) = waiting("10s");
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 11 WHERE id = 1").expect("updates");
+    two.execute("BEGIN").expect("begins");
+    thread::scope(|scope| {
+        // Nothing read yet, so the snapshot is taken again once the row is free, with the commit
+        // in it, rather than failing on a row changed after the first one.
+        let waiter = scope.spawn(|| two.execute("UPDATE t SET v = v + 1 WHERE id = 1"));
+        thread::sleep(Duration::from_millis(100));
+        one.execute("COMMIT").expect("commits");
+        waiter.join().expect("joins").expect("updates over the commit");
+    });
+    assert_eq!(rows(&two, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 12), (2, 20)]));
+    two.execute("COMMIT").expect("commits");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 12), (2, 20)]));
+
+    // The same through the short way of a prepared write, by key.
+    let write = two.prepare("UPDATE t SET v = v + ? WHERE id = ?").expect("prepares");
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 0 WHERE id = 2").expect("updates");
+    two.execute("BEGIN").expect("begins");
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| write.execute(&[Value::Integer(5), Value::Integer(2)]));
+        thread::sleep(Duration::from_millis(100));
+        one.execute("COMMIT").expect("commits");
+        waiter.join().expect("joins").expect("updates over the commit");
+    });
+    two.execute("COMMIT").expect("commits");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 12), (2, 5)]));
+
+    // Past the first statement the conflict is the transaction's, as before.
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 1 WHERE id = 1").expect("updates");
+    two.execute("BEGIN").expect("begins");
+    two.execute("UPDATE t SET v = 2 WHERE id = 2").expect("updates");
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| two.execute("UPDATE t SET v = v + 1 WHERE id = 1"));
+        thread::sleep(Duration::from_millis(100));
+        one.execute("COMMIT").expect("commits");
+        let error = waiter.join().expect("joins").expect_err("the row changed after the snapshot");
+        assert!(error.to_string().contains("Conflict on update!"), "{error}");
+    });
+    two.execute("ROLLBACK").expect("rolls back");
+    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 1), (2, 5)]));
+}
+
+#[test]
 fn a_write_outside_a_transaction_waits_for_the_holder_to_commit() {
     let (_database, one, two) = waiting("10s");
     one.execute("BEGIN").expect("begins");
