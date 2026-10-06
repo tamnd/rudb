@@ -1385,6 +1385,9 @@ pub(crate) fn found_for(
         }
     }
     let spare = spare.filter(|_| exact.is_some());
+    if std::env::var_os("RUDB_DBG").is_some() {
+        eprintln!("found_for rows={rows} placed={placed} exact={} reduced={reduced:?} domain={} listing={} pushed_rows={}", exact.is_some(), domain.is_some(), listing.is_some(), exact.as_ref().map_or(0, |r| r.len()));
+    }
     Ok(Found {
         range: extremes.into_range(),
         filter,

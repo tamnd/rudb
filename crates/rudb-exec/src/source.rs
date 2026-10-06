@@ -2545,6 +2545,9 @@ impl<'a> Scan<'a> {
         let mut reaching: Vec<(u64, &Arc<Sideways<'_>>)> =
             joins.filter_map(|sideways| Some((sideways.reach(self.index)?, sideways))).collect();
         reaching.sort_by_key(|(reach, _)| *reach);
+        if std::env::var_os("RUDB_DBG").is_some() {
+            eprintln!("handed index={} held={:?} reaching={:?} joins={}", self.index, held.as_ref().map(|r| r.len()), reaching.iter().map(|r| r.0).collect::<Vec<_>>(), self.sideways.iter().count() + self.also.len());
+        }
         if let Some(&(fewest, _)) = reaching.first()
             && held.as_ref().is_none_or(|rows| fewest < rows.len())
         {
