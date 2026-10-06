@@ -8,6 +8,20 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.35
+
+This release continues the PostgreSQL work inside PG2 (#2490) and has engine speed work and two new types.
+
+#2641 runs `COPY FROM STDIN` and `COPY TO STDOUT` in the server, in text, CSV and binary format. #2644 and #2643 make the parse side of a load faster: lines are found with `memchr`, ISO dates are read without the full parser, and the cells and null flags are walked a column at a time.
+
+#2647 infers more parameter types as PostgreSQL does and fixes three datetime operators. #2648 adds `x op ANY (array)` and `x op ALL (array)`. #2651 makes `char(n)` pad on output and ignore trailing spaces in a compare, as in PostgreSQL, and keeps the length rules of `char(n)` and `varchar(n)` on the prepared insert and update paths. #2652 gives the common functions, such as `length`, `sum` of an `int4` and `date_part`, the result types of PostgreSQL, and adds `cardinality`, `array_ndims`, `array_lower`, `array_upper`, `num_nulls`, `num_nonnulls`, `width_bucket`, `regexp_count`, `regexp_instr`, `every` and `pg_backend_pid`.
+
+#2649 adds the types `TIME_NS` and `TIMESTAMPTZ_NS`. It also gives `VARIANT` its own tag in the native file format, because it had the tag of `LIST`.
+
+#2638, #2639 and #2640 make the pipelines cheaper: a sink that reads few rows of each chunk gets its sparse chunks as they come, and a filter on narrow packed codes compares sixteen codes to a register. #2642, #2646 and #2650 make TPC-H q03, q04 and q02 faster: q03 closes its groups on the one key that fixes the others, q04 walks each order to its lines, and in q02 a join handoff that is set aside lists the rows its keys reach.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.34
 
 This release continues the PostgreSQL work inside PG2 (#2490) and has engine speed work and a new type.
