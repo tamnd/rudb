@@ -115,6 +115,7 @@ mod foreign;
 mod journal;
 mod mirror;
 mod prepared;
+mod recluster;
 mod result;
 mod settings;
 mod statements;
