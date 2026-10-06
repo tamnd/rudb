@@ -611,6 +611,7 @@ fn serve(
         zone: Zone::of("UTC"),
         zone_name: "UTC".to_owned(),
         utf8: true,
+        least: Severity::Notice,
         seen: u64::MAX,
         encoder: RowEncoder::default(),
         implicit: false,
@@ -856,6 +857,8 @@ struct Runner {
     zone: Zone,
     zone_name: String,
     utf8: bool,
+    /// The least severity of a notice that the client gets, from `client_min_messages`.
+    least: Severity,
     /// The generation of `guc` that `format` and `zone` come from.
     seen: u64,
     encoder: RowEncoder,
@@ -906,14 +909,23 @@ enum Outcome {
     Done(CommandTag),
 }
 
-/// Writes a `NoticeResponse` with the severity `WARNING`.
-fn warning(out: &mut OutBuf, sqlstate: &str, message: &str) {
-    out.notice_response(&[
-        (b'S', b"WARNING"),
-        (b'V', b"WARNING"),
-        (b'C', sqlstate.as_bytes()),
-        (b'M', message.as_bytes()),
-    ]);
+/// The severities of a `NoticeResponse` that `client_min_messages` chooses between. The levels
+/// below `NOTICE` are for messages that rudb does not send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Severity {
+    Notice,
+    Warning,
+    Error,
+}
+
+impl Severity {
+    fn word(self) -> &'static [u8] {
+        match self {
+            Self::Notice => b"NOTICE",
+            Self::Warning => b"WARNING",
+            Self::Error => b"ERROR",
+        }
+    }
 }
 
 /// The error for a statement in a failed transaction block.
@@ -1038,6 +1050,11 @@ impl Runner {
         self.format.bytea_output =
             if text("bytea_output") == "escape" { ByteaOutput::Escape } else { ByteaOutput::Hex };
         self.utf8 = text("client_encoding") != "SQL_ASCII";
+        self.least = match text("client_min_messages").as_str() {
+            "warning" => Severity::Warning,
+            "error" => Severity::Error,
+            _ => Severity::Notice,
+        };
         let zone_name = text("TimeZone");
         if zone_name != self.zone_name {
             self.zone = Zone::of(&zone_name);
@@ -1107,7 +1124,12 @@ impl Runner {
                     None => None,
                 };
                 if *local && state == Transaction::Idle && !self.implicit {
-                    warning(out, "25P01", "SET LOCAL can only be used in transaction blocks");
+                    self.notice(
+                        out,
+                        Severity::Warning,
+                        "25P01",
+                        "SET LOCAL can only be used in transaction blocks",
+                    );
                 }
                 let action = if *local { Action::Local } else { Action::Set };
                 self.guc.set(name, text.as_deref(), action, Origin::Statement).map_err(failure)?;
@@ -1290,12 +1312,17 @@ impl Runner {
             (Some(Control::Begin), Transaction::Open) => {
                 // A BEGIN in the implicit transaction makes it a transaction block.
                 if !std::mem::take(&mut self.implicit) {
-                    warning(out, "25001", "there is already a transaction in progress");
+                    self.notice(
+                        out,
+                        Severity::Warning,
+                        "25001",
+                        "there is already a transaction in progress",
+                    );
                 }
                 return Ok(Outcome::Done(CommandTag::Begin));
             }
             (Some(end @ (Control::Commit | Control::Rollback)), Transaction::Idle) => {
-                warning(out, "25P01", "there is no transaction in progress");
+                self.notice(out, Severity::Warning, "25P01", "there is no transaction in progress");
                 return Ok(Outcome::Done(end.tag()));
             }
             (Some(end @ (Control::Commit | Control::Rollback)), Transaction::Open)
@@ -1304,7 +1331,7 @@ impl Runner {
                 self.implicit = false;
                 let sql = if end == Control::Commit { "COMMIT" } else { "ROLLBACK" };
                 self.connection.execute(sql).map_err(|e| Failure::engine(&e, 0))?;
-                warning(out, "25P01", "there is no transaction in progress");
+                self.notice(out, Severity::Warning, "25P01", "there is no transaction in progress");
                 return Ok(Outcome::Done(end.tag()));
             }
             _ => {}
@@ -1318,7 +1345,24 @@ impl Runner {
             self.refresh();
             return done;
         }
-        run(&self.connection).map(Outcome::Result).map_err(|e| Failure::engine(&e, offset))
+        let result = run(&self.connection).map_err(|e| Failure::engine(&e, offset))?;
+        for notice in result.notices() {
+            self.notice(out, Severity::Notice, notice.sqlstate, &notice.message);
+        }
+        Ok(Outcome::Result(result))
+    }
+
+    /// Writes a `NoticeResponse`, if `client_min_messages` lets the client have it.
+    fn notice(&self, out: &mut OutBuf, severity: Severity, sqlstate: &str, message: &str) {
+        if severity < self.least {
+            return;
+        }
+        out.notice_response(&[
+            (b'S', severity.word()),
+            (b'V', severity.word()),
+            (b'C', sqlstate.as_bytes()),
+            (b'M', message.as_bytes()),
+        ]);
     }
 
     /// True when the server stops or `DROP DATABASE ... WITH (FORCE)` ends the session.

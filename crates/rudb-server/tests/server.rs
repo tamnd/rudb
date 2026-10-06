@@ -647,6 +647,54 @@ fn the_errors_of_the_extended_query_flow() {
 }
 
 #[test]
+fn a_name_that_if_exists_lets_go_gives_a_notice() {
+    let dirs = Dirs::new("skipping");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let notices = |messages: &[Message]| -> Vec<(String, String)> {
+        let notices = messages.iter().filter(|message| message.tag == b'N');
+        notices
+            .map(|message| {
+                assert_eq!(message.field(b'S').as_deref(), Some("NOTICE"));
+                (message.field(b'C').unwrap(), message.field(b'M').unwrap())
+            })
+            .collect()
+    };
+    let skipping = |kind: &str, name: &str| {
+        ("00000".to_owned(), format!("{kind} \"{name}\" does not exist, skipping"))
+    };
+
+    // One notice for each name, before the tag.
+    let messages = client.query("drop table if exists nx, ny");
+    assert_eq!(tags(&messages), "NNCZ");
+    assert_eq!(notices(&messages), [skipping("table", "nx"), skipping("table", "ny")]);
+    assert_eq!(notices(&client.query("drop view if exists nv")), [skipping("view", "nv")]);
+    assert_eq!(notices(&client.query("drop index if exists ni")), [skipping("index", "ni")]);
+    assert_eq!(notices(&client.query("drop schema if exists ns")), [skipping("schema", "ns")]);
+
+    // A name that is there gives a notice for a create that does nothing.
+    client.query("create table t (a integer)");
+    client.query("create index i on t (a)");
+    let exists =
+        |name: &str| ("42P07".to_owned(), format!("relation \"{name}\" already exists, skipping"));
+    assert_eq!(notices(&client.query("create table if not exists t (a integer)")), [exists("t")]);
+    assert_eq!(notices(&client.query("create index if not exists i on t (a)")), [exists("i")]);
+    let messages = client.query("drop table if exists t");
+    assert_eq!(tags(&messages), "CZ");
+
+    // client_min_messages above NOTICE keeps them from the client, and ERROR keeps warnings too.
+    client.query("set client_min_messages = warning");
+    assert_eq!(tags(&client.query("drop table if exists nx")), "CZ");
+    assert_eq!(tags(&client.query("commit")), "NCZ");
+    client.query("set client_min_messages = error");
+    assert_eq!(tags(&client.query("commit")), "CZ");
+    client.query("reset client_min_messages");
+    assert_eq!(tags(&client.query("drop table if exists nx")), "NCZ");
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_transaction_rules_of_postgres() {
     let dirs = Dirs::new("implicit");
     let server = Server::start(dirs.config()).unwrap();

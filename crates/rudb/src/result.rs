@@ -61,6 +61,33 @@ struct Body {
     held: Reservation,
     /// The session whose zone decides how zoned values are rendered.
     session: Session,
+    /// What the statement has to tell the client that is not an error, in the order it said it.
+    notices: Vec<Notice>,
+}
+
+/// A message a statement gives that is not an error, such as the one for a `DROP TABLE IF EXISTS`
+/// of a table that is not there. A PostgreSQL client gets it as a `NoticeResponse` with the
+/// severity `NOTICE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// The SQLSTATE, which is `00000` for most notices.
+    pub sqlstate: &'static str,
+    /// The text, in the words of PostgreSQL.
+    pub message: String,
+}
+
+impl Notice {
+    /// The notice for a name that a statement did not find and did not need.
+    #[must_use]
+    pub fn skipped(kind: &str, name: &str) -> Self {
+        Self { sqlstate: "00000", message: format!("{kind} \"{name}\" does not exist, skipping") }
+    }
+
+    /// The notice for a name that a statement found and did not make again.
+    #[must_use]
+    pub fn exists(sqlstate: &'static str, kind: &str, name: &str) -> Self {
+        Self { sqlstate, message: format!("{kind} \"{name}\" already exists, skipping") }
+    }
 }
 
 impl QueryResult {
@@ -80,7 +107,15 @@ impl QueryResult {
         }
         starts.push(rows);
         Self {
-            body: Arc::new(Body { names, types, chunks, starts, held, session: Session::new() }),
+            body: Arc::new(Body {
+                names,
+                types,
+                chunks,
+                starts,
+                held,
+                session: Session::new(),
+                notices: Vec::new(),
+            }),
             rows,
             metrics: None,
             changes: None,
@@ -112,6 +147,27 @@ impl QueryResult {
             body.session = session;
         }
         self
+    }
+
+    /// The same result, carrying the notices of the statement.
+    #[must_use]
+    pub(crate) fn noting(mut self, notices: Vec<Notice>) -> Self {
+        if notices.is_empty() {
+            return self;
+        }
+        // Called on a result made for the statement, which nothing else holds yet.
+        let body = Arc::get_mut(&mut self.body);
+        debug_assert!(body.is_some(), "notices given to a result already shared");
+        if let Some(body) = body {
+            body.notices = notices;
+        }
+        self
+    }
+
+    /// What the statement had to tell the client that is not an error.
+    #[must_use]
+    pub fn notices(&self) -> &[Notice] {
+        &self.body.notices
     }
 
     /// A value rendered under the session that produced this result.

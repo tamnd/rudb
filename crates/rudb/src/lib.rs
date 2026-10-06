@@ -130,7 +130,7 @@ pub use config::{Config, parse_size};
 pub use connection::{Connection, Transaction};
 pub use database::{Database, NativeExtremaValues};
 pub use prepared::{Description, Prepared};
-pub use result::QueryResult;
+pub use result::{Notice, QueryResult};
 pub use statements::{Statement, is_complete, statements};
 pub use syntax::{
     RowOrder, accepts, line_and_column, parses, row_order, split, statement_kind, statement_kinds,

@@ -27,7 +27,7 @@ use crate::config::Config;
 use crate::connection::{Connection, single};
 use crate::journal::{Change, Journal, Replayed};
 use crate::prepared::Prepared;
-use crate::result::QueryResult;
+use crate::result::{Notice, QueryResult};
 use crate::settings::{COMPILED_ENGINE, Settings, Visibility};
 use crate::txn::{self, Board, Open, Registry};
 use crate::{foreign, upsert};
@@ -6412,6 +6412,7 @@ impl Shared {
                     }
                 }
                 let name = create.name.clone();
+                let skipped = create.if_not_exists && catalog.entry(&name).is_ok();
                 self.creating(&name)?;
                 create_table(
                     sql,
@@ -6423,9 +6424,14 @@ impl Shared {
                     &seams,
                     &session,
                 )?;
+                let notices = if skipped {
+                    vec![Notice::exists("42P07", "relation", &name.table)]
+                } else {
+                    Vec::new()
+                };
                 self.created(name);
                 self.stage_ddl(ddl, sql);
-                Ok(QueryResult::empty())
+                Ok(QueryResult::empty().noting(notices))
             }
             Bound::CreateView(create) => {
                 create_view(create, &mut catalog)?;
@@ -6443,15 +6449,23 @@ impl Shared {
                     }
                 }
                 self.stage_ddl(ddl, sql);
-                Ok(QueryResult::empty())
+                let kind = if drop.kind == Entry::View { "view" } else { "table" };
+                let notices = drop.missing.iter().map(|name| Notice::skipped(kind, name)).collect();
+                Ok(QueryResult::empty().noting(notices))
             }
             Bound::Schema(change) => {
                 let there = catalog.has_schema(&change.catalog, &change.name);
                 if change.drop {
                     if there || !change.quiet {
                         catalog.drop_schema(&change.catalog, &change.name, change.cascade)?;
+                        return Ok(QueryResult::empty());
                     }
-                    return Ok(QueryResult::empty());
+                    let skipped = Notice::skipped("schema", &change.name);
+                    return Ok(QueryResult::empty().noting(vec![skipped]));
+                }
+                if there && change.quiet {
+                    let skipped = Notice::exists("42P06", "schema", &change.name);
+                    return Ok(QueryResult::empty().noting(vec![skipped]));
                 }
                 // The native file keeps every table under its bare name and has nowhere to say
                 // which schema one is in, so a schema other than `main` in it would come back as
@@ -6460,9 +6474,6 @@ impl Shared {
                     return Err(Error::not_implemented(
                         "CREATE SCHEMA in a database file, which holds only the main schema so far",
                     ));
-                }
-                if there && change.quiet {
-                    return Ok(QueryResult::empty());
                 }
                 if there && change.or_replace {
                     catalog.drop_schema(&change.catalog, &change.name, false)?;
@@ -6562,18 +6573,25 @@ impl Shared {
                 Ok(QueryResult::empty())
             }
             Bound::Index(change) => {
+                let mut notices = Vec::new();
                 // The native file keeps no keys yet, and an index is kept the way a key is, so one
                 // in a database file lasts until it is closed.
                 match (change.table, change.index) {
                     (Some(table), Some(index)) => {
-                        catalog.create_index(&table, index, change.quiet)?;
+                        let name = index.name.clone();
+                        if !catalog.create_index(&table, index, change.quiet)? {
+                            notices.push(Notice::exists("42P07", "relation", &name));
+                        }
                     }
                     _ => {
                         let parts: Vec<&str> = change.name.iter().map(String::as_str).collect();
-                        catalog.drop_index(&parts, change.quiet)?;
+                        if !catalog.drop_index(&parts, change.quiet)? {
+                            let name = parts.last().copied().unwrap_or_default();
+                            notices.push(Notice::skipped("index", name));
+                        }
                     }
                 }
-                Ok(QueryResult::empty())
+                Ok(QueryResult::empty().noting(notices))
             }
             Bound::Insert(mut insert) => {
                 // The source runs to completion before anything is appended, which is not an
