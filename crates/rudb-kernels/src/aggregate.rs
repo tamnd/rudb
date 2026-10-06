@@ -2648,6 +2648,10 @@ pub struct PlaceSums {
     calls: Vec<(usize, Feed, i64)>,
     /// The codes or values of the chunk's rows for each of those calls, in the same order.
     values: Vec<Vec<u64>>,
+    /// By call, whether its codes are still in its packed input rather than in [`Self::values`].
+    /// They are read out the first time a pass wants them, and a pass over two packed calls by
+    /// place reads them where they are and never does.
+    pending: u64,
     /// The calls that want the row count and no value.
     counting: Vec<usize>,
     /// Per place of the map and one more for the rows the filter dropped, the same cells as
@@ -2689,6 +2693,7 @@ impl PlaceSums {
         self.calls.clear();
         self.counting.clear();
         self.cells.clear();
+        self.pending = 0;
         if rows >= 1 << 31 {
             return false;
         }
@@ -2728,7 +2733,7 @@ impl PlaceSums {
                     if packed.width() > 32 {
                         return false;
                     }
-                    packed.unpack(0, values);
+                    self.pending |= 1 << self.calls.len();
                     (feed, base)
                 }
                 None => return false,
@@ -2739,12 +2744,30 @@ impl PlaceSums {
         took == wanted
     }
 
+    /// Reads the codes of every call [`Self::ready`] left in its packed input into
+    /// [`Self::values`], out of the same `inputs`.
+    fn read_pending(&mut self, inputs: &[Option<&Vector>]) -> Result<()> {
+        for (at, &(offset, ..)) in self.calls.iter().enumerate() {
+            if self.pending >> at & 1 == 0 {
+                continue;
+            }
+            let Some(packed) = inputs.get(offset).copied().flatten().and_then(Vector::packed_parts)
+            else {
+                return Err(Error::internal("a summed call lost its packed input".to_string()));
+            };
+            packed.unpack(0, &mut self.values[at]);
+        }
+        self.pending = 0;
+        Ok(())
+    }
+
     /// Adds the rows from `from` on into the group the map holds at each row's place, and gives the
     /// first kept row whose place holds no group yet, or the end.
     ///
     /// `places` is each row's place in `map`, one for every row [`Self::ready`] read, and `kept` the
-    /// rows the filter kept, in order, when it dropped any. The caller opens a group for the row
-    /// handed back, writes it into the map, and asks again from that row.
+    /// rows the filter kept, in order, when it dropped any. `inputs` are the ones [`Self::ready`]
+    /// was given. The caller opens a group for the row handed back, writes it into the map, and
+    /// asks again from that row.
     ///
     /// # Errors
     ///
@@ -2756,7 +2779,9 @@ impl PlaceSums {
         places: &[u32],
         kept: Option<&[u32]>,
         from: usize,
+        inputs: &[Option<&Vector>],
     ) -> Result<usize> {
+        self.read_pending(inputs)?;
         let values = &self.values[..self.calls.len()];
         let cells = &mut self.cells;
         macro_rules! widths {
@@ -2822,6 +2847,7 @@ impl PlaceSums {
         places: &mut [u32],
         kept: Option<&[u32]>,
         combos: usize,
+        inputs: &[Option<&Vector>],
     ) -> Result<()> {
         let needed = (combos + 1) * cell_span(self.calls.len());
         let Ok(past) = u32::try_from(combos) else {
@@ -2844,6 +2870,10 @@ impl PlaceSums {
             }
             fill_dropped(kept, places, past);
         }
+        if self.pairs_in_place(places, needed, inputs)? {
+            return Ok(());
+        }
+        self.read_pending(inputs)?;
         let values = &self.values[..self.calls.len()];
         let cells = &mut self.by_place[..needed];
         macro_rules! widths {
@@ -2855,6 +2885,42 @@ impl PlaceSums {
             };
         }
         widths!(0 1, 1 2, 2 4, 3 4, 4 8, 5 8, 6 8, 7 8, 8 16)
+    }
+
+    /// Adds two packed calls by place straight out of their packed inputs, and says whether it did.
+    ///
+    /// q01 sums `l_quantity` and `l_extendedprice`, and reading their codes out into two vectors of
+    /// words before the pass was a store and a load of sixteen bytes a row. Here eight rows of each
+    /// are read out of the words in lanes and added where they stand. See
+    /// `spec/perf/125-pairs-out-of-packed-codes.md`.
+    fn pairs_in_place(
+        &mut self,
+        places: &[u32],
+        needed: usize,
+        inputs: &[Option<&Vector>],
+    ) -> Result<bool> {
+        let &[(first, ..), (second, ..)] = &self.calls[..] else { return Ok(false) };
+        if self.pending != 0b11 {
+            return Ok(false);
+        }
+        let packed = |offset: usize| inputs.get(offset).copied().flatten().and_then(Vector::packed_parts);
+        let (Some(first), Some(second)) = (packed(first), packed(second)) else {
+            return Ok(false);
+        };
+        let cells = self.by_place[..needed].as_chunks_mut::<4>().0;
+        let done = rudb_vector::vector::add_packed_pairs_by_place(cells, &first, &second, places);
+        if done == 0 {
+            return Ok(false);
+        }
+        for (row, &place) in places.iter().enumerate().skip(done) {
+            let Some(cell) = cells.get_mut(place as usize) else {
+                return Err(Error::internal(format!("place {place} is past the map")));
+            };
+            cell[0] = cell[0].wrapping_add(first.code(row) as i64);
+            cell[1] = cell[1].wrapping_add(second.code(row) as i64);
+            cell[2] += 1;
+        }
+        Ok(true)
     }
 
     /// Writes down the places [`Self::add_places`] added rows into, and says whether `map` has no
@@ -6539,7 +6605,7 @@ mod tests {
         let mut row = 0;
         let mut asked = 0;
         loop {
-            row = sums.add(&map, &places, Some(&kept), row).expect("adds them up");
+            row = sums.add(&map, &places, Some(&kept), row, &inputs).expect("adds them up");
             if row == rows {
                 break;
             }
@@ -6565,7 +6631,7 @@ mod tests {
         for chunk in 0..3 {
             assert!(sums.ready(&each_place, stride, &inputs, wanted, rows));
             let mut cut = places.clone();
-            sums.add_places(&mut cut, Some(&kept), groups).expect("adds them up");
+            sums.add_places(&mut cut, Some(&kept), groups, &inputs).expect("adds them up");
             // The first chunk has no places from before and looks at every place. The second
             // finds its places among the first's, and the third is left one of them to ask first,
             // so its rows add up short and it looks at every place again.
