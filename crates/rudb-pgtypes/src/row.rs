@@ -74,6 +74,9 @@ enum Kind {
     /// The `numeric` of PostgreSQL, in the bytes of `rudb_common::numeric`.
     Numeric,
     Text,
+    /// A `char(n)`, which goes out padded with spaces to n characters in both formats. The value
+    /// is kept with no trailing spaces.
+    Bpchar(u32),
     Bytea,
     Date,
     Time,
@@ -242,6 +245,7 @@ impl Kind {
             Kind::Decimal(_)
             | Kind::Numeric
             | Kind::Text
+            | Kind::Bpchar(_)
             | Kind::Bytea
             | Kind::Array
             | Kind::Vector
@@ -322,9 +326,23 @@ impl RowEncoder {
     /// binary format when its flag is true. A pair that the encoder cannot send is an error, which
     /// is a bug in the binder.
     pub fn new(columns: &[(LogicalType, Oid, bool)]) -> Result<RowEncoder, TypeError> {
+        RowEncoder::with_typmods(columns, &[])
+    }
+
+    /// [`RowEncoder::new`] with the typmod of each column. A `char(n)` column pads its values to
+    /// n characters. A column with no typmod in `typmods` has the typmod -1.
+    pub fn with_typmods(
+        columns: &[(LogicalType, Oid, bool)],
+        typmods: &[i32],
+    ) -> Result<RowEncoder, TypeError> {
         let plans = columns
             .iter()
-            .map(|(logical, oid, binary)| {
+            .enumerate()
+            .map(|(c, (logical, oid, binary))| {
+                let typmod = typmods.get(c).copied().unwrap_or(-1);
+                if *oid == oids::BPCHAR && *logical == LogicalType::Varchar && typmod >= 4 {
+                    return Ok(Kind::Bpchar((typmod - 4) as u32).plan(*binary, None));
+                }
                 let kind = Kind::of(logical, *oid).ok_or_else(|| {
                     TypeError::new(
                         SqlState::FEATURE_NOT_SUPPORTED,
@@ -658,6 +676,13 @@ fn stage_column(
                 })?;
             }
         }
+        (Kind::Bpchar(n), _) => {
+            let Data::Varlen(strings) = data else { return Err(wrong_data(plan)) };
+            for i in rows {
+                let bytes = strings.bytes(start + i).ok_or_else(|| wrong_data(plan))?;
+                stage(lens, staged, i, |out| bpchar_out(bytes, n as usize, out))?;
+            }
+        }
         (Kind::Bytea, _) => {
             let Data::Varlen(strings) = data else { return Err(wrong_data(plan)) };
             let style = settings.bytea_output;
@@ -829,6 +854,17 @@ fn reg_out(kind: RegKind, oid: Oid, out: &mut Vec<u8>) {
 }
 
 /// Writes one staged value and keeps its length.
+/// A `char(n)` value padded with spaces to n characters. A longer value goes out as it is.
+fn bpchar_out(bytes: &[u8], n: usize, out: &mut Vec<u8>) {
+    out.extend_from_slice(bytes);
+    // Most values are ASCII, and then the byte length is the character count.
+    let chars = match bytes.is_ascii() {
+        true => bytes.len(),
+        false => bytes.iter().filter(|&&b| (b as i8) >= -0x40).count(),
+    };
+    out.resize(out.len() + n.saturating_sub(chars), b' ');
+}
+
 fn stage(
     lens: &mut [i32],
     staged: &mut Vec<u8>,
@@ -1014,6 +1050,7 @@ fn fixed(
         Kind::Decimal(_)
         | Kind::Numeric
         | Kind::Text
+        | Kind::Bpchar(_)
         | Kind::Bytea
         | Kind::Array
         | Kind::Vector
@@ -1543,6 +1580,31 @@ mod tests {
         crate::array::oidvector_send(&[23, 25], &mut expected);
         assert_eq!(binary[0][1].as_deref(), Some(&expected[..]));
         assert_eq!(binary[0][2].as_deref(), Some(&23u32.to_be_bytes()[..]));
+    }
+
+    #[test]
+    fn a_char_column_is_padded_to_its_length() {
+        let zone = FixedZone::utc();
+        let settings = settings(&zone);
+        let values = ["ab", "", "é", "abcd"].map(|v| Value::Varchar(v.into()));
+        let mut values = values.to_vec();
+        values.push(Value::Null);
+        let column = Vector::from_values(LogicalType::Varchar, &values).unwrap();
+        for binary in [false, true] {
+            let columns = [(LogicalType::Varchar, oids::BPCHAR, binary)];
+            let mut encoder = RowEncoder::with_typmods(&columns, &[8]).unwrap();
+            let mut out = Vec::new();
+            encoder.encode(std::slice::from_ref(&column), 0..5, &settings, &mut out).unwrap();
+            let values: Vec<_> = decode(&out).into_iter().map(|row| row[0].clone()).collect();
+            let padded = ["ab  ", "    ", "é   ", "abcd"].map(|v| Some(v.as_bytes().to_vec()));
+            assert_eq!(values[..4], padded);
+            assert_eq!(values[4], None);
+        }
+        // A `bpchar` with no length is sent as it is.
+        let mut encoder = RowEncoder::new(&[(LogicalType::Varchar, oids::BPCHAR, false)]).unwrap();
+        let mut out = Vec::new();
+        encoder.encode(std::slice::from_ref(&column), 0..1, &settings, &mut out).unwrap();
+        assert_eq!(decode(&out)[0][0], Some(b"ab".to_vec()));
     }
 
     #[test]

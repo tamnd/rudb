@@ -127,7 +127,8 @@ pub fn param_value(
 /// The value of a column of the type `ty` from one field of `COPY FROM`, in the text format, or in
 /// the binary format when `binary` is set. The typmod of the column applies as the input function
 /// applies it: a `numeric(p, s)` is rounded to its scale or is an error when it does not fit, and
-/// a `varchar(n)` or a `char(n)` that is too long is an error.
+/// a `varchar(n)` or a `char(n)` that is too long is an error. A `char(n)` value loses its
+/// trailing spaces.
 ///
 /// # Errors
 ///
@@ -147,9 +148,7 @@ pub fn column_value(
             oids::VARCHAR if typmod >= 0 => {
                 Value::Varchar(varchar_in(recv.text()?, typmod)?.to_owned())
             }
-            oids::BPCHAR if typmod >= 0 => {
-                Value::Varchar(bpchar_in(recv.text()?, typmod)?.into_owned())
-            }
+            oids::BPCHAR if typmod >= 0 => bpchar_value(recv.text()?, typmod)?,
             _ => binary_value(oid, &mut recv)?,
         };
         if recv.remaining() > 0 {
@@ -164,9 +163,15 @@ pub fn column_value(
     Ok(match oid {
         oids::NUMERIC => numeric(&numeric_in(text, typmod)?),
         oids::VARCHAR if typmod >= 0 => Value::Varchar(varchar_in(text, typmod)?.to_owned()),
-        oids::BPCHAR if typmod >= 0 => Value::Varchar(bpchar_in(text, typmod)?.into_owned()),
+        oids::BPCHAR if typmod >= 0 => bpchar_value(text, typmod)?,
         _ => text_value(oid, text, settings)?,
     })
+}
+
+/// A `char(n)` value as rudb keeps it, with no trailing spaces. The encoder of the rows pads it.
+fn bpchar_value(text: &str, typmod: i32) -> Result<Value, TypeError> {
+    bpchar_in(text, typmod)?;
+    Ok(Value::Varchar(text.trim_end_matches(' ').to_owned()))
 }
 
 fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Value, TypeError> {
@@ -340,6 +345,30 @@ mod tests {
             interval_style: IntervalStyle::Postgres,
         };
         param_value(oid, binary, data, 1, &settings)
+    }
+
+    #[test]
+    fn a_char_column_value_has_no_trailing_spaces() {
+        let zone = FixedZone::utc();
+        let settings = InputSettings {
+            datetime: DateTimeInput {
+                order: DateOrder::Mdy,
+                zone: &zone,
+                zones: &NoZones,
+                abbrevs: ZoneAbbrevs::postgres_default(),
+                now: 0,
+            },
+            interval_style: IntervalStyle::Postgres,
+        };
+        let ty = PgType { oid: oids::BPCHAR, typmod: 8 };
+        for binary in [false, true] {
+            for (data, kept) in [(&b"ab"[..], "ab"), (b"ab  ", "ab"), (b"abcd    ", "abcd")] {
+                let value = column_value(ty, binary, data, &settings).unwrap();
+                assert_eq!(value, Value::Varchar(kept.into()));
+            }
+            let error = column_value(ty, binary, b"abcde", &settings).unwrap_err();
+            assert_eq!(error.message, "value too long for type character(4)");
+        }
     }
 
     #[test]

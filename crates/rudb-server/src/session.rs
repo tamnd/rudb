@@ -1669,7 +1669,8 @@ impl Runner {
             fields: None,
             position: None,
         };
-        self.encoder = match RowEncoder::new(&columns) {
+        let typmods: Vec<i32> = types.iter().map(|ty| ty.typmod).collect();
+        self.encoder = match RowEncoder::with_typmods(&columns, &typmods) {
             Ok(encoder) => encoder,
             Err(error) => return Ok(Err(type_failure(error))),
         };

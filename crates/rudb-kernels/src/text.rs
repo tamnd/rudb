@@ -221,8 +221,10 @@ pub(crate) fn chr(code: &Value) -> Result<Value> {
 /// The length rules of the PostgreSQL string types, which the binder of a PostgreSQL session adds
 /// to a cast and to a store into a column. `__rudb_pg_name` cuts text to the 63 bytes of a `name`.
 /// `__rudb_pg_varchar` and `__rudb_pg_bpchar` take the typmod of the column and refuse a value
-/// that is too long with `22001`, unless the extra characters are spaces, which they remove. The
-/// padding of `char(n)` comes with PG2, so `__rudb_pg_bpchar` does not pad yet.
+/// that is too long with `22001`, unless the extra characters are spaces, which they remove.
+/// `__rudb_pg_bpchar_cut` is the explicit cast to `char(n)`, which cuts a longer value with no
+/// error. A `char(n)` value is kept with no trailing spaces, as they do not count in a compare, in
+/// `length()` or in a cast to text. The encoder of the rows pads it to n characters.
 pub(crate) fn postgres(name: &str, args: &[Value]) -> Result<Option<Value>> {
     let text = match args.first() {
         Some(Value::Null) => return Ok(Some(Value::Null)),
@@ -231,13 +233,17 @@ pub(crate) fn postgres(name: &str, args: &[Value]) -> Result<Option<Value>> {
     };
     let kept = match (name, args) {
         ("__rudb_pg_name", [_]) => rudb_pgtypes::name_in(string(text)?),
-        ("__rudb_pg_varchar" | "__rudb_pg_bpchar", [_, typmod]) => {
+        ("__rudb_pg_varchar", [_, typmod]) => {
+            rudb_pgtypes::varchar_coerce(string(text)?, whole(typmod)? as i32, false)?
+        }
+        ("__rudb_pg_bpchar" | "__rudb_pg_bpchar_cut", [_, typmod]) => {
+            let explicit = name == "__rudb_pg_bpchar_cut";
             let text = string(text)?;
             let typmod = whole(typmod)? as i32;
-            if name == "__rudb_pg_bpchar" {
+            if !explicit {
                 rudb_pgtypes::bpchar_coerce(text, typmod, false)?;
             }
-            rudb_pgtypes::varchar_coerce(text, typmod, name == "__rudb_pg_bpchar")?
+            rudb_pgtypes::varchar_coerce(text, typmod, true)?.trim_end_matches(' ')
         }
         _ => return Ok(None),
     };

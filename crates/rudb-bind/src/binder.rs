@@ -1364,7 +1364,7 @@ impl<'a> Binder<'a> {
     }
 
     /// The column a projected expression passes straight through from below, if it is one.
-    fn through<'s>(&self, expr: ExprRef, input: &'s Scope) -> Option<&'s Visible> {
+    pub(crate) fn through<'s>(&self, expr: ExprRef, input: &'s Scope) -> Option<&'s Visible> {
         let Expr::Column(binding) = *self.plan.expr(expr) else { return None };
         input.columns.iter().find(|column| column.binding == binding)
     }

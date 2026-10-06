@@ -12,7 +12,8 @@ use rudb_catalog::{Catalog, DEFAULT_CATALOG, Entry, Key, KeyLog, QualifiedName, 
 use rudb_common::session::Postgres;
 use rudb_common::stat::Provenance;
 use rudb_common::{
-    Cancel, Clustering, Error, Field, LogicalType, Memory, Result, Rule, Session, Value,
+    Cancel, Clustering, DeclaredType, Error, Field, LogicalType, Memory, Result, Rule, Session,
+    Value,
 };
 use rudb_io::{Filesystem, RealFilesystem};
 use rudb_metrics::{Document, LoadProfile, Report, Span, Stage};
@@ -4213,19 +4214,20 @@ impl Shared {
             None => direct_targets(&catalog, direct)?,
         };
         let journals = self.journals(&name);
-        let fields = catalog.table(&name).ok()?.columns();
+        let table = catalog.table(&name).ok()?;
+        let fields = table.columns();
         // The values as they were given are the row when there is one row with one for each
         // column, in order, and each is already its column's type, and then the table reads them
         // where they are. Anything else is gathered into rows of their own, which copies every
         // value.
         let built: Vec<Vec<Value>>;
-        let rows: Vec<&[Value]> = match as_given(direct, given, &targets, fields) {
+        let rows: Vec<&[Value]> = match as_given(direct, given, &targets, table) {
             Some(values) => vec![values],
             None => {
                 built = direct
                     .rows
                     .iter()
-                    .map(|items| typed_row(items, given, &targets, fields))
+                    .map(|items| typed_row(items, given, &targets, table))
                     .collect::<Option<_>>()?;
                 built.iter().map(Vec::as_slice).collect()
             }
@@ -4302,6 +4304,9 @@ impl Shared {
             }
         };
         let table = catalog.table(&target.name).ok()?;
+        if !keys_fit(table, &target.key, &values) {
+            return None;
+        }
         let mut unanswered = false;
         let result = kept(sql, 0, |_| {
             let Some(point) = table.point(&target.key, &values, &target.columns)? else {
@@ -4497,7 +4502,7 @@ impl Shared {
         let table = catalog.table(&name).ok()?;
         let fields = table.columns();
         let [items] = upsert.insert.rows.as_slice() else { return None };
-        let row = typed_row(items, given, &targets, fields)?;
+        let row = typed_row(items, given, &targets, table)?;
         if row.iter().zip(fields).any(|(value, field)| value.is_null() && field.not_null) {
             return None;
         }
@@ -4547,7 +4552,9 @@ impl Shared {
         // A value of the column at `at`, as the plan's cast to it would leave it.
         let typed = |value: Value, at: usize| {
             let ty = &fields[at].ty;
-            if value.is_null() || value.is_of(ty) {
+            if !fits_declared(&value, table.declared_type(at)) {
+                None
+            } else if value.is_null() || value.is_of(ty) {
                 Some(value)
             } else if widens(&value.logical_type(), ty) {
                 rudb_kernels::cast::cast_value(&value, ty, false).ok()
@@ -4703,7 +4710,7 @@ impl Shared {
         let name = &target.name;
         let sets = target.sets.as_slice();
         let table = catalog.table(name).ok()?;
-        if !writes_in_place(&catalog, &target) {
+        if !writes_in_place(&catalog, &target) || !keys_fit(table, &target.key, &keys) {
             return None;
         }
         let Some((spot, row)) = table.spot(&target.key, &keys, &target.columns).ok()?? else {
@@ -4726,7 +4733,9 @@ impl Shared {
             let value = match set {
                 Set::To(item) => {
                     let value = given.value(item)?;
-                    if value.is_null() || value.is_of(ty) {
+                    if !fits_declared(&value, table.declared_type(column)) {
+                        return None;
+                    } else if value.is_null() || value.is_of(ty) {
                         value
                     } else if widens(&value.logical_type(), ty) {
                         rudb_kernels::cast::cast_value(&value, ty, false).ok()?
@@ -7559,13 +7568,16 @@ fn typed_row(
     items: &[crate::prepared::Item],
     given: crate::prepared::Given<'_>,
     targets: &[usize],
-    fields: &[Field],
+    table: &rudb_catalog::Table,
 ) -> Option<Vec<Value>> {
+    let fields = table.columns();
     let mut row = vec![Value::Null; fields.len()];
     for (item, &at) in items.iter().zip(targets) {
         let value = given.value(item)?;
         let ty = &fields[at].ty;
-        let value = if value.is_null() {
+        let value = if !fits_declared(&value, table.declared_type(at)) {
+            return None;
+        } else if value.is_null() {
             Value::Null
         } else if value.is_of(ty) {
             value
@@ -7586,8 +7598,9 @@ fn as_given<'a>(
     direct: &crate::prepared::Direct,
     given: crate::prepared::Given<'a>,
     targets: &[usize],
-    fields: &[Field],
+    table: &rudb_catalog::Table,
 ) -> Option<&'a [Value]> {
+    let fields = table.columns();
     use crate::prepared::{Given, Item};
     let Given::Positional(values) = given else { return None };
     let [items] = direct.rows.as_slice() else { return None };
@@ -7596,10 +7609,35 @@ fn as_given<'a>(
         && items.iter().zip(targets).enumerate().all(|(column, (item, &at))| {
             at == column && matches!(item, Item::Parameter(_, Some(place)) if *place == column)
         })
-        && values.iter().zip(fields).all(|(value, field)| {
-            if value.is_null() { !field.not_null } else { value.is_of(&field.ty) }
+        && values.iter().zip(fields).enumerate().all(|(at, (value, field))| {
+            let typed = if value.is_null() { !field.not_null } else { value.is_of(&field.ty) };
+            typed && fits_declared(value, table.declared_type(at))
         });
     fits.then_some(values)
+}
+
+/// Whether a string goes into a column of this PostgreSQL type with no change. A `name` holds at
+/// most 63 bytes, and a `varchar(n)` or a `char(n)` at most n characters. A `char(n)` value is
+/// kept with no trailing spaces. A value that the length rule of its type cuts, refuses or changes
+/// is left to the plan, which applies the rule. A string of n bytes or less has n characters or
+/// less, so the check counts no characters.
+fn fits_declared(value: &Value, declared: Option<DeclaredType>) -> bool {
+    const NAME: u32 = 19;
+    const BPCHAR: u32 = 1042;
+    const VARCHAR: u32 = 1043;
+    let (Value::Varchar(text), Some(declared)) = (value, declared) else { return true };
+    let max = match declared.oid {
+        NAME => 63,
+        VARCHAR | BPCHAR if declared.typmod >= 4 => (declared.typmod - 4) as usize,
+        _ => return true,
+    };
+    text.len() <= max && !(declared.oid == BPCHAR && text.ends_with(' '))
+}
+
+/// Whether the key values of a point read or a point write fit the key columns as
+/// [`fits_declared`] has it.
+fn keys_fit(table: &rudb_catalog::Table, key: &[usize], values: &[Value]) -> bool {
+    key.iter().zip(values).all(|(&at, value)| fits_declared(value, table.declared_type(at)))
 }
 
 fn direct_targets(

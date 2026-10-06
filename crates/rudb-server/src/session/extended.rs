@@ -1073,15 +1073,18 @@ fn format_of(formats: &[i16], at: usize) -> i16 {
 /// The encoder of the rows of `result` in `formats`, one for each column, or one or none for all.
 fn encoder(result: &QueryResult, formats: &[i16], sql: &Arc<str>) -> Result<RowEncoder, Problem> {
     let mut columns = Vec::with_capacity(result.width());
+    let mut typmods = Vec::with_capacity(result.width());
     for (i, logical) in result.types().iter().enumerate() {
         let format = format_of(formats, i);
         if format != 0 && format != 1 {
             return Err(error("22023", format!("unsupported format code: {format}")));
         }
-        let oid = column_type(logical, result.origin(i)).oid;
-        columns.push((logical.clone(), oid, format == 1));
+        let ty = column_type(logical, result.origin(i));
+        columns.push((logical.clone(), ty.oid, format == 1));
+        typmods.push(ty.typmod);
     }
-    RowEncoder::new(&columns).map_err(|e| Problem::failure(type_failure(e, None), sql))
+    RowEncoder::with_typmods(&columns, &typmods)
+        .map_err(|e| Problem::failure(type_failure(e, None), sql))
 }
 
 /// The chunk of row `row`, counted from 0, and the place of the row in it. `walk` is the chunk
