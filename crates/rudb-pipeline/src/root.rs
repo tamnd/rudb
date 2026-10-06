@@ -20,8 +20,8 @@
 //! never turns into an answer change nobody meant to make.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
 use rudb_common::{Error, Result};
@@ -53,6 +53,17 @@ struct Shared {
     /// would see it. It is the last copy a query makes, and on a query with a large answer it is a
     /// real part of the time.
     flattened: AtomicU64,
+    /// How many ready rows make a worker wait in the sink, or zero when no worker waits. See
+    /// [`RootReader::streaming`].
+    bound: AtomicUsize,
+    /// Wakes the reader when half the bound is ready or the run ends.
+    filled: Condvar,
+    /// Wakes the workers that wait for room when the reader takes the ready rows or goes away.
+    room: Condvar,
+    /// The run of the query returned, with or without an error. See [`RootReader::end`].
+    ended: AtomicBool,
+    /// The reader will take no more chunks. See [`RootReader::close`].
+    closed: AtomicBool,
 }
 
 /// Everything the root holds under one lock.
@@ -60,6 +71,11 @@ struct Shared {
 struct Queue {
     /// Chunks the reader may take, in the order it will get them.
     ready: VecDeque<Chunk>,
+    /// The rows in `ready`, counted only on a streaming root.
+    rows: usize,
+    /// The rows that wait in the order for the morsels in front of them, counted only on a
+    /// streaming root.
+    held: usize,
     /// Set when this root restores the source order, `None` when it hands chunks on as they come.
     order: Option<Order>,
 }
@@ -206,7 +222,12 @@ fn build(
         ordered: order.is_some(),
         flatten: AtomicBool::new(false),
         flattened: AtomicU64::new(0),
-        queue: Mutex::new(Queue { ready: VecDeque::new(), order }),
+        bound: AtomicUsize::new(0),
+        filled: Condvar::new(),
+        room: Condvar::new(),
+        ended: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
+        queue: Mutex::new(Queue { ready: VecDeque::new(), rows: 0, held: 0, order }),
     });
     (RootSink { shared: Arc::clone(&shared) }, RootReader { shared })
 }
@@ -228,6 +249,60 @@ impl RootSink {
             return flat;
         }
         Ok(chunk.clone())
+    }
+
+    /// On a streaming root, counts the chunks that became ready after the first `before`, wakes
+    /// the reader when half the bound is ready, and waits while the ready rows are at the bound.
+    ///
+    /// The wait is the backpressure of a caller that sends the rows on while the query runs: a
+    /// worker does not make more rows until the reader took the ones that are ready. The reader is
+    /// never a worker, so it can always take them and the wait cannot become a deadlock. The reader
+    /// takes all the ready rows at once and wakes at half the bound, not at each chunk, because a
+    /// query can give chunks of a few rows and a wake for each of them costs more than the rows.
+    /// On a streaming root that restores the order, waits while the rows that are ready and the
+    /// rows that wait in the order are at the bound. Without it the workers on the morsels behind
+    /// a slow one fill the order with the whole result. The worker on the morsel in front never
+    /// waits here, so the order always moves.
+    fn held_back<'q>(
+        &self,
+        mut queue: MutexGuard<'q, Queue>,
+        morsel: u64,
+        bound: usize,
+    ) -> Result<MutexGuard<'q, Queue>> {
+        while queue.rows + queue.held >= bound
+            && queue.order.as_ref().is_some_and(|order| order.next != morsel)
+        {
+            if self.shared.closed.load(Ordering::Acquire) {
+                return Err(Error::interrupt("the reader of the result went away"));
+            }
+            queue = self.shared.room.wait(queue).map_err(poisoned)?;
+        }
+        Ok(queue)
+    }
+
+    fn settle(&self, mut queue: MutexGuard<'_, Queue>, before: usize) -> Result<()> {
+        let bound = self.shared.bound.load(Ordering::Relaxed);
+        if bound == 0 {
+            return Ok(());
+        }
+        let added: usize = queue.ready.range(before..).map(Chunk::len).sum();
+        queue.rows += added;
+        if added > 0 && queue.rows >= bound / 2 {
+            self.shared.filled.notify_one();
+        }
+        if queue.order.is_some() {
+            // The rows came out of the order, and the morsel in front can be another one now, so
+            // a worker that waits to put its rows in the order looks again.
+            queue.held = queue.held.saturating_sub(added);
+            self.shared.room.notify_all();
+        }
+        while queue.rows >= bound {
+            if self.shared.closed.load(Ordering::Acquire) {
+                return Err(Error::interrupt("the reader of the result went away"));
+            }
+            queue = self.shared.room.wait(queue).map_err(poisoned)?;
+        }
+        Ok(())
     }
 }
 
@@ -252,7 +327,8 @@ impl Sink for RootSink {
 
     fn at(&self, morsel: &Morsel, place: &mut RootPlace) -> Result<()> {
         let mut queue = self.shared.queue.lock().map_err(poisoned)?;
-        let Queue { ready, order } = &mut *queue;
+        let before = queue.ready.len();
+        let Queue { ready, order, .. } = &mut *queue;
         if let Some(order) = order.as_mut() {
             // Taking a morsel is also finishing the one before it, because an instance reads one at
             // a time, and finishing one is what lets the chunks behind it go.
@@ -261,6 +337,7 @@ impl Sink for RootSink {
             }
             order.release(ready);
         }
+        self.settle(queue, before)?;
         place.morsel = Some(morsel.index());
         place.at = 0;
         Ok(())
@@ -285,11 +362,12 @@ impl Sink for RootSink {
         if full(queue.ready.len()) {
             return Ok(Progress::Blocked(Blocked::Downstream(self.shared.buffer)));
         }
-        let Queue { ready, order } = &mut *queue;
-        let Some(order) = order.as_mut() else {
-            ready.push_back(taken);
+        let before = queue.ready.len();
+        if queue.order.is_none() {
+            queue.ready.push_back(taken);
+            self.settle(queue, before)?;
             return Ok(Progress::More);
-        };
+        }
         // An order restoring root whose driver never said which morsel this came from has nowhere to
         // put it, and picking a place would be a silently reordered answer rather than a slow one.
         // The driver calls `at` before it reads, so this is a driver that does not.
@@ -297,6 +375,14 @@ impl Sink for RootSink {
             return Err(Error::internal(
                 "the root was told to keep the source order by a driver that does not say which morsel a chunk came from",
             ));
+        };
+        let bound = self.shared.bound.load(Ordering::Relaxed);
+        if bound > 0 {
+            queue = self.held_back(queue, morsel, bound)?;
+            queue.held += taken.len();
+        }
+        let Some(order) = queue.order.as_mut() else {
+            return Err(Error::internal("an order restoring root lost its order"));
         };
         if full(order.waiting.len()) && order.next != morsel {
             return Ok(Progress::Blocked(Blocked::Downstream(self.shared.buffer)));
@@ -308,14 +394,15 @@ impl Sink for RootSink {
 
     fn combine(&self, place: RootPlace) -> Result<()> {
         let mut queue = self.shared.queue.lock().map_err(poisoned)?;
-        let Queue { ready, order } = &mut *queue;
+        let before = queue.ready.len();
+        let Queue { ready, order, .. } = &mut *queue;
         if let Some(order) = order.as_mut() {
             if let Some(done) = place.morsel {
                 order.finish(done);
             }
             order.release(ready);
         }
-        Ok(())
+        self.settle(queue, before)
     }
 
     fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
@@ -325,10 +412,11 @@ impl Sink for RootSink {
             // instances at all, which is a pipeline over an empty file, come out empty rather than
             // holding something forever.
             let mut queue = self.shared.queue.lock().map_err(poisoned)?;
-            let Queue { ready, order } = &mut *queue;
+            let Queue { ready, order, .. } = &mut *queue;
             if let Some(order) = order.as_mut() {
                 order.rest(ready);
             }
+            self.shared.filled.notify_one();
         }
         self.shared.finished.store(true, Ordering::Release);
         Ok(())
@@ -358,6 +446,59 @@ impl RootReader {
         self.shared.flattened.load(Ordering::Relaxed)
     }
 
+    /// Ask the workers to wait in the sink while `bound` rows are ready and nobody took them.
+    ///
+    /// For a caller that reads with [`RootReader::wait_chunks`] on its own thread while the query
+    /// runs on another, and sends the rows on before it takes more. Without the bound the query
+    /// runs ahead of a slow caller and the queue holds the whole result. Call it before the query
+    /// runs. A bound of zero is no bound, which is the default.
+    pub fn streaming(&self, bound: usize) {
+        self.shared.bound.store(bound, Ordering::Relaxed);
+    }
+
+    /// Moves the ready chunks into `into`, which must be empty, waiting until half the bound is
+    /// ready or the run ended. False when the run ended and nothing is ready.
+    ///
+    /// An order restoring root can still hold chunks after a run that failed. See
+    /// [`RootReader::failed`].
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::Internal`](rudb_common::ErrorCode::Internal) if a thread panicked while
+    /// holding the queue.
+    pub fn wait_chunks(&self, into: &mut VecDeque<Chunk>) -> Result<bool> {
+        let half = self.shared.bound.load(Ordering::Relaxed) / 2;
+        let mut queue = self.shared.queue.lock().map_err(poisoned)?;
+        loop {
+            let ended = self.shared.ended.load(Ordering::Acquire);
+            if queue.rows >= half.max(1) || ended && !queue.ready.is_empty() {
+                std::mem::swap(&mut queue.ready, into);
+                queue.rows = 0;
+                self.shared.room.notify_all();
+                return Ok(true);
+            }
+            if ended {
+                return Ok(false);
+            }
+            queue = self.shared.filled.wait(queue).map_err(poisoned)?;
+        }
+    }
+
+    /// Says that the run of the query returned, so a reader that waits for a chunk stops waiting.
+    pub fn end(&self) {
+        self.shared.ended.store(true, Ordering::Release);
+        // Under the lock, so a reader between its check and its wait does not miss the wake.
+        let _queue = self.shared.queue.lock();
+        self.shared.filled.notify_all();
+    }
+
+    /// Says that the reader takes no more chunks, so a worker that waits for room fails instead.
+    pub fn close(&self) {
+        self.shared.closed.store(true, Ordering::Release);
+        let _queue = self.shared.queue.lock();
+        self.shared.room.notify_all();
+    }
+
     /// The next chunk, or `None` when there is nothing queued right now.
     ///
     /// `None` does not mean the query is over. Ask [`RootReader::is_finished`] for that. The two
@@ -385,7 +526,7 @@ impl RootReader {
     /// holding the queue.
     pub fn failed(&self) -> Result<()> {
         let mut queue = self.shared.queue.lock().map_err(poisoned)?;
-        let Queue { ready, order } = &mut *queue;
+        let Queue { ready, order, .. } = &mut *queue;
         if let Some(order) = order.as_mut() {
             order.failed(ready);
         }

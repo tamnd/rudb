@@ -118,6 +118,7 @@ mod prepared;
 mod result;
 mod settings;
 mod statements;
+mod stream;
 mod syntax;
 mod txn;
 mod upsert;
@@ -132,6 +133,7 @@ pub use database::{Database, NativeExtremaValues};
 pub use prepared::{Description, Prepared};
 pub use result::{Notice, QueryResult};
 pub use statements::{Statement, is_complete, statements};
+pub use stream::{RowSink, streaming};
 pub use syntax::{
     RowOrder, accepts, line_and_column, parses, row_order, split, statement_kind, statement_kinds,
     where_it_happened,

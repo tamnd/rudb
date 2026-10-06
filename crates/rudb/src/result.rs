@@ -39,6 +39,8 @@ pub struct QueryResult {
     /// The table column that each column reads with no change, where there is one, or empty when
     /// nothing recorded them.
     origins: Vec<Option<Origin>>,
+    /// The rows went to a [`RowSink`](crate::RowSink) while the query ran, so this has none.
+    streamed: bool,
 }
 
 /// The part of a [`QueryResult`] its clones share.
@@ -120,6 +122,7 @@ impl QueryResult {
             metrics: None,
             changes: None,
             origins: Vec::new(),
+            streamed: false,
         }
     }
 
@@ -135,6 +138,20 @@ impl QueryResult {
     pub(crate) fn measured(mut self, metrics: Document) -> Self {
         self.metrics = Some(Box::new(metrics));
         self
+    }
+
+    /// The same result, saying whether its rows went to a sink instead.
+    #[must_use]
+    pub(crate) fn streaming(mut self, streamed: bool) -> Self {
+        self.streamed = streamed;
+        self
+    }
+
+    /// Whether the rows of the query went to the [`RowSink`](crate::RowSink) of
+    /// [`streaming`](crate::streaming) while it ran. Such a result has the columns and no rows.
+    #[must_use]
+    pub fn streamed(&self) -> bool {
+        self.streamed
     }
 
     /// Carries the session that produced the result so zoned values keep its rendering.
