@@ -4100,6 +4100,9 @@ pub fn call_values(
     {
         return Ok(value);
     }
+    if let Some(value) = crate::variant::call(name, args)? {
+        return Ok(value);
+    }
     if let ("__rudb_zero_to_null", [value]) = (name, args) {
         return Ok(if approximate(value) == Some(0.0) { Value::Null } else { value.clone() });
     }

@@ -174,6 +174,7 @@ const MACROS: &[Macro] = &[
         "\"if\"(((string IS NOT NULL) AND (\"delimiter\" IS NOT NULL) AND (\"position\" IS NOT \
          NULL)), COALESCE(string_split(string, \"delimiter\")[\"position\"], ''), NULL)",
     ),
+    define("variant_group_array", &["x"], "CAST(list(x) AS VARIANT)"),
     define("wavg", &["value", "weight"], "weighted_avg(\"value\", weight)"),
     define(
         "weighted_avg",
@@ -191,6 +192,7 @@ const AGGREGATING: &[&str] = &[
     "json_group_array",
     "json_group_object",
     "json_group_structure",
+    "variant_group_array",
     "wavg",
     "weighted_avg",
 ];

@@ -2669,7 +2669,8 @@ fn weight(ty: &LogicalType) -> usize {
         | LogicalType::Blob
         | LogicalType::Bit
         | LogicalType::BigNum
-        | LogicalType::Numeric => 64,
+        | LogicalType::Numeric
+        | LogicalType::Variant => 64,
         LogicalType::HugeInt
         | LogicalType::UHugeInt
         | LogicalType::Uuid
@@ -10311,6 +10312,7 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::Blob => Ok(23),
         LogicalType::Bit => Ok(24),
         LogicalType::BigNum => Ok(28),
+        LogicalType::Variant => Ok(29),
         LogicalType::TimestampS => Ok(25),
         LogicalType::TimestampMs => Ok(26),
         LogicalType::TimestampNs => Ok(27),
@@ -10380,6 +10382,7 @@ fn tag_type(tag: u8) -> Result<LogicalType> {
         23 => Ok(LogicalType::Blob),
         24 => Ok(LogicalType::Bit),
         28 => Ok(LogicalType::BigNum),
+        29 => Ok(LogicalType::Variant),
         25 => Ok(LogicalType::TimestampS),
         26 => Ok(LogicalType::TimestampMs),
         27 => Ok(LogicalType::TimestampNs),
@@ -13860,7 +13863,8 @@ fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
             | LogicalType::Blob
             | LogicalType::Bit
             | LogicalType::BigNum
-            | LogicalType::Numeric,
+            | LogicalType::Numeric
+            | LogicalType::Variant,
             Data::Varlen(values),
         ) => {
             let mut bytes = Vec::new();
@@ -15748,7 +15752,8 @@ fn decode(
         | LogicalType::Blob
         | LogicalType::Bit
         | LogicalType::BigNum
-        | LogicalType::Numeric => {
+        | LogicalType::Numeric
+        | LogicalType::Variant => {
             let offset_bytes = cur
                 .take((rows + 1).checked_mul(4).ok_or_else(|| invalid("offset count overflow"))?)?;
             let offsets = offset_bytes

@@ -3069,6 +3069,7 @@ pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>, across: 
     hashes.clear();
     hashes.resize(rows, 0);
     if let ([column], Across::OneInput) = (keys, across)
+        && column.logical_type() != &rudb_common::LogicalType::Variant
         && let Some((codes, _)) = column.stable_dictionary_parts()
     {
         let validity = column.validity();
@@ -3157,6 +3158,10 @@ pub(crate) fn repeats(keys: &[Vector], rows: usize, least: usize, same: &mut Vec
 /// a float column answers false throughout rather than comparing, because which of `-0.0` and `0.0`
 /// and which pair of nulls groups together is settled in one place and this is not it.
 fn repeats_in(column: &Vector, rows: usize, same: &mut [bool]) -> bool {
+    // A variant's bytes are not its key, since `1` and `1.0` are two encodings of one group.
+    if column.logical_type() == &rudb_common::LogicalType::Variant {
+        return false;
+    }
     let validity = column.validity();
     let same = &mut same[..rows];
     /// One pass over a run of fixed width values, each row reading its own place in it.
@@ -3232,7 +3237,10 @@ fn narrow(same: &mut [bool], validity: &rudb_vector::Validity, equal: impl Fn(us
 /// up to, which is what makes a day and twenty four hours one group.
 fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish: bool) {
     let validity = column.validity();
+    // A variant hashes as its sort key, which only the value at a time path at the bottom reads.
+    let variant = column.logical_type() == &rudb_common::LogicalType::Variant;
     if across == Across::OneInput
+        && !variant
         && let Some((codes, _)) = column.stable_dictionary_parts()
     {
         // The same two runs side by side as in [`hash`], for the same reason.
@@ -3271,6 +3279,12 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish
     // check to say what the column already said once, and hashing is nine to twelve percent of
     // every query on the suite.
     let straight = !validity.has_nulls(rows);
+    if variant {
+        for (row, state) in hashes.iter_mut().enumerate().take(rows) {
+            *state = end(fold_value(*state, &column.value_at(row)), finish);
+        }
+        return;
+    }
     // A `numeric` hashes its key and not its bytes, so that `1.0` and `1.00` are one group. The
     // value at a time path below does that.
     let numeric = column.logical_type() == &rudb_common::LogicalType::Numeric;
@@ -3614,6 +3628,7 @@ fn fold_value(state: u64, value: &Value) -> u64 {
         Value::Varchar(x) => mix(state, bytes_word(x.as_bytes())),
         Value::Blob(x) | Value::Bit(x) | Value::BigNum(x) => mix(state, bytes_word(x)),
         Value::Numeric(x) => mix(state, bytes_word(rudb_common::numeric::key(x))),
+        Value::Variant(x) => mix(state, bytes_word(&rudb_common::variant::sort_key_of(x))),
         // Two words, low first, the way the 128 bit layouts are read. The width and the scale of a
         // decimal are not mixed, because they are the column's and not the value's, and a flat
         // decimal column is a run of integers with no room to keep them.

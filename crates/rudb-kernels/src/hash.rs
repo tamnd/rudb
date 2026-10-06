@@ -97,7 +97,9 @@ pub(crate) fn hash(value: &Value) -> u64 {
             _ => huge(*unscaled),
         },
         Value::Varchar(text) => bytes(text.as_bytes()),
-        Value::Blob(data) | Value::Bit(data) | Value::BigNum(data) => bytes(data),
+        Value::Blob(data) | Value::Bit(data) | Value::BigNum(data) | Value::Variant(data) => {
+            bytes(data)
+        }
         Value::Numeric(data) => bytes(rudb_common::numeric::key(data)),
         Value::Interval { months, days, micros } => {
             let (months, days, micros) = normalized(*months, *days, *micros);

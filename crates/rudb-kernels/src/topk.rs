@@ -523,6 +523,16 @@ pub(crate) fn sort_key(value: &Value, out: &mut Vec<u8>) {
             out.extend(text.bytes().map(|byte| byte.wrapping_add(1)));
             out.push(0);
         }
+        // A variant sorts by the pin's comparator key, escaped the way a blob is.
+        Value::Variant(held) => {
+            for byte in rudb_common::variant::sort_key_of(held) {
+                if byte <= 1 {
+                    out.push(1);
+                }
+                out.push(byte);
+            }
+            out.push(0);
+        }
         Value::Blob(data) | Value::Bit(data) | Value::BigNum(data) | Value::Numeric(data) => {
             let data = match value {
                 Value::Numeric(data) => rudb_common::numeric::key(data),

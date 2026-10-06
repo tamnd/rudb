@@ -1,16 +1,16 @@
 //! What `duckdb_types()` says about each type name this engine knows.
 //!
-//! One entry per name, and one row per entry per modifier signature, which is why 76 names produce 96
+//! One entry per name, and one row per entry per modifier signature, which is why 77 names produce 97
 //! rows. The list, the oids, the modifier signatures and the row order were all read off the pinned
 //! binary rather than worked out from first principles, because every one of them turned out to have
 //! something in it that reading the type system would not have told you.
 //!
 //! # The table lists the types this engine has
 //!
-//! The pinned binary returns 104 rows in the `memory` schema and this returns 96. The eight that are
-//! not here are seven names for types rudb does not have at all, `array`, `geometry`,
-//! `timestamptz_ns`, `time_ns`, `tuple`, `type` and `variant`, plus `geometry` a second time for its
-//! `crs` modifier. A catalog table that listed a type you cannot make a value
+//! The pinned binary returns 104 rows in the `memory` schema and this returns 97. The seven that are
+//! not here are six names for types rudb does not have at all, `array`, `geometry`,
+//! `timestamptz_ns`, `time_ns`, `tuple` and `type`, plus `geometry` a second time for its `crs`
+//! modifier. A catalog table that listed a type you cannot make a value
 //! of would be a table that lies, and the point of this one is that a client can read it to find out
 //! what the engine supports. The names come back when the types do.
 //!
@@ -170,6 +170,7 @@ pub static TYPE_NAMES: &[TypeEntry] = &[
     entry("uuid", "UUID", None),
     entry("varbinary", "BLOB", None),
     TypeEntry { signatures: STRING, ..entry("varchar", "VARCHAR", None) },
+    entry("variant", "VARIANT", Some(109)),
     entry("varint", "BIGNUM", None),
 ];
 
@@ -246,6 +247,7 @@ pub fn representative(logical_type: &str) -> Option<LogicalType> {
         "MAP" => LogicalType::map(LogicalType::Varchar, LogicalType::Varchar),
         "STRUCT" => LogicalType::Struct(Vec::new()),
         "UNION" => LogicalType::Union(Vec::new()),
+        "VARIANT" => LogicalType::Variant,
         _ => return None,
     })
 }
@@ -273,6 +275,10 @@ pub fn type_oid(logical_type: &str) -> Option<i64> {
 pub fn type_size(logical_type: &str) -> Option<i64> {
     if logical_type == "DECIMAL" {
         return None;
+    }
+    // A variant is a blob of its own layout, and the pin says it takes no bytes of its own.
+    if logical_type == "VARIANT" {
+        return Some(0);
     }
     let ty = representative(logical_type)?;
     i64::try_from(ty.physical().size()).ok()
@@ -316,6 +322,7 @@ pub fn type_category(logical_type: &str) -> Option<&'static str> {
         | LogicalType::Map(_, _)
         | LogicalType::Struct(_)
         | LogicalType::Union(_) => "COMPOSITE",
+        LogicalType::Variant => "VARIANT",
         _ => return None,
     })
 }
@@ -339,8 +346,8 @@ mod tests {
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
         let rows: usize = TYPE_NAMES.iter().map(|entry| entry.signatures.len()).sum();
-        assert_eq!(TYPE_NAMES.len(), 76, "names");
-        assert_eq!(rows, 96, "rows, which is the pin's 104 less the eight for types we lack");
+        assert_eq!(TYPE_NAMES.len(), 77, "names");
+        assert_eq!(rows, 97, "rows, which is the pin's 104 less the seven for types we lack");
         assert_eq!(type_fields().len(), 17);
     }
 

@@ -69,6 +69,9 @@ pub enum Value {
     /// The `numeric` of PostgreSQL, in the layout [`crate::numeric`] describes, whose bytes less
     /// the last two order as the numbers do.
     Numeric(Vec<u8>),
+    /// `VARIANT`, in the layout [`crate::variant`] describes. Two of these are the same value when
+    /// their [`crate::variant::sort_key`]s are the same bytes, which their own bytes need not be.
+    Variant(Vec<u8>),
     /// `UUID`, in the stored form [`crate::uuid`] describes, which is the pin's and orders the way
     /// the text does.
     Uuid(i128),
@@ -240,9 +243,11 @@ impl Value {
     fn heap(&self) -> usize {
         match self {
             Self::Varchar(text) => text.capacity(),
-            Self::Blob(bytes) | Self::Bit(bytes) | Self::BigNum(bytes) | Self::Numeric(bytes) => {
-                bytes.capacity()
-            }
+            Self::Blob(bytes)
+            | Self::Bit(bytes)
+            | Self::BigNum(bytes)
+            | Self::Numeric(bytes)
+            | Self::Variant(bytes) => bytes.capacity(),
             Self::List { values, .. } => {
                 values.capacity() * size_of::<Self>() + values.iter().map(Self::heap).sum::<usize>()
             }
@@ -303,6 +308,7 @@ impl Value {
             Self::Bit(_) => LogicalType::Bit,
             Self::BigNum(_) => LogicalType::BigNum,
             Self::Numeric(_) => LogicalType::Numeric,
+            Self::Variant(_) => LogicalType::Variant,
             Self::Uuid(_) => LogicalType::Uuid,
             Self::Date(_) => LogicalType::Date,
             Self::Time(_) => LogicalType::Time,
@@ -356,6 +362,7 @@ impl Value {
             | (Self::Bit(_), T::Bit)
             | (Self::BigNum(_), T::BigNum)
             | (Self::Numeric(_), T::Numeric)
+            | (Self::Variant(_), T::Variant)
             | (Self::Uuid(_), T::Uuid)
             | (Self::Date(_), T::Date)
             | (Self::Time(_), T::Time)
@@ -434,6 +441,7 @@ impl fmt::Display for Value {
             Self::Bit(v) => f.write_str(&crate::bit::to_text(v)),
             Self::BigNum(v) => f.write_str(&crate::bignum::to_text(v)),
             Self::Numeric(v) => f.write_str(&crate::numeric::to_text(v)),
+            Self::Variant(v) => write!(f, "{}", crate::variant::decode(v)),
             Self::Uuid(v) => crate::uuid::write(f, *v),
             Self::Date(v) => write_date(f, *v),
             Self::Time(v) => write_time(f, *v),
@@ -718,6 +726,7 @@ fn write_element(f: &mut fmt::Formatter<'_>, value: &Value) -> fmt::Result {
             return write!(f, "{value}");
         }
         Value::Union { value, .. } => return write_element(f, value),
+        Value::Variant(held) => return write_element(f, &crate::variant::decode(held)),
         _ => {
             printed = value.to_string();
             &printed

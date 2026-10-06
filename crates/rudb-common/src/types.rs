@@ -207,6 +207,9 @@ pub enum LogicalType {
     /// checks the text parses and keeps it, so `'{"a" : 1}'::JSON` prints with its spaces. It sorts
     /// and compares as that text, and every string function takes it as the string it is.
     Json,
+    /// `VARIANT`, a value of any type that carries its type, held in the layout [`crate::variant`]
+    /// describes.
+    Variant,
 }
 
 /// The call an [`LogicalType::AggregateState`] came from and the shape its state is written in.
@@ -438,7 +441,8 @@ impl LogicalType {
             | Self::BigNum
             | Self::Numeric
             | Self::Type
-            | Self::Json => PhysicalType::Varlen,
+            | Self::Json
+            | Self::Variant => PhysicalType::Varlen,
             Self::Interval => PhysicalType::Interval,
             // A map is a list of two-field structs, which is how Arrow does it and how every
             // engine that has to interoperate with Arrow ends up doing it.
@@ -621,6 +625,9 @@ impl LogicalType {
         }
         match (self, other) {
             (Self::Null, ty) | (ty, Self::Null) => Some(ty.clone()),
+            // Anything meets a variant as a variant, which is the pin's, though nothing casts to
+            // one without being asked.
+            (Self::Variant, _) | (_, Self::Variant) => Some(Self::Variant),
             // Two states meet at the left one, whatever call the right one came from, and the
             // right side's layout is cast to the left's, which is the pin's.
             (Self::AggregateState(_), Self::AggregateState(_)) => Some(self.clone()),
@@ -835,6 +842,7 @@ impl fmt::Display for LogicalType {
             Self::Bit => f.write_str("BIT"),
             Self::BigNum => f.write_str("BIGNUM"),
             Self::Numeric => f.write_str("PG_NUMERIC"),
+            Self::Variant => f.write_str("VARIANT"),
             Self::Uuid => f.write_str("UUID"),
             Self::Date => f.write_str("DATE"),
             Self::Time => f.write_str("TIME"),
@@ -1559,6 +1567,7 @@ fn alias(upper: &str) -> Option<LogicalType> {
         "BIT" | "BITSTRING" | "VARBIT" => LogicalType::Bit,
         "BIGNUM" | "VARINT" => LogicalType::BigNum,
         "PG_NUMERIC" => LogicalType::Numeric,
+        "VARIANT" => LogicalType::Variant,
         "UUID" | "GUID" => LogicalType::Uuid,
         "TYPE" => LogicalType::Type,
         "JSON" => LogicalType::Json,
@@ -1755,6 +1764,7 @@ mod tests {
             LogicalType::Bit,
             LogicalType::BigNum,
             LogicalType::Numeric,
+            LogicalType::Variant,
             LogicalType::Uuid,
             LogicalType::Type,
             LogicalType::Json,

@@ -156,6 +156,55 @@ impl Binder<'_> {
         self.call("json_extract", vec![input, key]).map(Some)
     }
 
+    /// `v.a`, `v['a']` and `v[i]` on a `VARIANT`, which are `variant_extract` with a key or a
+    /// position.
+    ///
+    /// A constant position is checked here, as the pin checks it while binding: zero is refused
+    /// because positions count from one, and a negative one is refused because it does not fit the
+    /// `UINTEGER` a position is.
+    pub(crate) fn variant_field(
+        &mut self,
+        written: &str,
+        bound: &[ExprRef],
+    ) -> Result<Option<ExprRef>> {
+        let &[input, key] = bound else {
+            return Ok(None);
+        };
+        if *self.plan().expr_type(input) != LogicalType::Variant {
+            return Ok(None);
+        }
+        if !rudb_catalog::same_name(written, "array_extract")
+            && !rudb_catalog::same_name(written, STRUCT_EXTRACT)
+        {
+            return Ok(None);
+        }
+        let mut key = key;
+        if let Expr::Constant(held) = *self.plan().expr(key) {
+            let value = self.plan().value(held).clone();
+            if let (false, Some(index)) = (matches!(value, Value::Varchar(_)), value.as_i64()) {
+                if index == 0 {
+                    return Err(Error::binder(
+                        "Extracting index 0 from VARIANT(ARRAY) is invalid, indexes are 1-based",
+                    ));
+                }
+                let Ok(index) = u32::try_from(index) else {
+                    let physical = match value {
+                        Value::TinyInt(_) => "INT8",
+                        Value::SmallInt(_) => "INT16",
+                        Value::Integer(_) => "INT32",
+                        _ => "INT64",
+                    };
+                    return Err(Error::invalid_input(format!(
+                        "Failed to cast value: Type {physical} with value {index} can't be cast \
+                         because the value is out of range for the destination type UINT32"
+                    )));
+                };
+                key = self.add_constant(Value::UInteger(index));
+            }
+        }
+        self.call("variant_extract", vec![input, key]).map(Some)
+    }
+
     /// `struct_extract_at(s, i)`, the field at place `i` counted from one, in a named struct as well
     /// as an unnamed one.
     ///

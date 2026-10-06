@@ -824,6 +824,7 @@ mod tests {
             LogicalType::Bit,
             LogicalType::BigNum,
             LogicalType::Numeric,
+            LogicalType::Variant,
             LogicalType::Uuid,
             LogicalType::Date,
             LogicalType::Time,

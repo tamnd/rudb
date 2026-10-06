@@ -112,6 +112,7 @@ mod text;
 mod timebucket;
 mod timed;
 mod topk;
+mod variant;
 mod zoned;
 
 pub use aggregate::{
