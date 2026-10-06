@@ -1022,16 +1022,15 @@ impl Load {
             let mut found = false;
             let mut raw_end = line.len();
             while i < line.len() {
-                let c = line[i];
+                let run = memchr::memchr2(delim, b'\\', &line[i..]).unwrap_or(line.len() - i);
+                self.scratch.extend_from_slice(&line[i..i + run]);
+                i += run;
+                let Some(&c) = line.get(i) else { break };
                 i += 1;
                 if c == delim {
                     found = true;
                     raw_end = i - 1;
                     break;
-                }
-                if c != b'\\' {
-                    self.scratch.push(c);
-                    continue;
                 }
                 let Some(&c) = line.get(i) else { break };
                 i += 1;
@@ -1481,6 +1480,23 @@ fn next_line(
     let mut in_quote = false;
     let mut last_was_escape = false;
     while i < buf.len() {
+        // Skip to the next byte that can change the state.
+        let rest = &buf[i..];
+        let skip = if !csv {
+            memchr::memchr3(b'\\', b'\n', b'\r', rest)
+        } else if !in_quote {
+            memchr::memchr3(quote, b'\n', b'\r', rest)
+        } else if quote == escape {
+            memchr::memchr(quote, rest)
+        } else {
+            memchr::memchr2(quote, escape, rest)
+        };
+        let skip = skip.unwrap_or(rest.len());
+        if skip > 0 {
+            i += skip;
+            last_was_escape = false;
+            continue;
+        }
         let c = buf[i];
         if csv {
             // When the quote is the escape too, it only turns the quoted state on and off.
@@ -1886,8 +1902,9 @@ impl Runner {
     /// Writes the rows that the load holds to the table.
     fn copy_write(&self, load: &mut Load) -> Result<(), Failure> {
         let count = load.names.len();
-        let values = std::mem::replace(&mut load.values, vec![Vec::new(); count]);
         let rows = std::mem::take(&mut load.rows);
+        let values = (0..count).map(|_| Vec::with_capacity(rows)).collect();
+        let values = std::mem::replace(&mut load.values, values);
         self.connection
             .load(&load.target, &load.given, values, rows)
             .map_err(|error| Failure { position: None, ..Failure::engine(&error, 0) })?;
