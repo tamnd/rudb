@@ -13,10 +13,11 @@
 //! frozen one in place in the sequence, under the same id. [`to_freeze`] picks the stripes,
 //! [`StripeDirectory::begin_freeze`] and [`StripeDirectory::settle`] stop writes in place and wait
 //! for the stripe's rows to be final, the caller encodes them, and [`StripeDirectory::publish`]
-//! swaps the frozen stripe in once no statement reading the table has a snapshot from before.
-//! A snapshot from before would meet a stripe with no `created` stamps to tell it which rows
-//! were not there yet. Freezing writes nothing to the log: it changes how the rows are held, not
-//! what they are.
+//! swaps the frozen stripe in. A statement still reading the table at a snapshot from before
+//! would meet a stripe with no `created` stamps to tell it which rows were not there yet, so the
+//! rows such statements see differently go into a [`Graveyard`] beside the frozen stripe, which
+//! [`StripeDirectory::bury`] drops once they have all ended. Freezing writes nothing to the log:
+//! it changes how the rows are held, not what they are.
 //!
 //! A thaw, `07-the-head.md` section 7.9, puts a hot stripe back under the frozen one's id, so
 //! every rid stays where it is. [`StripeDirectory::begin_thaw`] marks the frozen stripe, and from
@@ -31,6 +32,7 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 
 use crate::deletes::{DeleteVector, PART_ROWS, PART_WORDS, Refusal};
+use crate::graveyard::Graveyard;
 use crate::horizon::Horizons;
 use crate::hot::{HotStripe, Lease, Width};
 use crate::park::Wait;
@@ -102,6 +104,9 @@ pub struct FrozenStripe {
     thawed: Condvar,
     /// Rows moved out of it into the head, which the thaw rule reads as a rate.
     migrations: AtomicU64,
+    /// The rows the statements running when it was swapped in see differently from its
+    /// checkpoint, until they end.
+    graveyard: Mutex<Option<Arc<Graveyard>>>,
 }
 
 impl FrozenStripe {
@@ -120,6 +125,7 @@ impl FrozenStripe {
             thaw: AtomicU8::new(STILL),
             thawed: Condvar::new(),
             migrations: AtomicU64::new(0),
+            graveyard: Mutex::new(None),
         }
     }
 
@@ -156,6 +162,26 @@ impl FrozenStripe {
     #[must_use]
     pub fn is_thawing(&self) -> bool {
         self.thaw.load(Ordering::SeqCst) != STILL
+    }
+
+    /// The rows the statements that were running when it was swapped in see differently from its
+    /// checkpoint, while one of them may still be running. A reader below the checkpoint reads a
+    /// slot the graveyard holds from it, see [`Graveyard::seen`], and takes it once for its scan:
+    /// it is not dropped while the reader runs.
+    #[must_use]
+    pub fn graveyard(&self) -> Option<Arc<Graveyard>> {
+        self.graveyard.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Drops its graveyard once `horizon`, the oldest snapshot reading its table, is at or past
+    /// its checkpoint, and says whether it did.
+    fn bury(&self, horizon: u64) -> bool {
+        let mut graveyard = self.graveyard.lock().unwrap_or_else(PoisonError::into_inner);
+        let done = graveyard.as_ref().is_some_and(|graveyard| graveyard.at() <= horizon);
+        if done {
+            *graveyard = None;
+        }
+        done
     }
 
     /// Counts `n` more rows moved out, for a test of the thaw rule.
@@ -246,6 +272,11 @@ impl Stripe {
                     }
                 } else {
                     mask.fill(u64::MAX);
+                }
+                if snapshot < stripe.checkpoint()
+                    && let Some(graveyard) = stripe.graveyard()
+                {
+                    graveyard.patch(part, snapshot, mask);
                 }
                 clip(mask, rows);
                 mask.iter().map(|word| word.count_ones() as usize).sum()
@@ -475,29 +506,32 @@ impl StripeDirectory {
         Some(Freeze { stripe: Arc::clone(stripe), at, rows })
     }
 
-    /// Swaps the frozen stripe in for the hot one `freeze` settled, once no statement reading the
-    /// table has a snapshot before the freeze's F, and returns it. A statement that loaded the
-    /// stripes before keeps reading the hot stripe, which lives as long as it does. While an older
-    /// snapshot is held `freeze` comes back, and the freezer asks again.
+    /// Swaps the frozen stripe in for the hot one `freeze` settled and returns it. A statement
+    /// that loaded the stripes before keeps reading the hot stripe, which lives as long as it
+    /// does. A statement reading the table at a snapshot before the freeze's F, which may load the
+    /// stripes again in its next scan, reads the rows it sees differently from F out of the
+    /// frozen stripe's [`Graveyard`], dug here from the hot stripe's stamps and undo chains.
     ///
-    /// # Errors
+    /// The snapshots are read after F was, so a statement missing from them has a snapshot at or
+    /// past F and needs nothing of the graveyard.
     ///
-    /// `freeze` itself when a statement reading the table holds a snapshot before its F.
-    pub fn publish(
-        &self,
-        freeze: Freeze,
-        horizons: &Horizons,
-        clock: &AtomicU64,
-    ) -> Result<Arc<FrozenStripe>, Freeze> {
-        if horizons.oldest(clock, self.table) < freeze.at {
-            return Err(freeze);
-        }
+    /// # Panics
+    ///
+    /// If the hot stripe `freeze` settled is no longer in the table, which it is until this swaps
+    /// it out, and a stripe is frozen once.
+    pub fn publish(&self, freeze: Freeze, horizons: &Horizons) -> Arc<FrozenStripe> {
         let frozen = Arc::new(FrozenStripe::sharing(
             freeze.stripe.id(),
             freeze.rows,
             freeze.at,
             Arc::clone(freeze.stripe.pending()),
         ));
+        let snapshots = horizons.snapshots(self.table);
+        if let Some(graveyard) = Graveyard::dig(&freeze.stripe, freeze.rows, freeze.at, &snapshots)
+        {
+            *frozen.graveyard.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(Arc::new(graveyard));
+        }
         let mut guard = self.stripes.write().unwrap_or_else(PoisonError::into_inner);
         let mut next = guard.to_vec();
         let at = next
@@ -509,16 +543,39 @@ impl StripeDirectory {
         next[at] = Stripe::Frozen(Arc::clone(&frozen));
         *guard = next.into();
         freeze.stripe.frozen();
-        Ok(frozen)
+        frozen
+    }
+
+    /// Drops the graveyards of the frozen stripes no statement reading the table needs any more,
+    /// the ones whose checkpoint its horizon reached, and says how many it dropped.
+    pub fn bury(&self, horizons: &Horizons, clock: &AtomicU64) -> usize {
+        let horizon = horizons.oldest(clock, self.table);
+        self.stripes()
+            .iter()
+            .filter(|stripe| matches!(stripe, Stripe::Frozen(frozen) if frozen.bury(horizon)))
+            .count()
+    }
+
+    /// Bytes the graveyards of its frozen stripes hold.
+    #[must_use]
+    pub fn graveyard_bytes(&self) -> usize {
+        self.stripes()
+            .iter()
+            .filter_map(|stripe| match stripe {
+                Stripe::Frozen(frozen) => frozen.graveyard().map(|graveyard| graveyard.bytes()),
+                Stripe::Hot(_) => None,
+            })
+            .sum()
     }
 
     /// Begins thawing frozen stripe `id`, `07-the-head.md` section 7.9 step 1, and returns it:
     /// from here on a delete or a move of one of its rows waits for [`Self::thaw`]. `None` when
-    /// it is not a frozen stripe or its thaw already began.
+    /// it is not a frozen stripe, its thaw already began, or it still has a graveyard, whose rows
+    /// a hot stripe made from its pages would not have.
     pub fn begin_thaw(&self, id: u32) -> Option<Arc<FrozenStripe>> {
         let Some(Stripe::Frozen(frozen)) = self.find(id) else { return None };
         let deletes = frozen.lock();
-        if frozen.thaw.load(Ordering::SeqCst) != STILL {
+        if frozen.thaw.load(Ordering::SeqCst) != STILL || frozen.graveyard().is_some() {
             return None;
         }
         frozen.thaw.store(THAWING, Ordering::SeqCst);
@@ -823,7 +880,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{Inserter, Rid, Stripe, StripeDirectory, to_freeze};
+    use crate::arena::Space;
     use crate::deletes::{Base, DeleteVector, PART_WORDS, Refusal, STRIPE_ROWS};
+    use crate::graveyard::Cell;
     use crate::horizon::{Horizons, Reads};
     use crate::hot::{HotStripe, Lease, Width};
     use crate::park::Wait;
@@ -873,7 +932,7 @@ mod tests {
         assert!(hot.is_full(), "and seals the stripe");
         let freeze = table.settle(&hot, &clock).expect("nothing in flight");
         assert_eq!((freeze.at(), freeze.rows()), (11, hot.reserved()));
-        let frozen = table.publish(freeze, &horizons, &clock).expect("no older snapshot");
+        let frozen = table.publish(freeze, &horizons);
         assert_eq!((frozen.id(), frozen.checkpoint(), frozen.rows()), (id, 11, hot.reserved()));
         assert!(matches!(table.find(id), Some(Stripe::Frozen(_))));
         assert_eq!(table.count(11, 0), 2_900);
@@ -913,7 +972,7 @@ mod tests {
         assert!(!hot.visible(rids[1].slot(), 2, 8) && hot.visible(rids[1].slot(), 2, 0));
 
         let freeze = table.settle(&hot, &clock).expect("the delete vector holds no row");
-        let frozen = table.publish(freeze, &horizons, &clock).expect("no older snapshot");
+        let frozen = table.publish(freeze, &horizons);
         table.commit(&[rids[0], moved, rids[1]], 8, 3);
         table.abort(&[rids[2]], 9);
         clock.store(3, Ordering::SeqCst);
@@ -925,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn a_freeze_waits_for_writes_in_flight_and_for_older_snapshots() {
+    fn a_freeze_waits_for_writes_in_flight_and_not_for_older_snapshots() {
         let table = directory();
         let clock = AtomicU64::new(2);
         let horizons = Horizons::new(1);
@@ -954,16 +1013,107 @@ mod tests {
         let freeze = table.settle(&hot, &clock).expect("settled");
         assert_eq!(freeze.at(), 3);
         let seen = table.stripes();
-        let freeze = table.publish(freeze, &horizons, &clock).expect_err("a snapshot from before");
-        horizons.end(0);
-        horizons.resume(0, old);
-        let freeze = table.publish(freeze, &horizons, &clock).expect_err("its next statement");
-        horizons.end(0);
-        table.publish(freeze, &horizons, &clock).expect("nobody reads from before");
+        let frozen = table.publish(freeze, &horizons);
         assert!(matches!(seen[0], Stripe::Hot(_)), "a scan keeps the stripes it loaded");
         assert!(matches!(table.find(id), Some(Stripe::Frozen(_))));
         assert_eq!(seen[0].visible(0, 2, 0, &mut [0; 128]), 100, "and reads them as before");
         assert_eq!(table.count(3, 0), 100);
+
+        // The statement from before reads the row written since out of the graveyard.
+        let graveyard = frozen.graveyard().expect("a snapshot from before");
+        assert_eq!((graveyard.snapshots(), graveyard.len()), (&[old][..], 1));
+        let before = [Some(Cell::Fixed(0))];
+        assert_eq!(graveyard.seen(rids[0].slot(), old), Some(Some(&before[..])));
+        assert_eq!(graveyard.seen(rids[0].slot(), 3), None, "F reads the frozen stripe");
+        assert_eq!(table.bury(&horizons, &clock), 0, "while the statement runs");
+        assert!(table.begin_thaw(id).is_none(), "nor is it thawed");
+        horizons.end(0);
+        assert_eq!(table.bury(&horizons, &clock), 1);
+        assert!(frozen.graveyard().is_none());
+        assert!(table.begin_thaw(id).is_some());
+    }
+
+    #[test]
+    fn a_snapshot_from_before_a_freeze_reads_its_rows_out_of_the_graveyard() {
+        let table = Arc::new(StripeDirectory::new(
+            &[Width::Eight, Width::Text],
+            Arc::new(UndoSpace::new()),
+        ));
+        let clock = AtomicU64::new(2);
+        let horizons = Horizons::new(2);
+        let name = |slot: u32| format!("row {slot}, long enough to go in the arena");
+        let mut inserter = Inserter::new(Arc::clone(&table));
+        let mut insert = |n: u32, txn: u64, ts: u64| {
+            let (lease, slots) = inserter.take(n);
+            assert_eq!(slots.len(), n as usize);
+            for slot in slots.clone() {
+                lease.stripe().write(slot, 0, Some(u128::from(slot)));
+                lease.write_text(slot, 1, Some(name(slot).as_bytes())).expect("text");
+            }
+            assert!(lease.stripe().insert(slots.clone(), txn));
+            lease.stripe().commit_insert(slots.clone(), txn, ts);
+            inserter.rids(slots)
+        };
+        let rids = insert(10, 1, 2);
+        let id = rids[0].stripe();
+        let Some(Stripe::Hot(hot)) = table.find(id) else { panic!("a hot stripe") };
+        let old = horizons.begin(0, &clock, Reads::Tables(vec![0]));
+
+        // After the old snapshot: a row written, a row deleted, two rows inserted.
+        let mut buffer = UndoBuffer::default();
+        let mut space = Space::default();
+        let view = hot.stage_text(b"written after the old snapshot was taken", &mut space);
+        let changes = [(0, Some(100)), (1, Some(view.expect("staged")))];
+        hot.update(rids[0].slot(), &changes, 2, 8, Wait::NEVER, &mut buffer).expect("update");
+        hot.commit_write(rids[0].slot(), 8, 3);
+        table.delete(rids[1], 3, 9, Wait::NEVER, &mut buffer).expect("delete");
+        table.commit(&rids[1..2], 9, 4);
+        let late = insert(2, 10, 5);
+        assert!(late.iter().all(|rid| rid.stripe() == id));
+        clock.store(5, Ordering::SeqCst);
+        let mid = horizons.begin(1, &clock, Reads::Tables(vec![0]));
+
+        // After the middle one: another row written, and one of the new rows deleted.
+        hot.update(rids[2].slot(), &[(0, Some(200))], 5, 11, Wait::NEVER, &mut buffer)
+            .expect("update");
+        hot.commit_write(rids[2].slot(), 11, 6);
+        table.delete(late[0], 6, 12, Wait::NEVER, &mut buffer).expect("delete");
+        table.commit(&late[..1], 12, 7);
+        clock.store(7, Ordering::SeqCst);
+
+        let hot = table.begin_freeze(id).expect("a hot stripe");
+        let freeze = table.settle(&hot, &clock).expect("settled");
+        assert_eq!(freeze.at(), 7);
+        let frozen = table.publish(freeze, &horizons);
+        assert!(matches!(table.find(id), Some(Stripe::Frozen(_))));
+        assert_eq!((table.count(old, 0), table.count(mid, 0), table.count(7, 0)), (10, 11, 10));
+
+        let graveyard = frozen.graveyard().expect("two snapshots from before");
+        assert_eq!((graveyard.snapshots(), graveyard.len()), (&[old, mid][..], 5));
+        assert!(graveyard.bytes() > 2 * name(0).len());
+        assert_eq!(table.graveyard_bytes(), graveyard.bytes());
+        let row = |slot: u32, value: u128| {
+            vec![Some(Cell::Fixed(value)), Some(Cell::Text(name(slot).into_bytes().into()))]
+        };
+        let seen = |rid: Rid, snapshot| {
+            graveyard.seen(rid.slot(), snapshot).map(|seen| seen.map(<[_]>::to_vec))
+        };
+        assert_eq!((seen(rids[0], old), seen(rids[0], mid)), (Some(Some(row(0, 0))), None));
+        assert_eq!((seen(rids[1], old), seen(rids[1], mid)), (Some(Some(row(1, 1))), Some(None)));
+        assert_eq!(seen(rids[2], old), Some(Some(row(2, 2))));
+        assert_eq!(seen(rids[2], mid), Some(Some(row(2, 2))));
+        let (gone, kept) = (late[0], late[1]);
+        assert_eq!((seen(gone, old), seen(gone, mid)), (Some(None), Some(Some(row(10, 10)))));
+        assert_eq!((seen(kept, old), seen(kept, mid)), (Some(None), None));
+        assert_eq!((seen(rids[3], old), seen(rids[0], 7)), (None, None), "the frozen stripe's");
+
+        assert_eq!(table.bury(&horizons, &clock), 0);
+        horizons.end(0);
+        assert_eq!(table.bury(&horizons, &clock), 0, "the middle one still reads");
+        assert_eq!(table.count(mid, 0), 11);
+        horizons.end(1);
+        assert_eq!((table.bury(&horizons, &clock), table.graveyard_bytes()), (1, 0));
+        assert_eq!(table.count(7, 0), 10);
     }
 
     #[test]
@@ -1069,7 +1219,7 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(1));
         };
-        table.publish(freeze, &horizons, &clock).expect("nobody reads");
+        assert!(table.publish(freeze, &horizons).graveyard().is_none(), "nobody reads");
         for worker in workers {
             worker.join().expect("writes");
         }

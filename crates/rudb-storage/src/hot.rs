@@ -1184,6 +1184,32 @@ impl HotStripe {
                 .is_some_and(|pending| lock(pending).is_deleted(slot, snapshot, txn))
     }
 
+    /// Whether the row at `slot` was there at `snapshot` by the stamps in place, which leave out
+    /// the deletes taken after a freeze began, for the graveyard of a freeze. Every write of the
+    /// stripe is settled then, so no stamp is uncommitted.
+    pub(crate) fn there(&self, slot: u32, snapshot: u64) -> bool {
+        let (part, at) = place(slot);
+        let created = self.created.get(part).map_or(0, |part| part[at].load(Ordering::Acquire));
+        let deleted = self.deleted.get(part).map_or(LIVE, |part| part[at].load(Ordering::Acquire));
+        seen(created, deleted, snapshot, UNCOMMITTED)
+    }
+
+    /// Whether a commit after `since` inserted, deleted or wrote in place the row at `slot`, by
+    /// the stamps in place and its undo chain, for the graveyard of a freeze.
+    pub(crate) fn changed_after(&self, slot: u32, since: u64) -> bool {
+        let (part, at) = place(slot);
+        let created = self.created.get(part).map_or(0, |part| part[at].load(Ordering::Acquire));
+        let deleted = self.deleted.get(part).map_or(LIVE, |part| part[at].load(Ordering::Acquire));
+        (created != 0 && created > since)
+            || (deleted != LIVE && deleted > since)
+            || self.newest_change(slot) > since
+    }
+
+    /// Whether `column` holds text, whose values are views into the arena.
+    pub(crate) fn is_text(&self, column: usize) -> bool {
+        self.columns[column].text
+    }
+
     /// Sets bit `i` of `mask` for every slot `i` of part `part` that is visible to a reader at
     /// `snapshot` running as `txn`, and clears the others, and says how many are visible.
     ///
