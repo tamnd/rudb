@@ -288,8 +288,19 @@ pub(crate) fn top_down(plan: &Plan) -> Vec<NodeRef> {
 /// walk from the root down marks everything reachable before the walk gets to it. When none of the
 /// nodes with the index is reachable, which is a pass asking about a subtree it has built and not
 /// attached yet, the newest of them is the answer, since that is the one the pass just built.
+///
+/// Most indexes have only the one node, and then that node is the answer whether the root reaches
+/// it or not, so the walk is only for an index a pass has rebuilt. The estimates ask this for every
+/// column they follow, and walking the whole arena for each of them was about a tenth of planning q02.
 pub(crate) fn producer(plan: &Plan, table: u32) -> Option<NodeRef> {
     let count = plan.node_count();
+    let mut found = (0..u32::try_from(count).unwrap_or(u32::MAX))
+        .rev()
+        .filter(|&at| plan.node(at).table_index() == Some(table));
+    let only = found.next()?;
+    if found.next().is_none() {
+        return Some(only);
+    }
     let mut reached = vec![false; count];
     if let Some(root) = reached.get_mut(plan.root() as usize) {
         *root = true;
