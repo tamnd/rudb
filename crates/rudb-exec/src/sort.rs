@@ -1530,7 +1530,8 @@ mod tests {
     #[test]
     fn coded_keys_rank_the_way_their_strings_do() {
         let words = ["pear", "apple", "fig", "apple", "kiwi"];
-        let mut values: Vec<Value> = words.iter().map(|&word| Value::Varchar(word.into())).collect();
+        let mut values: Vec<Value> =
+            words.iter().map(|&word| Value::Varchar(word.into())).collect();
         values.push(Value::Null);
         let dictionary =
             Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("strings"));

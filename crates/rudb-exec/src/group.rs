@@ -8785,11 +8785,11 @@ mod tests {
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, COMPACT_FROM, Call, CompactNumeric,
         Distinct, DistinctSet, EncodedCountRecord, EncodedCountRun, EncodedCountRuns, EncodedValid,
-        FixedPartition, FixedRecord, FixedRun, FixedRuns, HeldDistinct, PARTITION_FROM, RADIX_PARTITIONS,
-        RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
-        bigint_distinct_partition, by_set, closed_runs, cut_runs, drop_unkept, encoded_count_partition,
-        first_kept, fixed_partition, interior, packed_run_totals, run_total, slot_runs_of,
-        spread_runs, spread_slots,
+        FixedPartition, FixedRecord, FixedRun, FixedRuns, HeldDistinct, PARTITION_FROM,
+        RADIX_PARTITIONS, RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
+        bigint_distinct_partition, by_set, closed_runs, cut_runs, drop_unkept,
+        encoded_count_partition, first_kept, fixed_partition, interior, packed_run_totals,
+        run_total, slot_runs_of, spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -9597,7 +9597,8 @@ mod tests {
     #[test]
     fn held_distinct_values_count_what_a_row_at_a_time_counts() {
         let sets = 2000;
-        let mut direct: Vec<BigIntDistinct> = (0..sets).map(|_| BigIntDistinct::default()).collect();
+        let mut direct: Vec<BigIntDistinct> =
+            (0..sets).map(|_| BigIntDistinct::default()).collect();
         let mut counted = vec![0_i64; sets];
         let mut seen: Vec<DistinctSet> =
             (0..sets).map(|_| DistinctSet::BigInt(BigIntDistinct::default())).collect();
