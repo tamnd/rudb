@@ -223,14 +223,13 @@ impl LinkJoin {
         let held = held.get(..rows).ok_or_else(|| {
             Error::internal("a link join was handed fewer row ids than the chunk has rows")
         })?;
-        local.children.clear();
-        for &id in held {
-            local.children.push(
-                u64::try_from(id).map_err(|_| {
-                    Error::internal("a link join was handed a negative child row id")
-                })?,
-            );
+        // Checked once for the chunk and then converted in a loop with nothing else in it, rather
+        // than a push and a conversion that can fail for each row.
+        if held.iter().any(|&id| id < 0) {
+            return Err(Error::internal("a link join was handed a negative child row id"));
         }
+        local.children.clear();
+        local.children.extend(held.iter().map(|&id| id.cast_unsigned()));
         // A child past the end of the link comes back with no parent, the same answer as one with
         // no parent, and for the same reason: section 3.1 says the answer to a section that does
         // not cover a row is no section, and no section says nothing about that row. A child past
@@ -240,16 +239,17 @@ impl LinkJoin {
             return Err(Error::internal("a link join by key reached the link"));
         };
         link.forward_each(&local.children, &mut local.parents);
+        // The same again on the way out: a parent too large to gather is noted rather than
+        // returned from the middle of the loop, and the loop is a conversion of each row.
+        let mut wide = false;
         local.rids.clear();
-        local.rids.reserve(rows);
-        for &parent in &local.parents {
-            local.rids.push(if parent == NO_PARENT {
-                NO_ROW
-            } else {
-                u32::try_from(parent).ok().filter(|&rid| rid != NO_ROW).ok_or_else(|| {
-                    Error::internal("a link answered a parent row id a gather cannot hold")
-                })?
-            });
+        local.rids.extend(local.parents.iter().map(|&parent| {
+            let fits = parent < u64::from(NO_ROW);
+            wide |= !fits && parent != NO_PARENT;
+            if fits { parent as u32 } else { NO_ROW }
+        }));
+        if wide {
+            return Err(Error::internal("a link answered a parent row id a gather cannot hold"));
         }
         Ok(())
     }
