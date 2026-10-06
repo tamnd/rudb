@@ -1580,12 +1580,21 @@ fn exact(
 /// key of the parent is not in the key map, and the lookup that finds that out sends the join back
 /// to the filter, see `sideways::held_parents`, so nothing here has to prove that the build side's
 /// values are parent keys.
+///
+/// A column whose forward link did not fit the budget can still have its backward adjacency, and
+/// that names the parent the same way. TPC-H q20 is the case: the semi join of `lineitem` to the
+/// pairs of `partsupp` has `partsupp` on its build side, whose key map is over no single column, and
+/// the link from `l_partkey` to `part` was over the budget. The adjacency was in the file, and
+/// without it the 2,127 parts the build side holds tested about a million rows of `lineitem` read
+/// for the year, where the adjacency lists the 63,832 rows they reach.
 fn linked_parent<'a>(
     catalog: &'a Catalog,
     child: &Table,
     child_column: usize,
 ) -> Option<(&'a Table, usize)> {
-    let (name, column) = rudb_native::graph::link_parent(child.rows().stored()?, child_column)?;
+    let rows = child.rows().stored()?;
+    let (name, column) = rudb_native::graph::link_parent(rows, child_column)
+        .or_else(|| rudb_native::graph::adjacency_parent(rows, child_column))?;
     let owner = child.name();
     let parent = catalog
         .table(&QualifiedName::new(owner.catalog.clone(), owner.schema.clone(), name))
