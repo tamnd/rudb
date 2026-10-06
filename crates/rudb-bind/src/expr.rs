@@ -256,7 +256,13 @@ impl Binder<'_> {
                 self.exporting = ast.exports_state(expr);
                 let bound = self.bind_call(ast, name, args, distinct, filter, sorted, scope);
                 self.exporting = false;
-                bound
+                match self.session.postgres() {
+                    Some(_) => {
+                        let written = ast.name(name).last().unwrap_or_default();
+                        Ok(self.postgres_result(written, bound?))
+                    }
+                    None => bound,
+                }
             }
             ast::Expr::Window { name, args, distinct, filter, ignore_nulls, order, spec } => {
                 let written = ast.name(name).last().unwrap_or_default().to_string();
@@ -1191,8 +1197,13 @@ impl Binder<'_> {
         sorted: &[ast::OrderItem],
         scope: &Scope,
     ) -> Result<ExprRef> {
-        let written = ast.name(name).last().unwrap_or_default().to_string();
+        let mut written = ast.name(name).last().unwrap_or_default().to_string();
         let arguments = ast.expr_list(args).to_vec();
+        // `every` is the SQL standard name of `bool_and`, which PostgreSQL has and the pin does not.
+        let postgres = self.session.postgres().is_some();
+        if postgres && rudb_catalog::same_name(&written, "every") {
+            written = "bool_and".to_string();
+        }
         // count(*) is a different function from count(x), because one of them counts rows and the
         // other counts the rows where its argument is not null.
         // A replace list on the star is not this, and not anything: upstream's parser refuses
@@ -1246,6 +1257,12 @@ impl Binder<'_> {
                 false => rudb_pgtypes::format_type(rudb_pgtypes::pg_type(&ty).oid).into_owned(),
             };
             return Ok(self.add_constant(Value::Varchar(name)));
+        }
+        if !modified
+            && postgres
+            && let Some(call) = self.postgres_call(ast, &written, &arguments, scope)?
+        {
+            return Ok(call);
         }
         if !modified && let Some(call) = self.advisory_call(ast, &written, &arguments, scope)? {
             return Ok(call);
@@ -1539,11 +1556,32 @@ impl Binder<'_> {
             return Err(rudb_functions::named_mismatch(&name, &spelled, false));
         }
         let bound = self.variant_arguments(ast, &written, &arguments, bound)?;
-        let postgres = self.session.postgres().is_some();
-        self.call(&written, bound).map_err(|error| match postgres {
+        // PostgreSQL counts the bytes of a text with `octet_length` and of a bytea with `length`,
+        // and the pin has `strlen` and `octet_length` for these.
+        if postgres && let [only] = &types[..] {
+            let bytes = match only {
+                LogicalType::Varchar | LogicalType::Null
+                    if rudb_catalog::same_name(&written, "octet_length") =>
+                {
+                    Some("strlen")
+                }
+                LogicalType::Blob if rudb_catalog::same_name(&written, "length") => {
+                    Some("octet_length")
+                }
+                _ => None,
+            };
+            if let Some(bytes) = bytes {
+                return self.call(bytes, bound);
+            }
+        }
+        let call = self.call(&written, bound).map_err(|error| match postgres {
             true => undefined_function(ast, error, &written, &arguments, &types),
             false => literals_spelled(ast, error, &arguments, &types),
-        })
+        })?;
+        match postgres {
+            true => Ok(self.postgres_narrowed(&written, &types, call)),
+            false => Ok(call),
+        }
     }
 
     /// The arguments of a function over `VARIANT`, read the way the pin reads them.
@@ -3286,6 +3324,7 @@ pub(crate) fn aggregating(ast: &Ast, expr: ast::ExprRef, user: &dyn Fn(&str) -> 
         ast::Expr::Function { name, args, .. } => {
             let written = ast.name(name).last().unwrap_or_default();
             kind_of(written) == Some(FunctionKind::Aggregate)
+                || rudb_catalog::same_name(written, "every")
                 || crate::macros::aggregates(written)
                 || user(written)
                 || ast.expr_list(args).iter().any(|&arg| aggregating(ast, arg, user))

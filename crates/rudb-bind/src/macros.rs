@@ -278,7 +278,12 @@ impl Binder<'_> {
     }
 
     /// The text a macro's body came to once its arguments were put in, bound where the call was.
-    fn bind_macro_body(&mut self, name: &str, text: &str, scope: &Scope) -> Result<ExprRef> {
+    pub(crate) fn bind_macro_body(
+        &mut self,
+        name: &str,
+        text: &str,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
         let body =
             parse_ast_with_case(&format!("SELECT {text}"), self.semantics.identifier_case())?;
         let expr = match body.statements.first() {

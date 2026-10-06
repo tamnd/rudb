@@ -30,6 +30,7 @@ mod listaggr;
 mod macros;
 mod maps;
 mod parameters;
+mod pgcalls;
 mod query_text;
 mod scope;
 mod state;
