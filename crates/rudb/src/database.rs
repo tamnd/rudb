@@ -4936,6 +4936,7 @@ impl Shared {
         let staged = self.conn.staged.lock().unwrap_or_else(PoisonError::into_inner).take();
         self.conn.private.store(false, Ordering::Release);
         let mut committed = self.committed();
+        let wrote = snapshot.written.keys().copied().collect::<Vec<_>>();
         let merged = if commit {
             let workers = self.inner.pool.threads();
             txn::merge(&mut committed, mine, &mut snapshot, workers)
@@ -4950,6 +4951,20 @@ impl Shared {
             journal.absorb(staged);
         }
         self.inner.registry.end(snapshot.id, commit && merged.is_ok());
+        if commit && merged.is_ok() {
+            // The snapshot shared the key sets of the tables this transaction wrote, so the keys it
+            // added are in runs of their own. With the snapshot gone they go back into one set.
+            drop(snapshot);
+            for oid in wrote {
+                let Some(table) = committed.tables().find(|table| table.oid() == oid) else {
+                    continue;
+                };
+                let name = table.name().clone();
+                if let Ok(table) = committed.table_noting(&name) {
+                    table.settle_keys();
+                }
+            }
+        }
         merged
     }
 
