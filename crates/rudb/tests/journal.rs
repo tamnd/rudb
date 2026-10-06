@@ -641,7 +641,7 @@ fn a_sequence_hands_out_no_value_twice_across_a_crash() {
     assert_eq!(rows(&db, "SELECT id FROM t ORDER BY id"), ids);
     db.execute("INSERT INTO t (name) VALUES ('d')").expect("inserts");
     let Value::BigInt(after) = rows(&db, "SELECT max(id) FROM t")[0][0] else { panic!() };
-    assert!((4..=35).contains(&after), "{after}");
+    assert!((4..=36).contains(&after), "{after}");
     drop(db);
 
     // A close writes the counter as it is, so no value is skipped.

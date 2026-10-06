@@ -5994,9 +5994,10 @@ impl Shared {
             .filter(|held| held.event == event)
             .filter(|held| {
                 held.columns.is_empty()
-                    || held.columns.iter().any(|column| {
-                        set.iter().any(|named| rudb_catalog::same_name(named, column))
-                    })
+                    || held
+                        .columns
+                        .iter()
+                        .any(|column| set.iter().any(|named| same_name(named, column)))
             })
             .cloned()
             .collect();
