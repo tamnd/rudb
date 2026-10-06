@@ -19,6 +19,7 @@ mod keywords;
 mod literal;
 mod role;
 mod setting;
+mod streamed;
 mod zone;
 
 use std::io::{self, Read, Write};
@@ -617,6 +618,10 @@ fn serve(
         least: Severity::Notice,
         seen: u64::MAX,
         encoder: RowEncoder::default(),
+        socket: match &wire.stream {
+            Stream::Tls(_) => None,
+            stream => stream.try_clone().ok(),
+        },
         implicit: false,
         committed: false,
         load: None,
@@ -936,6 +941,9 @@ struct Runner {
     /// The generation of `guc` that `format` and `zone` come from.
     seen: u64,
     encoder: RowEncoder,
+    /// A second handle on the socket, for the rows that go out while the query runs. TLS has
+    /// none, since its state is in the one handle.
+    socket: Option<Stream>,
     /// The server opened the transaction for a `Query` of more than one statement or for the
     /// extended flow, and it ends the transaction at the end of the `Query` or at `Sync`. This is
     /// the implicit transaction block of PostgreSQL.
@@ -1579,12 +1587,29 @@ impl Runner {
             let control = Control::of(statement.sql());
             let command = setting::parse(statement.sql());
             let started = if implicit { self.begin_implicit() } else { Ok(()) };
-            let ran = started.and_then(|()| {
-                let offset = statement.offset();
-                self.run(control, command.as_ref(), sql, offset, out, |c| {
-                    c.execute(statement.sql())
-                })
-            });
+            let offset = statement.offset();
+            let one = statement.sql();
+            let (ran, ended) = match started {
+                Err(failure) => (Err(failure), streamed::Ended::none()),
+                Ok(()) if control.is_none() && command.is_none() && streamed::streamable(one) => {
+                    self.streamed(one, streamed::Flow::Simple, out, |runner, out| {
+                        runner.run(None, None, sql, offset, out, |c| c.execute(one))
+                    })
+                }
+                Ok(()) => {
+                    let ran =
+                        self.run(control, command.as_ref(), sql, offset, out, |c| c.execute(one));
+                    (ran, streamed::Ended::none())
+                }
+            };
+            if let Some(lost) = ended.lost {
+                return Err(lost);
+            }
+            // The error that the sink found stopped the query, and the engine reports the stop.
+            let ran = match (ran, ended.failed) {
+                (Err(_), Some(failed)) => Err(failed),
+                (ran, _) => ran,
+            };
             let result = match ran {
                 Ok(Outcome::Result(result)) => result,
                 Ok(Outcome::Done(tag)) => {
@@ -1597,7 +1622,8 @@ impl Runner {
                     if !self.ending() {
                         // The rows that the query made before the error go first, as in
                         // PostgreSQL. A failure to send one of them does not change the error.
-                        if let Some(result) = self.connection.rows_before_error() {
+                        let before = self.connection.rows_before_error();
+                        if let Some(result) = before.filter(|_| ended.rows.is_none()) {
                             let _ = self.rows(&result, out, &mut flush)?;
                         }
                         self.advisory_warnings(out);
@@ -1609,6 +1635,8 @@ impl Runner {
             let tag = command_tag(statement.sql(), &result, before);
             let rows = if let Some(changes) = result.changes() {
                 changes as u64
+            } else if let Some(rows) = ended.rows.filter(|_| result.streamed()) {
+                rows
             } else if result.width() > 0 || tag == CommandTag::Select {
                 match self.rows(&result, out, &mut flush)? {
                     Ok(rows) => rows,

@@ -8207,6 +8207,7 @@ fn keep_before_error(
     query: &rudb_exec::Query<'_>,
     names: Vec<String>,
     types: Vec<LogicalType>,
+    origins: &[Option<rudb_common::Origin>],
     memory: &Memory,
     session: &Session,
 ) {
@@ -8227,6 +8228,7 @@ fn keep_before_error(
     }
     // With no rows the result still has its columns, which PostgreSQL describes before the error.
     let result = QueryResult::new(names, types, chunks, held).in_session(session.clone());
+    let result = result.with_origins(origins);
     BEFORE_ERROR.with(|kept| *kept.borrow_mut() = Some(result));
 }
 
@@ -8253,9 +8255,23 @@ fn finish(
     // is. The loop after it is the one that turns the queued chunks into a result set, and it is
     // inside the span because a caller waiting for rows is waiting for that too.
     let driving = Span::start();
-    if let Err(error) = query.run(cancel, pool) {
+    let sink = match going == Rows::ForACaller && streams(sql, plan, facts, &query, session) {
+        true => crate::stream::take(sql),
+        false => None,
+    };
+    let streamed = sink.is_some();
+    if let Some(mut sink) = sink {
+        sink.start(&names, &types, plan.origins())?;
+        query.stream(cancel, pool, STREAM_BOUND, &mut |chunk| {
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            // flatten: the rows go out of the engine to the caller, as in the loop below.
+            sink.rows(chunk.into_flat()?)
+        })?;
+    } else if let Err(error) = query.run(cancel, pool) {
         if going == Rows::ForACaller && session.postgres().is_some() {
-            keep_before_error(&query, names, types, memory, session);
+            keep_before_error(&query, names, types, plan.origins(), memory, session);
         }
         return Err(error);
     }
@@ -8310,7 +8326,32 @@ fn finish(
     report.fill(&mut metrics);
     rudb_opt::explain::record_estimates(plan, facts, &mut metrics);
     rudb_metrics::remember(&metrics);
-    Ok(QueryResult::new(names, types, chunks, held).in_session(session.clone()).measured(metrics))
+    let result = QueryResult::new(names, types, chunks, held).in_session(session.clone());
+    Ok(result.measured(metrics).streaming(streamed))
+}
+
+/// How many rows of a streamed query wait for the caller before a worker waits too. The caller
+/// takes them when half are ready, so the next rows are ready when it is done with the last ones,
+/// and the rows in memory are a few chunks and not the result.
+const STREAM_BOUND: usize = 16 << 10;
+
+/// The estimated rows of a result under which a query of a PostgreSQL session runs as it always
+/// does and is not streamed, because a thread to run the query costs more than holding the rows.
+const STREAM_FROM: u64 = 50_000;
+
+/// Whether the rows of `query` go to a sink that a PostgreSQL server set for the statement `sql`
+/// while the query runs. See [`crate::stream`].
+fn streams(
+    sql: &str,
+    plan: &Plan,
+    facts: &rudb_opt::estimate::Facts,
+    query: &rudb_exec::Query<'_>,
+    session: &Session,
+) -> bool {
+    session.postgres().is_some()
+        && query.reads_tables()
+        && crate::stream::waits(sql)
+        && rudb_opt::estimate::rows(plan, plan.root(), facts).is_none_or(|rows| rows >= STREAM_FROM)
 }
 
 /// Runs a plan the compiled engine took, with the same budget and the same timing fields `run`

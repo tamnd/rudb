@@ -21,6 +21,7 @@
 //! than a driver that is handed one. It is also worth much less: the shapes in ClickBench are a
 //! scan feeding an aggregate feeding a sort, which is a chain, and a chain has nothing to overlap.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use rudb_common::{Cancel, Error, Result};
@@ -289,4 +290,101 @@ impl<'a> Query<'a> {
         }
         Ok(chunks)
     }
+
+    /// Runs the query on a thread of its own and gives each chunk to `each` on this thread as it
+    /// comes, in the order [`Query::next_chunk`] would give it.
+    ///
+    /// For a caller that sends the rows on while the query runs. About `bound` rows wait for `each`
+    /// at a time: a worker that makes more waits in the root until `each` took the ready ones, so a
+    /// slow caller holds the query in place and the result is never all in memory. An error from
+    /// `each` stops the query. When the query fails, `each` gets the rows it made in order before
+    /// the error, and then the error comes back.
+    ///
+    /// # Errors
+    ///
+    /// The error of `each`, or else the error of the run, as [`Query::run`].
+    pub fn stream(
+        &self,
+        cancel: &Cancel,
+        pool: &Pool,
+        bound: usize,
+        each: &mut dyn FnMut(Chunk) -> Result<()>,
+    ) -> Result<()> {
+        let reader = self
+            .reader
+            .as_ref()
+            .ok_or_else(|| Error::internal("a query built into a sink has no result reader"))?;
+        reader.streaming(bound.max(1));
+        std::thread::scope(|scope| {
+            let driver = std::thread::Builder::new()
+                .name("rudb-query".to_owned())
+                .stack_size(QUERY_STACK)
+                .spawn_scoped(scope, || {
+                    let before = rudb_metrics::thread_cpu_ns();
+                    let ran = self.run(cancel, pool);
+                    reader.end();
+                    if let (Some(before), Some(after)) = (before, rudb_metrics::thread_cpu_ns()) {
+                        self.worker_cpu_ns
+                            .fetch_add(after.saturating_sub(before), Ordering::Relaxed);
+                    }
+                    ran
+                });
+            let driver = match driver {
+                Ok(driver) => driver,
+                Err(error) => {
+                    reader.end();
+                    return Err(Error::internal(format!(
+                        "could not start a query thread: {error}"
+                    )));
+                }
+            };
+            let mut given = Ok(());
+            let mut chunks = VecDeque::new();
+            'reading: loop {
+                match reader.wait_chunks(&mut chunks) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        given = Err(error);
+                        break;
+                    }
+                }
+                for chunk in chunks.drain(..) {
+                    if let Err(error) = chunk.validate_external().and_then(|()| each(chunk)) {
+                        given = Err(error);
+                        break 'reading;
+                    }
+                }
+            }
+            if given.is_err() {
+                reader.close();
+            }
+            let ran = driver
+                .join()
+                .unwrap_or_else(|_| Err(Error::internal("the thread of a query panicked")));
+            given?;
+            match ran {
+                Ok(()) => {
+                    while let Some(chunk) = self.next_chunk()? {
+                        each(chunk)?;
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if reader.failed().is_ok() {
+                        while let Ok(Some(chunk)) = self.next_chunk() {
+                            if each(chunk).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error)
+                }
+            }
+        })
+    }
 }
+
+/// The stack of the thread that runs a streamed query, the same as a session thread, because an
+/// expression evaluates on it the way it would on the session thread.
+const QUERY_STACK: usize = 8 << 20;

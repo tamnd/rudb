@@ -1045,6 +1045,76 @@ fn the_rows_before_an_error_go_before_the_error() {
     server.stop().unwrap();
 }
 
+/// The rows of the messages and the command tag at the end, for a result too large to list.
+fn counted(messages: &[Message]) -> (String, usize, Option<Vec<Option<Vec<u8>>>>) {
+    let rows = messages.iter().filter(|m| m.tag == b'D').count();
+    let last = messages.iter().rev().find(|m| m.tag == b'D').map(data_row);
+    let shape = tags(messages).replace('D', "");
+    (shape, rows, last)
+}
+
+#[test]
+fn a_large_result_goes_out_while_the_query_runs() {
+    let dirs = Dirs::new("stream");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create table big as select i, 'row ' || i as t from range(0, 200000) r(i)");
+    let last = |i: i64| Some(vec![Some(i.to_string().into_bytes())]);
+
+    // The rows come in the order of the table, and the tag counts the rows that went out.
+    let messages = client.query("select i from big");
+    assert_eq!(counted(&messages), ("TCZ".to_owned(), 200_000, last(199_999)));
+    assert_eq!(text(&messages[messages.len() - 2]), "SELECT 200000");
+
+    // A client that does not read for a while holds the query, and then gets all the rows.
+    client.send(&Frontend::Query(b"select i from big"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(counted(&client.until_ready()), ("TCZ".to_owned(), 200_000, last(199_999)));
+
+    // The rows before an error go out before it, as in PostgreSQL.
+    let messages = client.query("select i, 10 / (i - 199990) from big");
+    let (shape, rows, _) = counted(&messages);
+    assert_eq!((shape.as_str(), rows), ("TEZ", 199_990));
+    assert_eq!(messages[messages.len() - 2].field(b'C').as_deref(), Some("22012"));
+
+    // A query of more than one statement.
+    let messages = client.query("select 1; select i from big; select 2");
+    assert_eq!(counted(&messages).1, 200_002);
+    assert_eq!(tags(&messages).chars().filter(|&tag| tag == 'C').count(), 3);
+
+    // The extended flow, with the rows in binary.
+    client.parse("", "select i from big", &[]);
+    client.bind_with("", "", &[], &[], &[1]);
+    client.describe(Target::Portal, "");
+    client.execute("", 0);
+    let messages = client.sync();
+    let binary = Some(vec![Some(199_999i64.to_be_bytes().to_vec())]);
+    assert_eq!(counted(&messages), ("12TCZ".to_owned(), 200_000, binary));
+
+    // A portal with a row limit sends its rows in parts, and the rest at the next Execute.
+    client.query("begin");
+    client.parse("", "select i from big", &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 1000);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(counted(&messages), ("12sCZ".to_owned(), 200_000, last(199_999)));
+    assert_eq!(text(&messages[messages.len() - 2]), "SELECT 199000");
+    client.query("rollback");
+
+    // The error of the extended flow comes where the CommandComplete goes.
+    client.parse("", "select i, 10 / (i - 199990) from big", &[]);
+    client.bind("", "", &[], &[]);
+    client.describe(Target::Portal, "");
+    client.execute("", 0);
+    let (shape, rows, _) = counted(&client.sync());
+    assert_eq!((shape.as_str(), rows), ("12TEZ", 199_990));
+
+    assert_eq!(tags(&client.query("select 1")), "TDCZ");
+    server.stop().unwrap();
+}
+
 #[test]
 fn a_call_that_no_function_takes_is_the_error_of_postgres() {
     let dirs = Dirs::new("function");

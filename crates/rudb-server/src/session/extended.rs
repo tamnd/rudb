@@ -34,6 +34,7 @@ use rudb_pgwire::{Bind, CommandTag, Level, OutBuf, Portals, ProtocolError, State
 use super::copy::{self, Copy};
 use super::cursor::{self, ALL, Cursor, Declare, Direction, NoScroll, Place, Run};
 use super::setting::{self, Command};
+use super::streamed::{self, Flow};
 use super::{
     Control, FLUSH_AT, Failure, Outcome, Runner, column_type, command_tag, field, leading_words,
 };
@@ -241,6 +242,8 @@ struct Ran {
     encoder: Option<RowEncoder>,
     /// The error of a query that made rows before it failed. `Execute` sends it after the rows.
     failed: Option<Problem>,
+    /// The rows went out while the query ran, this many, and the `CommandComplete` did not.
+    streamed: Option<u64>,
 }
 
 /// The statements and the portals of a session.
@@ -536,7 +539,7 @@ impl Extended {
                 }
                 let formats = portal.formats.clone();
                 let alone = alone(rest, name, 1);
-                let ran = portal.run(runner, alone, out)?.filter(|ran| ran.rows);
+                let ran = portal.run(runner, alone, None, out)?.filter(|ran| ran.rows);
                 match ran.and_then(|ran| ran.result.as_ref()) {
                     Some(result) => {
                         let format = |i: usize| match formats.len() {
@@ -614,7 +617,10 @@ impl Extended {
         let sql = portal.statement.sql.clone();
         let formats = portal.formats.clone();
         let described = portal.described.take();
-        let ran = match portal.run(runner, alone(rest, name, 0), out) {
+        // All the rows of the portal go out at this `Execute`, so they can go while the query runs.
+        let flow = (max_rows <= 0 && portal.ran.is_none() && streamed::streamable(&sql))
+            .then(|| Flow::Portal { formats: formats.clone(), described: described.clone() });
+        let ran = match portal.run(runner, alone(rest, name, 0), flow, out) {
             Ok(Some(ran)) => ran,
             Ok(None) => {
                 out.empty_query_response();
@@ -629,6 +635,10 @@ impl Extended {
             }
             ran.reported = true;
             out.command_tag(ran.tag, ran.changes);
+            return Ok(Ok(()));
+        }
+        if let Some(rows) = ran.streamed.take() {
+            out.command_tag(ran.tag, rows);
             return Ok(Ok(()));
         }
         let Some(result) = &ran.result else {
@@ -777,7 +787,8 @@ impl Extended {
             cursor: Some(options),
         };
         if declare.hold {
-            let ran = portal.run(runner, true, out).map_err(|p| p.within(sql, declare.query))?;
+            let ran =
+                portal.run(runner, true, None, out).map_err(|p| p.within(sql, declare.query))?;
             if let Some(failed) = ran.and_then(|ran| ran.failed.take()) {
                 return Err(failed.within(sql, declare.query));
             }
@@ -920,7 +931,7 @@ impl Portal {
             None => (false, cursor::scrolls(&self.statement.sql)),
         };
         let sql = self.statement.sql.clone();
-        let ran = match self.run(runner, true, out) {
+        let ran = match self.run(runner, true, None, out) {
             Ok(Some(ran)) if ran.rows => ran,
             Ok(_) => return Ok(Err(error("55000", format!("portal \"{name}\" cannot be run")))),
             Err(problem) => return Ok(Err(problem)),
@@ -982,11 +993,13 @@ impl Portal {
 
     /// Runs the portal if it did not run yet. `None` is an empty query. The portal runs in the
     /// implicit transaction that ends at `Sync`, but a portal that is `alone` up to `Sync` runs in
-    /// its own transaction, which gives the same result for less work.
+    /// its own transaction, which gives the same result for less work. With a `flow`, the rows of
+    /// a large query go out while it runs.
     fn run(
         &mut self,
         runner: &mut Runner,
         alone: bool,
+        flow: Option<Flow>,
         out: &mut OutBuf,
     ) -> Result<Option<&mut Ran>, Problem> {
         if self.statement.prepared.is_none() && self.statement.command.is_none() {
@@ -1003,13 +1016,31 @@ impl Portal {
             let before = runner.connection.transaction();
             let values = &self.values;
             let command = statement.command.as_ref();
-            let ran = runner.run(statement.control, command, sql, 0, out, |_| {
-                match &statement.prepared {
+            let control = statement.control;
+            let execute = |runner: &mut Runner, out: &mut OutBuf| {
+                runner.run(control, command, sql, 0, out, |_| match &statement.prepared {
                     Some(prepared) => statement.execute(prepared, values),
                     None => unreachable!("a statement without a plan is a command"),
+                })
+            };
+            let (ran, ended) = match flow {
+                Some(flow) if control.is_none() && command.is_none() => {
+                    runner.streamed(sql, flow, out, execute)
                 }
-            });
+                _ => (execute(runner, out), streamed::Ended::none()),
+            };
             runner.advisory_warnings(out);
+            // The error that the sink found stopped the query, and the engine reports the stop. A
+            // socket that failed ends the session at the next write.
+            let ran = match (ran, ended.failed) {
+                (Err(_), Some(failed)) => Err(failed),
+                (ran, _) => ran,
+            };
+            if ended.rows.is_some()
+                && let Err(failure) = ran
+            {
+                return Err(problem(failure));
+            }
             let outcome = match ran {
                 Ok(outcome) => outcome,
                 Err(failure) => {
@@ -1034,7 +1065,11 @@ impl Portal {
                     if rows {
                         check_formats(&self.formats, result.width())?;
                     }
-                    Ran::new(Some(result), tag, changes, rows)
+                    let mut ran = Ran::new(Some(result), tag, changes, rows);
+                    ran.streamed = ended
+                        .rows
+                        .filter(|_| ran.result.as_ref().is_some_and(QueryResult::streamed));
+                    ran
                 }
                 Outcome::Done(tag) => Ran::new(None, tag, 0, false),
             };
@@ -1056,6 +1091,7 @@ impl Ran {
             walk: (0, 0),
             encoder: None,
             failed: None,
+            streamed: None,
         }
     }
 }
