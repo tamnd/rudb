@@ -1523,7 +1523,7 @@ pub(crate) fn coded_within<'a>(
     }
     // One column's places are the values it holds and several columns' places are their product,
     // which is why the two get different room. See [`WIDE_COMBOS`].
-    let room = if keys.len() == 1 { WIDE_COMBOS } else { PRODUCT };
+    let room = if keys.len() == 1 { WIDE_COMBOS } else { WIDE_COMBOS };
     // The columns with places of their own first, because what they take out of the room is what
     // a window is allowed to be.
     let mut found = [None; KEYS];

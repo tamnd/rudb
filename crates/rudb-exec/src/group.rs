@@ -1441,7 +1441,7 @@ const WINDOW_RATE: usize = 2;
 
 /// The places a map read by value may clear before a row has been folded, which is enough for the
 /// smallest window [`coded_within`](crate::table::coded_within) makes and a few times over.
-const WINDOW_SLACK: usize = 4_096;
+const WINDOW_SLACK: usize = 1 << 19;
 
 /// How much of one set of tables per instance the cache is taken to hold.
 ///
