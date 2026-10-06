@@ -159,7 +159,10 @@ fn pushed(
             if open != Some(at) {
                 // Only with nothing above owed another look, because an operator asked again reads
                 // the chunk it produced last time and has to find it where it left it.
-                if again.is_empty() && at >= locals.holds_from && Held::wants(chunk) {
+                if again.is_empty()
+                    && (locals.holds_from..locals.holds_to).contains(&at)
+                    && Held::wants(chunk)
+                {
                     let Some(full) = locals.held[at].take(chunk)? else {
                         return Ok(settled(finished));
                     };

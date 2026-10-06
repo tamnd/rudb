@@ -529,6 +529,51 @@ fn every_instance_lets_go_of_what_it_held() {
     );
 }
 
+/// Writes down how many rows each chunk it is given has, and wants them as they come.
+#[derive(Debug, Default)]
+struct Sizes {
+    global: Mutex<Vec<usize>>,
+}
+
+impl Sink for Sizes {
+    type Local = Vec<usize>;
+
+    fn local(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    fn sink(&self, chunk: &Chunk, sizes: &mut Vec<usize>) -> rudb_common::Result<Progress> {
+        sizes.push(chunk.len());
+        Ok(Progress::More)
+    }
+
+    fn combine(&self, local: Vec<usize>) -> rudb_common::Result<()> {
+        self.global.lock().unwrap().extend(local);
+        Ok(())
+    }
+
+    fn finalize(&self, _threads: &crate::Lease<'_>) -> rudb_common::Result<()> {
+        Ok(())
+    }
+
+    fn wants_full(&self) -> bool {
+        false
+    }
+}
+
+/// A sink that does not want full chunks gets them as the operator above it made them, while that
+/// operator still gets the source's ten row chunks laid into one per morsel.
+#[test]
+fn a_sink_that_wants_sparse_chunks_gets_them_as_they_came() {
+    let source = Arc::new(Counting::new((1..=100).collect(), 50, 10));
+    let sink = Arc::new(Sizes::default());
+    let built = pipeline(source, Arc::clone(&sink)).then(Arc::new(Evens) as Arc<dyn DynStream>);
+
+    run_serial(&built, &Cancel::new()).unwrap();
+
+    assert_eq!(*sink.global.lock().unwrap(), vec![25, 25]);
+}
+
 /// Who flattens a chunk on its way out of the engine, which is the sink and not the caller.
 ///
 /// A caller outside the engine reads a value at a time and cannot be handed a dictionary, so

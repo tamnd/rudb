@@ -534,6 +534,14 @@ struct Held {
 impl Sink for Collect<'_> {
     type Local = Collecting;
 
+    // The sink reads the keys of a chunk and keeps the rows the children allow, which on JOB is a
+    // few of them, and holds only those. Laying sparse chunks into full ones in front of it copied
+    // every column of every row first, the strings of the extremes included. On JOB 13a at one
+    // thread that copy was 40 percent of the time in the pipelines and the sink itself 10.
+    fn wants_full(&self) -> bool {
+        false
+    }
+
     fn local(&self) -> Collecting {
         let role = &self.shared.roles[self.at];
         // Only a root reads extremes and hands keys down as it goes, and not one that relations

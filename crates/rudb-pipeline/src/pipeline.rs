@@ -192,6 +192,7 @@ impl<'a> Pipeline<'a> {
             } else {
                 self.streams.iter().rposition(|stream| stream.may_stop()).map_or(0, |at| at + 1)
             },
+            holds_to: self.streams.len() + usize::from(self.sink.wants_full_chunks()),
         }
     }
 }
@@ -208,4 +209,7 @@ pub struct Locals {
     /// The first boundary anything is held at, which is below the last operator that can stop
     /// early.
     pub(crate) holds_from: usize,
+    /// The boundary past the last one anything is held at, which leaves out the one in front of
+    /// a sink that does not want full chunks.
+    pub(crate) holds_to: usize,
 }
