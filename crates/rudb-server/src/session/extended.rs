@@ -355,6 +355,12 @@ impl Extended {
             values.push(value);
         }
         let formats: Vec<i16> = params.finish()?.iter().collect();
+        // PostgreSQL plans the portal here, and an error of folding a constant comes now.
+        if statement.prepared.as_ref().is_some_and(Prepared::binds_at_parse)
+            && let Some(error) = statement.describe()?.and_then(|d| d.planning)
+        {
+            return Err(Problem::failure(Failure::engine(&error, 0), &statement.sql));
+        }
         if formats.len() > 1
             && let Some(fields) = statement.describe()?.and_then(|d| d.fields)
         {

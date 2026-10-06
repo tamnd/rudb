@@ -686,16 +686,16 @@ fn serve(
             }
             Some(Ok(Frontend::Parse { name, sql, types })) => {
                 let done = extended.parse(&runner, name, sql, types.iter(), &mut wire.out);
-                failure(done, &mut wire.out, start.protocol)
+                aborting(failure(done, &mut wire.out, start.protocol), &runner)
             }
             Some(Ok(Frontend::Bind(bind))) => {
                 let done = extended.bind(&runner, &bind, &mut wire.out);
-                failure(done, &mut wire.out, start.protocol)
+                aborting(failure(done, &mut wire.out, start.protocol), &runner)
             }
             Some(Ok(Frontend::Describe { target, name })) => {
                 let rest = &input.pending()[used..];
                 let done = extended.describe(&mut runner, target, name, rest, &mut wire.out);
-                failure(done, &mut wire.out, start.protocol)
+                aborting(failure(done, &mut wire.out, start.protocol), &runner)
             }
             Some(Ok(Frontend::Execute { portal, max_rows })) => {
                 let rest = &input.pending()[used..];
@@ -777,6 +777,16 @@ fn failure(done: Result<(), extended::Problem>, out: &mut OutBuf, protocol: u32)
             true
         }
     }
+}
+
+/// Marks an open transaction block as aborted after an error of `Parse`, `Bind` or `Describe`, as
+/// PostgreSQL does for an error of any message. The engine does it itself for an error of
+/// `Execute`.
+fn aborting(failed: bool, runner: &Runner) -> bool {
+    if failed {
+        runner.connection.abort_transaction();
+    }
+    failed
 }
 
 /// The end of a session when the server stops, or when `DROP DATABASE ... WITH (FORCE)` ends

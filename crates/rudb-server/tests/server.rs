@@ -548,8 +548,9 @@ fn a_portal_is_described_before_it_runs() {
     let server = Server::start(dirs.config()).unwrap();
     let mut client = Client::unix(&server);
     connect(&mut client, PROTOCOL_3_0);
-    // The error of the run comes at Execute, after the RowDescription, as in PostgreSQL.
-    client.parse("", "select 0/0", &[]);
+    // The error of the run comes at Execute, after the RowDescription, as in PostgreSQL. A
+    // constant `0/0` would fail at Bind, where PostgreSQL folds it.
+    client.parse("", "select 1 / g from generate_series(0, 1) g", &[]);
     client.bind("", "", &[], &[]);
     client.describe(Target::Portal, "");
     client.execute("", 0);
@@ -772,8 +773,17 @@ fn the_rows_before_an_error_go_before_the_error() {
     let messages = client.sync();
     assert_eq!(tags(&messages), "12DDsDEZ");
     client.query("rollback");
-    // A statement that fails before it makes a row sends no rows.
-    assert_eq!(tags(&client.query("select 1 / g from generate_series(0, 2) g")), "EZ");
+    // A statement that fails at its first row sends its columns and no rows.
+    assert_eq!(tags(&client.query("select 1 / g from generate_series(0, 2) g")), "TEZ");
+    // An error of folding a constant comes when the query is planned, before its columns, and
+    // on the extended flow at Bind.
+    let sql = "select 1 / 0 + g from generate_series(1, 2) g where false";
+    assert_eq!(tags(&client.query(sql)), "EZ");
+    client.parse("", sql, &[]);
+    client.bind("", "", &[], &[]);
+    client.describe(Target::Portal, "");
+    client.execute("", 0);
+    assert_eq!(tags(&client.sync()), "1EZ");
     assert_eq!(tags(&client.query("select 1")), "TDCZ");
     server.stop().unwrap();
 }

@@ -61,6 +61,106 @@ pub const VOLATILE: [&str; 17] = [
     "write_log",
 ];
 
+/// Raises the first error of a part of the plan that PostgreSQL works out when it plans the query.
+///
+/// The planner of PostgreSQL folds each call whose arguments are all constants, in every expression
+/// of the plan, and an error there fails the statement before it makes a row. So
+/// `SELECT 1/0 + x FROM t WHERE false` is a division by zero there, and on the extended protocol the
+/// error comes at `Bind` and not at `Execute`. It does not fold an arm of a `CASE` after a condition
+/// that is a constant true or in place of one that is a constant false or null, nor an operand of
+/// `AND` after a constant false, of `OR` after a constant true or of `COALESCE` after a constant
+/// that is not null. This does the same.
+///
+/// # Errors
+///
+/// The first error that folding raises.
+pub fn planned(plan: &Plan) -> Result<()> {
+    let mut seen = vec![false; plan.node_count()];
+    let mut stack = vec![plan.root()];
+    while let Some(node) = stack.pop() {
+        let Some(slot) = seen.get_mut(node as usize) else { continue };
+        if std::mem::replace(slot, true) {
+            continue;
+        }
+        let held = plan.node(node);
+        for (expr, _, _) in plan.top_level_exprs(held) {
+            constant_parts(plan, expr)?;
+        }
+        stack.extend(held.children().into_iter().flatten());
+    }
+    Ok(())
+}
+
+/// Folds the constant parts of one expression for [`planned`], the whole of it if it is constant.
+fn constant_parts(plan: &Plan, expr: ExprRef) -> Result<()> {
+    // The value of an `AND`, an `OR` or a `COALESCE` reads every operand, and the operands after
+    // the one that decides it are not folded.
+    let stops = match *plan.expr(expr) {
+        Expr::Conjunction { .. } => true,
+        Expr::Function { name, .. } => plan.string(name) == "coalesce",
+        _ => false,
+    };
+    if !stops && value_of(plan, expr)?.is_some() {
+        return Ok(());
+    }
+    match *plan.expr(expr) {
+        Expr::Column(_) | Expr::Constant(_) | Expr::Lambda { .. } | Expr::LambdaParam(_) => Ok(()),
+        Expr::Cast { input, .. } => constant_parts(plan, input),
+        Expr::Compare { left, right, .. } => {
+            constant_parts(plan, left)?;
+            constant_parts(plan, right)
+        }
+        Expr::Conjunction { op, children } => {
+            let decides = Value::Boolean(op == ConjunctionOp::Or);
+            for &child in plan.expr_list(children) {
+                constant_parts(plan, child)?;
+                if value_of(plan, child)? == Some(decides.clone()) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        Expr::Function { name, args } => {
+            let coalesce = plan.string(name) == "coalesce";
+            for &arg in plan.expr_list(args) {
+                constant_parts(plan, arg)?;
+                if coalesce && value_of(plan, arg)?.is_some_and(|value| !value.is_null()) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        Expr::Aggregate { args, filter, .. } => {
+            for &arg in plan.expr_list(args).iter().chain(filter.iter()) {
+                constant_parts(plan, arg)?;
+            }
+            Ok(())
+        }
+        Expr::Window { args, filter, order, .. } => {
+            for &arg in plan.expr_list(args).iter().chain(filter.iter()) {
+                constant_parts(plan, arg)?;
+            }
+            for key in plan.sort_key_list(order) {
+                constant_parts(plan, key.expr)?;
+            }
+            Ok(())
+        }
+        Expr::Case { arms, otherwise } => {
+            for arm in plan.arm_list(arms) {
+                constant_parts(plan, arm.when)?;
+                match value_of(plan, arm.when)? {
+                    Some(when) if when.as_bool() == Some(true) => {
+                        return constant_parts(plan, arm.then);
+                    }
+                    Some(_) => {}
+                    None => constant_parts(plan, arm.then)?,
+                }
+            }
+            otherwise.map_or(Ok(()), |otherwise| constant_parts(plan, otherwise))
+        }
+    }
+}
+
 /// What an expression comes to, or `None` if it does not come to one thing.
 ///
 /// # Errors

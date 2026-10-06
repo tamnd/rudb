@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rudb_common::{Field, LogicalType, Origin, Value};
+use rudb_common::{Error, Field, LogicalType, Origin, Value};
 
 /// What a prepared statement was handed, by identifier.
 ///
@@ -45,6 +45,9 @@ pub struct Described {
     pub fields: Option<Vec<Field>>,
     /// The table column that each of `fields` reads with no change, where there is one.
     pub origins: Vec<Option<Origin>>,
+    /// The error of [`crate::fold::planned`] for a query of a PostgreSQL session with no
+    /// parameters, which PostgreSQL raises when it plans the query and not when it parses it.
+    pub planning: Option<Error>,
 }
 
 impl Placeholders {
@@ -73,6 +76,17 @@ impl Placeholders {
     /// Keeps the columns the statement answers.
     pub fn answer(&self, fields: Vec<Field>) {
         self.lock().fields = Some(fields);
+    }
+
+    /// Keeps the error that planning the statement would raise.
+    pub fn plan_error(&self, error: Option<Error>) {
+        self.lock().planning = error;
+    }
+
+    /// Whether the statement has no parameters.
+    #[must_use]
+    pub fn none(&self) -> bool {
+        self.lock().declared.is_empty()
     }
 
     /// Keeps the table column of each column the statement answers.
