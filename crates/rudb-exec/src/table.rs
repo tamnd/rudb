@@ -1003,6 +1003,9 @@ enum Places<'a> {
     Bits {
         /// The words and what they mean, which is all a code needs to be read.
         packed: Packed<'a>,
+        /// The bottom of the window the map was built on, when the run is placed against that
+        /// window rather than against its own base. See [`Places::lift`].
+        low: Option<i64>,
     },
     /// A packed run behind a list of rows, which is the shape a filter leaves on a packed column.
     ///
@@ -1014,6 +1017,8 @@ enum Places<'a> {
         at: &'a [u32],
         /// The run those rows are read out of.
         packed: Packed<'a>,
+        /// The bottom of the window the map was built on, as [`Self::Bits`] keeps it.
+        low: Option<i64>,
     },
     /// An integer column read by its value, as the distance from the bottom of a window.
     ///
@@ -1036,6 +1041,37 @@ enum Places<'a> {
         /// value and the row it ends before, or empty when it did not keep them.
         runs: &'a [(i64, usize)],
     },
+}
+
+impl Places<'_> {
+    /// What a packed run placed against a window adds to each of its codes, which is how far its
+    /// base sits above the bottom of the window, and nothing for any other form.
+    ///
+    /// A page packs against its own base, so on q01 the first chunks, cut by the filter and flat,
+    /// open a window on `l_discount` and every packed page after them moves off it. Each of those
+    /// was widened to its values a row at a time and read by value, which was a tenth of the query.
+    /// Its values are still inside the window, and a code plus this distance is the place the
+    /// value would have had, so the page is placed out of its codes and nothing is widened.
+    fn lift(&self) -> u32 {
+        match self {
+            Places::Bits { packed, low: Some(low) }
+            | Places::CodedBits { packed, low: Some(low), .. } => {
+                (packed.base() - i128::from(*low)) as u32
+            }
+            _ => 0,
+        }
+    }
+
+    /// Whether the places are values less the bottom of a window, whatever form they are read out
+    /// of.
+    fn by_value(&self) -> bool {
+        matches!(
+            self,
+            Places::Values { .. }
+                | Places::Bits { low: Some(_), .. }
+                | Places::CodedBits { low: Some(_), .. }
+        )
+    }
 }
 
 /// Where the key columns a map reads by value are widened into, kept by the caller so that it is
@@ -1096,6 +1132,7 @@ impl CodedColumn<'_> {
     /// to tell apart, which is more than the whole probe it saves.
     fn add_into(&self, into: &mut [u32]) {
         let stride = self.stride as u32;
+        let lift = self.places.lift();
         if self.nullable {
             let nothing = self.nothing as u32;
             let column = self.column;
@@ -1106,19 +1143,22 @@ impl CodedColumn<'_> {
                         *place += code * stride;
                     }
                 }
-                Places::Bits { packed } => {
-                    for (row, place) in into.iter_mut().enumerate() {
-                        let code =
-                            if column.is_null_at(row) { nothing } else { packed.code(row) as u32 };
-                        *place += code * stride;
-                    }
-                }
-                Places::CodedBits { at, packed } => {
+                Places::Bits { packed, .. } => {
                     for (row, place) in into.iter_mut().enumerate() {
                         let code = if column.is_null_at(row) {
                             nothing
                         } else {
-                            packed.code(at[row] as usize) as u32
+                            packed.code(row) as u32 + lift
+                        };
+                        *place += code * stride;
+                    }
+                }
+                Places::CodedBits { at, packed, .. } => {
+                    for (row, place) in into.iter_mut().enumerate() {
+                        let code = if column.is_null_at(row) {
+                            nothing
+                        } else {
+                            packed.code(at[row] as usize) as u32 + lift
                         };
                         *place += code * stride;
                     }
@@ -1146,7 +1186,7 @@ impl CodedColumn<'_> {
             // reads it through a bound and asks whether it straddles the next, which was twenty
             // instructions a row on a key of `l_discount` and `l_tax`. The first block ends where the
             // packed rows reach a whole word, so that every block after it unpacks as one.
-            Places::Bits { packed } => {
+            Places::Bits { packed, .. } => {
                 let mut block = [0_u64; 64];
                 let lead = (64 - packed.offset() % 64) % 64;
                 let (first, rest) = into.split_at_mut(lead.min(into.len()));
@@ -1155,14 +1195,14 @@ impl CodedColumn<'_> {
                     let codes = &mut block[..places.len()];
                     packed.unpack(from, codes);
                     for (place, &code) in places.iter_mut().zip(codes.iter()) {
-                        *place += code as u32 * stride;
+                        *place += (code as u32 + lift) * stride;
                     }
                     from += places.len();
                 }
             }
-            Places::CodedBits { at, packed } => {
+            Places::CodedBits { at, packed, .. } => {
                 for (row, place) in into.iter_mut().enumerate() {
-                    *place += packed.code(at[row] as usize) as u32 * stride;
+                    *place += (packed.code(at[row] as usize) as u32 + lift) * stride;
                 }
             }
             Places::Values { values, low, .. } => {
@@ -1211,13 +1251,13 @@ impl<'a> Coded<'a> {
 
     /// Whether every key column is read by its value, so that [`Self::hash_of`] can answer a row.
     pub(crate) fn by_value(&self) -> bool {
-        self.columns.iter().flatten().all(|column| matches!(column.places, Places::Values { .. }))
+        self.columns.iter().flatten().all(|column| column.places.by_value())
     }
 
     /// Whether any key column is read by its value, so that the map's places are a window of
     /// values the caller chose rather than codes a page came with.
     pub(crate) fn reads_values(&self) -> bool {
-        self.columns.iter().flatten().any(|column| matches!(column.places, Places::Values { .. }))
+        self.columns.iter().flatten().any(|column| column.places.by_value())
     }
 
     /// The hash [`hash`] gives `row`, worked out for that row alone.
@@ -1233,6 +1273,12 @@ impl<'a> Coded<'a> {
             let word = match column.places {
                 _ if column.nullable && column.column.is_null_at(row) => NOTHING,
                 Places::Values { values, .. } => values[row] as u64,
+                Places::Bits { packed, low: Some(_) } => {
+                    (packed.base() + i128::from(packed.code(row))) as i64 as u64
+                }
+                Places::CodedBits { at, packed, low: Some(_) } => {
+                    (packed.base() + i128::from(packed.code(at[row] as usize))) as i64 as u64
+                }
                 _ => NOTHING,
             };
             state = mix(state, word);
@@ -1360,11 +1406,15 @@ impl<'a> Coded<'a> {
                 }
                 (
                     Some(Origin::Bits(base, width)),
-                    Places::Bits { packed } | Places::CodedBits { packed, .. },
+                    Places::Bits { packed, low: None }
+                    | Places::CodedBits { packed, low: None, .. },
                 ) => *base == packed.base() && *width == packed.width(),
-                (Some(Origin::Window(bottom, span)), Places::Values { low, .. }) => {
-                    *bottom == low && *span == column.nothing + 1
-                }
+                (
+                    Some(Origin::Window(bottom, span)),
+                    Places::Values { low, .. }
+                    | Places::Bits { low: Some(low), .. }
+                    | Places::CodedBits { low: Some(low), .. },
+                ) => *bottom == low && *span == column.nothing + 1,
                 _ => false,
             };
             if !same {
@@ -1405,10 +1455,15 @@ impl<'a> Coded<'a> {
         for column in self.columns.iter().flatten() {
             into.push(match column.places {
                 Places::Codes { values, .. } => Origin::Dictionary(Arc::clone(values)),
-                Places::Bits { packed } | Places::CodedBits { packed, .. } => {
+                Places::Bits { packed, low: None }
+                | Places::CodedBits { packed, low: None, .. } => {
                     Origin::Bits(packed.base(), packed.width())
                 }
-                Places::Values { low, .. } => Origin::Window(low, column.nothing + 1),
+                Places::Values { low, .. }
+                | Places::Bits { low: Some(low), .. }
+                | Places::CodedBits { low: Some(low), .. } => {
+                    Origin::Window(low, column.nothing + 1)
+                }
             });
         }
     }
@@ -1487,6 +1542,16 @@ pub(crate) fn coded_within<'a>(
                 continue;
             }
             let limit = room / taken;
+            // A packed page whose values all land inside the window the map was built on is
+            // placed out of its codes against that window. Not for a key of one column, whose
+            // window also finds the runs it is folded by.
+            if let Some(read) = fallback[at].filter(|_| keys.len() > 1)
+                && let Some(read) = lifted(read, held.get(at), limit)
+            {
+                taken = taken.checked_mul(read.1).filter(|&taken| taken <= room)?;
+                found[at] = Some(read);
+                continue;
+            }
             // Only a key of one column is ever folded by its runs. See [`Coded::place_runs`].
             let into = (&mut values[at], &mut runs[at], keys.len() == 1);
             let window = window_of(key, rows, held.get(at), limit, wanting == 1, into);
@@ -1609,6 +1674,30 @@ pub(crate) fn seeded_window(
     (places <= WIDE_COMBOS).then_some((i64::try_from(low).ok()?, places))
 }
 
+/// A packed column's places read against the window `held` was built on, when every value the page
+/// can hold falls inside it and the window is no wider than `limit`.
+fn lifted<'a>(
+    (places, _, nullable): (Places<'a>, usize, bool),
+    held: Option<&Origin>,
+    limit: usize,
+) -> Option<(Places<'a>, usize, bool)> {
+    let &Origin::Window(low, span) = held? else {
+        return None;
+    };
+    let (Places::Bits { packed, .. } | Places::CodedBits { packed, .. }) = places else {
+        return None;
+    };
+    let top = i128::from(low) + span as i128 - 2;
+    if span > limit || packed.base() < i128::from(low) || packed.ceiling() > top {
+        return None;
+    }
+    let places = match places {
+        Places::CodedBits { at, .. } => Places::CodedBits { at, packed, low: Some(low) },
+        _ => Places::Bits { packed, low: Some(low) },
+    };
+    Some((places, span, nullable))
+}
+
 /// Whether a column's own places come from a packed page other than the one `held` was built on.
 ///
 /// Only once there is a map, since a first page is as good a place as any to start one. A shared
@@ -1616,7 +1705,7 @@ pub(crate) fn seeded_window(
 /// column that moves off one is refused by value at once and keeps its codes too.
 fn moved_off(places: &Places<'_>, held: Option<&Origin>) -> bool {
     match (places, held) {
-        (Places::Bits { packed } | Places::CodedBits { packed, .. }, Some(held)) => {
+        (Places::Bits { packed, .. } | Places::CodedBits { packed, .. }, Some(held)) => {
             !matches!(held, Origin::Bits(base, width)
                 if *base == packed.base() && *width == packed.width())
         }
@@ -2007,7 +2096,7 @@ fn places_of(key: &Vector, rows: usize, room: usize) -> Option<(Places<'_>, usiz
         // vector at the code rather than at the row, so the question is whether the page has a
         // null anywhere in it rather than whether this chunk does.
         let nullable = key.validity().has_nulls(rows) || values.validity().has_nulls(values.len());
-        return Some((Places::CodedBits { at, packed }, span, nullable));
+        return Some((Places::CodedBits { at, packed, low: None }, span, nullable));
     }
     if let Some((codes, values)) = key.shared_dictionary_parts() {
         let codes = codes.get(..rows)?;
@@ -2043,7 +2132,8 @@ fn places_of(key: &Vector, rows: usize, room: usize) -> Option<(Places<'_>, usiz
     let span = 1_usize.checked_shl(packed.width()).filter(|&span| span <= COMBOS)?;
     // A packed run keeps its nulls in the vector's own validity rather than in what it points at,
     // so unlike a dictionary there is nothing else to ask.
-    Some((Places::Bits { packed }, span.checked_add(1)?, key.validity().has_nulls(rows)))
+    let places = Places::Bits { packed, low: None };
+    Some((places, span.checked_add(1)?, key.validity().has_nulls(rows)))
 }
 
 /// One key column in its common physical width.
@@ -5006,6 +5096,56 @@ mod tests {
         assert_eq!(placed(&coded, 2)[0] - placed(&coded, 2)[1], 3);
         let wide = [packed_numbers(&[0, 1 << 20, 0, 1], 21, 0)];
         assert!(coded_within(&wide, 4, &held, Some(&mut values)).is_none(), "no places either");
+    }
+
+    /// A packed page of a key of several columns whose values land inside the window the map was
+    /// built on is placed out of its codes against that window, and keeps the map.
+    #[test]
+    fn a_packed_page_inside_the_window_is_placed_out_of_its_codes() {
+        let first = [
+            integers(&[Some(1), Some(2), Some(1), Some(2)]),
+            integers(&[Some(10), Some(12), Some(14), Some(11)]),
+        ];
+        let mut values = Widened::default();
+        let mut held = Vec::new();
+        coded_within(&first, 4, &[], Some(&mut values)).expect("read by value").hold(&mut held);
+        let Some(Origin::Window(low, span)) = held.get(1).cloned() else {
+            panic!("a window on the second column");
+        };
+        assert_eq!((low, span), (10, 6));
+        let page = [
+            integers(&[Some(2), Some(1), Some(1), Some(2)]),
+            packed_numbers(&[11, 12, 14, 11], 2, 11),
+        ];
+        let coded = coded_within(&page, 4, &held, Some(&mut values)).expect("placed by codes");
+        assert!(matches!(
+            coded.columns[1].map(|column| column.places),
+            Some(Places::Bits { low: Some(10), .. })
+        ));
+        assert!(coded.by_value() && coded.same_as(&held), "the window outlives the page");
+        assert_eq!(placed(&coded, 4), vec![1 + 3, 2 * 3, 4 * 3, 1 + 3]);
+        let mut whole = Vec::new();
+        hash(&page, 4, &mut whole, Across::OneInput);
+        let alone: Vec<u64> = (0..4).map(|row| coded.hash_of(row)).collect();
+        assert_eq!(alone, whole);
+        let filtered = [
+            integers(&[Some(1), Some(2)]),
+            Vector::dictionary(vec![3, 0], packed_numbers(&[11, 12, 13, 14], 2, 11))
+                .expect("the rows a filter kept"),
+        ];
+        let coded = coded_within(&filtered, 2, &held, Some(&mut values)).expect("placed by codes");
+        assert!(coded.same_as(&held), "a filtered page lands in it too");
+        assert_eq!(placed(&coded, 2), vec![4 * 3, 1 + 3]);
+        let past = [
+            integers(&[Some(1), Some(2), Some(1), Some(2)]),
+            packed_numbers(&[11, 12, 18, 11], 3, 11),
+        ];
+        let coded = coded_within(&past, 4, &held, Some(&mut values)).expect("read by value");
+        assert!(matches!(
+            coded.columns[1].map(|column| column.places),
+            Some(Places::Values { .. })
+        ));
+        assert!(!coded.same_as(&held), "a page that can reach past the window opens a new one");
     }
 
     /// A row hashed on its own is the row hashed with its chunk, which is what lets a probe of one
