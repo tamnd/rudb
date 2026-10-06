@@ -3847,7 +3847,7 @@ fn date_runs<A: Fn(usize) -> usize>(
             let mut out = vec![0i64; rows];
             // The dates read out once into a column of their own, which both passes then go
             // through in order. The years under a null are worked out with the rest, since they
-            // cannot fail and are never read.
+            // cannot fail, and then put back to the zero every other path leaves there.
             let read: Vec<i32> = if part == Part::Year {
                 (0..rows).map(|index| days[at(index)]).collect()
             } else {
@@ -3857,6 +3857,17 @@ fn date_runs<A: Fn(usize) -> usize>(
                 && let Some(years) = Years::over(read.iter().copied())
             {
                 years.fill(&read, &mut out);
+                match &base {
+                    Validity::AllValid => {}
+                    Validity::AllInvalid => out.fill(0),
+                    Validity::Mask(mask) => {
+                        for (index, year) in out.iter_mut().enumerate() {
+                            if !mask.get(index) {
+                                *year = 0;
+                            }
+                        }
+                    }
+                }
                 if rows == 0 { Validity::AllValid } else { base.normalize(rows) }
             } else {
                 over_valid(rows, base, |index| {
