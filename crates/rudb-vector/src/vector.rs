@@ -3861,11 +3861,11 @@ impl Vector {
             let mut out = Vec::with_capacity(rows);
             for &(start, length) in runs {
                 let first = (packed.offset + start as usize) * width;
-                let last = first + length as usize * width;
+                // A range of known length, so that the vector takes the run without asking at each
+                // value whether it has room. A step over the bits asked, and cost twice the read.
                 out.extend(
-                    (first..last)
-                        .step_by(width)
-                        .map(|bit| value(code_at(packed.words, bit, packed.width))),
+                    (0..length as usize)
+                        .map(|row| value(code_at(packed.words, first + row * width, packed.width))),
                 );
             }
             out
