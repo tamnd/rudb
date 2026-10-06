@@ -4298,11 +4298,11 @@ pub fn add_packed_pairs_by_place(
 ) -> usize {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
-        let side = |packed: &Packed<'_>| {
+        fn side<'a>(packed: &Packed<'a>) -> Option<(&'a [u8], usize, usize)> {
             let width = packed.width as usize;
             ((1..=crate::lanes::LANE_WIDTH_MAX).contains(&width) && packed.offset % 8 == 0)
                 .then(|| (crate::lanes::bytes_of(packed.words), packed.offset * width / 8, width))
-        };
+        }
         if let (Some(one), Some(two)) = (side(first), side(second)) {
             return crate::lanes::add_pair_codes(cells, [one, two], places);
         }
