@@ -1857,11 +1857,13 @@ impl Catalog {
         Ok(table)
     }
 
-    /// Table `name` to append rows to and change nothing else of, see [`Self::table_mut`].
+    /// Table `name` to append rows to or take rows out of and change nothing else of, see
+    /// [`Self::table_mut`].
     ///
     /// The table draws a new revision and keeps where its keys are, and an append through
     /// [`Table::append_all`] or the others like it notes the keys of the rows it adds, so a table
     /// that takes one row at a time between lookups by key is not looked through again for each.
+    /// [`Table::remove_rows`] does the same for the rows it takes out.
     ///
     /// # Errors
     ///

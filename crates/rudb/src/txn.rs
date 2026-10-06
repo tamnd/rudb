@@ -678,11 +678,8 @@ fn rebase(
         let numbers = done.updated.into_iter().collect::<Vec<_>>();
         let rows = picked(mine, &copied(&numbers, &done.deleted))?;
         let own = picked(mine, &(kept..mine.rows().len() as u64).collect::<Vec<_>>())?;
-        let table = if done.deleted.is_empty() {
-            committed.table_appending(name)?
-        } else {
-            committed.table_mut(name)?
-        };
+        // Where the keys are stays built across all three, see `Table::remove_rows`.
+        let table = committed.table_appending(name)?;
         if !table.put_rows(&numbers, &rows)? {
             return Err(commit_conflict());
         }
