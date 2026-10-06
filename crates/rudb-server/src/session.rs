@@ -11,6 +11,7 @@
 //! in [`auth`].
 
 mod auth;
+mod copy;
 mod cursor;
 mod database;
 mod extended;
@@ -618,6 +619,7 @@ fn serve(
         encoder: RowEncoder::default(),
         implicit: false,
         committed: false,
+        load: None,
     };
     rudb_common::advisory::register(pid, runner.connection.cancel_flag());
     runner.refresh();
@@ -673,7 +675,19 @@ fn serve(
                 }
             }
             Some(Err(error)) => {
-                wire.out.protocol_error(&error, start.protocol);
+                match runner.copy_context().filter(|_| error.level == Level::Error) {
+                    // An error in `COPY FROM STDIN` has the line of the copy.
+                    Some(context) => {
+                        let mut fields = rudb_common::Fields::default();
+                        fields.context = Some(context);
+                        let failure = Failure {
+                            fields: Some(Box::new(fields)),
+                            ..Failure::new(error.sqlstate, error.message.clone())
+                        };
+                        failure.write("", &mut wire.out);
+                    }
+                    None => wire.out.protocol_error(&error, start.protocol),
+                }
                 if error.level != Level::Error {
                     if error.level == Level::Log {
                         log("LOG", &error.message);
@@ -741,6 +755,42 @@ fn serve(
                 false
             }
             Some(Ok(Frontend::Terminate)) => return Ok(()),
+            Some(Ok(Frontend::CopyData(data))) => match runner.copy_data(data, &mut wire.out) {
+                Ok(()) => false,
+                Err(failure) => {
+                    failure.write("", &mut wire.out);
+                    aborting(true, &runner)
+                }
+            },
+            Some(Ok(Frontend::CopyDone)) => match runner.copy_done(&mut wire.out) {
+                Ok((rows, rest)) => {
+                    wire.out.command_tag(CommandTag::Copy, rows);
+                    match rest {
+                        // The rest of the `Query` runs, and its end commits the copy.
+                        Some(rest) => {
+                            let flush = wire_flush(&mut wire.stream);
+                            let failed = runner.query_from(
+                                &rest.sql,
+                                rest.next,
+                                &mut extended,
+                                &mut wire.out,
+                                flush,
+                            )?;
+                            extended.end_of_transaction(&runner);
+                            failed
+                        }
+                        None => false,
+                    }
+                }
+                Err(failure) => {
+                    failure.write("", &mut wire.out);
+                    aborting(true, &runner)
+                }
+            },
+            Some(Ok(Frontend::CopyFail(text))) => {
+                runner.copy_fail(text).write("", &mut wire.out);
+                aborting(true, &runner)
+            }
             Some(Ok(other)) => {
                 let message = match other {
                     Frontend::FunctionCall(_) => "the function call protocol is not supported yet",
@@ -759,6 +809,7 @@ fn serve(
         };
         input.consume(used);
         if failed {
+            runner.load = None;
             runner.abort_implicit();
             extended.end_of_transaction(&runner);
             if shared.stopping() || shared.terminating(pid) {
@@ -770,6 +821,11 @@ fn serve(
             }
             // As in PostgreSQL the error goes to the client at once. The server skips a `Flush`
             // after it until the next `Sync`.
+            wire.flush()?;
+        }
+        if runner.load.is_some() && !session.in_copy() {
+            // The client sends the data when it has the `CopyInResponse`.
+            session.copy_in();
             wire.flush()?;
         }
         if wire.out.len() >= FLUSH_AT {
@@ -886,6 +942,8 @@ struct Runner {
     implicit: bool,
     /// The last transaction that ended committed, for the cursors `WITH HOLD` that it made.
     committed: bool,
+    /// The `COPY FROM STDIN` that reads data.
+    load: Option<Box<copy::Load>>,
 }
 
 /// A statement of transaction control that the server runs itself, because PostgreSQL gives a
@@ -1414,7 +1472,7 @@ impl Runner {
         sql: &[u8],
         extended: &mut Extended,
         out: &mut OutBuf,
-        mut flush: impl FnMut(&mut OutBuf) -> io::Result<()>,
+        flush: impl FnMut(&mut OutBuf) -> io::Result<()>,
     ) -> io::Result<bool> {
         let Ok(sql) = std::str::from_utf8(sql) else {
             out.error_response(&[
@@ -1425,6 +1483,19 @@ impl Runner {
             ]);
             return Ok(true);
         };
+        self.query_from(sql, 0, extended, out, flush)
+    }
+
+    /// Runs the statements of a `Query` from the statement `from`. A `COPY FROM STDIN` stops it,
+    /// and the rest runs after the copy.
+    fn query_from(
+        &mut self,
+        sql: &str,
+        from: usize,
+        extended: &mut Extended,
+        out: &mut OutBuf,
+        mut flush: impl FnMut(&mut OutBuf) -> io::Result<()>,
+    ) -> io::Result<bool> {
         let statements = match rudb::statements(sql) {
             Ok(statements) => statements,
             Err(error) => {
@@ -1438,7 +1509,36 @@ impl Runner {
         }
         // A query of more than one statement runs in one transaction, as in PostgreSQL.
         let implicit = statements.len() > 1;
-        for statement in statements {
+        for (index, statement) in statements.into_iter().enumerate().skip(from) {
+            if let Some(parsed) = copy::parse(statement.sql()) {
+                let offset = statement.offset();
+                let started = if implicit { self.begin_implicit() } else { Ok(()) };
+                let done = match started.and_then(|()| {
+                    parsed.map_err(|failure| Failure {
+                        position: failure.position.map(|at| at + offset),
+                        ..failure
+                    })
+                }) {
+                    Ok(parsed) => {
+                        let rest = copy::Rest { sql: sql.to_owned(), next: index + 1 };
+                        self.copy(parsed, sql, offset, Some(rest), out, &mut flush)?
+                    }
+                    Err(failure) => {
+                        self.connection.abort_transaction();
+                        Err(failure)
+                    }
+                };
+                match done {
+                    Ok(()) if self.load.is_some() => return Ok(false),
+                    Ok(()) => continue,
+                    Err(failure) => {
+                        if !self.ending() {
+                            failure.write(sql, out);
+                        }
+                        return Ok(true);
+                    }
+                }
+            }
             if let Some(cursor) = cursor::parse(statement.sql()) {
                 // A statement on a cursor runs here, since a cursor is a portal of the session.
                 let text: Arc<str> = sql.into();
