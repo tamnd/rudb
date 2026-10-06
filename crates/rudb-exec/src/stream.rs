@@ -364,6 +364,8 @@ impl Stream for Project {
 pub(crate) struct Limit {
     count: Edge,
     offset: Edge,
+    /// A negative end gives the error of PostgreSQL.
+    postgres: bool,
 }
 
 /// One end of a limit while the query runs.
@@ -391,7 +393,7 @@ pub(crate) struct Taken {
 
 impl Limit {
     pub(crate) fn new(count: Edge, offset: Edge) -> Self {
-        Self { count, offset }
+        Self { count, offset, postgres: false }
     }
 
     /// Applies the session semantics to whatever casts the two ends hold.
@@ -399,6 +401,7 @@ impl Limit {
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.count = self.count.in_session(session);
         self.offset = self.offset.in_session(session);
+        self.postgres = session.postgres().is_some();
         self
     }
 
@@ -434,6 +437,7 @@ impl Edge {
         chunk: &Chunk,
         scratch: &mut Scratch,
         clause: &str,
+        postgres: bool,
     ) -> Result<Option<u64>> {
         match self {
             Self::All => Ok(None),
@@ -443,7 +447,7 @@ impl Edge {
                 if value.is_null() {
                     return Ok(None);
                 }
-                row_count(&value, clause).map(Some)
+                row_count(&value, clause, postgres).map(Some)
             }
         }
     }
@@ -487,9 +491,12 @@ impl Stream for Limit {
         let (count, offset) = match taken.settled {
             Some(settled) => settled,
             None => {
-                let count = self.count.rows(chunk, &mut taken.counting, "LIMIT")?;
+                let count = self.count.rows(chunk, &mut taken.counting, "LIMIT", self.postgres)?;
                 // No offset written and a null offset are the same thing, which is none skipped.
-                let offset = self.offset.rows(chunk, &mut taken.skipping, "OFFSET")?.unwrap_or(0);
+                let offset = self
+                    .offset
+                    .rows(chunk, &mut taken.skipping, "OFFSET", self.postgres)?
+                    .unwrap_or(0);
                 *taken.settled.insert((count, offset))
             }
         };

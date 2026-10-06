@@ -1214,19 +1214,32 @@ pub fn renamed(from: &[Field], target: &LogicalType, members: &[Field]) -> Resul
 /// and the number has to be read off the rows instead, and a limit that answered two different ways
 /// depending on which of those it went through would be a wrong answer nobody would look for.
 ///
+/// In a PostgreSQL session a negative number gives the error of `recompute_limits` in
+/// `nodeLimit.c`, which names the clause and has its own SQLSTATE.
+///
 /// # Errors
 ///
 /// If the value does not cast to `BIGINT`, or if it casts to a negative number.
-pub fn row_count(value: &Value, clause: &str) -> Result<u64> {
+pub fn row_count(value: &Value, clause: &str, postgres: bool) -> Result<u64> {
     let count = cast_value(value, &LogicalType::BigInt, false)?.as_i64().ok_or_else(|| {
         Error::binder(format!(
             "{clause} takes a whole number of rows, not a value of type {}",
             value.logical_type()
         ))
     })?;
-    // One message for both clauses, spelled the way the pin spells it, which names the clause it
-    // did not get rather than the one it did.
-    u64::try_from(count).map_err(|_| Error::binder("LIMIT/OFFSET cannot be negative"))
+    u64::try_from(count).map_err(|_| {
+        if !postgres {
+            // One message for both clauses, spelled the way the pin spells it, which names the
+            // clause it did not get rather than the one it did.
+            return Error::binder("LIMIT/OFFSET cannot be negative");
+        }
+        let state = if clause == "OFFSET" {
+            SqlState::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE
+        } else {
+            SqlState::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE
+        };
+        Error::invalid_input(format!("{clause} must not be negative")).state(state).unplaced()
+    })
 }
 
 /// The share a `LIMIT` written as a percentage names, as a `DOUBLE`.

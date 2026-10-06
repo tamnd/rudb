@@ -1066,6 +1066,45 @@ fn a_mean_and_a_sum_of_a_numeric_are_numerics_with_their_digits() {
 }
 
 #[test]
+fn fetch_first_is_a_limit_and_a_negative_count_is_the_error_of_postgres() {
+    let dirs = Dirs::new("fetch_first");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // Hibernate and other ORMs write a limit in the words of the SQL standard.
+    let sql =
+        "select g from generate_series(1, 9) g order by g offset $1 rows fetch next $2 rows only";
+    client.parse("", sql, &[]);
+    client.describe(Target::Statement, "");
+    client.bind("", "", &[], &[Some(b"2"), Some(b"3")]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "1tT2DDDCZ");
+    assert_eq!(parameter_types(&messages[1]), [20, 20]);
+    let rows: Vec<_> = messages[4..7].iter().map(data_row).collect();
+    assert_eq!(rows, [[Some(b"3".to_vec())], [Some(b"4".to_vec())], [Some(b"5".to_vec())]]);
+    let messages = client.query("select 1 fetch first 1 row only");
+    assert_eq!(tags(&messages), "TDCZ");
+
+    // PostgreSQL finds a negative count when the query runs, so the error has no position. rudb
+    // finds a constant count when it binds the query, so no RowDescription goes before the error.
+    for (sql, order, code, message) in [
+        ("select 1 limit -1", "EZ", "2201W", "LIMIT must not be negative"),
+        ("select 1 fetch first -1 rows only", "EZ", "2201W", "LIMIT must not be negative"),
+        ("select 1 offset -1", "EZ", "2201X", "OFFSET must not be negative"),
+        ("select 1 offset (select -1)", "TEZ", "2201X", "OFFSET must not be negative"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), order, "{sql}");
+        let error = &messages[order.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P'), None, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_rows_before_an_error_go_before_the_error() {
     let dirs = Dirs::new("partial");
     let server = Server::start(dirs.config()).unwrap();

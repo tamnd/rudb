@@ -163,7 +163,7 @@ impl LimitPercent {
             return Ok(0);
         };
         let mut scratch = self.offset.scratch();
-        Ok(self.offset.rows(first, &mut scratch, "OFFSET")?.unwrap_or(0))
+        Ok(self.offset.rows(first, &mut scratch, "OFFSET", false)?.unwrap_or(0))
     }
 
     /// The share to take, reading `first` when that is where the value is.
