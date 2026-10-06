@@ -10,7 +10,9 @@
 //! The session also tracks which reported values changed, so that the server sends one
 //! `ParameterStatus` message for each before `ReadyForQuery`, in the order of PostgreSQL.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use super::{Context, Parameter, Setting, check, find, flag, valid_custom_name};
 use crate::error::{Error, ErrorCode};
@@ -170,21 +172,33 @@ const STARTUP_REPORTS: [&str; 15] = [
     "DateStyle",
 ];
 
+/// `name` in lower case, which is the key of its slot. Most names are in lower case already, and
+/// for those this makes no new string.
+fn lower(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|c| c.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
 /// The prefix that rudb keeps for its own parameters.
 const RESERVED_PREFIX: &str = "rudb";
 
 /// The parameter values of one session.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// The changed parameters and the placeholders, by name in lower case.
-    slots: HashMap<String, Slot>,
+    /// The changed parameters and the placeholders, by name in lower case. Shared between the
+    /// copies of one session's settings until one of them changes a value, because the server
+    /// copies the settings for the engine at each change and at the start of each session.
+    slots: Arc<HashMap<String, Slot>>,
     /// The names of the slots that the current transaction changed.
     saved: Vec<String>,
     /// The names of the reported parameters that changed since the last report, the first one
     /// first.
     pending: Vec<&'static str>,
     /// The value of each reported parameter that the client last got.
-    reported: HashMap<&'static str, String>,
+    reported: Arc<HashMap<&'static str, String>>,
     generation: u64,
     superuser: bool,
 }
@@ -194,10 +208,10 @@ impl Settings {
     #[must_use]
     pub fn new(superuser: bool) -> Self {
         Self {
-            slots: HashMap::new(),
+            slots: Arc::default(),
             saved: Vec::new(),
             pending: Vec::new(),
-            reported: HashMap::new(),
+            reported: Arc::default(),
             generation: 0,
             superuser,
         }
@@ -351,13 +365,13 @@ impl Settings {
             )
             .state(SqlState::FEATURE_NOT_SUPPORTED));
         }
-        let key = parameter.name.to_ascii_lowercase();
+        let key = lower(parameter.name);
         let value = match text {
             Some(text) => Value {
                 setting: self.parse(parameter, text)?,
                 source: if origin == Origin::Startup { Source::Client } else { Source::Session },
             },
-            None => self.slots.get(&key).map_or_else(
+            None => self.slots.get(key.as_ref()).map_or_else(
                 || Value { setting: parameter.boot(), source: Source::Default },
                 |slot| slot.reset.clone(),
             ),
@@ -429,8 +443,7 @@ impl Settings {
     /// Reads a value with the type rules and the check hook of the parameter.
     fn parse(&self, parameter: &Parameter, text: &str) -> Result<Setting, Error> {
         let setting = parameter.parse(text)?;
-        let key = parameter.name.to_ascii_lowercase();
-        let (current, reset) = match self.slots.get(&key) {
+        let (current, reset) = match self.slots.get(lower(parameter.name).as_ref()) {
             Some(slot) => {
                 (parameter.show(&slot.current.setting), parameter.show(&slot.reset.setting))
             }
@@ -445,7 +458,11 @@ impl Settings {
     /// Makes the slot of a parameter if the session did not change it before.
     fn slot(&mut self, key: &str, parameter: Option<&'static Parameter>, name: &str) -> &mut Slot {
         let order = self.slots.len();
-        self.slots.entry(key.to_owned()).or_insert_with(|| {
+        let slots = Arc::make_mut(&mut self.slots);
+        if slots.contains_key(key) {
+            return slots.get_mut(key).expect("the slot is there");
+        }
+        slots.entry(key.to_owned()).or_insert_with(|| {
             let setting = parameter.map_or_else(|| Setting::String(String::new()), Parameter::boot);
             let value = Value { setting, source: Source::Default };
             Slot {
@@ -461,7 +478,7 @@ impl Settings {
 
     /// Sets the current value and the reset value, outside of a transaction.
     fn store_reset(&mut self, parameter: &'static Parameter, value: Value) {
-        let key = parameter.name.to_ascii_lowercase();
+        let key = lower(parameter.name);
         let slot = self.slot(&key, Some(parameter), parameter.name);
         slot.reset = value.clone();
         if slot.current != value {
@@ -472,7 +489,7 @@ impl Settings {
 
     /// Sets the current value in the current transaction, with the save of `push_old_value`.
     fn assign(&mut self, key: &str, value: Value, action: Action) {
-        let slot = self.slots.get_mut(key).expect("the caller made the slot");
+        let slot = Arc::make_mut(&mut self.slots).get_mut(key).expect("the caller made the slot");
         match (&mut slot.save, action) {
             (None, _) => {
                 let state = if action == Action::Set { State::Set } else { State::Local };
@@ -527,7 +544,7 @@ impl Settings {
     /// The end of a transaction: keeps or restores the values that it changed.
     pub fn end(&mut self, commit: bool) {
         for key in std::mem::take(&mut self.saved) {
-            let Some(slot) = self.slots.get_mut(&key) else { continue };
+            let Some(slot) = Arc::make_mut(&mut self.slots).get_mut(&key) else { continue };
             let Some(save) = slot.save.take() else { continue };
             let restore = match save.state {
                 State::Set if commit => None,
@@ -550,20 +567,21 @@ impl Settings {
     pub fn get(&self, name: &str) -> Option<String> {
         match find(name) {
             Some(parameter) => Some(self.shown(parameter)),
-            None => {
-                self.slots.get(&name.to_ascii_lowercase()).map(|slot| match &slot.current.setting {
-                    Setting::String(text) => text.clone(),
-                    _ => String::new(),
-                })
-            }
+            None => self.slots.get(lower(name).as_ref()).map(|slot| match &slot.current.setting {
+                Setting::String(text) => text.clone(),
+                _ => String::new(),
+            }),
         }
     }
 
     /// The current value of a parameter in its base unit.
     #[must_use]
     pub fn setting(&self, parameter: &'static Parameter) -> Setting {
+        if self.slots.is_empty() {
+            return parameter.boot();
+        }
         self.slots
-            .get(&parameter.name.to_ascii_lowercase())
+            .get(lower(parameter.name).as_ref())
             .map_or_else(|| parameter.boot(), |slot| slot.current.setting.clone())
     }
 
@@ -576,7 +594,7 @@ impl Settings {
         if let Some(parameter) = find(name) {
             return Ok((parameter.name.to_owned(), self.shown(parameter)));
         }
-        match self.slots.get(&name.to_ascii_lowercase()) {
+        match self.slots.get(lower(name).as_ref()) {
             Some(slot) => Ok((slot.name.clone(), self.get(name).unwrap_or_default())),
             None => Err(unrecognized(name)),
         }
@@ -608,13 +626,14 @@ impl Settings {
 
     /// The `ParameterStatus` messages of the start of a session, in the order of PostgreSQL.
     pub fn startup_reports(&mut self) -> Vec<(&'static str, String)> {
+        static PARAMETERS: LazyLock<Vec<&'static Parameter>> =
+            LazyLock::new(|| STARTUP_REPORTS.iter().filter_map(|name| find(name)).collect());
         self.pending.clear();
-        STARTUP_REPORTS
+        PARAMETERS
             .iter()
-            .filter_map(|name| find(name))
-            .map(|parameter| {
+            .map(|&parameter| {
                 let value = self.shown(parameter);
-                self.reported.insert(parameter.name, value.clone());
+                Arc::make_mut(&mut self.reported).insert(parameter.name, value.clone());
                 (parameter.name, value)
             })
             .collect()
@@ -628,7 +647,7 @@ impl Settings {
             let Some(parameter) = find(name) else { continue };
             let value = self.shown(parameter);
             if self.reported.get(name) != Some(&value) {
-                self.reported.insert(name, value.clone());
+                Arc::make_mut(&mut self.reported).insert(name, value.clone());
                 reports.push((name, value));
             }
         }

@@ -5,6 +5,7 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::{Mutex, PoisonError};
 
 /// Waits until one of `fds` can be read, and gives the readiness of each one in the same order.
 /// A descriptor that hung up or has an error is ready too, because the read then tells what
@@ -49,21 +50,52 @@ fn ready(polled: libc::pollfd) -> bool {
     polled.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
 }
 
-/// Fills `buf` with strong random bytes from the system.
+/// Strong random bytes from the system.
+///
+/// The bytes come from a pool that one call of `getentropy` fills, 256 bytes at a time, and each
+/// byte goes out once. So a new connection, which needs a cancel key, does not make a system call
+/// of its own each time. A request for more than the pool holds goes to the system directly.
 ///
 /// # Panics
 ///
 /// When the system has no random source, which is not a state in which the server can make a
 /// cancel key that is safe.
 pub(crate) fn random<const N: usize>() -> [u8; N] {
+    static POOL: Mutex<Pool> = Mutex::new(Pool { left: 0, bytes: [0; POOL_LEN] });
     let mut buf = [0u8; N];
-    for part in buf.chunks_mut(256) {
-        // SAFETY: `part` is a valid buffer of `part.len()` bytes, and `getentropy` takes at most
-        // 256 bytes in one call.
-        let done = unsafe { libc::getentropy(part.as_mut_ptr().cast(), part.len()) };
-        assert_eq!(done, 0, "getentropy failed: {}", io::Error::last_os_error());
+    if N > POOL_LEN {
+        for part in buf.chunks_mut(POOL_LEN) {
+            entropy(part);
+        }
+        return buf;
     }
+    let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+    if pool.left < N {
+        entropy(&mut pool.bytes);
+        pool.left = POOL_LEN;
+    }
+    let from = POOL_LEN - pool.left;
+    buf.copy_from_slice(&pool.bytes[from..from + N]);
+    // The bytes that went out are not kept, so a later reader of the pool cannot see them.
+    pool.bytes[from..from + N].fill(0);
+    pool.left -= N;
     buf
+}
+
+/// The most bytes that `getentropy` gives in one call.
+const POOL_LEN: usize = 256;
+
+/// The random bytes not handed out yet, which are the last `left` bytes of `bytes`.
+struct Pool {
+    left: usize,
+    bytes: [u8; POOL_LEN],
+}
+
+fn entropy(part: &mut [u8]) {
+    // SAFETY: `part` is a valid buffer of `part.len()` bytes, and the callers give at most 256
+    // bytes, which is the most that `getentropy` takes in one call.
+    let done = unsafe { libc::getentropy(part.as_mut_ptr().cast(), part.len()) };
+    assert_eq!(done, 0, "getentropy failed: {}", io::Error::last_os_error());
 }
 
 #[cfg(test)]
@@ -88,5 +120,10 @@ mod tests {
     fn random_bytes_differ() {
         assert_ne!(random::<32>(), random::<32>());
         assert_eq!(random::<300>().len(), 300);
+        // More than the pool holds, taken in small parts, still differ from part to part.
+        let parts: Vec<[u8; 24]> = (0..40).map(|_| random::<24>()).collect();
+        for (at, part) in parts.iter().enumerate() {
+            assert!(parts[at + 1..].iter().all(|other| other != part));
+        }
     }
 }
