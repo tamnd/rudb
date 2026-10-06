@@ -826,11 +826,12 @@ const SPARSE_READ: usize = 8;
 /// `Scan::read_reduced`, and gathering costs a few instructions or a few tens for every row the
 /// keys reach, which are more. What gathering buys beyond that is a part with no row left in it,
 /// which is never opened. So the keys are gathered when the rows in both, taking the two as
-/// independent, are expected to touch under half the parts `rows` touches. In JOB 24a the people
-/// kept reach 23,041 rows of `cast_info` in 800 parts and the movies kept reach ten times that,
-/// and the rows in both are 43 parts. On TPC-H q07 the orders kept reach 173 thousand rows of
-/// `lineitem` in every part and the suppliers kept 478 thousand, and the rows in both still sit in
-/// nearly every part, so pushing the suppliers' lists bought nothing a bitmap test does not.
+/// independent, are expected to touch under half the parts `rows` touches. In JOB 24a the rows
+/// of `cast_info` in both sets are expected to be about 147 against 800 parts the first touches,
+/// so both are read. On TPC-H q07 the orders kept reach 173 thousand rows of `lineitem` in about
+/// 2,930 parts and the suppliers kept 478 thousand, and the rows in both are expected to be 13.8
+/// thousand, which still sit in nearly every part, so pushing the suppliers' lists buys nothing a
+/// bitmap test does not.
 fn leaves_parts(rows: &Rids, reach: u64) -> bool {
     let expected = u128::from(rows.len()) * u128::from(reach) / u128::from(rows.rows().max(1));
     let touched = rows.parts_touched(VECTOR_SIZE as u64);
