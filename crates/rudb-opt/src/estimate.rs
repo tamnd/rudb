@@ -797,10 +797,10 @@ fn listed(
     let mut columns: Vec<(usize, Vec<(Op, Bound)>, Vec<ExprRef>)> = Vec::new();
     for &conjunct in pending.iter() {
         let tests = bounds::of(plan, input, conjunct);
-        let Some(position) = tests.first().map(|test| test.column) else {
+        let Some(&(position, ..)) = tests.first() else {
             continue;
         };
-        if tests.iter().any(|test| test.column != position) {
+        if tests.iter().any(|&(column, ..)| column != position) {
             continue;
         }
         let at = match columns.iter().position(|(held, ..)| *held == position) {
@@ -810,7 +810,7 @@ fn listed(
                 columns.len() - 1
             }
         };
-        columns[at].1.extend(tests.into_iter().map(|test| (test.op, test.value)));
+        columns[at].1.extend(tests.into_iter().map(|(_, op, value)| (op, value)));
         columns[at].2.push(conjunct);
     }
     let mut fraction = 1.0;
