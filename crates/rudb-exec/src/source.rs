@@ -2544,9 +2544,16 @@ impl<'a> Scan<'a> {
         // keys reach fewest rows is read as those rows, when they are fewer than the rows already
         // handed, and so is any other within `ALONGSIDE` of it. The rest are tested row by row.
         // See `Listing`.
+        // Rows already few enough to read one at a time are narrowed by any listing that reaches
+        // fewer, whatever its share of the table. See `listed_keys`.
+        let within = held
+            .as_ref()
+            .filter(|rows| rows.len().saturating_mul(SPARSE_READ as u64) <= rows.rows())
+            .map(Rids::len);
         let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
-        let mut reaching: Vec<(u64, &Arc<Sideways<'_>>)> =
-            joins.filter_map(|sideways| Some((sideways.reach(self.index)?, sideways))).collect();
+        let mut reaching: Vec<(u64, &Arc<Sideways<'_>>)> = joins
+            .filter_map(|sideways| Some((sideways.reach(self.index, within)?, sideways)))
+            .collect();
         reaching.sort_by_key(|(reach, _)| *reach);
         if let Some(&(fewest, _)) = reaching.first()
             && held.as_ref().is_none_or(|rows| fewest < rows.len())
