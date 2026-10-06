@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use rudb_bind::{Bound, Described, Parameters, Placeholders, Write};
-use rudb_catalog::{Catalog, DEFAULT_CATALOG, Entry, Key, KeyLog, QualifiedName, View};
+use rudb_catalog::{Catalog, DEFAULT_CATALOG, Entry, Key, KeyLog, QualifiedName, View, same_name};
 use rudb_common::session::Postgres;
 use rudb_common::stat::Provenance;
 use rudb_common::{
@@ -1934,6 +1934,26 @@ fn replayable(bound: &Bound, catalog: &Catalog) -> bool {
         }
 }
 
+/// Stages a `setval` for each counter of the file whose values the log does not cover yet, so that
+/// a replay after a crash starts each counter after every value this commit wrote. One record covers
+/// [`rudb_common::sequence::PREFETCH`] values, so most commits stage nothing.
+fn stage_counters(catalog: &Catalog, journal: &mut Journal) {
+    for held in catalog.sequences() {
+        if !same_name(&held.name().catalog, DEFAULT_CATALOG) {
+            continue;
+        }
+        let Some((value, called)) = held.counter().ahead() else { continue };
+        let name = format!(
+            "{}.{}",
+            rudb_parse::quoted(&held.name().schema),
+            rudb_parse::quoted(&held.name().table)
+        );
+        let sql = format!("SELECT setval('{}', {value}, {called})", name.replace('\'', "''"));
+        let record = journal.encode_ddl(&sql);
+        journal.stage(record);
+    }
+}
+
 /// Runs a schema change a Ddl record carried against `catalog`, through a database in memory that
 /// borrows the catalog for the statement. `runner` is that database, made at the first one.
 fn replay_statement(runner: &mut Option<Database>, catalog: &mut Catalog, sql: &str) -> Result<()> {
@@ -2254,7 +2274,17 @@ fn persist_main(
         return persist(path, catalog, pages, DEFAULT_CATALOG);
     };
     let anchor = journal.anchor();
+    // What the file is about to say of each counter, read before it is written, so a value a
+    // counter hands out while the file is written is logged at the next commit.
+    let counters: Vec<_> = catalog
+        .sequences()
+        .filter(|held| same_name(&held.name().catalog, DEFAULT_CATALOG))
+        .map(|held| (Arc::clone(held.counter()), held.counter().snapshot().1))
+        .collect();
     persist_anchored(path, catalog, pages, DEFAULT_CATALOG, Some(&anchor))?;
+    for (counter, uses) in counters {
+        counter.covered(uses);
+    }
     if closing {
         return journal.close();
     }
@@ -2489,6 +2519,10 @@ fn views(catalog: &Catalog, database: &str) -> Vec<rudb_native::ViewEntry> {
             aliases: Vec::new(),
             columns: Vec::new(),
         });
+    let sequences = catalog
+        .sequences()
+        .filter(|held| same_name(&held.name().catalog, database))
+        .map(kept_sequence);
     catalog
         .stored_views_in(database)
         .map(|view| rudb_native::ViewEntry {
@@ -2499,7 +2533,66 @@ fn views(catalog: &Catalog, database: &str) -> Vec<rudb_native::ViewEntry> {
             columns: view.columns(),
         })
         .chain(macros)
+        .chain(sequences)
         .collect()
+}
+
+/// The kind of entry a sequence is in a file's list of views, after [`KEPT`].
+const SEQUENCE: &str = "sequence ";
+
+/// A sequence as an entry of a file's list of views. `sql` holds the options and the place the
+/// counter has got to, as numbers with a space between them, and `aliases` holds the table that
+/// owns it. `statement` makes the sequence again and is there for a person who reads the file.
+fn kept_sequence(held: &rudb_catalog::Sequence) -> rudb_native::ViewEntry {
+    let rudb_common::sequence::Options { increment, min, max, start, cycle } =
+        held.counter().options();
+    let (counter, uses) = held.counter().snapshot();
+    let name = &held.name().table;
+    let cycle_word = if cycle { " CYCLE" } else { "" };
+    rudb_native::ViewEntry {
+        name: format!("{KEPT}{SEQUENCE}{name}"),
+        sql: format!("{increment} {min} {max} {start} {} {counter} {uses}", u8::from(cycle)),
+        statement: format!(
+            "CREATE SEQUENCE {} INCREMENT BY {increment} MINVALUE {min} MAXVALUE {max} START WITH \
+             {start}{cycle_word};",
+            rudb_parse::quoted(name)
+        ),
+        aliases: held.owner().map(|owner| owner.table.clone()).into_iter().collect(),
+        columns: Vec::new(),
+    }
+}
+
+/// Puts a sequence that a file kept back into `database`, with the table that owns it.
+fn create_kept_sequence(
+    catalog: &mut Catalog,
+    database: &str,
+    name: &str,
+    kept: &rudb_native::ViewEntry,
+) -> Result<()> {
+    let damaged = || Error::invalid_input(format!("the file keeps sequence \"{name}\" damaged"));
+    let numbers: Vec<i64> = kept
+        .sql
+        .split(' ')
+        .map(str::parse)
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|_| damaged())?;
+    let &[increment, min, max, start, cycle, counter, uses] = numbers.as_slice() else {
+        return Err(damaged());
+    };
+    let options = rudb_common::sequence::Options { increment, min, max, start, cycle: cycle != 0 };
+    let uses = u64::try_from(uses).map_err(|_| damaged())?;
+    let counter = rudb_common::sequence::Counter::resume(name, options, counter, uses);
+    let held = QualifiedName {
+        catalog: database.to_string(),
+        schema: rudb_catalog::DEFAULT_SCHEMA.to_string(),
+        table: name.to_string(),
+    };
+    catalog.create_sequence(held.clone(), counter, false, false)?;
+    if let Some(owner) = kept.aliases.first() {
+        let owner = QualifiedName { table: owner.clone(), ..held.clone() };
+        catalog.own_sequence(&held, owner)?;
+    }
+    Ok(())
 }
 
 /// What the name of an entry in a file's list of views begins with when the entry is not a view
@@ -2517,6 +2610,9 @@ fn create_native_entry(
 ) -> Result<()> {
     if !view.name.starts_with(KEPT) {
         return catalog.create_native_view_in(database, view);
+    }
+    if let Some(name) = view.name[KEPT.len_utf8()..].strip_prefix(SEQUENCE) {
+        return create_kept_sequence(catalog, database, name, view);
     }
     let aggregating: Vec<bool> = view.sql.chars().map(|flag| flag == '1').collect();
     let made = rudb_bind::kept_macro(&view.statement, database, &aggregating)?;
@@ -4732,6 +4828,7 @@ impl Shared {
         let mut catalog = self.committed();
         let mut journal = self.committed_journal();
         let Some(held) = journal.as_mut() else { return Ok(()) };
+        stage_counters(&catalog, held);
         // A block the lane refused is followed by the checkpoint, which makes the same rows
         // durable the slow way.
         if !held.needs_checkpoint() {
@@ -5897,9 +5994,10 @@ impl Shared {
             .filter(|held| held.event == event)
             .filter(|held| {
                 held.columns.is_empty()
-                    || held.columns.iter().any(|column| {
-                        set.iter().any(|named| rudb_catalog::same_name(named, column))
-                    })
+                    || held
+                        .columns
+                        .iter()
+                        .any(|column| set.iter().any(|named| same_name(named, column)))
             })
             .cloned()
             .collect();
@@ -6147,7 +6245,9 @@ impl Shared {
         // A plain append, an update and a delete have log records, staged once the rows are in,
         // and so does a schema change replay can run again from its text, staged once it is done.
         // Every other change checkpoints when it commits.
-        let ddl = parameters.is_empty() && replayable(&bound, &catalog);
+        // The replay runs the text in a DuckDB session, so a PostgreSQL statement checkpoints.
+        let ddl =
+            parameters.is_empty() && session.postgres().is_none() && replayable(&bound, &catalog);
         let logged = ddl
             || matches!(&bound, Bound::Insert(insert)
             if insert.conflict.is_none()
@@ -6405,13 +6505,6 @@ impl Shared {
                 }
                 let name = create.name.clone();
                 let skipped = create.if_not_exists && catalog.entry(&name).is_ok();
-                // A serial column makes a sequence, and the file cannot keep one yet.
-                if !create.serials.is_empty() && holds_a_file(&self.inner, &catalog, &name.catalog)
-                {
-                    return Err(Error::not_implemented(
-                        "a serial column in a database file, which cannot hold a sequence so far",
-                    ));
-                }
                 self.creating(&name)?;
                 create_table(
                     sql,
@@ -6490,13 +6583,6 @@ impl Shared {
                     catalog.drop_sequence(&name, change.cascade)?;
                     return Ok(QueryResult::empty());
                 }
-                // The native file has nowhere to keep a sequence yet, so one in it would be gone
-                // on the next open. Refused until the file can say it, the way a schema is.
-                if holds_a_file(&self.inner, &catalog, &name.catalog) {
-                    return Err(Error::not_implemented(
-                        "CREATE SEQUENCE in a database file, which cannot hold one so far",
-                    ));
-                }
                 let counter = rudb_common::sequence::Counter::register(&name.table, change.options);
                 catalog.create_sequence(name, counter, change.or_replace, change.if_not_exists)?;
                 Ok(QueryResult::empty())
@@ -6507,7 +6593,7 @@ impl Shared {
                     catalog.drop_type(&name, change.cascade)?;
                     return Ok(QueryResult::empty());
                 };
-                // The native file has nowhere to keep a type yet, the same as a sequence.
+                // The native file has nowhere to keep a type yet.
                 if holds_a_file(&self.inner, &catalog, &name.catalog) {
                     return Err(Error::not_implemented(
                         "CREATE TYPE in a database file, which cannot hold one so far",
