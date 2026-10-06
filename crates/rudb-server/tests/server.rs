@@ -901,6 +901,54 @@ fn a_char_column_pads_on_output_and_ignores_trailing_spaces() {
 }
 
 #[test]
+fn the_functions_of_postgres_have_its_result_types() {
+    let dirs = Dirs::new("pgcalls");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or("null".to_string(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    // Each case has the values and the type OIDs of PostgreSQL.
+    let cases = [
+        (
+            "select length('h\u{e9}llo'), octet_length('h\u{e9}llo'), length('ab'::bytea), strpos('abc', 'c')",
+            "5,6,2,3",
+            vec![23, 23, 23, 23],
+        ),
+        (
+            "select cardinality(array[[1,2],[3,4]]), array_ndims(array[[1],[2]]), \
+             array_length(array[[1,2,3]], 2), array_upper(array[1], 2), array_lower(array[]::int[], 1)",
+            "4,2,3,null,null",
+            vec![23, 23, 23, 23, 23],
+        ),
+        (
+            "select num_nulls(1, null, 2), num_nonnulls(1, null), width_bucket(5.35, 0.024, 10.06, 5), \
+             regexp_count('abcabc', 'b'), regexp_instr('abcabc', 'c')",
+            "1,1,3,2,3",
+            vec![23, 23, 23, 23, 23],
+        ),
+        (
+            "select sum(x), sum(x::int8), every(x > 1) from (values (2), (4)) t(x)",
+            "6,6,t",
+            vec![20, 1700, 16],
+        ),
+        ("select gcd(4, 6), gcd(4::int8, 6)", "2,2", vec![23, 20]),
+        ("select date_part('second', timestamp '2024-05-01 10:00:01.5')", "1.5", vec![701]),
+    ];
+    for (sql, expected, oids) in cases {
+        let messages = client.query(sql);
+        let shape: Vec<u32> = row_shape(&messages[0]).into_iter().map(|(_, oid, _)| oid).collect();
+        assert_eq!(shape, oids, "{sql}");
+        assert_eq!(text(data_row(&messages[1])), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_rows_before_an_error_go_before_the_error() {
     let dirs = Dirs::new("partial");
     let server = Server::start(dirs.config()).unwrap();

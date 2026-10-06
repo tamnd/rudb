@@ -4804,7 +4804,19 @@ impl<'a> Binder<'a> {
         };
         let aggregation = self.aggregation.as_ref().expect("checked above");
         let (index, groups) = (aggregation.index, aggregation.groups.len());
-        Ok(self.column(index, groups + at, ty))
+        let column = self.column(index, groups + at, ty);
+        // PostgreSQL sums an `int2` or an `int4` into an `int8` and a `float4` into a `float4`,
+        // where the pin sums them into a HUGEINT and a DOUBLE.
+        if self.session.postgres().is_some() && !exporting && resolved.name == "sum" {
+            match types.first() {
+                Some(LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer) => {
+                    return Ok(self.cast_to(column, &LogicalType::BigInt));
+                }
+                Some(LogicalType::Float) => return Ok(self.cast_to(column, &LogicalType::Float)),
+                _ => {}
+            }
+        }
+        Ok(column)
     }
 
     /// The fraction of a quantile call, checked the way the pin checks it and counted from the top
