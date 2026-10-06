@@ -985,6 +985,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "libc",
+ "memchr",
  "ring",
  "rudb",
  "rudb-common",

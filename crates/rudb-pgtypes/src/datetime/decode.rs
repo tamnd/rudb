@@ -2206,6 +2206,14 @@ fn tm2timestamp(tm: &Tm, fsec: i32, tz: Option<i32>) -> Option<i64> {
 
 /// `date_in`: the days since 2000-01-01.
 pub fn date_in(input: &str, cx: &DateTimeInput<'_>) -> Result<i32, TypeError> {
+    match iso_date(input.as_bytes()) {
+        Some(date) => Ok(date),
+        None => parsed_date(input, cx),
+    }
+}
+
+/// `date_in` through `ParseDateTime` and `DecodeDateTime`.
+fn parsed_date(input: &str, cx: &DateTimeInput<'_>) -> Result<i32, TypeError> {
     let error = |e: DtErr| e.into_error(input, "date");
     let parsed = parse_date_time(c_string(input), DATE_BUFLEN).map_err(error)?;
     let decoded = decode_date_time(&parsed, cx).map_err(error)?;
@@ -2230,6 +2238,24 @@ pub fn date_in(input: &str, cx: &DateTimeInput<'_>) -> Result<i32, TypeError> {
         return Err(range());
     }
     Ok(date)
+}
+
+/// The date of a valid `YYYY-MM-DD`, which every `DateStyle` reads the same way. Other input
+/// gives `None` and goes through the full parser, which also gives the errors.
+fn iso_date(b: &[u8]) -> Option<i32> {
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| {
+        b[range]
+            .iter()
+            .try_fold(0, |n: i32, &c| c.is_ascii_digit().then(|| n * 10 + (c - b'0') as i32))
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    if year == 0 || !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    Some(date2j(year, month, day) - POSTGRES_EPOCH_JDATE)
 }
 
 /// `DecodeTimeOnly` for `time_in` and `timetz_in`: the time in microseconds and the zone.
@@ -2397,5 +2423,30 @@ mod tests {
             error.hint.as_deref(),
             Some("Perhaps you need a different \"DateStyle\" setting.")
         );
+    }
+
+    #[test]
+    fn the_iso_date_path_agrees_with_the_parser() {
+        let utc = FixedZone::utc();
+        for order in [DateOrder::Mdy, DateOrder::Dmy, DateOrder::Ymd] {
+            let cx = DateTimeInput {
+                order,
+                zone: &utc,
+                zones: &NoZones,
+                abbrevs: ZoneAbbrevs::postgres_default(),
+                now: 0,
+            };
+            for year in [1, 4, 100, 1582, 1900, 1999, 2000, 2024, 2100, 9999] {
+                for month in 0..=13 {
+                    for day in 0..=32 {
+                        let input = format!("{year:04}-{month:02}-{day:02}");
+                        match iso_date(input.as_bytes()) {
+                            Some(date) => assert_eq!(parsed_date(&input, &cx), Ok(date), "{input}"),
+                            None => assert!(parsed_date(&input, &cx).is_err(), "{input}"),
+                        }
+                    }
+                }
+            }
+        }
     }
 }
