@@ -1316,9 +1316,9 @@ pub(crate) fn found_for(
     // The lists are left for the scan to read when it chooses to, see [`listed`], and that needs
     // the bitmap over the key values to test the rows by if it reads another set instead. Without
     // one they are read now.
-    let testable = by_key.as_ref().is_some_and(|(_, held)| {
-        exact.and_then(Exact::keys).is_some_and(|map| *held < map.len())
-    });
+    let testable = by_key
+        .as_ref()
+        .is_some_and(|(_, held)| exact.and_then(Exact::keys).is_some_and(|map| *held < map.len()));
     let (listed, deferred) = match (exact, planned) {
         (_, Some(planned)) if testable => (None, Some(planned)),
         (Some(exact), Some(planned)) => (gathered(exact, &planned), None),
@@ -2637,13 +2637,16 @@ mod tests {
         );
         let keys: Vec<Option<i32>> = (100..1_100).map(Some).collect();
 
-        let found = found_for(&keyed, Some(&exact), &chunks(&keys), false, false).expect("integers");
+        let found =
+            found_for(&keyed, Some(&exact), &chunks(&keys), false, false).expect("integers");
         assert!(found.rows.is_none() && found.domain.is_some(), "no rows of its own");
         assert_eq!(found.reach(Some(&exact), None), None, "a tenth of the table is not listed");
 
-        let found = found_for(&keyed, Some(&exact), &chunks(&keys), false, false).expect("integers");
+        let found =
+            found_for(&keyed, Some(&exact), &chunks(&keys), false, false).expect("integers");
         assert_eq!(found.reach(Some(&exact), Some(3_999)), None, "no fewer than the scan holds");
-        let found = found_for(&keyed, Some(&exact), &chunks(&keys), false, false).expect("integers");
+        let found =
+            found_for(&keyed, Some(&exact), &chunks(&keys), false, false).expect("integers");
         assert_eq!(found.reach(Some(&exact), Some(5_000)), Some(4_000));
         let rows = &found.gather(Some(&exact)).expect("pushed").rids;
         assert_eq!(rows.iter().collect::<Vec<u64>>(), (0..4_000).collect::<Vec<u64>>());
