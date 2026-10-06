@@ -359,6 +359,19 @@ impl Accumulator {
         }
     }
 
+    /// Adds `values` to a COUNT state, which is what that many calls of [`Self::update`] with a
+    /// value that is not null would have done. False for every other aggregate, which is left as it
+    /// was.
+    pub fn count_more(&mut self, values: i64) -> bool {
+        match &mut self.state {
+            State::Counted { count, .. } => {
+                *count += values;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Finish an exact integer SUM held in a compact grouped state.
     #[must_use]
     pub fn exact_sum(total: i128, seen: bool, returns: &LogicalType) -> Self {

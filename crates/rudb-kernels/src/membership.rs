@@ -516,9 +516,23 @@ pub fn select_in(input: &Vector, members: &Members, live: Option<&Selection>) ->
             let values = $values.as_slice();
             let wanted: Vec<$ty> =
                 set.short.iter().filter_map(|&value| <$ty>::try_from(value).ok()).collect();
-            Some(match named {
-                Some(named) => chosen(|slot| values[named[slot] as usize], &wanted, negated, named),
-                None => chosen_all(values, &wanted, negated),
+            Some(match (named, window(&wanted)) {
+                (Some(named), Some((low, mask))) => chosen(
+                    |slot| values[named[slot] as usize],
+                    |value| in_window(value, low, mask),
+                    negated,
+                    named,
+                ),
+                (Some(named), None) => chosen(
+                    |slot| values[named[slot] as usize],
+                    |value| among(value, &wanted),
+                    negated,
+                    named,
+                ),
+                (None, Some((low, mask))) => {
+                    chosen_all(values, |value| in_window(value, low, mask), negated)
+                }
+                (None, None) => chosen_all(values, |value| among(value, &wanted), negated),
             })
         }};
     }
@@ -541,12 +555,17 @@ pub fn select_in(input: &Vector, members: &Members, live: Option<&Selection>) ->
             Some(match named {
                 Some(named) => {
                     let codes = packed.codes_at(|slot| named[slot] as usize, count);
-                    chosen(|slot| codes[slot], &wanted, negated, named)
+                    chosen(|slot| codes[slot], |code| among(code, &wanted), negated, named)
                 }
                 None => {
                     let mut codes = vec![0; rows];
                     packed.unpack(0, &mut codes);
-                    chosen_all(&codes, &wanted, negated)
+                    match window(&wanted) {
+                        Some((low, mask)) => {
+                            chosen_all(&codes, |code| in_window(code, low, mask), negated)
+                        }
+                        None => chosen_all(&codes, |code| among(code, &wanted), negated),
+                    }
                 }
             })
         }
@@ -604,26 +623,26 @@ fn picked(count: usize, row: impl Fn(usize) -> u32, keep: impl Fn(usize) -> bool
     Selection::from_indices(out)
 }
 
-/// Every row of `values` that is one of `wanted`, or that is none of them when `negated`.
+/// Every row of `values` that `has` holds for, or that it does not when `negated`.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the caller checked that the row count fits in a u32"
 )]
-fn chosen_all<T: Copy + PartialEq>(values: &[T], wanted: &[T], negated: bool) -> Selection {
+fn chosen_all<T: Copy>(values: &[T], has: impl Fn(T) -> bool, negated: bool) -> Selection {
     let mut out = vec![0_u32; values.len()];
     let mut kept = 0;
     for (row, &value) in values.iter().enumerate() {
         out[kept] = row as u32;
-        kept += usize::from(among(value, wanted) != negated);
+        kept += usize::from(has(value) != negated);
     }
     out.truncate(kept);
     Selection::from_indices(out)
 }
 
 /// [`chosen_all`] over the rows `named` names, with slot `i` of `value` being row `named[i]`.
-fn chosen<T: Copy + PartialEq>(
+fn chosen<T: Copy>(
     value: impl Fn(usize) -> T,
-    wanted: &[T],
+    has: impl Fn(T) -> bool,
     negated: bool,
     named: &[u32],
 ) -> Selection {
@@ -631,10 +650,35 @@ fn chosen<T: Copy + PartialEq>(
     let mut kept = 0;
     for (slot, &row) in named.iter().enumerate() {
         out[kept] = row;
-        kept += usize::from(among(value(slot), wanted) != negated);
+        kept += usize::from(has(value(slot)) != negated);
     }
     out.truncate(kept);
     Selection::from_indices(out)
+}
+
+/// The smallest of `wanted` and a bit for each member at its distance from it, when there are more
+/// than [`among`] writes out by hand and every one is within 64 of the smallest.
+///
+/// TPC-H q16 asks for `p_size IN (49, 14, 23, 45, 19, 3, 36, 9)`, which was eight compares a row
+/// over every part. Inside a window of 64 it is a subtract, a compare and a shift.
+fn window<T: Copy + Into<i128>>(wanted: &[T]) -> Option<(i128, u64)> {
+    if wanted.len() <= 3 {
+        return None;
+    }
+    let low = wanted.iter().map(|&value| value.into()).min()?;
+    let mut mask = 0_u64;
+    for &value in wanted {
+        let place = u32::try_from(value.into() - low).ok().filter(|&place| place < u64::BITS)?;
+        mask |= 1 << place;
+    }
+    Some((low, mask))
+}
+
+/// Whether `value` is one of the members [`window`] found the window of.
+#[inline]
+fn in_window<T: Into<i128>>(value: T, low: i128, mask: u64) -> bool {
+    let place = value.into() - low;
+    (0..64).contains(&place) & ((mask >> (place & 63)) & 1 == 1)
 }
 
 /// Whether `value` is one of `wanted`, with no branch for the lists a query writes out by hand.
@@ -816,7 +860,36 @@ mod tests {
     use rudb_common::{LogicalType, Value};
     use rudb_vector::{Form, Selection, Vector};
 
-    use super::{Kernel, Members, fallback, in_set, select_in};
+    use super::{Kernel, Members, among, fallback, in_set, in_window, select_in, window};
+
+    #[test]
+    fn a_list_inside_a_window_of_64_answers_as_the_compares_do() {
+        let lists: [&[i64]; 5] = [
+            &[49, 14, 23, 45, 19, 3, 36, 9],
+            &[-5, 0, 7, 58],
+            &[i64::MIN, i64::MIN + 1, i64::MIN + 63, i64::MIN + 9],
+            &[i64::MAX, i64::MAX - 1, i64::MAX - 63, i64::MAX - 20],
+            &[10, 11, 12, 73],
+        ];
+        for wanted in lists {
+            let Some((low, mask)) = window(wanted) else {
+                assert_eq!(wanted, &[10, 11, 12, 73], "only the last list is wider than 64");
+                continue;
+            };
+            let probes = wanted
+                .iter()
+                .flat_map(|&value| [value.wrapping_sub(1), value, value.wrapping_add(1)])
+                .chain([i64::MIN, i64::MAX, 0, -1, 64, -64]);
+            for value in probes {
+                assert_eq!(
+                    in_window(value, low, mask),
+                    among(value, wanted),
+                    "{value} in {wanted:?}"
+                );
+            }
+        }
+        assert_eq!(window(&[1_u8, 2, 3]), None, "three are written out by hand");
+    }
 
     /// What the kernel answers for each row, as the values a caller would read back.
     fn over(input: &Vector, list: &[Value], negated: bool) -> Vec<Value> {
