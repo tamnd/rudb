@@ -2638,7 +2638,7 @@ impl<'a> Binder<'a> {
         if value.is_null() {
             return Ok(Bound::All);
         }
-        row_count(&value, clause).map(Bound::Rows)
+        row_count(&value, clause, self.session.postgres().is_some()).map(Bound::Rows)
     }
 
     // ------------------------------------------------------------------- from

@@ -4054,8 +4054,24 @@ impl<'a> Transform<'a> {
                 }
                 Ok(())
             }
+            "OffsetFetchClause" | "FetchOnlyClause" => {
+                let offset = self.find(node, "OffsetClause");
+                if offset != NONE {
+                    self.offset(query, offset)?;
+                }
+                self.fetch(query, self.find(node, "FetchClause"))
+            }
             _ => self.unsupported(node),
         }
+    }
+
+    /// `FetchClause <- 'FETCH' FirstOrNext FetchValue RowOrRows 'ONLY'`, the SQL standard spelling
+    /// of a limit. `FIRST` and `NEXT` mean the same, and so do `ROW` and `ROWS`.
+    fn fetch(&mut self, query: QueryRef, node: u32) -> Result<()> {
+        let value = self.find(node, "FetchValue");
+        let expr = self.expr(self.first(value))?;
+        self.ast.queries[query as usize].limit = expr;
+        Ok(())
     }
 
     /// `LimitClause <- 'LIMIT' LimitValue`.
@@ -8589,6 +8605,12 @@ mod tests {
         assert_eq!(round("SELECT a FROM t OFFSET 5 LIMIT 10"), "SELECT a FROM t LIMIT 10 OFFSET 5");
         assert_eq!(round("SELECT a FROM t LIMIT 10%"), "SELECT a FROM t LIMIT 10%");
         assert_eq!(round("SELECT a FROM t LIMIT ALL"), "SELECT a FROM t", "which is no limit");
+        assert_eq!(round("SELECT a FROM t FETCH FIRST 3 ROWS ONLY"), "SELECT a FROM t LIMIT 3");
+        assert_eq!(
+            round("SELECT a FROM t OFFSET 5 ROWS FETCH NEXT 1 ROW ONLY"),
+            "SELECT a FROM t LIMIT 1 OFFSET 5"
+        );
+        assert_eq!(round("SELECT a FROM t FETCH FIRST $1 ROWS ONLY"), "SELECT a FROM t LIMIT $1");
     }
 
     #[test]
