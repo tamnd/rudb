@@ -136,11 +136,17 @@ impl Statement {
     fn parameter_types(&self, description: Option<&Description>) -> Vec<Oid> {
         let mut types = self.types.clone();
         if let Some(description) = description {
-            for (slot, found) in self.slots.iter().zip(&description.parameters) {
+            let found = description.parameters.iter().zip(&description.written);
+            for (slot, (found, written)) in self.slots.iter().zip(found) {
                 if types[*slot] == 0
                     && let Some(found) = found
                 {
-                    types[*slot] = pg_type(found).oid;
+                    // A cast or a column declaration can write a type such as `varchar(10)`, which
+                    // has the same logical type as `text`.
+                    types[*slot] = match written {
+                        Some(written) if rudb_pgtypes::encodable(found, written.oid) => written.oid,
+                        _ => pg_type(found).oid,
+                    };
                 }
             }
         }
@@ -847,6 +853,16 @@ fn statement(runner: &Runner, sql: Arc<str>, mut types: Vec<Oid>) -> Result<Stat
     // is an error of `Parse` and not of `Execute`.
     if statement.prepared.as_ref().is_some_and(Prepared::binds_at_parse) {
         statement.describe()?;
+        // A parameter that the query does not use and that `Parse` gave no type has no type at
+        // all, as `check_variable_parameters` finds after the analysis.
+        if let Some(unused) = (0..statement.types.len())
+            .find(|slot| statement.types[*slot] == 0 && !statement.slots.contains(slot))
+        {
+            return Err(error(
+                "42P18",
+                format!("could not determine data type of parameter ${}", unused + 1),
+            ));
+        }
     }
     Ok(statement)
 }

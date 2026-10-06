@@ -923,8 +923,21 @@ impl Binder<'_> {
             return self.call("->>", vec![picked, last]);
         }
         let written = [left, right];
-        let left = self.bind_expr(ast, left, scope)?;
+        let mut left = self.bind_expr(ast, left, scope)?;
         let mut right = self.bind_expr(ast, right, scope)?;
+        let mut op = op;
+        if self.session.postgres().is_some() {
+            self.unknown_operand(op, &mut left, &mut right);
+            if let Some(done) = self.pg_datetime_operator(op, left, right)? {
+                return Ok(done);
+            }
+            // `/` divides an interval in PostgreSQL. Only two integers make an integer division.
+            if op == BinaryOp::IntegerDivide
+                && *self.plan().expr_type(left) == LogicalType::Interval
+            {
+                op = BinaryOp::Divide;
+            }
+        }
         if let Some(comparison) = comparison_of(op) {
             return self.compare(comparison, left, right);
         }
@@ -1010,6 +1023,69 @@ impl Binder<'_> {
             }
             Some(name) => self.call(name, vec![left, right]),
             None => Err(Error::not_implemented(format!("the {} operator", spelling(ast, op)))),
+        }
+    }
+
+    /// Casts a parameter of no known type on one side of an arithmetic operator to the type that
+    /// PostgreSQL picks for it, when the other side is a date, a time or an interval.
+    ///
+    /// PostgreSQL first tries the operator with the parameter as the type of the other side, so
+    /// `now() - $1` subtracts two `timestamptz` values. When there is no such operator, it takes
+    /// the one operator that is left, so `now() + $1` adds an `interval`. The function resolution
+    /// of rudb finds no overload for a null on these operators, so the cast comes first. The
+    /// operators that PostgreSQL finds ambiguous, such as `date + $1`, are left as they are.
+    fn unknown_operand(&mut self, op: BinaryOp, left: &mut ExprRef, right: &mut ExprRef) {
+        use LogicalType as L;
+        let (unknown_left, other) = match (self.is_placeholder(*left), self.is_placeholder(*right))
+        {
+            (true, false) => (true, self.plan().expr_type(*right).clone()),
+            (false, true) => (false, self.plan().expr_type(*left).clone()),
+            _ => return,
+        };
+        let wanted = match (op, &other) {
+            (BinaryOp::Add, L::Timestamp | L::TimestampTz | L::Time | L::Interval) => L::Interval,
+            (
+                BinaryOp::Subtract,
+                L::Date | L::Timestamp | L::TimestampTz | L::Time | L::Interval,
+            ) => other.clone(),
+            (BinaryOp::Subtract, L::TimeTz) if !unknown_left => L::Interval,
+            (BinaryOp::Divide | BinaryOp::IntegerDivide, L::Interval) if !unknown_left => L::Double,
+            _ => return,
+        };
+        let side = if unknown_left { left } else { right };
+        *side = self.cast_to(*side, &wanted);
+    }
+
+    /// The PostgreSQL operators on dates and times that the functions of rudb answer in another
+    /// way, or `None` for an operator that the functions answer as PostgreSQL does.
+    ///
+    /// `date - date` is the number of days as an `int4`. `time - time` is an `interval`, which is
+    /// the difference of the two times on the same day.
+    fn pg_datetime_operator(
+        &mut self,
+        op: BinaryOp,
+        left: ExprRef,
+        right: ExprRef,
+    ) -> Result<Option<ExprRef>> {
+        if op != BinaryOp::Subtract {
+            return Ok(None);
+        }
+        let types = [left, right].map(|side| self.plan().expr_type(side).clone());
+        match types {
+            [LogicalType::Date, LogicalType::Date] => {
+                let days = self.call("-", vec![left, right])?;
+                Ok(Some(self.cast_to(days, &LogicalType::Integer)))
+            }
+            [LogicalType::Time, LogicalType::Time] => {
+                let day = Value::Date(0);
+                let mut sides = [left, right];
+                for side in &mut sides {
+                    let day = self.add_constant(day.clone());
+                    *side = self.call("+", vec![day, *side])?;
+                }
+                Ok(Some(self.call("-", sides.to_vec())?))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1742,6 +1818,7 @@ impl Binder<'_> {
         explicit: bool,
     ) -> Result<ExprRef> {
         use rudb_pgtypes::oid;
+        self.resolve_written(expr, declared);
         if *self.plan().expr_type(expr) != LogicalType::Varchar {
             return Ok(expr);
         }
@@ -2766,38 +2843,91 @@ impl Binder<'_> {
 
     /// Gives the parameter `expr` stands for the type `ty`, when `expr` is the null of a parameter
     /// of no known type and the statement is being described.
+    pub(crate) fn resolve_placeholder(&self, expr: ExprRef, ty: &LogicalType) {
+        let Some(placeholders) = self.parameters.placeholders() else { return };
+        for (name, ty) in self.placeholders_under(expr, ty, 0) {
+            placeholders.resolve(&name, &ty);
+        }
+    }
+
+    /// Gives the parameter that `expr` stands for the PostgreSQL type `declared`, which a cast or
+    /// the declaration of the column that `expr` is stored into wrote. `expr` has the logical type
+    /// of `declared`, and the cast to that type can be on `expr` or inside the `VALUES` that it
+    /// reads, so one cast is looked through, and only one, because `$1::int` stored into a
+    /// `varchar` column is an `int4` parameter.
+    pub(crate) fn resolve_written(&self, expr: ExprRef, declared: DeclaredType) {
+        let Some(placeholders) = self.parameters.placeholders() else { return };
+        let ty = self.plan().expr_type(expr).clone();
+        for (name, _) in self.placeholders_under(expr, &ty, 1) {
+            placeholders.resolve_written(&name, declared);
+        }
+    }
+
+    /// The parameters of no known type that `expr` stands for when it is given the type `ty`,
+    /// each with the type that it gets. The way from `expr` to a parameter can go through at most
+    /// `casts` casts.
     ///
     /// A column is followed back to the projection or the `VALUES` that makes it, since that is
     /// how a parameter in a `SET`, in an `INSERT ... SELECT` or in a `VALUES` of several rows gets
-    /// to the cast to the type of the column it is written to.
-    fn resolve_placeholder(&self, expr: ExprRef, ty: &LogicalType) {
-        let Some(placeholders) = self.parameters.placeholders() else { return };
+    /// to the cast to the type of the column it is written to. A row is followed into its fields,
+    /// so in `(a, c) = ($1, $2)` each parameter takes the type of its own column.
+    fn placeholders_under(
+        &self,
+        expr: ExprRef,
+        ty: &LogicalType,
+        casts: usize,
+    ) -> Vec<(String, LogicalType)> {
+        let mut found = Vec::new();
         if self.placeholders.is_empty() {
-            return;
+            return found;
         }
-        let mut pending = vec![expr];
-        while let Some(expr) = pending.pop() {
+        let mut pending = vec![(expr, ty.clone(), casts)];
+        while let Some((expr, ty, casts)) = pending.pop() {
             if let Some((_, name)) = self.placeholders.iter().find(|(held, _)| *held == expr) {
-                placeholders.resolve(name, ty);
+                found.push((name.clone(), ty));
                 continue;
             }
-            let Expr::Column(binding) = self.plan().expr(expr) else { continue };
             let plan = self.plan();
-            let column = binding.column as usize;
-            for node in 0..plan.node_count() {
-                match plan.node(node as NodeRef) {
-                    Node::Project { index, exprs, .. } if *index == binding.table => {
-                        pending.extend(plan.expr_list(*exprs).get(column));
+            match plan.expr(expr) {
+                Expr::Cast { input, .. } if casts > 0 => pending.push((*input, ty, casts - 1)),
+                Expr::Function { name, args }
+                    if plan.string(*name) == crate::structs::STRUCT_PACK
+                        && let LogicalType::Struct(fields) = &ty =>
+                {
+                    for (&arg, field) in plan.expr_list(*args).iter().zip(fields) {
+                        pending.push((arg, field.ty.clone(), casts));
                     }
-                    Node::Values { index, rows, .. } if *index == binding.table => {
-                        for &row in plan.row_list(*rows) {
-                            pending.extend(plan.expr_list(row).get(column));
+                }
+                Expr::Column(binding) => {
+                    let column = binding.column as usize;
+                    for node in 0..plan.node_count() {
+                        match plan.node(node as NodeRef) {
+                            Node::Project { index, exprs, .. } if *index == binding.table => {
+                                if let Some(&made) = plan.expr_list(*exprs).get(column) {
+                                    pending.push((made, ty.clone(), casts));
+                                }
+                            }
+                            Node::Values { index, rows, .. } if *index == binding.table => {
+                                for &row in plan.row_list(*rows) {
+                                    if let Some(&made) = plan.expr_list(row).get(column) {
+                                        pending.push((made, ty.clone(), casts));
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
+        found
+    }
+
+    /// Whether `expr` is the null of a parameter of no known type, in a statement that is being
+    /// described.
+    pub(crate) fn is_placeholder(&self, expr: ExprRef) -> bool {
+        self.placeholders.iter().any(|(held, _)| *held == expr)
     }
 
     /// A comparison, with both sides brought to the type they meet at.

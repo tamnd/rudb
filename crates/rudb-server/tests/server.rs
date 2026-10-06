@@ -475,7 +475,7 @@ fn the_extended_query_flow() {
     client.describe(Target::Statement, "");
     let messages = client.sync();
     assert_eq!(tags(&messages), "1tnZ");
-    assert_eq!(parameter_types(&messages[1]), [23, 25]);
+    assert_eq!(parameter_types(&messages[1]), [23, 1043]);
 
     // A text value and a binary value of the type that Describe gives.
     client.bind("", "", &[], &[Some(b"1"), Some(b"a")]);
@@ -731,6 +731,48 @@ fn a_name_that_if_exists_lets_go_gives_a_notice() {
 }
 
 #[test]
+fn a_parameter_of_no_type_takes_the_type_that_postgres_gives_it() {
+    let dirs = Dirs::new("inference");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create table t (a int4, c text, h varchar(5), i timestamptz)");
+    let cases: [(&str, &[u32]); 10] = [
+        ("select a from t limit $1 offset $2", &[20, 20]),
+        ("select a from t where a = $1 limit $2", &[23, 20]),
+        ("insert into t (h, a) values ($1, $2)", &[1043, 23]),
+        ("update t set h = $1", &[1043]),
+        ("select $1::varchar(3), $2::char(2)", &[1043, 1042]),
+        ("select a from t where (a, c) = ($1, $2)", &[23, 25]),
+        ("select now() + $1, now() - $2", &[1186, 1184]),
+        ("select current_date - $1, interval '1 day' / $2", &[1082, 701]),
+        ("select a from t where i > now() - $1::interval", &[1186]),
+        ("select '10:00'::time - $1", &[1083]),
+    ];
+    for (sql, types) in cases {
+        client.parse("", sql, &[]);
+        client.describe(Target::Statement, "");
+        let messages = client.sync();
+        assert_eq!(tags(&messages)[..2], *"1t", "{sql}");
+        assert_eq!(parameter_types(&messages[1]), types, "{sql}");
+    }
+    // A parameter that the query does not use has no type, unless Parse gives it one.
+    for (sql, missing) in [("select $2", "$1"), ("select $3, $1", "$2")] {
+        client.parse("", sql, &[]);
+        let messages = client.sync();
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("42P18"), "{sql}");
+        let message = format!("could not determine data type of parameter {missing}");
+        assert_eq!(messages[0].field(b'M'), Some(message), "{sql}");
+    }
+    client.parse("", "select $2", &[23]);
+    client.describe(Target::Statement, "");
+    let messages = client.sync();
+    assert_eq!(parameter_types(&messages[1]), [23, 25]);
+    server.stop().unwrap();
+}
+
+#[test]
 fn division_follows_the_rules_of_postgres() {
     let dirs = Dirs::new("division");
     let server = Server::start(dirs.config()).unwrap();
@@ -739,6 +781,13 @@ fn division_follows_the_rules_of_postgres() {
     let messages = client.query("select 7 / 2, -7 / 2, 7::float8 / 2");
     let row: Vec<_> = data_row(&messages[1]).into_iter().map(Option::unwrap).collect();
     assert_eq!(row, [b"3".to_vec(), b"-3".to_vec(), b"3.5".to_vec()]);
+    // An interval divides with `/`, two times give an interval and two dates an `int4`.
+    let sql = "select interval '1 mon 1 day' / 7, time '09:00' - time '23:59', \
+               date '2020-03-01' - date '2020-02-01'";
+    let messages = client.query(sql);
+    assert_eq!(row_shape(&messages[0]).iter().map(|c| c.1).collect::<Vec<_>>(), [1186, 1186, 23]);
+    let row: Vec<_> = data_row(&messages[1]).into_iter().map(Option::unwrap).collect();
+    assert_eq!(row, [b"4 days 10:17:08.546743".to_vec(), b"-14:59:00".to_vec(), b"29".to_vec()]);
     // A zero divisor is an error for every type, with no position, as it is in PostgreSQL.
     for sql in ["select 0 / 0", "select 1 % 0", "select 1.0 / 0", "select 1::float8 / 0"] {
         let messages = client.query(sql);
