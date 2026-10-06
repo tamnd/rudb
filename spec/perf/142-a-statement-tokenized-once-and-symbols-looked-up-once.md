@@ -4,7 +4,7 @@
 
 Planning q02 cost about nine million instructions, measured as the difference between running its `EXPLAIN` a few times and many times. The query itself is 26 million, so a third of what q02 costs went into getting from text to a plan. Two pieces of that had nothing to do with planning.
 
-1. The shell asks `rudb::is_complete` after every line whether the statement typed so far is finished, and that tokenizes the whole statement each time. q02 is 46 lines, so its first line was tokenized 46 times, its second 45 times and so on, before the statement ran and was tokenized again to be split and parsed.
+1. The shell asks `rudb::is_complete` after every line whether the statement typed so far is finished, and that tokenizes the whole statement each time. q02 is 44 lines, so its first line was tokenized 44 times, its second 43 times and so on, before the statement ran and was tokenized again to be split and parsed.
 2. The matcher compares a grammar symbol such as `(` or `,` to a token by comparing the token's text with the symbol's text, which is a call into memcmp. The same token is tried against many symbols as the matcher works through the alternatives of a rule, so every one of those tries paid for the call.
 
 ## The change
