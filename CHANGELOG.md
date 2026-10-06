@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.33
+
+This release continues the PostgreSQL work inside PG2 (#2490) and has engine speed work.
+
+#2625 adds the `numeric` type of PostgreSQL with no limit on its digits. A value keeps its display scale, so `1.0` and `1.00` are equal and print as written. The arithmetic, the input and the output follow `numeric.c`.
+
+#2628 sends the rows that a query made before an error, and then the error, on the simple and on the extended protocol, as PostgreSQL does. It runs `generate_series` in the select list of a PostgreSQL session. A text value in `Bind` for a parameter of no declared type is now read as the type that the binder found, so `SELECT 1 + $1` works. The libpq traces `pipeline_abort` and `singlerow` now give the same frames as PostgreSQL.
+
+#2626 makes TPC-H q16 faster: values for many distinct sets are sorted by set before they go in, and coded sort keys are ranked by code. #2627 keeps a chunk of codes into a table wide dictionary as codes when it is appended to a table.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.32
 
 This release continues the PostgreSQL work inside PG2 (#2490) and has engine speed work.
