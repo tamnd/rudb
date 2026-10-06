@@ -2049,7 +2049,7 @@ fn persist(
     pages: &rudb_native::PagePool,
     database: &str,
 ) -> Result<()> {
-    persist_anchored(path, catalog, pages, database, None)
+    persist_anchored(path, catalog, pages, database, None, false)
 }
 
 /// Whether a schema change is one a Ddl record carries, which replay runs again from its text.
@@ -2416,7 +2416,7 @@ fn persist_main(
         .filter(|held| same_name(&held.name().catalog, DEFAULT_CATALOG))
         .map(|held| (Arc::clone(held.counter()), held.counter().snapshot().1))
         .collect();
-    persist_anchored(path, catalog, pages, DEFAULT_CATALOG, Some(&anchor))?;
+    persist_anchored(path, catalog, pages, DEFAULT_CATALOG, Some(&anchor), false)?;
     for (counter, uses) in counters {
         counter.covered(uses);
     }
@@ -2428,14 +2428,69 @@ fn persist_main(
     journal.checkpointed(&tables, catalog.generation())
 }
 
+/// A `VACUUM` of the default database: a checkpoint, and then the whole file written again when
+/// it holds space nothing reads, see [`wasted`]. The checkpoint first is what makes every table
+/// one the file holds, so that what is live can be told from the file alone, and it is cheap,
+/// since it only writes what changed.
+fn vacuum_main(
+    path: &Path,
+    catalog: &mut Catalog,
+    pages: &rudb_native::PagePool,
+    journal: &mut Option<Journal>,
+) -> Result<()> {
+    persist_main(path, catalog, pages, journal, false)?;
+    let names = catalog
+        .stored_tables_in(DEFAULT_CATALOG)
+        .map(|table| table.name().clone())
+        .collect::<Vec<_>>();
+    if names.is_empty() || !wasted(path, catalog, &names)? {
+        return Ok(());
+    }
+    let anchor = journal.as_ref().map(Journal::anchor);
+    persist_anchored(path, catalog, pages, DEFAULT_CATALOG, anchor.as_ref(), true)
+}
+
+/// How much of a file a `VACUUM` leaves to space nothing reads before it writes the file again: a
+/// tenth of it, and never less than this, so a small file is not written again for the few pages
+/// its headers take.
+const VACUUM_SLACK: u64 = 1 << 20;
+
+/// Whether a file every table of which it holds has rows deleted out of it, or more space than a
+/// tenth that no table reads, which a checkpoint leaves when it writes a table again and not the
+/// whole file, see [`mostly_live`].
+fn wasted(path: &Path, catalog: &Catalog, names: &[QualifiedName]) -> Result<bool> {
+    let size = std::fs::metadata(path)?.len();
+    let mut live = 0u64;
+    for name in names {
+        let rows = catalog.table(name)?.rows();
+        if rows.gone().is_some_and(|gone| gone.total() > 0) {
+            return Ok(true);
+        }
+        let reader = match rows {
+            rudb_catalog::Rows::Native(reader) | rudb_catalog::Rows::Masked(reader, ..) => reader,
+            _ => continue,
+        };
+        let layout = reader.layout();
+        live = live
+            .saturating_add(layout.columns_total())
+            .saturating_add(layout.indexes)
+            .saturating_add(layout.directory);
+    }
+    let dead = size.saturating_sub(live);
+    Ok(dead > VACUUM_SLACK && dead.saturating_mul(10) > size)
+}
+
 /// [`persist`], writing `anchor` into the file when there is one, and carrying the file's own
-/// forward when there is not.
+/// forward when there is not. With `whole` every table is written again into a new file, even
+/// those the file already holds, which drops the rows deleted from them and the space no table
+/// reads any more.
 fn persist_anchored(
     path: &Path,
     catalog: &mut Catalog,
     pages: &rudb_native::PagePool,
     database: &str,
     anchor: Option<&LogAnchor>,
+    whole: bool,
 ) -> Result<()> {
     let names =
         catalog.stored_tables_in(database).map(|table| table.name().clone()).collect::<Vec<_>>();
@@ -2461,6 +2516,7 @@ fn persist_anchored(
     // same questions it already answered.
     let anchored = |held: &Held| anchor.is_none_or(|anchor| held.anchor.as_ref() == Some(anchor));
     if clean
+        && !whole
         && held.as_ref().is_some_and(|held| {
             held.tables == wanted(&names) && same_views(&held.views, &views) && anchored(held)
         })
@@ -2480,7 +2536,7 @@ fn persist_anchored(
     // happened to them, so nothing has to be written again. Everything the file holds is still the
     // right bytes in the right place and the commit is a new catalog naming the same pages, with
     // the rows gone written down beside the tables they went from.
-    let restated = restate(path, catalog, &names, held.as_ref())?;
+    let restated = !whole && restate(path, catalog, &names, held.as_ref())?;
     let marks = marks(catalog, &names)?;
     let marked = catalog.stored_tables_in(database).all(|table| {
         (table.rows().is_stored() || table.rows().markable()) && table.clustering_is_stored()
@@ -7338,14 +7394,34 @@ impl Shared {
                     Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns },
                 )
             }
-            // The statistics of a table are kept up to date as its rows are written, so what is
-            // left is the refusal of PostgreSQL in a transaction block and the warnings for the
-            // relations it skips.
+            // The statistics of a table are kept up to date as its rows are written, so `ANALYZE`
+            // has nothing to gather. `VACUUM` gives back the space deleted rows and tables written
+            // again left in the file, of the whole file whichever table it names. PostgreSQL
+            // refuses it in a transaction block, and the pin takes it there and writes nothing, as
+            // it does on a database without a file.
             Bound::Vacuum(vacuum) => {
                 if vacuum.outside_transaction && self.transacting() {
                     return Err(Error::transaction("VACUUM cannot run inside a transaction block")
                         .state(SqlState::ACTIVE_SQL_TRANSACTION)
                         .unplaced());
+                }
+                drop(catalog);
+                if vacuum.vacuum
+                    && !self.transacting()
+                    && let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable)
+                {
+                    let mut catalog = self.committed();
+                    vacuum_main(
+                        path,
+                        &mut catalog,
+                        &self.inner.pages,
+                        &mut self.committed_journal(),
+                    )?;
+                    let links = self.inner.settings.links();
+                    sketch(path, &mut catalog, &self.inner.pages, |catalog| {
+                        index(path, catalog, &links, &self.inner.pages)?;
+                        seal(path, catalog, &self.inner.pages)
+                    })?;
                 }
                 let level = rudb_common::notice::Level::Warning;
                 let notices = vacuum
