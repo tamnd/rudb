@@ -1,0 +1,13 @@
+# 164. The loosest test every branch of a disjunction makes of a column
+
+## The problem
+
+A disjunction over two tables tells the filter pass two things already. `shared` lifts a test that every branch makes word for word, and `narrowed` gives each table the disjunction of what each branch says about it. Neither takes a branch apart. TPC-H q19 names a brand, four containers and a range of sizes in each of its three branches, so part gets a disjunction of three conjunctions and the filter walks it branch by branch over all 200,000 parts to keep 485. Selection::without and Selection::complement, which thread an OR, came to about 21M instructions a run between them, and range comparisons over packed integers another 13M, out of about 95M for the query.
+
+## The change
+
+For each column that every branch tests against constants, the pass now also states the loosest such test beside the disjunction. Equalities, including an IN list as the binder writes it, are gathered into one list across the branches. Of the bounds on one side, each branch's tightest is what the branch promises, and the loosest of those over the branches is stated. On q19 part gets `p_brand IN` three brands, `p_container IN` twelve containers and `p_size <= 15`, and lineitem gets `l_quantity >= 1` and `l_quantity <= 30`. Each is one membership test over dictionary codes or one comparison of packed integers, and together they leave about one part in a hundred for the disjunction. A bound at the top of a filter is also one a scan can skip a block with, which a bound inside an OR never is. As with `narrowed`, this applies only to a disjunction over more than one table, and volatile tests are left out. `stretch` (#2765) states the one range that a column's ranges cover inside the disjunction `narrowed` gives one table, when the ranges meet with no gap. On q19 it states the same two `l_quantity` bounds, which are stated once, since each is checked against what the list already has. What this adds over it is the lists of equalities, which a range does not cover, and the bounds of a disjunction whose ranges leave a gap.
+
+## Results
+
+Measured against main at 2bade134, in instructions a run at SF1 on one thread, with every answer the same at one and four threads on both the clustered and the base database. Together with note 134, which reads a code page at the rows a scan keeps, q19 went from 181M to 173M. Against the main of a few days before, at 20444c5d, the same two took q19 from 95M to 88M. Main itself moved q19 from 95M to 181M in between, which is not this change and is written up on the milestone.
