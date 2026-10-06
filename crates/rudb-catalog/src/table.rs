@@ -3362,9 +3362,10 @@ impl Table {
         }
     }
 
-    /// The error DuckDB raises when a null reaches a column that refuses them.
+    /// The error DuckDB raises when a null reaches a column that refuses them, with the text
+    /// PostgreSQL gives.
     fn null_in(&self, column: &str) -> Error {
-        Error::constraint(format!("NOT NULL constraint failed: {}.{}", self.name.table, column))
+        null_in(&self.name.table, column)
     }
 }
 
@@ -3461,6 +3462,16 @@ fn lay(ty: &LogicalType, chunks: &[Chunk], column: usize, rows: usize) -> Result
         chunks.iter().map(|chunk| chunk.column(column).cloned()).collect::<Result<Vec<_>>>()?;
     let order = (0..rows).collect::<Vec<_>>();
     rudb_vector::assemble::interleave(ty, &pieces, &order)
+}
+
+/// The error for a null in the column `column` of `table`, which refuses them.
+#[must_use]
+pub fn null_in(table: &str, column: &str) -> Error {
+    Error::constraint(format!("NOT NULL constraint failed: {table}.{column}"))
+        .state(rudb_common::SqlState::NOT_NULL_VIOLATION)
+        .pg(format!(
+            "null value in column \"{column}\" of relation \"{table}\" violates not-null constraint"
+        ))
 }
 
 #[cfg(test)]

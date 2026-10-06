@@ -6,7 +6,6 @@ use rudb_bind::Parameters;
 use rudb_catalog::QualifiedName;
 use rudb_common::{Error, Field, LogicalType, Origin, Result, Value};
 use rudb_parse::ast::{self, Ast};
-use rudb_parse::parse_ast_with_case;
 
 use crate::connection::single;
 use crate::database::Shared;
@@ -777,7 +776,7 @@ impl Prepared {
     /// Parses `sql` and reads the parameters out of it.
     pub(crate) fn new(shared: Shared, sql: &str) -> Result<Self> {
         let session = shared.session();
-        let ast = parse_ast_with_case(sql, session.semantics().identifier_case())?;
+        let ast = crate::database::parse(&session, sql)?;
         let names: Vec<String> = ast.parameters().into_iter().map(str::to_string).collect();
         let direct = Direct::of(&ast);
         let lookup = Lookup::of(&ast);
