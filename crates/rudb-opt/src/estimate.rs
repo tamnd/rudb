@@ -3411,7 +3411,7 @@ mod tests {
         // Two conditions on the column are one interval, and only the middle value is inside it.
         let both =
             "(#0.0::INTEGER > 3::INTEGER)::BOOLEAN AND (#0.0::INTEGER < 5::INTEGER)::BOOLEAN";
-        let text = format!("Filter {both}\n  {}", bounded_scan());
+        let text = format!("Filter ({both})::BOOLEAN\n  {}", bounded_scan());
         assert_eq!(common_stat(&text, 3, &held).value(), Some(&732_044));
     }
 

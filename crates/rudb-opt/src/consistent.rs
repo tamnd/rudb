@@ -1049,15 +1049,14 @@ impl Weight {
                 Some(reach.touched(share * reach.values as f64))
             })
             .fold(1.0, f64::min);
-        // The rest of the columns at the rows the keys keep, and those are read out of every part
-        // one of the rows is in, at the share of a scan of it [`DECODE`] says, and at the rows on
-        // top. Priced at the rows alone, the names of the 285,237 people `cast_info` left in JOB 6d
-        // cost a fifteenth of reading every name. Those people are in every part of `name`, and
-        // reading them took nine tenths of the time of the whole scan.
+        // The rest of the columns at the rows the keys keep, each at what [`PICK`] says reading a
+        // column at one row picked out of a part costs, and at no more than reading them at every
+        // row of the parts touched. Priced at a unit a row, the names of the 285,237 people
+        // `cast_info` left in JOB 6d cost a fifteenth of reading every name, and reading them took
+        // nine tenths of the time of the whole scan.
         let rows = self.rows as f64;
         let parts = (rows / PART).ceil().max(1.0);
-        let spread = (1.0 - (1.0 - 1.0 / parts).powf(rows * touched * fed)).min(touched);
-        let wide = (spread * DECODE + touched * fed * (1.0 - DECODE)).min(touched);
+        let wide = touched * (fed * PICK).min(1.0);
         let scanned = rows * (touched + self.width as f64 * wide);
         // Read at the rows the narrowed classes' values are in, which the executor does when each
         // is under one row in `GATHERED`, see `listed_keys` in `rudb-exec`, and at the rows all of
@@ -1306,6 +1305,15 @@ impl std::ops::Index<&u32> for Standing {
 /// read `name` with its pattern first. Across the JOB queries whose plans this moves, 0.3 ran faster
 /// than both 1 and 0.1, where 0.1 made gathers so cheap that 17c took `cast_info` early again.
 const DECODE: f64 = 0.3;
+
+/// What reading a column at one row the keys picked out of a part costs, as rows of a scan of it.
+/// The rows left are read one by one where a scan runs over the column, and a string column is
+/// found in its part a row at a time. In JOB 6d `name` read at 560 rows a part took nine tenths of
+/// the time of reading it whole, which is about 13 rows of a scan a row picked. A charge of the
+/// share of a scan a gather decodes each part at, which is what the spread of the rows first
+/// priced, made `cast_info` read at the 4,512 voice roles of JOB 8a in nine milliseconds cost more
+/// than reading every name in 66, and the plan read `name` whole first at twice the time.
+const PICK: f64 = 12.0;
 
 /// The rows of one part of a native table, which a row gathered out of it decodes.
 const PART: f64 = 8192.0;
@@ -2145,11 +2153,14 @@ mod tests {
         let gathered = 4_000_000.0 * decoded * DECODE * 5.0 + 40.0 * GATHER;
         assert!((cost - gathered).abs() < 1.0, "{cost} {gathered}");
         assert!(cost < 2_000_000.0, "{cost}");
-        // Four thousand rows fall in nearly every part, and the scan is cheaper.
+        // Four thousand rows fall in nearly every part, and a gather decodes every part, so the
+        // scan of the key column with the rest read at the rows it keeps is cheaper.
         let spread = Standing::from([(1, 0.001)]);
-        assert!((name.cost(&spread, &classes) - 4_000_000.0 * 1.004).abs() < 1.0);
+        let picked = 4_000_000.0 * (1.0 + 4.0 * 0.001 * PICK);
+        assert!((name.cost(&spread, &classes) - picked).abs() < 1.0);
+        // Half the people is past what a gather takes, and the scan reads every row of the rest.
         let many = Standing::from([(1, 0.5)]);
-        assert!((name.cost(&many, &classes) - 12_000_000.0).abs() < 1.0);
+        assert!((name.cost(&many, &classes) - 20_000_000.0).abs() < 1.0);
     }
 
     /// JOB 6d's `movie_keyword`: eight keywords of 134,170 reach 35,548 rows, which the average
@@ -2340,10 +2351,9 @@ mod tests {
         let average = movie_info.cost(&standing, &classes);
         movie_info.named = vec![(0, 1, 0.085, Some(390.0 / 1_812.0))];
         let counted = movie_info.cost(&standing, &classes);
-        // The rows the keys keep are in every part the named value is in, so the rest of the
-        // columns are read in all of those parts, at the share of a scan a gather decodes them at.
+        // The rows the keys keep are read one by one in every part the named value is in.
         let touched = 390.0 / 1_812.0;
-        let wide = touched * (DECODE + 0.085 * (1.0 - DECODE));
+        let wide = touched * (0.085 * PICK).min(1.0);
         assert!((counted - 14_835_720.0 * (touched + 4.0 * wide)).abs() < 1.0, "{counted}");
         assert!(counted > average * 4.0, "{average} {counted}");
     }
