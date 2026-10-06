@@ -1294,6 +1294,18 @@ pub enum Expr {
         /// Whether the quantifier was `ALL` rather than `ANY`.
         all: bool,
     },
+    /// `x op ANY (array)` or `x op ALL (array)`, the PostgreSQL form whose candidates are the
+    /// elements of an array value rather than the rows of a query.
+    QuantifiedArray {
+        /// The value on the left of the comparison.
+        operand: ExprRef,
+        /// The comparison applied to each element.
+        op: BinaryOp,
+        /// The array whose elements are the candidates.
+        array: ExprRef,
+        /// Whether the quantifier was `ALL` rather than `ANY`.
+        all: bool,
+    },
     /// `DEFAULT` where a value is written, which is the column's default and only means something
     /// as a whole item of an `INSERT`'s `VALUES` row.
     Default,

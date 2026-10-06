@@ -4632,12 +4632,14 @@ impl<'a> Transform<'a> {
             if self.contains(operator, "AnyAllParsedOperator") {
                 let any_op = self.descendant(operator, "AnyOp");
                 let op = self.binary_op(any_op)?;
+                let all = self.contains(operator, "SubqueryAll");
                 let reference = self.descendant(operand, "SubqueryReference");
                 if reference == NONE {
-                    return self.unsupported(operand);
+                    let array = self.expr(operand)?;
+                    left = self.push(Expr::QuantifiedArray { operand: left, op, array, all });
+                    continue;
                 }
                 let query = self.query(self.first(reference))?;
-                let all = self.contains(operator, "SubqueryAll");
                 left = self.push(Expr::QuantifiedSubquery { operand: left, op, query, all });
                 continue;
             }
@@ -6861,6 +6863,10 @@ mod tests {
             Expr::QuantifiedSubquery { operand, op, query, all } => {
                 let quantifier = if all { "ALL" } else { "ANY" };
                 format!("{} {op:?} {quantifier} ({})", show(ast, operand), show_query(ast, query))
+            }
+            Expr::QuantifiedArray { operand, op, array, all } => {
+                let quantifier = if all { "ALL" } else { "ANY" };
+                format!("{} {op:?} {quantifier} ({})", show(ast, operand), show(ast, array))
             }
         }
     }

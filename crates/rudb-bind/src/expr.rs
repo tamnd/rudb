@@ -309,6 +309,9 @@ impl Binder<'_> {
             ast::Expr::QuantifiedSubquery { operand, op, query, all } => {
                 self.bind_quantified_subquery(ast, operand, op, query, all, scope)
             }
+            ast::Expr::QuantifiedArray { operand, op, array, all } => {
+                self.bind_quantified_array(ast, operand, op, array, all, scope)
+            }
             // A row is a struct whose fields have no names, which the pin calls a TUPLE.
             ast::Expr::Row { items } => {
                 let written = ast.expr_list(items).to_vec();
@@ -1738,6 +1741,141 @@ impl Binder<'_> {
         self.bind_mark_subquery(ast, subject, query, op, all, scope)
     }
 
+    /// Binds `x op ANY (array)` or `x op ALL (array)`.
+    ///
+    /// The comparison is made against each element by `list_transform`, and the list of answers
+    /// is folded by PostgreSQL's rule. `ANY` is true when one answer is true, null when none is
+    /// true and one is null, and false else. `ALL` is false when one answer is false, null when
+    /// none is false and one is null, and true else. An empty array is false for `ANY` and true
+    /// for `ALL` even when `x` is null, and a null array is null.
+    ///
+    /// Both sides are cast to the type they compare at before the lambda, so the cast is made
+    /// once a row and not once an element. An untyped parameter or string on the right is an
+    /// array of the left side's type, which is what PostgreSQL gives `c = ANY($1)`.
+    fn bind_quantified_array(
+        &mut self,
+        ast: &Ast,
+        operand: ast::ExprRef,
+        op: BinaryOp,
+        array: ast::ExprRef,
+        all: bool,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        // The elements of `ARRAY(SELECT ...)` are the rows of the query, and the array is never
+        // null, so the comparison is the one against the query, which is a mark join and not a
+        // list built and searched once a row.
+        if let ast::Expr::Subquery { query, array: true } = ast.expr(array) {
+            return self.bind_quantified_subquery(ast, operand, op, query, all, scope);
+        }
+        let comparison = comparison_of(op).ok_or_else(|| {
+            Error::binder("Only comparisons can be used before ANY or ALL".to_string())
+        })?;
+        // A string on one side is of no type yet in PostgreSQL, and it is read with the input
+        // function of the type the other side gives it. On the right that is an array of the left
+        // side's type, so `x = ANY('{1,2}')` is `x = ANY('{1,2}'::int[])` for an `int` x. On the
+        // left it is the element type, so `'a' = ANY(array[1])` reads `'a'` as an integer.
+        let string =
+            |expr| matches!(ast.expr(expr), ast::Expr::Literal { kind: LiteralKind::String, .. });
+        let late = string(operand) && !string(array);
+        let early = if late { Some(self.bind_expr(ast, array, scope)?) } else { None };
+        let mut subject = if let Some(list) = early {
+            let element = match self.plan().expr_type(list) {
+                LogicalType::List(element) | LogicalType::Array(element, _) => (**element).clone(),
+                _ => LogicalType::Varchar,
+            };
+            match self.read_literal(ast, operand, rudb_pgtypes::pg_type(&element).oid) {
+                Some(read) => read?,
+                None => self.bind_expr(ast, operand, scope)?,
+            }
+        } else {
+            self.bind_expr(ast, operand, scope)?
+        };
+        let subject_type = self.plan().expr_type(subject).clone();
+        let mut list = match early {
+            Some(list) => list,
+            None => {
+                let ty = LogicalType::List(Box::new(subject_type.clone()));
+                match self.read_literal(ast, array, rudb_pgtypes::pg_type(&ty).oid) {
+                    Some(read) => read?,
+                    None => self.bind_expr(ast, array, scope)?,
+                }
+            }
+        };
+        // A multidimensional array is compared element by element, as if it were flat.
+        while let LogicalType::List(element) | LogicalType::Array(element, _) =
+            self.plan().expr_type(list).clone()
+            && matches!(*element, LogicalType::List(_) | LogicalType::Array(..))
+        {
+            list = self.call("flatten", vec![list])?;
+        }
+        let list_type = self.plan().expr_type(list).clone();
+        let constant = matches!(self.plan().expr(list), Expr::Constant(_));
+        let element = match list_type {
+            LogicalType::List(element) | LogicalType::Array(element, _) => *element,
+            LogicalType::Null => subject_type.clone(),
+            LogicalType::Varchar if constant => subject_type.clone(),
+            _ => {
+                return Err(Error::binder("op ANY/ALL (array) requires array on right side")
+                    .state(SqlState::WRONG_OBJECT_TYPE));
+            }
+        };
+        if self.is_placeholder(subject) && element != LogicalType::Null {
+            subject = self.cast_to(subject, &element);
+        }
+        let subject_type = self.plan().expr_type(subject).clone();
+        let common = match comparison_type(&subject_type, &element) {
+            Some(common) => common,
+            None => {
+                return Err(Error::binder(format!(
+                    "Cannot compare values of type {subject_type} and type {element} - an explicit cast is required"
+                )));
+            }
+        };
+        let common = if common == LogicalType::Null { LogicalType::Varchar } else { common };
+        let subject = self.checked_cast_to(subject, &common, false)?;
+        let as_list = LogicalType::List(Box::new(common.clone()));
+        let list = self.checked_cast_to(list, &as_list, false)?;
+        // An array known when the statement is bound, which is what a driver's `c = ANY($1)` is
+        // once the parameter has its value, is written out as one comparison an element joined
+        // by `OR` or `AND`. That is the shape of `IN`, which the optimizer reads as a set of
+        // values, and the null rule of the two connectives is the rule of `ANY` and `ALL`.
+        if let Ok(Some(Value::List { values, .. })) = fold::value_of(self.plan(), list)
+            && values.len() <= MAX_EXPANDED_ARRAY
+        {
+            let mut tests = Vec::with_capacity(values.len());
+            for value in values {
+                let value = self.add_constant(value);
+                let value = self.cast_to(value, &common);
+                tests.push(self.add_expr(
+                    Expr::Compare { op: comparison, left: subject, right: value },
+                    LogicalType::Boolean,
+                ));
+            }
+            let connective = if all { ConjunctionOp::And } else { ConjunctionOp::Or };
+            return Ok(self.conjunction(connective, tests));
+        }
+        let table = self.fresh_index();
+        let name = self.plan_mut().intern("x");
+        let params = self.plan_mut().add_name_list(&[name]);
+        let candidate =
+            self.add_expr(Expr::LambdaParam(rudb_plan::ColumnBinding::new(table, 0)), common);
+        let body = self.add_expr(
+            Expr::Compare { op: comparison, left: subject, right: candidate },
+            LogicalType::Boolean,
+        );
+        let lambda = self.add_expr(Expr::Lambda { table, params, body }, LogicalType::Boolean);
+        let args = self.plan_mut().add_expr_list(&[list, lambda]);
+        let transform = self.plan_mut().intern(crate::lambda::TRANSFORM);
+        let answers = self.add_expr(
+            Expr::Function { name: transform, args },
+            LogicalType::List(Box::new(LogicalType::Boolean)),
+        );
+        let fold = if all { "pg_quantified_all" } else { "pg_quantified_any" };
+        let fold = self.plan_mut().intern(fold);
+        let args = self.plan_mut().add_expr_list(&[answers]);
+        Ok(self.add_expr(Expr::Function { name: fold, args }, LogicalType::Boolean))
+    }
+
     fn bind_mark_subquery(
         &mut self,
         ast: &Ast,
@@ -3102,6 +3240,9 @@ pub(crate) fn aggregating(ast: &Ast, expr: ast::ExprRef, user: &dyn Fn(&str) -> 
         }
         ast::Expr::InSubquery { operand, .. } => aggregating(ast, operand, user),
         ast::Expr::QuantifiedSubquery { operand, .. } => aggregating(ast, operand, user),
+        ast::Expr::QuantifiedArray { operand, array, .. } => {
+            aggregating(ast, operand, user) || aggregating(ast, array, user)
+        }
         ast::Expr::Lambda { body, .. } => aggregating(ast, body, user),
         ast::Expr::Row { items } => {
             ast.expr_list(items).iter().any(|&item| aggregating(ast, item, user))
@@ -3435,6 +3576,15 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             );
             if all { format!("(NOT {any})") } else { any }
         }
+        ast::Expr::QuantifiedArray { operand, op, array, all } => {
+            format!(
+                "({} {} {}({}))",
+                describe(ast, operand, semantics),
+                name_spelling(ast, op),
+                if all { "ALL" } else { "ANY" },
+                describe(ast, array, semantics)
+            )
+        }
         // The parameters keep the case they were written in, which is what the pin prints even though
         // the body finds them without it.
         ast::Expr::Lambda { params, body } => {
@@ -3586,6 +3736,10 @@ fn rank(ty: &LogicalType) -> u32 {
         _ => 1000,
     }
 }
+
+/// The most elements of a known array that `x op ANY (array)` is written out for. A longer array
+/// is compared element by element at run time.
+const MAX_EXPANDED_ARRAY: usize = 1024;
 
 /// The comparison an operator is, if it is one.
 fn comparison_of(op: BinaryOp) -> Option<CompareOp> {

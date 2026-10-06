@@ -800,6 +800,57 @@ fn division_follows_the_rules_of_postgres() {
 }
 
 #[test]
+fn any_and_all_compare_against_the_elements_of_an_array() {
+    let dirs = Dirs::new("quantified");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or("null".to_string(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    // A null answer makes the whole answer null only when no element settles it, and an empty
+    // array settles it for any left side, a null one too.
+    let cases = [
+        ("select 1 = any(array[1,2]), 3 <> all(array[1,2]), 1 = any('{1,2}')", "t,t,t"),
+        (
+            "select 1 = any(array[null,2]), 2 = any(array[null,2]), 3 < all(array[2,null])",
+            "null,t,f",
+        ),
+        ("select null::int = any(array[]::int[]), null::int = all(array[]::int[])", "f,t"),
+        ("select 1 = any(null::int[]), null::int = any(array[1])", "null,null"),
+        (
+            "select 4 = any(array[[1,2],[3,4]]), 2 >= all(array(select generate_series(1, 2)))",
+            "t,t",
+        ),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(text(data_row(&messages[1])), expected, "{sql}");
+    }
+    let messages = client.query("select 1 = any(5)");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("42809"));
+    // A string on the left is read as the element type.
+    let messages = client.query("select 'a' = any(array[1,2])");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("22P02"));
+    // The parameter is an array of the type on the left.
+    client.query("create table t (a int4, c text)");
+    for (sql, types) in [
+        ("select a from t where a = any($1)", [1007]),
+        ("select a from t where c <> all($1)", [1009]),
+        ("select a from t where a = any($1::int8[])", [1016]),
+    ] {
+        client.parse("", sql, &[]);
+        client.describe(Target::Statement, "");
+        let messages = client.sync();
+        assert_eq!(parameter_types(&messages[1]), types, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_rows_before_an_error_go_before_the_error() {
     let dirs = Dirs::new("partial");
     let server = Server::start(dirs.config()).unwrap();
