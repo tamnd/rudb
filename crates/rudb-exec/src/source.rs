@@ -2555,6 +2555,10 @@ impl<'a> Scan<'a> {
             .filter_map(|sideways| Some((sideways.reach(self.index, within)?, sideways)))
             .collect();
         reaching.sort_by_key(|(reach, _)| *reach);
+        if std::env::var_os("RUDB_DBG").is_some() {
+            let n = self.sideways.iter().count() + self.also.len();
+            eprintln!("handed index={} joins={n} held={:?} within={within:?} reaching={:?}", self.index, held.as_ref().map(Rids::len), reaching.iter().map(|(r, _)| *r).collect::<Vec<_>>());
+        }
         if let Some(&(fewest, _)) = reaching.first()
             && held.as_ref().is_none_or(|rows| fewest < rows.len())
         {

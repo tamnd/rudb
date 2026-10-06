@@ -1608,6 +1608,9 @@ fn listed_keys(
     if exact.own {
         return owned_keys(exact, count, keys, within).map(Planned::Ready);
     }
+    if std::env::var_os("RUDB_DBG").is_some() {
+        eprintln!("listed_keys count={count} within={within:?} children={:?} parents={} mono={} link={} keys={}", exact.children, exact.parents, exact.monotone(), exact.link().is_some(), exact.keys().is_some());
+    }
     let children = exact.children.filter(|&children| children > 0)?;
     let worth = |reach: u64| match within {
         Some(held) => reach < held,
@@ -1662,7 +1665,14 @@ fn pushed_keys(
         return None;
     }
     let link = exact.link()?;
-    let pushed = keyed_parents(map, link.parents(), keys)?.forward(link).ok()?;
+    let parents = keyed_parents(map, link.parents(), keys);
+    if std::env::var_os("RUDB_DBG").is_some() {
+        eprintln!("pushed_keys parents={:?}", parents.as_ref().map(Rids::len));
+    }
+    let pushed = parents?.forward(link).ok()?;
+    if std::env::var_os("RUDB_DBG").is_some() {
+        eprintln!("pushed_keys rows={}", pushed.rids.len());
+    }
     (worth(pushed.rids.len()) && (within || thin(&pushed.rids))).then_some(pushed)
 }
 
