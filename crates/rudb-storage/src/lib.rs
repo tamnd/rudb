@@ -19,6 +19,7 @@ pub mod image;
 pub mod memory;
 pub mod mostly;
 pub mod park;
+pub mod round;
 pub mod sieve;
 pub mod stripes;
 pub mod tally;
