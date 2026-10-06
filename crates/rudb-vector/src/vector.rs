@@ -4547,30 +4547,6 @@ impl Packed<'_> {
         }
     }
 
-    /// Asks for the cache line that holds the start of `row`'s code, without waiting for it.
-    ///
-    /// A gather of rows far apart, which is what a join hands back, reads one word a row and each
-    /// of them misses the cache, and a code at a time the core waits out every miss in turn. Asked
-    /// for some rows ahead, the misses overlap. On TPC-H the wait on that one load was most of the
-    /// gather and the gather was the largest cost over all 22 queries.
-    #[inline]
-    fn prefetch(&self, row: usize) {
-        let word = (self.offset + row) * self.width as usize / u64::BITS as usize;
-        if let Some(word) = self.words.get(word) {
-            #[cfg(target_arch = "x86_64")]
-            #[allow(unsafe_code)]
-            // SAFETY: a prefetch is a hint. It reads nothing into the program and does not fault
-            // whatever the address, and this one is of a word the slice holds.
-            unsafe {
-                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                    std::ptr::from_ref(word).cast::<i8>(),
-                );
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            let _ = word;
-        }
-    }
-
     /// Which code a value would have, and `None` for a value this vector cannot be holding.
     ///
     /// The translation a comparison does once per vector so that it does not have to unpack once per
@@ -4727,11 +4703,15 @@ impl Packed<'_> {
             return;
         }
         if high - low >= rows.saturating_mul(4) {
+            // The fields in locals, the way [`Self::values_at`] reads rows far apart.
+            let (words, width, offset) = (self.words, self.width, self.offset);
+            let wide = width as usize;
             for (index, code) in out[..rows].iter_mut().enumerate() {
                 if index + PREFETCH_AHEAD < rows {
-                    self.prefetch(at(index + PREFETCH_AHEAD));
+                    let ahead = (offset + at(index + PREFETCH_AHEAD)) * wide;
+                    prefetch_word(words, ahead / u64::BITS as usize);
                 }
-                *code = self.code(at(index));
+                *code = code_at(words, (offset + at(index)) * wide, width);
             }
             return;
         }
@@ -4759,19 +4739,27 @@ impl Packed<'_> {
     /// minimum, and here they are signed 32 bit ones, which it has. The span was a fresh buffer
     /// of zeroes, and here each thread keeps one. And the codes were written out whole before the
     /// values were made from them.
-    pub fn values_at<T>(&self, at: &[u32], value: impl Fn(u64) -> T) -> Vec<T> {
+    ///
+    /// Rows spread too far apart to unpack the span they cover are read a code at a time, with the
+    /// words, the width and the offset held in locals and each value written into room the answer
+    /// already has. Read through `self` and pushed, the fields were loaded again for every row and
+    /// the vector asked at each one whether it had room. On q21 that was about fifty instructions a
+    /// value for the dates of the rows a supplier's join list reaches in `lineitem`.
+    pub fn values_at<T: Copy + Default>(&self, at: &[u32], value: impl Fn(u64) -> T) -> Vec<T> {
         thread_local! {
             static SPAN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
         }
         let Some((low, high)) = extent(at) else { return Vec::new() };
         let (low, high) = (low as usize, high as usize);
         if high - low >= at.len().saturating_mul(4) {
-            let mut out = Vec::with_capacity(at.len());
-            for (index, &row) in at.iter().enumerate() {
+            let (words, width, offset) = (self.words, self.width, self.offset);
+            let wide = width as usize;
+            let mut out = vec![T::default(); at.len()];
+            for (index, (slot, &row)) in out.iter_mut().zip(at).enumerate() {
                 if let Some(&ahead) = at.get(index + PREFETCH_AHEAD) {
-                    self.prefetch(ahead as usize);
+                    prefetch_word(words, (offset + ahead as usize) * wide / u64::BITS as usize);
                 }
-                out.push(value(self.code(row as usize)));
+                *slot = value(code_at(words, (offset + row as usize) * wide, width));
             }
             return out;
         }
@@ -5427,6 +5415,30 @@ fn unpack(
 /// How many rows ahead a sparse gather asks for the cache line of. A miss is a few hundred cycles
 /// and a row's read is a handful, so the line has to be asked for well before it is wanted.
 const PREFETCH_AHEAD: usize = 16;
+
+/// Asks for the cache line that holds `words[word]`, without waiting for it, and nothing for a word
+/// past the end.
+///
+/// A gather of rows far apart, which is what a join hands back, reads one word a row and each of
+/// them misses the cache, and a code at a time the core waits out every miss in turn. Asked for
+/// some rows ahead, the misses overlap. On TPC-H the wait on that one load was most of the gather
+/// and the gather was the largest cost over all 22 queries.
+#[inline]
+fn prefetch_word(words: &[u64], word: usize) {
+    if let Some(word) = words.get(word) {
+        #[cfg(target_arch = "x86_64")]
+        #[allow(unsafe_code)]
+        // SAFETY: a prefetch is a hint. It reads nothing into the program and does not fault
+        // whatever the address, and this one is of a word the slice holds.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                std::ptr::from_ref(word).cast::<i8>(),
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = word;
+    }
+}
 
 /// The `width` bits starting at `bit`, low end first.
 ///
