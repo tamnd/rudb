@@ -4606,7 +4606,7 @@ impl Packed<'_> {
             self.unpack(first, &mut out[..rows]);
             return;
         }
-        if high - low >= rows.saturating_mul(4) {
+        if high - low >= rows.saturating_mul(sparse_x()) {
             for (index, code) in out[..rows].iter_mut().enumerate() {
                 if index + PREFETCH_AHEAD < rows {
                     self.prefetch(at(index + PREFETCH_AHEAD));
@@ -4645,7 +4645,7 @@ impl Packed<'_> {
         }
         let Some((low, high)) = extent(at) else { return Vec::new() };
         let (low, high) = (low as usize, high as usize);
-        if high - low >= at.len().saturating_mul(4) {
+        if high - low >= at.len().saturating_mul(sparse_x()) {
             let mut out = Vec::with_capacity(at.len());
             for (index, &row) in at.iter().enumerate() {
                 if let Some(&ahead) = at.get(index + PREFETCH_AHEAD) {
@@ -5307,6 +5307,11 @@ fn unpack(
 /// How many rows ahead a sparse gather asks for the cache line of. A miss is a few hundred cycles
 /// and a row's read is a handful, so the line has to be asked for well before it is wanted.
 const PREFETCH_AHEAD: usize = 16;
+
+fn sparse_x() -> usize {
+    static X: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *X.get_or_init(|| std::env::var("RUDB_SPARSE_X").ok().and_then(|v| v.parse().ok()).unwrap_or(4))
+}
 
 /// The `width` bits starting at `bit`, low end first.
 ///
