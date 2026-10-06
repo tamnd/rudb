@@ -32,7 +32,7 @@
 //! This is the step before `engine-v4/08-concurrency.md`'s design, which keeps one copy of each row
 //! with an undo chain and a lock word in it, and the conflicts it reports are the same ones.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -344,8 +344,9 @@ pub(crate) enum Clash {
 struct Claims {
     /// The revision its snapshot was taken at.
     at: u64,
-    /// By table, updated and deleted rows together.
-    tables: HashMap<i64, Marks>,
+    /// By table, updated and deleted rows together, apart for each set of columns written and for
+    /// deltas.
+    tables: HashMap<i64, Vec<Marks>>,
     /// The tables it created, whose names nobody else may create until it is done.
     creating: Vec<QualifiedName>,
     /// The tables it altered or made a trigger on, which nobody else may do either to until it is
@@ -361,11 +362,40 @@ pub(crate) struct Marks {
     pub(crate) rows: BTreeSet<u64>,
     /// Every row, for a write that could not say which.
     pub(crate) all: bool,
+    /// The columns written, or `None` for every one, which is what a delete and any write that
+    /// does not say are.
+    pub(crate) columns: Option<Box<[usize]>>,
+    /// Whether the write only added to the columns, which two writers can both do to a row and
+    /// both commit, see [`merge`].
+    pub(crate) delta: bool,
 }
 
 impl Marks {
-    /// Whether these rows and `other` share one.
+    /// Every column of `rows` in `frame`, or of every row when `all` says so.
+    pub(crate) fn rows(frame: u64, rows: BTreeSet<u64>, all: bool) -> Self {
+        Self { frame, rows, all, columns: None, delta: false }
+    }
+
+    /// Whether these rows and `other` share one that the two writes cannot both make.
+    ///
+    /// Two deltas never meet, since each adds to what the other left, `08-concurrency.md`
+    /// section 8.5. A delta and any other write meet only in a column they both write, and two
+    /// other writes meet in any row they share, as the pin's do.
     fn meets(&self, other: &Self) -> bool {
+        if self.delta && other.delta {
+            return false;
+        }
+        if (self.delta || other.delta)
+            && let (Some(mine), Some(theirs)) = (&self.columns, &other.columns)
+            && !mine.iter().any(|column| theirs.contains(column))
+        {
+            return false;
+        }
+        self.shares(other)
+    }
+
+    /// Whether these rows and `other` share one, whatever was written to it.
+    fn shares(&self, other: &Self) -> bool {
         if self.all || other.all {
             return true;
         }
@@ -419,7 +449,12 @@ impl Registry {
         self.open
             .iter()
             .filter(|(id, _)| Some(**id) != me)
-            .filter(|(_, claims)| claims.tables.get(&oid).is_some_and(|held| held.meets(marks)))
+            .filter(|(_, claims)| {
+                claims
+                    .tables
+                    .get(&oid)
+                    .is_some_and(|held| held.iter().any(|held| held.meets(marks)))
+            })
             .map(|(id, _)| *id)
             .min()
             .map(Clash::Open)
@@ -439,15 +474,16 @@ impl Registry {
     /// Records that transaction `me` wrote `marks` in the table `oid`.
     pub(crate) fn mark(&mut self, me: u64, oid: i64, marks: Marks) {
         let Some(claims) = self.open.get_mut(&me) else { return };
-        match claims.tables.get_mut(&oid) {
+        let held = claims.tables.entry(oid).or_default();
+        let like =
+            held.iter_mut().find(|held| held.delta == marks.delta && held.columns == marks.columns);
+        match like {
             Some(held) if held.frame == marks.frame => {
                 held.all |= marks.all;
                 held.rows.extend(marks.rows);
             }
             Some(held) => held.all = true,
-            None => {
-                claims.tables.insert(oid, marks);
-            }
+            None => held.push(marks),
         }
     }
 
@@ -458,6 +494,25 @@ impl Registry {
             let at = rudb_catalog::next_revision();
             self.done.push(Done { oid, at, marks });
         }
+    }
+
+    /// The tables where a commit since the snapshot of transaction `me` wrote a row it wrote too,
+    /// which only a delta and a write of other columns let both do. Its commit puts the two
+    /// together there rather than writing its rows over theirs, see [`merge`].
+    pub(crate) fn blends(&self, me: u64) -> HashSet<i64> {
+        let Some(claims) = self.open.get(&me) else { return HashSet::new() };
+        claims
+            .tables
+            .iter()
+            .filter(|(oid, held)| {
+                self.done.iter().any(|done| {
+                    done.oid == **oid
+                        && done.at > claims.at
+                        && held.iter().any(|held| held.shares(&done.marks))
+                })
+            })
+            .map(|(oid, _)| *oid)
+            .collect()
     }
 
     /// Whether any transaction is open, which is when a write has to say which rows it changed.
@@ -501,8 +556,8 @@ impl Registry {
         let Some(claims) = self.open.remove(&me) else { return };
         if committed && !self.open.is_empty() {
             let at = rudb_catalog::next_revision();
-            for (oid, marks) in claims.tables {
-                self.done.push(Done { oid, at, marks });
+            for (oid, held) in claims.tables {
+                self.done.extend(held.into_iter().map(|marks| Done { oid, at, marks }));
             }
         }
         match self.open.values().map(|claims| claims.at).min() {
@@ -554,11 +609,12 @@ pub(crate) fn merge(
     mine: Catalog,
     snapshot: &mut Snapshot,
     workers: usize,
-) -> Result<()> {
+    blend: &HashSet<i64>,
+) -> Result<Blended> {
     let base = &snapshot.base;
     if committed.generation() == base.generation() {
         committed.install(mine);
-        return Ok(());
+        return Ok(Vec::new());
     }
     if mine.shape() == base.shape() {
         // One table changed, which is what an autocommit write is, lands on the committed catalog
@@ -576,18 +632,22 @@ pub(crate) fn merge(
             let name = now.name().clone();
             if now.revision() == before.revision() {
                 *committed.table_mut(&name)? = table.clone();
-                return Ok(());
+                return Ok(Vec::new());
             }
             if written.appends() {
                 let written = snapshot.written.remove(&table.oid()).expect("asked just above");
                 let changes = written.into_changes().ok_or_else(commit_conflict)?;
-                return rebase(committed, &name, before, table, changes, workers).map(|_| ());
+                let blends = blend.contains(&table.oid());
+                let mut blended = Vec::new();
+                rebase(committed, &name, (before, table), changes, workers, blends, &mut blended)?;
+                return Ok(blended);
             }
         }
         // Only rows changed here, so the committed catalog keeps its shape and takes this
         // transaction's tables. Worked on a copy, so a conflict in the second table leaves the
         // first one as it was.
         let mut next = committed.clone();
+        let mut blended = Vec::new();
         for table in mine.tables() {
             let Some(before) = by_oid(base, table.oid()) else { return Err(commit_conflict()) };
             // A table handed out to be changed and given back as it was, which is what a `CHECK`
@@ -603,10 +663,12 @@ pub(crate) fn merge(
                 continue;
             }
             let changes = written.into_changes().ok_or_else(commit_conflict)?;
-            snapshot.renumbered |= rebase(&mut next, &name, before, table, changes, workers)?;
+            let blends = blend.contains(&table.oid());
+            snapshot.renumbered |=
+                rebase(&mut next, &name, (before, table), changes, workers, blends, &mut blended)?;
         }
         *committed = next;
-        return Ok(());
+        return Ok(blended);
     }
     if committed.shape() == base.shape() {
         // The schema changed here and only rows changed there, so this transaction's catalog is
@@ -625,10 +687,16 @@ pub(crate) fn merge(
             *mine.table_mut(&name)? = table.clone();
         }
         committed.install(mine);
-        return Ok(());
+        return Ok(Vec::new());
     }
     Err(commit_conflict())
 }
+
+/// Rows a commit wrote other than the transaction had them, because it put a delta or other
+/// columns committed since its snapshot together with its own writes, which the log is told after
+/// the transaction's own records: by table, its name, the rows by the numbers those records use,
+/// and the rows as the commit wrote them.
+pub(crate) type Blended = Vec<(QualifiedName, Vec<u64>, Vec<Chunk>)>;
 
 /// Does what a transaction did to one table again, on the committed table `name`, which others
 /// changed since the snapshot's `before`. `mine` is the transaction's copy of the table.
@@ -651,13 +719,18 @@ pub(crate) fn merge(
 ///
 /// Anything else is done again on every row of the table read into memory, as long as the table
 /// still has the snapshot's rows and no more.
+///
+/// With `blends` a commit since the snapshot wrote some of the rows the transaction did, and each
+/// of them is put together column by column, see [`blended`], and noted in `blended` for the log.
+/// Only the first way can tell which rows those are, so the second fails the commit then.
 fn rebase(
     committed: &mut Catalog,
     name: &QualifiedName,
-    before: &Table,
-    mine: &Table,
+    (before, mine): (&Table, &Table),
     changes: Vec<Change>,
     workers: usize,
+    blends: bool,
+    blended: &mut Blended,
 ) -> Result<bool> {
     let appends = changes.iter().all(|change| matches!(change, Change::Insert(_)));
     if appends {
@@ -685,7 +758,15 @@ fn rebase(
     {
         let kept = base - done.deleted.len() as u64;
         let numbers = done.updated.into_iter().collect::<Vec<_>>();
-        let rows = picked(mine, &copied(&numbers, &done.deleted))?;
+        let copies = copied(&numbers, &done.deleted);
+        let mut rows = picked(mine, &copies)?;
+        if blends && !numbers.is_empty() {
+            let (together, changed) = self::blended(before, now, &numbers, &rows)?;
+            if changed {
+                blended.push((name.clone(), copies, together.clone()));
+            }
+            rows = together;
+        }
         let own = picked(mine, &(kept..mine.rows().len() as u64).collect::<Vec<_>>())?;
         // Where the keys are stays built across all three, see `Table::remove_rows`.
         let table = committed.table_appending(name)?;
@@ -699,7 +780,8 @@ fn rebase(
         return Ok(false);
     }
     // The rows the transaction added go on the end as its copy has them now, so what it did to
-    // them needs no doing again here, only the log numbers them as the copy did.
+    // them needs no doing again here, only the log numbers them as the copy did. The rows found
+    // again are the snapshot's as they were, so nothing committed since needs blending into them.
     if let Some(done) = Redone::of(&changes, base)
         && mine.rows().len() as u64 >= base - done.deleted.len() as u64
         && let Some((updated, deleted)) = found_again(before, now, &done)?
@@ -720,7 +802,7 @@ fn rebase(
     }
     // Row numbers only mean the same rows while nothing committed since moved a row or added one,
     // since the transaction's own appends were numbered from the snapshot's end.
-    if now.frame() != before.frame() || now.rows().len() != before.rows().len() {
+    if blends || now.frame() != before.frame() || now.rows().len() != before.rows().len() {
         return Err(commit_conflict());
     }
     let fields = now.columns().to_vec();
@@ -780,6 +862,112 @@ fn found_again(before: &Table, now: &Table, done: &Redone) -> Result<Option<(Vec
         return Ok(None);
     };
     Ok(Some((updated, deleted)))
+}
+
+/// The rows `mine`, which the transaction wrote over the snapshot's rows `numbers`, put together
+/// with what was committed to those rows since: each column the transaction changed from the
+/// snapshot's `before` takes its value, each it left takes the committed one, and one both
+/// changed, which only two deltas can, takes the committed value plus what the transaction added.
+/// Whether that is anything other than `mine`.
+///
+/// # Errors
+///
+/// A column both changed that cannot be added to, or a sum that does not fit its column, which
+/// fails the commit.
+fn blended(
+    before: &Table,
+    now: &Table,
+    numbers: &[u64],
+    mine: &[Chunk],
+) -> Result<(Vec<Chunk>, bool)> {
+    let fields = now.columns();
+    let was = cells(&picked(before, numbers)?)?;
+    let is = cells(&picked(now, numbers)?)?;
+    let mut rows = cells(mine)?;
+    if was.len() != rows.len() || is.len() != rows.len() {
+        return Err(Error::internal("the rows a transaction wrote are not where it wrote them"));
+    }
+    let mut changed = false;
+    for ((row, was), is) in rows.iter_mut().zip(&was).zip(&is) {
+        for ((value, was), is) in row.iter_mut().zip(was).zip(is) {
+            if same_value(is, was) {
+                continue;
+            }
+            changed = true;
+            *value = if same_value(value, was) {
+                is.clone()
+            } else {
+                added(is, value, was).ok_or_else(commit_conflict)?
+            };
+        }
+    }
+    if !changed {
+        return Ok((mine.to_vec(), false));
+    }
+    let mut chunks = Vec::new();
+    for rows in rows.chunks(VECTOR_SIZE) {
+        let columns = fields
+            .iter()
+            .enumerate()
+            .map(|(at, field)| {
+                let values: Vec<Value> = rows.iter().map(|row| row[at].clone()).collect();
+                Vector::from_values(field.ty.clone(), &values)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        chunks.push(Chunk::with_rows(columns, rows.len())?);
+    }
+    Ok((chunks, true))
+}
+
+/// Whether two values of a column are the same, a NaN the same as itself.
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+        (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
+        _ => a == b,
+    }
+}
+
+/// Every value of `chunks`, row by row.
+fn cells(chunks: &[Chunk]) -> Result<Vec<Vec<Value>>> {
+    let mut rows = Vec::new();
+    for chunk in chunks {
+        for row in 0..chunk.len() {
+            rows.push(
+                (0..chunk.width()).map(|at| chunk.try_value_at(row, at)).collect::<Result<_>>()?,
+            );
+        }
+    }
+    Ok(rows)
+}
+
+/// `now` plus what `mine` added to `was`, for two deltas of one column, or `None` for values that
+/// are not integers or decimals of one type or a sum that does not fit it.
+fn added(now: &Value, mine: &Value, was: &Value) -> Option<Value> {
+    match (now, mine, was) {
+        (Value::Integer(now), Value::Integer(mine), Value::Integer(was)) => {
+            let sum = i64::from(*now) + i64::from(*mine) - i64::from(*was);
+            Some(Value::Integer(i32::try_from(sum).ok()?))
+        }
+        (Value::BigInt(now), Value::BigInt(mine), Value::BigInt(was)) => {
+            let sum = i128::from(*now) + i128::from(*mine) - i128::from(*was);
+            Some(Value::BigInt(i64::try_from(sum).ok()?))
+        }
+        (
+            Value::Decimal { unscaled: now, width, scale },
+            Value::Decimal { unscaled: mine, width: w1, scale: s1 },
+            Value::Decimal { unscaled: was, width: w2, scale: s2 },
+        ) if (width, scale) == (w1, s1) && (width, scale) == (w2, s2) => {
+            let sum = now.checked_add(mine.checked_sub(*was)?)?;
+            let most = 10_i128.checked_pow(u32::from(*width))?;
+            (sum.abs() < most).then_some(Value::Decimal {
+                unscaled: sum,
+                width: *width,
+                scale: *scale,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// What a transaction's changes to one table did to the snapshot's rows, by the snapshot's numbers
