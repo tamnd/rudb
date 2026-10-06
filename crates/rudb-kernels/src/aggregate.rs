@@ -5631,6 +5631,30 @@ mod tests {
     }
 
     #[test]
+    fn a_numeric_sum_and_mean_keep_every_digit() {
+        let number =
+            |text: &str| Value::Numeric(rudb_pgtypes::numeric_in(text, -1).unwrap().to_bytes());
+        let rows = [number("1e30"), Value::Null, number("3.14159"), number("2")];
+        assert_eq!(
+            run("sum", &LogicalType::Numeric, &rows),
+            number("1000000000000000000000000000005.14159")
+        );
+        // The mean has the scale that `numeric_div` gives, as `avg` has in PostgreSQL.
+        let small = [number("1"), number("2"), number("2")];
+        assert_eq!(run("avg", &LogicalType::Numeric, &small).to_string(), "1.6666666666666667");
+        assert_eq!(run("avg", &LogicalType::Numeric, &[Value::Null]), Value::Null);
+        assert_eq!(run("sum", &LogicalType::Numeric, &[number("NaN"), number("1")]), number("NaN"));
+        // Two halves of one group, as two threads fold them, give the mean of the whole group.
+        let mut here = Accumulator::new("avg", &LogicalType::Numeric).expect("known");
+        here.update(&[number("1")]).expect("accumulates");
+        let mut there = Accumulator::new("avg", &LogicalType::Numeric).expect("known");
+        there.update(&[number("2")]).expect("accumulates");
+        there.update(&[number("2")]).expect("accumulates");
+        here.combine(&there).expect("combines");
+        assert_eq!(here.finish().expect("finishes").to_string(), "1.6666666666666667");
+    }
+
+    #[test]
     fn a_sum_of_integers_accumulates_wider_than_it_reads() {
         let rows = vec![Value::Integer(i32::MAX); 4];
         let total = run("sum", &LogicalType::HugeInt, &rows);

@@ -17,6 +17,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, Result, StateKey, StateType, Value, bignum};
+use rudb_pgtypes::Numeric;
 
 use crate::aggregate::Accumulator;
 use crate::aggregate::export::Merge;
@@ -54,6 +55,10 @@ pub(crate) enum General {
     /// `sum` over `BIGNUM`, which has no total too wide to keep, in the layout of
     /// [`rudb_common::bignum`].
     BigSum { held: Option<Vec<u8>> },
+    /// `sum` and `avg` over the `numeric` of PostgreSQL, the total so far and the count of the
+    /// values in it. The total keeps all its digits, and `avg` divides once at the end, with the
+    /// scale that `numeric_div` picks.
+    NumericSum { held: Option<Box<Numeric>>, count: i64, average: bool },
     /// `min` and `max` over an `ENUM`, which keep the place of the label rather than the label,
     /// since an enum is ordered by where its labels were declared.
     Placed { held: Option<usize>, least: bool, returns: LogicalType },
@@ -179,6 +184,9 @@ impl General {
         };
         if name == "sum" && *returns == LogicalType::BigNum {
             return Some(Self::BigSum { held: None });
+        }
+        if matches!(name, "sum" | "avg") && *returns == LogicalType::Numeric {
+            return Some(Self::NumericSum { held: None, count: 0, average: name == "avg" });
         }
         if matches!(name, "min" | "max") && returns.labels().is_some() {
             return Some(Self::Placed {
@@ -342,6 +350,15 @@ impl General {
                 (Value::BigNum(number), Some(so_far)) => *so_far = bignum::add(so_far, number),
                 _ => return Err(unexpected("sum", value)),
             },
+            Self::NumericSum { held, count, .. } => {
+                let Value::Numeric(bytes) = value else { return Err(unexpected("sum", value)) };
+                let number = Numeric::from_bytes(bytes);
+                *held = Some(Box::new(match held.as_deref() {
+                    Some(so_far) => so_far.add(&number)?,
+                    None => number,
+                }));
+                *count += 1;
+            }
             Self::BitString { held, op } => {
                 let Value::Bit(bits) = value else { return Err(unexpected("bit_and", value)) };
                 match held {
@@ -659,6 +676,18 @@ impl General {
                     });
                 }
             }
+            (
+                Self::NumericSum { held, count, .. },
+                Self::NumericSum { held: theirs, count: more, .. },
+            ) => {
+                if let Some(there) = theirs {
+                    *held = Some(Box::new(match held.as_deref() {
+                        Some(here) => here.add(there)?,
+                        None => (**there).clone(),
+                    }));
+                }
+                *count += *more;
+            }
             (Self::BitString { held, op }, Self::BitString { held: theirs, .. }) => {
                 match (held.as_mut(), theirs) {
                     (Some(here), Some(there)) => fold_bits(here, there, *op)?,
@@ -820,6 +849,15 @@ impl General {
             Self::Binned(state) => state.finish(),
             Self::BitString { held, .. } => held.clone().map_or(Value::Null, Value::Bit),
             Self::BigSum { held } => held.clone().map_or(Value::Null, Value::BigNum),
+            Self::NumericSum { held: None, .. } => Value::Null,
+            Self::NumericSum { held: Some(total), count, average } => {
+                let total = if *average {
+                    total.div(&Numeric::from_integer(i128::from(*count)))?
+                } else {
+                    (**total).clone()
+                };
+                Value::Numeric(total.to_bytes())
+            }
             Self::Placed { held, returns, .. } => match (held, returns.labels()) {
                 (Some(place), Some(labels)) => Value::Varchar(labels[*place].clone()),
                 _ => Value::Null,
