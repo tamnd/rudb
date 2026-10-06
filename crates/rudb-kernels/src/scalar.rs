@@ -6528,8 +6528,8 @@ mod tests {
             let count = Vector::from_values(LogicalType::BigInt, &values).expect("counts");
             agrees("__rudb_stamp_seconds", &[stamp.clone(), count], &LogicalType::Timestamp);
             for &one in &counts {
-                let count = Vector::from_values(LogicalType::BigInt, &vec![Value::BigInt(one); 7])
-                    .expect("counts");
+                let values: Vec<Value> = (0..7).map(|_| Value::BigInt(one)).collect();
+                let count = Vector::from_values(LogicalType::BigInt, &values).expect("counts");
                 agrees("__rudb_stamp_seconds", &[stamp.clone(), count], &LogicalType::Timestamp);
             }
         }
