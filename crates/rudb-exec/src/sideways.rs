@@ -1337,6 +1337,15 @@ pub(crate) fn found_for(
             spare = bitmap;
         }
     }
+    // A handoff set aside places no rows of its own, but the scan can still read the rows its keys
+    // reach when they are fewer than what the rest left it, the way it reads a relation of a
+    // consistent reduction. TPC-H q02 is the case: the subquery's `partsupp` scan owns the bitmap of
+    // the 1,987 suppliers of Europe, which reach a fifth of the table, and the 747 parts of the semi
+    // join above reach 2,988 rows. Testing both bitmaps read all 800 thousand rows.
+    let listing = exact
+        .filter(|_| !placed && domain.is_some())
+        .and(reduced.filter(|reduced| reduced.by_key))
+        .map(|reduced| Listing { count: reduced.kept, planned: OnceLock::new(), gathered: OnceLock::new() });
     // The exact rows answer everything the filter would, with no false positives, so a side that
     // has them does not pay for building the filter too. Nor does a side whose reduction stopped
     // early, because it stopped on finding that the first third of the driving table all matches,
@@ -1385,7 +1394,7 @@ pub(crate) fn found_for(
         held,
         reduced,
         keys,
-        listing: None,
+        listing,
     })
 }
 
@@ -1922,11 +1931,13 @@ impl Found {
     /// [`Listing`].
     fn reach(&self, exact: Option<&Exact>) -> Option<u64> {
         let listing = self.listing.as_ref()?;
-        let words = &self.domain.as_ref()?.words;
-        let planned = listing
-            .planned
-            .get_or_init(|| listed_keys(exact?, listing.count, members(words)))
-            .as_ref()?;
+        let domain = self.domain.as_ref()?;
+        // Bit zero is the smallest key the parent holds for a join's bitmap, and key zero for the
+        // one a consistent reduction kept.
+        let base = i64::try_from(domain.base).ok()?;
+        let keys = members(&domain.words).map(move |key| key.wrapping_add(base));
+        let planned =
+            listing.planned.get_or_init(|| listed_keys(exact?, listing.count, keys)).as_ref()?;
         Some(planned.reach())
     }
 
