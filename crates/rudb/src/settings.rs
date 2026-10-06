@@ -338,6 +338,12 @@ pub(crate) struct Settings {
     ///
     /// Not a DuckDB setting either.
     lock_timeout: RwLock<Duration>,
+    /// How many lanes the log writes commits to, as `SET log_lanes` has left it, `None` for
+    /// `auto`, which is what the device card chose, `09-the-log.md` section 9.2. Read at every
+    /// commit, so a change takes effect at the next one.
+    ///
+    /// Not a DuckDB setting either.
+    log_lanes: RwLock<Option<usize>>,
     /// When a commit's rows are seen by other connections, as `SET visibility` has left it.
     visibility: RwLock<Visibility>,
     /// What `SET VARIABLE` has left, in the order the names were first set.
@@ -459,6 +465,7 @@ impl Settings {
             ablate: RwLock::new(rudb_qc::Ablate::NONE),
             commit_sync: RwLock::new(CommitSync::Full),
             lock_timeout: RwLock::new(LOCK_TIMEOUT),
+            log_lanes: RwLock::new(None),
             visibility: RwLock::new(Visibility::Durable),
             variables: RwLock::new(Vec::new()),
             changes: AtomicU64::new(0),
@@ -532,6 +539,11 @@ impl Settings {
     /// What `SET lock_timeout` left a write waiting for a held row.
     pub(crate) fn lock_timeout(&self) -> Duration {
         *self.lock_timeout.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// What `SET log_lanes` left: a number of lanes, or `None` for `auto`.
+    pub(crate) fn log_lanes(&self) -> Option<usize> {
+        *self.log_lanes.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The log size after which a commit checkpoints, `SET checkpoint_threshold`.
@@ -799,6 +811,26 @@ impl Settings {
                 Error::invalid_input(format!("commit_sync is full, os or none, not {written}"))
             })?;
             *self.commit_sync.write().unwrap_or_else(|held| held.into_inner()) = sync;
+            return Ok(());
+        }
+        if is_log_lanes(name) {
+            let written = value.map_or_else(|| "auto".to_string(), text_of);
+            let lanes = match written.trim().to_ascii_lowercase().as_str() {
+                "auto" => None,
+                number => Some(
+                    number
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|lanes| (1..=crate::journal::MOST_LANES).contains(lanes))
+                        .ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "log_lanes is auto or a number from 1 to {}, not {written}",
+                                crate::journal::MOST_LANES
+                            ))
+                        })?,
+                ),
+            };
+            *self.log_lanes.write().unwrap_or_else(|held| held.into_inner()) = lanes;
             return Ok(());
         }
         if is_lock_timeout(name) {
@@ -1363,6 +1395,9 @@ impl Settings {
         if is_lock_timeout(name) {
             return Ok(duration_name(self.lock_timeout()));
         }
+        if is_log_lanes(name) {
+            return Ok(self.log_lanes().map_or_else(|| "auto".to_string(), |n| n.to_string()));
+        }
         if is_visibility(name) {
             let word = match self.visibility() {
                 Visibility::Durable => "durable",
@@ -1784,6 +1819,11 @@ fn is_commit_sync(name: &str) -> bool {
 /// Whether this name is the row lock wait setting, the same shape as [`is_engine`].
 fn is_lock_timeout(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("lock_timeout")
+}
+
+/// Whether this name is the log's lane count, the same shape as [`is_engine`].
+fn is_log_lanes(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("log_lanes")
 }
 
 /// How long a write waits for a held row until a statement says otherwise, the second section

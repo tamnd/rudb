@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -649,13 +649,14 @@ impl Shared {
     /// A handle on a new database, speaking for its first connection.
     fn first(inner: Inner) -> Self {
         let inner = Arc::new(inner);
-        let conn = Arc::new(Conn::new(&inner));
+        let conn = Arc::new(Conn::new(&inner, 0));
         Self { inner, conn }
     }
 
     /// A handle on the same database for a new connection.
     fn another(&self) -> Self {
-        let conn = Arc::new(Conn::new(&self.inner));
+        let worker = self.inner.workers.fetch_add(1, Ordering::Relaxed);
+        let conn = Arc::new(Conn::new(&self.inner, worker));
         Self { inner: Arc::clone(&self.inner), conn }
     }
 }
@@ -684,6 +685,8 @@ struct Conn {
     /// committed since the snapshot, set by [`Shared::clashed`] whether or not it may wait. See
     /// [`Shared::in_transaction`], which runs the first statement of a transaction again then.
     met: AtomicBool,
+    /// Its number among the database's connections, which picks the log lane its commits go to.
+    worker: usize,
     /// The statements `PREPARE` named, by the name in lower case, since the pin finds `"S"` under
     /// `s`.
     prepared: Mutex<BTreeMap<String, Arc<Named>>>,
@@ -753,7 +756,7 @@ struct Named {
 }
 
 impl Conn {
-    fn new(inner: &Arc<Inner>) -> Self {
+    fn new(inner: &Arc<Inner>, worker: usize) -> Self {
         let registry = Arc::clone(&inner.registry);
         Self {
             open: Mutex::default(),
@@ -765,6 +768,7 @@ impl Conn {
             blocked: AtomicU64::new(0),
             transaction: AtomicU64::new(0),
             met: AtomicBool::new(false),
+            worker,
             prepared: Mutex::default(),
             listed: Mutex::default(),
             simple: Mutex::default(),
@@ -861,6 +865,8 @@ struct Inner {
     writer: Mutex<()>,
     /// Which rows the open transactions have written. See [`crate::txn`].
     registry: Arc<Board>,
+    /// How many connections were made after the first, which numbers the next one.
+    workers: AtomicUsize,
     /// The log of the file, for a database that has one it may write. Taken after the catalog lock
     /// by whatever holds both.
     journal: Mutex<Option<Journal>>,
@@ -1494,6 +1500,7 @@ impl Database {
             catalog: ReadMostly::new(Catalog::new()),
             writer: Mutex::default(),
             registry: Arc::default(),
+            workers: AtomicUsize::new(1),
             journal: Mutex::default(),
             #[cfg(test)]
             loading: Mutex::default(),
@@ -1677,6 +1684,7 @@ impl Database {
             catalog: ReadMostly::new(catalog),
             writer: Mutex::default(),
             registry: Arc::default(),
+            workers: AtomicUsize::new(1),
             journal: Mutex::new(journal),
             #[cfg(test)]
             loading: Mutex::default(),
@@ -5427,7 +5435,11 @@ impl Shared {
         // A block the lane refused is followed by the checkpoint, which makes the same rows
         // durable the slow way.
         if !held.needs_checkpoint() {
-            match held.enqueue(self.commit_sync()) {
+            match held.enqueue(
+                self.commit_sync(),
+                self.conn.worker,
+                self.inner.settings.log_lanes(),
+            ) {
                 Ok(None) if !self.over(held) => return Ok(()),
                 Ok(None) => {}
                 Ok(Some(pending)) => {
