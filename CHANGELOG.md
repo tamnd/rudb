@@ -8,6 +8,20 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.36
+
+This release continues the PostgreSQL work inside PG2 (#2490), makes the write path of a table in memory cheaper, and has engine speed work.
+
+#2689 adds the `jsonb` type. The input function writes the normal form of PostgreSQL, the result column has the OID 3802, the binary format is the version byte 1 and then the text, and a JSON syntax error has the detail and the context of PostgreSQL. #2685 stores a `JSON` column in a database file, and refuses at `CREATE TABLE` and `ALTER TABLE` a type that the file cannot store, before the catalog changes. Before this change such a table made every later statement fail. #2686 stores `ENUM` columns in a database file, and #2655 orders an enum by the places of its labels and makes an enum from a query.
+
+#2661 sends the rows of a large query while it runs, with backpressure. #2677 puts the statements of `PREPARE` and of `Parse` in one namespace, as in PostgreSQL. #2683 runs a statement with its values written in on the short paths of a prepared statement, which is how most clients send a statement in the simple flow. #2654 types the parameters that have no type in a function call as PostgreSQL does, and #2657 keeps `round`, `trunc`, `ceil`, `floor` and `abs` of a `numeric` a `numeric`. #2679 and #2680 add the table functions `test_all_types` and `test_vector_types`.
+
+#2662 to #2676 make the writes to a table in memory cheaper. A transaction shares the rows, the keys, the zones and the counts of a table with the copy it started from, and copies a part only when it writes to it. A prepared insert writes its log record from its values, and a prepared delete by key takes the row out where its key finds it.
+
+#2656, #2658, #2660, #2678, #2681, #2682, #2684, #2687 and #2690 make the scans, the joins and the per row loops faster. #2688 tokenizes a statement once in the shell. #2659 makes the cheap steps of the release gate pass.
+
+The native file format now has the column type tags 35 for `ENUM` and 36 for `JSONB`. The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.35
 
 This release continues the PostgreSQL work inside PG2 (#2490) and has engine speed work and two new types.
