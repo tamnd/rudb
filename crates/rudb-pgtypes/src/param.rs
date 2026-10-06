@@ -28,7 +28,7 @@ use crate::reg::{RegInput, RegKind, reg_in};
 use crate::scalar::{bool_in, bytea_in, char_in, name_in, uuid_in};
 use crate::string::{bpchar_in, varchar_in};
 use crate::types::{Oid, PgType, TypeInfo, format_type};
-use crate::{float4_in, float8_in};
+use crate::{float4_in, float8_in, jsonb_in, jsonb_recv};
 
 /// What the text input of a parameter depends on: `DateStyle`, `TimeZone` and `IntervalStyle`.
 #[derive(Debug)]
@@ -65,6 +65,7 @@ pub fn logical_type(oid: Oid) -> Option<LogicalType> {
         oids::TIMESTAMPTZ => LogicalType::TimestampTz,
         oids::INTERVAL => LogicalType::Interval,
         oids::JSON => LogicalType::Json,
+        oids::JSONB => LogicalType::Jsonb,
         oid => {
             let (element, _) = element(oid)?;
             LogicalType::List(Box::new(logical_type(element)?))
@@ -197,6 +198,7 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
         oids::FLOAT8 => Value::Double(float8_in(text)?),
         oids::NUMERIC => numeric(&numeric_in(text, -1)?),
         oids::BYTEA => Value::Blob(bytea_in(text)?),
+        oids::JSONB => Value::Varchar(jsonb_in(text)?),
         oids::UUID => Value::Uuid(uuid::from_bytes(uuid_in(text)?)),
         oids::DATE => date(date_in(text, cx)?),
         oids::TIME => Value::Time(time_in(text, -1, cx)?),
@@ -256,16 +258,7 @@ fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
         oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::NAME | oids::UNKNOWN | oids::JSON => {
             Value::Varchar(recv.text()?.to_owned())
         }
-        oids::JSONB => {
-            let version = recv.byte()?;
-            if version != 1 {
-                return Err(TypeError::new(
-                    SqlState::INVALID_BINARY_REPRESENTATION,
-                    format!("unsupported jsonb version number {version}"),
-                ));
-            }
-            Value::Varchar(recv.text()?.to_owned())
-        }
+        oids::JSONB => Value::Varchar(jsonb_recv(recv.rest())?),
         oids::UUID => Value::Uuid(uuid::from_bytes(recv.uuid()?)),
         oids::DATE => date(date_recv(recv)?),
         oids::TIME => Value::Time(time_recv(recv, -1)?),

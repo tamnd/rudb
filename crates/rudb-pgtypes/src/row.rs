@@ -74,6 +74,9 @@ enum Kind {
     /// The `numeric` of PostgreSQL, in the bytes of `rudb_common::numeric`.
     Numeric,
     Text,
+    /// A `jsonb`, held as its text in the normal form. The text format is the text, and the binary
+    /// format is the version byte 1 and then the text.
+    Jsonb,
     /// A `char(n)`, which goes out padded with spaces to n characters in both formats. The value
     /// is kept with no trailing spaces.
     Bpchar(u32),
@@ -141,6 +144,7 @@ pub fn pg_type(logical: &LogicalType) -> PgType {
         L::TimestampTz => (oids::TIMESTAMPTZ, -1),
         L::Interval => (oids::INTERVAL, -1),
         L::Json => (oids::JSON, -1),
+        L::Jsonb => (oids::JSONB, -1),
         _ => (oids::TEXT, -1),
     };
     PgType { oid, typmod }
@@ -204,6 +208,7 @@ impl Kind {
                 Kind::Text
             }
             oids::JSON if matches!(logical, L::Json | L::Varchar) => Kind::Text,
+            oids::JSONB if *logical == L::Jsonb => Kind::Jsonb,
             oids::BYTEA if *logical == L::Blob => Kind::Bytea,
             oids::DATE if *logical == L::Date => Kind::Date,
             oids::TIME if *logical == L::Time => Kind::Time,
@@ -226,7 +231,7 @@ impl Kind {
     /// pass.
     fn plan(self, binary: bool, element: Option<Element>) -> Plan {
         let path = match (self, binary) {
-            (Kind::Text, _) | (Kind::Bytea, true) => Path::Bytes,
+            (Kind::Text | Kind::Jsonb, false) | (Kind::Text | Kind::Bytea, true) => Path::Bytes,
             (kind, true) => kind.binary_width().map_or(Path::Staged, Path::Fixed),
             (_, false) => Path::Staged,
         };
@@ -245,6 +250,7 @@ impl Kind {
             Kind::Decimal(_)
             | Kind::Numeric
             | Kind::Text
+            | Kind::Jsonb
             | Kind::Bpchar(_)
             | Kind::Bytea
             | Kind::Array
@@ -678,6 +684,16 @@ fn stage_column(
                 })?;
             }
         }
+        (Kind::Jsonb, _) => {
+            let Data::Varlen(strings) = data else { return Err(wrong_data(plan)) };
+            for i in rows {
+                let bytes = strings.bytes(start + i).ok_or_else(|| wrong_data(plan))?;
+                stage(lens, staged, i, |out| {
+                    out.push(1);
+                    out.extend_from_slice(bytes);
+                })?;
+            }
+        }
         (Kind::Bpchar(n), _) => {
             let Data::Varlen(strings) = data else { return Err(wrong_data(plan)) };
             for i in rows {
@@ -1053,6 +1069,7 @@ fn fixed(
         Kind::Decimal(_)
         | Kind::Numeric
         | Kind::Text
+        | Kind::Jsonb
         | Kind::Bpchar(_)
         | Kind::Bytea
         | Kind::Array
@@ -1130,6 +1147,7 @@ mod tests {
             }
             Value::Numeric(v) if binary => numeric_send(&Numeric::from_bytes(v), &mut out),
             Value::Numeric(v) => numeric_out(&Numeric::from_bytes(v), &mut out),
+            Value::Varchar(v) if binary && oid == oids::JSONB => crate::jsonb_send(v, &mut out),
             Value::Varchar(v) => out.extend_from_slice(v.as_bytes()),
             Value::Blob(v) if binary => out.extend_from_slice(v),
             Value::Blob(v) => bytea_out(v, settings.bytea_output, &mut out),

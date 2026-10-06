@@ -7,14 +7,15 @@
 //! the tokens in the same order and finds the same first error.
 //!
 //! `json_in` does not decode the escapes, so it takes `\u0000` and a lone surrogate such as
-//! `\ud800`. Only `jsonb` refuses them.
+//! `\ud800`. Only `jsonb` refuses them: its lexer decodes each string as it reads it, which is
+//! `need_escapes` in `jsonapi.c`, and gives the events of the parse to [`Sink`].
 
 use rudb_common::SqlState;
 
 use crate::error::TypeError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     ObjectStart,
     ObjectEnd,
     ArrayStart,
@@ -52,11 +53,14 @@ enum Error {
     ExpectedObjectFirst,
     ExpectedObjectNext,
     ExpectedString,
+    CodePointZero,
+    HighSurrogate,
+    LowSurrogate,
 }
 
 /// An error and the bytes of the token that it is about.
 #[derive(Debug, Clone, Copy)]
-struct Fail {
+pub(crate) struct Fail {
     error: Error,
     start: usize,
     end: usize,
@@ -71,6 +75,10 @@ fn alphanumeric(b: u8) -> bool {
 struct Lexer<'a> {
     input: &'a [u8],
     at: usize,
+    /// Whether the lexer decodes the strings into `text`.
+    escapes: bool,
+    /// The last string, with its escapes decoded, when `escapes` is set.
+    text: String,
 }
 
 impl Lexer<'_> {
@@ -133,11 +141,15 @@ impl Lexer<'_> {
         (at + len).min(self.input.len())
     }
 
-    /// `json_lex_string` with no decoding: the string that starts with the quote at `start`.
-    /// Gives the end of the string after the closing quote.
-    fn string(&self, start: usize) -> Result<usize, Fail> {
+    /// `json_lex_string`: the string that starts with the quote at `start`. Gives the end of the
+    /// string after the closing quote. With `escapes` set, the string goes into `text` with its
+    /// escapes decoded, and a surrogate pair is one character.
+    fn string(&mut self, start: usize) -> Result<usize, Fail> {
         let b = self.input;
         let unterminated = Fail { error: Error::InvalidToken, start, end: b.len() };
+        let escapes = self.escapes;
+        self.text.clear();
+        let mut high: Option<u32> = None;
         let mut s = start + 1;
         loop {
             // The bytes that need no work. A byte below 32 must be an escape.
@@ -145,19 +157,34 @@ impl Lexer<'_> {
             let Some(run) = run else {
                 return Err(unterminated);
             };
+            if escapes && run > 0 {
+                if high.is_some() {
+                    let end = self.char_end(s);
+                    return Err(Fail { error: Error::LowSurrogate, start, end });
+                }
+                self.text.push_str(std::str::from_utf8(&b[s..s + run]).unwrap_or_default());
+            }
             s += run;
             match b[s] {
-                b'"' => return Ok(s + 1),
+                b'"' => {
+                    if high.is_some() {
+                        return Err(Fail { error: Error::LowSurrogate, start, end: s + 1 });
+                    }
+                    return Ok(s + 1);
+                }
                 b'\\' => {
                     s += 1;
                     match b.get(s) {
                         None => return Err(unterminated),
                         Some(b'u') => {
+                            let mut ch = 0u32;
                             for _ in 0..4 {
                                 s += 1;
                                 match b.get(s) {
                                     None => return Err(unterminated),
-                                    Some(c) if c.is_ascii_hexdigit() => {}
+                                    Some(c) if c.is_ascii_hexdigit() => {
+                                        ch = ch * 16 + char::from(*c).to_digit(16).unwrap_or(0);
+                                    }
                                     Some(_) => {
                                         let end = self.char_end(s);
                                         return Err(Fail {
@@ -168,9 +195,55 @@ impl Lexer<'_> {
                                     }
                                 }
                             }
+                            if escapes {
+                                let fail = |error| Fail { error, start, end: s + 1 };
+                                if (0xd800..=0xdbff).contains(&ch) {
+                                    if high.is_some() {
+                                        return Err(fail(Error::HighSurrogate));
+                                    }
+                                    high = Some(ch);
+                                    s += 1;
+                                    continue;
+                                }
+                                if (0xdc00..=0xdfff).contains(&ch) {
+                                    let Some(first) = high.take() else {
+                                        return Err(fail(Error::LowSurrogate));
+                                    };
+                                    ch = 0x10000 + ((first & 0x3ff) << 10) + (ch & 0x3ff);
+                                }
+                                if high.is_some() {
+                                    return Err(fail(Error::LowSurrogate));
+                                }
+                                if ch == 0 {
+                                    return Err(fail(Error::CodePointZero));
+                                }
+                                self.text.push(char::from_u32(ch).unwrap_or('\u{fffd}'));
+                            }
                         }
-                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {}
+                        Some(&c @ (b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't')) => {
+                            if escapes {
+                                if high.is_some() {
+                                    return Err(Fail {
+                                        error: Error::LowSurrogate,
+                                        start,
+                                        end: s + 1,
+                                    });
+                                }
+                                self.text.push(match c {
+                                    b'b' => '\u{8}',
+                                    b'f' => '\u{c}',
+                                    b'n' => '\n',
+                                    b'r' => '\r',
+                                    b't' => '\t',
+                                    other => char::from(other),
+                                });
+                            }
+                        }
                         Some(_) => {
+                            if escapes && high.is_some() {
+                                let end = self.char_end(s);
+                                return Err(Fail { error: Error::LowSurrogate, start, end });
+                            }
                             // The error shows only the escape and not the whole string.
                             let end = self.char_end(s);
                             return Err(Fail { error: Error::EscapingInvalid, start: s, end });
@@ -225,7 +298,7 @@ impl Lexer<'_> {
 
 /// An array or an object that the parser is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Open {
+pub(crate) enum Open {
     Array,
     Object,
 }
@@ -247,9 +320,54 @@ fn unexpected(token: Token, error: Error) -> Fail {
     Fail { error, start: token.start, end: token.end }
 }
 
-/// `pg_parse_json` with no semantic actions.
-fn parse(input: &[u8]) -> Result<(), Fail> {
-    let mut lexer = Lexer { input, at: 0 };
+/// The semantic actions of a parse. Each event comes after the lexer reads its token and before
+/// it reads the next one, as in `pg_parse_json`, so an error of an action comes before an error
+/// of a later token.
+pub(crate) trait Sink {
+    /// The start of an array or an object.
+    fn open(&mut self, open: Open);
+    /// The end of the array or the object that was opened last.
+    fn close(&mut self);
+    /// The key of the next field of an object, decoded.
+    fn key(&mut self, key: &str);
+    /// A scalar: its kind, its bytes in the input and, for a string, its decoded text.
+    ///
+    /// # Errors
+    ///
+    /// The error of the action, which stops the parse.
+    fn scalar(&mut self, kind: Kind, token: &str, text: &str) -> Result<(), TypeError>;
+}
+
+/// Why a parse stopped.
+pub(crate) enum Stop {
+    Syntax(Fail),
+    Action(TypeError),
+}
+
+impl From<Fail> for Stop {
+    fn from(fail: Fail) -> Stop {
+        Stop::Syntax(fail)
+    }
+}
+
+/// A sink with no actions, for `json_in`.
+struct Check;
+
+impl Sink for Check {
+    fn open(&mut self, _: Open) {}
+    fn close(&mut self) {}
+    fn key(&mut self, _: &str) {}
+    fn scalar(&mut self, _: Kind, _: &str, _: &str) -> Result<(), TypeError> {
+        Ok(())
+    }
+}
+
+/// `pg_parse_json`, which gives each event to `sink`. With `escapes` set, the lexer decodes the
+/// strings and refuses the escapes that do not make text.
+pub(crate) fn parse(input: &str, escapes: bool, sink: &mut impl Sink) -> Result<(), Stop> {
+    let text = |token: Token| &input[token.start..token.end];
+    let input = input.as_bytes();
+    let mut lexer = Lexer { input, at: 0, escapes, text: String::new() };
     let mut stack = Vec::new();
     let mut token = lexer.next()?;
     let mut step = Step::Value;
@@ -258,20 +376,24 @@ fn parse(input: &[u8]) -> Result<(), Fail> {
             Step::Value => match token.kind {
                 Kind::ObjectStart => {
                     stack.push(Open::Object);
+                    sink.open(Open::Object);
                     token = lexer.next()?;
                     match token.kind {
                         Kind::String => Step::Field,
                         Kind::ObjectEnd => {
                             stack.pop();
+                            sink.close();
                             token = lexer.next()?;
                             Step::After
                         }
-                        _ => return Err(unexpected(token, Error::ExpectedObjectFirst)),
+                        _ => return Err(unexpected(token, Error::ExpectedObjectFirst).into()),
                     }
                 }
                 Kind::ArrayStart => {
+                    sink.open(Open::Array);
                     token = lexer.next()?;
                     if token.kind == Kind::ArrayEnd {
+                        sink.close();
                         token = lexer.next()?;
                         Step::After
                     } else {
@@ -280,18 +402,20 @@ fn parse(input: &[u8]) -> Result<(), Fail> {
                     }
                 }
                 Kind::String | Kind::Number | Kind::True | Kind::False | Kind::Null => {
+                    sink.scalar(token.kind, text(token), &lexer.text).map_err(Stop::Action)?;
                     token = lexer.next()?;
                     Step::After
                 }
-                _ => return Err(unexpected(token, Error::ExpectedJson)),
+                _ => return Err(unexpected(token, Error::ExpectedJson).into()),
             },
             Step::Field => {
                 if token.kind != Kind::String {
-                    return Err(unexpected(token, Error::ExpectedString));
+                    return Err(unexpected(token, Error::ExpectedString).into());
                 }
+                sink.key(&lexer.text);
                 token = lexer.next()?;
                 if token.kind != Kind::Colon {
-                    return Err(unexpected(token, Error::ExpectedColon));
+                    return Err(unexpected(token, Error::ExpectedColon).into());
                 }
                 token = lexer.next()?;
                 Step::Value
@@ -299,7 +423,7 @@ fn parse(input: &[u8]) -> Result<(), Fail> {
             Step::After => {
                 let Some(&open) = stack.last() else {
                     if token.kind != Kind::End {
-                        return Err(unexpected(token, Error::ExpectedEnd));
+                        return Err(unexpected(token, Error::ExpectedEnd).into());
                     }
                     return Ok(());
                 };
@@ -312,10 +436,11 @@ fn parse(input: &[u8]) -> Result<(), Fail> {
                     next
                 } else if token.kind == close {
                     stack.pop();
+                    sink.close();
                     token = lexer.next()?;
                     Step::After
                 } else {
-                    return Err(unexpected(token, error));
+                    return Err(unexpected(token, error).into());
                 }
             }
         };
@@ -324,9 +449,15 @@ fn parse(input: &[u8]) -> Result<(), Fail> {
 
 /// The text input of `json`: the string, after a check of the syntax.
 pub fn json_in(s: &str) -> Result<&str, TypeError> {
-    let Err(fail) = parse(s.as_bytes()) else {
-        return Ok(s);
-    };
+    match parse(s, false, &mut Check) {
+        Ok(()) => Ok(s),
+        Err(Stop::Syntax(fail)) => Err(syntax(s, fail)),
+        Err(Stop::Action(error)) => Err(error),
+    }
+}
+
+/// The error of PostgreSQL for a parse that failed, which says `json` for `jsonb` too.
+pub(crate) fn syntax(s: &str, fail: Fail) -> TypeError {
     let token = &s[fail.start..fail.end];
     let detail = match fail.error {
         Error::InvalidToken => format!("Token \"{token}\" is invalid."),
@@ -345,13 +476,46 @@ pub fn json_in(s: &str) -> Result<&str, TypeError> {
         Error::ExpectedObjectFirst => format!("Expected string or \"}}\", but found \"{token}\"."),
         Error::ExpectedObjectNext => format!("Expected \",\" or \"}}\", but found \"{token}\"."),
         Error::ExpectedString => format!("Expected string, but found \"{token}\"."),
+        Error::CodePointZero => "\\u0000 cannot be converted to text.".to_string(),
+        Error::HighSurrogate => {
+            "Unicode high surrogate must not follow a high surrogate.".to_string()
+        }
+        Error::LowSurrogate => "Unicode low surrogate must follow a high surrogate.".to_string(),
     };
-    let mut error = TypeError::new(
-        SqlState::INVALID_TEXT_REPRESENTATION,
-        "invalid input syntax for type json".to_string(),
-    );
+    let mut error = match fail.error {
+        Error::CodePointZero => TypeError::new(
+            SqlState::UNTRANSLATABLE_CHARACTER,
+            "unsupported Unicode escape sequence".to_string(),
+        ),
+        _ => TypeError::new(
+            SqlState::INVALID_TEXT_REPRESENTATION,
+            "invalid input syntax for type json".to_string(),
+        ),
+    };
     error.detail = Some(detail);
-    Err(error)
+    error.context = Some(context(s, fail));
+    error
+}
+
+/// `report_json_context`: the line of the input up to the end of the bad token, cut to about 50
+/// bytes before that end. `...` marks the text that is not shown.
+fn context(s: &str, fail: Fail) -> String {
+    let b = s.as_bytes();
+    let end = fail.end;
+    let line_start =
+        b[..fail.start.min(end)].iter().rposition(|&c| c == b'\n').map_or(0, |at| at + 1);
+    let line = 1 + b[..line_start].iter().filter(|&&c| c == b'\n').count();
+    let mut start = line_start;
+    while end - start >= 50 {
+        start += s[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    if start - line_start <= 3 {
+        start = line_start;
+    }
+    let prefix = if start > line_start { "..." } else { "" };
+    let more = fail.error != Error::ExpectedMore && end < b.len();
+    let suffix = if more && !matches!(b[end], b'\n' | b'\r') { "..." } else { "" };
+    format!("JSON data, line {line}: {prefix}{}{suffix}", &s[start..end])
 }
 
 #[cfg(test)]
@@ -373,6 +537,12 @@ mod tests {
         assert_eq!(detail(r#""\é""#), r#"Escape sequence "\é" is invalid."#);
         assert_eq!(detail("\"a\tb\""), "Character with value 0x09 must be escaped.");
         assert_eq!(detail(r#""abc"#), r#"Token ""abc" is invalid."#);
+        let context = |s: &str| json_in(s).unwrap_err().context.unwrap();
+        assert_eq!(context("[1 2]"), "JSON data, line 1: [1 2...");
+        assert_eq!(context("[1,"), "JSON data, line 1: [1,");
+        assert_eq!(context("[1,\n 2,\n x]"), "JSON data, line 3:  x...");
+        let long = format!("[{}x]", "1, ".repeat(30));
+        assert_eq!(context(&long), format!("JSON data, line 1: ...{}...", &long[43..92]));
     }
 
     #[test]

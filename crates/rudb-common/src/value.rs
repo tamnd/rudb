@@ -485,7 +485,9 @@ impl fmt::Display for Value {
                         f.write_str(", ")?;
                     }
                     match (element, value) {
-                        (LogicalType::Json, Self::Varchar(text)) => f.write_str(text)?,
+                        (LogicalType::Json | LogicalType::Jsonb, Self::Varchar(text)) => {
+                            f.write_str(text)?;
+                        }
                         _ => write_element(f, value)?,
                     }
                 }

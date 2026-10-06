@@ -1049,7 +1049,7 @@ fn placed_strings(
 /// when it is a string and every piece is flat views.
 #[must_use]
 pub fn strings_placeable(ty: &LogicalType, pieces: &[Vector]) -> bool {
-    matches!(ty, LogicalType::Varchar | LogicalType::Blob | LogicalType::Json)
+    matches!(ty, LogicalType::Varchar | LogicalType::Blob | LogicalType::Json | LogicalType::Jsonb)
         && pieces.iter().all(|piece| piece.text_parts().is_some())
 }
 
@@ -1106,8 +1106,10 @@ fn merged_dictionary(
     order: &[usize],
     inverse: Option<&[u32]>,
 ) -> Result<Option<Vector>> {
-    if !matches!(ty, LogicalType::Varchar | LogicalType::Blob | LogicalType::Json)
-        || pieces.is_empty()
+    if !matches!(
+        ty,
+        LogicalType::Varchar | LogicalType::Blob | LogicalType::Json | LogicalType::Jsonb
+    ) || pieces.is_empty()
     {
         return Ok(None);
     }
