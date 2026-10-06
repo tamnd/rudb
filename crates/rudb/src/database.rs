@@ -4275,7 +4275,7 @@ impl Shared {
                 }
             }
             if let Some(chunk) = noted {
-                self.wrote(table.oid(), |written, _| written.appended(&[chunk]));
+                self.wrote(table.oid(), |written, _| written.appended(vec![chunk]));
             }
             if let Some(rows) = &staged {
                 self.stage_rows(&name, table.columns(), rows);
@@ -4551,7 +4551,7 @@ impl Shared {
                 let table = catalog.table_appending(&name)?;
                 table.append_row(&row)?;
                 if let Some(chunk) = noted {
-                    self.wrote(table.oid(), |written, _| written.appended(&[chunk]));
+                    self.wrote(table.oid(), |written, _| written.appended(vec![chunk]));
                 }
                 if let Some(rows) = &staged {
                     self.stage_rows(&name, table.columns(), rows);
@@ -6905,7 +6905,7 @@ impl Shared {
                         let table = catalog.table_appending(name)?;
                         table.append_all(chunks, workers)?;
                         if let Some(noted) = noted {
-                            self.wrote(table.oid(), |written, _| written.appended(&noted));
+                            self.wrote(table.oid(), |written, _| written.appended(noted));
                         }
                         if let Some(payload) = staged
                             && let Some(journal) = self.journal().as_mut()
@@ -7187,7 +7187,7 @@ impl Shared {
         let table = catalog.table_mut(name)?;
         table.append_all(chunks, workers)?;
         if let Some(noted) = noted {
-            self.wrote(table.oid(), |written, _| written.appended(&noted));
+            self.wrote(table.oid(), |written, _| written.appended(noted));
         }
         if let Some(payload) = staged
             && let Some(journal) = self.journal().as_mut()

@@ -129,8 +129,9 @@ impl Written {
         }
     }
 
-    /// Notes rows appended.
-    pub(crate) fn appended(&mut self, chunks: &[Chunk]) {
+    /// Notes rows appended, keeping the chunks themselves rather than a copy, since a copy of a
+    /// chunk is a copy of every value in it and the caller has no more use for them.
+    pub(crate) fn appended(&mut self, chunks: Vec<Chunk>) {
         let added = chunks.iter().map(Chunk::len).sum::<usize>();
         if let Some(origin) = self.origin.as_mut() {
             origin.extend(std::iter::repeat_n(u64::MAX, added));
@@ -139,9 +140,9 @@ impl Written {
         // list of rows rather than a change for each.
         if let Some(changes) = self.changes.as_mut() {
             if let Some(Change::Insert(last)) = changes.last_mut() {
-                last.extend(chunks.iter().cloned());
+                last.extend(chunks);
             } else {
-                changes.push(Change::Insert(chunks.to_vec()));
+                changes.push(Change::Insert(chunks));
             }
         }
     }
