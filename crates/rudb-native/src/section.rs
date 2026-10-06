@@ -103,6 +103,10 @@ pub const LINK_COUNTS: &[u8; 8] = b"RUDBLC1\0";
 /// Paid for out of its own share, so it is on neither budget list below.
 pub const KEY_RUNS: &[u8; 8] = b"RUDBKI1\0";
 
+/// A hot stripe's image as of a checkpoint round's cut, see [`crate::images`]. A stripe's state
+/// rather than a structure over it, so it is on neither budget list below.
+pub const HOT_IMAGE: &[u8; 8] = b"RUDBHI1\0";
+
 /// The kinds the graph document owns, which share its ten percent of the column bytes.
 pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
 
@@ -244,6 +248,7 @@ impl Section {
                 | SORTED_PROJECTION
                 | RUN_PROJECTION
                 | TEXT_GRAMS
+                | HOT_IMAGE
                 | VALUE_ROWS
                 | LINK_COUNTS
                 | KEY_RUNS

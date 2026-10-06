@@ -67,6 +67,7 @@ mod free;
 pub mod grams;
 pub mod graph;
 pub mod host;
+pub mod images;
 mod nested;
 pub mod postings;
 mod prepare;
