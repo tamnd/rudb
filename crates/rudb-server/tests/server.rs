@@ -543,6 +543,32 @@ fn the_extended_query_flow() {
 }
 
 #[test]
+fn a_portal_is_described_before_it_runs() {
+    let dirs = Dirs::new("describe-portal");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The error of the run comes at Execute, after the RowDescription, as in PostgreSQL.
+    client.parse("", "select 0/0", &[]);
+    client.bind("", "", &[], &[]);
+    client.describe(Target::Portal, "");
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12TEZ");
+    assert_eq!(messages[3].field(b'C').as_deref(), Some("22012"));
+    // A described portal sends the rows of the run.
+    client.parse("", "select $1::integer + 1 as n", &[]);
+    client.bind("", "", &[], &[Some(b"4")]);
+    client.describe(Target::Portal, "");
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12TDCZ");
+    assert_eq!(row_shape(&messages[2]), [("n".to_owned(), 23, 0)]);
+    assert_eq!(data_row(&messages[3]), [Some(b"5".to_vec())]);
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_errors_of_the_extended_query_flow() {
     let dirs = Dirs::new("extended-errors");
     let server = Server::start(dirs.config()).unwrap();

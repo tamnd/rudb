@@ -85,3 +85,19 @@ fn a_missing_table_is_an_error_and_nothing_runs() {
     let count = db.prepare("SELECT count(*) FROM t").unwrap().value(&[]).unwrap();
     assert_eq!(count, rudb_common::Value::BigInt(0));
 }
+
+#[test]
+fn a_description_is_kept_until_the_table_changes() {
+    let db = database();
+    let prepared = db.prepare("SELECT * FROM t").unwrap();
+    let first = prepared.describe(&[]).unwrap();
+    assert_eq!(prepared.describe(&[]).unwrap(), first);
+    db.execute("DROP TABLE t").unwrap();
+    db.execute("CREATE TABLE t (other INTEGER)").unwrap();
+    let fields = prepared.describe(&[]).unwrap().fields;
+    assert_eq!(fields, Some(vec![Field::new("other", LogicalType::Integer)]));
+    let typed = db.prepare("SELECT $1 AS x").unwrap();
+    assert_eq!(typed.describe(&[]).unwrap().parameters, [None]);
+    let declared = typed.describe(&[Some(LogicalType::BigInt)]).unwrap();
+    assert_eq!(declared.fields, Some(vec![Field::new("x", LogicalType::BigInt)]));
+}
