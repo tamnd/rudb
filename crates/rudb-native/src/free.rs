@@ -26,6 +26,13 @@
 //! [`OWNED`]. What a table owns is then given back whole when the table is written again, and a
 //! table from a file older than the block owns nothing anybody knows about and gives nothing back.
 //! That leaks its pages until a `VACUUM`, which is the safe direction to be wrong in.
+//!
+//! The runs on the end of the file that nothing can read are not handed out. They are left off the
+//! list, the commit writes where what is still read ends, and the file is cut there once the
+//! commit is published, which is the tail truncation of section 10.8. The catalog goes into the
+//! lowest run it can rather than onto the end, so that the end is free to be cut two generations
+//! later. A cut that does not happen, because the process stopped between the publish and the cut
+//! or the cut failed, leaves bytes past the end that no list names, and a `VACUUM` gets them back.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -198,14 +205,16 @@ pub(crate) fn patch_pages(bytes: &[u8]) -> Result<Vec<(u64, u64)>> {
 /// Where one commit puts what it writes, and what it gives back.
 ///
 /// It starts from the free list the committed generation holds and the end of the file. A write
-/// goes into the smallest run that takes it and that nothing can still read, see the module, and
-/// onto the end of the file when there is none. The commit's own catalog always goes on the end,
-/// since it is what holds the list, and that keeps the list it writes the one it was built from.
+/// goes into the lowest run that takes it and that nothing can still read, see the module, and
+/// onto the end of the file when there is none. The lowest rather than the one that fits best, so
+/// that what is written keeps to the front of the file and its end empties and can be cut. The commit's own catalog goes in with
+/// [`Space::catalog`], since it is what holds the list.
 #[derive(Debug)]
 pub(crate) struct Space {
     /// Where the next write that no run takes goes.
     end: u64,
-    /// Where the file ended when the commit started. Everything given back is under it.
+    /// Where the file ends for the committed generation: where it ended when the commit started,
+    /// less the runs on the end that nothing can read. Everything given back is under it.
     start: u64,
     /// Sorted by offset, none overlapping or touching.
     free: Vec<Freed>,
@@ -224,7 +233,49 @@ impl Space {
     /// `free` given back by the commits before.
     pub(crate) fn new(path: &Path, end: u64, free: Vec<Freed>, generation: u64) -> Self {
         let holds = holds(path);
-        Self { end, start: end, free, generation, holds, taken: Vec::new() }
+        let mut space = Self { end, start: end, free, generation, holds, taken: Vec::new() };
+        space.merge();
+        space.trim();
+        space
+    }
+
+    /// Joins the runs that touch and that this commit may both write into. A run given back is
+    /// only joined with a neighbour freed at the same generation, since one freed later would make
+    /// the whole wait for it, so a table written again in place leaves a row of runs that come
+    /// free one after another and are joined here as they do. A run nothing can read stays that
+    /// way, since a hold taken later read a generation that names none of it, so the joined run
+    /// takes the later generation and the table tag when both had it, or zero, as any reader might.
+    fn merge(&mut self) {
+        let mut merged: Vec<Freed> = Vec::with_capacity(self.free.len());
+        for run in std::mem::take(&mut self.free) {
+            if let Some(last) = merged.last_mut()
+                && last.end() == run.offset
+                && self.usable(last)
+                && self.usable(&run)
+            {
+                last.length += run.length;
+                last.since = last.since.max(run.since);
+                if last.table != run.table {
+                    last.table = 0;
+                }
+            } else {
+                merged.push(run);
+            }
+        }
+        self.free = merged;
+    }
+
+    /// Leaves off the runs on the end of the file that nothing can read, so that this commit
+    /// writes where what is still read ends and the file can be cut there once it is published.
+    fn trim(&mut self) {
+        while let Some(run) = self.free.last()
+            && run.end() == self.end
+            && self.usable(run)
+        {
+            self.end = run.offset;
+            self.free.pop();
+        }
+        self.start = self.end;
     }
 
     /// The space of a file being written from nothing, which has nothing to give.
@@ -254,7 +305,8 @@ impl Space {
             && !self.taken.iter().any(|&(at, len)| at <= offset && offset < at + len)
     }
 
-    /// Where the file ends, counting what this commit put on the end of it.
+    /// Where the file ends, counting what this commit put on the end of it, which is where it is
+    /// cut once the commit is published.
     pub(crate) fn end(&self) -> u64 {
         self.end
     }
@@ -262,13 +314,7 @@ impl Space {
     /// Finds a place for `length` bytes, and answers whether it is on the end of the file.
     pub(crate) fn take(&mut self, length: u64) -> Result<(u64, bool)> {
         if length > 0 {
-            let fits = self
-                .free
-                .iter()
-                .enumerate()
-                .filter(|(_, run)| run.length >= length && self.usable(run))
-                .min_by_key(|(_, run)| run.length)
-                .map(|(at, _)| at);
+            let fits = self.free.iter().position(|run| run.length >= length && self.usable(run));
             if let Some(at) = fits {
                 let run = &mut self.free[at];
                 let offset = run.offset;
@@ -284,9 +330,28 @@ impl Space {
         Ok((self.append(length)?, true))
     }
 
-    /// Finds a place for `length` bytes on the end of the file whatever runs there are, which is
-    /// where a catalog goes.
-    pub(crate) fn append(&mut self, length: u64) -> Result<u64> {
+    /// Finds a place for a catalog of `length` bytes, and answers whether it took it out of a run.
+    ///
+    /// The catalog holds the free list, so the list it writes has to be the one left once its own
+    /// place is taken. It goes at the front of the lowest run nothing can read that is longer
+    /// than it, which leaves that run on the list a little shorter, so the list keeps as many runs
+    /// and the catalog encoded again from it keeps its length. The lowest, so that the end of the
+    /// file empties and can be cut. With no such run it goes on the end.
+    pub(crate) fn catalog(&mut self, length: u64) -> Result<(u64, bool)> {
+        let Some(at) = self.free.iter().position(|run| run.length > length && self.usable(run))
+        else {
+            return Ok((self.append(length)?, false));
+        };
+        let run = &mut self.free[at];
+        let offset = run.offset;
+        run.offset += length;
+        run.length -= length;
+        self.taken.push((offset, length));
+        Ok((offset, true))
+    }
+
+    /// Finds a place for `length` bytes on the end of the file whatever runs there are.
+    fn append(&mut self, length: u64) -> Result<u64> {
         let offset = self.end;
         self.end =
             offset.checked_add(length).ok_or_else(|| invalid("native file length overflow"))?;
@@ -314,20 +379,19 @@ impl Space {
         }
         let at = self.free.partition_point(|run| run.offset < offset);
         self.free.insert(at, Freed { offset, length, since: self.generation, table });
-        // Joined with the runs either side when they touch and were the same table's. The joined
-        // run takes the later of the two generations, which can only make it wait longer than it
-        // had to.
-        let joins =
-            |left: &Freed, right: &Freed| left.end() == right.offset && left.table == right.table;
+        // Joined with the runs either side when they touch and were the same table's freed at the
+        // same generation. One freed earlier is left apart, or the old run would wait for the new
+        // one, and [`Space::merge`] joins the two once both have come free.
+        let joins = |left: &Freed, right: &Freed| {
+            left.end() == right.offset && left.table == right.table && left.since == right.since
+        };
         if at + 1 < self.free.len() && joins(&self.free[at], &self.free[at + 1]) {
             let next = self.free.remove(at + 1);
             self.free[at].length += next.length;
-            self.free[at].since = self.free[at].since.max(next.since);
         }
         if at > 0 && joins(&self.free[at - 1], &self.free[at]) {
             let run = self.free.remove(at);
             self.free[at - 1].length += run.length;
-            self.free[at - 1].since = self.free[at - 1].since.max(run.since);
         }
     }
 
@@ -402,15 +466,34 @@ mod tests {
     }
 
     #[test]
-    fn a_run_waits_two_generations_and_the_smallest_that_fits_is_taken() {
+    fn a_run_waits_two_generations_and_the_lowest_that_fits_is_taken() {
         let free = vec![run(100, 50, 3, 0), run(200, 20, 3, 0), run(300, 80, 4, 0)];
         let mut early = space(free.clone(), 5);
-        assert_eq!(early.take(10).unwrap(), (200, false));
+        assert_eq!(early.take(10).unwrap(), (100, false));
         assert_eq!(early.take(60).unwrap(), (1000, true), "the run of 80 is too young");
         let mut late = space(free, 6);
         assert_eq!(late.take(60).unwrap(), (300, false));
-        assert_eq!(late.take(10).unwrap(), (200, false));
-        assert_eq!(late.list()[0], run(100, 50, 3, 0));
+        assert_eq!(late.take(10).unwrap(), (100, false));
+        assert_eq!(late.take(40).unwrap(), (110, false));
+        assert_eq!(late.list(), vec![run(200, 20, 3, 0), run(360, 20, 4, 0)]);
+    }
+
+    #[test]
+    fn touching_runs_join_once_both_are_free() {
+        let free = vec![
+            run(100, 50, 3, 0),
+            run(150, 20, 4, 7),
+            run(170, 30, 5, 7),
+            run(200, 10, 5, 7),
+            run(300, 10, 3, 7),
+        ];
+        let mut space = space(free, 6);
+        space.merge();
+        assert_eq!(
+            space.list(),
+            vec![run(100, 70, 4, 0), run(170, 30, 5, 7), run(200, 10, 5, 7), run(300, 10, 3, 7)]
+        );
+        assert_eq!(space.take(60).unwrap(), (100, false));
     }
 
     #[test]
@@ -432,14 +515,50 @@ mod tests {
     }
 
     #[test]
+    fn the_runs_on_the_end_nothing_reads_are_left_off_and_a_catalog_goes_low() {
+        let free =
+            vec![run(100, 50, 3, 0), run(700, 100, 5, 0), run(800, 120, 3, 0), run(920, 80, 3, 7)];
+        // The two runs on the end are old enough, and the one under them is not.
+        let mut cut = space(free.clone(), 6);
+        cut.trim();
+        assert_eq!(cut.end(), 800);
+        assert_eq!(cut.list(), vec![run(100, 50, 3, 0), run(700, 100, 5, 0)]);
+        assert!(!cut.committed(850), "what was left off is not the committed generation's");
+        // A catalog goes at the front of the lowest run longer than it, and on the end when no
+        // run is.
+        assert_eq!(cut.catalog(20).unwrap(), (100, true));
+        assert_eq!(cut.list()[0], run(120, 30, 3, 0));
+        assert!(!cut.committed(110));
+        assert_eq!(cut.catalog(30).unwrap(), (800, false));
+        assert_eq!(cut.end(), 830);
+        // A reader of another table at 2 lets its table's run go and keeps the one any reader
+        // might read.
+        let mut held = space(free, 6);
+        held.holds = vec![(2, 9)];
+        held.trim();
+        assert_eq!(held.end(), 920);
+    }
+
+    #[test]
     fn runs_given_back_join_their_neighbours_and_survive_the_catalog() {
         let mut space = space(vec![run(100, 50, 3, 0)], 7);
         space.give(150, 10, 0);
+        space.give(170, 10, 0);
+        space.give(160, 10, 0);
         space.give(90, 10, 0);
         space.give(400, 8, 5);
         space.give(408, 8, 6);
         let free = space.list();
-        assert_eq!(free, vec![run(90, 70, 7, 0), run(400, 8, 7, 5), run(408, 8, 7, 6)]);
+        assert_eq!(
+            free,
+            vec![
+                run(90, 10, 7, 0),
+                run(100, 50, 3, 0),
+                run(150, 30, 7, 0),
+                run(400, 8, 7, 5),
+                run(408, 8, 7, 6),
+            ]
+        );
         let mut out = Vec::new();
         encode(&free, &mut out).unwrap();
         let mut cur = Cursor::new(&out[8..]);
