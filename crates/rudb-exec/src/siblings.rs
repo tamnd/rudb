@@ -532,7 +532,9 @@ impl Siblings {
     ) -> Result<()> {
         let starts = self.starts()?;
         let length = starts[part + 1] - starts[part];
-        if wanted * DENSE >= length && kept.as_ref().is_none_or(|(at, _)| *at != part) {
+        static DENSE_X: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let dense = *DENSE_X.get_or_init(|| std::env::var("RUDB_DENSE").ok().and_then(|v| v.parse().ok()).unwrap_or(DENSE));
+        if wanted * dense >= length && kept.as_ref().is_none_or(|(at, _)| *at != part) {
             *kept = Some((part, self.rows.read(part, &self.read)?));
         }
         match kept {
