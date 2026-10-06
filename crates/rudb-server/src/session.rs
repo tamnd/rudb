@@ -74,22 +74,27 @@ const VERSION: &str = concat!(
 );
 
 /// The bytes from the client that the session did not use yet.
+///
+/// The bytes from `head` to `end` are the ones not used yet. The bytes after `end` are space for
+/// the next read. They stay in the buffer from one read to the next, so a read does not set to
+/// zero again the space that the read before it used.
 #[derive(Default)]
 struct Input {
     buf: Vec<u8>,
     head: usize,
+    end: usize,
 }
 
 impl Input {
     fn pending(&self) -> &[u8] {
-        &self.buf[self.head..]
+        &self.buf[self.head..self.end]
     }
 
     fn consume(&mut self, n: usize) {
         self.head += n;
-        if self.head == self.buf.len() {
-            self.buf.clear();
+        if self.head == self.end {
             self.head = 0;
+            self.end = 0;
         }
     }
 }
@@ -116,8 +121,9 @@ struct Wire {
 impl Wire {
     /// Waits for bytes from the client or for a wake, and adds the bytes to `input`.
     fn fill(&mut self, input: &mut Input) -> io::Result<Filled> {
-        if input.head > 0 && input.head * 2 >= input.buf.len() {
-            input.buf.drain(..input.head);
+        if input.head > 0 && input.head * 2 >= input.end {
+            input.buf.copy_within(input.head..input.end, 0);
+            input.end -= input.head;
             input.head = 0;
         }
         let [socket, wake] = if self.stream.buffered() {
@@ -132,15 +138,16 @@ impl Wire {
                 return Ok(Filled::Woken);
             }
         }
-        let len = input.buf.len();
-        input.buf.resize(len + READ_SIZE, 0);
+        if input.buf.len() < input.end + READ_SIZE {
+            input.buf.resize(input.end + READ_SIZE, 0);
+        }
         let read = loop {
-            match self.stream.read(&mut input.buf[len..]) {
+            match self.stream.read(&mut input.buf[input.end..]) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 other => break other,
             }
         };
-        input.buf.truncate(len + *read.as_ref().unwrap_or(&0));
+        input.end += *read.as_ref().unwrap_or(&0);
         match read {
             Ok(0) => Ok(Filled::Closed),
             Ok(_) => Ok(Filled::Data),
