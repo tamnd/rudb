@@ -9338,23 +9338,62 @@ impl Reader {
                 }
                 _ => return Err(invalid("page validity tag differs")),
             };
-            let mut held = vec![false; rows];
+            // The rows that hold some pattern, in order.
+            let mut held = Vec::new();
             for sequence in sequences {
                 let needs = sequence.needs();
-                let maybe = |row: usize| sketch.is_none_or(|words| words[row] & needs == needs);
-                if !string::holds_in_where(&bytes[cur.at..], sequence, maybe, &mut held)? {
-                    return Ok(None);
+                let count = match sketch {
+                    Some(words) => string::holds_in_rows(
+                        &bytes[cur.at..],
+                        sequence,
+                        (0..rows).filter(|&row| words[row] & needs == needs),
+                        &mut held,
+                    )?,
+                    None => string::holds_in_rows(&bytes[cur.at..], sequence, 0..rows, &mut held)?,
+                };
+                match count {
+                    None => return Ok(None),
+                    Some(count) if count != rows => {
+                        return Err(invalid("compressed text page holds the wrong number of rows"));
+                    }
+                    Some(_) => {}
                 }
             }
-            // Every row is written and the count moves only past the kept ones, so there is no
-            // branch a row. With `NOT LIKE` nearly every row is kept, and a filtered collect paid a
-            // push and a guessed branch for each of them on q13.
+            if sequences.len() > 1 {
+                held.sort_unstable();
+                held.dedup();
+            }
+            let valid = |row: u32| {
+                let row = row as usize;
+                mask.is_none_or(|mask| mask[row / 8] >> (row % 8) & 1 == 1)
+            };
+            if !negated {
+                held.retain(|&row| valid(row));
+                return Ok(Some(held));
+            }
+            // With `NOT LIKE` nearly every row is kept, so the rows go in as runs between the held
+            // ones when there are no nulls to take out, and otherwise every row is written and the
+            // count moves only past the kept ones, so there is no branch a row.
             let mut kept = vec![0_u32; rows];
             let mut count = 0;
-            for (row, &held) in held.iter().enumerate() {
-                let valid = mask.is_none_or(|mask| mask[row / 8] >> (row % 8) & 1 == 1);
-                kept[count] = row as u32;
-                count += usize::from((held != negated) & valid);
+            let mut from = 0;
+            if mask.is_none() {
+                for &row in held.iter().chain([&(rows as u32)]) {
+                    let run = row as usize - from;
+                    kept[count..count + run]
+                        .iter_mut()
+                        .zip(from as u32..)
+                        .for_each(|(slot, row)| *slot = row);
+                    count += run;
+                    from = row as usize + 1;
+                }
+            } else {
+                let mut next = held.iter().copied().peekable();
+                for row in 0..rows as u32 {
+                    let is_held = next.next_if_eq(&row).is_some();
+                    kept[count] = row;
+                    count += usize::from(!is_held & valid(row));
+                }
             }
             kept.truncate(count);
             Ok(Some(kept))

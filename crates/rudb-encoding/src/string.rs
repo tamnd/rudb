@@ -354,43 +354,42 @@ pub fn holds_in(bytes: &[u8], sequence: &Sequence) -> Result<Option<Vec<bool>>> 
     }
     let mut reader = Reader::new(bytes);
     reader.u8()?;
-    let mut held = vec![false; reader.u32()? as usize];
-    holds_in_where(bytes, sequence, |_| true, &mut held)?;
+    let count = reader.u32()? as usize;
+    let mut found = Vec::new();
+    holds_in_rows(bytes, sequence, 0..count, &mut found)?;
+    let mut held = vec![false; count];
+    for row in found {
+        held[row as usize] = true;
+    }
     Ok(Some(held))
 }
 
-/// [`holds_in`], walking only the values `maybe` does not rule out, and marking the ones that hold
-/// the pieces in `held`, which has a place for every value. A place already marked stays marked,
-/// so a caller with several patterns passes the same places to each. False for a chunk that is not
-/// compressed, which leaves `held` as it was.
+/// [`holds_in`] over the values at `rows` alone, which rise, adding the ones that hold the pieces
+/// to `found` in order, and answers how many values the chunk holds. `None` for a chunk that is
+/// not compressed, which leaves `found` as it was.
 ///
-/// For a caller that holds a sketch of each value, see [`crate::sequence::grams`]. A value ruled out
-/// is stepped over by its length and never walked. With the sketch on q13 one comment in forty is
-/// walked, so what each of the others costs is the whole of the scan: the lengths are read as they
-/// were decoded, with no second array of them and no pass to add them up first, and the codes of a
-/// value are only cut out for one that is walked.
+/// For a caller that holds a sketch of each value, see [`crate::sequence::grams`], and passes the
+/// rows the sketch does not rule out. With the sketch on q13 one comment in forty is walked, so
+/// what each of the others costs is the whole of the scan, and here it is a share of a sum: the
+/// lengths of the values between two walked ones are added up in one go to find where the next one
+/// starts, and nothing is written for a value that is not walked. Stepping over each value on its
+/// own with a test of the sketch in between was 17 instructions a value.
 ///
 /// # Errors
 ///
-/// As [`decode`], and when `held` is not as long as the chunk.
-pub fn holds_in_where(
+/// As [`decode`], and when `rows` do not rise or one is past the chunk.
+pub fn holds_in_rows(
     bytes: &[u8],
     sequence: &Sequence,
-    mut maybe: impl FnMut(usize) -> bool,
-    held: &mut [bool],
-) -> Result<bool> {
+    rows: impl IntoIterator<Item = usize>,
+    found: &mut Vec<u32>,
+) -> Result<Option<usize>> {
     if bytes.first() != Some(&Kind::Fsst.tag()) {
-        return Ok(false);
+        return Ok(None);
     }
     let mut reader = Reader::new(bytes);
     reader.u8()?;
     let count = reader.u32()? as usize;
-    if count != held.len() {
-        return Err(Error::internal(format!(
-            "a string chunk holds {count} values and was asked about {}",
-            held.len()
-        )));
-    }
     let (table, used) = SymbolTable::deserialize(reader.rest())?;
     reader.skip(used)?;
     let lengths = decode_integers(&mut reader)?;
@@ -402,36 +401,35 @@ pub fn holds_in_where(
     }
     let payload = reader.rest();
     let limit = payload.len() as u64;
+    // Checked once for the chunk, so the sums below are plain adds. A negative length reads as a
+    // number past any payload, and with every length under the payload's no sum of a chunk's
+    // lengths can wrap.
+    let longest = lengths.iter().fold(0_u64, |longest, &length| longest.max(length as u64));
+    let total = lengths.iter().fold(0_u64, |total, &length| total.wrapping_add(length as u64));
+    if longest > limit || total != limit {
+        return Err(Error::internal(format!(
+            "a compressed chunk of {limit} bytes says its values come to {total}"
+        )));
+    }
     let mut coded = None;
-    // A length past the payload, a negative one among them, is caught once the loop is done. Each
-    // one under the limit keeps the sum from wrapping before then, and a value is cut out with a
-    // checked slice, so a wrong length never reads past the payload.
-    let mut wrong = false;
+    // The first value not stepped over yet, and where it starts.
+    let mut next = 0;
     let mut at = 0_u64;
-    for (row, (&length, held)) in lengths.iter().zip(held.iter_mut()).enumerate() {
-        let from = at;
-        wrong |= length as u64 > limit;
-        at = at.wrapping_add(length as u64);
-        if maybe(row) {
-            let Some(codes) = payload.get(from as usize..at as usize) else {
-                return Err(Error::internal("a compressed run is past the end of its chunk"));
-            };
-            *held |= coded.get_or_insert_with(|| sequence.over(&table)).holds(codes)?;
+    for row in rows {
+        if row < next || row >= count {
+            return Err(Error::internal("a compressed chunk was asked about a row out of order"));
         }
+        at += lengths[next..row].iter().map(|&length| length as u64).sum::<u64>();
+        let end = at + lengths[row] as u64;
+        let codes = &payload[at as usize..end as usize];
+        if coded.get_or_insert_with(|| sequence.over(&table)).holds(codes)? {
+            // Under the count, which is a `u32`.
+            found.push(row as u32);
+        }
+        at = end;
+        next = row + 1;
     }
-    if wrong || at > limit {
-        return Err(Error::internal(format!(
-            "a compressed chunk says it holds more than its {limit} bytes"
-        )));
-    }
-    reader.skip(at as usize)?;
-    if reader.remaining() != 0 {
-        return Err(Error::internal(format!(
-            "{} bytes left over after decoding a string chunk",
-            reader.remaining()
-        )));
-    }
-    Ok(true)
+    Ok(Some(count))
 }
 
 /// Which values of a compressed chunk are one of `literals`, compared on the codes, or `None` for
@@ -1738,6 +1736,39 @@ mod tests {
                 let Some(encoded) = encode_only(kind, &refs).expect("encoded") else { continue };
                 assert_eq!(Runs::of(&encoded).expect("read").is_some(), kind == Kind::Fsst);
             }
+        }
+    }
+
+    /// A walk of some of the rows of a compressed chunk finds among them the ones a search of the
+    /// strings finds, wherever the rows fall, and refuses rows out of order or past the end.
+    #[test]
+    fn a_walk_of_some_rows_finds_what_a_search_of_those_strings_finds() {
+        let values = urls(1000);
+        let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        let fsst = encode_only(Kind::Fsst, &refs).expect("encoded").expect("compressible");
+        let sequence = Sequence::new(&[b"com", b"/"]).expect("an automaton");
+        let searched = |row: usize| {
+            let text = &values[row];
+            text.windows(3).position(|window| window == b"com").is_some_and(|at| {
+                text[at + 3..].contains(&b'/')
+            })
+        };
+        for rows in [(0..1000).collect::<Vec<_>>(), vec![0, 1, 2, 500, 999], vec![999], vec![]] {
+            let mut found = Vec::new();
+            let count = holds_in_rows(&fsst, &sequence, rows.iter().copied(), &mut found)
+                .expect("walked");
+            assert_eq!(count, Some(1000));
+            let wanted: Vec<u32> =
+                rows.iter().copied().filter(|&row| searched(row)).map(|row| row as u32).collect();
+            assert_eq!(found, wanted);
+        }
+        let held = holds_in(&fsst, &sequence).expect("walked").expect("compressed");
+        assert_eq!(held, (0..1000).map(searched).collect::<Vec<_>>());
+        assert!(holds_in_rows(&fsst, &sequence, [4, 3], &mut Vec::new()).is_err());
+        assert!(holds_in_rows(&fsst, &sequence, [1000], &mut Vec::new()).is_err());
+        assert!(holds_in_rows(&fsst[..fsst.len() - 1], &sequence, [0], &mut Vec::new()).is_err());
+        if let Some(plain) = encode_only(Kind::Plain, &refs).expect("encoded") {
+            assert_eq!(holds_in_rows(&plain, &sequence, [0], &mut Vec::new()).expect("read"), None);
         }
     }
 
