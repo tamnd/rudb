@@ -1650,6 +1650,11 @@ impl<'a> Scan<'a> {
     /// `lineitem` row in seven, the suppliers of one region keep one in five of those, and reading
     /// the part whole decoded every order key and gathered four columns at the first set of rows to
     /// keep a fifth of them.
+    ///
+    /// The bitmap goes first in a sparse part too. On q05 the orders a reduction keeps hold one
+    /// `lineitem` row in thirty two, under the line, and reading every column and working out the
+    /// order key from the link at all of them came to a fifth of the query for rows the suppliers'
+    /// bitmap threw four fifths of straight after.
     fn read_reduced(&self, at: usize, out: &mut Chunk) -> Result<bool> {
         let Some((rows, first)) = self.reduced(at).filter(|(rows, _)| !rows.is_full()) else {
             return Ok(false);
@@ -1657,12 +1662,10 @@ impl<'a> Scan<'a> {
         let len = self.table.rows().chunk_len(at)?;
         // Counted before the offsets are written down, since a part past the line reads whole and
         // would throw them away.
-        let bitmap = if rows.count_in(first, len).saturating_mul(SPARSE_READ) > len {
-            let Some(bitmap) = self.first_bitmap() else { return Ok(false) };
-            Some(bitmap)
-        } else {
-            None
-        };
+        let bitmap = self.first_bitmap();
+        if bitmap.is_none() && rows.count_in(first, len).saturating_mul(SPARSE_READ) > len {
+            return Ok(false);
+        }
         let mut positions = rows.offsets_in(first, len);
         if let Some((_, column, domain, paying)) = bitmap {
             let keys = self.table.rows().read_rows(at, &[column], &positions)?;
