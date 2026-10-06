@@ -1251,7 +1251,14 @@ impl MemoryTable {
     /// Pushes every row of `chunk` into the columns being built, and says whether it did. A row
     /// that will not go in takes the ones before it back out, and the chunk is left to be kept as
     /// it is.
+    ///
+    /// A chunk with codes into a table wide dictionary is kept as it is too. Built into the columns
+    /// its codes would turn back into strings, and a read that gathers the column hands on the
+    /// codes only when every piece of it is still codes into the one dictionary.
     fn build_chunk(&mut self, chunk: &Chunk) -> bool {
+        if chunk.columns().iter().any(|column| column.stable_dictionary_parts().is_some()) {
+            return false;
+        }
         let start = self.built;
         for row in 0..chunk.len() {
             let values = (0..chunk.width())
