@@ -86,6 +86,8 @@ pub enum Value {
     /// plan holds a constant's type and its value in two places and checks that the two agree, and
     /// because printing one is not printing the other: a zoned time carries the offset after it.
     TimeTz(i64),
+    /// `TIME_NS`, nanoseconds since midnight.
+    TimeNs(i64),
     /// `TIMESTAMP`, microseconds since 1970-01-01 00:00:00.
     Timestamp(i64),
     /// `TIMESTAMP WITH TIME ZONE`, microseconds since 1970-01-01 00:00:00 UTC.
@@ -107,6 +109,9 @@ pub enum Value {
     TimestampMs(i64),
     /// `TIMESTAMP_NS`, nanoseconds since 1970-01-01 00:00:00.
     TimestampNs(i64),
+    /// `TIMESTAMPTZ_NS`, nanoseconds since 1970-01-01 00:00:00 UTC, which is to
+    /// [`Value::TimestampNs`] what [`Value::TimestampTz`] is to [`Value::Timestamp`].
+    TimestampTzNs(i64),
     /// `INTERVAL`, the months, days and microseconds triple.
     ///
     /// Three fields rather than one duration because interval arithmetic with months is not
@@ -313,11 +318,13 @@ impl Value {
             Self::Date(_) => LogicalType::Date,
             Self::Time(_) => LogicalType::Time,
             Self::TimeTz(_) => LogicalType::TimeTz,
+            Self::TimeNs(_) => LogicalType::TimeNs,
             Self::Timestamp(_) => LogicalType::Timestamp,
             Self::TimestampTz(_) => LogicalType::TimestampTz,
             Self::TimestampS(_) => LogicalType::TimestampS,
             Self::TimestampMs(_) => LogicalType::TimestampMs,
             Self::TimestampNs(_) => LogicalType::TimestampNs,
+            Self::TimestampTzNs(_) => LogicalType::TimestampTzNs,
             Self::Interval { .. } => LogicalType::Interval,
             Self::List { element, .. } => LogicalType::list(element.clone()),
             Self::Struct(fields) => LogicalType::Struct(
@@ -367,11 +374,13 @@ impl Value {
             | (Self::Date(_), T::Date)
             | (Self::Time(_), T::Time)
             | (Self::TimeTz(_), T::TimeTz)
+            | (Self::TimeNs(_), T::TimeNs)
             | (Self::Timestamp(_), T::Timestamp)
             | (Self::TimestampTz(_), T::TimestampTz)
             | (Self::TimestampS(_), T::TimestampS)
             | (Self::TimestampMs(_), T::TimestampMs)
             | (Self::TimestampNs(_), T::TimestampNs)
+            | (Self::TimestampTzNs(_), T::TimestampTzNs)
             | (Self::Interval { .. }, T::Interval) => true,
             _ => false,
         }
@@ -461,6 +470,12 @@ impl fmt::Display for Value {
             Self::TimestampS(v) => write_coarse(f, *v, 1_000_000),
             Self::TimestampMs(v) => write_coarse(f, *v, 1_000),
             Self::TimestampNs(v) => write_nanos(f, *v),
+            Self::TimeNs(v) => write_time_nanos(f, *v),
+            Self::TimestampTzNs(v) if *v == i64::MAX || *v == -i64::MAX => write_nanos(f, *v),
+            Self::TimestampTzNs(v) => {
+                write_nanos(f, *v)?;
+                f.write_str(UTC)
+            }
             Self::Interval { months, days, micros } => write_interval(f, *months, *days, *micros),
             // A `JSON` element is written as the document it is, with no quotes round it.
             Self::List { element, values } => {
@@ -554,7 +569,39 @@ impl Value {
                     offset_text(offset_seconds / 60 * 60)
                 )
             }
+            Self::TimestampTzNs(nanos) if *nanos == i64::MAX || *nanos == -i64::MAX => {
+                self.to_string()
+            }
+            Self::TimestampTzNs(nanos) => {
+                const NANOS_PER_DAY: i128 = 86_400 * 1_000_000_000;
+                let local = i128::from(*nanos) + i128::from(offset_seconds) * 1_000_000_000;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "an i64 of nanoseconds and an offset of hours is about 10^5 days"
+                )]
+                let (days, within) = (
+                    local.div_euclid(NANOS_PER_DAY) as i32,
+                    local.rem_euclid(NANOS_PER_DAY) as i64,
+                );
+                format!(
+                    "{} {}{}",
+                    Self::Date(days),
+                    Self::TimeNs(within),
+                    offset_text(offset_seconds / 60 * 60)
+                )
+            }
             other => other.to_string(),
+        }
+    }
+
+    /// The instant a zoned timestamp holds in microseconds, which is what the session zone is
+    /// asked for its offset at, or `None` for every other value.
+    #[must_use]
+    pub const fn zoned_micros(&self) -> Option<i64> {
+        match self {
+            Self::TimestampTz(micros) => Some(*micros),
+            Self::TimestampTzNs(nanos) => Some(nanos.div_euclid(1_000)),
+            _ => None,
         }
     }
 }
@@ -863,6 +910,19 @@ fn write_time(f: &mut fmt::Formatter<'_>, micros: i64) -> fmt::Result {
     if fraction != 0 {
         // Trailing zeros are trimmed, so a value on a millisecond boundary prints three digits.
         let text = format!("{fraction:06}");
+        write!(f, ".{}", text.trim_end_matches('0'))?;
+    }
+    Ok(())
+}
+
+/// A time of day in nanoseconds, which prints the way [`write_time`] does with up to nine digits.
+fn write_time_nanos(f: &mut fmt::Formatter<'_>, nanos: i64) -> fmt::Result {
+    let seconds = nanos.div_euclid(1_000_000_000);
+    let fraction = nanos.rem_euclid(1_000_000_000);
+    let (hours, minutes, seconds) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
+    write!(f, "{hours:02}:{minutes:02}:{seconds:02}")?;
+    if fraction != 0 {
+        let text = format!("{fraction:09}");
         write!(f, ".{}", text.trim_end_matches('0'))?;
     }
     Ok(())

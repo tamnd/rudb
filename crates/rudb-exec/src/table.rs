@@ -3618,7 +3618,9 @@ fn fold_value(state: u64, value: &Value) -> u64 {
         | Value::TimestampTz(x)
         | Value::TimestampS(x)
         | Value::TimestampMs(x)
-        | Value::TimestampNs(x) => mix(state, *x as u64),
+        | Value::TimestampNs(x)
+        | Value::TimeNs(x)
+        | Value::TimestampTzNs(x) => mix(state, *x as u64),
         Value::UTinyInt(x) => mix(state, u64::from(*x)),
         Value::USmallInt(x) => mix(state, u64::from(*x)),
         Value::UInteger(x) => mix(state, u64::from(*x)),

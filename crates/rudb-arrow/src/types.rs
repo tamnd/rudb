@@ -135,6 +135,9 @@ impl DataType {
             LogicalType::TimestampS => Self::Timestamp(TimeUnit::Second, None),
             LogicalType::TimestampMs => Self::Timestamp(TimeUnit::Millisecond, None),
             LogicalType::TimestampNs => Self::Timestamp(TimeUnit::Nanosecond, None),
+            LogicalType::TimestampTzNs => {
+                Self::Timestamp(TimeUnit::Nanosecond, Some("UTC".to_string()))
+            }
             LogicalType::TimestampTz => {
                 Self::Timestamp(TimeUnit::Microsecond, Some("UTC".to_string()))
             }

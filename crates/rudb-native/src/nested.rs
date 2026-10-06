@@ -108,7 +108,9 @@ fn put(out: &mut Vec<u8>, value: &Value, ty: &LogicalType) -> Result<()> {
         | (LogicalType::TimestampTz, Value::TimestampTz(held))
         | (LogicalType::TimestampS, Value::TimestampS(held))
         | (LogicalType::TimestampMs, Value::TimestampMs(held))
-        | (LogicalType::TimestampNs, Value::TimestampNs(held)) => {
+        | (LogicalType::TimestampNs, Value::TimestampNs(held))
+        | (LogicalType::TimeNs, Value::TimeNs(held))
+        | (LogicalType::TimestampTzNs, Value::TimestampTzNs(held)) => {
             out.extend_from_slice(&held.to_le_bytes());
         }
         (LogicalType::UBigInt, Value::UBigInt(held)) => out.extend_from_slice(&held.to_le_bytes()),
@@ -204,6 +206,8 @@ fn get(cur: &mut Reader<'_>, ty: &LogicalType) -> Result<Value> {
         LogicalType::TimestampS => Value::TimestampS(i64::from_le_bytes(cur.array()?)),
         LogicalType::TimestampMs => Value::TimestampMs(i64::from_le_bytes(cur.array()?)),
         LogicalType::TimestampNs => Value::TimestampNs(i64::from_le_bytes(cur.array()?)),
+        LogicalType::TimeNs => Value::TimeNs(i64::from_le_bytes(cur.array()?)),
+        LogicalType::TimestampTzNs => Value::TimestampTzNs(i64::from_le_bytes(cur.array()?)),
         LogicalType::UBigInt => Value::UBigInt(u64::from_le_bytes(cur.array()?)),
         LogicalType::Double => Value::Double(f64::from_le_bytes(cur.array()?)),
         LogicalType::HugeInt => Value::HugeInt(i128::from_le_bytes(cur.array()?)),

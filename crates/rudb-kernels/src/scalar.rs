@@ -3879,6 +3879,24 @@ fn date_runs<A: Fn(usize) -> usize>(
     }
 }
 
+/// One of the parts a time of day has, read off its microseconds since midnight.
+///
+/// The hour is counted rather than wrapped, so `24:00:00` is hour 24 the way it is on the pin, and
+/// a time has no zone, so the three zone parts are 0.
+fn clock_part(part: Part, micros: i64, doubled: bool) -> Value {
+    let whole = match part {
+        Part::Epoch if doubled => return Value::Double(micros as f64 / 1_000_000.0),
+        Part::Hour => micros / 3_600_000_000,
+        Part::Minute => micros / 60_000_000 % 60,
+        Part::Second => micros / 1_000_000 % 60,
+        Part::Epoch => micros / 1_000_000,
+        Part::Millisecond => micros / 1_000 % 60_000,
+        Part::Microsecond => micros % 60_000_000,
+        _ => 0,
+    };
+    if doubled { Value::Double(whole as f64) } else { Value::BigInt(whole) }
+}
+
 /// `date_part` and `date_trunc` on one row.
 ///
 /// The answer type is passed in rather than worked out here, because a part that is read is a
@@ -3910,6 +3928,30 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
         });
     }
     let doubled = *returns == LogicalType::Double;
+    // A nanosecond time answers the parts a time does from its microseconds, cut rather than
+    // rounded, which is how the pin gets 86399.999999 for the epoch of 23:59:59.999999999.
+    if let Value::TimeNs(nanos) = when
+        && name != "date_trunc"
+    {
+        let timed = matches!(
+            part,
+            Part::Hour
+                | Part::Minute
+                | Part::Second
+                | Part::Millisecond
+                | Part::Microsecond
+                | Part::Epoch
+                | Part::Timezone
+                | Part::TimezoneHour
+                | Part::TimezoneMinute
+        );
+        if !timed {
+            return Err(Error::not_implemented(format!(
+                "\"time_ns\" units \"{spelling}\" not recognized"
+            )));
+        }
+        return Ok(clock_part(part, nanos / 1_000, doubled));
+    }
     // A time of day is read as the moment it is on the first day of 1970, which gives the pin's
     // answer for the six parts a time has. The rest are refused in the pin's words, since a time
     // is on no day at all.
@@ -3959,7 +4001,7 @@ fn date_value(name: &str, spec: &Value, when: &Value, returns: &LogicalType) -> 
                     "\"time\" units \"{spelling}\" not recognized"
                 )));
             }
-            Value::Timestamp(*micros)
+            return Ok(clock_part(part, *micros, doubled));
         }
         other => other.clone(),
     };

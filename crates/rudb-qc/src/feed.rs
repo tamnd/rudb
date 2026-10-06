@@ -1386,6 +1386,8 @@ fn contenders(
             | LogicalType::TimestampS
             | LogicalType::TimestampMs
             | LogicalType::TimestampNs
+            | LogicalType::TimeNs
+            | LogicalType::TimestampTzNs
             | LogicalType::TimestampTz
     );
     let w = slot.ty.bytes() as usize;

@@ -601,7 +601,9 @@ fn write_value<W: Write>(out: &mut W, value: &Value) -> fmt::Result {
         | Value::TimestampTz(held)
         | Value::TimestampS(held)
         | Value::TimestampMs(held)
-        | Value::TimestampNs(held) => write!(out, "{held}"),
+        | Value::TimestampNs(held)
+        | Value::TimeNs(held)
+        | Value::TimestampTzNs(held) => write!(out, "{held}"),
         Value::Interval { months, days, micros } => write!(out, "{{{months}, {days}, {micros}}}"),
         Value::List { values, .. } => {
             out.write_char('{')?;
@@ -833,6 +835,8 @@ mod tests {
             LogicalType::TimestampS,
             LogicalType::TimestampMs,
             LogicalType::TimestampNs,
+            LogicalType::TimeNs,
+            LogicalType::TimestampTzNs,
             LogicalType::TimestampTz,
             LogicalType::Interval,
         ];

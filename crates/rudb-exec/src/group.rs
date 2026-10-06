@@ -8396,6 +8396,8 @@ fn fixed_width(ty: &LogicalType) -> bool {
             | LogicalType::TimestampS
             | LogicalType::TimestampMs
             | LogicalType::TimestampNs
+            | LogicalType::TimeNs
+            | LogicalType::TimestampTzNs
             | LogicalType::TimestampTz
     )
 }

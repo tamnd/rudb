@@ -226,9 +226,9 @@ pub(crate) fn cast_value_in_time_zone(
         return crate::variant::cast(value, &value.logical_type(), target, try_cast, time_zone);
     }
     if matches!(target, LogicalType::Varchar)
-        && let (Value::TimestampTz(micros), Some(time_zone)) = (value, time_zone)
+        && let (Some(micros), Some(time_zone)) = (value.zoned_micros(), time_zone)
     {
-        return Ok(Value::Varchar(value.to_string_at_offset(time_zone.offset_seconds_at(*micros))));
+        return Ok(Value::Varchar(value.to_string_at_offset(time_zone.offset_seconds_at(micros))));
     }
     let zone = time_zone.unwrap_or_default();
     let zoned = match (value, target) {
@@ -254,9 +254,13 @@ pub(crate) fn cast_value_in_time_zone(
             let written = written_in(value, zone);
             Some(cast_value(&written, target, try_cast))
         }
+        (Value::TimestampTzNs(nanos), _) if *target != LogicalType::TimestampTzNs => {
+            Some(from_timestamp_tz_ns(*nanos, target, try_cast, zone))
+        }
         (_, LogicalType::TimestampTz) if value.logical_type() != LogicalType::TimestampTz => {
             Some(to_timestamp_tz_in(value, zone))
         }
+        (_, LogicalType::TimestampTzNs) => Some(to_timestamp_tz_ns(value, zone)),
         (Value::Varchar(_) | Value::Time(_) | Value::TimestampTz(_), LogicalType::TimeTz) => {
             Some(to_time_tz_in(value, zone))
         }
@@ -294,6 +298,18 @@ pub fn reads_time_zone(from: &LogicalType, to: &LogicalType) -> bool {
         (Varchar | LogicalType::Time, LogicalType::TimeTz) => true,
         // A variant may hold an instant, and the cast out of one writes it in the zone.
         (LogicalType::Variant, to) => *to != LogicalType::Variant,
+        // The pin's casts of the nanosecond instant read the zone only to and from a wall clock,
+        // so a date or a coarser timestamp going in is read at UTC and a time going out is too.
+        (LogicalType::TimestampTzNs, to) => !matches!(
+            to,
+            LogicalType::TimestampTzNs
+                | LogicalType::TimestampTz
+                | LogicalType::TimeTz
+                | LogicalType::Variant
+        ),
+        (from, LogicalType::TimestampTzNs) => {
+            matches!(from, Varchar | LogicalType::TimestampNs)
+        }
         _ => {
             (from == &LogicalType::TimestampTz) != (to == &LogicalType::TimestampTz)
                 && !matches!(from, LogicalType::Null)
@@ -304,7 +320,7 @@ pub fn reads_time_zone(from: &LogicalType, to: &LogicalType) -> bool {
 /// Whether a type is or holds a `TIMESTAMP WITH TIME ZONE`.
 fn holds_time_zone(ty: &LogicalType) -> bool {
     match ty {
-        LogicalType::TimestampTz => true,
+        LogicalType::TimestampTz | LogicalType::TimestampTzNs => true,
         LogicalType::List(element) | LogicalType::Array(element, _) => holds_time_zone(element),
         LogicalType::Struct(fields) => fields.iter().any(|field| holds_time_zone(&field.ty)),
         LogicalType::Map(key, value) => holds_time_zone(key) || holds_time_zone(value),
@@ -316,8 +332,9 @@ fn holds_time_zone(ty: &LogicalType) -> bool {
 /// the same text the value would, since an element is quoted by what its text holds.
 fn written_in(value: &Value, zone: SessionTimeZone) -> Value {
     match value {
-        Value::TimestampTz(micros) => {
-            Value::Varchar(value.to_string_at_offset(zone.offset_seconds_at(*micros)))
+        Value::TimestampTz(_) | Value::TimestampTzNs(_) => {
+            let micros = value.zoned_micros().unwrap_or(0);
+            Value::Varchar(value.to_string_at_offset(zone.offset_seconds_at(micros)))
         }
         Value::List { element, values } => Value::List {
             element: element.clone(),
@@ -1381,6 +1398,9 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
     if matches!(value, Value::Union { .. }) && !matches!(target, LogicalType::Varchar) {
         return Err(no_cast(value, target));
     }
+    if let Value::TimestampTzNs(nanos) = value {
+        return from_timestamp_tz_ns(*nanos, target, false, SessionTimeZone::default());
+    }
     match target {
         LogicalType::Boolean => to_boolean(value),
         LogicalType::TinyInt
@@ -1402,8 +1422,10 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
         LogicalType::Date => to_date(value),
         LogicalType::Time => to_time(value),
         LogicalType::TimeTz => to_time_tz(value),
+        LogicalType::TimeNs => to_time_ns(value),
         LogicalType::Timestamp => to_timestamp(value),
         LogicalType::TimestampTz => to_timestamp_tz(value),
+        LogicalType::TimestampTzNs => to_timestamp_tz_ns(value, SessionTimeZone::default()),
         LogicalType::TimestampS | LogicalType::TimestampMs | LogicalType::TimestampNs => {
             to_precise(value, target)
         }
@@ -2152,6 +2174,9 @@ fn to_time(value: &Value) -> Result<Value> {
         }
         // The time as it was read, with the offset dropped rather than applied.
         Value::TimeTz(key) => Ok(Value::Time(time_tz::micros(*key))),
+        Value::TimeNs(nanos) => {
+            Ok(Value::Time(restamp(*nanos, NANOS_PER_SECOND, MICROS_PER_SECOND).unwrap_or(0)))
+        }
         Value::Varchar(text) => parse_clock(text).map(Value::Time).ok_or_else(|| bad_time(text)),
         _ => Err(no_cast(value, &LogicalType::Time)),
     }
@@ -2166,6 +2191,9 @@ fn to_time_tz(value: &Value) -> Result<Value> {
     match value {
         Value::TimeTz(_) => Ok(value.clone()),
         Value::Time(micros) => Ok(Value::TimeTz(time_tz::pack(*micros, 0))),
+        Value::Timestamp(micros) if *micros == i64::MAX || *micros == -i64::MAX => {
+            Err(Error::conversion("Can't get TIME of infinite TIMESTAMP"))
+        }
         Value::Timestamp(micros) => {
             Ok(Value::TimeTz(time_tz::pack(micros.rem_euclid(MICROS_PER_DAY), 0)))
         }
@@ -2534,6 +2562,169 @@ fn sub_micros(text: &str) -> i64 {
     };
     let extra: String = digits.chars().skip(6).take(3).collect();
     format!("{extra:0<3}").parse().unwrap_or(0)
+}
+
+/// A cast to `TIME_NS`, which reads text the way `TIME` does and keeps three more digits of it.
+///
+/// A `TIME` and a `TIMESTAMP_NS` are the only other types the pin casts to one.
+fn to_time_ns(value: &Value) -> Result<Value> {
+    match value {
+        Value::Time(micros) => Ok(Value::TimeNs(micros * 1_000)),
+        Value::TimestampNs(nanos) if *nanos == i64::MAX || *nanos == -i64::MAX => {
+            Err(Error::conversion("Can't get TIME_NS of infinite TIMESTAMP"))
+        }
+        Value::TimestampNs(nanos) => Ok(Value::TimeNs(nanos.rem_euclid(NANOS_PER_DAY))),
+        Value::Varchar(text) => parse_clock(text)
+            .map(|micros| Value::TimeNs(micros * 1_000 + clock_sub_micros(text)))
+            .ok_or_else(|| bad_time(text)),
+        _ => Err(no_cast(value, &LogicalType::TimeNs)),
+    }
+}
+
+/// The nanoseconds past the microsecond in a written clock that [`parse_clock`] has already read,
+/// which are the seventh to the ninth digits after the first point that follows a colon.
+fn clock_sub_micros(text: &str) -> i64 {
+    let Some(colon) = text.find(':') else {
+        return 0;
+    };
+    let Some(point) = text[colon..].find('.') else {
+        return 0;
+    };
+    let digits: String = text[colon + point + 1..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .skip(6)
+        .take(3)
+        .collect();
+    if digits.is_empty() {
+        return 0;
+    }
+    format!("{digits:0<3}").parse().unwrap_or(0)
+}
+
+/// A cast to `TIMESTAMPTZ_NS` in the session zone `zone`.
+///
+/// Text and a `TIMESTAMP_NS` are wall clocks read in the zone, the way they are for `TIMESTAMPTZ`.
+/// A date and the coarser timestamps are not: the pin restates them in nanoseconds and calls that
+/// the instant, so a date is midnight UTC whatever the session says. A `TIMESTAMPTZ` is the same
+/// instant at a finer grain, which the pin refuses and the corpus written after it expects.
+fn to_timestamp_tz_ns(value: &Value, zone: SessionTimeZone) -> Result<Value> {
+    let finer = || Error::conversion("Could not convert Timestamp to higher precision.");
+    let restated = |ticks: i64, per_second: i64| {
+        restamp(ticks, per_second, NANOS_PER_SECOND).map(Value::TimestampTzNs).ok_or_else(finer)
+    };
+    match value {
+        Value::Varchar(text) => zoned_nanos(text, zone),
+        Value::TimestampNs(nanos) => local_nanos_instant(*nanos, zone)
+            .map(Value::TimestampTzNs)
+            .ok_or_else(|| Error::conversion("ICU date overflows timestamp range")),
+        Value::Date(days) => restated(stamp_of_day(*days), MICROS_PER_SECOND),
+        Value::Timestamp(micros) | Value::TimestampTz(micros) => {
+            restated(*micros, MICROS_PER_SECOND)
+        }
+        Value::TimestampS(ticks) => restated(*ticks, 1),
+        Value::TimestampMs(ticks) => restated(*ticks, 1_000),
+        _ => Err(no_cast(value, &LogicalType::TimestampTzNs)),
+    }
+}
+
+/// Text read as a `TIMESTAMPTZ_NS`, which is [`to_timestamp_tz_in`] with three more digits.
+fn zoned_nanos(text: &str, zone: SessionTimeZone) -> Result<Value> {
+    let range = || Fault::Range.said("timestamp", text, TIMESTAMP_FORMAT);
+    let (micros, written) = parse_timestamp_zoned(text)
+        .map_err(|fault| fault.for_date().said("timestamp", text, TIMESTAMP_FORMAT))?;
+    if micros == i64::MAX || micros == -i64::MAX {
+        return Ok(Value::TimestampTzNs(micros));
+    }
+    let nanos = micros
+        .checked_mul(1_000)
+        .and_then(|nanos| nanos.checked_add(sub_micros(text)))
+        .ok_or_else(range)?;
+    let instant = match written {
+        Suffix::Nothing => local_nanos_instant(nanos, zone),
+        Suffix::Named(name) => {
+            let Some(named) = SessionTimeZone::named(name) else {
+                return Err(Error::conversion(format!("Unknown TimeZone '{name}'!")));
+            };
+            local_nanos_instant(nanos, named)
+        }
+        Suffix::Offset(seconds) => nanos.checked_sub(seconds * NANOS_PER_SECOND),
+    };
+    instant.filter(|nanos| finite(*nanos)).map(Value::TimestampTzNs).ok_or_else(range)
+}
+
+/// Whether a count of ticks is a timestamp rather than one of the two infinities, and not past
+/// them either.
+const fn finite(ticks: i64) -> bool {
+    ticks != i64::MAX && ticks > -i64::MAX
+}
+
+/// The instant in nanoseconds that a wall clock in nanoseconds names in `zone`, with the two
+/// infinities kept infinite. The offset is found at the microsecond the clock is in, and an offset
+/// is whole seconds, so the nanoseconds past it carry over unchanged.
+fn local_nanos_instant(nanos: i64, zone: SessionTimeZone) -> Option<i64> {
+    if !finite(nanos) {
+        return Some(nanos);
+    }
+    let micros = nanos.div_euclid(1_000);
+    let instant = zone.instant_of_local(micros)?;
+    nanos.checked_sub((micros - instant).checked_mul(1_000)?).filter(|nanos| finite(*nanos))
+}
+
+/// A `TIMESTAMPTZ_NS` cast to another type in the session zone `zone`.
+///
+/// Text and the wall clock types read the zone. A `TIMESTAMPTZ` and a `TIMETZ` round to the
+/// microsecond, and the `TIMETZ` is the time of day at UTC, which is what the pin answers in every
+/// zone. A date floors instead, so the last nanosecond of a day stays on it.
+fn from_timestamp_tz_ns(
+    nanos: i64,
+    target: &LogicalType,
+    try_cast: bool,
+    zone: SessionTimeZone,
+) -> Result<Value> {
+    let value = Value::TimestampTzNs(nanos);
+    let micros = || restamp(nanos, NANOS_PER_SECOND, MICROS_PER_SECOND).unwrap_or(nanos);
+    let local = || {
+        if !finite(nanos) {
+            return Ok(nanos);
+        }
+        let offset = zone.offset_seconds_at(nanos.div_euclid(1_000));
+        nanos
+            .checked_add(i64::from(offset) * NANOS_PER_SECOND)
+            .filter(|local| finite(*local))
+            .ok_or_else(|| Error::conversion("Unable to convert TIMESTAMPTZ to local TIMESTAMP"))
+    };
+    match target {
+        LogicalType::Varchar => {
+            Ok(Value::Varchar(value.to_string_at_offset(zone.offset_seconds_at(micros()))))
+        }
+        LogicalType::TimestampTz => Ok(Value::TimestampTz(micros())),
+        LogicalType::TimeTz if !finite(nanos) => {
+            Err(Error::conversion("Can't get TIME of infinite TIMESTAMP"))
+        }
+        LogicalType::TimeTz => {
+            Ok(Value::TimeTz(time_tz::pack(micros().rem_euclid(MICROS_PER_DAY), 0)))
+        }
+        LogicalType::TimestampNs => local().map(Value::TimestampNs),
+        LogicalType::Date => {
+            let local = local()?;
+            let micros = if finite(local) { local.div_euclid(1_000) } else { local };
+            day_of_stamp(micros).map(Value::Date).ok_or_else(|| out_of_range(&value, target))
+        }
+        LogicalType::Timestamp | LogicalType::TimestampS | LogicalType::TimestampMs => {
+            let per_second = ticks_per_second(target).unwrap_or(MICROS_PER_SECOND);
+            let ticks = restamp(local()?, NANOS_PER_SECOND, per_second).unwrap_or(0);
+            Ok(match target {
+                LogicalType::TimestampS => Value::TimestampS(ticks),
+                LogicalType::TimestampMs => Value::TimestampMs(ticks),
+                _ => Value::Timestamp(ticks),
+            })
+        }
+        LogicalType::Json => {
+            crate::json::cast_to_json(&value, &value.logical_type(), try_cast, Some(zone))
+        }
+        _ => Err(no_cast(&value, target)),
+    }
 }
 
 /// What the timestamp message says the format should have been, including the parts of it this
@@ -3131,6 +3322,9 @@ fn to_interval(value: &Value) -> Result<Value> {
 
 /// Nanoseconds to the second, which is the precision a written fraction of a unit is read at.
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// The nanoseconds in a day, which is what a `TIME_NS` counts up to.
+const NANOS_PER_DAY: i64 = MICROS_PER_DAY * 1_000;
 
 /// The length of a month wherever an interval has to put a fraction of one into days.
 const DAYS_PER_MONTH: i64 = 30;

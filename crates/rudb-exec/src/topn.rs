@@ -324,6 +324,8 @@ fn orders_as_stored(logical: &LogicalType) -> bool {
             | LogicalType::TimestampS
             | LogicalType::TimestampMs
             | LogicalType::TimestampNs
+            | LogicalType::TimeNs
+            | LogicalType::TimestampTzNs
             | LogicalType::TimestampTz
     )
 }

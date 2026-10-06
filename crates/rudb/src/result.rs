@@ -180,7 +180,7 @@ impl QueryResult {
     #[must_use]
     pub fn value_text(&self, value: &Value) -> String {
         let instant = match value {
-            Value::TimestampTz(micros) => *micros,
+            Value::TimestampTz(_) | Value::TimestampTzNs(_) => value.zoned_micros().unwrap_or(0),
             // A zoned value inside a list, a struct or a map is written in the session zone too,
             // which UTC already is.
             Value::List { .. } | Value::Struct(_) | Value::Map { .. }
@@ -202,7 +202,9 @@ impl QueryResult {
     /// its text holds and not by its type.
     fn written_inside(&self, value: &Value) -> Value {
         match value {
-            Value::TimestampTz(_) => Value::Varchar(self.value_text(value)),
+            Value::TimestampTz(_) | Value::TimestampTzNs(_) => {
+                Value::Varchar(self.value_text(value))
+            }
             Value::List { element, values } => Value::List {
                 element: element.clone(),
                 values: values.iter().map(|value| self.written_inside(value)).collect(),
@@ -529,7 +531,7 @@ const _: () = assert!(size_of::<QueryResult>() <= 256, "a result has grown past 
 /// is written the same in every session.
 fn zoned_inside(value: &Value) -> bool {
     match value {
-        Value::TimestampTz(_) => true,
+        Value::TimestampTz(_) | Value::TimestampTzNs(_) => true,
         Value::List { values, .. } => values.iter().any(zoned_inside),
         Value::Struct(fields) => fields.iter().any(|(_, value)| zoned_inside(value)),
         Value::Map { entries, .. } => {

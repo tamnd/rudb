@@ -2686,7 +2686,7 @@ impl Binder<'_> {
         let wanted = match &types[0] {
             LogicalType::Date | LogicalType::Timestamp | LogicalType::TimestampTz => None,
             LogicalType::Interval if interval => None,
-            LogicalType::Time | LogicalType::TimeTz if timed => None,
+            LogicalType::Time | LogicalType::TimeTz | LogicalType::TimeNs if timed => None,
             LogicalType::TimestampS | LogicalType::TimestampMs | LogicalType::TimestampNs => {
                 Some(LogicalType::Timestamp)
             }

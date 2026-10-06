@@ -7800,6 +7800,7 @@ fn unzoned(ty: &LogicalType) -> bool {
             | T::TimestampS
             | T::TimestampMs
             | T::TimestampNs
+            | T::TimeNs
     )
 }
 

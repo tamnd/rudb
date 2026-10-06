@@ -117,9 +117,9 @@ fn structs(from: &[Field], to: &[Field]) -> Option<i64> {
 /// the same and not nested.
 fn widens(source: &LogicalType, target: &LogicalType) -> bool {
     use LogicalType::{
-        BigInt, BigNum, Date, Decimal, Double, Enum, Float, HugeInt, Integer, Numeric, SmallInt, Timestamp,
-        TimestampMs, TimestampNs, TimestampS, TimestampTz, TinyInt, UBigInt, UHugeInt, UInteger,
-        USmallInt, UTinyInt, Varchar,
+        BigInt, BigNum, Date, Decimal, Double, Enum, Float, HugeInt, Integer, Numeric, SmallInt,
+        Timestamp, TimestampMs, TimestampNs, TimestampS, TimestampTz, TimestampTzNs, TinyInt,
+        UBigInt, UHugeInt, UInteger, USmallInt, UTinyInt, Varchar,
     };
     // Every integer and a `FLOAT` go into a number of any size, and that goes into a double, which
     // is how the pin multiplies one.
@@ -171,13 +171,18 @@ fn widens(source: &LogicalType, target: &LogicalType) -> bool {
         UBigInt => matches!(target, UHugeInt | HugeInt | Float | Double | Decimal { .. }),
         UHugeInt => matches!(target, Float | Double | Decimal { .. }),
         Float | Decimal { .. } => matches!(target, Float | Double),
-        Date => matches!(target, Timestamp | TimestampTz | TimestampMs | TimestampNs | TimestampS),
+        Date => matches!(
+            target,
+            Timestamp | TimestampTz | TimestampMs | TimestampNs | TimestampS | TimestampTzNs
+        ),
         Enum(_) => matches!(target, Varchar),
         BigNum | Numeric => matches!(target, Double),
-        TimestampS => matches!(target, Timestamp | TimestampMs | TimestampNs),
-        TimestampMs => matches!(target, Timestamp | TimestampNs),
+        // A coarser timestamp goes into the nanosecond instant the way it goes into the microsecond
+        // one, which the pin does for `TIMESTAMP` and the corpus written after it for the others.
+        TimestampS => matches!(target, Timestamp | TimestampMs | TimestampNs | TimestampTzNs),
+        TimestampMs => matches!(target, Timestamp | TimestampNs | TimestampTzNs),
         TimestampNs => matches!(target, Timestamp),
-        Timestamp => matches!(target, TimestampNs | TimestampTz),
+        Timestamp => matches!(target, TimestampNs | TimestampTz | TimestampTzNs),
         _ => false,
     }
 }

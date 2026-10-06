@@ -376,7 +376,9 @@ fn number(value: &Value) -> Option<i128> {
         | Value::TimestampTz(held)
         | Value::TimestampS(held)
         | Value::TimestampMs(held)
-        | Value::TimestampNs(held) => Some(i128::from(held)),
+        | Value::TimestampNs(held)
+        | Value::TimeNs(held)
+        | Value::TimestampTzNs(held) => Some(i128::from(held)),
         Value::HugeInt(held) => Some(held),
         Value::UTinyInt(held) => Some(i128::from(held)),
         Value::USmallInt(held) => Some(i128::from(held)),

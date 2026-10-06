@@ -2165,6 +2165,8 @@ impl Transform<'_> {
             | LogicalType::TimestampS
             | LogicalType::TimestampMs
             | LogicalType::TimestampNs
+            | LogicalType::TimeNs
+            | LogicalType::TimestampTzNs
             | LogicalType::TimestampTz
             | LogicalType::Uuid => Ok(self.string_column(items, ty)),
             _ if ty.is_numeric() || *ty == LogicalType::Boolean => Ok(self.numerical(items, ty)),

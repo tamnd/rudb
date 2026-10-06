@@ -644,6 +644,8 @@ impl<'a> Sorted<'a> {
                 | LogicalType::TimestampS
                 | LogicalType::TimestampMs
                 | LogicalType::TimestampNs
+                | LogicalType::TimeNs
+                | LogicalType::TimestampTzNs
                 | LogicalType::TimestampTz
                 | LogicalType::Decimal { .. }
                 | LogicalType::Varchar

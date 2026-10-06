@@ -1,18 +1,17 @@
 //! What `duckdb_types()` says about each type name this engine knows.
 //!
-//! One entry per name, and one row per entry per modifier signature, which is why 77 names produce 97
+//! One entry per name, and one row per entry per modifier signature, which is why 79 names produce 99
 //! rows. The list, the oids, the modifier signatures and the row order were all read off the pinned
 //! binary rather than worked out from first principles, because every one of them turned out to have
 //! something in it that reading the type system would not have told you.
 //!
 //! # The table lists the types this engine has
 //!
-//! The pinned binary returns 104 rows in the `memory` schema and this returns 97. The seven that are
-//! not here are six names for types rudb does not have at all, `array`, `geometry`,
-//! `timestamptz_ns`, `time_ns`, `tuple` and `type`, plus `geometry` a second time for its `crs`
-//! modifier. A catalog table that listed a type you cannot make a value
-//! of would be a table that lies, and the point of this one is that a client can read it to find out
-//! what the engine supports. The names come back when the types do.
+//! The pinned binary returns 104 rows in the `memory` schema and this returns 99. The five that are
+//! not here are four names for types rudb does not have at all, `array`, `geometry`, `tuple` and
+//! `type`, plus `geometry` a second time for its `crs` modifier. A catalog table that listed a type
+//! you cannot make a value of would be a table that lies, and the point of this one is that a
+//! client can read it to find out what the engine supports. The names come back when the types do.
 //!
 //! `list` is here even though `NULL::LIST(INTEGER)` is a parser error in both engines. The name is a
 //! catalog entry rather than something a cast can spell, the spelling that works is `INTEGER[]`, and
@@ -150,11 +149,13 @@ pub static TYPE_NAMES: &[TypeEntry] = &[
     TypeEntry { signatures: PRECISION, ..entry("timestamp", "TIMESTAMP", None) },
     entry("timestamp with time zone", "TIMESTAMP WITH TIME ZONE", Some(32)),
     entry("timestamptz", "TIMESTAMP WITH TIME ZONE", None),
+    entry("timestamptz_ns", "TIMESTAMPTZ_NS", Some(33)),
     entry("timestamp_ms", "TIMESTAMP_MS", Some(18)),
     entry("timestamp_ns", "TIMESTAMP_NS", Some(20)),
     entry("timestamp_s", "TIMESTAMP_S", Some(17)),
     entry("timestamp_us", "TIMESTAMP", None),
     entry("timetz", "TIME WITH TIME ZONE", None),
+    entry("time_ns", "TIME_NS", Some(35)),
     entry("tinyint", "TINYINT", None),
     entry("ubigint", "UBIGINT", Some(31)),
     entry("uhugeint", "UHUGEINT", Some(49)),
@@ -241,6 +242,8 @@ pub fn representative(logical_type: &str) -> Option<LogicalType> {
         "TIMESTAMP_S" => LogicalType::TimestampS,
         "TIMESTAMP_MS" => LogicalType::TimestampMs,
         "TIMESTAMP_NS" => LogicalType::TimestampNs,
+        "TIME_NS" => LogicalType::TimeNs,
+        "TIMESTAMPTZ_NS" => LogicalType::TimestampTzNs,
         "TIMESTAMP WITH TIME ZONE" => LogicalType::TimestampTz,
         "INTERVAL" => LogicalType::Interval,
         "LIST" => LogicalType::list(LogicalType::Integer),
@@ -315,6 +318,8 @@ pub fn type_category(logical_type: &str) -> Option<&'static str> {
         | LogicalType::TimestampS
         | LogicalType::TimestampMs
         | LogicalType::TimestampNs
+        | LogicalType::TimeNs
+        | LogicalType::TimestampTzNs
         | LogicalType::TimestampTz
         | LogicalType::Interval => "DATETIME",
         LogicalType::List(_)
@@ -346,8 +351,8 @@ mod tests {
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
         let rows: usize = TYPE_NAMES.iter().map(|entry| entry.signatures.len()).sum();
-        assert_eq!(TYPE_NAMES.len(), 77, "names");
-        assert_eq!(rows, 97, "rows, which is the pin's 104 less the seven for types we lack");
+        assert_eq!(TYPE_NAMES.len(), 79, "names");
+        assert_eq!(rows, 99, "rows, which is the pin's 104 less the five for types we lack");
         assert_eq!(type_fields().len(), 17);
     }
 
@@ -377,7 +382,7 @@ mod tests {
         let total = oids.len();
         oids.dedup();
         assert_eq!(oids.len(), total, "two names claim the same oid");
-        assert_eq!(total, 34, "one oid per type this engine has");
+        assert_eq!(total, 37, "one oid per type this engine has");
     }
 
     #[test]

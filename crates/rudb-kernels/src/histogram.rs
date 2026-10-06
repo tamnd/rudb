@@ -226,6 +226,8 @@ pub(crate) fn other_bin(key: &LogicalType) -> Option<Value> {
         LogicalType::TimestampS => Value::TimestampS(i64::MAX),
         LogicalType::TimestampMs => Value::TimestampMs(i64::MAX),
         LogicalType::TimestampNs => Value::TimestampNs(i64::MAX),
+        LogicalType::TimeNs => Value::TimeNs(86_400_000_000_000),
+        LogicalType::TimestampTzNs => Value::TimestampTzNs(i64::MAX),
         LogicalType::Float => Value::Float(f32::INFINITY),
         LogicalType::Double => Value::Double(f64::INFINITY),
         LogicalType::Varchar => Value::Varchar(String::new()),
