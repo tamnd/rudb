@@ -4749,6 +4749,24 @@ impl<'a> Aggregate<'a> {
         // the order the rows came is a cache miss a row. Once any value is held every later one is,
         // so that a set is always given its values in the order they arrived.
         let hold = seen.len() >= DIRECT_SETS || !held.values.is_empty();
+        // Nothing about a held value needs its set until it is given, so a column of flat integers
+        // with no filter on the call is held without a read of `seen`. That read was a cache miss a
+        // row, the one holding the values is there to take away, and on q16 it was most of what
+        // was left of this loop.
+        if hold
+            && rows.filters[at].is_none()
+            && let Some((values, validity)) = &ints
+        {
+            u32::try_from(seen.len()).map_err(|_| Error::internal("too many distinct sets"))?;
+            match values {
+                Ints::Wide(values) => held.hold_rows(slots, (calls, at), *values, validity),
+                Ints::Narrow(values) => held.hold_rows(slots, (calls, at), *values, validity),
+            }
+            if held.values.len() >= HELD_DISTINCT {
+                aside += held.give(seen, states)?;
+            }
+            return Ok(aside);
+        }
         // row at a time: a set of rows is what `DISTINCT` is, and the table that would replace this
         // one is the one #237 built for grouping. Until that is shared, this is the honest loop.
         for (row, &slot) in slots.iter().enumerate() {
@@ -6188,6 +6206,29 @@ impl HeldDistinct {
         }
         self.values.push((set, value));
         Ok(())
+    }
+
+    /// Holds what every row of a chunk offers the sets of call `at` of `calls`, for a column of
+    /// flat integers and a call with no filter, which is the row loop of [`Aggregate::distinct`]
+    /// with nothing in it but the push. The caller has made sure every set's index fits a `u32`.
+    fn hold_rows<T: Copy + Into<i64>>(
+        &mut self,
+        slots: &[usize],
+        (calls, at): (usize, usize),
+        values: &[T],
+        validity: &Validity,
+    ) {
+        if self.values.capacity() == 0 {
+            self.values.reserve(HELD_DISTINCT + VECTOR_SIZE);
+        }
+        let nulls = validity.has_nulls(slots.len());
+        for (row, (&slot, &value)) in slots.iter().zip(values).enumerate() {
+            if slot == NOWHERE || (nulls && !validity.is_valid(row)) {
+                continue;
+            }
+            let set = u32::try_from(slot * calls + at).unwrap_or(u32::MAX);
+            self.values.push((set, value.into()));
+        }
     }
 
     /// Gives every held value to its set and counts the new ones in their accumulators, and
@@ -9595,6 +9636,16 @@ mod tests {
     }
 
     /// Held values come back in the order of their sets, and in the order they came within a set.
+    /// A row the group limit turned away and a null offer nothing, and the rest are held under the
+    /// index of their set, which is the slot times the calls plus the call.
+    #[test]
+    fn held_rows_skip_the_rows_with_no_group_and_the_nulls() {
+        let mut held = HeldDistinct::default();
+        let validity = rudb_vector::Validity::from_iter(4, |row| row != 2);
+        held.hold_rows(&[3, NOWHERE, 1, 0], (2, 1), &[10_i32, 11, 12, 13], &validity);
+        assert_eq!(held.values, [(7, 10), (1, 13)]);
+    }
+
     #[test]
     fn held_distinct_values_sort_by_set_and_keep_their_order() {
         let mut values: Vec<(u32, i64)> = (0..5000_i64)
