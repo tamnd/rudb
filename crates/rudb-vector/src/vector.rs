@@ -2601,7 +2601,7 @@ impl Vector {
         match &self.body {
             Body::Constant(value) => match value.as_ref() {
                 Value::Varchar(text) => Some(text.as_bytes()),
-                Value::Blob(bytes) | Value::Bit(bytes) | Value::BigNum(bytes) => Some(bytes),
+                Value::Blob(bytes) | Value::Bit(bytes) | Value::BigNum(bytes) | Value::Numeric(bytes) => Some(bytes),
                 _ => None,
             },
             Body::Dictionary { codes, values, .. } => {
@@ -2635,7 +2635,7 @@ impl Vector {
         match &self.body {
             Body::Constant(value) => Ok(match value.as_ref() {
                 Value::Varchar(text) => Some(text.as_bytes()),
-                Value::Blob(bytes) | Value::Bit(bytes) | Value::BigNum(bytes) => {
+                Value::Blob(bytes) | Value::Bit(bytes) | Value::BigNum(bytes) | Value::Numeric(bytes) => {
                     Some(bytes.as_slice())
                 }
                 _ => None,
@@ -5728,6 +5728,7 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
         | LogicalType::Blob
         | LogicalType::Bit
         | LogicalType::BigNum
+        | LogicalType::Numeric
         | LogicalType::Type
         | LogicalType::Json => data.bytes_at(index).map(|bytes| bytes_as(ty, bytes)),
         LogicalType::Enum(labels) => unsigned()
@@ -5806,6 +5807,7 @@ fn bytes_as(ty: &LogicalType, bytes: &[u8]) -> Value {
         LogicalType::Blob => Value::Blob(bytes.to_vec()),
         LogicalType::Bit => Value::Bit(bytes.to_vec()),
         LogicalType::BigNum => Value::BigNum(bytes.to_vec()),
+        LogicalType::Numeric => Value::Numeric(bytes.to_vec()),
         _ => Value::Null,
     }
 }
@@ -6156,7 +6158,7 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
             // A blob goes in as the bytes it is. The column stores a length and some bytes either
             // way, so text is the reading of one rather than a different column, and a blob that
             // is not UTF-8 is stored exactly like one that happens to be.
-            Value::Blob(bytes) | Value::Bit(bytes) | Value::BigNum(bytes) => {
+            Value::Blob(bytes) | Value::Bit(bytes) | Value::BigNum(bytes) | Value::Numeric(bytes) => {
                 column.push_bytes(bytes);
             }
             other => return Err(Error::internal(format!("{other:?} is not a string"))),

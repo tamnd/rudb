@@ -1865,6 +1865,34 @@ fn bignummed(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>,
     }
 }
 
+/// The arguments and the answer of the arithmetic over the `numeric` of PostgreSQL, or `None`
+/// for any other call. An integer, a decimal or a null next to one goes into a `numeric` too, and
+/// a call with a double is left to go through a double.
+fn numericked(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
+    use LogicalType::{Decimal, Null, Numeric};
+    if !arguments.contains(&Numeric) {
+        return None;
+    }
+    let exact = |ty: &LogicalType| ty.is_integer() || matches!(ty, Numeric | Decimal { .. } | Null);
+    match (name, arguments) {
+        (
+            "+"
+            | "-"
+            | "*"
+            | "/"
+            | "//"
+            | "%"
+            | "__rudb_checked_slash"
+            | "__rudb_checked_remainder"
+            | "__rudb_divide"
+            | "__rudb_mod",
+            [_, _],
+        ) if arguments.iter().all(exact) => Some((vec![Numeric, Numeric], Numeric)),
+        ("-", [Numeric]) => Some((vec![Numeric], Numeric)),
+        _ => None,
+    }
+}
+
 /// A scalar over bit strings.
 const fn bits(name: &'static str, arity: Arity) -> Entry {
     Entry { name, kind: FunctionKind::Scalar, arity, shape: Shape::Bits, numeric_only: false }
@@ -2084,12 +2112,16 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     if let Some((cast_to, returns)) = bignummed(entry.name, arguments) {
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
     }
+    if let Some((cast_to, returns)) = numericked(entry.name, arguments) {
+        return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
+    }
     // Anything else numeric over a number of any size goes through a double, which is the one
     // implicit cast the pin has out of one, so `big * 2` and `abs(big)` answer a double.
-    if entry.numeric_only && arguments.contains(&LogicalType::BigNum) {
+    let wide = |ty: &LogicalType| matches!(ty, LogicalType::BigNum | LogicalType::Numeric);
+    if entry.numeric_only && arguments.iter().any(wide) {
         let doubles: Vec<LogicalType> = arguments
             .iter()
-            .map(|ty| if *ty == LogicalType::BigNum { LogicalType::Double } else { ty.clone() })
+            .map(|ty| if wide(ty) { LogicalType::Double } else { ty.clone() })
             .collect();
         return resolved(name, &doubles).map_err(|_| no_match(entry.name, arguments));
     }

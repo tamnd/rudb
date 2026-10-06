@@ -155,6 +155,10 @@ pub(crate) fn same(left: &Value, right: &Value) -> bool {
             Value::Interval { months: am, days: ad, micros: au },
             Value::Interval { months: bm, days: bd, micros: bu },
         ) => interval_micros(*am, *ad, *au) == interval_micros(*bm, *bd, *bu),
+        // `1.0` and `1.00` are one group, and the group shows the first of them it saw.
+        (Value::Numeric(a), Value::Numeric(b)) => {
+            rudb_common::numeric::key(a) == rudb_common::numeric::key(b)
+        }
         _ => left == right,
     }
 }
@@ -192,6 +196,7 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
         Value::Double(x) => canonical(*x).hash(state),
         Value::Varchar(x) => x.hash(state),
         Value::Blob(x) | Value::Bit(x) | Value::BigNum(x) => x.hash(state),
+        Value::Numeric(x) => rudb_common::numeric::key(x).hash(state),
         Value::Decimal { unscaled, width, scale } => {
             unscaled.hash(state);
             width.hash(state);

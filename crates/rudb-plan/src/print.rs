@@ -823,6 +823,7 @@ mod tests {
             LogicalType::Blob,
             LogicalType::Bit,
             LogicalType::BigNum,
+            LogicalType::Numeric,
             LogicalType::Uuid,
             LogicalType::Date,
             LogicalType::Time,

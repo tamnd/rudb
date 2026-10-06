@@ -3277,13 +3277,16 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish
     // check to say what the column already said once, and hashing is nine to twelve percent of
     // every query on the suite.
     let straight = !validity.has_nulls(rows);
+    // A `numeric` hashes its key and not its bytes, so that `1.0` and `1.00` are one group. The
+    // value at a time path below does that.
+    let numeric = column.logical_type() == &rudb_common::LogicalType::Numeric;
     if let Some(packed) = column.packed_parts() {
         fold_packed(&packed, wide, rows, straight.then_some(Reads::Own), finish, hashes, |row| {
             validity.is_valid(row).then_some(row)
         });
         return;
     }
-    if let Some(data) = column.data()
+    if let Some(data) = column.data().filter(|_| !numeric)
         && fold_data(data, rows, hashes, straight.then_some(Reads::Own), finish, |row| {
             validity.is_valid(row).then_some(row)
         })
@@ -3300,7 +3303,7 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish
     // A dictionary a Parquet reader hands over covers a whole column chunk and can hold far more
     // values than the thousand rows being hashed, so hashing it whole would be the slower of the two
     // exactly when the dictionary is doing its job.
-    if let Some((at, values)) = column.positions() {
+    if let Some((at, values)) = column.positions().filter(|_| !numeric) {
         // Whether no row is nothing, which for a column read through codes takes both sides saying
         // so: the column's own validity and that of what the codes point at. This is the shape a
         // filter hands on, since it keeps the rows that got through as codes into the chunk it was
@@ -3616,6 +3619,7 @@ fn fold_value(state: u64, value: &Value) -> u64 {
         Value::Double(x) => mix(state, canonical(*x)),
         Value::Varchar(x) => mix(state, bytes_word(x.as_bytes())),
         Value::Blob(x) | Value::Bit(x) | Value::BigNum(x) => mix(state, bytes_word(x)),
+        Value::Numeric(x) => mix(state, bytes_word(rudb_common::numeric::key(x))),
         // Two words, low first, the way the 128 bit layouts are read. The width and the scale of a
         // decimal are not mixed, because they are the column's and not the value's, and a flat
         // decimal column is a run of integers with no room to keep them.

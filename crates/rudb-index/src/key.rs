@@ -70,6 +70,7 @@ pub fn push(value: &Value, out: &mut Vec<u8>) -> bool {
         Value::Double(v) => out.extend_from_slice(&float(*v).to_be_bytes()),
         Value::Varchar(v) => text(v.as_bytes(), out),
         Value::Blob(v) | Value::Bit(v) | Value::BigNum(v) => text(v, out),
+        Value::Numeric(v) => text(rudb_common::numeric::key(v), out),
         _ => {
             out.truncate(at);
             return false;
