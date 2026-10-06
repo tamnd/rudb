@@ -38,6 +38,13 @@
 //! [`HotStripe::take_deletes`] turns the frozen stripe's delete vector into `deleted` stamps and
 //! row locks. Every row is created at 1, before any snapshot, and a row of the base is deleted at
 //! 1 too, so the stripe answers every reader the way the frozen one did.
+//!
+//! A checkpoint round writes a stripe it does not freeze as a hot image, section 10.5 step 3, of
+//! the (column, part) pairs a commit changed since the stripe's last image. Each pair keeps the
+//! newest commit timestamp stamped on it for that, and each part the newest delete, set when the
+//! commit stamps the row: the undo flag of a part's summary cannot say it, since the collector
+//! clears it. [`HotStripe::image`] reads the values as of the round's cut the way a reader at
+//! that snapshot does, and [`HotStripe::restore`] makes a stripe from an image again.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
@@ -48,6 +55,7 @@ use rudb_common::Error;
 
 use crate::arena::{Arena, Place, Space};
 use crate::deletes::{DeleteVector, PART_ROWS, PART_WORDS, Refusal, STRIPE_ROWS, UNCOMMITTED};
+use crate::image::{ColumnImage, HotImage, PartImage, Values};
 use crate::park::{self, Wait};
 use crate::undo::{ABORTED, Image, Row, UndoBuffer, UndoKind, UndoRef, UndoSpace};
 
@@ -289,6 +297,11 @@ pub struct HotStripe {
     thawed: bool,
     /// Writes of its rows in place committed, which the thaw rule reads as a rate.
     writes: AtomicU64,
+    /// The newest commit timestamp stamped on each (column, part), column by column, which says
+    /// which pairs a hot image writes.
+    stamps: Box<[AtomicU64]>,
+    /// The newest commit timestamp of a delete in each part.
+    erased: Box<[AtomicU64]>,
 }
 
 impl HotStripe {
@@ -327,6 +340,8 @@ impl HotStripe {
             pending: OnceLock::new(),
             thawed: false,
             writes: AtomicU64::new(0),
+            stamps: (0..widths.len() * PARTS).map(|_| AtomicU64::new(0)).collect(),
+            erased: (0..PARTS).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
@@ -441,6 +456,13 @@ impl HotStripe {
     #[must_use]
     pub fn is_freezing(&self) -> bool {
         self.state.load(Ordering::SeqCst) >= FREEZING
+    }
+
+    /// The newest commit timestamp stamped on a row of it, its last change. A round whose stripe
+    /// image is at or past this has nothing of it to write, section 10.5 step 6.
+    #[must_use]
+    pub fn changed(&self) -> u64 {
+        self.changed.load(Ordering::SeqCst)
     }
 
     /// When a row of it last committed, in [`now_ms`].
@@ -619,6 +641,13 @@ impl HotStripe {
     ///
     /// If a slot was never leased.
     pub fn commit_insert(&self, slots: Range<u32>, txn: u64, ts: u64) {
+        if !slots.is_empty() {
+            for part in place(slots.start).0..=place(slots.end - 1).0 {
+                for column in 0..self.columns.len() {
+                    self.stamps[column * PARTS + part].fetch_max(ts, Ordering::AcqRel);
+                }
+            }
+        }
         self.restamp(&self.created, slots, txn | UNCOMMITTED, ts);
         self.stamped(ts);
     }
@@ -719,9 +748,17 @@ impl HotStripe {
         self.stamped(ts);
         self.writes.fetch_add(1, Ordering::Relaxed);
         let (part, at) = place(slot);
-        self.walk_own(slot, me, |record| record.stamp(ts));
-        if let Some(deleted) = self.deleted.get(part) {
-            let _ = deleted[at].compare_exchange(me, ts, Ordering::AcqRel, Ordering::Relaxed);
+        self.walk_own(slot, me, |record| {
+            for image in record.images() {
+                self.stamps[usize::from(image.column) * PARTS + part]
+                    .fetch_max(ts, Ordering::AcqRel);
+            }
+            record.stamp(ts);
+        });
+        if let Some(deleted) = self.deleted.get(part)
+            && deleted[at].compare_exchange(me, ts, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        {
+            self.erased[part].fetch_max(ts, Ordering::AcqRel);
         }
         self.release(slot);
     }
@@ -1185,6 +1222,136 @@ impl HotStripe {
         count
     }
 
+    /// Its image as of `at`, `10-freezing-and-checkpoint.md` section 10.5 step 3: of every
+    /// (column, part) a commit after `since` changed, or of every part with a slot handed out when
+    /// there is no `since`, which is a stripe with no image yet, a thawed one among them. A part
+    /// only rows were deleted from has no column in it.
+    ///
+    /// A row is in it when it was committed at or before `at`, and listed deleted when that is
+    /// true of its delete too. Its values are the ones a reader at `at` sees. The caller holds
+    /// `at` as a snapshot while this runs, so the undo records that say those values are not
+    /// collected, and every commit at or below `at` has stamped its rows.
+    #[must_use]
+    pub fn image(&self, since: Option<u64>, at: u64) -> HotImage {
+        let rows = self.reserved();
+        let changed =
+            |stamp: &AtomicU64| since.is_none_or(|since| stamp.load(Ordering::Acquire) > since);
+        let mut parts = Vec::new();
+        let mut out = [None];
+        for part in 0..rows.div_ceil(PART_ROWS) {
+            let p = part as usize;
+            let columns: Vec<usize> =
+                (0..self.columns.len()).filter(|&c| changed(&self.stamps[c * PARTS + p])).collect();
+            if columns.is_empty() && !changed(&self.erased[p]) {
+                continue;
+            }
+            let first = part * PART_ROWS;
+            let len = (rows - first).min(PART_ROWS);
+            let mut present = Box::new([0_u64; PART_WORDS]);
+            let mut deleted = Vec::new();
+            let created = self.created.get(p);
+            for slot in first..first + len {
+                let i = (slot - first) as usize;
+                let stamp = created.map_or(0, |created| created[i].load(Ordering::Acquire));
+                if stamp == 0 || stamp & UNCOMMITTED != 0 || stamp > at {
+                    continue;
+                }
+                present[i / 64] |= 1 << (i % 64);
+                if !self.visible(slot, at, 0) {
+                    deleted.push(slot);
+                }
+            }
+            let columns = columns
+                .into_iter()
+                .map(|column| {
+                    let text = self.columns[column].text;
+                    let mut valid = Box::new([0_u64; PART_WORDS]);
+                    let (mut fixed, mut bytes, mut ends) = (Vec::new(), Vec::new(), Vec::new());
+                    for slot in first..first + len {
+                        let i = (slot - first) as usize;
+                        out[0] = None;
+                        if present[i / 64] & (1 << (i % 64)) != 0 {
+                            self.read_as_of(slot, &[column], at, 0, &mut out);
+                        }
+                        if out[0].is_some() {
+                            valid[i / 64] |= 1 << (i % 64);
+                        }
+                        if text {
+                            self.text(out[0], &mut bytes);
+                            ends.push(bytes.len() as u64);
+                        } else {
+                            fixed.push(out[0].unwrap_or(0));
+                        }
+                    }
+                    let values =
+                        if text { Values::Text { bytes, ends } } else { Values::Fixed(fixed) };
+                    ColumnImage { column, valid, values }
+                })
+                .collect();
+            parts.push(PartImage { part, present, deleted, columns });
+        }
+        HotImage { stripe: self.id, at, rows, parts }
+    }
+
+    /// Stripe `id` of table `table` as `image` says it was, the whole of it, from
+    /// [`HotImage::layered`]: every row it holds committed and every delete it lists committed,
+    /// both before any snapshot, the way a thaw makes its rows. The log above the image's cut is
+    /// replayed over it from there. It takes inserts after the slots the image handed out until
+    /// it is full.
+    ///
+    /// # Errors
+    ///
+    /// When a string does not fit in the arena.
+    ///
+    /// # Panics
+    ///
+    /// If the image names a column past `widths`, or holds values of the wrong kind for one.
+    pub fn restore(
+        id: u32,
+        table: u32,
+        widths: &[Width],
+        undos: Arc<UndoSpace>,
+        image: &HotImage,
+    ) -> rudb_common::Result<Self> {
+        let stripe = Self::with_undo(id, widths, undos).in_table(table);
+        if image.rows > 0 {
+            stripe.lease(image.rows).expect("an image fits in a stripe");
+        }
+        let mut space = Space::default();
+        for part in &image.parts {
+            let first = part.first();
+            let len = image.rows.saturating_sub(first).min(PART_ROWS) as usize;
+            let created = cells(stripe.created.get(part.part as usize));
+            for i in (0..len).filter(|&i| part.is_present(i)) {
+                created[i].store(BEFORE_ALL, Ordering::Relaxed);
+            }
+            for &slot in &part.deleted {
+                let (p, at) = place(slot);
+                stripe.deleted.get_or(p, || AtomicU64::new(LIVE))[at]
+                    .store(BEFORE_ALL, Ordering::Relaxed);
+            }
+            for column in &part.columns {
+                for i in 0..len.min(column.values.len()) {
+                    let slot = first + i as u32;
+                    if !column.is_valid(i) {
+                        stripe.write(slot, column.column, None);
+                        continue;
+                    }
+                    match &column.values {
+                        Values::Fixed(values) => stripe.write(slot, column.column, Some(values[i])),
+                        Values::Text { .. } => {
+                            let text = column.values.text(i);
+                            stripe.write_text(slot, column.column, Some(text), &mut space)?;
+                        }
+                    }
+                }
+            }
+        }
+        stripe.changed.store(image.at, Ordering::SeqCst);
+        fence(Ordering::Release);
+        Ok(stripe)
+    }
+
     /// Bytes the stripe holds in allocated parts.
     #[must_use]
     pub fn bytes(&self) -> usize {
@@ -1347,6 +1514,113 @@ mod tests {
     fn visible(stripe: &HotStripe, snapshot: u64, txn: u64) -> usize {
         let mut mask = [0_u64; PART_WORDS];
         (0..STRIPE_ROWS / PART_ROWS).map(|part| stripe.mask(part, snapshot, txn, &mut mask)).sum()
+    }
+
+    /// A stripe of an integer and a text column, with `rows` rows committed at 5 by transaction 1,
+    /// row `i` holding `i` and a string that is long for odd `i`, and two more inserted by
+    /// transaction 2 and not committed. Row 3 is then updated to 300 at 7 and row 4 deleted at 8.
+    fn imaged(rows: u32) -> HotStripe {
+        let stripe = HotStripe::new(9, &[Width::Eight, Width::Text]);
+        let mut space = Space::default();
+        let slots = stripe.lease(rows).expect("room");
+        for slot in slots.clone() {
+            stripe.write(slot, 0, Some(u128::from(slot)));
+            let text = text_of(slot);
+            let value = (slot % 5 != 0).then_some(text.as_slice());
+            stripe.write_text(slot, 1, value, &mut space).expect("room");
+        }
+        stripe.insert(slots.clone(), 1);
+        stripe.commit_insert(slots, 1, 5);
+        let open = stripe.lease(2).expect("room");
+        stripe.insert(open, 2);
+        let mut buffer = UndoBuffer::default();
+        stripe.update(3, &[(0, Some(300))], 5, 3, Wait::NEVER, &mut buffer).expect("updates");
+        stripe.commit_write(3, 3, 7);
+        stripe.delete(4, 7, 4, Wait::NEVER, &mut buffer).expect("deletes");
+        stripe.commit_write(4, 4, 8);
+        stripe
+    }
+
+    fn text_of(slot: u32) -> Vec<u8> {
+        if slot % 2 == 1 {
+            format!("the longer string of row {slot}").into_bytes()
+        } else {
+            format!("row {slot}").into_bytes()
+        }
+    }
+
+    #[test]
+    fn an_image_is_the_stripe_as_of_its_cut() {
+        let stripe = imaged(10_000);
+        let whole = stripe.image(None, 6);
+        assert_eq!((whole.stripe, whole.at, whole.rows, whole.parts.len()), (9, 6, 10_002, 2));
+        let first = &whole.parts[0];
+        assert_eq!(first.rows(), 8_192);
+        assert!(first.deleted.is_empty(), "the delete at 8 is after the cut");
+        assert_eq!(first.columns.len(), 2);
+        let crate::image::Values::Fixed(values) = &first.columns[0].values else { panic!() };
+        assert_eq!((values[3], values[4], values.len()), (3, 4, 8_192));
+        let text = &first.columns[1];
+        assert_eq!(text.values.text(7), text_of(7).as_slice());
+        assert_eq!(text.values.text(2), text_of(2).as_slice());
+        assert!(!text.is_valid(5) && text.values.text(5).is_empty());
+        // The uncommitted inserts are holes in it.
+        let second = &whole.parts[1];
+        assert_eq!(second.rows(), 10_000 - 8_192);
+        assert!(!second.is_present(10_000 - 8_192) && !second.is_present(10_001 - 8_192));
+        assert_eq!(second.columns[0].values.len(), 10_002 - 8_192);
+
+        let later = stripe.image(None, 8);
+        let crate::image::Values::Fixed(values) = &later.parts[0].columns[0].values else {
+            panic!()
+        };
+        assert_eq!(values[3], 300);
+        assert_eq!(later.parts[0].deleted, [4]);
+
+        // Since 5: the update to the integer column and the delete, both in the first part.
+        let since = stripe.image(Some(5), 8);
+        assert_eq!(since.parts.len(), 1);
+        assert_eq!(since.parts[0].part, 0);
+        assert_eq!(since.parts[0].columns.iter().map(|c| c.column).collect::<Vec<_>>(), [0]);
+        assert_eq!(since.parts[0].deleted, [4]);
+        // Since 7, only the delete, and since 8 nothing.
+        let deletes = stripe.image(Some(7), 9);
+        assert_eq!(deletes.parts.len(), 1);
+        assert!(deletes.parts[0].columns.is_empty());
+        assert_eq!(deletes.parts[0].deleted, [4]);
+        assert!(stripe.image(Some(8), 9).parts.is_empty());
+        assert_eq!(stripe.changed(), 8);
+    }
+
+    #[test]
+    fn a_stripe_restored_from_its_images_reads_as_it_did() {
+        let stripe = imaged(10_000);
+        let images = [stripe.image(None, 6), stripe.image(Some(6), 8)];
+        let layered = crate::image::HotImage::layered(&images);
+        assert_eq!(layered.parts.len(), 2);
+        assert_eq!(layered.parts[0].columns.len(), 2, "the older text column is kept");
+        let undos = Arc::new(crate::undo::UndoSpace::new());
+        let restored =
+            HotStripe::restore(9, 4, &[Width::Eight, Width::Text], undos, &layered).expect("fits");
+        assert_eq!(visible(&restored, 2, 0), visible(&stripe, 8, 0));
+        assert_eq!(visible(&restored, 2, 0), 9_999);
+        let (mut was, mut now) = (Vec::new(), Vec::new());
+        for slot in 0..10_002 {
+            assert_eq!(restored.visible(slot, 2, 0), stripe.visible(slot, 8, 0), "slot {slot}");
+            assert_eq!(as_of(&restored, slot, 2, 0)[0], as_of(&stripe, slot, 8, 0)[0]);
+            was.clear();
+            now.clear();
+            let view = as_of(&stripe, slot, 8, 0)[1];
+            assert_eq!(restored.read_text(slot, 1, &mut now), stripe.text(view, &mut was));
+            assert_eq!(now, was, "slot {slot}");
+        }
+        assert_eq!(restored.changed(), 8);
+        // An image of the restored stripe since its cut is empty, and its whole image is the
+        // layered one.
+        assert!(restored.image(Some(8), 9).parts.is_empty());
+        let again = restored.image(None, 8);
+        assert_eq!(again.parts[1].columns, layered.parts[1].columns);
+        assert_eq!(restored.lease(1), Some(10_002..10_003), "slots are never handed out twice");
     }
 
     #[test]

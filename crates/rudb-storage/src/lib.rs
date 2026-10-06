@@ -15,6 +15,7 @@ pub mod deletes;
 pub mod grams;
 pub mod horizon;
 pub mod hot;
+pub mod image;
 pub mod memory;
 pub mod mostly;
 pub mod park;
