@@ -1368,6 +1368,7 @@ pub(crate) fn found_for(
     // consistent reduction. TPC-H q02 is the case: the subquery's `partsupp` scan owns the bitmap of
     // the 1,987 suppliers of Europe, which reach a fifth of the table, and the 747 parts of the semi
     // join above reach 2,988 rows. Testing both bitmaps read all 800 thousand rows.
+    let deferring = deferred.is_some();
     let listing = match deferred {
         Some(planned) => Some(Listing {
             count: reduced.map_or(0, |reduced| reduced.kept),
@@ -1403,7 +1404,13 @@ pub(crate) fn found_for(
     let held = if wanted && domain.is_none() { dense(&keyed, rows) } else { None };
     let settled = settled || domain.is_some();
     let mut filter = if settled { None } else { Blocked::sized(rows, BUDGET) };
-    let keys = if exact.is_none() && !stopped && rows <= KEYS { sorted(&keyed) } else { None };
+    // Lists left for the scan answer it as the exact rows would, and a sorted list beside them
+    // would only have the scan ask every part's range about keys the lists or the bitmap settle.
+    let keys = if exact.is_none() && !stopped && !deferring && rows <= KEYS {
+        sorted(&keyed)
+    } else {
+        None
+    };
     let mut hashes = Vec::new();
     for (keys, len) in &keyed {
         let (Some(keys), len) = (keys, *len) else { continue };
