@@ -5590,6 +5590,45 @@ enum PartSlot {
         vector: Arc<Vector>,
         used: Arc<AtomicBool>,
     },
+    /// A part of compressed text with its runs read, so that a read of a few of its rows
+    /// decompresses those and reads nothing else, and the rows reads have decoded so far. See
+    /// [`Reader::runs`].
+    Indexed {
+        runs: Arc<string::Runs>,
+        seen: usize,
+        used: Arc<AtomicBool>,
+    },
+}
+
+impl PartSlot {
+    /// The rows reads have decoded so far, or `None` when the part is held.
+    fn seen(&self) -> Option<usize> {
+        match self {
+            Self::Unseen => Some(0),
+            Self::Seen(seen) | Self::Indexed { seen, .. } => Some(*seen),
+            Self::Held { .. } => None,
+        }
+    }
+
+    /// Adds `rows` to what reads have decoded, unless the part is held.
+    fn pay(&mut self, rows: usize) {
+        match self {
+            Self::Unseen => *self = Self::Seen(rows),
+            Self::Seen(seen) | Self::Indexed { seen, .. } => *seen = seen.saturating_add(rows),
+            Self::Held { .. } => {}
+        }
+    }
+}
+
+/// What [`Reader::decoded`] says a read of a part it does not hold should do.
+#[derive(Debug)]
+enum Undecoded {
+    /// Read the part's pages, at the positions when there are some.
+    Read,
+    /// Decode the part whole and hold it.
+    Keep,
+    /// Read the rows at the positions through the part's kept runs, which the read has paid for.
+    Through(Arc<string::Runs>),
 }
 
 /// One page a reader holds, and whether anyone has read it since the pool last looked.
@@ -5841,10 +5880,19 @@ impl PagePool {
                 let Some(Ok(mut held)) = shelf.slot(entry.column, part).map(Mutex::lock) else {
                     continue;
                 };
-                if matches!(&*held, PartSlot::Held { used, .. } if Arc::ptr_eq(used, &entry.used)) {
-                    // Dropped after the lock is let go, since the last holder frees the vector.
-                    let _vector = std::mem::take(&mut *held);
-                    drop(held);
+                match &*held {
+                    PartSlot::Held { used, .. } if Arc::ptr_eq(used, &entry.used) => {
+                        // Dropped after the lock is let go, since the last holder frees the vector.
+                        let _vector = std::mem::take(&mut *held);
+                        drop(held);
+                    }
+                    // The runs go and what reads have paid stays.
+                    PartSlot::Indexed { seen, used, .. } if Arc::ptr_eq(used, &entry.used) => {
+                        let seen = *seen;
+                        let _runs = std::mem::replace(&mut *held, PartSlot::Seen(seen));
+                        drop(held);
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -9263,10 +9311,8 @@ impl Reader {
         if sketch.is_none()
             && let Some(Ok(slot)) = self.cache.made(column, part).map(Mutex::lock)
         {
-            match *slot {
-                PartSlot::Held { .. } => return Ok(None),
-                PartSlot::Seen(before) if before >= rows => return Ok(None),
-                PartSlot::Seen(_) | PartSlot::Unseen => {}
+            if slot.seen().is_none_or(|before| before >= rows) {
+                return Ok(None);
             }
         }
         self.with_part(part, column, |bytes| {
@@ -9340,10 +9386,8 @@ impl Reader {
         // once the part is held or the next whole read would hold it. JOB 18a compared the codes of
         // `cast_info.note` on every warm run and spent half again what the held strings cost.
         if let Some(Ok(slot)) = self.cache.made(column, part).map(Mutex::lock) {
-            match *slot {
-                PartSlot::Held { .. } => return Ok(None),
-                PartSlot::Seen(before) if before >= rows => return Ok(None),
-                PartSlot::Seen(_) | PartSlot::Unseen => {}
+            if slot.seen().is_none_or(|before| before >= rows) {
+                return Ok(None);
             }
         }
         self.with_part(part, column, |bytes| {
@@ -9686,6 +9730,8 @@ impl Reader {
         for &column in columns {
             // Whether this read decodes the part whole and keeps it, when it is not held already.
             let mut keeping = false;
+            // The part's kept runs, when this read goes through them and has paid already.
+            let mut through = None;
             if keeps {
                 match self.decoded(at, column, positions, rows) {
                     Ok(vector) => {
@@ -9695,7 +9741,9 @@ impl Reader {
                         });
                         continue;
                     }
-                    Err(whole) => keeping = whole,
+                    Err(Undecoded::Keep) => keeping = true,
+                    Err(Undecoded::Read) => {}
+                    Err(Undecoded::Through(runs)) => through = Some(runs),
                 }
             }
             let field = self
@@ -9759,17 +9807,28 @@ impl Reader {
             // projection of a bare column name does the same, and a cut of a flat run copies unless
             // the run is a page. One `Arc` per column per part buys all of those, and it moves the
             // run into the `Arc` without touching a value.
+            // Whether this read went through the part's kept runs, which touch only the pages of the
+            // rows it wants.
+            let mut indexed = false;
             let mut vector = match positions {
+                Some(positions) if through.is_some() => {
+                    indexed = true;
+                    decode_at(&field.ty, rows, bytes, dictionary, positions, through.as_deref())?
+                }
                 Some(positions) if !keeping => {
                     let paid = paid_at(rows, bytes, positions, self.pool.is_final());
+                    let runs = if keeps { self.runs(at, column, rows, bytes)? } else { None };
+                    indexed = runs.is_some();
+                    let runs = runs.as_deref();
                     if keeps && self.pool.is_last_for(&self.table.name) {
                         self.pay(at, column, paid);
-                        decode_at(&field.ty, rows, bytes, dictionary, positions)?
+                        decode_at(&field.ty, rows, bytes, dictionary, positions, runs)?
                     } else if keeps && self.pay_or_hold(at, column, paid, rows) {
                         keeping = true;
+                        indexed = false;
                         decode(&field.ty, rows, bytes, dictionary)?
                     } else {
-                        decode_at(&field.ty, rows, bytes, dictionary, positions)?
+                        decode_at(&field.ty, rows, bytes, dictionary, positions, runs)?
                     }
                 }
                 _ => decode(&field.ty, rows, bytes, dictionary)?,
@@ -9790,7 +9849,9 @@ impl Reader {
                         == Ok(1)
                 }) {
                     map.release(page.offset, page.length as usize);
-                } else if positions.is_some() && !keeping {
+                } else if positions.is_some() && !keeping && !indexed {
+                    // A read through the part's runs is one that comes back to the part, and
+                    // letting the pages go had every point read fault them in again.
                     map.release(page.offset + span.start as u64, span.length);
                 }
             }
@@ -9820,28 +9881,36 @@ impl Reader {
         Chunk::with_rows(picked, positions.map_or(rows, <[u32]>::len))
     }
 
-    /// Part `at` of `column` as it was decoded before, or, when it is not held, whether this read
-    /// should decode it whole and keep it. See [`PartSlot`].
+    /// Part `at` of `column` as it was decoded before, or, when it is not held, how this read
+    /// should go about it. See [`PartSlot`].
     fn decoded(
         &self,
         at: usize,
         column: usize,
         positions: Option<&[u32]>,
         rows: usize,
-    ) -> std::result::Result<Arc<Vector>, bool> {
+    ) -> std::result::Result<Arc<Vector>, Undecoded> {
         let Some(Ok(mut held)) = self.cache.made(column, at).map(Mutex::lock) else {
-            return Err(false);
+            return Err(Undecoded::Read);
         };
+        // A read at positions of a part whose runs are kept pays what it costs here, which is its
+        // rows, so that it takes the slot's lock once rather than three times. See [`Self::runs`].
+        if let (PartSlot::Indexed { runs, seen, used }, Some(positions)) = (&mut *held, positions) {
+            let paid = positions.len();
+            if !self.pool.is_last_for(&self.table.name) && seen.saturating_add(paid) >= rows {
+                return Err(Undecoded::Keep);
+            }
+            *seen = seen.saturating_add(paid);
+            used.store(true, Atomic::Relaxed);
+            return Err(Undecoded::Through(Arc::clone(runs)));
+        }
         match &*held {
             PartSlot::Held { vector, used } => {
                 used.store(true, Atomic::Relaxed);
                 Ok(Arc::clone(vector))
             }
-            PartSlot::Unseen | PartSlot::Seen(_) => {
-                let before = match &*held {
-                    PartSlot::Seen(before) => *before,
-                    _ => 0,
-                };
+            PartSlot::Unseen | PartSlot::Seen(_) | PartSlot::Indexed { .. } => {
+                let before = held.seen().unwrap_or_default();
                 // A whole read holds the part at once. It has decoded all of it anyway, so what
                 // holding costs is the memory and not the time, and the run after it is the one
                 // that pays otherwise: on JOB the second run of each query cost 60 billion cycles
@@ -9850,16 +9919,16 @@ impl Reader {
                 if before >= rows
                     || (positions.is_none() && !self.pool.is_last_for(&self.table.name))
                 {
-                    return Err(true);
+                    return Err(Undecoded::Keep);
                 }
                 // With no statement after this one, a whole read only counts its rows, and a
                 // second read of the part in this statement is the one that holds it.
                 if positions.is_none() {
-                    *held = PartSlot::Seen(before.saturating_add(rows));
+                    held.pay(rows);
                 }
                 // A read at positions counts what it cost once it knows how the part is coded.
                 // See [`Self::pay`].
-                Err(false)
+                Err(Undecoded::Read)
             }
         }
     }
@@ -9876,27 +9945,66 @@ impl Reader {
         let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else {
             return false;
         };
-        let before = match &*held {
-            PartSlot::Held { .. } => return false,
-            PartSlot::Seen(before) => *before,
-            PartSlot::Unseen => 0,
-        };
+        let Some(before) = held.seen() else { return false };
         if before.saturating_add(paid) >= rows {
             return true;
         }
-        *held = PartSlot::Seen(before + paid);
+        held.pay(paid);
         false
     }
 
     /// Adds `rows` to what reads of part `at` of `column` have paid, unless it is held already.
     fn pay(&self, at: usize, column: usize, rows: usize) {
         let Some(Ok(mut held)) = self.cache.slot(column, at).map(Mutex::lock) else { return };
-        let before = match &*held {
-            PartSlot::Held { .. } => return,
-            PartSlot::Seen(before) => *before,
-            PartSlot::Unseen => 0,
+        held.pay(rows);
+    }
+
+    /// The runs of part `at` of `column` when it is compressed text, read the second time a read
+    /// at positions comes to the part and kept for the reads after.
+    ///
+    /// A read at positions of a compressed part parsed the symbol table and decoded every run's
+    /// length to find the few it wanted. A point read on a YCSB table reads eleven such parts and
+    /// that was nearly all of what it cost, 1.4 million instructions a read at 20,000 rows and
+    /// more the longer the part. With the runs kept a row is one run decompressed. The first read
+    /// does not keep them, since a scan that reads each part at positions once would pay for an
+    /// index nothing reads. What the runs hold is counted against the pool, which lets them go the
+    /// way it lets a held part go.
+    fn runs(
+        &self,
+        at: usize,
+        column: usize,
+        rows: usize,
+        bytes: &[u8],
+    ) -> Result<Option<Arc<string::Runs>>> {
+        let Some(body) = body_of(6, rows, bytes).filter(|body| string::pointed(body)) else {
+            return Ok(None);
         };
-        *held = PartSlot::Seen(before.saturating_add(rows));
+        let Some(Ok(mut slot)) = self.cache.slot(column, at).map(Mutex::lock) else {
+            return Ok(None);
+        };
+        let seen = match &*slot {
+            PartSlot::Indexed { runs, used, .. } => {
+                used.store(true, Atomic::Relaxed);
+                return Ok(Some(Arc::clone(runs)));
+            }
+            PartSlot::Unseen | PartSlot::Held { .. } => return Ok(None),
+            PartSlot::Seen(seen) => *seen,
+        };
+        let Some(runs) = string::Runs::of(body)? else { return Ok(None) };
+        let runs = Arc::new(runs);
+        let bytes = runs.footprint();
+        let used = Arc::new(AtomicBool::new(false));
+        *slot = PartSlot::Indexed { runs: Arc::clone(&runs), seen, used: Arc::clone(&used) };
+        drop(slot);
+        self.pool.admit(Held {
+            shelf: Arc::downgrade(&self.cache),
+            column,
+            stripe: 0,
+            part: Some(at),
+            bytes,
+            used,
+        });
+        Ok(Some(runs))
     }
 
     /// Holds `vector` as part `at` of `column` and counts it against the pool, and answers what the
@@ -15269,6 +15377,7 @@ fn decode_at(
     bytes: &[u8],
     global: Option<Arc<Vector>>,
     positions: &[u32],
+    runs: Option<&string::Runs>,
 ) -> Result<Vector> {
     if positions.last().is_some_and(|&last| last as usize >= rows) {
         return Err(invalid("a position is past the end of the part"));
@@ -15304,7 +15413,11 @@ fn decode_at(
         }
         _ => return Err(invalid("page validity tag differs")),
     };
-    let (payload, ends) = string::decode_flat_at(&bytes[cur.at..], positions)?.into_parts();
+    let flat = match runs {
+        Some(runs) => runs.decode_at(&bytes[cur.at..], positions)?,
+        None => string::decode_flat_at(&bytes[cur.at..], positions)?,
+    };
+    let (payload, ends) = flat.into_parts();
     let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
     push_values(&mut values, ty, &ends)?;
     Ok(Vector::flat(ty.clone(), Data::Varlen(values))?.with_validity(validity))
@@ -17521,15 +17634,15 @@ mod tests {
         page.extend_from_slice(&compressed);
         let whole = decode(&LogicalType::Varchar, rows, &page, None).expect("the whole page");
         let positions = [0_u32, 3, 8, 13, 200, 299];
-        let some =
-            decode_at(&LogicalType::Varchar, rows, &page, None, &positions).expect("some rows");
+        let some = decode_at(&LogicalType::Varchar, rows, &page, None, &positions, None)
+            .expect("some rows");
         assert_eq!(some.len(), positions.len());
         for (at, &row) in positions.iter().enumerate() {
             assert_eq!(some.value_at(at), whole.value_at(row as usize), "row {row}");
         }
         assert_eq!(some.value_at(1), Value::Null, "row 3 is null");
-        assert!(decode_at(&LogicalType::Varchar, rows, &page, None, &[300]).is_err());
-        assert!(decode_at(&LogicalType::Varchar, rows, &page, None, &[8, 3]).is_err());
+        assert!(decode_at(&LogicalType::Varchar, rows, &page, None, &[300], None).is_err());
+        assert!(decode_at(&LogicalType::Varchar, rows, &page, None, &[8, 3], None).is_err());
     }
 
     /// Every column of a part read at some rows is the part read whole and gathered, whatever the
@@ -21230,6 +21343,53 @@ mod tests {
         assert!(matches!(*slot(), PartSlot::Held { .. }), "to a read that holds the part");
         assert_eq!(a.rows_equal(0, 0, &literals).expect("answered"), None, "and stays out");
         drop((a, catalog));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// The second read at positions of a compressed text part keeps its runs, the reads after it
+    /// read through them and give the rows a decode of the part has, and a pool over its budget
+    /// lets the runs go and keeps what the reads paid.
+    #[test]
+    fn reads_of_a_few_rows_of_compressed_text_keep_its_runs() {
+        let path = path("text-runs");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        let words = ["carefully", "final", "deposits", "sleep", "furiously", "quickly", "among"];
+        let text: Vec<Value> = (0..5_000_usize)
+            .map(|row| {
+                let pick = |at: usize| words[(row * 7 + at * 3) % words.len()];
+                Value::Varchar(format!("{} {} {} number {row}", pick(0), pick(1), pick(2)))
+            })
+            .collect();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::Varchar, &text).expect("text")])
+                .expect("one column");
+        writer.append(&chunk).expect("one part");
+        writer.finish().expect("commit");
+
+        for budget in [usize::MAX, 1] {
+            let pool = PagePool::new(budget);
+            let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+            let a = catalog.table("items").expect("items");
+            let slot = || a.cache.slot(0, 0).expect("made").lock().expect("the slot");
+            for (read, rows) in
+                [[7_u32, 1_234], [0, 1_000], [31, 32], [1_234, 1_235]].iter().enumerate()
+            {
+                let chunk = a.read_rows(0, &[0], rows, false).expect("two rows");
+                for (at, &row) in rows.iter().enumerate() {
+                    assert_eq!(chunk.value_at(at, 0), text[row as usize]);
+                }
+                let paid = slot().seen();
+                assert_eq!(paid, Some(2 * (read + 1)), "each read pays for its rows");
+                let indexed = matches!(*slot(), PartSlot::Indexed { .. });
+                assert_eq!(indexed, read > 0 && budget > 1, "read {read}");
+            }
+            if budget > 1 {
+                assert!(pool.bytes() > 5_000, "the pool counts the runs");
+            }
+            drop((a, catalog));
+        }
         fs::remove_file(path).expect("remove scratch file");
     }
 
