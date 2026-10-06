@@ -535,7 +535,8 @@ mod tests {
     #[test]
     fn codes_added_in_lanes_are_the_codes_read_one_at_a_time() {
         for width in 1..=LANE_WIDTH_MAX {
-            let codes: Vec<u32> = (0..200_u32).map(|i| (i * 2_654_435_761) % (1 << width)).collect();
+            let codes: Vec<u32> =
+                (0..200_u32).map(|i| i.wrapping_mul(2_654_435_761) % (1 << width)).collect();
             let mut bytes = vec![0_u8; 200 * width / 8 + 1];
             for (i, &code) in codes.iter().enumerate() {
                 for b in 0..width {
