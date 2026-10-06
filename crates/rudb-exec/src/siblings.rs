@@ -663,26 +663,36 @@ impl Siblings {
             &mut local.block,
             &mut local.values,
         )?;
-        let holds = |sibling: i64, row: i64| match op {
-            CompareOp::Equal => sibling == row,
-            CompareOp::NotEqual => sibling != row,
-            CompareOp::Less => sibling < row,
-            CompareOp::LessOrEqual => sibling <= row,
-            CompareOp::Greater => sibling > row,
-            CompareOp::GreaterOrEqual => sibling >= row,
-            _ => false,
-        };
-        for &(row, start, len) in &local.spans {
-            let Some(side) = local.sides[row as usize] else { continue };
-            let found = (start..start + len).any(|place| {
-                let at = if local.rising { place } else { local.moved[place as usize] };
-                local.values[at as usize].is_some_and(|value| holds(value, side))
-            });
-            if found {
-                local.hit[row as usize] = true;
-            }
+        // The operator is settled once for the batch, so that the loop over the siblings has no
+        // match in it.
+        match op {
+            CompareOp::Equal => found(local, |sibling, row| sibling == row),
+            CompareOp::NotEqual => found(local, |sibling, row| sibling != row),
+            CompareOp::Less => found(local, |sibling, row| sibling < row),
+            CompareOp::LessOrEqual => found(local, |sibling, row| sibling <= row),
+            CompareOp::Greater => found(local, |sibling, row| sibling > row),
+            CompareOp::GreaterOrEqual => found(local, |sibling, row| sibling >= row),
+            _ => {}
         }
         Ok(())
+    }
+}
+
+/// Marks each row of the batch with a sibling whose value `holds` against the row's side.
+fn found(local: &mut Walking, holds: impl Fn(i64, i64) -> bool) {
+    for &(row, start, len) in &local.spans {
+        let Some(side) = local.sides[row as usize] else { continue };
+        let places = start as usize..(start + len) as usize;
+        let found = if local.rising {
+            local.values[places].iter().any(|value| value.is_some_and(|value| holds(value, side)))
+        } else {
+            local.moved[places]
+                .iter()
+                .any(|&at| local.values[at as usize].is_some_and(|value| holds(value, side)))
+        };
+        if found {
+            local.hit[row as usize] = true;
+        }
     }
 }
 
