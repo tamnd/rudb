@@ -2103,8 +2103,13 @@ impl Catalog {
     /// the rows, both under the same lock and so with the same answer.
     #[must_use]
     pub fn takes_rows(&self, name: &QualifiedName) -> bool {
-        self.table(name).is_ok_and(Table::takes_rows)
-            && !self.tables().any(|held| held.foreign().iter().any(|key| &key.table == name))
+        self.table(name).is_ok_and(Table::takes_rows) && !self.referenced(name)
+    }
+
+    /// Whether a foreign key of some table points into table `name`.
+    #[must_use]
+    pub fn referenced(&self, name: &QualifiedName) -> bool {
+        self.tables().any(|held| held.foreign().iter().any(|key| &key.table == name))
     }
 
     /// The native mirror of the Parquet file at `path`, where there is one made from the file as

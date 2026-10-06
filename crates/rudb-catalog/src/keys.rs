@@ -69,8 +69,16 @@ impl Key {
 /// minutes. [`Seen::settle`] puts the runs back into one once nothing else holds the first, and a
 /// run is folded into the one before it whenever it grows to half that one's size, so there are
 /// never more runs than the logarithm of the keys for a lookup to look through.
+///
+/// A key a delete took out goes from its run when nothing else holds the run, and otherwise into
+/// `gone`, so a delete of one row from a table of ten million copies none of the ten million
+/// either. A key in `gone` is always in some run, and is not held. [`Seen::settle`] takes the keys
+/// in `gone` out of the runs once nothing else holds them.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Seen(Vec<Arc<Held>>);
+pub(crate) struct Seen {
+    runs: Vec<Arc<Held>>,
+    gone: Held,
+}
 
 /// The keys themselves. A key of one integer column is kept as the integer, which is about a fifth
 /// of the memory of its encoding in a box of its own. Built over the 36 million rows of the JOB
@@ -146,6 +154,18 @@ impl Ints {
         self.bits[word] |= bit;
         self.set += 1;
         true
+    }
+
+    /// Takes a key out and says whether it was there.
+    fn remove(&mut self, key: i64) -> bool {
+        match self.slot(key) {
+            Some((word, bit)) if self.bits[word] & bit != 0 => {
+                self.bits[word] &= !bit;
+                self.set -= 1;
+                true
+            }
+            _ => self.rest.remove(&key),
+        }
     }
 
     /// Adds the keys in order, stopping at the first one that was already held, and says where it
@@ -311,8 +331,27 @@ impl Held {
         }
     }
 
+    /// Takes a key out and says whether it was there. A null key never is.
+    fn remove(&mut self, encoded: Encoded, scratch: &[u8]) -> bool {
+        match encoded {
+            Encoded::Null => false,
+            Encoded::Int(v) => self.ints.remove(v),
+            Encoded::Bytes => self.bytes.remove(scratch),
+        }
+    }
+
     fn len(&self) -> usize {
         self.ints.len() + self.bytes.len()
+    }
+
+    /// Takes out every key `other` holds.
+    fn forget(&mut self, other: &Self) {
+        for key in other.ints.keys() {
+            self.ints.remove(key);
+        }
+        for key in &other.bytes {
+            self.bytes.remove(key);
+        }
     }
 
     /// Takes in the keys of `run`, moving them when nothing else holds it.
@@ -396,24 +435,29 @@ fn bare(chunk: &Chunk, key: &Key, row: usize) -> Result<String> {
 
 impl Seen {
     fn contains(&self, encoded: Encoded, scratch: &[u8]) -> bool {
-        self.0.iter().any(|run| run.contains(encoded, scratch))
+        self.runs.iter().any(|run| run.contains(encoded, scratch))
+            && !self.gone.contains(encoded, scratch)
     }
 
     fn is_empty(&self) -> bool {
-        self.0.iter().all(|run| run.len() == 0)
+        self.runs.iter().all(|run| run.len() == 0)
     }
 
     /// Makes the last run one nothing else holds, starting a new one when it is shared.
     fn open(&mut self) {
-        if !self.0.last_mut().is_some_and(|run| Arc::get_mut(run).is_some()) {
-            self.0.push(Arc::default());
+        if !self.runs.last_mut().is_some_and(|run| Arc::get_mut(run).is_some()) {
+            self.runs.push(Arc::default());
         }
     }
 
     /// Adds a key to the last run, which [`Self::open`] has made this set's own, and says whether
-    /// it was new. A null key always is.
+    /// it was new. A null key always is. A key a delete took out of a shared run is that run's
+    /// again.
     fn insert(&mut self, encoded: Encoded, scratch: &[u8]) -> bool {
-        let (last, rest) = self.0.split_last_mut().expect("opened");
+        if self.gone.remove(encoded, scratch) {
+            return true;
+        }
+        let (last, rest) = self.runs.split_last_mut().expect("opened");
         !rest.iter().any(|run| run.contains(encoded, scratch))
             && Arc::get_mut(last).expect("opened").insert(encoded, scratch)
     }
@@ -422,7 +466,10 @@ impl Seen {
     /// stopping at the first one already held, here or in an earlier run, and says where it was.
     /// The keys before it are added and the rest are not.
     fn insert_all(&mut self, keys: &[i64]) -> Option<usize> {
-        let (last, rest) = self.0.split_last_mut().expect("opened");
+        if !self.gone.ints.is_empty() {
+            return keys.iter().position(|&key| !self.insert(Encoded::Int(key), &[]));
+        }
+        let (last, rest) = self.runs.split_last_mut().expect("opened");
         let held = rest.iter().filter_map(|run| run.ints.first_held(keys)).min();
         let upto = held.unwrap_or(keys.len());
         Arc::get_mut(last).expect("opened").ints.insert_all(&keys[..upto]).or(held)
@@ -430,17 +477,46 @@ impl Seen {
 
     /// Where the first of a block of integer keys that any run holds is.
     fn first_held(&self, keys: &[i64]) -> Option<usize> {
-        self.0.iter().filter_map(|run| run.ints.first_held(keys)).min()
+        if !self.gone.ints.is_empty() {
+            return keys.iter().position(|&key| self.contains(Encoded::Int(key), &[]));
+        }
+        self.runs.iter().filter_map(|run| run.ints.first_held(keys)).min()
+    }
+
+    /// Takes a key out, from the run that holds it when nothing else holds that run, and into
+    /// `gone` when something does.
+    fn remove(&mut self, encoded: Encoded, scratch: &[u8]) {
+        let Some(run) = self.runs.iter_mut().find(|run| run.contains(encoded, scratch)) else {
+            return;
+        };
+        match Arc::get_mut(run) {
+            Some(run) => {
+                run.remove(encoded, scratch);
+            }
+            None => {
+                self.gone.insert(encoded, scratch);
+            }
+        }
+    }
+
+    /// Takes out the keys of the rows of `chunk`, rows a delete took out of the table.
+    pub(crate) fn forget(&mut self, chunk: &Chunk, key: &Key) -> Result<()> {
+        let mut scratch = Vec::new();
+        for row in 0..chunk.len() {
+            let encoded = encode(chunk, key, row, &mut scratch)?;
+            self.remove(encoded, &scratch);
+        }
+        Ok(())
     }
 
     /// Folds the last run into the one before it while it holds at least half as many keys, which
     /// keeps each run at least twice the size of the one after it.
     fn fold(&mut self) {
-        while let [.., before, last] = self.0.as_slice()
+        while let [.., before, last] = self.runs.as_slice()
             && before.len() <= 2 * last.len()
         {
-            let last = self.0.pop().expect("two runs");
-            Arc::make_mut(self.0.last_mut().expect("two runs")).take(last);
+            let last = self.runs.pop().expect("two runs");
+            Arc::make_mut(self.runs.last_mut().expect("two runs")).take(last);
         }
     }
 
@@ -448,16 +524,19 @@ impl Seen {
     /// the catalog that shared it is gone. A transaction's keys then go back into the table's one
     /// set at its commit, and the next transaction shares one set rather than a run for each one
     /// before it.
+    ///
+    /// The keys a delete took out of a shared run come out of it then too.
     pub(crate) fn settle(&mut self) {
-        let Some((first, rest)) = self.0.split_first_mut() else { return };
-        if rest.is_empty() || Arc::get_mut(first).is_none() {
+        let Some((first, rest)) = self.runs.split_first_mut() else { return };
+        if (rest.is_empty() && self.gone.len() == 0) || Arc::get_mut(first).is_none() {
             return;
         }
-        let rest = self.0.split_off(1);
-        let first = Arc::get_mut(&mut self.0[0]).expect("asked just above");
+        let rest = self.runs.split_off(1);
+        let first = Arc::get_mut(&mut self.runs[0]).expect("asked just above");
         for run in rest {
             first.take(run);
         }
+        first.forget(&std::mem::take(&mut self.gone));
     }
 
     /// The keys of these rows, refused if one repeats. `fresh` says the rows are all of the table,
@@ -608,10 +687,24 @@ impl Seen {
             *self = added;
             return;
         }
-        for run in added.0 {
-            match self.0.last_mut().and_then(Arc::get_mut) {
+        for mut run in added.runs {
+            // A key a delete took out of a shared run is held there again rather than twice.
+            if self.gone.len() > 0 {
+                let run = Arc::make_mut(&mut run);
+                let back = self.gone.ints.keys().filter(|&key| run.ints.remove(key));
+                let back = back.collect::<Vec<_>>();
+                for key in back {
+                    self.gone.ints.remove(key);
+                }
+                let back = self.gone.bytes.iter().filter(|&key| run.bytes.remove(key));
+                let back = back.cloned().collect::<Vec<_>>();
+                for key in back {
+                    self.gone.bytes.remove(&key);
+                }
+            }
+            match self.runs.last_mut().and_then(Arc::get_mut) {
                 Some(last) => last.take(run),
-                None => self.0.push(run),
+                None => self.runs.push(run),
             }
             self.fold();
         }
@@ -794,26 +887,65 @@ mod tests {
             let field = Field::new("k", ty);
             let mut table = Seen::default();
             assert!(add(&mut table, &rows(0, 10_000), &field));
-            assert_eq!(table.0.len(), 1);
+            assert_eq!(table.runs.len(), 1);
             for round in 0..50 {
                 let base = table.clone();
                 let mut mine = table.clone();
                 let from = 10_000 + round * 100;
                 assert!(add(&mut mine, &rows(from, from + 50), &field));
                 assert!(add(&mut mine, &rows(from + 50, from + 100), &field));
-                assert!(std::sync::Arc::ptr_eq(&mine.0[0], &table.0[0]), "the big run is shared");
+                assert!(
+                    std::sync::Arc::ptr_eq(&mine.runs[0], &table.runs[0]),
+                    "the big run is shared"
+                );
                 assert!(!add(&mut mine, &rows(5, 6), &field), "a key the shared run holds");
                 assert!(!add(&mut mine, &rows(from + 70, from + 71), &field), "one of its own");
                 assert!(add(&mut table, &rows(from, from + 1), &field), "not the original's");
                 // The commit: the copy is the table from now on, and the snapshot goes.
                 table = mine;
-                assert!(table.0.len() > 1);
+                assert!(table.runs.len() > 1);
                 drop(base);
                 table.settle();
-                assert_eq!(table.0.len(), 1);
+                assert_eq!(table.runs.len(), 1);
             }
-            assert_eq!(table.0[0].len(), 15_000);
+            assert_eq!(table.runs[0].len(), 15_000);
             assert!(!add(&mut table, &rows(14_999, 15_000), &field));
+        }
+    }
+
+    /// A key a delete took out is not held, whether its run was shared or not, can be added again
+    /// once, and the original keeps it. Settling takes it out of the run for good.
+    #[test]
+    fn a_key_taken_out_can_be_added_again() {
+        let key = Key { columns: vec![0], primary: true };
+        for (ty, rows) in [
+            (LogicalType::BigInt, ints as fn(i64, i64) -> Vec<Chunk>),
+            (LogicalType::Varchar, texts),
+        ] {
+            let field = Field::new("k", ty);
+            let mut table = Seen::default();
+            assert!(add(&mut table, &rows(0, 10_000), &field));
+            let base = table.clone();
+            let mut mine = table.clone();
+            assert!(add(&mut mine, &rows(10_000, 10_100), &field));
+            // Out of the shared run, and out of the copy's own.
+            for chunk in rows(5, 10).iter().chain(&rows(10_050, 10_060)) {
+                mine.forget(chunk, &key).expect("keys");
+            }
+            assert_eq!(mine.gone.len(), 5);
+            assert!(add(&mut mine, &rows(5, 6), &field), "taken out of the shared run");
+            assert!(!add(&mut mine, &rows(5, 6), &field), "and now held again");
+            assert!(add(&mut mine, &rows(10_055, 10_056), &field), "taken out of its own");
+            assert!(!add(&mut mine, &rows(4, 5), &field) && !add(&mut mine, &rows(10, 11), &field));
+            assert!(add(&mut mine, &rows(6, 8), &field));
+            assert!(!add(&mut table, &rows(6, 7), &field), "the original still holds it");
+            assert_eq!(mine.gone.len(), 2);
+            drop((base, table));
+            mine.settle();
+            assert!(mine.gone.len() == 0 && mine.runs.len() == 1);
+            assert_eq!(mine.runs[0].len(), 10_100 - 2 - 9);
+            assert!(add(&mut mine, &rows(8, 10), &field));
+            assert!(!add(&mut mine, &rows(7, 8), &field));
         }
     }
 
@@ -831,18 +963,18 @@ mod tests {
             assert!(add(&mut table, &ints(at, at + 10), &field));
             at += 10;
             drop(snapshot);
-            assert!(table.0.len() <= 20, "{} runs", table.0.len());
-            for pair in table.0.windows(2) {
+            assert!(table.runs.len() <= 20, "{} runs", table.runs.len());
+            for pair in table.runs.windows(2) {
                 assert!(pair[0].len() > 2 * pair[1].len());
             }
         }
-        assert!(std::sync::Arc::ptr_eq(&held.0[0], &table.0[0]));
-        assert_eq!(table.0.iter().map(|run| run.len()).sum::<usize>(), 120_000);
+        assert!(std::sync::Arc::ptr_eq(&held.runs[0], &table.runs[0]));
+        assert_eq!(table.runs.iter().map(|run| run.len()).sum::<usize>(), 120_000);
         assert!(!add(&mut table, &ints(119_999, 120_000), &field));
         assert!(!add(&mut table, &ints(0, 1), &field));
         drop(held);
         table.settle();
-        assert_eq!(table.0.len(), 1);
-        assert_eq!(table.0[0].len(), 120_000);
+        assert_eq!(table.runs.len(), 1);
+        assert_eq!(table.runs[0].len(), 120_000);
     }
 }

@@ -7004,9 +7004,13 @@ impl Shared {
                         // the scan read every row in order.
                         let width = catalog.table(&insert.name)?.columns().len();
                         let rows = catalog.table(&insert.name)?.rows().len();
-                        let taken = delete
-                            && catalog.takes_rows(&insert.name)
-                            && chunks.iter().map(Chunk::len).sum::<usize>() == rows;
+                        let whole = chunks.iter().map(Chunk::len).sum::<usize>() == rows;
+                        let taken = delete && catalog.takes_rows(&insert.name) && whole;
+                        // A delete from any other table nothing points into takes its rows out by
+                        // number too, see `Table::remove_rows`, rather than build the table again
+                        // from the rows it keeps.
+                        let removed =
+                            delete && !taken && whole && !catalog.referenced(&insert.name);
                         // The binder reads only the condition when it expects the rows taken, and
                         // a source without the table's columns has no rows to keep.
                         if !taken && chunks.first().is_some_and(|chunk| chunk.width() <= width) {
@@ -7015,7 +7019,7 @@ impl Shared {
                             ));
                         }
                         let (kept, changed, count, flagged, scanned) =
-                            split(chunks, delete, needed, !taken)?;
+                            split(chunks, delete, needed, !taken && !removed)?;
                         if let Some(checks) = checks.as_mut() {
                             self.check(sql, &mut catalog, place, &insert.name, checks, &changed)?;
                         }
@@ -7061,6 +7065,8 @@ impl Shared {
                         let table = catalog.table_mut(name)?;
                         if taken {
                             table.take_rows(&flagged)?;
+                        } else if removed {
+                            table.remove_rows(&flagged, workers)?;
                         } else if delete {
                             table.replace_all(kept, workers)?;
                         } else {
