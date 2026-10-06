@@ -61,6 +61,16 @@ fn tokens(sql: &str) -> Option<Vec<Token>> {
 
 /// The tokens of the statement and the byte offset where each one starts.
 pub(super) fn spanned(sql: &str) -> Option<(Vec<Token>, Vec<usize>)> {
+    scan(sql, false)
+}
+
+/// The tokens of a statement that this reader only looks at, such as a query: other punctuation
+/// is a token of its own, and a bit string or a `U&` string is not an error.
+pub(super) fn loose(sql: &str) -> Option<Vec<Token>> {
+    scan(sql, true).map(|(tokens, _)| tokens)
+}
+
+fn scan(sql: &str, loose: bool) -> Option<(Vec<Token>, Vec<usize>)> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut starts = Vec::new();
@@ -161,7 +171,7 @@ pub(super) fn spanned(sql: &str) -> Option<(Vec<Token>, Vec<usize>)> {
                     }
                 }
             }
-            if bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') {
+            if !loose && bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') {
                 return None;
             }
             tokens.push(Token::Number { text: sql[start..i].to_owned(), integer });
@@ -175,12 +185,12 @@ pub(super) fn spanned(sql: &str) -> Option<(Vec<Token>, Vec<usize>)> {
             {
                 i += 1;
             }
-            if bytes.get(i) == Some(&b'\'') || bytes.get(i) == Some(&b'&') {
+            if !loose && (bytes.get(i) == Some(&b'\'') || bytes.get(i) == Some(&b'&')) {
                 // `B'...'`, `X'...'` and `U&'...'`.
                 return None;
             }
             tokens.push(Token::Word { text: sql[start..i].to_ascii_lowercase(), quoted: false });
-        } else if matches!(c, b'=' | b',' | b'.' | b'(' | b')' | b'+' | b'-' | b';') {
+        } else if loose || matches!(c, b'=' | b',' | b'.' | b'(' | b')' | b'+' | b'-' | b';') {
             tokens.push(Token::Punct(char::from(c)));
             i += 1;
         } else {
