@@ -3900,10 +3900,14 @@ impl Vector {
                 Data::Int64(Buffer::from_vec(each(&packed, runs, rows, value)))
             }
             rudb_common::PhysicalType::Int32 => {
-                Data::Int32(Buffer::from_vec(each(&packed, runs, rows, move |code| value(code) as i32)))
+                Data::Int32(Buffer::from_vec(each(&packed, runs, rows, move |code| {
+                    value(code) as i32
+                })))
             }
             rudb_common::PhysicalType::Int16 => {
-                Data::Int16(Buffer::from_vec(each(&packed, runs, rows, move |code| value(code) as i16)))
+                Data::Int16(Buffer::from_vec(each(&packed, runs, rows, move |code| {
+                    value(code) as i16
+                })))
             }
             _ => return None,
         };
