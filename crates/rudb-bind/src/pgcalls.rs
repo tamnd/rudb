@@ -11,7 +11,7 @@
 
 use rudb_common::{LogicalType, Result, Value};
 use rudb_parse::{Ast, ast, deparse};
-use rudb_plan::ExprRef;
+use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
 
 use crate::binder::Binder;
 use crate::scope::Scope;
@@ -88,6 +88,10 @@ impl Binder<'_> {
                      1)) ELSE ((floor((((({low}) - {value}) * ({count})) / (({low}) - ({high})))) \
                      + 1)) END) END AS INTEGER)"
                 )
+            }
+            // The fill is a space when the call does not give one.
+            [string, length] if named("lpad") || named("rpad") => {
+                format!("{written}(({string}), ({length}), ' ')")
             }
             [string, pattern] if named("regexp_count") => {
                 format!("CAST(len(regexp_extract_all(({string}), ({pattern}))) AS INTEGER)")
@@ -166,18 +170,29 @@ impl Binder<'_> {
         call
     }
 
-    /// The call `written(types)` resolved to `call`, cast to an `int4` when PostgreSQL has an
-    /// overload of `written` over `int4` that it chooses for these types.
+    /// The call `written(types)` resolved to `call`, cast to the type of the overload that
+    /// PostgreSQL chooses for these types.
     ///
     /// `gcd` and `lcm` have overloads over `int4`, `int8` and `numeric` there and only over a
     /// BIGINT and a HUGEINT here, so the types have to be the ones that were given and not the
-    /// ones that the call cast them to.
+    /// ones that the call cast them to. `sign` is a TINYINT here and has overloads over `float8`
+    /// and `numeric` there, and an integer goes to `float8`.
     pub(crate) fn postgres_narrowed(
         &mut self,
         written: &str,
         types: &[LogicalType],
         call: ExprRef,
     ) -> ExprRef {
+        if rudb_catalog::same_name(written, "sign") && types.len() == 1 {
+            let ty = match types[0] {
+                LogicalType::Decimal { .. } | LogicalType::Numeric => LogicalType::Numeric,
+                _ => LogicalType::Double,
+            };
+            if *self.plan().expr_type(call) != ty {
+                return self.cast_to(call, &ty);
+            }
+            return call;
+        }
         let named = ["gcd", "lcm"].iter().any(|name| rudb_catalog::same_name(written, name));
         match named && !types.is_empty() && types.iter().all(narrow) {
             true if *self.plan().expr_type(call) == LogicalType::BigInt => {
@@ -185,5 +200,52 @@ impl Binder<'_> {
             }
             _ => call,
         }
+    }
+
+    /// Whether `function(arguments)` is the series over `int4` of PostgreSQL, which gives an
+    /// `int4` column where the series here gives a BIGINT. A parameter of no type is typed as an
+    /// `int4` here, as PostgreSQL types it.
+    pub(crate) fn postgres_series(&mut self, function: &str, arguments: &mut [ExprRef]) -> bool {
+        if self.session.postgres().is_none()
+            || !rudb_catalog::same_name(function, "generate_series")
+            || arguments.is_empty()
+        {
+            return false;
+        }
+        let integers = arguments.iter().all(|&argument| {
+            narrow(self.plan().expr_type(argument)) || self.is_placeholder(argument)
+        });
+        if integers {
+            for argument in arguments.iter_mut() {
+                if self.is_placeholder(*argument) {
+                    *argument = self.cast_to(*argument, &LogicalType::Integer);
+                }
+            }
+        }
+        integers
+    }
+
+    /// A projection over the series `node` that casts its BIGINT column to an `int4`.
+    pub(crate) fn integer_series(&mut self, node: NodeRef, mut scope: Scope) -> (NodeRef, Scope) {
+        let index = self.fresh_index();
+        let mut exprs = Vec::with_capacity(scope.columns.len());
+        let mut names = Vec::with_capacity(scope.columns.len());
+        for column in &scope.columns {
+            let read = self.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
+            exprs.push(match column.ty {
+                LogicalType::BigInt => self.cast_to(read, &LogicalType::Integer),
+                _ => read,
+            });
+            names.push(self.plan_mut().intern(&column.name));
+        }
+        for (at, column) in scope.columns.iter_mut().enumerate() {
+            column.binding = ColumnBinding::new(index, at as u32);
+            if column.ty == LogicalType::BigInt {
+                column.ty = LogicalType::Integer;
+            }
+        }
+        let exprs = self.plan_mut().add_expr_list(&exprs);
+        let names = self.plan_mut().add_name_list(&names);
+        (self.add_node(Node::Project { input: node, index, exprs, names }), scope)
     }
 }

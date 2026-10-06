@@ -938,6 +938,11 @@ fn the_functions_of_postgres_have_its_result_types() {
         ),
         ("select gcd(4, 6), gcd(4::int8, 6)", "2,2", vec![23, 20]),
         ("select date_part('second', timestamp '2024-05-01 10:00:01.5')", "1.5", vec![701]),
+        (
+            "select sign(-2.5), sign(3), sum(g) from generate_series(1, 4) g",
+            "-1,1,10",
+            vec![1700, 701, 20],
+        ),
     ];
     for (sql, expected, oids) in cases {
         let messages = client.query(sql);
@@ -945,6 +950,43 @@ fn the_functions_of_postgres_have_its_result_types() {
         assert_eq!(shape, oids, "{sql}");
         assert_eq!(text(data_row(&messages[1])), expected, "{sql}");
     }
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_parameter_in_a_call_gets_the_type_of_postgres() {
+    let dirs = Dirs::new("unknowns");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // Each case has the parameter types and the column types of PostgreSQL.
+    let cases: [(&str, &[u32], &[u32]); 12] = [
+        ("select abs($1)", &[701], &[701]),
+        ("select substr($1, $2)", &[25, 23], &[25]),
+        ("select repeat($1, $2)", &[25, 23], &[25]),
+        ("select lpad($1, 3)", &[25], &[25]),
+        ("select coalesce($1, $2)", &[25, 25], &[25]),
+        ("select nullif($1, $2)", &[25, 25], &[25]),
+        ("select max($1)", &[25], &[25]),
+        ("select sign($1)", &[701], &[701]),
+        ("select mod($1, 2)", &[23], &[23]),
+        ("select $1 + $2", &[23, 23], &[23]),
+        ("select * from generate_series(1, $1)", &[23], &[23]),
+        ("select generate_series(1, $1)", &[23], &[23]),
+    ];
+    for (sql, parameters, columns) in cases {
+        client.parse("", sql, &[]);
+        client.describe(Target::Statement, "");
+        let messages = client.sync();
+        assert_eq!(tags(&messages), "1tTZ", "{sql}");
+        assert_eq!(parameter_types(&messages[1]), parameters, "{sql}");
+        let shape: Vec<u32> = row_shape(&messages[2]).into_iter().map(|(_, oid, _)| oid).collect();
+        assert_eq!(shape, columns, "{sql}");
+    }
+    // A parameter in a query that has no values for it is an undefined parameter.
+    let messages = client.query("select * from generate_series(1, $1)");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("42P02"));
+    assert_eq!(messages[0].field(b'M').as_deref(), Some("there is no parameter $1"));
     server.stop().unwrap();
 }
 

@@ -3099,6 +3099,7 @@ impl<'a> Binder<'a> {
 
         // The types are what resolve the call, not the count, because `read_parquet(3)` is a
         // different answer from `read_parquet('3')` and only the types tell them apart.
+        let integers = !pragma && self.postgres_series(function_name, &mut bound);
         let given: Vec<LogicalType> =
             bound.iter().map(|&expr| self.plan.expr_type(expr).clone()).collect();
         let resolved = if pragma {
@@ -3252,7 +3253,11 @@ impl<'a> Binder<'a> {
             &label,
             &names,
         )?;
-        Ok((self.lateral_over_subqueries(node, waiting), scope))
+        let node = self.lateral_over_subqueries(node, waiting);
+        if integers {
+            return Ok(self.integer_series(node, scope));
+        }
+        Ok((node, scope))
     }
 
     /// A series or an unnest whose arguments read a query, `range((SELECT 3))`, as the same call
@@ -4724,6 +4729,14 @@ impl<'a> Binder<'a> {
             ));
         }
 
+        // `min` and `max` of a parameter of no type read `text` in PostgreSQL.
+        if self.session.postgres().is_some()
+            && matches!(name.to_ascii_lowercase().as_str(), "min" | "max")
+            && let [only] = bound[..]
+            && self.is_placeholder(only)
+        {
+            bound[0] = self.cast_to(only, &LogicalType::Varchar);
+        }
         let types: Vec<LogicalType> =
             bound.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
         let resolved = resolve(name, &types)?;

@@ -578,6 +578,13 @@ impl Binder<'_> {
             });
         }
         let Some(value) = self.parameters.get(name) else {
+            // A numbered parameter in a query that has no values for it is an undefined parameter
+            // in PostgreSQL.
+            if self.session.postgres().is_some() {
+                let number = name.trim_start_matches('$');
+                return Err(Error::binder(format!("there is no parameter ${number}"))
+                    .state(SqlState::UNDEFINED_PARAMETER));
+            }
             return Err(Error::invalid_input(
                 "Prepared statement parameters cannot be used directly\nTo use prepared statement \
                  parameters, use PREPARE to prepare a statement, followed by EXECUTE",
@@ -1489,6 +1496,20 @@ impl Binder<'_> {
                 })
                 .collect();
             self.adopt_literals(function, &kinds, &mut bound)?;
+            // Parameters of no type and nothing else are `text` in PostgreSQL.
+            if postgres && bound.iter().all(|&arg| self.is_placeholder(arg)) {
+                for arg in &mut bound {
+                    *arg = self.cast_to(*arg, &LogicalType::Varchar);
+                }
+            }
+        }
+        if postgres
+            && rudb_catalog::same_name(&written, "nullif")
+            && bound.iter().all(|&arg| self.is_placeholder(arg))
+        {
+            for arg in &mut bound {
+                *arg = self.cast_to(*arg, &LogicalType::Varchar);
+            }
         }
         if rudb_catalog::same_name(&written, "coalesce") && bound.len() > 1 {
             let call = self.call(&written, bound)?;
@@ -2097,6 +2118,63 @@ impl Binder<'_> {
         }
     }
 
+    /// Types each parameter of no type that a call reads as a number, the way PostgreSQL types an
+    /// `unknown` argument of a function.
+    ///
+    /// PostgreSQL prefers `float8` in the numeric category, so `abs($1)` and `round($1)` take a
+    /// `float8`. That holds only when the overload over a DOUBLE takes each other argument as it
+    /// is, since an argument of a known type that matches exactly decides first, so `mod($1, 2)`
+    /// stays an `int4`. Where the overload here takes a BIGINT, PostgreSQL has one over an `int4`,
+    /// so `substr($1, $2)` takes an `int4`, unless another argument is a BIGINT already.
+    fn unknown_numbers(
+        &mut self,
+        name: &str,
+        args: &mut [ExprRef],
+        resolved: &mut rudb_functions::Resolved,
+    ) -> Result<()> {
+        for at in 0..args.len() {
+            let types: Vec<LogicalType> =
+                args.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+            if types[at] != LogicalType::Null || !self.is_placeholder(args[at]) {
+                continue;
+            }
+            let Some(wanted) = resolved.arguments.get(at).cloned() else { continue };
+            if !wanted.is_numeric() {
+                continue;
+            }
+            let mut doubles = types.clone();
+            doubles[at] = LogicalType::Double;
+            let known = |other: &rudb_functions::Resolved| {
+                types.iter().zip(&other.arguments).enumerate().all(|(position, (given, taken))| {
+                    position == at || *given == LogicalType::Null || given == taken
+                })
+            };
+            // A parameter of no type at another position keeps the type that the call chose
+            // for it, so `repeat($1, $2)` still repeats text.
+            for (position, ty) in doubles.iter_mut().enumerate() {
+                if position != at
+                    && *ty == LogicalType::Null
+                    && let Some(taken) = resolved.arguments.get(position)
+                {
+                    *ty = taken.clone();
+                }
+            }
+            if let Ok(double) = resolve(name, &doubles)
+                && double.arguments.get(at) == Some(&LogicalType::Double)
+                && known(&double)
+            {
+                args[at] = self.cast_to(args[at], &LogicalType::Double);
+                *resolved = double;
+            } else if wanted == LogicalType::BigInt && !types.contains(&LogicalType::BigInt) {
+                args[at] = self.cast_to(args[at], &LogicalType::Integer);
+                let mut integers = doubles;
+                integers[at] = LogicalType::Integer;
+                *resolved = resolve(name, &integers)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn call(&mut self, name: &str, args: Vec<ExprRef>) -> Result<ExprRef> {
         self.call_recorded_as(name, None, args)
     }
@@ -2160,6 +2238,11 @@ impl Binder<'_> {
                 && let Ok(text) = resolve(resolved_name, &texts)
             {
                 resolved = text;
+            }
+            // An operator is left as it was. PostgreSQL refuses most operators over two
+            // parameters of no type, and the engine gives them an `int4`.
+            if resolved_name.starts_with(|first: char| first.is_ascii_alphabetic()) {
+                self.unknown_numbers(resolved_name, &mut args, &mut resolved)?;
             }
         }
         // The sort order and the null order of a list sort are read once for the whole call on the
