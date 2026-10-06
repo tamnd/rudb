@@ -8080,7 +8080,7 @@ pub(crate) fn rows_before_error() -> Option<QueryResult> {
 }
 
 /// Keeps the rows that a failed query queued before its error, because PostgreSQL sends the rows
-/// it made before the error. Keeps nothing when there are no rows.
+/// it made before the error, with the columns before them even when there are no rows.
 fn keep_before_error(
     query: &rudb_exec::Query<'_>,
     names: Vec<String>,
@@ -8103,9 +8103,7 @@ fn keep_before_error(
         }
         chunks.push(chunk);
     }
-    if chunks.is_empty() {
-        return;
-    }
+    // With no rows the result still has its columns, which PostgreSQL describes before the error.
     let result = QueryResult::new(names, types, chunks, held).in_session(session.clone());
     BEFORE_ERROR.with(|kept| *kept.borrow_mut() = Some(result));
 }

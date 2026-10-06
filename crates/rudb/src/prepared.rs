@@ -21,6 +21,9 @@ pub struct Description {
     pub fields: Option<Vec<Field>>,
     /// The table column that each of `fields` reads with no change, where there is one.
     pub origins: Vec<Option<Origin>>,
+    /// The error that planning a query of a PostgreSQL session with no parameters raises, from
+    /// the folding of its constant parts. PostgreSQL sends it at `Bind`.
+    pub planning: Option<Error>,
 }
 
 /// A prepared statement.
@@ -872,8 +875,12 @@ impl Prepared {
                     .map(|(_, ty)| ty.clone())
             })
             .collect();
-        let description =
-            Description { parameters, fields: described.fields, origins: described.origins };
+        let description = Description {
+            parameters,
+            fields: described.fields,
+            origins: described.origins,
+            planning: described.planning,
+        };
         let declared = declared.to_vec();
         *kept = Some(Described { stamp, declared, description: description.clone() });
         Ok(description)

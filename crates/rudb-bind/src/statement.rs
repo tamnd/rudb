@@ -567,6 +567,17 @@ pub(crate) fn bind_one(
             }
             let mut plan = finish(binder, root)?;
             plan.set_origins(scope.origins());
+            if session.postgres().is_some() {
+                match parameters.placeholders() {
+                    // A parameter is a null while a statement is described, and its value can
+                    // change what folds.
+                    Some(placeholders) if placeholders.none() => {
+                        placeholders.plan_error(crate::fold::planned(&plan).err());
+                    }
+                    Some(_) => {}
+                    None => crate::fold::planned(&plan)?,
+                }
+            }
             Ok(Bound::Query(plan))
         }
         ast::Statement::CreateTable(index) => {

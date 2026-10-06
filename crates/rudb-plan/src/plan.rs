@@ -1613,12 +1613,14 @@ impl Plan {
         Ok(())
     }
 
-    /// Every expression a node holds directly, paired with whether an aggregate is allowed there.
+    /// Every expression a node holds directly, paired with whether an aggregate is allowed there
+    /// and whether a window function is.
     ///
     /// One list rather than a rule restated in each arm of `validate_node`, because the rule is
     /// about the whole node set and a rule stated twelve times is a rule that is wrong in one of
     /// them. Runs after the per-operator checks, so every run named here is known to be in range.
-    fn top_level_exprs(&self, node: &Node) -> Vec<(ExprRef, bool, bool)> {
+    #[must_use]
+    pub fn top_level_exprs(&self, node: &Node) -> Vec<(ExprRef, bool, bool)> {
         let plain = |list: &[ExprRef]| -> Vec<(ExprRef, bool, bool)> {
             list.iter().map(|&expr| (expr, false, false)).collect()
         };
