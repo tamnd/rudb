@@ -1035,6 +1035,37 @@ fn a_numeric_parameter_keeps_its_type_and_all_its_digits() {
 }
 
 #[test]
+fn a_mean_and_a_sum_of_a_numeric_are_numerics_with_their_digits() {
+    let dirs = Dirs::new("numeric_mean");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create table t (g int, i int, b bigint, d numeric(10,2), m numeric)");
+    client.query(
+        "insert into t values (1, 1, 9223372036854775807, 1.25, 1e30), \
+         (1, 2, 9223372036854775807, 2.50, 3.14159), (2, null, null, null, null)",
+    );
+    // Each case has the text of PostgreSQL 19 and the column type, which is `numeric` for all.
+    let cases = [
+        ("select avg(i) from t", "1.5000000000000000"),
+        ("select avg(b) from t", "9223372036854775807"),
+        ("select avg(d) from t", "1.8750000000000000"),
+        ("select sum(m) from t", "1000000000000000000000000000003.14159"),
+        ("select avg(m) from t", "500000000000000000000000000001.57080"),
+        ("select avg(i) from t where g = 2", ""),
+        ("select avg(i) over (partition by g) from t order by g, i limit 1", "1.5000000000000000"),
+    ];
+    for (sql, text) in cases {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "TDCZ", "{sql}");
+        assert_eq!(row_shape(&messages[0])[0].1, 1700, "{sql}");
+        let wanted = (!text.is_empty()).then(|| text.as_bytes().to_vec());
+        assert_eq!(data_row(&messages[1]), [wanted], "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_rows_before_an_error_go_before_the_error() {
     let dirs = Dirs::new("partial");
     let server = Server::start(dirs.config()).unwrap();

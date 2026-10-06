@@ -4790,6 +4790,7 @@ impl<'a> Binder<'a> {
             keys.into_iter().map(|key| self.by_position(key)).collect()
         };
         let (mut name, order) = self.ordered_aggregate(called, sorted, &keys, &mut cast, exporting);
+        let unordered = order.is_empty();
         // An enum orders by where its labels were declared and not by how they are spelled, and the
         // `arg_min` family answers its first argument, so the second can be weighed by its code.
         if called.starts_with("arg_") && given > 1 && !exporting {
@@ -4818,25 +4819,29 @@ impl<'a> Binder<'a> {
             ty = LogicalType::aggregate_state(resolved.name, columns, ty, layout, constants, order);
             name.push_str(rudb_kernels::EXPORTED);
         }
-        let args = self.plan.add_expr_list(&cast);
-        let name = self.plan.intern(&name);
-        let call = self.plan.add_expr(Expr::Aggregate { name, args, distinct, filter }, ty.clone());
-
-        // Two identical aggregates are one column of the aggregate's output. `SELECT sum(x),
-        // sum(x) / count(*)` computes one sum, not two.
-        let existing = self.aggregation.as_ref().map(|held| held.aggregates.clone());
-        let existing = existing.unwrap_or_default();
-        let at = match existing.iter().position(|&held| self.same_expr(held, call)) {
-            Some(at) => at,
-            None => {
-                let aggregation = self.aggregation.as_mut().expect("checked above");
-                aggregation.aggregates.push(call);
-                aggregation.aggregates.len() - 1
-            }
-        };
-        let aggregation = self.aggregation.as_ref().expect("checked above");
-        let (index, groups) = (aggregation.index, aggregation.groups.len());
-        let column = self.column(index, groups + at, ty);
+        // PostgreSQL takes the mean of an integer or a decimal as a `numeric`: `int8_avg` and
+        // `numeric_avg` divide the exact sum by the count with `numeric_div`. The sum and the count
+        // keep the fast paths that the executor has for them, where a mean as a `numeric` would not.
+        let exact = |ty: &LogicalType| ty.is_integer() || matches!(ty, LogicalType::Decimal { .. });
+        if self.session.postgres().is_some()
+            && !exporting
+            && resolved.name == "avg"
+            && unordered
+            && let [argument] = bound[..]
+            && exact(self.plan.expr_type(argument))
+        {
+            let summed = resolve("sum", &types)?;
+            let argument = self.checked_cast_to(argument, &summed.arguments[0], false)?;
+            let total = self.aggregate_call("sum", &[argument], distinct, filter, summed.returns);
+            let count =
+                self.aggregate_call("count", &[argument], distinct, filter, LogicalType::BigInt);
+            let total = self.cast_to(total, &LogicalType::Numeric);
+            // A group with no values has a null sum and a count of zero, and its mean is null.
+            let count = self.cast_to(count, &LogicalType::Numeric);
+            let count = self.zero_to_null(count);
+            return self.call("/", vec![total, count]);
+        }
+        let column = self.aggregate_call(&name, &cast, distinct, filter, ty);
         // PostgreSQL sums an `int2` or an `int4` into an `int8` and a `float4` into a `float4`,
         // where the pin sums them into a HUGEINT and a DOUBLE.
         if self.session.postgres().is_some() && !exporting && resolved.name == "sum" {
@@ -4849,6 +4854,35 @@ impl<'a> Binder<'a> {
             }
         }
         Ok(column)
+    }
+
+    /// The column of the aggregate output that holds the call `name` over `args`. Two identical
+    /// aggregates are one column of the aggregate's output, so `SELECT sum(x), sum(x) / count(*)`
+    /// computes one sum, not two.
+    fn aggregate_call(
+        &mut self,
+        name: &str,
+        args: &[ExprRef],
+        distinct: bool,
+        filter: Option<ExprRef>,
+        ty: LogicalType,
+    ) -> ExprRef {
+        let args = self.plan.add_expr_list(args);
+        let name = self.plan.intern(name);
+        let call = self.plan.add_expr(Expr::Aggregate { name, args, distinct, filter }, ty.clone());
+        let existing = self.aggregation.as_ref().map(|held| held.aggregates.clone());
+        let existing = existing.unwrap_or_default();
+        let at = match existing.iter().position(|&held| self.same_expr(held, call)) {
+            Some(at) => at,
+            None => {
+                let aggregation = self.aggregation.as_mut().expect("checked by the caller");
+                aggregation.aggregates.push(call);
+                aggregation.aggregates.len() - 1
+            }
+        };
+        let aggregation = self.aggregation.as_ref().expect("checked by the caller");
+        let (index, groups) = (aggregation.index, aggregation.groups.len());
+        self.column(index, groups + at, ty)
     }
 
     /// The fraction of a quantile call, checked the way the pin checks it and counted from the top
@@ -5227,6 +5261,38 @@ impl<'a> Binder<'a> {
         }
         if resolved.name == "approx_top_k" {
             self.top_k_argument(&parts.args)?;
+        }
+        // The mean of an integer or a decimal is the exact sum over the count as a `numeric`, as
+        // it is for an aggregate in `bind_aggregate_over_rows`.
+        let exact = |ty: &LogicalType| ty.is_integer() || matches!(ty, LogicalType::Decimal { .. });
+        if self.session.postgres().is_some()
+            && resolved.name == "avg"
+            && parts.inner.is_empty()
+            && let [argument] = parts.args[..]
+            && exact(self.plan.expr_type(argument))
+        {
+            let summed = window_signature("sum", &types)?;
+            let argument = self.checked_cast_to(argument, &summed.arguments[0], false)?;
+            let args = self.plan.add_expr_list(&[argument]);
+            let order = self.plan.add_sort_keys(&[]);
+            let mut columns =
+                [("sum", summed.returns), ("count", LogicalType::BigInt)].map(|(name, ty)| {
+                    let name = self.plan.intern(name);
+                    let window = Expr::Window { name, args, distinct, filter, ignore_nulls, order };
+                    let call = self.plan.add_expr(window, ty.clone());
+                    let at = self.window_run(
+                        parts.partition.clone(),
+                        parts.order.clone(),
+                        parts.frame,
+                        call,
+                    );
+                    let index = self.windows.last().expect("the run was just filed").index;
+                    let column = self.column(index, at, ty);
+                    self.cast_to(column, &LogicalType::Numeric)
+                });
+            // A frame with no values has a null sum and a count of zero, and its mean is null.
+            columns[1] = self.zero_to_null(columns[1]);
+            return self.call("/", columns.to_vec());
         }
         let mut cast = Vec::with_capacity(parts.args.len());
         for (arg, wanted) in parts.args.iter().zip(&resolved.arguments) {
