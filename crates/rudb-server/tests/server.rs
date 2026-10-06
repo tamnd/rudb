@@ -715,6 +715,34 @@ fn division_follows_the_rules_of_postgres() {
 }
 
 #[test]
+fn a_call_that_no_function_takes_is_the_error_of_postgres() {
+    let dirs = Dirs::new("function");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for (sql, message, detail) in [
+        (
+            "select no_such(1, 'a', null, 2.5)",
+            "function no_such(integer, unknown, unknown, numeric) does not exist",
+            "There is no function of that name.",
+        ),
+        (
+            "select upper(1)",
+            "function upper(integer) does not exist",
+            "No function of that name accepts the given argument types.",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("42883"), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'D').as_deref(), Some(detail), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), Some("8"), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn create_unlogged_and_a_serial_column() {
     let dirs = Dirs::new("serial");
     let server = Server::start(dirs.config()).unwrap();

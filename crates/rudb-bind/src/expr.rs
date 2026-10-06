@@ -1311,7 +1311,11 @@ impl Binder<'_> {
             let name = written.to_ascii_lowercase();
             return Err(rudb_functions::named_mismatch(&name, &spelled, false));
         }
-        self.call(&written, bound).map_err(|error| literals_spelled(ast, error, &arguments, &types))
+        let postgres = self.session.postgres().is_some();
+        self.call(&written, bound).map_err(|error| match postgres {
+            true => undefined_function(ast, error, &written, &arguments, &types),
+            false => literals_spelled(ast, error, &arguments, &types),
+        })
     }
 
     /// `list_append` and the five names like it, which are macros on the pin and are expanded the
@@ -3762,6 +3766,47 @@ fn literals_spelled(
     match error.span() {
         Some(span) => respelled.with_span(span),
         None => respelled,
+    }
+}
+
+/// The error of PostgreSQL for a call that no function takes, which a PostgreSQL session sends in
+/// place of the error of the pin. The message names the types of the arguments as `format_type`
+/// does, with `unknown` for a string literal and a null. A name with no function at all gets the
+/// detail that says so, and a name with the wrong types gets another detail and a hint. Another error stays as it is.
+fn undefined_function(
+    ast: &Ast,
+    error: Error,
+    written: &str,
+    arguments: &[ast::ExprRef],
+    types: &[LogicalType],
+) -> Error {
+    let unknown = kind_of(written).is_none();
+    if !unknown && !error.message().starts_with("No function matches") {
+        return error;
+    }
+    let spelled = types
+        .iter()
+        .zip(arguments)
+        .map(|(ty, &arg)| match ast.expr(arg) {
+            ast::Expr::Literal { kind: LiteralKind::String, .. } => "unknown".into(),
+            _ if *ty == LogicalType::Null => "unknown".into(),
+            _ => rudb_pgtypes::format_type(rudb_pgtypes::pg_type(ty).oid),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = format!("function {written}({spelled}) does not exist");
+    let mut mapped = Error::new(error.code(), error.message().to_string())
+        .state(SqlState::UNDEFINED_FUNCTION)
+        .pg(message);
+    mapped = match unknown {
+        true => mapped.detail("There is no function of that name."),
+        false => mapped
+            .detail("No function of that name accepts the given argument types.")
+            .hint("You might need to add explicit type casts."),
+    };
+    match error.span() {
+        Some(span) => mapped.with_span(span),
+        None => mapped,
     }
 }
 
