@@ -956,6 +956,10 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
         let from = value.logical_type();
         return crate::json::cast_to_json(value, &from, try_cast, None);
     }
+    if matches!(target, LogicalType::Jsonb) {
+        let from = value.logical_type();
+        return crate::json::cast_to_jsonb(value, &from, try_cast, None);
+    }
     if let (LogicalType::List(wanted), Value::List { values, .. }) = (target, value) {
         return to_list(values, wanted, try_cast);
     }
@@ -2732,6 +2736,9 @@ fn from_timestamp_tz_ns(
         }
         LogicalType::Json => {
             crate::json::cast_to_json(&value, &value.logical_type(), try_cast, Some(zone))
+        }
+        LogicalType::Jsonb => {
+            crate::json::cast_to_jsonb(&value, &value.logical_type(), try_cast, Some(zone))
         }
         _ => Err(no_cast(&value, target)),
     }

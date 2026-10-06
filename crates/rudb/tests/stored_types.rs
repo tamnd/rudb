@@ -1,5 +1,5 @@
 //! A column type that the file cannot store must not take the database down with it. A `JSON`
-//! column goes into the file and comes back out of it. A type that the file cannot store yet is
+//! column and a `JSONB` column go into the file and come back out of it. A type that the file cannot store yet is
 //! refused at `CREATE TABLE`, before the catalog changes, so that the writes after it still work.
 
 use std::path::{Path, PathBuf};
@@ -44,6 +44,34 @@ fn a_json_column_goes_into_the_file_and_comes_back() {
     assert_eq!(rows[1][1], Value::Null);
     assert_eq!(rows[2][1], Value::Varchar(r#""text""#.into()));
     db.execute("INSERT INTO j VALUES (4, '[]')").expect("writes after the reopen");
+    drop(db);
+    remove(&path);
+}
+
+#[test]
+fn a_jsonb_column_keeps_the_normal_form_through_the_file() {
+    let path = path("jsonb");
+    let db = open(&path);
+    for sql in [
+        "CREATE TABLE j (k INTEGER, doc JSONB)",
+        r#"INSERT INTO j VALUES (1, '{"bb":1,"a":[1.50,1e2],"bb":2}'), (2, NULL)"#,
+        r#"INSERT INTO j SELECT 3, '{"z" : true}'::JSON"#,
+        "CHECKPOINT",
+    ] {
+        db.execute(sql).expect(sql);
+    }
+    let refused = db.execute("INSERT INTO j VALUES (4, 'nope')").expect_err("not a document");
+    assert_eq!(refused.reported_state().as_str(), "22P02");
+    drop(db);
+    let db = open(&path);
+    let rows: Vec<Vec<Value>> =
+        db.execute("SELECT k, doc::VARCHAR FROM j ORDER BY k").expect("reads").rows().collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1], Value::Varchar(r#"{"a": [1.50, 100], "bb": 2}"#.into()));
+    assert_eq!(rows[1][1], Value::Null);
+    assert_eq!(rows[2][1], Value::Varchar(r#"{"z": true}"#.into()));
+    let found = db.execute(r#"SELECT k FROM j WHERE doc = '{ "z":true }'"#).expect("compares");
+    assert_eq!(found.rows().collect::<Vec<_>>(), [[Value::Integer(3)]]);
     drop(db);
     remove(&path);
 }

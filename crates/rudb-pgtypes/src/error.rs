@@ -10,11 +10,13 @@ pub struct TypeError {
     pub message: String,
     pub detail: Option<String>,
     pub hint: Option<String>,
+    /// The context of PostgreSQL, such as the place in a `json` value.
+    pub context: Option<String>,
 }
 
 impl TypeError {
     pub(crate) fn new(sqlstate: SqlState, message: String) -> TypeError {
-        TypeError { sqlstate, message, detail: None, hint: None }
+        TypeError { sqlstate, message, detail: None, hint: None, context: None }
     }
 
     /// `22P02`, `invalid input syntax for type integer: "1e3"`.
@@ -50,6 +52,9 @@ impl From<TypeError> for rudb_common::Error {
         }
         if let Some(hint) = error.hint {
             out = out.hint(hint);
+        }
+        if let Some(context) = error.context {
+            out = out.context(context);
         }
         out
     }

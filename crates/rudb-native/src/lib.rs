@@ -2673,7 +2673,8 @@ fn weight(ty: &LogicalType) -> usize {
         | LogicalType::BigNum
         | LogicalType::Numeric
         | LogicalType::Variant
-        | LogicalType::Json => 64,
+        | LogicalType::Json
+        | LogicalType::Jsonb => 64,
         LogicalType::HugeInt
         | LogicalType::UHugeInt
         | LogicalType::Uuid
@@ -10411,8 +10412,8 @@ pub fn stores(ty: &LogicalType) -> bool {
 /// the only thing that may happen to this list is that it grows. 1 to 13 are the tags the format
 /// had when it could store thirteen types, and 14 to 27 are the rest, in the order they were added
 /// rather than in an order that means anything. 28 is `BIGNUM`, 29 is a list, 30 is the `numeric`
-/// of PostgreSQL, 31 is `VARIANT`, 32 is `TIME_NS`, 33 is `TIMESTAMPTZ_NS`, 34 is `JSON` and 35 is
-/// an `ENUM`.
+/// of PostgreSQL, 31 is `VARIANT`, 32 is `TIME_NS`, 33 is `TIMESTAMPTZ_NS`, 34 is `JSON`, 35 is an
+/// `ENUM` and 36 is `JSONB`.
 fn type_tag(ty: &LogicalType) -> Result<u8> {
     match ty {
         LogicalType::SmallInt => Ok(1),
@@ -10447,6 +10448,7 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::Numeric => Ok(30),
         LogicalType::Variant => Ok(31),
         LogicalType::Json => Ok(34),
+        LogicalType::Jsonb => Ok(36),
         LogicalType::TimeNs => Ok(32),
         LogicalType::TimestampTzNs => Ok(33),
         LogicalType::Enum(_) => Ok(35),
@@ -10539,6 +10541,7 @@ fn tag_type(tag: u8) -> Result<LogicalType> {
         30 => Ok(LogicalType::Numeric),
         31 => Ok(LogicalType::Variant),
         34 => Ok(LogicalType::Json),
+        36 => Ok(LogicalType::Jsonb),
         32 => Ok(LogicalType::TimeNs),
         33 => Ok(LogicalType::TimestampTzNs),
         _ => Err(invalid("column type tag is unknown")),
@@ -14041,7 +14044,8 @@ fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
             | LogicalType::BigNum
             | LogicalType::Numeric
             | LogicalType::Variant
-            | LogicalType::Json,
+            | LogicalType::Json
+            | LogicalType::Jsonb,
             Data::Varlen(values),
         ) => {
             let mut bytes = Vec::new();
@@ -15968,7 +15972,8 @@ fn decode(
         | LogicalType::BigNum
         | LogicalType::Numeric
         | LogicalType::Variant
-        | LogicalType::Json => {
+        | LogicalType::Json
+        | LogicalType::Jsonb => {
             let offset_bytes = cur
                 .take((rows + 1).checked_mul(4).ok_or_else(|| invalid("offset count overflow"))?)?;
             let offsets = offset_bytes

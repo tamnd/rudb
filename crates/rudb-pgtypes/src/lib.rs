@@ -98,6 +98,7 @@ mod error;
 mod float;
 mod generated;
 mod json;
+mod jsonb;
 mod number;
 mod numeric;
 mod param;
@@ -129,6 +130,7 @@ pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};
 pub use generated::oids as oid;
 pub use json::json_in;
+pub use jsonb::{jsonb_in, jsonb_recv, jsonb_send};
 pub use number::{int_out, int2_in, int4_in, int8_in, oid_in, oid_out, u64_out};
 pub use numeric::{
     Numeric, NumericSign, decimal_out, decimal_send, numeric_in, numeric_out, numeric_recv,

@@ -211,6 +211,13 @@ pub enum LogicalType {
     /// checks the text parses and keeps it, so `'{"a" : 1}'::JSON` prints with its spaces. It sorts
     /// and compares as that text, and every string function takes it as the string it is.
     Json,
+    /// `JSONB`, the JSON document of PostgreSQL in its normal form.
+    ///
+    /// Held as the text PostgreSQL prints for the document: keys in order of length and then of
+    /// bytes, the last of two equal keys kept, numbers in the form of `numeric` and one space after
+    /// each comma and colon. A cast from `VARCHAR` or `JSON` parses the text and makes that form.
+    /// It compares and sorts as that text, so `1.0` and `1` are not equal as they are in PostgreSQL.
+    Jsonb,
     /// `VARIANT`, a value of any type that carries its type, held in the layout [`crate::variant`]
     /// describes.
     Variant,
@@ -448,6 +455,7 @@ impl LogicalType {
             | Self::Numeric
             | Self::Type
             | Self::Json
+            | Self::Jsonb
             | Self::Variant => PhysicalType::Varlen,
             Self::Interval => PhysicalType::Interval,
             // A map is a list of two-field structs, which is how Arrow does it and how every
@@ -758,6 +766,8 @@ impl LogicalType {
             // A document meets a string as a document, so the string has to parse, which is how
             // the pin's `coalesce`, list and `UNION` take the two.
             (Self::Json, Self::Varchar) | (Self::Varchar, Self::Json) => Some(Self::Json),
+            (Self::Jsonb, Self::Varchar | Self::Json)
+            | (Self::Varchar | Self::Json, Self::Jsonb) => Some(Self::Jsonb),
             _ => None,
         }
     }
@@ -892,6 +902,7 @@ impl fmt::Display for LogicalType {
             Self::AggregateState(_) => f.write_str("AGGREGATE_STATE"),
             Self::Type => f.write_str("TYPE"),
             Self::Json => f.write_str("JSON"),
+            Self::Jsonb => f.write_str("JSONB"),
             Self::Enum(labels) => {
                 f.write_str("ENUM(")?;
                 for (index, label) in labels.iter().enumerate() {
@@ -1592,6 +1603,7 @@ fn alias(upper: &str) -> Option<LogicalType> {
         "UUID" | "GUID" => LogicalType::Uuid,
         "TYPE" => LogicalType::Type,
         "JSON" => LogicalType::Json,
+        "JSONB" => LogicalType::Jsonb,
         "DATE" => LogicalType::Date,
         "TIMETZ" => LogicalType::TimeTz,
         "TIME_NS" => LogicalType::TimeNs,
@@ -1791,6 +1803,7 @@ mod tests {
             LogicalType::Uuid,
             LogicalType::Type,
             LogicalType::Json,
+            LogicalType::Jsonb,
             LogicalType::Date,
             LogicalType::Time,
             LogicalType::TimeTz,

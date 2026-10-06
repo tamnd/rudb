@@ -1030,6 +1030,8 @@ fn involved(from: &LogicalType, target: &LogicalType) -> bool {
     let listed = matches!(from, LogicalType::List(element) | LogicalType::Array(element, _) if **element == LogicalType::Json);
     *target == LogicalType::Json
         || *from == LogicalType::Json
+        || *target == LogicalType::Jsonb
+        || *from == LogicalType::Jsonb
         || (listed && *target == LogicalType::Varchar)
         || (*target == LogicalType::Variant && crate::variant::mentions_json(from))
 }
@@ -1058,6 +1060,8 @@ pub fn cast_typed(
     }
     Some(match (from, target, value) {
         (_, _, Value::Null) => Ok(Value::Null),
+        (_, LogicalType::Jsonb, _) => cast_to_jsonb(value, from, try_cast, zone),
+        (LogicalType::Jsonb, _, Value::Varchar(text)) => cast_from_json(text, target, try_cast),
         (_, LogicalType::Json, _) => cast_to_json(value, from, try_cast, zone),
         (LogicalType::Json, _, Value::Varchar(text)) => cast_from_json(text, target, try_cast),
         (_, LogicalType::Varchar, Value::List { values, .. }) => {
@@ -1074,6 +1078,36 @@ pub fn cast_typed(
         (_, LogicalType::Variant, _) => Ok(crate::variant::to_variant(value, from)),
         _ => cast_value(value, target, try_cast),
     })
+}
+
+/// A value a cast to `JSONB` reads: a string or a `JSON` document is parsed and put in the normal
+/// form of PostgreSQL, and anything else is first made into a document as a cast to `JSON` does.
+///
+/// # Errors
+///
+/// What [`rudb_pgtypes::jsonb_in`] and [`cast_to_json`] report.
+pub fn cast_to_jsonb(
+    value: &Value,
+    from: &LogicalType,
+    try_cast: bool,
+    zone: Option<SessionTimeZone>,
+) -> Result<Value> {
+    let text = match (value, from) {
+        (Value::Null, _) => return Ok(Value::Null),
+        (
+            Value::Varchar(text),
+            LogicalType::Varchar | LogicalType::Json | LogicalType::Jsonb | LogicalType::Null,
+        ) => text.clone(),
+        _ => match cast_to_json(value, from, try_cast, zone)? {
+            Value::Varchar(text) => text,
+            other => return Ok(other),
+        },
+    };
+    match rudb_pgtypes::jsonb_in(&text) {
+        Ok(normal) => Ok(Value::Varchar(normal)),
+        Err(_) if try_cast => Ok(Value::Null),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// A column cast into or out of `JSON`, and nothing for a cast that has nothing to do with it, as

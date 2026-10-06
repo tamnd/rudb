@@ -94,9 +94,16 @@ fn error(sqlstate: &'static str, message: String) -> Problem {
 }
 
 fn type_failure(error: TypeError, context: Option<String>) -> Failure {
-    let fields = context.map(|context| {
+    // The context of the value comes first, as the innermost one.
+    let context = match (error.context, context) {
+        (Some(inner), Some(outer)) => Some(format!("{inner}\n{outer}")),
+        (inner, outer) => inner.or(outer),
+    };
+    let fields = (error.detail.is_some() || error.hint.is_some() || context.is_some()).then(|| {
         let mut fields = Fields::default();
-        fields.context = Some(context);
+        fields.detail = error.detail;
+        fields.hint = error.hint;
+        fields.context = context;
         Box::new(fields)
     });
     Failure {
