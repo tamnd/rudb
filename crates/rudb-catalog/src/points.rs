@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_index::normalize;
 use rudb_vector::Chunk;
 
 use crate::keys::{Encoded, Key, encode, push};
@@ -100,6 +101,67 @@ pub(crate) struct Located {
     /// The keys in order, each with its row's number, built the first time a read of a range of
     /// keys asks.
     sorted: OnceLock<Ordered>,
+    /// Whether this is for a key or a unique index. One for an index that is not unique holds no
+    /// levels and nothing in `sorted`, only `normal`, since a key there can name more than one row.
+    unique: bool,
+    /// The keys normalized, built the first time a read of a range over the front of the key asks,
+    /// and `None` inside when a column of the key is of a type the normalized form does not write.
+    normal: OnceLock<Option<Normal>>,
+}
+
+/// The keys of [`Located`] as `rudb_index::normalize` writes them, each with its row's number, in
+/// runs the way [`Ordered`] holds them, oldest first. A run is in the order of the key and then of
+/// the number, and holds a key once for each row that holds it, so this serves an index that is
+/// not unique as well as a key.
+///
+/// The normalized form sorts as the plan compares the key's columns one after another, and the
+/// form of the first columns of a key is the front of the form of the whole key. So the rows whose
+/// first columns hold given values are one window of each run, in the order of the columns after
+/// them, which is what a read of a range over the front of a key reads.
+#[derive(Debug, Clone, Default)]
+struct Normal(Vec<Arc<Vec<NormalKey>>>);
+
+/// A key as `rudb_index::normalize` writes it, with its row's number.
+type NormalKey = (Box<[u8]>, u64);
+
+impl Normal {
+    /// Adds `keys` as a run, and merges a run into the one before it while it holds at least half
+    /// as many keys, as [`Ordered::note`] does.
+    fn note(&mut self, mut keys: Vec<(Box<[u8]>, u64)>) {
+        if keys.is_empty() {
+            return;
+        }
+        keys.sort_unstable();
+        match self.0.last_mut().and_then(Arc::get_mut) {
+            Some(last) if last.last().is_none_or(|held| *held < keys[0]) => last.extend(keys),
+            _ => self.0.push(Arc::new(keys)),
+        }
+        while let [.., before, last] = self.0.as_slice()
+            && before.len() <= 2 * last.len()
+        {
+            let last = self.0.pop().expect("two runs");
+            let before = self.0.last_mut().expect("two runs");
+            *before = Arc::new(interleave(before, &last));
+        }
+    }
+}
+
+/// Two runs in order as one, keeping every entry of both.
+fn interleave<T: Ord + Clone>(older: &[T], newer: &[T]) -> Vec<T> {
+    let mut merged = Vec::with_capacity(older.len() + newer.len());
+    let (mut old, mut new) = (0, 0);
+    while let (Some(left), Some(right)) = (older.get(old), newer.get(new)) {
+        if left <= right {
+            merged.push(left.clone());
+            old += 1;
+        } else {
+            merged.push(right.clone());
+            new += 1;
+        }
+    }
+    merged.extend_from_slice(&older[old..]);
+    merged.extend_from_slice(&newer[new..]);
+    merged
 }
 
 /// The keys of [`Located`] in order, in runs, oldest first, each behind an [`Arc`] the way the
@@ -290,8 +352,9 @@ enum Wanted<'a> {
 }
 
 impl Located {
-    /// Reads the key's columns of every part of `rows` and notes where each key is.
-    fn build(rows: &Rows, columns: &[usize], placed: u64) -> Result<Self> {
+    /// Reads the key's columns of every part of `rows` and notes where each key is. For an index
+    /// that is not `unique` only where the parts start, and the keys wait for a read of a range.
+    fn build(rows: &Rows, columns: &[usize], placed: u64, unique: bool) -> Result<Self> {
         let projected = Key { columns: (0..columns.len()).collect(), primary: false };
         let parts = rows.chunk_count();
         let mut level = Level::default();
@@ -300,6 +363,10 @@ impl Located {
         let mut number = 0_u64;
         for part in 0..parts {
             starts.push(number);
+            if !unique {
+                number += rows.chunk_len(part)? as u64;
+                continue;
+            }
             let chunk = rows.read(part, columns)?;
             for row in 0..chunk.len() {
                 match encode(&chunk, &projected, row, &mut scratch)? {
@@ -323,6 +390,8 @@ impl Located {
             starts,
             taken: Vec::new(),
             sorted: OnceLock::new(),
+            unique,
+            normal: OnceLock::new(),
         })
     }
 
@@ -394,6 +463,8 @@ impl Located {
             starts,
             taken,
             sorted: OnceLock::new(),
+            unique: true,
+            normal: OnceLock::new(),
         }))
     }
 
@@ -408,6 +479,8 @@ impl Located {
             starts: self.starts.clone(),
             taken: self.taken.clone(),
             sorted: self.sorted.get().cloned().map(OnceLock::from).unwrap_or_default(),
+            unique: self.unique,
+            normal: self.normal.get().cloned().map(OnceLock::from).unwrap_or_default(),
         }
     }
 
@@ -444,9 +517,19 @@ impl Located {
     /// again where the parts from `from` on start. An append changes no part before the last one
     /// it found, and keeps every row's number, which is its place among the rows.
     ///
+    /// `normal` has the keys normalized, when the keys are held that way too, see
+    /// [`Self::normal`], and when it does not they are dropped and read again when next asked.
+    ///
     /// Says whether the rows came out as many as this now counts. When they do not, the caller
     /// drops this and the next lookup builds it again.
-    fn extend(&mut self, rows: &Rows, before: u64, from: usize, keys: Vec<Noted>) -> Result<bool> {
+    fn extend(
+        &mut self,
+        rows: &Rows,
+        before: u64,
+        from: usize,
+        keys: Vec<Noted>,
+        normal: Option<Vec<Box<[u8]>>>,
+    ) -> Result<bool> {
         if self.starts.last() != Some(&before) || from >= self.starts.len() {
             return Ok(false);
         }
@@ -464,6 +547,17 @@ impl Located {
         let mut sorted = self.sorted.get_mut().map(|_| (Vec::new(), Vec::new()));
         // Every row taken out came before these, so their keys skip that many numbers.
         let first = before + self.taken.len() as u64;
+        if let Some(Some(held)) = self.normal.get_mut() {
+            match normal {
+                Some(normal) if normal.len() == keys.len() => {
+                    held.note(normal.into_iter().zip(first..).collect());
+                }
+                _ => self.normal = OnceLock::new(),
+            }
+        }
+        if !self.unique {
+            return Ok(true);
+        }
         let level = {
             if !self.levels.last_mut().is_some_and(|level| Arc::get_mut(level).is_some()) {
                 self.levels.push(Arc::default());
@@ -578,6 +672,47 @@ impl Located {
         self.sorted.get_or_init(|| Ordered(vec![Arc::new(self.sort())]))
     }
 
+    /// The keys normalized with their rows' numbers, read from `rows` the first time a read of a
+    /// range over the front of the key asks, or `None` when a column of the key is of a type the
+    /// normalized form does not write.
+    fn normal(&self, rows: &Rows) -> Result<Option<&Normal>> {
+        if let Some(normal) = self.normal.get() {
+            return Ok(normal.as_ref());
+        }
+        let mut keys = Vec::with_capacity(rows.len());
+        // A row's number as its key has it skips the numbers of the rows taken out.
+        let mut taken = self.taken.iter().copied().peekable();
+        let mut noted = 0_u64;
+        let mut values = Vec::with_capacity(self.columns.len());
+        let mut key = Vec::new();
+        let mut normal = None;
+        'read: {
+            for part in 0..rows.chunk_count() {
+                let chunk = rows.read(part, &self.columns)?;
+                for row in 0..chunk.len() {
+                    while taken.next_if_eq(&noted).is_some() {
+                        noted += 1;
+                    }
+                    values.clear();
+                    for column in 0..self.columns.len() {
+                        values.push(chunk.column(column)?.value_at(row));
+                    }
+                    key.clear();
+                    if !normalize(&values, &mut key) {
+                        break 'read;
+                    }
+                    keys.push((key.as_slice().into(), noted));
+                    noted += 1;
+                }
+            }
+            let mut held = Normal::default();
+            held.note(keys);
+            normal = Some(held);
+        }
+        let _ = self.normal.set(normal);
+        Ok(self.normal.get().and_then(Option::as_ref))
+    }
+
     /// The keys of every level in order with their rows' numbers: the integer ones when there are
     /// any, and otherwise the text ones. A key of one column holds keys of only one of the two.
     ///
@@ -637,9 +772,11 @@ impl Located {
         Sorted::Text(sorted.into_iter().map(|(key, _, number)| (key, number)).collect())
     }
 
-    /// Whether this was built for `key` of `rows` at `placed`.
-    fn fits(&self, rows: &Rows, placed: u64, key: &[usize]) -> bool {
+    /// Whether this was built for `key` of `rows` at `placed`, as a key or a unique index when
+    /// `unique` says so.
+    fn fits(&self, rows: &Rows, placed: u64, key: &[usize], unique: bool) -> bool {
         self.placed == placed
+            && self.unique == unique
             && self.columns == key
             && self.starts.last() == Some(&(rows.len() as u64))
     }
@@ -706,11 +843,12 @@ impl Clone for Points {
 }
 
 /// The keys of `rows` out of a run sealed at checkpoint when there is one, and read from the rows
-/// when not.
-fn opened_or_built(rows: &Rows, key: &[usize], placed: u64) -> Result<Located> {
-    match Located::opened(rows, key, placed)? {
+/// when not. A checkpoint seals only keys and unique indexes.
+fn opened_or_built(rows: &Rows, key: &[usize], placed: u64, unique: bool) -> Result<Located> {
+    let opened = if unique { Located::opened(rows, key, placed)? } else { None };
+    match opened {
         Some(located) => Ok(located),
-        None => Located::build(rows, key, placed),
+        None => Located::build(rows, key, placed, unique),
     }
 }
 
@@ -788,9 +926,14 @@ fn pick<'a, T, K: Ord + Copy, P>(
 }
 
 /// The keys of rows about to be appended, for each key a lookup has built where the rows are, which
-/// [`Points::appended`] notes once the rows are in.
+/// [`Points::appended`] notes once the rows are in, and the keys normalized for each that holds
+/// them that way too.
 #[derive(Debug, Default)]
-pub(crate) struct Appending(Vec<(usize, Vec<Noted>)>);
+pub(crate) struct Appending(Vec<(usize, Vec<Noted>, Option<Normalized>)>);
+
+/// The keys of rows about to be appended as `rudb_index::normalize` writes them, in the rows'
+/// order.
+type Normalized = Vec<Box<[u8]>>;
 
 /// Which side of a value a read of a range of keys takes, as the key column stands on the left of
 /// the comparison.
@@ -861,6 +1004,74 @@ fn encoded(values: &[Value], out: &mut Vec<u8>) -> Encoded {
     Encoded::Bytes
 }
 
+/// The normalized keys over `columns` of the rows of `chunks`, or `None` when a value is of a type
+/// the normalized form does not write.
+fn normalized(chunks: &[Chunk], columns: &[usize]) -> Result<Option<Vec<Box<[u8]>>>> {
+    let mut keys = Vec::with_capacity(chunks.iter().map(Chunk::len).sum());
+    let mut values = Vec::with_capacity(columns.len());
+    let mut key = Vec::new();
+    for chunk in chunks {
+        for row in 0..chunk.len() {
+            values.clear();
+            for &column in columns {
+                values.push(chunk.column(column)?.value_at(row));
+            }
+            key.clear();
+            if !normalize(&values, &mut key) {
+                return Ok(None);
+            }
+            keys.push(key.as_slice().into());
+        }
+    }
+    Ok(Some(keys))
+}
+
+/// The first normalized key a read of a range over the front `front` reads, and the first one past
+/// it, or `None` when a value is of a type the normalized form does not write.
+///
+/// A key holds the front when its form starts with the front's and the next byte, if any, starts
+/// a column, which is `0x00` for a null or `0x01` for a value. Only an escaped `0x00` inside text
+/// is followed by `0xFF`, so the keys holding the front are the ones from it to it and `0xFF`. A
+/// bound on the next column cuts that the same way: the keys whose next column equals the bound
+/// run from the front and the bound to those and `0xFF`, and a value of the next column starts at
+/// the front and `0x01`.
+fn edges(front: &[Value], bound: Option<(Reach, &Value)>) -> Option<(Vec<u8>, Vec<u8>)> {
+    const VALUE: u8 = 0x01;
+    const PAST: u8 = 0xFF;
+    let mut start = Vec::new();
+    if !normalize(front, &mut start) {
+        return None;
+    }
+    let after = |at: &[u8], byte: u8| {
+        let mut out = at.to_vec();
+        out.push(byte);
+        out
+    };
+    let end = after(&start, PAST);
+    let Some((reach, value)) = bound else { return Some((start, end)) };
+    let mut equal = start.clone();
+    if !normalize(std::slice::from_ref(value), &mut equal) {
+        return None;
+    }
+    let past = after(&equal, PAST);
+    let valued = after(&start, VALUE);
+    Some(match reach {
+        Reach::AtLeast => (equal, end),
+        Reach::Above => (past, end),
+        Reach::AtMost => (valued, past),
+        Reach::Below => (valued, equal),
+    })
+}
+
+/// How a read of a range over the front of a key orders its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    /// In the order of the rows, for a statement with no `ORDER BY`.
+    Rows,
+    /// In the order of the key's columns after the front, the highest first when `true`.
+    Key(bool),
+}
+
 impl Points {
     /// The row of `rows` whose key over `key` is `values`, with the columns `columns`, and where it
     /// is, or `None` when no row holds the key.
@@ -887,12 +1098,12 @@ impl Points {
                 Some(built)
                     if !fresh
                         && !self.stale.load(Ordering::Relaxed)
-                        && built.fits(rows, placed, key) =>
+                        && built.fits(rows, placed, key, true) =>
                 {
                     built.as_ref()
                 }
                 _ => {
-                    again = self.again(which, rows, placed, key, fresh)?;
+                    again = self.again((which, true), rows, placed, key, fresh)?;
                     again.as_ref()
                 }
             };
@@ -944,14 +1155,22 @@ impl Points {
             let mut keys = Vec::with_capacity(chunks.iter().map(Chunk::len).sum());
             for chunk in chunks {
                 for row in 0..chunk.len() {
-                    keys.push(match encode(chunk, &key, row, &mut scratch)? {
-                        Encoded::Null => Noted::Null,
-                        Encoded::Int(key) => Noted::Int(key),
-                        Encoded::Bytes => Noted::Bytes(scratch.as_slice().into()),
+                    keys.push(if located.unique {
+                        match encode(chunk, &key, row, &mut scratch)? {
+                            Encoded::Null => Noted::Null,
+                            Encoded::Int(key) => Noted::Int(key),
+                            Encoded::Bytes => Noted::Bytes(scratch.as_slice().into()),
+                        }
+                    } else {
+                        Noted::Null
                     });
                 }
             }
-            appending.push((which, keys));
+            let normal = match located.normal.get() {
+                Some(Some(_)) => normalized(chunks, &located.columns)?,
+                _ => None,
+            };
+            appending.push((which, keys, normal));
         }
         Ok(Appending(appending))
     }
@@ -967,10 +1186,11 @@ impl Points {
         self.again.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
         let mut appending = appending.0.into_iter().peekable();
         for (which, slot) in self.built.iter_mut().enumerate() {
-            let keys = appending.next_if(|(at, _)| *at == which).map(|(_, keys)| keys);
+            let keys =
+                appending.next_if(|(at, ..)| *at == which).map(|(_, keys, normal)| (keys, normal));
             let kept = match (slot.get_mut(), keys) {
-                (Some(located), Some(keys)) => {
-                    unshared(located).extend(rows, before, from, keys).unwrap_or(false)
+                (Some(located), Some((keys, normal))) => {
+                    unshared(located).extend(rows, before, from, keys, normal).unwrap_or(false)
                 }
                 _ => false,
             };
@@ -1051,12 +1271,12 @@ impl Points {
                 Some(built)
                     if !fresh
                         && !self.stale.load(Ordering::Relaxed)
-                        && built.fits(rows, placed, &held) =>
+                        && built.fits(rows, placed, &held, true) =>
                 {
                     built.as_ref()
                 }
                 _ => {
-                    again = self.again(which, rows, placed, &held, fresh)?;
+                    again = self.again((which, true), rows, placed, &held, fresh)?;
                     again.as_ref()
                 }
             };
@@ -1132,12 +1352,134 @@ impl Points {
         }
     }
 
+    /// The rows of `rows` whose first columns of the key over `key` hold `front`, and whose next
+    /// column is on the `reach` side of the value of `bound` when there is one, at most `limit` of
+    /// them in `order`, with the columns `columns`, one row to a chunk.
+    ///
+    /// `None` when that would not answer what the plan does: a value or a column of the key is of
+    /// a type the normalized form does not write, an order by the next column would meet a null
+    /// there, which the plan puts last and the normalized form first, or `order` is
+    /// [`Order::Rows`] and more than `most` keys hold the front.
+    ///
+    /// The caller has made sure `key` is the key or the index at `which`, which `unique` says is a
+    /// key or a unique index, and that every value passes [`looks_up`] against its column.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefix(
+        &self,
+        (which, unique): (usize, bool),
+        rows: &Rows,
+        placed: u64,
+        key: &[usize],
+        front: &[Value],
+        bound: Option<(Reach, &Value)>,
+        order: Order,
+        (limit, most): (usize, usize),
+        columns: &[usize],
+    ) -> Result<Option<Vec<Chunk>>> {
+        let Some((low, high)) = edges(front, bound) else { return Ok(None) };
+        // A null in the next column holds the front, and a bound leaves it out. With no bound the
+        // window starts at the front itself, and the next column after it.
+        let nulls = bound.is_none() && key.len() > front.len() && order != Order::Rows;
+        let depth = low.len();
+        let mut read = columns.to_vec();
+        read.extend_from_slice(key);
+        let mut values = Vec::with_capacity(key.len());
+        let mut held = Vec::new();
+        let mut fresh = false;
+        'again: loop {
+            let again;
+            let built = self.built.get(which).and_then(OnceLock::get);
+            let located = match built {
+                Some(built)
+                    if !fresh
+                        && !self.stale.load(Ordering::Relaxed)
+                        && built.fits(rows, placed, key, unique) =>
+                {
+                    built.as_ref()
+                }
+                _ => {
+                    again = self.again((which, unique), rows, placed, key, fresh)?;
+                    again.as_ref()
+                }
+            };
+            let Some(normal) = located.normal(rows)? else { return Ok(None) };
+            let windows: Vec<&[NormalKey]> = normal
+                .0
+                .iter()
+                .map(|run| {
+                    let start = run.partition_point(|(at, _)| **at < *low);
+                    let end = run.partition_point(|(at, _)| **at < *high).max(start);
+                    &run[start..end]
+                })
+                .collect();
+            // A null sorts first, so it would be at the front of a window.
+            if nulls
+                && windows
+                    .iter()
+                    .any(|window| window.first().is_some_and(|(at, _)| at.get(depth) == Some(&0)))
+            {
+                return Ok(None);
+            }
+            let picked: Vec<(&[u8], u64)> = match order {
+                Order::Key(descending) => pick(
+                    &windows,
+                    descending,
+                    limit,
+                    |(at, number)| (&**at, *number),
+                    |(at, number)| Some((&**at, located.number(*number)?)),
+                ),
+                Order::Rows => {
+                    if windows.iter().map(|window| window.len()).sum::<usize>() > most {
+                        return Ok(None);
+                    }
+                    let mut all: Vec<(&[u8], u64)> = windows
+                        .iter()
+                        .flat_map(|window| window.iter())
+                        .filter_map(|(at, number)| Some((&**at, located.number(*number)?)))
+                        .collect();
+                    all.sort_unstable_by_key(|&(_, number)| number);
+                    all.truncate(limit);
+                    all
+                }
+            };
+            let mut chunks = Vec::with_capacity(picked.len());
+            for (wanted, number) in picked {
+                let found = match located.place(number) {
+                    Some((part, place)) if (place as usize) < rows.chunk_len(part)? => {
+                        let chunk = rows.read_selected(part, &read, &[place])?;
+                        values.clear();
+                        for at in columns.len()..read.len() {
+                            values.push(chunk.column(at)?.value_at(0));
+                        }
+                        held.clear();
+                        (normalize(&values, &mut held) && held == wanted).then_some(chunk)
+                    }
+                    _ => None,
+                };
+                let Some(chunk) = found else {
+                    if fresh {
+                        return Err(Error::internal(
+                            "a key found where it was just noted is not there",
+                        ));
+                    }
+                    fresh = true;
+                    continue 'again;
+                };
+                let mut kept = chunk.into_columns();
+                kept.truncate(columns.len());
+                chunks.push(Chunk::with_rows(kept, 1)?);
+            }
+            return Ok(Some(chunks));
+        }
+    }
+
     /// The rows' keys over `key` at `placed` when `built` cannot answer: built into `built` the
     /// first time, and otherwise into `again` when what that holds is for anything else or when
-    /// `fresh` says what was used was wrong.
+    /// `fresh` says what was used was wrong. `unique` says whether the key at `which` is a key or a
+    /// unique index.
     fn again(
         &self,
-        which: usize,
+        (which, unique): (usize, bool),
         rows: &Rows,
         placed: u64,
         key: &[usize],
@@ -1153,16 +1495,17 @@ impl Points {
             && slot.get().is_none()
         {
             // Under the lock, so two lookups building at once build once.
-            let located = Arc::new(opened_or_built(rows, key, placed)?);
+            let located = Arc::new(opened_or_built(rows, key, placed, unique)?);
             return Ok(Arc::clone(slot.get_or_init(|| located)));
-        } else if let Some(located) = held.iter().find(|held| held.fits(rows, placed, key)) {
+        } else if let Some(located) = held.iter().find(|held| held.fits(rows, placed, key, unique))
+        {
             return Ok(Arc::clone(located));
         }
         // Once what was used turned out wrong, the keys are read from the rows and not from a run.
         let located = Arc::new(if fresh {
-            Located::build(rows, key, placed)?
+            Located::build(rows, key, placed, unique)?
         } else {
-            opened_or_built(rows, key, placed)?
+            opened_or_built(rows, key, placed, unique)?
         });
         held.retain(|held| held.columns != key);
         held.push(Arc::clone(&located));

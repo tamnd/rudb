@@ -23,7 +23,7 @@ use crate::gone::Gone;
 use crate::held::Held;
 use crate::keys::{ForeignKey, Identity, Key, Seen};
 use crate::name::{QualifiedName, same_name};
-use crate::points::{Edge, Point, Points, Reach, Spot, looks_up};
+use crate::points::{Edge, Order, Point, Points, Reach, Spot, looks_up};
 
 /// Where table revisions are counted from, one counter for the process.
 ///
@@ -2204,6 +2204,131 @@ impl Table {
             .find(|(_, held)| same(held))
     }
 
+    /// The keys and plain indexes a read of a range over the front of a key reads through: those of
+    /// [`Self::held`] in its order, then the plain indexes that are not unique. Each comes with its
+    /// place among them and whether it is a key or a unique index.
+    fn fronted(&self) -> impl Iterator<Item = (usize, &[usize], bool)> {
+        let unique = self.indexes.iter().filter(|index| index.unique && index.plain);
+        let other = self.indexes.iter().filter(|index| !index.unique && index.plain);
+        self.keys
+            .iter()
+            .map(|held| (held.columns.as_slice(), true))
+            .chain(unique.map(|index| (index.columns.as_slice(), true)))
+            .chain(other.map(|index| (index.columns.as_slice(), false)))
+            .enumerate()
+            .map(|(which, (columns, unique))| (which, columns, unique))
+    }
+
+    /// The first of [`Self::fronted`] whose first columns are `front` in any order, followed by
+    /// `next` when there is one, with its place, its columns and whether it is unique.
+    fn front_of(&self, front: &[usize], next: Option<usize>) -> Option<(usize, &[usize], bool)> {
+        self.fronted().find(|&(_, held, _)| {
+            let width = front.len() + usize::from(next.is_some());
+            held.len() >= width
+                && held[..front.len()].iter().all(|column| front.contains(column))
+                && next.is_none_or(|next| held[front.len()] == next)
+        })
+    }
+
+    /// Whether [`Self::prefix`] can read the rows whose columns `front` are given, through a key or
+    /// an index whose next column is `next` when there is one, given values of their types.
+    #[must_use]
+    pub fn reads_front(&self, front: &[usize], next: Option<usize>) -> bool {
+        let distinct = front.iter().enumerate().all(|(at, column)| !front[..at].contains(column));
+        !front.is_empty()
+            && distinct
+            && next.is_none_or(|next| !front.contains(&next) && self.orders_by(next))
+            && self.front_of(front, next).is_some()
+    }
+
+    /// Whether the normalized form of a key sorts a column the way the plan does, for an order or
+    /// a bound on it: integers, dates, timestamps and text by its bytes. A float has two zeros and
+    /// any number of NaNs, and the rest are left to the plan.
+    fn orders_by(&self, column: usize) -> bool {
+        self.columns.get(column).is_some_and(|field| {
+            matches!(
+                field.ty,
+                LogicalType::Boolean
+                    | LogicalType::TinyInt
+                    | LogicalType::SmallInt
+                    | LogicalType::Integer
+                    | LogicalType::BigInt
+                    | LogicalType::Date
+                    | LogicalType::Timestamp
+                    | LogicalType::Varchar
+            )
+        })
+    }
+
+    /// The rows whose columns `front` hold `values`, read where a key or a plain index whose
+    /// first columns those are holds them rather than by reading the table,
+    /// `13-the-point-path.md` section 13.4. With `bound` only the rows whose next column of the key
+    /// is on its side of the value, and with `order` at most `limit` of them in the order of that
+    /// column, the highest first when it says so. Without `order` the rows come in the table's
+    /// order, the first `limit` of them, and only when no more than `most` hold the front.
+    ///
+    /// `None` when that would not answer what the plan does: no key or plain index fits, a value
+    /// is not one [`looks_up`] takes for its column as it is, or see `Points::prefix`.
+    ///
+    /// # Errors
+    ///
+    /// If the rows cannot be read.
+    pub fn prefix(
+        &self,
+        (front, values): (&[usize], &[Value]),
+        bound: Option<(usize, Reach, &Value)>,
+        order: Option<(usize, bool)>,
+        (limit, most): (usize, usize),
+        columns: &[usize],
+    ) -> Result<Option<Vec<Chunk>>> {
+        let next = match (bound, order) {
+            (Some((bounded, ..)), Some((ordered, _))) if bounded != ordered => return Ok(None),
+            (Some((next, ..)), _) | (None, Some((next, _))) => Some(next),
+            (None, None) => None,
+        };
+        let looked = |column: usize, value: &Value| {
+            self.columns.get(column).is_some_and(|field| looks_up(value, &field.ty))
+        };
+        let fits = front.len() == values.len()
+            && front.iter().zip(values).all(|(&column, value)| looked(column, value))
+            && bound.is_none_or(|(column, _, value)| looked(column, value));
+        if !fits
+            || !self.reads_front(front, next)
+            || columns.iter().any(|&column| column >= self.columns.len())
+        {
+            return Ok(None);
+        }
+        let Some((which, held, unique)) = self.front_of(front, next) else { return Ok(None) };
+        // In the key's own order.
+        let values: Vec<Value> = held[..front.len()]
+            .iter()
+            .filter_map(|column| front.iter().position(|at| at == column))
+            .map(|at| values[at].clone())
+            .collect();
+        let order = order.map_or(Order::Rows, |(_, descending)| Order::Key(descending));
+        self.points.prefix(
+            (which, unique),
+            &self.rows,
+            self.placed,
+            held,
+            &values,
+            bound.map(|(_, reach, value)| (reach, value)),
+            order,
+            (limit, most),
+            columns,
+        )
+    }
+
+    /// Every column of a key or a plain index, which a write where the row is leaves alone, since
+    /// the keys held for the next read would be wrong.
+    fn keyed(&self) -> Vec<usize> {
+        let mut keyed: Vec<usize> =
+            self.fronted().flat_map(|(_, held, _)| held.iter().copied()).collect();
+        keyed.sort_unstable();
+        keyed.dedup();
+        keyed
+    }
+
     /// The columns of each key and plain unique index, each in its own order, which are the keys a
     /// lookup finds rows by and a checkpoint seals into runs, see [`crate::sealed`].
     #[must_use]
@@ -2297,8 +2422,7 @@ impl Table {
         values: &[Value],
         row: &Chunk,
     ) -> Result<bool> {
-        if self.guards().iter().any(|key| key.columns.iter().any(|column| targets.contains(column)))
-        {
+        if self.keyed().iter().any(|column| targets.contains(column)) {
             return Ok(false);
         }
         self.refuse_nulls(row)?;
@@ -2347,8 +2471,7 @@ impl Table {
         for chunk in rows {
             self.refuse_nulls(chunk)?;
         }
-        let keyed: Vec<usize> =
-            self.guards().iter().flat_map(|key| key.columns.iter().copied()).collect();
+        let keyed = self.keyed();
         let targets: Vec<usize> =
             (0..self.columns.len()).filter(|column| !keyed.contains(column)).collect();
         let given = || rows.iter().flat_map(|chunk| (0..chunk.len()).map(move |row| (chunk, row)));
@@ -3024,6 +3147,8 @@ impl Table {
         }
         self.indexes.push(index);
         self.seen = vec![None; self.guards().len()];
+        // What is built is numbered by the place of each key and index among them.
+        self.points = Points::default();
         Ok(())
     }
 
@@ -3031,6 +3156,7 @@ impl Table {
     pub(crate) fn drop_index(&mut self, at: usize) {
         self.indexes.remove(at);
         self.seen = vec![None; self.guards().len()];
+        self.points = Points::default();
     }
 
     /// The `DEFAULT` of a column as the SQL of its expression, or `None` when it has none, which

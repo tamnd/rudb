@@ -723,6 +723,7 @@ pub(crate) enum Shape<'a> {
     Lookup(&'a Lookup),
     Write(&'a PointWrite),
     Range(&'a RangeRead),
+    Front(&'a FrontRead),
     Upsert(&'a Upsert),
 }
 
@@ -741,7 +742,6 @@ pub(crate) const RANGE_ROWS: usize = 1_000;
 impl RangeRead {
     /// The shape of `ast`, if it is one statement of it.
     fn of(ast: &Ast, compare: IdentifierCompare) -> Option<Self> {
-        use rudb_catalog::Reach;
         let [ast::Statement::Query(at)] = ast.statements.as_slice() else { return None };
         let query = ast.query(*at);
         let ast::QueryBody::Select(select) = query.body else { return None };
@@ -767,13 +767,7 @@ impl RangeRead {
         if matches!(bound, Item::Null) {
             return None;
         }
-        let reach = match (op, flipped) {
-            (ast::BinaryOp::GtEq, false) | (ast::BinaryOp::LtEq, true) => Reach::AtLeast,
-            (ast::BinaryOp::Gt, false) | (ast::BinaryOp::Lt, true) => Reach::Above,
-            (ast::BinaryOp::LtEq, false) | (ast::BinaryOp::GtEq, true) => Reach::AtMost,
-            (ast::BinaryOp::Lt, false) | (ast::BinaryOp::Gt, true) => Reach::Below,
-            _ => return None,
-        };
+        let reach = reach_of(op, flipped)?;
         // The order is by the same column written the same way, and by nothing the select list
         // names, since an `ORDER BY` takes an output name before a column of the table.
         let ast::Expr::Column { name } = ast.expr(order.expr) else { return None };
@@ -795,18 +789,155 @@ impl RangeRead {
             // The operator decides the direction, and only the binder knows the operator.
             ast::Order::Using { .. } => return None,
         };
-        let limit = match ast.expr(query.limit) {
-            ast::Expr::Literal { kind: ast::LiteralKind::Number, text } => {
-                Limit::Rows(ast.string(text).parse().ok().filter(|&rows| rows <= RANGE_ROWS)?)
+        let limit = limit_of(ast, query)?;
+        lookup.equal = vec![(column, bound)];
+        Some(Self { lookup, reach, descending, limit })
+    }
+}
+
+/// A `SELECT ... FROM t WHERE a = ? AND b = ?` over the first columns of a key or an index,
+/// with at most one bound on the column after them, `ORDER BY` that column or nothing, and a
+/// `LIMIT` or none, where the select list is a [`Lookup`]'s.
+///
+/// That is TPC-C's customer by last name and latest order of a customer, which read a few rows
+/// through an index the table has for them, and the plan reads every row of the table to find
+/// them. An execution that finds a key or a plain index whose first columns are the ones set
+/// equal, and whose next is the one bounded or ordered by, reads the rows where it holds them, see
+/// `Table::prefix`.
+#[derive(Debug, Clone)]
+pub(crate) struct FrontRead {
+    /// The table and the select list, with the columns set equal to their values, then the column
+    /// bounded or ordered by set to the bound, or to [`Item::Null`] when there is none.
+    pub(crate) lookup: Lookup,
+    /// How many of the lookup's columns are set equal.
+    pub(crate) equal: usize,
+    /// The side of the bound the rows are on, when there is one.
+    pub(crate) reach: Option<rudb_catalog::Reach>,
+    /// The order the `ORDER BY` wrote, when there is one, and `None` in it when it wrote none and
+    /// the session's applies.
+    pub(crate) order: Option<Option<bool>>,
+    /// How many rows at most, when it says.
+    pub(crate) limit: Option<Limit>,
+}
+
+/// The side of a bound `column op parameter` puts a column on, with `flipped` when the parameter
+/// is written first.
+fn reach_of(op: ast::BinaryOp, flipped: bool) -> Option<rudb_catalog::Reach> {
+    use rudb_catalog::Reach;
+    Some(match (op, flipped) {
+        (ast::BinaryOp::GtEq, false) | (ast::BinaryOp::LtEq, true) => Reach::AtLeast,
+        (ast::BinaryOp::Gt, false) | (ast::BinaryOp::Lt, true) => Reach::Above,
+        (ast::BinaryOp::LtEq, false) | (ast::BinaryOp::GtEq, true) => Reach::AtMost,
+        (ast::BinaryOp::Lt, false) | (ast::BinaryOp::Gt, true) => Reach::Below,
+        _ => return None,
+    })
+}
+
+/// The `LIMIT` of `query` when it is a number no more than [`RANGE_ROWS`] or a parameter.
+fn limit_of(ast: &Ast, query: ast::Query) -> Option<Limit> {
+    Some(match ast.expr(query.limit) {
+        ast::Expr::Literal { kind: ast::LiteralKind::Number, text } => {
+            Limit::Rows(ast.string(text).parse().ok().filter(|&rows| rows <= RANGE_ROWS)?)
+        }
+        ast::Expr::Parameter { name } => {
+            let name = ast.string(name);
+            Limit::Given(Item::Parameter(name.to_owned(), numbered(name)))
+        }
+        _ => return None,
+    })
+}
+
+impl FrontRead {
+    /// The shape of `ast`, if it is one statement of it.
+    fn of(ast: &Ast, compare: IdentifierCompare) -> Option<Self> {
+        let [ast::Statement::Query(at)] = ast.statements.as_slice() else { return None };
+        let query = ast.query(*at);
+        let ast::QueryBody::Select(select) = query.body else { return None };
+        if query.ctes.len != 0
+            || query.order_by_all
+            || query.limit_percent
+            || query.with_ties
+            || query.offset != rudb_parse::NONE
+        {
+            return None;
+        }
+        let limit =
+            if query.limit == rudb_parse::NONE { None } else { Some(limit_of(ast, query)?) };
+        let select = ast.select(select);
+        let mut lookup = Lookup::reading(ast, select, compare)?;
+        let words = |slice| ast.name(slice).map(str::to_owned).collect::<Vec<_>>();
+        let parameter = |name| {
+            let name = ast.string(name);
+            Item::Parameter(name.to_owned(), numbered(name))
+        };
+        let mut equal = Vec::new();
+        let mut bound = None;
+        let mut pending = vec![select.filter];
+        while let Some(expr) = pending.pop() {
+            let ast::Expr::Binary { op, left, right } = ast.expr(expr) else { return None };
+            if op == ast::BinaryOp::And {
+                pending.extend([right, left]);
+                continue;
             }
-            ast::Expr::Parameter { name } => {
-                let name = ast.string(name);
-                Limit::Given(Item::Parameter(name.to_owned(), numbered(name)))
+            let (column, item, flipped) = match (ast.expr(left), ast.expr(right)) {
+                (ast::Expr::Column { name }, ast::Expr::Parameter { name: item }) => {
+                    (words(name), parameter(item), false)
+                }
+                (ast::Expr::Parameter { name: item }, ast::Expr::Column { name }) => {
+                    (words(name), parameter(item), true)
+                }
+                _ => return None,
+            };
+            if op == ast::BinaryOp::Eq {
+                equal.push((column, item));
+            } else if bound.is_none() {
+                bound = Some((column, item, reach_of(op, flipped)?));
+            } else {
+                return None;
+            }
+        }
+        if equal.is_empty() {
+            return None;
+        }
+        let order = match ast.order_list(query.order_by) {
+            [] => None,
+            [order] => {
+                // By a column written as it is, and by nothing the select list names, since an
+                // `ORDER BY` takes an output name before a column of the table.
+                let ast::Expr::Column { name } = ast.expr(order.expr) else { return None };
+                let ordered = words(name);
+                let last = ordered.last()?;
+                let renamed = lookup.picks.iter().any(|pick| match pick {
+                    Pick::Column(_, Some(alias)) => compare.same(alias, last),
+                    _ => false,
+                });
+                if renamed {
+                    return None;
+                }
+                let descending = match order.order {
+                    ast::Order::Unstated => None,
+                    ast::Order::Ascending => Some(false),
+                    ast::Order::Descending => Some(true),
+                    ast::Order::Using { .. } => return None,
+                };
+                Some((ordered, descending))
             }
             _ => return None,
         };
-        lookup.equal = vec![(column, bound)];
-        Some(Self { lookup, reach, descending, limit })
+        let same = |a: &[String], b: &[String]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| compare.same(a, b))
+        };
+        let count = equal.len();
+        lookup.equal = equal;
+        let reach = bound.as_ref().map(|(_, _, reach)| *reach);
+        match (bound, &order) {
+            (Some((bounded, _, _)), Some((ordered, _))) if !same(&bounded, ordered) => return None,
+            (Some((column, item, _)), _) => lookup.equal.push((column, item)),
+            (None, Some((ordered, _))) => lookup.equal.push((ordered.clone(), Item::Null)),
+            (None, None) => {}
+        }
+        let order = order.map(|(_, descending)| descending);
+        Some(Self { lookup, equal: count, reach, order, limit })
     }
 }
 
@@ -913,6 +1044,7 @@ pub(crate) struct Short {
     lookup: Option<Lookup>,
     write: Option<PointWrite>,
     range: Option<RangeRead>,
+    front: Option<FrontRead>,
     upsert: Option<Upsert>,
 }
 
@@ -925,6 +1057,7 @@ impl Short {
             lookup: Lookup::of(ast, compare),
             write: PointWrite::of(ast, compare),
             range: RangeRead::of(ast, compare),
+            front: FrontRead::of(ast, compare),
             upsert: Upsert::of(ast, compare),
         }
     }
@@ -953,6 +1086,11 @@ impl Short {
         }
         if let Some(range) = &self.range
             && let Some(done) = shared.range_read(range, given, sql)
+        {
+            return Some(done);
+        }
+        if let Some(front) = &self.front
+            && let Some(done) = shared.front_read(front, given, sql)
         {
             return Some(done);
         }
@@ -1108,7 +1246,8 @@ impl Prepared {
     ///
     /// The point plans are `InsertOne t`, `InsertRows t`, `POINT Lookup t(key)`,
     /// `UpdateOne t(key) SET column`, `DeltaOne t(key) SET column`, `DeleteOne t(key)`,
-    /// `Range t(key)` and `Upsert t(key)`. They hold for values of the key's and the columns' types. Inside a
+    /// `Range t(key)` for a range by a key or by the first columns of a key or an index, and
+    /// `Upsert t(key)`. They hold for values of the key's and the columns' types. Inside a
     /// transaction all of them take the short way too, until the transaction aborts.
     /// A benchmark checks this before it measures, so a statement that would fall back to the
     /// pipeline is found out by name rather than by a slow number.
@@ -1120,6 +1259,7 @@ impl Prepared {
             short.lookup.as_ref().map(Shape::Lookup),
             short.write.as_ref().map(Shape::Write),
             short.range.as_ref().map(Shape::Range),
+            short.front.as_ref().map(Shape::Front),
             short.upsert.as_ref().map(Shape::Upsert),
         ];
         let plan = shapes.into_iter().flatten().find_map(|shape| self.shared.point_plan(shape));
@@ -1337,6 +1477,61 @@ mod tests {
             "SELECT name FROM t WHERE id >= ? ORDER BY id LIMIT 5000",
         ] {
             assert!(db.prepare(sql).expect("prepares").short.range.is_none(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_range_over_the_front_of_an_index_takes_the_short_way() {
+        let db = Database::new();
+        db.execute("CREATE TABLE t (a INTEGER, b VARCHAR, c BIGINT, v VARCHAR)").expect("creates");
+        db.execute("CREATE INDEX t_abc ON t (a, b, c)").expect("indexes");
+        db.execute("INSERT INTO t SELECT i % 3, 'b' || (i % 5), i, 'v' || i FROM range(30) r(i)")
+            .expect("inserts");
+        for (sql, plan) in [
+            ("SELECT v FROM t WHERE a = ? AND b = ? ORDER BY c DESC LIMIT 1", "Range t(a, b, c)"),
+            ("SELECT v FROM t WHERE b = ? AND a = ? ORDER BY c", "Range t(b, a, c)"),
+            (
+                "SELECT * FROM t WHERE a = ? AND b = ? AND c >= ? ORDER BY c LIMIT ?",
+                "Range t(a, b, c)",
+            ),
+            ("SELECT * FROM t WHERE a = ? AND c < ?", "PIPELINE"),
+            ("SELECT * FROM t WHERE a = ? ORDER BY b", "Range t(a, b)"),
+            ("SELECT * FROM t WHERE a = ?", "Range t(a)"),
+            ("SELECT * FROM t WHERE b = ?", "PIPELINE"),
+            ("SELECT * FROM t WHERE a = ? ORDER BY c", "PIPELINE"),
+        ] {
+            let prepared = db.prepare(sql).expect("prepares");
+            assert!(prepared.short.front.is_some(), "{sql}");
+            assert_eq!(prepared.explain(), plan, "{sql}");
+        }
+        let prepared = db
+            .prepare("SELECT c, v FROM t WHERE a = ? AND b = ? ORDER BY c DESC LIMIT 2")
+            .expect("prepares");
+        let front = prepared.short.front.as_ref().expect("the shape is recognised");
+        let values = vec![Value::Integer(1), Value::Varchar("b1".into())];
+        let taken = prepared.shared.front_read(front, Given::Positional(&values), prepared.sql());
+        let result = taken.expect("taken").expect("runs");
+        assert_eq!(
+            result.rows().collect::<Vec<_>>(),
+            vec![
+                vec![Value::BigInt(16), Value::Varchar("v16".into())],
+                vec![Value::BigInt(1), Value::Varchar("v1".into())],
+            ]
+        );
+
+        for sql in [
+            "SELECT v FROM t WHERE a >= ? ORDER BY a LIMIT 1",
+            "SELECT v FROM t WHERE a = ? AND c >= ? AND c < ?",
+            "SELECT v FROM t WHERE a = ? AND b >= ? ORDER BY c",
+            "SELECT v FROM t WHERE a = ? ORDER BY b, c",
+            "SELECT v AS b FROM t WHERE a = ? ORDER BY b",
+            "SELECT v FROM t WHERE a = ? ORDER BY 1",
+            "SELECT v FROM t WHERE a = ? LIMIT 1 OFFSET 1",
+            "SELECT v FROM t WHERE a = ? LIMIT 5000",
+            "SELECT v FROM t WHERE a = ? OR b = ?",
+            "SELECT v FROM t WHERE a <> ?",
+        ] {
+            assert!(db.prepare(sql).expect("prepares").short.front.is_none(), "{sql}");
         }
     }
 
