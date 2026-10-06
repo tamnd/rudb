@@ -107,7 +107,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_pipeline::{Lease, Progress, Sink};
@@ -340,6 +340,9 @@ impl Ranked {
     /// A sort key of text is almost always a grouped column with few values, a brand or a type on
     /// TPC-H q16, and sorting every row's bytes compared the same few strings over and over.
     fn ranks(&self, position: usize) -> Result<Vec<u32>> {
+        if let Some(ranks) = self.coded_ranks(position)? {
+            return Ok(ranks);
+        }
         let mut seen: HashMap<&[u8], u32, BuildHasherDefault<Digest>> = HashMap::default();
         let mut distinct: Vec<&[u8]> = Vec::new();
         let mut ids: Vec<u32> = Vec::with_capacity(self.arrivals.len());
@@ -371,6 +374,89 @@ impl Ranked {
             rank_of[id as usize] = rank;
         }
         Ok(ids.into_iter().map(|id| rank_of.get(id as usize).copied().unwrap_or(0)).collect())
+    }
+
+    /// [`Self::ranks`] for a key whose every chunk is codes into one shared dictionary, and `None`
+    /// for any other.
+    ///
+    /// That is how a grouped string key comes out of the table, so it is the ordinary case for a
+    /// sort over a grouping. The codes say which rows hold the same string already, so a row is a
+    /// load from an array indexed by its code, and only the codes the rows use are read out of the
+    /// dictionary and sorted. Hashing every row's bytes was most of the sort on TPC-H q16, where
+    /// 18,314 rows hold 24 brands and 145 types, and each row's bytes were fetched out of storage
+    /// to be hashed.
+    fn coded_ranks(&self, position: usize) -> Result<Option<Vec<u32>>> {
+        // What a code whose value is null stands for, which like a null row takes any rank.
+        const NULL_CODE: u32 = u32::MAX - 1;
+        let mut shared: Option<&Arc<Vector>> = None;
+        for columns in &self.keys {
+            let column = columns.get(position).ok_or_else(mismatched)?;
+            let Some((_, values)) = column.stable_dictionary_parts() else {
+                return Ok(None);
+            };
+            match shared {
+                Some(held) if !Arc::ptr_eq(held, values) => return Ok(None),
+                _ => shared = Some(values),
+            }
+        }
+        let Some(values) = shared else {
+            return Ok(None);
+        };
+        // An array a code, so a dictionary far larger than the rows is left to the hash.
+        if values.len() > self.arrivals.len().saturating_mul(4).max(1 << 16) {
+            return Ok(None);
+        }
+        let mut id_of = vec![u32::MAX; values.len()];
+        let mut distinct: Vec<u32> = Vec::new();
+        let mut ids: Vec<u32> = Vec::with_capacity(self.arrivals.len());
+        for columns in &self.keys {
+            let column = columns.get(position).ok_or_else(mismatched)?;
+            let (codes, _) = column.stable_dictionary_parts().ok_or_else(mismatched)?;
+            let validity = column.validity();
+            for (at, &code) in codes.iter().enumerate() {
+                // A null row's rank is never read, because the column it is written as carries the
+                // row's validity, so it takes any.
+                if !validity.is_valid(at) {
+                    ids.push(0);
+                    continue;
+                }
+                let id = id_of
+                    .get_mut(code as usize)
+                    .ok_or_else(|| Error::internal("a dictionary code past its dictionary"))?;
+                if *id == u32::MAX {
+                    *id = if values.is_null_at(code as usize) {
+                        NULL_CODE
+                    } else {
+                        let next = u32::try_from(distinct.len()).map_err(|_| too_many())?;
+                        distinct.push(code);
+                        next
+                    };
+                }
+                ids.push(*id);
+            }
+        }
+        if ids.len() != self.arrivals.len() {
+            return Err(mismatched());
+        }
+        let mut bytes: Vec<(&[u8], u32)> = Vec::with_capacity(distinct.len());
+        for (id, &code) in (0_u32..).zip(&distinct) {
+            bytes.push((values.try_bytes_at(code as usize)?.unwrap_or_default(), id));
+        }
+        bytes.sort_unstable();
+        // Equal strings take one rank between them, should the dictionary hold one twice, so that a
+        // tie is still settled by arrival.
+        let mut rank_of = vec![0_u32; distinct.len()];
+        let mut rank = 0_u32;
+        for (at, &(value, id)) in bytes.iter().enumerate() {
+            if at > 0 && bytes[at - 1].0 != value {
+                rank += 1;
+            }
+            rank_of[id as usize] = rank;
+        }
+        for id in &mut ids {
+            *id = rank_of.get(*id as usize).copied().unwrap_or(0);
+        }
+        Ok(Some(ids))
     }
 
     /// What the rows were charged when they arrived: their key columns and an arrival a row.
@@ -1431,8 +1517,50 @@ mod tests {
     use rudb_pipeline::{Lease, Pool};
     use rudb_vector::VECTOR_SIZE;
 
-    use super::{Normalized, merged};
+    use std::sync::Arc;
+
+    use rudb_common::{LogicalType, Value};
+    use rudb_vector::{Validity, Vector};
+
+    use super::{Normalized, Ranked, merged};
     use crate::normal::{self, WIDTH};
+
+    /// A key held as codes into one dictionary ranks its rows the way hashing their strings does,
+    /// with a string the dictionary holds twice taking one rank and a null row taking any.
+    #[test]
+    fn coded_keys_rank_the_way_their_strings_do() {
+        let words = ["pear", "apple", "fig", "apple", "kiwi"];
+        let mut values: Vec<Value> = words.iter().map(|&word| Value::Varchar(word.into())).collect();
+        values.push(Value::Null);
+        let dictionary =
+            Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("strings"));
+        let chunks: [Vec<u32>; 2] = [vec![2, 0, 3, 5, 1, 2], vec![4, 1, 0, 0, 3]];
+        let mut coded = Ranked::new(vec![(4, true)]);
+        let mut plain = Ranked::new(vec![(4, true)]);
+        for (at, codes) in chunks.iter().enumerate() {
+            let validity = Validity::from_iter(codes.len(), |row| at == 0 || row != 2);
+            let column = Vector::stable_dictionary(codes.clone(), Arc::clone(&dictionary))
+                .expect("codes in range")
+                .with_validity(validity);
+            let rows: Vec<Value> = (0..codes.len()).map(|row| column.value_at(row)).collect();
+            plain.keys.push(vec![Vector::from_values(LogicalType::Varchar, &rows).expect("rows")]);
+            coded.keys.push(vec![column]);
+            for _ in codes {
+                coded.arrivals.push((0, 0));
+                plain.arrivals.push((0, 0));
+            }
+        }
+        let fast = coded.coded_ranks(0).expect("ranked").expect("one shared dictionary");
+        let hashed = plain.ranks(0).expect("ranked");
+        assert!(plain.coded_ranks(0).expect("asked").is_none());
+        let nulls = [3, 8];
+        for row in 0..fast.len() {
+            if !nulls.contains(&row) {
+                assert_eq!(fast[row], hashed[row], "row {row}");
+            }
+        }
+        assert_eq!(fast[2], fast[7], "apple twice in the dictionary is one rank");
+    }
 
     /// Rows with keys that repeat a lot and an arrival that settles every tie, shuffled.
     fn shuffled(count: usize) -> Vec<(u64, u64)> {
