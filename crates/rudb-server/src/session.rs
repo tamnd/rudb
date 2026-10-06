@@ -17,6 +17,7 @@ mod database;
 mod extended;
 mod keywords;
 mod literal;
+mod prepare;
 mod role;
 mod setting;
 mod streamed;
@@ -1570,6 +1571,29 @@ impl Runner {
                             &mut flush,
                         )?;
                         match done {
+                            Ok(()) => {
+                                extended.end_of_transaction(self);
+                                continue;
+                            }
+                            Err(problem) => problem.within(&text, statement.offset()),
+                        }
+                    }
+                };
+                if !self.ending() {
+                    problem.write(out, 0);
+                }
+                return Ok(true);
+            }
+            if let Some(named) = prepare::parse(statement.sql()) {
+                // A statement on the prepared statements runs here, since they are the
+                // statements of `Parse` too.
+                let text: Arc<str> = sql.into();
+                let started = if implicit { self.begin_implicit() } else { Ok(()) };
+                let problem = match started {
+                    Err(failure) => extended::Problem::failure(failure, &text),
+                    Ok(()) => {
+                        let one: Arc<str> = statement.sql().into();
+                        match extended.named(self, &named, &one, None, out, &mut flush)? {
                             Ok(()) => {
                                 extended.end_of_transaction(self);
                                 continue;

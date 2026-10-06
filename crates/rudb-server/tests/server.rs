@@ -1902,6 +1902,99 @@ fn advisory_locks_are_held_by_the_session_or_the_transaction() {
 }
 
 #[test]
+fn prepare_and_parse_share_one_namespace() {
+    let dirs = Dirs::new("prepare");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let rows = |messages: &[Message]| -> Vec<String> {
+        let rows = messages.iter().filter(|m| m.tag == b'D').map(data_row);
+        rows.map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap()).collect()
+    };
+    let error = |messages: &[Message]| {
+        let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+        (error.field(b'C').unwrap(), error.field(b'M').unwrap())
+    };
+
+    // `PREPARE` takes a list of types, and `EXECUTE` casts each value to its type.
+    assert_eq!(text(&client.query("prepare q(int) as select $1 * 2")[0]), "PREPARE");
+    let messages = client.query("execute q('21')");
+    assert_eq!(tags(&messages), "TDCZ");
+    assert_eq!(rows(&messages), ["42"]);
+    assert_eq!(text(&messages[2]), "SELECT 1");
+    let messages = client.query("execute q('x')");
+    assert_eq!(error(&messages).0, "22P02");
+    assert_eq!(messages[0].field(b'P').as_deref(), Some("11"));
+    let messages = client.query("execute q");
+    assert_eq!(error(&messages).1, "wrong number of parameters for prepared statement \"q\"");
+    assert_eq!(messages[0].field(b'D').as_deref(), Some("Expected 1 parameters but got 0."));
+    let messages = client.query("prepare q as select 2");
+    assert_eq!(
+        error(&messages),
+        ("42P05".to_owned(), "prepared statement \"q\" already exists".to_owned())
+    );
+    let messages = client.query("prepare c as create table c (a int)");
+    assert_eq!(
+        error(&messages),
+        ("42601".to_owned(), "syntax error at or near \"create\"".to_owned())
+    );
+    let messages = client.query("prepare c(nosuchtype) as select $1");
+    assert_eq!(
+        error(&messages),
+        ("42704".to_owned(), "type \"nosuchtype\" does not exist".to_owned())
+    );
+
+    // A statement of `PREPARE` binds, and a statement of `Parse` runs by `EXECUTE`.
+    client.bind_with("", "q", &[], &[Some(b"5")], &[1]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "2DCZ");
+    assert_eq!(data_row(&messages[1])[0].as_deref(), Some(&10i32.to_be_bytes()[..]));
+    client.parse("s", "select 'parsed'", &[]);
+    assert_eq!(tags(&client.sync()), "1Z");
+    assert_eq!(rows(&client.query("execute s")), ["parsed"]);
+    assert_eq!(error(&client.query("prepare s as select 1")).0, "42P05");
+
+    // `EXECUTE` on the extended flow gives the rows of the statement in the formats of `Bind`.
+    client.parse("", "execute q(4)", &[]);
+    client.describe(Target::Statement, "");
+    client.bind_with("", "", &[], &[], &[1]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "1tT2DCZ");
+    assert_eq!(parameter_types(&messages[1]), [0u32; 0]);
+    assert_eq!(data_row(&messages[4])[0].as_deref(), Some(&8i32.to_be_bytes()[..]));
+
+    // `DEALLOCATE` removes a statement of either kind, and `ALL` keeps the unnamed one.
+    assert_eq!(text(&client.query("deallocate s")[0]), "DEALLOCATE");
+    client.bind("", "s", &[], &[]);
+    let messages = client.sync();
+    assert_eq!(
+        error(&messages),
+        ("26000".to_owned(), "prepared statement \"s\" does not exist".to_owned())
+    );
+    assert_eq!(error(&client.query("deallocate s")).0, "26000");
+    client.parse("", "select 'unnamed'", &[]);
+    client.parse("n", "select 'named'", &[]);
+    assert_eq!(tags(&client.sync()), "11Z");
+    assert_eq!(text(&client.query("deallocate prepare all")[0]), "DEALLOCATE ALL");
+    assert_eq!(error(&client.query("execute q(1)")).0, "26000");
+    client.bind("", "n", &[], &[]);
+    assert_eq!(error(&client.sync()).0, "26000");
+
+    // In a failed block the three statements fail as any other.
+    client.query("prepare q(int) as select $1");
+    client.query("begin");
+    client.query("select 1/0");
+    for sql in ["prepare z as select 1", "execute q(1)", "deallocate q"] {
+        assert_eq!(error(&client.query(sql)).0, "25P02", "{sql}");
+    }
+    client.query("rollback");
+    assert_eq!(rows(&client.query("prepare m as values (7); execute m; deallocate m")), ["7"]);
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_cursor_moves_and_ends_as_in_postgresql() {
     let dirs = Dirs::new("cursors");
     let server = Server::start(dirs.config()).unwrap();
