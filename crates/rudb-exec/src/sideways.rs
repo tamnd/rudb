@@ -187,16 +187,16 @@ struct Listing {
 enum Planned {
     /// The parents the keys name, to push through the adjacency, and how many rows they reach.
     Through { held: Rids, reach: u64 },
-    /// The rows of a table that hold the keys in its own unique column, which the key map gives
-    /// directly and so are found already.
-    Own(Pushed),
+    /// Rows found already, because the key map gives them directly for a table's own unique
+    /// column, or because a monotone link pushes a set for about what the set holds.
+    Ready(Pushed),
 }
 
 impl Planned {
     fn reach(&self) -> u64 {
         match self {
             Self::Through { reach, .. } => *reach,
-            Self::Own(pushed) => pushed.rids.len(),
+            Self::Ready(pushed) => pushed.rids.len(),
         }
     }
 }
@@ -1337,6 +1337,19 @@ pub(crate) fn found_for(
             spare = bitmap;
         }
     }
+    // A handoff set aside places no rows of its own, but the scan can still read the rows its keys
+    // reach when they are fewer than what the rest left it, the way it reads a relation of a
+    // consistent reduction. TPC-H q02 is the case: the subquery's `partsupp` scan owns the bitmap of
+    // the 1,987 suppliers of Europe, which reach a fifth of the table, and the 747 parts of the semi
+    // join above reach 2,988 rows. Testing both bitmaps read all 800 thousand rows.
+    let listing = exact
+        .filter(|_| !placed && domain.is_some())
+        .and(reduced.filter(|reduced| reduced.by_key))
+        .map(|reduced| Listing {
+            count: reduced.kept,
+            planned: OnceLock::new(),
+            gathered: OnceLock::new(),
+        });
     // The exact rows answer everything the filter would, with no false positives, so a side that
     // has them does not pay for building the filter too. Nor does a side whose reduction stopped
     // early, because it stopped on finding that the first third of the driving table all matches,
@@ -1385,7 +1398,7 @@ pub(crate) fn found_for(
         held,
         reduced,
         keys,
-        listing: None,
+        listing,
     })
 }
 
@@ -1561,8 +1574,9 @@ fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Op
 }
 
 /// How the driving rows that hold one of `count` key values would be read off the backward
-/// adjacency, when they are fewer than one row in [`GATHERED`], or in [`BARE`] for a relation with
-/// no filter of its own. See [`gathered`] for reading them.
+/// adjacency, or pushed through a monotone link where the table has none, when they are fewer than
+/// one row in [`GATHERED`], or in [`BARE`] for a relation with no filter of its own. See
+/// [`gathered`] for reading them.
 ///
 /// The same lists [`listed`] reads for a join, for the keys a relation of a consistent reduction
 /// kept, which are values and not the rows of a build side. Every value has to be in the parent's
@@ -1570,21 +1584,17 @@ fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Op
 /// no list, so the set would miss them and the scan is left to test its rows instead.
 fn listed_keys(exact: &Exact, count: u64, keys: impl Iterator<Item = i64>) -> Option<Planned> {
     if exact.own {
-        return owned_keys(exact, count, keys).map(Planned::Own);
+        return owned_keys(exact, count, keys).map(Planned::Ready);
     }
     let children = exact.children.filter(|&children| children > 0)?;
     if count.saturating_mul(exact.gathered) >= exact.parents.min(children) {
         return None;
     }
-    let adjacency = exact.adjacency()?;
     let map = exact.keys()?;
-    let parents = adjacency.parents();
-    let mut words = vec![0_u64; usize::try_from(parents.div_ceil(64)).ok()?];
-    for key in keys {
-        let rid = map.lookup(i128::from(key)).ok()??;
-        *words.get_mut(usize::try_from(rid / 64).ok()?)? |= 1 << (rid % 64);
-    }
-    let held = Rids::from_words(parents, words).ok()?;
+    let Some(adjacency) = exact.adjacency() else {
+        return pushed_keys(exact, map, children, keys).map(Planned::Ready);
+    };
+    let held = keyed_parents(map, adjacency.parents(), keys)?;
     let reach = adjacency.reached(&held).ok()?;
     if reach.saturating_mul(exact.gathered) >= children {
         return None;
@@ -1592,11 +1602,44 @@ fn listed_keys(exact: &Exact, count: u64, keys: impl Iterator<Item = i64>) -> Op
     Some(Planned::Through { held, reach })
 }
 
+/// The parents that hold `keys`, as a set over the `parents` rows of the parent table, `None` when
+/// a key is not in the map.
+fn keyed_parents(map: &KeyMap, parents: u64, keys: impl Iterator<Item = i64>) -> Option<Rids> {
+    let mut words = vec![0_u64; usize::try_from(parents.div_ceil(64)).ok()?];
+    for key in keys {
+        let rid = map.lookup(i128::from(key)).ok()??;
+        *words.get_mut(usize::try_from(rid / 64).ok()?)? |= 1 << (rid % 64);
+    }
+    Rids::from_words(parents, words).ok()
+}
+
+/// The driving rows that hold `keys`, pushed through a monotone link, for a table stored in its
+/// parent's order that has no backward adjacency because it needs none.
+///
+/// A monotone link holds each parent's children as one run, so the push walks from one held parent
+/// to the next and costs about what the set holds, which is why [`found_for`] pushes such a link
+/// whatever it could skip. TPC-H q02 is the case: `partsupp` is stored in part order, and the 747
+/// parts the semi join above its subquery keeps are 2,988 of its 800 thousand rows.
+fn pushed_keys(
+    exact: &Exact,
+    map: &KeyMap,
+    children: u64,
+    keys: impl Iterator<Item = i64>,
+) -> Option<Pushed> {
+    if !exact.monotone() {
+        return None;
+    }
+    let link = exact.link()?;
+    let pushed = keyed_parents(map, link.parents(), keys)?.forward(link).ok()?;
+    (pushed.rids.len().saturating_mul(exact.gathered) < children && thin(&pushed.rids))
+        .then_some(pushed)
+}
+
 /// The rows a plan of [`listed_keys`] names, `None` when they sit too thickly in their parts to be
 /// worth reading one at a time.
 fn gathered(exact: &Exact, planned: &Planned) -> Option<Pushed> {
     match planned {
-        Planned::Own(pushed) => Some(pushed.clone()),
+        Planned::Ready(pushed) => Some(pushed.clone()),
         Planned::Through { held, .. } => {
             let children = exact.children?;
             let rids = exact.adjacency()?.push(held).ok()?;
@@ -1922,11 +1965,13 @@ impl Found {
     /// [`Listing`].
     fn reach(&self, exact: Option<&Exact>) -> Option<u64> {
         let listing = self.listing.as_ref()?;
-        let words = &self.domain.as_ref()?.words;
-        let planned = listing
-            .planned
-            .get_or_init(|| listed_keys(exact?, listing.count, members(words)))
-            .as_ref()?;
+        let domain = self.domain.as_ref()?;
+        // Bit zero is the smallest key the parent holds for a join's bitmap, and key zero for the
+        // one a consistent reduction kept.
+        let base = i64::try_from(domain.base).ok()?;
+        let keys = members(&domain.words).map(move |key| key.wrapping_add(base));
+        let planned =
+            listing.planned.get_or_init(|| listed_keys(exact?, listing.count, keys)).as_ref()?;
         Some(planned.reach())
     }
 
@@ -2467,6 +2512,31 @@ mod tests {
         );
         let found = Found::kept(words(&[103]), Some(&clustered));
         assert!(found.gather(Some(&clustered)).is_none() && found.domain.is_some());
+    }
+
+    /// A join set aside under another one places no rows, but its keys can still be read as the
+    /// rows they reach. A table stored in its parent's order has no adjacency to list them from, and
+    /// its monotone link pushes them instead, which is TPC-H q02's `partsupp` under the semi join on
+    /// the parts its subquery is asked about.
+    #[test]
+    fn a_side_set_aside_lists_its_rows_through_a_monotone_link() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let parent_keys: Vec<Option<i128>> = (0..10_000).map(|rid| Some(100 + rid)).collect();
+        let parents_of: Vec<u64> = (0..40_000).map(|child| child / 4).collect();
+        let exact = Exact::new(
+            KeyMap::build(&parent_keys).expect("unique keys"),
+            Some(Link::build(&parents_of, 10_000).expect("every parent exists")),
+        );
+        let side = [chunk(&[Some(103), Some(5_100)])];
+
+        let found = found_for(&keyed, Some(&exact), &side, false, false).expect("integers");
+        assert!(found.rows.is_none() && found.domain.is_some(), "no rows of its own");
+        assert_eq!(found.reach(Some(&exact)), Some(8));
+        let rows = &found.gather(Some(&exact)).expect("pushed").rids;
+        let expected: Vec<u64> = (12..16).chain(20_000..20_004).collect();
+        assert_eq!(rows.iter().collect::<Vec<u64>>(), expected);
     }
 
     /// The exact rows answer the scan, which leaves no bitmap behind for a join above that narrows
