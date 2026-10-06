@@ -324,7 +324,7 @@ pub struct MacroChange {
 }
 
 /// A bound `CREATE TYPE` or `DROP TYPE`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TypeChange {
     /// The full name. `None` for a `DROP TYPE IF EXISTS` of one that is not there.
     pub name: Option<QualifiedName>,
@@ -338,6 +338,9 @@ pub struct TypeChange {
     pub or_replace: bool,
     /// Whether a drop takes the types made from this one with it.
     pub cascade: bool,
+    /// The query of `ENUM (SELECT ...)`, whose one column read as strings is the list of labels,
+    /// in which case `ty` is `None` on a create too.
+    pub labels: Option<Plan>,
 }
 
 /// A bound `ALTER TABLE` or `ALTER VIEW`.
@@ -634,6 +637,7 @@ pub(crate) fn bind_one(
         ast::Statement::Type(index) => {
             let written = ast.type_def(index);
             let parts: Vec<&str> = ast.name(written.name).collect();
+            let mut labels = None;
             let (name, ty, uses) = if written.drop {
                 let name = catalog.resolve_type(&parts).map(|made| made.name().clone());
                 if name.is_none() && !written.quiet {
@@ -649,8 +653,18 @@ pub(crate) fn bind_one(
                 } else {
                     catalog.resolve_for_create(&parts)?
                 };
-                let (ty, uses) = written_type(catalog, ast.string(written.ty))?;
-                (Some(name), Some(ty), uses)
+                if written.query != NONE {
+                    let mut binder = Binder::with(catalog, parameters, session);
+                    let (root, scope) = binder.bind_query(ast, written.query)?;
+                    if scope.columns.len() != 1 {
+                        return Err(Error::binder("The query must return a single column"));
+                    }
+                    labels = Some(finish(binder, root)?);
+                    (Some(name), None, Vec::new())
+                } else {
+                    let (ty, uses) = written_type(catalog, ast.string(written.ty))?;
+                    (Some(name), Some(ty), uses)
+                }
             };
             Ok(Bound::Type(TypeChange {
                 name,
@@ -659,6 +673,7 @@ pub(crate) fn bind_one(
                 if_not_exists: written.quiet,
                 or_replace: written.or_replace,
                 cascade: written.cascade,
+                labels,
             }))
         }
         ast::Statement::Trigger(index) => trigger(ast, catalog, parameters, session, index),

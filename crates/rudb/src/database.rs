@@ -6606,9 +6606,43 @@ impl Shared {
             }
             Bound::Type(change) => {
                 let Some(name) = change.name else { return Ok(QueryResult::empty()) };
-                let Some(ty) = change.ty else {
-                    catalog.drop_type(&name, change.cascade)?;
-                    return Ok(QueryResult::empty());
+                let ty = match (change.ty, change.labels) {
+                    (Some(ty), _) => ty,
+                    // The strings the query answers with, in the order it gives them, with the
+                    // nulls left out and a string that comes twice kept at its first place, which
+                    // is what the pin makes of `ENUM (SELECT ...)`.
+                    (None, Some(mut plan)) => {
+                        let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
+                        let facts = context.facts();
+                        let under =
+                            Under::new(self.budget(), facts, &seams, &session, Rows::ForATable)
+                                .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
+                        let answer = run(sql, &plan, &catalog, cancel, under)?;
+                        let mut labels: Vec<String> = Vec::new();
+                        let mut seen = BTreeSet::new();
+                        for row in answer.rows() {
+                            let Some(value) = row.into_iter().next() else { continue };
+                            if value.is_null() {
+                                continue;
+                            }
+                            let text = match rudb_kernels::cast::cast_value(
+                                &value,
+                                &LogicalType::Varchar,
+                                false,
+                            )? {
+                                Value::Varchar(text) => text,
+                                other => other.to_string(),
+                            };
+                            if seen.insert(text.clone()) {
+                                labels.push(text);
+                            }
+                        }
+                        LogicalType::Enum(labels.into())
+                    }
+                    (None, None) => {
+                        catalog.drop_type(&name, change.cascade)?;
+                        return Ok(QueryResult::empty());
+                    }
                 };
                 // The native file has nowhere to keep a type yet.
                 if holds_a_file(&self.inner, &catalog, &name.catalog) {
