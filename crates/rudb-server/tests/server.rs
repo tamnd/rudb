@@ -715,6 +715,31 @@ fn division_follows_the_rules_of_postgres() {
 }
 
 #[test]
+fn create_unlogged_and_a_serial_column() {
+    let dirs = Dirs::new("serial");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query("create unlogged table u (a int); insert into u values (1)");
+    assert_eq!(tags(&messages), "CCZ");
+    // A serial column is an integer with a sequence the table owns, and the file cannot keep a
+    // sequence yet, so the test makes a temporary table.
+    let messages = client.query("create temp table s (id serial, b text)");
+    assert_eq!(tags(&messages), "CZ");
+    client.query("insert into s (b) values ('x'), ('y')");
+    let messages = client.query("select id from s order by id");
+    assert_eq!(data_row(&messages[1]), [Some(b"1".to_vec())]);
+    assert_eq!(data_row(&messages[2]), [Some(b"2".to_vec())]);
+    let messages = client.query("select nextval('s_id_seq')");
+    assert_eq!(data_row(&messages[1]), [Some(b"3".to_vec())]);
+    let messages = client.query("insert into s (id) values (null)");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("23502"));
+    let messages = client.query("create temp table d (id serial default 4)");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("42601"));
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_transaction_rules_of_postgres() {
     let dirs = Dirs::new("implicit");
     let server = Server::start(dirs.config()).unwrap();

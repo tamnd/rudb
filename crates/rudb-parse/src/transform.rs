@@ -51,6 +51,14 @@ pub fn parse_ast_with_case(query: &str, identifier_case: IdentifierCase) -> Resu
     transform_with_case(query, &tokens, &tree, identifier_case)
 }
 
+/// Parse a script that a PostgreSQL session sent, see [`crate::dialect::postgres_tokens`].
+pub fn parse_ast_postgres(query: &str, identifier_case: IdentifierCase) -> Result<Ast> {
+    let mut tokens = tokenize(query)?;
+    crate::dialect::postgres_tokens(query, &mut tokens);
+    let tree = parse_tokens(query, &tokens, PROGRAM, true)?;
+    transform_with_case(query, &tokens, &tree, identifier_case)
+}
+
 /// Transform a parse tree that has already been produced.
 pub fn transform(query: &str, tokens: &[Token], tree: &Tree) -> Result<Ast> {
     transform_with_case(query, tokens, tree, IdentifierCase::Preserve)

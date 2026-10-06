@@ -3487,10 +3487,7 @@ impl NativeSink {
                 _ => vector.validity().has_nulls(vector.len()),
             };
             if null {
-                return Err(Error::constraint(format!(
-                    "NOT NULL constraint failed: {}.{}",
-                    self.table, field.name
-                )));
+                return Err(rudb_catalog::null_in(&self.table, &field.name));
             }
         }
         if !self.keys.is_empty() {
@@ -3967,8 +3964,7 @@ impl Shared {
             // The pin binds before it looks at the transaction, so a statement that would not bind
             // anyway says why rather than that the transaction is aborted.
             let session = self.session();
-            let case = session.semantics().identifier_case();
-            let ast = rudb_parse::parse_ast_with_case(sql, case)?;
+            let ast = parse(&session, sql)?;
             let bound = rudb_bind::bind_statement_with(
                 &ast,
                 &self.read(),
@@ -5197,8 +5193,7 @@ impl Shared {
         let seams = self.seams(sql)?;
         let context = self.optimizer(&catalog)?;
         let session = self.session();
-        let (ast, parse_ns) =
-            timed(|| rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case()))?;
+        let (ast, parse_ns) = timed(|| parse(&session, sql))?;
         let outlined = mirror && self.inner.settings.config().parquet_mirror();
         let (bound, bind_ns) = timed(|| {
             if outlined {
@@ -5599,9 +5594,7 @@ impl Shared {
                 return Ok(answer);
             }
             let session = self.session();
-            let (ast, parse_ns) = timed(|| {
-                rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case())
-            })?;
+            let (ast, parse_ns) = timed(|| parse(&session, sql))?;
             if let Some(answer) = self.prepared_statement(&ast, sql, cancel) {
                 return answer;
             }
@@ -5647,7 +5640,7 @@ impl Shared {
     /// for a parameter could not have changed those.
     fn prepare_named(&self, name: &str, text: &str) -> Result<QueryResult> {
         let session = self.session();
-        let ast = rudb_parse::parse_ast_with_case(text, session.semantics().identifier_case())?;
+        let ast = parse(&session, text)?;
         let names: Vec<String> = ast.parameters().into_iter().map(str::to_string).collect();
         let mut trial = Parameters::new();
         for parameter in &names {
@@ -6002,8 +5995,7 @@ impl Shared {
         if let Some(name) = &trigger.old_table {
             given.relate(name.clone(), rows(&caught.old));
         }
-        let case = self.session().semantics().identifier_case();
-        let body = rudb_parse::parse_ast_with_case(&trigger.fired, case)?;
+        let body = parse(&self.session(), &trigger.fired)?;
         self.execute_ast(&body, &trigger.fired, &given, cancel, 0)?;
         Ok(())
     }
@@ -6413,6 +6405,13 @@ impl Shared {
                 }
                 let name = create.name.clone();
                 let skipped = create.if_not_exists && catalog.entry(&name).is_ok();
+                // A serial column makes a sequence, and the file cannot keep one yet.
+                if !create.serials.is_empty() && holds_a_file(&self.inner, &catalog, &name.catalog)
+                {
+                    return Err(Error::not_implemented(
+                        "a serial column in a database file, which cannot hold a sequence so far",
+                    ));
+                }
                 self.creating(&name)?;
                 create_table(
                     sql,
@@ -7699,6 +7698,17 @@ fn optimized(plan: &mut Plan, context: &rudb_opt::pass::Context) -> Result<(u64,
 /// which was two reads of the thread CPU clock per phase and six per statement, and on Linux every
 /// one of those is a system call where the wall clock is a read out of the vDSO. The phases are
 /// single threaded, so the CPU reading said nothing the wall one did not.
+/// Parse a script in the dialect of the session. Every parse of a statement that a session runs
+/// comes through here, `08-the-dialect.md` section 8.1.
+pub(crate) fn parse(session: &Session, sql: &str) -> Result<Ast> {
+    let case = session.semantics().identifier_case();
+    if session.postgres().is_some() {
+        rudb_parse::parse_ast_postgres(sql, case)
+    } else {
+        rudb_parse::parse_ast_with_case(sql, case)
+    }
+}
+
 fn timed<T>(what: impl FnOnce() -> Result<T>) -> Result<(T, u64)> {
     let span = Span::wall();
     let out = what()?;
@@ -8302,7 +8312,14 @@ fn create_table(
     if create.or_replace && catalog.table(&create.name).is_ok() {
         catalog.drop_table(&create.name)?;
     }
+    for (sequence, options) in &create.serials {
+        let counter = rudb_common::sequence::Counter::register(&sequence.table, *options);
+        catalog.create_sequence(sequence.clone(), counter, false, false)?;
+    }
     catalog.create_table(create.name.clone(), create.columns)?;
+    for (sequence, _) in &create.serials {
+        catalog.own_sequence(sequence, create.name.clone())?;
+    }
     if !create.keys.is_empty() {
         catalog.table_mut(&create.name)?.set_keys(create.keys)?;
     }

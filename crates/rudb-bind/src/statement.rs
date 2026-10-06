@@ -18,7 +18,7 @@ use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
     Bound as ColumnBound, Clustering, DeclaredType, Error, Field, LogicalType, Result, Session,
-    Stat, Value, Width,
+    SqlState, Stat, Value, Width,
 };
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
@@ -222,6 +222,9 @@ pub struct CreateTable {
     pub types: Vec<Option<DeclaredType>>,
     /// The sequences the defaults use, which the table depends on.
     pub sequences: Vec<QualifiedName>,
+    /// The sequences that a `serial` column makes, which the table owns. Each is also in
+    /// `sequences`.
+    pub serials: Vec<(QualifiedName, rudb_common::sequence::Options)>,
     /// The SQL of each `CHECK`, in the order written.
     pub checks: Vec<String>,
     /// The foreign keys, in the order written.
@@ -1200,6 +1203,7 @@ fn create_table(
     };
     let defs = ast.column_defs(written.columns);
     let mut types = Vec::with_capacity(defs.len());
+    let mut serials = Vec::with_capacity(defs.len());
     let (mut columns, source) = if written.query == NONE {
         let mut columns = Vec::with_capacity(defs.len());
         for def in defs {
@@ -1210,13 +1214,18 @@ fn create_table(
                     ast.string(def.name)
                 )));
             }
-            let ty = session_type(catalog, session, text)?;
+            let serial = if session.postgres().is_some() { serial_type(text) } else { None };
+            serials.push(serial.is_some());
+            let ty = match serial.clone() {
+                Some(ty) => ty,
+                None => session_type(catalog, session, text)?,
+            };
             if ty == LogicalType::Type {
                 return Err(Error::invalid_input("A table cannot be created with a 'TYPE' column"));
             }
             types.push(pg_declared(text, &ty));
             let column = ast.string(def.name);
-            columns.push(if def.not_null {
+            columns.push(if def.not_null || serial.is_some() {
                 Field::required(column, ty)
             } else {
                 Field::new(column, ty)
@@ -1249,7 +1258,28 @@ fn create_table(
     duplicate_check(&columns)?;
     let mut defaults = Vec::with_capacity(defs.len());
     let mut sequences = Vec::new();
-    for def in defs {
+    let mut made = Vec::new();
+    for (at, def) in defs.iter().enumerate() {
+        if serials.get(at).copied().unwrap_or(false) {
+            let column = &columns[at];
+            if def.default != NONE {
+                return Err(Error::binder(format!(
+                    "multiple default values specified for column \"{}\" of table \"{}\"",
+                    column.name, name.table
+                ))
+                .state(SqlState::SYNTAX_ERROR));
+            }
+            let sequence = serial_sequence(catalog, &name, &column.name, &made);
+            let text = if sequence.schema.eq_ignore_ascii_case(&name.schema) {
+                sequence.table.clone()
+            } else {
+                format!("{}.{}", sequence.schema, sequence.table)
+            };
+            defaults.push(Some(format!("nextval('{}')", text.replace('\'', "''"))));
+            sequences.push(sequence.clone());
+            made.push((sequence, serial_options(&column.ty)));
+            continue;
+        }
         defaults.push(if def.default == NONE {
             None
         } else {
@@ -1310,6 +1340,7 @@ fn create_table(
         checks,
         foreign,
         sequences,
+        serials: made,
         order: ast.constraint_list(written.order).iter().map(|&held| constraint(held)).collect(),
         apart: ast
             .constraint_list(written.order)
@@ -1320,6 +1351,71 @@ fn create_table(
             })
             .collect(),
     }))
+}
+
+/// The integer type of a PostgreSQL `serial` column, or `None` for any other type.
+fn serial_type(text: &str) -> Option<LogicalType> {
+    Some(match text.trim().to_ascii_lowercase().as_str() {
+        "smallserial" | "serial2" => LogicalType::SmallInt,
+        "serial" | "serial4" => LogicalType::Integer,
+        "bigserial" | "serial8" => LogicalType::BigInt,
+        _ => return None,
+    })
+}
+
+/// The options of the sequence behind a `serial` column, which stops at the largest value of the
+/// column type, as `CREATE SEQUENCE ... AS` does.
+fn serial_options(ty: &LogicalType) -> rudb_common::sequence::Options {
+    let max = match ty {
+        LogicalType::SmallInt => i64::from(i16::MAX),
+        LogicalType::Integer => i64::from(i32::MAX),
+        _ => i64::MAX,
+    };
+    rudb_common::sequence::Options { increment: 1, min: 1, max, start: 1, cycle: false }
+}
+
+/// The name PostgreSQL gives the sequence of a `serial` column: `<table>_<column>_seq`, cut to the
+/// 63 bytes of a name, with a number after it when the name is taken.
+fn serial_sequence(
+    catalog: &Catalog,
+    table: &QualifiedName,
+    column: &str,
+    made: &[(QualifiedName, rudb_common::sequence::Options)],
+) -> QualifiedName {
+    const NAME: usize = 63;
+    let taken = |candidate: &str| {
+        let name = QualifiedName { table: candidate.to_string(), ..table.clone() };
+        catalog.entry(&name).is_ok()
+            || catalog.sequence(&name).is_ok()
+            || made.iter().any(|(held, _)| same_name(&held.table, candidate))
+    };
+    let mut pass = 0usize;
+    loop {
+        let label = if pass == 0 { "seq".to_string() } else { format!("seq{pass}") };
+        let (mut first, mut second) = (table.table.as_str(), column);
+        // The longer part loses a byte until both fit, the way `makeObjectName` cuts them.
+        while first.len() + second.len() + label.len() + 2 > NAME {
+            if first.len() >= second.len() {
+                first = cut(first, first.len() - 1);
+            } else {
+                second = cut(second, second.len() - 1);
+            }
+        }
+        let candidate = format!("{first}_{second}_{label}");
+        if !taken(&candidate) {
+            return QualifiedName { table: candidate, ..table.clone() };
+        }
+        pass += 1;
+    }
+}
+
+/// The longest start of `text` that is `most` bytes or less and ends on a character boundary.
+fn cut(text: &str, most: usize) -> &str {
+    let mut end = most.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// A constraint the parser kept the place of, as the catalog keeps it.
