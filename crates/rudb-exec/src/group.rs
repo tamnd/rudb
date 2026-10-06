@@ -4759,8 +4759,8 @@ impl<'a> Aggregate<'a> {
         {
             u32::try_from(seen.len()).map_err(|_| Error::internal("too many distinct sets"))?;
             match values {
-                Ints::Wide(values) => held.hold_rows(slots, (calls, at), *values, validity),
-                Ints::Narrow(values) => held.hold_rows(slots, (calls, at), *values, validity),
+                Ints::Wide(values) => held.hold_rows(slots, (calls, at), values, validity),
+                Ints::Narrow(values) => held.hold_rows(slots, (calls, at), values, validity),
             }
             if held.values.len() >= HELD_DISTINCT {
                 aside += held.give(seen, states)?;

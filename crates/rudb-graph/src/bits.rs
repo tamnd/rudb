@@ -502,7 +502,7 @@ pub(crate) fn nth_set(word: u64, nth: u32) -> u32 {
     // Each byte holds the ones of every byte up to and including it, at most 64, so the high bit
     // of each is clear and the subtraction below borrows across no byte.
     sums = ((sums + (sums >> 4)) & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(ONES);
-    let within = ((u64::from(nth) * ONES | HIGH) - sums) & HIGH;
+    let within = (((u64::from(nth) * ONES) | HIGH) - sums) & HIGH;
     // The bytes whose count is at most `nth` are the ones below the byte with the bit, and there
     // are at most seven of them, since the whole word has more.
     let place = within.count_ones() * 8;

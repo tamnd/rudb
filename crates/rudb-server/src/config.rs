@@ -43,7 +43,7 @@ pub struct Config {
     pub ssl_ca_file: PathBuf,
     /// `ssl_min_protocol_version`.
     pub ssl_min_protocol_version: TlsVersion,
-    /// `ssl_max_protocol_version`. [`TlsVersion::Any`] is no limit.
+    /// `ssl_max_protocol_version`. `TlsVersion::Any` is no limit.
     pub ssl_max_protocol_version: TlsVersion,
     /// `hba_file`, `pg_hba.conf` in the data directory when it is empty.
     pub hba_file: PathBuf,

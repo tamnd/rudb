@@ -245,10 +245,7 @@ impl Ordered {
             _ => return false,
         };
         let run = match self.0.last_mut().and_then(Arc::get_mut) {
-            Some(last) => match last.extend_after(run) {
-                Ok(()) => None,
-                Err(run) => Some(run),
-            },
+            Some(last) => last.extend_after(run).err(),
             None => Some(run),
         };
         if let Some(run) = run {

@@ -550,7 +550,7 @@ pub fn decode_flat_at(bytes: &[u8], positions: &[u32]) -> Result<Flat> {
 /// of the read: 1.4 million instructions to fetch eleven values, most of them in the lengths of
 /// runs the read never looked at. Kept, a value is one run decompressed.
 ///
-/// Where a run starts is kept as a mark every [`RUNS_PER_MARK`] runs and a byte for each run,
+/// Where a run starts is kept as a mark every `RUNS_PER_MARK` runs and a byte for each run,
 /// when every run is shorter than 256 bytes, and as a start for each run when one is not. A value
 /// costs at most that many bytes added up, and the index costs a little over a byte a value.
 #[derive(Debug)]
@@ -565,7 +565,7 @@ pub struct Runs {
 
 #[derive(Debug)]
 enum Starts {
-    /// Where every [`RUNS_PER_MARK`]th run starts in the payload, and every run's length.
+    /// Where every `RUNS_PER_MARK`th run starts in the payload, and every run's length.
     Marked { marks: Vec<u32>, lengths: Vec<u8> },
     /// Where every run starts in the payload, and where the last one ends.
     Whole(Vec<u32>),
@@ -669,7 +669,7 @@ impl Runs {
     pub fn footprint(&self) -> usize {
         // The symbols and the decode table, see [`SymbolTable`].
         const TABLE: usize = 256 * 16 + 256 * 9;
-        std::mem::size_of::<Self>()
+        size_of::<Self>()
             + TABLE
             + match &self.starts {
                 Starts::Marked { marks, lengths } => marks.len() * 4 + lengths.len(),

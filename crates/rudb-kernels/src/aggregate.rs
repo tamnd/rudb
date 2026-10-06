@@ -3071,7 +3071,7 @@ impl PlaceSums {
     }
 
     /// Whether a chunk of `rows` rows can go on adding into the cells the chunks before it left
-    /// in [`Self::by_place`], which it can while the calls, how they are fed and the stride are
+    /// in `by_place`, which it can while the calls, how they are fed and the stride are
     /// the same and no total can leave its `i64`. A base can move, since a packed run of q01's
     /// `l_extendedprice` has a base of its own every page, and the codes of the chunk are lifted by
     /// what it moved. Over fewer than 2^30 rows of codes under 2^32 lifted by less than 2^31 no
@@ -6828,14 +6828,17 @@ mod tests {
         let mut rng = Rng(0x5eed_0115_d40b);
         for rows in [1, 2, 7, 64, 300] {
             for every in [2, 3, 70, 1000] {
-                let kept: Vec<u32> = (0..rows as u32).filter(|_| rng.next() % every != 0).collect();
+                let kept: Vec<u32> =
+                    (0..rows as u32).filter(|_| !rng.next().is_multiple_of(every)).collect();
                 let mut found: Vec<u32> = (0..rows as u32).collect();
                 fill_dropped(&kept, &mut found, u32::MAX);
                 let mut walked: Vec<u32> = (0..rows as u32).collect();
                 if let (Some(&first), Some(&last)) = (kept.first(), kept.last()) {
-                    for row in first as usize..=last as usize {
+                    for (row, slot) in
+                        walked.iter_mut().enumerate().take(last as usize + 1).skip(first as usize)
+                    {
                         if kept.binary_search(&(row as u32)).is_err() {
-                            walked[row] = u32::MAX;
+                            *slot = u32::MAX;
                         }
                     }
                 }

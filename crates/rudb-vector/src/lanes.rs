@@ -594,7 +594,6 @@ const fn kept_first() -> [[u32; 8]; 256] {
         let (mut lane, mut kept) = (0, 0);
         while lane < 8 {
             if found >> lane & 1 == 1 {
-                #[expect(clippy::cast_possible_truncation, reason = "a lane under eight")]
                 {
                     table[found][kept] = lane as u32;
                 }
@@ -789,7 +788,7 @@ mod tests {
                 let lifts = [-i64::from(skip as u32), 1 << 40];
                 let done = add_pair_codes(&mut cells, sides, lifts, &places);
                 assert!(
-                    done % 8 == 0 && done <= past.unwrap_or(rows),
+                    done.is_multiple_of(8) && done <= past.unwrap_or(rows),
                     "{one} {two} {skip} {past:?}"
                 );
                 if past.is_none() {
@@ -1008,6 +1007,8 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn two_packed_sides_compare_as_their_codes_do() {
+        type Against = fn((&[u8], usize), (&[u8], usize), i32, &mut [u64], bool);
+        type Case = (Against, fn(i64, i64) -> bool);
         let blocks = 3;
         for (one, other) in [(1, 1), (5, 7), (12, 12), (12, 13), (25, 3), (25, 25)] {
             let (left, a) = packed_blocks(one, blocks, 1);
@@ -1023,17 +1024,14 @@ mod tests {
                         })
                         .collect()
                 };
-                let run = |f: fn((&[u8], usize), (&[u8], usize), i32, &mut [u64], bool)| {
+                let run = |f: Against| {
                     let mut words = vec![0_u64; blocks];
                     f((&left, one), (&right, other), shift, &mut words, true);
                     let mut narrowed = vec![u64::MAX, 0, 0x5555_5555_5555_5555];
                     f((&left, one), (&right, other), shift, &mut narrowed, false);
                     (words, narrowed)
                 };
-                let cases: [(
-                    fn((&[u8], usize), (&[u8], usize), i32, &mut [u64], bool),
-                    fn(i64, i64) -> bool,
-                ); 6] = [
+                let cases: [Case; 6] = [
                     (against_words::<true, false, false>, |x, y| x < y),
                     (against_words::<false, false, false>, |x, y| x > y),
                     (against_words::<false, false, true>, |x, y| x <= y),

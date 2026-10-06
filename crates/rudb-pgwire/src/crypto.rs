@@ -24,7 +24,7 @@ pub fn md5(parts: &[&[u8]]) -> [u8; 16] {
     let mut h: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
     for block in pad(parts, false).chunks(64) {
         let m: Vec<u32> =
-            block.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            block.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         let [mut a, mut b, mut c, mut d] = h;
         for i in 0..64 {
             let (f, g) = match i / 16 {

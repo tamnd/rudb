@@ -9314,10 +9314,9 @@ impl Reader {
             .and_then(|words| words.get(first..first + rows));
         if sketch.is_none()
             && let Some(Ok(slot)) = self.cache.made(column, part).map(Mutex::lock)
+            && slot.seen().is_none_or(|before| before >= rows)
         {
-            if slot.seen().is_none_or(|before| before >= rows) {
-                return Ok(None);
-            }
+            return Ok(None);
         }
         self.with_part(part, column, |bytes| {
             if bytes.first() != Some(&6) {
@@ -9424,10 +9423,10 @@ impl Reader {
         // this pays the rent of a whole read, see [`PartSlot`], and steps aside for the usual read
         // once the part is held or the next whole read would hold it. JOB 18a compared the codes of
         // `cast_info.note` on every warm run and spent half again what the held strings cost.
-        if let Some(Ok(slot)) = self.cache.made(column, part).map(Mutex::lock) {
-            if slot.seen().is_none_or(|before| before >= rows) {
-                return Ok(None);
-            }
+        if let Some(Ok(slot)) = self.cache.made(column, part).map(Mutex::lock)
+            && slot.seen().is_none_or(|before| before >= rows)
+        {
+            return Ok(None);
         }
         self.with_part(part, column, |bytes| {
             if bytes.first() != Some(&6) {
@@ -20052,7 +20051,7 @@ mod tests {
         let value = |row: usize| {
             if row / 1_000 < repeated {
                 Value::Varchar(format!("{row:09} a value that appears exactly once in the table"))
-            } else if row % 97 == 0 {
+            } else if row.is_multiple_of(97) {
                 Value::Null
             } else {
                 Value::Varchar(format!("one of five values, this is number {}", row % 5))
