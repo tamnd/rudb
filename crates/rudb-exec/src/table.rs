@@ -1176,43 +1176,42 @@ impl CodedColumn<'_> {
             }
             return;
         }
+        self.add_rows(0, into);
+    }
+
+    /// [`Self::add_into`] for a column with no null in it, for the rows from `from` on, one for
+    /// each place of `into`.
+    fn add_rows(&self, from: usize, into: &mut [u32]) {
+        let stride = self.stride as u32;
+        let lift = self.places.lift();
+        let rows = from..from + into.len();
         match self.places {
             Places::Codes { codes, .. } => {
-                for (row, place) in into.iter_mut().enumerate() {
-                    *place += codes[row] * stride;
+                for (place, &code) in into.iter_mut().zip(&codes[rows]) {
+                    *place += code * stride;
                 }
             }
-            // Sixty four codes at a time out of the words, since a code at a time works out its word,
-            // reads it through a bound and asks whether it straddles the next, which was twenty
-            // instructions a row on a key of `l_discount` and `l_tax`. The first block ends where the
-            // packed rows reach a whole word, so that every block after it unpacks as one.
-            Places::Bits { packed, .. } => {
-                let mut block = [0_u64; 64];
-                let lead = (64 - packed.offset() % 64) % 64;
-                let (first, rest) = into.split_at_mut(lead.min(into.len()));
-                let mut from = 0;
-                for places in std::iter::once(first).chain(rest.chunks_mut(64)) {
-                    let codes = &mut block[..places.len()];
-                    packed.unpack(from, codes);
-                    for (place, &code) in places.iter_mut().zip(codes.iter()) {
-                        *place += (code as u32 + lift) * stride;
-                    }
-                    from += places.len();
-                }
-            }
+            // Eight codes at a time out of the words and into the places, since a code at a time
+            // works out its word, reads it through a bound and asks whether it straddles the next,
+            // which was twenty instructions a row on a key of `l_discount` and `l_tax`.
+            Places::Bits { packed, .. } => packed.add_codes(from, into, lift, stride),
             Places::CodedBits { at, packed, .. } => {
-                for (row, place) in into.iter_mut().enumerate() {
-                    *place += (packed.code(at[row] as usize) as u32 + lift) * stride;
+                for (place, &row) in into.iter_mut().zip(&at[rows]) {
+                    *place += (packed.code(row as usize) as u32 + lift) * stride;
                 }
             }
             Places::Values { values, low, .. } => {
-                for (place, &value) in into.iter_mut().zip(values) {
+                for (place, &value) in into.iter_mut().zip(&values[rows]) {
                     *place += value.wrapping_sub(low) as u32 * stride;
                 }
             }
         }
     }
 }
+
+/// How many rows [`Coded::places`] works out at a time, every key column added into them before
+/// they are written out.
+const PLACE_ROWS: usize = 512;
 
 /// A chunk whose whole key is a few small codes, so a row's group is an index into a table.
 ///
@@ -1292,11 +1291,29 @@ impl<'a> Coded<'a> {
     /// `usize` each multiply by a column's stride was three multiplies and two shifts on AVX2, which
     /// has no 64 bit multiply, and q01's four key columns came to a sixth of the query. As a `u32` it
     /// is one multiply of eight lanes, and half the bytes go back to memory.
+    ///
+    /// A key with no null in it is worked out a block of [`PLACE_ROWS`] rows at a time, every column
+    /// added into a block that stays in the cache and the block then written out once. A pass over
+    /// all the places for each column was a read and a write of every place per column, and on q01,
+    /// with four key columns, that was most of what working out the places cost.
     pub(crate) fn places(&self, rows: usize, places: &mut Vec<u32>) {
         places.clear();
-        places.resize(rows, 0);
-        for column in self.columns.iter().flatten() {
-            column.add_into(places);
+        if self.columns.iter().flatten().any(|column| column.nullable) {
+            places.resize(rows, 0);
+            for column in self.columns.iter().flatten() {
+                column.add_into(places);
+            }
+            return;
+        }
+        places.reserve(rows);
+        let mut block = [0_u32; PLACE_ROWS];
+        for from in (0..rows).step_by(PLACE_ROWS) {
+            let block = &mut block[..PLACE_ROWS.min(rows - from)];
+            block.fill(0);
+            for column in self.columns.iter().flatten() {
+                column.add_rows(from, block);
+            }
+            places.extend_from_slice(block);
         }
     }
 

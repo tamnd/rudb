@@ -4348,6 +4348,35 @@ impl Packed<'_> {
         code_at(self.words, (self.offset + row) * self.width as usize, self.width)
     }
 
+    /// Adds `(code + lift) * stride` for the codes of rows `from` on into `into`, one for each of
+    /// its places, which is how a coded map works out the part of a row's place one packed key
+    /// column gives.
+    ///
+    /// The rows up to the first that starts a group of eight are read one at a time, and from there
+    /// eight at a time in lanes when the build has AVX2, straight into the places. On q01 the two
+    /// packed key columns were unpacked into a block of words first and then added, which was a
+    /// store and a load of eight bytes a code more than this.
+    pub fn add_codes(&self, from: usize, into: &mut [u32], lift: u32, stride: u32) {
+        let start = self.offset + from;
+        let width = self.width as usize;
+        let head = ((8 - start % 8) % 8).min(into.len());
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        let at = if (1..=crate::lanes::LANE_WIDTH_MAX).contains(&width) {
+            let bytes = crate::lanes::bytes_of(self.words);
+            let first = (start + head) * width / 8;
+            head + crate::lanes::add_codes((bytes, first, width), &mut into[head..], lift, stride)
+        } else {
+            head
+        };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        let at = head;
+        for row in (0..head).chain(at..into.len()) {
+            #[expect(clippy::cast_possible_truncation, reason = "a key column's codes fit its places")]
+            let code = code_at(self.words, (start + row) * width, self.width) as u32;
+            into[row] += (code + lift) * stride;
+        }
+    }
+
     /// Asks for the cache line that holds the start of `row`'s code, without waiting for it.
     ///
     /// A gather of rows far apart, which is what a join hands back, reads one word a row and each
