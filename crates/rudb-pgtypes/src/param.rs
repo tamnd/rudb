@@ -56,6 +56,7 @@ pub fn logical_type(oid: Oid) -> Option<LogicalType> {
         oid if RegKind::from_oid(oid).is_some() => LogicalType::UInteger,
         oids::FLOAT4 => LogicalType::Float,
         oids::FLOAT8 => LogicalType::Double,
+        oids::NUMERIC => LogicalType::Numeric,
         oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::NAME => LogicalType::Varchar,
         oids::BYTEA => LogicalType::Blob,
         oids::UUID => LogicalType::Uuid,
@@ -196,7 +197,7 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
         oids::NAME => Value::Varchar(name_in(text).to_owned()),
         oids::FLOAT4 => Value::Float(float4_in(text)?),
         oids::FLOAT8 => Value::Double(float8_in(text)?),
-        oids::NUMERIC => numeric(&numeric_in(text, -1)?),
+        oids::NUMERIC => Value::Numeric(numeric_in(text, -1)?.to_bytes()),
         oids::BYTEA => Value::Blob(bytea_in(text)?),
         oids::JSONB => Value::Varchar(jsonb_in(text)?),
         oids::UUID => Value::Uuid(uuid::from_bytes(uuid_in(text)?)),
@@ -253,7 +254,7 @@ fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
         oid if RegKind::from_oid(oid).is_some() => Value::UInteger(recv.u32()?),
         oids::FLOAT4 => Value::Float(recv.f32()?),
         oids::FLOAT8 => Value::Double(recv.f64()?),
-        oids::NUMERIC => numeric(&numeric_recv(recv, -1)?),
+        oids::NUMERIC => Value::Numeric(numeric_recv(recv, -1)?.to_bytes()),
         oids::BYTEA => Value::Blob(recv.rest().to_vec()),
         oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::NAME | oids::UNKNOWN | oids::JSON => {
             Value::Varchar(recv.text()?.to_owned())
@@ -419,13 +420,12 @@ mod tests {
             read(oids::TIMESTAMP, false, b"1970-01-01 00:00:01").unwrap(),
             Value::Timestamp(1_000_000)
         );
-        assert_eq!(
-            read(oids::NUMERIC, false, b"12.340").unwrap(),
-            Value::Decimal { unscaled: 12340, width: 38, scale: 3 }
-        );
-        assert!(
-            matches!(read(oids::NUMERIC, false, b"NaN").unwrap(), Value::Double(v) if v.is_nan())
-        );
+        // A `numeric` keeps its scale and all its digits.
+        for text in ["12.340", "NaN", "-Infinity", "123456789012345678901234567890123456789012.5"] {
+            let value = read(oids::NUMERIC, false, text.as_bytes()).unwrap();
+            assert_eq!(value.to_string(), text);
+            assert_eq!(value.logical_type(), LogicalType::Numeric);
+        }
         assert_eq!(read(0, false, b"abc").unwrap(), Value::Varchar("abc".into()));
         assert_eq!(
             read(oids::TEXT_ARRAY, false, br#"{a,"b c",NULL}"#).unwrap(),

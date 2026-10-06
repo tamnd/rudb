@@ -999,6 +999,42 @@ fn a_parameter_in_a_call_gets_the_type_of_postgres() {
 }
 
 #[test]
+fn a_numeric_parameter_keeps_its_type_and_all_its_digits() {
+    let dirs = Dirs::new("numeric_param");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // A driver such as psycopg sends a decimal as a `numeric` parameter. The statement must give
+    // the `numeric` column at Describe and at Execute, or the plan of the statement changes type.
+    let long = "123456789012345678901234567890123456789012.5";
+    for value in ["1.50", long, "NaN"] {
+        client.parse("", "select $1", &[1700]);
+        client.describe(Target::Statement, "");
+        client.bind("", "", &[], &[Some(value.as_bytes())]);
+        client.describe(Target::Portal, "");
+        client.execute("", 0);
+        let messages = client.sync();
+        assert_eq!(tags(&messages), "1tT2TDCZ", "{value}");
+        assert_eq!(parameter_types(&messages[1]), [1700]);
+        assert_eq!(row_shape(&messages[2])[0].1, 1700);
+        assert_eq!(row_shape(&messages[4])[0].1, 1700);
+        assert_eq!(data_row(&messages[5]), [Some(value.as_bytes().to_vec())]);
+    }
+    // An integer column meets a `numeric` parameter as a `numeric`, and an insert rounds it.
+    client.query("create table t (i int)");
+    client.parse("", "insert into t values ($1)", &[1700]);
+    client.bind("", "", &[], &[Some(b"1.5")]);
+    client.execute("", 0);
+    client.parse("", "select i, i + $1 from t where i = $2", &[1700, 1700]);
+    client.bind("", "", &[], &[Some(b"0.25"), Some(b"2.0")]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12C12DCZ");
+    assert_eq!(data_row(&messages[5]), [Some(b"2".to_vec()), Some(b"2.25".to_vec())]);
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_rows_before_an_error_go_before_the_error() {
     let dirs = Dirs::new("partial");
     let server = Server::start(dirs.config()).unwrap();
