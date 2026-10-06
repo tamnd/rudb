@@ -55,7 +55,7 @@ use rudb_common::stat::{Direction, Provenance};
 use rudb_common::{ColumnFacts, LogicalType, Stat, Value};
 use rudb_storage::Probe;
 
-use crate::Reader;
+use crate::{Bucket, Reader};
 
 /// The bounds of a committed native table, as the planner asks for them.
 ///
@@ -461,13 +461,15 @@ impl Frequencies for Common {
     }
 
     fn rows_passing(&self, column: usize, tests: &[(Op, Bound)]) -> Stat<u64> {
-        // Only a list that left nothing out. A prefix holds the leading values and a range takes
-        // the tail as well, which the prefix cannot count.
-        let Ok(Some((entries, 0))) = self.reader.held_prefix(column) else {
-            return Stat::Unknown;
-        };
-        match rudb_common::bounds::passing(entries.iter(), tests) {
-            Some(rows) => Stat::exact(rows, Provenance::FrequencySynopsis),
+        // A list that left nothing out first. A prefix holds the leading values and a range takes
+        // the tail as well, which the prefix cannot count, and the buckets can.
+        if let Ok(Some((entries, 0))) = self.reader.held_prefix(column)
+            && let Some(rows) = rudb_common::bounds::passing(entries.iter(), tests)
+        {
+            return Stat::exact(rows, Provenance::FrequencySynopsis);
+        }
+        match bucketed(self.reader.quantiles(column), tests) {
+            Some(rows) => Stat::estimated(rows, Provenance::Quantiles),
             None => Stat::Unknown,
         }
     }
@@ -543,4 +545,98 @@ fn fraction(tests: &[Test], zone: &rudb_storage::Zone) -> Spread {
         spread.read += kept.read;
     }
     spread
+}
+
+/// The rows of `buckets` whose value passes every one of `tests`.
+///
+/// A bucket wholly inside the range counts all its rows and one outside it none. Only the bucket at
+/// each end of the range is a guess, which takes its rows to be spread evenly over its span, and a
+/// test for one value inside a bucket takes that value's share of its distinct values. A heavy
+/// value is a bucket of its own, so the guess is over the light ones.
+///
+/// `None` with no buckets, and where a constant is not an integer, which is a column compared
+/// against another domain and no count of this one.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a share of a bucket is an estimate, and it is never more than the bucket"
+)]
+fn bucketed(buckets: &[Bucket], tests: &[(Op, Bound)]) -> Option<u64> {
+    if buckets.is_empty() {
+        return None;
+    }
+    let (mut low, mut high) = (i128::MIN, i128::MAX);
+    for (op, constant) in tests {
+        let Bound::Int(at) = *constant else { return None };
+        match op {
+            Op::Equal => (low, high) = (low.max(at), high.min(at)),
+            Op::Less => match at.checked_sub(1) {
+                Some(below) => high = high.min(below),
+                None => return Some(0),
+            },
+            Op::LessOrEqual => high = high.min(at),
+            Op::Greater => match at.checked_add(1) {
+                Some(above) => low = low.max(above),
+                None => return Some(0),
+            },
+            Op::GreaterOrEqual => low = low.max(at),
+        }
+    }
+    let mut rows = 0.0;
+    for bucket in buckets {
+        let (from, to) = (low.max(bucket.low), high.min(bucket.high));
+        if from > to {
+            continue;
+        }
+        let share = if from == bucket.low && to == bucket.high {
+            1.0
+        } else if from == to {
+            1.0 / bucket.values as f64
+        } else {
+            ((to - from) as f64 + 1.0) / ((bucket.high - bucket.low) as f64 + 1.0)
+        };
+        rows += bucket.rows as f64 * share;
+    }
+    Some(rows.round() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use rudb_common::bounds::{Bound, Op};
+
+    use super::bucketed;
+    use crate::Bucket;
+
+    /// Years in small: a light stretch of old years, three heavy recent ones on their own, and a
+    /// light stretch after them.
+    fn years() -> Vec<Bucket> {
+        vec![
+            Bucket { low: 1880, high: 1979, rows: 1_000, values: 100 },
+            Bucket { low: 2005, high: 2005, rows: 5_000, values: 1 },
+            Bucket { low: 2006, high: 2006, rows: 6_000, values: 1 },
+            Bucket { low: 2007, high: 2007, rows: 7_000, values: 1 },
+            Bucket { low: 2008, high: 2019, rows: 1_200, values: 12 },
+        ]
+    }
+
+    #[test]
+    fn a_range_over_whole_buckets_is_their_rows_and_an_end_bucket_is_its_share() {
+        let between = [(Op::GreaterOrEqual, Bound::Int(2005)), (Op::LessOrEqual, Bound::Int(2007))];
+        assert_eq!(bucketed(&years(), &between), Some(18_000));
+        // Past 2006 is the whole of 2007, and four of the twelve years of the last bucket are a
+        // third of its rows.
+        let after = [(Op::Greater, Bound::Int(2006)), (Op::Less, Bound::Int(2012))];
+        assert_eq!(bucketed(&years(), &after), Some(7_000 + 400));
+        assert_eq!(bucketed(&years(), &[(Op::Equal, Bound::Int(2006))]), Some(6_000));
+        assert_eq!(bucketed(&years(), &[(Op::Equal, Bound::Int(1900))]), Some(10));
+        assert_eq!(bucketed(&years(), &[(Op::Greater, Bound::Int(2019))]), Some(0));
+        assert_eq!(bucketed(&years(), &[(Op::Less, Bound::Int(i128::MIN))]), Some(0));
+    }
+
+    #[test]
+    fn a_constant_of_another_domain_or_no_buckets_is_no_count() {
+        assert_eq!(bucketed(&years(), &[(Op::Less, Bound::Real(2000.5))]), None);
+        assert_eq!(bucketed(&[], &[(Op::Less, Bound::Int(2000))]), None);
+    }
 }

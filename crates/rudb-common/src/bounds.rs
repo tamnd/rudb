@@ -734,6 +734,9 @@ pub trait Frequencies: std::fmt::Debug + Send + Sync {
     /// more than half, and in 6d that put the movies left after `title` at a quarter of what they
     /// were. A complete list has every value with its rows, so the answer is a sum and not a guess.
     ///
+    /// A store that cuts its lists down before it writes them can answer from buckets over the
+    /// values instead, as an estimate, which is what the native format does.
+    ///
     /// [`Stat::Unknown`] where the list left something out, where there is no list, and where a
     /// value in it does not compare against a constant. See [`passing`].
     fn rows_passing(&self, column: usize, tests: &[(Op, Bound)]) -> Stat<u64> {

@@ -732,12 +732,13 @@ fn kept(
             None => pending.push(conjunct),
         }
     }
-    let (listed, ranged) = listed(plan, input, &mut pending, reads);
+    let (listed, ranged, from) = listed(plan, input, &mut pending, reads);
     if ranged > 0 {
         fraction *= listed;
         counted += ranged;
         source = match source {
-            None | Some(Provenance::FrequencySynopsis) => Some(Provenance::FrequencySynopsis),
+            None => from,
+            Some(held) if Some(held) == from => Some(held),
             Some(_) => Some(Provenance::Propagation),
         };
     }
@@ -769,8 +770,8 @@ fn kept(
 }
 
 /// What fraction of a scan's rows the ranges among `pending` keep, counted out of a synopsis that
-/// lists every value of the column they are on, with how many conditions that answered. The ones
-/// it answered come out of `pending`.
+/// lists every value of the column they are on or out of its buckets, with how many conditions that
+/// answered and what answered them. The ones it answered come out of `pending`.
 ///
 /// Ahead of [`spread`], because a count of the rows that pass is a fact and an interpolation between
 /// the ends of each part is a guess, and on a column of years a bad one: see
@@ -782,17 +783,17 @@ fn listed(
     input: NodeRef,
     pending: &mut Vec<ExprRef>,
     reads: &mut Vec<Stat<u64>>,
-) -> (f64, usize) {
+) -> (f64, usize, Option<Provenance>) {
     let (Some(index), Some(fields)) = (bounds::scanned(plan, input), scanned_fields(plan, input))
     else {
-        return (1.0, 0);
+        return (1.0, 0, None);
     };
     let Some(frequencies) = plan.frequencies(index) else {
-        return (1.0, 0);
+        return (1.0, 0, None);
     };
     let rows = frequencies.rows();
     if rows == 0 {
-        return (1.0, 0);
+        return (1.0, 0, None);
     }
     let mut columns: Vec<(usize, Vec<(Op, Bound)>, Vec<ExprRef>)> = Vec::new();
     for &conjunct in pending.iter() {
@@ -815,6 +816,7 @@ fn listed(
     }
     let mut fraction = 1.0;
     let mut answered = 0;
+    let mut from = None;
     for (position, tests, conjuncts) in columns {
         let Some(column) = fields.get(position).and_then(|field| frequencies.column(&field.name))
         else {
@@ -828,8 +830,13 @@ fn listed(
         fraction *= share(held, rows);
         answered += conjuncts.len();
         pending.retain(|conjunct| !conjuncts.contains(conjunct));
+        from = match (from, stat.provenance()) {
+            (None, read) => read,
+            (Some(held), read) if read == Some(held) => Some(held),
+            _ => Some(Provenance::Propagation),
+        };
     }
-    (fraction, answered)
+    (fraction, answered, from)
 }
 
 /// What fraction of a scan's rows these conditions are expected to keep, interpolated between bounds.
