@@ -725,9 +725,8 @@ impl LogicalType {
             {
                 Some(Self::Numeric)
             }
-            (Self::Numeric, Self::Float | Self::Double) | (Self::Float | Self::Double, Self::Numeric) => {
-                Some(Self::Double)
-            }
+            (Self::Numeric, Self::Float | Self::Double)
+            | (Self::Float | Self::Double, Self::Numeric) => Some(Self::Double),
             _ if self.is_numeric() && other.is_numeric() => {
                 Some(promote_numeric(self.clone(), other.clone()))
             }

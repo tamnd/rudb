@@ -694,13 +694,13 @@ impl Pass {
     /// column is here rather than in the fast path because its values are not a slice of one width
     /// and its ends are byte comparisons, and `bytes_value` is already written to not allocate.
     fn scan_rows(&mut self, vector: &Vector) {
+        let own = vector.own_nulls();
         // row at a time: the run count and the order flags are a sequential dependency. Whether this
         // value is below the one before it is a question about a pair of adjacent rows, so there is
         // no shape of this loop that answers it a vector at a time, and the two typed accessors
         // below are loads against a slice rather than value construction. What the checker is
         // looking for is the third arm, which does build a `Value`, and that one runs for a float
         // column and for a form the first two cannot read and for nothing else.
-        let own = vector.own_nulls();
         for row in 0..vector.len() {
             self.rows += 1;
             if own.map_or_else(|| vector.is_null_at(row), |live| !live.at(row)) {
