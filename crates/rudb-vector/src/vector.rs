@@ -3762,6 +3762,18 @@ impl Vector {
                 .stable_gathered(codes, values, indices, inside, |index| index as usize)?
                 .loosened());
         }
+        // Any other dictionary with no nulls of its own, which is the selection a filter leaves on a
+        // column it did not copy, is its values gathered at the codes the positions name. The copy
+        // below took the same codes a position at a time through a run of wide positions and a walk
+        // down the chain, where a flat column under the dictionary has a gather of its own that is a
+        // load a row.
+        if let Body::Dictionary { codes, values, stable: false } = &self.body
+            && !self.validity.has_nulls(self.len)
+            && below(indices, codes.len())
+        {
+            let at: Vec<u32> = indices.iter().map(|&index| codes[index as usize]).collect();
+            return values.gather(&at);
+        }
         // A constant gathered is the same constant at the new length, as long as every position is
         // a row of it or the value is null anyway. A join's probe gathers every column of its driving
         // side, and a scan hands up a null constant for a column only its filter read.
@@ -8005,6 +8017,22 @@ mod tests {
         assert_eq!(gathered.form(), Form::Flat);
         assert_eq!(gathered.value_at(0), Value::Integer(8));
         assert_eq!(gathered.value_at(1), Value::Null);
+    }
+
+    /// A selection over a flat column is gathered as the column at the selected rows, flat, and a
+    /// position past the end still comes back null.
+    #[test]
+    fn gathering_a_selection_over_a_flat_column_gathers_the_column_at_its_codes() {
+        let rows: Vec<i32> = (0..40).map(|row| row * 5 - 3).collect();
+        let selection = Vector::dictionary(vec![39, 4, 4, 17, 0], integers(&rows)).unwrap();
+        let gathered = selection.gather(&[3, 0, 2, 4]).unwrap();
+        assert_eq!(gathered.form(), Form::Flat);
+        assert_eq!(
+            gathered.iter().collect::<Vec<_>>(),
+            [17, 39, 4, 0].map(|at: usize| Value::Integer(rows[at])).to_vec()
+        );
+        let past = selection.gather(&[1, 5]).unwrap();
+        assert_eq!(past.iter().collect::<Vec<_>>(), [Value::Integer(17), Value::Null]);
     }
 
     /// Two filters over one chunk build a dictionary over a dictionary, four conjuncts pushed down
