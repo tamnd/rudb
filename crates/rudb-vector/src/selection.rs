@@ -54,14 +54,27 @@ impl Selection {
     }
 
     /// A selection of the positions a predicate accepts.
+    ///
+    /// Written the way [`Selection::from_indices`] asks a kernel to be written: every position is
+    /// stored at the current length and only one that is kept moves the length on. A push for each
+    /// kept row was a capacity check, a conversion and a branch the predictor gets wrong whenever
+    /// the rows kept are mixed, which on q09 was 13 million instructions for a link join that
+    /// keeps every row it sees.
+    ///
+    /// # Panics
+    ///
+    /// If `len` does not fit in a `u32`, for the reason [`Selection::push`] gives.
     pub fn from_predicate(len: usize, keep: impl Fn(usize) -> bool) -> Self {
-        let mut selection = Self::with_capacity(len);
+        assert!(u32::try_from(len).is_ok(), "a position past four billion");
+        let mut indices = vec![0_u32; len];
+        let mut kept = 0;
         for index in 0..len {
-            if keep(index) {
-                selection.push(index);
-            }
+            // `kept` is never past `index`, so the store is always in bounds.
+            indices[kept] = index as u32;
+            kept += usize::from(keep(index));
         }
-        selection
+        indices.truncate(kept);
+        Self { indices }
     }
 
     /// Adds a position to the end.
