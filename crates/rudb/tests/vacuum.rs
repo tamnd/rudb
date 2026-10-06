@@ -123,3 +123,39 @@ fn a_vacuum_of_a_file_with_nothing_to_give_back_is_a_checkpoint() {
     drop(db);
     remove(&path);
 }
+
+#[test]
+fn a_table_written_again_at_every_checkpoint_reuses_the_space_its_old_copies_gave_back() {
+    let path = path("cycles");
+    let db = open(&path);
+    db.execute("CREATE TABLE a AS SELECT range AS id, hash(range) AS v FROM range(2000000)")
+        .expect("creates");
+    db.execute("CREATE TABLE b AS SELECT range AS id, hash(range) AS v FROM range(500000)")
+        .expect("creates");
+    db.execute("CHECKPOINT").expect("checkpoints");
+    let full = size(&path);
+    // Every row of `b` changes each round, so each checkpoint writes it again. The first copy
+    // after the old one goes on the end, and so does the second, since the runs the first gave
+    // back wait two generations. From the third on, each goes where an old copy was.
+    db.execute("UPDATE b SET v = v // 2").expect("updates");
+    db.execute("CHECKPOINT").expect("checkpoints");
+    let copy = size(&path) - full;
+    for round in 2..=8 {
+        db.execute("UPDATE b SET v = v // 2").expect("updates");
+        db.execute("CHECKPOINT").expect("checkpoints");
+        let now = size(&path);
+        assert!(
+            now <= full + copy * 5 / 2,
+            "round {round}: the file went from {full} to {now} bytes, a copy of b is {copy}"
+        );
+    }
+    let want = "SELECT count(*) FROM b WHERE v = hash(id) // 256";
+    assert_eq!(value(&db, want), Value::BigInt(500_000));
+    drop(db);
+
+    let db = open(&path);
+    assert_eq!(value(&db, want), Value::BigInt(500_000));
+    assert_eq!(value(&db, "SELECT count(*) FROM a WHERE v = hash(id)"), Value::BigInt(2_000_000));
+    drop(db);
+    remove(&path);
+}

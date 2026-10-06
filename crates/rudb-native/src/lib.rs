@@ -37,7 +37,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::mem::{size_of, size_of_val};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as Atomic,
@@ -63,6 +63,7 @@ use rudb_vector::{
 
 mod anchor;
 mod distinct;
+mod free;
 pub mod grams;
 pub mod graph;
 pub mod host;
@@ -1333,6 +1334,11 @@ pub struct Table {
     /// The keys and foreign keys the table was created with, which the file keeps so that a
     /// reopened table refuses the rows it refused before.
     constraints: Constraints,
+    /// Every run of the file the writer placed for this table, its directory aside, joined where
+    /// they touch, see [`free::OWNED`]. What is given back when the table is written again.
+    ///
+    /// Empty for a table from a file older than the block, which then gives nothing back.
+    owned: Vec<(u64, u64)>,
 }
 
 /// A table's keys and the rest of what it was declared with, as the file stores them.
@@ -1762,12 +1768,9 @@ fn total_rows(places: &[Place]) -> u64 {
 /// Writes `gone` down for the table of `entry` and points the entry at it, or points it at nothing
 /// when no row is gone. The counts the catalog keeps for the table stop being right about it, so
 /// they go.
-fn mark_gone(
-    file: &dyn rudb_io::File,
-    at: &mut u64,
-    entry: &mut Entry,
-    gone: &GoneRows,
-) -> Result<()> {
+fn mark_gone(sink: &mut dyn Sink, entry: &mut Entry, gone: &GoneRows) -> Result<()> {
+    // The record this one replaces and the pages it names are read by no generation from this one.
+    sink.give_gone(entry);
     entry.patched = gone.is_patched();
     entry.gone = if gone.total == 0 && !entry.patched {
         None
@@ -1786,7 +1789,7 @@ fn mark_gone(
                     return Err(invalid("patched rows differ from the rows they replace"));
                 }
                 let bytes = encode(column, &mut Settling::default())?;
-                let offset = append(file, at, &bytes)?;
+                let offset = sink.put(&bytes)?;
                 named.push(Page {
                     offset,
                     length: u32::try_from(bytes.len())
@@ -1797,7 +1800,7 @@ fn mark_gone(
             pages.push(named);
         }
         let bytes = gone.encode_naming(entry.patched.then_some(&pages[..]))?;
-        let offset = append(file, at, &bytes)?;
+        let offset = sink.put(&bytes)?;
         Some(Page {
             offset,
             length: u32::try_from(bytes.len()).map_err(|_| invalid("gone rows too long"))?,
@@ -2540,14 +2543,20 @@ pub struct Writer {
     /// The file, through `rudb-io` rather than `std::fs`, so that a test can hand the writer a
     /// simulated filesystem and crash a load at every call it makes.
     file: Box<dyn rudb_io::File>,
-    /// Where the next write goes, counted here rather than asked of the file.
+    /// Where the next write goes, counted here rather than asked of the file: into a run an
+    /// earlier commit gave back, or onto the end. See [`free`].
     ///
     /// The file's own cursor is not ours. Building the numeric frequencies reads pages back through
     /// [`read_at`], and a positional read is only positional about where it reads from: `pread`
     /// leaves the cursor alone, and the call Windows has for it moves the cursor to the end of what
     /// it read. A writer that asked the file where it was would then write the directory over a
     /// page it had already written, which is what it did.
-    at: u64,
+    space: free::Space,
+    /// How many bytes this writer has written, wherever they went, for the load profile.
+    wrote: u64,
+    /// The runs placed for the table the writer is on, which its directory lists, see
+    /// [`Table::owned`].
+    owned: Vec<(u64, u64)>,
     /// How far into the file the kernel has been asked to start writing, see [`WRITEBACK_STRETCH`].
     written_back: u64,
     /// Whether parts are checked with [`part_checksum`], which is every file but one opened to
@@ -2791,9 +2800,10 @@ impl Writer {
     /// Opens a committed file and starts a table in the generation after the one it holds.
     ///
     /// The tables already in the file are carried forward by name and by directory pointer, and
-    /// their pages are not read. Nothing in the file is overwritten: the new table's pages and the
-    /// new catalog go on the end, past the catalog the committed generation points at, and the one
-    /// write that is not an append is the slot in the header that [`Writer::finish`] does last.
+    /// their pages are not read. Nothing a committed generation still reads is overwritten: the new
+    /// table's pages go into runs the free list says no reader can reach, or on the end, the new
+    /// catalog always goes on the end, and the one write into the committed file's own bytes is the
+    /// slot in the header that [`Writer::finish`] does last.
     ///
     /// That slot is the other one. A file committed at generation 1 is named by the slot at 16 and
     /// generation 2 writes the one at 44, so until the last four bytes of the commit land the file
@@ -2860,9 +2870,10 @@ impl Writer {
     /// generations before this one and by nothing after it.
     ///
     /// This is a checkpoint of a table that rows were deleted from or changed in costing that
-    /// table, and not every other table in the file as well. The space the old stripes held is
-    /// only given back by a rewrite of the whole file, which the caller weighs against how much of
-    /// the file is still live.
+    /// table, and not every other table in the file as well. The runs the old stripes held go on
+    /// the free list, and a commit two generations on writes into them once no reader of the old
+    /// table is left, see [`free`]. A table from a file older than that list gives back nothing,
+    /// and only a rewrite of the whole file gets its space back.
     ///
     /// # Errors
     ///
@@ -2888,11 +2899,21 @@ impl Writer {
         let file = fs.open(path, OpenMode::ReadWrite)?;
         let size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
-        let (mut closed, views, card, anchor) = decode_catalog(&bytes, size)?;
+        let (mut closed, views, card, anchor, free) = decode_catalog(&bytes, size)?;
         let card = card_for(path, card);
         let mut version = [0; 4];
         read_at(&*file, 8, &mut version)?;
         let wide = u32::from_le_bytes(version) >= 31;
+        // The generation of the slot whose bytes checksummed, and not the highest number in the
+        // header. A slot torn across a write can hold any number at all, and taking that one would
+        // be choosing which slot to overwrite from a value nothing has vouched for, which is how a
+        // half written commit gets to destroy the one good copy beside it.
+        let generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("native file generation overflow"))?;
+        let mut space = free::Space::new(path, size, free, generation);
+        space.give(slot.offset, u64::from(slot.length), 0);
         // A table already in the file under this name is only in the way if it holds rows. One that
         // holds none has no pages for this generation to carry and no reader that could lose
         // anything, so the table being started here takes its place in the catalog rather than
@@ -2909,23 +2930,19 @@ impl Writer {
                 return Err(invalid("two tables in one native file have the same name"));
             }
             let entry = closed.remove(at);
+            give_entry(&*file, &mut space, &entry, taking == Same::Extend, size);
             held = (taking == Same::Extend).then_some(entry);
         }
         let owed = held.iter().filter(|entry| entry.gone.is_some()).map(|entry| entry.name.clone());
         let owed = owed.collect();
-        // The generation of the slot whose bytes checksummed, and not the highest number in the
-        // header. A slot torn across a write can hold any number at all, and taking that one would
-        // be choosing which slot to overwrite from a value nothing has vouched for, which is how a
-        // half written commit gets to destroy the one good copy beside it.
-        let generation = slot
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| invalid("native file generation overflow"))?;
         let mut writer = Self {
             file,
-            // The end of the file, so that the committed generation's catalog stays where its slot
-            // says it is and keeps naming a file a reader can still open.
-            at: size,
+            // What is not written into a run given back goes on the end of the file, so that the
+            // committed generation's catalog stays where its slot says it is and keeps naming a
+            // file a reader can still open.
+            space,
+            wrote: 0,
+            owned: Vec::new(),
             written_back: size,
             wide,
             dictionaries: fields
@@ -2955,6 +2972,7 @@ impl Writer {
                 constraints: Constraints::default(),
                 generation,
                 sections: Vec::new(),
+                owned: Vec::new(),
             },
             generation,
             order: Vec::new(),
@@ -3013,7 +3031,9 @@ impl Writer {
         file.write_at(0, &header)?;
         Ok(Self {
             file,
-            at: HEADER,
+            space: free::Space::fresh(HEADER),
+            wrote: 0,
+            owned: Vec::new(),
             written_back: HEADER,
             wide: true,
             dictionaries: fields
@@ -3043,6 +3063,7 @@ impl Writer {
                 constraints: Constraints::default(),
                 generation: 1,
                 sections: Vec::new(),
+                owned: Vec::new(),
             },
             generation: 1,
             order: Vec::new(),
@@ -3092,7 +3113,8 @@ impl Writer {
         header[..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&FORMAT.to_le_bytes());
         file.write_at(0, &header)?;
-        let catalog = encode_catalog(&[], views, card_for(path.as_ref(), None).as_ref(), anchor)?;
+        let catalog =
+            encode_catalog(&[], views, card_for(path.as_ref(), None).as_ref(), anchor, &[])?;
         file.write_at(HEADER, &catalog)?;
         // The same two syncs in the same order as [`Writer::finish`], and for the same reason. The
         // catalog is on the disk before the slot names it, so a file this is interrupted in the
@@ -3160,17 +3182,33 @@ impl Writer {
                 return Err(invalid("two tables in one native file have the same name"));
             }
             let entry = self.closed.remove(at);
+            let size = self.space.end();
+            give_entry(&*self.file, &mut self.space, &entry, taking == Same::Extend, size);
             held = (taking == Same::Extend).then_some(entry);
         }
-        let Self { file, at, wide, generation, mut closed, views, card, anchor, mut owed, .. } =
-            self;
+        let Self {
+            file,
+            space,
+            wrote,
+            written_back,
+            wide,
+            generation,
+            mut closed,
+            views,
+            card,
+            anchor,
+            mut owed,
+            ..
+        } = self;
         owed.extend(held.iter().filter(|entry| entry.gone.is_some()).map(|e| e.name.clone()));
         closed.push(entry);
         let mut writer = Self {
             file,
-            written_back: at,
+            written_back,
             wide,
-            at,
+            space,
+            wrote,
+            owned: Vec::new(),
             generation,
             closed,
             views,
@@ -3206,6 +3244,7 @@ impl Writer {
                 constraints: Constraints::default(),
                 generation,
                 sections: Vec::new(),
+                owned: Vec::new(),
             },
             order: Vec::new(),
             next_order: 0,
@@ -3213,7 +3252,7 @@ impl Writer {
             pending: Vec::with_capacity(STRIPE_PARTS),
         };
         if let Some(entry) = held.filter(|entry| entry.rows > 0) {
-            let bound = writer.at;
+            let bound = writer.space.end();
             writer.seed(&entry, bound)?;
         }
         Ok(writer)
@@ -3273,6 +3312,8 @@ impl Writer {
         self.table.rows = held.rows;
         self.table.clustering = held.clustering;
         self.table.constraints = held.constraints;
+        // What the old stripes own is the table's still, along with whatever goes on after them.
+        self.owned = held.owned;
         Ok(())
     }
 
@@ -3379,21 +3420,39 @@ impl Writer {
         Ok(self)
     }
 
-    /// Appends bytes at the end of the file and moves the writer's own offset past them.
+    /// Writes bytes where [`Writer::place`] puts them and answers where that is.
     ///
-    /// Every write in here goes through this, so that [`Writer::at`] is the only answer to where
-    /// anything is and the file's cursor is never consulted for it.
-    fn put(&mut self, bytes: &[u8]) -> Result<()> {
-        self.file.write_at(self.at, bytes)?;
-        self.at = self
-            .at
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| invalid("native file length overflow"))?;
-        if self.at - self.written_back >= WRITEBACK_STRETCH {
-            self.file.start_writeback(self.written_back, self.at - self.written_back);
-            self.written_back = self.at;
+    /// Every write in here goes through this or through `place`, so that [`Writer::space`] is the
+    /// only answer to where anything is and the file's cursor is never consulted for it.
+    fn put(&mut self, bytes: &[u8]) -> Result<u64> {
+        let offset = self.place(bytes.len() as u64)?;
+        self.file.write_at(offset, bytes)?;
+        self.written();
+        Ok(offset)
+    }
+
+    /// Finds a place for `length` bytes the caller writes next, in one piece, and counts it as the
+    /// table's, see [`Table::owned`].
+    fn place(&mut self, length: u64) -> Result<u64> {
+        let (offset, _) = self.space.take(length)?;
+        self.wrote += length;
+        if length > 0 {
+            match self.owned.last_mut() {
+                Some((at, held)) if *at + *held == offset => *held += length,
+                _ => self.owned.push((offset, length)),
+            }
         }
-        Ok(())
+        Ok(offset)
+    }
+
+    /// Asks the kernel to start writing the end of the file once enough has gone onto it. A write
+    /// into a run given back is left to the kernel, since it is not where a load's bytes pile up.
+    fn written(&mut self) {
+        let end = self.space.end();
+        if end - self.written_back >= WRITEBACK_STRETCH {
+            self.file.start_writeback(self.written_back, end - self.written_back);
+            self.written_back = end;
+        }
     }
 
     /// Writes one chunk as independently readable column pages.
@@ -3547,8 +3606,7 @@ impl Writer {
         let mut dictionaries = std::mem::take(&mut self.dictionaries);
         let placed = dictionaries.iter_mut().flatten().try_for_each(|dictionary| {
             for block in std::mem::take(&mut dictionary.blocks) {
-                let start = self.at;
-                self.put(&block)?;
+                let start = self.put(&block)?;
                 dictionary.placed.push(Placed {
                     start,
                     length: block.len() as u64,
@@ -3571,8 +3629,7 @@ impl Writer {
             let Ok(mut held) = column.try_lock() else { continue };
             let Some(dictionary) = held.dictionary.as_mut() else { continue };
             for block in std::mem::take(&mut dictionary.blocks) {
-                let start = self.at;
-                self.put(&block)?;
+                let start = self.put(&block)?;
                 dictionary.placed.push(Placed {
                     start,
                     length: block.len() as u64,
@@ -3627,24 +3684,31 @@ impl Writer {
         // Before a byte of the stripe is written, so that the blocks the stripe's pages were built
         // with, and any that were waiting on them, are let go of now rather than a stripe later.
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
-        let before = self.at;
+        let before = self.wrote;
         self.place_blocks()?;
         drop(timing);
         if let Some(profile) = &profile {
-            profile.moved(Stage::Dictionary, 0, self.at - before, 0);
+            profile.moved(Stage::Dictionary, 0, self.wrote - before, 0);
         }
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Write));
-        let before = self.at;
+        let before = self.wrote;
         let mut pages = Vec::with_capacity(width);
         let mut memberships = vec![None; width];
         let mut ranges = Vec::with_capacity(width);
         let mut index = Vec::with_capacity(width.saturating_mul(index_section(parts)?));
         // Every page of the stripe goes to the file in one call after the loop, since they sit
-        // back to back from where the stripe starts and a page is often a few kilobytes.
-        let start = self.at;
+        // back to back from where the stripe starts and a page is often a few kilobytes. So the
+        // place is found for all of them at once, before the loop counts through it.
+        let total = encoded
+            .iter()
+            .flat_map(|stripe| &stripe.pages)
+            .try_fold(0_u64, |total, page| total.checked_add(page.len() as u64))
+            .ok_or_else(|| invalid("native file length overflow"))?;
+        let start = self.place(total)?;
+        let mut at = start;
         let mut out = Vec::with_capacity(width.saturating_mul(parts));
         for stripe in &encoded {
-            let offset = self.at;
+            let offset = at;
             let section = index.len();
             let mut length = 0_usize;
             if stripe.sums.len() != stripe.pages.len() {
@@ -3674,10 +3738,7 @@ impl Writer {
             if length > MAX_PAGE {
                 return Err(invalid("column page exceeds the configured bound"));
             }
-            self.at = self
-                .at
-                .checked_add(length as u64)
-                .ok_or_else(|| invalid("native file length overflow"))?;
+            at += length as u64;
             pages.push(Span {
                 offset,
                 length: u32::try_from(length).map_err(|_| invalid("page length overflow"))?,
@@ -3685,6 +3746,7 @@ impl Writer {
             ranges.push(merged_range(stripe.ranges.iter().cloned()));
         }
         self.file.write_parts_at(start, &out)?;
+        self.written();
         drop(out);
         for (membership, stripe) in memberships.iter_mut().zip(&encoded) {
             if stripe.codes.iter().all(Option::is_none) {
@@ -3696,8 +3758,7 @@ impl Writer {
                 .map(|codes| codes.clone().unwrap_or_default())
                 .collect::<Vec<_>>();
             let bytes = encode_membership(&merged_codes(lists));
-            let offset = self.at;
-            self.put(&bytes)?;
+            let offset = self.put(&bytes)?;
             *membership = Some(Page {
                 offset,
                 length: u32::try_from(bytes.len())
@@ -3711,8 +3772,7 @@ impl Writer {
                 continue;
             }
             let bytes = encode_sieves(stripe.sieves.iter())?;
-            let offset = self.at;
-            self.put(&bytes)?;
+            let offset = self.put(&bytes)?;
             *page = Some(Page {
                 offset,
                 length: u32::try_from(bytes.len())
@@ -3732,8 +3792,7 @@ impl Writer {
                 if bytes.len() >= span.length as usize {
                     continue;
                 }
-                let offset = self.at;
-                self.put(&bytes)?;
+                let offset = self.put(&bytes)?;
                 *page = Some(Page {
                     offset,
                     length: u32::try_from(bytes.len())
@@ -3742,8 +3801,7 @@ impl Writer {
                 });
             }
         }
-        let offset = self.at;
-        self.put(&index)?;
+        let offset = self.put(&index)?;
         let index = Span {
             offset,
             length: u32::try_from(index.len())
@@ -3770,7 +3828,7 @@ impl Writer {
         });
         drop(timing);
         if let Some(profile) = &profile {
-            profile.moved(Stage::Write, 0, self.at - before, rows as u64);
+            profile.moved(Stage::Write, 0, self.wrote - before, rows as u64);
         }
         Ok(())
     }
@@ -4393,7 +4451,7 @@ impl Writer {
         // this costs, and the rest as publish.
         let profile = self.profile.clone();
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
-        let before = self.at;
+        let before = self.wrote;
         let mut stripes = std::mem::take(&mut self.order)
             .into_iter()
             .zip(std::mem::take(&mut self.table.stripes))
@@ -4409,7 +4467,7 @@ impl Writer {
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
         drop(timing);
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
-        let placing = self.at;
+        let placing = self.wrote;
         finish_dictionaries(&mut self.dictionaries)?;
         self.place_blocks()?;
         for dictionary in self.dictionaries.iter_mut().flatten() {
@@ -4459,10 +4517,6 @@ impl Writer {
             if hosts.is_some() {
                 self.table.host_groups = hosts;
             }
-            let offset = self.at;
-            self.put(&encoded.index)?;
-            self.put(&encoded.ranks)?;
-            self.put(&encoded.grams)?;
             self.table.dictionary_payloads[index] = payload;
             let length = encoded
                 .index
@@ -4470,6 +4524,11 @@ impl Writer {
                 .checked_add(encoded.ranks.len())
                 .and_then(|len| len.checked_add(encoded.grams.len()))
                 .ok_or_else(|| invalid("dictionary page length overflow"))?;
+            // One page in three writes, so its three parts go in one place.
+            let offset = self.place(length as u64)?;
+            let parts = [&encoded.index[..], &encoded.ranks[..], &encoded.grams[..]];
+            self.file.write_parts_at(offset, &parts)?;
+            self.written();
             self.table.dictionaries[index] = Some(Page {
                 offset,
                 length: u32::try_from(length)
@@ -4485,18 +4544,22 @@ impl Writer {
         }
         drop(timing);
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
-        let placed = self.at - placing;
+        let placed = self.wrote - placing;
         self.write_stats()?;
+        // Everything the table owns is placed by now, and the directory is not one of them: it
+        // is given back on its own, by whatever commit stops naming it.
+        let mut owned = std::mem::take(&mut self.owned);
+        free::coalesce(&mut owned);
+        self.table.owned = owned;
         let directory = encode_directory(&self.table)?;
         if directory.len() > MAX_DIRECTORY {
             return Err(invalid("directory exceeds the configured bound"));
         }
-        let offset = self.at;
-        self.put(&directory)?;
+        let offset = self.put(&directory)?;
         drop(timing);
         if let Some(profile) = &profile {
             profile.moved(Stage::Dictionary, 0, placed, 0);
-            profile.moved(Stage::Publish, 0, self.at - before - placed, 0);
+            profile.moved(Stage::Publish, 0, self.wrote - before - placed, 0);
         }
         Ok(Entry {
             name: self.table.name.clone(),
@@ -4731,12 +4794,12 @@ impl Writer {
             ];
             let wanted = 1 + usize::from(sketched);
             for (kind, bytes, header_bytes) in sections.into_iter().take(wanted) {
+                let (generation, wide) = (self.generation, self.wide);
                 let written = write_section(
-                    &*self.file,
-                    &mut self.at,
+                    self,
                     &section::Attachment { kind, id, flags: 0, header_bytes, bytes },
-                    self.generation,
-                    self.wide,
+                    generation,
+                    wide,
                 )?;
                 self.table.sections.push(written);
             }
@@ -4768,7 +4831,7 @@ impl Writer {
             let held = tables.iter_mut().find(|held| held.name == name).ok_or_else(|| {
                 invalid(&format!("rows gone from {name}, which this generation does not carry"))
             })?;
-            mark_gone(&*self.file, &mut self.at, held, &gone)?;
+            mark_gone(&mut self, held, &gone)?;
             self.owed.retain(|owed| *owed != name);
         }
         if let Some(name) = self.owed.first() {
@@ -4776,13 +4839,19 @@ impl Writer {
                 "table {name} had rows gone from it and is extended without saying which"
             )));
         }
-        let catalog =
-            encode_catalog(&tables, &self.views, self.card.as_ref(), self.anchor.as_ref())?;
+        let catalog = encode_catalog(
+            &tables,
+            &self.views,
+            self.card.as_ref(),
+            self.anchor.as_ref(),
+            &self.space.list(),
+        )?;
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
-        let offset = self.at;
-        self.put(&catalog)?;
+        // On the end and not into a run, since it is the catalog that lists the runs.
+        let offset = self.space.append(catalog.len() as u64)?;
+        self.file.write_at(offset, &catalog)?;
         if let Some(profile) = &profile {
             profile.moved(Stage::Publish, 0, catalog.len() as u64, 0);
         }
@@ -4796,8 +4865,8 @@ impl Writer {
             generation: self.generation,
             hash: checksum(&catalog),
         };
-        // The one write that is not an append, and the last one. It goes back over the slot in the
-        // header, so it names its offset rather than going through `put`, and `at` does not move.
+        // The last write. It goes back over the slot in the header, so it names its offset rather
+        // than going through `put`, and the space does not move.
         // Which of the two slots it is alternates with the generation, so the one naming the
         // generation before this is still intact and still valid until this write lands.
         self.file.write_at(slot_offset(self.generation), &slot.bytes())?;
@@ -4844,41 +4913,27 @@ impl Writer {
         anchor: Option<&LogAnchor>,
         marks: &[(String, GoneRows)],
     ) -> Result<()> {
-        let file = RealFilesystem::new().open(path.as_ref(), OpenMode::ReadWrite)?;
-        let mut size = file.len()?;
+        let path = path.as_ref();
+        let file = RealFilesystem::new().open(path, OpenMode::ReadWrite)?;
+        let size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
-        let (mut closed, _, card, held) = decode_catalog(&bytes, size)?;
+        let (mut closed, _, card, held, free) = decode_catalog(&bytes, size)?;
+        let mut out = Out::new(path, &*file, size, slot, free)?;
         for (name, gone) in marks {
             let held = closed.iter_mut().find(|held| held.name == *name).ok_or_else(|| {
                 invalid(&format!("rows gone from {name}, which the file does not hold"))
             })?;
-            mark_gone(&*file, &mut size, held, gone)?;
+            mark_gone(&mut out, held, gone)?;
         }
         let anchor = anchor.cloned().or(held);
-        let generation = slot
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| invalid("native file generation overflow"))?;
         let catalog = encode_catalog(
             &closed,
             views,
-            card_for(path.as_ref(), card).as_ref(),
+            card_for(path, card).as_ref(),
             anchor.as_ref(),
+            &out.space.list(),
         )?;
-        if catalog.len() > MAX_DIRECTORY {
-            return Err(invalid("catalog exceeds the configured bound"));
-        }
-        file.write_at(size, &catalog)?;
-        file.sync()?;
-        let slot = Slot {
-            offset: size,
-            length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
-            generation,
-            hash: checksum(&catalog),
-        };
-        file.write_at(slot_offset(generation), &slot.bytes())?;
-        file.sync()?;
-        Ok(())
+        out.publish(slot, &catalog)
     }
 
     /// Commits a generation that writes down the device card this process has for the device the
@@ -4894,7 +4949,7 @@ impl Writer {
     pub fn keep_device_card(path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let (_, size, _, bytes, _) = slot_bytes(path)?;
-        let (_, views, held, _) = decode_catalog(&bytes, size)?;
+        let (_, views, held, ..) = decode_catalog(&bytes, size)?;
         if card_for(path, held.clone()) == held {
             return Ok(());
         }
@@ -4906,7 +4961,7 @@ impl Writer {
     pub fn certify_summaries(path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let (_, size, slot, bytes, _) = slot_bytes(path)?;
-        let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
+        let (mut entries, views, card, anchor, free) = decode_catalog(&bytes, size)?;
         let native = Catalog::open(path)?;
         // A table with rows gone from it is left without them, because its stripes still hold
         // those rows and a count taken off the stripes would count them.
@@ -4920,27 +4975,16 @@ impl Writer {
             entry.extremes = reader_integer_extremes(&reader)?;
             entry.frequencies = reader_complete_numeric_frequencies(&reader)?;
         }
-        let generation = slot
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| invalid("native file generation overflow"))?;
-        let catalog =
-            encode_catalog(&entries, &views, card_for(path, card).as_ref(), anchor.as_ref())?;
-        if catalog.len() > MAX_DIRECTORY {
-            return Err(invalid("catalog exceeds the configured bound"));
-        }
         let file = RealFilesystem::new().open(path, OpenMode::ReadWrite)?;
-        file.write_at(size, &catalog)?;
-        file.sync()?;
-        let slot = Slot {
-            offset: size,
-            length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
-            generation,
-            hash: checksum(&catalog),
-        };
-        file.write_at(slot_offset(generation), &slot.bytes())?;
-        file.sync()?;
-        Ok(())
+        let out = Out::new(path, &*file, size, slot, free)?;
+        let catalog = encode_catalog(
+            &entries,
+            &views,
+            card_for(path, card).as_ref(),
+            anchor.as_ref(),
+            &out.space.list(),
+        )?;
+        out.publish(slot, &catalog)
     }
 
     /// The earlier name for [`Self::certify_summaries`].
@@ -4949,17 +4993,155 @@ impl Writer {
     }
 }
 
-/// Appends one run of bytes at `at` and moves it past them, answering where they went.
+/// Where a commit writes what it writes: a [`Writer`], or an [`Out`] for the commits that write no
+/// table.
+trait Sink {
+    /// Writes `bytes` where the commit's space puts them and answers where that is.
+    fn put(&mut self, bytes: &[u8]) -> Result<u64>;
+
+    /// Gives back the record of rows gone from the table of `entry`, see [`give_gone`].
+    fn give_gone(&mut self, entry: &Entry);
+}
+
+impl Sink for Writer {
+    fn put(&mut self, bytes: &[u8]) -> Result<u64> {
+        Writer::put(self, bytes)
+    }
+
+    fn give_gone(&mut self, entry: &Entry) {
+        give_gone(&*self.file, &mut self.space, entry);
+    }
+}
+
+/// A commit that writes no table: [`attach`], [`restate`] and the restatements on [`Writer`].
 ///
-/// The append half of [`attach`], which cannot use [`Writer::put`] because it is not writing a
-/// table. Every byte a section costs goes through here, so the offsets in an extent table come
-/// from one place.
-fn append(file: &dyn rudb_io::File, at: &mut u64, bytes: &[u8]) -> Result<u64> {
-    let offset = *at;
-    file.write_at(offset, bytes)?;
-    *at =
-        at.checked_add(bytes.len() as u64).ok_or_else(|| invalid("native file length overflow"))?;
-    Ok(offset)
+/// Every byte such a commit writes before its catalog goes through here, so the offsets in an
+/// extent table come from one place, and the runs it placed are known for the table they are for.
+struct Out<'a> {
+    file: &'a dyn rudb_io::File,
+    space: free::Space,
+    /// Every run [`Out::put`] placed, in order.
+    placed: Vec<(u64, u64)>,
+}
+
+impl<'a> Out<'a> {
+    /// The commit after the one `slot` names, of the file at `path` that is `size` bytes long and
+    /// lists `free`. The catalog the slot names is the first thing it gives back.
+    fn new(
+        path: &Path,
+        file: &'a dyn rudb_io::File,
+        size: u64,
+        slot: Slot,
+        free: Vec<free::Freed>,
+    ) -> Result<Self> {
+        let generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("native file generation overflow"))?;
+        let mut space = free::Space::new(path, size, free, generation);
+        space.give(slot.offset, u64::from(slot.length), 0);
+        Ok(Self { file, space, placed: Vec::new() })
+    }
+
+    /// Writes `catalog` on the end of the file and publishes it as the generation after `slot`,
+    /// with the same two syncs in the same order as [`Writer::finish`].
+    fn publish(mut self, slot: Slot, catalog: &[u8]) -> Result<()> {
+        if catalog.len() > MAX_DIRECTORY {
+            return Err(invalid("catalog exceeds the configured bound"));
+        }
+        let offset = self.space.append(catalog.len() as u64)?;
+        self.file.write_at(offset, catalog)?;
+        self.file.sync()?;
+        let generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("native file generation overflow"))?;
+        let committed = Slot {
+            offset,
+            length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
+            generation,
+            hash: checksum(catalog),
+        };
+        self.file.write_at(slot_offset(generation), &committed.bytes())?;
+        self.file.sync()?;
+        Ok(())
+    }
+}
+
+impl Sink for Out<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<u64> {
+        let (offset, _) = self.space.take(bytes.len() as u64)?;
+        self.file.write_at(offset, bytes)?;
+        if !bytes.is_empty() {
+            self.placed.push((offset, bytes.len() as u64));
+        }
+        Ok(offset)
+    }
+
+    fn give_gone(&mut self, entry: &Entry) {
+        give_gone(self.file, &mut self.space, entry);
+    }
+}
+
+/// Gives back the record of rows gone from the table of `entry` and the pages of updated rows it
+/// names, which a commit that writes the record again or drops the table stops naming.
+///
+/// A record that does not read back gives back only itself, which leaks its pages and nothing
+/// worse.
+fn give_gone(file: &dyn rudb_io::File, space: &mut free::Space, entry: &Entry) {
+    let Some(page) = entry.gone else { return };
+    if !space.committed(page.offset) {
+        return;
+    }
+    let tag = free::tag(&entry.name);
+    if entry.patched {
+        let mut bytes = vec![0; page.length as usize];
+        if read_at(file, page.offset, &mut bytes).is_ok()
+            && checksum(&bytes) == page.hash
+            && let Ok(pages) = free::patch_pages(&bytes)
+        {
+            for (offset, length) in pages {
+                space.give(offset, length, tag);
+            }
+        }
+    }
+    space.give(page.offset, u64::from(page.length), tag);
+}
+
+/// Gives back what the committed entry of a table names when the next generation drops the entry:
+/// its directory, its record of gone rows, and, unless the table is `kept` because its stripes go
+/// on into the next generation, every run its directory says it owns.
+///
+/// A directory that does not read back gives back nothing it owns, which leaks those runs. So does
+/// an entry this commit wrote itself, which no generation has named yet.
+fn give_entry(
+    file: &dyn rudb_io::File,
+    space: &mut free::Space,
+    entry: &Entry,
+    kept: bool,
+    size: u64,
+) {
+    if !space.committed(entry.directory.offset) {
+        return;
+    }
+    let tag = free::tag(&entry.name);
+    give_gone(file, space, entry);
+    if !kept && let Ok(owned) = owned_by(file, entry, size) {
+        for (offset, length) in owned {
+            space.give(offset, length, tag);
+        }
+    }
+    space.give(entry.directory.offset, u64::from(entry.directory.length), tag);
+}
+
+/// The runs the directory of `entry` says its table owns.
+fn owned_by(file: &dyn rudb_io::File, entry: &Entry, size: u64) -> Result<Vec<(u64, u64)>> {
+    let mut directory = vec![0; entry.directory.length as usize];
+    read_at(file, entry.directory.offset, &mut directory)?;
+    if checksum(&directory) != entry.directory.hash {
+        return Err(invalid(&format!("the directory of table {} does not checksum", entry.name)));
+    }
+    Ok(decode_directory(&directory, size)?.owned)
 }
 
 /// Writes one attachment's payload as extents and returns the entry that names it.
@@ -4968,8 +5150,7 @@ fn append(file: &dyn rudb_io::File, at: &mut u64, bytes: &[u8]) -> Result<u64> {
 /// whose extents should break on a row boundary instead will want to hand its extents over already
 /// split; nothing needs that yet, and guessing at the shape of it now would be guessing.
 fn write_section(
-    file: &dyn rudb_io::File,
-    at: &mut u64,
+    sink: &mut dyn Sink,
     one: &section::Attachment<'_>,
     generation: u64,
     wide: bool,
@@ -4993,7 +5174,7 @@ fn write_section(
             section::MAX_EXTENT as usize
         };
     for chunk in one.bytes.chunks(extent_size) {
-        let offset = append(file, at, chunk)?;
+        let offset = sink.put(chunk)?;
         extents.push(section::Extent {
             offset,
             length: u32::try_from(chunk.len()).map_err(|_| invalid("extent length overflow"))?,
@@ -5008,7 +5189,7 @@ fn write_section(
     // A payload of nothing is a section of no extents and no extent table, and its `extent_page`
     // is zero rather than the end of the file. Section 3.7 wants that entry to exist: it is how a
     // relationship that did not fit the budget is recorded as not built rather than forgotten.
-    let extent_page = if table.is_empty() { 0 } else { append(file, at, &table)? };
+    let extent_page = if table.is_empty() { 0 } else { sink.put(&table)? };
     Ok(Section {
         kind: one.kind,
         id: one.id,
@@ -5069,11 +5250,10 @@ pub fn extendable(
 /// written afterwards, by this, and the file in between the two is a correct file that answers
 /// every query more slowly.
 ///
-/// Nothing is overwritten. The payloads, the extent tables, the new directory for this table and
-/// the new catalog all go on the end of the file past the committed generation, and the last write
-/// is the header slot, exactly as [`Writer::finish`] does it. So a crash anywhere in here leaves
-/// the generation before it intact, and leaves unreferenced trailing bytes that the next commit
-/// writes past.
+/// Nothing the committed generation reads is overwritten. The payloads, the extent tables and the
+/// new directory for this table go into free runs no open reader can reach or on the end, the new
+/// catalog goes on the end, and the last write is the header slot, exactly as [`Writer::finish`]
+/// does it. So a crash anywhere in here leaves the generation before it intact.
 ///
 /// An attachment replaces any section of the same kind and id, and every other section is carried
 /// through untouched, including one whose kind this build does not know. The table's own generation
@@ -5098,7 +5278,7 @@ pub fn attach(
     let file = &*file;
     let size = file.len()?;
     let (slot, bytes, _) = committed_slot(file, size)?;
-    let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
+    let (mut entries, views, card, anchor, free) = decode_catalog(&bytes, size)?;
     let card = card_for(path.as_ref(), card);
     let at = entries
         .iter()
@@ -5129,20 +5309,26 @@ pub fn attach(
         return Err(invalid(&format!("the directory of table {table} does not checksum")));
     }
     let mut held = decode_directory(&directory, size)?;
-    let mut cursor = size;
+    let mut out = Out::new(path.as_ref(), file, size, slot, free)?;
     for one in attachments {
-        let written = write_section(file, &mut cursor, one, held.generation, version >= 31)?;
+        let written = write_section(&mut out, one, held.generation, version >= 31)?;
         held.sections.retain(|old| !(old.kind == one.kind && old.id == one.id));
         held.sections.push(written);
     }
     if held.sections.len() > MAX_SECTIONS {
         return Err(invalid("the table would name more sections than the bound allows"));
     }
+    // The sections are the table's from now on. The ones they replace stay in what it owns rather
+    // than being given back here, since the list cannot say which runs were theirs.
+    held.owned.append(&mut out.placed);
+    free::coalesce(&mut held.owned);
     let encoded = encode_directory(&held)?;
     if encoded.len() > MAX_DIRECTORY {
         return Err(invalid("directory exceeds the configured bound"));
     }
-    let offset = append(file, &mut cursor, &encoded)?;
+    let old = entries[at].directory;
+    out.space.give(old.offset, u64::from(old.length), free::tag(table));
+    let offset = out.put(&encoded)?;
     entries[at].directory = Page {
         offset,
         length: u32::try_from(encoded.len()).map_err(|_| invalid("directory length overflow"))?,
@@ -5150,22 +5336,9 @@ pub fn attach(
     };
     // The views the file already had, written back unchanged. Attaching a section to a table says
     // nothing about a view and must not drop one.
-    let catalog = encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref())?;
-    if catalog.len() > MAX_DIRECTORY {
-        return Err(invalid("catalog exceeds the configured bound"));
-    }
-    let offset = append(file, &mut cursor, &catalog)?;
-    file.sync()?;
-    let generation =
-        slot.generation.checked_add(1).ok_or_else(|| invalid("native file generation overflow"))?;
-    let committed = Slot {
-        offset,
-        length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
-        generation,
-        hash: checksum(&catalog),
-    };
-    file.write_at(slot_offset(generation), &committed.bytes())?;
-    file.sync()?;
+    let catalog =
+        encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref(), &out.space.list())?;
+    out.publish(slot, &catalog)?;
     Ok(held)
 }
 
@@ -5179,8 +5352,9 @@ pub fn attach(
 /// hold them is the only way to see what an answer is without them.
 ///
 /// It commits the way [`attach`] does: a new directory for each table that lost a section and a new
-/// catalog go on the end of the file, and the last write is the header slot. The payloads stay where
-/// they were with nothing naming them. A file nothing was dropped from is not written at all.
+/// catalog go where the file has room, and the last write is the header slot. The payloads stay
+/// where they were, owned by their table with nothing naming them. A file nothing was dropped from
+/// is not written at all.
 ///
 /// # Errors
 ///
@@ -5199,9 +5373,9 @@ pub fn strip_sections(path: impl AsRef<Path>, picked: impl Fn(&[u8; 8]) -> bool)
         )));
     }
     let (slot, bytes, _) = committed_slot(file, size)?;
-    let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
+    let (mut entries, views, card, anchor, free) = decode_catalog(&bytes, size)?;
     let card = card_for(path.as_ref(), card);
-    let mut cursor = size;
+    let mut out = Out::new(path.as_ref(), file, size, slot, free)?;
     let mut dropped = 0;
     for entry in &mut entries {
         let mut directory = vec![0; entry.directory.length as usize];
@@ -5220,7 +5394,9 @@ pub fn strip_sections(path: impl AsRef<Path>, picked: impl Fn(&[u8; 8]) -> bool)
         }
         dropped += before - held.sections.len();
         let encoded = encode_directory(&held)?;
-        let offset = append(file, &mut cursor, &encoded)?;
+        let old = entry.directory;
+        out.space.give(old.offset, u64::from(old.length), free::tag(&entry.name));
+        let offset = out.put(&encoded)?;
         entry.directory = Page {
             offset,
             length: u32::try_from(encoded.len())
@@ -5231,22 +5407,9 @@ pub fn strip_sections(path: impl AsRef<Path>, picked: impl Fn(&[u8; 8]) -> bool)
     if dropped == 0 {
         return Ok(0);
     }
-    let catalog = encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref())?;
-    if catalog.len() > MAX_DIRECTORY {
-        return Err(invalid("catalog exceeds the configured bound"));
-    }
-    let offset = append(file, &mut cursor, &catalog)?;
-    file.sync()?;
-    let generation =
-        slot.generation.checked_add(1).ok_or_else(|| invalid("native file generation overflow"))?;
-    let committed = Slot {
-        offset,
-        length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
-        generation,
-        hash: checksum(&catalog),
-    };
-    file.write_at(slot_offset(generation), &committed.bytes())?;
-    file.sync()?;
+    let catalog =
+        encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref(), &out.space.list())?;
+    out.publish(slot, &catalog)?;
     Ok(dropped)
 }
 
@@ -5278,7 +5441,7 @@ pub fn restate(
         return Ok(false);
     }
     let (slot, bytes, _) = committed_slot(file, size)?;
-    let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
+    let (mut entries, views, card, anchor, free) = decode_catalog(&bytes, size)?;
     let card = card_for(path.as_ref(), card);
     let at = entries
         .iter()
@@ -5313,29 +5476,18 @@ pub fn restate(
     if encoded.len() > MAX_DIRECTORY {
         return Err(invalid("directory exceeds the configured bound"));
     }
-    let mut cursor = size;
-    let offset = append(file, &mut cursor, &encoded)?;
+    let mut out = Out::new(path.as_ref(), file, size, slot, free)?;
+    let old = entries[at].directory;
+    out.space.give(old.offset, u64::from(old.length), free::tag(table));
+    let offset = out.put(&encoded)?;
     entries[at].directory = Page {
         offset,
         length: u32::try_from(encoded.len()).map_err(|_| invalid("directory length overflow"))?,
         hash: checksum(&encoded),
     };
-    let catalog = encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref())?;
-    if catalog.len() > MAX_DIRECTORY {
-        return Err(invalid("catalog exceeds the configured bound"));
-    }
-    let offset = append(file, &mut cursor, &catalog)?;
-    file.sync()?;
-    let generation =
-        slot.generation.checked_add(1).ok_or_else(|| invalid("native file generation overflow"))?;
-    let committed = Slot {
-        offset,
-        length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
-        generation,
-        hash: checksum(&catalog),
-    };
-    file.write_at(slot_offset(generation), &committed.bytes())?;
-    file.sync()?;
+    let catalog =
+        encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref(), &out.space.list())?;
+    out.publish(slot, &catalog)?;
     Ok(true)
 }
 
@@ -5357,6 +5509,9 @@ pub struct Reader {
     file: Arc<File>,
     /// The file mapped, shared with the catalog. See [`Catalog`].
     map: Option<Arc<Mapped>>,
+    /// Keeps the runs this table owns at the generation it was opened at from being written over,
+    /// see [`free`]. Every page and dictionary that reads them later takes a clone.
+    hold: Arc<free::Hold>,
     table: Arc<Table>,
     dictionaries: Arc<Vec<OnceLock<Arc<Vector>>>>,
     /// Held while a global dictionary is being opened, one per column.
@@ -5563,7 +5718,14 @@ impl AsRef<[u8]> for MappedRange {
 #[derive(Debug)]
 enum PageBytes {
     Read(Vec<u8>),
-    Mapped { map: Arc<Mapped>, offset: u64, length: usize },
+    /// The hold keeps the range from being written over by a later commit while this page is
+    /// still read, however long it outlives the reader that took it.
+    Mapped {
+        map: Arc<Mapped>,
+        offset: u64,
+        length: usize,
+        _hold: Arc<free::Hold>,
+    },
 }
 
 impl PageBytes {
@@ -5571,7 +5733,9 @@ impl PageBytes {
         match self {
             Self::Read(bytes) => bytes,
             // The range was checked against the mapping when the page was taken.
-            Self::Mapped { map, offset, length } => map.get(*offset, *length).unwrap_or_default(),
+            Self::Mapped { map, offset, length, .. } => {
+                map.get(*offset, *length).unwrap_or_default()
+            }
         }
     }
 
@@ -5594,7 +5758,7 @@ impl PageBytes {
 /// later faults it back in from the page cache.
 impl Drop for PageBytes {
     fn drop(&mut self) {
-        if let Self::Mapped { map, offset, length } = self {
+        if let Self::Mapped { map, offset, length, .. } = self {
             map.release(*offset, *length);
         }
     }
@@ -5608,7 +5772,7 @@ impl HeldPage {
     /// Counts one part of the page as read, and lets a mapped page's pages go once as many have
     /// been as it has parts. See [`Self::left`].
     fn read_one(&self) {
-        let PageBytes::Mapped { map, offset, length } = &self.bytes else { return };
+        let PageBytes::Mapped { map, offset, length, .. } = &self.bytes else { return };
         let parts = self.checked.len();
         let before = self.left.fetch_update(Atomic::Relaxed, Atomic::Relaxed, |left| {
             Some(if left <= 1 { parts } else { left - 1 })
@@ -6130,6 +6294,8 @@ const RANKS_WORTH: usize = 16384;
 #[derive(Debug)]
 struct NativeText {
     file: Arc<File>,
+    /// What keeps the payload from being written over while a vector over this still reads it.
+    _hold: Arc<free::Hold>,
     /// How many values the dictionary holds.
     values: usize,
     /// Where each value ends inside its payload block, packed at `offset_bits` in runs of
@@ -7763,6 +7929,12 @@ fn remember(cached: &mut Cached, held: &CachedColumn) -> Option<(usize, Arc<Atom
 pub struct Catalog {
     file: Arc<File>,
     size: u64,
+    /// The file as [`free`] knows it, and the generation this read.
+    key: Arc<PathBuf>,
+    generation: u64,
+    /// Keeps everything this generation names from being written over while a table of it can
+    /// still be opened, see [`free`].
+    _hold: Arc<free::Hold>,
     /// The file as it was at open, mapped, so a reader takes a page's bytes where the page cache
     /// holds them instead of copying them out. `None` where the file cannot be mapped.
     map: Option<Arc<Mapped>>,
@@ -7813,14 +7985,21 @@ impl Catalog {
     /// If the file has no valid committed catalog or a catalog pointer is out of bounds.
     pub fn open_in(path: impl AsRef<Path>, pool: &PagePool) -> Result<Self> {
         let path = path.as_ref();
-        let (file, size, _, bytes, opening) = slot_bytes(path)?;
-        let (entries, views, card, anchor) = decode_catalog(&bytes, size)?;
+        let (file, size, slot, bytes, opening) = slot_bytes(path)?;
+        let (entries, views, card, anchor, _) = decode_catalog(&bytes, size)?;
         remember_card(path, card.as_ref());
         let map = Mapped::open_until(&file, size, Arc::clone(&pool.told)).map(Arc::new);
+        // Until this and the last reader of this generation are gone, no commit writes into a run
+        // they could read.
+        let key = free::key(path);
+        let hold = free::hold(&key, slot.generation, 0);
         Ok(Self {
             anchor: anchor.map(Arc::new),
             file: Arc::new(file),
             size,
+            key: Arc::new(key),
+            generation: slot.generation,
+            _hold: hold,
             map,
             entries: Arc::new(entries),
             views: Arc::new(views),
@@ -7901,6 +8080,7 @@ impl Catalog {
             u64::from(entry.directory.length),
             opening,
             self.pool.clone(),
+            free::hold(&self.key, self.generation, free::tag(name)),
         )?;
         if let Some(page) = &entry.gone {
             let mut bytes = vec![0; page.length as usize];
@@ -8217,6 +8397,10 @@ impl Reader {
     }
 
     /// Builds a reader over one decoded table directory.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "what an open file and its catalog hand a reader"
+    )]
     fn build(
         file: Arc<File>,
         map: Option<Arc<Mapped>>,
@@ -8225,6 +8409,7 @@ impl Reader {
         directory: u64,
         opening: Opening,
         pool: PagePool,
+        hold: Arc<free::Hold>,
     ) -> Result<Self> {
         let places = places(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
@@ -8260,6 +8445,7 @@ impl Reader {
         Ok(Self {
             file,
             map,
+            hold,
             table: Arc::new(table),
             dictionaries: Arc::new(dictionaries),
             loading: Arc::new((0..table_fields).map(|_| Mutex::new(())).collect()),
@@ -9543,6 +9729,7 @@ impl Reader {
             &self.table.fields[column].ty,
             TEXT_KEEP_BUDGET,
             Arc::clone(&self.pool.last),
+            Arc::clone(&self.hold),
         )?);
         let _ = self.dictionaries[column].set(Arc::clone(&dictionary));
         Ok(Some(dictionary))
@@ -10264,9 +10451,12 @@ impl Reader {
             let span = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
             let length = span.length as usize;
             let bytes = match &self.map {
-                Some(map) if map.get(span.offset, length).is_some() => {
-                    PageBytes::Mapped { map: Arc::clone(map), offset: span.offset, length }
-                }
+                Some(map) if map.get(span.offset, length).is_some() => PageBytes::Mapped {
+                    map: Arc::clone(map),
+                    offset: span.offset,
+                    length,
+                    _hold: Arc::clone(&self.hold),
+                },
                 _ => {
                     let mut bytes = vec![0; length];
                     read_at(&self.file, span.offset, &mut bytes)?;
@@ -11775,6 +11965,7 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             put_u64(&mut out, table.dictionary_payloads.get(at).copied().unwrap_or(0));
         }
     }
+    free::encode_owned(&table.owned, &mut out)?;
     Ok(out)
 }
 
@@ -12002,6 +12193,7 @@ fn encode_catalog(
     views: &[ViewEntry],
     card: Option<&KeptCard>,
     anchor: Option<&LogAnchor>,
+    free: &[free::Freed],
 ) -> Result<Vec<u8>> {
     let mut out = CATALOG.to_vec();
     put_u32(&mut out, u32::try_from(entries.len()).map_err(|_| invalid("too many tables"))?);
@@ -12195,6 +12387,7 @@ fn encode_catalog(
     if let Some(anchor) = anchor {
         anchor.encode(&mut out)?;
     }
+    free::encode(free, &mut out)?;
     Ok(out)
 }
 
@@ -12453,12 +12646,13 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<Decoded> {
     let mut card = None;
     let mut anchor = None;
     let mut gone = false;
+    let mut free = Vec::new();
     // The extensions in the order they are written, each at most once. An older build stops at the
     // first magic it does not know, which is how a file it cannot read whole says so.
     while !cur.done() {
         let tag = cur.take(8)?;
-        if (tag == GONE_ROWS || tag == GONE_PATCHED) && !gone && card.is_none() && anchor.is_none()
-        {
+        let later = card.is_some() || anchor.is_some() || !free.is_empty();
+        if (tag == GONE_ROWS || tag == GONE_PATCHED) && !gone && !later {
             gone = true;
             let holds_patches = tag == GONE_PATCHED;
             for entry in &mut entries {
@@ -12484,24 +12678,27 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<Decoded> {
                     _ => return Err(invalid("gone rows tag differs")),
                 };
             }
-        } else if tag == DEVICE_CARD && card.is_none() && anchor.is_none() {
+        } else if tag == DEVICE_CARD && !later {
             let device = cur.text()?;
             let len = cur.u32()? as usize;
             if len > MAX_CARD {
                 return Err(invalid("device card is longer than any card"));
             }
             card = Some(KeptCard { device, bytes: cur.take(len)?.to_vec() });
-        } else if tag == anchor::LOG_ANCHOR && anchor.is_none() {
+        } else if tag == anchor::LOG_ANCHOR && anchor.is_none() && free.is_empty() {
             anchor = Some(LogAnchor::decode(&mut cur)?);
+        } else if tag == free::FREE_EXTENTS && free.is_empty() {
+            free = free::decode(&mut cur, size)?;
         } else {
             return Err(invalid("catalog extension magic differs or repeats"));
         }
     }
-    Ok((entries, views, card, anchor))
+    Ok((entries, views, card, anchor, free))
 }
 
-/// What [`decode_catalog`] reads: the tables, the views, the device card and the log anchor.
-type Decoded = (Vec<Entry>, Vec<ViewEntry>, Option<KeptCard>, Option<LogAnchor>);
+/// What [`decode_catalog`] reads: the tables, the views, the device card, the log anchor and the
+/// free list.
+type Decoded = (Vec<Entry>, Vec<ViewEntry>, Option<KeptCard>, Option<LogAnchor>, Vec<free::Freed>);
 
 /// The most a kept device card can take, which is many times what one holds.
 const MAX_CARD: usize = 64 << 10;
@@ -13570,6 +13767,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
     let mut seen_sections = false;
     let mut dictionary_payloads = Vec::new();
     let mut seen_payloads = false;
+    let mut owned = Vec::new();
     let mut constraints = Constraints::default();
     // Zero until a section table says otherwise, which is what a format 22 table gets and what
     // makes every section stamp fail to match on one, because real generations start at one.
@@ -13963,6 +14161,11 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
             if !constraints.keyed() {
                 return Err(invalid("a key block holds no key"));
             }
+        } else if &tag == free::OWNED {
+            if !owned.is_empty() {
+                return Err(invalid("directory names two owned run blocks"));
+            }
+            owned = free::decode_owned(&mut cur, size)?;
         } else {
             return Err(invalid("directory extension magic differs"));
         }
@@ -14001,6 +14204,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         generation,
         sections,
         constraints,
+        owned,
     })
 }
 
@@ -15893,6 +16097,7 @@ fn open_global_dictionary(
     ty: &LogicalType,
     keep_budget: usize,
     last: Arc<AtomicBool>,
+    hold: Arc<free::Hold>,
 ) -> Result<Vector> {
     if !coded_type(ty) {
         return Err(invalid("global dictionary belongs to a non-string column"));
@@ -16012,6 +16217,7 @@ fn open_global_dictionary(
             map: Arc::clone(map),
             offset: page.offset,
             length: DICTIONARY_HEADER + offset_len,
+            _hold: Arc::clone(&hold),
         },
         (None, None) => return Err(invalid("global dictionary index was neither read nor mapped")),
     };
@@ -16063,6 +16269,7 @@ fn open_global_dictionary(
         ty.clone(),
         Arc::new(NativeText {
             file,
+            _hold: hold,
             values: count,
             offsets,
             offset_bits,
@@ -17441,6 +17648,7 @@ mod tests {
             constraints: Constraints::default(),
             generation: 1,
             sections,
+            owned: Vec::new(),
         }
     }
 
@@ -18136,18 +18344,18 @@ mod tests {
         assert!(!anchor.replays(41) && anchor.replays(42) && !anchor.replays(43));
         let card = KeptCard { device: "dev:42".to_string(), bytes: vec![1, 2, 3] };
         for card in [None, Some(&card)] {
-            let bytes = encode_catalog(&[entry()], &[], card, Some(&anchor)).expect("encodes");
-            let (_, _, kept, held) = decode_catalog(&bytes, HEADER + 8).expect("decodes");
+            let bytes = encode_catalog(&[entry()], &[], card, Some(&anchor), &[]).expect("encodes");
+            let (_, _, kept, held, _) = decode_catalog(&bytes, HEADER + 8).expect("decodes");
             assert_eq!((kept.as_ref(), held.as_ref()), (card, Some(&anchor)));
         }
-        let mut twice = encode_catalog(&[entry()], &[], None, Some(&anchor)).expect("encodes");
+        let mut twice = encode_catalog(&[entry()], &[], None, Some(&anchor), &[]).expect("encodes");
         anchor.encode(&mut twice).expect("encodes");
         assert!(decode_catalog(&twice, HEADER + 8).is_err(), "a second anchor");
-        let mut after = encode_catalog(&[entry()], &[], None, Some(&anchor)).expect("encodes");
+        let mut after = encode_catalog(&[entry()], &[], None, Some(&anchor), &[]).expect("encodes");
         after.extend_from_slice(DEVICE_CARD);
         assert!(decode_catalog(&after, HEADER + 8).is_err(), "a card after the anchor");
         let under = LogAnchor { voids: vec![40], ..anchor.clone() };
-        let bytes = encode_catalog(&[entry()], &[], None, Some(&under)).expect("encodes");
+        let bytes = encode_catalog(&[entry()], &[], None, Some(&under), &[]).expect("encodes");
         assert!(decode_catalog(&bytes, HEADER + 8).is_err(), "a void under the cut");
 
         let path = path("anchored");
@@ -18191,11 +18399,11 @@ mod tests {
             patched: false,
         };
         let card = KeptCard { device: "dev:42".to_string(), bytes: vec![1, 2, 3] };
-        let bytes = encode_catalog(&[entry()], &[], Some(&card), None).expect("encodes");
-        let (entries, views, kept, _) = decode_catalog(&bytes, HEADER + 8).expect("decodes");
+        let bytes = encode_catalog(&[entry()], &[], Some(&card), None, &[]).expect("encodes");
+        let (entries, views, kept, ..) = decode_catalog(&bytes, HEADER + 8).expect("decodes");
         assert_eq!((entries.len(), views.len()), (1, 0));
         assert_eq!(kept, Some(card));
-        let bytes = encode_catalog(&[entry()], &[], None, None).expect("encodes");
+        let bytes = encode_catalog(&[entry()], &[], None, None, &[]).expect("encodes");
         assert_eq!(decode_catalog(&bytes, HEADER + 8).expect("decodes").2, None);
     }
 
@@ -18365,6 +18573,169 @@ mod tests {
         assert_eq!(reader.parts(), 2);
     }
 
+    /// Appends the rows of a test of the free list to `writer`, a vector at a time: `rows`
+    /// integers that look random, so that each copy of the table takes as many bytes as the one
+    /// before, different for every `round`.
+    fn append_shuffled(writer: &mut Writer, round: u32, rows: u32) {
+        let step = rudb_vector::VECTOR_SIZE as u32;
+        for start in (0..rows).step_by(step as usize) {
+            let values = (start..rows.min(start + step))
+                .map(|row| shuffled_value(round, row))
+                .collect::<Vec<_>>();
+            let chunk = Chunk::new(vec![
+                Vector::flat(LogicalType::Integer, Data::Int32(values.into())).expect("integers"),
+            ])
+            .expect("one column");
+            writer.append(&chunk).expect("rows");
+        }
+    }
+
+    fn shuffled_value(round: u32, row: u32) -> i32 {
+        (row.wrapping_mul(2_654_435_761) ^ round.wrapping_mul(0x9e37_79b9)) as i32
+    }
+
+    /// What [`summed`] reads back from the rows of [`shuffled`].
+    fn shuffled_sum(round: u32, rows: u32) -> (i64, usize) {
+        let sum = (0..rows).map(|row| i64::from(shuffled_value(round, row))).sum();
+        (sum, rows as usize)
+    }
+
+    /// The sum and count of the one column `reader` reads.
+    fn summed_by(reader: &Reader) -> (i64, usize) {
+        let (mut sum, mut rows) = (0, 0);
+        for part in 0..reader.parts() {
+            let chunk = reader.read(part, &[0]).expect("a part");
+            for row in 0..chunk.len() {
+                let Value::Integer(value) = chunk.value_at(row, 0) else { panic!("an integer") };
+                sum += i64::from(value);
+                rows += 1;
+            }
+        }
+        (sum, rows)
+    }
+
+    /// The same of `items` as the file at `path` holds it now.
+    fn summed(path: &Path) -> (i64, usize) {
+        summed_by(&Catalog::open(path).expect("opens").table("items").expect("the table"))
+    }
+
+    fn file_size(path: &Path) -> u64 {
+        fs::metadata(path).expect("the file is there").len()
+    }
+
+    /// The free list the committed generation of the file at `path` holds.
+    fn free_list(path: &Path) -> Vec<free::Freed> {
+        let (_, size, _, bytes, _) = slot_bytes(path).expect("reads");
+        decode_catalog(&bytes, size).expect("decodes").4
+    }
+
+    const FREE_ROWS: u32 = 200_000;
+
+    /// A table written again and again goes into the runs the copy two generations before it gave
+    /// back, so the file stops growing at about three copies. Nothing the committed generation
+    /// reads is on its free list, so writing over every run on it changes no answer.
+    #[test]
+    fn a_table_written_again_and_again_reuses_the_runs_its_old_copies_gave_back() {
+        let path = path("free-again");
+        let fields = vec![Field::required("id", LogicalType::Integer)];
+        let mut writer = Writer::create(&path, "items", fields.clone()).expect("new file");
+        append_shuffled(&mut writer, 0, FREE_ROWS);
+        writer.finish().expect("commit");
+        let one = file_size(&path);
+        for round in 1..12 {
+            let mut writer = Writer::replace(&path, "items", fields.clone()).expect("replaces");
+            append_shuffled(&mut writer, round, FREE_ROWS);
+            writer.finish().expect("commit");
+            assert_eq!(summed(&path), shuffled_sum(round, FREE_ROWS), "round {round}");
+        }
+        let size = file_size(&path);
+        assert!(size < one * 4, "eleven copies later the file went from {one} to {size} bytes");
+
+        let free = free_list(&path);
+        assert!(!free.is_empty(), "the last copies gave runs back");
+        let mut file = OpenOptions::new().write(true).open(&path).expect("opens");
+        for run in &free {
+            file.seek(SeekFrom::Start(run.offset)).expect("seeks");
+            file.write_all(&vec![0xff; run.length as usize]).expect("writes");
+        }
+        drop(file);
+        assert_eq!(summed(&path), shuffled_sum(11, FREE_ROWS), "after the free runs are scribbled");
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// A reader of an old copy of a table keeps that copy from being written over for as long as
+    /// it is open, and a reader of another table keeps nothing of this one.
+    #[test]
+    fn a_reader_of_an_old_copy_keeps_it_and_nothing_else() {
+        let path = path("free-held");
+        let fields = vec![Field::required("id", LogicalType::Integer)];
+        let mut writer = Writer::create(&path, "items", fields.clone()).expect("new file");
+        append_shuffled(&mut writer, 0, FREE_ROWS);
+        let mut writer = writer.next("other", fields.clone()).expect("a second table");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+        let one = file_size(&path);
+        let catalog = Catalog::open(&path).expect("opens");
+        let (old, other) = (
+            catalog.table("items").expect("the table"),
+            catalog.table("other").expect("the table"),
+        );
+        drop(catalog);
+        let write = |round| {
+            let mut writer = Writer::replace(&path, "items", fields.clone()).expect("replaces");
+            append_shuffled(&mut writer, round, FREE_ROWS);
+            writer.finish().expect("commit");
+        };
+        for round in 1..6 {
+            write(round);
+        }
+        let held = file_size(&path);
+        assert!(held > one * 5, "every copy since the old one is still there: {one} to {held}");
+        assert_eq!(summed_by(&old), shuffled_sum(0, FREE_ROWS));
+        drop(old);
+        for round in 6..14 {
+            write(round);
+        }
+        let size = file_size(&path);
+        assert!(size < held + one / 2, "the copies the reader kept were used: {held} to {size}");
+        assert_eq!(summed(&path), shuffled_sum(13, FREE_ROWS));
+        assert_eq!(summed_by(&other), (24, 3));
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// Writing down the rows gone from a table again gives back the record it replaces.
+    #[test]
+    fn a_record_of_gone_rows_written_again_gives_the_old_one_back() {
+        let path = path("free-gone");
+        let fields = vec![Field::required("id", LogicalType::Integer)];
+        let mut writer = Writer::create(&path, "items", fields).expect("new file");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+        let mark = |bits: u64, total| GoneRows {
+            parts: vec![(0, vec![bits].into_boxed_slice())],
+            total,
+            sums: Vec::new(),
+            patches: Vec::new(),
+            touched: Vec::new(),
+        };
+        Writer::restate_marking(&path, &[], None, &[("items".to_string(), mark(0b010, 1))])
+            .expect("marks");
+        let (_, size, _, bytes, _) = slot_bytes(&path).expect("reads");
+        let first = decode_catalog(&bytes, size).expect("decodes").0[0].gone.expect("a record");
+        Writer::restate_marking(&path, &[], None, &[("items".to_string(), mark(0b011, 2))])
+            .expect("marks again");
+        let end = first.offset + u64::from(first.length);
+        assert!(
+            free_list(&path)
+                .iter()
+                .any(|run| run.offset <= first.offset && end <= run.offset + run.length),
+            "the first record is on the free list"
+        );
+        let reader = Catalog::open(&path).expect("reopen").table("items").expect("the table");
+        assert_eq!(reader.gone(), Some(&mark(0b011, 2)));
+        fs::remove_file(&path).expect("clean up");
+    }
+
     /// The values the gone rows held are counted once, and a second record counts only the rows
     /// gone since the first, so the two together are the sum over every row gone.
     #[test]
@@ -18480,6 +18851,7 @@ mod tests {
             &[sample_view("items")],
             None,
             None,
+            &[],
         )
         .expect("it encodes, because encoding does not look");
         let error = decode_catalog(&bytes, HEADER + 8).expect_err("and decoding does");
@@ -21720,6 +22092,7 @@ mod tests {
             &LogicalType::Varchar,
             0,
             Arc::default(),
+            Arc::new(free::Hold),
         )
         .expect("a dictionary opens whatever it may keep");
         let starved = Arc::new(starved);
@@ -22221,6 +22594,7 @@ mod tests {
                     &LogicalType::Varchar,
                     TEXT_KEEP_BUDGET,
                     Arc::default(),
+                    Arc::new(free::Hold),
                 )
                 .expect("a dictionary laid out either way opens");
                 let mut swept: Vec<Vec<u8>> = Vec::new();
@@ -22297,9 +22671,16 @@ mod tests {
         let reader = Reader::open(&path).expect("valid directory");
         let page = reader.table.dictionaries[0].expect("a string column has one");
         let file = Arc::clone(&reader.file);
-        let starved =
-            open_global_dictionary(file, None, page, &LogicalType::Varchar, 0, Arc::default())
-                .expect("a dictionary opens whatever it may keep");
+        let starved = open_global_dictionary(
+            file,
+            None,
+            page,
+            &LogicalType::Varchar,
+            0,
+            Arc::default(),
+            Arc::new(free::Hold),
+        )
+        .expect("a dictionary opens whatever it may keep");
 
         let resting = starved.footprint();
         let mut swept: Vec<Vec<u8>> = Vec::new();
@@ -22360,6 +22741,7 @@ mod tests {
             &LogicalType::Varchar,
             TEXT_KEEP_BUDGET,
             last,
+            Arc::new(free::Hold),
         )
         .expect("a dictionary opens");
         let resting = dictionary.footprint();
@@ -22666,6 +23048,7 @@ mod tests {
             constraints: Constraints::default(),
             generation: 1,
             sections: Vec::new(),
+            owned: Vec::new(),
         };
         let directory = encode_directory(&table).expect("directory");
         let file_size = dictionary.offset + u64::from(dictionary.length) + 1;
