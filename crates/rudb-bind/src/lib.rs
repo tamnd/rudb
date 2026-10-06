@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod advisory;
+mod all_types;
 mod binder;
 mod columns;
 mod context;
