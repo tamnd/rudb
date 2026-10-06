@@ -315,7 +315,13 @@ impl Ranked {
                     Some(ranks) => {
                         let ranks = ranks.get(first..first + len).ok_or_else(mismatched)?;
                         let ranks = Buffer::from_vec(ranks.to_vec());
-                        let valid = Validity::from_iter(len, |at| !column.is_null_at(at));
+                        // A row at a time only when the column could hold a null, because the
+                        // read goes through the codes of a dictionary to the values behind them.
+                        let valid = if crate::lookup::has_nulls(column, len) {
+                            Validity::from_iter(len, |at| !column.is_null_at(at))
+                        } else {
+                            Validity::AllValid
+                        };
                         let ranked = Vector::flat(LogicalType::UInteger, Data::UInt32(ranks))?
                             .with_validity(valid);
                         normal::write_column(into, written, wide, &ranked, key)?;

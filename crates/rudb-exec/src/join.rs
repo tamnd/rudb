@@ -1546,6 +1546,10 @@ impl<'a> Probe<'a> {
             // [`Probing::keys`]. Every such row is already decided by `empty` or by `undecided`.
             _ => local.keys.first(),
         };
+        // A key that cannot hold a null has nothing to say, and asking it a row at a time read
+        // through a filter's codes for every row that missed, which is nearly every line of
+        // `partsupp` in q16.
+        let driving = driving.filter(|key| crate::lookup::has_nulls(key, rows));
         let mut marks = vec![false; rows];
         let mut known = vec![true; rows];
         // No check in here. It is one slot read and one validity read per row over a driving chunk
