@@ -341,6 +341,7 @@ impl Local {
         }
         // flatten: the page is one code a row whatever form the rows came in.
         let flat = column.flatten()?;
+        let own = flat.own_nulls();
         let mut codes = Vec::with_capacity(flat.len());
         let mut last = None;
         for row in 0..flat.len() {
@@ -354,7 +355,7 @@ impl Local {
                 _ => self.code(text)?,
             };
             last = Some(code);
-            if flat.is_null_at(row) {
+            if own.map_or_else(|| flat.is_null_at(row), |live| !live.at(row)) {
                 self.nulls += 1;
             } else {
                 self.counts[code as usize] += 1;

@@ -652,9 +652,13 @@ fn signed_values(vector: &Vector, nullable: bool) -> Option<Vec<i64>> {
         return None;
     }
     if nullable {
+        let (own, len) = (vector.own_nulls(), vector.len());
         let mut row = 0;
         numbers.retain(|_| {
-            let valid = !vector.is_null_at(row);
+            let valid = match own {
+                Some(live) => row < len && live.at(row),
+                None => !vector.is_null_at(row),
+            };
             row += 1;
             valid
         });

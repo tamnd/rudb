@@ -39,11 +39,23 @@ pub(crate) struct Cells<'a> {
 impl Cells<'_> {
     /// Field `column` of row `row`, or `None` for a null, which is a field that is one of the null
     /// strings, an empty one unless it was told otherwise, or one the row is too short to have.
+    #[inline]
     fn at(&self, row: usize, column: usize) -> Option<Span> {
-        let span = self.records.field(row, column)?;
+        self.records.field(row, column).filter(|&span| self.kept(span))
+    }
+
+    /// Field `column` of each row in `rows`, in order, each the way [`Self::at`] answers it.
+    #[inline]
+    fn column(&self, column: usize, rows: Range<usize>) -> impl Iterator<Item = Option<Span>> + '_ {
+        self.records.column(column, rows).map(|span| span.filter(|&span| self.kept(span)))
+    }
+
+    /// Whether a field the row has is a value and not a null.
+    #[inline]
+    fn kept(&self, span: Span) -> bool {
         match self.nulls {
-            None => (!span.is_empty()).then_some(span),
-            Some(nulls) => (!is_null(span, self.bytes, self.dialect, nulls)).then_some(span),
+            None => !span.is_empty(),
+            Some(nulls) => !is_null(span, self.bytes, self.dialect, nulls),
         }
     }
 }
@@ -283,8 +295,8 @@ where
         rows: Range<usize>,
         refuse: &dyn Fn(&str, usize) -> Error,
     ) -> Result<()> {
-        for row in rows {
-            let Some(span) = cells.at(row, column) else {
+        for (row, span) in rows.clone().zip(cells.column(column, rows)) {
+            let Some(span) = span else {
                 self.out.push(T::default());
                 self.valid.push(false);
                 continue;
@@ -346,8 +358,8 @@ impl Build for Text {
         rows: Range<usize>,
         _refuse: &dyn Fn(&str, usize) -> Error,
     ) -> Result<()> {
-        for row in rows {
-            let Some(span) = cells.at(row, column) else {
+        for span in cells.column(column, rows) {
+            let Some(span) = span else {
                 self.views.push(StringView::empty());
                 self.valid.push(false);
                 continue;
@@ -386,8 +398,8 @@ impl Build for Values {
         rows: Range<usize>,
         refuse: &dyn Fn(&str, usize) -> Error,
     ) -> Result<()> {
-        for row in rows {
-            self.values.push(match cells.at(row, column) {
+        for (row, span) in rows.clone().zip(cells.column(column, rows)) {
+            self.values.push(match span {
                 None => Value::Null,
                 Some(span) => cast(cells, span, &self.ty, row, refuse)?,
             });

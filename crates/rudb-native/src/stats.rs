@@ -700,9 +700,10 @@ impl Pass {
         // below are loads against a slice rather than value construction. What the checker is
         // looking for is the third arm, which does build a `Value`, and that one runs for a float
         // column and for a form the first two cannot read and for nothing else.
+        let own = vector.own_nulls();
         for row in 0..vector.len() {
             self.rows += 1;
-            if vector.is_null_at(row) {
+            if own.map_or_else(|| vector.is_null_at(row), |live| !live.at(row)) {
                 self.nulls += 1;
                 continue;
             }
