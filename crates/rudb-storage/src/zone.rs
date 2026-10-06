@@ -418,6 +418,19 @@ impl Zone {
         range.sum = None;
     }
 
+    /// Leaves out of column `column` rows taken out of its chunk, `nulls` of them null, which is
+    /// what a `DELETE` that leaves the rows where they are does to the zone of their chunk.
+    ///
+    /// The ends stay, because ends wider than the rows still rule out what they ruled out, and stop
+    /// being exact, and the total is gone, for the reason [`Self::rewrite`] gives. The null count
+    /// follows the rows.
+    pub fn take(&mut self, column: usize, nulls: usize) {
+        let Some(range) = self.columns.get_mut(column) else { return };
+        range.nulls = range.nulls.saturating_sub(nulls);
+        range.exact = false;
+        range.sum = None;
+    }
+
     /// Builds a zone from persisted ranges.
     #[must_use]
     pub fn from_ranges(columns: Vec<Range>) -> Self {

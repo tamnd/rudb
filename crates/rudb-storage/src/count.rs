@@ -426,6 +426,19 @@ impl Counts {
         }
     }
 
+    /// Leaves rows taken out of the table out of every column's counts.
+    ///
+    /// A value taken may have been the last of its kind, so a column whose answers are exact gives
+    /// them up, the way [`Self::rewrite`] does. An estimate counted values the rows left behind no
+    /// longer hold, which is still an estimate of the same column.
+    pub fn take_rows(&mut self) {
+        for held in &mut self.columns {
+            if !held.blind && (held.tally.counting() || held.sketch.is_exact()) {
+                held.blind();
+            }
+        }
+    }
+
     /// Gives up on a column, which is what a form with no hash rule leaves behind.
     fn blind(&mut self, at: usize) {
         if let Some(column) = self.columns.get_mut(at) {
