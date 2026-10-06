@@ -4246,25 +4246,12 @@ impl Shared {
                 built.iter().map(Vec::as_slice).collect()
             }
         };
-        let staged = journals.then(|| rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>());
-        // The rows as a chunk, for what a transaction checks them against and notes them as.
-        let noted = if transacting {
-            let columns = fields
-                .iter()
-                .enumerate()
-                .map(|(at, field)| {
-                    let values: Vec<Value> = rows.iter().map(|row| row[at].clone()).collect();
-                    Vector::from_values(field.ty.clone(), &values)
-                })
-                .collect::<Result<Vec<_>>>()
-                .and_then(Chunk::new);
-            Some(columns.ok()?)
-        } else {
-            None
-        };
+        // The rows for the log, and for a transaction to note for its commit.
+        let staged = (journals || transacting)
+            .then(|| rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>());
         let result = kept(sql, 0, |_| {
-            if let Some(chunk) = &noted {
-                self.refuse_keys_since(&catalog, &name, std::slice::from_ref(chunk))?;
+            if transacting {
+                self.refuse_row_keys_since(&catalog, &name, &rows)?;
             }
             let table = catalog.table_appending(&name)?;
             // Several rows go in together, so a key the last one repeats leaves out the first.
@@ -4274,11 +4261,12 @@ impl Shared {
                     table.append_rows(&many.iter().map(|row| row.to_vec()).collect::<Vec<_>>())?
                 }
             }
-            if let Some(chunk) = noted {
-                self.wrote(table.oid(), |written, _| written.appended(vec![chunk]));
-            }
-            if let Some(rows) = &staged {
+            if journals && let Some(rows) = &staged {
                 self.stage_rows(&name, table.columns(), rows);
+            }
+            if transacting && let Some(rows) = staged {
+                let fields = table.columns();
+                self.wrote(table.oid(), |written, _| written.appended_values(fields, rows));
             }
             QueryResult::changed(rows.len())
         });
@@ -4533,28 +4521,20 @@ impl Shared {
         let Some((spot, held)) = table.spot(&key, &values, &all).ok()?? else {
             // Nobody holds the key, so the row goes in.
             let staged = self.journals(&name).then(|| vec![row.clone()]);
-            let noted = if transacting {
-                let columns = fields
-                    .iter()
-                    .zip(&row)
-                    .map(|(field, value)| {
-                        Vector::from_values(field.ty.clone(), std::slice::from_ref(value))
-                    })
-                    .collect::<Result<Vec<_>>>();
-                let chunk = Chunk::new(columns.ok()?).ok()?;
-                self.refuse_keys_since(&catalog, &name, std::slice::from_ref(&chunk)).ok()?;
-                Some(chunk)
-            } else {
-                None
-            };
+            if transacting {
+                self.refuse_row_keys_since(&catalog, &name, &[row.as_slice()]).ok()?;
+            }
             let result = kept(sql, 0, |_| {
                 let table = catalog.table_appending(&name)?;
                 table.append_row(&row)?;
-                if let Some(chunk) = noted {
-                    self.wrote(table.oid(), |written, _| written.appended(vec![chunk]));
-                }
                 if let Some(rows) = &staged {
                     self.stage_rows(&name, table.columns(), rows);
+                }
+                if transacting {
+                    let fields = table.columns();
+                    self.wrote(table.oid(), |written, _| {
+                        written.appended_values(fields, vec![row])
+                    });
                 }
                 QueryResult::changed(1)
             });
@@ -5007,6 +4987,49 @@ impl Shared {
         let Some(now) = committed.tables().find(|table| table.oid() == oid) else { return Ok(()) };
         let now = now.name().clone();
         committed.table_noting(&now)?.refuse_keys_since(before, chunks)
+    }
+
+    /// [`Self::refuse_keys_since`] for rows given as values, which are built into a chunk only when
+    /// somebody committed to the table since the snapshot, since that is the only time there is
+    /// anything to refuse them for. A load inside a transaction used to build a chunk for every
+    /// statement here, a vector for each column of one row.
+    fn refuse_row_keys_since(
+        &self,
+        mine: &Catalog,
+        name: &QualifiedName,
+        rows: &[&[Value]],
+    ) -> Result<()> {
+        let table = mine.table(name)?;
+        if table.keys().is_empty() && table.indexes().iter().all(|index| !index.unique) {
+            return Ok(());
+        }
+        let oid = table.oid();
+        {
+            let open = self.open();
+            let Some(snapshot) = open.as_ref().and_then(|open| open.snapshot.as_ref()) else {
+                return Ok(());
+            };
+            let Some(before) = snapshot.base.tables().find(|table| table.oid() == oid) else {
+                return Ok(());
+            };
+            let committed = self.committed();
+            let Some(now) = committed.tables().find(|table| table.oid() == oid) else {
+                return Ok(());
+            };
+            if now.revision() == before.revision() {
+                return Ok(());
+            }
+        }
+        let columns = table
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(at, field)| {
+                let values: Vec<Value> = rows.iter().map(|row| row[at].clone()).collect();
+                Vector::from_values(field.ty.clone(), &values)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.refuse_keys_since(mine, name, &[Chunk::new(columns)?])
     }
 
     /// Checks the rows at `flagged` of the table `oid`, which an update or a delete is about to

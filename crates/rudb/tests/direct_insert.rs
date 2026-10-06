@@ -350,6 +350,26 @@ fn rows_put_in_inside_a_transaction_commit_and_abort_as_the_plan_does() {
     pair.both("COMMIT").expect("commits");
     assert_eq!(pair.same(), before + 101);
     pair.put(false, 6000).expect_err("taken");
+
+    // And with an update between them, of a row the snapshot had, which the commit does again
+    // in its place among the rows put in.
+    let before = pair.same();
+    pair.both("BEGIN").expect("begins");
+    for id in 7000..7050 {
+        pair.put(false, id).expect("inserts");
+    }
+    pair.both("UPDATE t SET name = 'changed' WHERE id = 5").expect("updates");
+    for id in 7050..7060 {
+        pair.put(false, id).expect("inserts");
+    }
+    pair.put(true, 8000).expect("inserts");
+    pair.both("COMMIT").expect("commits");
+    assert_eq!(pair.same(), before + 61);
+    let changed = rows(&pair.dbs[0], "SELECT name FROM t WHERE id = 5 OR id = 7055 ORDER BY id");
+    assert_eq!(
+        changed,
+        vec![vec![Value::Varchar("changed".into())], vec![Value::Varchar("n7055".into())]]
+    );
 }
 
 #[test]
