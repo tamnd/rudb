@@ -612,7 +612,15 @@ impl Session {
     }
 
     /// Records the PostgreSQL session that runs the statements, or none.
+    ///
+    /// A PostgreSQL session also takes the rules of PostgreSQL for division: `/` of two integers
+    /// is an integer, and a zero divisor is an error for every type.
     pub fn set_postgres(&mut self, postgres: Option<Arc<Postgres>>) {
+        if postgres.is_some() {
+            self.semantics.integer_division = true;
+            self.semantics.ieee_floating_point_ops = false;
+            self.semantics.null_on_division_by_zero = false;
+        }
         self.postgres = Postgreses(postgres);
     }
 

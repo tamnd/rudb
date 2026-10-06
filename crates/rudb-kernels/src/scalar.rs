@@ -49,7 +49,9 @@
 //! a `Vec<char>` on every row.
 
 use memchr::memmem;
-use rudb_common::{Error, LogicalType, Result, Value, bignum, civil_from_days, days_from_civil};
+use rudb_common::{
+    Error, LogicalType, Result, SqlState, Value, bignum, civil_from_days, days_from_civil,
+};
 use rudb_vector::{Data, Form, NO_ROW, StringColumn, Validity, Vector, picked};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4652,6 +4654,9 @@ fn divided_by_zero(written: Written<'_>, symbol: &str, left: &Value, right: &Val
         "Division by zero in expression {quoted}. Use TRY(...) to return NULL for this expression, \
          or SET null_on_division_by_zero=true to return NULL for all divisions by zero."
     ))
+    .state(SqlState::DIVISION_BY_ZERO)
+    .pg("division by zero")
+    .unplaced()
 }
 
 /// `abs` says it differently: `Overflow on abs(-2147483648)`, with no type in it and no punctuation

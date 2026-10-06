@@ -965,14 +965,17 @@ impl Failure {
             // The engine answers `SHOW` of an unknown name in the words of DuckDB.
             sqlstate = "42704".to_owned();
             format!("unrecognized configuration parameter \"{name}\"")
+        } else if let Some(text) = error.fields().and_then(|fields| fields.postgres.as_ref()) {
+            text.clone()
         } else {
             error.message().to_owned()
         };
+        let placed = !error.fields().is_some_and(|fields| fields.unplaced);
         Failure {
             sqlstate,
             message,
             fields: error.fields().cloned().map(Box::new),
-            position: error.span().map(|span| offset + span.start as usize),
+            position: error.span().filter(|_| placed).map(|span| offset + span.start as usize),
         }
     }
 
