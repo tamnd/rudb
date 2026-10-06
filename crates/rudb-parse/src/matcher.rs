@@ -238,6 +238,8 @@ struct Matcher<'a> {
     /// One FIRST key per token, computed once. The filter asks for the key of the token at the
     /// current position on every node it enters, and the same token is entered on many times.
     keys: Vec<u64>,
+    /// Which of [`SYMBOLS`] each token spells, or `u8::MAX`, computed once for the same reason.
+    symbols: Vec<u8>,
     arena: Vec<ParseNode>,
     stack: Vec<Frame>,
     /// One slot per memoized rule per token position, holding an arena index, `MEMO_FAILED` or
@@ -254,6 +256,18 @@ struct Matcher<'a> {
     /// failure is what a person reads as the place the query went wrong, and the place the matcher
     /// finally gives up is usually the start of the statement.
     furthest: u32,
+}
+
+/// Which of [`SYMBOLS`] `text` spells, or `u8::MAX` when it is none of them.
+///
+/// The matcher tries a symbol at the same position many times over, and comparing the text each
+/// time was a call into memcmp each time. Fifty five short strings once per token is less.
+fn symbol_of(text: &str) -> u8 {
+    SYMBOLS
+        .iter()
+        .position(|&symbol| symbol == text)
+        .and_then(|at| u8::try_from(at).ok())
+        .unwrap_or(u8::MAX)
 }
 
 /// The memo row each rule uses, built once for the process.
@@ -282,12 +296,14 @@ fn build_slots() -> (Box<[u32]>, usize) {
 impl<'a> Matcher<'a> {
     fn new(query: &'a str, tokens: &'a [Token], filter: bool) -> Self {
         let keys = tokens.iter().map(|token| crate::rules::token_key(*token)).collect();
+        let symbols = tokens.iter().map(|token| symbol_of(token.text(query))).collect();
         // One row per memoized rule, one column per token plus one for the position past the end.
         let memo = vec![MEMO_EMPTY; slots().1 * (tokens.len() + 1)];
         Self {
             query,
             tokens,
             keys,
+            symbols,
             // The arena grows as the tree does. A guess here saves a handful of reallocations on
             // anything but the smallest query, and a token is worth about a node in practice.
             arena: Vec::with_capacity(tokens.len()),
@@ -660,8 +676,9 @@ impl<'a> Matcher<'a> {
             // `.5` until it has read past the dot, so a check that the token is an operator would
             // make `DottedIdentifier` unmatchable. Nothing is lost by dropping it: every symbol is
             // punctuation, no word or literal has punctuation for its whole text, and a quoted or
-            // string token carries its quotes in its text and so cannot collide either.
-            Op::Symbol => token.text(self.query) == SYMBOLS[node.a as usize],
+            // string token carries its quotes in its text and so cannot collide either. The text
+            // was looked up in the table once per token, so what runs here is an index compare.
+            Op::Symbol => u32::from(self.symbols[self.pos as usize]) == node.a,
             // The other half of the same fact. Upstream rejects a lone dot here, and this is why:
             // without it `a.b` would parse `.` as a numeric literal and `SELECT a.b` would come
             // out as three expressions rather than one qualified name.
