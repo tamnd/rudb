@@ -3037,6 +3037,27 @@ fn like_run<A: Fn(usize) -> usize>(
     returns: &LogicalType,
 ) -> Result<Option<Vector>> {
     let mut out = vec![false; rows];
+    // A prefix is decided on the length and the first four bytes, which every view holds whether
+    // the string is in it or in the arena, and only a row they agree with is read from the arena.
+    // TPC-H q20 asks `p_name LIKE 'forest%'` of the two hundred thousand parts twice, and a call to
+    // compare bytes for each of them was a fifth of the query.
+    if let (false, Pattern::Prefix(prefix)) = (like.fold_case, &like.compiled) {
+        let prefix = prefix.as_bytes();
+        let views = column.views();
+        let head = prefix.len().min(4);
+        let validity = over_valid(rows, base, |index| {
+            let at = at(index);
+            let held = views.get(at).is_some_and(|view| {
+                view.len() >= prefix.len()
+                    && view.prefix()[..head] == prefix[..head]
+                    && (prefix.len() <= 4
+                        || column.bytes(at).is_some_and(|text| text.starts_with(prefix)))
+            }) || (prefix.is_empty() && views.get(at).is_none());
+            out[index] = held != like.negated;
+            Ok(())
+        })?;
+        return finish(returns, Data::Bool(out.into()), validity);
+    }
     let mut characters: Vec<char> = Vec::new();
     let validity = over_valid(rows, base, |index| {
         out[index] = like.holds_at(column, at(index), &mut characters);
@@ -5670,6 +5691,47 @@ mod tests {
                 let want = answer(flat);
                 assert_eq!(answer(short), want, "{name} {spelling} over a short dictionary");
                 assert_eq!(answer(long), want, "{name} {spelling} over a long one");
+            }
+        }
+    }
+
+    /// A prefix decided on a view's length and first four bytes agrees with the bytes themselves,
+    /// for strings held in the view and in the arena, ones that share the first four bytes and part
+    /// later, ones shorter than the prefix, and nulls.
+    #[test]
+    fn a_prefix_like_on_the_views_agrees_with_the_bytes() {
+        let seen = [
+            Some("forest green almond"),
+            Some("forest"),
+            Some("fore"),
+            Some("foresee the weather"),
+            Some("forestx"),
+            Some("frosted lace navy"),
+            Some(""),
+            None,
+            Some("forest green almond blue"),
+            Some("f"),
+        ];
+        let rows: Vec<Value> = seen
+            .iter()
+            .map(|text| text.map_or(Value::Null, |text| Value::Varchar(text.into())))
+            .collect();
+        let text = Vector::from_values(LogicalType::Varchar, &rows).expect("builds");
+        let count = rows.len();
+        for prefix in ["", "f", "fore", "fores", "forest", "forest green almond b", "x"] {
+            let pattern =
+                Vector::constant(LogicalType::Varchar, Value::Varchar(format!("{prefix}%")), count);
+            for (name, negated) in [("~~", false), ("!~~", true)] {
+                let out =
+                    binary(name, &Hoisted::Nothing, &text, &pattern, &LogicalType::Boolean, count, None)
+                        .expect("the call is written")
+                        .expect("flat text has a loop of its own");
+                for (row, held) in seen.iter().enumerate() {
+                    let want = held.map_or(Value::Null, |held| {
+                        Value::Boolean(held.starts_with(prefix) != negated)
+                    });
+                    assert_eq!(out.value_at(row), want, "{name} {prefix:?} on {held:?}");
+                }
             }
         }
     }
