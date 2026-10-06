@@ -3,8 +3,8 @@
 //! The thread reads with `poll(2)` on the socket and on its wake pipe. The startup reads packets
 //! with [`Handshake`] until a `StartupMessage`, and the main loop reads messages with [`Session`],
 //! which decides when `ReadyForQuery` goes out and which messages to drop. The output collects in
-//! one buffer, which goes to the socket at `ReadyForQuery`, at `Flush`, at the end of the
-//! connection, and when it is larger than [`FLUSH_AT`], as PostgreSQL does.
+//! one buffer, which goes to the socket at `ReadyForQuery`, at `Flush`, after an error, at the
+//! end of the connection, and when it is larger than [`FLUSH_AT`], as PostgreSQL does.
 //!
 //! This version has the simple and the extended query flows, and the settings of PostgreSQL with
 //! `SET`, `RESET`, `SHOW` and `ParameterStatus`, and the authentication methods of `pg_hba.conf`
@@ -761,6 +761,9 @@ fn serve(
                 wire.out.protocol_error(&fatal, start.protocol);
                 return wire.flush();
             }
+            // As in PostgreSQL the error goes to the client at once. The server skips a `Flush`
+            // after it until the next `Sync`.
+            wire.flush()?;
         }
         if wire.out.len() >= FLUSH_AT {
             wire.flush()?;

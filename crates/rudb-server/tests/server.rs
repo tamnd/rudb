@@ -670,6 +670,15 @@ fn the_errors_of_the_extended_query_flow() {
     let messages = client.sync();
     assert_eq!(tags(&messages), "12CZ");
     assert_eq!(messages[3].body, b"I");
+
+    // An error goes to the client at once, also in a pipeline that sends Flush and no Sync.
+    client.parse("", "select nope(1)", &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 0);
+    client.send(&Frontend::Flush);
+    let error = client.next().unwrap();
+    assert_eq!((error.tag, error.field(b'C').as_deref()), (b'E', Some("42883")));
+    assert_eq!(tags(&client.sync()), "Z");
     server.stop().unwrap();
 }
 
