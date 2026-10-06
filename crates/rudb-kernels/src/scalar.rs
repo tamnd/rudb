@@ -3780,9 +3780,19 @@ impl Years {
         Some(Self { first: i64::from(first), starts })
     }
 
-    /// The year of `day`, which has to be one of the dates this was made over.
-    fn of(&self, day: i32) -> i64 {
-        self.first + self.starts.iter().map(|&start| i64::from(day >= start)).sum::<i64>()
+    /// The year of each of `days`, which have to be the dates this was made over, into `out`.
+    ///
+    /// One pass over the rows for each new year day rather than one pass over the new year days
+    /// for each row, so the inner loop is a compare and an add across the column with nothing
+    /// carried from one row to the next, which is the shape that goes into vector registers. A row
+    /// at a time was 44 instructions a row on q09 and this is a few for each year the dates span.
+    fn fill(&self, days: &[i32], out: &mut [i64]) {
+        out.fill(self.first);
+        for &start in &self.starts {
+            for (year, &day) in out.iter_mut().zip(days) {
+                *year += i64::from(day >= start);
+            }
+        }
     }
 }
 
@@ -3835,13 +3845,19 @@ fn date_runs<A: Fn(usize) -> usize>(
         }
         (LogicalType::Date, Data::Int32(days), false) => {
             let mut out = vec![0i64; rows];
+            // The dates read out once into a column of their own, which both passes then go
+            // through in order. The years under a null are worked out with the rest, since they
+            // cannot fail and are never read.
+            let read: Vec<i32> = if part == Part::Year {
+                (0..rows).map(|index| days[at(index)]).collect()
+            } else {
+                Vec::new()
+            };
             let validity = if part == Part::Year
-                && let Some(years) = Years::over((0..rows).map(|index| days[at(index)]))
+                && let Some(years) = Years::over(read.iter().copied())
             {
-                over_valid(rows, base, |index| {
-                    out[index] = years.of(days[at(index)]);
-                    Ok(())
-                })?
+                years.fill(&read, &mut out);
+                if rows == 0 { Validity::AllValid } else { base.normalize(rows) }
             } else {
                 over_valid(rows, base, |index| {
                     out[index] = part.of_days(days[at(index)])?;
