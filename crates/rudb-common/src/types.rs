@@ -104,7 +104,7 @@ impl Field {
 /// nesting level, which makes it a property of a vector's validity mask rather than of a type.
 /// The one exception is [`LogicalType::Null`], which is the type of a literal `NULL` before
 /// anything has told it what it is, and which every other type absorbs during resolution.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LogicalType {
     /// The type of an untyped `NULL` literal.
@@ -339,6 +339,25 @@ impl PhysicalType {
             Self::Int64 | Self::UInt64 | Self::Float64 | Self::List => 8,
             Self::Int128 | Self::UInt128 | Self::Interval | Self::Varlen => 16,
             Self::Array | Self::Struct | Self::Empty => 0,
+        }
+    }
+}
+
+// A type is hashed every time an expression is, and an enum can have tens of thousands of labels,
+// so an enum hashes as how many labels it has and its first and last one rather than every label.
+// Equal types still hash the same, which is all a hash owes `Eq`.
+impl std::hash::Hash for LogicalType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Decimal { width, scale } => (width, scale).hash(state),
+            Self::List(element) => element.hash(state),
+            Self::Array(element, size) => (element, size).hash(state),
+            Self::Struct(fields) | Self::Union(fields) => fields.hash(state),
+            Self::Map(key, value) => (key, value).hash(state),
+            Self::Enum(labels) => (labels.len(), labels.first(), labels.last()).hash(state),
+            Self::AggregateState(held) => held.hash(state),
+            _ => {}
         }
     }
 }

@@ -692,6 +692,14 @@ impl Accumulator {
                 }
                 return Ok(());
             }
+            if general.takes_places()
+                && let Some(codes) = args.first().map(places).transpose()?.flatten()
+            {
+                for (_, place) in placed(&codes, rows) {
+                    general.push_place(place);
+                }
+                return Ok(());
+            }
             if general.takes_columns()
                 && let Some(input) = args.first()
                 && let Some(column) = Column::of(input, rows)
@@ -1662,6 +1670,27 @@ pub fn update_tallied(
     Ok(())
 }
 
+/// The label positions of an enum vector, flat, or `None` when `input` is not an enum and has to
+/// go in as values.
+fn places(input: &Vector) -> Result<Option<Vector>> {
+    if input.logical_type().labels().is_none() {
+        return Ok(None);
+    }
+    // flatten: the codes of a constant come back as a constant, and the loops read them by row.
+    Ok(Some(input.enum_codes()?.flatten()?))
+}
+
+/// Every row of the first `rows` of `codes` that is not null, with the place of its label.
+fn placed(codes: &Vector, rows: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let data = codes.data();
+    (0..rows.min(codes.len())).filter(|&row| codes.validity().is_valid(row)).filter_map(
+        move |row| {
+            let code = data?.unsigned_at(row)?;
+            Some((row, usize::try_from(code).ok()?))
+        },
+    )
+}
+
 /// Folds every argument of one call into many accumulators a row at a time, for the aggregates that
 /// are not a count, a total or an extreme, or says `false` for those and touches nothing.
 ///
@@ -1688,6 +1717,20 @@ pub fn update_general(
         return Err(Error::internal(format!("an aggregate handed {rows} rows and less to fold")));
     }
     let into = Where { slots: &slots[..rows], stride, offset, tally: None };
+    let codes = match (&states[offset].state, inputs.first()) {
+        (State::General(general), Some(input)) if general.takes_places() => places(input)?,
+        _ => None,
+    };
+    if let Some(codes) = codes {
+        for (row, place) in placed(&codes, rows) {
+            let Some(index) = into.index(row) else { continue };
+            let Some(Accumulator { state: State::General(general) }) = states.get_mut(index) else {
+                return Err(Error::internal(format!("an aggregate state at {index} is not held")));
+            };
+            general.push_place(place);
+        }
+        return Ok(true);
+    }
     let column = match (&states[offset].state, inputs.first()) {
         (State::General(general), Some(input)) if general.takes_columns() => {
             Column::of(input, rows).map(|column| (column, input.validity()))

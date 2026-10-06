@@ -82,6 +82,28 @@ fn a_grouped_or_ordered_aggregate_weighs_an_enum_by_place() {
 }
 
 #[test]
+fn min_and_max_read_the_places_an_enum_is_stored_as() {
+    let database = declared();
+    for (sql, expected) in [
+        (
+            "SELECT min(e), max(e), min(g), max(g), count(g) FROM (SELECT large_enum AS g, \
+             medium_enum AS e FROM test_all_types(use_large_enum := true)), range(3)",
+            vec!["enum_0|enum_299|enum_0|enum_69999|6"],
+        ),
+        (
+            "SELECT r % 2 AS k, max('x'::t), \
+             min(CASE WHEN r % 3 = 0 THEN NULL ELSE ['y', 'z', 'x'][1 + r % 3]::t END), \
+             max(CASE WHEN r % 3 = 0 THEN NULL ELSE ['y', 'z', 'x'][1 + r % 3]::t END) \
+             FROM range(10) AS s(r) GROUP BY k ORDER BY k",
+            vec!["0|x|z|x", "1|x|z|x"],
+        ),
+        ("SELECT min(v), max(v) FROM (SELECT NULL::t AS v FROM range(4))", vec!["NULL|NULL"]),
+    ] {
+        assert_eq!(answered(&database, sql), expected, "{sql}");
+    }
+}
+
+#[test]
 fn an_enum_hashes_as_the_integer_it_is_stored_in() {
     let database = declared();
     assert_eq!(
