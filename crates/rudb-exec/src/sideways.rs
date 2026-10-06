@@ -1345,7 +1345,11 @@ pub(crate) fn found_for(
     let listing = exact
         .filter(|_| !placed && domain.is_some())
         .and(reduced.filter(|reduced| reduced.by_key))
-        .map(|reduced| Listing { count: reduced.kept, planned: OnceLock::new(), gathered: OnceLock::new() });
+        .map(|reduced| Listing {
+            count: reduced.kept,
+            planned: OnceLock::new(),
+            gathered: OnceLock::new(),
+        });
     // The exact rows answer everything the filter would, with no false positives, so a side that
     // has them does not pay for building the filter too. Nor does a side whose reduction stopped
     // early, because it stopped on finding that the first third of the driving table all matches,
