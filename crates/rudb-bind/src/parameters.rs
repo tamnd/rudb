@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rudb_common::{Error, Field, LogicalType, Origin, Value};
+use rudb_common::{DeclaredType, Error, Field, LogicalType, Origin, Value};
 
 /// What a prepared statement was handed, by identifier.
 ///
@@ -40,6 +40,9 @@ pub struct Described {
     pub declared: Vec<(String, Option<LogicalType>)>,
     /// Each parameter that got a type, with that type, in the order they got it.
     pub resolved: Vec<(String, LogicalType)>,
+    /// Each parameter that got a PostgreSQL type that a cast or a column declaration wrote, such
+    /// as `varchar(10)`, with that type. The logical type of such a type is in `resolved` too.
+    pub written: Vec<(String, DeclaredType)>,
     /// The columns the statement answers: those of a query or of a `RETURNING` list. `None` for a
     /// statement that answers no rows.
     pub fields: Option<Vec<Field>>,
@@ -70,6 +73,14 @@ impl Placeholders {
         let mut described = self.lock();
         if !described.resolved.iter().any(|(held, _)| same(held, name)) {
             described.resolved.push((name.to_string(), ty.clone()));
+        }
+    }
+
+    /// Gives the parameter `name` the PostgreSQL type `ty`, unless it has one already.
+    pub fn resolve_written(&self, name: &str, ty: DeclaredType) {
+        let mut described = self.lock();
+        if !described.written.iter().any(|(held, _)| same(held, name)) {
+            described.written.push((name.to_string(), ty));
         }
     }
 

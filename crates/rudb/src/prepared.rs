@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rudb_bind::Parameters;
 use rudb_catalog::QualifiedName;
-use rudb_common::{Error, Field, LogicalType, Origin, Result, Value};
+use rudb_common::{DeclaredType, Error, Field, LogicalType, Origin, Result, Value};
 use rudb_parse::ast::{self, Ast};
 
 use crate::connection::single;
@@ -17,6 +17,9 @@ pub struct Description {
     /// The type of each parameter, in the order of [`Prepared::parameters`], or `None` where
     /// nothing in the statement settles it.
     pub parameters: Vec<Option<LogicalType>>,
+    /// The PostgreSQL type of each parameter, in the same order, where a cast or the declaration
+    /// of a column wrote one, such as `varchar(10)`.
+    pub written: Vec<Option<DeclaredType>>,
     /// The columns the statement answers, or `None` for a statement that answers no rows.
     pub fields: Option<Vec<Field>>,
     /// The table column that each of `fields` reads with no change, where there is one.
@@ -875,8 +878,20 @@ impl Prepared {
                     .map(|(_, ty)| ty.clone())
             })
             .collect();
+        let written = self
+            .names
+            .iter()
+            .map(|name| {
+                described
+                    .written
+                    .iter()
+                    .find(|(held, _)| held.eq_ignore_ascii_case(name))
+                    .map(|(_, ty)| *ty)
+            })
+            .collect();
         let description = Description {
             parameters,
+            written,
             fields: described.fields,
             origins: described.origins,
             planning: described.planning,

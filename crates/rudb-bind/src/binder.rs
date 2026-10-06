@@ -2626,6 +2626,10 @@ impl<'a> Binder<'a> {
         self.clause = "LIMIT clause";
         let scope = Scope::empty();
         let bound = self.bind_expr(ast, written, &scope)?;
+        // PostgreSQL casts the count to `bigint`, and a parameter takes that type.
+        if self.session.postgres().is_some() {
+            self.resolve_placeholder(bound, &LogicalType::BigInt);
+        }
         let Some(value) = fold::value_of(&self.plan, bound)? else {
             return Ok(Bound::Read(bound));
         };
