@@ -5225,8 +5225,10 @@ mod tests {
         let days: Vec<i32> =
             (-800..5000).step_by(7).chain([-731, -366, -365, -1, 0, 364, 365]).collect();
         let years = Years::over(days.iter().copied()).expect("a span this short has its years");
-        for &day in &days {
-            assert_eq!(years.of(day), Part::Year.of_days(day).expect("a date"), "day {day}");
+        let mut out = vec![0; days.len()];
+        years.fill(&days, &mut out);
+        for (&day, &year) in days.iter().zip(&out) {
+            assert_eq!(year, Part::Year.of_days(day).expect("a date"), "day {day}");
         }
         assert!(Years::over(std::iter::empty()).is_none());
         assert!(Years::over([0, 365 * 40].into_iter()).is_none());
