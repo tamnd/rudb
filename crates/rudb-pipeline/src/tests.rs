@@ -561,17 +561,18 @@ impl Sink for Sizes {
     }
 }
 
-/// A sink that does not want full chunks gets them as the operator above it made them, while that
-/// operator still gets the source's ten row chunks laid into one per morsel.
+/// A sink that does not want full chunks gets them as the operator above it made them. The source's
+/// chunks are too full to hold, and the halves `Evens` leaves of them are sparse, so the only
+/// boundary that could lay them together is the one in front of the sink.
 #[test]
 fn a_sink_that_wants_sparse_chunks_gets_them_as_they_came() {
-    let source = Arc::new(Counting::new((1..=100).collect(), 50, 10));
+    let source = Arc::new(Counting::new((1..=6000).collect(), 6000, 1500));
     let sink = Arc::new(Sizes::default());
     let built = pipeline(source, Arc::clone(&sink)).then(Arc::new(Evens) as Arc<dyn DynStream>);
 
     run_serial(&built, &Cancel::new()).unwrap();
 
-    assert_eq!(*sink.global.lock().unwrap(), vec![25, 25]);
+    assert_eq!(*sink.global.lock().unwrap(), vec![750; 4]);
 }
 
 /// Who flattens a chunk on its way out of the engine, which is the sink and not the caller.
