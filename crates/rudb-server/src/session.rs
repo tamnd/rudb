@@ -53,7 +53,17 @@ use crate::x509;
 /// result, the size of the send buffer of PostgreSQL.
 const FLUSH_AT: usize = 64 << 10;
 
-/// The size of each read from the socket.
+/// The time after which a session that waits for input counts as idle and gives back the memory
+/// that a statement used, the stack pages and a large input buffer. A client that sends its next
+/// statement sooner does not pay for this.
+const IDLE_MS: i32 = 100;
+
+/// The size of the first read from the socket. Most messages are small, so a session that only
+/// sends small messages keeps a small buffer while it is idle.
+const FIRST_READ: usize = 1 << 10;
+
+/// The largest size of a read from the socket. A read that fills all the space it had makes the
+/// next read twice as large, up to this size.
 const READ_SIZE: usize = 16 << 10;
 
 /// The version that `server_version` gives. `libpq` and the drivers read the number before the
@@ -83,11 +93,20 @@ struct Input {
     buf: Vec<u8>,
     head: usize,
     end: usize,
+    /// The space that the next read has at least, zero before the first read.
+    read: usize,
 }
 
 impl Input {
     fn pending(&self) -> &[u8] {
         &self.buf[self.head..self.end]
+    }
+
+    /// Gives back a buffer that grew past the size of the first read, when it holds nothing.
+    fn trim(&mut self) {
+        if self.head == self.end && self.buf.len() > FIRST_READ {
+            *self = Self::default();
+        }
     }
 
     fn consume(&mut self, n: usize) {
@@ -129,7 +148,15 @@ impl Wire {
         let [socket, wake] = if self.stream.buffered() {
             [true, false]
         } else {
-            poll::readable([self.stream.as_raw_fd(), self.wake.as_raw_fd()])?
+            let fds = [self.stream.as_raw_fd(), self.wake.as_raw_fd()];
+            match poll::readable_within(fds, IDLE_MS)? {
+                Some(ready) => ready,
+                None => {
+                    input.trim();
+                    poll::trim_stack();
+                    poll::readable(fds)?
+                }
+            }
         };
         if wake {
             let mut drop = [0u8; 64];
@@ -138,16 +165,20 @@ impl Wire {
                 return Ok(Filled::Woken);
             }
         }
-        if input.buf.len() < input.end + READ_SIZE {
-            input.buf.resize(input.end + READ_SIZE, 0);
+        let want = input.read.max(FIRST_READ);
+        if input.buf.len() < input.end + want {
+            input.buf.resize(input.end + want, 0);
         }
+        let room = input.buf.len() - input.end;
         let read = loop {
             match self.stream.read(&mut input.buf[input.end..]) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 other => break other,
             }
         };
-        input.end += *read.as_ref().unwrap_or(&0);
+        let count = *read.as_ref().unwrap_or(&0);
+        input.end += count;
+        input.read = if count == room { (want * 2).min(READ_SIZE) } else { want };
         match read {
             Ok(0) => Ok(Filled::Closed),
             Ok(_) => Ok(Filled::Data),
@@ -495,6 +526,8 @@ pub(crate) fn base_settings(
     for (name, value) in paths {
         let _ = settings.set_argument(name, value);
     }
+    // Each session shares these slots and holds only the ones it changes.
+    settings.share();
     settings
 }
 

@@ -80,8 +80,20 @@ impl<T> ReadMostly<T> {
     /// A lock holding `value`.
     #[must_use]
     pub fn new(value: T) -> Self {
+        Self::with_slots(value, SLOTS)
+    }
+
+    /// A lock holding `value` with one reader slot, for a value that one thread reads nearly
+    /// always. It takes 128 bytes, where [`ReadMostly::new`] takes 8 KiB.
+    #[must_use]
+    pub fn narrow(value: T) -> Self {
+        Self::with_slots(value, 1)
+    }
+
+    fn with_slots(value: T, slots: usize) -> Self {
+        debug_assert!(slots.is_power_of_two() && slots <= SLOTS);
         Self {
-            slots: (0..SLOTS).map(|_| Slot::default()).collect(),
+            slots: (0..slots).map(|_| Slot::default()).collect(),
             writing: AtomicBool::new(false),
             writers: Mutex::new(()),
             value: UnsafeCell::new(value),
@@ -90,7 +102,8 @@ impl<T> ReadMostly<T> {
 
     /// Reads the value, waiting for a writer that holds it.
     pub fn read(&self) -> ReadGuard<'_, T> {
-        let slot = &self.slots[mine()];
+        // The number of slots is a power of two, so the mask keeps the index in the slots.
+        let slot = &self.slots[mine() & (self.slots.len() - 1)];
         loop {
             slot.0.fetch_add(1, Ordering::SeqCst);
             if !self.writing.load(Ordering::SeqCst) {
@@ -217,7 +230,16 @@ mod tests {
 
     #[test]
     fn readers_see_whole_writes_and_writers_wait_for_readers() {
-        let lock = Arc::new(ReadMostly::new((0_u64, 0_u64)));
+        readers_and_writers(ReadMostly::new((0, 0)));
+    }
+
+    #[test]
+    fn readers_that_share_one_slot_see_whole_writes() {
+        readers_and_writers(ReadMostly::narrow((0, 0)));
+    }
+
+    fn readers_and_writers(lock: ReadMostly<(u64, u64)>) {
+        let lock = Arc::new(lock);
         let done = Arc::new(AtomicBool::new(false));
         let readers: Vec<_> = (0..6)
             .map(|_| {

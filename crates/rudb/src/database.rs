@@ -698,7 +698,8 @@ impl Conn {
     fn new(registry: Arc<Board>) -> Self {
         Self {
             open: Mutex::default(),
-            catalog: ReadMostly::new(Catalog::bare()),
+            // Only the thread of the connection reads it, so one reader slot is enough.
+            catalog: ReadMostly::narrow(Catalog::bare()),
             private: AtomicBool::new(false),
             staged: Mutex::default(),
             registry,

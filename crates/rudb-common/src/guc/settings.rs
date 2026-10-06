@@ -182,16 +182,34 @@ fn lower(name: &str) -> Cow<'_, str> {
     }
 }
 
+/// The slot of a name in lower case to change, copied from `base` when it is only there.
+fn owned<'a>(
+    slots: &'a mut Arc<HashMap<String, Slot>>,
+    base: &HashMap<String, Slot>,
+    key: &str,
+) -> Option<&'a mut Slot> {
+    let slots = Arc::make_mut(slots);
+    if !slots.contains_key(key) {
+        slots.insert(key.to_owned(), base.get(key)?.clone());
+    }
+    slots.get_mut(key)
+}
+
 /// The prefix that rudb keeps for its own parameters.
 const RESERVED_PREFIX: &str = "rudb";
 
 /// The parameter values of one session.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// The changed parameters and the placeholders, by name in lower case. Shared between the
-    /// copies of one session's settings until one of them changes a value, because the server
-    /// copies the settings for the engine at each change and at the start of each session.
+    /// The slots that [`Settings::share`] moved here, which the server makes once for every
+    /// session. A session does not change them. It copies a slot to `slots` before it changes it.
+    base: Arc<HashMap<String, Slot>>,
+    /// The changed parameters and the placeholders, by name in lower case, over the ones in
+    /// `base`. Shared between the copies of one session's settings until one of them changes a
+    /// value, because the server copies the settings for the engine at each change.
     slots: Arc<HashMap<String, Slot>>,
+    /// The number of names in `base` and `slots` together, which gives the order of a new slot.
+    count: usize,
     /// The names of the slots that the current transaction changed.
     saved: Vec<String>,
     /// The names of the reported parameters that changed since the last report, the first one
@@ -208,13 +226,38 @@ impl Settings {
     #[must_use]
     pub fn new(superuser: bool) -> Self {
         Self {
+            base: Arc::default(),
             slots: Arc::default(),
+            count: 0,
             saved: Vec::new(),
             pending: Vec::new(),
             reported: Arc::default(),
             generation: 0,
             superuser,
         }
+    }
+
+    /// Moves the slots of these settings to the part that the copies share and do not change. The
+    /// server does this to the values that each session starts with, so that a session holds only
+    /// the slots that it changes. Call it outside of a transaction.
+    pub fn share(&mut self) {
+        if self.slots.is_empty() {
+            return;
+        }
+        let own = std::mem::take(&mut self.slots);
+        let own = Arc::try_unwrap(own).unwrap_or_else(|own| (*own).clone());
+        Arc::make_mut(&mut self.base).extend(own);
+    }
+
+    /// The slot of a name in lower case, from `slots` or else from `base`.
+    fn find_slot(&self, key: &str) -> Option<&Slot> {
+        self.slots.get(key).or_else(|| self.base.get(key))
+    }
+
+    /// Each slot with its name, once for each name.
+    fn each_slot(&self) -> impl Iterator<Item = (&String, &Slot)> {
+        let base = self.base.iter().filter(|(key, _)| !self.slots.contains_key(key.as_str()));
+        self.slots.iter().chain(base)
     }
 
     /// Changes whether the session counts as a superuser for the parameters that only a superuser
@@ -331,8 +374,8 @@ impl Settings {
     #[must_use]
     pub fn file_names(&self) -> Vec<String> {
         let mut names: Vec<(usize, String)> = self
-            .slots
-            .values()
+            .each_slot()
+            .map(|(_, slot)| slot)
             .filter(|slot| slot.reset.source == Source::File)
             .map(|slot| (slot.order, slot.name.clone()))
             .collect();
@@ -371,7 +414,7 @@ impl Settings {
                 setting: self.parse(parameter, text)?,
                 source: if origin == Origin::Startup { Source::Client } else { Source::Session },
             },
-            None => self.slots.get(key.as_ref()).map_or_else(
+            None => self.find_slot(key.as_ref()).map_or_else(
                 || Value { setting: parameter.boot(), source: Source::Default },
                 |slot| slot.reset.clone(),
             ),
@@ -443,7 +486,7 @@ impl Settings {
     /// Reads a value with the type rules and the check hook of the parameter.
     fn parse(&self, parameter: &Parameter, text: &str) -> Result<Setting, Error> {
         let setting = parameter.parse(text)?;
-        let (current, reset) = match self.slots.get(lower(parameter.name).as_ref()) {
+        let (current, reset) = match self.find_slot(lower(parameter.name).as_ref()) {
             Some(slot) => {
                 (parameter.show(&slot.current.setting), parameter.show(&slot.reset.setting))
             }
@@ -457,23 +500,28 @@ impl Settings {
 
     /// Makes the slot of a parameter if the session did not change it before.
     fn slot(&mut self, key: &str, parameter: Option<&'static Parameter>, name: &str) -> &mut Slot {
-        let order = self.slots.len();
         let slots = Arc::make_mut(&mut self.slots);
-        if slots.contains_key(key) {
-            return slots.get_mut(key).expect("the slot is there");
+        if !slots.contains_key(key) {
+            let slot = match self.base.get(key) {
+                Some(slot) => slot.clone(),
+                None => {
+                    let setting =
+                        parameter.map_or_else(|| Setting::String(String::new()), Parameter::boot);
+                    let value = Value { setting, source: Source::Default };
+                    self.count += 1;
+                    Slot {
+                        parameter,
+                        name: name.to_owned(),
+                        current: value.clone(),
+                        reset: value,
+                        save: None,
+                        order: self.count - 1,
+                    }
+                }
+            };
+            slots.insert(key.to_owned(), slot);
         }
-        slots.entry(key.to_owned()).or_insert_with(|| {
-            let setting = parameter.map_or_else(|| Setting::String(String::new()), Parameter::boot);
-            let value = Value { setting, source: Source::Default };
-            Slot {
-                parameter,
-                name: name.to_owned(),
-                current: value.clone(),
-                reset: value,
-                save: None,
-                order,
-            }
-        })
+        slots.get_mut(key).expect("the slot is there")
     }
 
     /// Sets the current value and the reset value, outside of a transaction.
@@ -489,7 +537,7 @@ impl Settings {
 
     /// Sets the current value in the current transaction, with the save of `push_old_value`.
     fn assign(&mut self, key: &str, value: Value, action: Action) {
-        let slot = Arc::make_mut(&mut self.slots).get_mut(key).expect("the caller made the slot");
+        let slot = owned(&mut self.slots, &self.base, key).expect("the caller made the slot");
         match (&mut slot.save, action) {
             (None, _) => {
                 let state = if action == Action::Set { State::Set } else { State::Local };
@@ -523,8 +571,7 @@ impl Settings {
     /// that `RESET ALL` does not change.
     pub fn reset_all(&mut self) {
         let mut keys: Vec<(usize, String)> = self
-            .slots
-            .iter()
+            .each_slot()
             .filter(|(_, slot)| {
                 slot.current.source == Source::Session
                     && slot.parameter.is_none_or(|parameter| {
@@ -536,7 +583,7 @@ impl Settings {
             .collect();
         keys.sort();
         for (_, key) in keys {
-            let reset = self.slots[&key].reset.clone();
+            let Some(reset) = self.find_slot(&key).map(|slot| slot.reset.clone()) else { continue };
             self.assign(&key, reset, Action::Set);
         }
     }
@@ -544,7 +591,7 @@ impl Settings {
     /// The end of a transaction: keeps or restores the values that it changed.
     pub fn end(&mut self, commit: bool) {
         for key in std::mem::take(&mut self.saved) {
-            let Some(slot) = Arc::make_mut(&mut self.slots).get_mut(&key) else { continue };
+            let Some(slot) = owned(&mut self.slots, &self.base, &key) else { continue };
             let Some(save) = slot.save.take() else { continue };
             let restore = match save.state {
                 State::Set if commit => None,
@@ -567,7 +614,7 @@ impl Settings {
     pub fn get(&self, name: &str) -> Option<String> {
         match find(name) {
             Some(parameter) => Some(self.shown(parameter)),
-            None => self.slots.get(lower(name).as_ref()).map(|slot| match &slot.current.setting {
+            None => self.find_slot(lower(name).as_ref()).map(|slot| match &slot.current.setting {
                 Setting::String(text) => text.clone(),
                 _ => String::new(),
             }),
@@ -577,11 +624,10 @@ impl Settings {
     /// The current value of a parameter in its base unit.
     #[must_use]
     pub fn setting(&self, parameter: &'static Parameter) -> Setting {
-        if self.slots.is_empty() {
+        if self.slots.is_empty() && self.base.is_empty() {
             return parameter.boot();
         }
-        self.slots
-            .get(lower(parameter.name).as_ref())
+        self.find_slot(lower(parameter.name).as_ref())
             .map_or_else(|| parameter.boot(), |slot| slot.current.setting.clone())
     }
 
@@ -594,7 +640,7 @@ impl Settings {
         if let Some(parameter) = find(name) {
             return Ok((parameter.name.to_owned(), self.shown(parameter)));
         }
-        match self.slots.get(lower(name).as_ref()) {
+        match self.find_slot(lower(name).as_ref()) {
             Some(slot) => Ok((slot.name.clone(), self.get(name).unwrap_or_default())),
             None => Err(unrecognized(name)),
         }
@@ -851,5 +897,38 @@ mod tests {
         assert!(s.set_file("nodot", Some("x")).is_err());
         assert!(s.set_file("rudb.option", Some("x")).is_err());
         assert!(s.set_file("work_mem", Some("1kB")).is_err());
+    }
+
+    #[test]
+    fn shared_values_stay_the_same_for_the_other_copies() {
+        let mut server = Settings::new(true);
+        server.set_file("work_mem", Some("8MB")).unwrap();
+        server.set_file("my.option", Some("x")).unwrap();
+        server.set_argument("lock_timeout", "2s").unwrap();
+        server.share();
+        assert!(server.slots.is_empty());
+        let mut one = server.clone();
+        let two = server.clone();
+        assert!(Arc::ptr_eq(&one.base, &two.base));
+
+        set(&mut one, "work_mem", "64MB").unwrap();
+        set(&mut one, "my.option", "y").unwrap();
+        set(&mut one, "statement_timeout", "5s").unwrap();
+        one.end(true);
+        assert_eq!(one.slots.len(), 3, "only the changed slots are copied");
+        assert_eq!(one.get("work_mem").unwrap(), "64MB");
+        assert_eq!(two.get("work_mem").unwrap(), "8MB");
+        assert_eq!(two.get("my.option").unwrap(), "x");
+        assert_eq!(one.file_names(), ["work_mem", "my.option"]);
+
+        set(&mut one, "lock_timeout", "9s").unwrap();
+        one.end(false);
+        assert_eq!(one.get("lock_timeout").unwrap(), "2s");
+        one.reset_all();
+        one.end(true);
+        assert_eq!(one.get("work_mem").unwrap(), "8MB", "RESET ALL goes to the shared value");
+        assert_eq!(one.get("my.option").unwrap(), "x");
+        assert_eq!(one.get("statement_timeout").unwrap(), "0");
+        assert_eq!(two.slots.len(), 0);
     }
 }

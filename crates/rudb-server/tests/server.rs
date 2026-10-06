@@ -793,6 +793,26 @@ fn the_startup_refusals() {
 }
 
 /// The `ParameterStatus` messages of a list, as `name=value`.
+/// After 100 ms with no input, a session gives back the stack pages and the input buffer that
+/// its last statement used. The statements after that get new pages and a new buffer.
+#[test]
+fn a_session_that_was_idle_runs_deep_and_long_statements() {
+    let dirs = Dirs::new("idle");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::tcp(&server);
+    connect(&mut client, PROTOCOL_3_2);
+    let deep = format!("select {}1{}", "(".repeat(100), ")".repeat(100));
+    let long = format!("select '{}'", "x".repeat(100_000));
+    for _ in 0..3 {
+        assert_eq!(scalar(&mut client, &deep), "1");
+        assert_eq!(scalar(&mut client, &long).len(), 100_000);
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(scalar(&mut client, "select 2"), "2");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    server.stop().unwrap();
+}
+
 fn statuses(messages: &[Message]) -> Vec<String> {
     let status = |m: &Message| text(m).replacen('\0', "=", 1);
     messages.iter().filter(|m| m.tag == b'S').map(status).collect()
