@@ -65,6 +65,7 @@
 //! is the one the estimator asks.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -255,6 +256,18 @@ pub struct MemoryTable {
     /// counted the first time they are asked for and dropped whenever a row is added, like `grams`.
     /// The compiler asks for every column it scans on every query, and counting walks every group.
     coded: Vec<OnceLock<usize>>,
+    /// The rows a delete took out of each chunk that lost any, by their place among the rows the
+    /// chunk was given, rising.
+    ///
+    /// A chunk keeps its slot and its rows for as long as the table does, through a tail closing
+    /// and a group sealing, so a row is taken out by noting it here rather than by building the
+    /// table again without it, which a `DELETE` of one row by its key used to do. Every read leaves
+    /// the rows out and everything that counts rows counts the ones left. Shared between copies of
+    /// the table, as `counts` is.
+    taken: Arc<BTreeMap<usize, Vec<u32>>>,
+    /// How many rows `taken` holds.
+    taken_rows: usize,
+    /// How many rows the table was given, the ones taken out since included.
     rows: usize,
     stats_ns: u64,
     counts_ns: u64,
@@ -286,6 +299,8 @@ impl MemoryTable {
             lists,
             extremes,
             coded,
+            taken: Arc::default(),
+            taken_rows: 0,
             rows: 0,
             stats_ns: 0,
             counts_ns: 0,
@@ -307,13 +322,19 @@ impl MemoryTable {
     /// How many rows, across every chunk.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.rows
+        self.rows - self.taken_rows
     }
 
     /// Whether the table has no rows.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rows == 0
+        self.len() == 0
+    }
+
+    /// How many rows were taken out of the table where they are, see [`Self::take`].
+    #[must_use]
+    pub fn taken(&self) -> usize {
+        self.taken_rows
     }
 
     /// How many chunks a scan will read.
@@ -794,11 +815,34 @@ impl MemoryTable {
     #[must_use]
     pub fn group_rows(&self, index: usize) -> usize {
         match self.groups.get(index) {
-            Some(group) => group.rows,
+            Some(group) => group.rows - self.lost_over(group.chunks.clone()),
             // The open run, which is the entry `group_parts` puts after the groups.
-            None if index == self.groups.len() => self.open_rows,
+            None if index == self.groups.len() => {
+                let open = self.open.len() + usize::from(self.tail_rows > 0);
+                self.open_rows - self.lost_over(self.slots.len() - open..self.slots.len())
+            }
             None => 0,
         }
+    }
+
+    /// How many rows were taken out of chunk `index`.
+    fn lost(&self, index: usize) -> usize {
+        self.taken.get(&index).map_or(0, Vec::len)
+    }
+
+    /// How many rows were taken out of the chunks `chunks`.
+    fn lost_over(&self, chunks: std::ops::Range<usize>) -> usize {
+        if self.taken_rows == 0 {
+            return 0;
+        }
+        self.taken.range(chunks).map(|(_, places)| places.len()).sum()
+    }
+
+    /// The places of the rows chunk `index` has left, of the `rows` it was given, when some were
+    /// taken out of it.
+    fn left_in(&self, index: usize, rows: usize) -> Option<Vec<u32>> {
+        let mut taken = self.taken.get(&index)?.iter().copied().peekable();
+        Some((0..rows as u32).filter(|&place| taken.next_if_eq(&place).is_none()).collect())
     }
 
     /// Whether the probes rule out every row of group `index`.
@@ -1141,7 +1185,7 @@ impl MemoryTable {
                 .filter(|g| {
                     g.columns.get(column).is_some_and(|v| v.shared_dictionary_parts().is_some())
                 })
-                .map(|g| g.rows)
+                .map(|g| g.rows - self.lost_over(g.chunks.clone()))
                 .sum()
         });
         Ok((coded, self.len()))
@@ -1209,11 +1253,11 @@ impl MemoryTable {
             )));
         }
         let mut found = Vec::with_capacity(self.zones.len());
-        for (zone, slot) in self.zones.iter().zip(&self.slots) {
+        for (at, (zone, slot)) in self.zones.iter().zip(&self.slots).enumerate() {
             let range = zone
                 .column(column)
                 .ok_or_else(|| Error::internal("a chunk's zone is narrower than the table"))?;
-            found.push((range, self.rows_of(*slot)));
+            found.push((range, self.rows_of(*slot) - self.lost(at)));
         }
         Ok(found)
     }
@@ -1380,6 +1424,19 @@ impl MemoryTable {
     ///
     /// If there is no such chunk, or if a column is past the end of the table.
     pub fn read(&self, chunk: usize, columns: &[usize]) -> Result<Chunk> {
+        let read = self.read_given(chunk, columns)?;
+        let Some(left) = self.left_in(chunk, read.len()) else { return Ok(read) };
+        // Gathered rather than cut, so what a checkpoint writes from it is a plain column and not
+        // a window onto the rows it is leaving behind.
+        let mut picked = Vec::with_capacity(read.width());
+        for column in 0..read.width() {
+            picked.push(read.column(column)?.gather(&left)?);
+        }
+        Chunk::with_rows(picked, left.len())
+    }
+
+    /// [`Self::read`] of every row chunk `chunk` was given, the ones taken out of it included.
+    fn read_given(&self, chunk: usize, columns: &[usize]) -> Result<Chunk> {
         let slot = *self.slots.get(chunk).ok_or_else(|| {
             Error::internal(format!(
                 "chunk {chunk} of a table that has {} chunks",
@@ -1442,6 +1499,15 @@ impl MemoryTable {
     ///
     /// As [`Self::read`], and if a position is past the end of the chunk.
     pub fn read_rows(&self, chunk: usize, columns: &[usize], positions: &[u32]) -> Result<Chunk> {
+        match self.taken.get(&chunk) {
+            Some(taken) => self.read_places(chunk, columns, &among(taken, positions)),
+            None => self.read_places(chunk, columns, positions),
+        }
+    }
+
+    /// [`Self::read_rows`] at places among every row chunk `chunk` was given, the ones taken out
+    /// of it included.
+    fn read_places(&self, chunk: usize, columns: &[usize], positions: &[u32]) -> Result<Chunk> {
         let slot = *self.slots.get(chunk).ok_or_else(|| {
             Error::internal(format!(
                 "chunk {chunk} of a table that has {} chunks",
@@ -1539,7 +1605,7 @@ impl MemoryTable {
     /// every chunk to find out how many rows are in them is the cost this is for.
     #[must_use]
     pub fn chunk_len(&self, index: usize) -> Option<usize> {
-        self.slots.get(index).map(|&slot| self.rows_of(slot))
+        self.slots.get(index).map(|&slot| self.rows_of(slot) - self.lost(index))
     }
 
     /// One stored chunk, whole.
@@ -1588,6 +1654,10 @@ impl MemoryTable {
             .slots
             .get(chunk)
             .ok_or_else(|| Error::internal("a row written in a chunk that is not there"))?;
+        let place = match self.taken.get(&chunk) {
+            Some(taken) => among(taken, &[place as u32])[0] as usize,
+            None => place,
+        };
         if place >= self.rows_of(slot) {
             return Err(Error::internal("a row written past the end of its chunk"));
         }
@@ -1663,6 +1733,87 @@ impl MemoryTable {
         }
         Ok(true)
     }
+
+    /// Takes the rows at `places` of chunk `chunk` out of the table, places among the rows the
+    /// chunk has left, which rise. The rows stay where they are and every read leaves them out from
+    /// now on, so a `DELETE` of a few rows costs those rows rather than a table built again without
+    /// them. Every row after them moves down a place, as it would had the table been built again.
+    ///
+    /// The zones of the chunk and of the group or the run it is in leave the rows out of their null
+    /// counts and stop saying their ends and totals are exact, the counts give up the answers they
+    /// can no longer give exactly, and what was worked out from the rows is dropped the way an
+    /// append drops it.
+    ///
+    /// # Errors
+    ///
+    /// If there is no such chunk, a place is past its end, or the places do not rise.
+    pub fn take(&mut self, chunk: usize, places: &[u32]) -> Result<()> {
+        if places.is_empty() {
+            return Ok(());
+        }
+        if places.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Error::internal("the rows taken out of a chunk do not rise"));
+        }
+        let slot = *self
+            .slots
+            .get(chunk)
+            .ok_or_else(|| Error::internal("rows taken out of a chunk that is not there"))?;
+        let given = match self.taken.get(&chunk) {
+            Some(taken) => among(taken, places),
+            None => places.to_vec(),
+        };
+        if given.last().is_some_and(|&last| last as usize >= self.rows_of(slot)) {
+            return Err(Error::internal("a row taken out past the end of its chunk"));
+        }
+        let all: Vec<usize> = (0..self.types.len()).collect();
+        let rows = self.read_places(chunk, &all, &given)?;
+        self.forget_grams();
+        for column in 0..rows.width() {
+            let held = rows.column(column)?;
+            let mut nulls = 0;
+            for row in 0..rows.len() {
+                nulls += usize::from(held.try_value_at(row)?.is_null());
+            }
+            if let Some(zone) = self.zones.get_mut(chunk) {
+                zone.take(column, nulls);
+            }
+            match slot {
+                Slot::Window { group, .. } => {
+                    if let Some(held) = self.groups.get_mut(group) {
+                        held.zone.take(column, nulls);
+                    }
+                }
+                Slot::Open { .. } => {
+                    if let Some(zone) = &mut self.open_zone {
+                        zone.take(column, nulls);
+                    }
+                }
+                // The tail's zone is the chunk's, and is folded into the run's when it closes.
+                Slot::Tail => {}
+            }
+        }
+        Arc::make_mut(&mut self.counts).take_rows();
+        let taken = Arc::make_mut(&mut self.taken).entry(chunk).or_default();
+        taken.extend_from_slice(&given);
+        taken.sort_unstable();
+        self.taken_rows += given.len();
+        Ok(())
+    }
+}
+
+/// The places among every row a chunk was given of the rows at `positions` among the ones it has
+/// left, which rise, `taken` being the places of the rows taken out of it, which rise too.
+fn among(taken: &[u32], positions: &[u32]) -> Vec<u32> {
+    let mut before = 0;
+    positions
+        .iter()
+        .map(|&position| {
+            while taken.get(before).is_some_and(|&gone| gone <= position + before as u32) {
+                before += 1;
+            }
+            position + before as u32
+        })
+        .collect()
 }
 
 /// An open run taken away to be sealed: the slot of its first chunk, its chunks, and its zone.
@@ -2451,6 +2602,133 @@ mod tests {
             "the fourth column crosses the cap"
         );
         assert!(all.counts_ns() <= all.stats_ns(), "a part is larger than the whole");
+    }
+
+    /// Rows taken out of a sealed group, an open chunk, the tail's chunks and the rows being built
+    /// are left out of every read, count and place after them, in the table and in a copy of it.
+    #[test]
+    fn rows_taken_out_where_they_are_are_left_out_of_every_read() {
+        let types = vec![LogicalType::BigInt, LogicalType::Varchar];
+        let name = |id: i64| (id % 7 != 0).then(|| format!("n{}", id % 5));
+        let value = |name: &Option<String>| name.clone().map_or(Value::Null, Value::Varchar);
+        let chunk_of = |ids: std::ops::Range<i64>| {
+            let ids: Vec<i64> = ids.collect();
+            let column = |ty: &LogicalType, values: Vec<Value>| {
+                Vector::from_values(ty.clone(), &values).expect("values of the type")
+            };
+            let first = column(&types[0], ids.iter().map(|&id| Value::BigInt(id)).collect());
+            let second = column(&types[1], ids.iter().map(|&id| value(&name(id))).collect());
+            Chunk::new(vec![first, second]).expect("two columns")
+        };
+        let mut table = MemoryTable::new(types.clone());
+        let mut model: Vec<(i64, Option<String>)> = Vec::new();
+        let mut next = 0_i64;
+        let mut add = |table: &mut MemoryTable, model: &mut Vec<_>, rows: i64, one: bool| {
+            if one {
+                for id in next..next + rows {
+                    table.append_row(&[Value::BigInt(id), value(&name(id))]).expect("a row");
+                }
+            } else {
+                table.append(chunk_of(next..next + rows)).expect("a chunk");
+            }
+            model.extend((next..next + rows).map(|id| (id, name(id))));
+            next += rows;
+        };
+        // A sealed group, an open chunk after it, two small chunks of tail and rows being built.
+        for _ in 0..61 {
+            add(&mut table, &mut model, VECTOR_SIZE as i64, false);
+        }
+        add(&mut table, &mut model, 20, false);
+        add(&mut table, &mut model, 30, false);
+        add(&mut table, &mut model, 5, true);
+        // How many groups the strings seal into is the layout's business, so long as there is one.
+        let groups = table.group_count();
+        assert!(groups >= 1, "nothing sealed");
+        let check = |table: &MemoryTable, model: &[(i64, Option<String>)]| {
+            assert_eq!(table.len(), model.len());
+            let lens: usize =
+                (0..table.chunk_count()).map(|at| table.chunk_len(at).expect("a chunk")).sum();
+            assert_eq!(lens, model.len());
+            let groups = table.group_parts().len();
+            assert_eq!((0..groups).map(|at| table.group_rows(at)).sum::<usize>(), model.len());
+            let mut at = 0;
+            for chunk in 0..table.chunk_count() {
+                let read = table.read(chunk, &[0, 1]).expect("a chunk");
+                assert_eq!(Some(read.len()), table.chunk_len(chunk));
+                for row in 0..read.len() {
+                    assert_eq!(read.value_at(row, 0), Value::BigInt(model[at + row].0));
+                    assert_eq!(read.value_at(row, 1), value(&model[at + row].1));
+                }
+                // Every third row by place, the first and the last.
+                let places: Vec<u32> = (0..read.len() as u32)
+                    .step_by(3)
+                    .chain(read.len().checked_sub(1).map(|last| last as u32))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let some = table.read_rows(chunk, &[1, 0], &places).expect("rows of the chunk");
+                for (row, &place) in places.iter().enumerate() {
+                    assert_eq!(some.value_at(row, 1), Value::BigInt(model[at + place as usize].0));
+                }
+                at += read.len();
+            }
+            let nulls = model.iter().filter(|(_, name)| name.is_none()).count();
+            assert_eq!(table.null_count(1).expect("a column"), nulls);
+        };
+        check(&table, &model);
+        assert!(table.exact_sum(0).expect("a column").is_some());
+        // Finds row `number` of the table and takes it and the ones `then` places after it in its
+        // chunk out.
+        let take = |table: &mut MemoryTable,
+                    model: &mut Vec<(i64, Option<String>)>,
+                    number: usize,
+                    then: &[u32]| {
+            let (mut chunk, mut start) = (0, 0);
+            while start + table.chunk_len(chunk).expect("a chunk") <= number {
+                start += table.chunk_len(chunk).expect("a chunk");
+                chunk += 1;
+            }
+            let place = (number - start) as u32;
+            let places: Vec<u32> =
+                std::iter::once(place).chain(then.iter().map(|&after| place + after)).collect();
+            table.take(chunk, &places).expect("rows of the chunk");
+            for &gone in places.iter().rev() {
+                model.remove(start + gone as usize);
+            }
+        };
+        let last = model.len() - 1;
+        // From the group, the open chunk, the tail's chunks and the rows being built.
+        for number in [0, 7, 2048 * 30 + 5, 2048 * 60 + 1, 2048 * 61 + 3, 2048 * 61 + 40, last] {
+            let number = number.min(model.len() - 1);
+            take(&mut table, &mut model, number, &[]);
+            check(&table, &model);
+        }
+        assert!(table.exact_sum(0).expect("a column").is_none(), "the totals are gone");
+        assert!(table.exact_extremes(0).expect("a column").is_none(), "the ends are not exact");
+        // Several at once, around rows taken already.
+        take(&mut table, &mut model, 4, &[1, 2, 9]);
+        check(&table, &model);
+        assert_eq!(table.taken(), 11);
+        // A copy takes its own rows, and a row written over lands on the row that place now names.
+        let original = table.clone();
+        let kept = model.clone();
+        let mut copy = table;
+        let mut copied = model;
+        take(&mut copy, &mut copied, 2048 * 61 + 2, &[1]);
+        assert!(copy.put_row(0, 3, &[1], &[Value::Varchar("put".into())]).expect("a row"));
+        copied[3].1 = Some("put".into());
+        check(&copy, &copied);
+        check(&original, &kept);
+        // Rows that arrive afterwards go on the end, and fill the run until it seals.
+        let mut table = copy;
+        let mut model = copied;
+        add(&mut table, &mut model, 3, true);
+        check(&table, &model);
+        for _ in 0..60 {
+            add(&mut table, &mut model, VECTOR_SIZE as i64, false);
+        }
+        assert!(table.group_count() > groups, "the run did not seal");
+        check(&table, &model);
     }
 
     fn trickled(rows: i32) -> MemoryTable {
