@@ -27,7 +27,7 @@ use crate::error::TypeError;
 use crate::float::{float4_out, float8_out};
 use crate::generated::oids;
 use crate::number::{int_out, u64_out};
-use crate::numeric::{decimal_out, decimal_send, numeric_in, numeric_send};
+use crate::numeric::{Numeric, decimal_out, decimal_send, numeric_in, numeric_out, numeric_send};
 use crate::reg::{RegKind, reg_out_oid};
 use crate::scalar::{ByteaOutput, bool_out, bytea_out, char_out, uuid_out};
 use crate::types::{Oid, PgType, TypeInfo, format_type};
@@ -71,6 +71,8 @@ enum Kind {
     Float4,
     Float8,
     Decimal(u32),
+    /// The `numeric` of PostgreSQL, in the bytes of `rudb_common::numeric`.
+    Numeric,
     Text,
     Bytea,
     Date,
@@ -126,6 +128,7 @@ pub fn pg_type(logical: &LogicalType) -> PgType {
         L::Decimal { width, scale } => {
             (oids::NUMERIC, numeric_typmod(i32::from(*width), i32::from(*scale)))
         }
+        L::Numeric => (oids::NUMERIC, -1),
         L::Blob => (oids::BYTEA, -1),
         L::Uuid => (oids::UUID, -1),
         L::Date => (oids::DATE, -1),
@@ -188,6 +191,7 @@ impl Kind {
             oids::FLOAT8 if *logical == L::Double => Kind::Float8,
             oids::NUMERIC => match *logical {
                 L::Decimal { scale, .. } => Kind::Decimal(u32::from(scale)),
+                L::Numeric => Kind::Numeric,
                 L::UBigInt | L::HugeInt | L::UHugeInt => Kind::Display { numeric: true },
                 _ => return None,
             },
@@ -236,6 +240,7 @@ impl Kind {
             Kind::TimeTz => 12,
             Kind::Interval | Kind::Uuid => 16,
             Kind::Decimal(_)
+            | Kind::Numeric
             | Kind::Text
             | Kind::Bytea
             | Kind::Array
@@ -642,6 +647,17 @@ fn stage_column(
                 })?;
             }
         }),
+        (Kind::Numeric, binary) => {
+            let Data::Varlen(strings) = data else { return Err(wrong_data(plan)) };
+            for i in rows {
+                let bytes = strings.bytes(start + i).ok_or_else(|| wrong_data(plan))?;
+                let value = Numeric::from_bytes(bytes);
+                stage(lens, staged, i, |out| match binary {
+                    true => numeric_send(&value, out),
+                    false => numeric_out(&value, out),
+                })?;
+            }
+        }
         (Kind::Bytea, _) => {
             let Data::Varlen(strings) = data else { return Err(wrong_data(plan)) };
             let style = settings.bytea_output;
@@ -996,6 +1012,7 @@ fn fixed(
             });
         }
         Kind::Decimal(_)
+        | Kind::Numeric
         | Kind::Text
         | Kind::Bytea
         | Kind::Array
@@ -1071,6 +1088,8 @@ mod tests {
             Value::Decimal { unscaled, scale, .. } => {
                 decimal_out(*unscaled, u32::from(*scale), &mut out)
             }
+            Value::Numeric(v) if binary => numeric_send(&Numeric::from_bytes(v), &mut out),
+            Value::Numeric(v) => numeric_out(&Numeric::from_bytes(v), &mut out),
             Value::Varchar(v) => out.extend_from_slice(v.as_bytes()),
             Value::Blob(v) if binary => out.extend_from_slice(v),
             Value::Blob(v) => bytea_out(v, settings.bytea_output, &mut out),

@@ -719,13 +719,34 @@ impl Binder<'_> {
         Some(value.map(|value| self.add_constant(value)).map_err(|e| e.with_fallback_span(span)))
     }
 
+    /// The value of a number literal. PostgreSQL reads a number with an exponent, an integer past
+    /// `bigint` and a decimal past 38 digits as a `numeric`, where DuckDB reads a double, a
+    /// `HUGEINT` or a `BIGNUM`.
+    fn number(&self, text: &str, negative: bool) -> Result<Value> {
+        let value = number(text, negative)?;
+        if self.session.postgres().is_none()
+            || !matches!(
+                value,
+                Value::Double(_) | Value::HugeInt(_) | Value::UHugeInt(_) | Value::BigNum(_)
+            )
+        {
+            return Ok(value);
+        }
+        let bare: String = text.chars().filter(|c| *c != '_').collect();
+        let sign = if negative { "-" } else { "" };
+        match rudb_pgtypes::numeric_in(&format!("{sign}{bare}"), -1) {
+            Ok(held) => Ok(Value::Numeric(held.to_bytes())),
+            Err(_) => Ok(value),
+        }
+    }
+
     fn bind_literal(&mut self, ast: &Ast, kind: LiteralKind, text: ast::StrRef) -> Result<ExprRef> {
         let value = match kind {
             LiteralKind::Null => Value::Null,
             LiteralKind::True => Value::Boolean(true),
             LiteralKind::False => Value::Boolean(false),
             LiteralKind::String | LiteralKind::Blob => Value::Varchar(ast.string(text).to_string()),
-            LiteralKind::Number => number(ast.string(text), false)?,
+            LiteralKind::Number => self.number(ast.string(text), false)?,
         };
         let constant = self.add_constant(value);
         // A blob literal is the text a blob prints as, so the cast that reads that text back is the
@@ -815,7 +836,7 @@ impl Binder<'_> {
         if op == UnaryOp::Negate
             && let ast::Expr::Literal { kind: LiteralKind::Number, text } = ast.expr(operand)
         {
-            let value = number(ast.string(text), true)?;
+            let value = self.number(ast.string(text), true)?;
             return Ok(self.add_constant(value));
         }
         let bound = self.bind_expr(ast, operand, scope)?;
@@ -937,6 +958,27 @@ impl Binder<'_> {
         {
             right = self.zero_to_null(right);
         }
+        // A division in PostgreSQL over an exact number that is not an integer is a `numeric`
+        // division, which picks its own scale, so `1.0 / 3` is `0.33333333333333333333`.
+        if self.session.postgres().is_some()
+            && matches!(op, BinaryOp::Divide | BinaryOp::IntegerDivide)
+        {
+            let types = [left, right].map(|arg| self.plan().expr_type(arg).clone());
+            let exact = |ty: &LogicalType| {
+                ty.is_integer()
+                    || matches!(
+                        ty,
+                        LogicalType::Decimal { .. } | LogicalType::Numeric | LogicalType::Null
+                    )
+            };
+            let fractional =
+                |ty: &LogicalType| matches!(ty, LogicalType::Decimal { .. } | LogicalType::Numeric);
+            if types.iter().all(exact) && types.iter().any(fractional) {
+                let left = self.cast_to(left, &LogicalType::Numeric);
+                let right = self.cast_to(right, &LogicalType::Numeric);
+                return self.call("//", vec![left, right]);
+            }
+        }
         match function_of(op) {
             Some(name) if checked_slash && !self.semantics.null_on_division_by_zero() => {
                 self.call_as(name, "__rudb_checked_slash", vec![left, right])
@@ -1025,6 +1067,23 @@ impl Binder<'_> {
                 "Function \"{written}\" is a Macro Function. \"DISTINCT\", \"FILTER\", and \
                  \"ORDER BY\" are only applicable to window and aggregate functions."
             )));
+        }
+        // `pg_typeof` names the PostgreSQL type, as `format_type` does with no typmod, so a
+        // `numeric(2,1)` literal is `numeric`. A string literal or a null has no type yet.
+        if !modified
+            && self.session.postgres().is_some()
+            && rudb_catalog::same_name(&written, "pg_typeof")
+            && let [only] = arguments[..]
+        {
+            let bound = self.bind_expr(ast, only, scope)?;
+            let ty = self.plan().expr_type(bound).clone();
+            let untyped = ty == LogicalType::Null
+                || matches!(ast.expr(only), ast::Expr::Literal { kind: LiteralKind::String, .. });
+            let name = match untyped {
+                true => "unknown".to_string(),
+                false => rudb_pgtypes::format_type(rudb_pgtypes::pg_type(&ty).oid).into_owned(),
+            };
+            return Ok(self.add_constant(Value::Varchar(name)));
         }
         if let Some(expanded) = self.builtin_macro(ast, &written, &arguments, scope)? {
             return Ok(expanded);

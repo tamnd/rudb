@@ -4727,8 +4727,31 @@ fn arithmetic(
             }
             _ => Err(Error::not_implemented(format!("{} on BIGNUM", op.word()))),
         },
+        LogicalType::Numeric => numeric_arithmetic(op, left, right),
         other => Err(Error::not_implemented(format!("{} on {other}", op.word()))),
     }
+}
+
+/// The arithmetic of the `numeric` of PostgreSQL, whose result scale is the one `numeric.c` picks.
+fn numeric_arithmetic(op: Op, left: &Value, right: &Value) -> Result<Value> {
+    use rudb_pgtypes::Numeric;
+    let operand = |value: &Value| -> Result<Numeric> {
+        match cast::cast_value(value, &LogicalType::Numeric, false)? {
+            Value::Numeric(bytes) => Ok(Numeric::from_bytes(&bytes)),
+            other => Err(Error::internal(format!("{other} is not a numeric"))),
+        }
+    };
+    let (a, b) = (operand(left)?, operand(right)?);
+    let answer = match op {
+        Op::Add => a.add(&b),
+        Op::Subtract => a.sub(&b),
+        Op::Multiply => a.mul(&b),
+        Op::Divide => a.div(&b),
+        Op::Modulo => a.modulo(&b),
+    }
+    // A division by zero or an overflow is a fault of the row and not of a place in the text.
+    .map_err(|error| Error::from(error).unplaced())?;
+    Ok(Value::Numeric(answer.to_bytes()))
 }
 
 fn integer_arithmetic(
@@ -4903,6 +4926,9 @@ fn unscaled_at(value: &Value, scale: u8) -> Option<i128> {
 
 /// `/`, which the binder has already promoted both sides to the result type.
 fn divide(left: &Value, right: &Value, returns: &LogicalType) -> Result<Value> {
+    if returns == &LogicalType::Numeric {
+        return numeric_arithmetic(Op::Divide, left, right);
+    }
     let (a, b) = match (approximate(left), approximate(right)) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -4925,6 +4951,9 @@ fn divide(left: &Value, right: &Value, returns: &LogicalType) -> Result<Value> {
 fn negate(value: &Value, ty: &LogicalType) -> Result<Value> {
     match value {
         Value::BigNum(held) => Ok(Value::BigNum(bignum::negate(held))),
+        Value::Numeric(held) => {
+            Ok(Value::Numeric(rudb_pgtypes::Numeric::from_bytes(held).negate().to_bytes()))
+        }
         Value::Float(v) => Ok(Value::Float(-v)),
         Value::Double(v) => Ok(Value::Double(-v)),
         Value::Decimal { unscaled, width, scale } => {

@@ -2665,7 +2665,11 @@ fn dictionary_tag(ty: &LogicalType) -> u8 {
 /// a column nobody else can help with.
 fn weight(ty: &LogicalType) -> usize {
     match ty {
-        LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit | LogicalType::BigNum => 64,
+        LogicalType::Varchar
+        | LogicalType::Blob
+        | LogicalType::Bit
+        | LogicalType::BigNum
+        | LogicalType::Numeric => 64,
         LogicalType::HugeInt
         | LogicalType::UHugeInt
         | LogicalType::Uuid
@@ -10278,7 +10282,8 @@ fn write_at(file: &File, offset: u64, bytes: &[u8]) -> Result<()> {
 /// A tag is a number in a file somebody else wrote, so a tag that has been used is used forever and
 /// the only thing that may happen to this list is that it grows. 1 to 13 are the tags the format
 /// had when it could store thirteen types, and 14 to 27 are the rest, in the order they were added
-/// rather than in an order that means anything.
+/// rather than in an order that means anything. 28 is `BIGNUM`, 29 is a list and 30 is the `numeric`
+/// of PostgreSQL.
 fn type_tag(ty: &LogicalType) -> Result<u8> {
     match ty {
         LogicalType::SmallInt => Ok(1),
@@ -10310,6 +10315,7 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::TimestampMs => Ok(26),
         LogicalType::TimestampNs => Ok(27),
         LogicalType::List(element) => type_tag(element).map(|_| 29),
+        LogicalType::Numeric => Ok(30),
         _ => Err(Error::not_implemented(format!("native storage for {ty}"))),
     }
 }
@@ -10377,6 +10383,7 @@ fn tag_type(tag: u8) -> Result<LogicalType> {
         25 => Ok(LogicalType::TimestampS),
         26 => Ok(LogicalType::TimestampMs),
         27 => Ok(LogicalType::TimestampNs),
+        30 => Ok(LogicalType::Numeric),
         _ => Err(invalid("column type tag is unknown")),
     }
 }
@@ -13849,7 +13856,11 @@ fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
         // read the payload as text, which is why this arm asks the column for bytes rather than for
         // a string, and why the codecs above that do read text are all asked of a varchar by name.
         (
-            LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit | LogicalType::BigNum,
+            LogicalType::Varchar
+            | LogicalType::Blob
+            | LogicalType::Bit
+            | LogicalType::BigNum
+            | LogicalType::Numeric,
             Data::Varlen(values),
         ) => {
             let mut bytes = Vec::new();
@@ -15733,7 +15744,11 @@ fn decode(
                 )
             }
         },
-        LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit | LogicalType::BigNum => {
+        LogicalType::Varchar
+        | LogicalType::Blob
+        | LogicalType::Bit
+        | LogicalType::BigNum
+        | LogicalType::Numeric => {
             let offset_bytes = cur
                 .take((rows + 1).checked_mul(4).ok_or_else(|| invalid("offset count overflow"))?)?;
             let offsets = offset_bytes

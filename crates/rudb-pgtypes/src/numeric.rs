@@ -143,6 +143,250 @@ impl Numeric {
     }
 }
 
+impl Numeric {
+    /// The value of bytes in the layout of [`rudb_common::numeric`], which is how a vector holds a
+    /// value of the type `NUMERIC`.
+    pub fn from_bytes(bytes: &[u8]) -> Numeric {
+        let unpacked = rudb_common::numeric::decode(bytes);
+        let sign = NumericSign::from_code(unpacked.sign).unwrap_or(NumericSign::NaN);
+        if !sign.is_finite() {
+            return Numeric::special(sign);
+        }
+        let sign = if unpacked.digits.is_empty() { NumericSign::Positive } else { sign };
+        Numeric { sign, weight: unpacked.weight, dscale: unpacked.dscale, digits: unpacked.digits }
+    }
+
+    /// The bytes of the value in the layout of [`rudb_common::numeric`].
+    pub fn to_bytes(&self) -> Vec<u8> {
+        rudb_common::numeric::encode(self.sign.code(), self.weight, self.dscale, &self.digits)
+    }
+
+    /// The value of an integer, with a display scale of 0, as `int8_numeric` gives it.
+    pub fn from_integer(value: i128) -> Numeric {
+        Numeric::from_decimal(value, 0)
+    }
+
+    /// `float8_numeric`: the value of the double printed with 15 significant digits, so that
+    /// `0.1::float8::numeric` is `0.1`.
+    pub fn from_f64(value: f64) -> Numeric {
+        if value.is_nan() {
+            return Numeric::NAN;
+        }
+        if value.is_infinite() {
+            return if value > 0.0 { Numeric::INFINITY } else { Numeric::NEGATIVE_INFINITY };
+        }
+        // `%.15g` with the trailing zeros dropped from the digits. The exponent form gives the
+        // same value and the same display scale as the plain form does.
+        let text = format!("{value:.14e}");
+        let (mantissa, exponent) = text.split_once('e').unwrap_or((&text, "0"));
+        let mantissa = match mantissa.contains('.') {
+            true => mantissa.trim_end_matches('0').trim_end_matches('.'),
+            false => mantissa,
+        };
+        numeric_in(&format!("{mantissa}e{exponent}"), -1).unwrap_or(Numeric::NAN)
+    }
+
+    /// `numeric_float8`: the double nearest to the text of the value.
+    pub fn to_f64(&self) -> f64 {
+        match self.sign {
+            NumericSign::NaN => f64::NAN,
+            NumericSign::Infinity => f64::INFINITY,
+            NumericSign::NegativeInfinity => f64::NEG_INFINITY,
+            _ => {
+                let mut out = Vec::new();
+                numeric_out(self, &mut out);
+                std::str::from_utf8(&out)
+                    .ok()
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(f64::NAN)
+            }
+        }
+    }
+
+    /// The value rounded half away from zero to an integer, as the casts to the integer types
+    /// round. The error names the type, as `numeric_int4` and `numeric_int8` do.
+    pub fn to_integer(&self, type_name: &str) -> Result<i128, TypeError> {
+        let range = || {
+            TypeError::new(
+                SqlState::NUMERIC_VALUE_OUT_OF_RANGE,
+                format!("{type_name} out of range"),
+            )
+        };
+        match self.sign {
+            NumericSign::NaN => {
+                return Err(TypeError::new(
+                    SqlState::FEATURE_NOT_SUPPORTED,
+                    format!("cannot convert NaN to {type_name}"),
+                ));
+            }
+            NumericSign::Infinity | NumericSign::NegativeInfinity => {
+                return Err(TypeError::new(
+                    SqlState::FEATURE_NOT_SUPPORTED,
+                    format!("cannot convert infinity to {type_name}"),
+                ));
+            }
+            _ => {}
+        }
+        self.to_decimal(0).ok_or_else(range)
+    }
+
+    /// The value with `typmod` applied, as a cast to `numeric(p, s)` gives it.
+    pub fn with_typmod(&self, typmod: i32) -> Result<Numeric, TypeError> {
+        if !self.sign.is_finite() {
+            apply_typmod_special(self.sign, typmod)?;
+            return Ok(self.clone());
+        }
+        let mut var = Var::from(self);
+        var.apply_typmod(typmod)?;
+        var.make()
+    }
+
+    /// `numeric_uminus`.
+    pub fn negate(&self) -> Numeric {
+        let sign = match self.sign {
+            NumericSign::Positive if !self.digits.is_empty() => NumericSign::Negative,
+            NumericSign::Negative => NumericSign::Positive,
+            NumericSign::Infinity => NumericSign::NegativeInfinity,
+            NumericSign::NegativeInfinity => NumericSign::Infinity,
+            sign => sign,
+        };
+        Numeric { sign, ..self.clone() }
+    }
+
+    /// `numeric_add`: the display scale is the larger of the two.
+    pub fn add(&self, other: &Numeric) -> Result<Numeric, TypeError> {
+        if let Some(special) = special_sum(self.sign, other.sign) {
+            return Ok(special);
+        }
+        Var::from(self).add(&Var::from(other)).make()
+    }
+
+    /// `numeric_sub`.
+    pub fn sub(&self, other: &Numeric) -> Result<Numeric, TypeError> {
+        self.add(&other.negate())
+    }
+
+    /// `numeric_mul`: the display scale is the sum of the two.
+    pub fn mul(&self, other: &Numeric) -> Result<Numeric, TypeError> {
+        use NumericSign::{Infinity, NaN, Negative, NegativeInfinity};
+        let (a, b) = (self.sign, other.sign);
+        if !a.is_finite() || !b.is_finite() {
+            if a == NaN || b == NaN {
+                return Ok(Numeric::NAN);
+            }
+            let zero = (a.is_finite() && self.digits.is_empty())
+                || (b.is_finite() && other.digits.is_empty());
+            if zero {
+                return Ok(Numeric::NAN);
+            }
+            let negative = |sign| matches!(sign, Negative | NegativeInfinity);
+            return Ok(if negative(a) != negative(b) {
+                Numeric::NEGATIVE_INFINITY
+            } else {
+                Numeric::special(Infinity)
+            });
+        }
+        let rscale = (i64::from(self.dscale) + i64::from(other.dscale)).min(DSCALE_MAX);
+        let mut product = Var::from(self).mul(&Var::from(other));
+        product.round(rscale);
+        product.make()
+    }
+
+    /// `numeric_div`: the result scale is the one `select_div_scale` picks, and the last digit is
+    /// rounded half away from zero.
+    pub fn div(&self, other: &Numeric) -> Result<Numeric, TypeError> {
+        use NumericSign::{Infinity, NaN, Negative, NegativeInfinity, Positive};
+        let (a, b) = (self.sign, other.sign);
+        let zero = || TypeError::new(SqlState::DIVISION_BY_ZERO, "division by zero".to_string());
+        if !a.is_finite() || !b.is_finite() {
+            if a == NaN || b == NaN {
+                return Ok(Numeric::NAN);
+            }
+            if a.is_finite() {
+                // A number over an infinity is zero.
+                return Ok(Numeric { sign: Positive, weight: 0, dscale: 0, digits: Vec::new() });
+            }
+            if !b.is_finite() {
+                return Ok(Numeric::NAN);
+            }
+            if other.digits.is_empty() {
+                return Err(zero());
+            }
+            let negative = (a == NegativeInfinity) != (b == Negative);
+            return Ok(Numeric::special(if negative { NegativeInfinity } else { Infinity }));
+        }
+        let (x, y) = (Var::from(self), Var::from(other));
+        let rscale = select_div_scale(&x, &y);
+        if y.digits.is_empty() {
+            return Err(zero());
+        }
+        x.div(&y, rscale, true).make()
+    }
+
+    /// `numeric_mod`: the remainder of the quotient cut to an integer, with the sign of `self`.
+    pub fn modulo(&self, other: &Numeric) -> Result<Numeric, TypeError> {
+        let (a, b) = (self.sign, other.sign);
+        if !a.is_finite() || !b.is_finite() {
+            if a == NumericSign::NaN || b == NumericSign::NaN || !a.is_finite() {
+                return Ok(Numeric::NAN);
+            }
+            // A number modulo an infinity is the number.
+            return Ok(self.clone());
+        }
+        if other.digits.is_empty() {
+            return Err(TypeError::new(SqlState::DIVISION_BY_ZERO, "division by zero".to_string()));
+        }
+        let (x, y) = (Var::from(self), Var::from(other));
+        let mut product = y.mul(&x.div(&y, 0, false));
+        product.dscale = y.dscale;
+        product.sign = match product.sign {
+            NumericSign::Positive if !product.digits.is_empty() => NumericSign::Negative,
+            _ => NumericSign::Positive,
+        };
+        x.add(&product).make()
+    }
+
+    /// `cmp_numerics`: `NaN` is equal to itself and above every other value, and the display scale
+    /// does not count.
+    pub fn compare(&self, other: &Numeric) -> std::cmp::Ordering {
+        let left = self.to_bytes();
+        let right = other.to_bytes();
+        rudb_common::numeric::key(&left).cmp(rudb_common::numeric::key(&right))
+    }
+}
+
+/// The sum when one side is not a finite number, or `None` when both are.
+fn special_sum(a: NumericSign, b: NumericSign) -> Option<Numeric> {
+    use NumericSign::{Infinity, NaN, NegativeInfinity};
+    match (a, b) {
+        _ if a.is_finite() && b.is_finite() => None,
+        (NaN, _) | (_, NaN) => Some(Numeric::NAN),
+        (Infinity, NegativeInfinity) | (NegativeInfinity, Infinity) => Some(Numeric::NAN),
+        (Infinity, _) | (_, Infinity) => Some(Numeric::INFINITY),
+        _ => Some(Numeric::NEGATIVE_INFINITY),
+    }
+}
+
+/// `NUMERIC_MIN_SIG_DIGITS`, the fewest significant digits that a quotient has.
+const MIN_SIG_DIGITS: i64 = 16;
+
+/// `select_div_scale`: enough digits after the point for 16 significant digits, and no fewer than
+/// the display scale of either side.
+fn select_div_scale(x: &Var, y: &Var) -> i64 {
+    let first = |v: &Var| match v.digits.iter().position(|&d| d != 0) {
+        Some(at) => (v.weight - at as i64, v.digits[at]),
+        None => (0, 0),
+    };
+    let (weight1, first1) = first(x);
+    let (weight2, first2) = first(y);
+    let mut qweight = weight1 - weight2;
+    if first1 <= first2 {
+        qweight -= 1;
+    }
+    let rscale = MIN_SIG_DIGITS - qweight * DEC_DIGITS;
+    rscale.max(x.dscale).max(y.dscale).clamp(0, 1000)
+}
+
 /// `NumericVar`: the working form. The weight and the scale can go out of the range of the format
 /// here, and [`Var::make`] checks them at the end, as `make_result` does.
 #[derive(Debug, Clone)]
@@ -329,6 +573,215 @@ impl Var {
             _ => Err(overflow()),
         }
     }
+}
+
+impl Var {
+    /// The digit with the power of 10000 `weight`, which is 0 outside the digits.
+    fn digit(&self, weight: i64) -> i32 {
+        usize::try_from(self.weight - weight)
+            .ok()
+            .and_then(|at| self.digits.get(at))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The power of 10000 of the last digit.
+    fn low(&self) -> i64 {
+        self.weight + 1 - self.digits.len() as i64
+    }
+
+    /// `cmp_abs`.
+    fn cmp_abs(&self, other: &Var) -> std::cmp::Ordering {
+        let high = self.weight.max(other.weight);
+        let low = self.low().min(other.low());
+        for weight in (low..=high).rev() {
+            match self.digit(weight).cmp(&other.digit(weight)) {
+                std::cmp::Ordering::Equal => {}
+                order => return order,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    /// `add_abs` and `sub_abs` in one: the sum of the two magnitudes, or the difference when
+    /// `subtract` is set, which needs the magnitude of `self` to be the larger one.
+    fn add_abs(&self, other: &Var, subtract: bool, sign: NumericSign) -> Var {
+        let weight = self.weight.max(other.weight) + 1;
+        let low = self.low().min(other.low());
+        let mut digits = vec![0; (weight - low + 1) as usize];
+        let mut carry = 0;
+        for (at, w) in (low..=weight).enumerate() {
+            let other = other.digit(w);
+            let mut d = self.digit(w) + carry + if subtract { -other } else { other };
+            carry = 0;
+            if d >= NBASE {
+                d -= NBASE;
+                carry = 1;
+            } else if d < 0 {
+                d += NBASE;
+                carry = -1;
+            }
+            let end = digits.len() - 1 - at;
+            digits[end] = d;
+        }
+        let mut var = Var { sign, weight, dscale: self.dscale.max(other.dscale), digits };
+        var.strip();
+        var
+    }
+
+    /// `add_var`.
+    fn add(&self, other: &Var) -> Var {
+        if self.sign == other.sign {
+            return self.add_abs(other, false, self.sign);
+        }
+        match self.cmp_abs(other) {
+            std::cmp::Ordering::Less => other.add_abs(self, true, other.sign),
+            _ => self.add_abs(other, true, self.sign),
+        }
+    }
+
+    /// The exact product, with no rounding. The display scale is set by the caller.
+    fn mul(&self, other: &Var) -> Var {
+        let sign =
+            if self.sign == other.sign { NumericSign::Positive } else { NumericSign::Negative };
+        if self.digits.is_empty() || other.digits.is_empty() {
+            return Var { sign: NumericSign::Positive, weight: 0, dscale: 0, digits: Vec::new() };
+        }
+        let mut acc = vec![0i64; self.digits.len() + other.digits.len()];
+        for (i, &a) in self.digits.iter().enumerate() {
+            for (j, &b) in other.digits.iter().enumerate() {
+                acc[i + j + 1] += i64::from(a) * i64::from(b);
+            }
+        }
+        let mut carry = 0;
+        for slot in acc.iter_mut().rev() {
+            let total = *slot + carry;
+            *slot = total % i64::from(NBASE);
+            carry = total / i64::from(NBASE);
+        }
+        let digits = acc.into_iter().map(|d| d as i32).collect();
+        let weight = self.weight + other.weight + 1;
+        let mut var = Var { sign, weight, dscale: self.dscale + other.dscale, digits };
+        var.strip();
+        var
+    }
+
+    /// `div_var` with `exact` set: the quotient to `rscale` digits after the point, rounded half
+    /// away from zero when `round` is set and cut when it is not. The divisor is not zero.
+    fn div(&self, other: &Var, rscale: i64, round: bool) -> Var {
+        let sign =
+            if self.sign == other.sign { NumericSign::Positive } else { NumericSign::Negative };
+        // The quotient is cut one digit of 10000 below the scale and then rounded. The cut keeps
+        // every digit above it, so the rounding sees the same digit as for the exact quotient.
+        let low = -((rscale + DEC_DIGITS - 1) / DEC_DIGITS + 1);
+        let shift = self.low() - other.low() - low;
+        let mut dividend: Vec<i64> = self.digits.iter().map(|&d| i64::from(d)).collect();
+        if shift >= 0 {
+            dividend.resize(dividend.len() + shift as usize, 0);
+        } else {
+            let keep = dividend.len().saturating_sub((-shift) as usize);
+            dividend.truncate(keep);
+        }
+        let divisor: Vec<i64> = other.digits.iter().map(|&d| i64::from(d)).collect();
+        let quotient = divide(&dividend, &divisor);
+        let weight = low + quotient.len() as i64 - 1;
+        let digits = quotient.into_iter().map(|d| d as i32).collect();
+        let mut var = Var { sign, weight, dscale: rscale, digits };
+        var.strip();
+        if round {
+            var.round(rscale);
+        } else {
+            var.trunc(rscale);
+        }
+        var.strip();
+        if var.digits.is_empty() {
+            var.sign = NumericSign::Positive;
+        }
+        var
+    }
+}
+
+/// The integer quotient of two numbers in base 10000, the most significant digit first, by
+/// algorithm D of Knuth (TAOCP volume 2, section 4.3.1). The divisor has no leading zero.
+fn divide(dividend: &[i64], divisor: &[i64]) -> Vec<i64> {
+    let base = i64::from(NBASE);
+    let n = divisor.len();
+    if dividend.len() < n {
+        return Vec::new();
+    }
+    if n == 1 {
+        let d = divisor[0];
+        let mut rest = 0;
+        return dividend
+            .iter()
+            .map(|&digit| {
+                let current = rest * base + digit;
+                rest = current % d;
+                current / d
+            })
+            .collect();
+    }
+    // Scale both so that the first digit of the divisor is at least half the base, which keeps
+    // each trial quotient at most 2 above the true digit.
+    let scale = base / (divisor[0] + 1);
+    let times = |digits: &[i64]| -> Vec<i64> {
+        let mut out = vec![0; digits.len() + 1];
+        let mut carry = 0;
+        for (at, &digit) in digits.iter().enumerate().rev() {
+            let total = digit * scale + carry;
+            out[at + 1] = total % base;
+            carry = total / base;
+        }
+        out[0] = carry;
+        out
+    };
+    let mut u = times(dividend);
+    let v = times(divisor);
+    let v = &v[1..];
+    let m = dividend.len() - n;
+    let mut q = vec![0; m + 1];
+    for j in 0..=m {
+        let top = u[j] * base + u[j + 1];
+        let mut qhat = top / v[0];
+        let mut rhat = top % v[0];
+        while qhat >= base || qhat * v[1] > rhat * base + u[j + 2] {
+            qhat -= 1;
+            rhat += v[0];
+            if rhat >= base {
+                break;
+            }
+        }
+        // Take qhat times the divisor away from the window of the dividend.
+        let mut borrow = 0;
+        let mut carry = 0;
+        for i in (0..n).rev() {
+            let product = qhat * v[i] + carry;
+            carry = product / base;
+            let mut d = u[j + i + 1] - product % base - borrow;
+            borrow = 0;
+            if d < 0 {
+                d += base;
+                borrow = 1;
+            }
+            u[j + i + 1] = d;
+        }
+        let d = u[j] - carry - borrow;
+        if d < 0 {
+            // The trial digit was one too large: add the divisor back.
+            qhat -= 1;
+            let mut carry = 0;
+            for i in (0..n).rev() {
+                let total = u[j + i + 1] + v[i] + carry;
+                u[j + i + 1] = total % base;
+                carry = total / base;
+            }
+            u[j] = d + carry;
+        } else {
+            u[j] = d;
+        }
+        q[j] = qhat;
+    }
+    q
 }
 
 fn overflow() -> TypeError {
@@ -756,6 +1209,110 @@ mod tests {
 
     fn round_trip(input: &str, typmod: i32) -> String {
         numeric_in(input, typmod).map(|v| text(&v)).unwrap_or_else(|e| e.message)
+    }
+
+    fn value(text: &str) -> Numeric {
+        numeric_in(text, -1).unwrap()
+    }
+
+    #[test]
+    fn the_arithmetic_keeps_the_scales_of_postgres() {
+        // The texts are the ones PostgreSQL 19 prints.
+        for (a, op, b, out) in [
+            ("1.0", '/', "3", "0.33333333333333333333"),
+            ("10.0", '/', "4", "2.5000000000000000"),
+            ("1e20", '/', "3", "33333333333333333333"),
+            ("0.000001", '/', "3", "0.000000333333333333333333"),
+            ("2", '/', "3", "0.66666666666666666667"),
+            ("-2", '/', "3", "-0.66666666666666666667"),
+            ("123456789012345678901234567890", '/', "7", "17636684144620811271604938270"),
+            ("1", '/', "98765432109876543210", "0.000000000000000000010124999998860938"),
+            ("99999999", '/', "0.0001", "999999990000.00000000"),
+            ("0", '/', "5", "0.00000000000000000000"),
+            ("1.50", '+', "2.125", "3.625"),
+            ("1.50", '-', "2.125", "-0.625"),
+            ("1.5", '-', "1.5", "0.0"),
+            ("1.50", '*', "2.125", "3.18750"),
+            ("-0.01", '*', "0", "0.00"),
+            ("9999.9999", '+', "0.0001", "10000.0000"),
+            ("NaN", '+', "1", "NaN"),
+            ("Infinity", '-', "Infinity", "NaN"),
+            ("Infinity", '*', "-2", "-Infinity"),
+            ("Infinity", '*', "0", "NaN"),
+            ("1", '/', "Infinity", "0"),
+            ("7.5", '%', "2", "1.5"),
+            ("-7.5", '%', "2", "-1.5"),
+            ("7", '%', "-0.25", "0.00"),
+            ("10", '%', "Infinity", "10"),
+            ("-Infinity", '/', "-3", "Infinity"),
+        ] {
+            let (a, b) = (value(a), value(b));
+            let result = match op {
+                '+' => a.add(&b),
+                '-' => a.sub(&b),
+                '*' => a.mul(&b),
+                '%' => a.modulo(&b),
+                _ => a.div(&b),
+            };
+            assert_eq!(text(&result.unwrap()), out, "{} {op} {}", text(&a), text(&b));
+        }
+        assert_eq!(value("1").div(&value("0")).unwrap_err().message, "division by zero");
+        assert_eq!(value("Infinity").div(&value("0")).unwrap_err().message, "division by zero");
+    }
+
+    #[test]
+    fn the_long_division_agrees_with_the_integers() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2000 {
+            let a = i128::from(next() >> (next() % 60));
+            let b = i128::from(next() >> (next() % 63)).max(1);
+            let quotient = Numeric::from_integer(a).div(&Numeric::from_integer(b)).unwrap();
+            assert_eq!(
+                quotient.with_typmod(-1).unwrap().to_decimal(0),
+                Some((2 * a + b) / (2 * b)),
+                "{a} / {b}"
+            );
+            let back = quotient.mul(&Numeric::from_integer(b)).unwrap();
+            let error = back.sub(&Numeric::from_integer(a)).unwrap().to_f64().abs();
+            assert!(error <= b as f64, "{a} / {b} = {}", text(&quotient));
+        }
+    }
+
+    #[test]
+    fn a_double_converts_with_fifteen_digits() {
+        for (input, out) in [
+            (0.1, "0.1"),
+            (1.0 / 3.0, "0.333333333333333"),
+            (1e20, "100000000000000000000"),
+            (1.5e-7, "0.00000015"),
+            (-2.0, "-2"),
+            (123456.789, "123456.789"),
+        ] {
+            assert_eq!(text(&Numeric::from_f64(input)), out);
+        }
+        assert_eq!(value("0.33333333333333333333").to_f64(), 1.0 / 3.0);
+        assert_eq!(value("2.5").to_integer("integer").unwrap(), 3);
+        assert_eq!(value("-2.5").to_integer("integer").unwrap(), -3);
+        assert_eq!(
+            value("NaN").to_integer("integer").unwrap_err().message,
+            "cannot convert NaN to integer"
+        );
+    }
+
+    #[test]
+    fn the_bytes_hold_the_value_and_order_it() {
+        for input in ["0.00", "-123456.78", "1e-30", "NaN", "-Infinity", "33333333333333333333.3"] {
+            let v = value(input);
+            assert_eq!(Numeric::from_bytes(&v.to_bytes()), v);
+        }
+        assert_eq!(value("1.0").compare(&value("1.000")), std::cmp::Ordering::Equal);
+        assert_eq!(value("-1.1").compare(&value("-1.01")), std::cmp::Ordering::Less);
     }
 
     #[test]

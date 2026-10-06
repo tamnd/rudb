@@ -150,6 +150,9 @@ pub enum LogicalType {
     Bit,
     /// `BIGNUM`, an integer of any size, kept in the pin's layout, which [`crate::bignum`] reads.
     BigNum,
+    /// The `numeric` of PostgreSQL with no typmod, a decimal number of any size and any scale, in
+    /// the layout [`crate::numeric`] describes. Only a PostgreSQL session makes one.
+    Numeric,
     /// `UUID`.
     Uuid,
     /// `DATE`, days since 1970-01-01.
@@ -429,9 +432,13 @@ impl LogicalType {
                 10..=18 => PhysicalType::Int64,
                 _ => PhysicalType::Int128,
             },
-            Self::Varchar | Self::Blob | Self::Bit | Self::BigNum | Self::Type | Self::Json => {
-                PhysicalType::Varlen
-            }
+            Self::Varchar
+            | Self::Blob
+            | Self::Bit
+            | Self::BigNum
+            | Self::Numeric
+            | Self::Type
+            | Self::Json => PhysicalType::Varlen,
             Self::Interval => PhysicalType::Interval,
             // A map is a list of two-field structs, which is how Arrow does it and how every
             // engine that has to interoperate with Arrow ends up doing it.
@@ -696,6 +703,16 @@ impl LogicalType {
                 Some(Self::BigNum)
             }
             (Self::BigNum, Self::Double) | (Self::Double, Self::BigNum) => Some(Self::Double),
+            // The `numeric` of PostgreSQL meets an integer or a decimal as itself, and a float as a
+            // `DOUBLE`, as the implicit casts of PostgreSQL go.
+            (Self::Numeric, ty) | (ty, Self::Numeric)
+                if ty.is_integer() || matches!(ty, Self::Decimal { .. }) =>
+            {
+                Some(Self::Numeric)
+            }
+            (Self::Numeric, Self::Float | Self::Double) | (Self::Float | Self::Double, Self::Numeric) => {
+                Some(Self::Double)
+            }
             _ if self.is_numeric() && other.is_numeric() => {
                 Some(promote_numeric(self.clone(), other.clone()))
             }
@@ -817,6 +834,7 @@ impl fmt::Display for LogicalType {
             Self::Blob => f.write_str("BLOB"),
             Self::Bit => f.write_str("BIT"),
             Self::BigNum => f.write_str("BIGNUM"),
+            Self::Numeric => f.write_str("PG_NUMERIC"),
             Self::Uuid => f.write_str("UUID"),
             Self::Date => f.write_str("DATE"),
             Self::Time => f.write_str("TIME"),
@@ -1540,6 +1558,7 @@ fn alias(upper: &str) -> Option<LogicalType> {
         "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => LogicalType::Blob,
         "BIT" | "BITSTRING" | "VARBIT" => LogicalType::Bit,
         "BIGNUM" | "VARINT" => LogicalType::BigNum,
+        "PG_NUMERIC" => LogicalType::Numeric,
         "UUID" | "GUID" => LogicalType::Uuid,
         "TYPE" => LogicalType::Type,
         "JSON" => LogicalType::Json,
@@ -1735,6 +1754,7 @@ mod tests {
             LogicalType::Blob,
             LogicalType::Bit,
             LogicalType::BigNum,
+            LogicalType::Numeric,
             LogicalType::Uuid,
             LogicalType::Type,
             LogicalType::Json,

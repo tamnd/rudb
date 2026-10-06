@@ -943,6 +943,12 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
     if matches!(target, LogicalType::Union(_)) {
         return cast_to_union(value, &value.logical_type(), target, try_cast);
     }
+    if matches!(target, LogicalType::Numeric) || matches!(value, Value::Numeric(_)) {
+        return match numeric_cast(value, target) {
+            Err(error) if try_cast && recoverable(&error) => Ok(Value::Null),
+            answer => answer,
+        };
+    }
     if matches!(target, LogicalType::BigNum) || matches!(value, Value::BigNum(_)) {
         return match bignum_cast(value, target) {
             Err(error) if try_cast && recoverable(&error) => Ok(Value::Null),
@@ -1865,6 +1871,60 @@ fn bignum_cast(value: &Value, target: &LogicalType) -> Result<Value> {
         },
     };
     Ok(Value::BigNum(held))
+}
+
+/// A cast to or from the `numeric` of PostgreSQL, which works as the casts of `numeric.c` do: a
+/// double goes through its text with 15 digits, and a number goes to an integer rounded half away
+/// from zero.
+fn numeric_cast(value: &Value, target: &LogicalType) -> Result<Value> {
+    use rudb_pgtypes::Numeric;
+    if let Value::Numeric(bytes) = value {
+        let held = Numeric::from_bytes(bytes);
+        return match target {
+            LogicalType::Numeric => Ok(value.clone()),
+            LogicalType::Varchar => Ok(Value::Varchar(rudb_common::numeric::to_text(bytes))),
+            LogicalType::Double => Ok(Value::Double(held.to_f64())),
+            #[expect(clippy::cast_possible_truncation, reason = "float4 rounds the double")]
+            LogicalType::Float => Ok(Value::Float(held.to_f64() as f32)),
+            &LogicalType::Decimal { width, scale } => {
+                let typmod = ((i32::from(width) << 16) | i32::from(scale)) + 4;
+                let fitted = held.with_typmod(typmod)?;
+                // The typmod has checked the digits, so the value fits the width.
+                let unscaled = fitted.to_decimal(u32::from(scale)).unwrap_or_default();
+                Ok(Value::Decimal { unscaled, width, scale })
+            }
+            _ if target.is_integer() => {
+                let name = match target {
+                    LogicalType::SmallInt => "smallint",
+                    LogicalType::Integer => "integer",
+                    _ => "bigint",
+                };
+                let whole = held.to_integer(name).map_err(|error| Error::from(error).unplaced())?;
+                fit(whole, target).ok_or_else(|| {
+                    Error::out_of_range(format!("{name} out of range"))
+                        .state(rudb_common::SqlState::NUMERIC_VALUE_OUT_OF_RANGE)
+                        .unplaced()
+                })
+            }
+            _ => Err(no_cast(value, target)),
+        };
+    }
+    let held = match value {
+        Value::Varchar(text) => rudb_pgtypes::numeric_in(text, -1)?,
+        &Value::Decimal { unscaled, scale, .. } => {
+            Numeric::from_decimal(unscaled, u32::from(scale))
+        }
+        Value::Float(_) | Value::Double(_) => {
+            Numeric::from_f64(approximate(value).unwrap_or(f64::NAN))
+        }
+        Value::BigNum(bytes) => rudb_pgtypes::numeric_in(&bignum::to_text(bytes), -1)?,
+        Value::Boolean(_) => return Err(no_cast(value, target)),
+        _ => match integral(value) {
+            Some(whole) => Numeric::from_integer(whole),
+            None => return Err(no_cast(value, target)),
+        },
+    };
+    Ok(Value::Numeric(held.to_bytes()))
 }
 
 /// The pin's refusal of a `BIGNUM` that does not fit an integer type, which does not name the type.

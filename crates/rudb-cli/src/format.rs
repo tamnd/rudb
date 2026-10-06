@@ -333,6 +333,7 @@ fn type_name(ty: &LogicalType) -> String {
         LogicalType::Blob => "blob".to_string(),
         LogicalType::Bit => "bit".to_string(),
         LogicalType::BigNum => "bignum".to_string(),
+        LogicalType::Numeric => "numeric".to_string(),
         LogicalType::Uuid => "uuid".to_string(),
         LogicalType::Type => "type".to_string(),
         LogicalType::Json => "json".to_string(),

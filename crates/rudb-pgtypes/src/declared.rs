@@ -213,9 +213,12 @@ impl Parser {
 /// DuckDB reads `oid` as `BIGINT` and `"char"` as `VARCHAR`. A PostgreSQL session keeps them as
 /// `UINTEGER` and `UTINYINT`, which have the values and the width of the PostgreSQL types. The OID
 /// alias types such as `regtype` are `UINTEGER` too, and `int2vector` and `oidvector` are lists of
-/// `SMALLINT` and of `UINTEGER`. The same is true for an array of them.
+/// `SMALLINT` and of `UINTEGER`. A `numeric` with no precision is the `numeric` of PostgreSQL. The
+/// same is true for an array of them.
 pub fn session_type(declared: DeclaredType) -> Option<LogicalType> {
+    let unbounded = declared.typmod < 0;
     let of = |oid| match oid {
+        oid::NUMERIC if unbounded => Some(LogicalType::Numeric),
         oid::OID => Some(LogicalType::UInteger),
         oid::CHAR => Some(LogicalType::UTinyInt),
         oid::INT2VECTOR => Some(LogicalType::List(Box::new(LogicalType::SmallInt))),
