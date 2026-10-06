@@ -2601,7 +2601,10 @@ impl Vector {
         match &self.body {
             Body::Constant(value) => match value.as_ref() {
                 Value::Varchar(text) => Some(text.as_bytes()),
-                Value::Blob(bytes) | Value::Bit(bytes) | Value::BigNum(bytes) | Value::Numeric(bytes) => Some(bytes),
+                Value::Blob(bytes)
+                | Value::Bit(bytes)
+                | Value::BigNum(bytes)
+                | Value::Numeric(bytes) => Some(bytes),
                 _ => None,
             },
             Body::Dictionary { codes, values, .. } => {
@@ -2635,9 +2638,10 @@ impl Vector {
         match &self.body {
             Body::Constant(value) => Ok(match value.as_ref() {
                 Value::Varchar(text) => Some(text.as_bytes()),
-                Value::Blob(bytes) | Value::Bit(bytes) | Value::BigNum(bytes) | Value::Numeric(bytes) => {
-                    Some(bytes.as_slice())
-                }
+                Value::Blob(bytes)
+                | Value::Bit(bytes)
+                | Value::BigNum(bytes)
+                | Value::Numeric(bytes) => Some(bytes.as_slice()),
                 _ => None,
             }),
             Body::Dictionary { codes, values, .. } => match codes.get(index) {
@@ -3761,6 +3765,18 @@ impl Vector {
             return Ok(self
                 .stable_gathered(codes, values, indices, inside, |index| index as usize)?
                 .loosened());
+        }
+        // Any other dictionary with no nulls of its own, which is the selection a filter leaves on a
+        // column it did not copy, is its values gathered at the codes the positions name. The copy
+        // below took the same codes a position at a time through a run of wide positions and a walk
+        // down the chain, where a flat column under the dictionary has a gather of its own that is a
+        // load a row.
+        if let Body::Dictionary { codes, values, stable: false } = &self.body
+            && !self.validity.has_nulls(self.len)
+            && below(indices, codes.len())
+        {
+            let at: Vec<u32> = indices.iter().map(|&index| codes[index as usize]).collect();
+            return values.gather(&at);
         }
         // A constant gathered is the same constant at the new length, as long as every position is
         // a row of it or the value is null anyway. A join's probe gathers every column of its driving
@@ -6158,7 +6174,10 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
             // A blob goes in as the bytes it is. The column stores a length and some bytes either
             // way, so text is the reading of one rather than a different column, and a blob that
             // is not UTF-8 is stored exactly like one that happens to be.
-            Value::Blob(bytes) | Value::Bit(bytes) | Value::BigNum(bytes) | Value::Numeric(bytes) => {
+            Value::Blob(bytes)
+            | Value::Bit(bytes)
+            | Value::BigNum(bytes)
+            | Value::Numeric(bytes) => {
                 column.push_bytes(bytes);
             }
             other => return Err(Error::internal(format!("{other:?} is not a string"))),
@@ -8005,6 +8024,22 @@ mod tests {
         assert_eq!(gathered.form(), Form::Flat);
         assert_eq!(gathered.value_at(0), Value::Integer(8));
         assert_eq!(gathered.value_at(1), Value::Null);
+    }
+
+    /// A selection over a flat column is gathered as the column at the selected rows, flat, and a
+    /// position past the end still comes back null.
+    #[test]
+    fn gathering_a_selection_over_a_flat_column_gathers_the_column_at_its_codes() {
+        let rows: Vec<i32> = (0..40).map(|row| row * 5 - 3).collect();
+        let selection = Vector::dictionary(vec![39, 4, 4, 17, 0], integers(&rows)).unwrap();
+        let gathered = selection.gather(&[3, 0, 2, 4]).unwrap();
+        assert_eq!(gathered.form(), Form::Flat);
+        assert_eq!(
+            gathered.iter().collect::<Vec<_>>(),
+            [17, 39, 4, 0].map(|at: usize| Value::Integer(rows[at])).to_vec()
+        );
+        let past = selection.gather(&[1, 5]).unwrap();
+        assert_eq!(past.iter().collect::<Vec<_>>(), [Value::Integer(17), Value::Null]);
     }
 
     /// Two filters over one chunk build a dictionary over a dictionary, four conjuncts pushed down
