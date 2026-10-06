@@ -1286,6 +1286,7 @@ pub(crate) fn found_for(
     // for each of its rows. On TPC-H q09 that is the join with all 1.5 million orders, which cost
     // 0.56 G instructions to learn that it held every one of them. It is left to the bitmap or the
     // filter, which measure what they keep and stop paying when it is everything.
+    let ex_dbg = exact.map(|e| format!("own={} parents={} adj={} mono={} link={}", e.own, e.parents, e.adjacency().is_some(), e.monotone(), e.link().is_some()));
     let exact = exact.filter(|exact| (rows as u64) < exact.parents);
     // The bitmap over the key values first, because it is one bit a build row and the key map
     // alone, and it counts the parents the side holds. That count says whether a push could skip
@@ -1389,6 +1390,9 @@ pub(crate) fn found_for(
         }
     }
     let spare = spare.filter(|_| exact.is_some());
+    if std::env::var_os("RUDB_DBG").is_some() {
+        eprintln!("found_for rows={rows} placed={placed} armed={} exact={} reduced={reduced:?} domain={} listing={} stopped={stopped}", ex_dbg, exact.is_some(), domain.is_some(), listing.is_some());
+    }
     Ok(Found {
         range: extremes.into_range(),
         filter,
