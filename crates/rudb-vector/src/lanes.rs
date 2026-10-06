@@ -266,10 +266,10 @@ pub(crate) fn add_pair_codes(
     places: &[u32],
 ) -> usize {
     use std::arch::x86_64::{
-        _mm_add_epi64, _mm_loadu_si128, _mm_storeu_si128, _mm256_add_epi64,
-        _mm256_castsi256_si128, _mm256_cmpeq_epi32, _mm256_cvtepu32_epi64,
-        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_max_epu32, _mm256_movemask_epi8,
-        _mm256_set_epi64x, _mm256_set1_epi32, _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
+        _mm_add_epi64, _mm_loadu_si128, _mm_storeu_si128, _mm256_add_epi64, _mm256_castsi256_si128,
+        _mm256_cmpeq_epi32, _mm256_cvtepu32_epi64, _mm256_extracti128_si256, _mm256_loadu_si256,
+        _mm256_max_epu32, _mm256_movemask_epi8, _mm256_set_epi64x, _mm256_set1_epi32,
+        _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
     };
     let mut groups = places.len() / 8;
     for &(bytes, at, width) in &sides {

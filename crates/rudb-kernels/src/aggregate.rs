@@ -2866,7 +2866,9 @@ impl PlaceSums {
             return Err(Error::internal(format!("a map of {combos} places")));
         };
         if !self.carries(places.len()) {
-            return Err(Error::internal("totals by place for other calls were not folded".to_string()));
+            return Err(Error::internal(
+                "totals by place for other calls were not folded".to_string(),
+            ));
         }
         if self.held_rows == 0 {
             self.held.clone_from(&self.calls);
