@@ -16,8 +16,25 @@ use std::sync::{Mutex, PoisonError};
 /// An error of `poll` other than `EINTR`, which only starts the wait again.
 pub(crate) fn readable<const N: usize>(fds: [RawFd; N]) -> io::Result<[bool; N]> {
     let mut polled = fds.map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
-    wait(&mut polled)?;
+    wait(&mut polled, -1)?;
     Ok(polled.map(ready))
+}
+
+/// [`readable`] that waits for `millis` milliseconds at most, and gives `None` when no
+/// descriptor is ready in that time.
+///
+/// # Errors
+///
+/// An error of `poll` other than `EINTR`.
+pub(crate) fn readable_within<const N: usize>(
+    fds: [RawFd; N],
+    millis: i32,
+) -> io::Result<Option<[bool; N]>> {
+    let mut polled = fds.map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+    // A wait that a signal stops starts again with all of its time, so it can be longer than
+    // `millis`, which does not matter to the callers.
+    let ready_count = wait(&mut polled, millis)?;
+    Ok((ready_count > 0).then(|| polled.map(ready)))
 }
 
 /// [`readable`] for a list of any length.
@@ -28,16 +45,18 @@ pub(crate) fn readable<const N: usize>(fds: [RawFd; N]) -> io::Result<[bool; N]>
 pub(crate) fn readable_any(fds: &[RawFd]) -> io::Result<Vec<bool>> {
     let mut polled: Vec<libc::pollfd> =
         fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
-    wait(&mut polled)?;
+    wait(&mut polled, -1)?;
     Ok(polled.into_iter().map(ready).collect())
 }
 
-fn wait(polled: &mut [libc::pollfd]) -> io::Result<()> {
+/// The number of ready descriptors, zero when `millis` passed first. A negative `millis` waits
+/// with no limit.
+fn wait(polled: &mut [libc::pollfd], millis: i32) -> io::Result<usize> {
     loop {
         // SAFETY: `polled` is a valid buffer of `polled.len()` entries for the whole call.
-        let n = unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as libc::nfds_t, -1) };
-        if n >= 0 {
-            return Ok(());
+        let n = unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as libc::nfds_t, millis) };
+        if let Ok(n) = usize::try_from(n) {
+            return Ok(n);
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -48,6 +67,79 @@ fn wait(polled: &mut [libc::pollfd]) -> io::Result<()> {
 
 fn ready(polled: libc::pollfd) -> bool {
     polled.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+}
+
+/// Gives back to the system the pages of the stack of the calling thread below the frame of the
+/// caller. A statement can use tens of KiB of stack, and the pages stay with the thread after the
+/// statement ends. An idle session calls this so that it holds only the pages that it uses while
+/// it waits. The next statement gets new pages, which are zero, as it goes deeper again.
+///
+/// It does nothing on a system other than Linux and macOS.
+#[inline(never)]
+pub(crate) fn trim_stack() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let Some(low) = stack_low() else { return };
+        let here = std::hint::black_box(0u8);
+        let here = std::ptr::from_ref(&here) as usize;
+        // SAFETY: `sysconf` has no preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(0);
+        if page == 0 {
+            return;
+        }
+        // The page of this frame and one page more stay, for the frame of `madvise` itself.
+        let end = here.saturating_sub(page) & !(page - 1);
+        let start = low.next_multiple_of(page);
+        if end <= start {
+            return;
+        }
+        // SAFETY: the range is in the stack of this thread, below the frame of this function and
+        // a page more, so no frame that is live uses it. The pages stay mapped and writable, and
+        // a later frame that touches one gets a page of zeros, which is what a frame expects of
+        // nothing.
+        unsafe {
+            #[cfg(target_os = "linux")]
+            libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
+            // On macOS, `madvise` keeps the pages resident, so new pages of zeros go over them.
+            #[cfg(target_os = "macos")]
+            libc::mmap(
+                start as *mut libc::c_void,
+                end - start,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            );
+        }
+    }
+}
+
+/// The lowest address of the stack of the calling thread, above its guard page.
+#[cfg(target_os = "linux")]
+fn stack_low() -> Option<usize> {
+    let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+    // SAFETY: `pthread_getattr_np` fills `attr` when it gives 0, and `attr` is destroyed once.
+    unsafe {
+        if libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) != 0 {
+            return None;
+        }
+        let mut addr = std::ptr::null_mut();
+        let mut size = 0;
+        let got = libc::pthread_attr_getstack(attr.as_ptr(), &raw mut addr, &raw mut size);
+        libc::pthread_attr_destroy(attr.as_mut_ptr());
+        (got == 0 && !addr.is_null()).then_some(addr as usize)
+    }
+}
+
+/// The lowest address of the stack of the calling thread, above its guard page.
+#[cfg(target_os = "macos")]
+fn stack_low() -> Option<usize> {
+    // SAFETY: both calls only read the description of the calling thread.
+    let (top, size) = unsafe {
+        let me = libc::pthread_self();
+        (libc::pthread_get_stackaddr_np(me) as usize, libc::pthread_get_stacksize_np(me))
+    };
+    top.checked_sub(size)
 }
 
 /// Strong random bytes from the system.
