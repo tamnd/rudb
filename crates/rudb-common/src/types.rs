@@ -885,6 +885,8 @@ impl fmt::Display for LogicalType {
                 }
                 f.write_str(")")
             }
+            // The pin writes a struct with no fields as the bare word.
+            Self::Struct(fields) if fields.is_empty() => f.write_str("STRUCT"),
             Self::Struct(fields) => write_fields(f, "STRUCT", fields),
             Self::Union(fields) => write_fields(f, "UNION", fields),
             Self::AggregateState(_) => f.write_str("AGGREGATE_STATE"),
