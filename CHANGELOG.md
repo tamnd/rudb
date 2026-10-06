@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.31
+
+This release makes rudb-server faster and smaller inside PG1, and has engine speed work and a new crate.
+
+#2606 keeps the plans of the last 32 query texts of each connection, so a second `SELECT 1` runs without a parse, a bind or an optimize. A plan is used again only while the catalog, the database settings and the session are the same, and a query that reads the time, a function, a view or a table function is not kept. #2607 reads the thread CPU clock once for a short run of readings. #2608 keeps the read space of a session from one read to the next. #2610 shares the parameter values of a session between its copies and takes the random bytes of the cancel keys from a pool.
+
+#2612 cuts the memory of an idle session from 108 KiB to 42 KiB on macOS. The settings of the server are shared and a session holds only the ones it changes, the first read has 1 KiB of space, the catalog of each connection has one reader slot, and a session that waits 100 ms gives back the stack pages and the input buffer that its last statement used. With these changes `rudb-postgres perf` gives 15 times the connections per second of PostgreSQL 19 with `trust`.
+
+#2604, #2605 and #2611 make q01 faster: packed pages are placed inside a held window out of their codes, two totals and a count are added by place eight rows at a time, and the places of a chunk are worked out 512 rows at a time. #2609 adds the crate `rudb-index` with normalized keys and sorted runs, the first part of the key index.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.30
 
 This release has PostgreSQL work in rudb-server inside PG1, and engine speed work.
