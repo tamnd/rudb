@@ -33,6 +33,7 @@ use rudb_pgwire::{Bind, CommandTag, Level, OutBuf, Portals, ProtocolError, State
 
 use super::copy::{self, Copy};
 use super::cursor::{self, ALL, Cursor, Declare, Direction, NoScroll, Place, Run};
+use super::prepare::{self, Named};
 use super::setting::{self, Command};
 use super::streamed::{self, Flow};
 use super::{
@@ -129,6 +130,9 @@ pub(super) struct Statement {
     query: Option<Arc<Statement>>,
     /// The `COPY` with `STDIN` or `STDOUT` that the server runs itself, from [`copy::parse`].
     copy: Option<Copy>,
+    /// The statement on the prepared statements that the server runs itself, from
+    /// [`prepare::parse`].
+    named: Option<Named>,
 }
 
 impl Statement {
@@ -292,7 +296,27 @@ impl Extended {
         let one = rudb::statements(&sql).map_err(engine)?.len() == 1;
         let cursor = if one { cursor::parse(&sql) } else { None };
         let copied = if one { copy::parse(&sql) } else { None };
+        let named = if one { prepare::parse(&sql) } else { None };
         let statement = match (cursor, copied) {
+            _ if named.is_some() => {
+                if runner.connection.transaction() == Transaction::Aborted {
+                    return Err(aborted());
+                }
+                Statement {
+                    sql,
+                    control: None,
+                    command: None,
+                    prepared: None,
+                    types: Vec::new(),
+                    slots: Vec::new(),
+                    positional: true,
+                    found: OnceLock::new(),
+                    cursor: None,
+                    query: None,
+                    copy: None,
+                    named,
+                }
+            }
             (None, Some(copied)) => {
                 if runner.connection.transaction() == Transaction::Aborted {
                     return Err(aborted());
@@ -310,6 +334,7 @@ impl Extended {
                     cursor: None,
                     query: None,
                     copy: Some(copy),
+                    named: None,
                 }
             }
             (Some(cursor), _) => {
@@ -338,6 +363,7 @@ impl Extended {
                     cursor: Some(cursor),
                     query,
                     copy: None,
+                    named: None,
                 }
             }
             (None, None) => statement(runner, sql, types)?,
@@ -465,6 +491,10 @@ impl Extended {
                     }
                     return Ok(());
                 }
+                if let Some(named) = &statement.named {
+                    out.parameter_description(&[]);
+                    return self.describe_named(named, &[], out);
+                }
                 if statement.copy.is_some() {
                     out.parameter_description(&[]);
                     out.no_data();
@@ -506,6 +536,10 @@ impl Extended {
                         None => out.no_data(),
                     }
                     return Ok(());
+                }
+                if let Some(named) = &portal.statement.named {
+                    let (named, formats) = (named.clone(), portal.formats.clone());
+                    return self.describe_named(&named, &formats, out);
                 }
                 if portal.statement.control.is_some() || portal.statement.copy.is_some() {
                     out.no_data();
@@ -601,6 +635,18 @@ impl Extended {
                 out,
                 flush,
             );
+        }
+        if let Some(named) = portal.statement.named.clone() {
+            if portal.ran.is_some() {
+                let name = String::from_utf8_lossy(name);
+                return Ok(Err(error("55000", format!("portal \"{name}\" cannot be run"))));
+            }
+            let mut ran = Ran::new(None, CommandTag::Execute, 0, false);
+            ran.reported = true;
+            portal.ran = Some(ran);
+            let sql = portal.statement.sql.clone();
+            let formats = portal.formats.clone();
+            return self.named(runner, &named, &sql, Some(&formats), out, flush);
         }
         if let Some(copied) = portal.statement.copy.clone() {
             if portal.ran.is_some() {
@@ -803,6 +849,230 @@ impl Extended {
         Ok(())
     }
 
+    /// Runs `PREPARE`, `EXECUTE` or `DEALLOCATE` on the statements of the session. `formats` are
+    /// the result formats of `Bind`, or `None` on the simple flow, where the rows of `EXECUTE` go
+    /// out with a `RowDescription`. An error marks an open transaction block as aborted.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn named(
+        &mut self,
+        runner: &mut Runner,
+        named: &Named,
+        sql: &Arc<str>,
+        formats: Option<&[i16]>,
+        out: &mut OutBuf,
+        flush: &mut impl FnMut(&mut OutBuf) -> io::Result<()>,
+    ) -> io::Result<Result<(), Problem>> {
+        let done = if runner.connection.transaction() == Transaction::Aborted {
+            Err(aborted())
+        } else {
+            match named {
+                Named::Prepare { name, types, query } => {
+                    let done = self.prepare(runner, name, types, *query, sql);
+                    done.map(|()| out.command_tag(CommandTag::Prepare, 0))
+                }
+                Named::Execute { name, values } => {
+                    self.execute_prepared(runner, name, values, sql, formats, out, flush)?
+                }
+                Named::Deallocate(Some(name)) => {
+                    match self.statements.deallocate(name.as_bytes()) {
+                        Ok(_) => {
+                            out.command_tag(CommandTag::Deallocate, 0);
+                            Ok(())
+                        }
+                        Err(error) => Err(error.into()),
+                    }
+                }
+                Named::Deallocate(None) => {
+                    self.statements.deallocate_all();
+                    out.command_tag(CommandTag::DeallocateAll, 0);
+                    Ok(())
+                }
+            }
+        };
+        if done.is_err() {
+            runner.connection.abort_transaction();
+        }
+        Ok(done)
+    }
+
+    /// `PrepareQuery`: the statement after `AS`, prepared as a `Parse` prepares it, with the
+    /// types of the list.
+    fn prepare(
+        &mut self,
+        runner: &Runner,
+        name: &str,
+        types: &[(usize, usize)],
+        query: usize,
+        sql: &Arc<str>,
+    ) -> Result<(), Problem> {
+        let text = &sql[query..];
+        if let Some(word) = prepare::not_preparable(text) {
+            let failure = Failure {
+                sqlstate: "42601".to_owned(),
+                message: format!("syntax error at or near \"{word}\""),
+                fields: None,
+                position: Some(query + text.len() - text.trim_start().len()),
+            };
+            return Err(Problem::failure(failure, sql));
+        }
+        let mut oids = Vec::with_capacity(types.len());
+        for &(start, end) in types {
+            let written = sql[start..end].trim_end();
+            let Some(declared) = rudb_pgtypes::declared_type(written) else {
+                let shown = if written.contains('"') {
+                    written.replace('"', "")
+                } else {
+                    written.to_lowercase()
+                };
+                let failure = Failure {
+                    sqlstate: "42704".to_owned(),
+                    message: format!("type \"{shown}\" does not exist"),
+                    fields: None,
+                    position: Some(start),
+                };
+                return Err(Problem::failure(failure, sql));
+            };
+            oids.push(declared.oid);
+        }
+        let statement =
+            statement(runner, text.into(), oids).map_err(|problem| problem.within(sql, query))?;
+        self.statements.insert(name.as_bytes(), Arc::new(statement))?;
+        Ok(())
+    }
+
+    /// `ExecuteQuery`: runs a prepared statement with the values of the list, each one cast to
+    /// the type of its parameter.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_prepared(
+        &mut self,
+        runner: &mut Runner,
+        name: &str,
+        values: &[(usize, usize)],
+        sql: &Arc<str>,
+        formats: Option<&[i16]>,
+        out: &mut OutBuf,
+        flush: &mut impl FnMut(&mut OutBuf) -> io::Result<()>,
+    ) -> io::Result<Result<(), Problem>> {
+        let statement = match self.statements.get(name.as_bytes()) {
+            Ok(statement) => statement.clone(),
+            Err(error) => return Ok(Err(error.into())),
+        };
+        if statement.named.is_some() || statement.cursor.is_some() || statement.copy.is_some() {
+            let message = format!("prepared statement \"{name}\" cannot be run by EXECUTE");
+            return Ok(Err(error("0A000", message)));
+        }
+        let types = match statement.found() {
+            Ok(types) => types.to_vec(),
+            Err(problem) => return Ok(Err(problem)),
+        };
+        if types.len() != values.len() {
+            let error = ProtocolError {
+                level: Level::Error,
+                sqlstate: "42601",
+                message: format!("wrong number of parameters for prepared statement \"{name}\""),
+                detail: Some(format!(
+                    "Expected {} parameters but got {}.",
+                    types.len(),
+                    values.len()
+                )),
+                hint: None,
+            };
+            return Ok(Err(error.into()));
+        }
+        let values = match evaluate(runner, &types, values, sql) {
+            Ok(values) => values,
+            Err(problem) => return Ok(Err(problem)),
+        };
+        let text = statement.sql.clone();
+        let mut portal = Portal {
+            statement,
+            values,
+            formats: formats.map_or_else(Vec::new, <[i16]>::to_vec),
+            ran: None,
+            described: None,
+            cursor: None,
+        };
+        let flow = streamed::streamable(&text).then(|| match formats {
+            None => Flow::Simple,
+            Some(formats) => Flow::Portal { formats: formats.to_vec(), described: None },
+        });
+        let ran = match portal.run(runner, true, flow, out) {
+            Ok(Some(ran)) => ran,
+            Ok(None) => {
+                out.empty_query_response();
+                return Ok(Ok(()));
+            }
+            Err(problem) => return Ok(Err(problem)),
+        };
+        if !ran.rows {
+            out.command_tag(ran.tag, ran.changes);
+            return Ok(Ok(()));
+        }
+        if let Some(rows) = ran.streamed.take() {
+            out.command_tag(ran.tag, rows);
+            return Ok(Ok(()));
+        }
+        let Some(result) = &ran.result else {
+            return Ok(Ok(()));
+        };
+        let formats = match formats {
+            Some(formats) => formats.to_vec(),
+            None => {
+                let columns: Vec<_> = result
+                    .names()
+                    .iter()
+                    .zip(result.types())
+                    .enumerate()
+                    .map(|(at, (name, ty))| field(name, ty, result.origin(at), 0))
+                    .collect();
+                out.row_description(&columns);
+                Vec::new()
+            }
+        };
+        let mut encoder = match encoder(result, &formats, &text) {
+            Ok(encoder) => encoder,
+            Err(problem) => return Ok(Err(problem)),
+        };
+        let run = ran.place.forward(result.len() as u64, ALL);
+        if let Err(failure) = send(result, &mut ran.walk, run, &mut encoder, runner, out, flush)? {
+            return Ok(Err(Problem::failure(failure, &text)));
+        }
+        if let Some(failed) = ran.failed.take() {
+            return Ok(Err(failed));
+        }
+        out.command_tag(ran.tag, run.count);
+        Ok(Ok(()))
+    }
+
+    /// The `Describe` of a statement on the prepared statements: the rows of the statement that
+    /// `EXECUTE` runs, in `formats`, and `NoData` for the others.
+    fn describe_named(
+        &self,
+        named: &Named,
+        formats: &[i16],
+        out: &mut OutBuf,
+    ) -> Result<(), Problem> {
+        let Named::Execute { name, .. } = named else {
+            out.no_data();
+            return Ok(());
+        };
+        let statement = self.statements.get(name.as_bytes())?;
+        match statement.describe()? {
+            Some(Description { fields: Some(fields), origins, .. }) => {
+                check_formats(formats, fields.len())?;
+                let origin = |at: usize| origins.get(at).copied().flatten();
+                let columns: Vec<_> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(at, f)| field(&f.name, &f.ty, origin(at), format_of(formats, at)))
+                    .collect();
+                out.row_description(&columns);
+            }
+            _ => out.no_data(),
+        }
+        Ok(())
+    }
+
     pub(super) fn close(&mut self, target: Target, name: &[u8], out: &mut OutBuf) {
         match target {
             Target::Statement => drop(self.statements.close(name)),
@@ -859,6 +1129,7 @@ fn statement(runner: &Runner, sql: Arc<str>, mut types: Vec<Oid>) -> Result<Stat
         cursor: None,
         query: None,
         copy: None,
+        named: None,
     };
     // PostgreSQL binds a query and a change to the data at `Parse`, so a name that is not there
     // is an error of `Parse` and not of `Execute`.
@@ -876,6 +1147,50 @@ fn statement(runner: &Runner, sql: Arc<str>, mut types: Vec<Oid>) -> Result<Stat
         }
     }
     Ok(statement)
+}
+
+/// The values of `EXECUTE`, each one cast to the type of its parameter, as `EvaluateParams`
+/// casts them. The engine finds them with one query, and the position of an error in a value
+/// counts from the start of `sql`.
+fn evaluate(
+    runner: &Runner,
+    types: &[Oid],
+    values: &[(usize, usize)],
+    sql: &Arc<str>,
+) -> Result<Vec<Value>, Problem> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = String::from("SELECT ");
+    // The place of each value in the query, the place in `sql` and the length.
+    let mut places = Vec::with_capacity(values.len());
+    for (at, (&(start, end), &oid)) in values.iter().zip(types).enumerate() {
+        if at > 0 {
+            query.push_str(", ");
+        }
+        query.push_str("CAST(");
+        let text = sql[start..end].trim_end();
+        places.push((query.len(), start, text.len()));
+        query.push_str(text);
+        let ty = match logical_type(oid) {
+            Some(logical) => logical.to_string(),
+            None => rudb_pgtypes::format_type(oid).into_owned(),
+        };
+        query.push_str(" AS ");
+        query.push_str(&ty);
+        query.push(')');
+    }
+    let result = runner.connection.execute(&query).map_err(|e| {
+        let mut failure = Failure::engine(&e, 0);
+        failure.position = failure.position.and_then(|at| {
+            places
+                .iter()
+                .find(|(from, _, len)| (*from..from + len).contains(&at))
+                .map(|(from, start, _)| at - from + start)
+        });
+        Problem::failure(failure, sql)
+    })?;
+    Ok(result.row(0).unwrap_or_default())
 }
 
 impl Portal {
