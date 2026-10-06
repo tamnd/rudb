@@ -64,8 +64,8 @@
 //! over types where equal values are the same value, which leaves out floating point, where `0.0`
 //! and `-0.0` are equal and different, and strings, which a collation may compare loosely.
 
-use rudb_common::{LogicalType, Result};
 use rudb_common::rules::Rule;
+use rudb_common::{LogicalType, Result};
 use rudb_plan::{
     BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef,
     Plan, Slice,
@@ -190,7 +190,8 @@ fn sorted(
 
 /// Whether `binding` is one of the columns `at` hands up.
 fn produces(plan: &Plan, at: NodeRef, binding: ColumnBinding) -> bool {
-    walk::outputs(plan, at).is_some_and(|columns| columns.iter().any(|(bound, _)| *bound == binding))
+    walk::outputs(plan, at)
+        .is_some_and(|columns| columns.iter().any(|(bound, _)| *bound == binding))
 }
 
 /// Whether the join's condition holds an equality the executor's probe keys on, which is what
