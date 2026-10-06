@@ -261,6 +261,18 @@ impl<'a> Query<'a> {
         Ok(chunk)
     }
 
+    /// Lets [`Query::next_chunk`] give the chunks that the query made in order before it failed.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Query::next_chunk`].
+    pub fn failed(&self) -> Result<()> {
+        self.reader
+            .as_ref()
+            .ok_or_else(|| Error::internal("a query built into a sink has no result reader"))?
+            .failed()
+    }
+
     /// Runs the query and collects everything it produced.
     ///
     /// The convenience the tests and the simple callers want. A caller that cares about holding one

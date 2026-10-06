@@ -20,7 +20,7 @@
 //! the type that `Describe` finds for it.
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rudb::{Description, Prepared, QueryResult, Transaction};
@@ -108,6 +108,8 @@ pub(super) struct Statement {
     slots: Vec<usize>,
     /// The names are `1` to `n` for `n` parameters, so the values go by position.
     positional: bool,
+    /// The types of [`Statement::parameter_types`], found once as PostgreSQL finds them at `Parse`.
+    found: OnceLock<Vec<Oid>>,
 }
 
 impl Statement {
@@ -130,6 +132,17 @@ impl Statement {
             }
         }
         types
+    }
+
+    /// The types of [`Statement::parameter_types`] for the values of `Bind`. A text value of a
+    /// parameter of no declared type is read as the type that the binder found, so `1 + $1` adds
+    /// two integers.
+    fn found(&self) -> Result<&[Oid], Problem> {
+        if let Some(types) = self.found.get() {
+            return Ok(types);
+        }
+        let types = self.parameter_types(self.describe()?.as_ref());
+        Ok(self.found.get_or_init(|| types))
     }
 
     fn describe(&self) -> Result<Option<Description>, Problem> {
@@ -181,6 +194,8 @@ struct Ran {
     chunk: usize,
     row: usize,
     encoder: Option<RowEncoder>,
+    /// The error of a query that made rows before it failed. `Execute` sends it after the rows.
+    failed: Option<Problem>,
 }
 
 /// The statements and the portals of a session.
@@ -249,7 +264,16 @@ impl Extended {
                 *s < count && !slots[..i].contains(s)
             });
         let control = Control::of(&sql);
-        let statement = Statement { sql, control, command, prepared, types, slots, positional };
+        let statement = Statement {
+            sql,
+            control,
+            command,
+            prepared,
+            types,
+            slots,
+            positional,
+            found: OnceLock::new(),
+        };
         // PostgreSQL binds a query and a change to the data at `Parse`, so a name that is not
         // there is an error of `Parse` and not of `Execute`.
         if statement.prepared.as_ref().is_some_and(Prepared::binds_at_parse) {
@@ -288,7 +312,6 @@ impl Extended {
             interval_style: runner.format.interval_style,
         };
         let formats = params.formats;
-        let mut found: Option<Vec<Oid>> = None;
         let mut values = Vec::with_capacity(statement.types.len());
         for i in 0..statement.types.len() {
             let Some(data) = params.next().transpose()? else {
@@ -310,16 +333,18 @@ impl Extended {
                 |e: TypeError| Problem::failure(type_failure(e, Some(context())), &statement.sql);
             let value = match formats.of(i) {
                 0 => {
-                    param_value(statement.types[i], false, data, i + 1, &settings).map_err(fail)?
+                    // A statement that does not bind is read as text here, and `Execute` sends
+                    // its error.
+                    let mut oid = statement.types[i];
+                    if oid == 0 {
+                        oid = statement.found().map_or(TEXT, |types| types[i]);
+                    }
+                    param_value(oid, false, data, i + 1, &settings).map_err(fail)?
                 }
                 1 => {
                     let mut oid = statement.types[i];
                     if oid == 0 {
-                        if found.is_none() {
-                            let description = statement.describe()?;
-                            found = Some(statement.parameter_types(description.as_ref()));
-                        }
-                        oid = found.as_ref().map_or(TEXT, |types| types[i]);
+                        oid = statement.found()?[i];
                     }
                     param_value(oid, true, data, i + 1, &settings).map_err(fail)?
                 }
@@ -529,6 +554,8 @@ impl Extended {
         // one more, so a limit that is the number of the rows left also suspends the portal.
         if max_rows > 0 && sent == limit {
             out.portal_suspended();
+        } else if let Some(failed) = ran.failed.take() {
+            return Ok(Err(failed));
         } else {
             out.command_tag(ran.tag, sent);
         }
@@ -577,12 +604,27 @@ impl Portal {
             let before = runner.connection.transaction();
             let values = &self.values;
             let command = statement.command.as_ref();
-            let outcome = runner
-                .run(statement.control, command, sql, 0, out, |_| match &statement.prepared {
+            let ran = runner.run(statement.control, command, sql, 0, out, |_| {
+                match &statement.prepared {
                     Some(prepared) => statement.execute(prepared, values),
                     None => unreachable!("a statement without a plan is a command"),
-                })
-                .map_err(problem)?;
+                }
+            });
+            let outcome = match ran {
+                Ok(outcome) => outcome,
+                Err(failure) => {
+                    // The rows that the query made before the error go out first, as in
+                    // PostgreSQL, and the error comes where the `CommandComplete` would.
+                    let Some(result) = runner.connection.rows_before_error() else {
+                        return Err(problem(failure));
+                    };
+                    let tag = command_tag(sql, &result, before);
+                    let mut ran = Ran::new(Some(result), tag, 0, true);
+                    ran.failed = Some(problem(failure));
+                    self.ran = Some(ran);
+                    return Ok(self.ran.as_mut());
+                }
+            };
             let ran = match outcome {
                 Outcome::Result(result) => {
                     let tag = command_tag(sql, &result, before);
@@ -604,7 +646,17 @@ impl Portal {
 
 impl Ran {
     fn new(result: Option<QueryResult>, tag: CommandTag, changes: u64, rows: bool) -> Ran {
-        Ran { result, changes, tag, rows, reported: false, chunk: 0, row: 0, encoder: None }
+        Ran {
+            result,
+            changes,
+            tag,
+            rows,
+            reported: false,
+            chunk: 0,
+            row: 0,
+            encoder: None,
+            failed: None,
+        }
     }
 }
 

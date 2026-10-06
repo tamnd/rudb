@@ -12,7 +12,7 @@
 //! drives them is the serial driver in `rudb-pipeline`, which pushes one chunk through every stream
 //! of a pipeline in the order `build.rs` stacked them.
 
-use rudb_common::{Field, Result, Session};
+use rudb_common::{Error, Field, Result, Session};
 use rudb_kernels::row_count;
 use rudb_pipeline::{Compaction, Gauge, Progress, Stream, narrow};
 use rudb_plan::{ExprRef, Node, NodeRef, Plan, Slice};
@@ -216,6 +216,17 @@ fn reads(node: &Node) -> u32 {
 pub(crate) struct Project {
     exprs: Prepared,
     schema: Schema,
+    /// Whether a chunk with a row that fails hands on the rows before that row, as PostgreSQL
+    /// sends the rows it made before an error.
+    before: bool,
+}
+
+/// What one instance of a projection holds between two chunks.
+#[derive(Debug, Default)]
+pub(crate) struct Projecting {
+    scratch: Scratch,
+    /// The error of a row, held while the rows before it go on.
+    failed: Option<Error>,
 }
 
 impl Project {
@@ -223,6 +234,7 @@ impl Project {
     #[must_use]
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.exprs = self.exprs.in_session(session);
+        self.before = session.postgres().is_some();
         self
     }
 
@@ -243,7 +255,7 @@ impl Project {
         let exprs: Vec<ExprRef> = plan.expr_list(exprs).to_vec();
         let names = plan.name_list(names);
         if names.len() != exprs.len() {
-            return Err(rudb_common::Error::internal(format!(
+            return Err(Error::internal(format!(
                 "a projection of {} expressions under {} names",
                 exprs.len(),
                 names.len()
@@ -255,27 +267,73 @@ impl Project {
             .map(|(&expr, &name)| Field::new(plan.string(name), plan.expr_type(expr).clone()))
             .collect();
         let exprs = Prepared::new(plan, &exprs, input)?;
-        Ok(Self { exprs, schema: Schema::numbered(fields, index) })
+        Ok(Self { exprs, schema: Schema::numbered(fields, index), before: false })
     }
 
     /// The columns this projection produces.
     pub(crate) fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    /// The rows of `chunk` before the first row that fails, and the error of that row.
+    ///
+    /// The steps run over longer and longer starts of the chunk, cut in half each time, so a chunk
+    /// of a thousand rows runs them about ten times. This is only done after a step failed.
+    fn before(
+        &self,
+        chunk: &Chunk,
+        scratch: &mut Scratch,
+        mut error: Error,
+    ) -> Result<(Option<Chunk>, Error)> {
+        let start = |rows: usize| chunk.clone().select(&Selection::identity(rows));
+        // The first `good` rows run, and the first `bad` rows do not.
+        let (mut good, mut bad) = (0, chunk.len());
+        while bad - good > 1 {
+            let middle = good + (bad - good) / 2;
+            match self.exprs.steps(&start(middle)?, scratch) {
+                Ok(()) => good = middle,
+                Err(failed) => (bad, error) = (middle, failed),
+            }
+        }
+        if good == 0 {
+            return Ok((None, error));
+        }
+        let mut columns = Vec::with_capacity(self.exprs.len());
+        self.exprs.evaluate(&start(good)?, scratch, &mut columns)?;
+        Ok((Some(Chunk::with_rows(columns, good)?), error))
+    }
 }
 
 impl Stream for Project {
-    type Local = Scratch;
+    type Local = Projecting;
 
-    fn local(&self) -> Scratch {
-        self.exprs.scratch()
+    fn local(&self) -> Projecting {
+        Projecting { scratch: self.exprs.scratch(), failed: None }
     }
 
-    fn push(&self, chunk: &mut Chunk, scratch: &mut Scratch) -> Result<Progress> {
+    fn push(&self, chunk: &mut Chunk, local: &mut Projecting) -> Result<Progress> {
+        if let Some(error) = local.failed.take() {
+            return Err(error);
+        }
         let mut columns = Vec::with_capacity(self.exprs.len());
         let rows = chunk.len();
         let taken = std::mem::replace(chunk, Chunk::with_rows(Vec::new(), 0)?);
-        self.exprs.evaluate_taking(taken, scratch, &mut columns)?;
+        if let Err(error) = self.exprs.steps(&taken, &mut local.scratch) {
+            if !self.before || taken.kept().is_some() {
+                return Err(error);
+            }
+            // The rows before the error go on, and the error comes at the next call, which is
+            // after those rows went through everything below. A limit below that has its rows by
+            // then stops the query, and the error is not seen, as in PostgreSQL.
+            let (rows, error) = self.before(&taken, &mut local.scratch, error)?;
+            let Some(rows) = rows else {
+                return Err(error);
+            };
+            *chunk = rows;
+            local.failed = Some(error);
+            return Ok(Progress::Again);
+        }
+        self.exprs.hand_over(taken, &mut local.scratch, &mut columns)?;
         *chunk = Chunk::with_rows(columns, rows)?;
         Ok(Progress::More)
     }

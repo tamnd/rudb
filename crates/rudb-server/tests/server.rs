@@ -741,6 +741,44 @@ fn division_follows_the_rules_of_postgres() {
 }
 
 #[test]
+fn the_rows_before_an_error_go_before_the_error() {
+    let dirs = Dirs::new("partial");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let sql = "select 10 / g from generate_series(3, -1, -1) g";
+    let messages = client.query(sql);
+    assert_eq!(tags(&messages), "TDDDEZ");
+    let rows: Vec<_> = messages[1..4].iter().map(data_row).collect();
+    assert_eq!(rows, [[Some(b"3".to_vec())], [Some(b"5".to_vec())], [Some(b"10".to_vec())]]);
+    assert_eq!(messages[4].field(b'C').as_deref(), Some("22012"));
+    // A limit that has its rows before the row that fails gives no error.
+    let messages = client.query("select 10 / g from generate_series(3, -1, -1) g limit 2");
+    assert_eq!(tags(&messages), "TDDCZ");
+    // The extended flow sends the rows at Execute, and the error where the CommandComplete goes.
+    client.parse("", sql, &[]);
+    client.bind("", "", &[], &[]);
+    client.describe(Target::Portal, "");
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12TDDDEZ");
+    // With a row limit the portal stops at the limit, and the next Execute gives the rest and
+    // then the error.
+    client.query("begin");
+    client.parse("", sql, &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 2);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "12DDsDEZ");
+    client.query("rollback");
+    // A statement that fails before it makes a row sends no rows.
+    assert_eq!(tags(&client.query("select 1 / g from generate_series(0, 2) g")), "EZ");
+    assert_eq!(tags(&client.query("select 1")), "TDCZ");
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_call_that_no_function_takes_is_the_error_of_postgres() {
     let dirs = Dirs::new("function");
     let server = Server::start(dirs.config()).unwrap();

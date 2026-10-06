@@ -110,6 +110,25 @@ impl Order {
         }
     }
 
+    /// Move the chunks of the first morsel that did not finish onto the ready queue, after the
+    /// query failed while it read that morsel.
+    ///
+    /// The chunks of a later morsel stay, because the rows of the morsel in front of them did not
+    /// all arrive. On one thread the morsel that failed is that first morsel, so the rows before
+    /// the error all go.
+    fn failed(&mut self, ready: &mut VecDeque<Chunk>) {
+        self.release(ready);
+        let first = self.next;
+        while let Some((&key, _)) = self.waiting.iter().next() {
+            if key.0 != first {
+                break;
+            }
+            if let Some(chunk) = self.waiting.remove(&key) {
+                ready.push_back(chunk);
+            }
+        }
+    }
+
     /// Move everything still waiting onto the ready queue, in key order.
     ///
     /// For the end of a run, once every instance has combined and nothing is being read, so there
@@ -354,6 +373,23 @@ impl RootReader {
     pub fn next_chunk(&self) -> Result<Option<Chunk>> {
         let mut queue = self.shared.queue.lock().map_err(poisoned)?;
         Ok(queue.ready.pop_front())
+    }
+
+    /// Lets the reader take the chunks that arrived in source order before the query failed. See
+    /// [`Order::failed`]. A root that does not restore the order queues each chunk as it comes and
+    /// has nothing held.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::Internal`](rudb_common::ErrorCode::Internal) if a thread panicked while
+    /// holding the queue.
+    pub fn failed(&self) -> Result<()> {
+        let mut queue = self.shared.queue.lock().map_err(poisoned)?;
+        let Queue { ready, order } = &mut *queue;
+        if let Some(order) = order.as_mut() {
+            order.failed(ready);
+        }
+        Ok(())
     }
 
     /// Whether the pipeline that feeds this has finalised.
