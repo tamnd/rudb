@@ -254,19 +254,22 @@ pub(crate) fn add_codes(
 ///
 /// Each side is the run's bytes, the byte its first row's group starts at, and its width, which is
 /// between one and [`LANE_WIDTH_MAX`]. A group of eight codes of each side is one shuffle, shift and
-/// mask, and four of them widened to 64 bits are a load's worth of [`add_pairs`].
+/// mask, and four of them widened to 64 bits are a load's worth of [`add_pairs`]. Each side's
+/// `lifts` is added to every one of its codes, so that runs with other bases can add into the same
+/// cells.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(unsafe_code)]
 pub(crate) fn add_pair_codes(
     cells: &mut [[i64; 4]],
     sides: [(&[u8], usize, usize); 2],
+    lifts: [i64; 2],
     places: &[u32],
 ) -> usize {
     use std::arch::x86_64::{
-        _mm_add_epi64, _mm_loadu_si128, _mm_storeu_si128, _mm256_castsi256_si128,
-        _mm256_cmpeq_epi32, _mm256_cvtepu32_epi64, _mm256_extracti128_si256, _mm256_loadu_si256,
-        _mm256_max_epu32, _mm256_movemask_epi8, _mm256_set1_epi32, _mm256_unpackhi_epi64,
-        _mm256_unpacklo_epi64,
+        _mm_add_epi64, _mm_loadu_si128, _mm_storeu_si128, _mm256_add_epi64,
+        _mm256_castsi256_si128, _mm256_cmpeq_epi32, _mm256_cvtepu32_epi64,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_max_epu32, _mm256_movemask_epi8,
+        _mm256_set_epi64x, _mm256_set1_epi32, _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
     };
     let mut groups = places.len() / 8;
     for &(bytes, at, width) in &sides {
@@ -297,6 +300,7 @@ pub(crate) fn add_pair_codes(
         };
         let [ones, twos] = sides.map(side);
         let top = _mm256_set1_epi32(last as i32);
+        let lift = _mm256_set_epi64x(lifts[1], lifts[0], lifts[1], lifts[0]);
         let to = cells.as_mut_ptr();
         for group in 0..groups {
             let held = _mm256_loadu_si256(places.as_ptr().add(done).cast());
@@ -312,8 +316,10 @@ pub(crate) fn add_pair_codes(
             ];
             for (half, (first, second)) in halves.into_iter().enumerate() {
                 let (first, second) = (_mm256_cvtepu32_epi64(first), _mm256_cvtepu32_epi64(second));
-                let (even, odd) =
-                    (_mm256_unpacklo_epi64(first, second), _mm256_unpackhi_epi64(first, second));
+                let (even, odd) = (
+                    _mm256_add_epi64(_mm256_unpacklo_epi64(first, second), lift),
+                    _mm256_add_epi64(_mm256_unpackhi_epi64(first, second), lift),
+                );
                 let pairs = [
                     _mm256_castsi256_si128(even),
                     _mm256_castsi256_si128(odd),
@@ -647,7 +653,8 @@ mod tests {
                 }
                 let mut cells = vec![[0_i64; 4]; 11];
                 let sides = [(&first[..], skip * one / 8, one), (&second[..], skip * two / 8, two)];
-                let done = add_pair_codes(&mut cells, sides, &places);
+                let lifts = [-i64::from(skip as u32), 1 << 40];
+                let done = add_pair_codes(&mut cells, sides, lifts, &places);
                 assert!(
                     done % 8 == 0 && done <= past.unwrap_or(rows),
                     "{one} {two} {skip} {past:?}"
@@ -661,8 +668,8 @@ mod tests {
                 let mut want = vec![[0_i64; 4]; 11];
                 for row in 0..done {
                     let cell = &mut want[places[row] as usize];
-                    cell[0] += i64::from(ones[skip + row]);
-                    cell[1] += i64::from(twos[skip + row]);
+                    cell[0] += i64::from(ones[skip + row]) + lifts[0];
+                    cell[1] += i64::from(twos[skip + row]) + lifts[1];
                     cell[2] += 1;
                 }
                 assert_eq!(cells, want, "{one} {two} {skip} {past:?}");

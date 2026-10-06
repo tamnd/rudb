@@ -2660,8 +2660,10 @@ pub struct PlaceSums {
     /// chunk.
     by_place: Vec<i64>,
     /// The calls, the counting calls and the stride the cells of [`Self::by_place`] were added up
-    /// for, and the rows the filter kept they hold.
+    /// for, and the rows the filter kept they hold. The cells are codes short of the bases the
+    /// first chunk had, and by call, `lifts` is what a code of this chunk is short of one of those.
     held: Vec<(usize, Feed, i64)>,
+    lifts: Vec<i64>,
     held_counting: Vec<usize>,
     held_stride: usize,
     held_rows: i64,
@@ -2871,6 +2873,8 @@ impl PlaceSums {
             self.held_counting.clone_from(&self.counting);
             self.held_stride = self.stride;
         }
+        self.lifts.clear();
+        self.lifts.extend(self.calls.iter().zip(&self.held).map(|(call, held)| call.2 - held.2));
         self.added = places.len();
         if self.by_place.len() < needed {
             self.by_place.resize(needed, 0);
@@ -2892,6 +2896,13 @@ impl PlaceSums {
             return Ok(());
         }
         self.read_pending(inputs)?;
+        for (values, &lift) in self.values.iter_mut().zip(&self.lifts) {
+            if lift != 0 {
+                for value in values.iter_mut() {
+                    *value = value.wrapping_add(lift.cast_unsigned());
+                }
+            }
+        }
         let values = &self.values[..self.calls.len()];
         let cells = &mut self.by_place[..needed];
         macro_rules! widths {
@@ -2927,7 +2938,9 @@ impl PlaceSums {
             return Ok(false);
         };
         let cells = self.by_place[..needed].as_chunks_mut::<4>().0;
-        let done = rudb_vector::vector::add_packed_pairs_by_place(cells, &first, &second, places);
+        let lifts = [self.lifts[0], self.lifts[1]];
+        let done =
+            rudb_vector::vector::add_packed_pairs_by_place(cells, &first, &second, lifts, places);
         if done == 0 {
             return Ok(false);
         }
@@ -2935,8 +2948,8 @@ impl PlaceSums {
             let Some(cell) = cells.get_mut(place as usize) else {
                 return Err(Error::internal(format!("place {place} is past the map")));
             };
-            cell[0] = cell[0].wrapping_add(first.code(row) as i64);
-            cell[1] = cell[1].wrapping_add(second.code(row) as i64);
+            cell[0] = cell[0].wrapping_add(first.code(row) as i64 + lifts[0]);
+            cell[1] = cell[1].wrapping_add(second.code(row) as i64 + lifts[1]);
             cell[2] += 1;
         }
         Ok(true)
@@ -3000,15 +3013,24 @@ impl PlaceSums {
     }
 
     /// Whether a chunk of `rows` rows can go on adding into the cells the chunks before it left
-    /// in [`Self::by_place`], which it can while the calls, how they are fed, their bases and the
-    /// stride are the same and no total can leave its `i64`. When it cannot, the caller folds the
-    /// cells in with [`Self::fold_places`] before [`Self::add_places`].
+    /// in [`Self::by_place`], which it can while the calls, how they are fed and the stride are
+    /// the same and no total can leave its `i64`. A base can move, since a packed run of q01's
+    /// `l_extendedprice` has a base of its own every page, and the codes of the chunk are lifted by
+    /// what it moved. Over fewer than 2^30 rows of codes under 2^32 lifted by less than 2^31 no
+    /// total leaves its `i64`. When it cannot go on, the caller folds the cells in with
+    /// [`Self::fold_places`] before [`Self::add_places`].
     pub fn carries(&self, rows: usize) -> bool {
+        let alike = |call: &(usize, Feed, i64), held: &(usize, Feed, i64)| {
+            call.0 == held.0
+                && call.1 == held.1
+                && call.2.checked_sub(held.2).is_some_and(|lift| lift.unsigned_abs() < 1 << 31)
+        };
         self.held_rows == 0
-            || (self.held == self.calls
+            || (self.held.len() == self.calls.len()
+                && self.calls.iter().zip(&self.held).all(|(call, held)| alike(call, held))
                 && self.held_counting == self.counting
                 && self.held_stride == self.stride
-                && i64::try_from(rows).is_ok_and(|rows| self.held_rows + rows < 1 << 31))
+                && i64::try_from(rows).is_ok_and(|rows| self.held_rows + rows < 1 << 30))
     }
 
     /// Adds the totals of each place that has rows to what is owed the group `map` holds for it,

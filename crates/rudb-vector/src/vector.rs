@@ -4288,12 +4288,13 @@ pub fn add_pairs_by_place(
 }
 
 /// [`add_pairs_by_place`] with the two values read out of two packed runs, for runs that start on a
-/// group of eight codes and are no wider than the lanes take. It adds nothing for any other runs,
-/// and nothing without AVX2.
+/// group of eight codes and are no wider than the lanes take, with `lifts` added to each run's
+/// codes. It adds nothing for any other runs, and nothing without AVX2.
 pub fn add_packed_pairs_by_place(
     cells: &mut [[i64; 4]],
     first: &Packed<'_>,
     second: &Packed<'_>,
+    lifts: [i64; 2],
     places: &[u32],
 ) -> usize {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -4304,13 +4305,13 @@ pub fn add_packed_pairs_by_place(
                 .then(|| (crate::lanes::bytes_of(packed.words), packed.offset * width / 8, width))
         }
         if let (Some(one), Some(two)) = (side(first), side(second)) {
-            return crate::lanes::add_pair_codes(cells, [one, two], places);
+            return crate::lanes::add_pair_codes(cells, [one, two], lifts, places);
         }
         0
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     {
-        let _ = (cells, first, second, places);
+        let _ = (cells, first, second, lifts, places);
         0
     }
 }
