@@ -741,6 +741,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-index"
+version = "0.8.30"
+dependencies = [
+ "rudb-common",
+]
+
+[[package]]
 name = "rudb-io"
 version = "0.8.30"
 dependencies = [

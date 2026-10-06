@@ -83,6 +83,11 @@ rudb-graph = 5
 # file or a plan is. `rudb-native` at rank 6 is what puts one on disk and `rudb-opt` at rank 11 is
 # what reads one to choose a plan.
 rudb-stats = 5
+# The key index of notes/Spec/2140/engine-v4/11-indexes-and-keys.md: normalized keys, the in-memory
+# level and the sorted runs under it. Rank 5 beside `rudb-graph`, because an index entry is a key and
+# a row id and nothing about a file or a plan. `rudb-native` above is what puts its runs in a file,
+# and the catalog above that is what keeps one per key.
+rudb-index = 5
 rudb-native = 6
 rudb-arrow = 5
 rudb-csv = 5

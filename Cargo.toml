@@ -76,6 +76,7 @@ rudb-exec = { version = "=0.8.30", path = "crates/rudb-exec" }
 rudb-extension = { version = "=0.8.30", path = "crates/rudb-extension" }
 rudb-functions = { version = "=0.8.30", path = "crates/rudb-functions" }
 rudb-graph = { version = "=0.8.30", path = "crates/rudb-graph" }
+rudb-index = { version = "=0.8.30", path = "crates/rudb-index" }
 rudb-iceberg = { version = "=0.8.30", path = "crates/rudb-iceberg" }
 rudb-io = { version = "=0.8.30", path = "crates/rudb-io" }
 rudb-json = { version = "=0.8.30", path = "crates/rudb-json" }
