@@ -2510,6 +2510,31 @@ mod tests {
         assert!(found.gather(Some(&clustered)).is_none() && found.domain.is_some());
     }
 
+    /// A join set aside under another one places no rows, but its keys can still be read as the
+    /// rows they reach. A table stored in its parent's order has no adjacency to list them from, and
+    /// its monotone link pushes them instead, which is TPC-H q02's `partsupp` under the semi join on
+    /// the parts its subquery is asked about.
+    #[test]
+    fn a_side_set_aside_lists_its_rows_through_a_monotone_link() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let parent_keys: Vec<Option<i128>> = (0..10_000).map(|rid| Some(100 + rid)).collect();
+        let parents_of: Vec<u64> = (0..40_000).map(|child| child / 4).collect();
+        let exact = Exact::new(
+            KeyMap::build(&parent_keys).expect("unique keys"),
+            Some(Link::build(&parents_of, 10_000).expect("every parent exists")),
+        );
+        let side = [chunk(&[Some(103), Some(5_100)])];
+
+        let found = found_for(&keyed, Some(&exact), &side, false, false).expect("integers");
+        assert!(found.rows.is_none() && found.domain.is_some(), "no rows of its own");
+        assert_eq!(found.reach(Some(&exact)), Some(8));
+        let rows = &found.gather(Some(&exact)).expect("pushed").rids;
+        let expected: Vec<u64> = (12..16).chain(20_000..20_004).collect();
+        assert_eq!(rows.iter().collect::<Vec<u64>>(), expected);
+    }
+
     /// The exact rows answer the scan, which leaves no bitmap behind for a join above that narrows
     /// its own table by these keys. Asked for, the side makes one anyway, and it holds exactly the
     /// keys the side holds.
