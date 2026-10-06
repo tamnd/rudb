@@ -70,6 +70,9 @@ impl Flags {
     /// The token ran to the end of the input without its closing delimiter. Only a dollar quoted
     /// string reaches the matcher this way; the other unterminated forms are errors.
     pub const UNTERMINATED: Flags = Flags(1 << 2);
+    /// On the `BEGIN` or `START` of a transaction that asked for `ISOLATION LEVEL SERIALIZABLE`, a
+    /// clause [`crate::dialect::isolation_levels`] took out before the grammar saw it.
+    pub const SERIALIZABLE: Flags = Flags(1 << 3);
 
     /// Whether every flag in `other` is set here.
     pub const fn has(self, other: Flags) -> bool {
