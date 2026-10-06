@@ -90,8 +90,18 @@ pub(crate) struct Located {
     starts: Vec<u64>,
     /// The keys in order, each with its row's number, built the first time a read of a range of
     /// keys asks.
-    sorted: OnceLock<Sorted>,
+    sorted: OnceLock<Ordered>,
 }
+
+/// The keys of [`Located`] in order, in runs, oldest first, each behind an [`Arc`] the way the
+/// levels are. A key in more than one run is the newest run's.
+///
+/// A copy of a table shares the runs and an append adds its keys as a run of its own, sorted on
+/// their own, and a run is merged into the one before it whenever it grows to half that one's
+/// size. Before, a copy left the keys in order behind, and a read of a range after any write to a
+/// table of ten million keys sorted all ten million again.
+#[derive(Debug, Clone)]
+struct Ordered(Vec<Arc<Sorted>>);
 
 /// One level of the keys of [`Located`].
 #[derive(Debug, Clone, Default)]
@@ -132,12 +142,123 @@ impl Level {
 }
 
 /// The keys of one column in order, each with its row's number.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Sorted {
     /// The keys of an `INTEGER` or `BIGINT` column.
     Ints(Vec<(i64, u64)>),
     /// The keys of a `VARCHAR` column as their bytes, which is the order the plan compares text in.
     Text(Vec<(Box<[u8]>, u64)>),
+}
+
+impl Sorted {
+    fn len(&self) -> usize {
+        match self {
+            Self::Ints(keys) => keys.len(),
+            Self::Text(keys) => keys.len(),
+        }
+    }
+
+    /// Adds `run` at the end when every key of it comes after every key here, which is how a
+    /// table keyed by a counter grows, and hands it back otherwise.
+    fn extend_after(&mut self, run: Self) -> std::result::Result<(), Self> {
+        match (self, run) {
+            (Self::Ints(held), Self::Ints(run))
+                if held.last().zip(run.first()).is_none_or(|(last, first)| last.0 < first.0) =>
+            {
+                held.extend(run);
+                Ok(())
+            }
+            (Self::Text(held), Self::Text(run))
+                if held.last().zip(run.first()).is_none_or(|(last, first)| last.0 < first.0) =>
+            {
+                held.extend(run);
+                Ok(())
+            }
+            (_, run) => Err(run),
+        }
+    }
+
+    /// The keys of this and of `newer` in one run, with `newer`'s number for a key both hold.
+    fn merged(&self, newer: &Self) -> Self {
+        match (self, newer) {
+            (Self::Ints(older), Self::Ints(newer)) => Self::Ints(merge(older, newer)),
+            (Self::Text(older), Self::Text(newer)) => Self::Text(merge(older, newer)),
+            // [`Ordered::note`] never puts keys of the other kind beside these.
+            _ => newer.clone(),
+        }
+    }
+}
+
+/// Two runs of keys in order as one, with `newer`'s number for a key both hold.
+fn merge<K: Ord + Clone>(older: &[(K, u64)], newer: &[(K, u64)]) -> Vec<(K, u64)> {
+    let mut merged = Vec::with_capacity(older.len() + newer.len());
+    let (mut old, mut new) = (0, 0);
+    while let (Some(left), Some(right)) = (older.get(old), newer.get(new)) {
+        match left.0.cmp(&right.0) {
+            std::cmp::Ordering::Less => {
+                merged.push(left.clone());
+                old += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push(right.clone());
+                new += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push(right.clone());
+                old += 1;
+                new += 1;
+            }
+        }
+    }
+    merged.extend_from_slice(&older[old..]);
+    merged.extend_from_slice(&newer[new..]);
+    merged
+}
+
+/// `keys` in order, with the last number given for a key given more than once.
+fn sorted_run<K: Ord>(mut keys: Vec<(K, u64)>) -> Vec<(K, u64)> {
+    // Stable, so of equal keys the one given last comes last.
+    keys.sort_by(|left, right| left.0.cmp(&right.0));
+    keys.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            kept.1 = later.1;
+        }
+        same
+    });
+    keys
+}
+
+impl Ordered {
+    /// Adds the keys an append noted, the integer ones or the text ones, as a run, and merges a
+    /// run into the one before it while it holds at least half as many keys. Answers `false` when
+    /// the keys are not of the kind the runs hold, and the caller drops the runs.
+    fn note(&mut self, ints: Vec<(i64, u64)>, texts: Vec<(Box<[u8]>, u64)>) -> bool {
+        let run = match (self.0.first().map(|run| &**run), ints.is_empty(), texts.is_empty()) {
+            (_, true, true) => return true,
+            (Some(Sorted::Ints(_)), false, true) => Sorted::Ints(sorted_run(ints)),
+            (Some(Sorted::Text(_)), true, false) => Sorted::Text(sorted_run(texts)),
+            _ => return false,
+        };
+        let run = match self.0.last_mut().and_then(Arc::get_mut) {
+            Some(last) => match last.extend_after(run) {
+                Ok(()) => None,
+                Err(run) => Some(run),
+            },
+            None => Some(run),
+        };
+        if let Some(run) = run {
+            self.0.push(Arc::new(run));
+        }
+        while let [.., before, last] = self.0.as_slice()
+            && before.len() <= 2 * last.len()
+        {
+            let last = self.0.pop().expect("two runs");
+            let before = self.0.last_mut().expect("two runs");
+            *before = Arc::new(before.merged(&last));
+        }
+        true
+    }
 }
 
 /// The bytes of a text key from its encoding: a tag and a length of eight bytes, then the bytes.
@@ -197,16 +318,15 @@ impl Located {
         })
     }
 
-    /// A copy that shares this one's levels, for a table that is about to note keys of its own
-    /// while something else holds this. The keys in order are left behind, and built again the
-    /// next time a read of a range asks.
+    /// A copy that shares this one's levels and its keys in order, for a table that is about to
+    /// note keys of its own while something else holds this.
     fn layered(&self) -> Self {
         Self {
             placed: self.placed,
             columns: self.columns.clone(),
             levels: self.levels.clone(),
             starts: self.starts.clone(),
-            sorted: OnceLock::new(),
+            sorted: self.sorted.get().cloned().map(OnceLock::from).unwrap_or_default(),
         }
     }
 
@@ -257,9 +377,9 @@ impl Located {
         if number != before + keys.len() as u64 || number != rows.len() as u64 {
             return Ok(false);
         }
-        // The keys in order stay in order for keys that come after every key there is, which is
-        // how a table keyed by a counter grows, and are dropped for anything else.
-        let mut sorted = self.sorted.get_mut();
+        // The keys in order get a run of the keys noted here, and are dropped when a key is not of
+        // the kind they hold.
+        let mut sorted = self.sorted.get_mut().map(|_| (Vec::new(), Vec::new()));
         let level = {
             if !self.levels.last_mut().is_some_and(|level| Arc::get_mut(level).is_some()) {
                 self.levels.push(Arc::default());
@@ -271,71 +391,70 @@ impl Located {
                 Noted::Null => {}
                 Noted::Int(key) => {
                     level.ints.insert(key, number);
-                    match sorted.as_deref_mut() {
-                        Some(Sorted::Ints(held))
-                            if held.last().is_none_or(|&(last, _)| last < key) =>
-                        {
-                            held.push((key, number));
-                        }
-                        Some(_) => sorted = None,
-                        None => {}
+                    if let Some((ints, _)) = &mut sorted {
+                        ints.push((key, number));
                     }
                 }
                 Noted::Bytes(key) => {
-                    match (sorted.as_deref_mut(), text_of(&key)) {
-                        (Some(Sorted::Text(held)), Some(text))
-                            if held.last().is_none_or(|(last, _)| **last < *text) =>
-                        {
-                            held.push((text.into(), number));
-                        }
-                        (Some(_), _) => sorted = None,
+                    match (&mut sorted, text_of(&key)) {
+                        (Some((_, texts)), Some(text)) => texts.push((text.into(), number)),
+                        (Some(_), None) => sorted = None,
                         (None, _) => {}
                     }
                     level.bytes.insert(key, number);
                 }
             }
         }
-        if sorted.is_none() {
-            self.sorted = OnceLock::new();
-        }
         self.fold();
+        match (sorted, self.sorted.get_mut()) {
+            (Some((ints, texts)), Some(ordered)) => {
+                if !ordered.note(ints, texts) {
+                    self.sorted = OnceLock::new();
+                }
+            }
+            _ => self.sorted = OnceLock::new(),
+        }
         Ok(true)
     }
 
-    /// The keys in order with their rows' numbers: the integer ones when there are any, and
-    /// otherwise the text ones. A key of one column holds keys of only one of the two.
+    /// The keys in order with their rows' numbers, sorted from the levels the first time a read
+    /// of a range asks.
+    fn sorted(&self) -> &Ordered {
+        self.sorted.get_or_init(|| Ordered(vec![Arc::new(self.sort())]))
+    }
+
+    /// The keys of every level in order with their rows' numbers: the integer ones when there are
+    /// any, and otherwise the text ones. A key of one column holds keys of only one of the two.
     ///
     /// A key two levels hold is the newer one's, which an append after a placing that kept the
     /// rows never makes and which is kept right all the same.
-    fn sorted(&self) -> &Sorted {
-        self.sorted.get_or_init(|| {
-            // Each key with how new its level is, newest first among equal keys, so the first of
-            // a run of equal keys is the one kept.
-            let newest = |at: usize| usize::MAX - at;
-            if self.levels.iter().all(|level| level.bytes.is_empty()) {
-                let mut sorted: Vec<(i64, usize, u64)> = Vec::with_capacity(self.len());
-                for (at, level) in self.levels.iter().enumerate() {
-                    sorted
-                        .extend(level.ints.iter().map(|(&key, &number)| (key, newest(at), number)));
-                }
-                sorted.sort_unstable();
-                sorted.dedup_by_key(|&mut (key, _, _)| key);
-                return Sorted::Ints(
-                    sorted.into_iter().map(|(key, _, number)| (key, number)).collect(),
-                );
-            }
-            let mut sorted: Vec<(Box<[u8]>, usize, u64)> = Vec::with_capacity(self.len());
+    fn sort(&self) -> Sorted {
+        // Each key with how new its level is, newest first among equal keys, so the first of
+        // a run of equal keys is the one kept.
+        let newest = |at: usize| usize::MAX - at;
+        if self.levels.iter().all(|level| level.bytes.is_empty()) {
+            let mut sorted: Vec<(i64, usize, u64)> = Vec::with_capacity(self.len());
             for (at, level) in self.levels.iter().enumerate() {
-                sorted.extend(
-                    level.bytes.iter().filter_map(|(key, &number)| {
-                        Some((text_of(key)?.into(), newest(at), number))
-                    }),
-                );
+                sorted.extend(level.ints.iter().map(|(&key, &number)| (key, newest(at), number)));
             }
             sorted.sort_unstable();
-            sorted.dedup_by(|later, first| later.0 == first.0);
-            Sorted::Text(sorted.into_iter().map(|(key, _, number)| (key, number)).collect())
-        })
+            sorted.dedup_by_key(|&mut (key, _, _)| key);
+            return Sorted::Ints(
+                sorted.into_iter().map(|(key, _, number)| (key, number)).collect(),
+            );
+        }
+        let mut sorted: Vec<(Box<[u8]>, usize, u64)> = Vec::with_capacity(self.len());
+        for (at, level) in self.levels.iter().enumerate() {
+            sorted.extend(
+                level
+                    .bytes
+                    .iter()
+                    .filter_map(|(key, &number)| Some((text_of(key)?.into(), newest(at), number))),
+            );
+        }
+        sorted.sort_unstable();
+        sorted.dedup_by(|later, first| later.0 == first.0);
+        Sorted::Text(sorted.into_iter().map(|(key, _, number)| (key, number)).collect())
     }
 
     /// Whether this was built for `key` of `rows` at `placed`.
@@ -424,18 +543,46 @@ fn window<T>(sorted: &[T], reach: Reach, order: impl Fn(&T) -> std::cmp::Orderin
     sorted.get(low..high).unwrap_or(&[])
 }
 
-/// The first `limit` entries of `within`, from the end when `descending`.
-fn pick<'a, T, P>(
-    within: &'a [T],
+/// The first `limit` entries over `windows`, which are of runs in the order of `key`, oldest run
+/// first, from the highest when `descending`. A key more than one window holds is taken from the
+/// newest.
+fn pick<'a, T, K: Ord + Copy, P>(
+    windows: &[&'a [T]],
     descending: bool,
     limit: usize,
+    key: impl Fn(&'a T) -> K,
     f: impl Fn(&'a T) -> P,
 ) -> Vec<P> {
-    if descending {
-        within.iter().rev().take(limit).map(f).collect()
-    } else {
-        within.iter().take(limit).map(f).collect()
+    let head = |window: &'a [T], taken: usize| {
+        if descending {
+            window.len().checked_sub(taken + 1).map(|at| &window[at])
+        } else {
+            window.get(taken)
+        }
+    };
+    let mut picked = Vec::new();
+    // How many entries of each window are behind the ones still to pick.
+    let mut taken = vec![0; windows.len()];
+    while picked.len() < limit {
+        let mut best: Option<(&'a T, K)> = None;
+        // Oldest first, so the newest of equal keys is the one left as the best.
+        for (&window, &taken) in windows.iter().zip(&taken) {
+            if let Some(entry) = head(window, taken) {
+                let at = key(entry);
+                if best.is_none_or(|(_, best)| if descending { at >= best } else { at <= best }) {
+                    best = Some((entry, at));
+                }
+            }
+        }
+        let Some((entry, best)) = best else { break };
+        for (&window, taken) in windows.iter().zip(&mut taken) {
+            if head(window, *taken).is_some_and(|entry| key(entry) == best) {
+                *taken += 1;
+            }
+        }
+        picked.push(f(entry));
     }
+    picked
 }
 
 /// The keys of rows about to be appended, for each key a lookup has built where the rows are, which
@@ -691,18 +838,44 @@ impl Points {
                     again.as_ref()
                 }
             };
-            let picked: Vec<(Wanted<'_>, u64)> = match (located.sorted(), bound) {
-                (Sorted::Ints(sorted), Edge::Int(bound)) => {
-                    let within = window(sorted, reach, |(at, _)| at.cmp(&bound));
-                    pick(within, descending, limit, |&(at, number)| (Wanted::Int(at), number))
+            // Runs of keys of the other kind have none the bound reaches, which happens only for
+            // a table with no rows.
+            let runs = &located.sorted().0;
+            let picked: Vec<(Wanted<'_>, u64)> = match bound {
+                Edge::Int(bound) => {
+                    let windows: Vec<_> = runs
+                        .iter()
+                        .filter_map(|run| match &**run {
+                            Sorted::Ints(run) => Some(window(run, reach, |(at, _)| at.cmp(&bound))),
+                            Sorted::Text(_) => None,
+                        })
+                        .collect();
+                    pick(
+                        &windows,
+                        descending,
+                        limit,
+                        |&(at, _)| at,
+                        |&(at, number)| (Wanted::Int(at), number),
+                    )
                 }
-                (Sorted::Text(sorted), Edge::Text(bound)) => {
-                    let within = window(sorted, reach, |(at, _)| (**at).cmp(bound.as_bytes()));
-                    pick(within, descending, limit, |(at, number)| (Wanted::Text(at), *number))
+                Edge::Text(bound) => {
+                    let windows: Vec<_> = runs
+                        .iter()
+                        .filter_map(|run| match &**run {
+                            Sorted::Text(run) => {
+                                Some(window(run, reach, |(at, _)| (**at).cmp(bound.as_bytes())))
+                            }
+                            Sorted::Ints(_) => None,
+                        })
+                        .collect();
+                    pick(
+                        &windows,
+                        descending,
+                        limit,
+                        |(at, _)| &**at,
+                        |(at, number)| (Wanted::Text(at), *number),
+                    )
                 }
-                // Keys of the other kind, so none the bound reaches, which happens only for a
-                // table with no rows.
-                _ => Vec::new(),
             };
             let mut chunks = Vec::with_capacity(picked.len());
             for (wanted, number) in picked {

@@ -3657,4 +3657,78 @@ mod tests {
             assert!(finds(&copy, key(8050)) && finds(&copy, key(3)));
         }
     }
+
+    /// A copy of a table that appends rows keeps the keys in order beside the original's: a read
+    /// of a range on either gives its own keys in order, from either end, after appends of many
+    /// rows and of one, and after the copy settles.
+    #[test]
+    fn a_copy_reads_a_range_of_the_keys_it_appends_beside_the_original() {
+        let keys: [(LogicalType, fn(i64) -> Value); 2] = [
+            (LogicalType::BigInt, Value::BigInt),
+            (LogicalType::Varchar, |at| Value::Varchar(format!("user{at}"))),
+        ];
+        let order = |left: &Value, right: &Value| match (left, right) {
+            (Value::BigInt(left), Value::BigInt(right)) => left.cmp(right),
+            (Value::Varchar(left), Value::Varchar(right)) => left.cmp(right),
+            _ => panic!("keys of one type"),
+        };
+        for (ty, key) in keys {
+            let mut table = Table::new(
+                QualifiedName::new("memory", "main", "t"),
+                vec![Field::new("k", ty), Field::new("v", LogicalType::Varchar)],
+            )
+            .expect("two columns");
+            table.set_keys(vec![Key { columns: vec![0], primary: true }]).expect("an empty table");
+            // Keys out of order, so that no append adds only keys after every key there is.
+            let scattered = |at: i64| key(at * 7919 % 10_007);
+            let rows = |from: i64, to: i64| {
+                (from..to)
+                    .map(|at| vec![scattered(at), Value::Varchar(format!("v{at}"))])
+                    .collect::<Vec<_>>()
+            };
+            let check = |table: &Table, count: i64| {
+                let mut all: Vec<Value> = (0..count).map(scattered).collect();
+                all.sort_by(order);
+                for (bound, descending) in [(key(0), false), (key(5003), false), (key(5003), true)]
+                {
+                    let reach = if descending { Reach::AtMost } else { Reach::AtLeast };
+                    let chunks = table
+                        .range(0, (reach, &bound), descending, 20, &[0])
+                        .expect("readable rows")
+                        .expect("a range by the key");
+                    let read: Vec<Value> = chunks
+                        .iter()
+                        .map(|chunk| chunk.column(0).expect("one column").value_at(0))
+                        .collect();
+                    let mut expected: Vec<Value> = if descending {
+                        all.iter().rev().filter(|at| order(at, &bound).is_le()).cloned().collect()
+                    } else {
+                        all.iter().filter(|at| order(at, &bound).is_ge()).cloned().collect()
+                    };
+                    expected.truncate(20);
+                    assert_eq!(
+                        read, expected,
+                        "{count} rows from {bound:?}, descending {descending}"
+                    );
+                }
+            };
+            table.append_rows(&rows(0, 3000)).expect("new keys");
+            check(&table, 3000);
+            let mut copy = table.clone();
+            for from in (3000..6000).step_by(250) {
+                copy.append_rows(&rows(from, from + 250)).expect("new keys");
+                check(&copy, from + 250);
+            }
+            for at in 6000..6040 {
+                copy.append_rows(&rows(at, at + 1)).expect("a new key");
+            }
+            check(&copy, 6040);
+            check(&table, 3000);
+            drop(table);
+            copy.settle_keys();
+            check(&copy, 6040);
+            copy.append_rows(&rows(6040, 6100)).expect("new keys");
+            check(&copy, 6100);
+        }
+    }
 }
