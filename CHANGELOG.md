@@ -8,6 +8,20 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.34
+
+This release continues the PostgreSQL work inside PG2 (#2490) and has engine speed work and a new type.
+
+#2636 adds the cursor statements `DECLARE`, `FETCH`, `MOVE` and `CLOSE`, with `SCROLL`, `NO SCROLL`, `WITH HOLD` and `BINARY`. A cursor moves as in PostgreSQL, and a cursor with no `SCROLL` can move back only when its plan can run backward. All 9 libpq_pipeline traces now give the same frames as PostgreSQL 19.
+
+#2635 adds the eleven advisory lock functions of PostgreSQL, such as `pg_advisory_lock` and `pg_try_advisory_xact_lock`, and sends an error of the extended flow to the client at once. #2632 raises the errors of constant folding when a PostgreSQL query is planned, so a division by zero in a constant comes at `Bind` on the extended protocol, as in PostgreSQL.
+
+#2633 adds `VARIANT`, the type that holds a value of any type with the type it has, with its casts, comparisons, JSON round trip and path functions.
+
+#2630, #2631 and #2634 make TPC-H q16 faster: a key of several columns gets the wide map, distinct rows are held without their sets, selections are gathered at their codes, and a mark join and a ranked sort key ask about nulls only when the column can hold one.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.33
 
 This release continues the PostgreSQL work inside PG2 (#2490) and has engine speed work.
