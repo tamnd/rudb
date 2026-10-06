@@ -2670,7 +2670,8 @@ fn weight(ty: &LogicalType) -> usize {
         | LogicalType::Bit
         | LogicalType::BigNum
         | LogicalType::Numeric
-        | LogicalType::Variant => 64,
+        | LogicalType::Variant
+        | LogicalType::Json => 64,
         LogicalType::HugeInt
         | LogicalType::UHugeInt
         | LogicalType::Uuid
@@ -10393,13 +10394,22 @@ fn write_at(file: &File, offset: u64, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes).map_err(io)
 }
 
+/// Whether a column of type `ty` can go into the file.
+///
+/// A caller asks this before the catalog takes a table, because the file is written after the
+/// statement and a table that it cannot write stops every write that comes after it.
+#[must_use]
+pub fn stores(ty: &LogicalType) -> bool {
+    type_tag(ty).is_ok()
+}
+
 /// What a column type is called in the directory.
 ///
 /// A tag is a number in a file somebody else wrote, so a tag that has been used is used forever and
 /// the only thing that may happen to this list is that it grows. 1 to 13 are the tags the format
 /// had when it could store thirteen types, and 14 to 27 are the rest, in the order they were added
 /// rather than in an order that means anything. 28 is `BIGNUM`, 29 is a list, 30 is the `numeric`
-/// of PostgreSQL, 31 is `VARIANT`, 32 is `TIME_NS` and 33 is `TIMESTAMPTZ_NS`.
+/// of PostgreSQL, 31 is `VARIANT`, 32 is `TIME_NS`, 33 is `TIMESTAMPTZ_NS` and 34 is `JSON`.
 fn type_tag(ty: &LogicalType) -> Result<u8> {
     match ty {
         LogicalType::SmallInt => Ok(1),
@@ -10433,6 +10443,7 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::List(element) => type_tag(element).map(|_| 29),
         LogicalType::Numeric => Ok(30),
         LogicalType::Variant => Ok(31),
+        LogicalType::Json => Ok(34),
         LogicalType::TimeNs => Ok(32),
         LogicalType::TimestampTzNs => Ok(33),
         _ => Err(Error::not_implemented(format!("native storage for {ty}"))),
@@ -10504,6 +10515,7 @@ fn tag_type(tag: u8) -> Result<LogicalType> {
         27 => Ok(LogicalType::TimestampNs),
         30 => Ok(LogicalType::Numeric),
         31 => Ok(LogicalType::Variant),
+        34 => Ok(LogicalType::Json),
         32 => Ok(LogicalType::TimeNs),
         33 => Ok(LogicalType::TimestampTzNs),
         _ => Err(invalid("column type tag is unknown")),
@@ -14000,7 +14012,8 @@ fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
             | LogicalType::Bit
             | LogicalType::BigNum
             | LogicalType::Numeric
-            | LogicalType::Variant,
+            | LogicalType::Variant
+            | LogicalType::Json,
             Data::Varlen(values),
         ) => {
             let mut bytes = Vec::new();
@@ -15898,7 +15911,8 @@ fn decode(
         | LogicalType::Bit
         | LogicalType::BigNum
         | LogicalType::Numeric
-        | LogicalType::Variant => {
+        | LogicalType::Variant
+        | LogicalType::Json => {
             let offset_bytes = cur
                 .take((rows + 1).checked_mul(4).ok_or_else(|| invalid("offset count overflow"))?)?;
             let offsets = offset_bytes
