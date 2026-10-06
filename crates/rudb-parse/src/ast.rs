@@ -436,8 +436,11 @@ pub struct TypeDef {
     pub temporary: bool,
     /// Whether `CASCADE` was written, which only a drop can have.
     pub cascade: bool,
-    /// The type the name stands for, as it was written, and `NONE` on a drop.
+    /// The type the name stands for, as it was written, and `NONE` on a drop or when the type is
+    /// an `ENUM` over a query.
     pub ty: StrRef,
+    /// The query of `ENUM (SELECT ...)`, whose strings are the labels, and `NONE` otherwise.
+    pub query: QueryRef,
 }
 
 /// `CREATE TRIGGER name timing event ON table [REFERENCING ...] [FOR EACH ...] body` or `DROP

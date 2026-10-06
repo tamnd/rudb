@@ -4775,7 +4775,18 @@ impl<'a> Binder<'a> {
         }
         let called = top_values(resolved.name, &mut cast);
         let given = cast.len();
+        // An ordered call sorts an enum by where its labels were declared, as `ORDER BY` does.
+        let keys: Vec<ExprRef> = if exporting {
+            keys
+        } else {
+            keys.into_iter().map(|key| self.by_position(key)).collect()
+        };
         let (mut name, order) = self.ordered_aggregate(called, sorted, &keys, &mut cast, exporting);
+        // An enum orders by where its labels were declared and not by how they are spelled, and the
+        // `arg_min` family answers its first argument, so the second can be weighed by its code.
+        if called.starts_with("arg_") && given > 1 && !exporting {
+            cast[1] = self.by_position(cast[1]);
+        }
         let mut ty = resolved.returns;
         // An exported state is typed with the call it came from, so that `finalize` and `combine`
         // know what to read it back into, and the name says so, which keeps the executor's paths

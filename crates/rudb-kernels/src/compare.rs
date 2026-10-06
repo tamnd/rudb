@@ -2640,6 +2640,29 @@ pub fn extreme_order(left: &Value, right: &Value) -> Result<Ordering> {
     }
 }
 
+/// The order of two values of `ty`, which is [`order`] except for an enum. The value of an enum is
+/// its label, and its order is the order the labels were declared in rather than their spelling.
+///
+/// # Errors
+///
+/// The ones [`order`] has.
+pub fn order_as(ty: &LogicalType, left: &Value, right: &Value) -> Result<Ordering> {
+    if let (Some(left), Some(right)) = (enum_place(ty, left), enum_place(ty, right)) {
+        return Ok(left.cmp(&right));
+    }
+    order(left, right)
+}
+
+/// Where `value` was declared in the enum `ty`, or `None` when `ty` is not an enum or the value is
+/// not one of its labels.
+#[must_use]
+pub fn enum_place(ty: &LogicalType, value: &Value) -> Option<usize> {
+    let (Some(labels), Value::Varchar(label)) = (ty.labels(), value) else {
+        return None;
+    };
+    labels.iter().position(|held| held == label)
+}
+
 /// The order of two values with nulls in it, for a sort key.
 ///
 /// A sort has to put nulls somewhere and SQL lets the query say where, so this takes the answer

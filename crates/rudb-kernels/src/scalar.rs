@@ -4183,10 +4183,18 @@ pub fn call_values(
     if matches!(name, "greatest" | "least") {
         let wanted =
             if name == "greatest" { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+        // An enum is weighed by where its labels were declared rather than by how they are spelled.
+        let weigh = |value: &Value, held: &Value| {
+            if returns.labels().is_some() {
+                compare::order_as(returns, value, held)
+            } else {
+                compare::extreme_order(value, held)
+            }
+        };
         let mut best: Option<&Value> = None;
         for value in args.iter().filter(|value| !value.is_null()) {
             best = match best {
-                Some(held) if compare::extreme_order(value, held)? != wanted => Some(held),
+                Some(held) if weigh(value, held)? != wanted => Some(held),
                 _ => Some(value),
             };
         }

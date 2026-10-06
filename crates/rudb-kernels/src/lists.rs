@@ -25,7 +25,7 @@ use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::{Buffer, Data, Live, Validity, Vector, interleave};
 
 use crate::aggregate::{Accumulator, NOWHERE, finish_run, update_runs, update_scattered};
-use crate::compare::order;
+use crate::compare::{order, order_as};
 use crate::datetime;
 use crate::number::integral;
 
@@ -89,30 +89,32 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
         ("list_select", [Value::List { values, .. }, Value::List { values: indexes, .. }]) => {
             selected(values, indexes).and_then(&list)
         }
-        ("list_sort", [Value::List { values, .. }, spelled @ ..]) => {
+        ("list_sort", [Value::List { element, values }, spelled @ ..]) => {
             let order = spelled.first().map(spelled_order).transpose();
             let nulls = spelled.get(1).map(spelled_nulls).transpose();
             match (order, nulls) {
                 (Ok(order), Ok(nulls)) => {
-                    sort(values, order.unwrap_or(false), nulls.unwrap_or(false)).and_then(list)
+                    sort(element, values, order.unwrap_or(false), nulls.unwrap_or(false))
+                        .and_then(list)
                 }
                 (Err(error), _) | (_, Err(error)) => Err(error),
             }
         }
         ("range" | "generate_series", _) => ranged(name == "generate_series", args).and_then(list),
-        ("list_grade_up", [Value::List { values, .. }, spelled @ ..]) => {
+        ("list_grade_up", [Value::List { element, values }, spelled @ ..]) => {
             let order = spelled.first().map(spelled_order).transpose();
             let nulls = spelled.get(1).map(spelled_nulls).transpose();
             match (order, nulls) {
                 (Ok(order), Ok(nulls)) => {
-                    graded(values, order.unwrap_or(false), nulls.unwrap_or(false)).and_then(list)
+                    graded(element, values, order.unwrap_or(false), nulls.unwrap_or(false))
+                        .and_then(list)
                 }
                 (Err(error), _) | (_, Err(error)) => Err(error),
             }
         }
-        ("list_reverse_sort", [Value::List { values, .. }, spelled @ ..]) => {
+        ("list_reverse_sort", [Value::List { element, values }, spelled @ ..]) => {
             match spelled.first().map(spelled_nulls).transpose() {
-                Ok(nulls) => sort(values, true, nulls.unwrap_or(false)).and_then(list),
+                Ok(nulls) => sort(element, values, true, nulls.unwrap_or(false)).and_then(list),
                 Err(error) => Err(error),
             }
         }
@@ -563,13 +565,26 @@ fn unrecognized(spelled: &str, kind: &str) -> Error {
 }
 
 /// `list_sort`: the values in order, with the nulls kept together at one end.
-fn sort(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Value>> {
-    Ok(grade(values, descending, nulls_first)?.into_iter().map(|at| values[at].clone()).collect())
+fn sort(
+    element: &LogicalType,
+    values: &[Value],
+    descending: bool,
+    nulls_first: bool,
+) -> Result<Vec<Value>> {
+    Ok(grade(element, values, descending, nulls_first)?
+        .into_iter()
+        .map(|at| values[at].clone())
+        .collect())
 }
 
 /// `list_grade_up`: the one based place of each value in the order `list_sort` would put it.
-fn graded(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Value>> {
-    grade(values, descending, nulls_first)?
+fn graded(
+    element: &LogicalType,
+    values: &[Value],
+    descending: bool,
+    nulls_first: bool,
+) -> Result<Vec<Value>> {
+    grade(element, values, descending, nulls_first)?
         .into_iter()
         .map(|at| {
             Ok(Value::BigInt(
@@ -584,12 +599,17 @@ fn graded(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<V
 /// The nulls go last unless asked otherwise whichever way the rest are sorted, which is the pin's
 /// default and not the reverse of an ascending sort. The sort is stable, so equal values keep the
 /// order they came in, which is what makes the grade of a list with repeats the pin's.
-fn grade(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<usize>> {
+fn grade(
+    element: &LogicalType,
+    values: &[Value],
+    descending: bool,
+    nulls_first: bool,
+) -> Result<Vec<usize>> {
     let (mut held, nulls): (Vec<usize>, Vec<usize>) =
         (0..values.len()).partition(|&at| !values[at].is_null());
     let mut failed = None;
     held.sort_by(|&left, &right| {
-        let ordering = order(&values[left], &values[right]).unwrap_or_else(|error| {
+        let ordering = order_as(element, &values[left], &values[right]).unwrap_or_else(|error| {
             failed.get_or_insert(error);
             Ordering::Equal
         });

@@ -1030,11 +1030,15 @@ impl<'a> Transform<'a> {
             "CreateTypeStmt" => {
                 // `CreateType <- EnumSelectType / EnumStringLiteralList / CreateTypeFromType`. A
                 // list of strings is the text of an `ENUM` type as it stands, and an `ENUM` over a
-                // query is not something this engine makes yet.
+                // query keeps the query, whose answer is only known once it runs.
                 let made = self.first(self.find(inner, "CreateType"));
-                let text = match self.name(made) {
-                    "CreateTypeFromType" => self.text(self.first(made)).to_string(),
-                    "EnumStringLiteralList" => self.text(made).to_string(),
+                let (text, query) = match self.name(made) {
+                    "CreateTypeFromType" => (self.text(self.first(made)).to_string(), NONE),
+                    "EnumStringLiteralList" => (self.text(made).to_string(), NONE),
+                    "EnumSelectType" => {
+                        let body = self.find(made, "SelectStatementInternal");
+                        (String::new(), self.query(body)?)
+                    }
                     _ => return self.unsupported(made),
                 };
                 let made = crate::ast::TypeDef {
@@ -1044,7 +1048,8 @@ impl<'a> Transform<'a> {
                     or_replace,
                     temporary,
                     cascade: false,
-                    ty: self.intern(&text),
+                    ty: if query == NONE { self.intern(&text) } else { NONE },
+                    query,
                 };
                 Ok(self.type_statement(made))
             }
@@ -2145,6 +2150,7 @@ impl<'a> Transform<'a> {
                 temporary: false,
                 cascade,
                 ty: NONE,
+                query: NONE,
             };
             return Ok(self.type_statement(made));
         }
@@ -7238,7 +7244,9 @@ mod tests {
                     out += if made.drop { " IF EXISTS" } else { " IF NOT EXISTS" };
                 }
                 out += &format!(" {}", ast.name_text(made.name));
-                if !made.drop {
+                if made.query != NONE {
+                    out += &format!(" AS ENUM ({})", show_query(&ast, made.query));
+                } else if !made.drop {
                     out += &format!(" AS {}", ast.string(made.ty));
                 }
                 if made.cascade {

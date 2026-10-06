@@ -54,6 +54,9 @@ pub(crate) enum General {
     /// `sum` over `BIGNUM`, which has no total too wide to keep, in the layout of
     /// [`rudb_common::bignum`].
     BigSum { held: Option<Vec<u8>> },
+    /// `min` and `max` over an `ENUM`, which keep the place of the label rather than the label,
+    /// since an enum is ordered by where its labels were declared.
+    Placed { held: Option<usize>, least: bool, returns: LogicalType },
     /// `bitstring_agg`, in [`crate::bitstring`].
     Gathered(Gathered),
     /// `approx_count_distinct`, in [`crate::hash`].
@@ -176,6 +179,13 @@ impl General {
         };
         if name == "sum" && *returns == LogicalType::BigNum {
             return Some(Self::BigSum { held: None });
+        }
+        if matches!(name, "min" | "max") && returns.labels().is_some() {
+            return Some(Self::Placed {
+                held: None,
+                least: name == "min",
+                returns: returns.clone(),
+            });
         }
         if let Some(state) = ArgExtreme::named(name) {
             return Some(Self::Arg { state: Box::new(state), returns: returns.clone() });
@@ -318,6 +328,13 @@ impl General {
                     (Some(so_far), BitOp::Or) => so_far | bits,
                     (Some(so_far), BitOp::Xor) => so_far ^ bits,
                 });
+            }
+            Self::Placed { held, least, returns } => {
+                let place = crate::compare::enum_place(returns, value)
+                    .ok_or_else(|| unexpected(if *least { "min" } else { "max" }, value))?;
+                *held = Some(held.map_or(place, |so_far| {
+                    if *least { so_far.min(place) } else { so_far.max(place) }
+                }));
             }
             Self::BigSum { held } => match (value, held.as_mut()) {
                 (Value::Null, _) => {}
@@ -626,6 +643,14 @@ impl General {
                     (here, there) => here.or(there),
                 };
             }
+            (Self::Placed { held, least, .. }, Self::Placed { held: theirs, .. }) => {
+                *held = match (*held, *theirs) {
+                    (Some(here), Some(there)) => {
+                        Some(if *least { here.min(there) } else { here.max(there) })
+                    }
+                    (here, there) => here.or(there),
+                };
+            }
             (Self::BigSum { held }, Self::BigSum { held: theirs }) => {
                 if let Some(there) = theirs {
                     *held = Some(match held.as_ref() {
@@ -780,7 +805,11 @@ impl General {
             Self::Timed(state) => state.finish()?,
             Self::Tally(tally) => tally.entropy()?,
             Self::Counted { tally, key } => {
-                let entries = tally.sorted()?;
+                let mut entries = tally.sorted()?;
+                // The keys of an enum come in the order its labels were declared in.
+                if key.labels().is_some() {
+                    entries.sort_by_key(|(value, _)| crate::compare::enum_place(key, value));
+                }
                 if entries.is_empty() {
                     return Ok(Value::Null);
                 }
@@ -791,6 +820,10 @@ impl General {
             Self::Binned(state) => state.finish(),
             Self::BitString { held, .. } => held.clone().map_or(Value::Null, Value::Bit),
             Self::BigSum { held } => held.clone().map_or(Value::Null, Value::BigNum),
+            Self::Placed { held, returns, .. } => match (held, returns.labels()) {
+                (Some(place), Some(labels)) => Value::Varchar(labels[*place].clone()),
+                _ => Value::Null,
+            },
             Self::Gathered(state) => state.finish(),
             Self::Sketched(sketch) => Value::BigInt(sketch.count()),
             Self::Top { top, element } => top.finish(element),

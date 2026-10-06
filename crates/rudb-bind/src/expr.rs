@@ -1367,6 +1367,12 @@ impl Binder<'_> {
         if let Some(call) = self.enum_call(&written, &bound)? {
             return Ok(call);
         }
+        // The pin hashes an enum as the integer it is stored in and not as its label.
+        if rudb_catalog::same_name(&written, "hash") {
+            for arg in &mut bound {
+                *arg = self.by_position(*arg);
+            }
+        }
         if let Some(&builder) =
             rudb_kernels::json::BUILDERS.iter().find(|name| rudb_catalog::same_name(&written, name))
         {
@@ -2428,6 +2434,10 @@ impl Binder<'_> {
         };
         if name == "enum_range_boundary" {
             let [start, end] = bound else { return Ok(None) };
+            // Each end is an enum or a null, and a string is not taken for a label here.
+            if !types.iter().all(|ty| ty.labels().is_some() || *ty == LogicalType::Null) {
+                return Err(needs());
+            }
             let ty = match (types[0].labels(), types[1].labels()) {
                 (None, None) => return Err(needs()),
                 (Some(_), Some(_)) if types[0] != types[1] => {
