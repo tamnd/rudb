@@ -2843,6 +2843,8 @@ impl<'a> Aggregate<'a> {
         let mut placed = false;
         if let Some(codes) = &direct {
             if !codes.same_as(coded_on) {
+                // The totals kept by place were added up against the map as it is.
+                place_sums.fold_places(coded_map, states)?;
                 if codes.reads_values() {
                     *coded_spent += codes.combos() - grown.unwrap_or(0);
                 }
@@ -2948,6 +2950,9 @@ impl<'a> Aggregate<'a> {
                     // per row, and the groups a place has none for yet are opened afterwards in
                     // the order their first rows come in, the same order as the pass below.
                     let combos = coded_map.len();
+                    if !place_sums.carries(*length) {
+                        place_sums.fold_places(coded_map, states)?;
+                    }
                     place_sums.add_places(&mut coded_places[..*length], kept, combos, &inputs)?;
                     if place_sums.touched(coded_map)? {
                         for (row, &place) in coded_places[..*length].iter().enumerate() {
@@ -2958,7 +2963,6 @@ impl<'a> Aggregate<'a> {
                             }
                         }
                     }
-                    place_sums.fold_places(coded_map, states, calls)?;
                 } else {
                     let mut row = 0;
                     loop {
@@ -5907,6 +5911,7 @@ impl Building {
     /// Folds in the totals [`PlaceSums`] still owes the accumulators, which everything that reads
     /// them or moves the groups asks for first.
     fn settle(&mut self) -> Result<()> {
+        self.place_sums.fold_places(&self.coded_map, &mut self.states)?;
         self.place_sums.settle(&mut self.states)
     }
 }

@@ -2655,10 +2655,18 @@ pub struct PlaceSums {
     /// The calls that want the row count and no value.
     counting: Vec<usize>,
     /// Per place of the map and one more for the rows the filter dropped, the same cells as
-    /// [`Self::cells`], for [`Self::add_places`]. Every cell is back to nothing between chunks.
+    /// [`Self::cells`], for [`Self::add_places`]. They go on from chunk to chunk until
+    /// [`Self::fold_places`] folds them in, and the place for the dropped rows is cleared every
+    /// chunk.
     by_place: Vec<i64>,
-    /// The places of [`Self::by_place`] with rows in the chunk, as [`Self::touched`] found them.
-    touched: Vec<usize>,
+    /// The calls, the counting calls and the stride the cells of [`Self::by_place`] were added up
+    /// for, and the rows the filter kept they hold.
+    held: Vec<(usize, Feed, i64)>,
+    held_counting: Vec<usize>,
+    held_stride: usize,
+    held_rows: i64,
+    /// The stride [`Self::ready`] was last given.
+    stride: usize,
     /// Every place that has had rows, for [`Self::touched`] to ask first, and by place whether it
     /// is on that list.
     seen: Vec<usize>,
@@ -2694,6 +2702,7 @@ impl PlaceSums {
         self.counting.clear();
         self.cells.clear();
         self.pending = 0;
+        self.stride = stride;
         if rows >= 1 << 31 {
             return false;
         }
@@ -2834,7 +2843,8 @@ impl PlaceSums {
     /// with no list of rows, and a row adds into its place's cells with no map and nothing to stop
     /// at. What it costs is a pass over the places a chunk to find the ones with rows, which is why
     /// the map has to be well short of the rows. The caller then opens a group for any place
-    /// [`Self::touched`] says has none and folds with [`Self::fold_places`].
+    /// [`Self::touched`] says has none. The cells are folded in by [`Self::fold_places`] only when
+    /// [`Self::carries`] says the next chunk cannot go on adding into them, or before a settle.
     ///
     /// See `spec/perf/115-totals-by-place.md`.
     ///
@@ -2853,6 +2863,14 @@ impl PlaceSums {
         let Ok(past) = u32::try_from(combos) else {
             return Err(Error::internal(format!("a map of {combos} places")));
         };
+        if !self.carries(places.len()) {
+            return Err(Error::internal("totals by place for other calls were not folded".to_string()));
+        }
+        if self.held_rows == 0 {
+            self.held.clone_from(&self.calls);
+            self.held_counting.clone_from(&self.counting);
+            self.held_stride = self.stride;
+        }
         self.added = places.len();
         if self.by_place.len() < needed {
             self.by_place.resize(needed, 0);
@@ -2927,13 +2945,13 @@ impl PlaceSums {
     /// Writes down the places [`Self::add_places`] added rows into, and says whether `map` has no
     /// group yet for any of them.
     ///
-    /// The caller opens a group for each such place before [`Self::fold_places`]. On q01 the map
-    /// has a place for every two or three rows of a chunk and about 400 of them have rows, so the
-    /// fold goes through the list rather than through the map again.
+    /// The caller opens a group for each such place before the next chunk. On q01 the map has a
+    /// place for every two or three rows of a chunk and about 400 of them have rows, so the fold
+    /// goes through the list of places that have had rows rather than through the map again.
     ///
     /// The places that have had rows in any chunk before are asked first. Every row adds one to the
-    /// count of its place, so when their counts add up to the rows the chunk put in the map no other
-    /// place can have any, and the other three thousand places of q01's map are not looked at. A
+    /// count of its place, so when their counts add up to the rows held no other place can have
+    /// any, and the other three thousand places of q01's map are not looked at. A
     /// chunk with a row in a place no chunk had before is a pass over the count of every place, as
     /// it always was. Asking only the places of the chunk before was tried first, and q01 has groups
     /// of a row in every few chunks, so nearly every chunk fell back to the pass.
@@ -2942,31 +2960,29 @@ impl PlaceSums {
     ///
     /// An internal error for a place past the map with rows, which is a bug in the caller.
     pub fn touched(&mut self, map: &[u32]) -> Result<bool> {
-        let (width, span) = (self.calls.len(), cell_span(self.calls.len()));
+        let (width, span) = (self.held.len(), cell_span(self.held.len()));
         let used = self.by_place.len().min((map.len() + 1) * span);
         let counts = self.by_place[..used].get(width..).unwrap_or_default();
         // The rows the filter dropped, which are all in the place past the map.
         let dropped = counts.get(map.len() * span).copied().unwrap_or(0);
-        let rows = i64::try_from(self.added).unwrap_or(i64::MAX) - dropped;
+        self.held_rows += i64::try_from(self.added).unwrap_or(i64::MAX) - dropped;
         let mut found = 0;
-        self.touched.clear();
+        let mut unseen = false;
         for &place in &self.seen {
             let count = if place < map.len() { counts[place * span] } else { 0 };
             found += count;
-            if count != 0 {
-                self.touched.push(place);
-            }
+            unseen |= count != 0 && map[place] == UNSEEN;
         }
-        if found != rows {
+        if found != self.held_rows {
             // Only the count of each place is read, as every `span`th cell, since asking each
             // place's cells whether it had rows was ten instructions a place.
-            self.touched.clear();
+            unseen = false;
             if self.marked.len() < map.len() {
                 self.marked.resize(map.len(), false);
             }
             for (place, &count) in counts.iter().step_by(span).take(map.len()).enumerate() {
                 if count != 0 {
-                    self.touched.push(place);
+                    unseen |= map[place] == UNSEEN;
                     if !self.marked[place] {
                         self.marked[place] = true;
                         self.seen.push(place);
@@ -2980,40 +2996,53 @@ impl PlaceSums {
         if self.by_place[used..].iter().any(|&cell| cell != 0) {
             return Err(Error::internal("a place past the map has rows".to_string()));
         }
-        let mut unseen = false;
-        for &place in &self.touched {
-            unseen |= map.get(place).is_some_and(|&held| held == UNSEEN);
-        }
         Ok(unseen)
     }
 
-    /// Adds the totals of each place [`Self::touched`] wrote down to what is owed the group `map`
-    /// holds for it, and leaves every cell at nothing for the next chunk.
+    /// Whether a chunk of `rows` rows can go on adding into the cells the chunks before it left
+    /// in [`Self::by_place`], which it can while the calls, how they are fed, their bases and the
+    /// stride are the same and no total can leave its `i64`. When it cannot, the caller folds the
+    /// cells in with [`Self::fold_places`] before [`Self::add_places`].
+    pub fn carries(&self, rows: usize) -> bool {
+        self.held_rows == 0
+            || (self.held == self.calls
+                && self.held_counting == self.counting
+                && self.held_stride == self.stride
+                && i64::try_from(rows).is_ok_and(|rows| self.held_rows + rows < 1 << 31))
+    }
+
+    /// Adds the totals of each place that has rows to what is owed the group `map` holds for it,
+    /// and leaves every cell at nothing.
     ///
     /// Folding them into the accumulators a chunk at a time was about an eighth of q01, a hundred
     /// instructions a group a chunk to find each state, ask what it is and check its add. What is
-    /// owed is a plain total and count per call, so a chunk adds to it with no questions asked and
-    /// [`Self::settle`] folds it in once, before anything reads the accumulators. A chunk whose
-    /// calls are fed differently from what is owed settles first.
+    /// owed is a plain total and count per call, so this adds to it with no questions asked and
+    /// [`Self::settle`] folds it in once, before anything reads the accumulators. Cells fed
+    /// differently from what is owed settle first.
     ///
-    /// See `spec/perf/117-totals-owed.md`.
+    /// Folding even that once a chunk was a tenth of q01's cycles, about 400 places of a few
+    /// thousand rows each, so the cells go on from chunk to chunk and are folded only when the
+    /// map is about to change, [`Self::carries`] says no, or the caller is about to settle. The
+    /// map has to be the one the cells were added up against.
+    ///
+    /// See `spec/perf/117-totals-owed.md` and `spec/perf/126-totals-by-place-kept-across-chunks.md`.
     ///
     /// # Errors
     ///
     /// The overflow a total raises, and an internal error for a place with rows and no group, or a
     /// group with no state for a call.
-    pub fn fold_places(
-        &mut self,
-        map: &[u32],
-        states: &mut [Accumulator],
-        stride: usize,
-    ) -> Result<()> {
+    pub fn fold_places(&mut self, map: &[u32], states: &mut [Accumulator]) -> Result<()> {
+        if self.held_rows == 0 {
+            return Ok(());
+        }
+        self.held_rows = 0;
+        let stride = self.held_stride;
         let alike =
             self.owed_feeds.len() == stride
-                && self.calls.iter().all(|&(offset, feed, _)| {
+                && self.held.iter().all(|&(offset, feed, _)| {
                     self.owed_feeds[offset].is_none_or(|owed| owed == feed)
                 })
-                && self.counting.iter().all(|&offset| {
+                && self.held_counting.iter().all(|&offset| {
                     self.owed_feeds[offset].is_none_or(|owed| owed == Feed::Counted)
                 });
         if !alike {
@@ -3021,27 +3050,31 @@ impl PlaceSums {
             self.owed_feeds.clear();
             self.owed_feeds.resize(stride, None);
         }
-        for &(offset, feed, _) in &self.calls {
+        for &(offset, feed, _) in &self.held {
             self.owed_feeds[offset] = Some(feed);
         }
-        for &offset in &self.counting {
+        for &offset in &self.held_counting {
             self.owed_feeds[offset] = Some(Feed::Counted);
         }
-        let span = cell_span(self.calls.len());
-        for &place in &self.touched {
-            let held = map.get(place).copied().unwrap_or(UNSEEN);
-            if held == UNSEEN {
-                return Err(Error::internal(format!("place {place} has rows and no group")));
-            }
-            let (group, at) = (held as usize, held as usize * stride);
-            let cells = &mut self.by_place[place * span..][..span];
-            let count = cells[self.calls.len()];
+        let span = cell_span(self.held.len());
+        // Every place with rows is on the list, since `touched` looked at every place whenever the
+        // ones on it fell short of the rows.
+        for &place in &self.seen {
+            let Some(cells) = self.by_place.get_mut(place * span..(place + 1) * span) else {
+                continue;
+            };
+            let count = cells[self.held.len()];
             if count != 0 {
+                let held = map.get(place).copied().unwrap_or(UNSEEN);
+                if held == UNSEEN {
+                    return Err(Error::internal(format!("place {place} has rows and no group")));
+                }
+                let (group, at) = (held as usize, held as usize * stride);
                 if self.owed.len() < at + stride {
                     self.owed.resize(at + stride, (0, 0));
                 }
                 let owed = &mut self.owed[at..at + stride];
-                for (&total, &(offset, feed, base)) in cells.iter().zip(&self.calls) {
+                for (&total, &(offset, feed, base)) in cells.iter().zip(&self.held) {
                     let number = i128::from(total) + i128::from(base) * i128::from(count);
                     let (sum, rows) = &mut owed[offset];
                     match sum.checked_add(number) {
@@ -3049,7 +3082,7 @@ impl PlaceSums {
                         None => fold_wide(states, at + offset, feed, number, count)?,
                     }
                 }
-                for &offset in &self.counting {
+                for &offset in &self.held_counting {
                     owed[offset].1 += count;
                 }
                 if self.owes.len() <= group {
@@ -3059,8 +3092,8 @@ impl PlaceSums {
                     self.owes[group] = true;
                     self.owing.push(group);
                 }
+                cells.fill(0);
             }
-            cells.fill(0);
         }
         Ok(())
     }
@@ -6644,9 +6677,10 @@ mod tests {
             }
             assert_eq!(sums.touched(&map).expect("looks"), chunk == 0, "chunk {chunk}");
             map[2] = 2;
-            sums.fold_places(&map, &mut each_place, stride).expect("folds them in");
-            assert!(!sums.owing.is_empty(), "chunk {chunk} owes nothing");
+            assert!(sums.carries(rows), "chunk {chunk} cannot go on in the same cells");
             if chunk == 1 {
+                sums.fold_places(&map, &mut each_place).expect("folds them in");
+                assert!(!sums.owing.is_empty(), "chunk {chunk} owes nothing");
                 sums.settle(&mut each_place).expect("settles");
             }
             for at in elsewhere {
@@ -6654,8 +6688,10 @@ mod tests {
                     .expect("folds it");
             }
         }
+        sums.fold_places(&map, &mut each_place).expect("folds them in");
         sums.settle(&mut each_place).expect("settles");
         assert!(sums.owing.is_empty() && sums.owed.iter().all(|&owed| owed == (0, 0)));
+        assert!(sums.by_place.iter().all(|&cell| cell == 0), "a cell was left behind");
         let mut thrice = fresh();
         for _ in 0..3 {
             for (at, &input) in inputs.iter().enumerate() {
