@@ -325,11 +325,11 @@ impl Siblings {
         // The parent of the row before and where its siblings are in the batch, so that a run of
         // rows with one parent looks it up and finds its siblings once.
         let paired = matches!(self.tests, Tests::Pairs { .. });
-        // A compared walk over a link takes each parent's children as the run they are and never
-        // lists them, see [`Self::compare`].
+        // A walk over a link takes each parent's children as the run they are and never lists
+        // them, see [`Self::read`].
         let link = match &self.children {
-            Children::Runs(link) if !paired => Some(link),
-            _ => None,
+            Children::Runs(link) => Some(link),
+            Children::Listed(_) => None,
         };
         let mut last: Option<(i128, Rid)> = None;
         let mut group: Option<(Rid, u32, u32)> = None;
@@ -563,8 +563,14 @@ impl Siblings {
     ) -> Result<()> {
         // A child in no order, or a parent that came back after another, is read in row order and
         // each pair's place moved to where its sibling went.
+        let listed = matches!(self.children, Children::Listed(_));
+        if !local.rising && !listed {
+            list(local)?;
+        }
         if local.rising {
-            coalesce(&local.rids, &mut local.runs);
+            if listed {
+                coalesce(&local.rids, &mut local.runs);
+            }
         } else {
             local.sorted.clear();
             local.sorted.extend_from_slice(&local.rids);
@@ -630,14 +636,7 @@ impl Siblings {
         // lists them here and goes the way every walk in no order goes.
         let listed = matches!(self.children, Children::Listed(_));
         if !local.rising && !listed {
-            local.rids.clear();
-            for &(first, length) in &local.runs {
-                for rid in first..first + u64::from(length) {
-                    local.rids.push(u32::try_from(rid).map_err(|_| {
-                        Error::internal("a sibling row id is past what a gather can hold")
-                    })?);
-                }
-            }
+            list(local)?;
         }
         if !local.rising {
             local.sorted.clear();
@@ -685,6 +684,20 @@ impl Siblings {
         }
         Ok(())
     }
+}
+
+/// The runs a walk over a link found, as the rows of `local`, for a batch whose parents did not
+/// rise and which is read the way a walk in no order is.
+fn list(local: &mut Walking) -> Result<()> {
+    local.rids.clear();
+    for &(first, length) in &local.runs {
+        for rid in first..first + u64::from(length) {
+            local.rids.push(u32::try_from(rid).map_err(|_| {
+                Error::internal("a sibling row id is past what a gather can hold")
+            })?);
+        }
+    }
+    Ok(())
 }
 
 /// `rids`, which rise, as runs of rows, a first row and a length, in `runs`.
