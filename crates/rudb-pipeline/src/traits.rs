@@ -346,6 +346,16 @@ pub trait Sink: Send + Sync + fmt::Debug {
         false
     }
 
+    /// Whether sparse chunks are worth laying into full ones in front of this sink.
+    ///
+    /// They are for a sink that spends something on every chunk it is handed. A sink that reads a
+    /// few columns of each chunk and keeps a few of its rows is cheaper handed the sparse chunks as
+    /// they come, since laying them out copies every column of every row, strings and all, before
+    /// the sink drops most of them.
+    fn wants_full(&self) -> bool {
+        true
+    }
+
     /// Whether every row has to arrive under the morsel it was read from.
     ///
     /// The driver holds sparse chunks back and pushes them on together, and without this it lets

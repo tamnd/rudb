@@ -168,6 +168,9 @@ pub trait DynSink: Send + Sync + fmt::Debug {
     /// Whether the typed operator can stop early. See [`Sink::stops_early`].
     fn may_stop(&self) -> bool;
 
+    /// Whether the typed operator wants sparse chunks laid out. See [`Sink::wants_full`].
+    fn wants_full_chunks(&self) -> bool;
+
     /// Take one chunk into the local state.
     ///
     /// # Errors
@@ -230,6 +233,10 @@ impl<S: Sink> DynSink for S {
 
     fn may_stop(&self) -> bool {
         self.stops_early()
+    }
+
+    fn wants_full_chunks(&self) -> bool {
+        self.wants_full()
     }
 
     fn sink_state(&self, chunk: &Chunk, local: &mut LocalState) -> Result<Progress> {
