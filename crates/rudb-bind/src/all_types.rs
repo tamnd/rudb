@@ -220,7 +220,7 @@ fn all_types_text() -> String {
 
 /// Every column of `test_all_types()`, in the pin's order: the name, the type, the least value and
 /// the greatest, each written as SQL. The type is empty for the columns whose type is not written.
-fn all_types_columns() -> Vec<(&'static str, &'static str, String, String)> {
+pub(crate) fn all_types_columns() -> Vec<(&'static str, &'static str, String, String)> {
     let int_lists = (
         format!("[[], {INTS}, NULL, [], {INTS}]"),
         format!("[[], {INTS}, []]"),
