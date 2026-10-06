@@ -350,7 +350,7 @@ pub(crate) fn encode(chunk: &Chunk, key: &Key, row: usize, out: &mut Vec<u8>) ->
 /// with no null in it, which is what a primary key on an `id` is. False for every other key, which
 /// is encoded a row at a time with [`encode`] instead. The block is the same keys `encode` gives,
 /// in the same order, with the row a key is from its place in the block.
-fn int_block(chunk: &Chunk, key: &Key, out: &mut Vec<i64>) -> Result<bool> {
+pub(crate) fn int_block(chunk: &Chunk, key: &Key, out: &mut Vec<i64>) -> Result<bool> {
     let &[column] = key.columns.as_slice() else {
         return Ok(false);
     };

@@ -3234,6 +3234,61 @@ fn key_in(table: &rudb_catalog::Table, columns: &[String]) -> Option<usize> {
     rudb_native::graph::key_of(&at)
 }
 
+/// Seals the keys of every table of the file into a run each, for the keys and unique indexes
+/// whose run is missing or covers too little of the table now. See `rudb_catalog::sealed`.
+///
+/// A lookup on a table just opened then reads the run rather than the key of every row of the
+/// file. It runs after the links and beside the text sections, which read other columns and write
+/// sections of their own.
+fn seal(path: &Path, catalog: &mut Catalog, pages: &rudb_native::PagePool) -> Result<()> {
+    let wanted = catalog
+        .stored_tables_in(DEFAULT_CATALOG)
+        .map(|table| {
+            let keys = table.point_keys().into_iter().map(<[usize]>::to_vec).collect::<Vec<_>>();
+            (table.name().clone(), keys)
+        })
+        .filter(|(_, keys)| !keys.is_empty())
+        .collect::<Vec<_>>();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let native = rudb_native::Catalog::open_in(path, pages)?;
+    let mut names = Vec::new();
+    for (name, keys) in &wanted {
+        let Ok(reader) = native.table(&name.table) else { continue };
+        let mut payloads = Vec::new();
+        for key in keys {
+            if rudb_catalog::sealed::current(&reader, key) {
+                continue;
+            }
+            if let Some(payload) = rudb_catalog::sealed::seal(&reader, key)? {
+                payloads.push((key.len(), rudb_catalog::sealed::id(key), payload));
+            }
+        }
+        if payloads.is_empty() {
+            continue;
+        }
+        let attachments = payloads
+            .iter()
+            .map(|(columns, id, payload)| rudb_native::section::Attachment {
+                kind: *rudb_native::section::KEY_RUNS,
+                id: *id,
+                flags: 0,
+                header_bytes: u32::try_from(rudb_catalog::sealed::head_bytes(*columns))
+                    .unwrap_or(u32::MAX),
+                bytes: payload,
+            })
+            .collect::<Vec<_>>();
+        rudb_native::attach(path, &name.table, &attachments)?;
+        names.push(name.clone());
+    }
+    drop(native);
+    if names.is_empty() {
+        return Ok(());
+    }
+    rebind(path, catalog, &names, pages)
+}
+
 /// Points every table at the generation the file now holds.
 fn rebind(
     path: &Path,
@@ -7268,7 +7323,8 @@ impl Shared {
                     )?;
                     let links = self.inner.settings.links();
                     sketch(path, &mut catalog, &self.inner.pages, |catalog| {
-                        index(path, catalog, &links, &self.inner.pages)
+                        index(path, catalog, &links, &self.inner.pages)?;
+                        seal(path, catalog, &self.inner.pages)
                     })?;
                 }
                 Ok(QueryResult::empty())

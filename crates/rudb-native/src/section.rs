@@ -98,6 +98,11 @@ pub const VALUE_ROWS: &[u8; 8] = b"RUDBVR1\0";
 /// It is a few dozen bytes, so it is on neither budget list below.
 pub const LINK_COUNTS: &[u8; 8] = b"RUDBLC1\0";
 
+/// The keys of one key or unique index of a table in a sorted run, written at checkpoint, see
+/// `rudb_catalog::sealed`. The id is a hash of the key's columns, which the payload names as well.
+/// Paid for out of its own share, so it is on neither budget list below.
+pub const KEY_RUNS: &[u8; 8] = b"RUDBKI1\0";
+
 /// The kinds the graph document owns, which share its ten percent of the column bytes.
 pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
 
@@ -241,6 +246,7 @@ impl Section {
                 | TEXT_GRAMS
                 | VALUE_ROWS
                 | LINK_COUNTS
+                | KEY_RUNS
         )
     }
 
